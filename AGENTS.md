@@ -6,8 +6,10 @@ Read [docs/README.md](docs/README.md) (which document answers what),
 
 ## Principles
 
-- Fix a problem in the layer that owns the concept. Prefer the change that improves several
-  paths, and remove what it makes redundant.
+- Understand a problem on every level it touches, from the question asked down to the
+  machine code, and across the owners involved, until its general cause is clear. Fix it in
+  the layer that owns that cause; prefer the change that improves several paths, and remove
+  what it makes redundant.
 - Keep the measured wins ([performance.md](docs/design/performance.md) §0). A new win comes
   with its guard, a cheap deterministic test, in the same commit.
 - Correctness before speed: an optimisation has a differential test against an oracle, a fix
@@ -19,7 +21,9 @@ Read [docs/README.md](docs/README.md) (which document answers what),
 ## Boundaries
 
 - Work in your own branch and worktree. The lead merges and pushes. Never skip the hooks.
-- Delete only what you created; stop processes by PID.
+- Delete only what you created; stop processes by PID. Large datasets live once, read-only,
+  in `C:\Users\Johannes\nrese-data\` on the main PC; point to them, never copy them into a
+  worktree.
 - `literature/` is read-only. Results of licensed systems are never committed.
 - Write files with the editor tools; the shell mangles backslashes.
 - Commit messages end with `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`.

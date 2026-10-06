@@ -101,14 +101,11 @@ impl<'a> Driver<'a> {
         let mut lower_top = Vec::new();
         if self.options.horn_lower_bound {
             let t = Instant::now();
-            if let Some(lower) = known::horn_lower_bound(
-                self.normalised,
-                self.classes,
-                self.options.threads,
+            let core = self.options.core(
                 self.deadline
                     .budget(self.options, Some(self.options.lower_bound_timeout)),
-                self.options.lower_bound_strategy,
-            ) {
+            );
+            if let Some(lower) = known::horn_lower_bound(self.normalised, self.classes, &core) {
                 if lower.inconsistent {
                     return self.inconsistent();
                 }
@@ -122,6 +119,26 @@ impl<'a> Driver<'a> {
             }
             self.profile.lower_bound = t.elapsed();
         }
+        // Axioms every test leaves out (an irregular role hierarchy, …): no test can show a
+        // class satisfiable or a subsumption absent, so the lower bound is the answer, now,
+        // instead of after a search whose every "no" is unsupported.
+        let left_out = crate::tableau::left_out(self.ontology, self.normalised);
+        if !left_out.is_empty() {
+            let why = left_out.join("; ");
+            self.incomplete
+                .push(format!("consistency not decided (unsupported): {why}"));
+            if self.top_known.is_none() {
+                self.incomplete
+                    .push(format!("owl:Thing not decided (unsupported): {why}"));
+            }
+            for s in &mut self.status {
+                if matches!(s, Status::Open) {
+                    *s = Status::Unknown(format!("unsupported: {why}"));
+                }
+            }
+            let known = self.known.clone();
+            return self.finish(&known, &lower_top, started);
+        }
         super::trace("consistency");
         // 1. Consistency: the context core where it can, else the hypertableau.
         let t = Instant::now();
@@ -131,8 +148,7 @@ impl<'a> Driver<'a> {
                 self.normalised,
                 self.classes,
                 &self.config(),
-                self.options.threads,
-                self.deadline.budget(self.options, None),
+                &self.options.core(self.deadline.budget(self.options, None)),
             )
         } else {
             None
@@ -188,6 +204,12 @@ impl<'a> Driver<'a> {
         } else {
             self.tableau_phases(full)
         };
+        self.finish(&subsumers, &top, started)
+    }
+
+    /// The taxonomy from the subsumers and `owl:Thing`'s equivalents found, with what
+    /// stays undecided.
+    fn finish(mut self, subsumers: &[Vec<u32>], top: &[u32], started: Instant) -> Taxonomy {
         let mut c = Classification {
             classes: self.classes.to_vec(),
             consistent: true,
