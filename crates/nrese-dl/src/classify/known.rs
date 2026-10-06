@@ -173,6 +173,7 @@ fn exact_for(
         .iter()
         .any(|(_, r)| *r != UNSUPPORTED_DATATYPE_DEFINITIONS && *r != UNSUPPORTED_KEYS)
     {
+        super::trace("exactness: unsupported axioms");
         return;
     }
     let mut inside = vec![false; n.clauses.len()];
@@ -181,12 +182,21 @@ fn exact_for(
     }
     let mut triggers = Vec::new();
     let mut roles: Vec<Term> = Vec::new();
+    let mut local: Vec<crate::context::Local> = Vec::new();
     for (i, c) in n.clauses.iter().enumerate() {
         if inside[i] {
             continue;
         }
         if c.body.is_empty() {
+            super::trace(&format!(
+                "exactness: an everywhere clause left out: {:?} -> {:?}",
+                c.body, c.head
+            ));
             return;
+        }
+        if let Some(l) = local_clause(c, saturated) {
+            local.push(l);
+            continue;
         }
         let mut concepts = false;
         for b in &c.body {
@@ -195,7 +205,10 @@ fn exact_for(
                 match saturated.concept_of(*concept) {
                     // Not in the part: no context has it.
                     None => {}
-                    Some((_, true)) => return,
+                    Some((_, true)) => {
+                        super::trace("exactness: a flipped body concept");
+                        return;
+                    }
                     Some((id, false)) => triggers.push(id),
                 }
             }
@@ -226,10 +239,20 @@ fn exact_for(
     }
     let role_ids: Vec<crate::context::atoms::RoleId> =
         seen.iter().filter_map(|&r| saturated.role_of(r)).collect();
-    if triggers.is_empty() && role_ids.is_empty() && part.len() == n.clauses.len() {
+    if triggers.is_empty()
+        && role_ids.is_empty()
+        && local.is_empty()
+        && part.len() == n.clauses.len()
+    {
         lower.exact = true;
     }
-    let untouched = saturated.untouched(&triggers, &role_ids);
+    super::trace(&format!(
+        "exactness: {} triggers, {} roles, {} local clauses",
+        triggers.len(),
+        role_ids.len(),
+        local.len()
+    ));
+    let untouched = saturated.untouched(&triggers, &role_ids, &local);
     let names = &saturated.program().names;
     lower.exact_for = classes
         .iter()
@@ -276,4 +299,47 @@ fn lower(c: &crate::context::Classification, classes: &[Term]) -> Lower {
     lower.top = c.top.iter().filter_map(index).map(|i| i as u32).collect();
     lower.top.sort_unstable();
     lower
+}
+
+/// A left-out clause over `x` alone, concepts in body and head, none flipped and none
+/// `⊥`, in the program's ids (a concept the part doesn't have can't hold: such a body
+/// atom makes the clause never fire, such a head atom never helps).
+fn local_clause(
+    c: &nrese_owl::Clause,
+    saturated: &crate::context::Saturated,
+) -> Option<crate::context::Local> {
+    if c.head.is_empty() {
+        return None;
+    }
+    let mut body = Vec::new();
+    for b in &c.body {
+        let BodyAtom::Concept(concept, nrese_owl::Var::X) = b else {
+            return None;
+        };
+        match saturated.concept_of(*concept) {
+            Some((id, false)) => body.push(id),
+            Some((_, true)) => return None,
+            // No context has it: the clause never fires.
+            None => {}
+        }
+    }
+    if body.len() < c.body.len() {
+        // Some body concept never holds: nothing to watch.
+        return Some(crate::context::Local {
+            body: Vec::new(),
+            head: Vec::new(),
+        });
+    }
+    let mut head = Vec::new();
+    for h in &c.head {
+        let HeadAtom::Concept(concept, nrese_owl::Var::X) = h else {
+            return None;
+        };
+        match saturated.concept_of(*concept) {
+            Some((id, false)) => head.push(id),
+            Some((_, true)) => return None,
+            None => {}
+        }
+    }
+    Some(crate::context::Local { body, head })
 }

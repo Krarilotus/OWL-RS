@@ -281,7 +281,7 @@ impl Worker<'_> {
                 let mut s = std::mem::take(&mut self.scratch);
                 s.found.clear();
                 s.premises.clear();
-                self.pred_join(id, None, 0, &[], &mut s);
+                self.pred_join(id, None, 0, &[], true, &mut s);
                 self.conclude(&s.found);
                 self.scratch = s;
             }

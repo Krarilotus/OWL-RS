@@ -27,6 +27,9 @@ pub struct Options {
     pub normalise: nrese_owl::Options,
     /// What the saturation may use (unlimited by default); past it, [`Unsupported::Budget`].
     pub budget: Budget,
+    /// Pred joins stop where the body so far already makes the conclusion redundant
+    /// (else every combination is made and `derive` drops it).
+    pub prune_pred: bool,
 }
 
 impl Default for Options {
@@ -37,6 +40,7 @@ impl Default for Options {
             proofs: true,
             normalise: nrese_owl::Options::default(),
             budget: Budget::default(),
+            prune_pred: true,
         }
     }
 }
@@ -136,7 +140,9 @@ pub fn saturate_normalised(
     let started = Instant::now();
     let Compiled { program, abox, .. } = compiled;
     let named = program.named();
-    let engine = Engine::new(program, options.strategy, options.proofs).with_budget(options.budget);
+    let engine = Engine::new(program, options.strategy, options.proofs)
+        .with_budget(options.budget)
+        .with_prune_pred(options.prune_pred);
     let query: Vec<ContextId> = (0..named)
         .map(|c| engine.context_for(&[Atom::concept(c, CTerm::X)]).0)
         .collect();
@@ -156,6 +162,7 @@ pub fn saturate_normalised(
         }
         profile.add(&state.clauses.counters);
         profile.proof_steps += state.clauses.derivations.len() as u64;
+        profile.largest_context = profile.largest_context.max(state.clauses.recs.len() as u64);
     }
     // The program's named concepts: the signature's classes and any the clauses add.
     let classes = engine.program.names.clone();
@@ -256,7 +263,12 @@ impl Saturated {
     /// a role in `roles`. The model the calculus builds for the concept then has no
     /// element in a trigger, so clauses left out of the program whose bodies need one
     /// hold in it: what was derived for the concept is all that holds.
-    pub fn untouched(&self, triggers: &[ConceptId], roles: &[super::atoms::RoleId]) -> Vec<bool> {
+    pub fn untouched(
+        &self,
+        triggers: &[ConceptId],
+        roles: &[super::atoms::RoleId],
+        local: &[Local],
+    ) -> Vec<bool> {
         let triggers: std::collections::HashSet<ConceptId> = triggers.iter().copied().collect();
         let n = self.engine.count();
         let mut tainted = vec![false; n];
@@ -273,7 +285,8 @@ impl Saturated {
                 .heads
                 .keys()
                 .any(|a| a.kind() == super::atoms::Kind::Concept && triggers.contains(&a.pred()));
-            if role || concept {
+            let fires = || local.iter().any(|l| l.may_fire(c));
+            if role || concept || fires() {
                 tainted[id as usize] = true;
                 stack.push(id);
             }
@@ -368,5 +381,44 @@ impl Saturated {
             }
         }
         Some(graph)
+    }
+}
+
+/// A left-out clause over one element: `B₁(x) ∧ … → D₁(x) ∨ …` (its concepts in the
+/// program's ids; no head is `⊥`). A context it can't fire in unsatisfied isn't touched
+/// by it ([`Saturated::untouched`]): where every `Bᵢ` that occurs is `x`'s,
+/// unconditionally, and either some `Bᵢ` doesn't occur or some `Dⱼ` holds of `x`
+/// unconditionally, the context's model satisfies it.
+#[derive(Debug, Clone)]
+pub struct Local {
+    pub body: Vec<ConceptId>,
+    pub head: Vec<ConceptId>,
+}
+
+impl Local {
+    fn may_fire(&self, c: &super::state::Clauses) -> bool {
+        use super::atoms::Kind;
+        if self.body.is_empty() {
+            // A body concept that no context has: the clause never fires.
+            return false;
+        }
+        let at_x = |b: ConceptId| Atom::concept(b, CTerm::X);
+        // Any occurrence of a body concept about another term, or conditional at x.
+        let elsewhere = c.heads.keys().any(|a| {
+            a.kind() == Kind::Concept
+                && self.body.contains(&a.pred())
+                && (a.term() != CTerm::X || c.unconditional(*a).is_none())
+        });
+        if elsewhere {
+            return true;
+        }
+        let all = self
+            .body
+            .iter()
+            .all(|&b| c.unconditional(at_x(b)).is_some());
+        all && !self
+            .head
+            .iter()
+            .any(|&d| c.unconditional(at_x(d)).is_some())
     }
 }

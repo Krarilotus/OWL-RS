@@ -108,7 +108,10 @@ impl Default for Options {
             // ore_ont_7127 (65 k classes) needs 3.9 s, and then no class needs a test: at
             // 2 s it ran out, and 65 k tests took 43 s.
             lower_bound_timeout: Duration::from_secs(60),
-            lower_bound_strategy: crate::context::Strategy::Cautious,
+            // Split: successors whose filler isn't certain get a context per Skolem
+            // function, not one shared by all (where it formed, that hub held up to 99 %
+            // of the clauses; ORE development A/B in the commit that made it default).
+            lower_bound_strategy: crate::context::Strategy::Split,
             max_join: 1 << 20,
             // No lazy unfolding: it under-approximates the unfolded classes in a model, and
             // the driver reads its subsumers off model labels. No proofs are read here, so
