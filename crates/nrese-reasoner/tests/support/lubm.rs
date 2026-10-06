@@ -164,6 +164,43 @@ pub fn declarations(vocabulary: &mut LocalVocabulary) -> Vec<[u64; 3]> {
     out
 }
 
+/// A cascade of `owl:sameAs` merges over typed individuals of `facts`: a functional
+/// property `f` with `x0 f a1`, `x0 f b1` (so `a1 = b1`), then `a_k f a_k+1` and
+/// `b_k f b_k+1` (so `a_k+1 = b_k+1` once `a_k = b_k`): `depth` merges, each found only
+/// after the one before (the investigation of 6 October 2026, §5.2).
+pub fn cascade(
+    vocabulary: &mut LocalVocabulary,
+    facts: &[[u64; 3]],
+    depth: usize,
+) -> Vec<[u64; 3]> {
+    let ty = vocabulary.iri(&format!("{RDF}type"));
+    let mut individuals: Vec<u64> = Vec::new();
+    for &[s, p, _] in facts {
+        if p == ty && !individuals.contains(&s) {
+            individuals.push(s);
+            if individuals.len() > 2 * depth {
+                break;
+            }
+        }
+    }
+    let f = vocabulary.iri(&format!("{EX}functional"));
+    let functional = vocabulary.iri(&format!("{OWL}FunctionalProperty"));
+    let (a, b) = (
+        |k: usize| individuals[2 * k - 1],
+        |k: usize| individuals[2 * k],
+    );
+    let mut out = vec![
+        [f, ty, functional],
+        [individuals[0], f, a(1)],
+        [individuals[0], f, b(1)],
+    ];
+    for k in 1..depth {
+        out.push([a(k), f, a(k + 1)]);
+        out.push([b(k), f, b(k + 1)]);
+    }
+    out
+}
+
 /// `facts` as the store hands them over ([`Grouped`]).
 pub fn grouped(mut facts: Vec<[u64; 3]>) -> Grouped {
     facts.sort_unstable_by_key(|&[s, p, o]| (p, o, s));
