@@ -296,7 +296,11 @@ fn explain(store: &StoreService, text: &str) {
                     ql.atoms,
                     ql.limits,
                     ql.completeness.as_str(),
-                    ql.completeness.reasons()
+                    ql.completeness
+                        .reasons
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
                 );
             }
             for step in &explanation.steps {

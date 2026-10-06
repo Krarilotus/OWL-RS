@@ -18,17 +18,18 @@ Use the combined URL for clients that take one endpoint address (RDF4J's SPARQL 
 - `POST` with `Content-Type: application/sparql-query` and the query as the body
 
 Where the OWL 2 QL rewriting applies (`reasoner.ql_rewriting`), every answer carries the
-header `NRESE-QL-Completeness`: `complete`, or `sound-only; reasons="…"` when answers
+header `NRESE-Completeness`: `complete`, or `sound-only; reasons="ql: …"` when answers
 through anonymous individuals may be missing (an axiom outside OWL 2 QL meets them, a
 pattern reached a bound or runs without the rewriting; at most five reasons, the rest
-counted, non-ASCII characters escaped as `\u{…}`). The answers are never changed for it
-([design](../design/ql-rewriting.md) §7).
+counted, non-ASCII characters escaped as `\u{…}`). Each reason starts with its source
+(`ql`); the same header carries the DL bounds' status (`lower=…; upper=…; unresolved=…`).
+The answers are never changed for it ([design](../design/ql-rewriting.md) §7).
 
 | Parameter | Meaning |
 |---|---|
 | `default-graph-uri`, `named-graph-uri` (repeatable) | The query's dataset; replaces its `FROM` clauses |
 | `infer=false` | Asserted statements only (the default reads asserted and inferred) |
-| `explain=true` | Run the query and return how it ran, as JSON: `executor`, `rewrites` (the rewrites that changed the query before it ran, in order: `triple-terms`, `ql-tree-witness`, `ql-limit`, `join-groups`, `filter-pushdown`, `ask-limit`), `rows`, `micros`, `ql` (the OWL 2 QL rewriting, `null` where it doesn't apply: `completeness` (`complete` or `sound-only`), `reasons`, `patterns`, `witnesses`, `branches`, `atoms`, `limits`; [design](../design/ql-rewriting.md)), and `steps` (one per operator: `depth`, `operator`, `detail`, `estimated_rows`, `rows`, `micros`) |
+| `explain=true` | Run the query and return how it ran, as JSON: `executor`, `rewrites` (the rewrites that changed the query before it ran, in order: `triple-terms`, `ql-tree-witness`, `ql-limit`, `join-groups`, `filter-pushdown`, `ask-limit`), `rows`, `micros`, `ql` (the OWL 2 QL rewriting, `null` where it doesn't apply: `completeness` (`complete` or `sound-only`), `sound`, `complete`, `reasons` (each `{source, text}`), `patterns`, `witnesses`, `branches`, `atoms`, `limits`; [design](../design/ql-rewriting.md)), and `steps` (one per operator: `depth`, `operator`, `detail`, `estimated_rows`, `rows`, `micros`) |
 | `explain=plan` | Return the plan the query would run as, without running it, as JSON: `executor`, `rewrites`, `ql`, and `steps` (one per plan node from the top down: `depth`, `operator`, `detail`, `estimated_rows` from the store's statistics, `null` where unknown, as below a `SERVICE`) |
 
 Other parameters are ignored, so clients that send their own (`queryLn`, `timeout`) work.

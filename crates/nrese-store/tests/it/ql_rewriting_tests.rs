@@ -22,7 +22,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use nrese_reasoner::rulesets::Ruleset;
-use nrese_sparql::ql::Completeness;
+use nrese_sparql::Completeness;
 use nrese_store::{
     BulkLoadRequest, GraphTarget, SolutionsResultFormat, SparqlQueryRequest, StoreConfig,
     StoreService,
@@ -892,10 +892,9 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
             let (rows, completeness) = store_answer(&with, &query.sparql(true));
             let distinct: BTreeSet<Vec<usize>> = rows.into_iter().collect();
             // Pure QL: nothing the rewriting doesn't follow.
-            assert_eq!(
-                completeness,
-                Completeness::Complete,
-                "case {case}:\n{turtle}\n{}",
+            assert!(
+                completeness.complete,
+                "case {case}: {completeness:?}\n{turtle}\n{}",
                 query.sparql(true)
             );
             assert_eq!(
@@ -958,6 +957,8 @@ fn mixed_ontologies_answer_soundly_and_say_when_they_may_miss() {
     let (mut checked, mut skipped) = (0, 0);
     // Queries that missed answers (all flagged), flagged ones that missed none, complete ones.
     let (mut missed, mut cautious, mut complete) = (0, 0, 0);
+    // The misses by the hazards their reasons name.
+    let mut by_hazard: std::collections::BTreeMap<&'static str, usize> = Default::default();
     for case in 0..cases {
         let tbox = random_tbox(&mut rng);
         let roles: Vec<usize> = tbox.generating.iter().map(|g| g.1.property).collect();
@@ -1023,11 +1024,16 @@ fn mixed_ontologies_answer_soundly_and_say_when_they_may_miss() {
             );
             // Never silent: a miss says so.
             let misses = certain.difference(&answered).count();
-            match (misses, &completeness) {
-                (0, Completeness::Complete) => complete += 1,
-                (0, Completeness::SoundOnly(_)) => cautious += 1,
-                (_, Completeness::SoundOnly(_)) => missed += 1,
-                (_, Completeness::Complete) => {
+            match (misses, completeness.complete) {
+                (0, true) => complete += 1,
+                (0, false) => cautious += 1,
+                (_, false) => {
+                    missed += 1;
+                    for kind in hazard_kinds(&completeness) {
+                        *by_hazard.entry(kind).or_default() += 1;
+                    }
+                }
+                (_, true) => {
                     panic!("{misses} answers missed without saying so: {}", context())
                 }
             }
@@ -1037,11 +1043,112 @@ fn mixed_ontologies_answer_soundly_and_say_when_they_may_miss() {
     eprintln!(
         "QL mixed: {checked} queries checked, {skipped} cases skipped (chase too large); \
          {missed} missed answers and said sound-only, {cautious} said sound-only and missed \
-         none, {complete} complete"
+         none, {complete} complete; the misses by hazard: {by_hazard:?}"
     );
     assert!(checked >= cases * 3, "too many cases skipped: {skipped}");
     assert!(
         missed > 0,
         "no case missed an answer: the flag went untested"
     );
+}
+
+/// The kinds of hazard a status's reasons name.
+fn hazard_kinds(completeness: &Completeness) -> Vec<&'static str> {
+    let kinds = [
+        ("is transitive", "transitive"),
+        ("property chain", "chain"),
+        ("functional", "functional"),
+        ("on the left", "left"),
+        ("bound", "bound"),
+    ];
+    kinds
+        .iter()
+        .filter(|(text, _)| completeness.reasons.iter().any(|r| r.text.contains(text)))
+        .map(|&(_, kind)| kind)
+        .collect()
+}
+
+/// The research review's case: existentials feeding a transitive role. `Engine ⊑
+/// ∃partOf.Car`, `Car ⊑ ∃partOf.Fleet`, `partOf` transitive, `e1 a Engine`; `SELECT ?x
+/// { ?x partOf ?f . ?f a Fleet }` has the certain answer `e1` (through two anonymous
+/// individuals and the transitive shortcut), which neither the RL closure nor the
+/// tree-witness rewriting over it finds. The answer must say `sound-only`, naming the
+/// transitive role; a miss without the flag fails. Here `C0`, `C1`, `C2` are Engine, Car
+/// and Fleet, `P0` is partOf, `a0` is e1.
+#[test]
+fn existentials_feeding_a_transitive_role_miss_with_the_flag() {
+    let (engine, car, fleet, part_of) = (0, 1, 2, 0);
+    let role = Role {
+        property: part_of,
+        inverse: false,
+    };
+    let tbox = Tbox {
+        generating: vec![
+            (Basic::Class(engine), role, Some(car)),
+            (Basic::Class(car), role, Some(fleet)),
+        ],
+        turtle: vec![
+            format!(
+                ":C{engine} rdfs:subClassOf {} .",
+                restriction(role, Some(car))
+            ),
+            format!(
+                ":C{car} rdfs:subClassOf {} .",
+                restriction(role, Some(fleet))
+            ),
+        ],
+        ..Tbox::default()
+    };
+    let extras = Extras {
+        chains: vec![(part_of, part_of, part_of)],
+        turtle: vec![format!(":P{part_of} a owl:TransitiveProperty .")],
+        ..Extras::default()
+    };
+    let query = Query {
+        atoms: vec![
+            QAtom::Role(T::Var(0), part_of, T::Var(1)),
+            QAtom::Class(T::Var(1), fleet),
+        ],
+        vars: 2,
+        answers: vec![0],
+    };
+    let chase = Chase::run(&tbox, &extras, &[(0, engine)], &[], 6, 1_000).expect("a small chase");
+    let certain = chase.named_answers(&query);
+    assert_eq!(certain, BTreeSet::from([vec![0]]), "e1 is a certain answer");
+    let turtle = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         {}\n{}\n:a0 a :C{engine} .",
+        tbox.turtle.join("\n"),
+        extras.turtle.join("\n")
+    );
+    let dir = tempfile::tempdir().unwrap();
+    for ruleset in [Ruleset::Owl2Rl, Ruleset::Owl2Ql] {
+        let store = store(&turtle, dir.path(), ruleset, true);
+        let (rows, completeness) = store_answer(&store, &query.sparql(true));
+        let answered: BTreeSet<Vec<usize>> = rows.into_iter().collect();
+        assert!(
+            answered.is_subset(&certain),
+            "{}: {answered:?}",
+            ruleset.name()
+        );
+        if answered != certain {
+            assert!(
+                !completeness.complete,
+                "{}: e1 missed without saying so",
+                ruleset.name()
+            );
+        }
+        // Today it is missed, and said so, naming the transitive role.
+        assert!(answered.is_empty(), "{}: {answered:?}", ruleset.name());
+        assert_eq!(completeness.as_str(), "sound-only", "{}", ruleset.name());
+        assert!(
+            completeness
+                .reasons
+                .iter()
+                .any(|r| r.source == "ql" && r.text.contains("P0> is transitive")),
+            "{}: {completeness:?}",
+            ruleset.name()
+        );
+    }
 }

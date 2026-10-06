@@ -84,7 +84,7 @@ pub async fn execute_query_in(
         )
         .await;
     }
-    // The QL completeness goes with the answers, in a header: the store reports it on the
+    // The completeness goes with the answers, in a header: the store reports it on the
     // snapshot it reads before writing any answer, and the response starts after that.
     let status: std::sync::Arc<std::sync::Mutex<Option<nrese_sparql::ql::QlReport>>> =
         std::sync::Arc::default();
@@ -109,43 +109,19 @@ pub async fn execute_query_in(
     )
     .await?;
     if let Some(report) = status.lock().unwrap_or_else(|p| p.into_inner()).take() {
-        response
-            .headers_mut()
-            .insert(QL_COMPLETENESS, completeness_header(&report.completeness));
+        response.headers_mut().insert(
+            COMPLETENESS,
+            axum::http::HeaderValue::from_str(&report.completeness.header()).unwrap_or_else(|_| {
+                axum::http::HeaderValue::from_static(report.completeness.as_str())
+            }),
+        );
     }
     Ok(response)
 }
 
-/// The header that says whether the answers through anonymous individuals are complete
-/// (docs/design/ql-rewriting.md §7).
-pub const QL_COMPLETENESS: &str = "nrese-ql-completeness";
-
-/// `complete`, or `sound-only; reasons="…"` with the first reasons, ASCII only (other
-/// characters escaped as `\u{…}`, quotes and backslashes with a backslash).
-fn completeness_header(completeness: &nrese_sparql::ql::Completeness) -> axum::http::HeaderValue {
-    const SHOWN: usize = 5;
-    let reasons = completeness.reasons();
-    if reasons.is_empty() {
-        return axum::http::HeaderValue::from_static("complete");
-    }
-    let mut text: Vec<String> = reasons.iter().take(SHOWN).cloned().collect();
-    if reasons.len() > SHOWN {
-        text.push(format!("and {} more", reasons.len() - SHOWN));
-    }
-    let mut escaped = String::new();
-    for c in text.join("; ").chars() {
-        match c {
-            '"' | '\\' => {
-                escaped.push('\\');
-                escaped.push(c);
-            }
-            c if c.is_ascii_graphic() || c == ' ' => escaped.push(c),
-            c => escaped.extend(c.escape_unicode()),
-        }
-    }
-    axum::http::HeaderValue::from_str(&format!("sound-only; reasons=\"{escaped}\""))
-        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("sound-only"))
-}
+/// The header that says whether the answers are sound and complete, and why not
+/// ([`nrese_sparql::Completeness::header`]; docs/design/ql-rewriting.md §7).
+pub const COMPLETENESS: &str = "nrese-completeness";
 
 /// The JSON form of an EXPLAIN: the executor, the rewrites that changed the query, totals,
 /// and one object per operator in evaluation order (`depth` gives the nesting).
@@ -180,7 +156,14 @@ fn ql_json(report: Option<&nrese_sparql::ql::QlReport>) -> serde_json::Value {
     report.map_or(serde_json::Value::Null, |r| {
         serde_json::json!({
             "completeness": r.completeness.as_str(),
-            "reasons": r.completeness.reasons(),
+            "sound": r.completeness.sound,
+            "complete": r.completeness.complete,
+            "reasons": r
+                .completeness
+                .reasons
+                .iter()
+                .map(|reason| serde_json::json!({"source": reason.source, "text": reason.text}))
+                .collect::<Vec<_>>(),
             "patterns": r.patterns,
             "witnesses": r.witnesses,
             "branches": r.branches,
