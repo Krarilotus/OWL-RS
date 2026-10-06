@@ -1,0 +1,1 @@
+{"id":"rules","title":"With rules","path":"/api/v1/repositories/rules","default":false,"reasoning":"owl2-rl","settings":{"title":"With rules","reasoning":"owl2-rl","rules":{"name":"rules.n3","format":"n3","text":"@prefix : <http://e/> .\n\n{ ?x :memberOf ?d . ?d :subOrganisationOf ?u } => { ?x :affiliatedWith ?u } .\n"}}}
