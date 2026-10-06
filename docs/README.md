@@ -43,6 +43,6 @@ list wins and the lower one is corrected in the same change.
 [replication.md](ops/replication.md), [backup-restore-drills.md](ops/backup-restore-drills.md).
 Integrations: [ResearchSpace](integration/researchspace.md),
 [the Datamodel Workflow](integration/datamodel-workflow.md).
-Contributing: [CONTRIBUTING.md](../CONTRIBUTING.md), [code rules](dev/code-structure-guidelines.md),
+Contributing: [CONTRIBUTING.md](../CONTRIBUTING.md), for agents [AGENTS.md](../AGENTS.md), [code rules](dev/code-structure-guidelines.md),
 the console: [frontend contract](dev/frontend-backend-contract.md),
 [extending it](dev/frontend-extension-guide.md).
