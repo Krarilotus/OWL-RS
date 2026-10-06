@@ -5,6 +5,7 @@
 //! Everything here is over the source's term ids; the SPARQL layer turns basic graph
 //! patterns into [`Cq`]s and [`Rewriting`]s back into patterns.
 
+mod hazards;
 mod rewrite;
 mod tbox;
 mod witness;
@@ -12,6 +13,7 @@ mod witness;
 #[cfg(test)]
 mod tests;
 
+pub use hazards::Hazard;
 pub use rewrite::{Branch, Limits, Outcome, Part, Rewriting, rewrite};
 pub use tbox::{Basic, Closure, Role, Tbox};
 

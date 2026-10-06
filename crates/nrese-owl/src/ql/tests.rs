@@ -367,3 +367,69 @@ fn witnesses_the_query_implies_are_dropped() {
         ["Wellbore(?w) drilledBy(?w ?a)"]
     );
 }
+
+/// The hazards a query's atoms reach, as `term: hazard` with local names.
+fn concerns(axioms: &str, atoms: &str) -> Vec<String> {
+    let (tbox, mut table) = tbox(axioms, true);
+    let (query, _) = cq(&mut table, atoms, &[]);
+    let name = |t: Term| {
+        table.names[t as usize]
+            .trim_start_matches("http://e/")
+            .to_owned()
+    };
+    tbox.concerns(&query)
+        .into_iter()
+        .map(|(t, h)| format!("{}: {}", name(t), h.describe(&name)))
+        .collect()
+}
+
+#[test]
+fn axioms_beyond_ql_that_meet_anonymous_individuals_are_hazards() {
+    let ql = "SubClassOf(:A ObjectSomeValuesFrom(:R :B))
+        SubObjectPropertyOf(:R :S)";
+    // Pure QL: nothing.
+    assert!(concerns(ql, "S(?x ?y), B(?y), A(?x)").is_empty());
+    // A transitive super-role: its atoms, the role's and the filler's.
+    let transitive = format!("{ql}\nTransitiveObjectProperty(:S)");
+    assert_eq!(
+        concerns(&transitive, "S(?x ?y), B(?y), C(?x)"),
+        ["S: S is transitive", "B: S is transitive"]
+    );
+    // A transitive property no existential reaches: nothing.
+    let apart = format!("{ql}\nTransitiveObjectProperty(:T)");
+    assert!(concerns(&apart, "S(?x ?y), T(?x ?y)").is_empty());
+    // A chain through the role, and what the chain's result implies.
+    let chain = format!(
+        "{ql}\nSubObjectPropertyOf(ObjectPropertyChain(:R :Q) :P)\nObjectPropertyDomain(:P :D)"
+    );
+    let found = concerns(&chain, "P(?x ?y), D(?x), A(?x)");
+    assert!(found.iter().any(|c| c.starts_with("P: ")), "{found:?}");
+    assert!(found.iter().any(|c| c.starts_with("D: ")), "{found:?}");
+    // A functional role can make an anonymous individual a named one: every term.
+    let functional = format!("{ql}\nFunctionalObjectProperty(:R)");
+    assert_eq!(
+        concerns(&functional, "E(?x)"),
+        ["E: R is functional or inverse functional"]
+    );
+    // An RL axiom on the left classifies anonymous individuals: its conclusion.
+    let left = format!("{ql}\nSubClassOf(ObjectSomeValuesFrom(:R :B) :D)");
+    assert_eq!(
+        concerns(&left, "D(?x)"),
+        ["D: a qualified someValuesFrom on R on the left of an axiom"]
+    );
+}
+
+#[test]
+fn an_equating_hazard_is_not_hidden_by_another_on_the_same_role() {
+    // Found by the mixed differential test (case 2378 of seed 11): a transitive property
+    // whose inverse is inverse functional makes two named individuals equal through an
+    // anonymous one; transitivity came first and hid it.
+    let axioms = "SubClassOf(:A ObjectSomeValuesFrom(:P :A))
+        InverseObjectProperties(:P :Q)
+        TransitiveObjectProperty(:Q)
+        InverseFunctionalObjectProperty(:P)";
+    assert_eq!(
+        concerns(axioms, "R(?x :a)"),
+        ["R: P is functional or inverse functional"]
+    );
+}
