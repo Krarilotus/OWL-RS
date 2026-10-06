@@ -1046,19 +1046,23 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             modes::commits(&pipeline, file, &texts, args.readers)?,
         ));
         if let Some(program) = &program {
-            // The maintained closure against one computed afresh.
+            // The maintained closure against one computed afresh, both as stored: the
+            // report's count is the closure handed to the engine, which in compact mode
+            // also lists asserted facts that mention a class (stored only where they are
+            // asserted in a named graph alone), so it exceeds what is stored.
             let held = store.engine_stats().inferred;
             let fresh = store.rematerialise(program)?;
+            let recomputed = store.engine_stats().inferred;
             eprintln!(
-                "closure after the commits: maintained {held}, recomputed {}",
+                "closure after the commits: maintained {held}, recomputed {recomputed} (listed {})",
                 fresh.inferred
             );
             report.sections.push((
                 "closure_after_commits",
                 format!(
-                    "{{\"maintained\": {held}, \"recomputed\": {}, \"equal\": {}}}",
+                    "{{\"maintained\": {held}, \"recomputed\": {recomputed}, \"listed\": {}, \"equal\": {}}}",
                     fresh.inferred,
-                    held == fresh.inferred
+                    held == recomputed
                 ),
             ));
         }
