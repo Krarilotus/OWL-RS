@@ -15,7 +15,7 @@ const ONTOLOGY: &str = r#"
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
 :A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :B rdfs:subClassOf :D . :C rdfs:subClassOf :D .
-:x a :A . :y a :B .
+:x a :A . :y a :B . :w a [ owl:unionOf ( :B :C ) ] .
 "#;
 
 fn get(query: &str, extra: &str) -> Result<Request<Body>, axum::http::Error> {
@@ -43,7 +43,7 @@ async fn answers_carry_their_status() -> Result<(), Box<dyn std::error::Error>> 
     let headers = response.headers().clone();
     assert_eq!(headers["nrese-completeness"], "complete");
     let bounds = headers["nrese-completeness-bounds"].to_str()?;
-    assert!(bounds.contains("lower=1; upper=2; proved=1"), "{bounds}");
+    assert!(bounds.contains("lower=2; upper=3; proved=1"), "{bounds}");
     let text = body_text(response).await?;
     assert!(text.contains("http://example.com/x") && text.contains("http://example.com/y"));
 
