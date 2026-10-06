@@ -177,7 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let whole = tableau::consistency(&ontology, &config);
         println!("whole ABox: {} in {:.1?}", verdict(&whole), at.elapsed());
         let at = Instant::now();
-        let parts = islands::consistency(&ontology, &config);
+        let parts = islands::by_islands(&ontology, &config);
         println!("islands: {} in {:.1?}", verdict(&parts), at.elapsed());
     }
     Ok(())
