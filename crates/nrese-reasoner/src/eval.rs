@@ -735,12 +735,25 @@ pub fn run_jobs<S: Source + ?Sized>(
     run_jobs_with(source, jobs, keep, false, stop, None)
 }
 
-/// How often [`run_jobs_counted`] asked `keep` (the membership probes), and how many of
-/// those asks came out of (predicate, subject, object) order within their morsel.
+/// How often [`run_jobs_by_morsel`] asked `keep` (the membership probes), how many of
+/// those asks came out of (predicate, subject, object) order within their morsel, and
+/// the complete bindings each job enumerated (the joins' work, §5.1 of the 6 October
+/// investigation; empty if not asked for, see [`Probes::for_jobs`]).
 #[derive(Debug, Default)]
 pub struct Probes {
     pub probes: std::sync::atomic::AtomicU64,
     pub unordered: std::sync::atomic::AtomicU64,
+    pub bindings: Vec<std::sync::atomic::AtomicU64>,
+}
+
+impl Probes {
+    /// Counts with a binding counter for each of `jobs` jobs.
+    pub fn for_jobs(jobs: usize) -> Self {
+        Self {
+            bindings: (0..jobs).map(|_| Default::default()).collect(),
+            ..Self::default()
+        }
+    }
 }
 
 /// [`run_jobs`] by morsel: each morsel's facts, sorted by (predicate, subject, object) and
@@ -811,7 +824,9 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                 return finish(Vec::new());
             }
             let mut out = Vec::new();
+            let mut enumerated = 0u64;
             job.run(source, range.clone(), &mut |bindings| {
+                enumerated += 1;
                 for head in heads {
                     let fact = instantiate_head(head, bindings);
                     let circular = acyclic
@@ -842,6 +857,9 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                 use std::sync::atomic::Ordering::Relaxed;
                 probes.probes.fetch_add(asked, Relaxed);
                 probes.unordered.fetch_add(unordered, Relaxed);
+                if let Some(count) = probes.bindings.get(*j) {
+                    count.fetch_add(enumerated, Relaxed);
+                }
             }
             finish(out)
         })
