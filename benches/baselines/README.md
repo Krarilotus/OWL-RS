@@ -2,6 +2,13 @@
 
 Recorded reference numbers that later milestones are measured against. Each file is a raw harness report; this README records how it was produced.
 
+**Retention.** A baseline committed here is small: the run's commit, machine and
+configuration, its counts and correctness, and its key timings. A tool whose full reports
+grow with every run keeps them outside git and commits a compact record that names the full
+report by path, host and SHA-256. The fast suite does this (`fast/`, see
+[../fast/README.md](../fast/README.md), "What is kept"): its full reports are in
+`~/nrese-bench/reports/fast/`.
+
 ## `v1-write-scaling-reasoning-disabled.json`
 
 - **What:** engine v1 (Oxigraph-backed), reasoning `disabled`, in-memory store, write-scaling to 1 M triples.
