@@ -137,3 +137,43 @@ from about 99 % to near 0); the same 30 s then covers roughly 75× the clashes.
 **Falsified if** the rebuilt share stays high (retraction misses dependencies, or the
 fallback dominates). If the rebuilt share drops but 662 to 664 still need more than 10⁶
 clashes, the bottleneck is the clash count, and nogood learning (3.9) comes next.
+
+## 7. Step 2, as built (8 October 2026)
+
+Behind `Config::dynamic_backtracking` (off), with `Config::check_retraction`.
+
+**What building it added to §3:**
+- **The closure.** A frame above `k` whose premise names a retracted level depends on it.
+  So does a frame whose *failed* set names one: its eliminated alternatives may be
+  possible again. These are Ginsberg's eliminating explanations that mention the
+  retracted variable. Such frames are retracted with `k`, and their disjunctions are
+  decided afresh.
+- **Exhausted culprits.** When `k` has no alternative left, it is retracted and its
+  disjunction's clash (premise ∪ failed) goes on, retracting again.
+- **Subtrees.** A node dies with its parent. Facts made by clauses that apply to every
+  node depend on nothing, so a successor born from them would otherwise outlive a
+  retracted parent. The blocking checker found this (seed 94543, case 118).
+- **Re-firing.** The live facts of the touched nodes and their neighbours are joined again.
+  The disjunctions behind the scan that bind a touched node are reopened. Resetting the
+  scan cursor cost 1.6× more.
+
+**Measured** (662 to 664, lab profile):
+- Truncating backjumps fall to 0 and rebuilt levels to 0. Branch points fall from millions
+  to 130–330 k per 30 s.
+- None is decided, not in 300 s either (662: 36,814 clashes).
+- A clash now costs about 8 ms, against 0.73 ms in the plain search (662: 41,221 clashes in
+  30 s). Every retraction scans what was built since the culprit's mark: the frames above
+  for the closure (on average 85,000), the fact arenas and the pending entries. The plain
+  search, by contrast, discards about 370 levels per backjump.
+- The plain search on 664 for 20 minutes: 117 M branch points, 19,794 clashes, not decided.
+
+**Next:** make retraction cost what it retracts, not what it keeps:
+- frames by the levels their premise and failed set name;
+- facts and pending disjunctions by their interned dependency set, each set registered
+  under its levels when it is interned;
+- pending disjunctions by node, for the reopening.
+
+Dynamic backtracking doesn't reduce the number of clashes, only their cost. Whether 662 to 664
+are then decided depends on how many clashes they need. If that stays out of reach, nogood
+learning (3.9) is the next angle.
+
