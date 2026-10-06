@@ -138,3 +138,56 @@ fn a_clash_in_the_upper_bound_sends_the_check_to_a_dl_engine() {
     assert_eq!(status.consistency.engine, "hypertableau");
     assert_eq!(status.consistency.verdict.as_str(), "consistent");
 }
+
+/// A key is a rule of U1 (over every term: more equalities, still an upper bound), so an
+/// ontology with one keeps U1: it bounds the answers and proves consistency on commit,
+/// where the key's axiom counted as uncovered sent every commit to the hypertableau.
+#[test]
+fn a_key_keeps_the_upper_bound() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":D owl:hasKey ( :k ) . :A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . \
+         :d1 a :D ; :k 7 . :d2 a :D ; :k 7 . :d1 a :E .",
+    )
+    .expect("data");
+    let bounds = dl.store().dl_bounds();
+    assert_eq!(bounds.unavailable, None, "{bounds:?}");
+    insert(&dl, ":d3 a :A .").expect("an assertion");
+    let status = dl.store().dl().status().expect("status");
+    assert_eq!(status.consistency.engine, "upper-bound");
+    // The key equates d1 and d2: d2 is an E.
+    let (rows, status) = super::queries::query(&dl, "SELECT ?x { ?x a :E }");
+    assert_eq!(rows, ["d1", "d2"]);
+    assert!(status.is_complete(), "{:?}", status.reasons());
+}
+
+/// U1 compares data values by value, OWL 2's identity of data values: a key over one
+/// value written two ways (`"07"` and `"7"` as `xsd:integer`) equates its individuals,
+/// and a `hasValue` of `7.0` as `xsd:decimal` holds for `7` as `xsd:integer`. Compared by
+/// term, U1 would miss both, and the answers without them would say they are complete.
+#[test]
+fn data_values_are_compared_by_value() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":D owl:hasKey ( :k ) . :A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . \
+         :d1 a :D ; :k \"07\"^^xsd:integer . :d2 a :D ; :k \"7\"^^xsd:integer . :d1 a :E . \
+         :Seven owl:equivalentClass [ a owl:Restriction ; owl:onProperty :age ; \
+           owl:hasValue \"7.0\"^^xsd:decimal ] . \
+         :p :age \"7\"^^xsd:integer .",
+    )
+    .expect("data");
+    for (q, want) in [
+        ("SELECT ?x { ?x a :E }", vec!["d1", "d2"]),
+        ("SELECT ?x { ?x a :Seven }", vec!["p"]),
+    ] {
+        let (rows, status) = super::queries::query(&dl, q);
+        assert!(
+            rows == want || !status.is_complete(),
+            "{q}: {rows:?} said complete without what the equal values entail"
+        );
+        assert_eq!(rows, want, "{q}: {:?}", status.reasons());
+        assert!(status.is_complete(), "{q}: {:?}", status.reasons());
+    }
+}

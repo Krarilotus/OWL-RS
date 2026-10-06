@@ -135,11 +135,15 @@ pub fn compile_with(
         top_object,
         top_data,
     };
-    // Datatype definitions only refine data ranges, which U1 doesn't read.
+    // Datatype definitions only refine data ranges, which U1 doesn't read; keys are rules
+    // here (`axiom`), which the clauses leave to the engines that apply them.
     c.program.incomplete = normalised
         .unsupported
         .iter()
-        .filter(|(_, why)| !why.starts_with("datatype definitions"))
+        .filter(|(_, why)| {
+            *why != nrese_owl::UNSUPPORTED_DATATYPE_DEFINITIONS
+                && *why != nrese_owl::UNSUPPORTED_KEYS
+        })
         .copied()
         .collect();
     for (index, clause) in normalised.clauses.iter().enumerate() {
