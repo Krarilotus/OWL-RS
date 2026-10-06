@@ -1,7 +1,10 @@
 //! NRESE execution core (decision D11, `docs/design/execution-core.md`).
 //!
-//! The id-level machinery shared by the native SPARQL executor (`nrese-sparql`) and the
-//! reasoner's batch and delta executors (`nrese-reasoner`):
+//! The id-level machinery of the native SPARQL executor (`nrese-sparql`), the engine and
+//! the reasoner's batch and delta executors (`nrese-reasoner`). What is shared is kernels,
+//! not executors: the reasoner's rule joins are their own (investigation of 6 October
+//! 2026, G1); it uses the closures ([`graph`]) and the memory watch, and the sort kernel
+//! and the engine's probe cursors (`nrese_engine::ProbeCursor`) are there for it.
 //! - [`table`]: [`IdTable`], column-major `u64` tables with sort metadata
 //! - [`join`]: merge, hash, left (OPTIONAL) and anti (MINUS, NOT EXISTS) joins on key columns
 //! - [`group`]: grouping with aggregates over sorted or unsorted input
