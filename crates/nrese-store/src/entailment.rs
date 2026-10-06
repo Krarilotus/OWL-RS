@@ -311,6 +311,12 @@ impl StoreService {
         use crate::dl::entailment::{Entailed, entails_ontology};
         use crate::dl::{Verdict, consistency, gate, source};
         use nrese_rdf::{BlankNode, NamedNodeRef, NamedOrBlankNode};
+        if self.dl().replica() {
+            // Reading a conclusion interns its terms, which a replica must not.
+            return Err(StoreError::Configuration(
+                "entailment checks run on the primary, not on a read replica".to_owned(),
+            ));
+        }
         let snapshot = self.engine().snapshot();
         let premise = source::read_snapshot(&snapshot);
         let budget = gate::budget(self, None);
@@ -372,9 +378,9 @@ impl StoreService {
                 premise: checked.verdict,
             });
         }
-        let fresh: Vec<u64> = (0..8)
+        let fresh: Vec<u64> = (0..source::FRESH)
             .map(|i| {
-                tx.intern(NamedNodeRef::new_unchecked(&format!("urn:nrese:dl:fresh:{i}")).into())
+                tx.intern(NamedNodeRef::new_unchecked(&source::fresh_iri(i)).into())
                     .raw()
             })
             .collect();

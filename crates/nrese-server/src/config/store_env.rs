@@ -132,6 +132,12 @@ fn parse_dl(source: &dyn ConfigSource) -> Result<nrese_store::DlConfig> {
             defaults.max_candidates,
         )?,
         threads: super::env_values::parse_usize(source, names::DL_THREADS, defaults.threads)?,
+        max_nodes: super::env_values::parse_usize(source, names::DL_MAX_NODES, defaults.max_nodes)?,
+        max_branch_points: super::env_values::parse_u64(
+            source,
+            names::DL_MAX_BRANCH_POINTS,
+            defaults.max_branch_points,
+        )?,
     })
 }
 

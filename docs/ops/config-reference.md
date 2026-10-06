@@ -229,6 +229,7 @@ api_key = "replace-me"
   - file key `dl.memory`, env `NRESE_DL_MEMORY` (default 4GiB): the memory one DL task may hold
   - file key `dl.max_candidates`, env `NRESE_DL_MAX_CANDIDATES` (default 1000): the candidate answers (in the upper bound, not the lower) a query checks with the exact services at most; the rest are reported unresolved
   - file key `dl.threads`, env `NRESE_DL_THREADS` (default 0, every core): the workers of a classification
+  - file key `dl.max_nodes`, env `NRESE_DL_MAX_NODES` (default 2000000), and `dl.max_branch_points`, env `NRESE_DL_MAX_BRANCH_POINTS` (default 1000000): the deterministic budgets of one hypertableau run (a consistency check, an entailment test, a class test), beside `dl.timeout`. A run past a budget decides nothing: its candidate stays unresolved, its class untested, its commit's status `unknown`, never a wrong answer
 - with any mode but `disabled`:
   - `nrese-server load` and startup materialise the closure (startup skips it when `reasoning.state` in the data directory records that the inferred stack is current for this build's semantics; `/version` reports them as `reasoning_semantics`, e.g. `owl2-rl v2 <fingerprint>`)
   - what each mode derives and omits: [reasoning-semantics.md](../spec/reasoning-semantics.md)

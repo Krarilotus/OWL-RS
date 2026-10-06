@@ -634,12 +634,20 @@ fn decide(
         tests.push(Some(built));
     }
     let tx = store.engine().speculative();
-    let fresh: Vec<u64> = (0..8)
+    let replica = store.dl().replica();
+    let fresh: Option<Vec<u64>> = (0..source::FRESH)
         .map(|i| {
-            tx.intern(NamedNodeRef::new_unchecked(&format!("urn:nrese:dl:fresh:{i}")).into())
-                .raw()
+            source::resolve(
+                replica,
+                &tx,
+                NamedNodeRef::new_unchecked(&source::fresh_iri(i)).into(),
+            )
+            .map(TermId::raw)
         })
         .collect();
+    let Some(fresh) = fresh else {
+        return unresolved("the entailment tests' terms haven't reached this replica yet");
+    };
     let deadline = started + config.timeout;
     let ontology = &ontology;
     let verdicts: Vec<Entailed> = tests
@@ -659,6 +667,8 @@ fn decide(
                     memory_bytes: config.memory_bytes / config.workers().max(1),
                     threads: 1,
                     cancel: None,
+                    max_nodes: config.max_nodes,
+                    max_branch_points: config.max_branch_points,
                 };
                 let found = match test {
                     Test::Axiom(axiom) => entailment::entails(ontology, &axiom, &fresh, &budget),

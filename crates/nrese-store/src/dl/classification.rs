@@ -27,6 +27,9 @@ fn options(store: &StoreService) -> classify::Options {
     classify::Options {
         threads: dl.workers(),
         timeout: Some(dl.timeout),
+        // Each test's budgets: the driver's memory per test, the store's deterministic
+        // ones (an undecided class is reported incomplete).
+        tableau: dl.tableau(dl.timeout, classify::Options::default().tableau.max_memory),
         ..classify::Options::default()
     }
 }

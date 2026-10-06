@@ -169,7 +169,13 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     source::intern_vocabulary(tx);
     let ontology = source::read_pending(tx);
     let normalised = nrese_owl::normalise(&ontology);
-    let upper = Upper::build(&ontology, &normalised, &pending, &|t| tx.intern(t), &stop);
+    let upper = Upper::build(
+        &ontology,
+        &normalised,
+        &pending,
+        &|t| Some(tx.intern(t)),
+        &stop,
+    );
     Preparation {
         base,
         proves_consistency: upper.as_ref().is_ok_and(Upper::proves_consistency),
@@ -275,12 +281,16 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
     }
     if state.as_ref().is_none_or(|s| s.revision != revision) {
         let tx = store.engine().speculative();
-        source::intern_vocabulary(&tx);
+        let replica = store.dl().replica();
+        if !replica {
+            source::intern_vocabulary(&tx);
+        }
         let ontology = source::read_snapshot(&snapshot);
         let normalised = nrese_owl::normalise(&ontology);
         let deadline = Instant::now() + store.config().dl.timeout;
         let stop = move || Instant::now() >= deadline;
-        let upper = Upper::build(&ontology, &normalised, &snapshot, &|t| tx.intern(t), &stop);
+        let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve(replica, &tx, t);
+        let upper = Upper::build(&ontology, &normalised, &snapshot, &resolve, &stop);
         *state = Some(State {
             revision,
             upper,
@@ -439,14 +449,17 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
     };
     let facts: Vec<Triple> = if afresh {
         let tx = store.engine().speculative();
-        source::intern_vocabulary(&tx);
+        let replica = store.dl().replica();
+        if !replica {
+            source::intern_vocabulary(&tx);
+        }
         let ontology = source::read_snapshot(&snapshot);
         let normalised = nrese_owl::normalise(&ontology);
         let upper = Upper::build(
             &ontology,
             &normalised,
             &snapshot,
-            &|t| tx.intern(t),
+            &|t| source::resolve(replica, &tx, t),
             nrese_reasoner::eval::NEVER,
         )
         .ok()?;

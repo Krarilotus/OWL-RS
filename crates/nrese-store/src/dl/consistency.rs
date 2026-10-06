@@ -52,7 +52,14 @@ pub struct Budget {
     pub threads: usize,
     /// Stops the hypertableau at its next budget check (a cancelled commit).
     pub cancel: Option<tableau::Cancel>,
+    /// The deterministic budgets of a hypertableau run.
+    pub max_nodes: usize,
+    pub max_branch_points: u64,
 }
+
+/// The most conclusions one join of the context core may produce (its deterministic
+/// budget; past it the Horn stage gives up and the hypertableau decides).
+const MAX_JOIN: usize = 1 << 20;
 
 /// Why a model of `ontology` says nothing for the source: parts of the source weren't
 /// read (fatal diagnostics), so they may have no model. An inconsistency found stands.
@@ -87,6 +94,10 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
     let options = nrese_dl::context::Options {
         threads: budget.threads.max(1),
         proofs: false,
+        budget: nrese_dl::context::Budget {
+            deadline: Some(started + budget.timeout),
+            max_join: Some(MAX_JOIN),
+        },
         ..nrese_dl::context::Options::default()
     };
     if let Ok(saturated) = nrese_dl::context::saturate(ontology, &options) {
@@ -101,8 +112,10 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
         };
     }
     let config = tableau::Config {
-        timeout: Some(budget.timeout),
+        timeout: Some(budget.timeout.saturating_sub(started.elapsed())),
         max_memory: budget.memory_bytes,
+        max_nodes: budget.max_nodes,
+        max_branch_points: Some(budget.max_branch_points),
         cancel: budget.cancel.clone(),
         ..tableau::Config::default()
     };
