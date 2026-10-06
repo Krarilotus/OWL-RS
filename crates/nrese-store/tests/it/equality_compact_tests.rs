@@ -519,3 +519,44 @@ fn late_expansion_answers_as_early_expansion_and_replication() {
             .any(|o| o == "late equality expansion")
     );
 }
+
+/// G5 of the investigation of 6 October 2026: a commit that merges `sameAs` classes in
+/// compact mode publishes its inferences with it, in one revision, as every other commit
+/// does (reasoner-v2 §2.2). Before, it committed the asserted change alone and the store
+/// re-materialised afterwards, in a second revision: readers of the first saw the
+/// equality without its consequences.
+#[test]
+fn a_commit_that_merges_classes_publishes_its_inferences_with_it() {
+    let modes = [Mode::Replicate, Mode::Compact];
+    let pipelines = modes.map(pipeline);
+    let steps = [
+        // The first commit to a fresh store also materialises it: a revision of its own.
+        "INSERT DATA { ex:z ex:knows ex:w }",
+        "INSERT DATA {
+           ex:a owl:sameAs ex:b . ex:a ex:knows ex:kim . ex:c a ex:Person .
+           ex:Person rdfs:subClassOf ex:Agent . ex:hasMother a owl:FunctionalProperty .
+           ex:kim ex:hasMother ex:m1 . ex:m2 ex:livesIn ex:berlin }",
+        // Asserted merges: of a class with a term in none, and of two classes.
+        "INSERT DATA { ex:c owl:sameAs ex:b }",
+        "INSERT DATA { ex:x owl:sameAs ex:y . ex:y ex:likes ex:z . ex:x owl:sameAs ex:a }",
+        // A merge the rules derive.
+        "INSERT DATA { ex:kim ex:hasMother ex:m2 }",
+    ];
+    for (i, step) in steps.into_iter().enumerate() {
+        let before = pipelines[1].store().current_revision();
+        for pipeline in &pipelines {
+            update(pipeline, step);
+        }
+        if i > 0 {
+            assert_eq!(
+                pipelines[1].store().current_revision(),
+                before + 1,
+                "one revision for: {step}"
+            );
+        }
+        let (reference, seen) = (observe(&pipelines[0]), observe(&pipelines[1]));
+        for (i, (got, want)) in seen.iter().zip(&reference).enumerate() {
+            assert_eq!(got, want, "observation {i}, after: {step}");
+        }
+    }
+}
