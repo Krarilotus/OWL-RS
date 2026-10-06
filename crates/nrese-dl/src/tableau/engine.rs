@@ -70,6 +70,11 @@ pub struct Pending {
 /// A branch point.
 #[derive(Debug, Clone)]
 pub struct Frame {
+    /// The level its choices' dependency sets name: stable, and increasing along the
+    /// stack (a frame is only ever pushed on top, with the next id), so a level's frame is
+    /// found by binary search and the largest level is the most recent decision
+    /// (docs/design/owl2-dl-dynamic-backtracking.md §3).
+    pub id: u32,
     pub mark: Mark,
     pub pending: u32,
     pub bindings: u32,
@@ -133,6 +138,8 @@ pub struct Engine<'a> {
     /// ([`super::probe::Base`]): a backtrack that would go there stops the run instead
     /// (`GaveUp` with [`super::search::FLOOR`]).
     pub floor: u32,
+    /// The next branch point's level ([`Frame::id`]); never reused within a run.
+    pub next_level: u32,
 }
 
 impl<'a> Engine<'a> {
@@ -147,6 +154,7 @@ impl<'a> Engine<'a> {
             bindings: Vec::new(),
             pending_open: 0,
             frames: Vec::new(),
+            next_level: 1,
             roots: Vec::new(),
             stats: Telemetry::default(),
             started: Instant::now(),
