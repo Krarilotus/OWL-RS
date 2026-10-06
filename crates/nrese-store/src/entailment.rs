@@ -281,3 +281,106 @@ fn list_items(triples: &[Triple], head: &Term) -> Option<(Vec<Term>, Vec<NamedOr
     }
     Some((items, nodes))
 }
+
+/// Whether the store's asserted ontology entails a document under OWL 2 DL
+/// ([`StoreService::entails_dl`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DlEntailment {
+    pub answer: crate::dl::entailment::Entailed,
+    /// The premise's consistency: an inconsistent one entails everything.
+    pub premise: crate::dl::Verdict,
+}
+
+impl DlEntailment {
+    pub fn holds(&self) -> bool {
+        self.premise == crate::dl::Verdict::Inconsistent
+            || self.answer == crate::dl::entailment::Entailed::Yes
+    }
+}
+
+/// Blank nodes of conclusions get labels of their own, so none is a premise's.
+static CONCLUSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl StoreService {
+    /// Whether the asserted statements (every graph) entail `conclusion` under the OWL 2
+    /// Direct Semantics: each logical axiom of the conclusion read as an OWL 2 ontology
+    /// (declarations and annotations hold no logical content), decided by the DL engines
+    /// ([`crate::dl::entailment`]) within `dl.timeout` per test. A conclusion that isn't
+    /// well-formed OWL 2 DL is `unknown`. Reads only; never commits.
+    pub fn entails_dl(&self, conclusion: &[Triple]) -> StoreResult<DlEntailment> {
+        use crate::dl::entailment::{Entailed, entails_ontology};
+        use crate::dl::{Verdict, consistency, gate, source};
+        use nrese_rdf::{BlankNode, NamedNodeRef, NamedOrBlankNode};
+        let snapshot = self.engine().snapshot();
+        let premise = source::read_snapshot(&snapshot);
+        let budget = gate::budget(self, None);
+        let checked = consistency::check(&premise, &budget);
+        if checked.verdict != Verdict::Consistent {
+            let answer = match &checked.verdict {
+                Verdict::Unknown(why) => Entailed::Unknown(format!("the premise: {why}")),
+                _ => Entailed::Yes,
+            };
+            return Ok(DlEntailment {
+                answer,
+                premise: checked.verdict,
+            });
+        }
+        let tx = self.engine().speculative();
+        source::intern_vocabulary(&tx);
+        let n = CONCLUSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let blank = |b: &BlankNode| BlankNode::new_unchecked(format!("nresec{n}x{}", b.as_str()));
+        let id = |t: Term| -> u64 {
+            let t = match t {
+                Term::BlankNode(b) => Term::BlankNode(blank(&b)),
+                other => other,
+            };
+            tx.intern(t.as_ref()).raw()
+        };
+        let statements: Vec<nrese_owl::Statement> = conclusion
+            .iter()
+            .map(|t| {
+                let subject: Term = match &t.subject {
+                    NamedOrBlankNode::NamedNode(n) => Term::NamedNode(n.clone()),
+                    NamedOrBlankNode::BlankNode(b) => Term::BlankNode(b.clone()),
+                };
+                nrese_owl::Statement {
+                    triple: [
+                        id(subject),
+                        id(Term::NamedNode(t.predicate.clone())),
+                        id(t.object.clone()),
+                    ],
+                    graph: nrese_engine::TermId::DEFAULT_GRAPH.raw(),
+                }
+            })
+            .collect();
+        let decode = |term| tx.decode(term);
+        let lookup = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
+        let read = nrese_owl::read(
+            &statements,
+            &source::StoreTerms {
+                decode: &decode,
+                lookup: &lookup,
+            },
+        );
+        // A structure no axiom uses says nothing under the Direct Semantics (OWL 1
+        // conclusions state expressions so); anything else unread leaves it undecided.
+        if let Some(diagnostic) = read.diagnostics.iter().find(|d| d.is_fatal()) {
+            return Ok(DlEntailment {
+                answer: Entailed::Unknown(format!(
+                    "the conclusion isn't well-formed OWL 2 DL: {diagnostic:?}"
+                )),
+                premise: checked.verdict,
+            });
+        }
+        let fresh: Vec<u64> = (0..8)
+            .map(|i| {
+                tx.intern(NamedNodeRef::new_unchecked(&format!("urn:nrese:dl:fresh:{i}")).into())
+                    .raw()
+            })
+            .collect();
+        Ok(DlEntailment {
+            answer: entails_ontology(&premise, &read, &fresh, &budget),
+            premise: checked.verdict,
+        })
+    }
+}
