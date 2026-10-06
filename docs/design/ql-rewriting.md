@@ -203,13 +203,17 @@ would change; otherwise `complete`. Each reason names the term and the hazard.
 
 **Reported** in EXPLAIN (`ql.completeness`, `ql.sound`, `ql.complete`, `ql.reasons`, both
 forms), in the store's results, and with every answer over HTTP: the header
-`NRESE-Completeness: complete` or `sound-only; reasons="ql: …"`, computed on the snapshot
+`NRESE-Completeness: complete; regime=owl2-ql` or `sound-only; regime=owl2-ql; reasons="ql: …"`
+(`owl2-rl` over the RL closure), computed on the snapshot
 the query reads before its first byte.
 
 **One status for every engine.** The status is `nrese_sparql::Completeness`, the shape the
 DL design gives every answer (owl2-dl.md, "Every answer carries its status"): `sound`,
-`complete`, optional `bounds` (lower, upper and unresolved counts), and `reasons`, each with
-its `source` (`ql` here, `dl` for the bounds). Sources add reasons and `merge` combines
+`complete`, optional `bounds` (lower, upper and unresolved counts), `reasons`, each with
+its `source` (`ql` here, `dl` for the bounds), and the `regime` its `complete` refers to (set
+by the producer: `owl2-ql` or `owl2-rl` here, by the closure; `owl2-dl` for the bounds).
+QL's `complete` is every answer the closure's rules and the existentials entail, not every
+certain answer under OWL 2 DL. Sources add reasons and `merge` combines
 statuses; `header()` writes the header (`complete`, `sound-only` or `unsound`, then
 `lower=…; upper=…; unresolved=…` where bounds are known, then the first five reasons). The
 QL rewriting reports `sound` and, under a hazard, not `complete`, without bounds: it

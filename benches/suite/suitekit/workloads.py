@@ -36,6 +36,7 @@ class Plan:
     note: str = ""
     clients: list[int] = field(default_factory=list)  # the queries again from this many concurrent clients each (throughput, p99)
     duration_s: int = 20
+    replay: bool = False  # the queries are a log: each run once, in name order, no warm-up
 
 
 def expected_counts(path: Path) -> dict[str, int] | None:
@@ -200,6 +201,8 @@ def fast(root: Path, tier: str, settings: dict) -> Plan:
         plan.queries = root / "benches/reasoning/queries" / queries
     elif queries and not queries.startswith("@"):
         plan.queries = root / "benches/fast/queries" / queries
+    if queries == "@cache-log":
+        plan.replay = True
     if settings.get("FAST_QUERIES"):
         # Several cases on the same data in one run: their queries merged (compete.py).
         plan.queries = Path(settings["FAST_QUERIES"])

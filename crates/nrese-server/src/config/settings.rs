@@ -468,10 +468,17 @@ pub const SETTINGS: &[Setting] = &[
             "budgets.result_cache",
             names::QUERY_CACHE_BYTES,
             Amount(BytesOrShare),
-            "Serialised results kept for repeated queries; 0 switches the cache off \
-             (default 2% of memory, 64MiB to 8GiB).",
+            "Results of query parts (id columns) kept for repeated queries and shared \
+             sub-patterns; 0 switches the cache off (default 2% of memory, 64MiB to 8GiB).",
         ),
         &["store.query_cache_bytes"],
+    ),
+    setting(
+        "budgets.result_cache_pins",
+        names::PINNED_QUERIES,
+        List { delimiter: ";" },
+        "SPARQL query files whose results are pinned in the result cache at startup, each \
+         under its file name without the extension (none by default).",
     ),
     // [policy]
     setting(

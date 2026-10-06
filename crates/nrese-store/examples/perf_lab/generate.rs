@@ -577,6 +577,22 @@ fn churn(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
     nt.t(&ex("advisor"), &rdfs("range"), &ex("Professor"))?;
     nt.t(&ex("advisee"), &owl("inverseOf"), &ex("advisor"))?;
     nt.t(&ex("memberOf"), &rdfs("subPropertyOf"), &ex("worksWith"))?;
+    // `violate=1`: students and professors are disjoint, and the last commit makes a
+    // student a professor: the OWL 2 RL gate rejects it (cax-dw). `violate=2`: a visitor is
+    // faculty or a professor (a union on the right, outside RL) and disjoint from both, and
+    // the last commit adds a visitor: inconsistent only under OWL 2 DL, so only the DL gate
+    // can reject it.
+    let violate = p.get("violate", 0);
+    if violate == 1 {
+        nt.t(&ex("Student"), &owl("disjointWith"), &ex("Professor"))?;
+    }
+    if violate == 2 {
+        let union = list(nt, "visitor", &[ex("Faculty"), ex("Professor")])?;
+        nt.t("_:visitorOf", &owl("unionOf"), &union)?;
+        nt.t(&ex("Visitor"), &rdfs("subClassOf"), "_:visitorOf")?;
+        nt.t(&ex("Visitor"), &owl("disjointWith"), &ex("Faculty"))?;
+        nt.t(&ex("Visitor"), &owl("disjointWith"), &ex("Professor"))?;
+    }
     for i in 0..people {
         let x = ex(format!("s{i}"));
         nt.t(&x, &rdf("type"), &ex("GraduateStudent"))?;
@@ -596,6 +612,12 @@ fn churn(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
     }
     for i in 0..changes {
         writeln!(out, "DELETE DATA {{ {} }}", statements(i))?;
+    }
+    if violate == 1 {
+        writeln!(out, "INSERT DATA {{ <{EX}s0> a <{EX}Professor> }}")?;
+    }
+    if violate == 2 {
+        writeln!(out, "INSERT DATA {{ <{EX}guest0> a <{EX}Visitor> }}")?;
     }
     // `existing=N`: N people of the data deleted, one per commit (the deletion tail).
     for i in 0..p.get("existing", 0) {
@@ -1020,8 +1042,13 @@ fn dl_roles(p: &Params, nt: &mut Nt) -> std::io::Result<Expect> {
 
 /// A random OWL 2 EL ontology of `classes` classes: a subclass DAG, existentials,
 /// definitions by conjunctions, a role hierarchy with a transitive role and a chain.
+/// Every class and property is declared: OWL API readers (ELK, Konclude, HermiT through the
+/// DL kit) drop axioms about undeclared terms, and so classified a weaker ontology.
 fn el(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     let (n, roles) = (p.get("classes", 100_000), p.get("roles", 12));
+    for r in 0..roles {
+        nt.t(&ex(format!("r{r}")), &rdf("type"), &owl("ObjectProperty"))?;
+    }
     for r in 1..roles {
         nt.t(
             &ex(format!("r{r}")),
@@ -1036,8 +1063,16 @@ fn el(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
         &rdf("type"),
         &owl("TransitiveProperty"),
     )?;
+    // The chain is regular by default (r1 ∘ r2 ⊑ r1, with r2 ⊑ r1), so HermiT and Openllet
+    // take the ontology too. `irregular=1` puts it under r3 instead: r3 ⊑ r1 makes the role
+    // hierarchy irregular, outside OWL 2 DL (OWL 2 EL allows it; HermiT refuses it).
     let chain = list(nt, "chain", &[ex("r1"), ex("r2")])?;
-    nt.t(&ex("r3"), &owl("propertyChainAxiom"), &chain)?;
+    let implied = if p.get("irregular", 0) == 1 {
+        "r3"
+    } else {
+        "r1"
+    };
+    nt.t(&ex(implied), &owl("propertyChainAxiom"), &chain)?;
     for i in 0..n {
         let a = ex(format!("A{i}"));
         nt.t(&a, &rdf("type"), &owl("Class"))?;
@@ -1068,7 +1103,9 @@ fn el(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
             )?;
             let and = format!("_:i{i}");
             nt.t(&and, &owl("intersectionOf"), &parts)?;
-            nt.t(&ex(format!("D{i}")), &owl("equivalentClass"), &and)?;
+            let d = ex(format!("D{i}"));
+            nt.t(&d, &rdf("type"), &owl("Class"))?;
+            nt.t(&d, &owl("equivalentClass"), &and)?;
         }
     }
     Ok(Expect::new())
@@ -1079,6 +1116,10 @@ fn el(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
 fn horn(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     let n = p.get("classes", 20_000);
     let r = ex("r");
+    // Declared, as in `el`.
+    for property in [&r, &ex("rInv")] {
+        nt.t(property, &rdf("type"), &owl("ObjectProperty"))?;
+    }
     nt.t(&ex("rInv"), &owl("inverseOf"), &r)?;
     for i in 0..n {
         let a = ex(format!("A{i}"));

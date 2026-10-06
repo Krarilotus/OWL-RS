@@ -110,7 +110,7 @@ fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, prop
                         .unavailable
                         .map(|why| format!(" ({why})"))
                         .unwrap_or_default()
-                ),
+                ) + &gap(&store),
             )
         }
         false => ("rules".to_owned(), String::new()),
@@ -123,6 +123,29 @@ fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, prop
         engine,
         upper,
     }
+}
+
+/// U1's facts beyond L per predicate (`a C` for a class), and how many of them name no
+/// Skolem constant: the facts that can make an answer of their own.
+fn gap(store: &StoreService) -> String {
+    const SKOLEM: &str = "urn:nrese:u1:";
+    const TYPE: &str = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>";
+    let mut by: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+    for [s, p, o] in store.dl_upper_facts(false).unwrap_or_default() {
+        let key = match p == TYPE {
+            true => format!("a {o}"),
+            false => p,
+        };
+        let named = !s.contains(SKOLEM) && !o.contains(SKOLEM);
+        let entry = by.entry(key).or_default();
+        entry.0 += 1;
+        entry.1 += usize::from(named);
+    }
+    by.iter()
+        .map(|(key, (all, named))| {
+            format!("\n  gap {key}: {all} facts, {named} without a Skolem constant")
+        })
+        .collect()
 }
 
 fn main() {

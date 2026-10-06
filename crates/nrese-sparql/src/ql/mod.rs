@@ -143,6 +143,12 @@ impl QlRewriting {
         self.closure
     }
 
+    /// What decides its rewritings besides the snapshot's TBox: the closure and the
+    /// bounds (part of the result cache's key of an answer).
+    pub(crate) fn fingerprint(&self) -> String {
+        format!("{:?} {:?}", self.closure, self.limits)
+    }
+
     pub(crate) fn limits(&self) -> &Limits {
         &self.limits
     }

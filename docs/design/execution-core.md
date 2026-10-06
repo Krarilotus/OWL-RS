@@ -66,6 +66,7 @@ nrese-engine   permutations, cursors with seek, exact range counts, statistics, 
    - `count()` is **exact**: the sum of range sizes per run minus tombstones in range. That's O(r log n) with a per-block tombstone count (Pf1), and a scan until then.
    - Exact scan cardinalities at plan time are the planner's biggest advantage over estimate-only systems.
    - Pf1 (compressed blocks) and Pf2 (mmap) change what's behind the cursor, and nothing above it.
+   - Built for probes (6 October 2026): `nrese_engine::ProbeCursor`, per run a finger kept across probes, a seek galloping from the last one; `seek(pattern, component)` is the leapfrog step. Index joins and the worst-case-optimal join read through it ([performance.md](performance.md) §6).
 
 ## 4. Data model
 

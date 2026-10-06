@@ -407,10 +407,12 @@ class Suite:
     def queries(self, ctx: Context, plan, key: str, system, endpoint: Endpoint, base: dict, run: int):
         suffix = "" if base["cache"] == "-" else f"-cache-{base['cache']}"
         report = ctx.logs / f"queries{suffix}.json"
+        # A log is replayed as it is: each entry once, in order, without a warm-up.
+        warmup, runs = ("0", "1") if plan.replay else ("1", str(self.args.query_runs))
         command = [self.harness(), "query-mix", "--endpoint", endpoint.query, "--queries", str(plan.queries),
-                   "--label", key, "--warmup", "1", "--runs", str(self.args.query_runs),
+                   "--label", key, "--warmup", warmup, "--runs", runs,
                    "--timeout-s", str(self.args.query_timeout_s), "--report-json", str(report)]
-        if self.args.order == "shuffled":
+        if self.args.order == "shuffled" and not plan.replay:
             seed = self.args.seed * 1000 + run
             command += ["--order", "shuffled", "--seed", str(seed)]
             base = {**base, "order": f"shuffled:{seed}"}

@@ -15,8 +15,8 @@ fsst = { package = "fsst-rs", version = "0.6" }
 hashbrown = { workspace = true }
 memchr = { workspace = true }
 memmap2 = "0.9"
-# The union kernel of the equality classes (src/engine/equality.rs), shared with the
-# reasoner.
+# The kernels shared with the reasoner and the query engine: the union of the equality
+# classes (src/engine/equality.rs), the sort.
 nrese-exec = { path = "../nrese-exec" }
 nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
