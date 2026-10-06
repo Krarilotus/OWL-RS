@@ -287,6 +287,22 @@ fn explain(store: &StoreService, text: &str) {
         });
     match explained {
         Ok(explanation) => {
+            if let Some(ql) = &explanation.ql {
+                println!(
+                    "    ql: {} patterns, {} witnesses, {} branches, {} atoms, limits {:?}, {} {:?}",
+                    ql.patterns,
+                    ql.witnesses,
+                    ql.branches,
+                    ql.atoms,
+                    ql.limits,
+                    ql.completeness.as_str(),
+                    ql.completeness
+                        .reasons
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                );
+            }
             for step in &explanation.steps {
                 let mut detail = step.detail.clone();
                 if detail.len() > 90 {
@@ -517,6 +533,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         equality_compact,
         equality_early_expansion: setting("NRESE_REASONING_EQUALITY_EXPANSION") == "early",
         equality_canonical_answers: setting("NRESE_REASONING_EQUALITY_ANSWERS") == "canonical",
+        // The OWL 2 QL rewriting as the server takes it (`NRESE_REASONING_QL_REWRITING`).
+        ql_rewriting: setting("NRESE_REASONING_QL_REWRITING") != "off",
         ..config
     };
     let started = Instant::now();

@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use nrese_sparql::Completeness;
+use super::Status as Completeness;
 use nrese_store::{
     CancellationToken, DlAnswers, DlConfig, MutationPipeline, SparqlQueryRequest, StoreError,
 };
@@ -24,9 +24,7 @@ pub(super) fn query_with(
     request.dl_answers = mode;
     let prepared = store.prepare_query(&request)?;
     let mut out = Vec::new();
-    let status = store
-        .run_query_reporting(&prepared, &CancellationToken::new(), &mut out)?
-        .expect("a status under owl2-dl");
+    let status = super::run_dl(store, &prepared, &mut out)?.expect("a status under owl2-dl");
     let json: serde_json::Value = serde_json::from_slice(&out).expect("json results");
     if let Some(b) = json.get("boolean") {
         return Ok((vec![b.to_string()], status));
@@ -123,7 +121,11 @@ fn an_existential_answer_is_proved_by_rolling_up_the_query() {
     let (rows, status) = query(&dl, "SELECT ?x { ?x :worksFor ?y }");
     assert_eq!(rows, ["ann", "bob"]);
     assert!(status.is_complete(), "{:?}", status.reasons());
-    assert!(status.paths.contains(&"exact-internalisable-cq"));
+    assert!(
+        status.paths.contains(&"exact-internalisable-cq"),
+        "{:?}",
+        status
+    );
     let (rows, _) = query(&dl, "SELECT ?x { ?x :worksFor ?y . ?y a :Org }");
     assert_eq!(rows, ["ann"], "acme isn't known to be an Org");
     // With ?y an answer variable, ann's employer is anonymous: no named answer.
@@ -228,10 +230,10 @@ fn explain_and_plan_carry_the_status() {
         .explain_query(&prepared, &CancellationToken::new())
         .expect("explain");
     let status = explained.completeness.expect("a status");
-    assert!(status.is_complete());
-    assert!(status.paths.contains(&"exact-ground-entailment"));
+    assert!(status.complete);
+    assert!(explained.decided_by.contains(&"exact-ground-entailment"));
     let planned = store.plan_query(&prepared).expect("plan");
-    assert!(!planned.completeness.expect("a status").is_complete());
+    assert!(!planned.completeness.expect("a status").complete);
 }
 
 /// Term table for generated ontologies.

@@ -106,6 +106,7 @@ impl StoreService {
             equality_closed: std::sync::Arc::default(),
             equality_canonical: config.equality_canonical_answers,
             equality_early_expansion: config.equality_early_expansion,
+            ql: std::sync::Arc::default(),
         };
         let namespaces = crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
@@ -145,6 +146,7 @@ impl StoreService {
     /// A stack kept over representatives (`reasoner.equality = "compact"`) is read
     /// expanded: the engine learns `owl:sameAs` ([`nrese_engine::Engine::set_equality`]).
     fn note_equality(&self, state: &crate::ReasoningState) {
+        self.note_ql(state);
         let closed = nrese_reasoner::RuleProgram::closes_equality(&state.ruleset);
         self.settings
             .equality_closed
@@ -158,6 +160,25 @@ impl StoreService {
             })
             .flatten();
         self.engine.set_equality(same_as);
+    }
+
+    /// Switches the QL rewriting on for a closure it can rewrite over (docs/design/
+    /// ql-rewriting.md §4): `owl2-ql` and `owl2-rl` make the data H-complete, `owl2-rl`
+    /// with its list rules; the others don't close inverses or the domains of restrictions.
+    /// Under `owl2-dl` the bounds give those answers ([`crate::dl`]): no rewriting.
+    fn note_ql(&self, state: &crate::ReasoningState) {
+        use nrese_sparql::ql::{Closure, QlRewriting};
+        let closure = match state.ruleset.as_str() {
+            "owl2-rl" => Some(Closure { lists: true }),
+            "owl2-ql" => Some(Closure { lists: false }),
+            _ => None,
+        };
+        let closure = closure.filter(|_| self.config.ql_rewriting && !self.dl.active());
+        let mut ql = self.settings.ql.write().unwrap_or_else(|p| p.into_inner());
+        // The same closure keeps its compiled schema.
+        if ql.as_ref().map(|q| q.closure()) != closure {
+            *ql = closure.map(|closure| std::sync::Arc::new(QlRewriting::new(closure)));
+        }
     }
 
     /// The store's namespace prefixes ([`crate::namespaces`]).
@@ -200,6 +221,7 @@ impl StoreService {
         self.settings
             .equality_closed
             .store(false, Ordering::Release);
+        *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = None;
         if !self.marker.swap(false, Ordering::AcqRel) {
             return Ok(());
@@ -379,6 +401,10 @@ impl StoreService {
     /// run with it.
     pub fn use_dl(&self, active: bool, user_rules: bool) {
         self.dl.set_active(active, user_rules);
+        if active {
+            // The bounds give the answers through existentials (see `note_ql`).
+            *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
+        }
     }
 
     /// Marks the store as a read replica: it follows a primary's log, whose dictionary
@@ -412,11 +438,27 @@ impl StoreService {
     ) -> StoreResult<SerializedQueryResult> {
         let prepared = self.prepare_query(request)?;
         let mut payload = Vec::new();
-        self.run_query(&prepared, &CancellationToken::new(), &mut payload)?;
+        let mut completeness = None;
+        self.run_query_reporting(
+            &prepared,
+            &CancellationToken::new(),
+            &mut payload,
+            |status| completeness = status,
+        )?;
+        let ql = match self.dl_mode(&prepared) {
+            Some(_) => None,
+            None => crate::query_executor::ql_status(
+                &self.read_snapshot(prepared.access()),
+                &prepared,
+                &self.settings,
+            ),
+        };
         Ok(SerializedQueryResult {
             kind: prepared.kind(),
             media_type: prepared.media_type(),
             payload,
+            ql,
+            completeness,
         })
     }
 
@@ -434,43 +476,97 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
     ) -> StoreResult<()> {
-        self.run_query_reporting(prepared, cancellation, out)
-            .map(|_| ())
+        self.run_query_reporting(prepared, cancellation, out, |_| {})
     }
 
-    /// [`Self::run_query`], with whether the answers are complete where a reasoning path
-    /// can leave some out (`None` where none can): under `owl2-dl`, every query that reads
-    /// the inferred statements goes through the bounds ([`crate::dl`]); its answers are
-    /// computed before the first byte is written.
+    /// [`Self::run_query`], handing `report` whether the answers are complete, where a
+    /// reasoning path can leave some out (`None` where none can), before any answer is
+    /// written: a transport sends it ahead of them. Under `owl2-dl` the bounds' status
+    /// ([`crate::dl`]; the answers are then completed before the first byte), else the
+    /// OWL 2 QL rewriting's where it applies, else a ruleset closure's
+    /// ([`Self::status_without_dl`]). One status, [`nrese_sparql::Completeness`].
     pub fn run_query_reporting(
         &self,
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
         out: impl std::io::Write,
-    ) -> StoreResult<Option<nrese_sparql::Completeness>> {
+        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+    ) -> StoreResult<()> {
+        self.run_reporting(prepared, cancellation, out, report)
+            .map(|_| ())
+    }
+
+    /// [`Self::run_query`] with the answers' status and, under `owl2-dl`, what decided it
+    /// (the paths, the candidates proved and refuted; empty outside the mode); `None`
+    /// where no reasoning path can leave answers out. For tests and the lab.
+    #[doc(hidden)]
+    pub fn run_query_dl(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+    ) -> StoreResult<Option<(nrese_sparql::Completeness, crate::dl::DlDetail)>> {
+        let mut status = None;
+        let detail = self.run_reporting(prepared, cancellation, out, |s| status = s)?;
+        Ok(status.map(|s| (s, detail.unwrap_or_default())))
+    }
+
+    fn run_reporting(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+    ) -> StoreResult<Option<crate::dl::DlDetail>> {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
-        let mut dl_status = self.status_without_dl(prepared);
         if let Some(mode) = self.dl_mode(prepared) {
-            match crate::dl::query::answer(self, prepared, cancellation, mode)? {
-                crate::dl::query::Outcome::Answers(answers, status) => {
-                    crate::query_executor::write_answers(prepared, answers, out)?;
-                    return Ok(Some(status));
-                }
-                // Over the lower bound as every query runs, its status known already.
-                crate::dl::query::Outcome::Stream(status, None) => dl_status = Some(status),
-                // L adds memberships to the snapshot: streamed over its view, uncached.
-                crate::dl::query::Outcome::Stream(status, Some(lower)) => {
-                    run_query(&lower, prepared, &self.settings, cancellation, out)?;
-                    return Ok(Some(status));
-                }
-            }
+            use crate::dl::query::Outcome;
+            return Ok(Some(
+                match crate::dl::query::answer(self, prepared, cancellation, mode)? {
+                    Outcome::Answers(answers, status, detail) => {
+                        report(Some(status));
+                        crate::query_executor::write_answers(prepared, answers, out)?;
+                        detail
+                    }
+                    // L adds memberships to the snapshot: streamed over its view, uncached.
+                    Outcome::Stream(status, Some(lower), detail) => {
+                        report(Some(status));
+                        run_query(&lower, prepared, &self.settings, cancellation, out)?;
+                        detail
+                    }
+                    // Over the lower bound as every query runs, its status known already.
+                    Outcome::Stream(status, None, detail) => {
+                        report(Some(status));
+                        let snapshot = self.read_snapshot(prepared.access());
+                        self.run_cached(&snapshot, prepared, cancellation, out)?;
+                        detail
+                    }
+                },
+            ));
         }
         let snapshot = self.read_snapshot(prepared.access());
+        let status = match crate::query_executor::ql_status(&snapshot, prepared, &self.settings) {
+            Some(ql) => Some(ql.completeness),
+            None => self.status_without_dl(prepared),
+        };
+        report(status);
+        self.run_cached(&snapshot, prepared, cancellation, out)?;
+        Ok(None)
+    }
+
+    /// Runs `prepared` on `snapshot` through the result cache.
+    fn run_cached(
+        &self,
+        snapshot: &nrese_engine::Snapshot,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+    ) -> StoreResult<()> {
         let settings = &self.settings;
         if !self.query_cache.enabled() || prepared.volatile() {
-            return run_query(&snapshot, prepared, settings, cancellation, out).map(|()| dl_status);
+            return run_query(snapshot, prepared, settings, cancellation, out);
         }
         let key = crate::query_cache::CacheKey {
             request: prepared.cache_request(),
@@ -479,18 +575,18 @@ impl StoreService {
         let mut out = out;
         if let Some(bytes) = self.query_cache.get(&key) {
             out.write_all(&bytes)?;
-            return Ok(dl_status);
+            return Ok(());
         }
         let mut tee = crate::query_cache::Tee {
             inner: out,
             copy: Some(Vec::new()),
             limit: self.query_cache.max_entry(),
         };
-        run_query(&snapshot, prepared, settings, cancellation, &mut tee)?;
+        run_query(snapshot, prepared, settings, cancellation, &mut tee)?;
         if let Some(copy) = tee.copy {
             self.query_cache.insert(key, copy);
         }
-        Ok(dl_status)
+        Ok(())
     }
 
     /// Outside `owl2-dl`, the status of answers that read a ruleset's closure (`None`
@@ -511,16 +607,15 @@ impl StoreService {
             .as_ref()?
             .ruleset
             .clone();
-        Some(nrese_sparql::Completeness::sound_only(format!(
-            "answers over the {ruleset} closure: what its rules derive, not every certain \
-             answer under OWL 2 DL (reasoner.mode = \"owl2-dl\" gives those)"
-        )))
-    }
-
-    /// Whether [`Self::run_query_reporting`] computes `prepared`'s answers in full before
-    /// writing them (under `owl2-dl`, to complete them through the bounds).
-    pub fn reports_completeness(&self, prepared: &PreparedQuery) -> bool {
-        self.dl_mode(prepared).is_some()
+        let mut status = nrese_sparql::Completeness::default();
+        status.incomplete(
+            "rules",
+            format!(
+                "answers over the {ruleset} closure: what its rules derive, not every \
+                 certain answer under OWL 2 DL (reasoner.mode = \"owl2-dl\" gives those)"
+            ),
+        );
+        Some(status)
     }
 
     /// Under `owl2-dl`, the answers a query reading the inferred statements asks for;
@@ -557,12 +652,19 @@ impl StoreService {
                 crate::DlAnswers::Exact => crate::DlAnswers::CertainWhereComplete,
                 other => other,
             };
-            explanation.completeness = Some(
+            let (status, detail) =
                 match crate::dl::query::answer(self, prepared, cancellation, mode)? {
-                    crate::dl::query::Outcome::Answers(_, status)
-                    | crate::dl::query::Outcome::Stream(status, _) => status,
-                },
-            );
+                    crate::dl::query::Outcome::Answers(_, status, detail)
+                    | crate::dl::query::Outcome::Stream(status, _, detail) => (status, detail),
+                };
+            explanation.completeness = Some(status);
+            explanation.decided_by = detail.paths;
+        } else {
+            explanation.completeness = explanation
+                .ql
+                .as_ref()
+                .map(|ql| ql.completeness.clone())
+                .or_else(|| self.status_without_dl(prepared));
         }
         Ok(explanation)
     }
@@ -575,9 +677,14 @@ impl StoreService {
             prepared,
             &self.settings,
         )?;
-        if self.dl_mode(prepared).is_some() {
-            planned.completeness = Some(crate::dl::query::plan_status(self, prepared));
-        }
+        planned.completeness = match self.dl_mode(prepared) {
+            Some(_) => Some(crate::dl::query::plan_status(self, prepared)),
+            None => planned
+                .ql
+                .as_ref()
+                .map(|ql| ql.completeness.clone())
+                .or_else(|| self.status_without_dl(prepared)),
+        };
         Ok(planned)
     }
 
@@ -670,11 +777,38 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
     ) -> StoreResult<()> {
+        self.run_query_pending_reporting(pending, prepared, cancellation, out, |_| {})
+    }
+
+    /// [`Self::run_query_pending`], handing `report` the answers' status as
+    /// [`Self::run_query_reporting`] does. The pending data has no DL bounds: under
+    /// `owl2-dl` its answers are its closure's, sound only.
+    pub fn run_query_pending_reporting(
+        &self,
+        pending: &crate::StatementsRequest,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+    ) -> StoreResult<()> {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         let scope = crate::ReadScope::of(prepared.access().cloned());
+        let in_dl = self.dl_mode(prepared).is_some();
         self.with_pending(pending, &scope, cancellation, |snapshot| {
+            let mut status = crate::query_executor::ql_status(snapshot, prepared, &self.settings)
+                .map(|ql| ql.completeness)
+                .or_else(|| self.status_without_dl(prepared));
+            if in_dl {
+                status.get_or_insert_with(Default::default).incomplete(
+                    "dl",
+                    "a read inside a transaction: the pending data's closure, without the \
+                     DL bounds"
+                        .to_owned(),
+                );
+            }
+            report(status);
             run_query(snapshot, prepared, &self.settings, cancellation, out)
         })
     }

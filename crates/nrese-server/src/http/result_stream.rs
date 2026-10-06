@@ -5,8 +5,6 @@
 //!   slow client slows the producer down instead of the server buffering the whole result.
 //! - **Status.** The response status is chosen only when the first chunk (or the producer's
 //!   error) arrives, so errors and timeouts before any output still get a proper status.
-//! - **Headers.** The producer may add headers before its first byte
-//!   ([`ChannelWriter::set_header`]): the response is built when the first chunk arrives.
 //! - **After the first chunk,** a failure can only abort the connection; the 200 is already
 //!   sent. Clients see a truncated body, as with QLever or Fuseki.
 //! - **Cancellation.** Reaching the deadline, or the client disconnecting (the body is
@@ -39,22 +37,9 @@ pub struct ChannelWriter {
     buffer: Vec<u8>,
     deadline: Instant,
     runtime: tokio::runtime::Handle,
-    headers: Headers,
 }
 
-/// Headers the producer sets before its first byte.
-type Headers = std::sync::Arc<std::sync::Mutex<Vec<(header::HeaderName, HeaderValue)>>>;
-
 impl ChannelWriter {
-    /// Adds a response header. Only headers set before the first byte is written reach the
-    /// response; later ones are dropped.
-    pub fn set_header(&mut self, name: header::HeaderName, value: HeaderValue) {
-        self.headers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push((name, value));
-    }
-
     /// Sends `message`, waiting for room in the channel until the deadline.
     fn send(&self, message: Message) -> io::Result<()> {
         let sent = self.runtime.block_on(tokio::time::timeout_at(
@@ -116,15 +101,12 @@ pub async fn stream_blocking(
 ) -> Result<Response, ApiError> {
     let (sender, mut receiver) = mpsc::channel::<Message>(CHANNEL_CHUNKS);
     let runtime = tokio::runtime::Handle::current();
-    let headers = Headers::default();
-    let set = std::sync::Arc::clone(&headers);
     tokio::task::spawn_blocking(move || {
         let mut writer = ChannelWriter {
             sender,
             buffer: Vec::with_capacity(CHUNK_BYTES),
             deadline,
             runtime,
-            headers: set,
         };
         let result = produce(&mut writer).and_then(|()| {
             io::Write::flush(&mut writer).map_err(|error| ApiError::internal(error.to_string()))
@@ -184,9 +166,6 @@ pub async fn stream_blocking(
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(media_type));
-    for (name, value) in headers.lock().unwrap_or_else(|p| p.into_inner()).drain(..) {
-        response.headers_mut().insert(name, value);
-    }
     Ok(response)
 }
 

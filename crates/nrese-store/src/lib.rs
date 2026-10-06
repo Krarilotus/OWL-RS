@@ -51,7 +51,7 @@ pub use config::{
     StoreConfig, StoreMode,
 };
 pub use delta::MutationDeltaPreview;
-pub use dl::{DlAnswers, DlConfig, DlConsistency};
+pub use dl::{DlAnswers, DlConfig, DlConsistency, DlDetail};
 pub use draft_check::{
     DRAFT_CHECK_PROFILES, DRAFT_CHECK_PROTOCOL, DRAFT_CHECK_SEMANTICS, DraftInputs, DraftLimits,
     DraftOperation, DraftOutcome, DraftStatus, DraftTerm, input_hash_mismatch, run_draft_check,
