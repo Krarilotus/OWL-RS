@@ -34,6 +34,13 @@ owns its tests, and benchmarks never run in a gate.
   cargo-nextest`): every test of every binary in parallel. Without it, `cargo test` runs
   crate by crate.
 - Enable the hooks with `git config core.hooksPath .githooks`.
-- CI (`.github/workflows/ci.yml`, the same steps on Linux) runs at milestones and on
-  merges to `main`: `gh workflow run ci.yml --ref <branch>`; the Jena oracle likewise
-  (`oracle.yml`).
+
+## Building and measuring
+
+Build through `scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most
+`NRESE_BUILD_SLOTS` builds at once per machine). Validate in batches: quick checks while
+working, the push tier once per batch. Measure counts first; time only to answer a stated
+question, inside `scripts/quiet-slot.sh`, on `release` (`--profile lab` to iterate).
+
+CI (`.github/workflows/ci.yml`, the same steps on Linux) runs at milestones and on merges to
+`main`: `gh workflow run ci.yml --ref <branch>`; the Jena oracle likewise (`oracle.yml`).

@@ -277,11 +277,10 @@ fn queries_without_tree_witnesses_plan_as_before() {
             (&with.rewrites, &with.steps),
             "{query}"
         );
-        // Nothing rewritten, and nothing missing.
-        assert_eq!(
-            with.ql.unwrap_or_default(),
-            nrese_sparql::ql::QlReport::default()
-        );
+        // Nothing rewritten, and nothing missing (complete under the closure's regime).
+        let mut nothing = nrese_sparql::ql::QlReport::default();
+        nothing.completeness.regime = with.ql.as_ref().and_then(|r| r.completeness.regime);
+        assert_eq!(with.ql.unwrap_or_default(), nothing);
     }
     let plain = engine(
         ":Manager rdfs:subClassOf :Employee . :worksFor rdfs:domain :Person .
@@ -300,11 +299,10 @@ fn queries_without_tree_witnesses_plan_as_before() {
             (&with.rewrites, &with.steps),
             "{query}"
         );
-        // Nothing rewritten, and nothing missing.
-        assert_eq!(
-            with.ql.unwrap_or_default(),
-            nrese_sparql::ql::QlReport::default()
-        );
+        // Nothing rewritten, and nothing missing (complete under the closure's regime).
+        let mut nothing = nrese_sparql::ql::QlReport::default();
+        nothing.completeness.regime = with.ql.as_ref().and_then(|r| r.completeness.regime);
+        assert_eq!(with.ql.unwrap_or_default(), nothing);
     }
 }
 

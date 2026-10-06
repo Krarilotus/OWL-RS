@@ -2,13 +2,28 @@
 
 use crate::term::TermId;
 
-/// A quad in canonical `(subject, predicate, object, graph)` order.
+/// A quad in canonical `(subject, predicate, object, graph)` order. `repr(C)`: four
+/// `u64`s in that order, the layout and order of its SPOG key ([`as_keys_mut`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(C)]
 pub struct EncodedQuad {
     pub subject: TermId,
     pub predicate: TermId,
     pub object: TermId,
     pub graph: TermId,
+}
+
+const _: () = assert!(
+    size_of::<EncodedQuad>() == size_of::<Key>() && align_of::<EncodedQuad>() == align_of::<Key>()
+);
+
+/// `quads` as their SPOG keys, in place, for the key kernels ([`nrese_exec::sort`]): the
+/// keys sort as the quads do (components compared in the same order, by their raw ids).
+pub(crate) fn as_keys_mut(quads: &mut [EncodedQuad]) -> &mut [Key] {
+    // SAFETY: `EncodedQuad` is `repr(C)` of four `TermId`s, each `repr(transparent)` over
+    // a `u64`: the size, alignment and bytes of a `[u64; 4]` (asserted above), and every
+    // bit pattern is a valid one of either. The slice borrows `quads` for its lifetime.
+    unsafe { std::slice::from_raw_parts_mut(quads.as_mut_ptr().cast::<Key>(), quads.len()) }
 }
 
 impl EncodedQuad {
@@ -112,6 +127,13 @@ impl QuadPattern {
             object: None,
             graph: GraphSelector::Exact(graph),
         }
+    }
+
+    /// The components (subject 0, predicate 1, object 2, graph 3) in the order the index
+    /// reads patterns of this shape, its bound ones first: patterns whose bound values
+    /// ascend in this order are read forward by a [`crate::ProbeCursor`].
+    pub fn read_order(&self) -> [usize; 4] {
+        AccessPlan::for_pattern(self).permutation.order()
     }
 
     pub fn matches(&self, quad: &EncodedQuad) -> bool {
