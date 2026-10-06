@@ -19,112 +19,15 @@
 //! ([`EqualityClasses::expand`]). The property test checks exactly that, and that the
 //! same consistency rules fire.
 
-use hashbrown::HashMap;
-
 use super::batch::{self, Schema};
 use super::ir::Rule;
 use super::ir::{Triple, Violation};
 use super::lists::ListVocabulary;
 
 /// The `owl:sameAs` classes of a closure: each term's representative, and each
-/// representative's members (only for classes of two or more).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EqualityClasses {
-    /// Every member of a class other than its representative, with the representative.
-    representative: HashMap<u64, u64>,
-    /// Each representative's members, sorted (the representative first).
-    members: HashMap<u64, Vec<u64>>,
-}
-
-impl EqualityClasses {
-    /// The representative of `term` (the term itself outside every class).
-    pub fn representative(&self, term: u64) -> u64 {
-        self.representative.get(&term).copied().unwrap_or(term)
-    }
-
-    /// The identities of `term`'s class, sorted, if it has two or more.
-    pub fn class_of(&self, term: u64) -> Option<&[u64]> {
-        self.members
-            .get(&self.representative(term))
-            .map(Vec::as_slice)
-    }
-
-    /// The identities of `term`'s class (`[term]` outside every class), sorted.
-    pub fn members(&self, term: u64) -> Vec<u64> {
-        self.class_of(term)
-            .map_or_else(|| vec![term], <[u64]>::to_vec)
-    }
-
-    /// Whether `term` is the representative of its class (or in no class).
-    pub fn is_representative(&self, term: u64) -> bool {
-        !self.representative.contains_key(&term)
-    }
-
-    /// The classes of two or more identities: representative and members.
-    pub fn classes(&self) -> impl Iterator<Item = (u64, &[u64])> {
-        self.members.iter().map(|(&r, m)| (r, m.as_slice()))
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.members.is_empty()
-    }
-
-    /// `fact` with every term replaced by its representative.
-    pub fn rewrite(&self, [s, p, o]: Triple) -> Triple {
-        [
-            self.representative(s),
-            self.representative(p),
-            self.representative(o),
-        ]
-    }
-
-    /// Every fact a representative fact stands for.
-    pub fn expand(&self, [s, p, o]: Triple) -> Vec<Triple> {
-        let (ms, mp, mo) = (self.members(s), self.members(p), self.members(o));
-        let mut out = Vec::with_capacity(ms.len() * mp.len() * mo.len());
-        for &s in &ms {
-            for &p in &mp {
-                for &o in &mo {
-                    out.push([s, p, o]);
-                }
-            }
-        }
-        out
-    }
-
-    /// Merges the classes of `a` and `b`; returns the representative that lost its place
-    /// (the larger of the two), or `None` if they were one class. The members of that
-    /// class move under the smaller representative.
-    pub fn union(&mut self, a: u64, b: u64) -> Option<u64> {
-        let (ra, rb) = (self.representative(a), self.representative(b));
-        if ra == rb {
-            return None;
-        }
-        let (keep, lose) = (ra.min(rb), ra.max(rb));
-        let moved = self.members.remove(&lose).unwrap_or_else(|| vec![lose]);
-        for &member in &moved {
-            self.representative.insert(member, keep);
-        }
-        let members = self.members.entry(keep).or_insert_with(|| vec![keep]);
-        members.extend(moved);
-        members.sort_unstable();
-        Some(lose)
-    }
-
-    /// Merges the classes of each pair; returns the representatives that lost their place.
-    pub fn union_all(&mut self, pairs: &[(u64, u64)]) -> Vec<u64> {
-        pairs
-            .iter()
-            .filter_map(|&(a, b)| self.union(a, b))
-            .collect()
-    }
-
-    /// Merges the classes of each pair; returns whether any class changed.
-    #[cfg(test)]
-    fn merge(&mut self, pairs: &[(u64, u64)]) -> bool {
-        !self.union_all(pairs).is_empty()
-    }
-}
+/// representative's members (only for classes of two or more). The union kernel the
+/// engine shares ([`nrese_exec::classes`]).
+pub use nrese_exec::classes::Classes as EqualityClasses;
 
 /// A closure over representatives.
 #[derive(Debug, Default)]
@@ -197,28 +100,4 @@ pub fn materialise_until(
         merges: result.merges,
         passes: 1,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn classes_merge_expand_and_rewrite() {
-        let mut classes = EqualityClasses::default();
-        assert!(classes.merge(&[(5, 3), (7, 9)]));
-        assert!(!classes.merge(&[(3, 5)]));
-        assert!(classes.merge(&[(9, 5)]));
-        assert_eq!(classes.members(7), &[3, 5, 7, 9]);
-        assert_eq!(classes.representative(9), 3);
-        assert_eq!(classes.members(42), vec![42]);
-        assert!(classes.is_representative(3) && !classes.is_representative(5));
-        assert_eq!(classes.rewrite([9, 1, 42]), [3, 1, 42]);
-        let expanded: Vec<Triple> = classes.expand([3, 1, 42]);
-        assert_eq!(expanded.len(), 4);
-        // The representative that lost its place is reported.
-        assert_eq!(classes.union(2, 7), Some(3));
-        assert_eq!(classes.members(9), &[2, 3, 5, 7, 9]);
-        assert_eq!(classes.union(9, 2), None);
-    }
 }
