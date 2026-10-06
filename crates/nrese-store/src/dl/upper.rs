@@ -207,24 +207,39 @@ impl Base for UpperBase<'_> {
     }
 }
 
-/// Interns IRIs and literals into the store's dictionary (U1's own terms: fresh classes,
-/// Skolem constants, the clash).
-pub(crate) struct Interner<'a>(pub &'a dyn Fn(TermRef<'_>) -> TermId);
+/// Gives IRIs and literals their ids in the store's dictionary (U1's own terms: fresh
+/// classes, Skolem constants, the clash): interned on a primary, looked up on a replica
+/// ([`super::source::resolve`]), where a term no record brought yet is `missing`.
+pub(crate) struct Interner<'a> {
+    pub resolve: &'a dyn Fn(TermRef<'_>) -> Option<TermId>,
+    pub missing: bool,
+}
+
+impl Interner<'_> {
+    fn id(&mut self, term: TermRef<'_>) -> u64 {
+        match (self.resolve)(term) {
+            Some(id) => id.raw(),
+            None => {
+                self.missing = true;
+                0
+            }
+        }
+    }
+}
 
 impl ir::Vocabulary for Interner<'_> {
     fn iri(&mut self, iri: &str) -> u64 {
-        (self.0)(NamedNodeRef::new_unchecked(iri).into()).raw()
+        self.id(NamedNodeRef::new_unchecked(iri).into())
     }
 
     fn literal(&mut self, lexical: &str, datatype: &str) -> u64 {
-        (self.0)(
+        self.id(
             LiteralRef::new_typed_literal(lexical, NamedNodeRef::new_unchecked(datatype)).into(),
         )
-        .raw()
     }
 
     fn language_literal(&mut self, lexical: &str, language: &str) -> u64 {
-        (self.0)(LiteralRef::new_language_tagged_literal_unchecked(lexical, language).into()).raw()
+        self.id(LiteralRef::new_language_tagged_literal_unchecked(lexical, language).into())
     }
 }
 
@@ -309,21 +324,31 @@ fn view_facts(view: &Snapshot) -> Vec<Triple> {
 
 impl Upper {
     /// Compiles U1 for `ontology` and evaluates it over `view` (the materialised view the
-    /// ontology was read from). `intern` adds U1's own terms to the dictionary; `stop`
-    /// ends the evaluation (U1 is then not available). O(the closure).
+    /// ontology was read from). `resolve` gives U1's own terms their ids (`None`: not in
+    /// a replica's dictionary yet, and U1 isn't available); `stop` ends the evaluation (U1
+    /// is then not available). O(the closure).
     pub fn build(
         ontology: &Ontology,
         normalised: &Normalised,
         view: &Snapshot,
-        intern: &dyn Fn(TermRef<'_>) -> TermId,
+        resolve: &dyn Fn(TermRef<'_>) -> Option<TermId>,
         stop: Stop<'_>,
     ) -> Result<Self, GaveUp> {
         let started = Instant::now();
-        let mut vocabulary = Interner(intern);
+        let mut vocabulary = Interner {
+            resolve,
+            missing: false,
+        };
         let program = bounds::compile(ontology, normalised, &mut |iri| {
             ir::Vocabulary::iri(&mut vocabulary, iri)
         });
         let schema = Schema::owl(&mut vocabulary);
+        if vocabulary.missing {
+            return Err(GaveUp(
+                "its terms haven't reached this replica yet: the primary interns them in a commit"
+                    .to_owned(),
+            ));
+        }
         let rules = reasoner_rules(&program);
         let facts: HashSet<Triple> = program.facts.iter().map(|(f, _)| *f).collect();
         let mut input = view_facts(view);

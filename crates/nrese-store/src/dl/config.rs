@@ -74,6 +74,13 @@ pub struct DlConfig {
     pub max_candidates: usize,
     /// Workers of a classification (`dl.threads`; 0: every core).
     pub threads: usize,
+    /// The most nodes one hypertableau run may hold (`dl.max_nodes`): a deterministic
+    /// budget beside `timeout`.
+    pub max_nodes: usize,
+    /// The most branch points one hypertableau run may open (`dl.max_branch_points`): a
+    /// deterministic budget on its search, so a decision doesn't depend on the machine's
+    /// speed. A run past it gives no answer (unresolved, sound-only), never a wrong one.
+    pub max_branch_points: u64,
 }
 
 impl Default for DlConfig {
@@ -85,11 +92,25 @@ impl Default for DlConfig {
             memory_bytes: 4 << 30,
             max_candidates: 1_000,
             threads: 0,
+            max_nodes: 2_000_000,
+            max_branch_points: 1_000_000,
         }
     }
 }
 
 impl DlConfig {
+    /// The hypertableau's configuration of a DL task under these settings, each test
+    /// within `timeout` and `memory`.
+    pub fn tableau(&self, timeout: Duration, memory: usize) -> nrese_dl::tableau::Config {
+        nrese_dl::tableau::Config {
+            timeout: Some(timeout),
+            max_memory: memory,
+            max_nodes: self.max_nodes,
+            max_branch_points: Some(self.max_branch_points),
+            ..nrese_dl::tableau::Config::default()
+        }
+    }
+
     /// The workers a task gets.
     pub fn workers(&self) -> usize {
         match self.threads {

@@ -62,6 +62,8 @@ pub(crate) fn budget(store: &StoreService, cancel: Option<Cancel>) -> Budget {
         memory_bytes: dl.memory_bytes,
         threads: dl.workers(),
         cancel,
+        max_nodes: dl.max_nodes,
+        max_branch_points: dl.max_branch_points,
     }
 }
 
