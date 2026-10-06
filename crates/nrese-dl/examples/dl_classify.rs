@@ -16,6 +16,7 @@
 //!   --eager-lower-bound     ... with Strategy::Eager
 //!   --equality            the context core takes functional properties (its Eq rule)
 //!   --max-join N          the most conclusions one context-core join may make
+//!   --max-join-steps N    the most steps one context-core Pred join may take
 //!   --max-memory-mb N     the most memory the process may hold while the context core runs
 //!   --clauses             print the DL-clauses with more than one head atom, then stop
 //!   --no-context-core --no-inline --no-lower-bound --no-exact-shortcut --no-model-pruning
@@ -224,6 +225,9 @@ fn args() -> Result<Args, String> {
                 a.options.lower_bound_strategy = nrese_dl::context::Strategy::Eager;
             }
             "--max-join" => a.options.max_join = number("--max-join")? as usize,
+            "--max-join-steps" => {
+                a.options.max_join_steps = number("--max-join-steps")? as usize;
+            }
             "--max-memory-mb" => {
                 a.options.max_memory = Some(number("--max-memory-mb")? << 20);
             }
