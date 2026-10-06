@@ -20,6 +20,7 @@
 pub(crate) mod compaction;
 #[cfg(test)]
 mod compression_study;
+pub(crate) mod cursor;
 mod derive;
 pub(crate) mod keys;
 mod merge;
@@ -106,7 +107,7 @@ impl Layout {
 
     /// The plan that answers `plan` over this layout, or `None` if no quad the layout can
     /// hold matches it. The plan's permutation must be [`supported`](Self::supports).
-    fn adapt(self, plan: &AccessPlan) -> Option<AccessPlan> {
+    pub(crate) fn adapt(self, plan: &AccessPlan) -> Option<AccessPlan> {
         if self == Self::Quads {
             return Some(*plan);
         }
