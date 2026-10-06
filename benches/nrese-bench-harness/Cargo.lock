@@ -1020,6 +1020,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "memchr",
  "memmap2",
+ "nrese-exec",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-vector",
