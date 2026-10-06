@@ -167,61 +167,21 @@ pub fn non_recursive(
         .collect()
 }
 
-/// Strongly connected components (iterative Tarjan): the component of each node.
+/// Strongly connected components: the component of each node (the shared kernel,
+/// [`nrese_exec::graph::components`]).
 fn components(nodes: usize, edges: &[(usize, usize)]) -> Vec<usize> {
-    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); nodes];
-    for &(a, b) in edges {
-        adjacency[a].push(b);
-    }
-    const UNSEEN: usize = usize::MAX;
-    let (mut index, mut low, mut on_stack) =
-        (vec![UNSEEN; nodes], vec![0; nodes], vec![false; nodes]);
-    let mut component = vec![UNSEEN; nodes];
-    let (mut next, mut count) = (0, 0);
-    let mut stack = Vec::new();
-    for root in 0..nodes {
-        if index[root] != UNSEEN {
-            continue;
-        }
-        // (node, next edge to look at)
-        let mut work = vec![(root, 0usize)];
-        index[root] = next;
-        low[root] = next;
-        next += 1;
-        stack.push(root);
-        on_stack[root] = true;
-        while let Some(&mut (v, ref mut at)) = work.last_mut() {
-            if let Some(&w) = adjacency[v].get(*at) {
-                *at += 1;
-                if index[w] == UNSEEN {
-                    index[w] = next;
-                    low[w] = next;
-                    next += 1;
-                    stack.push(w);
-                    on_stack[w] = true;
-                    work.push((w, 0));
-                } else if on_stack[w] {
-                    low[v] = low[v].min(index[w]);
-                }
-                continue;
-            }
-            work.pop();
-            if let Some(&(parent, _)) = work.last() {
-                low[parent] = low[parent].min(low[v]);
-            }
-            if low[v] == index[v] {
-                while let Some(w) = stack.pop() {
-                    on_stack[w] = false;
-                    component[w] = count;
-                    if w == v {
-                        break;
-                    }
-                }
-                count += 1;
-            }
-        }
-    }
-    component
+    let edges: Vec<(u32, u32)> = edges
+        .iter()
+        .map(|&(a, b)| {
+            let id = |x: usize| u32::try_from(x).expect("fewer than 2^32 nodes");
+            (id(a), id(b))
+        })
+        .collect();
+    nrese_exec::graph::components(nodes, &edges)
+        .component
+        .into_iter()
+        .map(|c| c as usize)
+        .collect()
 }
 
 /// The `owl:sameAs` partners of `term` in `source` (other than itself).

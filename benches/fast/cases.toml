@@ -1209,8 +1209,10 @@ route = {}
 cap_gb = 6
 systems = []
 guards = ["investigation G5: a compact-mode commit that merges sameAs"]
-outcome = "wrong"
-known = "6 Oct 2026, 200 merges: the maintained stack held 380,845 inferred facts, a fresh materialisation 440,032; the values query agreed; commits not incremental, p50 2.2 s"
+# 6 Oct 2026, first run: "wrong" (maintained 380,845, fresh 440,032) was the check
+# comparing the stored count with the closure handed to the engine, which in compact
+# mode also lists asserted facts that mention a class; stored, both hold the same count.
+# Commits were then rematerialisations (p50 2.2 s); since G5 incremental (0.13 s).
 [[case]]
 name = "rl-fed-chain"
 area = "reasoning"
