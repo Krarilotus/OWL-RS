@@ -151,7 +151,8 @@ pub struct Explanation {
     /// status the answers carry (set by the store: QL's, the DL bounds', a closure's).
     pub completeness: Option<crate::completeness::Completeness>,
     /// What decided the status (the DL bounds' paths: `closed-predicates`,
-    /// `bounds-equal`, `exact-ground-entailment`, `exact-internalisable-cq`).
+    /// `skolem-only-gap`, `bounds-equal`, `exact-ground-entailment`,
+    /// `exact-internalisable-cq`).
     pub decided_by: Vec<&'static str>,
     /// The candidates of the DL bounds' gap the exact services decided; `None` where the
     /// bounds didn't run. Diagnostics: the status says what the answers are.

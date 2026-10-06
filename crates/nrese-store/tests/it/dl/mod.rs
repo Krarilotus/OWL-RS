@@ -5,6 +5,7 @@ mod classification;
 mod consistency;
 mod entailment;
 mod explain;
+mod gap;
 mod gates;
 mod mode;
 mod queries;
