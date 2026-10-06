@@ -1,0 +1,49 @@
+# A run record (benches/runs/README.md), written by hand: the fast suite's comparisons on
+# bench/fast-compete. Outcomes only; times are in benches/fast/results/ (git-ignored).
+# The office PC's overnight batch (scripts/office/fast-compete.sh) adds its pairs to this
+# record when it is back.
+
+id = "2026-10-06-fast-compete"
+kit = "fast"
+purpose = "The fast suite's comparisons after Phase 2: Nemo and Jena's rules rerun, the plain SPARQL cases, the printer's rewritten queries (counts), the QL and DL-mode cases, dl-roles' reference, el-classify regenerated"
+baseline = "2026-10-06-e8b9aea9"
+findings = [
+  "Counts first: every comparison below compares answers before times; where a system answered, its answers equal NRESE's. Statement counts differ by constant offsets only (Nemo 32 fewer, on every case; Virtuoso 5,763 more, on every data set; Jena's RDFS 19,485 more): not examined yet, the answers being equal",
+  "Nemo (OWL 2 RL encoding, 8 GiB, load and reasoning): behind NRESE on every rule case it finished (rl-sameas 191 s vs 1.6 s, rl-lubm100 696 s vs 7.9 s, eq-cascade-4 58 s vs 3.1 s, eq-cascade-16 136 s vs 5.1 s, rl-single-thread 128 s vs 1.2-3.5 s on one thread); memory limit at 8 GiB on rl-clique, rl-chain, rl-owl2bench and rl-fed-chain; timeout at 900 s on rl-hierarchy. On its home turf (custom-tc, Datalog) 937 ms vs NRESE's 241 ms, the same 1,354,196 pairs",
+  "Nemo 0.10.1 panics on a right-recursive transitive closure (index out of bounds in nemo-physical's rowscan.rs:83); the left-recursive program gives the same closure",
+  "Jena's rules: rdfs-hierarchy answers match (queries 2.8 s vs 1.8 ms; Jena's load excludes its lazy reasoning). OWL-Horst gave no answer on rl-clique, rl-chain and rl-owl2bench (recorded as hangs); on horst-lubm10, its home turf, the count of everything ran out of a 6 GiB heap after 400 s and q01-q02 timed out: rerun tonight without the count",
+  "Plain SPARQL (social data, 7.7 M statements): NRESE ahead on q-star, q-chain, q-snowflake and open-first-query (Oxigraph's home turf); QLever ahead on q-cycles (4.5 s vs 6.9 s for triangles and 4-cycles; Virtuoso 29 s, Jena and Oxigraph time out on 4-cycles). Load of 20 M: NRESE 5.7 s, Oxigraph 17.7 s, QLever 22.4 s, Virtuoso 78 s, Jena 152 s",
+  "The printer (QL rewriting printed as SPARQL, both forms): every printed query answers as NRESE does on rl-hierarchy, rdfs-hierarchy, rl-clique, rl-chain, rl-fed-chain, custom-tc and the four LUBM 10 profiles (14 of 14 each); ql-owl2bench 21 of 22 (q01: a reflexive property, not expressible); rl-owl2bench 0 of 22 expressible; rl-lubm100 7 of 7 checked before the check's 24 GB cap; sameAs and equality cases not expressible",
+  "DL: with its runner given 10 GB (the JVM's -Xmx8g), dl-roles has its references: Openllet 1.0 s, Konclude 1.2 s, HermiT 22.7 s, NRESE 1.9 s. el-classify on the declared ontology: ELK's and Konclude's taxonomies equal NRESE's (NRESE 1.35 s, ELK 3.0 s, Konclude 3.1 s; HermiT and Openllet time out at 120 s); on the irregular chain (el-classify-irregular) ELK equals NRESE and Konclude differs",
+  "Six new cases on QL and the owl2-dl mode: ql-owl2bench (tree-witness rewrite on q12, q15, q21, q22, none on q01), dlmode-lubm1 (all 14 answers complete and equal to the published counts), dlmode-commits, dlmode-reject (the RL gate), dlmode-reject-dl (the hypertableau gate), classify-store-horn and -tableau (the context core; the tableau)",
+]
+started = "2026-10-06"
+host = "Kraris-GPTler"
+machine = "AMD Ryzen 7 7800X3D, 16 threads, 63 GiB; Windows 11; Docker Desktop (31 GiB VM); other agents building alongside (the quiet slot from 9799760 on)"
+commit = "96a679d (Nemo, Jena), 9ede48a (EL), 93a590a and later (plain SPARQL, printer)"
+protocol = "fast.py compete: the suite's driver (cache off, 1 warm-up and 2 measured runs per query, 120 s per query, 900 s per load and count), the DL kit's image (120 s per task, 10 GB), Nemo's own image; answers compared before times"
+commands = [
+  "python benches/fast/fast.py compete --systems nemo",
+  "python benches/fast/fast.py compete --systems jena --cases rl-clique,rl-chain,horst-lubm10,rdfs-hierarchy,rl-owl2bench,custom-tc",
+  "python benches/fast/fast.py compete --cases dl-roles; compete --cases el-classify,el-classify-irregular,horn-classify,classify-store-horn,dl-pipeline",
+  "python benches/fast/fast.py compete --counts-only --systems qlever,oxigraph,virtuoso",
+  "python benches/fast/fast.py compete --systems qlever,oxigraph,virtuoso,jena --cases load-entities,open-first-query,q-star,q-chain,q-cycles,q-snowflake (stopped after q-snowflake: the rest goes to the office PC)",
+]
+results = "benches/fast/results/2026-10-06-1304, -1305, -1406, -1420, -1433, -1652 (git-ignored)"
+publishable = "all"
+
+pairs = [
+  { workload = "fast", tier = "rule cases~owl2-rl", system = "nemo", regime = "owl2-rl", outcome = "partial", items = "5 ok, 4 memory-limit, 1 timeout", note = "answers equal NRESE's where it finished" },
+  { workload = "fast", tier = "custom-tc~custom", system = "nemo", regime = "custom", outcome = "ok" },
+  { workload = "fast", tier = "rdfs-hierarchy~rdfs", system = "jena", regime = "rdfs", outcome = "ok" },
+  { workload = "fast", tier = "rl-clique, rl-chain, rl-owl2bench~owl-horst", system = "jena", regime = "owl-horst", outcome = "hangs" },
+  { workload = "fast", tier = "horst-lubm10~owl-horst", system = "jena", regime = "owl-horst", outcome = "failed", note = "count out of heap; rerun without it tonight" },
+  { workload = "fast", tier = "6 plain cases", system = "qlever", regime = "none", outcome = "ok" },
+  { workload = "fast", tier = "6 plain cases", system = "oxigraph", regime = "none", outcome = "partial", note = "4-cycles timed out" },
+  { workload = "fast", tier = "6 plain cases", system = "virtuoso", regime = "none", outcome = "ok" },
+  { workload = "fast", tier = "6 plain cases", system = "jena", regime = "none", outcome = "partial", note = "4-cycles timed out" },
+  { workload = "fast", tier = "dl-roles, el-classify", system = "konclude", regime = "dl", outcome = "ok" },
+  { workload = "fast", tier = "dl-roles, el-classify", system = "hermit", regime = "dl", outcome = "partial", note = "el-classify timed out" },
+  { workload = "fast", tier = "dl-roles, el-classify", system = "openllet", regime = "dl", outcome = "partial", note = "el-classify timed out" },
+  { workload = "fast", tier = "el-classify", system = "elk", regime = "el", outcome = "ok" },
+]
