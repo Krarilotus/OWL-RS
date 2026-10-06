@@ -2,6 +2,7 @@
 
 mod classification;
 mod consistency;
+mod entailment;
 mod mode;
 
 use std::sync::Arc;

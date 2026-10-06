@@ -6,6 +6,7 @@
 //! - [`consistency`]: consistency by the engine the ontology allows; [`gate`]: the check
 //!   on commit.
 //! - [`classification`]: classification and realisation, kept per revision.
+//! - [`entailment`]: axiom entailment, reduced to consistency.
 //!
 //! The mode is the reasoner's (`ReasoningMode::Owl2Dl`): its OWL 2 RL closure is the
 //! inferred stack, the lower bound L. What the store adds is switched on by the mutation
@@ -14,6 +15,7 @@
 pub(crate) mod classification;
 pub mod config;
 pub mod consistency;
+pub mod entailment;
 pub(crate) mod gate;
 pub(crate) mod source;
 

@@ -56,7 +56,7 @@ pub use draft_check::{
     DRAFT_CHECK_PROFILES, DRAFT_CHECK_PROTOCOL, DRAFT_CHECK_SEMANTICS, DraftInputs, DraftLimits,
     DraftOperation, DraftOutcome, DraftStatus, DraftTerm, input_hash_mismatch, run_draft_check,
 };
-pub use entailment::Entailment;
+pub use entailment::{DlEntailment, Entailment};
 pub use error::{Refusal, StoreError, StoreResult};
 pub use graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
