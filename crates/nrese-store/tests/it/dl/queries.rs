@@ -114,6 +114,62 @@ fn a_candidate_the_union_splits_into_is_refuted() {
     assert_eq!((b.refuted, b.unresolved), (2, 0), "x and w");
 }
 
+const COURSES: &str = ":Student rdfs:subClassOf [ a owl:Restriction ; \
+       owl:onProperty :takesCourse ; owl:someValuesFrom :Course ] . \
+     :Course rdfs:subClassOf :Work . \
+     :ann a :Student ; :takesCourse :c1 . :bob a :Student . :c1 a :Course .";
+
+/// U1's facts beyond L all name a Skolem constant (LUBM's case): where the query has a
+/// term or an answer variable at their ends, they give no answer, and L's answers are
+/// complete in one evaluation.
+#[test]
+fn a_gap_of_skolem_constants_only_costs_one_evaluation_where_no_answer_can_name_them() {
+    let dl = pipeline();
+    insert(&dl, COURSES).expect("data");
+    for (q, want) in [
+        ("SELECT ?x { ?x :takesCourse :c1 }", vec!["ann"]),
+        ("SELECT ?x ?y { ?x :takesCourse ?y }", vec!["ann"]),
+        ("SELECT ?x { ?x a :Course }", vec!["c1"]),
+        ("SELECT ?x { ?x a :Work }", vec!["c1"]),
+        (
+            "SELECT DISTINCT ?x ?y { { ?x :takesCourse ?y } UNION { ?y a :Work . ?x :takesCourse ?y } }",
+            vec!["ann"],
+        ),
+    ] {
+        let (rows, status) = query(&dl, q);
+        assert_eq!(rows, want, "{q}");
+        assert!(status.is_complete(), "{q}: {:?}", status.reasons());
+        assert_eq!(status.paths, ["skolem-only-gap"], "{q}");
+    }
+    // Where they can: the bounds and the exact services decide.
+    for (q, want) in [
+        // An existential variable: bob takes some course.
+        ("SELECT ?x { ?x :takesCourse ?y }", vec!["ann", "bob"]),
+        // A value computed from a Skolem constant is no Skolem constant.
+        (
+            "SELECT ?x ?y ?s { ?x :takesCourse ?y BIND(STR(?y) AS ?s) }",
+            vec!["ann"],
+        ),
+        // A path's inner nodes: bob takes some course, a Course and a Work.
+        (
+            "SELECT ?x ?w { ?x :takesCourse/rdf:type ?w }",
+            vec!["ann", "bob"],
+        ),
+        // An ASK's variables are all existential.
+        ("ASK { :bob :takesCourse ?y }", vec!["true"]),
+    ] {
+        let (mut rows, status) = query(&dl, q);
+        rows.dedup();
+        let mut want = want;
+        want.dedup();
+        assert_eq!(rows, want, "{q}");
+        assert!(
+            !status.paths.contains(&"skolem-only-gap"),
+            "{q}: {status:?}"
+        );
+    }
+}
+
 #[test]
 fn an_existential_answer_is_proved_by_rolling_up_the_query() {
     let dl = pipeline();
@@ -345,4 +401,45 @@ fn class_queries_answer_as_the_realisation_on_random_ontologies() {
     assert!(compared >= 15, "only {compared} ontologies compared");
     assert!(complete > 0, "no complete answer");
     eprintln!("{compared} ontologies, {complete} complete class queries");
+}
+
+/// A repeated query is answered from the result cache with the status a fresh evaluation
+/// reports, and a query asked under another `dl-answers` mode never gets the first
+/// mode's answer.
+#[test]
+fn cached_answers_carry_the_status_of_fresh_ones() {
+    let dl = pipeline_with(DlConfig {
+        answers: DlAnswers::Sound,
+        ..DlConfig::default()
+    });
+    insert(&dl, UNION).expect("data");
+    let ask = |query: &str, mode: Option<DlAnswers>| {
+        let (rows, status) = query_with(&dl, query, mode).expect("answered");
+        (rows, status.shared, status.paths)
+    };
+    // Closed predicates: evaluated over the snapshot as any query, so through the cache.
+    let closed = "SELECT ?x { ?z :knows ?x }";
+    let first = ask(closed, None);
+    assert_eq!(first.0, ["y"]);
+    let hits = dl.store().query_cache_stats().hits;
+    assert_eq!(ask(closed, None), first);
+    assert!(
+        dl.store().query_cache_stats().hits > hits,
+        "the repeat came from the cache: {:?}",
+        dl.store().query_cache_stats()
+    );
+    let open = ask(closed, Some(DlAnswers::Exact));
+    assert_eq!(
+        (open.0.clone(), open.1.complete),
+        (vec!["y".to_owned()], true)
+    );
+    // The bounds' modes: each answer as the mode decides, repeated.
+    let union = "SELECT ?x { ?x a :D }";
+    let sound = ask(union, None);
+    assert_eq!(sound.0, ["x", "y"], "the lower bound alone");
+    let exact = ask(union, Some(DlAnswers::Exact));
+    assert_eq!(exact.0, ["w", "x", "y"]);
+    assert!(exact.1.complete && !sound.1.complete);
+    assert_eq!(ask(union, Some(DlAnswers::Exact)), exact);
+    assert_eq!(ask(union, None), sound);
 }

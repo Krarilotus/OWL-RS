@@ -5,11 +5,13 @@ mod classification;
 mod consistency;
 mod entailment;
 mod explain;
+mod gap;
 mod gates;
 mod mode;
 mod queries;
 mod review;
 mod routing;
+mod versions;
 
 use std::sync::Arc;
 

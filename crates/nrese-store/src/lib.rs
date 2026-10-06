@@ -24,7 +24,6 @@ mod loader;
 pub mod mutation;
 pub mod namespaces;
 pub mod query;
-mod query_cache;
 mod query_executor;
 mod rdf_io;
 pub mod reasoning;
@@ -57,7 +56,7 @@ pub use draft_check::{
     DraftOperation, DraftOutcome, DraftStatus, DraftTerm, input_hash_mismatch, run_draft_check,
 };
 pub use entailment::{DlEntailment, Entailment};
-pub use error::{Refusal, StoreError, StoreResult};
+pub use error::{IncompleteAnswer, Refusal, StoreError, StoreResult};
 pub use graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
     GraphWriteRequest,
@@ -85,7 +84,6 @@ pub use query::{
     GraphResultFormat, QueryResultKind, SerializedQueryResult, SolutionsResultFormat,
     SparqlQueryRequest,
 };
-pub use query_cache::QueryCacheStats;
 pub use query_executor::PreparedQuery;
 pub use rdf_io::{convert_file, parse_payload, parse_payload_preserving_blank_nodes};
 pub use reasoning::{InferenceStep, MaterialisationReport, OntologyDiagnostic};

@@ -108,7 +108,7 @@ impl super::Context<'_> {
     /// expansion of its own.
     fn canonical_child(&self) -> super::Context<'static> {
         use std::cell::{Cell, RefCell};
-        super::Context {
+        let mut child = super::Context {
             snapshot: std::borrow::Cow::Owned(self.snapshot.with_canonical_equality()),
             model: self.model,
             aliases: RefCell::new(self.aliases.borrow().clone()),
@@ -121,6 +121,7 @@ impl super::Context<'_> {
             budget: std::sync::Arc::clone(&self.budget),
             trace: None,
             depth: Cell::new(0),
+            probed: Cell::default(),
             limit: Cell::new(None),
             graph: RefCell::new(self.graph.borrow().clone()),
             as_written: self.as_written,
@@ -134,7 +135,11 @@ impl super::Context<'_> {
             service_denied: self.service_denied,
             equality_closed: self.equality_closed,
             late: None,
-        }
+            cache: None,
+            pin: RefCell::default(),
+        };
+        child.cache = self.child_cache(&child);
+        child
     }
 
     /// Every row of `solutions` with each value replaced by each identity of its class,

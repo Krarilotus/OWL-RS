@@ -315,5 +315,13 @@ async fn a_replica_gives_its_primarys_dl_answers() -> Result<(), Box<dyn std::er
         replica_state.store().current_revision(),
         primary_state.store().current_revision()
     );
+    // At one revision, one U1: the replica's, built from the records, is the primary's,
+    // maintained by its commits.
+    let (primary, replica) = (primary_state.store(), replica_state.store());
+    assert_eq!(replica.dl_bounds().revision, replica.current_revision());
+    assert_eq!(
+        replica.dl_upper_facts(false).expect("the replica's U1"),
+        primary.dl_upper_facts(false).expect("the primary's U1")
+    );
     Ok(())
 }
