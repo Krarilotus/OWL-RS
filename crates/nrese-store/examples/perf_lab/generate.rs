@@ -1063,8 +1063,16 @@ fn el(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
         &rdf("type"),
         &owl("TransitiveProperty"),
     )?;
+    // The chain is regular by default (r1 ∘ r2 ⊑ r1, with r2 ⊑ r1), so HermiT and Openllet
+    // take the ontology too. `irregular=1` puts it under r3 instead: r3 ⊑ r1 makes the role
+    // hierarchy irregular, outside OWL 2 DL (OWL 2 EL allows it; HermiT refuses it).
     let chain = list(nt, "chain", &[ex("r1"), ex("r2")])?;
-    nt.t(&ex("r3"), &owl("propertyChainAxiom"), &chain)?;
+    let implied = if p.get("irregular", 0) == 1 {
+        "r3"
+    } else {
+        "r1"
+    };
+    nt.t(&ex(implied), &owl("propertyChainAxiom"), &chain)?;
     for i in 0..n {
         let a = ex(format!("A{i}"));
         nt.t(&a, &rdf("type"), &owl("Class"))?;

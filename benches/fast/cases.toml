@@ -439,11 +439,33 @@ metric = "whole_ms"
 check = { "taxonomy_equal" = "true" }
 route = {}
 cap_gb = 6
-systems = ["elk:el", "konclude:dl", "hermit:dl"]
+systems = ["elk:el", "konclude:dl", "hermit:dl", "openllet:dl"]
 home_turf = "elk"
 reference = "/fast/ref/el-classes20000-roles12.elk.tax"
-outcome = "wrong"
-known = "6 Oct 2026: 4,526 direct subsumptions more than ELK and Konclude, which agree (e.g. A1 below the defined class D3). Adjudicated (benches/reasoning/dl/disputed.tsv): not NRESE; the generator declared neither the D classes nor the roles, and the OWL API drops axioms about undeclared terms, so the references classified a weaker ontology. With declarations ELK's taxonomy equals NRESE's on all 22,000 classes. The generator declares them now and the check says signature-differs for such a reference; ok once the volume's data file and reference are regenerated"
+# 6 Oct 2026: 4,526 direct subsumptions more than ELK and Konclude at first. Adjudicated
+# (benches/reasoning/dl/disputed.tsv): the generator declared neither the D classes nor the
+# roles, and the OWL API drops axioms about undeclared terms. Declared, ELK's taxonomy
+# equals NRESE's. The chain is regular now (r1 ∘ r2 ⊑ r1), so HermiT and Openllet run it.
+
+[[case]]
+name = "el-classify-irregular"
+area = "dl"
+what = "the same EL ontology with an irregular role chain (r1 ∘ r2 ⊑ r3, r3 ⊑ r1): outside OWL 2 DL, inside OWL 2 EL"
+semantics = "el"
+data = "el classes=20000 roles=12 irregular=1"
+tool = "classify-el"
+repeat = 3
+metric = "whole_ms"
+check = { "taxonomy_equal" = "true" }
+route = {}
+cap_gb = 6
+# HermiT and Openllet refuse an irregular hierarchy; ELK and Konclude don't check it. On
+# 6 Oct 2026 ELK's taxonomy equalled NRESE's and Konclude's differed (outside OWL 2 DL,
+# Konclude's answer isn't defined).
+systems = ["elk:el", "konclude:dl"]
+home_turf = "elk"
+reference = "/fast/ref/el-classes20000-roles12-irregular1.elk.tax"
+
 [[case]]
 name = "horn-classify"
 area = "dl"
