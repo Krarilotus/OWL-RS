@@ -39,14 +39,7 @@ pub fn materialise_until(
     let (input, axioms) = input_of(program, snapshot);
     let schema = program.schema_for(snapshot);
     let result = match program.same_as.filter(|_| program.by_representatives) {
-        Some(same_as) => by_representatives(
-            program,
-            input,
-            &|| input_of(program, snapshot).0,
-            same_as,
-            &schema,
-            stop,
-        )?,
+        Some(same_as) => by_representatives(program, input, same_as, &schema, stop)?,
         None => batch::materialise_grouped_until(
             input,
             &program.rules,
@@ -109,120 +102,47 @@ fn input_of(program: &Program, snapshot: &Snapshot) -> (Grouped, Vec<Triple>) {
 }
 
 /// The closure of `input` (grouped by predicate) over representatives of the `owl:sameAs`
-/// classes, expanded to every identity: what the replacement rules derive, as a batch
-/// materialisation reports it (the derived facts beyond the input). Violations are over
-/// representatives.
-///
-/// Where no equality appears, nothing needs representatives: without asserted `sameAs`,
-/// the closure is computed first on the compact grouped input without the replacement
-/// rules, and if it derives no `sameAs` between two terms either, that is the closure
-/// (LUBM: the replicated time and memory, the replacement rules saved). Otherwise the
-/// representative closure starts from the input (`rebuild` reads it again) and what that
-/// first pass derived.
+/// classes, in one materialisation whose rounds merge the classes
+/// ([`batch::materialise_representatives_until`]): expanded to every identity, as the
+/// replacement rules derive it, or as the inferred stack keeps it over representatives,
+/// with each other identity as `identity sameAs representative`. Violations are over
+/// representatives. Without equalities, this is the plain closure, without the
+/// replacement rules.
 fn by_representatives(
     program: &Program,
     input: Grouped,
-    rebuild: &dyn Fn() -> Grouped,
     same_as: u64,
     schema: &Schema,
     stop: crate::eval::Stop<'_>,
 ) -> Result<batch::Materialisation, delta::Interrupted> {
-    let equal = |pairs: &[(u64, u64)]| pairs.iter().any(|&(o, s)| o != s);
-    let asserts_equality = input
-        .binary_search_by_key(&same_as, |(p, _)| *p)
-        .is_ok_and(|at| equal(&input[at].1));
-    let mut seeds: Vec<Triple> = Vec::new();
-    let input = if asserts_equality {
-        input
-    } else {
-        let rules = crate::representatives::without_replacement(&program.rules);
-        let first =
-            batch::materialise_grouped_until(input, &rules, program.lists.as_ref(), schema, stop)?;
-        if !first
-            .derived
-            .iter()
-            .any(|t| t[1] == same_as && t[0] != t[2])
-        {
-            return Ok(first);
-        }
-        seeds = first.derived;
-        rebuild()
+    let listing = match program.store_representatives {
+        true => batch::Listing::Stored,
+        false => batch::Listing::Expanded,
     };
-    let mut asserted: Vec<Triple> = input
-        .into_iter()
-        .flat_map(|(p, pairs)| pairs.into_iter().map(move |(o, s)| [s, p, o]))
-        .collect();
-    asserted.par_sort_unstable();
-    let start: Vec<Triple> = match seeds.is_empty() {
-        true => asserted.clone(),
-        false => {
-            let mut all = asserted.clone();
-            all.extend(seeds);
-            all.par_sort_unstable();
-            all.dedup();
-            all
-        }
-    };
-    let closure = crate::representatives::materialise_until(
-        &start,
+    let mut result = batch::materialise_representatives_until(
+        batch::Input::Grouped(input),
         &program.rules,
         program.lists.as_ref(),
         schema,
+        listing,
         stop,
     )?;
-    drop(start);
-    let classes = &closure.classes;
-    if program.store_representatives {
-        // The closure as it is, and each identity's place in its class. A fact asserted
-        // in some graph needs no inferred copy unless its terms have identities (the
-        // default graph's reads expand only what it holds).
-        let touches = |fact: &Triple| fact.iter().any(|&term| classes.class_of(term).is_some());
-        let mut derived: Vec<Triple> = closure
-            .facts
-            .par_iter()
-            .copied()
-            .filter(|fact| touches(fact) || asserted.binary_search(fact).is_err())
+    if program.store_representatives && !result.classes.is_empty() {
+        let classes = &result.classes;
+        let members: Vec<Triple> = classes
+            .classes()
+            .flat_map(|(representative, members)| {
+                members
+                    .iter()
+                    .filter(move |&&member| member != representative)
+                    .map(move |&member| [member, same_as, representative])
+            })
             .collect();
-        derived.extend(classes.classes().flat_map(|(representative, members)| {
-            members
-                .iter()
-                .filter(move |&&member| member != representative)
-                .map(move |&member| [member, same_as, representative])
-        }));
-        derived.par_sort_unstable();
-        derived.dedup();
-        return Ok(batch::Materialisation {
-            derived,
-            violations: closure.violations,
-            diagnostics: closure.diagnostics,
-            rounds: closure.rounds,
-            ..batch::Materialisation::default()
-        });
+        result.derived.extend(members);
+        result.derived.par_sort_unstable();
+        result.derived.dedup();
     }
-    let mut derived: Vec<Triple> = closure
-        .facts
-        .par_iter()
-        .flat_map_iter(|&fact| {
-            let [s, p, o] = fact;
-            match classes.class_of(s).is_none()
-                && classes.class_of(p).is_none()
-                && classes.class_of(o).is_none()
-            {
-                true => vec![fact],
-                false => classes.expand(fact),
-            }
-        })
-        .filter(|fact| asserted.binary_search(fact).is_err())
-        .collect();
-    derived.par_sort_unstable();
-    derived.dedup();
-    Ok(batch::Materialisation {
-        derived,
-        violations: closure.violations,
-        diagnostics: closure.diagnostics,
-        rounds: closure.rounds,
-        ..batch::Materialisation::default()
-    })
+    Ok(result)
 }
 
 /// Equality by representatives against replication on the asserted data of `snapshot`
