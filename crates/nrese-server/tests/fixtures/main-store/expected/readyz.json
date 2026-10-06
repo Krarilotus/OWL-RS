@@ -1,0 +1,1 @@
+{"status":"ready","consistency":"consistent","violations":null,"revision":4,"quad_count":42,"named_graph_count":2,"ontology_path":null,"deployment_posture":"internal-authenticated","store_mode":"on-disk","durability":"durable","reasoning_mode":"owl2-rl","reasoning_profile":"nrese-v2","reasoning_read_model":"materialised","reasoning_semantic_tier":"owl2-rl"}

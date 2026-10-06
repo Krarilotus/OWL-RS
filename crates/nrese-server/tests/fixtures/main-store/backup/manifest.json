@@ -1,0 +1,11 @@
+{
+  "format": "nrese-checkpoint",
+  "file": "checkpoint-00000000000000000004.nck",
+  "revision": 4,
+  "quads": 42,
+  "inferred": 88,
+  "bytes": 14308,
+  "sha256": "b75a010c7fd61a6d2fd26c0cc9b867b26fa9b78c521ed14156a37dd516f6558a",
+  "created_unix": 1791301808,
+  "nrese_version": "0.1.0"
+}
