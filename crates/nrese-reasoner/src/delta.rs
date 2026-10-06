@@ -225,6 +225,8 @@ pub fn update_until<B: Base + ?Sized>(
     cache: Option<&GroundProgram>,
     stop: Stop<'_>,
 ) -> Result<Update, Interrupted> {
+    // The process's memory limit stops it too, whatever the caller polls.
+    let stop: Stop<'_> = &|| stop() || super::eval::over_memory_limit();
     let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
     let mut result = Update::default();
     let mut clock = std::time::Instant::now();
