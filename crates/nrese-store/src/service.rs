@@ -380,6 +380,19 @@ impl StoreService {
         &self.dl
     }
 
+    /// The `owl2-dl` mode's bounds at the latest revision ([`crate::dl::bounds`]): the
+    /// upper bound U1 built afresh if it doesn't describe that revision.
+    pub fn dl_bounds(&self) -> crate::dl::BoundsReport {
+        crate::dl::bounds::report(self)
+    }
+
+    /// U1's facts beyond L, as maintained or (`afresh`) evaluated anew; for the
+    /// differential tests of its maintenance.
+    #[doc(hidden)]
+    pub fn dl_upper_facts(&self, afresh: bool) -> Option<Vec<[String; 3]>> {
+        crate::dl::bounds::upper_facts(self, afresh)
+    }
+
     pub fn execute_query(
         &self,
         request: &SparqlQueryRequest,

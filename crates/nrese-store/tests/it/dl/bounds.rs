@@ -1,0 +1,130 @@
+//! Step 4: the upper bound U1 in a stack of its own, maintained per commit. The
+//! maintained U1 is checked against U1 evaluated afresh after every commit of a random
+//! sequence (the design's rule: every incremental path against a clean rebuild), and
+//! each performance choice has its guard: an assertion-only commit updates U1 by the
+//! delta executor, a schema change rebuilds it, and U1 after an assertion commit proves
+//! consistency without a DL engine.
+
+use nrese_owl::fuzz::Rng;
+
+use super::{ask, insert, pipeline, update};
+
+/// A schema with what U1 approximates: existentials (Skolem constants), a union (split),
+/// disjointness (clashes), a transitive property, an inverse.
+const SCHEMA: &str = ":Person rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :parent ; \
+       owl:someValuesFrom :Person ] . \
+     :Person owl:equivalentClass [ owl:unionOf ( :Man :Woman ) ] . \
+     :Man owl:disjointWith :Woman . \
+     :ancestor a owl:TransitiveProperty . :parent rdfs:subPropertyOf :ancestor . \
+     :child owl:inverseOf :parent . \
+     :Parent owl:equivalentClass [ a owl:Restriction ; owl:onProperty :child ; \
+       owl:someValuesFrom owl:Thing ] .";
+
+/// U1's facts with its own terms (Skolem constants, fresh classes) as one name: their
+/// numbering follows the clauses', which assertions read with the ontology shift. The
+/// count of each of U1's own terms' facts is kept, so a lost or extra one shows.
+fn canonical(facts: &[[String; 3]]) -> Vec<([String; 3], usize)> {
+    let mut out = std::collections::BTreeMap::new();
+    for fact in facts {
+        let key = fact.clone().map(|t| match t.starts_with("<urn:nrese:u1:") {
+            true => "<urn:nrese:u1:*>".to_owned(),
+            false => t,
+        });
+        *out.entry(key).or_insert(0) += 1;
+    }
+    out.into_iter().collect()
+}
+
+#[test]
+fn the_maintained_upper_bound_is_the_one_evaluated_afresh() {
+    let classes = ["Person", "Man", "Woman", "Parent"];
+    let properties = ["parent", "child", "ancestor"];
+    for seed in 0..6u64 {
+        let dl = super::pipeline_with(nrese_store::DlConfig {
+            consistency: nrese_store::DlConsistency::Off,
+            ..nrese_store::DlConfig::default()
+        });
+        insert(&dl, SCHEMA).expect("schema");
+        let mut rng = Rng::new(seed);
+        let mut asserted: Vec<String> = Vec::new();
+        for step in 0..12 {
+            let fact = if rng.one_in(2) {
+                format!(":i{} a :{} .", rng.below(5), classes[rng.below(4) as usize])
+            } else {
+                format!(
+                    ":i{} :{} :i{} .",
+                    rng.below(5),
+                    properties[rng.below(3) as usize],
+                    rng.below(5)
+                )
+            };
+            if !asserted.is_empty() && rng.one_in(3) {
+                let gone = asserted.remove(rng.below(asserted.len() as u64) as usize);
+                update(&dl, &format!("DELETE DATA {{ {gone} }}")).expect("delete");
+            } else {
+                insert(&dl, &fact).expect("insert");
+                asserted.push(fact);
+            }
+            let maintained = dl.store().dl_upper_facts(false).expect("U1");
+            let afresh = dl.store().dl_upper_facts(true).expect("U1 afresh");
+            assert_eq!(
+                canonical(&maintained),
+                canonical(&afresh),
+                "seed {seed}, step {step}"
+            );
+            assert_eq!(
+                dl.store().dl_bounds().last,
+                "delta",
+                "seed {seed}, step {step}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_upper_bound_is_never_visible_as_inferred_data() {
+    let dl = pipeline();
+    insert(&dl, &format!("{SCHEMA} :ann a :Person .")).expect("data");
+    let report = dl.store().dl_bounds();
+    assert!(report.unavailable.is_none(), "{report:?}");
+    assert!(report.upper_facts > 0, "U1 has facts beyond L: {report:?}");
+    // ann's parent is a Skolem constant in U1, never an answer and never a statement.
+    let result = dl
+        .store()
+        .execute_query_str("SELECT * { ?s ?p ?o }")
+        .expect("query");
+    let text = String::from_utf8(result.payload).expect("utf8");
+    assert!(!text.contains("urn:nrese:u1:"), "{text}");
+    assert!(!ask(&dl, ":ann :parent ?someone"));
+}
+
+#[test]
+fn assertion_commits_update_the_bound_by_delta_and_schema_commits_rebuild_it() {
+    let dl = pipeline();
+    insert(&dl, SCHEMA).expect("schema");
+    assert_eq!(dl.store().dl_bounds().last, "rebuilt");
+    // Not a Person (whom U1's split union would make a Man and a Woman, a clash).
+    insert(&dl, ":ann :parent :bob .").expect("an assertion");
+    assert_eq!(dl.store().dl_bounds().last, "delta");
+    // U1 proves the data consistent: no DL engine ran for the commit.
+    let status = dl.store().dl().status().expect("status");
+    assert_eq!(status.consistency.engine, "upper-bound");
+    assert_eq!(status.consistency.verdict.as_str(), "consistent");
+    insert(&dl, ":Parent rdfs:subClassOf :Human .").expect("a schema change");
+    assert_eq!(dl.store().dl_bounds().last, "rebuilt");
+    // A class U1 wasn't compiled for: rebuilt as well.
+    insert(&dl, ":bob a :Martian .").expect("new vocabulary");
+    assert_eq!(dl.store().dl_bounds().last, "rebuilt");
+}
+
+#[test]
+fn a_clash_in_the_upper_bound_sends_the_check_to_a_dl_engine() {
+    let dl = pipeline();
+    insert(&dl, SCHEMA).expect("schema");
+    // ann is a Person: U1 splits the union, making her a Man and a Woman, a clash; only
+    // the hypertableau can tell that a model exists.
+    insert(&dl, ":ann a :Person .").expect("consistent");
+    let status = dl.store().dl().status().expect("status");
+    assert_eq!(status.consistency.engine, "hypertableau");
+    assert_eq!(status.consistency.verdict.as_str(), "consistent");
+}

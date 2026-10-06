@@ -7,21 +7,26 @@
 //!   on commit.
 //! - [`classification`]: classification and realisation, kept per revision.
 //! - [`entailment`]: axiom entailment, reduced to consistency.
+//! - [`upper`]: the upper bound U1 in a stack of its own; [`bounds`]: U1 per revision,
+//!   maintained per commit, and the read view queries take.
 //!
 //! The mode is the reasoner's (`ReasoningMode::Owl2Dl`): its OWL 2 RL closure is the
 //! inferred stack, the lower bound L. What the store adds is switched on by the mutation
 //! pipeline that runs the mode ([`crate::StoreService::use_dl`]).
 
+pub(crate) mod bounds;
 pub(crate) mod classification;
 pub mod config;
 pub mod consistency;
 pub mod entailment;
 pub(crate) mod gate;
 pub(crate) mod source;
+pub mod upper;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub use bounds::BoundsReport;
 pub use config::{DlAnswers, DlConfig, DlConsistency};
 pub use consistency::{Checked, Verdict};
 
@@ -39,6 +44,7 @@ pub struct Dl {
     active: AtomicBool,
     status: Mutex<Option<DlStatus>>,
     pub(crate) classification: classification::Cache,
+    pub(crate) bounds: bounds::Bounds,
 }
 
 impl Dl {

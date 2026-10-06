@@ -65,12 +65,15 @@ pub(crate) fn budget(store: &StoreService, cancel: Option<Cancel>) -> Budget {
     }
 }
 
-/// Checks the state `tx` would commit. O(asserted statements) for reading the ontology,
-/// plus the engine's work.
+/// Checks the state `tx` would commit. Where U1 after the commit proves it consistent
+/// ([`super::bounds::Preparation`]), nothing more runs: the cost of the U1's change.
+/// Otherwise O(asserted statements) for reading the ontology (unless the preparation
+/// read it), plus the engine's work.
 pub(crate) fn check_commit(
     store: &StoreService,
     tx: &Transaction<'_>,
     cancelled: &(dyn Fn() -> bool + Sync),
+    preparation: &mut super::bounds::Preparation,
 ) -> Gate {
     if store.config().dl.consistency == DlConsistency::Off {
         return Gate {
@@ -82,8 +85,23 @@ pub(crate) fn check_commit(
             reject: None,
         };
     }
-    source::intern_vocabulary(tx);
-    let ontology = source::read_pending(tx);
+    if preparation.proves_consistency {
+        return Gate {
+            checked: Checked {
+                verdict: Verdict::Consistent,
+                engine: "upper-bound",
+                elapsed: Duration::ZERO,
+            },
+            reject: None,
+        };
+    }
+    let ontology = match preparation.ontology.take() {
+        Some(ontology) => ontology,
+        None => {
+            source::intern_vocabulary(tx);
+            source::read_pending(tx)
+        }
+    };
     let checked = cancellable(cancelled, |cancel| {
         consistency::check(&ontology, &budget(store, Some(cancel)))
     });
