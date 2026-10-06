@@ -57,6 +57,38 @@ impl Engine<'_> {
         out
     }
 
+    /// Why merging `a` and `b` would clash at once (the dependencies of the facts that
+    /// clash), if it would: a concept of one and its negation at the other, or two
+    /// concepts no node may have together ([`super::program::Program::disjoint`]). Such
+    /// a merge is no alternative of the ≤-rule: trying it would only fail.
+    fn unmergeable(&mut self, a: u32, b: u32) -> Option<DepSetId> {
+        let la: Vec<(u32, DepSetId)> = self.g.labels(a).map(|f| (f.concept, f.dep)).collect();
+        let lb: Vec<(u32, DepSetId)> = self.g.labels(b).map(|f| (f.concept, f.dep)).collect();
+        for &(c, dc) in &la {
+            if let Some(i) = self.g.negative(b, c) {
+                let d = self.g.negatives[i as usize].dep;
+                return Some(self.deps.union(dc, d));
+            }
+        }
+        for &(c, dc) in &lb {
+            if let Some(i) = self.g.negative(a, c) {
+                let d = self.g.negatives[i as usize].dep;
+                return Some(self.deps.union(dc, d));
+            }
+        }
+        if self.p.disjoint.is_empty() {
+            return None;
+        }
+        for &(c, dc) in &la {
+            for &(e, de) in &lb {
+                if self.p.disjoint.contains(&(c, e)) {
+                    return Some(self.deps.union(dc, de));
+                }
+            }
+        }
+        None
+    }
+
     /// Whether `k` of `candidates` are pairwise unequal.
     fn distinct(&self, candidates: &[u32], k: usize, chosen: &mut Vec<u32>, from: usize) -> bool {
         if chosen.len() == k {
@@ -249,6 +281,14 @@ impl Engine<'_> {
                             Some(k) => {
                                 let d = self.g.inequalities[k as usize].dep;
                                 premise = self.deps.union(premise, d);
+                            }
+                            None if self.config.merge_filter => {
+                                // A merge that would clash at once is no alternative: its
+                                // clash's reasons join the premise, as an inequality's do.
+                                match self.unmergeable(a, b) {
+                                    Some(d) => premise = self.deps.union(premise, d),
+                                    None => alternatives.push(Lit::Equal(a, b, annot)),
+                                }
                             }
                             None => alternatives.push(Lit::Equal(a, b, annot)),
                         }

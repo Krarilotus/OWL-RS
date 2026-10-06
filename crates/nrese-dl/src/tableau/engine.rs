@@ -127,6 +127,8 @@ pub struct Engine<'a> {
     pub data_approximate: Option<String>,
     /// The root the test's concepts were asserted on (`NONE`: no test).
     pub probe: u32,
+    /// Per clause: how many clashes depended on a choice of it ([`Config::conflict_order`]).
+    pub activity: Vec<u32>,
     /// Branch levels at or below this belong to a base the run was resumed from
     /// ([`super::probe::Base`]): a backtrack that would go there stops the run instead
     /// (`GaveUp` with [`super::search::FLOOR`]).
@@ -156,6 +158,7 @@ impl<'a> Engine<'a> {
             theory: crate::datatypes::DatatypeTheory::default(),
             data_approximate: None,
             probe: NONE,
+            activity: Vec::new(),
             floor: 0,
         }
     }

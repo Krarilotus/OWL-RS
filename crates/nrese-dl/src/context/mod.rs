@@ -13,7 +13,8 @@
 //!   made Horn by renaming fresh names where that is possible ([`horn`]), or the reason
 //!   the Horn stage gives up ([`Unsupported`]);
 //! - [`state`]: a context's clauses, indexes and redundancy elimination;
-//! - [`rules`]: the rules on one context, [`links`] those over links between contexts;
+//! - [`rules`]: the rules on one context, [`links`] those over links between contexts,
+//!   [`equality`] the merges of functional properties' neighbours;
 //! - [`engine`]: the contexts, created on demand, and their parallel saturation (ELK's
 //!   activation scheme on rayon);
 //! - [`abox`]: consistency of assertions (no nominals): individuals' contexts and the
@@ -27,16 +28,18 @@ pub mod canonical;
 pub mod classify;
 pub mod compile;
 pub mod engine;
+pub mod equality;
 pub mod horn;
 pub mod links;
 pub mod profile;
 pub mod program;
 pub mod rules;
+mod settrie;
 pub mod state;
 pub mod unsupported;
 
 pub use classify::{
-    Classification, Options, Saturated, classify, saturate, saturate_normalised, signature,
+    Classification, Local, Options, Saturated, classify, saturate, saturate_normalised, signature,
 };
 pub use compile::Unsupported;
 pub use engine::{Budget, Strategy};
