@@ -36,8 +36,7 @@ use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
 use crate::index::{IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple, Permutation, QuadPattern};
-use crate::term::TermId;
-use crate::term::pending::{Adopted, Pending};
+use crate::term::pending::Pending;
 
 /// Batches copied between releases of their memory ([`crate::memory`]): about 256 MiB at
 /// the stores' batch size.
@@ -210,6 +209,10 @@ impl<'e> BulkLoad<'e> {
         let mut spilled = spilled;
         // The batches into one array, each freed once copied (not all held twice).
         let batches = batches.into_inner().batches;
+        // What the threads freed while interning (the shards' arrays outgrown by doubling,
+        // freed by whichever thread grew them) goes back before the largest allocation:
+        // without, LUBM 1000's committed peak was 0.9 GB higher, at this copy.
+        crate::memory::release_all();
         let mut quads: Vec<EncodedQuad> = Vec::with_capacity(batches.iter().map(Vec::len).sum());
         // What the copied batches held stays with the threads that interned them until
         // released: without, the batches would count twice at the peak.
@@ -225,9 +228,9 @@ impl<'e> BulkLoad<'e> {
         let mut renumbered = Ok(());
         shared.dictionary.adopt_pending(pending, |adopted| {
             nrese_exec::heap::phase("load: renumbering");
-            remap(adopted, &mut quads);
+            adopted.renumber(&mut quads);
             if let Some(spill) = spilled.as_mut() {
-                renumbered = spill.sort_raw(&|quads: &mut [EncodedQuad]| remap(adopted, quads));
+                renumbered = spill.sort_raw(&|quads: &mut [EncodedQuad]| adopted.renumber(quads));
             }
         });
         renumbered?;
@@ -336,22 +339,6 @@ impl<'e> BulkLoad<'e> {
         engine.after_commit(0);
         Ok(summary)
     }
-}
-
-/// `quads` with their provisional ids replaced by the ids `adopted` numbered them to.
-fn remap(adopted: &Adopted, quads: &mut [EncodedQuad]) {
-    let id = |id: TermId| match id.kind().is_dictionary() {
-        true => TermId::new(id.kind(), adopted.remap(id.payload())),
-        false => id,
-    };
-    quads.par_iter_mut().for_each(|quad| {
-        *quad = EncodedQuad::new(
-            id(quad.subject),
-            id(quad.predicate),
-            id(quad.object),
-            id(quad.graph),
-        );
-    });
 }
 
 /// Whether a load in `mode` publishes a version holding nothing but the loaded quads,

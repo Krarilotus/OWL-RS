@@ -1084,11 +1084,13 @@ impl Dictionary {
                 continue;
             }
             for (s, shard) in adopted.shards.iter().enumerate() {
-                let ids_of = adopted.ids(s);
                 ids.extend(
                     super::strings::matching(&shard.bytes, &shard.ends[..], 0, u64::MAX, test)
                         .into_iter()
-                        .map(|found| TermId::new(found.kind(), ids_of[found.payload() as usize]))
+                        .map(|found| {
+                            let id = adopted.id_of(s, found.payload() as usize);
+                            TermId::new(found.kind(), id)
+                        })
                         .filter(|id| id.payload() < limit),
                 );
             }
@@ -1336,7 +1338,7 @@ impl Dictionary {
     /// it was interned. Readers go on meanwhile; writers wait.
     pub(crate) fn adopt_pending(&self, pending: Pending, remap: impl FnOnce(&Adopted)) {
         if pending.is_empty() {
-            remap(&Pending::default().number(0, |_, _| None));
+            remap(&Adopted::empty(self.len()));
             return;
         }
         let inner = self.inner.upgradable_read();
