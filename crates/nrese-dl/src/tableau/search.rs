@@ -124,6 +124,9 @@ impl Engine<'_> {
 
     /// Runs to a model, a refutation or a stop.
     pub fn run(&mut self, seed: &Seed) -> End {
+        if self.refuted() {
+            return End::Refuted;
+        }
         if let Err(stop) = self.init(seed) {
             return match stop {
                 Stop::Clash(_) => End::Refuted,
@@ -136,8 +139,16 @@ impl Engine<'_> {
     /// Adds a test to a state a run left (a base, [`super::probe::Base`]) and runs on:
     /// the base's choices stay below [`Engine::floor`].
     pub fn resume(&mut self, seed: &Seed) -> End {
+        if self.refuted() {
+            return End::Refuted;
+        }
         let first = self.init_probe(seed).err();
         self.search(first)
+    }
+
+    /// The class sizes refute the program: no model, whatever the test.
+    fn refuted(&self) -> bool {
+        self.config.counting && self.p.refuted.is_some()
     }
 
     /// The search from the state as it is (`first`: a stop already met).
