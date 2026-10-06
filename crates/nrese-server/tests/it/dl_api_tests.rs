@@ -41,9 +41,8 @@ async fn answers_carry_their_status() -> Result<(), Box<dyn std::error::Error>> 
     let response = app.clone().oneshot(get(query, "")?).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let headers = response.headers().clone();
-    assert_eq!(headers["nrese-completeness"], "complete");
-    let bounds = headers["nrese-completeness-bounds"].to_str()?;
-    assert!(bounds.contains("lower=2; upper=3; proved=1"), "{bounds}");
+    let status = headers["nrese-completeness"].to_str()?;
+    assert_eq!(status, "complete; lower=2; upper=3; unresolved=0");
     let text = body_text(response).await?;
     assert!(text.contains("http://example.com/x") && text.contains("http://example.com/y"));
 
@@ -51,9 +50,9 @@ async fn answers_carry_their_status() -> Result<(), Box<dyn std::error::Error>> 
     let response = app.clone().oneshot(get(query, "&explain=true")?).await?;
     let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
     assert_eq!(json["completeness"]["status"], "complete");
-    assert_eq!(json["completeness"]["bounds"]["proved"], 1);
+    assert_eq!(json["completeness"]["bounds"]["lower"], 2);
     assert!(
-        json["completeness"]["paths"]
+        json["completeness"]["decided_by"]
             .as_array()
             .is_some_and(|p| p.contains(&serde_json::json!("exact-ground-entailment")))
     );
@@ -67,7 +66,8 @@ async fn answers_carry_their_status() -> Result<(), Box<dyn std::error::Error>> 
         .await?;
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let response = app.clone().oneshot(get(union, "")?).await?;
-    assert_eq!(response.headers()["nrese-completeness"], "sound-only");
+    let status = response.headers()["nrese-completeness"].to_str()?;
+    assert!(status.starts_with("sound-only; "), "{status}");
     // Why w is a D: not derived by the rules, explained by OWL 2 DL's axioms.
     let explain = serde_urlencoded::to_string([
         ("subj", "<http://example.com/w>"),

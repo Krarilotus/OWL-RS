@@ -195,7 +195,11 @@ fn main() {
 fn timed(
     pipeline: &MutationPipeline,
     text: &str,
-) -> (usize, Option<nrese_sparql::Completeness>, Duration) {
+) -> (
+    usize,
+    Option<(nrese_sparql::Completeness, nrese_store::DlDetail)>,
+    Duration,
+) {
     let store = pipeline.store();
     let prepared = store
         .prepare_query(&nrese_store::SparqlQueryRequest::all(text))
@@ -203,7 +207,7 @@ fn timed(
     let started = Instant::now();
     let mut out = Vec::new();
     let status = store
-        .run_query_reporting(&prepared, &nrese_store::CancellationToken::new(), &mut out)
+        .run_query_dl(&prepared, &nrese_store::CancellationToken::new(), &mut out)
         .expect("query runs");
     let elapsed = started.elapsed();
     let json: serde_json::Value = serde_json::from_slice(&out).unwrap_or_default();
@@ -245,7 +249,7 @@ fn compare_queries(dir: &str, stores: &[&MutationPipeline]) {
         }
         let [dl, rl] = times;
         let (label, paths) = status.map_or(("-".to_owned(), String::new()), |s| {
-            (s.as_str().to_owned(), s.paths.join(","))
+            (s.0.as_str().to_owned(), s.1.paths.join(","))
         });
         println!(
             "{name}	{}	{}	{label}	{paths}	{:.2}	{:.2}",

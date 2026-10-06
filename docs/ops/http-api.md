@@ -17,21 +17,27 @@ Use the combined URL for clients that take one endpoint address (RDF4J's SPARQL 
 - `POST` with `Content-Type: application/x-www-form-urlencoded` and a `query` field
 - `POST` with `Content-Type: application/sparql-query` and the query as the body
 
+Where the OWL 2 QL rewriting applies (`reasoner.ql_rewriting`), every answer carries the
+header `NRESE-Completeness`: `complete`, or `sound-only; reasons="ql: …"` when answers
+through anonymous individuals may be missing (an axiom outside OWL 2 QL meets them, a
+pattern reached a bound or runs without the rewriting; at most five reasons, the rest
+counted, non-ASCII characters escaped as `\u{…}`). Each reason starts with its source
+(`ql`); the same header carries the DL bounds' status (`lower=…; upper=…; unresolved=…`).
+The answers are never changed for it ([design](../design/ql-rewriting.md) §7).
+
 | Parameter | Meaning |
 |---|---|
 | `default-graph-uri`, `named-graph-uri` (repeatable) | The query's dataset; replaces its `FROM` clauses |
 | `infer=false` | Asserted statements only (the default reads asserted and inferred) |
-| `explain=true` | Run the query and return how it ran, as JSON: `executor`, `rewrites` (the rewrites that changed the query before it ran, in order: `triple-terms`, `join-groups`, `filter-pushdown`, `ask-limit`), `rows`, `micros`, and `steps` (one per operator: `depth`, `operator`, `detail`, `estimated_rows`, `rows`, `micros`) |
-| `explain=plan` | Return the plan the query would run as, without running it, as JSON: `executor`, `rewrites`, and `steps` (one per plan node from the top down: `depth`, `operator`, `detail`, `estimated_rows` from the store's statistics, `null` where unknown, as below a `SERVICE`) |
+| `explain=true` | Run the query and return how it ran, as JSON: `executor`, `rewrites` (the rewrites that changed the query before it ran, in order: `triple-terms`, `ql-tree-witness`, `ql-limit`, `join-groups`, `filter-pushdown`, `ask-limit`), `rows`, `micros`, `ql` (the OWL 2 QL rewriting, `null` where it doesn't apply: `completeness` (`complete` or `sound-only`), `sound`, `complete`, `reasons` (each `{source, text}`), `patterns`, `witnesses`, `branches`, `atoms`, `limits`; [design](../design/ql-rewriting.md)), `completeness` (the status below), and `steps` (one per operator: `depth`, `operator`, `detail`, `estimated_rows`, `rows`, `micros`) |
+| `explain=plan` | Return the plan the query would run as, without running it, as JSON: `executor`, `rewrites`, `ql`, `completeness`, and `steps` (one per plan node from the top down: `depth`, `operator`, `detail`, `estimated_rows` from the store's statistics, `null` where unknown, as below a `SERVICE`) |
 | `dl-answers` | Under `reasoner.mode = "owl2-dl"`: which answers this query asks for, over `dl.answers`: `certain-where-complete`, `sound` or `exact` (fails with 409 when the answers can't be proven complete). Anything else is a 400 |
 
-**Under `owl2-dl`, every answer carries its status** ([design](../design/owl2-dl.md) §8; [reasoning-semantics.md](../spec/reasoning-semantics.md)). Answers are always sound. The response headers say whether they are complete:
-- `nrese-completeness`: `complete` or `sound-only`;
-- `nrese-completeness-bounds`, where the query went through the bounds: `lower=…; upper=…; proved=…; refuted=…; unresolved=…` (answers in the lower bound; in the upper bound; candidates of the gap an exact service proved, which are returned, or refuted; and those neither, which are not returned).
+**Under `owl2-dl`, every answer carries its status** in the same `NRESE-Completeness` header ([design](../design/owl2-dl.md) §8; [reasoning-semantics.md](../spec/reasoning-semantics.md)). Answers are always sound. `complete`, or `sound-only; …; reasons="dl: …"`; where the query went through the bounds, with `lower=…; upper=…; unresolved=…` (answers in the lower bound; in the upper bound; candidates of the gap no exact service decided, which are not returned). A query with its status is computed in full before the first byte (the status is a header); one whose predicates are closed streams as usual. Inside a transaction, answers are the pending data's closure, `sound-only`.
 
-Under any other reasoning mode (a ruleset's closure), answers carry `nrese-completeness: sound-only`: the closure's, not every certain answer under OWL 2 DL; with reasoning disabled, and for `infer=false`, no status is sent.
+Under a ruleset's closure where the QL rewriting doesn't apply, answers carry `NRESE-Completeness: sound-only; reasons="rules: …"`: the closure's, not every certain answer under OWL 2 DL; with reasoning disabled, and for `infer=false`, no status is sent.
 
-`explain=true` and `explain=plan` carry the same status as `completeness`: `status`, `complete`, `sound`, `reasons` (why answers may be missing), `paths` (what decided: `closed-predicates`, `bounds-equal`, `exact-ground-entailment`, `exact-internalisable-cq`) and `bounds`; `null` outside `owl2-dl`. A query with its status is computed in full before the first byte (the status is a header); one whose predicates are closed streams as usual.
+`explain=true` and `explain=plan` carry the same status as `completeness` (`null` where no status is sent): `status`, `sound`, `complete`, `reasons` (each `{source, text}`), `bounds` (`lower`, `upper`, `unresolved`, or `null`) and `decided_by` (what decided under `owl2-dl`: `closed-predicates`, `bounds-equal`, `exact-ground-entailment`, `exact-internalisable-cq`).
 
 Other parameters are ignored, so clients that send their own (`queryLn`, `timeout`) work.
 

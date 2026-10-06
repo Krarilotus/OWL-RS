@@ -190,11 +190,11 @@ async fn a_replica_follows_its_primary() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// A query's body and its completeness headers.
+/// A query's body and its completeness header.
 async fn answered(
     app: axum::Router,
     query: &str,
-) -> Result<(String, Option<String>, Option<String>), Box<dyn std::error::Error>> {
+) -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
     let response = app
         .oneshot(
             Request::builder()
@@ -212,11 +212,8 @@ async fn answered(
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned)
     };
-    let (status, bounds) = (
-        header("nrese-completeness"),
-        header("nrese-completeness-bounds"),
-    );
-    Ok((body_text(response).await?, status, bounds))
+    let status = header("nrese-completeness");
+    Ok((body_text(response).await?, status))
 }
 
 /// Under `owl2-dl` a replica gives its primary's answers with the same status: it builds
@@ -297,12 +294,17 @@ async fn a_replica_gives_its_primarys_dl_answers() -> Result<(), Box<dyn std::er
         assert_eq!(got, want, "{query}");
         assert!(want.1.is_some(), "a status: {query}");
     }
-    let (text, status, _) = answered(
+    let (text, status) = answered(
         replica_app.clone(),
         &format!("{PREFIXES}SELECT ?x WHERE {{ ?x a ex:E }}"),
     )
     .await?;
-    assert_eq!(status.as_deref(), Some("complete"));
+    assert!(
+        status
+            .as_deref()
+            .is_some_and(|s| s == "complete" || s.starts_with("complete; ")),
+        "{status:?}"
+    );
     for x in ["x", "w", "y"] {
         assert!(text.contains(&format!("example.com/{x}")), "{text}");
     }

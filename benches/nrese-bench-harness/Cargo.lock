@@ -1116,6 +1116,7 @@ dependencies = [
  "md-5",
  "nrese-engine",
  "nrese-exec",
+ "nrese-owl",
  "nrese-rdf",
  "nrese-sparql-results",
  "nrese-sparql-syntax",

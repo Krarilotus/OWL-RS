@@ -11,6 +11,8 @@ license.workspace = true
 rayon = { workspace = true }
 nrese-engine = { path = "../nrese-engine" }
 nrese-exec = { path = "../nrese-exec" }
+# OWL 2 QL: the schema read from RDF and the tree-witness rewriting.
+nrese-owl = { path = "../nrese-owl" }
 nrese-xsd = { path = "../rdf/nrese-xsd" }
 regex = { workspace = true }
 # RDF terms and their XSD values.

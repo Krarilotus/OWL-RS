@@ -45,6 +45,11 @@ pub struct StoreConfig {
     /// Reasoning leaves out memberships in unnamed union classes that nothing consumes
     /// (`reasoner.unnamed_classes = "skip"`; work package W7).
     pub hide_unnamed_classes: bool,
+    /// OWL 2 QL answers through existentials by tree-witness rewriting
+    /// (`reasoner.ql_rewriting`, docs/design/ql-rewriting.md): `true` (`auto`, the default)
+    /// rewrites queries while the inferred stack is current under `owl2-ql` or `owl2-rl`;
+    /// `false` (`off`) never.
+    pub ql_rewriting: bool,
     /// Full materialisations with equality rules compute the closure over representatives
     /// of the `owl:sameAs` classes and expand it (`reasoner.equality = "representatives"`,
     /// the default) instead of copying every fact to every identity while computing it
@@ -187,6 +192,7 @@ impl StoreConfig {
             process_memory_bytes: default_process_memory_bytes(),
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
+            ql_rewriting: true,
             equality_by_representatives: true,
             equality_compact: false,
             equality_canonical_answers: false,
@@ -216,6 +222,7 @@ impl StoreConfig {
             process_memory_bytes: default_process_memory_bytes(),
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
+            ql_rewriting: true,
             equality_by_representatives: true,
             equality_compact: false,
             equality_canonical_answers: false,
