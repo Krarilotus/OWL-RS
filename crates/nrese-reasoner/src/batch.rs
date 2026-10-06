@@ -191,6 +191,11 @@ pub struct Counters {
     /// Lookups by object alone in relations kept without their object order (P1-F11:
     /// none).
     pub lookups_without_order: u64,
+    /// Per round: the complete bindings the rule jobs enumerated, each a candidate fact
+    /// per head atom (the joins' work).
+    pub bindings: Vec<u64>,
+    /// The bindings of all rounds by the name of the rule the jobs' instances come from.
+    pub bindings_by_rule: std::collections::BTreeMap<String, u64>,
 }
 
 /// The bytes the working set's runs hold (both orders, spare capacity included; a run
@@ -1384,7 +1389,7 @@ fn run(
         for rule in &program.rules[evaluated..] {
             jobs.extend(Job::full(&store, rule));
         }
-        let probes = Probes::default();
+        let probes = Probes::for_jobs(jobs.len());
         let keep = |fact| !store.contains(fact);
         candidates.extend(run_jobs_by_morsel(
             &store, &jobs, &keep, stop, &probes, &split,
@@ -1393,6 +1398,21 @@ fn run(
         counters.driver_bytes_copied += jobs.iter().map(Job::copied_bytes).sum::<usize>();
         counters.probes.push(probes.probes.into_inner());
         counters.unordered_probes += probes.unordered.into_inner();
+        let mut round = 0;
+        for (job, count) in jobs.iter().zip(probes.bindings) {
+            let count = count.into_inner();
+            round += count;
+            match counters.bindings_by_rule.get_mut(&job.rule.name) {
+                Some(total) => *total += count,
+                None if count > 0 => {
+                    counters
+                        .bindings_by_rule
+                        .insert(job.rule.name.clone(), count);
+                }
+                None => {}
+            }
+        }
+        counters.bindings.push(round);
         drop(jobs);
         check_stop()?;
         phases.joins += clock.elapsed();
