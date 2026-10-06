@@ -120,7 +120,8 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
         cancel: budget.cancel.clone(),
         ..tableau::Config::default()
     };
-    let outcome = tableau::consistency(ontology, &config);
+    // Island by island where the ABox splits (`nrese_dl::islands`).
+    let outcome = nrese_dl::islands::consistency(ontology, &config);
     let verdict = match outcome.answer {
         tableau::Answer::Consistent => Verdict::Consistent,
         tableau::Answer::Inconsistent => Verdict::Inconsistent,
