@@ -114,6 +114,62 @@ fn a_candidate_the_union_splits_into_is_refuted() {
     assert_eq!((b.refuted, b.unresolved), (2, 0), "x and w");
 }
 
+const COURSES: &str = ":Student rdfs:subClassOf [ a owl:Restriction ; \
+       owl:onProperty :takesCourse ; owl:someValuesFrom :Course ] . \
+     :Course rdfs:subClassOf :Work . \
+     :ann a :Student ; :takesCourse :c1 . :bob a :Student . :c1 a :Course .";
+
+/// U1's facts beyond L all name a Skolem constant (LUBM's case): where the query has a
+/// term or an answer variable at their ends, they give no answer, and L's answers are
+/// complete in one evaluation.
+#[test]
+fn a_gap_of_skolem_constants_only_costs_one_evaluation_where_no_answer_can_name_them() {
+    let dl = pipeline();
+    insert(&dl, COURSES).expect("data");
+    for (q, want) in [
+        ("SELECT ?x { ?x :takesCourse :c1 }", vec!["ann"]),
+        ("SELECT ?x ?y { ?x :takesCourse ?y }", vec!["ann"]),
+        ("SELECT ?x { ?x a :Course }", vec!["c1"]),
+        ("SELECT ?x { ?x a :Work }", vec!["c1"]),
+        (
+            "SELECT DISTINCT ?x ?y { { ?x :takesCourse ?y } UNION { ?y a :Work . ?x :takesCourse ?y } }",
+            vec!["ann"],
+        ),
+    ] {
+        let (rows, status) = query(&dl, q);
+        assert_eq!(rows, want, "{q}");
+        assert!(status.is_complete(), "{q}: {:?}", status.reasons());
+        assert_eq!(status.paths, ["skolem-only-gap"], "{q}");
+    }
+    // Where they can: the bounds and the exact services decide.
+    for (q, want) in [
+        // An existential variable: bob takes some course.
+        ("SELECT ?x { ?x :takesCourse ?y }", vec!["ann", "bob"]),
+        // A value computed from a Skolem constant is no Skolem constant.
+        (
+            "SELECT ?x ?y ?s { ?x :takesCourse ?y BIND(STR(?y) AS ?s) }",
+            vec!["ann"],
+        ),
+        // A path's inner nodes: bob takes some course, a Course and a Work.
+        (
+            "SELECT ?x ?w { ?x :takesCourse/rdf:type ?w }",
+            vec!["ann", "bob"],
+        ),
+        // An ASK's variables are all existential.
+        ("ASK { :bob :takesCourse ?y }", vec!["true"]),
+    ] {
+        let (mut rows, status) = query(&dl, q);
+        rows.dedup();
+        let mut want = want;
+        want.dedup();
+        assert_eq!(rows, want, "{q}");
+        assert!(
+            !status.paths.contains(&"skolem-only-gap"),
+            "{q}: {status:?}"
+        );
+    }
+}
+
 #[test]
 fn an_existential_answer_is_proved_by_rolling_up_the_query() {
     let dl = pipeline();
