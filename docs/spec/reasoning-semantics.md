@@ -4,7 +4,7 @@ This is the contract for what NRESE's reasoning computes, as implemented on 30 S
 
 ## Modes
 
-`reasoner.mode` / `NRESE_REASONING_MODE`: `disabled`, `rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql`, `owl2-rl` or `custom`. The profiles between `rdfs` and `owl2-rl` are the RDFS rules plus named OWL 2 RL rules, as GraphDB's rulesets of the same names are. User rules in Notation3 (`reasoner.rules`) are added to any of them, or are the whole program with `custom` (see "User rules" below).
+`reasoner.mode` / `NRESE_REASONING_MODE`: `disabled`, `rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql`, `owl2-rl`, `owl2-dl` or `custom`. The profiles between `rdfs` and `owl2-rl` are the RDFS rules plus named OWL 2 RL rules, as GraphDB's rulesets of the same names are. User rules in Notation3 (`reasoner.rules`) are added to any of them, or are the whole program with `custom` (see "User rules" below).
 
 | Mode | Rules |
 |---|---|
@@ -14,6 +14,7 @@ This is the contract for what NRESE's reasoning computes, as implemented on 30 S
 | `owl-horst` | `rdfs-plus` + cls-hv1/2, cls-svf1/2, cls-avf |
 | `owl2-ql` | prp-dom, prp-rng, prp-spo1, prp-eqp1/2, prp-inv1/2, prp-symp, cax-sco, cax-eqc1/2, cls-svf2, the schema rules scm-cls, sco, eqc1/2, op, dp, spo, eqp1/2, dom1/2, rng1/2, and the checks prp-asyp, prp-irp, prp-pdw, cls-nothing2, cax-dw. Existentials on the right of `SubClassOf` are not materialised (they would invent individuals); a query rewriter would answer them |
 | `owl2-rl` | below |
+| `owl2-dl` | the `owl2-rl` rules as the lower bound, and the OWL 2 DL engines: below |
 
 ### Unnamed union classes
 
@@ -61,7 +62,26 @@ This matches GraphDB's `rdfs` with *partialRDFS*. Full RDFS entailment is `rdfs-
 - Only storable facts are persisted. Commit-path reasoning reads persisted facts, so it doesn't see the dropped ones.
 - This only affects rules that would turn such triples back into storable facts, for example `owl:inverseOf` on a datatype property, which OWL 2 doesn't allow.
 
-**Completeness:** W3C states the conditions under which the RL/RDF rules are complete for OWL 2 RL ontologies. Datasets labelled EL, QL or DL are reasoned with these RL rules, and results are RL entailments, not EL/QL/DL reasoning.
+**Completeness:** W3C states the conditions under which the RL/RDF rules are complete for OWL 2 RL ontologies. Datasets labelled EL, QL or DL are reasoned with these RL rules, and results are RL entailments, not EL/QL/DL reasoning: every answer under a ruleset carries the status `sound-only` (the `nrese-completeness` header), saying it is the closure's. `owl2-dl` gives certain answers under OWL 2 DL.
+
+### `owl2-dl`: OWL 2 DL, answers with their completeness
+
+The OWL 2 Direct Semantics over the asserted statements of every graph, read as an OWL 2 ontology by the reverse RDF mapping ([design](../design/owl2-dl.md) §8). Every answer is **sound** and says whether it is **complete** (`complete` or `sound-only`, with the reasons, in the `nrese-completeness` headers and EXPLAIN); certain answers to conjunctive queries over OWL 2 DL have no known decision procedure, so the store answers through bounds and says what it knows.
+
+- **The lower bound L:** the `owl2-rl` closure (the inferred stack, maintained per commit as under `owl2-rl`), plus the class memberships the DL engines' taxonomy of the TBox adds (every member of `C` is a member of each superclass of `C`; the taxonomy is the TBox's alone, so its subsumptions hold whatever the assertions). L's facts are entailed.
+- **The upper bound U1:** PAGOdA's datalog strengthening of the ontology (Zhou et al., JAIR 2015, Definition 5.1): disjunctions split so that **every** disjunct is derived (choosing one would lose an answer the other gives where `⊥` blocks the first), existentials c-Skolemised to constants, `⊥` turned into a clash fact, evaluated over L and the data. For a consistent ontology it contains every certain answer of a conjunctive query (Theorem 5.5 (ii)); answers are therefore claimed complete only where consistency is proven. Maintained per commit by the delta executor beside the engine's stacks, never visible as data; U1's own terms (Skolem constants) are never answers.
+- **Consistency on commit:** a commit that makes consistent data inconsistent under OWL 2 DL is rejected (`owl2-dl-consistency`), decided by U1 where it proves consistency (no clash, every `⊥` checked), else by the context core (Horn ontologies) or the hypertableau. Data inconsistent before a commit is quarantined, not locked. An undecided check accepts the commit and leaves the status `unknown` (then no answer is complete). `dl.consistency = "off"` doesn't check.
+- **Queries** (everything reading the inferred statements):
+  1. a query whose predicates and classes have no fact in U1 beyond L is answered over L, complete, whatever its operators;
+  2. otherwise a monotone query (basic graph patterns, paths, joins, unions, filters, projection, `DISTINCT`, `ORDER BY`, `BIND`, `VALUES`) runs over L and over L ∪ U1; equal answers are complete;
+  3. the gap's candidates, for one basic graph pattern under filters over its answer variables, go to the exact services: each ground atom not in L by the DL engines (`ExactGroundEntailment`: its negation makes the ontology inconsistent), each tree of existential variables rolled up into a class expression with named terms as nominals (`ExactInternalisableCQ`). A candidate that a representative Skolem constant alone witnesses is never taken as an answer: it is proved as above, refuted, or left unresolved (a cycle through existential variables can't be rolled up). At most `dl.max_candidates` candidates within `dl.timeout`;
+  4. `sound-only` with the reason: unresolved candidates; a non-monotone operator (`OPTIONAL`, `MINUS`, `EXISTS`, aggregates, `LIMIT`/`OFFSET`, `GRAPH`, `SERVICE`) over predicates whose bounds differ; `CONSTRUCT` (answered over L); the schema vocabulary (`rdfs:subClassOf`, `owl:*` and the like: entailed schema statements aren't bounded; `/classification` has them) and variable predicates; a reader who sees part of the data; a query naming its dataset; U1 not available; consistency not proven; user rules (below). Session reads of pending changes carry no status.
+  5. `dl.answers` (and `dl-answers` per query): `certain-where-complete` (the default), `sound` (L alone), `exact` (409 when not complete).
+- **Classification and realisation** (`/classification`, `/realisation`) and **axiom entailment** (`StoreService::entails_dl`) by the DL engines, each saying whether it is complete; these run in every mode.
+
+## User rules with `owl2-dl`
+
+OWL 2 DL with arbitrary rules is undecidable; rules whose variables bind to named individuals only (DL-safe rules) keep it decidable. User rules (`reasoner.rules`) run with `owl2-dl` as they do with `owl2-rl`: over the RL closure, their variables bound to the store's terms (never to the anonymous individuals OWL 2 DL entails), so their conclusions are entailed under the DL-safe reading. But they never see what only OWL 2 DL entails, and U1 doesn't apply them: a conclusion drawn from such a fact is in neither bound. So with user rules, **no answer is claimed complete** (the reason names them); answers stay sound, and the DL engines' proofs of candidates still hold (more axioms only add entailments).
 
 ## Graph scope
 
@@ -114,6 +134,6 @@ Startup skips rematerialisation only if the ruleset and the fingerprint match. A
 | `?x log:equalTo ?y` | the two are one (a variable takes the other's place) |
 | plain triples | facts that hold whatever the data, never retracted |
 
-The rules' name in the materialisation state and on `/version` is `custom:<file>` (`owl2-rl+custom:<file>` when added to a ruleset). Its fingerprint covers the file's text, so a changed file rebuilds the closure.
+Under `owl2-dl`, see "User rules with `owl2-dl`" above. The rules' name in the materialisation state and on `/version` is `custom:<file>` (`owl2-rl+custom:<file>` when added to a ruleset). Its fingerprint covers the file's text, so a changed file rebuilds the closure.
 
 Not supported, with a startup error naming the rule: other builtins (`math:`, `string:`, `list:`, `time:`, and the rest of `log:`), blank nodes in conclusions (existentials), formulas as terms and rules inside formulas. W3C N3 Community Group reasoner tests: all 13 within this scope pass (`crates/nrese-reasoner/tests/w3c_n3_reasoner`). Of the other 76, 49 use cwm options other than "rules to a fixpoint, then the data", 13 need builtins, and the rest need formulas or generalised triples.
