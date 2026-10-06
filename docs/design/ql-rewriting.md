@@ -79,8 +79,9 @@ only:
 - the class memberships the closure lacks: those only an existential gives (`A ⊑ ∃R`,
   `∃R ⊑ B`: `A ⊑ B`, which no RL rule derives), and those of QL inclusions the ruleset
   doesn't apply (intersections on the right and unions on the left under `owl2-ql`, whose
-  ruleset has no list rules; inclusions through inverse expressions); each class atom
-  gets them as alternatives.
+  ruleset has no list rules); each class atom gets them as alternatives. Inclusions
+  through inverse expressions (`[owl:inverseOf p]`) both rulesets apply, their facts
+  being generalised triples (`inclusions_through_inverse_expressions_are_materialised`).
 
 Alternatives the closure already implies are dropped: `B` is left out when another
 alternative (or the atom itself) follows from it by what the ruleset materialises
@@ -232,3 +233,64 @@ silently. The test found two bugs on the way: chains weren't read from the store
 schema, and a transitive property hid that its inverse was inverse functional. The
 detection is conservative: 15,953 queries said `sound-only` and missed nothing (98 % of
 those flagged), most of them because a functional property makes every term suspect.
+
+## 8. The printer: rewritten queries as standard SPARQL 1.1
+
+For the comparison with stores without reasoning (the protocol's QL line), a query is
+printed as standard SPARQL 1.1 that answers, on a store holding the same asserted
+statements (the schema included) and nothing inferred, as NRESE answers it under `owl2-rl`
+with the rewriting on: the closure's matches plus the tree witnesses, the same rows as bags
+and as sets.
+
+**Entries.** `nrese_sparql::ql::print(view, query, form)` returns `Printed::Query { text,
+completeness }` or `Printed::NotExpressible(reasons)`; `StoreService::print_query(text,
+form)` on a store's snapshot; on the command line `nrese-server print-query [--form
+paths|values] [--schema FILE]... (QUERY | --file PATH)` against the configured store, or
+with `--schema` against those files alone (exit status 2 and the reasons on standard error
+when not expressible). `crates/nrese-store/examples/ql_print_check.rs` prints a query
+directory in both forms, runs the printed queries on a store without reasoning and
+compares the rows with NRESE's, writing the printed queries with `--out`.
+
+**What is written.** The query is rewritten (§2) and each atom of a basic graph pattern
+replaced by what makes it hold in the closure, as a `SELECT DISTINCT` subquery over the
+atom's variables (the closure holds each statement once, so its matches stay bags of the
+right size). Only the inclusions the materialisation applies (the *base* ones, §2) go into
+an atom; what the others give comes from the rewriting's own branch, once, as in NRESE:
+- a property: its sub-properties, inverses as `^p`, a transitive one as `(…)+`, a chain as
+  `p/q`;
+- a class: the classes below it, the existentials below it (`?x p ?fresh`), and the left
+  sides of RL rules concluding it, unfolded (intersections as joins, qualified existentials
+  and `hasValue` as edges, unions, enumerations as `VALUES`);
+- the headline form (`paths`) reaches the hierarchy through the schema statements:
+  `rdf:type/(rdfs:subClassOf|owl:equivalentClass|^owl:equivalentClass|owl:intersectionOf/rdf:rest*/rdf:first)*`,
+  with the classes the closure puts below that the path doesn't reach listed; the secondary
+  form (`values`) lists every class below in `VALUES` and property alternatives
+  enumerated, computed from NRESE's hierarchy;
+- an empty projection (a pattern without answer variables) as `{ FILTER EXISTS { … } }`,
+  since `SELECT DISTINCT *` would keep every variable.
+
+**Not expressible, said and never approximated:** equality (`owl:sameAs` in the data,
+functional and inverse functional properties, keys, maximum cardinalities, same
+individuals), `allValuesFrom`, `hasValue` and `hasSelf` on the right, reflexive
+properties, recursive chains and class definitions (an RL rule through its own conclusion
+at another individual), a variable predicate or class, the schema vocabulary in a query,
+property paths over inferred properties, complex class assertions. NRESE's own status goes
+with a printed query (`# NRESE completeness: …` on the command line): where NRESE says
+`sound-only` (§7), the printed query gives the same answers and says the same. DL answers
+(the `owl2-dl` bounds) aren't printed.
+
+**Tested** (`printed_queries_answer_on_a_store_without_reasoning_as_nrese_with_it`, in the
+gate): on the random pure and mixed cases of §6 and §7, every printed query in both forms,
+as bags and with `DISTINCT`, on a store without reasoning, gives NRESE's rows and status.
+On 6 October, 150 cases (the gate's): 300 pure queries printed (all of them) and 100 mixed,
+58 of them `sound-only` as NRESE's; the rest refused for equality (functional properties,
+`owl:sameAs`) or recursive chains. Two seeds of 1,000 cases: 4,000 pure and 711 mixed
+queries printed, no difference. The test found three things: the empty projection above;
+atoms expanded by every QL inclusion, which counted rows the rewriting adds once; and that
+the materialisation applies inclusions through inverse expressions (`[owl:inverseOf p]` in
+sub-properties, domains, ranges, restrictions: its facts are generalised triples), which
+the TBox had marked as not applied (harmless for the rewriting, which then added answers
+the closure had; now marked applied, the QL tests unchanged). LUBM(1)
+(`univ-bench.owl`, its 14 queries and the 6 of `lubm-ql`) and OWL2Bench-QL(1) (its 10):
+every query printed in both forms, the same rows as NRESE's on every one
+(`ql_print_check`).

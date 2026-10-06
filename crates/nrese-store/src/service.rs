@@ -526,6 +526,20 @@ impl StoreService {
         Some((budget.used(), budget.peak(), budget.limit()))
     }
 
+    /// `query` printed as standard SPARQL 1.1 for a store without reasoning that holds
+    /// this store's asserted statements (its schema included): answering as this store does
+    /// under `owl2-rl` with the QL rewriting on (docs/design/ql-rewriting.md §8), or why it
+    /// can't be written exactly. For benchmarks of stores without reasoning.
+    pub fn print_query(
+        &self,
+        query: &str,
+        form: nrese_sparql::ql::PrintForm,
+    ) -> StoreResult<nrese_sparql::ql::Printed> {
+        let query = nrese_sparql::compat::parse_query(query, None)?;
+        let snapshot = self.read_snapshot(None);
+        Ok(nrese_sparql::ql::print(&snapshot, &query, form)?)
+    }
+
     /// A query over every graph (the server's own work, tests).
     pub fn execute_query_str(&self, query: &str) -> StoreResult<SerializedQueryResult> {
         self.execute_query(&SparqlQueryRequest::new(query, crate::ReadScope::All))

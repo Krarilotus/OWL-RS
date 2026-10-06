@@ -14,6 +14,9 @@ use nrese_rdf::{NamedNodeRef, Term};
 use crate::GraphAccess;
 
 pub use nrese_owl::ql::{Closure, Limits};
+pub use print::{PrintForm, Printed, print};
+
+mod print;
 
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
