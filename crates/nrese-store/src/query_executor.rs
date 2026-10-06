@@ -15,9 +15,9 @@ use nrese_engine::ReadModel;
 use nrese_rdf::{GraphName, NamedNode, NamedOrBlankNode};
 use nrese_rdf_io::RdfSerializer;
 use nrese_sparql::{
-    CancellationToken, Explanation, PlannedQuery, QueryDatasetSpecification, QueryEvaluationError,
-    QueryOptions, QueryResults, ReadView, ResultsFormat, WriteResultsError, evaluate_query,
-    explain_query, plan_query, write_results,
+    CachedOutput, CancellationToken, Explanation, PlannedQuery, QueryDatasetSpecification,
+    QueryEvaluationError, QueryOptions, QueryResults, ReadView, ResultsFormat, WriteResultsError,
+    evaluate_query, explain_query, plan_query, write_results,
 };
 use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
 use nrese_sparql_syntax::Query;
@@ -56,6 +56,9 @@ pub(crate) struct StoreSettings {
     pub equality_canonical: bool,
     /// [`StoreConfig::equality_early_expansion`](crate::StoreConfig).
     pub equality_early_expansion: bool,
+    /// The results of query parts, shared by every query on a committed snapshot
+    /// ([`StoreConfig::query_cache_bytes`](crate::StoreConfig)).
+    pub result_cache: Option<std::sync::Arc<nrese_sparql::ResultCache>>,
     /// The QL rewriting, while the inferred stack is current under a ruleset that makes the
     /// data H-complete ([`StoreConfig::ql_rewriting`](crate::StoreConfig)).
     pub ql:
@@ -87,9 +90,8 @@ pub struct PreparedQuery {
     access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
     /// Who sent it, for the list of running queries.
     origin: Option<String>,
-    /// The repository's namespaces the query was parsed with, if it needed them (it used a
-    /// prefix it doesn't declare): part of its cache key.
-    implicit_prefixes: Option<crate::NamespaceMap>,
+    /// The name its result is pinned under in the result cache ([`Self::pin_as`]).
+    pin: Option<nrese_sparql::PinRequest>,
     /// Whether the results may use RDF 1.2 (triple terms): then they announce
     /// `version=1.2` ([`Self::announce_rdf12`]).
     rdf12: bool,
@@ -109,20 +111,19 @@ impl PreparedQuery {
         request: &SparqlQueryRequest,
         namespaces: Option<&crate::NamespaceMap>,
     ) -> StoreResult<Self> {
-        let (mut query, implicit_prefixes) =
-            match nrese_sparql::compat::parse_query(&request.query, None) {
-                Ok(query) => (query, None),
-                Err(error) => match namespaces.filter(|namespaces| !namespaces.is_empty()) {
-                    None => return Err(error.into()),
-                    Some(namespaces) => {
-                        match nrese_sparql::compat::parse_query(&request.query, Some(namespaces)) {
-                            Ok(query) => (query, Some(namespaces.clone())),
-                            // A mistake of its own: the error without the namespaces.
-                            Err(_) => return Err(error.into()),
-                        }
+        let mut query = match nrese_sparql::compat::parse_query(&request.query, None) {
+            Ok(query) => query,
+            Err(error) => match namespaces.filter(|namespaces| !namespaces.is_empty()) {
+                None => return Err(error.into()),
+                Some(namespaces) => {
+                    match nrese_sparql::compat::parse_query(&request.query, Some(namespaces)) {
+                        Ok(query) => query,
+                        // A mistake of its own: the error without the namespaces.
+                        Err(_) => return Err(error.into()),
                     }
-                },
-            };
+                }
+            },
+        };
         let mut default_graphs = request.default_graphs.clone();
         let from_protocol = pseudo_graph_strings(&mut default_graphs);
         let from_query = query_dataset(&mut query)
@@ -158,7 +159,7 @@ impl PreparedQuery {
             graph_format: request.graph_format,
             access: request.scope.access().cloned(),
             origin: None,
-            implicit_prefixes,
+            pin: None,
             rdf12: false,
             dl_answers: request.dl_answers,
         })
@@ -208,6 +209,15 @@ impl PreparedQuery {
         self.rdf12 = true;
     }
 
+    /// Pins the query's result in the result cache under `name` when it runs: kept while
+    /// the store doesn't change, and pinned again when it runs after a change.
+    pub fn pin_as(&mut self, name: impl Into<String>) {
+        self.pin = Some(nrese_sparql::PinRequest {
+            name: name.into(),
+            query: self.text.clone(),
+        });
+    }
+
     /// The query's text, as sent.
     pub fn text(&self) -> &str {
         &self.text
@@ -253,53 +263,6 @@ impl PreparedQuery {
     /// Which statements the query reads.
     pub fn read_model(&self) -> ReadModel {
         self.read_model
-    }
-
-    /// Everything the serialised result depends on besides the data: the query text, the
-    /// dataset parameters, the read model and the output formats.
-    pub(crate) fn cache_request(&self) -> String {
-        // The access too: users who may read different graphs get different answers; and
-        // the namespaces a query needed: the same text means another query under others.
-        format!(
-            "{}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}\u{0}{:?}",
-            self.text,
-            self.dataset,
-            self.read_model,
-            self.solutions_format,
-            self.graph_format,
-            self.access,
-            self.implicit_prefixes
-        )
-    }
-
-    /// Whether repeating the query on the same data may give another answer: it calls
-    /// `RAND`, `UUID`, `STRUUID`, `BNODE` or `NOW` (stable within one evaluation, not across
-    /// them), or reads a `SERVICE`, whose data may change without this store's revision.
-    /// Decided on the parsed query, so spacing (`RAND ()`) and words in strings or IRIs
-    /// don't fool it.
-    pub(crate) fn volatile(&self) -> bool {
-        use nrese_sparql_syntax::algebra::{Expression, Function, GraphPattern};
-        use nrese_sparql_syntax::visit::Node;
-        let pattern = match &self.query {
-            Query::Select { pattern, .. }
-            | Query::Ask { pattern, .. }
-            | Query::Describe { pattern, .. }
-            | Query::Construct { pattern, .. } => pattern,
-        };
-        pattern.find(&mut |node| {
-            matches!(
-                node,
-                Node::Pattern(GraphPattern::Service { .. })
-                    | Node::Expression(Expression::FunctionCall(
-                        Function::Rand
-                            | Function::Uuid
-                            | Function::StrUuid
-                            | Function::BNode
-                            | Function::Now,
-                        _,
-                    ))
-            )
-        })
     }
 
     pub fn kind(&self) -> QueryResultKind {
@@ -398,12 +361,17 @@ pub(crate) fn protocol_dataset(
 
 /// Evaluates `prepared` on `view` and writes the serialised results to `out` as they are
 /// produced. On error the output is incomplete and must be discarded by the caller.
+/// `context` is what the store's answer depends on beyond the query's options (the
+/// `owl2-dl` mode with its `dl-answers` option, the completeness status it reports): part
+/// of the key of the answer's bytes in the result cache. A part's rows don't depend on it
+/// (every path evaluates with the same options; the QL rewriting is in the algebra).
 pub(crate) fn run_query(
     view: &impl ReadView,
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
     out: impl Write,
+    context: &str,
 ) -> StoreResult<()> {
     let options = QueryOptions {
         dataset: prepared.dataset.clone(),
@@ -424,8 +392,74 @@ pub(crate) fn run_query(
         cross_chunk_rows: None,
         stream_rows: None,
         access: prepared.access.clone(),
+        result_cache: store.result_cache.clone(),
+        pin: prepared.pin.clone(),
         ql: store.ql(),
     };
+    // A repeated query's answer as written before, in this format; else written, and its
+    // bytes offered to the cache with the time writing them took (`nrese_sparql::cache`).
+    let mut out = out;
+    let slot = match nrese_sparql::cached_output(
+        view,
+        &prepared.query,
+        &options,
+        prepared.media_type(),
+        context,
+    ) {
+        CachedOutput::Hit(bytes) => return Ok(out.write_all(&bytes)?),
+        CachedOutput::Miss(slot) => slot,
+        CachedOutput::Off => return serialize(view, prepared, &options, cancellation, out),
+    };
+    let mut tee = Tee {
+        inner: out,
+        copy: Some(Vec::new()),
+        limit: slot.limit(),
+    };
+    // What the bytes save: this answer's evaluation, as far as the cache didn't answer
+    // its parts, and its serialisation (written at the end, on every core, for JSON).
+    let started = std::time::Instant::now();
+    serialize(view, prepared, &options, cancellation, &mut tee)?;
+    if let Some(copy) = tee.copy {
+        slot.offer(copy, started.elapsed());
+    }
+    Ok(())
+}
+
+/// A writer that forwards to `inner` and keeps a copy of what it writes up to `limit`
+/// bytes.
+struct Tee<W> {
+    inner: W,
+    copy: Option<Vec<u8>>,
+    limit: usize,
+}
+
+impl<W: Write> Write for Tee<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        if let Some(copy) = &mut self.copy {
+            if copy.len() + written > self.limit {
+                self.copy = None;
+            } else {
+                copy.extend_from_slice(&buf[..written]);
+            }
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Evaluates `prepared` on `view` with `options` and writes its serialised results to
+/// `out` as they are produced.
+fn serialize(
+    view: &impl ReadView,
+    prepared: &PreparedQuery,
+    options: &QueryOptions,
+    cancellation: &CancellationToken,
+    out: impl Write,
+) -> StoreResult<()> {
     let alive = || match cancellation.is_cancelled() {
         true => Err(StoreError::SparqlEvaluation(
             QueryEvaluationError::Cancelled,
@@ -443,14 +477,14 @@ pub(crate) fn run_query(
     if let Some(format) = format
         && matches!(prepared.query, Query::Select { .. } | Query::Ask { .. })
         && let Some(written) =
-            write_results(view, &prepared.query, &options, format, version, &mut out)
+            write_results(view, &prepared.query, options, format, version, &mut out)
     {
         return written.map_err(|error| match error {
             WriteResultsError::Evaluation(error) => StoreError::SparqlEvaluation(error),
             WriteResultsError::Io(error) => StoreError::Io(error),
         });
     }
-    match evaluate_query(view, &prepared.query, &options)? {
+    match evaluate_query(view, &prepared.query, options)? {
         QueryResults::Boolean(value) => {
             results_serializer(prepared, version).serialize_boolean_to_writer(out, value)?;
         }
@@ -625,6 +659,8 @@ fn explain_options(
         cross_chunk_rows: None,
         stream_rows: None,
         access: prepared.access.clone(),
+        result_cache: store.result_cache.clone(),
+        pin: prepared.pin.clone(),
         ql: store.ql(),
     }
 }

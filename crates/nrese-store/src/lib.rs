@@ -24,7 +24,6 @@ mod loader;
 pub mod mutation;
 pub mod namespaces;
 pub mod query;
-mod query_cache;
 mod query_executor;
 mod rdf_io;
 pub mod reasoning;
@@ -47,8 +46,8 @@ pub use backup::{
 pub use bulk_load::{BulkLoadReport, BulkLoadRequest, LoadProgress};
 pub use classification::{ClassificationReport, RealisationReport};
 pub use config::{
-    DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity, ShaclGate,
-    StoreConfig, StoreMode,
+    DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity,
+    QlRewritingMode, ShaclGate, StoreConfig, StoreMode,
 };
 pub use delta::MutationDeltaPreview;
 pub use dl::{DlAnswers, DlConfig, DlConsistency, DlDetail};
@@ -85,7 +84,6 @@ pub use query::{
     GraphResultFormat, QueryResultKind, SerializedQueryResult, SolutionsResultFormat,
     SparqlQueryRequest,
 };
-pub use query_cache::QueryCacheStats;
 pub use query_executor::PreparedQuery;
 pub use rdf_io::{convert_file, parse_payload, parse_payload_preserving_blank_nodes};
 pub use reasoning::{InferenceStep, MaterialisationReport, OntologyDiagnostic};

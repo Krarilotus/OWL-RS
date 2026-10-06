@@ -14,6 +14,9 @@ use nrese_rdf::{NamedNodeRef, Term};
 use crate::GraphAccess;
 
 pub use nrese_owl::ql::{Closure, Limits};
+pub use print::{PrintForm, Printed, print};
+
+mod print;
 
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
@@ -138,6 +141,12 @@ impl QlRewriting {
     /// What the closure it rewrites over applies.
     pub fn closure(&self) -> Closure {
         self.closure
+    }
+
+    /// What decides its rewritings besides the snapshot's TBox: the closure and the
+    /// bounds (part of the result cache's key of an answer).
+    pub(crate) fn fingerprint(&self) -> String {
+        format!("{:?} {:?}", self.closure, self.limits)
     }
 
     pub(crate) fn limits(&self) -> &Limits {

@@ -68,6 +68,8 @@ pub struct Tbox {
     base_down: Vec<Vec<u32>>,
     /// Per role, the roles it is included in (itself too).
     sup: HashMap<Role, HashSet<Role>>,
+    /// The same by the role inclusions the materialisation applies.
+    base_sup: HashMap<Role, HashSet<Role>>,
     reflexive: HashSet<Term>,
     data: HashSet<Term>,
     pub(crate) generators: Vec<Generator>,
@@ -242,6 +244,38 @@ impl Tbox {
                 .is_some_and(|id| ty.concepts.contains(&id))
     }
 
+    /// Every class and existential whose instances the materialisation makes instances of
+    /// `class` (`class` itself included): what a class atom reads over the closure, before
+    /// the rewriting adds what the other inclusions give.
+    pub fn entailing(&self, class: Term) -> Vec<Basic> {
+        let Some(id) = self.id(Basic::Class(class)) else {
+            return vec![Basic::Class(class)];
+        };
+        let mut out: Vec<Basic> = reach(&self.base_down, [id])
+            .into_iter()
+            .map(|b| self.basic(b))
+            .filter(|b| matches!(b, Basic::Class(_) | Basic::Exists(_)))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Every role the materialisation includes in `role` (`role` itself included),
+    /// inverses as inverses.
+    pub fn sub_roles(&self, role: Role) -> Vec<Role> {
+        let mut out: Vec<Role> = self
+            .base_sup
+            .iter()
+            .filter(|(_, sup)| sup.contains(&role))
+            .map(|(&sub, _)| sub)
+            .collect();
+        if !out.contains(&role) {
+            out.push(role);
+        }
+        out.sort();
+        out
+    }
+
     /// The basic concepts below `target` (itself included).
     pub(crate) fn below(&self, target: u32) -> Vec<u32> {
         reach(&self.down, [target])
@@ -404,34 +438,31 @@ impl Builder {
                 }
             }
             Axiom::SubObjectPropertyOf(chain, sup) if chain.len() == 1 => {
-                self.role(chain[0], *sup, named(chain[0]) && named(*sup));
+                self.role(chain[0], *sup, true);
             }
             Axiom::EquivalentObjectProperties(properties) => {
                 for &a in properties {
                     for &b in properties {
                         if a != b {
-                            self.role(a, b, named(a) && named(b));
+                            self.role(a, b, true);
                         }
                     }
                 }
             }
             Axiom::InverseObjectProperties(a, b) => {
-                let base = named(*a) && named(*b);
-                self.role(*a, b.inverse(), base);
-                self.role(b.inverse(), *a, base);
+                self.role(*a, b.inverse(), true);
+                self.role(b.inverse(), *a, true);
             }
             Axiom::ObjectPropertyDomain(property, class) => {
-                let base = named(*property);
                 let left = self.basic(Basic::Exists(*property));
-                self.superclass(o, left, *class, base);
+                self.superclass(o, left, *class, true);
             }
             Axiom::ObjectPropertyRange(property, class) => {
-                let base = named(*property);
                 let left = self.basic(Basic::Exists(property.inverse()));
-                self.superclass(o, left, *class, base);
+                self.superclass(o, left, *class, true);
             }
             Axiom::ObjectCharacteristic(Characteristic::Symmetric, property) => {
-                self.role(*property, property.inverse(), named(*property));
+                self.role(*property, property.inverse(), true);
             }
             Axiom::ObjectCharacteristic(Characteristic::Reflexive, property) => {
                 self.tbox.reflexive.insert(property.named());
@@ -459,9 +490,9 @@ impl Builder {
         }
     }
 
-    /// A role inclusion; `base` if the materialisation applies it: one stated between
-    /// named properties (`prp-spo1`, `prp-inv1/2`, `prp-symp`, `prp-eqp1/2`), not one
-    /// through an inverse expression.
+    /// A role inclusion; `base` if the materialisation applies it (`prp-spo1`,
+    /// `prp-inv1/2`, `prp-symp`, `prp-eqp1/2`): every one, through an inverse expression
+    /// too, since its facts are generalised triples (`x [owl:inverseOf p] y`).
     fn role(&mut self, sub: Role, sup: Role, base: bool) {
         self.roles.push((sub, sup, base));
     }
@@ -479,14 +510,18 @@ impl Builder {
             ClassExpr::Class(a) => vec![(self.basic(Basic::Class(*a)), true)],
             ClassExpr::Thing => vec![(self.basic(Basic::Thing), false)],
             ClassExpr::Some(property, filler) if matches!(o.class(*filler), ClassExpr::Thing) => {
-                vec![(self.basic(Basic::Exists(*property)), named(*property))]
+                vec![(self.basic(Basic::Exists(*property)), true)]
             }
             ClassExpr::Min(n, property, filler)
                 if *n >= 1 && matches!(o.class(*filler), ClassExpr::Thing) =>
             {
                 vec![(self.basic(Basic::Exists(*property)), false)]
             }
-            ClassExpr::DataSome(property, _) => {
+            // OWL 2 QL allows a data existential on the left over `rdfs:Literal` only: with
+            // another range, having some value isn't enough.
+            ClassExpr::DataSome(property, range)
+                if matches!(o.range(*range), crate::model::DataRange::Literal) =>
+            {
                 self.tbox.data.insert(*property);
                 vec![(self.basic(Basic::Exists(ObjProp::Named(*property))), false)]
             }
@@ -607,6 +642,7 @@ impl Builder {
                 self.include(from, to, base_sup.contains(&sigma));
             }
             self.tbox.sup.insert(rho, sup);
+            self.tbox.base_sup.insert(rho, base_sup);
         }
         // Generating axioms: `B ⊑ ∃ρ`, never applied by the materialisation.
         let mut types: HashMap<TypeKey, usize> = HashMap::new();
@@ -688,11 +724,6 @@ impl Builder {
             });
         self.tbox
     }
-}
-
-/// Whether a role is a property, not an inverse expression.
-fn named(role: Role) -> bool {
-    matches!(role, ObjProp::Named(_))
 }
 
 /// Roles that exist: data properties only as themselves.

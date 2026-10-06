@@ -13,11 +13,16 @@
 //! - [`query`] evaluates queries ([`evaluate_query`]) over id tables (`native`, the
 //!   execution core of D11)
 //! - [`update`] applies SPARQL Update requests ([`apply_update`])
+//! - [`cache`]: the results of query plan parts, shared by a store's queries
 
+pub mod cache;
 pub mod compat;
 pub mod completeness;
 pub mod dataset;
 pub mod plan;
+pub use cache::{
+    CachedOutput, OutputSlot, PinRequest, PinnedResult, ResultCache, ResultCacheStats,
+};
 pub use dataset::GraphAccess;
 mod native;
 pub mod ql;
@@ -49,7 +54,8 @@ pub use native::{ResultsFormat, geometry_literal};
 pub use nrese_exec::{BudgetExceeded, SharedBudget};
 pub use query::{
     Candidates, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryOptions, WriteResultsError,
-    evaluate_query, explain_query, plan_query, ql_report, runs_natively, write_results,
+    cached_output, evaluate_query, explain_query, plan_query, ql_report, runs_natively,
+    write_results,
 };
 pub use results::{
     CancellationToken, QueryDatasetSpecification, QueryEvaluationError, QueryResults,

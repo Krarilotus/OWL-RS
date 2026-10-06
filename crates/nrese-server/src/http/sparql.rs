@@ -164,6 +164,7 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
                 "estimated_rows": step.estimated_rows,
                 "rows": step.rows,
                 "micros": step.micros,
+                "cache": step.cache,
             })
         })
         .collect();
@@ -235,7 +236,7 @@ fn plan_json(planned: &nrese_store::PlannedQuery) -> serde_json::Value {
 
 /// Query errors caused by the request are 400s; a cancelled evaluation is a timeout;
 /// anything else is the server's fault.
-fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
+pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
     match error {
         // The policy deadline cancels a query, and so may an operator
         // (`DELETE /api/v1/repositories/{id}/queries/{query}`).

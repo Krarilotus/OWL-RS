@@ -165,6 +165,8 @@ pub struct RepresentativeClosure {
     /// Rounds of the last closure, and how many times classes merged.
     pub rounds: usize,
     pub merges: usize,
+    /// The times and work of every pass, summed (`passes` counts them).
+    pub phases: batch::Phases,
 }
 
 /// The `owl:sameAs` id of rules that do equality reasoning (`eq-rep-s`), if they do.
@@ -214,6 +216,7 @@ pub fn materialise_until(
             violations: result.violations,
             diagnostics: result.diagnostics,
             rounds: result.rounds,
+            phases: result.phases,
             ..RepresentativeClosure::default()
         });
     };
@@ -221,6 +224,7 @@ pub fn materialise_until(
     let mut classes = EqualityClasses::default();
     let mut facts: Vec<Triple> = input.to_vec();
     let mut merges = 0;
+    let mut phases = batch::Phases::default();
     loop {
         // Classes from the sameAs facts known so far.
         let pairs: Vec<(u64, u64)> = facts
@@ -241,8 +245,10 @@ pub fn materialise_until(
             violations,
             diagnostics,
             rounds,
+            phases: pass,
             ..
         } = batch::materialise_owned_until(rewritten.clone(), &rules, lists, schema, stop)?;
+        phases.add(&pass);
         let input_len = rewritten.len();
         let mut closure = rewritten;
         closure.extend(derived);
@@ -283,6 +289,7 @@ pub fn materialise_until(
                     diagnostics,
                     rounds,
                     merges,
+                    phases,
                 });
             }
         }
