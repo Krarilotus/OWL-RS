@@ -735,8 +735,10 @@ pub fn run_jobs<S: Source + ?Sized>(
     run_jobs_with(source, jobs, keep, false, stop, None)
 }
 
-/// How often [`run_jobs_counted`] asked `keep` (the membership probes), and how many of
-/// those asks came out of (predicate, subject, object) order within their morsel.
+/// How often [`run_jobs_by_morsel`] asked `keep` (the membership probes), how many of
+/// those asks came out of (predicate, subject, object) order within their morsel, and
+/// the complete bindings each job enumerated (the joins' work, §5.1 of the 6 October
+/// investigation; empty if not asked for, see [`Probes::for_jobs`]).
 #[derive(Debug, Default)]
 pub struct Probes {
     pub probes: std::sync::atomic::AtomicU64,
@@ -744,27 +746,51 @@ pub struct Probes {
     /// Head facts the bindings produced before each morsel's deduplication (one per
     /// binding and head): with the new facts, the bindings per derived fact.
     pub emitted: std::sync::atomic::AtomicU64,
+    pub bindings: Vec<std::sync::atomic::AtomicU64>,
+}
+
+impl Probes {
+    /// Counts with a binding counter for each of `jobs` jobs.
+    pub fn for_jobs(jobs: usize) -> Self {
+        Self {
+            bindings: (0..jobs).map(|_| Default::default()).collect(),
+            ..Self::default()
+        }
+    }
 }
 
 /// [`run_jobs`] by morsel: each morsel's facts, sorted by (predicate, subject, object) and
 /// distinct, are handed to `finish`, and its results come back in the morsels' order,
 /// not concatenated (a caller that regroups them needs no copy of all of them). Counts
-/// the probes into `probes` (once per morsel).
+/// the probes into `probes` (once per morsel). `rewrite`, if given, maps each derived
+/// fact before it is checked (equality by representatives: to its representatives).
 pub fn run_jobs_by_morsel<S: Source + ?Sized, T: Send>(
     source: &S,
     jobs: &[Job<'_>],
     keep: &(dyn Fn(Triple) -> bool + Sync),
+    rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)>,
     stop: Stop<'_>,
     probes: &Probes,
     finish: &(dyn Fn(Vec<Triple>) -> T + Sync),
 ) -> Vec<T> {
-    run_morsels(source, jobs, keep, false, stop, Some(probes), finish)
+    run_morsels(
+        source,
+        jobs,
+        keep,
+        false,
+        rewrite,
+        stop,
+        Some(probes),
+        finish,
+    )
 }
 
 /// [`run_jobs`] without circular derivations: those whose head is one of their own
-/// premises, such as `(?x type C) -> (?x type C)` from `C subClassOf C`. A well-founded
-/// proof never uses such a step, so overdeletion can skip them; it would otherwise
-/// cascade through every reflexive instance.
+/// premises under the binding, such as `(?x p ?x) -> (?x p ?x)` from a symmetric `p`, or
+/// transitivity with `?y = ?z`. A well-founded proof never uses such a step, so
+/// overdeletion can skip them; it would otherwise cascade through them. Instances that
+/// are circular under every binding (`(?x type C) -> (?x type C)` from `C subClassOf C`)
+/// aren't in a [`GroundProgram`] at all.
 pub fn run_jobs_acyclic<S: Source + ?Sized>(
     source: &S,
     jobs: &[Job<'_>],
@@ -782,14 +808,19 @@ fn run_jobs_with<S: Source + ?Sized>(
     stop: Stop<'_>,
     probes: Option<&Probes>,
 ) -> Vec<Triple> {
-    run_morsels(source, jobs, keep, acyclic, stop, probes, &|facts| facts).concat()
+    run_morsels(source, jobs, keep, acyclic, None, stop, probes, &|facts| {
+        facts
+    })
+    .concat()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_morsels<S: Source + ?Sized, T: Send>(
     source: &S,
     jobs: &[Job<'_>],
     keep: &(dyn Fn(Triple) -> bool + Sync),
     acyclic: bool,
+    rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)>,
     stop: Stop<'_>,
     probes: Option<&Probes>,
     finish: &(dyn Fn(Vec<Triple>) -> T + Sync),
@@ -814,7 +845,9 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                 return finish(Vec::new());
             }
             let mut out = Vec::new();
+            let mut enumerated = 0u64;
             job.run(source, range.clone(), &mut |bindings| {
+                enumerated += 1;
                 for head in heads {
                     let fact = instantiate_head(head, bindings);
                     let circular = acyclic
@@ -824,7 +857,7 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                             .iter()
                             .any(|atom| instantiate_head(atom, bindings) == fact);
                     if !circular {
-                        out.push(fact);
+                        out.push(rewrite.map_or(fact, |rewrite| rewrite(fact)));
                     }
                 }
             });
@@ -846,6 +879,9 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                 use std::sync::atomic::Ordering::Relaxed;
                 probes.probes.fetch_add(asked, Relaxed);
                 probes.unordered.fetch_add(unordered, Relaxed);
+                if let Some(count) = probes.bindings.get(*j) {
+                    count.fetch_add(enumerated, Relaxed);
+                }
                 probes.emitted.fetch_add(emitted, Relaxed);
             }
             finish(out)
@@ -925,6 +961,22 @@ pub fn transitive_predicate(rule: &Rule) -> Option<u64> {
         }
     }
     None
+}
+
+/// `rule` without the head atoms that are one of its body atoms; `None` if no head is
+/// left. Whenever the body holds, such a head's fact is already a premise: the tautology
+/// `A → A` that reflexive schema facts ground into (`C subClassOf C` gives
+/// `(?x type C) → (?x type C)` under `cax-sco`, `p subPropertyOf p` gives
+/// `(?x p ?y) → (?x p ?y)` under `prp-spo1`). Dropping it changes no closure and no
+/// well-founded proof, and saves re-deriving every type and property fact once more.
+fn without_tautologies(mut rule: Rule) -> Option<Rule> {
+    if let Head::Facts(heads) = &mut rule.head {
+        heads.retain(|head| !rule.body.contains(head));
+        if heads.is_empty() {
+            return None;
+        }
+    }
+    Some(rule)
 }
 
 /// Identity of a ground rule, for deduplication (the name doesn't matter).
@@ -1093,6 +1145,7 @@ impl GroundProgram {
             }
             None
         } else {
+            let rule = without_tautologies(rule)?;
             let key = rule_key(&rule);
             if let Some(&r) = self.known.get(&key) {
                 if self.premises[r] != premises {

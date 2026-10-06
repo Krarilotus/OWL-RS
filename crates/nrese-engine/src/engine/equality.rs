@@ -91,38 +91,19 @@ impl Classes {
             object: None,
             graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
         };
-        let mut parent: HashMap<u64, u64> = HashMap::new();
-        fn find(parent: &mut HashMap<u64, u64>, x: u64) -> u64 {
-            let mut x = x;
-            loop {
-                let p = *parent.get(&x).unwrap_or(&x);
-                if p == x {
-                    return x;
-                }
-                let grand = *parent.get(&p).unwrap_or(&p);
-                parent.insert(x, grand);
-                x = grand;
-            }
-        }
+        // The reasoner's union kernel (G7 of the investigation of 6 October 2026).
+        let mut union = nrese_exec::classes::Classes::default();
         for stack in Stack::ALL {
             for quad in version.stack(stack).scan(&pattern) {
                 let (a, b) = (quad.subject.raw(), quad.object.raw());
-                if a == b {
-                    continue;
-                }
-                let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-                if ra != rb {
-                    parent.insert(ra.max(rb), ra.min(rb));
-                    parent.entry(ra.min(rb)).or_insert(ra.min(rb));
+                if a != b {
+                    union.union(a, b);
                 }
             }
         }
-        let nodes: Vec<u64> = parent.keys().copied().collect();
-        let mut members: HashMap<u64, Vec<u64>> = HashMap::new();
-        for node in nodes {
-            let root = find(&mut parent, node);
-            members.entry(root).or_default().push(node);
-        }
+        let members = union
+            .classes()
+            .map(|(representative, members)| (representative, members.to_vec()));
         let mut classes = Self::default();
         for (_, mut identities) in members {
             if identities.len() < 2 {
