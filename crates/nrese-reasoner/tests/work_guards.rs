@@ -113,3 +113,16 @@ fn a_cascade_of_merges_costs_one_materialisation() {
         bindings(&plain)
     );
 }
+
+/// #10 of the investigation of 6 October 2026: a recent run that is the delta (shared,
+/// right after a fold) has no old part, so reading it as old checks nothing against the
+/// delta. On this input every old read of a recent run is such a read: no check (a
+/// binary search into the delta per pair before: 36 on 6 October; LUBM 100 854,105).
+#[test]
+fn old_reads_of_a_recent_run_that_is_the_delta_check_nothing() {
+    let (result, _) = materialise();
+    assert_eq!(
+        result.counters.old_checks, 0,
+        "pairs checked against the delta"
+    );
+}
