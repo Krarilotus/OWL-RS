@@ -289,7 +289,7 @@ Every error is an `application/problem+json` document (RFC 9457), whoever answer
 
 | URL | What |
 |---|---|
-| `/healthz`, `/readyz` | Liveness; readiness with revision, reasoning mode and consistency |
+| `/healthz`, `/readyz` | Liveness; readiness with revision, reasoning mode and consistency; under `owl2-dl` also `dl`: the consistency under OWL 2 DL as last checked (`consistent`, `inconsistent`, `unknown` with its `reason`), the `engine` that decided and the `revision` checked |
 | `/version` | Build, enabled surfaces, reasoning semantics |
 | `/dataset/service-description` | SPARQL service description (Turtle); it names every endpoint above |
 | `/dataset/info` | Statement and graph counts |
