@@ -14,6 +14,7 @@ pub(crate) mod hash;
 mod inline;
 pub(crate) mod offsets;
 pub(crate) mod order;
+pub(crate) mod pending;
 mod strings;
 pub mod text;
 pub mod vectors;
