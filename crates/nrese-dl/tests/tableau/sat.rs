@@ -3,7 +3,7 @@
 //! `T : {l₁, l₂, l₃}`. Variable `i` is true iff `plusᵢ = T`.
 
 use super::build::Build;
-use nrese_dl::tableau::{Answer, Config, consistency};
+use nrese_dl::tableau::{Answer, BRANCH_BUDGET, Config, consistency};
 use nrese_owl::{ClassExpr, Ontology, Term};
 
 /// The clauses of WebOnt-description-logic-501 (satisfiable: x2, x6, x7, x8 true, x1, x3,
@@ -106,7 +106,10 @@ fn configs() -> impl Iterator<Item = Config> {
         backjumping: bits & 2 != 0,
         anywhere_blocking: bits & 4 != 0,
         disjunctions_first: bits & 8 != 0,
-        timeout: Some(std::time::Duration::from_secs(2)),
+        // The work is bounded by branch points, not the clock (a loaded machine must not
+        // change an answer); the timeout is only a safety net.
+        max_branch_points: Some(200_000),
+        timeout: Some(std::time::Duration::from_secs(300)),
         max_nodes: 10_000,
         max_memory: 256 << 20,
         check_blocking: true,
@@ -116,7 +119,8 @@ fn configs() -> impl Iterator<Item = Config> {
 
 /// The right answer under every switch. With neither semantic branching nor backjumping
 /// the search thrashes on these (a failed `T ≈ l` is tried again by other routes): it may
-/// run out of time, never answer wrongly, and is left out where `thrashing` is false.
+/// run out of its branch-point budget, never answer wrongly, and is left out where
+/// `thrashing` is false.
 fn check(vars: u8, clauses: &[Vec<i8>], thrashing: bool) {
     let expected = if satisfiable(vars, clauses) {
         Answer::Consistent
@@ -130,7 +134,7 @@ fn check(vars: u8, clauses: &[Vec<i8>], thrashing: bool) {
             continue;
         }
         let got = consistency(&o, &config).answer;
-        let slow = plain && matches!(&got, Answer::GaveUp(why) if why.contains("time"));
+        let slow = plain && matches!(&got, Answer::GaveUp(why) if why.contains(BRANCH_BUDGET));
         assert!(
             got == expected || slow,
             "{clauses:?} under {config:?}: {got:?}, not {expected:?}"

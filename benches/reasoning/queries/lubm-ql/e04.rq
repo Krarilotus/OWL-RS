@@ -1,0 +1,4 @@
+# Graduate students taking a graduate course (GraduateStudent ⊑ ∃takesCourse.GraduateCourse)
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX ub: <http://www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#>
+SELECT DISTINCT ?x WHERE { ?x rdf:type ub:GraduateStudent . ?x ub:takesCourse ?c . ?c rdf:type ub:GraduateCourse }

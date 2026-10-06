@@ -11,6 +11,9 @@ nrese-engine = { path = "../nrese-engine" }
 # The process's memory and its limit (memory).
 nrese-exec = { path = "../nrese-exec" }
 nrese-reasoner = { path = "../nrese-reasoner" }
+# The owl2-dl mode: the OWL 2 structural model and the DL engines.
+nrese-owl = { path = "../nrese-owl" }
+nrese-dl = { path = "../nrese-dl" }
 nrese-shacl = { path = "../nrese-shacl" }
 nrese-sparql = { path = "../nrese-sparql" }
 nrese-rdf = { path = "../rdf/nrese-rdf" }

@@ -74,9 +74,17 @@ use nrese_store::{
 
 /// mimalloc, as in the server; `RUSTFLAGS="--cfg system_alloc"` measures the system allocator.
 /// With `--count-allocations` it also counts allocations and their bytes, per phase.
-#[cfg(not(system_alloc))]
+#[cfg(not(any(system_alloc, alloc_profile)))]
 #[global_allocator]
 static GLOBAL: Counting = Counting;
+
+/// `RUSTFLAGS="--cfg alloc_profile"`: mimalloc with every allocation counted, and a heap
+/// profile of `--reason` by phase (the bytes requested, not what the system commits; the
+/// counting slows parallel work, so time is measured without it).
+#[cfg(alloc_profile)]
+#[global_allocator]
+static GLOBAL: nrese_exec::heap::Counting<mimalloc::MiMalloc> =
+    nrese_exec::heap::Counting(mimalloc::MiMalloc);
 
 /// Whether allocations are counted (`--count-allocations`), and the counts.
 static COUNT_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
@@ -84,10 +92,10 @@ static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 /// mimalloc, counting allocations when asked (one relaxed load when not).
-#[cfg(not(system_alloc))]
+#[cfg(not(any(system_alloc, alloc_profile)))]
 struct Counting;
 
-#[cfg(not(system_alloc))]
+#[cfg(not(any(system_alloc, alloc_profile)))]
 impl Counting {
     fn count(bytes: usize) {
         if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
@@ -98,7 +106,7 @@ impl Counting {
 }
 
 // SAFETY: every call is passed on to mimalloc unchanged; counting has no other effect.
-#[cfg(not(system_alloc))]
+#[cfg(not(any(system_alloc, alloc_profile)))]
 unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         Self::count(layout.size());
@@ -463,6 +471,22 @@ fn explain(store: &StoreService, text: &str) {
         });
     match explained {
         Ok(explanation) => {
+            if let Some(ql) = &explanation.ql {
+                println!(
+                    "    ql: {} patterns, {} witnesses, {} branches, {} atoms, limits {:?}, {} {:?}",
+                    ql.patterns,
+                    ql.witnesses,
+                    ql.branches,
+                    ql.atoms,
+                    ql.limits,
+                    ql.completeness.as_str(),
+                    ql.completeness
+                        .reasons
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                );
+            }
             for step in &explanation.steps {
                 let mut detail = step.detail.clone();
                 if detail.len() > 90 {
@@ -548,7 +572,73 @@ fn qerror_summary(by_operator: &BTreeMap<String, Vec<f64>>) -> String {
     format!("{{\n{}\n  }}", json.join(",\n"))
 }
 
+/// The heap profile of a materialisation (`--cfg alloc_profile` builds): each phase's peak
+/// and what it left, merged over the rounds, in the order the phases first came.
+fn heap_profile(phases: Vec<nrese_exec::heap::Phase>) {
+    // Without the counting allocator every phase reads zero.
+    if phases.iter().all(|phase| phase.peak == 0) {
+        return;
+    }
+    let mib = |bytes: usize| bytes as f64 / 1048576.0;
+    let mut merged: Vec<(&str, usize, usize, usize)> = Vec::new();
+    for phase in &phases {
+        match merged.iter_mut().find(|(label, ..)| *label == phase.label) {
+            Some((_, peak, after, times)) => {
+                *peak = (*peak).max(phase.peak);
+                *after = (*after).max(phase.live_after);
+                *times += 1;
+            }
+            None => merged.push((phase.label, phase.peak, phase.live_after, 1)),
+        }
+    }
+    eprintln!("heap profile (MiB requested): phase, times, peak, most live after");
+    for (label, peak, after, times) in merged {
+        eprintln!(
+            "  {label:<28} {times:>3} {:>10.1} {:>10.1}",
+            mib(peak),
+            mib(after)
+        );
+    }
+    eprintln!("heap profile by round (MiB requested): phase, peak, live after");
+    let mut round = 0;
+    for phase in &phases {
+        round += usize::from(phase.label == "reasoner: grounding");
+        eprintln!(
+            "  {round:>2} {:<28} {:>10.1} {:>10.1}",
+            phase.label,
+            mib(phase.peak),
+            mib(phase.live_after)
+        );
+    }
+    let top = phases
+        .iter()
+        .max_by_key(|phase| phase.peak)
+        .expect("not empty");
+    let round = phases
+        .iter()
+        .take_while(|phase| !std::ptr::eq(*phase, top))
+        .filter(|phase| phase.label == "reasoner: grounding")
+        .count();
+    eprintln!(
+        "heap peak {:.1} MiB in {} (round {round})",
+        mib(top.peak),
+        top.label
+    );
+}
+
+/// Peak and current memory in MiB, where the OS reports it: on Linux the resident set, on
+/// Windows the committed private bytes.
+#[cfg(windows)]
+fn memory_mib() -> Option<(u64, u64)> {
+    let mib = |bytes: u64| bytes / 1048576;
+    Some((
+        mib(nrese_exec::memory::peak_process_bytes()?),
+        mib(nrese_exec::memory::process_bytes()?),
+    ))
+}
+
 /// Peak and current resident memory in MiB, where the OS reports it (Linux).
+#[cfg(not(windows))]
 fn memory_mib() -> Option<(u64, u64)> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let field = |name: &str| {
@@ -761,6 +851,8 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         equality_compact,
         equality_early_expansion: setting("NRESE_REASONING_EQUALITY_EXPANSION") == "early",
         equality_canonical_answers: setting("NRESE_REASONING_EQUALITY_ANSWERS") == "canonical",
+        // The OWL 2 QL rewriting as the server takes it (`NRESE_REASONING_QL_REWRITING`).
+        ql_rewriting: setting("NRESE_REASONING_QL_REWRITING") != "off",
         ..config
     };
     COUNT_ALLOCATIONS.store(args.count_allocations, Ordering::Relaxed);
@@ -810,14 +902,43 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         .with_rules(rules)?;
     let program = reasoner.materialised_program();
     if let Some(program) = &program {
+        if let Some((peak, rss)) = memory_mib() {
+            eprintln!("before reasoning: memory peak {peak} MiB, resident {rss} MiB");
+        }
         let phase = Phase::start();
+        nrese_exec::heap::start("store: compile");
         let mut times = Vec::new();
         let mut last = None;
-        for _ in 0..args.reason_runs {
-            let done = store.rematerialise(program)?;
-            times.push(done.elapsed);
-            last = Some(done);
-        }
+        // The process's memory while it reasons, read every 20 ms: the peak counter of
+        // the OS also holds the load's.
+        let sampling = AtomicBool::new(true);
+        let sampled = std::thread::scope(|scope| -> Result<u64, Box<dyn std::error::Error>> {
+            let sampler = scope.spawn(|| {
+                let mut peak = 0;
+                while sampling.load(Ordering::Relaxed) {
+                    peak = peak.max(nrese_exec::memory::process_bytes().unwrap_or(0));
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                peak
+            });
+            let mut run = || -> Result<(), Box<dyn std::error::Error>> {
+                for _ in 0..args.reason_runs {
+                    let done = store.rematerialise(program)?;
+                    times.push(done.elapsed);
+                    last = Some(done);
+                }
+                Ok(())
+            };
+            let outcome = run();
+            sampling.store(false, Ordering::Relaxed);
+            let peak = sampler.join().expect("the sampler ends");
+            outcome.map(|()| peak)
+        })?;
+        eprintln!(
+            "reasoning: process memory peak {} MiB (sampled)",
+            sampled / 1048576
+        );
+        heap_profile(nrese_exec::heap::finish());
         let done = last.expect("at least one run");
         let (p50, _, max) = modes::percentiles(&mut times);
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
@@ -835,7 +956,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             format!(
                 "{{\"program\": {:?}, \"asserted\": {}, \"inferred\": {}, \"violations\": {}, \"rounds\": {}, \
                  \"runs\": {}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \"samples_ms\": [{}], \"grounding_ms\": {:.3}, \
-                 \"joins_ms\": {:.3}, \"modules_ms\": {:.3}, \"merge_ms\": {:.3}, \"consistency_ms\": {:.3}, \"bindings\": {}, \"probes\": {}, \"candidates\": {}, \"new_facts\": {}, \"passes\": {}}}",
+                 \"joins_ms\": {:.3}, \"modules_ms\": {:.3}, \"merge_ms\": {:.3}, \"consistency_ms\": {:.3}, \"bindings\": {}, \"probes\": {}, \"new_facts\": {}, \"passes\": {}}}",
                 done.ruleset,
                 done.asserted,
                 done.inferred,
@@ -850,7 +971,6 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
                 ms(done.phases.consistency),
                 done.phases.bindings,
                 done.phases.probes,
-                done.phases.candidates,
                 done.phases.new_facts,
                 done.phases.passes,
             ),

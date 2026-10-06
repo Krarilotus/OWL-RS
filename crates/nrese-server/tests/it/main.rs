@@ -10,6 +10,7 @@ mod classification_api_tests;
 mod client_compat_tests;
 mod connection_tests;
 mod console_ai_api_tests;
+mod dl_api_tests;
 mod draft_check_tests;
 mod engine_api_tests;
 mod federation_tests;
