@@ -772,9 +772,11 @@ pub fn run_jobs_by_morsel<S: Source + ?Sized, T: Send>(
 }
 
 /// [`run_jobs`] without circular derivations: those whose head is one of their own
-/// premises, such as `(?x type C) -> (?x type C)` from `C subClassOf C`. A well-founded
-/// proof never uses such a step, so overdeletion can skip them; it would otherwise
-/// cascade through every reflexive instance.
+/// premises under the binding, such as `(?x p ?x) -> (?x p ?x)` from a symmetric `p`, or
+/// transitivity with `?y = ?z`. A well-founded proof never uses such a step, so
+/// overdeletion can skip them; it would otherwise cascade through them. Instances that
+/// are circular under every binding (`(?x type C) -> (?x type C)` from `C subClassOf C`)
+/// aren't in a [`GroundProgram`] at all.
 pub fn run_jobs_acyclic<S: Source + ?Sized>(
     source: &S,
     jobs: &[Job<'_>],
@@ -938,6 +940,22 @@ pub fn transitive_predicate(rule: &Rule) -> Option<u64> {
         }
     }
     None
+}
+
+/// `rule` without the head atoms that are one of its body atoms; `None` if no head is
+/// left. Whenever the body holds, such a head's fact is already a premise: the tautology
+/// `A → A` that reflexive schema facts ground into (`C subClassOf C` gives
+/// `(?x type C) → (?x type C)` under `cax-sco`, `p subPropertyOf p` gives
+/// `(?x p ?y) → (?x p ?y)` under `prp-spo1`). Dropping it changes no closure and no
+/// well-founded proof, and saves re-deriving every type and property fact once more.
+fn without_tautologies(mut rule: Rule) -> Option<Rule> {
+    if let Head::Facts(heads) = &mut rule.head {
+        heads.retain(|head| !rule.body.contains(head));
+        if heads.is_empty() {
+            return None;
+        }
+    }
+    Some(rule)
 }
 
 /// Identity of a ground rule, for deduplication (the name doesn't matter).
@@ -1106,6 +1124,7 @@ impl GroundProgram {
             }
             None
         } else {
+            let rule = without_tautologies(rule)?;
             let key = rule_key(&rule);
             if let Some(&r) = self.known.get(&key) {
                 if self.premises[r] != premises {
