@@ -291,3 +291,167 @@ fn rematerialisation_replaces_the_inferred_stack_durably() {
     );
     assert_eq!(contents(&engine.snapshot(), ReadModel::Inferred), inferred);
 }
+
+/// Each term's id in `data` (subject, predicate, object, graph per quad), as `engine`'s
+/// dictionary has it.
+fn ids_of(engine: &Engine, data: &[Quad]) -> Vec<TermId> {
+    let snapshot = engine.snapshot();
+    data.iter()
+        .flat_map(|quad| {
+            let graph = match &quad.graph_name {
+                GraphName::DefaultGraph => TermId::DEFAULT_GRAPH,
+                GraphName::NamedNode(node) => snapshot.lookup(node.as_ref().into()).unwrap(),
+                GraphName::BlankNode(node) => snapshot.lookup(node.as_ref().into()).unwrap(),
+            };
+            [
+                snapshot.lookup(quad.subject.as_ref().into()).unwrap(),
+                snapshot.lookup(quad.predicate.as_ref().into()).unwrap(),
+                snapshot.lookup(quad.object.as_ref()).unwrap(),
+                graph,
+            ]
+        })
+        .collect()
+}
+
+/// Interning without the global lock (performance.md §0): a bulk load's new terms take
+/// dense ids in the order they first occur in the input, whatever order the batches
+/// arrive in, on however many threads, however the input is cut into chunks and batches,
+/// and when the load spills to disk.
+#[test]
+fn new_terms_take_ids_in_input_order_whatever_the_threads() {
+    use rayon::prelude::*;
+    let data = quads(0..6000);
+    let batches: Vec<&[Quad]> = data.chunks(500).collect();
+    let in_order = {
+        let engine = Engine::new(config()).unwrap();
+        let load = engine.bulk_load(BulkMode::Replace);
+        for (b, batch) in batches.iter().enumerate() {
+            load.add_at(1, b as u32, batch);
+        }
+        load.finish().unwrap();
+        ids_of(&engine, &data)
+    };
+    // First occurrences ascend and the new ids are dense.
+    let mut seen = HashSet::new();
+    let firsts: Vec<u64> = in_order
+        .iter()
+        .filter(|id| id.kind().is_dictionary() && seen.insert(**id))
+        .map(|id| id.payload())
+        .collect();
+    assert!(firsts.windows(2).all(|w| w[0] < w[1]), "ids in input order");
+    assert_eq!(
+        firsts.last().unwrap() - firsts[0] + 1,
+        firsts.len() as u64,
+        "dense"
+    );
+    let reversed = {
+        let engine = Engine::new(config()).unwrap();
+        let load = engine.bulk_load(BulkMode::Replace);
+        for (b, batch) in batches.iter().enumerate().rev() {
+            load.add_at(1, b as u32, batch);
+        }
+        load.finish().unwrap();
+        ids_of(&engine, &data)
+    };
+    assert_eq!(reversed, in_order);
+    let parallel = |engine: &Engine| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        let load = engine.bulk_load(BulkMode::Replace);
+        // Cut differently: three chunks of 2,000 quads, batches of 300.
+        pool.install(|| {
+            data.par_chunks(2000).enumerate().for_each(|(c, chunk)| {
+                chunk
+                    .par_chunks(300)
+                    .enumerate()
+                    .for_each(|(b, batch)| load.add_at(1 + c as u32, b as u32, batch));
+            });
+        });
+        load.finish().unwrap();
+        ids_of(engine, &data)
+    };
+    assert_eq!(parallel(&Engine::new(config()).unwrap()), in_order);
+    // Spilled to disk in chunks of 21 quads, each renumbered before it is sorted.
+    let dir = tempfile::tempdir().unwrap();
+    let spilling = EngineConfig {
+        durability: nrese_engine::DurabilityConfig {
+            bulk_load_memory: Some(2048),
+            ..nrese_engine::DurabilityConfig::default()
+        },
+        ..config()
+    };
+    let engine = Engine::open(dir.path(), spilling).unwrap();
+    assert_eq!(parallel(&engine), in_order);
+    let all = contents(&engine.snapshot(), ReadModel::Asserted);
+    assert_eq!(all, data.iter().cloned().collect::<HashSet<_>>());
+}
+
+/// A bulk load's terms stay in the arenas they were interned into, a segment of the
+/// dictionary between the entries before it (frozen) and those after: every term decodes,
+/// is found, and a string scan sees all of them, in memory and after reopening.
+#[test]
+fn bulk_loaded_terms_are_found_beside_the_others() {
+    use nrese_engine::{Placement, StringTest};
+    let before = quads(0..300);
+    let loaded: Vec<Quad> = (300..3000).map(quad).collect();
+    let after = quads(3000..3300);
+    let check = |engine: &Engine| {
+        let snapshot = engine.snapshot();
+        for quad in before.iter().chain(&loaded).chain(&after) {
+            let id = snapshot.lookup(quad.object.as_ref()).expect("found");
+            assert_eq!(snapshot.decode(id).as_ref(), Some(&quad.object));
+        }
+        // "label 1…" in each part: before, loaded and after.
+        let test = StringTest {
+            needle: "label 1",
+            placement: Placement::Anywhere,
+            iris: false,
+            strings: false,
+            lang_strings: true,
+            typed: false,
+            language: None,
+            ascii_case_insensitive: false,
+        };
+        let found: HashSet<String> = snapshot
+            .matching_strings(&test)
+            .into_iter()
+            .filter_map(|id| match snapshot.decode(id)? {
+                nrese_rdf::Term::Literal(literal) => Some(literal.value().to_owned()),
+                _ => None,
+            })
+            .collect();
+        let expected: HashSet<String> = before
+            .iter()
+            .chain(&loaded)
+            .chain(&after)
+            .filter_map(|quad| match &quad.object {
+                nrese_rdf::Term::Literal(l) if l.value().contains("label 1") => {
+                    Some(l.value().to_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(found, expected);
+    };
+    let dir = tempfile::tempdir().unwrap();
+    for durable in [false, true] {
+        let engine = match durable {
+            false => Engine::new(config()).unwrap(),
+            true => Engine::open(dir.path(), config()).unwrap(),
+        };
+        load_by_transaction(&engine, &before);
+        let load = engine.bulk_load(BulkMode::Append);
+        for (b, batch) in loaded.chunks(400).enumerate() {
+            load.add_at(1, b as u32, batch);
+        }
+        load.finish().unwrap();
+        load_by_transaction(&engine, &after);
+        check(&engine);
+        if durable {
+            drop(engine);
+            check(&Engine::open(dir.path(), config()).unwrap());
+        }
+    }
+}

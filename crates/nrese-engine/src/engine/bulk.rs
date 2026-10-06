@@ -1,10 +1,15 @@
 //! Bulk loads (E5): initial loads and restores that bypass the per-commit path.
 //!
 //! A [`BulkLoad`] holds the writer slot for its whole lifetime. Callers add batches of
-//! quads, from any number of threads; each batch is interned with one lock acquisition
-//! ([`Dictionary::intern_quads`](crate::term::Dictionary)). [`BulkLoad::finish`] then
-//! sorts once in parallel, builds the base run directly (no transaction hash sets, no
-//! per-quad existence checks against an empty base) and publishes one revision.
+//! quads, from any number of threads, each at its place in the input
+//! ([`BulkLoad::add_at`]). Terms the dictionary holds are found under its shared lock;
+//! new ones go to tables of their own, a lock per shard, and the quads take provisional
+//! ids ([`crate::term::pending`]). [`BulkLoad::finish`] numbers the new terms in the order
+//! they first occur in the input (dense ids, the same at any thread count, their text left
+//! where it was interned), renumbers the quads, sorts once in parallel, builds the base
+//! run directly (no transaction hash sets, no per-quad existence checks against an empty
+//! base) and publishes one revision. A load dropped unfinished leaves the dictionary as
+//! it was.
 //!
 //! Memory: in a durable store with `map_checkpoints`, a load into an empty store or one
 //! replacing its data is bounded by `bulk_load_memory`: past it, quads are sorted in chunks
@@ -31,6 +36,8 @@ use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
 use crate::index::{IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple, Permutation, QuadPattern};
+use crate::term::TermId;
+use crate::term::pending::{Adopted, Pending};
 
 /// Batches copied between releases of their memory ([`crate::memory`]): about 256 MiB at
 /// the stores' batch size.
@@ -60,6 +67,10 @@ pub struct BulkLoad<'e> {
     spiller: Mutex<Option<Spiller>>,
     /// Spilling failed (setting it up, or the thread): the load fails at `finish`.
     spill_failed: Mutex<Option<std::io::Error>>,
+    /// The new terms, numbered at `finish`.
+    pending: Pending,
+    /// Batches [`add`](Self::add) has numbered.
+    added: std::sync::atomic::AtomicU32,
 }
 
 /// Interned quads not yet spilled.
@@ -89,14 +100,31 @@ impl<'e> BulkLoad<'e> {
             chunk,
             spiller: Mutex::new(None),
             spill_failed: Mutex::new(None),
+            pending: Pending::default(),
+            added: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
-    /// Adds a batch of quads. Callable from several threads at once; batches of 10⁴–10⁵
-    /// quads amortise the dictionary lock well. Past the memory budget, it waits while the
-    /// last chunk is spilled.
+    /// Adds a batch of quads as the next of this load's own numbering (chunk 0): in the
+    /// order the calls come, which is the input's where one thread adds.
     pub fn add(&self, quads: &[Quad]) {
-        let encoded = self.engine.shared.dictionary.intern_quads(quads);
+        let batch = self
+            .added
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.add_at(0, batch, quads);
+    }
+
+    /// Adds batch `batch` of chunk `chunk` of the input, chunks and their batches numbered
+    /// in input order (chunk 0 is [`add`](Self::add)'s): new terms take their ids at
+    /// `finish` in the order they first occur so, whatever the threads' order. Callable
+    /// from several threads at once. Past the memory budget, it waits while the last
+    /// chunk is spilled.
+    pub fn add_at(&self, chunk: u32, batch: u32, quads: &[Quad]) {
+        let encoded =
+            self.engine
+                .shared
+                .dictionary
+                .intern_quads_pending(quads, &self.pending, chunk, batch);
         let full = {
             let mut batches = self.batches.lock();
             batches.quads += encoded.len();
@@ -164,6 +192,7 @@ impl<'e> BulkLoad<'e> {
             batches,
             spiller,
             spill_failed,
+            pending,
             ..
         } = self;
         let shared = &engine.shared;
@@ -178,9 +207,7 @@ impl<'e> BulkLoad<'e> {
             (None, None) => None,
         };
         let current = base.version();
-        if let Some(spill) = spilled {
-            return publish_spilled(engine, spill, current, started, _compaction);
-        }
+        let mut spilled = spilled;
         // The batches into one array, each freed once copied (not all held twice).
         let batches = batches.into_inner().batches;
         let mut quads: Vec<EncodedQuad> = Vec::with_capacity(batches.iter().map(Vec::len).sum());
@@ -192,6 +219,18 @@ impl<'e> BulkLoad<'e> {
                 drop(batch);
                 crate::memory::release_all();
             }
+        }
+        // The new terms numbered, the quads (and spilled chunks) renumbered to them.
+        let mut renumbered = Ok(());
+        shared.dictionary.adopt_pending(pending, |adopted| {
+            remap(adopted, &mut quads);
+            if let Some(spill) = spilled.as_mut() {
+                renumbered = spill.sort_raw(&|quads: &mut [EncodedQuad]| remap(adopted, quads));
+            }
+        });
+        renumbered?;
+        if let Some(spill) = spilled {
+            return publish_spilled(engine, spill, current, started, _compaction);
         }
         // By radix over the bits the ids use ([`nrese_exec::sort`]).
         let kept = nrese_exec::sort::sort_dedup_keys(crate::quad::as_keys_mut(&mut quads));
@@ -293,6 +332,22 @@ impl<'e> BulkLoad<'e> {
         engine.after_commit(0);
         Ok(summary)
     }
+}
+
+/// `quads` with their provisional ids replaced by the ids `adopted` numbered them to.
+fn remap(adopted: &Adopted, quads: &mut [EncodedQuad]) {
+    let id = |id: TermId| match id.kind().is_dictionary() {
+        true => TermId::new(id.kind(), adopted.remap(id.payload())),
+        false => id,
+    };
+    quads.par_iter_mut().for_each(|quad| {
+        *quad = EncodedQuad::new(
+            id(quad.subject),
+            id(quad.predicate),
+            id(quad.object),
+            id(quad.graph),
+        );
+    });
 }
 
 /// Whether a load in `mode` publishes a version holding nothing but the loaded quads,

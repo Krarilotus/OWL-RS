@@ -12,10 +12,14 @@
 //! checkpoint's table was built with.
 //!
 //! Concurrency: writers intern under an exclusive lock; readers look up and decode under a
-//! shared lock. Bulk loads intern from many threads through
-//! [`intern_quads`](Dictionary::intern_quads), which encodes, hashes and deduplicates a batch
-//! before taking the lock, so the critical section is only table probes and arena appends. Ids are dense and assigned in insertion order, which is what the
-//! write-ahead log relies on to replay dictionary growth deterministically.
+//! shared lock. Ids are dense and assigned in insertion order, which is what the
+//! write-ahead log relies on to replay dictionary growth deterministically. Bulk loads
+//! intern from many threads without the exclusive lock
+//! ([`intern_quads_pending`](Dictionary::intern_quads_pending)): a batch is encoded,
+//! hashed and deduplicated on its own, its known keys found under the shared lock, its
+//! new ones put in tables of their own ([`super::pending`]); at the end they are numbered
+//! in the order they first occur in the input and become a segment of entries whose text
+//! stays where it was interned ([`Dictionary::adopt_pending`]).
 
 use hashbrown::HashTable;
 use nrese_rdf::{
@@ -27,6 +31,7 @@ use parking_lot::RwLock;
 use super::hash::key_hash;
 use super::offsets::{Ends, Offsets};
 use super::order::Key;
+use super::pending::{Adopted, NewKey, Pending};
 use super::vocabulary::Codec;
 use super::{TermId, TermKind, inline_to_literal, try_inline_literal};
 use crate::error::{EngineError, EngineResult};
@@ -190,45 +195,130 @@ pub(crate) fn base_slots(len: u64) -> u64 {
     (len + len / 3 + 1).next_power_of_two()
 }
 
+/// Entries kept on the heap, one after another, from id `start` on.
 #[derive(Default)]
-struct Inner {
-    /// Entries `0..base.len` from a mapped checkpoint.
-    base: Option<Base>,
-    /// The keys of the entries after the base, one after another.
+struct Heap {
+    start: u64,
+    /// The keys, one after another.
     bytes: Vec<u8>,
     /// Their end offsets in `bytes`.
     ends: Vec<u64>,
     /// Their [`key_hash`]es: the table grows by moving numbers, without reading and
     /// hashing every key again under the write lock (a bulk load stalled on it).
     hashes: Vec<u64>,
-    /// Their indexes, by [`key_hash`].
+    /// Their ids, by [`key_hash`].
     table: HashTable<u64>,
 }
 
+impl Heap {
+    fn at(start: u64) -> Self {
+        Self {
+            start,
+            ..Self::default()
+        }
+    }
+
+    fn len(&self) -> u64 {
+        self.ends.len() as u64
+    }
+
+    fn key(&self, id: u64) -> &[u8] {
+        heap_key(&self.bytes, &self.ends, (id - self.start) as usize)
+    }
+
+    fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
+        self.table.find(hash, |&id| self.key(id) == key).copied()
+    }
+
+    /// Appends `key` (not an entry yet), whose hash is `hash`, and returns its id.
+    fn push(&mut self, key: &[u8], hash: u64) -> u64 {
+        let id = self.start + self.len();
+        self.bytes.extend_from_slice(key);
+        self.ends.push(self.bytes.len() as u64);
+        self.hashes.push(hash);
+        let Heap {
+            table,
+            hashes,
+            start,
+            ..
+        } = self;
+        table.insert_unique(hash, id, |&i| hashes[(i - *start) as usize]);
+        id
+    }
+}
+
+/// Entries between the base and the live heap: a heap frozen when a bulk load's terms
+/// came after it, or a bulk load's terms in the arenas they were interned into
+/// ([`super::pending`]).
+enum Segment {
+    Heap(Heap),
+    Adopted(Adopted),
+}
+
+impl Segment {
+    fn start(&self) -> u64 {
+        match self {
+            Self::Heap(heap) => heap.start,
+            Self::Adopted(adopted) => adopted.start,
+        }
+    }
+
+    fn key(&self, id: u64) -> &[u8] {
+        match self {
+            Self::Heap(heap) => heap.key(id),
+            Self::Adopted(adopted) => adopted.key(id - adopted.start),
+        }
+    }
+
+    fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
+        match self {
+            Self::Heap(heap) => heap.find(hash, key),
+            Self::Adopted(adopted) => adopted.find(hash, key),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Inner {
+    /// Entries `0..base.len` from a mapped checkpoint.
+    base: Option<Base>,
+    /// Entries after the base, before the heap, by id.
+    segments: Vec<Segment>,
+    /// The entries interned one by one since, at the end.
+    heap: Heap,
+}
+
 impl Inner {
+    fn with_base(base: Base) -> Self {
+        Self {
+            heap: Heap::at(base.len),
+            base: Some(base),
+            segments: Vec::new(),
+        }
+    }
+
     fn base_len(&self) -> u64 {
         self.base.as_ref().map_or(0, |base| base.len)
     }
 
     fn len(&self) -> u64 {
-        self.base_len() + self.ends.len() as u64
+        self.heap.start + self.heap.len()
     }
 
     /// Entry `index`'s plain key: in place, or decoded from a compressed base.
     fn key(&self, index: u64) -> Key<'_> {
-        let base_len = self.base_len();
-        if index < base_len {
+        if index < self.base_len() {
             return self
                 .base
                 .as_ref()
                 .expect("an index below the base")
                 .plain(index);
         }
-        Key::Borrowed(heap_key(
-            &self.bytes,
-            &self.ends,
-            (index - base_len) as usize,
-        ))
+        if index >= self.heap.start {
+            return Key::Borrowed(self.heap.key(index));
+        }
+        let at = self.segments.partition_point(|s| s.start() <= index) - 1;
+        Key::Borrowed(self.segments[at].key(index))
     }
 
     /// The index of `key`, whose hash is `hash`, if it is an entry.
@@ -236,21 +326,47 @@ impl Inner {
         if let Some(index) = self.base.as_ref().and_then(|base| base.find(hash, key)) {
             return Some(index);
         }
-        self.table
-            .find(hash, |&index| *self.key(index) == *key)
-            .copied()
+        self.segments
+            .iter()
+            .find_map(|segment| segment.find(hash, key))
+            .or_else(|| self.heap.find(hash, key))
     }
 
     /// Appends `key` (not an entry yet), whose hash is `hash`, and returns its index.
     fn push(&mut self, key: &[u8], hash: u64) -> u64 {
-        let index = self.len();
-        let base_len = self.base_len();
-        self.bytes.extend_from_slice(key);
-        self.ends.push(self.bytes.len() as u64);
-        self.hashes.push(hash);
-        let Inner { table, hashes, .. } = self;
-        table.insert_unique(hash, index, |&i| hashes[(i - base_len) as usize]);
-        index
+        self.heap.push(key, hash)
+    }
+
+    /// Takes a bulk load's numbered terms, ids `adopted.start..` (the next ones): the heap
+    /// so far is frozen before them, a new one begins after.
+    fn adopt(&mut self, adopted: Adopted) {
+        assert_eq!(adopted.start, self.len(), "adopted terms take the next ids");
+        let after = adopted.start + adopted.len();
+        let heap = std::mem::replace(&mut self.heap, Heap::at(after));
+        if heap.len() > 0 {
+            self.segments.push(Segment::Heap(heap));
+        }
+        self.segments.push(Segment::Adopted(adopted));
+    }
+
+    /// The heaps' and segments' key bytes and index bytes.
+    fn heap_bytes(&self) -> (u64, u64) {
+        let heap = |h: &Heap| {
+            (
+                h.bytes.len() as u64,
+                (h.ends.capacity() * 16 + h.table.capacity() * 9) as u64,
+            )
+        };
+        let mut total = heap(&self.heap);
+        for segment in &self.segments {
+            let (keys, index) = match segment {
+                Segment::Heap(h) => heap(h),
+                Segment::Adopted(a) => a.bytes(),
+            };
+            total.0 += keys;
+            total.1 += index;
+        }
+        total
     }
 }
 
@@ -611,9 +727,9 @@ impl Dictionary {
                 .loads
                 .load(std::sync::atomic::Ordering::Relaxed),
             terms: inner.len(),
-            arena_bytes: inner.bytes.len() as u64 + base.map_or(0, |b| b.arena.len() as u64),
+            arena_bytes: inner.heap_bytes().0 + base.map_or(0, |b| b.arena.len() as u64),
             // A slot is the stored index plus one control byte.
-            index_bytes: (inner.ends.capacity() * 16 + inner.table.capacity() * 9) as u64,
+            index_bytes: inner.heap_bytes().1,
             mapped_bytes: base.map_or(0, Base::bytes),
         }
     }
@@ -934,22 +1050,51 @@ impl Dictionary {
             return self.prefix_matches(test, limit);
         }
         let inner = self.inner.read();
-        let base_len = inner.base_len();
         let mut ids = match &inner.base {
             Some(base) if base.codec.is_some() => decoded_matching(base, limit, test),
             Some(base) => super::strings::matching(&base.arena, &base.offsets, 0, limit, test),
             None => Vec::new(),
         };
-        if limit > base_len {
-            ids.extend(super::strings::matching(
-                &inner.bytes,
-                &inner.ends[..],
-                base_len,
-                limit - base_len,
-                test,
-            ));
+        let heaps = inner
+            .segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Heap(heap) => Some(heap),
+                Segment::Adopted(_) => None,
+            })
+            .chain([&inner.heap]);
+        for heap in heaps {
+            if limit > heap.start {
+                ids.extend(super::strings::matching(
+                    &heap.bytes,
+                    &heap.ends[..],
+                    heap.start,
+                    limit - heap.start,
+                    test,
+                ));
+            }
+        }
+        // A bulk load's terms: each shard's arena, its entries numbered to their ids
+        // (an entry that existed already shows under its own id too: deduplicated).
+        for segment in &inner.segments {
+            let Segment::Adopted(adopted) = segment else {
+                continue;
+            };
+            if limit <= adopted.start {
+                continue;
+            }
+            for (s, shard) in adopted.shards.iter().enumerate() {
+                let ids_of = adopted.ids(s);
+                ids.extend(
+                    super::strings::matching(&shard.bytes, &shard.ends[..], 0, u64::MAX, test)
+                        .into_iter()
+                        .map(|found| TermId::new(found.kind(), ids_of[found.payload() as usize]))
+                        .filter(|id| id.payload() < limit),
+                );
+            }
         }
         ids.sort_unstable();
+        ids.dedup();
         ids
     }
 
@@ -1146,66 +1291,59 @@ impl Dictionary {
     /// keys are encoded, hashed and deduplicated per batch without the lock, which is then
     /// held once, for the distinct keys only. Ids depend on the interleaving of concurrent
     /// batches, which is fine: they are logged by key, never recomputed.
-    pub(crate) fn intern_quads(&self, quads: &[Quad]) -> Vec<EncodedQuad> {
-        let mut batch = KeyBatch::with_capacity(quads.len());
-        let slots: Vec<[Slot; 4]> = quads
-            .iter()
-            .map(|quad| {
-                let quad = quad.as_ref();
-                let graph = match graph_term(quad.graph_name) {
-                    Some(term) => batch.slot(self, term),
-                    None => Slot::Id(TermId::DEFAULT_GRAPH),
-                };
-                [
-                    batch.slot(self, quad.subject.into()),
-                    batch.slot(self, quad.predicate.into()),
-                    batch.slot(self, quad.object),
-                    graph,
-                ]
-            })
-            .collect();
-        // The keys known already are found under the read lock, which every loading thread
-        // holds at once; only the new ones take the write lock (and are looked up again
-        // there: another thread may have added them in between). Under the write lock alone,
-        // the lookups of every batch ran one after another: on YAGO tiny the whole parse
-        // phase waited on them.
-        let mut found: Vec<Option<u64>> = {
+    pub(crate) fn intern_quads_pending(
+        &self,
+        quads: &[Quad],
+        pending: &Pending,
+        chunk: u32,
+        batch: u32,
+    ) -> Vec<EncodedQuad> {
+        let mut keys = KeyBatch::with_capacity(quads.len());
+        let slots = keys.slots(self, quads);
+        // Known keys under the shared lock; the others go to `pending`, each shard locked
+        // once, at their positions in the input.
+        let found: Vec<Option<u64>> = {
             let inner = self.inner.read();
-            batch
-                .keys
+            keys.keys
                 .iter()
-                .map(|key| inner.find(key.hash, &batch.arena[key.start..key.end]))
+                .map(|key| inner.find(key.hash, &keys.arena[key.start..key.end]))
                 .collect()
         };
-        if found.iter().any(Option::is_none) {
-            let mut inner = self.inner.write();
-            for (slot, key) in found.iter_mut().zip(&batch.keys) {
-                if slot.is_none() {
-                    let bytes = &batch.arena[key.start..key.end];
-                    *slot = Some(self.intern_hashed_locked(&mut inner, bytes, key.hash));
-                }
-            }
-        }
+        let new: Vec<NewKey> = keys
+            .keys
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| found[i].is_none())
+            .map(|(i, key)| NewKey {
+                start: key.start,
+                end: key.end,
+                hash: key.hash,
+                at: super::pending::position(chunk, batch, i),
+            })
+            .collect();
+        let provisional = pending.intern(&keys.arena, &new);
+        let mut provisional = provisional.into_iter();
         let indexes: Vec<u64> = found
             .into_iter()
-            .map(|index| index.unwrap_or_default())
+            .map(|index| index.unwrap_or_else(|| provisional.next().expect("one per new key")))
             .collect();
-        let resolve = |slot: Slot| match slot {
-            Slot::Id(id) => id,
-            Slot::Key(key) => {
-                let key = key as usize;
-                TermId::new(batch.keys[key].kind, indexes[key])
-            }
-        };
-        // A new array of the quads' size: `collect` from `slots` would keep its allocation,
-        // 64 bytes per quad for 32 (twice the memory of every batch a bulk load holds).
-        let mut quads = Vec::with_capacity(slots.len());
-        quads.extend(
-            slots.iter().map(|&[s, p, o, g]| {
-                EncodedQuad::new(resolve(s), resolve(p), resolve(o), resolve(g))
-            }),
-        );
-        quads
+        keys.resolve(&slots, &indexes)
+    }
+
+    /// Numbers a bulk load's `pending` terms after the entries there are (in the order of
+    /// their first occurrence in the input: [`super::pending`]), calls `remap` with them so
+    /// the load's quads take their ids, and adds them as a segment: their text stays where
+    /// it was interned. Readers go on meanwhile; writers wait.
+    pub(crate) fn adopt_pending(&self, pending: Pending, remap: impl FnOnce(&Adopted)) {
+        if pending.is_empty() {
+            remap(&Pending::default().number(0, |_, _| None));
+            return;
+        }
+        let inner = self.inner.upgradable_read();
+        let adopted = pending.number(inner.len(), |hash, key| inner.find(hash, key));
+        remap(&adopted);
+        let mut inner = parking_lot::RwLockUpgradableReadGuard::upgrade(inner);
+        inner.adopt(adopted);
     }
 
     /// Encodes `quad` without interning; `None` if any term is unknown (below `limit`).
@@ -1276,7 +1414,7 @@ impl Dictionary {
                 "checkpoint dictionary restored into a non-empty dictionary".to_owned(),
             ));
         }
-        inner.base = Some(base);
+        *inner = Inner::with_base(base);
         Ok(())
     }
 
@@ -1294,10 +1432,7 @@ impl Dictionary {
                 "a checkpoint's dictionary doesn't match the dictionary".to_owned(),
             ));
         }
-        let mut next = Inner {
-            base: Some(base),
-            ..Inner::default()
-        };
+        let mut next = Inner::with_base(base);
         for index in len..inner.len() {
             let key = inner.key(index);
             next.push(&key, key_hash(&key));
@@ -1323,13 +1458,13 @@ impl Dictionary {
                 "checkpoint dictionary restored into a non-empty dictionary".to_owned(),
             ));
         }
-        let Inner {
+        let Heap {
             table,
             bytes,
             ends,
             hashes: kept,
             ..
-        } = &mut *inner;
+        } = &mut inner.heap;
         bytes.reserve_exact(keys.iter().map(|key| key.len()).sum());
         ends.reserve_exact(keys.len());
         for key in keys {
@@ -1412,6 +1547,46 @@ struct KeyBatch {
 }
 
 impl KeyBatch {
+    /// Each quad's terms as slots, its keys added to the batch.
+    /// Keys are added in the order the terms come (subject, predicate, object, graph): a
+    /// bulk load's new terms are numbered in this order ([`super::pending`]).
+    fn slots(&mut self, dictionary: &Dictionary, quads: &[Quad]) -> Vec<[Slot; 4]> {
+        quads
+            .iter()
+            .map(|quad| {
+                let quad = quad.as_ref();
+                let subject = self.slot(dictionary, quad.subject.into());
+                let predicate = self.slot(dictionary, quad.predicate.into());
+                let object = self.slot(dictionary, quad.object);
+                let graph = match graph_term(quad.graph_name) {
+                    Some(term) => self.slot(dictionary, term),
+                    None => Slot::Id(TermId::DEFAULT_GRAPH),
+                };
+                [subject, predicate, object, graph]
+            })
+            .collect()
+    }
+
+    /// The quads of `slots`, each key taking its index in `indexes`.
+    fn resolve(&self, slots: &[[Slot; 4]], indexes: &[u64]) -> Vec<EncodedQuad> {
+        let resolve = |slot: Slot| match slot {
+            Slot::Id(id) => id,
+            Slot::Key(key) => {
+                let key = key as usize;
+                TermId::new(self.keys[key].kind, indexes[key])
+            }
+        };
+        // A new array of the quads' size: `collect` from `slots` would keep its allocation,
+        // 64 bytes per quad for 32 (twice the memory of every batch a bulk load holds).
+        let mut quads = Vec::with_capacity(slots.len());
+        quads.extend(
+            slots.iter().map(|&[s, p, o, g]| {
+                EncodedQuad::new(resolve(s), resolve(p), resolve(o), resolve(g))
+            }),
+        );
+        quads
+    }
+
     fn with_capacity(quads: usize) -> Self {
         Self {
             arena: Vec::with_capacity(quads * 64),
