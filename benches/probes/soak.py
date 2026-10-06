@@ -177,17 +177,23 @@ def worker(index: int, base: str, stop: threading.Event, ledger: Ledger, stats: 
                 triples = ledger.take(rng.randint(1, 10))
                 if triples:
                     with ledger.lock:
-                        # Claimed before the request: no other worker deletes them too.
+                        # Claimed before the request: no other worker deletes them too, and
+                        # none inserts them again until the delete has settled (else an
+                        # insert the server orders first would be deleted, while the
+                        # ledger, settling it last, would count it live).
                         claimed = [t for t in triples if t in ledger.live]
                         ledger.live.difference_update(claimed)
+                        ledger.reserved.update(claimed)
                     if claimed:
                         pending = claimed
                         update = f"DELETE DATA {{ GRAPH <{SOAK}> {{ {' '.join(claimed)} }} }}"
                         status, body = call("POST", "/dataset/update", update.encode(),
                                             "application/sparql-update")
-                        if status not in (200, 204):
-                            with ledger.lock:
+                        with ledger.lock:
+                            ledger.reserved.difference_update(claimed)
+                            if status not in (200, 204):
                                 ledger.live.update(claimed)
+                        if status not in (200, 204):
                             error = f"{status} {body[:200]!r}"
             elif kind == "gsp":
                 graph = urllib.parse.quote(f"urn:soak:gsp:{rng.randint(0, 9)}")
