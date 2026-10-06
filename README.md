@@ -50,4 +50,7 @@ Copyright (C) 2026 Krarilotus. Licensed under either of the
 [Apache License, Version 2.0](LICENSE-APACHE) or the [MIT licence](LICENSE-MIT), at your
 option. The v1 prototype published before October 2026 (`main` up to `8088e9a`) carried
 `Apache-2.0` in its package metadata; that statement stands for those commits.
+Third-party material keeps its own licence: the dependencies (MIT, Apache-2.0, BSD and
+similar), the vendored vocabularies under `benches/nrese-bench-harness/fixtures/catalog-cache/`,
+and the W3C test suites, which are fetched and not part of this repository.
 Contributions come in under the same terms: [CONTRIBUTING.md](CONTRIBUTING.md).
