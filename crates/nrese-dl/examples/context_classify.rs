@@ -7,7 +7,7 @@
 //!                     (the EL classifier's example's format, `canonical.py`'s input)
 //!   --tax FILE        the canonical taxonomy (`benches/reasoning/dl/canonical.py`'s format)
 //!   --threads N       saturation workers (default 1)
-//!   --strategy S      `cautious` (default) or `eager`
+//!   --strategy S      `cautious` (default), `eager` or `split`
 //!   --no-proofs       don't record derivations
 //!   --repeat N        classify N times; times are the median of the runs
 //!   --compare-el      also classify with the EL classifier (`nrese_reasoner::classify`) on
@@ -167,7 +167,10 @@ fn args() -> Result<Args, String> {
                 a.options.strategy = match it.next().as_deref() {
                     Some("cautious") => Strategy::Cautious,
                     Some("eager") => Strategy::Eager,
-                    other => return Err(format!("--strategy cautious|eager, not {other:?}")),
+                    Some("split") => Strategy::Split,
+                    other => {
+                        return Err(format!("--strategy cautious|eager|split, not {other:?}"));
+                    }
                 }
             }
             _ => a.inputs.push(arg),

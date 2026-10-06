@@ -79,6 +79,9 @@ pub struct Options {
     pub lower_bound_strategy: crate::context::Strategy,
     /// The most conclusions one join of the context core may produce, per run.
     pub max_join: usize,
+    /// The most steps one Pred join of the context core may take; a join past them is
+    /// left, and the classes whose saturation reaches its context aren't exact.
+    pub max_join_steps: usize,
     /// The most memory the process may hold while the context core runs (bytes; `None`:
     /// three quarters of what the machine or container has).
     pub max_memory: Option<u64>,
@@ -133,6 +136,7 @@ impl Default for Options {
             // of the clauses; ORE development A/B in the commit that made it default).
             lower_bound_strategy: crate::context::Strategy::Split,
             max_join: 1 << 20,
+            max_join_steps: 1 << 16,
             max_memory: None,
             equality: false,
             // No lazy unfolding: it under-approximates the unfolded classes in a model, and
@@ -195,6 +199,7 @@ impl Deadline {
         crate::context::Budget {
             deadline,
             max_join: Some(options.max_join),
+            max_join_steps: Some(options.max_join_steps),
             // A saturation is only an optimisation here: past the limit it stops, where an
             // allocation failure would end the process (ore_ont_9724 under equality).
             max_memory: options
