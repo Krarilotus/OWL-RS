@@ -669,7 +669,7 @@ async fn query_answers_say_whether_answers_through_existentials_are_complete()
     let response = app.clone().oneshot(query()?).await?;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers()["nrese-ql-completeness"],
+        response.headers()["nrese-completeness"],
         "complete",
         "{:?}",
         response.headers()
@@ -686,11 +686,11 @@ async fn query_answers_say_whether_answers_through_existentials_are_complete()
         .await?;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     let response = app.oneshot(query()?).await?;
-    let header = response.headers()["nrese-ql-completeness"]
+    let header = response.headers()["nrese-completeness"]
         .to_str()?
         .to_owned();
     assert!(
-        header.starts_with("sound-only; reasons=\"") && header.contains("is transitive"),
+        header.starts_with("sound-only; reasons=\"ql: ") && header.contains("is transitive"),
         "{header}"
     );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;

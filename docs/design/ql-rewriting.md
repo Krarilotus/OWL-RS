@@ -174,9 +174,28 @@ bound (§5), when a predicate or class is a variable, or when a pattern the rewr
 enter (`EXISTS`, `MINUS`, `GRAPH`, `SERVICE`, a property path) reads a term the rewriting
 would change; otherwise `complete`. Each reason names the term and the hazard.
 
-**Reported** in EXPLAIN (`ql.completeness` and `ql.reasons`, both forms), in the store's
-results, and with every answer over HTTP: the header `NRESE-QL-Completeness: complete` or
-`sound-only; reasons="…"`, computed on the snapshot the query reads before its first byte.
+**Reported** in EXPLAIN (`ql.completeness`, `ql.sound`, `ql.complete`, `ql.reasons`, both
+forms), in the store's results, and with every answer over HTTP: the header
+`NRESE-Completeness: complete` or `sound-only; reasons="ql: …"`, computed on the snapshot
+the query reads before its first byte.
+
+**One status for every engine.** The status is `nrese_sparql::Completeness`, the shape the
+DL design gives every answer (owl2-dl.md, "Every answer carries its status"): `sound`,
+`complete`, optional `bounds` (lower, upper and unresolved counts), and `reasons`, each with
+its `source` (`ql` here, `dl` for the bounds). Sources add reasons and `merge` combines
+statuses; `header()` writes the header (`complete`, `sound-only` or `unsound`, then
+`lower=…; upper=…; unresolved=…` where bounds are known, then the first five reasons). The
+QL rewriting reports `sound` and, under a hazard, not `complete`, without bounds: it
+doesn't know how many answers it misses.
+
+**The research review's case** (existentials feeding a transitive role): `Engine ⊑
+∃partOf.Car`, `Car ⊑ ∃partOf.Fleet`, `partOf` transitive, `e1 a Engine`. `SELECT ?x { ?x
+partOf ?f . ?f a Fleet }` has the certain answer `e1` through two anonymous individuals and
+the transitive shortcut; the closure and the rewriting miss it, and the answer says
+`sound-only` with "partOf is transitive" (tests
+`existentials_feeding_a_transitive_role_miss_with_the_flag` against the chase,
+`existentials_feeding_a_transitive_role_are_flagged`). In `owl2-dl` mode the DL bounds
+answer it exactly.
 
 **Tested** with mixed ontologies in the differential test: QL axioms with transitive,
 chain, functional and inverse functional properties and `owl:sameAs` in the data, under

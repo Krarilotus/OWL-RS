@@ -89,46 +89,8 @@ pub struct QlReport {
     pub atoms: usize,
     /// The bounds reached ([`Limits`]): those patterns ran as written.
     pub limits: Vec<&'static str>,
-    pub completeness: Completeness,
-}
-
-/// Whether the answers through anonymous individuals are complete (docs/design/
-/// ql-rewriting.md §5): `Complete`, or `SoundOnly` with the reasons some may be missing.
-/// Answers are never changed for it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum Completeness {
-    #[default]
-    Complete,
-    SoundOnly(Vec<String>),
-}
-
-impl Completeness {
-    /// `complete` or `sound-only`.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Complete => "complete",
-            Self::SoundOnly(_) => "sound-only",
-        }
-    }
-
-    pub fn reasons(&self) -> &[String] {
-        match self {
-            Self::Complete => &[],
-            Self::SoundOnly(reasons) => reasons,
-        }
-    }
-
-    /// Adds a reason (once).
-    pub fn add(&mut self, reason: String) {
-        match self {
-            Self::Complete => *self = Self::SoundOnly(vec![reason]),
-            Self::SoundOnly(reasons) => {
-                if !reasons.contains(&reason) {
-                    reasons.push(reason);
-                }
-            }
-        }
-    }
+    /// Whether answers through anonymous individuals may be missing (reasons from `ql`).
+    pub completeness: crate::Completeness,
 }
 
 /// A store's QL rewriting: what its closure applies, the bounds, and the schema compiled

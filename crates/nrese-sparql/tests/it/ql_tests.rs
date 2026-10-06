@@ -360,7 +360,12 @@ fn incompleteness_is_reported_never_silent() {
         let ql = plan.ql.expect("the rewriting applies");
         (
             ql.completeness.as_str(),
-            ql.completeness.reasons().join(" | "),
+            ql.completeness
+                .reasons
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" | "),
         )
     };
     let pure = engine(STAFF);
@@ -413,10 +418,38 @@ fn chains_in_the_store_are_hazards() {
     assert_eq!(ql.completeness.as_str(), "sound-only");
     assert!(
         ql.completeness
-            .reasons()
-            .join(" ")
-            .contains("property chain"),
+            .reasons
+            .iter()
+            .any(|r| r.text.contains("property chain")),
         "{:?}",
         ql.completeness
+    );
+}
+
+/// The research review's case, with its names: existentials feeding a transitive role.
+/// `e1` is a certain answer through two anonymous individuals and the transitive shortcut;
+/// the closure (here: `e1 a Engine`, nothing more) and the rewriting miss it, and the
+/// answer says so, naming `partOf`.
+#[test]
+fn existentials_feeding_a_transitive_role_are_flagged() {
+    let e = engine(
+        ":Engine rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :partOf ;
+            owl:someValuesFrom :Car ] .
+         :Car rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :partOf ;
+            owl:someValuesFrom :Fleet ] .
+         :partOf a owl:TransitiveProperty .
+         :e1 a :Engine .",
+    );
+    let query = "SELECT ?x { ?x :partOf ?f . ?f a :Fleet }";
+    assert_eq!(rows(&e, query, &on()), Vec::<String>::new());
+    let plan = plan_query(&e.snapshot(), &parse(query), &on()).unwrap();
+    let completeness = plan.ql.expect("the rewriting applies").completeness;
+    assert_eq!(completeness.as_str(), "sound-only");
+    assert!(
+        completeness
+            .reasons
+            .iter()
+            .any(|r| r.source == "ql" && r.text.contains("partOf> is transitive")),
+        "{completeness:?}"
     );
 }
