@@ -17,13 +17,15 @@
 //!   in `expected-failures.txt`. The run fails on any failure not in the list, and on any
 //!   listed test that passes.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
 
-use nrese_rdf::{NamedOrBlankNode, Term, Triple};
-use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_reasoner::rulesets::Ruleset;
 use nrese_store::{BulkLoadRequest, GraphTarget, StoreConfig, StoreService};
+
+#[path = "../w3c_owl2_suite/mod.rs"]
+mod suite;
+
+use suite::{Case, cases, parse_rdf_xml, quoted_entities, suite_path};
 
 const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");
 
@@ -59,105 +61,6 @@ const TRANSLATIONS: &[(&str, &str)] = &[
 :a a [ a owl:Restriction ; owl:onProperty :hasAge ; owl:hasValue "19"^^xsd:integer ] ."#,
     ),
 ];
-const TEST: &str = "http://www.w3.org/2007/OWL/testOntology#";
-const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
-
-fn suite_path() -> PathBuf {
-    std::env::var_os("NRESE_W3C_OWL_TESTS").map_or_else(
-        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.cache/owl-test/all.rdf"),
-        PathBuf::from,
-    )
-}
-
-/// RDF/XML with its entity declarations in double quotes: the test cases write
-/// `<!ENTITY owl 'http://…'>`, which the parser doesn't take.
-fn quoted_entities(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find("<!ENTITY") {
-        let (before, from) = rest.split_at(at);
-        out.push_str(before);
-        let end = from.find('>').map_or(from.len(), |e| e + 1);
-        let declaration = &from[..end];
-        if declaration.contains('"') {
-            out.push_str(declaration);
-        } else {
-            out.push_str(&declaration.replace('\'', "\""));
-        }
-        rest = &from[end..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn parse_rdf_xml(text: &str) -> Result<Vec<Triple>, String> {
-    let text = quoted_entities(text);
-    RdfParser::from_format(RdfFormat::RdfXml)
-        .with_base_iri("http://www.w3.org/2007/OWL/test-base/")
-        .map_err(|e| e.to_string())?
-        .for_reader(text.as_bytes())
-        .map(|quad| quad.map(Triple::from).map_err(|e| e.to_string()))
-        .collect()
-}
-
-/// One test case: its kinds (the local names of its types) and ontologies.
-#[derive(Default)]
-struct Case {
-    kinds: BTreeSet<String>,
-    premise: Option<String>,
-    conclusion: Option<String>,
-    non_conclusion: Option<String>,
-    imports: bool,
-    rl: bool,
-    rdf_based: bool,
-    rejected: bool,
-}
-
-fn cases(triples: &[Triple]) -> BTreeMap<String, Case> {
-    let mut by_node: HashMap<NamedOrBlankNode, Case> = HashMap::new();
-    let mut names: HashMap<NamedOrBlankNode, String> = HashMap::new();
-    for t in triples {
-        let Some(local) = t.predicate.as_str().strip_prefix(TEST) else {
-            if t.predicate.as_str() == RDF_TYPE
-                && let Term::NamedNode(class) = &t.object
-                && let Some(kind) = class.as_str().strip_prefix(TEST)
-            {
-                by_node
-                    .entry(t.subject.clone())
-                    .or_default()
-                    .kinds
-                    .insert(kind.to_owned());
-            }
-            continue;
-        };
-        let case = by_node.entry(t.subject.clone()).or_default();
-        let text = || match &t.object {
-            Term::Literal(l) => Some(l.value().to_owned()),
-            _ => None,
-        };
-        let object = |name: &str| matches!(&t.object, Term::NamedNode(n) if n.as_str() == format!("{TEST}{name}"));
-        match local {
-            "identifier" => {
-                if let Some(name) = text() {
-                    names.insert(t.subject.clone(), name);
-                }
-            }
-            "rdfXmlPremiseOntology" => case.premise = text(),
-            "rdfXmlConclusionOntology" => case.conclusion = text(),
-            "rdfXmlNonConclusionOntology" => case.non_conclusion = text(),
-            "importedOntology" => case.imports = true,
-            "profile" => case.rl |= object("RL"),
-            "semantics" => case.rdf_based |= object("RDF-BASED"),
-            "status" => case.rejected |= object("Rejected") || object("Extracredit"),
-            _ => {}
-        }
-    }
-    by_node
-        .into_iter()
-        .filter_map(|(node, case)| Some((names.get(&node)?.clone(), case)))
-        .collect()
-}
-
 fn run(name: &str, case: &Case, dir: &std::path::Path) -> Result<(), String> {
     let stem = name.replace(|c: char| !c.is_ascii_alphanumeric(), "_");
     let file = match (&case.premise, TRANSLATIONS.iter().find(|(n, _)| *n == name)) {
@@ -246,7 +149,8 @@ fn w3c_owl2_rl_test_cases() {
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
     let (mut passed, mut skipped) = (0, Vec::new());
     for (name, case) in &all {
-        if !(case.rl && case.rdf_based) || case.rejected {
+        if !(case.profiles.contains("RL") && case.semantics.contains("RDF-BASED")) || case.rejected
+        {
             continue;
         }
         if case.imports {
