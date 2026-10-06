@@ -14,7 +14,7 @@ use super::{PREFIXES, insert, pipeline, pipeline_with};
 
 /// The answers of `query` (with [`PREFIXES`]) as `?x` values (local names, or `true` /
 /// `false` for ASK), and their status.
-fn query_with(
+pub(super) fn query_with(
     pipeline: &MutationPipeline,
     query: &str,
     mode: Option<DlAnswers>,
@@ -47,7 +47,7 @@ fn query_with(
     Ok((values, status))
 }
 
-fn query(pipeline: &MutationPipeline, query: &str) -> (Vec<String>, Completeness) {
+pub(super) fn query(pipeline: &MutationPipeline, query: &str) -> (Vec<String>, Completeness) {
     query_with(pipeline, query, None).expect("query")
 }
 

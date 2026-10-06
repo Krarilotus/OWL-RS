@@ -130,6 +130,11 @@ impl StoreService {
         }
         if let Some(state) = service.reasoning_state() {
             service.note_equality(&state);
+            // Kept in memory too: reads ask for it per query ([`Self::status_without_dl`]).
+            *service
+                .materialised
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(state);
         }
         Ok(service)
     }
@@ -370,9 +375,10 @@ impl StoreService {
     }
 
     /// Switches the `owl2-dl` mode's work on or off ([`crate::dl`]): the mutation
-    /// pipeline running the reasoner's `owl2-dl` mode registers it.
-    pub fn use_dl(&self, active: bool) {
-        self.dl.set_active(active);
+    /// pipeline running the reasoner's `owl2-dl` mode registers it, and whether user rules
+    /// run with it.
+    pub fn use_dl(&self, active: bool, user_rules: bool) {
+        self.dl.set_active(active, user_rules);
     }
 
     /// The `owl2-dl` mode's state.
@@ -438,7 +444,7 @@ impl StoreService {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
-        let mut dl_status = None;
+        let mut dl_status = self.status_without_dl(prepared);
         if let Some(mode) = self.dl_mode(prepared) {
             match crate::dl::query::answer(self, prepared, cancellation, mode)? {
                 crate::dl::query::Outcome::Answers(answers, status) => {
@@ -480,8 +486,32 @@ impl StoreService {
         Ok(dl_status)
     }
 
-    /// Whether [`Self::run_query_reporting`] reports `prepared`'s completeness (computing
-    /// its answers in full before writing them).
+    /// Outside `owl2-dl`, the status of answers that read a ruleset's closure (`None`
+    /// without reasoning, or for asserted statements only): sound, and complete only for
+    /// what the ruleset derives, never certain answers under OWL 2 DL. Known before the
+    /// query runs.
+    pub fn status_without_dl(
+        &self,
+        prepared: &PreparedQuery,
+    ) -> Option<nrese_sparql::Completeness> {
+        if self.dl.active() || prepared.read_model() == ReadModel::Asserted {
+            return None;
+        }
+        let ruleset = self
+            .materialised
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()?
+            .ruleset
+            .clone();
+        Some(nrese_sparql::Completeness::sound_only(format!(
+            "answers over the {ruleset} closure: what its rules derive, not every certain \
+             answer under OWL 2 DL (reasoner.mode = \"owl2-dl\" gives those)"
+        )))
+    }
+
+    /// Whether [`Self::run_query_reporting`] computes `prepared`'s answers in full before
+    /// writing them (under `owl2-dl`, to complete them through the bounds).
     pub fn reports_completeness(&self, prepared: &PreparedQuery) -> bool {
         self.dl_mode(prepared).is_some()
     }

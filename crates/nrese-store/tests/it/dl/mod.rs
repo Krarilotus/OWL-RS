@@ -6,6 +6,7 @@ mod consistency;
 mod entailment;
 mod mode;
 mod queries;
+mod review;
 
 use std::sync::Arc;
 

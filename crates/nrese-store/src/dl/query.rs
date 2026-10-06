@@ -388,6 +388,16 @@ fn decide_answers(
             "the data's consistency under OWL 2 DL isn't known ({why})"
         )),
     }
+    if store.dl().user_rules() {
+        // The rules run over the RL closure only (DL-safe in effect: their variables bind
+        // to the store's terms), never over what OWL 2 DL entails beyond it nor over U1:
+        // a conclusion they'd draw from such a fact is missing from both bounds.
+        status.add(
+            "user rules run with OWL 2 DL: their conclusions from what only OWL 2 DL entails \
+             aren't computed, so no answer is claimed complete"
+                .to_owned(),
+        );
+    }
     if let Some(what) = unbounded(&analysis) {
         status.add(format!(
             "the query reads {what}: entailed schema statements aren't bounded (the RL \

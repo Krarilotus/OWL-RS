@@ -29,6 +29,8 @@ Use the combined URL for clients that take one endpoint address (RDF4J's SPARQL 
 - `nrese-completeness`: `complete` or `sound-only`;
 - `nrese-completeness-bounds`, where the query went through the bounds: `lower=…; upper=…; proved=…; refuted=…; unresolved=…` (answers in the lower bound; in the upper bound; candidates of the gap an exact service proved, which are returned, or refuted; and those neither, which are not returned).
 
+Under any other reasoning mode (a ruleset's closure), answers carry `nrese-completeness: sound-only`: the closure's, not every certain answer under OWL 2 DL; with reasoning disabled, and for `infer=false`, no status is sent.
+
 `explain=true` and `explain=plan` carry the same status as `completeness`: `status`, `complete`, `sound`, `reasons` (why answers may be missing), `paths` (what decided: `closed-predicates`, `bounds-equal`, `exact-ground-entailment`, `exact-internalisable-cq`) and `bounds`; `null` outside `owl2-dl`. A query with its status is computed in full before the first byte (the status is a header); one whose predicates are closed streams as usual.
 
 Other parameters are ignored, so clients that send their own (`queryLn`, `timeout`) work.

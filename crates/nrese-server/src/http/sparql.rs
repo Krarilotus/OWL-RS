@@ -106,9 +106,18 @@ pub async fn execute_query_in(
                     std::io::Write::write_all(out, &body)
                         .map_err(|error| ApiError::internal(error.to_string()))
                 }
-                None => store
-                    .run_query(&prepared, &token, out)
-                    .map_err(|error| map_query_error(&policy, error)),
+                None => {
+                    // A status known before the query runs (a ruleset's closure): a header,
+                    // then the answers as they stream.
+                    if let Some(status) = store.status_without_dl(&prepared) {
+                        for (name, value) in completeness_headers(&status) {
+                            out.set_header(name, value);
+                        }
+                    }
+                    store
+                        .run_query(&prepared, &token, out)
+                        .map_err(|error| map_query_error(&policy, error))
+                }
                 Some(pending) => store
                     .run_query_pending(pending, &prepared, &token, out)
                     .map_err(|error| map_query_error(&policy, error)),
