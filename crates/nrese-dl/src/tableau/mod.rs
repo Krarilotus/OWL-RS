@@ -33,6 +33,7 @@ mod ni;
 mod portfolio;
 mod probe;
 mod program;
+mod retract;
 mod search;
 mod telemetry;
 
@@ -91,6 +92,12 @@ pub struct Config {
     /// choices it depended on, and the open disjunction of the most active clause is
     /// decided first (else the oldest open one).
     pub conflict_order: bool,
+    /// Dynamic backtracking: a clash retracts its culprit level alone and re-decides it on
+    /// top, keeping the levels above (docs/design/owl2-dl-dynamic-backtracking.md).
+    pub dynamic_backtracking: bool,
+    /// After each retraction, assert that nothing alive depends on the retracted level
+    /// (on in debug builds; the campaigns set it).
+    pub check_retraction: bool,
     /// Sizes of counted classes compared before the search ([`crate::numbers`]): a class
     /// with two sizes refutes the program without a branch.
     pub counting: bool,
@@ -130,6 +137,8 @@ impl Default for Config {
             max_branch_points: None,
             merge_filter: true,
             conflict_order: false,
+            dynamic_backtracking: false,
+            check_retraction: cfg!(debug_assertions),
             counting: true,
             timeout: None,
             max_memory: 4 << 30,

@@ -104,6 +104,14 @@ fn configs() -> Vec<(&'static str, Config)> {
             },
         ),
         (
+            "dynamic-backtracking",
+            Config {
+                dynamic_backtracking: true,
+                check_retraction: true,
+                ..base.clone()
+            },
+        ),
+        (
             "at-most-atoms",
             Config {
                 expand_at_most_up_to: 0,
@@ -168,6 +176,25 @@ fn shrink(o: &Ontology) {
 
 /// Every configuration's answer on `o` against the semantics and against each other;
 /// renaming and shuffling (`shuffled`) keep the answer.
+/// Whether `o` counts: a number restriction, or a functional or inverse-functional
+/// property (an at-most-one). A folded model may break those (two predecessors merged by
+/// blocking), and the small-model search is then the only confirmation.
+fn counts(o: &Ontology) -> bool {
+    use nrese_owl::{Axiom, Characteristic, ClassExpr};
+    o.axioms.iter().any(|a| {
+        matches!(
+            a,
+            Axiom::ObjectCharacteristic(Characteristic::Functional, _)
+                | Axiom::ObjectCharacteristic(Characteristic::InverseFunctional, _)
+        )
+    }) || (0..o.classes.len()).any(|i| {
+        matches!(
+            o.classes.get(i as u32),
+            ClassExpr::Max(..) | ClassExpr::Exact(..)
+        ) || matches!(o.classes.get(i as u32), ClassExpr::Min(n, ..) if *n > 1)
+    })
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the campaign's state, threaded through"
@@ -215,8 +242,13 @@ fn check_case(
         // Every configuration's answer is checked against the semantics.
         match &out.answer {
             Answer::Consistent => {
-                let model = out.model.as_ref().and_then(interp);
-                let ok = model.is_some_and(|i| confirms(o, i));
+                // No verdict where the model doesn't fit the reference's 128 elements.
+                let verdict = out
+                    .model
+                    .as_ref()
+                    .and_then(interp)
+                    .and_then(|i| confirms(o, i));
+                let ok = verdict == Some(true);
                 if *name == "default" {
                     tally.consistent += 1;
                 }
@@ -248,7 +280,7 @@ fn check_case(
                     }
                 }
                 assert!(
-                    found.is_some() || numbers,
+                    found.is_some() || numbers || verdict.is_none(),
                     "case {case} ({name}): consistent, but the folded model fails and no small \
                      model exists, without number restrictions\n{}\nmodel: {:?}",
                     render(o),
@@ -325,8 +357,8 @@ fn answers_agree_with_the_semantics() {
 }
 
 /// Guard (the oracle): seed 94543, case 143 is consistent (a 3-cycle along a property
-/// disjoint with its inverse), and its folded model closes a loop on the blocker; untied
-/// into three copies it is a model (`semantics::untie_loops`). It failed the push gate's
+/// disjoint with its inverse), and its folded model closes a loop on the blocker; lifted
+/// into three copies it is a model (`semantics::lift`). It failed the push gate's
 /// new seeds as "consistent, but no model", a confirmation the oracle couldn't make.
 #[test]
 fn a_loop_folded_onto_its_blocker_is_untied() {
@@ -383,7 +415,7 @@ fn campaign(seed: u64, cases: u64, only: Option<u64>) -> Tally {
             &o,
             shuffled,
             &sig,
-            profile.numbers,
+            profile.numbers || counts(&o),
             &mut tally,
             &mut check,
             &mut unconfirmed,

@@ -113,6 +113,12 @@ pub struct Engine<'a> {
     pub deps: DepSets,
     pub done: Done,
     pub pending: Vec<Pending>,
+    /// Pending disjunctions retracted with their level (dynamic backtracking).
+    pub pending_dead: Vec<bool>,
+    /// Nodes whose live facts are joined again after a retraction.
+    pub refire: Vec<u32>,
+    /// Pending disjunctions behind the scan that a retraction may have opened again.
+    pub reopen: Vec<u32>,
     pub bindings: Vec<u32>,
     pub pending_open: u32,
     pub frames: Vec<Frame>,
@@ -151,6 +157,9 @@ impl<'a> Engine<'a> {
             deps: DepSets::default(),
             done: Done::default(),
             pending: Vec::new(),
+            pending_dead: Vec::new(),
+            refire: Vec::new(),
+            reopen: Vec::new(),
             bindings: Vec::new(),
             pending_open: 0,
             frames: Vec::new(),
@@ -430,6 +439,7 @@ impl<'a> Engine<'a> {
                     bind: at,
                     dep,
                 });
+                self.pending_dead.push(false);
                 Ok(())
             }
         }
@@ -454,9 +464,16 @@ impl<'a> Engine<'a> {
                 self.check_memory()?;
             }
             if (self.done.equalities as usize) < self.g.equalities.len() {
-                let e = self.g.equalities[self.done.equalities as usize];
+                let i = self.done.equalities;
+                let e = self.g.equalities[i as usize];
                 self.done.equalities += 1;
-                self.merge(e.a, e.b, e.dep, e.annot)?;
+                if !self.g.equality_dead(i) {
+                    self.merge(e.a, e.b, e.dep, e.annot)?;
+                }
+                continue;
+            }
+            if let Some(step) = self.refire_one() {
+                step?;
                 continue;
             }
             if (self.done.nodes as usize) < self.g.nodes.len() {
@@ -476,7 +493,7 @@ impl<'a> Engine<'a> {
                 let i = self.done.unary;
                 self.done.unary += 1;
                 let f = self.g.unary[i as usize];
-                if self.g.live(f.node) {
+                if self.g.live(f.node) && !self.g.dead.unary[i as usize] {
                     join_concept(
                         self.p,
                         &self.g,
@@ -493,7 +510,7 @@ impl<'a> Engine<'a> {
                 let i = self.done.edges;
                 self.done.edges += 1;
                 let e = self.g.edges[i as usize];
-                if self.g.live(e.from) && self.g.live(e.to) {
+                if self.g.live(e.from) && self.g.live(e.to) && !self.g.dead.edges[i as usize] {
                     join_edge(
                         self.p,
                         &self.g,
@@ -510,7 +527,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn apply_firings(&mut self) -> Step<()> {
+    pub(super) fn apply_firings(&mut self) -> Step<()> {
         if self.firings.len() >= super::hyper::MAX_FIRINGS {
             self.firings.clear();
             return Err(Stop::GaveUp(format!(
