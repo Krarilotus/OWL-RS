@@ -119,9 +119,12 @@ pub struct Engine {
     contexts: Arena,
     registry: Mutex<HashMap<CoreKey, ContextId>>,
     budget: Budget,
+    /// Pred joins stop where the body so far already makes the conclusion redundant.
+    pub prune_pred: bool,
     /// The budget ran out: the workers drop what is left (the saturation is then
     /// incomplete and says so).
     exhausted: AtomicBool,
+    memory: Option<nrese_exec::memory::MemoryWatch>,
 }
 
 /// What a saturation may use (the dynamic fallback's budgets, design §4, in their first
@@ -132,6 +135,9 @@ pub struct Budget {
     /// The most conclusions one join of the Pred rule may produce (its premises'
     /// combinations can grow as their product).
     pub max_join: Option<usize>,
+    /// The most memory the process may hold (bytes, `nrese_exec::memory`): a saturation
+    /// that grows past it stops instead of taking the machine.
+    pub max_memory: Option<u64>,
 }
 
 impl Engine {
@@ -143,13 +149,22 @@ impl Engine {
             contexts: Arena::new(),
             registry: Mutex::new(HashMap::new()),
             budget: Budget::default(),
+            prune_pred: true,
             exhausted: AtomicBool::new(false),
+            memory: None,
         }
+    }
+
+    /// The engine with Pred's pruning on or off (on by default; off only for A/B runs).
+    pub fn with_prune_pred(mut self, on: bool) -> Self {
+        self.prune_pred = on;
+        self
     }
 
     /// The engine with a budget.
     pub fn with_budget(mut self, budget: Budget) -> Self {
         self.budget = budget;
+        self.memory = budget.max_memory.map(nrese_exec::memory::MemoryWatch::new);
         self
     }
 
@@ -167,12 +182,15 @@ impl Engine {
         self.exhausted.store(true, Relaxed);
     }
 
-    /// Whether the deadline passed (marks the budget spent if so).
-    pub(super) fn out_of_time(&self) -> bool {
+    /// Whether the deadline passed or the memory limit is exceeded (marks the budget
+    /// spent if so).
+    pub(super) fn out_of_budget(&self) -> bool {
         if self.exhausted() {
             return true;
         }
-        if self.budget.deadline.is_some_and(|d| Instant::now() >= d) {
+        if self.budget.deadline.is_some_and(|d| Instant::now() >= d)
+            || self.memory.as_ref().is_some_and(|m| m.exceeded())
+        {
             self.exhaust();
             return true;
         }
@@ -264,7 +282,7 @@ impl Engine {
         let context = self.context(c);
         loop {
             let mut batch = std::mem::take(&mut *lock(&context.inbox));
-            if !batch.is_empty() && self.out_of_time() {
+            if !batch.is_empty() && self.out_of_budget() {
                 // Out of budget: the messages are dropped, the run reports it.
                 batch.clear();
             }

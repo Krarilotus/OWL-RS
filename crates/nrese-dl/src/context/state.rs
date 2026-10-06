@@ -7,7 +7,7 @@
 
 use hashbrown::HashMap;
 
-use super::atoms::{Atom, CTerm, Kind, RoleId, is_subset};
+use super::atoms::{Atom, CTerm, Kind, RoleId, is_subset, signature};
 
 /// A context, by its index in the arena of contexts.
 pub type ContextId = u32;
@@ -31,6 +31,9 @@ pub enum Rule {
     Pred,
     /// `A → A` for a possible atom of a successor.
     Succ,
+    /// A clause about a neighbour copied onto one merged with it (`dl`: the merge, an
+    /// index into the context's merges).
+    Eq,
 }
 
 /// How a clause was derived: the first derivation, recorded when proofs are on.
@@ -54,6 +57,11 @@ pub struct ClauseRec {
     /// premises of Hyper and Pred (the given-clause loop), so each inference happens
     /// once, when its last premise is processed.
     pub processed: bool,
+    /// The body's [`signature`].
+    pub sig: u64,
+    /// A copy along an unconditional merge by the Eq rule, which is not copied on (the
+    /// unconditional merges are closed).
+    pub copy: bool,
 }
 
 /// Bodies of one context, interned: sorted, without repeats.
@@ -100,8 +108,6 @@ pub struct Counters {
     pub forward: u64,
     /// Clauses removed by backward redundancy (a new clause was stronger).
     pub backward: u64,
-    /// Body inclusion tests (`is_subset`) the redundancy checks made, forward and backward.
-    pub subset_checks: u64,
     pub hyper: u64,
     pub pred: u64,
     pub messages: u64,
@@ -112,6 +118,12 @@ pub struct Counters {
     pub slots: u64,
     /// Premise lists looked up by the joins.
     pub lookups: u64,
+    /// Inclusion tests of the redundancy checks: forward, one set-trie query per head
+    /// looked up; backward, each candidate past its signature.
+    pub subset_checks: u64,
+    /// The Eq rule's merges, and its copies.
+    pub merges: u64,
+    pub eq: u64,
 }
 
 /// A context's clauses and indexes.
@@ -136,6 +148,18 @@ pub struct Clauses {
     /// To process: clauses with an empty body first (Sequoia's §5.2.2), then the rest.
     pub agenda: Vec<ClauseId>,
     pub agenda_conditional: Vec<ClauseId>,
+    /// The forward redundancy index: per head, its clauses' bodies in a set-trie (the
+    /// subset query walks only the paths the body has), and the heads that hold
+    /// unconditionally. Dead clauses stay in it and are skipped.
+    pub tries: HashMap<Atom, super::settrie::SetTrie>,
+    /// The backward redundancy index: clauses with a non-empty body by `(head, atom of
+    /// the body)`. A body that contains a new clause's body contains each of its atoms,
+    /// so the rarest atom's list holds every candidate. Dead clauses are dropped from a
+    /// list when it is walked.
+    pub occurrences: HashMap<(Atom, Atom), Vec<ClauseId>>,
+    /// Per head: entries of `heads` whose clause died since the list was compacted.
+    pub dead: HashMap<Atom, u32>,
+    pub unconditional_heads: hashbrown::HashSet<Atom>,
     /// `⊤ → ⊥` is here: every other clause is redundant.
     pub unsat: bool,
     pub derivations: Vec<Derivation>,
@@ -165,20 +189,17 @@ impl Clauses {
             })
     }
 
-    /// Whether a live clause makes `body → head` redundant (Definition 4, case 2), and the
-    /// inclusion tests that took.
-    fn subsumed(&self, body: &[Atom], head: Atom) -> (bool, u64) {
-        let mut checks = 0;
-        let mut stronger = |key: Atom| {
-            self.heads.get(&key).is_some_and(|list| {
-                list.iter().any(|&c| {
-                    checks += 1;
-                    is_subset(self.bodies.get(self.recs[c as usize].body), body)
-                })
-            })
+    /// Whether a live clause makes `body → head` redundant (Definition 4, case 2).
+    pub(super) fn subsumed(&self, body: &[Atom], head: Atom) -> bool {
+        let stronger = |key: Atom| {
+            if self.unconditional_heads.contains(&key) {
+                return true;
+            }
+            self.tries
+                .get(&key)
+                .is_some_and(|trie| trie.has_subset(body, &|c| self.recs[c as usize].live))
         };
-        let found = stronger(Atom::BOTTOM) || (!head.is_bottom() && stronger(head));
-        (found, checks)
+        stronger(Atom::BOTTOM) || (!head.is_bottom() && stronger(head))
     }
 
     /// Adds `body → head` unless it is redundant (the paper's Derive, Algorithm 3);
@@ -192,34 +213,34 @@ impl Clauses {
         proofs: bool,
     ) -> Option<ClauseId> {
         self.counters.generated += 1;
-        if self.unsat {
-            self.counters.forward += 1;
-            return None;
-        }
-        let (subsumed, checks) = self.subsumed(body, head);
-        self.counters.subset_checks += checks;
-        if subsumed {
+        self.counters.subset_checks += if head.is_bottom() { 1 } else { 2 };
+        if self.unsat || self.subsumed(body, head) {
             self.counters.forward += 1;
             return None;
         }
         // Backward: weaker clauses with the same head (for ⊥ only when the context is
         // contradictory: then everything goes; a scan for every weaker clause of any head
         // costs more than the inferences it saves).
-        if let Some(list) = self.heads.get_mut(&head) {
-            let (recs, bodies) = (&mut self.recs, &self.bodies);
-            let before = list.len();
-            self.counters.subset_checks += before as u64;
-            list.retain(|&c| {
-                let rec = &mut recs[c as usize];
-                if is_subset(body, bodies.get(rec.body)) {
-                    rec.live = false;
-                    false
-                } else {
-                    true
+        let sig = signature(body);
+        let removed = if body.is_empty() {
+            // Every clause with this head is weaker.
+            let mut n = 0u32;
+            if let Some(list) = self.heads.get_mut(&head) {
+                for &c in list.iter() {
+                    let rec = &mut self.recs[c as usize];
+                    if rec.live {
+                        rec.live = false;
+                        n += 1;
+                    }
                 }
-            });
-            self.counters.backward += (before - list.len()) as u64;
-        }
+                list.clear();
+            }
+            self.dead.remove(&head);
+            n
+        } else {
+            self.remove_weaker(body, sig, head)
+        };
+        self.counters.backward += u64::from(removed);
         let id = self.recs.len() as ClauseId;
         let body_id = self.bodies.intern(body);
         self.recs.push(ClauseRec {
@@ -227,7 +248,12 @@ impl Clauses {
             head,
             live: true,
             processed: false,
+            sig,
+            copy: false,
         });
+        for &a in body {
+            self.occurrences.entry((head, a)).or_default().push(id);
+        }
         self.counters.kept += 1;
         self.counters.max_body = self.counters.max_body.max(body.len() as u64);
         if proofs {
@@ -245,6 +271,11 @@ impl Clauses {
             self.index_role(head);
         }
         self.heads.entry(head).or_default().push(id);
+        if body.is_empty() {
+            self.unconditional_heads.insert(head);
+        } else {
+            self.tries.entry(head).or_default().insert(body, id);
+        }
         if head.is_bottom() && body.is_empty() {
             self.unsat = true;
             self.agenda.clear();
@@ -255,6 +286,11 @@ impl Clauses {
             self.recs[id as usize].live = true;
             self.heads.clear();
             self.heads.insert(Atom::BOTTOM, vec![id]);
+            self.tries.clear();
+            self.occurrences.clear();
+            self.dead.clear();
+            self.unconditional_heads.clear();
+            self.unconditional_heads.insert(Atom::BOTTOM);
         }
         if body.is_empty() {
             self.agenda.push(id);
@@ -264,6 +300,53 @@ impl Clauses {
         let waiting = (self.agenda.len() + self.agenda_conditional.len()) as u64;
         self.counters.peak_agenda = self.counters.peak_agenda.max(waiting);
         Some(id)
+    }
+
+    /// Marks dead the clauses with `head` whose body contains `body` (non-empty, with
+    /// signature `sig`); how many. The head's list drops them once half of it is dead.
+    fn remove_weaker(&mut self, body: &[Atom], sig: u64, head: Atom) -> u32 {
+        let Some(&rarest) = body
+            .iter()
+            .min_by_key(|&&a| self.occurrences.get(&(head, a)).map_or(0, Vec::len))
+        else {
+            return 0;
+        };
+        let Some(list) = self.occurrences.get_mut(&(head, rarest)) else {
+            return 0;
+        };
+        let (recs, bodies) = (&mut self.recs, &self.bodies);
+        let mut removed = 0u32;
+        let mut checks = 0u64;
+        list.retain(|&c| {
+            let rec = &mut recs[c as usize];
+            if !rec.live {
+                return false;
+            }
+            if sig & !rec.sig != 0 {
+                return true;
+            }
+            checks += 1;
+            if is_subset(body, bodies.get(rec.body)) {
+                rec.live = false;
+                removed += 1;
+                return false;
+            }
+            true
+        });
+        self.counters.subset_checks += checks;
+        if removed > 0 {
+            let dead = self.dead.entry(head).or_default();
+            *dead += removed;
+            let len = self.heads.get(&head).map_or(0, Vec::len) as u32;
+            if *dead * 2 > len {
+                *dead = 0;
+                if let Some(list) = self.heads.get_mut(&head) {
+                    let recs = &self.recs;
+                    list.retain(|&c| recs[c as usize].live);
+                }
+            }
+        }
+        removed
     }
 
     fn index_role(&mut self, head: Atom) {

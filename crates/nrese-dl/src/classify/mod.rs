@@ -79,8 +79,28 @@ pub struct Options {
     pub lower_bound_strategy: crate::context::Strategy,
     /// The most conclusions one join of the context core may produce, per run.
     pub max_join: usize,
+    /// The most memory the process may hold while the context core runs (bytes; `None`:
+    /// three quarters of what the machine or container has).
+    pub max_memory: Option<u64>,
+    /// The context core takes functional properties with its Eq rule
+    /// ([`crate::context::Options::equality`]).
+    pub equality: bool,
     /// How `nrese-owl` normalises (never with lazy definitions: see the default).
     pub normalise: nrese_owl::Options,
+}
+
+impl Options {
+    /// The context core's options for a run of the driver within `budget` (no proofs).
+    pub(crate) fn core(&self, budget: crate::context::Budget) -> crate::context::Options {
+        crate::context::Options {
+            threads: self.threads,
+            proofs: false,
+            budget,
+            strategy: self.lower_bound_strategy,
+            equality: self.equality,
+            ..crate::context::Options::default()
+        }
+    }
 }
 
 impl Default for Options {
@@ -108,8 +128,13 @@ impl Default for Options {
             // ore_ont_7127 (65 k classes) needs 3.9 s, and then no class needs a test: at
             // 2 s it ran out, and 65 k tests took 43 s.
             lower_bound_timeout: Duration::from_secs(60),
-            lower_bound_strategy: crate::context::Strategy::Cautious,
+            // Split: successors whose filler isn't certain get a context per Skolem
+            // function, not one shared by all (where it formed, that hub held up to 99 %
+            // of the clauses; ORE development A/B in the commit that made it default).
+            lower_bound_strategy: crate::context::Strategy::Split,
             max_join: 1 << 20,
+            max_memory: None,
+            equality: false,
             // No lazy unfolding: it under-approximates the unfolded classes in a model, and
             // the driver reads its subsumers off model labels. No proofs are read here, so
             // the minimal automata do.
@@ -170,6 +195,11 @@ impl Deadline {
         crate::context::Budget {
             deadline,
             max_join: Some(options.max_join),
+            // A saturation is only an optimisation here: past the limit it stops, where an
+            // allocation failure would end the process (ore_ont_9724 under equality).
+            max_memory: options
+                .max_memory
+                .or_else(|| nrese_exec::memory::available_bytes().map(|b| b / 4 * 3)),
         }
     }
 
@@ -240,15 +270,11 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
     let normalise = t.elapsed();
     trace("context core");
     if options.context_core {
-        let core = crate::context::Options {
-            threads: options.threads,
-            proofs: false,
-            normalise: options.normalise,
-            budget: deadline.budget(options, None),
-            ..crate::context::Options::default()
-        };
+        let core = options.core(deadline.budget(options, None));
         let t = Instant::now();
-        if let Ok(saturated) = crate::context::saturate_normalised(&normalised, &classes, &core) {
+        if let Ok(saturated) = crate::context::saturate_normalised(&normalised, &classes, &core)
+            && saturated.complete()
+        {
             let classification = saturated.classification();
             let profile = Profile {
                 path: "context-core",

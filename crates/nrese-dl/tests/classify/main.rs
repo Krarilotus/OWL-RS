@@ -195,10 +195,25 @@ fn variants() -> Vec<(&'static str, Options)> {
             },
         ),
         (
-            "split-lower-bound",
+            "cautious-lower-bound",
             Options {
                 context_core: false,
-                lower_bound_strategy: nrese_dl::context::Strategy::Split,
+                lower_bound_strategy: nrese_dl::context::Strategy::Cautious,
+                ..base.clone()
+            },
+        ),
+        (
+            "equality",
+            Options {
+                equality: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "equality-lower-bound",
+            Options {
+                context_core: false,
+                equality: true,
                 ..base.clone()
             },
         ),
@@ -714,4 +729,45 @@ fn tests_with_individuals_start_from_their_model() {
         "{}",
         off.profile.line()
     );
+}
+
+/// Guard: axioms every test would leave out (an irregular role hierarchy, `r1∘r2 ⊑ r3`
+/// beside `r3 ⊑ r1`, outside OWL 2 DL) are known before any test. The Horn lower bound is
+/// the answer at once, with every class incomplete, and no test runs (an EL ontology of
+/// 20,000 classes searched 600 s, 30 M nodes, to the same answer).
+#[test]
+fn left_out_axioms_answer_from_the_lower_bound_at_once() {
+    use nrese_owl::ObjProp;
+    let mut o = Ontology::default();
+    let class = |o: &mut Ontology, t: Term| ExprId(o.classes.intern(ClassExpr::Class(t)));
+    let (a, b, c, d) = (
+        class(&mut o, 1),
+        class(&mut o, 2),
+        class(&mut o, 3),
+        class(&mut o, 4),
+    );
+    let (r1, r2, r3) = (ObjProp::Named(10), ObjProp::Named(11), ObjProp::Named(12));
+    o.axioms.push(Axiom::SubObjectPropertyOf(vec![r1, r2], r3));
+    o.axioms.push(Axiom::SubObjectPropertyOf(vec![r3], r1));
+    // A universal over `r1` needs its automaton, which the hierarchy has none of.
+    let e = class(&mut o, 5);
+    let all_b = ExprId(o.classes.intern(ClassExpr::All(r1, b)));
+    o.axioms.push(Axiom::SubClassOf(e, all_b));
+    // The Horn part's subsumption, over a role outside the hierarchy (the axiom with the
+    // universal is left out of it).
+    let r4 = ObjProp::Named(13);
+    let some_b = ExprId(o.classes.intern(ClassExpr::Some(r4, b)));
+    let some_c = ExprId(o.classes.intern(ClassExpr::Some(r4, c)));
+    o.axioms.push(Axiom::SubClassOf(a, some_b));
+    o.axioms.push(Axiom::SubClassOf(b, c));
+    o.axioms.push(Axiom::EquivalentClasses(vec![d, some_c]));
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let t = classify::classify(&o, &options());
+    assert_eq!(t.profile.tests, 0, "{}", t.profile.line());
+    assert!(
+        t.incomplete.iter().any(|i| i.contains("irregular")),
+        "{:?}",
+        t.incomplete
+    );
+    assert!(t.classification.subsumptions.contains(&(1, 4)));
 }

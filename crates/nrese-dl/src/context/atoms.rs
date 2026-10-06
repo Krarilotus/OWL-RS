@@ -218,6 +218,14 @@ impl TermOrder {
 }
 
 /// Whether sorted `small` is a subset of sorted `big`.
+/// A body's signature: one of 64 bits per atom (SatELite's): `small ⊆ big` needs
+/// `sig(small) & !sig(big) == 0`, so most failing subset tests end at one AND.
+pub fn signature(body: &[Atom]) -> u64 {
+    body.iter().fold(0u64, |s, a| {
+        s | 1u64 << (a.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58)
+    })
+}
+
 pub fn is_subset(small: &[Atom], big: &[Atom]) -> bool {
     if small.len() > big.len() {
         return false;

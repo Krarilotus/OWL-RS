@@ -38,9 +38,10 @@ pub fn resident_bytes() -> Option<u64> {
     imp::resident_bytes()
 }
 
-/// The memory this process may use: the container's limit if there is one (cgroup v2,
-/// then v1, on Linux), else the machine's physical memory; `None` where the platform
-/// doesn't say.
+/// The memory this process may use: the smallest of the machine's physical memory and the
+/// limits it runs under (on Linux its cgroup's and every ancestor's, so a container, a
+/// Kubernetes pod or a systemd scope counts; on Windows its job object's); `None` where the
+/// platform doesn't say.
 pub fn available_bytes() -> Option<u64> {
     imp::available_bytes()
 }
@@ -103,6 +104,11 @@ impl MemoryWatch {
 
 #[cfg(windows)]
 mod imp {
+    use windows_sys::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject,
+    };
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
     };
@@ -151,7 +157,43 @@ mod imp {
         // SAFETY: `status` is a valid, writable MEMORYSTATUSEX with dwLength set, as the
         // API requires.
         let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
-        (ok != 0).then_some(status.ullTotalPhys)
+        let machine = (ok != 0).then_some(status.ullTotalPhys)?;
+        Some(job_limit().map_or(machine, |limit| limit.min(machine)))
+    }
+
+    /// The memory limit of the job object the process runs in (a job-wide or a per-process
+    /// one, whichever is smaller), if it runs in one that has a limit. Only the innermost job
+    /// is visible: a process started by `cargo run` or `cargo test` sits in cargo's own job
+    /// (which has no limit), so a cap on an enclosing job is seen only by processes started
+    /// directly, as a service or a container starts the server.
+    pub(super) fn job_limit() -> Option<u64> {
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        let size =
+            u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).ok()?;
+        // SAFETY: a null handle names the job of the calling process; `info` is a valid,
+        // writable JOBOBJECT_EXTENDED_LIMIT_INFORMATION of `size` bytes, and the returned
+        // length isn't wanted. Outside a job the call fails.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                std::ptr::null_mut(),
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_mut(&mut info).cast(),
+                size,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let flags = info.BasicLimitInformation.LimitFlags;
+        [
+            (JOB_OBJECT_LIMIT_JOB_MEMORY, info.JobMemoryLimit),
+            (JOB_OBJECT_LIMIT_PROCESS_MEMORY, info.ProcessMemoryLimit),
+        ]
+        .into_iter()
+        .filter(|&(flag, limit)| flags & flag != 0 && limit > 0)
+        .map(|(_, limit)| limit as u64)
+        .min()
     }
 }
 
@@ -203,15 +245,8 @@ mod imp {
             let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
             Some(kib * 1024)
         })?;
-        // cgroup v2, then v1; "max" and absurd values mean "no limit".
-        let container = [
-            "/sys/fs/cgroup/memory.max",
-            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-        ]
-        .iter()
-        .filter_map(|path| read(path)?.trim().parse::<u64>().ok())
-        .find(|&limit| limit > 0 && limit < machine);
-        Some(container.unwrap_or(machine))
+        let limit = read("/proc/self/cgroup").and_then(|own| super::cgroup::limit(&own, read));
+        Some(limit.map_or(machine, |limit| limit.min(machine)))
     }
 }
 
@@ -238,9 +273,124 @@ mod imp {
     }
 }
 
+/// The memory limit a Linux process runs under, from its cgroup membership: cgroup v2 (a
+/// `0::/path` line) reads `memory.max` in the process's group and every ancestor's, v1 (a
+/// line naming the `memory` controller) `memory.limit_in_bytes`; the smallest counts. "max"
+/// and v1's page-aligned maximum mean no limit. `read` reads a file's text.
+#[cfg(any(target_os = "linux", test))]
+mod cgroup {
+    /// Above this a limit means "none".
+    const NONE_ABOVE: u64 = 1 << 62;
+
+    pub fn limit(own: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64> {
+        let (root, file, path) = own.lines().find_map(|line| {
+            let mut fields = line.splitn(3, ':');
+            let (_, controllers, path) = (fields.next()?, fields.next()?, fields.next()?);
+            if controllers.is_empty() {
+                Some(("/sys/fs/cgroup", "memory.max", path))
+            } else if controllers.split(',').any(|c| c == "memory") {
+                Some(("/sys/fs/cgroup/memory", "memory.limit_in_bytes", path))
+            } else {
+                None
+            }
+        })?;
+        let mut dir = path.trim().trim_end_matches('/').to_owned();
+        let mut smallest: Option<u64> = None;
+        loop {
+            if let Some(value) = read(&format!("{root}{dir}/{file}"))
+                .and_then(|text| text.trim().parse::<u64>().ok())
+                .filter(|&value| value > 0 && value < NONE_ABOVE)
+            {
+                smallest = Some(smallest.map_or(value, |s| s.min(value)));
+            }
+            match dir.rfind('/') {
+                Some(cut) => dir.truncate(cut),
+                None => break,
+            }
+        }
+        smallest
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cgroup_limit_is_the_smallest_on_the_path_up() {
+        use std::collections::HashMap;
+        let files: HashMap<&str, &str> = HashMap::from([
+            ("/sys/fs/cgroup/user.slice/memory.max", "max"),
+            (
+                "/sys/fs/cgroup/user.slice/user-1000.slice/memory.max",
+                "34359738368",
+            ),
+            (
+                "/sys/fs/cgroup/user.slice/user-1000.slice/run.scope/memory.max",
+                "17179869184",
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+                "4294967296",
+            ),
+            (
+                "/sys/fs/cgroup/memory/free/memory.limit_in_bytes",
+                "9223372036854771712",
+            ),
+        ]);
+        let read = |path: &str| files.get(path).map(|text| (*text).to_owned());
+        // v2: the scope's 16 GiB, under its slice's 32 GiB.
+        let own = "0::/user.slice/user-1000.slice/run.scope";
+        assert_eq!(cgroup::limit(own, read), Some(16 << 30));
+        // v1: the memory controller's line, not the others'.
+        let own = "4:cpu,cpuacct:/docker/abc\n3:memory:/docker/abc";
+        assert_eq!(cgroup::limit(own, read), Some(4 << 30));
+        // No limit anywhere, or v1's "none" value.
+        assert_eq!(cgroup::limit("0::/system.slice/x.service", read), None);
+        assert_eq!(cgroup::limit("3:memory:/free", read), None);
+    }
+
+    /// A job object's memory limit counts as the memory the process may use: the test puts
+    /// its own process into a job with a limit below the machine's memory (it becomes the
+    /// innermost job) and reads it back.
+    #[cfg(windows)]
+    #[test]
+    fn a_job_objects_memory_limit_counts_as_the_memory_available() {
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_JOB_MEMORY,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let machine = available_bytes().expect("the platform reports the memory it may use");
+        // Above what the tests use, below the machine; whole pages, as Windows keeps it.
+        let limit = (machine / 4 * 3).max(4 << 30) & !0xFFF;
+        if limit >= machine {
+            return;
+        }
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
+        info.JobMemoryLimit = usize::try_from(limit).expect("a limit that fits");
+        let size = u32::try_from(std::mem::size_of_val(&info)).expect("a small struct");
+        // SAFETY: a fresh unnamed job; `info` is a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        // of `size` bytes; the current process's pseudo-handle needs no closing. The job
+        // handle stays open for the process's life, so the job lives as long as the test
+        // binary.
+        let assigned = unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            !job.is_null()
+                && SetInformationJobObject(
+                    job,
+                    JobObjectExtendedLimitInformation,
+                    std::ptr::from_ref(&info).cast(),
+                    size,
+                ) != 0
+                && AssignProcessToJobObject(job, GetCurrentProcess()) != 0
+        };
+        assert!(assigned, "{}", std::io::Error::last_os_error());
+        assert_eq!(imp::job_limit(), Some(limit));
+        assert_eq!(available_bytes(), Some(limit));
+    }
 
     #[test]
     fn the_process_and_the_machine_report_their_memory() {

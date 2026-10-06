@@ -58,6 +58,10 @@ comparator also `hangs`, `unsupported` and `not expressible`.
   its memory cap, with the build from the worktree's own target volume. The build is
   `scripts/cargo-guarded.sh` inside that image (`CARGO_BUILD_JOBS`, default 4;
   `NRESE_MEMORY_CAP_GB`, default 8; the container capped to match).
+- **A quiet slot per case.** Each case's timed repetitions, and each comparison's runs, hold
+  the machine's quiet slot (`scripts/quiet-slot.sh`: one timing at a time, no build running,
+  new builds waiting), taken per case so other builds wait minutes, not the whole run.
+  Waiting for the slot doesn't count against a case's timeout. `NRESE_QUIET_SLOT=0` skips it.
 - **Memory:** the container's peak (cgroup `memory.peak`) and the process's (`VmHWM`), after
   the load, after reasoning and at the end.
 - **Repetitions:** `--reps 2` by default, interleaved: every case once, then every case

@@ -103,6 +103,28 @@ run_tests() {
   fi
 }
 
+# The random tests of the given crates (scripts/lib/fuzz-targets.txt) with a few more seeds
+# than the one they run with otherwise: seeds drawn from the commit, so each push tries new
+# ones and a failure replays (NRESE_FUZZ_SEED=<seed>). The fuzz campaign runs many more.
+run_seeds() {
+  local -A wanted=()
+  local name entry crate target filter seed code=0
+  for name in "$@"; do wanted[$name]=1; done
+  local base=$(( 16#$(git rev-parse --short=6 HEAD) % 100000 + 1000 ))
+  while IFS=: read -r crate target filter; do
+    [ -n "${wanted[$crate]:-}" ] || continue
+    local kind=(--test "$target")
+    [ "$target" = lib ] && kind=(--lib)
+    for seed in $base $((base + 1)) $((base + 2)); do
+      if ! NRESE_FUZZ_SEED=$seed "$guarded" test --locked -q -p "$crate" "${kind[@]}" -- $filter > /dev/null 2>&1; then
+        echo "random tests fail: NRESE_FUZZ_SEED=$seed cargo test -p $crate ${kind[*]} -- $filter"
+        code=1
+      fi
+    done
+  done < <(grep -v '^#' scripts/lib/fuzz-targets.txt | tr -d '\r' | grep .)
+  return $code
+}
+
 # The steps for files outside the Rust workspace.
 side_steps() {
   local files=("$@")
@@ -137,7 +159,11 @@ console() {
 
 case "$mode" in
   commit | push)
-    if [ "$mode" = commit ]; then
+    if [ "$mode" = commit ] && git rev-parse -q --verify MERGE_HEAD > /dev/null; then
+      # A merge: what the merged tree has the same as the branch merged in was tested there.
+      # New is what differs from it: this side's changes and the resolved conflicts.
+      mapfile -t files < <(git diff --name-only --cached MERGE_HEAD; git ls-files --others --exclude-standard)
+    elif [ "$mode" = commit ]; then
       mapfile -t files < <(git diff --name-only HEAD; git ls-files --others --exclude-standard)
     else
       base=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || echo HEAD~1)
@@ -156,6 +182,7 @@ case "$mode" in
         step test run_tests "${changed[@]}" -- "${changed[@]}"
       else
         step test run_tests "${changed[@]}" "${dependents[@]}" -- "${dependents[@]}"
+        step seeds run_seeds "${changed[@]}"
         step locks bash scripts/check-locks.sh
       fi
     fi
