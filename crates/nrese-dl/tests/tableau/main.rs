@@ -826,3 +826,95 @@ fn an_edge_tries_only_the_plans_its_ends_key() {
         out.telemetry
     );
 }
+
+/// The W3C integer-multiplication shape (DL-906, 907, 910) with `N`, `M` and the count
+/// `K` of `d`'s r-predecessors: `{d} ≡ (= N p⁻) ≡ (= K r⁻)`, `CN ≡ ∃p.{d} ≡ (= M q⁻)`,
+/// `NM ≡ ∃q.CN ≡ ∃r.{d}`; p, r and (where `q_functional`) q functional. Consistent iff
+/// `K = N·M` (with q functional).
+fn multiplication(n: u32, m: u32, k: u32, q_functional: bool) -> nrese_owl::Ontology {
+    let mut b = Build::default();
+    let (p, q, r) = (
+        ObjProp::Named(200),
+        ObjProp::Named(201),
+        ObjProp::Named(202),
+    );
+    let only_d = b.class(1);
+    let cn = b.class(2);
+    let nm = b.class(3);
+    let d = b.e(ClassExpr::OneOf(vec![100]));
+    b.equivalent(only_d, d);
+    let thing = b.e(ClassExpr::Thing);
+    let n_p = b.e(ClassExpr::Exact(n, p.inverse(), thing));
+    b.equivalent(only_d, n_p);
+    let k_r = b.e(ClassExpr::Exact(k, r.inverse(), thing));
+    b.equivalent(only_d, k_r);
+    let to_d = b.some(p, only_d);
+    b.equivalent(cn, to_d);
+    let m_q = b.e(ClassExpr::Exact(m, q.inverse(), thing));
+    b.equivalent(cn, m_q);
+    let to_cn = b.some(q, cn);
+    b.equivalent(nm, to_cn);
+    let r_d = b.some(r, only_d);
+    b.equivalent(nm, r_d);
+    b.characteristic(Characteristic::Functional, p);
+    b.characteristic(Characteristic::Functional, r);
+    if q_functional {
+        b.characteristic(Characteristic::Functional, q);
+    }
+    b.o
+}
+
+/// Guard (counted classes): `K ≠ N·M` is refuted by arithmetic before the search, with no
+/// branch point (the merge search is pigeonhole-hard: N=2, M=3, K=7 gave up after 774 k
+/// branch points in 30 s; DL-910 likewise). `K = N·M` stays consistent; without q
+/// functional the product doesn't hold and nothing is refuted.
+#[test]
+fn class_sizes_refute_a_wrong_product() {
+    let config = Config {
+        max_branch_points: Some(20_000),
+        ..Config::default()
+    };
+    let out = consistency(&multiplication(2, 3, 7, true), &config);
+    assert_eq!(out.answer, Answer::Inconsistent, "{}", out.telemetry);
+    assert_eq!(out.telemetry.branch_points, 0, "{}", out.telemetry);
+    let off = consistency(
+        &multiplication(2, 3, 7, true),
+        &Config {
+            counting: false,
+            ..config.clone()
+        },
+    );
+    assert!(off.telemetry.branch_points > 0, "{}", off.telemetry);
+    let out = consistency(&multiplication(2, 3, 6, true), &config);
+    assert_eq!(out.answer, Answer::Consistent, "{}", out.telemetry);
+    let out = consistency(&multiplication(2, 3, 7, false), &config);
+    assert_ne!(out.answer, Answer::Inconsistent, "{}", out.telemetry);
+}
+
+/// Guard (keyed role plans on a self-loop): a plan keyed by the edge's target must run
+/// for `r(x, x)` too (the brute-force campaign, seed 96, case 206: a subsumption through
+/// `∃r.Self` was missed where the keyed lookup stopped after the source). Here
+/// `A ⊓ ∃r.Self ⊓ ∀r⁻.B`: `r(x, x)` with `∀r⁻.B(x)` (keyed by the target) gives `B(x)`,
+/// which clashes with `A`. Padding universals make the role's keyed plans outnumber the
+/// labels, so the lookup path runs.
+#[test]
+fn keyed_plans_run_on_a_self_loop() {
+    let mut b = Build::default();
+    let r = ObjProp::Named(200);
+    let (a, bb) = (b.class(1), b.class(2));
+    let own = b.e(ClassExpr::HasSelf(r));
+    let back = b.all(r.inverse(), bb);
+    let x = b.and(&[a, own, back]);
+    let nothing = b.e(ClassExpr::Nothing);
+    let ab = b.and(&[a, bb]);
+    b.sub(ab, nothing);
+    for i in 0..50 {
+        let pad = b.class(100 + i);
+        let pad_to = b.class(200 + i);
+        let all = b.all(r, pad_to);
+        b.sub(pad, all);
+    }
+    b.assert(x, 1000);
+    let out = consistency(&b.o, &Config::default());
+    assert_eq!(out.answer, Answer::Inconsistent, "{}", out.telemetry);
+}

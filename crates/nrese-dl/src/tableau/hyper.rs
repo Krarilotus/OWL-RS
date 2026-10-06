@@ -83,10 +83,9 @@ pub fn join_edge(
         keyed.iter().for_each(&mut start);
         return;
     }
+    // Each end's keys apart, a self-loop's too: a plan is keyed by one end only, so none
+    // runs twice.
     for (node, end) in [(e.from, false), (e.to, true)] {
-        if end && e.from == e.to {
-            break;
-        }
         for f in g.labels(node) {
             for &k in p
                 .keyed_by

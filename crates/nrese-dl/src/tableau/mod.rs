@@ -91,6 +91,9 @@ pub struct Config {
     /// choices it depended on, and the open disjunction of the most active clause is
     /// decided first (else the oldest open one).
     pub conflict_order: bool,
+    /// Sizes of counted classes compared before the search ([`crate::numbers`]): a class
+    /// with two sizes refutes the program without a branch.
+    pub counting: bool,
     pub timeout: Option<Duration>,
     /// The most memory a run may hold (its tables, indexes and arenas), in bytes.
     pub max_memory: usize,
@@ -127,6 +130,7 @@ impl Default for Config {
             max_branch_points: None,
             merge_filter: true,
             conflict_order: false,
+            counting: true,
             timeout: None,
             max_memory: 4 << 30,
             keep_model: false,

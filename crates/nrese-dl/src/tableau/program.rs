@@ -207,6 +207,8 @@ pub struct Program {
     pub assertions: Assertions,
     /// What was left out, and why.
     pub weakened: Vec<String>,
+    /// Why the clauses' class sizes contradict each other, if they do ([`crate::numbers`]).
+    pub refuted: Option<String>,
     /// Whether every clause is simple (Definition 10: no edge towards `x`, no inverse in a
     /// number restriction), so that single blocking is complete.
     pub simple: bool,
@@ -255,6 +257,7 @@ impl Program {
             ..Program::default()
         };
         p.weakened = left_out(ontology, normalised);
+        p.refuted = crate::numbers::refute(normalised).map(|r| r.why);
         let facts = &normalised.facts;
         if normalised.clauses.iter().any(|c| c.flags.datatype)
             || !facts.data.is_empty()
