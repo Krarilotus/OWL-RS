@@ -440,7 +440,7 @@ systems = ["elk:el", "konclude:dl", "hermit:dl"]
 home_turf = "elk"
 reference = "/fast/ref/el-classes20000-roles12.elk.tax"
 outcome = "wrong"
-known = "6 Oct 2026: 4,526 direct subsumptions more than ELK and Konclude, which agree (e.g. A1 below the defined class D3); to adjudicate with a minimal witness (benches/reasoning/dl/disputed.tsv)"
+known = "6 Oct 2026: 4,526 direct subsumptions more than ELK and Konclude, which agree (e.g. A1 below the defined class D3). Adjudicated (benches/reasoning/dl/disputed.tsv): not NRESE; the generator declared neither the D classes nor the roles, and the OWL API drops axioms about undeclared terms, so the references classified a weaker ontology. With declarations ELK's taxonomy equals NRESE's on all 22,000 classes. The generator declares them now and the check says signature-differs for such a reference; ok once the volume's data file and reference are regenerated"
 [[case]]
 name = "horn-classify"
 area = "dl"
