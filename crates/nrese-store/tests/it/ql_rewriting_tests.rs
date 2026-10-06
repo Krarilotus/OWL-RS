@@ -1152,3 +1152,57 @@ fn existentials_feeding_a_transitive_role_miss_with_the_flag() {
         );
     }
 }
+
+/// A rewritten query reads only what its reader may (design §1), and uses the schema as
+/// the RL closure the reader sees was computed: a reader who sees the inferences its graphs
+/// support (`inferred = "supported"`) gets the existentials of readable graphs only, one who
+/// sees every inference (`"visible"`) all of them, one who sees none no rewriting.
+#[test]
+fn rewritten_answers_follow_the_readers_graph_access() {
+    use std::sync::Arc;
+
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, SparqlUpdateRequest};
+
+    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    store
+        .execute_update(&SparqlUpdateRequest::new(
+            "PREFIX ex: <http://e/> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {
+                ex:bob a ex:Employee .
+                GRAPH ex:secret { ex:Employee rdfs:subClassOf [ a owl:Restriction ;
+                    owl:onProperty ex:worksFor ; owl:someValuesFrom owl:Thing ] }
+             }",
+        ))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    let reader = |inferred: bool, by_support: bool| {
+        ReadScope::Graphs(Arc::new(GraphAccess {
+            graphs: vec!["http://e/open".to_owned()],
+            default_graph: true,
+            inferred,
+            inferred_by_support: by_support,
+            ..GraphAccess::default()
+        }))
+    };
+    let ask = |scope: ReadScope| {
+        let mut request =
+            SparqlQueryRequest::new("SELECT ?x WHERE { ?x <http://e/worksFor> ?y }", scope);
+        request.solutions_format = SolutionsResultFormat::Tsv;
+        let result = store.execute_query(&request).unwrap();
+        let text = String::from_utf8(result.payload).unwrap();
+        let status = result.ql.map(|r| r.completeness.as_str());
+        (text.contains("<http://e/bob>"), status)
+    };
+    // Everything readable: through the existential.
+    assert_eq!(ask(ReadScope::All), (true, Some("complete")));
+    // The axiom is in a graph the reader may not read, and it sees only supported
+    // inferences: not through it.
+    assert_eq!(ask(reader(true, true)), (false, Some("complete")));
+    // It sees every inference, so the schema they come from too.
+    assert_eq!(ask(reader(true, false)), (true, Some("complete")));
+    // It sees no inferences: no rewriting, no status.
+    assert_eq!(ask(reader(false, false)), (false, None));
+}

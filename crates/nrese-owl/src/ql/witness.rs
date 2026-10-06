@@ -30,19 +30,46 @@ pub(crate) struct TreeWitness {
     pub generators: Vec<usize>,
 }
 
-/// The query's tree witnesses; `None` if there are more than `limit`, or more than
-/// `candidates` sets of variables to try.
+/// Steps a rewriting may take (design §5): each candidate interior, each place a witness
+/// search tries, each set of witnesses. Counted, not timed: the same query over the same
+/// TBox takes the same steps, so the bound is deterministic.
+pub(crate) struct Work(std::cell::Cell<usize>);
+
+impl Work {
+    pub(crate) fn new(steps: usize) -> Self {
+        Self(std::cell::Cell::new(steps))
+    }
+
+    /// Takes a step; `false` once there are none left.
+    pub(crate) fn spend(&self) -> bool {
+        match self.0.get() {
+            0 => false,
+            left => {
+                self.0.set(left - 1);
+                true
+            }
+        }
+    }
+
+    pub(crate) fn exhausted(&self) -> bool {
+        self.0.get() == 0
+    }
+}
+
+/// The query's tree witnesses; `Err` with the bound reached: more than `limit` witnesses,
+/// more than `candidates` sets of variables to try, or no `work` left.
 pub(crate) fn tree_witnesses(
     tbox: &Tbox,
     cq: &Cq,
     limit: usize,
     candidates: usize,
-) -> Option<Vec<TreeWitness>> {
+    work: &Work,
+) -> Result<Vec<TreeWitness>, &'static str> {
     let existential: Vec<u32> = (0..cq.vars)
         .filter(|&v| cq.existential[v as usize] && cq.atoms.iter().any(|a| a.has_var(v)))
         .collect();
     if existential.is_empty() || tbox.generators.is_empty() {
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
     // Existential variables are neighbours when an atom has both.
     let mut neighbours: HashMap<u32, BTreeSet<u32>> = HashMap::new();
@@ -60,18 +87,26 @@ pub(crate) fn tree_witnesses(
             }
         }
     }
-    let subsets = connected_subsets(&existential, &neighbours, candidates)?;
-    let search = Search { tbox, cq };
+    let subsets = connected_subsets(&existential, &neighbours, candidates).ok_or("candidates")?;
+    let search = Search { tbox, cq, work };
     let mut witnesses = Vec::new();
     for interior in subsets {
-        if let Some(witness) = search.witness(interior) {
+        if !work.spend() {
+            return Err("work");
+        }
+        let witness = search.witness(interior);
+        // A search cut short decided nothing: the bound, not "no witness".
+        if work.exhausted() {
+            return Err("work");
+        }
+        if let Some(witness) = witness {
             witnesses.push(witness);
             if witnesses.len() > limit {
-                return None;
+                return Err("tree witnesses");
             }
         }
     }
-    Some(witnesses)
+    Ok(witnesses)
 }
 
 /// Every connected set of `vars` (ESU: each once, from its least member); `None` past
@@ -132,6 +167,7 @@ type Path = Vec<usize>;
 struct Search<'a> {
     tbox: &'a Tbox,
     cq: &'a Cq,
+    work: &'a Work,
 }
 
 impl Search<'_> {
@@ -236,6 +272,9 @@ impl Search<'_> {
         start: u32,
         ty: usize,
     ) -> bool {
+        if !self.work.spend() {
+            return false;
+        }
         let mut assigned: HashMap<u32, Path> = HashMap::new();
         assigned.insert(start, vec![ty]);
         if !self.consistent(start, &assigned, atoms, roots) {
@@ -303,6 +342,9 @@ impl Search<'_> {
                 candidates.push(here.clone());
             }
             for path in candidates {
+                if !self.work.spend() {
+                    return false;
+                }
                 assigned.insert(to, path);
                 if self.consistent(to, assigned, atoms, roots)
                     && self.extend(interior, atoms, roots, assigned)

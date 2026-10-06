@@ -293,7 +293,7 @@ fn ql_stage(
     let Some(ql) = ql_rewriting(query, options) else {
         return (None, None);
     };
-    let tbox = ql.tbox(snapshot);
+    let tbox = ql.tbox(snapshot, options.access.as_deref());
     if tbox.is_empty() {
         return (None, Some(crate::ql::QlReport::default()));
     }
@@ -556,8 +556,8 @@ fn native_pattern<'q>(
 }
 
 /// The QL rewriting, if it applies to `query`: on, and the query reads the inferred
-/// statements of the default graph without a dataset, access restrictions or pre-bound
-/// variables (docs/design/ql-rewriting.md §1).
+/// statements of the default graph without a dataset or pre-bound variables, by a reader
+/// who sees inferences (docs/design/ql-rewriting.md §1).
 fn ql_rewriting<'o>(
     query: &Query,
     options: &'o QueryOptions,
@@ -566,7 +566,8 @@ fn ql_rewriting<'o>(
     (options.read_model == ReadModel::Materialised
         && options.dataset.is_none()
         && query_dataset(query).is_none()
-        && options.access.is_none()
+        // A reader who sees no inferences gets no answers through them.
+        && options.access.as_deref().is_none_or(|a| a.inferred)
         && options.pre_bound.is_none())
     .then_some(ql)
 }
