@@ -1188,6 +1188,51 @@ fn head_constants_deriving_their_own_class_end_the_closure() {
     assert!(closure.passes <= 3, "{} passes", closure.passes);
 }
 
+/// Closed rule families (`cax-sco`, `prp-spo1`) don't read the part of the delta they
+/// produced: on deep class and property hierarchies, with an equivalence cycle, types
+/// that domains and ranges produce deep in the hierarchy, and a property under
+/// `rdf:type` (`prp-spo1` producing into the relation whose closed part `cax-sco` owns),
+/// the batch closure equals the naive one.
+#[test]
+fn closed_families_skip_their_own_output_exactly() {
+    let mut lines: Vec<String> = Vec::new();
+    for i in 0..40 {
+        lines.push(format!("ex:C{} rdfs:subClassOf ex:C{i}", i + 1));
+    }
+    lines.push("ex:C20 owl:equivalentClass ex:E".to_owned());
+    lines.push("ex:E rdfs:subClassOf ex:C25".to_owned());
+    lines.push("ex:B rdfs:subClassOf ex:C33".to_owned());
+    for i in 0..8 {
+        lines.push(format!("ex:p{} rdfs:subPropertyOf ex:p{i}", i + 1));
+    }
+    lines.extend(
+        [
+            "ex:p3 rdfs:domain ex:C38",
+            "ex:p6 rdfs:range ex:B",
+            "ex:q rdfs:subPropertyOf rdf:type",
+            "ex:p0 owl:inverseOf ex:r",
+            "ex:r rdfs:domain ex:C30",
+            "ex:a rdf:type ex:C40",
+            "ex:b rdf:type ex:C10",
+            "ex:c ex:p8 ex:d",
+            "ex:e ex:q ex:C39",
+            "ex:f ex:p5 ex:a",
+        ]
+        .map(str::to_owned),
+    );
+    let (mut vocabulary, derived, _) = closure(&lines.join("\n"));
+    for fact in [
+        "ex:a rdf:type ex:C0",
+        "ex:c rdf:type ex:C0",
+        "ex:d rdf:type ex:C0",
+        "ex:e rdf:type ex:C0",
+        "ex:c ex:p0 ex:d",
+        "ex:a rdf:type ex:E",
+    ] {
+        assert!(has(&mut vocabulary, &derived, fact), "{fact}");
+    }
+}
+
 /// Equality-heavy data: the batch executor's equality module equals the generic
 /// `eq-rep-*` rules of the naive evaluator (chains of `sameAs` that merge classes over
 /// several rounds, equal predicates, equal objects).
