@@ -113,6 +113,15 @@ semantics it names, and on nothing else:
 - **Reasoners** run under their own semantics: Nemo on OWL 2 RL (the kit's encoding) and on
   the N3 case's Datalog program, Jena on its rules (RDFS, OWL-Horst), HermiT, Openllet and
   Konclude on DL, ELK on EL.
+- **The same stores on rewritten queries** (`rewritten`; PROTOCOL.md §3): a reasoning case's
+  queries as NRESE's own OWL 2 QL rewriter prints them as SPARQL, never by hand. The headline
+  form uses property paths (`rdf:type/rdfs:subClassOf*`), so the other store does its share of
+  the work; the second form hands it the hierarchy NRESE computed as `VALUES` lists. NRESE
+  runs the path form with reasoning off too, which shows what precomputing buys. RDFS, OWL 2
+  QL and property axioms between named individuals are expressible; RL and EL only per query;
+  `sameAs`, DL and recursive RL/EL rules not (`rewrite` in `cases.toml`): those cases report
+  "not expressible" per system, which is where reasoning in the store wins. The printer comes
+  with the `ql/tree-witness` work; until it lands, `compete` lists these comparators as waiting.
 - **Licensed systems** (GraphDB, RDFox, Stardog, AnzoGraph) only with `--licensed` and their
   licences; their results stay in `results/` (git-ignored).
 

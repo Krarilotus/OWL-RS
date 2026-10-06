@@ -242,6 +242,37 @@ def parse_queries() -> Path:
     return directory
 
 
+def cache_log(entries: int = 1000, seed: int = 7) -> Path:
+    """A repeating query log over the social network, replayed in order (one file per
+    entry, `--warmup 0 --runs 1`): as in a real endpoint's log, a few queries recur often
+    (ranks drawn by a power law) and a long tail of parameterised lookups seldom does."""
+    directory = SCRATCH / "queries" / "cache-log"
+    directory.mkdir(parents=True, exist_ok=True)
+    for old in directory.glob("*.rq"):
+        old.unlink()
+    prefix = "PREFIX e: <http://example.org/fast/>\nPREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>\n"
+    rng = random.Random(seed)
+    zipf = lambda n: min(n - 1, int(n ** rng.random()) - 1)  # noqa: E731
+    templates = [
+        lambda: f"SELECT ?p ?o WHERE {{ e:u{zipf(300000)} ?p ?o }}",
+        lambda: f"SELECT ?f WHERE {{ ?f e:follows e:u{zipf(300000)} }}",
+        lambda: f"SELECT ?u ?n WHERE {{ ?u e:city e:c{zipf(1000)} ; e:name ?n }} LIMIT 100",
+        lambda: f"SELECT (COUNT(*) AS ?n) WHERE {{ ?p e:tag e:t{zipf(2000)} }}",
+        lambda: f"SELECT ?p ?s WHERE {{ ?p e:author e:u{zipf(300000)} ; e:score ?s }}",
+    ]
+    heavy = [
+        "SELECT ?t (COUNT(*) AS ?n) WHERE { ?p e:tag ?t } GROUP BY ?t ORDER BY DESC(?n) LIMIT 20",
+        "SELECT ?c (COUNT(*) AS ?n) WHERE { ?p e:likes ?u . ?u e:city ?c } GROUP BY ?c ORDER BY DESC(?n) LIMIT 10",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?a e:follows ?b . ?b e:follows ?c . ?c e:follows ?a }",
+        "SELECT ?t (AVG(?s) AS ?avg) WHERE { ?p e:tag ?t ; e:score ?s } GROUP BY ?t HAVING (COUNT(*) > 100)",
+    ]
+    for i in range(entries):
+        roll = rng.random()
+        text = heavy[zipf(len(heavy))] if roll < 0.05 else templates[zipf(len(templates))]()
+        (directory / f"{i:05d}.rq").write_text(prefix + text + "\n", encoding="utf-8")
+    return directory
+
+
 def queries_path(case: dict, expect: dict) -> str | None:
     name = case.get("queries", "")
     if not name:
@@ -251,6 +282,9 @@ def queries_path(case: dict, expect: dict) -> str | None:
     if name == "@parse":
         parse_queries()
         return "/out/queries/parse"
+    if name == "@cache-log":
+        cache_log()
+        return "/out/queries/cache-log"
     if name.startswith("@"):
         # Another kit's query set: benches/competitors/queries/NAME.
         return f"/src/benches/competitors/queries/{name[1:]}"
@@ -410,6 +444,13 @@ def run_case(case: dict, label: str, rep: int) -> dict:
     record["metric"] = metric_value(case, result)
     record["samples"] = samples(case, result)
     record["counters"] = counters(case, result)
+    if result.get("client_sweep"):
+        # Throughput against p99 per level, and per GB of the level's peak memory.
+        record["throughput"] = [
+            {"clients": level["clients"], "qps": level["qps"], "p99_ms": level["p99_ms"],
+             "peak_mib": (level.get("memory") or {}).get("peak_mib"),
+             "qps_per_gb": round(level["qps"] / max((level.get("memory") or {}).get("peak_mib") or 1, 1) * 1024, 1)}
+            for level in result["client_sweep"]]
     record["phase_peaks"] = {k: v.get("peak_mib") for k, v in (result.get("phases") or {}).items()}
     record["peak_mib"] = result.get("cgroup_peak_mib") or result.get("peak_mib")
     if case.get("queries", "").startswith("@vectors") and record["status"] == "ok":
@@ -437,7 +478,7 @@ COUNTERS = ("reason.candidates", "reason.new_facts", "reason.inferred", "reason.
             "clauses", "nodes_created", "branch_points", "backjumps", "clashes", "merges", "facts", "clauses_fired",
             "concepts", "contexts", "subsumers", "links", "conclusions", "duplicates", "dl_clauses", "functions",
             "shacl.results", "kernel.rows", "held.index_bytes",
-            "reason.bindings", "reason.probes", "reason.passes", "subset_checks", "clauses_generated", "clauses_kept",
+            "reason.bindings", "reason.probes", "reason.passes", "cache.hits", "subset_checks", "clauses_generated", "clauses_kept",
             "redundant_forward", "redundant_backward", "contexts_created", "hyper", "pred")
 
 
@@ -570,6 +611,8 @@ def metric_value(case: dict, result: dict):
 def samples(case: dict, result: dict) -> dict:
     """Per series, the measured samples (ms) the metric is a median or sum of medians of."""
     metric = case["metric"]
+    if result.get("client_sweep"):
+        return {f"{level['clients']} clients p99": [level["p99_ms"]] for level in result["client_sweep"]}
     if case.get("sweep") and "_repeats" in result:
         scale = 1000.0 if metric in ("load_s", "open_s") else 1.0
         series: dict[str, list[float]] = {}
