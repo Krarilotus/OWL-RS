@@ -208,15 +208,6 @@ fn optional_and_construct_see_the_rewriting() {
             "<cat> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <Employed>",
         ]
     );
-    // Negation keeps its materialised meaning.
-    assert_eq!(
-        rows(
-            &e,
-            "SELECT ?x WHERE { ?x a :Employee FILTER NOT EXISTS { ?x :worksFor [] } }",
-            &on()
-        ),
-        ["?x=<bob>", "?x=<cat>"]
-    );
 }
 
 #[test]
@@ -382,12 +373,9 @@ fn incompleteness_is_reported_never_silent() {
         "complete"
     );
     // Patterns the rewriting doesn't enter, and variable predicates.
-    let (state, reasons) = status(
-        &pure,
-        "SELECT ?x WHERE { ?x a :Person FILTER EXISTS { ?x :worksFor [] } }",
-    );
+    let (state, reasons) = status(&pure, "SELECT ?x WHERE { ?x a :Person ; :worksFor+ ?y }");
     assert_eq!(state, "sound-only");
-    assert!(reasons.contains("inside EXISTS"), "{reasons}");
+    assert!(reasons.contains("inside a property path"), "{reasons}");
     assert_eq!(
         status(&pure, "SELECT ?x ?p WHERE { ?x ?p [] }").0,
         "sound-only"
@@ -450,4 +438,106 @@ fn existentials_feeding_a_transitive_role_are_flagged() {
             .any(|r| r.source == "ql" && r.text.contains("partOf> is transitive")),
         "{completeness:?}"
     );
+}
+
+/// `EXISTS`, `NOT EXISTS`, `MINUS`'s right side and `GRAPH` naming the default graph read
+/// the entailments as the query's other patterns do (design §2): a pattern there is a set,
+/// its variables bound outside answer variables. Named graphs hold their asserted
+/// statements only.
+#[test]
+fn negation_and_the_default_graph_alias_see_the_rewriting() {
+    let e = engine(STAFF);
+    let ask = |query: &str| {
+        let plan = plan_query(&e.snapshot(), &parse(query), &on()).unwrap();
+        let status = plan.ql.map(|ql| ql.completeness.as_str()).unwrap_or("none");
+        (rows(&e, query, &on()), status)
+    };
+    let strings = |rows: &[&str]| rows.iter().map(|r| r.to_string()).collect::<Vec<_>>();
+    let employed = strings(&["?x=<ann>", "?x=<bob>", "?x=<cat>"]);
+    let (got, status) = ask("SELECT ?x WHERE { ?x a :Person FILTER EXISTS { ?x :worksFor [] } }");
+    assert_eq!((got, status), (employed.clone(), "complete"));
+    // Bob and Cat work for some organisation: no person but Dan is without an employer.
+    for query in [
+        "SELECT ?x WHERE { ?x a :Person FILTER NOT EXISTS { ?x :worksFor [] } }",
+        "SELECT ?x WHERE { ?x a :Person FILTER (!EXISTS { ?x :worksFor ?y }) }",
+        "SELECT ?x WHERE { ?x a :Person MINUS { ?x :worksFor ?y } }",
+    ] {
+        assert_eq!(ask(query), (strings(&["?x=<dan>"]), "complete"), "{query}");
+    }
+    assert_eq!(
+        ask("SELECT ?x WHERE { GRAPH <urn:x-arq:DefaultGraph> { ?x :worksFor [] } }"),
+        (employed.clone(), "complete")
+    );
+    let (got, _) =
+        ask("SELECT ?x ?b WHERE { ?x a :Employee BIND(EXISTS { ?x :worksFor [] } AS ?b) }");
+    assert!(got.iter().all(|row| row.contains("\"true\"")), "{got:?}");
+
+    // What a negated pattern may miss can make an answer wrong: unsound, with the reason.
+    let mixed = engine(&format!("{STAFF} :worksFor a owl:TransitiveProperty ."));
+    for query in [
+        "SELECT ?x WHERE { ?x a :Person FILTER NOT EXISTS { ?x :worksFor [] } }",
+        "SELECT ?x WHERE { ?x a :Person MINUS { ?x :worksFor ?y } }",
+        "SELECT ?x ?b WHERE { ?x a :Person BIND(EXISTS { ?x :worksFor [] } AS ?b) }",
+    ] {
+        let plan = plan_query(&mixed.snapshot(), &parse(query), &on()).unwrap();
+        let ql = plan.ql.expect("the rewriting applies");
+        assert_eq!(ql.completeness.as_str(), "unsound", "{query}");
+        assert!(
+            ql.completeness
+                .reasons
+                .iter()
+                .any(|r| r.text.contains("may be wrong as well as missing")),
+            "{query}: {:?}",
+            ql.completeness.reasons
+        );
+    }
+    // Under no negation, sound-only as anywhere else.
+    let plan = plan_query(
+        &mixed.snapshot(),
+        &parse("SELECT ?x WHERE { ?x a :Person FILTER EXISTS { ?x :worksFor [] } }"),
+        &on(),
+    )
+    .unwrap();
+    assert_eq!(plan.ql.unwrap().completeness.as_str(), "sound-only");
+
+    // A variable an outer solution may leave unbound is free inside the EXISTS: said.
+    let plan = plan_query(
+        &e.snapshot(),
+        &parse(
+            "SELECT ?p WHERE { ?p a :Person OPTIONAL { ?p :knows ?x } FILTER EXISTS { ?x :worksFor [] } }",
+        ),
+        &on(),
+    )
+    .unwrap();
+    let ql = plan.ql.unwrap();
+    assert_eq!(ql.completeness.as_str(), "sound-only");
+    assert!(
+        ql.completeness
+            .reasons
+            .iter()
+            .any(|r| r.text.contains("may be unbound")),
+        "{:?}",
+        ql.completeness.reasons
+    );
+
+    // A named graph holds what was asserted in it, with nothing to say about it.
+    let quads = engine_trig(&format!(
+        "{PREFIXES} :Employee rdfs:subClassOf [ a owl:Restriction ;
+            owl:onProperty :worksFor ; owl:someValuesFrom :Organisation ] .
+         :g {{ :eve a :Employee . :fay :worksFor :acme }}"
+    ));
+    let query = "SELECT ?x WHERE { GRAPH ?g { ?x :worksFor [] } }";
+    assert_eq!(rows(&quads, query, &on()), ["?x=<fay>"]);
+    let plan = plan_query(&quads.snapshot(), &parse(query), &on()).unwrap();
+    assert_eq!(plan.ql.map(|ql| ql.completeness.as_str()), Some("complete"));
+}
+
+fn engine_trig(trig: &str) -> Engine {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for quad in RdfParser::from_format(RdfFormat::TriG).for_reader(trig.as_bytes()) {
+        tx.insert(quad.unwrap().as_ref());
+    }
+    tx.commit().unwrap();
+    engine
 }
