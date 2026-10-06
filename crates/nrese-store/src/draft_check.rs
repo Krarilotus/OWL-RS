@@ -12,8 +12,9 @@
 //! - **Query**: the data alone, asserted statements only; `ASK` and `SELECT`. More rows
 //!   than the limit is a failure, never a truncated answer.
 //! - **Reasoning**: the OWL 2 RL rules decide consistency over data and schema; the
-//!   OWL 2 EL classifier lists unsatisfiable classes. Whatever either skipped is reported
-//!   unsupported, and the answer is then not complete.
+//!   OWL 2 DL classification lists unsatisfiable classes. Whatever the rules skipped,
+//!   and whatever left the classification incomplete, is reported unsupported, and the
+//!   answer is then not complete.
 //!
 //! The caller enforces the time limit and owns the cancellation token.
 
@@ -424,9 +425,9 @@ fn check_reasoning(
     }
     unsupported.extend(
         classification
-            .skipped
+            .incomplete
             .iter()
-            .map(|(kind, count)| format!("owl2-el classifier skipped {count} {kind} axioms")),
+            .map(|why| format!("owl2-dl classification: {why}")),
     );
     let consistent = report.violations == 0;
     Ok(DraftOutcome {

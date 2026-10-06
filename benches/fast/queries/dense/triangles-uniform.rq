@@ -1,0 +1,2 @@
+PREFIX e: <http://example.org/fast/>
+SELECT (COUNT(*) AS ?n) WHERE { ?a e:u ?b . ?b e:u ?c . ?c e:u ?a }

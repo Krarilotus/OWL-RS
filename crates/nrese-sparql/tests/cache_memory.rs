@@ -89,7 +89,7 @@ fn the_result_cache_holds_no_more_heap_than_its_budget() {
                     // The answer's bytes too, as the store keeps them.
                     let format = "text/tab-separated-values";
                     if let CachedOutput::Miss(slot) =
-                        cached_output(&snapshot, query, &options, format)
+                        cached_output(&snapshot, query, &options, format, "")
                     {
                         let mut written = Vec::new();
                         let tsv = nrese_sparql::ResultsFormat::Tsv;

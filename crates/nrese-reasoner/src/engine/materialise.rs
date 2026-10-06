@@ -132,6 +132,7 @@ fn by_representatives(
         .binary_search_by_key(&same_as, |(p, _)| *p)
         .is_ok_and(|at| equal(&input[at].1));
     let mut seeds: Vec<Triple> = Vec::new();
+    let mut phases = batch::Phases::default();
     let input = if asserts_equality {
         input
     } else {
@@ -145,6 +146,7 @@ fn by_representatives(
         {
             return Ok(first);
         }
+        phases.add(&first.phases);
         seeds = first.derived;
         rebuild()
     };
@@ -171,6 +173,7 @@ fn by_representatives(
         stop,
     )?;
     drop(start);
+    phases.add(&closure.phases);
     let classes = &closure.classes;
     if program.store_representatives {
         // The closure as it is, and each identity's place in its class. A fact asserted
@@ -196,6 +199,7 @@ fn by_representatives(
             violations: closure.violations,
             diagnostics: closure.diagnostics,
             rounds: closure.rounds,
+            phases,
             ..batch::Materialisation::default()
         });
     }
@@ -221,6 +225,7 @@ fn by_representatives(
         violations: closure.violations,
         diagnostics: closure.diagnostics,
         rounds: closure.rounds,
+        phases,
         ..batch::Materialisation::default()
     })
 }

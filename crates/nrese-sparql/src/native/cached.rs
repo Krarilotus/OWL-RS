@@ -308,7 +308,8 @@ impl Context<'_> {
 }
 
 /// The key of `query`'s whole answer written in `format` (the media type with its
-/// parameters) on `snapshot`: its context, the format, the query form with a CONSTRUCT's
+/// parameters) on `snapshot`, for a caller whose answer depends on `context` too: its
+/// context, the format, the caller's context, the QL rewriting, the query form with a CONSTRUCT's
 /// template, and its pattern as parsed (the answer is the query's, however it is planned).
 /// `None` if the query isn't cached (no cache, a volatile query, pre-bound variables).
 pub(crate) fn output_key(
@@ -316,6 +317,7 @@ pub(crate) fn output_key(
     query: &nrese_sparql_syntax::Query,
     options: &crate::QueryOptions,
     format: &str,
+    context: &str,
 ) -> Option<Key> {
     use nrese_sparql_syntax::Query;
     if options.pre_bound.is_some() {
@@ -331,6 +333,16 @@ pub(crate) fn output_key(
     let mut encoder = ctx.key_start(scope);
     encoder.tag(b'S');
     encoder.text(format);
+    encoder.text(context);
+    // The QL rewriting changes the answer of the query as parsed (parts see it in the
+    // algebra they evaluate): its closure and bounds; its TBox is the snapshot's.
+    match super::ql_rewriting(query, options) {
+        Some(ql) => {
+            encoder.tag(b'q');
+            encoder.text(&ql.fingerprint());
+        }
+        None => encoder.tag(b'-'),
+    }
     let pattern = match query {
         Query::Select { pattern, .. } => {
             encoder.tag(b's');

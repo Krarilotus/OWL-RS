@@ -741,6 +741,9 @@ pub fn run_jobs<S: Source + ?Sized>(
 pub struct Probes {
     pub probes: std::sync::atomic::AtomicU64,
     pub unordered: std::sync::atomic::AtomicU64,
+    /// Head facts the bindings produced before each morsel's deduplication (one per
+    /// binding and head): with the new facts, the bindings per derived fact.
+    pub emitted: std::sync::atomic::AtomicU64,
 }
 
 /// [`run_jobs`] by morsel: each morsel's facts, sorted by (predicate, subject, object) and
@@ -829,6 +832,7 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
             // run in (predicate, subject, object) order: about half of an OWL 2 RL round's
             // candidates repeat within it, and sorted probes walk a relation's sorted run
             // forward instead of missing the cache at every level of every search.
+            let emitted = out.len() as u64;
             out.sort_unstable_by_key(|&[s, p, o]| (p, s, o));
             out.dedup();
             let (mut asked, mut unordered, mut last) = (0, 0, None);
@@ -842,6 +846,7 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                 use std::sync::atomic::Ordering::Relaxed;
                 probes.probes.fetch_add(asked, Relaxed);
                 probes.unordered.fetch_add(unordered, Relaxed);
+                probes.emitted.fetch_add(emitted, Relaxed);
             }
             finish(out)
         })

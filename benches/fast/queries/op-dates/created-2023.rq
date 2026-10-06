@@ -1,0 +1,4 @@
+PREFIX e: <http://example.org/fast/>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT (COUNT(*) AS ?n) WHERE { ?p e:created ?d FILTER(?d >= "2023-01-01T00:00:00"^^xsd:dateTime && ?d < "2024-01-01T00:00:00"^^xsd:dateTime) }
