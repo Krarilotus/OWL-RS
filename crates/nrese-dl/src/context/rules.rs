@@ -85,8 +85,18 @@ pub struct State {
     pub merges: Vec<super::equality::Merge>,
     pub merges_by_term: HashMap<CTerm, Vec<u32>>,
     pub merges_by_pair: HashMap<(CTerm, CTerm), Vec<u32>>,
+    /// Why the saturation here may miss consequences, if it may: what it derived still
+    /// holds, but the context is no complete answer and not exact.
+    pub incomplete: Option<Incomplete>,
+}
+
+/// Why a context's saturation may miss consequences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Incomplete {
     /// A merge of `x` with a neighbour was due and not made ([`super::equality`]).
-    pub unmerged: bool,
+    Merge,
+    /// A Pred join went past `Budget::max_join_steps` and was left ([`super::links`]).
+    Join,
 }
 
 /// Messages for other contexts, and for this one.
@@ -179,6 +189,12 @@ pub struct Scratch {
     pub(super) body: Vec<Atom>,
     pub(super) waiting: Vec<u32>,
     pub(super) preds: Vec<(ContextId, FuncId)>,
+    /// The bodies Pred found in this batch, per head (they are derived after the joins,
+    /// so the context's own redundancy check doesn't see them yet).
+    pub(super) batch: HashMap<Atom, super::settrie::SetTrie>,
+    /// The current Pred join's steps (calls), and whether it went past its budget.
+    pub(super) steps: usize,
+    pub(super) left: bool,
 }
 
 /// The rules on one context, by the worker holding it.
@@ -287,8 +303,14 @@ impl Worker<'_> {
                 });
                 let mut s = std::mem::take(&mut self.scratch);
                 s.found.clear();
+                s.batch.clear();
                 s.premises.clear();
+                s.steps = 0;
+                s.left = false;
                 self.pred_join(id, None, 0, &[], true, &mut s);
+                if s.left {
+                    self.state.incomplete.get_or_insert(Incomplete::Join);
+                }
                 self.conclude(&s.found);
                 self.scratch = s;
             }
