@@ -112,7 +112,7 @@ def container(name: str, cap_gb: float, command: list[str], env: dict | None = N
 # --- build -----------------------------------------------------------------------------------
 
 BUILD = [
-    ["-p", "nrese-store", "--example", "perf_lab"],
+    ["-p", "nrese-store", "--example", "perf_lab", "--example", "ql_print_check"],
     ["-p", "nrese-dl", "--example", "tableau_consistency", "--example", "context_classify"],
     ["-p", "nrese-reasoner", "--example", "classify"],
     ["-p", "nrese-server"],
@@ -551,7 +551,13 @@ def lookup(path: str, result: dict):
         _, name, field = path.split(".", 2)
         for q in result.get("queries", []):
             if q["name"] == name:
-                return q.get(field)
+                # A field can go deeper: q.NAME.status.complete.
+                value = q
+                for part in field.split("."):
+                    if not isinstance(value, dict) or part not in value:
+                        return None
+                    value = value[part]
+                return value
         return None
     value = result
     for part in path.split("."):
@@ -577,11 +583,11 @@ def same(a, b) -> bool:
 def check(path: str, want, result: dict, expect: dict, alt_expect: dict) -> dict:
     expected = resolve(want, alt_expect if path.startswith("alt.") else expect)
     got = lookup(path, result)
-    if isinstance(want, str) and want[:2] in (">=", "<="):
+    if isinstance(want, str) and (want[:2] in (">=", "<=") or want.startswith(("has ", "lacks "))):
         ok = compare_op(got, want)
     else:
         ok = got is not None and expected is not None and same(got, expected)
-    return {"path": path, "expected": expected if not isinstance(want, str) or not want[:2] in (">=", "<=") else want,
+    return {"path": path, "expected": want if isinstance(want, str) and (want[:2] in (">=", "<=") or want.startswith(("has ", "lacks "))) else expected,
             "got": got, "ok": ok}
 
 
@@ -590,7 +596,8 @@ def compare_op(got, want: str) -> bool:
     if got is None:
         return False
     if op in ("has", "lacks"):
-        present = value in (got if isinstance(got, list) else [got])
+        # A list holds the value; a text contains it.
+        present = value in got if isinstance(got, (list, str)) else value == got
         return present if op == "has" else not present
     try:
         g, v = float(got), float(value)
@@ -905,8 +912,9 @@ def table(args) -> int:
              + (" Case s, peak MiB |" if times else ""),
              "|---|---|---|---|---|---|" + ("---|" if times else "")]
     for c in cases:
-        systems = ", ".join(f"{s.split(':')[0]}: {s.split(':')[1]}" for s in c.get("systems", [])) \
-            or "none: NRESE's own column"
+        hangs = c.get("hangs") or {}
+        systems = ", ".join(f"{s.split(':')[0]}: {s.split(':')[1]}" + (" (hangs)" if s in hangs else "")
+                            for s in c.get("systems", [])) or "none: NRESE's own column"
         turf = TURF.get(c.get("home_turf", ""), c.get("home_turf", ""))
         row = f"| `{c['name']}` | {c['area']} | {c['semantics']} | {systems} | {turf} | {c['what']} |"
         if times:

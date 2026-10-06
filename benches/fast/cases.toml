@@ -32,6 +32,7 @@
 # rewrite    what that rewriting can express: expressible (RDFS, OWL 2 QL, property axioms
 #            between named individuals), per-query (RL, EL), not-expressible (sameAs, DL,
 #            recursive RL/EL rules: reported per system as a result); default by semantics
+# hangs      system:semantics = why: a pair known to hang, recorded as `hangs` and not run
 # home_turf  the competitor whose documented strength the case is (CATALOG.md §6)
 # guards     the wins of docs/design/performance.md §0 the case measures
 #
@@ -133,6 +134,8 @@ cap_gb = 6
 systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["transitive properties by SCC condensation and bitset reachability"]
 rewrite = "expressible"
+hangs = { "jena:owl-horst" = "6 Oct 2026: Jena's OWL rules gave no answer to the count within 16 min (lazy reasoning over a 6.2 M-pair transitive closure); recorded, not run again" }
+
 [[case]]
 name = "rl-lubm100"
 area = "reasoning"
@@ -436,11 +439,33 @@ metric = "whole_ms"
 check = { "taxonomy_equal" = "true" }
 route = {}
 cap_gb = 6
-systems = ["elk:el", "konclude:dl", "hermit:dl"]
+systems = ["elk:el", "konclude:dl", "hermit:dl", "openllet:dl"]
 home_turf = "elk"
 reference = "/fast/ref/el-classes20000-roles12.elk.tax"
-outcome = "wrong"
-known = "6 Oct 2026: 4,526 direct subsumptions more than ELK and Konclude, which agree (e.g. A1 below the defined class D3). Adjudicated (benches/reasoning/dl/disputed.tsv): not NRESE; the generator declared neither the D classes nor the roles, and the OWL API drops axioms about undeclared terms, so the references classified a weaker ontology. With declarations ELK's taxonomy equals NRESE's on all 22,000 classes. The generator declares them now and the check says signature-differs for such a reference; ok once the volume's data file and reference are regenerated"
+# 6 Oct 2026: 4,526 direct subsumptions more than ELK and Konclude at first. Adjudicated
+# (benches/reasoning/dl/disputed.tsv): the generator declared neither the D classes nor the
+# roles, and the OWL API drops axioms about undeclared terms. Declared, ELK's taxonomy
+# equals NRESE's. The chain is regular now (r1 ∘ r2 ⊑ r1), so HermiT and Openllet run it.
+
+[[case]]
+name = "el-classify-irregular"
+area = "dl"
+what = "the same EL ontology with an irregular role chain (r1 ∘ r2 ⊑ r3, r3 ⊑ r1): outside OWL 2 DL, inside OWL 2 EL"
+semantics = "el"
+data = "el classes=20000 roles=12 irregular=1"
+tool = "classify-el"
+repeat = 3
+metric = "whole_ms"
+check = { "taxonomy_equal" = "true" }
+route = {}
+cap_gb = 6
+# HermiT and Openllet refuse an irregular hierarchy; ELK and Konclude don't check it. On
+# 6 Oct 2026 ELK's taxonomy equalled NRESE's and Konclude's differed (outside OWL 2 DL,
+# Konclude's answer isn't defined).
+systems = ["elk:el", "konclude:dl"]
+home_turf = "elk"
+reference = "/fast/ref/el-classes20000-roles12-irregular1.elk.tax"
+
 [[case]]
 name = "horn-classify"
 area = "dl"
@@ -1380,3 +1405,111 @@ counters = ["cache.hits"]
 systems = ["qlever:plain"]
 home_turf = "qlever"
 guards = ["the caching work package: QLever caches every plan subtree, NRESE whole results"]
+
+# --- OWL 2 QL rewriting and the owl2-dl mode (refactor/engine-v2: QL, G3) ----------------------
+
+[[case]]
+name = "ql-owl2bench"
+area = "reasoning"
+what = "OWL2Bench's QL profile under owl2-ql: the RL closure and the tree-witness rewriting of each query (its rewrites and completeness recorded)"
+semantics = "owl2-ql"
+data = "volume:owl2bench-ql-1.nt"
+args = ["--reason", "owl2-ql", "--reason-runs", "40", "--runs", "30"]
+queries = "owl2bench"
+metric = "sum_p50_ms"
+check = { "q.q12.rows" = 2494, "q.q15.rows" = 21, "q.q21.rows" = 145, "q.q22.rows" = 106, "q.q20.rows" = 2825, "q.q12.status.complete" = "true" }
+route = { "q.q12.rewrites" = "has ql-tree-witness", "q.q15.rewrites" = "has ql-tree-witness", "q.q21.rewrites" = "has ql-tree-witness", "q.q22.rewrites" = "has ql-tree-witness", "q.q01.rewrites" = "lacks ql-tree-witness" }
+cap_gb = 4
+systems = ["qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
+rewrite = "expressible"
+guards = ["OWL 2 QL rewriting only where it adds answers (ql-tree-witness)"]
+pinned = "NRESE 6 Oct 2026; the printed queries (ql_print_check) give the same rows on a store without reasoning"
+repeat = 4
+[[case]]
+name = "dlmode-lubm1"
+area = "dl"
+what = "LUBM 1 under owl2-dl: the 14 queries over the bounds, each answer's status (sound, complete) and the path that decided it"
+semantics = "owl2-dl"
+data = "volume:lubm-1.nt"
+extra = ["volume:univ-bench.nt"]
+args = ["--reason", "owl2-dl", "--runs", "20"]
+queries = "lubm"
+metric = "sum_p50_ms"
+check = { "q.q01.rows" = 4, "q.q02.rows" = 0, "q.q03.rows" = 6, "q.q04.rows" = 34, "q.q05.rows" = 719, "q.q06.rows" = 7790, "q.q07.rows" = 67, "q.q08.rows" = 7790, "q.q09.rows" = 208, "q.q10.rows" = 4, "q.q11.rows" = 224, "q.q12.rows" = 15, "q.q13.rows" = 1, "q.q14.rows" = 5916, "q.q01.status.complete" = "true", "q.q02.status.complete" = "true", "q.q03.status.complete" = "true", "q.q04.status.complete" = "true", "q.q05.status.complete" = "true", "q.q06.status.complete" = "true", "q.q07.status.complete" = "true", "q.q08.status.complete" = "true", "q.q09.status.complete" = "true", "q.q10.status.complete" = "true", "q.q11.status.complete" = "true", "q.q12.status.complete" = "true", "q.q13.status.complete" = "true", "q.q14.status.complete" = "true" }
+route = { "q.q03.status.paths" = "has closed-predicates", "q.q09.status.paths" = "has bounds-equal", "q.q14.status.paths" = "has closed-predicates" }
+cap_gb = 4
+systems = []
+guards = ["DL in the store: routing by profile, closed predicates, U1's estimates"]
+pinned = "LUBM(1)'s published answers under complete reasoning (expected-lubm-1.tsv); every answer complete, 6 Oct 2026"
+repeat = 6
+[[case]]
+name = "dlmode-commits"
+area = "maintenance"
+what = "4,000 commits under owl2-dl: the RL closure maintained and each commit's consistency checked under OWL 2 DL (the gate inline)"
+semantics = "owl2-dl"
+data = "churn people=20000 changes=2000"
+args = ["--reason", "owl2-dl", "--commits", "{data}.commits.ru"]
+queries = "churn"
+metric = "commits.p50_ms"
+check = { "commits.commits" = 4000, "closure_after_commits.equal" = "true" }
+route = { "commits.incremental" = "== true" }
+cap_gb = 4
+systems = ["graphdb:owl2-rl", "rdfox:owl2-rl"]
+guards = ["DL in the store (owl2-dl): a commit's consistency proved by the upper bound U1"]
+
+[[case]]
+name = "dlmode-reject"
+area = "maintenance"
+what = "under owl2-dl, 200 commits and then one that makes a student a professor where the two are disjoint: the OWL 2 RL gate rejects it (cax-dw)"
+semantics = "owl2-dl"
+data = "churn people=20000 changes=100 violate=1"
+args = ["--reason", "owl2-dl", "--commits", "{data}.commits.ru"]
+queries = ""
+metric = "commits.p50_ms"
+check = { "commits.commits" = 200, "commits.error" = "has violates 1 consistency check" }
+route = {}
+cap_gb = 4
+systems = []
+
+[[case]]
+name = "classify-store-horn"
+area = "dl"
+what = "the store's /classification of 3,000 Horn classes in a fresh process each time (the store keeps a classification per revision): the context core must take it"
+semantics = "dl"
+data = "horn classes=3000"
+args = ["--classify", "--runs", "1"]
+queries = ""
+metric = "classification.max_ms"
+check = { "classification.consistent" = "true" }
+route = { "classification.engine" = "== context-core" }
+cap_gb = 6
+systems = ["hermit:dl", "konclude:dl"]
+repeat = 5
+[[case]]
+name = "classify-store-tableau"
+area = "dl"
+what = "the store's /classification of qualified number restrictions with a union (beyond the Horn stage), in a fresh process each time: the hypertableau driver must take it"
+semantics = "dl"
+data = "dl-number n=24 individuals=100"
+args = ["--classify", "--runs", "1"]
+queries = ""
+metric = "classification.max_ms"
+check = { "classification.consistent" = "true" }
+route = { "classification.engine" = "== tableau" }
+cap_gb = 6
+systems = ["hermit:dl", "konclude:dl"]
+repeat = 5
+[[case]]
+name = "dlmode-reject-dl"
+area = "maintenance"
+what = "under owl2-dl, 200 commits and then one that adds a visitor, who must be faculty or a professor and is disjoint from both: inconsistent only under OWL 2 DL, so only the DL gate can reject it"
+semantics = "owl2-dl"
+data = "churn people=20000 changes=100 violate=2"
+args = ["--reason", "owl2-dl", "--commits", "{data}.commits.ru"]
+queries = ""
+metric = "commits.p50_ms"
+check = { "commits.commits" = 200, "commits.error" = "has inconsistent under OWL 2 DL" }
+route = {}
+cap_gb = 4
+systems = []
+guards = ["DL in the store: a commit's consistency proved by U1, a clash sent to a DL engine"]

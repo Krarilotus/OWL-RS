@@ -33,6 +33,9 @@
 //!   `--routes` records the operators each query ran with (from EXPLAIN) in the JSON
 //!   report, for the fast suite's route checks; a query with one row also records its
 //!   first value there (`value`), the answer of a count.
+//!   `--faults` prints, per query, the first execution's time and page faults beside the
+//!   later runs' median faults (the first execution after opening a mapped store, P6),
+//!   and the working set after opening; the report gets `first_faults` and `faults`.
 //!   `--qerror` measures the planner's estimates: every operator with an estimate, over
 //!   every query, gets its q-error, `max(estimate, rows) / min(estimate, rows)` (both at
 //!   least 1; Moerkotte et al., VLDB 2009), summarised per operator (median, p90, max, the
@@ -183,6 +186,7 @@ struct Args {
     json: Option<PathBuf>,
     baseline: Option<PathBuf>,
     explain: bool,
+    faults: bool,
     qerror: bool,
     format: SolutionsResultFormat,
     shapes: Option<PathBuf>,
@@ -202,6 +206,7 @@ struct Args {
     count_allocations: bool,
     parse_only: bool,
     kernel: Option<String>,
+    classify: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -217,6 +222,7 @@ fn parse_args() -> Result<Args, String> {
         json: None,
         baseline: None,
         explain: false,
+        faults: false,
         qerror: false,
         format: SolutionsResultFormat::Tsv,
         shapes: None,
@@ -236,6 +242,7 @@ fn parse_args() -> Result<Args, String> {
         count_allocations: false,
         parse_only: false,
         kernel: None,
+        classify: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -255,16 +262,14 @@ fn parse_args() -> Result<Args, String> {
             "--json" => args.json = Some(value()?.into()),
             "--baseline" => args.baseline = Some(value()?.into()),
             "--explain" => args.explain = true,
+            "--faults" => args.faults = true,
             "--results" => args.results = Some(value()?.into()),
             "--qerror" => args.qerror = true,
             "--shapes" => args.shapes = Some(value()?.into()),
             "--reason" => {
                 let name = value()?;
                 args.reason = Some(
-                    ReasoningMode::REASONING
-                        .into_iter()
-                        .chain([ReasoningMode::Custom])
-                        .find(|mode| mode.as_str() == name)
+                    ReasoningMode::from_name(&name)
                         .ok_or(format!("--reason: unknown mode {name}"))?,
                 );
             }
@@ -304,6 +309,7 @@ fn parse_args() -> Result<Args, String> {
             "--count-allocations" => args.count_allocations = true,
             "--parse-only" => args.parse_only = true,
             "--kernel" => args.kernel = Some(value()?),
+            "--classify" => args.classify = true,
             "--format" => {
                 args.format = match value()?.as_str() {
                     "tsv" => SolutionsResultFormat::Tsv,
@@ -347,6 +353,9 @@ struct Measured {
     /// The query's first execution in this process (the warm-up, or the first measured run).
     first: Option<Duration>,
     error: Option<String>,
+    /// Page faults of the first execution, and of each later one (sorted).
+    first_faults: Option<u64>,
+    faults: Vec<u64>,
 }
 
 fn run_once(
@@ -427,6 +436,8 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
                 times: Vec::new(),
                 first: None,
                 error: Some(e.to_string()),
+                first_faults: None,
+                faults: Vec::new(),
             };
         }
     };
@@ -435,10 +446,19 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
         times: Vec::new(),
         first: None,
         error: None,
+        first_faults: None,
+        faults: Vec::new(),
     };
     for i in 0..args.warmup + args.runs {
+        let faults = nrese_exec::memory::page_faults();
         match run_once(store, &prepared, args.timeout) {
             Ok((rows, elapsed)) => {
+                if let (Some(before), Some(after)) = (faults, nrese_exec::memory::page_faults()) {
+                    match measured.first_faults {
+                        None => measured.first_faults = Some(after - before),
+                        Some(_) => measured.faults.push(after - before),
+                    }
+                }
                 measured.rows = rows;
                 measured.first.get_or_insert(elapsed);
                 if i >= args.warmup {
@@ -452,6 +472,7 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
         }
     }
     measured.times.sort();
+    measured.faults.sort();
     measured
 }
 
@@ -488,7 +509,11 @@ fn explain(store: &StoreService, text: &str) {
                 );
             }
             for step in &explanation.steps {
-                let mut detail = step.detail.clone();
+                // Long patterns are cut; counts after ` | ` (seeks, lookups) are kept.
+                let (mut detail, counts) = match step.detail.split_once(" | ") {
+                    Some((pattern, counts)) => (pattern.to_owned(), format!(" | {counts}")),
+                    None => (step.detail.clone(), String::new()),
+                };
                 if detail.len() > 90 {
                     let cut = (0..=90)
                         .rev()
@@ -497,6 +522,7 @@ fn explain(store: &StoreService, text: &str) {
                     detail.truncate(cut);
                     detail.push('…');
                 }
+                detail.push_str(&counts);
                 println!(
                     "    {:indent$}{} {detail}  [est {} rows {} {:.2} ms]",
                     "",
@@ -697,6 +723,52 @@ fn first_value(store: &StoreService, text: &str) -> Option<String> {
             .unwrap_or(cell)
             .to_owned(),
     )
+}
+
+/// The rewrites EXPLAIN reports for `text` (`ql-tree-witness`, `join-groups`, ...).
+fn rewrites(store: &StoreService, text: &str) -> Vec<&'static str> {
+    PreparedQuery::parse(&SparqlQueryRequest::all(text))
+        .ok()
+        .and_then(|prepared| {
+            store
+                .explain_query(&prepared, &CancellationToken::new())
+                .ok()
+        })
+        .map(|explanation| explanation.rewrites)
+        .unwrap_or_default()
+}
+
+/// The status of `text`'s answers, as JSON (`null` where nothing can leave answers out):
+/// sound, complete, the bounds' counts and, under `owl2-dl`, the paths that decided.
+fn query_status(store: &StoreService, text: &str) -> String {
+    let Ok(prepared) = PreparedQuery::parse(&SparqlQueryRequest::all(text)) else {
+        return "null".to_owned();
+    };
+    match store.run_query_dl(
+        &prepared,
+        &CancellationToken::new(),
+        CountingSink::default(),
+    ) {
+        Ok(Some((status, detail))) => {
+            let bounds = status.bounds.as_ref().map_or("null".to_owned(), |b| {
+                format!(
+                    "{{\"lower\": {}, \"upper\": {}, \"unresolved\": {}}}",
+                    b.lower, b.upper, b.unresolved
+                )
+            });
+            format!(
+                "{{\"sound\": {}, \"complete\": {}, \"reasons\": {}, \"bounds\": {bounds}, \"paths\": {:?}, \"proved\": {}, \"refuted\": {}}}",
+                status.sound,
+                status.complete,
+                status.reasons.len(),
+                detail.paths,
+                detail.proved,
+                detail.refuted
+            )
+        }
+        Ok(None) => "null".to_owned(),
+        Err(e) => format!("{{\"error\": {:?}}}", e.to_string()),
+    }
 }
 
 /// The distinct operators `text` runs with, in the order EXPLAIN lists them.
@@ -904,6 +976,14 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     let reasoner = ReasonerConfig::for_mode(args.reason.unwrap_or(ReasoningMode::Disabled))
         .with_rules(rules)?;
     let program = reasoner.materialised_program();
+    // Under `owl2-dl` the store enters the mode with its pipeline (the bounds, the
+    // consistency gate, a status on every answer); the commits below use the same one.
+    let mut dl_pipeline = reasoner.mode().is_dl().then(|| {
+        MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(reasoner.clone())),
+        )
+    });
     if let Some(program) = &program {
         if let Some((peak, rss)) = memory_mib() {
             eprintln!("before reasoning: memory peak {peak} MiB, resident {rss} MiB");
@@ -1037,10 +1117,12 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         .collect::<Result<_, _>>()?;
     if let Some(file) = &args.commits {
         let phase = Phase::start();
-        let pipeline = MutationPipeline::new(
-            Arc::clone(&store),
-            Arc::new(ReasonerService::new(reasoner.clone())),
-        );
+        let pipeline = dl_pipeline.take().unwrap_or_else(|| {
+            MutationPipeline::new(
+                Arc::clone(&store),
+                Arc::new(ReasonerService::new(reasoner.clone())),
+            )
+        });
         report.sections.push((
             "commits",
             modes::commits(&pipeline, file, &texts, args.readers)?,
@@ -1063,6 +1145,11 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             ));
         }
         phases.push(("commits", phase.json()));
+    }
+    if args.classify {
+        report
+            .sections
+            .push(("classification", modes::classification(&store, args.runs)?));
     }
     if !args.clients.is_empty() {
         // One level per count of clients, each with its own peak memory.
@@ -1101,6 +1188,11 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         eprintln!("exported in {:.2} s", started.elapsed().as_secs_f64());
     }
     let memory_after_load = memory_mib();
+    if args.faults
+        && let Some(resident) = nrese_exec::memory::resident_bytes()
+    {
+        eprintln!("working set after open: {} MiB", resident / 1048576);
+    }
     eprintln!(
         "open {:.2} s{}",
         report.open_s,
@@ -1192,12 +1284,32 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         if let Some(first) = m.first {
             extra.push_str(&format!(",\n      \"first_ms\": {:.3}", ms(first)));
         }
+        if let Some(first) = m.first_faults {
+            let later = m.faults.get(m.faults.len() / 2).copied().unwrap_or(0);
+            extra.push_str(&format!(
+                ",\n      \"first_faults\": {first},\n      \"faults\": {later}"
+            ));
+            if args.faults {
+                println!(
+                    "    first {:.2} ms, {first} page faults; later runs {later} faults (median)",
+                    m.first.map_or(0.0, ms)
+                );
+            }
+        }
         if args.routes {
             if m.rows == 1
                 && let Some(value) = first_value(&store, text)
             {
                 extra.push_str(&format!(",\n      \"value\": {value:?}"));
             }
+            extra.push_str(&format!(
+                ",\n      \"rewrites\": {:?}",
+                rewrites(&store, text)
+            ));
+            extra.push_str(&format!(
+                ",\n      \"status\": {}",
+                query_status(&store, text)
+            ));
             extra.push_str(&format!(
                 ",\n      \"operators\": {:?}",
                 operators(&store, text)

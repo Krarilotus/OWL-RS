@@ -358,7 +358,7 @@ impl PermutationBuilder {
         self.keys.par_iter_mut().for_each(|key| {
             *key = permutation.to_key(&order.key_to_quad(key));
         });
-        self.keys.par_sort_unstable();
+        nrese_exec::sort::sort_keys(&mut self.keys);
         self.order = permutation;
         self.sorts += 1;
     }

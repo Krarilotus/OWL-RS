@@ -1188,6 +1188,8 @@ struct Context<'a> {
     trace: Option<RefCell<Vec<PlanStep>>>,
     /// Nesting depth of the operator being evaluated (for the trace).
     depth: Cell<usize>,
+    /// The seeks of the last index nested-loop join, for EXPLAIN ([`Probe`]).
+    probed: Cell<nrese_engine::SeekStats>,
     /// A LIMIT for the next basic graph pattern: any this many of its rows will do
     /// ([`Context::eval_limited`]). Taken by the pattern, so nothing nested sees it.
     limit: Cell<Option<usize>>,
@@ -1315,6 +1317,7 @@ impl<'a> Context<'a> {
             ),
             trace: None,
             depth: Cell::new(0),
+            probed: Cell::default(),
             limit: Cell::new(None),
             graph: RefCell::new(scope),
             synthetic: Cell::new(0),
@@ -2436,17 +2439,20 @@ impl<'a> Context<'a> {
                 None => self.snapshot.estimate_in(self.model, &s.quad_pattern()),
             })
             .collect();
+        let cyclic = ranged.iter().all(Option::is_none);
+        // EXPLAIN's estimate of a cyclic BGP samples its join: before the join is timed.
+        let estimate = match self.trace {
+            Some(_) if cyclic => self
+                .cyclic_estimate(&scans, &counts)
+                .map(|rows| rows.round() as u64),
+            _ => None,
+        };
         let start = Instant::now();
         let start_joins = start;
-        if scans.len() >= 3
-            && ranged.iter().all(Option::is_none)
-            && scans.iter().all(ScanPattern::in_default_graph)
-            && let Some(solutions) = self.cyclic_bgp(&scans, &counts)?
-        {
+        if cyclic && let Some(solutions) = self.cyclic_bgp(&scans, &counts, estimate)? {
             if self.trace.is_some() {
                 let detail = triples.iter().map(ToString::to_string).collect::<Vec<_>>();
                 let rows = solutions.table.len();
-                let estimate = self.bgp_estimate(&scans, &counts);
                 self.note("wcoj", detail.join(" . "), estimate, rows, start);
             }
             return Ok(solutions);
@@ -2475,15 +2481,8 @@ impl<'a> Context<'a> {
                 }
             })
             .collect();
-        let plan = self.join_order(&scans, &planned);
-        // Two patterns the orderer only sorts: the larger bounds their join (`estimate`).
-        let estimate = |step: usize| {
-            let rows = plan.rows[step];
-            Some(match rows.is_finite() {
-                true => rows.round() as u64,
-                false => plan.order[..=step].iter().map(|&i| planned[i]).max()?,
-            })
-        };
+        let plan = self.join_order(&scans, &planned, self.trace.is_some());
+        let estimate = |step: usize| Some(plan.rows[step].max(0.0).round() as u64);
         let order = &plan.order;
         // Each prefix of the order is a part of the result cache ([`cached::Joins`]): the
         // longest one cached is where the joins start.
@@ -2571,7 +2570,10 @@ impl<'a> Context<'a> {
                         (false, true) => "cross product",
                         (false, false) => "join",
                     };
-                    let detail = triples[next].to_string();
+                    let mut detail = triples[next].to_string();
+                    if probe && linked.is_none() {
+                        detail = self.probed_detail(detail);
+                    }
                     self.note(operator, detail, estimate(step), result.table.len(), start);
                 }
                 result = self.filter_bound(result, filters)?;
@@ -2765,6 +2767,7 @@ impl<'a> Context<'a> {
             if self.trace.is_some() {
                 let count = counts[next] as f64;
                 let mut divisor = 1.0f64;
+                let mut check = true;
                 for v in scans[next].vars() {
                     let d = self.distinct(&scans[next], &v, counts[next]) as f64;
                     let joined = match distinct.get(&v) {
@@ -2772,11 +2775,23 @@ impl<'a> Context<'a> {
                             divisor *= seen.max(d).max(1.0);
                             seen.min(d)
                         }
-                        None => d,
+                        None => {
+                            check = false;
+                            d
+                        }
                     };
                     distinct.insert(v, joined.max(1.0));
                 }
+                // The orderer's bounds (`plan`): a check keeps at most its input, and a
+                // fraction of a row is one.
+                let before = estimated;
                 estimated = estimated * count / divisor;
+                if check {
+                    estimated = estimated.min(before);
+                }
+                if estimated > 0.0 {
+                    estimated = estimated.max(1.0);
+                }
                 for d in distinct.values_mut() {
                     *d = d.min(estimated.max(1.0));
                 }
@@ -2791,7 +2806,11 @@ impl<'a> Context<'a> {
                 let operator = if probe { "index join" } else { "join" };
                 let rows = result.table.len();
                 let estimate = Some(estimated.round() as u64);
-                self.note(operator, triples[next].to_string(), estimate, rows, start);
+                let mut detail = triples[next].to_string();
+                if probe {
+                    detail = self.probed_detail(detail);
+                }
+                self.note(operator, detail, estimate, rows, start);
             }
             for v in scans[next].vars() {
                 if !bound.contains(&v) {
@@ -2881,40 +2900,34 @@ impl<'a> Context<'a> {
 
     /// The order in which to join a BGP's patterns ([`plan`]; `counts` are exact). Two
     /// patterns start with the smaller one; larger BGPs are planned with distinct counts.
-    fn join_order(&self, scans: &[ScanPattern], counts: &[u64]) -> plan::Plan {
+    /// The rows after each step are estimated where `estimated` asks (or the order
+    /// depends on them): a two-pattern BGP run without EXPLAIN skips its model.
+    fn join_order(&self, scans: &[ScanPattern], counts: &[u64], estimated: bool) -> plan::Plan {
         if scans.is_empty() {
             return plan::Plan {
                 order: Vec::new(),
                 rows: Vec::new(),
             };
         }
-        if scans.len() <= 2 {
-            let mut order: Vec<usize> = (0..scans.len()).collect();
-            order.sort_by_key(|&i| counts[i]);
-            let mut rows = vec![f64::NAN; order.len()];
-            rows[0] = counts[order[0]] as f64;
-            // Two patterns of one star: the characteristic sets estimate the pair; an edge
-            // and a star on its object: the characteristic pairs estimate the chain.
-            if let [a, b] = scans
-                && let (Some(x), Some(y)) = (self.star(a, counts[0], 0), self.star(b, counts[1], 0))
-                && let Some(sets) = self.snapshot.characteristic_sets_in(self.model)
-            {
-                if a.slots[0] == b.slots[0] {
-                    rows[1] =
-                        sets.star(&[x.predicate, y.predicate]) * x.selectivity * y.selectivity;
-                } else if let Some((edge, star)) = match (&a.slots[2], &b.slots[2]) {
-                    (Slot::Var(_), _) if a.slots[2] == b.slots[0] => Some((x, y)),
-                    (_, Slot::Var(_)) if b.slots[2] == a.slots[0] => Some((y, x)),
-                    _ => None,
-                } && let Some(chain) = sets.pair(&[], edge.predicate, &[star.predicate])
-                {
-                    rows[1] = chain * edge.selectivity * star.selectivity;
-                }
-            }
+        let mut order: Vec<usize> = (0..scans.len()).collect();
+        order.sort_by_key(|&i| counts[i]);
+        if scans.len() <= 2 && !estimated {
+            let rows = vec![f64::NAN; order.len()];
             return plan::Plan { order, rows };
         }
         let mut vars: Vec<Variable> = Vec::new();
         let inputs = self.plan_inputs(scans, counts, &mut vars);
+        if scans.len() <= 2 {
+            // The smaller pattern first; the join's rows by the orderer's model (a star's
+            // pair by the characteristic sets, an edge and a star on its object by the
+            // characteristic pairs, a check bounded by the rows it checks).
+            let sets = inputs
+                .iter()
+                .any(|i| i.star.is_some())
+                .then(|| self.snapshot.characteristic_sets_in(self.model))
+                .flatten();
+            return plan::along(&inputs, vars.len(), PROBE_FACTOR, sets.as_deref(), &order);
+        }
         self.order_inputs(&inputs, vars.len())
     }
 
@@ -2939,10 +2952,12 @@ impl<'a> Context<'a> {
         vars: &mut Vec<Variable>,
     ) -> Vec<plan::Input> {
         let mut index_of = |v: Variable| variable_index(vars, v);
+        let overlaps = self.overlaps(scans, counts);
         scans
             .iter()
             .zip(counts)
-            .map(|(scan, &count)| {
+            .zip(overlaps)
+            .map(|((scan, &count), overlaps)| {
                 let star = match &scan.slots[0] {
                     Slot::Var(v) => self.star(scan, count, index_of(v.clone())),
                     _ => None,
@@ -2965,9 +2980,71 @@ impl<'a> Context<'a> {
                         })
                         .collect(),
                     star,
+                    overlaps,
                 }
             })
             .collect()
+    }
+
+    /// Per pattern of `scans` with one variable, the values it has in common with each
+    /// other such pattern on the same variable ([`plan::Input::overlaps`]), where their
+    /// `counts` together are at most [`plan::OVERLAP_VALUES`]: both lists are read sorted
+    /// from the index and merged.
+    fn overlaps(&self, scans: &[ScanPattern], counts: &[u64]) -> Vec<Vec<(usize, u64)>> {
+        let mut out = vec![Vec::new(); scans.len()];
+        // The single-variable patterns: their variable and its position.
+        let single: Vec<Option<(Variable, usize)>> = scans
+            .iter()
+            .map(|scan| {
+                let [v] = &scan.vars()[..] else {
+                    return None;
+                };
+                if !scan.in_default_graph() || scan.repeats_variable() {
+                    return None;
+                }
+                let position = (0..3).find(|&c| scan.slots[c].is_var(v))?;
+                Some((v.clone(), position))
+            })
+            .collect();
+        let mut lists: Vec<Option<Vec<u64>>> = vec![None; scans.len()];
+        for i in 0..scans.len() {
+            for j in i + 1..scans.len() {
+                let (Some((a, _)), Some((b, _))) = (&single[i], &single[j]) else {
+                    continue;
+                };
+                if a != b || counts[i].saturating_add(counts[j]) > plan::OVERLAP_VALUES {
+                    continue;
+                }
+                for k in [i, j] {
+                    if lists[k].is_none() {
+                        let (v, position) = single[k].as_ref().expect("single");
+                        let permutation = scans[k].permutation_for(Some(v));
+                        let pattern = scans[k].quad_pattern();
+                        // A column at a time where the index allows (a few ns a value;
+                        // a quad at a time took 50: LUBM-10 q11 0.06 → 0.18 ms).
+                        lists[k] = self
+                            .snapshot
+                            .scan_columns_in(self.model, &pattern, permutation, &[*position])
+                            .and_then(|mut columns| columns.pop())
+                            .or_else(|| {
+                                let quads = self.snapshot.scan_sorted_in(
+                                    self.model,
+                                    &pattern,
+                                    permutation,
+                                )?;
+                                Some(quads.map(|q| q.components()[*position]).collect())
+                            });
+                    }
+                }
+                let (Some(x), Some(y)) = (&lists[i], &lists[j]) else {
+                    continue;
+                };
+                let both = sorted_overlap(x, y);
+                out[i].push((j, both));
+                out[j].push((i, both));
+            }
+        }
+        out
     }
 
     /// `scan` (with `count` matches) as part of a star on its subject (the variable with
@@ -3034,8 +3111,15 @@ impl<'a> Context<'a> {
             .map_or(count, |d| d.min(count))
     }
 
-    /// A cyclic BGP by a worst-case-optimal join ([`wcoj`]); `None` if it isn't cyclic.
-    fn cyclic_bgp(&self, scans: &[ScanPattern], counts: &[u64]) -> NativeResult<Option<Solutions>> {
+    /// `scans` as a worst-case-optimal join's patterns over their variables, if they are a
+    /// cyclic BGP the executor joins so: at least three patterns, all in the default graph.
+    fn cyclic_patterns(
+        &self,
+        scans: &[ScanPattern],
+    ) -> Option<(Vec<Variable>, Vec<[wcoj::Pos; 3]>)> {
+        if scans.len() < 3 || !scans.iter().all(ScanPattern::in_default_graph) {
+            return None;
+        }
         let mut vars: Vec<Variable> = Vec::new();
         for scan in scans {
             for v in scan.vars() {
@@ -3047,7 +3131,7 @@ impl<'a> Context<'a> {
         let patterns: Vec<[wcoj::Pos; 3]> = scans
             .iter()
             .map(|scan| {
-                // Default-graph patterns only (checked by the caller): the graph is constant.
+                // Default-graph patterns only: the graph is constant.
                 [0, 1, 2].map(|c| match &scan.slots[c] {
                     Slot::Const(id) => wcoj::Pos::Const(id.raw()),
                     Slot::Var(v) => {
@@ -3057,9 +3141,39 @@ impl<'a> Context<'a> {
                 })
             })
             .collect();
-        if !wcoj::cyclic(&patterns, vars.len()) {
-            return Ok(None);
+        wcoj::cyclic(&patterns, vars.len()).then_some((vars, patterns))
+    }
+
+    /// The rows of a cyclic BGP ([`Self::cyclic_patterns`]) by sampling its
+    /// worst-case-optimal join ([`wcoj::Query::estimate`]): independence can't see a
+    /// cycle closed by a correlated pattern (LUBM-10 q9, students taking a course of
+    /// their advisor: 14 estimated for 2,540). `None` if the BGP isn't one.
+    fn cyclic_estimate(&self, scans: &[ScanPattern], counts: &[u64]) -> Option<f64> {
+        let (vars, patterns) = self.cyclic_patterns(scans)?;
+        if counts.contains(&0) {
+            return Some(0.0);
         }
+        let patterns: Vec<[wcoj::Pos; 3]> = patterns
+            .into_iter()
+            .filter(|p| p.iter().any(|x| matches!(x, wcoj::Pos::Var(_))))
+            .collect();
+        let width = vars.len();
+        let rows = wcoj::SAMPLE_ROWS;
+        let query = wcoj::Query::new(&self.snapshot, self.model, patterns, width, rows);
+        Some(query.estimate())
+    }
+
+    /// A cyclic BGP by a worst-case-optimal join ([`wcoj`]); `None` if it isn't cyclic.
+    /// `estimate` is EXPLAIN's.
+    fn cyclic_bgp(
+        &self,
+        scans: &[ScanPattern],
+        counts: &[u64],
+        estimate: Option<u64>,
+    ) -> NativeResult<Option<Solutions>> {
+        let Some((vars, patterns)) = self.cyclic_patterns(scans) else {
+            return Ok(None);
+        };
         let width = vars.len();
         // A pattern without matches (constants-only ones included) empties the BGP.
         if counts.contains(&0) {
@@ -3110,12 +3224,18 @@ impl<'a> Context<'a> {
             trace.borrow_mut().push(PlanStep {
                 depth: self.depth.get() + 1,
                 operator: "wcoj order".to_owned(),
-                detail: format!(
-                    "{} | {} lookups",
-                    order.join(", "),
-                    stats.lookups.load(std::sync::atomic::Ordering::Relaxed)
-                ),
-                estimated_rows: self.bgp_estimate(scans, counts),
+                detail: {
+                    let load = |n: &AtomicUsize| n.load(AtomicOrdering::Relaxed);
+                    format!(
+                        "{} | {} lookups ({} seeks, {} from the root), {} candidates skipped",
+                        order.join(", "),
+                        load(&stats.lookups),
+                        load(&stats.seeks),
+                        load(&stats.roots),
+                        load(&stats.skipped)
+                    )
+                },
+                estimated_rows: estimate,
                 rows: table.len() as u64,
                 micros: 0,
                 cache: None,
@@ -3383,6 +3503,16 @@ impl<'a> Context<'a> {
         })
     }
 
+    /// EXPLAIN's detail of an index nested-loop join: the pattern, its seeks in the
+    /// index's runs and how many of them searched from the root.
+    fn probed_detail(&self, pattern: String) -> String {
+        let seeks = self.probed.get();
+        format!(
+            "{pattern} | {} seeks, {} from the root",
+            seeks.seeks, seeks.root_searches
+        )
+    }
+
     /// Joins `result` with `scan` by probing the index once per distinct key of `result`.
     fn probe_join(
         &self,
@@ -3390,6 +3520,25 @@ impl<'a> Context<'a> {
         scan: &ScanPattern,
         shared: &[Variable],
     ) -> NativeResult<Solutions> {
+        let mut shared = shared.to_vec();
+        if !result.ordered {
+            // The keys sorted in the order the index reads the probed pattern: the probes
+            // then ascend, and its cursor reads each run forward ([`Probe`]).
+            let mut shape = scan.clone();
+            for slot in &mut shape.slots {
+                if matches!(slot, Slot::Var(v) if shared.contains(v)) {
+                    *slot = Slot::Const(TermId::DEFAULT_GRAPH);
+                }
+            }
+            let order = shape.quad_pattern().read_order();
+            shared.sort_by_key(|v| {
+                (0..4)
+                    .filter(|&i| scan.slots[i].is_var(v))
+                    .filter_map(|i| order.iter().position(|&c| c == i))
+                    .min()
+            });
+        }
+        let shared = &shared[..];
         let key_columns: Vec<usize> = shared
             .iter()
             .map(|v| result.column(v).expect("shared"))
@@ -3428,6 +3577,7 @@ impl<'a> Context<'a> {
             width: vars.len(),
             max_rows: self.max_rows(vars.len()),
             produced: AtomicUsize::new(0),
+            seeks: std::sync::Mutex::default(),
         };
         let token = self.cancellation.clone();
         let cancelled = move || token.as_ref().is_some_and(CancellationToken::is_cancelled);
@@ -3456,6 +3606,8 @@ impl<'a> Context<'a> {
                 return Err(self.too_large(probe.max_rows.saturating_add(1), vars.len()));
             }
         };
+        self.probed
+            .set(*probe.seeks.lock().unwrap_or_else(|e| e.into_inner()));
         let out = if result.ordered {
             out
         } else {
@@ -4876,6 +5028,8 @@ struct Probe<'a> {
     /// Output rows allowed in total (the query's memory budget), and produced so far.
     max_rows: usize,
     produced: AtomicUsize,
+    /// The index seeks of all chunks.
+    seeks: std::sync::Mutex<nrese_engine::SeekStats>,
 }
 
 /// Why an index nested-loop join stopped early.
@@ -4885,7 +5039,11 @@ enum ProbeStop {
 }
 
 impl Probe<'_> {
-    /// The joined rows for `table` rows `rows`, in order.
+    /// The joined rows for `table` rows `rows`, in order. One probe cursor reads the index
+    /// for all of them: the keys ascend in its order (`probe_join`), so each probe seeks
+    /// forward from the last instead of searching every run from the root. The matches
+    /// of a key are kept flat, `positions.len()` values each: nothing is allocated per
+    /// match.
     fn rows(
         &self,
         rows: Range<usize>,
@@ -4893,12 +5051,21 @@ impl Probe<'_> {
     ) -> Result<IdTable, ProbeStop> {
         let table = self.table;
         let width = table.width();
+        let stride = self.positions.len();
         let mut out = IdTable::new(self.width);
-        let mut matches: Vec<Vec<u64>> = Vec::new();
+        let mut cursor = self.snapshot.probe_cursor(self.model);
+        // The new variables' values of each match of the current key, and their number
+        // (a pattern binding nothing new matches without values).
+        let mut matches: Vec<u64> = Vec::new();
+        let mut found = 0usize;
         let mut row = vec![0u64; self.width];
         let mut bound = self.scan.clone();
         let first = rows.start;
         let mut counted = 0;
+        let finish = |cursor: &nrese_engine::ProbeCursor<'_>| {
+            let mut seeks = self.seeks.lock().unwrap_or_else(|e| e.into_inner());
+            seeks.add(cursor.stats());
+        };
         for r in rows {
             if (r - first).is_multiple_of(4096) {
                 if cancelled() {
@@ -4914,39 +5081,44 @@ impl Probe<'_> {
                     .all(|&k| table.get(r, k) == table.get(r - 1, k));
             if !same_key {
                 matches.clear();
+                found = 0;
                 for (slots, &k) in self.shared_positions.iter().zip(self.key_columns) {
                     let id = TermId::from_raw(table.get(r, k));
                     for &i in slots {
                         bound.slots[i] = Slot::Const(id);
                     }
                 }
-                'quads: for quad in self
-                    .snapshot
-                    .quads_for_pattern_in(self.model, &bound.quad_pattern())
-                {
+                cursor.for_each(&bound.quad_pattern(), |quad| {
                     let components = quad.components();
-                    let mut values = Vec::with_capacity(self.positions.len());
+                    let start = matches.len();
                     for places in self.positions {
                         let value = components[places[0]];
                         if places[1..].iter().any(|&p| components[p] != value) {
-                            continue 'quads;
+                            matches.truncate(start);
+                            return;
                         }
-                        values.push(value);
+                        matches.push(value);
                     }
-                    matches.push(values);
-                }
-                if self.scan.merged() {
+                    found += 1;
+                });
+                if self.scan.merged() && found > 1 {
                     // A statement in several graphs matched once per graph; its values
                     // are the same each time.
-                    matches.sort_unstable();
-                    matches.dedup();
+                    let mut distinct: Vec<&[u64]> = match stride {
+                        0 => vec![&[]],
+                        _ => matches.chunks_exact(stride).collect(),
+                    };
+                    distinct.sort_unstable();
+                    distinct.dedup();
+                    found = distinct.len();
+                    matches = distinct.concat();
                 }
             }
-            for values in &matches {
+            for m in 0..found {
                 for (c, slot) in row.iter_mut().enumerate().take(width) {
                     *slot = table.get(r, c);
                 }
-                row[width..].copy_from_slice(values);
+                row[width..].copy_from_slice(&matches[m * stride..(m + 1) * stride]);
                 out.push_row(&row);
             }
             // One key can match a whole index range: check within large fan-outs too.
@@ -4955,6 +5127,7 @@ impl Probe<'_> {
                 counted = out.len();
             }
         }
+        finish(&cursor);
         self.grow(out.len() - counted)?;
         Ok(out)
     }
@@ -5617,6 +5790,28 @@ fn drop_last_columns(mut solutions: Solutions, count: usize) -> Solutions {
         IdTable::from_columns(columns)
     };
     solutions
+}
+
+/// The distinct values two sorted lists have in common: one merge.
+fn sorted_overlap(a: &[u64], b: &[u64]) -> u64 {
+    let (mut i, mut j, mut both) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                let value = a[i];
+                both += 1;
+                while i < a.len() && a[i] == value {
+                    i += 1;
+                }
+                while j < b.len() && b[j] == value {
+                    j += 1;
+                }
+            }
+        }
+    }
+    both
 }
 
 fn has_undef(table: &IdTable, columns: &[usize]) -> bool {

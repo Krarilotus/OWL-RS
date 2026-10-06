@@ -495,6 +495,14 @@ The micro-benchmarks follow what the fastest systems publish (research notes R3-
 R3-S2, R3-S3, R3-G1, Store-2, DL-D, DL-F of the literature wiki) and the investigation of 6
 October (its §5, all nine items).
 
+**QL rewriting and the DL mode** (owner, 6 October 2026): `ql-owl2bench` asserts the
+tree-witness rewrite on the OWL2Bench queries that need it and its absence on the others.
+The `dlmode-*` cases run the `owl2-dl` mode: LUBM 1's queries with each answer's status and
+the path that decided it, commits under it, and the consistency gate on commit (the RL check
+in `dlmode-reject`, the hypertableau in `dlmode-reject-dl`). The `classify-store-*` cases
+time the store's classification (`/classification`) and assert its engine (the context core,
+the tableau). Pairs that hang are recorded in their case (`hangs`) and not run again.
+
 <!-- fast-cases:start (fast.py table --write) -->
 | Case | Area | NRESE runs | Comparators (system: semantics) | Home turf of | Measures |
 |---|---|---|---|---|---|
@@ -503,7 +511,7 @@ October (its §5, all nine items).
 | `rl-clique` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | a symmetric and transitive property closing 40 random trees of 300 to cliques (3.6 M pairs) |
 | `rl-sameas` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, rdfox: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | owl:sameAs chains: 20,000 groups of 10, a value each, spread to the group (equality by representatives, expanded in the stack) |
 | `rl-sameas-compact` | reasoning | owl2-rl | qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | the same sameAs groups with the stack kept over representatives (equality = compact) |
-| `rl-chain` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | two chains of 2,500 nodes along a transitive property (6.2 M pairs) |
+| `rl-chain` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst (hangs), graphdb: owl2-rl, rdfox: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | two chains of 2,500 nodes along a transitive property (6.2 M pairs) |
 | `rl-lubm100` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl, qlever: closure, oxigraph: closure, virtuoso: closure, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | LUBM 100 (13.4 M asserted, 8.7 M inferred) and its 14 queries: the headline materialisation |
 | `rl-owl2bench` | reasoning | owl2-rl | nemo: owl2-rl, jena: owl-horst, graphdb: owl2-rl, rdfox: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | OWL2Bench RL-1: a 1.3 M-pair symmetric-transitive clique from a real TBox, 22 queries |
 | `rl-single-thread` | reasoning | owl2-rl | nemo: owl2-rl | GLog/VLog (no runner: Nemo stands in) | LUBM 10 on one thread: materialisation without parallelism |
@@ -585,6 +593,13 @@ October (its §5, all nine items).
 | `clients-sweep` | concurrency | none | qlever: plain, virtuoso: plain, oxigraph: plain, jena: plain | QLever | 1 to 64 concurrent clients on point lookups and small joins, 4 s per level: throughput against p99, peak memory per level, throughput per GB (NRESE's snapshot reads) |
 | `writes-under-readers` | concurrency | none | none: NRESE's own column | Virtuoso | 10,000 commits without reasoning under 0, 8 and 32 readers: write latency (p99) under read load |
 | `cache-replay` | cache | none | qlever: plain | QLever | a repeating query log (1,000 entries: a few queries recurring by a power law, a long tail of lookups) replayed in order with NRESE's result cache off and on (256 MiB) |
+| `ql-owl2bench` | reasoning | owl2-ql | qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | OWL2Bench's QL profile under owl2-ql: the RL closure and the tree-witness rewriting of each query (its rewrites and completeness recorded) |
+| `dlmode-lubm1` | dl | owl2-dl | none: NRESE's own column |  | LUBM 1 under owl2-dl: the 14 queries over the bounds, each answer's status (sound, complete) and the path that decided it |
+| `dlmode-commits` | maintenance | owl2-dl | graphdb: owl2-rl, rdfox: owl2-rl |  | 4,000 commits under owl2-dl: the RL closure maintained and each commit's consistency checked under OWL 2 DL (the gate inline) |
+| `dlmode-reject` | maintenance | owl2-dl | none: NRESE's own column |  | under owl2-dl, 200 commits and then one that makes a student a professor where the two are disjoint: the OWL 2 RL gate rejects it (cax-dw) |
+| `classify-store-horn` | dl | dl | hermit: dl, konclude: dl |  | the store's /classification of 3,000 Horn classes in a fresh process each time (the store keeps a classification per revision): the context core must take it |
+| `classify-store-tableau` | dl | dl | hermit: dl, konclude: dl |  | the store's /classification of qualified number restrictions with a union (beyond the Horn stage), in a fresh process each time: the hypertableau driver must take it |
+| `dlmode-reject-dl` | maintenance | owl2-dl | none: NRESE's own column |  | under owl2-dl, 200 commits and then one that adds a visitor, who must be faculty or a professor and is disjoint from both: inconsistent only under OWL 2 DL, so only the DL gate can reject it |
 <!-- fast-cases:end -->
 
 ## 7. Sources

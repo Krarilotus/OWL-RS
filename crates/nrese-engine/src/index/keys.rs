@@ -953,8 +953,49 @@ impl PackedKeys {
     /// in the same or a nearby block).
     pub(crate) fn range(&self, low: &Key, high: &Key) -> (usize, usize) {
         let start = self.bound_in(0, self.len, low, false);
+        (start, self.end_from(start, high))
+    }
+
+    /// [`Self::range`] for a `low` not below the key at `from - 1`: a finger search from
+    /// `from` ([`Self::bound_from`]) instead of one from the root. Probes in ascending
+    /// order then cost O(log d) for a range d blocks on, not O(log n) each.
+    pub(crate) fn range_from(&self, from: usize, low: &Key, high: &Key) -> (usize, usize) {
+        let start = self.bound_from(from, low);
+        (start, self.end_from(start, high))
+    }
+
+    /// The first index at or after `from` whose key is not below `key`, where every key
+    /// before `from` is below it: galloping over the blocks' first keys from `from`'s
+    /// block (1, 2, 4, … blocks on), then a binary search between the last two probes and
+    /// inside one block.
+    pub(crate) fn bound_from(&self, from: usize, key: &Key) -> usize {
+        if from >= self.len {
+            return self.len;
+        }
+        let blocks = self.firsts.len();
+        let block = from / BLOCK;
+        // Blocks after `block` whose first key is below `key`: gallop to a failing one.
+        let (mut below, mut step) = (block, 1);
+        while below + step < blocks && self.firsts[below + step] < *key {
+            below += step;
+            step *= 2;
+        }
+        let until = (below + step).min(blocks);
+        let failing = below + 1 + self.firsts[below + 1..until].partition_point(|k| k < key);
+        let start = if failing - 1 == block {
+            from
+        } else {
+            (failing - 1) * BLOCK
+        };
+        self.bound_in(start, (failing * BLOCK).min(self.len), key, false)
+    }
+
+    /// The end of the range from `start` (a lower bound) up to `high` inclusive: galloping
+    /// over the block first keys from `start`'s block (short ranges end in the same or a
+    /// nearby block).
+    fn end_from(&self, start: usize, high: &Key) -> usize {
         if start == self.len {
-            return (start, start);
+            return start;
         }
         let blocks = self.firsts.len();
         let (mut from, mut step) = (start / BLOCK + 1, 1);
@@ -965,8 +1006,7 @@ impl PackedKeys {
         }
         let until = (from + step - 1).min(blocks);
         let failing = from + self.firsts[from..until].partition_point(|k| k <= high);
-        let end = self.bound_in(start, (failing * BLOCK).min(self.len), high, true);
-        (start, end)
+        self.bound_in(start, (failing * BLOCK).min(self.len), high, true)
     }
 
     /// The first index in `start..end` whose key is not below `key` (`inclusive`: not at or
@@ -1087,6 +1127,34 @@ mod tests {
                 let between = [probe[0], probe[1], probe[2] + 1, 0];
                 let expected = start + keys[start..end].partition_point(|k| k < &between);
                 assert_eq!(packed.bound_in(start, end, &between, false), expected);
+            }
+        }
+    }
+
+    /// Finger searches from any earlier position find what searches from the root find.
+    #[test]
+    fn finger_searches_equal_searches_from_the_root() {
+        let mut state = 41;
+        for n in [1, 127, 128, 129, 5000, 70_000] {
+            let keys = random_keys(&mut state, n);
+            let packed = PackedKeys::from_sorted(&keys);
+            let mut probes: Vec<Key> = (0..300)
+                .map(|_| {
+                    let mut key = keys[(rng(&mut state) as usize) % keys.len()];
+                    key[2] += rng(&mut state) % 2; // between stored keys too
+                    key
+                })
+                .collect();
+            probes.sort_unstable();
+            let mut from = 0;
+            for probe in &probes {
+                let high = [probe[0], u64::MAX, u64::MAX, u64::MAX];
+                let expected = packed.range(probe, &high);
+                assert_eq!(packed.range_from(from, probe, &high), expected, "n {n}");
+                // Any position up to the lower bound will do.
+                let earlier = from + (rng(&mut state) as usize) % (expected.0 - from + 1);
+                assert_eq!(packed.bound_from(earlier, probe), expected.0, "n {n}");
+                from = expected.0;
             }
         }
     }
