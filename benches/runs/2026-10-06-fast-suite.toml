@@ -28,7 +28,7 @@ commands = [
   "python benches/fast/fast.py run --reps 2",
   "python benches/fast/fast.py compete --areas dl; compete --cases ... (rule reasoners, closure)",
 ]
-results = "benches/baselines/fast/2026-10-06-8233ea59.json, 2026-10-06-e8b9aea9.json (committed); benches/fast/results/2026-10-06-* (git-ignored)"
+results = "full reports on the main PC: ~/nrese-bench/reports/fast/2026-10-06-8233ea59.json (sha256 named in the compact record benches/baselines/fast/2026-10-06-8233ea59.json) and 2026-10-06-e8b9aea9.json (likewise); comparisons: benches/fast/results/2026-10-06-* (git-ignored)"
 publishable = "all"
 
 pairs = [
