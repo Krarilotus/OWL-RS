@@ -291,3 +291,41 @@ fn loads_report_progress_and_stop_when_cancelled() {
         before
     );
 }
+
+/// Bulk loads number new terms in the order they first occur in the files, whatever the
+/// number of threads parsing them (one chunk per thread): the same ids, so the same
+/// answers in the same order (a scan answers in id order).
+#[test]
+fn loads_give_the_same_ids_at_any_thread_count() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("data.nt");
+    let mut text = ntriples(20_000);
+    for i in 0..20_000 {
+        writeln!(
+            text,
+            "<http://example.com/s{}> <http://example.com/q{}> <http://example.com/o{}> .",
+            (i * 7919) % 5000,
+            i % 11,
+            (i * 104_729) % 3000
+        )
+        .unwrap();
+    }
+    fs::write(&path, text).unwrap();
+    let answers = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let service = service();
+        pool.install(|| service.bulk_load(&request(&[&path])).expect("load"));
+        // Blank nodes are labelled afresh per load: the IRIs' statements, whose ids lie
+        // among the blank nodes' (any difference there moves them too).
+        service
+            .execute_query_str("SELECT * WHERE { ?s ?p ?o FILTER(isIRI(?s)) }")
+            .expect("query")
+            .payload
+    };
+    let one = answers(1);
+    assert_eq!(answers(6), one);
+    assert_eq!(answers(3), one);
+}
