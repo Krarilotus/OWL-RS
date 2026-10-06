@@ -10,6 +10,7 @@ pub mod catalog;
 mod classification;
 pub mod config;
 mod delta;
+pub mod dl;
 pub mod draft_check;
 mod entailment;
 pub mod error;
@@ -44,17 +45,18 @@ pub use backup::{
     DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
 };
 pub use bulk_load::{BulkLoadReport, BulkLoadRequest, LoadProgress};
-pub use classification::ClassificationReport;
+pub use classification::{ClassificationReport, RealisationReport};
 pub use config::{
     DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity, ShaclGate,
     StoreConfig, StoreMode,
 };
 pub use delta::MutationDeltaPreview;
+pub use dl::{DlAnswers, DlConfig, DlConsistency, DlDetail};
 pub use draft_check::{
     DRAFT_CHECK_PROFILES, DRAFT_CHECK_PROTOCOL, DRAFT_CHECK_SEMANTICS, DraftInputs, DraftLimits,
     DraftOperation, DraftOutcome, DraftStatus, DraftTerm, input_hash_mismatch, run_draft_check,
 };
-pub use entailment::Entailment;
+pub use entailment::{DlEntailment, Entailment};
 pub use error::{Refusal, StoreError, StoreResult};
 pub use graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,

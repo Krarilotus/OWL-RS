@@ -7,6 +7,7 @@ mod backup_restore_tests;
 mod bulk_load_tests;
 mod catalog_ontology_store_tests;
 mod convert_tests;
+mod dl;
 mod entailment_tests;
 mod equality_compact_tests;
 mod explanation_tests;

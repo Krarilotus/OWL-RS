@@ -1,13 +1,11 @@
-//! OWL 2 EL classification of the store's asserted statements (all graphs), on request
-//! ([`nrese_reasoner::classify`]).
+//! Classification and realisation of the store's asserted statements (all graphs), on
+//! request, by the OWL 2 DL engines ([`crate::dl::classification`]): complete for OWL 2
+//! DL within `dl.timeout`, and saying so when a budget or an unsupported construct leaves
+//! a result incomplete (what it contains is entailed either way).
 
-use std::collections::BTreeMap;
 use std::time::Instant;
 
-use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, TermKind};
-use nrese_rdf::{LiteralRef, NamedNodeRef};
-use nrese_reasoner::classify::classify;
-use nrese_reasoner::ir::Vocabulary;
+use nrese_engine::{Snapshot, TermId};
 
 use crate::{StoreResult, StoreService};
 
@@ -18,103 +16,104 @@ pub struct ClassificationReport {
     pub subsumptions: Vec<(String, String)>,
     /// Classes that can have no instance.
     pub unsatisfiable: Vec<String>,
-    /// Axioms outside OWL 2 EL that were skipped, by kind.
-    pub skipped: BTreeMap<&'static str, usize>,
+    /// Classes equivalent to `owl:Thing`.
+    pub equivalent_to_thing: Vec<String>,
+    /// False if the ontology has no model: then every class is unsatisfiable.
+    pub consistent: bool,
+    /// The engine that classified: `context-core` (the Horn stage took the ontology) or
+    /// `tableau` (the hypertableau driver).
+    pub engine: &'static str,
+    /// Why the hierarchy may lack subsumptions (empty: it is complete).
+    pub incomplete: Vec<String>,
     pub micros: u64,
 }
 
-/// Ids of the vocabulary the classifier looks for; a term the store doesn't hold gets an
-/// id no statement has.
-struct Lookup<'a> {
-    snapshot: &'a Snapshot,
-    missing: u64,
+impl ClassificationReport {
+    pub fn complete(&self) -> bool {
+        self.incomplete.is_empty()
+    }
 }
 
-impl Vocabulary for Lookup<'_> {
-    fn iri(&mut self, iri: &str) -> u64 {
-        self.snapshot
-            .lookup(NamedNodeRef::new_unchecked(iri).into())
-            .map_or_else(
-                || {
-                    self.missing -= 1;
-                    self.missing
-                },
-                TermId::raw,
-            )
-    }
+/// The named individuals' types under the store's asserted ontology.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RealisationReport {
+    /// Per named individual (IRI, sorted): every named class it is an instance of.
+    pub types: Vec<(String, Vec<String>)>,
+    pub consistent: bool,
+    /// The engine that classified (as [`ClassificationReport::engine`]).
+    pub engine: &'static str,
+    /// Why types may be missing (empty: complete).
+    pub incomplete: Vec<String>,
+    pub micros: u64,
+}
 
-    fn literal(&mut self, lexical: &str, datatype: &str) -> u64 {
-        let literal = LiteralRef::new_typed_literal(lexical, NamedNodeRef::new_unchecked(datatype));
-        self.snapshot.lookup(literal.into()).map_or_else(
-            || {
-                self.missing -= 1;
-                self.missing
-            },
-            TermId::raw,
-        )
+impl RealisationReport {
+    pub fn complete(&self) -> bool {
+        self.incomplete.is_empty()
     }
+}
 
-    fn language_literal(&mut self, lexical: &str, language: &str) -> u64 {
-        let literal = LiteralRef::new_language_tagged_literal_unchecked(lexical, language);
-        self.snapshot.lookup(literal.into()).map_or_else(
-            || {
-                self.missing -= 1;
-                self.missing
-            },
-            TermId::raw,
-        )
+/// An IRI's text; `None` for any other term.
+fn iri(snapshot: &Snapshot, id: u64) -> Option<String> {
+    match snapshot.decode(TermId::from_raw(id)) {
+        Some(nrese_rdf::Term::NamedNode(n)) => Some(n.into_string()),
+        _ => None,
     }
+}
+
+fn sorted_iris(snapshot: &Snapshot, ids: &[u64]) -> Vec<String> {
+    let mut out: Vec<String> = ids.iter().filter_map(|&c| iri(snapshot, c)).collect();
+    out.sort();
+    out
 }
 
 impl StoreService {
-    /// Classifies the asserted statements of every graph under OWL 2 EL; for a scope that
+    /// Classifies the asserted statements of every graph under OWL 2 DL; for a scope that
     /// reads every graph.
     pub fn classify(&self, scope: &crate::ReadScope) -> StoreResult<ClassificationReport> {
         scope.require_all("classification")?;
         let started = Instant::now();
         let snapshot = self.engine().snapshot();
-        let mut triples: Vec<[u64; 3]> = snapshot
-            .quads_for_pattern_in(
-                ReadModel::Asserted,
-                &QuadPattern {
-                    subject: None,
-                    predicate: None,
-                    object: None,
-                    graph: GraphSelector::Any,
-                },
-            )
-            .map(|q| [q.subject.raw(), q.predicate.raw(), q.object.raw()])
-            .collect();
-        triples.sort_unstable();
-        triples.dedup();
-        let mut vocabulary = Lookup {
-            snapshot: &snapshot,
-            missing: u64::MAX,
-        };
-        let result = classify(&triples, &mut vocabulary, &|id| {
-            TermId::from_raw(id).kind() == TermKind::Iri
-        });
-        let text = |id: u64| match snapshot.decode(TermId::from_raw(id)) {
-            Some(nrese_rdf::Term::NamedNode(n)) => n.into_string(),
-            other => format!("{other:?}"),
-        };
-        let mut skipped = BTreeMap::new();
-        for (_, kind) in &result.skipped {
-            *skipped.entry(*kind).or_default() += 1;
-        }
-        let mut subsumptions: Vec<(String, String)> = result
+        let taxonomy = crate::dl::classification::taxonomy(self, &snapshot);
+        let c = &taxonomy.classification;
+        let mut subsumptions: Vec<(String, String)> = c
             .subsumptions
             .iter()
-            .map(|&(a, b)| (text(a), text(b)))
+            .filter_map(|&(a, b)| Some((iri(&snapshot, a)?, iri(&snapshot, b)?)))
             .collect();
         subsumptions.sort();
-        let mut unsatisfiable: Vec<String> =
-            result.unsatisfiable.iter().map(|&c| text(c)).collect();
-        unsatisfiable.sort();
         Ok(ClassificationReport {
             subsumptions,
-            unsatisfiable,
-            skipped,
+            unsatisfiable: sorted_iris(&snapshot, &c.unsatisfiable),
+            equivalent_to_thing: sorted_iris(&snapshot, &c.top),
+            consistent: c.consistent,
+            engine: taxonomy.profile.path,
+            incomplete: taxonomy.incomplete.clone(),
+            micros: started.elapsed().as_micros() as u64,
+        })
+    }
+
+    /// Realises the asserted statements of every graph under OWL 2 DL: each named
+    /// individual's types; for a scope that reads every graph.
+    pub fn realise(&self, scope: &crate::ReadScope) -> StoreResult<RealisationReport> {
+        scope.require_all("realisation")?;
+        let started = Instant::now();
+        let snapshot = self.engine().snapshot();
+        let r = crate::dl::classification::realisation(self, &snapshot);
+        let mut types: Vec<(String, Vec<String>)> = r
+            .individuals
+            .iter()
+            .zip(&r.types)
+            .filter_map(|(&a, classes)| Some((iri(&snapshot, a)?, sorted_iris(&snapshot, classes))))
+            .collect();
+        types.sort();
+        let mut incomplete = r.taxonomy.incomplete.clone();
+        incomplete.extend(r.incomplete.iter().cloned());
+        Ok(RealisationReport {
+            types,
+            consistent: r.taxonomy.classification.consistent,
+            engine: r.taxonomy.profile.path,
+            incomplete,
             micros: started.elapsed().as_micros() as u64,
         })
     }
