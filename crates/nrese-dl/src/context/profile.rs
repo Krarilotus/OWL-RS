@@ -48,6 +48,8 @@ pub struct Profile {
     pub equality_literals_generated: u64,
     pub nominal_contexts: u64,
     pub threads: usize,
+    /// The most clauses one context holds (a context shared by many successors grows).
+    pub largest_context: u64,
 }
 
 impl Profile {
@@ -78,7 +80,7 @@ impl Profile {
              functions={} renamed={} split={} recentred={} dropped_data={} contexts_created={} \
              contexts_saturated={} clauses_generated={} clauses_kept={} redundant_forward={} \
              redundant_backward={} hyper={} pred={} max_head={} max_body={} edges={} \
-             peak_agenda={} messages={} slots={} proof_steps={} threads={}",
+             peak_agenda={} messages={} slots={} proof_steps={} threads={} largest_context={}",
             ms(self.normalise),
             ms(self.compile),
             ms(self.saturate),
@@ -107,6 +109,7 @@ impl Profile {
             self.slots,
             self.proof_steps,
             self.threads,
+            self.largest_context,
         );
         out
     }

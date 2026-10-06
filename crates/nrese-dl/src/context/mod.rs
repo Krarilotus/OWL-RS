@@ -32,11 +32,12 @@ pub mod links;
 pub mod profile;
 pub mod program;
 pub mod rules;
+mod settrie;
 pub mod state;
 pub mod unsupported;
 
 pub use classify::{
-    Classification, Options, Saturated, classify, saturate, saturate_normalised, signature,
+    Classification, Local, Options, Saturated, classify, saturate, saturate_normalised, signature,
 };
 pub use compile::Unsupported;
 pub use engine::{Budget, Strategy};

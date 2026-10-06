@@ -119,6 +119,8 @@ pub struct Engine {
     contexts: Arena,
     registry: Mutex<HashMap<CoreKey, ContextId>>,
     budget: Budget,
+    /// Pred joins stop where the body so far already makes the conclusion redundant.
+    pub prune_pred: bool,
     /// The budget ran out: the workers drop what is left (the saturation is then
     /// incomplete and says so).
     exhausted: AtomicBool,
@@ -143,8 +145,15 @@ impl Engine {
             contexts: Arena::new(),
             registry: Mutex::new(HashMap::new()),
             budget: Budget::default(),
+            prune_pred: true,
             exhausted: AtomicBool::new(false),
         }
+    }
+
+    /// The engine with Pred's pruning on or off (on by default; off only for A/B runs).
+    pub fn with_prune_pred(mut self, on: bool) -> Self {
+        self.prune_pred = on;
+        self
     }
 
     /// The engine with a budget.
