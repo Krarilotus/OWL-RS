@@ -179,6 +179,7 @@ impl Context<'_> {
                 vars: ends,
                 star: None,
                 edge_object: None,
+                overlaps: Vec::new(),
             });
         }
         Some(self.order_inputs(&inputs, vars.len()))
