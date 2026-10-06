@@ -3,13 +3,13 @@
 Status: **design**, 2026-09-27. Phase 2 of [ROADMAP §3.1](../ROADMAP.md); decision D11: one execution core for SPARQL and reasoning.
 Update 2026-10-01: the fallback below is gone; the native executor evaluates every query,
 and the differential tests compare it with `nrese-sparql-reference`
-([migration plan](../plan/2026-10-01-oxigraph-migration.md)).
+([migration plan](rdf-bundle.md)).
 
 ## 1. Goal
 
 Close the query gap to QLever, and give the reasoner (R2/R4) its join machinery, with one implementation.
 
-The basics scorecard ([SCORECARD.md](../../benches/competitors/SCORECARD.md)) locates the gap. QLever is 10–2000× faster on joins and aggregates, and every cause sits in the borrowed evaluator (spareval):
+The basics scorecard of 26 September (on the borrowed evaluator) located the gap. QLever is 10–2000× faster on joins and aggregates, and every cause sits in the borrowed evaluator (spareval):
 - joins build hash tables over full scans instead of using sorted order or probing indexes
 - FILTERs aren't pushed into range scans
 - counts and group-bys don't use index order or metadata

@@ -290,7 +290,7 @@ With access enforced (the access state's `enforced` setting, on once a policy fi
 | 500 | The server's fault; logged with the request id |
 | 503 | Starting, or (for `/readyz`) in quarantine |
 
-Errors are `application/problem+json` documents. Every response carries `x-request-id`.
+Every error is an `application/problem+json` document (RFC 9457), whoever answered: a handler, or the framework itself (no such route 404, a method the route doesn't take 405 with `Allow`, a body that doesn't decode). It has `type`, `title`, `status` and `detail`, and `request_id`, the id that `x-request-id` carries on every response and the server's log carries with the request. A commit rejected by a consistency check adds `reasoner_reject`. The one exception is SPARQL parse errors under the `plain-text` profile, for clients that show the message as text. The console and its CLI print an error as `title: detail (request <id>)`, and the CLI exits non-zero.
 
 ## Service and operations
 

@@ -76,7 +76,7 @@ impl Local {
 const SEARCH_BUDGET: u64 = 200_000;
 
 /// Constraints over data variables.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct DatatypeTheory {
     constraints: Vec<Vec<Constraint>>,
     /// Per variable: the variable it was merged into (itself if none), and the merge's

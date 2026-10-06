@@ -130,6 +130,11 @@ pub struct Program {
     pub su_in: Vec<bool>,
     /// The named class of each concept below [`Program::named`]; fresh ones after.
     pub names: Vec<Term>,
+    /// Per fresh name of the clauses: whether the renaming flipped it (its concept stands
+    /// for the complement).
+    pub flipped: Vec<bool>,
+    /// The roles by their property.
+    pub role_ids: hashbrown::HashMap<Term, RoleId>,
     pub concepts: u32,
     pub roles: u32,
     pub order: TermOrder,

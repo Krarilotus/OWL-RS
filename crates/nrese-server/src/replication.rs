@@ -208,9 +208,7 @@ pub async fn log(
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let batch = match batch {
         Ok(batch) => batch,
-        Err(nrese_store::StoreError::Engine(nrese_engine::EngineError::LogTruncated {
-            oldest,
-        })) => {
+        Err(nrese_store::StoreError::Engine(nrese_store::EngineError::LogTruncated { oldest })) => {
             return Err(ApiError::gone(format!(
                 "the log holds no records after revision {} (from {oldest} on at the \
                      earliest): start the replica from an image",

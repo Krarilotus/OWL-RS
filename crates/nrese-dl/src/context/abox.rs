@@ -33,6 +33,8 @@ pub struct Abox {
     /// For a DL-clause with a role body atom and a head about a successor: the concept
     /// `E` with `E(x) → head`, added to an individual where the clause fires.
     pub existential: HashMap<u32, ConceptId>,
+    /// Two individuals asserted different are the same (`SameIndividual`): no model.
+    pub clash: bool,
 }
 
 impl Compiler {
@@ -63,6 +65,13 @@ impl Compiler {
             parent[a] = b;
         }
         let mut abox = Abox::default();
+        // Without equality clauses (step 3), only `SameIndividual` makes individuals equal.
+        for &(a, b, _) in &facts.different {
+            let (a, b) = (id(a, &mut parent), id(b, &mut parent));
+            if find(&mut parent, a) == find(&mut parent, b) {
+                abox.clash = true;
+            }
+        }
         let mut dense: HashMap<usize, u32> = HashMap::new();
         let mut individual = |t: Term, parent: &mut Vec<usize>, abox: &mut Abox| {
             let i = id(t, parent);
@@ -92,7 +101,11 @@ impl Compiler {
         }
         abox.edges.sort_unstable();
         abox.edges.dedup();
-        if abox.edges.is_empty() {
+        // Self-loops (`∃R.Self`) add edges during saturation even where none is asserted.
+        let self_loops = self.program.clauses.iter().any(|c| {
+            matches!(c.head, Some(h) if h.kind != KindPat::Concept && h.term == TermPat::Var(Var::X))
+        });
+        if abox.edges.is_empty() && (abox.types.is_empty() || !self_loops) {
             return Ok(abox);
         }
         // Clauses a named edge can fire: one neighbour at most, and a fresh name for heads
@@ -148,8 +161,11 @@ impl Individuals {
                 .collect(),
             edges: abox.edges.iter().copied().collect(),
             contexts: Vec::new(),
-            consistent: true,
+            consistent: !abox.clash,
         };
+        if abox.clash {
+            return me;
+        }
         loop {
             let mut seeds = Vec::new();
             me.contexts = me

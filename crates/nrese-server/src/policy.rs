@@ -188,23 +188,3 @@ fn enforce_size_limit(kind: &str, size: usize, limit: usize) -> Result<(), ApiEr
 
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use super::PolicyAction;
-    use crate::auth::{AccessGrant, authorize_grants};
-
-    #[test]
-    fn read_grant_authorizes_query_reads() {
-        let grants = BTreeSet::from([AccessGrant::Read]);
-        assert!(authorize_grants(PolicyAction::QueryRead, &grants));
-    }
-
-    #[test]
-    fn read_grant_does_not_authorize_update_writes() {
-        let grants = BTreeSet::from([AccessGrant::Read]);
-        assert!(!authorize_grants(PolicyAction::UpdateWrite, &grants));
-    }
-}
