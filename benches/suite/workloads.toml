@@ -310,7 +310,9 @@ check = "answers against the single-store run"
 title = "The fast suite's cases on their comparators: each case under the semantics a system supports"
 kind = "performance"
 tasks = ["basics", "RT1", "RT3"]
-needs = ["load", "query"]
+# load only: rule engines without SPARQL (Nemo) have their closure answered by Oxigraph, as
+# for LUBM; the plain cases' stores all have query.
+needs = ["load"]
 scales = "generated, 10-300 s per case (benches/fast/cases.toml)"
 source = "benches/fast: perf_lab generate (deterministic, seeded) and the reasoning kit's LUBM and OWL2Bench"
 licence = "ours; LUBM GPL-2.0 (generator), OWL2Bench queries CC-BY-4.0"

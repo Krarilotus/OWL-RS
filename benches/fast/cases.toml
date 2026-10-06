@@ -433,12 +433,14 @@ data = "el classes=20000 roles=12"
 tool = "classify-el"
 repeat = 3
 metric = "whole_ms"
-check = {}
+check = { "taxonomy_equal" = "true" }
 route = {}
 cap_gb = 6
 systems = ["elk:el", "konclude:dl", "hermit:dl"]
 home_turf = "elk"
-
+reference = "/fast/ref/el-classes20000-roles12.elk.tax"
+outcome = "wrong"
+known = "6 Oct 2026: 4,526 direct subsumptions more than ELK and Konclude, which agree (e.g. A1 below the defined class D3); to adjudicate with a minimal witness (benches/reasoning/dl/disputed.tsv)"
 [[case]]
 name = "horn-classify"
 area = "dl"
