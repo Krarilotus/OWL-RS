@@ -1,0 +1,9 @@
+?s	?p	?o
+<http://e/Employee>	<http://www.w3.org/2000/01/rdf-schema#subClassOf>	_:f5eb7a56fc189f04799be7f9e228be23
+<http://e/jo>	<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>	<http://e/Employee>
+<http://e/jo>	<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>	_:f5eb7a56fc189f04799be7f9e228be23
+<http://e/kim>	<http://e/worksFor>	<http://e/acme>
+<http://e/knows>	<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>	<http://www.w3.org/2002/07/owl#ReflexiveProperty>
+_:f5eb7a56fc189f04799be7f9e228be23	<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>	<http://www.w3.org/2002/07/owl#Restriction>
+_:f5eb7a56fc189f04799be7f9e228be23	<http://www.w3.org/2002/07/owl#onProperty>	<http://e/worksFor>
+_:f5eb7a56fc189f04799be7f9e228be23	<http://www.w3.org/2002/07/owl#someValuesFrom>	<http://e/Organisation>

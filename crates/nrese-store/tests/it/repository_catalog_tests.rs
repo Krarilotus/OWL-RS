@@ -87,8 +87,8 @@ fn repositories_outlive_the_catalogue_that_made_them() {
             .map(|entries| entries.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
             .unwrap_or_default()
     };
-    std::fs::create_dir_all(root.join(".trash-old-0")).unwrap();
-    std::fs::write(root.join(".trash-old-0").join("file"), b"x").unwrap();
+    std::fs::create_dir_all(root.join("~trash-old-0")).unwrap();
+    std::fs::write(root.join("~trash-old-0").join("file"), b"x").unwrap();
     let catalog = open(dir.path());
     assert!(catalog.list().is_empty());
     assert!(left(&root).is_empty(), "{:?}", left(&root));

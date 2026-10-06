@@ -1,0 +1,6 @@
+?x	?y
+<http://e/dept1>	<http://e/school1>
+<http://e/dept1>	<http://e/uni1>
+<http://e/dept2>	<http://e/school1>
+<http://e/dept2>	<http://e/uni1>
+<http://e/school1>	<http://e/uni1>
