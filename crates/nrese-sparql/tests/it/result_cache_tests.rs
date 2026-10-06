@@ -331,19 +331,19 @@ fn serialised_answers_are_kept_per_format_form_and_snapshot() {
     let options = with_cache(&cache, ReadModel::Materialised);
     let select = parse(&format!("SELECT ?s ?o WHERE {{ ?s <{EX}p> ?o }}"));
     let snapshot = engine.snapshot();
-    let CachedOutput::Miss(slot) = cached_output(&snapshot, &select, &options, TSV) else {
+    let CachedOutput::Miss(slot) = cached_output(&snapshot, &select, &options, TSV, "") else {
         panic!("nothing cached yet")
     };
     let written = tsv(&snapshot, &select, &options);
     slot.offer(written.clone(), std::time::Duration::from_millis(5));
-    let CachedOutput::Hit(bytes) = cached_output(&snapshot, &select, &options, TSV) else {
+    let CachedOutput::Hit(bytes) = cached_output(&snapshot, &select, &options, TSV, "") else {
         panic!("the bytes just offered")
     };
     assert_eq!(&*bytes, written.as_slice());
     // Another format, another form or template over the same pattern: not these bytes.
     let json = "application/sparql-results+json";
     assert!(matches!(
-        cached_output(&snapshot, &select, &options, json),
+        cached_output(&snapshot, &select, &options, json, ""),
         CachedOutput::Miss(_)
     ));
     for other in [
@@ -352,21 +352,37 @@ fn serialised_answers_are_kept_per_format_form_and_snapshot() {
         format!("CONSTRUCT {{ ?o <{EX}r> ?s }} WHERE {{ ?s <{EX}p> ?o }}"),
     ] {
         let other = parse(&other);
-        let CachedOutput::Miss(slot) = cached_output(&snapshot, &other, &options, TSV) else {
+        let CachedOutput::Miss(slot) = cached_output(&snapshot, &other, &options, TSV, "") else {
             panic!("another query")
         };
         slot.offer(b"other".to_vec(), std::time::Duration::from_millis(5));
     }
-    let CachedOutput::Hit(bytes) = cached_output(&snapshot, &select, &options, TSV) else {
+    let CachedOutput::Hit(bytes) = cached_output(&snapshot, &select, &options, TSV, "") else {
         panic!("still cached")
     };
     assert_eq!(&*bytes, written.as_slice());
+    // Another caller context (the store's reasoning mode, the status it reports), or the
+    // QL rewriting on: not these bytes.
+    assert!(matches!(
+        cached_output(&snapshot, &select, &options, TSV, "owl2-dl"),
+        CachedOutput::Miss(_)
+    ));
+    let rewriting = QueryOptions {
+        ql: Some(Arc::new(nrese_sparql::ql::QlRewriting::new(
+            nrese_sparql::ql::Closure::default(),
+        ))),
+        ..options.clone()
+    };
+    assert!(matches!(
+        cached_output(&snapshot, &select, &rewriting, TSV, ""),
+        CachedOutput::Miss(_)
+    ));
     // Never answered from bytes: a volatile query, a pin, a transaction's pending state.
     let volatile = parse(&format!(
         "SELECT ?s ?r WHERE {{ ?s <{EX}p> ?o BIND(RAND() AS ?r) }}"
     ));
     assert!(matches!(
-        cached_output(&snapshot, &volatile, &options, TSV),
+        cached_output(&snapshot, &volatile, &options, TSV, ""),
         CachedOutput::Off
     ));
     let pinning = QueryOptions {
@@ -377,19 +393,19 @@ fn serialised_answers_are_kept_per_format_form_and_snapshot() {
         ..options.clone()
     };
     assert!(matches!(
-        cached_output(&snapshot, &select, &pinning, TSV),
+        cached_output(&snapshot, &select, &pinning, TSV, ""),
         CachedOutput::Off
     ));
     let mut tx = engine.transaction();
     tx.insert(Quad::new(ex("c"), ex("p"), ex("d"), GraphName::DefaultGraph).as_ref());
     assert!(matches!(
-        cached_output(&tx, &select, &options, TSV),
+        cached_output(&tx, &select, &options, TSV, ""),
         CachedOutput::Off
     ));
     tx.commit().unwrap();
     // A commit: the older bytes don't answer the newer snapshot.
     assert!(matches!(
-        cached_output(&engine.snapshot(), &select, &options, TSV),
+        cached_output(&engine.snapshot(), &select, &options, TSV, ""),
         CachedOutput::Miss(_)
     ));
 }
@@ -435,7 +451,7 @@ fn serialised_answers_equal_fresh_ones_over_random_commits() {
                         ..QueryOptions::default()
                     },
                 );
-                let answer = match cached_output(&snapshot, &query, &options, TSV) {
+                let answer = match cached_output(&snapshot, &query, &options, TSV, "") {
                     CachedOutput::Hit(bytes) => {
                         from_bytes += 1;
                         bytes.to_vec()

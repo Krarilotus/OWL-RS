@@ -1,0 +1,6 @@
+% The custom-tc case's program for Nemo: the transitive closure of `edge`, as rules/tc.n3.
+@import triple :- ntriples{resource="input.nt"} .
+edge(?x, ?y) :- triple(?x, <http://example.org/fast/edge>, ?y) .
+path(?x, ?y) :- edge(?x, ?y) .
+path(?x, ?z) :- edge(?x, ?y), path(?y, ?z) .
+@export path :- csv{resource="path.csv"} .
