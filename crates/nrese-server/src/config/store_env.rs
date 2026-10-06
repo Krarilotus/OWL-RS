@@ -18,6 +18,16 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             .unwrap_or(defaults.data_dir),
         ontology_path: source.get(names::ONTOLOGY_PATH).map(PathBuf::from),
         query_cache_bytes: parse_cache_bytes(source.get(names::QUERY_CACHE_BYTES).as_deref())?,
+        pinned_queries: source
+            .get(names::PINNED_QUERIES)
+            .map(|list| {
+                list.split(';')
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
         shapes_graph: source
             .get(names::SHACL_SHAPES_GRAPH)
             .unwrap_or(defaults.shapes_graph),
@@ -35,7 +45,15 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         hide_unnamed_classes: parse_unnamed_classes(
             source.get(names::REASONING_UNNAMED_CLASSES).as_deref(),
         )?,
-        ql_rewriting: choice(source, names::REASONING_QL_REWRITING, &["auto", "off"])? != Some(1),
+        ql_rewriting: match choice(
+            source,
+            names::REASONING_QL_REWRITING,
+            &["auto", "on", "off"],
+        )? {
+            Some(1) => nrese_store::QlRewritingMode::On,
+            Some(2) => nrese_store::QlRewritingMode::Off,
+            _ => nrese_store::QlRewritingMode::Auto,
+        },
         equality_by_representatives: equality.0,
         equality_compact: equality.1,
         equality_canonical_answers: choice(
