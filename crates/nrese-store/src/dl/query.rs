@@ -780,10 +780,26 @@ fn instantiate(
 }
 
 #[derive(Clone, Copy)]
-struct Ids {
+pub(crate) struct Ids {
     rdf_type: Option<u64>,
     same_as: Option<u64>,
     thing: Option<u64>,
+}
+
+impl Ids {
+    /// The ids of the vocabulary ground atoms are read with, in `snapshot`.
+    pub(crate) fn of(snapshot: &Snapshot) -> Self {
+        let id = |iri: &str| {
+            snapshot
+                .lookup(NamedNodeRef::new_unchecked(iri).into())
+                .map(TermId::raw)
+        };
+        Self {
+            rdf_type: id(RDF_TYPE),
+            same_as: id(OWL_SAME_AS),
+            thing: id(OWL_THING),
+        }
+    }
 }
 
 fn is_literal(t: u64) -> bool {
@@ -851,7 +867,7 @@ fn tests_of(
 }
 
 /// The axiom a ground atom states.
-fn ground_axiom(
+pub(crate) fn ground_axiom(
     o: &mut Ontology,
     snapshot: &Snapshot,
     [s, p, v]: [u64; 3],

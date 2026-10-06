@@ -24,6 +24,9 @@ use crate::StoreService;
 pub(crate) struct Gate {
     pub checked: Checked,
     pub reject: Option<String>,
+    /// For a rejection: a minimal set of axioms the commit leaves inconsistent, each by
+    /// its source triples ([`super::explain`]).
+    pub evidence: Vec<nrese_reasoner::RejectEvidence>,
 }
 
 /// Runs `check` with a [`Cancel`] that fires when `cancelled` does (a cancelled commit).
@@ -85,6 +88,7 @@ pub(crate) fn check_commit(
                 elapsed: Duration::ZERO,
             },
             reject: None,
+            evidence: Vec::new(),
         };
     }
     if preparation.proves_consistency {
@@ -95,6 +99,7 @@ pub(crate) fn check_commit(
                 elapsed: Duration::ZERO,
             },
             reject: None,
+            evidence: Vec::new(),
         };
     }
     let ontology = match preparation.ontology.take() {
@@ -111,6 +116,7 @@ pub(crate) fn check_commit(
         return Gate {
             checked,
             reject: None,
+            evidence: Vec::new(),
         };
     }
     // Inconsistent after the commit: rejected unless it was so before (quarantine).
@@ -128,12 +134,51 @@ pub(crate) fn check_commit(
             checked.verdict == Verdict::Inconsistent
         }
     };
-    let reject = (!was_inconsistent).then(|| {
-        format!(
-            "the mutation makes the data inconsistent under OWL 2 DL (found by the {} in {} ms)",
-            checked.engine,
-            checked.elapsed.as_millis()
-        )
-    });
-    Gate { checked, reject }
+    if was_inconsistent {
+        return Gate {
+            checked,
+            reject: None,
+            evidence: Vec::new(),
+        };
+    }
+    // Why: a minimal set of axioms that has no model, each by its source triples.
+    let justification = super::explain::justify(
+        &ontology,
+        &super::explain::Goal::Inconsistent,
+        &[],
+        &budget(store, None),
+    );
+    let decode = |t: u64| {
+        tx.decode(nrese_engine::TermId::from_raw(t))
+            .map_or_else(|| format!("#{t}"), |term| term.to_string())
+    };
+    let evidence: Vec<nrese_reasoner::RejectEvidence> = justification
+        .iter()
+        .flat_map(|j| super::explain::explained(&ontology, j, &decode))
+        .flat_map(|axiom| {
+            axiom.sources.into_iter().flat_map(|(_, triples)| {
+                triples
+                    .into_iter()
+                    .map(|[s, p, o]| nrese_reasoner::RejectEvidence {
+                        role: "axiom",
+                        subject: s,
+                        predicate: p,
+                        object: o,
+                        origin: "asserted".to_owned(),
+                    })
+            })
+        })
+        .collect();
+    let axioms = justification.as_ref().map_or(0, |j| j.axioms.len());
+    let reject = Some(format!(
+        "the mutation makes the data inconsistent under OWL 2 DL (found by the {} in {} ms); \
+         {axioms} axiom(s) have no model together",
+        checked.engine,
+        checked.elapsed.as_millis()
+    ));
+    Gate {
+        checked,
+        reject,
+        evidence,
+    }
 }

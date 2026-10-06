@@ -250,7 +250,7 @@ impl MutationPipeline {
                         summary: detail.clone(),
                         violated_constraint: "owl2-dl-consistency".to_owned(),
                         focus_resource: String::new(),
-                        evidence: Vec::new(),
+                        evidence: gate.evidence.clone(),
                     }),
                     attribution: None,
                 })));
