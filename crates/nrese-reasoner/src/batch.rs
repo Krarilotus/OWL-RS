@@ -136,7 +136,9 @@ fn sort_chunked<P: AsRef<[Pair]> + Send>(parts: Vec<P>, swap: bool) -> Pairs {
             for piece in pieces {
                 chunk.extend_from_slice(&piece);
             }
-            chunk.sort_unstable();
+            // In parallel too: few chunks may come at once (OWL2Bench RL-1's modules hand
+            // over one list of 1.3 M pairs: two chunks, two threads, 13 % slower).
+            chunk.par_sort_unstable();
             chunk.dedup();
             if chunk.len() == chunk.capacity() {
                 chunk
