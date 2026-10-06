@@ -72,6 +72,13 @@ utoipa = "6.0.0"
 lto = "fat"
 codegen-units = 1
 
+# `--profile lab`: release code built fast, for iterating on an A/B (thin LTO, parallel code
+# generation). Numbers that are kept or published are measured on `release`.
+[profile.lab]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
 # `cargo build --profile profiling`: release code with symbols, for perf/samply.
 [profile.profiling]
 inherits = "release"
