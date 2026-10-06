@@ -31,7 +31,7 @@ use nrese_engine::{ReadModel, Snapshot, TermId};
 use nrese_owl::{Axiom, ClassExpr, ExprId, Literal, ObjProp, Ontology};
 use nrese_rdf::{NamedNodeRef, Term};
 use nrese_sparql::CancellationToken;
-use nrese_sparql::completeness::{Bounds as Counts, Completeness};
+use nrese_sparql::completeness::{Bounds, Completeness};
 use nrese_sparql_syntax::Query;
 use nrese_sparql_syntax::algebra::{GraphPattern, PropertyPathExpression};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern, Variable};
@@ -41,7 +41,7 @@ use rayon::prelude::*;
 use super::bounds::View;
 use super::consistency::{self, Verdict};
 use super::entailment::{self, Entailed};
-use super::{DlAnswers, DlStatus, gate, source};
+use super::{DlAnswers, DlDetail, DlStatus, gate, source};
 use crate::query_executor::{Answers, PreparedQuery, evaluate_prepared};
 use crate::{StoreError, StoreResult, StoreService};
 
@@ -306,27 +306,90 @@ fn consistency_at(store: &StoreService, snapshot: &Snapshot, view: &View) -> Ver
     checked.verdict
 }
 
+/// The bounds' counts as a query's evaluation finds them: the shared status keeps lower,
+/// upper and unresolved; [`DlDetail`] the proved and refuted.
+#[derive(Debug, Clone, Copy, Default)]
+struct Counts {
+    lower: u64,
+    upper: Option<u64>,
+    proved: u64,
+    refuted: u64,
+    unresolved: u64,
+}
+
+/// A DL answer's status as it is built: the shared [`Completeness`] (reasons from `dl`)
+/// and what decided it ([`DlDetail`]).
+#[derive(Debug, Default)]
+struct Status {
+    completeness: Completeness,
+    detail: DlDetail,
+}
+
+impl Status {
+    fn complete() -> Self {
+        Self::default()
+    }
+
+    fn sound_only(reason: impl Into<String>) -> Self {
+        let mut status = Self::default();
+        status.add(reason.into());
+        status
+    }
+
+    fn add(&mut self, reason: String) {
+        self.completeness.incomplete("dl", reason);
+    }
+
+    fn path(&mut self, path: &'static str) {
+        if !self.detail.paths.contains(&path) {
+            self.detail.paths.push(path);
+        }
+    }
+
+    fn set_counts(&mut self, c: Counts) {
+        self.detail.proved = c.proved;
+        self.detail.refuted = c.refuted;
+        self.completeness.bounds = c.upper.map(|upper| Bounds {
+            lower: c.lower,
+            upper,
+            unresolved: c.unresolved,
+        });
+    }
+
+    fn stream(self, view: Option<Snapshot>) -> Outcome {
+        Outcome::Stream(self.completeness, view, self.detail)
+    }
+
+    fn answers(self, answers: Answers) -> Outcome {
+        Outcome::Answers(answers, self.completeness, self.detail)
+    }
+}
+
 /// What can be said before running `prepared`: complete where every predicate it reads
 /// is closed; otherwise the bounds decide when it runs.
 pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Completeness {
+    plan_status_built(store, prepared).completeness
+}
+
+fn plan_status_built(store: &StoreService, prepared: &PreparedQuery) -> Status {
     if prepared.access().is_some() || prepared.has_dataset() {
-        return Completeness::sound_only(
+        return Status::sound_only(
             "the query reads part of the data: not checked against the bounds",
         );
     }
     let (snapshot, view) = super::bounds::view(store);
     let analysis = analyse(prepared.query());
     if let Some(what) = unbounded(&analysis) {
-        return Completeness::sound_only(format!(
+        return Status::sound_only(format!(
             "the query reads {what}: entailed schema statements aren't bounded"
         ));
     }
     if closed(&analysis, &view, &snapshot) {
-        let mut status = Completeness::complete();
+        let mut status = Status::complete();
         status.path("closed-predicates");
         return status;
     }
-    Completeness::sound_only(
+    Status::sound_only(
         "the upper bound has candidates for what the query reads: decided when it runs",
     )
 }
@@ -340,10 +403,11 @@ pub(crate) fn answer(
 ) -> StoreResult<Outcome> {
     let outcome = decide_answers(store, prepared, cancellation, mode)?;
     let status = match &outcome {
-        Outcome::Stream(status, _) | Outcome::Answers(_, status) => status,
+        Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => status,
     };
-    if mode == DlAnswers::Exact && !status.is_complete() {
-        return Err(StoreError::Incomplete(status.reasons().join("; ")));
+    if mode == DlAnswers::Exact && !status.complete {
+        let reasons: Vec<&str> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+        return Err(StoreError::Incomplete(reasons.join("; ")));
     }
     Ok(outcome)
 }
@@ -352,8 +416,8 @@ pub(crate) fn answer(
 /// it runs), or with answers collected and completed through the bounds.
 pub(crate) enum Outcome {
     /// Over the store's snapshot, or over the lower bound's view where it adds to it.
-    Stream(Completeness, Option<Snapshot>),
-    Answers(Answers, Completeness),
+    Stream(Completeness, Option<Snapshot>, DlDetail),
+    Answers(Answers, Completeness, DlDetail),
 }
 
 fn decide_answers(
@@ -364,26 +428,22 @@ fn decide_answers(
 ) -> StoreResult<Outcome> {
     let settings = store.query_settings();
     if prepared.access().is_some() {
-        return Ok(Outcome::Stream(
-            Completeness::sound_only(
-                "the reader sees part of the data: answers are checked against the bounds only \
+        return Ok(Status::sound_only(
+            "the reader sees part of the data: answers are checked against the bounds only \
              for readers of every graph",
-            ),
-            None,
-        ));
+        )
+        .stream(None));
     }
     if prepared.has_dataset() {
-        return Ok(Outcome::Stream(
-            Completeness::sound_only(
-                "the query names its dataset: answers are over those graphs, not checked \
+        return Ok(Status::sound_only(
+            "the query names its dataset: answers are over those graphs, not checked \
              against the bounds",
-            ),
-            None,
-        ));
+        )
+        .stream(None));
     }
     let (snapshot, view) = super::bounds::view(store);
     let analysis = analyse(prepared.query());
-    let mut status = Completeness::complete();
+    let mut status = Status::complete();
     match consistency_at(store, &snapshot, &view) {
         Verdict::Consistent => {}
         Verdict::Inconsistent => status
@@ -407,27 +467,27 @@ fn decide_answers(
             "the query reads {what}: entailed schema statements aren't bounded (the RL \
              closure's are sound; /classification has the subsumptions under OWL 2 DL)"
         ));
-        return Ok(Outcome::Stream(status, lower_view(&view)));
+        return Ok(status.stream(lower_view(&view)));
     }
     if closed(&analysis, &view, &snapshot) {
         // One evaluation, streamed: L's answers are the certain ones.
         status.path("closed-predicates");
-        return Ok(Outcome::Stream(status, lower_view(&view)));
+        return Ok(status.stream(lower_view(&view)));
     }
     if let Some(why) = &view.unavailable {
         status.add(why.clone());
-        return Ok(Outcome::Stream(status, lower_view(&view)));
+        return Ok(status.stream(lower_view(&view)));
     }
     if mode == DlAnswers::Sound {
         status.add("dl.answers = sound: the lower bound alone".to_owned());
-        return Ok(Outcome::Stream(status, lower_view(&view)));
+        return Ok(status.stream(lower_view(&view)));
     }
     if let Some(op) = analysis.not_monotone {
         status.add(format!(
             "the query uses {op}, which isn't monotone, over predicates whose lower and upper \
              bounds differ"
         ));
-        return Ok(Outcome::Stream(status, lower_view(&view)));
+        return Ok(status.stream(lower_view(&view)));
     }
     if matches!(prepared.query(), Query::Construct { .. }) {
         status.add(
@@ -435,7 +495,7 @@ fn decide_answers(
              predicates it reads are closed"
                 .to_owned(),
         );
-        return Ok(Outcome::Stream(status, lower_view(&view)));
+        return Ok(status.stream(lower_view(&view)));
     }
     let lower = evaluate_prepared(&view.lower, prepared, settings, cancellation)?;
     let upper_snapshot = view.upper.as_ref().expect("available");
@@ -541,8 +601,8 @@ fn decide_answers(
                 .unwrap_or_default()
         ));
     }
-    status.bounds = Some(counts);
-    Ok(Outcome::Answers(answers, status))
+    status.set_counts(counts);
+    Ok(status.answers(answers))
 }
 
 /// The lower bound's view where it adds to the store's snapshot.

@@ -252,6 +252,12 @@ pub const SETTINGS: &[Setting] = &[
          (default derive).",
     ),
     setting(
+        "reasoner.ql_rewriting",
+        names::REASONING_QL_REWRITING,
+        Choice(&["auto", "off"]),
+        "OWL 2 QL answers through existentials by tree-witness rewriting of queries: auto          (the default) while the inferred stack is current under owl2-ql or owl2-rl, or off.",
+    ),
+    setting(
         "reasoner.support_sets",
         names::REASONING_SUPPORT_SETS,
         Integer,

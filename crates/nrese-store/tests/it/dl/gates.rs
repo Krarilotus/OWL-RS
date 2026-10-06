@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use nrese_sparql::GraphAccess;
-use nrese_store::{CancellationToken, DlConfig, MutationPipeline, ReadScope, SparqlQueryRequest};
+use nrese_store::{DlConfig, MutationPipeline, ReadScope, SparqlQueryRequest};
 
 use super::queries::query;
 use super::{PREFIXES, insert, pipeline, pipeline_with};
@@ -77,14 +77,13 @@ fn reader(by_support: bool) -> ReadScope {
     }))
 }
 
-fn read(dl: &MutationPipeline, scope: ReadScope, q: &str) -> (String, nrese_sparql::Completeness) {
+fn read(dl: &MutationPipeline, scope: ReadScope, q: &str) -> (String, super::Status) {
     let store = dl.store();
     let prepared = store
         .prepare_query(&SparqlQueryRequest::new(format!("{PREFIXES}{q}"), scope))
         .expect("prepared");
     let mut out = Vec::new();
-    let status = store
-        .run_query_reporting(&prepared, &CancellationToken::new(), &mut out)
+    let status = super::run_dl(store, &prepared, &mut out)
         .expect("query")
         .expect("a status");
     (String::from_utf8(out).expect("utf8"), status)

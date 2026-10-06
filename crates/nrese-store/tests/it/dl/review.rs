@@ -13,20 +13,19 @@
 use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
-use nrese_store::{CancellationToken, MutationPipeline, SparqlQueryRequest, StoreService};
+use nrese_store::{MutationPipeline, SparqlQueryRequest, StoreService};
 
 use super::queries::query;
 use super::{PREFIXES, insert, pipeline};
 
 /// The `?x ?z` rows of a query, and its status.
-fn pairs(dl: &MutationPipeline, q: &str) -> (Vec<(String, String)>, nrese_sparql::Completeness) {
+fn pairs(dl: &MutationPipeline, q: &str) -> (Vec<(String, String)>, super::Status) {
     let store = dl.store();
     let prepared = store
         .prepare_query(&SparqlQueryRequest::all(format!("{PREFIXES}{q}")))
         .expect("prepared");
     let mut out = Vec::new();
-    let status = store
-        .run_query_reporting(&prepared, &CancellationToken::new(), &mut out)
+    let status = super::run_dl(store, &prepared, &mut out)
         .expect("query")
         .expect("a status");
     let json: serde_json::Value = serde_json::from_slice(&out).expect("json");
@@ -191,6 +190,15 @@ fn a_part_of_a_part_of_a_fleet_is_found_through_the_bounds() {
     insert(&rl, FLEET).expect("data");
     let (rows, status) = query(&rl, q);
     assert!(rows.is_empty());
-    assert_eq!(status.as_str(), "sound-only");
-    assert!(status.reasons()[0].contains("owl2-rl closure"));
+    assert_eq!(status.shared.as_str(), "sound-only");
+    // Why: the closure's (`rules`), or the QL rewriting's where it runs over it (`ql`).
+    assert!(
+        status
+            .shared
+            .reasons
+            .iter()
+            .any(|r| r.source == "rules" || r.source == "ql"),
+        "{:?}",
+        status.shared
+    );
 }

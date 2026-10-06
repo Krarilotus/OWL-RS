@@ -72,3 +72,54 @@ pub fn ask(pipeline: &MutationPipeline, pattern: &str) -> bool {
         .expect("utf8")
         .contains("true")
 }
+
+/// A DL answer's status as the tests read it: the shared status
+/// ([`nrese_sparql::Completeness`]) with what decided it ([`nrese_store::DlDetail`]).
+#[derive(Debug)]
+pub struct Status {
+    pub shared: nrese_sparql::Completeness,
+    pub paths: Vec<&'static str>,
+    pub bounds: Option<Counts>,
+}
+
+/// The bounds' counts: the shared status's, with the candidates proved and refuted.
+#[derive(Debug, Clone, Copy)]
+pub struct Counts {
+    pub lower: u64,
+    pub upper: Option<u64>,
+    pub proved: u64,
+    pub refuted: u64,
+    pub unresolved: u64,
+}
+
+impl Status {
+    pub fn is_complete(&self) -> bool {
+        self.shared.complete
+    }
+
+    /// The reasons' texts.
+    pub fn reasons(&self) -> Vec<String> {
+        self.shared.reasons.iter().map(|r| r.text.clone()).collect()
+    }
+}
+
+/// Runs `prepared`, writing the answers to `out`; its status (with what decided it under
+/// `owl2-dl`), `None` where no reasoning path can leave answers out.
+pub fn run_dl(
+    store: &StoreService,
+    prepared: &nrese_store::PreparedQuery,
+    out: &mut Vec<u8>,
+) -> Result<Option<Status>, nrese_store::StoreError> {
+    let reported = store.run_query_dl(prepared, &nrese_store::CancellationToken::new(), out)?;
+    Ok(reported.map(|(shared, detail)| Status {
+        bounds: shared.bounds.map(|b| Counts {
+            lower: b.lower,
+            upper: Some(b.upper),
+            proved: detail.proved,
+            refuted: detail.refuted,
+            unresolved: b.unresolved,
+        }),
+        paths: detail.paths,
+        shared,
+    }))
+}

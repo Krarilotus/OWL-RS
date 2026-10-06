@@ -35,6 +35,7 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         hide_unnamed_classes: parse_unnamed_classes(
             source.get(names::REASONING_UNNAMED_CLASSES).as_deref(),
         )?,
+        ql_rewriting: choice(source, names::REASONING_QL_REWRITING, &["auto", "off"])? != Some(1),
         equality_by_representatives: equality.0,
         equality_compact: equality.1,
         equality_canonical_answers: choice(
