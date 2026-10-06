@@ -89,6 +89,13 @@ def docker(args: list[str], timeout: float | None = None, capture: bool = True) 
                           encoding="utf-8", errors="replace")
 
 
+def capped(gb: float) -> float:
+    """A container's memory within a machine's ceiling for the whole run (FAST_MAX_GB, as on
+    a shared PC), whatever a case asks for."""
+    limit = os.environ.get("FAST_MAX_GB")
+    return min(gb, float(limit)) if limit else gb
+
+
 def cpu_args() -> list[str]:
     """`--cpus N` when a run gives every container the same CPUs (DOCKER_CPUS, as the suite)."""
     cpus = os.environ.get("DOCKER_CPUS")
@@ -121,6 +128,7 @@ def container(name: str, cap_gb: float, command: list[str], env: dict | None = N
               timeout: float = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
     """Runs `command` in the Rust image under a memory cap without swap; (exit code,
     stdout, stderr, wall seconds). Exit 137: killed at the cap."""
+    cap_gb = capped(cap_gb)
     SCRATCH.mkdir(parents=True, exist_ok=True)
     argv = ["run", "--rm", "--name", name, f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g", *cpu_args(),
             "-v", f"{TARGET_VOLUME}:/target:ro", "-v", f"{DATA_VOLUME}:/fast",
@@ -371,8 +379,12 @@ def run_case(case: dict, label: str, rep: int) -> dict:
         vector_queries(expect, exact=case["queries"] == "@vectors-exact")
     # Times count only from the machine's quiet slot, held for this case's repetitions alone,
     # so other agents' builds wait for one case, not for the whole run.
+    waited = time.monotonic()
     with quiet_slot(f"fast {case['name']}"):
-        return measure(case, label, rep, expect, alt_expect, data)
+        waited = time.monotonic() - waited
+        record = measure(case, label, rep, expect, alt_expect, data)
+    record["slot_wait_s"] = round(waited, 1)
+    return record
 
 
 def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
@@ -736,7 +748,8 @@ def run(args) -> int:
             except Exception as error:  # a case that breaks mustn't stop the suite
                 record = {"case": case["name"], "rep": rep, "status": "failed", "notes": [str(error)[:300]],
                           "checks": [], "routes": [], "samples": {}, "metric": None}
-            record["case_s"] = round(time.monotonic() - t0, 1)
+            # The case's own time, without the wait for the quiet slot.
+            record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
             report["records"].append(record)
             mark = "" if record["status"] == record.get("expected_outcome", "ok") else "  <<<"
             metric = record.get("metric")
