@@ -1,39 +1,23 @@
 # NRESE
 
-An RDF triple store with built-in OWL reasoning, written in Rust. Its own storage engine
-answers SPARQL; the reasoning is materialised and kept up to date on every commit, so
-inferred statements are queried like asserted ones. SHACL validation, full-text search and
-the RDF4J protocol are built in.
+A hobby project: an RDF triple store with built-in OWL reasoning, written in Rust, to
+learn and experiment with. It answers SPARQL, keeps inferred statements up to date on
+every commit so they can be queried like asserted ones, and validates data with SHACL.
 
-The aim: query speed like [QLever](https://github.com/ad-freiburg/qlever), reasoning like
-the dedicated OWL reasoners, and data governance like GraphDB, in one server.
+Many of its ideas come from the research literature and from systems such as QLever,
+Konclude, HermiT and RDFox. Thanks to their authors.
 
 ## State
 
-**`main`** (this branch) is the stable version:
+**`main`** (this branch):
 
 - SPARQL 1.1 query and update, the Graph Store Protocol, the RDF4J protocol;
 - reasoning in the `rdfs`, `owl2-rl`, `owl2-ql`, `owl-horst` and `custom` (Notation3
-  rules) modes. Commits that make the data inconsistent are rejected, with an explanation.
-  What each mode computes and omits: [reasoning-semantics.md](docs/spec/reasoning-semantics.md);
-- SHACL Core and SHACL-SPARQL (W3C suites 98 of 98 and 22 of 22), on request or as a
-  commit gate;
-- full-text search, users, workspaces and graph policies, an operator UI and a console.
+  rules) modes. What each mode computes and omits: [reasoning-semantics.md](docs/spec/reasoning-semantics.md);
+- SHACL Core and SHACL-SPARQL, full-text search, and a small console.
 
-Measured over HTTP at 10 M triples ([baselines](benches/baselines/README.md)): a one-triple
-insert takes 0.2 ms in memory and 2.0 ms on disk with fsync, and loading runs at about
-400,000 triples/s.
-
-**[`refactor/engine-v2`](https://github.com/Krarilotus/OWL-RS/tree/refactor/engine-v2)** is
-where development happens, merged into `main` when it is complete and benchmarked:
-
-- OWL 2 DL: a hypertableau, consequence-based classification, consistency on commit, and
-  query answers as lower and upper bounds with a completeness status;
-- OWL 2 QL query rewriting; a faster rule engine and query executor;
-- comparisons with QLever, Oxigraph, Nemo, Konclude, HermiT, Openllet and ELK, each on its
-  own strengths.
-
-What is done and what is open: [docs/STATUS.md](docs/STATUS.md) on that branch.
+Work in progress, OWL 2 DL among it, happens on
+[`refactor/engine-v2`](https://github.com/Krarilotus/OWL-RS/tree/refactor/engine-v2).
 
 ## Quick start
 
@@ -56,13 +40,9 @@ Then open `http://localhost:8080/console`, or send SPARQL to `/dataset/sparql` a
 
 ## Documentation
 
-- [Building, running and developing](docs/dev/getting-started.md): the console, the CLI,
-  where to start in the code
+- [Building, running and developing](docs/dev/getting-started.md)
 - [HTTP interface](docs/ops/http-api.md) and [configuration](docs/ops/config-reference.md)
-- [Architecture](docs/ARCHITECTURE.md), [roadmap](docs/ROADMAP.md),
-  [decisions](docs/adr/), [document index](docs/README.md)
-- Integrations: [ResearchSpace](docs/integration/researchspace.md),
-  [the Datamodel Workflow](docs/integration/datamodel-workflow.md)
+- [Architecture](docs/ARCHITECTURE.md) and the [document index](docs/README.md)
 
 ## Licence
 
