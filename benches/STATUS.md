@@ -1,14 +1,14 @@
 # Benchmark status
 
-Generated 2026-10-05 by `python benches/suite/suite.py status --write` from [suite/systems.toml](suite/systems.toml), [suite/workloads.toml](suite/workloads.toml) and the run records in [runs/](runs/README.md). Don't edit it by hand: change those and regenerate. How to read and extend it: [README.md](README.md).
+Generated 2026-10-06 by `python benches/suite/suite.py status --write` from [suite/systems.toml](suite/systems.toml), [suite/workloads.toml](suite/workloads.toml) and the run records in [runs/](runs/README.md). Don't edit it by hand: change those and regenerate. How to read and extend it: [README.md](README.md).
 
 ## At a glance
 
-- **Workloads:** 23 (3 partial, 10 planned, 10 ready)
+- **Workloads:** 24 (4 partial, 10 planned, 10 ready)
 - **Systems:** 20 (16 free to publish, 4 only with the vendor's permission)
-- **Pairs** (standard tier × system that can run it; build variants apart): 263; run at least once: 95; ok on their newest run: 76
-- **NRESE:** 19 of its 44 standard tiers ok on their newest run
-- **Run records:** 11, newest 2026-10-04
+- **Pairs** (standard tier × system that can run it; build variants apart): 290; run at least once: 97; ok on their newest run: 78
+- **NRESE:** 19 of its 47 standard tiers ok on their newest run
+- **Run records:** 12, newest 2026-10-06
 
 ## Coverage
 
@@ -38,6 +38,7 @@ Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome 
 | fulltext-search | planned | · | · | · | · | – | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | – |
 | geosparql | partial | 1/1 | n/a | n/a | n/a | – | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | – |
 | federation | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
+| fast | partial | · | · | · | 1/3 | 1/3 | · | · | · | n/a | n/a | n/a | n/a | – | – | – | – | · | · | n/a | · |
 | clients | ready | · | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
 
 `ok` every repetition loaded, every step and query execution ok · `part` a load, step or query execution failed or timed out in some repetition · `WRONG` an answer count differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the suite skipped it (reason in the record) · `≠?` its answers differ from another system's, not yet adjudicated · `ran*` ran; a licensed system whose outcome stays local · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit for it
@@ -241,6 +242,22 @@ planned, performance; tasks federation; kit `-` (outside the driver); checked by
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | - | · | · | · | · | · | · | · | · | · | · | · |
 
+### fast: The fast suite's cases on their comparators: each case under the semantics a system supports
+
+partial, performance; tasks basics, RT1, RT3; kit `benches/fast` (suite driver); checked by: the generator's own answers and pinned counts (fast.py run); answer counts across systems.
+
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| q-cycles~plain | · | · | · | · | · | · | · | · | · | · | · |
+| rl-hierarchy~closure | · | · | · | ok 10-06 | ok 10-06 | · | · | · | · | · | · |
+| rl-clique | · | · | · | · | · | · | · | · | · | · | · |
+| 84 cases (extra) | ok 10-06 | · | · | · | · | · | · | · | · | · | · |
+| dl cases (extra) | · | · | · | · | · | · | · | · | · | · | · |
+| el-classify (extra) | · | · | · | · | · | · | · | · | · | · | · |
+| rdfs-hierarchy~rdfs (extra) | · | · | · | · | · | · | part 10-06 | · | · | · | · |
+| rl-clique~owl-horst (extra) | · | · | · | · | · | · | part 10-06 | · | · | · | · |
+| rule cases~owl2-rl (extra) | · | · | · | · | · | · | · | · | · | · | · |
+
 ### clients: ResearchSpace on the store; the Datamodel Workflow's export protocol
 
 ready, conformance; tasks integration; kit `scripts` (suite driver); checked by: the scripts' assertions.
@@ -270,6 +287,7 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - **era-shacl:** nrese (-); jena (-); rdf4j (-); graphdb (-); rdfox (-)
 - **fulltext-search:** nrese (-); qlever (-); virtuoso (-); jena (-); rdf4j (-); graphdb (-); rdfox (-)
 - **federation:** nrese (-); qlever (-); oxigraph (-); virtuoso (-); jena (-); rdf4j (-); graphdb (-); rdfox (-); anzograph (-)
+- **fast:** nrese (q-cycles~plain, rl-hierarchy~closure, rl-clique); qlever (q-cycles~plain, rl-clique); oxigraph (q-cycles~plain, rl-clique); virtuoso (q-cycles~plain, rl-hierarchy~closure, rl-clique); jena (q-cycles~plain, rl-hierarchy~closure, rl-clique); rdf4j (q-cycles~plain, rl-hierarchy~closure, rl-clique); graphdb (q-cycles~plain, rl-hierarchy~closure, rl-clique); rdfox (q-cycles~plain, rl-hierarchy~closure, rl-clique); anzograph (q-cycles~plain, rl-hierarchy~closure, rl-clique)
 - **clients:** nrese (-)
 
 ### Build variants without an outcome (nrese-fsst, nrese-oxigraph, nemo-schemafirst, nemo-sparq; optional)
@@ -291,6 +309,7 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - **era-shacl:** nrese-fsst (-); nrese-oxigraph (-)
 - **fulltext-search:** nrese-fsst (-); nrese-oxigraph (-)
 - **federation:** nrese-fsst (-); nrese-oxigraph (-)
+- **fast:** nrese-fsst (q-cycles~plain, rl-hierarchy~closure, rl-clique); nrese-oxigraph (q-cycles~plain, rl-hierarchy~closure, rl-clique)
 
 ### Problems on the newest run
 
@@ -303,6 +322,11 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - basics-mix olympics on virtuoso: wrong (2026-10-03-office-a): wrong answer counts: q12-all-labels; incomplete: q08-event-hierarchy (q08-event-hierarchy: 3 failed of 3)
 - basics-mix wikidata-lexemes-60m on rdf4j: failed (2026-10-03-office-a): server start-up excluded; SPARQL LOAD per file
 - basics-mix yago-tiny on virtuoso: partial (2026-10-03-office-a): incomplete: q01-label-lookup, q03-taxon-path, q08-subclass-path (q01-label-lookup: 3 failed of 3)
+- fast dl cases on hermit: partial (2026-10-06-fast-suite): timeouts at 120 s on most generated ontologies; parse and classify ok on the others
+- fast dl cases on konclude: partial (2026-10-06-fast-suite): an error on dl-number; timeouts on nominals and Horn classification
+- fast dl cases on openllet: partial (2026-10-06-fast-suite): timeouts on most
+- fast rdfs-hierarchy~rdfs on jena: partial (2026-10-06-fast-suite)
+- fast rl-clique~owl-horst on jena: partial (2026-10-06-fast-suite)
 - lubm 10 on jena: partial (2026-10-03-office-b): incomplete: q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14 (q01: 3 timeout of 3); steps: count failed
 - lubm 100 on jena: partial (2026-10-03-office-b): incomplete: q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14 (q01: 1 timeout of 1); steps: count failed
 - lubm 1000 on nemo-sparq: failed (2026-10-03-office-b): encoding sparq/owl-rl.rls sha256 9012609fe35f25b7; load time includes concatenating the inputs
@@ -331,6 +355,7 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - **fulltext-search** (planned): Keyword search: ResearchSpace's search queries; LUBMft.
 - **geosparql** (partial): GeoSPARQL compliance benchmark (206 queries); Geographica 2 for performance. The compliance part runs on NRESE in CI: 175 of 212; the 37 others are reference answers that contradict GeoSPARQL's definitions or each other (expected-failures.txt). Geographica 2 (performance) is to add
 - **federation** (planned): FedBench / W3C federation tests.
+- **fast** (partial): The fast suite's cases on their comparators: each case under the semantics a system supports. Tier = CASE~SEMANTICS (benches/fast/compete.py prepares the data in the volume nrese-fast-data). NRESE runs every case in benches/fast/fast.py; this workload is the comparison
 
 ## Runs
 
@@ -338,7 +363,8 @@ Newest first; the records are in [runs/](runs/).
 
 | Run | Started | Kit | Host | Commit | Pairs | Purpose |
 |---|---|---|---|---|---|---|
-| [2026-10-03-office-b](runs/2026-10-03-office-b.toml) | 2026-10-04T02:28 | suite | sus-ai | fb8c0cbb76 | 33 | The reasoning batch on the office PC: OWL 2 RL / QL / OWL-Horst materialisation on LUBM 1-1000 and OWL2Bench RL-1 and QL-1, against Nemo (three encodings), owlrl, Jena and GraphDB. |
+| [2026-10-06-fast-suite](runs/2026-10-06-fast-suite.toml) | 2026-10-06 | fast | Kraris-GPTler | 8233ea5 (f | 9 | Phase 2 of the benchmark work: the fast suite's first baselines (NRESE on every case) and its first comparisons with the systems each case declares |
+| [2026-10-03-office-b](runs/2026-10-03-office-b.toml) | 2026-10-04T02:28 | suite | sus-ai | fb8c0cbb76 | 33 | The reasoning batch on the office PC: OWL 2 RL / QL / OWL-Horst materialisation on LUBM 1-1000 and OWL2Bench RL-1 and QL-1, against Nemo (three encodings), owlrl, Jena and a licensed system whose outcomes stay local. |
 | [2026-10-03-office-a](runs/2026-10-03-office-a.toml) | 2026-10-03T17:19 | suite | sus-ai | 5ccf8dbb2e | 62 | The first comparison batch on the office PC, the benchmark machine since 3 October: query engines without reasoning (basics-mix on five datasets, materialised LUBM 1-100), and NRESE's W3C conformance, write scaling and GeoSPARQL. |
 | [2026-10-03-full](runs/2026-10-03-full.toml) | 2026-10-03T15:34 | suite | Kraris-GPTler | 5ccf8dbb2e | 12 | Full comparison on the main PC at 5ccf8db; interrupted after 35 min (olympics complete, YAGO tiny begun) and moved to the office PC (2026-10-03-office-a and -b), which runs independently while the main PC is used for development |
 | [2026-10-03-nrese-current](runs/2026-10-03-nrese-current.toml) | 2026-10-03T12:20 | suite | Kraris-GPTler | b963708 +  | 17 | Regression check before the milestone: NRESE at the head of 3 October on the standard tiers, plus OWL2Bench QL-1 and write scaling 1m |

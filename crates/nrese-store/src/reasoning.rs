@@ -90,6 +90,10 @@ pub struct MaterialisationReport {
     pub diagnostics_total: usize,
     pub rounds: usize,
     pub elapsed: Duration,
+    /// Time per phase of a full materialisation (grounding, rule joins, the modules for
+    /// hierarchies, transitive and equivalence properties and equality, merging,
+    /// consistency); zero for a commit.
+    pub phases: nrese_reasoner::batch::Phases,
     /// A commit made an unnamed class that was left out consumable: its memberships are
     /// missing until the store rematerialises.
     pub needs_rematerialisation: bool,
