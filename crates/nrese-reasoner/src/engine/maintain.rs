@@ -97,8 +97,9 @@ pub struct Maintenance {
     /// List axioms the change introduced that weren't instantiated.
     pub diagnostics: Vec<ListDiagnostic>,
     /// A change the inferred stack can't follow commit by commit (an unnamed class left
-    /// out became consumable; a change merging or splitting `owl:sameAs` classes while the
-    /// stack is kept over representatives): the caller rematerialises after the commit.
+    /// out became consumable; a change deleting an equality, which may split `owl:sameAs`
+    /// classes, while the stack is kept over representatives): the caller rematerialises
+    /// after the commit.
     pub needs_rematerialisation: bool,
     /// The ground program after the change, to reuse for the next commit.
     pub program: Option<GroundProgram>,
@@ -212,9 +213,14 @@ pub fn maintain(
 
 /// Applies `update` (over every identity, as the delta executor reads the expanded stack)
 /// to an inferred stack kept over representatives (W4 stage B): each fact rewritten to
-/// its representatives. Returns the inferred statements added and removed; `None` if the
-/// change merges or splits `owl:sameAs` classes, which rewrites every fact about them: the
-/// caller recomputes the stack after the commit, and nothing is applied.
+/// the representatives of the classes after the change. A change that merges classes
+/// rewrites, in the same transaction, the stored facts that mention a representative
+/// that lost its place, and stores each new identity as `identity sameAs representative`
+/// (G5 of the investigation of 6 October 2026: before, such a commit published without
+/// its inferences, and the store re-materialised in a second revision). Returns the
+/// inferred statements added and removed; `None` if the change deletes an equality,
+/// which may split a class (B3): the caller recomputes the stack after the commit, and
+/// nothing is applied.
 fn store_over_representatives(
     program: &Program,
     update: &delta::Update,
@@ -223,27 +229,72 @@ fn store_over_representatives(
 ) -> Option<(u64, u64)> {
     let same_as = program.same_as?;
     let equates = |t: &Triple| t[1] == same_as && t[0] != t[2];
-    let asserted_change = tx
-        .inserted()
-        .chain(tx.deleted())
-        .map(triple)
-        .any(|t| equates(&t));
-    if asserted_change || update.insert.iter().chain(&update.remove).any(equates) {
+    if tx.deleted().map(triple).any(|t| equates(&t)) || update.remove.iter().any(equates) {
         return None;
     }
-    let classes = tx.base().equality_classes();
-    let rewrite = |t: Triple| -> Triple {
-        match &classes {
-            Some(classes) => t.map(|term| classes.representative(TermId::from_raw(term)).raw()),
-            None => t,
+    // The classes after the change: those before, merged by its new equalities.
+    let mut classes = crate::representatives::EqualityClasses::default();
+    if let Some(before) = tx.base().equality_classes() {
+        for (representative, members) in before.iter() {
+            for &member in members {
+                classes.union(representative, member);
+            }
         }
-    };
-    let touches = |t: &Triple| {
-        classes.as_ref().is_some_and(|classes| {
-            t.iter()
-                .any(|&term| classes.class_of(TermId::from_raw(term)).is_some())
-        })
-    };
+    }
+    let equalities: Vec<(u64, u64)> = tx
+        .inserted()
+        .map(triple)
+        .chain(update.insert.iter().copied())
+        .filter(equates)
+        .map(|[a, _, b]| (a, b))
+        .collect();
+    let lost: HashSet<u64> = classes.union_all(&equalities).into_iter().collect();
+    let rewrite = |t: Triple| -> Triple { classes.rewrite(t) };
+    let touches = |t: &Triple| t.iter().any(|&term| classes.class_of(term).is_some());
+    let (mut inserted, mut removed) = (0, 0);
+    // Stored facts that mention a former representative: the inferred ones move to the
+    // new representative, the asserted ones get a copy over it; and each former
+    // representative is now an identity of its class.
+    let mut moved: Vec<Triple> = Vec::new();
+    if !lost.is_empty() {
+        let stored = tx.base().stored();
+        let mut stale: Vec<Triple> = Vec::new();
+        for &term in &lost {
+            for position in 0..3 {
+                let mut bound = [None; 3];
+                bound[position] = Some(term);
+                let pattern = pattern(bound, GraphSelector::Any);
+                stale.extend(
+                    stored
+                        .quads_for_pattern_in(ReadModel::Inferred, &pattern)
+                        .map(triple),
+                );
+                moved.extend(
+                    stored
+                        .quads_for_pattern_in(ReadModel::Asserted, &pattern)
+                        .map(|quad| rewrite(triple(quad))),
+                );
+            }
+        }
+        // Each identity of a class a merge touched placed in it (a stored placement
+        // `identity sameAs former` rewrites to `representative sameAs representative`).
+        let merged: HashSet<u64> = lost.iter().map(|&t| classes.representative(t)).collect();
+        for representative in merged {
+            for &member in classes.members(representative).iter() {
+                if member != representative {
+                    moved.push([member, same_as, representative]);
+                }
+            }
+        }
+        stale.sort_unstable();
+        stale.dedup();
+        for fact in stale {
+            moved.push(rewrite(fact));
+            if tx.remove_inferred(encode(fact)) {
+                removed += 1;
+            }
+        }
+    }
     let asserted_somewhere = |tx: &Transaction<'_>, t: Triple| {
         tx.quads_for_pattern_in(
             ReadModel::Asserted,
@@ -252,7 +303,6 @@ fn store_over_representatives(
         .next()
         .is_some()
     };
-    let (mut inserted, mut removed) = (0, 0);
     let mut removals: Vec<Triple> = update.remove.iter().map(|&t| rewrite(t)).collect();
     // A statement asserted now needs no inferred copy, unless its terms have identities.
     for quad in tx.inserted().collect::<Vec<_>>() {
@@ -273,6 +323,7 @@ fn store_over_representatives(
         .iter()
         .chain(missing_axioms)
         .map(|&t| rewrite(t))
+        .chain(moved)
         .filter(|&t| storable(t))
         .collect();
     // A statement deleted from the default graph but still asserted in another stays a
