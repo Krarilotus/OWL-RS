@@ -61,6 +61,69 @@ pub(crate) struct Analysis {
     not_monotone: Option<&'static str>,
     /// The single basic graph pattern with filters the exact services take.
     shape: Option<Shape>,
+    /// Each triple pattern and path step with its ends.
+    atoms: Vec<Atom>,
+    /// The answer variables: a `SELECT`'s projection, none for `ASK`; `None` for the
+    /// other forms.
+    answers: Option<HashSet<String>>,
+    /// Variables an expression computes from (`BIND`, `SELECT (… AS ?v)`): a value
+    /// derived from one may be no term of its own.
+    computed: HashSet<String>,
+}
+
+/// A triple pattern or path step: what it reads and what stands at its ends.
+#[derive(Debug, Clone)]
+struct Atom {
+    predicate: Option<String>,
+    class: Option<String>,
+    ends: [End; 2],
+}
+
+/// One end of an [`Atom`], as the gap's Skolem constants see it.
+#[derive(Debug, Clone)]
+enum End {
+    /// A term the query names: never a Skolem constant.
+    Term,
+    Var(String),
+    /// A blank node, a path's inner node, a quoted triple, or one of U1's own terms.
+    Hidden,
+}
+
+fn end_of(term: &TermPattern) -> End {
+    match term {
+        TermPattern::NamedNode(n) if n.as_str().starts_with(U1) => End::Hidden,
+        TermPattern::NamedNode(_) | TermPattern::Literal(_) => End::Term,
+        TermPattern::Variable(v) => End::Var(v.as_str().to_owned()),
+        _ => End::Hidden,
+    }
+}
+
+fn atom_of(t: &TriplePattern) -> Atom {
+    let (predicate, class) = pattern_reads(t);
+    Atom {
+        predicate,
+        class,
+        ends: [end_of(&t.subject), end_of(&t.object)],
+    }
+}
+
+/// The answer variables of a `SELECT` (none for `ASK`).
+fn answer_variables(query: &Query) -> Option<HashSet<String>> {
+    let pattern = match query {
+        Query::Select { pattern, .. } => pattern,
+        Query::Ask { .. } => return Some(HashSet::new()),
+        _ => return None,
+    };
+    let mut p = pattern;
+    loop {
+        match p {
+            GraphPattern::Distinct { inner } | GraphPattern::Reduced { inner } => p = inner,
+            GraphPattern::Project { variables, .. } => {
+                return Some(variables.iter().map(|v| v.as_str().to_owned()).collect());
+            }
+            _ => return None,
+        }
+    }
 }
 
 /// A query that is one basic graph pattern under filters, with the answer variables.
@@ -174,6 +237,7 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
     };
     let mut analysis = Analysis {
         shape: shape_of(query),
+        answers: answer_variables(query),
         ..Analysis::default()
     };
     if matches!(query, Query::Describe { .. }) {
@@ -185,10 +249,26 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
                 let op = match p {
                     GraphPattern::Bgp { patterns } => {
                         analysis.reads.extend(patterns.iter().map(pattern_reads));
+                        analysis.atoms.extend(patterns.iter().map(atom_of));
                         None
                     }
                     GraphPattern::Path { path, .. } => {
+                        let from = analysis.reads.len();
                         path_reads(path, &mut analysis.reads);
+                        // A path's steps meet at nodes the query doesn't see.
+                        let steps = analysis.reads[from..]
+                            .iter()
+                            .map(|(predicate, class)| Atom {
+                                predicate: predicate.clone(),
+                                class: class.clone(),
+                                ends: [End::Hidden, End::Hidden],
+                            });
+                        let steps: Vec<Atom> = steps.collect();
+                        analysis.atoms.extend(steps);
+                        None
+                    }
+                    GraphPattern::Extend { expression, .. } => {
+                        variables_of(expression, &mut analysis.computed);
                         None
                     }
                     GraphPattern::LeftJoin { .. } => Some("OPTIONAL"),
@@ -243,7 +323,8 @@ fn closed(analysis: &Analysis, view: &View, snapshot: &Snapshot) -> bool {
     if view.rules {
         return true;
     }
-    if view.upper.is_none() {
+    // U1 that doesn't cover every axiom bounds nothing: its gap may miss predicates.
+    if view.upper.is_none() || view.unavailable.is_some() {
         return false;
     }
     let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
@@ -260,6 +341,81 @@ fn closed(analysis: &Analysis, view: &View, snapshot: &Snapshot) -> bool {
         }
         id(predicate).is_none_or(|p| !view.gap_predicates.contains(&p.raw()))
     })
+}
+
+/// Whether U1's facts beyond L on what a monotone query reads all put a Skolem constant
+/// where the query has a term or an answer variable. Then an answer over U1 that L lacks
+/// has a Skolem constant in it, which is never an answer: L's answers are the certain
+/// ones (U1 contains them all where the data is consistent). The predicates are open,
+/// but only through individuals no answer names (LUBM's existentials).
+fn closed_for_answers(analysis: &Analysis, view: &View, snapshot: &Snapshot) -> bool {
+    if view.upper.is_none() || view.unavailable.is_some() || analysis.not_monotone.is_some() {
+        return false;
+    }
+    let Some(answers) = &analysis.answers else {
+        return false;
+    };
+    let safe = |end: &End| match end {
+        End::Term => true,
+        End::Var(v) => answers.contains(v) && !analysis.computed.contains(v),
+        End::Hidden => false,
+    };
+    let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+    analysis.atoms.iter().all(|atom| {
+        let Some(predicate) = &atom.predicate else {
+            return false;
+        };
+        let (gap, named) = if predicate == RDF_TYPE {
+            match &atom.class {
+                Some(c) => id(c).map_or((false, false), |c| {
+                    (
+                        view.gap_classes.contains(&c.raw()),
+                        view.named_gap_classes.contains(&c.raw()),
+                    )
+                }),
+                // Any class: U1's own among them.
+                None => (true, !view.named_gap_classes.is_empty()),
+            }
+        } else {
+            id(predicate).map_or((false, false), |p| {
+                (
+                    view.gap_predicates.contains(&p.raw()),
+                    view.named_gap_predicates.contains(&p.raw()),
+                )
+            })
+        };
+        !gap || (!named && atom.ends.iter().all(safe))
+    })
+}
+
+/// In debug builds, what [`closed_for_answers`] claims: U1's answers without a Skolem
+/// constant are L's.
+#[cfg(debug_assertions)]
+fn check_closed_for_answers(
+    view: &View,
+    prepared: &PreparedQuery,
+    settings: &crate::query_executor::StoreSettings,
+    cancellation: &CancellationToken,
+) -> StoreResult<()> {
+    let upper = view.upper.as_ref().expect("closed_for_answers needs U1");
+    let lower = evaluate_prepared(&view.lower, prepared, settings, cancellation)?;
+    let upper = evaluate_prepared(upper, prepared, settings, cancellation)?;
+    match (lower, upper) {
+        (Answers::Boolean(l), Answers::Boolean(u)) => {
+            assert_eq!(l, u, "skolem-only-gap: {}", prepared.text());
+        }
+        (Answers::Solutions { rows: l, .. }, Answers::Solutions { rows: u, .. }) => {
+            let named = |row: &Vec<Option<Term>>| {
+                !row.iter()
+                    .any(|t| matches!(t, Some(Term::NamedNode(n)) if n.as_str().starts_with(U1)))
+            };
+            let l: HashSet<Vec<Option<Term>>> = l.into_iter().collect();
+            let u: HashSet<Vec<Option<Term>>> = u.into_iter().filter(named).collect();
+            assert_eq!(l, u, "skolem-only-gap: {}", prepared.text());
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// The ontology of a revision, kept for the exact services of its queries.
@@ -507,6 +663,13 @@ fn decide_answers(
     if closed(&analysis, &view, &snapshot) {
         // One evaluation, streamed: L's answers are the certain ones.
         status.path("closed-predicates");
+        return Ok(status.stream(lower_view(&view)));
+    }
+    if closed_for_answers(&analysis, &view, &snapshot) {
+        // The same, where the gap has only individuals no answer can name.
+        #[cfg(debug_assertions)]
+        check_closed_for_answers(&view, prepared, settings, cancellation)?;
+        status.path("skolem-only-gap");
         return Ok(status.stream(lower_view(&view)));
     }
     if let Some(why) = &view.unavailable {

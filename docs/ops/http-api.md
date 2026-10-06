@@ -43,7 +43,7 @@ Exact answers asked for (`dl-answers=exact`, or `dl.answers = "exact"`) that can
 
 Under a ruleset's closure where the QL rewriting doesn't apply, answers carry `NRESE-Completeness: sound-only; regime=owl2-rl; reasons="rules: …"` (the ruleset's regime): the closure's, not every certain answer under OWL 2 DL; with reasoning disabled, and for `infer=false`, no status is sent.
 
-`explain=true` and `explain=plan` carry the same status as `completeness` (`null` where no status is sent): `status`, `regime`, `sound`, `complete`, `reasons` (each `{source, text}`), `bounds` (`lower`, `upper`, `unresolved`, or `null`) and `decided_by` (what decided under `owl2-dl`: `closed-predicates`, `bounds-equal`, `exact-ground-entailment`, `exact-internalisable-cq`).
+`explain=true` and `explain=plan` carry the same status as `completeness` (`null` where no status is sent): `status`, `regime`, `sound`, `complete`, `reasons` (each `{source, text}`), `bounds` (`lower`, `upper`, `unresolved`, or `null`) and `decided_by` (what decided under `owl2-dl`: `closed-predicates`, `skolem-only-gap`, `bounds-equal`, `exact-ground-entailment`, `exact-internalisable-cq`).
 
 Other parameters are ignored, so clients that send their own (`queryLn`, `timeout`) work.
 
