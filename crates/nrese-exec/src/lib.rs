@@ -8,7 +8,9 @@
 //! - [`table`]: [`IdTable`], column-major `u64` tables with sort metadata
 //! - [`join`]: merge, hash, left (OPTIONAL) and anti (MINUS, NOT EXISTS) joins on key columns
 //! - [`group`]: grouping with aggregates over sorted or unsorted input
-//! - [`graph`]: adjacency, reachability and closures (property paths, hierarchies)
+//! - [`graph`]: adjacency, strongly connected components, reachability and closures
+//!   (property paths, hierarchies)
+//! - [`classes`]: equivalence classes by union (`owl:sameAs` classes)
 //! - [`budget`]: per-query memory accounting
 //! - [`memory`]: the process's memory, and a watch for limits on long operations
 //! - [`heap`]: heap profiles by phase, for memory guards and profiles
@@ -23,6 +25,7 @@
 //! have no stored id.
 
 pub mod budget;
+pub mod classes;
 pub mod graph;
 pub mod group;
 pub mod heap;
