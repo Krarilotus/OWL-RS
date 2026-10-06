@@ -337,10 +337,10 @@ impl Engine<'_> {
 
     /// Takes the next alternative of the newest branch point.
     pub fn take_alternative(&mut self) -> Step<()> {
-        let level = self.frames.len() as u32;
         let Some(frame) = self.frames.last() else {
             return Ok(());
         };
+        let level = frame.id;
         let lit = frame.alternatives[frame.next];
         let (premise, failed) = (frame.premise, frame.failed);
         let tried: Vec<Lit> = frame.alternatives[..frame.next].to_vec();
@@ -359,7 +359,7 @@ impl Engine<'_> {
     /// Raises the activity of the clauses whose choices `dep` holds.
     fn bump(&mut self, dep: DepSetId) {
         for level in self.deps.points(dep) {
-            let Some(frame) = self.frames.get(level as usize - 1) else {
+            let Some(frame) = self.frame_of(level).map(|i| &self.frames[i]) else {
                 continue;
             };
             if frame.clause == NONE {
@@ -373,6 +373,11 @@ impl Engine<'_> {
         }
     }
 
+    /// The stack position of level `level`'s frame, if it is on the stack.
+    fn frame_of(&self, level: u32) -> Option<usize> {
+        self.frames.binary_search_by_key(&level, |f| f.id).ok()
+    }
+
     /// Backtracks from a clash with `dep`; `false` if no branch point is left to try.
     fn backtrack(&mut self, mut dep: DepSetId) -> Result<bool, String> {
         let started = Instant::now();
@@ -380,10 +385,9 @@ impl Engine<'_> {
             self.bump(dep);
         }
         let out = loop {
-            let top = self.frames.len() as u32;
-            if top == 0 {
+            let Some(top) = self.frames.last().map(|f| f.id) else {
                 break Ok(false);
-            }
+            };
             let k = if self.config.backjumping {
                 match self.deps.max(dep) {
                     Some(k) => k.min(top),
@@ -396,11 +400,14 @@ impl Engine<'_> {
                 // The clash needs a choice of the base undone: not this run's to decide.
                 break Err(FLOOR.into());
             }
-            if k < top {
+            // The frames up to level `k` stay (`k` itself, the culprit, on top).
+            let keep = self.frames.partition_point(|f| f.id <= k);
+            let skipped = self.frames.len() - keep;
+            if skipped > 0 {
                 self.stats.backjumps += 1;
-                self.stats.levels_skipped += u64::from(top - k);
+                self.stats.levels_skipped += skipped as u64;
             }
-            self.frames.truncate(k as usize);
+            self.frames.truncate(keep);
             let rest = if self.config.backjumping {
                 self.deps.without(dep, k)
             } else {
@@ -451,6 +458,8 @@ impl Engine<'_> {
     /// run leaves it, or a branch point finds it).
     pub fn checkpoint(&self) -> super::engine::Frame {
         super::engine::Frame {
+            // A point to roll back to, not a branch point: no level of its own.
+            id: 0,
             mark: self.g.mark(),
             pending: self.pending.len() as u32,
             bindings: self.bindings.len() as u32,
