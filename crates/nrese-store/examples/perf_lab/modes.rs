@@ -212,3 +212,93 @@ pub fn canonicalize(
         graphs.len()
     ))
 }
+
+/// SplitMix64, for the kernels' data (the same as the generators').
+fn splitmix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// A kernel on generated data, `runs` times: `sort-u128-N` sorts N random 128-bit keys
+/// (two id columns) with the executor's `IdTable::sort_by`, and, for scale, the same keys as
+/// `u128` with the standard library's unstable sort.
+pub fn kernel(name: &str, runs: usize) -> Result<String, Box<dyn std::error::Error>> {
+    let rows: usize = name
+        .strip_prefix("sort-u128-")
+        .ok_or(format!("unknown kernel {name}"))?
+        .parse()?;
+    let mut state = 1u64;
+    let a: Vec<u64> = (0..rows).map(|_| splitmix(&mut state)).collect();
+    let b: Vec<u64> = (0..rows).map(|_| splitmix(&mut state)).collect();
+    let (mut table_times, mut std_times) = (Vec::new(), Vec::new());
+    let mut sorted = true;
+    for _ in 0..runs {
+        let mut table = nrese_exec::IdTable::from_columns(vec![a.clone(), b.clone()]);
+        let at = Instant::now();
+        table.sort_by(&[0, 1]);
+        table_times.push(at.elapsed());
+        sorted &= (1..table.len()).all(|i| {
+            (table.get(i - 1, 0), table.get(i - 1, 1)) <= (table.get(i, 0), table.get(i, 1))
+        });
+        let mut keys: Vec<u128> = a
+            .iter()
+            .zip(&b)
+            .map(|(&x, &y)| (u128::from(x) << 64) | u128::from(y))
+            .collect();
+        let at = Instant::now();
+        keys.sort_unstable();
+        std_times.push(at.elapsed());
+    }
+    let samples: Vec<String> = table_times
+        .iter()
+        .map(|t| format!("{:.3}", t.as_secs_f64() * 1e3))
+        .collect();
+    let (p50, _, _) = percentiles(&mut table_times);
+    let (std50, _, _) = percentiles(&mut std_times);
+    let megabytes = (rows * 16) as f64 / 1048576.0;
+    eprintln!(
+        "{name}: IdTable::sort_by p50 {p50:.1} ms ({:.0} MB/s), std sort_unstable {std50:.1} ms; sorted: {sorted}",
+        megabytes / (p50 / 1e3)
+    );
+    Ok(format!(
+        "{{\"name\": {name:?}, \"rows\": {rows}, \"p50_ms\": {p50:.3}, \"mb_per_s\": {:.1}, \"std_p50_ms\": {std50:.3}, \
+         \"sorted\": {sorted}, \"samples_ms\": [{}]}}",
+        megabytes / (p50 / 1e3),
+        samples.join(", ")
+    ))
+}
+
+/// Parsing and planning a query without running it, `runs` times: the cost of the parser
+/// and the rewrites on large or deeply nested queries. The JSON object of a query in the
+/// report, with the plan's size (steps and rewrites) as its counts.
+pub fn parse_and_plan(
+    store: &StoreService,
+    name: &str,
+    text: &str,
+    runs: usize,
+) -> Result<(String, f64), Box<dyn std::error::Error>> {
+    let mut times = Vec::new();
+    let (mut steps, mut rewrites) = (0, 0);
+    for _ in 0..runs {
+        let at = Instant::now();
+        let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(text))?;
+        let plan = store.plan_query(&prepared)?;
+        times.push(at.elapsed());
+        steps = plan.steps.len();
+        rewrites = plan.rewrites.len();
+    }
+    let samples: Vec<String> = times
+        .iter()
+        .map(|t| format!("{:.3}", t.as_secs_f64() * 1e3))
+        .collect();
+    let (p50, _, max) = percentiles(&mut times);
+    println!("{name:<28} parse and plan p50 {p50:.2} ms, {steps} steps, {rewrites} rewrites");
+    let json = format!(
+        "    {{\n      \"name\": \"{name}\",\n      \"rows\": {steps},\n      \"p50_ms\": {p50:.3},\n      \"max_ms\": {max:.3},\n      \"steps\": {steps},\n      \"rewrites\": {rewrites},\n      \"samples_ms\": [{}]\n    }}",
+        samples.join(", ")
+    );
+    Ok((json, p50))
+}

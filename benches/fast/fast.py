@@ -140,14 +140,31 @@ def build(args) -> int:
 # --- data ------------------------------------------------------------------------------------
 
 def data_file(spec: str) -> str:
-    """The container path of a data spec: `volume:FILE` from the dataset volume, or a
+    """The container path of a data spec: `volume:FILE` from the dataset volume, `ore:ID`
+    an ORE ontology converted to N-Triples, `concat:A+B` the specs' files concatenated, or a
     generated file in the fast suite's volume."""
+    if spec.startswith("ore:"):
+        return f"/fast/ore/{spec[len('ore:'):]}.nt"
+    if spec.startswith("concat:"):
+        return "/fast/concat-" + "-".join(fast_data_name(p).removesuffix(".nt") for p in spec[7:].split("+")) + ".nt"
     return ("/data/" if spec.startswith("volume:") else "/fast/") + fast_data_name(spec)
+
+
+ORE_DIR = Path(os.environ.get("NRESE_ORE_DIR", ROOT.parent.parent / "OWL-RS" / ".cache" / "ore2015" / "pool_sample" / "files"))
 
 
 def ensure_data(spec: str) -> dict:
     """Generates `spec` once; its `expect` (the generator's own answers)."""
-    if spec.startswith("volume:"):
+    if spec.startswith("volume:") or spec == "none":
+        return {}
+    if spec.startswith("ore:"):
+        ensure_ore(spec[len("ore:"):])
+        return {}
+    if spec.startswith("concat:"):
+        target = data_file(spec)
+        parts = " ".join(data_file(part) for part in spec[len("concat:"):].split("+"))
+        docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "-v", f"{BENCH_VOLUME}:/data:ro", "alpine", "sh", "-c",
+                f"test -s {target} || cat {parts} > {target}"])
         return {}
     path = data_file(spec)
     found = docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "cat", f"{path}.expect.json"])
@@ -161,6 +178,28 @@ def ensure_data(spec: str) -> dict:
     if code != 0:
         raise RuntimeError(f"generating {spec} failed: {err[-500:]}")
     return json.loads(out)["expect"]
+
+
+def ensure_ore(name: str):
+    """An ORE 2015 ontology (functional syntax, from the corpus cache; CC BY-NC-ND, never
+    committed) converted once to N-Triples by the DL kit's runner, for the NRESE tools."""
+    target = f"/fast/ore/{name}.nt"
+    found = docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "test", "-s", target])
+    if found.returncode == 0:
+        return
+    source = ORE_DIR / f"{name}.owl"
+    if not source.exists():
+        raise RuntimeError(f"{source} is missing: set NRESE_ORE_DIR to the ORE 2015 corpus (benches/reasoning/dl/ore.py)")
+    print(f"  converting {name} to N-Triples", flush=True)
+    script = (f"mkdir -p /fast/ore && cp /ore/{name}.owl /fast/ore/{name}.owl && "
+              f"printf '{name}\\tconvert\\tntriples\\t/fast/ore/{name}.owl\\n' > /fast/ore/{name}.manifest.tsv")
+    docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "-v", f"{host_path(ORE_DIR)}:/ore:ro", "alpine", "sh", "-c", script])
+    docker(["run", "--rm", "--memory=10g", "-v", f"{DATA_VOLUME}:/fast", "nrese-bench/dl-reference", "batch",
+            f"/fast/ore/{name}.manifest.tsv", f"/fast/ore/{name}.results.tsv", "/fast/ore", "600"], timeout=900)
+    docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "sh", "-c",
+            f"rm -f /fast/ore/{name}.owl /fast/ore/{name}.manifest.tsv /fast/ore/{name}.results.tsv"])
+    if docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "test", "-s", target]).returncode != 0:
+        raise RuntimeError(f"converting {name} failed")
 
 
 def vector_queries(expect: dict, exact: bool) -> Path:
@@ -177,12 +216,44 @@ def vector_queries(expect: dict, exact: bool) -> Path:
     return directory
 
 
+def parse_queries() -> Path:
+    """Large and deeply nested queries for the parse-and-rewrite cases (deterministic)."""
+    directory = SCRATCH / "queries" / "parse"
+    directory.mkdir(parents=True, exist_ok=True)
+    for old in directory.glob("*.rq"):
+        old.unlink()
+    prefix = "PREFIX e: <http://example.org/fast/>\n"
+    queries = {
+        "values-5000": "SELECT ?u ?n WHERE { VALUES ?u { " + " ".join(f"e:u{i}" for i in range(5000))
+                       + " } ?u e:name ?n }",
+        "bgp-1000": "SELECT * WHERE { " + " ".join(f"?x{i} e:follows ?x{i + 1} ." for i in range(1000)) + " }",
+        "union-500": "SELECT ?x WHERE { " + " UNION ".join(f"{{ ?x e:city e:c{i} }}" for i in range(500)) + " }",
+        "optional-120-nested": "SELECT * WHERE { ?x0 e:follows ?x1 "
+                               + "".join(f"OPTIONAL {{ ?x{i} e:follows ?x{i + 1} " for i in range(1, 120))
+                               + "}" * 119 + " }",
+        "subqueries-50-deep": "SELECT ?x WHERE { " + "{ SELECT ?x WHERE { " * 50 + "?x e:follows e:u1 "
+                              + "} } " * 50 + "}",
+        "filter-or-2000": "SELECT ?u WHERE { ?u e:age ?a FILTER(" + " || ".join(f"?a = {i}" for i in range(2000)) + ") }",
+        "path-alternatives-300": "SELECT ?y WHERE { e:u1 (" + "|".join(f"e:p{i}" for i in range(300)) + ")+ ?y }",
+        "expression-depth-120": "SELECT ?v WHERE { ?u e:age ?a BIND(" + "(" * 120 + "?a" + " + 1)" * 120 + " AS ?v) }",
+    }
+    for name, text in queries.items():
+        (directory / f"{name}.rq").write_text(prefix + text + "\n", encoding="utf-8")
+    return directory
+
+
 def queries_path(case: dict, expect: dict) -> str | None:
     name = case.get("queries", "")
     if not name:
         return None
     if name.startswith("@vectors"):
         return f"/out/queries/{name[1:]}"
+    if name == "@parse":
+        parse_queries()
+        return "/out/queries/parse"
+    if name.startswith("@"):
+        # Another kit's query set: benches/competitors/queries/NAME.
+        return f"/src/benches/competitors/queries/{name[1:]}"
     if name in ("lubm", "owl2bench"):
         return f"/src/benches/reasoning/queries/{name}"
     return f"/src/benches/fast/queries/{name}"
@@ -244,7 +315,8 @@ def run_case(case: dict, label: str, rep: int) -> dict:
     result: dict = {}
     if tool == "perf_lab":
         base = ["/target/release/examples/perf_lab", "--label", label, "--routes", "--json", out_json]
-        loads = [] if "setup" in case else [x for f in [case["data"], *case.get("extra", [])] for x in ("--load", data_file(f))]
+        loads = [] if "setup" in case or case["data"] == "none" else \
+            [x for f in [case["data"], *case.get("extra", [])] for x in ("--load", data_file(f))]
         if case.get("tool_loads") is False:
             loads = []
         # The canonicalisation case reads its files itself.
@@ -263,9 +335,11 @@ def run_case(case: dict, label: str, rep: int) -> dict:
         code = 0
         err = ""
         wall = 0.0
-        for _ in range(repeat):
-            # Each repeat of a case with a setup is a fresh process opening the store.
-            shell = script + " ".join(f"'{c}'" for c in command)
+        sweep = case.get("sweep", [[]])
+        runs = [(entry, i) for entry in sweep for i in range(repeat)]
+        for index, (entry, _) in enumerate(runs):
+            # The setup (a store on disk) runs once; each repeat is a fresh process opening it.
+            shell = (script if index == 0 else "") + " ".join(f"'{c}'" for c in [*command, *entry])
             code, _, err, w = container(name, case["cap_gb"], ["bash", "-c", shell], case.get("env"))
             wall += w
             path = SCRATCH / f"{case['name']}.json"
@@ -273,12 +347,15 @@ def run_case(case: dict, label: str, rep: int) -> dict:
                 break
             result = json.loads(path.read_text(encoding="utf-8"))
             path.unlink()
+            result["_sweep"] = " ".join(entry)
             samples_runs.append(result)
             if code != 0:
                 break
+        if "setup" in case:
+            container(name, 1, ["rm", "-rf", scratch])
         if samples_runs:
             result = samples_runs[-1]
-            if repeat > 1:
+            if len(samples_runs) > 1:
                 result["_repeats"] = samples_runs
         record["wall_s"] = round(wall, 2)
         if code != 0:
@@ -294,6 +371,9 @@ def run_case(case: dict, label: str, rep: int) -> dict:
         alt = [r for r in rows if r["file"] != data]
         result = dict(main[0]) if main else {}
         result["samples_ms"] = [r.get("whole_ms", 0.0) for r in rows]
+        # The pipeline's phases, one series each (reading, normalising, then the tableau's).
+        result["phase_samples"] = {phase: [r[f"{phase}_ms"] for r in rows if isinstance(r.get(f"{phase}_ms"), float)]
+                                   for phase in DL_PHASES}
         result["whole_ms"] = statistics.median(result["samples_ms"]) if rows else None
         if alt:
             result["alt"] = {"answer": alt[0]["answer"]}
@@ -320,12 +400,17 @@ def run_case(case: dict, label: str, rep: int) -> dict:
             total = sum(result[k] for k in phases)
         result["whole_ms"] = total
         result["samples_ms"] = [total] if total is not None else []
+        result["phase_samples"] = {k: [v] for k, v in result.items()
+                                   if k in ("read", "owl", "normalise", "compile", "prepare", "saturate", "assemble", "write")
+                                   and isinstance(v, float)}
         record["wall_s"] = round(wall, 2)
         if code != 0:
             record["status"] = classify_failure(code, err, result)
             record["notes"].append(err.strip()[-300:])
     record["metric"] = metric_value(case, result)
     record["samples"] = samples(case, result)
+    record["counters"] = counters(case, result)
+    record["phase_peaks"] = {k: v.get("peak_mib") for k, v in (result.get("phases") or {}).items()}
     record["peak_mib"] = result.get("cgroup_peak_mib") or result.get("peak_mib")
     if case.get("queries", "").startswith("@vectors") and record["status"] == "ok":
         result["recall"] = vector_recall(case, expect)
@@ -342,12 +427,45 @@ def run_case(case: dict, label: str, rep: int) -> dict:
     return record
 
 
+DL_PHASES = ("parse", "read", "normalise", "compile", "saturate", "blocking", "expand", "search", "datatypes")
+
+# Deterministic work counters, recorded for every case and compared exactly: a change in
+# them is a change in the work done, whatever the machine's noise.
+COUNTERS = ("reason.candidates", "reason.new_facts", "reason.inferred", "reason.rounds",
+            "commits.inferred_inserted", "commits.inferred_deleted", "commits.max_rounds",
+            "held.index_mib", "held.dictionary_terms", "held.inferred",
+            "clauses", "nodes_created", "branch_points", "backjumps", "clashes", "merges", "facts", "clauses_fired",
+            "concepts", "contexts", "subsumers", "links", "conclusions", "duplicates", "dl_clauses", "functions",
+            "shacl.results", "kernel.rows", "held.index_bytes",
+            "reason.bindings", "reason.probes", "reason.passes", "subset_checks", "clauses_generated", "clauses_kept",
+            "redundant_forward", "redundant_backward", "contexts_created", "hyper", "pred")
+
+
+def counters(case: dict, result: dict) -> dict:
+    out = {}
+    for path in (*COUNTERS, *case.get("counters", [])):
+        value = lookup(path, result)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            out[path] = value
+    for q in result.get("queries", []):
+        for field in ("steps", "rewrites"):
+            if field in q:
+                out[f"q.{q['name']}.{field}"] = q[field]
+    for phase, values in (result.get("phases") or {}).items():
+        for field in ("allocations", "allocated_mib"):
+            if field in values:
+                out[f"phases.{phase}.{field}"] = values[field]
+    return out
+
+
 def classify_failure(code: int, err: str, result: dict) -> str:
     text = (err or "") + json.dumps(result.get("error", ""))
     if code == 137 or "memory limit" in text.lower() or "ProcessMemoryLimit" in text:
         return "memory-limit"
     if code == 124:
         return "timeout"
+    if "unsupported:" in text:
+        return "unsupported"
     return "failed"
 
 
@@ -355,7 +473,7 @@ def slim(result: dict) -> dict:
     """The result without per-sample arrays (they are kept in `samples`)."""
     out = {}
     for key, value in result.items():
-        if key == "_repeats":
+        if key in ("_repeats", "phase_samples"):
             continue
         if key == "queries":
             out["queries"] = {q["name"]: {k: v for k, v in q.items() if k not in ("samples_ms", "name")}
@@ -430,7 +548,8 @@ def cold_ms(result: dict) -> float | None:
     """Opening the store and the first execution of each query, in ms."""
     if "open_s" not in result:
         return None
-    return result["open_s"] * 1000.0 + result.get("sum_p50_ms", 0.0)
+    firsts = [q.get("first_ms", q.get("p50_ms", 0.0)) for q in result.get("queries", []) if "error" not in q]
+    return result["open_s"] * 1000.0 + sum(firsts)
 
 
 def metric_value(case: dict, result: dict):
@@ -451,6 +570,16 @@ def metric_value(case: dict, result: dict):
 def samples(case: dict, result: dict) -> dict:
     """Per series, the measured samples (ms) the metric is a median or sum of medians of."""
     metric = case["metric"]
+    if case.get("sweep") and "_repeats" in result:
+        scale = 1000.0 if metric in ("load_s", "open_s") else 1.0
+        series: dict[str, list[float]] = {}
+        for r in result["_repeats"]:
+            value = lookup(metric, r)
+            if value is not None:
+                series.setdefault(r.get("_sweep") or "-", []).append(value * scale)
+        return series
+    if result.get("phase_samples") and any(result["phase_samples"].values()):
+        return {k: v for k, v in result["phase_samples"].items() if v}
     if metric == "cold_ms":
         return {"_": [v for v in (cold_ms(r) for r in result.get("_repeats", [result])) if v is not None]}
     if metric == "sum_p50_ms":
@@ -531,7 +660,13 @@ def pooled(report: dict) -> dict[str, dict]:
     """Per case: its samples per repetition, statuses, peak memory, the metric per repetition."""
     out: dict[str, dict] = {}
     for r in report["records"]:
-        entry = out.setdefault(r["case"], {"reps": [], "status": [], "peaks": [], "metrics": []})
+        entry = out.setdefault(r["case"], {"reps": [], "status": [], "peaks": [], "metrics": [],
+                                           "counters": {}, "phase_peaks": {}})
+        for path, value in (r.get("counters") or {}).items():
+            entry["counters"].setdefault(path, []).append(value)
+        for phase, peak in (r.get("phase_peaks") or {}).items():
+            if peak:
+                entry["phase_peaks"].setdefault(phase, []).append(peak)
         entry["status"].append(r["status"])
         if r.get("peak_mib"):
             entry["peaks"].append(r["peak_mib"])
@@ -589,6 +724,37 @@ def bootstrap_ratio(base: list[dict], new: list[dict], rounds: int = 1000, seed:
     return point, ratios[int(0.025 * rounds)], ratios[int(0.975 * rounds) - 1]
 
 
+def counter_changes(base: dict, new: dict) -> tuple[bool, list[str]]:
+    """Whether a work counter grew beyond 2 %, and a note per changed counter. A counter
+    whose repetitions differ within one run is not deterministic and isn't judged."""
+    grew, notes = False, []
+    for path in sorted(set(base) & set(new)):
+        b, n = base[path], new[path]
+        if len(set(b)) > 1 or len(set(n)) > 1:
+            continue
+        before, after = b[0], n[0]
+        if before == after:
+            continue
+        change = (after - before) / before if before else float("inf")
+        mark = ""
+        if change > 0.02:
+            grew, mark = True, "  MORE WORK"
+        elif change < -0.02:
+            mark = "  less work"
+        notes.append(f"{path}: {before:g} -> {after:g} ({change:+.1%}){mark}")
+    return grew, notes
+
+
+def series_ratios(base: list[dict], new: list[dict], series: list[str]) -> list[str]:
+    """The series of a case sorted by how far their median moved, as `name ratio`."""
+    out = []
+    for s in series:
+        b, n = statistic(base, [s]), statistic(new, [s])
+        if b > 0:
+            out.append((abs(n / b - 1), f"{s} {n / b:.2f}x"))
+    return [text for _, text in sorted(out, reverse=True)]
+
+
 def compare(args) -> int:
     base_report = json.loads(Path(args.base).read_text(encoding="utf-8"))
     new_report = json.loads(Path(args.new).read_text(encoding="utf-8"))
@@ -625,9 +791,22 @@ def compare(args) -> int:
         if bp and np_ and np_ > bp * (1 + max(0.10, threshold)) and np_ - bp > 64:
             verdict += ", MORE MEMORY"
             regressions += 1
+        for phase in sorted(set(b["phase_peaks"]) & set(n["phase_peaks"])):
+            before, after = max(b["phase_peaks"][phase]), max(n["phase_peaks"][phase])
+            if after > before * (1 + max(0.10, threshold)) and after - before > 64:
+                verdict += f", MORE MEMORY in {phase} ({before} -> {after} MiB)"
+                regressions += 1
+        work, notes = counter_changes(b["counters"], n["counters"])
+        if work:
+            verdict += ", MORE WORK"
+            regressions += 1
         peaks = f"{bp or '-'} -> {np_ or '-'}"
         print(f"{case:<26} {bm:>11.1f} {nm:>11.1f} {ratio:>7.2f} {f'[{low:.2f}, {high:.2f}]':>15} "
               f"{threshold:>6.0%} {peaks:>17}  {verdict}")
+        for note in notes:
+            print(f"{'':<28}{note}")
+        if verdict.startswith(("SLOWER", "faster")) and len(series) > 1:
+            print(f"{'':<28}by series: " + ", ".join(series_ratios(b["reps"], n["reps"], series)[:3]))
     if spreads:
         print(f"\nspread between repetitions: median {statistics.median(spreads):.0%}, max {max(spreads):.0%}")
     print(f"{regressions} regression(s): a change counts beyond max(10 %, the spread of both sides) and 2 ms, "

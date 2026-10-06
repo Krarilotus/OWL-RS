@@ -62,6 +62,7 @@ mod modes;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
@@ -72,9 +73,95 @@ use nrese_store::{
 };
 
 /// mimalloc, as in the server; `RUSTFLAGS="--cfg system_alloc"` measures the system allocator.
+/// With `--count-allocations` it also counts allocations and their bytes, per phase.
 #[cfg(not(system_alloc))]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: Counting = Counting;
+
+/// Whether allocations are counted (`--count-allocations`), and the counts.
+static COUNT_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
+static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// mimalloc, counting allocations when asked (one relaxed load when not).
+#[cfg(not(system_alloc))]
+struct Counting;
+
+#[cfg(not(system_alloc))]
+impl Counting {
+    fn count(bytes: usize) {
+        if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
+            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            ALLOCATED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+// SAFETY: every call is passed on to mimalloc unchanged; counting has no other effect.
+#[cfg(not(system_alloc))]
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        Self::count(layout.size());
+        // SAFETY: the caller's contract for `alloc` is mimalloc's.
+        unsafe { mimalloc::MiMalloc.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        Self::count(layout.size());
+        // SAFETY: as for `alloc`.
+        unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: `ptr` came from mimalloc with `layout`, as the caller guarantees.
+        unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        Self::count(new_size);
+        // SAFETY: as for `dealloc`, and `new_size` is the caller's.
+        unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+    }
+}
+
+/// Allocations and bytes counted so far.
+fn allocations() -> (u64, u64) {
+    (
+        ALLOCATIONS.load(Ordering::Relaxed),
+        ALLOCATED_BYTES.load(Ordering::Relaxed),
+    )
+}
+
+/// The memory a phase used: its peak resident memory (Linux: the high-water mark reset at
+/// the phase's start through /proc/self/clear_refs) and, when counted, its allocations.
+struct Phase {
+    allocations: (u64, u64),
+}
+
+impl Phase {
+    fn start() -> Self {
+        // Writing 5 resets the peak resident set size to the current one (Linux 4.0 on).
+        let _ = std::fs::write("/proc/self/clear_refs", "5");
+        Self {
+            allocations: allocations(),
+        }
+    }
+
+    /// `{"peak_mib": .., "allocations": .., "allocated_mib": ..}` since `start`.
+    fn json(&self) -> String {
+        let (count, bytes) = allocations();
+        let peak = memory_mib().map_or("null".to_owned(), |(peak, _)| peak.to_string());
+        if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
+            format!(
+                "{{\"peak_mib\": {peak}, \"allocations\": {}, \"allocated_mib\": {}}}",
+                count - self.allocations.0,
+                (bytes - self.allocations.1) / 1048576
+            )
+        } else {
+            format!("{{\"peak_mib\": {peak}}}")
+        }
+    }
+}
 
 struct Args {
     store: Option<PathBuf>,
@@ -103,6 +190,9 @@ struct Args {
     threads: Option<usize>,
     export: Option<PathBuf>,
     canonicalize: Vec<PathBuf>,
+    count_allocations: bool,
+    parse_only: bool,
+    kernel: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -133,6 +223,9 @@ fn parse_args() -> Result<Args, String> {
         threads: None,
         export: None,
         canonicalize: Vec::new(),
+        count_allocations: false,
+        parse_only: false,
+        kernel: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -189,6 +282,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--export" => args.export = Some(value()?.into()),
             "--canonicalize" => args.canonicalize.push(value()?.into()),
+            "--count-allocations" => args.count_allocations = true,
+            "--parse-only" => args.parse_only = true,
+            "--kernel" => args.kernel = Some(value()?),
             "--format" => {
                 args.format = match value()?.as_str() {
                     "tsv" => SolutionsResultFormat::Tsv,
@@ -229,6 +325,8 @@ impl Write for CountingSink {
 struct Measured {
     rows: u64,
     times: Vec<Duration>,
+    /// The query's first execution in this process (the warm-up, or the first measured run).
+    first: Option<Duration>,
     error: Option<String>,
 }
 
@@ -308,6 +406,7 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
             return Measured {
                 rows: 0,
                 times: Vec::new(),
+                first: None,
                 error: Some(e.to_string()),
             };
         }
@@ -315,12 +414,14 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
     let mut measured = Measured {
         rows: 0,
         times: Vec::new(),
+        first: None,
         error: None,
     };
     for i in 0..args.warmup + args.runs {
         match run_once(store, &prepared, args.timeout) {
             Ok((rows, elapsed)) => {
                 measured.rows = rows;
+                measured.first.get_or_insert(elapsed);
                 if i >= args.warmup {
                     measured.times.push(elapsed);
                 }
@@ -514,6 +615,28 @@ fn operators(store: &StoreService, text: &str) -> Vec<String> {
     seen
 }
 
+/// `{"minor": .., "major": ..}`: the process's page faults so far (Linux, /proc/self/stat).
+fn faults() -> String {
+    let fields: Vec<i64> = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|stat| {
+            // The fields after the command name, which is in parentheses.
+            let rest = stat.rsplit_once(')')?.1.to_owned();
+            Some(
+                rest.split_whitespace()
+                    .filter_map(|f| f.parse().ok())
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
+    // After the name: state (not numeric, skipped), ppid, pgrp, session, tty, tpgid (may
+    // be -1), flags, minflt, cminflt, majflt.
+    match (fields.get(6), fields.get(8)) {
+        (Some(minor), Some(major)) => format!("{{\"minor\": {minor}, \"major\": {major}}}"),
+        _ => "null".to_owned(),
+    }
+}
+
 /// The container's peak memory in MiB, where it runs under cgroup v2 (Docker on Linux).
 fn cgroup_peak_mib() -> Option<u64> {
     std::fs::read_to_string("/sys/fs/cgroup/memory.peak")
@@ -628,10 +751,25 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         equality_canonical_answers: setting("NRESE_REASONING_EQUALITY_ANSWERS") == "canonical",
         ..config
     };
+    COUNT_ALLOCATIONS.store(args.count_allocations, Ordering::Relaxed);
+    if let Some(kernel) = &args.kernel {
+        report
+            .sections
+            .push(("kernel", modes::kernel(kernel, args.runs)?));
+        return Ok(());
+    }
+    let mut phases: Vec<(&'static str, String)> = Vec::new();
     let started = Instant::now();
     let store = Arc::new(StoreService::new(config)?);
     report.open_s = started.elapsed().as_secs_f64();
+    if let Some((_, resident)) = memory_mib() {
+        report
+            .sections
+            .push(("open_resident_mib", resident.to_string()));
+    }
+    report.sections.push(("faults_at_open", faults()));
     if !args.load.is_empty() {
+        let phase = Phase::start();
         let started = Instant::now();
         let loaded = store.bulk_load(&BulkLoadRequest {
             files: args.load.clone(),
@@ -647,6 +785,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         if let Some((peak, _)) = memory_mib() {
             report.sections.push(("load_peak_mib", peak.to_string()));
         }
+        phases.push(("load", phase.json()));
     }
     let rules = match &args.rules {
         Some(path) => Some(Arc::new(UserRules::n3(
@@ -659,6 +798,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         .with_rules(rules)?;
     let program = reasoner.materialised_program();
     if let Some(program) = &program {
+        let phase = Phase::start();
         let mut times = Vec::new();
         let mut last = None;
         for _ in 0..args.reason_runs {
@@ -683,7 +823,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             format!(
                 "{{\"program\": {:?}, \"asserted\": {}, \"inferred\": {}, \"violations\": {}, \"rounds\": {}, \
                  \"runs\": {}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \"samples_ms\": [{}], \"grounding_ms\": {:.3}, \
-                 \"joins_ms\": {:.3}, \"modules_ms\": {:.3}, \"merge_ms\": {:.3}, \"consistency_ms\": {:.3}}}",
+                 \"joins_ms\": {:.3}, \"modules_ms\": {:.3}, \"merge_ms\": {:.3}, \"consistency_ms\": {:.3}, \"bindings\": {}, \"probes\": {}, \"candidates\": {}, \"new_facts\": {}, \"passes\": {}}}",
                 done.ruleset,
                 done.asserted,
                 done.inferred,
@@ -696,11 +836,17 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
                 ms(done.phases.modules),
                 ms(done.phases.merge),
                 ms(done.phases.consistency),
+                done.phases.bindings,
+                done.phases.probes,
+                done.phases.candidates,
+                done.phases.new_facts,
+                done.phases.passes,
             ),
         ));
         if let Some((peak, _)) = memory_mib() {
             report.sections.push(("reason_peak_mib", peak.to_string()));
         }
+        phases.push(("reason", phase.json()));
     }
     if let Some(shapes) = &args.shapes {
         store.bulk_load(&BulkLoadRequest {
@@ -755,6 +901,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         .map(std::fs::read_to_string)
         .collect::<Result<_, _>>()?;
     if let Some(file) = &args.commits {
+        let phase = Phase::start();
         let pipeline = MutationPipeline::new(
             Arc::clone(&store),
             Arc::new(ReasonerService::new(reasoner.clone())),
@@ -780,6 +927,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
                 ),
             ));
         }
+        phases.push(("commits", phase.json()));
     }
     if args.clients > 0 {
         report.sections.push((
@@ -829,11 +977,15 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     report.sections.push((
         "held",
         format!(
-            "{{\"quads\": {}, \"inferred\": {}, \"index_mib\": {}, \"dictionary_terms\": {}}}",
+            "{{\"quads\": {}, \"inferred\": {}, \"index_mib\": {}, \"index_bytes\": {}, \"dictionary_terms\": {}, \
+             \"dictionary_text_bytes\": {}, \"dictionary_index_bytes\": {}}}",
             stats.quads,
             stats.inferred,
             mib(stats.index_bytes),
-            stats.dictionary.terms
+            stats.index_bytes,
+            stats.dictionary.terms,
+            stats.dictionary.arena_bytes,
+            stats.dictionary.index_bytes
         ),
     ));
 
@@ -849,8 +1001,15 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         );
     }
     let mut estimates: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    let queries_phase = Phase::start();
     for (file, text) in files.iter().zip(&texts) {
         let name = file.file_stem().unwrap().to_string_lossy().into_owned();
+        if args.parse_only {
+            let (json, p50) = modes::parse_and_plan(&store, &name, text, args.runs)?;
+            report.queries.push(json);
+            report.sum_p50 += p50;
+            continue;
+        }
         let m = measure(&store, text, args);
         if let Some(dir) = &args.results {
             write_results(&store, text, args, &dir.join(format!("{name}.out")))?;
@@ -880,6 +1039,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             m.rows
         );
         let mut extra = String::new();
+        if let Some(first) = m.first {
+            extra.push_str(&format!(",\n      \"first_ms\": {:.3}", ms(first)));
+        }
         if args.routes {
             if m.rows == 1
                 && let Some(value) = first_value(&store, text)
@@ -900,6 +1062,19 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     }
     if !files.is_empty() {
         println!("sum of p50: {:.1} ms", report.sum_p50);
+    }
+    if !files.is_empty() {
+        phases.push(("queries", queries_phase.json()));
+    }
+    report.sections.push(("faults_at_end", faults()));
+    if !phases.is_empty() {
+        let members: Vec<String> = phases
+            .iter()
+            .map(|(name, json)| format!("\"{name}\": {json}"))
+            .collect();
+        report
+            .sections
+            .push(("phases", format!("{{{}}}", members.join(", "))));
     }
     report.qerror = (args.qerror && !estimates.is_empty()).then(|| qerror_summary(&estimates));
     if let Some((peak, rss)) = memory_mib() {
