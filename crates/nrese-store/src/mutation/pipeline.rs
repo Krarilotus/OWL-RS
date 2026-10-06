@@ -232,6 +232,26 @@ impl MutationPipeline {
                 None,
                 None,
             ));
+            // The owl2-dl mode: the state the commit leaves, under OWL 2 DL.
+            let dl = self
+                .store
+                .dl()
+                .active()
+                .then(|| crate::dl::gate::check_commit(&self.store, &tx, &stop));
+            if let Some(gate) = &dl
+                && let Some(detail) = &gate.reject
+            {
+                return Err(MutationError::Rejected(Box::new(MutationReject {
+                    detail: detail.clone(),
+                    explanation: Some(nrese_reasoner::RejectExplanation {
+                        summary: detail.clone(),
+                        violated_constraint: "owl2-dl-consistency".to_owned(),
+                        focus_resource: String::new(),
+                        evidence: Vec::new(),
+                    }),
+                    attribution: None,
+                })));
+            }
             crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph)
                 .map_err(store_error)?;
             self.shacl_gate(&tx)?;
@@ -249,6 +269,12 @@ impl MutationPipeline {
             })?;
             if let Some(touched) = touched {
                 supports.note_commit(before, summary.revision, touched);
+            }
+            if let Some(gate) = dl {
+                self.store.dl().record(crate::dl::DlStatus {
+                    revision: summary.revision,
+                    consistency: gate.checked,
+                });
             }
             // The program now describes the committed state.
             match changed {
