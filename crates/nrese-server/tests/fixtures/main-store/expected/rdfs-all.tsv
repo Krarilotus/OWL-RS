@@ -1,0 +1,4 @@
+?s	?p	?o
+<http://e/Student>	<http://www.w3.org/2000/01/rdf-schema#subClassOf>	<http://e/Person>
+<http://e/hal>	<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>	<http://e/Person>
+<http://e/hal>	<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>	<http://e/Student>

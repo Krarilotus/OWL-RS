@@ -313,6 +313,24 @@ server {
 - Error budget policy SHOULD define rollback gates for releases.
 
 ## 13. Upgrade Strategy
+
+### 13.1 Upgrading a Store (from `main` to v2)
+
+A data directory written by an earlier NRESE opens as it is: no migration step. Checkpoints of formats 4 to 11 are read, the write-ahead log is replayed (also after a crash or a kill), and the repositories, their settings and rules, the namespaces, the access state (users, local logins, roles, workspaces, saved queries) and the image backups carry over. Sessions and the result cache live in memory and start empty, as at every start.
+
+1. Stop the server, and keep a copy of the data directory (or an image backup) and the old binary.
+2. Install the new binary and start it with the same configuration. The first start brings each inferred stack in line with the new rules: a stack whose rules didn't change (the reasoning marker's fingerprint, `reasoning.state`) is kept; one whose rules did is rebuilt before the server reports ready, which takes about as long as reasoning after a bulk load. From `main` (d9a4b24) to v2, `owl2-ql` and `owl-horst` stacks are rebuilt; `rdfs`, `owl2-rl` and repositories with their own rules are kept.
+3. Check `/readyz` (`revision`, `quad_count`) and a few known queries against the old server's answers.
+
+What changes on purpose:
+- **Answers through existentials under `owl2-ql`:** the QL rewriting is on by default there (`reasoner.ql_rewriting = "auto"`), so queries can find individuals that only an existential axiom makes match (`Employee ⊑ ∃worksFor`: an employee without a stated employer now works for something). `reasoner.ql_rewriting = "off"`, or a repository's own `ql_rewriting`, keeps the earlier answers. Under `owl2-rl` nothing changes.
+- **Repository ids:** new repositories can't have an id starting or ending with `.` or a Windows device name (`CON`, `NUL`, `COM1`, ...). Existing ones keep working and are logged at start; copy one into a repository with another id to move the data directory between systems.
+
+**Rolling back:** the earlier binary opens the directory again (checkpoint format 11, unchanged log), rebuilding the stacks whose rules differ. A repository switched to a mode only the new version has (`owl2-dl`) isn't opened by the earlier one: switch it back first. Settings only the new version knows (`ql_rewriting`, `query_timeout_ms`, access `inferred = "supported"`) are ignored, `supported` reading as `hidden`.
+
+**Tested** (`crates/nrese-server/tests/it/upgrade_tests.rs`): a data directory written by `main`'s server (`crates/nrese-server/tests/fixtures/main-store`, with the script that writes it) opened by this build's binary: the same data and answers in every repository (the QL rewriting's one answer apart), every setting, local logins, current stacks, writes surviving a restart, and `main`'s image backup restoring.
+
+### 13.2 Rollout
 - Prefer blue/green or canary rollout.
 - Before upgrade:
 - Verify backward-compatible API behavior.
