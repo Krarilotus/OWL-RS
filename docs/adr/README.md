@@ -14,3 +14,4 @@ One file per decision that is expensive to reverse. Format: context → decision
 | [0008](0008-users-workspaces-policies.md) | Users, workspaces and graph policies in the store | accepted |
 | [0009](0009-owl2-dl-reasoning.md) | OWL 2 DL reasoning: one OWL model, hypertableau, consequence-based classification, certain answers with datalog bounds | proposed |
 | [0010](0010-standing-product-decisions.md) | Standing product decisions: reasoning leads, configurable defaults, one execution core, Rust natively, no C/C++ speed dependencies, licence | accepted |
+| [0011](0011-equality-one-contract-three-backends.md) | Equality: one contract (reasons, deltas, owner domains), backends per lifetime (monotone, persistent, rollback) | proposed |

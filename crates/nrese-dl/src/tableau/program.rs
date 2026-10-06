@@ -210,6 +210,33 @@ pub struct Program {
     pub keys: Vec<KeyRule>,
     /// By individual: whether it is anonymous (keys don't apply to it).
     pub anonymous: Vec<bool>,
+    /// Pairs of concepts no node may have together: `C(x) ∧ D(x) → ⊥` (each pair both
+    /// ways; `C` with itself for `C(x) → ⊥`). The ≤-rule skips merges they would refute.
+    pub disjoint: hashbrown::HashSet<(ConceptId, ConceptId)>,
+}
+
+/// The axioms any program of `normalised` leaves out, and why: those the normalisation
+/// reports unsupported (but datatype definitions, the datatype theory's, and keys, which
+/// are rules), and those the reader couldn't take as OWL 2 DL. Known before any test: with
+/// one, no test can show a class satisfiable or a subsumption absent.
+pub fn left_out(ontology: &Ontology, normalised: &Normalised) -> Vec<String> {
+    let reasons: BTreeSet<&str> = normalised
+        .unsupported
+        .iter()
+        .map(|(_, r)| *r)
+        .filter(|r| *r != UNSUPPORTED_DATATYPE_DEFINITIONS && *r != UNSUPPORTED_KEYS)
+        .collect();
+    let mut why: Vec<String> = reasons
+        .into_iter()
+        .map(|reason| format!("axioms left out: {reason}"))
+        .collect();
+    let fatal = ontology.diagnostics.iter().filter(|d| d.is_fatal()).count();
+    if fatal > 0 {
+        why.push(format!(
+            "{fatal} reader diagnostics (not OWL 2 DL, left out)"
+        ));
+    }
+    why
 }
 
 impl Program {
@@ -219,16 +246,7 @@ impl Program {
             simple: true,
             ..Program::default()
         };
-        // Datatype definitions are the datatype theory's; keys are rules (below).
-        let reasons: BTreeSet<&str> = normalised
-            .unsupported
-            .iter()
-            .map(|(_, r)| *r)
-            .filter(|r| *r != UNSUPPORTED_DATATYPE_DEFINITIONS && *r != UNSUPPORTED_KEYS)
-            .collect();
-        for reason in reasons {
-            p.weakened.push(format!("axioms left out: {reason}"));
-        }
+        p.weakened = left_out(ontology, normalised);
         let facts = &normalised.facts;
         if normalised.clauses.iter().any(|c| c.flags.datatype)
             || !facts.data.is_empty()
@@ -238,13 +256,6 @@ impl Program {
                 ranges: Ranges::new(ontology, normalised),
                 ..DataProgram::default()
             }));
-        }
-        // What the reader couldn't take as OWL 2 DL: the axioms it is part of are left out.
-        let fatal = ontology.diagnostics.iter().filter(|d| d.is_fatal()).count();
-        if fatal > 0 {
-            p.weakened.push(format!(
-                "{fatal} reader diagnostics (not OWL 2 DL, left out)"
-            ));
         }
         for (index, clause) in normalised.clauses.iter().enumerate() {
             match p.clause(clause, index as u32) {
@@ -787,6 +798,21 @@ impl Program {
 
     /// The join plans, one per body atom.
     fn plans(&mut self) {
+        for clause in &self.clauses {
+            if !clause.head.is_empty() {
+                continue;
+            }
+            match clause.body[..] {
+                [Body::Concept(a, 0), Body::Concept(b, 0)] => {
+                    self.disjoint.insert((a, b));
+                    self.disjoint.insert((b, a));
+                }
+                [Body::Concept(a, 0)] => {
+                    self.disjoint.insert((a, a));
+                }
+                _ => {}
+            }
+        }
         self.by_concept = vec![Vec::new(); self.concepts.len()];
         self.by_role = vec![Vec::new(); self.roles.len()];
         for (index, clause) in self.clauses.iter().enumerate() {

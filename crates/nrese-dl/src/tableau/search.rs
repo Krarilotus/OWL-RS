@@ -206,50 +206,99 @@ impl Engine<'_> {
 
     /// The first open disjunction: asserted if one disjunct is left, else a branch point.
     fn choose(&mut self) -> Step<bool> {
+        if self.config.conflict_order
+            && let Some(at) = self.most_active()
+            && let Some(step) = self.decide(at)
+        {
+            // Decided in place: the scan below skips it later, as satisfied.
+            return step;
+        }
         let mut at = self.pending_open as usize;
         while at < self.pending.len() {
-            let pend = self.pending[at];
+            let here = at;
             at += 1;
+            match self.decide(here) {
+                Some(step) => return step,
+                None => {
+                    if here == self.pending_open as usize {
+                        self.pending_open = at as u32;
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// The pending disjunction at `at`: `None` if it no longer needs a choice (a node of
+    /// it merged away, or a disjunct holds), else asserted (one disjunct left), a clash
+    /// (none left) or a branch point.
+    fn decide(&mut self, at: usize) -> Option<Step<bool>> {
+        let pend = self.pending[at];
+        let clause = &self.p.clauses[pend.clause as usize];
+        let bind = &self.bindings[pend.bind as usize..pend.bind as usize + clause.vars as usize];
+        if bind.iter().any(|&n| !self.g.live(n)) {
+            // A merged node's facts were copied, and fire again at the target.
+            return None;
+        }
+        let bind: Vec<u32> = bind.to_vec();
+        let mut dep = pend.dep;
+        let annotation = clause.annotation;
+        let mut open = Vec::new();
+        for (i, &h) in clause.head.iter().enumerate() {
+            let lit = self.lit(h, &bind, annotation);
+            match self.holds(lit) {
+                Ok(true) => return None,
+                Ok(false) => open.push((lit, i as u8)),
+                Err(refuted) => dep = self.deps.union(dep, refuted),
+            }
+        }
+        let source = clause.source;
+        Some(match open.len() {
+            0 => Err(self.clash(dep, DepSetId::EMPTY)),
+            1 => self.assert(open[0].0, dep, source).map(|()| true),
+            _ => {
+                self.order_disjuncts(pend.clause, &mut open);
+                let (alternatives, heads) = open.into_iter().unzip();
+                self.branch_on_clause(alternatives, dep, pend.clause, heads)
+                    .map(|()| true)
+            }
+        })
+    }
+
+    /// The open pending disjunction (an index past the cursor, among the next few
+    /// thousand) whose clause is the most active, if any has activity.
+    fn most_active(&mut self) -> Option<usize> {
+        const WINDOW: usize = 4096;
+        let start = self.pending_open as usize;
+        let end = self.pending.len().min(start + WINDOW);
+        let mut best: Option<(u32, usize)> = None;
+        for at in start..end {
+            let pend = self.pending[at];
+            let a = self
+                .activity
+                .get(pend.clause as usize)
+                .copied()
+                .unwrap_or(0);
+            if a == 0 || best.is_some_and(|(b, _)| b >= a) {
+                continue;
+            }
             let clause = &self.p.clauses[pend.clause as usize];
             let bind =
                 &self.bindings[pend.bind as usize..pend.bind as usize + clause.vars as usize];
             if bind.iter().any(|&n| !self.g.live(n)) {
-                // A merged node's facts were copied, and fire again at the target.
-                self.pending_open = at as u32;
                 continue;
             }
             let bind: Vec<u32> = bind.to_vec();
-            let mut dep = pend.dep;
             let annotation = clause.annotation;
-            let mut open = Vec::new();
-            let mut satisfied = false;
-            for (i, &h) in clause.head.iter().enumerate() {
-                let lit = self.lit(h, &bind, annotation);
-                match self.holds(lit) {
-                    Ok(true) => {
-                        satisfied = true;
-                        break;
-                    }
-                    Ok(false) => open.push((lit, i as u8)),
-                    Err(refuted) => dep = self.deps.union(dep, refuted),
-                }
+            let heads = clause.head.clone();
+            let satisfied = heads
+                .iter()
+                .any(|&h| matches!(self.holds(self.lit(h, &bind, annotation)), Ok(true)));
+            if !satisfied {
+                best = Some((a, at));
             }
-            if satisfied {
-                self.pending_open = at as u32;
-                continue;
-            }
-            return match open.len() {
-                0 => Err(self.clash(dep, DepSetId::EMPTY)),
-                1 => self.assert(open[0].0, dep, clause.source).map(|()| true),
-                _ => {
-                    self.order_disjuncts(pend.clause, &mut open);
-                    let (alternatives, heads) = open.into_iter().unzip();
-                    self.branch_on_clause(alternatives, dep, pend.clause, heads)
-                        .map(|()| true)
-                }
-            };
         }
-        Ok(false)
+        best.map(|(_, at)| at)
     }
 
     /// The order to try a clause's open disjuncts in: those that failed less often first,
@@ -296,9 +345,29 @@ impl Engine<'_> {
         Ok(())
     }
 
+    /// Raises the activity of the clauses whose choices `dep` holds.
+    fn bump(&mut self, dep: DepSetId) {
+        for level in self.deps.points(dep) {
+            let Some(frame) = self.frames.get(level as usize - 1) else {
+                continue;
+            };
+            if frame.clause == NONE {
+                continue;
+            }
+            let c = frame.clause as usize;
+            if self.activity.len() <= c {
+                self.activity.resize(c + 1, 0);
+            }
+            self.activity[c] = self.activity[c].saturating_add(1);
+        }
+    }
+
     /// Backtracks from a clash with `dep`; `false` if no branch point is left to try.
     fn backtrack(&mut self, mut dep: DepSetId) -> Result<bool, String> {
         let started = Instant::now();
+        if self.config.conflict_order {
+            self.bump(dep);
+        }
         let out = loop {
             let top = self.frames.len() as u32;
             if top == 0 {
