@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use nrese_dl::tableau::{Answer, Config, Model, consistency};
 use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
 use nrese_owl::{Concept, Ontology, Term};
-use semantics::{Interp, close, find_model, model_of};
+use semantics::{Interp, confirms, find_model};
 
 fn env(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
@@ -216,10 +216,7 @@ fn check_case(
         match &out.answer {
             Answer::Consistent => {
                 let model = out.model.as_ref().and_then(interp);
-                let ok = model.is_some_and(|mut i| {
-                    close(o, &mut i);
-                    model_of(o, &i)
-                });
+                let ok = model.is_some_and(|i| confirms(o, i));
                 if *name == "default" {
                     tally.consistent += 1;
                 }
@@ -323,6 +320,22 @@ fn check_case(
 fn answers_agree_with_the_semantics() {
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
     let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x0020_2610_0333);
+    let tally = campaign(seed, cases, env("NRESE_FUZZ_ONLY"));
+    assert!(tally.inconsistent > 0 && tally.consistent > 0, "{tally:?}");
+}
+
+/// Guard (the oracle): seed 94543, case 143 is consistent (a 3-cycle along a property
+/// disjoint with its inverse), and its folded model closes a loop on the blocker; untied
+/// into three copies it is a model (`semantics::untie_loops`). It failed the push gate's
+/// new seeds as "consistent, but no model", a confirmation the oracle couldn't make.
+#[test]
+fn a_loop_folded_onto_its_blocker_is_untied() {
+    let tally = campaign(94543, 144, Some(143));
+    assert_eq!(tally.consistent, 1, "{tally:?}");
+}
+
+/// The random cases of `seed` (`only`: that one alone), each checked against the semantics.
+fn campaign(seed: u64, cases: u64, only: Option<u64>) -> Tally {
     let mut rng = Rng::new(seed);
     let mut check = Rng::new(seed ^ 0xA5A5);
     let mut tally = Tally::default();
@@ -355,14 +368,14 @@ fn answers_agree_with_the_semantics() {
         };
         let o = fuzz::ontology(&mut rng, &sig, profile);
         let shuffled = fuzz::shuffle(&o, &mut rng);
-        if env("NRESE_FUZZ_ONLY").is_some_and(|only| only != case) {
+        if only.is_some_and(|only| only != case) {
             continue;
         }
-        if env("NRESE_FUZZ_ONLY").is_some() {
+        if only.is_some() {
             eprintln!("{}", render(&o));
             if env("NRESE_FUZZ_SHRINK").is_some() {
                 shrink(&o);
-                return;
+                return tally;
             }
         }
         check_case(
@@ -380,7 +393,7 @@ fn answers_agree_with_the_semantics() {
     for u in unconfirmed.iter().take(5) {
         eprintln!("unconfirmed {u}");
     }
-    assert!(tally.inconsistent > 0 && tally.consistent > 0, "{tally:?}");
+    tally
 }
 
 /// The NI rule's pattern (`ni_gen`): a nominal, a role into it, an at-most restriction on

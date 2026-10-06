@@ -61,8 +61,7 @@ fn witness(
                     for &(t, e) in &m.individuals {
                         i.individuals.insert(t, e as u32);
                     }
-                    semantics::close(o, &mut i);
-                    semantics::model_of(o, &i)
+                    semantics::confirms(o, i)
                 });
             eprintln!(
                 "witness: the folded model {}",
