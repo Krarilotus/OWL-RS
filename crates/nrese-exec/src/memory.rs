@@ -26,6 +26,18 @@ pub fn peak_process_bytes() -> Option<u64> {
     imp::peak_process_bytes()
 }
 
+/// The page faults the process has taken since it started (soft and hard: a mapped file's
+/// pages count as they are first touched), where the platform keeps them.
+pub fn page_faults() -> Option<u64> {
+    imp::page_faults()
+}
+
+/// The memory resident in the process's working set now, mapped file pages included;
+/// `None` where the platform doesn't say.
+pub fn resident_bytes() -> Option<u64> {
+    imp::resident_bytes()
+}
+
 /// The memory this process may use: the container's limit if there is one (cgroup v2,
 /// then v1, on Linux), else the machine's physical memory; `None` where the platform
 /// doesn't say.
@@ -123,6 +135,14 @@ mod imp {
         counters().map(|counters| counters.PeakPagefileUsage as u64)
     }
 
+    pub fn page_faults() -> Option<u64> {
+        counters().map(|counters| u64::from(counters.PageFaultCount))
+    }
+
+    pub fn resident_bytes() -> Option<u64> {
+        counters().map(|counters| counters.WorkingSetSize as u64)
+    }
+
     pub fn available_bytes() -> Option<u64> {
         let mut status = MEMORYSTATUSEX {
             dwLength: u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?,
@@ -151,6 +171,22 @@ mod imp {
         let resident: u64 = fields.next()?.parse().ok()?;
         let shared: u64 = fields.next()?.parse().ok()?;
         Some(resident.saturating_sub(shared) * PAGE)
+    }
+
+    pub fn page_faults() -> Option<u64> {
+        // Fields 10 and 12 of /proc/self/stat (minor and major faults), counted after the
+        // command name, which may hold spaces but ends with the last ')'.
+        let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+        let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        let minor: u64 = fields.get(7)?.parse().ok()?;
+        let major: u64 = fields.get(9)?.parse().ok()?;
+        Some(minor + major)
+    }
+
+    pub fn resident_bytes() -> Option<u64> {
+        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+        let resident: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+        Some(resident * PAGE)
     }
 
     pub fn peak_process_bytes() -> Option<u64> {
@@ -189,6 +225,14 @@ mod imp {
         None
     }
 
+    pub fn page_faults() -> Option<u64> {
+        None
+    }
+
+    pub fn resident_bytes() -> Option<u64> {
+        None
+    }
+
     pub fn available_bytes() -> Option<u64> {
         None
     }
@@ -203,6 +247,13 @@ mod tests {
         let held = process_bytes().expect("the platform reports the process's memory");
         let total = available_bytes().expect("the platform reports the memory it may use");
         assert!(held > 0 && held < total, "{held} of {total}");
+        let resident = resident_bytes().expect("the platform reports the working set");
+        assert!(resident > 0 && resident < total, "{resident} of {total}");
+        // Touching fresh pages faults them in.
+        let before = page_faults().expect("the platform counts page faults");
+        let pages = vec![1u8; 64 << 20];
+        let touched: u64 = pages.iter().step_by(4096).map(|&b| u64::from(b)).sum();
+        assert!(page_faults().unwrap() > before, "{touched} pages touched");
     }
 
     #[test]
