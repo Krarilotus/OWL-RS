@@ -34,6 +34,8 @@ class Plan:
     systems: set[str] | None = None  # kit and writes: the systems it runs on
     unavailable: str | None = None  # why it can't run here at all
     note: str = ""
+    clients: list[int] = field(default_factory=list)  # the queries again from this many concurrent clients each (throughput, p99)
+    duration_s: int = 20
 
 
 def expected_counts(path: Path) -> dict[str, int] | None:
@@ -155,6 +157,59 @@ def clients(root: Path, tier: str, settings: dict) -> Plan:
                             "run scripts/smoke-researchspace.sh and scripts/smoke-dmw-export.sh by hand")
 
 
+def fast_data_name(spec: str) -> str:
+    """The file a fast-suite data spec names (benches/fast/cases.toml): `volume:FILE` is the
+    dataset volume's FILE; `KIND key=value ...` the generator's output, by its parameters."""
+    if spec.startswith("volume:"):
+        return spec[len("volume:"):]
+    kind, *params = spec.split()
+    return "-".join([kind, *[p.replace("=", "") for p in params]]) + ".nt"
+
+
+# A fast case's semantics as the suite's regime; the others have no runner in the suite.
+FAST_REGIMES = {"plain": "none", "closure": "none", "none": "none", "rdfs": "rdfs",
+                "owl-horst": "owl-horst", "owl2-rl": "owl2-rl", "owl2-ql": "owl2-ql"}
+
+
+def fast(root: Path, tier: str, settings: dict) -> Plan:
+    """A case of the fast suite (benches/fast) on its comparators. The tier is the case's
+    name, with `~SEMANTICS` for a comparator's semantics: `~closure` reads NRESE's exported
+    closure, `~plain` the case's data without reasoning, `~owl-horst` and the like the data
+    under the system's own reasoner. benches/fast/compete.py prepares the files in the
+    volume nrese-fast-data, which it passes as --data."""
+    import tomllib
+    name, _, semantics = tier.partition("~")
+    cases = {c["name"]: c for c in
+             tomllib.loads((root / "benches/fast/cases.toml").read_text(encoding="utf-8"))["case"]}
+    case = cases.get(name)
+    plan = Plan("fast", tier, note="a fast-suite case on its comparators (benches/fast/compete.py)")
+    if case is None:
+        plan.unavailable = f"no case {name} in benches/fast/cases.toml"
+        return plan
+    semantics = semantics or case["semantics"]
+    if semantics not in FAST_REGIMES:
+        plan.unavailable = f"semantics {semantics} has no runner in the suite"
+        return plan
+    plan.regimes = [FAST_REGIMES[semantics]]
+    if semantics == "closure":
+        plan.inputs = [f"/data/{name}.closure.nt"]
+    else:
+        plan.inputs = [f"/data/{fast_data_name(f)}" for f in [case["data"], *case.get("extra", [])]]
+    queries = case.get("queries", "")
+    if queries in ("lubm", "owl2bench"):
+        plan.queries = root / "benches/reasoning/queries" / queries
+    elif queries and not queries.startswith("@"):
+        plan.queries = root / "benches/fast/queries" / queries
+    if settings.get("FAST_QUERIES"):
+        # Several cases on the same data in one run: their queries merged (compete.py).
+        plan.queries = Path(settings["FAST_QUERIES"])
+    args = case.get("args", [])
+    if "--clients" in args:
+        plan.clients = [int(n) for n in args[args.index("--clients") + 1].split(",")]
+        plan.duration_s = int(float(args[args.index("--duration-s") + 1])) if "--duration-s" in args else 20
+    return plan
+
+
 # workload -> (the plan of a tier, the default tiers)
 DEFINITIONS = {
     "lubm": (lubm, ["1"]),
@@ -168,6 +223,7 @@ DEFINITIONS = {
     "geosparql": (geosparql, ["compliance"]),
     "write-scaling": (write_scaling, ["1m"]),
     "clients": (clients, ["-"]),
+    "fast": (fast, []),
 }
 
 
