@@ -14,8 +14,13 @@
 //! U1's input. A commit that changes the ontology's schema (anything but assertions over
 //! the signature U1 was compiled for) recompiles U1 and evaluates it afresh
 //! ([`is_assertion`]): its rules are the TBox's.
+//!
+//! **Data values by value** ([`Values`]): U1 reads every literal as its value's
+//! representative, so keys, `hasValue` and joins over data values match equal values
+//! written differently, as OWL 2 DL's identity of data values has it.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use nrese_dl::bounds;
@@ -156,34 +161,127 @@ fn pattern([s, p, o]: [Option<u64>; 3]) -> QuadPattern {
     }
 }
 
+/// Data values by value (OWL 2's identity of data values, [`nrese_xsd::owl::Value`]): each
+/// literal U1 meets has a representative, the first literal of its value it met, and U1
+/// reads, joins and derives representatives only. So a key, a `hasValue` and every join
+/// over data values match equal values written differently (`"07"` and `"7"` as
+/// `xsd:integer`, `"7"^^xsd:integer` and `"7.0"^^xsd:decimal`), as OWL 2 DL does: without
+/// it, U1 would miss what such an equality entails and stop being an upper bound. A
+/// literal whose value can't be read (ill-typed, beyond the value spaces) is its own.
+/// Representatives are ids the store has already: nothing is interned (replicas too).
+#[derive(Debug, Default)]
+pub(crate) struct Values {
+    /// A literal's representative, where it isn't the literal itself.
+    rep: HashMap<u64, u64>,
+    /// A representative's literals (itself first), for values written two or more ways.
+    members: HashMap<u64, Vec<u64>>,
+    by_value: HashMap<nrese_xsd::owl::Value, u64>,
+    /// Literals already read.
+    seen: HashSet<u64>,
+}
+
+impl Values {
+    /// Notes `id` if it is a literal: its value's representative from now on.
+    fn add(&mut self, view: &Snapshot, id: u64) {
+        if !is_literal(id) || !self.seen.insert(id) {
+            return;
+        }
+        let Some(value) = value_of(view, id) else {
+            return;
+        };
+        match self.by_value.entry(value) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(id);
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let rep = *e.get();
+                self.rep.insert(id, rep);
+                self.members
+                    .entry(rep)
+                    .or_insert_with(|| vec![rep])
+                    .push(id);
+            }
+        }
+    }
+
+    /// Notes the literals among the objects of `facts`.
+    fn add_objects(&mut self, view: &Snapshot, facts: &[Triple]) {
+        for t in facts {
+            self.add(view, t[2]);
+        }
+    }
+
+    /// `id`'s representative (itself for anything but a literal of a value met before).
+    pub(crate) fn of(&self, id: u64) -> u64 {
+        self.rep.get(&id).copied().unwrap_or(id)
+    }
+
+    /// `fact` with its object's representative (literals stand only as objects).
+    fn map(&self, [s, p, o]: Triple) -> Triple {
+        [s, p, self.of(o)]
+    }
+
+    /// Every term `rep` stands for: the literals with its value, or `rep` alone.
+    fn members(&self, rep: u64) -> impl Iterator<Item = u64> + '_ {
+        let all = self.members.get(&rep);
+        all.into_iter()
+            .flatten()
+            .copied()
+            .chain(all.is_none().then_some(rep))
+    }
+}
+
+/// The OWL 2 data value of the literal `id`; `None` for anything else, or a literal whose
+/// value can't be read.
+fn value_of(view: &Snapshot, id: u64) -> Option<nrese_xsd::owl::Value> {
+    let nrese_rdf::Term::Literal(literal) = view.decode(TermId::from_raw(id))? else {
+        return None;
+    };
+    let datatype = nrese_xsd::owl::Datatype::from_iri(literal.datatype().as_str())?;
+    nrese_xsd::owl::Value::parse(literal.value(), datatype, literal.language()).ok()
+}
+
 /// U1's input and its stack as the delta executor reads them: the store's materialised
 /// view after the change and the program's facts count as asserted, the stack as
-/// inferred.
+/// inferred. The view's literals are read as their representatives ([`Values`]).
 struct UpperBase<'a> {
     view: &'a Snapshot,
     facts: &'a HashSet<Triple>,
     stack: &'a Stack,
+    values: &'a Values,
 }
 
 impl UpperBase<'_> {
+    /// Whether the view has `s p o`, `o` standing for every literal of its value.
     fn in_view(&self, [s, p, o]: Triple) -> bool {
-        self.view
-            .quads_for_pattern_in(
-                ReadModel::Materialised,
-                &pattern([Some(s), Some(p), Some(o)]),
-            )
-            .next()
-            .is_some()
+        self.values.members(o).any(|o| {
+            self.view
+                .quads_for_pattern_in(
+                    ReadModel::Materialised,
+                    &pattern([Some(s), Some(p), Some(o)]),
+                )
+                .next()
+                .is_some()
+        })
     }
 }
 
 impl Base for UpperBase<'_> {
     fn scan(&self, bound: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
-        for q in self
-            .view
-            .quads_for_pattern_in(ReadModel::Materialised, &pattern(bound))
-        {
-            f([q.subject.raw(), q.predicate.raw(), q.object.raw()]);
+        let [s, p, o] = bound;
+        let objects: Vec<Option<u64>> = match o {
+            Some(o) => self.values.members(o).map(Some).collect(),
+            None => vec![None],
+        };
+        for o in objects {
+            for q in self
+                .view
+                .quads_for_pattern_in(ReadModel::Materialised, &pattern([s, p, o]))
+            {
+                f(self
+                    .values
+                    .map([q.subject.raw(), q.predicate.raw(), q.object.raw()]));
+            }
         }
         for t in self.facts {
             if bound.iter().zip(t).all(|(b, v)| b.is_none_or(|b| b == *v)) {
@@ -269,6 +367,10 @@ pub struct Upper {
     signature: HashSet<u64>,
     /// The ground program of the delta executor, for the next commit.
     ground: Option<GroundProgram>,
+    /// The literals U1 met and their values' representatives. A commit's new literals
+    /// are noted when its change is computed: a representative stays one whether the
+    /// commit happens or not.
+    values: Mutex<Values>,
     rdf_type: u64,
     same_as: u64,
     /// How long the last evaluation or maintenance took.
@@ -292,8 +394,13 @@ fn slot(s: bounds::Slot) -> ir::Term {
     }
 }
 
-/// U1's rules as the reasoner's (the atoms copied one to one).
-fn reasoner_rules(program: &bounds::Program) -> Vec<ir::Rule> {
+/// U1's rules as the reasoner's (the atoms copied one to one, each constant literal as
+/// its value's representative).
+fn reasoner_rules(program: &bounds::Program, values: &Values) -> Vec<ir::Rule> {
+    let slot = |s: bounds::Slot| match slot(s) {
+        ir::Term::Const(t) => ir::Term::Const(values.of(t)),
+        var => var,
+    };
     let atom = |a: &bounds::Atom| ir::Atom(a.0.map(slot));
     program
         .rules
@@ -349,9 +456,26 @@ impl Upper {
                     .to_owned(),
             ));
         }
-        let rules = reasoner_rules(&program);
-        let facts: HashSet<Triple> = program.facts.iter().map(|(f, _)| *f).collect();
+        // Every literal of the view and of the program, by value.
+        let mut values = Values::default();
         let mut input = view_facts(view);
+        values.add_objects(view, &input);
+        let program_facts: Vec<Triple> = program.facts.iter().map(|(f, _)| *f).collect();
+        values.add_objects(view, &program_facts);
+        for rule in &program.rules {
+            for atom in rule.body.iter().chain(&rule.head) {
+                for slot in atom.0 {
+                    if let bounds::Slot::Const(t) = slot {
+                        values.add(view, t);
+                    }
+                }
+            }
+        }
+        let rules = reasoner_rules(&program, &values);
+        let facts: HashSet<Triple> = program_facts.iter().map(|&f| values.map(f)).collect();
+        for t in &mut input {
+            *t = values.map(*t);
+        }
         input.extend(facts.iter().copied());
         input.sort_unstable();
         input.dedup();
@@ -379,6 +503,7 @@ impl Upper {
             stack,
             signature,
             ground: None,
+            values: Mutex::new(values),
             elapsed: started.elapsed(),
         })
     }
@@ -415,10 +540,12 @@ impl Upper {
         stop: Stop<'_>,
     ) -> Result<Change, GaveUp> {
         let started = Instant::now();
+        let mut values = self.values.lock().unwrap_or_else(|p| p.into_inner());
+        values.add_objects(view, inserted);
         let mut inserted: Vec<Triple> = inserted
             .iter()
-            .filter(|t| !self.facts.contains(*t))
-            .copied()
+            .map(|&t| values.map(t))
+            .filter(|t| !self.facts.contains(t))
             .collect();
         inserted.sort_unstable();
         inserted.dedup();
@@ -432,8 +559,8 @@ impl Upper {
         inserted.retain(|t| !self.stack.contains(t));
         let mut deleted: Vec<Triple> = deleted
             .iter()
-            .filter(|t| !self.facts.contains(*t))
-            .copied()
+            .map(|&t| values.map(t))
+            .filter(|t| !self.facts.contains(t))
             .collect();
         deleted.sort_unstable();
         deleted.dedup();
@@ -441,6 +568,7 @@ impl Upper {
             view,
             facts: &self.facts,
             stack: &self.stack,
+            values: &values,
         };
         deleted.retain(|t| !base.in_view(*t));
         let mut change = Change {
@@ -469,7 +597,7 @@ impl Upper {
         change.insert = update
             .insert
             .into_iter()
-            .filter(|t| !base_has(view, &self.facts, *t))
+            .filter(|t| !base.is_asserted(*t))
             .collect();
         change.elapsed = started.elapsed();
         Ok(change)
@@ -536,17 +664,6 @@ fn is_literal(t: u64) -> bool {
         TermId::from_raw(t).kind(),
         TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
     )
-}
-
-fn base_has(view: &Snapshot, facts: &HashSet<Triple>, [s, p, o]: Triple) -> bool {
-    facts.contains(&[s, p, o])
-        || view
-            .quads_for_pattern_in(
-                ReadModel::Materialised,
-                &pattern([Some(s), Some(p), Some(o)]),
-            )
-            .next()
-            .is_some()
 }
 
 #[cfg(test)]

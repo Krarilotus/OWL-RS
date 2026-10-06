@@ -320,4 +320,10 @@ fn chains_nominals_cardinalities_and_keys() {
         .count();
     assert_eq!(successors, 2);
     assert!(!e.upper.facts.iter().any(|f| f[1] == e.program.names.clash));
+    // The key is a rule of U1: covered, so U1 bounds every answer.
+    assert!(
+        e.program.incomplete.is_empty(),
+        "{:?}",
+        e.program.incomplete
+    );
 }
