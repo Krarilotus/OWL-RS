@@ -457,3 +457,22 @@ fn the_work_bound_stops_a_search_the_size_bounds_dont() {
     // Within every size bound (12 existential variables, few witnesses), but not the work.
     assert_eq!(rewritten(&axioms, &atoms, &existential), ["exceeded work"]);
 }
+
+#[test]
+fn a_data_existential_on_the_left_needs_rdfs_literal() {
+    // `∃age.xsd:integer ⊑ Adult` says nothing about a string age: no alternative.
+    let typed = "Declaration(DataProperty(:age))
+        SubClassOf(DataSomeValuesFrom(:age xsd:integer) :Adult)
+        SubClassOf(:P DataSomeValuesFrom(:age rdfs:Literal))";
+    let out = rewritten(typed, "Adult(?x)", &[]);
+    assert!(out.iter().all(|b| !b.contains("P(")), "{out:?}");
+    // Over `rdfs:Literal` it is QL: any value will do (no RL rule applies it, so having a
+    // value is an alternative of its own).
+    let literal = "Declaration(DataProperty(:age))
+        SubClassOf(DataSomeValuesFrom(:age rdfs:Literal) :Adult)
+        SubClassOf(:P DataSomeValuesFrom(:age rdfs:Literal))";
+    assert_eq!(
+        rewritten(literal, "Adult(?x)", &[]),
+        ["{Adult(?x) | P(?x) | age(?x _)}"]
+    );
+}

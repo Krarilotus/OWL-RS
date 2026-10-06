@@ -486,7 +486,11 @@ impl Builder {
             {
                 vec![(self.basic(Basic::Exists(*property)), false)]
             }
-            ClassExpr::DataSome(property, _) => {
+            // OWL 2 QL allows a data existential on the left over `rdfs:Literal` only: with
+            // another range, having some value isn't enough.
+            ClassExpr::DataSome(property, range)
+                if matches!(o.range(*range), crate::model::DataRange::Literal) =>
+            {
                 self.tbox.data.insert(*property);
                 vec![(self.basic(Basic::Exists(ObjProp::Named(*property))), false)]
             }
