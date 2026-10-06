@@ -13,10 +13,11 @@
 //! the terms take the next dense ids in the order they first occur in the input, the same
 //! at any thread count. Only ids move: the text stays in the shards' arenas, which become
 //! a segment of the dictionary ([`Adopted`]), and the quads are renumbered through the
-//! shards ([`Adopted::remap`]).
+//! shards ([`Adopted::renumber`]).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use hashbrown::HashTable;
 use parking_lot::Mutex;
@@ -66,8 +67,9 @@ pub(crate) struct Shard {
     pub(crate) ends: Vec<u32>,
     /// Each key's hash, for the table to grow by (dropped once numbered).
     hashes: Vec<u64>,
-    /// Each key's first position while loading; its final id once numbered.
-    slots: Vec<u64>,
+    /// Each key's first position while loading; its final id once numbered (atomic so
+    /// that the ranges of the numbering merge write their entries' ids in parallel).
+    slots: Vec<AtomicU64>,
     /// Indexes into the keys, by hash.
     table: HashTable<u32>,
 }
@@ -94,7 +96,7 @@ impl Shard {
     /// `key`'s entry, added if new, with `at` as its first position if it is earlier.
     fn intern(&mut self, key: &[u8], hash: u64, at: u64) -> u32 {
         if let Some(local) = self.find(hash, key) {
-            let first = &mut self.slots[local as usize];
+            let first = self.slots[local as usize].get_mut();
             *first = (*first).min(at);
             return local;
         }
@@ -103,7 +105,7 @@ impl Shard {
         let end = u32::try_from(self.bytes.len()).expect("a shard's text under 4 GiB");
         self.ends.push(end);
         self.hashes.push(hash);
-        self.slots.push(at);
+        self.slots.push(AtomicU64::new(at));
         let Shard { table, hashes, .. } = self;
         table.insert_unique(hash, local, |&i| hashes[i as usize]);
         local
@@ -163,7 +165,10 @@ impl Pending {
     /// Numbers the pending terms from `start` in the order of their first occurrence; a
     /// term `existing` finds (interned meanwhile by another path: a triple term's
     /// components) keeps that id and takes no new one. Each shard is sorted on its own
-    /// thread, then one merge hands out the ids.
+    /// thread; then the merge of the shards hands out the ids, cut into ranges of first
+    /// positions (splitters from a sample) merged in parallel, each range's ids starting
+    /// after the sizes of those before it. One sequential merge took 2 s of LUBM 1000's
+    /// load (33 M terms) while the other threads waited.
     pub(crate) fn number(
         self,
         start: u64,
@@ -182,11 +187,11 @@ impl Pending {
                 let mut order: Vec<u32> = Vec::with_capacity(shard.len());
                 for local in 0..shard.len() {
                     match existing(shard.hashes[local], shard.key(local)) {
-                        Some(id) => shard.slots[local] = id,
+                        Some(id) => *shard.slots[local].get_mut() = id,
                         None => order.push(local as u32),
                     }
                 }
-                order.sort_unstable_by_key(|&local| shard.slots[local as usize]);
+                order.sort_unstable_by_key(|&local| shard.slots[local as usize].load(Relaxed));
                 // The table finds keys without the hashes from now on, and the arrays
                 // shed what growing by doubling left over (a shard at a time, so the
                 // copies are small).
@@ -210,21 +215,70 @@ impl Pending {
             })
             .collect();
         let total: usize = orders.iter().map(Vec::len).sum();
-        let mut locals: Vec<u64> = Vec::with_capacity(total);
-        let mut heads: BinaryHeap<Reverse<(u64, usize, usize)>> = orders
+        let first = |s: usize, local: u32| shards[s].slots[local as usize].load(Relaxed);
+        // Ranges of first positions, a few per thread, from a sample of each shard.
+        let ranges = (rayon::current_num_threads() * 4).min(total / 4096 + 1);
+        let mut sample: Vec<u64> = orders
             .iter()
             .enumerate()
-            .filter(|(_, order)| !order.is_empty())
-            .map(|(s, order)| Reverse((shards[s].slots[order[0] as usize], s, 0)))
+            .flat_map(|(s, order)| {
+                let step = (order.len() / ranges).max(1);
+                order
+                    .iter()
+                    .step_by(step)
+                    .map(move |&local| first(s, local))
+            })
             .collect();
-        while let Some(Reverse((_, s, i))) = heads.pop() {
-            let local = orders[s][i] as usize;
-            shards[s].slots[local] = start + locals.len() as u64;
-            locals.push(((s as u64) << 32) | local as u64);
-            if let Some(&next) = orders[s].get(i + 1) {
-                heads.push(Reverse((shards[s].slots[next as usize], s, i + 1)));
-            }
+        sample.sort_unstable();
+        let splitters: Vec<u64> = (1..ranges)
+            .map(|r| sample[r * sample.len() / ranges])
+            .collect();
+        // Per shard, where each range begins in its order.
+        let bounds: Vec<Vec<usize>> = orders
+            .par_iter()
+            .enumerate()
+            .map(|(s, order)| {
+                let mut bounds = Vec::with_capacity(ranges + 1);
+                bounds.push(0);
+                for &splitter in &splitters {
+                    bounds.push(order.partition_point(|&local| first(s, local) < splitter));
+                }
+                bounds.push(order.len());
+                bounds
+            })
+            .collect();
+        let mut locals = vec![0u64; total];
+        let mut parts: Vec<(usize, &mut [u64])> = Vec::with_capacity(ranges);
+        let (mut rest, mut offset) = (&mut locals[..], 0);
+        for r in 0..ranges {
+            let size: usize = bounds.iter().map(|b| b[r + 1] - b[r]).sum();
+            let (part, tail) = std::mem::take(&mut rest).split_at_mut(size);
+            parts.push((offset, part));
+            rest = tail;
+            offset += size;
         }
+        parts
+            .into_par_iter()
+            .enumerate()
+            .for_each(|(r, (offset, out))| {
+                let mut heads: BinaryHeap<Reverse<(u64, usize, usize)>> = (0..orders.len())
+                    .filter(|&s| bounds[s][r] < bounds[s][r + 1])
+                    .map(|s| {
+                        let i = bounds[s][r];
+                        Reverse((first(s, orders[s][i]), s, i))
+                    })
+                    .collect();
+                let mut n = 0;
+                while let Some(Reverse((_, s, i))) = heads.pop() {
+                    let local = orders[s][i];
+                    shards[s].slots[local as usize].store(start + (offset + n) as u64, Relaxed);
+                    out[n] = ((s as u64) << 32) | u64::from(local);
+                    n += 1;
+                    if i + 1 < bounds[s][r + 1] {
+                        heads.push(Reverse((first(s, orders[s][i + 1]), s, i + 1)));
+                    }
+                }
+            });
         Adopted {
             start,
             shards,
@@ -243,6 +297,15 @@ pub(crate) struct Adopted {
 }
 
 impl Adopted {
+    /// No terms (a load that interned none).
+    pub(crate) fn empty(start: u64) -> Self {
+        Self {
+            start,
+            shards: Vec::new(),
+            locals: Vec::new(),
+        }
+    }
+
     /// Entries in the segment (not counting keys that turned out to exist already).
     pub(crate) fn len(&self) -> u64 {
         self.locals.len() as u64
@@ -259,15 +322,34 @@ impl Adopted {
         let shard = &self.shards[shard_of(hash)];
         shard
             .find(hash, key)
-            .map(|local| shard.slots[local as usize])
+            .map(|local| shard.slots[local as usize].load(Relaxed))
     }
 
-    /// The final payload of a provisional one; any other payload as it is.
-    pub(crate) fn remap(&self, payload: u64) -> u64 {
-        match split(payload) {
-            Some((shard, local)) => self.shards[shard].slots[local as usize],
-            None => payload,
+    /// The final id of a provisional one; any other id as it is (an inline value's payload
+    /// may have the provisional bit: only dictionary kinds are provisional).
+    pub(crate) fn id(&self, id: super::TermId) -> super::TermId {
+        if !id.kind().is_dictionary() {
+            return id;
         }
+        match split(id.payload()) {
+            Some((shard, local)) => super::TermId::new(
+                id.kind(),
+                self.shards[shard].slots[local as usize].load(Relaxed),
+            ),
+            None => id,
+        }
+    }
+
+    /// `quads` with their provisional ids replaced by their final ones, in parallel.
+    pub(crate) fn renumber(&self, quads: &mut [crate::quad::EncodedQuad]) {
+        quads.par_iter_mut().for_each(|quad| {
+            *quad = crate::quad::EncodedQuad::new(
+                self.id(quad.subject),
+                self.id(quad.predicate),
+                self.id(quad.object),
+                self.id(quad.graph),
+            );
+        });
     }
 
     /// Bytes of keys, and of what finds them (offsets, ids, tables).
@@ -284,9 +366,9 @@ impl Adopted {
         (keys, index)
     }
 
-    /// The ids of each shard's entries, for scans of a shard's arena.
-    pub(crate) fn ids(&self, shard: usize) -> &[u64] {
-        &self.shards[shard].slots
+    /// The id of entry `local` of shard `shard`, for scans of a shard's arena.
+    pub(crate) fn id_of(&self, shard: usize, local: usize) -> u64 {
+        self.shards[shard].slots[local].load(Relaxed)
     }
 }
 
@@ -298,11 +380,12 @@ mod tests {
         super::super::hash::key_hash(key)
     }
 
-    /// Ids follow first occurrences, whichever order the batches came in.
+    /// Ids follow first occurrences, whichever order the batches came in (enough terms
+    /// that the numbering merge cuts them into several ranges).
     #[test]
     fn ids_follow_first_occurrence_whatever_the_arrival() {
-        let words: Vec<Vec<u8>> = (0..5000)
-            .map(|i| format!("Iterm{}", i % 1700).into_bytes())
+        let words: Vec<Vec<u8>> = (0..50_000)
+            .map(|i| format!("Iterm{}", i % 17_000).into_bytes())
             .collect();
         let numbered = |order: &[usize]| {
             let pending = Pending::default();
@@ -327,15 +410,19 @@ mod tests {
             }
             let adopted = pending.number(10, |_, _| None);
             (0..adopted.len())
-                .map(|i| adopted.key(i).to_vec())
+                .map(|i| {
+                    let key = adopted.key(i);
+                    assert_eq!(adopted.find(hash(key), key), Some(10 + i));
+                    key.to_vec()
+                })
                 .collect::<Vec<_>>()
         };
-        let forward: Vec<usize> = (0..50).collect();
-        let backward: Vec<usize> = (0..50).rev().collect();
+        let forward: Vec<usize> = (0..500).collect();
+        let backward: Vec<usize> = (0..500).rev().collect();
         let a = numbered(&forward);
         assert_eq!(a, numbered(&backward));
-        // First occurrences in input order: term0, term1, ... term1699.
-        let expected: Vec<Vec<u8>> = (0..1700)
+        // First occurrences in input order: term0, term1, ... term16999.
+        let expected: Vec<Vec<u8>> = (0..17_000)
             .map(|i| format!("Iterm{i}").into_bytes())
             .collect();
         assert_eq!(a, expected);
