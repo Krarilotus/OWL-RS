@@ -1,0 +1,25 @@
+# Test cases whose profile annotations the per-axiom checker doesn't reproduce, with why.
+# Format: <test identifier><TAB><reason>. The checker follows the Recommendation's text
+# (OWL 2 Profiles, second edition: the grammars of §2.2, §3.2, §4.2 and §6), checked
+# against it on 6 October 2026; each entry is an annotation that contradicts it, or a
+# case whose annotation covers what this runner doesn't read.
+FS2RDF-propertychain-2-ar	annotated QL; QL's SubObjectPropertyOf has no property chain (§3.2.4, §6.2)
+FS2RDF-propertychain-2-annotated-ar	annotated QL; QL's SubObjectPropertyOf has no property chain (§3.2.4, §6.2)
+FS2RDF-same-individual-2-annotation-ar	annotated QL and not EL; QL's Assertion has no SameIndividual, EL's has (§6.1, §6.2)
+FS2RDF-same-individual-3-annotation-ar	annotated QL and not EL; QL's Assertion has no SameIndividual, EL's has (§6.1, §6.2)
+WebOnt-I4.6-003	annotated RL only; SameIndividual and EquivalentClasses of named classes are EL (§6.1)
+WebOnt-I4.6-004	annotated RL only; SameIndividual and EquivalentClasses of named classes are EL (§6.1)
+FS2RDF-negative-property-assertion-ar	annotated in no profile; NegativeObjectPropertyAssertion is in EL's and RL's Assertion (§6.1, §6.3)
+Footnote-not-about-self	annotated in no profile; ObjectHasSelf and DisjointClasses are EL (§2.2.3)
+New-Feature-ReflexiveProperty-001	annotated RL; RL's ObjectPropertyAxiom has no ReflexiveObjectProperty (§4.2.5, §6.3)
+WebOnt-I5.26-001	annotated EL and QL with an anonymous individual; "OWL 2 EL/QL does not support anonymous individuals" (§6.1, §6.2)
+WebOnt-I5.26-002	annotated EL and QL with an anonymous individual (§6.1, §6.2)
+WebOnt-Nothing-001	annotated EL and QL with an anonymous individual (§6.1, §6.2)
+WebOnt-description-logic-104	annotated QL with an anonymous individual (§6.2)
+WebOnt-someValuesFrom-003	annotated EL with an anonymous individual (§6.1)
+bnode2somevaluesfrom	annotated EL with an anonymous individual (§6.1)
+somevaluesfrom2bnode	annotated EL with an anonymous individual (§6.1)
+WebOnt-imports-005	imports another ontology: the annotation covers it, the runner reads the premise alone
+WebOnt-imports-006	imports another ontology: the annotation covers it, the runner reads the premise alone
+WebOnt-imports-008	imports another ontology: the annotation covers it, the runner reads the premise alone
+WebOnt-miscellaneous-011	imports two ontologies: the annotation covers them, the runner reads the premise alone

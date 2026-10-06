@@ -17,6 +17,7 @@ pub mod mapping;
 pub mod model;
 pub mod normalise;
 pub mod ofn;
+pub mod profile;
 pub mod proof;
 mod properties;
 pub mod ql;
@@ -38,6 +39,7 @@ pub use normalise::{
     Options, UNSUPPORTED_DATATYPE_DEFINITIONS, UNSUPPORTED_KEYS, normalise, normalise_with,
 };
 pub use ofn::{Document, FunctionalReader, Intern, read_functional};
+pub use profile::Profiles;
 pub use proof::{Inference, Justifications, Proof, ProofError, ProofGraph};
 pub use vocab::Vocabulary;
 pub use write::{Make, write};
