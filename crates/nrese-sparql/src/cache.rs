@@ -30,6 +30,13 @@
 //! result instead of computing it again (QLever's `computeOnce`); a waiter gets the result
 //! even if it isn't admitted, and computes it itself if the other query fails.
 //!
+//! **Serialised answers.** A query's whole answer is also kept as the bytes of each
+//! output format it was asked in ([`ResultCache::output`], [`CachedOutput`]), beside its
+//! id columns, so a repeated query with a large answer is copied instead of serialised
+//! again. They share the budget and the ranking; their cost is the time the request took
+//! (what the cache didn't answer of the evaluation, and the serialisation), so they are
+//! kept where writing the answer costs much more than copying it.
+//!
 //! **Pinned.** A named query's result can be pinned ([`ResultCache::pins`]): it is never
 //! evicted while its revision is current, and counts against the budget. After a commit it
 //! is pinned again the next time it is computed.
@@ -45,12 +52,14 @@ use nrese_exec::IdTable;
 use nrese_rdf::Term;
 
 /// A part computed faster than this isn't kept: a hit would save less than looking it
-/// up costs.
+/// up costs. An answer's bytes have no such floor (a hit replaces the whole request).
 pub const MIN_COST: Duration = Duration::from_micros(20);
 
-/// Bytes a hit copies per microsecond (at about 4 GB/s, half of it): a part must have
-/// taken longer to compute than its copy takes, twice over.
-pub const COPY_BYTES_PER_MICRO: u64 = 2_000;
+/// Bytes a hit copies per microsecond: a part must have taken longer to compute than its
+/// copy takes, twice over. 10 GB/s, a fifth of what the main PC measured copying a cached
+/// answer of 63.5 MB (1.2 ms, 6 October 2026); 2 GB/s before, which refused serialised
+/// answers costing three times their copy.
+pub const COPY_BYTES_PER_MICRO: u64 = 10_000;
 
 /// Bookkeeping per entry beside its columns and key: the part's allocation, the map's
 /// slot (with its free share), the ranking's node, the counters. Checked against the
@@ -105,8 +114,26 @@ fn term_heap(term: &Term) -> usize {
     }
 }
 
+/// What an entry holds.
+#[derive(Debug, Clone)]
+pub(crate) enum Payload {
+    /// A part's result as id columns.
+    Part(Arc<Part>),
+    /// A whole query's answer in one output format.
+    Output(Arc<[u8]>),
+}
+
+impl Payload {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Part(part) => part.bytes(),
+            Self::Output(bytes) => bytes.len(),
+        }
+    }
+}
+
 struct Entry {
-    part: Arc<Part>,
+    payload: Payload,
     bytes: usize,
     cost: u64,
     hits: u64,
@@ -291,6 +318,8 @@ pub struct ResultCacheStats {
     pub bytes: usize,
     /// Bytes of pinned entries.
     pub pinned_bytes: usize,
+    /// Entries holding a whole answer's serialised bytes (the others hold id columns).
+    pub answers: usize,
     pub capacity: usize,
 }
 
@@ -314,6 +343,42 @@ impl std::fmt::Debug for ResultCache {
         f.debug_struct("ResultCache")
             .field("stats", &self.stats())
             .finish()
+    }
+}
+
+/// A query's whole answer in one output format, as the result cache holds it
+/// ([`crate::query::cached_output`]).
+pub enum CachedOutput {
+    /// The answer's bytes, as written before.
+    Hit(Arc<[u8]>),
+    /// Not cached: write the answer, then offer its bytes to the slot.
+    Miss(OutputSlot),
+    /// Not cached and not to be (no cache, a transaction's pending state, a volatile
+    /// query, a pin).
+    Off,
+}
+
+/// Where a written answer is offered to the result cache ([`CachedOutput::Miss`]).
+pub struct OutputSlot {
+    cache: Arc<ResultCache>,
+    key: Key,
+}
+
+impl OutputSlot {
+    /// The largest answer the cache could keep: a copy of more isn't worth making.
+    pub fn limit(&self) -> usize {
+        self.cache.capacity / 4
+    }
+
+    /// Offers the answer's `bytes`, which took `cost` to evaluate and write: kept if that
+    /// is worth their bytes (module docs).
+    pub fn offer(self, bytes: Vec<u8>, cost: Duration) {
+        // Not a part computed: no miss (the query's parts counted theirs). No floor: a hit
+        // replaces the whole request, whose parsing and key it pays as well.
+        let len = bytes.len();
+        self.cache.admit(&self.key, len, cost, Duration::ZERO, || {
+            Some(Payload::Output(bytes.into()))
+        });
     }
 }
 
@@ -344,7 +409,7 @@ impl Computing<'_> {
     pub(crate) fn wants(&self, bytes: usize, cost: Duration) -> bool {
         self.flight.waiters.load(Ordering::Acquire) > 0
             || self.cache.state().pinned(&self.key.part)
-            || self.cache.worth(bytes, cost)
+            || self.cache.worth(bytes, cost, MIN_COST)
     }
 
     /// Hands `part` (if it was computed and wanted) to the waiters and offers it to the
@@ -354,7 +419,9 @@ impl Computing<'_> {
         self.finished = true;
         let part = part.map(Arc::new);
         let stored = match &part {
-            Some(part) => self.cache.store(&self.key, Arc::clone(part), cost),
+            Some(part) => self
+                .cache
+                .store(&self.key, Payload::Part(Arc::clone(part)), cost),
             None => Ok(()),
         };
         self.cache.land(&self.key, &self.flight, part);
@@ -403,15 +470,15 @@ impl ResultCache {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether a part is worth keeping: it took longer than [`MIN_COST`] and than copying
-    /// it twice, and takes at most a quarter of the budget.
-    fn worth(&self, bytes: usize, cost: Duration) -> bool {
+    /// Whether an entry is worth keeping: it took longer than `floor` and than copying it
+    /// twice, and takes at most a quarter of the budget.
+    fn worth(&self, bytes: usize, cost: Duration, floor: Duration) -> bool {
         let micros = cost.as_micros() as u64;
         if self.admit_all {
             return bytes <= self.capacity / 4;
         }
         bytes <= self.capacity / 4
-            && cost >= MIN_COST
+            && cost >= floor
             && micros.saturating_mul(COPY_BYTES_PER_MICRO) >= 2 * bytes as u64
     }
 
@@ -435,7 +502,7 @@ impl ResultCache {
                 state.rerank(&key);
             }
         }
-        if let Some(part) = self.hit(&mut state, key) {
+        if let Some(Payload::Part(part)) = self.hit(&mut state, key) {
             return Claim::Hit(part);
         }
         let me = std::thread::current().id();
@@ -467,16 +534,31 @@ impl ResultCache {
 
     /// The part under `key`, if it is cached (for a request that won't store one).
     pub(crate) fn lookup(&self, key: &Key) -> Option<Arc<Part>> {
-        self.hit(&mut self.state(), key)
+        match self.hit(&mut self.state(), key)? {
+            Payload::Part(part) => Some(part),
+            Payload::Output(_) => None,
+        }
     }
 
-    fn hit(&self, state: &mut State, key: &Key) -> Option<Arc<Part>> {
+    fn hit(&self, state: &mut State, key: &Key) -> Option<Payload> {
         let entry = state.entries.get_mut(key)?;
         entry.hits += 1;
-        let part = Arc::clone(&entry.part);
+        let payload = entry.payload.clone();
         state.rerank(key);
         self.hits.fetch_add(1, Ordering::Relaxed);
-        Some(part)
+        Some(payload)
+    }
+
+    /// A query's whole answer in the format `key` names: the bytes if cached, else a slot
+    /// to offer them to once written ([`crate::query::cached_output`]).
+    pub(crate) fn output(self: &Arc<Self>, key: Key) -> CachedOutput {
+        match self.hit(&mut self.state(), &key) {
+            Some(Payload::Output(bytes)) => CachedOutput::Hit(bytes),
+            _ => CachedOutput::Miss(OutputSlot {
+                cache: Arc::clone(self),
+                key,
+            }),
+        }
     }
 
     /// Offers a part computed without a claim (a prefix of a basic graph pattern's joins,
@@ -487,16 +569,29 @@ impl ResultCache {
         key: &Key,
         bytes: usize,
         cost: Duration,
-        part: impl FnOnce() -> Option<Part>,
+        payload: impl FnOnce() -> Option<Payload>,
     ) {
         self.misses.fetch_add(1, Ordering::Relaxed);
-        if !self.worth(bytes, cost) {
+        self.admit(key, bytes, cost, MIN_COST, payload);
+    }
+
+    /// Stores what `payload` makes if one of `bytes` that took `cost` (at least `floor`)
+    /// is worth keeping.
+    fn admit(
+        &self,
+        key: &Key,
+        bytes: usize,
+        cost: Duration,
+        floor: Duration,
+        payload: impl FnOnce() -> Option<Payload>,
+    ) {
+        if !self.worth(bytes, cost, floor) {
             self.rejected.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        if let Some(part) = part() {
-            // Not pinned (pins are whole queries): never an error.
-            let _ = self.store(key, Arc::new(part), cost);
+        if let Some(payload) = payload() {
+            // Not pinned (pins are whole queries' id columns): never an error.
+            let _ = self.store(key, payload, cost);
         }
     }
 
@@ -519,11 +614,15 @@ impl ResultCache {
     }
 
     /// Admits `part` if it is worth its bytes (module docs), or pins it.
-    fn store(&self, key: &Key, part: Arc<Part>, cost: Duration) -> Result<(), String> {
-        let bytes = part.bytes() + key.part.len() + ENTRY_OVERHEAD;
+    fn store(&self, key: &Key, payload: Payload, cost: Duration) -> Result<(), String> {
+        let bytes = payload.bytes() + key.part.len() + ENTRY_OVERHEAD;
         let cost = cost.as_micros() as u64;
         let mut state = self.state();
         let pinned = state.pinned(&key.part);
+        let floor = match payload {
+            Payload::Part(_) => MIN_COST,
+            Payload::Output(_) => Duration::ZERO,
+        };
         state.advance(key.snapshot.revision);
         let reject = |state: &mut State, reason: Option<String>| {
             self.rejected.fetch_add(1, Ordering::Relaxed);
@@ -540,7 +639,7 @@ impl ResultCache {
         }
         let victims = match pinned {
             true => state.victims(bytes, self.capacity, None),
-            false if !self.worth(bytes, Duration::from_micros(cost)) => None,
+            false if !self.worth(bytes, Duration::from_micros(cost), floor) => None,
             false if self.admit_all => state.victims(bytes, self.capacity, None),
             false => {
                 let rank = state.clock + cost as f64 / bytes.max(1) as f64;
@@ -569,7 +668,7 @@ impl ResultCache {
         state.entries.insert(
             key.clone(),
             Entry {
-                part,
+                payload,
                 bytes,
                 cost,
                 hits: 0,
@@ -589,6 +688,11 @@ impl ResultCache {
             .filter(|entry| entry.rank.is_none())
             .map(|entry| entry.bytes)
             .sum();
+        let answers = state
+            .entries
+            .values()
+            .filter(|entry| matches!(entry.payload, Payload::Output(_)))
+            .count();
         ResultCacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
@@ -599,6 +703,7 @@ impl ResultCache {
             entries: state.entries.len(),
             bytes: state.bytes,
             pinned_bytes,
+            answers,
             capacity: self.capacity,
         }
     }
@@ -619,7 +724,10 @@ impl ResultCache {
                     name: name.clone(),
                     query: pin.query.clone(),
                     revision: held.map(|(key, _)| key.snapshot.revision),
-                    rows: held.map_or(0, |(_, entry)| entry.part.table.len()),
+                    rows: held.map_or(0, |(_, entry)| match &entry.payload {
+                        Payload::Part(part) => part.table.len(),
+                        Payload::Output(_) => 0,
+                    }),
                     bytes: held.map_or(0, |(_, entry)| entry.bytes),
                 }
             })
@@ -819,6 +927,45 @@ mod tests {
         drop(computing);
         assert!(flight.wait(|| false).unwrap().is_none());
         assert!(matches!(cache.claim(&key, None), Claim::Compute(_)));
+    }
+
+    #[test]
+    fn an_answers_bytes_are_kept_where_writing_costs_more_than_copying() {
+        let one = identity(1);
+        let cache = Arc::new(ResultCache::new(1 << 20));
+        // A part this cheap isn't kept: looking it up costs about as much.
+        assert!(!compute(
+            &cache,
+            &key(one, "part"),
+            10,
+            Duration::from_micros(5)
+        ));
+        assert!(!compute(
+            &cache,
+            &key(one, "part"),
+            10,
+            Duration::from_micros(5)
+        ));
+        // An answer's bytes replace the whole request: kept however cheap.
+        let CachedOutput::Miss(slot) = cache.output(key(one, "answer")) else {
+            panic!("nothing cached")
+        };
+        slot.offer(vec![b'x'; 100], Duration::from_micros(5));
+        assert!(matches!(
+            cache.output(key(one, "answer")),
+            CachedOutput::Hit(bytes) if bytes.len() == 100
+        ));
+        // Unless copying them costs as much as writing them did.
+        let CachedOutput::Miss(slot) = cache.output(key(one, "large")) else {
+            panic!("nothing cached")
+        };
+        slot.offer(vec![b'x'; 100_000], Duration::from_micros(5));
+        assert!(matches!(
+            cache.output(key(one, "large")),
+            CachedOutput::Miss(_)
+        ));
+        let stats = cache.stats();
+        assert_eq!((stats.answers, stats.entries), (1, 1));
     }
 
     #[test]

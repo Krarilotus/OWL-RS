@@ -307,6 +307,61 @@ impl Context<'_> {
     }
 }
 
+/// The key of `query`'s whole answer written in `format` (the media type with its
+/// parameters) on `snapshot`: its context, the format, the query form with a CONSTRUCT's
+/// template, and its pattern as parsed (the answer is the query's, however it is planned).
+/// `None` if the query isn't cached (no cache, a volatile query, pre-bound variables).
+pub(crate) fn output_key(
+    snapshot: &nrese_engine::Snapshot,
+    query: &nrese_sparql_syntax::Query,
+    options: &crate::QueryOptions,
+    format: &str,
+) -> Option<Key> {
+    use nrese_sparql_syntax::Query;
+    if options.pre_bound.is_some() {
+        return None;
+    }
+    let ctx = Context::new(
+        snapshot,
+        options,
+        super::query_dataset(query),
+        super::query_base(query),
+    );
+    let scope = ctx.cache.as_ref()?;
+    let mut encoder = ctx.key_start(scope);
+    encoder.tag(b'S');
+    encoder.text(format);
+    let pattern = match query {
+        Query::Select { pattern, .. } => {
+            encoder.tag(b's');
+            pattern
+        }
+        Query::Ask { pattern, .. } => {
+            encoder.tag(b'a');
+            pattern
+        }
+        Query::Describe { pattern, .. } => {
+            encoder.tag(b'd');
+            pattern
+        }
+        Query::Construct {
+            template, pattern, ..
+        } => {
+            encoder.tag(b'c');
+            encoder.number(template.len() as u64);
+            for triple in template {
+                encoder.triple(triple).ok()?;
+            }
+            pattern
+        }
+    };
+    encoder.pattern(pattern).ok()?;
+    Some(Key {
+        snapshot: scope.snapshot,
+        part: encoder.bytes.into(),
+    })
+}
+
 /// A basic graph pattern as [`Context::bgp`] joins it: its triples, their scans and range
 /// hints, the join order, and the filter conjuncts it was given. A prefix of the order is
 /// a part too (QLever caches every join of its plan): its rows are the prefix's triples
@@ -444,7 +499,8 @@ impl Context<'_> {
         scope
             .cache
             .offer(&key, solutions.table.memory_bytes(), cost, || {
-                self.to_part(solutions, &vars)
+                let part = self.to_part(solutions, &vars)?;
+                Some(crate::cache::Payload::Part(Arc::new(part)))
             });
     }
 }

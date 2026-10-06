@@ -42,7 +42,7 @@ impl Encoder {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn text(&mut self, text: &str) {
+    pub(super) fn text(&mut self, text: &str) {
         self.number(text.len() as u64);
         self.bytes.extend_from_slice(text.as_bytes());
     }

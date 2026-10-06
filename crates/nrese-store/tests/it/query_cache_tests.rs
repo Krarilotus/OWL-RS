@@ -217,3 +217,38 @@ fn configured_queries_are_pinned_at_startup() {
     });
     assert!(missing.is_err());
 }
+
+/// A repeated query is answered from the bytes written the first time, per format: no
+/// part evaluated, nothing serialised again (repeats as fast as the whole-query cache
+/// this cache replaced, docs/design/performance.md §0).
+#[test]
+fn repeats_are_answered_from_their_written_bytes() {
+    let store = store(1 << 20, 4_000);
+    let first = answer(&store, &per_city());
+    let stats = store.query_cache_stats();
+    assert_eq!(stats.answers, 1, "{stats:?}");
+    assert_eq!(answer(&store, &per_city()), first);
+    let again = store.query_cache_stats();
+    assert_eq!(
+        (again.hits, again.misses, again.answers),
+        (stats.hits + 1, stats.misses, 1),
+        "{again:?}"
+    );
+    // Another format: written from the id columns, then kept as well.
+    let xml = |store: &StoreService| {
+        let request = SparqlQueryRequest {
+            solutions_format: nrese_store::SolutionsResultFormat::Xml,
+            ..SparqlQueryRequest::all(per_city())
+        };
+        String::from_utf8(store.execute_query(&request).unwrap().payload).unwrap()
+    };
+    let written = xml(&store);
+    assert!(written.starts_with("<?xml"), "{written}");
+    assert_eq!(store.query_cache_stats().answers, 2);
+    assert_eq!(xml(&store), written);
+    // A commit: written anew.
+    store
+        .execute_update_str(&format!("INSERT DATA {{ <{EX}x> <{EX}knows> <{EX}p0> }}"))
+        .unwrap();
+    assert_ne!(answer(&store, &per_city()), first);
+}

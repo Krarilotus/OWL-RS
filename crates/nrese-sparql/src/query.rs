@@ -102,6 +102,28 @@ fn for_view<'o>(view: &impl ReadView, options: &'o QueryOptions) -> Cow<'o, Quer
     }
 }
 
+/// What the result cache holds of `query`'s whole answer on `view` written in `format`
+/// (the media type with its parameters, as sent): its bytes, or a slot to offer them to
+/// once written, or nothing to do with the cache ([`crate::cache`]). A transaction's
+/// pending state, a pin and pre-bound variables are never answered from it.
+pub fn cached_output<V: ReadView>(
+    view: &V,
+    query: &Query,
+    options: &QueryOptions,
+    format: &str,
+) -> crate::cache::CachedOutput {
+    use crate::cache::CachedOutput;
+    let (Some(cache), Some(snapshot), None) =
+        (&options.result_cache, view.snapshot(), &options.pin)
+    else {
+        return CachedOutput::Off;
+    };
+    match crate::native::output_key(snapshot, query, options, format) {
+        Some(key) => cache.output(key),
+        None => CachedOutput::Off,
+    }
+}
+
 /// A failure while writing results directly ([`write_results`]).
 #[derive(Debug, thiserror::Error)]
 pub enum WriteResultsError {
