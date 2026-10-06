@@ -35,8 +35,10 @@ pub mod rules;
 pub mod state;
 pub mod unsupported;
 
-pub use classify::{Classification, Options, Saturated, classify, saturate, signature};
+pub use classify::{
+    Classification, Options, Saturated, classify, saturate, saturate_normalised, signature,
+};
 pub use compile::Unsupported;
-pub use engine::Strategy;
+pub use engine::{Budget, Strategy};
 pub use profile::Profile;
 pub use state::ClauseRef;

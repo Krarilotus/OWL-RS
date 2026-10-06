@@ -38,7 +38,7 @@ pub struct NiPending {
 }
 
 /// The NI rule's state.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Ni {
     pub pending: Vec<NiPending>,
     /// The pending equalities before this one are settled.
