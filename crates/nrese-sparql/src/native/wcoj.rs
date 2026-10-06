@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nrese_engine::quad::Permutation;
-use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
+use nrese_engine::{GraphSelector, ProbeCursor, QuadPattern, ReadModel, Seek, Snapshot, TermId};
 use rayon::prelude::*;
 
 /// A pattern position: a constant id, or a variable (index into the query's variables).
@@ -57,7 +57,7 @@ const CHUNKS_PER_THREAD: usize = 4;
 const ROW_STEP: usize = 4096;
 
 /// Candidates of the first variable a sampled estimate joins ([`Query::estimate`]).
-const SAMPLES: usize = 32;
+const SAMPLES: usize = 128;
 
 /// Lookups after which a sampled estimate scales what it has.
 const SAMPLE_LOOKUPS: usize = 100_000;
@@ -79,8 +79,13 @@ pub(super) struct Stats {
     pub order: Vec<usize>,
     /// Candidate values produced, per depth.
     pub candidates: Vec<AtomicUsize>,
-    /// Index lookups (counts) made to check candidates.
+    /// Checks of candidates (leapfrog seeks).
     pub lookups: AtomicUsize,
+    /// The runs' seeks those checks made, and how many of them searched from the root.
+    pub seeks: AtomicUsize,
+    pub roots: AtomicUsize,
+    /// Candidates skipped: a check named a next value past them.
+    pub skipped: AtomicUsize,
 }
 
 /// Whether the variable graph of `patterns` has a cycle: patterns connect the variables
@@ -199,14 +204,20 @@ impl<'a> Query<'a> {
     /// larger is intersected as a sorted index range (leapfrog style): a sequential scan
     /// costs a few nanoseconds per value, a lookup per candidate far more. The remaining
     /// patterns are checked per candidate ([`consistent`](Self::consistent)).
-    fn candidates(&self, var: usize, bindings: &[Option<u64>]) -> Option<(Vec<u64>, Vec<bool>)> {
+    fn candidates(
+        &self,
+        var: usize,
+        depth: usize,
+        work: &mut Work<'a>,
+    ) -> Option<(Vec<u64>, Vec<bool>)> {
         let mut counts: Vec<Option<u64>> = vec![None; self.patterns.len()];
         let mut best: Option<(u64, usize)> = None;
         for (i, pattern) in self.patterns.iter().enumerate() {
             if !pattern.contains(&Pos::Var(var)) {
                 continue;
             }
-            let count = self.count(pattern, bindings);
+            let quad = self.quad_pattern(pattern, &work.bindings);
+            let count = work.cursor(depth, i, Use::Count, self).count(&quad);
             if count == 0 {
                 return None;
             }
@@ -218,7 +229,7 @@ impl<'a> Query<'a> {
         let (smallest, driver) = best?;
         let mut enforced = vec![false; self.patterns.len()];
         enforced[driver] = true;
-        let mut values = match self.sorted_values(driver, var, bindings) {
+        let mut values = match self.sorted_values(driver, var, depth, work) {
             Some(values) => values.into_owned(),
             None => {
                 let pattern = &self.patterns[driver];
@@ -227,7 +238,7 @@ impl<'a> Query<'a> {
                 let mut values: Vec<u64> = Vec::new();
                 for quad in self
                     .snapshot
-                    .quads_for_pattern_in(self.model, &self.quad_pattern(pattern, bindings))
+                    .quads_for_pattern_in(self.model, &self.quad_pattern(pattern, &work.bindings))
                 {
                     let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
                     let value = components[positions[0]];
@@ -252,7 +263,7 @@ impl<'a> Query<'a> {
             if values.is_empty() {
                 break;
             }
-            if let Some(list) = self.sorted_values(i, var, bindings) {
+            if let Some(list) = self.sorted_values(i, var, depth, work) {
                 values = intersect(&values, &list);
                 enforced[i] = true;
             }
@@ -261,13 +272,15 @@ impl<'a> Query<'a> {
     }
 
     /// The values of `var` in pattern `index`'s matches, in id order, if `var` is its only
-    /// unbound position (then an index range lists them sorted and distinct). A pattern
-    /// with no other variable gives the same list under any bindings: read once.
+    /// unbound position (then an index range lists them sorted and distinct), read by the
+    /// pattern's listing cursor at `depth`. A pattern with no other variable gives the
+    /// same list under any bindings: read once.
     fn sorted_values(
         &self,
         index: usize,
         var: usize,
-        bindings: &[Option<u64>],
+        depth: usize,
+        work: &mut Work<'a>,
     ) -> Option<Cow<'_, [u64]>> {
         let pattern = &self.patterns[index];
         let only_var = pattern
@@ -275,24 +288,37 @@ impl<'a> Query<'a> {
             .all(|&p| matches!(p, Pos::Const(_)) || p == Pos::Var(var));
         if only_var {
             return self.lists[index]
-                .get_or_init(|| self.read_values(index, var, bindings))
+                .get_or_init(|| self.read_values(index, var, &work.bindings))
                 .as_deref()
                 .map(Cow::Borrowed);
         }
-        self.read_values(index, var, bindings).map(Cow::Owned)
+        let position = self.free_position(index, var, &work.bindings)?;
+        let quad = self.quad_pattern(pattern, &work.bindings);
+        let mut values = Vec::new();
+        if work
+            .cursor(depth, index, Use::Values, self)
+            .values(&quad, position, &mut values)
+        {
+            return Some(Cow::Owned(values));
+        }
+        self.read_values(index, var, &work.bindings).map(Cow::Owned)
     }
 
-    /// [`Self::sorted_values`], read from the index.
-    fn read_values(&self, index: usize, var: usize, bindings: &[Option<u64>]) -> Option<Vec<u64>> {
+    /// The position of `var` in pattern `index` if it is its only unbound position.
+    fn free_position(&self, index: usize, var: usize, bindings: &[Option<u64>]) -> Option<usize> {
         let pattern = &self.patterns[index];
         let mut free = (0..3).filter(|&c| match pattern[c] {
             Pos::Var(v) => bindings[v].is_none(),
             Pos::Const(_) => false,
         });
         let position = free.next()?;
-        if free.next().is_some() || pattern[position] != Pos::Var(var) {
-            return None;
-        }
+        (free.next().is_none() && pattern[position] == Pos::Var(var)).then_some(position)
+    }
+
+    /// [`Self::sorted_values`], read from the index.
+    fn read_values(&self, index: usize, var: usize, bindings: &[Option<u64>]) -> Option<Vec<u64>> {
+        let pattern = &self.patterns[index];
+        let position = self.free_position(index, var, bindings)?;
         // A graph-first order with the free component last.
         let permutation = match position {
             0 => Permutation::Gpos,
@@ -311,41 +337,115 @@ impl<'a> Query<'a> {
         )
     }
 
-    /// Whether every pattern with `var` not in `enforced` still matches once `var` is
-    /// bound (exact for the patterns this binding completes).
-    fn consistent(
+    /// Calls `extend` deeper for each of `values` (ascending) of `var` with which every
+    /// pattern containing `var` and not in `enforced` still matches (exact for the
+    /// patterns the binding completes). Each check is a leapfrog seek of the pattern's
+    /// cursor ([`ProbeCursor::seek`]): the candidates ascend, so it reads forward, and a
+    /// pattern that fails names the next value of `var` that can match it, so the
+    /// candidates below are skipped (or all the rest, where none can).
+    #[allow(clippy::too_many_arguments)]
+    fn extend_values(
         &self,
-        var: usize,
-        bindings: &[Option<u64>],
+        order: &[usize],
+        depth: usize,
+        values: &[u64],
         enforced: &[bool],
+        work: &mut Work<'a>,
+        rows: &mut Vec<u64>,
+        shared: &Shared<'_>,
         stats: &Stats,
-    ) -> bool {
-        self.patterns
-            .iter()
-            .zip(enforced)
-            .filter(|(p, done)| !**done && p.contains(&Pos::Var(var)))
-            .all(|(p, _)| {
-                if repeats_unbound(p, bindings) {
+    ) -> Result<(), Stop> {
+        let var = order[depth];
+        let mut i = 0;
+        let mut seen = 0usize;
+        while i < values.len() {
+            seen += 1;
+            if seen.is_multiple_of(1024)
+                && (shared.cancelled.load(Ordering::Relaxed) || (shared.token)())
+            {
+                shared.cancelled.store(true, Ordering::Relaxed);
+                return Err(Stop::Cancelled);
+            }
+            let value = values[i];
+            work.bindings[var] = Some(value);
+            let mut skip_to = 0u64;
+            let mut passed = true;
+            let mut exhausted = false;
+            for (p, pattern) in self.patterns.iter().enumerate() {
+                // The patterns with `var` not enforced, and where `var` sits in each
+                // (`None`: more than once, so no next value can be named).
+                if enforced[p] {
+                    continue;
+                }
+                let mut places = (0..3).filter(|&c| pattern[c] == Pos::Var(var));
+                let Some(first) = places.next() else {
+                    continue;
+                };
+                let at = places.next().is_none().then_some(first);
+                if repeats_unbound(pattern, &work.bindings) {
                     // Checked exactly once its last variable is bound.
-                    return true;
+                    continue;
                 }
                 stats.lookups.fetch_add(1, Ordering::Relaxed);
-                self.snapshot
-                    .exists_in(self.model, &self.quad_pattern(p, bindings))
-            })
+                let quad = self.quad_pattern(pattern, &work.bindings);
+                let cursor = work.cursor(depth, p, Use::Seek, self);
+                let seek = match at {
+                    Some(c) => cursor.seek(&quad, c),
+                    None => match cursor.exists(&quad) {
+                        true => Seek::Found,
+                        false => Seek::Missing,
+                    },
+                };
+                match seek {
+                    Seek::Found => {}
+                    Seek::Next(next) => {
+                        passed = false;
+                        skip_to = skip_to.max(next);
+                    }
+                    Seek::Missing => passed = false,
+                    Seek::Exhausted => {
+                        // No larger value of `var` matches this pattern.
+                        exhausted = true;
+                        break;
+                    }
+                }
+            }
+            if exhausted {
+                stats
+                    .skipped
+                    .fetch_add(values.len() - i - 1, Ordering::Relaxed);
+                break;
+            }
+            if passed {
+                self.extend(order, depth + 1, work, rows, shared, stats)?;
+                i += 1;
+            } else if skip_to > value {
+                let next = i + 1 + values[i + 1..].partition_point(|&v| v < skip_to);
+                stats.skipped.fetch_add(next - i - 1, Ordering::Relaxed);
+                i = next;
+            } else {
+                i += 1;
+            }
+        }
+        work.bindings[var] = None;
+        Ok(())
     }
 
     fn extend(
         &self,
         order: &[usize],
         depth: usize,
-        bindings: &mut Vec<Option<u64>>,
+        work: &mut Work<'a>,
         rows: &mut Vec<u64>,
         shared: &Shared<'_>,
         stats: &Stats,
     ) -> Result<(), Stop> {
         let Some(&var) = order.get(depth) else {
-            rows.extend(bindings.iter().map(|b| b.expect("every variable is bound")));
+            rows.extend(
+                work.bindings
+                    .iter()
+                    .map(|b| b.expect("every variable is bound")),
+            );
             if (rows.len() / self.variables.max(1)).is_multiple_of(ROW_STEP) {
                 let total = shared.rows.fetch_add(ROW_STEP, Ordering::Relaxed) + ROW_STEP;
                 if total > self.max_rows {
@@ -354,22 +454,11 @@ impl<'a> Query<'a> {
             }
             return Ok(());
         };
-        let Some((values, enforced)) = self.candidates(var, bindings) else {
+        let Some((values, enforced)) = self.candidates(var, depth, work) else {
             return Ok(());
         };
         stats.candidates[depth].fetch_add(values.len(), Ordering::Relaxed);
-        for (n, value) in values.into_iter().enumerate() {
-            if n % 1024 == 0 && (shared.cancelled.load(Ordering::Relaxed) || (shared.token)()) {
-                shared.cancelled.store(true, Ordering::Relaxed);
-                return Err(Stop::Cancelled);
-            }
-            bindings[var] = Some(value);
-            if self.consistent(var, bindings, &enforced, stats) {
-                self.extend(order, depth + 1, bindings, rows, shared, stats)?;
-            }
-        }
-        bindings[var] = None;
-        Ok(())
+        self.extend_values(order, depth, &values, &enforced, work, rows, shared, stats)
     }
 
     /// The solutions estimated by sampling (index-based join sampling, Leis et al., CIDR
@@ -378,8 +467,8 @@ impl<'a> Query<'a> {
     /// [`SAMPLE_LOOKUPS`] lookups or the query's `max_rows`, scaling what it has.
     pub(super) fn estimate(&self) -> f64 {
         let order = self.order();
-        let mut bindings = vec![None; self.variables];
-        let Some((first, enforced)) = self.candidates(order[0], &bindings) else {
+        let mut work = Work::new(self, order.len());
+        let Some((first, enforced)) = self.candidates(order[0], 0, &mut work) else {
             return 0.0;
         };
         if first.is_empty() {
@@ -398,16 +487,12 @@ impl<'a> Query<'a> {
         let picked = first.len().min(SAMPLES);
         let (mut rows, mut sampled) = (Vec::new(), 0);
         for k in 0..picked {
-            bindings[order[0]] = Some(first[k * first.len() / picked]);
+            let value = [first[k * first.len() / picked]];
             sampled += 1;
-            if self.consistent(order[0], &bindings, &enforced, &stats)
-                && self
-                    .extend(&order, 1, &mut bindings, &mut rows, &shared, &stats)
-                    .is_err()
-            {
-                break;
-            }
-            if stats.lookups.load(Ordering::Relaxed) > SAMPLE_LOOKUPS {
+            let done = self.extend_values(
+                &order, 0, &value, &enforced, &mut work, &mut rows, &shared, &stats,
+            );
+            if done.is_err() || stats.lookups.load(Ordering::Relaxed) > SAMPLE_LOOKUPS {
                 break;
             }
         }
@@ -425,8 +510,10 @@ impl<'a> Query<'a> {
         stats.order.clone_from(&order);
         stats.candidates = (0..order.len()).map(|_| AtomicUsize::new(0)).collect();
         let stats = &*stats;
-        let bindings = vec![None; self.variables];
-        let Some((first, enforced)) = self.candidates(order[0], &bindings) else {
+        let mut work = Work::new(self, order.len());
+        let first = self.candidates(order[0], 0, &mut work);
+        work.finish(stats);
+        let Some((first, enforced)) = first else {
             return Ok(Vec::new());
         };
         stats.candidates[0].fetch_add(first.len(), Ordering::Relaxed);
@@ -444,15 +531,13 @@ impl<'a> Query<'a> {
         let chunks: Vec<Result<Vec<u64>, Stop>> = first
             .par_chunks(chunk)
             .map(|chunk| {
-                let mut bindings = vec![None; self.variables];
+                let mut work = Work::new(self, order.len());
                 let mut rows = Vec::new();
-                for &value in chunk {
-                    bindings[order[0]] = Some(value);
-                    if self.consistent(order[0], &bindings, &enforced, stats) {
-                        self.extend(&order, 1, &mut bindings, &mut rows, &shared, stats)?;
-                    }
-                }
-                Ok(rows)
+                let done = self.extend_values(
+                    &order, 0, chunk, &enforced, &mut work, &mut rows, &shared, stats,
+                );
+                work.finish(stats);
+                done.map(|()| rows)
             })
             .collect();
         let mut rows = Vec::new();
@@ -466,20 +551,71 @@ impl<'a> Query<'a> {
     }
 }
 
+/// A thread's state in a join: its bindings, and a probe cursor per depth and pattern,
+/// kept across all the candidates it checks (each reads its runs forward from where the
+/// last check of the same pattern at the same depth landed).
+struct Work<'a> {
+    bindings: Vec<Option<u64>>,
+    /// Per depth, pattern and use: counting, listing and checking read different
+    /// orders and ranges, each ascending in its own sequence.
+    cursors: Vec<[Option<ProbeCursor<'a>>; 3]>,
+    patterns: usize,
+}
+
+/// What a cursor of a [`Work`] is for.
+#[derive(Clone, Copy)]
+enum Use {
+    Count = 0,
+    Values = 1,
+    Seek = 2,
+}
+
+impl<'a> Work<'a> {
+    fn new(query: &Query<'a>, depths: usize) -> Self {
+        Self {
+            bindings: vec![None; query.variables],
+            cursors: (0..depths * query.patterns.len())
+                .map(|_| [None, None, None])
+                .collect(),
+            patterns: query.patterns.len(),
+        }
+    }
+
+    fn cursor(
+        &mut self,
+        depth: usize,
+        pattern: usize,
+        what: Use,
+        query: &Query<'a>,
+    ) -> &mut ProbeCursor<'a> {
+        self.cursors[depth * self.patterns + pattern][what as usize]
+            .get_or_insert_with(|| query.snapshot.probe_cursor(query.model))
+    }
+
+    /// Adds the cursors' seeks to `stats`.
+    fn finish(&self, stats: &Stats) {
+        for cursor in self.cursors.iter().flatten().flatten() {
+            let seeks = cursor.stats();
+            stats
+                .seeks
+                .fetch_add(seeks.seeks as usize, Ordering::Relaxed);
+            stats
+                .roots
+                .fetch_add(seeks.root_searches as usize, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Whether `pattern` has a variable at two positions that `bindings` leave unbound: its
 /// count then over-approximates (the positions must bind one term).
 fn repeats_unbound(pattern: &[Pos; 3], bindings: &[Option<u64>]) -> bool {
-    let unbound: Vec<usize> = pattern
-        .iter()
-        .filter_map(|p| match p {
-            Pos::Var(v) if bindings[*v].is_none() => Some(*v),
-            _ => None,
-        })
-        .collect();
-    unbound
-        .iter()
-        .enumerate()
-        .any(|(i, v)| unbound[i + 1..].contains(v))
+    let unbound = |c: usize| match pattern[c] {
+        Pos::Var(v) if bindings[v].is_none() => Some(v),
+        _ => None,
+    };
+    [(0, 1), (0, 2), (1, 2)]
+        .into_iter()
+        .any(|(a, b)| unbound(a).is_some() && unbound(a) == unbound(b))
 }
 
 /// The values in both sorted, distinct lists: a merge that gallops over the longer one.

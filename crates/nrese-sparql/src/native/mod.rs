@@ -1053,6 +1053,8 @@ struct Context<'a> {
     trace: Option<RefCell<Vec<PlanStep>>>,
     /// Nesting depth of the operator being evaluated (for the trace).
     depth: Cell<usize>,
+    /// The seeks of the last index nested-loop join, for EXPLAIN ([`Probe`]).
+    probed: Cell<nrese_engine::SeekStats>,
     /// A LIMIT for the next basic graph pattern: any this many of its rows will do
     /// ([`Context::eval_limited`]). Taken by the pattern, so nothing nested sees it.
     limit: Cell<Option<usize>>,
@@ -1174,6 +1176,7 @@ impl<'a> Context<'a> {
             ),
             trace: None,
             depth: Cell::new(0),
+            probed: Cell::default(),
             limit: Cell::new(None),
             graph: RefCell::new(scope),
             synthetic: Cell::new(0),
@@ -2388,7 +2391,10 @@ impl<'a> Context<'a> {
                         (false, true) => "cross product",
                         (false, false) => "join",
                     };
-                    let detail = triples[next].to_string();
+                    let mut detail = triples[next].to_string();
+                    if probe && linked.is_none() {
+                        detail = self.probed_detail(detail);
+                    }
                     self.note(operator, detail, estimate(step), result.table.len(), start);
                 }
                 result = self.filter_bound(result, filters)?;
@@ -2618,7 +2624,11 @@ impl<'a> Context<'a> {
                 let operator = if probe { "index join" } else { "join" };
                 let rows = result.table.len();
                 let estimate = Some(estimated.round() as u64);
-                self.note(operator, triples[next].to_string(), estimate, rows, start);
+                let mut detail = triples[next].to_string();
+                if probe {
+                    detail = self.probed_detail(detail);
+                }
+                self.note(operator, detail, estimate, rows, start);
             }
             for v in scans[next].vars() {
                 if !bound.contains(&v) {
@@ -3032,11 +3042,17 @@ impl<'a> Context<'a> {
             trace.borrow_mut().push(PlanStep {
                 depth: self.depth.get() + 1,
                 operator: "wcoj order".to_owned(),
-                detail: format!(
-                    "{} | {} lookups",
-                    order.join(", "),
-                    stats.lookups.load(std::sync::atomic::Ordering::Relaxed)
-                ),
+                detail: {
+                    let load = |n: &AtomicUsize| n.load(AtomicOrdering::Relaxed);
+                    format!(
+                        "{} | {} lookups ({} seeks, {} from the root), {} candidates skipped",
+                        order.join(", "),
+                        load(&stats.lookups),
+                        load(&stats.seeks),
+                        load(&stats.roots),
+                        load(&stats.skipped)
+                    )
+                },
                 estimated_rows: estimate,
                 rows: table.len() as u64,
                 micros: 0,
@@ -3304,6 +3320,16 @@ impl<'a> Context<'a> {
         })
     }
 
+    /// EXPLAIN's detail of an index nested-loop join: the pattern, its seeks in the
+    /// index's runs and how many of them searched from the root.
+    fn probed_detail(&self, pattern: String) -> String {
+        let seeks = self.probed.get();
+        format!(
+            "{pattern} | {} seeks, {} from the root",
+            seeks.seeks, seeks.root_searches
+        )
+    }
+
     /// Joins `result` with `scan` by probing the index once per distinct key of `result`.
     fn probe_join(
         &self,
@@ -3311,6 +3337,25 @@ impl<'a> Context<'a> {
         scan: &ScanPattern,
         shared: &[Variable],
     ) -> NativeResult<Solutions> {
+        let mut shared = shared.to_vec();
+        if !result.ordered {
+            // The keys sorted in the order the index reads the probed pattern: the probes
+            // then ascend, and its cursor reads each run forward ([`Probe`]).
+            let mut shape = scan.clone();
+            for slot in &mut shape.slots {
+                if matches!(slot, Slot::Var(v) if shared.contains(v)) {
+                    *slot = Slot::Const(TermId::DEFAULT_GRAPH);
+                }
+            }
+            let order = shape.quad_pattern().read_order();
+            shared.sort_by_key(|v| {
+                (0..4)
+                    .filter(|&i| scan.slots[i].is_var(v))
+                    .filter_map(|i| order.iter().position(|&c| c == i))
+                    .min()
+            });
+        }
+        let shared = &shared[..];
         let key_columns: Vec<usize> = shared
             .iter()
             .map(|v| result.column(v).expect("shared"))
@@ -3349,6 +3394,7 @@ impl<'a> Context<'a> {
             width: vars.len(),
             max_rows: self.max_rows(vars.len()),
             produced: AtomicUsize::new(0),
+            seeks: std::sync::Mutex::default(),
         };
         let token = self.cancellation.clone();
         let cancelled = move || token.as_ref().is_some_and(CancellationToken::is_cancelled);
@@ -3377,6 +3423,8 @@ impl<'a> Context<'a> {
                 return Err(self.too_large(probe.max_rows.saturating_add(1), vars.len()));
             }
         };
+        self.probed
+            .set(*probe.seeks.lock().unwrap_or_else(|e| e.into_inner()));
         let out = if result.ordered {
             out
         } else {
@@ -4797,6 +4845,8 @@ struct Probe<'a> {
     /// Output rows allowed in total (the query's memory budget), and produced so far.
     max_rows: usize,
     produced: AtomicUsize,
+    /// The index seeks of all chunks.
+    seeks: std::sync::Mutex<nrese_engine::SeekStats>,
 }
 
 /// Why an index nested-loop join stopped early.
@@ -4806,7 +4856,11 @@ enum ProbeStop {
 }
 
 impl Probe<'_> {
-    /// The joined rows for `table` rows `rows`, in order.
+    /// The joined rows for `table` rows `rows`, in order. One probe cursor reads the index
+    /// for all of them: the keys ascend in its order (`probe_join`), so each probe seeks
+    /// forward from the last instead of searching every run from the root. The matches
+    /// of a key are kept flat, `positions.len()` values each: nothing is allocated per
+    /// match.
     fn rows(
         &self,
         rows: Range<usize>,
@@ -4814,12 +4868,21 @@ impl Probe<'_> {
     ) -> Result<IdTable, ProbeStop> {
         let table = self.table;
         let width = table.width();
+        let stride = self.positions.len();
         let mut out = IdTable::new(self.width);
-        let mut matches: Vec<Vec<u64>> = Vec::new();
+        let mut cursor = self.snapshot.probe_cursor(self.model);
+        // The new variables' values of each match of the current key, and their number
+        // (a pattern binding nothing new matches without values).
+        let mut matches: Vec<u64> = Vec::new();
+        let mut found = 0usize;
         let mut row = vec![0u64; self.width];
         let mut bound = self.scan.clone();
         let first = rows.start;
         let mut counted = 0;
+        let finish = |cursor: &nrese_engine::ProbeCursor<'_>| {
+            let mut seeks = self.seeks.lock().unwrap_or_else(|e| e.into_inner());
+            seeks.add(cursor.stats());
+        };
         for r in rows {
             if (r - first).is_multiple_of(4096) {
                 if cancelled() {
@@ -4835,39 +4898,44 @@ impl Probe<'_> {
                     .all(|&k| table.get(r, k) == table.get(r - 1, k));
             if !same_key {
                 matches.clear();
+                found = 0;
                 for (slots, &k) in self.shared_positions.iter().zip(self.key_columns) {
                     let id = TermId::from_raw(table.get(r, k));
                     for &i in slots {
                         bound.slots[i] = Slot::Const(id);
                     }
                 }
-                'quads: for quad in self
-                    .snapshot
-                    .quads_for_pattern_in(self.model, &bound.quad_pattern())
-                {
+                cursor.for_each(&bound.quad_pattern(), |quad| {
                     let components = quad.components();
-                    let mut values = Vec::with_capacity(self.positions.len());
+                    let start = matches.len();
                     for places in self.positions {
                         let value = components[places[0]];
                         if places[1..].iter().any(|&p| components[p] != value) {
-                            continue 'quads;
+                            matches.truncate(start);
+                            return;
                         }
-                        values.push(value);
+                        matches.push(value);
                     }
-                    matches.push(values);
-                }
-                if self.scan.merged() {
+                    found += 1;
+                });
+                if self.scan.merged() && found > 1 {
                     // A statement in several graphs matched once per graph; its values
                     // are the same each time.
-                    matches.sort_unstable();
-                    matches.dedup();
+                    let mut distinct: Vec<&[u64]> = match stride {
+                        0 => vec![&[]],
+                        _ => matches.chunks_exact(stride).collect(),
+                    };
+                    distinct.sort_unstable();
+                    distinct.dedup();
+                    found = distinct.len();
+                    matches = distinct.concat();
                 }
             }
-            for values in &matches {
+            for m in 0..found {
                 for (c, slot) in row.iter_mut().enumerate().take(width) {
                     *slot = table.get(r, c);
                 }
-                row[width..].copy_from_slice(values);
+                row[width..].copy_from_slice(&matches[m * stride..(m + 1) * stride]);
                 out.push_row(&row);
             }
             // One key can match a whole index range: check within large fan-outs too.
@@ -4876,6 +4944,7 @@ impl Probe<'_> {
                 counted = out.len();
             }
         }
+        finish(&cursor);
         self.grow(out.len() - counted)?;
         Ok(out)
     }

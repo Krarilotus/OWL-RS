@@ -278,6 +278,54 @@ fn estimates_never_exceed_their_bounds() {
     }
 }
 
+/// The seeks and searches from the root an EXPLAIN detail reports (`… | N seeks, M from the
+/// root`, or `… | L lookups (N seeks, M from the root), …`).
+fn seeks(detail: &str) -> Option<(u64, u64)> {
+    let counts = detail.rsplit_once(" | ")?.1;
+    let counts = counts.split_once('(').map_or(counts, |(_, inner)| inner);
+    let mut numbers = counts
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u64>().unwrap());
+    Some((numbers.next()?, numbers.next()?))
+}
+
+/// Seekable cursors (investigation §1 #3): an index join reads the index forward, its
+/// keys sorted in the index's order, one search from the root per run; the
+/// worst-case-optimal join checks candidates by leapfrog seeks kept across them (LUBM-10
+/// q9: 96.9 k searches from the root → 3,573 of 59,766 seeks).
+#[test]
+fn probes_seek_forward_instead_of_from_the_root() {
+    let engine = engine();
+    // 27 rows reached in three steps (10 distinct `?c`), their labels probed (3,000).
+    let plan = steps(
+        &engine,
+        "SELECT * WHERE { e:n1 e:knows ?a . ?a e:knows ?b . ?b e:knows ?c . ?c e:label ?l }",
+    );
+    let probed: Vec<(u64, u64)> = plan
+        .iter()
+        .filter(|s| s.operator == "index join")
+        .filter_map(|s| seeks(&s.detail))
+        .collect();
+    assert!(probed.iter().any(|&(seeks, _)| seeks >= 8), "{plan:#?}");
+    for (seeks, roots) in probed {
+        assert!(
+            roots * 8 <= seeks.max(8),
+            "{seeks} seeks, {roots} from the root"
+        );
+    }
+    let plan = steps(
+        &engine,
+        "SELECT * WHERE { ?a e:knows ?b . ?b e:knows ?c . ?c e:knows ?a }",
+    );
+    let order = plan
+        .iter()
+        .find(|s| s.operator == "wcoj order")
+        .unwrap_or_else(|| panic!("{plan:#?}"));
+    let (seeks, roots) = seeks(&order.detail).unwrap_or_else(|| panic!("{order:#?}"));
+    assert!(roots * 4 <= seeks, "{}", order.detail);
+}
+
 /// Paths planned with the patterns they are joined to: a path from a constant that
 /// reaches few nodes goes first and the large pattern is probed from what it reaches,
 /// instead of the pattern being joined whole and the path after it.
