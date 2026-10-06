@@ -3,7 +3,8 @@
 //! clauses follows from all of them. So each subsumption and each unsatisfiable class it
 //! finds is entailed: a lower bound the driver needn't test.
 //!
-//! The part: the clauses without equality, nominals or data, the individuals left out
+//! The part: the clauses without equality (but for at-most-one clauses where the context
+//! core's Eq rule is on), nominals or data, the individuals left out
 //! (without nominals they can't change a subsumption of a consistent ontology). The
 //! context core makes what it can Horn by renaming fresh names; if it can't, the
 //! clauses with more than one head atom go too, and where it still refuses a clause (its
@@ -45,22 +46,25 @@ pub struct Lower {
 const RETRIES: usize = 16;
 
 /// Clauses the Horn stage can take at all (after renaming).
-fn admissible(c: &Clause) -> bool {
-    !c.flags.equality && !c.flags.nominal && !c.flags.datatype
+fn admissible(c: &Clause, equality: bool) -> bool {
+    (!c.flags.equality || (equality && crate::context::compile::at_most_one(c).is_some()))
+        && !c.flags.nominal
+        && !c.flags.datatype
 }
 
 /// The Horn part's consequences over `classes` (sorted), or `None` if the context core
-/// takes none of it.
+/// takes none of it; the context core runs with `core` (its proofs off).
 pub fn horn_lower_bound(
     normalised: &Normalised,
     classes: &[Term],
-    threads: usize,
-    budget: crate::context::Budget,
-    strategy: crate::context::Strategy,
+    core: &crate::context::Options,
 ) -> Option<Lower> {
     let all = &normalised.clauses;
+    let budget = core.budget;
     // The clauses of the part, by index into the normalisation's.
-    let kept: Vec<usize> = (0..all.len()).filter(|&i| admissible(&all[i])).collect();
+    let kept: Vec<usize> = (0..all.len())
+        .filter(|&i| admissible(&all[i], core.equality))
+        .collect();
     // First everything admissible (the context core renames what it can into Horn
     // clauses); then the Horn clauses alone.
     // The first, fuller part gets three quarters: where it saturates, it is the one that
@@ -79,13 +83,18 @@ pub fn horn_lower_bound(
         .filter(|&i| all[i].flags.horn)
         .collect();
     let all_horn = horn.len() == kept.len();
-    if let Some(l) = saturate(normalised, kept, classes, threads, first, strategy) {
+    let with = |budget| crate::context::Options {
+        budget,
+        proofs: false,
+        ..*core
+    };
+    if let Some(l) = saturate(normalised, kept, classes, &with(first)) {
         return Some(l);
     }
     if all_horn {
         return None;
     }
-    saturate(normalised, horn, classes, threads, budget, strategy)
+    saturate(normalised, horn, classes, &with(budget))
 }
 
 /// The context core on the clauses `part` (indexes) of `n`, dropping clauses it refuses a
@@ -94,17 +103,8 @@ fn saturate(
     n: &Normalised,
     mut part: Vec<usize>,
     classes: &[Term],
-    threads: usize,
-    budget: crate::context::Budget,
-    strategy: crate::context::Strategy,
+    options: &crate::context::Options,
 ) -> Option<Lower> {
-    let options = crate::context::Options {
-        threads,
-        proofs: false,
-        budget,
-        strategy,
-        ..crate::context::Options::default()
-    };
     let build = |part: &[usize]| Normalised {
         clauses: part.iter().map(|&i| n.clauses[i].clone()).collect(),
         fresh: n.fresh.clone(),
@@ -113,7 +113,7 @@ fn saturate(
         ..Normalised::default()
     };
     for _ in 0..RETRIES {
-        let why = match crate::context::saturate_normalised(&build(&part), classes, &options) {
+        let why = match crate::context::saturate_normalised(&build(&part), classes, options) {
             Ok(saturated) => {
                 let mut lower = lower(&saturated.classification(), classes);
                 exact_for(&mut lower, &saturated, n, &part, classes);
@@ -243,6 +243,7 @@ fn exact_for(
         && role_ids.is_empty()
         && local.is_empty()
         && part.len() == n.clauses.len()
+        && saturated.complete()
     {
         lower.exact = true;
     }
