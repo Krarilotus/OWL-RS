@@ -7,6 +7,7 @@
 //!   on commit.
 //! - [`classification`]: classification and realisation, kept per revision.
 //! - [`entailment`]: axiom entailment, reduced to consistency.
+//! - [`lower`]: L's memberships beyond the RL closure, from the TBox's taxonomy.
 //! - [`upper`]: the upper bound U1 in a stack of its own; [`bounds`]: U1 per revision,
 //!   maintained per commit, and the read view queries take.
 //! - [`query`]: the query path: closed predicates, the bounds, the exact services, the
@@ -22,6 +23,7 @@ pub mod config;
 pub mod consistency;
 pub mod entailment;
 pub(crate) mod gate;
+pub(crate) mod lower;
 pub(crate) mod query;
 pub(crate) mod source;
 pub mod upper;

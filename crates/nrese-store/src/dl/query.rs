@@ -262,7 +262,7 @@ fn closed(analysis: &Analysis, view: &View, snapshot: &Snapshot) -> bool {
 #[derive(Debug, Default)]
 pub(crate) struct OntologyCache(std::sync::Mutex<Option<(u64, Arc<Ontology>)>>);
 
-fn ontology_at(store: &StoreService, snapshot: &Snapshot) -> Arc<Ontology> {
+pub(crate) fn ontology_at(store: &StoreService, snapshot: &Snapshot) -> Arc<Ontology> {
     let mut cache = store
         .dl()
         .query_ontology
@@ -336,7 +336,7 @@ pub(crate) fn answer(
 ) -> StoreResult<Outcome> {
     let outcome = decide_answers(store, prepared, cancellation, mode)?;
     let status = match &outcome {
-        Outcome::Stream(status) | Outcome::Answers(_, status) => status,
+        Outcome::Stream(status, _) | Outcome::Answers(_, status) => status,
     };
     if mode == DlAnswers::Exact && !status.is_complete() {
         return Err(StoreError::Incomplete(status.reasons().join("; ")));
@@ -347,7 +347,8 @@ pub(crate) fn answer(
 /// How a query is answered: over the lower bound as it streams (its status known before
 /// it runs), or with answers collected and completed through the bounds.
 pub(crate) enum Outcome {
-    Stream(Completeness),
+    /// Over the store's snapshot, or over the lower bound's view where it adds to it.
+    Stream(Completeness, Option<Snapshot>),
     Answers(Answers, Completeness),
 }
 
@@ -359,16 +360,22 @@ fn decide_answers(
 ) -> StoreResult<Outcome> {
     let settings = store.query_settings();
     if prepared.access().is_some() {
-        return Ok(Outcome::Stream(Completeness::sound_only(
-            "the reader sees part of the data: answers are checked against the bounds only \
+        return Ok(Outcome::Stream(
+            Completeness::sound_only(
+                "the reader sees part of the data: answers are checked against the bounds only \
              for readers of every graph",
-        )));
+            ),
+            None,
+        ));
     }
     if prepared.has_dataset() {
-        return Ok(Outcome::Stream(Completeness::sound_only(
-            "the query names its dataset: answers are over those graphs, not checked \
+        return Ok(Outcome::Stream(
+            Completeness::sound_only(
+                "the query names its dataset: answers are over those graphs, not checked \
              against the bounds",
-        )));
+            ),
+            None,
+        ));
     }
     let (snapshot, view) = super::bounds::view(store);
     let analysis = analyse(prepared.query());
@@ -386,27 +393,27 @@ fn decide_answers(
             "the query reads {what}: entailed schema statements aren't bounded (the RL \
              closure's are sound; /classification has the subsumptions under OWL 2 DL)"
         ));
-        return Ok(Outcome::Stream(status));
+        return Ok(Outcome::Stream(status, lower_view(&view)));
     }
     if closed(&analysis, &view, &snapshot) {
         // One evaluation, streamed: L's answers are the certain ones.
         status.path("closed-predicates");
-        return Ok(Outcome::Stream(status));
+        return Ok(Outcome::Stream(status, lower_view(&view)));
     }
     if let Some(why) = &view.unavailable {
         status.add(why.clone());
-        return Ok(Outcome::Stream(status));
+        return Ok(Outcome::Stream(status, lower_view(&view)));
     }
     if mode == DlAnswers::Sound {
         status.add("dl.answers = sound: the lower bound alone".to_owned());
-        return Ok(Outcome::Stream(status));
+        return Ok(Outcome::Stream(status, lower_view(&view)));
     }
     if let Some(op) = analysis.not_monotone {
         status.add(format!(
             "the query uses {op}, which isn't monotone, over predicates whose lower and upper \
              bounds differ"
         ));
-        return Ok(Outcome::Stream(status));
+        return Ok(Outcome::Stream(status, lower_view(&view)));
     }
     if matches!(prepared.query(), Query::Construct { .. }) {
         status.add(
@@ -414,9 +421,9 @@ fn decide_answers(
              predicates it reads are closed"
                 .to_owned(),
         );
-        return Ok(Outcome::Stream(status));
+        return Ok(Outcome::Stream(status, lower_view(&view)));
     }
-    let lower = evaluate_prepared(&snapshot, prepared, settings, cancellation)?;
+    let lower = evaluate_prepared(&view.lower, prepared, settings, cancellation)?;
     let upper_snapshot = view.upper.as_ref().expect("available");
     let upper = evaluate_prepared(upper_snapshot, prepared, settings, cancellation)?;
     let (answers, counts, unresolved_why) = match (lower, upper) {
@@ -426,7 +433,14 @@ fn decide_answers(
         }
         (Answers::Boolean(false), Answers::Boolean(true)) => {
             let candidates = vec![Vec::new()];
-            let decided = decide(store, &snapshot, &analysis, &[], &candidates, cancellation);
+            let decided = decide(
+                store,
+                &view.lower,
+                &analysis,
+                &[],
+                &candidates,
+                cancellation,
+            );
             let mut counts = Counts {
                 lower: 0,
                 upper: Some(1),
@@ -475,7 +489,14 @@ fn decide_answers(
             let mut rows = rows;
             let mut why = None;
             if !gap.is_empty() {
-                let decided = decide(store, &snapshot, &analysis, &variables, &gap, cancellation);
+                let decided = decide(
+                    store,
+                    &view.lower,
+                    &analysis,
+                    &variables,
+                    &gap,
+                    cancellation,
+                );
                 decided.paths.iter().for_each(|p| status.path(p));
                 why = decided.why;
                 for (row, verdict) in gap.into_iter().zip(decided.verdicts) {
@@ -508,6 +529,11 @@ fn decide_answers(
     }
     status.bounds = Some(counts);
     Ok(Outcome::Answers(answers, status))
+}
+
+/// The lower bound's view where it adds to the store's snapshot.
+fn lower_view(view: &View) -> Option<Snapshot> {
+    (view.lower_facts > 0).then(|| view.lower.clone())
 }
 
 fn lower_counts(n: u64) -> Counts {
