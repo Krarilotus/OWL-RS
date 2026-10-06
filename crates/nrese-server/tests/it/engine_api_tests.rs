@@ -1033,3 +1033,104 @@ async fn rules_are_uploaded_checked_and_removed() {
     .await;
     assert!(text.contains("false"), "the inference is gone: {text}");
 }
+
+/// The result cache through the engine API: a query pinned by name is listed with its
+/// result's size, EXPLAIN shows its answer coming from the cache, a query that can't be
+/// cached can't be pinned, and unpinning a name twice finds nothing the second time.
+#[tokio::test]
+async fn query_results_are_pinned_listed_and_unpinned() {
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory(),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let data: String = (0..50)
+        .map(|i| {
+            format!(
+                "<urn:s{i}> <urn:p> {i} . <urn:s{i}> <urn:q> <urn:s{}> . ",
+                i / 2
+            )
+        })
+        .collect();
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/update",
+        Some("application/sparql-update"),
+        &format!("INSERT DATA {{ {data} }}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let query = "SELECT ?a ?x WHERE { ?a <urn:q> ?b . ?b <urn:p> ?x }";
+    let (status, text) = send(
+        &app,
+        Method::PUT,
+        "/api/v1/repositories/nrese/cache/pins/pairs",
+        Some("application/sparql-query"),
+        query,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let pin: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        (pin["name"].as_str(), pin["rows"].as_u64()),
+        (Some("pairs"), Some(50))
+    );
+    let (status, text) = send(
+        &app,
+        Method::GET,
+        "/api/v1/repositories/nrese/cache",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cache: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(cache["pins"][0]["query"], query);
+    assert!(cache["pinned_bytes"].as_u64().unwrap() > 0, "{cache}");
+    // The pinned answer, from the cache.
+    let (status, text) = send(
+        &app,
+        Method::GET,
+        &format!(
+            "/api/v1/repositories/nrese/query?explain=true&query={}",
+            urlencoding(query)
+        ),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let explanation: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(explanation["steps"][0]["cache"], "hit", "{explanation}");
+    let (status, _) = send(
+        &app,
+        Method::PUT,
+        "/api/v1/repositories/nrese/cache/pins/random",
+        Some("application/sparql-query"),
+        "SELECT (RAND() AS ?r) WHERE {}",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for expected in [StatusCode::NO_CONTENT, StatusCode::NOT_FOUND] {
+        let (status, _) = send(
+            &app,
+            Method::DELETE,
+            "/api/v1/repositories/nrese/cache/pins/pairs",
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, expected);
+    }
+    let (status, _) = send(
+        &app,
+        Method::DELETE,
+        "/api/v1/repositories/nrese/cache",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}

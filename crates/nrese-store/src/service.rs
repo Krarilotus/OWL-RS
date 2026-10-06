@@ -44,7 +44,6 @@ pub struct StoreService {
     /// The latest full materialisation's report (startup, load, ruleset change).
     last_materialisation:
         std::sync::Arc<std::sync::Mutex<Option<crate::reasoning::MaterialisationReport>>>,
-    query_cache: std::sync::Arc<crate::query_cache::QueryCache>,
     /// What every query gets from the store: the default graph's meaning and the budget
     /// all running queries share.
     settings: crate::query_executor::StoreSettings,
@@ -97,9 +96,6 @@ impl StoreService {
         };
         let before = engine.snapshot().revision();
         let preloaded_ontology = preload_ontology(&engine, &config)?;
-        let query_cache = std::sync::Arc::new(crate::query_cache::QueryCache::new(
-            config.query_cache_bytes,
-        ));
         let ql_mode = config.ql_rewriting;
         let settings = crate::query_executor::StoreSettings {
             union_default_graph: config.union_default_graph,
@@ -110,13 +106,15 @@ impl StoreService {
             equality_closed: std::sync::Arc::default(),
             equality_canonical: config.equality_canonical_answers,
             equality_early_expansion: config.equality_early_expansion,
+            result_cache: (config.query_cache_bytes > 0).then(|| {
+                std::sync::Arc::new(nrese_sparql::ResultCache::new(config.query_cache_bytes))
+            }),
             ql: std::sync::Arc::default(),
         };
         let namespaces = crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
         );
         let service = Self {
-            query_cache,
             settings,
             namespaces: std::sync::Arc::new(namespaces),
             sessions: std::sync::Arc::default(),
@@ -142,6 +140,7 @@ impl StoreService {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) = Some(state);
         }
+        service.pin_configured_queries()?;
         Ok(service)
     }
 
@@ -481,9 +480,105 @@ impl StoreService {
         })
     }
 
-    /// Hits, misses and size of the query result cache.
-    pub fn query_cache_stats(&self) -> crate::query_cache::QueryCacheStats {
-        self.query_cache.stats()
+    /// Hits, misses and size of the result cache ([`nrese_sparql::cache`]); all zero
+    /// without one.
+    pub fn query_cache_stats(&self) -> nrese_sparql::ResultCacheStats {
+        self.settings
+            .result_cache
+            .as_ref()
+            .map(|cache| cache.stats())
+            .unwrap_or_default()
+    }
+
+    /// Runs `request` and pins its result in the result cache under `name`: it is kept
+    /// while the store doesn't change and pinned again when the query runs after a change
+    /// (replacing what `name` pinned before). An error if the cache is off, the query
+    /// can't be cached (`RAND`, `NOW`, `UUID`, `STRUUID`, `BNODE`, `SERVICE`), or its
+    /// result doesn't fit in the budget beside the other pinned ones.
+    pub fn pin_query(
+        &self,
+        name: &str,
+        request: &SparqlQueryRequest,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<nrese_sparql::PinnedResult> {
+        let mut prepared = self.prepare_query(request)?;
+        prepared.pin_as(name);
+        self.run_query(&prepared, cancellation, std::io::sink())?;
+        self.pinned_queries()
+            .into_iter()
+            .find(|pin| pin.name == name)
+            .ok_or_else(|| {
+                crate::StoreError::Configuration(format!("the result of '{name}' was not pinned"))
+            })
+    }
+
+    /// Unpins `name`'s result (it stays cached like any other); `false` if nothing is
+    /// pinned under that name.
+    pub fn unpin_query(&self, name: &str) -> bool {
+        self.settings
+            .result_cache
+            .as_ref()
+            .is_some_and(|cache| cache.unpin(name))
+    }
+
+    /// The pinned queries, by name; a result computed before the latest commit isn't
+    /// held (the cache drops it when the next query runs).
+    pub fn pinned_queries(&self) -> Vec<nrese_sparql::PinnedResult> {
+        let Some(cache) = &self.settings.result_cache else {
+            return Vec::new();
+        };
+        let revision = self.engine.snapshot().revision();
+        cache
+            .pins()
+            .into_iter()
+            .map(|pin| match pin.revision {
+                Some(held) if held < revision => nrese_sparql::PinnedResult {
+                    revision: None,
+                    rows: 0,
+                    bytes: 0,
+                    ..pin
+                },
+                _ => pin,
+            })
+            .collect()
+    }
+
+    /// Drops every cached result that isn't pinned.
+    pub fn clear_query_cache(&self) {
+        if let Some(cache) = &self.settings.result_cache {
+            cache.clear();
+        }
+    }
+
+    /// Pins the queries of [`StoreConfig::pinned_queries`], each under its file name
+    /// without the extension.
+    fn pin_configured_queries(&self) -> StoreResult<()> {
+        for path in &self.config.pinned_queries {
+            let name = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| {
+                    crate::StoreError::Configuration(format!(
+                        "pinned query {} has no file name",
+                        path.display()
+                    ))
+                })?;
+            let text = std::fs::read_to_string(path).map_err(|error| {
+                crate::StoreError::Configuration(format!(
+                    "pinned query {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let request = SparqlQueryRequest::new(text, crate::ReadScope::All);
+            self.pin_query(name, &request, &CancellationToken::new())
+                .map_err(|error| {
+                    crate::StoreError::Configuration(format!(
+                        "pinned query {}: {error}",
+                        path.display()
+                    ))
+                })?;
+        }
+        Ok(())
     }
 
     /// Evaluates a prepared query on the latest snapshot, writing results to `out` as they
@@ -542,6 +637,7 @@ impl StoreService {
             .register(prepared.text(), prepared.origin(), cancellation);
         if let Some(mode) = self.dl_mode(prepared) {
             use crate::dl::query::Outcome;
+            let dl = format!("owl2-dl {mode:?}");
             return Ok(Some(
                 match crate::dl::query::answer(self, prepared, cancellation, mode)? {
                     Outcome::Answers(answers, status, detail) => {
@@ -549,17 +645,34 @@ impl StoreService {
                         crate::query_executor::write_answers(prepared, answers, out)?;
                         detail
                     }
-                    // L adds memberships to the snapshot: streamed over its view, uncached.
+                    // L adds memberships to the snapshot: streamed over its view, kept per
+                    // revision, whose identity is its own (never the snapshot's parts).
                     Outcome::Stream(status, Some(lower), detail) => {
+                        let context = format!("{dl} {status:?}");
                         report(Some(status));
-                        run_query(&lower, prepared, &self.settings, cancellation, out)?;
+                        run_query(
+                            &lower,
+                            prepared,
+                            &self.settings,
+                            cancellation,
+                            out,
+                            &context,
+                        )?;
                         detail
                     }
                     // Over the lower bound as every query runs, its status known already.
                     Outcome::Stream(status, None, detail) => {
+                        let context = format!("{dl} {status:?}");
                         report(Some(status));
                         let snapshot = self.read_snapshot(prepared.access());
-                        self.run_cached(&snapshot, prepared, cancellation, out)?;
+                        run_query(
+                            &snapshot,
+                            prepared,
+                            &self.settings,
+                            cancellation,
+                            out,
+                            &context,
+                        )?;
                         detail
                     }
                 },
@@ -570,47 +683,17 @@ impl StoreService {
             Some(ql) => Some(ql.completeness),
             None => self.status_without_dl(prepared),
         };
+        let context = format!("{status:?}");
         report(status);
-        self.run_cached(&snapshot, prepared, cancellation, out)?;
+        run_query(
+            &snapshot,
+            prepared,
+            &self.settings,
+            cancellation,
+            out,
+            &context,
+        )?;
         Ok(None)
-    }
-
-    /// Runs `prepared` on `snapshot` through the result cache.
-    fn run_cached(
-        &self,
-        snapshot: &nrese_engine::Snapshot,
-        prepared: &PreparedQuery,
-        cancellation: &CancellationToken,
-        out: impl std::io::Write,
-    ) -> StoreResult<()> {
-        let settings = &self.settings;
-        if !self.query_cache.enabled() || prepared.volatile() {
-            return run_query(snapshot, prepared, settings, cancellation, out);
-        }
-        // The rewriting's mode changes answers without a new revision.
-        let key = crate::query_cache::CacheKey {
-            request: format!(
-                "{}\u{0}ql={}",
-                prepared.cache_request(),
-                self.ql_rewriting().name()
-            ),
-            revision: snapshot.revision(),
-        };
-        let mut out = out;
-        if let Some(bytes) = self.query_cache.get(&key) {
-            out.write_all(&bytes)?;
-            return Ok(());
-        }
-        let mut tee = crate::query_cache::Tee {
-            inner: out,
-            copy: Some(Vec::new()),
-            limit: self.query_cache.max_entry(),
-        };
-        run_query(snapshot, prepared, settings, cancellation, &mut tee)?;
-        if let Some(copy) = tee.copy {
-            self.query_cache.insert(key, copy);
-        }
-        Ok(())
     }
 
     /// Outside `owl2-dl`, the status of answers that read a ruleset's closure (`None`
@@ -846,8 +929,9 @@ impl StoreService {
                         .to_owned(),
                 );
             }
+            // A transaction's pending state: never answered from the cache.
             report(status);
-            run_query(snapshot, prepared, &self.settings, cancellation, out)
+            run_query(snapshot, prepared, &self.settings, cancellation, out, "")
         })
     }
 

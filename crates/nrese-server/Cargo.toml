@@ -41,6 +41,8 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }
+# A paused clock that tests advance themselves: deadlines decided without real time.
+tokio = { version = "1.48.0", features = ["test-util"] }
 
 [lints]
 workspace = true

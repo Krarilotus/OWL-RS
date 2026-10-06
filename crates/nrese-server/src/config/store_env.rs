@@ -18,6 +18,16 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             .unwrap_or(defaults.data_dir),
         ontology_path: source.get(names::ONTOLOGY_PATH).map(PathBuf::from),
         query_cache_bytes: parse_cache_bytes(source.get(names::QUERY_CACHE_BYTES).as_deref())?,
+        pinned_queries: source
+            .get(names::PINNED_QUERIES)
+            .map(|list| {
+                list.split(';')
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
         shapes_graph: source
             .get(names::SHACL_SHAPES_GRAPH)
             .unwrap_or(defaults.shapes_graph),
