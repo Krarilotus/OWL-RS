@@ -193,8 +193,9 @@ impl<'e> BulkLoad<'e> {
                 crate::memory::release_all();
             }
         }
-        quads.par_sort_unstable();
-        quads.dedup();
+        // By radix over the bits the ids use ([`nrese_exec::sort`]).
+        let kept = nrese_exec::sort::sort_dedup_keys(crate::quad::as_keys_mut(&mut quads));
+        quads.truncate(kept);
 
         // Nothing else in the new version: its permutations go straight into the checkpoint.
         let streamed = streamable(engine, mode);
