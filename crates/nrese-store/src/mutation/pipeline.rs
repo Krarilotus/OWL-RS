@@ -233,12 +233,12 @@ impl MutationPipeline {
                 None,
             ));
             // The owl2-dl mode: the state the commit leaves, under OWL 2 DL.
-            let dl = self
-                .store
-                .dl()
-                .active()
-                .then(|| crate::dl::gate::check_commit(&self.store, &tx, &stop));
-            if let Some(gate) = &dl
+            let dl = self.store.dl().active().then(|| {
+                let mut bounds = crate::dl::bounds::prepare(&self.store, &tx, &stop);
+                let gate = crate::dl::gate::check_commit(&self.store, &tx, &stop, &mut bounds);
+                (gate, bounds)
+            });
+            if let Some((gate, _)) = &dl
                 && let Some(detail) = &gate.reject
             {
                 return Err(MutationError::Rejected(Box::new(MutationReject {
@@ -270,7 +270,8 @@ impl MutationPipeline {
             if let Some(touched) = touched {
                 supports.note_commit(before, summary.revision, touched);
             }
-            if let Some(gate) = dl {
+            if let Some((gate, bounds)) = dl {
+                crate::dl::bounds::install(&self.store, bounds, summary.revision);
                 self.store.dl().record(crate::dl::DlStatus {
                     revision: summary.revision,
                     consistency: gate.checked,

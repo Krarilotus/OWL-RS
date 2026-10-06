@@ -1,0 +1,421 @@
+//! The bounds of the store's latest revision (docs/design/owl2-dl.md §8): the lower bound
+//! L is the inferred stack (the OWL 2 RL closure); the upper bound U1 ([`super::upper`])
+//! is kept here, beside the engine's stacks, and maintained per commit.
+//!
+//! - **On commit** ([`prepare`], [`install`]): the commit's change to U1 is computed
+//!   inside the commit (by the delta executor, or a rebuild where the schema changed) and
+//!   applied once the commit is done; U1 after the change also answers the commit's
+//!   consistency check where it can (no clash and every `⊥` checked: consistent, with no
+//!   DL engine run).
+//! - **On query** ([`view`]): the revision's read view, built once per revision: a
+//!   snapshot with U1's facts in its inferred stack, never published, and which
+//!   predicates and classes U1 has facts on beyond L (the gap's signature). A revision U1
+//!   doesn't describe (a write past the pipeline, a start) gets U1 built afresh.
+
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use nrese_engine::{EncodedQuad, EncodedTriple, ReadModel, Snapshot, TermId, Transaction};
+use nrese_owl::Ontology;
+use nrese_reasoner::eval::Stop;
+use nrese_reasoner::ir::Triple;
+
+use super::source;
+use super::upper::{Change, GaveUp, Upper};
+use crate::StoreService;
+
+/// U1 at a revision.
+struct State {
+    revision: u64,
+    upper: Result<Upper, GaveUp>,
+    /// How U1 got to this revision: `delta` (the delta executor), `rebuilt` (compiled
+    /// and evaluated afresh on commit), `read` (afresh for a query), `kept` (U1 gave up
+    /// and nothing it is compiled from changed).
+    last: &'static str,
+}
+
+/// The store's bounds: U1 for the revision it describes, and the read view of the latest
+/// revision a query asked for.
+#[derive(Default)]
+pub(crate) struct Bounds {
+    state: Mutex<Option<State>>,
+    view: Mutex<Option<Arc<View>>>,
+}
+
+impl std::fmt::Debug for Bounds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bounds").finish_non_exhaustive()
+    }
+}
+
+/// What a query reads of the bounds at a revision.
+pub(crate) struct View {
+    pub revision: u64,
+    /// L ∪ U1 as a snapshot (`None`: U1 isn't available).
+    pub upper: Option<Snapshot>,
+    /// Why U1 can't bound the answers (not built, gave up, or axioms it doesn't cover).
+    pub unavailable: Option<String>,
+    /// Classes U1 has memberships in beyond L, and the other predicates it has facts on
+    /// beyond L (Skolem constants included): the gap's signature.
+    pub gap_classes: HashSet<u64>,
+    pub gap_predicates: HashSet<u64>,
+    /// U1's own terms among its facts: never answers.
+    pub internal: HashSet<u64>,
+    /// U1's facts beyond L.
+    pub facts: usize,
+}
+
+fn triple(q: EncodedTriple) -> Triple {
+    [q.subject.raw(), q.predicate.raw(), q.object.raw()]
+}
+
+fn quad_triple(q: EncodedQuad) -> Triple {
+    [q.subject.raw(), q.predicate.raw(), q.object.raw()]
+}
+
+/// What a commit prepared for U1, applied by [`install`] once the commit is done.
+pub(crate) enum Prepared {
+    /// The delta executor's change to U1.
+    Delta(Box<Change>),
+    /// U1 compiled and evaluated afresh (the schema changed, or U1 described another
+    /// revision), or why that gave up.
+    Rebuilt(Box<Result<Upper, GaveUp>>),
+    /// U1 had given up, and nothing it was compiled from changed.
+    Unavailable,
+}
+
+/// A commit's preparation: what to install, and what U1 after the commit says about
+/// consistency.
+pub(crate) struct Preparation {
+    base: u64,
+    prepared: Prepared,
+    /// U1 after the commit proves the data consistent.
+    pub proves_consistency: bool,
+    /// The ontology the commit leaves, where the preparation had to read it (for the
+    /// consistency check, which then needn't read it again).
+    pub ontology: Option<Ontology>,
+}
+
+/// Prepares U1 for the commit `tx` (after the RL reasoning applied its changes): the
+/// change by the delta executor where only assertions over U1's signature changed, else
+/// U1 afresh. Cost: the change's, or the closure's on a rebuild.
+pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>) -> Preparation {
+    let base = tx.base().revision();
+    let pending = tx.pending_snapshot();
+    let deadline = Instant::now() + store.config().dl.timeout;
+    let stop = move || stop() || Instant::now() >= deadline;
+    let state = store
+        .dl()
+        .bounds
+        .state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let current = state.as_ref().filter(|s| s.revision == base);
+    let asserted: Vec<Triple> = tx.inserted().chain(tx.deleted()).map(quad_triple).collect();
+    if let Some(State { upper, .. }) = current {
+        match upper {
+            Ok(upper) if asserted.iter().all(|t| upper.is_assertion(*t)) => {
+                let before = tx.base();
+                let inserted: Vec<Triple> = tx
+                    .inserted()
+                    .map(quad_triple)
+                    .chain(tx.inferred_inserted().map(triple))
+                    .filter(|t| !in_view(before, *t))
+                    .collect();
+                let deleted: Vec<Triple> = tx
+                    .deleted()
+                    .map(quad_triple)
+                    .chain(tx.inferred_deleted().map(triple))
+                    .collect();
+                return match upper.change(&pending, &inserted, &deleted, &stop) {
+                    Ok(change) => Preparation {
+                        base,
+                        proves_consistency: upper.program.proves_consistency()
+                            && upper.clashes_after(&change) == 0,
+                        prepared: Prepared::Delta(Box::new(change)),
+                        ontology: None,
+                    },
+                    Err(gave_up) => Preparation {
+                        base,
+                        prepared: Prepared::Rebuilt(Box::new(Err(gave_up))),
+                        proves_consistency: false,
+                        ontology: None,
+                    },
+                };
+            }
+            Err(_) if !asserted.iter().any(|t| changes_schema(tx, *t)) => {
+                return Preparation {
+                    base,
+                    prepared: Prepared::Unavailable,
+                    proves_consistency: false,
+                    ontology: None,
+                };
+            }
+            _ => {}
+        }
+    }
+    drop(state);
+    source::intern_vocabulary(tx);
+    let ontology = source::read_pending(tx);
+    let normalised = nrese_owl::normalise(&ontology);
+    let upper = Upper::build(&ontology, &normalised, &pending, &|t| tx.intern(t), &stop);
+    Preparation {
+        base,
+        proves_consistency: upper.as_ref().is_ok_and(Upper::proves_consistency),
+        prepared: Prepared::Rebuilt(Box::new(upper)),
+        ontology: Some(ontology),
+    }
+}
+
+/// Whether a changed statement may change the ontology's schema (and so U1's rules),
+/// judged without U1's signature: a blank node, OWL's, RDF's or RDFS's vocabulary as
+/// predicate (but `rdf:type` with another class, and `owl:sameAs`).
+fn changes_schema(tx: &Transaction<'_>, [s, p, o]: Triple) -> bool {
+    use nrese_engine::TermKind;
+    let kind = |t: u64| TermId::from_raw(t).kind();
+    if kind(s) == TermKind::BlankNode || kind(o) == TermKind::BlankNode {
+        return true;
+    }
+    let reserved = |t: u64| match tx.decode(TermId::from_raw(t)) {
+        Some(nrese_rdf::Term::NamedNode(n)) => {
+            let iri = n.as_str();
+            iri.starts_with("http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+                || iri.starts_with("http://www.w3.org/2000/01/rdf-schema#")
+                || iri.starts_with("http://www.w3.org/2002/07/owl#")
+        }
+        _ => false,
+    };
+    let text = |t: u64| match tx.decode(TermId::from_raw(t)) {
+        Some(nrese_rdf::Term::NamedNode(n)) => n.into_string(),
+        _ => String::new(),
+    };
+    match text(p).as_str() {
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" => reserved(o),
+        "http://www.w3.org/2002/07/owl#sameAs" => false,
+        _ => reserved(p),
+    }
+}
+
+fn in_view(view: &Snapshot, [s, p, o]: Triple) -> bool {
+    view.quads_for_pattern_in(
+        ReadModel::Materialised,
+        &nrese_engine::QuadPattern {
+            subject: Some(TermId::from_raw(s)),
+            predicate: Some(TermId::from_raw(p)),
+            object: Some(TermId::from_raw(o)),
+            graph: nrese_engine::GraphSelector::Any,
+        },
+    )
+    .next()
+    .is_some()
+}
+
+/// Installs a commit's preparation for its new `revision`.
+pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: u64) {
+    let mut state = store
+        .dl()
+        .bounds
+        .state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    match preparation.prepared {
+        Prepared::Rebuilt(upper) => {
+            *state = Some(State {
+                revision,
+                upper: *upper,
+                last: "rebuilt",
+            });
+        }
+        Prepared::Delta(change) => match state.as_mut() {
+            Some(s) if s.revision == preparation.base => {
+                if let Ok(upper) = &mut s.upper {
+                    upper.apply(*change);
+                }
+                s.revision = revision;
+                s.last = "delta";
+            }
+            // A query rebuilt U1 for the new revision meanwhile: it stands.
+            Some(s) if s.revision == revision => {}
+            _ => *state = None,
+        },
+        Prepared::Unavailable => {
+            if let Some(s) = state.as_mut()
+                && s.revision == preparation.base
+            {
+                s.revision = revision;
+                s.last = "kept";
+            }
+        }
+    }
+}
+
+/// The read view of the store's latest revision, and its snapshot: U1 built afresh if it
+/// doesn't describe that revision (O(the closure)), the view once per revision.
+pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
+    let bounds = &store.dl().bounds;
+    let mut state = bounds.state.lock().unwrap_or_else(|p| p.into_inner());
+    let snapshot = store.engine().snapshot();
+    let revision = snapshot.revision();
+    if let Some(view) = &*bounds.view.lock().unwrap_or_else(|p| p.into_inner())
+        && view.revision == revision
+    {
+        return (snapshot, Arc::clone(view));
+    }
+    if state.as_ref().is_none_or(|s| s.revision != revision) {
+        let tx = store.engine().speculative();
+        source::intern_vocabulary(&tx);
+        let ontology = source::read_snapshot(&snapshot);
+        let normalised = nrese_owl::normalise(&ontology);
+        let deadline = Instant::now() + store.config().dl.timeout;
+        let stop = move || Instant::now() >= deadline;
+        let upper = Upper::build(&ontology, &normalised, &snapshot, &|t| tx.intern(t), &stop);
+        *state = Some(State {
+            revision,
+            upper,
+            last: "read",
+        });
+    }
+    let s = state.as_ref().expect("built above");
+    let view = Arc::new(build_view(&snapshot, s));
+    *bounds.view.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&view));
+    (snapshot, view)
+}
+
+fn build_view(snapshot: &Snapshot, state: &State) -> View {
+    let upper = match &state.upper {
+        Ok(upper) => upper,
+        Err(GaveUp(why)) => {
+            return View {
+                revision: state.revision,
+                upper: None,
+                unavailable: Some(format!("the upper bound isn't available: {why}")),
+                gap_classes: HashSet::new(),
+                gap_predicates: HashSet::new(),
+                internal: HashSet::new(),
+                facts: 0,
+            };
+        }
+    };
+    let rdf_type = upper.program.names.rdf_type;
+    let clash = upper.program.names.clash;
+    let mut view = View {
+        revision: state.revision,
+        upper: None,
+        unavailable: (!upper.program.incomplete.is_empty()).then(|| {
+            format!(
+                "the upper bound doesn't cover {} axiom(s) (first: {})",
+                upper.program.incomplete.len(),
+                upper.program.incomplete[0].1
+            )
+        }),
+        gap_classes: HashSet::new(),
+        gap_predicates: HashSet::new(),
+        internal: HashSet::new(),
+        facts: upper.stack.len(),
+    };
+    let mut quads = Vec::with_capacity(upper.stack.len());
+    for [s, p, o] in upper.stack.iter() {
+        for t in [s, p, o] {
+            if upper.is_internal(t) {
+                view.internal.insert(t);
+            }
+        }
+        if p == clash {
+            continue;
+        }
+        if p == rdf_type {
+            if !upper.is_internal(o) {
+                view.gap_classes.insert(o);
+            }
+        } else if !upper.is_internal(p) {
+            view.gap_predicates.insert(p);
+        }
+        quads.push(
+            EncodedTriple::new(
+                TermId::from_raw(s),
+                TermId::from_raw(p),
+                TermId::from_raw(o),
+            )
+            .in_default_graph(),
+        );
+    }
+    view.upper = Some(snapshot.with_inferred_added(&quads));
+    view
+}
+
+/// The bounds at the store's latest revision, for reports and tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundsReport {
+    pub revision: u64,
+    /// Why U1 can't bound answers (`None`: it can).
+    pub unavailable: Option<String>,
+    /// U1's facts beyond L.
+    pub upper_facts: usize,
+    /// Classes and other predicates with facts in U1 beyond L.
+    pub gap_classes: usize,
+    pub gap_predicates: usize,
+    /// How U1 got to this revision: `delta`, `rebuilt`, `read` or `kept`.
+    pub last: &'static str,
+}
+
+/// The bounds at the latest revision (U1 built afresh if it doesn't describe it).
+pub(crate) fn report(store: &StoreService) -> BoundsReport {
+    let (_, view) = self::view(store);
+    let last = store
+        .dl()
+        .bounds
+        .state
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .filter(|s| s.revision == view.revision)
+        .map_or("read", |s| s.last);
+    BoundsReport {
+        revision: view.revision,
+        unavailable: view.unavailable.clone(),
+        upper_facts: view.facts,
+        gap_classes: view.gap_classes.len(),
+        gap_predicates: view.gap_predicates.len(),
+        last,
+    }
+}
+
+/// U1's facts beyond L at the latest revision, as N-Triples terms, sorted: as
+/// maintained, or with `afresh` evaluated anew (not installed). `None` if U1 isn't
+/// available. For the differential tests of the maintenance.
+pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[String; 3]>> {
+    let snapshot = store.engine().snapshot();
+    let decode = |t: u64| {
+        snapshot
+            .decode(TermId::from_raw(t))
+            .map_or_else(|| format!("#{t}"), |term| term.to_string())
+    };
+    let facts: Vec<Triple> = if afresh {
+        let tx = store.engine().speculative();
+        source::intern_vocabulary(&tx);
+        let ontology = source::read_snapshot(&snapshot);
+        let normalised = nrese_owl::normalise(&ontology);
+        let upper = Upper::build(
+            &ontology,
+            &normalised,
+            &snapshot,
+            &|t| tx.intern(t),
+            nrese_reasoner::eval::NEVER,
+        )
+        .ok()?;
+        upper.stack.iter().collect()
+    } else {
+        let _ = view(store);
+        let state = store
+            .dl()
+            .bounds
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        state.as_ref()?.upper.as_ref().ok()?.stack.iter().collect()
+    };
+    let mut out: Vec<[String; 3]> = facts.into_iter().map(|t| t.map(decode)).collect();
+    out.sort();
+    Some(out)
+}

@@ -15,8 +15,10 @@
 //! - [`update`] applies SPARQL Update requests ([`apply_update`])
 
 pub mod compat;
+pub mod completeness;
 pub mod dataset;
 pub mod plan;
+pub use completeness::Completeness;
 pub use dataset::GraphAccess;
 mod native;
 pub mod query;
