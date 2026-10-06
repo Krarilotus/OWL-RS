@@ -27,7 +27,7 @@ impl DepSetId {
 const MEMO_LIMIT: usize = 1 << 20;
 
 /// The arena of dependency sets.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DepSets {
     /// `(point, rest)` per set; index 0 is the empty set.
     cells: Vec<(u32, DepSetId)>,

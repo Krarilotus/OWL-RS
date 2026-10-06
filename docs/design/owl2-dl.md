@@ -452,7 +452,7 @@ says what it knows.
 
   L only grows with more sound sources (PAGOdA: LUBM's query count closed by the bounds went from 26 to 33 with the stronger lower bound, C).
 - **Upper bound U1:** a static, TBox-compiled datalog over-approximation:
-  - disjunctions strengthened to one disjunct;
+  - disjunctions split so that every disjunct is derived (PAGOdA's strengthening, Zhou et al. JAIR 2015, Definition 5.1; choosing one disjunct would not bound: where `⊥` blocks it, the answers of the other are lost);
   - existentials to representative Skolem constants;
   - `⊥` neutralised.
 

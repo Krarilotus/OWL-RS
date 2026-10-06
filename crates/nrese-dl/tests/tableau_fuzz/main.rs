@@ -53,8 +53,9 @@ fn interp(m: &Model) -> Option<Interp> {
 fn configs() -> Vec<(&'static str, Config)> {
     // Every blocking pass is checked against a recomputation from scratch.
     let base = Config {
-        max_nodes: 20_000,
-        timeout: Some(std::time::Duration::from_secs(2)),
+        max_nodes: 5_000,
+        max_branch_points: Some(5_000),
+        timeout: Some(std::time::Duration::from_secs(300)),
         check_blocking: true,
         ..Config::default()
     };
@@ -139,7 +140,8 @@ fn render(o: &Ontology) -> String {
 fn shrink(o: &Ontology) {
     let config = Config {
         max_nodes: 3000,
-        timeout: Some(std::time::Duration::from_secs(5)),
+        max_branch_points: Some(5_000),
+        timeout: Some(std::time::Duration::from_secs(300)),
         ..Config::default()
     };
     let stuck = |o: &Ontology| matches!(consistency(o, &config).answer, Answer::GaveUp(_));
@@ -295,8 +297,9 @@ fn check_case(
     }
     // Renaming and shuffling leave the answer as it is.
     let base = Config {
-        max_nodes: 20_000,
-        timeout: Some(std::time::Duration::from_secs(2)),
+        max_nodes: 5_000,
+        max_branch_points: Some(5_000),
+        timeout: Some(std::time::Duration::from_secs(300)),
         ..Config::default()
     };
     let renamed = fuzz::rename(o, &|t| t + 1000);

@@ -129,7 +129,9 @@ pub struct Clause {
 }
 
 impl Clause {
-    pub(crate) fn new(body: Vec<BodyAtom>, head: Vec<HeadAtom>, sources: Vec<usize>) -> Self {
+    /// A clause from its atoms (sorted, deduplicated) with its flags; `sources` is one
+    /// set of axioms that give it.
+    pub fn new(body: Vec<BodyAtom>, head: Vec<HeadAtom>, sources: Vec<usize>) -> Self {
         let mut body = body;
         body.sort();
         body.dedup();

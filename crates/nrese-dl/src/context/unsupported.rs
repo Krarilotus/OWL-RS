@@ -35,6 +35,8 @@ pub enum Unsupported {
     },
     /// More concepts, roles or functions than an atom holds.
     TooLarge,
+    /// The saturation's budget ran out ([`super::engine::Budget`]).
+    Budget,
 }
 
 impl fmt::Display for Unsupported {
@@ -49,6 +51,7 @@ impl fmt::Display for Unsupported {
             Unsupported::ClauseShape { axiom } => write!(out, "clause shape (axiom {axiom})"),
             Unsupported::Normalisation { axiom, why } => write!(out, "{why} (axiom {axiom})"),
             Unsupported::TooLarge => write!(out, "too many concepts or roles"),
+            Unsupported::Budget => write!(out, "the saturation's budget ran out"),
         }
     }
 }

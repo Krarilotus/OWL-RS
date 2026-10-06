@@ -48,6 +48,7 @@ fn repository_routes() -> Router<AppState> {
         )
         .route("/autocomplete", get(handlers::autocomplete))
         .route("/classification", get(handlers::classification_get))
+        .route("/realisation", get(handlers::realisation_get))
         .route("/backup", get(handlers::admin_backup_dataset))
         .route("/restore", post(handlers::admin_restore_dataset))
         .route("/image", post(handlers::repository_image_backup))
@@ -268,6 +269,7 @@ pub fn router(state: AppState) -> Router {
             get(handlers::shacl_get).post(handlers::shacl_post),
         )
         .route("/dataset/classification", get(handlers::classification_get))
+        .route("/dataset/realisation", get(handlers::realisation_get))
         // The engine API (ADR-0007): every capability for every repository, by the same
         // handlers as the default repository's `/dataset/…` routes.
         .route("/api/v1/repositories", get(api_v1::repositories))

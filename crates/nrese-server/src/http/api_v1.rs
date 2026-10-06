@@ -387,6 +387,58 @@ pub async fn session_rollback(
 struct Explanation {
     /// The statement first; each premise after the steps that use it.
     steps: Vec<ExplanationStep>,
+    /// Under `owl2-dl`, for a statement the rules don't derive but OWL 2 DL entails: a
+    /// minimal set of the ontology's axioms it follows from (`steps` is then empty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owl2_dl: Option<DlJustified>,
+}
+
+/// A justification under OWL 2 DL.
+#[derive(Serialize, utoipa::ToSchema)]
+struct DlJustified {
+    /// The axioms, each in the functional-style syntax with the triples it was read from.
+    axioms: Vec<DlAxiom>,
+    /// No axiom can be left out (false: a budget ran out first; the set still entails it).
+    minimal: bool,
+    /// A fresh entailment test confirmed the set.
+    verified: bool,
+    /// Entailment tests run by the DL engines.
+    tests: usize,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct DlAxiom {
+    axiom: String,
+    sources: Vec<DlSource>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct DlSource {
+    /// The graph (`null`: the default graph).
+    graph: Option<String>,
+    triples: Vec<[String; 3]>,
+}
+
+impl From<nrese_store::dl::explain::DlExplanation> for DlJustified {
+    fn from(e: nrese_store::dl::explain::DlExplanation) -> Self {
+        Self {
+            axioms: e
+                .axioms
+                .into_iter()
+                .map(|a| DlAxiom {
+                    axiom: a.axiom,
+                    sources: a
+                        .sources
+                        .into_iter()
+                        .map(|(graph, triples)| DlSource { graph, triples })
+                        .collect(),
+                })
+                .collect(),
+            minimal: e.minimal,
+            verified: e.verified,
+            tests: e.tests,
+        }
+    }
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -415,7 +467,7 @@ struct ExplanationStep {
     responses((status = 200, description = "`{\"steps\": [...]}`: the statement first, each step with its premises; with `justifications`, `{\"mode\", \"justifications\" | \"statements\", \"complete\", \"verified\"}`", body = Explanation),
         (status = 400, description = "An unknown `justifications` mode", body = crate::http::openapi::Problem),
         (status = 403, description = "The requester doesn't see inferred statements", body = crate::http::openapi::Problem),
-        (status = 404, description = "The statement doesn't hold, or reasoning is off", body = crate::http::openapi::Problem)))]
+        (status = 404, description = "The statement doesn't hold, or reasoning is off; under `owl2-dl`, a statement the rules don't derive is explained by `owl2_dl` (a minimal set of axioms) if OWL 2 DL entails it", body = crate::http::openapi::Problem)))]
 /// Why the statement `subj pred obj` (N-Triples terms, as RDF4J's parameters) holds: a
 /// derivation from asserted statements, the statement first. 404 if it doesn't hold or
 /// reasoning is off; 403 for users who don't see inferred statements.
@@ -485,18 +537,22 @@ pub async fn explain(
         .ok_or_else(|| ApiError::not_found("the statement doesn't hold"))?;
         return Ok(Json(Justified::from(answer)).into_response());
     }
-    let steps = tokio::task::spawn_blocking(move || {
-        store.explain_statement(
-            program,
-            &scope,
-            subject.as_ref(),
-            predicate.as_ref(),
-            object.as_ref(),
-        )
+    let dl = state.store().dl().active();
+    let found = tokio::task::spawn_blocking(move || {
+        let statement = [subject.as_ref(), predicate.as_ref(), object.as_ref()];
+        match store.explain_statement(program, &scope, statement[0], statement[1], statement[2]) {
+            Some(steps) => Some((steps, None)),
+            // Not derived by the rules: under owl2-dl, why OWL 2 DL entails it.
+            None if dl => store
+                .explain_dl(&scope, statement)
+                .map(|e| (Vec::new(), Some(DlJustified::from(e)))),
+            None => None,
+        }
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
     .ok_or_else(|| ApiError::not_found("the statement doesn't hold"))?;
+    let (steps, owl2_dl) = found;
     let steps: Vec<ExplanationStep> = steps
         .into_iter()
         .map(|step| ExplanationStep {
@@ -508,7 +564,7 @@ pub async fn explain(
             premises: step.premises,
         })
         .collect();
-    Ok(Json(Explanation { steps }).into_response())
+    Ok(Json(Explanation { steps, owl2_dl }).into_response())
 }
 
 /// The justifications of a statement (`explain?justifications=...`).
