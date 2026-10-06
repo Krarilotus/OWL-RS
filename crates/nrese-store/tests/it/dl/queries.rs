@@ -137,6 +137,26 @@ fn non_monotone_operators_over_an_open_gap_are_sound_only() {
 }
 
 #[test]
+fn schema_vocabulary_and_variable_predicates_are_not_bounded() {
+    let dl = pipeline();
+    insert(&dl, UNION).expect("data");
+    // A ⊑ D holds under OWL 2 DL; the RL closure doesn't have it, and U1 bounds no
+    // schema statement: never reported complete.
+    let (_, status) = query(&dl, "SELECT ?x { :A rdfs:subClassOf ?x }");
+    assert!(!status.is_complete());
+    assert!(
+        status.reasons()[0].contains("subClassOf"),
+        "{:?}",
+        status.reasons()
+    );
+    let (_, status) = query(&dl, "SELECT ?x { ?x ?p :y }");
+    assert!(status.reasons()[0].contains("variable predicate"));
+    // rdf:type and owl:sameAs are bounded.
+    let (_, status) = query(&dl, "SELECT ?x { ?x owl:sameAs ?y }");
+    assert!(status.is_complete(), "{:?}", status.reasons());
+}
+
+#[test]
 fn the_sound_and_exact_modes() {
     let dl = pipeline_with(DlConfig {
         answers: DlAnswers::Sound,
