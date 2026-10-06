@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# The quick gate before a commit: fmt, clippy and tests of the crates changed against HEAD.
+# The commit tier: fmt, clippy and the fast tests of the crates changed against HEAD.
 # Enable the hooks with: git config core.hooksPath .githooks
-exec scripts/check.sh --changed
+exec scripts/check.sh commit

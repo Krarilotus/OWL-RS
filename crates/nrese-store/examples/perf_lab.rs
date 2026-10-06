@@ -47,9 +47,17 @@ use nrese_store::{
 };
 
 /// mimalloc, as in the server; `RUSTFLAGS="--cfg system_alloc"` measures the system allocator.
-#[cfg(not(system_alloc))]
+#[cfg(not(any(system_alloc, alloc_profile)))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// `RUSTFLAGS="--cfg alloc_profile"`: mimalloc with every allocation counted, and a heap
+/// profile of `--reason` by phase (the bytes requested, not what the system commits; the
+/// counting slows parallel work, so time is measured without it).
+#[cfg(alloc_profile)]
+#[global_allocator]
+static GLOBAL: nrese_exec::heap::Counting<mimalloc::MiMalloc> =
+    nrese_exec::heap::Counting(mimalloc::MiMalloc);
 
 struct Args {
     store: Option<PathBuf>,
@@ -376,7 +384,73 @@ fn qerror_summary(by_operator: &BTreeMap<String, Vec<f64>>) -> String {
     format!("{{\n{}\n  }}", json.join(",\n"))
 }
 
+/// The heap profile of a materialisation (`--cfg alloc_profile` builds): each phase's peak
+/// and what it left, merged over the rounds, in the order the phases first came.
+fn heap_profile(phases: Vec<nrese_exec::heap::Phase>) {
+    // Without the counting allocator every phase reads zero.
+    if phases.iter().all(|phase| phase.peak == 0) {
+        return;
+    }
+    let mib = |bytes: usize| bytes as f64 / 1048576.0;
+    let mut merged: Vec<(&str, usize, usize, usize)> = Vec::new();
+    for phase in &phases {
+        match merged.iter_mut().find(|(label, ..)| *label == phase.label) {
+            Some((_, peak, after, times)) => {
+                *peak = (*peak).max(phase.peak);
+                *after = (*after).max(phase.live_after);
+                *times += 1;
+            }
+            None => merged.push((phase.label, phase.peak, phase.live_after, 1)),
+        }
+    }
+    eprintln!("heap profile (MiB requested): phase, times, peak, most live after");
+    for (label, peak, after, times) in merged {
+        eprintln!(
+            "  {label:<28} {times:>3} {:>10.1} {:>10.1}",
+            mib(peak),
+            mib(after)
+        );
+    }
+    eprintln!("heap profile by round (MiB requested): phase, peak, live after");
+    let mut round = 0;
+    for phase in &phases {
+        round += usize::from(phase.label == "reasoner: grounding");
+        eprintln!(
+            "  {round:>2} {:<28} {:>10.1} {:>10.1}",
+            phase.label,
+            mib(phase.peak),
+            mib(phase.live_after)
+        );
+    }
+    let top = phases
+        .iter()
+        .max_by_key(|phase| phase.peak)
+        .expect("not empty");
+    let round = phases
+        .iter()
+        .take_while(|phase| !std::ptr::eq(*phase, top))
+        .filter(|phase| phase.label == "reasoner: grounding")
+        .count();
+    eprintln!(
+        "heap peak {:.1} MiB in {} (round {round})",
+        mib(top.peak),
+        top.label
+    );
+}
+
+/// Peak and current memory in MiB, where the OS reports it: on Linux the resident set, on
+/// Windows the committed private bytes.
+#[cfg(windows)]
+fn memory_mib() -> Option<(u64, u64)> {
+    let mib = |bytes: u64| bytes / 1048576;
+    Some((
+        mib(nrese_exec::memory::peak_process_bytes()?),
+        mib(nrese_exec::memory::process_bytes()?),
+    ))
+}
+
 /// Peak and current resident memory in MiB, where the OS reports it (Linux).
+#[cfg(not(windows))]
 fn memory_mib() -> Option<(u64, u64)> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let field = |name: &str| {
@@ -475,14 +549,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("loaded {} quads in {load_s:.2} s", report.inserted);
     }
     if let Some(ruleset) = args.reason {
+        if let Some((peak, rss)) = memory_mib() {
+            eprintln!("before reasoning: memory peak {peak} MiB, resident {rss} MiB");
+        }
+        nrese_exec::heap::start("store: compile");
         let started = Instant::now();
-        let report = store.rematerialise(ruleset)?;
+        // The process's memory while it reasons, read every 20 ms: the peak counter of
+        // the OS also holds the load's.
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let (report, sampled) = std::thread::scope(|scope| {
+            let sampler = scope.spawn(|| {
+                let mut peak = 0;
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    peak = peak.max(nrese_exec::memory::process_bytes().unwrap_or(0));
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                peak
+            });
+            let report = store.rematerialise(ruleset);
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            (report, sampler.join().expect("the sampler ends"))
+        });
+        let report = report?;
         eprintln!(
             "reasoned ({}): {} inferred in {:.2} s",
             ruleset.name(),
             report.inferred,
             started.elapsed().as_secs_f64()
         );
+        eprintln!(
+            "reasoning: process memory peak {} MiB (sampled)",
+            sampled / 1048576
+        );
+        heap_profile(nrese_exec::heap::finish());
     }
     if let Some(shapes) = &args.shapes {
         store.bulk_load(&BulkLoadRequest {

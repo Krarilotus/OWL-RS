@@ -20,4 +20,18 @@ describe("textReport", () => {
       });
     }
   });
+
+  test("a problem document prints as one line with its request id", () => {
+    const problem = {
+      type: "https://nrese.dev/problems/not-found",
+      title: "Not Found",
+      status: 404,
+      detail: "no graph <http://e/g>",
+      request_id: "req-1",
+    };
+    expect(textReport({ ok: false, status: 404, body: "{}", problem })).toEqual({
+      lines: ["status=404", "error: Not Found: no graph <http://e/g> (request req-1)"],
+      exitCode: 1,
+    });
+  });
 });

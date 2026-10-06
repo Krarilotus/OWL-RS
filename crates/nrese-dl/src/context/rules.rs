@@ -127,6 +127,11 @@ struct Item {
 }
 
 impl Found {
+    /// Conclusions so far.
+    pub(super) fn len(&self) -> usize {
+        self.items.len()
+    }
+
     pub(super) fn clear(&mut self) {
         self.items.clear();
         self.atoms.clear();
@@ -188,9 +193,17 @@ impl Worker<'_> {
     pub fn handle(&mut self, message: Message) {
         self.state.clauses.counters.messages += 1;
         self.message(message);
+        let mut given = 0u32;
         loop {
             while let Some(c) = self.state.clauses.next_given() {
                 self.process(c);
+                given = given.wrapping_add(1);
+                // One context's agenda can run for minutes (its redundancy checks grow with
+                // its clauses): the budget is checked inside it too. Stopping leaves the
+                // run exhausted, which ends it as `Unsupported::Budget`, never an answer.
+                if given.is_multiple_of(256) && self.engine.out_of_time() {
+                    return;
+                }
             }
             match self.out.local.pop() {
                 Some(m) => {

@@ -8,6 +8,7 @@ import {
   runUpdate,
   writeGraph,
 } from "../lib/api";
+import { describeProblem, type Problem } from "../lib/http";
 import type { OutputState, QuerySuggestion } from "../lib/types";
 
 type Setter<T> = (value: T) => void;
@@ -32,7 +33,7 @@ type SuggestionState = {
 export function useConsoleActions(strings: AppStrings, runtimeRefs: RuntimeRefs) {
   async function applyAction(
     title: string,
-    operation: Promise<{ ok: boolean; status: number; body: string }>,
+    operation: Promise<{ ok: boolean; status: number; body: string; problem?: Problem }>,
     setOutput: Setter<OutputState>,
     refresh = false,
   ) {
@@ -40,7 +41,9 @@ export function useConsoleActions(strings: AppStrings, runtimeRefs: RuntimeRefs)
     setOutput({
       title: `${title} (${response.status})`,
       status: response.ok ? "success" : "error",
-      body: response.body || strings.noOutput,
+      body: response.problem
+        ? describeProblem(response.problem)
+        : response.body || strings.noOutput,
     });
     if (refresh) {
       void runtimeRefs.refetchRuntime();

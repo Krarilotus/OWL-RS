@@ -1,6 +1,7 @@
 //! HTTP fuzzing (G7): seeded random requests against every route the router serves. Each
-//! answer must come in time, never be a server error (500 or 502), and a JSON body must
-//! be JSON; a handler that panics fails the test where it runs. Afterwards the server
+//! answer must come in time, never be a server error (500 or 502), a JSON body must be
+//! JSON, and an error must be a problem document with its status and request id (one
+//! envelope, whoever answered); a handler that panics fails the test where it runs. Afterwards the server
 //! still answers `/readyz` and a query.
 //!
 //! The routes are read from the router's source (`src/http/routes.rs`), templates filled
@@ -446,11 +447,14 @@ async fn fuzz(policy: nrese_server::policy::PolicyConfig, tokens: &[&str], strea
         let response = response.unwrap();
         let status = response.status();
         *by_status.entry(status.as_u16()).or_default() += 1;
-        let json = response
+        let media = response
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.starts_with("application/json"));
+            .unwrap_or_default()
+            .to_owned();
+        let json = media.starts_with("application/json");
+        let problem = media.starts_with("application/problem+json");
         let body = axum::body::to_bytes(response.into_body(), 256 << 20).await;
         let Ok(body) = body else {
             failures.push(format!("{line}: {status}, the body couldn't be read"));
@@ -469,6 +473,19 @@ async fn fuzz(policy: nrese_server::policy::PolicyConfig, tokens: &[&str], strea
                 "{line}: {status}, a JSON content type over {}",
                 String::from_utf8_lossy(&body[..body.len().min(200)])
             ));
+        } else if (status.is_client_error() || status.is_server_error()) && !head {
+            // One error envelope: a problem document with its status and request id.
+            let document = serde_json::from_slice::<serde_json::Value>(&body).ok();
+            let enveloped = problem
+                && document.as_ref().is_some_and(|document| {
+                    document["status"] == status.as_u16() && document["request_id"].is_string()
+                });
+            if !enveloped {
+                failures.push(format!(
+                    "{line}: {status}, not a problem document ({media}): {}",
+                    String::from_utf8_lossy(&body[..body.len().min(200)])
+                ));
+            }
         }
     }
     eprintln!("{cases} requests (seed {seed:#x}), by status: {by_status:?}");

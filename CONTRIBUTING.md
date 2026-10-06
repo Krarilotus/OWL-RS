@@ -11,7 +11,7 @@ NRESE is licensed under the Apache License, Version 2.0 ([LICENSE-APACHE](LICENS
 
 - A new dependency must be permissively licensed, so that NRESE stays usable under MIT or Apache-2.0 alone: MIT, Apache-2.0, BSD, ISC, Zlib, Unicode, and similar. MPL-2.0 only unmodified, and only after asking.
 - GPL, LGPL (statically linked), AGPL and source-available dependencies aren't accepted: they would impose their terms on everyone who uses NRESE.
-- Prefer none at all: see the rules in [docs/plan/2026-09-30-graphdb-parity-plan.md](docs/plan/2026-09-30-graphdb-parity-plan.md) §6.
+- Prefer none at all: the rules are in [ADR-0010](docs/adr/0010-standing-product-decisions.md) (libraries behind our own traits; no C or C++ for speed).
 
 ## Working rules
 
@@ -19,6 +19,21 @@ Layer ownership, where to fix what, and the evidence a change needs are in [docs
 
 ## Checks
 
-- `scripts/check.sh` is the gate every change passes before it is pushed: rustfmt, clippy on all targets with warnings as errors, the tests of both Cargo workspaces, the lock check, `cargo-deny` (licences, advisories, bans, sources; `deny.toml`) and the console's typecheck and tests. `scripts/check.sh --changed` runs fmt, clippy and the tests of the crates you changed.
-- Git hooks run them for you: `git config core.hooksPath .githooks` (`pre-commit`: the changed crates; `pre-push`: the whole gate).
-- CI (`.github/workflows/ci.yml`, the same steps on Linux) runs at milestones and on merges to `main`: `gh workflow run ci.yml --ref <branch>`; the Jena oracle likewise (`oracle.yml`).
+`scripts/check.sh` is the gate, in three tiers. A test runs where it matters: each crate
+owns its tests, and benchmarks never run in a gate.
+
+| Tier | When | What |
+|---|---|---|
+| `commit` | the pre-commit hook | rustfmt; clippy (warnings are errors) on the changed crates and every crate depending on them; the changed crates' fast tests |
+| `push` | the pre-push hook | the same for everything changed since the upstream branch, with all the changed crates' tests (their slow suites too), the dependents' fast tests, and the lock check |
+| `all` | milestones, merges to `main`, CI | everything: both Cargo workspaces, doc tests, the lock check, `cargo-deny` (licences, advisories, bans, sources; `deny.toml`), the console's typecheck and tests |
+
+- A crate declares its slow test binaries (conformance suites, fuzz campaigns: over ~15 s)
+  in its manifest, `[package.metadata.nrese] slow-tests = [...]`.
+- Tests run under `cargo-nextest` where it is installed (`cargo install --locked
+  cargo-nextest`): every test of every binary in parallel. Without it, `cargo test` runs
+  crate by crate.
+- Enable the hooks with `git config core.hooksPath .githooks`.
+- CI (`.github/workflows/ci.yml`, the same steps on Linux) runs at milestones and on
+  merges to `main`: `gh workflow run ci.yml --ref <branch>`; the Jena oracle likewise
+  (`oracle.yml`).
