@@ -159,6 +159,7 @@ impl<B: Base + ?Sized> Overlay<'_, B> {
 
 impl<B: Base + ?Sized> Source for Overlay<'_, B> {
     fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
+        let seg = seg.plain();
         self.extra.scan(pattern, seg, f);
         if seg != Seg::Delta {
             self.base.scan(pattern, &mut |fact| {
@@ -170,10 +171,11 @@ impl<B: Base + ?Sized> Source for Overlay<'_, B> {
     }
 
     fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
+        let seg = seg.plain();
         let extra = self.extra.estimate(pattern, seg);
         match seg {
-            Seg::Delta => extra,
             Seg::Old | Seg::All => extra + self.base.estimate(pattern),
+            _ => extra,
         }
     }
 
