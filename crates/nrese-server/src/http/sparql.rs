@@ -132,6 +132,7 @@ fn completeness_json(
     status.map_or(serde_json::Value::Null, |c| {
         serde_json::json!({
             "status": c.as_str(),
+            "regime": c.regime.map(|r| r.as_str()),
             "sound": c.sound,
             "complete": c.complete,
             "reasons": c
@@ -175,6 +176,10 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
             explanation.completeness.as_ref(),
             &explanation.decided_by,
         ),
+        "candidates": explanation.candidates.map(|c| serde_json::json!({
+            "proved": c.proved,
+            "refuted": c.refuted,
+        })),
         "ql": ql_json(explanation.ql.as_ref()),
         "steps": steps,
     })
@@ -251,7 +256,7 @@ fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
             policy.bad_request_for_sparql_parse_error(error.to_string())
         }
         // Exact answers asked for under owl2-dl, and the store can't prove them complete.
-        StoreError::Incomplete(_) => ApiError::conflict(error.to_string()),
+        StoreError::Incomplete(answer) => ApiError::IncompleteAnswer(answer),
         error => ApiError::internal(error.to_string()),
     }
 }

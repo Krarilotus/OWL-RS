@@ -670,7 +670,7 @@ async fn query_answers_say_whether_answers_through_existentials_are_complete()
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.headers()["nrese-completeness"],
-        "complete",
+        "complete; regime=owl2-rl",
         "{:?}",
         response.headers()
     );
@@ -690,7 +690,8 @@ async fn query_answers_say_whether_answers_through_existentials_are_complete()
         .to_str()?
         .to_owned();
     assert!(
-        header.starts_with("sound-only; reasons=\"ql: ") && header.contains("is transitive"),
+        header.starts_with("sound-only; regime=owl2-rl; reasons=\"ql: ")
+            && header.contains("is transitive"),
         "{header}"
     );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
