@@ -46,7 +46,13 @@ pub struct DlDetail {
     pub paths: Vec<&'static str>,
     pub proved: u64,
     pub refuted: u64,
+    /// The first candidates neither proved nor refuted, as `?x=<…> ?y=<…>` (`ASK` for a
+    /// boolean query), at most [`UNRESOLVED_SHOWN`].
+    pub unresolved: Vec<String>,
 }
+
+/// The unresolved candidates a status names; the bounds count them all.
+pub const UNRESOLVED_SHOWN: usize = 20;
 
 /// The DL status of a revision: whether its data is consistent under OWL 2 DL, by which
 /// engine.
