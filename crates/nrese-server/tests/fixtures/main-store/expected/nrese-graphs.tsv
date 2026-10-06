@@ -1,0 +1,5 @@
+?g	?s	?p	?o
+<http://e/g1>	<http://e/dan>	<http://e/name>	"Dan"
+<http://e/g1>	<http://e/dan>	<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>	<http://e/Professor>
+<http://e/g1>	<http://e/gus>	<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>	<http://e/Faculty>
+<http://e/g2>	<http://e/eve>	<http://e/memberOf>	<http://e/dept1>

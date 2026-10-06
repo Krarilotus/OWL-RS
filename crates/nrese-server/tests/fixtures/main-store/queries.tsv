@@ -1,0 +1,22 @@
+nrese	all-asserted	SELECT ?s ?p ?o WHERE { ?s ?p ?o }
+nrese	graphs	SELECT ?g ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }
+nrese	persons	SELECT ?x WHERE { ?x a <http://e/Person> }
+nrese	chairs	SELECT ?x WHERE { ?x a <http://e/Chair> }
+nrese	works-for	SELECT ?x ?y WHERE { ?x <http://e/worksFor> ?y }
+nrese	members	SELECT ?x ?y WHERE { ?y <http://e/member> ?x }
+nrese	sub-organisations	SELECT ?x ?y WHERE { ?x <http://e/subOrganisationOf> ?y }
+nrese	same-as	SELECT ?x ?e WHERE { ?x <http://e/email> ?e }
+nrese	works-somewhere	SELECT ?x WHERE { ?x <http://e/worksFor> [] }
+nrese	prefixed	SELECT ?n WHERE { ex:uni1 ex:name ?n }
+nrese	count	SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }
+rdfs	persons	SELECT ?x WHERE { ?x a <http://e/Person> }
+rdfs	all	SELECT ?s ?p ?o WHERE { ?s ?p ?o }
+rules	affiliated	SELECT ?x ?u WHERE { ?x <http://e/affiliatedWith> ?u }
+rules	persons	SELECT ?x WHERE { ?x a <http://e/Person> }
+dotted.1	all	SELECT ?s ?p ?o WHERE { ?s ?p ?o }
+.staging	all	SELECT ?s ?p ?o WHERE { ?s ?p ?o }
+.trash-kept	all	SELECT ?s ?p ?o WHERE { ?s ?p ?o }
+ql	works-somewhere	SELECT ?x WHERE { ?x <http://e/worksFor> [] }
+ql	knows	SELECT ?x ?y WHERE { ?x <http://e/knows> ?y }
+ql	all	SELECT ?s ?p ?o WHERE { ?s ?p ?o }
+horst	all	SELECT ?s ?p ?o WHERE { ?s ?p ?o }
