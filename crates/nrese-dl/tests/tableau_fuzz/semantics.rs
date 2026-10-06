@@ -281,3 +281,58 @@ pub fn find_model(
     }
     None
 }
+
+/// Whether a folded model `i` of the engine's confirms `o`: closed under the role
+/// inclusions, as it is or with its loops untied ([`untie_loops`]).
+pub fn confirms(o: &Ontology, mut i: Interp) -> bool {
+    close(o, &mut i);
+    model_of(o, &i)
+        || untie_loops(&i).is_some_and(|mut u| {
+            close(o, &mut u);
+            model_of(o, &u)
+        })
+}
+
+/// `i` with every self-loop untied: each looped element `v` becomes a cycle of three
+/// copies with `v`'s concepts and `v`'s edges to the other elements, its loops running
+/// along the cycle. Folding a blocked node onto its blocker can close a loop on one
+/// element, which an irreflexive role (a property disjoint with its inverse, say)
+/// forbids, while the unravelled model it stands for is a model (seed 94543, case 143);
+/// three copies keep every non-counting constraint the element met. `None` without a
+/// loop, or past 128 elements.
+fn untie_loops(i: &Interp) -> Option<Interp> {
+    let looped: Vec<u32> = (0..i.n)
+        .filter(|&v| i.roles.values().any(|r| r[v as usize] & (1 << v) != 0))
+        .collect();
+    if looped.is_empty() || i.n as usize + 2 * looped.len() > 128 {
+        return None;
+    }
+    let mut out = i.clone();
+    out.n = i.n + 2 * looped.len() as u32;
+    for rows in out.roles.values_mut() {
+        rows.resize(out.n as usize, 0);
+    }
+    for (k, &v) in looped.iter().enumerate() {
+        let copies = [v, i.n + 2 * k as u32, i.n + 2 * k as u32 + 1];
+        for c in copies[1..].iter() {
+            for set in out.concepts.values_mut() {
+                if *set & (1 << v) != 0 {
+                    *set |= 1 << c;
+                }
+            }
+        }
+        for (p, rows) in &i.roles {
+            let row = rows[v as usize];
+            let others = row & !(1 << v);
+            let looping = row & (1 << v) != 0;
+            let out_rows = out.roles.get_mut(p).expect("same roles");
+            for (at, &c) in copies.iter().enumerate() {
+                out_rows[c as usize] = others;
+                if looping {
+                    out_rows[c as usize] |= 1 << copies[(at + 1) % 3];
+                }
+            }
+        }
+    }
+    Some(out)
+}
