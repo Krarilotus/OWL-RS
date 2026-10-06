@@ -73,6 +73,27 @@ fn union(mut parts: Vec<Vec<Pair>>) -> Pairs {
     sort_chunked(parts, false)
 }
 
+/// `pairs` without those of `other` (both sorted), in one pass over both; chunks keep no
+/// spare capacity.
+fn without(pairs: Pairs, other: &Pairs) -> Pairs {
+    if other.len() == 0 {
+        return pairs;
+    }
+    let mut others = other.iter().peekable();
+    let mut out = Pairs::default();
+    for mut chunk in pairs.chunks {
+        chunk.retain(|pair| {
+            while others.next_if(|&other| other < pair).is_some() {}
+            others.peek() != Some(&pair)
+        });
+        if chunk.len() < chunk.capacity() {
+            chunk = chunk.as_slice().to_vec();
+        }
+        out.push(chunk);
+    }
+    out
+}
+
 /// The pairs of `parts` (each read as `(b, a)` if `swap`), sorted and distinct, in chunks
 /// of at most about [`chunk_pairs`] pairs, without ever holding them in one vector: a sample of
 /// them gives the chunks' bounds, each part is split by the bounds (and freed, if it is
@@ -227,6 +248,9 @@ pub struct Counters {
     pub closure_pairs: Vec<u64>,
     /// Scans for `sameAs` partners by the equality module (equality by copying, #12).
     pub member_scans: u64,
+    /// The pairs the relations' merges wrote into their base and recent runs (both
+    /// orders): the merge phase's work (R13's layout).
+    pub merged_pairs: u64,
     /// Per round: the complete bindings the rule jobs enumerated, each a candidate fact
     /// per head atom (the joins' work).
     pub bindings: Vec<u64>,
@@ -400,9 +424,19 @@ impl Cursor {
             at: 0,
         }
     }
+}
 
-    /// The pairs of the current chunk not read yet; empty at the end. A chunk read to its
-    /// end is freed here if the cursor holds the only reference to the pairs.
+/// What a merge reads from: sorted pairs, a slice at a time.
+trait Feed {
+    /// The next pairs not read yet; empty at the end.
+    fn rest(&mut self) -> &[Pair];
+    /// Marks the first `n` pairs of [`Feed::rest`] read.
+    fn read(&mut self, n: usize);
+}
+
+impl Feed for Cursor {
+    /// The pairs of the current chunk not read yet. A chunk read to its end is freed here
+    /// if the cursor holds the only reference to the pairs.
     fn rest(&mut self) -> &[Pair] {
         while self
             .pairs
@@ -421,54 +455,96 @@ impl Cursor {
             .get(self.chunk)
             .map_or(&[], |chunk| &chunk[self.at..])
     }
+
+    fn read(&mut self, n: usize) {
+        self.at += n;
+    }
 }
 
-/// The union of two disjoint runs, in chunks of [`chunk_pairs`]; a source this holds the only
-/// reference to is freed a chunk at a time as the merge passes it.
-fn merge(a: Arc<Pairs>, b: Arc<Pairs>) -> Pairs {
-    let total = a.len() + b.len();
-    let (mut a, mut b) = (Cursor::new(a), Cursor::new(b));
-    let mut out = Pairs::default();
-    let size = chunk_pairs();
-    let mut chunk = Vec::with_capacity(size.min(total));
+/// The union of two disjoint feeds, a buffer at a time: a merge's source that is itself a
+/// merge, so three runs merge in one pass, without a copy of the union of two of them.
+struct Merged<A, B> {
+    a: A,
+    b: B,
+    buffer: Vec<Pair>,
+    at: usize,
+}
+
+impl<A: Feed, B: Feed> Merged<A, B> {
+    fn new(a: A, b: B) -> Self {
+        Self {
+            a,
+            b,
+            buffer: Vec::with_capacity(chunk_pairs().min(4096)),
+            at: 0,
+        }
+    }
+}
+
+impl<A: Feed, B: Feed> Feed for Merged<A, B> {
+    fn rest(&mut self) -> &[Pair] {
+        if self.at == self.buffer.len() {
+            self.buffer.clear();
+            self.at = 0;
+            fill(&mut self.a, &mut self.b, &mut self.buffer);
+        }
+        &self.buffer[self.at..]
+    }
+
+    fn read(&mut self, n: usize) {
+        self.at += n;
+    }
+}
+
+/// Moves the pairs of `a` and `b` (disjoint), in order, into `out` until it is full or
+/// both are read.
+fn fill(a: &mut impl Feed, b: &mut impl Feed, out: &mut Vec<Pair>) {
     loop {
         let (x, y) = (a.rest(), b.rest());
-        let room = chunk.capacity() - chunk.len();
+        let room = out.capacity() - out.len();
         let (i, j) = if y.is_empty() {
             let n = room.min(x.len());
-            chunk.extend_from_slice(&x[..n]);
+            out.extend_from_slice(&x[..n]);
             (n, 0)
         } else if x.is_empty() {
             let n = room.min(y.len());
-            chunk.extend_from_slice(&y[..n]);
+            out.extend_from_slice(&y[..n]);
             (0, n)
         } else {
             let (mut i, mut j) = (0, 0);
             while i + j < room && i < x.len() && j < y.len() {
                 if x[i] < y[j] {
-                    chunk.push(x[i]);
+                    out.push(x[i]);
                     i += 1;
                 } else {
-                    chunk.push(y[j]);
+                    out.push(y[j]);
                     j += 1;
                 }
             }
             (i, j)
         };
         if i + j == 0 {
+            return;
+        }
+        a.read(i);
+        b.read(j);
+    }
+}
+
+/// The union of two disjoint feeds holding `total` pairs, in chunks of [`chunk_pairs`]; a
+/// source a cursor holds the only reference to is freed a chunk at a time as the merge
+/// passes it.
+fn merge(mut a: impl Feed, mut b: impl Feed, total: usize) -> Pairs {
+    let mut out = Pairs::default();
+    let size = chunk_pairs();
+    while out.len() < total {
+        let mut chunk = Vec::with_capacity(size.min(total - out.len()));
+        fill(&mut a, &mut b, &mut chunk);
+        if chunk.is_empty() {
             break;
         }
-        a.at += i;
-        b.at += j;
-        if chunk.len() == chunk.capacity() {
-            let left = total - out.len() - chunk.len();
-            out.push(std::mem::replace(
-                &mut chunk,
-                Vec::with_capacity(size.min(left)),
-            ));
-        }
+        out.push(chunk);
     }
-    out.push(chunk);
     out
 }
 
@@ -614,7 +690,7 @@ impl Run {
         &'a self,
         s: Option<u64>,
         o: Option<u64>,
-        old: Option<bool>,
+        old: bool,
         out: &mut Slices<'a>,
     ) -> bool {
         match (s, o) {
@@ -649,27 +725,55 @@ impl Run {
 
     /// The union with a disjoint run, one order at a time, so the sources and the result
     /// never coexist in both; a source this holds the only reference to is freed as it is
-    /// merged.
-    fn merge(self, other: Run) -> Run {
+    /// merged. Adds the pairs it writes (both orders) to `written`.
+    fn merge(self, other: Run, written: &mut usize) -> Run {
         if self.len() == 0 {
             return other;
         }
         if other.len() == 0 {
             return self;
         }
-        let so = Arc::new(merge(self.so, other.so));
+        let two = |a: Arc<Pairs>, b: Arc<Pairs>| {
+            let total = a.len() + b.len();
+            Arc::new(merge(Cursor::new(a), Cursor::new(b), total))
+        };
+        let so = two(self.so, other.so);
         let os = match (self.os, other.os) {
-            (Some(a), Some(b)) => Some(Arc::new(merge(a, b))),
+            (Some(a), Some(b)) => Some(two(a, b)),
             _ => None,
         };
+        *written += so.len() + os.as_ref().map_or(0, |os| os.len());
+        Run { so, os }
+    }
+
+    /// [`Run::merge`] with two runs at once (all three disjoint), in one pass: `b` and `c`
+    /// are merged as they are read, without a copy of their union.
+    fn merge_both(self, b: Run, c: Run, written: &mut usize) -> Run {
+        if b.len() == 0 {
+            return self.merge(c, written);
+        }
+        if c.len() == 0 || self.len() == 0 {
+            return self.merge(b, written).merge(c, written);
+        }
+        let three = |a: Arc<Pairs>, b: Arc<Pairs>, c: Arc<Pairs>| {
+            let total = a.len() + b.len() + c.len();
+            let rest = Merged::new(Cursor::new(b), Cursor::new(c));
+            Arc::new(merge(Cursor::new(a), rest, total))
+        };
+        let so = three(self.so, b.so, c.so);
+        let os = match (self.os, b.os, c.os) {
+            (Some(a), Some(b), Some(c)) => Some(three(a, b, c)),
+            _ => None,
+        };
+        *written += so.len() + os.as_ref().map_or(0, |os| os.len());
         Run { so, os }
     }
 }
 
 /// Slices of runs matching a pattern: each with whether its order is `(object, subject)`,
-/// and whether its pairs are read as old (a recent run's, whose delta pairs are skipped:
-/// `Some(false)` the main delta's, `Some(true)` the closed part's).
-type Slices<'a> = smallvec::SmallVec<[(&'a [Pair], bool, Option<bool>); 4]>;
+/// and whether its pairs are read as old (the recent run's, whose delta pairs are
+/// skipped).
+type Slices<'a> = smallvec::SmallVec<[(&'a [Pair], bool, bool); 4]>;
 
 /// The pairs of one predicate, in sorted runs: the store's input, apart, and what was
 /// added since, in a large base and a small recent run that takes each round's delta.
@@ -684,8 +788,15 @@ pub(crate) struct Relation {
     input: Run,
     base: Run,
     recent: Run,
-    /// The last round's pairs (also in `recent`).
+    /// The last round's pairs (also in `recent`) but those of `closed`.
     delta: Run,
+    /// The last round's pairs one closed rule family produced (the family whose schema
+    /// link is `closed_by`: `rdfs:subClassOf` for `cax-sco`), held here only: the next
+    /// round merges them into `recent` with its own delta, in one pass. The family's
+    /// instances read the delta without them ([`Seg::DeltaNotBy`]): it derived them
+    /// with all their consequences under the family.
+    closed: Run,
+    closed_by: Option<u64>,
     /// Whether the delta is still the input (the store's first round is to come).
     fresh: bool,
     /// Whether no rule looks the relation up by object alone, so its runs keep no
@@ -696,15 +807,6 @@ pub(crate) struct Relation {
     missed: std::sync::atomic::AtomicU64,
     /// Pairs of the recent run read as old that were looked up in the delta.
     old_checks: std::sync::atomic::AtomicU64,
-    /// The added pairs one closed rule family produced (the family whose schema link is
-    /// `closed_by`: `rdfs:subClassOf` for `cax-sco`), in a recent run and a delta of
-    /// their own beside `recent` and `delta`, which hold everything else. The family's
-    /// instances read the delta without them ([`Seg::DeltaNotBy`]): it derived them
-    /// with all their consequences under the family. Folds merge both recent runs into
-    /// the base, so a pair is held once either way.
-    closed_recent: Run,
-    closed_delta: Run,
-    closed_by: Option<u64>,
 }
 
 /// The pairs whose first component is `key`.
@@ -717,7 +819,7 @@ fn range(pairs: &[Pair], key: u64) -> &[Pair] {
 impl Relation {
     /// The pairs the last round added (both parts).
     pub(crate) fn delta_len(&self) -> usize {
-        self.delta.len() + self.closed_delta.len()
+        self.delta.len() + self.closed.len()
     }
 
     /// Whether the recent run holds nothing but the delta (it is the delta, shared: right
@@ -726,13 +828,8 @@ impl Relation {
         self.recent.shares(&self.delta)
     }
 
-    /// [`Self::recent_is_delta`] for the closed part.
-    fn closed_recent_is_delta(&self) -> bool {
-        self.closed_recent.shares(&self.closed_delta)
-    }
-
-    /// Whether `seg` reads the closed part's delta.
-    fn reads_closed_delta(&self, seg: Seg) -> bool {
+    /// Whether `seg` reads the closed part of the delta.
+    fn reads_closed(&self, seg: Seg) -> bool {
         match seg {
             Seg::DeltaNotBy(family) => self.closed_by != Some(family),
             _ => true,
@@ -741,13 +838,7 @@ impl Relation {
 
     fn bytes(&self) -> StoreBytes {
         let (input, base, recent) = (&self.input, &self.base, &self.recent);
-        let closed = &self.closed_recent;
-        let shared = |run: &Run| {
-            [input, base, recent, closed]
-                .iter()
-                .any(|other| run.shares(other))
-        };
-        let unshared = |run: &Run| if shared(run) { 0 } else { run.bytes() };
+        let shared = |run: &Run| [input, base, recent].iter().any(|other| run.shares(other));
         StoreBytes {
             input: input.bytes(),
             added: base.bytes()
@@ -756,8 +847,12 @@ impl Relation {
                 } else {
                     recent.bytes()
                 }
-                + closed.bytes(),
-            delta: unshared(&self.delta) + unshared(&self.closed_delta),
+                + self.closed.bytes(),
+            delta: if shared(&self.delta) {
+                0
+            } else {
+                self.delta.bytes()
+            },
         }
     }
 
@@ -765,7 +860,7 @@ impl Relation {
     pub(crate) fn delta_has_object(&self, o: u64) -> bool {
         let mut found = false;
         let all = |_: u64, _: u64| true;
-        for delta in [&self.delta, &self.closed_delta] {
+        for delta in [&self.delta, &self.closed] {
             delta.scan(None, Some(o), &all, &self.missed, &mut |_, _| found = true);
         }
         found
@@ -773,21 +868,8 @@ impl Relation {
 
     /// Calls `f` with each distinct object of the delta.
     pub(crate) fn delta_objects(&self, f: &mut dyn FnMut(u64)) {
-        if self.closed_delta.len() > 0 {
-            let mut objects: Vec<u64> = self
-                .delta
-                .so
-                .iter()
-                .chain(self.closed_delta.so.iter())
-                .map(|&(_, o)| o)
-                .collect();
-            objects.sort_unstable();
-            objects.dedup();
-            objects.into_iter().for_each(f);
-            return;
-        }
-        match &self.delta.os {
-            Some(os) => {
+        match (&self.delta.os, self.closed.len()) {
+            (Some(os), 0) => {
                 let mut last = None;
                 for &(o, _) in os.iter() {
                     if last != Some(o) {
@@ -796,8 +878,14 @@ impl Relation {
                     }
                 }
             }
-            None => {
-                let mut objects: Vec<u64> = self.delta.so.iter().map(|&(_, o)| o).collect();
+            _ => {
+                let mut objects: Vec<u64> = self
+                    .delta
+                    .so
+                    .iter()
+                    .chain(self.closed.so.iter())
+                    .map(|&(_, o)| o)
+                    .collect();
                 objects.sort_unstable();
                 objects.dedup();
                 objects.into_iter().for_each(f);
@@ -813,33 +901,33 @@ impl Relation {
             &mut self.input,
             &mut self.base,
             &mut self.recent,
-            &mut self.closed_recent,
+            &mut self.closed,
         ] {
             run.objects(objects);
         }
-        // A delta shares its recent run's pairs or is its own.
-        for (delta, recent) in [
-            (&mut self.delta, &self.recent),
-            (&mut self.closed_delta, &self.closed_recent),
-        ] {
-            if delta.shares(recent) {
-                delta.os = recent.os.clone();
-            } else {
-                delta.objects(objects);
-            }
+        // The delta shares the recent run's pairs or is its own.
+        if self.delta.shares(&self.recent) {
+            self.delta.os = self.recent.os.clone();
+        } else {
+            self.delta.objects(objects);
         }
     }
 
+    /// The runs a membership check reads, in order. The closed part goes first: small
+    /// (one round of one family), and what the next round's rules derive again most often
+    /// (on LUBM 100, 9.1 M of 34 M checks end there; read last, each first missed in the
+    /// three large runs: the joins 24 % slower than before the partition).
+    fn membership(&self) -> [&Run; 4] {
+        [&self.closed, &self.base, &self.recent, &self.input]
+    }
+
     pub(crate) fn contains(&self, s: u64, o: u64) -> bool {
-        self.base.contains(s, o)
-            || self.recent.contains(s, o)
-            || self.closed_recent.contains(s, o)
-            || self.input.contains(s, o)
+        self.membership().iter().any(|run| run.contains(s, o))
     }
 
     /// Every pair, in no particular order.
     pub(crate) fn pairs(&self) -> Vec<Pair> {
-        let runs = [&self.input, &self.base, &self.recent, &self.closed_recent];
+        let runs = [&self.input, &self.base, &self.recent, &self.closed];
         let mut out = Vec::with_capacity(runs.iter().map(|run| run.len()).sum());
         for run in runs {
             out.extend(run.so.iter());
@@ -854,39 +942,30 @@ impl Relation {
         match seg {
             Seg::Delta | Seg::DeltaNotBy(_) => {
                 self.delta.scan(s, o, &all, missed, f);
-                if self.reads_closed_delta(seg) {
-                    self.closed_delta.scan(s, o, &all, missed, f);
+                if self.reads_closed(seg) {
+                    self.closed.scan(s, o, &all, missed, f);
                 }
             }
             Seg::All => {
                 self.input.scan(s, o, &all, missed, f);
                 self.base.scan(s, o, &all, missed, f);
                 self.recent.scan(s, o, &all, missed, f);
-                self.closed_recent.scan(s, o, &all, missed, f);
+                self.closed.scan(s, o, &all, missed, f);
             }
-            // Each delta is in its recent run only, so the input and the base need no
-            // filter.
+            // The delta is in `recent` only (its closed part apart), so the input and the
+            // base need no filter.
             Seg::Old => {
                 self.input.scan(s, o, &all, missed, f);
                 self.base.scan(s, o, &all, missed, f);
-                for (recent, delta, is_delta) in [
-                    (&self.recent, &self.delta, self.recent_is_delta()),
-                    (
-                        &self.closed_recent,
-                        &self.closed_delta,
-                        self.closed_recent_is_delta(),
-                    ),
-                ] {
-                    if is_delta || recent.len() == 0 {
-                        continue;
-                    }
-                    let old = |s: u64, o: u64| {
-                        self.old_checks
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        !delta.contains(s, o)
-                    };
-                    recent.scan(s, o, &old, missed, f);
+                if self.recent_is_delta() {
+                    return;
                 }
+                let old = |s: u64, o: u64| {
+                    self.old_checks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    !self.delta.contains(s, o)
+                };
+                self.recent.scan(s, o, &old, missed, f);
             }
         }
     }
@@ -898,22 +977,19 @@ impl Relation {
         let mut out = Slices::new();
         let whole = match seg {
             Seg::Delta | Seg::DeltaNotBy(_) => {
-                self.delta.matching(s, o, None, &mut out)
-                    && (!self.reads_closed_delta(seg)
-                        || self.closed_delta.matching(s, o, None, &mut out))
+                self.delta.matching(s, o, false, &mut out)
+                    && (!self.reads_closed(seg) || self.closed.matching(s, o, false, &mut out))
             }
             Seg::All => {
-                self.input.matching(s, o, None, &mut out)
-                    && self.base.matching(s, o, None, &mut out)
-                    && self.recent.matching(s, o, None, &mut out)
-                    && self.closed_recent.matching(s, o, None, &mut out)
+                self.input.matching(s, o, false, &mut out)
+                    && self.base.matching(s, o, false, &mut out)
+                    && self.recent.matching(s, o, false, &mut out)
+                    && self.closed.matching(s, o, false, &mut out)
             }
             Seg::Old => {
-                self.input.matching(s, o, None, &mut out)
-                    && self.base.matching(s, o, None, &mut out)
-                    && (self.recent_is_delta() || self.recent.matching(s, o, Some(false), &mut out))
-                    && (self.closed_recent_is_delta()
-                        || self.closed_recent.matching(s, o, Some(true), &mut out))
+                self.input.matching(s, o, false, &mut out)
+                    && self.base.matching(s, o, false, &mut out)
+                    && (self.recent_is_delta() || self.recent.matching(s, o, true, &mut out))
             }
         };
         whole.then_some(out)
@@ -921,54 +997,53 @@ impl Relation {
 
     /// An upper bound on the matches of the bound positions in `seg`.
     fn estimate(&self, s: Option<u64>, o: Option<u64>, seg: Seg) -> usize {
+        let delta = |seg| {
+            self.delta.estimate(s, o)
+                + if self.reads_closed(seg) {
+                    self.closed.estimate(s, o)
+                } else {
+                    0
+                }
+        };
         match seg {
-            Seg::Delta | Seg::DeltaNotBy(_) => {
-                self.delta.estimate(s, o)
-                    + if self.reads_closed_delta(seg) {
-                        self.closed_delta.estimate(s, o)
-                    } else {
-                        0
-                    }
-            }
+            Seg::Delta | Seg::DeltaNotBy(_) => delta(seg),
             Seg::Old | Seg::All => {
                 self.input.estimate(s, o)
                     + self.base.estimate(s, o)
                     + self.recent.estimate(s, o)
-                    + self.closed_recent.estimate(s, o)
+                    + self.closed.estimate(s, o)
             }
         }
     }
 
     /// Makes `new` the delta and `closed` (produced by the family `closed_by` names) its
     /// closed part; both sorted, deduplicated, disjoint from each other and from the
-    /// relation.
-    fn advance(&mut self, new: Pairs, closed: Pairs) {
-        // The old deltas go first: they share the recent runs, which are then merged,
-        // and freed as they are, only where nothing else holds them.
+    /// relation. Returns the pairs its merges wrote.
+    fn advance(&mut self, new: Pairs, closed: Pairs) -> usize {
+        let mut written = 0;
+        // The old delta goes first: it shares the recent run, which is then merged, and
+        // freed as it is, only where nothing else holds it. The old closed part is old
+        // now: it goes where the recent run goes.
         self.delta = Run::default();
-        self.closed_delta = Run::default();
+        let mut old = std::mem::take(&mut self.closed);
         if self.fresh {
             // The first round read the input as its delta (and recent run, shared): it
             // goes apart, unmoved.
             self.input = std::mem::take(&mut self.recent);
             self.fresh = false;
-        } else if (self.recent.len() + self.closed_recent.len()) * 4 > self.base.len() {
-            // Fold the recent runs into the base first, so the new deltas stay in theirs.
+        } else if (self.recent.len() + old.len()) * 4 > self.base.len() {
+            // Fold the recent run and the old closed part into the base first (one pass),
+            // so the new delta stays in `recent`.
             let recent = std::mem::take(&mut self.recent);
-            self.base = std::mem::take(&mut self.base).merge(recent);
-            let closed = std::mem::take(&mut self.closed_recent);
-            self.base = std::mem::take(&mut self.base).merge(closed);
+            let old = std::mem::take(&mut old);
+            self.base = std::mem::take(&mut self.base).merge_both(recent, old, &mut written);
         }
         self.delta = Run::new(new, !self.by_subject_only);
-        if self.delta.len() > 0 {
-            // An empty recent run becomes the delta itself (shared, not copied).
-            self.recent = std::mem::take(&mut self.recent).merge(self.delta.clone());
-        }
-        self.closed_delta = Run::new(closed, !self.by_subject_only);
-        if self.closed_delta.len() > 0 {
-            self.closed_recent =
-                std::mem::take(&mut self.closed_recent).merge(self.closed_delta.clone());
-        }
+        // One pass; an empty recent run becomes the delta itself (shared, not copied).
+        self.recent =
+            std::mem::take(&mut self.recent).merge_both(old, self.delta.clone(), &mut written);
+        self.closed = Run::new(closed, !self.by_subject_only);
+        written
     }
 }
 
@@ -981,6 +1056,8 @@ pub(crate) struct Store {
     index: HashMap<u64, usize>,
     /// Relations whose closed part a family claimed beforehand ([`Store::claim`]).
     claims: HashMap<u64, u64>,
+    /// The pairs the relations' merges wrote so far (both orders).
+    merged: u64,
 }
 
 impl Store {
@@ -1010,13 +1087,12 @@ impl Store {
                     base: Run::default(),
                     recent: delta.clone(),
                     delta,
+                    closed: Run::default(),
+                    closed_by: None,
                     fresh: true,
                     by_subject_only: false,
                     missed: Default::default(),
                     old_checks: Default::default(),
-                    closed_recent: Run::default(),
-                    closed_delta: Run::default(),
-                    closed_by: None,
                 }
             })
             .collect();
@@ -1115,11 +1191,7 @@ impl Store {
             .map(|(relation, p)| {
                 (
                     p,
-                    [
-                        relation.base.so,
-                        relation.recent.so,
-                        relation.closed_recent.so,
-                    ],
+                    [relation.base.so, relation.recent.so, relation.closed.so],
                 )
             })
             .collect();
@@ -1173,11 +1245,7 @@ impl Store {
             .map(|(relation, p)| {
                 (
                     p,
-                    [
-                        relation.base.so,
-                        relation.recent.so,
-                        relation.closed_recent.so,
-                    ],
+                    [relation.base.so, relation.recent.so, relation.closed.so],
                 )
             })
             .collect();
@@ -1220,7 +1288,7 @@ impl Store {
                     &relation.input,
                     &relation.base,
                     &relation.recent,
-                    &relation.closed_recent,
+                    &relation.closed,
                 ]
                 .into_iter()
                 .flat_map(|run| run.so.iter())
@@ -1243,7 +1311,7 @@ impl Store {
                     &relation.input,
                     &relation.base,
                     &relation.recent,
-                    &relation.closed_recent,
+                    &relation.closed,
                 ] {
                     if terms.contains(&p) {
                         out.extend(run.so.iter().map(|&(s, o)| [s, p, o]));
@@ -1273,10 +1341,12 @@ impl Store {
 
     /// Makes `news` (per relation: the open part, the closed part) the relations' deltas.
     fn install(&mut self, news: Vec<(Pairs, Pairs)>) {
-        self.relations
+        self.merged += self
+            .relations
             .par_iter_mut()
             .zip(news.into_par_iter())
-            .for_each(|(relation, (open, closed))| relation.advance(open, closed));
+            .map(|(relation, (open, closed))| relation.advance(open, closed) as u64)
+            .sum::<u64>();
     }
 
     /// Reserves the closed part of `p`'s relation for `family` (a family that reads and
@@ -1349,12 +1419,8 @@ impl Store {
                     true => Pairs::default(),
                     false => union(closed),
                 };
-                if closed.len() > 0 {
-                    for part in &mut open {
-                        part.retain(|&pair| !closed.contains(pair));
-                    }
-                }
-                (index, (union(open), closed))
+                let open = without(union(open), &closed);
+                (index, (open, closed))
             })
             .collect();
         let mut news: Vec<(Pairs, Pairs)> = self
@@ -1427,19 +1493,14 @@ impl Source for Store {
                     return;
                 }
                 let part = &pairs[range.start.max(start) - start..range.end.min(end) - start];
-                if old.is_some() {
+                if old {
                     relation
                         .old_checks
                         .fetch_add(part.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
-                let delta = match old {
-                    Some(false) => Some(&relation.delta),
-                    Some(true) => Some(&relation.closed_delta),
-                    None => None,
-                };
                 for &(a, b) in part {
                     let (s, o) = if swapped { (b, a) } else { (a, b) };
-                    if !delta.is_some_and(|delta| delta.contains(s, o)) {
+                    if !(old && relation.delta.contains(s, o)) {
                         f([s, p, o]);
                     }
                 }
@@ -2323,6 +2384,7 @@ fn run(
                 .load(std::sync::atomic::Ordering::Relaxed)
         })
         .sum();
+    result.counters.merged_pairs = store.merged;
     phases.consistency = clock.elapsed();
     result.phases = phases;
     heap::phase("reasoner: derived");
@@ -2523,10 +2585,96 @@ mod chunk_tests {
             let (left, right): (Vec<Pair>, Vec<Pair>) =
                 all.iter().partition(|pair| (pair.0 + pair.1) % 3 == 0);
             let shared = Arc::new(Pairs::chunked(left.clone()));
-            let merged = merge(shared.clone(), Arc::new(sort_chunked(vec![right], false)));
+            let owned = Arc::new(sort_chunked(vec![right.clone()], false));
+            let merged = merge(Cursor::new(shared.clone()), Cursor::new(owned), all.len());
             assert_eq!(merged.iter().copied().collect::<Vec<_>>(), all);
             assert_eq!(merged.len(), all.len());
             assert_eq!(shared.iter().copied().collect::<Vec<_>>(), left);
+            // Three at once, two of them merged as they are read; and a difference.
+            let (middle, last): (Vec<Pair>, Vec<Pair>) =
+                right.iter().partition(|pair| pair.0 % 2 == 0);
+            let rest = Merged::new(
+                Cursor::new(Arc::new(Pairs::chunked(middle.clone()))),
+                Cursor::new(Arc::new(Pairs::chunked(last))),
+            );
+            let three = merge(Cursor::new(shared.clone()), rest, all.len());
+            assert_eq!(three.iter().copied().collect::<Vec<_>>(), all);
+            let rest = without(three, &Pairs::chunked(middle.clone()));
+            let expected: Vec<Pair> = all
+                .iter()
+                .copied()
+                .filter(|pair| middle.binary_search(pair).is_err())
+                .collect();
+            assert_eq!(rest.iter().copied().collect::<Vec<_>>(), expected);
+            assert_eq!(rest.len(), expected.len());
         }
+    }
+
+    /// R13's layout: a closed family's part of the delta reads as the delta (the family's
+    /// own reads skip it) and costs the merges one copy of its pairs, over the same
+    /// rounds with every pair open. Kept beside the recent run for good, it cost each fold
+    /// a second pass over the base (LUBM 100: the merges wrote 26.5 M pairs, 12.5 M with
+    /// every pair open, 19.4 M since).
+    #[test]
+    fn a_closed_part_reads_as_the_delta_and_costs_one_copy() {
+        let mut x = 7u64;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            x >> 33
+        };
+        let (mut split, mut open) = (Relation::default(), Relation::default());
+        split.closed_by = Some(1);
+        let (mut written, mut plain, mut copies) = (0, 0, 0);
+        let mut known = std::collections::BTreeSet::new();
+        let sorted = |mut pairs: Vec<Pair>| {
+            pairs.sort_unstable();
+            pairs
+        };
+        for round in 0..12u64 {
+            let fresh: Vec<Pair> = (0..40 + round * 30)
+                .map(|_| (next() % 61, next() % 53))
+                .filter(|&pair| known.insert(pair))
+                .collect();
+            let fresh = sorted(fresh);
+            let (closed, rest): (Vec<Pair>, Vec<Pair>) =
+                fresh.iter().partition(|pair| (pair.0 + pair.1) % 3 == 0);
+            copies += closed.len();
+            let closed_set: std::collections::BTreeSet<Pair> = closed.iter().copied().collect();
+            written += split.advance(Pairs::chunked(rest), Pairs::chunked(closed));
+            plain += open.advance(Pairs::chunked(fresh), Pairs::default());
+            for (s, o) in [
+                (None, None),
+                (Some(3), None),
+                (None, Some(5)),
+                (Some(3), Some(5)),
+            ] {
+                let read = |relation: &Relation, seg: Seg| {
+                    let mut out = Vec::new();
+                    relation.scan(s, o, seg, &mut |s, o| out.push((s, o)));
+                    sorted(out)
+                };
+                for seg in [Seg::Delta, Seg::Old, Seg::All, Seg::DeltaNotBy(2)] {
+                    assert_eq!(read(&split, seg), read(&open, seg), "round {round} {seg:?}");
+                }
+                let mut own = read(&open, Seg::Delta);
+                own.retain(|pair| !closed_set.contains(pair));
+                assert_eq!(read(&split, Seg::DeltaNotBy(1)), own, "round {round}");
+            }
+            for s in 0..61 {
+                for o in 0..53 {
+                    assert_eq!(split.contains(s, o), known.contains(&(s, o)));
+                }
+            }
+            // What the family produced is answered by the first run a check reads.
+            for &(s, o) in &closed_set {
+                assert!(split.membership()[0].contains(s, o), "round {round}");
+            }
+        }
+        assert!(
+            written <= plain + copies,
+            "the merges wrote {written} pairs, {plain} with every pair open, {copies} closed"
+        );
     }
 }
