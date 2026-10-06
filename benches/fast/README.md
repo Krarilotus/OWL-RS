@@ -25,7 +25,7 @@ python benches/fast/fast.py clean                         the generated data and
 | `queries/` | the cases' SPARQL (LUBM's and OWL2Bench's come from `../reasoning/queries`) |
 | `rules/`, `shapes/` | the user-rules case's N3 and Datalog programs; the SHACL case's shapes |
 | `crates/nrese-store/examples/perf_lab/` | the measuring tool: `generate.rs` (the data), `modes.rs` (commits with readers, clients, canonicalisation, the store's classification), `main.rs` (with `--routes`: each query's rewrites, operators and, under `owl2-dl`, its status and path) |
-| `../baselines/fast/` | committed NRESE results (`<date>-<label>.json`) |
+| `../baselines/fast/` | NRESE's runs, one compact record each (`<date>-<label>.json`; "What is kept") |
 
 ## A case
 
@@ -73,6 +73,24 @@ comparator also `hangs`, `unsupported` and `not expressible`.
   the ratio new/base. A change counts when the interval excludes 1, the ratio is at least
   10 % and the difference at least 2 ms (as PROTOCOL.md §5); 10 % more peak memory (and
   64 MiB) is a regression too. A status change (an `ok` case now `wrong`) comes first.
+
+## What is kept
+
+A run writes two files:
+- **The full report**, outside git: `~/nrese-bench/reports/fast/<date>-<label>.json`
+  (`NRESE_BENCH_REPORTS` moves it; the same path on the main and the office PC). It holds
+  every sample and each case's raw result, 1-3 MB a run.
+- **The compact record**, committed: `../baselines/fast/<date>-<label>.json`, 0.1-0.3 MB. It
+  holds the run's commit, machine and configuration. Per case and repetition it holds the
+  status, the checks and routes (long values shortened), the work counters, the metric, the
+  peaks and the case's time. Each series is kept as 41 order statistics. It names the full
+  report: its path, host, size and SHA-256.
+
+`compare` reads the full report when the record names one that is here with its hash.
+Otherwise it uses the record's 41 points per series; on the two runs of 6 October these gave
+the full reports' verdicts. A run record (`../runs/`) points to the full reports in
+`results`. Raw results of `compete` stay in `results/` (git-ignored) and go into the run
+record as outcomes.
 
 ## The performance phase: a case per level
 

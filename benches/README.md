@@ -68,7 +68,7 @@ benches/
 | [clients](clients/README.md) | client libraries end to end | `run-all.sh` | stdout | — |
 | [oracle](oracle/README.md) | NRESE's SPARQL answers against Jena's | its script | `oracle/results/` | — |
 | [oxigraph-comparison](oxigraph-comparison/README.md) | parsers, serialisers and evaluators against Oxigraph's | `cargo test`, `cargo run --bin bench` | `oxigraph-comparison/results/` | — |
-| [fast](fast/README.md) | many small cases (10-300 s each, under an hour): every reasoning profile, maintenance, DL, memory caps, query shapes and operators, services; checks and route checks before times; home-turf cases per competitor | `fast/fast.py run`, `compare`, `compete` | `tmp/fast/`, `fast/results/` | `baselines/fast/*.json` |
+| [fast](fast/README.md) | many small cases (10-300 s each, under an hour): every reasoning profile, maintenance, DL, memory caps, query shapes and operators, services; checks and route checks before times; home-turf cases per competitor | `fast/fast.py run`, `compare`, `compete` | `~/nrese-bench/reports/fast/` (full reports), `tmp/fast/`, `fast/results/` | `baselines/fast/*.json` (compact records) |
 | perf lab | the store and query engine without HTTP, per query p50; the fast suite's measuring tool | `perf-lab.sh` | — | `baselines/perf-lab/*.json` |
 | [probes](probes/README.md) | one property at a time | one script each | stdout | — |
 | [cluster](cluster/README.md) | the suite on Draco | `suite.sbatch` | the job's directory | record in `runs/` |
