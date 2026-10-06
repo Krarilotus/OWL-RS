@@ -78,3 +78,24 @@ fn no_hub_context_and_pruned_pred_joins() {
         split_pruned.line()
     );
 }
+
+/// Guard (memory): past `Budget::max_memory` the saturation stops with
+/// `Unsupported::Budget` instead of allocating on (ore_ont_9724 with the Eq rule took a
+/// 12 GB process down). One byte is always exceeded.
+#[test]
+fn a_memory_limit_stops_the_saturation() {
+    let mut table = Table::default();
+    let o = pattern(&mut table, 20);
+    let options = Options {
+        proofs: false,
+        budget: context::Budget {
+            max_memory: Some(1),
+            ..context::Budget::default()
+        },
+        ..Options::default()
+    };
+    assert!(matches!(
+        context::classify(&o, &options),
+        Err(context::Unsupported::Budget)
+    ));
+}

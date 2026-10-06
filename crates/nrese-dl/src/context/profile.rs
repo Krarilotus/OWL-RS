@@ -44,8 +44,12 @@ pub struct Profile {
     pub slots: u64,
     /// Derivations recorded for proofs.
     pub proof_steps: u64,
-    /// Zero in the Horn stage (§4's list, for the later stages).
+    /// The Eq rule's copies of clauses onto merged terms (§4's list).
     pub equality_literals_generated: u64,
+    /// Merges of neighbour terms the Eq rule made.
+    pub merges: u64,
+    /// Contexts where a merge of `x` with a neighbour was due and not made.
+    pub contexts_unmerged: u64,
     pub nominal_contexts: u64,
     pub threads: usize,
     /// The most clauses one context holds (a context shared by many successors grows).
@@ -63,6 +67,8 @@ impl Profile {
         self.successor_edges += c.edges;
         self.messages += c.messages;
         self.slots += c.slots;
+        self.equality_literals_generated += c.eq;
+        self.merges += c.merges;
         self.peak_agenda_size = self.peak_agenda_size.max(c.peak_agenda);
         self.max_clause_body_width = self.max_clause_body_width.max(c.max_body);
         if c.kept > 0 {
@@ -80,7 +86,8 @@ impl Profile {
              functions={} renamed={} split={} recentred={} dropped_data={} contexts_created={} \
              contexts_saturated={} clauses_generated={} clauses_kept={} redundant_forward={} \
              redundant_backward={} hyper={} pred={} max_head={} max_body={} edges={} \
-             peak_agenda={} messages={} slots={} proof_steps={} threads={} largest_context={}",
+             peak_agenda={} messages={} slots={} proof_steps={} threads={} largest_context={} \
+             merges={} eq={} unmerged={}",
             ms(self.normalise),
             ms(self.compile),
             ms(self.saturate),
@@ -110,6 +117,9 @@ impl Profile {
             self.proof_steps,
             self.threads,
             self.largest_context,
+            self.merges,
+            self.equality_literals_generated,
+            self.contexts_unmerged,
         );
         out
     }

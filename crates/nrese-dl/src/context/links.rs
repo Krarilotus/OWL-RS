@@ -82,7 +82,7 @@ impl Worker<'_> {
         }
         let found = s.found.len();
         if self.engine.budget().max_join.is_some_and(|m| found >= m)
-            || (found % 4096 == 4095 && self.engine.out_of_time())
+            || (found % 4096 == 4095 && self.engine.out_of_budget())
         {
             self.engine.exhaust();
             return;
