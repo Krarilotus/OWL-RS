@@ -27,10 +27,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import hashlib
 import json
 import os
 import random
 import re
+import socket
 import statistics
 import subprocess
 import sys
@@ -49,7 +51,9 @@ BENCH_VOLUME = "nrese-bench-data"
 TARGET_VOLUME = os.environ.get("NRESE_TARGET_VOLUME", f"nrese-target-{ROOT.name}")
 CARGO_VOLUME = "nrese-cargo"
 SCRATCH = ROOT / "tmp" / "fast"
-BASELINES = ROOT / "benches" / "baselines" / "fast"
+BASELINES = ROOT / "benches" / "baselines" / "fast"  # the compact records (committed)
+# The full reports, outside git (the same path on the main and the office PC).
+REPORTS = Path(os.environ.get("NRESE_BENCH_REPORTS") or Path.home() / "nrese-bench" / "reports") / "fast"
 CASE_TIMEOUT_S = 900
 ENV = {**os.environ, "MSYS_NO_PATHCONV": "1"}
 
@@ -732,8 +736,10 @@ def run(args) -> int:
     cases = select(load_cases(), args)
     label = args.label or (manifest.git(ROOT).get("commit") or "nrese")[:8]
     started = datetime.datetime.now()
+    # The full report outside git; the repository keeps its compact record (README, "What is kept").
+    REPORTS.mkdir(parents=True, exist_ok=True)
     BASELINES.mkdir(parents=True, exist_ok=True)
-    out = (Path(args.out) if args.out else BASELINES / f"{started:%Y-%m-%d}-{label}.json").resolve()
+    out = (Path(args.out) if args.out else REPORTS / f"{started:%Y-%m-%d}-{label}.json").resolve()
     report = {"label": label, "started": started.isoformat(timespec="seconds"),
               "git": manifest.git(ROOT), "machine": manifest.machine("docker"), "image": rust_image(),
               "reps": args.reps, "records": []}
@@ -767,10 +773,65 @@ def run(args) -> int:
     report["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
     report["duration_s"] = round((datetime.datetime.now() - started).total_seconds(), 1)
     out.write_text(json.dumps(report, indent=1), encoding="utf-8")
+    kept = write_compact(out, BASELINES / out.name)
     bad = [r for r in report["records"] if r["status"] != r.get("expected_outcome", "ok")]
     print(f"\n{len(report['records'])} runs of {len(cases)} cases in {report['duration_s'] / 60:.1f} min; "
-          f"{len(bad)} not as expected; report: {out.relative_to(ROOT)}")
+          f"{len(bad)} not as expected; report: {out}; kept: {kept.relative_to(ROOT)}")
     return 1 if bad else 0
+
+
+# --- what is kept ----------------------------------------------------------------------------
+
+# Order statistics per series in a compact record (every 2.5th percentile): compare's
+# verdicts on the two runs of 6 Oct 2026 were the full reports' with 41; with 21, two of 80
+# borderline cases flipped.
+KEPT_POINTS = 41
+
+
+def write_compact(full: Path, target: Path) -> Path:
+    """The compact record of a full report, for the repository: the run's commit, machine
+    and configuration; per case and repetition its status, checks, routes, counters, metric,
+    peaks and time, and each series as KEPT_POINTS order statistics (for compare's bootstrap);
+    and where the full report is, with its hash."""
+    data = full.read_bytes()
+    report = json.loads(data)
+    home = Path.home()
+    where = f"~/{full.relative_to(home).as_posix()}" if full.is_relative_to(home) else full.as_posix()
+    keep = {k: v for k, v in report.items() if k != "records"}
+    keep["full_report"] = {"path": where, "host": socket.gethostname(), "bytes": len(data),
+                           "sha256": hashlib.sha256(data).hexdigest()}
+    keep["records"] = [compact_record(r) for r in report["records"]]
+    target.write_text(json.dumps(keep, indent=1), encoding="utf-8")
+    return target
+
+
+def compact_record(r: dict) -> dict:
+    """A record without its raw result, long check values shortened, its series thinned."""
+    def short(c: dict) -> dict:
+        got = c.get("got")
+        if len(json.dumps(got)) > 160:
+            got = f"<{type(got).__name__} of {len(got) if hasattr(got, '__len__') else '?'}>"
+        return {**c, "got": got}
+    out = {k: v for k, v in r.items() if k not in ("result", "samples", "checks", "routes")}
+    out["checks"] = [short(c) for c in r.get("checks", [])]
+    out["routes"] = [short(c) for c in r.get("routes", [])]
+    out["samples"] = {k: thin(sorted(v for v in vs if v is not None), KEPT_POINTS)
+                      for k, vs in (r.get("samples") or {}).items()}
+    return out
+
+
+def load_report(path: Path) -> dict:
+    """A run's report: the full one when a compact record names it and it is here with its
+    hash, else the compact record (its KEPT_POINTS points per series)."""
+    report = json.loads(path.read_text(encoding="utf-8"))
+    full = report.get("full_report")
+    if full:
+        candidate = Path(full["path"].replace("~", str(Path.home()), 1))
+        if candidate.exists() and hashlib.sha256(candidate.read_bytes()).hexdigest() == full["sha256"]:
+            return json.loads(candidate.read_text(encoding="utf-8"))
+        print(f"note: {path.name}: the full report isn't here ({full['path']} on {full['host']}); "
+              f"comparing its {KEPT_POINTS} points per series")
+    return report
 
 
 # --- compare ---------------------------------------------------------------------------------
@@ -875,8 +936,7 @@ def series_ratios(base: list[dict], new: list[dict], series: list[str]) -> list[
 
 
 def compare(args) -> int:
-    base_report = json.loads(Path(args.base).read_text(encoding="utf-8"))
-    new_report = json.loads(Path(args.new).read_text(encoding="utf-8"))
+    base_report, new_report = load_report(Path(args.base)), load_report(Path(args.new))
     base, new = pooled(base_report), pooled(new_report)
     for name, report in (("base", base_report), ("new", new_report)):
         if report.get("reps", 2) < 2:
