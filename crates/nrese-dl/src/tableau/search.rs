@@ -217,6 +217,13 @@ impl Engine<'_> {
 
     /// The first open disjunction: asserted if one disjunct is left, else a branch point.
     fn choose(&mut self) -> Step<bool> {
+        while let Some(at) = self.reopen.pop() {
+            if (at as usize) < self.pending.len()
+                && let Some(step) = self.decide(at as usize)
+            {
+                return step;
+            }
+        }
         if self.config.conflict_order
             && let Some(at) = self.most_active()
             && let Some(step) = self.decide(at)
@@ -244,6 +251,9 @@ impl Engine<'_> {
     /// it merged away, or a disjunct holds), else asserted (one disjunct left), a clash
     /// (none left) or a branch point.
     fn decide(&mut self, at: usize) -> Option<Step<bool>> {
+        if self.pending_dead[at] {
+            return None;
+        }
         let pend = self.pending[at];
         let clause = &self.p.clauses[pend.clause as usize];
         let bind = &self.bindings[pend.bind as usize..pend.bind as usize + clause.vars as usize];
@@ -374,7 +384,7 @@ impl Engine<'_> {
     }
 
     /// The stack position of level `level`'s frame, if it is on the stack.
-    fn frame_of(&self, level: u32) -> Option<usize> {
+    pub(super) fn frame_of(&self, level: u32) -> Option<usize> {
         self.frames.binary_search_by_key(&level, |f| f.id).ok()
     }
 
@@ -399,6 +409,18 @@ impl Engine<'_> {
             if self.floor > 0 && k <= self.floor {
                 // The clash needs a choice of the base undone: not this run's to decide.
                 break Err(FLOOR.into());
+            }
+            // Dynamic backtracking: `k` retracted alone, its disjunction re-decided on top.
+            if self.config.dynamic_backtracking && k < top {
+                match self.retract_culprit(dep, k) {
+                    Some(Ok(())) => break Ok(true),
+                    Some(Err(Stop::Clash(d) | Stop::Abandon(d, _))) => {
+                        dep = d;
+                        continue;
+                    }
+                    Some(Err(Stop::GaveUp(why))) => break Err(why),
+                    None => {}
+                }
             }
             // The frames up to level `k` stay (`k` itself, the culprit, on top).
             let keep = self.frames.partition_point(|f| f.id <= k);
@@ -488,6 +510,10 @@ impl Engine<'_> {
     fn restore(&mut self, frame: &super::engine::Frame) {
         self.g.cut(&frame.mark);
         self.pending.truncate(frame.pending as usize);
+        self.pending_dead.truncate(frame.pending as usize);
+        // Retractions below the cut stay, and so does their redoing.
+        self.refire.retain(|&n| n < frame.mark.nodes);
+        self.reopen.retain(|&i| i < frame.pending);
         self.bindings.truncate(frame.bindings as usize);
         self.pending_open = frame.pending_open;
         self.ni.pending.truncate(frame.ni_pending as usize);
