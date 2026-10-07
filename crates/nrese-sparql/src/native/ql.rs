@@ -15,8 +15,11 @@
 
 use std::collections::HashSet;
 
-use nrese_engine::{Snapshot, TermId};
-use nrese_owl::ql::{Atom, Branch, Cq, Limits, Outcome, Part, QTerm, Tbox, rewrite};
+use nrese_engine::{GraphSelector, QuadPattern, Snapshot, TermId};
+use nrese_owl::ObjProp;
+use nrese_owl::ql::{
+    Atom, Basic, Branch, Cq, Limits, Outcome, Part, Probe, QTerm, Tbox, rewrite_with,
+};
 use nrese_rdf::{NamedNode, NamedNodeRef, Term, Variable};
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
@@ -108,6 +111,13 @@ fn used(expression: &Expression) -> Vec<Variable> {
     out
 }
 
+/// What a rewriting may ask the data (design §3): the store's rewriting, for its cache,
+/// and the options of the query, to read what it reads.
+pub(crate) struct DataCheck<'a> {
+    pub ql: &'a crate::ql::QlRewriting,
+    pub options: crate::QueryOptions,
+}
+
 /// The query pattern rewritten. `all_needed`: the query returns every variable it binds
 /// (SELECT's projection is in the pattern; CONSTRUCT and DESCRIBE read what they read);
 /// `set`: its answer is a set (ASK, CONSTRUCT, DESCRIBE).
@@ -118,11 +128,13 @@ pub(crate) fn rewrite_query(
     limits: &Limits,
     needed: Option<Vec<Variable>>,
     set: bool,
+    data: Option<&DataCheck<'_>>,
 ) -> (GraphPattern, QlReport) {
     let mut rewriter = Rewriter {
         tbox,
         snapshot,
         limits,
+        data,
         rdf_type: snapshot
             .lookup(NamedNodeRef::new_unchecked(RDF_TYPE).into())
             .map(TermId::raw),
@@ -140,6 +152,7 @@ struct Rewriter<'a> {
     tbox: &'a Tbox,
     snapshot: &'a Snapshot,
     limits: &'a Limits,
+    data: Option<&'a DataCheck<'a>>,
     rdf_type: Option<u64>,
     report: QlReport,
 }
@@ -302,12 +315,22 @@ impl Rewriter<'_> {
                         }
                     }
                 }
-                // Groups count rows: the bag form.
+                // Groups count rows: the bag form, unless no aggregate depends on how often
+                // a row comes (`MIN`, `MAX`, `SAMPLE`, `DISTINCT` ones, none).
+                let insensitive = aggregates.iter().all(|(_, aggregate)| {
+                    use nrese_sparql_syntax::algebra::AggregateFunction as F;
+                    match aggregate {
+                        AggregateExpression::FunctionCall { name, distinct, .. } => {
+                            *distinct || matches!(name, F::Min | F::Max | F::Sample)
+                        }
+                        AggregateExpression::CountSolutions { distinct } => *distinct,
+                    }
+                });
                 P::Group {
                     inner: boxed(self.walk(
                         inner,
                         &Needed::Only(read.into_iter().collect()),
-                        false,
+                        insensitive,
                     )),
                     variables: variables.clone(),
                     aggregates: aggregates.clone(),
@@ -441,7 +464,8 @@ impl Rewriter<'_> {
                 "a variable predicate or class: the rewriting reads constant ones only".to_owned(),
             );
         }
-        let rewriting = match rewrite(self.tbox, &cq, self.limits) {
+        let (tbox, limits) = (self.tbox, self.limits);
+        let rewriting = match rewrite_with(tbox, &cq, limits, &mut |probe| self.realised(probe)) {
             Outcome::Unchanged => return original,
             Outcome::Exceeded(what) => {
                 self.report.limits.push(what);
@@ -461,18 +485,25 @@ impl Rewriter<'_> {
             terms: &terms,
             pattern: self.report.patterns,
         };
-        let union = rewriting
-            .branches
-            .iter()
-            .map(|b| self.branch(b, patterns, &names, &cq))
-            .reduce(|left, right| GraphPattern::Union {
-                left: Box::new(left),
-                right: Box::new(right),
-            })
-            .unwrap_or_else(|| original.clone());
+        let union = |this: &Self, branches: &mut dyn Iterator<Item = &Branch>| {
+            branches
+                .map(|b| this.branch(b, patterns, &names, &cq))
+                .reduce(|left, right| GraphPattern::Union {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+        };
         if set {
-            return union;
+            return union(self, &mut rewriting.branches.iter()).unwrap_or(original);
         }
+        // What the bag form adds comes from the branches other than the pattern as written:
+        // that one's rows are the materialised ones, all taken already.
+        let Some(union) = union(
+            self,
+            &mut rewriting.branches.iter().filter(|b| !as_written(b, &cq)),
+        ) else {
+            return original;
+        };
         // Bags: the materialised rows as they are, and once each answer only the
         // rewriting finds (design §3).
         let visible: Vec<Variable> = terms
@@ -497,6 +528,142 @@ impl Rewriter<'_> {
             left: Box::new(original),
             right: Box::new(added),
         }
+    }
+
+    /// Whether the data the query reads has the tree of `probe` at every individual of
+    /// each concept it folds to (once per snapshot revision and probe; `false` where the
+    /// rewriting has no data to ask or can't write the question).
+    fn realised(&mut self, probe: &Probe<'_>) -> bool {
+        let Some(data) = self.data else {
+            return false;
+        };
+        let term = |t: QTerm| -> Option<TermPattern> {
+            Some(match t {
+                QTerm::Var(v) => TermPattern::Variable(Variable::new_unchecked(format!("_qlr{v}"))),
+                QTerm::Const(id) => match self.snapshot.decode(TermId::from_raw(id))? {
+                    Term::NamedNode(n) => TermPattern::NamedNode(n),
+                    Term::Literal(l) => TermPattern::Literal(l),
+                    Term::BlankNode(b) => TermPattern::BlankNode(b),
+                    _ => return None,
+                },
+            })
+        };
+        let property = |p: u64| match self.snapshot.decode(TermId::from_raw(p)) {
+            Some(Term::NamedNode(n)) => Some(n),
+            _ => None,
+        };
+        let rdf_type = || NamedNodePattern::NamedNode(NamedNode::new_unchecked(RDF_TYPE));
+        let triple = |atom: &Atom| -> Option<TriplePattern> {
+            Some(match atom {
+                Atom::Class(t, class) => TriplePattern {
+                    subject: term(*t)?,
+                    predicate: rdf_type(),
+                    object: TermPattern::NamedNode(property(*class)?),
+                },
+                Atom::Role(s, p, o) => TriplePattern {
+                    subject: term(*s)?,
+                    predicate: NamedNodePattern::NamedNode(property(*p)?),
+                    object: term(*o)?,
+                },
+                Atom::Other(..) => return None,
+            })
+        };
+        let Some(tree) = probe.atoms.iter().map(triple).collect::<Option<Vec<_>>>() else {
+            return false;
+        };
+        let other = TermPattern::Variable(Variable::new_unchecked("_qlr_other"));
+        let revision = self.snapshot.revision();
+        // What a question reads, counted before it runs: each triple pattern's statements
+        // with its constant predicate (and class).
+        let model = data.options.read_model;
+        let reads = |t: &TriplePattern| -> u64 {
+            let id = |n: &NamedNode| self.snapshot.lookup(n.as_ref().into());
+            let predicate = match &t.predicate {
+                NamedNodePattern::NamedNode(p) => id(p),
+                NamedNodePattern::Variable(_) => None,
+            };
+            let object = match (&t.predicate, &t.object) {
+                (NamedNodePattern::NamedNode(p), TermPattern::NamedNode(c))
+                    if p.as_str() == RDF_TYPE =>
+                {
+                    id(c)
+                }
+                _ => None,
+            };
+            self.snapshot.count_in(
+                model,
+                &QuadPattern {
+                    subject: None,
+                    predicate,
+                    object,
+                    graph: GraphSelector::Any,
+                },
+            )
+        };
+        let tree_reads: u64 = tree.iter().map(reads).sum();
+        for &alternative in probe.alternatives {
+            let Some(root) = term(probe.root) else {
+                return false;
+            };
+            let stated = match alternative {
+                Basic::Class(class) => property(class).map(|c| TriplePattern {
+                    subject: root.clone(),
+                    predicate: rdf_type(),
+                    object: TermPattern::NamedNode(c),
+                }),
+                Basic::Exists(ObjProp::Named(p)) => property(p).map(|p| TriplePattern {
+                    subject: root.clone(),
+                    predicate: NamedNodePattern::NamedNode(p),
+                    object: other.clone(),
+                }),
+                Basic::Exists(ObjProp::Inverse(p)) => property(p).map(|p| TriplePattern {
+                    subject: other.clone(),
+                    predicate: NamedNodePattern::NamedNode(p),
+                    object: root.clone(),
+                }),
+                Basic::Thing | Basic::Fresh(_) => None,
+            };
+            let Some(stated) = stated else {
+                return false;
+            };
+            if tree_reads.saturating_add(reads(&stated)) > self.limits.check_rows {
+                return false;
+            }
+            // Is there an individual of the concept without the tree?
+            let query = nrese_sparql_syntax::Query::Ask {
+                dataset: None,
+                pattern: GraphPattern::Filter {
+                    expr: Expression::Not(Box::new(Expression::Exists(Box::new(
+                        GraphPattern::Bgp {
+                            patterns: tree.clone(),
+                        },
+                    )))),
+                    inner: Box::new(GraphPattern::Bgp {
+                        patterns: vec![stated],
+                    }),
+                },
+                base_iri: None,
+            };
+            let key = query.to_string();
+            let snapshot = self.snapshot;
+            let asked = &mut self.report.checks;
+            let budget = self.limits.checks;
+            let has = data.ql.realised(revision, &key, || {
+                if *asked >= budget {
+                    return None;
+                }
+                *asked += 1;
+                Some(matches!(
+                    crate::query::evaluate_query(snapshot, &query, &data.options),
+                    Ok(crate::results::QueryResults::Boolean(false))
+                ))
+            });
+            if !has {
+                return false;
+            }
+        }
+        self.report.realised += 1;
+        true
     }
 
     /// A term as a reason names it.
@@ -776,6 +943,16 @@ impl Rewriter<'_> {
             },
         }
     }
+}
+
+/// Whether `branch` is `cq` as written: its atoms, nothing folded, merged or added.
+fn as_written(branch: &Branch, cq: &Cq) -> bool {
+    branch.merged.is_empty()
+        && branch.parts.len() == cq.atoms.len()
+        && branch
+            .parts
+            .iter()
+            .all(|p| matches!(p, Part::Atom(a) if cq.atoms.contains(a)))
 }
 
 /// Whether a triple pattern has a variable predicate, or a variable class under
