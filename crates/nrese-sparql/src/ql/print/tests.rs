@@ -249,3 +249,30 @@ fn negations_and_the_default_graph_alias_print_with_the_rewriting() {
         &["<cat>"],
     );
 }
+
+/// The printer's budget: RL rules unfolded into each other can make the printed query
+/// exponential (each class here has two rules over the one below: 2^18 copies of the
+/// bottom); past its bound it says so instead of printing.
+#[test]
+fn the_printer_stops_at_its_size_bound() {
+    let mut turtle = String::new();
+    for i in 1..=18 {
+        for p in ["p", "q"] {
+            turtle.push_str(&format!(
+                "[ owl:intersectionOf ( :C{} [ a owl:Restriction ; owl:onProperty :{p} ;
+                    owl:someValuesFrom :X ] ) ] rdfs:subClassOf :C{i} .\n",
+                i - 1
+            ));
+        }
+    }
+    let e = engine(&turtle);
+    match printed(&e, "SELECT ?x WHERE { ?x a :C18 }", PrintForm::Paths) {
+        Printed::NotExpressible(reasons) => {
+            assert!(
+                reasons.iter().any(|r| r.contains("class expansions")),
+                "{reasons:?}"
+            );
+        }
+        Printed::Query { text, .. } => panic!("printed {} bytes", text.len()),
+    }
+}

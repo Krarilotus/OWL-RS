@@ -12,7 +12,7 @@
 //! - A conclusion's assertions about anonymous individuals are an existential: each
 //!   tree of them is rolled up into a class expression (`rollup`).
 //! - `NRESE_W3C_SWITCHES` (`no-disjunct-learning`, `full-blocking`,
-//!   `no-lazy-definitions`, comma-separated)
+//!   `no-lazy-definitions`, `no-complements`, comma-separated)
 //!   switches optimisations off, for A/B runs.
 //! - Every test ends as `pass`, `wrong`, or not decided with the reason (`unsupported`,
 //!   `gave-up`, `not-run`). A wrong answer fails the run; the rest is reported by test
@@ -22,6 +22,8 @@
 //! - Tests whose expected answer is wrong under the direct semantics are listed in
 //!   `disputed.txt` with a witness model (checked by `disputed_witnesses_are_models`);
 //!   they are counted apart, and the run fails if one of them changes its answer.
+//! - Tests documented as over budget are listed in `over-budget.txt` with their cause; they
+//!   run on a small budget.
 
 mod negate;
 mod rdf;
@@ -48,6 +50,12 @@ use rdf::{Table, parse_rdf_xml};
 const TEST: &str = "http://www.w3.org/2007/OWL/testOntology#";
 const EXPECTED_WRONG: &str = include_str!("expected-wrong.txt");
 const DISPUTED: &str = include_str!("disputed.txt");
+const OVER_BUDGET: &str = include_str!("over-budget.txt");
+
+thread_local! {
+    /// Set while a test of `over-budget.txt` runs: [`config`] gives it a small budget.
+    static SMALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// The lines of a list: `(id, rest)`.
 fn listed(text: &str) -> Vec<(&str, &str)> {
@@ -92,37 +100,39 @@ enum Verdict {
     Open(String),
 }
 
-thread_local! {
-    /// Set by tests whose assertions must not depend on the machine's speed: their runs
-    /// are bounded by branch points, and the clock is only a safety net.
-    static DETERMINISTIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
+/// The suite's configuration: a test is bounded by branch points and merges (per variant
+/// of the portfolio; `NRESE_W3C_BRANCH_POINTS`, `NRESE_W3C_MERGES`), nodes and memory,
+/// never by the clock, so its answer is the same on every machine (DL-203 needs 325 k
+/// branch points of its plain clauses; DL-906 merges far more than it branches). The clock (`NRESE_W3C_TIMEOUT`, seconds) is only
+/// a safety net. `NRESE_W3C_SWITCHES` names optimisations to switch off, for A/B runs.
 fn config() -> Config {
-    if DETERMINISTIC.with(std::cell::Cell::get) {
-        return Config {
-            max_branch_points: Some(5_000_000),
-            ..base_config(600)
-        };
-    }
-    let secs = std::env::var("NRESE_W3C_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(20);
-    base_config(secs)
-}
-
-/// The suite's configuration with a time budget of `secs` per test;
-/// `NRESE_W3C_SWITCHES` names optimisations to switch off, for A/B runs.
-fn base_config(secs: u64) -> Config {
+    let number = |name: &str, default: u64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
     let off = std::env::var("NRESE_W3C_SWITCHES").unwrap_or_default();
     let off = |name: &str| off.split(',').any(|s| s.trim() == name);
+    let small = SMALL.with(std::cell::Cell::get);
     Config {
-        timeout: Some(Duration::from_secs(secs)),
+        max_nodes: if small {
+            500
+        } else {
+            Config::default().max_nodes
+        },
+        max_branch_points: Some(number("NRESE_W3C_BRANCH_POINTS", 1_000_000)),
+        max_merges: Some(if small {
+            1_000
+        } else {
+            number("NRESE_W3C_MERGES", 20_000)
+        }),
+        timeout: Some(Duration::from_secs(number("NRESE_W3C_TIMEOUT", 600))),
         max_memory: 2 << 30,
         disjunct_learning: !off("no-disjunct-learning"),
         incremental_blocking: !off("full-blocking"),
         lazy_definitions: !off("no-lazy-definitions"),
+        complements: !off("no-complements"),
         ..Config::default()
     }
 }
@@ -143,7 +153,10 @@ fn reason_class(why: &str) -> String {
         "keys".into()
     } else if why.contains("NI rule") {
         "NI rule".into()
-    } else if why.contains("time budget") || why.contains("node budget") {
+    } else if ["time", "node", "branch-point", "merge"]
+        .iter()
+        .any(|kind| why.contains(&format!("{kind} budget")))
+    {
         "budget".into()
     } else if why.starts_with("not-run") {
         why.split(':').take(2).collect::<Vec<_>>().join(":")
@@ -424,18 +437,23 @@ fn read_cases(text: &str) -> Vec<Case> {
 /// formula as definitions, 20 s and given up before disjunct learning; HermiT 0.3 s),
 /// DL-206 (HermiT 3 s), DL-204 (k_grz: decided only with lazily unfolded definitions, in
 /// the portfolio) and DL-661 (k_branch: lazily unfolding definitions by restrictions too
-/// made it eight times slower). Guards of docs/design/performance.md §0.
+/// made it eight times slower); DL-662 to 664 (k_d4, k_dum, k_grz as OWL Lite writes them,
+/// complements through cardinalities: undecided until complementary definitions became one
+/// class and its negation, `nrese_owl`'s `complements.rs`; then k_d4 and k_dum by the plain
+/// clauses, k_grz by the unfolded ones). Guards of docs/design/performance.md §0.
 #[test]
 fn hard_search_tests_are_decided() {
     let Ok(text) = std::fs::read_to_string(suite_path()) else {
         return;
     };
-    DETERMINISTIC.with(|d| d.set(true));
     for name in [
         "WebOnt-description-logic-202",
         "WebOnt-description-logic-206",
         "WebOnt-description-logic-204",
         "WebOnt-description-logic-661",
+        "WebOnt-description-logic-662",
+        "WebOnt-description-logic-663",
+        "WebOnt-description-logic-664",
     ] {
         let case = read_cases(&text)
             .into_iter()
@@ -557,7 +575,10 @@ fn the_w3c_dl_suite() {
             if std::env::var_os("NRESE_W3C_TRACE").is_some() {
                 eprintln!("running {} ({kind})", case.name);
             }
+            let over = listed(OVER_BUDGET).iter().any(|(id, _)| *id == case.name);
+            SMALL.with(|s| s.set(over));
             let (verdict, features) = run_case(&case, kind);
+            SMALL.with(|s| s.set(false));
             let ms = started.elapsed().as_millis();
             let id = format!("{} ({kind})", case.name);
             let is_disputed = disputed.contains(&id.as_str());

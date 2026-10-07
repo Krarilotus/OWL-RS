@@ -77,6 +77,12 @@ pub fn live() -> usize {
     LIVE.load(Ordering::Relaxed)
 }
 
+/// The most bytes live at once since the current phase began, or since the start where no
+/// profile runs (0 without [`Counting`]).
+pub fn peak() -> usize {
+    PEAK.load(Ordering::Relaxed)
+}
+
 /// Starts a profile: phases are recorded from here on, the first one named `label`.
 pub fn start(label: &'static str) {
     let mut phases = PHASES.lock().unwrap_or_else(|p| p.into_inner());

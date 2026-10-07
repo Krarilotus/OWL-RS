@@ -94,6 +94,10 @@ pub struct Frame {
     pub premise: DepSetId,
     /// What the failed alternatives' clashes depended on, besides this branch point.
     pub failed: DepSetId,
+    /// The retraction queues as they were (`Engine::reopen`, `Engine::refire`): a
+    /// backtrack to this point restores them, the work they held with them.
+    pub reopen: Vec<u32>,
+    pub refire: Vec<u32>,
 }
 
 /// How far each queue is processed.
@@ -113,6 +117,12 @@ pub struct Engine<'a> {
     pub deps: DepSets,
     pub done: Done,
     pub pending: Vec<Pending>,
+    /// Pending disjunctions retracted with their level (dynamic backtracking).
+    pub pending_dead: Vec<bool>,
+    /// Nodes whose live facts are joined again after a retraction.
+    pub refire: Vec<u32>,
+    /// Pending disjunctions behind the scan that a retraction may have opened again.
+    pub reopen: Vec<u32>,
     pub bindings: Vec<u32>,
     pub pending_open: u32,
     pub frames: Vec<Frame>,
@@ -140,6 +150,15 @@ pub struct Engine<'a> {
     pub floor: u32,
     /// The next branch point's level ([`Frame::id`]); never reused within a run.
     pub next_level: u32,
+    /// When the last retraction happened, on the levels' clock (`next_level` then): a
+    /// checkpoint older than that can't be restored (`search.rs`, `backtrack`).
+    pub last_retraction: u32,
+    /// Dynamic backtracking switched off for the rest of the run, after a restart.
+    pub dynamic_off: bool,
+    /// The first branch point above the floor as it was before the run's first
+    /// retraction: the point a restart goes back to (no retraction reaches its
+    /// checkpoint; a re-decided frame's own checkpoint is newer).
+    pub restart_point: Option<Frame>,
 }
 
 impl<'a> Engine<'a> {
@@ -151,10 +170,16 @@ impl<'a> Engine<'a> {
             deps: DepSets::default(),
             done: Done::default(),
             pending: Vec::new(),
+            pending_dead: Vec::new(),
+            refire: Vec::new(),
+            reopen: Vec::new(),
             bindings: Vec::new(),
             pending_open: 0,
             frames: Vec::new(),
             next_level: 1,
+            last_retraction: 0,
+            dynamic_off: false,
+            restart_point: None,
             roots: Vec::new(),
             stats: Telemetry::default(),
             started: Instant::now(),
@@ -430,6 +455,7 @@ impl<'a> Engine<'a> {
                     bind: at,
                     dep,
                 });
+                self.pending_dead.push(false);
                 Ok(())
             }
         }
@@ -454,9 +480,16 @@ impl<'a> Engine<'a> {
                 self.check_memory()?;
             }
             if (self.done.equalities as usize) < self.g.equalities.len() {
-                let e = self.g.equalities[self.done.equalities as usize];
+                let i = self.done.equalities;
+                let e = self.g.equalities[i as usize];
                 self.done.equalities += 1;
-                self.merge(e.a, e.b, e.dep, e.annot)?;
+                if !self.g.equality_dead(i) {
+                    self.merge(e.a, e.b, e.dep, e.annot)?;
+                }
+                continue;
+            }
+            if let Some(step) = self.refire_one() {
+                step?;
                 continue;
             }
             if (self.done.nodes as usize) < self.g.nodes.len() {
@@ -476,7 +509,7 @@ impl<'a> Engine<'a> {
                 let i = self.done.unary;
                 self.done.unary += 1;
                 let f = self.g.unary[i as usize];
-                if self.g.live(f.node) {
+                if self.g.live(f.node) && !self.g.dead.unary[i as usize] {
                     join_concept(
                         self.p,
                         &self.g,
@@ -493,7 +526,7 @@ impl<'a> Engine<'a> {
                 let i = self.done.edges;
                 self.done.edges += 1;
                 let e = self.g.edges[i as usize];
-                if self.g.live(e.from) && self.g.live(e.to) {
+                if self.g.live(e.from) && self.g.live(e.to) && !self.g.dead.edges[i as usize] {
                     join_edge(
                         self.p,
                         &self.g,
@@ -510,7 +543,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn apply_firings(&mut self) -> Step<()> {
+    pub(super) fn apply_firings(&mut self) -> Step<()> {
         if self.firings.len() >= super::hyper::MAX_FIRINGS {
             self.firings.clear();
             return Err(Stop::GaveUp(format!(

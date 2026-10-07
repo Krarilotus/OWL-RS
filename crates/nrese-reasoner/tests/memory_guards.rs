@@ -170,6 +170,14 @@ fn membership_probes_are_distinct_and_ordered_per_morsel() {
         result.rounds,
         counters.probes
     );
+    // G1: within a morsel, each relation's runs are read forward from the last check's
+    // place (58 starts for 83,643 checks on 7 October 2026); checked one by one, every
+    // check started every run from the root and none is counted.
+    assert!(
+        (1..=100).contains(&counters.probe_starts),
+        "{} starts of the runs for {probes} checks",
+        counters.probe_starts
+    );
 }
 
 /// The probes of [`membership_probes_are_distinct_and_ordered_per_morsel`]'s run on

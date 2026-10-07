@@ -18,6 +18,9 @@ jsonwebtoken = "9.3.1"
 mimalloc = { workspace = true }
 # mimalloc's `mi_collect`: memory given back after bulk loads and reasoning.
 libmimalloc-sys = { workspace = true }
+# The counting allocator of `--cfg alloc_profile` builds (soak runs: the allocator's live
+# bytes in /metrics).
+nrese-exec = { path = "../nrese-exec" }
 nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-reasoner = { path = "../nrese-reasoner" }
 nrese-sparql = { path = "../nrese-sparql" }

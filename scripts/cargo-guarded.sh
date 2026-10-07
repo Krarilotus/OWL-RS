@@ -125,9 +125,15 @@ if [ "${NRESE_MEMORY_CAP_GB:-0}" -gt 0 ] && [ -r "/proc/$$/winpid" ] && command 
     || printf 'memory cap not applied; building uncapped\n' >&2
 fi
 
+# Jobs per build: the cores shared by the builds the slots allow at once (below), so that
+# full slots don't run more compilers than the machine has threads (8 jobs x 3 slots on 16
+# threads did). Without slots, half the cores.
 if [ -z "${CARGO_BUILD_JOBS:-}" ]; then
   cores=$(nproc 2>/dev/null || printf 4)
-  export CARGO_BUILD_JOBS=$(( cores > 3 ? cores / 2 : 2 ))
+  share=${NRESE_BUILD_SLOTS:-3}
+  [ "$share" -gt 0 ] 2>/dev/null || share=2
+  jobs=$(( (cores + share - 1) / share ))
+  export CARGO_BUILD_JOBS=$(( jobs > 2 ? jobs : 2 ))
 fi
 
 # A machine-wide limit on builds: at most NRESE_BUILD_SLOTS (default 3) cargo runs of ours at

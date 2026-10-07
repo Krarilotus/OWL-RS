@@ -33,6 +33,7 @@ mod ni;
 mod portfolio;
 mod probe;
 mod program;
+mod retract;
 mod search;
 mod telemetry;
 
@@ -83,6 +84,10 @@ pub struct Config {
     /// The most branch points a run may open (`None`: no limit): a deterministic bound
     /// on the search, for tests that must not depend on the machine's speed.
     pub max_branch_points: Option<u64>,
+    /// The most merges a run may make (`None`: no limit), the same kind of bound for a
+    /// search whose work is merging rather than branching (W3C DL-906: 1.6 M merges and
+    /// 3,381 branch points in 30 s).
+    pub max_merges: Option<u64>,
     /// The ≤-rule leaves out merges that would clash at once (a concept against its
     /// negation, a disjointness clause), with their reasons in its premise: a
     /// pigeonhole of disjoint successors is a clash, not a branch per pair.
@@ -91,6 +96,12 @@ pub struct Config {
     /// choices it depended on, and the open disjunction of the most active clause is
     /// decided first (else the oldest open one).
     pub conflict_order: bool,
+    /// Dynamic backtracking: a clash retracts its culprit level alone and re-decides it on
+    /// top, keeping the levels above (docs/design/owl2-dl-dynamic-backtracking.md).
+    pub dynamic_backtracking: bool,
+    /// After each retraction, assert that nothing alive depends on the retracted level
+    /// (on in debug builds; the campaigns set it).
+    pub check_retraction: bool,
     /// Sizes of counted classes compared before the search ([`crate::numbers`]): a class
     /// with two sizes refutes the program without a branch.
     pub counting: bool,
@@ -107,6 +118,9 @@ pub struct Config {
     /// under-approximates such classes. Which clauses decide sooner depends on the
     /// ontology: with [`Config::portfolio`] both run side by side.
     pub lazy_definitions: bool,
+    /// Rewrite complementary definitions to one class and its negation
+    /// (`nrese_owl::Options::complements`); never when the model is kept.
+    pub complements: bool,
     /// Where lazy unfolding changes the clauses and two cores are free, race the plain and
     /// the unfolded clauses (`portfolio`), each with half the memory budget; else the
     /// unfolded clauses alone if this is off, the plain ones if cores are short.
@@ -128,13 +142,17 @@ impl Default for Config {
             check_blocking: false,
             max_nodes: 2_000_000,
             max_branch_points: None,
+            max_merges: None,
             merge_filter: true,
             conflict_order: false,
+            dynamic_backtracking: false,
+            check_retraction: cfg!(debug_assertions),
             counting: true,
             timeout: None,
             max_memory: 4 << 30,
             keep_model: false,
             lazy_definitions: true,
+            complements: true,
             portfolio: true,
             cancel: None,
             expand_at_most_up_to: Options::default().expand_at_most_up_to,
@@ -144,6 +162,9 @@ impl Default for Config {
 
 /// Why a run gave up when [`Config::max_branch_points`] ran out.
 pub const BRANCH_BUDGET: &str = "the branch-point budget ran out";
+
+/// Why a run gave up when [`Config::max_merges`] ran out.
+pub const MERGE_BUDGET: &str = "the merge budget ran out";
 
 /// The answer of a consistency or satisfiability test.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +221,7 @@ pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
     let options = |lazy_definitions| Options {
         expand_at_most_up_to: config.expand_at_most_up_to,
         lazy_definitions,
+        complements: config.complements && !config.keep_model,
         exact_provenance: false,
     };
     if !config.lazy_definitions || config.keep_model {

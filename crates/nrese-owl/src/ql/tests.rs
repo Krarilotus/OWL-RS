@@ -476,3 +476,31 @@ fn a_data_existential_on_the_left_needs_rdfs_literal() {
         ["{Adult(?x) | P(?x) | age(?x _)}"]
     );
 }
+
+/// One query's patterns share one work budget (`Limits::query_work`): many patterns can't
+/// multiply the time `Limits::work` bounds. Given exactly what one pattern takes, a second
+/// stops at "the query's work".
+#[test]
+fn a_query_has_one_work_budget_for_its_patterns() {
+    let (tbox, mut table) = tbox("SubClassOf(:A ObjectSomeValuesFrom(:R :A))", true);
+    let (query, _) = cq(&mut table, "R(?x ?y), R(?y ?z)", &["y", "z"]);
+    let limits = Limits::default();
+    let budget = Budget::new(limits.query_work);
+    let none = &mut |_: &Probe<'_>| false;
+    assert!(matches!(
+        rewrite_with(&tbox, &query, &limits, &budget, none),
+        Outcome::Rewritten(_)
+    ));
+    let used = limits.query_work - budget.left();
+    assert!(used > 0);
+    let budget = Budget::new(used);
+    assert!(matches!(
+        rewrite_with(&tbox, &query, &limits, &budget, none),
+        Outcome::Rewritten(_)
+    ));
+    assert_eq!(budget.left(), 0);
+    assert_eq!(
+        rewrite_with(&tbox, &query, &limits, &budget, none),
+        Outcome::Exceeded("the query's work")
+    );
+}

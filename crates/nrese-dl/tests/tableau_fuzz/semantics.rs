@@ -282,57 +282,131 @@ pub fn find_model(
     None
 }
 
-/// Whether a folded model `i` of the engine's confirms `o`: closed under the role
-/// inclusions, as it is or with its loops untied ([`untie_loops`]).
-pub fn confirms(o: &Ontology, mut i: Interp) -> bool {
+/// Whether a folded model `i` of the engine's confirms `o`, closed under the role
+/// inclusions, as it is or lifted ([`lift`], loops broken or kept): `Some(true)` it does,
+/// `Some(false)` neither is a model, `None` the lift doesn't fit in 128 elements (no
+/// verdict).
+pub fn confirms(o: &Ontology, mut i: Interp) -> Option<bool> {
     close(o, &mut i);
-    model_of(o, &i)
-        || untie_loops(&i).is_some_and(|mut u| {
-            close(o, &mut u);
-            model_of(o, &u)
-        })
+    if model_of(o, &i) {
+        return Some(true);
+    }
+    // Whether to keep a property's loops is decided per property: a reflexive one needs
+    // them where an asymmetric one beside it forbids its own (seeds 182, 200, 268 and 403
+    // of the office campaign: no single choice for all properties was a model).
+    let named: Vec<bool> = (0..i.n)
+        .map(|e| i.individuals.values().any(|&v| v == e))
+        .collect();
+    let mut looped: Vec<Term> = i
+        .roles
+        .iter()
+        .filter(|(_, rows)| (0..i.n as usize).any(|u| !named[u] && rows[u] & (1 << u) != 0))
+        .map(|(&p, _)| p)
+        .collect();
+    looped.sort_unstable();
+    looped.truncate(8);
+    let mut checked = false;
+    for mask in 0u32..(1 << looped.len()) {
+        let keep = |p: Term| {
+            looped
+                .iter()
+                .position(|&q| q == p)
+                .is_some_and(|k| mask & (1 << k) != 0)
+        };
+        if let Some(mut l) = lift(&i, &keep) {
+            checked = true;
+            close(o, &mut l);
+            if model_of(o, &l) {
+                return Some(true);
+            }
+        }
+    }
+    checked.then_some(false)
 }
 
-/// `i` with every self-loop untied: each looped element `v` becomes a cycle of three
-/// copies with `v`'s concepts and `v`'s edges to the other elements, its loops running
-/// along the cycle. Folding a blocked node onto its blocker can close a loop on one
-/// element, which an irreflexive role (a property disjoint with its inverse, say)
-/// forbids, while the unravelled model it stands for is a model (seed 94543, case 143);
-/// three copies keep every non-counting constraint the element met. `None` without a
-/// loop, or past 128 elements.
-fn untie_loops(i: &Interp) -> Option<Interp> {
-    let looped: Vec<u32> = (0..i.n)
-        .filter(|&v| i.roles.values().any(|r| r[v as usize] & (1 << v) != 0))
+/// The 3-fold covering lift of a folded model: each element that isn't an individual
+/// becomes three copies with its concepts, an edge between two such elements runs from
+/// copy `j` to copy `j + 1`, and an individual stays one element, joined to every copy
+/// of its neighbours. Every copy's successors and predecessors have the concepts its
+/// original's have, so every constraint that doesn't count holds as before; a cycle
+/// through anonymous elements gets a length divisible by three, so no loop or 2-cycle a
+/// fold closed is left (an irreflexive or asymmetric property, or one disjoint with its
+/// inverse, forbids them, while the unravelled model the fold stands for is a model:
+/// seed 94543 case 143, seed 2007 case 299). `keep_loops`: the properties whose loops on
+/// an anonymous element stay loops on each copy (a `∃R.Self` or a reflexive property needs
+/// them). `None` past 128 elements.
+fn lift(i: &Interp, keep_loops: &dyn Fn(Term) -> bool) -> Option<Interp> {
+    let named: Vec<bool> = (0..i.n)
+        .map(|e| i.individuals.values().any(|&v| v == e))
         .collect();
-    if looped.is_empty() || i.n as usize + 2 * looped.len() > 128 {
+    // Each element's copies in the lift.
+    let mut copies: Vec<[u32; 3]> = Vec::with_capacity(i.n as usize);
+    let mut n = 0u32;
+    for &individual in &named {
+        if individual {
+            copies.push([n; 3]);
+            n += 1;
+        } else {
+            copies.push([n, n + 1, n + 2]);
+            n += 3;
+        }
+    }
+    if n > 128 {
         return None;
     }
-    let mut out = i.clone();
-    out.n = i.n + 2 * looped.len() as u32;
-    for rows in out.roles.values_mut() {
-        rows.resize(out.n as usize, 0);
+    let mut out = Interp {
+        n,
+        individuals: i
+            .individuals
+            .iter()
+            .map(|(&t, &e)| (t, copies[e as usize][0]))
+            .collect(),
+        ..Interp::default()
+    };
+    for (&c, &set) in &i.concepts {
+        let mut lifted = 0u128;
+        for (e, of) in copies.iter().enumerate() {
+            if set & (1 << e) != 0 {
+                for &x in of {
+                    lifted |= 1 << x;
+                }
+            }
+        }
+        out.concepts.insert(c, lifted);
     }
-    for (k, &v) in looped.iter().enumerate() {
-        let copies = [v, i.n + 2 * k as u32, i.n + 2 * k as u32 + 1];
-        for c in copies[1..].iter() {
-            for set in out.concepts.values_mut() {
-                if *set & (1 << v) != 0 {
-                    *set |= 1 << c;
+    for (&p, rows) in &i.roles {
+        let mut lifted = vec![0u128; n as usize];
+        for u in 0..i.n as usize {
+            for v in 0..i.n as usize {
+                if rows[u] & (1 << v) == 0 {
+                    continue;
+                }
+                match (named[u], named[v]) {
+                    (true, true) => lifted[copies[u][0] as usize] |= 1 << copies[v][0],
+                    (true, false) => {
+                        for &x in &copies[v] {
+                            lifted[copies[u][0] as usize] |= 1 << x;
+                        }
+                    }
+                    (false, true) => {
+                        for &x in &copies[u] {
+                            lifted[x as usize] |= 1 << copies[v][0];
+                        }
+                    }
+                    (false, false) => {
+                        for j in 0..3 {
+                            let to = if u == v && keep_loops(p) {
+                                j
+                            } else {
+                                (j + 1) % 3
+                            };
+                            lifted[copies[u][j] as usize] |= 1 << copies[v][to];
+                        }
+                    }
                 }
             }
         }
-        for (p, rows) in &i.roles {
-            let row = rows[v as usize];
-            let others = row & !(1 << v);
-            let looping = row & (1 << v) != 0;
-            let out_rows = out.roles.get_mut(p).expect("same roles");
-            for (at, &c) in copies.iter().enumerate() {
-                out_rows[c as usize] = others;
-                if looping {
-                    out_rows[c as usize] |= 1 << copies[(at + 1) % 3];
-                }
-            }
-        }
+        out.roles.insert(p, lifted);
     }
     Some(out)
 }

@@ -5,8 +5,8 @@
 //! cargo run --release -p nrese-dl --example tableau_consistency -- [--timeout SECS]
 //!     [--no-semantic-branching] [--no-backjumping] [--ancestor-blocking] [--pairwise-always]
 //!     [--disjunctions-first] [--no-disjunct-learning] [--full-blocking] [--expand-at-most N]
-//!     [--conflict-order] [--no-merge-filter]
-//!     [--exact-provenance] [--no-lazy-definitions] FILE...
+//!     [--conflict-order] [--dynamic-backtracking] [--check-retraction] [--no-merge-filter]
+//!     [--exact-provenance] [--no-lazy-definitions] [--no-complements] FILE...
 //! ```
 //!
 //! `NRESE_CLAUSE_STATS=1` also prints, on standard error, the clauses per kind of axiom
@@ -180,9 +180,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--no-disjunct-learning" => config.disjunct_learning = false,
             "--full-blocking" => config.incremental_blocking = false,
             "--conflict-order" => config.conflict_order = true,
+            "--dynamic-backtracking" => config.dynamic_backtracking = true,
+            "--check-retraction" => config.check_retraction = true,
             "--no-merge-filter" => config.merge_filter = false,
             "--exact-provenance" => exact_provenance = true,
             "--no-lazy-definitions" => config.lazy_definitions = false,
+            "--no-complements" => config.complements = false,
             "--expand-at-most" => {
                 config.expand_at_most_up_to = args.next().ok_or("--expand-at-most N")?.parse()?;
             }
@@ -209,6 +212,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Options {
                 expand_at_most_up_to: config.expand_at_most_up_to,
                 lazy_definitions: config.lazy_definitions && !config.keep_model,
+                complements: config.complements && !config.keep_model,
                 exact_provenance,
             },
         );
