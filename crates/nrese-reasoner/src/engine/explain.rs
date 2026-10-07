@@ -29,10 +29,17 @@ fn describe(rule: &str) -> &'static str {
 
 /// A violation decoded for a reject report: the violated rule's premises under its
 /// bindings (the facts that clash), each marked asserted or inferred.
+///
+/// `readable`, where the committer may not read every graph, tells whether an asserted
+/// statement is in a graph it may read: only those premises are shown. An inferred one is
+/// withheld too (it may follow from graphs the committer can't read, and a rejected
+/// commit's state has no support sets to tell). The withheld ones are counted, and no
+/// term of theirs reaches the report.
 pub fn explain_violation(
     program: &Program,
     violation: &Violation,
     tx: &Transaction<'_>,
+    readable: Option<&dyn Fn(Triple) -> bool>,
 ) -> crate::RejectExplanation {
     use crate::ir::{Head, Term};
     let decode = |id: u64| decoded(tx.decode(TermId::from_raw(id)), id);
@@ -40,45 +47,60 @@ pub fn explain_violation(
         Term::Const(c) => Some(c),
         Term::Var(v) => violation.bindings.get(usize::from(v)).copied(),
     };
-    let evidence: Vec<crate::RejectEvidence> = program
+    let mut withheld = 0usize;
+    let mut evidence: Vec<crate::RejectEvidence> = Vec::new();
+    if let Some(rule) = program
         .rules
         .iter()
         .find(|r| r.name == violation.rule && r.head == Head::Inconsistent)
-        .map(|rule| {
-            rule.body
-                .iter()
-                .filter_map(|atom| {
-                    let [s, p, o] = [value(atom.0[0])?, value(atom.0[1])?, value(atom.0[2])?];
-                    let asserted = tx
-                        .quads_for_pattern_in(
-                            ReadModel::Asserted,
-                            &pattern([Some(s), Some(p), Some(o)], GraphSelector::Any),
-                        )
-                        .next()
-                        .is_some();
-                    Some(crate::RejectEvidence {
-                        role: "premise",
-                        subject: decode(s),
-                        predicate: decode(p),
-                        object: decode(o),
-                        origin: if asserted { "asserted" } else { "inferred" }.to_owned(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    // The instance the violation is about: the subject of the last premise (OWL 2 RL
-    // rules list schema premises first), else the first binding.
+    {
+        for atom in &rule.body {
+            let (Some(s), Some(p), Some(o)) =
+                (value(atom.0[0]), value(atom.0[1]), value(atom.0[2]))
+            else {
+                continue;
+            };
+            let asserted = tx
+                .quads_for_pattern_in(
+                    ReadModel::Asserted,
+                    &pattern([Some(s), Some(p), Some(o)], GraphSelector::Any),
+                )
+                .next()
+                .is_some();
+            if readable.is_some_and(|readable| !asserted || !readable([s, p, o])) {
+                withheld += 1;
+                continue;
+            }
+            evidence.push(crate::RejectEvidence {
+                role: "premise",
+                subject: decode(s),
+                predicate: decode(p),
+                object: decode(o),
+                origin: if asserted { "asserted" } else { "inferred" }.to_owned(),
+            });
+        }
+    }
+    // The instance the violation is about: the subject of the last premise shown (OWL 2
+    // RL rules list schema premises first), else the first binding, unless premises were
+    // withheld (a binding may be a term of theirs).
     let focus = evidence
         .last()
         .map(|e| e.subject.clone())
-        .or_else(|| violation.bindings.first().map(|&id| decode(id)))
+        .or_else(|| {
+            (withheld == 0)
+                .then(|| violation.bindings.first().map(|&id| decode(id)))
+                .flatten()
+        })
         .unwrap_or_default();
     let premises: Vec<String> = evidence
         .iter()
         .map(|e| format!("{} {} {} ({})", e.subject, e.predicate, e.object, e.origin))
         .collect();
-    let summary = if premises.is_empty() {
+    let hidden = match withheld {
+        0 => String::new(),
+        n => format!(" ({n} premise(s) not shown: inferred, or asserted in graphs you can't read)"),
+    };
+    let summary = if premises.is_empty() && withheld == 0 {
         let bindings: Vec<String> = violation.bindings.iter().map(|&id| decode(id)).collect();
         format!(
             "{} ({}): {}",
@@ -88,7 +110,7 @@ pub fn explain_violation(
         )
     } else {
         format!(
-            "{} ({}): {}",
+            "{} ({}): {}{hidden}",
             violation.rule,
             describe(&violation.rule),
             premises.join("; ")
