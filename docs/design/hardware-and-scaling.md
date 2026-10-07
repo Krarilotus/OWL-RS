@@ -74,6 +74,22 @@ decision: the GPU toolchain must fit ADR-0010 (Rust, no C/C++ build dependency, 
 neutral where possible): candidates are wgpu compute shaders and CubeCL (Rust kernels for
 CUDA, ROCm and wgpu), measured on the main PC's RTX 4090.
 
+*The GPU gate* (owner, 7 October 2026), built first, before any GPU kernel pays off: one
+decider, owned by the hardware module, that places each piece of work on the CPU, the GPU,
+or both.
+- **Inputs:** the operator's estimated bytes moved and reused, its rows and work per byte
+  (from the planner's and the rule engine's estimates), the free GPU memory, and the
+  measured speeds of both sides from the installation profile (calibrated per kernel on the
+  machine, not assumed).
+- **Hybrid placement:** work that only partly pays is split. Examples: the GPU takes the
+  dense partitions of a join, a closure's large strongly connected components or a batch of
+  vector distances, while the CPU takes the sparse rest and everything that doesn't fit the
+  card's memory. The results meet in the shared id columns.
+- **Every placement is visible** in EXPLAIN, can be forced or forbidden per request and per
+  workload, and is checked against the CPU result in the differential tests.
+- **v3's GraphRAG components** (embeddings, vector search, graph algorithms) use the same
+  gate rather than a GPU path of their own.
+
 **H6. Several machines (scale-out).**
 - *Read replicas:* the whole store on several machines; one machine takes the writes and
   ships its write-ahead log to the others, which answer queries. More query throughput and
