@@ -517,13 +517,19 @@ fn canonical_number(literal: &Literal) -> Literal {
     }
 }
 
-/// The column of a `(SAMPLE(…) AS ?v)` in a result with `variables`, if the query has one.
-fn sample_column(text: &str, variables: &[String]) -> Option<usize> {
-    let after = &text[text.find("(SAMPLE(")?..];
-    let alias = after[after.find(" AS ?")? + 5..]
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .next()?;
-    variables.iter().position(|v| v == alias)
+/// The columns of every `(SAMPLE(…) AS ?v)` in a result with `variables`: each picks any
+/// value of its group, independently of the others (seed 1814 of the fuzz campaign: two
+/// `SAMPLE(?d)` of one group, the second compared, `<e3>` and `"-1"` both in it).
+fn sample_columns(text: &str, variables: &[String]) -> Vec<usize> {
+    text.match_indices("(SAMPLE(")
+        .filter_map(|(at, _)| {
+            let after = &text[at..];
+            let alias = after[after.find(" AS ?")? + 5..]
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()?;
+            variables.iter().position(|v| v == alias)
+        })
+        .collect()
 }
 
 /// Rows with the parts of every simple literal that holds `separator` sorted (as
@@ -553,13 +559,29 @@ fn concatenations_sorted(rows: &[String], separator: char) -> Vec<String> {
 }
 
 /// Rows of tab-separated cells without cell `column`, sorted.
-fn without_column(rows: &[String], column: usize) -> Vec<String> {
+/// Every `SAMPLE` column is left out of a comparison, not only the first: the queries of
+/// fuzz seeds 1814 and 1908, two `SAMPLE(?d)` of one group, the second compared.
+#[test]
+fn every_sample_column_is_left_out() {
+    let variables = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+    let seed_1814 = "SELECT ?b (SAMPLE(?d) AS ?x0) (SAMPLE(?d) AS ?x1) (MAX(STR(?e)) AS ?x2) WHERE { ?a <http://example.com/p0> ?b } GROUP BY ?b";
+    assert_eq!(
+        sample_columns(seed_1814, &variables(&["b", "x0", "x1", "x2"])),
+        [1, 2]
+    );
+    let seed_1908 = "SELECT ?b (SAMPLE(?d) AS ?x0) (SAMPLE(?d) AS ?x1) WHERE { ?a <http://example.com/p1> ?b } GROUP BY ?b";
+    let rows = ["<e2>\t\"300\"\t<e1>".to_owned()];
+    let columns = sample_columns(seed_1908, &variables(&["b", "x0", "x1"]));
+    assert_eq!(without_columns(&rows, &columns), ["<e2>"]);
+}
+
+fn without_columns(rows: &[String], columns: &[usize]) -> Vec<String> {
     let mut out: Vec<String> = rows
         .iter()
         .map(|row| {
             row.split('\t')
                 .enumerate()
-                .filter(|(i, _)| *i != column)
+                .filter(|(i, _)| !columns.contains(i))
                 .map(|(_, cell)| cell)
                 .collect::<Vec<_>>()
                 .join("\t")
@@ -1895,15 +1917,12 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
                 false,
             );
             // SAMPLE may pick any value of its group, and two plans may visit the rows in
-            // another order: its column is left out of the comparison.
-            let (native_rows, plain_rows) =
-                match sample_column(&text, &variables(&snapshot, &query)) {
-                    Some(column) => (
-                        without_column(&native, column),
-                        without_column(&plain, column),
-                    ),
-                    None => (native.clone(), plain.clone()),
-                };
+            // another order: its columns are left out of the comparison.
+            let samples = sample_columns(&text, &variables(&snapshot, &query));
+            let (native_rows, plain_rows) = (
+                without_columns(&native, &samples),
+                without_columns(&plain, &samples),
+            );
             let (native_rows, plain_rows) = match text.contains("GROUP_CONCAT") {
                 true => (
                     concatenations_sorted(&native_rows, '|'),

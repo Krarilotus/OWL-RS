@@ -59,7 +59,14 @@ known through a source read; *ours* = measured or tested here).
   `"visible"` (every inference, whatever graphs it came from) the whole schema, so schema
   graphs are exempt exactly as they are for the RL inferences that reader already sees;
   with `"hidden"` no rewriting and no status. Test
-  `rewritten_answers_follow_the_readers_graph_access`.
+  `rewritten_answers_follow_the_readers_graph_access`. The same holds where the rewriting
+  goes further (7 October, `restricted_readers_get_nothing_from_graphs_they_cant_read`):
+  the data check (§3) is asked only for a reader of every graph, since its answer comes
+  from the whole data (a reader who doesn't see an inference keeps the witness, and the
+  answer through the existential); a negated pattern is rewritten with the reader's
+  schema, so no answer disappears because of an axiom in a graph it can't read. The
+  printer reads the whole store: it is the operator's offline tool
+  (`nrese-server print-query`), not a request.
 
 ## 2. What it reads, and how it combines with the closure
 
@@ -113,7 +120,30 @@ their multiplicities, plus **one row per answer that only the rewriting finds**:
 `P ∪ (DISTINCT π_V(rewriting) FILTER NOT EXISTS P)`, `V` its non-existential variables.
 So queries without witnesses keep their bags exactly, and no answer is counted twice.
 `COUNT(*)` reads every variable of the solutions it counts, so none of them is existential
-for it; `COUNT(?x)` reads only `?x`.
+for it; `COUNT(?x)` reads only `?x`. The union of the bag form leaves out the branch that is
+`P` as written: its rows are `P`'s, all filtered out again. A group none of whose
+aggregates depends on how often a row comes (`MIN`, `MAX`, `SAMPLE`, the `DISTINCT` ones,
+none) reads a set: the plain union.
+
+**No cost where the rewriting adds nothing** (7 October). Before a witness is folded, the
+data the query reads is asked whether every individual of each concept the witness folds
+to already has the witness's tree (`ASK { ?r a C FILTER NOT EXISTS { tree(?r) } }`, per
+concept). If so, every branch that folds it gives only what the same branch without it
+gives, so the witness goes, as a witness the rest of the query implies does (§2,
+Ontop's CQ subsumption, decided here by the data instead of the TBox). Where no witness is
+left the pattern runs as written. The answer is cached per snapshot revision and question
+in the store's rewriting (the first query after a commit asks again), asked only for a
+reader of every graph (a restricted reader keeps the whole rewriting), and EXPLAIN counts
+the witnesses left out (`ql.realised`) and the questions asked (`ql.checks`). Bounded like
+the rewriting (§5), counted, not timed: at most 16 questions per query and 1,000,000
+statements per question (the concept's and the tree's predicates', counted before it
+runs); past them a witness is folded unasked. A question runs under the query's own
+options (cancellation, memory budget). The printer doesn't ask: its queries hold for any
+data. On NPD's data 9 of the 12 rewritten queries have their witness in the data and run
+as written (`benches/reasoning/queries/npd-stress/README.md`); the random cases of the
+differential test leave out 47 witnesses in 600 queries with every answer still the chase's
+(`rewritten_answers_are_the_certain_answers_of_random_ql_cases`; guard
+`witnesses_the_data_has_are_not_folded`).
 
 ## 4. Switching it on
 
@@ -160,6 +190,21 @@ Tree witnesses can be exponential in the query: k independent ones give 2^k bran
   in a class none has (about 10^11 places): flagged after 30.5 ms (main PC, release),
   where the search would not have finished. NPD's 31 queries and stress set don't reach
   it.
+- **One budget per query** (7 October). The 50,000 steps bound one pattern; a query of
+  many patterns (unions, `EXISTS`, `MINUS`, each rewritten on its own) shares 200,000:
+  each pattern takes at most what the query has left, and past it the rest run as
+  written, flagged (`the query's work`). Planning isn't cancellable, so without it a
+  query's rewriting time grew with its number of patterns (tests
+  `a_query_has_one_work_budget_for_its_patterns`,
+  `the_rewriting_paths_end_in_a_status_at_their_budgets`).
+- **Every path ends in a status.** Under a negation a bound reached makes the answers
+  `unsound` (§1); the data check (§3) folds a witness unasked past its 16 questions per
+  query or 1,000,000 statements per question; the printer (§8) stops after 100,000 class
+  expansions (RL rules unfolded into each other can make its query exponential: two rules
+  per class over the one below, 18 deep, would be 2^18 copies) and says the query is
+  not expressible (`the_printer_stops_at_its_size_bound`). The rewritten query runs
+  under the query's memory budget and cancellation like any other; so do the data
+  check's questions.
 - **Reported.** EXPLAIN (`explain=true` and `explain=plan`) gives `ql`: the patterns
   rewritten, their witnesses, branches and triple patterns, the bounds reached, and the
   completeness.

@@ -6,11 +6,12 @@
 # when that crate changed, or at a milestone. Benchmarks never run here.
 #
 # Usage: scripts/check.sh commit   pre-commit hook: the crates changed against HEAD
-#                                  (staged or not). fmt; clippy on them and their
-#                                  dependents; their fast tests.
+#                                  (staged or not). fmt; clippy on them; their
+#                                  dependents' libraries compile; their fast tests.
 #        scripts/check.sh push     pre-push hook: the crates changed since the upstream
-#                                  branch. fmt; clippy on them and their dependents; all
-#                                  their tests, the dependents' fast tests; the lock check.
+#                                  branch. fmt; clippy on them; all their tests, the
+#                                  dependents' fast tests; random tests on new seeds; the
+#                                  lock check.
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
 #
@@ -21,6 +22,10 @@
 set -u
 cd "$(dirname "$0")/.."
 mode=${1:-all}
+# Warnings fail the gate through Cargo (build.warnings), not through a lint flag: a flag
+# changes the build's fingerprint, so the gate and plain clippy runs would not share
+# artifacts.
+export CARGO_BUILD_WARNINGS=deny
 [ "$mode" = --changed ] && mode=commit
 guarded=scripts/cargo-guarded.sh
 declare -a results=()
@@ -126,9 +131,11 @@ run_seeds() {
     if nextest; then
       # One run per seed: every random test of every changed crate in parallel.
       # shellcheck disable=SC2046
-      if ! NRESE_FUZZ_SEED=$seed "$guarded" nextest run --locked --no-fail-fast \
-          $(package_args "${crates[@]}") -E "$expr" > /dev/null 2>&1; then
-        echo "random tests fail: NRESE_FUZZ_SEED=$seed cargo nextest run -E '$expr'"
+      local out
+      if ! out=$(NRESE_FUZZ_SEED=$seed "$guarded" nextest run --locked --no-fail-fast \
+          $(package_args "${crates[@]}") -E "$expr" 2>&1); then
+        echo "random tests fail with NRESE_FUZZ_SEED=$seed:"
+        printf '%s\n' "$out" | grep -E '^ +FAIL|panicked at' -A1 | grep -v '^--' | sort -u | head -20
         code=1
       fi
       continue
@@ -166,7 +173,7 @@ harness() {
   local manifest=benches/nrese-bench-harness/Cargo.toml
   step "fmt (bench harness)" cargo fmt --manifest-path $manifest --all --check
   step "clippy (bench harness)" "$guarded" clippy --locked --manifest-path $manifest \
-    --all-targets -- -D warnings
+    --all-targets
   step "test (bench harness)" "$guarded" test --locked --manifest-path $manifest --no-fail-fast
 }
 console() {
@@ -198,9 +205,16 @@ case "$mode" in
     echo "=== changed: ${changed[*]:-none}; depending on them: ${dependents[*]:-none}"
     step fmt cargo fmt --all --check
     if [ ${#changed[@]} -gt 0 ]; then
+      # Lints where code changed: every target of the changed crates. A dependent's code didn't
+      # change, so its lints can't either; what can break there is compiling against the new
+      # API. At commit that is checked on the dependents' libraries only; at push the
+      # dependents' tests are built and run anyway, which checks every target of theirs.
       # shellcheck disable=SC2046
-      step clippy "$guarded" clippy --locked $(package_args "${changed[@]}" "${dependents[@]}") \
-        --all-targets -- -D warnings
+      step clippy "$guarded" clippy --locked $(package_args "${changed[@]}") --all-targets
+      if [ "$mode" = commit ] && [ ${#dependents[@]} -gt 0 ]; then
+        # shellcheck disable=SC2046
+        step "dependents compile" "$guarded" check --locked -q $(package_args "${dependents[@]}") --lib
+      fi
       if [ "$mode" = commit ]; then
         step test run_tests "${changed[@]}" -- "${changed[@]}"
       else
@@ -213,7 +227,7 @@ case "$mode" in
     ;;
   all)
     step fmt cargo fmt --all --check
-    step clippy "$guarded" clippy --locked --workspace --all-targets -- -D warnings
+    step clippy "$guarded" clippy --locked --workspace --all-targets
     mapfile -t everything < <(cargo metadata --no-deps --format-version 1 --offline \
       | python -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))" \
       | tr -d '\r')

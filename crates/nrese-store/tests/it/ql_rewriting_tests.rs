@@ -786,6 +786,13 @@ fn store_rows(store: &StoreService, query: &str) -> Vec<Vec<usize>> {
 }
 
 /// [`store_rows`], and whether the store says they are complete (with its reasons).
+/// What the rewriting did for a query.
+fn store_report(store: &StoreService, query: &str) -> Option<nrese_sparql::ql::QlReport> {
+    let mut request = SparqlQueryRequest::all(query);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    store.execute_query(&request).ok()?.ql
+}
+
 fn store_answer(store: &StoreService, query: &str) -> (Vec<Vec<usize>>, Completeness) {
     let mut request = SparqlQueryRequest::all(query);
     request.solutions_format = SolutionsResultFormat::Tsv;
@@ -852,6 +859,8 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
         .unwrap_or(0x9e37_79b9_7f4a_7c15);
     let mut rng = Rng(seed);
     let (mut checked, mut skipped, mut gained) = (0, 0, 0);
+    // Witnesses the data had wherever they fold (not folded, design §3).
+    let mut realised = 0;
     for case in 0..cases {
         let tbox = random_tbox(&mut rng);
         let mut types = Vec::new();
@@ -903,6 +912,7 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
         let without = store(&turtle, dir.path(), ruleset, false);
         for query in &queries {
             let certain = chase.answers(query);
+            realised += store_report(&with, &query.sparql(false)).map_or(0, |r| r.realised);
             let (rows, completeness) = store_answer(&with, &query.sparql(true));
             let distinct: BTreeSet<Vec<usize>> = rows.into_iter().collect();
             // Pure QL: nothing the rewriting doesn't follow.
@@ -950,7 +960,11 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
         }
     }
     eprintln!(
-        "QL differential: {checked} queries checked, {gained} answers only through the rewriting, {skipped} cases skipped (chase too large)"
+        "QL differential: {checked} queries checked, {gained} answers only through the rewriting, {realised} witnesses the data had (not folded), {skipped} cases skipped (chase too large)"
+    );
+    assert!(
+        realised > 0,
+        "no witness the data had: the check went untested"
     );
     assert!(checked >= cases * 3, "too many cases skipped: {skipped}");
     assert!(gained > 0, "no case exercised the rewriting");
@@ -1669,4 +1683,73 @@ fn negation_and_exists_answer_as_the_chase() {
         decided_by_rewriting > 0,
         "no query needed the rewriting inside the negation"
     );
+}
+
+/// A reader who may not read every graph gets nothing derived from what it can't see
+/// (merge checklist §4). Neither the data check (asked of the whole data, design §3) nor a
+/// negated pattern's rewriting reads such a graph for it.
+#[test]
+fn restricted_readers_get_nothing_from_graphs_they_cant_read() {
+    use std::sync::Arc;
+
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, SparqlUpdateRequest};
+
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: nrese_store::QlRewritingMode::On,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    // Ann is an employee; that she works for Acme is inferred from a secret graph only.
+    // Bob is a clerk; that clerks help someone is secret.
+    store
+        .execute_update(&SparqlUpdateRequest::new(
+            "PREFIX ex: <http://e/> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {
+                ex:Employee rdfs:subClassOf [ a owl:Restriction ;
+                    owl:onProperty ex:worksFor ; owl:someValuesFrom owl:Thing ] .
+                ex:headOf rdfs:subPropertyOf ex:worksFor .
+                ex:ann a ex:Employee .
+                GRAPH ex:secret { ex:ann ex:headOf ex:acme }
+                ex:Clerk rdfs:subClassOf ex:Person . ex:bob a ex:Clerk .
+                GRAPH ex:secret2 { ex:Clerk rdfs:subClassOf [ a owl:Restriction ;
+                    owl:onProperty ex:helps ; owl:someValuesFrom owl:Thing ] }
+             }",
+        ))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    let supported = ReadScope::Graphs(Arc::new(GraphAccess {
+        graphs: vec!["http://e/open".to_owned()],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..GraphAccess::default()
+    }));
+    let ask = |query: &str, scope: ReadScope| {
+        let mut request = SparqlQueryRequest::new(query, scope);
+        request.solutions_format = SolutionsResultFormat::Tsv;
+        let result = store.execute_query(&request).unwrap();
+        let mut rows: Vec<String> = String::from_utf8(result.payload)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|l| l.replace("http://e/", ""))
+            .collect();
+        rows.sort();
+        rows
+    };
+    // The whole data has Ann's employer, so for a reader of everything the witness adds
+    // nothing; the restricted reader doesn't see that inference, and gets Ann through
+    // the existential: the data check isn't asked for it.
+    let works = "SELECT ?x WHERE { ?x <http://e/worksFor> ?y }";
+    assert_eq!(ask(works, ReadScope::All), ["<ann>"]);
+    assert_eq!(ask(works, supported.clone()), ["<ann>"]);
+    // A negated pattern reads the reader's schema only: that clerks help someone is in a
+    // graph the reader can't read, so Bob stays an answer for it.
+    let idle =
+        "SELECT ?x WHERE { ?x a <http://e/Person> FILTER NOT EXISTS { ?x <http://e/helps> [] } }";
+    assert_eq!(ask(idle, ReadScope::All), Vec::<String>::new());
+    assert_eq!(ask(idle, supported), ["<bob>"]);
 }

@@ -178,6 +178,7 @@ impl Engine<'_> {
                 let mut fresh = Vec::with_capacity(number.n as usize);
                 for _ in 0..number.n {
                     let t = self.new_node(s, NONE)?;
+                    self.g.born[t as usize] = dep;
                     if data {
                         // A data value: a leaf of its own kind.
                         self.g.nodes[t as usize].flags |= flag::CONCRETE;
@@ -364,6 +365,8 @@ impl Engine<'_> {
             next: 0,
             premise,
             failed: DepSetId::EMPTY,
+            reopen: self.reopen.clone(),
+            refire: self.refire.clone(),
         });
         self.take_alternative()
     }

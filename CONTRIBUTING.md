@@ -42,7 +42,8 @@ Build through `scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most
 working, the push tier once per batch. Measure counts first; time only to answer a stated
 question, inside `scripts/quiet-slot.sh`, on `release` (`--profile lab` to iterate). A slot
 holds one short measurement, since builds wait for it; long comparison runs go to a machine of
-their own.
+their own. Every number names the commit its binary was built from and whether the tree was
+clean; a binary kept for comparison is rebuilt after its source changes or is reverted.
 
 CI (`.github/workflows/ci.yml`, the same steps on Linux) runs at milestones and on merges to
 `main`: `gh workflow run ci.yml --ref <branch>`; the Jena oracle likewise (`oracle.yml`).

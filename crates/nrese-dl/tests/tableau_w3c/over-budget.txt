@@ -1,0 +1,6 @@
+# W3C tests documented as over budget (docs/plan/2026-10-05-coverage.md, the DL row), with
+# their cause: one per line, "name<TAB>why". They run on a small budget (500 nodes, 1,000
+# merges): a wrong answer within it still fails the run, and a full budget spends a minute
+# on each (DL-906 builds 600 successors and their inequalities before it merges).
+WebOnt-description-logic-906	N×M = 600 successors to match one to one; each merge cascades through the functional properties (an algebraic tableau's case)
+WebOnt-description-logic-907	N×M = 60,000 successors with pairwise inequalities exceed memory

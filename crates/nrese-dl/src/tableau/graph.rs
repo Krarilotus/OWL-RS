@@ -15,6 +15,10 @@
 //!   merges (HermiT's canonical-node dependency set).
 //! - **Membership:** a hash index per table; the hyperresolution joins and the clash
 //!   checks ask it.
+//! - **Retraction** (dynamic backtracking, docs/design/owl2-dl-dynamic-backtracking.md):
+//!   a fact whose level is retracted gets a dead bit and leaves its index; the iterators
+//!   skip it, and a cut truncates it as any other. A node whose birth depended on the
+//!   level is `RETRACTED`, untrailed: a cut's restore of its flags keeps the bit.
 
 use hashbrown::HashMap;
 
@@ -37,7 +41,9 @@ pub mod flag {
     /// A data value (concrete node): a leaf, never blocked nor a blocker, no centre of a
     /// clause, outside the NI rule (`data.rs`).
     pub const CONCRETE: u32 = 32;
-    pub const DEAD: u32 = PRUNED | MERGED;
+    /// Its birth depended on a retracted level (dynamic backtracking).
+    pub const RETRACTED: u32 = 64;
+    pub const DEAD: u32 = PRUNED | MERGED | RETRACTED;
     pub const BLOCKED: u32 = DIRECTLY_BLOCKED | INDIRECTLY_BLOCKED;
 }
 
@@ -188,6 +194,17 @@ fn key(a: u32, b: u32) -> u64 {
     (u64::from(a) << 32) | u64::from(b)
 }
 
+/// The retracted entries of each table.
+#[derive(Debug, Clone, Default)]
+pub struct Dead {
+    pub unary: Vec<bool>,
+    pub negatives: Vec<bool>,
+    pub edges: Vec<bool>,
+    pub numbers: Vec<bool>,
+    pub inequalities: Vec<bool>,
+    pub equalities: Vec<bool>,
+}
+
 /// The completion graph.
 #[derive(Debug, Clone, Default)]
 pub struct Graph {
@@ -202,6 +219,10 @@ pub struct Graph {
     /// By node: what its merge into its representative depended on (read only while the
     /// node is merged).
     pub merge_deps: Vec<DepSetId>,
+    /// By node: what its creation depended on (a successor's: its at-least fact's).
+    pub born: Vec<DepSetId>,
+    /// Retracted facts, by table index (dynamic backtracking).
+    pub dead: Dead,
     /// Counts cuts: a fact index can be reused after one, so caches keyed by list heads
     /// are valid within one generation only.
     pub generation: u32,
@@ -259,6 +280,7 @@ impl Graph {
             blocking_hash: 0,
         });
         self.merge_deps.push(DepSetId::EMPTY);
+        self.born.push(DepSetId::EMPTY);
         id
     }
 
@@ -353,6 +375,7 @@ impl Graph {
             next: n.label,
         });
         n.label = id;
+        self.dead.unary.push(false);
         self.touch(node);
         true
     }
@@ -377,6 +400,7 @@ impl Graph {
             next: n.negatives,
         });
         n.negatives = id;
+        self.dead.negatives.push(false);
         self.touch(node);
         true
     }
@@ -406,6 +430,7 @@ impl Graph {
         });
         self.nodes[from as usize].first_out = id;
         self.nodes[to as usize].first_in = id;
+        self.dead.edges.push(false);
         // Both ends: a pairwise signature holds the edges between a node and its parent.
         self.touch(from);
         self.touch(to);
@@ -435,6 +460,7 @@ impl Graph {
             next: n.numbers,
         });
         n.numbers = id;
+        self.dead.numbers.push(false);
         self.touch(node);
         true
     }
@@ -461,6 +487,7 @@ impl Graph {
         });
         self.nodes[a as usize].inequalities = id;
         self.nodes[b as usize].inequalities = id;
+        self.dead.inequalities.push(false);
         self.touch(a.min(b));
         true
     }
@@ -479,7 +506,8 @@ impl Graph {
                     if parent != NONE {
                         low = low.min(parent);
                     }
-                    self.nodes[node as usize].flags = old
+                    let kept = self.nodes[node as usize].flags & flag::RETRACTED;
+                    self.nodes[node as usize].flags = old | kept
                 }
                 Some(Undo::Representative { node, old, old_dep }) => {
                     self.nodes[node as usize].representative = old;
@@ -577,6 +605,111 @@ impl Graph {
         self.equalities.truncate(mark.equalities as usize);
         self.nodes.truncate(alive);
         self.merge_deps.truncate(alive);
+        self.born.truncate(alive);
+        let d = &mut self.dead;
+        d.unary.truncate(mark.unary as usize);
+        d.negatives.truncate(mark.negatives as usize);
+        d.edges.truncate(mark.edges as usize);
+        d.numbers.truncate(mark.numbers as usize);
+        d.inequalities.truncate(mark.inequalities as usize);
+        d.equalities.truncate(mark.equalities as usize);
+    }
+
+    // Retracting (dynamic backtracking) -------------------------------------------------
+
+    /// Retracts fact `i` of the concept table: dead, out of its index.
+    pub fn kill_unary(&mut self, i: u32) {
+        let f = &self.unary[i as usize];
+        let (node, k) = (f.node, key(f.node, f.concept));
+        if self.unary_ix.get(&k) == Some(&i) {
+            self.unary_ix.remove(&k);
+        }
+        self.dead.unary[i as usize] = true;
+        self.touch(node);
+    }
+
+    pub fn kill_negative(&mut self, i: u32) {
+        let f = &self.negatives[i as usize];
+        let (node, k) = (f.node, key(f.node, f.concept));
+        if self.negative_ix.get(&k) == Some(&i) {
+            self.negative_ix.remove(&k);
+        }
+        self.dead.negatives[i as usize] = true;
+        self.touch(node);
+    }
+
+    pub fn kill_edge(&mut self, i: u32) {
+        let e = &self.edges[i as usize];
+        let (from, to, k) = (e.from, e.to, (e.role, e.from, e.to));
+        if self.edge_ix.get(&k) == Some(&i) {
+            self.edge_ix.remove(&k);
+        }
+        self.dead.edges[i as usize] = true;
+        self.touch(from);
+        self.touch(to);
+    }
+
+    pub fn kill_number(&mut self, i: u32) {
+        let f = &self.numbers[i as usize];
+        let (node, k) = (f.node, key(f.node, f.number | (u32::from(f.at_most) << 31)));
+        if self.number_ix.get(&k) == Some(&i) {
+            self.number_ix.remove(&k);
+        }
+        self.dead.numbers[i as usize] = true;
+        self.touch(node);
+    }
+
+    pub fn kill_inequality(&mut self, i: u32) {
+        let f = &self.inequalities[i as usize];
+        let (a, b) = (f.a, f.b);
+        let k = key(a.min(b), a.max(b));
+        if self.inequality_ix.get(&k) == Some(&i) {
+            self.inequality_ix.remove(&k);
+        }
+        self.dead.inequalities[i as usize] = true;
+        self.touch(a.min(b));
+    }
+
+    /// Retracts a pending equality (not yet applied).
+    pub fn kill_equality(&mut self, i: u32) {
+        if self.dead.equalities.len() < self.equalities.len() {
+            self.dead.equalities.resize(self.equalities.len(), false);
+        }
+        self.dead.equalities[i as usize] = true;
+    }
+
+    /// Marks `node` retracted (untrailed: a cut's flag restore keeps the bit).
+    pub fn kill_node(&mut self, node: u32) {
+        self.nodes[node as usize].flags |= flag::RETRACTED;
+        self.touch(node);
+        let parent = self.nodes[node as usize].parent;
+        if parent != NONE {
+            self.touch(parent);
+        }
+    }
+
+    /// The live concept facts and edges (both directions) of `node`, by index.
+    pub fn live_ids(&self, node: u32) -> (Vec<u32>, Vec<u32>) {
+        let mut facts = Vec::new();
+        let mut at = self.nodes[node as usize].label;
+        while at != NONE {
+            if !self.dead.unary[at as usize] {
+                facts.push(at);
+            }
+            at = self.unary[at as usize].next;
+        }
+        let mut edges: Vec<u32> = self.out_edges(node).map(|(i, _)| i).collect();
+        edges.extend(self.in_edges(node).map(|(i, _)| i));
+        (facts, edges)
+    }
+
+    /// Whether pending equality `i` was retracted.
+    pub fn equality_dead(&self, i: u32) -> bool {
+        self.dead
+            .equalities
+            .get(i as usize)
+            .copied()
+            .unwrap_or(false)
     }
 
     // Iteration ------------------------------------------------------------------------
@@ -585,68 +718,90 @@ impl Graph {
     pub fn labels(&self, node: u32) -> impl Iterator<Item = &Unary> {
         let mut at = self.nodes[node as usize].label;
         std::iter::from_fn(move || {
-            (at != NONE).then(|| {
-                let f = &self.unary[at as usize];
+            while at != NONE {
+                let i = at as usize;
+                let f = &self.unary[i];
                 at = f.next;
-                f
-            })
+                if !self.dead.unary[i] {
+                    return Some(f);
+                }
+            }
+            None
         })
     }
 
     pub fn out_edges(&self, node: u32) -> impl Iterator<Item = (u32, &Edge)> {
         let mut at = self.nodes[node as usize].first_out;
         std::iter::from_fn(move || {
-            (at != NONE).then(|| {
+            while at != NONE {
                 let id = at;
                 let e = &self.edges[at as usize];
                 at = e.next_out;
-                (id, e)
-            })
+                if !self.dead.edges[id as usize] {
+                    return Some((id, e));
+                }
+            }
+            None
         })
     }
 
     pub fn in_edges(&self, node: u32) -> impl Iterator<Item = (u32, &Edge)> {
         let mut at = self.nodes[node as usize].first_in;
         std::iter::from_fn(move || {
-            (at != NONE).then(|| {
+            while at != NONE {
                 let id = at;
                 let e = &self.edges[at as usize];
                 at = e.next_in;
-                (id, e)
-            })
+                if !self.dead.edges[id as usize] {
+                    return Some((id, e));
+                }
+            }
+            None
         })
     }
 
     pub fn number_facts(&self, node: u32) -> impl Iterator<Item = &NumberFact> {
         let mut at = self.nodes[node as usize].numbers;
         std::iter::from_fn(move || {
-            (at != NONE).then(|| {
-                let f = &self.numbers[at as usize];
+            while at != NONE {
+                let i = at as usize;
+                let f = &self.numbers[i];
                 at = f.next;
-                f
-            })
+                if !self.dead.numbers[i] {
+                    return Some(f);
+                }
+            }
+            None
         })
     }
 
     pub fn negative_facts(&self, node: u32) -> impl Iterator<Item = &Unary> {
         let mut at = self.nodes[node as usize].negatives;
         std::iter::from_fn(move || {
-            (at != NONE).then(|| {
-                let f = &self.negatives[at as usize];
+            while at != NONE {
+                let i = at as usize;
+                let f = &self.negatives[i];
                 at = f.next;
-                f
-            })
+                if !self.dead.negatives[i] {
+                    return Some(f);
+                }
+            }
+            None
         })
     }
 
     pub fn inequality_facts(&self, node: u32) -> impl Iterator<Item = &Inequality> {
         let mut at = self.nodes[node as usize].inequalities;
         std::iter::from_fn(move || {
-            (at != NONE).then(|| {
-                let f = &self.inequalities[at as usize];
+            while at != NONE {
+                let i = at as usize;
+                let f = &self.inequalities[i];
                 at = if f.a == node { f.next_a } else { f.next_b };
-                f
-            })
+                if !self.dead.inequalities[i] {
+                    return Some(f);
+                }
+            }
+            None
         })
     }
 

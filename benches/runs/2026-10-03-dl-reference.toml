@@ -9,6 +9,7 @@ findings = [
   "HermiT, Openllet and Konclude agree on 79 of 80 ORE dev tasks; ore_ont_1340 (Openllet differs) is open",
   "Konclude 0.7.0 answers 30 W3C DL tests wrongly (its own answers; disputed.tsv)",
   "NRESE's EL classifier agrees on all 20 EL tasks; its quadratic result assembly fixed in c0b5e5c (EMAP 1.77 s -> 0.013 s)",
+  "Not reproduced (7 October): Konclude's WebOnt-description-logic-663 (consistent, 2.2 s) and Openllet's 664 (consistent, 3.5 s) run out of time cold in 5 and 7 reruns (30-120 s, 6 GB); cause not understood: the premises are byte-identical, the path and a cold JVM as then, the loading code and the pinned versions unchanged; the image was rebuilt that evening, so the binaries of that run can't be retested",
 ]
 started = "2026-10-03"
 host = "Kraris-GPTler"

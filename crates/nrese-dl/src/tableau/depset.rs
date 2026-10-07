@@ -75,6 +75,18 @@ impl DepSets {
         self.cons(point, DepSetId::EMPTY)
     }
 
+    /// Whether `point` is in `set`.
+    pub fn contains(&self, mut set: DepSetId, point: u32) -> bool {
+        while !set.is_empty() {
+            let (p, rest) = self.cells[set.0 as usize];
+            if p <= point {
+                return p == point;
+            }
+            set = rest;
+        }
+        false
+    }
+
     /// The points of `set`, newest first.
     pub fn points(&self, mut set: DepSetId) -> Vec<u32> {
         let mut out = Vec::new();

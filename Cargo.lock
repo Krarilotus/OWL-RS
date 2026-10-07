@@ -1256,6 +1256,7 @@ dependencies = [
  "jsonwebtoken",
  "libmimalloc-sys",
  "mimalloc",
+ "nrese-exec",
  "nrese-rdf",
  "nrese-reasoner",
  "nrese-sparql",
