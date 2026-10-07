@@ -8,9 +8,11 @@
 //!    lies outside is kept, with the reason.
 //! 2. [`closure`]: the sizes and edge counts the problem fixes, or a [`Refutation`]. Sound
 //!    for any problem: its axioms are a subset of the ontology's.
+//! 3. [`candidate`]: a compressed model built from the counts, untrusted.
 //!
 //! Nothing here claims a model yet.
 
+pub mod candidate;
 pub mod closure;
 pub mod problem;
 
