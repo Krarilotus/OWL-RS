@@ -19,7 +19,7 @@ decisions that still bind. Superseded ones are left out; git history has them.
 |---|---|
 | **Asserted and inferred data in separate index stacks,** not per-entry flags. | 25 Sep (D2) |
 | **One shared execution core** (`nrese-exec`) for SPARQL and the reasoner: the same id tables, sorts, joins and memory budgets, so every optimisation speeds up both. | 27 Sep (D11) |
-| **Full-text search with tantivy.** | 25 Sep (D3) |
+| **Full-text search built in.** Planned with tantivy (D3); built as our own inverted index over the dictionary's literals (BM25), so no tantivy dependency. | 25 Sep (D3) |
 | **All the hardware a machine has.** The hardware is measured once at installation and every layer may rely on that profile (each derived setting overridable). Targets: Intel and AMD desktops and servers, ARM servers, cluster nodes. GPUs take parallel workloads wherever they measure better, the CPU path always available ([hardware-and-scaling.md](../design/hardware-and-scaling.md)). | 7 Oct |
 
 ## Code and dependencies
