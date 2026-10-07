@@ -165,7 +165,11 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     }
     if let Some(State { upper, .. }) = current {
         match upper {
-            Ok(upper) if asserted.iter().all(|t| upper.is_assertion(*t)) => {
+            // A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
+            Ok(upper)
+                if upper.classes().is_empty()
+                    && asserted.iter().all(|t| upper.is_assertion(*t)) =>
+            {
                 let before = tx.base();
                 let inserted: Vec<Triple> = tx
                     .inserted()
@@ -178,23 +182,29 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
                     .map(quad_triple)
                     .chain(tx.inferred_deleted().map(triple))
                     .collect();
-                return match upper.change(&pending, &inserted, &deleted, &stop) {
-                    Ok(change) => Preparation {
-                        base,
-                        decided_by: "upper-bound",
-                        proves_consistency: upper.program.proves_consistency()
-                            && upper.clashes_after(&change) == 0,
-                        prepared: Prepared::Delta(Box::new(change)),
-                        ontology: None,
-                    },
-                    Err(gave_up) => Preparation {
-                        base,
-                        prepared: Prepared::Rebuilt(Box::new(Err(gave_up))),
-                        decided_by: "upper-bound",
-                        proves_consistency: false,
-                        ontology: None,
-                    },
-                };
+                match upper.change(&pending, &inserted, &deleted, &stop) {
+                    Ok(change) if !change.merges() => {
+                        return Preparation {
+                            base,
+                            decided_by: "upper-bound",
+                            proves_consistency: upper.program.proves_consistency()
+                                && upper.clashes_after(&change) == 0,
+                            prepared: Prepared::Delta(Box::new(change)),
+                            ontology: None,
+                        };
+                    }
+                    // The commit equates terms: U1 afresh, by representatives (below).
+                    Ok(_) => {}
+                    Err(gave_up) => {
+                        return Preparation {
+                            base,
+                            prepared: Prepared::Rebuilt(Box::new(Err(gave_up))),
+                            decided_by: "upper-bound",
+                            proves_consistency: false,
+                            ontology: None,
+                        };
+                    }
+                }
             }
             Err(_) if !asserted.iter().any(|t| changes_schema(tx, *t)) => {
                 return Preparation {
@@ -468,7 +478,23 @@ fn build_view(
         proves_consistency: upper.proves_consistency(),
         rules: false,
     };
-    let mut quads = lower_quads;
+    // A fact over a representative stands for its members: named where one of them is.
+    let named_classes: HashSet<u64> = upper
+        .classes()
+        .classes()
+        .filter(|(_, members)| members.iter().any(|&m| !upper.is_internal(m)))
+        .map(|(representative, _)| representative)
+        .collect();
+    let named = |t: u64| !upper.is_internal(t) || named_classes.contains(&t);
+    // L's memberships beside it, over representatives as the expanded reads want them.
+    let classes = upper.classes();
+    let mut quads: Vec<EncodedQuad> = match classes.is_empty() {
+        true => lower_quads,
+        false => lower
+            .iter()
+            .map(|&[s, p, o]| encode([classes.representative(s), p, classes.representative(o)]))
+            .collect(),
+    };
     for [s, p, o] in upper.stack.iter() {
         // L's memberships from the taxonomy are certain: no gap.
         if lower.contains(&[s, p, o]) {
@@ -485,19 +511,24 @@ fn build_view(
         if p == rdf_type {
             if !upper.is_internal(o) {
                 view.gap_classes.insert(o);
-                if !upper.is_internal(s) {
+                if named(s) {
                     view.named_gap_classes.insert(o);
                 }
             }
         } else if !upper.is_internal(p) {
             view.gap_predicates.insert(p);
-            if !upper.is_internal(s) && !upper.is_internal(o) {
+            if named(s) && named(o) {
                 view.named_gap_predicates.insert(p);
             }
         }
         quads.push(encode([s, p, o]));
     }
-    view.upper = Some(snapshot.with_inferred_added(&quads));
+    let upper_view = snapshot.with_inferred_added(&quads);
+    // Read expanded to every identity of U1's classes (the stack keeps representatives).
+    view.upper = Some(match upper.classes().is_empty() {
+        true => upper_view,
+        false => upper_view.with_equality(Some(TermId::from_raw(upper.same_as()))),
+    });
     view
 }
 
@@ -518,6 +549,9 @@ pub struct BoundsReport {
     pub last: &'static str,
     /// The literals U1 reads by value: those of predicates its rules compare.
     pub literals_by_value: usize,
+    /// U1's `owl:sameAs` classes (kept by representatives) and their largest.
+    pub equality_classes: usize,
+    pub largest_class: usize,
 }
 
 /// The bounds at the latest revision (U1 built afresh if it doesn't describe it).
@@ -531,9 +565,12 @@ pub(crate) fn report(store: &StoreService) -> BoundsReport {
         .unwrap_or_else(|p| p.into_inner());
     let current = state.as_ref().filter(|s| s.revision == view.revision);
     let last = current.map_or("read", |s| s.last);
-    let literals_by_value = current
-        .and_then(|s| s.upper.as_ref().ok())
-        .map_or(0, Upper::literals_by_value);
+    let upper = current.and_then(|s| s.upper.as_ref().ok());
+    let literals_by_value = upper.map_or(0, Upper::literals_by_value);
+    let (equality_classes, largest_class) = upper.map_or((0, 0), |u| {
+        let sizes = u.classes().classes().map(|(_, members)| members.len());
+        sizes.fold((0, 0), |(n, max), size| (n + 1, max.max(size)))
+    });
     BoundsReport {
         revision: view.revision,
         unavailable: view.unavailable.clone(),
@@ -543,6 +580,8 @@ pub(crate) fn report(store: &StoreService) -> BoundsReport {
         gap_predicates: view.gap_predicates.len(),
         last,
         literals_by_value,
+        equality_classes,
+        largest_class,
     }
 }
 
