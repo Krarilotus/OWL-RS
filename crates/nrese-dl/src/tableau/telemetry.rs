@@ -36,8 +36,10 @@ pub struct Telemetry {
     pub blocking_tests: u64,
     pub blocking_hits: u64,
     pub clauses_fired: u64,
-    /// Levels retracted alone (dynamic backtracking).
+    /// Levels retracted alone (dynamic backtracking), and searches started again from
+    /// the first branch point because a backtrack would have crossed a retraction.
     pub retractions: u64,
+    pub restarts: u64,
     /// Join plans run (each new fact runs those its trigger matches).
     pub plans_tried: u64,
     pub facts: u64,
@@ -59,7 +61,7 @@ impl fmt::Display for Telemetry {
             "compile_ms={:.3} saturate_ms={:.3} blocking_ms={:.3} expand_ms={:.3} search_ms={:.3} \
              datatypes_ms={:.3} total_ms={:.3} nodes_created={} peak_nodes={} branch_points={} \
              backjumps={} levels_skipped={} clashes={} merges={} ni={} blocking_tests={} \
-             blocking_hits={} clauses_fired={} retractions={} plans_tried={} facts={} data_checks={} \
+             blocking_hits={} clauses_fired={} retractions={} restarts={} plans_tried={} facts={} data_checks={} \
              key_firings={} \
              bytes_per_hot_node={} bytes_per_node={} dependency_sets={}",
             ms(self.compile),
@@ -81,6 +83,7 @@ impl fmt::Display for Telemetry {
             self.blocking_hits,
             self.clauses_fired,
             self.retractions,
+            self.restarts,
             self.plans_tried,
             self.facts,
             self.data_checks,

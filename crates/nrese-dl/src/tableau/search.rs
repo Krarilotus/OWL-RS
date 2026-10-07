@@ -411,7 +411,7 @@ impl Engine<'_> {
                 break Err(FLOOR.into());
             }
             // Dynamic backtracking: `k` retracted alone, its disjunction re-decided on top.
-            if self.config.dynamic_backtracking && k < top {
+            if self.config.dynamic_backtracking && !self.dynamic_off && k < top {
                 match self.retract_culprit(dep, k) {
                     Some(Ok(())) => break Ok(true),
                     Some(Err(Stop::Clash(d) | Stop::Abandon(d, _))) => {
@@ -421,6 +421,24 @@ impl Engine<'_> {
                     Some(Err(Stop::GaveUp(why))) => break Err(why),
                     None => {}
                 }
+            }
+            if self.last_retraction > k {
+                // A retraction since `k`'s checkpoint killed facts below its mark, and what
+                // redid them (the retracted choice made again on top, the disjunctions it
+                // reopened) lies above: restoring the checkpoint would keep the one without
+                // the other (fuzz seed 131, case 138: a re-decided choice lost, a model
+                // without it). The search starts again from its first branch point as it
+                // was before any retraction, without dynamic backtracking.
+                let Some(point) = self.restart_point.take() else {
+                    break Err("a restart found no branch point to start from".into());
+                };
+                let first = self.frames.partition_point(|f| f.id <= self.floor);
+                self.frames.truncate(first);
+                self.restore(&point);
+                self.dynamic_off = true;
+                self.last_retraction = 0;
+                self.stats.restarts += 1;
+                break Ok(true);
             }
             // The frames up to level `k` stay (`k` itself, the culprit, on top).
             let keep = self.frames.partition_point(|f| f.id <= k);
@@ -495,6 +513,8 @@ impl Engine<'_> {
             next: 0,
             premise: DepSetId::EMPTY,
             failed: DepSetId::EMPTY,
+            reopen: self.reopen.clone(),
+            refire: self.refire.clone(),
         }
     }
 
@@ -511,9 +531,10 @@ impl Engine<'_> {
         self.g.cut(&frame.mark);
         self.pending.truncate(frame.pending as usize);
         self.pending_dead.truncate(frame.pending as usize);
-        // Retractions below the cut stay, and so does their redoing.
-        self.refire.retain(|&n| n < frame.mark.nodes);
-        self.reopen.retain(|&i| i < frame.pending);
+        // The redoing a retraction before the point queued, as it was then (`backtrack`
+        // never restores a point older than a retraction).
+        self.refire.clone_from(&frame.refire);
+        self.reopen.clone_from(&frame.reopen);
         self.bindings.truncate(frame.bindings as usize);
         self.pending_open = frame.pending_open;
         self.ni.pending.truncate(frame.ni_pending as usize);
