@@ -183,6 +183,21 @@ fn islands_decide_where_the_whole_abox_gives_up() {
     }
 }
 
+/// A budget neither the whole ABox nor a batch of islands fits ends undecided (the store
+/// then says the data's consistency is unknown), never in a verdict.
+#[test]
+fn a_spent_budget_leaves_the_islands_undecided() {
+    let config = Config {
+        max_nodes: 2,
+        timeout: Some(std::time::Duration::from_secs(60)),
+        ..Config::default()
+    };
+    for clash in [false, true] {
+        let answer = islands::consistency(&chain(400, clash), &config).answer;
+        assert!(matches!(answer, Answer::GaveUp(_)), "{answer:?}");
+    }
+}
+
 fn decided(answer: &Answer) -> Option<bool> {
     match answer {
         Answer::Consistent => Some(true),
