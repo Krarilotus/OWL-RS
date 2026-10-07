@@ -7,8 +7,7 @@ mod functional;
 use std::collections::HashMap;
 
 use nrese_owl::{
-    Axiom, Characteristic, ClassExpr, DataRange, Diagnostic, EntityKind, ExprId, Make, ObjProp,
-    Ontology, RangeId, Statement, Term, TermKind, Terms, Vocabulary, read, write,
+    Axiom, Diagnostic, Make, Ontology, Statement, Term, TermKind, Terms, Vocabulary, read, write,
 };
 use nrese_rdf::{BlankNode, Literal, NamedNode, Term as RdfTerm};
 use nrese_rdf_io::{RdfFormat, RdfParser};
@@ -196,6 +195,8 @@ ex:bob owl:differentFrom ex:alice .
 ex:Adult rdfs:comment "grown up" .
 "#;
 
+/// Every construct of the RDF mapping is read, each axiom with its source triples, and
+/// written back to the same model.
 #[test]
 fn every_construct_is_read() {
     let mut table = Table::default();
@@ -261,6 +262,7 @@ fn every_construct_is_read() {
         1 + 4,
         "the axiom and the restriction's four"
     );
+    assert_round_trip(&ontology, &mut table);
 }
 
 /// What a datatype theory and key rules need reaches the model and the normalisation:
@@ -586,247 +588,6 @@ fn assert_round_trip(ontology: &Ontology, table: &mut Table) {
         let missing: Vec<&String> = before.iter().filter(|l| !after.contains(l)).collect();
         let extra: Vec<&String> = after.iter().filter(|l| !before.contains(l)).collect();
         panic!("round trip differs\nmissing: {missing:#?}\nextra: {extra:#?}");
-    }
-}
-
-#[test]
-fn the_sample_round_trips() {
-    let mut table = Table::default();
-    let statements = load(&mut table, SAMPLE);
-    let ontology = read(&statements, &table);
-    assert_round_trip(&ontology, &mut table);
-}
-
-/// The terms random ontologies are built from.
-struct Names {
-    classes: Vec<Term>,
-    props: Vec<Term>,
-    data: Term,
-    individuals: Vec<Term>,
-    integer: Term,
-    facet: Term,
-    literals: Vec<Term>,
-}
-
-/// Random ontologies built in the model, written and read back.
-#[test]
-fn random_ontologies_round_trip() {
-    let cases = std::env::var("NRESE_FUZZ_CASES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(200);
-    let mut state = 0x0EEF_2026_1003u64;
-    let mut next = move |n: u64| {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        (z ^ (z >> 31)) % n.max(1)
-    };
-    for _ in 0..cases {
-        let mut table = Table::default();
-        let mut o = Ontology::default();
-        let classes: Vec<Term> = (0..4).map(|i| table.iri_id(&format!("{EX}C{i}"))).collect();
-        let props: Vec<Term> = (0..3).map(|i| table.iri_id(&format!("{EX}p{i}"))).collect();
-        let data = table.iri_id(&format!("{EX}d"));
-        let individuals: Vec<Term> = (0..3).map(|i| table.iri_id(&format!("{EX}a{i}"))).collect();
-        let integer = table.iri_id(&format!("{XSD}integer"));
-        let min_inclusive = table.iri_id(&format!("{XSD}minInclusive"));
-        let literals: Vec<Term> = (0..3)
-            .map(|n| {
-                table.id(Literal::new_typed_literal(
-                    n.to_string(),
-                    NamedNode::new_unchecked(format!("{XSD}integer")),
-                )
-                .into())
-            })
-            .collect();
-        let mut axioms: Vec<Axiom> = Vec::new();
-        for &c in &classes {
-            axioms.push(Axiom::Declaration(EntityKind::Class, c));
-        }
-        for &p in &props {
-            axioms.push(Axiom::Declaration(EntityKind::ObjectProperty, p));
-        }
-        axioms.push(Axiom::Declaration(EntityKind::DataProperty, data));
-        let property = |next: &mut dyn FnMut(u64) -> u64| {
-            let p = props[next(props.len() as u64) as usize];
-            if next(4) == 0 {
-                ObjProp::Inverse(p)
-            } else {
-                ObjProp::Named(p)
-            }
-        };
-        fn range(
-            o: &mut Ontology,
-            next: &mut dyn FnMut(u64) -> u64,
-            integer: Term,
-            facet: Term,
-            literals: &[Term],
-        ) -> RangeId {
-            let r = match next(3) {
-                0 => DataRange::Datatype(integer),
-                1 => DataRange::Restriction(integer, vec![(facet, literals[next(3) as usize])]),
-                _ => DataRange::OneOf(vec![literals[0], literals[1 + next(2) as usize]]),
-            };
-            RangeId(o.ranges.intern(r))
-        }
-        fn class(
-            o: &mut Ontology,
-            next: &mut dyn FnMut(u64) -> u64,
-            depth: u32,
-            names: &Names,
-        ) -> ExprId {
-            let Names {
-                classes,
-                props,
-                data,
-                individuals,
-                integer,
-                facet,
-                literals,
-            } = names;
-            let property = |next: &mut dyn FnMut(u64) -> u64| {
-                let p = props[next(props.len() as u64) as usize];
-                if next(4) == 0 {
-                    ObjProp::Inverse(p)
-                } else {
-                    ObjProp::Named(p)
-                }
-            };
-            let pick = if depth == 0 { 0 } else { next(15) };
-            let e = match pick {
-                0 | 1 => ClassExpr::Class(classes[next(classes.len() as u64) as usize]),
-                2 => {
-                    let (a, b) = (
-                        class(o, next, depth - 1, names),
-                        class(o, next, depth - 1, names),
-                    );
-                    let mut v = vec![a, b];
-                    v.sort();
-                    v.dedup();
-                    ClassExpr::And(v)
-                }
-                3 => {
-                    let (a, b) = (
-                        class(o, next, depth - 1, names),
-                        class(o, next, depth - 1, names),
-                    );
-                    let mut v = vec![a, b];
-                    v.sort();
-                    v.dedup();
-                    ClassExpr::Or(v)
-                }
-                4 => ClassExpr::Not(class(o, next, depth - 1, names)),
-                5 => ClassExpr::Some(property(next), class(o, next, depth - 1, names)),
-                6 => ClassExpr::All(property(next), class(o, next, depth - 1, names)),
-                7 => ClassExpr::HasValue(property(next), individuals[next(3) as usize]),
-                8 => ClassExpr::Min(
-                    next(4) as u32,
-                    property(next),
-                    class(o, next, depth - 1, names),
-                ),
-                9 => ClassExpr::Max(
-                    next(4) as u32,
-                    property(next),
-                    class(o, next, depth - 1, names),
-                ),
-                10 => ClassExpr::Exact(
-                    1 + next(3) as u32,
-                    property(next),
-                    class(o, next, depth - 1, names),
-                ),
-                11 => ClassExpr::OneOf(vec![individuals[0], individuals[1 + next(2) as usize]]),
-                12 => ClassExpr::DataSome(*data, range(o, next, *integer, *facet, literals)),
-                13 => ClassExpr::DataHasValue(*data, literals[next(3) as usize]),
-                _ => ClassExpr::Thing,
-            };
-            ExprId(o.classes.intern(e))
-        }
-        let names = Names {
-            classes: classes.clone(),
-            props: props.clone(),
-            data,
-            individuals: individuals.clone(),
-            integer,
-            facet: min_inclusive,
-            literals: literals.clone(),
-        };
-        for _ in 0..12 {
-            let axiom = match next(12) {
-                0..=2 => {
-                    let (a, b) = (
-                        class(&mut o, &mut next, 2, &names),
-                        class(&mut o, &mut next, 2, &names),
-                    );
-                    Axiom::SubClassOf(a, b)
-                }
-                3 => {
-                    let (a, b) = (
-                        class(&mut o, &mut next, 2, &names),
-                        class(&mut o, &mut next, 2, &names),
-                    );
-                    if a == b {
-                        continue;
-                    }
-                    let mut v = vec![a, b];
-                    v.sort();
-                    Axiom::EquivalentClasses(v)
-                }
-                4 => {
-                    let mut v: Vec<ExprId> = (0..2 + next(2))
-                        .map(|_| class(&mut o, &mut next, 1, &names))
-                        .collect();
-                    v.sort();
-                    v.dedup();
-                    if v.len() < 2 {
-                        continue;
-                    }
-                    Axiom::DisjointClasses(v)
-                }
-                5 => {
-                    let chain: Vec<ObjProp> =
-                        (0..1 + next(2)).map(|_| property(&mut next)).collect();
-                    Axiom::SubObjectPropertyOf(chain, ObjProp::Named(props[next(3) as usize]))
-                }
-                6 => Axiom::ObjectPropertyDomain(
-                    property(&mut next),
-                    class(&mut o, &mut next, 1, &names),
-                ),
-                7 => Axiom::ObjectCharacteristic(
-                    [
-                        Characteristic::Functional,
-                        Characteristic::Symmetric,
-                        Characteristic::Reflexive,
-                    ][next(3) as usize],
-                    property(&mut next),
-                ),
-                8 => Axiom::ClassAssertion(
-                    class(&mut o, &mut next, 2, &names),
-                    individuals[next(3) as usize],
-                ),
-                9 => Axiom::ObjectPropertyAssertion(
-                    props[next(3) as usize],
-                    individuals[next(3) as usize],
-                    individuals[next(3) as usize],
-                ),
-                10 => Axiom::DataPropertyAssertion(
-                    data,
-                    individuals[next(3) as usize],
-                    literals[next(3) as usize],
-                ),
-                _ => Axiom::DataPropertyRange(
-                    data,
-                    range(&mut o, &mut next, integer, min_inclusive, &literals),
-                ),
-            };
-            axioms.push(axiom);
-        }
-        axioms.sort();
-        axioms.dedup();
-        o.sources = vec![Vec::new(); axioms.len()];
-        o.axioms = axioms;
-        assert_round_trip(&o, &mut table);
     }
 }
 

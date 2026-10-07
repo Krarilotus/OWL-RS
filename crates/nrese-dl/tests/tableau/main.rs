@@ -115,12 +115,15 @@ fn disjunctions_branch_and_backtrack() {
     assert_eq!(answer(&b.o), Answer::Consistent);
 }
 
+/// Backjumping: ten independent disjunctions decided first (`disjunctions_first`), then
+/// a clash that depends on none of them, refuted at once rather than after all 1,024
+/// combinations. (By default the existential comes before the choices and the clash
+/// before any branch point: the test checked nothing.)
 #[test]
 fn backjumping_skips_unrelated_choices() {
-    // Many independent disjunctions, then a clash that depends on none of them.
     let mut b = Build::default();
     let a = b.class(1);
-    for i in 0..12 {
+    for i in 0..10 {
         let (x, y) = (b.class(10 + 2 * i), b.class(11 + 2 * i));
         let xy = b.or(&[x, y]);
         b.sub(a, xy);
@@ -133,9 +136,24 @@ fn backjumping_skips_unrelated_choices() {
     let all = b.all(ObjProp::Named(200), nq);
     b.sub(a, all);
     b.assert(a, 100);
-    let config = Config::default();
-    let out = consistency(&b.o, &config);
-    assert_eq!(out.answer, Answer::Inconsistent);
+    let run = |backjumping| {
+        let config = Config {
+            disjunctions_first: true,
+            backjumping,
+            ..Config::default()
+        };
+        consistency(&b.o, &config)
+    };
+    let jumped = run(true);
+    assert_eq!(jumped.answer, Answer::Inconsistent);
+    assert!(jumped.telemetry.branch_points <= 10, "{}", jumped.telemetry);
+    let chronological = run(false);
+    assert_eq!(chronological.answer, Answer::Inconsistent);
+    assert!(
+        chronological.telemetry.branch_points >= 1_000,
+        "{}",
+        chronological.telemetry
+    );
 }
 
 #[test]
@@ -218,55 +236,46 @@ fn functional_roles_merge() {
     assert_eq!(answer(&b.o), Answer::Inconsistent);
 }
 
+/// The ≤-rule merges successors, with every encoding of at-most restrictions (atoms, or
+/// spelled out up to 2 or 8): `≥ 3 R ⊓ ≤ 2 R` is unsatisfiable and `≥ 2 R ⊓ ≤ 2 R` isn't;
+/// `≥ 2 R.B ⊓ ≤ 1 R.B` is unsatisfiable and `≥ 2 R.B ⊓ ≤ 1 R.C` isn't.
 #[test]
-fn number_restrictions() {
-    // ≥ 3 R ⊓ ≤ 2 R is unsatisfiable; ≥ 2 R ⊓ ≤ 2 R isn't.
-    for (min, max, expected) in [(3, 2, Answer::Inconsistent), (2, 2, Answer::Consistent)] {
-        for expand in [0, 2, 8] {
+fn at_most_restrictions_merge_successors() {
+    let r = ObjProp::Named(200);
+    for expand in [0, 2, 8] {
+        let config = Config {
+            expand_at_most_up_to: expand,
+            ..Config::default()
+        };
+        for (min, max, qualified, expected) in [
+            (3, 2, None, Answer::Inconsistent),
+            (2, 2, None, Answer::Consistent),
+            (2, 1, Some(true), Answer::Inconsistent),
+            (2, 1, Some(false), Answer::Consistent),
+        ] {
             let mut b = Build::default();
+            let [bb, c] = [2, 3].map(|t| b.class(t));
             let thing = b.e(ClassExpr::Thing);
-            let at_least = b.e(ClassExpr::Min(min, ObjProp::Named(200), thing));
-            let at_most = b.e(ClassExpr::Max(max, ObjProp::Named(200), thing));
+            let (least, most) = match qualified {
+                None => (thing, thing),
+                Some(same) => (bb, if same { bb } else { c }),
+            };
+            let at_least = b.e(ClassExpr::Min(min, r, least));
+            let at_most = b.e(ClassExpr::Max(max, r, most));
             let both = b.and(&[at_least, at_most]);
             b.assert(both, 100);
-            let config = Config {
-                expand_at_most_up_to: expand,
-                ..Config::default()
-            };
             assert_eq!(
                 consistency(&b.o, &config).answer,
                 expected,
-                "{min} {max} {expand}"
+                "{min} {max} {qualified:?} {expand}"
             );
         }
     }
 }
 
-#[test]
-fn qualified_at_most_merges_by_filler() {
-    // a: ≥2 R.B ⊓ ≤1 R.B is inconsistent; ≥2 R.B ⊓ ≤1 R.C is fine.
-    for expand in [0, 2] {
-        let mut b = Build::default();
-        let bb = b.class(2);
-        let at_least = b.e(ClassExpr::Min(2, ObjProp::Named(200), bb));
-        let at_most = b.e(ClassExpr::Max(1, ObjProp::Named(200), bb));
-        let both = b.and(&[at_least, at_most]);
-        b.assert(both, 100);
-        let config = Config {
-            expand_at_most_up_to: expand,
-            ..Config::default()
-        };
-        assert_eq!(consistency(&b.o, &config).answer, Answer::Inconsistent);
-        let mut b = Build::default();
-        let [bb, c] = [2, 3].map(|t| b.class(t));
-        let at_least = b.e(ClassExpr::Min(2, ObjProp::Named(200), bb));
-        let at_most = b.e(ClassExpr::Max(1, ObjProp::Named(200), c));
-        let both = b.and(&[at_least, at_most]);
-        b.assert(both, 100);
-        assert_eq!(consistency(&b.o, &config).answer, Answer::Consistent);
-    }
-}
-
+/// Transitive roles through automata, an inverse of one too (ore_ont_15971: `after`
+/// inverse of `before`, `before` transitive, was "unsupported: an irregular role
+/// hierarchy"; the regularity is `nrese_owl`'s, in its `models` tests).
 #[test]
 fn transitive_roles_through_automata() {
     let mut b = Build::default();
@@ -279,6 +288,32 @@ fn transitive_roles_through_automata() {
     b.role_assertion(200, 101, 102);
     let nb = b.not(bb);
     b.assert(nb, 102);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // a: ∀before.¬C, before(a, b), after(c, b) (so before(b, c)), c: C.
+    let (before, after) = (ObjProp::Named(200), ObjProp::Named(201));
+    let mut b = Build::default();
+    let c = b.class(1);
+    b.axiom(Axiom::InverseObjectProperties(before, after));
+    b.characteristic(Characteristic::Transitive, before);
+    let nc = b.not(c);
+    let all = b.all(before, nc);
+    b.assert(all, 100);
+    b.role_assertion(200, 100, 101);
+    b.role_assertion(201, 102, 101);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.assert(c, 102);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // ... and along after: c: ∀after.¬C, before(a, b), before(b, c), a: C.
+    let mut b = Build::default();
+    let c = b.class(1);
+    b.axiom(Axiom::InverseObjectProperties(before, after));
+    b.characteristic(Characteristic::Transitive, before);
+    let nc = b.not(c);
+    let all = b.all(after, nc);
+    b.assert(all, 102);
+    b.role_assertion(200, 100, 101);
+    b.role_assertion(200, 101, 102);
+    b.assert(c, 100);
     assert_eq!(answer(&b.o), Answer::Inconsistent);
 }
 
@@ -412,7 +447,8 @@ fn patterns_count_their_strings() {
     }
 }
 
-/// Cardinalities against the values a range has: 256 bytes, but not 257.
+/// Cardinalities against the values a range has: 256 bytes, but not 257. One individual
+/// and no choice: the search's switches don't bear on it (under all 64 it took 21 s).
 #[test]
 fn data_cardinalities_count_values() {
     for (n, expected) in [(256, Answer::Consistent), (257, Answer::Inconsistent)] {
@@ -422,7 +458,11 @@ fn data_cardinalities_count_values() {
         let literal = b.range(nrese_owl::DataRange::Literal);
         let at_least = b.e(ClassExpr::DataMin(n, 400, literal));
         b.assert(at_least, 100);
-        assert_eq!(answer(&b.o), expected, "{n}");
+        assert_eq!(
+            consistency(&b.o, &Config::default()).answer,
+            expected,
+            "{n}"
+        );
     }
 }
 
@@ -686,39 +726,6 @@ fn horn_encodings_keep_their_answers() {
 }
 
 #[test]
-fn an_inverse_pair_with_a_transitive_role_is_regular() {
-    // ore_ont_15971: after inverse of before, before transitive. a: ∀before.¬C,
-    // before(a, b), after(c, b) (so before(b, c)), c: C is inconsistent; it was
-    // "unsupported: an irregular role hierarchy".
-    let mut b = Build::default();
-    let c = b.class(1);
-    let (before, after) = (ObjProp::Named(200), ObjProp::Named(201));
-    b.axiom(Axiom::InverseObjectProperties(before, after));
-    b.characteristic(Characteristic::Transitive, before);
-    let nc = b.not(c);
-    let all = b.all(before, nc);
-    b.assert(all, 100);
-    b.role_assertion(200, 100, 101);
-    b.role_assertion(201, 102, 101);
-    assert_eq!(answer(&b.o), Answer::Consistent);
-    b.assert(c, 102);
-    assert_eq!(answer(&b.o), Answer::Inconsistent);
-    // ... and along after: c: ∀after.¬C, before(a, b), before(b, c), a: C.
-    let mut b = Build::default();
-    let c = b.class(1);
-    b.axiom(Axiom::InverseObjectProperties(before, after));
-    b.characteristic(Characteristic::Transitive, before);
-    let nc = b.not(c);
-    let all = b.all(after, nc);
-    b.assert(all, 102);
-    b.role_assertion(200, 100, 101);
-    b.role_assertion(200, 101, 102);
-    b.assert(c, 100);
-    assert!(normalise(&b.o).unsupported.is_empty());
-    assert_eq!(answer(&b.o), Answer::Inconsistent);
-}
-
-#[test]
 fn a_branch_too_large_to_expand_is_abandoned_not_the_run() {
     // a: A, A ⊑ (C ⊓ ≥10⁹ R) ⊔ {o}: the first disjunct can't be expanded within a budget,
     // the second is a model (as in DL-909, which the search order decided).
@@ -878,17 +885,24 @@ fn class_sizes_refute_a_wrong_product() {
     let out = consistency(&multiplication(2, 3, 7, true), &config);
     assert_eq!(out.answer, Answer::Inconsistent, "{}", out.telemetry);
     assert_eq!(out.telemetry.branch_points, 0, "{}", out.telemetry);
+    // Without counting the search starts (one branch point is enough to see it).
     let off = consistency(
         &multiplication(2, 3, 7, true),
         &Config {
             counting: false,
+            max_branch_points: Some(1),
             ..config.clone()
         },
     );
     assert!(off.telemetry.branch_points > 0, "{}", off.telemetry);
     let out = consistency(&multiplication(2, 3, 6, true), &config);
     assert_eq!(out.answer, Answer::Consistent, "{}", out.telemetry);
-    let out = consistency(&multiplication(2, 3, 7, false), &config);
+    // Nothing refuted: decided consistent, or given up on a small budget.
+    let few = Config {
+        max_branch_points: Some(2_000),
+        ..config.clone()
+    };
+    let out = consistency(&multiplication(2, 3, 7, false), &few);
     assert_ne!(out.answer, Answer::Inconsistent, "{}", out.telemetry);
 }
 

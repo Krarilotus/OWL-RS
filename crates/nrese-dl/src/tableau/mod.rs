@@ -84,6 +84,10 @@ pub struct Config {
     /// The most branch points a run may open (`None`: no limit): a deterministic bound
     /// on the search, for tests that must not depend on the machine's speed.
     pub max_branch_points: Option<u64>,
+    /// The most merges a run may make (`None`: no limit), the same kind of bound for a
+    /// search whose work is merging rather than branching (W3C DL-906: 1.6 M merges and
+    /// 3,381 branch points in 30 s).
+    pub max_merges: Option<u64>,
     /// The ≤-rule leaves out merges that would clash at once (a concept against its
     /// negation, a disjointness clause), with their reasons in its premise: a
     /// pigeonhole of disjoint successors is a clash, not a branch per pair.
@@ -138,6 +142,7 @@ impl Default for Config {
             check_blocking: false,
             max_nodes: 2_000_000,
             max_branch_points: None,
+            max_merges: None,
             merge_filter: true,
             conflict_order: false,
             dynamic_backtracking: false,
@@ -157,6 +162,9 @@ impl Default for Config {
 
 /// Why a run gave up when [`Config::max_branch_points`] ran out.
 pub const BRANCH_BUDGET: &str = "the branch-point budget ran out";
+
+/// Why a run gave up when [`Config::max_merges`] ran out.
+pub const MERGE_BUDGET: &str = "the merge budget ran out";
 
 /// The answer of a consistency or satisfiability test.
 #[derive(Debug, Clone, PartialEq, Eq)]
