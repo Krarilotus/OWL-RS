@@ -408,6 +408,20 @@ In order, each only once the one before is proven correct:
    - Nominals, merges, cardinalities and ABox dependencies must be in the key or the footprint.
 2. **Completion-graph caching** (Konclude's)†. Measured on Wine: 49.5 s without it, 0.8 s with it; UOBM-1 went from 240.6 s to 1.3 s.
 
+**Open (W6, caching across a classification's tests; ORE 5303, 3262, 14551, 6485, 10019):**
+what is a cacheable node label? With inverse roles a node's satisfiability depends on its
+predecessor (a `∀R⁻` sends conclusions back up), and with nominals on the nominal nodes
+and the NI rule's merges it shares with other subtrees, so the label alone is no key.
+Settled in the performance phase, by a count first: per class test, the nodes whose whole
+label (fresh names included) repeats one from an earlier test's complete model (a
+satisfiable hit) or from a clash (an unsatisfiable one), split by whether the node's
+subtree reached an inverse edge or a nominal; that share, under each candidate key, is
+what such a cache can save. What is known (7 October): on 5303 each test's search
+dominates, not the number of tests (136 tests, 786 k branch points, 3,391 clashes, 15.2 s
+on the lab build; Konclude 0.1 s). Lazily unfolded definitions, which classification
+can't use since it reads subsumers off model labels, cut the search to 104 k branch
+points over 1,433 tests (12.4 s), with the same taxonomy.
+
 ### Gates
 
 The W3C OWL 2 test suite, direct semantics, all of it green:
