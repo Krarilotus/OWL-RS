@@ -22,6 +22,10 @@
 set -u
 cd "$(dirname "$0")/.."
 mode=${1:-all}
+# Warnings fail the gate through Cargo (build.warnings), not through a lint flag: a flag
+# changes the build's fingerprint, so the gate and plain clippy runs would not share
+# artifacts.
+export CARGO_BUILD_WARNINGS=deny
 [ "$mode" = --changed ] && mode=commit
 guarded=scripts/cargo-guarded.sh
 declare -a results=()
@@ -169,7 +173,7 @@ harness() {
   local manifest=benches/nrese-bench-harness/Cargo.toml
   step "fmt (bench harness)" cargo fmt --manifest-path $manifest --all --check
   step "clippy (bench harness)" "$guarded" clippy --locked --manifest-path $manifest \
-    --all-targets -- -D warnings
+    --all-targets
   step "test (bench harness)" "$guarded" test --locked --manifest-path $manifest --no-fail-fast
 }
 console() {
@@ -206,7 +210,7 @@ case "$mode" in
       # API. At commit that is checked on the dependents' libraries only; at push the
       # dependents' tests are built and run anyway, which checks every target of theirs.
       # shellcheck disable=SC2046
-      step clippy "$guarded" clippy --locked $(package_args "${changed[@]}") --all-targets -- -D warnings
+      step clippy "$guarded" clippy --locked $(package_args "${changed[@]}") --all-targets
       if [ "$mode" = commit ] && [ ${#dependents[@]} -gt 0 ]; then
         # shellcheck disable=SC2046
         step "dependents compile" "$guarded" check --locked -q $(package_args "${dependents[@]}") --lib
@@ -223,7 +227,7 @@ case "$mode" in
     ;;
   all)
     step fmt cargo fmt --all --check
-    step clippy "$guarded" clippy --locked --workspace --all-targets -- -D warnings
+    step clippy "$guarded" clippy --locked --workspace --all-targets
     mapfile -t everything < <(cargo metadata --no-deps --format-version 1 --offline \
       | python -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))" \
       | tr -d '\r')
