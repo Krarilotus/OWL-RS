@@ -541,3 +541,57 @@ fn engine_trig(trig: &str) -> Engine {
     tx.commit().unwrap();
     engine
 }
+
+/// The guard of performance.md's "witnesses the data has" (design §3): a witness whose
+/// tree the data has at every individual it folds to adds no answer, so the query runs as
+/// written; one individual without it, and the rewriting is back.
+#[test]
+fn witnesses_the_data_has_are_not_folded() {
+    let realised = ":Employee rdfs:subClassOf [ a owl:Restriction ;
+            owl:onProperty :worksFor ; owl:someValuesFrom :Organisation ] .
+        :ann a :Employee ; :worksFor :acme . :acme a :Organisation .";
+    let query = "SELECT ?x WHERE { ?x :worksFor ?y }";
+    let e = engine(realised);
+    let plan = plan_query(&e.snapshot(), &parse(query), &on()).unwrap();
+    let ql = plan.ql.unwrap();
+    assert_eq!((ql.patterns, ql.realised, ql.checks), (0, 1, 1));
+    assert!(
+        !plan.rewrites.contains(&"ql-tree-witness"),
+        "{:?}",
+        plan.rewrites
+    );
+    assert_eq!(rows(&e, query, &on()), ["?x=<ann>"]);
+    // Asked once per snapshot revision: the next query's answer is the cache's.
+    let options = on();
+    let snapshot = e.snapshot();
+    plan_query(&snapshot, &parse(query), &options).unwrap();
+    let again = plan_query(&snapshot, &parse(query), &options)
+        .unwrap()
+        .ql
+        .unwrap();
+    assert_eq!((again.realised, again.checks), (1, 0));
+
+    let e = engine(&format!("{realised} :bob a :Employee ."));
+    let plan = plan_query(&e.snapshot(), &parse(query), &on()).unwrap();
+    let ql = plan.ql.unwrap();
+    assert_eq!((ql.patterns, ql.realised), (1, 0));
+    assert_eq!(rows(&e, query, &on()), ["?x=<ann>", "?x=<bob>"]);
+    // A group no aggregate of which depends on how often a row comes reads a set.
+    assert_eq!(
+        rows(
+            &e,
+            "SELECT (COUNT(DISTINCT ?x) AS ?n) (SAMPLE(?x) AS ?s) WHERE { ?x :worksFor [] } HAVING (COUNT(DISTINCT ?x) > 0)",
+            &on()
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        rows(
+            &e,
+            "SELECT (COUNT(DISTINCT ?x) AS ?n) WHERE { ?x :worksFor [] }",
+            &on()
+        ),
+        ["?n=\"2\"^^<http://www.w3.org/2001/XMLSchema#integer>"]
+    );
+}
