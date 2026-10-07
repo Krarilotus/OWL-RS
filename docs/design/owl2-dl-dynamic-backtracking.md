@@ -26,11 +26,17 @@ So the search throws away and rebuilds the same independent work after nearly ev
 Phase saving changes nothing (the choices already repeat), and replaying the trail would save
 the choosing only (at most about 1.6×).
 
-## 2. Prior art (reported; not yet in `literature/`, to fetch before it is cited)
+## 2. Prior art (`corpus/solvers/sat`: ginsberg1993dynamic, nadel2018chrono, mohle2019backing; wiki: *Backtracking that keeps independent work*)
 
 - Ginsberg, *Dynamic backtracking* (JAIR 1993): on a conflict, retract only the culprit
   decision and what depends on it; keep the rest, with an eliminating explanation per
-  retracted value. Complete, polynomial space.
+  retracted value. Complete, polynomial space. The reassigned variable moves to the end of
+  the order (Def. 2.2; Alg. 4.1/4.3 step 3, §4) and the culprit is the most recent variable
+  of the conflict (step 5): checked against the paper, the fresh largest id and `k = max(C)`
+  below match, as do the kept part and the eliminating explanation (eq. 2). Lifting the
+  restriction to the most recent culprit can loop (§7.2.1): the culprit stays strictly the
+  most recent here, and a heuristic choice of the level to retract would need an argument
+  of its own.
 - Nadel and Ryvchin, *Chronological backtracking* (SAT 2018), and Möhle and Biere, *Backing
   backtracking* (SAT 2019): CDCL backtracks one level instead of jumping far, with assignments
   out of level order; the invariants that keep conflict analysis sound. CaDiCaL uses this
@@ -107,11 +113,13 @@ types fit as they are: a reason already carries the dependency set.
   what the calculus derives from the remaining decisions, minus some redundant work.
 - Completeness follows Ginsberg's argument: each retracted value keeps its eliminating
   explanation (the negated alternative under `C \ {k}`) while that explanation's levels stand.
-- Termination by the same argument: with the re-decided frame moved to the end of the
-  decision order (a fresh id), the eliminating explanations in that order form the
-  lexicographically decreasing measure Ginsberg's proof uses (reported, to verify when the
-  paper is in `literature/`).
-- The 3.9 proof obligation covers this together with learning.
+- Termination by the same argument (Theorem 4.2): its proof strengthens each nogood with the
+  current values of all variables before the culprit (eq. 8); each is valid, none follows
+  from the earlier ones, and the consequences of their conjunction grow monotonically
+  (Lemma A.1, which needs the order: the re-decided frame at the end, here its fresh id).
+- The 3.9 proof obligation covers this together with learning. There termination rests on
+  keeping the learned clauses, not on an order (Möhle and Biere, rule Jump, Props. 1–2):
+  with permanent nogoods the backtrack level becomes free.
 
 **Gates:**
 - A switch `Config::dynamic_backtracking`, off until the A/B.
@@ -156,6 +164,16 @@ Behind `Config::dynamic_backtracking` (off), with `Config::check_retraction`.
 - **Re-firing.** The live facts of the touched nodes and their neighbours are joined again.
   The disjunctions behind the scan that bind a touched node are reopened. Resetting the
   scan cursor cost 1.6× more.
+- **No checkpoint older than a retraction is restored.** A retraction kills facts below
+  the marks of the frames that stay, and what redoes them (the re-decided choice, the
+  reopened disjunctions) lies above. A backtrack that falls back to truncation (a merge
+  since its culprit) would restore a checkpoint that keeps the kills without the redoing.
+  On fuzz seed 131, case 138, it lost a re-decided choice and found a model of an
+  inconsistent ontology. Such a backtrack now starts the search again from the first
+  branch point as it was before the run's first retraction, with dynamic backtracking off
+  for the rest of the run (`restarts` in the telemetry). Checkpoints also keep the
+  retraction queues, which a backtrack restores as they were. Without the fallback (the
+  rollback backend, step 3) no restart would be needed.
 
 **Measured** (662 to 664, lab profile):
 - Truncating backjumps fall to 0 and rebuilt levels to 0. Branch points fall from millions

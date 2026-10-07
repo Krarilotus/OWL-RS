@@ -94,6 +94,10 @@ pub struct Frame {
     pub premise: DepSetId,
     /// What the failed alternatives' clashes depended on, besides this branch point.
     pub failed: DepSetId,
+    /// The retraction queues as they were (`Engine::reopen`, `Engine::refire`): a
+    /// backtrack to this point restores them, the work they held with them.
+    pub reopen: Vec<u32>,
+    pub refire: Vec<u32>,
 }
 
 /// How far each queue is processed.
@@ -146,6 +150,15 @@ pub struct Engine<'a> {
     pub floor: u32,
     /// The next branch point's level ([`Frame::id`]); never reused within a run.
     pub next_level: u32,
+    /// When the last retraction happened, on the levels' clock (`next_level` then): a
+    /// checkpoint older than that can't be restored (`search.rs`, `backtrack`).
+    pub last_retraction: u32,
+    /// Dynamic backtracking switched off for the rest of the run, after a restart.
+    pub dynamic_off: bool,
+    /// The first branch point above the floor as it was before the run's first
+    /// retraction: the point a restart goes back to (no retraction reaches its
+    /// checkpoint; a re-decided frame's own checkpoint is newer).
+    pub restart_point: Option<Frame>,
 }
 
 impl<'a> Engine<'a> {
@@ -164,6 +177,9 @@ impl<'a> Engine<'a> {
             pending_open: 0,
             frames: Vec::new(),
             next_level: 1,
+            last_retraction: 0,
+            dynamic_off: false,
+            restart_point: None,
             roots: Vec::new(),
             stats: Telemetry::default(),
             started: Instant::now(),

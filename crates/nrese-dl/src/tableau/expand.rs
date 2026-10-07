@@ -365,6 +365,8 @@ impl Engine<'_> {
             next: 0,
             premise,
             failed: DepSetId::EMPTY,
+            reopen: self.reopen.clone(),
+            refire: self.refire.clone(),
         });
         self.take_alternative()
     }
