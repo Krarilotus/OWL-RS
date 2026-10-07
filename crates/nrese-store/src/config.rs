@@ -43,6 +43,10 @@ pub struct StoreConfig {
     /// instead of taking the machine; 0 is no limit. By default three quarters of what the
     /// process may use ([`default_process_memory_bytes`]).
     pub process_memory_bytes: u64,
+    /// Whether the process's memory may be backed by transparent huge pages (Linux;
+    /// `nrese_exec::memory::set_transparent_huge_pages`): faster work over large heaps
+    /// (materialisation, loads), more memory held while serving many small requests.
+    pub huge_pages: bool,
     /// Which remote endpoints `SERVICE` may call.
     pub federation: FederationConfig,
     /// Reasoning leaves out memberships in unnamed union classes that nothing consumes
@@ -81,6 +85,11 @@ pub struct StoreConfig {
     /// On disk: serve the data from each checkpoint once written, freeing its copies in
     /// memory (see `nrese_engine::DurabilityConfig::map_checkpoints`).
     pub map_checkpoints: bool,
+    /// On disk: a checkpoint is written in the background once the write-ahead log has
+    /// grown by this many bytes since the last (see
+    /// `nrese_engine::DurabilityConfig::checkpoint_after_wal_bytes`): what a restart
+    /// replays, against the work of writing checkpoints.
+    pub checkpoint_after_wal_bytes: u64,
     /// On disk: memory for a bulk load's quads, in bytes (`0`: no limit); past it they are
     /// sorted in chunks spilled to the data directory (see
     /// `nrese_engine::DurabilityConfig::bulk_load_memory`).
@@ -200,6 +209,14 @@ impl FederationConfig {
     }
 }
 
+/// Whether transparent huge pages may back the process's memory by default: yes, as
+/// before the setting (LUBM 100 materialises 26 % faster with them; serving holds less
+/// without them: docs/ops/server-setup.md §12.1).
+pub const DEFAULT_HUGE_PAGES: bool = true;
+
+/// The write-ahead log's growth after which a checkpoint is written: 256 MiB.
+pub const DEFAULT_CHECKPOINT_AFTER_WAL_BYTES: u64 = 256 << 20;
+
 /// Default query result cache: 64 MiB.
 pub const DEFAULT_QUERY_CACHE_BYTES: usize = 64 << 20;
 
@@ -232,6 +249,7 @@ impl StoreConfig {
             geosparql_stated_only: false,
             total_query_memory_bytes: 0,
             process_memory_bytes: default_process_memory_bytes(),
+            huge_pages: DEFAULT_HUGE_PAGES,
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
             ql_rewriting: QlRewritingMode::Auto,
@@ -242,6 +260,7 @@ impl StoreConfig {
             support_sets: DEFAULT_SUPPORT_SETS,
             verify_on_open: false,
             map_checkpoints: true,
+            checkpoint_after_wal_bytes: DEFAULT_CHECKPOINT_AFTER_WAL_BYTES,
             bulk_load_memory_bytes: 0,
             wal_archive: false,
             index_encoding: nrese_engine::IndexEncoding::Fast,
@@ -263,6 +282,7 @@ impl StoreConfig {
             geosparql_stated_only: false,
             total_query_memory_bytes: 0,
             process_memory_bytes: default_process_memory_bytes(),
+            huge_pages: DEFAULT_HUGE_PAGES,
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
             ql_rewriting: QlRewritingMode::Auto,
@@ -273,6 +293,7 @@ impl StoreConfig {
             support_sets: DEFAULT_SUPPORT_SETS,
             verify_on_open: false,
             map_checkpoints: true,
+            checkpoint_after_wal_bytes: DEFAULT_CHECKPOINT_AFTER_WAL_BYTES,
             bulk_load_memory_bytes: 0,
             wal_archive: false,
             index_encoding: nrese_engine::IndexEncoding::Fast,
