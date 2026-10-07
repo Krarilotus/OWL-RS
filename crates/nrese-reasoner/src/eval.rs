@@ -797,13 +797,15 @@ impl Probes {
 
 /// [`run_jobs`] by morsel: each morsel's facts, sorted by (predicate, subject, object) and
 /// distinct, are handed to `finish` with the index of the job they come from, and its results come back in the morsels' order,
-/// not concatenated (a caller that regroups them needs no copy of all of them). Counts
-/// the probes into `probes` (once per morsel). `rewrite`, if given, maps each derived
-/// fact before it is checked (equality by representatives: to its representatives).
+/// not concatenated (a caller that regroups them needs no copy of all of them). `keep`
+/// removes the facts the source already holds from a morsel's facts in that order, all at
+/// once (a store reads its runs forward across them). Counts the probes into `probes`
+/// (once per morsel). `rewrite`, if given, maps each derived fact before it is checked
+/// (equality by representatives: to its representatives).
 pub fn run_jobs_by_morsel<S: Source + ?Sized, T: Send>(
     source: &S,
     jobs: &[Job<'_>],
-    keep: &(dyn Fn(Triple) -> bool + Sync),
+    keep: &(dyn Fn(&mut Vec<Triple>) + Sync),
     rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)>,
     stop: Stop<'_>,
     probes: &Probes,
@@ -847,7 +849,7 @@ fn run_jobs_with<S: Source + ?Sized>(
     run_morsels(
         source,
         jobs,
-        keep,
+        &|facts: &mut Vec<Triple>| facts.retain(|&fact| keep(fact)),
         acyclic,
         None,
         stop,
@@ -861,7 +863,7 @@ fn run_jobs_with<S: Source + ?Sized>(
 fn run_morsels<S: Source + ?Sized, T: Send>(
     source: &S,
     jobs: &[Job<'_>],
-    keep: &(dyn Fn(Triple) -> bool + Sync),
+    keep: &(dyn Fn(&mut Vec<Triple>) + Sync),
     acyclic: bool,
     rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)>,
     stop: Stop<'_>,
@@ -906,18 +908,18 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
             });
             // The morsel's duplicates go before `keep` probes the source, and the probes
             // run in (predicate, subject, object) order: about half of an OWL 2 RL round's
-            // candidates repeat within it, and sorted probes walk a relation's sorted run
-            // forward instead of missing the cache at every level of every search.
+            // candidates repeat within it, and sorted probes let a store read a relation's
+            // sorted runs forward from the last probe's place instead of searching each
+            // from the root, missing the cache at every level.
             let emitted = out.len() as u64;
             out.sort_unstable_by_key(|&[s, p, o]| (p, s, o));
             out.dedup();
-            let (mut asked, mut unordered, mut last) = (0, 0, None);
-            out.retain(|&fact @ [s, p, o]| {
-                asked += 1;
-                unordered += u64::from(last.is_some_and(|last| last > (p, s, o)));
-                last = Some((p, s, o));
-                keep(fact)
-            });
+            let asked = out.len() as u64;
+            let unordered = out
+                .windows(2)
+                .filter(|w| (w[0][1], w[0][0], w[0][2]) > (w[1][1], w[1][0], w[1][2]))
+                .count() as u64;
+            keep(&mut out);
             if let Some(probes) = probes {
                 use std::sync::atomic::Ordering::Relaxed;
                 probes.probes.fetch_add(asked, Relaxed);
