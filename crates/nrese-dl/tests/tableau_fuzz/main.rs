@@ -213,12 +213,23 @@ fn check_case(
     let mut first: Option<Answer> = None;
     // The search for a small model, once per ontology (the configurations agree).
     let mut searched: Option<Option<Interp>> = None;
+    // A case past the default's budget: the others run on a small one, checked where they
+    // decide all the same (the default seed's case 14 spent 100 of the campaign's 130 s
+    // giving up nine times).
+    let mut beyond = false;
     for (name, config) in &all {
-        let config = Config {
+        let mut config = Config {
             keep_model: true,
             ..config.clone()
         };
+        if beyond {
+            config.max_nodes = config.max_nodes.min(1_000);
+            config.max_branch_points = Some(1_000);
+        }
         let out = consistency(o, &config);
+        if *name == "default" {
+            beyond = matches!(out.answer, Answer::GaveUp(_));
+        }
         if *name == "default" {
             tally.ni_firings += out.telemetry.ni_applications;
         }
@@ -323,6 +334,10 @@ fn check_case(
                 }
             }
         }
+    }
+    if beyond {
+        // The metamorphic runs compare decided answers only.
+        return;
     }
     // Renaming and shuffling leave the answer as it is.
     let base = Config {

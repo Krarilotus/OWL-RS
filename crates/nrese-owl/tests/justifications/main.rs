@@ -36,18 +36,18 @@ fn graph(
     g
 }
 
-/// Every minimal axiom set deriving the goal, by brute force over subsets.
+/// Every minimal axiom set deriving the goal, by brute force over subsets. Deriving is
+/// monotone, so a set is minimal iff no set with one axiom fewer derives (comparing every
+/// pair of deriving sets made this test take 13 s).
 fn brute(g: &ProofGraph<u32, u32>, axioms: u32) -> Vec<Vec<u32>> {
-    let mut derives: Vec<u32> = Vec::new();
-    for mask in 0u32..(1 << axioms) {
-        if g.derivable(&|a| mask & (1 << a) != 0) {
-            derives.push(mask);
-        }
-    }
-    let minimal: Vec<u32> = derives
-        .iter()
-        .copied()
-        .filter(|&m| !derives.iter().any(|&o| o != m && o & m == o))
+    let derives: Vec<bool> = (0u32..(1 << axioms))
+        .map(|mask| g.derivable(&|a| mask & (1 << a) != 0))
+        .collect();
+    let minimal: Vec<u32> = (0u32..(1 << axioms))
+        .filter(|&m| {
+            derives[m as usize]
+                && (0..axioms).all(|a| m & (1 << a) == 0 || !derives[(m & !(1 << a)) as usize])
+        })
         .collect();
     let mut out: Vec<Vec<u32>> = minimal
         .into_iter()
