@@ -464,10 +464,12 @@ fn hard_search_tests_are_decided() {
     }
 }
 
-/// The integer-multiplication tests (DL-906, 907, 910) lie in the number module's fragment
-/// as the RDF reader gives them (`nrese_dl::numbers::problem`): every axiom read.
+/// Guard (the number module, docs/design/owl2-dl.md#number-reasoning-layers): the
+/// integer-multiplication tests lie in its fragment as the RDF reader gives them, and
+/// counting decides them before any search: DL-906 and 907 consistent by a validated
+/// compressed model (907's 60,000 witnesses never built: no tableau node), DL-910 refuted.
 #[test]
-fn the_multiplication_tests_are_number_problems() {
+fn the_multiplication_tests_are_decided_by_counting() {
     let Ok(text) = std::fs::read_to_string(suite_path()) else {
         return;
     };
@@ -487,6 +489,15 @@ fn the_multiplication_tests_are_number_problems() {
             .expect("it reads");
         let problem = nrese_dl::numbers::problem::extract(&premise);
         assert!(problem.complete(), "{name}: {:?}", problem.outside);
+        let out = consistency(&premise, &config());
+        let expected = if name.ends_with("910") {
+            Answer::Inconsistent
+        } else {
+            Answer::Consistent
+        };
+        assert_eq!(out.answer, expected, "{name}");
+        assert_eq!(out.telemetry.nodes_created, 0, "{name}: {}", out.telemetry);
+        assert_eq!(out.telemetry.branch_points, 0, "{name}: {}", out.telemetry);
     }
 }
 
