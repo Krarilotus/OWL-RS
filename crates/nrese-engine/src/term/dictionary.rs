@@ -1897,6 +1897,7 @@ mod tests {
         assert_eq!(dict.decode(id).as_ref().map(Term::as_ref), Some(term));
     }
 
+    /// Every shape round-trips, and shapes of one text are distinct terms.
     #[test]
     fn all_term_shapes_roundtrip() {
         roundtrip(NamedNodeRef::new_unchecked("http://example.com/a").into());
@@ -1906,6 +1907,16 @@ mod tests {
         roundtrip(LiteralRef::new_typed_literal("1450-01-01", xsd::DATE).into());
         roundtrip(LiteralRef::new_typed_literal("01", xsd::INTEGER).into());
         roundtrip(LiteralRef::new_typed_literal("7", xsd::INTEGER).into());
+        let dict = Dictionary::default();
+        let ids = dict.intern_all([
+            NamedNodeRef::new_unchecked("x:a").into(),
+            LiteralRef::new_simple_literal("x:a").into(),
+            BlankNodeRef::new_unchecked("a").into(),
+            LiteralRef::new_typed_literal("01", xsd::INTEGER).into(),
+            LiteralRef::new_typed_literal("1", xsd::INTEGER).into(),
+        ]);
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len());
     }
 
     #[test]
@@ -2009,20 +2020,6 @@ mod tests {
                 .as_deref(),
             Some("Haus")
         );
-    }
-
-    #[test]
-    fn distinct_shapes_with_same_text_get_distinct_ids() {
-        let dict = Dictionary::default();
-        let ids = dict.intern_all([
-            NamedNodeRef::new_unchecked("x:a").into(),
-            LiteralRef::new_simple_literal("x:a").into(),
-            BlankNodeRef::new_unchecked("a").into(),
-            LiteralRef::new_typed_literal("01", xsd::INTEGER).into(),
-            LiteralRef::new_typed_literal("1", xsd::INTEGER).into(),
-        ]);
-        let unique: std::collections::HashSet<_> = ids.iter().collect();
-        assert_eq!(unique.len(), ids.len());
     }
 
     #[test]
