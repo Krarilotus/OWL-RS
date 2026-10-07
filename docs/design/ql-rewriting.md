@@ -59,7 +59,14 @@ known through a source read; *ours* = measured or tested here).
   `"visible"` (every inference, whatever graphs it came from) the whole schema, so schema
   graphs are exempt exactly as they are for the RL inferences that reader already sees;
   with `"hidden"` no rewriting and no status. Test
-  `rewritten_answers_follow_the_readers_graph_access`.
+  `rewritten_answers_follow_the_readers_graph_access`. The same holds where the rewriting
+  goes further (7 October, `restricted_readers_get_nothing_from_graphs_they_cant_read`):
+  the data check (§3) is asked only for a reader of every graph, since its answer comes
+  from the whole data (a reader who doesn't see an inference keeps the witness, and the
+  answer through the existential); a negated pattern is rewritten with the reader's
+  schema, so no answer disappears because of an axiom in a graph it can't read. The
+  printer reads the whole store: it is the operator's offline tool
+  (`nrese-server print-query`), not a request.
 
 ## 2. What it reads, and how it combines with the closure
 
@@ -183,6 +190,21 @@ Tree witnesses can be exponential in the query: k independent ones give 2^k bran
   in a class none has (about 10^11 places): flagged after 30.5 ms (main PC, release),
   where the search would not have finished. NPD's 31 queries and stress set don't reach
   it.
+- **One budget per query** (7 October). The 50,000 steps bound one pattern; a query of
+  many patterns (unions, `EXISTS`, `MINUS`, each rewritten on its own) shares 200,000:
+  each pattern takes at most what the query has left, and past it the rest run as
+  written, flagged (`the query's work`). Planning isn't cancellable, so without it a
+  query's rewriting time grew with its number of patterns (tests
+  `a_query_has_one_work_budget_for_its_patterns`,
+  `the_rewriting_paths_end_in_a_status_at_their_budgets`).
+- **Every path ends in a status.** Under a negation a bound reached makes the answers
+  `unsound` (§1); the data check (§3) folds a witness unasked past its 16 questions per
+  query or 1,000,000 statements per question; the printer (§8) stops after 100,000 class
+  expansions (RL rules unfolded into each other can make its query exponential: two rules
+  per class over the one below, 18 deep, would be 2^18 copies) and says the query is
+  not expressible (`the_printer_stops_at_its_size_bound`). The rewritten query runs
+  under the query's memory budget and cancellation like any other; so do the data
+  check's questions.
 - **Reported.** EXPLAIN (`explain=true` and `explain=plan`) gives `ql`: the patterns
   rewritten, their witnesses, branches and triple patterns, the bounds reached, and the
   completeness.
