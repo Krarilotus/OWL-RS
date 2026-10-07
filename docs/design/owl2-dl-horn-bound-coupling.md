@@ -165,9 +165,13 @@ runs out of its budget, or both in the portfolio's way.
 0. **Counts before building** (one build of counters, no behaviour change): per task, the
    contexts, clauses, conditional clauses and `Incomplete::Join` contexts of the conditional
    core, and the share of classes whose saturation receives a possible atom (would be
-   critical under B).
-1. B as a strategy, with its exactness; the brute-force and metamorphic gates.
-2. C: copies for certain universals, the Eq rule's unconditional half.
+   critical under B). Done, §7.
+1. **Revised by §7:** C first. Copies keyed by what the filler's saturated label lacks (the
+   thesis's keying), as a strategy, with the Eq rule's unconditional half; B's critical
+   marking only for what the copies leave (on 7914, 0.3 % of the classes). The brute-force
+   and metamorphic gates.
+2. Before building C on 9724: why a copy run reaches only 18 of its classes in its budget
+   (eager and keyed alike, §7), counted per class (copies made, clauses), counters only.
 3. D, behind a switch; the A/B on the ORE development set by stratum.
 
 **Expected:**
@@ -184,3 +188,68 @@ then too coarse for these ontologies, C's copies (or the possible atoms B drops)
 they need, and C comes before B. If B and C give exact bounds but the classes they leave
 still exhaust memory in the tests, D is the lever, and its count (nodes per test covered by
 a saturated label) decides it.
+
+## 7. Step 0, measured (7 October)
+
+Counters on the state each run reached (the lab build at a5f4f4c with a counters-only patch,
+`NRESE_W1_COUNTS`; the bound's default budget; a run that ran out counts what it reached, so
+its shares are of the classes whose contexts started). A class is *critical without copies*
+when its context reaches one that gets an atom its core lacks (`A → A`), *critical with
+copies* when that atom is only possible at the predecessor.
+
+| | 9724 | 7914 | 9835 |
+|---|---|---|---|
+| split: finished | yes (equality left out) | no | no |
+| contexts, live clauses | 33,088, 13.1 M | 18,117, 391 k | 46,982, 389 k |
+| conditional clauses | 58 % | 51 % | 80 % |
+| classes reached | 23,136 of 23,136 | 12,889 of 17,680 | 1,393 of 46,247 |
+| critical without copies (step 1) | **91.4 %** | 19.8 % | **98.8 %** |
+| critical with copies | 73.9 % | 18.4 % | 93.4 % |
+| eager (copies keyed by `K₁`): contexts, live clauses | 151,484, 26.4 M | 278,875, 23.7 M | 379,165, 27.5 M |
+| eager: conditional clauses, critical classes | 0, 0 | 0, 0 | 0, 0 |
+| eager: classes reached | 18 | 10,954 | 450 |
+
+**What it says:**
+- **Step 1 alone is falsified** (over 50 % critical on 9724 and 9835): an unconditional
+  saturation that reuses one context per filler leaves nearly every class to the tests. As §6
+  said, the copies come first.
+- **Copies remove the conditions entirely.** With a context per set of certain atoms (the
+  eager strategy), not one clause is conditional and no class is critical on any of the
+  three: in a Horn ontology a condition only arises where a successor gets a certain atom its
+  core lacks. The "critical with copies" row above, read off the split run, overstates it.
+- **The cost moves to the number of contexts:** eager makes 4.6× (9724) to 15× (7914) the
+  contexts within the same budget and reaches far fewer classes.
+
+**Next count (counters only), which decides step 2's form:** the number of distinct copies
+under the thesis's keying, by the atoms the filler's own saturation *lacks* (Konclude's
+extension mapping, p. 127), against eager's keying by all of `K₁`, which separates sets
+that differ only in atoms the filler implies anyway. If the reduced keys are within a small
+factor of split's contexts, step 2 is copies so keyed; if they too run into hundreds of
+thousands, the copies need sharing beyond that (or the hypertableau's result transfer, step
+3, carries these classes), and this note gets revised before anything is built.
+
+**The keyed-copies count (counters only, the same patch plus a measurement strategy):**
+a successor's core is its filler plus the certain atoms the filler's own saturated label
+lacks, the label read off a split run of the same clauses first (the thesis's keying,
+p. 127). The other atoms are still sent as `A → A`, so they show up as conditional clauses,
+redundant ones: the successor derives them from its core anyway.
+
+| | split | eager (keyed by `K₁`) | keyed by the label |
+|---|---|---|---|
+| 7914 (first clause set): contexts | 18,117 | 278,875 | **33,366** |
+| 7914: live clauses | 391 k | 23.7 M | 1.4 M |
+| 7914: classes reached in budget | 12,889 | 10,954 | 10,325 |
+| 7914: critical classes | 19.8 % | 0 % | **0.3 %** |
+| 9724: contexts, classes reached | 33,088, all | 151,484, 18 | 23,731, 18 |
+| 9835: labels available | – | – | 1,393 of 46,247 classes (split doesn't finish) |
+
+- **On 7914 the thesis's keying works:** 8.4× fewer contexts than eager, 1.8× split's, and
+  nearly nothing critical. That decides step 2's form: copies keyed by the label, not by
+  `K₁`.
+- **9724 is inconclusive:** both copy runs (eager and keyed) reach only 18 of its 23,136
+  classes in their budget, even with 120 s and 10 GB; memory isn't the limit. Something per
+  class explodes there; it needs its own count before step 2 is built for it (the revised
+  step 2 above).
+- **9835 is inconclusive:** the labels come from a split run that reaches 3 % of its classes,
+  so the keyed run has nothing to key by for the rest. Its count waits for a label source
+  that finishes (the keyed run itself, iterated, or step 1's saturation).

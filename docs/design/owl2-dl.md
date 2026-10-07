@@ -368,7 +368,7 @@ struct HotNode {                     // expansion and blocking data only: one ca
   - **Individual reuse** comes later (D: weaker measurements, error-prone with nominals).
 - **Nominals and numbers:**
   - The NI rule and at-most merging in the order the calculus prescribes. Motik et al. discuss the "yo-yo" effects that otherwise arise.
-  - An algebraic method for cardinalities (ILP, CARON's arithmetic module) comes only if profiling on UOBM, OWL2Bench and ORE shows merge combinatorics as the hotspot (B, D).
+  - Counting before merging where the clauses fix class sizes: the number module, [§ Number reasoning layers](#number-reasoning-layers).
 - **Search:**
   - **Semantic branching:** after `C` fails, `¬C` is added.
   - **Dependency-directed backjumping:** on a clash, jump to the latest branch point the clash depends on.
@@ -398,6 +398,75 @@ DatatypeTheory
 - **Equality:** value equality and lexical equality are kept apart.
 - **Clashes carry dependency sets,** as FaCT++'s intervals do†. Without that, backjumping over a choice whose impossibility only a facet combination shows would be wrong.
 - **Shared code:** the numeric value spaces reuse `nrese-xsd`'s parsing and comparison (one numeric semantics in the store, roadmap step 4). They don't reuse SPARQL's operator semantics, which differs for out-of-range and invalid literals (C).
+
+<a id="number-reasoning-layers"></a>
+
+### Number reasoning layers
+
+**What it is for.** Some class sizes are fixed globally, and no merge search sees it. In
+W3C DL-906, 907 and 910 (WebOnt 2003, Extracredit, issue `dl-900-arith`), with `p`, `q`
+and `r` functional:
+- `N` is exactly the `p`-predecessors of the nominal `d`, and `d` has `n` of them;
+- each `N`-element has `m` `q`-predecessors, so `|NM| = m·|N|`;
+- `NM` is also exactly the `r`-predecessors of `d`, and `d` has `k` of them.
+
+So `k = m·n`: a degree sum over a singleton anchor (the nominal), inverse cardinalities and
+functional forward roles. 906 is (20, 30, 600), 907 (200, 300, 60,000), consistent; 910 is
+(20, 30, 601), inconsistent. The merge search is resolution-like, and pigeonhole formulas
+need exponential resolution proofs and have polynomial cutting-plane ones (paper says,
+Buresh-Oppenheim et al. 2003 citing Haken 1985 and Cook et al. 1987). The search gives up
+on 906 from `n = 3, m = 4`, and 907's 60,000 pairwise-unequal successors exceed memory.
+(Wiki: *Cardinality reasoning and pigeonhole cases*, with the review of 7 October.)
+
+**Four layers, the trust boundary in the types:**
+1. **Extraction** to a `NumberProblem`, within a syntactic fragment: singleton nominals,
+   domains and ranges, inverses, functional properties, existentials, the sub- and
+   equivalent-class axioms over the counted classes, and exact, min and max cardinalities
+   that translate fully. Anything else (chains, transitivity, `Self`, keys, property
+   disjointness, negative assertions, an unrelated ABox) and the module declines: the
+   search decides.
+2. **Count closure and refutation:** an integer variable per type (the classes split into
+   types where they overlap), equations from each pattern (`|X| = n` at a nominal,
+   `|Y| = m·|X|` through a functional role), bounds from at-least and at-most. Infeasible
+   means inconsistent, and that is sound: the clauses used are a subset of the axioms.
+   `nrese_dl::numbers` is this layer today, with sizes per class compared pairwise
+   (DL-910: 9.5 ms, no branch point).
+3. **Construction of a `CompressedModelCandidate`,** untrusted: one proxy per type with its
+   multiplicity, **role blocks** (the edges of each role between proxy types) and **degree
+   constraints** (907: the out-degree of `q` on `NM` is 1, the in-degree on `N` is 300). A
+   role is a relation, not a multiset, so the counts must be realisable as a simple
+   relation: trivial for these shapes, an integer-flow or b-matching problem in general.
+   A construction that fails means "fall back to the search", never "inconsistent".
+4. **An independent validator** checks every axiom of the problem on the compressed model,
+   multiplicity-aware, without knowing how the candidate was built. Only a validated
+   candidate answers "consistent", and only where the whole ontology lies inside the
+   fragment; anything else falls back.
+
+Only layer 2's refutation and layer 4's validated model are types that become answers; a
+`NumberProblem` or a `CompressedModelCandidate` cannot. No count solution is "consistent".
+
+For 907 the candidate has three proxies: `d`; `N` × 200; `NM` × 60,000 with 300
+`q`-predecessors per `N`-element. That compresses one chosen model of 60,201 elements; it
+isn't a minimal model size (the ontology doesn't make the classes disjoint).
+
+**Guards:**
+- a parametric family: `(n, m, n·m)` consistent and `(n, m, n·m ± 1)` inconsistent, with the
+  answers, no branch point, and the number of types and proxies (counts before times);
+- at small sizes, the candidate expanded to an explicit model and checked by the fuzz suite's
+  model checker (`tests/tableau_fuzz/semantics.rs`). Expansion is a test oracle only:
+  "consistent" in production comes from the validator;
+- 907's acceptance test asserts that no 60,000 witnesses are built;
+- mutants with one axiom outside the fragment, which the module must decline.
+
+**Later:** inside the search (not only before it), a refutation carries the dependency sets
+of the facts its constraints came from, so that backjumping works; today it runs before the
+search, where 910's facts are unconditional.
+
+**Separate lever:** pool-based merging of at-most candidates (Steigmiller et al. 2012, §4) is
+an optimisation of the fallback search, measured on its own. It may bring 906 (621 elements)
+into budget; it can't help 907.
+
+Built in the performance phase.
 
 ### Caching
 
