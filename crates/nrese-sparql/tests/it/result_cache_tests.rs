@@ -7,9 +7,7 @@ use std::sync::Arc;
 
 use nrese_engine::{EncodedTriple, Engine, EngineConfig, ReadModel};
 use nrese_rdf::{GraphName, Quad};
-use nrese_sparql::{
-    QueryOptions, QueryResults, ResultCache, evaluate_query, explain_query, runs_natively,
-};
+use nrese_sparql::{QueryOptions, QueryResults, ResultCache, evaluate_query, runs_natively};
 use nrese_sparql_syntax::SparqlParser;
 
 use crate::native_differential_tests::{
@@ -194,50 +192,6 @@ fn select(
         false,
         text,
     )
-}
-
-#[test]
-fn parts_are_shared_across_queries_and_renamed_into_each() {
-    let engine = store_of(&[
-        ("a", "knows", "b"),
-        ("b", "knows", "c"),
-        ("a", "name", "x"),
-        ("b", "name", "y"),
-    ]);
-    let snapshot = engine.snapshot();
-    let cache = Arc::new(ResultCache::new(1 << 20).admitting_all());
-    let options = with_cache(&cache, ReadModel::Materialised);
-    let first = format!("SELECT ?s ?o WHERE {{ ?s <{EX}knows> ?o . ?o <{EX}name> ?n }}");
-    let renamed = format!("SELECT ?p ?q WHERE {{ ?p <{EX}knows> ?q . ?q <{EX}name> ?m }}");
-    assert_eq!(
-        select(&snapshot, &first, &options),
-        select(&snapshot, &renamed, &QueryOptions::default())
-    );
-    let hits = cache.stats().hits;
-    // The same join under other names: answered from the first query's parts.
-    let answer = select(&snapshot, &renamed, &options);
-    assert_eq!(
-        answer,
-        select(&snapshot, &renamed, &QueryOptions::default())
-    );
-    assert!(cache.stats().hits > hits, "{:?}", cache.stats());
-    // A larger query sharing the join: the join comes from the cache (EXPLAIN says so).
-    let larger = format!(
-        "SELECT ?s ?o (COUNT(*) AS ?k) WHERE {{ {{ SELECT ?s ?o WHERE {{ ?s <{EX}knows> ?o . ?o <{EX}name> ?n }} }} ?s ?p ?x }} GROUP BY ?s ?o"
-    );
-    let explanation = explain_query(&snapshot, &parse(&larger), &options).unwrap();
-    assert!(
-        explanation
-            .steps
-            .iter()
-            .any(|step| step.cache == Some("hit")),
-        "{:#?}",
-        explanation.steps
-    );
-    assert_eq!(
-        select(&snapshot, &larger, &options),
-        select(&snapshot, &larger, &QueryOptions::default())
-    );
 }
 
 #[test]

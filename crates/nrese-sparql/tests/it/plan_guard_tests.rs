@@ -379,7 +379,8 @@ fn selective_paths_join_first() {
 
 /// Plan parts cached and shared across queries (the result cache, QLever's level): a
 /// query whose join another query computed before, under other variable names, gets the
-/// join from the cache, and EXPLAIN marks it; the answer is the one computed afresh.
+/// join from the cache, and EXPLAIN marks it; the answer is the one computed afresh. The
+/// same join alone under other names is answered from the cache too.
 #[test]
 fn parts_are_shared_across_queries_through_the_result_cache() {
     let engine = engine();
@@ -397,6 +398,13 @@ fn parts_are_shared_across_queries_through_the_result_cache() {
         "SELECT ?a ?b WHERE { ?a e:knows ?b . ?b e:kind e:k3 }",
         &cached,
     );
+    let renamed = "SELECT ?p ?q WHERE { ?p e:knows ?q . ?q e:kind e:k3 }";
+    let hits = cache.stats().hits;
+    assert_eq!(
+        run(renamed, &cached).rows,
+        run(renamed, &QueryOptions::default()).rows
+    );
+    assert!(cache.stats().hits > hits, "{:?}", cache.stats());
     let shared = "SELECT ?x (COUNT(?l) AS ?n) WHERE { ?x e:knows ?y . ?y e:kind e:k3 . ?x e:label ?l } GROUP BY ?x";
     let explanation = run(shared, &cached);
     let hit = explanation.steps.iter().find(|s| s.cache == Some("hit"));
