@@ -46,6 +46,36 @@ type Pair = (u64, u64);
 /// this way, a list per morsel: 16 bytes a fact instead of 24, and never concatenated.
 type Segments = Vec<(u64, Vec<Pair>)>;
 
+/// A relation's new pairs, in its subject order, with the marks of those a closed family
+/// produced ([`Marks`]).
+type New = (Pairs, Option<Marks>);
+
+/// The new pairs of the lists `open` and `closed` (each sorted and distinct), those of
+/// `closed` marked: what a closed family produced.
+fn new_pairs(open: Vec<Vec<Pair>>, mut closed: Vec<Vec<Pair>>) -> New {
+    closed.retain(|part| !part.is_empty());
+    if closed.is_empty() {
+        return (union(open), None);
+    }
+    let all = open.iter().all(Vec::is_empty);
+    let parts = open
+        .into_iter()
+        .map(|part| (part, Marking::None))
+        .chain(closed.into_iter().map(|part| (part, Marking::All)))
+        .collect();
+    let (pairs, marks) = sort_marked(parts, false);
+    let marks = Marks {
+        all,
+        so: if all {
+            Vec::new()
+        } else {
+            marks.expect("marked")
+        },
+        os: None,
+    };
+    (pairs, Some(marks))
+}
+
 /// Candidate facts with the closed rule family that produced them, if one did (its schema
 /// link; see [`Relation::closed_by`]).
 type Candidates = (Option<u64>, Segments);
@@ -73,27 +103,6 @@ fn union(mut parts: Vec<Vec<Pair>>) -> Pairs {
     sort_chunked(parts, false)
 }
 
-/// `pairs` without those of `other` (both sorted), in one pass over both; chunks keep no
-/// spare capacity.
-fn without(pairs: Pairs, other: &Pairs) -> Pairs {
-    if other.len() == 0 {
-        return pairs;
-    }
-    let mut others = other.iter().peekable();
-    let mut out = Pairs::default();
-    for mut chunk in pairs.chunks {
-        chunk.retain(|pair| {
-            while others.next_if(|&other| other < pair).is_some() {}
-            others.peek() != Some(&pair)
-        });
-        if chunk.len() < chunk.capacity() {
-            chunk = chunk.as_slice().to_vec();
-        }
-        out.push(chunk);
-    }
-    out
-}
-
 /// The pairs of `parts` (each read as `(b, a)` if `swap`), sorted and distinct, in chunks
 /// of at most about [`chunk_pairs`] pairs, without ever holding them in one vector: a sample of
 /// them gives the chunks' bounds, each part is split by the bounds (and freed, if it is
@@ -101,83 +110,171 @@ fn without(pairs: Pairs, other: &Pairs) -> Pairs {
 /// are what is held at once, not the parts beside a sorted copy of all of them (at
 /// LUBM 1000, a round's `rdf:type` candidates, 2.2 times its new facts: 1 GB).
 fn sort_chunked<P: AsRef<[Pair]> + Send>(parts: Vec<P>, swap: bool) -> Pairs {
-    let read = |&(a, b): &Pair| if swap { (b, a) } else { (a, b) };
-    let total: usize = parts.iter().map(|part| part.as_ref().len()).sum();
-    let chunks = total.div_ceil(chunk_pairs());
-    if chunks <= 1 {
-        let mut all: Vec<Pair> = Vec::with_capacity(total);
-        for part in parts {
-            all.extend(part.as_ref().iter().map(read));
-        }
-        all.par_sort_unstable();
-        all.dedup();
-        return Pairs::chunked(all);
-    }
-    // The bounds: chunk i takes the pairs from bounds[i - 1] up to bounds[i].
-    let step = (total / (chunks * 64)).max(1);
-    let mut sample: Vec<Pair> = Vec::with_capacity(total / step + 1);
-    let mut at = 0;
-    for part in &parts {
-        let part = part.as_ref();
-        let first = (step - at % step) % step;
-        sample.extend(part.iter().skip(first).step_by(step).map(read));
-        at += part.len();
-    }
-    sample.par_sort_unstable();
-    let bounds: Vec<Pair> = (1..chunks)
-        .map(|i| sample[i * sample.len() / chunks])
+    let parts = parts
+        .into_iter()
+        .map(|part| (part, Marking::None))
         .collect();
-    drop(sample);
+    sort_marked(parts, swap).0
+}
+
+/// How the pairs of a part of [`sort_marked`] are marked ([`Marks`]).
+#[derive(Clone, Copy)]
+enum Marking<'a> {
+    None,
+    All,
+    /// A bit per pair of the part.
+    Bits(&'a [u64]),
+}
+
+/// [`sort_chunked`] of parts whose pairs may be marked, with the marks per chunk if a part
+/// is (a pair both marked and not is marked). Each chunk's marked and unmarked pieces are
+/// sorted apart and merged, so the marks cost a pass over the chunk in the cache. The
+/// chunks are of even sizes, never a power of two: a binary search over arrays of
+/// 2^20 pairs met the same cache sets at every step (R13's layout, 7 October 2026).
+fn sort_marked<P: AsRef<[Pair]> + Send>(
+    parts: Vec<(P, Marking<'_>)>,
+    swap: bool,
+) -> (Pairs, Option<Vec<Vec<u64>>>) {
+    let read = |&(a, b): &Pair| if swap { (b, a) } else { (a, b) };
+    let total: usize = parts.iter().map(|(part, _)| part.as_ref().len()).sum();
+    let any_marked = parts
+        .iter()
+        .any(|(part, marking)| !matches!(marking, Marking::None) && !part.as_ref().is_empty());
+    let chunks = total.div_ceil(chunk_pairs()).max(1);
+    // The bounds: chunk i takes the pairs from bounds[i - 1] up to bounds[i].
+    let bounds: Vec<Pair> = if chunks > 1 {
+        let step = (total / (chunks * 64)).max(1);
+        let mut sample: Vec<Pair> = Vec::with_capacity(total / step + 1);
+        let mut at = 0;
+        for (part, _) in &parts {
+            let part = part.as_ref();
+            let first = (step - at % step) % step;
+            sample.extend(part.iter().skip(first).step_by(step).map(read));
+            at += part.len();
+        }
+        sample.par_sort_unstable();
+        (1..chunks)
+            .map(|i| sample[i * sample.len() / chunks])
+            .collect()
+    } else {
+        Vec::new()
+    };
     let chunk_of = |pair: &Pair| bounds.partition_point(|bound| bound <= pair);
-    // Each part split by the bounds, at the pieces' exact sizes.
-    let pieces: Vec<Vec<(usize, Vec<Pair>)>> = parts
+    // Each part split by the bounds (and by its marks), at the pieces' exact sizes.
+    type Pieces = Vec<(usize, bool, Vec<Pair>)>;
+    let pieces: Vec<Pieces> = parts
         .into_par_iter()
-        .map(|part| {
+        .map(|(part, marking)| {
             let pairs = part.as_ref();
-            let mut counts = vec![0; chunks];
-            for pair in pairs {
-                counts[chunk_of(&read(pair))] += 1;
+            // A loop per marking, so that none tests it per pair.
+            match marking {
+                Marking::None => split_part(pairs, chunks, &chunk_of, read, |_| false),
+                Marking::All => split_part(pairs, chunks, &chunk_of, read, |_| true),
+                Marking::Bits(words) => {
+                    split_part(pairs, chunks, &chunk_of, read, |i| marked(words, i))
+                }
             }
-            let mut pieces: Vec<Vec<Pair>> =
-                counts.iter().map(|&n| Vec::with_capacity(n)).collect();
-            for pair in pairs {
-                let pair = read(pair);
-                pieces[chunk_of(&pair)].push(pair);
-            }
-            pieces
-                .into_iter()
-                .enumerate()
-                .filter(|(_, piece)| !piece.is_empty())
-                .collect()
         })
         .collect();
-    let mut by_chunk: Vec<Vec<Vec<Pair>>> = (0..chunks).map(|_| Vec::new()).collect();
-    for (chunk, piece) in pieces.into_iter().flatten() {
-        by_chunk[chunk].push(piece);
+    let mut by_chunk: Vec<[Vec<Vec<Pair>>; 2]> =
+        (0..chunks).map(|_| [Vec::new(), Vec::new()]).collect();
+    for (chunk, is_marked, piece) in pieces.into_iter().flatten() {
+        by_chunk[chunk][usize::from(is_marked)].push(piece);
     }
-    let sorted: Vec<Vec<Pair>> = by_chunk
+    let gather = |pieces: Vec<Vec<Pair>>| {
+        let mut chunk = Vec::with_capacity(pieces.iter().map(Vec::len).sum());
+        for piece in pieces {
+            chunk.extend_from_slice(&piece);
+        }
+        // In parallel too: few chunks may come at once (OWL2Bench RL-1's modules hand
+        // over one list of 1.3 M pairs: two chunks, two threads, 13 % slower).
+        chunk.par_sort_unstable();
+        chunk.dedup();
+        chunk
+    };
+    let sorted: Vec<(Vec<Pair>, Option<Vec<u64>>)> = by_chunk
         .into_par_iter()
-        .map(|pieces| {
-            let mut chunk = Vec::with_capacity(pieces.iter().map(Vec::len).sum());
-            for piece in pieces {
-                chunk.extend_from_slice(&piece);
-            }
-            // In parallel too: few chunks may come at once (OWL2Bench RL-1's modules hand
-            // over one list of 1.3 M pairs: two chunks, two threads, 13 % slower).
-            chunk.par_sort_unstable();
-            chunk.dedup();
-            if chunk.len() == chunk.capacity() {
-                chunk
+        .map(|[open, closed]| {
+            let (open, closed) = (gather(open), gather(closed));
+            let (chunk, words) = if closed.is_empty() {
+                (open, None)
             } else {
-                chunk.as_slice().to_vec()
+                let (chunk, words) = merge_marked(&open, &closed);
+                (chunk, Some(words))
+            };
+            let words =
+                any_marked.then(|| words.unwrap_or_else(|| vec![0; chunk.len().div_ceil(64)]));
+            if chunk.len() == chunk.capacity() {
+                (chunk, words)
+            } else {
+                (chunk.as_slice().to_vec(), words)
             }
         })
         .collect();
     let mut out = Pairs::default();
-    for chunk in sorted {
+    let mut marks = any_marked.then(Vec::new);
+    for (chunk, words) in sorted {
+        if chunk.is_empty() {
+            continue;
+        }
         out.push(chunk);
+        if let (Some(marks), Some(words)) = (&mut marks, words) {
+            marks.push(words);
+        }
     }
-    out
+    (out, marks)
+}
+
+/// The pieces of `pairs` (each read by `read`) per chunk of [`sort_marked`] and per mark:
+/// `(chunk, marked, pairs)`, at their exact sizes.
+fn split_part(
+    pairs: &[Pair],
+    chunks: usize,
+    chunk_of: &impl Fn(&Pair) -> usize,
+    read: impl Fn(&Pair) -> Pair,
+    is_marked: impl Fn(usize) -> bool,
+) -> Vec<(usize, bool, Vec<Pair>)> {
+    let slot = |i: usize, pair: &Pair| 2 * chunk_of(pair) + usize::from(is_marked(i));
+    let mut counts = vec![0; 2 * chunks];
+    for (i, pair) in pairs.iter().enumerate() {
+        counts[slot(i, &read(pair))] += 1;
+    }
+    let mut pieces: Vec<Vec<Pair>> = counts.iter().map(|&n| Vec::with_capacity(n)).collect();
+    for (i, pair) in pairs.iter().enumerate() {
+        let pair = read(pair);
+        pieces[slot(i, &pair)].push(pair);
+    }
+    pieces
+        .into_iter()
+        .enumerate()
+        .filter(|(_, piece)| !piece.is_empty())
+        .map(|(at, piece)| (at / 2, at % 2 == 1, piece))
+        .collect()
+}
+
+/// The union of `open` and `marked` (each sorted and distinct), with a bit per pair set
+/// where it is in `marked` (a pair in both is marked).
+fn merge_marked(open: &[Pair], marked: &[Pair]) -> (Vec<Pair>, Vec<u64>) {
+    let mut out = Vec::with_capacity(open.len() + marked.len());
+    let mut words = vec![0u64; out.capacity().div_ceil(64)];
+    let (mut i, mut j) = (0, 0);
+    while i < open.len() || j < marked.len() {
+        let take_marked = j < marked.len() && (i == open.len() || marked[j] <= open[i]);
+        if take_marked {
+            if i < open.len() && open[i] == marked[j] {
+                i += 1;
+            }
+            let at = out.len();
+            words[at / 64] |= 1 << (at % 64);
+            out.push(marked[j]);
+            j += 1;
+        } else {
+            out.push(open[i]);
+            i += 1;
+        }
+    }
+    words.truncate(out.len().div_ceil(64));
+    (out, words)
 }
 
 /// The result of [`materialise`].
@@ -396,12 +493,31 @@ impl Pairs {
             .is_some_and(|chunk| chunk.binary_search(&pair).is_ok())
     }
 
+    /// The chunk and the place in it of `pair`, if it is there.
+    fn position(&self, pair: Pair) -> Option<(usize, usize)> {
+        let at = self.lasts.partition_point(|&last| last < pair);
+        let chunk = self.chunks.get(at)?;
+        chunk.binary_search(&pair).ok().map(|i| (at, i))
+    }
+
     /// The pairs whose first component is `key`: a slice of each chunk they are in.
     fn range(&self, key: u64) -> impl Iterator<Item = &[Pair]> {
+        self.range_at(key).map(|(_, _, pairs)| pairs)
+    }
+
+    /// [`Self::range`], each slice with its chunk and where it starts in it.
+    fn range_at(&self, key: u64) -> impl Iterator<Item = (usize, usize, &[Pair])> {
         let first = self.lasts.partition_point(|last| last.0 < key);
         self.chunks[first..]
             .iter()
-            .map_while(move |chunk| (chunk[0].0 <= key).then(|| range(chunk, key)))
+            .enumerate()
+            .map_while(move |(i, chunk)| {
+                (chunk[0].0 <= key).then(|| {
+                    let start = chunk.partition_point(|p| p.0 < key);
+                    let len = chunk[start..].partition_point(|p| p.0 == key);
+                    (first + i, start, &chunk[start..start + len])
+                })
+            })
     }
 
     fn iter(&self) -> impl Iterator<Item = &Pair> {
@@ -461,39 +577,28 @@ impl Feed for Cursor {
     }
 }
 
-/// The union of two disjoint feeds, a buffer at a time: a merge's source that is itself a
-/// merge, so three runs merge in one pass, without a copy of the union of two of them.
-struct Merged<A, B> {
-    a: A,
-    b: B,
-    buffer: Vec<Pair>,
-    at: usize,
+/// Which pairs of a delta one closed rule family produced ([`Relation::closed_by`]): a bit
+/// per pair, per chunk of each order the delta keeps, or all of them. The family's
+/// instances skip those pairs ([`Seg::DeltaNotBy`]); every other read sees the delta as
+/// one run, so the partition costs lookups, folds and merges nothing.
+#[derive(Default)]
+struct Marks {
+    /// Every pair is marked (the family produced the whole delta).
+    all: bool,
+    so: Vec<Vec<u64>>,
+    os: Option<Vec<Vec<u64>>>,
 }
 
-impl<A: Feed, B: Feed> Merged<A, B> {
-    fn new(a: A, b: B) -> Self {
-        Self {
-            a,
-            b,
-            buffer: Vec::with_capacity(chunk_pairs().min(4096)),
-            at: 0,
-        }
+impl Marks {
+    fn bytes(&self) -> usize {
+        let words = |chunks: &Vec<Vec<u64>>| chunks.iter().map(Vec::capacity).sum::<usize>();
+        (words(&self.so) + self.os.as_ref().map_or(0, words)) * 8
     }
 }
 
-impl<A: Feed, B: Feed> Feed for Merged<A, B> {
-    fn rest(&mut self) -> &[Pair] {
-        if self.at == self.buffer.len() {
-            self.buffer.clear();
-            self.at = 0;
-            fill(&mut self.a, &mut self.b, &mut self.buffer);
-        }
-        &self.buffer[self.at..]
-    }
-
-    fn read(&mut self, n: usize) {
-        self.at += n;
-    }
+/// Whether bit `at` of `words` is set.
+fn marked(words: &[u64], at: usize) -> bool {
+    words[at / 64] >> (at % 64) & 1 != 0
 }
 
 /// Moves the pairs of `a` and `b` (disjoint), in order, into `out` until it is full or
@@ -698,17 +803,102 @@ impl Run {
                 if let Some(chunk) = self.so.chunk_of((s, o))
                     && let Ok(at) = chunk.binary_search(&(s, o))
                 {
-                    out.push((&chunk[at..=at], false, old));
+                    out.push(Slice::of(&chunk[at..=at], false, old));
                 }
             }
-            (Some(s), None) => out.extend(self.so.range(s).map(|pairs| (pairs, false, old))),
+            (Some(s), None) => out.extend(self.so.range(s).map(|p| Slice::of(p, false, old))),
             (None, Some(o)) => match &self.os {
-                Some(os) => out.extend(os.range(o).map(|pairs| (pairs, true, old))),
+                Some(os) => out.extend(os.range(o).map(|p| Slice::of(p, true, old))),
                 None => return self.len() == 0,
             },
-            (None, None) => out.extend(self.so.chunks.iter().map(|pairs| (&pairs[..], false, old))),
+            (None, None) => out.extend(self.so.chunks.iter().map(|p| Slice::of(p, false, old))),
         }
         true
+    }
+
+    /// [`Run::matching`] without the pairs `marks` marks, as slices that carry their
+    /// chunk's marks ([`Slice::skip`]); `false` where [`Run::matching`] is.
+    fn matching_unmarked<'a>(
+        &'a self,
+        s: Option<u64>,
+        o: Option<u64>,
+        marks: &'a Marks,
+        out: &mut Slices<'a>,
+    ) -> bool {
+        if marks.all {
+            return true;
+        }
+        let slice = |pairs, swapped, words: &'a [u64], start| Slice {
+            pairs,
+            swapped,
+            old: false,
+            skip: Some((words, start)),
+        };
+        match (s, o) {
+            (Some(s), Some(o)) => {
+                if let Some((c, i)) = self.so.position((s, o))
+                    && !marked(&marks.so[c], i)
+                {
+                    out.push(Slice::of(&self.so.chunks[c][i..=i], false, false));
+                }
+            }
+            (Some(s), None) => out.extend(
+                self.so
+                    .range_at(s)
+                    .map(|(c, start, p)| slice(p, false, &marks.so[c][..], start)),
+            ),
+            (None, Some(o)) => match (&self.os, &marks.os) {
+                (Some(os), Some(os_marks)) => out.extend(
+                    os.range_at(o)
+                        .map(|(c, start, p)| slice(p, true, &os_marks[c][..], start)),
+                ),
+                _ => return self.len() == 0,
+            },
+            (None, None) => out.extend(
+                self.so
+                    .chunks
+                    .iter()
+                    .zip(&marks.so)
+                    .map(|(p, words)| slice(p, false, &words[..], 0)),
+            ),
+        }
+        true
+    }
+
+    /// [`Run::scan`] without the pairs `marks` marks.
+    fn scan_unmarked(
+        &self,
+        s: Option<u64>,
+        o: Option<u64>,
+        marks: &Marks,
+        missed: &std::sync::atomic::AtomicU64,
+        f: &mut dyn FnMut(u64, u64),
+    ) {
+        if marks.all {
+            return;
+        }
+        let mut slices = Slices::new();
+        if self.matching_unmarked(s, o, marks, &mut slices) {
+            for slice in &slices {
+                slice.for_each(|(a, b)| match slice.swapped {
+                    true => f(b, a),
+                    false => f(a, b),
+                });
+            }
+            return;
+        }
+        // By object without the object order: every pair read.
+        let o = o.expect("only lookups by object alone have no slices");
+        if self.len() > 0 {
+            missed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        for (chunk, words) in self.so.chunks.iter().zip(&marks.so) {
+            for (i, &(s, other)) in chunk.iter().enumerate() {
+                if other == o && !marked(words, i) {
+                    f(s, o);
+                }
+            }
+        }
     }
 
     fn estimate(&self, s: Option<u64>, o: Option<u64>) -> usize {
@@ -745,35 +935,52 @@ impl Run {
         *written += so.len() + os.as_ref().map_or(0, |os| os.len());
         Run { so, os }
     }
+}
 
-    /// [`Run::merge`] with two runs at once (all three disjoint), in one pass: `b` and `c`
-    /// are merged as they are read, without a copy of their union.
-    fn merge_both(self, b: Run, c: Run, written: &mut usize) -> Run {
-        if b.len() == 0 {
-            return self.merge(c, written);
+/// A slice of a run matching a pattern.
+#[derive(Clone, Copy)]
+struct Slice<'a> {
+    pairs: &'a [Pair],
+    /// Whether its order is `(object, subject)`.
+    swapped: bool,
+    /// Whether its pairs are read as old (the recent run's, whose delta pairs are skipped).
+    old: bool,
+    /// The marks of its chunk and where the slice starts in it: marked pairs are skipped
+    /// ([`Marks`]).
+    skip: Option<(&'a [u64], usize)>,
+}
+
+impl<'a> Slice<'a> {
+    fn of(pairs: &'a [Pair], swapped: bool, old: bool) -> Self {
+        Self {
+            pairs,
+            swapped,
+            old,
+            skip: None,
         }
-        if c.len() == 0 || self.len() == 0 {
-            return self.merge(b, written).merge(c, written);
+    }
+
+    /// Calls `f` with each pair of `range` (positions in the slice) not skipped, as stored.
+    fn for_each_in(&self, range: std::ops::Range<usize>, mut f: impl FnMut(Pair)) {
+        match self.skip {
+            None => self.pairs[range].iter().for_each(|&pair| f(pair)),
+            Some((words, start)) => {
+                for i in range {
+                    if !marked(words, start + i) {
+                        f(self.pairs[i]);
+                    }
+                }
+            }
         }
-        let three = |a: Arc<Pairs>, b: Arc<Pairs>, c: Arc<Pairs>| {
-            let total = a.len() + b.len() + c.len();
-            let rest = Merged::new(Cursor::new(b), Cursor::new(c));
-            Arc::new(merge(Cursor::new(a), rest, total))
-        };
-        let so = three(self.so, b.so, c.so);
-        let os = match (self.os, b.os, c.os) {
-            (Some(a), Some(b), Some(c)) => Some(three(a, b, c)),
-            _ => None,
-        };
-        *written += so.len() + os.as_ref().map_or(0, |os| os.len());
-        Run { so, os }
+    }
+
+    fn for_each(&self, f: impl FnMut(Pair)) {
+        self.for_each_in(0..self.pairs.len(), f);
     }
 }
 
-/// Slices of runs matching a pattern: each with whether its order is `(object, subject)`,
-/// and whether its pairs are read as old (the recent run's, whose delta pairs are
-/// skipped).
-type Slices<'a> = smallvec::SmallVec<[(&'a [Pair], bool, bool); 4]>;
+/// Slices of runs matching a pattern, in the order their runs are read.
+type Slices<'a> = smallvec::SmallVec<[Slice<'a>; 4]>;
 
 /// The pairs of one predicate, in sorted runs: the store's input, apart, and what was
 /// added since, in a large base and a small recent run that takes each round's delta.
@@ -788,14 +995,13 @@ pub(crate) struct Relation {
     input: Run,
     base: Run,
     recent: Run,
-    /// The last round's pairs (also in `recent`) but those of `closed`.
+    /// The last round's pairs (also in `recent`).
     delta: Run,
-    /// The last round's pairs one closed rule family produced (the family whose schema
-    /// link is `closed_by`: `rdfs:subClassOf` for `cax-sco`), held here only: the next
-    /// round merges them into `recent` with its own delta, in one pass. The family's
-    /// instances read the delta without them ([`Seg::DeltaNotBy`]): it derived them
+    /// Those of the delta one closed rule family produced (the family whose schema link
+    /// is `closed_by`: `rdfs:subClassOf` for `cax-sco`), if it produced some: the family's
+    /// instances read the delta without them ([`Seg::DeltaNotBy`]), as it derived them
     /// with all their consequences under the family.
-    closed: Run,
+    marks: Option<Marks>,
     closed_by: Option<u64>,
     /// Whether the delta is still the input (the store's first round is to come).
     fresh: bool,
@@ -809,17 +1015,34 @@ pub(crate) struct Relation {
     old_checks: std::sync::atomic::AtomicU64,
 }
 
-/// The pairs whose first component is `key`.
-fn range(pairs: &[Pair], key: u64) -> &[Pair] {
-    let start = pairs.partition_point(|p| p.0 < key);
-    let len = pairs[start..].partition_point(|p| p.0 == key);
-    &pairs[start..start + len]
+/// The delta of `pairs` (sorted, disjoint from the relation), some of them marked by
+/// `marks` (its subject order's, from [`sort_marked`]), with its `(object, subject)` order
+/// and that order's marks if `objects`.
+fn marked_run(pairs: Pairs, marks: Option<Marks>, objects: bool) -> (Run, Option<Marks>) {
+    let Some(mut marks) = marks else {
+        return (Run::new(pairs, objects), None);
+    };
+    if marks.all || !objects {
+        return (Run::new(pairs, objects), Some(marks));
+    }
+    let parts = pairs
+        .chunks
+        .iter()
+        .zip(&marks.so)
+        .map(|(chunk, words)| (chunk.as_slice(), Marking::Bits(words)))
+        .collect();
+    let (os, os_marks) = sort_marked(parts, true);
+    marks.os = os_marks;
+    let run = Run {
+        so: Arc::new(pairs),
+        os: Some(Arc::new(os)),
+    };
+    (run, Some(marks))
 }
 
 impl Relation {
-    /// The pairs the last round added (both parts).
     pub(crate) fn delta_len(&self) -> usize {
-        self.delta.len() + self.closed.len()
+        self.delta.len()
     }
 
     /// Whether the recent run holds nothing but the delta (it is the delta, shared: right
@@ -828,11 +1051,11 @@ impl Relation {
         self.recent.shares(&self.delta)
     }
 
-    /// Whether `seg` reads the closed part of the delta.
-    fn reads_closed(&self, seg: Seg) -> bool {
+    /// The marks `seg` skips: the closed part of the delta, read by its own family.
+    fn skips(&self, seg: Seg) -> Option<&Marks> {
         match seg {
-            Seg::DeltaNotBy(family) => self.closed_by != Some(family),
-            _ => true,
+            Seg::DeltaNotBy(family) if self.closed_by == Some(family) => self.marks.as_ref(),
+            _ => None,
         }
     }
 
@@ -846,13 +1069,12 @@ impl Relation {
                     0
                 } else {
                     recent.bytes()
-                }
-                + self.closed.bytes(),
+                },
             delta: if shared(&self.delta) {
                 0
             } else {
                 self.delta.bytes()
-            },
+            } + self.marks.as_ref().map_or(0, Marks::bytes),
         }
     }
 
@@ -860,16 +1082,15 @@ impl Relation {
     pub(crate) fn delta_has_object(&self, o: u64) -> bool {
         let mut found = false;
         let all = |_: u64, _: u64| true;
-        for delta in [&self.delta, &self.closed] {
-            delta.scan(None, Some(o), &all, &self.missed, &mut |_, _| found = true);
-        }
+        self.delta
+            .scan(None, Some(o), &all, &self.missed, &mut |_, _| found = true);
         found
     }
 
     /// Calls `f` with each distinct object of the delta.
     pub(crate) fn delta_objects(&self, f: &mut dyn FnMut(u64)) {
-        match (&self.delta.os, self.closed.len()) {
-            (Some(os), 0) => {
+        match &self.delta.os {
+            Some(os) => {
                 let mut last = None;
                 for &(o, _) in os.iter() {
                     if last != Some(o) {
@@ -878,14 +1099,8 @@ impl Relation {
                     }
                 }
             }
-            _ => {
-                let mut objects: Vec<u64> = self
-                    .delta
-                    .so
-                    .iter()
-                    .chain(self.closed.so.iter())
-                    .map(|&(_, o)| o)
-                    .collect();
+            None => {
+                let mut objects: Vec<u64> = self.delta.so.iter().map(|&(_, o)| o).collect();
                 objects.sort_unstable();
                 objects.dedup();
                 objects.into_iter().for_each(f);
@@ -897,12 +1112,7 @@ impl Relation {
     /// [`Relation::by_subject_only`]).
     fn objects(&mut self, objects: bool) {
         self.by_subject_only = !objects;
-        for run in [
-            &mut self.input,
-            &mut self.base,
-            &mut self.recent,
-            &mut self.closed,
-        ] {
+        for run in [&mut self.input, &mut self.base, &mut self.recent] {
             run.objects(objects);
         }
         // The delta shares the recent run's pairs or is its own.
@@ -911,25 +1121,44 @@ impl Relation {
         } else {
             self.delta.objects(objects);
         }
-    }
-
-    /// The runs a membership check reads, in order. The closed part goes first: small
-    /// (one round of one family), and what the next round's rules derive again most often
-    /// (on LUBM 100, 9.1 M of 34 M checks end there; read last, each first missed in the
-    /// three large runs: the joins 24 % slower than before the partition).
-    fn membership(&self) -> [&Run; 4] {
-        [&self.closed, &self.base, &self.recent, &self.input]
+        // The marks follow the delta's orders: an object order built since the delta was
+        // marked gets its marks from the subject order's.
+        if let Some(marks) = &mut self.marks
+            && !marks.all
+        {
+            match &self.delta.os {
+                None => marks.os = None,
+                Some(os) if marks.os.is_none() => {
+                    let so = &self.delta.so;
+                    let words = os
+                        .chunks
+                        .iter()
+                        .map(|chunk| {
+                            let mut words = vec![0u64; chunk.len().div_ceil(64)];
+                            for (i, &(o, s)) in chunk.iter().enumerate() {
+                                let (c, at) = so.position((s, o)).expect("one delta");
+                                if marked(&marks.so[c], at) {
+                                    words[i / 64] |= 1 << (i % 64);
+                                }
+                            }
+                            words
+                        })
+                        .collect();
+                    marks.os = Some(words);
+                }
+                Some(_) => {}
+            }
+        }
     }
 
     pub(crate) fn contains(&self, s: u64, o: u64) -> bool {
-        self.membership().iter().any(|run| run.contains(s, o))
+        self.base.contains(s, o) || self.recent.contains(s, o) || self.input.contains(s, o)
     }
 
     /// Every pair, in no particular order.
     pub(crate) fn pairs(&self) -> Vec<Pair> {
-        let runs = [&self.input, &self.base, &self.recent, &self.closed];
-        let mut out = Vec::with_capacity(runs.iter().map(|run| run.len()).sum());
-        for run in runs {
+        let mut out = Vec::with_capacity(self.input.len() + self.base.len() + self.recent.len());
+        for run in [&self.input, &self.base, &self.recent] {
             out.extend(run.so.iter());
         }
         out
@@ -940,20 +1169,16 @@ impl Relation {
         let all = |_: u64, _: u64| true;
         let missed = &self.missed;
         match seg {
-            Seg::Delta | Seg::DeltaNotBy(_) => {
-                self.delta.scan(s, o, &all, missed, f);
-                if self.reads_closed(seg) {
-                    self.closed.scan(s, o, &all, missed, f);
-                }
-            }
+            Seg::Delta | Seg::DeltaNotBy(_) => match self.skips(seg) {
+                Some(marks) => self.delta.scan_unmarked(s, o, marks, missed, f),
+                None => self.delta.scan(s, o, &all, missed, f),
+            },
             Seg::All => {
                 self.input.scan(s, o, &all, missed, f);
                 self.base.scan(s, o, &all, missed, f);
                 self.recent.scan(s, o, &all, missed, f);
-                self.closed.scan(s, o, &all, missed, f);
             }
-            // The delta is in `recent` only (its closed part apart), so the input and the
-            // base need no filter.
+            // The delta is in `recent` only, so the input and the base need no filter.
             Seg::Old => {
                 self.input.scan(s, o, &all, missed, f);
                 self.base.scan(s, o, &all, missed, f);
@@ -976,20 +1201,15 @@ impl Relation {
     fn matching(&self, s: Option<u64>, o: Option<u64>, seg: Seg) -> Option<Slices<'_>> {
         let mut out = Slices::new();
         let whole = match seg {
-            Seg::Delta | Seg::DeltaNotBy(_) => {
-                self.delta.matching(s, o, false, &mut out)
-                    && (!self.reads_closed(seg) || self.closed.matching(s, o, false, &mut out))
-            }
-            Seg::All => {
+            Seg::Delta | Seg::DeltaNotBy(_) => match self.skips(seg) {
+                Some(marks) => self.delta.matching_unmarked(s, o, marks, &mut out),
+                None => self.delta.matching(s, o, false, &mut out),
+            },
+            Seg::All | Seg::Old => {
                 self.input.matching(s, o, false, &mut out)
                     && self.base.matching(s, o, false, &mut out)
-                    && self.recent.matching(s, o, false, &mut out)
-                    && self.closed.matching(s, o, false, &mut out)
-            }
-            Seg::Old => {
-                self.input.matching(s, o, false, &mut out)
-                    && self.base.matching(s, o, false, &mut out)
-                    && (self.recent_is_delta() || self.recent.matching(s, o, true, &mut out))
+                    && (seg == Seg::Old && self.recent_is_delta()
+                        || self.recent.matching(s, o, seg == Seg::Old, &mut out))
             }
         };
         whole.then_some(out)
@@ -997,52 +1217,41 @@ impl Relation {
 
     /// An upper bound on the matches of the bound positions in `seg`.
     fn estimate(&self, s: Option<u64>, o: Option<u64>, seg: Seg) -> usize {
-        let delta = |seg| {
-            self.delta.estimate(s, o)
-                + if self.reads_closed(seg) {
-                    self.closed.estimate(s, o)
-                } else {
-                    0
-                }
-        };
         match seg {
-            Seg::Delta | Seg::DeltaNotBy(_) => delta(seg),
+            Seg::Delta | Seg::DeltaNotBy(_) => match self.skips(seg) {
+                Some(marks) if marks.all => 0,
+                _ => self.delta.estimate(s, o),
+            },
             Seg::Old | Seg::All => {
-                self.input.estimate(s, o)
-                    + self.base.estimate(s, o)
-                    + self.recent.estimate(s, o)
-                    + self.closed.estimate(s, o)
+                self.input.estimate(s, o) + self.base.estimate(s, o) + self.recent.estimate(s, o)
             }
         }
     }
 
-    /// Makes `new` the delta and `closed` (produced by the family `closed_by` names) its
-    /// closed part; both sorted, deduplicated, disjoint from each other and from the
-    /// relation. Returns the pairs its merges wrote.
-    fn advance(&mut self, new: Pairs, closed: Pairs) -> usize {
+    /// Makes `new` and `closed` (produced by the family `closed_by` names) the delta, the
+    /// pairs of `closed` marked; both sorted, deduplicated, disjoint from each other and
+    /// from the relation. Returns the pairs its merges wrote.
+    fn advance(&mut self, new: Pairs, marks: Option<Marks>) -> usize {
         let mut written = 0;
         // The old delta goes first: it shares the recent run, which is then merged, and
-        // freed as it is, only where nothing else holds it. The old closed part is old
-        // now: it goes where the recent run goes.
+        // freed as it is, only where nothing else holds it.
         self.delta = Run::default();
-        let mut old = std::mem::take(&mut self.closed);
+        self.marks = None;
         if self.fresh {
             // The first round read the input as its delta (and recent run, shared): it
             // goes apart, unmoved.
             self.input = std::mem::take(&mut self.recent);
             self.fresh = false;
-        } else if (self.recent.len() + old.len()) * 4 > self.base.len() {
-            // Fold the recent run and the old closed part into the base first (one pass),
-            // so the new delta stays in `recent`.
+        } else if self.recent.len() * 4 > self.base.len() {
+            // Fold the recent run into the base first, so the new delta stays in `recent`.
             let recent = std::mem::take(&mut self.recent);
-            let old = std::mem::take(&mut old);
-            self.base = std::mem::take(&mut self.base).merge_both(recent, old, &mut written);
+            self.base = std::mem::take(&mut self.base).merge(recent, &mut written);
         }
-        self.delta = Run::new(new, !self.by_subject_only);
-        // One pass; an empty recent run becomes the delta itself (shared, not copied).
-        self.recent =
-            std::mem::take(&mut self.recent).merge_both(old, self.delta.clone(), &mut written);
-        self.closed = Run::new(closed, !self.by_subject_only);
+        (self.delta, self.marks) = marked_run(new, marks, !self.by_subject_only);
+        if self.delta.len() > 0 {
+            // An empty recent run becomes the delta itself (shared, not copied).
+            self.recent = std::mem::take(&mut self.recent).merge(self.delta.clone(), &mut written);
+        }
         written
     }
 }
@@ -1087,7 +1296,7 @@ impl Store {
                     base: Run::default(),
                     recent: delta.clone(),
                     delta,
-                    closed: Run::default(),
+                    marks: None,
                     closed_by: None,
                     fresh: true,
                     by_subject_only: false,
@@ -1162,20 +1371,13 @@ impl Store {
         schema: &Schema,
     ) -> (usize, bool) {
         let news = self.news(candidates, false);
-        let count = news
-            .iter()
-            .map(|(open, closed)| open.len() + closed.len())
-            .sum();
-        let schema_facts =
-            news.par_iter()
-                .zip(self.predicates.par_iter())
-                .any(|((open, closed), &p)| {
-                    open.iter()
-                        .chain(closed.iter())
-                        .any(|&(s, o)| schema.is_schema_fact([s, p, o]))
-                });
+        let schema_facts = news
+            .par_iter()
+            .zip(self.predicates.par_iter())
+            .any(|((pairs, _), &p)| pairs.iter().any(|&(s, o)| schema.is_schema_fact([s, p, o])));
         heap::phase("reasoner: install");
         self.install(news);
+        let count = self.relations.iter().map(Relation::delta_len).sum();
         (count, schema_facts)
     }
 
@@ -1184,16 +1386,11 @@ impl Store {
     /// the facts never sit beside all of it: the input runs and the `(object, subject)`
     /// orders go first, and each relation's runs once their facts are out.
     pub(crate) fn into_derived(self) -> Vec<Triple> {
-        let runs: Vec<(u64, [Arc<Pairs>; 3])> = self
+        let runs: Vec<(u64, [Arc<Pairs>; 2])> = self
             .relations
             .into_iter()
             .zip(self.predicates)
-            .map(|(relation, p)| {
-                (
-                    p,
-                    [relation.base.so, relation.recent.so, relation.closed.so],
-                )
-            })
+            .map(|(relation, p)| (p, [relation.base.so, relation.recent.so]))
             .collect();
         let mut out = Vec::with_capacity(
             runs.iter()
@@ -1238,16 +1435,11 @@ impl Store {
                     .filter(|&fact| input(fact))
             })
             .collect();
-        let runs: Vec<(u64, [Arc<Pairs>; 3])> = self
+        let runs: Vec<(u64, [Arc<Pairs>; 2])> = self
             .relations
             .into_iter()
             .zip(self.predicates)
-            .map(|(relation, p)| {
-                (
-                    p,
-                    [relation.base.so, relation.recent.so, relation.closed.so],
-                )
-            })
+            .map(|(relation, p)| (p, [relation.base.so, relation.recent.so]))
             .collect();
         // At most this many, so the list never grows by doubling.
         out.reserve(
@@ -1284,16 +1476,11 @@ impl Store {
             .par_iter()
             .zip(self.predicates.par_iter())
             .flat_map_iter(|(relation, &p)| {
-                [
-                    &relation.input,
-                    &relation.base,
-                    &relation.recent,
-                    &relation.closed,
-                ]
-                .into_iter()
-                .flat_map(|run| run.so.iter())
-                .map(move |&(s, o)| [s, p, o])
-                .filter(|&fact| keep(fact))
+                [&relation.input, &relation.base, &relation.recent]
+                    .into_iter()
+                    .flat_map(|run| run.so.iter())
+                    .map(move |&(s, o)| [s, p, o])
+                    .filter(|&fact| keep(fact))
             })
             .collect()
     }
@@ -1307,12 +1494,7 @@ impl Store {
             .zip(self.predicates.par_iter())
             .flat_map_iter(|(relation, &p)| {
                 let mut out = Vec::new();
-                for run in [
-                    &relation.input,
-                    &relation.base,
-                    &relation.recent,
-                    &relation.closed,
-                ] {
+                for run in [&relation.input, &relation.base, &relation.recent] {
                     if terms.contains(&p) {
                         out.extend(run.so.iter().map(|&(s, o)| [s, p, o]));
                         continue;
@@ -1340,12 +1522,12 @@ impl Store {
     }
 
     /// Makes `news` (per relation: the open part, the closed part) the relations' deltas.
-    fn install(&mut self, news: Vec<(Pairs, Pairs)>) {
+    fn install(&mut self, news: Vec<New>) {
         self.merged += self
             .relations
             .par_iter_mut()
             .zip(news.into_par_iter())
-            .map(|(relation, (open, closed))| relation.advance(open, closed) as u64)
+            .map(|(relation, (pairs, marks))| relation.advance(pairs, marks) as u64)
             .sum::<u64>();
     }
 
@@ -1359,8 +1541,8 @@ impl Store {
     /// each sorted, distinct and in chunks without spare capacity: those a closed family
     /// produced in the relation's closed part (the first family that produces into a
     /// relation owns its closed part; another's go to the open part), the others in the
-    /// open part, which leaves out what the closed part holds.
-    fn news(&mut self, candidates: Vec<Candidates>, check: bool) -> Vec<(Pairs, Pairs)> {
+    /// open part. A pair in both parts is marked when the delta is built ([`marked_run`]).
+    fn news(&mut self, candidates: Vec<Candidates>, check: bool) -> Vec<New> {
         // Each predicate's lists together (a stable sort: the parts keep their order).
         let mut parts: Vec<(u64, Option<u64>, Vec<Pair>)> = candidates
             .into_iter()
@@ -1406,7 +1588,7 @@ impl Store {
             }
         }
         // Keep only facts not already known, per predicate and in parallel.
-        let groups: Vec<(usize, (Pairs, Pairs))> = groups
+        let groups: Vec<(usize, New)> = groups
             .into_par_iter()
             .map(|(index, (mut open, mut closed))| {
                 if check {
@@ -1415,18 +1597,13 @@ impl Store {
                         part.retain(|&(s, o)| !relation.contains(s, o));
                     }
                 }
-                let closed = match closed.is_empty() {
-                    true => Pairs::default(),
-                    false => union(closed),
-                };
-                let open = without(union(open), &closed);
-                (index, (open, closed))
+                (index, new_pairs(open, closed))
             })
             .collect();
-        let mut news: Vec<(Pairs, Pairs)> = self
+        let mut news: Vec<New> = self
             .relations
             .iter()
-            .map(|_| (Pairs::default(), Pairs::default()))
+            .map(|_| (Pairs::default(), None))
             .collect();
         for (index, pairs) in groups {
             news[index] = pairs;
@@ -1466,7 +1643,7 @@ impl Source for Store {
         self.relations_of(p)
             .map(|(_, relation)| {
                 let slices = relation.matching(s, o, seg)?;
-                Some(slices.iter().map(|(pairs, ..)| pairs.len()).sum::<usize>())
+                Some(slices.iter().map(|slice| slice.pairs.len()).sum::<usize>())
             })
             .sum()
     }
@@ -1483,8 +1660,8 @@ impl Source for Store {
             let slices = relation
                 .matching(s, o, seg)
                 .expect("matches_len gave slices");
-            for &(pairs, swapped, old) in &slices {
-                let (start, end) = (at, at + pairs.len());
+            for slice in &slices {
+                let (start, end) = (at, at + slice.pairs.len());
                 at = end;
                 if end <= range.start {
                     continue;
@@ -1492,18 +1669,18 @@ impl Source for Store {
                 if start >= range.end {
                     return;
                 }
-                let part = &pairs[range.start.max(start) - start..range.end.min(end) - start];
-                if old {
+                let part = range.start.max(start) - start..range.end.min(end) - start;
+                if slice.old {
                     relation
                         .old_checks
                         .fetch_add(part.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
-                for &(a, b) in part {
-                    let (s, o) = if swapped { (b, a) } else { (a, b) };
-                    if !(old && relation.delta.contains(s, o)) {
+                slice.for_each_in(part, |(a, b)| {
+                    let (s, o) = if slice.swapped { (b, a) } else { (a, b) };
+                    if !(slice.old && relation.delta.contains(s, o)) {
                         f([s, p, o]);
                     }
-                }
+                });
             }
         }
     }
@@ -2540,6 +2717,13 @@ pub(crate) fn check<S: Source + ?Sized>(
 mod chunk_tests {
     use super::*;
 
+    /// The pairs whose first component is `key`.
+    fn range(pairs: &[Pair], key: u64) -> &[Pair] {
+        let start = pairs.partition_point(|p| p.0 < key);
+        let len = pairs[start..].partition_point(|p| p.0 == key);
+        &pairs[start..start + len]
+    }
+
     /// Pseudo-random pairs over a small range, so that chunks repeat keys at their ends.
     fn pairs(seed: u64, n: usize) -> Vec<Pair> {
         let mut x = seed;
@@ -2590,33 +2774,49 @@ mod chunk_tests {
             assert_eq!(merged.iter().copied().collect::<Vec<_>>(), all);
             assert_eq!(merged.len(), all.len());
             assert_eq!(shared.iter().copied().collect::<Vec<_>>(), left);
-            // Three at once, two of them merged as they are read; and a difference.
-            let (middle, last): (Vec<Pair>, Vec<Pair>) =
-                right.iter().partition(|pair| pair.0 % 2 == 0);
-            let rest = Merged::new(
-                Cursor::new(Arc::new(Pairs::chunked(middle.clone()))),
-                Cursor::new(Arc::new(Pairs::chunked(last))),
-            );
-            let three = merge(Cursor::new(shared.clone()), rest, all.len());
-            assert_eq!(three.iter().copied().collect::<Vec<_>>(), all);
-            let rest = without(three, &Pairs::chunked(middle.clone()));
-            let expected: Vec<Pair> = all
-                .iter()
-                .copied()
-                .filter(|pair| middle.binary_search(pair).is_err())
-                .collect();
-            assert_eq!(rest.iter().copied().collect::<Vec<_>>(), expected);
-            assert_eq!(rest.len(), expected.len());
+            // A sort that marks one side's pairs (also those on both sides), and the other
+            // order of its result, marked from the first.
+            for (open, closed) in [(left.clone(), right.clone()), (all.clone(), right.clone())] {
+                let (sorted, marks) =
+                    sort_marked(vec![(open, Marking::None), (closed, Marking::All)], false);
+                let marks = marks.expect("marked");
+                assert_eq!(sorted.iter().copied().collect::<Vec<_>>(), all);
+                for (chunk, words) in sorted.chunks.iter().zip(&marks) {
+                    assert_eq!(chunk.len(), chunk.capacity());
+                    for (i, pair) in chunk.iter().enumerate() {
+                        assert_eq!(marked(words, i), right.binary_search(pair).is_ok());
+                    }
+                }
+                let parts = sorted
+                    .chunks
+                    .iter()
+                    .zip(&marks)
+                    .map(|(chunk, words)| (chunk.as_slice(), Marking::Bits(words)))
+                    .collect();
+                let (swapped, swapped_marks) = sort_marked(parts, true);
+                for (chunk, words) in swapped.chunks.iter().zip(&swapped_marks.expect("marked")) {
+                    for (i, &(b, a)) in chunk.iter().enumerate() {
+                        assert_eq!(marked(words, i), right.binary_search(&(a, b)).is_ok());
+                    }
+                }
+            }
         }
     }
 
-    /// R13's layout: a closed family's part of the delta reads as the delta (the family's
-    /// own reads skip it) and costs the merges one copy of its pairs, over the same
-    /// rounds with every pair open. Kept beside the recent run for good, it cost each fold
-    /// a second pass over the base (LUBM 100: the merges wrote 26.5 M pairs, 12.5 M with
-    /// every pair open, 19.4 M since).
+    impl Relation {
+        fn advance_with(&mut self, (pairs, marks): New) -> usize {
+            self.advance(pairs, marks)
+        }
+    }
+
+    /// R13's layout: a closed family's part of the delta is marked in the one delta run
+    /// ([`Marks`]): it reads as the delta, the family's own reads skip it, and it costs the
+    /// merges nothing over the same rounds with every pair open. As a run of its own it
+    /// cost each fold into an empty base a copy, and every lookup a fourth run (LUBM 100:
+    /// the merges wrote 19.4 M pairs, 12.5 M with every pair open; 18.5 M point lookups for
+    /// 12.9 M).
     #[test]
-    fn a_closed_part_reads_as_the_delta_and_costs_one_copy() {
+    fn a_closed_part_reads_as_the_delta_and_costs_nothing() {
         let mut x = 7u64;
         let mut next = move || {
             x = x
@@ -2626,55 +2826,82 @@ mod chunk_tests {
         };
         let (mut split, mut open) = (Relation::default(), Relation::default());
         split.closed_by = Some(1);
-        let (mut written, mut plain, mut copies) = (0, 0, 0);
+        let (mut written, mut plain) = (0, 0);
         let mut known = std::collections::BTreeSet::new();
         let sorted = |mut pairs: Vec<Pair>| {
             pairs.sort_unstable();
             pairs
         };
-        for round in 0..12u64 {
+        for round in 0..14u64 {
             let fresh: Vec<Pair> = (0..40 + round * 30)
                 .map(|_| (next() % 61, next() % 53))
                 .filter(|&pair| known.insert(pair))
                 .collect();
             let fresh = sorted(fresh);
+            // A third of the pairs closed; every pair in some rounds, none in others.
             let (closed, rest): (Vec<Pair>, Vec<Pair>) =
-                fresh.iter().partition(|pair| (pair.0 + pair.1) % 3 == 0);
-            copies += closed.len();
+                fresh.iter().partition(|pair| match round % 5 {
+                    3 => true,
+                    4 => false,
+                    _ => (pair.0 + pair.1) % 3 == 0,
+                });
             let closed_set: std::collections::BTreeSet<Pair> = closed.iter().copied().collect();
-            written += split.advance(Pairs::chunked(rest), Pairs::chunked(closed));
-            plain += open.advance(Pairs::chunked(fresh), Pairs::default());
+            written += split.advance_with(new_pairs(vec![rest], vec![closed]));
+            plain += open.advance_with(new_pairs(vec![fresh], Vec::new()));
+            if round % 2 == 1 {
+                // An object order dropped and built again: the marks follow it.
+                for relation in [&mut split, &mut open] {
+                    relation.objects(false);
+                    relation.objects(true);
+                }
+            }
             for (s, o) in [
                 (None, None),
                 (Some(3), None),
                 (None, Some(5)),
                 (Some(3), Some(5)),
+                (Some(3), Some(6)),
             ] {
                 let read = |relation: &Relation, seg: Seg| {
                     let mut out = Vec::new();
                     relation.scan(s, o, seg, &mut |s, o| out.push((s, o)));
                     sorted(out)
                 };
+                // As morsels read it: the slices, their skipped pairs left out.
+                let sliced = |relation: &Relation, seg: Seg| {
+                    let mut out = Vec::new();
+                    for slice in relation.matching(s, o, seg).expect("slices") {
+                        slice.for_each(&mut |(a, b)| {
+                            let (s, o) = if slice.swapped { (b, a) } else { (a, b) };
+                            if !(slice.old && relation.delta.contains(s, o)) {
+                                out.push((s, o));
+                            }
+                        });
+                    }
+                    sorted(out)
+                };
                 for seg in [Seg::Delta, Seg::Old, Seg::All, Seg::DeltaNotBy(2)] {
                     assert_eq!(read(&split, seg), read(&open, seg), "round {round} {seg:?}");
+                    assert_eq!(
+                        sliced(&split, seg),
+                        read(&open, seg),
+                        "round {round} {seg:?}"
+                    );
                 }
                 let mut own = read(&open, Seg::Delta);
                 own.retain(|pair| !closed_set.contains(pair));
                 assert_eq!(read(&split, Seg::DeltaNotBy(1)), own, "round {round}");
+                assert_eq!(sliced(&split, Seg::DeltaNotBy(1)), own, "round {round}");
             }
             for s in 0..61 {
                 for o in 0..53 {
                     assert_eq!(split.contains(s, o), known.contains(&(s, o)));
                 }
             }
-            // What the family produced is answered by the first run a check reads.
-            for &(s, o) in &closed_set {
-                assert!(split.membership()[0].contains(s, o), "round {round}");
-            }
         }
-        assert!(
-            written <= plain + copies,
-            "the merges wrote {written} pairs, {plain} with every pair open, {copies} closed"
+        assert_eq!(
+            written, plain,
+            "pairs the merges wrote, with a closed part and without"
         );
     }
 }
