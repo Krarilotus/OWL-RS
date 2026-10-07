@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use nrese_engine::{GraphSelector, QuadPattern, Snapshot, TermId};
 use nrese_owl::ObjProp;
 use nrese_owl::ql::{
-    Atom, Basic, Branch, Cq, Limits, Outcome, Part, Probe, QTerm, Tbox, rewrite_with,
+    Atom, Basic, Branch, Budget, Cq, Limits, Outcome, Part, Probe, QTerm, Tbox, rewrite_with,
 };
 use nrese_rdf::{NamedNode, NamedNodeRef, Term, Variable};
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern};
@@ -134,6 +134,7 @@ pub(crate) fn rewrite_query(
         tbox,
         snapshot,
         limits,
+        budget: Budget::new(limits.query_work),
         data,
         rdf_type: snapshot
             .lookup(NamedNodeRef::new_unchecked(RDF_TYPE).into())
@@ -152,6 +153,8 @@ struct Rewriter<'a> {
     tbox: &'a Tbox,
     snapshot: &'a Snapshot,
     limits: &'a Limits,
+    /// The steps the query's patterns have left together.
+    budget: Budget,
     data: Option<&'a DataCheck<'a>>,
     rdf_type: Option<u64>,
     report: QlReport,
@@ -465,7 +468,13 @@ impl Rewriter<'_> {
             );
         }
         let (tbox, limits) = (self.tbox, self.limits);
-        let rewriting = match rewrite_with(tbox, &cq, limits, &mut |probe| self.realised(probe)) {
+        // Out of `self` while the data check borrows it.
+        let budget = std::mem::replace(&mut self.budget, Budget::new(0));
+        let outcome = rewrite_with(tbox, &cq, limits, &budget, &mut |probe| {
+            self.realised(probe)
+        });
+        self.budget = budget;
+        let rewriting = match outcome {
             Outcome::Unchanged => return original,
             Outcome::Exceeded(what) => {
                 self.report.limits.push(what);

@@ -145,6 +145,7 @@ pub fn print<V: ReadView>(
         paths: SubclassPaths::of(&statements, snapshot),
         fresh: 0,
         reasons: Vec::new(),
+        expanded: 0,
     };
     let printed = printer.pattern(&rewritten);
     reasons.extend(printer.reasons);
@@ -467,7 +468,14 @@ struct Printer<'a> {
     paths: SubclassPaths,
     fresh: usize,
     reasons: Vec<String>,
+    /// Class memberships expanded so far: what bounds the printed query's size, which RL
+    /// rules unfolded into each other can make exponential.
+    expanded: usize,
 }
+
+/// Class memberships one printed query may expand ([`Printer::expanded`]); past them it
+/// isn't printed (said why).
+const EXPANSIONS: usize = 100_000;
 
 /// A class's membership at a term, being expanded (recursion through them).
 type Active = Vec<(u64, TermPattern)>;
@@ -853,6 +861,12 @@ impl Printer<'_> {
         subject: &TermPattern,
         active: &mut Active,
     ) -> Result<Option<GraphPattern>, String> {
+        self.expanded += 1;
+        if self.expanded > EXPANSIONS {
+            return Err(format!(
+                "the printed query would take more than {EXPANSIONS} class expansions (RL rules unfolded into each other)"
+            ));
+        }
         if active.iter().any(|(c, s)| *c == class && s == subject) {
             return Ok(None);
         }
