@@ -238,7 +238,13 @@ impl MutationPipeline {
             // The owl2-dl mode: the state the commit leaves, under OWL 2 DL.
             let dl = self.store.dl().active().then(|| {
                 let mut bounds = crate::dl::bounds::prepare(&self.store, &tx, &stop);
-                let gate = crate::dl::gate::check_commit(&self.store, &tx, &stop, &mut bounds);
+                let gate = crate::dl::gate::check_commit(
+                    &self.store,
+                    &tx,
+                    &stop,
+                    &mut bounds,
+                    &requester.read,
+                );
                 (gate, bounds)
             });
             if let Some((gate, _)) = &dl

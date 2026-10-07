@@ -26,6 +26,15 @@ pub struct Limits {
     /// Steps of work to build it (candidate interiors, places a witness search tries,
     /// sets of witnesses): bounds the time the other bounds don't.
     pub work: usize,
+    /// Steps of work for all the patterns of one query together ([`Budget`]): a query of
+    /// many patterns can't multiply the time `work` bounds.
+    pub query_work: usize,
+    /// Questions one query may ask the data (whether it has a witness's tree wherever the
+    /// witness folds, [`Probe`]); past them witnesses are folded unasked.
+    pub checks: usize,
+    /// Statements one question may read (the concept's and the tree's, counted before it
+    /// runs); past them the witness is folded unasked.
+    pub check_rows: u64,
 }
 
 impl Default for Limits {
@@ -37,6 +46,9 @@ impl Default for Limits {
             branches: 256,
             size: 4096,
             work: 50_000,
+            query_work: 200_000,
+            checks: 16,
+            check_rows: 1_000_000,
         }
     }
 }
@@ -96,13 +108,75 @@ pub enum Part {
     Any(Vec<Atom>),
 }
 
+/// What the data may be asked about a tree witness before it is folded: whether every
+/// individual of each basic concept it folds to (`alternatives`) has its tree in the data,
+/// `atoms` with every root made `root` (a constant root, or a variable no other atom has).
+/// If so, folding it adds no answer: a branch with it gives only what the same branch
+/// without it gives (the tree is there at the individual its roots stand for).
+pub struct Probe<'a> {
+    pub atoms: Vec<Atom>,
+    pub root: QTerm,
+    pub alternatives: &'a [Basic],
+}
+
+/// The steps of work one query's rewritings have left together ([`Limits::query_work`]):
+/// each pattern takes at most [`Limits::work`] of them.
+pub struct Budget(std::cell::Cell<usize>);
+
+impl Budget {
+    pub fn new(steps: usize) -> Self {
+        Self(std::cell::Cell::new(steps))
+    }
+
+    pub fn left(&self) -> usize {
+        self.0.get()
+    }
+}
+
 /// The rewriting of `cq` under `tbox`.
 pub fn rewrite(tbox: &Tbox, cq: &Cq, limits: &Limits) -> Outcome {
+    rewrite_with(
+        tbox,
+        cq,
+        limits,
+        &Budget::new(limits.query_work),
+        &mut |_| false,
+    )
+}
+
+/// [`rewrite`], leaving out the witnesses `realised` says the data has wherever they fold
+/// ([`Probe`]): where none adds an answer the query is left as it is, at no cost.
+pub fn rewrite_with(
+    tbox: &Tbox,
+    cq: &Cq,
+    limits: &Limits,
+    budget: &Budget,
+    realised: &mut dyn FnMut(&Probe<'_>) -> bool,
+) -> Outcome {
+    // This pattern's steps: its own bound, or what the query has left.
+    let steps = limits.work.min(budget.left());
+    let work = Work::new(steps);
+    let out = rewrite_within(tbox, cq, limits, &work, realised);
+    budget
+        .0
+        .set(budget.left().saturating_sub(steps - work.left()));
+    match out {
+        Outcome::Exceeded("work") if steps < limits.work => Outcome::Exceeded("the query's work"),
+        out => out,
+    }
+}
+
+fn rewrite_within(
+    tbox: &Tbox,
+    cq: &Cq,
+    limits: &Limits,
+    work: &Work,
+    realised: &mut dyn FnMut(&Probe<'_>) -> bool,
+) -> Outcome {
     if tbox.is_empty() {
         return Outcome::Unchanged;
     }
-    let work = Work::new(limits.work);
-    let mut witnesses = match tree_witnesses(tbox, cq, limits.witnesses, limits.candidates, &work) {
+    let mut witnesses = match tree_witnesses(tbox, cq, limits.witnesses, limits.candidates, work) {
         Ok(witnesses) => witnesses,
         Err(bound) => return Outcome::Exceeded(bound),
     };
@@ -145,14 +219,39 @@ pub fn rewrite(tbox: &Tbox, cq: &Cq, limits: &Limits) -> Outcome {
             atoms,
             ..reduced.into_owned()
         });
-        let next = match tree_witnesses(tbox, &reduced, limits.witnesses, limits.candidates, &work)
-        {
+        let next = match tree_witnesses(tbox, &reduced, limits.witnesses, limits.candidates, work) {
             Ok(next) => next,
             Err(bound) => return Outcome::Exceeded(bound),
         };
         witnesses = next;
     }
     let cq: &Cq = &reduced;
+    // Each witness's fold once, for every branch it is in; the witnesses the data has
+    // wherever they fold go.
+    let mut folds: Vec<Vec<Basic>> = Vec::new();
+    witnesses.retain(|w| {
+        let fold = tbox.generator_alternatives(w.generators.iter().copied());
+        let root = w
+            .roots
+            .iter()
+            .copied()
+            .find(|t| matches!(t, QTerm::Const(_)))
+            .unwrap_or(QTerm::Var(cq.vars));
+        let probe = Probe {
+            atoms: w
+                .atoms
+                .iter()
+                .map(|&i| cq.atoms[i].map(&|t| if w.roots.contains(&t) { root } else { t }))
+                .collect(),
+            root,
+            alternatives: &fold,
+        };
+        if !fold.is_empty() && realised(&probe) {
+            return false;
+        }
+        folds.push(fold);
+        true
+    });
     let existential = (0..cq.vars)
         .filter(|&v| cq.existential[v as usize] && cq.atoms.iter().any(|a| a.has_var(v)))
         .count();
@@ -180,7 +279,7 @@ pub fn rewrite(tbox: &Tbox, cq: &Cq, limits: &Limits) -> Outcome {
             witnesses: 0,
         });
     }
-    let Some(sets) = independent_sets(&witnesses, limits.branches, &work) else {
+    let Some(sets) = independent_sets(&witnesses, limits.branches, work) else {
         return Outcome::Exceeded(if work.exhausted() { "work" } else { "branches" });
     };
     let mut builder = Build {
@@ -188,11 +287,6 @@ pub fn rewrite(tbox: &Tbox, cq: &Cq, limits: &Limits) -> Outcome {
         alternatives: &alternatives,
         next: cq.vars,
     };
-    // Each witness's fold once, for every branch it is in.
-    let folds: Vec<Vec<Basic>> = witnesses
-        .iter()
-        .map(|w| tbox.generator_alternatives(w.generators.iter().copied()))
-        .collect();
     let mut branches = Vec::new();
     let mut size = 0;
     for set in sets {

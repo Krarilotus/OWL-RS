@@ -30,8 +30,26 @@ and two branches, 4-17 atoms; none reaches a bound.
 measured runs, medians; sum of the 31 medians 77.7 ms off, 103.8 ms on):
 - the 19 queries not rewritten: 0.75-1.26x, noise around equal;
 - q28-q30, which gain answers: 1.8-1.9x (+0.5-0.9 ms);
-- q17 and q20-q27, rewritten without a new answer: 1.3-2.7x (+0.9-6.1 ms). The bag form
-  evaluates the pattern a second time to subtract the materialised rows (design §3:
-  `P ∪ (DISTINCT π(rewriting) FILTER NOT EXISTS P)`); here an unprojected variable is
-  existential, the witness finds nothing the data doesn't already state, and the second
-  evaluation is all cost. The bag form's second evaluation is an open item (STATUS).
+- q17 and q20-q27, rewritten without a new answer: 1.3-2.7x (+0.9-6.1 ms). An
+  unprojected variable is existential and the witness branch finds nothing the data
+  doesn't already state: q22-q27 (`DISTINCT`) pay for the branch, q17, q20 and q21
+  (aggregates) for the bag form's second evaluation too.
+
+**No cost where nothing is added** (7 October, design §3): a witness whose tree the data
+has at every individual it folds to is left out. The nine are now run as written (EXPLAIN:
+`realised` 1, `patterns` 0); q28-q30 keep their witness and their answers. Same protocol,
+on the branch's base and then with the change (main PC, both runs on 7 October):
+
+| | sum of 31 medians off → on | q17, q20-q27 on/off | q28-q30 on/off |
+|---|---|---|---|
+| before | 117.1 → 148.7 ms (1.27x) | 1.10-3.13 | 1.68-1.87 |
+| after | 105.9 → 106.4 ms (1.00x) | 0.88-1.20 | 1.54-1.65 |
+
+The queries not rewritten: 0.75-1.26 in both runs. With the check's bounds (16 questions
+per query, 1,000,000 statements per question), 8 pairs under other agents' load (sums
+per pair 64-208 ms; per-query medians of per-pair ratios): the nine 0.76-1.13x, the
+untouched 0.57-1.08x, q28-q30 1.46-1.65x; the two quiet pairs 63.9 -> 66.7 and
+67.2 -> 65.1 ms. The check runs once per snapshot
+revision and question, in a query's first run: its first runs off and on differ within
+their noise (up to +3.7 ms for q26, +4.9 ms for q01, which isn't rewritten).
+

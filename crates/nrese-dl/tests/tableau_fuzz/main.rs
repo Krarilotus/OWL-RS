@@ -104,6 +104,14 @@ fn configs() -> Vec<(&'static str, Config)> {
             },
         ),
         (
+            "dynamic-backtracking",
+            Config {
+                dynamic_backtracking: true,
+                check_retraction: true,
+                ..base.clone()
+            },
+        ),
+        (
             "at-most-atoms",
             Config {
                 expand_at_most_up_to: 0,
@@ -168,6 +176,25 @@ fn shrink(o: &Ontology) {
 
 /// Every configuration's answer on `o` against the semantics and against each other;
 /// renaming and shuffling (`shuffled`) keep the answer.
+/// Whether `o` counts: a number restriction, or a functional or inverse-functional
+/// property (an at-most-one). A folded model may break those (two predecessors merged by
+/// blocking), and the small-model search is then the only confirmation.
+fn counts(o: &Ontology) -> bool {
+    use nrese_owl::{Axiom, Characteristic, ClassExpr};
+    o.axioms.iter().any(|a| {
+        matches!(
+            a,
+            Axiom::ObjectCharacteristic(Characteristic::Functional, _)
+                | Axiom::ObjectCharacteristic(Characteristic::InverseFunctional, _)
+        )
+    }) || (0..o.classes.len()).any(|i| {
+        matches!(
+            o.classes.get(i as u32),
+            ClassExpr::Max(..) | ClassExpr::Exact(..)
+        ) || matches!(o.classes.get(i as u32), ClassExpr::Min(n, ..) if *n > 1)
+    })
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the campaign's state, threaded through"
@@ -186,12 +213,23 @@ fn check_case(
     let mut first: Option<Answer> = None;
     // The search for a small model, once per ontology (the configurations agree).
     let mut searched: Option<Option<Interp>> = None;
+    // A case past the default's budget: the others run on a small one, checked where they
+    // decide all the same (the default seed's case 14 spent 100 of the campaign's 130 s
+    // giving up nine times).
+    let mut beyond = false;
     for (name, config) in &all {
-        let config = Config {
+        let mut config = Config {
             keep_model: true,
             ..config.clone()
         };
+        if beyond {
+            config.max_nodes = config.max_nodes.min(1_000);
+            config.max_branch_points = Some(1_000);
+        }
         let out = consistency(o, &config);
+        if *name == "default" {
+            beyond = matches!(out.answer, Answer::GaveUp(_));
+        }
         if *name == "default" {
             tally.ni_firings += out.telemetry.ni_applications;
         }
@@ -215,8 +253,13 @@ fn check_case(
         // Every configuration's answer is checked against the semantics.
         match &out.answer {
             Answer::Consistent => {
-                let model = out.model.as_ref().and_then(interp);
-                let ok = model.is_some_and(|i| confirms(o, i));
+                // No verdict where the model doesn't fit the reference's 128 elements.
+                let verdict = out
+                    .model
+                    .as_ref()
+                    .and_then(interp)
+                    .and_then(|i| confirms(o, i));
+                let ok = verdict == Some(true);
                 if *name == "default" {
                     tally.consistent += 1;
                 }
@@ -248,7 +291,7 @@ fn check_case(
                     }
                 }
                 assert!(
-                    found.is_some() || numbers,
+                    found.is_some() || numbers || verdict.is_none(),
                     "case {case} ({name}): consistent, but the folded model fails and no small \
                      model exists, without number restrictions\n{}\nmodel: {:?}",
                     render(o),
@@ -292,6 +335,10 @@ fn check_case(
             }
         }
     }
+    if beyond {
+        // The metamorphic runs compare decided answers only.
+        return;
+    }
     // Renaming and shuffling leave the answer as it is.
     let base = Config {
         max_nodes: 5_000,
@@ -300,8 +347,24 @@ fn check_case(
         ..Config::default()
     };
     let renamed = fuzz::rename(o, &|t| t + 1000);
-    for (what, other) in [("renamed", renamed), ("shuffled", shuffled)] {
-        let answer = consistency(&other, &base).answer;
+    // Complements as OWL Lite writes them, read with the rewriting (`nrese_owl`'s
+    // `complements.rs`) and without.
+    let mut next = 1_000_000;
+    let encoded = fuzz::encode_complements(o, 3, &mut || {
+        next += 1;
+        next
+    });
+    let plain = Config {
+        complements: false,
+        ..base.clone()
+    };
+    for (what, other, config) in [
+        ("renamed", renamed, &base),
+        ("shuffled", shuffled, &base),
+        ("complements encoded", encoded.clone(), &base),
+        ("complements encoded, not rewritten", encoded, &plain),
+    ] {
+        let answer = consistency(&other, config).answer;
         if let Some(f) = &first
             && matches!(f, Answer::Consistent | Answer::Inconsistent)
             && matches!(answer, Answer::Consistent | Answer::Inconsistent)
@@ -325,13 +388,44 @@ fn answers_agree_with_the_semantics() {
 }
 
 /// Guard (the oracle): seed 94543, case 143 is consistent (a 3-cycle along a property
-/// disjoint with its inverse), and its folded model closes a loop on the blocker; untied
-/// into three copies it is a model (`semantics::untie_loops`). It failed the push gate's
+/// disjoint with its inverse), and its folded model closes a loop on the blocker; lifted
+/// into three copies it is a model (`semantics::lift`). It failed the push gate's
 /// new seeds as "consistent, but no model", a confirmation the oracle couldn't make.
 #[test]
 fn a_loop_folded_onto_its_blocker_is_untied() {
     let tally = campaign(94543, 144, Some(143));
     assert_eq!(tally.consistent, 1, "{tally:?}");
+}
+
+/// Guard (the oracle): seed 182, case 19 is consistent (individuals `a`, `b` and one more
+/// element in a cycle of an asymmetric property, a reflexive one beside it). The folded
+/// model closes a loop of the asymmetric property on its blocker; the lift has to untie
+/// that loop but keep the reflexive property's, and choosing once for all properties gave
+/// neither (seeds 182, 200, 268 and 403 of the office campaign, "consistent, but the
+/// folded model fails and no small model exists").
+#[test]
+fn a_lift_keeps_some_properties_loops_and_unties_others() {
+    let tally = campaign(182, 20, Some(19));
+    assert_eq!(tally.consistent, 1, "{tally:?}");
+    assert_eq!(
+        tally.confirmed_by_model + tally.confirmed_by_search,
+        1,
+        "{tally:?}"
+    );
+}
+
+/// Guard (dynamic backtracking): seed 131, case 138 is inconsistent (a self-loop on a
+/// nominal whose successors need three successors with exactly two each). Retracting level
+/// 1 re-decided its disjunction on top; a later backtrack that couldn't retract (a merge
+/// since its culprit, level 2) restored level 2's checkpoint, older than the retraction:
+/// level 1's first choice stayed retracted, its new one was cut away, and the search found
+/// a model without the disjunction. Such a backtrack now starts the search again from
+/// before the first retraction. It failed the office campaign as "dynamic-backtracking
+/// changes the answer".
+#[test]
+fn a_backtrack_never_restores_a_point_older_than_a_retraction() {
+    let tally = campaign(131, 139, Some(138));
+    assert_eq!(tally.inconsistent, 1, "{tally:?}");
 }
 
 /// The random cases of `seed` (`only`: that one alone), each checked against the semantics.
@@ -383,7 +477,7 @@ fn campaign(seed: u64, cases: u64, only: Option<u64>) -> Tally {
             &o,
             shuffled,
             &sig,
-            profile.numbers,
+            profile.numbers || counts(&o),
             &mut tally,
             &mut check,
             &mut unconfirmed,

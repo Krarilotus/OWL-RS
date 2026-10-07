@@ -111,12 +111,14 @@ fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, prop
                     status.consistency.verdict.as_str()
                 ),
                 format!(
-                    "L: {} memberships from the taxonomy; U1: {} facts beyond L, {} classes and {} predicates in the gap, {} literals read by value, last update {}{}",
+                    "L: {} memberships from the taxonomy; U1: {} facts beyond L, {} classes and {} predicates in the gap, {} literals read by value, {} equality classes (largest {}), last update {}{}",
                     bounds.lower_facts,
                     bounds.upper_facts,
                     bounds.gap_classes,
                     bounds.gap_predicates,
                     bounds.literals_by_value,
+                    bounds.equality_classes,
+                    bounds.largest_class,
                     bounds.last,
                     bounds
                         .unavailable

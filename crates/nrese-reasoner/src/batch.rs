@@ -38,6 +38,7 @@ use super::ir::{Triple, Violation};
 use super::lists::{ListVocabulary, instantiate};
 use super::representatives::EqualityClasses;
 use nrese_exec::heap;
+use nrese_exec::search::Finger;
 
 type Pair = (u64, u64);
 
@@ -335,6 +336,10 @@ pub struct Counters {
     /// Checks that came out of (predicate, subject, object) order within their morsel
     /// (P1-F8: none).
     pub unordered_probes: u64,
+    /// Where the checks started a relation's runs from the beginning: once per relation
+    /// and morsel, the other checks reading each run forward from the last one's place
+    /// (G1; checked one by one, every check searched every run from the root).
+    pub probe_starts: u64,
     /// Lookups by object alone in relations kept without their object order (P1-F11:
     /// none).
     pub lookups_without_order: u64,
@@ -500,6 +505,19 @@ impl Pairs {
         chunk.binary_search(&pair).ok().map(|i| (at, i))
     }
 
+    /// [`Self::contains`] read forward from `finger`, where the last probe landed: for
+    /// probes in ascending order (a morsel's candidates).
+    fn contains_from(&self, finger: &mut PairsFinger, pair: Pair) -> bool {
+        let chunk = finger.chunk.seek(&self.lasts, &pair);
+        if chunk != finger.current {
+            finger.current = chunk;
+            finger.within = Finger::default();
+        }
+        self.chunks
+            .get(chunk)
+            .is_some_and(|pairs| finger.within.contains(pairs, &pair))
+    }
+
     /// The pairs whose first component is `key`: a slice of each chunk they are in.
     fn range(&self, key: u64) -> impl Iterator<Item = &[Pair]> {
         self.range_at(key).map(|(_, _, pairs)| pairs)
@@ -651,6 +669,14 @@ fn merge(mut a: impl Feed, mut b: impl Feed, total: usize) -> Pairs {
         out.push(chunk);
     }
     out
+}
+
+/// A finger into [`Pairs`]: over the chunks' last pairs, and into the chunk it is in.
+#[derive(Clone, Copy, Default)]
+struct PairsFinger {
+    chunk: Finger,
+    current: usize,
+    within: Finger,
 }
 
 /// A sorted run of pairs, by subject and, where a rule can look the relation up by object
@@ -1155,6 +1181,15 @@ impl Relation {
         self.base.contains(s, o) || self.recent.contains(s, o) || self.input.contains(s, o)
     }
 
+    /// [`Self::contains`] with a finger per run it reads, for pairs probed in ascending
+    /// order.
+    fn contains_from(&self, s: u64, o: u64, fingers: &mut [PairsFinger; 3]) -> bool {
+        [&self.base, &self.recent, &self.input]
+            .iter()
+            .zip(fingers)
+            .any(|(run, finger)| run.so.contains_from(finger, (s, o)))
+    }
+
     /// Every pair, in no particular order.
     pub(crate) fn pairs(&self) -> Vec<Pair> {
         let mut out = Vec::with_capacity(self.input.len() + self.base.len() + self.recent.len());
@@ -1340,6 +1375,28 @@ impl Store {
 
     pub(crate) fn relation(&self, p: u64) -> Option<&Relation> {
         self.index.get(&p).map(|&i| &self.relations[i])
+    }
+
+    /// Keeps the facts of `facts` (sorted by predicate, subject and object: a morsel's
+    /// candidates) that the store doesn't hold. Each relation's runs are read forward from
+    /// where the last probe landed ([`Finger`]), not searched from the root for each fact.
+    /// Those searches were 54 % of LUBM 100's reasoning samples, but mostly the cache
+    /// misses at their targets, which a finger keeps: the reasoning took 6 % less.
+    /// Returns how often it started the runs from the beginning: once per relation.
+    fn retain_new(&self, facts: &mut Vec<Triple>) -> u64 {
+        let mut at: Option<(u64, Option<&Relation>)> = None;
+        let mut fingers = [PairsFinger::default(); 3];
+        let mut starts = 0;
+        facts.retain(|&[s, p, o]| {
+            if at.is_none_or(|(q, _)| q != p) {
+                at = Some((p, self.relation(p)));
+                fingers = [PairsFinger::default(); 3];
+                starts += 1;
+            }
+            let relation = at.and_then(|(_, relation)| relation);
+            relation.is_none_or(|r| !r.contains_from(s, o, &mut fingers))
+        });
+        starts
     }
 
     /// The relation of `p`, or every relation where `p` is open, with their predicates.
@@ -2390,7 +2447,11 @@ fn run(
             }
         }
         let probes = Probes::for_jobs(jobs.len());
-        let keep = |fact| !store.contains(fact);
+        let starts = std::sync::atomic::AtomicU64::new(0);
+        let keep = |facts: &mut Vec<Triple>| {
+            let n = store.retain_new(facts);
+            starts.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        };
         candidates.extend(run_jobs_by_morsel(
             &current,
             &jobs,
@@ -2405,6 +2466,7 @@ fn run(
         let asked = probes.probes.into_inner();
         counters.probes.push(asked);
         counters.unordered_probes += probes.unordered.into_inner();
+        counters.probe_starts += starts.into_inner();
         let mut round = 0;
         for (job, count) in jobs.iter().zip(probes.bindings) {
             let count = count.into_inner();
@@ -2764,6 +2826,21 @@ mod chunk_tests {
             }
             for pair in pairs(seed + 1000, 50) {
                 assert_eq!(chunked.contains(pair), all.binary_search(&pair).is_ok());
+            }
+            // A finger answers the same over sorted probes (across chunks), and over
+            // probes in any order.
+            let mut finger = PairsFinger::default();
+            for pair in sorted(pairs(seed + 2000, 60)) {
+                assert_eq!(
+                    chunked.contains_from(&mut finger, pair),
+                    all.binary_search(&pair).is_ok()
+                );
+            }
+            for pair in pairs(seed + 3000, 40) {
+                assert_eq!(
+                    chunked.contains_from(&mut finger, pair),
+                    all.binary_search(&pair).is_ok()
+                );
             }
             // A merge of disjoint runs, one shared (kept) and one owned (freed).
             let (left, right): (Vec<Pair>, Vec<Pair>) =

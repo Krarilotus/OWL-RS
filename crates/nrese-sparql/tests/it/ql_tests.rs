@@ -541,3 +541,119 @@ fn engine_trig(trig: &str) -> Engine {
     tx.commit().unwrap();
     engine
 }
+
+/// The guard of performance.md's "witnesses the data has" (design §3): a witness whose
+/// tree the data has at every individual it folds to adds no answer, so the query runs as
+/// written; one individual without it, and the rewriting is back.
+#[test]
+fn witnesses_the_data_has_are_not_folded() {
+    let realised = ":Employee rdfs:subClassOf [ a owl:Restriction ;
+            owl:onProperty :worksFor ; owl:someValuesFrom :Organisation ] .
+        :ann a :Employee ; :worksFor :acme . :acme a :Organisation .";
+    let query = "SELECT ?x WHERE { ?x :worksFor ?y }";
+    let e = engine(realised);
+    let plan = plan_query(&e.snapshot(), &parse(query), &on()).unwrap();
+    let ql = plan.ql.unwrap();
+    assert_eq!((ql.patterns, ql.realised, ql.checks), (0, 1, 1));
+    assert!(
+        !plan.rewrites.contains(&"ql-tree-witness"),
+        "{:?}",
+        plan.rewrites
+    );
+    assert_eq!(rows(&e, query, &on()), ["?x=<ann>"]);
+    // Asked once per snapshot revision: the next query's answer is the cache's.
+    let options = on();
+    let snapshot = e.snapshot();
+    plan_query(&snapshot, &parse(query), &options).unwrap();
+    let again = plan_query(&snapshot, &parse(query), &options)
+        .unwrap()
+        .ql
+        .unwrap();
+    assert_eq!((again.realised, again.checks), (1, 0));
+
+    let e = engine(&format!("{realised} :bob a :Employee ."));
+    let plan = plan_query(&e.snapshot(), &parse(query), &on()).unwrap();
+    let ql = plan.ql.unwrap();
+    assert_eq!((ql.patterns, ql.realised), (1, 0));
+    assert_eq!(rows(&e, query, &on()), ["?x=<ann>", "?x=<bob>"]);
+    // A group no aggregate of which depends on how often a row comes reads a set.
+    assert_eq!(
+        rows(
+            &e,
+            "SELECT (COUNT(DISTINCT ?x) AS ?n) (SAMPLE(?x) AS ?s) WHERE { ?x :worksFor [] } HAVING (COUNT(DISTINCT ?x) > 0)",
+            &on()
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        rows(
+            &e,
+            "SELECT (COUNT(DISTINCT ?x) AS ?n) WHERE { ?x :worksFor [] }",
+            &on()
+        ),
+        ["?n=\"2\"^^<http://www.w3.org/2001/XMLSchema#integer>"]
+    );
+}
+
+fn with_limits(limits: Limits) -> QueryOptions {
+    QueryOptions {
+        ql: Some(Arc::new(
+            QlRewriting::new(Closure { lists: true }).with_limits(limits),
+        )),
+        ..QueryOptions::default()
+    }
+}
+
+/// Every rewriting path ends in a status at its budget (merge checklist §4): the query's
+/// work, the data check's questions and statements, and, under a negation, `unsound`.
+#[test]
+fn the_rewriting_paths_end_in_a_status_at_their_budgets() {
+    let query = "SELECT ?x WHERE { ?x :worksFor ?y }";
+    let e = engine(STAFF);
+    // No work left for the query: its patterns run as written, said.
+    let none = with_limits(Limits {
+        query_work: 0,
+        ..Limits::default()
+    });
+    let ql = plan_query(&e.snapshot(), &parse(query), &none)
+        .unwrap()
+        .ql
+        .unwrap();
+    assert_eq!(ql.limits, ["the query's work"]);
+    assert_eq!(ql.completeness.as_str(), "sound-only");
+    assert_eq!(rows(&e, query, &none), ["?x=<ann>"]);
+    // Under a negation the same makes the answers unsound.
+    let negated = "SELECT ?x WHERE { ?x a :Employee FILTER NOT EXISTS { ?x :worksFor [] } }";
+    let ql = plan_query(&e.snapshot(), &parse(negated), &none)
+        .unwrap()
+        .ql
+        .unwrap();
+    assert_eq!(ql.completeness.as_str(), "unsound", "{:?}", ql.completeness);
+
+    // The data check: no question left, or one reading more than it may: the witness is
+    // folded unasked (Ann has her employer, so asking would leave it out).
+    let realised = engine(
+        ":Employee rdfs:subClassOf [ a owl:Restriction ;
+            owl:onProperty :worksFor ; owl:someValuesFrom :Organisation ] .
+         :ann a :Employee ; :worksFor :acme .",
+    );
+    for limits in [
+        Limits {
+            checks: 0,
+            ..Limits::default()
+        },
+        Limits {
+            check_rows: 1,
+            ..Limits::default()
+        },
+    ] {
+        let options = with_limits(limits);
+        let ql = plan_query(&realised.snapshot(), &parse(query), &options)
+            .unwrap()
+            .ql
+            .unwrap();
+        assert_eq!((ql.patterns, ql.realised, ql.checks), (1, 0, 0));
+        assert_eq!(rows(&realised, query, &options), ["?x=<ann>"]);
+    }
+}

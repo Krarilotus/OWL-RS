@@ -38,6 +38,10 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         total_query_memory_bytes: parse_total_query_memory(
             source.get(names::MAX_TOTAL_QUERY_MEMORY_BYTES).as_deref(),
         )?,
+        huge_pages: match choice(source, names::HUGE_PAGES, &["off", "on"])? {
+            Some(on) => on == 1,
+            None => defaults.huge_pages,
+        },
         process_memory_bytes: parse_process_memory(
             source.get(names::PROCESS_MEMORY_BYTES).as_deref(),
         )?,
@@ -73,6 +77,12 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         )?,
         verify_on_open: parse_bool(source, names::VERIFY_ON_OPEN, defaults.verify_on_open)?,
         map_checkpoints: parse_bool(source, names::MAP_CHECKPOINTS, defaults.map_checkpoints)?,
+        checkpoint_after_wal_bytes: match source.get(names::CHECKPOINT_AFTER_WAL_BYTES) {
+            Some(text) => super::units::parse_size(&text).with_context(|| {
+                format!("failed to parse {}", names::CHECKPOINT_AFTER_WAL_BYTES)
+            })?,
+            None => defaults.checkpoint_after_wal_bytes,
+        },
         wal_archive: parse_bool(source, names::WAL_ARCHIVE, defaults.wal_archive)?,
         index_encoding: match source.get(names::INDEX_ENCODING) {
             None => defaults.index_encoding,

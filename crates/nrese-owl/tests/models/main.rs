@@ -717,6 +717,7 @@ fn clauses_and_ontologies_have_the_same_models() {
                 expand_at_most_up_to: if case % 2 == 0 { 2 } else { 0 },
                 // The clauses' models are the ontology's: not so when read one way.
                 lazy_definitions: false,
+                complements: false,
                 // Minimal automata accept the same words: the same models.
                 exact_provenance: case % 3 != 0,
             },
@@ -922,4 +923,34 @@ fn existentials_over_transitive_roles_on_the_left_stay_horn() {
         .filter(|clause| clause.body.is_empty() && clause.head.len() > 1)
         .collect();
     assert!(universal.is_empty(), "{universal:#?}");
+}
+
+/// An inverse pair with a transitive role is a regular role hierarchy: universals over
+/// both go through their automata and nothing is unsupported (ore_ont_15971: `after`
+/// inverse of `before`, `before` transitive, was "unsupported: an irregular role
+/// hierarchy"; the hypertableau's answers on it are `nrese-dl`'s
+/// `transitive_roles_through_automata`).
+#[test]
+fn an_inverse_pair_with_a_transitive_role_is_regular() {
+    let (before, after) = (ObjProp::Named(200), ObjProp::Named(201));
+    let mut o = Ontology::default();
+    let c = ExprId(o.classes.intern(ClassExpr::Class(1)));
+    let not_c = ExprId(o.classes.intern(ClassExpr::Not(c)));
+    let all_before = ExprId(o.classes.intern(ClassExpr::All(before, not_c)));
+    let all_after = ExprId(o.classes.intern(ClassExpr::All(after, not_c)));
+    o.axioms = vec![
+        Axiom::InverseObjectProperties(before, after),
+        Axiom::ObjectCharacteristic(Characteristic::Transitive, before),
+        Axiom::ClassAssertion(all_before, 100),
+        Axiom::ClassAssertion(all_after, 102),
+        Axiom::ObjectPropertyAssertion(200, 100, 101),
+        Axiom::ObjectPropertyAssertion(201, 102, 101),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let normalised = normalise_with(&o, Options::default());
+    assert!(
+        normalised.unsupported.is_empty(),
+        "{:?}",
+        normalised.unsupported
+    );
 }

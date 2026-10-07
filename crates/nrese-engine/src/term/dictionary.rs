@@ -73,6 +73,9 @@ pub struct DictionaryStats {
     pub vector_bytes: u64,
     /// Derived indexes read from their files since start ([`super::derived`]).
     pub derived_loaded: u64,
+    /// Terms the full-text indexes cover, of literals and of IRIs' local names (none
+    /// until a query searches text: [`super::text`]).
+    pub text_covered: u64,
 }
 
 /// Dictionary entries `0..len` in a mapped checkpoint: their keys one after another, the
@@ -722,6 +725,7 @@ impl Dictionary {
         let base = inner.base.as_ref();
         DictionaryStats {
             vector_bytes: self.vectors.read().memory_bytes() as u64,
+            text_covered: self.text.read().covered() + self.iri_text.read().covered(),
             derived_loaded: self
                 .derived
                 .loads

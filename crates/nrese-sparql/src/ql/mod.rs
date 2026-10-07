@@ -5,6 +5,7 @@
 //! [`QlRewriting`] is the store's switch and its cache of the compiled schema; the
 //! rewriting of a query's basic graph patterns is `native/ql.rs`.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
@@ -86,6 +87,11 @@ const LISTS: &[&str] = &[
 pub struct QlReport {
     /// Basic graph patterns rewritten.
     pub patterns: usize,
+    /// Tree witnesses not folded: the data has their tree wherever they would fold, so
+    /// they add no answer (design §3).
+    pub realised: usize,
+    /// Questions asked of the data for that (not those its cache answered).
+    pub checks: usize,
     /// Their tree witnesses.
     pub witnesses: usize,
     /// Branches of their unions.
@@ -105,6 +111,9 @@ pub struct QlRewriting {
     closure: Closure,
     limits: Limits,
     cached: Mutex<Vec<Cached>>,
+    /// Whether the data has a witness's tree wherever it folds, per probe, for one
+    /// snapshot revision (design §3).
+    realised: Mutex<(u64, HashMap<String, bool>)>,
 }
 
 /// Schemas compiled for different readers kept at once.
@@ -129,7 +138,37 @@ impl QlRewriting {
             closure,
             limits: Limits::default(),
             cached: Mutex::new(Vec::new()),
+            realised: Mutex::new((u64::MAX, HashMap::new())),
         }
+    }
+
+    /// Whether the data at snapshot revision `revision` has the tree of probe `key`
+    /// wherever it folds: `compute`d once per revision and probe (`None`: not asked, the
+    /// query's questions spent; `false` then, and nothing kept).
+    pub(crate) fn realised(
+        &self,
+        revision: u64,
+        key: &str,
+        compute: impl FnOnce() -> Option<bool>,
+    ) -> bool {
+        {
+            let cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
+            if cache.0 == revision
+                && let Some(&known) = cache.1.get(key)
+            {
+                return known;
+            }
+        }
+        // Computed without the lock: the check is a query of its own.
+        let Some(known) = compute() else {
+            return false;
+        };
+        let mut cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.0 != revision {
+            *cache = (revision, HashMap::new());
+        }
+        cache.1.insert(key.to_owned(), known);
+        known
     }
 
     /// The same with other bounds (tests make them small).
