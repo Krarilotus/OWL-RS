@@ -126,9 +126,11 @@ run_seeds() {
     if nextest; then
       # One run per seed: every random test of every changed crate in parallel.
       # shellcheck disable=SC2046
-      if ! NRESE_FUZZ_SEED=$seed "$guarded" nextest run --locked --no-fail-fast \
-          $(package_args "${crates[@]}") -E "$expr" > /dev/null 2>&1; then
-        echo "random tests fail: NRESE_FUZZ_SEED=$seed cargo nextest run -E '$expr'"
+      local out
+      if ! out=$(NRESE_FUZZ_SEED=$seed "$guarded" nextest run --locked --no-fail-fast \
+          $(package_args "${crates[@]}") -E "$expr" 2>&1); then
+        echo "random tests fail with NRESE_FUZZ_SEED=$seed:"
+        printf '%s\n' "$out" | grep -E '^ +FAIL|panicked at' -A1 | grep -v '^--' | sort -u | head -20
         code=1
       fi
       continue
