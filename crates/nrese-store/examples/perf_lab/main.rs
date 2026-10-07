@@ -494,9 +494,10 @@ fn explain(store: &StoreService, text: &str) {
         Ok(explanation) => {
             if let Some(ql) = &explanation.ql {
                 println!(
-                    "    ql: {} patterns, {} witnesses, {} branches, {} atoms, limits {:?}, {} {:?}",
+                    "    ql: {} patterns, {} witnesses ({} realised), {} branches, {} atoms, limits {:?}, {} {:?}",
                     ql.patterns,
                     ql.witnesses,
+                    ql.realised,
                     ql.branches,
                     ql.atoms,
                     ql.limits,
