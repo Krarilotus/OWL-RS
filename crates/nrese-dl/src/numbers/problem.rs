@@ -202,7 +202,7 @@ fn axiom_mentions_property(axiom: &Axiom, t: Term) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use nrese_owl::DataRange;
 
