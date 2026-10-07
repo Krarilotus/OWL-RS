@@ -291,9 +291,29 @@ pub fn confirms(o: &Ontology, mut i: Interp) -> Option<bool> {
     if model_of(o, &i) {
         return Some(true);
     }
+    // Whether to keep a property's loops is decided per property: a reflexive one needs
+    // them where an asymmetric one beside it forbids its own (seeds 182, 200, 268 and 403
+    // of the office campaign: no single choice for all properties was a model).
+    let named: Vec<bool> = (0..i.n)
+        .map(|e| i.individuals.values().any(|&v| v == e))
+        .collect();
+    let mut looped: Vec<Term> = i
+        .roles
+        .iter()
+        .filter(|(_, rows)| (0..i.n as usize).any(|u| !named[u] && rows[u] & (1 << u) != 0))
+        .map(|(&p, _)| p)
+        .collect();
+    looped.sort_unstable();
+    looped.truncate(8);
     let mut checked = false;
-    for keep_loops in [false, true] {
-        if let Some(mut l) = lift(&i, keep_loops) {
+    for mask in 0u32..(1 << looped.len()) {
+        let keep = |p: Term| {
+            looped
+                .iter()
+                .position(|&q| q == p)
+                .is_some_and(|k| mask & (1 << k) != 0)
+        };
+        if let Some(mut l) = lift(&i, &keep) {
             checked = true;
             close(o, &mut l);
             if model_of(o, &l) {
@@ -312,9 +332,10 @@ pub fn confirms(o: &Ontology, mut i: Interp) -> Option<bool> {
 /// through anonymous elements gets a length divisible by three, so no loop or 2-cycle a
 /// fold closed is left (an irreflexive or asymmetric property, or one disjoint with its
 /// inverse, forbids them, while the unravelled model the fold stands for is a model:
-/// seed 94543 case 143, seed 2007 case 299). `keep_loops`: an anonymous element's loops
-/// stay loops on each copy (a `∃R.Self` needs them). `None` past 128 elements.
-fn lift(i: &Interp, keep_loops: bool) -> Option<Interp> {
+/// seed 94543 case 143, seed 2007 case 299). `keep_loops`: the properties whose loops on
+/// an anonymous element stay loops on each copy (a `∃R.Self` or a reflexive property needs
+/// them). `None` past 128 elements.
+fn lift(i: &Interp, keep_loops: &dyn Fn(Term) -> bool) -> Option<Interp> {
     let named: Vec<bool> = (0..i.n)
         .map(|e| i.individuals.values().any(|&v| v == e))
         .collect();
@@ -374,7 +395,11 @@ fn lift(i: &Interp, keep_loops: bool) -> Option<Interp> {
                     }
                     (false, false) => {
                         for j in 0..3 {
-                            let to = if u == v && keep_loops { j } else { (j + 1) % 3 };
+                            let to = if u == v && keep_loops(p) {
+                                j
+                            } else {
+                                (j + 1) % 3
+                            };
                             lifted[copies[u][j] as usize] |= 1 << copies[v][to];
                         }
                     }
