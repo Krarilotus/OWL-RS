@@ -241,47 +241,6 @@ fn the_default_graph_can_be_the_merge_of_all_graphs() {
     assert_eq!(subjects(&own, seen), ["a"]);
 }
 
-/// `HAVING` may name a `SELECT` alias, as Jena and QLever allow: the alias means
-/// its expression. Read by the standard, the alias is unbound there and no group passes.
-#[test]
-fn having_may_name_a_select_alias() {
-    let service = StoreService::new(StoreConfig::in_memory()).expect("store");
-    service
-        .execute_update_str(
-            "PREFIX : <http://example.com/> INSERT DATA {
-               :a :member :m1, :m2, :m3 . :b :member :m4 . :c :member :m5, :m6 .
-               :m1 :age 10 . :m2 :age 20 . :m3 :age 30 . :m4 :age 90 . :m5 :age 1 . :m6 :age 2 }",
-        )
-        .expect("data");
-    let groups = |having: &str| -> Vec<String> {
-        let mut request = SparqlQueryRequest::all(format!(
-            "PREFIX : <http://example.com/>
-             SELECT ?g (COUNT(?m) AS ?members) (SUM(?age) / COUNT(?m) AS ?mean)
-             WHERE {{ ?g :member ?m . ?m :age ?age }}
-             GROUP BY ?g HAVING ({having}) ORDER BY ?g"
-        ));
-        request.solutions_format = nrese_store::SolutionsResultFormat::Tsv;
-        let result = service.execute_query(&request).expect("query");
-        String::from_utf8(result.payload)
-            .expect("utf8")
-            .lines()
-            .skip(1)
-            .map(|line| {
-                let group = line.split('\t').next().unwrap_or_default();
-                group
-                    .trim_start_matches("<http://example.com/")
-                    .trim_end_matches('>')
-                    .to_owned()
-            })
-            .collect()
-    };
-    assert_eq!(groups("?members >= 2"), ["a", "c"]);
-    assert_eq!(groups("?members >= 2 && ?mean > 5"), ["a"]);
-    assert_eq!(groups("?mean > 5 || ?g = :c"), ["a", "b", "c"]);
-    // The same, written as the standard has it.
-    assert_eq!(groups("COUNT(?m) >= 2 && SUM(?age) / COUNT(?m) > 5"), ["a"]);
-}
-
 /// Jena's and Fuseki's name for the default graph, `urn:x-arq:DefaultGraph`, which clients
 /// written for them use (rdflib's SPARQL store writes a graph so named into
 /// `GRAPH <urn:x-arq:DefaultGraph> { … }`): the default graph in update data, in `GRAPH`
@@ -339,26 +298,4 @@ fn jenas_default_graph_name_as_the_dataset() {
         text.contains("http://e/a") && !text.contains("http://e/c"),
         "{text}"
     );
-}
-
-/// A BGP of more than 64 patterns plans and runs (the planner's greedy path had a 64-bit
-/// membership mask: the review of 3 October 2026, P2): a chain of 70 links over a path
-/// of 71 nodes has one solution.
-#[test]
-fn a_bgp_of_70_patterns_runs() {
-    let service = StoreService::new(StoreConfig::in_memory()).expect("store");
-    let links: String = (0..70)
-        .map(|i| format!("<http://e/n{i}> <http://e/next> <http://e/n{}> .\n", i + 1))
-        .collect();
-    service
-        .execute_update_str(&format!("INSERT DATA {{ {links} }}"))
-        .expect("insert");
-    let chain: String = (0..70)
-        .map(|i| format!("?v{i} <http://e/next> ?v{} .\n", i + 1))
-        .collect();
-    let result = service
-        .execute_query_str(&format!("SELECT (COUNT(*) AS ?n) WHERE {{ {chain} }}"))
-        .expect("query");
-    let text = String::from_utf8(result.payload).unwrap();
-    assert!(text.contains("\"1\""), "{text}");
 }

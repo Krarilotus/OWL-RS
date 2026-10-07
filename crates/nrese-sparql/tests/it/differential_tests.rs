@@ -494,3 +494,104 @@ fn non_canonical_literals_keep_their_identity() {
         vec!["?s=<http://example.com/a>"]
     );
 }
+
+/// The engine and the reference evaluator over the same `quads`, answering `query` as
+/// [`nrese_sparql::compat::parse_query`] reads it (the store's way in).
+fn both_over(quads: &[Quad], query: &str) -> (Normalized, Normalized) {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut store = Dataset::default();
+    let mut tx = engine.transaction();
+    for quad in quads {
+        tx.insert(quad.as_ref());
+        store.insert(quad.clone());
+    }
+    tx.commit().unwrap();
+    let parsed = nrese_sparql::compat::parse_query(query, None).unwrap();
+    let ordered = query.contains("ORDER BY");
+    let snapshot = engine.snapshot();
+    let ours = evaluate_query(&snapshot, &parsed, &QueryOptions::default()).unwrap();
+    let theirs = store.query(&parsed, &QueryOptions::default()).unwrap();
+    (normalize(ours, ordered), normalize(theirs, ordered))
+}
+
+/// `HAVING` may name a `SELECT` alias, as Jena and QLever allow: the alias means its
+/// expression (`compat`). Read by the standard, the alias is unbound there and no group
+/// passes.
+#[test]
+fn having_may_name_a_select_alias() {
+    let int = |v: u32| Term::from(Literal::new_typed_literal(v.to_string(), xsd::INTEGER));
+    let mut quads = Vec::new();
+    for (group, members) in [("a", &[1, 2, 3][..]), ("b", &[4]), ("c", &[5, 6])] {
+        for m in members {
+            let member = ex(&format!("m{m}"));
+            quads.push(Quad::new(
+                ex(group),
+                ex("member"),
+                member.clone(),
+                GraphName::DefaultGraph,
+            ));
+        }
+    }
+    for (m, age) in [(1, 10), (2, 20), (3, 30), (4, 90), (5, 1), (6, 2)] {
+        quads.push(Quad::new(
+            ex(&format!("m{m}")),
+            ex("age"),
+            int(age),
+            GraphName::DefaultGraph,
+        ));
+    }
+    let groups = |having: &str| {
+        let query = format!(
+            "PREFIX : <{EX}> SELECT ?g (COUNT(?m) AS ?members) (SUM(?age) / COUNT(?m) AS ?mean)
+             WHERE {{ ?g :member ?m . ?m :age ?age }} GROUP BY ?g HAVING ({having}) ORDER BY ?g"
+        );
+        let (ours, theirs) = both_over(&quads, &query);
+        assert_eq!(ours, theirs, "{query}");
+        let Normalized::Solutions(rows) = ours else {
+            panic!("solutions")
+        };
+        rows.iter()
+            .map(|row| {
+                row.split(&format!("?g=<{EX}"))
+                    .nth(1)
+                    .unwrap_or("")
+                    .split('>')
+                    .next()
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(groups("?members >= 2"), ["a", "c"]);
+    assert_eq!(groups("?members >= 2 && ?mean > 5"), ["a"]);
+    assert_eq!(groups("?mean > 5 || ?g = :c"), ["a", "b", "c"]);
+    // The same, written as the standard has it.
+    assert_eq!(groups("COUNT(?m) >= 2 && SUM(?age) / COUNT(?m) > 5"), ["a"]);
+}
+
+/// A BGP of more than 64 patterns plans and runs (the planner's greedy path had a 64-bit
+/// membership mask: the review of 3 October 2026, P2): a chain of 70 links over a path
+/// of 71 nodes has one solution.
+#[test]
+fn a_bgp_of_70_patterns_runs() {
+    let quads: Vec<Quad> = (0..70)
+        .map(|i| {
+            let (from, to) = (ex(&format!("n{i}")), ex(&format!("n{}", i + 1)));
+            Quad::new(from, ex("next"), to, GraphName::DefaultGraph)
+        })
+        .collect();
+    let chain: String = (0..70)
+        .map(|i| format!("?v{i} <{EX}next> ?v{} . ", i + 1))
+        .collect();
+    let (ours, theirs) = both_over(
+        &quads,
+        &format!("SELECT (COUNT(*) AS ?n) WHERE {{ {chain} }}"),
+    );
+    assert_eq!(ours, theirs);
+    assert_eq!(
+        ours,
+        Normalized::Solutions(vec![
+            "?n=\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_owned()
+        ])
+    );
+}
