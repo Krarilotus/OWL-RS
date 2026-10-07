@@ -125,23 +125,24 @@ if [ "${NRESE_MEMORY_CAP_GB:-0}" -gt 0 ] && [ -r "/proc/$$/winpid" ] && command 
     || printf 'memory cap not applied; building uncapped\n' >&2
 fi
 
-# Jobs per build: the cores shared by the builds the slots allow at once (below), so that
+# Jobs per build: three quarters of the cores (the rest stays free for whoever uses the
+# machine), shared by the builds the slots allow at once (below), so that
 # full slots don't run more compilers than the machine has threads (8 jobs x 3 slots on 16
 # threads did). Without slots, half the cores.
 if [ -z "${CARGO_BUILD_JOBS:-}" ]; then
   cores=$(nproc 2>/dev/null || printf 4)
-  share=${NRESE_BUILD_SLOTS:-3}
+  share=${NRESE_BUILD_SLOTS:-2}
   [ "$share" -gt 0 ] 2>/dev/null || share=2
-  jobs=$(( (cores + share - 1) / share ))
+  jobs=$(( (cores * 3 / 4 + share - 1) / share ))
   export CARGO_BUILD_JOBS=$(( jobs > 2 ? jobs : 2 ))
 fi
 
-# A machine-wide limit on builds: at most NRESE_BUILD_SLOTS (default 3) cargo runs of ours at
+# A machine-wide limit on builds: at most NRESE_BUILD_SLOTS (default 2) cargo runs of ours at
 # once, so that agents sharing a machine don't run more compilers than it has cores. A build
 # waits for a free slot (at most NRESE_BUILD_SLOT_WAIT_S, default 3600 s, then it runs
 # anyway); a slot whose owner died is taken over. Waits are logged in tmp/guard-slots.log.
 # NRESE_BUILD_SLOTS=0 switches the limit off.
-SLOTS="${NRESE_BUILD_SLOTS:-3}"
+SLOTS="${NRESE_BUILD_SLOTS:-2}"
 SLOT_DIR="${NRESE_BUILD_SLOT_DIR:-$HOME/.nrese-build-slots}"
 slot=""
 take_slot() {
