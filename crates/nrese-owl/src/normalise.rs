@@ -47,6 +47,11 @@ pub struct Options {
     /// and `¬D` for each `¬A`, not `D ⊑ A` everywhere. Equisatisfiable, but a model of the
     /// clauses under-approximates such classes. Off by default.
     pub lazy_definitions: bool,
+    /// Two definitions by complementary restrictions (`A ≡ ≥ 1 P`, `B ≡ ≤ 0 P`) become one
+    /// class and its negation, and a property only they mention is left out
+    /// (`complements.rs`). Equisatisfiable; a model of the clauses says nothing of what is
+    /// left out. Off by default.
+    pub complements: bool,
     /// Every clause names exactly the axioms it needs (for proofs and justifications). Off,
     /// the automata of non-simple roles are minimised (`automata.rs`): far fewer clauses
     /// over large role hierarchies, with sources that may name more than needed. On by
@@ -63,6 +68,7 @@ impl Default for Options {
         Self {
             expand_at_most_up_to: 2,
             lazy_definitions: false,
+            complements: false,
             exact_provenance: true,
         }
     }
@@ -88,6 +94,11 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
         })
     });
     let ontology = rewritten.as_ref().map_or(ontology, |r| &r.ontology);
+    let complemented = options
+        .complements
+        .then(|| crate::complements::rewrite(ontology))
+        .flatten();
+    let ontology = complemented.as_ref().unwrap_or(ontology);
     let mut n = Normaliser::new(ontology);
     n.expand_up_to = options.expand_at_most_up_to.min(Options::MAX_EXPANSION);
     n.exact_provenance = options.exact_provenance;
