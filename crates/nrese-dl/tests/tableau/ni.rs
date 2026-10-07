@@ -14,8 +14,11 @@ fn configs() -> impl Iterator<Item = Config> {
         backjumping: bits & 2 != 0,
         anywhere_blocking: bits & 4 != 0,
         single_blocking: bits & 8 != 0,
-        // Bounded by branch points, not the clock; the timeout is only a safety net.
-        max_branch_points: Some(200_000),
+        // Bounded by branch points, not the clock; the timeout is only a safety net. The
+        // combinations that thrash give up on this budget (ancestor blocking with `≤`
+        // spelled out took 84 k branch points on 2·3 = 6, 24 s each in a debug build; the
+        // others 44 to 1,360).
+        max_branch_points: Some(10_000),
         timeout: Some(Duration::from_secs(300)),
         max_nodes: 100_000,
         max_memory: 512 << 20,
