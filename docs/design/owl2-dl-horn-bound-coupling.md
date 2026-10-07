@@ -165,9 +165,13 @@ runs out of its budget, or both in the portfolio's way.
 0. **Counts before building** (one build of counters, no behaviour change): per task, the
    contexts, clauses, conditional clauses and `Incomplete::Join` contexts of the conditional
    core, and the share of classes whose saturation receives a possible atom (would be
-   critical under B).
-1. B as a strategy, with its exactness; the brute-force and metamorphic gates.
-2. C: copies for certain universals, the Eq rule's unconditional half.
+   critical under B). Done, §7.
+1. **Revised by §7:** C first. Copies keyed by what the filler's saturated label lacks (the
+   thesis's keying), as a strategy, with the Eq rule's unconditional half; B's critical
+   marking only for what the copies leave (on 7914, 0.3 % of the classes). The brute-force
+   and metamorphic gates.
+2. Before building C on 9724: why a copy run reaches only 18 of its classes in its budget
+   (eager and keyed alike, §7), counted per class (copies made, clauses), counters only.
 3. D, behind a switch; the A/B on the ORE development set by stratum.
 
 **Expected:**
@@ -223,3 +227,29 @@ that differ only in atoms the filler implies anyway. If the reduced keys are wit
 factor of split's contexts, step 2 is copies so keyed; if they too run into hundreds of
 thousands, the copies need sharing beyond that (or the hypertableau's result transfer, step
 3, carries these classes), and this note gets revised before anything is built.
+
+**The keyed-copies count (counters only, the same patch plus a measurement strategy):**
+a successor's core is its filler plus the certain atoms the filler's own saturated label
+lacks, the label read off a split run of the same clauses first (the thesis's keying,
+p. 127). The other atoms are still sent as `A → A`, so they show up as conditional clauses,
+redundant ones: the successor derives them from its core anyway.
+
+| | split | eager (keyed by `K₁`) | keyed by the label |
+|---|---|---|---|
+| 7914 (first clause set): contexts | 18,117 | 278,875 | **33,366** |
+| 7914: live clauses | 391 k | 23.7 M | 1.4 M |
+| 7914: classes reached in budget | 12,889 | 10,954 | 10,325 |
+| 7914: critical classes | 19.8 % | 0 % | **0.3 %** |
+| 9724: contexts, classes reached | 33,088, all | 151,484, 18 | 23,731, 18 |
+| 9835: labels available | – | – | 1,393 of 46,247 classes (split doesn't finish) |
+
+- **On 7914 the thesis's keying works:** 8.4× fewer contexts than eager, 1.8× split's, and
+  nearly nothing critical. That decides step 2's form: copies keyed by the label, not by
+  `K₁`.
+- **9724 is inconclusive:** both copy runs (eager and keyed) reach only 18 of its 23,136
+  classes in their budget, even with 120 s and 10 GB; memory isn't the limit. Something per
+  class explodes there; it needs its own count before step 2 is built for it (the revised
+  step 2 above).
+- **9835 is inconclusive:** the labels come from a split run that reaches 3 % of its classes,
+  so the keyed run has nothing to key by for the rest. Its count waits for a label source
+  that finishes (the keyed run itself, iterated, or step 1's saturation).
