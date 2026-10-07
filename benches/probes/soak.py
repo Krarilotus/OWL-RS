@@ -14,10 +14,19 @@ latency percentiles by kind. At the end:
 
     python benches/probes/soak.py --server target/release/nrese-server[.exe] \
         [--minutes 30] [--workers 8] [--store tmp/soak-store] [--port 18970] \
-        [--out tmp/soak] [--max-growth-mib-per-hour 50] [--soak-triples 20000] [DATA.nt ...]
+        [--out tmp/soak] [--max-growth-mib-per-hour 50] [--soak-triples 20000]
+        [--metrics-every 10] [--env NAME=VALUE ...] [DATA.nt ...]
 
-Writes `samples.csv` (per second) and `windows.csv` (per window) into --out. Exits 1 on
-errors, lost writes, or growth past the limit. Needs psutil; works on Linux and Windows.
+Every --metrics-every seconds it also reads the server's /metrics: every `nrese_*` gauge
+(result cache bytes and entries, dictionary terms and bytes, index runs and bytes, the
+WAL since the last checkpoint, open sessions, running queries, the text index, the
+allocator's committed and, in `--cfg alloc_profile` builds, live bytes) beside resident
+memory, into `metrics.csv`; at the end each gauge's slope after the warm-up, per hour,
+so the counter whose growth explains resident memory's shows.
+
+Writes `samples.csv` (per second), `windows.csv` (per window) and `metrics.csv` into
+--out. Exits 1 on errors, lost writes, or growth past the limit. Needs psutil; works on
+Linux and Windows.
 """
 from __future__ import annotations
 
@@ -251,14 +260,67 @@ def worker(index: int, base: str, stop: threading.Event, ledger: Ledger, stats: 
         stats.record(kind, time.monotonic() - started, error)
 
 
-def slope_mib_per_hour(samples: list[tuple[float, int]]) -> float:
-    if len(samples) < 3:
+def slope_per_hour(points: list[tuple[float, float]]) -> float:
+    """The least-squares slope of `points` (seconds, value), per hour."""
+    if len(points) < 3:
         return 0.0
-    xs = [t for t, _ in samples]
-    ys = [rss / 2**20 for _, rss in samples]
+    xs = [t for t, _ in points]
+    ys = [v for _, v in points]
     mx, my = statistics.fmean(xs), statistics.fmean(ys)
     var = sum((x - mx) ** 2 for x in xs)
     return 0.0 if var == 0 else sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / var * 3600
+
+
+def slope_mib_per_hour(samples: list[tuple[float, int]]) -> float:
+    return slope_per_hour([(t, rss / 2**20) for t, rss in samples])
+
+
+def mappings(pid: int, store: Path) -> dict[str, int]:
+    """Resident bytes by mapping (Linux): `anon` (the allocator's memory, mmapped without
+    a file), `stack`, `store:<file>` (the store's mapped files: checkpoints, the WAL), and
+    `binary` (the executable and its libraries). Empty elsewhere."""
+    out: dict[str, int] = {}
+    try:
+        with open(f"/proc/{pid}/smaps") as f:
+            name = "anon"
+            for line in f:
+                head = line.split(maxsplit=5)
+                if len(head) >= 5 and "-" in head[0] and ":" in head[3]:
+                    path = head[5].strip() if len(head) > 5 else ""
+                    if not path or path.startswith("[anon"):
+                        name = "anon"
+                    elif path in ("[heap]",):
+                        name = "anon"
+                    elif path.startswith("[stack"):
+                        name = "stack"
+                    elif path.startswith("["):
+                        name = "other"
+                    elif path.startswith(str(store)):
+                        name = "store:" + Path(path).name.split(".")[0]
+                    else:
+                        name = "binary"
+                elif line.startswith("Rss:"):
+                    out[name] = out.get(name, 0) + int(line.split()[1]) * 1024
+    except OSError:
+        return {}
+    return out
+
+
+def scrape(call: "Connection") -> dict[str, float]:
+    """The server's `nrese_*` gauges and counters, by name with labels."""
+    status, body = call("GET", "/metrics")
+    out: dict[str, float] = {}
+    if status != 200:
+        return out
+    for line in body.decode("utf-8", "replace").splitlines():
+        if not line.startswith("nrese_"):
+            continue
+        name, _, value = line.rpartition(" ")
+        try:
+            out[name] = float(value)
+        except ValueError:
+            pass
+    return out
 
 
 def main() -> int:
@@ -274,6 +336,11 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=20261005)
     p.add_argument("--soak-triples", type=int, default=20000,
                    help="the soak graph's size the workers keep it near")
+    p.add_argument("--metrics-every", type=float, default=10,
+                   help="seconds between reads of the server's /metrics")
+    p.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
+                   help="a setting for the server (NRESE_CHECKPOINT_AFTER_WAL_BYTES=8MiB: "
+                        "checkpoints within a short run); repeatable")
     p.add_argument("data", nargs="*")
     args = p.parse_args()
     store, out = Path(args.store).resolve(), Path(args.out)
@@ -283,6 +350,9 @@ def main() -> int:
     env = dict(os.environ, NRESE_STORE_MODE="on-disk", NRESE_DATA_DIR=str(store), RUST_LOG="warn",
                NRESE_BIND_ADDR=f"127.0.0.1:{args.port}", NRESE_READ_REQUESTS_PER_WINDOW="1000000000",
                NRESE_WRITE_REQUESTS_PER_WINDOW="1000000000")
+    for setting in args.env:
+        name, _, value = setting.partition("=")
+        env[name] = value
     if args.data:
         subprocess.run([server_bin, "load", *args.data], env=env, check=True, capture_output=True)
     log = open(out / "server.log", "wb")
@@ -291,6 +361,7 @@ def main() -> int:
     base = f"http://127.0.0.1:{args.port}"
     stop, ledger, stats = threading.Event(), Ledger(5 * args.soak_triples), Stats()
     samples: list[tuple[float, int, int, int]] = []
+    metrics: list[tuple[float, dict[str, float]]] = []
     windows = []
     try:
         for _ in range(600):
@@ -309,11 +380,23 @@ def main() -> int:
             t.start()
         end = start + args.minutes * 60
         next_window = start + args.window
+        next_metrics = start
+        scraper = Connection(base)
         while time.monotonic() < end:
             time.sleep(1)
             now = time.monotonic() - start
             handles = process.num_handles() if hasattr(process, "num_handles") else process.num_fds()
             samples.append((now, process.memory_info().rss, handles, process.num_threads()))
+            if time.monotonic() >= next_metrics:
+                next_metrics += args.metrics_every
+                try:
+                    gauges = scrape(scraper)
+                    gauges["rss_bytes"] = samples[-1][1]
+                    for name, size in mappings(server.pid, store).items():
+                        gauges[f"rss_bytes{{mapping=\"{name}\"}}"] = size
+                    metrics.append((now, gauges))
+                except Exception:  # the server busy past the timeout: the next read
+                    pass
             if time.monotonic() >= next_window or time.monotonic() >= end:
                 next_window += args.window
                 requests, latency = stats.drain()
@@ -349,6 +432,12 @@ def main() -> int:
         w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()
         w.writerows(windows)
+    names = sorted({k for _, gauges in metrics for k in gauges})
+    with open(out / "metrics.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["t_s", *names])
+        for t, gauges in metrics:
+            w.writerow([round(t, 1), *(gauges.get(k, "") for k in names)])
     after_warmup = [(t, rss) for t, rss, _, _ in samples if t >= samples[-1][0] / 5] if samples else []
     growth = slope_mib_per_hour(after_warmup)
     warm = next((s for s in samples if s[0] >= samples[-1][0] / 5), samples[0]) if samples else None
@@ -366,6 +455,26 @@ def main() -> int:
     if samples and warm:
         print(f"resident memory: {warm[1] / 2**20:.0f} MiB after the warm-up, {samples[-1][1] / 2**20:.0f} MiB at the end, "
               f"slope {growth:+.1f} MiB/h; handles {warm[2]} -> {samples[-1][2]}, threads {warm[3]} -> {samples[-1][3]}")
+    if metrics:
+        # Each gauge's slope after the warm-up: bytes in MiB/h, the rest in units/h; the
+        # counters (`_total`, histograms) only ever rise, left out.
+        warm_t = metrics[-1][0] / 5
+        print("slopes after the warm-up, per hour (start -> end):")
+        rows = []
+        for name in names:
+            if name.split("{")[0].endswith(("_total", "_bucket", "_count", "_sum")):
+                continue
+            points = [(t, g[name]) for t, g in metrics if t >= warm_t and name in g]
+            if len(points) < 3:
+                continue
+            scale = 2**20 if "bytes" in name else 1
+            slope = slope_per_hour([(t, v / scale) for t, v in points])
+            if points[0][1] == points[-1][1] and slope == 0:
+                continue
+            rows.append((abs(slope) * (1 if scale > 1 else 0), name, slope, points[0][1] / scale,
+                         points[-1][1] / scale, "MiB" if scale > 1 else ""))
+        for _, name, slope, first, last, unit in sorted(rows, key=lambda r: (-r[0], r[1])):
+            print(f"  {name:62s} {slope:+12.2f} {unit}/h  ({first:,.1f} -> {last:,.1f})")
     shutil.rmtree(store, ignore_errors=True)
     lost = not expected <= held <= expected + ambiguous
     failed = stats.error_count > 0 or lost or growth > args.max_growth_mib_per_hour

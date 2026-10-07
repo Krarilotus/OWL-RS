@@ -78,8 +78,24 @@ nrese_query_cache_misses_total {}
 # HELP nrese_query_cache_bytes Bytes held by the query result cache.
 # TYPE nrese_query_cache_bytes gauge
 nrese_query_cache_bytes {}
+# HELP nrese_query_cache_entries Entries of the result cache: parts' id columns and answers' bytes.
+# TYPE nrese_query_cache_entries gauge
+nrese_query_cache_entries{{kind=\"parts\"}} {}
+nrese_query_cache_entries{{kind=\"answers\"}} {}
+# HELP nrese_sessions_open Client transactions open (idle ones until the next begin drops them).
+# TYPE nrese_sessions_open gauge
+nrese_sessions_open {}
+# HELP nrese_queries_running Queries running now.
+# TYPE nrese_queries_running gauge
+nrese_queries_running {}
 ",
-        cache.hits, cache.misses, cache.bytes,
+        cache.hits,
+        cache.misses,
+        cache.bytes,
+        cache.entries - cache.answers,
+        cache.answers,
+        state.store().sessions().len(),
+        state.store().running_queries().list().len(),
     ));
     if let Some((used, peak, limit)) = state.store().query_memory() {
         body.push_str(&format!(
@@ -134,6 +150,39 @@ nrese_dictionary_bytes{{part=\"mapped\"}} {}
         engine.dictionary.arena_bytes,
         engine.dictionary.index_bytes,
         engine.dictionary.mapped_bytes,
+    ));
+    body.push_str(&format!(
+        "# HELP nrese_text_index_terms Terms the full-text indexes cover (none until a query searches text).
+# TYPE nrese_text_index_terms gauge
+nrese_text_index_terms {}
+",
+        engine.dictionary.text_covered
+    ));
+    // What the allocator holds for the process (mimalloc's committed memory), and, in
+    // builds that count every allocation (`--cfg alloc_profile`), what the program holds.
+    let mut committed = 0usize;
+    // SAFETY: every out-parameter is null but `committed`, a valid, writable usize.
+    unsafe {
+        libmimalloc_sys::mi_process_info(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut committed,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+    }
+    body.push_str(&format!(
+        "# HELP nrese_allocator_bytes What the allocator holds: committed (mimalloc's); live (allocated and not freed) and peak (the most live at once since the start), only in builds with `--cfg alloc_profile`, else 0.
+# TYPE nrese_allocator_bytes gauge
+nrese_allocator_bytes{{kind=\"committed\"}} {committed}
+nrese_allocator_bytes{{kind=\"live\"}} {}
+nrese_allocator_bytes{{kind=\"peak\"}} {}
+",
+        nrese_exec::heap::live(),
+        nrese_exec::heap::peak()
     ));
     if let Some(resident) = resident_bytes() {
         body.push_str(&format!(
