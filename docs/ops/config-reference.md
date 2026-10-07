@@ -182,6 +182,11 @@ api_key = "replace-me"
 - default: `true`
 - on disk, once a checkpoint is written (after a bulk load, and by background or explicit checkpoints) the data it holds is served from the file, mapped, as after a restart, and its copies in memory are freed: memory then grows with what queries touch, and the OS can page out the rest. `false` keeps everything in memory as well (the file is still written)
 
+- file key: `store.checkpoint_after_wal`
+- env override: `NRESE_CHECKPOINT_AFTER_WAL_BYTES`
+- default: `256MiB`
+- on disk, a checkpoint is written in the background once the write-ahead log has grown by this much since the last one. Smaller: a restart replays less, and the WAL takes less disk; larger: fewer checkpoints written under heavy writing. The checkpoint covers the whole store, so its cost grows with the data, not with the log
+
 - file key: `store.wal_archive`
 - env override: `NRESE_WAL_ARCHIVE`
 - default: `false`
@@ -274,6 +279,7 @@ Every limit on memory, time and request size is in one table, `[budgets]`. Value
 | `budgets.query_memory` | `NRESE_MAX_QUERY_MEMORY_BYTES` | 4 GiB | Intermediate results of one query. A query that needs more is answered `413`. `0` = unlimited |
 | `budgets.total_query_memory` | `NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES` | 50 % of the machine's memory | Intermediate results of all running queries together. A query that asks for more than is left is answered `503` and may succeed later. `0` = unlimited |
 | `budgets.process_memory` | `NRESE_PROCESS_MEMORY_BYTES` | 75 % of the machine's memory (the container's limit where there is one) | The private memory (mapped store files excluded) the server may hold before a long operation stops instead of taking the machine: a materialisation (load, startup, change of rules) or the reasoning of a commit ends with an error and applies nothing. A size (`48 GiB`) or a share (`60%`); `0` = unlimited |
+| `budgets.huge_pages` | `NRESE_HUGE_PAGES` | `on` | Whether transparent huge pages may back the server's memory (Linux; elsewhere nothing changes). `on`: work over large heaps runs faster (LUBM 100's materialisation 26 % faster), but while serving many small requests the allocator holds about 2.7 times the memory (a whole 2 MiB page resident for a touched byte). `off`: less memory held while serving, slower materialisation. See [server-setup.md](server-setup.md) §12.1 |
 | `budgets.bulk_load_memory` | `NRESE_BULK_LOAD_MEMORY` | 25 % of the machine's memory | The quads of a bulk load (`nrese-server load`, or a load into an empty store). Past it they are sorted in chunks of a third of it (one filling, one being sorted, its sorted copy), spilled to `bulk-spill/` in the data directory and merged into each index permutation while the checkpoint is written: one more pass over the disk, but the load's quads take this much plus one packed permutation whatever the data's size. The dictionary is apart (it grows with the distinct terms). Needs `store.map_checkpoints`. `0` = unlimited |
 | `budgets.query_timeout` | `NRESE_QUERY_TIMEOUT_MS` | 30 s | A query, until its last result is sent (`408`) |
 | `budgets.update_timeout` | `NRESE_UPDATE_TIMEOUT_MS` | 60 s | A SPARQL update, reasoning included |

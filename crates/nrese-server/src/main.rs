@@ -16,8 +16,24 @@ use nrese_server::{
 
 /// mimalloc (Pf7a): 7-20% faster query sets and 30% faster bulk loads than the system
 /// allocator in the perf lab (benches/baselines/perf-lab/2026-09-27-r198-*).
+#[cfg(not(any(system_alloc, alloc_profile)))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// `RUSTFLAGS="--cfg system_alloc"`: the system allocator, to compare (with `alloc_profile`
+/// too: the system allocator, counted).
+#[cfg(all(system_alloc, alloc_profile))]
+#[global_allocator]
+static GLOBAL: nrese_exec::heap::Counting<std::alloc::System> =
+    nrese_exec::heap::Counting(std::alloc::System);
+
+/// `RUSTFLAGS="--cfg alloc_profile"`: mimalloc with every allocation counted, so /metrics
+/// shows the bytes the program holds beside what the process holds (soak runs: growth
+/// that is the program's, or the allocator's). The counting slows allocation-heavy work.
+#[cfg(all(alloc_profile, not(system_alloc)))]
+#[global_allocator]
+static GLOBAL: nrese_exec::heap::Counting<mimalloc::MiMalloc> =
+    nrese_exec::heap::Counting(mimalloc::MiMalloc);
 
 fn main() -> Result<()> {
     // Built for a CPU with more than this one has (NRESE_TARGET_CPU): stop here, with the
