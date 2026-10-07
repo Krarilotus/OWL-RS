@@ -79,6 +79,7 @@ pub(crate) fn check_commit(
     tx: &Transaction<'_>,
     cancelled: &(dyn Fn() -> bool + Sync),
     preparation: &mut super::bounds::Preparation,
+    reader: &crate::ReadScope,
 ) -> Gate {
     if store.config().dl.consistency == DlConsistency::Off {
         return Gate {
@@ -152,11 +153,28 @@ pub(crate) fn check_commit(
         tx.decode(nrese_engine::TermId::from_raw(t))
             .map_or_else(|| format!("#{t}"), |term| term.to_string())
     };
-    let evidence: Vec<nrese_reasoner::RejectEvidence> = justification
+    // The committer sees the axioms of the graphs it may read; the others are withheld,
+    // and counted (graph access: nothing from a graph a reader can't read reaches it).
+    let readable = |graph: &Option<String>| match reader.access() {
+        None => true,
+        Some(access) => match graph {
+            None => access.default_graph,
+            // As the source gives it: `<iri>`.
+            Some(graph) => access.allows(graph.trim_start_matches('<').trim_end_matches('>')),
+        },
+    };
+    let mut withheld = 0usize;
+    let mut evidence: Vec<nrese_reasoner::RejectEvidence> = Vec::new();
+    for axiom in justification
         .iter()
         .flat_map(|j| super::explain::explained(&ontology, j, &decode))
-        .flat_map(|axiom| {
-            axiom.sources.into_iter().flat_map(|(_, triples)| {
+    {
+        for (graph, triples) in axiom.sources {
+            if !readable(&graph) {
+                withheld += triples.len();
+                continue;
+            }
+            evidence.extend(
                 triples
                     .into_iter()
                     .map(|[s, p, o]| nrese_reasoner::RejectEvidence {
@@ -165,14 +183,18 @@ pub(crate) fn check_commit(
                         predicate: p,
                         object: o,
                         origin: "asserted".to_owned(),
-                    })
-            })
-        })
-        .collect();
+                    }),
+            );
+        }
+    }
     let axioms = justification.as_ref().map_or(0, |j| j.axioms.len());
+    let hidden = match withheld {
+        0 => String::new(),
+        n => format!(" ({n} of their statements are in graphs you can't read, not shown)"),
+    };
     let reject = Some(format!(
         "the mutation makes the data inconsistent under OWL 2 DL (found by the {} in {} ms); \
-         {axioms} axiom(s) have no model together",
+         {axioms} axiom(s) have no model together{hidden}",
         checked.engine,
         checked.elapsed.as_millis()
     ));
