@@ -31,6 +31,7 @@ pub mod group;
 pub mod heap;
 pub mod join;
 pub mod memory;
+pub mod search;
 pub mod sort;
 pub mod table;
 
