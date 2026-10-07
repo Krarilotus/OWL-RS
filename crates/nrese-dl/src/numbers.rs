@@ -9,17 +9,34 @@
 //! 2. [`closure`]: the sizes and edge counts the problem fixes, or a [`Refutation`]. Sound
 //!    for any problem: its axioms are a subset of the ontology's.
 //! 3. [`candidate`]: a compressed model built from the counts, untrusted.
+//! 4. [`validate`]: an independent check of a candidate against the ontology's axioms,
+//!    the only way to [`Validated`] and so to "consistent".
 //!
-//! Nothing here claims a model yet.
+//! Anything else (a problem outside the fragment, no candidate, a candidate the validator
+//! declines) answers nothing: the search decides.
 
 pub mod candidate;
 pub mod closure;
 pub mod problem;
+pub mod validate;
 
 pub use closure::Refutation;
 use nrese_owl::Ontology;
+pub use validate::Validated;
 
 /// Whether the counts the axioms fix refute `ontology` (layers 1 and 2).
 pub fn refute(ontology: &Ontology) -> Option<Refutation> {
     closure::close(&problem::extract(ontology)).err()
+}
+
+/// A model of `ontology` from its counts, checked (layers 1 to 4); `None` where the module
+/// can't show one.
+pub fn model(ontology: &Ontology) -> Option<Validated> {
+    let p = problem::extract(ontology);
+    if !p.complete() {
+        return None;
+    }
+    let counts = closure::close(&p).ok()?;
+    let candidate = candidate::construct(&p, &counts)?;
+    validate::validate(ontology, &candidate).ok()
 }
