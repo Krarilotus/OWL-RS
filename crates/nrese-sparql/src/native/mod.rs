@@ -320,7 +320,24 @@ fn ql_stage(
         }
         Form::Describe => (None, true),
     };
-    let (out, mut report) = ql::rewrite_query(pattern, &tbox, snapshot, ql.limits(), needed, set);
+    // A witness the data already has wherever it folds adds nothing (design §3), asked of
+    // the data the query reads: for a reader of every graph (the cache is the store's).
+    let data = options.access.is_none().then(|| ql::DataCheck {
+        ql,
+        options: QueryOptions {
+            ql: None,
+            ..options.clone()
+        },
+    });
+    let (out, mut report) = ql::rewrite_query(
+        pattern,
+        &tbox,
+        snapshot,
+        ql.limits(),
+        needed,
+        set,
+        data.as_ref(),
+    );
     report.completeness.regime = Some(regime);
     let changed = report.patterns > 0;
     (changed.then_some(out), Some(report))

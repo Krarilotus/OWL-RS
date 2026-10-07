@@ -202,6 +202,7 @@ fn ql_json(report: Option<&nrese_sparql::ql::QlReport>) -> serde_json::Value {
                 .collect::<Vec<_>>(),
             "patterns": r.patterns,
             "witnesses": r.witnesses,
+            "realised": r.realised,
             "branches": r.branches,
             "atoms": r.atoms,
             "limits": r.limits,
