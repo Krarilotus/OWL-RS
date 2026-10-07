@@ -123,7 +123,16 @@ pub fn print<V: ReadView>(
         Query::Describe { pattern, .. } => (pattern, None, true),
     };
     let (rewritten, report) =
-        crate::native::ql::rewrite_query(pattern, &tbox, snapshot, &Limits::default(), needed, set);
+        // Without the data check: the printed query holds for any data.
+        crate::native::ql::rewrite_query(
+            pattern,
+            &tbox,
+            snapshot,
+            &Limits::default(),
+            needed,
+            set,
+            None,
+        );
     // NRESE's own status goes with the printed query: the same answers, so the same
     // completeness. What only the printer can't write is below.
 

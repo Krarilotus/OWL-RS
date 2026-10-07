@@ -786,6 +786,13 @@ fn store_rows(store: &StoreService, query: &str) -> Vec<Vec<usize>> {
 }
 
 /// [`store_rows`], and whether the store says they are complete (with its reasons).
+/// What the rewriting did for a query.
+fn store_report(store: &StoreService, query: &str) -> Option<nrese_sparql::ql::QlReport> {
+    let mut request = SparqlQueryRequest::all(query);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    store.execute_query(&request).ok()?.ql
+}
+
 fn store_answer(store: &StoreService, query: &str) -> (Vec<Vec<usize>>, Completeness) {
     let mut request = SparqlQueryRequest::all(query);
     request.solutions_format = SolutionsResultFormat::Tsv;
@@ -852,6 +859,8 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
         .unwrap_or(0x9e37_79b9_7f4a_7c15);
     let mut rng = Rng(seed);
     let (mut checked, mut skipped, mut gained) = (0, 0, 0);
+    // Witnesses the data had wherever they fold (not folded, design §3).
+    let mut realised = 0;
     for case in 0..cases {
         let tbox = random_tbox(&mut rng);
         let mut types = Vec::new();
@@ -903,6 +912,7 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
         let without = store(&turtle, dir.path(), ruleset, false);
         for query in &queries {
             let certain = chase.answers(query);
+            realised += store_report(&with, &query.sparql(false)).map_or(0, |r| r.realised);
             let (rows, completeness) = store_answer(&with, &query.sparql(true));
             let distinct: BTreeSet<Vec<usize>> = rows.into_iter().collect();
             // Pure QL: nothing the rewriting doesn't follow.
@@ -950,7 +960,11 @@ fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
         }
     }
     eprintln!(
-        "QL differential: {checked} queries checked, {gained} answers only through the rewriting, {skipped} cases skipped (chase too large)"
+        "QL differential: {checked} queries checked, {gained} answers only through the rewriting, {realised} witnesses the data had (not folded), {skipped} cases skipped (chase too large)"
+    );
+    assert!(
+        realised > 0,
+        "no witness the data had: the check went untested"
     );
     assert!(checked >= cases * 3, "too many cases skipped: {skipped}");
     assert!(gained > 0, "no case exercised the rewriting");

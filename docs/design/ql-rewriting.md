@@ -113,7 +113,30 @@ their multiplicities, plus **one row per answer that only the rewriting finds**:
 `P ∪ (DISTINCT π_V(rewriting) FILTER NOT EXISTS P)`, `V` its non-existential variables.
 So queries without witnesses keep their bags exactly, and no answer is counted twice.
 `COUNT(*)` reads every variable of the solutions it counts, so none of them is existential
-for it; `COUNT(?x)` reads only `?x`.
+for it; `COUNT(?x)` reads only `?x`. The union of the bag form leaves out the branch that is
+`P` as written: its rows are `P`'s, all filtered out again. A group none of whose
+aggregates depends on how often a row comes (`MIN`, `MAX`, `SAMPLE`, the `DISTINCT` ones,
+none) reads a set: the plain union.
+
+**No cost where the rewriting adds nothing** (7 October). Before a witness is folded, the
+data the query reads is asked whether every individual of each concept the witness folds
+to already has the witness's tree (`ASK { ?r a C FILTER NOT EXISTS { tree(?r) } }`, per
+concept). If so, every branch that folds it gives only what the same branch without it
+gives, so the witness goes, as a witness the rest of the query implies does (§2,
+Ontop's CQ subsumption, decided here by the data instead of the TBox). Where no witness is
+left the pattern runs as written. The answer is cached per snapshot revision and question
+in the store's rewriting (the first query after a commit asks again), asked only for a
+reader of every graph (a restricted reader keeps the whole rewriting), and EXPLAIN counts
+the witnesses left out (`ql.realised`) and the questions asked (`ql.checks`). Bounded like
+the rewriting (§5), counted, not timed: at most 16 questions per query and 1,000,000
+statements per question (the concept's and the tree's predicates', counted before it
+runs); past them a witness is folded unasked. A question runs under the query's own
+options (cancellation, memory budget). The printer doesn't ask: its queries hold for any
+data. On NPD's data 9 of the 12 rewritten queries have their witness in the data and run
+as written (`benches/reasoning/queries/npd-stress/README.md`); the random cases of the
+differential test leave out 47 witnesses in 600 queries with every answer still the chase's
+(`rewritten_answers_are_the_certain_answers_of_random_ql_cases`; guard
+`witnesses_the_data_has_are_not_folded`).
 
 ## 4. Switching it on
 
