@@ -10,7 +10,8 @@
 //!   is regular (its properties precede its superproperty, which may stand at either end).
 //!   [`Profile`]s choose the constructors: EL (what the EL classifier reads), or all of
 //!   SROIQ(D) with data, nominals and numbers on or off.
-//! - **The transformations** ([`rename`], [`shuffle`], [`add_redundant`], [`define_fresh`])
+//! - **The transformations** ([`rename`], [`shuffle`], [`add_redundant`], [`define_fresh`],
+//!   [`encode_complements`])
 //!   leave the entailments over the original signature as they are (renaming: up to the
 //!   renaming), so an engine's answers must not change (§11's metamorphic tests).
 //!
@@ -952,6 +953,100 @@ pub fn define_fresh(o: &Ontology, count: usize, fresh: &mut dyn FnMut() -> Term)
         out.axioms
             .push(Axiom::EquivalentClasses(canonical(vec![f, e])));
         done += 1;
+    }
+    out.sources.resize(out.axioms.len(), Vec::new());
+    out
+}
+
+/// `o` with the complements `¬C` of up to `count` named classes written as OWL Lite has to
+/// (OilEd's encoding): a fresh `C'` in their place, with `C ≡ ≥ 1 P` and `C' ≡ = 0 P` over a
+/// fresh property `P`. A conservative extension (`P` relates each element of `C` to itself,
+/// and `C'` is `¬C`): what follows over the original signature doesn't change.
+pub fn encode_complements(o: &Ontology, count: usize, fresh: &mut dyn FnMut() -> Term) -> Ontology {
+    fn encode(
+        out: &mut Ontology,
+        e: ExprId,
+        names: &mut Vec<(Term, Term)>,
+        count: usize,
+        fresh: &mut dyn FnMut() -> Term,
+    ) -> ExprId {
+        let expr = out.classes.get(e.0).clone();
+        let mut one = |out: &mut Ontology, x: ExprId| encode(out, x, names, count, fresh);
+        let rebuilt = match expr {
+            ClassExpr::Not(x) => match *out.classes.get(x.0) {
+                ClassExpr::Class(c) => {
+                    let known = names.iter().find(|&&(d, _)| d == c).map(|&(_, n)| n);
+                    let name = match known {
+                        Some(n) => n,
+                        None if names.len() < count => {
+                            let n = fresh();
+                            names.push((c, n));
+                            n
+                        }
+                        None => return e,
+                    };
+                    ClassExpr::Class(name)
+                }
+                _ => ClassExpr::Not(one(out, x)),
+            },
+            ClassExpr::And(xs) => {
+                ClassExpr::And(canonical(xs.iter().map(|&x| one(out, x)).collect()))
+            }
+            ClassExpr::Or(xs) => {
+                ClassExpr::Or(canonical(xs.iter().map(|&x| one(out, x)).collect()))
+            }
+            ClassExpr::Some(r, x) => ClassExpr::Some(r, one(out, x)),
+            ClassExpr::All(r, x) => ClassExpr::All(r, one(out, x)),
+            ClassExpr::Min(n, r, x) => ClassExpr::Min(n, r, one(out, x)),
+            ClassExpr::Max(n, r, x) => ClassExpr::Max(n, r, one(out, x)),
+            ClassExpr::Exact(n, r, x) => ClassExpr::Exact(n, r, one(out, x)),
+            _ => return e,
+        };
+        ExprId(out.classes.intern(rebuilt))
+    }
+    let mut out = o.clone();
+    let mut names: Vec<(Term, Term)> = Vec::new();
+    for i in 0..out.axioms.len() {
+        let mut f = |out: &mut Ontology, x: ExprId| encode(out, x, &mut names, count, fresh);
+        let axiom = out.axioms[i].clone();
+        out.axioms[i] = match axiom {
+            Axiom::SubClassOf(a, b) => {
+                let a = f(&mut out, a);
+                Axiom::SubClassOf(a, f(&mut out, b))
+            }
+            Axiom::EquivalentClasses(xs) => {
+                Axiom::EquivalentClasses(canonical(xs.iter().map(|&x| f(&mut out, x)).collect()))
+            }
+            Axiom::DisjointClasses(xs) => {
+                Axiom::DisjointClasses(canonical(xs.iter().map(|&x| f(&mut out, x)).collect()))
+            }
+            Axiom::ObjectPropertyDomain(r, x) => Axiom::ObjectPropertyDomain(r, f(&mut out, x)),
+            Axiom::ObjectPropertyRange(r, x) => Axiom::ObjectPropertyRange(r, f(&mut out, x)),
+            Axiom::ClassAssertion(x, a) => Axiom::ClassAssertion(f(&mut out, x), a),
+            other => other,
+        };
+    }
+    let thing = ExprId(out.classes.intern(ClassExpr::Thing));
+    for (c, name) in names {
+        let p = fresh();
+        let (c, name) = (
+            ExprId(out.classes.intern(ClassExpr::Class(c))),
+            ExprId(out.classes.intern(ClassExpr::Class(name))),
+        );
+        let some = ExprId(
+            out.classes
+                .intern(ClassExpr::Min(1, ObjProp::Named(p), thing)),
+        );
+        let none = ExprId(
+            out.classes
+                .intern(ClassExpr::Exact(0, ObjProp::Named(p), thing)),
+        );
+        out.axioms
+            .push(Axiom::Declaration(EntityKind::ObjectProperty, p));
+        out.axioms
+            .push(Axiom::EquivalentClasses(canonical(vec![c, some])));
+        out.axioms
+            .push(Axiom::EquivalentClasses(canonical(vec![name, none])));
     }
     out.sources.resize(out.axioms.len(), Vec::new());
     out
