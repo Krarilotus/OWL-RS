@@ -24,6 +24,12 @@ Two research rounds agree on the design:
 - the 6 October report, *Equality as a shared service*: Motik et al. 2015, B/F≈,
   Nieuwenhuis–Oliveras proof-producing union-find, Flatt et al., egglog, HermiT.
 
+The research agent checked the 6 October report against the papers (wiki: *Store-2 equality*;
+`reports/round4/chatgpt-equality-service.md`). The architecture holds; five attributions
+were corrected, among them: the counting hybrid is Hu, Motik & Horrocks (AAAI 2018); the
+cost of rich provenance rests on Flatt et al.'s Table I; no paper fixes the smallest member
+as the representative, which is our policy.
+
 The 6 October report adds what §1 left open: why one shared data structure is wrong.
 
 - Path compression, rollback and split want contradictory structures.
