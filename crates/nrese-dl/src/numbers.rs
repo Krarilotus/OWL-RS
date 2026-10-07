@@ -14,6 +14,8 @@
 //! A class with two different sizes has no model, so neither has the ontology (the
 //! clauses used are a subset of its axioms). Nothing here claims a model.
 
+pub mod problem;
+
 use hashbrown::{HashMap, HashSet};
 use nrese_owl::{BodyAtom, Concept, Filler, HeadAtom, Normalised, ObjProp, Term, Var};
 

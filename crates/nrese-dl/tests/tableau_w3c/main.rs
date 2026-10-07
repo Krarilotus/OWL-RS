@@ -464,6 +464,32 @@ fn hard_search_tests_are_decided() {
     }
 }
 
+/// The integer-multiplication tests (DL-906, 907, 910) lie in the number module's fragment
+/// as the RDF reader gives them (`nrese_dl::numbers::problem`): every axiom read.
+#[test]
+fn the_multiplication_tests_are_number_problems() {
+    let Ok(text) = std::fs::read_to_string(suite_path()) else {
+        return;
+    };
+    let cases = read_cases(&text);
+    for name in [
+        "WebOnt-description-logic-906",
+        "WebOnt-description-logic-907",
+        "WebOnt-description-logic-910",
+    ] {
+        let case = cases
+            .iter()
+            .find(|c| c.name == name)
+            .expect("the suite has it");
+        let mut table = Table::default();
+        let premise = document(case, &["Premise", "Input"], &mut table)
+            .expect("a premise")
+            .expect("it reads");
+        let problem = nrese_dl::numbers::problem::extract(&premise);
+        assert!(problem.complete(), "{name}: {:?}", problem.outside);
+    }
+}
+
 /// The witness of every disputed test is a model of its premise.
 #[test]
 fn disputed_witnesses_are_models() {
