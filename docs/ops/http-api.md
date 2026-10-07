@@ -350,16 +350,20 @@ Every error is an `application/problem+json` document (RFC 9457), whoever answer
 | `nrese_ready`, `nrese_dataset_revision`, `nrese_store_quads`, `nrese_store_inferred`, `nrese_store_named_graphs` | Readiness and the dataset |
 | `nrese_reasoner_mode_info`, `nrese_store_mode_info` | Modes, as labels |
 | `nrese_query_cache_hits_total`, `nrese_query_cache_misses_total`, `nrese_query_cache_bytes` | The result cache: query parts answered from it, parts computed that could have been, bytes held |
+| `nrese_query_cache_entries{kind}` | Entries of the result cache: `parts` (id columns), `answers` (serialised bytes) |
+| `nrese_sessions_open`, `nrese_queries_running` | Client transactions open (idle ones until the next begins), queries running |
 | `nrese_query_memory_bytes`, `nrese_query_memory_peak_bytes`, `nrese_query_memory_limit_bytes` | Intermediate results of running queries, against `budgets.total_query_memory` |
 | `nrese_http_responses_total{kind, status}` | Responses by kind of request (`query`, `update`, `sparql` for the single endpoint, `graph_store`, `shacl`, `other`) and status class (`2xx` … `5xx`) |
 | `nrese_http_request_duration_seconds{kind}` | Histogram of the time to the response's start, by kind |
 | `nrese_http_requests_in_flight{kind}` | Requests begun and not yet answered (active and queued work), by kind |
 | `nrese_index_runs`, `nrese_index_bytes{place}` | Index runs; index data on the heap and mapped from the checkpoint |
 | `nrese_dictionary_terms`, `nrese_dictionary_bytes{part}` | Dictionary terms; their text, the heap's index, and what is mapped |
+| `nrese_text_index_terms` | Terms the full-text indexes cover (none until a query searches text) |
 | `nrese_wal_bytes_since_checkpoint`, `nrese_compactions_total`, `nrese_checkpoints_total` | What a restart would replay; run merges and checkpoints since start |
 | `nrese_vector_index_bytes` | The vector index (vectors and HNSW graphs) |
 | `nrese_derived_indexes_loaded_total` | Derived indexes (text, IRI text, vectors) read from `derived/` since start instead of built |
 | `nrese_support_sets_total{how}`, `nrese_support_views_total{how}`, `nrese_support_seconds_total{phase}` | Support graph sets for `inferred = "supported"`: computed afresh or updated for a commit, readers' views built or patched, and the time each took |
 | `nrese_process_resident_bytes` | Resident memory (Linux; mapped file pages included, which the OS can drop) |
+| `nrese_allocator_bytes{kind}` | The allocator: `committed` (what mimalloc holds for the process); `live` and `peak` (what the program holds now and held at most), only in builds with `--cfg alloc_profile`, else 0 ([server-setup.md](server-setup.md) §12.1) |
 | `nrese_backups_total{kind, outcome}` | Backups and restores (`dump`: N-Quads export, `image`, `restore`) that succeeded (`ok`) or `failed` |
 | `nrese_backup_last_success_timestamp_seconds{kind}`, `nrese_backup_last_duration_seconds{kind}`, `nrese_backup_last_bytes{kind}` | The last success of each kind: when it ended (0: none since start), how long it took, its size (for alerting on stale backups) |

@@ -312,6 +312,37 @@ server {
 - P99 update commit latency target: `<2 s` for moderate update transactions.
 - Error budget policy SHOULD define rollback gates for releases.
 
+### 12.1 Memory over time: what grows, and where it stops
+
+A server under steady load grows in memory for a while and then levels off. What the
+program holds stops growing once its working set is in place; what can keep growing
+grows with the data by design. Each part has a gauge in `/metrics`:
+
+| What | Grows with | Stops at | Gauge |
+|---|---|---|---|
+| The data and its indexes | the statements | the data | `nrese_index_bytes`, `nrese_store_quads` |
+| The dictionary | every distinct term ever written (append-only: a term deleted from the data keeps its entry) | the distinct terms; a store that keeps receiving new terms grows without bound, by design | `nrese_dictionary_terms`, `nrese_dictionary_bytes` |
+| The full-text index | the dictionary's literals, from the first text search on | as the dictionary | `nrese_text_index_terms` |
+| The result cache | repeated queries on an unchanged store (a commit makes it start over) | `budgets.result_cache` | `nrese_query_cache_bytes` |
+| The write-ahead log (on disk, not in memory) | writes | `store.checkpoint_after_wal`, then a checkpoint | `nrese_wal_bytes_since_checkpoint` |
+| Sessions, running queries | open client transactions, queries | their end (an idle session after ten minutes) | `nrese_sessions_open`, `nrese_queries_running` |
+| The allocator's memory | the most the program held at once, spread over its threads | what it reserved: it stops growing within minutes | `nrese_allocator_bytes{kind="committed"}` |
+
+The last line is most of a serving process's memory. In a soak of 16 clients (inserts,
+deletes, queries, transactions, the Graph Store; 7 October 2026) the program held about
+2 MiB once warm, and never more than 15 MiB at once, while the process held 250 to 330
+MiB: mimalloc backs its memory with transparent huge pages on Linux, where one touched
+byte makes 2 MiB resident and a page in use keeps the rest of its 2 MiB. That level moves
+within what mimalloc reserved (about 600 MiB there, reached in the first minutes) and does
+not leak: the program's own memory stays level (a test checks it,
+`crates/nrese-store/tests/memory_churn.rs`). With `budgets.huge_pages = "off"` the same
+soak held 95 to 120 MiB (the system allocator: 75 to 85 MiB), and materialising LUBM 100
+took 26 % longer. Choose `off` where serving memory matters more than reasoning speed.
+
+`benches/probes/soak.py` reads every gauge above beside resident memory and prints each
+one's slope; on Linux it also splits resident memory by mapping (the allocator, stacks,
+the store's mapped files, the binary).
+
 ## 13. Upgrade Strategy
 
 ### 13.1 Upgrading a Store (from `main` to v2)
