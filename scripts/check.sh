@@ -6,11 +6,12 @@
 # when that crate changed, or at a milestone. Benchmarks never run here.
 #
 # Usage: scripts/check.sh commit   pre-commit hook: the crates changed against HEAD
-#                                  (staged or not). fmt; clippy on them and their
-#                                  dependents; their fast tests.
+#                                  (staged or not). fmt; clippy on them; their
+#                                  dependents' libraries compile; their fast tests.
 #        scripts/check.sh push     pre-push hook: the crates changed since the upstream
-#                                  branch. fmt; clippy on them and their dependents; all
-#                                  their tests, the dependents' fast tests; the lock check.
+#                                  branch. fmt; clippy on them; all their tests, the
+#                                  dependents' fast tests; random tests on new seeds; the
+#                                  lock check.
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
 #
@@ -200,9 +201,16 @@ case "$mode" in
     echo "=== changed: ${changed[*]:-none}; depending on them: ${dependents[*]:-none}"
     step fmt cargo fmt --all --check
     if [ ${#changed[@]} -gt 0 ]; then
+      # Lints where code changed: every target of the changed crates. A dependent's code didn't
+      # change, so its lints can't either; what can break there is compiling against the new
+      # API. At commit that is checked on the dependents' libraries only; at push the
+      # dependents' tests are built and run anyway, which checks every target of theirs.
       # shellcheck disable=SC2046
-      step clippy "$guarded" clippy --locked $(package_args "${changed[@]}" "${dependents[@]}") \
-        --all-targets -- -D warnings
+      step clippy "$guarded" clippy --locked $(package_args "${changed[@]}") --all-targets -- -D warnings
+      if [ "$mode" = commit ] && [ ${#dependents[@]} -gt 0 ]; then
+        # shellcheck disable=SC2046
+        step "dependents compile" "$guarded" check --locked -q $(package_args "${dependents[@]}") --lib
+      fi
       if [ "$mode" = commit ]; then
         step test run_tests "${changed[@]}" -- "${changed[@]}"
       else
