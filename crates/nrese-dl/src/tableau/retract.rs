@@ -32,6 +32,10 @@ impl Engine<'_> {
         {
             return None;
         }
+        if self.restart_point.is_none() {
+            let first = self.frames.partition_point(|f| f.id <= self.floor);
+            self.restart_point = self.frames.get(first).cloned();
+        }
         // The closure: the frames above whose premise or failures name a retracted level.
         let mut levels = vec![k];
         let mut dependent = Vec::new();
@@ -49,6 +53,7 @@ impl Engine<'_> {
         }
         let mut frame = self.frames.remove(at);
         self.retract(&levels, mark, pending, pending_open);
+        self.last_retraction = self.next_level;
         let mut rest = dep;
         for &l in &levels {
             rest = self.deps.without(rest, l);
