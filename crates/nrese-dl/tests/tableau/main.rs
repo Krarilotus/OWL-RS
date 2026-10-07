@@ -12,13 +12,14 @@ use nrese_owl::{Axiom, Characteristic, ClassExpr, ObjProp, normalise};
 /// The answer under every combination of the switches; they must agree.
 fn answer(o: &nrese_owl::Ontology) -> Answer {
     let mut answers = Vec::new();
-    for bits in 0..32u32 {
+    for bits in 0..64u32 {
         let config = Config {
             semantic_branching: bits & 1 != 0,
             backjumping: bits & 2 != 0,
             anywhere_blocking: bits & 4 != 0,
             single_blocking: bits & 8 != 0,
             lazy_definitions: bits & 16 != 0,
+            complements: bits & 32 != 0,
             portfolio: false,
             check_blocking: true,
             ..Config::default()

@@ -114,6 +114,9 @@ pub struct Config {
     /// under-approximates such classes. Which clauses decide sooner depends on the
     /// ontology: with [`Config::portfolio`] both run side by side.
     pub lazy_definitions: bool,
+    /// Rewrite complementary definitions to one class and its negation
+    /// (`nrese_owl::Options::complements`); never when the model is kept.
+    pub complements: bool,
     /// Where lazy unfolding changes the clauses and two cores are free, race the plain and
     /// the unfolded clauses (`portfolio`), each with half the memory budget; else the
     /// unfolded clauses alone if this is off, the plain ones if cores are short.
@@ -144,6 +147,7 @@ impl Default for Config {
             max_memory: 4 << 30,
             keep_model: false,
             lazy_definitions: true,
+            complements: true,
             portfolio: true,
             cancel: None,
             expand_at_most_up_to: Options::default().expand_at_most_up_to,
@@ -209,6 +213,7 @@ pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
     let options = |lazy_definitions| Options {
         expand_at_most_up_to: config.expand_at_most_up_to,
         lazy_definitions,
+        complements: config.complements && !config.keep_model,
         exact_provenance: false,
     };
     if !config.lazy_definitions || config.keep_model {

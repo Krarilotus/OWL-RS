@@ -332,8 +332,24 @@ fn check_case(
         ..Config::default()
     };
     let renamed = fuzz::rename(o, &|t| t + 1000);
-    for (what, other) in [("renamed", renamed), ("shuffled", shuffled)] {
-        let answer = consistency(&other, &base).answer;
+    // Complements as OWL Lite writes them, read with the rewriting (`nrese_owl`'s
+    // `complements.rs`) and without.
+    let mut next = 1_000_000;
+    let encoded = fuzz::encode_complements(o, 3, &mut || {
+        next += 1;
+        next
+    });
+    let plain = Config {
+        complements: false,
+        ..base.clone()
+    };
+    for (what, other, config) in [
+        ("renamed", renamed, &base),
+        ("shuffled", shuffled, &base),
+        ("complements encoded", encoded.clone(), &base),
+        ("complements encoded, not rewritten", encoded, &plain),
+    ] {
+        let answer = consistency(&other, config).answer;
         if let Some(f) = &first
             && matches!(f, Answer::Consistent | Answer::Inconsistent)
             && matches!(answer, Answer::Consistent | Answer::Inconsistent)
@@ -364,6 +380,20 @@ fn answers_agree_with_the_semantics() {
 fn a_loop_folded_onto_its_blocker_is_untied() {
     let tally = campaign(94543, 144, Some(143));
     assert_eq!(tally.consistent, 1, "{tally:?}");
+}
+
+/// Guard (dynamic backtracking): seed 131, case 138 is inconsistent (a self-loop on a
+/// nominal whose successors need three successors with exactly two each). Retracting level
+/// 1 re-decided its disjunction on top; a later backtrack that couldn't retract (a merge
+/// since its culprit, level 2) restored level 2's checkpoint, older than the retraction:
+/// level 1's first choice stayed retracted, its new one was cut away, and the search found
+/// a model without the disjunction. Such a backtrack now starts the search again from
+/// before the first retraction. It failed the office campaign as "dynamic-backtracking
+/// changes the answer".
+#[test]
+fn a_backtrack_never_restores_a_point_older_than_a_retraction() {
+    let tally = campaign(131, 139, Some(138));
+    assert_eq!(tally.inconsistent, 1, "{tally:?}");
 }
 
 /// The random cases of `seed` (`only`: that one alone), each checked against the semantics.
