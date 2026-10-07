@@ -81,6 +81,90 @@ fn the_maintained_upper_bound_is_the_one_evaluated_afresh() {
     }
 }
 
+/// What U1 equates (a functional property over an existential, a key) gives it classes,
+/// kept by representatives: a commit then evaluates U1 afresh, one without classes keeps
+/// it by the delta executor. Either way the U1 a commit leaves is the one evaluated afresh.
+/// `NRESE_FUZZ_CASES` sets the seeds (ADR-0011's equality work: sweep about 200).
+#[test]
+fn the_upper_bound_with_equality_classes_is_the_one_evaluated_afresh() {
+    const EQUALITY: &str = ":Student rdfs:subClassOf [ a owl:Restriction ; \
+           owl:onProperty :enrollIn ; owl:someValuesFrom :Dept ] . \
+         :enrollIn a owl:FunctionalProperty . :Dept owl:hasKey ( :code ) . \
+         :A rdfs:subClassOf [ owl:unionOf ( :Dept :Lab ) ] .";
+    let seeds = std::env::var("NRESE_FUZZ_CASES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(8u64);
+    let (mut with_classes, mut by_delta) = (0, 0);
+    for seed in 0..seeds {
+        let dl = super::pipeline_with(nrese_store::DlConfig {
+            consistency: nrese_store::DlConsistency::Off,
+            ..nrese_store::DlConfig::default()
+        });
+        insert(&dl, EQUALITY).expect("schema");
+        let mut rng = Rng::new(seed);
+        let mut asserted: Vec<String> = Vec::new();
+        for step in 0..10 {
+            let (a, b) = (rng.below(5), rng.below(5));
+            let fact = match rng.below(4) {
+                0 => format!(":i{a} a :Student ."),
+                1 => format!(":i{a} :enrollIn :i{b} ."),
+                2 => format!(":i{a} :code {} .", rng.below(2)),
+                _ => format!(":i{a} a :A ."),
+            };
+            if !asserted.is_empty() && rng.one_in(3) {
+                let gone = asserted.remove(rng.below(asserted.len() as u64) as usize);
+                update(&dl, &format!("DELETE DATA {{ {gone} }}")).expect("delete");
+            } else {
+                insert(&dl, &fact).expect("insert");
+                asserted.push(fact);
+            }
+            let maintained = dl.store().dl_upper_facts(false).expect("U1");
+            let afresh = dl.store().dl_upper_facts(true).expect("U1 afresh");
+            assert_eq!(
+                canonical(&maintained),
+                canonical(&afresh),
+                "seed {seed}, step {step}"
+            );
+            match dl.store().dl_bounds().last {
+                "delta" => by_delta += 1,
+                _ => with_classes += 1,
+            }
+        }
+    }
+    // Both ways are taken.
+    assert!(
+        with_classes > 0 && by_delta > 0,
+        "{with_classes} afresh, {by_delta} by delta"
+    );
+}
+
+/// U1 equates both departments with its one constant for `∃enrollIn.Dept`: a class kept
+/// by a representative. Both are departments, as OWL 2 DL has it (each student's only
+/// `enrollIn` is a `Dept`), but U1's stack says so of the representative alone: read
+/// expanded, U1 bounds both; read as stored, the answer would say complete without one.
+/// U1's equality of the two departments is its own (an over-approximation): refuted.
+#[test]
+fn an_upper_bound_with_equality_classes_is_read_expanded() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":Student rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :enrollIn ; \
+           owl:someValuesFrom :Dept ] . :enrollIn a owl:FunctionalProperty . \
+         :s1 a :Student ; :enrollIn :d1 . :s2 a :Student ; :enrollIn :d2 .",
+    )
+    .expect("data");
+    let (rows, status) = super::queries::query(&dl, "SELECT ?x { ?x a :Dept }");
+    assert_eq!(rows, ["d1", "d2"], "{:?}", status.reasons());
+    assert!(status.is_complete(), "{:?}", status.reasons());
+    let (rows, status) = super::queries::query(&dl, "SELECT ?x { :d1 owl:sameAs ?x }");
+    assert!(
+        !rows.contains(&"d2".to_owned()),
+        "U1's equality is not an answer: {rows:?}"
+    );
+    assert!(status.is_complete(), "{:?}", status.reasons());
+}
+
 #[test]
 fn the_upper_bound_is_never_visible_as_inferred_data() {
     let dl = pipeline();

@@ -18,6 +18,15 @@
 //! **Data values by value** ([`Values`]): U1 reads every literal as its value's
 //! representative, so keys, `hasValue` and joins over data values match equal values
 //! written differently, as OWL 2 DL's identity of data values has it.
+//!
+//! **Equality by representatives** (ADR-0011's monotone backend, the reasoner's
+//! `materialise_representatives_until`): U1's `owl:sameAs` classes are kept as one
+//! representative each, never as the pairs of a class (OWL2Bench DL-1: one class of about
+//! 78 k terms, 6 × 10⁹ pairs). The stack holds the closure over representatives and each
+//! other identity as `identity sameAs representative`, which the upper view reads expanded
+//! ([`Upper::classes`]). A U1 with classes is evaluated afresh on each commit, as is one a
+//! commit's equality would give classes ([`Change::merges`]): the delta executor reads
+//! facts as stored, and a class that may split is never maintained.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
@@ -387,6 +396,16 @@ pub struct Change {
     remove: Vec<Triple>,
     program: Option<GroundProgram>,
     pub elapsed: Duration,
+    /// The change derives an equality between two terms: U1 then has classes, which it
+    /// keeps by representatives, so it is evaluated afresh instead.
+    merges: bool,
+}
+
+impl Change {
+    /// Whether the change equates two terms ([`Self::merges`] field).
+    pub fn merges(&self) -> bool {
+        self.merges
+    }
 }
 
 /// Why U1 isn't available: its evaluation ran out of its budget.
@@ -401,8 +420,12 @@ pub struct Upper {
     /// The program's facts.
     facts: HashSet<Triple>,
     pub stack: Stack,
-    /// The classes and properties U1 was compiled for: assertions over others change it.
+    /// The classes U1 was compiled for: memberships in others change it.
     signature: HashSet<u64>,
+    /// Its object and data properties: an assertion that uses one as the other kind, or
+    /// another property, changes it.
+    object_properties: HashSet<u64>,
+    data_properties: HashSet<u64>,
     /// The ground program of the delta executor, for the next commit.
     ground: Option<GroundProgram>,
     /// The literals U1 compares and their values' representatives. A commit's new
@@ -411,6 +434,8 @@ pub struct Upper {
     values: Mutex<Values>,
     /// The predicates whose values U1's rules compare ([`compared_predicates`]).
     compared: HashSet<u64>,
+    /// The `owl:sameAs` classes, by representative: the stack is over them.
+    classes: nrese_reasoner::representatives::EqualityClasses,
     rdf_type: u64,
     same_as: u64,
     /// How long the last evaluation or maintenance took.
@@ -520,20 +545,32 @@ impl Upper {
         input.extend(facts.iter().copied());
         input.sort_unstable();
         input.dedup();
-        let m = nrese_reasoner::batch::materialise_owned_until(input, &rules, None, &schema, stop)
-            .map_err(|_| GaveUp("the upper bound's evaluation was stopped".to_owned()))?;
+        // Equality by representatives: the closure over one term per class, the input's
+        // facts that mention a class rewritten beside it, each other identity placed in
+        // its class.
+        let m = nrese_reasoner::batch::materialise_representatives_until(
+            nrese_reasoner::batch::Input::Facts(input),
+            &rules,
+            None,
+            &schema,
+            nrese_reasoner::batch::Listing::Stored,
+            stop,
+        )
+        .map_err(|_| GaveUp("the upper bound's evaluation was stopped".to_owned()))?;
+        let same_as = program.names.same_as;
         let mut stack = Stack::default();
         for t in m.derived {
             stack.insert(t);
         }
+        for (representative, members) in m.classes.classes() {
+            for &member in members.iter().filter(|&&m| m != representative) {
+                stack.insert([member, same_as, representative]);
+            }
+        }
         let s = &program.signature;
-        let signature = s
-            .classes
-            .iter()
-            .chain(&s.object_properties)
-            .chain(&s.data_properties)
-            .copied()
-            .collect();
+        let signature = s.classes.iter().copied().collect();
+        let object_properties = s.object_properties.iter().copied().collect();
+        let data_properties = s.data_properties.iter().copied().collect();
         Ok(Self {
             rdf_type: program.names.rdf_type,
             same_as: program.names.same_as,
@@ -543,18 +580,22 @@ impl Upper {
             facts,
             stack,
             signature,
+            object_properties,
+            data_properties,
             ground: None,
             values: Mutex::new(values),
             compared,
+            classes: m.classes,
             elapsed: started.elapsed(),
         })
     }
 
     /// Whether a changed statement only asserts something about individuals over the
     /// signature U1 was compiled for, so U1's rules stay as they are: a class membership
-    /// in a known class, a known property between named individuals (or with a literal),
-    /// or an equality. Anything else (schema, blank nodes, OWL's vocabulary, new
-    /// vocabulary) means recompiling.
+    /// in a known class, an object property U1 knows as one between named individuals, a
+    /// data property it knows as one with a literal, or an equality. Anything else
+    /// (schema, blank nodes, OWL's vocabulary, new vocabulary, a property used as the
+    /// other kind, which the reading of the ontology then gives it) means recompiling.
     pub fn is_assertion(&self, [s, p, o]: Triple) -> bool {
         let named = |t: u64| TermId::from_raw(t).kind() == nrese_engine::TermKind::Iri;
         if !named(s) {
@@ -566,7 +607,8 @@ impl Upper {
         if p == self.same_as {
             return named(o);
         }
-        self.signature.contains(&p) && (named(o) || is_literal(o))
+        (named(o) && self.object_properties.contains(&p))
+            || (is_literal(o) && self.data_properties.contains(&p))
     }
 
     /// The stack's change for a commit, computed before it and applied after it
@@ -635,6 +677,11 @@ impl Upper {
         )
         .map_err(|_| GaveUp("the upper bound's maintenance was stopped".to_owned()))?;
         change.program = update.program;
+        // An equality the commit brings (the RL closure's, say: a functional property is
+        // OWL 2 RL) or U1 derives: U1 then has classes.
+        let same_as = self.same_as;
+        let equates = |t: &Triple| t[1] == same_as && t[0] != t[2];
+        change.merges = inserted.iter().any(equates) || update.insert.iter().any(equates);
         change.remove = update.remove;
         change.insert = update
             .insert
@@ -691,6 +738,18 @@ impl Upper {
     /// U1 checks every `⊥` ([`bounds::Program::proves_consistency`]).
     pub fn proves_consistency(&self) -> bool {
         self.program.proves_consistency() && self.clashes() == 0
+    }
+
+    /// U1's `owl:sameAs` classes: its stack is over their representatives, each other
+    /// identity stored as `identity sameAs representative`; empty where nothing is
+    /// equated. A U1 with classes is evaluated afresh on each commit.
+    pub fn classes(&self) -> &nrese_reasoner::representatives::EqualityClasses {
+        &self.classes
+    }
+
+    /// `owl:sameAs`, as U1's program names it.
+    pub fn same_as(&self) -> u64 {
+        self.same_as
     }
 
     /// How many literals U1 reads by value ([`Values`]).
