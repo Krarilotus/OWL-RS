@@ -64,6 +64,17 @@ pub fn set_process_limit(limit: u64) {
     PROCESS_OVER.store(false, Ordering::Relaxed);
 }
 
+/// Whether the process's anonymous memory may be backed by transparent huge pages
+/// (Linux; elsewhere there are none to switch, and nothing is done). An allocator that
+/// asks for them (mimalloc does, for its arenas) then makes a whole 2 MiB page resident
+/// for one touched byte, and gives back nothing of it while one of its small pages is in
+/// use: under a server's many threads that kept 3 times the memory the system allocator
+/// holds for the same work (soak, 7 October 2026). Applies from the next page touched,
+/// arenas reserved earlier included. Returns whether the setting was applied.
+pub fn set_transparent_huge_pages(allowed: bool) -> bool {
+    imp::set_transparent_huge_pages(allowed)
+}
+
 /// The process's memory limit, if one is set ([`set_process_limit`]).
 pub fn process_limit() -> Option<u64> {
     Some(PROCESS_LIMIT.load(Ordering::Relaxed)).filter(|&limit| limit > 0)
@@ -155,6 +166,11 @@ impl MemoryWatch {
 
 #[cfg(windows)]
 mod imp {
+    /// Windows backs no allocation with large pages unless asked (and privileged).
+    pub fn set_transparent_huge_pages(_allowed: bool) -> bool {
+        false
+    }
+
     use windows_sys::Win32::System::JobObjects::{
         JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -282,6 +298,27 @@ mod imp {
         Some(resident * PAGE)
     }
 
+    pub fn set_transparent_huge_pages(allowed: bool) -> bool {
+        use std::ffi::{c_int, c_ulong};
+        /// `prctl`'s option for the process's transparent huge pages (linux/prctl.h).
+        const PR_SET_THP_DISABLE: c_int = 41;
+        unsafe extern "C" {
+            fn prctl(option: c_int, ...) -> c_int;
+        }
+        let disable = c_ulong::from(!allowed);
+        // SAFETY: PR_SET_THP_DISABLE takes one integer argument (the rest must be zero)
+        // and reads no memory of ours.
+        unsafe {
+            prctl(
+                PR_SET_THP_DISABLE,
+                disable,
+                0 as c_ulong,
+                0 as c_ulong,
+                0 as c_ulong,
+            ) == 0
+        }
+    }
+
     pub fn peak_process_bytes() -> Option<u64> {
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
         let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
@@ -303,6 +340,10 @@ mod imp {
 
 #[cfg(not(any(windows, target_os = "linux")))]
 mod imp {
+    pub fn set_transparent_huge_pages(_allowed: bool) -> bool {
+        false
+    }
+
     pub fn process_bytes() -> Option<u64> {
         None
     }
@@ -480,5 +521,23 @@ mod tests {
         let watch = MemoryWatch::new(1);
         assert!(watch.exceeded());
         assert!(watch.exceeded());
+    }
+
+    /// Switched off, the kernel shows the process's huge pages off, and on again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transparent_huge_pages_switch_for_the_process() {
+        let state = || {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let line = status.lines().find(|l| l.starts_with("THP_enabled:"))?;
+            line.split_whitespace().nth(1).map(str::to_owned)
+        };
+        if state().is_none() {
+            return; // a kernel before 5.0 doesn't say
+        }
+        assert!(set_transparent_huge_pages(false));
+        assert_eq!(state().as_deref(), Some("0"));
+        assert!(set_transparent_huge_pages(true));
+        assert_eq!(state().as_deref(), Some("1"));
     }
 }

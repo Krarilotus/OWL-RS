@@ -79,6 +79,11 @@ impl StoreService {
         // Reasoning stops at the process's memory limit on every path, the DL bounds'
         // own evaluations included, not only where the store passes its watch.
         nrese_exec::memory::set_process_limit(config.process_memory_bytes);
+        // Only switched off: on leaves what the process was started with (an operator's
+        // `MIMALLOC_ALLOW_THP=0` switches them off the same way).
+        if !config.huge_pages {
+            nrese_exec::memory::set_transparent_huge_pages(false);
+        }
         let engine = match config.mode {
             StoreMode::InMemory => Engine::new(EngineConfig::default())?,
             StoreMode::OnDisk => {
@@ -87,6 +92,7 @@ impl StoreService {
                     durability: nrese_engine::DurabilityConfig {
                         verify_on_open: config.verify_on_open,
                         map_checkpoints: config.map_checkpoints,
+                        checkpoint_after_wal_bytes: config.checkpoint_after_wal_bytes,
                         bulk_load_memory: (config.bulk_load_memory_bytes > 0)
                             .then_some(config.bulk_load_memory_bytes),
                         wal_archive: config.wal_archive,

@@ -156,6 +156,13 @@ pub const SETTINGS: &[Setting] = &[
          (default true).",
     ),
     setting(
+        "store.checkpoint_after_wal",
+        names::CHECKPOINT_AFTER_WAL_BYTES,
+        Amount(Bytes),
+        "Write a checkpoint in the background once the write-ahead log has grown by this \
+         much since the last (default 256MiB).",
+    ),
+    setting(
         "store.wal_archive",
         names::WAL_ARCHIVE,
         Bool,
@@ -392,6 +399,13 @@ pub const SETTINGS: &[Setting] = &[
         Amount(BytesOrShare),
         "The memory the server may hold before a materialisation or a commit's reasoning \
          stops with an error instead of taking the machine; 0 is unlimited (default 75%).",
+    ),
+    setting(
+        "budgets.huge_pages",
+        names::HUGE_PAGES,
+        Choice(&["off", "on"]),
+        "Transparent huge pages for the server's memory (Linux): on is faster over large \
+         heaps, off holds less memory while serving (default on).",
     ),
     setting(
         "budgets.bulk_load_memory",
