@@ -81,6 +81,19 @@ The 6 October report adds what §1 left open: why one shared data structure is w
 **Datatype equality is a producer:** the datatype theory computes value equality and
 asserts it into the owning domain. It never makes two lexical terms one id.
 
+**Wording that binds every backend** (the research review of 7 October):
+- a representative's identity carries no meaning: only membership of a class does;
+- deleting a support is a capability of a storage policy (the persistent backend), not of
+  the equality service; the rollback union-find is the search's policy only, never a way to
+  delete;
+- explanations rest on the original equality edges and their justifications, never on a
+  representative staying the same.
+
+A split's cost of O(V_C + E_C) over the affected component is our own bound, not a
+published one. Faster fully dynamic connectivity exists (HDT; Huang, Huang, Kopelowitz,
+Pettie and Thorup, SODA 2017), but rebuilding the touched class stays the default until
+measurements show large classes and frequent deletes together.
+
 ## Consequences
 
 - G7's single kernel stays the monotone backend. The persistent backend is B3, owned by
