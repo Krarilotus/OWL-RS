@@ -122,6 +122,20 @@ impl Snapshot {
         }
     }
 
+    /// This snapshot reading the default graph expanded over the `owl:sameAs` classes of
+    /// its inferred stack (each identity other than its class's representative stored as
+    /// `identity sameAs representative`), as snapshots read with equality by
+    /// representatives on ([`crate::Engine::set_equality`]): for a stack kept so beside
+    /// the store's own, as the OWL 2 DL upper bound is (`nrese-store`'s `dl` module).
+    /// `None` reads the statements as stored ([`Self::stored`]).
+    pub fn with_equality(&self, same_as: Option<TermId>) -> Snapshot {
+        Snapshot {
+            equality: same_as,
+            canonical: false,
+            ..self.clone()
+        }
+    }
+
     /// This snapshot reading the statements as stored: no equality expansion.
     pub fn stored(&self) -> Snapshot {
         Snapshot {
