@@ -438,6 +438,9 @@ mod tests {
         assert!((plan.rows[1] - 30.0).abs() < 1e-9);
     }
 
+    /// BGPs too large for the exact order get a greedy one: a star of 14 patterns, and
+    /// chains beyond 64 (a 64-bit membership mask overflowed at 65 patterns: the review
+    /// of 3 October 2026, P2), up to 200 patterns over 201 variables.
     #[test]
     fn large_bgps_are_ordered_greedily() {
         let inputs: Vec<Input> = (0..14)
@@ -447,12 +450,6 @@ mod tests {
         let mut sorted = plan.order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..14).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn bgps_beyond_64_patterns_get_an_order() {
-        // A 64-bit membership mask overflowed at 65 patterns (the review of 3 October
-        // 2026, P2); a chain of 200 patterns over 201 variables.
         for n in [64usize, 65, 200] {
             let inputs: Vec<Input> = (0..n)
                 .map(|i| input(1_000 + i as u64, &[(i, 500), (i + 1, 500)]))
