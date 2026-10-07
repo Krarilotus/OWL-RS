@@ -14,7 +14,7 @@ mod witness;
 mod tests;
 
 pub use hazards::Hazard;
-pub use rewrite::{Branch, Limits, Outcome, Part, Probe, Rewriting, rewrite, rewrite_with};
+pub use rewrite::{Branch, Budget, Limits, Outcome, Part, Probe, Rewriting, rewrite, rewrite_with};
 pub use tbox::{Basic, Closure, Role, Tbox};
 
 use crate::model::Term;

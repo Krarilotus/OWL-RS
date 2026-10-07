@@ -54,6 +54,10 @@ impl Work {
     pub(crate) fn exhausted(&self) -> bool {
         self.0.get() == 0
     }
+
+    pub(crate) fn left(&self) -> usize {
+        self.0.get()
+    }
 }
 
 /// The query's tree witnesses; `Err` with the bound reached: more than `limit` witnesses,
