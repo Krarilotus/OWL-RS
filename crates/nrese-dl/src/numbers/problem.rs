@@ -206,60 +206,9 @@ pub(crate) mod tests {
     use super::*;
     use nrese_owl::DataRange;
 
-    /// DL-906's shape at `(n, m, k)`: `O ≡ {d} ≡ (= n p⁻) ≡ (= k r⁻)`, `N ≡ ∃p.O ≡ (= m q⁻)`,
-    /// `NM ≡ ∃q.N ≡ ∃r.O`, `p`, `q`, `r` functional with domains and ranges, `d : ⊤`.
+    /// DL-906's shape at `(n, m, k)` (`nrese_owl::fuzz::multiplication`).
     pub(crate) fn product(n: u32, m: u32, k: u32) -> Ontology {
-        let mut o = Ontology::default();
-        let (only_d, card_n, card_nm, d) = (1, 2, 3, 100);
-        let (p, inv_p, q, inv_q, r, inv_r) = (10, 11, 12, 13, 14, 15);
-        let e = |o: &mut Ontology, x: ClassExpr| ExprId(o.classes.intern(x));
-        let thing = e(&mut o, ClassExpr::Thing);
-        let [od, cn, cnm] = [only_d, card_n, card_nm].map(|c| e(&mut o, ClassExpr::Class(c)));
-        let one = e(&mut o, ClassExpr::OneOf(vec![d]));
-        let exact = |o: &mut Ontology, n: u32, r: Term| {
-            ExprId(
-                o.classes
-                    .intern(ClassExpr::Exact(n, ObjProp::Named(r), thing)),
-            )
-        };
-        let some = |o: &mut Ontology, r: Term, f: ExprId| {
-            ExprId(o.classes.intern(ClassExpr::Some(ObjProp::Named(r), f)))
-        };
-        let (n_p, k_r, m_q) = (
-            exact(&mut o, n, inv_p),
-            exact(&mut o, k, inv_r),
-            exact(&mut o, m, inv_q),
-        );
-        let (p_o, q_n, r_o) = (
-            some(&mut o, p, od),
-            some(&mut o, q, cn),
-            some(&mut o, r, od),
-        );
-        let mut axioms = vec![
-            Axiom::EquivalentClasses(vec![od, one]),
-            Axiom::EquivalentClasses(vec![od, n_p]),
-            Axiom::EquivalentClasses(vec![od, k_r]),
-            Axiom::EquivalentClasses(vec![cn, p_o]),
-            Axiom::EquivalentClasses(vec![cn, m_q]),
-            Axiom::EquivalentClasses(vec![cnm, q_n]),
-            Axiom::EquivalentClasses(vec![cnm, r_o]),
-            Axiom::ClassAssertion(thing, d),
-        ];
-        for (f, inv, dom, ran) in [(p, inv_p, cn, od), (q, inv_q, cnm, cn), (r, inv_r, cnm, od)] {
-            axioms.push(Axiom::ObjectCharacteristic(
-                Characteristic::Functional,
-                ObjProp::Named(f),
-            ));
-            axioms.push(Axiom::InverseObjectProperties(
-                ObjProp::Named(f),
-                ObjProp::Named(inv),
-            ));
-            axioms.push(Axiom::ObjectPropertyDomain(ObjProp::Named(f), dom));
-            axioms.push(Axiom::ObjectPropertyRange(ObjProp::Named(f), ran));
-        }
-        o.sources = vec![Vec::new(); axioms.len()];
-        o.axioms = axioms;
-        o
+        nrese_owl::fuzz::multiplication(n, m, k)
     }
 
     /// DL-906's shape lies in the fragment: every axiom read, inverses folded.

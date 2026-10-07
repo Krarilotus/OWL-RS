@@ -323,6 +323,20 @@ fn run(
     config: &Config,
 ) -> Outcome {
     let started = Instant::now();
+    // A model from the counts (docs/design/owl2-dl.md#number-reasoning-layers), checked
+    // against every axiom, answers before any search; it is compressed, so not where the
+    // caller wants the model.
+    if test.is_none() && !config.keep_model && crate::numbers::model(ontology).is_some() {
+        return Outcome {
+            answer: Answer::Consistent,
+            telemetry: Telemetry {
+                total: started.elapsed(),
+                ..Telemetry::default()
+            },
+            model: None,
+            features: Features::default(),
+        };
+    }
     let mut program = Program::compile(ontology, normalised);
     let test = test.map(|c| program.concept(ConceptName::Clause(c)));
     program.ensure_tables();

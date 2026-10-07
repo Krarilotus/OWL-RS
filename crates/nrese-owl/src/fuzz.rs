@@ -927,6 +927,67 @@ pub fn add_redundant(
     out
 }
 
+/// The terms of [`multiplication`]: the classes `only-d`, `N`, `NM`, the individual `d`,
+/// and the properties `p`, `p⁻`, `q`, `q⁻`, `r`, `r⁻` (named inverse pairs).
+pub const MULTIPLICATION_TERMS: ([Term; 3], Term, [Term; 6]) =
+    ([1, 2, 3], 100, [10, 11, 12, 13, 14, 15]);
+
+/// The W3C DL-906/907/910 family (integer multiplication through a nominal): `only-d ≡ {d}
+/// ≡ (= n p⁻) ≡ (= k r⁻)`, `N ≡ ∃p.only-d ≡ (= m q⁻)`, `NM ≡ ∃q.N ≡ ∃r.only-d`, `p`, `q`,
+/// `r` functional with domains and ranges, `d : ⊤`. Consistent iff `k = n · m`.
+pub fn multiplication(n: u32, m: u32, k: u32) -> Ontology {
+    let ([only_d, card_n, card_nm], d, [p, inv_p, q, inv_q, r, inv_r]) = MULTIPLICATION_TERMS;
+    let mut o = Ontology::default();
+    let e = |o: &mut Ontology, x: ClassExpr| ExprId(o.classes.intern(x));
+    let thing = e(&mut o, ClassExpr::Thing);
+    let [od, cn, cnm] = [only_d, card_n, card_nm].map(|c| e(&mut o, ClassExpr::Class(c)));
+    let one = e(&mut o, ClassExpr::OneOf(vec![d]));
+    let exact = |o: &mut Ontology, n: u32, r: Term| {
+        ExprId(
+            o.classes
+                .intern(ClassExpr::Exact(n, ObjProp::Named(r), thing)),
+        )
+    };
+    let some = |o: &mut Ontology, r: Term, f: ExprId| {
+        ExprId(o.classes.intern(ClassExpr::Some(ObjProp::Named(r), f)))
+    };
+    let (n_p, k_r, m_q) = (
+        exact(&mut o, n, inv_p),
+        exact(&mut o, k, inv_r),
+        exact(&mut o, m, inv_q),
+    );
+    let (p_o, q_n, r_o) = (
+        some(&mut o, p, od),
+        some(&mut o, q, cn),
+        some(&mut o, r, od),
+    );
+    let mut axioms = vec![
+        Axiom::EquivalentClasses(vec![od, one]),
+        Axiom::EquivalentClasses(vec![od, n_p]),
+        Axiom::EquivalentClasses(vec![od, k_r]),
+        Axiom::EquivalentClasses(vec![cn, p_o]),
+        Axiom::EquivalentClasses(vec![cn, m_q]),
+        Axiom::EquivalentClasses(vec![cnm, q_n]),
+        Axiom::EquivalentClasses(vec![cnm, r_o]),
+        Axiom::ClassAssertion(thing, d),
+    ];
+    for (f, inv, dom, ran) in [(p, inv_p, cn, od), (q, inv_q, cnm, cn), (r, inv_r, cnm, od)] {
+        axioms.push(Axiom::ObjectCharacteristic(
+            Characteristic::Functional,
+            ObjProp::Named(f),
+        ));
+        axioms.push(Axiom::InverseObjectProperties(
+            ObjProp::Named(f),
+            ObjProp::Named(inv),
+        ));
+        axioms.push(Axiom::ObjectPropertyDomain(ObjProp::Named(f), dom));
+        axioms.push(Axiom::ObjectPropertyRange(ObjProp::Named(f), ran));
+    }
+    o.sources = vec![Vec::new(); axioms.len()];
+    o.axioms = axioms;
+    o
+}
+
 /// `o` with up to `count` complex superclasses `E` of `A ⊑ E` given a fresh name: `F ≡ E`
 /// and `A ⊑ F`. The fresh names come from `fresh` (each a new class IRI, declared). A
 /// conservative extension: what follows over the original signature doesn't change.
