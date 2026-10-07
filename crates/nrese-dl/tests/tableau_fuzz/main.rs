@@ -397,6 +397,23 @@ fn a_loop_folded_onto_its_blocker_is_untied() {
     assert_eq!(tally.consistent, 1, "{tally:?}");
 }
 
+/// Guard (the oracle): seed 182, case 19 is consistent (individuals `a`, `b` and one more
+/// element in a cycle of an asymmetric property, a reflexive one beside it). The folded
+/// model closes a loop of the asymmetric property on its blocker; the lift has to untie
+/// that loop but keep the reflexive property's, and choosing once for all properties gave
+/// neither (seeds 182, 200, 268 and 403 of the office campaign, "consistent, but the
+/// folded model fails and no small model exists").
+#[test]
+fn a_lift_keeps_some_properties_loops_and_unties_others() {
+    let tally = campaign(182, 20, Some(19));
+    assert_eq!(tally.consistent, 1, "{tally:?}");
+    assert_eq!(
+        tally.confirmed_by_model + tally.confirmed_by_search,
+        1,
+        "{tally:?}"
+    );
+}
+
 /// Guard (dynamic backtracking): seed 131, case 138 is inconsistent (a self-loop on a
 /// nominal whose successors need three successors with exactly two each). Retracting level
 /// 1 re-decided its disjunction on top; a later backtrack that couldn't retract (a merge
