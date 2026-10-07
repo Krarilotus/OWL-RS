@@ -332,8 +332,24 @@ fn check_case(
         ..Config::default()
     };
     let renamed = fuzz::rename(o, &|t| t + 1000);
-    for (what, other) in [("renamed", renamed), ("shuffled", shuffled)] {
-        let answer = consistency(&other, &base).answer;
+    // Complements as OWL Lite writes them, read with the rewriting (`nrese_owl`'s
+    // `complements.rs`) and without.
+    let mut next = 1_000_000;
+    let encoded = fuzz::encode_complements(o, 3, &mut || {
+        next += 1;
+        next
+    });
+    let plain = Config {
+        complements: false,
+        ..base.clone()
+    };
+    for (what, other, config) in [
+        ("renamed", renamed, &base),
+        ("shuffled", shuffled, &base),
+        ("complements encoded", encoded.clone(), &base),
+        ("complements encoded, not rewritten", encoded, &plain),
+    ] {
+        let answer = consistency(&other, config).answer;
         if let Some(f) = &first
             && matches!(f, Answer::Consistent | Answer::Inconsistent)
             && matches!(answer, Answer::Consistent | Answer::Inconsistent)

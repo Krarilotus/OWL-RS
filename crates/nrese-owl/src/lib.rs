@@ -9,6 +9,7 @@
 
 mod automata;
 pub mod clauses;
+mod complements;
 mod definitions;
 pub mod diagnostics;
 pub mod functional;

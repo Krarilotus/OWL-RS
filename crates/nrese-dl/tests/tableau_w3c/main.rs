@@ -12,7 +12,7 @@
 //! - A conclusion's assertions about anonymous individuals are an existential: each
 //!   tree of them is rolled up into a class expression (`rollup`).
 //! - `NRESE_W3C_SWITCHES` (`no-disjunct-learning`, `full-blocking`,
-//!   `no-lazy-definitions`, comma-separated)
+//!   `no-lazy-definitions`, `no-complements`, comma-separated)
 //!   switches optimisations off, for A/B runs.
 //! - Every test ends as `pass`, `wrong`, or not decided with the reason (`unsupported`,
 //!   `gave-up`, `not-run`). A wrong answer fails the run; the rest is reported by test
@@ -123,6 +123,7 @@ fn base_config(secs: u64) -> Config {
         disjunct_learning: !off("no-disjunct-learning"),
         incremental_blocking: !off("full-blocking"),
         lazy_definitions: !off("no-lazy-definitions"),
+        complements: !off("no-complements"),
         ..Config::default()
     }
 }
@@ -424,7 +425,10 @@ fn read_cases(text: &str) -> Vec<Case> {
 /// formula as definitions, 20 s and given up before disjunct learning; HermiT 0.3 s),
 /// DL-206 (HermiT 3 s), DL-204 (k_grz: decided only with lazily unfolded definitions, in
 /// the portfolio) and DL-661 (k_branch: lazily unfolding definitions by restrictions too
-/// made it eight times slower). Guards of docs/design/performance.md §0.
+/// made it eight times slower); DL-662 to 664 (k_d4, k_dum, k_grz as OWL Lite writes them,
+/// complements through cardinalities: undecided until complementary definitions became one
+/// class and its negation, `nrese_owl`'s `complements.rs`; then k_d4 and k_dum by the plain
+/// clauses, k_grz by the unfolded ones). Guards of docs/design/performance.md §0.
 #[test]
 fn hard_search_tests_are_decided() {
     let Ok(text) = std::fs::read_to_string(suite_path()) else {
@@ -436,6 +440,9 @@ fn hard_search_tests_are_decided() {
         "WebOnt-description-logic-206",
         "WebOnt-description-logic-204",
         "WebOnt-description-logic-661",
+        "WebOnt-description-logic-662",
+        "WebOnt-description-logic-663",
+        "WebOnt-description-logic-664",
     ] {
         let case = read_cases(&text)
             .into_iter()
