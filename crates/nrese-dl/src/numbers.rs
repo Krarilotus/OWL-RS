@@ -1,4 +1,4 @@
-//! Arithmetic over counted classes (docs/design/owl2-dl.md, the number module's layer 2):
+//! Arithmetic over counted classes (docs/design/owl2-dl.md#number-reasoning-layers, layer 2):
 //! sizes of classes that the clauses fix exactly, compared before any search. The
 //! pigeonhole cases (W3C DL-906, 907, 910: integer multiplication through nominals and
 //! functional properties) are hard for merges, which are resolution, and trivial for
