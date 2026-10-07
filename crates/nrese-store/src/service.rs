@@ -1546,26 +1546,38 @@ fn read_model(infer: bool) -> crate::ReadModel {
 fn readable_asserted(
     snapshot: &nrese_engine::Snapshot,
     access: &nrese_sparql::GraphAccess,
-    [s, p, o]: [u64; 3],
+    fact: [u64; 3],
 ) -> bool {
+    let quads = snapshot.quads_for_pattern_in(nrese_engine::ReadModel::Asserted, &any_graph(fact));
+    in_readable_graph(quads, &|id| snapshot.decode(id), access)
+}
+
+/// The pattern of `fact` in any graph.
+pub(crate) fn any_graph([s, p, o]: [u64; 3]) -> nrese_engine::QuadPattern {
     let id = nrese_engine::TermId::from_raw;
-    let pattern = nrese_engine::QuadPattern {
+    nrese_engine::QuadPattern {
         subject: Some(id(s)),
         predicate: Some(id(p)),
         object: Some(id(o)),
         graph: nrese_engine::GraphSelector::Any,
-    };
-    snapshot
-        .quads_for_pattern_in(nrese_engine::ReadModel::Asserted, &pattern)
-        .any(|quad| {
-            let graph = if quad.graph.is_default_graph() {
-                nrese_rdf::GraphName::DefaultGraph
-            } else {
-                match snapshot.decode(quad.graph) {
-                    Some(nrese_rdf::Term::NamedNode(n)) => nrese_rdf::GraphName::NamedNode(n),
-                    _ => return false,
-                }
-            };
-            access.allows_graph(&graph)
-        })
+    }
+}
+
+/// Whether one of `quads` is in a graph `access` may read (`decode` names the graphs).
+pub(crate) fn in_readable_graph(
+    quads: impl IntoIterator<Item = nrese_engine::EncodedQuad>,
+    decode: &dyn Fn(nrese_engine::TermId) -> Option<nrese_rdf::Term>,
+    access: &nrese_sparql::GraphAccess,
+) -> bool {
+    quads.into_iter().any(|quad| {
+        let graph = if quad.graph.is_default_graph() {
+            nrese_rdf::GraphName::DefaultGraph
+        } else {
+            match decode(quad.graph) {
+                Some(nrese_rdf::Term::NamedNode(n)) => nrese_rdf::GraphName::NamedNode(n),
+                _ => return false,
+            }
+        };
+        access.allows_graph(&graph)
+    })
 }

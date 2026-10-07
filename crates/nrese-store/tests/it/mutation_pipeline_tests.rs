@@ -199,6 +199,71 @@ fn owl2_rl_rejects_inconsistent_commits() {
     assert!(!contains(&pipeline, &conflicting));
 }
 
+/// The G3 safety audit (7 October 2026): a commit the OWL 2 RL gate rejects listed its
+/// premises whatever the committer could read. A committer who may read and write `open`
+/// only is rejected for what the secret schema makes inconsistent, and the rejection shows
+/// the premises asserted in the graphs it may read: not the secret disjointness, nor the
+/// type the secret subclass axiom infers. A committer who reads everything sees them all.
+#[test]
+fn an_rl_rejection_shows_no_premise_of_a_graph_the_committer_cannot_read() {
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, Requester, WriteScope};
+    let setup = format!(
+        "GRAPH <{EX}secret> {{ <{EX}A> <http://www.w3.org/2002/07/owl#disjointWith> <{EX}B> .
+           <{EX}C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{EX}B> }}
+         GRAPH <{EX}open> {{ <{EX}x> a <{EX}A> }}"
+    );
+    let conflicting = format!("GRAPH <{EX}open> {{ <{EX}x> a <{EX}C> }}");
+    let access = Arc::new(GraphAccess {
+        graphs: vec![format!("{EX}open")],
+        ..GraphAccess::default()
+    });
+    let committers = [
+        Requester::new(
+            ReadScope::Graphs(Arc::clone(&access)),
+            WriteScope::Graphs(Arc::clone(&access)),
+        ),
+        Requester::all(),
+    ];
+    for (restricted, committer) in [true, false].into_iter().zip(committers) {
+        let pipeline = pipeline(ReasoningMode::Owl2Rl);
+        pipeline
+            .apply(
+                insert(&setup),
+                &nrese_store::Requester::all(),
+                &MutationTicket::new(),
+            )
+            .expect("consistent setup");
+        let result = pipeline.apply(insert(&conflicting), &committer, &MutationTicket::new());
+        let Err(MutationError::Rejected(reject)) = result else {
+            panic!("expected a rejection, got {result:?}");
+        };
+        let explanation = reject.explanation.expect("an explanation");
+        let shown: Vec<String> = explanation
+            .evidence
+            .iter()
+            .map(|e| format!("{} {} {}", e.subject, e.predicate, e.object))
+            .collect();
+        let secret = |text: &str| text.contains("disjointWith") || text.contains(&format!("{EX}B"));
+        if restricted {
+            // The committer's own statement, nothing of the secret graph or inferred from it.
+            assert!(
+                shown
+                    .iter()
+                    .any(|s| s.contains(&format!("{EX}x")) && s.contains(&format!("{EX}A"))),
+                "{shown:#?}"
+            );
+            assert!(!shown.iter().any(|s| secret(s)), "{shown:#?}");
+            assert!(!secret(&explanation.summary), "{}", explanation.summary);
+            assert!(!secret(&reject.detail), "{}", reject.detail);
+            assert!(reject.detail.contains("not shown"), "{}", reject.detail);
+        } else {
+            assert_eq!(shown.len(), 3, "{shown:#?}");
+            assert!(shown.iter().any(|s| secret(s)), "{shown:#?}");
+        }
+    }
+}
+
 #[test]
 fn rematerialise_installs_the_closure_of_existing_data() {
     // Data committed without reasoning, then the ruleset is switched on.
