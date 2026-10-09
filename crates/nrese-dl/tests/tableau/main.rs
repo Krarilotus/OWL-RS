@@ -3,6 +3,7 @@
 
 mod build;
 mod ni;
+mod probes;
 mod resources;
 mod sat;
 

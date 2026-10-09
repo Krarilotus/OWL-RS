@@ -62,7 +62,7 @@ pub enum End {
     GaveUp(String),
 }
 
-impl Engine<'_> {
+impl<'p> Engine<'p> {
     /// Roots for the individuals, the test and the assertions, at level 0.
     pub fn init(&mut self, seed: &Seed) -> Step<()> {
         for i in 0..self.p.individuals.len() as u32 {
@@ -124,6 +124,15 @@ impl Engine<'_> {
 
     /// Runs to a model, a refutation or a stop.
     pub fn run(&mut self, seed: &Seed) -> End {
+        self.run_with_checkpoint(seed, None)
+    }
+
+    /// Optionally retain the first saturated state, before any search choice.
+    pub(super) fn run_with_checkpoint(
+        &mut self,
+        seed: &Seed,
+        checkpoint: Option<&mut Option<Engine<'p>>>,
+    ) -> End {
         if self.refuted() {
             return End::Refuted;
         }
@@ -133,7 +142,7 @@ impl Engine<'_> {
                 Stop::GaveUp(why) | Stop::Abandon(_, why) => End::GaveUp(why),
             };
         }
-        self.search(None)
+        self.search_with_checkpoint(None, checkpoint)
     }
 
     /// Adds a test to a state a run left (a base, [`super::probe::Base`]) and runs on:
@@ -152,13 +161,21 @@ impl Engine<'_> {
     }
 
     /// The search from the state as it is (`first`: a stop already met).
-    pub fn search(&mut self, mut first: Option<Stop>) -> End {
+    pub fn search(&mut self, first: Option<Stop>) -> End {
+        self.search_with_checkpoint(first, None)
+    }
+
+    fn search_with_checkpoint(
+        &mut self,
+        mut first: Option<Stop>,
+        mut checkpoint: Option<&mut Option<Engine<'p>>>,
+    ) -> End {
         // Why a branch was abandoned, if one was: a refutation is then no answer.
         let mut abandoned: Option<String> = None;
         loop {
             let stop = match first.take() {
                 Some(stop) => stop,
-                None => match self.step() {
+                None => match self.step(&mut checkpoint) {
                     Ok(true) => continue,
                     Ok(false) => return End::Model,
                     Err(stop) => stop,
@@ -186,10 +203,14 @@ impl Engine<'_> {
     }
 
     /// One round; `false` when nothing is left to do.
-    fn step(&mut self) -> Step<bool> {
+    fn step(&mut self, checkpoint: &mut Option<&mut Option<Engine<'p>>>) -> Step<bool> {
         self.check_time()?;
         self.check_memory()?;
         self.saturate()?;
+        if let Some(checkpoint) = checkpoint.take() {
+            *checkpoint = Some(self.clone());
+            self.check_time()?;
+        }
         self.check_data()?;
         if self.apply_keys()? {
             return Ok(true);
