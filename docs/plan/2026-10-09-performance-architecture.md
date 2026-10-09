@@ -13,6 +13,11 @@ authorised the worker/runtime implementation following the scheduling discussion
 Prepared 9 October 2026 on `plan/engine-v2-performance-architecture`, based on
 `refactor/engine-v2` at `6b81ccb5baebdb72daf8eb3216378a6f00ed3e6c`.
 
+Runtime checkpoint, 9 October: retain the current CPU execution boundary. The
+FIFO caller-budget prototype was rejected on measured parallel-workload regressions;
+the proposed encoder-only caller bypass is not authorised. Discuss the ownership
+design before implementing another alternative; no caller bypass enters production.
+
 The aim is to make existing capabilities faster, cheaper to run, and easier to maintain.
 Improve the amount of work first, its representation second, and its machine execution
 third. Preserve semantics, compatibility and the measured wins already in the repository.
@@ -22,7 +27,9 @@ Potential gains below are hypotheses until measured. The original refactor check
 an unfinished merge of `dl/classify` at `4c5bc56`, including number-module changes and a
 conflict in `docs/design/performance.md`. With the owner's approval, the isolated branch
 incorporates that branch in `0f46563`, retaining both performance-log additions. The
-original checkout is untouched. `0f46563` is the implementation comparison base.
+original checkout's tracked files and pending merge remain intact. Its benchmark
+caches were subsequently migrated with verified remote copies under the owner's
+separate cleanup authorisation. `0f46563` is the implementation comparison base.
 
 ## 1. Scope and interpretation
 

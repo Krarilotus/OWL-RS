@@ -116,10 +116,20 @@ header says how). `benches/probes/` has the HTTP-level probes.
 
 ## Remote hosts and shared data
 
-Transfers from **KRARIS-GPTLER are underway** (9 October 2026). The Windows
-`nrese-data` and `nrese-bench` snapshots and Docker `nrese-fast-data` snapshot have
-passed full source/destination SHA-256 verification on both hosts; their local
-content has been retired. Other groups still require their own completed proof.
+The benchmark **data transfer from KRARIS-GPTLER is verified on both hosts**
+(9 October 2026): 30,739 file paths, 145,052,843,247 logical bytes, including
+Windows inputs/results, ORE and tool caches, eight Docker volumes and the restored
+Office conformance corpus. Every source/destination file has a matching SHA-256.
+The four local Windows source groups and eight local benchmark volumes have been
+retired after verification; the Office conformance source remains reusable there.
+Logical totals include duplicate paths and are not physical disk usage. Both
+MongoDB containers and all their volumes remain outside benchmark cleanup.
+All eight source benchmark images are also preserved in the SHA-256-verified
+`images/nrese-bench-source-tags.docker.tar` under the same root on both hosts.
+Office has the same image IDs loaded under `nrese-preserved/*` aliases; its existing
+tags were retained. `manifests/image-load-verification.json` maps original tags and
+IDs to those aliases. Phuoc retains the archive without installing Docker. The eight
+local source image tags were removed only after these checks; no blanket prune ran.
 Office-PC alone builds/tests/formats Rust and executes build-triggering hooks.
 Phuoc-Yu runs verified Office-built native binaries; it currently has no Docker,
 Java or Apptainer. The kit table above and [CATALOG.md](CATALOG.md) remain the suite
@@ -142,13 +152,19 @@ preservation and rerun needs to be settled; transfer progress alone is insuffici
 
 Both hosts now have `~/.config/nrese-bench.env` (mode 0600), explicitly sourced rather
 than autoloaded. It names the existing checkout/campaign paths, Python interpreter,
-shared Windows input snapshot (`BENCH_DATA`), fast snapshot (`BENCH_FAST_DATA`),
+shared Windows input snapshot (`BENCH_DATA`), general Docker-data snapshot
+(`BENCH_GENERAL_DATA`), fast snapshot (`BENCH_FAST_DATA`),
 results parent (`BENCH_RESULTS_ROOT`), mutable scratch (`NRESE_BENCH_SCRATCH`),
 native binaries (`NRESE_BIN`/`HARNESS`) and preserved licences (`NRESE_LICENSES`).
 The `BENCH_*` names are shell conveniences, not new suite settings. The current
 profiles identify measured binaries from `77478d1` through `BENCH_BINARY_REVISION`;
 the checkout revision can differ and must be recorded separately. They do not select
-latest-source binaries or start runs. For the verified LUBM 1 input directory:
+latest-source binaries or start runs. Both profiles also set `NRESE_ORE_DIR` to the
+preserved ontology directory and `BENCH_ORE_ARCHIVE` to its original ZIP. Office
+sets `FUSEKI_HOME` to the preserved distribution; Phuoc lacks its Java runtime.
+Use `--data "$BENCH_GENERAL_DATA"` explicitly for inputs from the general snapshot;
+do not infer input identity from matching names across snapshots.
+For the verified LUBM 1 input directory:
 
 ```sh
 ssh Phuoc-Yu 'bash -se' <<'REMOTE'
