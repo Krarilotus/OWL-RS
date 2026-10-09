@@ -67,6 +67,9 @@ Child work must partition its allowance explicitly. Full-width batches retain Ra
 work stealing; narrow batches use bounded lanes. Context activation uses nonblocking
 drains when narrowed, with enqueue and drain retirement under the same lock. Tableau
 portfolio siblings share a cancellation child and cannot cancel their request parent.
+A decision signals sibling cancellation immediately, but dispatch waits for every run to
+finish. If several runs decide concurrently, the returned outcome is the first decided
+one in input order; its telemetry does not identify the earliest wall-clock decision.
 
 Live native results retain their capacity reservation until drop. Update WHERE consumes
 the same catalog budget. These are accounted capacities, not process RSS or a strict
@@ -75,6 +78,13 @@ have separate lifetimes. DL task accounting remains distinct from the shared nat
 query budget. Rule materialisation, bulk spilling and background storage retain their
 existing execution owners. See [configuration](../ops/config-reference.md#cpu-execution)
 for the precise control surface and standalone embedding behavior.
+
+SPARQL's [`SolutionTable`](../../crates/nrese-sparql/src/native/typed_results.rs) retains
+its snapshot, computed terms and capacity reservations. Alignment rejects unrelated
+dictionaries or different variable lists, then remaps query-local computed values before
+ID comparison. The store owns lower/upper orchestration and candidate completeness;
+SPARQL owns decoding and result lifetime. This avoids serialising and evaluating the
+lower result again without treating raw IDs from separate contexts as interchangeable.
 
 ## 3. Storage access
 
@@ -140,4 +150,6 @@ An estimated logical plan must not be presented as a fully selected physical pla
   must preserve its semantics and these guards; moving code alone establishes no speedup.
 - Performance measurements follow [CONTRIBUTING.md](../../CONTRIBUTING.md) and the
   [benchmark protocol](../../benches/PROTOCOL.md). This document records architecture,
-  not a fresh benchmark result or a completed performance gate.
+  not a fresh benchmark result or a completed performance gate. Current runtime performance
+  acceptance is **BLOCKED**; see [STATUS.md](../STATUS.md) for the initial regression and
+  outstanding integration evidence.
