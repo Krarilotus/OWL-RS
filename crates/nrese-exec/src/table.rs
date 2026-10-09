@@ -338,14 +338,32 @@ impl IdTable {
         self.retain_mask(&mask);
     }
 
-    /// A table with the given columns of `self`, in that order. Sortedness is kept for the
-    /// longest prefix of the sort order that survives.
-    pub fn project(&self, columns: &[usize]) -> IdTable {
-        let projected = columns.iter().map(|&c| self.columns[c].clone()).collect();
+    /// Keeps the given columns in that order, moving their buffers. Only repeated columns
+    /// are copied. O(width + output width * (sort keys + 1)), plus copied repeated columns.
+    /// Sortedness is kept for the longest prefix of the sort order that survives.
+    pub fn project(mut self, columns: &[usize]) -> IdTable {
+        if columns.len() == self.width() && columns.iter().copied().eq(0..self.width()) {
+            return self;
+        }
         let sorted_by = self
             .sorted_by
             .iter()
             .map_while(|key| columns.iter().position(|c| c == key))
+            .collect();
+        let mut remaining = vec![0usize; self.width()];
+        for &column in columns {
+            remaining[column] += 1;
+        }
+        let projected = columns
+            .iter()
+            .map(|&column| {
+                remaining[column] -= 1;
+                if remaining[column] == 0 {
+                    std::mem::take(&mut self.columns[column])
+                } else {
+                    self.columns[column].clone()
+                }
+            })
             .collect();
         IdTable {
             columns: projected,
@@ -432,10 +450,10 @@ mod tests {
             t.rows().collect::<Vec<_>>(),
             vec![vec![1, 4], vec![1, 5], vec![2, 5]]
         );
-        let p = t.project(&[1]);
+        let p = t.clone().project(&[1]);
         assert_eq!(p.column(0), &[4, 5, 5]);
         assert!(p.sorted_by().is_empty(), "column 1 alone isn't sorted");
-        let q = t.project(&[0]);
+        let q = t.clone().project(&[0]);
         assert_eq!(q.sorted_by(), &[0]);
         let mut s = t.clone();
         s.slice(1, Some(1));
@@ -443,5 +461,34 @@ mod tests {
         t.retain(|t, row| t.get(row, 1) == 5);
         assert_eq!(t.len(), 2);
         assert!(t.is_sorted_on(&[0, 1]));
+    }
+
+    #[test]
+    fn projection_moves_buffers_and_preserves_order_and_empty_rows() {
+        let original = table(&[&[1, 4], &[1, 5], &[2, 5]]).assume_sorted_by(vec![0, 1]);
+        for columns in [
+            vec![],
+            vec![0],
+            vec![1],
+            vec![1, 0],
+            vec![0, 1],
+            vec![1, 0, 1],
+        ] {
+            let input = original.clone();
+            let buffers: Vec<_> = input.columns().iter().map(|c| c.as_ptr()).collect();
+            let expected: Vec<Vec<_>> = original
+                .rows()
+                .map(|row| columns.iter().map(|&c| row[c]).collect())
+                .collect();
+            let projected = input.project(&columns);
+            assert_eq!(projected.rows().collect::<Vec<_>>(), expected);
+            assert_eq!(projected.len(), original.len());
+            for (at, &column) in columns.iter().enumerate() {
+                if !columns[at + 1..].contains(&column) {
+                    assert_eq!(projected.column(at).as_ptr(), buffers[column]);
+                }
+            }
+            assert!(projected.check_sorted(projected.sorted_by()));
+        }
     }
 }
