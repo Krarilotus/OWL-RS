@@ -299,7 +299,8 @@ pub const SETTINGS: &[Setting] = &[
         "dl.memory",
         names::DL_MEMORY,
         Amount(Bytes),
-        "Under owl2-dl, the memory one DL task may hold (default 4GiB).",
+        "Under owl2-dl, the task capacity budget checked at work boundaries; temporary \
+         overshoot is possible (default 4GiB, 0 disables). Not a process memory ceiling.",
     ),
     setting(
         "dl.max_candidates",

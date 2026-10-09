@@ -94,11 +94,10 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
     let options = nrese_dl::context::Options {
         threads: budget.threads.max(1),
         proofs: false,
-        // Context max_memory caps the process; memory_bytes budgets this task's
-        // tableau structures. Passing the latter here would impose the wrong limit.
         budget: nrese_dl::context::Budget {
             deadline: Some(started + budget.timeout),
             max_join: Some(MAX_JOIN),
+            task_memory: (budget.memory_bytes != usize::MAX).then_some(budget.memory_bytes),
             ..nrese_dl::context::Budget::default()
         },
         ..nrese_dl::context::Options::default()

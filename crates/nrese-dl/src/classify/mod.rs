@@ -85,6 +85,9 @@ pub struct Options {
     /// The most memory the process may hold while the context core runs (bytes; `None`:
     /// three quarters of what the machine or container has).
     pub max_memory: Option<u64>,
+    /// Capacity budget of each context saturation, independent of the process ceiling.
+    /// `None` disables task accounting. The tableau's per-worker limit remains in `tableau`.
+    pub task_memory: Option<usize>,
     /// The context core takes functional properties with its Eq rule
     /// ([`crate::context::Options::equality`]).
     pub equality: bool,
@@ -138,6 +141,7 @@ impl Default for Options {
             max_join: 1 << 20,
             max_join_steps: 1 << 16,
             max_memory: None,
+            task_memory: None,
             equality: false,
             // No lazy unfolding: it under-approximates the unfolded classes in a model, and
             // the driver reads its subsumers off model labels. No proofs are read here, so
@@ -205,6 +209,7 @@ impl Deadline {
             max_memory: options
                 .max_memory
                 .or_else(|| nrese_exec::memory::available_bytes().map(|b| b / 4 * 3)),
+            task_memory: options.task_memory,
         }
     }
 

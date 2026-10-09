@@ -166,6 +166,10 @@ fn the_switches_keep_the_taxonomy() {
                 threads,
                 strategy,
                 proofs,
+                budget: context::Budget {
+                    task_memory: Some(64 * 1024 * 1024),
+                    ..context::Budget::default()
+                },
                 ..Options::default()
             };
             assert_eq!(

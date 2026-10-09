@@ -23,15 +23,7 @@ pub(crate) struct Cache {
 
 /// How the engines run under the store's settings.
 fn options(store: &StoreService) -> classify::Options {
-    let dl = &store.config().dl;
-    classify::Options {
-        threads: dl.workers(),
-        timeout: Some(dl.timeout),
-        // Each test's budgets: the driver's memory per test, the store's deterministic
-        // ones (an undecided class is reported incomplete).
-        tableau: dl.tableau(dl.timeout, classify::Options::default().tableau.max_memory),
-        ..classify::Options::default()
-    }
+    store.config().dl.classification_options()
 }
 
 /// The taxonomy of `snapshot`'s asserted ontology (from the cache if it is current).
