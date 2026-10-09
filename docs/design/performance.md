@@ -180,6 +180,77 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
 
+### 9 October: bounded reuse and contract repairs on the isolated branch
+
+Comparison base `0f46563` includes the pending DL number-module merge. Candidate code
+is `91900f8` on `plan/engine-v2-performance-architecture`. The original refactor checkout
+was not changed. This batch moves projection buffers, shares forward-search interval
+discovery, centralises SPARQL numeric arithmetic, removes the raw spill copy/pool, and
+repairs QL view identity, nested cancellation and atomic split/revival publication.
+The transaction repair still has a full-dataset fallback; it is a correctness repair,
+not a claim of delta-sized work or faster updates.
+
+**A regression found during measurement.** Retaining projection sort metadata exposed
+`dedup_preserving_order` calling the canonical column sorter even when another complete
+column order already made equal rows adjacent. This changed order and copied columns.
+The kernel now filters adjacent duplicates without sorting/gathering. Its guard fails
+with the old call and checks order, original buffers and incomplete/repeated sort keys.
+Before the repair, OWL2Bench QL q01/q20 repeatedly increased by roughly 0.1/0.04 ms,
+including with rewriting disabled. The final comparison no longer shows that increase.
+
+**Native diagnostic comparison, not publication qualification.** AMD Ryzen 7 7800X3D,
+64 GB RAM, Windows 11; Rust 1.98.1, release fat LTO, `target-cpu=native`, mimalloc.
+Each worktree built into its own target directory after a shared target had reused an
+incompatible local artifact. Baseline built from a clean tree; candidate code matches
+`91900f8`, with only documentation edits during its build. Saved executable SHA-256:
+baseline `daa94ffe9f0f24dc72543a7aadab4487e7282b0ff06ff760d192a6825e7ca3dd`,
+candidate `ae2d2d58ee26d842d73226451c67152f7a7f1c4ff2a9bd78d8a9ab34e04b9c8d`.
+
+Existing `perf_lab` only: 16 workers, cache disabled, fast index encoding/plain vocabulary,
+QL rewriting auto, fresh process/store per repetition, one warmup and 50 measured repeats
+per query, with first executions recorded separately. AB/BA/AB interleaving, three
+repetitions; DL and compact-equality updates extended to six to investigate variation.
+Every invocation used `quiet-slot.sh` after builds finished. Unlike the full protocol,
+the native lab repeats queries in name order rather than shuffled whole-mix rounds.
+Inputs remain in the shared dataset directory. Raw reports, answer files, commands and
+comparison details are retained locally under `tmp/native-final`; the verified baseline
+manifest and dataset/query fingerprints are under `tmp/baseline-0f46563`.
+
+| Covered case | Queries | Median sum of query p50, base → candidate (ms) | Median load, base → candidate (ms) |
+|---|---:|---:|---:|
+| LUBM-10, OWL 2 RL | 14 | 13.843 → 13.822 | 164 → 158 |
+| NPD, OWL 2 QL | 31 | 64.971 → 65.555 | 265 → 263 |
+| OWL2Bench QL-1 | 22 | 2.956 → 2.814 | 14 → 14 |
+| Forced 1 MiB spill, LUBM-1 without reasoning | 14 | 0.677 → 0.653 | 177 → 178 |
+
+All compared answer bags and requested ORDER BY sequences match; NPD's recorded counts
+and all 14 expected LUBM-1 DL counts match. Forced-spill stores reopen with matching
+answers. The small equality fixture (1,000 groups of 10, 20 merges, four concurrent
+readers) gives the expected 104,000 values and 20 group values after updates; maintained
+and recomputed closure counts agree in every repetition. Statement counts, dictionary
+terms and text bytes match. Small dictionary-index byte differences reflect allocation
+size, not additional terms.
+
+No query has a median increase exceeding both 10% and 2 ms in this coverage. That is a
+diagnostic threshold, not proof of neutrality for every smaller query or every workload.
+DL process peaks varied 311–360 MiB on the base and 282–352 MiB on the candidate. The
+six compact-update runs had median p50 about 42.8 → 43.5 ms; median p99 about 46.7 →
+51.2 ms, with candidate outliers up to 88.4 ms. These noisy process-peak and concurrent
+tail measurements do not qualify a memory or tail-latency improvement. Deterministic
+buffer/probe/allocation guards are the evidence for the retained kernel savings.
+The full fast-suite matrix, all profiles/core counts, external conformance corpora and
+Linux/distributed/hardware qualification remain open.
+
+Validation: the initial milestone gate passed 1,274 workspace tests, 79 benchmark-harness
+tests, 11 suite-contract tests, formatting, clippy, dependent compilation, doc tests,
+lock checks and dependency policy. Console dependencies were absent, so its checks were
+skipped; corpus-dependent W3C tests were not a full external-corpus run. Two nextest
+process-cleanup warnings did not recur alone. After the DISTINCT fix, 1,274 of 1,275
+tests passed in a run concurrent with release compilation; the existing cancellation
+latency test took 2.99 s against its unchanged 2 s limit. It passed three isolated reruns.
+The final workspace replay, with four test workers and no concurrent compilation,
+passed all 1,275 tests (five existing opt-in tests skipped), without cleanup warnings.
+
 **The phase's targets,** as set on 5 October (start values; progress is in the log below):
 
 | # | Target | At the start | Goal |
