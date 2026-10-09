@@ -42,14 +42,14 @@ impl SolutionsResultFormat {
 }
 
 /// What the store adds to every query it runs.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct StoreSettings {
     /// [`StoreConfig::union_default_graph`](crate::StoreConfig).
     pub union_default_graph: bool,
     /// [`StoreConfig::geosparql_stated_only`](crate::StoreConfig).
     pub geosparql_stated_only: bool,
-    /// The budget for all running queries together, if the store has one.
-    pub query_memory: Option<std::sync::Arc<nrese_sparql::SharedBudget>>,
+    /// Physical workers and capacity shared across the catalog's repositories.
+    pub runtime: std::sync::Arc<crate::Runtime>,
     /// Who answers `SERVICE` calls, once the application installs a client
     /// ([`StoreService::set_service_client`](crate::StoreService::set_service_client)).
     pub services: std::sync::Arc<std::sync::OnceLock<nrese_sparql::Services>>,
@@ -633,7 +633,8 @@ fn query_options(
         read_model: prepared.read_model,
         memory_limit: prepared.memory_limit,
         as_written: prepared.as_written,
-        shared_memory: store.query_memory.clone(),
+        shared_memory: store.runtime.query_memory(),
+        workers: Some(store.runtime.workers()),
         union_default_graph: store.union_default_graph,
         geosparql_stated_only: store.geosparql_stated_only,
         services: store.services.get().cloned(),

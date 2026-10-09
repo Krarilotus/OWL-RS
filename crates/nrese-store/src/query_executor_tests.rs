@@ -21,7 +21,12 @@ fn fixture() -> (Engine, PreparedQuery, StoreSettings) {
         "SELECT ?x WHERE { ?x <http://example.org/worksFor> ?y }",
     ))
     .unwrap();
-    let settings = StoreSettings::default();
+    let store = crate::StoreService::new(crate::StoreConfig {
+        execution_threads: 1,
+        ..crate::StoreConfig::in_memory()
+    })
+    .unwrap();
+    let settings = store.query_settings().clone();
     *settings.ql.write().unwrap() = Some(Arc::new(QlRewriting::new(Closure { lists: true })));
     (engine, prepared, settings)
 }

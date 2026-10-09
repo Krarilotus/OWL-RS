@@ -36,6 +36,10 @@ pub struct UpdateOptions {
     /// ([`QueryOptions::union_default_graph`](crate::QueryOptions)).
     pub union_default_graph: bool,
     pub cancellation: Option<CancellationToken>,
+    /// Resources for each WHERE evaluation, shared with concurrent queries.
+    pub workers: Option<nrese_exec::workers::Workers>,
+    pub shared_memory: Option<Arc<nrese_exec::SharedBudget>>,
+    pub memory_limit: Option<usize>,
     /// Who answers `SERVICE` calls in `WHERE` clauses ([`crate::service`]).
     pub services: Option<crate::Services>,
     /// The graphs `WHERE` clauses may read ([`crate::QueryOptions::access`]).
@@ -148,6 +152,9 @@ fn apply_operation(
                 .then(|| tx.pending_snapshot());
             let query_options = crate::query::QueryOptions {
                 cancellation: options.cancellation.clone(),
+                workers: options.workers.clone(),
+                shared_memory: options.shared_memory.clone(),
+                memory_limit: options.memory_limit,
                 union_default_graph: options.union_default_graph,
                 dataset: options.using.clone(),
                 services: options.services.clone(),

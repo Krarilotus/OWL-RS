@@ -124,6 +124,7 @@ impl MutationCommand {
 
 /// What updates are evaluated with besides their transaction and requester.
 pub(crate) struct UpdateContext<'a> {
+    pub runtime: &'a crate::Runtime,
     /// Stops a long-running `WHERE` clause.
     pub cancellation: &'a CancellationToken,
     pub union_default_graph: bool,
@@ -165,6 +166,9 @@ pub(crate) fn apply_sparql_update(
             &request.using_named_graphs,
         )?,
         cancellation: Some(context.cancellation.clone()),
+        workers: Some(context.runtime.workers()),
+        shared_memory: context.runtime.query_memory(),
+        memory_limit: None,
         union_default_graph: context.union_default_graph,
         services: context.services.clone(),
         access: requester.read.access().cloned(),

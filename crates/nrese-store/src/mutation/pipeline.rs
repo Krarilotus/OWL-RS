@@ -155,6 +155,7 @@ impl MutationPipeline {
             return Err(MutationError::Cancelled);
         }
         let context = crate::mutation::command::UpdateContext {
+            runtime: self.store.runtime(),
             cancellation: ticket.evaluation_token(),
             union_default_graph: self.store.config().union_default_graph,
             geosparql_stated_only: self.store.config().geosparql_stated_only,

@@ -7,6 +7,7 @@
 //! bound's use of them, cost nothing.
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use nrese_dl::classify::{self, Realisation, Taxonomy};
 use nrese_engine::Snapshot;
@@ -23,7 +24,13 @@ pub(crate) struct Cache {
 
 /// How the engines run under the store's settings.
 fn options(store: &StoreService) -> classify::Options {
-    store.config().dl.classification_options()
+    let config = &store.config().dl;
+    let workers = store.runtime().workers().limited(config.workers());
+    let mut options = config.classification_options();
+    options.threads = workers.width();
+    options.tableau.max_memory = config.memory_per_worker(workers.width());
+    options.workers = Some(workers);
+    options
 }
 
 /// The taxonomy of `snapshot`'s asserted ontology (from the cache if it is current).
@@ -40,8 +47,16 @@ pub(crate) fn taxonomy(store: &StoreService, snapshot: &Snapshot) -> Arc<Taxonom
     {
         return Arc::new(realisation.taxonomy.clone());
     }
+    let started = Instant::now();
     let ontology = source::read_snapshot(snapshot);
-    let taxonomy = Arc::new(classify::classify(&ontology, &options(store)));
+    let mut options = options(store);
+    let workers = options.workers.as_ref().unwrap().clone();
+    let taxonomy = Arc::new(workers.install(|| {
+        options.timeout = options
+            .timeout
+            .map(|limit| limit.saturating_sub(started.elapsed()));
+        classify::classify(&ontology, &options)
+    }));
     *cache.taxonomy.lock().unwrap_or_else(|p| p.into_inner()) =
         Some((revision, Arc::clone(&taxonomy)));
     taxonomy
@@ -56,8 +71,16 @@ pub(crate) fn realisation(store: &StoreService, snapshot: &Snapshot) -> Arc<Real
     {
         return Arc::clone(realisation);
     }
+    let started = Instant::now();
     let ontology = source::read_snapshot(snapshot);
-    let realisation = Arc::new(classify::realise(&ontology, &options(store)));
+    let mut options = options(store);
+    let workers = options.workers.as_ref().unwrap().clone();
+    let realisation = Arc::new(workers.install(|| {
+        options.timeout = options
+            .timeout
+            .map(|limit| limit.saturating_sub(started.elapsed()));
+        classify::realise(&ontology, &options)
+    }));
     *cache.realisation.lock().unwrap_or_else(|p| p.into_inner()) =
         Some((revision, Arc::clone(&realisation)));
     realisation

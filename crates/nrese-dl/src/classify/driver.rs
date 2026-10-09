@@ -85,7 +85,7 @@ impl<'a> Driver<'a> {
             possible: vec![None; n],
             top_possible: None,
             top_known: None,
-            workers: Workers::new(options.threads),
+            workers: options.workers(),
         }
     }
 
@@ -105,7 +105,13 @@ impl<'a> Driver<'a> {
                 self.deadline
                     .budget(self.options, Some(self.options.lower_bound_timeout)),
             );
-            if let Some(lower) = known::horn_lower_bound(self.normalised, self.classes, &core) {
+            if let Some(lower) = known::horn_lower_bound_with_workers(
+                self.normalised,
+                self.classes,
+                &core,
+                &self.workers,
+                self.options.tableau.cancel.clone(),
+            ) {
                 if lower.inconsistent {
                     return self.inconsistent();
                 }
@@ -149,6 +155,7 @@ impl<'a> Driver<'a> {
                 self.classes,
                 &self.config(),
                 &self.options.core(self.deadline.budget(self.options, None)),
+                &self.workers,
             )
         } else {
             None

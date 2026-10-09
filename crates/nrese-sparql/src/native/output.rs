@@ -213,6 +213,7 @@ impl DirectResults<'_> {
         table: &IdTable,
         out: &mut dyn Write,
         alive: &dyn Fn() -> std::io::Result<()>,
+        workers: Option<&nrese_exec::workers::Workers>,
     ) -> std::io::Result<()> {
         let mut buffer: Vec<u8> = Vec::with_capacity(CHUNK + 4096);
         let json = self.format == ResultsFormat::Json;
@@ -266,21 +267,28 @@ impl DirectResults<'_> {
         let blocks = rows.div_ceil(BLOCK_ROWS);
         let block = |b: usize| b * BLOCK_ROWS..((b + 1) * BLOCK_ROWS).min(rows);
         if blocks <= 1 {
-            self.rows(table, 0..rows, &keys, &mut buffer);
+            let mut encode = || self.rows(table, 0..rows, &keys, &mut buffer);
+            match workers {
+                Some(workers) => workers.install(encode),
+                None => encode(),
+            }
         } else {
             // A window of blocks serialised in parallel, then written in order. A
             // cancelled query stops within one chunk of output (and one window of work).
-            let window = rayon::current_num_threads() * BLOCKS_PER_THREAD;
+            let window =
+                workers.map_or_else(rayon::current_num_threads, |w| w.width()) * BLOCKS_PER_THREAD;
             for start in (0..blocks).step_by(window) {
                 alive()?;
-                let parts: Vec<Vec<u8>> = (start..(start + window).min(blocks))
-                    .into_par_iter()
-                    .map(|b| {
-                        let mut part = Vec::with_capacity(CHUNK);
-                        self.rows(table, block(b), &keys, &mut part);
-                        part
-                    })
-                    .collect();
+                let range = start..(start + window).min(blocks);
+                let encode = |b| {
+                    let mut part = Vec::with_capacity(CHUNK);
+                    self.rows(table, block(b), &keys, &mut part);
+                    part
+                };
+                let parts: Vec<Vec<u8>> = match workers {
+                    Some(workers) => workers.map_range(range, encode),
+                    None => range.into_par_iter().map(encode).collect(),
+                };
                 for part in parts {
                     let mut rest = part.as_slice();
                     while !rest.is_empty() {

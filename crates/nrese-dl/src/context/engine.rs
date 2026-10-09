@@ -23,6 +23,9 @@ use super::program::Program;
 use super::rules::{Message, Out, State, Worker};
 use super::state::ContextId;
 
+#[path = "scheduling.rs"]
+mod scheduling;
+
 /// How the Succ rule picks a successor's context (Bate et al., §4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Strategy {
@@ -320,57 +323,6 @@ impl Engine {
             lock(&self.context(id).inbox).memory = self.memory_charge();
         }
         (id, true)
-    }
-
-    /// Starts `seeds` and saturates until no context has work, on `threads` workers.
-    pub fn run(&self, seeds: &[ContextId], threads: usize) {
-        if threads <= 1 {
-            let mut queue = Vec::new();
-            let mut memory = self.memory_charge();
-            for &s in seeds {
-                self.deliver_seq(&mut queue, s, Message::Init);
-            }
-            memory.set(super::memory::vec(&queue));
-            while let Some(c) = queue.pop() {
-                let mut next = Vec::new();
-                let mut next_memory = self.memory_charge();
-                self.work(c, &mut |to, m| {
-                    self.deliver_seq(&mut next, to, m);
-                    next_memory.set(super::memory::vec(&next));
-                });
-                queue.extend(next);
-                drop(next_memory);
-                memory.set(super::memory::vec(&queue));
-            }
-            return;
-        }
-        let run = || {
-            rayon::scope(|scope| {
-                for &s in seeds {
-                    self.deliver_par(scope, s, Message::Init);
-                }
-            });
-        };
-        match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
-            Ok(pool) => pool.install(run),
-            Err(_) => run(),
-        }
-    }
-
-    fn deliver_seq(&self, queue: &mut Vec<ContextId>, to: ContextId, message: Message) {
-        let context = self.context(to);
-        lock(&context.inbox).push(message);
-        if !context.active.swap(true, SeqCst) {
-            queue.push(to);
-        }
-    }
-
-    fn deliver_par<'s>(&'s self, scope: &rayon::Scope<'s>, to: ContextId, message: Message) {
-        let context = self.context(to);
-        lock(&context.inbox).push(message);
-        if !context.active.swap(true, SeqCst) {
-            scope.spawn(move |scope| self.work(to, &mut |t, m| self.deliver_par(scope, t, m)));
-        }
     }
 
     /// Processes a context's messages until its inbox stays empty; messages for other

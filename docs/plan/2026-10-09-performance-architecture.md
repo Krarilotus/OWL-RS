@@ -1,14 +1,15 @@
 # Performance and architecture: discussion proposal
 
-Status: **bounded, reuse-based implementation authorised; in progress**. Larger new
-machinery, unresolved semantics and actual blockers go back to the owner before proceeding.
+Status: **implementation and a PR to `refactor/engine-v2` authorised; in progress**.
+Reuse existing owners and code. Material new scope, unresolved semantics and actual
+blockers go back to the owner before proceeding.
 This plan does not replace accepted architecture decisions.
 Implementation state is maintained in [STATUS.md](../STATUS.md); measured results and
 deterministic guards belong in [performance.md](../design/performance.md). P1 is only
-partly complete: atomic publication and cache identity are repaired, but bounded task
-memory and cancellation inside every preparation phase are not yet established. Full
-QL prepare-once and new context memory accounting are at the owner's implementation
-checkpoint. Their appearance in this plan is not permission to add that machinery.
+partly complete: atomic publication, cache identity, QL prepare-once and optional context
+task accounting are implemented. Cancellation inside every preparation phase and a
+shared end-to-end memory envelope are not yet established. The owner subsequently
+authorised the worker/runtime implementation following the scheduling discussion.
 Prepared 9 October 2026 on `plan/engine-v2-performance-architecture`, based on
 `refactor/engine-v2` at `6b81ccb5baebdb72daf8eb3216378a6f00ed3e6c`.
 

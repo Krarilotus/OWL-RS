@@ -243,7 +243,7 @@ api_key = "replace-me"
   - file key `dl.timeout`, env `NRESE_DL_TIMEOUT_MS` (default 30min): the time one DL task may take (a commit's consistency check, a query's exact services, a classification); what isn't decided by then is reported, never guessed
   - file key `dl.memory`, env `NRESE_DL_MEMORY` (default 4GiB; `0` disables the budget): task-owned capacity checked at context-saturation and tableau work boundaries. Temporary overshoot is possible; exhaustion is reported as incomplete/unknown. Classification divides the tableau allowance among configured workers. This is not a strict allocator or process ceiling; input, compilation and result buffers and a shared query envelope are outside this contract ([scope](../design/owl2-dl.md#13-configuration))
   - file key `dl.max_candidates`, env `NRESE_DL_MAX_CANDIDATES` (default 1000): the candidate answers (in the upper bound, not the lower) a query checks with the exact services at most; the rest are reported unresolved
-  - file key `dl.threads`, env `NRESE_DL_THREADS` (default 0, every core): the workers of a classification
+  - file key `dl.threads`, env `NRESE_DL_THREADS` (default 0, available runtime workers): the maximum workers of a DL operation, narrowed by `execution.threads`
   - file key `dl.max_nodes`, env `NRESE_DL_MAX_NODES` (default 2000000), and `dl.max_branch_points`, env `NRESE_DL_MAX_BRANCH_POINTS` (default 1000000): the deterministic budgets of one hypertableau run (a consistency check, an entailment test, a class test), beside `dl.timeout`. A run past a budget decides nothing: its candidate stays unresolved, its class untested, its commit's status `unknown`, never a wrong answer
 - with any mode but `disabled`:
   - `nrese-server load` and startup materialise the closure (startup skips it when `reasoning.state` in the data directory records that the inferred stack is current for this build's semantics; `/version` reports them as `reasoning_semantics`, e.g. `owl2-rl v2 <fingerprint>`)
@@ -270,6 +270,21 @@ Read replicas ([replication.md](replication.md)); both sides need an on-disk sto
 - `federation.max_rows` (env `NRESE_FEDERATION_MAX_ROWS`): rows one request may return; default 1,000,000
 - a `SERVICE` joined to a pattern sends the pattern's distinct values as `VALUES`, 200 rows per request (up to 20,000 values; beyond, the block goes once, unbound); redirects are not followed; queries with `SERVICE` are never answered from the result cache
 
+## CPU execution
+
+`execution.threads` (`NRESE_EXECUTION_THREADS`, default `0`) sets the physical pool
+shared by native SPARQL execution, output encoding, update WHERE evaluation and DL
+search across all repositories and the system store. `0` uses available parallelism;
+`1` serialises this work on one shared worker. DL operations may narrow the pool with
+`dl.threads`; nested tests reuse it. Pool creation retries with one worker on failure;
+if that also fails, opening the runtime fails instead of running unbounded caller work.
+
+This is a CPU execution boundary, not a ceiling on every server thread. Request parsing,
+planning, rule materialisation, bulk spill and background storage retain their existing
+owners. The separate spill pool avoids waiting for its own producer. No tenant fairness,
+NUMA placement or distributed admission policy is implied. Embedded applications may
+share `nrese_store::Runtime` explicitly; independent stores otherwise own separate pools.
+
 ## Budgets
 
 Every limit on memory, time and request size is in one table, `[budgets]`. Values are plain numbers (bytes, milliseconds) or numbers with a unit: `"4GiB"`, `"512MiB"`, `"2GB"`, `"30s"`, `"2min"`, and for memory a share of the machine, `"50%"`. `nrese-server check-config` prints the values in effect, and `/version` reports them under `budgets`.
@@ -277,7 +292,7 @@ Every limit on memory, time and request size is in one table, `[budgets]`. Value
 | Key | Environment | Default | What it bounds |
 |---|---|---|---|
 | `budgets.query_memory` | `NRESE_MAX_QUERY_MEMORY_BYTES` | 4 GiB | Intermediate results of one query. A query that needs more is answered `413`. `0` = unlimited |
-| `budgets.total_query_memory` | `NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES` | 50 % of the machine's memory | Intermediate results of all running queries together. A query that asks for more than is left is answered `503` and may succeed later. `0` = unlimited |
+| `budgets.total_query_memory` | `NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES` | 50 % of the machine's memory | Accounted native intermediates and retained results across the catalog, including update WHERE evaluation. A query that asks for more than is left is answered `503` and may succeed later. `0` = unlimited |
 | `budgets.process_memory` | `NRESE_PROCESS_MEMORY_BYTES` | 75 % of the machine's memory (the container's limit where there is one) | The private memory (mapped store files excluded) the server may hold before a long operation stops instead of taking the machine: a materialisation (load, startup, change of rules) or the reasoning of a commit ends with an error and applies nothing. A size (`48 GiB`) or a share (`60%`); `0` = unlimited |
 | `budgets.huge_pages` | `NRESE_HUGE_PAGES` | `on` | Whether transparent huge pages may back the server's memory (Linux; elsewhere nothing changes). `on`: work over large heaps runs faster (LUBM 100's materialisation 26 % faster), but while serving many small requests the allocator holds about 2.7 times the memory (a whole 2 MiB page resident for a touched byte). `off`: less memory held while serving, slower materialisation. See [server-setup.md](server-setup.md) §12.1 |
 | `budgets.bulk_load_memory` | `NRESE_BULK_LOAD_MEMORY` | 25 % of the machine's memory | The quads of a bulk load (`nrese-server load`, or a load into an empty store). Past it they are sorted in chunks of a third of it (one filling, one being sorted, its sorted copy), spilled to `bulk-spill/` in the data directory and merged into each index permutation while the checkpoint is written: one more pass over the disk, but the load's quads take this much plus one packed permutation whatever the data's size. The dictionary is apart (it grows with the distinct terms). Needs `store.map_checkpoints`. `0` = unlimited |
