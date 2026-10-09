@@ -1,6 +1,8 @@
 # Performance and architecture: discussion proposal
 
-Status: **proposed, not an accepted architecture change or implementation commitment**.
+Status: **bounded, reuse-based implementation authorised; in progress**. Larger new
+machinery, unresolved semantics and actual blockers go back to the owner before proceeding.
+This plan does not replace accepted architecture decisions.
 Prepared 9 October 2026 on `plan/engine-v2-performance-architecture`, based on
 `refactor/engine-v2` at `6b81ccb5baebdb72daf8eb3216378a6f00ed3e6c`.
 
@@ -11,8 +13,9 @@ third. Preserve semantics, compatibility and the measured wins already in the re
 This proposal follows source and history inspection, not a new benchmark campaign.
 Potential gains below are hypotheses until measured. The original refactor checkout has
 an unfinished merge of `dl/classify` at `4c5bc56`, including number-module changes and a
-conflict in `docs/design/performance.md`. Those changes are not in this branch's base.
-Reconcile the final merge before implementation; do not redo its number-module work.
+conflict in `docs/design/performance.md`. With the owner's approval, the isolated branch
+incorporates that branch in `0f46563`, retaining both performance-log additions. The
+original checkout is untouched. `0f46563` is the implementation comparison base.
 
 ## 1. Scope and interpretation
 
@@ -35,8 +38,9 @@ Reconcile the final merge before implementation; do not redo its number-module w
   plan does not authorise a general rewrite, extra frameworks, or generic APIs without users.
 
 The [documentation hierarchy](../README.md) remains authoritative. Existing roadmap
-decisions still put major refactoring after the v2 merge. Bringing a particular cleanup
-forward is a decision to discuss, not a change silently made by this proposal.
+decisions put major refactoring after the v2 merge. The owner has brought bounded
+reuse-based work forward on this isolated branch; larger redesigns still need a concrete
+problem, alternatives and a separate decision.
 
 ## 2. What the review means for the plan
 
@@ -185,7 +189,7 @@ This is a design exercise, not three unused adapters committed to production.
 **Deliverable:** one reproducible base, a workload matrix across all levels, and an accurate map of
 binding invariants, approved exceptions, migration stages and future targets.
 
-Reconcile the pending DL merge through its maintainer before baselining. Record the exact
+Use the approved isolated DL merge `0f46563` for baselining. Record the exact
 commit, build settings, machine, allocator, data hashes, correctness results and raw-run
 locations. Reuse [the existing suite](../../benches/README.md),
 [fast cases](../../benches/fast/cases.toml), and guarded wins in
@@ -507,7 +511,7 @@ redundant simply because they compute the same answer.
 
 ## 7. Suggested sequence and discussion decisions
 
-1. **First batch: P0 and P1.** Agree scope, reconcile the base and establish the cross-path
+1. **First batch: P0 and P1.** Reconcile the base and establish the cross-path
    contracts. Three bounded repairs rather than a broad architecture rewrite.
 2. **Second batch: P2 and P3.** Remove repeated preparation and bound-query work. These have
    direct source evidence and narrow measurable acceptance criteria.
@@ -527,12 +531,12 @@ Also report the automatic selection rule, supported overrides, decision overhead
 hardware/distributed extension assumptions. The sequencing is about dependencies and
 evidence, not assigning one workload permanent priority over the others.
 
-Decisions for discussion:
+Decision boundaries during implementation:
 
-- Keep major structural work after the v2 merge, as the roadmap says, or bring specific
-  packages forward when needed for the contract fixes?
-- Accept the distinction between required correctness repair, performance-neutral
-  simplification and measured optimisation? A blanket speedup promise would be misleading.
+- Bounded reuse-based work is authorised on the isolated branch. Report any larger
+  implementation before starting it, including what existing code it replaces.
+- Report the cost of correctness repair separately from simplification and optimisation.
+  A blanket speedup promise would be misleading.
 - Pursue a small pure exact-test API below the store after P4's evidence, or keep that
   responsibility in the store and improve its internal modularity first?
 
@@ -540,4 +544,4 @@ Confirmed direction: performance at every level, configuration first, automatic 
 selection from request/data/resource needs, and architecture that later distributed and
 hardware work can extend. Suggested start: P0/P1 first, P2/P3 next; retain the existing
 crate structure and measured specialisations. Decide larger abstractions from the evidence
-those steps produce. No implementation starts merely because it appears in this proposal.
+those steps produce; their appearance in this plan alone is not approval to build them.

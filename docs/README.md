@@ -47,8 +47,8 @@ Contributing: [CONTRIBUTING.md](../CONTRIBUTING.md), for agents [AGENTS.md](../A
 the console: [frontend contract](dev/frontend-backend-contract.md),
 [extending it](dev/frontend-extension-guide.md).
 
-## Discussion proposals
+## Implementation plans and proposals
 
 [Performance and architecture, 9 October](plan/2026-10-09-performance-architecture.md):
-source-based review, proposed work packages, ownership and verification criteria.
+source-based review, authorised bounded refactoring, work packages, ownership and verification criteria.
 Not an accepted replacement for the architecture, roadmap or v2 merge checklist.
