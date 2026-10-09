@@ -198,6 +198,60 @@ fn a_spent_budget_leaves_the_islands_undecided() {
     }
 }
 
+#[test]
+fn shared_island_limits_preserve_verdicts_and_never_raise_tiny_memory() {
+    let physical = nrese_exec::workers::Workers::pooled(4).unwrap();
+    for width in [1, 2, 4] {
+        let config = Config {
+            workers: Some(physical.limited(width)),
+            max_nodes: 200,
+            max_memory: usize::MAX,
+            keep_model: true,
+            ..Config::default()
+        };
+        for (clash, want) in [(false, Answer::Consistent), (true, Answer::Inconsistent)] {
+            let ontology = chain(400, clash);
+            assert!(matches!(
+                tableau::consistency(&ontology, &config).answer,
+                Answer::GaveUp(_)
+            ));
+            assert_eq!(islands::by_islands(&ontology, &config).answer, want);
+            assert_eq!(islands::consistency(&ontology, &config).answer, want);
+        }
+        let tiny = Config {
+            max_memory: 1,
+            ..config
+        };
+        let out = islands::by_islands(&chain(400, false), &tiny);
+        assert!(matches!(out.answer, Answer::GaveUp(_)), "{:?}", out.answer);
+    }
+}
+
+#[test]
+fn stopped_island_requests_do_not_split_or_start_search() {
+    let cancel = tableau::Cancel::default();
+    cancel.cancel();
+    for config in [
+        Config {
+            cancel: Some(cancel),
+            ..Config::default()
+        },
+        Config {
+            timeout: Some(std::time::Duration::ZERO),
+            ..Config::default()
+        },
+    ] {
+        for out in [
+            islands::by_islands(&chain(400, false), &config),
+            islands::consistency(&chain(400, false), &config),
+        ] {
+            assert!(matches!(out.answer, Answer::GaveUp(_)));
+            assert_eq!(out.telemetry.compile, std::time::Duration::ZERO);
+            assert_eq!(out.telemetry.peak_nodes, 0);
+        }
+    }
+}
+
 fn decided(answer: &Answer) -> Option<bool> {
     match answer {
         Answer::Consistent => Some(true),
