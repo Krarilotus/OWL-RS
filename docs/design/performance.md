@@ -178,6 +178,41 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
 
+### 10 October: retained DL probes follow merged individuals
+
+The normal push gate for `da4465d` finds a missing type in brute-force seed 5358,
+case 63, at one worker with model reuse enabled. The pre-reuse `be5c3d7` passes
+the same seed, including the current test's reuse-disabled/enabled variants.
+This is a correctness regression in the earlier Base reuse repair; the prior
+selected-case speedups and passing seeds did not establish general correctness.
+
+Probe initialization asserted assumptions on an individual's original node even
+after that node had merged. It now uses the existing canonical lookup for individual
+assumptions and carries the merge dependencies into both polarities. The original
+probe root remains available for label provenance. A clash caused by a model's
+branch-dependent alias can therefore fall back instead of becoming a global refutation.
+Fresh and absent probe sites keep their existing path. No new memoization layer,
+state copy, scheduler or limit is introduced.
+
+The two guards fail before the fix and pass afterwards: deterministic aliases cover
+both polarities and both roots; a choice of aliases compares retained/fresh probes
+and explicit assumptions, requiring fallback and revisiting the pooled model.
+All eight probe tests and the complete failing seed pass on Office (120 taxonomy
+cases; 120 realisation cases with 306 individual results). The brute-force failure
+message now includes the reuse mode. Independent source review finds no blocker.
+The [repair record](../../benches/runs/2026-10-10-dl-alias-da4465d.toml) retains the
+failed gate, baseline reproduction, patch and performance follow-up. Earlier
+measurements remain revision-specific; the overall runtime gate remains blocked.
+
+The follow-up reuses the existing seven fixtures at one/four workers and the preserved
+pre-fix binary: ten alternating pairs per case, 280 complete invocations. All emitted
+canonical answers match the prior record. Every timing and peak-RSS range overlaps its
+counterpart. Choice-300 medians are 47.35/19.10 -> 47.70/19.00 ms; ORE 16542 is
+1372.45/1212.75 -> 1377.60/1208.45 ms. These are process aggregates; generated cases
+emit only the last of three internal repetitions' answers. With no preregistered
+non-regression threshold, this is a bounded diagnostic, not a performance acceptance
+pass or a new speedup. Hashes, all samples and limitations are in the repair record.
+
 ### 10 October: cache validity and explicit DL retries
 
 QL compilation now compares the exact sorted schema input and the dictionary id of
