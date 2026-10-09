@@ -4334,6 +4334,173 @@ fn describe_equals_the_reference() {
     assert_eq!(checked, 1000);
 }
 
+/// Promotion, checked arithmetic and aggregate error handling at the shared numeric
+/// boundary, compared term for term across native and reference execution paths.
+#[test]
+fn numeric_expressions_and_totals_equal_the_reference() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let check = |body: String| {
+        let text = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {body}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        assert!(runs_natively(&query), "{text}");
+        assert_eq!(
+            rows(evaluate_query(&snapshot, &query, &options).unwrap(), false),
+            rows(reference(&snapshot, &query, &options).unwrap(), false),
+            "{text}"
+        );
+    };
+    let values = [
+        "0",
+        "1",
+        "-1",
+        "9223372036854775807",
+        "-9223372036854775808",
+        "1.5",
+        "-0.5",
+        "1e0",
+        "\"2.5\"^^xsd:float",
+        "\"-0\"^^xsd:float",
+        "\"INF\"^^xsd:double",
+        "\"-INF\"^^xsd:double",
+        "\"NaN\"^^xsd:float",
+        "\"NaN\"^^xsd:double",
+        "\"01\"^^xsd:int",
+        "\"bad\"^^xsd:integer",
+        "\"text\"",
+        "UNDEF",
+    ];
+    // The reference shares expression and aggregate value semantics, but evaluates
+    // groups independently of the native fast paths. Fixed value expectations below
+    // separately guard arithmetic itself.
+    for left in values {
+        check(format!(
+            "SELECT (-?a AS ?neg) (ABS(?a) AS ?abs) (CEIL(?a) AS ?ceil) \
+             (FLOOR(?a) AS ?floor) (ROUND(?a) AS ?round) {{ VALUES ?a {{ {left} }} }}"
+        ));
+        for right in values {
+            check(format!(
+                "SELECT (?a + ?b AS ?add) (?a - ?b AS ?sub) (?a * ?b AS ?mul) \
+                 (?a / ?b AS ?div) {{ VALUES (?a ?b) {{ ({left} {right}) }} }}"
+            ));
+            // Variable, memoised expression and DISTINCT/general aggregate paths.
+            for argument in ["?v", "(?v + 0)", "DISTINCT ?v"] {
+                check(format!(
+                    "SELECT (SUM({argument}) AS ?sum) (AVG({argument}) AS ?avg) \
+                     {{ VALUES ?v {{ {left} {right} }} }}"
+                ));
+            }
+        }
+    }
+    for values in ["", "UNDEF", "1 UNDEF", "1 1 2"] {
+        check(format!(
+            "SELECT (SUM(?v) AS ?sum) (AVG(?v) AS ?avg) (COUNT(?v) AS ?count) \
+             (MIN(?v) AS ?min) (MAX(?v) AS ?max) {{ VALUES ?v {{ {values} }} }}"
+        ));
+    }
+}
+
+/// Fixed expectations, independent of the shared expression evaluator and SUM/AVG
+/// helpers used by the reference. Check lexical value, datatype and unbound results.
+#[test]
+fn numeric_values_keep_their_sparql_semantics() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let check = |body: String, expected: Option<(&str, nrese_rdf::NamedNodeRef<'_>)>| {
+        let text = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {body}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let QueryResults::Solutions(mut solutions) =
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap()
+        else {
+            panic!("expected solutions: {text}");
+        };
+        let solution = solutions.next().unwrap().unwrap();
+        let expected = expected
+            .map(|(value, datatype)| Term::from(Literal::new_typed_literal(value, datatype)));
+        assert_eq!(solution.get("result"), expected.as_ref(), "{text}");
+        assert!(solutions.next().is_none(), "{text}");
+    };
+    for (expression, expected) in [
+        ("1 + 2", Some(("3", xsd::INTEGER))),
+        ("1 + 2.5", Some(("3.5", xsd::DECIMAL))),
+        ("1.0 + \"2.5\"^^xsd:float", Some(("3.5", xsd::FLOAT))),
+        ("\"2.5\"^^xsd:float + 1e0", Some(("3.5", xsd::DOUBLE))),
+        ("1 / 2", Some(("0.5", xsd::DECIMAL))),
+        ("1 / 0", None),
+        ("1.0 / 0.0", None),
+        ("1e0 / 0e0", Some(("INF", xsd::DOUBLE))),
+        ("0e0 / 0e0", Some(("NaN", xsd::DOUBLE))),
+        ("\"NaN\"^^xsd:float + 1", Some(("NaN", xsd::FLOAT))),
+        ("9223372036854775807 + 1", None),
+        ("-9223372036854775808 - 1", None),
+        ("9223372036854775807 * 2", None),
+        ("-(-9223372036854775808)", None),
+        ("ABS(-9223372036854775808)", None),
+        ("ROUND(-0.5)", Some(("0", xsd::DECIMAL))),
+        (
+            "\"PT1H\"^^xsd:dayTimeDuration + \"PT30M\"^^xsd:dayTimeDuration",
+            Some(("PT1H30M", xsd::DAY_TIME_DURATION)),
+        ),
+        ("\"text\" + 1", None),
+    ] {
+        check(format!("SELECT ({expression} AS ?result) {{}}"), expected);
+    }
+    for (values, sum, average) in [
+        ("", Some(("0", xsd::INTEGER)), Some(("0", xsd::INTEGER))),
+        (
+            "1 2",
+            Some(("3", xsd::INTEGER)),
+            Some(("1.5", xsd::DECIMAL)),
+        ),
+        (
+            "1 2.5",
+            Some(("3.5", xsd::DECIMAL)),
+            Some(("1.75", xsd::DECIMAL)),
+        ),
+        (
+            "1 \"2.5\"^^xsd:float",
+            Some(("3.5", xsd::FLOAT)),
+            Some(("1.75", xsd::FLOAT)),
+        ),
+        (
+            "1 2.5e0",
+            Some(("3.5", xsd::DOUBLE)),
+            Some(("1.75", xsd::DOUBLE)),
+        ),
+        (
+            "1 \"NaN\"^^xsd:float",
+            Some(("NaN", xsd::FLOAT)),
+            Some(("NaN", xsd::FLOAT)),
+        ),
+        ("9223372036854775807 1", None, None),
+        ("1 UNDEF", None, None),
+        ("1 \"text\"", None, None),
+        (
+            "\"P1M\"^^xsd:yearMonthDuration \"P3M\"^^xsd:yearMonthDuration",
+            Some(("P4M", xsd::YEAR_MONTH_DURATION)),
+            Some(("P2M", xsd::YEAR_MONTH_DURATION)),
+        ),
+        (
+            "\"PT1H\"^^xsd:dayTimeDuration \"PT2H\"^^xsd:dayTimeDuration",
+            Some(("PT3H", xsd::DAY_TIME_DURATION)),
+            Some(("PT1H30M", xsd::DAY_TIME_DURATION)),
+        ),
+        (
+            "\"P1M\"^^xsd:yearMonthDuration \"PT1H\"^^xsd:dayTimeDuration",
+            None,
+            None,
+        ),
+    ] {
+        for (function, expected) in [("SUM", sum), ("AVG", average)] {
+            check(
+                format!("SELECT ({function}(?v) AS ?result) {{ VALUES ?v {{ {values} }} }}"),
+                expected,
+            );
+        }
+    }
+}
+
 /// TIMEZONE and TZ of dates and times of every kind, the hashes, and IRI() resolved against
 /// the query's BASE equal the reference evaluator; RAND, UUID, STRUUID, BNODE() and NOW() have the
 /// properties SPARQL gives them (fresh per call, or one value per query).
