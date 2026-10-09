@@ -38,6 +38,66 @@ fn an_unconsumed_result_keeps_its_shared_capacity_until_drop() {
 }
 
 #[test]
+fn graph_results_keep_shared_capacity_through_conversion_and_early_drop() {
+    use nrese_rdf::{GraphName, NamedNode, Quad};
+    use nrese_sparql::{QueryResults, evaluate_query_typed};
+
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for name in ["urn:a", "urn:b"] {
+        tx.insert(
+            Quad::new(
+                NamedNode::new_unchecked(name),
+                NamedNode::new_unchecked("urn:p"),
+                NamedNode::new_unchecked("urn:o"),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let workers = Workers::pooled(1).unwrap();
+    for text in [
+        "CONSTRUCT { ?s <urn:p> ?value } WHERE { VALUES ?s { <urn:a> <urn:a> <urn:b> } BIND(CONCAT(STR(?s), 'value') AS ?value) }",
+        "DESCRIBE ?s WHERE { VALUES ?s { <urn:a> <urn:b> } }",
+    ] {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        let shared = SharedBudget::new(1 << 20);
+        let options = QueryOptions {
+            workers: Some(workers.clone()),
+            shared_memory: Some(shared.clone()),
+            ..Default::default()
+        };
+        let retained = evaluate_query_typed(&snapshot, &query, &options).unwrap();
+        assert!(
+            shared.used() > 0,
+            "typed graph retains its evaluation reservation"
+        );
+        drop(retained);
+        assert_eq!(shared.used(), 0);
+        let result = evaluate_query(&snapshot, &query, &options).unwrap();
+        let QueryResults::Graph(mut triples) = result else {
+            panic!()
+        };
+        assert!(shared.used() > 0, "conversion retains the same reservation");
+        assert!(triples.next().unwrap().is_ok());
+        assert!(
+            shared.used() > 0,
+            "partial consumption must not release capacity"
+        );
+        drop(triples);
+        assert_eq!(shared.used(), 0);
+        let QueryResults::Graph(triples) = evaluate_query(&snapshot, &query, &options).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(triples.collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+        assert_eq!(shared.used(), 0);
+    }
+}
+
+#[test]
 fn update_where_uses_shared_capacity_and_reads_earlier_operations() {
     use nrese_sparql::{QueryResults, UpdateOptions, apply_update};
     let engine = Engine::new(EngineConfig::default()).unwrap();
