@@ -738,9 +738,13 @@ Eligible exact tests use the existing `tableau::Prepared` probe engine. One immu
 program per candidate batch includes fresh selectors implying each test's assumption;
 only the selected probe asserts its selector. The unselected definitions are conservative
 extensions of the premise. Each probe owns fresh search state, and temporary selector
-axioms are removed from the operation's scratch ontology. Scalar reductions remain for
+axioms and their source entries are removed from the operation's scratch ontology;
+interned expressions remain operation-local. Scalar reductions remain for
 unsupported forms and as a differential oracle. This removes repeated premise copying and
 compilation inside eligible batches; it does not change store/OWL semantic ownership.
+There is no cross-query compiled cache: the batch owns the program and assumptions.
+Admission checkpoints charge waiting time against the remaining timeout and observe
+cancellation; normalisation and compilation themselves are not preemptible.
 
 The shared runtime schedules independent candidates with one-worker child allowances.
 Classification and realisation reuse the same physical owner, and context fixpoint rounds
@@ -750,18 +754,32 @@ probe, preserving result order without unsafe shared writes. Retained native bou
 query accounting across repositories. Scratch ontology and compilation memory remain outside
 the tableau search allowance, so these repairs do not establish a whole-operation ceiling.
 
+Portfolio decisions signal sibling cancellation immediately and leave the request parent
+untouched. Dispatch waits for all runs to finish. Both may decide before observing the
+signal; the returned decided outcome is first in input order, so its telemetry must not
+be described as the earliest wall-clock winner. Runtime performance acceptance remains
+**BLOCKED**, as recorded in [STATUS.md](../STATUS.md); the bounded implementation does not
+complete P3/P4 or the wider DL roadmap.
+
 ## 13. Configuration
 
 This table describes the design target; the deployed settings and defaults are in the
 [configuration reference](../ops/config-reference.md). Resource enforcement is still
-partial. As of 9 October, request cancellation shares one atomic flag with nested
+partial. As of 9 October, query cancellation shares one atomic flag with nested
 consistency, exact-candidate and context-saturation checks; it does not start a watcher
 thread. A cancelled query does not publish a replacement consistency status for its
 revision. Checks occur at existing budget boundaries, so bounds construction, schema
 reading, normalisation and compilation are not all internally interruptible.
 
+The commit gate adapts its cancellation callback with a watcher. Pending-state and
+prior-state consistency checks, evidence minimisation and verification consume one gate
+deadline/token rather than restarting the timeout. Exhausted evidence work retains sound
+rejection evidence without claiming completed minimisation or verification.
+
 The context core's `Budget::max_memory` measures the **whole process** and remains a
-separate opt-in guard. `Budget::task_memory` accounts saturation-owned capacity: compiled
+separate opt-in guard. Server startup owns the global process fallback; opening a store
+does not change it. Store-local watches also reach DL bounds and diagnostics, with explicit
+zero disabling the local limit. `Budget::task_memory` accounts saturation-owned capacity: compiled
 program, context arena and registry, clauses and indexes, queued payloads, assertion state
 and worker buffers. Owners retain their reservations when moved and release them on drop;
 incremental capacity totals avoid rescanning all contexts at each checkpoint. Hash-table

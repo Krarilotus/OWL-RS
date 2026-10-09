@@ -270,7 +270,9 @@ restrictions and pending reads. Measure cold preparation separately from warm ex
 ### P3. Keep DL bound results in IDs and bound work before collecting it
 
 **Owners:** SPARQL owns typed ID results; store owns lower/upper orchestration; exec owns
-generic set/join primitives. Start at `dl/query.rs` and `query_executor::evaluate_prepared`.
+generic set/join primitives. The implemented boundary is `dl/query/` and
+`query_executor::evaluate_prepared`, with retained ID results in SPARQL's
+`native/typed_results.rs`.
 
 - Short-circuit a lower-bound true `ASK` before evaluating the upper bound on eligible paths.
 - Compare lower and upper results using ID columns, useful order and existing set kernels.
@@ -528,7 +530,9 @@ redundant simply because they compute the same answer.
 4. **P8 in bounded slices**, after P2; bring forward a slice only if it removes a measured
    bottleneck or materially simplifies a needed change. P9 accompanies every batch.
 5. **Final integration:** the repository's milestone gate, performance comparison, soak,
-   documentation reconciliation and maintainer review. The maintainer merges and pushes.
+   documentation reconciliation and maintainer review. The user explicitly authorises
+   implementation pushes and the parent PR to `refactor/engine-v2`; final merge remains
+   with the maintainer. Hooks and evidence gates still apply.
 
 Each package supplies: problem and owner; current contract; work to remove; expected cost
 change; correctness guard; performance result or explicit lack of one; deleted old paths;
@@ -574,7 +578,9 @@ DL operations narrow it, context rounds reuse it, and candidate children receive
 worker and memory share. Standalone APIs retain independent operation owners. Native queries,
 output encoding and update WHERE share the runtime; rule materialisation, bulk spill and
 storage maintenance retain separate owners. This is not a universal scheduler or tenant
-fairness policy. Startup, single-client and mixed-load performance qualification is pending.
+fairness policy. Runtime performance acceptance is **BLOCKED** by the initial comparison;
+the benchmark owner is investigating. [STATUS.md](../STATUS.md) records the current
+acceptance state separately from the completed root correctness gate.
 
 **Typed DL bounds (P3).** Skipping upper evaluation when a lower ASK is true is the smallest
 independent saving, subject to a guard proving the upper evaluator is not entered. Retaining
@@ -586,14 +592,18 @@ with `Term::Ord` removes formatting work but changes candidate priority under a 
 The implementation retains the legacy priority while comparing aligned ID rows; dictionary
 identity and computed-value remapping are SPARQL-owned. Lower-true ASK skips upper evaluation,
 and retained lower results are delivered without a second evaluation. Exact work receives only
-the admitted prefix; the upper ID table is still materialised. Timed qualification is pending.
+the admitted prefix; the upper ID table is still materialised. A genuine exact-gap fixture
+is being built by the P3 owner; this slice does not close all P3 coverage or performance gates.
 
-**Premise reuse (P4).** Candidate construction clones the ontology, and `entails`/`nonempty`
-clone it again for each test before normalising/compiling. Try an operation-local reusable
-scratch premise first, retaining the current engine and proving that consecutive assumptions,
-interned expressions, sources and diagnostics cannot leak between tests. An immutable
-compiled base with assumption overlays may save more work but changes search lifetimes and
-invalidation. It needs a separate design and measured clone/compile share before implementation.
+**Premise reuse (P4).** The implemented `dl/entailment/batch.rs` reuses the existing
+`tableau::Prepared` probe engine. Eligible tests share one compiled program per batch;
+fresh selectors imply their assumptions, and each probe starts fresh search state.
+Temporary axioms and source entries are truncated from the operation-local scratch premise;
+interned expressions remain local to that operation. Scalar reductions remain for unsupported
+forms and as a differential oracle. There is no cross-query compiled cache or new search
+framework. This removes repeated copying/compilation within eligible batches, not all premise
+copies. Compilation scratch and non-interruptible preparation remain outside a shared
+end-to-end resource envelope. Broader P4 reuse and performance acceptance remain open.
 
 **Context task memory (P1/P7).** Reuse `nrese_exec::Budget`/`SharedBudget` for generic charging
 where their semantics fit. They do not provide the missing size/ownership information:
@@ -617,4 +627,6 @@ The store forwards its configured value to both engines; unlimited operation is 
 Capacity, concurrent release, cancellation cleanup, exhaustion and equivalence guards pass.
 The [lab log](../design/performance.md#6-lab-log-of-the-performance-phase-from-5-october-2026)
 records accounting's measured cost and unqualified coverage. This closes saturation
-accounting, not the shared end-to-end envelope or configured worker-width gaps.
+accounting, not the shared end-to-end envelope. Participating dispatch now respects worker
+allowances; arbitrary nested work and owners outside the shared runtime are not universally
+capped. Process watches and task capacity reservations remain distinct contracts.
