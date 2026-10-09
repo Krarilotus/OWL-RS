@@ -42,12 +42,8 @@ working rules on top of them.
 The gate is [`scripts/check.sh`](../../scripts/check.sh); its tiers are described in
 [CONTRIBUTING.md](../../CONTRIBUTING.md):
 
-- `commit`: rustfmt; clippy on every target of changed crates; compile their dependents'
-  libraries; run changed crates' fast tests.
-- `push`: rustfmt and clippy on changed crates; all their tests, dependents' fast tests,
-  additional random seeds for changed crates, and the lock check.
-- `all`: both Rust workspaces, doc tests, lock and dependency checks, benchmark-suite
-  contract tests, and console checks. Benchmarks never run in a gate.
+Use that definition rather than maintaining a second tier list here. Benchmarks never
+run in a gate.
 
 Test placement follows the invariant's owner, not which tier happens to run it. A narrow
 commit gate does not establish that cross-component invariants passed; the push and full

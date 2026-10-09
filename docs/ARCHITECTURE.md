@@ -51,9 +51,11 @@ Outside the layer model: `nrese-sparql-reference` (the SPARQL evaluator written 
 | `nrese-store` | Product operations and the **mutation pipeline** (plan → validate → commit), gates, revision reporting and preload; one result cache per store; catalog `Runtime` ownership of physical workers and the shared native query budget; DL bound orchestration, candidate adaptation and completeness. | HTTP status codes, auth, request parsing; what a cached result is keyed by; generic execution kernels. |
 | `nrese-server` | Routes, content negotiation, auth backends, policy (limits, timeouts, rate limits), deployment posture, operator/console hosting, AI suggestions, mapping store errors to HTTP. | Any data semantics. It never touches the engine directly. |
 
-The runtime covers native query computation, output encoding, update WHERE and participating
+The runtime covers native query computation, direct-result ID-block encoding, update WHERE and participating
 DL work. Direct-result writers and their liveness callbacks stay with the caller;
 `SERVICE` callbacks run within native evaluation and have no caller-affinity guarantee.
+Generic serializers and small ASK/header encoding still run on the caller; completing
+output CPU ownership is an open gap, not permission to add another caller bypass.
 Rule materialisation, bulk spill and background storage keep their existing owners.
 This is neither a universal worker cap nor
 a whole-request memory ceiling. SPARQL owns retained ID results, their dictionary/computed

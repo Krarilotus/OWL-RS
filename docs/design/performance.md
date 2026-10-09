@@ -178,6 +178,73 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
 
+### 9 October: complete frozen Office campaign and consolidation audit
+
+The retained `4e8bd38` → `77478d1` campaign completed at 20:20:22 UTC: **95 cases,
+570 invocations, three independent repetitions per side**. The original queue covered
+87 cases; two larger-memory cases and six restored-input cases completed separately.
+The latter used verified inputs; the former retained their declared 12 GiB/10 GiB caps.
+No sample was discarded or restarted by this analysis. This compares the runtime/plan
+integration with an earlier reuse revision, not the whole branch against `0f46563`,
+and does not qualify later repairs or the current HEAD.
+
+The current existing `fast.py compare` was applied to all retained reports with both
+the default 2 ms floor and an explicit zero floor. The zero-floor result is exploratory
+reanalysis, not a retrospectively preregistered threshold. Both retain the same 10%/spread
+and bootstrap interval tests; throughput has no millisecond floor.
+
+| Flagged latency case | Baseline → candidate, ms | Ratio |
+|---|---:|---:|
+| `kernel-intersect` | 152.4 → 182.5 | 1.20 |
+| `writes-under-readers` | 0.2664 → 0.3835 | 1.44 |
+| `open-first-query` | 0.3355 → 2.385 | 7.11 |
+| `clients-lookups` | 0.103 → 0.173 | 1.68 |
+| `clients-sweep` | 0.514 → 0.936 | 1.82 |
+| `commits-plain` | 0.0087 → 0.01555 | 1.79 |
+| `commits-readers` | 0.7684 → 0.8485 | 1.10 |
+
+These are the registered cases' latency statistics, not interchangeable single-query
+latencies. Lookup-sweep throughput separately falls at every width, to 13.4–78.1% of
+baseline across 1/2/4/8/16/32/64 clients. Eighteen cases flag higher memory, chiefly query
+phase RSS. Phase peaks are not lifetime peaks: for example `rl-lubm100` has lower overall
+peak but higher query-phase peak. No case qualifies as faster under this campaign's
+10%/spread rule; smaller changes remain in the raw comparisons, not proof of neutrality.
+
+Six expected boundaries earn no timing verdict: four unsupported context ORE cases and
+two memory-limit cases. Four more cases fail existing checks on both revisions:
+`dl-transitive-400`, `mem-load-20m-2g`, `ql-owl2bench` and `vector-knn-filtered`.
+The QL answer counts pass but q15 lacks its required rewrite route; vector recall is below
+its required threshold. These must be investigated, not removed from the denominator or
+turned green by weakening checks. Taxonomy correctness remains unqualified where a case
+has no reference; successful execution alone supplies no missing oracle.
+
+Office evidence root:
+`/home/krarilotus/nrese-prep-20261009-4e8bd38/registered-fast-77478d1/`.
+`all-completed-audit-20261009/summary.json` records source-report hashes and both comparisons;
+each case retains merged reports, checks, routes, metrics, peaks and comparator output.
+Analysis reused the existing comparator (SHA-256
+`41ffe18de3bef5e13b25d0493d9a92461e77e50366e4d099c98024323050a5fa`).
+Original manifests retain commands, builds, input identities and host controls. The audit
+created no benchmark worktree, target directory or local dataset copy.
+
+The source audit accounts for all 167 files changed through `4a21a90` against `0f46563`.
+Most large additions in plan, numeric/aggregate and DL query modules move existing code;
+the old production paths are gone. Retained algebra/plan adapters have live callers with
+different representations; reference tests and rollback/monotone state have distinct
+contracts. This follow-up removes two unused context forwarding layers, derives DL
+options once from actual workers and reuses the existing exact-test vocabulary helper.
+It adds no scheduler, solver, dependency or speculative hardware interface. Stale QL
+lifecycle claims and duplicated status/gate prose are consolidated into their owners.
+
+Machine-level conclusions stay narrow. The WCOJ intersection and shared search sources
+are identical between these frozen benchmark revisions, so their extraction cannot explain
+the newly measured intersection regression. The frozen context binary has no out-of-line
+`Charge::set` symbol, consistent with inlining, but that does not prove accounting is free.
+Next isolate dispatch, allocation locality and actual generated hot paths before changing
+kernels. Retain the physical CPU boundary; generic serialization coverage and any substantial
+coalescing or DL base-reuse wiring need the documented design checkpoint. No new latency
+or throughput improvement is claimed for this consolidation batch.
+
 ### 9 October: native scheduling profiles and width diagnostic
 
 Four short Phuoc captures compare frozen `4e8bd38` and `77478d1` at one and

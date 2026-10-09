@@ -123,22 +123,13 @@ pub fn classify(
 
 /// Normalises, compiles and saturates `ontology`.
 pub fn saturate(ontology: &Ontology, options: &Options) -> Result<Saturated, Unsupported> {
-    saturate_with_cancel(ontology, options, None)
-}
-
-/// As [`saturate`], stopping at budget checkpoints when the caller cancels.
-/// Normalisation and compilation are checked at their boundaries.
-pub fn saturate_with_cancel(
-    ontology: &Ontology,
-    options: &Options,
-    cancel: Option<crate::tableau::Cancel>,
-) -> Result<Saturated, Unsupported> {
     let workers = nrese_exec::workers::Workers::new(options.threads.max(1))
         .unwrap_or_else(|_| nrese_exec::workers::Workers::serial());
-    saturate_with_workers(ontology, options, cancel, &workers)
+    saturate_with_workers(ontology, options, None, &workers)
 }
 
-/// Normalises and saturates on caller-owned physical workers.
+/// Normalises and saturates on caller-owned physical workers, observing cancellation
+/// at budget checkpoints. Normalisation and compilation are checked at their boundaries.
 pub fn saturate_with_workers(
     ontology: &Ontology,
     options: &Options,
@@ -168,18 +159,9 @@ pub fn saturate_normalised(
     classes: &[Term],
     options: &Options,
 ) -> Result<Saturated, Unsupported> {
-    saturate_normalised_with_cancel(normalised, classes, options, None)
-}
-
-fn saturate_normalised_with_cancel(
-    normalised: &nrese_owl::Normalised,
-    classes: &[Term],
-    options: &Options,
-    cancel: Option<crate::tableau::Cancel>,
-) -> Result<Saturated, Unsupported> {
     let workers = nrese_exec::workers::Workers::new(options.threads.max(1))
         .unwrap_or_else(|_| nrese_exec::workers::Workers::serial());
-    saturate_normalised_with_workers(normalised, classes, options, cancel, &workers)
+    saturate_normalised_with_workers(normalised, classes, options, None, &workers)
 }
 
 /// Saturates using caller-owned workers. The pool survives all ABox rounds and is not

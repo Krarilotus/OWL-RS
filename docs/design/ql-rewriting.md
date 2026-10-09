@@ -86,12 +86,10 @@ known through a source read; *ours* = measured or tested here).
 
 **Current lifecycle (9 October).** Realised-witness results are scoped to the same
 snapshot identity. A failed or budget-skipped probe is not cached as a negative answer;
-a later request can retry it. Store-side status preparation now uses the request's
-cancellation token. Reporting and execution still prepare separately, however, and the
-status wrapper still discards preparation errors. Preparing once against one captured
-execution view, retaining its report, and propagating those errors is an open package
-in the [performance plan](../plan/2026-10-09-performance-architecture.md). Cancellation
-at evaluator boundaries does not yet make every schema scan or rewriting loop interruptible.
+a later request can retry it. Preparation, reporting and execution share the lifecycle
+in §1; the old separate status preparation and error-swallowing wrapper are removed.
+Cancellation at evaluator boundaries does not yet make every schema scan or rewriting
+loop interruptible.
 
 **The QL part of the TBox.** From every axiom, what OWL 2 QL can say (with three harmless
 generalisations):

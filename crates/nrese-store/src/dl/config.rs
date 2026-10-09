@@ -108,13 +108,18 @@ impl DlConfig {
         }
     }
 
-    pub(crate) fn classification_options(&self) -> nrese_dl::classify::Options {
+    pub(crate) fn classification_options(
+        &self,
+        workers: nrese_exec::workers::Workers,
+    ) -> nrese_dl::classify::Options {
         let memory = self.memory_per_worker(1);
+        let width = workers.width();
         nrese_dl::classify::Options {
-            threads: self.workers(),
+            threads: width,
+            workers: Some(workers),
             timeout: Some(self.timeout),
             task_memory: (memory != usize::MAX).then_some(memory),
-            tableau: self.tableau(self.timeout, self.memory_per_worker(self.workers())),
+            tableau: self.tableau(self.timeout, self.memory_per_worker(width)),
             ..nrese_dl::classify::Options::default()
         }
     }
@@ -131,7 +136,8 @@ impl DlConfig {
         }
     }
 
-    /// The workers a task gets.
+    /// Standalone worker count. Store operations instead narrow their existing
+    /// runtime owner, which can have fewer workers than this configured maximum.
     pub fn workers(&self) -> usize {
         match self.threads {
             0 => std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
@@ -151,11 +157,14 @@ mod memory_tests {
             threads: 4,
             ..DlConfig::default()
         };
-        let options = config.classification_options();
+        let workers = nrese_exec::workers::Workers::new(4).unwrap().limited(2);
+        let options = config.classification_options(workers.clone());
+        assert_eq!(options.threads, 2);
+        assert_eq!(options.workers.as_ref(), Some(&workers));
         assert_eq!(options.task_memory, Some(1024));
-        assert_eq!(options.tableau.max_memory, 256);
+        assert_eq!(options.tableau.max_memory, 512);
         config.memory_bytes = 0;
-        let options = config.classification_options();
+        let options = config.classification_options(workers);
         assert_eq!(options.task_memory, None);
         assert_eq!(options.tableau.max_memory, usize::MAX);
         assert_eq!(config.memory_per_worker(4000), usize::MAX);
