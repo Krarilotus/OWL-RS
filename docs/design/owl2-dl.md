@@ -466,7 +466,13 @@ search, where 910's facts are unconditional.
 an optimisation of the fallback search, measured on its own. It may bring 906 (621 elements)
 into budget; it can't help 907.
 
-Built in the performance phase.
+**As built (7 October):** layers 1 to 4 in `nrese_dl::numbers` (`problem`, `closure`,
+`candidate`, `validate`). Layer 2 replaced the clause-level size comparison and reads the
+`NumberProblem`, with the degree sums of properties that have a domain and a range of exact
+degrees. `Validated` has a private field: only `validate` makes one. The hypertableau asks
+`numbers::model` before it compiles a consistency test (not a class probe, and not where the
+caller keeps the model, since the compressed model is no completion graph). DL-906 and 907
+are consistent and DL-910 inconsistent in about 1 ms each, with no node and no branch point.
 
 ### Caching
 
