@@ -1,6 +1,52 @@
 use super::*;
 
 #[test]
+fn lower_true_ask_evaluates_once_and_delivers_that_result() {
+    use crate::{
+        MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlUpdateRequest,
+    };
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
+    let pipeline = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    );
+    pipeline
+        .apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(
+                "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#> \
+         INSERT DATA { :a a [ owl:unionOf ( :B :C ) ] . :b a :B . }",
+            )),
+            &Requester::all(),
+            &MutationTicket::new(),
+        )
+        .unwrap();
+    let prepared = store
+        .prepare_query(&crate::SparqlQueryRequest::all("ASK { ?x a <urn:test:B> }"))
+        .unwrap();
+    crate::query_executor::BOUND_EVALUATIONS.with(|n| n.set(0));
+    let outcome = answer(
+        &store,
+        &prepared,
+        &CancellationToken::new(),
+        DlAnswers::Exact,
+    )
+    .unwrap();
+    let Outcome::Answers(answers @ Answers::Boolean(true), status, detail) = outcome else {
+        panic!("retained lower truth")
+    };
+    assert!(status.complete);
+    assert!(detail.paths.contains(&"lower-true-ask"));
+    let mut out = Vec::new();
+    crate::query_executor::write_answers(&prepared, answers, &mut out).unwrap();
+    assert!(String::from_utf8(out).unwrap().contains("true"));
+    crate::query_executor::BOUND_EVALUATIONS
+        .with(|n| assert_eq!(n.get(), 1, "upper was never evaluated"));
+}
+
+#[test]
 fn cancelled_consistency_is_not_published_or_reused_by_another_request() {
     let store = StoreService::new(crate::StoreConfig::in_memory()).unwrap();
     let snapshot = store.read_snapshot(None);

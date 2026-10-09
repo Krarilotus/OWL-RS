@@ -103,7 +103,7 @@ impl Part {
 }
 
 /// Heap bytes of a term's strings, roughly (for the budget).
-fn term_heap(term: &Term) -> usize {
+pub(crate) fn term_heap(term: &Term) -> usize {
     match term {
         Term::NamedNode(n) => n.as_str().len(),
         Term::BlankNode(b) => b.as_str().len(),

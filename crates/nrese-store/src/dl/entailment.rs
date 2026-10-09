@@ -11,6 +11,9 @@ use nrese_owl::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, ObjProp, On
 
 use super::consistency::{self, Budget, Verdict};
 
+mod batch;
+pub(crate) use batch::{Batch, Test};
+
 /// Whether an axiom (or every axiom of a set) is entailed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Entailed {
@@ -346,9 +349,23 @@ pub fn entails_ontology(
         };
         conclusion.axioms.iter().map(|a| import.axiom(a)).collect()
     };
+    let tests: Vec<_> = axioms.iter().cloned().map(Test::Axiom).collect();
+    let started = std::time::Instant::now();
+    let compiled = Batch::new(&mut o, &tests);
     let mut answer = Entailed::Yes;
-    for axiom in &axioms {
-        answer = answer.and(entails(&o, axiom, fresh, budget));
+    for (index, axiom) in axioms.iter().enumerate() {
+        let remaining = Budget {
+            timeout: budget.timeout.saturating_sub(started.elapsed()),
+            ..budget.clone()
+        };
+        let found = compiled.check(index, &remaining).unwrap_or_else(|| {
+            let remaining = Budget {
+                timeout: budget.timeout.saturating_sub(started.elapsed()),
+                ..budget.clone()
+            };
+            entails(&o, axiom, fresh, &remaining)
+        });
+        answer = answer.and(found);
         if answer == Entailed::No {
             break;
         }

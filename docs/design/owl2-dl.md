@@ -725,6 +725,31 @@ optimisations"), per level:
 | Layout | interning; arenas; trails; persistent dependency sets; split labels | Store `TermId`s throughout (no string decoding on any path); 64-byte hot nodes; bitset labels; clause arenas; mapped checkpointed caches with axiom footprints (the derived-index mechanism of 3 October). |
 | Machine | coarse parallelism over tests, modules and contexts | Morsel parallelism and work stealing as in the query engine; SIMD for label subset and clash tests, blocking signatures and the candidate-subsumer matrix, **only where profiles show it** (D: no published evidence either way); GPU off the critical path (all reports). |
 
+### Bound results and exact-test reuse (9 October)
+
+The store's `dl/query` modules separate query analysis, ID-level gaps and exact-test
+adaptation. SPARQL owns each retained solution table's snapshot, computed terms and
+reservation. Lower and upper results must share a dictionary; query-local computed IDs
+are remapped before raw-ID comparison. Lower bags and delivery order survive; the capped
+candidate prefix retains its former priority. A true lower ASK skips the upper evaluation.
+The upper ID table remains materialised, while decoded exact-candidate rows are batched.
+
+Eligible exact tests use the existing `tableau::Prepared` probe engine. One immutable
+program per candidate batch includes fresh selectors implying each test's assumption;
+only the selected probe asserts its selector. The unselected definitions are conservative
+extensions of the premise. Each probe owns fresh search state, and temporary selector
+axioms are removed from the operation's scratch ontology. Scalar reductions remain for
+unsupported forms and as a differential oracle. This removes repeated premise copying and
+compilation inside eligible batches; it does not change store/OWL semantic ownership.
+
+The shared runtime schedules independent candidates with one-worker child allowances.
+Classification and realisation reuse the same physical owner, and context fixpoint rounds
+do not recreate pools. Finite search memory is divided by actual concurrent work; zero
+configured memory remains unlimited. Narrow irregular batches let idle lanes claim the next
+probe, preserving result order without unsafe shared writes. Retained native bounds share
+query accounting across repositories. Scratch ontology and compilation memory remain outside
+the tableau search allowance, so these repairs do not establish a whole-operation ceiling.
+
 ## 13. Configuration
 
 This table describes the design target; the deployed settings and defaults are in the
@@ -745,15 +770,15 @@ backing capacity and assertion B-tree nodes are estimated, not allocator telemet
 `dl.memory` configures context saturation and the tableau's existing capacity checks.
 Zero means unlimited; the standalone context API defaults to no accounting. Classification
 uses this configured value rather than its standalone driver's fixed tableau default,
-dividing the tableau allowance among configured workers. Checks happen at growth/work
+dividing the tableau allowance among actual workers. Checks happen at growth/work
 boundaries, so in-flight work can temporarily exceed a budget. Exhaustion yields an
 incomplete/budget outcome, never a classification inferred from truncated work. There is
 no allocation-by-allocation ceiling.
 
 Normalisation and compilation temporaries, input snapshots, result/proof assembly,
-allocator metadata and scheduler stacks are outside context accounting. Retained lower
-bounds and concurrent exact-candidate work still need a shared admission/envelope owner;
-these per-engine budgets do not establish an end-to-end query or process ceiling. The
+allocator metadata and scheduler stacks are outside context accounting. Retained native
+bounds now share query accounting, and exact work uses runtime dispatch allowances; DL
+compilation and per-engine task budgets still lack a shared end-to-end memory envelope. The
 context profile's `task_memory_peak` reports successfully reserved saturation capacity,
 not RSS or unreserved overshoot, and is zero when accounting is disabled.
 
@@ -765,7 +790,7 @@ not RSS or unreserved overshoot, and is zero when accounting is disabled.
 | `dl.timeout`, `dl.memory` | per task | 30 min, 75% of RAM |
 | `dl.fallback.clauses`, `dl.fallback.equalities`, `dl.fallback.contexts` | budgets of §4 | from the ORE and Oxford runs |
 | `dl.race` | `on`, `off` | `on` above a module size |
-| `dl.threads` | count | every core |
+| `dl.threads` | count; 0 inherits runtime workers | 0 |
 | `dl.cache` | `sat`, `completion-graph`, `off` | `sat` |
 | `dl.explanations` | `proofs` (record derivations), `off` | `proofs` |
 
