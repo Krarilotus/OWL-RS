@@ -61,7 +61,11 @@ comparator also `hangs`, `unsupported` and `not expressible`.
 - **A quiet slot per case.** Each case's timed repetitions, and each comparison's runs, hold
   the machine's quiet slot (`scripts/quiet-slot.sh`: one timing at a time, no build running,
   new builds waiting), taken per case so other builds wait minutes, not the whole run.
-  Waiting for the slot doesn't count against a case's timeout. `NRESE_QUIET_SLOT=0` skips it.
+  Waiting for the slot doesn't count against a case's timeout. If compilers remain after
+  `NRESE_QUIET_DRAIN_S` (default 600 seconds), the guard exits 124, releases the slot and
+  does not start the measurement; the driver fails that slot acquisition. Zero checks
+  without waiting. Process-inspection failures also abort (exit 2). `NRESE_QUIET_SLOT=0`
+  skips the slot for counts; it is not a way to accept timings under compiler contention.
 - **Memory:** the container's peak (cgroup `memory.peak`) and the process's (`VmHWM`), after
   the load, after reasoning and at the end.
 - **Repetitions:** `--reps 2` by default, interleaved: every case once, then every case
