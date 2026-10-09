@@ -116,7 +116,7 @@ is a separate, implemented engine path. Controls and limitations are mapped in
 
 | Stage from [query-plan.md](query-plan.md) | Current implementation |
 |---|---|
-| 1. Logical plan and lowering | Built in `nrese-sparql/src/plan.rs`: `Plan::of` and `Plan::lower`; execution still consumes the lowered algebra |
+| 1. Logical plan and lowering | Built in `nrese-sparql/src/plan/`: properties inspect nodes directly and consuming lowering moves buffers; execution still consumes lowered algebra |
 | 2. Named rewrites | Join flattening and eager aggregation are built; additional strategy decisions still live in the native interpreter |
 | 3. Estimates, physical choices, EXPLAIN before execution | Partly built: `plan_query` estimates the rewritten logical plan without executing it; BGP order uses statistics and characteristic sets/pairs. A complete physical operator plan is unfinished |
 | 4. Execute the physical plan | Unfinished: `native::Context::eval_operator` still dispatches on algebra nodes |

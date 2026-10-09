@@ -60,7 +60,7 @@ fn cancellable(
 /// The budget of a check under `store`'s settings.
 pub(crate) fn budget(store: &StoreService, cancel: Option<Cancel>) -> Budget {
     let dl = &store.config().dl;
-    let workers = store.runtime().workers().limited(dl.workers());
+    let workers = store.runtime().workers().limited(dl.threads);
     Budget {
         timeout: dl.timeout,
         memory_bytes: dl.memory_per_worker(1),
