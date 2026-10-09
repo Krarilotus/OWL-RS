@@ -356,16 +356,16 @@ pub(crate) fn write_results(
     version: Option<&'static str>,
     out: &mut dyn std::io::Write,
 ) -> Option<Result<(), crate::query::WriteResultsError>> {
+    match query {
+        Query::Construct { .. } | Query::Describe { .. } => return None,
+        Query::Ask { .. } if format != ResultsFormat::Json => return None,
+        _ => {}
+    }
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let (pattern, form, _, _) = match native_pattern(query, options, &ctx) {
         Ok(native) => native,
         Err(error) => return Some(Err(error.into())),
     };
-    match form {
-        Form::Construct(_) | Form::Describe => return None,
-        Form::Ask if format != ResultsFormat::Json => return None,
-        _ => {}
-    }
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let solutions = match ctx.eval_root(&pattern, options.pin.as_ref()) {
         Ok(solutions) => solutions,
