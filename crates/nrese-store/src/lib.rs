@@ -14,7 +14,9 @@ pub mod dl;
 pub mod draft_check;
 mod entailment;
 pub mod error;
-/// The process's memory and the limit long operations stop at ([`StoreConfig::process_memory_bytes`]).
+/// Process-memory measurements and explicit host policy helpers. Store operations use
+/// [`StoreConfig::process_memory_bytes`] for their own watches; opening a store does not
+/// install a process-wide limit. An embedding host may install that fallback explicitly.
 pub use nrese_exec::memory;
 pub mod graph_store;
 mod graph_store_executor;

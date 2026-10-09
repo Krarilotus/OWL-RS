@@ -91,9 +91,6 @@ impl StoreService {
         runtime.validate(&config)?;
         nrese_engine::set_index_encoding(config.index_encoding);
         nrese_engine::set_vocabulary_encoding(config.vocabulary);
-        // Reasoning stops at the process's memory limit on every path, the DL bounds'
-        // own evaluations included, not only where the store passes its watch.
-        nrese_exec::memory::set_process_limit(config.process_memory_bytes);
         // Only switched off: on leaves what the process was started with (an operator's
         // `MIMALLOC_ALLOW_THP=0` switches them off the same way).
         if !config.huge_pages {
@@ -1401,18 +1398,22 @@ impl StoreService {
         }
     }
 
-    /// The closure's size with equality replicated and over representatives, for
-    /// `program` on the asserted data ([`crate::reasoning::equality_report`]).
-    /// A watch over the process's memory limit; `None` without a limit.
+    /// A watch over this store's process-memory policy; `None` disables its watch.
+    /// Opening a store never changes the process owner's global safety fallback.
     pub(crate) fn memory_watch(&self) -> Option<nrese_exec::memory::MemoryWatch> {
         let limit = self.config.process_memory_bytes;
         (limit > 0).then(|| nrese_exec::memory::MemoryWatch::new(limit))
     }
 
+    /// The closure's size with equality replicated and over representatives, for
+    /// `program` on the asserted data, or an explicit diagnostic if stopped.
     pub fn equality_report(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> String {
+        let watch = self.memory_watch();
+        let stop = || watch.as_ref().is_some_and(|watch| watch.exceeded());
         let tx = self.engine.transaction();
         let program = crate::reasoning::Program::compile(&program.into(), &|term| tx.intern(term));
-        crate::reasoning::equality_report(&program, tx.base())
+        nrese_reasoner::engine::equality_report_until(&program, tx.base(), &stop)
+            .unwrap_or_else(|_| "equality: stopped by the process memory limit".to_owned())
     }
 
     /// Replaces the inferred stack with `program`'s closure over the asserted data, as one

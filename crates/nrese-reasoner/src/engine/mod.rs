@@ -42,7 +42,9 @@ pub use explain::{
     JustifiedStatement, explain_fact, explain_violation, justify_fact,
 };
 pub use maintain::{EngineBase, Maintenance, maintain};
-pub use materialise::{Closure, equality_report, materialise, materialise_until};
+pub use materialise::{
+    Closure, equality_report, equality_report_until, materialise, materialise_until,
+};
 
 /// A rule program compiled against the engine dictionary: its rules, list vocabulary and
 /// schema vocabulary as engine ids. Ids never change once interned, so it is built once.

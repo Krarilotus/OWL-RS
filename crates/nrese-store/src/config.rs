@@ -47,6 +47,9 @@ pub struct StoreConfig {
     /// reasoning of a commit) stops with [`StoreError::ProcessMemoryLimit`](crate::StoreError::ProcessMemoryLimit)
     /// instead of taking the machine; 0 is no limit. By default three quarters of what the
     /// process may use ([`default_process_memory_bytes`]).
+    /// This is the store's watch policy, not a write to the global process limit.
+    /// The server installs its process-wide fallback separately at startup. Disabling
+    /// this watch does not bypass a fallback explicitly installed by the process owner.
     pub process_memory_bytes: u64,
     /// Whether the process's memory may be backed by transparent huge pages (Linux;
     /// `nrese_exec::memory::set_transparent_huge_pages`): faster work over large heaps
