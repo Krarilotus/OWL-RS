@@ -178,6 +178,37 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
 
+### 10 October: cache validity and explicit DL retries
+
+QL compilation now compares the exact sorted schema input and the dictionary id of
+`owl:Thing` across snapshot identities. The old cache could return no answer after an
+ordinary data addition introduced `owl:Thing`, while fresh preparation returned `ann`.
+The differential regression reproduces that failure. Snapshot identity already bounds
+dictionary reads, so its fast hit needs no additional lookup. Hashing is removed; the
+existing scan buffer is retained as the exact key, costing 32 bytes per statement plus
+entry metadata, per reader entry (the existing maximum is eight).
+
+Five release process pairs on Office reuse the existing QL fixtures with a disposable
+probe. Refreshing an unchanged 1004-statement schema after a view change takes median
+38.230 -> 30.426 us (20.4% less); sample ranges [36.515, 41.520] and [27.854, 32.020] us
+do not overlap. The 4/104-statement cases and same-view hits have overlapping ranges;
+the sub-millisecond hit aggregates earn no timing claim. This is a component diagnostic,
+not an end-to-end improvement, concurrency qualification or clearance of the runtime gate.
+The schema payload retained in the three cases is 128/3328/32128 bytes; no memory-neutral
+claim is made. Probe source, exact binary/source identities and all samples are retained
+in the [run record](../../benches/runs/2026-10-10-cache-contracts-d31010c.toml).
+
+The owner selected complete-only caching for explicit DL classification and realisation.
+Incomplete requests retry under the existing configured budget, including unsupported
+ontologies; the query lower-bound cache remains separate. Late publication from an older
+revision no longer evicts a newer complete result. Both DL policy guards fail against the
+old code and pass with the repair; the initial rejected zero-timeout fixture is retained
+in the raw history and replaced by a positive-expired timeout. Focused Office checks pass
+6 QL tests, 2 DL cache-policy tests and 4 existing classification integration tests.
+The obsolete hash-only key and stale documentation of missing Base reuse are removed.
+No new scheduler, default limit or general cache is introduced. Profiling of result-cache
+key construction, shared ranking, ID-table copies and serialization remains next.
+
 ### 9 October: bounded DL Base reuse and deadline repair
 
 Against clean `be5c3d7`, the final source-qualified candidate reuses the initial

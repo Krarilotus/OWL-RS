@@ -510,6 +510,15 @@ disagreement that isn't adjudicated.
 
 ## 7. Classification and realisation
 
+**Explicit-result caching (10 October).** The store caches only complete results of
+explicit classification and realisation requests, by asserted revision. A subsequent
+request retries an incomplete attempt under the existing configured budget; this also
+repeats work for unsupported ontologies. It introduces no automatic background retries
+or new timeout. Publication keeps the first complete result for a revision and prevents
+an older in-flight request from displacing a newer cached revision. Each request still
+receives the result for its own snapshot. Query lower bounds retain their separate
+schema-lifetime taxonomy cache, including sound partial knowledge.
+
 **Completion-state ownership (9 October).** Each stage owns its compiled `Prepared`.
 `consistency_with_base` runs the existing search once and can retain its deterministic
 checkpoint and exact model in `Base`; the former separate `base()` search and

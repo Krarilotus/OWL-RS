@@ -39,13 +39,16 @@ known through a source read; *ours* = measured or tested here).
   `as_written` (it changes the answers, not just the plan). EXPLAIN lists it as the rewrite
   `ql-tree-witness`, and the plan shows the union it made.
 - **The schema at the snapshot.** The TBox is read from the snapshot the query reads
-  (asserted and inferred statements, every graph, as the rules read them), mapped by
+  (asserted schema statements, every graph), mapped by
   `nrese-owl`'s reverse RDF mapping, and compiled (`nrese-owl::ql`). It is cached per store
-  and rebuilt only when the schema statements change. Its fast key is the engine's
+  and rebuilt when a compiler input changes. Its fast key is the engine's
   `SnapshotIdentity`, including pending changes and visibility masks, alongside the
-  reader's graph access. On a new identity, a hash of the schema statements permits
-  reuse of the compiled TBox when the schema is unchanged. A revision and statement
-  counts alone cannot distinguish two pending views or a same-count replacement.
+  reader's graph access and the dictionary id of `owl:Thing`. Ordinary data can introduce
+  that id without changing the schema. On a new identity, exact equality of the sorted
+  schema statements permits reuse; a hash is not a proof of equality. The cache retains
+  the scan's statement buffer (32 bytes per statement, up to eight reader entries),
+  instead of retaining a hash alone. No additional statement copy is made. A revision
+  and statement counts cannot distinguish two pending views or a same-count replacement.
 - **Only where the closure applies:** the default graph of a query without a dataset of
   its own, read with the inferred statements, also as `GRAPH <urn:x-arq:DefaultGraph>`
   (another store's name for it, `compat`). Not inside `GRAPH` over a named graph, which
