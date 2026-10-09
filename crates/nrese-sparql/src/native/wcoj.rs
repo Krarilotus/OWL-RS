@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, ProbeCursor, QuadPattern, ReadModel, Seek, Snapshot, TermId};
+use nrese_exec::search::partition_point_from;
 use rayon::prelude::*;
 
 /// A pattern position: a constant id, or a variable (index into the query's variables).
@@ -937,12 +938,7 @@ fn intersect(small: &[u64], large: &[u64]) -> Vec<u64> {
     let mut out = Vec::with_capacity(small.len());
     let mut rest = large;
     for &value in small {
-        // Exponential then binary search for the first element >= value.
-        let mut step = 1;
-        while step < rest.len() && rest[step - 1] < value {
-            step *= 2;
-        }
-        let skip = rest[..step.min(rest.len())].partition_point(|&x| x < value);
+        let skip = partition_point_from(rest, 0, |&x| x < value);
         rest = &rest[skip..];
         match rest.first() {
             Some(&x) if x == value => out.push(value),
@@ -977,5 +973,10 @@ mod tests {
             assert_eq!(intersect(&a, &b), expected);
             assert_eq!(intersect(&b, &a), expected);
         }
+        // Though callers supply distinct lists, the merge keeps a matching repeated
+        // candidate and does not consume the longer side's match between probes.
+        assert_eq!(intersect(&[1, 1, 3], &[1, 2, 3, 3]), [1, 1, 3]);
+        assert_eq!(intersect(&[1, 2, 3, 3], &[1, 1, 3]), [1, 1, 3]);
+        assert_eq!(intersect(&[0, u64::MAX], &[0, 1, u64::MAX]), [0, u64::MAX]);
     }
 }
