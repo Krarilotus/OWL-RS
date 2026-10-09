@@ -1,14 +1,20 @@
 # The query plan
 
-The native executor (`nrese-sparql/src/native/mod.rs`, 5,400 lines) walks the SPARQL
-algebra and decides as it goes: `eval_operator`'s match guards pick a strategy per node
-(a path joined to a pattern is followed from its bound end, a `SERVICE` gets the values
-of what it is joined to, a `LIMIT` goes down to where rows are made, the smaller side of
-a join runs first), and join order is chosen inside one basic graph pattern
-(`native/plan.rs`). That is fast where it applies, but every new strategy is another
-guard in the interpreter, nothing is planned across the algebra's node boundaries (two
-basic graph patterns joined to each other are ordered separately), and EXPLAIN can only
-report what ran.
+The native executor still walks SPARQL algebra, after rewrites on a logical plan
+(`nrese-sparql/src/plan.rs`). Join flattening combines eligible groups so their patterns
+can be ordered together; eager aggregation reduces a join's inputs before its product
+is made. The plan is lowered back to algebra for execution.
+
+`native::Context::eval_operator` still selects strategies while executing: paths can be
+followed from their bound end, `SERVICE` receives bindings, and LIMIT can stop work
+early. BGP join order is chosen in `native/plan.rs`. These choices have not yet all
+become physical plan nodes consumed by the executor.
+
+EXPLAIN without ANALYZE already reports the rewritten logical plan and estimated rows
+through `plan_query` and `native/estimate.rs`; EXPLAIN ANALYZE records the operators
+that ran and their actual work. Pre-execution estimates are not a complete physical
+operator plan. The current stage boundaries are summarised in
+[execution-core.md §5](execution-core.md#5-planning-built-and-unfinished).
 
 ## Target
 

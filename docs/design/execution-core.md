@@ -31,10 +31,14 @@ nrese-engine   dictionary, permutations, snapshots, probe cursors, counts, stati
 - **Reuse is at the kernel boundary.** The reasoner's rule joins remain its own; it
   reuses sort, search, closures and memory monitoring where applicable. A query's BGP
   planner and worst-case-optimal join remain in `nrese-sparql`, not `nrese-exec`.
-- **The oracle stays independent.** Tests compare native answers with
-  `nrese-sparql-reference`, which evaluates the specification's algebra without the
-  native optimiser. Comparing optimised and `as_written` execution is an additional
-  check, not a replacement for that oracle.
+- **The reference independently evaluates the algebra.** Tests compare native answers
+  with `nrese-sparql-reference`, which uses neither the native optimiser nor its
+  algebra execution. It shares expression evaluation and value helpers, including
+  `SUM`, `AVG` and `GROUP_CONCAT`, with production; agreement does not independently
+  validate that arithmetic. Shared value semantics need expected-result tests such
+  as the W3C suites and independent engines such as [Jena](../../benches/oracle/README.md).
+  Comparing optimised and `as_written` execution is an additional check, not a
+  replacement for reference algebra evaluation.
 
 The kernel boundary is described in
 [`nrese-exec/src/lib.rs`](../../crates/nrese-exec/src/lib.rs); the query entry points and
