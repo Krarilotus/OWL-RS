@@ -8,8 +8,9 @@ in the branch), **deferred** (not done, with the reason and where it went), or *
   [capability matrix](spec/06-target-capability-matrix.md).
 - Why and in which order: [the roadmap](ROADMAP.md); the designs in [design/](design/).
 
-Branch update: 9 October 2026, partial milestone at `881119d` (production code identical
-to the measured `77478d1`), for the
+Branch update: 9 October 2026, repair batch `a6331c7` passed the normal commit and push
+gates on Office-PC. Completed Phuoc measurements cover `77478d1`, whose
+production code matches `881119d`, not later repairs. Work remains for the
 authorised PR to `refactor/engine-v2`. These are bounded slices, not completion of the
 performance programme or the historical product roadmap. `0f46563` remains the programme's
 historical comparison base; individual experiments identify their own base and candidate.
@@ -51,17 +52,23 @@ Subsequent query-consistency deadline fixes (`4e88d55`) and graph-result ownersh
 added to the earlier workspace total. The later remote push gate at `881119d` **failed**:
 DL bounds fuzz seeds 18273/18274/18275 failed, and the offline lock check lacked required
 cached dependencies. Seed 18273 reproduces the same failure on baseline `4e8bd38`; this
-establishes preexistence, not correctness or a gate waiver. Small bounds/gap/cancellation
-repairs are **in preparation**, not validated. No successful push followed this gate.
+establishes preexistence, not correctness or a gate waiver. The repair in `a6331c7`
+passes those three focused seeds and the normal push gate: format, lint, regular tests,
+new seeds 93060–93062, locks and 22 suite-contract tests. The branch push completed at
+16:46:12 UTC. External conformance corpora were missing on Office; their early-returning
+test wrappers confer no corpus coverage. Restoring the pinned inputs and running the
+existing conformance guards remains separate qualification work.
 
-Completed Phuoc coverage is partial: 96 native CLI processes, 24 native-suite processes
-and 18 client/cache processes. Selected registered inputs/checks ran; this is not the full
-fast suite or competitor coverage. Store classification checked counts/engine, not full
-taxonomy content; RL maintained closure was checked by size, with exported sets obtained
-after recomputation. Native write-scaling checks HTTP success without validating its final
-numeric count. Office's frozen `77478d1` fast campaign is still **running**; no completion
-or full-tier credit is claimed. Missing coverage and raw provenance remain explicit, and
-idle host time is not measurement time.
+Completed Phuoc evidence contains **222 execution records**: 96 CLI, 18 client/cache,
+84 supplemental and 24 native-suite cycles. This covers six of 95 fast cases through
+native CLI variants and four selections from the 24-workload suite; no full campaign or
+competitor credit follows. Store classification checks counts/engine, not full taxonomy;
+RL maintained closure checks sizes, with exports after recomputation. Write-scaling checks
+HTTP success without validating the final numeric count. Horn late-phase high-water
+readings are reset-affected; diagnostics do not establish a peak regression. Gap wins do not clear acceptance.
+The completed [run record](../benches/runs/2026-10-09-phuoc-partial-77478d1.toml) identifies
+verified raw provenance. Office's frozen `77478d1` campaign resumed at **16:48:32 UTC**; at 16:53:20 UTC
+it had completed **15 cases / 90 invocations**. It is not complete.
 
 Historical validation: 1,287 workspace tests passed with four test workers after integrating QL
 preparation and task memory at `74d83e8`; that revision's full milestone gate passed. Earlier, one cancellation latency
