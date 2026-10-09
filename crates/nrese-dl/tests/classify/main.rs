@@ -504,7 +504,7 @@ fn types_equal_brute_force() {
             assert_eq!(
                 r.types,
                 expected,
-                "case {case}, {threads} threads: the types differ from brute force\n{}",
+                "case {case}, {threads} threads, reuse_model={reuse_model}: the types differ from brute force\n{}",
                 render(&o)
             );
             tally.realised += 1;

@@ -24,6 +24,17 @@ retained as the exact key. This is the median of five process aggregate means, n
 qualified performance win, full-query speedup or memory-neutral change.
 General result-cache overhead profiling and the broader runtime acceptance remain open.
 
+The later `da4465d` push gate exposed a missing DL type at seed 5358, case 63,
+with model reuse enabled. The pre-reuse revision passes the same test variants.
+Retained probes now apply assumptions to the individual's current representative,
+carrying merge dependencies while preserving the original root for label provenance.
+Both new guards fail without the fix; all eight probe tests and the full failing seed
+pass on Office. The [repair record](../benches/runs/2026-10-10-dl-alias-da4465d.toml)
+keeps the failed gate, baseline control and subsequent qualification separate.
+Its 280-invocation diagnostic completes with matching emitted answers and overlapping
+timing/RSS ranges against the preserved pre-fix binary; no new speedup or general
+performance-neutrality claim follows.
+
 | Area | Implemented and retained | Remaining gap |
 |---|---|---|
 | QL preparation/cache identity | One preparation, execution snapshot and retained report; exact compiler-input identity; failed probes never cached as negative answers | Internally interruptible schema reading/rewriting; current-head performance qualification |

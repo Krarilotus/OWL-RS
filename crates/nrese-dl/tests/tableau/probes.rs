@@ -1,7 +1,7 @@
 //! Retained searches against fresh searches and explicit ontology assumptions.
 use super::build::Build;
 use nrese_dl::tableau::{self, Answer, At, Cancel, Config, From, Prepared, Probe, Want};
-use nrese_owl::{Axiom, normalise};
+use nrese_owl::{Axiom, ClassExpr, normalise};
 use std::time::Duration;
 
 fn choice() -> Build {
@@ -93,6 +93,80 @@ fn a_choice_free_model_is_the_deterministic_base() {
         let (out, from) = base.probe(&probe, &config, want()).unwrap();
         assert_eq!(from, From::Deterministic);
         assert_eq!(out.answer, p.probe(&probe, &config, want()).answer);
+    }
+}
+
+#[test]
+fn retained_probe_assumptions_follow_deterministic_merges() {
+    for positive in [false, true] {
+        let mut b = Build::default();
+        let c = b.class(1);
+        let asserted = if positive { b.not(c) } else { c };
+        b.assert(asserted, 100);
+        b.same(100, 101);
+        let p = Prepared::new(&b.o, &normalise(&b.o), &[1], &[100, 101]);
+        let config = Config::default();
+        let (_, base) = p.consistency_with_base(&config, want(), true);
+        let base = base.unwrap();
+        for individual in [0, 1, 1, 0] {
+            let probe = Probe {
+                at: At::Individual(individual),
+                positive: if positive { &[0] } else { &[] },
+                negative: if positive { &[] } else { &[0] },
+            };
+            let (out, _) = base.probe(&probe, &config, want()).unwrap();
+            assert_eq!(
+                out.answer,
+                Answer::Inconsistent,
+                "individual={individual}, positive={positive}"
+            );
+            assert_eq!(out.answer, p.probe(&probe, &config, want()).answer);
+        }
+    }
+}
+
+#[test]
+fn retained_probe_assumptions_preserve_choice_merge_dependencies() {
+    let mut b = Build::default();
+    let c = b.class(1);
+    let not = b.not(c);
+    b.assert(c, 100);
+    b.assert(not, 101);
+    let either = b.e(ClassExpr::OneOf(vec![100, 101]));
+    b.assert(either, 102);
+    let p = Prepared::new(&b.o, &normalise(&b.o), &[1], &[100, 101, 102]);
+    let config = Config::default();
+    let (initial, base) = p.consistency_with_base(&config, want(), true);
+    assert_eq!(initial.answer, Answer::Consistent);
+    let chosen = initial.labels.unwrap().individuals[2]
+        .as_ref()
+        .unwrap()
+        .classes
+        .contains(&0);
+    let base = base.unwrap();
+    // Contradict the chosen alias, then revisit the same pooled model after fallback.
+    for positive in [!chosen, chosen, !chosen] {
+        let probe = Probe {
+            at: At::Individual(2),
+            positive: if positive { &[0] } else { &[] },
+            negative: if positive { &[] } else { &[0] },
+        };
+        let (out, from) = base.probe(&probe, &config, want()).unwrap();
+        let mut explicit = Build { o: b.o.clone() };
+        explicit.assert(if positive { c } else { not }, 102);
+        assert_eq!(
+            out.answer,
+            tableau::consistency(&explicit.o, &config).answer
+        );
+        assert_eq!(out.answer, p.probe(&probe, &config, want()).answer);
+        assert_eq!(out.answer, Answer::Consistent);
+        let labels = out.labels.unwrap();
+        let label = labels.individuals[2].as_ref().unwrap();
+        assert_eq!(&labels.probe, label);
+        assert_eq!(label.classes.contains(&0), positive);
+        if positive != chosen {
+            assert_eq!(from, From::Deterministic);
+        }
     }
 }
 
