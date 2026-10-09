@@ -178,6 +178,86 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
 
+### 9 October: partial Phuoc milestone, runtime acceptance and push gate blocked
+
+The completed Phuoc batches compare `4e8bd38e0733055c06d77f9fdd7cd36c6d89bd7c`
+with `77478d195cb073b263b1eac8661034a09bfbbf20`. The latter's production code is
+identical to `881119d`; their diff is the initial diagnostic run record. Office-built
+binaries were transferred with hash and library checks, not rebuilt on Phuoc. The
+expanded baseline `perf_lab` SHA256 is
+`cb9df2d14ddc6b3e01df6b4bc0475521282d0ff4da95fd71cf7de8a81aa55e77`;
+candidate SHA256 is `047d9eaec886e71c170edc3874be3a33ca1df90187d8462654d85cdfe9511a1b`.
+These are different binaries from the initial `c888a20` diagnostics below.
+
+Three paired repetitions use AB/BA/AB order, the existing quiet guard and no measurement
+CPU quota. Phuoc is a Ryzen 7 7800X3D with 16 logical CPUs. The completed scope is:
+
+- **96 CLI processes:** DL-mode LUBM1 (six inner repetitions), store Horn classification
+  with 3,000 classes (five inner repetitions), commits with eight RL readers plus a
+  zero-reader diagnostic, and plain writes with 0/8/32 readers. Registry checks and
+  routes passed. CLI limits are 4 GiB for DL-mode and 6 GiB otherwise, no swap; commit
+  runs pin four CPUs and use four workers, cache disabled, no warm-up and one query run.
+- **24 native-suite processes:** LUBM1, OWL2Bench RL1 and write-scaling 1m/10m, three
+  pairs each, fixed candidate harness, 8 GiB/no swap. All four existing comparisons
+  exit zero with no non-ok records. This establishes only the checks those drivers do.
+- **18 client/cache processes:** social 300,000 and the existing 1,000-entry cache log
+  (seed 7), three pairs per case. Client widths 1/2/4/8/16/32/64 each run for four
+  seconds with default hardware workers; cache replay uses no warm-up, one run and
+  zero or 256 MiB cache. Limits are 6 GiB/no swap. Untimed result exports were added
+  for answer checks; cache-on counters include those checks.
+
+The default-worker lookup sweep has a severe, repeatable throughput regression:
+
+| Clients | Baseline queries/s | Candidate queries/s | Candidate / baseline |
+|---|---:|---:|---:|
+| 1 | 298,866.2 | 60,192.5 | 20.1% |
+| 2 | 563,940.0 | 110,107.2 | 19.5% |
+| 4 | 1,056,175.0 | 211,273.0 | 20.0% |
+| 8 | 1,813,656.5 | 420,982.5 | 23.2% |
+| 16 | 1,871,722.2 | 626,753.5 | 33.5% |
+| 32 | 1,877,310.2 | 616,987.5 | 32.9% |
+| 64 | 1,885,446.5 | 602,287.8 | 31.9% |
+
+Every pair is lower at every width. Medians are over the three process repetitions;
+these ratios are percentages **of** baseline, not percentage losses. Cache-on replay
+is 296.023 → 375.173 ms (+26.7%), also worse in all pairs; cache-off is
+2,572.162 → 2,694.876 ms (+4.8%). The native-suite comparison retains its existing
+10%/spread and 2 ms minimum screen: tiny-query deltas can fall below that floor and be
+labelled within noise. Its zero flagged queries do not negate the throughput regression
+or establish general neutrality. Runtime acceptance remains **BLOCKED**; no aggregate
+or passing correctness check overrides these cases.
+
+Correctness evidence has specific limits. Store classification checks consistency,
+1,161,634 subsumptions and the context-core route, **not full taxonomy content**.
+RL exports agree after recomputation; the maintained closure check compares sizes only,
+so this is **not a full maintained-closure oracle**. Plain readers return empty inference
+results and do not represent RL reader work. Retained query bags agree, but concurrent
+reader bags are not retained; unordered LIMIT subsets have no general stability guarantee.
+Native write-scaling checks HTTP success, not the numeric final COUNT. The analysis's
+empty export/bag collections must not be read as extra semantic coverage. No new speedup
+is accepted from the smaller CLI timing differences or noisy phase-memory figures.
+
+The remote push hook at clean `881119d` failed after fmt/clippy/main tests passed:
+DL bounds fuzz seeds 18273/18274/18275 failed; locks separately failed because offline
+metadata lacked `regex-syntax 0.8.11` and `libfuzzer-sys`. Seed 18273 was reproduced
+on candidate and baseline with identical 300-case tallies and the case-217 U1 model
+assertion at `crates/nrese-dl/tests/bounds/fuzz.rs:350`. This establishes a pre-existing
+failure relative to this baseline, not a correct result or permission to waive the gate.
+Small bounds/gap/cancellation repairs are in preparation and remain unvalidated here.
+The earlier `583c422` milestone pass does not supersede this failure.
+
+Source evidence is retained in
+`implementation-process-memory/tmp/phuoc-qualification/`: `cli-analysis.json`,
+`concurrency-analysis.json`, `summary.json`, `coverage-matrix.csv`, `compare-*.txt`,
+the recorded launch commands and binary-transfer manifests. The superseded `paired-cli`
+batch is excluded; completed CLI evidence uses `paired-cli-final`. Gate evidence is in
+`implementation-benchmark-hosts/tmp/remote-gate-failure-report.txt` and its named logs.
+The raw archive/hash handoff is still pending; no standard run record is issued from
+analysis summaries alone. Office's frozen `77478d1` fast campaign is still running.
+These selected native cases neither complete that campaign nor provide competitor or
+whole-programme qualification. Next: preserve raw provenance, resolve the gate failures,
+validate repairs, and investigate the runtime regression before acceptance.
+
 ### 9 October: shared-runtime candidate fails the initial throughput check
 
 `4e8bd38` → `c888a20` isolates the runtime/worker foundation and plan-inspection

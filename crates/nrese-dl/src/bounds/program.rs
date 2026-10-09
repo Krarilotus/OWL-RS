@@ -53,7 +53,8 @@ pub enum Origin {
     /// that the reasoner's equality module replaces the copying rules.
     Equality,
     /// An ABox axiom whose meaning the triples don't state in U1's vocabulary: a complex
-    /// class assertion (through its fresh name), a negative assertion, `DifferentIndividuals`.
+    /// class assertion (through its normalised concept), a negative assertion,
+    /// `DifferentIndividuals`.
     Assertion,
     /// The class `{a}` of an individual a rule body names, with the fact `a ∈ {a}`.
     Nominal,

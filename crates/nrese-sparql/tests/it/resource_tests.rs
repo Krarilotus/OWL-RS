@@ -140,6 +140,7 @@ struct CallerWriter {
     bytes: Rc<RefCell<Vec<u8>>>,
     caller: std::thread::ThreadId,
     fail: bool,
+    cancel: Option<nrese_sparql::CancellationToken>,
 }
 
 impl Write for CallerWriter {
@@ -149,6 +150,9 @@ impl Write for CallerWriter {
             return Err(std::io::Error::other("consumer stopped"));
         }
         self.bytes.borrow_mut().extend_from_slice(bytes);
+        if let Some(token) = &self.cancel {
+            token.cancel();
+        }
         Ok(bytes.len())
     }
 
@@ -188,6 +192,7 @@ fn shared_workers_preserve_direct_output_and_caller_owned_writers() {
                     bytes: bytes.clone(),
                     caller: std::thread::current().id(),
                     fail: false,
+                    cancel: None,
                 };
                 write_results(&snapshot, &query, &options, format, None, &mut writer)
                     .unwrap()
@@ -206,6 +211,66 @@ fn shared_workers_preserve_direct_output_and_caller_owned_writers() {
                     "writer failure must release execution capacity"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn direct_output_reports_cancellation_during_its_successful_final_write() {
+    use nrese_sparql::{CancellationToken, QueryEvaluationError, WriteResultsError};
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let workers = Workers::pooled(1).unwrap();
+    let queries = [
+        values(0),
+        values(3),
+        SparqlParser::new().parse_query("ASK {}").unwrap(),
+        SparqlParser::new()
+            .parse_query("ASK { FILTER(false) }")
+            .unwrap(),
+    ];
+    for query in queries {
+        for format in [ResultsFormat::Json, ResultsFormat::Tsv, ResultsFormat::Csv] {
+            if matches!(query, nrese_sparql_syntax::Query::Ask { .. })
+                && !matches!(format, ResultsFormat::Json)
+            {
+                continue;
+            }
+            let token = CancellationToken::new();
+            let shared = SharedBudget::new(1 << 20);
+            let options = QueryOptions {
+                cancellation: Some(token.clone()),
+                workers: Some(workers.clone()),
+                shared_memory: Some(shared.clone()),
+                ..Default::default()
+            };
+            let mut expected = Vec::new();
+            write_results(&snapshot, &query, &options, format, None, &mut expected)
+                .unwrap()
+                .unwrap();
+            let bytes = Rc::new(RefCell::new(Vec::new()));
+            let mut writer = CallerWriter {
+                bytes: Rc::clone(&bytes),
+                caller: std::thread::current().id(),
+                fail: false,
+                cancel: Some(token),
+            };
+            assert!(matches!(
+                write_results(&snapshot, &query, &options, format, None, &mut writer),
+                Some(Err(WriteResultsError::Evaluation(
+                    QueryEvaluationError::Cancelled
+                )))
+            ));
+            assert_eq!(
+                *bytes.borrow(),
+                expected,
+                "the writer accepted the final bytes"
+            );
+            assert_eq!(
+                shared.used(),
+                0,
+                "cancellation releases result reservations"
+            );
         }
     }
 }

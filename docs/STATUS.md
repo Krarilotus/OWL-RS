@@ -8,7 +8,8 @@ in the branch), **deferred** (not done, with the reason and where it went), or *
   [capability matrix](spec/06-target-capability-matrix.md).
 - Why and in which order: [the roadmap](ROADMAP.md); the designs in [design/](design/).
 
-Branch update: 9 October 2026, implementation integration through `5de8697`, for the
+Branch update: 9 October 2026, partial milestone at `881119d` (production code identical
+to the measured `77478d1`), for the
 authorised PR to `refactor/engine-v2`. These are bounded slices, not completion of the
 performance programme or the historical product roadmap. `0f46563` remains the programme's
 historical comparison base; individual experiments identify their own base and candidate.
@@ -31,15 +32,13 @@ Scope and decision checkpoints are in the
 No claim of a completed performance programme or an end-to-end resource envelope follows
 from these bounded changes. Existing v2 merge gates remain open until their evidence is recorded.
 
-Runtime performance acceptance: **BLOCKED**. The initial `c888a20` versus `4e8bd38`
-comparison regressed Office throughput by 12.8% at one client and 10.2% at two clients,
-with all three pairs lower. Phuoc showed smaller decreases, also lower in all three pairs.
-Two isolated coalescing experiments improved tiny-query latency but did not eliminate
-the mixed-throughput loss; the full-coalescing variant remained 11.6% below baseline
-at both one and two clients. Neither diagnostic patch is retained in production.
-Scheduling design remains a decision checkpoint. Matching results do not establish
-performance neutrality; these experiments do not qualify the current integration.
-Final evidence belongs in the [performance lab log](design/performance.md#6-lab-log-of-the-performance-phase-from-5-october-2026).
+Runtime performance acceptance: **BLOCKED**. Phuoc's three-pair `4e8bd38` versus
+`77478d1` lookup-client sweep reproduces a severe loss: candidate throughput is 20.1%
+of baseline at one client and 23.2% at eight (all pairs lower). Cache-on replay is
+26.7% slower. These extend the earlier `c888a20` failures; no scheduling diagnosis or
+repair is accepted from these measurements alone. The native comparison's 2 ms floor
+does not establish neutrality for tiny queries. Scope, protocol, correctness limits and
+evidence are in the [performance lab log](design/performance.md#6-lab-log-of-the-performance-phase-from-5-october-2026).
 
 Validation at `583c422`: all milestone stages passed, including 1,335 workspace tests,
 doc tests, 79 harness tests, the suite-contract check (16 tests, five Linux-only cases
@@ -49,14 +48,20 @@ and completeness checks. These are correctness results, not performance acceptan
 Subsequent query-consistency deadline fixes (`4e88d55`) and graph-result ownership
 (`5de8697`) passed their focused and owner-crate checks. The graph owner reported
 692 tests plus additional seeds and 201 commit-hook tests; these overlap and are not
-added to the earlier workspace total. The final integrated push gate remains pending.
+added to the earlier workspace total. The later remote push gate at `881119d` **failed**:
+DL bounds fuzz seeds 18273/18274/18275 failed, and the offline lock check lacked required
+cached dependencies. Seed 18273 reproduces the same failure on baseline `4e8bd38`; this
+establishes preexistence, not correctness or a gate waiver. Small bounds/gap/cancellation
+repairs are **in preparation**, not validated. No successful push followed this gate.
 
-The remote measurements so far are short internal diagnostics, not the registered
-fast-suite or competitor campaign. LUBM client phases lasted three seconds each;
-release builds used four compiler jobs. Idle time between those jobs is not measurement
-time. Final baseline/candidate coverage must use the existing `benches/fast` and
-`benches/suite` registries, record unavailable data or comparators explicitly, and
-preserve each run's commands, source/binary identities and raw results.
+Completed Phuoc coverage is partial: 96 native CLI processes, 24 native-suite processes
+and 18 client/cache processes. Selected registered inputs/checks ran; this is not the full
+fast suite or competitor coverage. Store classification checked counts/engine, not full
+taxonomy content; RL maintained closure was checked by size, with exported sets obtained
+after recomputation. Native write-scaling checks HTTP success without validating its final
+numeric count. Office's frozen `77478d1` fast campaign is still **running**; no completion
+or full-tier credit is claimed. Missing coverage and raw provenance remain explicit, and
+idle host time is not measurement time.
 
 Historical validation: 1,287 workspace tests passed with four test workers after integrating QL
 preparation and task memory at `74d83e8`; that revision's full milestone gate passed. Earlier, one cancellation latency
