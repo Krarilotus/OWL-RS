@@ -551,3 +551,58 @@ selection from request/data/resource needs, and architecture that later distribu
 hardware work can extend. Suggested start: P0/P1 first, P2/P3 next; retain the existing
 crate structure and measured specialisations. Decide larger abstractions from the evidence
 those steps produce; their appearance in this plan alone is not approval to build them.
+
+## 8. Concrete implementation checkpoints from the first batch
+
+**QL preparation (P2).** Reuse the existing rewriter behind one SPARQL-owned preparation
+function returning the query and its report. The store captures one execution snapshot,
+prepares once, keeps that report for completeness and diagnostics, and passes the prepared
+query to the existing writers/evaluator. Keep the original query/options in result-cache
+keys; disabling QL for the already-prepared execution must not erase its cache fingerprint.
+The estimated change is 100–170 replacement/plumbing lines plus focused tests, not a new
+executor. Required guards cover cold/warm caches, pending views, graph access, strict and
+canonical equality, limits, cancellation, and a cache hit that performs no evaluation.
+The smaller writer eligibility check is already moved before preparation. The full change
+is awaiting the owner's decision.
+
+**DL worker ownership (P7).** `context::Engine::run` currently creates a pool each round;
+the ABox fixpoint calls it repeatedly, and pool-creation failure falls back to ambient
+Rayon workers. Classification already has a private `Workers` helper with serial fallback.
+The next bounded change can reuse that pattern for one saturation operation, keeping the
+pool out of the returned `Saturated` state. Public entry points still need compatibility
+wrappers. Separately, exact candidates run on ambient Rayon although their memory allowance
+is divided by configured workers. A store-local bounded pool should align the actual width
+with that division, capped by eligible work, with an explicit serial fallback. Neither fix
+is a global scheduler or an admission policy across simultaneous client requests. Measure
+pool startup on tiny tasks as well as reuse across rounds; do not hide its cost in a batch
+average. These changes are inspected but not implemented in the first batch.
+
+**Typed DL bounds (P3).** Skipping upper evaluation when a lower ASK is true is the smallest
+independent saving, subject to a guard proving the upper evaluator is not entered. Retaining
+IDs across both evaluations is a larger interface change: computed IDs belong to each
+SPARQL context, so two `u64` columns alone do not establish equal terms. Any retained result
+must also carry or reconcile that identity domain. Replacing debug-string candidate sorting
+with `Term::Ord` removes formatting work but changes candidate priority under a finite
+`max_candidates` budget; it is a behavioural choice, not a mechanical deduplication cleanup.
+No such ordering change is included without a decision and deterministic coverage.
+
+**Premise reuse (P4).** Candidate construction clones the ontology, and `entails`/`nonempty`
+clone it again for each test before normalising/compiling. Try an operation-local reusable
+scratch premise first, retaining the current engine and proving that consecutive assumptions,
+interned expressions, sources and diagnostics cannot leak between tests. An immutable
+compiled base with assumption overlays may save more work but changes search lifetimes and
+invalidation. It needs a separate design and measured clone/compile share before implementation.
+
+**Context task memory (P1/P7).** Reuse `nrese_exec::Budget`/`SharedBudget` for generic charging
+where their semantics fit. They do not provide the missing size/ownership information:
+context clause/body arenas, nested indexes, message inboxes, context registry/segments,
+proofs, worker `Found` buffers, the compiled program and ABox state all need coverage.
+`SetTrie::bytes` is only a rough estimate of one component. A whole-state scan from every
+budget checkpoint would add expensive work and can deadlock while a worker holds a context
+lock. Prefer capacity changes charged by the owner at growth/release boundaries, with
+thread-safe totals and a documented allowance for in-flight growth. Moving a message must
+transfer its charge rather than double-count it; retained immutable inputs need one explicit
+owner. This is a multi-owner accounting change, not a one-line limit fix. First establish
+coverage, charging frequency and overshoot with allocation/concurrency guards. A separate
+process-memory ceiling remains useful but cannot replace task accounting. Implementation
+is awaiting the owner's decision; no new ledger is added by this plan.
