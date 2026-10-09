@@ -11,6 +11,9 @@ Existing QL fixture with 0/100/1000 additional independent subclass statements:
 Changed-view: 500 alternations between a committed snapshot and a pending view
 with one ordinary data addition; every access refreshes the schema identity.
 The probe checks equal schema input and Arc identity of the reused compiled TBox.
+Reported medians/ranges are over five per-process aggregate means, not per-call
+latency medians. This diagnostic does not meet PROTOCOL's ten-repetition claim
+requirements or establish acceptance under a predeclared microcase timing floor.
 No end-to-end query, contention, cold OS-cache, tail-latency or competitor claim.
 Both binaries built sequentially in the existing Office checkout/target. Source
 patches and binary identities retained before replacement. No new worktree,
@@ -20,7 +23,7 @@ findings = [
   "1004-statement refresh: baseline median 38.230 us [36.515, 41.520], candidate 30.426 us [27.854, 32.020], 20.4% less time; ranges do not overlap.",
   "104-statement refresh: 8.704 -> 8.143 us; 4-statement refresh: 4.919 -> 5.056 us. Ranges overlap; no improvement or regression established in those cases.",
   "Same-view medians remain about 7-8 ns, with overlapping ranges. Each aggregate is under 1 ms; these samples do not establish a speedup or general neutrality.",
-  "Exact schema identity retains 32 bytes per statement plus entry metadata: 128/3328/32128 payload bytes in these fixtures, per retained reader entry (existing maximum eight). No memory-neutrality claim.",
+  "Exact schema identity retains 32 bytes per statement plus entry metadata: 128/3328/32128 payload bytes in these fixtures, per retained reader entry (existing maximum eight). Structural payload accounting, not measured RSS or total cache growth; the existing temporary schema scan buffer remains. No memory-neutrality claim.",
   "Office reproduces the old QL wrong-answer cache hit after ordinary data introduces owl:Thing; fresh preparation returns ann while the old warm cache returns nothing. The repair passes the differential guard and existing view/access/rollback guards.",
   "Both DL cache-policy tests fail against old production code for intended retry/stale-publication assertions and pass with the repair. An initial zero-timeout fixture was rejected by configuration; corrected positive-expired fixture and both logs are retained.",
   "Focused validation: 6 QL unit tests, 2 DL cache-policy tests, 4 store classification integration tests. Broader correctness gates are required separately.",

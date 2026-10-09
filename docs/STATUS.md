@@ -18,14 +18,15 @@ The cache-contract follow-through repairs a reproduced QL warm-cache wrong answe
 ordinary data introduces `owl:Thing`, uses exact schema identity, and retries incomplete
 explicit DL classification/realisation requests under the existing budget. Complete-result
 publication cannot displace a newer revision with an older one. Query lower-bound caching
-is unchanged. Focused Office tests pass; the [component diagnostic](../benches/runs/2026-10-10-cache-contracts-d31010c.toml)
+is unchanged. Normal Office commit/push checks pass for `0f3155b`; the [component diagnostic](../benches/runs/2026-10-10-cache-contracts-d31010c.toml)
 measures 20.4% less schema-refresh time for 1004 statements, with 32 bytes per statement
-retained as the exact key. This is neither a full-query speedup nor a memory-neutral change.
+retained as the exact key. This is the median of five process aggregate means, not a
+qualified performance win, full-query speedup or memory-neutral change.
 General result-cache overhead profiling and the broader runtime acceptance remain open.
 
 | Area | Implemented and retained | Remaining gap |
 |---|---|---|
-| QL preparation/cache identity | One preparation, execution snapshot and retained report; original cache key; failed probes never cached as negative answers | Internally interruptible schema reading/rewriting; current-head performance qualification |
+| QL preparation/cache identity | One preparation, execution snapshot and retained report; exact compiler-input identity; failed probes never cached as negative answers | Internally interruptible schema reading/rewriting; current-head performance qualification |
 | Cancellation/deadlines | Request flags reach nested DL work; pending/prior checks and rejection evidence share one deadline | Compilation and some preparation phases are non-preemptible |
 | Context task memory | Optional owner-based capacity, incremental index totals and transferred message charges; zero stays unlimited | Checkpoint overshoot and excluded allocations; no shared whole-operation envelope |
 | Atomic reasoning updates | Split/revival closure participates in the pending transaction and gates; obsolete post-commit repair removed | Whole-dataset fallback still holds the writer; incremental split maintenance unfinished |
