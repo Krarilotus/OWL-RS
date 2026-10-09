@@ -307,6 +307,28 @@ normalised comparisons and all runs remain under Office's
 `kernel-intersect-diagnostic-20261009`. Storage layout/allocation locality and execution
 placement remain hypotheses to separate before adding kernel code.
 
+The follow-up Phuoc diagnostic fixes persisted layout: baseline loads the verified
+shared dense input once, then both frozen binaries reopen that same store. All store
+file hashes are unchanged after three BC/CB/BC pairs at 16 workers and 20 repetitions.
+The skewed-query process medians are baseline 95.655/95.984/95.319 ms and candidate
+148.266/148.122/148.235 ms; fresh-load controls reproduce the gap. Counts and WCOJ
+routes match. This rules out a different persisted dictionary/index layout as a
+necessary cause on this fixture, not allocation locality or execution placement.
+Two 99 Hz user-space profiles show broadly similar hot-symbol shares in packed-index
+access, sorted values and group-count sorting; they are perturbed attribution captures,
+not further timing evidence. Unprivileged perf was refused; a bounded sudo profiler
+ran the benchmark as its normal user without changing system settings. The old frozen
+quiet guard emitted a shell warning; independent process checks found no compilers.
+This remains a diagnostic, not a registered acceptance run.
+
+Phuoc evidence: `kernel-layout-diagnostic-20261009` under the same preparation root,
+manifest SHA-256 `2c39be1b999ce6e80bd68cc4a492d948188718f9b4e0a68aab2e1438fe94476d`;
+`profiles-user/profiles.json` SHA-256
+`793633218bf34f2d5a17519c61096d53e377822bf7b83f720f6bce62009c3a80`.
+The verified shared input was reused without transfer; the 21 MiB persisted store
+is retained for the planned worker-width/placement diagnostic. No kernel change follows
+from these profiles alone.
+
 ### 9 October: native scheduling profiles and width diagnostic
 
 Four short Phuoc captures compare frozen `4e8bd38` and `77478d1` at one and
