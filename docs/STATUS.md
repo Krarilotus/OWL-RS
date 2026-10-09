@@ -17,7 +17,7 @@ checkout is unchanged. The bounded reuse work below is isolated and not merged t
 | QL cache identity | Done: TBox and realised-witness caches distinguish pending and masked views with `SnapshotIdentity`; failed probes are not cached | Report and execution still prepare separately; status preparation still suppresses errors |
 | Nested query cancellation | Done: the request flag reaches consistency and exact-candidate checks, including context saturation | Bounds building and several compilation/scanning phases are not internally cancellable; task memory accounting for contexts is open |
 | Compact equality splits and hidden-class revival | Done: rebuilt closure participates in the pending transaction and gates; no post-commit inference repair | Rebuilds still scan the dataset under the writer lock; this restores atomicity, not the delta-cost target |
-| Execution and allocation reuse | Done: consuming projection moves retained buffers; common forward-search interval discovery; raw spilling frees batches without concatenation or an unused pool | Deterministic work/allocation guards pass in owner checks; integrated validation and timing comparison in progress |
+| Execution and allocation reuse | Done: consuming projection moves retained buffers; common forward-search interval discovery; raw spilling frees batches without concatenation or an unused pool; ordered DISTINCT reuses any complete sort order | Deterministic work/allocation guards and final integrated tests pass; covered native query comparisons match results, while DL process peaks and concurrent-update tails remain unqualified |
 | Numeric ownership | Done: one SPARQL promotion/arithmetic implementation and a separate aggregate helper module, retaining existing loops and caches | The reference evaluator shares arithmetic: fixed expected-value tests remain necessary alongside differential tests |
 | Architecture documentation | Updated: actual execution dependencies, lowering stage, hardware/scaling controls, test gates and ownership | Physical-plan completion, typed DL bounds and reusable premise assumptions remain proposals, not implemented features |
 
@@ -25,6 +25,13 @@ Scope and decision checkpoints are in the
 [performance and architecture plan](plan/2026-10-09-performance-architecture.md).
 No claim of a completed performance programme or an end-to-end resource envelope follows
 from these bounded changes. Existing v2 merge gates remain open until their evidence is recorded.
+
+Validation: 1,275 workspace tests passed on the final code with four test workers, following
+the milestone checks and a benchmark-discovered DISTINCT repair. One cancellation latency
+test failed during concurrent release compilation, then passed three isolated runs and
+the final workspace replay without changing its limit. Console dependencies and external
+conformance corpora were not installed in this worktree. The precise coverage, measurements
+and limitations are in the [9 October lab entry](design/performance.md#6-lab-log-of-the-performance-phase-from-5-october-2026).
 
 The following goal history was last reconciled on 6 October on `refactor/engine-v2`.
 What is left before v2 goes to

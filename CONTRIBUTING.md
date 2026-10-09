@@ -45,5 +45,11 @@ holds one short measurement, since builds wait for it; long comparison runs go t
 their own. Every number names the commit its binary was built from and whether the tree was
 clean; a binary kept for comparison is rebuilt after its source changes or is reverted.
 
+Keep a separate Cargo target directory for each worktree. Share downloaded registry
+dependencies through `CARGO_HOME`, not local-package artifacts from different revisions.
+On 9 October, a shared target reused an incompatible local API across worktrees; final
+validation therefore rebuilt in isolated targets. Baseline binaries need recorded source
+and binary identities before their target is cleaned.
+
 CI (`.github/workflows/ci.yml`, the same steps on Linux) runs at milestones and on merges to
 `main`: `gh workflow run ci.yml --ref <branch>`; the Jena oracle likewise (`oracle.yml`).
