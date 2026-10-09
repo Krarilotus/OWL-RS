@@ -55,9 +55,14 @@ cached dependencies. Seed 18273 reproduces the same failure on baseline `4e8bd38
 establishes preexistence, not correctness or a gate waiver. The repair in `a6331c7`
 passes those three focused seeds and the normal push gate: format, lint, regular tests,
 new seeds 93060–93062, locks and 22 suite-contract tests. The branch push completed at
-16:46:12 UTC. External conformance corpora were missing on Office; their early-returning
-test wrappers confer no corpus coverage. Restoring the pinned inputs and running the
-existing conformance guards remains separate qualification work.
+16:46:12 UTC. External corpora were missing during that gate. After restoring and
+hash-verifying the pinned inputs, Office completed 22 selected corpus-backed checks
+at 17:29:05 UTC, with zero unexpected failures or missing-corpus early returns.
+DL recorded 410 passing tasks and one adjudicated dispute; SPARQL evaluation recorded
+505 SPARQL 1.1 and 269 SPARQL 1.2 passes, and SHACL 98 Core plus 22 SPARQL passes.
+Known QL expected failures, import skips, JSON-LD exclusions and GeoSPARQL disputes
+remain. The lab log records the scope; this closes the missing-input qualification
+gap for those checks, not performance acceptance or universal conformance.
 
 Completed Phuoc evidence contains **222 execution records**: 96 CLI, 18 client/cache,
 84 supplemental and 24 native-suite cycles. This covers six of 95 fast cases through
@@ -67,8 +72,9 @@ RL maintained closure checks sizes, with exports after recomputation. Write-scal
 HTTP success without validating the final numeric count. Horn late-phase high-water
 readings are reset-affected; diagnostics do not establish a peak regression. Gap wins do not clear acceptance.
 The completed [run record](../benches/runs/2026-10-09-phuoc-partial-77478d1.toml) identifies
-verified raw provenance. Office's frozen `77478d1` campaign resumed at **16:48:32 UTC**; at 16:53:20 UTC
-it had completed **15 cases / 90 invocations**. It is not complete.
+verified raw provenance. Office's frozen `77478d1` campaign reached **23 complete cases /
+138 invocations** and paused at a clean boundary at **17:02:27 UTC** for the benchmark
+asset migration. The original queues and all samples are retained; the campaign is unfinished.
 
 Historical validation: 1,287 workspace tests passed with four test workers after integrating QL
 preparation and task memory at `74d83e8`; that revision's full milestone gate passed. Earlier, one cancellation latency

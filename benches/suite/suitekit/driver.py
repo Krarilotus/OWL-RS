@@ -252,8 +252,11 @@ class Suite:
         return self.settings.get("HARNESS") or str(target / "release" / f"nrese-bench-harness{EXE}")
 
     def build_harness(self) -> bool:
-        if self.args.skip_build and Path(self.harness()).exists():
-            return True
+        if self.args.skip_build:
+            if Path(self.harness()).is_file():
+                return True
+            self.say(f"--skip-build requires an existing harness: {self.harness()} (set HARNESS)")
+            return False
         self.say("building the harness (release)")
         log = self.results / "logs" / f"harness-build-{self.stamp}.log"
         rc = self.host_command(["bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked", "--quiet",

@@ -21,9 +21,18 @@ Read [docs/README.md](docs/README.md) (which document answers what),
 ## Boundaries
 
 - Work in your own branch and worktree. The maintainer merges and pushes. Never skip the hooks.
-- Delete only what you created; stop processes by PID. Large datasets live once, read-only,
-  in `C:\Users\Johannes\nrese-data\` on the main PC; point to them, never copy them into a
-  worktree.
+- Delete only what you created unless the user authorizes a wider cleanup; stop
+  processes by PID. Office-PC and Phuoc-Yu own reusable benchmark assets. Migration
+  from KRARIS-GPTLER requires completed verification for each source snapshot.
+  Both hosts' immutable preservation root is
+  `/home/krarilotus/nrese-assets/kraris-gptler-20261009`. Use verified shared inputs
+  read-only, never per-worktree data copies; keep mutable runs/results elsewhere and
+  preserve existing remote campaign paths. Verify each source snapshot before using it
+  or cleaning its local copy; matching names are not evidence of matching contents.
+  See [benches/README.md](benches/README.md#remote-hosts-and-shared-data).
+- Only Office-PC builds/tests/formats Rust and executes build-triggering hooks.
+  Phuoc-Yu runs verified Office-built native binaries; it currently lacks Docker,
+  Java and Apptainer. Record binary provenance and host compatibility before use.
 - `literature/` is read-only. Results of licensed systems are never committed.
 - Write files with the editor tools; the shell mangles backslashes.
 - A commit written by an AI agent ends with its `Co-Authored-By` trailer (Claude's:
