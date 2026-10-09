@@ -73,7 +73,7 @@ impl<'p> Engine<'p> {
         self.init_assertions()
     }
 
-    /// The test's root and concepts (with no dependency: they hold in every branch).
+    /// The test's root and concepts; an existing root carries its merge dependencies.
     pub fn init_probe(&mut self, seed: &Seed) -> Step<()> {
         let at = match seed.site {
             Site::Fresh => self.new_node(NONE, NONE)?,
@@ -86,11 +86,18 @@ impl<'p> Engine<'p> {
             Site::Nothing => NONE,
         };
         self.probe = at;
+        // A retained state's individual may already be merged. Keep the original
+        // probe root for label provenance, but assert on its current representative
+        // with the merge dependencies so a model-only clash can fall back.
+        let (at, dep) = match seed.site {
+            Site::Individual(_) => self.canonical(at),
+            _ => (at, DepSetId::EMPTY),
+        };
         for &c in &seed.positive {
-            self.assert(Lit::Concept(c, at), DepSetId::EMPTY, proof::ASSERTED)?;
+            self.assert(Lit::Concept(c, at), dep, proof::ASSERTED)?;
         }
         for &c in &seed.negative {
-            self.add_negative(at, c, DepSetId::EMPTY, proof::ASSERTED)?;
+            self.add_negative(at, c, dep, proof::ASSERTED)?;
         }
         Ok(())
     }

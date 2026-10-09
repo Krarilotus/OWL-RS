@@ -1,0 +1,51 @@
+date = "2026-10-10"
+finished_utc = "2026-10-09T23:42:55.226943+00:00"
+kind = "retained DL probe correctness repair and bounded timing diagnostic"
+host = "Office-PC (sus-ai), Ryzen 9 5950X; Rust 1.98.1, native release"
+base = "da4465d245a513b6b9c7fd2e2e392f6434eacc36"
+candidate = "base plus fixed-source.patch; final commit also corrects a comment and asserts probe-label provenance in the guard"
+failure = "The da4465d normal push gate fails brute-force seed 5358, case 63, threads=1, reuse_model=true: types [[0], []] instead of [[0], [0]]. No hook bypass."
+control = "be5c3d7 passes the same seed with current reuse-disabled/enabled test variants transplanted. Both minimal alias guards fail against the unfixed code."
+repair = "Probe initialization canonicalizes individual assumption targets, preserving original-root label provenance and carrying merge dependencies into both polarities. Fresh and absent probe sites keep their existing path."
+correctness = "All eight probe tests and full seed5358 pass on Office: 120 taxonomy cases and 120 realisation cases / 306 individual results. Broader gates are separate from the performance diagnostic."
+protocol = """
+Ten independent alternating BC/CB process pairs per case, seven existing fixtures
+at one and four workers: 280 invocations. Existing dl_classify argv, timeouts and
+internal repetitions unchanged from the prior DL reuse record (generated: repeat=3;
+ORE: repeat=1). Total time includes normalisation and stages, not parsing; peak RSS
+includes parsing. Canonical taxonomy/type hashes emitted from the final internal
+repetition, completeness and exit status must match the prior run before times are
+considered. This is not an independent ORE reference-reasoner comparison.
+
+Before binary is the preserved candidate-no-copy binary recorded by the prior DL
+reuse experiment and committed as a60e482. The a60e482..da4465d DL dependency source
+diff is comment-only; no Cargo/lock/toolchain/build-guard changes. Candidate built
+in the existing Office checkout/target. Inputs and before binary are SHA256-checked;
+source patch and both identities retained. No new target, worktree or dataset copy.
+
+Quiet-slot guard, all samples retained. No predeclared non-regression threshold,
+OS-cold, per-request tail or general performance-neutrality claim. Small sub-2ms
+cases earn no speed claim. Timings are medians/ranges of process aggregates, not
+per-request p50. Every timing range and every peak-RSS range overlaps its counterpart.
+No invocation times out; post-run process check finds no remaining dl_classify and
+the quiet slot is released. The actual runner is archived unchanged; a separate
+replay version adds process-group cleanup for a possible external timeout.
+"""
+findings = [
+  "All 280 invocations complete with emitted canonical answers matching the earlier record; separate failing-seed/minimal guards qualify the repaired alias behavior.",
+  "Choice-real-300 at widths 1/4: before median 47.35/19.10 ms, fixed 47.70/19.00 ms. Width-one ranges [47.0,47.8]/[47.0,49.1], width-four [17.9,19.5]/[18.1,19.3].",
+  "Horn-real-30000 widths 1/4: 43.35/43.45 -> 43.00/43.40 ms. Median peak RSS 38124/38268 -> 38004/38290 KiB; ranges overlap.",
+  "ORE9881 widths 1/4: 397.00/288.70 -> 395.85/287.55 ms; ORE16542: 1372.45/1212.75 -> 1377.60/1208.45 ms. All observed ranges overlap.",
+  "No clear timing regression is established on these cases. This is a bounded diagnostic, not a threshold-qualified non-regression pass, a new speedup, a full suite or clearance of the runtime regression gate.",
+]
+before_binary_sha256 = "71d9fb89d5aa9acf01bfcdff9ce5cb1100b849bf3b96f4eb2f58a23bf9e77b4a"
+candidate_binary_sha256 = "afdc3d275c37c43718c28eb36d8312bf187f97efa354ecbdb666ebedb3f93e9c"
+source_patch_sha256 = "2b60cf28e68ca75dde5be7793f9a0ca4a3027349453e02bef82a084c191847da"
+measurements_sha256 = "ecc02588a0660abec8c5feb2c928e001442cb9df5706f1b124046cd071b84e78"
+guards_before_log_sha256 = "a215d752b4c1bb23ce4a55f48824967bcb9a07388d76ec589a37ecf182350f77"
+guards_fixed_log_sha256 = "1e6519a2a2921dda12b6c3f3d9e92eff5d9eebfab0caf54c77409a9ae76adc71"
+seed_fixed_log_sha256 = "e8b0281dcc2d3bb98e3a764fd581e41d3729fbfcafa1f328bd6b5ba89d343917"
+artifacts = "/home/krarilotus/nrese-prep-20261009-4e8bd38/dl-alias-da4465d/"
+results = "measurements.json, runs/, fixed-source.patch, prior-source-difference.patch, fixed-dl_classify, toolchain.txt, actual runner/build scripts and separate replay runner"
+adjacent_logs = "office-cache-review-push.log, dl-seed5358-{reproduction,labelled,be5c3d7-matched-test,fixed}.log, dl-merge-probe-guards-{before,fixed}.log, office-dl-alias-build.log; subsequent commit/push log office-dl-alias-gate.log"
+publishable = "all"
