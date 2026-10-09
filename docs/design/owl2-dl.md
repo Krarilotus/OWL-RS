@@ -727,6 +727,21 @@ optimisations"), per level:
 
 ## 13. Configuration
 
+This table describes the design target; the deployed settings and defaults are in the
+[configuration reference](../ops/config-reference.md). Resource enforcement is still
+partial. As of 9 October, request cancellation shares one atomic flag with nested
+consistency, exact-candidate and context-saturation checks; it does not start a watcher
+thread. A cancelled query does not publish a replacement consistency status for its
+revision. Checks occur at existing budget boundaries, so bounds construction, schema
+reading, normalisation and compilation are not all internally interruptible.
+
+The context core's `Budget::max_memory` measures the **whole process**. The consistency
+budget's `memory_bytes` limits the tableau's **task structures**. Passing a per-worker
+task allowance to the process monitor would reject work based on unrelated resident data;
+the consistency adapter deliberately does not do that. Per-task context accounting and
+an end-to-end query memory envelope remain open. Neither cancellation propagation nor
+the current tableau budget establishes that stronger contract.
+
 | Setting | Values | Default |
 |---|---|---|
 | `reasoner.mode` | … `owl2-dl` | — |
