@@ -52,8 +52,10 @@ Outside the layer model: `nrese-sparql-reference` (the SPARQL evaluator written 
 | `nrese-server` | Routes, content negotiation, auth backends, policy (limits, timeouts, rate limits), deployment posture, operator/console hosting, AI suggestions, mapping store errors to HTTP. | Any data semantics. It never touches the engine directly. |
 
 The runtime covers native query computation, output encoding, update WHERE and participating
-DL work. Writers and callbacks stay with the caller; rule materialisation, bulk spill and
-background storage keep their existing owners. This is neither a universal worker cap nor
+DL work. Direct-result writers and their liveness callbacks stay with the caller;
+`SERVICE` callbacks run within native evaluation and have no caller-affinity guarantee.
+Rule materialisation, bulk spill and background storage keep their existing owners.
+This is neither a universal worker cap nor
 a whole-request memory ceiling. SPARQL owns retained ID results, their dictionary/computed
 value domain and reservations; the store decides which bound candidates require exact work.
 See [execution-core.md](design/execution-core.md) for resource lifetimes and

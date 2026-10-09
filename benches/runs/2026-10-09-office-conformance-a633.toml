@@ -1,0 +1,58 @@
+# Hand-written correctness record; no timings or global status regeneration.
+id = "2026-10-09-office-conformance-a633"
+kit = "suite"
+purpose = "Corpus-backed correctness of repaired Rust sources during migration; no timing, performance-acceptance or complete benchmark-suite claim."
+baseline = ""
+findings = [
+  "22 selected libtest checks passed with verified readable corpus paths; no missing-corpus early returns. Nine exact gate-used binaries supplied 16 checks; six genuinely missing targets were built once and supplied six checks. Source/lockfiles unchanged; no dependency upgrades.",
+  "DL: 410 pass, one disputed DL-909 task, zero wrong/open; disputed witness verified separately. Seven hard-search cases and counting 906/907/910 passed. Bounds: 193 consistency tasks (131 proved), 88 inconsistency tasks (12 incomplete/data unchecked), 84 entailment tasks and 170 entailed atoms; four unresolved imports, two not-read, one unparsed. Bounds tallies overlap and are not full-coverage credit.",
+  "OWL: 403 DL ontologies round-tripped; 77 ontologies/320 axioms agreed across RDF/functional syntax; 297 profile cases compared. QL: 51 pass, nine expected failures, two import skips. Separate RDF/XML all.rdf roundtrip passed its >10000-quads guard; exact count not printed.",
+  "Unregistered scopes, no invented pair credit: RDF syntax 1329 pass across 14 manifests; RDFC 86/86; SPARQL syntax 1289/1289; SPARQL 1.2 evaluation 269/269. JSON-LD 884 pass, 22 excluded by existing JSON-LD 1.0/generalized-RDF policy. N3 parser 1084 pass, one expected cwm number/base-reference failure; N3 reasoner 13 in-scope passes, 76 out of scope.",
+  "Shared corpus: /home/krarilotus/nrese-data-prep-20261009/conformance; all seven selected tree digests reverified, 9548 files/63182223 bytes plus nine external notices (15 notice hashes including six selected files). all.rdf SHA256 5383f1ddf4cf2f03703a2f886f41d4e5bc375633a1cfa94a03254fd89330f8bb. Selection/pins/tree hashes are in conformance-selected-manifest.json and preflight.json. Only missing candidate .cache symlinks added; no existing content replaced.",
+  "Benchmark queues stayed paused at 138 invocations/23 complete cases. No Phuoc work, hooks, commit, push or dataset deletion. Disputes, exclusions and import skips remain distinct from passes; wrapper success is not universal conformance."
+]
+started = "2026-10-09T17:25:36.836758+00:00"
+finished = "2026-10-09T17:29:05.135237+00:00"
+host = "Office-PC (sus-ai)"
+machine = "Ryzen 9 5950X, 32 threads, 32 GiB; Linux 7.0.0-34-generic. Native correctness processes, serial libtest, systemd MemoryMax=8G/MemorySwapMax=0/CPUQuota=400%/AllowedCPUs=0-3. Migration I/O concurrent."
+commit = "6f22e85da5cf643ced099e2262681066922e8e55; Rust/config/lock content equivalent to a6331c7a25c083982e5819cbcbf398389e3ac342"
+dirty = "At execution: 3 tracked non-Rust edits (AGENTS.md, benches/README.md, benches/suite/suitekit/driver.py) and 1 untracked test (benches/suite/tests/test_prebuilt.py); preserved unchanged."
+protocol = """
+Correctness only: no elapsed-time or performance claims under migration I/O.
+NRESE_W3C_REQUIRED=1 plus tree hashes, actual readable paths and embedded source-root
+checks; no W3C_ONLY/CASE/SWITCHES filters or budget overrides. Exact libtest names,
+--nocapture --test-threads=1; raw state files retain every command, PID, exit and hash.
+Existing binaries: tableau_w3c, bounds, w3c_owl2, w3c_owl2_ql, w3c_owl2_rl,
+w3c_sparql11, w3c_n3_reasoner, w3c_shacl, geosparql_compliance. Gate-reused binaries
+may predate a633; preflight records their paths/hashes/fingerprints and embedded roots.
+One later guarded Office build: nrese-rdf-io/{w3c_rdf,w3c_jsonld,w3c_n3,w3c_rdfc,it}
+and nrese-sparql-syntax/w3c_syntax; rustc1.98.1, native flags, jobs4, 8GiB,
+--no-run --locked --offline, existing target-candidate-c888a20/cache. No rebuild loop.
+"""
+commands = [
+  "Exact 16 prebuilt invocations: available-state.json; exact six later invocations: missing-state.json; each uses recorded executable --exact TEST --nocapture --test-threads=1.",
+  "bash scripts/cargo-guarded.sh test --no-run --locked --offline -p nrese-rdf-io -p nrese-sparql-syntax --test w3c_rdf --test w3c_jsonld --test w3c_n3 --test w3c_rdfc --test it --test w3c_syntax --message-format=json-render-diagnostics"
+]
+results = """
+Office root: /home/krarilotus/nrese-prep-20261009-4e8bd38/
+Raw directory: conformance-a633-corpus/ (individual logs and SPARQL/SHACL reports).
+SHA256, relative to raw directory:
+preflight.json e95ac08b63bca9461f10a7d143de393ee238a70d2d2a2fe88a82bb905289e5e5
+available-state.json 606c0a6d33aa1f5b9c8a551362d62333050bc06f4de9af8bbe3249fc38eb63cc
+missing-build.json 467c973005b35cfc34b55565092dd8e4ba45f02b01e4f1735a92e43a3f27af2b
+missing-state.json b8427b1deb9150963295fd72095bfb75a8f9d0895041c88684252f733735235c
+tableau-w3c-results.tsv d1f31d41210a08dc1d805bd91d771a9aaa2e77c9d1292035923fc9f3823200f0
+report.txt 3d24ba4926396251e884c690c9b74120721e1e5d92af7dec88c6345f5cc71e06
+../conformance-selected-manifest.json a1221af0929d1667f7aa574ef208c9eb27809a481e2bb924642260a594f947d1
+State files hash all 22 logs and generated reports; preflight/build manifests hash
+the 15 test executables. Detailed limitations are in report.txt; no raw timings here.
+"""
+publishable = "all"
+
+pairs = [
+  { workload = "w3c-owl2-dl", tier = "-", system = "nrese", regime = "direct", outcome = "partial", runs = 1, items = "410/411", note = "One disputed DL-909 task; witness guard passes; zero wrong/open. Dispute is not full-coverage green credit." },
+  { workload = "w3c-owl2-rl", tier = "-", system = "nrese", regime = "owl2-rl", outcome = "partial", runs = 1, items = "86/89", note = "Zero failures; two import skips and one functional-only premise skip." },
+  { workload = "w3c-sparql11", tier = "-", system = "nrese", regime = "none", outcome = "ok", runs = 1, items = "505/505", note = "Zero failures/skips in the pinned 1.1 runner; 1.2 findings are separate." },
+  { workload = "w3c-shacl", tier = "-", system = "nrese", regime = "none", outcome = "ok", runs = 2, items = "120/120", note = "98 Core plus 22 SPARQL tests; zero expected/unexpected failures." },
+  { workload = "geosparql", tier = "compliance", system = "nrese", regime = "none", outcome = "partial", runs = 1, items = "194/212", note = "18 disputed reference differences; no Geographica/performance coverage." }
+]
