@@ -1,0 +1,34 @@
+date = "2026-10-10"
+kind = "CPU attribution diagnostic; no performance acceptance"
+host = "Office-PC (sus-ai), Ryzen 9 5950X, Linux 7.0.0-34, perf 7.0.14"
+source = "77478d195cb073b263b1eac8661034a09bfbbf20 (frozen binary, not current head)"
+binary_sha256 = "047d9eaec886e71c170edc3874be3a33ca1df90187d8462654d85cdfe9511a1b"
+data_sha256 = "4e040318e5e9eb923cf6d12e6930330775f37034c5580e9beca678edc0118c07"
+protocol = """
+Reuse the registered Office cache-on invocation: social300k, archived seed-7
+1000-query log, --routes --warmup 0 --runs 1 --cache-bytes 268435456. There was
+no --results in that invocation. Binary/input hashes checked; each query hash
+and exact archived/actual argv recorded. Existing quiet guard, no new build,
+worktree or dataset copy. Native systemd user scope replaces Docker, retaining
+the 6GiB memory ceiling and zero swap; this is explicitly an attribution variant.
+First capture: cycles:u at 999Hz, DWARF 16384, whole process.
+Second: cpu-clock:u at 999Hz, DWARF 8192, 64MiB perf buffer; start disabled and
+enable through FIFO when the existing held: log marker arrives. The enable request
+timestamp is recorded, but the acknowledgment was not retained; the query prefix
+may run before sampling starts. Untimed routes/harness work remains included.
+"""
+findings = [
+  "Both invocations report 1000 queries and no query errors. This is not a new answer-bag equivalence check.",
+  "Whole process: 40552 samples, 10 lost samples; loading dominates. Resolved user leaves carry about 98.42% of recorded cycle weight, although few samples have usable user callchains. Raw kernel-space IPs occur despite exclude_kernel=1.",
+  "Focused query-and-route phase: 6465 software CPU samples, no loss reported. Self-symbol hotspots include index Header::component, snapshot merging, sorting and WCOJ. They cannot be assigned to timed query versus untimed route work with these callchains.",
+  "The samples do not identify key construction, ranking, ID copying, serialization or blocked mutex time as the regression cause. No timing claim or production change; current-head regression acceptance remains open.",
+  "Next: separate timed-query/route attribution and recover usable user callchains. Removing routes without checking its cache effects would change the workload.",
+]
+artifacts = [
+  "/home/krarilotus/nrese-prep-20261009-4e8bd38/cache-profile-77478d1-20261010/",
+  "/home/krarilotus/nrese-prep-20261009-4e8bd38/cache-profile-77478d1-20261010-focused/",
+]
+results = "manifest.json, cache-on.json, command.log, self.txt, callers.txt, stack-summary.json, cache-on.perf.data.zst, trace-archive.json and archived runner sources"
+raw_trace_sha256 = ["a44afee411b7c2d46d66c689ee1f1ac8aa87ac87d18d4ccce7110ffcf41b94c0", "45b07f7ece23097eeaf4abbfd6b8c2d8acc0f7bf3f53dbca12455ec9a4218125"]
+archive_cleanup = "Both decompressed SHA256s verified before removing owned uncompressed captures; 701557777 bytes (669 MiB) reclaimed on Office, evidence retained. No dataset or build cache removed."
+publishable = "all"

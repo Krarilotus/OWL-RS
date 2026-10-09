@@ -191,10 +191,13 @@ entry metadata, per reader entry (the existing maximum is eight).
 Five release process pairs on Office reuse the existing QL fixtures with a disposable
 probe. Refreshing an unchanged 1004-statement schema after a view change takes median
 38.230 -> 30.426 us (20.4% less); sample ranges [36.515, 41.520] and [27.854, 32.020] us
-do not overlap. The 4/104-statement cases and same-view hits have overlapping ranges;
-the sub-millisecond hit aggregates earn no timing claim. This is a component diagnostic,
+do not overlap. These are medians of five per-process aggregate means, not per-call
+latency medians. Five pairs do not meet the protocol's ten-repetition claim requirement,
+and no microcase acceptance floor was predeclared. The 4/104-statement cases and same-view
+hits have overlapping ranges; the sub-millisecond hit aggregates earn no timing claim. This is a component diagnostic,
 not an end-to-end improvement, concurrency qualification or clearance of the runtime gate.
-The schema payload retained in the three cases is 128/3328/32128 bytes; no memory-neutral
+The schema payload retained in the three cases is 128/3328/32128 bytes, calculated from
+the retained statement layout rather than measured RSS or total cache growth; no memory-neutral
 claim is made. Probe source, exact binary/source identities and all samples are retained
 in the [run record](../../benches/runs/2026-10-10-cache-contracts-d31010c.toml).
 
@@ -205,9 +208,25 @@ revision no longer evicts a newer complete result. Both DL policy guards fail ag
 old code and pass with the repair; the initial rejected zero-timeout fixture is retained
 in the raw history and replaced by a positive-expired timeout. Focused Office checks pass
 6 QL tests, 2 DL cache-policy tests and 4 existing classification integration tests.
+Normal commit and push checks on Office pass for `0f3155b`, including affected/dependent
+tests, additional random seeds, formatting, Clippy and lock checks. The first push's SSH
+connection expired during the gate; the passed checks are retained in
+`office-cache-contracts-gate.log` beside the run artifacts. Fresh independent source and
+measurement reviews found no actionable code defect and clarified these statistical limits.
 The obsolete hash-only key and stale documentation of missing Base reuse are removed.
 No new scheduler, default limit or general cache is introduced. Profiling of result-cache
-key construction, shared ranking, ID-table copies and serialization remains next.
+key construction, shared ranking, ID-table copies and serialization remains open.
+
+A first [frozen replay profile](../../benches/runs/2026-10-10-cache-replay-profile-77478d1.toml)
+reuses `77478d1`, social300k and the archived seed-7 log on Office. Both captures complete
+1000 queries without reported errors. Whole-process sampling is dominated by loading;
+enabling software CPU sampling after the existing `held:` marker reveals index decoding,
+sorting and WCOJ work. That phase still includes untimed `--routes` execution. Sampled
+leaf symbols are usable, but callchains are mostly unusable; neither capture attributes
+the measured replay regression to key construction, ranking, copying or encoding.
+CPU samples cannot establish blocked mutex time. No production change follows from this
+diagnostic. The next capture must distinguish timed queries from route work and recover
+usable user callchains; simply removing `--routes` can change cache population.
 
 ### 9 October: bounded DL Base reuse and deadline repair
 
