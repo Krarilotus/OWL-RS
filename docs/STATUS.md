@@ -23,6 +23,7 @@ historical v2 improvements are not credited to this branch.
 | Kernel/allocation reuse | Moving projection, shared forward search, direct raw spill, ordered dedup; one SPARQL numeric implementation | Work/copy savings do not establish end-to-end speedups; reference arithmetic is shared |
 | Execution ownership | Catalog runtime, reusable DL pools, bounded participating batches, update WHERE and retained results | Severe handoff/throughput regressions; generic serializers and ASK/header encoding remain outside the output CPU boundary |
 | DL bounds/exact work | Dictionary-safe ID results, lower-true ASK reuse, bounded decoding and existing compiled probes | Repeated base search/compilation between batches; materialised upper tables; no whole-request memory ceiling |
+| DL classification/realisation | Existing Base retains the initial search; current probe controls and one fallback allowance; realisation reuses the deterministic start | Separate stage compilation remains; cooperative checkpoints and partial aggregate counters; qualification is a selected DL comparison |
 | Process memory policy | Server owns global fallback; independent store watches reach bounds and diagnostics | Cooperative enforcement; task capacities and process memory are different contracts |
 | Benchmark machinery | One suite estimator, explicit microcase/QPS checks, reference-only GraphDB writes with numeric validation | Full current-head A/B, incremental reasoning sequences and unimplemented competitor adapters |
 | Architecture | Actual owners and retirement conditions documented | Direct physical-plan execution, calibrated routing, NUMA/GPU and distributed execution remain unfinished |
@@ -34,6 +35,14 @@ vocabulary resolution. Independent semantic oracles and distinct state lifetimes
 retained. The [plan](plan/2026-10-09-performance-architecture.md) owns the next decisions;
 the [lab log](design/performance.md#6-lab-log-of-the-performance-phase-from-5-october-2026)
 owns measurements and rejected experiments.
+
+The bounded DL repair against clean `be5c3d7` completes 84 paired classification and
+realisation invocations plus 24 fresh-search controls on Office. Canonical answers
+match throughout. ORE 9881/16542 classification improves 27–43% at 1/4 workers;
+the 300-individual choice realisation improves 14–18%. The initial unnecessary Horn
+checkpoint copy was removed and remeasured. These are new, scoped gains, not historical
+v2 numbers or clearance of the runtime regressions. The [DL run record](../benches/runs/2026-10-09-dl-reuse-be5c3d7.toml)
+identifies binaries, source, fixtures, superseded experiments and qualification limits.
 
 Office's frozen **`4e8bd38` → `77478d1` campaign is complete: 95 cases, 570 invocations,
 three repetitions per side**. Reanalysis with an explicit zero-ms floor flags seven

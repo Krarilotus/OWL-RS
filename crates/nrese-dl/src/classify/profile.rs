@@ -62,7 +62,8 @@ pub struct Profile {
     pub type_candidates: u64,
     pub type_tests: u64,
     pub type_positive: u64,
-    /// Summed over the tests.
+    /// Summed over recorded searches, including initial consistency and realisation.
+    /// Sequential fallback attempts include the work before a fallback too.
     pub nodes_created: u64,
     pub branch_points: u64,
     pub clashes: u64,

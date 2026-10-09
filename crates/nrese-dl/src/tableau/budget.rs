@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use nrese_exec::workers::Workers;
 
-use super::{Answer, Config, Outcome, Telemetry};
+use super::{Answer, Config, Outcome, ProbeOutcome, Telemetry};
 
 pub(crate) struct RunBudget {
     pub started: Instant,
@@ -69,6 +69,33 @@ impl RunBudget {
             },
             model: None,
             features: super::Features::default(),
+        }
+    }
+
+    /// One probe allowance, including setup, labels and any fallback attempts.
+    pub(crate) fn probe(
+        &self,
+        config: &Config,
+        run: impl FnOnce(&Config) -> ProbeOutcome,
+    ) -> ProbeOutcome {
+        let mut out = match self.remaining(config) {
+            Ok(remaining) => run(&remaining),
+            Err(why) => self.stopped_probe(why),
+        };
+        if let Err(why) = self.check_elapsed(config, self.started.elapsed()) {
+            out.answer = Answer::GaveUp(why.into());
+            out.labels = None;
+        }
+        out.telemetry.total = self.started.elapsed();
+        out
+    }
+
+    pub(crate) fn stopped_probe(&self, why: &str) -> ProbeOutcome {
+        let out = self.stopped(why);
+        ProbeOutcome {
+            answer: out.answer,
+            telemetry: out.telemetry,
+            labels: None,
         }
     }
 }
@@ -174,6 +201,48 @@ mod tests {
         assert_eq!(memory_share(1, 4), 0);
         assert_eq!(memory_share(0, 4), 0);
         assert_eq!(memory_share(101, 4), 25);
+    }
+
+    #[test]
+    fn probe_fallbacks_share_the_budget_and_preserve_work_when_stopped() {
+        let cancel = super::super::Cancel::default();
+        let config = Config {
+            cancel: Some(cancel.clone()),
+            ..Config::default()
+        };
+        let budget = RunBudget::new(&config);
+        let out = budget.probe(&config, |_| {
+            cancel.cancel();
+            let mut stopped = budget.probe(&config, |_| panic!("cancelled fallback started"));
+            stopped.telemetry.nodes_created = 7;
+            stopped
+        });
+        assert!(matches!(out.answer, Answer::GaveUp(_)));
+        assert_eq!(out.telemetry.nodes_created, 7);
+        assert!(out.labels.is_none());
+
+        let config = Config {
+            timeout: Some(Duration::from_secs(2)),
+            ..Config::default()
+        };
+        let budget = RunBudget {
+            started: Instant::now() - Duration::from_secs(3),
+            timeout: config.timeout,
+        };
+        assert!(matches!(
+            budget
+                .probe(&config, |_| panic!("expired fallback restarted"))
+                .answer,
+            Answer::GaveUp(_)
+        ));
+        let budget = RunBudget {
+            started: Instant::now() - Duration::from_secs(1),
+            timeout: config.timeout,
+        };
+        budget.probe(&config, |remaining| {
+            assert!(remaining.timeout.unwrap() <= Duration::from_secs(1));
+            budget.stopped_probe("test")
+        });
     }
 
     #[test]

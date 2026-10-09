@@ -40,6 +40,12 @@ bounded write-scaling harness repair: reference-only execution, numeric Person a
 probe checks, and actual rather than requested triple accounting. Separate complete
 incremental-reasoning sequences remain an open benchmark package.
 
+The owner also authorised the bounded DL completion-state reuse/deadline repair after
+the all-added-lines audit: reuse the existing `Base` and `RunBudget`, remove the second
+initial search and stale controls, preserve unknown outcomes and the deterministic
+fallback, and validate correctness and performance before acceptance. The v2 Base API
+changes deliberately; this authorises no new scheduler, cache or implicit limits.
+
 The aim is to make existing capabilities faster, cheaper to run, and easier to maintain.
 Improve the amount of work first, its representation second, and its machine execution
 third. Preserve semantics, compatibility and the measured wins already in the repository.
