@@ -1,0 +1,86 @@
+# Hand-written perf-lab diagnostic record; see README.md. Raw measurements stay local.
+# Custom tiers below deliberately earn no standard-tier or fast-suite coverage.
+# Horn fixtures have no matching registry workload: record them in protocol/findings,
+# not as ORE, OWL2Bench, fast-suite or competitor pairs. No status regeneration needed.
+
+id = "2026-10-09-initial-runtime-c888a20"
+kit = "reasoning"
+purpose = "Initial same-host runtime/plan diagnostics on Office-PC and Phuoc-Yu: LUBM 1 queries, a short client sweep, and generated Horn classification. Not a suite campaign, competitor comparison, steady-state qualification or final 77478d1 qualification."
+baseline = "4e8bd38e0733055c06d77f9fdd7cd36c6d89bd7c; the historical whole-programme baseline 0f46563 is not superseded"
+findings = [
+  "Runtime performance acceptance BLOCKED: Office throughput regresses beyond the screening threshold at one and two clients, with all three pairs lower. Phuoc decreases are smaller but all three pairs are lower at every width. Benchmark owner investigating; these data do not isolate runtime changes from P8.",
+  "All 62 invocations per host exited zero: two correctness preflights and 60 timed processes (30 A/B pairs). No failed, unknown or timeout outcome was discarded. An earlier quota-probe preflight aborted before launching benchmarks; its evidence is separate.",
+  "Every LUBM q01-q14 row count, byte size and answer bag matches across revisions. Counts in query order: 4, 0, 6, 34, 719, 7790, 67, 7790, 208, 4, 224, 15, 1, 5916. Serialized bytes: 242, 9, 447, 4909, 45508, 496234, 7718, 1228722, 36669, 242, 12685, 1471, 64, 384787. Per-query bag hashes are in correctness.json and each answer-checks.json; perf-lab-compare.py also passed all six perf/client pairs per host.",
+  "Both classifiers, both widths, both revisions and all repetitions agree on canonical taxonomies: Horn20 SHA256 6775e04638b9ab8ba1f832bf2d03adce16588464214c773ea13d976eda32fa29; Horn1500 SHA256 0c11800ff300534c8f73348a2cff71f3ed5c635edb1ef1491ca83b8421817745. This is differential identity, not independent competitor correctness.",
+  "No individual LUBM query or Horn case crossed the latency regression screen; that does not establish neutrality. Office client phase RSS increases also require investigation. Phase RSS is not lifetime RSS after clear_refs resets; cgroup peaks include launcher/page-cache costs. Raw times, ranges and memory measurements remain in the archives/report.",
+  "The candidate predates later P3/process-policy fixes and perf_lab runtime --threads wiring. No larger LUBM tier, real-ontology corpus, mixed-write load, long soak, fast-suite or competing system was measured by this record.",
+]
+started = "2026-10-09T14:40:08Z"
+# process.json records second-resolution starts plus wall_s, not exact end timestamps.
+finished = "2026-10-09T14:41:59Z (upper bound derived from last process start plus wall_s)"
+host = "Office-PC (sus-ai); Phuoc-Yu; analysed separately, no cross-host ratios"
+machine = "Office: Ryzen 9 5950X, 32 logical CPUs, 33559298048 bytes RAM, Ubuntu kernel 7.0.0-34-generic/glibc 2.39. Phuoc: Ryzen 7 7800X3D, 16 logical CPUs, 31824224256 bytes RAM, Ubuntu kernel 7.0.0-30-generic/glibc 2.43. Both: powersave governor, boost on, THP madvise; existing desktops remained running."
+commit = "candidate c888a203ea69cdceac032deec5be56fe998a9cc1; baseline 4e8bd38e0733055c06d77f9fdd7cd36c6d89bd7c; quiet guard a4ee3f4064ae83d158969b72bc4e8a2065e64bcc"
+dirty = "0 tracked changes in build worktrees, per host report; Phuoc used byte-identical transferred Office binaries, not a local rebuild"
+protocol = """
+Per host: ten cases, each three fresh-process pairs in AB, BA, AB order (A=base,
+B=candidate). Cases: one LUBM1 query run; one client sweep; context_classify and
+dl_classify on Horn20/Horn1500 at threads 1/4. Two separate correctness preflights
+use runs=1/warmup=0. Timed perf_lab uses runs=5/warmup=1, owl2-rl, cache-bytes=0;
+--threads is omitted on BOTH revisions (hardware defaults; candidate wiring unfixed).
+Clients 1,2,4,8 each run for 3 seconds on the same freshly loaded process. This is
+the existing prepared-query runner, completions divided by nominal duration, not
+the registered consumer workload 'clients' or a long steady-state test. Classifiers
+use repeat=1, threads=1/4; dl_classify timeout=120. Exact argv/cwd are archived in
+initial-c888a20/<case>-p<1..3>-<base|new>/command.json; preflights use correctness-p0-*.
+
+All invocations use the fixed quiet guard, compiler-absence checks before/inside,
+8 GiB memory.max, swap.max=0, no local or ancestor CPU quota, default affinity
+(Office 32, Phuoc 16 CPUs), and no build nice/idle override. No core pinning,
+governor changes or global page-cache drop; inputs mostly page-cache warm.
+Builds completed before measurements: same Office rustc 1.98.1/LLVM 22.1.8,
+--frozen --release, fat LTO, one CGU, target-cpu=native; perf_lab uses mimalloc,
+standalone classifiers System. Both binary sets and input SHA256s are in manifest.json.
+
+Deviations from broad qualification: short client duration, default perf_lab workers,
+small fixtures, only NRESE before/after, three pairs, no bootstrap confidence claim.
+Latency screen: >10%, >2 ms, beyond each side's spread and all pairs worse;
+throughput: >10% beyond spread and all pairs worse. No aggregate hides a slower case.
+Python wall_s includes wait polling and is diagnostic only. Initial unconfigured
+cpu.max preflight failure was fixed by checking all ancestor quotas before these runs.
+
+Archived process starts: Office 14:40:08Z..14:41:57Z; Phuoc 14:40:09Z..14:41:48Z,
+all on 2026-10-09. Office clients-p1-base starts 14:40:11Z, independently confirmed
+from process.json; its wall_s stays in that archive. The finished field is a derived
+upper bound, not an exact completion timestamp or evidence of sustained host use.
+"""
+commands = [
+  "Office clients-p1-base argv: /home/krarilotus/nrese-prep-20261009-4e8bd38/target-baseline-release/release/examples/perf_lab --load /home/krarilotus/nrese-data-prep-20261009/univ-bench.nt --load /home/krarilotus/nrese-bench/scratch/lubm/lubm-1.nt --reason owl2-rl --cache-bytes 0 --queries /home/krarilotus/nrese-prep-20261009-4e8bd38/source/benches/reasoning/queries/lubm --runs 5 --warmup 1 --json /home/krarilotus/nrese-prep-20261009-4e8bd38/initial-c888a20/clients-p1-base/report.json --results /home/krarilotus/nrese-prep-20261009-4e8bd38/initial-c888a20/clients-p1-base/answers --clients 1,2,4,8 --duration-s 3",
+  "LUBM-only invocation: same perf_lab arguments without --clients/--duration-s; per-case output paths. Preflight uses --runs 1 --warmup 0. Full argv for every invocation is in its archived command.json.",
+  "Classifier argv templates (exact expansions archived): <binary-dir>/dl_classify --timeout 120 --threads <1|4> --repeat 1 --tax <case-dir>/taxonomy.tax /home/krarilotus/nrese-data-prep-20261009/horn-<20|1500>.nt; <binary-dir>/context_classify --threads <1|4> --repeat 1 --tax <case-dir>/taxonomy.tax /home/krarilotus/nrese-data-prep-20261009/horn-<20|1500>.nt",
+  "Office binary dirs: /home/krarilotus/nrese-prep-20261009-4e8bd38/{target-baseline-release,target-candidate-c888a20}/release/examples. Phuoc dirs: /home/krarilotus/nrese-prep-20261009-4e8bd38/{baseline-bin,candidate-bin-c888a20}; its LUBM input is /home/krarilotus/nrese-data-prep-20261009/lubm-1.nt. Case directories and argv are recorded, not inferred from these templates.",
+]
+results = '''
+Office raw: C:\Users\Johannes\Documents\OWL-RS-wt\implementation-benchmark-hosts\tmp\benchmark-initial-Office-PC-results.tar.gz
+1971925 bytes; SHA256 00803b4bb72a882ead467892fb46cbdae8f462c4a41ed301e49ae3a476fabcd5
+Phuoc raw: C:\Users\Johannes\Documents\OWL-RS-wt\implementation-benchmark-hosts\tmp\benchmark-initial-Phuoc-Yu-results.tar.gz
+1951749 bytes; SHA256 ff9bf29dbf37268de592878084d64deec4f50b1c62056c4aa440bf024ec20486
+Both archives contain initial-c888a20/{manifest.json,correctness.json,<case>/command.json,<case>/process.json,...}.
+Original result directories on each host: /home/krarilotus/nrese-prep-20261009-4e8bd38/initial-c888a20/.
+Office summary: C:\Users\Johannes\Documents\OWL-RS-wt\implementation-benchmark-hosts\tmp\benchmark-initial-Office-PC-summary.json
+SHA256 52ab99da3d564057b2a9ea2319b49e773f3dd59125da0e3c141aa8b43619a3dd
+Phuoc summary: C:\Users\Johannes\Documents\OWL-RS-wt\implementation-benchmark-hosts\tmp\benchmark-initial-Phuoc-Yu-summary.json
+SHA256 ab307615d0f3c29a644649c5c4b245c99a8f518bd0daf590b11e7df089016f57
+Report: C:\Users\Johannes\Documents\OWL-RS-wt\implementation-benchmark-hosts\tmp\benchmark-initial-c888a20-report.txt
+SHA256 ef578a377c0361fe1a0e3269859a642215d196f435390075b6ce7fdb91a40ef6
+'''
+publishable = "all"
+
+# 'ok' means successful execution/checked answer identity, not performance acceptance.
+# runs counts six processes (three base plus three candidate), not six A/B pairs.
+pairs = [
+  { workload = "lubm", tier = "diagnostic-1-Office-PC-queries", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, items = "14/14 per process", note = "Initial before/after query diagnostic only; no standard tier credited" },
+  { workload = "lubm", tier = "diagnostic-1-Phuoc-Yu-queries", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, items = "14/14 per process", note = "Initial before/after query diagnostic only; no standard tier credited" },
+  { workload = "lubm", tier = "diagnostic-1-Office-PC-client-sweep", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, items = "4/4 client widths per process", note = "Runtime acceptance BLOCKED by repeatable throughput regressions; not consumer conformance or steady-state coverage" },
+  { workload = "lubm", tier = "diagnostic-1-Phuoc-Yu-client-sweep", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, items = "4/4 client widths per process", note = "Smaller but consistently lower throughput; runtime acceptance remains BLOCKED" },
+]
