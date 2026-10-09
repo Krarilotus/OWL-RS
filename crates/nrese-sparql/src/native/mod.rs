@@ -43,6 +43,8 @@ pub(crate) use preparation::prepare_ql_query;
 use preparation::{ql_rewriting, semantic_pattern};
 mod pushdown;
 pub(crate) use pushdown::per_solution;
+#[cfg(test)]
+mod graph_tests;
 pub(crate) mod ql;
 mod ranges;
 mod search;
@@ -170,18 +172,23 @@ pub(crate) fn explain(
     let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let (pattern, form, rewrites, ql) = native_pattern(query, options, &ctx)?;
     ctx.trace = Some(RefCell::default());
-    let (mut ctx, solutions) = ctx.on_workers(options.workers.as_ref(), |ctx| {
-        ctx.eval_root(&pattern, options.pin.as_ref())
+    let (_, (steps, rows)) = ctx.on_workers(options.workers.as_ref(), |ctx| {
+        let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
+        ctx.check()?;
+        let steps = ctx.trace.as_ref().map(RefCell::take).unwrap_or_default();
+        // CONSTRUCT and DESCRIBE count triples, without retaining a constructed graph.
+        let rows = match form {
+            Form::Select | Form::Ask => solutions.table.len(),
+            Form::Describe => ctx.describe(&solutions)?.len(),
+            Form::Construct(template) => {
+                construct(snapshot, ctx.computed.take(), solutions, template, || {
+                    ctx.check()
+                })
+                .try_fold(0usize, |count, triple| triple.map(|_| count + 1))?
+            }
+        };
+        Ok((steps, rows))
     })?;
-    let steps = ctx.trace.take().unwrap_or_default().into_inner();
-    // CONSTRUCT and DESCRIBE count triples.
-    let rows = match form {
-        Form::Select | Form::Ask => solutions.table.len(),
-        Form::Describe => ctx.describe(&solutions)?.len(),
-        Form::Construct(template) => {
-            construct(snapshot, ctx.computed.into_inner(), solutions, template).count()
-        }
-    };
     Ok((rewrites, steps, rows as u64, ql))
 }
 
@@ -549,7 +556,10 @@ fn construct<'a>(
     computed: Vec<Term>,
     solutions: Solutions,
     template: &[TriplePattern],
-) -> impl Iterator<Item = nrese_rdf::Triple> + 'a {
+    check: impl Fn() -> NativeResult<()> + 'a,
+) -> impl Iterator<Item = NativeResult<nrese_rdf::Triple>> + 'a {
+    #[cfg(test)]
+    graph_tests::checkpoint();
     let mut labels: Vec<String> = Vec::new();
     let mut resolve = |term: &TermPattern| resolve_template(term, &solutions, &mut labels);
     let resolved: Vec<[TemplateTerm; 3]> = template
@@ -569,69 +579,87 @@ fn construct<'a>(
     let mut emitted: HashSet<nrese_rdf::Triple> = HashSet::new();
     let mut buffer: Vec<nrese_rdf::Triple> = Vec::new();
     let mut row = 0;
+    let mut stopped = false;
     std::iter::from_fn(move || {
-        loop {
-            if let Some(triple) = buffer.pop() {
-                return Some(triple);
-            }
-            if row >= table.len() {
-                return None;
-            }
-            let fresh: Vec<nrese_rdf::BlankNode> = (0..fresh_count)
-                .map(|_| nrese_rdf::BlankNode::default())
-                .collect();
-            fn template_value(
-                term: &TemplateTerm,
-                column: &dyn Fn(usize) -> Option<Term>,
-                fresh: &[nrese_rdf::BlankNode],
-            ) -> Option<Term> {
-                match term {
-                    TemplateTerm::Constant(term) => Some(term.clone()),
-                    TemplateTerm::Column(c) => column(*c),
-                    TemplateTerm::Unbound => None,
-                    TemplateTerm::Fresh(i) => Some(fresh[*i].clone().into()),
-                    TemplateTerm::Triple(parts) => {
-                        let subject = match template_value(&parts[0], column, fresh)? {
-                            Term::NamedNode(n) => nrese_rdf::NamedOrBlankNode::from(n),
-                            Term::BlankNode(b) => b.into(),
-                            Term::Literal(_) | Term::Triple(_) => return None,
-                        };
-                        let Term::NamedNode(predicate) = template_value(&parts[1], column, fresh)?
-                        else {
-                            return None;
-                        };
-                        let object = template_value(&parts[2], column, fresh)?;
-                        Some(nrese_rdf::Triple::new(subject, predicate, object).into())
+        if stopped {
+            return None;
+        }
+        let next = (|| {
+            loop {
+                check()?;
+                if let Some(triple) = buffer.pop() {
+                    return Ok(Some(triple));
+                }
+                if row >= table.len() {
+                    return Ok(None);
+                }
+                let fresh: Vec<nrese_rdf::BlankNode> = (0..fresh_count)
+                    .map(|_| nrese_rdf::BlankNode::default())
+                    .collect();
+                fn template_value(
+                    term: &TemplateTerm,
+                    column: &dyn Fn(usize) -> Option<Term>,
+                    fresh: &[nrese_rdf::BlankNode],
+                ) -> Option<Term> {
+                    match term {
+                        TemplateTerm::Constant(term) => Some(term.clone()),
+                        TemplateTerm::Column(c) => column(*c),
+                        TemplateTerm::Unbound => None,
+                        TemplateTerm::Fresh(i) => Some(fresh[*i].clone().into()),
+                        TemplateTerm::Triple(parts) => {
+                            let subject = match template_value(&parts[0], column, fresh)? {
+                                Term::NamedNode(n) => nrese_rdf::NamedOrBlankNode::from(n),
+                                Term::BlankNode(b) => b.into(),
+                                Term::Literal(_) | Term::Triple(_) => return None,
+                            };
+                            let Term::NamedNode(predicate) =
+                                template_value(&parts[1], column, fresh)?
+                            else {
+                                return None;
+                            };
+                            let object = template_value(&parts[2], column, fresh)?;
+                            Some(nrese_rdf::Triple::new(subject, predicate, object).into())
+                        }
                     }
                 }
-            }
-            let column = |c: usize| decode(snapshot, &computed, table.get(row, c));
-            let value = |term: &TemplateTerm| template_value(term, &column, &fresh);
-            for [s, p, o] in &resolved {
-                let subject = match value(s) {
-                    Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
-                    Some(Term::BlankNode(b)) => nrese_rdf::NamedOrBlankNode::from(b),
-                    _ => continue,
-                };
-                let Some(Term::NamedNode(predicate)) = value(p) else {
-                    continue;
-                };
-                let Some(object) = value(o) else {
-                    continue;
-                };
-                let triple = nrese_rdf::Triple::new(subject, predicate, object);
-                let new = triple.subject.is_blank_node()
-                    || triple.object.is_blank_node()
-                    || emitted.insert(triple.clone());
-                if new {
-                    buffer.push(triple);
-                    if emitted.len() > 1024 * 1024 {
-                        emitted.clear();
+                let column = |c: usize| decode(snapshot, &computed, table.get(row, c));
+                let value = |term: &TemplateTerm| template_value(term, &column, &fresh);
+                for (index, [s, p, o]) in resolved.iter().enumerate() {
+                    if index % 256 == 0 {
+                        check()?;
+                    }
+                    let subject = match value(s) {
+                        Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
+                        Some(Term::BlankNode(b)) => nrese_rdf::NamedOrBlankNode::from(b),
+                        _ => continue,
+                    };
+                    let Some(Term::NamedNode(predicate)) = value(p) else {
+                        continue;
+                    };
+                    let Some(object) = value(o) else {
+                        continue;
+                    };
+                    let triple = nrese_rdf::Triple::new(subject, predicate, object);
+                    let new = triple.subject.is_blank_node()
+                        || triple.object.is_blank_node()
+                        || emitted.insert(triple.clone());
+                    if new {
+                        buffer.push(triple);
+                        if emitted.len() > 1024 * 1024 {
+                            emitted.clear();
+                        }
                     }
                 }
+                buffer.reverse();
+                row += 1;
             }
-            buffer.reverse();
-            row += 1;
+        })();
+        match next {
+            Ok(triple) => triple.map(Ok),
+            Err(error) => {
+                stopped = true;
+                Some(Err(error))
+            }
         }
     })
 }
@@ -3198,6 +3226,9 @@ impl<'a> Context<'a> {
     /// statements of the default graph it is the subject of; a blank node such a statement
     /// has as its object is described in turn.
     fn describe(&self, solutions: &Solutions) -> NativeResult<Vec<nrese_rdf::Triple>> {
+        #[cfg(test)]
+        graph_tests::checkpoint();
+        self.check()?;
         let (predicate, object) = (
             Variable::new_unchecked("described predicate"),
             Variable::new_unchecked("described object"),
@@ -3210,6 +3241,7 @@ impl<'a> Context<'a> {
         let mut todo = Vec::new();
         let mut out = Vec::new();
         for row in 0..table.len() {
+            self.check()?;
             for column in 0..table.width() {
                 let id = table.get(row, column);
                 if id != UNDEF && computed_index(id).is_none() && described.insert(id) {
@@ -3217,6 +3249,7 @@ impl<'a> Context<'a> {
                 }
             }
             while let Some(node) = todo.pop() {
+                self.check()?;
                 let Some(subject) = self
                     .term(node)
                     .and_then(|t| nrese_rdf::NamedOrBlankNode::try_from(t).ok())
@@ -3237,6 +3270,9 @@ impl<'a> Context<'a> {
                     statements.column(&object).expect("scanned"),
                 );
                 for r in 0..statements.table.len() {
+                    if r % 256 == 0 {
+                        self.check()?;
+                    }
                     let o_id = statements.table.get(r, o_column);
                     let (Some(Term::NamedNode(p)), Some(o)) = (
                         self.term(statements.table.get(r, p_column)),
@@ -3252,6 +3288,7 @@ impl<'a> Context<'a> {
                 self.consumed(&statements);
             }
         }
+        self.check()?;
         Ok(out)
     }
 
