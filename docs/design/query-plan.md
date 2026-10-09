@@ -1,9 +1,9 @@
 # The query plan
 
-The native executor still walks SPARQL algebra, after rewrites on a logical plan
-(`nrese-sparql/src/plan.rs`). Join flattening combines eligible groups so their patterns
-can be ordered together; eager aggregation reduces a join's inputs before its product
-is made. The plan is lowered back to algebra for execution.
+The native executor still walks SPARQL algebra after logical rewrites. The logical plan
+has n-ary joins and unions; join flattening combines eligible groups, and eager
+aggregation reduces a join's inputs before its product is made. These rewrites return
+algebra for execution. Direct physical-plan execution is not complete.
 
 `native::Context::eval_operator` still selects strategies while executing: paths can be
 followed from their bound end, `SERVICE` receives bindings, and LIMIT can stop work
@@ -16,42 +16,65 @@ that ran and their actual work. Pre-execution estimates are not a complete physi
 operator plan. The current stage boundaries are summarised in
 [execution-core.md §5](execution-core.md#5-planning-built-and-unfinished).
 
-## Target
+## Ownership and representation
 
-1. **A logical plan** built from the algebra: scans, paths, n-ary joins (a group's
-   patterns, subgroups and paths as one join), left joins, filters, unions, minus,
-   extensions, groups, orders, projections, slices, values, `SERVICE`, graph scopes, and
-   `EXISTS` as semi- and anti-joins where it is correlated that way.
-2. **Rewrites as named passes** over it, each with its own tests: filter placement (now
-   `pushdown.rs`), joins across groups, paths from their bound end, limit placement,
-   bind joins to `SERVICE`, the triple-term rewrite. EXPLAIN lists the passes that fired.
-3. **A physical plan** that chooses per node the operator (index probe, merge, hash,
-   leapfrog, semi-join reduction, grouped or factorised aggregation) with estimated
-   rows, so EXPLAIN without ANALYZE shows the plan before anything runs; and the
-   aggregate algebra over products (BSBM BI q4) as a rewrite on it.
-4. **The executor over the physical plan**; `mod.rs` split into plan, execution,
-   functions and federation.
+| Owner in `nrese-sparql/src/` | Responsibility |
+|---|---|
+| [`plan/mod.rs`](../../crates/nrese-sparql/src/plan/mod.rs) | Logical node representation and conversion: `Plan::of` builds from borrowed algebra; `into_pattern` consumes the plan, moving its payloads into algebra. `lower` remains a borrowing compatibility wrapper |
+| [`plan/properties.rs`](../../crates/nrese-sparql/src/plan/properties.rs) | In-scope variables, blank-node join dependencies and order sensitivity, read directly from nodes. Scope preserves lowering's variable order, including ordered scan runs |
+| [`plan/rewrite.rs`](../../crates/nrese-sparql/src/plan/rewrite.rs) | Join flattening and eager aggregation, their eligibility rules and shared child traversal. The native caller supplies the statistics-based decision about whether pre-aggregation pays |
+| [`native/estimate.rs`](../../crates/nrese-sparql/src/native/estimate.rs), [`native/plan.rs`](../../crates/nrese-sparql/src/native/plan.rs) | Logical row estimates and BGP join ordering. Estimates and runtime strategies are not a fully selected physical tree |
+| [`native/path_joins.rs`](../../crates/nrese-sparql/src/native/path_joins.rs) | Path/triple join eligibility and ordering. Estimation reads logical nodes directly; execution still reads algebra. Both entries share filter-scope eligibility and final validation |
+
+Property inspection no longer lowers subtrees to inspect them. Path-join estimation's
+lower-then-inspect adapter and the separate estimate-variable adapter are retired.
+Production lowering moves owned data instead of cloning it; join flattening reuses the
+rewrite child traversal. The previous lowering implementation remains only in
+[`plan/tests/lowering_oracle.rs`](../../crates/nrese-sparql/src/plan/tests/lowering_oracle.rs).
+It checks representation equivalence, not query semantics; the independent reference
+algebra evaluator remains the semantic oracle.
+
+These properties are not a general physical-property record: cardinality estimates,
+ID-table sortedness and runtime resource accounting still live with their existing
+owners. Global partitioning, uniqueness and resource costs are not attached to every
+logical node.
 
 ## Migration: one step at a time, never a second executor
 
-Each step keeps the executor's answers, checked by the differential tests against the
-reference evaluator, the fuzz campaign, and the perf lab (no query set slower).
+`native::optimise` still performs two round trips: algebra → logical plan → join
+flattening → algebra, then algebra → logical plan → eager aggregation → algebra.
+Filter pushdown then rewrites algebra. EXPLAIN constructs a logical plan from the
+rewritten algebra; operator estimates during execution can also construct one.
+Consuming lowering removes payload copies, not these representation transitions.
 
-1. The logical plan, built from the algebra and lowered back to it; the round trip is the
-   identity on the test corpora. The executor runs on the lowered algebra.
-2. The first rewrites on the plan, lowered before execution: groups joined to each other
-   become one join (so their patterns are ordered together), then the rewrites that now
-   live in match guards, one by one.
-3. Estimates on the plan (the store's statistics, characteristic sets), the physical
-   choices, EXPLAIN before running.
-4. The executor reads the plan instead of the algebra, node kind by node kind; the algebra
-   interpreter shrinks with each.
+The first round trip can retire when both rewrites share one logical plan while
+preserving the scan grouping and ordered-input placement currently performed by
+lowering, eager-aggregation eligibility, and the reported passes that fired. Simply
+chaining the two methods on an unnormalised plan is not equivalent. Moving filter
+pushdown and estimate callers to that retained representation removes their algebra
+boundary; this does not require a new executor framework.
+
+For each execution slice, remove its final lowering adapter and old production dispatch
+only when the same selected nodes serve every caller, including cache lookup, tracing
+and limited evaluation. They must preserve scoped cache identity, computed-term
+ownership, bags, errors, negation, order, cancellation and memory/result limits. The
+algebra `PathJoin::of` entry retires when execution consumes the same join representation
+as estimation. Unconverted operators may keep lowering; no second permanent executor
+or per-row virtual dispatch is introduced.
+
+Keep metadata counts, group walks, sideways probes, eager aggregation, LIMIT pushdown,
+component closures and cyclic worst-case-optimal joins. The
+[`plan tests`](../../crates/nrese-sparql/src/plan/tests.rs) guard scope/order and moved
+VALUES buffers; the [path-join tests](../../crates/nrese-sparql/src/native/path_joins/tests.rs)
+guard eligibility and zero inspection lowering. Native/reference differential tests and
+[route guards](../../crates/nrese-sparql/tests/it/plan_guard_tests.rs) cover execution.
+These work guards establish removed conversions/copying, not lower latency; integration
+and performance validation precede declaring a migrated slice complete.
 
 ## Plan parts in the result cache
 
-Every operator the executor evaluates is a part of the result cache (`nrese_sparql::cache`,
-merge checklist §2 item 7): its result is kept as id columns and shared by every query of
-the store, as QLever keeps the result of every subtree of its plan. A part's key is its
+Eligible operator results are parts of the result cache (`nrese_sparql::cache`): they are
+kept as id columns and shared across a store's queries. A part's key is its
 algebra with the variables numbered in the order they occur (so `?s ?p ?o` and `?x ?y ?z`
 are one part), after the context its result depends on: the snapshot's identity, the read
 model, the dataset as resolved for the user's access, the active graph, the equality
@@ -60,5 +83,7 @@ algebra but several joins of the plan: each prefix of its join order (two patter
 more, the whole pattern included) is a part, keyed by its triples, their range hints and
 the filter conjuncts applied within it, and a pattern starts from the longest prefix
 cached. Single patterns are scans, not parts: an index read costs what a copy would.
-Until the executor reads the physical plan (step 4), the parts are the algebra's nodes and
-the join prefixes; then they become the physical plan's subtrees.
+`native/cached.rs` and `cache_key.rs` still consume algebra, with special treatment for
+trivial, volatile and limited evaluations. A node migration must retain those contracts
+and sharing across variable renamings; replacing cache keys or adding finer invalidation
+is not a prerequisite for this preparation slice.
