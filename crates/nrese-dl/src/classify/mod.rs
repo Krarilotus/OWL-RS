@@ -43,7 +43,7 @@ pub use realise::{Realisation, realise};
 /// taxonomy).
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Workers; 1 runs everything on the calling thread.
+    /// Worker allowance; 1 runs on the caller only when no physical owner is supplied.
     pub threads: usize,
     /// Reusable physical workers supplied by an embedding runtime. `threads` narrows
     /// their allowance. Without an owner, classification creates one pool for its run.

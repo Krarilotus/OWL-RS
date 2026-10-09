@@ -178,7 +178,7 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
 
-### 9 October: partial Phuoc milestone, runtime acceptance and push gate blocked
+### 9 October: partial Phuoc milestone, runtime acceptance blocked
 
 The completed Phuoc batches compare `4e8bd38e0733055c06d77f9fdd7cd36c6d89bd7c`
 with `77478d195cb073b263b1eac8661034a09bfbbf20`. The latter's production code is
@@ -247,7 +247,27 @@ The repaired `a6331c7` passes all three focused seeds and the normal Office comm
 hooks: format, lint, regular tests, new seeds 93060–93062, locks and 22 suite contracts.
 The branch push completed at 16:46:12 UTC. This supersedes the failed gate, not the
 performance blockers. Missing external corpora caused conformance wrappers to return
-early; corpus-backed qualification remains pending despite the hook pass.
+early during that gate. The later Office corpus run below supplies separate qualification.
+
+At 17:29:05 UTC, Office completed 22 selected corpus-backed checks against Rust content
+equivalent to `a6331c7`: zero unexpected failures and no missing-input early returns.
+Seven pinned corpus trees (9,548 files, 63,182,223 bytes) were rehashed first. Existing
+gate binaries were reused; six missing RDF I/O/SPARQL syntax targets were built together
+with the existing target cache, locked/offline dependencies and the guarded build. No
+source or lockfile changed. Tests ran during migration I/O, so their elapsed times are
+not performance measurements.
+
+DL reported 410 passing test-type tasks plus one adjudicated dispute; bounds exercised
+193 consistency, 88 inconsistency and 84 entailment tasks, with unresolved imports,
+unread inputs and incomplete bounds reported separately. SPARQL evaluation passed
+505 1.1 and 269 1.2 cases; SHACL passed 98 Core and 22 SPARQL cases. RDF syntax passed
+1,329 checks, SPARQL syntax 1,289, RDFC 86 and JSON-LD 884 (22 excluded). N3 parsing
+passed 1,084 with one expected failure. Known QL expected failures/import skips, RL
+import/profile skips, out-of-scope N3 reasoning and 18 GeoSPARQL disputes remain.
+Counts from different runners overlap and are not a total of distinct ontologies.
+Exact commands, binary hashes, corpus preflight and per-run tallies are retained in
+`implementation-benchmark-hosts/tmp/office-conformance/` and Office's
+`nrese-prep-20261009-4e8bd38/conformance-a633-corpus/`.
 
 Source evidence is retained in
 `implementation-process-memory/tmp/phuoc-qualification/`: `cli-analysis.json`,
@@ -259,9 +279,21 @@ The completed handoff now contains 222 records (96 CLI, 18 client/cache, 84 supp
 24 native-suite), all exit zero; no final timeout/OOM/error was excluded. The stopped
 superseded batch remains excluded. Only six of 95 fast cases and four selections from
 24 broader workloads were exercised; no competitor ran. Office's frozen `77478d1`
-campaign resumed at 16:48:32 UTC; at 16:53:20 UTC it had completed
-15 cases / 90 invocations. The full campaign remains unfinished.
+campaign reached 23 complete cases / 138 invocations and paused at a clean boundary
+at 17:02:27 UTC for the benchmark asset migration. Its original queues, frozen binaries
+and samples are retained. The full campaign remains unfinished.
 These selected native cases neither complete that campaign nor qualify later repairs.
+
+The disposable caller-budget experiment is rejected in its present form. Its FIFO
+admission and exclusive parallel-pool leases passed nine deterministic guards and the
+29 Phuoc invocations' content/admission checks, but at 16 workers and eight clients the
+parallel-kernel elapsed ratios were 2.186/2.358/1.974 and mixed serial/parallel ratios
+3.010/2.753/2.557 versus the installed-pool control. This is a short mechanism screen,
+not native-query recovery evidence: pairs were within one process, 294 of 696 rows
+were below 2 ms, and candidate-only instrumentation was asymmetric. No production
+code from that prototype was kept. Source/binary hashes, all pairs and limitations
+are in `implementation-process-memory/tmp/caller-experiment-phuoc/`; a different
+ownership policy requires its own design checkpoint and real-query measurements.
 
 Correction: the prior Horn "process peak" label is withdrawn. GNU-time medians over
 15 runs/side, 337.46 -> 2,021.85 MiB, and internal median-of-pair-medians 488 -> 2,217 MiB
