@@ -83,6 +83,7 @@ fn consistency_at(
     snapshot: &Snapshot,
     view: &View,
     cancellation: &CancellationToken,
+    deadline: Instant,
 ) -> Verdict {
     if cancellation.is_cancelled() {
         return Verdict::Unknown("cancelled".to_owned());
@@ -98,12 +99,25 @@ fn consistency_at(
     if view.proves_consistency {
         return Verdict::Consistent;
     }
+    if Instant::now() >= deadline {
+        return Verdict::Unknown("past dl.timeout".to_owned());
+    }
     let cancel = nrese_dl::tableau::Cancel::from_flag(cancellation.flag());
     let ontology = ontology_at(store, snapshot);
-    let checked = consistency::check(&ontology, &gate::budget(store, Some(cancel)));
-    // Cancellation must not replace the revision's shared consistency status.
     if cancellation.is_cancelled() {
         return Verdict::Unknown("cancelled".to_owned());
+    }
+    let budget = gate::remaining_budget(&gate::budget(store, Some(cancel)), deadline);
+    if budget.timeout.is_zero() {
+        return Verdict::Unknown("past dl.timeout".to_owned());
+    }
+    let checked = consistency::check(&ontology, &budget);
+    // Request-local cancellation or expiry must not replace shared revision status.
+    if cancellation.is_cancelled() {
+        return Verdict::Unknown("cancelled".to_owned());
+    }
+    if Instant::now() >= deadline {
+        return Verdict::Unknown("past dl.timeout".to_owned());
     }
     store.dl().record(DlStatus {
         revision: snapshot.revision(),
@@ -296,7 +310,7 @@ fn decide_answers(
     let (snapshot, view) = super::bounds::view(store);
     let analysis = analyse(prepared.query());
     let mut status = Status::complete();
-    let consistency = consistency_at(store, &snapshot, &view, cancellation);
+    let consistency = consistency_at(store, &snapshot, &view, cancellation, deadline);
     if cancellation.is_cancelled() {
         return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
     }

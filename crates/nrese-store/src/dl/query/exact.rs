@@ -113,6 +113,12 @@ pub(super) fn decide_until(
         let Some(fresh) = fresh else {
             return unresolved("the entailment tests' terms haven't reached this replica yet");
         };
+        if cancellation.is_cancelled() {
+            return unresolved("cancelled");
+        }
+        if Instant::now() >= deadline {
+            return unresolved("past dl.timeout");
+        }
         let compiled = entailment::Batch::new(&mut ontology, &tests);
         let ontology = &ontology;
         let cancel = nrese_dl::tableau::Cancel::from_flag(cancellation.flag());
