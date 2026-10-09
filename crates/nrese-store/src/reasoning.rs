@@ -94,9 +94,6 @@ pub struct MaterialisationReport {
     /// hierarchies, transitive and equivalence properties and equality, merging,
     /// consistency); zero for a commit.
     pub phases: nrese_reasoner::batch::Phases,
-    /// A commit made an unnamed class that was left out consumable: its memberships are
-    /// missing until the store rematerialises.
-    pub needs_rematerialisation: bool,
 }
 
 impl MaterialisationReport {
@@ -132,7 +129,6 @@ pub(crate) fn apply_delta(
         violations: done.violations.len(),
         rounds: done.rounds,
         elapsed: started.elapsed(),
-        needs_rematerialisation: done.needs_rematerialisation,
         ..MaterialisationReport::default()
     }
     .with_diagnostics(&done.diagnostics, &|id| {

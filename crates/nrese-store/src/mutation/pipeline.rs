@@ -316,12 +316,6 @@ impl MutationPipeline {
                 }
             }
             drop(ground);
-            // A class left out became consumable: its memberships are computed in full.
-            if materialisation.needs_rematerialisation
-                && let Err(error) = self.store.rematerialise(&rules)
-            {
-                tracing::error!(%error, "rematerialisation for an unnamed class that became used failed");
-            }
             // In quarantine the commit checked only its own facts: revalidate everything, so
             // the store leaves quarantine once the data is repaired. The commit itself stands.
             if matches!(
