@@ -42,6 +42,11 @@ use nrese_owl::{
 use nrese_xsd::owl::{Datatype, Value};
 
 use crate::tableau;
+use crate::tableau::budget::{RunBudget, memory_share, workers};
+
+#[cfg(test)]
+#[path = "islands/resources_tests.rs"]
+mod resources_tests;
 
 /// About how many assertions one batch of islands holds.
 pub const BATCH: usize = 2048;
@@ -132,19 +137,20 @@ fn split_into(ontology: &Ontology, batch: usize) -> Split {
 /// (LUBM(1): whole 149–160 ms, by islands 167–204 ms; OWL2Bench QL-1: 189–217 against
 /// 256–434 ms); it pays where one model of the whole ABox exceeds the budget.
 pub fn consistency(ontology: &Ontology, config: &tableau::Config) -> tableau::Outcome {
-    let started = std::time::Instant::now();
-    let whole = tableau::consistency(ontology, config);
+    let budget = RunBudget::new(config);
+    let whole = budget.run(config, |remaining| {
+        tableau::consistency(ontology, remaining)
+    });
     if !matches!(whole.answer, tableau::Answer::GaveUp(_)) {
         return whole;
     }
-    let mut rest = config.clone();
-    rest.timeout = config.timeout.map(|t| t.saturating_sub(started.elapsed()));
-    if rest.timeout.is_some_and(|t| t.is_zero()) {
-        return whole;
-    }
-    match split_into(ontology, batch_for(config)) {
+    let split = match budget.stage(config, || split_into(ontology, batch_for(config))) {
+        Ok(split) => split,
+        Err(why) => return budget.stopped(why),
+    };
+    match split {
         Split::Whole(_) => whole,
-        Split::Islands(islands) => match decide(&islands, &rest) {
+        Split::Islands(islands) => match decide(&islands, config, &budget, tableau::consistency) {
             Some(outcome)
                 if matches!(
                     outcome.answer,
@@ -163,27 +169,50 @@ pub fn consistency(ontology: &Ontology, config: &tableau::Config) -> tableau::Ou
 /// otherwise the first island's reason for not deciding. `config`'s timeout holds for the
 /// whole check.
 pub fn by_islands(ontology: &Ontology, config: &tableau::Config) -> tableau::Outcome {
-    match split_into(ontology, batch_for(config)) {
-        Split::Whole(_) => tableau::consistency(ontology, config),
-        Split::Islands(islands) => {
-            decide(&islands, config).unwrap_or_else(|| tableau::consistency(ontology, config))
-        }
+    let budget = RunBudget::new(config);
+    let split = match budget.stage(config, || split_into(ontology, batch_for(config))) {
+        Ok(split) => split,
+        Err(why) => return budget.stopped(why),
+    };
+    match split {
+        Split::Whole(_) => budget.run(config, |remaining| {
+            tableau::consistency(ontology, remaining)
+        }),
+        Split::Islands(islands) => decide(&islands, config, &budget, tableau::consistency)
+            .unwrap_or_else(|| {
+                budget.run(config, |remaining| {
+                    tableau::consistency(ontology, remaining)
+                })
+            }),
     }
 }
 
 /// The islands' verdict (`None` without a batch: no assertion).
-fn decide(islands: &Islands, config: &tableau::Config) -> Option<tableau::Outcome> {
-    // The batches are independent: decided in parallel, each with its share of the
-    // memory budget and the whole check's deadline.
-    use rayon::prelude::*;
-    let threads = rayon::current_num_threads().clamp(1, islands.batches.len().max(1));
+/// O(batches) dispatch over bounded independent checks, preserving input order.
+fn decide(
+    islands: &Islands,
+    config: &tableau::Config,
+    budget: &RunBudget,
+    check: impl Fn(&Ontology, &tableau::Config) -> tableau::Outcome + Sync + Send,
+) -> Option<tableau::Outcome> {
+    if islands.batches.is_empty() {
+        return None;
+    }
+    // An island has at most two portfolio variants. With fewer islands than workers,
+    // retain their useful nested race; otherwise give each concurrent island one slot.
+    let workers = match budget.stage(config, || {
+        workers(config, islands.batches.len().saturating_mul(2))
+    }) {
+        Ok(workers) => workers,
+        Err(why) => return Some(budget.stopped(why)),
+    };
+    let concurrent = workers.for_items(islands.batches.len());
     let mut batch_config = config.clone();
-    batch_config.max_memory = (config.max_memory / threads).max(64 << 20);
-    let outcomes: Vec<tableau::Outcome> = islands
-        .batches
-        .par_iter()
-        .map(|batch| tableau::consistency(batch, &batch_config))
-        .collect();
+    batch_config.max_memory = memory_share(config.max_memory, concurrent);
+    batch_config.workers = Some(workers.limited(workers.width() / concurrent));
+    let outcomes = workers.limited(concurrent).map(&islands.batches, |batch| {
+        budget.run(&batch_config, |remaining| check(batch, remaining))
+    });
     let mut undecided: Option<tableau::Outcome> = None;
     let mut last = None;
     for outcome in outcomes {
