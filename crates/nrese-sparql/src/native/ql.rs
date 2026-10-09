@@ -546,6 +546,9 @@ impl Rewriter<'_> {
         let Some(data) = self.data else {
             return false;
         };
+        if super::preparation::preparation_alive(&data.options).is_err() {
+            return false;
+        }
         let term = |t: QTerm| -> Option<TermPattern> {
             Some(match t {
                 QTerm::Var(v) => TermPattern::Variable(Variable::new_unchecked(format!("_qlr{v}"))),
@@ -658,7 +661,8 @@ impl Rewriter<'_> {
             let asked = &mut self.report.checks;
             let budget = self.limits.checks;
             let has = data.ql.realised(identity, &key, || {
-                if *asked >= budget {
+                if *asked >= budget || super::preparation::preparation_alive(&data.options).is_err()
+                {
                     return None;
                 }
                 *asked += 1;

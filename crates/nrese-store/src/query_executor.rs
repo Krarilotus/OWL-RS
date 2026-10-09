@@ -365,7 +365,8 @@ pub(crate) fn protocol_dataset(
 
 /// Evaluates `prepared` on `view` and writes the serialised results to `out` as they are
 /// produced. On error the output is incomplete and must be discarded by the caller.
-/// `context` is what the store's answer depends on beyond the query's options (the
+/// `report` receives the retained QL report before any bytes and returns the cache
+/// context: what the store's answer depends on beyond the query's options (the
 /// `owl2-dl` mode with its `dl-answers` option, the completeness status it reports): part
 /// of the key of the answer's bytes in the result cache. A part's rows don't depend on it
 /// (every path evaluates with the same options; the QL rewriting is in the algebra).
@@ -375,31 +376,14 @@ pub(crate) fn run_query(
     store: &StoreSettings,
     cancellation: &CancellationToken,
     out: impl Write,
-    context: &str,
-) -> StoreResult<()> {
-    let options = QueryOptions {
-        dataset: prepared.dataset.clone(),
-        cancellation: Some(cancellation.clone()),
-        read_model: prepared.read_model,
-        memory_limit: prepared.memory_limit,
-        as_written: prepared.as_written,
-        shared_memory: store.query_memory.clone(),
-        union_default_graph: store.union_default_graph,
-        geosparql_stated_only: store.geosparql_stated_only,
-        services: store.services.get().cloned(),
-        equality_closed: store
-            .equality_closed
-            .load(std::sync::atomic::Ordering::Acquire),
-        equality_canonical: store.equality_canonical,
-        equality_early_expansion: store.equality_early_expansion,
-        pre_bound: None,
-        cross_chunk_rows: None,
-        stream_rows: None,
-        access: prepared.access.clone(),
-        result_cache: store.result_cache.clone(),
-        pin: prepared.pin.clone(),
-        ql: store.ql(),
-    };
+    report: impl FnOnce(Option<&nrese_sparql::ql::QlReport>) -> String,
+) -> StoreResult<Option<nrese_sparql::ql::QlReport>> {
+    let mut options = query_options(prepared, store, cancellation);
+    let (query, ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
+    let context = report(ql.as_ref());
+    if cancellation.is_cancelled() {
+        return Err(QueryEvaluationError::Cancelled.into());
+    }
     // A repeated query's answer as written before, in this format; else written, and its
     // bytes offered to the cache with the time writing them took (`nrese_sparql::cache`).
     let mut out = out;
@@ -408,11 +392,24 @@ pub(crate) fn run_query(
         &prepared.query,
         &options,
         prepared.media_type(),
-        context,
+        &context,
     ) {
-        CachedOutput::Hit(bytes) => return Ok(out.write_all(&bytes)?),
-        CachedOutput::Miss(slot) => slot,
-        CachedOutput::Off => return serialize(view, prepared, &options, cancellation, out),
+        CachedOutput::Hit(bytes) => {
+            if cancellation.is_cancelled() {
+                return Err(QueryEvaluationError::Cancelled.into());
+            }
+            out.write_all(&bytes)?;
+            return Ok(ql);
+        }
+        CachedOutput::Miss(slot) => Some(slot),
+        CachedOutput::Off => None,
+    };
+    // The key above uses the original query/options. Execution consumes their prepared
+    // algebra and must not run the semantic QL stage a second time.
+    options.ql = None;
+    let Some(slot) = slot else {
+        serialize(view, prepared, &query, &options, cancellation, out)?;
+        return Ok(ql);
     };
     let mut tee = Tee {
         inner: out,
@@ -422,11 +419,11 @@ pub(crate) fn run_query(
     // What the bytes save: this answer's evaluation, as far as the cache didn't answer
     // its parts, and its serialisation (written at the end, on every core, for JSON).
     let started = std::time::Instant::now();
-    serialize(view, prepared, &options, cancellation, &mut tee)?;
+    serialize(view, prepared, &query, &options, cancellation, &mut tee)?;
     if let Some(copy) = tee.copy {
         slot.offer(copy, started.elapsed());
     }
-    Ok(())
+    Ok(ql)
 }
 
 /// A writer that forwards to `inner` and keeps a copy of what it writes up to `limit`
@@ -460,6 +457,7 @@ impl<W: Write> Write for Tee<W> {
 fn serialize(
     view: &impl ReadView,
     prepared: &PreparedQuery,
+    query: &Query,
     options: &QueryOptions,
     cancellation: &CancellationToken,
     out: impl Write,
@@ -479,16 +477,15 @@ fn serialize(
         SolutionsResultFormat::Xml => None,
     };
     if let Some(format) = format
-        && matches!(prepared.query, Query::Select { .. } | Query::Ask { .. })
-        && let Some(written) =
-            write_results(view, &prepared.query, options, format, version, &mut out)
+        && matches!(query, Query::Select { .. } | Query::Ask { .. })
+        && let Some(written) = write_results(view, query, options, format, version, &mut out)
     {
         return written.map_err(|error| match error {
             WriteResultsError::Evaluation(error) => StoreError::SparqlEvaluation(error),
             WriteResultsError::Io(error) => StoreError::Io(error),
         });
     }
-    match evaluate_query(view, &prepared.query, options)? {
+    match evaluate_query(view, query, options)? {
         QueryResults::Boolean(value) => {
             results_serializer(prepared, version).serialize_boolean_to_writer(out, value)?;
         }
@@ -535,7 +532,7 @@ pub(crate) fn evaluate_prepared(
     store: &StoreSettings,
     cancellation: &CancellationToken,
 ) -> StoreResult<Answers> {
-    let options = explain_options(prepared, store, cancellation);
+    let options = query_options(prepared, store, cancellation);
     Ok(match evaluate_query(view, &prepared.query, &options)? {
         QueryResults::Boolean(value) => Answers::Boolean(value),
         QueryResults::Solutions(solutions) => {
@@ -609,7 +606,7 @@ pub(crate) fn explain_prepared(
     store: &StoreSettings,
     cancellation: &CancellationToken,
 ) -> StoreResult<Explanation> {
-    let options = explain_options(prepared, store, cancellation);
+    let options = query_options(prepared, store, cancellation);
     Ok(explain_query(view, &prepared.query, &options)?)
 }
 
@@ -620,27 +617,12 @@ pub(crate) fn plan_prepared(
     prepared: &PreparedQuery,
     store: &StoreSettings,
 ) -> StoreResult<PlannedQuery> {
-    let options = explain_options(prepared, store, &CancellationToken::new());
+    let options = query_options(prepared, store, &CancellationToken::new());
     Ok(plan_query(view, &prepared.query, &options)?)
 }
 
-/// What the OWL 2 QL rewriting does to `prepared` on `view`, and whether its answers are
-/// complete (docs/design/ql-rewriting.md §7); `None` where it doesn't apply or the query
-/// doesn't run natively.
-pub(crate) fn ql_status(
-    view: &impl ReadView,
-    prepared: &PreparedQuery,
-    store: &StoreSettings,
-    cancellation: &CancellationToken,
-) -> Option<nrese_sparql::ql::QlReport> {
-    let options = explain_options(prepared, store, cancellation);
-    nrese_sparql::ql_report(view, &prepared.query, &options)
-        .ok()
-        .flatten()
-}
-
-/// The options `prepared` runs with, for an explanation.
-fn explain_options(
+/// The options `prepared` runs with, for execution and explanation alike.
+fn query_options(
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
