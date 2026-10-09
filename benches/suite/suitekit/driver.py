@@ -353,7 +353,17 @@ class Suite:
         try:
             store = self.runtime.new_store(ctx.name("store"))
             if plan.kind == "writes":
+                if key == "graphdb":
+                    # Serving a fresh GraphDB home does not create its repository.
+                    # Reuse its configured loader; setup is outside write timings.
+                    (ctx.work / "empty.nt").write_bytes(b"")
+                    setup = system.load(ctx, store, ["/work/empty.nt"], regime)
+                    self.emit(base, task="load", status="ok" if setup.measured.ok else "failed",
+                              ms=setup.measured.ms, note="empty repository setup; " + setup.note)
+                    if not setup.measured.ok:
+                        return
                 endpoint = system.serve(ctx, store, regime)
+                base["version"] = system.version(ctx, endpoint)
                 self.writes(ctx, endpoint, base)
                 return
             step = system.load(ctx, store, plan.inputs, regime)
@@ -481,12 +491,39 @@ class Suite:
         report = ctx.logs / "write-scaling.json"
         steps = {"100k": "10000,100000", "1m": "10000,100000,500000,1000000",
                  "10m": "1000000,10000000"}.get(base["tier"], base["tier"])
+        if base["system"] == "nrese":
+            connection = ["--nrese-base-url", endpoint.query.rsplit("/dataset/", 1)[0]]
+        elif base["system"] == "graphdb":
+            connection = ["--reference-kind", "graphdb", "--reference-base-url", endpoint.query]
+        else:
+            raise ValueError("write-scaling has no route for " + base["system"])
         started = time.monotonic()
-        rc = self.host_command([self.harness(), "write-scaling", "--nrese-base-url",
-                                endpoint.query.rsplit("/dataset/", 1)[0], "--steps", steps,
+        rc = self.host_command([self.harness(), "write-scaling", *connection, "--steps", steps,
+                                "--reset", "true",
                                 "--report-json", str(report)], ctx.logs / "write-scaling.txt")
-        self.emit(base, task="update", status="ok" if rc == 0 else "failed", ms=(time.monotonic() - started) * 1000,
-                  note=f"steps {steps}; per-step figures in {report.name}")
+        checked = False
+        try:
+            result = json.loads(report.read_text(encoding="utf-8"))
+            services = result["services"]
+            records = services[0]["steps"]
+            requested = [int(n) for n in steps.split(",")]
+            samples = result["samples_per_step"]
+            checked = (result["mode"] == "write-scaling" and len(services) == 1
+                       and services[0]["label"].lower() == base["system"] and services[0]["reset"] is True
+                       and type(samples) is int and samples > 0 and len(records) == len(requested))
+            previous = 0
+            for i, (row, size) in enumerate(zip(records, requested)):
+                actual = size // 4 * 4
+                expected = dict(triples=size, asserted_entity_triples=actual, loaded_triples=actual - previous,
+                                expected_persons=size // 4, observed_persons=size // 4,
+                                expected_probes=(i + 1) * samples, observed_probes=(i + 1) * samples)
+                checked &= all(type(row[k]) is int and row[k] == v for k, v in expected.items())
+                previous = actual
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            checked = False
+        self.emit(base, task="update", status="ok" if rc == 0 and checked else "failed",
+                  ms=(time.monotonic() - started) * 1000,
+                  note=f"steps {steps}; numeric checks {'passed' if checked else 'missing/failed'}; per-step figures in {report.name}")
 
     def kit(self, plan, key: str):
         base = dict(date=self.date, host=self.host, runtime="process", system=key, version="-",

@@ -178,6 +178,57 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
 
+### 9 October: native scheduling profiles and width diagnostic
+
+Four short Phuoc captures compare frozen `4e8bd38` and `77478d1` at one and
+16 clients, followed by 12 candidate-only width invocations (two counterbalanced
+passes over widths 1/4/16 and clients 1/16). These reuse the Office-built binaries,
+the verified 300,000-person social input and four lookup queries, including result
+encoding. No production code, CPU ownership contract or default changed.
+
+At one client, 79.4% of the candidate's flat sampled cycles were in named
+Crossbeam/Rayon scheduling functions. Sampling perturbed candidate throughput;
+incomplete stacks and approximate phase normalization prevent treating that share
+as an exact causal fraction of the uninstrumented regression. All four workload
+exits and saved answer checks passed; captures and their decoding caveats remain.
+
+The lighter width screen used thread-creation tracing and `/proc` counters, without
+perf sampling. The option changes **both** the native and ambient pools; the actual
+thread counts matched. Ambient workers accumulated no CPU in the observed steady
+windows, but their indirect effects are not independently isolated.
+
+| Both pool widths | One-client QPS | 16-client QPS |
+|---|---:|---:|
+| 1 | 96,755 | 238,048 |
+| 4 | 90,747 | 622,740 |
+| 16 | 59,290 | 629,870 |
+
+These are medians of two diagnostic processes, not accepted performance timings.
+At 16 clients width 4 used about 37% less CPU/query and 96% less aggregate runnable
+wait/query than width 16, with throughput within the latter's observed spread.
+Width 1 instead constrained concurrent throughput. Per-query counters use estimated
+window completions; runnable wait is not blocked/futex time. All 12 processes exited
+zero and retained the existing count, route and saved-bag checks. This neither
+recovers baseline performance nor justifies a universal smaller pool. Larger parallel
+queries and mixed work still require qualification. Earlier Office coalescing and
+ambient-only experiments below were read, not repeated or replaced by this screen.
+
+The screen ran on Phuoc at 19:03:30–19:04:57 UTC with the existing quiet guard,
+6 GiB memory cap, no swap or CPU quota, four-second client phases and unchanged
+governor/affinity. Its wrappers consumed 447 CPU-seconds in total; peak cgroup memory
+was 1,232 MiB. No compiler ran there or locally. No further diagnostic work remained
+active after preservation.
+
+Raw evidence is under
+`/home/krarilotus/nrese-prep-20261009-4e8bd38/phuoc-qualification/`:
+`native-runtime-20261009-process-memory-01/evidence.tar.gz` (8,341,903 bytes,
+SHA-256 `534ebc52485ed833466c3dd1db494ad03e59c899ed86f71659f330c7383f9386`)
+and `native-width-20261009-process-memory-01/evidence.tar.gz` (439,343 bytes,
+SHA-256 `297f8e1ea69ca20a819c2261737745d8f915427dc0f9862aee79e02932409ed2`).
+Both archives were downloaded and hash-verified. These findings motivate a bounded
+submission/encoding experiment within the retained physical-worker boundary, not
+a new scheduler or caller bypass. Runtime performance acceptance remains blocked.
+
 ### 9 October: partial Phuoc milestone, runtime acceptance blocked
 
 The completed Phuoc batches compare `4e8bd38e0733055c06d77f9fdd7cd36c6d89bd7c`

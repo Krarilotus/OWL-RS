@@ -1,6 +1,7 @@
 # GraphDB repository for the NRESE comparison runs: ruleset "rdfsplus-optimized".
 # Settings follow GraphDB's own template (configs/templates/graphdb.ttl) with defaults,
-# except the ruleset and the repository ID.
+# except the ruleset, repository ID and fail-closed query timeouts.
+# RDFS-Plus has inverse/symmetric/transitive properties, not OWL identity semantics.
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.
 @prefix rep: <http://www.openrdf.org/config/repository#>.
 @prefix sr: <http://www.openrdf.org/config/repository/sail#>.
@@ -26,5 +27,7 @@
             graphdb:entity-index-size "10000000" ;
             graphdb:in-memory-literal-properties "true" ;
             graphdb:enable-literal-index "true" ;
+            graphdb:query-limit-results "0" ;
+            graphdb:throw-QueryEvaluationException-on-timeout "true" ;
         ]
     ].

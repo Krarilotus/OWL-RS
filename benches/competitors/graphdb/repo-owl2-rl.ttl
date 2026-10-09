@@ -1,6 +1,7 @@
 # GraphDB repository for the NRESE comparison runs: ruleset "owl2-rl".
 # Settings follow GraphDB's own template (configs/templates/graphdb.ttl) with defaults,
-# except the ruleset and the repository ID.
+# except the ruleset, repository ID, native equality and fail-closed query timeouts.
+# 11.5/sameas-optimisation.html: disabling sameAs also removes OWL entailments.
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#>.
 @prefix rep: <http://www.openrdf.org/config/repository#>.
 @prefix sr: <http://www.openrdf.org/config/repository/sail#>.
@@ -15,7 +16,7 @@
         sr:sailImpl [
             sail:sailType "graphdb:Sail" ;
             graphdb:ruleset "owl2-rl" ;
-            graphdb:disable-sameAs "true" ;
+            graphdb:disable-sameAs "false" ;
             graphdb:check-for-inconsistencies "false" ;
             graphdb:entity-id-size "32" ;
             graphdb:enable-context-index "false" ;
@@ -26,5 +27,7 @@
             graphdb:entity-index-size "10000000" ;
             graphdb:in-memory-literal-properties "true" ;
             graphdb:enable-literal-index "true" ;
+            graphdb:query-limit-results "0" ;
+            graphdb:throw-QueryEvaluationException-on-timeout "true" ;
         ]
     ].

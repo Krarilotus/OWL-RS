@@ -29,6 +29,7 @@ import contextlib
 import datetime
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -841,7 +842,12 @@ def pooled(report: dict) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for r in report["records"]:
         entry = out.setdefault(r["case"], {"reps": [], "status": [], "peaks": [], "metrics": [],
-                                           "counters": {}, "phase_peaks": {}})
+                                           "counters": {}, "phase_peaks": {}, "qps": {},
+                                           "expected": [], "invalid": False, "expected_reps": report.get("reps", 0)})
+        entry["expected"].append(r.get("expected_outcome", "ok"))
+        entry["invalid"] |= any(not c.get("ok") for c in r.get("checks", []) + r.get("routes", []))
+        for level in r.get("throughput", []):
+            entry["qps"].setdefault(str(level["clients"]), []).append(level.get("qps"))
         for path, value in (r.get("counters") or {}).items():
             entry["counters"].setdefault(path, []).append(value)
         for phase, peak in (r.get("phase_peaks") or {}).items():
@@ -941,6 +947,9 @@ def series_ratios(base: list[dict], new: list[dict], series: list[str]) -> list[
 
 
 def compare(args) -> int:
+    min_ms = getattr(args, "min_ms", 2.0)
+    if not math.isfinite(min_ms) or min_ms < 0:
+        raise ValueError("--min-ms must be finite and nonnegative")
     base_report, new_report = load_report(Path(args.base)), load_report(Path(args.new))
     base, new = pooled(base_report), pooled(new_report)
     for name, report in (("base", base_report), ("new", new_report)):
@@ -953,24 +962,43 @@ def compare(args) -> int:
     for case in sorted(set(base) | set(new)):
         b, n = base.get(case), new.get(case)
         if not b or not n:
-            print(f"{case:<26} {'only in one run':>45}")
+            print(f"{case:<26} {'LOST case' if b else 'new case without baseline':>45}")
+            regressions += int(b is not None)
             continue
         if set(n["status"]) != set(b["status"]):
             print(f"{case:<26} status {','.join(sorted(set(b['status'])))} -> {','.join(sorted(set(n['status'])))}  CHANGED")
             regressions += 1
             continue
+        if any(len(e["status"]) < e["expected_reps"] for e in (b, n)):
+            print(f"{case:<26} NOT COMPARABLE: missing/invalid timing series or repetitions")
+            regressions += 1
+            continue
+        if any(e["invalid"] or set(e["status"]) != {"ok"} for e in (b, n)):
+            expected = all(not e["invalid"] and e["status"] == e["expected"] for e in (b, n))
+            print(f"{case:<26} {'expected boundary' if expected else 'NOT COMPARABLE: failed checks/status'}; no timing verdict")
+            regressions += int(not expected)
+            continue
+        shapes = [set(rep) for e in (b, n) for rep in e["reps"]]
+        if (any(len(e["reps"]) != len(e["status"]) for e in (b, n)) or not shapes
+                or not shapes[0] or any(s != shapes[0] for s in shapes)
+                or any(not vs or any(not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in vs)
+                       for e in (b, n) for rep in e["reps"] for vs in rep.values())):
+            print(f"{case:<26} NOT COMPARABLE: missing/invalid timing series or repetitions")
+            regressions += 1
+            continue
         ratio, low, high = bootstrap_ratio(b["reps"], n["reps"])
         series = sorted({s for rep in b["reps"] for s in rep} & {s for rep in n["reps"] for s in rep})
         bm, nm = statistic(b["reps"], series), statistic(n["reps"], series)
-        # A change counts beyond max(10 %, the measured spread of both sides), beyond 2 ms,
+        # A change counts beyond max(10 %, the measured spread of both sides), the chosen floor,
         # and with the interval excluding 1.
         threshold = max(0.10, spread(b), spread(n))
         spreads.append(max(spread(b), spread(n)))
         verdict = "same"
-        if low > 1.0 and ratio >= 1 + threshold and nm - bm >= 2.0:
-            verdict, regressions = "SLOWER", regressions + 1
-        elif high < 1.0 and ratio <= 1 / (1 + threshold) and bm - nm >= 2.0:
-            verdict = "faster"
+        if low > 1.0 and ratio >= 1 + threshold:
+            verdict = "SLOWER" if nm - bm >= min_ms else "slower, below absolute floor"
+            regressions += int(nm - bm >= min_ms)
+        elif high < 1.0 and ratio <= 1 / (1 + threshold):
+            verdict = "faster" if bm - nm >= min_ms else "faster, below absolute floor"
         bp, np_ = (max(b["peaks"]) if b["peaks"] else None), (max(n["peaks"]) if n["peaks"] else None)
         if bp and np_ and np_ > bp * (1 + max(0.10, threshold)) and np_ - bp > 64:
             verdict += ", MORE MEMORY"
@@ -985,16 +1013,32 @@ def compare(args) -> int:
             verdict += ", MORE WORK"
             regressions += 1
         peaks = f"{bp or '-'} -> {np_ or '-'}"
-        print(f"{case:<26} {bm:>11.1f} {nm:>11.1f} {ratio:>7.2f} {f'[{low:.2f}, {high:.2f}]':>15} "
+        print(f"{case:<26} {bm:>11.4g} {nm:>11.4g} {ratio:>7.2f} {f'[{low:.2f}, {high:.2f}]':>15} "
               f"{threshold:>6.0%} {peaks:>17}  {verdict}")
+        for clients in sorted(set(b["qps"]) | set(n["qps"]), key=int):
+            values = [e["qps"].get(clients, []) for e in (b, n)]
+            if any(len(vs) != len(e["status"]) or len(vs) < 2
+                   or any(not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in vs)
+                   for e, vs in zip((b, n), values)) or statistics.median(values[0]) <= 0:
+                print(f"  {clients} clients QPS: NOT COMPARABLE (missing/invalid samples or fewer than two repetitions)")
+                regressions += 1
+                continue
+            qr, ql, qh = bootstrap_ratio(*[[{"qps": [v]} for v in vs] for vs in values])
+            qt = max(0.10, *(spread({"metrics": vs}) for vs in values))
+            qv = "LOWER QPS" if qh < 1 and qr <= 1 / (1 + qt) else (
+                "higher QPS" if ql > 1 and qr >= 1 + qt else "within noise")
+            regressions += int(qv == "LOWER QPS")
+            print(f"  {clients} clients QPS: {statistics.median(values[0]):.4g} -> {statistics.median(values[1]):.4g}; "
+                  f"ratio {qr:.3f}, 95% CI [{ql:.3f}, {qh:.3f}], spread threshold {qt:.1%}; {qv}")
         for note in notes:
             print(f"{'':<28}{note}")
         if verdict.startswith(("SLOWER", "faster")) and len(series) > 1:
             print(f"{'':<28}by series: " + ", ".join(series_ratios(b["reps"], n["reps"], series)[:3]))
     if spreads:
         print(f"\nspread between repetitions: median {statistics.median(spreads):.0%}, max {max(spreads):.0%}")
-    print(f"{regressions} regression(s): a change counts beyond max(10 %, the spread of both sides) and 2 ms, "
-          "with the 95 % interval of the ratio (repetitions and samples resampled) excluding 1")
+    print(f"{regressions} regression(s)/acceptance failure(s): latency floor {min_ms:g} ms (default 2); "
+          "changes require max(10 %, spread) and a 95 % ratio interval excluding 1; "
+          "QPS is higher-is-better, judged per client width without a millisecond floor")
     return 1 if regressions else 0
 
 
@@ -1088,6 +1132,8 @@ def main() -> int:
     c = sub.add_parser("compare")
     c.add_argument("base")
     c.add_argument("new")
+    c.add_argument("--min-ms", type=float, default=2.0,
+                   help="absolute latency floor in ms (default 2); explicitly lower for microcase comparisons")
     args = p.parse_args()
     if args.command == "compete":
         from compete import compete
