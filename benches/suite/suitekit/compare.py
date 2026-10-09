@@ -40,13 +40,14 @@ def files(spec: str) -> list[Path]:
 
 def collect(paths: list[Path], systems: set[str] | None, restricted: bool) -> dict[tuple, Pair]:
     rows = []
-    for path in paths:
+    # Distinct files can both live under records/; aliases of one file are not new runs.
+    for path in dict.fromkeys(p.resolve() for p in paths):
         for r in read(path):
             if systems and r["system"] not in systems:
                 continue
             if r["publish"] == "permission" and not restricted:
                 continue
-            rows.append(r | {"run": f"{path.parent.name}/{r['run']}"})
+            rows.append(r | {"run": f"{path.as_posix()}/{r['run']}"})
     return summarise(rows)
 
 

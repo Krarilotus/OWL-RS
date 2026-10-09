@@ -19,7 +19,7 @@ use crate::compat_common::{
 use crate::io::write_json_report;
 use crate::layout::ServiceTarget;
 use crate::model::{CompatGraphTarget, CompatHeaders, GenerateConfig, WriteScalingConfig};
-use crate::normalize::percentile;
+use crate::normalize::{extract_unsigned_count, parse_json, percentile};
 
 const TRIPLES_PER_ENTITY: u64 = 4;
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -37,12 +37,20 @@ pub struct WriteScalingReport {
 pub struct ServiceScalingReport {
     pub label: &'static str,
     pub base_url: String,
+    pub reset: bool,
     pub steps: Vec<ScalingStep>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ScalingStep {
+    /// Requested size; the generator emits whole four-triple entities.
     pub triples: u64,
+    pub asserted_entity_triples: u64,
+    pub loaded_triples: u64,
+    pub expected_persons: u64,
+    pub observed_persons: u64,
+    pub expected_probes: u64,
+    pub observed_probes: u64,
     pub load_ms: u128,
     pub load_triples_per_sec: u64,
     pub insert_p50_ms: u128,
@@ -62,12 +70,20 @@ pub async fn run_write_scaling(config: WriteScalingConfig) -> Result<()> {
         .timeout(std::time::Duration::from_secs(3600))
         .build()?;
 
-    let mut targets = vec![ServiceTarget::nrese(config.nrese.clone())];
+    let mut targets: Vec<_> = config
+        .nrese
+        .clone()
+        .map(ServiceTarget::nrese)
+        .into_iter()
+        .collect();
     if let Some(reference) = &config.reference {
         targets.push(ServiceTarget::reference(
             reference.kind,
             reference.connection.clone(),
         ));
+    }
+    if targets.is_empty() || config.samples == 0 {
+        bail!("write-scaling requires at least one target and a positive --samples count");
     }
 
     let mut services = Vec::new();
@@ -100,12 +116,19 @@ async fn scale_target(
     if config.reset {
         update(client, target, "DROP ALL").await?;
     }
+    // Non-reset runs are fresh benchmark namespaces, not resumptions: otherwise
+    // deterministic inserts could time no-ops. Also verify an acknowledged DROP.
+    let occupied = count(client, target,
+        "SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o FILTER(STRSTARTS(STR(?s), 'http://example.org/person/') || STRSTARTS(STR(?s), 'http://example.org/probe/') || (?p = <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> && ?o = <http://example.org/Person>)) }").await?;
+    require_count("initial benchmark namespace", occupied, 0)?;
 
     let chunk_entities = (config.chunk_triples / TRIPLES_PER_ENTITY).max(1);
     let mut loaded_entities = 0u64;
     let mut steps = Vec::with_capacity(config.steps.len());
+    let mut probes = Vec::new();
     for &step_triples in &config.steps {
         let target_entities = step_triples / TRIPLES_PER_ENTITY;
+        let previous_entities = loaded_entities;
         let load_started = Instant::now();
         while loaded_entities < target_entities {
             let count = chunk_entities.min(target_entities - loaded_entities);
@@ -118,21 +141,22 @@ async fn scale_target(
             loaded_entities += count;
         }
         let load_ms = load_started.elapsed().as_millis();
-        let loaded_triples =
-            step_triples.saturating_sub(steps.last().map_or(0, |s: &ScalingStep| s.triples));
+        let loaded_triples = (loaded_entities - previous_entities) * TRIPLES_PER_ENTITY;
 
         let mut latencies = Vec::with_capacity(config.samples);
         for sample in 0..config.samples {
+            let subject = format!("<http://example.org/probe/{step_triples}/{sample}>");
             let started = Instant::now();
             update(
                 client,
                 target,
                 &format!(
-                    "INSERT DATA {{ <http://example.org/probe/{step_triples}/{sample}> <http://example.org/knows> <http://example.org/person/0> }}"
+                    "INSERT DATA {{ {subject} <http://example.org/knows> <http://example.org/person/0> }}"
                 ),
             )
             .await?;
             latencies.push(started.elapsed().as_micros());
+            probes.push(subject);
         }
         latencies.sort_unstable();
 
@@ -146,11 +170,25 @@ async fn scale_target(
             RequestExecutionOptions::default(),
         )
         .await?;
-        require_success_http(target, "query", &outcome)?;
+        let response = require_success_http(target, "query", &outcome)?;
         let count_query_ms = started.elapsed().as_millis();
+        let observed_persons = extract_unsigned_count(&parse_json(&response.body)?, "c")?;
+        require_count("Person count", observed_persons, target_entities)?;
+        // Check the exact inserted subjects, outside measured insert/count latency.
+        let observed_probes = count(client, target, &format!(
+            "SELECT (COUNT(*) AS ?c) WHERE {{ VALUES ?s {{ {} }} ?s <http://example.org/knows> <http://example.org/person/0> }}",
+            probes.join(" "))).await?;
+        let expected_probes = probes.len() as u64;
+        require_count("probe count", observed_probes, expected_probes)?;
 
         let step = ScalingStep {
             triples: step_triples,
+            asserted_entity_triples: loaded_entities * TRIPLES_PER_ENTITY,
+            loaded_triples,
+            expected_persons: target_entities,
+            observed_persons,
+            expected_probes,
+            observed_probes,
             load_ms,
             load_triples_per_sec: (loaded_triples as u128 * 1000 / load_ms.max(1)) as u64,
             insert_p50_ms: percentile(&latencies, 50) / 1000,
@@ -176,8 +214,30 @@ async fn scale_target(
     Ok(ServiceScalingReport {
         label: target.label,
         base_url: target.base_url.clone(),
+        reset: config.reset,
         steps,
     })
+}
+
+fn require_count(label: &str, observed: u64, expected: u64) -> Result<()> {
+    if observed != expected {
+        bail!("{label}: expected {expected}, observed {observed}");
+    }
+    Ok(())
+}
+
+async fn count(client: &Client, target: &ServiceTarget, query: &str) -> Result<u64> {
+    let outcome = execute_query_raw(
+        client,
+        target,
+        query,
+        "application/sparql-results+json",
+        &CompatHeaders::new(),
+        RequestExecutionOptions::default(),
+    )
+    .await?;
+    let response = require_success_http(target, "query", &outcome)?;
+    extract_unsigned_count(&parse_json(&response.body)?, "c")
 }
 
 async fn update(client: &Client, target: &ServiceTarget, update: &str) -> Result<()> {
@@ -259,6 +319,33 @@ fn entities(start: u64, count: u64, universe: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{TRIPLES_PER_ENTITY, entities};
+
+    #[test]
+    fn acknowledged_but_wrong_data_is_rejected() {
+        assert!(super::require_count("Person count", 1, 2).is_err());
+        assert!(super::require_count("probe count", 0, 1).is_err());
+        assert!(super::require_count("initial benchmark namespace", 1, 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn no_target_is_an_error_before_any_request() {
+        let config = crate::model::WriteScalingConfig {
+            nrese: None,
+            reference: None,
+            steps: vec![5, 7, 8],
+            chunk_triples: 4,
+            samples: 1,
+            reset: true,
+            report_json_path: None,
+        };
+        assert!(
+            super::run_write_scaling(config)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("at least one target")
+        );
+    }
 
     #[test]
     fn generator_emits_four_triples_per_entity() {

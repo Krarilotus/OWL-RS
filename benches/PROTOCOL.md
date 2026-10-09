@@ -90,6 +90,14 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
   - the ratio per query;
   - the geometric mean of the ratios, beside the ratio of the sums;
   - a change counts only beyond `max(10 %, the measured spread of both sides)` and beyond 2 ms (`suite.py compare`).
+  - For declared microcase comparisons, record an explicitly lower `--min-ms` floor
+    (zero is supported). Keep the repetition and noise checks. Exploratory reanalysis
+    with a new floor is labelled as such; choose the acceptance thresholds before the
+    next measurement. A below-floor change is not evidence of equivalent performance.
+  - Compare throughput directly, with lower QPS as worse, at each client width.
+    A latency floor in milliseconds cannot qualify throughput. Missing cases, widths,
+    repetitions or answers cannot disappear into an intersection of successful work;
+    expected boundary outcomes receive no timing credit.
 - **Corpora** (ORE, the W3C suites, generated ontologies):
   - solved counts;
   - median, p90, p95 and p99;
