@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 
 use nrese_engine::{
-    EncodedQuad, EncodedTriple, GraphSelector, ReadModel, Snapshot, TermId, Transaction,
+    EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId,
+    Transaction,
 };
 
 use super::{Program, encode, pattern, storable, triple};
@@ -96,11 +97,6 @@ pub struct Maintenance {
     pub rounds: usize,
     /// List axioms the change introduced that weren't instantiated.
     pub diagnostics: Vec<ListDiagnostic>,
-    /// A change the inferred stack can't follow commit by commit (an unnamed class left
-    /// out became consumable; a change deleting an equality, which may split `owl:sameAs`
-    /// classes, while the stack is kept over representatives): the caller rematerialises
-    /// after the commit.
-    pub needs_rematerialisation: bool,
     /// The ground program after the change, to reuse for the next commit.
     pub program: Option<GroundProgram>,
 }
@@ -133,6 +129,17 @@ pub fn maintain(
         schema: &schema,
         ..program.rules()
     };
+    // Revived memberships must participate in the delta executor's introduced-only
+    // consistency checks. Keep the batch result for installation below: no second run.
+    let mut rebuilt = if revived {
+        Some(super::materialise_until(
+            program,
+            &tx.pending_snapshot(),
+            stop,
+        )?)
+    } else {
+        None
+    };
     let update = {
         let base = EngineBase::new(tx, &program.axioms);
         // Facts new to the state: in no graph and not inferred before the transaction.
@@ -149,6 +156,15 @@ pub fn maintain(
                 .filter(|&axiom| !base.known_before(axiom) && !base.inserts.contains(axiom))
                 .collect();
             inserted.extend(missing_axioms.iter().copied());
+        }
+        if let Some(closure) = &rebuilt {
+            inserted.extend(
+                closure
+                    .inferred
+                    .iter()
+                    .map(|t| triple(t.in_default_graph()))
+                    .filter(|&fact| !base.known_before(fact)),
+            );
         }
         inserted.sort_unstable();
         inserted.dedup();
@@ -175,7 +191,9 @@ pub fn maintain(
     ));
     let (mut inserted, mut removed) = (0, 0);
     let mut recompute = false;
-    if program.stores_representatives() {
+    if revived {
+        recompute = true;
+    } else if program.stores_representatives() {
         match store_over_representatives(program, &update, &missing_axioms, tx) {
             Some((added, dropped)) => (inserted, removed) = (added, dropped),
             None => recompute = true,
@@ -200,13 +218,49 @@ pub fn maintain(
             }
         }
     }
+    if recompute {
+        let closure = match rebuilt.take() {
+            Some(closure) => closure,
+            None => super::materialise_until(program, &tx.pending_snapshot(), stop)?,
+        };
+        // O(stored closure + rebuilt closure) visits, with indexed transaction updates.
+        // A stored snapshot shares the old runs and avoids expanding compact equality.
+        // Keep the pre-maintenance inferred view for rollback if the final grounding
+        // (which does not poll stop internally) crosses cancellation or a memory limit.
+        if stop() {
+            return Err(delta::Interrupted);
+        }
+        let before = tx.pending_snapshot().stored();
+        for quad in before.quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all()) {
+            tx.remove_inferred(quad.into());
+        }
+        for fact in closure.inferred {
+            tx.insert_inferred(fact);
+        }
+        let counts = tx.inferred_pending();
+        (inserted, removed) = (counts.0 as u64, counts.1 as u64);
+        update.rounds += closure.rounds;
+        // The delta cache may still contain heads rewritten for a formerly hidden
+        // class. Ground the final prospective state, and publish this cache only if
+        // the caller commits. Existing unrelated violations remain tolerated.
+        update.program = Some(program.ground_program(&tx.pending_snapshot()));
+        if stop() {
+            let pending = tx.pending_snapshot().stored();
+            for quad in pending.quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all()) {
+                tx.remove_inferred(quad.into());
+            }
+            for quad in before.quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all()) {
+                tx.insert_inferred(quad.into());
+            }
+            return Err(delta::Interrupted);
+        }
+    }
     Ok(Maintenance {
         violations: update.violations,
         inserted,
         removed,
         rounds: update.rounds,
         diagnostics: update.diagnostics,
-        needs_rematerialisation: revived || recompute,
         program: update.program,
     })
 }
@@ -219,7 +273,7 @@ pub fn maintain(
 /// (G5 of the investigation of 6 October 2026: before, such a commit published without
 /// its inferences, and the store re-materialised in a second revision). Returns the
 /// inferred statements added and removed; `None` if the change deletes an equality,
-/// which may split a class (B3): the caller recomputes the stack after the commit, and
+/// which may split a class (B3): maintenance rebuilds the stack in this transaction, and
 /// nothing is applied.
 fn store_over_representatives(
     program: &Program,
@@ -359,4 +413,88 @@ fn store_over_representatives(
         }
     }
     Some((inserted, removed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nrese_engine::{Engine, EngineConfig};
+    use nrese_rdf::{BlankNodeRef, NamedNodeRef};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn cancelling_a_split_or_revival_discards_the_prospective_closure() {
+        for revive in [false, true] {
+            let engine = Engine::new(EngineConfig {
+                background_maintenance: false,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let mut tx = engine.transaction();
+            let program =
+                Program::compile(&crate::rulesets::Ruleset::Owl2Rl.into(), &|t| tx.intern(t))
+                    .hiding_unnamed_classes(true)
+                    .storing_representatives(true);
+            engine.set_equality(program.same_as.map(TermId::from_raw));
+            let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+            let [a, b, p, x, class] =
+                ["a", "b", "p", "x", "Class"].map(|s| iri(&format!("http://example.com/{s}")));
+            let range = iri("http://www.w3.org/2000/01/rdf-schema#range");
+            let subclass = iri("http://www.w3.org/2000/01/rdf-schema#subClassOf");
+            let union = iri("http://www.w3.org/2002/07/owl#unionOf");
+            let first = iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#first");
+            let rest = iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#rest");
+            let nil = iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#nil");
+            let u = tx.intern(BlankNodeRef::new_unchecked("u").into()).raw();
+            let list = tx.intern(BlankNodeRef::new_unchecked("list").into()).raw();
+            let equality = [a, program.same_as.unwrap(), b];
+            for fact in [
+                equality,
+                [a, p, x],
+                [p, range, u],
+                [u, union, list],
+                [list, first, class],
+                [list, rest, nil],
+            ] {
+                tx.insert_encoded(encode(fact).in_default_graph());
+            }
+            tx.commit().unwrap();
+            let remat = engine.rematerialisation();
+            let closure = super::super::materialise(&program, remat.base());
+            remat.finish(closure.inferred).unwrap();
+            let before = engine.snapshot();
+            let ground = program.ground_program(&before);
+            let change = |tx: &mut Transaction<'_>| {
+                tx.remove_encoded(encode(equality).in_default_graph());
+                if revive {
+                    tx.insert_encoded(encode([u, subclass, class]).in_default_graph());
+                }
+            };
+            // Count the cancellation checkpoints, including the final one after
+            // grounding, which must roll inferred content back; no timing or race.
+            let polls = AtomicUsize::new(0);
+            let mut tx = engine.transaction();
+            change(&mut tx);
+            maintain(&program, Some(&ground), &mut tx, &|| {
+                polls.fetch_add(1, Ordering::Relaxed);
+                false
+            })
+            .unwrap();
+            drop(tx);
+            let total = polls.load(Ordering::Relaxed);
+            assert!(total > 1);
+            for at in [0, total / 2, total - 1] {
+                polls.store(0, Ordering::Relaxed);
+                let mut tx = engine.transaction();
+                change(&mut tx);
+                let result = maintain(&program, Some(&ground), &mut tx, &|| {
+                    polls.fetch_add(1, Ordering::Relaxed) >= at
+                });
+                assert!(result.is_err(), "revive={revive}, checkpoint={at}");
+                assert_eq!(tx.inferred_pending(), (0, 0));
+                drop(tx);
+                assert_eq!(engine.snapshot().revision(), before.revision());
+            }
+        }
+    }
 }

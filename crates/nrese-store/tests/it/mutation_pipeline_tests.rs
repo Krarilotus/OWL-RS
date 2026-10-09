@@ -882,6 +882,7 @@ fn unnamed_union_memberships_are_left_out_on_request() {
         .collect();
     assert_eq!(lean, without, "everything else is the same");
     // Making the class consumed brings its memberships back (and what they entail).
+    let before = lean_pipeline.store().current_revision();
     lean_pipeline
         .apply(
             MutationCommand::Update(SparqlUpdateRequest::new(format!(
@@ -897,6 +898,227 @@ fn unnamed_union_memberships_are_left_out_on_request() {
         format!("{rdf}type"),
         format!("{ex}Place")
     )));
+    assert_eq!(lean_pipeline.store().current_revision(), before + 1);
+    lean_pipeline
+        .apply(
+            insert(&format!("<{ex}cara> <{ex}livesIn> <{ex}erfurt>")),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .unwrap();
+    let after = crate::support::inferred_statements(lean_pipeline.store()).unwrap();
+    assert_eq!(
+        memberships(&after),
+        3,
+        "the cached program restores new memberships too"
+    );
+    assert!(after.contains(&(
+        format!("{ex}erfurt"),
+        format!("{rdf}type"),
+        format!("{ex}Place")
+    )));
+    assert_eq!(lean_pipeline.store().current_revision(), before + 2);
+}
+
+#[test]
+fn reviving_a_hidden_class_rejects_its_new_violation_before_commit() {
+    let store = Arc::new(
+        StoreService::new(nrese_store::StoreConfig {
+            hide_unnamed_classes: true,
+            ..in_memory_store_config()
+        })
+        .unwrap(),
+    );
+    let pipeline = MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    let prefixes = "PREFIX ex: <http://example.com/> PREFIX owl: <http://www.w3.org/2002/07/owl#> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ";
+    pipeline
+        .apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "{prefixes}
+            INSERT DATA {{ ex:p rdfs:range [ a owl:Class ; owl:unionOf (ex:A ex:B) ] .
+                ex:s ex:p ex:x . ex:x a ex:C }}"
+            ))),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .unwrap();
+    assert!(!contains(
+        &pipeline,
+        "<http://example.com/p> <http://www.w3.org/2000/01/rdf-schema#range> ?u . <http://example.com/x> a ?u FILTER(isBlank(?u))"
+    ));
+    pipeline
+        .apply(
+            insert(
+                "<http://example.com/unrelated> <http://example.com/note> <http://example.com/v>",
+            ),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .unwrap();
+    let before = store.current_revision();
+    let result = pipeline.apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "{prefixes}
+            INSERT {{ ?u owl:disjointWith ex:C }} WHERE {{ ex:p rdfs:range ?u FILTER(isBlank(?u)) }}"
+            ))),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        );
+    assert!(
+        matches!(result, Err(MutationError::Rejected(_))),
+        "{result:?}"
+    );
+    assert_eq!(store.current_revision(), before);
+}
+
+/// A preloaded hidden class, optionally beside an unrelated quarantined clash.
+fn hidden_range_pipeline(extra: &str, shacl: bool) -> MutationPipeline {
+    let store = Arc::new(
+        StoreService::new(nrese_store::StoreConfig {
+            hide_unnamed_classes: true,
+            equality_compact: true,
+            shacl_gate: if shacl {
+                nrese_store::ShaclGate::Enforce(nrese_store::GateSeverity::Violation)
+            } else {
+                nrese_store::ShaclGate::Off
+            },
+            ..in_memory_store_config()
+        })
+        .unwrap(),
+    );
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "
+        PREFIX ex: <http://example.com/> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        INSERT DATA {{ ex:p rdfs:range [ a owl:Class ; owl:unionOf (ex:A ex:B) ] .
+            ex:s ex:p ex:x . ex:x a ex:C . ex:a owl:sameAs ex:b . ex:b ex:note ex:v .
+            {extra} }}
+    "
+        )))
+        .unwrap();
+    store
+        .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
+        .unwrap();
+    MutationPipeline::new(
+        store,
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    )
+}
+
+fn revive_hidden_range(consumer: &str) -> MutationCommand {
+    MutationCommand::Update(SparqlUpdateRequest::new(format!(
+        "
+        PREFIX ex: <http://example.com/> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        DELETE {{ ex:a owl:sameAs ex:b }}
+        INSERT {{ ?u {consumer} }} WHERE {{ ex:p rdfs:range ?u FILTER(isBlank(?u)) }}
+    "
+    )))
+}
+
+#[test]
+fn a_revival_and_split_preserve_quarantine_and_reject_only_new_clashes() {
+    let extra = "ex:OldA owl:disjointWith ex:OldB . ex:old a ex:OldA, ex:OldB .";
+    let pipeline = hidden_range_pipeline(extra, false);
+    pipeline
+        .apply(
+            revive_hidden_range("rdfs:subClassOf ex:Place"),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .expect("old clash is tolerated");
+    assert!(matches!(
+        pipeline.store().consistency(),
+        nrese_store::ConsistencyStatus::Inconsistent { .. }
+    ));
+    assert!(contains(
+        &pipeline,
+        "<http://example.com/x> a <http://example.com/Place>"
+    ));
+    assert!(!contains(
+        &pipeline,
+        "<http://example.com/a> <http://example.com/note> <http://example.com/v>"
+    ));
+    // A separate old clash must not conceal the newly restored membership's clash.
+    let pipeline = hidden_range_pipeline(extra, false);
+    let before = pipeline.store().current_revision();
+    let result = pipeline.apply(
+        revive_hidden_range("owl:disjointWith ex:C"),
+        &nrese_store::Requester::all(),
+        &MutationTicket::new(),
+    );
+    assert!(
+        matches!(result, Err(MutationError::Rejected(_))),
+        "{result:?}"
+    );
+    assert_eq!(pipeline.store().current_revision(), before);
+    assert!(contains(
+        &pipeline,
+        "<http://example.com/a> <http://www.w3.org/2002/07/owl#sameAs> <http://example.com/b>"
+    ));
+}
+
+#[test]
+fn shacl_checks_restored_memberships_before_a_revival_and_split_commit() {
+    let pipeline = hidden_range_pipeline(&format!("
+        GRAPH <{}> {{
+            ex:shape a <http://www.w3.org/ns/shacl#NodeShape> ;
+              <http://www.w3.org/ns/shacl#targetNode> ex:x ;
+              <http://www.w3.org/ns/shacl#property> [
+                <http://www.w3.org/ns/shacl#path> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ;
+                <http://www.w3.org/ns/shacl#nodeKind> <http://www.w3.org/ns/shacl#IRI> ] .
+        }}", nrese_store::DEFAULT_SHAPES_GRAPH), true);
+    let before = pipeline.store().current_revision();
+    let result = pipeline.apply(
+        revive_hidden_range("rdfs:subClassOf ex:Place"),
+        &nrese_store::Requester::all(),
+        &MutationTicket::new(),
+    );
+    let Err(MutationError::Rejected(rejection)) = result else {
+        panic!("{result:?}")
+    };
+    assert!(rejection.detail.contains("SHACL"), "{}", rejection.detail);
+    assert_eq!(pipeline.store().current_revision(), before);
+}
+
+#[test]
+fn dl_commits_a_revival_and_split_with_its_final_closure() {
+    let baseline = hidden_range_pipeline("", false);
+    let pipeline = MutationPipeline::new(
+        Arc::clone(baseline.store()),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    );
+    let before = pipeline.store().current_revision();
+    pipeline
+        .apply(
+            revive_hidden_range("rdfs:subClassOf ex:Place"),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .unwrap();
+    assert_eq!(pipeline.store().current_revision(), before + 1);
+    assert!(contains(
+        &pipeline,
+        "<http://example.com/x> a <http://example.com/Place>"
+    ));
+    assert!(contains(
+        &pipeline,
+        "<http://example.com/p> <http://www.w3.org/2000/01/rdf-schema#range> ?u . <http://example.com/x> a ?u FILTER(isBlank(?u))"
+    ));
+    assert!(!contains(
+        &pipeline,
+        "<http://example.com/a> <http://example.com/note> <http://example.com/v>"
+    ));
 }
 
 /// A stopped rematerialisation changes nothing and says so.
