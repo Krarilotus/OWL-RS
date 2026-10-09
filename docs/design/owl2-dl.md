@@ -510,6 +510,30 @@ disagreement that isn't adjudicated.
 
 ## 7. Classification and realisation
 
+**Completion-state ownership (9 October).** Each stage owns its compiled `Prepared`.
+`consistency_with_base` runs the existing search once and can retain its deterministic
+checkpoint and exact model in `Base`; the former separate `base()` search and
+model-cloning `labels()` entry are removed. Where the existing feature analysis rules
+out choices, the completed graph becomes the deterministic base without a copy.
+Classification and realisation keep their
+different individual maps; no cross-stage cache is introduced. Realisation releases
+the base when the initial labels leave no candidates. Otherwise its candidates negate
+unproven classes in that initial model: it retains the deterministic start and releases
+the model that those probes would contradict, avoiding a redundant model attempt.
+
+Every retained probe receives its current configuration. Only timeout and cancellation
+may differ from the base; another strategy or capacity configuration declines reuse
+before execution and uses the existing fresh search. `None` means incompatibility,
+never timeout or unknown. An initially unknown search can retain its deterministic
+checkpoint without acquiring model status. Model rollback and its deterministic
+fallback use one `RunBudget`, as do detached terminology and full-ontology attempts.
+Workers refresh the absolute operation deadline on entry. Preparation, state copies,
+labels and cleanup consume the allowance; checks remain cooperative, not preemptive.
+Probe telemetry includes both fallback attempts; the profile now adds initial and
+realisation work. Existing top/subsumption aggregate-counter gaps remain; historical
+counters with narrower coverage are not directly comparable work savings.
+Per-engine capacity checks do not become an aggregate Base-plus-pool memory ceiling.
+
 Never one test per pair of classes:
 - `known_subsumers(C)`: told subsumers, the EL path's, the context core's, and those read from deterministic hypertableau labels. On deterministic ontologies the hierarchy can be read off the labels in a linear number of tests† (HermiT on GALEN).
 - `possible_subsumers(C)`: the candidates the model of `C` leaves; only these are tested, in hierarchy order, by the algorithm of Glimm, Horrocks, Motik, Shearer and Stoilos (*A Novel Approach to Ontology Classification*, JWS 2012)†, which improved some ontologies by one to two orders of magnitude over enhanced traversal†.

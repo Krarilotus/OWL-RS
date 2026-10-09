@@ -1,0 +1,47 @@
+id = "2026-10-09-dl-reuse-be5c3d7"
+kit = "reasoning/dl"
+purpose = "Qualify bounded Base reuse and current deadline/cancellation ownership against the immediately preceding consolidation commit. Selected DL cases, not the whole fast suite or a competitor comparison."
+baseline = "be5c3d7ea981faf9b538498e5be89dcd831a1129, clean Office checkout"
+started = "2026-10-09T21:28:18.987393Z"
+finished = "2026-10-09T21:28:50.229582Z; separate fresh controls completed afterwards"
+host = "Office-PC (sus-ai)"
+machine = "Ryzen 9 5950X, 32 hardware threads, 32 GiB RAM; native Linux; quiet-slot guard, no concurrent Rust build"
+commit = "be5c3d7 plus candidate-no-copy-source.patch SHA256 98b4000466f51dabfd7359c8f5634533b089afa168c7b3c2c7a01a338fe021a8"
+dirty = "13 reviewed files in the measured candidate; subsequent documentation and run-record changes do not alter measured Rust sources"
+protocol = """
+Three independent pairs BC/CB/BC at threads=1 and threads=4, seven cases, 84
+invocations. Existing dl_classify: generated cases repeat=3, ORE repeat=1;
+operation timeout=30s, test timeout=10s, otherwise defaults except explicit
+fixture flags retained in each argv. No OS-cold or tail-latency claim. Cases:
+choice-real-32/300, horn-real-3000/30000, nominal-classify-300, ORE 9881/16542.
+Canonical taxonomy/type SHA256, completeness and exit status checked before times.
+Generated fixtures are deterministic and their exact contents/hashes are retained.
+ORE inputs are read from the shared immutable preservation tree, not copied per run.
+GNU time peak RSS includes parsing; CLI total does not. All samples retained.
+Fresh consistency controls: four inputs, three pairs, 24 invocations, no Base.
+Both revisions built sequentially in one existing Office checkout/target using
+Rust 1.98.1, native release settings; source patches, binary hashes and commands
+retained before replacement. No local Rust build, new target or worktree.
+"""
+findings = [
+  "All 84 final invocations complete with matching canonical answers. ORE 9881/16542 improve 27–43%, and choice-real-300 improves 14–18% at widths 1/4. This is current work against be5c3d7, not historical v2 gains.",
+  "The 30,000-individual Horn control is neutral within observed spread after removal of the unnecessary deterministic checkpoint copy. Final RSS ranges do not establish a repeatable memory regression. Small fixture timings and three repetitions cannot establish general performance neutrality.",
+  "All 24 fresh consistency controls agree; timing ranges overlap. No new fresh-search improvement is claimed.",
+  "Earlier candidates and their measurements remain immutable: measurements.json and measurements-final.json. The original ORE 9151 width-one runs hit their allowance and receive no timing credit; they do not qualify the final candidate.",
+  "Differential tests retain the independent brute-force taxonomy/type oracle and compare Base probes with fresh searches and explicit assumptions. ORE canonical equality is revision equivalence, not a new independent reference-reasoner proof.",
+  "No benchmark threshold was weakened. The broader runtime latency/throughput regressions remain acceptance blockers; no competitor or full-current-head suite ran in this record.",
+]
+commands = [
+  "office-dl-reuse-no-copy.sh: verified replacement patch, Office-only format/focused tests/release build, then existing quiet-slot.sh around office-dl-reuse-measure.py --no-copy",
+  "quiet-slot.sh /usr/bin/python3.12 office-dl-reuse-fresh-controls.py; per-invocation argv recorded in fresh-controls.json",
+]
+results = """
+Office: /home/krarilotus/nrese-prep-20261009-4e8bd38/dl-reuse-pair-be5c3d7/
+Final: measurements-no-copy.json, measurements-no-copy/, fresh-controls.json,
+fresh-controls/, inputs/, candidate-no-copy-source.patch, SHA256SUMS-no-copy.
+Baseline dl_classify SHA256 ef8e5f32f5d4dad9bc9ac3cc09c833837191ad2f95d73b478e8bd010d70fd98e
+Candidate dl_classify SHA256 71d9fb89d5aa9acf01bfcdff9ce5cb1100b849bf3b96f4eb2f58a23bf9e77b4a
+Candidate tableau_consistency SHA256 56b6b6783708d9ab0eecf57e51a3ff690c4c021f8bb53bc547cff43d9f91214f
+Adjacent runner/build logs retain command, source, toolchain and test provenance.
+"""
+publishable = "all"

@@ -110,6 +110,7 @@ pub fn realise(ontology: &Ontology, options: &Options) -> Realisation {
     r.profile.type_candidates = work.stats.candidates;
     r.profile.type_tests = work.stats.tests;
     r.profile.type_positive = work.stats.positive;
+    r.profile.add(&work.stats.work);
     r.profile.compile += program.compile_time();
     r.profile.realisation = t.elapsed();
     r.profile.total = started.elapsed();
@@ -122,6 +123,7 @@ struct Stats {
     candidates: u64,
     tests: u64,
     positive: u64,
+    work: tableau::Telemetry,
 }
 
 struct Work<'a> {
@@ -204,16 +206,10 @@ impl<'a> Work<'a> {
             individuals: true,
             detached: false,
         };
-        let out = program.probe(
-            &Probe {
-                at: At::Nothing,
-                positive: &[],
-                negative: &[],
-            },
-            &config,
-            want,
-        );
+        let (out, mut base) =
+            program.consistency_with_base(&config, want, self.options.reuse_model);
         self.stats.tests += 1;
+        self.stats.work.accumulate(&out.telemetry);
         match (&out.answer, &out.labels) {
             (Answer::Consistent, Some(labels)) => {
                 for (a, label) in labels.individuals.iter().enumerate() {
@@ -254,6 +250,14 @@ impl<'a> Work<'a> {
             }) as u64;
         }
         let workers = self.options.workers();
+        if self.stats.candidates == 0 {
+            base = None;
+        } else {
+            // Candidates are in the initial model's labels but not proven: each
+            // negation contradicts its choices. Reuse the deterministic start,
+            // releasing that model instead of attempting it only to fall back.
+            base = base.map(tableau::Base::into_deterministic);
+        }
         // Waves: each individual's most general open candidate, over the workers.
         let wave = (self.options.threads * 4).max(1);
         let mut cursor = 0usize;
@@ -277,16 +281,22 @@ impl<'a> Work<'a> {
             }
             cursor = (batch.last().map_or(0, |b| b.0 as usize) + 1) % n.max(1);
             let outcomes: Vec<(u32, u32, ProbeOutcome)> = workers.map(&batch, |&(a, d)| {
+                let config = self.deadline.config(&self.options.tableau);
                 let probe = Probe {
                     at: At::Individual(a),
                     positive: &[],
                     negative: std::slice::from_ref(&d),
                 };
-                (a, d, program.probe(&probe, &config, want))
+                let out = base
+                    .as_ref()
+                    .and_then(|b| b.probe(&probe, &config, want))
+                    .map_or_else(|| program.probe(&probe, &config, want), |(out, _)| out);
+                (a, d, out)
             });
             for (a, d, out) in outcomes {
                 let a = a as usize;
                 self.stats.tests += 1;
+                self.stats.work.accumulate(&out.telemetry);
                 match out.answer {
                     Answer::Inconsistent => {
                         self.stats.positive += 1;

@@ -487,11 +487,12 @@ fn types_equal_brute_force() {
             tally.brute_undecided += 1;
             continue;
         };
-        for threads in [1, 3] {
+        for (threads, reuse_model) in [(1, false), (1, true), (3, true)] {
             let r = classify::realise(
                 &o,
                 &Options {
                     threads,
+                    reuse_model,
                     ..options()
                 },
             );

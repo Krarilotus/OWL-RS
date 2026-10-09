@@ -178,6 +178,56 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
 
+### 9 October: bounded DL Base reuse and deadline repair
+
+Against clean `be5c3d7`, the final source-qualified candidate reuses the initial
+consistency search and the existing Base for realisation, applies current probe
+controls, and charges model/rollback/deterministic fallback to one allowance.
+The separate `Prepared::base` search and model-cloning `Base::labels` are removed.
+No new cache, scheduler or default limit is added. Classification and realisation
+still own separate compiled maps; this is not cross-stage caching.
+
+Office ran three independent pairs in BC/CB/BC order at 1 and 4 workers, 84
+invocations across seven fixtures. All complete, with identical canonical taxonomy
+and type hashes across sides and repetitions. Generated cases use three internal
+repetitions; ORE uses one. The existing `dl_classify` total includes normalisation
+and stage work, but not parsing. Peak RSS includes parsing. This selected comparison
+does not replace the registered suite or an independent ORE taxonomy oracle.
+
+| Case | Workers | Baseline → candidate median, ms |
+|---|---:|---:|
+| ORE 9881 | 1 / 4 | 543.8 → 398.2 / 432.0 → 288.6 |
+| ORE 16542 | 1 / 4 | 2254.3 → 1358.6 / 2100.3 → 1188.5 |
+| 300-individual choice realisation | 1 / 4 | 57.2 → 47.2 / 21.5 → 18.5 |
+| 30,000-individual Horn realisation | 1 / 4 | 43.1 → 42.7 / 44.3 → 44.2 |
+
+The ORE and larger choice gains exceed the observed sample ranges. No speed claim
+is made for sub-2 ms fixtures. The Horn control is neutral within spread; no repeatable
+memory regression is established in the final set. In particular its median peak RSS
+is 37,856 → 38,208 KiB at one worker and 38,332 → 38,084 KiB at four. A 51.4 ms
+candidate Horn observation is retained, not discarded. Three repetitions do not
+establish tail latency or neutrality on unmeasured inputs.
+
+Two intermediate candidates remain in the evidence. The first realisation reused a
+model which every negative candidate would contradict. Releasing that model avoided
+the inevitable floor attempt. The next still copied a choice-free Horn graph, raising
+the 30,000-individual peak by about 6 MiB. The final candidate moves that completed
+graph into Base directly when the existing feature analysis rules out choices; both
+corrections were measured again. An earlier ORE 9151 width-one pair hit the allowance
+on both sides and earns no speed credit. Those intermediate timings do not qualify
+the final revision.
+
+The separate 24-invocation fresh-consistency control uses the same final binaries,
+without Base retention. Answers agree on four inputs; time differences overlap the
+observed ranges. It supplies no fresh-search speedup claim. Differential tests compare
+retained probes with fresh searches and explicit ontology assumptions; classification
+and realisation retain their brute-force checks. Current-token/expiry, unknown,
+rollback, counting shortcut and incompatible configuration paths are guarded.
+
+Source/binary/input hashes, exact commands, every sample and superseded variants:
+[run record](../../benches/runs/2026-10-09-dl-reuse-be5c3d7.toml).
+These gains do not clear the separate runtime regression gate.
+
 ### 9 October: complete frozen Office campaign and consolidation audit
 
 The retained `4e8bd38` → `77478d1` campaign completed at 20:20:22 UTC: **95 cases,
@@ -242,8 +292,20 @@ the newly measured intersection regression. The frozen context binary has no out
 `Charge::set` symbol, consistent with inlining, but that does not prove accounting is free.
 Next isolate dispatch, allocation locality and actual generated hot paths before changing
 kernels. Retain the physical CPU boundary; generic serialization coverage and any substantial
-coalescing or DL base-reuse wiring need the documented design checkpoint. No new latency
+coalescing wiring needs the documented design checkpoint. The separately authorised DL
+repair is recorded above. No new latency
 or throughput improvement is claimed for this consolidation batch.
+
+A subsequent native `kernel-intersect` diagnostic retains three pairs at 32 workers
+and 40 query repetitions: the skewed WCOJ median changes from 107.315 to 138.750 ms,
+with the same count (1,662) and route. Ten inspected WCOJ functions have equal sizes
+and equal instruction shapes after removing relocation addresses; this is not proof
+that relocated data or the whole binaries are identical. Whole-process hardware
+counters include loading and startup: similar retired instruction counts and less
+average parallel utilisation do not isolate a causal kernel regression. Raw assembly,
+normalised comparisons and all runs remain under Office's
+`kernel-intersect-diagnostic-20261009`. Storage layout/allocation locality and execution
+placement remain hypotheses to separate before adding kernel code.
 
 ### 9 October: native scheduling profiles and width diagnostic
 

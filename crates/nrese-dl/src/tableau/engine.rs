@@ -112,7 +112,7 @@ pub struct Done {
 #[derive(Clone)]
 pub struct Engine<'a> {
     pub p: &'a Program,
-    pub config: &'a Config,
+    pub config: Config,
     pub g: Graph,
     pub deps: DepSets,
     pub done: Done,
@@ -162,10 +162,10 @@ pub struct Engine<'a> {
 }
 
 impl<'a> Engine<'a> {
-    pub fn new(p: &'a Program, config: &'a Config) -> Self {
+    pub fn new(p: &'a Program, config: &Config) -> Self {
         Self {
             p,
-            config,
+            config: config.clone(),
             g: Graph::default(),
             deps: DepSets::default(),
             done: Done::default(),
