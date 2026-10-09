@@ -50,7 +50,7 @@ pub struct Budget {
     pub timeout: Duration,
     pub memory_bytes: usize,
     pub threads: usize,
-    /// Stops the hypertableau at its next budget check (a cancelled commit).
+    /// Stops the context core and hypertableau at their next budget check.
     pub cancel: Option<tableau::Cancel>,
     /// The deterministic budgets of a hypertableau run.
     pub max_nodes: usize,
@@ -94,6 +94,8 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
     let options = nrese_dl::context::Options {
         threads: budget.threads.max(1),
         proofs: false,
+        // Context max_memory caps the process; memory_bytes budgets this task's
+        // tableau structures. Passing the latter here would impose the wrong limit.
         budget: nrese_dl::context::Budget {
             deadline: Some(started + budget.timeout),
             max_join: Some(MAX_JOIN),
@@ -101,13 +103,26 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
         },
         ..nrese_dl::context::Options::default()
     };
-    if let Ok(saturated) = nrese_dl::context::saturate(ontology, &options) {
+    if let Ok(saturated) =
+        nrese_dl::context::saturate_with_cancel(ontology, &options, budget.cancel.clone())
+    {
         let verdict = match saturated.consistent() {
             true => Verdict::Consistent,
             false => Verdict::Inconsistent,
         };
         return Checked {
             verdict,
+            engine: "context-core",
+            elapsed: started.elapsed(),
+        };
+    }
+    if budget
+        .cancel
+        .as_ref()
+        .is_some_and(tableau::Cancel::is_cancelled)
+    {
+        return Checked {
+            verdict: Verdict::Unknown("cancelled".to_owned()),
             engine: "context-core",
             elapsed: started.elapsed(),
         };
@@ -132,5 +147,42 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
         verdict,
         engine: "hypertableau",
         elapsed: started.elapsed(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn budget() -> Budget {
+        Budget {
+            timeout: Duration::from_secs(10),
+            memory_bytes: usize::MAX,
+            threads: 1,
+            cancel: None,
+            max_nodes: 10_000,
+            max_branch_points: 10_000,
+        }
+    }
+
+    #[test]
+    fn the_request_flag_reaches_context_consistency_and_entailment() {
+        let request = nrese_sparql::CancellationToken::new();
+        let budget = Budget {
+            cancel: Some(tableau::Cancel::from_flag(request.flag())),
+            ..budget()
+        };
+        let mut ontology = Ontology::default();
+        let class = nrese_owl::ExprId(ontology.classes.intern(nrese_owl::ClassExpr::Class(1)));
+        assert_eq!(check(&ontology, &budget).verdict, Verdict::Consistent);
+        // The already-created nested budget must observe subsequent request cancellation.
+        request.cancel();
+        let checked = check(&ontology, &budget);
+        assert_eq!(checked.engine, "context-core");
+        assert_eq!(checked.verdict, Verdict::Unknown("cancelled".to_owned()));
+        assert!(matches!(
+            crate::dl::entailment::nonempty(&ontology, class, &budget),
+            crate::dl::entailment::Entailed::Unknown(_)
+        ));
     }
 }

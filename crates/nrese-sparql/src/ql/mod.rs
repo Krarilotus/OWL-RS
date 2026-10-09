@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
+use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, SnapshotIdentity, TermId};
 use nrese_owl::ql::Tbox;
 use nrese_rdf::{NamedNodeRef, Term};
 
@@ -18,6 +18,8 @@ pub use nrese_owl::ql::{Closure, Limits};
 pub use print::{PrintForm, Printed, print};
 
 mod print;
+#[cfg(test)]
+mod tests;
 
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
@@ -112,8 +114,8 @@ pub struct QlRewriting {
     limits: Limits,
     cached: Mutex<Vec<Cached>>,
     /// Whether the data has a witness's tree wherever it folds, per probe, for one
-    /// snapshot revision (design §3).
-    realised: Mutex<(u64, HashMap<String, bool>)>,
+    /// snapshot view (design §3).
+    realised: Mutex<(Option<SnapshotIdentity>, HashMap<String, bool>)>,
 }
 
 /// Schemas compiled for different readers kept at once.
@@ -124,8 +126,8 @@ struct Cached {
     /// The graphs the schema was read from: every graph (`None`), or a reader's who sees
     /// only the inferences its graphs support.
     access: Option<GraphAccess>,
-    /// The snapshot it was read from: revision and sizes of the two stacks.
-    key: (u64, u64, u64),
+    /// The exact snapshot view it was read from, including pending changes and masks.
+    key: SnapshotIdentity,
     /// A hash of the schema statements: a snapshot with the same schema reuses the TBox.
     schema: u64,
     tbox: Arc<Tbox>,
@@ -138,22 +140,22 @@ impl QlRewriting {
             closure,
             limits: Limits::default(),
             cached: Mutex::new(Vec::new()),
-            realised: Mutex::new((u64::MAX, HashMap::new())),
+            realised: Mutex::new((None, HashMap::new())),
         }
     }
 
-    /// Whether the data at snapshot revision `revision` has the tree of probe `key`
-    /// wherever it folds: `compute`d once per revision and probe (`None`: not asked, the
+    /// Whether the data at snapshot `identity` has the tree of probe `key`
+    /// wherever it folds: `compute`d once per view and probe (`None`: not asked, the
     /// query's questions spent; `false` then, and nothing kept).
     pub(crate) fn realised(
         &self,
-        revision: u64,
+        identity: SnapshotIdentity,
         key: &str,
         compute: impl FnOnce() -> Option<bool>,
     ) -> bool {
         {
             let cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
-            if cache.0 == revision
+            if cache.0 == Some(identity)
                 && let Some(&known) = cache.1.get(key)
             {
                 return known;
@@ -164,8 +166,8 @@ impl QlRewriting {
             return false;
         };
         let mut cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
-        if cache.0 != revision {
-            *cache = (revision, HashMap::new());
+        if cache.0 != Some(identity) {
+            *cache = (Some(identity), HashMap::new());
         }
         cache.1.insert(key.to_owned(), known);
         known
@@ -201,11 +203,7 @@ impl QlRewriting {
     /// schema, as the closure it reads was computed with it.
     pub(crate) fn tbox(&self, snapshot: &Snapshot, access: Option<&GraphAccess>) -> Arc<Tbox> {
         let access = access.filter(|a| a.inferred_by_support);
-        let key = (
-            snapshot.revision(),
-            snapshot.len_in(ReadModel::Asserted),
-            snapshot.len_in(ReadModel::Inferred),
-        );
+        let key = snapshot.identity();
         let mut cached = self.cached.lock().unwrap_or_else(|p| p.into_inner());
         let at = cached.iter().position(|c| c.access.as_ref() == access);
         if let Some(c) = at.map(|i| &cached[i]).filter(|c| c.key == key) {

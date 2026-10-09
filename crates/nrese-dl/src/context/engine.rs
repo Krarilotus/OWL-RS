@@ -119,6 +119,7 @@ pub struct Engine {
     contexts: Arena,
     registry: Mutex<HashMap<CoreKey, ContextId>>,
     budget: Budget,
+    cancel: Option<crate::tableau::Cancel>,
     /// Pred joins stop where the body so far already makes the conclusion redundant.
     pub prune_pred: bool,
     /// The budget ran out: the workers drop what is left (the saturation is then
@@ -152,6 +153,7 @@ impl Engine {
             contexts: Arena::new(),
             registry: Mutex::new(HashMap::new()),
             budget: Budget::default(),
+            cancel: None,
             prune_pred: true,
             exhausted: AtomicBool::new(false),
             memory: None,
@@ -175,6 +177,11 @@ impl Engine {
         self.budget
     }
 
+    pub(super) fn with_cancel(mut self, cancel: Option<crate::tableau::Cancel>) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
     /// Whether the budget ran out (then the saturation is incomplete).
     pub fn exhausted(&self) -> bool {
         self.exhausted.load(Relaxed)
@@ -185,13 +192,17 @@ impl Engine {
         self.exhausted.store(true, Relaxed);
     }
 
-    /// Whether the deadline passed or the memory limit is exceeded (marks the budget
-    /// spent if so).
+    /// Whether cancelled, the deadline passed or the memory limit is exceeded (marks
+    /// the budget spent if so).
     pub(super) fn out_of_budget(&self) -> bool {
         if self.exhausted() {
             return true;
         }
         if self.budget.deadline.is_some_and(|d| Instant::now() >= d)
+            || self
+                .cancel
+                .as_ref()
+                .is_some_and(crate::tableau::Cancel::is_cancelled)
             || self.memory.as_ref().is_some_and(|m| m.exceeded())
         {
             self.exhaust();
@@ -326,6 +337,55 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancellation_stops_nested_context_work_after_messages_have_run() {
+        use nrese_owl::{Axiom, ClassExpr, ExprId, ObjProp, Ontology};
+        use std::sync::Arc;
+
+        // A -> exists r.B starts a successor while processing A's context.
+        let mut ontology = Ontology::default();
+        let a = ExprId(ontology.classes.intern(ClassExpr::Class(1)));
+        let b = ExprId(ontology.classes.intern(ClassExpr::Class(2)));
+        let some = ExprId(
+            ontology
+                .classes
+                .intern(ClassExpr::Some(ObjProp::Named(3), b)),
+        );
+        ontology.axioms.push(Axiom::SubClassOf(a, some));
+        let normalised = nrese_owl::normalise_with(&ontology, Default::default());
+        let compiled = super::super::compile::compile(&normalised, &[1, 2], false).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let cancel = crate::tableau::Cancel::from_flag(Arc::clone(&flag));
+        let engine =
+            Engine::new(compiled.program, Strategy::Cautious, false).with_cancel(Some(cancel));
+        let concept = engine.program.names.iter().position(|&t| t == 1).unwrap() as u32;
+        let (root, _) =
+            engine.context_for(&[Atom::concept(concept, super::super::atoms::CTerm::X)]);
+        let mut queue = Vec::new();
+        engine.deliver_seq(&mut queue, root, Message::Init);
+        let mut delivered = 0;
+        while let Some(context) = queue.pop() {
+            // The scheduler's existing delivery callback is a deterministic checkpoint:
+            // cancellation fires only after actual rule work has emitted a message.
+            engine.work(context, &mut |to, message| {
+                delivered += 1;
+                assert!(
+                    engine
+                        .states()
+                        .any(|(_, s)| s.clauses.counters.messages > 0)
+                );
+                flag.store(true, std::sync::atomic::Ordering::Release);
+                engine.deliver_seq(&mut queue, to, message);
+            });
+        }
+        assert!(delivered > 0, "the test must cancel running nested work");
+        assert!(
+            engine.exhausted(),
+            "cancellation must reach a budget checkpoint"
+        );
+        assert!(engine.states().any(|(_, s)| !s.started));
+    }
 
     #[test]
     fn the_arena_locates_ids_in_growing_segments() {

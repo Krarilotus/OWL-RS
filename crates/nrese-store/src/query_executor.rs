@@ -26,6 +26,10 @@ use nrese_sparql_syntax::algebra::QueryDataset;
 use crate::error::{StoreError, StoreResult};
 use crate::query::{GraphResultFormat, QueryResultKind, SolutionsResultFormat, SparqlQueryRequest};
 
+#[cfg(test)]
+#[path = "query_executor_tests.rs"]
+mod tests;
+
 impl SolutionsResultFormat {
     fn results_format(self) -> QueryResultsFormat {
         match self {
@@ -627,8 +631,9 @@ pub(crate) fn ql_status(
     view: &impl ReadView,
     prepared: &PreparedQuery,
     store: &StoreSettings,
+    cancellation: &CancellationToken,
 ) -> Option<nrese_sparql::ql::QlReport> {
-    let options = explain_options(prepared, store, &CancellationToken::new());
+    let options = explain_options(prepared, store, cancellation);
     nrese_sparql::ql_report(view, &prepared.query, &options)
         .ok()
         .flatten()
