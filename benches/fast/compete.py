@@ -22,11 +22,11 @@ Answer counts must match NRESE's before a time counts: a differing count is repo
 from __future__ import annotations
 
 import csv
+from dataclasses import replace
 import datetime
 import hashlib
 import json
 import os
-import statistics
 import subprocess
 import sys
 import time
@@ -34,6 +34,7 @@ from pathlib import Path
 
 import fast
 from suitekit.workloads import FAST_REGIMES, fast_data_name
+from suitekit.summary import summarise
 
 DL_TIMEOUT_S = 120  # per reference reasoner and task in the comparisons
 # The reference image starts its JVM with -Xmx8g: its container gets that and room around it,
@@ -199,10 +200,13 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
 def summarise_suite(rows: list[dict]) -> dict[str, dict]:
     """Per system: load (with reasoning), statements, per-query median ms and rows, status.
     With its result cache on, a system is its own entry (`qlever (cache on)`)."""
+    # Completed client counts measure throughput, not equal query answers.
+    pairs = summarise([r for r in rows if not (r["task"] == "query" and r["item"].startswith("clients-"))])
     out: dict[str, dict] = {}
     for r in rows:
         system = r["system"] + (" (cache on)" if r.get("cache") == "on" else "")
         s = out.setdefault(system, {"queries": {}, "status": "ok", "notes": [], "publish": r["publish"]})
+        s["_pair"] = pairs.get((r["workload"], r["tier"], r["system"]))
         if r["status"] not in ("ok", ""):
             s["status"] = r["status"] if s["status"] == "ok" else s["status"]
             if r.get("note"):
@@ -214,19 +218,34 @@ def summarise_suite(rows: list[dict]) -> dict[str, dict]:
             s["reason_ms"] = float(r["ms"])
         if r["task"] == "count" and r["rows"]:
             s["statements"] = int(r["rows"])
-        if r["task"] == "query" and r["item"].startswith("clients-") and r["ms"]:
-            s.setdefault("clients", {})[r["item"]] = {"p99_ms": float(r["ms"]), "completed": r["rows"],
-                                                       "note": r.get("note", "")}
+        if r["task"] == "query" and r["item"].startswith("clients-"):
+            if r["ms"]:
+                s.setdefault("clients", {})[r["item"]] = {"p99_ms": float(r["ms"]), "completed": r["rows"],
+                                                           "note": r.get("note", "")}
             continue
         # Rows count even without a time: a closure-only system's answers (Nemo's, answered
         # by Oxigraph over its closure) are compared, though not timed.
-        if r["task"] == "query" and r["status"] in ("ok", "wrong") and r["repeat"] not in ("0", ""):
-            q = s["queries"].setdefault(r["item"], {"ms": [], "rows": r["rows"]})
+        if r["task"] == "query" and r["repeat"] not in ("0", ""):
+            q = s["queries"].setdefault(r["item"], {"ms": [], "rows": r["rows"], "executions": []})
+            q["executions"].append((r["run"], r["repeat"]))
+            q["_cache"] = r.get("cache") or "-"
             if r["ms"]:
                 q["ms"].append(float(r["ms"]))
     for s in out.values():
-        for q in s["queries"].values():
-            q["median_ms"] = statistics.median(q["ms"]) if q["ms"] else None
+        pair = s.pop("_pair")
+        # Publication restrictions are independent of answer completeness.
+        s["complete"] = (pair is not None and replace(pair, publish="free").outcome()["outcome"] == "ok"
+                         and s["status"] == "ok")
+        s["regime"] = pair.regime if pair else None
+        for name, q in s["queries"].items():
+            item = pair.items[q.pop("_cache")][name]
+            estimate = item.estimate()
+            q["executions"].sort()
+            q["complete"] = (item.complete and name not in pair.disputed and len(item.answers) == 1
+                             and {f":{run}" for run, _ in q["executions"]} == set(pair.ok_runs()))
+            q["median_ms"] = estimate[0] if estimate else None
+            q["noise"] = estimate[1] if estimate else None
+            q["problems"] = "disputed" if name in pair.disputed else item.problems()
             del q["ms"]
     return out
 
@@ -241,19 +260,26 @@ def verdicts(summary: dict[str, dict]) -> dict[str, dict]:
             continue
         shared = [q for q in s["queries"] if q in nrese["queries"]]
         differ = [q for q in shared if str(s["queries"][q]["rows"]) != str(nrese["queries"][q]["rows"])]
-        same = [q for q in shared if q not in differ]
+        same = [q for q in shared if q not in differ and s["queries"][q].get("complete", False)
+                and nrese["queries"][q].get("complete", False)
+                and s["queries"][q]["executions"] == nrese["queries"][q]["executions"]]
+        eligible = (s.get("complete", False) and nrese.get("complete", False)
+                    and s.get("regime") == nrese.get("regime")
+                    and set(same) == set(s["queries"]) == set(nrese["queries"]))
         timed = [q for q in same if s["queries"][q]["median_ms"] is not None and nrese["queries"][q]["median_ms"] is not None]
         theirs = sum(s["queries"][q]["median_ms"] for q in timed)
         ours = sum(nrese["queries"][q]["median_ms"] for q in timed)
         answers = "differ: " + ",".join(differ) if differ else ("match" if same else "none compared")
+        if not eligible:
+            answers += "; incomplete, disputed or incompatible comparison"
         v = {"status": s["status"], "answers": answers,
              "queries_compared": len(same), "their_query_ms": round(theirs, 2), "nrese_query_ms": round(ours, 2),
              "query_winner": None, "load_ms": s.get("load_ms"), "nrese_load_ms": nrese.get("load_ms"),
              "statements": s.get("statements"), "nrese_statements": nrese.get("statements"),
              "publish": s["publish"], "notes": s["notes"][:3]}
-        if timed:
+        if eligible and timed and len(timed) == len(same):
             v["query_winner"] = "nrese" if ours < theirs else system
-        if v["load_ms"] and v["nrese_load_ms"]:
+        if eligible and v["load_ms"] and v["nrese_load_ms"]:
             v["load_winner"] = "nrese" if v["nrese_load_ms"] < v["load_ms"] else system
         out[system] = v
     return out

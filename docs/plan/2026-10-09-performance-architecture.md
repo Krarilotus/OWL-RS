@@ -18,6 +18,28 @@ FIFO caller-budget prototype was rejected on measured parallel-workload regressi
 the proposed encoder-only caller bypass is not authorised. Discuss the ownership
 design before implementing another alternative; no caller bypass enters production.
 
+The later single-block worker-coalescing proposal is also **discussion only**.
+Today a direct SELECT evaluates on the pool, returns to its caller, re-enters the
+pool for encoding, then returns for writing. The proposed SPARQL-owned return
+variant would carry either encoded bytes or the existing deferred result, so small
+results need one pool entry. Writers and liveness callbacks remain on their caller;
+large results keep their existing streaming path. Reuse one encoder and buffer,
+preserve checks before/after delivery, and release computation resources before
+slow writes. The existing 4,096-row block is not a byte ceiling; long literals,
+retained tables and memory reservations need explicit lifetime checks.
+
+The observed scheduler cost supports testing granularity, not a universal smaller
+pool or a new scheduler. Earlier mixed-LUBM coalescing did not demonstrate recovery.
+Any experiment must compare both the pre-refactor baseline and current candidate,
+cover small social queries, mixed LUBM, large outputs and concurrent clients, and
+check throughput, tails, CPU/query, memory and cancellation. A local improvement
+does not clear the branch's regression gate. No implementation is authorised yet.
+
+The owner selected GraphDB Free with explicit edition limits and authorised the
+bounded write-scaling harness repair: reference-only execution, numeric Person and
+probe checks, and actual rather than requested triple accounting. Separate complete
+incremental-reasoning sequences remain an open benchmark package.
+
 The aim is to make existing capabilities faster, cheaper to run, and easier to maintain.
 Improve the amount of work first, its representation second, and its machine execution
 third. Preserve semantics, compatibility and the measured wins already in the repository.

@@ -75,8 +75,15 @@ comparator also `hangs`, `unsupported` and `not expressible`.
   the rematerialisations, the commits); the metric is the sum of the series' medians.
   `compare` resamples each series (bootstrap, 2,000 rounds, seeded) for a 95 % interval of
   the ratio new/base. A change counts when the interval excludes 1, the ratio is at least
-  10 % and the difference at least 2 ms (as PROTOCOL.md §5); 10 % more peak memory (and
-  64 MiB) is a regression too. A status change (an `ok` case now `wrong`) comes first.
+  10 % and the difference at least 2 ms by default (as PROTOCOL.md §5). For a declared
+  microcase comparison, `compare BASE NEW --min-ms 0` removes the absolute latency
+  floor while retaining noise and interval checks. Supported changes below the selected
+  floor are labelled as such, not as equal performance. QPS is compared independently
+  at every client width: lower is worse, with no millisecond floor and at least two
+  independent repetitions. Ten percent more peak memory (and 64 MiB) is a regression
+  too. Lost cases, missing repetitions/series/widths and failed checks come first.
+  Matching expected resource/unsupported outcomes track a frontier and earn no timing
+  verdict; matching unexpected failures do not make a valid performance comparison.
 
 ## What is kept
 
