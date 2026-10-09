@@ -133,7 +133,7 @@ other families and is not counted as another independent set of benchmarks.
 | `owl2bench` | RL-1 and QL-1; profile-specific reasoning and 22 queries | Existing suite path; separate documented QL semantic exceptions |
 | `basics-mix` | Olympics, YAGO, entities, DBpedia and Wikidata lexemes; load/restart/query mix | Existing suite path; qualify each size and its resource settings |
 | `fast` | Supported query, reasoning, concurrency and cache cases from the 95-case registry | Partial bridge; commit, SHACL and canonicalization modes are not replayed |
-| `write-scaling` | Batch uploads, individual inserts and sequential COUNT queries, 1M/10M tiers | Independent GraphDB route and numeric checks implemented; live empty-store setup and timing qualification pending |
+| `write-scaling` | Batch uploads, individual inserts and sequential COUNT queries, 1M/10M tiers | Independent GraphDB route and numeric checks implemented; live 100k setup/count qualification completed privately. Full 1M/10M and sustained timing qualification remain open |
 | `ldbc-spb` | Semantic publishing with continuous updates, inference, text and spatial queries | Planned; use official generator, validation and workload mix, not a substitute labelled SPB |
 | `integration-rg-gs-gnd` | Real identity links and competency questions | Partial; GraphDB adapter and cohort/full tiers open; publication permission separate |
 | `real-ontologies` | DBpedia/YAGO with their actual schema; real materialization | Planned; schema inputs and equivalent entailment checks needed |

@@ -41,7 +41,7 @@ pub mod unsupported;
 
 pub use classify::{
     Classification, Local, Options, Saturated, classify, saturate, saturate_normalised,
-    saturate_with_cancel, signature,
+    saturate_with_workers, signature,
 };
 pub use compile::Unsupported;
 pub use engine::{Budget, Strategy};
