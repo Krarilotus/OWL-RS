@@ -76,6 +76,35 @@ Existing id columns, engine access APIs and workload-specific executors are reus
 they do not yet provide device buffers, network exchange or distributed commit semantics.
 H1/H3/H5/H6 below identify that unfinished work without introducing a universal executor.
 
+## Readiness at the existing boundaries
+
+The [architecture readiness exercise](../plan/2026-10-09-performance-architecture.md#extension-boundaries-for-hardware-and-distributed-deployments)
+tests where three future workloads would cross today's contracts. It does not establish
+a distributed or accelerator backend, or require new production interfaces.
+
+| Workload | Existing contracts that suffice locally | Semantic decisions still required |
+|---|---|---|
+| Partitioned join: scan on each partition, exchange keys, join and finish the result | Engine snapshots and scan/seek APIs provide stable local reads. Exec's ID columns, sortedness and join kernels preserve local schemas, multiplicities and supported UNDEF behavior. SPARQL owns expression errors, dataset/access scope and final result semantics | Establish a common term identity or translate dictionary and query-computed IDs; a raw `u64` is not a cross-shard term. Choose a consistent read epoch and exchange/retry policy. Local order or uniqueness is not global: ORDER BY, DISTINCT, aggregates, LIMIT and absence tests in OPTIONAL/MINUS need a globally correct completion rule. Select placement/skew handling and bound exchange buffers without changing the local kernels |
+| Cross-partition reasoning update: a delta derives facts or equality links on another partition, then validates and commits | The reasoner's rule IR, batch/delta evaluation, equality maintenance and provenance remain the semantic owners. The store's mutation pipeline composes reasoning and SHACL over pending state, with cancellation before commit; the engine owns local WAL durability and publication | Define global fixpoint/termination, duplicate delivery, deletion/rederivation and cross-partition equality merge/split behavior. Provenance, access support and validation must see the relevant global state. Decide atomic publication, fencing, recovery and retry/idempotency across participants; several successful local commits or quiet local queues do not establish one globally valid commit |
+| Accelerator kernel: move a batch, execute, return ID columns | Exec's table, sort/join/group and row-limit contracts give a CPU result to preserve. SPARQL/reasoner callers retain value semantics; existing budgets and cancellation checks govern their local work | Specify supported inputs, including UNDEF and any value-dependent numeric/error behavior; preserve declared order and multiplicity. Decide device-buffer lifetime, host/device/scratch accounting, bounded cancellation and failure/fallback behavior without duplicate output. Placement must include transfer, conversion, setup and reuse costs, with CPU fallback and differential validation; existing host budgets do not account for device memory automatically |
+
+Concrete reuse points are [`Snapshot`](../../crates/nrese-engine/src/engine/snapshot.rs),
+[`IdTable`](../../crates/nrese-exec/src/table.rs),
+[`join`/`RowLimit`](../../crates/nrese-exec/src/join.rs),
+[`Budget`/`SharedBudget`](../../crates/nrese-exec/src/budget.rs), the
+[reasoner](../../crates/nrese-reasoner/src/lib.rs) and the
+[mutation pipeline](../../crates/nrese-store/src/mutation/pipeline.rs).
+Snapshot identity scopes local caches; it is not a distributed read epoch or dictionary
+translation. WAL replication and SERVICE remain useful transport-facing features, not
+partitioned execution or a distributed commit protocol.
+
+The [logical-plan slice](query-plan.md#ownership-and-representation) removes inspection
+adapters but supplies neither exchange operators nor global physical properties. Future
+placement must preserve semantic ownership and use coarse operator/batch work, keeping
+network/device checks and virtual dispatch out of the local per-row path. Worker-pool
+selection alone establishes none of the global or device guarantees above; remote
+deadlines also need an explicit translation rather than transmitting a local `Instant`.
+
 ## Plan
 
 **Owner's decision (7 October 2026):** the hardware is measured once, when the store is
