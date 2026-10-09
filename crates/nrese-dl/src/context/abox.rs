@@ -180,6 +180,16 @@ impl Individuals {
     /// Saturates the individuals' contexts on `engine` and evaluates the clauses on the
     /// edges until nothing changes.
     pub fn saturate(engine: &Engine, abox: &Abox, threads: usize) -> Self {
+        let workers = nrese_exec::workers::Workers::new(threads.max(1))
+            .unwrap_or_else(|_| nrese_exec::workers::Workers::serial());
+        Self::saturate_with_workers(engine, abox, &workers)
+    }
+
+    pub fn saturate_with_workers(
+        engine: &Engine,
+        abox: &Abox,
+        workers: &nrese_exec::workers::Workers,
+    ) -> Self {
         let mut me = Self {
             memory: engine.memory_charge(),
             type_count: abox.types.iter().map(Vec::len).sum(),
@@ -222,7 +232,7 @@ impl Individuals {
             if !memory.set(super::memory::vec(&seeds)) || !me.check_memory() {
                 return me;
             }
-            engine.run(&seeds, threads);
+            engine.run_with_workers(&seeds, workers);
             let mut changed = false;
             for (a, &context) in me.contexts.iter().enumerate() {
                 let state = lock(&engine.context(context).state);

@@ -977,6 +977,7 @@ fn decide(
                     timeout: deadline.saturating_duration_since(Instant::now()),
                     memory_bytes: config.memory_per_worker(config.workers()),
                     threads: 1,
+                    workers: Some(store.runtime().workers().limited(1)),
                     cancel: Some(cancel.clone()),
                     max_nodes: config.max_nodes,
                     max_branch_points: config.max_branch_points,

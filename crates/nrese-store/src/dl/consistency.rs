@@ -50,6 +50,8 @@ pub struct Budget {
     pub timeout: Duration,
     pub memory_bytes: usize,
     pub threads: usize,
+    /// The operation's physical owner; `threads` may narrow its dispatch allowance.
+    pub workers: Option<nrese_exec::workers::Workers>,
     /// Stops the context core and hypertableau at their next budget check.
     pub cancel: Option<tableau::Cancel>,
     /// The deterministic budgets of a hypertableau run.
@@ -80,7 +82,20 @@ pub fn left_out(ontology: &Ontology) -> Option<String> {
 /// ontology, else the hypertableau within `budget`. `Consistent` only if nothing of the
 /// source was left out ([`left_out`]).
 pub fn check(ontology: &Ontology, budget: &Budget) -> Checked {
-    let mut checked = check_read(ontology, budget);
+    let started = Instant::now();
+    let workers = budget.workers.as_ref().map_or_else(
+        || {
+            nrese_exec::workers::Workers::new(budget.threads.max(1))
+                .unwrap_or_else(|_| nrese_exec::workers::Workers::serial())
+        },
+        |workers| workers.limited(budget.threads.max(1)),
+    );
+    let mut checked = workers.install(|| {
+        let mut remaining = budget.clone();
+        remaining.timeout = budget.timeout.saturating_sub(started.elapsed());
+        check_read(ontology, &remaining, &workers)
+    });
+    checked.elapsed = started.elapsed();
     if checked.verdict == Verdict::Consistent
         && let Some(why) = left_out(ontology)
     {
@@ -89,10 +104,21 @@ pub fn check(ontology: &Ontology, budget: &Budget) -> Checked {
     checked
 }
 
-fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
+fn check_read(
+    ontology: &Ontology,
+    budget: &Budget,
+    workers: &nrese_exec::workers::Workers,
+) -> Checked {
     let started = Instant::now();
+    if budget.timeout.is_zero() {
+        return Checked {
+            verdict: Verdict::Unknown("timeout".to_owned()),
+            engine: "none",
+            elapsed: started.elapsed(),
+        };
+    }
     let options = nrese_dl::context::Options {
-        threads: budget.threads.max(1),
+        threads: workers.width(),
         proofs: false,
         budget: nrese_dl::context::Budget {
             deadline: Some(started + budget.timeout),
@@ -102,9 +128,12 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
         },
         ..nrese_dl::context::Options::default()
     };
-    if let Ok(saturated) =
-        nrese_dl::context::saturate_with_cancel(ontology, &options, budget.cancel.clone())
-    {
+    if let Ok(saturated) = nrese_dl::context::classify::saturate_with_workers(
+        ontology,
+        &options,
+        budget.cancel.clone(),
+        workers,
+    ) {
         let verdict = match saturated.consistent() {
             true => Verdict::Consistent,
             false => Verdict::Inconsistent,
@@ -132,6 +161,7 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
         max_nodes: budget.max_nodes,
         max_branch_points: Some(budget.max_branch_points),
         cancel: budget.cancel.clone(),
+        workers: Some(workers.clone()),
         ..tableau::Config::default()
     };
     // Island by island where the ABox splits (`nrese_dl::islands`).
@@ -158,6 +188,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             memory_bytes: usize::MAX,
             threads: 1,
+            workers: None,
             cancel: None,
             max_nodes: 10_000,
             max_branch_points: 10_000,

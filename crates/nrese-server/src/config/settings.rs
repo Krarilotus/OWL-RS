@@ -378,6 +378,12 @@ pub const SETTINGS: &[Setting] = &[
         Integer,
         "Rows one request may return (default 1000000).",
     ),
+    setting(
+        "execution.threads",
+        names::EXECUTION_THREADS,
+        Integer,
+        "Physical CPU workers shared by repositories; 0 uses available parallelism (default 0).",
+    ),
     // [budgets]
     older(
         setting(

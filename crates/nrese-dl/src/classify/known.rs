@@ -59,6 +59,18 @@ pub fn horn_lower_bound(
     classes: &[Term],
     core: &crate::context::Options,
 ) -> Option<Lower> {
+    let workers = nrese_exec::workers::Workers::new(core.threads.max(1))
+        .unwrap_or_else(|_| nrese_exec::workers::Workers::serial());
+    horn_lower_bound_with_workers(normalised, classes, core, &workers, None)
+}
+
+pub(crate) fn horn_lower_bound_with_workers(
+    normalised: &Normalised,
+    classes: &[Term],
+    core: &crate::context::Options,
+    workers: &nrese_exec::workers::Workers,
+    cancel: Option<crate::tableau::Cancel>,
+) -> Option<Lower> {
     let all = &normalised.clauses;
     let budget = core.budget;
     // The clauses of the part, by index into the normalisation's.
@@ -88,13 +100,20 @@ pub fn horn_lower_bound(
         proofs: false,
         ..*core
     };
-    if let Some(l) = saturate(normalised, kept, classes, &with(first)) {
+    if let Some(l) = saturate(
+        normalised,
+        kept,
+        classes,
+        &with(first),
+        workers,
+        cancel.clone(),
+    ) {
         return Some(l);
     }
     if all_horn {
         return None;
     }
-    saturate(normalised, horn, classes, &with(budget))
+    saturate(normalised, horn, classes, &with(budget), workers, cancel)
 }
 
 /// The context core on the clauses `part` (indexes) of `n`, dropping clauses it refuses a
@@ -104,6 +123,8 @@ fn saturate(
     mut part: Vec<usize>,
     classes: &[Term],
     options: &crate::context::Options,
+    workers: &nrese_exec::workers::Workers,
+    cancel: Option<crate::tableau::Cancel>,
 ) -> Option<Lower> {
     let build = |part: &[usize]| Normalised {
         clauses: part.iter().map(|&i| n.clauses[i].clone()).collect(),
@@ -113,7 +134,13 @@ fn saturate(
         ..Normalised::default()
     };
     for _ in 0..RETRIES {
-        let why = match crate::context::saturate_normalised(&build(&part), classes, options) {
+        let why = match crate::context::classify::saturate_normalised_with_workers(
+            &build(&part),
+            classes,
+            options,
+            cancel.clone(),
+            workers,
+        ) {
             Ok(saturated) => {
                 let mut lower = lower(&saturated.classification(), classes);
                 exact_for(&mut lower, &saturated, n, &part, classes);

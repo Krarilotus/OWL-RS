@@ -217,6 +217,8 @@ type Rows<'a> = Box<dyn Iterator<Item = Result<Vec<Option<Term>>, QueryEvaluatio
 pub struct QuerySolutionIter<'a> {
     variables: Arc<[Variable]>,
     rows: Rows<'a>,
+    /// Reservations live as long as the retained result, including an early drop.
+    budget: Option<Arc<nrese_exec::Budget>>,
 }
 
 impl<'a> QuerySolutionIter<'a> {
@@ -228,11 +230,17 @@ impl<'a> QuerySolutionIter<'a> {
         Self {
             variables,
             rows: Box::new(rows),
+            budget: None,
         }
     }
 
     pub fn variables(&self) -> &[Variable] {
         &self.variables
+    }
+
+    pub(crate) fn with_budget(mut self, budget: Arc<nrese_exec::Budget>) -> Self {
+        self.budget = Some(budget);
+        self
     }
 }
 
@@ -260,13 +268,20 @@ impl fmt::Debug for QuerySolutionIter<'_> {
 /// The triples of a CONSTRUCT or DESCRIBE, as they are computed.
 pub struct QueryTripleIter<'a> {
     triples: Box<dyn Iterator<Item = Result<Triple, QueryEvaluationError>> + 'a>,
+    budget: Option<Arc<nrese_exec::Budget>>,
 }
 
 impl<'a> QueryTripleIter<'a> {
     pub fn new(triples: impl Iterator<Item = Result<Triple, QueryEvaluationError>> + 'a) -> Self {
         Self {
             triples: Box::new(triples),
+            budget: None,
         }
+    }
+
+    pub(crate) fn with_budget(mut self, budget: Arc<nrese_exec::Budget>) -> Self {
+        self.budget = Some(budget);
+        self
     }
 }
 

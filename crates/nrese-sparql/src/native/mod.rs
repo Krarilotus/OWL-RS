@@ -173,35 +173,38 @@ pub(crate) fn evaluate<'a>(
         }
         None => pattern,
     };
-    let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
+    let (ctx, solutions) = ctx.on_workers(options.workers.as_ref(), |ctx| {
+        ctx.eval_root(&pattern, options.pin.as_ref())
+    })?;
     match form {
         Form::Select => {}
         Form::Describe => {
             let triples = ctx.describe(&solutions)?;
-            return Ok(QueryResults::Graph(QueryTripleIter::new(
-                triples.into_iter().map(Ok),
-            )));
+            return Ok(QueryResults::Graph(
+                QueryTripleIter::new(triples.into_iter().map(Ok)).with_budget(ctx.budget),
+            ));
         }
         Form::Ask => return Ok(QueryResults::Boolean(!solutions.table.is_empty())),
         Form::Construct(template) => {
             let computed = ctx.computed.into_inner();
             let triples: Vec<_> = construct(&snapshot, computed, solutions, template).collect();
-            return Ok(QueryResults::Graph(QueryTripleIter::new(
-                triples.into_iter().map(Ok),
-            )));
+            return Ok(QueryResults::Graph(
+                QueryTripleIter::new(triples.into_iter().map(Ok)).with_budget(ctx.budget),
+            ));
         }
     }
     let variables: Arc<[Variable]> = solutions.vars.clone().into();
     let computed = ctx.computed.into_inner();
     let table = solutions.table;
+    let budget = ctx.budget;
     let rows = (0..table.len()).map(move |row| {
         Ok((0..table.width())
             .map(|column| decode(&snapshot, &computed, table.get(row, column)))
             .collect::<Vec<_>>())
     });
-    Ok(QueryResults::Solutions(QuerySolutionIter::new(
-        variables, rows,
-    )))
+    Ok(QueryResults::Solutions(
+        QuerySolutionIter::new(variables, rows).with_budget(budget),
+    ))
 }
 
 /// Runs `query`, recording each operator ([`PlanStep`]); returns the rewrites that changed
@@ -215,7 +218,9 @@ pub(crate) fn explain(
     let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let (pattern, form, rewrites, ql) = native_pattern(query, options, &ctx)?;
     ctx.trace = Some(RefCell::default());
-    let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
+    let (mut ctx, solutions) = ctx.on_workers(options.workers.as_ref(), |ctx| {
+        ctx.eval_root(&pattern, options.pin.as_ref())
+    })?;
     let steps = ctx.trace.take().unwrap_or_default().into_inner();
     // CONSTRUCT and DESCRIBE count triples.
     let rows = match form {
@@ -292,9 +297,10 @@ pub(crate) fn write_results(
         Ok(native) => native,
         Err(error) => return Some(Err(error.into())),
     };
-    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
-    let solutions = match ctx.eval_root(&pattern, options.pin.as_ref()) {
-        Ok(solutions) => solutions,
+    let (ctx, solutions) = match ctx.on_workers(options.workers.as_ref(), |ctx| {
+        ctx.eval_root(&pattern, options.pin.as_ref())
+    }) {
+        Ok(result) => result,
         Err(error) => return Some(Err(QueryEvaluationError::from(error).into())),
     };
     if matches!(form, Form::Ask) {
@@ -319,7 +325,13 @@ pub(crate) fn write_results(
     };
     Some(
         writer
-            .write(&solutions.vars, &solutions.table, out, &alive)
+            .write(
+                &solutions.vars,
+                &solutions.table,
+                out,
+                &alive,
+                options.workers.as_ref(),
+            )
             .map_err(|error| {
                 if cancelled() {
                     QueryEvaluationError::Cancelled.into()
@@ -362,7 +374,7 @@ pub(crate) fn delete_insert(
     }
     let ctx = Context::new(snapshot, options, using, base);
     let pattern = optimise(pattern.clone(), &mut Vec::new(), &ctx);
-    let solutions = ctx.eval(&pattern)?;
+    let (ctx, solutions) = ctx.on_workers(options.workers.as_ref(), |ctx| ctx.eval(&pattern))?;
     let computed = ctx.computed.into_inner();
     let table = &solutions.table;
     let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
@@ -1142,6 +1154,24 @@ enum GraphScope {
 }
 
 impl<'a> Context<'a> {
+    /// Transfers only native computation to its physical owner. The context is Send,
+    /// not Sync; it moves as a whole and returns with its computed-term ID domain.
+    /// Caller-owned writers and reporting callbacks never cross the thread boundary.
+    fn on_workers<R: Send>(
+        self,
+        workers: Option<&nrese_exec::workers::Workers>,
+        run: impl FnOnce(&Self) -> NativeResult<R> + Send,
+    ) -> NativeResult<(Self, R)> {
+        let compute = move || {
+            let result = run(&self)?;
+            Ok((self, result))
+        };
+        match workers {
+            Some(workers) => workers.install(compute),
+            None => compute(),
+        }
+    }
+
     /// Whether `triple` is a GeoSPARQL relation computed from geometries
     /// ([`spatial`]): not when only stated relations are read.
     fn is_spatial(&self, triple: &TriplePattern) -> bool {

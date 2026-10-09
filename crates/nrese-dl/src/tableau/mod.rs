@@ -125,6 +125,9 @@ pub struct Config {
     /// the unfolded clauses (`portfolio`), each with half the memory budget; else the
     /// unfolded clauses alone if this is off, the plain ones if cores are short.
     pub portfolio: bool,
+    /// Reusable physical workers and this operation's allowance. Portfolio variants
+    /// share them; without an owner, a standalone race creates its own workers.
+    pub workers: Option<nrese_exec::workers::Workers>,
     /// Stops the run at its next budget check, answering `GaveUp`.
     pub cancel: Option<Cancel>,
 }
@@ -154,6 +157,7 @@ impl Default for Config {
             lazy_definitions: true,
             complements: true,
             portfolio: true,
+            workers: None,
             cancel: None,
             expand_at_most_up_to: Options::default().expand_at_most_up_to,
         }
@@ -236,10 +240,11 @@ pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
         return consistency_of(&ontology, &unfolded, config);
     }
     let plain = normalise_with(&ontology, options(false));
-    if !portfolio::cores_to_spare() {
+    let workers = portfolio::workers(config, 2);
+    if workers.width() < 2 {
         return consistency_of(&ontology, &plain, config);
     }
-    portfolio::race(&ontology, &[&plain, &unfolded], config)
+    portfolio::race(&ontology, &[&plain, &unfolded], config, &workers)
 }
 
 /// `ontology` with each negative assertion over a non-simple property `¬R(a, b)` as the

@@ -38,6 +38,11 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         total_query_memory_bytes: parse_total_query_memory(
             source.get(names::MAX_TOTAL_QUERY_MEMORY_BYTES).as_deref(),
         )?,
+        execution_threads: super::env_values::parse_usize(
+            source,
+            names::EXECUTION_THREADS,
+            defaults.execution_threads,
+        )?,
         huge_pages: match choice(source, names::HUGE_PAGES, &["off", "on"])? {
             Some(on) => on == 1,
             None => defaults.huge_pages,

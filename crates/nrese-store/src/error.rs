@@ -34,6 +34,8 @@ impl std::fmt::Display for IncompleteAnswer {
 pub enum StoreError {
     #[error("invalid store configuration: {0}")]
     Configuration(String),
+    #[error("execution workers could not be started: {0}")]
+    ExecutionUnavailable(#[source] rayon::ThreadPoolBuildError),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error("storage engine error: {0}")]
@@ -152,6 +154,7 @@ impl StoreError {
             | Self::FileParse { .. } => true,
             Self::SparqlEvaluation(_) => unreachable!("classified above"),
             Self::Configuration(_)
+            | Self::ExecutionUnavailable(_)
             | Self::Io(_)
             | Self::Engine(_)
             | Self::OntologyFileNotFound { .. }
