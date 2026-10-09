@@ -15,9 +15,9 @@
 //! next is merged. So the load's quads take the budget plus one packed permutation,
 //! whatever the data's size, at the cost of writing and reading each key twice more.
 //!
-//! The spilling thread sorts on a thread pool of its own. The loader's threads, which add
-//! the quads from the global pool, wait for it when the next chunk is full: a sort on
-//! the global pool could wait for those very threads.
+//! Raw writes run on an independent I/O thread: loader workers wait for it when the next
+//! chunk is full, so it must not need their pool to make progress. Sorting runs only after
+//! that thread has joined, when the load's terms have their final ids.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -36,15 +36,6 @@ use crate::quad::{EncodedQuad, Key, Permutation};
 /// The directory spilled chunks go to, in the store's directory. A load that ended without
 /// removing it (a crash) leaves it behind; opening the store removes it.
 pub(crate) const SPILL_DIR: &str = "bulk-spill";
-
-/// Quads concatenated into one array, each batch freed once copied.
-fn concat(batches: Vec<Vec<EncodedQuad>>) -> Vec<EncodedQuad> {
-    let mut quads: Vec<EncodedQuad> = Vec::with_capacity(batches.iter().map(Vec::len).sum());
-    for batch in batches {
-        quads.extend_from_slice(&batch);
-    }
-    quads
-}
 
 /// Chunks spilled to disk: as written (raw, until [`Spill::sort_raw`]), then per chunk one
 /// packed file per permutation of its layout.
@@ -71,13 +62,16 @@ impl Spill {
         })
     }
 
-    /// Writes `quads` as they are (32 bytes each, little-endian components).
-    fn write_raw(&mut self, quads: &[EncodedQuad]) -> std::io::Result<()> {
+    /// Writes batches in order (32 bytes per quad, little-endian), freeing each once
+    /// written. O(n) with one fixed-size I/O buffer, without concatenating the input.
+    fn write_raw(&mut self, batches: Vec<Vec<EncodedQuad>>) -> std::io::Result<()> {
         let path = self.dir.join(format!("raw-{:05}.quads", self.raw.len()));
         let mut out = BufWriter::with_capacity(1 << 20, File::create(&path)?);
-        for quad in quads {
-            for component in quad.components() {
-                out.write_all(&component.to_le_bytes())?;
+        for batch in batches {
+            for quad in batch {
+                for component in quad.components() {
+                    out.write_all(&component.to_le_bytes())?;
+                }
             }
         }
         out.into_inner()
@@ -270,12 +264,6 @@ pub(super) struct Spiller {
 impl Spiller {
     pub(super) fn start(root: &Path) -> std::io::Result<Self> {
         let mut spill = Spill::create(root)?;
-        let threads = std::thread::available_parallelism().map_or(4, usize::from);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|i| format!("nrese-spill-{i}"))
-            .build()
-            .map_err(std::io::Error::other)?;
         // One chunk waits while the last is written: a full chunk in the sender's hands
         // blocks it.
         let (chunks, received) = sync_channel::<Vec<Vec<EncodedQuad>>>(0);
@@ -283,8 +271,7 @@ impl Spiller {
             .name("nrese-spill".into())
             .spawn(move || {
                 for batches in received {
-                    pool.install(|| spill.write_raw(&concat(batches)))?;
-                    pool.broadcast(|_| crate::memory::release_thread());
+                    spill.write_raw(batches)?;
                     crate::memory::release_thread();
                 }
                 Ok(spill)
@@ -320,6 +307,85 @@ pub(crate) fn remove_leftovers(root: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::TermId;
+
+    #[global_allocator]
+    static ALLOCATOR: nrese_exec::heap::Counting<std::alloc::System> =
+        nrese_exec::heap::Counting(std::alloc::System);
+
+    /// Isolate the existing process-wide allocation counter from the other unit tests,
+    /// including when this binary is run by cargo test instead of nextest.
+    #[test]
+    fn raw_spill_keeps_bytes_without_a_chunk_copy() {
+        if !std::env::args().any(|arg| arg == "--test-threads=1") {
+            let test = std::thread::current();
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg(test.name().expect("libtest names its test threads"))
+                .arg("--test-threads=1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let value = quad(0x0102030405060708, 9, 10, u64::MAX);
+        let mut batches = vec![vec![value; 16 * 1024]; 16];
+        batches.insert(3, Vec::new());
+        let count: usize = batches.iter().map(Vec::len).sum();
+        nrese_exec::heap::start("raw spill");
+        let before = nrese_exec::heap::live();
+        let spiller = Spiller::start(dir.path()).unwrap();
+        assert!(spiller.send(batches));
+        let spill = spiller.finish().unwrap();
+        let peak = nrese_exec::heap::peak();
+        let _ = nrese_exec::heap::finish();
+        // 8 MiB of input, one 1 MiB writer, and a little path/file bookkeeping. The old
+        // concatenation alone allocated another 8 MiB before freeing any input batch.
+        assert!(
+            peak - before < 2 << 20,
+            "extra live bytes: {}",
+            peak - before
+        );
+        let bytes = fs::read(&spill.raw[0]).unwrap();
+        assert_eq!(bytes.len(), count * 32);
+        let expected: Vec<u8> = [9u64, 10, u64::MAX, 0x0102030405060708]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        assert!(
+            bytes
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .all(|record| record.as_slice() == expected)
+        );
+    }
+
+    #[test]
+    fn raw_spill_preserves_batch_order_and_reports_write_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let spiller = Spiller::start(dir.path()).unwrap();
+        assert!(spiller.send(vec![
+            vec![quad(4, 1, 2, 3)],
+            Vec::new(),
+            vec![quad(8, 5, 6, 7)],
+        ]));
+        assert!(spiller.send(Vec::new()));
+        let spill = spiller.finish().unwrap();
+        let expected: Vec<u8> = (1u64..=8).flat_map(u64::to_le_bytes).collect();
+        assert_eq!(fs::read(&spill.raw[0]).unwrap(), expected);
+        assert!(fs::read(&spill.raw[1]).unwrap().is_empty());
+        drop(spill);
+        assert!(!dir.path().join(SPILL_DIR).exists());
+
+        let spiller = Spiller::start(dir.path()).unwrap();
+        // A directory at the next file's path fails on every platform, without relying
+        // on permissions (which privileged test runners may bypass).
+        fs::create_dir(dir.path().join(SPILL_DIR).join("raw-00000.quads")).unwrap();
+        assert!(spiller.send(vec![vec![quad(4, 1, 2, 3)]]));
+        assert!(spiller.finish().is_err());
+        assert!(!dir.path().join(SPILL_DIR).exists());
+    }
 
     fn quad(g: u64, s: u64, p: u64, o: u64) -> EncodedQuad {
         EncodedQuad {
