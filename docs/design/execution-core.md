@@ -44,6 +44,13 @@ The kernel boundary is described in
 [`nrese-exec/src/lib.rs`](../../crates/nrese-exec/src/lib.rs); the query entry points and
 options are in [`query.rs`](../../crates/nrese-sparql/src/query.rs).
 
+Within the native executor, `numeric.rs` owns SPARQL numeric promotion and arithmetic
+for both expressions and aggregates. `aggregate.rs` owns aggregate value helpers;
+group planning, scheduling and result interning remain in the executor. Calendar and
+OWL datatype semantics retain their separate owners. Owned ID-table projection moves
+selected column buffers and preserves the surviving sort prefix; selecting a column
+more than once copies only its additional occurrences.
+
 ## 3. Storage access
 
 The engine owns term encodings and sorted permutations, including asserted GPSO and
