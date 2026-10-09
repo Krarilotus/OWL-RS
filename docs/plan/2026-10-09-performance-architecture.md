@@ -563,20 +563,21 @@ The estimated change is 100–170 replacement/plumbing lines plus focused tests,
 executor. The owner approved this bounded implementation; the repeated store preparation
 and duplicated options builder are removed. Required guards cover cold/warm caches, pending views, graph access, strict and
 canonical equality, limits, cancellation, and a cache hit that performs no evaluation.
-The smaller writer eligibility check is already moved before preparation. The full change
-is awaiting the owner's decision.
+The smaller writer eligibility check is already moved before preparation. The approved
+change is implemented in `0f9d98c`; combined validation and limitations are in the lab log.
 
 **DL worker ownership (P7).** `context::Engine::run` currently creates a pool each round;
 the ABox fixpoint calls it repeatedly, and pool-creation failure falls back to ambient
 Rayon workers. Classification already has a private `Workers` helper with serial fallback.
-The next bounded change can reuse that pattern for one saturation operation, keeping the
-pool out of the returned `Saturated` state. Public entry points still need compatibility
-wrappers. Separately, exact candidates run on ambient Rayon although their memory allowance
-is divided by configured workers. A store-local bounded pool should align the actual width
-with that division, capped by eligible work, with an explicit serial fallback. Neither fix
-is a global scheduler or an admission policy across simultaneous client requests. Measure
-pool startup on tiny tasks as well as reuse across rounds; do not hide its cost in a batch
-average. These changes are inspected but not implemented in the first batch.
+The owner chose design discussion before implementation. `dl.threads` is documented for
+classification; exact candidates nevertheless use its width to divide memory while
+executing on ambient Rayon. The demonstrated mismatch is between budgeting and actual
+concurrency, not a documented exact-query thread ceiling. Reusing a pool for a saturation
+operation is a candidate repair, not an accepted global architecture. First resolve runtime
+ownership of physical workers versus each operation's allowance, nested portfolio work,
+concurrent requests and maintenance. Store-local or per-request dedicated pools are not
+assumed to solve admission or oversubscription. Measure startup on tiny tasks, reuse across
+rounds and mixed-load tails. Worker changes remain unimplemented pending discussion.
 
 **Typed DL bounds (P3).** Skipping upper evaluation when a lower ASK is true is the smallest
 independent saving, subject to a guard proving the upper evaluator is not entered. Retaining
@@ -609,5 +610,11 @@ process-memory ceiling remains useful but cannot replace task accounting. Implem
 was approved by the owner, who prioritised flexibility and performance over fixed limits.
 Keep task limits configurable, with unlimited operation available; use task-owned capacity
 checks at work checkpoints, allowing temporary overshoot as the tableau does. Strict
-allocation-by-allocation enforcement is outside this bounded work. No process-memory
-watch is substituted for task accounting, and no accounting implementation is claimed yet.
+allocation-by-allocation enforcement is outside this bounded work. Implemented in
+`6a1e843` and integrated as `74d83e8`: per-owner reservations reuse `nrese_exec::Budget`,
+incremental index totals avoid whole-state scans, and message payloads transfer owners.
+The store forwards its configured value to both engines; unlimited operation is preserved.
+Capacity, concurrent release, cancellation cleanup, exhaustion and equivalence guards pass.
+The [lab log](../design/performance.md#6-lab-log-of-the-performance-phase-from-5-october-2026)
+records accounting's measured cost and unqualified coverage. This closes saturation
+accounting, not the shared end-to-end envelope or configured worker-width gaps.
