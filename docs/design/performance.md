@@ -178,6 +178,78 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
 
+### 9 October: QL preparation and configurable context capacity
+
+**QL preparation, `0f9d98c` against `91900f8`.** One SPARQL-owned preparation now supplies
+the report and execution on the same view; result keys retain the original query and
+options. The old store report helper/options builder are removed. Deterministic guards
+count one QL stage even with warm probe caches, check canonical/strict views at a probe
+limit, and cover all query forms/serializers, cancellation and cache hits without evaluation.
+
+The existing native lab used the preceding entry's machine, build and workload settings,
+six alternating process pairs, one warmup and 50 repeats per query. All 81 query answer bags,
+requested orderings, statuses and semantic held counts match in every pair. Median sums
+of query p50 (ms): LUBM-10 **14.662 -> 15.138**, NPD **68.897 -> 68.668**, OWL2Bench QL-1
+**2.914 -> 2.848**, LUBM-1 DL mode **4.050 -> 3.965**. No query crosses the diagnostic
+10%-and-2-ms threshold. LUBM's +3.2% aggregate and q09's +0.405 ms median remain visible
+within substantial run variation; this is not proof of universal performance neutrality.
+Process peaks also vary; no RSS improvement is claimed. The deterministic saving is the
+removed duplicate preparation, not a broad timing speedup. Raw evidence: local
+`tmp/ql-prepare-once`; saved candidate SHA-256
+`25640a6fe80c479c5314b56c04df8947f9e96f3b8989791edc3dd7a2acd4d86a`.
+
+**Context capacity, isolated source `6a1e843`, integrated as `74d83e8`.** This closes a
+configuration/ownership gap and has a bookkeeping cost. It reuses `nrese_exec::Budget`,
+with reservations owned by saturation state and scratch buffers, incremental nested
+capacity totals and queue payload transfer. `SetTrie::bytes` no longer walks its nodes.
+Redundant context-core, assertion-slot and merge-ID copies and an equality union clone
+are removed; classification options have one store owner. Hyper's existing join is moved
+to its own module. No second reasoning engine or allocation-ceiling framework is added.
+The configured budget can be disabled; exhaustion is incomplete, never a false decision.
+See [the exact scope](owl2-dl.md#13-configuration), including estimates and exclusions.
+
+Release/fat-LTO/native builds in separate targets, Rust 1.98.1, system allocator for these
+examples. The existing `context_classify` (university schema, proofs on, split strategy)
+and `dl_classify` (ORE 10212 and 9881, default driver choices) were compared against clean
+`0f46563`: three fresh processes per side/worker count, five classifications per process,
+base/off/on then reversed then base/off/on; each invocation had a quiet slot. File parsing
+precedes the inner repeats. All 54 completed taxonomies match across revisions, accounting
+modes and worker counts. These are diagnostic timings, not publication qualification.
+
+| Case | Workers | Baseline total (ms) | New, accounting off | New, 4 GiB budget |
+|---|---:|---:|---:|---:|
+| University schema | 1 | 0.7 | 0.7 | 0.7 |
+| University schema | 4 | 0.7 | 1.0 | 0.8 |
+| ORE 10212 | 1 | 23.9 | 25.1 | 24.6 |
+| ORE 10212 | 4 | 22.9 | 23.1 | 24.6 |
+| ORE 9881 | 1 | 849.2 | 860.0 | 870.5 |
+| ORE 9881 | 4 | 570.9 | 559.9 | 577.7 |
+
+On ORE 10212 the lower-bound medians with accounting off/on are 5.6/6.1 ms (one worker)
+and 4.0/4.4 ms (four). The optional feature is not free. The schema's accounted peak is
+about 425 KB; this is reserved capacity, not physical memory. Do not infer an RSS saving
+or a hard ceiling from it. ORE 1066's five-repeat baseline was interrupted after roughly
+two minutes and is unqualified; that grouped runtime does not itself prove a timeout bug.
+An earlier run explicitly lost its quiet slot and was excluded. OWL2Bench EL and LUBM's
+full assertions are not direct context benchmarks: the engine declines unsupported
+assertions in those inputs. No unsupported case is counted as successful coverage.
+
+Raw commands, taxonomies, hashes and logs remain in the memory worktree's
+`tmp/memory-check-final` and `tmp/candidate-6a1e843/PROVENANCE.json`. Candidate SHA-256:
+context example `3eb7160f422afa22f4dd6a2ad6e6a09a33b2799be3730668e58c08eab39b4066`,
+DL driver `566cf60affb2ffc755044c59a622b3339e826905897fde81255f266438373a11`.
+The combined `74d83e8` integration gate passed: 1,287 workspace tests, doc tests,
+fmt/clippy, 79 harness tests, 11 suite contracts, locks and dependency checks. Console
+dependencies and external conformance corpora were unavailable; these are not claimed.
+The release store example then ran three alternating comparison pairs against `0f9d98c`
+on LUBM 1 in DL mode, 50 samples per query, one warm-up, 16 workers and cache disabled,
+in quiet slots. All 14 queries preserved answers and status in every pair. Median sum
+of query p50s was 3.972 versus 4.165 ms; no query crossed the diagnostic 10% and 2 ms
+threshold. This small increase is visible, not proof of equivalence. Semantic held counts
+matched; dictionary index capacity varied by 560–1,120 bytes. Peak process readings are
+not an established memory saving. Raw results: `tmp/combined-dl-memory/` in the integration
+worktree. This store smoke comparison does not replace the direct context accounting cases.
+
 ### 9 October: bounded reuse and contract repairs on the isolated branch
 
 Comparison base `0f46563` includes the pending DL number-module merge. Candidate code
