@@ -61,7 +61,11 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
   - 3 per pair for a check (`--runs 3`);
   - 10 for a run behind a published claim;
   - 1 only for a smoke test, which is never compared.
-- **Warm-up and cold.** Each query's first execution on a fresh server is recorded apart (`repeat` 0): it is the cold case. Then come `--query-runs` measured repeats.
+- **Warm-up and first execution.** Each query's first execution on a fresh server
+  is recorded apart (`repeat` 0), followed by `--query-runs` measured repeats. The
+  suite's preceding count query can already warm indexes, the JVM and filesystem
+  cache. This is first-query latency, not evidence of an OS-cold run; a cold-cache
+  claim needs the separately recorded cache-control procedure below.
 - **Order.** Queries run in rounds over the whole mix, each round shuffled. Repetition r uses seed `seed·1000 + r`, so every system gets the same orders, and the order is recorded in each row. The DL kit shuffles the axiom order for its robustness runs.
 - **Limits.**
   - Per load: `--timeout-s`, default 3600.
@@ -85,7 +89,7 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
 
 - **Per query:** the median of the measured repeats within a repetition, then the median over the repetitions.
 - **Spread:** the range of the per-repetition medians relative to their median. With one repetition, the interquartile range of the repeats. The spread is reported next to every comparison.
-- **Per pair:** the sum of the query medians (cold and repeated apart), the load time, store size, restart time and peak memory, each as a median over the repetitions.
+- **Per pair:** the sum of the query medians (first and repeated executions apart), the load time, store size, restart time and peak memory, each as a median over the repetitions.
 - **Comparing two runs or two systems:**
   - the ratio per query;
   - the geometric mean of the ratios, beside the ratio of the sums;
@@ -144,7 +148,7 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
 | Threat | Answer |
 |---|---|
 | Docker Desktop's VM on Windows adds overhead to I/O and memory | every system runs under the same VM; the manifest records its limits; claim runs repeat on Linux (office PC, Draco) |
-| The OS page cache makes a second load faster | cold numbers come from the first execution on a fresh store; dataset files are read once per repetition by every system alike |
+| The OS page cache makes a second load faster | interleave fresh-store repetitions; identify OS-cold numbers only when the recorded cache-control procedure was used |
 | A load timed around `docker run` includes the container's start (a few hundred ms on Docker Desktop), which dominates the smallest tiers | the manifest records a no-op container's start (`container_start_ms`); NRESE's own load phases are in its load log; small tiers are read as start-up plus load, and claims about load speed use tiers whose loads take seconds |
 | Peak memory from `docker stats` comes about once a second and can miss a short peak | it misses peaks for every system alike; memory claims use steps that last several seconds; the process runtime (Apptainer, host processes) reads the kernel's peak resident memory instead |
 | Freshly written datasets are scanned in the background while the first runs measure (batch 1 of 3 October: YAGO tiny's load 36% slower in the suite, 3% in an interleaved A/B) | datasets are frozen and kept (`benches/datasets.toml`), not prepared before each run; repetitions are interleaved |
