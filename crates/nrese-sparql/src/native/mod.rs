@@ -38,6 +38,9 @@ mod output;
 mod path_joins;
 mod paths;
 mod plan;
+mod preparation;
+pub(crate) use preparation::prepare_ql_query;
+use preparation::{ql_rewriting, semantic_pattern};
 mod pushdown;
 pub(crate) use pushdown::per_solution;
 pub(crate) mod ql;
@@ -254,29 +257,6 @@ type PlanParts = (
     Option<crate::ql::QlReport>,
 );
 
-/// What the QL rewriting does to `query` (`None` where it doesn't apply), without
-/// running it: the status that goes with its answers.
-pub(crate) fn ql_report(
-    snapshot: &Snapshot,
-    query: &Query,
-    options: &QueryOptions,
-) -> Result<Option<crate::ql::QlReport>, QueryEvaluationError> {
-    if ql_rewriting(query, options).is_none() {
-        return Ok(None);
-    }
-    // Only the steps before the rewriting, not the optimiser: this runs once more per
-    // query, ahead of its answers.
-    let (pattern, form) = pattern_and_form(query);
-    let rewritten;
-    let pattern = if triple_terms::has_open(pattern) {
-        rewritten = triple_terms::rewrite(pattern);
-        &rewritten
-    } else {
-        pattern
-    };
-    Ok(ql_stage(query, options, snapshot, pattern, &form).1)
-}
-
 /// A query's pattern and form.
 fn pattern_and_form(query: &Query) -> (&GraphPattern, Form<'_>) {
     match query {
@@ -287,66 +267,6 @@ fn pattern_and_form(query: &Query) -> (&GraphPattern, Form<'_>) {
         } => (pattern, Form::Construct(template)),
         Query::Describe { pattern, .. } => (pattern, Form::Describe),
     }
-}
-
-/// The QL rewriting of a query's pattern: the pattern rewritten (`None` if unchanged), and
-/// what it did (`None` where it doesn't apply). A schema with nothing to rewrite leaves the
-/// pattern unread.
-fn ql_stage(
-    query: &Query,
-    options: &QueryOptions,
-    snapshot: &Snapshot,
-    pattern: &GraphPattern,
-    form: &Form<'_>,
-) -> (Option<GraphPattern>, Option<crate::ql::QlReport>) {
-    let Some(ql) = ql_rewriting(query, options) else {
-        return (None, None);
-    };
-    let tbox = ql.tbox(snapshot, options.access.as_deref());
-    // What its `complete` refers to: the closure it rewrites over.
-    let regime = match ql.closure().lists {
-        true => crate::Regime::Owl2Rl,
-        false => crate::Regime::Owl2Ql,
-    };
-    if tbox.is_empty() {
-        let mut report = crate::ql::QlReport::default();
-        report.completeness.regime = Some(regime);
-        return (None, Some(report));
-    }
-    let (needed, set) = match form {
-        Form::Select => (None, false),
-        Form::Ask => (Some(Vec::new()), true),
-        Form::Construct(template) => {
-            let mut vars = Vec::new();
-            GraphPattern::Bgp {
-                patterns: template.to_vec(),
-            }
-            .on_in_scope_variable(|v| vars.push(v.clone()));
-            (Some(vars), true)
-        }
-        Form::Describe => (None, true),
-    };
-    // A witness the data already has wherever it folds adds nothing (design §3), asked of
-    // the data the query reads: for a reader of every graph (the cache is the store's).
-    let data = options.access.is_none().then(|| ql::DataCheck {
-        ql,
-        options: QueryOptions {
-            ql: None,
-            ..options.clone()
-        },
-    });
-    let (out, mut report) = ql::rewrite_query(
-        pattern,
-        &tbox,
-        snapshot,
-        ql.limits(),
-        needed,
-        set,
-        data.as_ref(),
-    );
-    report.completeness.regime = Some(regime);
-    let changed = report.patterns > 0;
-    (changed.then_some(out), Some(report))
 }
 
 pub use output::ResultsFormat;
@@ -530,49 +450,22 @@ fn native_pattern<'q>(
     options: &QueryOptions,
     ctx: &Context<'_>,
 ) -> Result<NativePattern<'q>, QueryEvaluationError> {
-    let (pattern, form) = pattern_and_form(query);
+    let (_, form) = pattern_and_form(query);
     let mut rewrites = Vec::new();
-    // SPARQL 1.2 triple-term patterns with variables, as plain algebra.
-    let rewritten;
-    let pattern = if triple_terms::has_open(pattern) {
-        rewritten = triple_terms::rewrite(pattern);
-        rewrites.push("triple-terms");
-        &rewritten
-    } else {
-        pattern
-    };
-    // OWL 2 QL answers through existentials, before the optimiser, also as written: it
-    // changes the answers, not just the plan.
-    let (ql_pattern, ql_report) = ql_stage(query, options, &ctx.snapshot, pattern, &form);
-    if let Some(report) = &ql_report {
-        if report.patterns > 0 {
-            rewrites.push("ql-tree-witness");
-        }
-        if !report.limits.is_empty() {
-            rewrites.push("ql-limit");
-        }
-    }
-    let rewritten_ql;
-    let pattern = match ql_pattern {
-        Some(out) => {
-            rewritten_ql = out;
-            &rewritten_ql
-        }
-        None => pattern,
-    };
+    let (pattern, ql_report) = semantic_pattern(&ctx.snapshot, query, options, &mut rewrites)?;
     let template_supported = match &form {
         Form::Construct(template) => template.iter().all(supported_template_triple),
         _ => true,
     };
-    if !supported(pattern) || !template_supported {
+    if !supported(&pattern) || !template_supported {
         return Err(QueryEvaluationError::Unsupported(
-            unsupported_part(pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
+            unsupported_part(&pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
         ));
     }
     let pattern = if options.as_written {
-        pattern.clone()
+        pattern.into_owned()
     } else {
-        optimise(pattern.clone(), &mut rewrites, ctx)
+        optimise(pattern.into_owned(), &mut rewrites, ctx)
     };
     // ASK needs one solution: LIMIT 1 lets the evaluation stop at it.
     let pattern = match form {
@@ -587,23 +480,6 @@ fn native_pattern<'q>(
         _ => pattern,
     };
     Ok((pattern, form, rewrites, ql_report))
-}
-
-/// The QL rewriting, if it applies to `query`: on, and the query reads the inferred
-/// statements of the default graph without a dataset or pre-bound variables, by a reader
-/// who sees inferences (docs/design/ql-rewriting.md §1).
-fn ql_rewriting<'o>(
-    query: &Query,
-    options: &'o QueryOptions,
-) -> Option<&'o crate::ql::QlRewriting> {
-    let ql = options.ql.as_deref()?;
-    (options.read_model == ReadModel::Materialised
-        && options.dataset.is_none()
-        && query_dataset(query).is_none()
-        // A reader who sees no inferences gets no answers through them.
-        && options.access.as_deref().is_none_or(|a| a.inferred)
-        && options.pre_bound.is_none())
-    .then_some(ql)
 }
 
 /// The rewrites the executor applies to a query's (or an update's) pattern, in order;

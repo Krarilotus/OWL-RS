@@ -23,6 +23,17 @@ known through a source read; *ours* = measured or tested here).
 
 ## 1. Where it sits
 
+- **One preparation per operation.** `prepare_ql_query` in `nrese-sparql` returns the
+  rewritten algebra and its report together, borrowing unchanged queries. The store
+  retains one snapshot and one options value for reporting, cache lookup and execution.
+  Preparation uses the executor's strict or canonical equality view. Whole-output keys
+  still use the original query and QL options; a miss runs the prepared query through
+  the existing serializers with further QL rewriting disabled. A hit does no planning
+  or evaluation. Collected responses retain the first report, including its actual probe
+  count, instead of preparing again on a potentially newer snapshot.
+  Request cancellation is checked before/after preparation and before cached bytes;
+  preparation errors propagate. These boundary checks do not make the schema scan or
+  every rewriting loop internally cancellable.
 - **On the algebra, before planning.** `nrese-sparql` rewrites each basic graph pattern
   of the query (`native/ql.rs`) before the optimiser's passes run, also under
   `as_written` (it changes the answers, not just the plan). EXPLAIN lists it as the rewrite

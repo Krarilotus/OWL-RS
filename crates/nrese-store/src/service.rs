@@ -467,18 +467,9 @@ impl StoreService {
         let mut payload = Vec::new();
         let mut completeness = None;
         let cancellation = CancellationToken::new();
-        self.run_query_reporting(&prepared, &cancellation, &mut payload, |status| {
+        let (_, ql) = self.run_reporting(&prepared, &cancellation, &mut payload, |status| {
             completeness = status
         })?;
-        let ql = match self.dl_mode(&prepared) {
-            Some(_) => None,
-            None => crate::query_executor::ql_status(
-                &self.read_snapshot(prepared.access()),
-                &prepared,
-                &self.settings,
-                &cancellation,
-            ),
-        };
         Ok(SerializedQueryResult {
             kind: prepared.kind(),
             media_type: prepared.media_type(),
@@ -629,7 +620,7 @@ impl StoreService {
         out: impl std::io::Write,
     ) -> StoreResult<Option<(nrese_sparql::Completeness, crate::dl::DlDetail)>> {
         let mut status = None;
-        let detail = self.run_reporting(prepared, cancellation, out, |s| status = s)?;
+        let (detail, _) = self.run_reporting(prepared, cancellation, out, |s| status = s)?;
         Ok(status.map(|s| (s, detail.unwrap_or_default())))
     }
 
@@ -639,75 +630,77 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
         report: impl FnOnce(Option<nrese_sparql::Completeness>),
-    ) -> StoreResult<Option<crate::dl::DlDetail>> {
+    ) -> StoreResult<(
+        Option<crate::dl::DlDetail>,
+        Option<nrese_sparql::ql::QlReport>,
+    )> {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         if let Some(mode) = self.dl_mode(prepared) {
             use crate::dl::query::{Outcome, Read};
             let dl = format!("owl2-dl {mode:?}");
-            return Ok(Some(
-                match crate::dl::query::answer(self, prepared, cancellation, mode)? {
-                    Outcome::Answers(answers, status, detail) => {
-                        report(Some(status));
-                        crate::query_executor::write_answers(prepared, answers, out)?;
-                        detail
-                    }
-                    // Streamed over the snapshot the status was decided on (L's view where
-                    // L adds memberships, kept per revision, whose identity is its own),
-                    // never a later revision's.
-                    Outcome::Stream(status, Read::Lower(snapshot) | Read::At(snapshot), detail) => {
-                        let context = format!("{dl} {status:?}");
-                        report(Some(status));
-                        run_query(
-                            &snapshot,
-                            prepared,
-                            &self.settings,
-                            cancellation,
-                            out,
-                            &context,
-                        )?;
-                        detail
-                    }
-                    // A status that holds whatever the revision (sound only).
-                    Outcome::Stream(status, Read::Latest, detail) => {
-                        let context = format!("{dl} {status:?}");
-                        report(Some(status));
-                        let snapshot = self.read_snapshot(prepared.access());
-                        run_query(
-                            &snapshot,
-                            prepared,
-                            &self.settings,
-                            cancellation,
-                            out,
-                            &context,
-                        )?;
-                        detail
-                    }
-                },
-            ));
+            let detail = match crate::dl::query::answer(self, prepared, cancellation, mode)? {
+                Outcome::Answers(answers, status, detail) => {
+                    report(Some(status));
+                    crate::query_executor::write_answers(prepared, answers, out)?;
+                    detail
+                }
+                // Streamed over the snapshot the status was decided on (L's view where
+                // L adds memberships, kept per revision, whose identity is its own),
+                // never a later revision's.
+                Outcome::Stream(status, Read::Lower(snapshot) | Read::At(snapshot), detail) => {
+                    let context = format!("{dl} {status:?}");
+                    run_query(
+                        &snapshot,
+                        prepared,
+                        &self.settings,
+                        cancellation,
+                        out,
+                        |_| {
+                            report(Some(status));
+                            context
+                        },
+                    )?;
+                    detail
+                }
+                // A status that holds whatever the revision (sound only).
+                Outcome::Stream(status, Read::Latest, detail) => {
+                    let context = format!("{dl} {status:?}");
+                    let snapshot = self.read_snapshot(prepared.access());
+                    run_query(
+                        &snapshot,
+                        prepared,
+                        &self.settings,
+                        cancellation,
+                        out,
+                        |_| {
+                            report(Some(status));
+                            context
+                        },
+                    )?;
+                    detail
+                }
+            };
+            return Ok((Some(detail), None));
         }
         let snapshot = self.read_snapshot(prepared.access());
-        let status = match crate::query_executor::ql_status(
-            &snapshot,
-            prepared,
-            &self.settings,
-            cancellation,
-        ) {
-            Some(ql) => Some(ql.completeness),
-            None => self.status_without_dl(prepared),
-        };
-        let context = format!("{status:?}");
-        report(status);
-        run_query(
+        let ql = run_query(
             &snapshot,
             prepared,
             &self.settings,
             cancellation,
             out,
-            &context,
+            |ql| {
+                let status = ql
+                    .map(|ql| ql.completeness.clone())
+                    .or_else(|| self.status_without_dl(prepared));
+                let context = format!("{status:?}");
+                report(status);
+                context
+            },
         )?;
-        Ok(None)
+        Ok((None, ql))
     }
 
     /// Outside `owl2-dl`, the status of answers that read a ruleset's closure (`None`
@@ -948,38 +941,43 @@ impl StoreService {
             .iter()
             .any(|op| !matches!(op, crate::StatementOp::Add { .. }));
         self.with_pending(pending, &scope, cancellation, |snapshot| {
-            let mut status = match in_dl {
-                true => {
-                    let mut status =
-                        nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
-                    status.incomplete(
+            run_query(
+                snapshot,
+                prepared,
+                &self.settings,
+                cancellation,
+                out,
+                |ql| {
+                    let mut status = match in_dl {
+                        true => {
+                            let mut status =
+                                nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
+                            status.incomplete(
                         "dl",
                         "a read inside a transaction: its pending operations aren't reasoned \
                          over before the commit (the committed closure, no DL bounds)"
                             .to_owned(),
                     );
-                    Some(status)
-                }
-                false => crate::query_executor::ql_status(
-                    snapshot,
-                    prepared,
-                    &self.settings,
-                    cancellation,
-                )
-                .map(|ql| ql.completeness)
-                .or_else(|| self.status_without_dl(prepared)),
-            };
-            if deletes && let Some(status) = &mut status {
-                status.unsound(
-                    "transaction",
-                    "the pending operations may delete statements whose inferences remain \
+                            Some(status)
+                        }
+                        false => ql
+                            .map(|ql| ql.completeness.clone())
+                            .or_else(|| self.status_without_dl(prepared)),
+                    };
+                    if deletes && let Some(status) = &mut status {
+                        status.unsound(
+                            "transaction",
+                            "the pending operations may delete statements whose inferences remain \
                      until the commit"
-                        .to_owned(),
-                );
-            }
-            // A transaction's pending state: never answered from the cache.
-            report(status);
-            run_query(snapshot, prepared, &self.settings, cancellation, out, "")
+                                .to_owned(),
+                        );
+                    }
+                    // A transaction's pending state: never answered from the cache.
+                    report(status);
+                    String::new()
+                },
+            )
+            .map(|_| ())
         })
     }
 

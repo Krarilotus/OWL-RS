@@ -289,7 +289,19 @@ pub fn ql_report<V: ReadView>(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<Option<crate::ql::QlReport>, QueryEvaluationError> {
-    crate::native::ql_report(&view.evaluation_snapshot(), query, options)
+    prepare_ql_query(view, query, options).map(|(_, report)| report)
+}
+
+/// Prepares the semantic QL rewriting once, before planning or evaluating. Execute the
+/// returned query on the same view with `options.ql = None`; retain the original query
+/// and options for whole-output cache keys. The report describes these prepared answers.
+/// Borrows unchanged queries; work is bounded by the configured QL rewriting limits.
+pub fn prepare_ql_query<'q, V: ReadView>(
+    view: &V,
+    query: &'q Query,
+    options: &QueryOptions,
+) -> Result<(Cow<'q, Query>, Option<crate::ql::QlReport>), QueryEvaluationError> {
+    crate::native::prepare_ql_query(&view.evaluation_snapshot(), query, options)
 }
 
 /// True if `query` would run on the native executor over a snapshot with default options.

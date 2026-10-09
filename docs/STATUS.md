@@ -14,7 +14,7 @@ checkout is unchanged. The bounded reuse work below is isolated and not merged t
 
 | Area | Current state on this branch | Remaining contract or evidence |
 |---|---|---|
-| QL cache identity | Done: TBox and realised-witness caches distinguish pending and masked views with `SnapshotIdentity`; failed probes are not cached | Report and execution still prepare separately; status preparation still suppresses errors |
+| QL preparation and cache identity | Done: one preparation and retained report on the execution snapshot; original query/options cache keys; snapshot-specific TBox/witness caches; preparation errors propagate | Full gate and deterministic preparation/cache/snapshot/equality guards pass; timing comparison with the previous reuse batch pending |
 | Nested query cancellation | Done: the request flag reaches consistency and exact-candidate checks, including context saturation | Bounds building and several compilation/scanning phases are not internally cancellable; task memory accounting for contexts is open |
 | Compact equality splits and hidden-class revival | Done: rebuilt closure participates in the pending transaction and gates; no post-commit inference repair | Rebuilds still scan the dataset under the writer lock; this restores atomicity, not the delta-cost target |
 | Execution and allocation reuse | Done: consuming projection moves retained buffers; common forward-search interval discovery; raw spilling frees batches without concatenation or an unused pool; ordered DISTINCT reuses any complete sort order | Deterministic work/allocation guards and final integrated tests pass; covered native query comparisons match results, while DL process peaks and concurrent-update tails remain unqualified |
@@ -26,8 +26,8 @@ Scope and decision checkpoints are in the
 No claim of a completed performance programme or an end-to-end resource envelope follows
 from these bounded changes. Existing v2 merge gates remain open until their evidence is recorded.
 
-Validation: 1,275 workspace tests passed on the final code with four test workers, following
-the milestone checks and a benchmark-discovered DISTINCT repair. One cancellation latency
+Validation: 1,280 workspace tests passed with four test workers after the QL preparation
+change; the full milestone gate passed. Earlier, one cancellation latency
 test failed during concurrent release compilation, then passed three isolated runs and
 the final workspace replay without changing its limit. Console dependencies and external
 conformance corpora were not installed in this worktree. The precise coverage, measurements
