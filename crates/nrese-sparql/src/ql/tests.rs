@@ -171,6 +171,50 @@ fn unchanged_schema_reuses_the_compiled_tbox_across_views_and_commits() {
 }
 
 #[test]
+fn introducing_owl_thing_without_changing_the_schema_matches_fresh_preparation() {
+    let engine = engine("");
+    let cached = options();
+    check(&engine.snapshot(), &cached, &["<http://example.org/ann>"]);
+    assert!(iri(&engine.snapshot(), OWL, "Thing").is_none());
+    let mut tx = engine.transaction();
+    tx.insert(
+        Quad::new(
+            NamedNode::new_unchecked(format!("{EX}note")),
+            NamedNode::new_unchecked(format!("{EX}mentions")),
+            NamedNode::new_unchecked(format!("{OWL}Thing")),
+            GraphName::DefaultGraph,
+        )
+        .as_ref(),
+    );
+    let query = SparqlParser::new()
+        .parse_query(&format!(
+            "SELECT ?x WHERE {{ ?x <{EX}worksFor> ?y . ?y a <{OWL}Thing> }}"
+        ))
+        .unwrap();
+    let answers = |snapshot: &Snapshot, options: &QueryOptions| {
+        let QueryResults::Solutions(rows) = evaluate_query(snapshot, &query, options).unwrap()
+        else {
+            panic!("solutions expected");
+        };
+        let mut rows: Vec<_> = rows
+            .map(|row| row.unwrap().get("x").unwrap().to_string())
+            .collect();
+        rows.sort();
+        rows
+    };
+    let pending = tx.pending_snapshot();
+    assert_eq!(
+        schema_statements(&engine.snapshot()),
+        schema_statements(&pending)
+    );
+    let expected = answers(&pending, &options());
+    assert_eq!(expected, ["<http://example.org/ann>"]);
+    assert_eq!(answers(&pending, &cached), expected);
+    tx.commit().unwrap();
+    assert_eq!(answers(&engine.snapshot(), &cached), expected);
+}
+
+#[test]
 fn supported_graph_readers_keep_separate_schema_entries() {
     let engine = engine("");
     let ql = QlRewriting::new(Closure { lists: true });

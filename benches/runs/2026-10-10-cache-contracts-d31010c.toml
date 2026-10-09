@@ -1,0 +1,41 @@
+date = "2026-10-10"
+finished_utc = "2026-10-09T23:05:16.077203+00:00"
+kind = "bounded cache-contract repair; QL component diagnostic"
+host = "Office-PC (sus-ai), Ryzen 9 5950X; Rust 1.98.1, native release"
+base = "d31010c95e721c835d02018be322ab2a479fbd1b"
+candidate = "base plus candidate-source.patch below; includes a disposable ignored unit probe"
+protocol = """
+Five process pairs in BC/CB/BC/CB/BC order, inside the existing quiet-slot guard.
+Existing QL fixture with 0/100/1000 additional independent subclass statements:
+4/104/1004 schema statements. Same-view: 100000 TBox hits per process/case.
+Changed-view: 500 alternations between a committed snapshot and a pending view
+with one ordinary data addition; every access refreshes the schema identity.
+The probe checks equal schema input and Arc identity of the reused compiled TBox.
+No end-to-end query, contention, cold OS-cache, tail-latency or competitor claim.
+Both binaries built sequentially in the existing Office checkout/target. Source
+patches and binary identities retained before replacement. No new worktree,
+target, dataset copy, local Rust compilation or permanent benchmark target.
+"""
+findings = [
+  "1004-statement refresh: baseline median 38.230 us [36.515, 41.520], candidate 30.426 us [27.854, 32.020], 20.4% less time; ranges do not overlap.",
+  "104-statement refresh: 8.704 -> 8.143 us; 4-statement refresh: 4.919 -> 5.056 us. Ranges overlap; no improvement or regression established in those cases.",
+  "Same-view medians remain about 7-8 ns, with overlapping ranges. Each aggregate is under 1 ms; these samples do not establish a speedup or general neutrality.",
+  "Exact schema identity retains 32 bytes per statement plus entry metadata: 128/3328/32128 payload bytes in these fixtures, per retained reader entry (existing maximum eight). No memory-neutrality claim.",
+  "Office reproduces the old QL wrong-answer cache hit after ordinary data introduces owl:Thing; fresh preparation returns ann while the old warm cache returns nothing. The repair passes the differential guard and existing view/access/rollback guards.",
+  "Both DL cache-policy tests fail against old production code for intended retry/stale-publication assertions and pass with the repair. An initial zero-timeout fixture was rejected by configuration; corrected positive-expired fixture and both logs are retained.",
+  "Focused validation: 6 QL unit tests, 2 DL cache-policy tests, 4 store classification integration tests. Broader correctness gates are required separately.",
+  "The temporary probe is removed after measurement. General cache overhead profiling, larger reuse changes and runtime performance acceptance remain open.",
+]
+baseline_source_patch_sha256 = "c47d2954fecb048470d664b6da0fc0e9fdf971f907ed9d51434b718407baabc5"
+candidate_source_patch_sha256 = "11ed96ffd09622f5ad402b81afd731a7ab6c5fe695eef1489ce2c0c7a1d727a4"
+baseline_binary_sha256 = "58a5e70880d5c850b89c242dc139d5e5366cd09fe9282cb3eb9f658fc4c61a7c"
+candidate_binary_sha256 = "e3f660c0aa9d5a7acc782c688b2b49a29b7a89601c761fce16d09af96e458580"
+measurements_sha256 = "94937e0479f9053835da36e91810117ea6c715035bb617f1f8df36935dd6cbc5"
+probe_sha256 = "64a99313269ba480afb8562ca064f613bd76ec3432a7b9535042e65c411615c0"
+artifacts = "/home/krarilotus/nrese-prep-20261009-4e8bd38/cache-contracts-d31010c/"
+results = "measurements.json, per-process logs, *-identity.json, *-source.patch, *-build.jsonl, binaries and archived runner/probe sources"
+commands = [
+  "office-cache-contracts-tests.sh: controlled old-code comparison followed by focused candidate tests; see office-cache-contracts-tests-v2.log and cache-contracts-dl-baseline-v2.log",
+  "office-cache-contracts-measure.sh: release builds, retained identities, probe removal, quiet-slot.sh python office-cache-contracts-measure.py",
+]
+publishable = "all"
