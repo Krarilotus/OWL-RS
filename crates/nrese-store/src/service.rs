@@ -466,18 +466,17 @@ impl StoreService {
         let prepared = self.prepare_query(request)?;
         let mut payload = Vec::new();
         let mut completeness = None;
-        self.run_query_reporting(
-            &prepared,
-            &CancellationToken::new(),
-            &mut payload,
-            |status| completeness = status,
-        )?;
+        let cancellation = CancellationToken::new();
+        self.run_query_reporting(&prepared, &cancellation, &mut payload, |status| {
+            completeness = status
+        })?;
         let ql = match self.dl_mode(&prepared) {
             Some(_) => None,
             None => crate::query_executor::ql_status(
                 &self.read_snapshot(prepared.access()),
                 &prepared,
                 &self.settings,
+                &cancellation,
             ),
         };
         Ok(SerializedQueryResult {
@@ -689,7 +688,12 @@ impl StoreService {
             ));
         }
         let snapshot = self.read_snapshot(prepared.access());
-        let status = match crate::query_executor::ql_status(&snapshot, prepared, &self.settings) {
+        let status = match crate::query_executor::ql_status(
+            &snapshot,
+            prepared,
+            &self.settings,
+            cancellation,
+        ) {
             Some(ql) => Some(ql.completeness),
             None => self.status_without_dl(prepared),
         };
@@ -956,9 +960,14 @@ impl StoreService {
                     );
                     Some(status)
                 }
-                false => crate::query_executor::ql_status(snapshot, prepared, &self.settings)
-                    .map(|ql| ql.completeness)
-                    .or_else(|| self.status_without_dl(prepared)),
+                false => crate::query_executor::ql_status(
+                    snapshot,
+                    prepared,
+                    &self.settings,
+                    cancellation,
+                )
+                .map(|ql| ql.completeness)
+                .or_else(|| self.status_without_dl(prepared)),
             };
             if deletes && let Some(status) = &mut status {
                 status.unsound(

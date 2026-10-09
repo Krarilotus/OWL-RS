@@ -441,7 +441,15 @@ pub(crate) fn ontology_at(store: &StoreService, snapshot: &Snapshot) -> Arc<Onto
 
 /// The data's consistency at `snapshot`'s revision: recorded by its commit, proved by U1,
 /// or checked now (once per revision).
-fn consistency_at(store: &StoreService, snapshot: &Snapshot, view: &View) -> Verdict {
+fn consistency_at(
+    store: &StoreService,
+    snapshot: &Snapshot,
+    view: &View,
+    cancellation: &CancellationToken,
+) -> Verdict {
+    if cancellation.is_cancelled() {
+        return Verdict::Unknown("cancelled".to_owned());
+    }
     if let Some(DlStatus {
         revision,
         consistency,
@@ -453,8 +461,13 @@ fn consistency_at(store: &StoreService, snapshot: &Snapshot, view: &View) -> Ver
     if view.proves_consistency {
         return Verdict::Consistent;
     }
+    let cancel = nrese_dl::tableau::Cancel::from_flag(cancellation.flag());
     let ontology = ontology_at(store, snapshot);
-    let checked = consistency::check(&ontology, &gate::budget(store, None));
+    let checked = consistency::check(&ontology, &gate::budget(store, Some(cancel)));
+    // Cancellation must not replace the revision's shared consistency status.
+    if cancellation.is_cancelled() {
+        return Verdict::Unknown("cancelled".to_owned());
+    }
     store.dl().record(DlStatus {
         revision: snapshot.revision(),
         consistency: checked.clone(),
@@ -573,7 +586,13 @@ pub(crate) fn answer(
     cancellation: &CancellationToken,
     mode: DlAnswers,
 ) -> StoreResult<Outcome> {
+    if cancellation.is_cancelled() {
+        return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
+    }
     let outcome = decide_answers(store, prepared, cancellation, mode)?;
+    if cancellation.is_cancelled() {
+        return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
+    }
     let status = match &outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => status,
     };
@@ -590,6 +609,10 @@ pub(crate) fn answer(
     }
     Ok(outcome)
 }
+
+#[cfg(test)]
+#[path = "query_tests.rs"]
+mod cancellation_tests;
 
 /// How a query is answered: over the lower bound as it streams (its status known before
 /// it runs), or with answers collected and completed through the bounds.
@@ -635,7 +658,11 @@ fn decide_answers(
     let (snapshot, view) = super::bounds::view(store);
     let analysis = analyse(prepared.query());
     let mut status = Status::complete();
-    match consistency_at(store, &snapshot, &view) {
+    let consistency = consistency_at(store, &snapshot, &view, cancellation);
+    if cancellation.is_cancelled() {
+        return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
+    }
+    match consistency {
         Verdict::Consistent => {}
         Verdict::Inconsistent => status
             .add("the data is inconsistent under OWL 2 DL, so it entails every answer".to_owned()),
@@ -930,6 +957,7 @@ fn decide(
     };
     let deadline = started + config.timeout;
     let ontology = &ontology;
+    let cancel = nrese_dl::tableau::Cancel::from_flag(cancellation.flag());
     let verdicts: Vec<Entailed> = tests
         .into_par_iter()
         .map(|tests| {
@@ -939,14 +967,17 @@ fn decide(
             };
             let mut answer = Entailed::Yes;
             for test in tests {
-                if cancellation.is_cancelled() || Instant::now() >= deadline {
+                if cancellation.is_cancelled() {
+                    return Entailed::Unknown("cancelled".to_owned());
+                }
+                if Instant::now() >= deadline {
                     return Entailed::Unknown("past dl.timeout".to_owned());
                 }
                 let budget = consistency::Budget {
                     timeout: deadline.saturating_duration_since(Instant::now()),
                     memory_bytes: config.memory_bytes / config.workers().max(1),
                     threads: 1,
-                    cancel: None,
+                    cancel: Some(cancel.clone()),
                     max_nodes: config.max_nodes,
                     max_branch_points: config.max_branch_points,
                 };

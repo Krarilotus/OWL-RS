@@ -17,6 +17,11 @@ use super::{Answer, Config, Outcome, consistency_of};
 pub struct Cancel(Arc<AtomicBool>);
 
 impl Cancel {
+    /// Shares a caller's cancellation flag without a polling thread.
+    pub fn from_flag(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
     pub fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
     }
