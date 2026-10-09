@@ -655,7 +655,7 @@ impl StoreService {
             let detail = match crate::dl::query::answer(self, prepared, cancellation, mode)? {
                 Outcome::Answers(answers, status, detail) => {
                     report(Some(status));
-                    crate::query_executor::write_answers(prepared, answers, out)?;
+                    crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
                     detail
                 }
                 // Streamed over the snapshot the status was decided on (L's view where

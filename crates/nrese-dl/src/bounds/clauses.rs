@@ -50,7 +50,7 @@ fn mentions(atom: &BodyAtom, var: Var) -> bool {
 type AtMost = (ObjProp, Filler, Slot);
 
 impl Compiler<'_> {
-    fn concept(&self, c: Concept) -> Term {
+    pub(super) fn concept(&self, c: Concept) -> Term {
         match c {
             Concept::Named(t) => t,
             Concept::Fresh(q) => self.program.names.fresh[q as usize],

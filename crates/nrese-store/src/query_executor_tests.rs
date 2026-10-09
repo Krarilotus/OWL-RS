@@ -4,6 +4,23 @@ use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_sparql::ql::{Closure, QlRewriting};
 use std::sync::Arc;
 
+struct CancellingWriter<'a> {
+    token: &'a CancellationToken,
+    bytes: Vec<u8>,
+}
+
+impl Write for CancellingWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        self.token.cancel();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn fixture() -> (Engine, PreparedQuery, StoreSettings) {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let data = "@prefix : <http://example.org/> .
@@ -150,6 +167,59 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
     )
     .unwrap();
     assert_eq!(first, second);
+    let token = CancellationToken::new();
+    let mut writer = CancellingWriter {
+        token: &token,
+        bytes: Vec::new(),
+    };
+    assert!(matches!(
+        run_query(&snapshot, &prepared, &settings, &token, &mut writer, |_| {
+            "same-context".to_owned()
+        }),
+        Err(StoreError::SparqlEvaluation(
+            QueryEvaluationError::Cancelled
+        ))
+    ));
+    assert_eq!(
+        writer.bytes, first,
+        "cached output was accepted by the writer"
+    );
+}
+
+#[test]
+fn generic_serialization_checks_empty_and_boolean_delivery_cancellation() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    for text in ["ASK {}", "SELECT ?x WHERE { VALUES ?x {} }"] {
+        for format in [
+            SolutionsResultFormat::Json,
+            SolutionsResultFormat::Xml,
+            SolutionsResultFormat::Tsv,
+            SolutionsResultFormat::Csv,
+        ] {
+            let mut prepared = PreparedQuery::parse(&SparqlQueryRequest::all(text)).unwrap();
+            prepared.solutions_format = format;
+            for before_output in [true, false] {
+                let answers =
+                    evaluate_query(&snapshot, &prepared.query, &QueryOptions::default()).unwrap();
+                let token = CancellationToken::new();
+                if before_output {
+                    token.cancel();
+                }
+                let mut writer = CancellingWriter {
+                    token: &token,
+                    bytes: Vec::new(),
+                };
+                assert!(matches!(
+                    serialize_answers(&prepared, answers, &mut writer, || check_cancelled(&token)),
+                    Err(StoreError::SparqlEvaluation(
+                        QueryEvaluationError::Cancelled
+                    ))
+                ));
+                assert_eq!(writer.bytes.is_empty(), before_output);
+            }
+        }
+    }
 }
 
 #[test]

@@ -910,10 +910,15 @@ def counter_changes(base: dict, new: dict) -> tuple[bool, list[str]]:
     grew, notes = False, []
     for path in sorted(set(base) & set(new)):
         b, n = base[path], new[path]
-        if len(set(b)) > 1 or len(set(n)) > 1:
+        if any(value != b[0] for value in b[1:]) or any(value != n[0] for value in n[1:]):
             continue
         before, after = b[0], n[0]
         if before == after:
+            continue
+        if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                   for value in (before, after)):
+            notes.append(f"{path}: {json.dumps(before, sort_keys=True)} -> "
+                         f"{json.dumps(after, sort_keys=True)} (metadata changed)")
             continue
         change = (after - before) / before if before else float("inf")
         mark = ""

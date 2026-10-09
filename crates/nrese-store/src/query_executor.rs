@@ -381,9 +381,7 @@ pub(crate) fn run_query(
     let mut options = query_options(prepared, store, cancellation);
     let (query, ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
     let context = report(ql.as_ref());
-    if cancellation.is_cancelled() {
-        return Err(QueryEvaluationError::Cancelled.into());
-    }
+    check_cancelled(cancellation)?;
     // A repeated query's answer as written before, in this format; else written, and its
     // bytes offered to the cache with the time writing them took (`nrese_sparql::cache`).
     let mut out = out;
@@ -395,10 +393,9 @@ pub(crate) fn run_query(
         &context,
     ) {
         CachedOutput::Hit(bytes) => {
-            if cancellation.is_cancelled() {
-                return Err(QueryEvaluationError::Cancelled.into());
-            }
+            check_cancelled(cancellation)?;
             out.write_all(&bytes)?;
+            check_cancelled(cancellation)?;
             return Ok(ql);
         }
         CachedOutput::Miss(slot) => Some(slot),
@@ -452,6 +449,13 @@ impl<W: Write> Write for Tee<W> {
     }
 }
 
+fn check_cancelled(cancellation: &CancellationToken) -> StoreResult<()> {
+    if cancellation.is_cancelled() {
+        return Err(QueryEvaluationError::Cancelled.into());
+    }
+    Ok(())
+}
+
 /// Evaluates `prepared` on `view` with `options` and writes its serialised results to
 /// `out` as they are produced.
 fn serialize(
@@ -462,12 +466,7 @@ fn serialize(
     cancellation: &CancellationToken,
     out: impl Write,
 ) -> StoreResult<()> {
-    let alive = || match cancellation.is_cancelled() {
-        true => Err(StoreError::SparqlEvaluation(
-            QueryEvaluationError::Cancelled,
-        )),
-        false => Ok(()),
-    };
+    let alive = || check_cancelled(cancellation);
     let mut out = out;
     let version = prepared.rdf12.then_some("1.2");
     let format = match prepared.solutions_format {
@@ -494,6 +493,7 @@ fn serialize_answers(
     out: impl Write,
     alive: impl Fn() -> StoreResult<()>,
 ) -> StoreResult<()> {
+    alive()?;
     let version = prepared.rdf12.then_some("1.2");
     match answers {
         QueryResults::Boolean(value) => {
@@ -506,6 +506,7 @@ fn serialize_answers(
                 alive()?;
                 writer.serialize(&solution?)?;
             }
+            alive()?;
             writer.finish()?;
         }
         QueryResults::Graph(triples) => {
@@ -518,10 +519,11 @@ fn serialize_answers(
                 alive()?;
                 writer.serialize_triple(&triple?)?;
             }
+            alive()?;
             writer.finish()?;
         }
     }
-    Ok(())
+    alive()
 }
 
 pub(crate) use nrese_sparql::TypedResults as Answers;
@@ -573,9 +575,12 @@ pub(crate) fn bound_budget(
 pub(crate) fn write_answers(
     prepared: &PreparedQuery,
     answers: Answers,
+    cancellation: &CancellationToken,
     out: impl Write,
 ) -> StoreResult<()> {
-    serialize_answers(prepared, answers.into_results(), out, || Ok(()))
+    serialize_answers(prepared, answers.into_results(), out, || {
+        check_cancelled(cancellation)
+    })
 }
 
 /// The results serializer of `prepared`'s format, announcing `version`.
