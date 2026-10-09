@@ -3,6 +3,7 @@
 
 mod build;
 mod ni;
+mod resources;
 mod sat;
 
 use build::Build;
