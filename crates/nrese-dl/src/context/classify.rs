@@ -89,6 +89,7 @@ pub fn signature(ontology: &Ontology) -> Vec<Term> {
 
 /// A saturated context structure, with what it was built for.
 pub struct Saturated {
+    _memory: super::memory::Charge,
     engine: Engine,
     classes: Vec<Term>,
     /// The query context of each named concept.
@@ -188,15 +189,25 @@ fn saturate_normalised_with_cancel(
         .with_budget(options.budget)
         .with_cancel(cancel)
         .with_prune_pred(options.prune_pred);
+    let mut input_memory = engine.memory_charge();
+    if input_memory.enabled() {
+        input_memory.set(abox.bytes());
+    }
     if engine.out_of_budget() {
         return Err(Unsupported::Budget);
     }
     let query: Vec<ContextId> = (0..named)
+        .take_while(|_| !engine.exhausted())
         .map(|c| engine.context_for(&[Atom::concept(c, CTerm::X)]).0)
         .collect();
+    if engine.out_of_budget() {
+        return Err(Unsupported::Budget);
+    }
     let (top, _) = engine.context_for(&[]);
     let mut seeds = query.clone();
     seeds.push(top);
+    let mut memory = engine.memory_charge();
+    memory.set(super::memory::vec(&query) + super::memory::vec(&seeds));
     engine.run(&seeds, options.threads);
     if engine.out_of_budget() {
         return Err(Unsupported::Budget);
@@ -222,7 +233,13 @@ fn saturate_normalised_with_cancel(
     }
     // The program's named concepts: the signature's classes and any the clauses add.
     let classes = engine.program.names.clone();
+    drop(seeds);
+    if !memory.set(super::memory::vec(&query) + super::memory::vec(&classes)) {
+        return Err(Unsupported::Budget);
+    }
+    profile.task_memory_peak = engine.task_memory_bytes().1;
     Ok(Saturated {
+        _memory: memory,
         engine,
         classes,
         query,
@@ -233,6 +250,11 @@ fn saturate_normalised_with_cancel(
 }
 
 impl Saturated {
+    /// Accounted task capacity and peak (zero when accounting was disabled).
+    pub fn task_memory_bytes(&self) -> (usize, usize) {
+        self.engine.task_memory_bytes()
+    }
+
     pub fn profile(&self) -> &Profile {
         &self.profile
     }

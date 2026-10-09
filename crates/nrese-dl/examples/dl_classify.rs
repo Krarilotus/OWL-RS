@@ -18,6 +18,7 @@
 //!   --max-join N          the most conclusions one context-core join may make
 //!   --max-join-steps N    the most steps one context-core Pred join may take
 //!   --max-memory-mb N     the most memory the process may hold while the context core runs
+//!   --task-memory-mib N   context saturation capacity budget; 0 disables accounting
 //!   --clauses             print the DL-clauses with more than one head atom, then stop
 //!   --no-context-core --no-inline --no-lower-bound --no-exact-shortcut --no-model-pruning
 //!   --no-skip-seen --no-tbox-only --no-detached-probes --no-reuse-model
@@ -230,6 +231,18 @@ fn args() -> Result<Args, String> {
             }
             "--max-memory-mb" => {
                 a.options.max_memory = Some(number("--max-memory-mb")? << 20);
+            }
+            "--task-memory-mib" => {
+                let mib = usize::try_from(number("--task-memory-mib")?)
+                    .map_err(|_| "memory budget overflow")?;
+                a.options.task_memory = if mib == 0 {
+                    None
+                } else {
+                    Some(
+                        mib.checked_mul(1024 * 1024)
+                            .ok_or("memory budget overflow")?,
+                    )
+                };
             }
             "--expand-at-most" => {
                 let n = number("--expand-at-most")? as u32;

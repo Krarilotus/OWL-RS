@@ -735,12 +735,27 @@ thread. A cancelled query does not publish a replacement consistency status for 
 revision. Checks occur at existing budget boundaries, so bounds construction, schema
 reading, normalisation and compilation are not all internally interruptible.
 
-The context core's `Budget::max_memory` measures the **whole process**. The consistency
-budget's `memory_bytes` limits the tableau's **task structures**. Passing a per-worker
-task allowance to the process monitor would reject work based on unrelated resident data;
-the consistency adapter deliberately does not do that. Per-task context accounting and
-an end-to-end query memory envelope remain open. Neither cancellation propagation nor
-the current tableau budget establishes that stronger contract.
+The context core's `Budget::max_memory` measures the **whole process** and remains a
+separate opt-in guard. `Budget::task_memory` accounts saturation-owned capacity: compiled
+program, context arena and registry, clauses and indexes, queued payloads, assertion state
+and worker buffers. Owners retain their reservations when moved and release them on drop;
+incremental capacity totals avoid rescanning all contexts at each checkpoint. Hash-table
+backing capacity and assertion B-tree nodes are estimated, not allocator telemetry.
+
+`dl.memory` configures context saturation and the tableau's existing capacity checks.
+Zero means unlimited; the standalone context API defaults to no accounting. Classification
+uses this configured value rather than its standalone driver's fixed tableau default,
+dividing the tableau allowance among configured workers. Checks happen at growth/work
+boundaries, so in-flight work can temporarily exceed a budget. Exhaustion yields an
+incomplete/budget outcome, never a classification inferred from truncated work. There is
+no allocation-by-allocation ceiling.
+
+Normalisation and compilation temporaries, input snapshots, result/proof assembly,
+allocator metadata and scheduler stacks are outside context accounting. Retained lower
+bounds and concurrent exact-candidate work still need a shared admission/envelope owner;
+these per-engine budgets do not establish an end-to-end query or process ceiling. The
+context profile's `task_memory_peak` reports successfully reserved saturation capacity,
+not RSS or unreserved overshoot, and is zero when accounting is disabled.
 
 | Setting | Values | Default |
 |---|---|---|

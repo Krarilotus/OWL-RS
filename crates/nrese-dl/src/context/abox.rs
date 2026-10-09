@@ -37,6 +37,14 @@ pub struct Abox {
     pub clash: bool,
 }
 
+impl Abox {
+    pub(super) fn bytes(&self) -> usize {
+        super::memory::nested(&self.types)
+            + super::memory::vec(&self.edges)
+            + super::memory::table::<u32, ConceptId>(self.existential.capacity())
+    }
+}
+
 impl Compiler {
     /// The assertions over individuals, `SameIndividual` merged: their concepts, the edges
     /// between them, and, for each DL-clause that a named edge can fire and whose head is
@@ -143,6 +151,8 @@ impl Compiler {
 
 /// The individuals' contexts and what is known of them, to a fixpoint.
 pub struct Individuals {
+    memory: super::memory::Charge,
+    type_count: usize,
     types: Vec<BTreeSet<ConceptId>>,
     edges: HashSet<(RoleId, u32, u32)>,
     pub contexts: Vec<ContextId>,
@@ -150,10 +160,29 @@ pub struct Individuals {
 }
 
 impl Individuals {
+    fn check_memory(&mut self) -> bool {
+        // BTreeSet does not expose node capacity. 64 bytes per entry accounts for
+        // sparse nodes conservatively; this is an estimate, not allocator telemetry.
+        self.memory.set(
+            super::memory::vec(&self.types)
+                + self.type_count * 64
+                + super::memory::table::<(RoleId, u32, u32), ()>(self.edges.capacity())
+                + super::memory::vec(&self.contexts),
+        )
+    }
+
+    fn insert_type(&mut self, at: usize, concept: ConceptId) -> bool {
+        let new = self.types[at].insert(concept);
+        self.type_count += usize::from(new);
+        new
+    }
+
     /// Saturates the individuals' contexts on `engine` and evaluates the clauses on the
     /// edges until nothing changes.
     pub fn saturate(engine: &Engine, abox: &Abox, threads: usize) -> Self {
         let mut me = Self {
+            memory: engine.memory_charge(),
+            type_count: abox.types.iter().map(Vec::len).sum(),
             types: abox
                 .types
                 .iter()
@@ -163,24 +192,36 @@ impl Individuals {
             contexts: Vec::new(),
             consistent: !abox.clash,
         };
-        if abox.clash {
+        if abox.clash || !me.check_memory() {
             return me;
         }
         loop {
+            if engine.out_of_budget() {
+                return me;
+            }
             let mut seeds = Vec::new();
             me.contexts = me
                 .types
                 .iter()
-                .map(|types| {
+                .take_while(|_| !engine.exhausted())
+                .map_while(|types| {
                     let core: Vec<Atom> =
                         types.iter().map(|&c| Atom::concept(c, CTerm::X)).collect();
+                    let mut memory = engine.memory_charge();
+                    if !memory.set(super::memory::vec(&core)) {
+                        return None;
+                    }
                     let (id, created) = engine.context_for(&core);
                     if created {
                         seeds.push(id);
                     }
-                    id
+                    Some(id)
                 })
                 .collect();
+            let mut memory = engine.memory_charge();
+            if !memory.set(super::memory::vec(&seeds)) || !me.check_memory() {
+                return me;
+            }
             engine.run(&seeds, threads);
             let mut changed = false;
             for (a, &context) in me.contexts.iter().enumerate() {
@@ -190,7 +231,9 @@ impl Individuals {
                     return me;
                 }
                 for s in state.clauses.subsumers() {
-                    changed |= me.types[a].insert(s);
+                    let inserted = me.types[a].insert(s);
+                    me.type_count += usize::from(inserted);
+                    changed |= inserted;
                 }
                 for r in state.clauses.self_loops() {
                     changed |= me.edges.insert((r, a as u32, a as u32));
@@ -202,6 +245,9 @@ impl Individuals {
                     return me;
                 }
                 Some(more) => changed |= more,
+            }
+            if !me.check_memory() {
+                return me;
             }
             if !changed {
                 return me;
@@ -215,12 +261,19 @@ impl Individuals {
         let program = &engine.program;
         let mut changed = false;
         let mut todo: Vec<(RoleId, u32, u32)> = self.edges.iter().copied().collect();
+        let mut memory = engine.memory_charge();
         while let Some((r, a, b)) = todo.pop() {
+            if !memory.set(super::memory::vec(&todo))
+                || !self.check_memory()
+                || engine.out_of_budget()
+            {
+                return Some(changed);
+            }
             let slots = program.by_out[r as usize]
                 .iter()
                 .map(|&s| (s, a, b))
                 .chain(program.by_in[r as usize].iter().map(|&s| (s, b, a)));
-            for (slot, x, z) in slots.collect::<Vec<_>>() {
+            for (slot, x, z) in slots {
                 let (clause, pos) = (slot.clause, slot.pos);
                 let dl = &program.clauses[clause as usize];
                 // The slot binds the neighbour: S(x, z) from x's side, S(z, x) from z's.
@@ -239,12 +292,12 @@ impl Individuals {
                     TermPat::Var(Var::Z(_)) => (z, z),
                     TermPat::Func(_) => {
                         let e = abox.existential[&clause];
-                        changed |= self.types[x as usize].insert(e);
+                        changed |= self.insert_type(x as usize, e);
                         continue;
                     }
                 };
                 match h.kind {
-                    KindPat::Concept => changed |= self.types[at as usize].insert(h.pred),
+                    KindPat::Concept => changed |= self.insert_type(at as usize, h.pred),
                     KindPat::Out | KindPat::In => {
                         // S(x, v) or S(v, x) with v the head's term.
                         let edge = match (h.kind, at == x) {

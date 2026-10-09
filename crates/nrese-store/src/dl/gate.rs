@@ -62,7 +62,7 @@ pub(crate) fn budget(store: &StoreService, cancel: Option<Cancel>) -> Budget {
     let dl = &store.config().dl;
     Budget {
         timeout: dl.timeout,
-        memory_bytes: dl.memory_bytes,
+        memory_bytes: dl.memory_per_worker(1),
         threads: dl.workers(),
         cancel,
         max_nodes: dl.max_nodes,

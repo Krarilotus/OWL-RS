@@ -9,12 +9,19 @@ use super::support::{Build, Table, holds};
 
 /// Classifies with the Eq rule on.
 fn classify(o: &Ontology, threads: usize) -> Result<Classification, Unsupported> {
-    let options = Options {
+    let mut options = Options {
         threads,
         equality: true,
         ..Options::default()
     };
-    context::classify(o, &options).map(|(c, _)| c)
+    let unlimited = context::classify(o, &options).map(|(c, _)| c);
+    options.budget.task_memory = Some(64 * 1024 * 1024);
+    let budgeted = context::classify(o, &options).map(|(c, _)| c);
+    assert_eq!(
+        budgeted, unlimited,
+        "accounting must preserve equality reasoning"
+    );
+    budgeted
 }
 
 /// `A ⊑ ∃r.B ⊓ ∃r.C`, `∃r.(B ⊓ C) ⊑ E`: `A ⊑ E` only where `r` is functional (the two
