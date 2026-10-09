@@ -1,0 +1,87 @@
+# Proposed hand-written run record (benches/runs/README.md); outcomes, not timings.
+# Native variants of six fast cases do not certify the complete Docker campaign.
+# Limited HTTP write checks use diagnostic tiers to avoid semantic coverage credit.
+id = "2026-10-09-phuoc-partial-77478d1"
+kit = "suite"
+purpose = "Completed partial Phuoc qualification: selected existing native CLI, client/cache, suite and supplemental cases. Not Office campaign completion, competitor coverage, or qualification of later repairs."
+baseline = "4e8bd38e0733055c06d77f9fdd7cd36c6d89bd7c; historical whole-programme baseline 0f46563 is not replaced"
+findings = [
+  "Runtime acceptance BLOCKED: default-worker lookup throughput falls reproducibly at every client width and cache-on replay is slower. Horn memory interpretation is corrected below; no full-classification peak regression is established by the old final readings. No causality or production default change is inferred.",
+  "222 final execution records: 96 paired CLI, 18 client/cache, 84 supplemental, 24 native-suite cycles; all exit zero, no final timeout/OOM/error excluded. Superseded paired-cli is retained but excluded; final CLI evidence is paired-cli-final.",
+  "Six of 95 fast cases have native CLI coverage with documented variants, not a full Docker fast run. Four suite selections ran, not all 24 workloads. Coverage manifest: six completed/89 blocked fast rows, four completed/43 blocked suite tiers, 19 blocked systems/variants and 13 completed supplemental rows. No competitor ran.",
+  "Retained lookup/cache bags match; concurrent read bags were not retained. RL exports agree after recomputation, while maintained closure validation is size-only. Plain inference readers are empty. Store Horn checks consistency/subsumption count/engine, not taxonomy content. Write-scaling checks HTTP success of COUNT, not the numeric answer. Unordered LIMIT subsets have no general stability guarantee.",
+  "Exact-gap N=8/64/65/512 at widths 1/4 matches explicit proof/refutation bags, complete/sound, unresolved zero, exact-ground-entailment route. N512 improves at both widths but does not override service regressions. Supplemental gaps are not registered fast cases. No queued cancellation was injected.",
+  "MEMORY CORRECTION: the original report's Horn process-peak interpretation is withdrawn. Phase::start writes clear_refs=5 after classification even without queries, affecting both final JSON VmHWM and final GNU-time observations. These are late-phase high-water readings, not lifetime classification peaks or task reservations. Completed separate diagnostics find overlapping historical pre-reset peaks and similar sampled maxima in one default pair; the smaller THP-disabled difference changes sign, while late residency differs. No default peak-regression ratio, cause or instrumented speed claim follows. Original archive unchanged. Five other Horn entries lack checks/routes and taxonomy references; no extra coverage or taxonomy oracle follows.",
+  "Final verification matched all 1062 recorded input/binary hashes and found no active benchmark processes/units. Office separately resumed at 16:48:32 UTC; at 16:53:20 UTC it had completed 15 cases/90 invocations, with the full campaign unfinished. The later a6331c7 repair passed its normal Office commit/push gates and pushed at 16:46:12 UTC; this measurement record does not qualify those later source changes or missing external conformance corpora.",
+]
+started = "2026-10-09T15:58:55Z"
+finished = "before 2026-10-09T16:21:06Z audit (completion bound, not exact final invocation timestamp)"
+host = "Phuoc-Yu; same-host baseline/candidate only"
+machine = "Ryzen 7 7800X3D, 8 cores/16 threads, 29.6 GiB RAM, native Linux/glibc 2.43; powersave governor unchanged. Office-built binaries transferred after hash, ISA and library checks."
+commit = "candidate 77478d195cb073b263b1eac8661034a09bfbbf20; baseline 4e8bd38e0733055c06d77f9fdd7cd36c6d89bd7c; measured candidate production code equals 881119de4ad2f53e103013dd4700ac9e4d05b169, not later a6331c7 repairs"
+dirty = "Identity-verified frozen build binaries; no Phuoc production edits or rebuilds. See build/transfer manifests for source and all 18 binary hashes."
+protocol = """
+Three outer pairs AB/BA/AB, registered inner repetitions retained; not a ten-repeat
+published campaign. Fixed existing quiet guard, NRESE_QUIET_DRAIN_S=0, sequential
+batches, no same-host compiler or timing CPU quota, swap disabled. Defaults for
+DLmode/Horn/clients/cache/native HTTP. Churn and supplemental plain/replay use
+CPUs 0-3 and threads=4 where supported; gaps match CPU0/threads1 or CPUs0-3/threads4.
+Baseline --threads alone does not constrain StoreRuntime. Caps: DLmode 4 GiB;
+Horn/churn/registered clients+cache 6 GiB; native/supplemental 8 GiB.
+
+Clients use social300000, four lookup queries, widths 1/2/4/8/16/32/64, duration-s=4,
+runs=3. Cache log has 1000 entries, seed7, warmup0/runs1, cache0 or 256 MiB.
+Untimed --results checks affect cache-on counters; cache-off omits cache counters.
+No OS-cold claim. DLmode has six inner repetitions, store Horn five. Native suite
+uses runtime=process, skip-build, fixed candidate HARNESS for both servers, query
+timeout300; manifests label the driver while build-source.txt labels the server.
+Exact timeout/limit evidence is in launch commands and live controls, not unloaded
+systemd unit defaults. The native query comparison's unchanged 2 ms minimum can
+leave tiny-query deltas unflagged; it does not negate client throughput losses.
+
+Both expanded binaries were built on Office with identical commands/flags:
+rustc1.98.1/LLVM22.1.8, native Zen3 target, fat LTO, one CGU; matched allocators.
+Each record retains command, revision, binary identity and result path. Native
+manifest timestamps use UTC+2; launched.utc uses UTC. Batch completion bounds and
+hash verification are in final-report.txt/final-verification.json.
+"""
+commands = [
+  "Archived paired-cli-final-commands.sh: existing perf_lab, cases dlmode-lubm1, commits-readers, rl-no-readers, writes-r0/r8/r32, classify-store-horn; per-record command.txt contains exact argv.",
+  "Archived native-suite-commands.sh: existing suite.py --runtime process --skip-build, NRESE_BIN per revision and fixed HARNESS; LUBM1, OWL2BenchRL1, write-scaling1m/10m.",
+  "Archived registered-concurrency-commands.sh: perf_lab clients-sweep and cache-off/cache-on; supplemental-existing-wrapper.py reuses benchmark-initial-c888a20.py with final binaries and matched controls. Exact argv and UTC are retained per invocation; these are provenance pointers, not reconstructed shell commands.",
+]
+results = '''
+Local root: C:\Users\Johannes\Documents\OWL-RS-wt\implementation-process-memory\tmp\phuoc-qualification
+Raw archive: C:\Users\Johannes\Documents\OWL-RS-wt\implementation-process-memory\tmp\phuoc-qualification\qualification-evidence.tar.gz
+14627035 bytes; SHA256 86ee18f44ef53b9e92c5e23df15792f95113a546200ad38d063b96b982024c62
+Remote root: /home/krarilotus/nrese-prep-20261009-4e8bd38/phuoc-qualification/
+Archive evidence-manifest.json lists 17045 files with sizes/hashes/inclusion; large .nt inputs and final exports remain remote, hashed rather than duplicated.
+Separate delivered addenda (not assumed inside the archive):
+final-report.txt SHA256 39dc06e97c8a0c64f5d8c372ec001e5624ce2dfc2963f25ba0de8f69f9f9a3d4
+coverage-summary.json SHA256 25d045719704ccb1a3769e85752d83cb75a0605cbc20142c3e9f09ae315aafbf
+final-verification.json SHA256 ebdb29b9e448ca104a90b0461ff206370942ac38493f34e682bdb93c06577109
+SHA256SUMS-local.txt SHA256 17f18d60b84d96dd9ddf1c84b1e46ff7d70bd40fb4cb875a92621f5bec7c5390
+perf_lab baseline SHA256 cb9df2d14ddc6b3e01df6b4bc0475521282d0ff4da95fd71cf7de8a81aa55e77
+perf_lab candidate SHA256 047d9eaec886e71c170edc3874be3a33ca1df90187d8462654d85cdfe9511a1b
+Fixed HARNESS SHA256 6d0f692f6af0f77782986c9906f4eba5f7a41404f5ddf4a9803db3ab5e4daa64
+Read cli-analysis.json, concurrency-analysis.json, supplemental-analysis.json, summary.json and compare-*.txt with their stated oracle limits.
+Material interpretation correction delivered separately: horn-memory-diagnostic/report.txt under the same local/remote root.
+Correction report SHA256 207b54ce6ca16c0ef6013c7ae253a59ecc815e7ce29a5cdb42976858eb17d305
+Its eight instrumented diagnostic runs are separate from the 222 qualification records and must not be pooled into their performance results.
+'''
+publishable = "all"
+
+# ok = completed exposed checks, never performance acceptance. runs counts processes.
+# Only the completed LUBM1/OWL2BenchRL1 suite selections use standard tier names.
+pairs = [
+  { workload = "lubm", tier = "1", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, items = "14/14 queries; both cache modes", note = "Native before/after suite; no independent competitor oracle" },
+  { workload = "owl2bench", tier = "rl-1", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, items = "22/22 queries; both cache modes", note = "Native before/after suite; no independent competitor oracle" },
+  { workload = "write-scaling", tier = "diagnostic-http-1m", system = "nrese", regime = "none", outcome = "ok", runs = 6, note = "Limited HTTP success only; numeric COUNT not checked, no standard semantic tier credit" },
+  { workload = "write-scaling", tier = "diagnostic-http-10m", system = "nrese", regime = "none", outcome = "ok", runs = 6, note = "Limited HTTP success only; numeric COUNT not checked, no standard semantic tier credit" },
+  { workload = "fast", tier = "native-cli-dlmode-lubm1", system = "nrese", regime = "owl2-dl", outcome = "ok", runs = 36, note = "Registered counts/completeness/routes; native variant, not full fast campaign" },
+  { workload = "fast", tier = "native-cli-commits-readers", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, note = "Eight readers; incremental route/counts; maintained closure size-only; zero-reader diagnostic excluded from this row" },
+  { workload = "fast", tier = "native-cli-writes-under-readers", system = "nrese", regime = "none", outcome = "ok", runs = 18, note = "All 0/8/32 levels; inference reader answers empty, not equivalent to RL reader work" },
+  { workload = "fast", tier = "native-cli-classify-store-horn", system = "nrese", regime = "dl", outcome = "ok", runs = 30, note = "3000 classes; consistent, 1161634 subsumptions, context-core route; no full taxonomy oracle" },
+  { workload = "fast", tier = "native-cli-clients-sweep", system = "nrese", regime = "none", outcome = "ok", runs = 6, note = "Retained lookup bags match; concurrent bags not retained; throughput regression blocks acceptance" },
+  { workload = "fast", tier = "native-cli-cache-replay", system = "nrese", regime = "none", outcome = "ok", runs = 12, note = "All 1000 retained bags match across revisions/modes/pairs; cache-on regression retained" },
+]

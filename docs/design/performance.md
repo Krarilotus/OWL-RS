@@ -243,8 +243,11 @@ metadata lacked `regex-syntax 0.8.11` and `libfuzzer-sys`. Seed 18273 was reprod
 on candidate and baseline with identical 300-case tallies and the case-217 U1 model
 assertion at `crates/nrese-dl/tests/bounds/fuzz.rs:350`. This establishes a pre-existing
 failure relative to this baseline, not a correct result or permission to waive the gate.
-Small bounds/gap/cancellation repairs are in preparation and remain unvalidated here.
-The earlier `583c422` milestone pass does not supersede this failure.
+The repaired `a6331c7` passes all three focused seeds and the normal Office commit/push
+hooks: format, lint, regular tests, new seeds 93060–93062, locks and 22 suite contracts.
+The branch push completed at 16:46:12 UTC. This supersedes the failed gate, not the
+performance blockers. Missing external corpora caused conformance wrappers to return
+early; corpus-backed qualification remains pending despite the hook pass.
 
 Source evidence is retained in
 `implementation-process-memory/tmp/phuoc-qualification/`: `cli-analysis.json`,
@@ -252,11 +255,49 @@ Source evidence is retained in
 the recorded launch commands and binary-transfer manifests. The superseded `paired-cli`
 batch is excluded; completed CLI evidence uses `paired-cli-final`. Gate evidence is in
 `implementation-benchmark-hosts/tmp/remote-gate-failure-report.txt` and its named logs.
-The raw archive/hash handoff is still pending; no standard run record is issued from
-analysis summaries alone. Office's frozen `77478d1` fast campaign is still running.
-These selected native cases neither complete that campaign nor provide competitor or
-whole-programme qualification. Next: preserve raw provenance, resolve the gate failures,
-validate repairs, and investigate the runtime regression before acceptance.
+The completed handoff now contains 222 records (96 CLI, 18 client/cache, 84 supplemental,
+24 native-suite), all exit zero; no final timeout/OOM/error was excluded. The stopped
+superseded batch remains excluded. Only six of 95 fast cases and four selections from
+24 broader workloads were exercised; no competitor ran. Office's frozen `77478d1`
+campaign resumed at 16:48:32 UTC; at 16:53:20 UTC it had completed
+15 cases / 90 invocations. The full campaign remains unfinished.
+These selected native cases neither complete that campaign nor qualify later repairs.
+
+Correction: the prior Horn "process peak" label is withdrawn. GNU-time medians over
+15 runs/side, 337.46 -> 2,021.85 MiB, and internal median-of-pair-medians 488 -> 2,217 MiB
+are reset-affected late-phase high-water readings, not lifetime classification peaks.
+`Phase::start` writes `clear_refs=5` again after classification, even without queries
+(`perf_lab/main.rs:155,1255`). These readings do not demonstrate a full-classification
+peak regression or measure task reservations. The completed diagnostic reaggregates original
+pre-reset peaks: pair-median aggregation 3,268 -> 3,236 MiB, with closely overlapping ranges.
+One default external trace pair samples 3,184.07 -> 3,179.45 MiB, not a significance claim.
+Three instrumented THP-disabled pairs have a smaller sampled peak difference that changes
+sign in the third pair, while late-phase residency remains substantially different. These
+diagnostics establish neither a default peak-regression ratio nor the cause of retention;
+instrumented times are not speed evidence. See `horn-memory-diagnostic/report.txt` alongside
+the qualification artifacts. Its correction leaves the original archive unchanged.
+
+Supplemental exact-gap N512 improves from 352.350 -> 283.676 ms at one matched CPU
+(19.5%) and 93.076 -> 80.664 ms at four (13.3%): sums of prove/refute query medians,
+three outer pairs. All N=8/64/65/512 and widths 1/4 match explicit proof/refutation bags,
+complete/sound with zero unresolved and the exact-ground-entailment route. These are
+supplemental tests, not registered fast cases; the wins do not offset lookup throughput
+losses of 66.5-80.5% or cache-on +26.7%; Horn peak interpretation is corrected above.
+
+The source review also confirms empty check/route tables and no configured taxonomy
+reference for `horn-classify` and `ctx-ore-{9724,2738,9835,7914}`. Executing these five
+entries or recording hashes does not establish correct taxonomy content; they are not
+additional Phuoc coverage. Counts/engine assertions for store Horn remain weaker than
+full taxonomy equality. No queued cancellation was injected in the Phuoc measurements.
+
+[Completed partial run record](../../benches/runs/2026-10-09-phuoc-partial-77478d1.toml):
+`implementation-process-memory/tmp/phuoc-qualification/qualification-evidence.tar.gz`,
+14,627,035 bytes, SHA256
+`86ee18f44ef53b9e92c5e23df15792f95113a546200ad38d063b96b982024c62`.
+Final verification matched 1,062 recorded input/binary hashes. The archive's manifest
+identifies included files and hashed remote-only bulk inputs/exports; final-report,
+coverage additions and the final OWL2Bench hash are separate delivered addenda. Root
+must confirm the full gate and repair results and investigate performance before acceptance.
 
 ### 9 October: shared-runtime candidate fails the initial throughput check
 
