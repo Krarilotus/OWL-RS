@@ -11,6 +11,8 @@
 //!   a commit, by `nrese_dl::classify` (the context core where its Horn stage takes the
 //!   TBox, so EL and Horn TBoxes cost a saturation; else the hypertableau driver) within
 //!   `dl.timeout`; an incomplete one still gives only entailed subsumptions.
+//!   It uses the same store-owned classification options and process-memory watch policy
+//!   as an explicit classification request.
 //! - **The memberships** are computed per revision from L's (one scan of each subclass's
 //!   members) and kept in the read view, beside the engine's stacks, as U1's facts are.
 
@@ -36,8 +38,7 @@ pub(crate) fn tbox_taxonomy(store: &StoreService, ontology: &Ontology) -> Taxono
             tbox.sources.push(sources.clone());
         }
     }
-    let dl = &store.config().dl;
-    classify::classify(&tbox, &dl.classification_options())
+    classify::classify(&tbox, &super::classification::options(store))
 }
 
 /// The memberships `taxonomy` adds to `snapshot`'s: `(a rdf:type D)` for each member `a`
