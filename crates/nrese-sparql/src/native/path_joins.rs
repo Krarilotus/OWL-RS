@@ -24,7 +24,11 @@ use super::{
     Context, NativeResult, PathPattern, Solutions, as_path, contains_any_exists,
     expression_variables, plan, pushdown, ranges, search, triple_variables, variable_index,
 };
+use crate::plan::Plan as LogicalPlan;
 use crate::query::PlannedStep;
+
+#[cfg(test)]
+mod tests;
 
 /// A join of basic graph patterns (with filters on their own variables) and property
 /// paths, at least one path and one other part.
@@ -52,6 +56,25 @@ impl<'q> PathJoin<'q> {
         if !join.add(pattern) || join.paths.is_empty() {
             return None;
         }
+        join.finish()
+    }
+
+    /// Reads the logical join directly for EXPLAIN and eager-aggregation costing.
+    /// The algebra entry remains for execution until those callers consume plan nodes.
+    pub(super) fn of_plan(plan: &'q LogicalPlan) -> Option<Self> {
+        let mut join = Self {
+            triples: Vec::new(),
+            paths: Vec::new(),
+            conjuncts: Vec::new(),
+        };
+        if !join.add_plan(plan) || join.paths.is_empty() {
+            return None;
+        }
+        join.finish()
+    }
+
+    fn finish(self) -> Option<Self> {
+        let join = self;
         if join.triples.len() + join.paths.len() < 2 {
             return None;
         }
@@ -77,26 +100,97 @@ impl<'q> PathJoin<'q> {
                 let GraphPattern::Bgp { patterns } = &**inner else {
                     return false;
                 };
-                // A conjunct may move only if it reads the pattern's own variables: inside
-                // the group another one is unbound, which a later part would change.
-                let own: Vec<Variable> = patterns.iter().flat_map(triple_variables).collect();
-                let mut conjuncts = Vec::new();
-                pushdown::conjuncts_of(expr, &mut conjuncts);
-                let movable = !contains_any_exists(expr)
-                    && conjuncts.iter().all(|c| {
-                        pushdown::movable(c)
-                            && expression_variables(c).iter().all(|v| own.contains(v))
-                    });
-                if !movable {
-                    return false;
-                }
-                self.triples.extend(patterns.iter().cloned());
-                self.conjuncts.extend(conjuncts);
-                true
+                self.add_filtered(patterns.iter(), expr)
             }
             GraphPattern::Join { left, right } => self.add(left) && self.add(right),
             _ => false,
         }
+    }
+
+    fn add_plan(&mut self, plan: &'q LogicalPlan) -> bool {
+        match unwrapped(plan) {
+            LogicalPlan::Scan(triple) => {
+                self.triples.push(triple.clone());
+                true
+            }
+            LogicalPlan::Path {
+                subject,
+                path,
+                object,
+            } => {
+                self.paths.push(PathPattern {
+                    subject,
+                    path,
+                    object,
+                    filter: None,
+                });
+                true
+            }
+            LogicalPlan::Join(inputs) => {
+                // Lowering puts scans before other inputs; keep identical tie-breaking.
+                // Ordered inputs are ineligible for a PathJoin, so cannot reach finish.
+                [true, false].into_iter().all(|scans| {
+                    inputs
+                        .iter()
+                        .filter(|input| matches!(input, LogicalPlan::Scan(_)) == scans)
+                        .all(|input| self.add_plan(input))
+                })
+            }
+            LogicalPlan::Union(inputs) if inputs.is_empty() => true,
+            LogicalPlan::Filter { condition, input } => match unwrapped(input) {
+                LogicalPlan::Path {
+                    subject,
+                    path,
+                    object,
+                } if !contains_any_exists(condition) => {
+                    self.paths.push(PathPattern {
+                        subject,
+                        path,
+                        object,
+                        filter: Some(condition),
+                    });
+                    true
+                }
+                LogicalPlan::Scan(triple) => self.add_filtered(std::iter::once(triple), condition),
+                LogicalPlan::Join(inputs)
+                    if inputs.iter().all(|p| matches!(p, LogicalPlan::Scan(_))) =>
+                {
+                    self.add_filtered(
+                        inputs.iter().map(|p| {
+                            let LogicalPlan::Scan(triple) = p else {
+                                unreachable!("scans only")
+                            };
+                            triple
+                        }),
+                        condition,
+                    )
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn add_filtered(
+        &mut self,
+        patterns: impl Iterator<Item = &'q TriplePattern> + Clone,
+        expr: &'q Expression,
+    ) -> bool {
+        // A filter may move only within its own scope: a variable bound by another
+        // join input was unbound here and can change errors/BOUND results.
+        let own: Vec<Variable> = patterns.clone().flat_map(triple_variables).collect();
+        let mut conjuncts = Vec::new();
+        pushdown::conjuncts_of(expr, &mut conjuncts);
+        if contains_any_exists(expr)
+            || !conjuncts.iter().all(|c| {
+                pushdown::movable(c) && expression_variables(c).iter().all(|v| own.contains(v))
+            })
+        {
+            return false;
+        }
+        self.triples.extend(patterns.cloned());
+        self.conjuncts.extend(conjuncts);
+        true
     }
 
     /// The `i`-th input: the triple patterns first, then the paths.
@@ -122,6 +216,15 @@ impl<'q> PathJoin<'q> {
         }
         vars
     }
+}
+
+/// Lowering removes one-input joins/unions before path eligibility is inspected.
+fn unwrapped(mut plan: &LogicalPlan) -> &LogicalPlan {
+    while let LogicalPlan::Join(inputs) | LogicalPlan::Union(inputs) = plan {
+        let [inner] = inputs.as_slice() else { break };
+        plan = inner;
+    }
+    plan
 }
 
 /// The variable at a path's end (a blank node is one, as in the executor), if it isn't a
