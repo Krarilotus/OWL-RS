@@ -5,24 +5,40 @@
 //! misses it at every level (performance.md §4; the index's cursor does the same over
 //! packed keys, `nrese_engine::ProbeCursor`).
 
+use std::ops::Range;
+
 /// The first index `>= from` in `slice` whose element `pred` rejects, where `pred` holds
 /// for a prefix of `slice` (as for [`slice::partition_point`]): exponential steps from
 /// `from`, then a binary search in the last step.
+#[inline]
 pub fn partition_point_from<T>(slice: &[T], from: usize, pred: impl Fn(&T) -> bool) -> usize {
-    let len = slice.len();
-    if from >= len || !pred(&slice[from]) {
-        return from.min(len);
+    let range = partition_range_from(slice.len(), from.min(slice.len()), |i| pred(&slice[i]));
+    range.start + slice[range].partition_point(pred)
+}
+
+/// Bracket a forward partition point in O(log distance) index probes. `pred` must hold
+/// for a prefix of `0..len`. The answer lies in `start..=end`; only `start..end` still
+/// needs searching. An exhausted start (`from >= len`) returns `from..from` unprobed.
+/// Slices and columnar joins keep their own binary-search specialisations.
+// Inline early so slice callers can eliminate the predicate's redundant bounds checks.
+#[inline(always)]
+pub(crate) fn partition_range_from(
+    len: usize,
+    from: usize,
+    pred: impl Fn(usize) -> bool,
+) -> Range<usize> {
+    if from >= len || !pred(from) {
+        return from..from;
     }
     // `pred` holds at `low`; the answer is in `(low, high]`.
     let (mut low, mut step) = (from, 1);
     let mut high = from + 1;
-    while high < len && pred(&slice[high]) {
+    while high < len && pred(high) {
         low = high;
         step *= 2;
         high = low + step;
     }
-    let high = high.min(len);
-    low + 1 + slice[low + 1..high].partition_point(pred)
+    low + 1..high.min(len)
 }
 
 /// A finger into a sorted slice: probes in ascending order find each value by
@@ -53,7 +69,58 @@ impl Finger {
 
 #[cfg(test)]
 mod tests {
-    use super::{Finger, partition_point_from};
+    use std::cell::Cell;
+
+    use super::{Finger, partition_point_from, partition_range_from};
+
+    #[test]
+    fn forward_ranges_bracket_every_boundary_with_logarithmic_probes() {
+        for len in 0..=65 {
+            for from in 0..=len + 1 {
+                for boundary in 0..=len {
+                    let probes = Cell::new(0);
+                    let range = partition_range_from(len, from, |i| {
+                        assert!((from..len).contains(&i));
+                        probes.set(probes.get() + 1);
+                        i < boundary
+                    });
+                    let expected = boundary.max(from);
+                    assert!((range.start..=range.end).contains(&expected));
+                    assert!(range.start >= from);
+                    assert!(range.end <= len.max(from));
+                    // Everything skipped before the bracket is known to pass.
+                    assert!(range.start == from || range.start <= boundary);
+                    // The end is either exhausted or already known to reject.
+                    assert!(range.end >= boundary);
+                    if from >= len {
+                        assert_eq!(range, from..from);
+                        assert_eq!(probes.get(), 0);
+                    } else {
+                        let distance = expected - from;
+                        assert!(probes.get() <= 2 + distance.max(1).ilog2());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fingers_keep_the_first_duplicate_and_rewind_after_exhaustion() {
+        let values = [1, 1, 3, 3, 3, 7];
+        let mut finger = Finger::default();
+        for probe in [0, 1, 1, 2, 3, 3, 6, 7, 8, 9, 3, 1] {
+            assert_eq!(
+                finger.seek(&values, &probe),
+                values.partition_point(|v| *v < probe)
+            );
+        }
+        assert_eq!(finger.seek(&[], &3), 0);
+        assert_eq!(finger.seek(&values[..2], &1), 0);
+        assert_eq!(
+            partition_point_from(&values, usize::MAX, |_| panic!()),
+            values.len()
+        );
+    }
 
     #[test]
     fn galloping_equals_a_partition_point() {
