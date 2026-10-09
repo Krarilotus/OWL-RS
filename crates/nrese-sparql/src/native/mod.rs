@@ -4023,6 +4023,17 @@ impl<'a> Context<'a> {
     // --- modifiers -----------------------------------------------------------------------
 
     fn project(&self, solutions: Solutions, variables: &[Variable]) -> Solutions {
+        if let Some(columns) = variables
+            .iter()
+            .map(|variable| solutions.column(variable))
+            .collect::<Option<Vec<_>>>()
+        {
+            return Solutions {
+                vars: variables.to_vec(),
+                table: solutions.table.project(&columns),
+                ordered: solutions.ordered,
+            };
+        }
         let columns: Vec<Vec<u64>> = variables
             .iter()
             .map(|v| match solutions.column(v) {
