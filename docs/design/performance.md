@@ -226,6 +226,28 @@ Full hashes, commands, per-pair counters and raw archive hashes are retained in
 hosts' `~/nrese-prep-20261009-4e8bd38` work area. Final integration requires a fresh
 comparison, including store-owned DL work and mixed writes.
 
+Two subsequent Office-only diagnostics preserve the physical owner and caller-owned
+I/O, but remain disposable patches. Small-result encoding inside the evaluation stage
+halves the extra pool submissions: q01 falls from 29–31 to 22–26 µs (baseline
+12–14 µs), while mixed throughput remains 10.8% below baseline at one client and
+7.8% below at two. A second diagnostic moves context construction, evaluation, all
+encoding and context destruction into one outer pool entry, returning buffered bytes.
+Its three pairs still lose 11.6% at both client counts: 2,684 → 2,373 and
+4,690 → 4,145 queries/s. Every pair is slower; results agree. These are separate
+campaigns, not a paired comparison between the two diagnostics. Whole-result buffering
+adds copying and memory and is not an acceptable production replacement for streaming.
+
+Separate q01 counter runs show about 6.27 context switches per client query in `c888a20`
+and 3.14 after full coalescing, versus 0.027 on the baseline. Those ratios include fixed
+load/preparation phases. Flat profiles show substantial Rayon/Crossbeam scheduling work;
+sample shares vary between captures and do not identify the entire mixed-workload loss.
+The candidate allocates fewer objects than baseline, so object counts alone do not
+explain the slowdown. Allocator locality remains unproven. Neither patch is promoted;
+submission granularity and execution policy need a design checkpoint before larger
+wiring. Exact patches, executable hashes, paired results, counters and commands remain
+in `implementation-benchmark-hosts/tmp/runtime-regression-investigation.txt`; both raw
+archives and the small diagnostic binary are retained separately from the reused target.
+
 ### 9 October: QL preparation and configurable context capacity
 
 **QL preparation, `0f9d98c` against `91900f8`.** One SPARQL-owned preparation now supplies

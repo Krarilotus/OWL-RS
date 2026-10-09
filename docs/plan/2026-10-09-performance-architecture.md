@@ -592,8 +592,9 @@ with `Term::Ord` removes formatting work but changes candidate priority under a 
 The implementation retains the legacy priority while comparing aligned ID rows; dictionary
 identity and computed-value remapping are SPARQL-owned. Lower-true ASK skips upper evaluation,
 and retained lower results are delivered without a second evaluation. Exact work receives only
-the admitted prefix; the upper ID table is still materialised. A genuine exact-gap fixture
-is being built by the P3 owner; this slice does not close all P3 coverage or performance gates.
+the admitted prefix; the upper ID table is still materialised. Exact-gap fixtures with
+8, 64, 65 and 512 candidates now verify complete proofs/refutations with no unresolved
+candidates; release timing and broader P3 coverage remain open.
 
 **Premise reuse (P4).** The implemented `dl/entailment/batch.rs` reuses the existing
 `tableau::Prepared` probe engine. Eligible tests share one compiled program per batch;
