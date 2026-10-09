@@ -8,7 +8,7 @@ in the branch), **deferred** (not done, with the reason and where it went), or *
   [capability matrix](spec/06-target-capability-matrix.md).
 - Why and in which order: [the roadmap](ROADMAP.md); the designs in [design/](design/).
 
-Branch update: 9 October 2026, implementation integration through `583c422`, for the
+Branch update: 9 October 2026, implementation integration through `5de8697`, for the
 authorised PR to `refactor/engine-v2`. These are bounded slices, not completion of the
 performance programme or the historical product roadmap. `0f46563` remains the programme's
 historical comparison base; individual experiments identify their own base and candidate.
@@ -21,8 +21,8 @@ historical comparison base; individual experiments identify their own base and c
 | Compact equality splits and hidden-class revival | Done: rebuilt closure participates in the pending transaction and gates; no post-commit inference repair | Rebuilds still scan the dataset under the writer lock; this restores atomicity, not the delta-cost target |
 | Execution and allocation reuse | Done: consuming projection moves retained buffers; common forward-search interval discovery; raw spilling frees batches without concatenation or an unused pool; ordered DISTINCT reuses any complete sort order | Deterministic work/allocation guards and final integrated tests pass; covered native query comparisons match results, while DL process peaks and concurrent-update tails remain unqualified |
 | Numeric ownership | Done: one SPARQL promotion/arithmetic implementation and a separate aggregate helper module, retaining existing loops and caches | The reference evaluator shares arithmetic: fixed expected-value tests remain necessary alongside differential tests |
-| Shared execution ownership | Implemented: catalog/system-store runtime, bounded DL batches and reused saturation pools; output and update WHERE retain the same resources | Runtime performance acceptance **BLOCKED**, below; root milestone gate passed. RL, bulk spill and background storage retain existing owners |
-| Typed DL bounds and premise reuse | Implemented: dictionary-safe ID comparison, lower-true ASK short-circuit, capped candidate decoding and existing compiled probes per batch; duplicate collection/serialization removed | Genuine exact-gap fixture under construction by P3 owner; performance acceptance outstanding. Upper tables and compilation scratch are still materialised |
+| Shared execution ownership | Implemented: catalog/system-store runtime, bounded DL batches and reused saturation pools; output, graph completion/EXPLAIN and update WHERE retain the same resources | Runtime performance acceptance **BLOCKED**, below; root milestone gate passed at `583c422`, later graph changes have owner-level validation. RL, bulk spill and background storage retain existing owners |
+| Typed DL bounds and premise reuse | Implemented: dictionary-safe ID comparison, lower-true ASK short-circuit, capped candidate decoding and existing compiled probes per batch; duplicate collection/serialization removed | Verified gaps of 8/64/65/512 candidates: all expected proofs/refutations complete, zero unresolved. Release performance acceptance outstanding. Upper tables and compilation scratch are still materialised |
 | Process memory policy | Implemented: startup owns the global fallback; store watches reach bounds and diagnostics; explicit zero remains disabled | Integrated commit gate passed 726 tests; cooperative checkpoints do not preempt compilation |
 | Architecture documentation | Updated: actual execution dependencies, plan properties/lowering ownership, hardware/scaling readiness, test gates and resource lifetimes | Direct physical-plan execution and distributed/hardware backends remain future work; remaining adapters have explicit retirement conditions |
 
@@ -34,14 +34,29 @@ from these bounded changes. Existing v2 merge gates remain open until their evid
 Runtime performance acceptance: **BLOCKED**. The initial `c888a20` versus `4e8bd38`
 comparison regressed Office throughput by 12.8% at one client and 10.2% at two clients,
 with all three pairs lower. Phuoc showed smaller decreases, also lower in all three pairs.
-The benchmark owner is investigating. Matching results do not establish performance
-neutrality; this candidate predates later fixes and does not qualify the current integration.
+Two isolated coalescing experiments improved tiny-query latency but did not eliminate
+the mixed-throughput loss; the full-coalescing variant remained 11.6% below baseline
+at both one and two clients. Neither diagnostic patch is retained in production.
+Scheduling design remains a decision checkpoint. Matching results do not establish
+performance neutrality; these experiments do not qualify the current integration.
 Final evidence belongs in the [performance lab log](design/performance.md#6-lab-log-of-the-performance-phase-from-5-october-2026).
 
-Current validation: the root reports all milestone stage exits zero: 1,335 workspace tests,
-doctests, 79 harness tests, 16 suite contracts, fmt, clippy, locks and deny. Console checks
-were skipped because dependencies were absent. This is correctness evidence, not runtime
-performance acceptance or validation of the still-pending exact-gap fixture.
+Validation at `583c422`: all milestone stages passed, including 1,335 workspace tests,
+doc tests, 79 harness tests, the suite-contract check (16 tests, five Linux-only cases
+skipped on Windows), fmt, clippy, locks and deny. Console checks were skipped because
+dependencies were absent. The same revision's exact-gap fixtures passed separate output
+and completeness checks. These are correctness results, not performance acceptance.
+Subsequent query-consistency deadline fixes (`4e88d55`) and graph-result ownership
+(`5de8697`) passed their focused and owner-crate checks. The graph owner reported
+692 tests plus additional seeds and 201 commit-hook tests; these overlap and are not
+added to the earlier workspace total. The final integrated push gate remains pending.
+
+The remote measurements so far are short internal diagnostics, not the registered
+fast-suite or competitor campaign. LUBM client phases lasted three seconds each;
+release builds used four compiler jobs. Idle time between those jobs is not measurement
+time. Final baseline/candidate coverage must use the existing `benches/fast` and
+`benches/suite` registries, record unavailable data or comparators explicitly, and
+preserve each run's commands, source/binary identities and raw results.
 
 Historical validation: 1,287 workspace tests passed with four test workers after integrating QL
 preparation and task memory at `74d83e8`; that revision's full milestone gate passed. Earlier, one cancellation latency
