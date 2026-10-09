@@ -12,8 +12,9 @@
 //!    terms ([`nrese_owl::ProofGraph`]): one inference by the engine from the axioms to
 //!    the conclusion, so glass-box steps (the context core's, the RL rules') can join it.
 //!
-//! Each test has the query's budgets; past `MAX_TESTS` or `dl.timeout` the set found so
-//! far is returned, marked not `minimal` (it still entails the conclusion).
+//! All tests, including final verification, share one deadline and cancellation token.
+//! Past `MAX_TESTS` or `dl.timeout`, return a known-entailing set marked not `minimal`
+//! or `verified`; no fresh verification timeout is granted.
 
 use std::time::Instant;
 
@@ -62,7 +63,14 @@ impl Search<'_> {
     /// Whether the axioms `subset` (with the background) give the goal; a test past the
     /// budget counts as "no" (so the axioms stay in), and marks the search spent.
     fn holds(&mut self, subset: &[usize]) -> bool {
-        if self.tests >= MAX_TESTS || Instant::now() >= self.deadline {
+        if self.tests >= MAX_TESTS
+            || Instant::now() >= self.deadline
+            || self
+                .budget
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.is_cancelled())
+        {
             self.spent = true;
             return false;
         }
@@ -76,8 +84,9 @@ impl Search<'_> {
             o.axioms.push(self.ontology.axioms[i].clone());
             o.sources.push(Vec::new());
         }
+        let budget = super::gate::remaining_budget(self.budget, self.deadline);
         match self.goal {
-            Goal::Inconsistent => match consistency::check(&o, self.budget).verdict {
+            Goal::Inconsistent => match consistency::check(&o, &budget).verdict {
                 Verdict::Inconsistent => true,
                 Verdict::Consistent => false,
                 Verdict::Unknown(_) => {
@@ -85,7 +94,7 @@ impl Search<'_> {
                     false
                 }
             },
-            Goal::Entails(axiom) => match entailment::entails(&o, axiom, self.fresh, self.budget) {
+            Goal::Entails(axiom) => match entailment::entails(&o, axiom, self.fresh, &budget) {
                 Entailed::Yes => true,
                 Entailed::No => false,
                 Entailed::Unknown(_) => {
@@ -102,6 +111,9 @@ impl Search<'_> {
         if tested && self.holds(base) {
             return Vec::new();
         }
+        if self.spent {
+            return candidates.to_vec();
+        }
         if candidates.len() == 1 {
             return candidates.to_vec();
         }
@@ -114,15 +126,38 @@ impl Search<'_> {
         out.extend(x2);
         out
     }
+
+    /// Verify with the time and test count still left, or return the full set whose
+    /// entailment was established before minimisation. Never restart a spent search.
+    fn finish(&mut self, candidates: Vec<usize>, mut axioms: Vec<usize>) -> Justification {
+        let mut minimal = !self.spent;
+        let verified = self.holds(&axioms);
+        if !verified {
+            axioms = candidates;
+            minimal = false;
+        }
+        axioms.sort_unstable();
+        let mut proof = ProofGraph::new(0u8);
+        proof.add("owl2-dl", &[], &axioms, 0u8);
+        Justification {
+            axioms,
+            minimal,
+            verified,
+            tests: self.tests,
+            proof,
+        }
+    }
 }
 
 /// A justification of `goal` in `ontology`, or `None` where it doesn't hold (or that
-/// can't be decided within the budget).
+/// can't be decided within the budget). All nested checks and verification use the
+/// caller's absolute deadline.
 pub(crate) fn justify(
     ontology: &Ontology,
     goal: &Goal,
     fresh: &[u64],
     budget: &Budget,
+    deadline: Instant,
 ) -> Option<Justification> {
     let (background, candidates): (Vec<usize>, Vec<usize>) = (0..ontology.axioms.len())
         .partition(|&i| matches!(ontology.axioms[i], Axiom::Declaration(..)));
@@ -133,42 +168,17 @@ pub(crate) fn justify(
         budget,
         background,
         tests: 0,
-        deadline: Instant::now() + budget.timeout,
+        deadline,
         spent: false,
     };
     if !search.holds(&candidates) {
         return None;
     }
-    let mut axioms = match candidates.is_empty() {
+    let axioms = match candidates.is_empty() {
         true => Vec::new(),
         false => search.qx(&[], false, &candidates),
     };
-    let mut minimal = !search.spent;
-    // A spent search may have dropped nothing it needed (a "no" past the budget keeps an
-    // axiom in), but check: the set must still give the goal.
-    let verified = {
-        let spent = search.spent;
-        search.tests = search.tests.min(MAX_TESTS - 1);
-        search.deadline = search.deadline.max(Instant::now() + budget.timeout);
-        let holds = search.holds(&axioms);
-        search.spent = spent;
-        holds
-    };
-    if !verified {
-        // Fall back to every candidate: what certainly gives the goal.
-        axioms = candidates;
-        minimal = false;
-    }
-    axioms.sort_unstable();
-    let mut proof = ProofGraph::new(0u8);
-    proof.add("owl2-dl", &[], &axioms, 0u8);
-    Some(Justification {
-        axioms,
-        minimal,
-        verified,
-        tests: search.tests,
-        proof,
-    })
+    Some(search.finish(candidates, axioms))
 }
 
 /// An axiom of a justification, as the store holds it.
@@ -251,12 +261,18 @@ impl crate::StoreService {
                 .map(TermId::raw)
             })
             .collect::<Option<_>>()?;
-        let justification = justify(
-            &ontology,
-            &Goal::Entails(axiom),
-            &fresh,
-            &super::gate::budget(self, None),
-        )?;
+        let deadline = started + self.config().dl.timeout;
+        // An entailment oracle can contain several consistency checks. The shared
+        // token also stops those inner tests at this operation's deadline.
+        let justification = super::gate::cancellable(&|| Instant::now() >= deadline, |cancel| {
+            justify(
+                &ontology,
+                &Goal::Entails(axiom),
+                &fresh,
+                &super::gate::budget(self, Some(cancel)),
+                deadline,
+            )
+        })?;
         let decode = |t: u64| {
             snapshot
                 .decode(TermId::from_raw(t))
@@ -269,5 +285,56 @@ impl crate::StoreService {
             tests: justification.tests,
             micros: started.elapsed().as_micros() as u64,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nrese_dl::tableau::Cancel;
+    use std::time::Duration;
+
+    #[test]
+    fn cancellation_and_expiry_do_not_restart_minimisation_or_verification() {
+        let store = crate::StoreService::new(crate::StoreConfig::in_memory()).unwrap();
+        let mut ontology = Ontology::default();
+        let nothing = nrese_owl::ExprId(ontology.classes.intern(nrese_owl::ClassExpr::Nothing));
+        ontology.axioms.push(Axiom::ClassAssertion(nothing, 1));
+        ontology.sources.push(Vec::new());
+        for stop in ["cancelled", "deadline", "tests"] {
+            let cancel = Cancel::default();
+            let budget = super::super::gate::budget(&store, Some(cancel.clone()));
+            let mut search = Search {
+                ontology: &ontology,
+                goal: &Goal::Inconsistent,
+                fresh: &[],
+                budget: &budget,
+                background: Vec::new(),
+                tests: 0,
+                deadline: Instant::now() + budget.timeout,
+                spent: false,
+            };
+            assert!(
+                search.holds(&[0]),
+                "establish the full set before exhausting a budget"
+            );
+            match stop {
+                "cancelled" => cancel.cancel(),
+                "deadline" => search.deadline = Instant::now() - Duration::from_secs(1),
+                "tests" => search.tests = MAX_TESTS,
+                _ => unreachable!(),
+            }
+            let tests = search.tests;
+            let deadline = search.deadline;
+            let candidate = search.qx(&[], true, &[0]);
+            let result = search.finish(vec![0], candidate);
+            assert_eq!(result.axioms, [0]);
+            assert!(!result.minimal && !result.verified, "{stop}: {result:?}");
+            assert_eq!(result.tests, tests, "{stop}: no new oracle call");
+            assert_eq!(
+                search.deadline, deadline,
+                "verification cannot extend the deadline"
+            );
+        }
     }
 }
