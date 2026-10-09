@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use nrese_engine::Snapshot;
 use nrese_exec::{Budget, IdTable, UNDEF, computed_id, computed_index};
-use nrese_rdf::{Term, Variable};
+use nrese_rdf::{Term, Triple, Variable};
 
 use crate::{QueryEvaluationError, QueryResults, QuerySolutionIter, QueryTripleIter};
 
@@ -15,7 +15,7 @@ use crate::{QueryEvaluationError, QueryResults, QuerySolutionIter, QueryTripleIt
 pub enum TypedResults {
     Boolean(bool),
     Solutions(SolutionTable),
-    Graph(QueryTripleIter<'static>),
+    Graph(Vec<Triple>, Arc<Budget>),
 }
 
 /// An ID table and its complete decoding context. Row order and multiplicity are kept.
@@ -219,7 +219,9 @@ impl TypedResults {
     pub fn into_results(self) -> QueryResults<'static> {
         match self {
             Self::Boolean(value) => QueryResults::Boolean(value),
-            Self::Graph(triples) => QueryResults::Graph(triples),
+            Self::Graph(triples, budget) => QueryResults::Graph(
+                QueryTripleIter::new(triples.into_iter().map(Ok)).with_budget(budget),
+            ),
             Self::Solutions(solutions) => {
                 let variables = Arc::clone(&solutions.variables);
                 let rows = (0..solutions.len()).map(move |row| Ok(solutions.row(row)));
@@ -252,38 +254,43 @@ pub(crate) fn evaluate(
         }
         None => pattern,
     };
-    let (ctx, solutions) = ctx.on_workers(options.workers.as_ref(), |ctx| {
-        ctx.eval_root(&pattern, options.pin.as_ref())
+    let (_, results) = ctx.on_workers(options.workers.as_ref(), |ctx| {
+        let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
+        ctx.check()?;
+        match form {
+            Form::Ask => Ok(TypedResults::Boolean(!solutions.table.is_empty())),
+            Form::Describe => Ok(TypedResults::Graph(
+                ctx.describe(&solutions)?,
+                Arc::clone(&ctx.budget),
+            )),
+            Form::Construct(template) => {
+                let triples =
+                    construct(&snapshot, ctx.computed.take(), solutions, template, || {
+                        ctx.check()
+                    })
+                    .collect::<super::NativeResult<Vec<_>>>()?;
+                Ok(TypedResults::Graph(triples, Arc::clone(&ctx.budget)))
+            }
+            Form::Select => {
+                let computed = ctx.computed.take();
+                ctx.budget
+                    .charge(
+                        computed
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Term>())
+                            .saturating_add(computed.iter().map(crate::cache::term_heap).sum()),
+                    )
+                    .map_err(QueryEvaluationError::MemoryLimit)?;
+                Ok(TypedResults::Solutions(SolutionTable {
+                    snapshot: snapshot.clone(),
+                    variables: solutions.vars.into(),
+                    table: solutions.table,
+                    computed: Arc::new(computed),
+                    budget: Arc::clone(&ctx.budget),
+                    extra_budgets: Vec::new(),
+                }))
+            }
+        }
     })?;
-    match form {
-        Form::Ask => Ok(TypedResults::Boolean(!solutions.table.is_empty())),
-        Form::Describe => Ok(TypedResults::Graph(
-            QueryTripleIter::new(ctx.describe(&solutions)?.into_iter().map(Ok))
-                .with_budget(ctx.budget),
-        )),
-        Form::Construct(template) => {
-            let triples: Vec<_> =
-                construct(&snapshot, ctx.computed.into_inner(), solutions, template).collect();
-            Ok(TypedResults::Graph(
-                QueryTripleIter::new(triples.into_iter().map(Ok)).with_budget(ctx.budget),
-            ))
-        }
-        Form::Select => {
-            let computed = ctx.computed.into_inner();
-            ctx.budget.charge(
-                computed
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<Term>())
-                    .saturating_add(computed.iter().map(crate::cache::term_heap).sum()),
-            )?;
-            Ok(TypedResults::Solutions(SolutionTable {
-                snapshot: snapshot.clone(),
-                variables: solutions.vars.into(),
-                table: solutions.table,
-                computed: Arc::new(computed),
-                budget: ctx.budget,
-                extra_budgets: Vec::new(),
-            }))
-        }
-    }
+    Ok(results)
 }
