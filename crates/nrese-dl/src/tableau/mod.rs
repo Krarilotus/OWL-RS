@@ -17,7 +17,8 @@
 //!
 //! Datatypes (package 3.5) are concrete nodes checked by the datatype theory
 //! (`data.rs`, `crate::datatypes`); keys are DL-safe rules over the named individuals
-//! (`keys.rs`). Not yet: satisfiability caching and completion-graph reuse (3.7).
+//! (`keys.rs`). [`Base`] reuses deterministic completion state and models with rollback
+//! and fresh probe controls. General cross-probe satisfiability caching is not yet built.
 
 mod blocking;
 pub(crate) mod budget;

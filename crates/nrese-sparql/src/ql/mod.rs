@@ -128,8 +128,12 @@ struct Cached {
     access: Option<GraphAccess>,
     /// The exact snapshot view it was read from, including pending changes and masks.
     key: SnapshotIdentity,
-    /// A hash of the schema statements: a snapshot with the same schema reuses the TBox.
-    schema: u64,
+    /// The exact sorted input, moved from the schema scan. Equality is linear in the
+    /// schema size, as hashing was; a hash collision must never select another TBox.
+    schema: Box<[nrese_owl::Statement]>,
+    /// Compilation also needs the dictionary's id of Thing, even if no schema axiom
+    /// mentions it. Ordinary data can introduce that id without changing the schema.
+    thing: Option<nrese_owl::Term>,
     tbox: Arc<Tbox>,
 }
 
@@ -145,8 +149,9 @@ impl QlRewriting {
     }
 
     /// Whether the data at snapshot `identity` has the tree of probe `key`
-    /// wherever it folds: `compute`d once per view and probe (`None`: not asked, the
-    /// query's questions spent; `false` then, and nothing kept).
+    /// wherever it folds, memoised per view and probe (`None`: not asked, the query's
+    /// questions spent; `false` then, and nothing kept). Concurrent misses may compute
+    /// independently; the query itself runs outside the cache lock.
     pub(crate) fn realised(
         &self,
         identity: SnapshotIdentity,
@@ -195,7 +200,7 @@ impl QlRewriting {
     }
 
     /// The QL part of `snapshot`'s schema, compiled. Read once per snapshot, and compiled
-    /// only when the schema statements changed: data commits reuse it.
+    /// only when the schema or compiler vocabulary changes; other data commits reuse it.
     ///
     /// Graph access (design §1) matches what the reader sees of the RL closure: a reader
     /// who sees only the inferences its graphs support (`inferred = "supported"`) gets the
@@ -209,21 +214,23 @@ impl QlRewriting {
         if let Some(c) = at.map(|i| &cached[i]).filter(|c| c.key == key) {
             return Arc::clone(&c.tbox);
         }
+        // A snapshot bounds its dictionary reads, so an identity hit above needs no
+        // lookup. Across identities, unchanged statements alone are not sufficient.
+        let thing = snapshot
+            .lookup(nrese_rdf::vocab::owl::THING.into())
+            .map(TermId::raw);
         let mut statements = schema_statements(snapshot);
         if let Some(access) = access {
             statements.retain(|s| access.allows_id(snapshot, TermId::from_raw(s.graph)));
         }
-        let schema = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            statements.hash(&mut hasher);
-            hasher.finish()
-        };
-        if let Some(c) = at.map(|i| &mut cached[i]).filter(|c| c.schema == schema) {
+        if let Some(c) = at
+            .map(|i| &mut cached[i])
+            .filter(|c| c.thing == thing && c.schema.as_ref() == statements)
+        {
             c.key = key;
             return Arc::clone(&c.tbox);
         }
-        let tbox = Arc::new(compile(snapshot, &statements, self.closure));
+        let tbox = Arc::new(compile(snapshot, &statements, self.closure, thing));
         if let Some(i) = at {
             cached.remove(i);
         }
@@ -233,7 +240,8 @@ impl QlRewriting {
         cached.push(Cached {
             access: access.cloned(),
             key,
-            schema,
+            schema: statements.into_boxed_slice(),
+            thing,
             tbox: Arc::clone(&tbox),
         });
         tbox
@@ -360,9 +368,13 @@ impl nrese_owl::Terms for SnapshotTerms<'_> {
     }
 }
 
-fn compile(snapshot: &Snapshot, statements: &[nrese_owl::Statement], closure: Closure) -> Tbox {
+fn compile(
+    snapshot: &Snapshot,
+    statements: &[nrese_owl::Statement],
+    closure: Closure,
+    thing: Option<nrese_owl::Term>,
+) -> Tbox {
     let terms = SnapshotTerms(snapshot);
     let ontology = nrese_owl::read(statements, &terms);
-    let thing = iri(snapshot, OWL, "Thing").map(TermId::raw);
     Tbox::compile(&ontology, closure, thing)
 }

@@ -666,3 +666,26 @@ records accounting's measured cost and unqualified coverage. This closes saturat
 accounting, not the shared end-to-end envelope. Participating dispatch now respects worker
 allowances; arbitrary nested work and owners outside the shared runtime are not universally
 capped. Process watches and task capacity reservations remain distinct contracts.
+
+## 9. Memoization research follow-through (10 October)
+
+The owner authorised proceeding from the repository literature review. The first slice
+repairs QL compiler-input identity and explicit DL-result caching, without a new cache
+framework. Exact schema input replaces hash-only equality; `owl:Thing` dictionary identity
+also participates across snapshot identities. The existing snapshot contract bounds
+dictionary reads, so a same-identity hit needs no new lookup. The owner selected complete-only
+explicit classification/realisation caching: incomplete calls retry on the next explicit
+request, including unsupported ontologies. Ordinary query lower-bound caching is separate.
+
+Next, profile the existing result cache with the existing replay/perf lab, separating
+key construction, shared ranking, ID-column reconstruction and output encoding. `CacheScope`
+already retains the invariant context prefix; do not introduce a duplicate prefix cache.
+QL schema statements add retained memory, while exact comparison removes hashing: measure
+both same-view hits and unchanged-schema refreshes before making a speed claim.
+
+Immutable ID-table sharing, further exact-probe Base reuse and semantic SAT/UNSAT caches
+remain separate proposals. Each needs a measured repeated cost, an ownership/invalidation
+contract, a differential guard and a bounded scope checkpoint before appreciable wiring.
+Existing branch-dependency ids are not cross-probe logical certificates. No caller CPU
+bypass, global scheduler, new default limit or weakened benchmark gate follows from this
+research. The performance log and run records own the evidence and remaining acceptance.

@@ -8,11 +8,20 @@ in the branch), **deferred** (not done, with the reason and where it went), or *
   [capability matrix](spec/06-target-capability-matrix.md).
 - Why and in which order: [the roadmap](ROADMAP.md); the designs in [design/](design/).
 
-Branch update: 9 October 2026. Implementation and [draft PR #23](https://github.com/Krarilotus/OWL-RS/pull/23)
+Branch update: 10 October 2026. Implementation and [draft PR #23](https://github.com/Krarilotus/OWL-RS/pull/23)
 to `refactor/engine-v2` are authorised; **performance acceptance remains blocked**.
 The implementation comparison base is `0f46563`, including the independently authored
 DL number-module merge. Individual experiments below use their own identified revisions;
 historical v2 improvements are not credited to this branch.
+
+The cache-contract follow-through repairs a reproduced QL warm-cache wrong answer when
+ordinary data introduces `owl:Thing`, uses exact schema identity, and retries incomplete
+explicit DL classification/realisation requests under the existing budget. Complete-result
+publication cannot displace a newer revision with an older one. Query lower-bound caching
+is unchanged. Focused Office tests pass; the [component diagnostic](../benches/runs/2026-10-10-cache-contracts-d31010c.toml)
+measures 20.4% less schema-refresh time for 1004 statements, with 32 bytes per statement
+retained as the exact key. This is neither a full-query speedup nor a memory-neutral change.
+General result-cache overhead profiling and the broader runtime acceptance remain open.
 
 | Area | Implemented and retained | Remaining gap |
 |---|---|---|
