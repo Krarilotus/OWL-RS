@@ -560,7 +560,8 @@ prepares once, keeps that report for completeness and diagnostics, and passes th
 query to the existing writers/evaluator. Keep the original query/options in result-cache
 keys; disabling QL for the already-prepared execution must not erase its cache fingerprint.
 The estimated change is 100–170 replacement/plumbing lines plus focused tests, not a new
-executor. Required guards cover cold/warm caches, pending views, graph access, strict and
+executor. The owner approved this bounded implementation; the repeated store preparation
+and duplicated options builder are removed. Required guards cover cold/warm caches, pending views, graph access, strict and
 canonical equality, limits, cancellation, and a cache hit that performs no evaluation.
 The smaller writer eligibility check is already moved before preparation. The full change
 is awaiting the owner's decision.
@@ -605,4 +606,8 @@ transfer its charge rather than double-count it; retained immutable inputs need 
 owner. This is a multi-owner accounting change, not a one-line limit fix. First establish
 coverage, charging frequency and overshoot with allocation/concurrency guards. A separate
 process-memory ceiling remains useful but cannot replace task accounting. Implementation
-is awaiting the owner's decision; no new ledger is added by this plan.
+was approved by the owner, who prioritised flexibility and performance over fixed limits.
+Keep task limits configurable, with unlimited operation available; use task-owned capacity
+checks at work checkpoints, allowing temporary overshoot as the tableau does. Strict
+allocation-by-allocation enforcement is outside this bounded work. No process-memory
+watch is substituted for task accounting, and no accounting implementation is claimed yet.
