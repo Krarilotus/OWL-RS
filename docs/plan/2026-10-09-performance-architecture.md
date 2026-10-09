@@ -300,7 +300,7 @@ restrictions and pending reads. Measure cold preparation separately from warm ex
 
 **Owners:** SPARQL owns typed ID results; store owns lower/upper orchestration; exec owns
 generic set/join primitives. The implemented boundary is `dl/query/` and
-`query_executor::evaluate_prepared`, with retained ID results in SPARQL's
+`query_executor::evaluate_bound`, with retained ID results in SPARQL's
 `native/typed_results.rs`.
 
 - Short-circuit a lower-bound true `ASK` before evaluating the upper bound on eligible paths.

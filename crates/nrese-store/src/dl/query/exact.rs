@@ -56,9 +56,7 @@ pub(super) fn decide_until(
         let config = &store.config().dl;
         let base = ontology_at(store, snapshot);
         let mut ontology = (*base).clone();
-        let rdf_type = snapshot.lookup(NamedNodeRef::new_unchecked(RDF_TYPE).into());
-        let same_as = snapshot.lookup(NamedNodeRef::new_unchecked(OWL_SAME_AS).into());
-        let thing = snapshot.lookup(NamedNodeRef::new_unchecked(OWL_THING).into());
+        let ids = Ids::of(snapshot);
         let data_properties = data_properties(&ontology);
         let mut paths = Vec::new();
         let mut tests = Vec::new();
@@ -83,11 +81,7 @@ pub(super) fn decide_until(
                     &mut ontology,
                     snapshot,
                     &atoms,
-                    Ids {
-                        rdf_type: rdf_type.map(TermId::raw),
-                        same_as: same_as.map(TermId::raw),
-                        thing: thing.map(TermId::raw),
-                    },
+                    ids,
                     &data_properties,
                     &mut paths,
                 )

@@ -28,10 +28,7 @@ pub(crate) struct Cache {
 pub(super) fn options(store: &StoreService) -> classify::Options {
     let config = &store.config().dl;
     let workers = store.runtime().workers().limited(config.threads);
-    let mut options = config.classification_options();
-    options.threads = workers.width();
-    options.tableau.max_memory = config.memory_per_worker(workers.width());
-    options.workers = Some(workers);
+    let mut options = config.classification_options(workers);
     options.max_memory = Some(store.config().process_memory_bytes);
     options
 }
