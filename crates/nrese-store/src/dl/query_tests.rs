@@ -1,12 +1,17 @@
 use super::*;
 
-#[test]
-fn lower_true_ask_evaluates_once_and_delivers_that_result() {
+fn lower_true_store() -> Arc<StoreService> {
     use crate::{
         MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlUpdateRequest,
     };
     use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-    let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
+    let store = Arc::new(
+        StoreService::new(crate::StoreConfig {
+            execution_threads: 1,
+            ..crate::StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
         Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
@@ -23,6 +28,12 @@ fn lower_true_ask_evaluates_once_and_delivers_that_result() {
             &MutationTicket::new(),
         )
         .unwrap();
+    store
+}
+
+#[test]
+fn lower_true_ask_evaluates_once_and_delivers_that_result() {
+    let store = lower_true_store();
     let prepared = store
         .prepare_query(&crate::SparqlQueryRequest::all("ASK { ?x a <urn:test:B> }"))
         .unwrap();
@@ -40,10 +51,38 @@ fn lower_true_ask_evaluates_once_and_delivers_that_result() {
     assert!(status.complete);
     assert!(detail.paths.contains(&"lower-true-ask"));
     let mut out = Vec::new();
-    crate::query_executor::write_answers(&prepared, answers, &mut out).unwrap();
+    crate::query_executor::write_answers(&prepared, answers, &CancellationToken::new(), &mut out)
+        .unwrap();
     assert!(String::from_utf8(out).unwrap().contains("true"));
     crate::query_executor::BOUND_EVALUATIONS
         .with(|n| assert_eq!(n.get(), 1, "upper was never evaluated"));
+}
+
+#[test]
+fn retained_dl_answers_honor_reporting_cancellation_before_writing() {
+    let store = lower_true_store();
+    let mut request = crate::SparqlQueryRequest::all("ASK { ?x a <urn:test:B> }");
+    request.dl_answers = Some(DlAnswers::Exact);
+    let prepared = store.prepare_query(&request).unwrap();
+    let token = CancellationToken::new();
+    let mut reported = false;
+    let mut bytes = Vec::new();
+    let result = store.run_query_reporting(&prepared, &token, &mut bytes, |status| {
+        assert!(status.unwrap().complete);
+        reported = true;
+        token.cancel();
+    });
+    assert!(reported);
+    assert!(matches!(
+        result,
+        Err(StoreError::SparqlEvaluation(
+            nrese_sparql::QueryEvaluationError::Cancelled
+        ))
+    ));
+    assert!(
+        bytes.is_empty(),
+        "report cancellation precedes retained bytes"
+    );
 }
 
 #[test]

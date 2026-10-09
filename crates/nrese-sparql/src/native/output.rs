@@ -215,6 +215,7 @@ impl DirectResults<'_> {
         alive: &dyn Fn() -> std::io::Result<()>,
         workers: Option<&nrese_exec::workers::Workers>,
     ) -> std::io::Result<()> {
+        alive()?;
         let mut buffer: Vec<u8> = Vec::with_capacity(CHUNK + 4096);
         let json = self.format == ResultsFormat::Json;
         let (separator, end_of_row): (u8, &[u8]) = match self.format {
@@ -289,6 +290,7 @@ impl DirectResults<'_> {
                     Some(workers) => workers.map_range(range, encode),
                     None => range.into_par_iter().map(encode).collect(),
                 };
+                alive()?;
                 for part in parts {
                     let mut rest = part.as_slice();
                     while !rest.is_empty() {
@@ -296,6 +298,7 @@ impl DirectResults<'_> {
                         buffer.extend_from_slice(now);
                         rest = later;
                         if buffer.len() >= CHUNK {
+                            alive()?;
                             out.write_all(&buffer)?;
                             buffer.clear();
                             alive()?;
@@ -307,7 +310,9 @@ impl DirectResults<'_> {
         if json {
             buffer.extend_from_slice(b"]}}");
         }
-        out.write_all(&buffer)
+        alive()?;
+        out.write_all(&buffer)?;
+        alive()
     }
 }
 
@@ -328,7 +333,104 @@ pub(super) fn boolean(value: bool, version: Option<&str>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::escaped;
+    use super::*;
+    use crate::CancellationToken;
+
+    #[test]
+    fn cancelled_completed_tables_write_no_bytes_even_when_empty_or_small() {
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let snapshot = engine.snapshot();
+        let workers = nrese_exec::workers::Workers::pooled(1).unwrap();
+        for rows in [0, 1, BLOCK_ROWS] {
+            let table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows));
+            for format in [ResultsFormat::Json, ResultsFormat::Tsv, ResultsFormat::Csv] {
+                let token = CancellationToken::new();
+                token.cancel();
+                let alive = || {
+                    if token.is_cancelled() {
+                        Err(std::io::Error::other("cancelled"))
+                    } else {
+                        Ok(())
+                    }
+                };
+                let mut bytes = Vec::new();
+                assert!(
+                    DirectResults {
+                        snapshot: &snapshot,
+                        computed: &[],
+                        format,
+                        version: None,
+                    }
+                    .write(&[], &table, &mut bytes, &alive, Some(&workers))
+                    .is_err()
+                );
+                assert!(bytes.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn a_large_table_checks_cancellation_after_its_only_output_write() {
+        struct CancelOnWrite {
+            token: CancellationToken,
+            writes: usize,
+            bytes: usize,
+        }
+        impl Write for CancelOnWrite {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes += bytes.len();
+                self.token.cancel();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let snapshot = engine.snapshot();
+        let workers = nrese_exec::workers::Workers::pooled(1).unwrap();
+        // Two row blocks, but their zero-column JSON rows fit in the final byte buffer.
+        let table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], BLOCK_ROWS + 1));
+        let token = CancellationToken::new();
+        let mut writer = CancelOnWrite {
+            token: token.clone(),
+            writes: 0,
+            bytes: 0,
+        };
+        let output = DirectResults {
+            snapshot: &snapshot,
+            computed: &[],
+            format: ResultsFormat::Json,
+            version: None,
+        };
+        let mut expected = Vec::new();
+        output
+            .write(&[], &table, &mut expected, &|| Ok(()), Some(&workers))
+            .unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&expected).unwrap();
+        assert_eq!(
+            decoded["results"]["bindings"].as_array().unwrap().len(),
+            BLOCK_ROWS + 1
+        );
+        assert!(expected.len() < CHUNK);
+        let result = output.write(
+            &[],
+            &table,
+            &mut writer,
+            &|| {
+                if token.is_cancelled() {
+                    Err(std::io::Error::other("cancelled"))
+                } else {
+                    Ok(())
+                }
+            },
+            Some(&workers),
+        );
+        assert!(result.is_err());
+        assert_eq!(writer.writes, 1, "cancellation occurs in the final write");
+        assert_eq!(writer.bytes, expected.len());
+    }
 
     #[test]
     fn escaping_matches_json_event_parser() {

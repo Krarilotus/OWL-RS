@@ -262,9 +262,15 @@ pub(crate) fn write_results(
         Ok(result) => result,
         Err(error) => return Some(Err(QueryEvaluationError::from(error).into())),
     };
+    if let Err(error) = ctx.check() {
+        return Some(Err(QueryEvaluationError::from(error).into()));
+    }
     if matches!(form, Form::Ask) {
         let bytes = output::boolean(!solutions.table.is_empty(), version);
-        return Some(out.write_all(&bytes).map_err(Into::into));
+        return Some(out.write_all(&bytes).map_err(Into::into).and_then(|()| {
+            ctx.check()
+                .map_err(|error| QueryEvaluationError::from(error).into())
+        }));
     }
     let computed = ctx.computed.into_inner();
     let token = options.cancellation.clone();

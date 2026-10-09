@@ -446,6 +446,7 @@ fn decide_answers(
                 limit.saturating_add(super::UNRESOLVED_SHOWN),
                 &budget,
                 cancellation,
+                &store.runtime().workers(),
             )?;
             let mut counts = Counts {
                 lower: gap.lower,
