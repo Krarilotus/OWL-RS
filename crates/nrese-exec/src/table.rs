@@ -294,9 +294,18 @@ impl IdTable {
     pub fn dedup(&mut self) {
         let all: Vec<usize> = (0..self.width()).collect();
         self.sort_by(&all);
+        self.dedup_adjacent();
+    }
+
+    /// Equal rows are adjacent when any permutation of all columns orders the table.
+    fn dedup_adjacent(&mut self) {
         let mask: Vec<bool> = (0..self.len)
             .map(|row| {
-                row == 0 || self.compare_rows(row - 1, row, &all) != std::cmp::Ordering::Equal
+                row == 0
+                    || self
+                        .columns
+                        .iter()
+                        .any(|column| column[row - 1] != column[row])
             })
             .collect();
         self.retain_mask(&mask);
@@ -305,8 +314,8 @@ impl IdTable {
     /// Removes duplicate rows, keeping the first occurrence of each and the row order
     /// (SPARQL DISTINCT after ORDER BY). Sortedness is kept.
     pub fn dedup_preserving_order(&mut self) {
-        if self.sorted_by.len() == self.width() && self.width() > 0 {
-            self.dedup();
+        if self.width() > 0 && (0..self.width()).all(|column| self.sorted_by.contains(&column)) {
+            self.dedup_adjacent();
             return;
         }
         // A table of row numbers, hashed and compared through the columns: no row is
@@ -490,5 +499,27 @@ mod tests {
             }
             assert!(projected.check_sorted(projected.sorted_by()));
         }
+    }
+
+    #[test]
+    fn ordered_dedup_uses_any_complete_sort_order_without_gathering() {
+        let mut input = table(&[&[2, 1], &[2, 1], &[1, 2]]).assume_sorted_by(vec![1, 0]);
+        let buffers: Vec<_> = input
+            .columns()
+            .iter()
+            .map(|column| column.as_ptr())
+            .collect();
+        input.dedup_preserving_order();
+        assert_eq!(input.rows().collect::<Vec<_>>(), [vec![2, 1], vec![1, 2]]);
+        assert_eq!(input.sorted_by(), [1, 0]);
+        for (column, buffer) in input.columns().iter().zip(buffers) {
+            assert_eq!(column.as_ptr(), buffer, "dedup must not sort/gather again");
+        }
+
+        // Repeating one key does not cover the other column: equal rows need not be
+        // adjacent. Keep the hash path's first occurrence and its order in that case.
+        let mut partial = table(&[&[1, 2], &[1, 3], &[1, 2]]).assume_sorted_by(vec![0, 0]);
+        partial.dedup_preserving_order();
+        assert_eq!(partial.rows().collect::<Vec<_>>(), [vec![1, 2], vec![1, 3]]);
     }
 }
