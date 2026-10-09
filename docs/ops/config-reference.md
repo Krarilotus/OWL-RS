@@ -241,7 +241,7 @@ api_key = "replace-me"
   - file key `dl.answers`, env `NRESE_DL_ANSWERS`: `certain-where-complete` (the default: the certain answers where the store can prove them complete, else the sound ones, the status saying which), `sound` (the lower bound alone, never checked against the upper bound) or `exact` (certain answers, or the query fails with 422, problem type `incomplete-answer`, naming the reasons and the unresolved candidates)
   - file key `dl.consistency`, env `NRESE_DL_CONSISTENCY`: `inline` (the default: a commit that makes the data inconsistent under OWL 2 DL is rejected, as the RL gate rejects) or `off` (not checked; every answer's status then says the consistency is unknown)
   - file key `dl.timeout`, env `NRESE_DL_TIMEOUT_MS` (default 30min): the time one DL task may take (a commit's consistency check, a query's exact services, a classification); what isn't decided by then is reported, never guessed
-  - file key `dl.memory`, env `NRESE_DL_MEMORY` (default 4GiB; `0` disables the budget): task-owned capacity checked at context-saturation and tableau work boundaries. Temporary overshoot is possible; exhaustion is reported as incomplete/unknown. Classification divides the tableau allowance among configured workers. This is not a strict allocator or process ceiling; input, compilation and result buffers and a shared query envelope are outside this contract ([scope](../design/owl2-dl.md#13-configuration))
+  - file key `dl.memory`, env `NRESE_DL_MEMORY` (default 4GiB; `0` disables the budget): task-owned capacity checked at context-saturation and tableau work boundaries. Temporary overshoot is possible; exhaustion is reported as incomplete/unknown. Participating batches divide the tableau allowance by actual concurrent work. This is not a strict allocator or process ceiling; input, compilation temporaries, result buffers and a shared query envelope are outside this contract ([scope](../design/owl2-dl.md#13-configuration))
   - file key `dl.max_candidates`, env `NRESE_DL_MAX_CANDIDATES` (default 1000): the candidate answers (in the upper bound, not the lower) a query checks with the exact services at most; the rest are reported unresolved
   - file key `dl.threads`, env `NRESE_DL_THREADS` (default 0, available runtime workers): the maximum workers of a DL operation, narrowed by `execution.threads`
   - file key `dl.max_nodes`, env `NRESE_DL_MAX_NODES` (default 2000000), and `dl.max_branch_points`, env `NRESE_DL_MAX_BRANCH_POINTS` (default 1000000): the deterministic budgets of one hypertableau run (a consistency check, an entailment test, a class test), beside `dl.timeout`. A run past a budget decides nothing: its candidate stays unresolved, its class untested, its commit's status `unknown`, never a wrong answer
@@ -284,6 +284,8 @@ planning, rule materialisation, bulk spill and background storage retain their e
 owners. The separate spill pool avoids waiting for its own producer. No tenant fairness,
 NUMA placement or distributed admission policy is implied. Embedded applications may
 share `nrese_store::Runtime` explicitly; independent stores otherwise own separate pools.
+Worker handles limit participating dispatch, not arbitrary nested Rayon work. Writers and
+callbacks remain on their caller; encoding returns owned byte windows before output can block.
 
 ## Budgets
 
@@ -306,11 +308,18 @@ Every limit on memory, time and request size is in one table, `[budgets]`. Value
 | `budgets.result_cache` | `NRESE_QUERY_CACHE_BYTES` | 2% of memory (64 MiB to 8 GiB) | Results of query parts (id columns) kept for repeated queries and shared sub-patterns ([the result cache](#store)); a size or a share (`5%`). `0` switches the cache off |
 | `budgets.result_cache_pins` | `NRESE_PINNED_QUERIES` | none | Query files whose results are pinned in the result cache at startup |
 
-How the two memory budgets work:
-- They count what queries hold between their operators: the tables of joins, groups and sorts, and the hash tables of joins. A table that is being built may take half of what is left, because growing it, and merging the parts of a parallel join, holds its rows twice for a moment.
+How query memory accounting works:
+
+- Per-query and shared query budgets count operator tables and scratch, including joins, groups and sorts. Retained native results and DL bound tables keep their reservations until drop; update WHERE uses the same catalog owner. A table that is being built may take half of what is left, because growing it, and merging the parts of a parallel join, holds its rows twice for a moment. Decoded graph payloads, encoder buffers and DL compilation scratch are not a shared whole-request envelope.
 - The machine's memory is the container's limit where there is one (cgroups), else the machine's. It is known on Linux; elsewhere a share such as `50%` means "no limit", so set a size.
 - The store's own memory (the data and its indexes) is not part of either budget.
 - A request over a size limit is answered `413`. Requests are held in memory while they are handled, so a size limit is also memory a request may take.
+
+Server startup installs `budgets.process_memory` as the process fallback. Opening an
+embedded store never replaces that global policy; embedding hosts may install it explicitly.
+Store-local watches cover participating operations, including DL bounds and diagnostics;
+an explicit zero remains disabled. These are cooperative checkpoints, not allocator limits
+or preemption of schema reading, normalisation and compilation.
 
 The same settings have older names, which still work: `policy.limits.max_query_bytes`, `max_query_memory_bytes`, `max_update_bytes`, `max_rdf_upload_bytes`; `policy.timeouts.query_ms`, `update_ms`, `graph_read_ms`, `graph_write_ms`; `store.query_cache_bytes`. A setting under both names is a startup error.
 
@@ -327,7 +336,11 @@ A write that times out before its commit starts is never committed, and the requ
 - the `WHERE` evaluation of an update;
 - commit-path reasoning, polled between rounds and per work unit.
 
-A cancelled reasoning run discards the asserted and the inferred changes and frees the writer at once. Two steps don't poll the deadline:
+Once a reasoning run observes cancellation and finishes unwinding, it discards the asserted
+and inferred changes and releases the writer. The DL gate shares its deadline and token
+across pending/prior consistency checks and rejection evidence. Cancellation is cooperative;
+schema reading, normalisation and compilation are not all internally interruptible.
+Two rule-reasoning steps also don't poll the deadline:
 - the one-off full materialisation that runs when no current reasoning state is recorded;
 - closing a newly declared transitive property.
 

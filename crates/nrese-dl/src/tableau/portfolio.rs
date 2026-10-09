@@ -1,6 +1,8 @@
-//! Runs of one test with different clauses, raced: the first decided answer wins and the
-//! others are cancelled. Both answers are right; which run decides first depends on the
-//! ontology (lazily unfolded definitions decide the DL98 test k_grz at once and slow
+//! Runs of one test with different clauses, raced: a decision signals sibling cancellation
+//! immediately, then dispatch waits for all runs to finish. Several runs may decide before
+//! observing cancellation; the returned decided outcome is first in input order, so its
+//! telemetry does not identify the earliest wall-clock decision. Which run decides depends
+//! on the ontology (lazily unfolded definitions decide the DL98 test k_grz at once and slow
 //! k_d4 down to a timeout; the plain clauses the other way round).
 
 use nrese_exec::workers::Workers;
@@ -54,9 +56,10 @@ impl PartialEq for Cancel {
 
 impl Eq for Cancel {}
 
-/// The consistency of `ontology` by whichever of `variants` decides first, each run on a
-/// shared worker with an equal share of the capacity budget. The first decision
-/// cancels siblings immediately; scope completion releases all sibling scratch.
+/// The consistency of `ontology`, each variant run on a shared worker with an equal
+/// share of the capacity budget. A decision signals sibling cancellation immediately;
+/// scope completion waits for every run and releases all sibling scratch. If several
+/// decide, return the first decided outcome in input order, not wall-clock order.
 pub fn race(
     ontology: &Ontology,
     variants: &[&Normalised],
