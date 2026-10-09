@@ -178,6 +178,54 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
 
+### 9 October: shared-runtime candidate fails the initial throughput check
+
+`4e8bd38` → `c888a20` isolates the runtime/worker foundation and plan-inspection
+refactoring from the earlier reuse work. The comparison excludes the subsequent typed
+DL bounds, compiled probes, process-policy and deadline fixes. It is **not accepted as
+performance-neutral**: the Office-PC client regressions below are repeatable. The cause
+is still under investigation; two pool entries for small direct SELECT results are a
+source-level hypothesis, not yet a measured attribution.
+
+Both hosts ran three fresh-process pairs per case, in AB/BA/AB order: LUBM 1 plus
+univ-bench under OWL 2 RL, cache disabled, one warm-up and five query samples; then
+1/2/4/8 clients for three seconds each. `--threads` was omitted on both revisions:
+the candidate's example had not yet wired that option to the new runtime. Defaults
+were 32 available threads on Office-PC (Ryzen 9 5950X) and 16 on Phuoc-Yu (7800X3D).
+Horn 20/1500 classification ran at one/four threads through both standalone examples.
+All answer bags, serialized byte counts and canonical taxonomies matched; no failed or
+unknown result was discarded.
+
+| Host, clients | Baseline queries/s | Candidate queries/s | Change |
+|---|---:|---:|---:|
+| Office, 1 | 2,652.7 | 2,312.0 | −12.8% |
+| Office, 2 | 4,639.0 | 4,167.0 | −10.2% |
+| Office, 4 | 7,640.0 | 7,137.0 | −6.6% |
+| Office, 8 | 11,288.0 | 10,506.0 | −6.9% |
+| Phuoc-Yu, 1/2/4/8 | 3,569 / 6,456.3 / 9,968.7 / 13,137 | 3,311.7 / 5,935.7 / 9,420.3 / 12,605 | −7.2% / −8.1% / −5.5% / −4.1% |
+
+Office's one/two-client losses exceed 10%, lie beyond the observed spread and occur
+in every pair. Its query sum is 4.662 → 5.083 ms; tiny queries add about 20–30 µs.
+No individual query or standalone DL/context latency crosses the joint 10%/2 ms
+screen; this does not erase the throughput loss. Opening an empty store adds about
+2 ms on Office and 1 ms on Phuoc-Yu. Office client-phase RSS rises 288 → 367 MiB at
+two clients and 317 → 421 MiB at four. These are phase peaks: `perf_lab` resets Linux
+RSS high-water marks, so `/usr/bin/time` is not a lifetime-memory measure here.
+Whole-invocation cgroup peaks did not show a repeatable threshold-qualified increase.
+
+Builds used Rust 1.98.1/LLVM 22.1.8 on Office, frozen release dependencies, fat LTO,
+one codegen unit and `-C target-cpu=native`; the exact same binaries ran on Phuoc-Yu
+after CPU-feature, glibc-symbol and hash checks. `perf_lab` uses mimalloc, classifiers
+the system allocator, unchanged between revisions. The repaired quiet guard aborts
+when compilers fail to drain. Measurements used an 8 GiB cgroup with no swap, no CPU
+quota, no build-time nice override, and the existing powersave/boost/THP settings.
+No core pinning or cold-page-cache claim; three pairs are a check, not publication
+qualification. LUBM SHA256 starts `299677a2e26b9317`, schema `2c42947cd544da0b`.
+Full hashes, commands, per-pair counters and raw archive hashes are retained in
+`implementation-benchmark-hosts/tmp/benchmark-initial-c888a20-report.txt` and both
+hosts' `~/nrese-prep-20261009-4e8bd38` work area. Final integration requires a fresh
+comparison, including store-owned DL work and mixed writes.
+
 ### 9 October: QL preparation and configurable context capacity
 
 **QL preparation, `0f9d98c` against `91900f8`.** One SPARQL-owned preparation now supplies
