@@ -43,6 +43,8 @@ the 300-individual choice realisation improves 14–18%. The initial unnecessary
 checkpoint copy was removed and remeasured. These are new, scoped gains, not historical
 v2 numbers or clearance of the runtime regressions. The [DL run record](../benches/runs/2026-10-09-dl-reuse-be5c3d7.toml)
 identifies binaries, source, fixtures, superseded experiments and qualification limits.
+The repair is `a60e482`; normal Office commit/push hooks passed, including affected
+tests, dependent tests, additional semantic seeds, formatting, Clippy and lock checks.
 
 Office's frozen **`4e8bd38` → `77478d1` campaign is complete: 95 cases, 570 invocations,
 three repetitions per side**. Reanalysis with an explicit zero-ms floor flags seven
