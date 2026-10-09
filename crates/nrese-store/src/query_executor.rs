@@ -485,7 +485,17 @@ fn serialize(
             WriteResultsError::Io(error) => StoreError::Io(error),
         });
     }
-    match evaluate_query(view, query, options)? {
+    serialize_answers(prepared, evaluate_query(view, query, options)?, out, alive)
+}
+
+fn serialize_answers(
+    prepared: &PreparedQuery,
+    answers: QueryResults<'_>,
+    out: impl Write,
+    alive: impl Fn() -> StoreResult<()>,
+) -> StoreResult<()> {
+    let version = prepared.rdf12.then_some("1.2");
+    match answers {
         QueryResults::Boolean(value) => {
             results_serializer(prepared, version).serialize_boolean_to_writer(out, value)?;
         }
@@ -514,75 +524,58 @@ fn serialize(
     Ok(())
 }
 
-/// A query's answers, collected (the `owl2-dl` mode compares and completes them before
-/// writing).
-pub(crate) enum Answers {
-    Boolean(bool),
-    Solutions {
-        variables: std::sync::Arc<[nrese_sparql_syntax::term::Variable]>,
-        rows: Vec<Vec<Option<nrese_rdf::Term>>>,
-    },
-    Graph(Vec<nrese_rdf::Triple>),
+pub(crate) use nrese_sparql::TypedResults as Answers;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BOUND_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Evaluates `prepared` on `view` and collects its answers.
-pub(crate) fn evaluate_prepared(
+/// Retains bound results in IDs. An earlier live result reduces this evaluation's
+/// available local memory; its reservation already counts against the shared budget.
+pub(crate) fn evaluate_bound(
     view: &impl ReadView,
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
-) -> StoreResult<Answers> {
-    let options = query_options(prepared, store, cancellation);
-    Ok(match evaluate_query(view, &prepared.query, &options)? {
-        QueryResults::Boolean(value) => Answers::Boolean(value),
-        QueryResults::Solutions(solutions) => {
-            let variables: std::sync::Arc<[nrese_sparql_syntax::term::Variable]> =
-                solutions.variables().into();
-            let mut rows = Vec::new();
-            for solution in solutions {
-                rows.push(solution?.values().to_vec());
-            }
-            Answers::Solutions { variables, rows }
-        }
-        QueryResults::Graph(triples) => Answers::Graph(triples.collect::<Result<Vec<_>, _>>()?),
-    })
+    retained: usize,
+) -> StoreResult<nrese_sparql::TypedResults> {
+    #[cfg(test)]
+    BOUND_EVALUATIONS.with(|n| n.set(n.get() + 1));
+    let mut options = query_options(prepared, store, cancellation);
+    options.memory_limit = options
+        .memory_limit
+        .map(|limit| limit.saturating_sub(retained));
+    Ok(nrese_sparql::evaluate_query_typed(
+        view,
+        &prepared.query,
+        &options,
+    )?)
 }
 
-/// Writes collected answers in `prepared`'s format.
+pub(crate) fn bound_budget(
+    prepared: &PreparedQuery,
+    store: &StoreSettings,
+    retained: usize,
+) -> std::sync::Arc<nrese_exec::Budget> {
+    std::sync::Arc::new(
+        nrese_exec::Budget::new(
+            prepared
+                .memory_limit
+                .unwrap_or(usize::MAX)
+                .saturating_sub(retained),
+        )
+        .within(store.runtime.query_memory()),
+    )
+}
+
+/// Writes retained bound answers through the ordinary result serializer.
 pub(crate) fn write_answers(
     prepared: &PreparedQuery,
     answers: Answers,
     out: impl Write,
 ) -> StoreResult<()> {
-    let version = prepared.rdf12.then_some("1.2");
-    match answers {
-        Answers::Boolean(value) => {
-            results_serializer(prepared, version).serialize_boolean_to_writer(out, value)?;
-        }
-        Answers::Solutions { variables, rows } => {
-            let mut writer = results_serializer(prepared, version)
-                .serialize_solutions_to_writer(out, variables.to_vec())?;
-            for values in rows {
-                writer.serialize(&nrese_sparql::QuerySolution::new(
-                    std::sync::Arc::clone(&variables),
-                    values,
-                ))?;
-            }
-            writer.finish()?;
-        }
-        Answers::Graph(triples) => {
-            let mut serializer = RdfSerializer::from_format(prepared.graph_format.rdf_format());
-            if let Some(version) = version {
-                serializer = serializer.with_version(version);
-            }
-            let mut writer = serializer.for_writer(out);
-            for triple in &triples {
-                writer.serialize_triple(triple)?;
-            }
-            writer.finish()?;
-        }
-    }
-    Ok(())
+    serialize_answers(prepared, answers.into_results(), out, || Ok(()))
 }
 
 /// The results serializer of `prepared`'s format, announcing `version`.

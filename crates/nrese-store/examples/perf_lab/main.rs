@@ -915,6 +915,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     // `NRESE_REASONING_EQUALITY_ANSWERS`).
     let setting = |name: &str| std::env::var(name).unwrap_or_default();
     let config = StoreConfig {
+        execution_threads: args.threads.unwrap_or(0),
         // No result cache unless --cache-bytes: repeated runs measure evaluation.
         query_cache_bytes: args.cache_bytes,
         bulk_load_memory_bytes,

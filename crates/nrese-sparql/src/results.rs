@@ -217,8 +217,6 @@ type Rows<'a> = Box<dyn Iterator<Item = Result<Vec<Option<Term>>, QueryEvaluatio
 pub struct QuerySolutionIter<'a> {
     variables: Arc<[Variable]>,
     rows: Rows<'a>,
-    /// Reservations live as long as the retained result, including an early drop.
-    budget: Option<Arc<nrese_exec::Budget>>,
 }
 
 impl<'a> QuerySolutionIter<'a> {
@@ -230,17 +228,11 @@ impl<'a> QuerySolutionIter<'a> {
         Self {
             variables,
             rows: Box::new(rows),
-            budget: None,
         }
     }
 
     pub fn variables(&self) -> &[Variable] {
         &self.variables
-    }
-
-    pub(crate) fn with_budget(mut self, budget: Arc<nrese_exec::Budget>) -> Self {
-        self.budget = Some(budget);
-        self
     }
 }
 

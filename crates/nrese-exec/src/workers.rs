@@ -104,14 +104,44 @@ impl Workers {
         }
     }
 
-    /// O(n) dispatch, retaining input order and at most `width` concurrent bodies.
-    /// Task bodies must keep nested work within their own allowance. Contiguous chunks
-    /// amortise dispatch and avoid blocking pool threads on an admission semaphore.
+    /// O(n) dispatch of irregular tasks, retaining input order and at most `width`
+    /// concurrent bodies. Narrow lanes claim the next item rather than keeping a
+    /// static share of possibly skewed search work. Task bodies must constrain children.
     pub fn map<T: Sync, R: Send>(&self, items: &[T], f: impl Fn(&T) -> R + Sync + Send) -> Vec<R> {
-        self.map_range(0..items.len(), |i| f(&items[i]))
+        let width = self.for_items(items.len());
+        if width == 1 || width == self.pool_width() || items.len() <= width {
+            return self.map_range(0..items.len(), |i| f(&items[i]));
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        let next = AtomicUsize::new(0);
+        let lanes: Vec<Vec<(usize, R)>> = self.install(|| {
+            (0..width)
+                .into_par_iter()
+                .map(|_| {
+                    std::iter::from_fn(|| {
+                        let i = next.fetch_add(1, Relaxed);
+                        items.get(i).map(|item| (i, f(item)))
+                    })
+                    .collect()
+                })
+                .collect()
+        });
+        // Dense input indices avoid sorting and unsafe shared result writes. The extra
+        // O(n) slots are used only by narrowed irregular batches, never regular kernels.
+        let mut ordered: Vec<Option<R>> =
+            std::iter::repeat_with(|| None).take(items.len()).collect();
+        for (i, value) in lanes.into_iter().flatten() {
+            ordered[i] = Some(value);
+        }
+        ordered
+            .into_iter()
+            .map(|value| value.expect("every input is claimed once"))
+            .collect()
     }
 
-    /// As [`Self::map`], without allocating a vector of indices for a batch range.
+    /// O(n) dispatch of regular ranges, without an allocated vector of indices.
+    /// Narrow allowances use contiguous chunks to amortise dispatch. Prefer [`Self::map`]
+    /// for irregular search tasks; encoding windows have regular, bounded block work.
     pub fn map_range<R: Send>(
         &self,
         items: std::ops::Range<usize>,
@@ -167,6 +197,32 @@ mod tests {
             physical.pool.as_ref().unwrap(),
             workers.pool.as_ref().unwrap()
         ));
+    }
+
+    #[test]
+    fn a_free_narrow_lane_can_take_work_behind_a_busy_lane() {
+        use std::sync::{Condvar, Mutex};
+        let workers = Workers::pooled(4).unwrap().limited(2);
+        let progress = (Mutex::new(false), Condvar::new());
+        let items: Vec<_> = (0..8).collect();
+        let output = workers.map(&items, |&i| {
+            if i == 0 {
+                let (done, wait) = progress
+                    .1
+                    .wait_timeout_while(
+                        progress.0.lock().unwrap(),
+                        std::time::Duration::from_secs(5),
+                        |done| !*done,
+                    )
+                    .unwrap();
+                assert!(*done && !wait.timed_out(), "an idle lane must claim item 1");
+            } else if i == 1 {
+                *progress.0.lock().unwrap() = true;
+                progress.1.notify_all();
+            }
+            i
+        });
+        assert_eq!(output, items);
     }
 
     #[test]

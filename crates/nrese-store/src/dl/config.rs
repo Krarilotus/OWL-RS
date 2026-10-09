@@ -72,7 +72,7 @@ pub struct DlConfig {
     /// Candidate answers a query checks with the exact services at most; the rest are
     /// reported unresolved (`dl.max_candidates`).
     pub max_candidates: usize,
-    /// Workers of a classification (`dl.threads`; 0: every core).
+    /// Maximum workers of a DL operation (`dl.threads`; 0: inherit its runtime).
     pub threads: usize,
     /// The most nodes one hypertableau run may hold (`dl.max_nodes`): a deterministic
     /// budget beside `timeout`.

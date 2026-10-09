@@ -98,6 +98,19 @@ pub fn evaluate_query<'a, V: ReadView>(
     crate::native::evaluate(view.evaluation_snapshot(), query, &for_view(view, options))
 }
 
+/// Retains the evaluator's ID columns and their decoding context for bound comparison.
+pub fn evaluate_query_typed(
+    view: &impl ReadView,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<crate::TypedResults, QueryEvaluationError> {
+    crate::native::typed_results::evaluate(
+        view.evaluation_snapshot().into_owned(),
+        query,
+        &for_view(view, options),
+    )
+}
+
 /// `options` for evaluating on `view`: a transaction's pending state is read once, so its
 /// parts are not offered to the result cache (their snapshot identity is the pending
 /// state's own: they could never be hit).

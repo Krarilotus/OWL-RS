@@ -69,7 +69,7 @@ Key sources: [mutation pipeline](../../crates/nrese-store/src/mutation/pipeline.
 [QL caches](../../crates/nrese-sparql/src/ql/mod.rs),
 [pending snapshot](../../crates/nrese-engine/src/engine/transaction.rs),
 [query options and reporting](../../crates/nrese-store/src/query_executor.rs),
-[DL query path](../../crates/nrese-store/src/dl/query.rs),
+[DL query path](../../crates/nrese-store/src/dl/query/mod.rs),
 [entailment](../../crates/nrese-store/src/dl/entailment.rs),
 [query-plan migration](../design/query-plan.md),
 [DL ownership](../design/owl2-dl.md), [storage ADR](../adr/0002-engine-storage-lsm-permutations.md),
@@ -368,7 +368,7 @@ permutation derivation and sharded interning wins.
 ### P7. Bound parallel work across requests and nested engines
 
 **Policy owner:** store; server supplies transport deadlines; lower engines expose controls.
-Inspect `http/result_stream.rs`, `dl/query::decide`, `nrese-dl::classify::Workers`, the
+Inspect `http/result_stream.rs`, `dl/query/exact`, `nrese-exec::workers::Workers`, the
 context engine's pools, and bulk spilling's dedicated pool.
 
 Measure queue time, active threads, allocations per worker and nested parallel work under
@@ -567,18 +567,14 @@ canonical equality, limits, cancellation, and a cache hit that performs no evalu
 The smaller writer eligibility check is already moved before preparation. The approved
 change is implemented in `0f9d98c`; combined validation and limitations are in the lab log.
 
-**DL worker ownership (P7).** `context::Engine::run` currently creates a pool each round;
-the ABox fixpoint calls it repeatedly, and pool-creation failure falls back to ambient
-Rayon workers. Classification already has a private `Workers` helper with serial fallback.
-The owner chose design discussion before implementation. `dl.threads` is documented for
-classification; exact candidates nevertheless use its width to divide memory while
-executing on ambient Rayon. The demonstrated mismatch is between budgeting and actual
-concurrency, not a documented exact-query thread ceiling. Reusing a pool for a saturation
-operation is a candidate repair, not an accepted global architecture. First resolve runtime
-ownership of physical workers versus each operation's allowance, nested portfolio work,
-concurrent requests and maintenance. Store-local or per-request dedicated pools are not
-assumed to solve admission or oversubscription. Measure startup on tiny tasks, reuse across
-rounds and mixed-load tails. Worker changes remain unimplemented pending discussion.
+**DL worker ownership (P7).** The initial review found per-round context pools and ambient
+candidate dispatch whose width differed from memory division. Following design discussion,
+the owner authorised shared runtime implementation. A catalog now owns one physical pool;
+DL operations narrow it, context rounds reuse it, and candidate children receive an explicit
+worker and memory share. Standalone APIs retain independent operation owners. Native queries,
+output encoding and update WHERE share the runtime; rule materialisation, bulk spill and
+storage maintenance retain separate owners. This is not a universal scheduler or tenant
+fairness policy. Startup, single-client and mixed-load performance qualification is pending.
 
 **Typed DL bounds (P3).** Skipping upper evaluation when a lower ASK is true is the smallest
 independent saving, subject to a guard proving the upper evaluator is not entered. Retaining
@@ -587,7 +583,10 @@ SPARQL context, so two `u64` columns alone do not establish equal terms. Any ret
 must also carry or reconcile that identity domain. Replacing debug-string candidate sorting
 with `Term::Ord` removes formatting work but changes candidate priority under a finite
 `max_candidates` budget; it is a behavioural choice, not a mechanical deduplication cleanup.
-No such ordering change is included without a decision and deterministic coverage.
+The implementation retains the legacy priority while comparing aligned ID rows; dictionary
+identity and computed-value remapping are SPARQL-owned. Lower-true ASK skips upper evaluation,
+and retained lower results are delivered without a second evaluation. Exact work receives only
+the admitted prefix; the upper ID table is still materialised. Timed qualification is pending.
 
 **Premise reuse (P4).** Candidate construction clones the ontology, and `entails`/`nonempty`
 clone it again for each test before normalising/compiling. Try an operation-local reusable

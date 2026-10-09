@@ -53,6 +53,7 @@ mod stream;
 mod strings;
 mod substitute;
 mod triple_terms;
+pub(crate) mod typed_results;
 pub(crate) mod value;
 mod vectors;
 mod wcoj;
@@ -64,9 +65,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
-use crate::results::{
-    CancellationToken, QueryEvaluationError, QueryResults, QuerySolutionIter, QueryTripleIter,
-};
+use crate::results::{CancellationToken, QueryEvaluationError, QueryResults};
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
@@ -157,54 +156,7 @@ pub(crate) fn evaluate<'a>(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<QueryResults<'a>, QueryEvaluationError> {
-    let ctx = Context::new(&snapshot, options, query_dataset(query), query_base(query));
-    let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
-    let pattern = match &options.pre_bound {
-        Some(values) => {
-            // A blank node is put in as an alias IRI that stands for the node.
-            for term in values.values() {
-                if let nrese_rdf::Term::BlankNode(b) = term
-                    && let Some(id) = snapshot.lookup(term.as_ref())
-                {
-                    ctx.register_alias(substitute::alias(b.as_str()).as_str(), id.raw());
-                }
-            }
-            substitute::Values { terms: values }.top(&pattern)
-        }
-        None => pattern,
-    };
-    let (ctx, solutions) = ctx.on_workers(options.workers.as_ref(), |ctx| {
-        ctx.eval_root(&pattern, options.pin.as_ref())
-    })?;
-    match form {
-        Form::Select => {}
-        Form::Describe => {
-            let triples = ctx.describe(&solutions)?;
-            return Ok(QueryResults::Graph(
-                QueryTripleIter::new(triples.into_iter().map(Ok)).with_budget(ctx.budget),
-            ));
-        }
-        Form::Ask => return Ok(QueryResults::Boolean(!solutions.table.is_empty())),
-        Form::Construct(template) => {
-            let computed = ctx.computed.into_inner();
-            let triples: Vec<_> = construct(&snapshot, computed, solutions, template).collect();
-            return Ok(QueryResults::Graph(
-                QueryTripleIter::new(triples.into_iter().map(Ok)).with_budget(ctx.budget),
-            ));
-        }
-    }
-    let variables: Arc<[Variable]> = solutions.vars.clone().into();
-    let computed = ctx.computed.into_inner();
-    let table = solutions.table;
-    let budget = ctx.budget;
-    let rows = (0..table.len()).map(move |row| {
-        Ok((0..table.width())
-            .map(|column| decode(&snapshot, &computed, table.get(row, column)))
-            .collect::<Vec<_>>())
-    });
-    Ok(QueryResults::Solutions(
-        QuerySolutionIter::new(variables, rows).with_budget(budget),
-    ))
+    Ok(typed_results::evaluate(snapshot.into_owned(), query, options)?.into_results())
 }
 
 /// Runs `query`, recording each operator ([`PlanStep`]); returns the rewrites that changed
