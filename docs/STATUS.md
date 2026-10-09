@@ -41,6 +41,19 @@ repair is accepted from these measurements alone. The native comparison's 2 ms f
 does not establish neutrality for tiny queries. Scope, protocol, correctness limits and
 evidence are in the [performance lab log](design/performance.md#6-lab-log-of-the-performance-phase-from-5-october-2026).
 
+Benchmark-validation follow-up `08e8b4a` passed the normal Office commit/push hooks:
+55 Python suite contracts, 83 Rust harness tests, formatting and Clippy. Independent
+repetition identities and per-client-width throughput now remain visible; explicit
+microcase analysis can remove the absolute 2 ms floor without relaxing noise checks.
+The bounded write-scaling repair supports GraphDB alone and checks numeric Person
+and probe results. Its counts do not validate every generated triple or an inferred
+closure. GraphDB uses the selected Free edition with explicit limits; the
+[complete workload map](../benches/competitors/README.md#graphdb-comparison-coverage-and-qualification-9-october-2026)
+distinguishes ready paths, missing adapters and incomparable semantics. Licensed
+measurements stay private. These benchmark repairs change no engine runtime code.
+The subsequent single-block worker-coalescing proposal remains discussion-only;
+neither profiles nor pool-width diagnostics clear runtime performance acceptance.
+
 Validation at `583c422`: all milestone stages passed, including 1,335 workspace tests,
 doc tests, 79 harness tests, the suite-contract check (16 tests, five Linux-only cases
 skipped on Windows), fmt, clippy, locks and deny. Console checks were skipped because
