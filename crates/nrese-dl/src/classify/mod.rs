@@ -45,6 +45,9 @@ pub use realise::{Realisation, realise};
 pub struct Options {
     /// Workers; 1 runs everything on the calling thread.
     pub threads: usize,
+    /// Reusable physical workers supplied by an embedding runtime. `threads` narrows
+    /// their allowance. Without an owner, classification creates one pool for its run.
+    pub workers: Option<nrese_exec::workers::Workers>,
     /// Classify Horn ontologies with the context core (else the tableau driver only).
     pub context_core: bool,
     /// Eliminate the fresh names resolution can eliminate ([`inline`]).
@@ -96,6 +99,13 @@ pub struct Options {
 }
 
 impl Options {
+    pub(crate) fn workers(&self) -> nrese_exec::workers::Workers {
+        self.workers.as_ref().map_or_else(
+            || Workers::new(self.threads.max(1)).unwrap_or_else(|_| Workers::serial()),
+            |workers| workers.limited(self.threads.max(1)),
+        )
+    }
+
     /// The context core's options for a run of the driver within `budget` (no proofs).
     pub(crate) fn core(&self, budget: crate::context::Budget) -> crate::context::Options {
         crate::context::Options {
@@ -113,6 +123,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             threads: 1,
+            workers: None,
             context_core: true,
             inline: true,
             horn_lower_bound: true,
@@ -237,39 +248,15 @@ pub(crate) fn trace(what: &str) {
     }
 }
 
-/// The workers of a run: the calling thread alone for one, else a pool of their own
-/// (never rayon's global pool, so a run uses the threads it was given).
-pub(crate) struct Workers(Option<rayon::ThreadPool>);
-
-impl Workers {
-    pub(crate) fn new(threads: usize) -> Self {
-        if threads <= 1 {
-            return Self(None);
-        }
-        Self(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .ok(),
-        )
-    }
-
-    /// `f` of each item, in order.
-    pub(crate) fn map<T: Sync, R: Send>(
-        &self,
-        items: &[T],
-        f: impl Fn(&T) -> R + Sync + Send,
-    ) -> Vec<R> {
-        use rayon::prelude::*;
-        match &self.0 {
-            Some(pool) => pool.install(|| items.par_iter().map(&f).collect()),
-            None => items.iter().map(f).collect(),
-        }
-    }
-}
+use nrese_exec::workers::Workers;
 
 /// Classifies `ontology`.
 pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
+    let mut owned = options.clone();
+    let workers = options.workers();
+    owned.threads = workers.width();
+    owned.workers = Some(workers.clone());
+    let options = &owned;
     let started = Instant::now();
     let deadline = Deadline::new(options.timeout);
     let classes = crate::context::signature(ontology);
@@ -282,8 +269,13 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
     if options.context_core {
         let core = options.core(deadline.budget(options, None));
         let t = Instant::now();
-        if let Ok(saturated) = crate::context::saturate_normalised(&normalised, &classes, &core)
-            && saturated.complete()
+        if let Ok(saturated) = crate::context::classify::saturate_normalised_with_workers(
+            &normalised,
+            &classes,
+            &core,
+            options.tableau.cancel.clone(),
+            &workers,
+        ) && saturated.complete()
         {
             let classification = saturated.classification();
             let profile = Profile {

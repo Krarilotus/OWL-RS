@@ -74,6 +74,21 @@ impl fmt::Debug for StoreService {
 impl StoreService {
     pub fn new(config: StoreConfig) -> StoreResult<Self> {
         config.validate()?;
+        let runtime = std::sync::Arc::new(crate::Runtime::new(
+            config.execution_threads,
+            config.total_query_memory_bytes,
+        )?);
+        Self::with_runtime(config, runtime)
+    }
+
+    /// Opens a store on resources shared with other stores. A catalog uses this for
+    /// every repository; embedded applications can supply the same owner explicitly.
+    pub fn with_runtime(
+        config: StoreConfig,
+        runtime: std::sync::Arc<crate::Runtime>,
+    ) -> StoreResult<Self> {
+        config.validate()?;
+        runtime.validate(&config)?;
         nrese_engine::set_index_encoding(config.index_encoding);
         nrese_engine::set_vocabulary_encoding(config.vocabulary);
         // Reasoning stops at the process's memory limit on every path, the DL bounds'
@@ -109,8 +124,7 @@ impl StoreService {
         let settings = crate::query_executor::StoreSettings {
             union_default_graph: config.union_default_graph,
             geosparql_stated_only: config.geosparql_stated_only,
-            query_memory: (config.total_query_memory_bytes > 0)
-                .then(|| nrese_sparql::SharedBudget::new(config.total_query_memory_bytes)),
+            runtime,
             services: std::sync::Arc::default(),
             equality_closed: std::sync::Arc::default(),
             equality_canonical: config.equality_canonical_answers,
@@ -333,10 +347,11 @@ impl StoreService {
 
     /// What this store's updates are evaluated with.
     fn update_context<'a>(
-        &self,
+        &'a self,
         cancellation: &'a CancellationToken,
     ) -> crate::mutation::command::UpdateContext<'a> {
         crate::mutation::command::UpdateContext {
+            runtime: self.runtime(),
             cancellation,
             union_default_graph: self.config.union_default_graph,
             geosparql_stated_only: self.config.geosparql_stated_only,
@@ -746,6 +761,10 @@ impl StoreService {
         &self.settings
     }
 
+    pub fn runtime(&self) -> &std::sync::Arc<crate::Runtime> {
+        &self.settings.runtime
+    }
+
     /// Runs a prepared query on the latest snapshot to completion and reports how it ran:
     /// the executor, each operator with estimated and actual rows, and times.
     pub fn explain_query(
@@ -812,7 +831,7 @@ impl StoreService {
     /// once, and the limit; `None` without a limit
     /// ([`StoreConfig::total_query_memory_bytes`]).
     pub fn query_memory(&self) -> Option<(usize, usize, usize)> {
-        let budget = self.settings.query_memory.as_ref()?;
+        let budget = self.settings.runtime.query_memory()?;
         Some((budget.used(), budget.peak(), budget.limit()))
     }
 

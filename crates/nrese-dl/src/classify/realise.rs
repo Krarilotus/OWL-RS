@@ -20,7 +20,7 @@ use std::time::Instant;
 use nrese_owl::{Axiom, ClassExpr, EntityKind, Ontology, Term};
 
 use super::driver::{insert_sorted, intersect_opt, reason, union_into};
-use super::{Classification, Deadline, Options, Profile, Taxonomy, Workers, classify};
+use super::{Classification, Deadline, Options, Profile, Taxonomy, classify};
 use crate::tableau::{self, Answer, At, Labels, Prepared, Probe, ProbeOutcome, Want};
 
 const THING: &str = "http://www.w3.org/2002/07/owl#Thing";
@@ -73,6 +73,11 @@ pub fn individuals(ontology: &Ontology) -> Vec<Term> {
 
 /// Classifies `ontology` and realises its individuals.
 pub fn realise(ontology: &Ontology, options: &Options) -> Realisation {
+    let mut owned = options.clone();
+    let workers = options.workers();
+    owned.threads = workers.width();
+    owned.workers = Some(workers);
+    let options = &owned;
     let started = Instant::now();
     let deadline = Deadline::new(options.timeout);
     let taxonomy = classify(ontology, options);
@@ -248,7 +253,7 @@ impl<'a> Work<'a> {
                 p.iter().filter(|d| types.binary_search(d).is_err()).count()
             }) as u64;
         }
-        let workers = Workers::new(self.options.threads);
+        let workers = self.options.workers();
         // Waves: each individual's most general open candidate, over the workers.
         let wave = (self.options.threads * 4).max(1);
         let mut cursor = 0usize;

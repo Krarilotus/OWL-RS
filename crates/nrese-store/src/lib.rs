@@ -29,6 +29,7 @@ mod rdf_io;
 pub mod reasoning;
 pub mod reasoning_state;
 pub mod running;
+mod runtime;
 pub mod scope;
 pub mod service;
 pub mod sessions;
@@ -89,6 +90,7 @@ pub use rdf_io::{convert_file, parse_payload, parse_payload_preserving_blank_nod
 pub use reasoning::{InferenceStep, MaterialisationReport, OntologyDiagnostic};
 pub use reasoning_state::{ConsistencyStatus, ReasoningState};
 pub use running::{RunningQueries, RunningQuery};
+pub use runtime::Runtime;
 pub use scope::{ReadContext, ReadScope, Requester, WriteScope};
 pub use service::StoreService;
 pub use sessions::{SESSION_IDLE, Sessions};

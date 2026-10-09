@@ -38,6 +38,11 @@ pub struct StoreConfig {
     /// unlimited. A query that asks for more than is left fails with
     /// [`StoreError::is_server_memory_limit`](crate::StoreError::is_server_memory_limit).
     pub total_query_memory_bytes: usize,
+    /// Physical workers for native SPARQL execution and DL search, shared by this
+    /// store and its catalog's repositories (`execution.threads`). Zero uses available
+    /// parallelism. DL task widths may narrow this owner. Rule materialisation, bulk
+    /// loading and background storage work retain their existing execution owners.
+    pub execution_threads: usize,
     /// The memory the process may hold before a long operation (a materialisation, the
     /// reasoning of a commit) stops with [`StoreError::ProcessMemoryLimit`](crate::StoreError::ProcessMemoryLimit)
     /// instead of taking the machine; 0 is no limit. By default three quarters of what the
@@ -248,6 +253,7 @@ impl StoreConfig {
             union_default_graph: false,
             geosparql_stated_only: false,
             total_query_memory_bytes: 0,
+            execution_threads: 0,
             process_memory_bytes: default_process_memory_bytes(),
             huge_pages: DEFAULT_HUGE_PAGES,
             federation: FederationConfig::default(),
@@ -281,6 +287,7 @@ impl StoreConfig {
             union_default_graph: false,
             geosparql_stated_only: false,
             total_query_memory_bytes: 0,
+            execution_threads: 0,
             process_memory_bytes: default_process_memory_bytes(),
             huge_pages: DEFAULT_HUGE_PAGES,
             federation: FederationConfig::default(),

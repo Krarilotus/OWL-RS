@@ -133,6 +133,18 @@ pub fn saturate_with_cancel(
     options: &Options,
     cancel: Option<crate::tableau::Cancel>,
 ) -> Result<Saturated, Unsupported> {
+    let workers = nrese_exec::workers::Workers::new(options.threads.max(1))
+        .unwrap_or_else(|_| nrese_exec::workers::Workers::serial());
+    saturate_with_workers(ontology, options, cancel, &workers)
+}
+
+/// Normalises and saturates on caller-owned physical workers.
+pub fn saturate_with_workers(
+    ontology: &Ontology,
+    options: &Options,
+    cancel: Option<crate::tableau::Cancel>,
+    workers: &nrese_exec::workers::Workers,
+) -> Result<Saturated, Unsupported> {
     if cancel
         .as_ref()
         .is_some_and(crate::tableau::Cancel::is_cancelled)
@@ -143,7 +155,8 @@ pub fn saturate_with_cancel(
     let normalised = normalise_with(ontology, options.normalise);
     let normalise = started.elapsed();
     let classes = signature(ontology);
-    let mut saturated = saturate_normalised_with_cancel(&normalised, &classes, options, cancel)?;
+    let mut saturated =
+        saturate_normalised_with_workers(&normalised, &classes, options, cancel, workers)?;
     saturated.profile.normalise = normalise;
     Ok(saturated)
 }
@@ -164,6 +177,21 @@ fn saturate_normalised_with_cancel(
     options: &Options,
     cancel: Option<crate::tableau::Cancel>,
 ) -> Result<Saturated, Unsupported> {
+    let workers = nrese_exec::workers::Workers::new(options.threads.max(1))
+        .unwrap_or_else(|_| nrese_exec::workers::Workers::serial());
+    saturate_normalised_with_workers(normalised, classes, options, cancel, &workers)
+}
+
+/// Saturates using caller-owned workers. The pool survives all ABox rounds and is not
+/// retained by the returned logical state.
+pub fn saturate_normalised_with_workers(
+    normalised: &nrese_owl::Normalised,
+    classes: &[Term],
+    options: &Options,
+    cancel: Option<crate::tableau::Cancel>,
+    workers: &nrese_exec::workers::Workers,
+) -> Result<Saturated, Unsupported> {
+    let workers = workers.limited(options.threads.max(1));
     if cancel
         .as_ref()
         .is_some_and(crate::tableau::Cancel::is_cancelled)
@@ -171,7 +199,7 @@ fn saturate_normalised_with_cancel(
         return Err(Unsupported::Budget);
     }
     let mut profile = Profile {
-        threads: options.threads.max(1),
+        threads: workers.width(),
         ..Profile::default()
     };
     let started = Instant::now();
@@ -208,11 +236,11 @@ fn saturate_normalised_with_cancel(
     seeds.push(top);
     let mut memory = engine.memory_charge();
     memory.set(super::memory::vec(&query) + super::memory::vec(&seeds));
-    engine.run(&seeds, options.threads);
+    engine.run_with_workers(&seeds, &workers);
     if engine.out_of_budget() {
         return Err(Unsupported::Budget);
     }
-    let individuals = Individuals::saturate(&engine, &abox, options.threads);
+    let individuals = Individuals::saturate_with_workers(&engine, &abox, &workers);
     if engine.out_of_budget() {
         return Err(Unsupported::Budget);
     }

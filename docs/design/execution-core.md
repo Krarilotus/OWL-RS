@@ -1,6 +1,6 @@
 # Execution core and native query engine (XC, Pf3, Pf4)
 
-As built at `0f46563` (9 October 2026). Ownership follows
+As built on the performance/architecture branch (9 October 2026). Ownership follows
 [ARCHITECTURE.md](../ARCHITECTURE.md); the remaining query-plan migration is in
 [query-plan.md](query-plan.md). Measured wins and their guards live in
 [performance.md §0](performance.md#0-wins-to-keep-check-these-before-a-rewrite-and-guard-them).
@@ -50,6 +50,31 @@ group planning, scheduling and result interning remain in the executor. Calendar
 OWL datatype semantics retain their separate owners. Owned ID-table projection moves
 selected column buffers and preserves the surviving sort prefix; selecting a column
 more than once copies only its additional occurrences.
+
+### Physical workers and resource lifetime
+
+The store's `Runtime` owns the physical `nrese_exec::workers::Workers` pool and the
+shared query budget. A catalog and its system store share this owner. Native SPARQL
+computation moves its context into that pool and returns it with the result, retaining
+the computed-ID domain. Writers, callbacks and transactions stay on their caller;
+encoding windows return owned bytes before the caller writes them. A slow writer does
+not occupy a pool thread while waiting for output backpressure.
+
+DL classification, realisation and saturation reuse physical workers across phases and
+rounds. A smaller `Workers::limited` handle bounds participating batch dispatch; it is
+not a semaphore or a quota automatically inherited by arbitrary nested Rayon work.
+Child work must partition its allowance explicitly. Full-width batches retain Rayon
+work stealing; narrow batches use bounded lanes. Context activation uses nonblocking
+drains when narrowed, with enqueue and drain retirement under the same lock. Tableau
+portfolio siblings share a cancellation child and cannot cancel their request parent.
+
+Live native results retain their capacity reservation until drop. Update WHERE consumes
+the same catalog budget. These are accounted capacities, not process RSS or a strict
+allocation ceiling: decoded graph payloads, encoder buffers and runtime overhead still
+have separate lifetimes. DL task accounting remains distinct from the shared native
+query budget. Rule materialisation, bulk spilling and background storage retain their
+existing execution owners. See [configuration](../ops/config-reference.md#cpu-execution)
+for the precise control surface and standalone embedding behavior.
 
 ## 3. Storage access
 

@@ -23,6 +23,9 @@ pub struct QueryOptions {
     /// The server's budget for all running queries together, which this query's memory
     /// counts against as well.
     pub shared_memory: Option<std::sync::Arc<nrese_exec::SharedBudget>>,
+    /// Physical CPU workers supplied by the operation owner. Serialisation stays on
+    /// the caller; native evaluation and its parallel kernels enter this pool.
+    pub workers: Option<nrese_exec::workers::Workers>,
     /// Which statements the query reads: asserted and inferred (the default), or one
     /// stack (GraphDB's `infer=false`, `FROM onto:explicit` / `onto:implicit`).
     pub read_model: nrese_engine::ReadModel,
