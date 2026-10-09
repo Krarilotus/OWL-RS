@@ -122,11 +122,27 @@ pub fn classify(
 
 /// Normalises, compiles and saturates `ontology`.
 pub fn saturate(ontology: &Ontology, options: &Options) -> Result<Saturated, Unsupported> {
+    saturate_with_cancel(ontology, options, None)
+}
+
+/// As [`saturate`], stopping at budget checkpoints when the caller cancels.
+/// Normalisation and compilation are checked at their boundaries.
+pub fn saturate_with_cancel(
+    ontology: &Ontology,
+    options: &Options,
+    cancel: Option<crate::tableau::Cancel>,
+) -> Result<Saturated, Unsupported> {
+    if cancel
+        .as_ref()
+        .is_some_and(crate::tableau::Cancel::is_cancelled)
+    {
+        return Err(Unsupported::Budget);
+    }
     let started = Instant::now();
     let normalised = normalise_with(ontology, options.normalise);
     let normalise = started.elapsed();
     let classes = signature(ontology);
-    let mut saturated = saturate_normalised(&normalised, &classes, options)?;
+    let mut saturated = saturate_normalised_with_cancel(&normalised, &classes, options, cancel)?;
     saturated.profile.normalise = normalise;
     Ok(saturated)
 }
@@ -138,6 +154,21 @@ pub fn saturate_normalised(
     classes: &[Term],
     options: &Options,
 ) -> Result<Saturated, Unsupported> {
+    saturate_normalised_with_cancel(normalised, classes, options, None)
+}
+
+fn saturate_normalised_with_cancel(
+    normalised: &nrese_owl::Normalised,
+    classes: &[Term],
+    options: &Options,
+    cancel: Option<crate::tableau::Cancel>,
+) -> Result<Saturated, Unsupported> {
+    if cancel
+        .as_ref()
+        .is_some_and(crate::tableau::Cancel::is_cancelled)
+    {
+        return Err(Unsupported::Budget);
+    }
     let mut profile = Profile {
         threads: options.threads.max(1),
         ..Profile::default()
@@ -155,7 +186,11 @@ pub fn saturate_normalised(
     let named = program.named();
     let engine = Engine::new(program, options.strategy, options.proofs)
         .with_budget(options.budget)
+        .with_cancel(cancel)
         .with_prune_pred(options.prune_pred);
+    if engine.out_of_budget() {
+        return Err(Unsupported::Budget);
+    }
     let query: Vec<ContextId> = (0..named)
         .map(|c| engine.context_for(&[Atom::concept(c, CTerm::X)]).0)
         .collect();
@@ -163,8 +198,11 @@ pub fn saturate_normalised(
     let mut seeds = query.clone();
     seeds.push(top);
     engine.run(&seeds, options.threads);
+    if engine.out_of_budget() {
+        return Err(Unsupported::Budget);
+    }
     let individuals = Individuals::saturate(&engine, &abox, options.threads);
-    if engine.exhausted() {
+    if engine.out_of_budget() {
         return Err(Unsupported::Budget);
     }
     profile.saturate = started.elapsed();

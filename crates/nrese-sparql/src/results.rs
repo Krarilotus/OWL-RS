@@ -58,7 +58,7 @@ impl CancellationToken {
     }
 
     /// The flag itself, for loops that check it without knowing the token.
-    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+    pub fn flag(&self) -> Arc<AtomicBool> {
         self.0.clone()
     }
 }

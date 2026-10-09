@@ -540,7 +540,7 @@ impl Rewriter<'_> {
     }
 
     /// Whether the data the query reads has the tree of `probe` at every individual of
-    /// each concept it folds to (once per snapshot revision and probe; `false` where the
+    /// each concept it folds to (once per snapshot view and probe; `false` where the
     /// rewriting has no data to ask or can't write the question).
     fn realised(&mut self, probe: &Probe<'_>) -> bool {
         let Some(data) = self.data else {
@@ -581,7 +581,7 @@ impl Rewriter<'_> {
             return false;
         };
         let other = TermPattern::Variable(Variable::new_unchecked("_qlr_other"));
-        let revision = self.snapshot.revision();
+        let identity = self.snapshot.identity();
         // What a question reads, counted before it runs: each triple pattern's statements
         // with its constant predicate (and class).
         let model = data.options.read_model;
@@ -657,15 +657,17 @@ impl Rewriter<'_> {
             let snapshot = self.snapshot;
             let asked = &mut self.report.checks;
             let budget = self.limits.checks;
-            let has = data.ql.realised(revision, &key, || {
+            let has = data.ql.realised(identity, &key, || {
                 if *asked >= budget {
                     return None;
                 }
                 *asked += 1;
-                Some(matches!(
-                    crate::query::evaluate_query(snapshot, &query, &data.options),
-                    Ok(crate::results::QueryResults::Boolean(false))
-                ))
+                match crate::query::evaluate_query(snapshot, &query, &data.options) {
+                    Ok(crate::results::QueryResults::Boolean(missing)) => Some(!missing),
+                    // A cancelled or otherwise failed probe says nothing about the data.
+                    // Leave it uncached so a later request can ask again.
+                    _ => None,
+                }
             });
             if !has {
                 return false;
