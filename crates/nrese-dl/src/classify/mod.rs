@@ -86,7 +86,7 @@ pub struct Options {
     /// left, and the classes whose saturation reaches its context aren't exact.
     pub max_join_steps: usize,
     /// The most memory the process may hold while the context core runs (bytes; `None`:
-    /// three quarters of what the machine or container has).
+    /// three quarters of what the machine or container has; `Some(0)`: disabled).
     pub max_memory: Option<u64>,
     /// Capacity budget of each context saturation, independent of the process ceiling.
     /// `None` disables task accounting. The tableau's per-worker limit remains in `tableau`.
@@ -219,7 +219,8 @@ impl Deadline {
             // allocation failure would end the process (ore_ont_9724 under equality).
             max_memory: options
                 .max_memory
-                .or_else(|| nrese_exec::memory::available_bytes().map(|b| b / 4 * 3)),
+                .or_else(|| nrese_exec::memory::available_bytes().map(|b| b / 4 * 3))
+                .filter(|&bytes| bytes != 0),
             task_memory: options.task_memory,
         }
     }
@@ -323,4 +324,28 @@ pub(crate) fn classify_normalised(
     deadline: Deadline,
 ) -> Taxonomy {
     driver::Driver::new(ontology, normalised, classes, options, deadline).classify()
+}
+
+#[cfg(test)]
+mod memory_policy_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_zero_disables_the_watch_instead_of_selecting_the_auto_default() {
+        let deadline = Deadline::new(None);
+        let mut options = Options {
+            max_memory: Some(0),
+            ..Options::default()
+        };
+        assert_eq!(deadline.budget(&options, None).max_memory, None);
+        options.max_memory = Some(1);
+        assert_eq!(deadline.budget(&options, None).max_memory, Some(1));
+        options.max_memory = None;
+        assert_eq!(
+            deadline.budget(&options, None).max_memory,
+            nrese_exec::memory::available_bytes()
+                .map(|b| b / 4 * 3)
+                .filter(|&b| b != 0)
+        );
+    }
 }

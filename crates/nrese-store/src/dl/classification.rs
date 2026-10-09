@@ -5,6 +5,8 @@
 //!
 //! Results are kept per revision: a second request on an unchanged store, and the lower
 //! bound's use of them, cost nothing.
+//! The context core receives the store's explicit process-memory policy, including zero
+//! to disable its watch; opening another store cannot change that policy.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -23,13 +25,14 @@ pub(crate) struct Cache {
 }
 
 /// How the engines run under the store's settings.
-fn options(store: &StoreService) -> classify::Options {
+pub(super) fn options(store: &StoreService) -> classify::Options {
     let config = &store.config().dl;
-    let workers = store.runtime().workers().limited(config.workers());
+    let workers = store.runtime().workers().limited(config.threads);
     let mut options = config.classification_options();
     options.threads = workers.width();
     options.tableau.max_memory = config.memory_per_worker(workers.width());
     options.workers = Some(workers);
+    options.max_memory = Some(store.config().process_memory_bytes);
     options
 }
 

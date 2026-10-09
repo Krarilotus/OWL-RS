@@ -47,8 +47,9 @@ pub fn available_bytes() -> Option<u64> {
 }
 
 /// The process's memory limit, for long operations whose caller passes no watch of its
-/// own: set by whoever owns the process's configuration (the store, from
-/// `process_memory_bytes`), polled through [`process_limit_exceeded`] by the operations
+/// own: set by whoever owns the process's configuration (server startup, or an explicit
+/// embedding host), never by opening a store. Polled through [`process_limit_exceeded`]
+/// by the operations
 /// that can grow without bound (the reasoner's materialisations and commits). 0: none.
 static PROCESS_LIMIT: AtomicU64 = AtomicU64::new(0);
 /// Microseconds since [`PROCESS_EPOCH`] of the last reading for the process limit.

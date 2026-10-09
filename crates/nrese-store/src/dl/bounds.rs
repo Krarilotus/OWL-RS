@@ -11,6 +11,10 @@
 //!   snapshot with U1's facts in its inferred stack, never published, and which
 //!   predicates and classes U1 has facts on beyond L (the gap's signature). A revision U1
 //!   doesn't describe (a write past the pipeline, a start) gets U1 built afresh.
+//!
+//! Every U1 evaluation carries this store's `MemoryWatch` through `Stop`, including
+//! embedded reads and diagnostic rebuilds. A stopped U1 is unavailable, never complete;
+//! zero disables the store's watch without changing the process owner's fallback.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -24,6 +28,10 @@ use nrese_reasoner::ir::Triple;
 use super::source;
 use super::upper::{Change, GaveUp, Upper};
 use crate::StoreService;
+
+#[cfg(test)]
+#[path = "bounds_memory_tests.rs"]
+mod memory_tests;
 
 /// U1 at a revision.
 struct State {
@@ -143,7 +151,10 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     let base = tx.base().revision();
     let pending = tx.pending_snapshot();
     let deadline = Instant::now() + store.config().dl.timeout;
-    let stop = move || stop() || Instant::now() >= deadline;
+    let watch = store.memory_watch();
+    let stop = move || {
+        stop() || Instant::now() >= deadline || watch.as_ref().is_some_and(|w| w.exceeded())
+    };
     let state = store
         .dl()
         .bounds
@@ -367,7 +378,10 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
             false => {
                 let normalised = nrese_owl::normalise(&ontology);
                 let deadline = Instant::now() + store.config().dl.timeout;
-                let stop = move || Instant::now() >= deadline;
+                let watch = store.memory_watch();
+                let stop = move || {
+                    Instant::now() >= deadline || watch.as_ref().is_some_and(|w| w.exceeded())
+                };
                 let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve(replica, &tx, t);
                 Upper::build(&ontology, &normalised, &snapshot, &resolve, &stop)
             }
@@ -603,12 +617,15 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
         }
         let ontology = source::read_snapshot(&snapshot);
         let normalised = nrese_owl::normalise(&ontology);
+        let watch = store.memory_watch();
+        let deadline = Instant::now() + store.config().dl.timeout;
+        let stop = || Instant::now() >= deadline || watch.as_ref().is_some_and(|w| w.exceeded());
         let upper = Upper::build(
             &ontology,
             &normalised,
             &snapshot,
             &|t| source::resolve(replica, &tx, t),
-            nrese_reasoner::eval::NEVER,
+            &stop,
         )
         .ok()?;
         upper.stack.iter().collect()

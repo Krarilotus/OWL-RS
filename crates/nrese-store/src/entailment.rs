@@ -19,6 +19,8 @@
 //! The answer is sound; it is complete as far as the rules are for the premise (OWL 2 RL
 //! premises and the forms above). A conclusion outside them may be entailed although the
 //! answer is no.
+//! Refutation uses the store's process-memory watch; interruption is an error, never
+//! a negative entailment answer or an assumed-unreachable panic.
 
 use std::collections::HashSet;
 
@@ -83,7 +85,7 @@ impl StoreService {
             return Ok(Entailment::NotEntailed);
         }
         for opposite in &split.refutations {
-            if !self.refutes(&program, opposite) {
+            if !self.refutes(&program, opposite)? {
                 return Ok(Entailment::NotEntailed);
             }
         }
@@ -116,7 +118,9 @@ impl StoreService {
 
     /// Whether adding `opposite` to the data makes it inconsistent under `program`: the
     /// reasoner maintains the closure over a speculative transaction, which is dropped.
-    fn refutes(&self, program: &RuleProgram, opposite: &[Triple]) -> bool {
+    fn refutes(&self, program: &RuleProgram, opposite: &[Triple]) -> StoreResult<bool> {
+        let watch = self.memory_watch();
+        let stop = || watch.as_ref().is_some_and(|watch| watch.exceeded());
         let config = self.config();
         let mut tx = self.engine().speculative();
         for t in opposite {
@@ -133,9 +137,15 @@ impl StoreService {
             .by_representatives(config.equality_by_representatives)
             .storing_representatives(config.equality_compact);
         let done =
-            nrese_reasoner::engine::maintain(&compiled, None, &mut tx, nrese_reasoner::eval::NEVER)
-                .expect("never stopped");
-        !done.violations.is_empty()
+            nrese_reasoner::engine::maintain(&compiled, None, &mut tx, &stop).map_err(|_| {
+                StoreError::ProcessMemoryLimit {
+                    limit: watch.as_ref().filter(|w| w.exceeded()).map_or_else(
+                        || nrese_exec::memory::process_limit().unwrap_or(0),
+                        |w| w.limit(),
+                    ),
+                }
+            })?;
+        Ok(!done.violations.is_empty())
     }
 }
 
@@ -388,5 +398,44 @@ impl StoreService {
             answer: entails_ontology(&premise, &read, &fresh, &budget),
             premise: checked.verdict,
         })
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    use crate::StoreConfig;
+    use nrese_reasoner::rulesets::Ruleset;
+
+    #[test]
+    fn embedded_refutation_and_equality_diagnostics_obey_the_store_watch() {
+        if nrese_exec::memory::process_bytes().is_none() {
+            return;
+        }
+        let opposite = Triple::new(
+            nrese_rdf::NamedNode::new_unchecked("urn:test:a"),
+            owl::SAME_AS,
+            nrese_rdf::NamedNode::new_unchecked("urn:test:b"),
+        );
+        for limit in [1, 0] {
+            let store = StoreService::new(StoreConfig {
+                process_memory_bytes: limit,
+                ..StoreConfig::in_memory()
+            })
+            .unwrap();
+            let result = store.refutes(&Ruleset::Owl2Rl.into(), std::slice::from_ref(&opposite));
+            let diagnostic = store.equality_report(Ruleset::Owl2Rl);
+            if limit == 1 {
+                assert!(matches!(
+                    result,
+                    Err(StoreError::ProcessMemoryLimit { limit: 1 })
+                ));
+                assert_eq!(diagnostic, "equality: stopped by the process memory limit");
+            } else {
+                assert!(!result.unwrap());
+                assert!(diagnostic.contains("replicated closure"));
+                assert!(!diagnostic.contains("stopped"));
+            }
+        }
     }
 }
