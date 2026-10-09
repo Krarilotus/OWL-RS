@@ -9,6 +9,7 @@
 //!   --threads N       saturation workers (default 1)
 //!   --strategy S      `cautious` (default), `eager` or `split`
 //!   --no-proofs       don't record derivations
+//!   --task-memory-mib N  optional saturation capacity budget; 0 is unlimited
 //!   --repeat N        classify N times; times are the median of the runs
 //!   --compare-el      also classify with the EL classifier (`nrese_reasoner::classify`) on
 //!                     the same triples, runs interleaved (ABAB), and compare the taxonomies
@@ -162,6 +163,17 @@ fn args() -> Result<Args, String> {
             "--out" => a.out = it.next(),
             "--tax" => a.tax = it.next(),
             "--no-proofs" => a.options.proofs = false,
+            "--task-memory-mib" => {
+                let mib = number("--task-memory-mib")?;
+                a.options.budget.task_memory = if mib == 0 {
+                    None
+                } else {
+                    Some(
+                        mib.checked_mul(1024 * 1024)
+                            .ok_or("memory budget overflow")?,
+                    )
+                };
+            }
             "--compare-el" => a.compare = true,
             "--strategy" => {
                 a.options.strategy = match it.next().as_deref() {

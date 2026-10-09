@@ -975,7 +975,7 @@ fn decide(
                 }
                 let budget = consistency::Budget {
                     timeout: deadline.saturating_duration_since(Instant::now()),
-                    memory_bytes: config.memory_bytes / config.workers().max(1),
+                    memory_bytes: config.memory_per_worker(config.workers()),
                     threads: 1,
                     cancel: Some(cancel.clone()),
                     max_nodes: config.max_nodes,

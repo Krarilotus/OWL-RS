@@ -31,6 +31,7 @@ pub mod engine;
 pub mod equality;
 pub mod horn;
 pub mod links;
+mod memory;
 pub mod profile;
 pub mod program;
 pub mod rules;

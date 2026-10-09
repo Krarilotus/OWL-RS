@@ -18,6 +18,10 @@ impl Worker<'_> {
             return;
         };
         let mut body = Vec::with_capacity(self.state.clauses.body(c).len());
+        let mut memory = self.engine.memory_charge();
+        if !memory.set(super::memory::vec(&body)) {
+            return;
+        }
         for &a in self.state.clauses.body(c) {
             match a.up(f) {
                 Some(b) => body.push(b),
@@ -30,6 +34,7 @@ impl Worker<'_> {
             context: self.out.me,
             clause: c,
         };
+        drop(memory); // The outgoing message takes ownership of this payload.
         self.out.send(
             u,
             Message::Pred {
@@ -51,8 +56,13 @@ impl Worker<'_> {
         s.waiting.clear();
         s.waiting.extend_from_slice(waiting);
         s.found.clear();
-        s.batch.clear();
+        s.clear_batch();
         let waiting = std::mem::take(&mut s.waiting);
+        s.check_memory();
+        let mut memory = self.engine.memory_charge();
+        if !memory.set(super::memory::vec(&waiting)) {
+            return;
+        }
         for &r in &waiting {
             let at = self.state.remote[r as usize]
                 .body
@@ -67,7 +77,9 @@ impl Worker<'_> {
                 self.state.incomplete.get_or_insert(Incomplete::Join);
             }
         }
+        drop(memory);
         s.waiting = waiting;
+        s.check_memory();
         self.conclude(&s.found);
         self.scratch = s;
     }
@@ -83,7 +95,7 @@ impl Worker<'_> {
         grew: bool,
         s: &mut Scratch,
     ) {
-        if self.engine.exhausted() || s.left {
+        if self.engine.exhausted() || s.left || !s.check_memory() {
             return;
         }
         // A join past its step budget is left: what it found holds, and the context is
@@ -126,7 +138,13 @@ impl Worker<'_> {
         }
         if last {
             if self.engine.prune_pred {
-                s.batch.entry(remote.head).or_default().insert(acc, 0);
+                let before = s
+                    .batch
+                    .get(&remote.head)
+                    .map_or(0, super::settrie::SetTrie::bytes);
+                let trie = s.batch.entry(remote.head).or_default();
+                trie.insert(acc, 0);
+                s.batch_bytes += trie.bytes() - before;
             }
             s.refs.clear();
             if self.engine.proofs {
@@ -151,12 +169,14 @@ impl Worker<'_> {
                 }
             }
             s.found.push(acc, remote.head, Rule::Pred, NONE, &s.refs);
+            s.check_memory();
             return;
         }
         let clauses = &self.state.clauses;
         let trigger = fixed.map_or(NONE, |(_, c)| c);
         let only = fixed.filter(|&(at, _)| at == i).map(|(_, c)| c);
         let mut union = Vec::new();
+        let mut memory = self.engine.memory_charge();
         for p in clauses.premises_for(remote.body[i], trigger) {
             if only.is_some_and(|c| c != p) {
                 continue;
@@ -170,6 +190,9 @@ impl Worker<'_> {
                 &union
             };
             s.premises.push(p);
+            if !memory.set(super::memory::vec(&union)) {
+                return;
+            }
             self.pred_join(r, fixed, i + 1, next, !same, s);
             s.premises.pop();
         }
@@ -178,6 +201,28 @@ impl Worker<'_> {
     // Succ -------------------------------------------------------------------------------
 
     pub(super) fn succ(&mut self, c: ClauseId, head: Atom) {
+        let Some(f) = head.func() else {
+            return;
+        };
+        let before = self.state.memory.enabled().then(|| {
+            self.state
+                .succ
+                .get(&f)
+                .map_or(0, super::rules::Successor::bytes)
+        });
+        self.succ_inner(c, head);
+        if let Some(before) = before {
+            self.state.successor_bytes += self
+                .state
+                .succ
+                .get(&f)
+                .map_or(0, super::rules::Successor::bytes)
+                - before;
+            self.state.check_memory();
+        }
+    }
+
+    fn succ_inner(&mut self, c: ClauseId, head: Atom) {
         let Some(f) = head.func() else {
             return;
         };
@@ -223,6 +268,10 @@ impl Worker<'_> {
                 k1
             }
         };
+        let mut memory = self.engine.memory_charge();
+        if !memory.set(super::memory::vec(&core)) {
+            return;
+        }
         let (to, created) = self.engine.context_tagged(&core, tag);
         if created {
             self.out.send(to, Message::Init);

@@ -58,6 +58,9 @@ pub struct Profile {
     pub threads: usize,
     /// The most clauses one context holds (a context shared by many successors grows).
     pub largest_context: u64,
+    /// Peak successfully accounted saturation capacity; zero when accounting is off.
+    /// Excludes compilation, result assembly and allocator metadata; not process RSS.
+    pub task_memory_peak: usize,
 }
 
 impl Profile {
@@ -92,7 +95,7 @@ impl Profile {
              contexts_saturated={} clauses_generated={} clauses_kept={} redundant_forward={} \
              redundant_backward={} hyper={} pred={} max_head={} max_body={} edges={} \
              peak_agenda={} messages={} slots={} proof_steps={} threads={} largest_context={} \
-             merges={} eq={} unmerged={} joins_left={} subset_checks={}",
+             merges={} eq={} unmerged={} joins_left={} subset_checks={} task_memory_peak={}",
             ms(self.normalise),
             ms(self.compile),
             ms(self.saturate),
@@ -127,6 +130,7 @@ impl Profile {
             self.contexts_unmerged,
             self.contexts_joins_left,
             self.subset_checks,
+            self.task_memory_peak,
         );
         out
     }

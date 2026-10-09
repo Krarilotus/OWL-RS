@@ -91,6 +91,9 @@ impl Worker<'_> {
     /// The merges by at-most-one clause `k` that `c` is a premise of: of its term `at`
     /// with the other neighbours, or (a guard, `None`) of every pair of neighbours.
     fn merges(&mut self, k: u32, c: ClauseId, at: Option<CTerm>) {
+        if self.engine.task_memory_exhausted() {
+            return;
+        }
         let engine = self.engine;
         let a = &engine.program.at_most_one[k as usize];
         let clauses = &self.state.clauses;
@@ -121,24 +124,44 @@ impl Worker<'_> {
             Kind::In => Atom::into(a.role, t),
             _ => Atom::out(a.role, t),
         };
+        let mut scratch_memory = engine.memory_charge();
+        if !scratch_memory.set(super::memory::vec(&others) + super::memory::vec(&pairs)) {
+            return;
+        }
         let mut found = Vec::new();
+        let mut found_memory = engine.memory_charge();
+        let mut found_payload = 0;
         for (t0, t1) in pairs {
             let mut atoms = vec![neighbour(t0), neighbour(t1)];
             atoms.extend(a.guard.iter().map(|&g| Atom::concept(g, CTerm::X)));
             let head = self.state.clauses.recs[c as usize].head;
             let fixed = atoms.iter().position(|&x| x == head);
-            let mut premises = Vec::new();
+            let mut premises = Vec::with_capacity(atoms.len());
+            let mut memory = engine.memory_charge();
+            if !memory.set(super::memory::vec(&atoms) + super::memory::vec(&premises)) {
+                return;
+            }
             join(
+                engine,
                 &self.state.clauses,
                 (&atoms, fixed, c),
                 0,
                 &[],
                 &mut premises,
-                &mut |body, premises| found.push((t0, t1, body.to_vec(), premises.to_vec())),
+                &mut |body, premises| {
+                    let body = body.to_vec();
+                    let premises = premises.to_vec();
+                    found_payload += super::memory::vec(&body) + super::memory::vec(&premises);
+                    found.push((t0, t1, body, premises));
+                    found_memory.set(super::memory::vec(&found) + found_payload);
+                },
             );
         }
         let me = self.out.me;
+        let found_capacity = super::memory::vec(&found);
         for (t0, t1, body, premises) in found {
+            found_payload -= super::memory::vec(&body) + super::memory::vec(&premises);
+            found_memory.set(found_capacity + found_payload);
             let premises = premises
                 .iter()
                 .map(|&clause| ClauseRef {
@@ -161,6 +184,12 @@ impl Worker<'_> {
         by: Vec<u32>,
         premises: Vec<ClauseRef>,
     ) {
+        let mut payload_memory = self.engine.memory_charge();
+        if !payload_memory.set(
+            super::memory::vec(&body) + super::memory::vec(&by) + super::memory::vec(&premises),
+        ) {
+            return;
+        }
         if t0 == t1 {
             return;
         }
@@ -187,6 +216,13 @@ impl Worker<'_> {
                     .copied()
             })
             .collect();
+        let mut scratch_memory = self.engine.memory_charge();
+        if !scratch_memory.set(super::memory::vec(&earlier)) {
+            return;
+        }
+        self.state.merge_bytes += std::mem::size_of_val(body.as_slice())
+            + std::mem::size_of_val(by.as_slice())
+            + std::mem::size_of_val(premises.as_slice());
         self.state.merges.push(Merge {
             a: t0,
             b: t1,
@@ -194,11 +230,21 @@ impl Worker<'_> {
             by: by.into_boxed_slice(),
             premises: premises.into_boxed_slice(),
         });
+        drop(payload_memory); // Persistent merge state takes over the payload charge.
         self.state.clauses.counters.merges += 1;
         for t in [t0, t1] {
-            self.state.merges_by_term.entry(t).or_default().push(id);
+            let list = self.state.merges_by_term.entry(t).or_default();
+            let before = super::memory::vec(list);
+            list.push(id);
+            self.state.merge_bytes += super::memory::vec(list) - before;
         }
-        self.state.merges_by_pair.entry(key).or_default().push(id);
+        let list = self.state.merges_by_pair.entry(key).or_default();
+        let before = super::memory::vec(list);
+        list.push(id);
+        self.state.merge_bytes += super::memory::vec(list) - before;
+        if !self.state.check_memory() {
+            return;
+        }
         let clauses = &self.state.clauses;
         let about: Vec<ClauseId> = clauses
             .heads
@@ -210,9 +256,13 @@ impl Worker<'_> {
                 rec.live && rec.processed && !rec.copy
             })
             .collect();
+        if !scratch_memory.set(super::memory::vec(&earlier) + super::memory::vec(&about)) {
+            return;
+        }
         for c in about {
             self.copy(c, id);
         }
+        scratch_memory.set(super::memory::vec(&earlier));
         // `t0 ≈ t1` and `t1 ≈ u` give `t0 ≈ u` where one of the two is unconditional (the
         // body stays the other's, so bodies never multiply): the unconditional merges stay
         // closed, and a copy along one isn't copied on. Copies along conditional merges
@@ -255,7 +305,9 @@ impl Worker<'_> {
         let Some(ids) = self.state.merges_by_term.get(&head.term()) else {
             return;
         };
-        for m in ids.clone() {
+        let count = ids.len();
+        for at in 0..count {
+            let m = self.state.merges_by_term[&head.term()][at];
             self.copy(c, m);
         }
     }
@@ -287,6 +339,10 @@ impl Worker<'_> {
             premises.extend_from_slice(&merge.premises);
         }
         let closed = merge.body.is_empty();
+        let mut memory = self.engine.memory_charge();
+        if !memory.set(super::memory::vec(&body) + super::memory::vec(&premises)) {
+            return;
+        }
         self.state.clauses.counters.eq += 1;
         let id =
             self.state
@@ -318,6 +374,7 @@ impl Worker<'_> {
 /// any live clause with that head that is processed or the trigger), with the union of
 /// their bodies: each combination to `emit`.
 fn join(
+    engine: &super::engine::Engine,
     clauses: &super::state::Clauses,
     want: (&[Atom], Option<usize>, ClauseId),
     i: usize,
@@ -325,6 +382,9 @@ fn join(
     premises: &mut Vec<ClauseId>,
     emit: &mut dyn FnMut(&[Atom], &[ClauseId]),
 ) {
+    if engine.task_memory_exhausted() {
+        return;
+    }
     let (atoms, fixed, trigger) = want;
     if i == atoms.len() {
         emit(acc, premises);
@@ -336,10 +396,18 @@ fn join(
     } else {
         clauses.premises_for(atoms[i], trigger).collect()
     };
+    let capacity = super::memory::vec(&candidates);
+    let mut memory = engine.memory_charge();
+    if !memory.set(capacity) {
+        return;
+    }
     for p in candidates {
         union_into(acc, clauses.body(p), &mut union);
+        if !memory.set(capacity + super::memory::vec(&union)) {
+            return;
+        }
         premises.push(p);
-        join(clauses, want, i + 1, &union.clone(), premises, emit);
+        join(engine, clauses, want, i + 1, &union, premises, emit);
         premises.pop();
     }
 }

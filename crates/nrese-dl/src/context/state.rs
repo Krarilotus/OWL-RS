@@ -70,6 +70,7 @@ pub struct Bodies {
     atoms: Vec<Atom>,
     spans: Vec<(u32, u32)>,
     ids: HashMap<Box<[Atom]>, BodyId>,
+    keys_bytes: usize,
 }
 
 impl Bodies {
@@ -93,7 +94,13 @@ impl Bodies {
         self.atoms.extend_from_slice(body);
         let id = self.spans.len() as BodyId;
         self.ids.insert(body.into(), id);
+        self.keys_bytes += std::mem::size_of_val(body);
         id
+    }
+
+    fn bytes(&self) -> usize {
+        use super::memory::{map, vec};
+        vec(&self.atoms) + vec(&self.spans) + map(&self.ids) + self.keys_bytes
     }
 }
 
@@ -129,6 +136,9 @@ pub struct Counters {
 /// A context's clauses and indexes.
 #[derive(Debug, Default)]
 pub struct Clauses {
+    pub(super) memory: super::memory::Charge,
+    /// Capacity of nested index buffers, updated only for the head being changed.
+    index_bytes: usize,
     pub recs: Vec<ClauseRec>,
     pub bodies: Bodies,
     /// Live clauses by head literal (the paper's `hyperIndex` and `predHeadIndex`, which
@@ -168,6 +178,66 @@ pub struct Clauses {
 }
 
 impl Clauses {
+    fn flat_bytes(&self) -> usize {
+        use super::memory::{map, set, vec};
+        self.bodies.bytes()
+            + vec(&self.recs)
+            + vec(&self.concepts)
+            + vec(&self.agenda)
+            + vec(&self.agenda_conditional)
+            + vec(&self.derivations)
+            + vec(&self.premises)
+            + map(&self.heads)
+            + map(&self.out_terms)
+            + map(&self.in_terms)
+            + map(&self.tries)
+            + map(&self.occurrences)
+            + map(&self.dead)
+            + set(&self.present)
+            + set(&self.unconditional_heads)
+    }
+
+    /// O(1), apart from the changed head's body in `derive`: never walk all indexes
+    /// just to ask whether a task has memory left.
+    pub(super) fn check_memory(&mut self) -> bool {
+        if !self.memory.enabled() {
+            return true;
+        }
+        self.memory.set(self.flat_bytes() + self.index_bytes)
+    }
+
+    fn head_bytes(&self, body: &[Atom], head: Atom) -> usize {
+        use super::memory::vec;
+        self.heads.get(&head).map_or(0, vec)
+            + self
+                .tries
+                .get(&head)
+                .map_or(0, super::settrie::SetTrie::bytes)
+            + body
+                .iter()
+                .map(|&a| self.occurrences.get(&(head, a)).map_or(0, vec))
+                .sum::<usize>()
+            + if head.is_bottom() {
+                0
+            } else {
+                self.out_terms.get(&head.pred()).map_or(0, vec)
+                    + self.in_terms.get(&head.pred()).map_or(0, vec)
+            }
+    }
+
+    fn index_bytes(&self) -> usize {
+        use super::memory::vec;
+        self.heads.values().map(vec).sum::<usize>()
+            + self
+                .tries
+                .values()
+                .map(super::settrie::SetTrie::bytes)
+                .sum::<usize>()
+            + self.occurrences.values().map(vec).sum::<usize>()
+            + self.out_terms.values().map(vec).sum::<usize>()
+            + self.in_terms.values().map(vec).sum::<usize>()
+    }
+
     pub fn body(&self, c: ClauseId) -> &[Atom] {
         self.bodies.get(self.recs[c as usize].body)
     }
@@ -218,6 +288,7 @@ impl Clauses {
             self.counters.forward += 1;
             return None;
         }
+        let before = self.memory.enabled().then(|| self.head_bytes(body, head));
         // Backward: weaker clauses with the same head (for ⊥ only when the context is
         // contradictory: then everything goes; a scan for every weaker clause of any head
         // costs more than the inferences it saves).
@@ -299,6 +370,14 @@ impl Clauses {
         }
         let waiting = (self.agenda.len() + self.agenda_conditional.len()) as u64;
         self.counters.peak_agenda = self.counters.peak_agenda.max(waiting);
+        if let Some(before) = before {
+            self.index_bytes = if self.unsat {
+                self.index_bytes()
+            } else {
+                self.index_bytes + self.head_bytes(body, head) - before
+            };
+            self.check_memory();
+        }
         Some(id)
     }
 
@@ -427,6 +506,48 @@ mod tests {
 
     fn derive(c: &mut Clauses, body: &[Atom], head: Atom) -> Option<ClauseId> {
         c.derive(body, head, (Rule::Hyper, 0, &[]), false)
+    }
+
+    #[test]
+    fn incremental_capacity_matches_a_full_index_walk() {
+        let task = super::super::memory::Task::new(usize::MAX);
+        let mut c = Clauses {
+            memory: super::super::memory::Charge::new(Some(&task)),
+            ..Clauses::default()
+        };
+        for i in 0..500 {
+            let body = [
+                Atom::concept(i % 31, CTerm::X),
+                Atom::into(100 + i % 17, CTerm::Y),
+            ];
+            let head = if i % 3 == 0 {
+                Atom::out(i % 23, CTerm::func(i % 7))
+            } else {
+                Atom::concept(100 + i % 47, CTerm::X)
+            };
+            c.derive(
+                &body,
+                head,
+                (
+                    Rule::Hyper,
+                    i,
+                    &[ClauseRef {
+                        context: 0,
+                        clause: 0,
+                    }],
+                ),
+                true,
+            );
+            assert_eq!(task.used(), c.flat_bytes() + c.index_bytes());
+            if i % 7 == 0 {
+                derive(&mut c, &[], head);
+                assert_eq!(task.used(), c.flat_bytes() + c.index_bytes());
+            }
+        }
+        derive(&mut c, &[], Atom::BOTTOM);
+        assert_eq!(task.used(), c.flat_bytes() + c.index_bytes());
+        drop(c);
+        assert_eq!(task.used(), 0);
     }
 
     #[test]

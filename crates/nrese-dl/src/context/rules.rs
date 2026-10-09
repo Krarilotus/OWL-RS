@@ -16,9 +16,12 @@
 
 use hashbrown::HashMap;
 
-use super::atoms::{Atom, CTerm, FuncId, Kind, is_subset, union_into};
+mod hyper;
+use hyper::instantiate;
+
+use super::atoms::{Atom, CTerm, FuncId, Kind};
 use super::engine::Engine;
-use super::program::{BodyPat, DlClause, HeadPat, Slot, TermPat, Var};
+use super::program::Slot;
 use super::state::{ClauseId, ClauseRef, Clauses, ContextId, Rule};
 
 /// A message between contexts. Messages a context sends itself stay in its own batch.
@@ -38,6 +41,15 @@ pub enum Message {
         body: Box<[Atom]>,
         head: Atom,
     },
+}
+
+impl Message {
+    pub(super) fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Pred { body, .. } => std::mem::size_of_val(&**body),
+            _ => 0,
+        }
+    }
 }
 
 /// A successor's clause received for Pred.
@@ -70,9 +82,27 @@ pub struct Successor {
     pub edges: Vec<Edge>,
 }
 
+impl Successor {
+    pub(super) fn bytes(&self) -> usize {
+        use super::memory::vec;
+        vec(&self.k1)
+            + vec(&self.k2)
+            + vec(&self.edges)
+            + self
+                .edges
+                .iter()
+                .map(|e| std::mem::size_of_val(&*e.core) + vec(&e.sent))
+                .sum::<usize>()
+    }
+}
+
 /// A context's state: its clauses and its links.
 #[derive(Debug, Default)]
 pub struct State {
+    pub(super) memory: super::memory::Charge,
+    pub(super) remote_bytes: usize,
+    pub(super) successor_bytes: usize,
+    pub(super) merge_bytes: usize,
     pub clauses: Clauses,
     pub started: bool,
     pub preds: Vec<(ContextId, FuncId)>,
@@ -90,6 +120,28 @@ pub struct State {
     pub incomplete: Option<Incomplete>,
 }
 
+impl State {
+    pub(super) fn check_memory(&mut self) -> bool {
+        if !self.memory.enabled() {
+            return true;
+        }
+        use super::memory::{map, vec};
+        self.memory.set(
+            vec(&self.preds)
+                + vec(&self.pr)
+                + vec(&self.remote)
+                + vec(&self.merges)
+                + map(&self.remote_by_atom)
+                + map(&self.succ)
+                + map(&self.merges_by_term)
+                + map(&self.merges_by_pair)
+                + self.remote_bytes
+                + self.successor_bytes
+                + self.merge_bytes,
+        )
+    }
+}
+
 /// Why a context's saturation may miss consequences.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Incomplete {
@@ -105,6 +157,8 @@ pub struct Out {
     pub me: ContextId,
     pub local: Vec<Message>,
     pub sends: Vec<(ContextId, Message)>,
+    pub(super) memory: super::memory::Charge,
+    pub(super) payload_bytes: usize,
 }
 
 impl Out {
@@ -113,15 +167,32 @@ impl Out {
             me,
             local: Vec::new(),
             sends: Vec::new(),
+            memory: Default::default(),
+            payload_bytes: 0,
         }
     }
 
     pub(super) fn send(&mut self, to: ContextId, message: Message) {
+        self.payload_bytes += message.heap_bytes();
         if to == self.me {
             self.local.push(message);
         } else {
             self.sends.push((to, message));
         }
+        self.check_memory();
+    }
+
+    fn pop_local(&mut self) -> Option<Message> {
+        let message = self.local.pop()?;
+        self.payload_bytes -= message.heap_bytes();
+        self.check_memory();
+        Some(message)
+    }
+
+    fn check_memory(&mut self) {
+        self.memory.set(
+            super::memory::vec(&self.local) + super::memory::vec(&self.sends) + self.payload_bytes,
+        );
     }
 }
 
@@ -132,6 +203,7 @@ pub struct Found {
     items: Vec<Item>,
     atoms: Vec<Atom>,
     premises: Vec<ClauseRef>,
+    pub(super) memory: super::memory::Charge,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -144,6 +216,11 @@ struct Item {
 }
 
 impl Found {
+    fn check_memory(&mut self) -> bool {
+        use super::memory::vec;
+        self.memory
+            .set(vec(&self.items) + vec(&self.atoms) + vec(&self.premises))
+    }
     /// Conclusions so far.
     pub(super) fn len(&self) -> usize {
         self.items.len()
@@ -175,12 +252,14 @@ impl Found {
             body: b,
             premises: p,
         });
+        self.check_memory();
     }
 }
 
 /// A worker's buffers, reused across inferences.
 #[derive(Debug, Default)]
 pub struct Scratch {
+    pub(super) memory: super::memory::Charge,
     pub(super) slots: Vec<Slot>,
     pub(super) found: Found,
     pub(super) bind: Vec<Option<CTerm>>,
@@ -192,9 +271,44 @@ pub struct Scratch {
     /// The bodies Pred found in this batch, per head (they are derived after the joins,
     /// so the context's own redundancy check doesn't see them yet).
     pub(super) batch: HashMap<Atom, super::settrie::SetTrie>,
+    pub(super) batch_bytes: usize,
     /// The current Pred join's steps (calls), and whether it went past its budget.
     pub(super) steps: usize,
     pub(super) left: bool,
+}
+
+impl Scratch {
+    pub(super) fn new(engine: &Engine) -> Self {
+        Self {
+            memory: engine.memory_charge(),
+            found: Found {
+                memory: engine.memory_charge(),
+                ..Found::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn check_memory(&mut self) -> bool {
+        use super::memory::{map, vec};
+        self.memory.set(
+            vec(&self.slots)
+                + vec(&self.bind)
+                + vec(&self.premises)
+                + vec(&self.refs)
+                + vec(&self.body)
+                + vec(&self.waiting)
+                + vec(&self.preds)
+                + map(&self.batch)
+                + self.batch_bytes,
+        )
+    }
+
+    pub(super) fn clear_batch(&mut self) {
+        self.batch.clear();
+        self.batch_bytes = 0;
+        self.check_memory();
+    }
 }
 
 /// The rules on one context, by the worker holding it.
@@ -214,6 +328,9 @@ impl Worker<'_> {
 
     /// Handles a message, then the agenda and the messages to itself, to a fixpoint.
     pub fn handle(&mut self, message: Message) {
+        if self.engine.exhausted() {
+            return;
+        }
         self.state.clauses.counters.messages += 1;
         self.message(message);
         let mut given = 0u32;
@@ -224,11 +341,13 @@ impl Worker<'_> {
                 // One context's agenda can run for minutes (its redundancy checks grow with
                 // its clauses): the budget is checked inside it too. Stopping leaves the
                 // run exhausted, which ends it as `Unsupported::Budget`, never an answer.
-                if given.is_multiple_of(256) && self.engine.out_of_budget() {
+                if self.engine.task_memory_exhausted()
+                    || (given.is_multiple_of(256) && self.engine.out_of_budget())
+                {
                     return;
                 }
             }
-            match self.out.local.pop() {
+            match self.out.pop_local() {
                 Some(m) => {
                     self.state.clauses.counters.messages += 1;
                     self.message(m);
@@ -245,14 +364,19 @@ impl Worker<'_> {
                 if std::mem::replace(&mut self.state.started, true) {
                     return;
                 }
-                let core = self.engine.core(self.me()).to_vec();
-                for a in core {
+                for &a in self.engine.core(self.me()) {
+                    if self.engine.task_memory_exhausted() {
+                        return;
+                    }
                     self.state
                         .clauses
                         .derive(&[], a, (Rule::Core, NONE, &[]), proofs);
                 }
                 let program = &self.engine.program;
                 for &dl in &program.facts {
+                    if self.engine.task_memory_exhausted() {
+                        return;
+                    }
                     let head = instantiate(program.clauses[dl as usize].head, &[]);
                     if let Some(head) = head {
                         self.state
@@ -271,6 +395,7 @@ impl Worker<'_> {
                     return;
                 }
                 self.state.preds.push((from, func));
+                self.state.check_memory();
                 let replay: Vec<ClauseId> = self
                     .state
                     .pr
@@ -278,6 +403,10 @@ impl Worker<'_> {
                     .copied()
                     .filter(|&c| self.state.clauses.recs[c as usize].live)
                     .collect();
+                let mut memory = self.engine.memory_charge();
+                if !memory.set(super::memory::vec(&replay)) {
+                    return;
+                }
                 for c in replay {
                     self.send_pred(c, from, func);
                 }
@@ -293,17 +422,24 @@ impl Worker<'_> {
                 }
                 let id = self.state.remote.len() as u32;
                 for &a in body.iter() {
-                    self.state.remote_by_atom.entry(a).or_default().push(id);
+                    let list = self.state.remote_by_atom.entry(a).or_default();
+                    let before = super::memory::vec(list);
+                    list.push(id);
+                    self.state.remote_bytes += super::memory::vec(list) - before;
                 }
+                self.state.remote_bytes += std::mem::size_of_val(&*body);
                 self.state.remote.push(Remote {
                     from,
                     func,
                     body,
                     head,
                 });
+                if !self.state.check_memory() {
+                    return;
+                }
                 let mut s = std::mem::take(&mut self.scratch);
                 s.found.clear();
-                s.batch.clear();
+                s.clear_batch();
                 s.premises.clear();
                 s.steps = 0;
                 s.left = false;
@@ -323,15 +459,24 @@ impl Worker<'_> {
         let head = self.state.clauses.recs[c as usize].head;
         if !head.is_bottom() && head.kind() == Kind::Concept && head.term() == CTerm::X {
             self.state.clauses.present.insert(head.pred());
+            if !self.state.clauses.check_memory() {
+                return;
+            }
         }
         if !head.is_bottom() {
             self.hyper(c, head);
         }
         if self.engine.program.is_pr(head) {
             self.state.pr.push(c);
+            if !self.state.check_memory() {
+                return;
+            }
             let mut s = std::mem::take(&mut self.scratch);
             s.preds.clear();
             s.preds.extend_from_slice(&self.state.preds);
+            if !s.check_memory() {
+                return;
+            }
             for &(u, f) in &s.preds {
                 self.send_pred(c, u, f);
             }
@@ -347,6 +492,9 @@ impl Worker<'_> {
     pub(super) fn conclude(&mut self, found: &Found) {
         let proofs = self.engine.proofs;
         for item in &found.items {
+            if self.engine.task_memory_exhausted() {
+                return;
+            }
             let counters = &mut self.state.clauses.counters;
             match item.rule {
                 Rule::Pred => counters.pred += 1,
@@ -366,185 +514,4 @@ impl Worker<'_> {
             );
         }
     }
-
-    // Hyper ------------------------------------------------------------------------------
-
-    fn hyper(&mut self, c: ClauseId, head: Atom) {
-        let program = &self.engine.program;
-        let mut s = std::mem::take(&mut self.scratch);
-        let Scratch {
-            slots,
-            found,
-            bind,
-            premises,
-            body,
-            ..
-        } = &mut s;
-        program.slots(head, &self.state.clauses.concepts, slots);
-        if slots.is_empty() {
-            self.scratch = s;
-            return;
-        }
-        found.clear();
-        premises.clear();
-        premises.push(c);
-        body.clear();
-        body.extend_from_slice(self.state.clauses.body(c));
-        self.state.clauses.counters.slots += slots.len() as u64;
-        let present = &self.state.clauses.present;
-        for &Slot {
-            clause: dl,
-            guard,
-            pos,
-        } in slots.iter()
-        {
-            if guard != Slot::NO_GUARD && !present.contains(&guard) {
-                continue;
-            }
-            let clause = &program.clauses[dl as usize];
-            // The other concept atoms must be there: a probe each, before any join.
-            let missing = clause.body.iter().enumerate().any(|(i, b)| {
-                i != pos as usize && matches!(*b, BodyPat::Concept(k) if !present.contains(&k))
-            });
-            if missing {
-                continue;
-            }
-            bind.clear();
-            bind.resize(program.vars[dl as usize] as usize, None);
-            if !unify(clause.body[pos as usize], head, bind) {
-                continue;
-            }
-            self.hyper_join(
-                (clause, dl),
-                (pos as usize, c),
-                0,
-                bind,
-                body,
-                premises,
-                found,
-            );
-        }
-        self.conclude(found);
-        self.scratch = s;
-    }
-
-    /// Joins the body atoms of `dl` from position `i` on with the context's clauses;
-    /// `fixed` is the trigger's position and clause.
-    #[expect(clippy::too_many_arguments, reason = "the join's recursion state")]
-    fn hyper_join(
-        &self,
-        dl: (&DlClause, u32),
-        fixed: (usize, ClauseId),
-        i: usize,
-        bind: &mut [Option<CTerm>],
-        acc: &[Atom],
-        premises: &mut Vec<ClauseId>,
-        found: &mut Found,
-    ) {
-        let (clause, id) = dl;
-        if i == clause.body.len() {
-            if let Some(head) = instantiate(clause.head, bind) {
-                let b = (found.atoms.len() as u32, acc.len() as u32);
-                found.atoms.extend_from_slice(acc);
-                let p = found.premises.len() as u32;
-                if self.engine.proofs {
-                    let me = self.me();
-                    found
-                        .premises
-                        .extend(premises.iter().map(|&clause| ClauseRef {
-                            context: me,
-                            clause,
-                        }));
-                }
-                found.items.push(Item {
-                    head,
-                    rule: Rule::Hyper,
-                    dl: id,
-                    body: b,
-                    premises: (p, found.premises.len() as u32 - p),
-                });
-            }
-            return;
-        }
-        if i == fixed.0 {
-            return self.hyper_join(dl, fixed, i + 1, bind, acc, premises, found);
-        }
-        let clauses = &self.state.clauses;
-        let mut each = |atom: Atom, bind: &mut [Option<CTerm>]| {
-            let mut union = Vec::new();
-            for p in clauses.premises_for(atom, fixed.1) {
-                let body = clauses.body(p);
-                let next: &[Atom] = if body.is_empty() || is_subset(body, acc) {
-                    acc
-                } else {
-                    union_into(acc, body, &mut union);
-                    &union
-                };
-                premises.push(p);
-                self.hyper_join(dl, fixed, i + 1, bind, next, premises, found);
-                premises.pop();
-            }
-        };
-        match clause.body[i] {
-            BodyPat::Concept(b) => each(Atom::concept(b, CTerm::X), bind),
-            BodyPat::Out(r, Var::X) => each(Atom::out(r, CTerm::X), bind),
-            BodyPat::Out(r, Var::Z(z)) => match bind[z as usize] {
-                Some(t) => each(Atom::out(r, t), bind),
-                None => {
-                    for &t in clauses.out_terms.get(&r).into_iter().flatten() {
-                        bind[z as usize] = Some(t);
-                        each(Atom::out(r, t), bind);
-                    }
-                    bind[z as usize] = None;
-                }
-            },
-            BodyPat::In(r, z) => match bind[z as usize] {
-                Some(t) => each(Atom::into(r, t), bind),
-                None => {
-                    for &t in clauses.in_terms.get(&r).into_iter().flatten() {
-                        bind[z as usize] = Some(t);
-                        each(Atom::into(r, t), bind);
-                    }
-                    bind[z as usize] = None;
-                }
-            },
-        }
-    }
-}
-
-/// Whether the context atom `atom` matches the DL-clause body atom `pat` with `σ(x) = x`,
-/// extending `bind`.
-fn unify(pat: BodyPat, atom: Atom, bind: &mut [Option<CTerm>]) -> bool {
-    let (kind, pred, t) = (atom.kind(), atom.pred(), atom.term());
-    let mut set = |z: u8, t: CTerm| match bind[z as usize] {
-        Some(b) => b == t,
-        None => {
-            bind[z as usize] = Some(t);
-            true
-        }
-    };
-    match pat {
-        BodyPat::Concept(b) => atom == Atom::concept(b, CTerm::X),
-        BodyPat::Out(r, Var::X) => atom == Atom::out(r, CTerm::X),
-        BodyPat::Out(r, Var::Z(z)) => kind == Kind::Out && pred == r && set(z, t),
-        BodyPat::In(r, z) => match kind {
-            Kind::In if pred == r => set(z, t),
-            Kind::Out if pred == r && t == CTerm::X => set(z, t),
-            _ => false,
-        },
-    }
-}
-
-/// The head atom of a DL-clause under `bind` (`⊥` for no head); `None` if a variable is
-/// unbound (no DL-clause has one).
-fn instantiate(head: Option<HeadPat>, bind: &[Option<CTerm>]) -> Option<Atom> {
-    let Some(h) = head else {
-        return Some(Atom::BOTTOM);
-    };
-    let t = match h.term {
-        TermPat::Var(Var::X) => CTerm::X,
-        TermPat::Var(Var::Z(z)) => (*bind.get(z as usize)?)?,
-        TermPat::Func(f) => CTerm::func(f),
-    };
-    Some(Atom::of(h.kind.kind(), h.pred, t))
 }

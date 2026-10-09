@@ -37,15 +37,7 @@ pub(crate) fn tbox_taxonomy(store: &StoreService, ontology: &Ontology) -> Taxono
         }
     }
     let dl = &store.config().dl;
-    classify::classify(
-        &tbox,
-        &classify::Options {
-            threads: dl.workers(),
-            timeout: Some(dl.timeout),
-            tableau: dl.tableau(dl.timeout, classify::Options::default().tableau.max_memory),
-            ..classify::Options::default()
-        },
-    )
+    classify::classify(&tbox, &dl.classification_options())
 }
 
 /// The memberships `taxonomy` adds to `snapshot`'s: `(a rdf:type D)` for each member `a`
