@@ -30,8 +30,11 @@ known through a source read; *ours* = measured or tested here).
 - **The schema at the snapshot.** The TBox is read from the snapshot the query reads
   (asserted and inferred statements, every graph, as the rules read them), mapped by
   `nrese-owl`'s reverse RDF mapping, and compiled (`nrese-owl::ql`). It is cached per store
-  and rebuilt only when the schema statements change (a hash of them, checked once per
-  snapshot revision); data commits never rebuild it.
+  and rebuilt only when the schema statements change. Its fast key is the engine's
+  `SnapshotIdentity`, including pending changes and visibility masks, alongside the
+  reader's graph access. On a new identity, a hash of the schema statements permits
+  reuse of the compiled TBox when the schema is unchanged. A revision and statement
+  counts alone cannot distinguish two pending views or a same-count replacement.
 - **Only where the closure applies:** the default graph of a query without a dataset of
   its own, read with the inferred statements, also as `GRAPH <urn:x-arq:DefaultGraph>`
   (another store's name for it, `compat`). Not inside `GRAPH` over a named graph, which
@@ -69,6 +72,15 @@ known through a source read; *ours* = measured or tested here).
   (`nrese-server print-query`), not a request.
 
 ## 2. What it reads, and how it combines with the closure
+
+**Current lifecycle (9 October).** Realised-witness results are scoped to the same
+snapshot identity. A failed or budget-skipped probe is not cached as a negative answer;
+a later request can retry it. Store-side status preparation now uses the request's
+cancellation token. Reporting and execution still prepare separately, however, and the
+status wrapper still discards preparation errors. Preparing once against one captured
+execution view, retaining its report, and propagating those errors is an open package
+in the [performance plan](../plan/2026-10-09-performance-architecture.md). Cancellation
+at evaluator boundaries does not yet make every schema scan or rewriting loop interruptible.
 
 **The QL part of the TBox.** From every axiom, what OWL 2 QL can say (with three harmless
 generalisations):
