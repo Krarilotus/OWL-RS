@@ -561,6 +561,36 @@ fn a_commit_that_merges_classes_publishes_its_inferences_with_it() {
     }
 }
 
+#[test]
+fn a_commit_that_splits_classes_publishes_its_inferences_with_it() {
+    let pipelines = [Mode::Replicate, Mode::Compact].map(pipeline);
+    let steps = [
+        "INSERT DATA { ex:a owl:sameAs ex:b . ex:b ex:knows ex:kim .
+           ex:c owl:sameAs ex:d . ex:d a ex:Person .
+           ex:Person rdfs:subClassOf ex:Agent .
+           ex:mother a owl:FunctionalProperty . ex:k ex:mother ex:m1, ex:m2 .
+           ex:m2 ex:likes ex:z }",
+        "DELETE DATA { ex:a owl:sameAs ex:b }",
+        "DELETE DATA { ex:k ex:mother ex:m2 }",
+        // Exercise the ground program cached after each fallback.
+        "INSERT DATA { ex:d ex:knows ex:kim . ex:m1 ex:likes ex:w }",
+    ];
+    for (step_index, step) in steps.into_iter().enumerate() {
+        let before = pipelines[1].store().current_revision();
+        for pipeline in &pipelines {
+            update(pipeline, step);
+        }
+        assert_eq!(observe(&pipelines[1]), observe(&pipelines[0]), "{step}");
+        if step_index > 0 {
+            assert_eq!(
+                pipelines[1].store().current_revision(),
+                before + 1,
+                "{step}"
+            );
+        }
+    }
+}
+
 /// The fuzz campaign's `NRESE_FUZZ_SEED=4` (its first commit), reduced: a commit asserts
 /// facts whose objects a functional property merges, and the representative's form of
 /// them is asserted only in a named graph. The compact stack must store that form (the
