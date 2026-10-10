@@ -1421,8 +1421,10 @@ data = "volume:owl2bench-ql-1.nt"
 args = ["--reason", "owl2-ql", "--reason-runs", "40", "--runs", "30"]
 queries = "owl2bench"
 metric = "sum_p50_ms"
-check = { "q.q12.rows" = 2494, "q.q15.rows" = 21, "q.q21.rows" = 145, "q.q22.rows" = 106, "q.q20.rows" = 2825, "q.q12.status.complete" = "true" }
-route = { "q.q12.rewrites" = "has ql-tree-witness", "q.q15.rewrites" = "has ql-tree-witness", "q.q21.rewrites" = "has ql-tree-witness", "q.q22.rewrites" = "has ql-tree-witness", "q.q01.rewrites" = "lacks ql-tree-witness" }
+check = { "q.q12.rows" = 2494, "q.q15.rows" = 21, "q.q21.rows" = 145, "q.q22.rows" = 106, "q.q20.rows" = 2825, "q.q12.status.complete" = "true", "q.q15.status.complete" = "true", "q.q15.status.sound" = "true" }
+# This fixture's q15 needs no additional witness union. The realised-witness guard
+# in ql_tests also verifies that rewriting returns when a witness is missing.
+route = { "q.q12.rewrites" = "has ql-tree-witness", "q.q15.rewrites" = "lacks ql-tree-witness", "q.q21.rewrites" = "has ql-tree-witness", "q.q22.rewrites" = "has ql-tree-witness", "q.q01.rewrites" = "lacks ql-tree-witness" }
 cap_gb = 4
 systems = ["qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 rewrite = "expressible"

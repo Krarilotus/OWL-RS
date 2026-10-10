@@ -1,5 +1,5 @@
 //! Resources shared by repositories and their operations. Strategy selection stays
-//! with each semantic engine; this owner supplies physical workers and query capacity.
+//! with each semantic engine; this owner selects execution policy and query capacity.
 
 use std::sync::Arc;
 
@@ -16,11 +16,16 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Zero threads uses available parallelism; zero query bytes is unlimited. Create
-    /// this once and share it across repositories. A failed wide pool retries with one
-    /// physical worker; failure of that fallback is an error, never caller execution.
+    /// Zero threads preserves caller execution and existing parallel kernels, with no
+    /// catalog-wide CPU cap. Positive counts select a shared physical pool. Zero query
+    /// bytes is unlimited. A failed configured pool retries with one physical worker;
+    /// failure of that fallback is an error, never an implicit policy change.
     pub fn new(threads: usize, query_memory_bytes: usize) -> StoreResult<Self> {
-        let workers = Self::build_workers(threads, Workers::pooled)?;
+        let workers = if threads == 0 {
+            Workers::current()
+        } else {
+            Self::build_workers(threads, Workers::pooled)?
+        };
         Ok(Self {
             threads,
             query_memory_bytes,
@@ -43,7 +48,7 @@ impl Runtime {
         }
     }
 
-    /// Clones the physical owner, never its threads.
+    /// Clones the execution handle, never its threads.
     pub fn workers(&self) -> Workers {
         self.workers.clone()
     }
@@ -75,6 +80,20 @@ mod tests {
             .spawn_handler(|_| Err(std::io::Error::other("injected thread failure")))
             .build()
             .unwrap_err()
+    }
+
+    #[test]
+    fn default_execution_stays_on_the_caller_without_serialising_parallel_kernels() {
+        let runtime = Runtime::new(0, 0).unwrap();
+        let caller = std::thread::current().id();
+        assert_eq!(
+            runtime.workers().install(|| std::thread::current().id()),
+            caller
+        );
+        Workers::pooled(3).unwrap().install(|| {
+            assert_eq!(runtime.workers().width(), 3);
+            assert_eq!(runtime.workers().limited(2).width(), 2);
+        });
     }
 
     #[test]
