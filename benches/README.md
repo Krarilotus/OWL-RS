@@ -57,6 +57,33 @@ benches/
 
 ## Kits
 
+### Feedback cadence and scenario selection
+
+The owner's 10 October campaign direction keeps the existing kits and registries
+as the source of truth. These are scheduling targets, not measured duration
+guarantees or permission to terminate a case early:
+
+| Selection | Target | Existing owner | Purpose |
+|---|---|---|---|
+| Focused | Seconds to minutes where the case permits | Named fast cases, probes, semantic guards | Isolate a changed kernel, operator or contract; compare with its pinned baseline |
+| Area | 1–4 hours | Related fast cases plus the relevant reasoning/query/write/vector kit | Cover an area's mechanisms, realistic shapes, neighboring regressions and applicable competitors |
+| Full benchable profile | About one day across the runnable systems | Registry-selected standard tiers and existing kit drivers | Complete coverage of the declared profile, including preparation, failures and answer validation |
+| Scale extension | Estimated separately before launch | Larger existing tiers and planned kits as they become runnable | Establish capacity and scaling beyond the daily profile |
+
+Choose the complete case/system/semantic matrix and resource scenario before
+execution. Native-capacity, matched-resource and scaling/frontier scenarios answer
+different questions ([PROTOCOL.md §3](PROTOCOL.md#3-fairness)); report them separately.
+The daily profile does not claim to include every planned external benchmark or
+every scale. Full-size cases remain available and visible when a smaller declared
+tier supplies faster feedback. Do not silently replace their inputs or checks.
+
+Estimate from retained per-case elapsed times, including loads, validation and
+teardown, and revise estimates after each completed area. A once-through campaign
+provides coverage and diagnostic evidence. Repetition requirements for regression
+checks and published claims still apply; request the additional time rather than
+calling a single run a reliable speed ranking. Split independent comparisons across
+Office and Phuoc-Yu, keeping all systems or revisions of each comparison on one host.
+
 The 9 October inventory contains **95 fast cases** and **24 registered workloads**:
 10 ready, four partial and 10 planned. The `fast` registry entry bridges those same
 95 cases; it is not another independent campaign. The 20 system entries include

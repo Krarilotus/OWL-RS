@@ -38,10 +38,11 @@ pub struct StoreConfig {
     /// unlimited. A query that asks for more than is left fails with
     /// [`StoreError::is_server_memory_limit`](crate::StoreError::is_server_memory_limit).
     pub total_query_memory_bytes: usize,
-    /// Physical workers for native SPARQL execution and DL search, shared by this
-    /// store and its catalog's repositories (`execution.threads`). Zero uses available
-    /// parallelism. DL task widths may narrow this owner. Rule materialisation, bulk
-    /// loading and background storage work retain their existing execution owners.
+    /// Execution policy for native SPARQL and DL (`execution.threads`). Zero keeps
+    /// serial work on its caller and uses existing parallel kernels, without a shared
+    /// CPU cap. Positive values select that many physical workers shared by the catalog.
+    /// DL task widths may narrow either policy. Rule materialisation, bulk loading and
+    /// background storage retain their existing execution owners.
     pub execution_threads: usize,
     /// The memory the process may hold before a long operation (a materialisation, the
     /// reasoning of a commit) stops with [`StoreError::ProcessMemoryLimit`](crate::StoreError::ProcessMemoryLimit)

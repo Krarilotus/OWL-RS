@@ -1,5 +1,5 @@
 title = "Frozen v2 checkpoint: Office and Phuoc-Yu"
-status = "running"
+status = "complete; performance acceptance failed on both hosts"
 task = "docs/plan/2026-10-10-performance-campaign.md#user-request"
 pr = "https://github.com/Krarilotus/OWL-RS/pull/23"
 candidate = "bebada2e6631b58ed0554ee302572570e80b085e"
@@ -8,6 +8,7 @@ driver = "bebada2e6631b58ed0554ee302572570e80b085e"
 cases = 95
 outer_pairs_per_host = 3
 planned_invocations_per_host = 570
+completed_invocations_per_host = 570
 latency_floor_ms = 0
 qualified_current_head_improvement = false
 remote_root = "/home/krarilotus/nrese-prep-20261009-4e8bd38/campaign-20261010-bebada2"
@@ -39,4 +40,36 @@ memory = "Actual workload cgroup lifetime peak, maximum across case invocations;
 native_correction = "Original host-root cgroup probe is retained raw; actual service peak supplied to registered cgroup checks"
 failure_policy = "Failed/unsupported/OOM/timeout outcomes retained; transport-control failure halts queue"
 claims = "Three pairs are initial regression screening; ten pairs required for published speed claims"
-limits = "No current-head speedup or full competitor-comparison result yet; do not pool host/runtime wall times"
+limits = "No current-head qualification or full competitor result; three-pair screening, no pooled host/runtime times, rounded open timer, sampled client latency vectors confound memory"
+
+[audit]
+report = "campaign-audit-complete-20261010.md under remote_root; raw data retained alongside"
+report_sha256 = "6237eaed5899698306221286a0e2495e9940643ba86e93b79c724dc7f7b2dd52"
+new_status_or_check_failures = 0
+all_ok_cases_per_host = 85
+expected_boundary_cases_per_host = 6
+failed_cases_per_host = 4
+failed_cases = ["dl-transitive-400", "mem-load-20m-2g", "ql-owl2bench", "vector-knn-filtered"]
+office_baseline_sha256 = "2470cf0d917a4f5115d446dd52a72064278382b26ce44784a5ae84109968f01b"
+office_candidate_sha256 = "730f00ffa553a8200e87e95b307671fb66e304d6cc9c7e5688ca2fab2fde4287"
+phuoc_baseline_sha256 = "b73775cd689f215650a28908cca9072b991fda1023afaaf5811d1ca5f412237f"
+phuoc_candidate_sha256 = "89e8939718676d6aef9f8d57170de3dfa932060f05046ef8817af58c62e81e0b"
+findings = "Per-width QPS loss on both hosts; skewed counting, mixed readers/writes, open and phase-memory regressions; additional Office aggregation/write-tail flags"
+gains = "Two variable Office star-count screening flags; neither establishes a general or publication-qualified improvement"
+
+[followup]
+host = "Phuoc-Yu"
+unit = "owl-qualification-phuoc-20261010"
+status = "complete; performance acceptance failed"
+results = "qualification/NN-SIDE-CASE.json"
+outer_pairs = 10
+cases = ["clients-lookups", "clients-sweep", "kernel-intersect", "commits-plain", "open-first-query", "rl-clique", "op-aggregates"]
+reports = 140
+workload_calls = 520
+recorded_checks_pass = true
+manifest_sha256 = "662c5db3eb6f3d4203f28e27a19a37ddfb9d8d627d911ac823cddc54051a12fd"
+report_inventory_sha256 = "ca5aa41e616e9779fa256cd44912ad7665ea8d919650a7ce6a78d55ed7967558"
+inventory_format = "SHA256 of filename + space + file_SHA256 + newline, numbered JSON reports sorted lexically, UTF-8 with final LF"
+findings = "All eight QPS comparisons lose 67-80% in all ten pairs; mixed commit p50 +39%; skewed triangles +55%; aggregate query-phase RSS max +108 MiB"
+qualification = "Initial RL-clique maximum-based memory flag not reconfirmed; initial four failed cases remain unresolved and are outside this follow-up"
+limits = "Selected cases, not holdout/full-suite qualification; open rounding persists; affinity/governor/machine-wide quietness/cold-cache controls not independently established; no new causal profile"

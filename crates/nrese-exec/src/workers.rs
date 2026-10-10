@@ -1,6 +1,5 @@
-//! Reusable physical workers and bounded batches. The caller owns when work may run;
-//! this module owns the pool, its actual width and order-preserving batch execution.
-//! A clone shares threads. A smaller allowance never creates another pool.
+//! Execution handles and bounded batches. The policy owner chooses current execution
+//! or an owned pool. A clone shares that choice; a smaller allowance creates no pool.
 
 use std::sync::Arc;
 
@@ -9,6 +8,7 @@ use rayon::prelude::*;
 #[derive(Clone)]
 pub struct Workers {
     pool: Option<Arc<rayon::ThreadPool>>,
+    // Zero inherits the current Rayon width lazily; one without a pool is serial.
     width: usize,
 }
 
@@ -29,12 +29,25 @@ impl std::fmt::Debug for Workers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Workers")
             .field("width", &self.width)
-            .field("pool_width", &self.pool_width())
+            .field(
+                "pool_width",
+                &self.pool.as_ref().map(|p| p.current_num_threads()),
+            )
             .finish()
     }
 }
 
 impl Workers {
+    /// Keeps serial work on its caller and parallel batches in the current Rayon
+    /// registry (the global registry outside a worker). Creates no pool or admission
+    /// queue. This is an operation allowance, not a cap across concurrent callers.
+    pub fn current() -> Self {
+        Self {
+            pool: None,
+            width: 0,
+        }
+    }
+
     /// Creates a reusable pool; zero requests the machine's available parallelism.
     /// Failure is returned to the policy owner, never redirected to an ambient pool.
     pub fn new(threads: usize) -> Result<Self, rayon::ThreadPoolBuildError> {
@@ -67,34 +80,49 @@ impl Workers {
     }
 
     /// An allowance within this pool. Zero keeps the current allowance; a child may
-    /// narrow its parent but cannot increase it. No threads are started here.
+    /// narrow its parent but cannot increase it. No owned pool is created; resolving
+    /// a wider current allowance may initialise Rayon's global registry.
     pub fn limited(&self, requested: usize) -> Self {
         Self {
             pool: self.pool.clone(),
             width: if requested == 0 {
                 self.width
+            } else if requested == 1 {
+                1
             } else {
-                requested.min(self.width).max(1)
+                requested.min(self.width()).max(1)
             },
         }
     }
 
     pub fn width(&self) -> usize {
-        self.width
+        if self.pool.is_none() && self.width != 1 {
+            let available = rayon::current_num_threads();
+            if self.width == 0 {
+                available
+            } else {
+                self.width.min(available)
+            }
+        } else {
+            self.width
+        }
     }
 
     pub fn pool_width(&self) -> usize {
-        self.pool
-            .as_ref()
-            .map_or(1, |pool| pool.current_num_threads())
+        match &self.pool {
+            Some(pool) => pool.current_num_threads(),
+            None if self.width == 1 => 1,
+            None => rayon::current_num_threads(),
+        }
     }
 
     /// The largest number of batch bodies that can execute concurrently for `items`.
     pub fn for_items(&self, items: usize) -> usize {
-        self.width.min(items).max(1)
+        self.width().min(items).max(1)
     }
 
-    /// Enters the physical pool. The body is responsible for respecting its allowance
+    /// Enters an owned pool, or runs inline for current/serial execution. The body
+    /// is responsible for respecting its allowance
     /// when spawning work; use [`Self::map`] for independent bounded tasks. In particular,
     /// arbitrary nested Rayon iterators do not inherit a smaller allowance automatically.
     pub fn install<F: FnOnce() -> R + Send, R: Send>(&self, f: F) -> R {
@@ -172,6 +200,48 @@ impl Workers {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn current_execution_keeps_inline_work_and_reuses_parallel_workers() {
+        let current = Workers::current();
+        let caller = std::thread::current().id();
+        assert_eq!(current.install(|| std::thread::current().id()), caller);
+        let owner = Workers::pooled(4).unwrap();
+        let narrowed = owner.install(|| {
+            assert_eq!(current.width(), 4);
+            let narrowed = current.limited(2);
+            assert_eq!(narrowed.pool_width(), 4);
+            let active = AtomicUsize::new(0);
+            let peak = AtomicUsize::new(0);
+            let barrier = std::sync::Barrier::new(2);
+            let values = narrowed.map(&[0, 1, 2, 3], |&i| {
+                assert_eq!(rayon::current_num_threads(), 4);
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                if i < 2 {
+                    barrier.wait();
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                i * 3
+            });
+            assert_eq!(values, [0, 3, 6, 9]);
+            assert_eq!(peak.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                current.map_range(3..19, |i| i * 2),
+                (3..19).map(|i| i * 2).collect::<Vec<_>>()
+            );
+            narrowed
+        });
+        Workers::pooled(3).unwrap().install(|| {
+            assert_eq!(current.width(), 3);
+            assert_eq!(narrowed.width(), 2);
+            assert_eq!(narrowed.limited(3).width(), 2);
+        });
+        Workers::pooled(1).unwrap().install(|| {
+            assert_eq!(narrowed.width(), 1);
+            assert_eq!(narrowed.map(&[1, 2], |n| n * 2), [2, 4]);
+        });
+    }
 
     #[test]
     fn narrowed_batches_keep_order_and_do_not_start_more_workers() {

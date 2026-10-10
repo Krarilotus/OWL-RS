@@ -6,11 +6,45 @@ coordination rather than accumulating workarounds. The earlier intermediate
 recomputation proposal is not approved. This is part of the
 [checkpoint campaign](2026-10-10-performance-campaign.md#user-request), PR #23.
 
+The owner's follow-up asks whether this design is actually better. **That is not
+established, and is not implementation approval.** This is a candidate for validation,
+not a selected migration. Before recommending it, compare its progress guarantees,
+callback/embedding compatibility, no-wait cost and retained memory against the existing
+implementation and smaller alternatives. A small mechanism experiment can reject the
+design early; it cannot certify the full evaluator or justify a broad migration alone.
+
+**Later owner correction:** mandatory default pool entry is being selectively rewound.
+The design below addresses the reproduced pooled-execution cycle; it is not a prerequisite
+for restoring default caller execution. Reassess its necessity and scope for explicit pools,
+worker embedding and actual reachable waits before recommending replacement control flow.
+
+## Owner correction: adaptive solver cooperation
+
+The direction is request-wide adaptive cooperation: analyze, decompose and rewrite the
+request, then revise physical choices and remaining dependencies as solver evidence
+arrives. Capability/fragment analysis guards sound combinations; it is not fixed routing
+or a promise to lower arbitrary requests' theoretical complexity. Reuse existing store
+QL/DL orchestration and solver owners. Classifier Horn imports, model/probe feedback and
+taxonomy-strengthened query bounds already reduce subsequent work
+([DL design](../design/owl2-dl.md#7-classification-and-realisation)); richer internal
+saturation/tableau blocking coupling is separate and unproved here.
+
+Reuse compatible snapshots, compiled inputs and sound facts/bounds/candidates/certificates;
+create private solver state only as needed. Charge retained plus concurrent state, reclaim
+superseded models, and measure avoided work against transfer and retention costs. Preserve
+provenance, assumptions, revision/epoch, budget ownership, cross-fragment interactions and
+exact/incomplete/unknown contracts; branch-local results are not global facts.
+
+SPARQL owns its local operator state, not all request progress. The continuation below
+is a local, unselected candidate. Neither it nor root/kernel isolation defines the whole
+architecture. This adds no generic scheduler, cache or IR. The default-policy rewind is
+separately authorised; callback relocation under an explicitly selected pool is not.
+
 ## Problem and evidence
 
 The cache shares unfinished eligible operator results through `Flight`. A consumer
-waits on its condition variable. The store's Runtime now executes native queries on
-a retained physical Rayon pool. These are individually understandable mechanisms,
+waits on its condition variable. The measured failing checkpoint's Runtime executes
+native queries on a retained physical Rayon pool. These are individually understandable mechanisms,
 but their composition can prevent progress:
 
 1. Query A owns a cache flight and starts a parallel kernel.
@@ -30,9 +64,9 @@ to yield does not remove the stack dependency. See the upstream
 [join contract](https://docs.rs/rayon/1.12.0/rayon/fn.join.html) and
 [pool contract](https://docs.rs/rayon/1.12.0/rayon/struct.ThreadPool.html#method.install).
 
-## Design direction: retain the operation, release its worker
+## Local, unselected continuation candidate: retain the operation, release its worker
 
-SPARQL owns an operation's continuation: the remaining control flow and the values
+In this candidate, SPARQL owns its operation-local continuation: the control flow and values
 already computed. Run it on the existing workers until it completes or needs an
 external result. Return the whole operation to its synchronous caller while waiting;
 then resume it on the same physical pool. Do not restart the query or replay its

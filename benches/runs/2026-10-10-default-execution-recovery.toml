@@ -1,0 +1,106 @@
+title = "Selective default-execution rewind: original-baseline recovery"
+status = "fourteen ten-pair Phuoc cases and all 95 three-pair Office cases complete; no new comparator regression flags"
+task = "docs/plan/2026-10-10-performance-campaign.md#user-request"
+pr = "https://github.com/Krarilotus/OWL-RS/pull/23"
+baseline = "4e8bd38e0733055c06d77f9fdd7cd36c6d89bd7c"
+failed_checkpoint = "bebada2e6631b58ed0554ee302572570e80b085e"
+candidate_parent = "62ae2e0faeafea162f3a4dbf58cee9a56e8254d5"
+candidate_dirty = true
+candidate_patch_sha256 = "adc69dc6e323b708fd6db12004ec12529d4501fb00dade840cc4188ed5044c43"
+remote_root = "/home/krarilotus/nrese-prep-20261009-4e8bd38/recovery-current-20261010"
+campaign_root = "/home/krarilotus/nrese-prep-20261009-4e8bd38/campaign-20261010-bebada2"
+full_artifact_manifest = "full/SHA256SUMS"
+full_artifact_manifest_sha256 = "7bba791c669cfa0a8e808f2046291e8208d1d7d1d7d99da4fcd1e0d351e4b05d"
+qualified_speedup_claim = false
+
+[change]
+owner = "nrese-store Runtime chooses policy; nrese-exec Workers implements it"
+default = "execution.threads=0: serial caller execution and current-registry parallel kernels, no catalog-wide CPU cap"
+explicit = "Positive execution.threads keeps the existing shared physical pool and configured allowances"
+reuse = "Existing Workers/Runtime, kernels, serializers, shared query budget and correctness repairs"
+production_added_including_comments = 56
+production_removed_including_comments = 22
+test_added = 56
+limits = "Explicit-pool progress/handoff/retention and worker embedding remain open; no new scheduler or caller-budget queue"
+
+[validation]
+host = "Office-PC"
+complete_utc = "2026-10-10T12:30:01Z"
+commands = [
+  "cargo fmt --all",
+  "scripts/cargo-guarded.sh test --frozen -p nrese-exec --lib workers::tests",
+  "scripts/cargo-guarded.sh test --frozen -p nrese-store --lib runtime::tests",
+  "bash scripts/check.sh commit",
+]
+normal_gate = "passed: formatting, Clippy, dependent compilation, affected tests"
+build = "Office existing target-candidate-c888a20; Phuoc verifies Office-built binaries; no local Rust or new target/worktree"
+source = "Parent archive plus formatted.patch, toolchain, dependencies, commands and executable hashes retained"
+
+[screen]
+host = "Phuoc-Yu"
+runtime = "native systemd workload services"
+label = "recovery-default-screen"
+outer_pairs = 3
+invocations = 24
+cases = ["clients-lookups", "commits-plain", "kernel-intersect", "op-aggregates"]
+result = "all recorded checks pass; current zero-floor comparison flags no latency, QPS, lifetime/phase memory or work-counter regression"
+threads = "No --threads argument; positive values would select the old explicit-pool policy"
+lookup_qps_baseline = 1903910.8
+lookup_qps_candidate = 1926644.6
+commit_p50_us_baseline = 6.9
+commit_p50_us_candidate = 6.9
+skew_p50_ms_baseline = 96.36
+skew_p50_ms_candidate = 95.715
+uniform_p50_ms_baseline = 53.354
+uniform_p50_ms_candidate = 52.907
+aggregate_query_phase_rss_max_mib_baseline = 577
+aggregate_query_phase_rss_max_mib_candidate = 563
+limits = "Screening, not general neutrality; memory phase maxima are not lifetime peaks; client sample retention confounds client-memory attribution"
+
+[phuoc_extended]
+unit = "owl-recovery-default-qualification-20261010"
+label = "recovery-default-qualification"
+started_utc = "2026-10-10T12:40:17Z"
+outer_pairs = 10
+cases = ["clients-lookups", "clients-sweep", "commits-plain", "writes-under-readers", "kernel-intersect", "op-aggregates", "cache-replay", "ql-lubm10", "rdfs-full-lubm10", "q-large-result", "op-negation", "plan-estimates", "op-group", "rdf12-annotations"]
+status = "complete; completed cases analyzed before dispatching the next case"
+completed_cases = ["clients-lookups", "clients-sweep", "commits-plain", "writes-under-readers", "kernel-intersect", "op-aggregates", "cache-replay", "ql-lubm10", "rdfs-full-lubm10", "q-large-result", "op-negation", "plan-estimates", "op-group", "rdf12-annotations"]
+completed_reports = 280
+completed_native_calls = 340
+completed_result = "All recorded checks pass; no current-comparator latency/QPS/memory/work flags at min-ms=0"
+lookup_completed_pairs = 10
+lookup_qps_baseline = 1892315
+lookup_qps_candidate = 1922537
+lookup_result = "No flags; +1.6% QPS is below the comparator's 10% threshold and is not a speedup claim"
+commit_p50_us_baseline = 6.9
+commit_p50_us_candidate = 6.8
+skew_p50_ms_baseline = 96.402
+skew_p50_ms_candidate = 95.529
+aggregate_query_phase_rss_max_mib_baseline = 596
+aggregate_query_phase_rss_max_mib_candidate = 581
+
+[office_full]
+unit = "owl-recovery-full-office-20261010"
+label = "recovery-full-office"
+cases = 95
+outer_pairs = 3
+planned_invocations = 570
+status = "complete"
+completed_utc = "2026-10-10T14:02:30Z"
+completed_reports = 570
+valid_cases = 85
+expected_boundary_cases = 6
+known_both_failed_cases = ["dl-transitive-400", "mem-load-20m-2g", "ql-owl2bench", "vector-knn-filtered"]
+new_status_check_failures = 0
+new_latency_qps_memory_work_flags = 0
+result = "All paired source, binary and query identities agree; all workload cgroup peaks retained; noisy layout results are not new speedup claims"
+driver_reclaimed_logical_bytes = 23062991016
+transport_sha256 = "de02d169ceeaef80618a47bc842db58fa9b78ef6964feb03e812a8ba16b0c225"
+driver = "Frozen bebada2 fast workload/checks; only artifact/source identity rebound"
+
+[evidence]
+local = "tmp/regression-cause-20261010/{recovery-screen,recovery-qualification,office-full}"
+analysis = "Current fast.py compare --min-ms 0, including retained single-width QPS extraction"
+controls = "Counterbalanced fresh invocations, same preserved inputs/caps, serialized timed work, answers/statuses before timing credit"
+remaining = "Vector correctness/performance repair, explicit-policy investigations, full home-turf competitors, final source qualification and normal push gate"
+cleanup = "Driver removes owned finished store scratch; retain input snapshots, raw evidence, source and binary receipts"

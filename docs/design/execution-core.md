@@ -53,21 +53,23 @@ more than once copies only its additional occurrences.
 
 ### Physical workers and resource lifetime
 
-The store's `Runtime` owns the physical `nrese_exec::workers::Workers` pool and the
-shared query budget. A catalog and its system store share this owner. Native SPARQL
-computation moves its context into that pool and returns it with the result, retaining
-the computed-ID domain. Writers, liveness callbacks and transactions stay on their caller;
-encoding windows return owned bytes before the caller writes them. A slow writer does
-not occupy a pool thread while waiting for output backpressure.
+The store's `Runtime` owns execution policy and the shared query budget. A catalog and
+its system store share this owner. Default execution keeps serial work on the caller and
+reuses existing parallel kernels through `Workers::current`; it creates no dedicated
+pool and imposes no catalog-wide CPU cap. An explicit positive `execution.threads`
+selects a shared physical pool. Native computation then moves its context into that
+pool and returns it with the result and computed-ID domain. Writers, liveness callbacks
+and transactions stay on their caller; encoding windows return owned bytes before I/O.
+A slow writer does not occupy an explicitly selected pool while waiting for backpressure.
 
 This encoding ownership covers native direct-result ID blocks. Generic serializers
 (including XML and retained DL result delivery), ASK documents and headers still encode
-on their caller. Completing output CPU ownership remains open; this exception is not a
-waiver of the requested boundary. `SERVICE` callbacks run inside native evaluation and
+on their caller. An explicitly selected pool does not cover all output CPU work.
+`SERVICE` callbacks run inside native evaluation and
 have no caller-affinity guarantee.
 
-DL classification, realisation and saturation reuse physical workers across phases and
-rounds. A smaller `Workers::limited` handle bounds participating batch dispatch; it is
+DL classification, realisation and saturation reuse their execution handle across phases
+and rounds. A smaller `Workers::limited` handle bounds participating batch dispatch; it is
 not a semaphore or a quota automatically inherited by arbitrary nested Rayon work.
 Child work must partition its allowance explicitly. Full-width batches retain Rayon
 work stealing; narrow batches use bounded lanes. Context activation uses nonblocking
