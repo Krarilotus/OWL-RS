@@ -1,0 +1,42 @@
+title = "Frozen v2 checkpoint: Office and Phuoc-Yu"
+status = "running"
+task = "docs/plan/2026-10-10-performance-campaign.md#user-request"
+pr = "https://github.com/Krarilotus/OWL-RS/pull/23"
+candidate = "bebada2e6631b58ed0554ee302572570e80b085e"
+baseline = "4e8bd38e0733055c06d77f9fdd7cd36c6d89bd7c"
+driver = "bebada2e6631b58ed0554ee302572570e80b085e"
+cases = 95
+outer_pairs_per_host = 3
+planned_invocations_per_host = 570
+latency_floor_ms = 0
+qualified_current_head_improvement = false
+remote_root = "/home/krarilotus/nrese-prep-20261009-4e8bd38/campaign-20261010-bebada2"
+receipt = "checkpoint/manifest.json"
+inputs = ["inputs-office.json", "inputs-phuoc.json"]
+progress = "checkpoint/active.json"
+results = "checkpoint/NN-SIDE-CASE.json"
+raw = "checkpoint/NN-SIDE-CASE.raw/"
+cleanup = "smoke-cleanup.json and each completed case record"
+publication = "GraphDB, RDFox, Stardog and AnzoGraph numbers private; public coverage/status only"
+
+[[host]]
+ssh = "Office-PC"
+hostname = "sus-ai"
+runtime = "Docker, pinned rust:1.98.1-bookworm image ID recorded in manifest"
+unit = "owl-checkpoint-office-20261010"
+build = "Only Office builds; existing target-candidate-c888a20 reused"
+
+[[host]]
+ssh = "Phuoc-Yu"
+hostname = "Phuoc-Yu"
+runtime = "native systemd user service per invocation; registered MemoryMax and zero swap"
+unit = "owl-checkpoint-phuoc-20261010"
+build = "No builds; Office binaries verified against SHA256SUMS and executed in transport smoke checks"
+
+[measurement]
+checks = "Unchanged registered fast.py counts, routes, canonical taxonomies and existing vector answer checks"
+memory = "Actual workload cgroup lifetime peak, maximum across case invocations; originals and phase/per-width RSS retained separately"
+native_correction = "Original host-root cgroup probe is retained raw; actual service peak supplied to registered cgroup checks"
+failure_policy = "Failed/unsupported/OOM/timeout outcomes retained; transport-control failure halts queue"
+claims = "Three pairs are initial regression screening; ten pairs required for published speed claims"
+limits = "No current-head speedup or full competitor-comparison result yet; do not pool host/runtime wall times"
