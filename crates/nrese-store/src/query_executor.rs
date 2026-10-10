@@ -26,6 +26,10 @@ use nrese_sparql_syntax::algebra::QueryDataset;
 use crate::error::{StoreError, StoreResult};
 use crate::query::{GraphResultFormat, QueryResultKind, SolutionsResultFormat, SparqlQueryRequest};
 
+#[cfg(test)]
+#[path = "query_executor_tests.rs"]
+mod tests;
+
 impl SolutionsResultFormat {
     fn results_format(self) -> QueryResultsFormat {
         match self {
@@ -38,14 +42,14 @@ impl SolutionsResultFormat {
 }
 
 /// What the store adds to every query it runs.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct StoreSettings {
     /// [`StoreConfig::union_default_graph`](crate::StoreConfig).
     pub union_default_graph: bool,
     /// [`StoreConfig::geosparql_stated_only`](crate::StoreConfig).
     pub geosparql_stated_only: bool,
-    /// The budget for all running queries together, if the store has one.
-    pub query_memory: Option<std::sync::Arc<nrese_sparql::SharedBudget>>,
+    /// Physical workers and capacity shared across the catalog's repositories.
+    pub runtime: std::sync::Arc<crate::Runtime>,
     /// Who answers `SERVICE` calls, once the application installs a client
     /// ([`StoreService::set_service_client`](crate::StoreService::set_service_client)).
     pub services: std::sync::Arc<std::sync::OnceLock<nrese_sparql::Services>>,
@@ -361,7 +365,8 @@ pub(crate) fn protocol_dataset(
 
 /// Evaluates `prepared` on `view` and writes the serialised results to `out` as they are
 /// produced. On error the output is incomplete and must be discarded by the caller.
-/// `context` is what the store's answer depends on beyond the query's options (the
+/// `report` receives the retained QL report before any bytes and returns the cache
+/// context: what the store's answer depends on beyond the query's options (the
 /// `owl2-dl` mode with its `dl-answers` option, the completeness status it reports): part
 /// of the key of the answer's bytes in the result cache. A part's rows don't depend on it
 /// (every path evaluates with the same options; the QL rewriting is in the algebra).
@@ -371,31 +376,12 @@ pub(crate) fn run_query(
     store: &StoreSettings,
     cancellation: &CancellationToken,
     out: impl Write,
-    context: &str,
-) -> StoreResult<()> {
-    let options = QueryOptions {
-        dataset: prepared.dataset.clone(),
-        cancellation: Some(cancellation.clone()),
-        read_model: prepared.read_model,
-        memory_limit: prepared.memory_limit,
-        as_written: prepared.as_written,
-        shared_memory: store.query_memory.clone(),
-        union_default_graph: store.union_default_graph,
-        geosparql_stated_only: store.geosparql_stated_only,
-        services: store.services.get().cloned(),
-        equality_closed: store
-            .equality_closed
-            .load(std::sync::atomic::Ordering::Acquire),
-        equality_canonical: store.equality_canonical,
-        equality_early_expansion: store.equality_early_expansion,
-        pre_bound: None,
-        cross_chunk_rows: None,
-        stream_rows: None,
-        access: prepared.access.clone(),
-        result_cache: store.result_cache.clone(),
-        pin: prepared.pin.clone(),
-        ql: store.ql(),
-    };
+    report: impl FnOnce(Option<&nrese_sparql::ql::QlReport>) -> String,
+) -> StoreResult<Option<nrese_sparql::ql::QlReport>> {
+    let mut options = query_options(prepared, store, cancellation);
+    let (query, ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
+    let context = report(ql.as_ref());
+    check_cancelled(cancellation)?;
     // A repeated query's answer as written before, in this format; else written, and its
     // bytes offered to the cache with the time writing them took (`nrese_sparql::cache`).
     let mut out = out;
@@ -404,11 +390,23 @@ pub(crate) fn run_query(
         &prepared.query,
         &options,
         prepared.media_type(),
-        context,
+        &context,
     ) {
-        CachedOutput::Hit(bytes) => return Ok(out.write_all(&bytes)?),
-        CachedOutput::Miss(slot) => slot,
-        CachedOutput::Off => return serialize(view, prepared, &options, cancellation, out),
+        CachedOutput::Hit(bytes) => {
+            check_cancelled(cancellation)?;
+            out.write_all(&bytes)?;
+            check_cancelled(cancellation)?;
+            return Ok(ql);
+        }
+        CachedOutput::Miss(slot) => Some(slot),
+        CachedOutput::Off => None,
+    };
+    // The key above uses the original query/options. Execution consumes their prepared
+    // algebra and must not run the semantic QL stage a second time.
+    options.ql = None;
+    let Some(slot) = slot else {
+        serialize(view, prepared, &query, &options, cancellation, out)?;
+        return Ok(ql);
     };
     let mut tee = Tee {
         inner: out,
@@ -418,11 +416,11 @@ pub(crate) fn run_query(
     // What the bytes save: this answer's evaluation, as far as the cache didn't answer
     // its parts, and its serialisation (written at the end, on every core, for JSON).
     let started = std::time::Instant::now();
-    serialize(view, prepared, &options, cancellation, &mut tee)?;
+    serialize(view, prepared, &query, &options, cancellation, &mut tee)?;
     if let Some(copy) = tee.copy {
         slot.offer(copy, started.elapsed());
     }
-    Ok(())
+    Ok(ql)
 }
 
 /// A writer that forwards to `inner` and keeps a copy of what it writes up to `limit`
@@ -451,21 +449,24 @@ impl<W: Write> Write for Tee<W> {
     }
 }
 
+fn check_cancelled(cancellation: &CancellationToken) -> StoreResult<()> {
+    if cancellation.is_cancelled() {
+        return Err(QueryEvaluationError::Cancelled.into());
+    }
+    Ok(())
+}
+
 /// Evaluates `prepared` on `view` with `options` and writes its serialised results to
 /// `out` as they are produced.
 fn serialize(
     view: &impl ReadView,
     prepared: &PreparedQuery,
+    query: &Query,
     options: &QueryOptions,
     cancellation: &CancellationToken,
     out: impl Write,
 ) -> StoreResult<()> {
-    let alive = || match cancellation.is_cancelled() {
-        true => Err(StoreError::SparqlEvaluation(
-            QueryEvaluationError::Cancelled,
-        )),
-        false => Ok(()),
-    };
+    let alive = || check_cancelled(cancellation);
     let mut out = out;
     let version = prepared.rdf12.then_some("1.2");
     let format = match prepared.solutions_format {
@@ -475,16 +476,26 @@ fn serialize(
         SolutionsResultFormat::Xml => None,
     };
     if let Some(format) = format
-        && matches!(prepared.query, Query::Select { .. } | Query::Ask { .. })
-        && let Some(written) =
-            write_results(view, &prepared.query, options, format, version, &mut out)
+        && matches!(query, Query::Select { .. } | Query::Ask { .. })
+        && let Some(written) = write_results(view, query, options, format, version, &mut out)
     {
         return written.map_err(|error| match error {
             WriteResultsError::Evaluation(error) => StoreError::SparqlEvaluation(error),
             WriteResultsError::Io(error) => StoreError::Io(error),
         });
     }
-    match evaluate_query(view, &prepared.query, options)? {
+    serialize_answers(prepared, evaluate_query(view, query, options)?, out, alive)
+}
+
+fn serialize_answers(
+    prepared: &PreparedQuery,
+    answers: QueryResults<'_>,
+    out: impl Write,
+    alive: impl Fn() -> StoreResult<()>,
+) -> StoreResult<()> {
+    alive()?;
+    let version = prepared.rdf12.then_some("1.2");
+    match answers {
         QueryResults::Boolean(value) => {
             results_serializer(prepared, version).serialize_boolean_to_writer(out, value)?;
         }
@@ -495,6 +506,7 @@ fn serialize(
                 alive()?;
                 writer.serialize(&solution?)?;
             }
+            alive()?;
             writer.finish()?;
         }
         QueryResults::Graph(triples) => {
@@ -507,81 +519,68 @@ fn serialize(
                 alive()?;
                 writer.serialize_triple(&triple?)?;
             }
+            alive()?;
             writer.finish()?;
         }
     }
-    Ok(())
+    alive()
 }
 
-/// A query's answers, collected (the `owl2-dl` mode compares and completes them before
-/// writing).
-pub(crate) enum Answers {
-    Boolean(bool),
-    Solutions {
-        variables: std::sync::Arc<[nrese_sparql_syntax::term::Variable]>,
-        rows: Vec<Vec<Option<nrese_rdf::Term>>>,
-    },
-    Graph(Vec<nrese_rdf::Triple>),
+pub(crate) use nrese_sparql::TypedResults as Answers;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static BOUND_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Evaluates `prepared` on `view` and collects its answers.
-pub(crate) fn evaluate_prepared(
+/// Retains bound results in IDs. An earlier live result reduces this evaluation's
+/// available local memory; its reservation already counts against the shared budget.
+pub(crate) fn evaluate_bound(
     view: &impl ReadView,
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
-) -> StoreResult<Answers> {
-    let options = explain_options(prepared, store, cancellation);
-    Ok(match evaluate_query(view, &prepared.query, &options)? {
-        QueryResults::Boolean(value) => Answers::Boolean(value),
-        QueryResults::Solutions(solutions) => {
-            let variables: std::sync::Arc<[nrese_sparql_syntax::term::Variable]> =
-                solutions.variables().into();
-            let mut rows = Vec::new();
-            for solution in solutions {
-                rows.push(solution?.values().to_vec());
-            }
-            Answers::Solutions { variables, rows }
-        }
-        QueryResults::Graph(triples) => Answers::Graph(triples.collect::<Result<Vec<_>, _>>()?),
-    })
+    retained: usize,
+) -> StoreResult<nrese_sparql::TypedResults> {
+    #[cfg(test)]
+    BOUND_EVALUATIONS.with(|n| n.set(n.get() + 1));
+    let mut options = query_options(prepared, store, cancellation);
+    options.memory_limit = options
+        .memory_limit
+        .map(|limit| limit.saturating_sub(retained));
+    Ok(nrese_sparql::evaluate_query_typed(
+        view,
+        &prepared.query,
+        &options,
+    )?)
 }
 
-/// Writes collected answers in `prepared`'s format.
+pub(crate) fn bound_budget(
+    prepared: &PreparedQuery,
+    store: &StoreSettings,
+    retained: usize,
+) -> std::sync::Arc<nrese_exec::Budget> {
+    std::sync::Arc::new(
+        nrese_exec::Budget::new(
+            prepared
+                .memory_limit
+                .unwrap_or(usize::MAX)
+                .saturating_sub(retained),
+        )
+        .within(store.runtime.query_memory()),
+    )
+}
+
+/// Writes retained bound answers through the ordinary result serializer.
 pub(crate) fn write_answers(
     prepared: &PreparedQuery,
     answers: Answers,
+    cancellation: &CancellationToken,
     out: impl Write,
 ) -> StoreResult<()> {
-    let version = prepared.rdf12.then_some("1.2");
-    match answers {
-        Answers::Boolean(value) => {
-            results_serializer(prepared, version).serialize_boolean_to_writer(out, value)?;
-        }
-        Answers::Solutions { variables, rows } => {
-            let mut writer = results_serializer(prepared, version)
-                .serialize_solutions_to_writer(out, variables.to_vec())?;
-            for values in rows {
-                writer.serialize(&nrese_sparql::QuerySolution::new(
-                    std::sync::Arc::clone(&variables),
-                    values,
-                ))?;
-            }
-            writer.finish()?;
-        }
-        Answers::Graph(triples) => {
-            let mut serializer = RdfSerializer::from_format(prepared.graph_format.rdf_format());
-            if let Some(version) = version {
-                serializer = serializer.with_version(version);
-            }
-            let mut writer = serializer.for_writer(out);
-            for triple in &triples {
-                writer.serialize_triple(triple)?;
-            }
-            writer.finish()?;
-        }
-    }
-    Ok(())
+    serialize_answers(prepared, answers.into_results(), out, || {
+        check_cancelled(cancellation)
+    })
 }
 
 /// The results serializer of `prepared`'s format, announcing `version`.
@@ -605,7 +604,7 @@ pub(crate) fn explain_prepared(
     store: &StoreSettings,
     cancellation: &CancellationToken,
 ) -> StoreResult<Explanation> {
-    let options = explain_options(prepared, store, cancellation);
+    let options = query_options(prepared, store, cancellation);
     Ok(explain_query(view, &prepared.query, &options)?)
 }
 
@@ -616,26 +615,12 @@ pub(crate) fn plan_prepared(
     prepared: &PreparedQuery,
     store: &StoreSettings,
 ) -> StoreResult<PlannedQuery> {
-    let options = explain_options(prepared, store, &CancellationToken::new());
+    let options = query_options(prepared, store, &CancellationToken::new());
     Ok(plan_query(view, &prepared.query, &options)?)
 }
 
-/// What the OWL 2 QL rewriting does to `prepared` on `view`, and whether its answers are
-/// complete (docs/design/ql-rewriting.md §7); `None` where it doesn't apply or the query
-/// doesn't run natively.
-pub(crate) fn ql_status(
-    view: &impl ReadView,
-    prepared: &PreparedQuery,
-    store: &StoreSettings,
-) -> Option<nrese_sparql::ql::QlReport> {
-    let options = explain_options(prepared, store, &CancellationToken::new());
-    nrese_sparql::ql_report(view, &prepared.query, &options)
-        .ok()
-        .flatten()
-}
-
-/// The options `prepared` runs with, for an explanation.
-fn explain_options(
+/// The options `prepared` runs with, for execution and explanation alike.
+fn query_options(
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
@@ -646,7 +631,8 @@ fn explain_options(
         read_model: prepared.read_model,
         memory_limit: prepared.memory_limit,
         as_written: prepared.as_written,
-        shared_memory: store.query_memory.clone(),
+        shared_memory: store.runtime.query_memory(),
+        workers: Some(store.runtime.workers()),
         union_default_graph: store.union_default_graph,
         geosparql_stated_only: store.geosparql_stated_only,
         services: store.services.get().cloned(),

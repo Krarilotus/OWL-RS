@@ -75,6 +75,107 @@ fn ex(table: &mut Table, local: &str) -> u64 {
 }
 
 #[test]
+fn normalised_assertions_keep_missing_memberships_clashes_and_original_sources() {
+    use nrese_owl::{Axiom, ClassExpr, Concept};
+
+    for contradictory in [false, true] {
+        let mut text = String::from(
+            r#"
+@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+:C a owl:Class .
+:b a :C .
+:a a [ a owl:Class; owl:complementOf [ a owl:Class; owl:complementOf :C ] ] .
+"#,
+        );
+        if contradictory {
+            text.push_str(":a a [ a owl:Class; owl:complementOf :C ] .\n");
+        }
+        let mut table = Table::default();
+        let input = table.parse(RdfFormat::Turtle, text.as_bytes());
+        let (ontology, normalised) = support::read(&mut table, &input);
+        let (a, b, c) = (
+            ex(&mut table, "a"),
+            ex(&mut table, "b"),
+            ex(&mut table, "C"),
+        );
+        let source = ontology
+            .axioms
+            .iter()
+            .position(|axiom| {
+                matches!(axiom, Axiom::ClassAssertion(expr, individual)
+                    if *individual == a
+                        && matches!(ontology.classes.get(expr.0), ClassExpr::Not(inner)
+                            if matches!(ontology.classes.get(inner.0), ClassExpr::Not(_))))
+            })
+            .unwrap();
+        let ordinary_source = ontology
+            .axioms
+            .iter()
+            .position(
+                |axiom| matches!(axiom, Axiom::ClassAssertion(_, individual) if *individual == b),
+            )
+            .unwrap();
+        assert!(
+            normalised
+                .facts
+                .concepts
+                .contains(&(Concept::Named(c), a, source))
+        );
+        let program = support::compile(&mut table, &ontology, &normalised);
+        let missing = [a, program.names.rdf_type, c];
+        let ordinary = [b, program.names.rdf_type, c];
+        assert!(!input.contains(&missing));
+        assert!(input.contains(&ordinary));
+        let seeded: Vec<_> = program
+            .facts
+            .iter()
+            .filter(|(fact, _)| *fact == missing)
+            .collect();
+        assert_eq!(
+            seeded.len(),
+            1,
+            "seed the normalised membership exactly once"
+        );
+        assert_eq!(seeded[0].1.origin, Origin::Assertion);
+        assert_eq!(seeded[0].1.sources, vec![vec![source]]);
+        assert!(seeded[0].1.approximations.exact());
+        assert!(
+            program.facts.iter().all(|(fact, provenance)| {
+                *fact != ordinary
+                    && !provenance
+                        .sources
+                        .iter()
+                        .flatten()
+                        .any(|&s| s == ordinary_source)
+            }),
+            "ordinary named ABox facts and provenance must not be retained twice"
+        );
+        // Also retain the existing fresh-concept assertion path (the negative case).
+        for &(concept, individual, source) in &normalised.facts.concepts {
+            if let Concept::Fresh(q) = concept {
+                let fact = [
+                    individual,
+                    program.names.rdf_type,
+                    program.names.fresh[q as usize],
+                ];
+                assert!(program.facts.iter().any(|(f, p)| {
+                    *f == fact && p.origin == Origin::Assertion && p.sources == vec![vec![source]]
+                }));
+            }
+        }
+        assert!(program.incomplete.is_empty());
+        let upper = support::upper(&mut table, &program, &input);
+        assert!(upper.facts.binary_search(&missing).is_ok());
+        assert!(upper.facts.binary_search(&ordinary).is_ok());
+        assert_eq!(
+            upper.facts.iter().any(|t| t[1] == program.names.clash),
+            contradictory
+        );
+    }
+}
+
+#[test]
 fn pagoda_running_example_gives_the_papers_bound() {
     let mut e = example(KEX);
     assert!(e.program.incomplete.is_empty());

@@ -487,11 +487,12 @@ fn types_equal_brute_force() {
             tally.brute_undecided += 1;
             continue;
         };
-        for threads in [1, 3] {
+        for (threads, reuse_model) in [(1, false), (1, true), (3, true)] {
             let r = classify::realise(
                 &o,
                 &Options {
                     threads,
+                    reuse_model,
                     ..options()
                 },
             );
@@ -503,7 +504,7 @@ fn types_equal_brute_force() {
             assert_eq!(
                 r.types,
                 expected,
-                "case {case}, {threads} threads: the types differ from brute force\n{}",
+                "case {case}, {threads} threads, reuse_model={reuse_model}: the types differ from brute force\n{}",
                 render(&o)
             );
             tally.realised += 1;

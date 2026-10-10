@@ -7,7 +7,7 @@
 //!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE] [--reason MODE]
 //!     [--rules FILE.n3] [--reason-runs 1] [--results DIR] [--routes] [--commits FILE]
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
-//!     [--canonicalize FILE]...
+//!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC]
 //! cargo run --release -p nrese-store --example perf_lab -- generate KIND OUT [key=value]...
 //! ```
 //!
@@ -51,6 +51,8 @@
 //!   `--duration-s`. `--threads N` sizes the thread pool (1: single-threaded). `--export`
 //!   writes the store's statements, inferred ones included, as N-Triples (the closure the
 //!   stores without reasoning load). `--canonicalize` canonicalises blank nodes.
+//!   `--prepare-vector-graph 64:cosine` synchronously prepares that vector space before
+//!   query timing, recording its preparation phase and checking full graph coverage.
 //!   `generate` writes the suite's data (`generate.rs`). A failure still writes the report, with
 //!   its `error`.
 //!
@@ -207,6 +209,7 @@ struct Args {
     parse_only: bool,
     kernel: Option<String>,
     classify: bool,
+    prepare_vector_graph: Option<(usize, nrese_engine::vector::Metric)>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -243,6 +246,7 @@ fn parse_args() -> Result<Args, String> {
         parse_only: false,
         kernel: None,
         classify: false,
+        prepare_vector_graph: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -310,6 +314,21 @@ fn parse_args() -> Result<Args, String> {
             "--parse-only" => args.parse_only = true,
             "--kernel" => args.kernel = Some(value()?),
             "--classify" => args.classify = true,
+            "--prepare-vector-graph" => {
+                let input = value()?;
+                let (dimension, metric) = input
+                    .split_once(':')
+                    .ok_or("--prepare-vector-graph needs DIM:METRIC")?;
+                let dimension = dimension
+                    .parse::<usize>()
+                    .map_err(|e| format!("--prepare-vector-graph dimension: {e}"))?;
+                if dimension == 0 {
+                    return Err("--prepare-vector-graph dimension must be positive".into());
+                }
+                let metric = nrese_engine::vector::Metric::from_name(metric)
+                    .ok_or("--prepare-vector-graph metric must be cosine, dot or l2")?;
+                args.prepare_vector_graph = Some((dimension, metric));
+            }
             "--format" => {
                 args.format = match value()?.as_str() {
                     "tsv" => SolutionsResultFormat::Tsv,
@@ -915,6 +934,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     // `NRESE_REASONING_EQUALITY_ANSWERS`).
     let setting = |name: &str| std::env::var(name).unwrap_or_default();
     let config = StoreConfig {
+        execution_threads: args.threads.unwrap_or(0),
         // No result cache unless --cache-bytes: repeated runs measure evaluation.
         query_cache_bytes: args.cache_bytes,
         bulk_load_memory_bytes,
@@ -1239,6 +1259,28 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         ),
     ));
 
+    if let Some((dimension, metric)) = args.prepare_vector_graph {
+        let phase = Phase::start();
+        let started = Instant::now();
+        let snapshot = store.read_snapshot(None);
+        let mut query = nrese_engine::VectorQuery::new(vec![0.0; dimension], 1);
+        query.vector[0] = 1.0;
+        query.metric = metric;
+        query.strategy = nrese_engine::VectorStrategy::Approximate;
+        snapshot.prepare_vector_graph(&query);
+        let (_, readiness) = snapshot.vector_search(&query, &|_| true);
+        report.sections.push(("vector_prepare", phase.json()));
+        let metric = metric.name();
+        report.sections.push(("vector_graph", format!(
+            "{{\"dimension\": {dimension}, \"metric\": \"{metric}\", \"space\": {}, \"graph\": {}, \"scanned\": {}, \"prepare_ms\": {}}}",
+            readiness.space, readiness.graph, readiness.scanned, started.elapsed().as_secs_f64() * 1000.0,
+        )));
+        if readiness.space == 0 || !readiness.graph || readiness.scanned != 0 {
+            return Err(
+                "vector graph does not cover the requested space; query timing skipped".into(),
+            );
+        }
+    }
     let baseline = args
         .baseline
         .as_ref()

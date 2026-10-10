@@ -53,6 +53,44 @@ pub struct Telemetry {
     pub dependency_sets: u64,
 }
 
+impl Telemetry {
+    /// Work across sequential attempts; peak sizes remain maxima, not sums.
+    pub(crate) fn accumulate(&mut self, other: &Self) {
+        macro_rules! sum {
+            ($($field:ident),* $(,)?) => { $(self.$field += other.$field;)* };
+        }
+        sum!(
+            compile,
+            saturate,
+            blocking,
+            expand,
+            search,
+            datatypes,
+            total,
+            nodes_created,
+            branch_points,
+            backjumps,
+            levels_skipped,
+            clashes,
+            merges,
+            ni_applications,
+            blocking_tests,
+            blocking_hits,
+            clauses_fired,
+            retractions,
+            restarts,
+            plans_tried,
+            facts,
+            data_checks,
+            key_firings
+        );
+        self.peak_nodes = self.peak_nodes.max(other.peak_nodes);
+        self.bytes_per_hot_node = self.bytes_per_hot_node.max(other.bytes_per_hot_node);
+        self.bytes_per_node = self.bytes_per_node.max(other.bytes_per_node);
+        self.dependency_sets = self.dependency_sets.max(other.dependency_sets);
+    }
+}
+
 impl fmt::Display for Telemetry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let ms = |d: Duration| d.as_secs_f64() * 1000.0;

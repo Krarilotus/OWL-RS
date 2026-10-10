@@ -24,6 +24,10 @@ benchmark runs.
 
 | Win | Measured | Guard | Fast case |
 |---|---|---|---|
+| Order-preserving DISTINCT removes adjacent duplicates when any complete column order is known, without sorting/gathering again (9 Oct) | A full `[1, 0]` order used to call the `[0, 1]` sorter, changing row order and copying columns. The regression fails with that old call; the repair retains the original column buffers and sort metadata. Repeated keys that omit a column still use the hash path. Timing follow-up below. | `ordered_dedup_uses_any_complete_sort_order_without_gathering` (`nrese-exec`), executor differential tests | OWL2Bench QL q01/q20; projection/DISTINCT follow-up |
+| Raw spill writing consumes batches without concatenating the chunk or constructing an unused Rayon pool (9 Oct, `f4a18a1`) | Allocation guard: an 8 MiB input needs less than 2 MiB extra live heap, including the fixed 1 MiB writer. Restoring concatenation fails with 8,389,234 extra live bytes. No latency claim yet. | `raw_spill_keeps_bytes_without_a_chunk_copy`, raw byte ordering/error cleanup, spilled ID determinism at 1/2/8 threads and reopen | forced-spill load comparison pending |
+| Projection consumes its input and moves retained ID columns, preserving their useful order; only a repeated output column needs a copy | Work guard, 9 Oct: each retained column's original buffer survives projection, including reordered and repeated selections; zero-column projection retains the input row count. No latency measurement yet. | `projection_moves_buffers_and_preserves_order_and_empty_rows` (`nrese-exec`); SPARQL projection and duplicate-insensitive differential tests | `op-negation`, `op-aggregates`; timing comparison pending |
+| Forward search shares interval discovery while retaining slice and column-join binary searches (9 Oct, `10ae8d7`) | Deterministic comparison probes: slice 4,104,148 and join 3,745,795, unchanged over 732,290 cases each; WCOJ 103,789 → 94,047 over 8,385 cases. The release scalar probe inlines the helper without an additional bounds check. These are work/code-generation checks, not latency measurements. | `forward_ranges_bracket_every_boundary_with_logarithmic_probes`, `fingers_keep_the_first_duplicate_and_rewind_after_exhaustion`, WCOJ intersection and cyclic-query differential tests | `kernel-intersect`, `q-cycles`; timing comparison pending |
 | A QL witness the data already has wherever it folds isn't folded (7 Oct) | NPD: 9 of 12 rewritten queries run as written, sum of medians 1.27× → 1.00× of the rewriting off | `witnesses_the_data_has_are_not_folded` (a realised witness: `patterns` 0, `realised` 1; one individual without the edge: rewritten again) | `npd` A/B (`benches/probes/ql-rewriting-ab.sh`) |
 | Drivers read the batch store's runs in place, no copied drivers (P1-F1) | LUBM 1000 peak 22.2 → 12.9 GB, reasoning −31 % | `rule_jobs_copy_no_drivers_and_rounds_keep_no_derived_facts_list` (no driver bytes copied; 3.85 MB without in-place drivers) | `rl-lubm100`, `alloc-lubm10` (peak) |
 | No list of derived facts; the input kept apart (P1-F4) | LUBM 1000 peak 15.2 → 13.4 GB | the same test: after each round the heap beside the working set's runs (their byte counter) stays under 6 B per derived fact (38.8 kB on 5 Oct; a derived-facts list: 1.2 MB) | `rl-lubm100`, `alloc-lubm10` (peak) |
@@ -36,7 +40,7 @@ benchmark runs.
 | A recent run that is the delta has no old part: old reads skip it instead of a binary search into the delta per pair | LUBM 100: 854,105 checks → 0 | `old_reads_of_a_recent_run_that_is_the_delta_check_nothing` (none; 36 on the guard input without) | `rule-work-lubm10`, `rl-lubm100` |
 | Equality by copying expands only facts that mention a term with a `sameAs` partner (the batch module and every commit) | LUBM 100 + one `sameAs`: partner scans 6.31 M → 6,903 (LUBM 10), closure 3.25 → 2.24 s | `equality_by_copying_expands_only_facts_with_partners` (≤ 5,733 scans; 117,216 without) | none yet (equality by copying is off by default) |
 | Compact equality: a commit that merges classes rewrites only the stored facts that mention a former representative, in its own transaction | LUBM 10, compact: merging commits 5.5–6.7 s (two revisions) → 0.001–0.42 s (one) | `a_commit_that_merges_classes_publishes_its_inferences_with_it` (nrese-store: one revision per merging commit, answers as replication) | `eq-merge-compact`, `rl-sameas-compact` |
-| Closed rule families don't read what they produced: the delta of a relation is split by producer, `cax-sco`'s (and `prp-spo1`'s) output in a part of its own that the family's instances skip; the part is the last round's only, merged on in one pass, and membership reads it first | the fast suite's spine (1,000 deep, 1 M instances): bindings 529.5 → 14.0 M, closure 21.5 → 2.46 s | `a_deep_hierarchy_derives_each_inherited_type_once` (≤ 428,000 bindings; 20,130,000 without); `a_closed_part_reads_as_the_delta_and_costs_one_copy` (merges write at most one copy of the part beyond its rounds with every pair open, the part answers membership first) | `rl-hierarchy`, `rdfs-hierarchy` |
+| Closed rule families don't read what they produced: the delta of a relation is split by producer, `cax-sco`'s (and `prp-spo1`'s) output in a part of its own that the family's instances skip; the part is marked in the one delta run, so every other read, fold and merge is as without it | the fast suite's spine (1,000 deep, 1 M instances): bindings 529.5 → 14.0 M, closure 21.5 → 2.46 s | `a_deep_hierarchy_derives_each_inherited_type_once` (≤ 428,000 bindings; 20,130,000 without); `a_closed_part_reads_as_the_delta_and_costs_nothing` (reads and membership as with every pair open, merges write exactly as many pairs; the family's reads skip the marked pairs) | `rl-hierarchy`, `rdfs-hierarchy` |
 | Group counts on the index (`COUNT … GROUP BY` one pattern) | Wikidata q07 2,101 → 0.18 ms | `group_counts_walk_the_index` (plan shows `group count`) | `op-group` (route: `group count`) |
 | Distinct values by a group walk (NOT EXISTS sides, sets) | DBpedia q13 25 → 3.1 ms | `distinct_values_walk_the_index` (`group walk`) | `op-group` (route: `group walk`) |
 | Worst-case-optimal joins for cyclic patterns | LUBM 100 q2 18 → 4.8 ms | `triangles_join_worst_case_optimally` (`wcoj`) | `q-cycles`, `kernel-intersect` (route: `wcoj`) |
@@ -65,13 +69,12 @@ benchmark runs.
 | DL in the store: U1's stack estimates a pattern from per-predicate counts and one index probe, not by counting its matches (the delta executor asks for estimates per job) | LUBM(1), the commits above: 9.00 → 0.79 ms | `stack_estimates_are_bounds_and_zero_only_without_a_match` (`dl/upper.rs`) | none yet (G3) |
 | DL in the store: a query whose predicates and classes have no fact in U1 beyond L (closed) runs once over L and streams, its status known before it runs; only the others are collected, run over L ∪ U1 and compared | LUBM(1), the 14 LUBM queries, 5 interleaved runs: q06 4.13 → 1.18 ms, q14 2.92 → 1.04 ms (`owl2-rl`: 1.42, 1.04 ms); all 14 `complete` with RL's counts, 4 by closed predicates, 10 by equal bounds (those 1.3–3× `owl2-rl`: two evaluations and decoded rows) | `closed_predicates_answer_from_the_lower_bound_alone` (path `closed-predicates`) | `dlmode-lubm1` (q03, q06, q13, q14 by `closed-predicates`) |
 | DL in the store: a monotone query whose gap patterns have only facts with a Skolem constant beyond L, and a term or an answer variable at both ends of each, runs once over L and streams (an answer U1 adds would name a Skolem constant, never an answer) | LUBM(1), the 14 LUBM queries, 5 interleaved runs, main PC under load (70–98% CPU, other processes): the 10 bounds-equal queries now one evaluation, `owl2-dl` at `owl2-rl`'s time (q08 14.30 → 4.33 ms against 4.32; q09 2.73 → 1.10 against 1.11; q05 0.93 → 0.38 against 0.38); all 14 `complete` with RL's counts; U1's 58,981 facts beyond L on LUBM all name a Skolem constant | `a_gap_of_skolem_constants_only_costs_one_evaluation_where_no_answer_can_name_them` (path `skolem-only-gap`, and not where an existential variable, a computed value, a path or an ASK meets the gap); `the_skolem_gap_path_gives_u1s_answers_on_random_ontologies` (debug builds check each query that takes the path against U1: 174 of 1,000) | `dlmode-lubm1` (the paths of all 14) |
-| DL in the store: a query whose predicates and classes have no fact in U1 beyond L (closed) runs once over L and streams, its status known before it runs; only the others are collected, run over L ∪ U1 and compared | LUBM(1), the 14 LUBM queries, 5 interleaved runs: q06 4.13 → 1.18 ms, q14 2.92 → 1.04 ms (`owl2-rl`: 1.42, 1.04 ms); all 14 `complete` with RL's counts, 4 by closed predicates, 10 by equal bounds (those 1.3–3× `owl2-rl`: two evaluations and decoded rows) | `closed_predicates_answer_from_the_lower_bound_alone` (path `closed-predicates`) | none yet (G3) |
-| DL in the store: a monotone query whose gap patterns have only facts with a Skolem constant beyond L, and a term or an answer variable at both ends of each, runs once over L and streams (an answer U1 adds would name a Skolem constant, never an answer) | LUBM(1), the 14 LUBM queries, 5 interleaved runs, main PC under load (70–98% CPU, other processes): the 10 bounds-equal queries now one evaluation, `owl2-dl` at `owl2-rl`'s time (q08 14.30 → 4.33 ms against 4.32; q09 2.73 → 1.10 against 1.11; q05 0.93 → 0.38 against 0.38); all 14 `complete` with RL's counts; U1's 58,981 facts beyond L on LUBM all name a Skolem constant | `a_gap_of_skolem_constants_only_costs_one_evaluation_where_no_answer_can_name_them` (path `skolem-only-gap`, and not where an existential variable, a computed value, a path or an ASK meets the gap); `the_skolem_gap_path_gives_u1s_answers_on_random_ontologies` (debug builds check each query that takes the path against U1: 174 of 1,000) | none yet (G3) |
 | DL in the store: U1 reads by value only the literals of predicates its rules compare (a key's values, a `hasValue`; [`Values`] in `dl/upper.rs`), not every literal of the view | LUBM(10): literals decoded and parsed for U1's value identity 107,410 → 0 (names, e-mail addresses, telephone numbers: no rule compares them); counts, the first commit's time not measured | `data_values_are_compared_by_value` (3 literals read by value: the key's two and the `hasValue`'s; a name nothing compares, not) | none yet (G3) |
 | DL in the store: routing by profile; an ontology entirely in OWL 2 RL (the per-axiom checker) is decided by the RL rules alone (theorem PR1): no U1 compiled or maintained, no DL engine on commit, every query complete over L | OWL2Bench RL-1 (54,931 statements), single-assertion commits, main PC under load (97% CPU), 3 interleaved rounds × 30: `owl2-dl` 2.67 ms against `owl2-rl` 2.42 ms (1.10×), first commit 1.5 s against 1.4 s; re-timed 6 Oct afternoon (67–92% CPU, 3 interleaved rounds × 30): 1.68 ms against 2.05 ms, first commit 760 against 755 ms (no cost measurable); the counterfactual (routing off, the U1 path): the first commit and each commit 1,800 s, `dl.timeout`, verdict `unknown`: U1 doesn't cover the ontology's `owl:hasKey` axiom, so it can't prove consistency and the hypertableau runs over the whole ABox | `an_rl_ontology_is_decided_by_the_rules_alone` (update `rules`, engine `rules`, no U1 fact) | none yet (G3) |
 | DL classification: tests with nominals run on the terminology first, kept where the probed part reaches no individual (detached probes) | ore_ont_9881 77.8 → 64.0 s, 3262 10.9 → 9.1 s (before the reuse above) | `classes_away_from_the_individuals_need_no_assertions` (4 detached, 1 rerun) | `dl-nominals` |
 | DL: the ≤-rule leaves out merges that would clash at once (a concept against its negation, a disjointness clause), their reasons joining its premise | W3C DL-903 entailment (≥200 p.A ⊓ ≥300 q.B with A, B disjoint against ≤499 r): 60 s timeout → 9 ms, no branch point | `disjoint_successors_are_no_merge_candidates` (0 branch points; > 0 with the filter off) | none yet: the W3C tests aren't a fast case |
 | DL: sizes of counted classes compared before the search (neighbours of a nominal, products over functional properties): a class with two sizes refutes the program without a branch | W3C DL-910 gave up → 9.5 ms; N=2, M=3, K=7 gave up after 774 k branch points in 30 s → 13 ms, none | `class_sizes_refute_a_wrong_product` (no branch point; consistent at K = N·M; nothing refuted without q functional) | none yet: the W3C tests aren't a fast case |
+| DL: a model from the counts (the number module's layers 3 and 4: proxies with multiplicities, role blocks, an independent validator) answers "consistent" before the search | W3C DL-906 gave up (merges) → 1 ms, DL-907 out of memory (60,000 successors) → 1 ms (the W3C suite's times, debug build); no node, no branch point | `the_multiplication_tests_are_decided_by_counting` (no node, no branch point); `counted_products_agree_with_the_semantics` (the expanded models checked by the semantics, n, m ≤ 5) | none yet: the W3C tests aren't a fast case |
 | DL context core: Pred joins stop where the body so far is already subsumed for the head (every conclusion below would be dropped) | ore_ont_9835's Horn part: 18.6 M Pred conclusions (99 % redundant) → 0.2 M | `no_hub_context_and_pruned_pred_joins` (Pred conclusions at most half without it) | none yet: an ORE dev task, not a fast case |
 | DL context core: a Pred join also stops where its body so far contains a body it found earlier in the same batch (those are derived after the joins, so the context's own check can't see them) | Pred conclusions: ore_ont_9835 361 k → 129 k, ore_ont_7914 323 k → 58 k; a join of 9835 that had reached the 1 M cap (12 premises for each of 6 body atoms) no longer does | `pred_joins_prune_by_the_bodies_they_found` (64 → at most 4) | none yet: an ORE dev task, not a fast case |
 | DL context core: forward redundancy by a set-trie per head (Savnik's subset query), backward by occurrence lists per (head, atom) from the rarest atom, with 64-bit body signatures (SatELite's) | ore_ont_9835: conclusions per second about 1.7× (the subset scans had been 54-73 % of the saturation) | the set-trie's unit test and the brute-force campaigns; missing: a count of subset tests per derived clause | none yet: an ORE dev task, not a fast case |
@@ -175,6 +178,659 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
 
+### 10 October: retained DL probes follow merged individuals
+
+The normal push gate for `da4465d` finds a missing type in brute-force seed 5358,
+case 63, at one worker with model reuse enabled. The pre-reuse `be5c3d7` passes
+the same seed, including the current test's reuse-disabled/enabled variants.
+This is a correctness regression in the earlier Base reuse repair; the prior
+selected-case speedups and passing seeds did not establish general correctness.
+
+Probe initialization asserted assumptions on an individual's original node even
+after that node had merged. It now uses the existing canonical lookup for individual
+assumptions and carries the merge dependencies into both polarities. The original
+probe root remains available for label provenance. A clash caused by a model's
+branch-dependent alias can therefore fall back instead of becoming a global refutation.
+Fresh and absent probe sites keep their existing path. No new memoization layer,
+state copy, scheduler or limit is introduced.
+
+The two guards fail before the fix and pass afterwards: deterministic aliases cover
+both polarities and both roots; a choice of aliases compares retained/fresh probes
+and explicit assumptions, requiring fallback and revisiting the pooled model.
+All eight probe tests and the complete failing seed pass on Office (120 taxonomy
+cases; 120 realisation cases with 306 individual results). The brute-force failure
+message now includes the reuse mode. Independent source review finds no blocker.
+The [repair record](../../benches/runs/2026-10-10-dl-alias-da4465d.toml) retains the
+failed gate, baseline reproduction, patch and performance follow-up. Earlier
+measurements remain revision-specific; the overall runtime gate remains blocked.
+
+The follow-up reuses the existing seven fixtures at one/four workers and the preserved
+pre-fix binary: ten alternating pairs per case, 280 complete invocations. All emitted
+canonical answers match the prior record. Every timing and peak-RSS range overlaps its
+counterpart. Choice-300 medians are 47.35/19.10 -> 47.70/19.00 ms; ORE 16542 is
+1372.45/1212.75 -> 1377.60/1208.45 ms. These are process aggregates; generated cases
+emit only the last of three internal repetitions' answers. With no preregistered
+non-regression threshold, this is a bounded diagnostic, not a performance acceptance
+pass or a new speedup. Hashes, all samples and limitations are in the repair record.
+
+### 10 October: cache validity and explicit DL retries
+
+QL compilation now compares the exact sorted schema input and the dictionary id of
+`owl:Thing` across snapshot identities. The old cache could return no answer after an
+ordinary data addition introduced `owl:Thing`, while fresh preparation returned `ann`.
+The differential regression reproduces that failure. Snapshot identity already bounds
+dictionary reads, so its fast hit needs no additional lookup. Hashing is removed; the
+existing scan buffer is retained as the exact key, costing 32 bytes per statement plus
+entry metadata, per reader entry (the existing maximum is eight).
+
+Five release process pairs on Office reuse the existing QL fixtures with a disposable
+probe. Refreshing an unchanged 1004-statement schema after a view change takes median
+38.230 -> 30.426 us (20.4% less); sample ranges [36.515, 41.520] and [27.854, 32.020] us
+do not overlap. These are medians of five per-process aggregate means, not per-call
+latency medians. Five pairs do not meet the protocol's ten-repetition claim requirement,
+and no microcase acceptance floor was predeclared. The 4/104-statement cases and same-view
+hits have overlapping ranges; the sub-millisecond hit aggregates earn no timing claim. This is a component diagnostic,
+not an end-to-end improvement, concurrency qualification or clearance of the runtime gate.
+The schema payload retained in the three cases is 128/3328/32128 bytes, calculated from
+the retained statement layout rather than measured RSS or total cache growth; no memory-neutral
+claim is made. Probe source, exact binary/source identities and all samples are retained
+in the [run record](../../benches/runs/2026-10-10-cache-contracts-d31010c.toml).
+
+The owner selected complete-only caching for explicit DL classification and realisation.
+Incomplete requests retry under the existing configured budget, including unsupported
+ontologies; the query lower-bound cache remains separate. Late publication from an older
+revision no longer evicts a newer complete result. Both DL policy guards fail against the
+old code and pass with the repair; the initial rejected zero-timeout fixture is retained
+in the raw history and replaced by a positive-expired timeout. Focused Office checks pass
+6 QL tests, 2 DL cache-policy tests and 4 existing classification integration tests.
+Normal commit and push checks on Office pass for `0f3155b`, including affected/dependent
+tests, additional random seeds, formatting, Clippy and lock checks. The first push's SSH
+connection expired during the gate; the passed checks are retained in
+`office-cache-contracts-gate.log` beside the run artifacts. Fresh independent source and
+measurement reviews found no actionable code defect and clarified these statistical limits.
+The obsolete hash-only key and stale documentation of missing Base reuse are removed.
+No new scheduler, default limit or general cache is introduced. Profiling of result-cache
+key construction, shared ranking, ID-table copies and serialization remains open.
+
+A first [frozen replay profile](../../benches/runs/2026-10-10-cache-replay-profile-77478d1.toml)
+reuses `77478d1`, social300k and the archived seed-7 log on Office. Both captures complete
+1000 queries without reported errors. Whole-process sampling is dominated by loading;
+enabling software CPU sampling after the existing `held:` marker reveals index decoding,
+sorting and WCOJ work. That phase still includes untimed `--routes` execution. Sampled
+leaf symbols are usable, but callchains are mostly unusable; neither capture attributes
+the measured replay regression to key construction, ranking, copying or encoding.
+CPU samples cannot establish blocked mutex time. No production change follows from this
+diagnostic. The next capture must distinguish timed queries from route work and recover
+usable user callchains; simply removing `--routes` can change cache population.
+
+### 9 October: bounded DL Base reuse and deadline repair
+
+Against clean `be5c3d7`, the final source-qualified candidate reuses the initial
+consistency search and the existing Base for realisation, applies current probe
+controls, and charges model/rollback/deterministic fallback to one allowance.
+The separate `Prepared::base` search and model-cloning `Base::labels` are removed.
+No new cache, scheduler or default limit is added. Classification and realisation
+still own separate compiled maps; this is not cross-stage caching.
+
+Office ran three independent pairs in BC/CB/BC order at 1 and 4 workers, 84
+invocations across seven fixtures. All complete, with identical canonical taxonomy
+and type hashes across sides and repetitions. Generated cases use three internal
+repetitions; ORE uses one. The existing `dl_classify` total includes normalisation
+and stage work, but not parsing. Peak RSS includes parsing. This selected comparison
+does not replace the registered suite or an independent ORE taxonomy oracle.
+
+| Case | Workers | Baseline → candidate median, ms |
+|---|---:|---:|
+| ORE 9881 | 1 / 4 | 543.8 → 398.2 / 432.0 → 288.6 |
+| ORE 16542 | 1 / 4 | 2254.3 → 1358.6 / 2100.3 → 1188.5 |
+| 300-individual choice realisation | 1 / 4 | 57.2 → 47.2 / 21.5 → 18.5 |
+| 30,000-individual Horn realisation | 1 / 4 | 43.1 → 42.7 / 44.3 → 44.2 |
+
+The ORE and larger choice gains exceed the observed sample ranges. No speed claim
+is made for sub-2 ms fixtures. The Horn control is neutral within spread; no repeatable
+memory regression is established in the final set. In particular its median peak RSS
+is 37,856 → 38,208 KiB at one worker and 38,332 → 38,084 KiB at four. A 51.4 ms
+candidate Horn observation is retained, not discarded. Three repetitions do not
+establish tail latency or neutrality on unmeasured inputs.
+
+Two intermediate candidates remain in the evidence. The first realisation reused a
+model which every negative candidate would contradict. Releasing that model avoided
+the inevitable floor attempt. The next still copied a choice-free Horn graph, raising
+the 30,000-individual peak by about 6 MiB. The final candidate moves that completed
+graph into Base directly when the existing feature analysis rules out choices; both
+corrections were measured again. An earlier ORE 9151 width-one pair hit the allowance
+on both sides and earns no speed credit. Those intermediate timings do not qualify
+the final revision.
+
+The separate 24-invocation fresh-consistency control uses the same final binaries,
+without Base retention. Answers agree on four inputs; time differences overlap the
+observed ranges. It supplies no fresh-search speedup claim. Differential tests compare
+retained probes with fresh searches and explicit ontology assumptions; classification
+and realisation retain their brute-force checks. Current-token/expiry, unknown,
+rollback, counting shortcut and incompatible configuration paths are guarded.
+
+Source/binary/input hashes, exact commands, every sample and superseded variants:
+[run record](../../benches/runs/2026-10-09-dl-reuse-be5c3d7.toml).
+These gains do not clear the separate runtime regression gate.
+
+### 9 October: complete frozen Office campaign and consolidation audit
+
+The retained `4e8bd38` → `77478d1` campaign completed at 20:20:22 UTC: **95 cases,
+570 invocations, three independent repetitions per side**. The original queue covered
+87 cases; two larger-memory cases and six restored-input cases completed separately.
+The latter used verified inputs; the former retained their declared 12 GiB/10 GiB caps.
+No sample was discarded or restarted by this analysis. This compares the runtime/plan
+integration with an earlier reuse revision, not the whole branch against `0f46563`,
+and does not qualify later repairs or the current HEAD.
+
+The current existing `fast.py compare` was applied to all retained reports with both
+the default 2 ms floor and an explicit zero floor. The zero-floor result is exploratory
+reanalysis, not a retrospectively preregistered threshold. Both retain the same 10%/spread
+and bootstrap interval tests; throughput has no millisecond floor.
+
+| Flagged latency case | Baseline → candidate, ms | Ratio |
+|---|---:|---:|
+| `kernel-intersect` | 152.4 → 182.5 | 1.20 |
+| `writes-under-readers` | 0.2664 → 0.3835 | 1.44 |
+| `open-first-query` | 0.3355 → 2.385 | 7.11 |
+| `clients-lookups` | 0.103 → 0.173 | 1.68 |
+| `clients-sweep` | 0.514 → 0.936 | 1.82 |
+| `commits-plain` | 0.0087 → 0.01555 | 1.79 |
+| `commits-readers` | 0.7684 → 0.8485 | 1.10 |
+
+These are the registered cases' latency statistics, not interchangeable single-query
+latencies. Lookup-sweep throughput separately falls at every width, to 13.4–78.1% of
+baseline across 1/2/4/8/16/32/64 clients. Eighteen cases flag higher memory, chiefly query
+phase RSS. Phase peaks are not lifetime peaks: for example `rl-lubm100` has lower overall
+peak but higher query-phase peak. No case qualifies as faster under this campaign's
+10%/spread rule; smaller changes remain in the raw comparisons, not proof of neutrality.
+
+Six expected boundaries earn no timing verdict: four unsupported context ORE cases and
+two memory-limit cases. Four more cases fail existing checks on both revisions:
+`dl-transitive-400`, `mem-load-20m-2g`, `ql-owl2bench` and `vector-knn-filtered`.
+The QL answer counts pass but q15 lacks its required rewrite route; vector recall is below
+its required threshold. These must be investigated, not removed from the denominator or
+turned green by weakening checks. Taxonomy correctness remains unqualified where a case
+has no reference; successful execution alone supplies no missing oracle.
+
+Office evidence root:
+`/home/krarilotus/nrese-prep-20261009-4e8bd38/registered-fast-77478d1/`.
+`all-completed-audit-20261009/summary.json` records source-report hashes and both comparisons;
+each case retains merged reports, checks, routes, metrics, peaks and comparator output.
+Analysis reused the existing comparator (SHA-256
+`41ffe18de3bef5e13b25d0493d9a92461e77e50366e4d099c98024323050a5fa`).
+Original manifests retain commands, builds, input identities and host controls. The audit
+created no benchmark worktree, target directory or local dataset copy.
+
+The source audit accounts for all 167 files changed through `4a21a90` against `0f46563`.
+Most large additions in plan, numeric/aggregate and DL query modules move existing code;
+the old production paths are gone. Retained algebra/plan adapters have live callers with
+different representations; reference tests and rollback/monotone state have distinct
+contracts. This follow-up removes two unused context forwarding layers, derives DL
+options once from actual workers and reuses the existing exact-test vocabulary helper.
+It adds no scheduler, solver, dependency or speculative hardware interface. Stale QL
+lifecycle claims and duplicated status/gate prose are consolidated into their owners.
+
+Machine-level conclusions stay narrow. The WCOJ intersection and shared search sources
+are identical between these frozen benchmark revisions, so their extraction cannot explain
+the newly measured intersection regression. The frozen context binary has no out-of-line
+`Charge::set` symbol, consistent with inlining, but that does not prove accounting is free.
+Next isolate dispatch, allocation locality and actual generated hot paths before changing
+kernels. Retain the physical CPU boundary; generic serialization coverage and any substantial
+coalescing wiring needs the documented design checkpoint. The separately authorised DL
+repair is recorded above. No new latency
+or throughput improvement is claimed for this consolidation batch.
+
+A subsequent native `kernel-intersect` diagnostic retains three pairs at 32 workers
+and 40 query repetitions: the skewed WCOJ median changes from 107.315 to 138.750 ms,
+with the same count (1,662) and route. Ten inspected WCOJ functions have equal sizes
+and equal instruction shapes after removing relocation addresses; this is not proof
+that relocated data or the whole binaries are identical. Whole-process hardware
+counters include loading and startup: similar retired instruction counts and less
+average parallel utilisation do not isolate a causal kernel regression. Raw assembly,
+normalised comparisons and all runs remain under Office's
+`kernel-intersect-diagnostic-20261009`. Storage layout/allocation locality and execution
+placement remain hypotheses to separate before adding kernel code.
+
+The follow-up Phuoc diagnostic fixes persisted layout: baseline loads the verified
+shared dense input once, then both frozen binaries reopen that same store. All store
+file hashes are unchanged after three BC/CB/BC pairs at 16 workers and 20 repetitions.
+The skewed-query process medians are baseline 95.655/95.984/95.319 ms and candidate
+148.266/148.122/148.235 ms; fresh-load controls reproduce the gap. Counts and WCOJ
+routes match. This rules out a different persisted dictionary/index layout as a
+necessary cause on this fixture, not allocation locality or execution placement.
+Two 99 Hz user-space profiles show broadly similar hot-symbol shares in packed-index
+access, sorted values and group-count sorting; they are perturbed attribution captures,
+not further timing evidence. Unprivileged perf was refused; a bounded sudo profiler
+ran the benchmark as its normal user without changing system settings. The old frozen
+quiet guard emitted a shell warning; independent process checks found no compilers.
+This remains a diagnostic, not a registered acceptance run.
+
+Phuoc evidence: `kernel-layout-diagnostic-20261009` under the same preparation root,
+manifest SHA-256 `2c39be1b999ce6e80bd68cc4a492d948188718f9b4e0a68aab2e1438fe94476d`;
+`profiles-user/profiles.json` SHA-256
+`793633218bf34f2d5a17519c61096d53e377822bf7b83f720f6bce62009c3a80`.
+The verified shared input was reused without transfer; the 21 MiB persisted store
+is retained for the planned worker-width/placement diagnostic. No kernel change follows
+from these profiles alone.
+
+### 9 October: native scheduling profiles and width diagnostic
+
+Four short Phuoc captures compare frozen `4e8bd38` and `77478d1` at one and
+16 clients, followed by 12 candidate-only width invocations (two counterbalanced
+passes over widths 1/4/16 and clients 1/16). These reuse the Office-built binaries,
+the verified 300,000-person social input and four lookup queries, including result
+encoding. No production code, CPU ownership contract or default changed.
+
+At one client, 79.4% of the candidate's flat sampled cycles were in named
+Crossbeam/Rayon scheduling functions. Sampling perturbed candidate throughput;
+incomplete stacks and approximate phase normalization prevent treating that share
+as an exact causal fraction of the uninstrumented regression. All four workload
+exits and saved answer checks passed; captures and their decoding caveats remain.
+
+The lighter width screen used thread-creation tracing and `/proc` counters, without
+perf sampling. The option changes **both** the native and ambient pools; the actual
+thread counts matched. Ambient workers accumulated no CPU in the observed steady
+windows, but their indirect effects are not independently isolated.
+
+| Both pool widths | One-client QPS | 16-client QPS |
+|---|---:|---:|
+| 1 | 96,755 | 238,048 |
+| 4 | 90,747 | 622,740 |
+| 16 | 59,290 | 629,870 |
+
+These are medians of two diagnostic processes, not accepted performance timings.
+At 16 clients width 4 used about 37% less CPU/query and 96% less aggregate runnable
+wait/query than width 16, with throughput within the latter's observed spread.
+Width 1 instead constrained concurrent throughput. Per-query counters use estimated
+window completions; runnable wait is not blocked/futex time. All 12 processes exited
+zero and retained the existing count, route and saved-bag checks. This neither
+recovers baseline performance nor justifies a universal smaller pool. Larger parallel
+queries and mixed work still require qualification. Earlier Office coalescing and
+ambient-only experiments below were read, not repeated or replaced by this screen.
+
+The screen ran on Phuoc at 19:03:30–19:04:57 UTC with the existing quiet guard,
+6 GiB memory cap, no swap or CPU quota, four-second client phases and unchanged
+governor/affinity. Its wrappers consumed 447 CPU-seconds in total; peak cgroup memory
+was 1,232 MiB. No compiler ran there or locally. No further diagnostic work remained
+active after preservation.
+
+Raw evidence is under
+`/home/krarilotus/nrese-prep-20261009-4e8bd38/phuoc-qualification/`:
+`native-runtime-20261009-process-memory-01/evidence.tar.gz` (8,341,903 bytes,
+SHA-256 `534ebc52485ed833466c3dd1db494ad03e59c899ed86f71659f330c7383f9386`)
+and `native-width-20261009-process-memory-01/evidence.tar.gz` (439,343 bytes,
+SHA-256 `297f8e1ea69ca20a819c2261737745d8f915427dc0f9862aee79e02932409ed2`).
+Both archives were downloaded and hash-verified. These findings motivate a bounded
+submission/encoding experiment within the retained physical-worker boundary, not
+a new scheduler or caller bypass. Runtime performance acceptance remains blocked.
+
+### 9 October: partial Phuoc milestone, runtime acceptance blocked
+
+The completed Phuoc batches compare `4e8bd38e0733055c06d77f9fdd7cd36c6d89bd7c`
+with `77478d195cb073b263b1eac8661034a09bfbbf20`. The latter's production code is
+identical to `881119d`; their diff is the initial diagnostic run record. Office-built
+binaries were transferred with hash and library checks, not rebuilt on Phuoc. The
+expanded baseline `perf_lab` SHA256 is
+`cb9df2d14ddc6b3e01df6b4bc0475521282d0ff4da95fd71cf7de8a81aa55e77`;
+candidate SHA256 is `047d9eaec886e71c170edc3874be3a33ca1df90187d8462654d85cdfe9511a1b`.
+These are different binaries from the initial `c888a20` diagnostics below.
+
+Three paired repetitions use AB/BA/AB order, the existing quiet guard and no measurement
+CPU quota. Phuoc is a Ryzen 7 7800X3D with 16 logical CPUs. The completed scope is:
+
+- **96 CLI processes:** DL-mode LUBM1 (six inner repetitions), store Horn classification
+  with 3,000 classes (five inner repetitions), commits with eight RL readers plus a
+  zero-reader diagnostic, and plain writes with 0/8/32 readers. Registry checks and
+  routes passed. CLI limits are 4 GiB for DL-mode and 6 GiB otherwise, no swap; commit
+  runs pin four CPUs and use four workers, cache disabled, no warm-up and one query run.
+- **24 native-suite processes:** LUBM1, OWL2Bench RL1 and write-scaling 1m/10m, three
+  pairs each, fixed candidate harness, 8 GiB/no swap. All four existing comparisons
+  exit zero with no non-ok records. This establishes only the checks those drivers do.
+- **18 client/cache processes:** social 300,000 and the existing 1,000-entry cache log
+  (seed 7), three pairs per case. Client widths 1/2/4/8/16/32/64 each run for four
+  seconds with default hardware workers; cache replay uses no warm-up, one run and
+  zero or 256 MiB cache. Limits are 6 GiB/no swap. Untimed result exports were added
+  for answer checks; cache-on counters include those checks.
+
+The default-worker lookup sweep has a severe, repeatable throughput regression:
+
+| Clients | Baseline queries/s | Candidate queries/s | Candidate / baseline |
+|---|---:|---:|---:|
+| 1 | 298,866.2 | 60,192.5 | 20.1% |
+| 2 | 563,940.0 | 110,107.2 | 19.5% |
+| 4 | 1,056,175.0 | 211,273.0 | 20.0% |
+| 8 | 1,813,656.5 | 420,982.5 | 23.2% |
+| 16 | 1,871,722.2 | 626,753.5 | 33.5% |
+| 32 | 1,877,310.2 | 616,987.5 | 32.9% |
+| 64 | 1,885,446.5 | 602,287.8 | 31.9% |
+
+Every pair is lower at every width. Medians are over the three process repetitions;
+these ratios are percentages **of** baseline, not percentage losses. Cache-on replay
+is 296.023 → 375.173 ms (+26.7%), also worse in all pairs; cache-off is
+2,572.162 → 2,694.876 ms (+4.8%). The native-suite comparison retains its existing
+10%/spread and 2 ms minimum screen: tiny-query deltas can fall below that floor and be
+labelled within noise. Its zero flagged queries do not negate the throughput regression
+or establish general neutrality. Runtime acceptance remains **BLOCKED**; no aggregate
+or passing correctness check overrides these cases.
+
+Correctness evidence has specific limits. Store classification checks consistency,
+1,161,634 subsumptions and the context-core route, **not full taxonomy content**.
+RL exports agree after recomputation; the maintained closure check compares sizes only,
+so this is **not a full maintained-closure oracle**. Plain readers return empty inference
+results and do not represent RL reader work. Retained query bags agree, but concurrent
+reader bags are not retained; unordered LIMIT subsets have no general stability guarantee.
+Native write-scaling checks HTTP success, not the numeric final COUNT. The analysis's
+empty export/bag collections must not be read as extra semantic coverage. No new speedup
+is accepted from the smaller CLI timing differences or noisy phase-memory figures.
+
+The remote push hook at clean `881119d` failed after fmt/clippy/main tests passed:
+DL bounds fuzz seeds 18273/18274/18275 failed; locks separately failed because offline
+metadata lacked `regex-syntax 0.8.11` and `libfuzzer-sys`. Seed 18273 was reproduced
+on candidate and baseline with identical 300-case tallies and the case-217 U1 model
+assertion at `crates/nrese-dl/tests/bounds/fuzz.rs:350`. This establishes a pre-existing
+failure relative to this baseline, not a correct result or permission to waive the gate.
+The repaired `a6331c7` passes all three focused seeds and the normal Office commit/push
+hooks: format, lint, regular tests, new seeds 93060–93062, locks and 22 suite contracts.
+The branch push completed at 16:46:12 UTC. This supersedes the failed gate, not the
+performance blockers. Missing external corpora caused conformance wrappers to return
+early during that gate. The later Office corpus run below supplies separate qualification.
+
+At 17:29:05 UTC, Office completed 22 selected corpus-backed checks against Rust content
+equivalent to `a6331c7`: zero unexpected failures and no missing-input early returns.
+Seven pinned corpus trees (9,548 files, 63,182,223 bytes) were rehashed first. Existing
+gate binaries were reused; six missing RDF I/O/SPARQL syntax targets were built together
+with the existing target cache, locked/offline dependencies and the guarded build. No
+source or lockfile changed. Tests ran during migration I/O, so their elapsed times are
+not performance measurements.
+
+DL reported 410 passing test-type tasks plus one adjudicated dispute; bounds exercised
+193 consistency, 88 inconsistency and 84 entailment tasks, with unresolved imports,
+unread inputs and incomplete bounds reported separately. SPARQL evaluation passed
+505 1.1 and 269 1.2 cases; SHACL passed 98 Core and 22 SPARQL cases. RDF syntax passed
+1,329 checks, SPARQL syntax 1,289, RDFC 86 and JSON-LD 884 (22 excluded). N3 parsing
+passed 1,084 with one expected failure. Known QL expected failures/import skips, RL
+import/profile skips, out-of-scope N3 reasoning and 18 GeoSPARQL disputes remain.
+Counts from different runners overlap and are not a total of distinct ontologies.
+Exact commands, binary hashes, corpus preflight and per-run tallies are retained in
+`implementation-benchmark-hosts/tmp/office-conformance/` and Office's
+`nrese-prep-20261009-4e8bd38/conformance-a633-corpus/`.
+
+Source evidence is retained in
+`implementation-process-memory/tmp/phuoc-qualification/`: `cli-analysis.json`,
+`concurrency-analysis.json`, `summary.json`, `coverage-matrix.csv`, `compare-*.txt`,
+the recorded launch commands and binary-transfer manifests. The superseded `paired-cli`
+batch is excluded; completed CLI evidence uses `paired-cli-final`. Gate evidence is in
+`implementation-benchmark-hosts/tmp/remote-gate-failure-report.txt` and its named logs.
+The completed handoff now contains 222 records (96 CLI, 18 client/cache, 84 supplemental,
+24 native-suite), all exit zero; no final timeout/OOM/error was excluded. The stopped
+superseded batch remains excluded. Only six of 95 fast cases and four selections from
+24 broader workloads were exercised; no competitor ran. Office's frozen `77478d1`
+campaign reached 23 complete cases / 138 invocations and paused at a clean boundary
+at 17:02:27 UTC for the benchmark asset migration. Its original queues, frozen binaries
+and samples are retained. The full campaign remains unfinished.
+These selected native cases neither complete that campaign nor qualify later repairs.
+
+The disposable caller-budget experiment is rejected in its present form. Its FIFO
+admission and exclusive parallel-pool leases passed nine deterministic guards and the
+29 Phuoc invocations' content/admission checks, but at 16 workers and eight clients the
+parallel-kernel elapsed ratios were 2.186/2.358/1.974 and mixed serial/parallel ratios
+3.010/2.753/2.557 versus the installed-pool control. This is a short mechanism screen,
+not native-query recovery evidence: pairs were within one process, 294 of 696 rows
+were below 2 ms, and candidate-only instrumentation was asymmetric. No production
+code from that prototype was kept. Source/binary hashes, all pairs and limitations
+are in `implementation-process-memory/tmp/caller-experiment-phuoc/`; a different
+ownership policy requires its own design checkpoint and real-query measurements.
+
+Correction: the prior Horn "process peak" label is withdrawn. GNU-time medians over
+15 runs/side, 337.46 -> 2,021.85 MiB, and internal median-of-pair-medians 488 -> 2,217 MiB
+are reset-affected late-phase high-water readings, not lifetime classification peaks.
+`Phase::start` writes `clear_refs=5` again after classification, even without queries
+(`perf_lab/main.rs:155,1255`). These readings do not demonstrate a full-classification
+peak regression or measure task reservations. The completed diagnostic reaggregates original
+pre-reset peaks: pair-median aggregation 3,268 -> 3,236 MiB, with closely overlapping ranges.
+One default external trace pair samples 3,184.07 -> 3,179.45 MiB, not a significance claim.
+Three instrumented THP-disabled pairs have a smaller sampled peak difference that changes
+sign in the third pair, while late-phase residency remains substantially different. These
+diagnostics establish neither a default peak-regression ratio nor the cause of retention;
+instrumented times are not speed evidence. See `horn-memory-diagnostic/report.txt` alongside
+the qualification artifacts. Its correction leaves the original archive unchanged.
+
+Supplemental exact-gap N512 improves from 352.350 -> 283.676 ms at one matched CPU
+(19.5%) and 93.076 -> 80.664 ms at four (13.3%): sums of prove/refute query medians,
+three outer pairs. All N=8/64/65/512 and widths 1/4 match explicit proof/refutation bags,
+complete/sound with zero unresolved and the exact-ground-entailment route. These are
+supplemental tests, not registered fast cases; the wins do not offset lookup throughput
+losses of 66.5-80.5% or cache-on +26.7%; Horn peak interpretation is corrected above.
+
+The source review also confirms empty check/route tables and no configured taxonomy
+reference for `horn-classify` and `ctx-ore-{9724,2738,9835,7914}`. Executing these five
+entries or recording hashes does not establish correct taxonomy content; they are not
+additional Phuoc coverage. Counts/engine assertions for store Horn remain weaker than
+full taxonomy equality. No queued cancellation was injected in the Phuoc measurements.
+
+[Completed partial run record](../../benches/runs/2026-10-09-phuoc-partial-77478d1.toml):
+`implementation-process-memory/tmp/phuoc-qualification/qualification-evidence.tar.gz`,
+14,627,035 bytes, SHA256
+`86ee18f44ef53b9e92c5e23df15792f95113a546200ad38d063b96b982024c62`.
+Final verification matched 1,062 recorded input/binary hashes. The archive's manifest
+identifies included files and hashed remote-only bulk inputs/exports; final-report,
+coverage additions and the final OWL2Bench hash are separate delivered addenda. Root
+must confirm the full gate and repair results and investigate performance before acceptance.
+
+### 9 October: shared-runtime candidate fails the initial throughput check
+
+`4e8bd38` → `c888a20` isolates the runtime/worker foundation and plan-inspection
+refactoring from the earlier reuse work. The comparison excludes the subsequent typed
+DL bounds, compiled probes, process-policy and deadline fixes. It is **not accepted as
+performance-neutral**: the Office-PC client regressions below are repeatable. The cause
+is still under investigation; two pool entries for small direct SELECT results are a
+source-level hypothesis, not yet a measured attribution.
+
+Both hosts ran three fresh-process pairs per case, in AB/BA/AB order: LUBM 1 plus
+univ-bench under OWL 2 RL, cache disabled, one warm-up and five query samples; then
+1/2/4/8 clients for three seconds each. `--threads` was omitted on both revisions:
+the candidate's example had not yet wired that option to the new runtime. Defaults
+were 32 available threads on Office-PC (Ryzen 9 5950X) and 16 on Phuoc-Yu (7800X3D).
+Horn 20/1500 classification ran at one/four threads through both standalone examples.
+All answer bags, serialized byte counts and canonical taxonomies matched; no failed or
+unknown result was discarded.
+
+| Host, clients | Baseline queries/s | Candidate queries/s | Change |
+|---|---:|---:|---:|
+| Office, 1 | 2,652.7 | 2,312.0 | −12.8% |
+| Office, 2 | 4,639.0 | 4,167.0 | −10.2% |
+| Office, 4 | 7,640.0 | 7,137.0 | −6.6% |
+| Office, 8 | 11,288.0 | 10,506.0 | −6.9% |
+| Phuoc-Yu, 1/2/4/8 | 3,569 / 6,456.3 / 9,968.7 / 13,137 | 3,311.7 / 5,935.7 / 9,420.3 / 12,605 | −7.2% / −8.1% / −5.5% / −4.1% |
+
+Office's one/two-client losses exceed 10%, lie beyond the observed spread and occur
+in every pair. Its query sum is 4.662 → 5.083 ms; tiny queries add about 20–30 µs.
+No individual query or standalone DL/context latency crosses the joint 10%/2 ms
+screen; this does not erase the throughput loss. Opening an empty store adds about
+2 ms on Office and 1 ms on Phuoc-Yu. Office client-phase RSS rises 288 → 367 MiB at
+two clients and 317 → 421 MiB at four. These are phase peaks: `perf_lab` resets Linux
+RSS high-water marks, so `/usr/bin/time` is not a lifetime-memory measure here.
+Whole-invocation cgroup peaks did not show a repeatable threshold-qualified increase.
+
+Builds used Rust 1.98.1/LLVM 22.1.8 on Office, frozen release dependencies, fat LTO,
+one codegen unit and `-C target-cpu=native`; the exact same binaries ran on Phuoc-Yu
+after CPU-feature, glibc-symbol and hash checks. `perf_lab` uses mimalloc, classifiers
+the system allocator, unchanged between revisions. The repaired quiet guard aborts
+when compilers fail to drain. Measurements used an 8 GiB cgroup with no swap, no CPU
+quota, no build-time nice override, and the existing powersave/boost/THP settings.
+No core pinning or cold-page-cache claim; three pairs are a check, not publication
+qualification. LUBM SHA256 starts `299677a2e26b9317`, schema `2c42947cd544da0b`.
+Full hashes, commands, per-pair counters and raw archive hashes are retained in
+`implementation-benchmark-hosts/tmp/benchmark-initial-c888a20-report.txt` and both
+hosts' `~/nrese-prep-20261009-4e8bd38` work area. Final integration requires a fresh
+comparison, including store-owned DL work and mixed writes.
+
+Two subsequent Office-only diagnostics preserve the physical owner and caller-owned
+I/O, but remain disposable patches. Small-result encoding inside the evaluation stage
+halves the extra pool submissions: q01 falls from 29–31 to 22–26 µs (baseline
+12–14 µs), while mixed throughput remains 10.8% below baseline at one client and
+7.8% below at two. A second diagnostic moves context construction, evaluation, all
+encoding and context destruction into one outer pool entry, returning buffered bytes.
+Its three pairs still lose 11.6% at both client counts: 2,684 → 2,373 and
+4,690 → 4,145 queries/s. Every pair is slower; results agree. These are separate
+campaigns, not a paired comparison between the two diagnostics. Whole-result buffering
+adds copying and memory and is not an acceptable production replacement for streaming.
+
+Separate q01 counter runs show about 6.27 context switches per client query in `c888a20`
+and 3.14 after full coalescing, versus 0.027 on the baseline. Those ratios include fixed
+load/preparation phases. Flat profiles show substantial Rayon/Crossbeam scheduling work;
+sample shares vary between captures and do not identify the entire mixed-workload loss.
+The candidate allocates fewer objects than baseline, so object counts alone do not
+explain the slowdown. Allocator locality remains unproven. Neither patch is promoted;
+submission granularity and execution policy need a design checkpoint before larger
+wiring. Exact patches, executable hashes, paired results, counters and commands remain
+in `implementation-benchmark-hosts/tmp/runtime-regression-investigation.txt`; both raw
+archives and the small diagnostic binary are retained separately from the reused target.
+
+### 9 October: QL preparation and configurable context capacity
+
+**QL preparation, `0f9d98c` against `91900f8`.** One SPARQL-owned preparation now supplies
+the report and execution on the same view; result keys retain the original query and
+options. The old store report helper/options builder are removed. Deterministic guards
+count one QL stage even with warm probe caches, check canonical/strict views at a probe
+limit, and cover all query forms/serializers, cancellation and cache hits without evaluation.
+
+The existing native lab used the preceding entry's machine, build and workload settings,
+six alternating process pairs, one warmup and 50 repeats per query. All 81 query answer bags,
+requested orderings, statuses and semantic held counts match in every pair. Median sums
+of query p50 (ms): LUBM-10 **14.662 -> 15.138**, NPD **68.897 -> 68.668**, OWL2Bench QL-1
+**2.914 -> 2.848**, LUBM-1 DL mode **4.050 -> 3.965**. No query crosses the diagnostic
+10%-and-2-ms threshold. LUBM's +3.2% aggregate and q09's +0.405 ms median remain visible
+within substantial run variation; this is not proof of universal performance neutrality.
+Process peaks also vary; no RSS improvement is claimed. The deterministic saving is the
+removed duplicate preparation, not a broad timing speedup. Raw evidence: local
+`tmp/ql-prepare-once`; saved candidate SHA-256
+`25640a6fe80c479c5314b56c04df8947f9e96f3b8989791edc3dd7a2acd4d86a`.
+
+**Context capacity, isolated source `6a1e843`, integrated as `74d83e8`.** This closes a
+configuration/ownership gap and has a bookkeeping cost. It reuses `nrese_exec::Budget`,
+with reservations owned by saturation state and scratch buffers, incremental nested
+capacity totals and queue payload transfer. `SetTrie::bytes` no longer walks its nodes.
+Redundant context-core, assertion-slot and merge-ID copies and an equality union clone
+are removed; classification options have one store owner. Hyper's existing join is moved
+to its own module. No second reasoning engine or allocation-ceiling framework is added.
+The configured budget can be disabled; exhaustion is incomplete, never a false decision.
+See [the exact scope](owl2-dl.md#13-configuration), including estimates and exclusions.
+
+Release/fat-LTO/native builds in separate targets, Rust 1.98.1, system allocator for these
+examples. The existing `context_classify` (university schema, proofs on, split strategy)
+and `dl_classify` (ORE 10212 and 9881, default driver choices) were compared against clean
+`0f46563`: three fresh processes per side/worker count, five classifications per process,
+base/off/on then reversed then base/off/on; each invocation had a quiet slot. File parsing
+precedes the inner repeats. All 54 completed taxonomies match across revisions, accounting
+modes and worker counts. These are diagnostic timings, not publication qualification.
+
+| Case | Workers | Baseline total (ms) | New, accounting off | New, 4 GiB budget |
+|---|---:|---:|---:|---:|
+| University schema | 1 | 0.7 | 0.7 | 0.7 |
+| University schema | 4 | 0.7 | 1.0 | 0.8 |
+| ORE 10212 | 1 | 23.9 | 25.1 | 24.6 |
+| ORE 10212 | 4 | 22.9 | 23.1 | 24.6 |
+| ORE 9881 | 1 | 849.2 | 860.0 | 870.5 |
+| ORE 9881 | 4 | 570.9 | 559.9 | 577.7 |
+
+On ORE 10212 the lower-bound medians with accounting off/on are 5.6/6.1 ms (one worker)
+and 4.0/4.4 ms (four). The optional feature is not free. The schema's accounted peak is
+about 425 KB; this is reserved capacity, not physical memory. Do not infer an RSS saving
+or a hard ceiling from it. ORE 1066's five-repeat baseline was interrupted after roughly
+two minutes and is unqualified; that grouped runtime does not itself prove a timeout bug.
+An earlier run explicitly lost its quiet slot and was excluded. OWL2Bench EL and LUBM's
+full assertions are not direct context benchmarks: the engine declines unsupported
+assertions in those inputs. No unsupported case is counted as successful coverage.
+
+Raw commands, taxonomies, hashes and logs remain in the memory worktree's
+`tmp/memory-check-final` and `tmp/candidate-6a1e843/PROVENANCE.json`. Candidate SHA-256:
+context example `3eb7160f422afa22f4dd6a2ad6e6a09a33b2799be3730668e58c08eab39b4066`,
+DL driver `566cf60affb2ffc755044c59a622b3339e826905897fde81255f266438373a11`.
+The combined `74d83e8` integration gate passed: 1,287 workspace tests, doc tests,
+fmt/clippy, 79 harness tests, 11 suite contracts, locks and dependency checks. Console
+dependencies and external conformance corpora were unavailable; these are not claimed.
+The release store example then ran three alternating comparison pairs against `0f9d98c`
+on LUBM 1 in DL mode, 50 samples per query, one warm-up, 16 workers and cache disabled,
+in quiet slots. All 14 queries preserved answers and status in every pair. Median sum
+of query p50s was 3.972 versus 4.165 ms; no query crossed the diagnostic 10% and 2 ms
+threshold. This small increase is visible, not proof of equivalence. Semantic held counts
+matched; dictionary index capacity varied by 560–1,120 bytes. Peak process readings are
+not an established memory saving. Raw results: `tmp/combined-dl-memory/` in the integration
+worktree. This store smoke comparison does not replace the direct context accounting cases.
+
+### 9 October: bounded reuse and contract repairs on the isolated branch
+
+Comparison base `0f46563` includes the pending DL number-module merge. Candidate code
+is `91900f8` on `plan/engine-v2-performance-architecture`. The original refactor checkout
+was not changed. This batch moves projection buffers, shares forward-search interval
+discovery, centralises SPARQL numeric arithmetic, removes the raw spill copy/pool, and
+repairs QL view identity, nested cancellation and atomic split/revival publication.
+The transaction repair still has a full-dataset fallback; it is a correctness repair,
+not a claim of delta-sized work or faster updates.
+
+**A regression found during measurement.** Retaining projection sort metadata exposed
+`dedup_preserving_order` calling the canonical column sorter even when another complete
+column order already made equal rows adjacent. This changed order and copied columns.
+The kernel now filters adjacent duplicates without sorting/gathering. Its guard fails
+with the old call and checks order, original buffers and incomplete/repeated sort keys.
+Before the repair, OWL2Bench QL q01/q20 repeatedly increased by roughly 0.1/0.04 ms,
+including with rewriting disabled. The final comparison no longer shows that increase.
+
+**Native diagnostic comparison, not publication qualification.** AMD Ryzen 7 7800X3D,
+64 GB RAM, Windows 11; Rust 1.98.1, release fat LTO, `target-cpu=native`, mimalloc.
+Each worktree built into its own target directory after a shared target had reused an
+incompatible local artifact. Baseline built from a clean tree; candidate code matches
+`91900f8`, with only documentation edits during its build. Saved executable SHA-256:
+baseline `daa94ffe9f0f24dc72543a7aadab4487e7282b0ff06ff760d192a6825e7ca3dd`,
+candidate `ae2d2d58ee26d842d73226451c67152f7a7f1c4ff2a9bd78d8a9ab34e04b9c8d`.
+
+Existing `perf_lab` only: 16 workers, cache disabled, fast index encoding/plain vocabulary,
+QL rewriting auto, fresh process/store per repetition, one warmup and 50 measured repeats
+per query, with first executions recorded separately. AB/BA/AB interleaving, three
+repetitions; DL and compact-equality updates extended to six to investigate variation.
+Every invocation used `quiet-slot.sh` after builds finished. Unlike the full protocol,
+the native lab repeats queries in name order rather than shuffled whole-mix rounds.
+Inputs remain in the shared dataset directory. Raw reports, answer files, commands and
+comparison details are retained locally under `tmp/native-final`; the verified baseline
+manifest and dataset/query fingerprints are under `tmp/baseline-0f46563`.
+
+| Covered case | Queries | Median sum of query p50, base → candidate (ms) | Median load, base → candidate (ms) |
+|---|---:|---:|---:|
+| LUBM-10, OWL 2 RL | 14 | 13.843 → 13.822 | 164 → 158 |
+| NPD, OWL 2 QL | 31 | 64.971 → 65.555 | 265 → 263 |
+| OWL2Bench QL-1 | 22 | 2.956 → 2.814 | 14 → 14 |
+| Forced 1 MiB spill, LUBM-1 without reasoning | 14 | 0.677 → 0.653 | 177 → 178 |
+
+All compared answer bags and requested ORDER BY sequences match; NPD's recorded counts
+and all 14 expected LUBM-1 DL counts match. Forced-spill stores reopen with matching
+answers. The small equality fixture (1,000 groups of 10, 20 merges, four concurrent
+readers) gives the expected 104,000 values and 20 group values after updates; maintained
+and recomputed closure counts agree in every repetition. Statement counts, dictionary
+terms and text bytes match. Small dictionary-index byte differences reflect allocation
+size, not additional terms.
+
+No query has a median increase exceeding both 10% and 2 ms in this coverage. That is a
+diagnostic threshold, not proof of neutrality for every smaller query or every workload.
+DL process peaks varied 311–360 MiB on the base and 282–352 MiB on the candidate. The
+six compact-update runs had median p50 about 42.8 → 43.5 ms; median p99 about 46.7 →
+51.2 ms, with candidate outliers up to 88.4 ms. These noisy process-peak and concurrent
+tail measurements do not qualify a memory or tail-latency improvement. Deterministic
+buffer/probe/allocation guards are the evidence for the retained kernel savings.
+The full fast-suite matrix, all profiles/core counts, external conformance corpora and
+Linux/distributed/hardware qualification remain open.
+
+Validation: the initial milestone gate passed 1,274 workspace tests, 79 benchmark-harness
+tests, 11 suite-contract tests, formatting, clippy, dependent compilation, doc tests,
+lock checks and dependency policy. Console dependencies were absent, so its checks were
+skipped; corpus-dependent W3C tests were not a full external-corpus run. Two nextest
+process-cleanup warnings did not recur alone. After the DISTINCT fix, 1,274 of 1,275
+tests passed in a run concurrent with release compilation; the existing cancellation
+latency test took 2.99 s against its unchanged 2 s limit. It passed three isolated reruns.
+The final workspace replay, with four test workers and no concurrent compilation,
+passed all 1,275 tests (five existing opt-in tests skipped), without cleanup warnings.
+
 **The phase's targets,** as set on 5 October (start values; progress is in the log below):
 
 | # | Target | At the start | Goal |
@@ -243,8 +899,10 @@ medians), and kept or rejected.
 | 6 Oct | **`rl-hierarchy`: deep hierarchies are `cax-sco` re-firing on the types it derived itself.** The case's data (a 5,461-class tree and a 1,000-class spine, 1 M instances, every 1,000th at the spine's bottom), counted with the probe: 133671c 537.5 M bindings for 8.54 M new facts, all `cax-sco`; R1 removes 1.5 % (529.5 M, its tautologies); R2 (rejected) wouldn't apply (`cax-sco` binds only the head's variable). 514 M of them are round 3: every type a spine instance inherited fires its own ancestors again, quadratic in the spine (about 8 M bindings would do). The schema compiler isn't the cost: grounding 0.7 s for 544 k ground rules (one per class and ancestor). The investigation's negative result (14 k of 1.83 M on LUBM 10) holds for shallow hierarchies only. A prototype (not kept: global sets) that skips `cax-sco` variants on delta types `cax-sco` derived the round before (exact: the ancestors are closed when instances are grounded, and new instances run in full over all facts): 529.5 → 14.0 M bindings, joins 19.8 → 3.5 s, the closure 21.6 → 5.6 s, the same closures on the case, LUBM 1 (naive), LUBM 10 and OWL2Bench RL-1; LUBM 10 `cax-sco` only −4 % | Main PC, release probe, one run each (two for the case). Decision open: the virtual hierarchy (merge checklist §2 item 1) removes `cax-sco`'s work outright; within materialisation the skip needs per-fact provenance (one bit per new type, or a set of the previous round's `cax-sco` facts: 16 B each, about 1 GB transient at LUBM 1000 unless limited to classes with many ancestors) | measured |
 | 6 Oct | **Rules R13, closed rule families don't read what they produced** (the `rl-hierarchy` finding; the investigation's idempotent propagators). A rule of the shape `(?a S ?b), A[?a] -> A[?b]` with `S` transitive in the program (`cax-sco` over `rdfs:subClassOf`, `prp-spo1` over `rdfs:subPropertyOf`) derives, from `A[a]`, `A[c]` for every `c` above `a` by the instance for `a S c`; so a fact it derived needs nothing more from it (an instance grounded later is evaluated over all facts). Each relation's delta is now split by producer: what a closed family derived goes to a recent run and delta of their own (the family that names the relation, `cax-sco` for `rdf:type`, claims it), everything else to the other; the family's instances read the delta without its part (`Seg::DeltaNotBy`), every other rule and every full evaluation both. Folds merge both recent runs into the base, so no fact is held twice and no byte is added. A first version lost the object order of a fold whose closed run was empty (`Run::merge` now passes an empty side through) | Counted with the probe against bcf1f45, the same closures (fingerprints; naive on LUBM 1, the new test on deep class and property hierarchies, the random ontologies) and the same working-set bytes: the fast suite's spine case 529,473,000 → 13,988,000 bindings (round 3: 514 M → 0), closure 39.5 → 2.8 s (one run each, the machine under load; timed in the quiet slot below); LUBM 10 4,847,078 → 4,799,318, LUBM 100 51,048,919 → 50,542,683 (store bytes 544,509,184 both), OWL2Bench RL-1 7,156,712 → 7,140,193 | kept |
 | 6 Oct | **Rules R13, the closed part's layout** (R13's confirmation timings). Timed in the quiet slot against bcf1f45, R13 made LUBM 1000 22 % slower (31.4 → 38.4 s; LUBM 100 3.02 → 3.18, RL-1 0.47 → 0.49, the spine 21.95 → 2.60 s), its bindings and probes fewer. The closed part was kept beside the recent run for good: each fold passed over the base twice (with the recent run, then with the part), and each membership check read a fourth run. Counted with a new counter (`merged_pairs`), LUBM 100's merges wrote 12.48 M pairs before R13 and 26.54 M with it. Now the part is the last round's only: the next round merges it into the recent run with its own delta in one pass (a merge reads another merge as it goes, `Merged`, so no union of the two is copied), and a fold takes it into the base with the recent run; `news` drops the part's pairs from the open part in one pass over both, not a binary search each. Merges write 19.44 M (the rest: the fold into the empty base in round 2 copies what bcf1f45 hands over as it is). A first version kept the part in the recent run as well, so lookups read three runs; after a fold the recent run was then a copy of the delta for a round (`rounds_hold_no_second_copy_beside_the_working_set`: 6.92 bytes per fact, at most 6). The joins stayed slower (LUBM 1000 9.0 → 12.3–12.9 s) with fewer probes. A profile (samply, the symbols through `llvm-symbolizer` from the PDB, inlined frames included) put the difference in membership checks of the base, recent and input runs, and a count found why: 9.1 M of LUBM 100's 34 M checks end in the closed part, which was read last, each after missing the three large runs. Read first, the joins' samples went 16,853 → 12,646 (bcf1f45 13,634) | Quiet slot, interleaved, medians [range], bcf1f45 → now, closures identical: LUBM 1000 34.2 [31.1–34.7] → 35.1 [31.8–36.8] s (3 pairs; compilers ran during part of it), joins 9.02 → 9.86 s, merge 2.07 → 2.29 s, peak 8.86 → 8.87 GB; LUBM 100 2.86 [2.59–3.01] → 2.87 [2.73–3.20] s (6 pairs), joins 0.63 → 0.72 s, peak 1.42 GB both; RL-1 0.48 → 0.49 s; the spine 21.5 → 2.46 s, peak 1.30 → 1.58 GB | kept; open: LUBM's joins 5–15 % over bcf1f45 (a miss reads four runs, not three) and its merges 10–25 % (the copy above); the spine's peak +0.28 GB, not yet explained |
+| 7 Oct | **Rules R13, the closed part marked in the one delta run** (the residual of the row above: on LUBM, joins 5–15 % and merges 10–25 % over bcf1f45, the total level only by R13's savings; and the spine's peak +0.28 GB). Counted with scratch counters on LUBM 100 (bcf1f45 → the closed part as a run of its own): membership checks 34.47 → 33.97 M, the runs they searched 50.18 → 55.36 M; point lookups in the old and all segments 12.92 → 18.52 M (+43 %, the fourth run read by every one); merges 12.48 → 19.44 M pairs, all in folds (the recent run is the delta, shared, every round: 16 folds, 12 into an empty base, which bcf1f45 hands over as they are and which then merged the recent run with the closed part). Both causes are the part being a run. Now the delta is one run as before R13, and the pairs a closed family produced carry a mark (a bit per pair, per chunk of each order: `Marks`); the family's instances skip marked pairs (`Seg::DeltaNotBy`), every other read, fold and merge is bcf1f45's code. The marks are made in the sort that makes the delta (`sort_marked`: each chunk's marked and unmarked pieces sorted apart and merged in the cache; the object order sorted from the subject order's chunks with their marks). Counted again: searches 49.30 M, point lookups 12,916,828 and merged pairs 12,479,358, both exactly bcf1f45's; bindings 51.05 → 50.54 M. Two costs no count showed, found in profiles (samply, symbols through `llvm-symbolizer`) against the same build with the partition off, whose times were bcf1f45's: the membership checks took 37 % more samples for the same searches, in the binary search within a chunk (a first version merged the marked part on its own into chunks of exactly 2^20 pairs; the sort's chunks of even sizes took the samples back to the partition off's, 16,668 → 12,158); and the merge of the marked part ran on one thread per relation (now in the parallel sort). Rejected: a chunk size that is not a power of two for every run (1,000,000 pairs): no gain, LUBM 1000 joins 7.20 → 8.83 s, merge 1.74 → 1.96 s, so the base's chunks of 2^20 cost nothing measurable and the cache-set explanation of the even chunks is not confirmed. The spine's peak is the allocator's, not the reasoner's: the requested heap is lower since R13 (peak 974.8 → 930.2 MiB, live 750.9 → 751.7 MiB; `--cfg alloc_profile`), and with mimalloc purging at once (`MIMALLOC_PURGE_DELAY=0`) the committed peak is 1,077/1,081 → 1,032/1,032 MiB; with its default delay, memory freed is held for a while, and since R13 round 2 frees as much in 2.5 s as bcf1f45 in 22 s (1,383/1,482 → 1,447/1,716 MiB) | Quiet slot, interleaved, medians [range], bcf1f45 → now, closures identical: LUBM 1000 32.4 [29.0–40.3] → 31.4 [28.6–33.5] s (4 pairs), joins 8.18 → 7.67 s, merge 1.76 → 1.84 s [1.68–2.08 against 1.62–1.89], peak 9.07 → 9.11 GB; LUBM 100 (6 pairs) joins 541 → 517 ms, merge 148 → 147 ms, total even pair by pair (3 of 6 each); RL-1 (10 pairs) 490 → 497 ms, joins 195 → 198 ms [184–263 against 188–269]; the spine 19.3 → 2.50 s. A second three-way run (6 and 3 pairs, with the partition off): LUBM 1000 joins 8.30 (off) / 7.39 (bcf1f45) / 7.16 s (now), merge 1.99 / 1.65 / 1.81 s | kept; the guard `a_closed_part_reads_as_the_delta_and_costs_nothing` (merges write exactly the pairs of the same rounds with every pair open; reads equal, the family's without its marks) |
 | 6 Oct | **Interning without the global lock, built** (perf/interning; the row "measured, not built" above). New terms go into 256 hash shards, each under its own lock, with a provisional id (shard, entry) and the position of their first occurrence (chunk, batch, key: file order at any chunking). `finish` numbers each shard's new terms by first position (in parallel), merges the shards into dense ids, and renumbers the batches' quads, and a spilling load's raw chunks before they are sorted. The text stays in the shards' arenas, which the dictionary adopts as a segment; no copy (the owner's condition). Two costs were found by measuring. The merge ran on one thread: 2 s of LUBM 1000's load (samply, the other threads idle), now cut into ranges at sampled splitters and merged in parallel. And LUBM 1000's committed peak rose 0.9 GB at the copy of the batches into one array: memory the interning threads had freed (the shards' arrays outgrown by doubling) stayed with them (an immediate purge, `MIMALLOC_PURGE_DELAY=0`, didn't change it); releasing every thread's memory before the copy brings it back | Main PC, release, 16 threads, interleaved medians of 3 against b91d839 (load and committed peak): DBpedia core 16.96 → 12.29 s, 8,752 → 8,430 MiB; LUBM 1000 23.11 → 21.11 s, peak 12.8–13.0 GB against base's 12.25–13.7 GB (9 runs, bimodal: 12.25–12.6 or 13.7), before the release 13.1–13.3 GB. Heap profile (MiB requested, `--cfg alloc_profile`): DBpedia peak 7,745 → 7,883, live after the load 5,220 → 4,233; LUBM 1000 peak 12,920 → 12,185, live after 6,287 → 4,660 (the shards shed their growth slack when numbered). Ids: LUBM 100 q2's sampled cyclic estimate at 1, 4, 16 threads 313, 328, 453 before, 313 at each after (264 rows) | kept |
 | 6 Oct | **Cycles counted, not enumerated** (q-cycles: the compete run of 6 Oct had QLever ahead, 4.5 against 6.9 s). Per query, through the server: 4-cycles NRESE 5.6 s, QLever 4.4 s on its first run (its second, 44 ms, came from its cache although the run had the cache off); triangles NRESE 0.86 s, QLever 2.2 s. The 4-cycle `a→b→c→d→a` over 2.4 M `follows` (out-degree 8) bound a, b, c and intersected `c→?d` with `?d→a` for each of the 19.2 M 2-paths: 21.9 M checks, 106.8 M seeks, the list `?d→a` read again for each though it depends on `a` alone. A count needs no solutions: the join now binds the order's prefix until the other variables form a forest (patterns over one or two of them, no cycle) and counts the forest under each binding from the leaves up, per value the product of what the children send (variable elimination; Yannakakis' counting over the residual tree). 4-cycles bind `a` and count `Σ_c #{b: a→b→c} · #{d: c→d→a}`. Rooted at the first variable in the order (`b`), `c` received 64 values per `a` and read the patterns into each: 21.6 M seeks; rooted at the tree's center (`c`), each side reads 8: 5.7 M | Main PC, release, quiet slot, `perf_lab` (5 runs after a warm-up, medians of 3 interleaved series) against 69925ba: 4-cycles 4,116 → 442 ms, triangles 633 → 302 ms; answers 1,203,762 and 1,800,330 (the case's checks) | kept |
 | 7 Oct | **DL, complementary definitions as one class and its negation** (`nrese-owl` `complements.rs`, `Options::complements`; on in `tableau::consistency` where no model is kept). The OilEd DL98 tests in OWL Lite (W3C DL-662 k_d4, 663 k_dum, 664 k_grz) write each complement through a fresh property, `C ≡ ≥ 1 P` and `C.comp ≡ = 0 P`: `≤ 0 P ⊑ C.comp` is `⊤ → C.comp ∨ ∃P`, a choice on every node (24/28/47). Counts first: the references don't decide these reproducibly either (Openllet 664 and Konclude 663 once on 3 Oct, out of time in 5 to 7 cold reruns on 7 Oct). A pair of definitions whose right sides are complements gives `B ≡ ¬A` in every model: `B` is replaced by `¬A`, and a property only the pair mentions (one successor, filler `⊤`) is left out. After it 662's plain clauses equal those of DL-202, the same formula with `owl:complementOf`. Choices on every node 24/28/47 → 0 (lazy) and 3/1/20 (plain: and-definitions over two negated subformulas, as in DL-202); decided by the portfolio: 662 and 663 by the plain clauses (5.2 ms, 1,249 branch points; 14.4 ms, 6,792), 664 by the unfolded ones (0.18 ms, none), all three gave up before in either; DL-661 30 → 0.17 ms (15,750 → 4 branch points), DL-202/204/206 unchanged (lab profile, quiet slot, medians of 7). Tried first: tying it to lazy unfolding and widening the Horn test to names unfolded themselves. That gave 0 on every node too, but lazy unfolding is what k_d4 can't take (DL-202 gives up with it), so 662 and 663 stayed open. The W3C suite: 408 right, 0 wrong, 1 disputed, 2 open (906, 907); with `no-complements` the same but 662 to 664 open | kept, on by default |
 | 7 Oct | **G1, the kernels across owners, measured before adopting** (merge checklist G1; perf/g1-kernels). Profiles first (samply, main PC): LUBM 100 reasoning under OWL 2 RL (2.41 s, 4 rounds), the DL pipeline on a 60,000-class Horn ontology, `dl-roles`, and the Horn context classifier on 1,500 classes. **Kept, the reasoner's probes on a finger:** `batch::Run::contains` was 54 % of the reasoning's samples, a search from the root in each of a relation's four runs for each candidate, although a morsel hands its candidates over sorted (P1-F8). The morsel now hands them over at once, and the batch store reads each run forward from the last check's place (`nrese_exec::search::Finger`, a galloping partition point; the join's and the worst-case-optimal join's own galloping can move onto it). The gain is small because the cost is the cache misses at the targets, not the comparisons on the way: a morsel's checks of one relation lie thousands of pairs apart. **Rejected, radix for the reasoner's pairs:** 20 M pairs (44 significant bits), `par_sort_unstable` with dedup 303, 224, 205 ms, the radix kernel 303, 175, 207 ms; and the batch store's `(u64, u64)` pairs would need to become `[u64; 2]` everywhere. **Rejected, radix for a morsel's (p, s, o) sort** (the batch path's and the delta executor's, 4–8 % of the reasoning): one thread, morsels of 5,000 facts 128 vs 129 ms, 20,000 137 vs 103, 80,000 153 vs 106; at most about 2 % of the reasoning, under the A/B's noise, for a copy into (p, s, o) order. **Rejected, the DL engines:** sorts are 4 of 2,878 samples (pipeline), 1 of 624 (`dl-roles`), 37 of 31,986 (Horn classifier), and none search a sorted run. Next angle there instead: 22–26 % of their samples are the Windows heap (`RtlFreeHeap`; the examples run on the system allocator, the store on mimalloc) and 4–6 % SipHash (std's hasher) | Main PC, release, quiet slot, LUBM 100 reasoning p50 of 3 per process, interleaved against 022c1de: 10 rounds, the finger faster in 9; the five quietest 2,494 → 2,349 ms (−5.8 %) | finger kept; radix for pairs and morsels, and the DL engines, rejected |
 | 7 Oct | **P2: the soak's growth explained, not a leak.** The 6 October soak (office PC, 5 h, 8 workers) grew from 287 to 308 MiB resident, +4.7 MiB/h. `soak.py` now reads every `nrese_*` gauge with resident memory and, on Linux, resident memory per mapping. New gauges: the result cache's entries, open sessions, running queries, the text index, and the allocator's committed bytes. With `--cfg alloc_profile`, the allocator's live and peak bytes too. A short reproduction (16 workers, a checkpoint every 8 MiB of WAL through the new `store.checkpoint_after_wal`, Windows and Linux) ruled each suspect in or out. The result cache stays empty under write churn. The dictionary stops at the soak's pool of 100 k subjects (by design: it grows with distinct terms). The WAL is on disk and bounded by the checkpoint interval. Sessions and running queries return to 0. One checkpoint is mapped at a time (≤ 3 MiB). The program's heap stays at about 2 MiB, never more than 15 MiB at once. The rest is anonymous memory, almost all in mimalloc's one 1 GiB arena (257 of 260 MiB; thread stacks 2.3 MiB). The arena is backed by transparent huge pages, so a touched byte makes 2 MiB resident. Bounded by what mimalloc reserved (600 MiB, reached within minutes). Collecting on every tokio park and thread stop changed nothing (rejected); immediate purging (`MIMALLOC_PURGE_DELAY=0`) took off about 60 MiB. The guard `churn_over_a_bounded_pool_of_terms_holds_the_heap_level` (nrese-store, counting allocator) checks the program's heap stays level under the soak's mix: it moved by −14 kB over 900 rounds (4,500 commits); sessions kept after rollback grow it by 299 kB | Main PC, WSL2 Linux (kernel THP `madvise`), 10-minute soaks, 16 workers, means of resident memory after the first 2 minutes. mimalloc 254–294 MiB (h1–h4, d), mimalloc without THP (`MIMALLOC_ALLOW_THP=0`) 97 and 103 MiB, system allocator 75 and 77 MiB; program heap peak 14.1–15.2 MiB in every run; requests per run vary with WSL's disk (110 k–297 k), none fewer without THP. Windows (no THP): resident 127 → 136 MiB over 45 min, slope −1 MiB/h. Huge pages' worth, LUBM 100 + univ-bench under OWL 2 RL (8,726,942 inferred), perf lab on Linux, 3 interleaved pairs, medians: materialisation 2,265 ms with THP against 2,862 ms without; its peak 1,972 against 1,543 MiB; load 4.8 against 5.2 s | kept: the gauges, the probe, the guard, `budgets.huge_pages` (default `on`, as before); the setting's default left to the owner |
+| 7 Oct | **DL, the number module's four layers** (`nrese_dl::numbers`, docs/design/owl2-dl.md#number-reasoning-layers; ed9f94d, 0051424, f45277e and the validator's commit). Extraction to a `NumberProblem` within a fragment (twelve mutants declined), count closure over it with degree sums (replacing the clause-level comparison; a `k` that `m` doesn't divide now refuted without `n`), an untrusted compressed candidate, and an independent validator over the ontology's own axioms, the only way to "consistent". W3C DL-906 and 907 decided in about 1 ms each (907's candidate: 3 proxies for 60,201 elements); the suite 410 right, 0 open. Checked by expanding the candidates of `(n, m, n·m)`, n, m ≤ 5, and running the semantics' model check on them, and by the search where it decides | kept |

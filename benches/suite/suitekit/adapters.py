@@ -678,20 +678,31 @@ GRAPHDB_RULESETS = {"none": "empty", "rdfs": "rdfs", "owl-horst": "owl-horst",
 
 
 class Graphdb(Adapter):
-    """importrdf into a fresh home (preload without reasoning; load with a ruleset, which
-    infers while loading: UNVERIFIED until a licensed run). Queries need a licence:
-    GRAPHDB_EDITION=free (default; one core, two concurrent queries) or enterprise (all
-    cores, and 40-bit entity IDs for more than two billion distinct values, which full
-    Wikidata needs)."""
+    """Offline preload for plain data, parallel load including inference otherwise.
+
+    11.5 Free: one licensed core, two concurrent queries, five repositories; EE uses
+    its licensed core count, not necessarily the host's. Edition is a requested
+    configuration, not proof of entitlement. Verify the actual license before runs.
+    40-bit IDs require EE here and are useful above 2**31 unique RDF values, not
+    merely because EE is selected. Size the entity index for each workload.
+    See 11.5/{licensing,configuring-a-repository,configuring-graphdb-memory}.html.
+    The total runtime memory cap includes heap, native/direct memory and file cache.
+    """
 
     key = "graphdb"
     regimes = GRAPHDB_RULESETS
+    defaults = {"GRAPHDB_IMAGE": "ontotext/graphdb:11.5.1", "GRAPHDB_EDITION": "free",
+                "GRAPHDB_ENTITY_ID_SIZE": "32", "GRAPHDB_ENTITY_INDEX_SIZE": "10000000",
+                "GRAPHDB_CONTEXT_INDEX": "false", "GRAPHDB_CHECK_INCONSISTENCIES": "false"}
 
     def images(self, ctx):
-        return [ctx.setting("GRAPHDB_IMAGE", "ontotext/graphdb:11.5.1")]
+        return [ctx.setting("GRAPHDB_IMAGE", self.defaults["GRAPHDB_IMAGE"])]
 
     def enterprise(self, ctx) -> bool:
-        return ctx.setting("GRAPHDB_EDITION", "free") == "enterprise"
+        edition = ctx.setting("GRAPHDB_EDITION", self.defaults["GRAPHDB_EDITION"])
+        if edition not in ("free", "enterprise"):
+            raise ValueError("GRAPHDB_EDITION must be free or enterprise")
+        return edition == "enterprise"
 
     def licence(self, ctx) -> str:
         if self.enterprise(ctx):
@@ -699,22 +710,82 @@ class Graphdb(Adapter):
         return ctx.licence("GRAPHDB_LICENSE", "graphdb.license")
 
     def supports(self, ctx, inputs, regime):
+        unsupported = super().supports(ctx, inputs, regime)
+        if unsupported:
+            return unsupported
+        if regime not in self.regimes:
+            return f"no GraphDB ruleset for {regime}"
+        try:
+            self.repository_settings(ctx, regime)
+            self.env(ctx, "")
+        except ValueError as error:
+            return str(error)
         if not self.licence(ctx):
             file = "graphdb-enterprise.license" if self.enterprise(ctx) else "graphdb.license"
             return (f"needs {file} in the licences directory, or GRAPHDB_LICENSE=/path "
                     "(it answers no queries without one)")
-        return super().supports(ctx, inputs, regime)
+        return None
+
+    def repository_settings(self, ctx, regime) -> dict[str, str]:
+        enterprise = self.enterprise(ctx)
+        width = ctx.setting("GRAPHDB_ENTITY_ID_SIZE", self.defaults["GRAPHDB_ENTITY_ID_SIZE"])
+        if width not in ("32", "40") or (width == "40" and not enterprise):
+            raise ValueError("GRAPHDB_ENTITY_ID_SIZE must be 32, or 40 with an Enterprise license")
+        size = ctx.setting("GRAPHDB_ENTITY_INDEX_SIZE", self.defaults["GRAPHDB_ENTITY_INDEX_SIZE"])
+        if not re.fullmatch(r"[0-9]+", size) or not 1 <= int(size) <= 2147483647:
+            raise ValueError("GRAPHDB_ENTITY_INDEX_SIZE must be 1..2147483647")
+        values = {"ruleset": self.regimes[regime], "entity-id-size": width, "entity-index-size": size,
+                  # 11.5 reasoning.html: native equality belongs to the OWL regimes.
+                  "disable-sameAs": "false" if regime in ("owl-horst", "owl2-rl", "owl2-ql") else "true"}
+        for setting, predicate in (("GRAPHDB_CONTEXT_INDEX", "enable-context-index"),
+                                   ("GRAPHDB_CHECK_INCONSISTENCIES", "check-for-inconsistencies")):
+            value = ctx.setting(setting, self.defaults[setting])
+            if value not in ("true", "false"):
+                raise ValueError(f"{setting} must be true or false")
+            values[predicate] = value
+        return values
 
     def env(self, ctx, options: str) -> dict:
-        return {"GDB_HEAP_SIZE": ctx.heap, "GDB_JAVA_OPTS": options}
+        for setting, option in (("GRAPHDB_PAGE_CACHE_SIZE", "-Dgraphdb.page.cache.size="),
+                                ("GRAPHDB_QUERY_MEMORY_THRESHOLD", "-Dgraphdb.query.memory.threshold="),
+                                ("GRAPHDB_MAX_DIRECT_MEMORY", "-XX:MaxDirectMemorySize="),
+                                ("GRAPHDB_INFERENCE_CONCURRENCY", "-Dgraphdb.inference.concurrency="),
+                                ("GRAPHDB_INFERENCE_BUFFER", "-Dgraphdb.inference.buffer=")):
+            value = ctx.setting(setting)
+            if not value:
+                continue
+            integer = setting in ("GRAPHDB_INFERENCE_CONCURRENCY", "GRAPHDB_INFERENCE_BUFFER")
+            if not re.fullmatch(r"[1-9][0-9]*" + ("" if integer else "[kKmMgG]?"), value):
+                raise ValueError(f"{setting} must be positive {'integer' if integer else 'bytes or K/M/G size'}")
+            # 11.5 memory docs use page.cache.size=3G/5g and query threshold=250m.
+            # Normalize our size syntax to bytes; do not rely on JVM flag parsing
+            # for GraphDB properties. The native JVM flag keeps its own size syntax.
+            amount = int(value[:-1]) * 1024 ** ("kmg".index(value[-1].lower()) + 1) if value[-1].isalpha() else int(value)
+            if not integer and setting != "GRAPHDB_MAX_DIRECT_MEMORY":
+                value = str(amount)
+            options += " " + option + value
+        return {"GDB_HEAP_SIZE": ctx.heap, "GDB_JAVA_OPTS": options.strip()}
+
+    def configuration(self, ctx, regime) -> str:
+        config = (ctx.root / "benches/competitors/graphdb/repo-owl2-rl.ttl").read_text(encoding="utf-8")
+        for predicate, value in self.repository_settings(ctx, regime).items():
+            config = re.sub(r'graphdb:' + re.escape(predicate) + r' "[^"\n]*"',
+                            f'graphdb:{predicate} "{value}"', config)
+        return config
+
+    def record_configuration(self, ctx, spec, phase):
+        env = dict(spec.env)
+        env["GDB_JAVA_OPTS"] = re.sub(r"-Dgraphdb\.license\.file=\S+",
+                                     "-Dgraphdb.license.file=<set>", env["GDB_JAVA_OPTS"])
+        record = {"image": spec.image, "requested_edition": "enterprise" if self.enterprise(ctx) else "free",
+                  "memory": spec.memory, "env": env}
+        (ctx.logs / f"graphdb-{phase}-config.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
     def load(self, ctx, store, inputs, regime):
-        template = (ctx.root / "benches/competitors/graphdb/repo-owl2-rl.ttl").read_text(encoding="utf-8")
-        config = template.replace('graphdb:ruleset "owl2-rl"', f'graphdb:ruleset "{self.regimes[regime]}"')
-        if self.enterprise(ctx):
-            config = config.replace('graphdb:entity-id-size "32"', 'graphdb:entity-id-size "40"')
-        (ctx.work / "repo.ttl").write_text(config, encoding="utf-8")
-        mode = ["preload", "-f"] if regime == "none" else ["load", "-f", "-m", "parallel"]
+        config = self.configuration(ctx, regime)
+        for path in (ctx.work / "repo.ttl", ctx.logs / "graphdb-repo.ttl"):
+            path.write_text(config, encoding="utf-8")
+        mode = ["preload", "-f"] if regime == "none" else ["load", "-f", "-s", "-m", "parallel"]
         # The load runs under the same licence as the server: the edition decides the cores
         # it may use and whether 40-bit IDs are allowed.
         spec = Spec(ctx.name("load"), self.images(ctx)[0],
@@ -722,8 +793,9 @@ class Graphdb(Adapter):
                     self.env(ctx, "-Dgraphdb.home=/opt/graphdb/home -Dgraphdb.license.file=/license/graphdb.license"),
                     ctx.mounts(Mount(self.licence(ctx), "/license/graphdb.license"),
                                Mount(store, "/opt/graphdb/home", readonly=False)), memory=ctx.memory)
+        self.record_configuration(ctx, spec, "load")
         return Step(ctx.runtime.run(spec, ctx.logs / "load.log", ctx.timeout_s),
-                    note="" if regime == "none" else "UNVERIFIED: importrdf load with a ruleset")
+                    note="" if regime == "none" else "importrdf load includes inference; qualify each workload's answers")
 
     def serve(self, ctx, store, regime):
         port = ctx.listen(7200, fixed=True)
@@ -732,9 +804,25 @@ class Graphdb(Adapter):
                     self.env(ctx, "-Dgraphdb.license.file=/license/graphdb.license"),
                     ctx.mounts(licence, Mount(store, "/opt/graphdb/home", readonly=False)), port=port,
                     entrypoint=True, memory=ctx.memory)
+        self.record_configuration(ctx, spec, "serve")
         base = ctx.runtime.url(spec)
         return self.start(ctx, spec, Endpoint(f"{base}/repositories/bench",
                                               f"{base}/repositories/bench/statements"))
+
+    def version(self, ctx, endpoint):
+        if endpoint is None or ctx.dry:
+            return "-"
+        base = endpoint.query.rsplit("/repositories/", 1)[0]
+        try:
+            with urllib.request.urlopen(f"{base}/rest/info/version", timeout=10) as response:
+                info = json.loads(response.read())
+            metadata = {key: info[key] for key in ("productVersion", "productType")}
+            if not all(isinstance(v, str) and len(v) < 80 for v in metadata.values()):
+                return "-"
+            (ctx.logs / "graphdb-runtime.json").write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+            return metadata["productVersion"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return "-"
 
 
 class Rdfox(Adapter):

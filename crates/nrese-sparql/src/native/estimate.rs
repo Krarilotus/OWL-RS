@@ -32,7 +32,7 @@ use nrese_sparql_syntax::algebra::{GraphPattern, PropertyPathExpression};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
 
 use super::path_joins::PathJoin;
-use super::{Context, GraphScope, PathPattern, bound_variables, pushdown};
+use super::{Context, GraphScope, PathPattern, pushdown};
 use crate::plan::Plan;
 use crate::query::PlannedStep;
 
@@ -113,8 +113,7 @@ impl Context<'_> {
             // Paths joined to triple patterns, ordered with them as the executor does.
             Plan::Join(_)
                 if !self.as_written
-                    && let lowered = plan.lower()
-                    && let Some(join) = PathJoin::of(&lowered) =>
+                    && let Some(join) = PathJoin::of_plan(plan) =>
             {
                 let rows = self.path_join_steps(&join, depth + 1, steps);
                 let detail = format!(
@@ -129,7 +128,7 @@ impl Context<'_> {
                 let mut bound: Vec<Variable> = Vec::new();
                 for plan in inputs {
                     let next = input(plan, steps);
-                    let variables = variables(plan);
+                    let variables = plan.variables();
                     let shared = variables.iter().any(|v| bound.contains(v));
                     rows = join(rows, next, shared);
                     bound.extend(variables);
@@ -479,15 +478,9 @@ fn join(left: Option<f64>, right: Option<f64>, shared: bool) -> Option<f64> {
     Some(if shared { l.max(r) } else { l * r })
 }
 
-fn variables(plan: &Plan) -> Vec<Variable> {
-    let mut out = Vec::new();
-    bound_variables(&plan.lower(), &mut out);
-    out
-}
-
 fn shares(left: &Plan, right: &Plan) -> bool {
-    let left = variables(left);
-    variables(right).iter().any(|v| left.contains(v))
+    let left = left.variables();
+    right.variables().iter().any(|v| left.contains(v))
 }
 
 fn names(variables: &[Variable]) -> String {

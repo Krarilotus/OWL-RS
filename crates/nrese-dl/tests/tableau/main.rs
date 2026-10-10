@@ -3,6 +3,8 @@
 
 mod build;
 mod ni;
+mod probes;
+mod resources;
 mod sat;
 
 use build::Build;
@@ -31,6 +33,43 @@ fn answer(o: &nrese_owl::Ontology) -> Answer {
         "switches change the answer: {answers:?}"
     );
     answers.remove(0)
+}
+
+#[test]
+fn shared_portfolio_matches_plain_search_without_cancelling_its_parent() {
+    let physical = nrese_exec::workers::Workers::pooled(4).unwrap();
+    let mut b = Build::default();
+    let (a, bb, c) = (b.class(1), b.class(2), b.class(3));
+    let not_b = b.not(bb);
+    let definition = b.and(&[not_b, c]);
+    b.equivalent(a, definition);
+    b.assert(a, 100);
+    for inconsistent in [false, true] {
+        if inconsistent {
+            b.assert(bb, 100);
+        }
+        let expected = consistency(
+            &b.o,
+            &Config {
+                portfolio: false,
+                lazy_definitions: false,
+                ..Config::default()
+            },
+        )
+        .answer;
+        for width in [1, 2, 4] {
+            let parent = nrese_dl::tableau::Cancel::default();
+            let workers = physical.limited(width);
+            let config = Config {
+                workers: Some(workers.clone()),
+                cancel: Some(parent.clone()),
+                ..Config::default()
+            };
+            let actual = workers.install(|| consistency(&b.o, &config));
+            assert_eq!(actual.answer, expected, "width {width}");
+            assert!(!parent.is_cancelled());
+        }
+    }
 }
 
 /// Definitions unfolded lazily: `¬A` as `¬D` wherever it occurs (directly, under a value

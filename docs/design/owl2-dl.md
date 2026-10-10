@@ -466,7 +466,13 @@ search, where 910's facts are unconditional.
 an optimisation of the fallback search, measured on its own. It may bring 906 (621 elements)
 into budget; it can't help 907.
 
-Built in the performance phase.
+**As built (7 October):** layers 1 to 4 in `nrese_dl::numbers` (`problem`, `closure`,
+`candidate`, `validate`). Layer 2 replaced the clause-level size comparison and reads the
+`NumberProblem`, with the degree sums of properties that have a domain and a range of exact
+degrees. `Validated` has a private field: only `validate` makes one. The hypertableau asks
+`numbers::model` before it compiles a consistency test (not a class probe, and not where the
+caller keeps the model, since the compressed model is no completion graph). DL-906 and 907
+are consistent and DL-910 inconsistent in about 1 ms each, with no node and no branch point.
 
 ### Caching
 
@@ -503,6 +509,39 @@ Then the development subset (§11) against HermiT, KoncludeCLI and Openllet, wit
 disagreement that isn't adjudicated.
 
 ## 7. Classification and realisation
+
+**Explicit-result caching (10 October).** The store caches only complete results of
+explicit classification and realisation requests, by asserted revision. A subsequent
+request retries an incomplete attempt under the existing configured budget; this also
+repeats work for unsupported ontologies. It introduces no automatic background retries
+or new timeout. Publication keeps the first complete result for a revision and prevents
+an older in-flight request from displacing a newer cached revision. Each request still
+receives the result for its own snapshot. Query lower bounds retain their separate
+schema-lifetime taxonomy cache, including sound partial knowledge.
+
+**Completion-state ownership (9 October).** Each stage owns its compiled `Prepared`.
+`consistency_with_base` runs the existing search once and can retain its deterministic
+checkpoint and exact model in `Base`; the former separate `base()` search and
+model-cloning `labels()` entry are removed. Where the existing feature analysis rules
+out choices, the completed graph becomes the deterministic base without a copy.
+Classification and realisation keep their
+different individual maps; no cross-stage cache is introduced. Realisation releases
+the base when the initial labels leave no candidates. Otherwise its candidates negate
+unproven classes in that initial model: it retains the deterministic start and releases
+the model that those probes would contradict, avoiding a redundant model attempt.
+
+Every retained probe receives its current configuration. Only timeout and cancellation
+may differ from the base; another strategy or capacity configuration declines reuse
+before execution and uses the existing fresh search. `None` means incompatibility,
+never timeout or unknown. An initially unknown search can retain its deterministic
+checkpoint without acquiring model status. Model rollback and its deterministic
+fallback use one `RunBudget`, as do detached terminology and full-ontology attempts.
+Workers refresh the absolute operation deadline on entry. Preparation, state copies,
+labels and cleanup consume the allowance; checks remain cooperative, not preemptive.
+Probe telemetry includes both fallback attempts; the profile now adds initial and
+realisation work. Existing top/subsumption aggregate-counter gaps remain; historical
+counters with narrower coverage are not directly comparable work savings.
+Per-engine capacity checks do not become an aggregate Base-plus-pool memory ceiling.
 
 Never one test per pair of classes:
 - `known_subsumers(C)`: told subsumers, the EL path's, the context core's, and those read from deterministic hypertableau labels. On deterministic ontologies the hierarchy can be read off the labels in a linear number of tests† (HermiT on GALEN).
@@ -719,7 +758,80 @@ optimisations"), per level:
 | Layout | interning; arenas; trails; persistent dependency sets; split labels | Store `TermId`s throughout (no string decoding on any path); 64-byte hot nodes; bitset labels; clause arenas; mapped checkpointed caches with axiom footprints (the derived-index mechanism of 3 October). |
 | Machine | coarse parallelism over tests, modules and contexts | Morsel parallelism and work stealing as in the query engine; SIMD for label subset and clash tests, blocking signatures and the candidate-subsumer matrix, **only where profiles show it** (D: no published evidence either way); GPU off the critical path (all reports). |
 
+### Bound results and exact-test reuse (9 October)
+
+The store's `dl/query` modules separate query analysis, ID-level gaps and exact-test
+adaptation. SPARQL owns each retained solution table's snapshot, computed terms and
+reservation. Lower and upper results must share a dictionary; query-local computed IDs
+are remapped before raw-ID comparison. Lower bags and delivery order survive; the capped
+candidate prefix retains its former priority. A true lower ASK skips the upper evaluation.
+The upper ID table remains materialised, while decoded exact-candidate rows are batched.
+
+Eligible exact tests use the existing `tableau::Prepared` probe engine. One immutable
+program per candidate batch includes fresh selectors implying each test's assumption;
+only the selected probe asserts its selector. The unselected definitions are conservative
+extensions of the premise. Each probe owns fresh search state, and temporary selector
+axioms and their source entries are removed from the operation's scratch ontology;
+interned expressions remain operation-local. Scalar reductions remain for
+unsupported forms and as a differential oracle. This removes repeated premise copying and
+compilation inside eligible batches; it does not change store/OWL semantic ownership.
+There is no cross-query compiled cache: the batch owns the program and assumptions.
+Admission checkpoints charge waiting time against the remaining timeout and observe
+cancellation; normalisation and compilation themselves are not preemptible.
+
+The shared runtime schedules independent candidates with one-worker child allowances.
+Classification and realisation reuse the same physical owner, and context fixpoint rounds
+do not recreate pools. Finite search memory is divided by actual concurrent work; zero
+configured memory remains unlimited. Narrow irregular batches let idle lanes claim the next
+probe, preserving result order without unsafe shared writes. Retained native bounds share
+query accounting across repositories. Scratch ontology and compilation memory remain outside
+the tableau search allowance, so these repairs do not establish a whole-operation ceiling.
+
+Portfolio decisions signal sibling cancellation immediately and leave the request parent
+untouched. Dispatch waits for all runs to finish. Both may decide before observing the
+signal; the returned decided outcome is first in input order, so its telemetry must not
+be described as the earliest wall-clock winner. Runtime performance acceptance remains
+**BLOCKED**, as recorded in [STATUS.md](../STATUS.md); the bounded implementation does not
+complete P3/P4 or the wider DL roadmap.
+
 ## 13. Configuration
+
+This table describes the design target; the deployed settings and defaults are in the
+[configuration reference](../ops/config-reference.md). Resource enforcement is still
+partial. As of 9 October, query cancellation shares one atomic flag with nested
+consistency, exact-candidate and context-saturation checks; it does not start a watcher
+thread. A cancelled query does not publish a replacement consistency status for its
+revision. Checks occur at existing budget boundaries, so bounds construction, schema
+reading, normalisation and compilation are not all internally interruptible.
+
+The commit gate adapts its cancellation callback with a watcher. Pending-state and
+prior-state consistency checks, evidence minimisation and verification consume one gate
+deadline/token rather than restarting the timeout. Exhausted evidence work retains sound
+rejection evidence without claiming completed minimisation or verification.
+
+The context core's `Budget::max_memory` measures the **whole process** and remains a
+separate opt-in guard. Server startup owns the global process fallback; opening a store
+does not change it. Store-local watches also reach DL bounds and diagnostics, with explicit
+zero disabling the local limit. `Budget::task_memory` accounts saturation-owned capacity: compiled
+program, context arena and registry, clauses and indexes, queued payloads, assertion state
+and worker buffers. Owners retain their reservations when moved and release them on drop;
+incremental capacity totals avoid rescanning all contexts at each checkpoint. Hash-table
+backing capacity and assertion B-tree nodes are estimated, not allocator telemetry.
+
+`dl.memory` configures context saturation and the tableau's existing capacity checks.
+Zero means unlimited; the standalone context API defaults to no accounting. Classification
+uses this configured value rather than its standalone driver's fixed tableau default,
+dividing the tableau allowance among actual workers. Checks happen at growth/work
+boundaries, so in-flight work can temporarily exceed a budget. Exhaustion yields an
+incomplete/budget outcome, never a classification inferred from truncated work. There is
+no allocation-by-allocation ceiling.
+
+Normalisation and compilation temporaries, input snapshots, result/proof assembly,
+allocator metadata and scheduler stacks are outside context accounting. Retained native
+bounds now share query accounting, and exact work uses runtime dispatch allowances; DL
+compilation and per-engine task budgets still lack a shared end-to-end memory envelope. The
+context profile's `task_memory_peak` reports successfully reserved saturation capacity,
+not RSS or unreserved overshoot, and is zero when accounting is disabled.
 
 | Setting | Values | Default |
 |---|---|---|
@@ -729,7 +841,7 @@ optimisations"), per level:
 | `dl.timeout`, `dl.memory` | per task | 30 min, 75% of RAM |
 | `dl.fallback.clauses`, `dl.fallback.equalities`, `dl.fallback.contexts` | budgets of §4 | from the ORE and Oxford runs |
 | `dl.race` | `on`, `off` | `on` above a module size |
-| `dl.threads` | count | every core |
+| `dl.threads` | count; 0 inherits runtime workers | 0 |
 | `dl.cache` | `sat`, `completion-graph`, `off` | `sat` |
 | `dl.explanations` | `proofs` (record derivations), `off` | `proofs` |
 

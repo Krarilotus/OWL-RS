@@ -89,6 +89,7 @@ pub fn signature(ontology: &Ontology) -> Vec<Term> {
 
 /// A saturated context structure, with what it was built for.
 pub struct Saturated {
+    _memory: super::memory::Charge,
     engine: Engine,
     classes: Vec<Term>,
     /// The query context of each named concept.
@@ -122,11 +123,31 @@ pub fn classify(
 
 /// Normalises, compiles and saturates `ontology`.
 pub fn saturate(ontology: &Ontology, options: &Options) -> Result<Saturated, Unsupported> {
+    let workers = nrese_exec::workers::Workers::new(options.threads.max(1))
+        .unwrap_or_else(|_| nrese_exec::workers::Workers::serial());
+    saturate_with_workers(ontology, options, None, &workers)
+}
+
+/// Normalises and saturates on caller-owned physical workers, observing cancellation
+/// at budget checkpoints. Normalisation and compilation are checked at their boundaries.
+pub fn saturate_with_workers(
+    ontology: &Ontology,
+    options: &Options,
+    cancel: Option<crate::tableau::Cancel>,
+    workers: &nrese_exec::workers::Workers,
+) -> Result<Saturated, Unsupported> {
+    if cancel
+        .as_ref()
+        .is_some_and(crate::tableau::Cancel::is_cancelled)
+    {
+        return Err(Unsupported::Budget);
+    }
     let started = Instant::now();
     let normalised = normalise_with(ontology, options.normalise);
     let normalise = started.elapsed();
     let classes = signature(ontology);
-    let mut saturated = saturate_normalised(&normalised, &classes, options)?;
+    let mut saturated =
+        saturate_normalised_with_workers(&normalised, &classes, options, cancel, workers)?;
     saturated.profile.normalise = normalise;
     Ok(saturated)
 }
@@ -138,8 +159,29 @@ pub fn saturate_normalised(
     classes: &[Term],
     options: &Options,
 ) -> Result<Saturated, Unsupported> {
+    let workers = nrese_exec::workers::Workers::new(options.threads.max(1))
+        .unwrap_or_else(|_| nrese_exec::workers::Workers::serial());
+    saturate_normalised_with_workers(normalised, classes, options, None, &workers)
+}
+
+/// Saturates using caller-owned workers. The pool survives all ABox rounds and is not
+/// retained by the returned logical state.
+pub fn saturate_normalised_with_workers(
+    normalised: &nrese_owl::Normalised,
+    classes: &[Term],
+    options: &Options,
+    cancel: Option<crate::tableau::Cancel>,
+    workers: &nrese_exec::workers::Workers,
+) -> Result<Saturated, Unsupported> {
+    let workers = workers.limited(options.threads.max(1));
+    if cancel
+        .as_ref()
+        .is_some_and(crate::tableau::Cancel::is_cancelled)
+    {
+        return Err(Unsupported::Budget);
+    }
     let mut profile = Profile {
-        threads: options.threads.max(1),
+        threads: workers.width(),
         ..Profile::default()
     };
     let started = Instant::now();
@@ -155,16 +197,33 @@ pub fn saturate_normalised(
     let named = program.named();
     let engine = Engine::new(program, options.strategy, options.proofs)
         .with_budget(options.budget)
+        .with_cancel(cancel)
         .with_prune_pred(options.prune_pred);
+    let mut input_memory = engine.memory_charge();
+    if input_memory.enabled() {
+        input_memory.set(abox.bytes());
+    }
+    if engine.out_of_budget() {
+        return Err(Unsupported::Budget);
+    }
     let query: Vec<ContextId> = (0..named)
+        .take_while(|_| !engine.exhausted())
         .map(|c| engine.context_for(&[Atom::concept(c, CTerm::X)]).0)
         .collect();
+    if engine.out_of_budget() {
+        return Err(Unsupported::Budget);
+    }
     let (top, _) = engine.context_for(&[]);
     let mut seeds = query.clone();
     seeds.push(top);
-    engine.run(&seeds, options.threads);
-    let individuals = Individuals::saturate(&engine, &abox, options.threads);
-    if engine.exhausted() {
+    let mut memory = engine.memory_charge();
+    memory.set(super::memory::vec(&query) + super::memory::vec(&seeds));
+    engine.run_with_workers(&seeds, &workers);
+    if engine.out_of_budget() {
+        return Err(Unsupported::Budget);
+    }
+    let individuals = Individuals::saturate_with_workers(&engine, &abox, &workers);
+    if engine.out_of_budget() {
         return Err(Unsupported::Budget);
     }
     profile.saturate = started.elapsed();
@@ -184,7 +243,13 @@ pub fn saturate_normalised(
     }
     // The program's named concepts: the signature's classes and any the clauses add.
     let classes = engine.program.names.clone();
+    drop(seeds);
+    if !memory.set(super::memory::vec(&query) + super::memory::vec(&classes)) {
+        return Err(Unsupported::Budget);
+    }
+    profile.task_memory_peak = engine.task_memory_bytes().1;
     Ok(Saturated {
+        _memory: memory,
         engine,
         classes,
         query,
@@ -195,6 +260,11 @@ pub fn saturate_normalised(
 }
 
 impl Saturated {
+    /// Accounted task capacity and peak (zero when accounting was disabled).
+    pub fn task_memory_bytes(&self) -> (usize, usize) {
+        self.engine.task_memory_bytes()
+    }
+
     pub fn profile(&self) -> &Profile {
         &self.profile
     }

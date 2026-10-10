@@ -155,6 +155,7 @@ impl MutationPipeline {
             return Err(MutationError::Cancelled);
         }
         let context = crate::mutation::command::UpdateContext {
+            runtime: self.store.runtime(),
             cancellation: ticket.evaluation_token(),
             union_default_graph: self.store.config().union_default_graph,
             geosparql_stated_only: self.store.config().geosparql_stated_only,
@@ -205,7 +206,27 @@ impl MutationPipeline {
                 "the commit leaves an ontology axiom unusable",
             );
             if let Some(violation) = violations.first() {
-                let explanation = crate::reasoning::explain_violation(program, violation, &tx);
+                // The committer sees the premises asserted in graphs it may read; the
+                // others are withheld, and counted (graph access: nothing from a graph a
+                // reader can't read reaches it).
+                let readable = |fact: nrese_reasoner::ir::Triple| match &requester.read {
+                    crate::ReadScope::Graphs(access) => crate::service::in_readable_graph(
+                        tx.quads_for_pattern_in(
+                            nrese_engine::ReadModel::Asserted,
+                            &crate::service::any_graph(fact),
+                        ),
+                        &|id| tx.decode(id),
+                        access,
+                    ),
+                    _ => true,
+                };
+                let restricted = matches!(requester.read, crate::ReadScope::Graphs(_));
+                let explanation = crate::reasoning::explain_violation(
+                    program,
+                    violation,
+                    &tx,
+                    restricted.then_some(&readable as &dyn Fn(nrese_reasoner::ir::Triple) -> bool),
+                );
                 let attribution =
                     attribute_reject_delta(&explanation, &MutationDeltaPreview::of(&tx));
                 let mut detail = format!(
@@ -296,12 +317,6 @@ impl MutationPipeline {
                 }
             }
             drop(ground);
-            // A class left out became consumable: its memberships are computed in full.
-            if materialisation.needs_rematerialisation
-                && let Err(error) = self.store.rematerialise(&rules)
-            {
-                tracing::error!(%error, "rematerialisation for an unnamed class that became used failed");
-            }
             // In quarantine the commit checked only its own facts: revalidate everything, so
             // the store leaves quarantine once the data is repaired. The commit itself stands.
             if matches!(

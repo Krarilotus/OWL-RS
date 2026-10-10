@@ -28,6 +28,9 @@ working rules on top of them.
 
 - Unit tests next to the code they test; crate contracts in the crate's one integration
   binary (`tests/it`). A test lives in the crate that owns the behaviour it checks.
+  A cross-component invariant belongs at the layer that composes those components
+  (for example, the store's atomic mutation pipeline); it may legitimately fail after
+  a dependency changes. Keep lower-level regression tests at the cause as well.
 - Every optimisation has a differential test against an oracle; every fix a test that
   fails without it.
 - Small RDF fixtures inline; larger ones under the crate's `tests/` and fetched corpora
@@ -36,8 +39,14 @@ working rules on top of them.
 
 ## Finishing a change
 
-The gate's tiers (`scripts/check.sh commit|push|all`, [CONTRIBUTING.md](../../CONTRIBUTING.md))
-run a crate's tests when it changed and only compile the crates depending on it; a test
-that only fails when another crate changes sits at the wrong level.
+The gate is [`scripts/check.sh`](../../scripts/check.sh); its tiers are described in
+[CONTRIBUTING.md](../../CONTRIBUTING.md):
+
+Use that definition rather than maintaining a second tier list here. Benchmarks never
+run in a gate.
+
+Test placement follows the invariant's owner, not which tier happens to run it. A narrow
+commit gate does not establish that cross-component invariants passed; the push and full
+tiers provide broader coverage. Slow binaries are declared in crate metadata.
 Before closing a work package: dead code and stale helpers removed, duplicated builders
 collapsed, large files split, the docs it changes updated.

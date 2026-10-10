@@ -8,7 +8,160 @@ in the branch), **deferred** (not done, with the reason and where it went), or *
   [capability matrix](spec/06-target-capability-matrix.md).
 - Why and in which order: [the roadmap](ROADMAP.md); the designs in [design/](design/).
 
-Last updated: 6 October 2026, branch `refactor/engine-v2`. What is left before v2 goes to
+Branch update: 10 October 2026. Implementation and [draft PR #23](https://github.com/Krarilotus/OWL-RS/pull/23)
+to `refactor/engine-v2` are authorised; **performance acceptance remains blocked**.
+The implementation comparison base is `0f46563`, including the independently authored
+DL number-module merge. Individual experiments below use their own identified revisions;
+historical v2 improvements are not credited to this branch.
+
+The owner rejected the mandatory default physical-pool policy after these regressions.
+The recovery candidate restores caller execution and existing parallel kernels for
+`execution.threads = 0`, while retaining explicit positive worker limits, shared query
+capacity and independent correctness repairs. Office focused tests and the normal commit
+gate pass. The [four-case recovery screen](../benches/runs/2026-10-10-default-execution-recovery.toml)
+passes all 24 invocations and restores lookup throughput, mixed commits, skewed counting
+and aggregate phase memory near the original baseline. Phuoc's ten-pair comparison is
+complete for all 14 affected/control cases: 280 reports, 340 native calls, all recorded
+checks passing and no comparator regression flags. Small differences are not qualified
+speedups. Office's full 95-case comparison is also complete: 570 reports, 85 valid cases,
+six expected boundaries and four cases failing on both revisions; no new status/check,
+latency, throughput, memory or work-counter flags. Three-pair results remain screening
+evidence. General performance acceptance remains open. The earlier pending documentation
+commit was stopped before applying its patch.
+The restricted competitor campaign also omitted reusable home-turf tracks; its query
+tables are screening evidence, not completion of the requested comparison.
+
+The filtered-vector collector repair passes 22 focused tests and the Office commit
+gate. Phuoc's ten-pair exact controls complete 100 processes and 500 saved answers;
+all 25 query comparisons remain within the predeclared thresholds, without a speedup
+claim. Approximate recall fails on both binaries, so those paths remain unqualified.
+The [vector record](../benches/runs/2026-10-10-vector-collector-repair.toml) keeps
+source identities and controls separate. The registry's stale QL q15 rewrite guard
+is corrected, retaining answer checks and adding soundness/completeness checks;
+24 retained Office executions pass revalidation, without changing frozen results.
+New home-turf qualification matches the full EL taxonomy against ELK and Konclude;
+the Horn reference taxonomy omits asserted edges and remains disputed. Separate raw
+Konclude and adapter replay outputs match native. Three same-invocation captures with
+identical converted input reproduce one raw hierarchy missing 107 asserted pairs;
+Java preserves that closure, while the other two runs match native. The exact cause
+inside Konclude classification/output remains unknown. Aggregate numeric/type
+disagreements remain unqualified; Virtuoso's
+extra statements are outside the workload graph. ANN diagnostics locate missing hits
+before the collector, with existing route/effort choices still to qualify. A separate
+small adjacency-buffer reuse experiment passes the Office gate and 432 fixed-graph
+checks. Phuoc's 100-process exact qualification passes with no detected regression;
+the separate instrumented cohort records 81.18–81.44% fewer preparation allocations
+and 44.62–44.68% less cumulative allocation traffic. No latency or peak-memory win
+qualifies. Approximate-search routing still needs separate quality/cost qualification.
+
+The benchmark direction now explicitly distinguishes native-capacity, matched-resource
+and scaling/frontier scenarios. Existing full cases remain; harness memory overhead
+does not justify smaller workloads or added limits. Focused checks, 1–4-hour area
+campaigns and a roughly one-day runnable profile are scheduling targets, not verified
+durations. Four public home-turf cases completed once with full capture coverage,
+retaining numeric/ordering disputes and one Oxigraph timeout. The approved container
+peak-accounting proof is blocked by Office system-manager permissions, before resource
+creation. The large-answer recorder is under ownership review; no capped diagnostic
+was run. See the [campaign](plan/2026-10-10-performance-campaign.md) for the live gates.
+
+The later frozen `4e8bd38` → `bebada2` checkpoint completes all 95 cases on both
+hosts: 1,140 invocations, with no new status/check failures but performance acceptance
+failing on both. Phuoc's separate ten-pair follow-up confirms client-throughput,
+mixed-commit, skewed-counting and aggregate phase-memory regressions. Four existing
+failed cases remain unresolved. The [campaign record](../benches/runs/2026-10-10-checkpoint-bebada2.toml)
+keeps identities, qualifications and findings separate from older comparisons below.
+Both Phuoc follow-ups are finished. Root interrupted the restricted Office competitor
+queue to validate recovery; completed results and the interrupted Jena row are preserved.
+Existing home-turf runners and answer checks will supply the omitted coverage. The
+[ordered design gates](plan/2026-10-09-performance-architecture.md#7-ordered-design-and-implementation-gates-10-october)
+guide structural repair before dependent optimisation. The cache/worker progress
+defect is reproduced; a replacement mechanism and callback contract are not selected.
+
+The cache-contract follow-through repairs a reproduced QL warm-cache wrong answer when
+ordinary data introduces `owl:Thing`, uses exact schema identity, and retries incomplete
+explicit DL classification/realisation requests under the existing budget. Complete-result
+publication cannot displace a newer revision with an older one. Query lower-bound caching
+is unchanged. Normal Office commit/push checks pass for `0f3155b`; the [component diagnostic](../benches/runs/2026-10-10-cache-contracts-d31010c.toml)
+measures 20.4% less schema-refresh time for 1004 statements, with 32 bytes per statement
+retained as the exact key. This is the median of five process aggregate means, not a
+qualified performance win, full-query speedup or memory-neutral change.
+General result-cache overhead profiling and the broader runtime acceptance remain open.
+
+The later `da4465d` push gate exposed a missing DL type at seed 5358, case 63,
+with model reuse enabled. The pre-reuse revision passes the same test variants.
+Retained probes now apply assumptions to the individual's current representative,
+carrying merge dependencies while preserving the original root for label provenance.
+Both new guards fail without the fix; all eight probe tests and the full failing seed
+pass on Office. The [repair record](../benches/runs/2026-10-10-dl-alias-da4465d.toml)
+keeps the failed gate, baseline control and subsequent qualification separate.
+Its 280-invocation diagnostic completes with matching emitted answers and overlapping
+timing/RSS ranges against the preserved pre-fix binary; no new speedup or general
+performance-neutrality claim follows.
+
+| Area | Implemented and retained | Remaining gap |
+|---|---|---|
+| QL preparation/cache identity | One preparation, execution snapshot and retained report; exact compiler-input identity; failed probes never cached as negative answers | Internally interruptible schema reading/rewriting; current-head performance qualification |
+| Cancellation/deadlines | Request flags reach nested DL work; pending/prior checks and rejection evidence share one deadline | Compilation and some preparation phases are non-preemptible |
+| Context task memory | Optional owner-based capacity, incremental index totals and transferred message charges; zero stays unlimited | Checkpoint overshoot and excluded allocations; no shared whole-operation envelope |
+| Atomic reasoning updates | Split/revival closure participates in the pending transaction and gates; obsolete post-commit repair removed | Whole-dataset fallback still holds the writer; incremental split maintenance unfinished |
+| Kernel/allocation reuse | Moving projection, shared forward search, direct raw spill, ordered dedup; one SPARQL numeric implementation | Work/copy savings do not establish end-to-end speedups; reference arithmetic is shared |
+| Execution ownership | Catalog execution policy, reusable DL handles, bounded participating batches, update WHERE and retained results; default-pool rewind passes the 14-case ten-pair and 95-case three-pair checks | Explicit-pool handoff/progress costs and output coverage remain open |
+| DL bounds/exact work | Dictionary-safe ID results, lower-true ASK reuse, bounded decoding and existing compiled probes | Repeated base search/compilation between batches; materialised upper tables; no whole-request memory ceiling |
+| DL classification/realisation | Existing Base retains the initial search; current probe controls and one fallback allowance; realisation reuses the deterministic start | Separate stage compilation remains; cooperative checkpoints and partial aggregate counters; qualification is a selected DL comparison |
+| Process memory policy | Server owns global fallback; independent store watches reach bounds and diagnostics | Cooperative enforcement; task capacities and process memory are different contracts |
+| Benchmark machinery | One suite estimator, explicit microcase/QPS checks, reference-only GraphDB writes with numeric validation | Full current-head A/B, incremental reasoning sequences and unimplemented competitor adapters |
+| Architecture | Actual owners and retirement conditions documented | Direct physical-plan execution, calibrated routing, NUMA/GPU and distributed execution remain unfinished |
+
+The all-added-lines audit covers **167 changed files** through `4a21a90` against
+`0f46563`, including moved/deleted implementations and tests. This follow-up removes
+two unused context forwarding layers and consolidates actual-worker options and exact-test
+vocabulary resolution. Independent semantic oracles and distinct state lifetimes are
+retained. The [plan](plan/2026-10-09-performance-architecture.md) owns the next decisions;
+the [lab log](design/performance.md#6-lab-log-of-the-performance-phase-from-5-october-2026)
+owns measurements and rejected experiments.
+
+The bounded DL repair against clean `be5c3d7` completes 84 paired classification and
+realisation invocations plus 24 fresh-search controls on Office. Canonical answers
+match throughout. ORE 9881/16542 classification improves 27–43% at 1/4 workers;
+the 300-individual choice realisation improves 14–18%. The initial unnecessary Horn
+checkpoint copy was removed and remeasured. These are new, scoped gains, not historical
+v2 numbers or clearance of the runtime regressions. The [DL run record](../benches/runs/2026-10-09-dl-reuse-be5c3d7.toml)
+identifies binaries, source, fixtures, superseded experiments and qualification limits.
+The repair is `a60e482`; normal Office commit/push hooks passed, including affected
+tests, dependent tests, additional semantic seeds, formatting, Clippy and lock checks.
+
+Office's frozen **`4e8bd38` → `77478d1` campaign is complete: 95 cases, 570 invocations,
+three repetitions per side**. Reanalysis with an explicit zero-ms floor flags seven
+latency regressions, 18 cases with higher memory, and lower lookup throughput at every
+client width. Six expected boundaries earn no timing credit; four cases fail existing
+checks on both sides. No case qualifies as faster under this campaign's 10%/spread rule.
+This is not current-head qualification or a comparison of the entire branch to `0f46563`.
+
+Phuoc's separate frozen comparison also loses 66.5–80.5% lookup throughput and 26.7%
+cache-on replay time. Its exact-gap N512 diagnostic improves 19.5% at one CPU and 13.3%
+at four, with correct proof/refutation bags; those local gains do not clear regressions.
+Scope and hashes: [Phuoc record](../benches/runs/2026-10-09-phuoc-partial-77478d1.toml).
+Reset-affected late-phase RSS is not a full-classification memory peak.
+
+Validation history remains revision-specific: `583c422` passed the milestone gate;
+`a6331c7` repaired the later bounds fuzz failures and passed Office commit/push hooks.
+The [corpus-backed run](../benches/runs/2026-10-09-office-conformance-a633.toml)
+records actual conformance coverage, exclusions and disputes. Benchmark repair
+`08e8b4a` passed 55 Python contracts and 83 Rust harness tests plus normal hooks.
+These checks do not constitute a current-head full milestone or performance gate.
+
+GraphDB uses the selected Free edition and native settings. Private 100k write setup
+and numeric-count qualification completed; full 1M/10M, sustained timing and incremental
+reasoning comparisons remain open. The [workload map](../benches/competitors/README.md#graphdb-comparison-coverage-and-qualification-9-october-2026)
+distinguishes executable paths from missing adapters and incomparable semantics.
+Licensed measurements stay private.
+
+The caller-budget prototype was rejected; caller encoding bypass is not authorised.
+Single-block worker coalescing remains discussion-only. Further substantial wiring
+requires the agreed design checkpoint; passing correctness alone cannot accept it.
+
+The following goal history was last reconciled on 6 October on `refactor/engine-v2`.
+What is left before v2 goes to
 `main`, with owners and state, is the status table of the
 [merge checklist](plan/2026-10-05-v2-merge-checklist.md) §1; the rows below are the record
 by goal.

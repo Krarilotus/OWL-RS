@@ -28,6 +28,7 @@ use hashbrown::HashMap;
 use rayon::prelude::*;
 
 use crate::UNDEF;
+use crate::search::partition_range_from;
 use crate::table::IdTable;
 
 type Hasher = foldhash::fast::FixedState;
@@ -298,20 +299,10 @@ fn gallop(
         };
         ord == Ordering::Less
     };
-    let len = table.len();
-    if from >= len || !less(from) {
-        return from;
-    }
-    let mut step = 1;
-    let mut low = from; // less(low) holds
-    let mut high = from + 1;
-    while high < len && less(high) {
-        low = high;
-        step *= 2;
-        high = (low + step).min(len);
-    }
-    // less(low) and (high == len or !less(high)): binary search in (low, high]
-    let (mut lo, mut hi) = (low + 1, high);
+    let Range {
+        start: mut lo,
+        end: mut hi,
+    } = partition_range_from(table.len(), from, less);
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
         if less(mid) {

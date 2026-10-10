@@ -619,6 +619,39 @@ pub(crate) fn rows_up_to_equal_values(
     rows_with(results, ordered, ordered || open)
 }
 
+/// [`rows`] and [`rows_up_to_equal_values`] (unordered) of one evaluation.
+fn rows_both_ways(results: QueryResults<'_>, open: bool) -> (Vec<String>, Vec<String>) {
+    let QueryResults::Solutions(solutions) = results else {
+        let rows = rows_with(results, false, false);
+        return (rows.clone(), rows);
+    };
+    let variables: Vec<_> = solutions.variables().to_vec();
+    let cells: Vec<Vec<Option<Term>>> = solutions
+        .map(|solution| {
+            let solution = solution.expect("no evaluation error");
+            variables.iter().map(|v| solution.get(v).cloned()).collect()
+        })
+        .collect();
+    let format = |by_values: bool| {
+        let mut out: Vec<String> = cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| {
+                        cell.as_ref().map_or("UNDEF".to_owned(), |t| {
+                            if by_values { by_value(t) } else { t.clone() }.to_string()
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    (format(false), format(open))
+}
+
 fn rows_with(results: QueryResults<'_>, ordered: bool, by_values: bool) -> Vec<String> {
     let solutions = match results {
         QueryResults::Solutions(solutions) => solutions,
@@ -1908,9 +1941,12 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
                 .unwrap_or_else(|e| panic!("{e}: {text}"));
             assert!(runs_natively(&query), "{text}");
             let context = format!("dataset {dataset_case}, query {query_case}: {text}");
-            let native = rows(
+            // One native evaluation, compared both ways: with the as-written one, and up
+            // to equal values with the reference.
+            let open = has_extremes(&text);
+            let (native, native_by_value) = rows_both_ways(
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
-                false,
+                open,
             );
             let plain = rows(
                 evaluate_query(&snapshot, &query, &as_written).unwrap(),
@@ -1936,18 +1972,12 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
                 &format!("against as written: {context}"),
             );
             if !order_dependent {
-                let open = has_extremes(&text);
-                let native = rows_up_to_equal_values(
-                    evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
-                    false,
-                    open,
-                );
                 let expected = rows_up_to_equal_values(
                     reference(&snapshot, &query, &oracle).unwrap(),
                     false,
                     open,
                 );
-                assert_same_rows(&native, &expected, &context);
+                assert_same_rows(&native_by_value, &expected, &context);
             }
             checked += 1;
             with_solutions += usize::from(!native.is_empty());
@@ -2235,15 +2265,22 @@ fn cyclic_bgps_equal_the_reference() {
             );
             let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
             assert_eq!(native, expected, "{text}");
-            // Counted by the join (`wcoj::Query::count_solutions`), not from its rows.
-            let text = format!("SELECT (COUNT(*) AS ?n) WHERE {{ {body} }}");
-            let query = SparqlParser::new().parse_query(&text).unwrap();
+            // Counted by the join (`wcoj::Query::count_solutions`), not from its rows: as
+            // many as the reference's solutions.
+            let count = format!("SELECT (COUNT(*) AS ?n) WHERE {{ {body} }}");
+            let query = SparqlParser::new().parse_query(&count).unwrap();
             let native = rows(
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 false,
             );
-            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
-            assert_eq!(native, expected, "{text}");
+            let solutions = expected.len();
+            assert_eq!(
+                native,
+                [format!(
+                    "\"{solutions}\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+                )],
+                "{count}"
+            );
             checked += 1;
         }
     }
@@ -4297,6 +4334,173 @@ fn describe_equals_the_reference() {
     assert_eq!(checked, 1000);
 }
 
+/// Promotion, checked arithmetic and aggregate error handling at the shared numeric
+/// boundary, compared term for term across native and reference execution paths.
+#[test]
+fn numeric_expressions_and_totals_equal_the_reference() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let check = |body: String| {
+        let text = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {body}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        assert!(runs_natively(&query), "{text}");
+        assert_eq!(
+            rows(evaluate_query(&snapshot, &query, &options).unwrap(), false),
+            rows(reference(&snapshot, &query, &options).unwrap(), false),
+            "{text}"
+        );
+    };
+    let values = [
+        "0",
+        "1",
+        "-1",
+        "9223372036854775807",
+        "-9223372036854775808",
+        "1.5",
+        "-0.5",
+        "1e0",
+        "\"2.5\"^^xsd:float",
+        "\"-0\"^^xsd:float",
+        "\"INF\"^^xsd:double",
+        "\"-INF\"^^xsd:double",
+        "\"NaN\"^^xsd:float",
+        "\"NaN\"^^xsd:double",
+        "\"01\"^^xsd:int",
+        "\"bad\"^^xsd:integer",
+        "\"text\"",
+        "UNDEF",
+    ];
+    // The reference shares expression and aggregate value semantics, but evaluates
+    // groups independently of the native fast paths. Fixed value expectations below
+    // separately guard arithmetic itself.
+    for left in values {
+        check(format!(
+            "SELECT (-?a AS ?neg) (ABS(?a) AS ?abs) (CEIL(?a) AS ?ceil) \
+             (FLOOR(?a) AS ?floor) (ROUND(?a) AS ?round) {{ VALUES ?a {{ {left} }} }}"
+        ));
+        for right in values {
+            check(format!(
+                "SELECT (?a + ?b AS ?add) (?a - ?b AS ?sub) (?a * ?b AS ?mul) \
+                 (?a / ?b AS ?div) {{ VALUES (?a ?b) {{ ({left} {right}) }} }}"
+            ));
+            // Variable, memoised expression and DISTINCT/general aggregate paths.
+            for argument in ["?v", "(?v + 0)", "DISTINCT ?v"] {
+                check(format!(
+                    "SELECT (SUM({argument}) AS ?sum) (AVG({argument}) AS ?avg) \
+                     {{ VALUES ?v {{ {left} {right} }} }}"
+                ));
+            }
+        }
+    }
+    for values in ["", "UNDEF", "1 UNDEF", "1 1 2"] {
+        check(format!(
+            "SELECT (SUM(?v) AS ?sum) (AVG(?v) AS ?avg) (COUNT(?v) AS ?count) \
+             (MIN(?v) AS ?min) (MAX(?v) AS ?max) {{ VALUES ?v {{ {values} }} }}"
+        ));
+    }
+}
+
+/// Fixed expectations, independent of the shared expression evaluator and SUM/AVG
+/// helpers used by the reference. Check lexical value, datatype and unbound results.
+#[test]
+fn numeric_values_keep_their_sparql_semantics() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let check = |body: String, expected: Option<(&str, nrese_rdf::NamedNodeRef<'_>)>| {
+        let text = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {body}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let QueryResults::Solutions(mut solutions) =
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap()
+        else {
+            panic!("expected solutions: {text}");
+        };
+        let solution = solutions.next().unwrap().unwrap();
+        let expected = expected
+            .map(|(value, datatype)| Term::from(Literal::new_typed_literal(value, datatype)));
+        assert_eq!(solution.get("result"), expected.as_ref(), "{text}");
+        assert!(solutions.next().is_none(), "{text}");
+    };
+    for (expression, expected) in [
+        ("1 + 2", Some(("3", xsd::INTEGER))),
+        ("1 + 2.5", Some(("3.5", xsd::DECIMAL))),
+        ("1.0 + \"2.5\"^^xsd:float", Some(("3.5", xsd::FLOAT))),
+        ("\"2.5\"^^xsd:float + 1e0", Some(("3.5", xsd::DOUBLE))),
+        ("1 / 2", Some(("0.5", xsd::DECIMAL))),
+        ("1 / 0", None),
+        ("1.0 / 0.0", None),
+        ("1e0 / 0e0", Some(("INF", xsd::DOUBLE))),
+        ("0e0 / 0e0", Some(("NaN", xsd::DOUBLE))),
+        ("\"NaN\"^^xsd:float + 1", Some(("NaN", xsd::FLOAT))),
+        ("9223372036854775807 + 1", None),
+        ("-9223372036854775808 - 1", None),
+        ("9223372036854775807 * 2", None),
+        ("-(-9223372036854775808)", None),
+        ("ABS(-9223372036854775808)", None),
+        ("ROUND(-0.5)", Some(("0", xsd::DECIMAL))),
+        (
+            "\"PT1H\"^^xsd:dayTimeDuration + \"PT30M\"^^xsd:dayTimeDuration",
+            Some(("PT1H30M", xsd::DAY_TIME_DURATION)),
+        ),
+        ("\"text\" + 1", None),
+    ] {
+        check(format!("SELECT ({expression} AS ?result) {{}}"), expected);
+    }
+    for (values, sum, average) in [
+        ("", Some(("0", xsd::INTEGER)), Some(("0", xsd::INTEGER))),
+        (
+            "1 2",
+            Some(("3", xsd::INTEGER)),
+            Some(("1.5", xsd::DECIMAL)),
+        ),
+        (
+            "1 2.5",
+            Some(("3.5", xsd::DECIMAL)),
+            Some(("1.75", xsd::DECIMAL)),
+        ),
+        (
+            "1 \"2.5\"^^xsd:float",
+            Some(("3.5", xsd::FLOAT)),
+            Some(("1.75", xsd::FLOAT)),
+        ),
+        (
+            "1 2.5e0",
+            Some(("3.5", xsd::DOUBLE)),
+            Some(("1.75", xsd::DOUBLE)),
+        ),
+        (
+            "1 \"NaN\"^^xsd:float",
+            Some(("NaN", xsd::FLOAT)),
+            Some(("NaN", xsd::FLOAT)),
+        ),
+        ("9223372036854775807 1", None, None),
+        ("1 UNDEF", None, None),
+        ("1 \"text\"", None, None),
+        (
+            "\"P1M\"^^xsd:yearMonthDuration \"P3M\"^^xsd:yearMonthDuration",
+            Some(("P4M", xsd::YEAR_MONTH_DURATION)),
+            Some(("P2M", xsd::YEAR_MONTH_DURATION)),
+        ),
+        (
+            "\"PT1H\"^^xsd:dayTimeDuration \"PT2H\"^^xsd:dayTimeDuration",
+            Some(("PT3H", xsd::DAY_TIME_DURATION)),
+            Some(("PT1H30M", xsd::DAY_TIME_DURATION)),
+        ),
+        (
+            "\"P1M\"^^xsd:yearMonthDuration \"PT1H\"^^xsd:dayTimeDuration",
+            None,
+            None,
+        ),
+    ] {
+        for (function, expected) in [("SUM", sum), ("AVG", average)] {
+            check(
+                format!("SELECT ({function}(?v) AS ?result) {{ VALUES ?v {{ {values} }} }}"),
+                expected,
+            );
+        }
+    }
+}
+
 /// TIMEZONE and TZ of dates and times of every kind, the hashes, and IRI() resolved against
 /// the query's BASE equal the reference evaluator; RAND, UUID, STRUUID, BNODE() and NOW() have the
 /// properties SPARQL gives them (fresh per call, or one value per query).
@@ -5667,86 +5871,6 @@ fn groups_over_joins_stay_where_the_early_group_reduces_nothing() {
     let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
     assert_eq!(native, expected);
     assert_eq!(native.len(), 9);
-}
-
-/// Eager aggregation (BSBM BI q4's shape): counts, sums, extremes and averages of offers
-/// per product feature are made from per-product partial results, never from a row per
-/// feature and offer; the answers equal the reference evaluator's, also when an aggregate
-/// fails for one product (a non-numeric price), and for a group the rewrite doesn't apply
-/// to (COUNT DISTINCT).
-#[test]
-fn groups_over_joins_aggregate_before_joining() {
-    let engine = Engine::new(EngineConfig::default()).unwrap();
-    let mut tx = engine.transaction();
-    let add = |tx: &mut nrese_engine::Transaction, s: String, p: &str, o: Term| {
-        tx.insert(Quad::new(ex(&s), ex(p), o, GraphName::DefaultGraph).as_ref());
-    };
-    for product in 0..40 {
-        add(&mut tx, format!("product{product}"), "type", ex("T").into());
-        for feature in 0..(product % 5 + 1) {
-            add(
-                &mut tx,
-                format!("product{product}"),
-                "feature",
-                ex(&format!("f{}", (product + feature) % 7)).into(),
-            );
-        }
-        for offer in 0..(product % 4 + 2) {
-            let price: Term = if product == 13 && offer == 0 {
-                Literal::new_simple_literal("n/a").into()
-            } else {
-                Literal::new_typed_literal(format!("{}", product * 10 + offer), xsd::INTEGER).into()
-            };
-            add(
-                &mut tx,
-                format!("offer{product}_{offer}"),
-                "product",
-                ex(&format!("product{product}")).into(),
-            );
-            add(&mut tx, format!("offer{product}_{offer}"), "price", price);
-        }
-    }
-    tx.commit().unwrap();
-    let snapshot = engine.snapshot();
-    let oracle = QueryOptions {
-        as_written: true,
-        ..QueryOptions::default()
-    };
-    for (aggregates, rewritten) in [
-        (
-            "(COUNT(?price) AS ?n) (SUM(?price) AS ?total) (COUNT(*) AS ?rows)",
-            true,
-        ),
-        ("(AVG(?price) AS ?mean)", true),
-        (
-            "(MIN(?price) AS ?low) (MAX(DISTINCT ?price) AS ?high) (AVG(?price) AS ?mean) (COUNT(*) AS ?rows)",
-            true,
-        ),
-        (
-            "(MIN(STR(?price)) AS ?first) (AVG(?price * 1.5) AS ?scaled)",
-            true,
-        ),
-        ("(COUNT(DISTINCT ?price) AS ?prices)", false),
-    ] {
-        let text = format!(
-            "PREFIX : <{EX}> SELECT ?feature {aggregates} WHERE {{ ?product :type :T ; :feature ?feature . ?offer :product ?product ; :price ?price }} GROUP BY ?feature"
-        );
-        let query = SparqlParser::new().parse_query(&text).unwrap();
-        let explained = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
-        assert_eq!(
-            explained.rewrites.contains(&"eager-aggregation"),
-            rewritten,
-            "{aggregates}: {:?}",
-            explained.rewrites
-        );
-        let native = rows(
-            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
-            false,
-        );
-        let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
-        assert_eq!(native, expected, "{aggregates}");
-        assert_eq!(native.len(), 7);
-    }
 }
 
 /// A value of an offer for [`eager_aggregation_equals_the_reference_on_random_groups`]:

@@ -58,7 +58,7 @@ impl CancellationToken {
     }
 
     /// The flag itself, for loops that check it without knowing the token.
-    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+    pub fn flag(&self) -> Arc<AtomicBool> {
         self.0.clone()
     }
 }
@@ -260,13 +260,20 @@ impl fmt::Debug for QuerySolutionIter<'_> {
 /// The triples of a CONSTRUCT or DESCRIBE, as they are computed.
 pub struct QueryTripleIter<'a> {
     triples: Box<dyn Iterator<Item = Result<Triple, QueryEvaluationError>> + 'a>,
+    budget: Option<Arc<nrese_exec::Budget>>,
 }
 
 impl<'a> QueryTripleIter<'a> {
     pub fn new(triples: impl Iterator<Item = Result<Triple, QueryEvaluationError>> + 'a) -> Self {
         Self {
             triples: Box::new(triples),
+            budget: None,
         }
+    }
+
+    pub(crate) fn with_budget(mut self, budget: Arc<nrese_exec::Budget>) -> Self {
+        self.budget = Some(budget);
+        self
     }
 }
 

@@ -41,15 +41,29 @@ Outside the layer model: `nrese-sparql-reference` (the SPARQL evaluator written 
 |---|---|---|
 | `crates/rdf/` | The RDF model (`nrese-rdf`: IRIs, terms, quads, canonicalisation), every RDF syntax (`nrese-rdf-io`), SPARQL syntax and algebra (`nrese-sparql-syntax`), the results formats (`nrese-sparql-results`), XSD values and the OWL 2 datatype map (`nrese-xsd`), JSON (`nrese-json`). | Storage, evaluation, reasoning. |
 | `nrese-engine` | Term model and dictionary encoding (`TermId`), quad indexes in all needed permutations, LSM runs and compaction, MVCC snapshots, the commit protocol, the write-ahead log and checkpoints, bulk load, cardinality statistics. | SPARQL semantics, RDF syntax parsing, validation or reasoning rules, HTTP. |
-| `nrese-exec` | Id-level execution shared by SPARQL and reasoning: column-major id tables, merge/hash/left/anti joins, worst-case-optimal intersection, grouping and aggregation, graph closures, per-query memory budgets. It never decodes a term and depends on no NRESE crate. | Term values, storage, SPARQL or rule semantics. |
+| `nrese-exec` | Id-level tables, joins, grouping, graph closures and capacity accounting; physical worker handles and bounded batch dispatch shared by participating query and DL paths. It never decodes a term and depends on no NRESE crate. | Term values, storage, SPARQL or rule semantics; server-wide admission policy. |
 | `nrese-vector` | Vector literals' distances and indexes (exact scan, HNSW). | Terms, storage, SPARQL. |
 | `nrese-owl` | The OWL 2 structural model read from RDF or the functional syntax, its diagnostics, and the normaliser into DL-clauses (automata for role inclusions, lazy definitions). | Search, storage, rule evaluation. |
-| `nrese-dl` | The OWL 2 DL engines over `nrese-owl`'s clauses: the tableau with its portfolio, classification and realisation. | Storage, SPARQL, HTTP; when to run (the store and reasoner decide). |
+| `nrese-dl` | The OWL 2 DL engines over `nrese-owl`'s clauses: context saturation, tableau search and immutable compiled probes with fresh search state, portfolio, classification and realisation. | Storage, SPARQL, HTTP; when to run (the store and reasoner decide), query-to-assumption adaptation. |
 | `nrese-sparql` | SPARQL 1.1 query and update evaluation over an engine snapshot: the native executor (the only one) and its planner (EXPLAIN), the result cache of plan parts (its keys are plan parts, its entries id tables, and only the executor knows what a part's result depends on), query cancellation, dataset specification (`FROM`, protocol `default-graph-uri`), update-to-delta planning, result serialisation. | Commit decisions, validation, persistence, HTTP; the cache's instance and budget (the store's, as with the query memory budget). |
 | `nrese-reasoner` | Reasoning profiles, rule sets, materialisation, incremental maintenance, consistency checks, explanations. | Storage layout, HTTP, SHACL. |
 | `nrese-shacl` | Shapes-graph compilation, SHACL Core (later SHACL-SPARQL) validation, incremental validation scoped to a delta, validation reports. It reads through `nrese-sparql`'s `ReadView` and uses its value semantics, because SHACL defines its constraints through SPARQL's operators; `nrese-sparql` never depends on it ([design/shacl.md](design/shacl.md)). | Storage layout, reasoning, HTTP, when to validate and what a failure means for a commit. |
-| `nrese-store` | The operations the product offers (query, update, graph store, tell, backup/restore, stats, pinning query results), the **mutation pipeline** (plan → validate → commit), gate ordering, revision reporting, preload; one result cache per store, shared by its queries. | HTTP status codes, auth, request parsing; what a cached result is keyed by. |
+| `nrese-store` | Product operations and the **mutation pipeline** (plan → validate → commit), gates, revision reporting and preload; one result cache per store; catalog `Runtime` execution policy and shared native query budget; DL bound orchestration, candidate adaptation and completeness. | HTTP status codes, auth, request parsing; what a cached result is keyed by; generic execution kernels. |
 | `nrese-server` | Routes, content negotiation, auth backends, policy (limits, timeouts, rate limits), deployment posture, operator/console hosting, AI suggestions, mapping store errors to HTTP. | Any data semantics. It never touches the engine directly. |
+
+The runtime selects execution policy for native query computation, direct-result ID-block encoding,
+update WHERE and participating DL work. Default execution keeps serial work on its caller
+and existing parallel kernels in their current Rayon registry; it has no catalog-wide CPU cap.
+An explicit positive worker count selects a shared physical pool. Direct-result writers and their liveness callbacks stay with the caller;
+`SERVICE` callbacks run within native evaluation and have no caller-affinity guarantee.
+Generic serializers and small ASK/header encoding still run on the caller; completing
+the explicit pool does not cover all output CPU work.
+Rule materialisation, bulk spill and background storage keep their existing owners.
+This is neither a universal worker cap nor
+a whole-request memory ceiling. SPARQL owns retained ID results, their dictionary/computed
+value domain and reservations; the store decides which bound candidates require exact work.
+See [execution-core.md](design/execution-core.md) for resource lifetimes and
+[owl2-dl.md](design/owl2-dl.md#bound-results-and-exact-test-reuse-9-october) for batch reuse.
 
 ### 2.2 Data flow
 
@@ -88,7 +102,7 @@ Each crate's `lib.rs` starts with a short module doc restating its ownership. Wh
 See [ADR-0002](adr/0002-engine-storage-lsm-permutations.md) for the full rationale.
 
 - **Terms** are encoded as 64-bit `TermId`s. The top bits carry the term kind: IRI, blank node, literal, and **inline** values for canonical `xsd:integer` and `xsd:boolean`. A value is only inlined if its lexical form is canonical, so `"01"^^xsd:integer` and `"1"^^xsd:integer` stay distinct terms. This is RDF-correct, unlike QLever's value folding. Everything else goes through a dictionary (SwissTable hash index over one string arena).
-- **Quads** are `[TermId; 4]` in **seven permutations**: `SPOG POSG OSPG` answer patterns with an unbound graph, and `GSPO GPOS GOSP` answer patterns with a bound graph (including the default graph, `TermId::DEFAULT_GRAPH`). Every triple pattern is a contiguous range scan in one of them. The seventh, `GPSO`, gives executors `(?s p ?o)` sorted by subject for star joins (XC1). The inferred stack keeps `SPOG POSG OSPG PSOG`. `Snapshot::count_in` is exact without scanning, and `Snapshot::scan_sorted_in` returns a scan in a requested order.
+- **Quads** are `[TermId; 4]` in **seven permutations**: `SPOG POSG OSPG` answer patterns with an unbound graph, and `GSPO GPOS GOSP` answer patterns with a bound graph (including the default graph, `TermId::DEFAULT_GRAPH`). Every triple pattern is a contiguous range scan in one of them. The seventh, `GPSO`, gives executors `(?s p ?o)` sorted by subject for star joins (XC1). The inferred stack keeps `SPOG POSG OSPG PSOG`. `Snapshot::count_in` is exact: range bounds suffice for tombstone-free runs; tombstones add bitmap counts, and equality expansion or post-filtered access paths can require scanning. `Snapshot::scan_sorted_in` returns a scan in a requested order.
 - **Log-structured runs:** the index is a stack of immutable sorted runs, oldest (largest) first. A commit appends one small run containing inserts and tombstones. Reads k-way merge the runs covering a range (newest wins). A size-tiered compaction policy keeps O(log N) runs, with O(log N) amortised merge work per quad. Large merges run off the write path.
 - **MVCC:** a snapshot is an `Arc` of the run list plus the revision. Readers never block writers or each other. A snapshot stays valid for as long as it's held.
 - **Durability:** a redo-only write-ahead log (length + CRC32 per record, fsync policy configurable) and periodic checkpoints (atomic write-rename). Recovery = latest checkpoint + WAL replay; a torn tail is truncated. There's no RocksDB, so there's no native toolchain dependency.

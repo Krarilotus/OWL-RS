@@ -47,6 +47,59 @@ fn run(o: &Ontology, strategy: Strategy, prune: bool) -> (Classification, contex
     context::classify(o, &options).expect("Horn")
 }
 
+#[test]
+fn task_memory_is_optional_and_exhaustion_never_becomes_a_classification() {
+    let ontology = pattern(&mut Table::default(), 12);
+    for threads in [1, 4] {
+        for proofs in [false, true] {
+            let options = Options {
+                threads,
+                proofs,
+                strategy: Strategy::Split,
+                ..Options::default()
+            };
+            let unlimited = context::saturate(&ontology, &options).unwrap();
+            assert_eq!(unlimited.task_memory_bytes(), (0, 0));
+            let bounded = context::saturate(
+                &ontology,
+                &Options {
+                    budget: context::Budget {
+                        task_memory: Some(64 << 20),
+                        ..Default::default()
+                    },
+                    ..options
+                },
+            )
+            .unwrap();
+            assert_eq!(bounded.classification(), unlimited.classification());
+            let (live, peak) = bounded.task_memory_bytes();
+            assert!(live > 0 && peak >= live && peak < 64 << 20);
+            assert_eq!(
+                bounded.profile().clauses_generated,
+                unlimited.profile().clauses_generated
+            );
+            for limit in [0, 1, live / 2] {
+                assert!(
+                    matches!(
+                        context::saturate(
+                            &ontology,
+                            &Options {
+                                budget: context::Budget {
+                                    task_memory: Some(limit),
+                                    ..Default::default()
+                                },
+                                ..options
+                            }
+                        ),
+                        Err(context::Unsupported::Budget)
+                    ),
+                    "limit={limit}"
+                );
+            }
+        }
+    }
+}
+
 /// Guard (split strategy): the successors whose filler isn't certain share one
 /// empty-core context under the cautious strategy, which then holds a clause per
 /// predecessor's condition (ore_ont_9835: 3.0 M of 3.0 M clauses); split gives each

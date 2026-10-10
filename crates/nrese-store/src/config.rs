@@ -38,10 +38,19 @@ pub struct StoreConfig {
     /// unlimited. A query that asks for more than is left fails with
     /// [`StoreError::is_server_memory_limit`](crate::StoreError::is_server_memory_limit).
     pub total_query_memory_bytes: usize,
+    /// Execution policy for native SPARQL and DL (`execution.threads`). Zero keeps
+    /// serial work on its caller and uses existing parallel kernels, without a shared
+    /// CPU cap. Positive values select that many physical workers shared by the catalog.
+    /// DL task widths may narrow either policy. Rule materialisation, bulk loading and
+    /// background storage retain their existing execution owners.
+    pub execution_threads: usize,
     /// The memory the process may hold before a long operation (a materialisation, the
     /// reasoning of a commit) stops with [`StoreError::ProcessMemoryLimit`](crate::StoreError::ProcessMemoryLimit)
     /// instead of taking the machine; 0 is no limit. By default three quarters of what the
     /// process may use ([`default_process_memory_bytes`]).
+    /// This is the store's watch policy, not a write to the global process limit.
+    /// The server installs its process-wide fallback separately at startup. Disabling
+    /// this watch does not bypass a fallback explicitly installed by the process owner.
     pub process_memory_bytes: u64,
     /// Whether the process's memory may be backed by transparent huge pages (Linux;
     /// `nrese_exec::memory::set_transparent_huge_pages`): faster work over large heaps
@@ -248,6 +257,7 @@ impl StoreConfig {
             union_default_graph: false,
             geosparql_stated_only: false,
             total_query_memory_bytes: 0,
+            execution_threads: 0,
             process_memory_bytes: default_process_memory_bytes(),
             huge_pages: DEFAULT_HUGE_PAGES,
             federation: FederationConfig::default(),
@@ -281,6 +291,7 @@ impl StoreConfig {
             union_default_graph: false,
             geosparql_stated_only: false,
             total_query_memory_bytes: 0,
+            execution_threads: 0,
             process_memory_bytes: default_process_memory_bytes(),
             huge_pages: DEFAULT_HUGE_PAGES,
             federation: FederationConfig::default(),

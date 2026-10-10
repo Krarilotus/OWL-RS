@@ -151,6 +151,7 @@ fn renaming_reordering_and_redundancy_keep_the_taxonomy() {
 fn the_switches_keep_the_taxonomy() {
     let n = cases(300);
     let mut rng = Rng::new(0x2026_1003_3103);
+    let shared = nrese_exec::workers::Workers::new(4).unwrap();
     for i in 0..n {
         let (_, _, o, _) = case(&mut rng, i);
         let Some(base) = run(&o, defaults()) else {
@@ -166,6 +167,10 @@ fn the_switches_keep_the_taxonomy() {
                 threads,
                 strategy,
                 proofs,
+                budget: context::Budget {
+                    task_memory: Some(64 * 1024 * 1024),
+                    ..context::Budget::default()
+                },
                 ..Options::default()
             };
             assert_eq!(
@@ -173,6 +178,16 @@ fn the_switches_keep_the_taxonomy() {
                 Some(&base),
                 "case {i}: {threads} threads, {strategy:?}, proofs {proofs}"
             );
+            if threads > 1 {
+                let allowance = shared.limited(2);
+                let saturated =
+                    context::classify::saturate_with_workers(&o, &options, None, &allowance)
+                        .expect("sharing a narrower pool preserves the supported fragment");
+                assert!(saturated.complete(), "case {i}: narrowed pool incomplete");
+                assert_eq!(saturated.profile().threads, 2);
+                assert_eq!(saturated.profile().contexts_joins_left, 0);
+                assert_eq!(saturated.classification(), base, "case {i}: shared pool");
+            }
         }
     }
 }

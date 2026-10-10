@@ -1,0 +1,78 @@
+title = "Filtered-vector collector: ranked payload ownership and matched validation"
+status = "Office gate and ten-pair exact controls passed; approximate recall remains blocked"
+task = "docs/plan/2026-10-10-performance-campaign.md#user-request"
+pr = "https://github.com/Krarilotus/OWL-RS/pull/23"
+parent = "62ae2e0faeafea162f3a4dbf58cee9a56e8254d5"
+dirty = true
+candidate_patch_sha256 = "b9777281354c08e509572f265b73e975e65c329f03308951f829452b474843b1"
+baseline_binary_sha256 = "a1f8656ded75bf799b43d71dd86313cc8194bb0c0a270fae108aa84c36b12614"
+candidate_binary_sha256 = "730383abc043a5acab304b1515f2c0bf5935779fb0f6202079d25fd817490bf5"
+remote_artifacts = "/home/krarilotus/nrese-prep-20261009-4e8bd38/vector-repair-20261010"
+remote_results = "/home/krarilotus/nrese-prep-20261009-4e8bd38/vector-qualification-20261010"
+accepted_performance_claim = false
+
+[change]
+owner = "nrese-sparql native vector collector"
+behavior = "Merge sorted search rounds; candidates retain their probe rows; discard displaced rows and charges; combine only final winners"
+removed = "Append-only admission, final sorting and eager probe-result unions"
+preserved = "Search algorithms, budgets, strategy settings, public APIs and existing kernel/cache owners"
+production_added_including_formatting_comments = 133
+production_removed_including_formatting_comments = 59
+benchmark = "Identical --prepare-vector-graph DIM:METRIC instrumentation in both binaries, using existing snapshot preparation and search reports"
+
+[validation]
+host = "Office-PC"
+focused_tests = 22
+focused_result = "Passed: four collector, five SPARQL vector, five resource, two engine vector, six vector tests"
+normal_commit_gate = "Passed: rustfmt, Clippy, dependent compilation and affected tests"
+build_complete_utc = "2026-10-10T14:07:42Z"
+source_transfer = "Office-formatted source copied back; both frozen manifests verified after delivery to Phuoc"
+
+[measurement]
+host = "Phuoc-Yu"
+runtime = "native systemd workload services"
+workload_cpus = "1-7,9-15"
+controller_cpus = "0,8"
+governor = "temporary performance profile; all policy governors and EPP verified performance; originals restored after each case"
+boost = true
+cache_bytes = 0
+threads = "default, no --threads override"
+memory_max_bytes = 6442450944
+swap_max_bytes = 0
+graph_readiness = "dimension 64, cosine, graph=true, scanned=0, space=200000; loaded=400000"
+cohorts = "Separate allocation/correctness pass; three paired diagnostic repetitions; ten new paired qualification repetitions"
+exact_controls = ["service-exact", "probe-exact", "filtered-exact", "filtered-ranked-exact", "highfanout-exact"]
+exact_diagnostic = "All 30 processes passed full-answer and readiness checks; no change beyond predeclared statistical thresholds"
+exact_qualification = "Complete: 100 processes and 500 saved answers; all 25 query comparisons within predeclared thresholds, not proof of equivalence or a speedup"
+qualification_completed_utc = "2026-10-10T14:31:51Z"
+final_audit_utc = "2026-10-10T14:32:01Z"
+raw_outputs_hashed = 730
+raw_output_bytes = 4176686383
+restoration = "All original CPU policies/profile/holds/daemon/boost/affinity restored; no owned running workload unit or quiet lock"
+approximate_cases = ["filtered-auto", "filtered-ranked-auto", "highfanout-auto"]
+approximate_status = "All three fail the unchanged recall gate on both revisions; no timed qualification or speed credit"
+required_recall = 0.9
+first_filtered_recall_baseline = 0.54
+first_filtered_recall_candidate = 0.46
+causal_limit = "One independently built graph per process; parallel HNSW construction varies, so this first-pair difference alone does not attribute a regression to the collector"
+answer_scope = "Untimed complete replay per process; immutable prepared graph. Full bags, multiplicities, rank/score and winning-item recall checks; not every timed response"
+memory_scope = "Actual workload-cgroup lifetime peak, query-phase RSS and separate allocation pass; no per-query retained-memory claim"
+
+[evidence]
+local = "tmp/regression-cause-20261010/{vector-build-evidence,vector-qualification,vector-validation}"
+remaining = "Qualify candidate-first routing cost and robust recall; single-graph diagnostics locate missing winners before the collector. Separate adjacency allocation experiment completed exact qualification without a latency/peak-memory win. Further appreciable wiring requires a scope checkpoint"
+
+[recall_diagnostics]
+timing_credit = false
+same_graph_exposure = "All 24 available oracle winners retained; 26 absent from original search rounds at terminal K160"
+second_graph_auto_hits = 24
+second_graph_explicit_effort_256_hits = 34
+second_graph_candidate_first_hits = 50
+second_graph_exact_hits = 50
+oracle_hits = 50
+limit = "Candidate-first changes both eligibility routing and effective search effort; no equal-effort, general recall or performance claim"
+third_graph_auto_hits = 27
+third_graph_literal_effort_640_hits = 45
+third_graph_candidate_first_effective_effort_640_hits = 50
+third_graph_exact_hits = 50
+third_graph_scope = "One graph, 30 outputs; literal raw-prefix checks pass. Equal beam is not equal traversal work or memory, and this is not a timing or robust-recall qualification"

@@ -90,31 +90,6 @@ fn bulk_append_equals_a_transactional_load() {
 }
 
 #[test]
-fn parallel_batches_give_the_same_dataset() {
-    let data = quads(0..20_000);
-    let engine = Engine::new(config()).unwrap();
-    let load = engine.bulk_load(BulkMode::Append);
-    std::thread::scope(|scope| {
-        for chunk in data.chunks(2_500) {
-            let load = &load;
-            scope.spawn(move || {
-                for batch in chunk.chunks(300) {
-                    load.add(batch);
-                }
-            });
-        }
-    });
-    load.finish().expect("finish");
-    let expected: HashSet<Quad> = data.into_iter().collect();
-    assert_eq!(contents(&engine.snapshot(), ReadModel::Asserted), expected);
-    // Every interned term decodes to itself: ids assigned under concurrency are consistent.
-    let snapshot = engine.snapshot();
-    for quad in &expected {
-        assert!(snapshot.lookup_quad(quad.as_ref()).is_some(), "{quad}");
-    }
-}
-
-#[test]
 fn append_skips_existing_quads_and_makes_inferred_ones_explicit() {
     let engine = Engine::new(config()).unwrap();
     load_by_transaction(&engine, &quads(0..100));
@@ -354,9 +329,9 @@ fn new_terms_take_ids_in_input_order_whatever_the_threads() {
         ids_of(&engine, &data)
     };
     assert_eq!(reversed, in_order);
-    let parallel = |engine: &Engine| {
+    let parallel = |engine: &Engine, threads| {
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(8)
+            .num_threads(threads)
             .build()
             .unwrap();
         let load = engine.bulk_load(BulkMode::Replace);
@@ -372,9 +347,12 @@ fn new_terms_take_ids_in_input_order_whatever_the_threads() {
         load.finish().unwrap();
         ids_of(engine, &data)
     };
-    assert_eq!(parallel(&Engine::new(config()).unwrap()), in_order);
+    // Concurrent batches give the input's dataset, every term found.
+    let engine = Engine::new(config()).unwrap();
+    assert_eq!(parallel(&engine, 8), in_order);
+    let expected: HashSet<Quad> = data.iter().cloned().collect();
+    assert_eq!(contents(&engine.snapshot(), ReadModel::Asserted), expected);
     // Spilled to disk in chunks of 21 quads, each renumbered before it is sorted.
-    let dir = tempfile::tempdir().unwrap();
     let spilling = EngineConfig {
         durability: nrese_engine::DurabilityConfig {
             bulk_load_memory: Some(2048),
@@ -382,10 +360,16 @@ fn new_terms_take_ids_in_input_order_whatever_the_threads() {
         },
         ..config()
     };
-    let engine = Engine::open(dir.path(), spilling).unwrap();
-    assert_eq!(parallel(&engine), in_order);
-    let all = contents(&engine.snapshot(), ReadModel::Asserted);
-    assert_eq!(all, data.iter().cloned().collect::<HashSet<_>>());
+    for threads in [1, 2, 8] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(dir.path(), spilling).unwrap();
+        assert_eq!(parallel(&engine, threads), in_order);
+        assert_eq!(contents(&engine.snapshot(), ReadModel::Asserted), expected);
+        drop(engine);
+        let engine = Engine::open(dir.path(), spilling).unwrap();
+        assert_eq!(ids_of(&engine, &data), in_order);
+        assert_eq!(contents(&engine.snapshot(), ReadModel::Asserted), expected);
+    }
 }
 
 /// A bulk load's terms stay in the arenas they were interned into, a segment of the

@@ -24,9 +24,9 @@ owns its tests, and benchmarks never run in a gate.
 
 | Tier | When | What |
 |---|---|---|
-| `commit` | the pre-commit hook | rustfmt; clippy (warnings are errors) on the changed crates and every crate depending on them; the changed crates' fast tests |
-| `push` | the pre-push hook | the same for everything changed since the upstream branch, with all the changed crates' tests (their slow suites too), the dependents' fast tests, and the lock check |
-| `all` | milestones, merges to `main`, CI | everything: both Cargo workspaces, doc tests, the lock check, `cargo-deny` (licences, advisories, bans, sources; `deny.toml`), the console's typecheck and tests |
+| `commit` | the pre-commit hook | rustfmt; clippy (warnings are errors) on every target of changed crates; compile their dependents' libraries; run the changed crates' fast tests |
+| `push` | the pre-push hook | changes since the upstream branch: rustfmt and clippy on changed crates; all their tests (slow suites too), dependents' fast tests, additional random seeds for changed crates, and the lock check |
+| `all` | milestones, merges to `main`, CI | everything: both Cargo workspaces, doc tests, the lock check, `cargo-deny` (licences, advisories, bans, sources; `deny.toml`), benchmark-suite contract tests, the console's typecheck and tests |
 
 - A crate declares its slow test binaries (conformance suites, fuzz campaigns: over ~15 s)
   in its manifest, `[package.metadata.nrese] slow-tests = [...]`.
@@ -44,6 +44,12 @@ question, inside `scripts/quiet-slot.sh`, on `release` (`--profile lab` to itera
 holds one short measurement, since builds wait for it; long comparison runs go to a machine of
 their own. Every number names the commit its binary was built from and whether the tree was
 clean; a binary kept for comparison is rebuilt after its source changes or is reverted.
+
+Keep a separate Cargo target directory for each worktree. Share downloaded registry
+dependencies through `CARGO_HOME`, not local-package artifacts from different revisions.
+On 9 October, a shared target reused an incompatible local API across worktrees; final
+validation therefore rebuilt in isolated targets. Baseline binaries need recorded source
+and binary identities before their target is cleaned.
 
 CI (`.github/workflows/ci.yml`, the same steps on Linux) runs at milestones and on merges to
 `main`: `gh workflow run ci.yml --ref <branch>`; the Jena oracle likewise (`oracle.yml`).

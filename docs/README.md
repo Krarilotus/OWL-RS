@@ -46,3 +46,13 @@ Integrations: [ResearchSpace](integration/researchspace.md),
 Contributing: [CONTRIBUTING.md](../CONTRIBUTING.md), for agents [AGENTS.md](../AGENTS.md), [code rules](dev/code-structure-guidelines.md),
 the console: [frontend contract](dev/frontend-backend-contract.md),
 [extending it](dev/frontend-extension-guide.md).
+
+## Implementation plans and proposals
+
+[Performance and architecture, 9 October](plan/2026-10-09-performance-architecture.md):
+source-based review, authorised bounded refactoring, work packages, ownership and verification criteria.
+Not an accepted replacement for the architecture, roadmap or v2 merge checklist.
+
+[Query progress, 10 October](plan/2026-10-10-query-progress.md): proposed replacement
+of blocking cache/worker coordination, its ownership boundary and unresolved callback
+contract. Design only; not an implemented or accepted execution model.

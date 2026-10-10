@@ -149,25 +149,41 @@ fn by_representatives(
 /// (work package W4): facts and time of both closures, and the classes. A measurement,
 /// not a store operation.
 pub fn equality_report(program: &Program, snapshot: &Snapshot) -> String {
+    equality_report_until(program, snapshot, crate::eval::NEVER)
+        .unwrap_or_else(|_| "equality: stopped by the process memory limit".to_owned())
+}
+
+/// [`equality_report`] with a caller's watch. No partial measurement is returned when
+/// either closure is interrupted; the global process safety fallback still applies.
+pub fn equality_report_until(
+    program: &Program,
+    snapshot: &Snapshot,
+    stop: crate::eval::Stop<'_>,
+) -> Result<String, crate::delta::Interrupted> {
+    if stop() || crate::eval::over_memory_limit() {
+        return Err(crate::delta::Interrupted);
+    }
     let input: Vec<Triple> = asserted_by_predicate(snapshot)
         .into_iter()
         .flat_map(|(p, pairs)| pairs.into_iter().map(move |(o, s)| [s, p, o]))
         .collect();
     let started = Instant::now();
-    let replicated = batch::materialise(
-        &input,
+    let replicated = batch::materialise_owned_until(
+        input.clone(),
         &program.rules,
         program.lists.as_ref(),
         &program.schema,
-    );
+        stop,
+    )?;
     let replicated_time = started.elapsed();
     let started = Instant::now();
-    let closure = crate::representatives::materialise(
+    let closure = crate::representatives::materialise_until(
         &input,
         &program.rules,
         program.lists.as_ref(),
         &program.schema,
-    );
+        stop,
+    )?;
     let representative_time = started.elapsed();
     let classes = closure.classes.classes().count();
     let members: usize = closure.classes.classes().map(|(_, m)| m.len()).sum();
@@ -177,7 +193,7 @@ pub fn equality_report(program: &Program, snapshot: &Snapshot) -> String {
         .map(|(_, m)| m.len())
         .max()
         .unwrap_or(0);
-    format!(
+    Ok(format!(
         "equality: asserted {} | replicated closure {} facts in {:.3} s | representatives {} facts in {:.3} s, {} merges | {} classes, {} members, largest {}",
         input.len(),
         input.len() + replicated.derived.len(),
@@ -188,7 +204,7 @@ pub fn equality_report(program: &Program, snapshot: &Snapshot) -> String {
         classes,
         members,
         largest
-    )
+    ))
 }
 
 /// The asserted facts (any graph) of `snapshot` per predicate, as sorted, distinct

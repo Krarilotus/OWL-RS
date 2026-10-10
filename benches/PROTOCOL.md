@@ -34,15 +34,48 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
 - **Rulesets before times.** The OWL 2 RL rules are complete only for ground assertions over RL ontologies without punning or annotation-property axioms (OWL 2 Profiles, Theorem PR1); elsewhere they are sound only, and stores add or omit axiomatic triples and some RDFS rules. When answer counts differ between rule reasoners, compare their rulesets first: a difference there is a semantics difference, not a wrong answer.
 - **A wrong answer is a finding.** It is reported as `wrong`, never as a time. The report and the comparison list wrong answers first.
 - **No majority votes.** When references disagree, a person settles the case with a minimised witness and records it (`reasoning/dl/disputed.tsv`).
+- **Match the oracle to the task.** Exact bags preserve duplicates and RDF term
+  identity; a total order additionally permits exact sequence comparison. Unordered
+  `LIMIT`, tied ordering and other permitted nondeterminism need case-specific
+  legal-output checks. Different permitted outputs alone are not a wrong answer.
+  Keep strict mismatches and their adjudication visible. Do not silently coerce
+  numeric terms, add an ordering to the measured query, or treat equal counts as
+  complete validation. An approximate task declares its quality target before timing.
 - **Timeouts aren't answers.** An exact service never turns a timeout into "not entailed" or an empty result.
 
 ## 3. Fairness
 
-- **Same machine, same runtime.** Every system of a comparison runs on one machine, in the same container runtime, with the same memory: `JAVA_HEAP` for the JVMs, `DOCKER_MEMORY` as a cap where the machine is shared. Numbers from different machines are never compared.
+- **Same hardware opportunity, declared resource scenario.** Every system of a
+  comparison runs on the same machine and runtime. Numbers from different machines
+  are never compared. Choose the scenario before running, and do not pool scenarios:
+  - **Native capacity:** each system gets suitable documented settings and the
+    available host capacity. Do not impose an extra memory or CPU quota merely to
+    make the harness fit. Record actual heap, internal memory, thread, affinity and
+    ancestor-cgroup settings; an unlimited container can still have a limited parent.
+    `DOCKER_MEMORY=0` is the existing suite override for no added container memory cap;
+    it does not remove a JVM heap or another system's internal limit.
+  - **Matched resources:** all systems get the same explicitly selected external
+    CPU/memory envelope for that scenario. A JVM heap is part of its process memory,
+    not an equivalent envelope for a native process. Give each system appropriate
+    internal settings within that envelope and record them.
+  - **Scaling and frontiers:** vary a declared resource, concurrency, data-size or
+    quality dimension; keep the other conditions fixed. Existing capped fast cases
+    remain useful here. A boundary outcome is coverage, not a fast successful answer.
+  Isolation and client capacity are prerequisites in every scenario. If a host
+  cannot meet a case's requirements, report the blocked pairing or use a suitable
+  host for the entire comparison; do not silently shrink its input or add a cap.
 - **Every system's strengths count.** Nothing is switched off to level the field.
   - Systems with a result cache run twice: cache off (repeated runs measure evaluation), then, after a restart, cache on (what a user sending the query again sees).
   - Both lines are reported.
 - **Defaults first, tuning documented.** Each system runs with its documented defaults and the vendor's recommended settings for the workload. Any further tuning is in its adapter, with the reason, and applies to every run.
+- **The measurement infrastructure must accommodate the task.** Complete answer
+  recording and validation belong to the harness. Their CPU, memory, disk and time
+  are reported separately from the system under test, with any shared-host
+  interference disclosed. A recorder retaining every prior answer is a harness
+  defect, not a reason to truncate results, reduce the workload or omit a system.
+  Preserve raw answers and exact multiplicities; validate large answers without
+  accumulating the whole campaign in RAM. Keep validation outside timed execution
+  and label lifetime peaks that include an untimed validation replay.
 - **Regimes are compared only within themselves.** A reasoning workload names the regimes it accepts, in order of preference, and each system runs the first one it has.
   - **NRESE runs every case,** in every profile it has (RDFS variants, OWL-Horst, OWL 2 QL, RL, EL, DL). Each case keeps its own NRESE baseline. Competitors run only the cases whose semantics they support.
   - **Stores without reasoning** (QLever, Oxigraph, Virtuoso, …) run the plain-SPARQL cases. They also run a reasoning workload's queries over NRESE's closure loaded as data. That compares the query side fairly and puts a number on what reasoning in the store buys.
@@ -61,14 +94,23 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
   - 3 per pair for a check (`--runs 3`);
   - 10 for a run behind a published claim;
   - 1 only for a smoke test, which is never compared.
-- **Warm-up and cold.** Each query's first execution on a fresh server is recorded apart (`repeat` 0): it is the cold case. Then come `--query-runs` measured repeats.
+- **Warm-up and first execution.** Each query's first execution on a fresh server
+  is recorded apart (`repeat` 0), followed by `--query-runs` measured repeats. The
+  suite's preceding count query can already warm indexes, the JVM and filesystem
+  cache. This is first-query latency, not evidence of an OS-cold run; a cold-cache
+  claim needs the separately recorded cache-control procedure below.
 - **Order.** Queries run in rounds over the whole mix, each round shuffled. Repetition r uses seed `seed·1000 + r`, so every system gets the same orders, and the order is recorded in each row. The DL kit shuffles the axiom order for its robustness runs.
 - **Limits.**
   - Per load: `--timeout-s`, default 3600.
   - Per query: `--query-timeout-s`, default 300.
   - Per DL task: 300 s on the development tiers, 1,800 s on the full tiers (ORE's limit).
   - A limit is reached as `timeout`, never as a time.
-- **Memory.** The peak resident memory of the load and of the serving process; for the DL kit, per task.
+- **Memory.** Report process peak RSS, container/cgroup charged lifetime peak and
+  phase observations as different measurements. Cgroup accounting includes more
+  than process RSS. Record which processes and phases each number includes; a
+  cumulative high-water mark cannot be subtracted to obtain a phase peak. Missing
+  lifetime accounting stays unknown. Sampled observations are labelled as samples,
+  regardless of run length, and cannot establish that brief peaks were absent.
 - **Isolation.**
   - No other benchmark runs on the machine at the same time.
   - Containers that must stay up (the DMW containers on the main PC) are idle.
@@ -85,11 +127,19 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
 
 - **Per query:** the median of the measured repeats within a repetition, then the median over the repetitions.
 - **Spread:** the range of the per-repetition medians relative to their median. With one repetition, the interquartile range of the repeats. The spread is reported next to every comparison.
-- **Per pair:** the sum of the query medians (cold and repeated apart), the load time, store size, restart time and peak memory, each as a median over the repetitions.
+- **Per pair:** the sum of the query medians (first and repeated executions apart), the load time, store size, restart time and peak memory, each as a median over the repetitions.
 - **Comparing two runs or two systems:**
   - the ratio per query;
   - the geometric mean of the ratios, beside the ratio of the sums;
   - a change counts only beyond `max(10 %, the measured spread of both sides)` and beyond 2 ms (`suite.py compare`).
+  - For declared microcase comparisons, record an explicitly lower `--min-ms` floor
+    (zero is supported). Keep the repetition and noise checks. Exploratory reanalysis
+    with a new floor is labelled as such; choose the acceptance thresholds before the
+    next measurement. A below-floor change is not evidence of equivalent performance.
+  - Compare throughput directly, with lower QPS as worse, at each client width.
+    A latency floor in milliseconds cannot qualify throughput. Missing cases, widths,
+    repetitions or answers cannot disappear into an intersection of successful work;
+    expected boundary outcomes receive no timing credit.
 - **Corpora** (ORE, the W3C suites, generated ontologies):
   - solved counts;
   - median, p90, p95 and p99;
@@ -127,8 +177,13 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
 - **Before a milestone.** NRESE runs on its standard tiers and is compared against the last baseline run. The other systems rerun only where their pairs are missing or their versions changed.
 - **Cleanup**, on every machine:
   - Containers, stores and scratch go after every run.
-  - Datasets stay until the run's results are concluded, meaning its record has its findings and any reruns are done. Then `scripts/bench-cleanup.sh` removes them.
-  - When the drive has less than 100 GB free, the datasets go at once (`batch.sh` checks).
+  - Verified shared input snapshots, seeds, hashes, unique fixtures, reference
+    answers and retained results stay. Reuse these across campaigns; neither a
+    completed run nor low disk space authorizes deleting preservation copies.
+  - Remove only identified owned disposable stores, containers, scratch and
+    obsolete builds after final use. Keep caches/images needed by planned runs.
+    Legacy `batch.sh`/`bench-cleanup.sh` broad or low-disk cleanup must not manage
+    preserved inputs or another campaign's resources.
   - Installed tools and the `nrese-bench/*` images stay.
 
 ## 9. Threats to validity, and what answers them
@@ -136,9 +191,9 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
 | Threat | Answer |
 |---|---|
 | Docker Desktop's VM on Windows adds overhead to I/O and memory | every system runs under the same VM; the manifest records its limits; claim runs repeat on Linux (office PC, Draco) |
-| The OS page cache makes a second load faster | cold numbers come from the first execution on a fresh store; dataset files are read once per repetition by every system alike |
+| The OS page cache makes a second load faster | interleave fresh-store repetitions; identify OS-cold numbers only when the recorded cache-control procedure was used |
 | A load timed around `docker run` includes the container's start (a few hundred ms on Docker Desktop), which dominates the smallest tiers | the manifest records a no-op container's start (`container_start_ms`); NRESE's own load phases are in its load log; small tiers are read as start-up plus load, and claims about load speed use tiers whose loads take seconds |
-| Peak memory from `docker stats` comes about once a second and can miss a short peak | it misses peaks for every system alike; memory claims use steps that last several seconds; the process runtime (Apptainer, host processes) reads the kernel's peak resident memory instead |
+| Sampled `docker stats` can miss short peaks differently across systems | retain kernel lifetime accounting through container exit, record its scope and qualify its lifecycle; otherwise label memory as sampled/unavailable and withhold lifetime-peak claims |
 | Freshly written datasets are scanned in the background while the first runs measure (batch 1 of 3 October: YAGO tiny's load 36% slower in the suite, 3% in an interleaved A/B) | datasets are frozen and kept (`benches/datasets.toml`), not prepared before each run; repetitions are interleaved |
 | Thermal or background noise | shuffled order, repetitions, the spread reported, a noise threshold on comparisons |
 | One dataset favours one design | several workloads per task; the basics mix uses five real datasets; DL corpora are stratified |

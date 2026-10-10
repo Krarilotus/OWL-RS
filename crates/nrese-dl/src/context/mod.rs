@@ -31,6 +31,7 @@ pub mod engine;
 pub mod equality;
 pub mod horn;
 pub mod links;
+mod memory;
 pub mod profile;
 pub mod program;
 pub mod rules;
@@ -39,7 +40,8 @@ pub mod state;
 pub mod unsupported;
 
 pub use classify::{
-    Classification, Local, Options, Saturated, classify, saturate, saturate_normalised, signature,
+    Classification, Local, Options, Saturated, classify, saturate, saturate_normalised,
+    saturate_with_workers, signature,
 };
 pub use compile::Unsupported;
 pub use engine::{Budget, Strategy};

@@ -57,7 +57,7 @@ impl AppState {
         ai: AiSuggestionService,
         deployment_posture: DeploymentPosture,
     ) -> anyhow::Result<Self> {
-        let access = Arc::new(open_access(store.config(), &policy)?);
+        let access = Arc::new(open_access(store.config(), store.runtime(), &policy)?);
         let repositories =
             Arc::new(Catalog::open(store, reasoner).map_err(|error| anyhow::anyhow!(error))?);
         let state = Self {
@@ -417,15 +417,19 @@ impl AppState {
 /// policy file of `policy` imported if the state is new.
 fn open_access(
     template: &nrese_store::StoreConfig,
+    runtime: &Arc<nrese_store::Runtime>,
     policy: &PolicyConfig,
 ) -> anyhow::Result<nrese_store::access::AccessControl> {
     use anyhow::Context;
     use nrese_store::access::{AccessControl, Change, Principal};
-    let config = match template.mode {
+    let mut config = match template.mode {
         StoreMode::OnDisk => nrese_store::StoreConfig::on_disk(template.data_dir.join("system")),
         StoreMode::InMemory => nrese_store::StoreConfig::in_memory(),
     };
-    let store = StoreService::new(config).context("the system store (access state)")?;
+    config.execution_threads = template.execution_threads;
+    config.total_query_memory_bytes = template.total_query_memory_bytes;
+    let store = StoreService::with_runtime(config, Arc::clone(runtime))
+        .context("the system store (access state)")?;
     let access = AccessControl::open(store, &policy.workspace_base)
         .map_err(|error| anyhow::anyhow!("the access state: {error}"))?;
     if let Some(file) = &policy.access {

@@ -54,6 +54,30 @@ fn on() -> QueryOptions {
     }
 }
 
+#[test]
+fn a_declined_direct_writer_does_not_prepare_ql() {
+    let e = engine(STAFF);
+    let snapshot = e.snapshot();
+    let query = parse("ASK { ?x :worksFor ?y }");
+    for format in [
+        nrese_sparql::ResultsFormat::Tsv,
+        nrese_sparql::ResultsFormat::Csv,
+    ] {
+        let options = on();
+        let mut bytes = Vec::new();
+        assert!(
+            nrese_sparql::write_results(&snapshot, &query, &options, format, None, &mut bytes)
+                .is_none()
+        );
+        assert!(bytes.is_empty());
+        // A declined writer must leave witness probes cold for the actual evaluator.
+        let report = nrese_sparql::ql_report(&snapshot, &query, &options)
+            .unwrap()
+            .unwrap();
+        assert!(report.checks > 0);
+    }
+}
+
 /// The solutions, as sorted lines of `?var=value` (with repeats: bags).
 fn rows(engine: &Engine, query: &str, options: &QueryOptions) -> Vec<String> {
     let snapshot = engine.snapshot();

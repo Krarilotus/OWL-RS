@@ -17,9 +17,11 @@
 //!
 //! Datatypes (package 3.5) are concrete nodes checked by the datatype theory
 //! (`data.rs`, `crate::datatypes`); keys are DL-safe rules over the named individuals
-//! (`keys.rs`). Not yet: satisfiability caching and completion-graph reuse (3.7).
+//! (`keys.rs`). [`Base`] reuses deterministic completion state and models with rollback
+//! and fresh probe controls. General cross-probe satisfiability caching is not yet built.
 
 mod blocking;
+pub(crate) mod budget;
 mod data;
 pub(crate) mod depset;
 mod engine;
@@ -37,7 +39,7 @@ mod retract;
 mod search;
 mod telemetry;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nrese_owl::{Concept, Normalised, Ontology, Options, Term, normalise_with};
 
@@ -105,6 +107,8 @@ pub struct Config {
     /// Sizes of counted classes compared before the search ([`crate::numbers`]): a class
     /// with two sizes refutes the program without a branch.
     pub counting: bool,
+    /// Elapsed allowance, including preparation, compilation and queued portfolio work.
+    /// These stages check before and after running; compilation is not preemptible.
     pub timeout: Option<Duration>,
     /// The most memory a run may hold (its tables, indexes and arenas), in bytes.
     pub max_memory: usize,
@@ -125,6 +129,9 @@ pub struct Config {
     /// the unfolded clauses (`portfolio`), each with half the memory budget; else the
     /// unfolded clauses alone if this is off, the plain ones if cores are short.
     pub portfolio: bool,
+    /// Reusable physical workers and this operation's allowance. Portfolio variants
+    /// share them; without an owner, a standalone race creates its own workers.
+    pub workers: Option<nrese_exec::workers::Workers>,
     /// Stops the run at its next budget check, answering `GaveUp`.
     pub cancel: Option<Cancel>,
 }
@@ -154,6 +161,7 @@ impl Default for Config {
             lazy_definitions: true,
             complements: true,
             portfolio: true,
+            workers: None,
             cancel: None,
             expand_at_most_up_to: Options::default().expand_at_most_up_to,
         }
@@ -216,7 +224,16 @@ pub struct Outcome {
 
 /// Whether `ontology` is consistent.
 pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
-    let ontology = prepared(ontology);
+    let budget = budget::RunBudget::new(config);
+    consistency_with_budget(ontology, config, &budget).unwrap_or_else(|why| budget.stopped(why))
+}
+
+fn consistency_with_budget(
+    ontology: &Ontology,
+    config: &Config,
+    budget: &budget::RunBudget,
+) -> Result<Outcome, &'static str> {
+    let ontology = budget.stage(config, || prepared(ontology))?;
     // The engine reads no provenance: minimal automata.
     let options = |lazy_definitions| Options {
         expand_at_most_up_to: config.expand_at_most_up_to,
@@ -225,21 +242,27 @@ pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
         exact_provenance: false,
     };
     if !config.lazy_definitions || config.keep_model {
-        return consistency_of(
-            &ontology,
-            &normalise_with(&ontology, options(false)),
-            config,
-        );
+        let plain = budget.stage(config, || normalise_with(&ontology, options(false)))?;
+        return Ok(budget.run(config, |remaining| {
+            consistency_of(&ontology, &plain, remaining)
+        }));
     }
-    let unfolded = normalise_with(&ontology, options(true));
+    let unfolded = budget.stage(config, || normalise_with(&ontology, options(true)))?;
     if unfolded.unfolded == 0 || !config.portfolio {
-        return consistency_of(&ontology, &unfolded, config);
+        return Ok(budget.run(config, |remaining| {
+            consistency_of(&ontology, &unfolded, remaining)
+        }));
     }
-    let plain = normalise_with(&ontology, options(false));
-    if !portfolio::cores_to_spare() {
-        return consistency_of(&ontology, &plain, config);
+    let plain = budget.stage(config, || normalise_with(&ontology, options(false)))?;
+    let workers = budget.stage(config, || budget::workers(config, 2))?;
+    if workers.width() < 2 {
+        return Ok(budget.run(config, |remaining| {
+            consistency_of(&ontology, &plain, remaining)
+        }));
     }
-    portfolio::race(&ontology, &[&plain, &unfolded], config)
+    Ok(budget.run(config, |remaining| {
+        portfolio::race(&ontology, &[&plain, &unfolded], remaining, &workers)
+    }))
 }
 
 /// `ontology` with each negative assertion over a non-simple property `¬R(a, b)` as the
@@ -322,13 +345,43 @@ fn run(
     test: Option<Concept>,
     config: &Config,
 ) -> Outcome {
-    let started = Instant::now();
-    let mut program = Program::compile(ontology, normalised);
+    let budget = budget::RunBudget::new(config);
+    run_with_budget(ontology, normalised, test, config, &budget)
+        .unwrap_or_else(|why| budget.stopped(why))
+}
+
+fn run_with_budget(
+    ontology: &Ontology,
+    normalised: &Normalised,
+    test: Option<Concept>,
+    config: &Config,
+    budget: &budget::RunBudget,
+) -> Result<Outcome, &'static str> {
+    let started = budget.started;
+    // A model from the counts (docs/design/owl2-dl.md#number-reasoning-layers), checked
+    // against every axiom, answers before any search; it is compressed, so not where the
+    // caller wants the model.
+    if budget.stage(config, || {
+        test.is_none() && !config.keep_model && crate::numbers::model(ontology).is_some()
+    })? {
+        return Ok(Outcome {
+            answer: Answer::Consistent,
+            telemetry: Telemetry {
+                total: started.elapsed(),
+                ..Telemetry::default()
+            },
+            model: None,
+            features: Features::default(),
+        });
+    }
+    let mut program = budget.stage(config, || Program::compile(ontology, normalised))?;
     let test = test.map(|c| program.concept(ConceptName::Clause(c)));
-    program.ensure_tables();
+    budget.stage(config, || program.ensure_tables())?;
     let compiled = started.elapsed();
     let features = features(&program);
-    let mut engine = Engine::new(&program, config);
+    let mut engine = budget.stage(config, || Engine::new(&program, config))?;
+    // Search uses the same clock as compilation, not a fresh timeout after it.
+    engine.started = started;
     engine.stats.compile = compiled;
     let seed = match test {
         Some(c) => Seed {
@@ -346,12 +399,12 @@ fn run(
     telemetry.bytes_per_hot_node = std::mem::size_of::<graph::HotNode>() as u64;
     telemetry.bytes_per_node = (engine.g.bytes() as u64) / telemetry.peak_nodes.max(1);
     telemetry.dependency_sets = engine.deps.len() as u64;
-    Outcome {
+    Ok(Outcome {
         answer,
         telemetry,
         model,
         features,
-    }
+    })
 }
 
 fn end_is_model(answer: &Answer, _program: &Program) -> bool {

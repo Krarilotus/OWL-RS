@@ -11,6 +11,7 @@
 //! smaller than the next pattern, and otherwise by merge joins on sorted scans or hash joins.
 //! `COUNT(*)` over a single pattern reads the count from the index.
 
+mod aggregate;
 mod cache_key;
 mod cached;
 pub(crate) use cached::output_key;
@@ -26,6 +27,7 @@ mod geo;
 mod geo_formats;
 mod late;
 mod lateral;
+mod numeric;
 
 /// The reference system (an IRI) and geometry of a GeoSPARQL literal: WKT, GeoJSON or
 /// GML; `None` for other terms. EPSG:4326 is read as CRS84 (longitude first).
@@ -36,8 +38,13 @@ mod output;
 mod path_joins;
 mod paths;
 mod plan;
+mod preparation;
+pub(crate) use preparation::prepare_ql_query;
+use preparation::{ql_rewriting, semantic_pattern};
 mod pushdown;
 pub(crate) use pushdown::per_solution;
+#[cfg(test)]
+mod graph_tests;
 pub(crate) mod ql;
 mod ranges;
 mod search;
@@ -48,6 +55,7 @@ mod stream;
 mod strings;
 mod substitute;
 mod triple_terms;
+pub(crate) mod typed_results;
 pub(crate) mod value;
 mod vectors;
 mod wcoj;
@@ -59,9 +67,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
-use crate::results::{
-    CancellationToken, QueryEvaluationError, QueryResults, QuerySolutionIter, QueryTripleIter,
-};
+use crate::results::{CancellationToken, QueryEvaluationError, QueryResults};
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
@@ -71,14 +77,14 @@ use nrese_exec::join::{
 use nrese_exec::{
     Budget, BudgetExceeded, IdTable, UNDEF, computed_id, computed_index, group::group_rows,
 };
-use nrese_rdf::vocab::xsd;
-use nrese_rdf::{Literal, Term, Variable};
+use nrese_rdf::{Term, Variable};
 use nrese_sparql_syntax::Query;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
 };
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
-use nrese_xsd::{Decimal, Double, Float, Integer};
+use nrese_xsd::Integer;
+use numeric::Numeric;
 use rayon::prelude::*;
 
 /// The most numbers kept per aggregate argument between groupings ([`Context::numeric_pass`]).
@@ -92,6 +98,10 @@ const PARALLEL_RANKS: usize = 4096;
 use std::borrow::Cow;
 
 use crate::query::{PlanStep, QueryOptions};
+use aggregate::{
+    Agg, Aggregator, Number, aggregate_in_one_pass, counts_rows, finish_total, integer, integer_agg,
+};
+pub use aggregate::{average, group_concat, sum};
 use expr::Evaluator;
 use value::Value;
 
@@ -148,51 +158,7 @@ pub(crate) fn evaluate<'a>(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<QueryResults<'a>, QueryEvaluationError> {
-    let ctx = Context::new(&snapshot, options, query_dataset(query), query_base(query));
-    let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
-    let pattern = match &options.pre_bound {
-        Some(values) => {
-            // A blank node is put in as an alias IRI that stands for the node.
-            for term in values.values() {
-                if let nrese_rdf::Term::BlankNode(b) = term
-                    && let Some(id) = snapshot.lookup(term.as_ref())
-                {
-                    ctx.register_alias(substitute::alias(b.as_str()).as_str(), id.raw());
-                }
-            }
-            substitute::Values { terms: values }.top(&pattern)
-        }
-        None => pattern,
-    };
-    let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
-    match form {
-        Form::Select => {}
-        Form::Describe => {
-            let triples = ctx.describe(&solutions)?;
-            return Ok(QueryResults::Graph(QueryTripleIter::new(
-                triples.into_iter().map(Ok),
-            )));
-        }
-        Form::Ask => return Ok(QueryResults::Boolean(!solutions.table.is_empty())),
-        Form::Construct(template) => {
-            let computed = ctx.computed.into_inner();
-            let triples: Vec<_> = construct(&snapshot, computed, solutions, template).collect();
-            return Ok(QueryResults::Graph(QueryTripleIter::new(
-                triples.into_iter().map(Ok),
-            )));
-        }
-    }
-    let variables: Arc<[Variable]> = solutions.vars.clone().into();
-    let computed = ctx.computed.into_inner();
-    let table = solutions.table;
-    let rows = (0..table.len()).map(move |row| {
-        Ok((0..table.width())
-            .map(|column| decode(&snapshot, &computed, table.get(row, column)))
-            .collect::<Vec<_>>())
-    });
-    Ok(QueryResults::Solutions(QuerySolutionIter::new(
-        variables, rows,
-    )))
+    Ok(typed_results::evaluate(snapshot.into_owned(), query, options)?.into_results())
 }
 
 /// Runs `query`, recording each operator ([`PlanStep`]); returns the rewrites that changed
@@ -206,16 +172,23 @@ pub(crate) fn explain(
     let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let (pattern, form, rewrites, ql) = native_pattern(query, options, &ctx)?;
     ctx.trace = Some(RefCell::default());
-    let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
-    let steps = ctx.trace.take().unwrap_or_default().into_inner();
-    // CONSTRUCT and DESCRIBE count triples.
-    let rows = match form {
-        Form::Select | Form::Ask => solutions.table.len(),
-        Form::Describe => ctx.describe(&solutions)?.len(),
-        Form::Construct(template) => {
-            construct(snapshot, ctx.computed.into_inner(), solutions, template).count()
-        }
-    };
+    let (_, (steps, rows)) = ctx.on_workers(options.workers.as_ref(), |ctx| {
+        let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
+        ctx.check()?;
+        let steps = ctx.trace.as_ref().map(RefCell::take).unwrap_or_default();
+        // CONSTRUCT and DESCRIBE count triples, without retaining a constructed graph.
+        let rows = match form {
+            Form::Select | Form::Ask => solutions.table.len(),
+            Form::Describe => ctx.describe(&solutions)?.len(),
+            Form::Construct(template) => {
+                construct(snapshot, ctx.computed.take(), solutions, template, || {
+                    ctx.check()
+                })
+                .try_fold(0usize, |count, triple| triple.map(|_| count + 1))?
+            }
+        };
+        Ok((steps, rows))
+    })?;
     Ok((rewrites, steps, rows as u64, ql))
 }
 
@@ -248,29 +221,6 @@ type PlanParts = (
     Option<crate::ql::QlReport>,
 );
 
-/// What the QL rewriting does to `query` (`None` where it doesn't apply), without
-/// running it: the status that goes with its answers.
-pub(crate) fn ql_report(
-    snapshot: &Snapshot,
-    query: &Query,
-    options: &QueryOptions,
-) -> Result<Option<crate::ql::QlReport>, QueryEvaluationError> {
-    if ql_rewriting(query, options).is_none() {
-        return Ok(None);
-    }
-    // Only the steps before the rewriting, not the optimiser: this runs once more per
-    // query, ahead of its answers.
-    let (pattern, form) = pattern_and_form(query);
-    let rewritten;
-    let pattern = if triple_terms::has_open(pattern) {
-        rewritten = triple_terms::rewrite(pattern);
-        &rewritten
-    } else {
-        pattern
-    };
-    Ok(ql_stage(query, options, snapshot, pattern, &form).1)
-}
-
 /// A query's pattern and form.
 fn pattern_and_form(query: &Query) -> (&GraphPattern, Form<'_>) {
     match query {
@@ -281,66 +231,6 @@ fn pattern_and_form(query: &Query) -> (&GraphPattern, Form<'_>) {
         } => (pattern, Form::Construct(template)),
         Query::Describe { pattern, .. } => (pattern, Form::Describe),
     }
-}
-
-/// The QL rewriting of a query's pattern: the pattern rewritten (`None` if unchanged), and
-/// what it did (`None` where it doesn't apply). A schema with nothing to rewrite leaves the
-/// pattern unread.
-fn ql_stage(
-    query: &Query,
-    options: &QueryOptions,
-    snapshot: &Snapshot,
-    pattern: &GraphPattern,
-    form: &Form<'_>,
-) -> (Option<GraphPattern>, Option<crate::ql::QlReport>) {
-    let Some(ql) = ql_rewriting(query, options) else {
-        return (None, None);
-    };
-    let tbox = ql.tbox(snapshot, options.access.as_deref());
-    // What its `complete` refers to: the closure it rewrites over.
-    let regime = match ql.closure().lists {
-        true => crate::Regime::Owl2Rl,
-        false => crate::Regime::Owl2Ql,
-    };
-    if tbox.is_empty() {
-        let mut report = crate::ql::QlReport::default();
-        report.completeness.regime = Some(regime);
-        return (None, Some(report));
-    }
-    let (needed, set) = match form {
-        Form::Select => (None, false),
-        Form::Ask => (Some(Vec::new()), true),
-        Form::Construct(template) => {
-            let mut vars = Vec::new();
-            GraphPattern::Bgp {
-                patterns: template.to_vec(),
-            }
-            .on_in_scope_variable(|v| vars.push(v.clone()));
-            (Some(vars), true)
-        }
-        Form::Describe => (None, true),
-    };
-    // A witness the data already has wherever it folds adds nothing (design §3), asked of
-    // the data the query reads: for a reader of every graph (the cache is the store's).
-    let data = options.access.is_none().then(|| ql::DataCheck {
-        ql,
-        options: QueryOptions {
-            ql: None,
-            ..options.clone()
-        },
-    });
-    let (out, mut report) = ql::rewrite_query(
-        pattern,
-        &tbox,
-        snapshot,
-        ql.limits(),
-        needed,
-        set,
-        data.as_ref(),
-    );
-    report.completeness.regime = Some(regime);
-    let changed = report.patterns > 0;
-    (changed.then_some(out), Some(report))
 }
 
 pub use output::ResultsFormat;
@@ -356,24 +246,31 @@ pub(crate) fn write_results(
     version: Option<&'static str>,
     out: &mut dyn std::io::Write,
 ) -> Option<Result<(), crate::query::WriteResultsError>> {
+    match query {
+        Query::Construct { .. } | Query::Describe { .. } => return None,
+        Query::Ask { .. } if format != ResultsFormat::Json => return None,
+        _ => {}
+    }
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let (pattern, form, _, _) = match native_pattern(query, options, &ctx) {
         Ok(native) => native,
         Err(error) => return Some(Err(error.into())),
     };
-    match form {
-        Form::Construct(_) | Form::Describe => return None,
-        Form::Ask if format != ResultsFormat::Json => return None,
-        _ => {}
-    }
-    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
-    let solutions = match ctx.eval_root(&pattern, options.pin.as_ref()) {
-        Ok(solutions) => solutions,
+    let (ctx, solutions) = match ctx.on_workers(options.workers.as_ref(), |ctx| {
+        ctx.eval_root(&pattern, options.pin.as_ref())
+    }) {
+        Ok(result) => result,
         Err(error) => return Some(Err(QueryEvaluationError::from(error).into())),
     };
+    if let Err(error) = ctx.check() {
+        return Some(Err(QueryEvaluationError::from(error).into()));
+    }
     if matches!(form, Form::Ask) {
         let bytes = output::boolean(!solutions.table.is_empty(), version);
-        return Some(out.write_all(&bytes).map_err(Into::into));
+        return Some(out.write_all(&bytes).map_err(Into::into).and_then(|()| {
+            ctx.check()
+                .map_err(|error| QueryEvaluationError::from(error).into())
+        }));
     }
     let computed = ctx.computed.into_inner();
     let token = options.cancellation.clone();
@@ -393,7 +290,13 @@ pub(crate) fn write_results(
     };
     Some(
         writer
-            .write(&solutions.vars, &solutions.table, out, &alive)
+            .write(
+                &solutions.vars,
+                &solutions.table,
+                out,
+                &alive,
+                options.workers.as_ref(),
+            )
             .map_err(|error| {
                 if cancelled() {
                     QueryEvaluationError::Cancelled.into()
@@ -436,7 +339,7 @@ pub(crate) fn delete_insert(
     }
     let ctx = Context::new(snapshot, options, using, base);
     let pattern = optimise(pattern.clone(), &mut Vec::new(), &ctx);
-    let solutions = ctx.eval(&pattern)?;
+    let (ctx, solutions) = ctx.on_workers(options.workers.as_ref(), |ctx| ctx.eval(&pattern))?;
     let computed = ctx.computed.into_inner();
     let table = &solutions.table;
     let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
@@ -524,49 +427,22 @@ fn native_pattern<'q>(
     options: &QueryOptions,
     ctx: &Context<'_>,
 ) -> Result<NativePattern<'q>, QueryEvaluationError> {
-    let (pattern, form) = pattern_and_form(query);
+    let (_, form) = pattern_and_form(query);
     let mut rewrites = Vec::new();
-    // SPARQL 1.2 triple-term patterns with variables, as plain algebra.
-    let rewritten;
-    let pattern = if triple_terms::has_open(pattern) {
-        rewritten = triple_terms::rewrite(pattern);
-        rewrites.push("triple-terms");
-        &rewritten
-    } else {
-        pattern
-    };
-    // OWL 2 QL answers through existentials, before the optimiser, also as written: it
-    // changes the answers, not just the plan.
-    let (ql_pattern, ql_report) = ql_stage(query, options, &ctx.snapshot, pattern, &form);
-    if let Some(report) = &ql_report {
-        if report.patterns > 0 {
-            rewrites.push("ql-tree-witness");
-        }
-        if !report.limits.is_empty() {
-            rewrites.push("ql-limit");
-        }
-    }
-    let rewritten_ql;
-    let pattern = match ql_pattern {
-        Some(out) => {
-            rewritten_ql = out;
-            &rewritten_ql
-        }
-        None => pattern,
-    };
+    let (pattern, ql_report) = semantic_pattern(&ctx.snapshot, query, options, &mut rewrites)?;
     let template_supported = match &form {
         Form::Construct(template) => template.iter().all(supported_template_triple),
         _ => true,
     };
-    if !supported(pattern) || !template_supported {
+    if !supported(&pattern) || !template_supported {
         return Err(QueryEvaluationError::Unsupported(
-            unsupported_part(pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
+            unsupported_part(&pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
         ));
     }
     let pattern = if options.as_written {
-        pattern.clone()
+        pattern.into_owned()
     } else {
-        optimise(pattern.clone(), &mut rewrites, ctx)
+        optimise(pattern.into_owned(), &mut rewrites, ctx)
     };
     // ASK needs one solution: LIMIT 1 lets the evaluation stop at it.
     let pattern = match form {
@@ -581,23 +457,6 @@ fn native_pattern<'q>(
         _ => pattern,
     };
     Ok((pattern, form, rewrites, ql_report))
-}
-
-/// The QL rewriting, if it applies to `query`: on, and the query reads the inferred
-/// statements of the default graph without a dataset or pre-bound variables, by a reader
-/// who sees inferences (docs/design/ql-rewriting.md §1).
-fn ql_rewriting<'o>(
-    query: &Query,
-    options: &'o QueryOptions,
-) -> Option<&'o crate::ql::QlRewriting> {
-    let ql = options.ql.as_deref()?;
-    (options.read_model == ReadModel::Materialised
-        && options.dataset.is_none()
-        && query_dataset(query).is_none()
-        // A reader who sees no inferences gets no answers through them.
-        && options.access.as_deref().is_none_or(|a| a.inferred)
-        && options.pre_bound.is_none())
-    .then_some(ql)
 }
 
 /// The rewrites the executor applies to a query's (or an update's) pattern, in order;
@@ -703,7 +562,10 @@ fn construct<'a>(
     computed: Vec<Term>,
     solutions: Solutions,
     template: &[TriplePattern],
-) -> impl Iterator<Item = nrese_rdf::Triple> + 'a {
+    check: impl Fn() -> NativeResult<()> + 'a,
+) -> impl Iterator<Item = NativeResult<nrese_rdf::Triple>> + 'a {
+    #[cfg(test)]
+    graph_tests::checkpoint();
     let mut labels: Vec<String> = Vec::new();
     let mut resolve = |term: &TermPattern| resolve_template(term, &solutions, &mut labels);
     let resolved: Vec<[TemplateTerm; 3]> = template
@@ -723,69 +585,87 @@ fn construct<'a>(
     let mut emitted: HashSet<nrese_rdf::Triple> = HashSet::new();
     let mut buffer: Vec<nrese_rdf::Triple> = Vec::new();
     let mut row = 0;
+    let mut stopped = false;
     std::iter::from_fn(move || {
-        loop {
-            if let Some(triple) = buffer.pop() {
-                return Some(triple);
-            }
-            if row >= table.len() {
-                return None;
-            }
-            let fresh: Vec<nrese_rdf::BlankNode> = (0..fresh_count)
-                .map(|_| nrese_rdf::BlankNode::default())
-                .collect();
-            fn template_value(
-                term: &TemplateTerm,
-                column: &dyn Fn(usize) -> Option<Term>,
-                fresh: &[nrese_rdf::BlankNode],
-            ) -> Option<Term> {
-                match term {
-                    TemplateTerm::Constant(term) => Some(term.clone()),
-                    TemplateTerm::Column(c) => column(*c),
-                    TemplateTerm::Unbound => None,
-                    TemplateTerm::Fresh(i) => Some(fresh[*i].clone().into()),
-                    TemplateTerm::Triple(parts) => {
-                        let subject = match template_value(&parts[0], column, fresh)? {
-                            Term::NamedNode(n) => nrese_rdf::NamedOrBlankNode::from(n),
-                            Term::BlankNode(b) => b.into(),
-                            Term::Literal(_) | Term::Triple(_) => return None,
-                        };
-                        let Term::NamedNode(predicate) = template_value(&parts[1], column, fresh)?
-                        else {
-                            return None;
-                        };
-                        let object = template_value(&parts[2], column, fresh)?;
-                        Some(nrese_rdf::Triple::new(subject, predicate, object).into())
+        if stopped {
+            return None;
+        }
+        let next = (|| {
+            loop {
+                check()?;
+                if let Some(triple) = buffer.pop() {
+                    return Ok(Some(triple));
+                }
+                if row >= table.len() {
+                    return Ok(None);
+                }
+                let fresh: Vec<nrese_rdf::BlankNode> = (0..fresh_count)
+                    .map(|_| nrese_rdf::BlankNode::default())
+                    .collect();
+                fn template_value(
+                    term: &TemplateTerm,
+                    column: &dyn Fn(usize) -> Option<Term>,
+                    fresh: &[nrese_rdf::BlankNode],
+                ) -> Option<Term> {
+                    match term {
+                        TemplateTerm::Constant(term) => Some(term.clone()),
+                        TemplateTerm::Column(c) => column(*c),
+                        TemplateTerm::Unbound => None,
+                        TemplateTerm::Fresh(i) => Some(fresh[*i].clone().into()),
+                        TemplateTerm::Triple(parts) => {
+                            let subject = match template_value(&parts[0], column, fresh)? {
+                                Term::NamedNode(n) => nrese_rdf::NamedOrBlankNode::from(n),
+                                Term::BlankNode(b) => b.into(),
+                                Term::Literal(_) | Term::Triple(_) => return None,
+                            };
+                            let Term::NamedNode(predicate) =
+                                template_value(&parts[1], column, fresh)?
+                            else {
+                                return None;
+                            };
+                            let object = template_value(&parts[2], column, fresh)?;
+                            Some(nrese_rdf::Triple::new(subject, predicate, object).into())
+                        }
                     }
                 }
-            }
-            let column = |c: usize| decode(snapshot, &computed, table.get(row, c));
-            let value = |term: &TemplateTerm| template_value(term, &column, &fresh);
-            for [s, p, o] in &resolved {
-                let subject = match value(s) {
-                    Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
-                    Some(Term::BlankNode(b)) => nrese_rdf::NamedOrBlankNode::from(b),
-                    _ => continue,
-                };
-                let Some(Term::NamedNode(predicate)) = value(p) else {
-                    continue;
-                };
-                let Some(object) = value(o) else {
-                    continue;
-                };
-                let triple = nrese_rdf::Triple::new(subject, predicate, object);
-                let new = triple.subject.is_blank_node()
-                    || triple.object.is_blank_node()
-                    || emitted.insert(triple.clone());
-                if new {
-                    buffer.push(triple);
-                    if emitted.len() > 1024 * 1024 {
-                        emitted.clear();
+                let column = |c: usize| decode(snapshot, &computed, table.get(row, c));
+                let value = |term: &TemplateTerm| template_value(term, &column, &fresh);
+                for (index, [s, p, o]) in resolved.iter().enumerate() {
+                    if index % 256 == 0 {
+                        check()?;
+                    }
+                    let subject = match value(s) {
+                        Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
+                        Some(Term::BlankNode(b)) => nrese_rdf::NamedOrBlankNode::from(b),
+                        _ => continue,
+                    };
+                    let Some(Term::NamedNode(predicate)) = value(p) else {
+                        continue;
+                    };
+                    let Some(object) = value(o) else {
+                        continue;
+                    };
+                    let triple = nrese_rdf::Triple::new(subject, predicate, object);
+                    let new = triple.subject.is_blank_node()
+                        || triple.object.is_blank_node()
+                        || emitted.insert(triple.clone());
+                    if new {
+                        buffer.push(triple);
+                        if emitted.len() > 1024 * 1024 {
+                            emitted.clear();
+                        }
                     }
                 }
+                buffer.reverse();
+                row += 1;
             }
-            buffer.reverse();
-            row += 1;
+        })();
+        match next {
+            Ok(triple) => triple.map(Ok),
+            Err(error) => {
+                stopped = true;
+                Some(Err(error))
+            }
         }
     })
 }
@@ -1260,6 +1140,24 @@ enum GraphScope {
 }
 
 impl<'a> Context<'a> {
+    /// Transfers only native computation to its physical owner. The context is Send,
+    /// not Sync; it moves as a whole and returns with its computed-term ID domain.
+    /// Caller-owned writers and reporting callbacks never cross the thread boundary.
+    fn on_workers<R: Send>(
+        self,
+        workers: Option<&nrese_exec::workers::Workers>,
+        run: impl FnOnce(&Self) -> NativeResult<R> + Send,
+    ) -> NativeResult<(Self, R)> {
+        let compute = move || {
+            let result = run(&self)?;
+            Ok((self, result))
+        };
+        match workers {
+            Some(workers) => workers.install(compute),
+            None => compute(),
+        }
+    }
+
     /// Whether `triple` is a GeoSPARQL relation computed from geometries
     /// ([`spatial`]): not when only stated relations are read.
     fn is_spatial(&self, triple: &TriplePattern) -> bool {
@@ -3334,6 +3232,9 @@ impl<'a> Context<'a> {
     /// statements of the default graph it is the subject of; a blank node such a statement
     /// has as its object is described in turn.
     fn describe(&self, solutions: &Solutions) -> NativeResult<Vec<nrese_rdf::Triple>> {
+        #[cfg(test)]
+        graph_tests::checkpoint();
+        self.check()?;
         let (predicate, object) = (
             Variable::new_unchecked("described predicate"),
             Variable::new_unchecked("described object"),
@@ -3346,6 +3247,7 @@ impl<'a> Context<'a> {
         let mut todo = Vec::new();
         let mut out = Vec::new();
         for row in 0..table.len() {
+            self.check()?;
             for column in 0..table.width() {
                 let id = table.get(row, column);
                 if id != UNDEF && computed_index(id).is_none() && described.insert(id) {
@@ -3353,6 +3255,7 @@ impl<'a> Context<'a> {
                 }
             }
             while let Some(node) = todo.pop() {
+                self.check()?;
                 let Some(subject) = self
                     .term(node)
                     .and_then(|t| nrese_rdf::NamedOrBlankNode::try_from(t).ok())
@@ -3373,6 +3276,9 @@ impl<'a> Context<'a> {
                     statements.column(&object).expect("scanned"),
                 );
                 for r in 0..statements.table.len() {
+                    if r % 256 == 0 {
+                        self.check()?;
+                    }
                     let o_id = statements.table.get(r, o_column);
                     let (Some(Term::NamedNode(p)), Some(o)) = (
                         self.term(statements.table.get(r, p_column)),
@@ -3388,6 +3294,7 @@ impl<'a> Context<'a> {
                 self.consumed(&statements);
             }
         }
+        self.check()?;
         Ok(out)
     }
 
@@ -4023,6 +3930,17 @@ impl<'a> Context<'a> {
     // --- modifiers -----------------------------------------------------------------------
 
     fn project(&self, solutions: Solutions, variables: &[Variable]) -> Solutions {
+        if let Some(columns) = variables
+            .iter()
+            .map(|variable| solutions.column(variable))
+            .collect::<Option<Vec<_>>>()
+        {
+            return Solutions {
+                vars: variables.to_vec(),
+                table: solutions.table.project(&columns),
+                ordered: solutions.ordered,
+            };
+        }
         let columns: Vec<Vec<u64>> = variables
             .iter()
             .map(|v| match solutions.column(v) {
@@ -4755,7 +4673,7 @@ impl<'a> Context<'a> {
                 let binding = aggregator.binding(solutions, row);
                 match aggregator.evaluator.eval(expr, &binding) {
                     None => Number::Error,
-                    Some(term) => match Numeric::of(&term) {
+                    Some(term) => match Numeric::of(&Value::of(&term)) {
                         Some(number) => Number::Value(number),
                         None => Number::Other,
                     },
@@ -5237,618 +5155,6 @@ impl Probe<'_> {
         }
         Ok(())
     }
-}
-
-/// An aggregate's value: a stored or computed id, or a new term the query interns.
-enum Agg {
-    Id(u64),
-    Term(Term),
-}
-
-/// Computes aggregates over groups of rows. Thread-safe given a thread-safe `term`, so
-/// groups can be aggregated in parallel; the caller interns the results.
-struct Aggregator<'a> {
-    evaluator: &'a Evaluator,
-    term: &'a dyn Fn(u64) -> Option<Term>,
-    /// The value of an expression over one variable, per (expression, id): groups share
-    /// most of their values, and `STR(?x)` of an id is the same in each of them.
-    memo: RefCell<HashMap<(usize, u64), Option<Term>>>,
-    /// The same for SUM and AVG: the value as a number ([`Aggregator::numeric_total`]).
-    numbers: RefCell<HashMap<(usize, u64), Number>>,
-}
-
-/// An expression's value for SUM and AVG.
-#[derive(Clone, Copy)]
-enum Number {
-    Value(Numeric),
-    /// An error: SUM and AVG are unbound.
-    Error,
-    /// Not a number (a duration, or no sum): the general path decides.
-    Other,
-}
-
-impl Aggregator<'_> {
-    /// SUM (or AVG with `average`) of `expr`, an expression of one variable, over `rows`:
-    /// each id's number found once, then added up without a term per row. `None` where the
-    /// general path must decide (a value that isn't a number, a value drawn per row). BSBM
-    /// BI q4 averaged `xsd:float(xsd:string(?price))` over 154 M rows.
-    fn numeric_total(
-        &self,
-        solutions: &Solutions,
-        rows: &[usize],
-        expr: &Expression,
-        average: bool,
-    ) -> Option<Agg> {
-        if pushdown::per_solution(expr) {
-            return None;
-        }
-        let mut columns: Vec<usize> = expression_variables(expr)
-            .iter()
-            .filter_map(|v| solutions.column(v))
-            .collect();
-        columns.sort_unstable();
-        columns.dedup();
-        let [column] = columns[..] else {
-            return None;
-        };
-        let key = expr as *const Expression as usize;
-        let table = &solutions.table;
-        let mut numbers = self.numbers.borrow_mut();
-        let mut total = Some(Numeric::Integer(Integer::from(0)));
-        let mut error = false;
-        for &row in rows {
-            let number =
-                *numbers
-                    .entry((key, table.get(row, column)))
-                    .or_insert_with(|| {
-                        match self.evaluator.eval(expr, &self.binding(solutions, row)) {
-                            None => Number::Error,
-                            Some(term) => match Numeric::of(&term) {
-                                Some(number) => Number::Value(number),
-                                None => Number::Other,
-                            },
-                        }
-                    });
-            match number {
-                Number::Value(number) => total = total.and_then(|total| total.add(number)),
-                Number::Error => error = true,
-                Number::Other => return None,
-            }
-        }
-        Some(finish_total(total, error, rows.len() as u64, average))
-    }
-
-    fn binding<'s>(
-        &'s self,
-        solutions: &'s Solutions,
-        row: usize,
-    ) -> impl Fn(&Variable) -> Option<Term> + 's {
-        move |variable| (self.term)(solutions.table.get(row, solutions.column(variable)?))
-    }
-
-    /// An aggregate over one variable's ids without decoding terms, where that is exact:
-    /// COUNT always, and SUM/AVG/MIN/MAX when every value is an inline integer (whose id
-    /// order is value order). `None` means "evaluate on terms". Errors as in §18.5.1: an
-    /// unbound value makes SUM/AVG/MIN/MAX unbound, and an i64 overflow makes SUM/AVG
-    /// unbound.
-    fn aggregate_ids(
-        &self,
-        name: &AggregateFunction,
-        mut ids: Vec<u64>,
-        distinct: bool,
-    ) -> Option<Agg> {
-        let dedup = |ids: &mut Vec<u64>| {
-            let mut seen = std::collections::HashSet::with_capacity(ids.len());
-            ids.retain(|id| seen.insert(*id));
-        };
-        match name {
-            AggregateFunction::Count => {
-                ids.retain(|&id| id != UNDEF);
-                if distinct {
-                    dedup(&mut ids);
-                }
-                Some(Agg::Term(integer(ids.len() as u64)))
-            }
-            AggregateFunction::Sum
-            | AggregateFunction::Avg
-            | AggregateFunction::Min
-            | AggregateFunction::Max => {
-                if ids.contains(&UNDEF) {
-                    return Some(Agg::Id(UNDEF));
-                }
-                let values: Option<Vec<i64>> = ids
-                    .iter()
-                    .map(|&id| TermId::from_raw(id).as_inline_integer())
-                    .collect();
-                let values = values?;
-                if distinct {
-                    dedup(&mut ids);
-                }
-                let values: Vec<i64> = if distinct {
-                    ids.iter()
-                        .filter_map(|&id| TermId::from_raw(id).as_inline_integer())
-                        .collect()
-                } else {
-                    values
-                };
-                // By value: xsd:integer and derived ids are of different kinds.
-                let value = |id: &u64| TermId::from_raw(*id).as_inline_integer();
-                Some(match name {
-                    AggregateFunction::Min => {
-                        Agg::Id(ids.iter().copied().min_by_key(value).unwrap_or(UNDEF))
-                    }
-                    AggregateFunction::Max => {
-                        Agg::Id(ids.iter().copied().max_by_key(value).unwrap_or(UNDEF))
-                    }
-                    _ => {
-                        let Some(sum) = values.iter().try_fold(0i64, |acc, &v| acc.checked_add(v))
-                        else {
-                            return Some(Agg::Id(UNDEF));
-                        };
-                        if *name == AggregateFunction::Sum {
-                            Agg::Term(
-                                Literal::new_typed_literal(sum.to_string(), xsd::INTEGER).into(),
-                            )
-                        } else if values.is_empty() {
-                            Agg::Term(integer(0))
-                        } else {
-                            match Decimal::from(sum).checked_div(Decimal::from(values.len() as i64))
-                            {
-                                Some(avg) => Agg::Term(
-                                    Literal::new_typed_literal(avg.to_string(), xsd::DECIMAL)
-                                        .into(),
-                                ),
-                                None => Agg::Id(UNDEF),
-                            }
-                        }
-                    }
-                })
-            }
-            _ => None,
-        }
-    }
-
-    /// The expression's value for each of `rows`. With `distinct`, only for the first row
-    /// of each combination of the expression's variables: the repeats can't add a value.
-    fn evaluated(
-        &self,
-        solutions: &Solutions,
-        rows: &[usize],
-        expr: &Expression,
-        distinct: bool,
-    ) -> Vec<Option<Term>> {
-        let mut columns: Vec<usize> = expression_variables(expr)
-            .iter()
-            .filter_map(|v| solutions.column(v))
-            .collect();
-        columns.sort_unstable();
-        columns.dedup();
-        let table = &solutions.table;
-        let eval = |row: usize| self.evaluator.eval(expr, &self.binding(solutions, row));
-        // A value drawn per row (RAND, BNODE, ...) is drawn for every row.
-        if pushdown::per_solution(expr) {
-            return rows.iter().map(|&row| eval(row)).collect();
-        }
-        if let [column] = columns[..] {
-            // One variable: its ids stand for the rows, and the values are remembered
-            // across groups.
-            let key = expr as *const Expression as usize;
-            let mut seen = HashSet::new();
-            let mut memo = self.memo.borrow_mut();
-            return rows
-                .iter()
-                .filter(|&&row| !distinct || seen.insert(table.get(row, column)))
-                .map(|&row| {
-                    memo.entry((key, table.get(row, column)))
-                        .or_insert_with(|| eval(row))
-                        .clone()
-                })
-                .collect();
-        }
-        if !distinct || columns.is_empty() {
-            return rows.iter().map(|&row| eval(row)).collect();
-        }
-        let mut seen: HashSet<Vec<u64>> = HashSet::new();
-        rows.iter()
-            .filter(|&&row| seen.insert(columns.iter().map(|&c| table.get(row, c)).collect()))
-            .map(|&row| eval(row))
-            .collect()
-    }
-
-    fn aggregate(
-        &self,
-        solutions: &Solutions,
-        rows: &[usize],
-        aggregate: &AggregateExpression,
-    ) -> Agg {
-        match aggregate {
-            AggregateExpression::CountSolutions { distinct } => {
-                let count = if *distinct {
-                    let mut seen: Vec<Vec<u64>> =
-                        rows.iter().map(|&r| solutions.table.row(r)).collect();
-                    seen.sort_unstable();
-                    seen.dedup();
-                    seen.len()
-                } else {
-                    rows.len()
-                };
-                Agg::Term(integer(count as u64))
-            }
-            AggregateExpression::FunctionCall {
-                name,
-                expr,
-                distinct,
-            } => {
-                if let Expression::Variable(variable) = expr {
-                    let ids: Vec<u64> = match solutions.column(variable) {
-                        Some(column) => rows
-                            .iter()
-                            .map(|&r| solutions.table.get(r, column))
-                            .collect(),
-                        None => vec![UNDEF; rows.len()],
-                    };
-                    if let Some(result) = self.aggregate_ids(name, ids, *distinct) {
-                        return result;
-                    }
-                }
-                if !*distinct
-                    && matches!(name, AggregateFunction::Sum | AggregateFunction::Avg)
-                    && let Some(result) =
-                        self.numeric_total(solutions, rows, expr, *name == AggregateFunction::Avg)
-                {
-                    return result;
-                }
-                let evaluated = self.evaluated(solutions, rows, expr, *distinct);
-                // COUNT skips errors and SAMPLE takes the first value, but one error makes
-                // SUM, AVG, MIN and MAX unbound.
-                let fails_on_error =
-                    !matches!(name, AggregateFunction::Count | AggregateFunction::Sample);
-                if fails_on_error && evaluated.iter().any(Option::is_none) {
-                    return Agg::Id(UNDEF);
-                }
-                let mut values: Vec<Term> = evaluated.into_iter().flatten().collect();
-                if *distinct {
-                    // The first of each, in order.
-                    let mut seen: HashSet<&Term> = HashSet::with_capacity(values.len());
-                    let first: Vec<bool> = values.iter().map(|value| seen.insert(value)).collect();
-                    let mut first = first.into_iter();
-                    values.retain(|_| first.next().unwrap_or(false));
-                }
-                let result = match name {
-                    AggregateFunction::Count => Some(integer(values.len() as u64)),
-                    AggregateFunction::Sample => values.into_iter().next(),
-                    // The first of equal extremes.
-                    AggregateFunction::Min => values.into_iter().reduce(|best, v| {
-                        if value::order(Some(&v), Some(&best)).is_lt() {
-                            v
-                        } else {
-                            best
-                        }
-                    }),
-                    AggregateFunction::Max => values.into_iter().reduce(|best, v| {
-                        if value::order(Some(&v), Some(&best)).is_gt() {
-                            v
-                        } else {
-                            best
-                        }
-                    }),
-                    AggregateFunction::Sum => sum(&values),
-                    AggregateFunction::Avg => average(&values),
-                    AggregateFunction::GroupConcat { separator } => {
-                        group_concat(&values, separator.as_deref().unwrap_or(" "))
-                    }
-                    _ => None,
-                };
-                result.map_or(Agg::Id(UNDEF), Agg::Term)
-            }
-        }
-    }
-}
-
-/// SUM (or AVG with `average`) of `count` values adding up to `total`, as `sum` and
-/// `average` give it: unbound after an error or an overflow, AVG of none 0, of integers
-/// and decimals a decimal.
-fn finish_total(total: Option<Numeric>, error: bool, count: u64, average: bool) -> Agg {
-    let Some(total) = total.filter(|_| !error) else {
-        return Agg::Id(UNDEF);
-    };
-    if !average {
-        return Agg::Term(total.term());
-    }
-    if count == 0 {
-        return Agg::Term(integer(0));
-    }
-    let mean = match total {
-        Numeric::Integer(_) | Numeric::Decimal(_) => total
-            .decimal()
-            .and_then(|sum| sum.checked_div(Decimal::from(count as i64)))
-            .map(|mean| Numeric::Decimal(mean).term()),
-        Numeric::Float(f) => Some(Numeric::Float(f / Float::from(count as f32)).term()),
-        Numeric::Double(d) => Some(Numeric::Double(d / Double::from(count as f64)).term()),
-    };
-    mean.map_or(Agg::Id(UNDEF), Agg::Term)
-}
-
-fn counts_rows(aggregate: &AggregateExpression, scan: &ScanPattern) -> bool {
-    match aggregate {
-        AggregateExpression::CountSolutions { distinct: false } => true,
-        AggregateExpression::FunctionCall {
-            name: AggregateFunction::Count,
-            expr: Expression::Variable(v),
-            distinct: false,
-        } => scan.vars().contains(v),
-        _ => false,
-    }
-}
-
-fn integer(value: u64) -> Term {
-    Literal::new_typed_literal(value.to_string(), xsd::INTEGER).into()
-}
-
-/// An `xsd:integer` result as an inline id where it fits, else as a term.
-fn integer_agg(value: i64) -> Agg {
-    match TermId::inline_integer(value) {
-        Some(id) => Agg::Id(id.raw()),
-        None => Agg::Term(Literal::new_typed_literal(value.to_string(), xsd::INTEGER).into()),
-    }
-}
-
-/// What one pass keeps of a group's values for one aggregate.
-#[derive(Clone, Copy, Default)]
-struct Running {
-    /// Bound values.
-    count: u64,
-    sum: i64,
-    overflow: bool,
-    unbound: bool,
-    /// The smallest and largest value, with its id.
-    min: Option<(i64, u64)>,
-    max: Option<(i64, u64)>,
-}
-
-impl Running {
-    fn add(&mut self, id: u64) {
-        if id == UNDEF {
-            self.unbound = true;
-            return;
-        }
-        self.count += 1;
-        let Some(value) = TermId::from_raw(id).as_inline_integer() else {
-            return;
-        };
-        match self.sum.checked_add(value) {
-            Some(sum) => self.sum = sum,
-            None => self.overflow = true,
-        }
-        if self.min.is_none_or(|(m, _)| value < m) {
-            self.min = Some((value, id));
-        }
-        if self.max.is_none_or(|(m, _)| value > m) {
-            self.max = Some((value, id));
-        }
-    }
-}
-
-/// Every aggregate of every group in one pass over the rows, where each is `COUNT(*)`,
-/// or `COUNT`, `SUM`, `AVG`, `MIN` or `MAX` (without DISTINCT) of a variable holding only
-/// inline integers (`COUNT`: any terms): the results [`Aggregator::aggregate_ids`] gives,
-/// without a list of rows per group. `None` for other aggregates. DBpedia q12 summed 1 M
-/// goals into 35 k teams.
-fn aggregate_in_one_pass(
-    solutions: &Solutions,
-    group_of: &[u32],
-    groups: usize,
-    aggregates: &[(Variable, AggregateExpression)],
-) -> Option<Vec<Vec<Agg>>> {
-    // Per aggregate: the column it reads (`None`: the rows) and its function.
-    let mut plan: Vec<(Option<usize>, AggregateFunction)> = Vec::new();
-    for (_, aggregate) in aggregates {
-        match aggregate {
-            AggregateExpression::CountSolutions { distinct: false } => {
-                plan.push((None, AggregateFunction::Count));
-            }
-            AggregateExpression::FunctionCall {
-                name,
-                expr: Expression::Variable(variable),
-                distinct: false,
-            } => {
-                let numeric = matches!(
-                    name,
-                    AggregateFunction::Sum
-                        | AggregateFunction::Avg
-                        | AggregateFunction::Min
-                        | AggregateFunction::Max
-                );
-                if !numeric && *name != AggregateFunction::Count {
-                    return None;
-                }
-                let column = solutions.column(variable)?;
-                if numeric
-                    && !solutions.table.column(column).iter().all(|&id| {
-                        id == UNDEF || TermId::from_raw(id).as_inline_integer().is_some()
-                    })
-                {
-                    return None;
-                }
-                plan.push((Some(column), name.clone()));
-            }
-            _ => return None,
-        }
-    }
-    let mut running = vec![Running::default(); groups * plan.len()];
-    let mut rows = vec![0u64; groups];
-    for (row, &group) in group_of.iter().enumerate() {
-        let group = group as usize;
-        rows[group] += 1;
-        for (a, (column, _)) in plan.iter().enumerate() {
-            if let Some(column) = column {
-                running[group * plan.len() + a].add(solutions.table.get(row, *column));
-            }
-        }
-    }
-    Some(
-        (0..groups)
-            .map(|group| {
-                plan.iter()
-                    .enumerate()
-                    .map(|(a, (column, name))| {
-                        let r = running[group * plan.len() + a];
-                        if column.is_none() {
-                            return integer_agg(rows[group] as i64);
-                        }
-                        match name {
-                            AggregateFunction::Count => integer_agg(r.count as i64),
-                            _ if r.unbound => Agg::Id(UNDEF),
-                            AggregateFunction::Min => Agg::Id(r.min.map_or(UNDEF, |m| m.1)),
-                            AggregateFunction::Max => Agg::Id(r.max.map_or(UNDEF, |m| m.1)),
-                            _ if r.overflow => Agg::Id(UNDEF),
-                            AggregateFunction::Sum => integer_agg(r.sum),
-                            _ if r.count == 0 => Agg::Term(integer(0)),
-                            _ => match Decimal::from(r.sum)
-                                .checked_div(Decimal::from(r.count as i64))
-                            {
-                                Some(avg) => Agg::Term(
-                                    Literal::new_typed_literal(avg.to_string(), xsd::DECIMAL)
-                                        .into(),
-                                ),
-                                None => Agg::Id(UNDEF),
-                            },
-                        }
-                    })
-                    .collect()
-            })
-            .collect(),
-    )
-}
-
-/// A running numeric sum with SPARQL type promotion; `None` once a non-number appears.
-#[derive(Clone, Copy)]
-enum Numeric {
-    Integer(Integer),
-    Decimal(Decimal),
-    Float(Float),
-    Double(Double),
-}
-
-impl Numeric {
-    fn of(term: &Term) -> Option<Self> {
-        Some(match Value::of(term) {
-            Value::Integer(i) => Self::Integer(i),
-            Value::Decimal(d) => Self::Decimal(d),
-            Value::Float(f) => Self::Float(f),
-            Value::Double(d) => Self::Double(d),
-            _ => return None,
-        })
-    }
-
-    fn add(self, other: Self) -> Option<Self> {
-        use Numeric::{Decimal as D, Double as Db, Float as F, Integer as I};
-        Some(match (self, other) {
-            (I(a), I(b)) => I(a.checked_add(b)?),
-            (I(_) | D(_), I(_) | D(_)) => D(self.decimal()?.checked_add(other.decimal()?)?),
-            (I(_) | D(_) | F(_), I(_) | D(_) | F(_)) => F(self.float()? + other.float()?),
-            _ => Db(self.double() + other.double()),
-        })
-    }
-
-    fn decimal(self) -> Option<Decimal> {
-        match self {
-            Self::Integer(i) => Some(Decimal::from(i)),
-            Self::Decimal(d) => Some(d),
-            _ => None,
-        }
-    }
-
-    fn float(self) -> Option<Float> {
-        match self {
-            Self::Integer(i) => Some(Float::from(i)),
-            Self::Decimal(d) => Some(Float::from(d)),
-            Self::Float(f) => Some(f),
-            Self::Double(_) => None,
-        }
-    }
-
-    fn double(self) -> Double {
-        match self {
-            Self::Integer(i) => Double::from(i),
-            Self::Decimal(d) => Double::from(d),
-            Self::Float(f) => Double::from(f),
-            Self::Double(d) => d,
-        }
-    }
-
-    fn term(self) -> Term {
-        let (lexical, datatype) = match self {
-            Self::Integer(i) => (i.to_string(), xsd::INTEGER),
-            Self::Decimal(d) => (d.to_string(), xsd::DECIMAL),
-            Self::Float(f) => (f.to_string(), xsd::FLOAT),
-            Self::Double(d) => (d.to_string(), xsd::DOUBLE),
-        };
-        Literal::new_typed_literal(lexical, datatype).into()
-    }
-}
-
-/// GROUP_CONCAT (SPARQL 1.1 §18.5.1.7): string literals only (anything else makes the
-/// result unbound), joined in row order with the separator, as CONCAT of the values: a
-/// simple literal whatever language the values share.
-pub fn group_concat(values: &[Term], separator: &str) -> Option<Term> {
-    let mut concat = String::new();
-    for (i, value) in values.iter().enumerate() {
-        let Term::Literal(literal) = value else {
-            return None;
-        };
-        if literal.language().is_none() && literal.datatype() != xsd::STRING {
-            return None;
-        }
-        if i > 0 {
-            concat.push_str(separator);
-        }
-        concat.push_str(literal.value());
-    }
-    Some(Literal::new_simple_literal(concat).into())
-}
-
-pub fn sum(values: &[Term]) -> Option<Term> {
-    if let Some(durations) = durations(values) {
-        return calendar::sum(&durations);
-    }
-    let mut total = Numeric::Integer(Integer::from(0));
-    for value in values {
-        total = total.add(Numeric::of(value)?)?;
-    }
-    Some(total.term())
-}
-
-pub fn average(values: &[Term]) -> Option<Term> {
-    if values.is_empty() {
-        return Some(integer(0));
-    }
-    if let Some(durations) = durations(values) {
-        return calendar::average(&durations);
-    }
-    let mut total = Numeric::Integer(Integer::from(0));
-    for value in values {
-        total = total.add(Numeric::of(value)?)?;
-    }
-    let count = values.len() as i64;
-    Some(match total {
-        // SPARQL: the average of integers or decimals is a decimal.
-        Numeric::Integer(_) | Numeric::Decimal(_) => {
-            Numeric::Decimal(total.decimal()?.checked_div(Decimal::from(count))?).term()
-        }
-        Numeric::Float(f) => Numeric::Float(f / Float::from(count as f32)).term(),
-        Numeric::Double(d) => Numeric::Double(d / Double::from(count as f64)).term(),
-    })
-}
-
-/// The values, if the first is a year-month or day-time duration (`SUM` and `AVG` of
-/// durations, SEP-0002); `None` for numbers.
-fn durations(values: &[Term]) -> Option<Vec<Value>> {
-    let first = value::Value::of(values.first()?);
-    if !calendar::is_summable_duration(&first) {
-        return None;
-    }
-    Some(values.iter().map(value::Value::of).collect())
 }
 
 /// Columns of the variables `left` and `right` share, pairwise.

@@ -294,9 +294,18 @@ impl IdTable {
     pub fn dedup(&mut self) {
         let all: Vec<usize> = (0..self.width()).collect();
         self.sort_by(&all);
+        self.dedup_adjacent();
+    }
+
+    /// Equal rows are adjacent when any permutation of all columns orders the table.
+    fn dedup_adjacent(&mut self) {
         let mask: Vec<bool> = (0..self.len)
             .map(|row| {
-                row == 0 || self.compare_rows(row - 1, row, &all) != std::cmp::Ordering::Equal
+                row == 0
+                    || self
+                        .columns
+                        .iter()
+                        .any(|column| column[row - 1] != column[row])
             })
             .collect();
         self.retain_mask(&mask);
@@ -305,8 +314,8 @@ impl IdTable {
     /// Removes duplicate rows, keeping the first occurrence of each and the row order
     /// (SPARQL DISTINCT after ORDER BY). Sortedness is kept.
     pub fn dedup_preserving_order(&mut self) {
-        if self.sorted_by.len() == self.width() && self.width() > 0 {
-            self.dedup();
+        if self.width() > 0 && (0..self.width()).all(|column| self.sorted_by.contains(&column)) {
+            self.dedup_adjacent();
             return;
         }
         // A table of row numbers, hashed and compared through the columns: no row is
@@ -338,14 +347,32 @@ impl IdTable {
         self.retain_mask(&mask);
     }
 
-    /// A table with the given columns of `self`, in that order. Sortedness is kept for the
-    /// longest prefix of the sort order that survives.
-    pub fn project(&self, columns: &[usize]) -> IdTable {
-        let projected = columns.iter().map(|&c| self.columns[c].clone()).collect();
+    /// Keeps the given columns in that order, moving their buffers. Only repeated columns
+    /// are copied. O(width + output width * (sort keys + 1)), plus copied repeated columns.
+    /// Sortedness is kept for the longest prefix of the sort order that survives.
+    pub fn project(mut self, columns: &[usize]) -> IdTable {
+        if columns.len() == self.width() && columns.iter().copied().eq(0..self.width()) {
+            return self;
+        }
         let sorted_by = self
             .sorted_by
             .iter()
             .map_while(|key| columns.iter().position(|c| c == key))
+            .collect();
+        let mut remaining = vec![0usize; self.width()];
+        for &column in columns {
+            remaining[column] += 1;
+        }
+        let projected = columns
+            .iter()
+            .map(|&column| {
+                remaining[column] -= 1;
+                if remaining[column] == 0 {
+                    std::mem::take(&mut self.columns[column])
+                } else {
+                    self.columns[column].clone()
+                }
+            })
             .collect();
         IdTable {
             columns: projected,
@@ -432,10 +459,10 @@ mod tests {
             t.rows().collect::<Vec<_>>(),
             vec![vec![1, 4], vec![1, 5], vec![2, 5]]
         );
-        let p = t.project(&[1]);
+        let p = t.clone().project(&[1]);
         assert_eq!(p.column(0), &[4, 5, 5]);
         assert!(p.sorted_by().is_empty(), "column 1 alone isn't sorted");
-        let q = t.project(&[0]);
+        let q = t.clone().project(&[0]);
         assert_eq!(q.sorted_by(), &[0]);
         let mut s = t.clone();
         s.slice(1, Some(1));
@@ -443,5 +470,56 @@ mod tests {
         t.retain(|t, row| t.get(row, 1) == 5);
         assert_eq!(t.len(), 2);
         assert!(t.is_sorted_on(&[0, 1]));
+    }
+
+    #[test]
+    fn projection_moves_buffers_and_preserves_order_and_empty_rows() {
+        let original = table(&[&[1, 4], &[1, 5], &[2, 5]]).assume_sorted_by(vec![0, 1]);
+        for columns in [
+            vec![],
+            vec![0],
+            vec![1],
+            vec![1, 0],
+            vec![0, 1],
+            vec![1, 0, 1],
+        ] {
+            let input = original.clone();
+            let buffers: Vec<_> = input.columns().iter().map(|c| c.as_ptr()).collect();
+            let expected: Vec<Vec<_>> = original
+                .rows()
+                .map(|row| columns.iter().map(|&c| row[c]).collect())
+                .collect();
+            let projected = input.project(&columns);
+            assert_eq!(projected.rows().collect::<Vec<_>>(), expected);
+            assert_eq!(projected.len(), original.len());
+            for (at, &column) in columns.iter().enumerate() {
+                if !columns[at + 1..].contains(&column) {
+                    assert_eq!(projected.column(at).as_ptr(), buffers[column]);
+                }
+            }
+            assert!(projected.check_sorted(projected.sorted_by()));
+        }
+    }
+
+    #[test]
+    fn ordered_dedup_uses_any_complete_sort_order_without_gathering() {
+        let mut input = table(&[&[2, 1], &[2, 1], &[1, 2]]).assume_sorted_by(vec![1, 0]);
+        let buffers: Vec<_> = input
+            .columns()
+            .iter()
+            .map(|column| column.as_ptr())
+            .collect();
+        input.dedup_preserving_order();
+        assert_eq!(input.rows().collect::<Vec<_>>(), [vec![2, 1], vec![1, 2]]);
+        assert_eq!(input.sorted_by(), [1, 0]);
+        for (column, buffer) in input.columns().iter().zip(buffers) {
+            assert_eq!(column.as_ptr(), buffer, "dedup must not sort/gather again");
+        }
+
+        // Repeating one key does not cover the other column: equal rows need not be
+        // adjacent. Keep the hash path's first occurrence and its order in that case.
+        let mut partial = table(&[&[1, 2], &[1, 3], &[1, 2]]).assume_sorted_by(vec![0, 0]);
+        partial.dedup_preserving_order();
+        assert_eq!(partial.rows().collect::<Vec<_>>(), [vec![1, 2], vec![1, 3]]);
     }
 }

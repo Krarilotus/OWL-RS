@@ -43,8 +43,11 @@ pub use realise::{Realisation, realise};
 /// taxonomy).
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Workers; 1 runs everything on the calling thread.
+    /// Worker allowance; 1 runs on the caller only when no physical owner is supplied.
     pub threads: usize,
+    /// Reusable physical workers supplied by an embedding runtime. `threads` narrows
+    /// their allowance. Without an owner, classification creates one pool for its run.
+    pub workers: Option<nrese_exec::workers::Workers>,
     /// Classify Horn ontologies with the context core (else the tableau driver only).
     pub context_core: bool,
     /// Eliminate the fresh names resolution can eliminate ([`inline`]).
@@ -83,8 +86,11 @@ pub struct Options {
     /// left, and the classes whose saturation reaches its context aren't exact.
     pub max_join_steps: usize,
     /// The most memory the process may hold while the context core runs (bytes; `None`:
-    /// three quarters of what the machine or container has).
+    /// three quarters of what the machine or container has; `Some(0)`: disabled).
     pub max_memory: Option<u64>,
+    /// Capacity budget of each context saturation, independent of the process ceiling.
+    /// `None` disables task accounting. The tableau's per-worker limit remains in `tableau`.
+    pub task_memory: Option<usize>,
     /// The context core takes functional properties with its Eq rule
     /// ([`crate::context::Options::equality`]).
     pub equality: bool,
@@ -93,6 +99,13 @@ pub struct Options {
 }
 
 impl Options {
+    pub(crate) fn workers(&self) -> nrese_exec::workers::Workers {
+        self.workers.as_ref().map_or_else(
+            || Workers::new(self.threads.max(1)).unwrap_or_else(|_| Workers::serial()),
+            |workers| workers.limited(self.threads.max(1)),
+        )
+    }
+
     /// The context core's options for a run of the driver within `budget` (no proofs).
     pub(crate) fn core(&self, budget: crate::context::Budget) -> crate::context::Options {
         crate::context::Options {
@@ -110,6 +123,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             threads: 1,
+            workers: None,
             context_core: true,
             inline: true,
             horn_lower_bound: true,
@@ -138,6 +152,7 @@ impl Default for Options {
             max_join: 1 << 20,
             max_join_steps: 1 << 16,
             max_memory: None,
+            task_memory: None,
             equality: false,
             // No lazy unfolding: it under-approximates the unfolded classes in a model, and
             // the driver reads its subsumers off model labels. No proofs are read here, so
@@ -204,7 +219,9 @@ impl Deadline {
             // allocation failure would end the process (ore_ont_9724 under equality).
             max_memory: options
                 .max_memory
-                .or_else(|| nrese_exec::memory::available_bytes().map(|b| b / 4 * 3)),
+                .or_else(|| nrese_exec::memory::available_bytes().map(|b| b / 4 * 3))
+                .filter(|&bytes| bytes != 0),
+            task_memory: options.task_memory,
         }
     }
 
@@ -232,39 +249,15 @@ pub(crate) fn trace(what: &str) {
     }
 }
 
-/// The workers of a run: the calling thread alone for one, else a pool of their own
-/// (never rayon's global pool, so a run uses the threads it was given).
-pub(crate) struct Workers(Option<rayon::ThreadPool>);
-
-impl Workers {
-    pub(crate) fn new(threads: usize) -> Self {
-        if threads <= 1 {
-            return Self(None);
-        }
-        Self(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .ok(),
-        )
-    }
-
-    /// `f` of each item, in order.
-    pub(crate) fn map<T: Sync, R: Send>(
-        &self,
-        items: &[T],
-        f: impl Fn(&T) -> R + Sync + Send,
-    ) -> Vec<R> {
-        use rayon::prelude::*;
-        match &self.0 {
-            Some(pool) => pool.install(|| items.par_iter().map(&f).collect()),
-            None => items.iter().map(f).collect(),
-        }
-    }
-}
+use nrese_exec::workers::Workers;
 
 /// Classifies `ontology`.
 pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
+    let mut owned = options.clone();
+    let workers = options.workers();
+    owned.threads = workers.width();
+    owned.workers = Some(workers.clone());
+    let options = &owned;
     let started = Instant::now();
     let deadline = Deadline::new(options.timeout);
     let classes = crate::context::signature(ontology);
@@ -277,8 +270,13 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
     if options.context_core {
         let core = options.core(deadline.budget(options, None));
         let t = Instant::now();
-        if let Ok(saturated) = crate::context::saturate_normalised(&normalised, &classes, &core)
-            && saturated.complete()
+        if let Ok(saturated) = crate::context::classify::saturate_normalised_with_workers(
+            &normalised,
+            &classes,
+            &core,
+            options.tableau.cancel.clone(),
+            &workers,
+        ) && saturated.complete()
         {
             let classification = saturated.classification();
             let profile = Profile {
@@ -326,4 +324,28 @@ pub(crate) fn classify_normalised(
     deadline: Deadline,
 ) -> Taxonomy {
     driver::Driver::new(ontology, normalised, classes, options, deadline).classify()
+}
+
+#[cfg(test)]
+mod memory_policy_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_zero_disables_the_watch_instead_of_selecting_the_auto_default() {
+        let deadline = Deadline::new(None);
+        let mut options = Options {
+            max_memory: Some(0),
+            ..Options::default()
+        };
+        assert_eq!(deadline.budget(&options, None).max_memory, None);
+        options.max_memory = Some(1);
+        assert_eq!(deadline.budget(&options, None).max_memory, Some(1));
+        options.max_memory = None;
+        assert_eq!(
+            deadline.budget(&options, None).max_memory,
+            nrese_exec::memory::available_bytes()
+                .map(|b| b / 4 * 3)
+                .filter(|&b| b != 0)
+        );
+    }
 }

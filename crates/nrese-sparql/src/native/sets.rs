@@ -121,16 +121,12 @@ impl Context<'_> {
             .filter(|&column| needed.contains(&solutions.vars[column]))
             .collect();
         let rows = solutions.table.len();
+        self.consumed(&solutions);
         let mut table = if kept.is_empty() {
             // No column left: one row if there was any.
             IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows.min(1)))
-        } else if kept.len() == solutions.vars.len() {
-            self.consumed(&solutions);
-            solutions.table
         } else {
-            let projected = solutions.table.project(&kept);
-            self.consumed(&solutions);
-            projected
+            solutions.table.project(&kept)
         };
         if !kept.is_empty() {
             table.dedup_preserving_order();
