@@ -68,6 +68,12 @@ comparator also `hangs`, `unsupported` and `not expressible`.
   skips the slot for counts; it is not a way to accept timings under compiler contention.
 - **Memory:** the container's peak (cgroup `memory.peak`) and the process's (`VmHWM`), after
   the load, after reasoning and at the end.
+  In-process client cases retain latency samples per completed request. Their peaks
+  include the harness and grow with completed work; lower throughput can lower the
+  measured peak without reducing engine memory. Interpret these alongside QPS.
+  Single-level clients and client sweeps both retain per-width throughput in compact
+  reports. Older full reports can recover single-level QPS from the raw result;
+  older compact records without that result require their verified full report.
 - **Repetitions:** `--reps 2` by default, interleaved: every case once, then every case
   again in an order rotated by one. Within a repetition the perf lab repeats its
   measurements (`--runs`, `--reason-runs`, `repeat`) and keeps every sample.

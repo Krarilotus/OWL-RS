@@ -4,6 +4,7 @@ import contextlib
 import copy
 import io
 import json
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -81,6 +82,41 @@ def comparison(base, new, **options):
 
 
 class FastComparison(unittest.TestCase):
+    def test_single_client_level_survives_measurement_and_compaction(self):
+        clients = {"clients": 32, "qps": 100, "p99_ms": 1, "memory": {"peak_mib": 64}}
+        case = {"name": "single", "data": "none", "args": ["--clients", "32"],
+                "queries": "", "metric": "clients.p99_ms", "cap_gb": 2}
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+
+            def measured(*args, **kwargs):
+                (scratch / "single.json").write_text(json.dumps({"clients": clients}))
+                return 0, "", "", 1
+
+            with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", measured):
+                record = fast.measure(case, "single", 1, {}, {}, "none")
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["throughput"][0]["qps"], 100)
+        self.assertEqual(fast.compact_record(record)["throughput"], record["throughput"])
+        self.assertEqual(record["throughput"], fast.client_throughput({"client_sweep": [clients]}))
+        clients.pop("memory")
+        self.assertIsNone(fast.client_throughput({"clients": clients})[0]["qps_per_gb"])
+
+    def test_old_full_single_level_report_cannot_hide_lower_qps_behind_faster_tail(self):
+        base, new = report(1), report(0.5)
+        for data, qps in ((base, 100), (new, 50)):
+            for record in data["records"]:
+                record["result"] = {"clients": {"clients": 32, "qps": qps, "p99_ms": record["metric"]}}
+        code, text = comparison(base, new)
+        self.assertEqual(code, 1)
+        self.assertIn("32 clients QPS: 100 -> 50", text)
+        self.assertIn("LOWER QPS", text)
+        self.assertIn("faster", text)
+        new["records"][1]["throughput"] = []
+        code, text = comparison(base, new)
+        self.assertEqual(code, 1)
+        self.assertIn("QPS: NOT COMPARABLE", text)
+
     def test_lost_case_fails_but_added_case_is_not_a_regression(self):
         empty = {"reps": 3, "records": []}
         code, text = comparison(report(), empty)
@@ -89,6 +125,52 @@ class FastComparison(unittest.TestCase):
         code, text = comparison(empty, report())
         self.assertEqual(code, 0)
         self.assertIn("without baseline", text)
+
+    def test_missing_client_evidence_on_both_sides_is_unqualified(self):
+        for raw, explicit in ((True, True), (True, False), (False, False)):
+            with self.subTest(raw=raw, explicit=explicit):
+                data = report()
+                for record in data["records"]:
+                    record["case"] = "clients-lookups"
+                    if raw:
+                        record["result"] = {"clients": {"clients": 32}}
+                    if explicit:
+                        record["throughput"] = []
+                code, text = comparison(data, copy.deepcopy(data))
+                self.assertEqual(code, 1)
+                self.assertIn("QPS: NOT COMPARABLE", text)
+
+    def test_explicit_throughput_owns_incomplete_raw_and_failed_status(self):
+        data = report(qps={32: 100})
+        for record in data["records"]:
+            record["result"] = {"clients": {"clients": 32}}
+        self.assertEqual(comparison(data, copy.deepcopy(data))[0], 0)
+        for record in data["records"]:
+            record["status"] = "failed"
+            record["throughput"] = []
+        code, text = comparison(data, copy.deepcopy(data))
+        self.assertEqual(code, 1)
+        self.assertIn("failed checks/status", text)
+
+    def test_duplicate_width_cannot_replace_a_missing_repetition(self):
+        data = report(qps={32: 100})
+        data["records"][0]["throughput"] *= 2
+        data["records"][1]["throughput"] = []
+        code, text = comparison(data, copy.deepcopy(data))
+        self.assertEqual(code, 1)
+        self.assertIn("QPS: NOT COMPARABLE", text)
+
+    def test_same_missing_width_on_both_sides_is_not_intersected_away(self):
+        for raw in (True, False):
+            data = report(qps={1: 100})
+            for record in data["records"]:
+                if raw:
+                    record["result"] = {"client_sweep": [{"clients": 1}, {"clients": 8}]}
+                else:
+                    record["samples"] = {"1 clients p99": [1], "8 clients p99": [1]}
+            code, text = comparison(data, copy.deepcopy(data))
+            self.assertEqual(code, 1)
+            self.assertIn("8 clients QPS: NOT COMPARABLE", text)
 
     def test_matching_failures_never_acquire_a_timing_verdict(self):
         for status in ("failed", "wrong", "off-route", "timeout", "unsupported"):
