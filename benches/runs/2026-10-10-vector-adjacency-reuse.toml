@@ -1,0 +1,62 @@
+id = "2026-10-10-vector-adjacency-reuse"
+kit = "fast"
+purpose = "Replace repeated HNSW adjacency clones with routine-owned reusable storage; preserve exact search behavior and qualify affected paths"
+baseline = "Collector candidate: parent 62ae2e0 plus patch b9777281354c08e509572f265b73e975e65c329f03308951f829452b474843b1"
+findings = "Preparation allocation calls and cumulative traffic fall in the separate instrumented cohort. All exact controls pass; no detected regression in ten new pairs. No qualified latency or peak-memory improvement. Auto recall remains failed and receives no query speed credit."
+host = "Phuoc-Yu"
+commit = "62ae2e0faeafea162f3a4dbf58cee9a56e8254d5"
+dirty = true
+publishable = "all"
+task = "docs/plan/2026-10-10-performance-campaign.md#user-request"
+results = "/home/krarilotus/nrese-prep-20261009-4e8bd38/adjacency-qualification-20261010"
+candidate_patch_sha256 = "a6a643962ae268969320bdc10f92a178a03c90a7dffa581626a8e5aa1948ccdc"
+baseline_binary_sha256 = "730383abc043a5acab304b1515f2c0bf5935779fb0f6202079d25fd817490bf5"
+candidate_binary_sha256 = "ebf996415404aa05259d9707a37f8545f6b2cdd230b81e2cdf5f9f180696572c"
+
+[change]
+owner = "nrese-vector HNSW traversal"
+production_added = 16
+production_removed = 12
+test_lines = 36
+reuse = "One Vec per greedy/search_level invocation, populated through the existing adjacency lock and released on routine return"
+preserved = "Graph representation, visit order, distance bits, acceptance calls, search settings, algorithms and public APIs"
+risk = "An oversized imported adjacency retains its reusable capacity until the routine returns"
+
+[validation]
+build_host = "Office-PC"
+normal_gate = "Passed: formatting, Clippy, dependent compilation and affected tests; one release artifact frozen"
+frozen_graph_configurations = 432
+frozen_graph_result = "Exact ordered IDs, distance bits and acceptance traces match"
+allocation_processes = 16
+diagnostic_processes = 30
+qualification_processes = 100
+qualification_outer_pairs = 10
+qualification_result = "All five exact families and cross-family projections pass full bags, ranks and scores; 25 measured-query and 25 first-execution comparisons plus family sums show no detected regression"
+families = ["service-exact", "probe-exact", "filtered-exact", "filtered-ranked-exact", "highfanout-exact"]
+approximate_status = "All six Auto allocation-cohort quality checks fail the unchanged 0.90 recall requirement; not timed for performance acceptance"
+statistical_scope = "Existing two-level bootstrap, 1000 rounds, seed 1, 95% interval; max(10%, both spreads), zero absolute floor; separate fresh qualification, no pooling with diagnostics"
+limits = "No detected regression is not equivalence; small upward memory observations remain in the report. Independent graph builds do not establish identical topology."
+
+[controls]
+scenario = "Matched-resource kernel regression check; not a native-capacity competitor ranking"
+runtime = "Native systemd services"
+workload_cpus = "1-7,9-15"
+controller_cpus = "0,8"
+memory_max_bytes = 6442450944
+swap_max_bytes = 0
+cache_bytes = 0
+threads = "Default; no explicit worker pool"
+readiness = "Existing synchronous graph preparation in both binaries, before timed queries"
+cpu_policy = "Temporary performance profile and boost enabled; all original settings restored"
+memory = "Actual workload-cgroup lifetime peaks; separate preparation/query phase RSS and instrumented cumulative allocation traffic"
+timing = "First execution is not OS-cold; answer validation replay is outside query timing but inside lifetime memory"
+
+[preservation]
+raw_answers = 730
+raw_answer_bytes = 4176666395
+raw_location = "Phuoc results root; remotely rehashed and retained, no duplicate full local download"
+local_evidence = "tmp/regression-cause-20261010/adjacency-qualification"
+final_audit_utc = "2026-10-10T15:16:17Z"
+slot_release_utc = "2026-10-10T15:18:18Z"
+cleanup = "No owned running service, workload, lock or profile hold; no new target, dataset copy or persistent scratch"
+reclaimed_bytes = 0

@@ -272,22 +272,27 @@ Read replicas ([replication.md](replication.md)); both sides need an on-disk sto
 
 ## CPU execution
 
-`execution.threads` (`NRESE_EXECUTION_THREADS`, default `0`) sets the physical pool
-shared by native SPARQL execution, direct-result ID-block encoding, update WHERE evaluation and DL
-search across all repositories and the system store. `0` uses available parallelism;
-`1` serialises this work on one shared worker. DL operations may narrow the pool with
-`dl.threads`; nested tests reuse it. Pool creation retries with one worker on failure;
-if that also fails, opening the runtime fails instead of running unbounded caller work.
+`execution.threads` (`NRESE_EXECUTION_THREADS`, default `0`) selects execution policy.
+With `0`, serial native evaluation and encoding stay on their caller; existing parallel
+kernels use the current Rayon registry (the global registry outside a worker). Opening
+a store does not create a dedicated pool. This mode has no catalog-wide CPU cap.
+Positive values select a physical pool shared by native SPARQL execution, direct-result
+ID-block encoding, update WHERE and DL search across the catalog. `1` serialises this
+participating work on one shared worker. DL operations may narrow either policy with
+`dl.threads`. Configured pool creation retries with one worker on failure; if that also
+fails, opening the runtime fails instead of silently changing execution policy.
 
-This is a CPU execution boundary, not a ceiling on every server thread. Request parsing,
+An explicit pool is not a ceiling on every server thread. Request parsing,
 planning, rule materialisation, bulk spill and background storage retain their existing
 owners. The separate spill pool avoids waiting for its own producer. No tenant fairness,
 NUMA placement or distributed admission policy is implied. Embedded applications may
-share `nrese_store::Runtime` explicitly; independent stores otherwise own separate pools.
+share `nrese_store::Runtime` explicitly; independent stores with positive limits otherwise
+own separate pools. Algorithm selection and kernel parallelism remain with their owners;
+selecting automatic execution is not a new adaptive cost model.
 Worker handles limit participating dispatch, not arbitrary nested Rayon work. Writers and
 liveness callbacks remain on their caller; direct encoding returns owned byte windows before
 output can block. Generic serializers (including XML and retained DL results), ASK documents
-and headers still encode on the caller: output CPU ownership is incomplete.
+and headers still encode on the caller: the explicit pool does not cover all output CPU work.
 `SERVICE` callbacks run inside evaluation, without a caller-affinity guarantee.
 
 ## Budgets

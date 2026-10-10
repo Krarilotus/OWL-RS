@@ -1,4 +1,4 @@
-# Performance and architecture: discussion proposal
+# Performance and architecture: implementation plan
 
 Status: **implementation and a PR to `refactor/engine-v2` authorised; in progress**.
 Reuse existing owners and code. Material new scope, unresolved semantics and actual
@@ -13,13 +13,20 @@ authorised the worker/runtime implementation following the scheduling discussion
 Prepared 9 October 2026 on `plan/engine-v2-performance-architecture`, based on
 `refactor/engine-v2` at `6b81ccb5baebdb72daf8eb3216378a6f00ed3e6c`.
 
-Runtime checkpoint, 9 October: retain the current CPU execution boundary. The
+**Current direction, 10 October:** the owner rejected mandatory default pool entry
+and authorised its selective rewind. Default execution keeps serial work on its
+caller and parallel kernels in the current registry; explicitly selected positive
+worker counts retain their pool. Measure recovery against `4e8bd38`, preserve
+independent correctness repairs, and fix each remaining cause in its owning layer.
+The following 9 October checkpoints explain rejected proposals, not today's default.
+
+Historical runtime checkpoint, 9 October: retain the current CPU execution boundary. The
 FIFO caller-budget prototype was rejected on measured parallel-workload regressions;
 the proposed encoder-only caller bypass is not authorised. Discuss the ownership
 design before implementing another alternative; no caller bypass enters production.
 
 The later single-block worker-coalescing proposal is also **discussion only**.
-Today a direct SELECT evaluates on the pool, returns to its caller, re-enters the
+In that pooled checkpoint a direct SELECT evaluates on the pool, returns to its caller, re-enters the
 pool for encoding, then returns for writing. The proposed SPARQL-owned return
 variant would carry either encoded bytes or the existing deferred result, so small
 results need one pool entry. Writers and liveness callbacks remain on their caller;
@@ -50,8 +57,9 @@ The aim is to make existing capabilities faster, cheaper to run, and easier to m
 Improve the amount of work first, its representation second, and its machine execution
 third. Preserve semantics, compatibility and the measured wins already in the repository.
 
-This proposal follows source and history inspection, not a new benchmark campaign.
-Potential gains below are hypotheses until measured. The original refactor checkout has
+The initial proposal followed source and history inspection. The subsequent
+[checkpoint campaign](2026-10-10-performance-campaign.md) now supplies regression
+evidence; unmeasured gains below remain hypotheses. The original refactor checkout has
 an unfinished merge of `dl/classify` at `4c5bc56`, including number-module changes and a
 conflict in `docs/design/performance.md`. With the owner's approval, the isolated branch
 incorporates that branch in `0f46563`, retaining both performance-log additions. The
@@ -553,44 +561,93 @@ Retain multiple algorithms when each wins for a meaningful input/resource region
 selection policy and shared semantics need one owner; the algorithms themselves are not
 redundant simply because they compute the same answer.
 
-## 7. Suggested sequence and discussion decisions
+## 7. Ordered design and implementation gates, 10 October
 
-1. **First batch: P0 and P1.** Reconcile the base and establish the cross-path
-   contracts. Three bounded repairs rather than a broad architecture rewrite.
-2. **Second batch: P2 and P3.** Remove repeated preparation and bound-query work. These have
-   direct source evidence and narrow measurable acceptance criteria.
-3. **Profile-led batch: P4/P5/P6/P7.** Prioritise by measured end-to-end cost, bytes and tails;
-   independent owners can work in parallel on separate branches and shared read-only data.
-   Pool/resource changes require coordination across owners.
-4. **P8 in bounded slices**, after P2; bring forward a slice only if it removes a measured
-   bottleneck or materially simplifies a needed change. P9 accompanies every batch.
-5. **Final integration:** the repository's milestone gate, performance comparison, soak,
-   documentation reconciliation and maintainer review. The user explicitly authorises
-   implementation pushes and the parent PR to `refactor/engine-v2`; final merge remains
-   with the maintainer. Hooks and evidence gates still apply.
+This sequence supersedes the original batch order for the remaining work. Completed
+P1–P4 repairs stay individually auditable. The owner requests structure first, followed
+by aggressive optimisation; each structural slice still needs performance validation.
+Do not finish a large speculative framework before discovering its execution cost.
+The [campaign task](2026-10-10-performance-campaign.md#user-request) remains the
+continuation reference. This section orders work; the canonical architecture and
+component designs continue to own contracts, and STATUS owns implementation state.
 
-Each package supplies: problem and owner; current contract; work to remove; expected cost
-change; correctness guard; performance result or explicit lack of one; deleted old paths;
-documentation changes; residual limitations. No calendar estimate precedes the baselines.
+### Request cooperation and ownership
 
-Also report the automatic selection rule, supported overrides, decision overhead and
-hardware/distributed extension assumptions. The sequencing is about dependencies and
-evidence, not assigning one workload permanent priority over the others.
+Analyze and rewrite the whole request, expose sound subproblems and dependencies,
+then revise remaining work when a solver contributes useful evidence. Classification
+is a capability guard, not a permanent route to one solver. The store composes mixed
+QL/DL operations; SPARQL owns query semantics and local planning/evaluation; the
+reasoner and DL engines own their deductions/search; Runtime/Workers own resources.
+An orchestration defect belongs at the composition boundary, without moving solver
+mathematics there. No new coordinator crate or universal intermediate language is implied.
 
-Decision boundaries during implementation:
+Start with implemented cooperation: Horn-derived classifier knowledge, model/probe
+candidate elimination, taxonomy-strengthened lower bounds and lower/upper exact gaps.
+Each extension names its producer, consuming decision and work it eliminates. Reuse
+compatible snapshots/compiled inputs; allocate speculative state only as needed and
+release it when superseded. Preserve assumption scope, provenance, revision/domain
+identity and exact/incomplete/unknown outcomes. A branch-local conclusion cannot become
+a global fact. Preserve cross-fragment equality, existential and negation dependencies;
+decomposition cannot discard them. Existing branch dependencies are not general logical
+certificates. Logical dependency acyclicity and worker availability need separate proofs.
 
-- Bounded reuse-based work is authorised on the isolated branch. Report any larger
-  implementation before starting it, including what existing code it replaces.
-- Report the cost of correctness repair separately from simplification and optimisation.
-  A blanket speedup promise would be misleading.
-- Pursue a small pure exact-test API below the store after P4's evidence, or keep that
-  responsibility in the store and improve its internal modularity first?
+For every exchange, name who owns the retained bytes, cancellation and remaining
+deadline, and how charges transfer on reuse/release. No unlimited portfolio of copied
+states, unaccounted suspended work, or new hardcoded limit follows. Configured unlimited
+operation remains supported. Shared end-to-end accounting is a design gap, not a claim
+about the current implementation. See [DL design](../design/owl2-dl.md) and
+[progress candidates](2026-10-10-query-progress.md) for the concrete seams and constraints.
 
-Confirmed direction: performance at every level, configuration first, automatic strategy
-selection from request/data/resource needs, and architecture that later distributed and
-hardware work can extend. Suggested start: P0/P1 first, P2/P3 next; retain the existing
-crate structure and measured specialisations. Decide larger abstractions from the evidence
-those steps produce; their appearance in this plan alone is not approval to build them.
+### Stages and exit evidence
+
+| Stage | Bounded deliverable using P0–P9 | Gate before dependent work |
+|---|---|---|
+| A. Contract and cost map | Record actual entry points, ownership/lifetimes, dependency waits, duplication and the cost of crossing each boundary. Specify one producer/consumer exchange at a time; distinguish existing laws from proposed API changes. | Independent source review; explicit callback/embedding and resource contracts; reproducible failing guards and causal hypotheses. No runtime design selected merely by documenting it. |
+| B. Structural repair | Compare bounded coordination/lifetime alternatives, then replace the responsible path in existing owners. Separate cache liveness, dispatch overhead, allocator retention and skewed counting diagnoses. Consolidate an entry or representation only when its semantics and callers are proven equivalent. | Minimal mechanism evidence before broad migration; correctness/cancellation/reentry guards, no hidden work or resource escape, per-case performance and memory checks. Reject all candidates if none meets the contract. Delete the replaced path in the same accepted slice. |
+| C. Avoid work through cooperation | Extend an existing bound/probe/planner seam so one solver's result removes another's work; preserve IDs/order/compiled inputs where useful. Bring forward physical-plan slices only when they remove an identified conversion or enable this consumer. | Differential answers/completeness, fewer actual probes/scans/copies, transfer and retention cost included. Compare with existing combinations and each applicable specialised route; reject combination overhead without benefit. |
+| D. Optimise representations and kernels | Tune the remaining measured allocation, layout, batching, skew handling, SIMD/ISA and locality costs inside their owners. Reuse generic kernels across semantic consumers. | Query-phase CPU/allocation profiles and hardware counters where available; inspect generated code for a demonstrated hot loop. Verify portable fallbacks and end-to-end gains on both host architectures. No per-row abstraction overhead for hypothetical backends. |
+| E. Integrate and qualify | Retest affected cases plus neighboring controls after every kept slice; full suites/soak on the exact final revision, public/private competitor reports, docs and cleanup. | Correct answers and honest incomplete statuses, no repeatable regression in covered cases, full milestone gate, audited provenance and maintainer review. Final merge remains with the maintainer. |
+
+Stage A precedes a change of ownership; B precedes C/D work that depends on that
+boundary. Independent preparation consolidation, profiling, competitor runs and repairs
+in other settled owners continue before the progress mechanism is selected. The first
+preparation candidate removes the plan/algebra round trip between join flattening and
+eager aggregation; [query-plan.md](../design/query-plan.md#migration-one-step-at-a-time-never-a-second-executor)
+owns its normalization, eligibility and EXPLAIN gates. P9 applies at every stage.
+This ordering does not prioritise one workload
+permanently or require a global rewrite before a local improvement.
+
+### Change record and regression discipline
+
+Every slice records the problem, existing owner/API, invariant, code/work removed,
+proposed cost change, semantic guard, matched measurements, deletion and residual gaps.
+Report production/test line deltas, but judge clarity by responsibilities and removed
+coordination rather than line count alone. A temporary adapter names its remaining
+callers and exact removal condition; independent semantic oracles remain independent.
+
+Use the immediate parent to attribute a change and frozen `4e8bd38` to check recovery
+from the runtime regression. `bebada2` is the failing checkpoint, not a new acceptable
+baseline; `0f46563` remains the whole-branch implementation base. Record all identities.
+Keep per-width throughput, tails, CPU/work, lifetime peak and phase/retained memory
+separate. A faster aggregate cannot erase a slower case or a wrong answer. Structural
+neutrality requires adequate measurement resolution; inconclusive evidence is not a pass.
+Do not loosen thresholds after results arrive. Reject/revert harmful experiments and
+retain their evidence; report correctness-restoration costs separately from speedups.
+
+Automatic choices use capability guards and measured request/data/resource costs,
+including preparation, transfer, retained memory and switching overhead. Preserve
+explicit overrides and useful specialised algorithms; add a selector only when the
+alternatives have demonstrated different winning regions. Future NUMA/accelerator and
+distributed backends must preserve semantic ownership and coarse local fast paths;
+their actual protocols/implementations remain separate work.
+
+The immediate recovery gate tests the authorised default-policy rewind. Cache/worker
+progress and callback reentry remain unresolved for explicitly pooled execution and
+worker embedding; reassess the reachable dependencies under each execution policy.
+Full continuations, fixed root/kernel partitions and callback relocation are candidates,
+not selected implementations. Larger wiring or a resource/behavioural change still goes
+to the owner with a concrete replacement, alternatives and scope before implementation.
+The latest direction authorises this disciplined path, not those unresolved tradeoffs.
 
 ## 8. Concrete implementation checkpoints from the first batch
 
@@ -608,9 +665,10 @@ change is implemented in `0f9d98c`; combined validation and limitations are in t
 
 **DL worker ownership (P7).** The initial review found per-round context pools and ambient
 candidate dispatch whose width differed from memory division. Following design discussion,
-the owner authorised shared runtime implementation. A catalog now owns one physical pool;
-DL operations narrow it, context rounds reuse it, and candidate children receive an explicit
-worker and memory share. Standalone APIs retain independent operation owners. Native queries,
+the owner authorised shared runtime implementation. The later correction makes the physical
+pool an explicit positive-thread policy; default execution uses the current registry without
+serial handoffs. DL operations narrow their execution allowance, context rounds reuse it,
+and candidate children receive an explicit worker and memory share. Standalone APIs retain independent operation owners. Native queries,
 output encoding and update WHERE share the runtime; rule materialisation, bulk spill and
 storage maintenance retain separate owners. This is not a universal scheduler or tenant
 fairness policy. Runtime performance acceptance is **BLOCKED** by the initial comparison;

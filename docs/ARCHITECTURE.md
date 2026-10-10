@@ -48,14 +48,16 @@ Outside the layer model: `nrese-sparql-reference` (the SPARQL evaluator written 
 | `nrese-sparql` | SPARQL 1.1 query and update evaluation over an engine snapshot: the native executor (the only one) and its planner (EXPLAIN), the result cache of plan parts (its keys are plan parts, its entries id tables, and only the executor knows what a part's result depends on), query cancellation, dataset specification (`FROM`, protocol `default-graph-uri`), update-to-delta planning, result serialisation. | Commit decisions, validation, persistence, HTTP; the cache's instance and budget (the store's, as with the query memory budget). |
 | `nrese-reasoner` | Reasoning profiles, rule sets, materialisation, incremental maintenance, consistency checks, explanations. | Storage layout, HTTP, SHACL. |
 | `nrese-shacl` | Shapes-graph compilation, SHACL Core (later SHACL-SPARQL) validation, incremental validation scoped to a delta, validation reports. It reads through `nrese-sparql`'s `ReadView` and uses its value semantics, because SHACL defines its constraints through SPARQL's operators; `nrese-sparql` never depends on it ([design/shacl.md](design/shacl.md)). | Storage layout, reasoning, HTTP, when to validate and what a failure means for a commit. |
-| `nrese-store` | Product operations and the **mutation pipeline** (plan → validate → commit), gates, revision reporting and preload; one result cache per store; catalog `Runtime` ownership of physical workers and the shared native query budget; DL bound orchestration, candidate adaptation and completeness. | HTTP status codes, auth, request parsing; what a cached result is keyed by; generic execution kernels. |
+| `nrese-store` | Product operations and the **mutation pipeline** (plan → validate → commit), gates, revision reporting and preload; one result cache per store; catalog `Runtime` execution policy and shared native query budget; DL bound orchestration, candidate adaptation and completeness. | HTTP status codes, auth, request parsing; what a cached result is keyed by; generic execution kernels. |
 | `nrese-server` | Routes, content negotiation, auth backends, policy (limits, timeouts, rate limits), deployment posture, operator/console hosting, AI suggestions, mapping store errors to HTTP. | Any data semantics. It never touches the engine directly. |
 
-The runtime covers native query computation, direct-result ID-block encoding, update WHERE and participating
-DL work. Direct-result writers and their liveness callbacks stay with the caller;
+The runtime selects execution policy for native query computation, direct-result ID-block encoding,
+update WHERE and participating DL work. Default execution keeps serial work on its caller
+and existing parallel kernels in their current Rayon registry; it has no catalog-wide CPU cap.
+An explicit positive worker count selects a shared physical pool. Direct-result writers and their liveness callbacks stay with the caller;
 `SERVICE` callbacks run within native evaluation and have no caller-affinity guarantee.
 Generic serializers and small ASK/header encoding still run on the caller; completing
-output CPU ownership is an open gap, not permission to add another caller bypass.
+the explicit pool does not cover all output CPU work.
 Rule materialisation, bulk spill and background storage keep their existing owners.
 This is neither a universal worker cap nor
 a whole-request memory ceiling. SPARQL owns retained ID results, their dictionary/computed
