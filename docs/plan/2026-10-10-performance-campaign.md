@@ -90,10 +90,30 @@ or treat an earlier revision's results as current-head qualification.
 - Bootstrap comparison runs on the coordinating PC to avoid adding analysis CPU
   load to timed hosts. Only cases with all three complete pairs receive a verdict;
   failed statuses, missing series and boundaries retain the protocol's checks.
-- A source review identified a possible nested Rayon/cache-flight dependency cycle.
-  A bounded reproduction is being prepared; it is not yet an observed product
-  failure or justification to weaken the compute-once contract.
+- Office reproduced the nested Rayon/cache-flight dependency cycle with a disposable
+  two-worker test: forced ordering and cleanup assertions pass, then the progress
+  assertion fails after the five-second watchdog cancels only the waiter. Source
+  is restored clean. Evidence: `flight-diagnostic.patch`, `flight-diagnostic-test.log`
+  and `flight-diagnostic-exit.txt` under the remote root. This establishes the
+  composition defect, not its frequency or contribution to throughput regressions.
+  Whole-query retry is unsafe for SERVICE/volatile evaluation and partial reservations.
+  The owner requested a proper replacement design instead of approving intermediate
+  recomputation. [Query progress design](2026-10-10-query-progress.md) proposes owned
+  continuations on the existing worker pool, reusing kernels and cache semantics.
+  Synchronous SERVICE/worker reentry is an explicit ownership decision still to settle;
+  the complete migration touches low thousands of lines, not the earlier bounded bypass.
+- Initial completed client pairs show lower QPS at every sweep width on both hosts.
+  Phuoc's better high-concurrency p99 must not hide the throughput loss. Client peaks
+  include one retained latency sample per completed request, so a slower run's lower
+  peak does not establish an engine-memory improvement. The single-level QPS omission
+  is being repaired in `fast.py`, reusing the sweep comparison and retained full reports;
+  the frozen measuring driver and checkpoint binaries remain unchanged.
 - No performance fix is approved/accepted merely because a benchmark has completed.
+- Intermediate comparison at 108 Office / 197 Phuoc invocations: 18 / 32 complete
+  paired cases. Beyond client throughput and skewed triangles, Office QL-LUBM10
+  query-phase RSS and Phuoc RL-clique memory trigger investigation. Initial DL/EL
+  cases show no qualified large latency change; existing failures retain no timing
+  credit. These are three-pair screening results, not final performance acceptance.
 
 ## User request
 

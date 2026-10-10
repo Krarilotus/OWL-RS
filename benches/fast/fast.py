@@ -500,13 +500,8 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
     record["metric"] = metric_value(case, result)
     record["samples"] = samples(case, result)
     record["counters"] = counters(case, result)
-    if result.get("client_sweep"):
-        # Throughput against p99 per level, and per GB of the level's peak memory.
-        record["throughput"] = [
-            {"clients": level["clients"], "qps": level["qps"], "p99_ms": level["p99_ms"],
-             "peak_mib": (level.get("memory") or {}).get("peak_mib"),
-             "qps_per_gb": round(level["qps"] / max((level.get("memory") or {}).get("peak_mib") or 1, 1) * 1024, 1)}
-            for level in result["client_sweep"]]
+    if levels := client_throughput(result):
+        record["throughput"] = levels
     record["phase_peaks"] = {k: v.get("peak_mib") for k, v in (result.get("phases") or {}).items()}
     record["peak_mib"] = result.get("cgroup_peak_mib") or result.get("peak_mib")
     if case.get("queries", "").startswith("@vectors") and record["status"] == "ok":
@@ -525,6 +520,24 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
 
 
 DL_PHASES = ("parse", "read", "normalise", "compile", "saturate", "blocking", "expand", "search", "datatypes")
+
+
+def client_throughput(result: dict) -> list[dict]:
+    """One client level and a sweep share the same throughput contract.
+
+    These peaks include the in-process harness's latency samples; they are not
+    isolated engine memory. Unknown memory must not become a synthetic QPS/GB win.
+    """
+    levels = result.get("client_sweep") or ([result["clients"]] if result.get("clients") else [])
+    out = []
+    for level in levels:
+        peak = (level.get("memory") or {}).get("peak_mib")
+        qps = level.get("qps")
+        out.append({"clients": level.get("clients"), "qps": qps, "p99_ms": level.get("p99_ms"),
+                    "peak_mib": peak,
+                    "qps_per_gb": round(qps / peak * 1024, 1)
+                    if isinstance(qps, (int, float)) and isinstance(peak, (int, float)) and peak > 0 else None})
+    return out
 
 # Deterministic work counters, recorded for every case and compared exactly: a change in
 # them is a change in the work done, whatever the machine's noise.
@@ -842,12 +855,32 @@ def pooled(report: dict) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for r in report["records"]:
         entry = out.setdefault(r["case"], {"reps": [], "status": [], "peaks": [], "metrics": [],
-                                           "counters": {}, "phase_peaks": {}, "qps": {},
+                                           "counters": {}, "phase_peaks": {}, "qps": [], "client_case": False,
                                            "expected": [], "invalid": False, "expected_reps": report.get("reps", 0)})
         entry["expected"].append(r.get("expected_outcome", "ok"))
         entry["invalid"] |= any(not c.get("ok") for c in r.get("checks", []) + r.get("routes", []))
-        for level in r.get("throughput", []):
-            entry["qps"].setdefault(str(level["clients"]), []).append(level.get("qps"))
+        # Older full reports retain single-level clients only in their raw result.
+        # An explicitly empty throughput list remains missing evidence, not a fallback.
+        raw = r.get("result") or {}
+        levels = r["throughput"] if "throughput" in r else client_throughput(raw)
+        # Old compact client reports lost the raw QPS. Their case/series still
+        # identifies the missing evidence; a latency-only pass would be misleading.
+        entry["client_case"] |= ("throughput" in r or "clients" in raw or "client_sweep" in raw
+                                 or r["case"] in ("clients-lookups", "clients-sweep")
+                                 or any(s.endswith(" clients p99") for s in r.get("samples", {})))
+        widths = {}
+        for level in levels or []:
+            width = str(level.get("clients"))
+            # A duplicate in this repetition must not replace a missing observation
+            # in another repetition. Keep invalid observations explicitly missing.
+            widths[width] = None if width in widths else level.get("qps")
+        raw_levels = raw.get("client_sweep") or ([raw["clients"]] if raw.get("clients") else [])
+        for level in raw_levels:
+            widths.setdefault(str(level.get("clients")), None)
+        for series in r.get("samples", {}):
+            if match := re.fullmatch(r"(\d+) clients p99", series):
+                widths.setdefault(match[1], None)
+        entry["qps"].append(widths)
         for path, value in (r.get("counters") or {}).items():
             entry["counters"].setdefault(path, []).append(value)
         for phase, peak in (r.get("phase_peaks") or {}).items():
@@ -1015,9 +1048,13 @@ def compare(args) -> int:
         peaks = f"{bp or '-'} -> {np_ or '-'}"
         print(f"{case:<26} {bm:>11.4g} {nm:>11.4g} {ratio:>7.2f} {f'[{low:.2f}, {high:.2f}]':>15} "
               f"{threshold:>6.0%} {peaks:>17}  {verdict}")
-        for clients in sorted(set(b["qps"]) | set(n["qps"]), key=int):
-            values = [e["qps"].get(clients, []) for e in (b, n)]
-            if any(len(vs) != len(e["status"]) or len(vs) < 2
+        widths = {width for e in (b, n) for rep in e["qps"] for width in rep}
+        if not widths and any(e["client_case"] for e in (b, n)):
+            print("  clients QPS: NOT COMPARABLE (throughput missing; retrieve the verified full reports)")
+            regressions += 1
+        for clients in sorted(widths, key=lambda w: (len(w), w)):
+            values = [[rep.get(clients) for rep in e["qps"]] for e in (b, n)]
+            if not clients.isdecimal() or int(clients) <= 0 or any(len(vs) != len(e["status"]) or len(vs) < 2
                    or any(not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in vs)
                    for e, vs in zip((b, n), values)) or statistics.median(values[0]) <= 0:
                 print(f"  {clients} clients QPS: NOT COMPARABLE (missing/invalid samples or fewer than two repetitions)")
