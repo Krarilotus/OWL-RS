@@ -22,4 +22,5 @@ cases = [
 ]
 findings = [
   "The rewind recovers the bebada2 losses (2026-10-10-checkpoint-bebada2) on every recorded case.",
+  "The candidate still had the configurable pool (execution.threads > 0); 4c60c62 removed it, so these runs measured the default path that remains.",
 ]
