@@ -91,7 +91,7 @@ impl Worker<'_> {
     /// The merges by at-most-one clause `k` that `c` is a premise of: of its term `at`
     /// with the other neighbours, or (a guard, `None`) of every pair of neighbours.
     fn merges(&mut self, k: u32, c: ClauseId, at: Option<CTerm>) {
-        if self.engine.task_memory_exhausted() {
+        if self.engine.exhausted() {
             return;
         }
         let engine = self.engine;
@@ -230,7 +230,7 @@ impl Worker<'_> {
             by: by.into_boxed_slice(),
             premises: premises.into_boxed_slice(),
         });
-        drop(payload_memory); // Persistent merge state takes over the payload charge.
+        drop(payload_memory); // Persistent merge state now includes this payload in its capacity summary.
         self.state.clauses.counters.merges += 1;
         for t in [t0, t1] {
             let list = self.state.merges_by_term.entry(t).or_default();
@@ -242,7 +242,7 @@ impl Worker<'_> {
         let before = super::memory::vec(list);
         list.push(id);
         self.state.merge_bytes += super::memory::vec(list) - before;
-        if !self.state.check_memory() {
+        if !self.checkpoint() {
             return;
         }
         let clauses = &self.state.clauses;
@@ -382,7 +382,7 @@ fn join(
     premises: &mut Vec<ClauseId>,
     emit: &mut dyn FnMut(&[Atom], &[ClauseId]),
 ) {
-    if engine.task_memory_exhausted() {
+    if engine.exhausted() {
         return;
     }
     let (atoms, fixed, trigger) = want;

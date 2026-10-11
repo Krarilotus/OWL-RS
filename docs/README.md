@@ -49,6 +49,10 @@ the console: [frontend contract](dev/frontend-backend-contract.md),
 
 ## Implementation plans and proposals
 
+[Performance handover, 11 October](plan/2026-10-10-performance-campaign.md#closeout-and-maintainer-handover-11-october):
+retained recovery, losses, rejected experiments, open ownership contracts and benchmark
+reproduction locations. The owner has ended this optimisation round for takeover.
+
 [Performance and architecture, 9 October](plan/2026-10-09-performance-architecture.md):
 source-based review, authorised bounded refactoring, work packages, ownership and verification criteria.
 Not an accepted replacement for the architecture, roadmap or v2 merge checklist.

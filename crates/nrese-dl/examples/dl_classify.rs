@@ -18,7 +18,7 @@
 //!   --max-join N          the most conclusions one context-core join may make
 //!   --max-join-steps N    the most steps one context-core Pred join may take
 //!   --max-memory-mb N     the most memory the process may hold while the context core runs
-//!   --task-memory-mib N   context saturation capacity budget; 0 disables accounting
+//!   --task-memory-mib N   sampled saturation-capacity envelope; 0 disables observations
 //!   --clauses             print the DL-clauses with more than one head atom, then stop
 //!   --no-context-core --no-inline --no-lower-bound --no-exact-shortcut --no-model-pruning
 //!   --no-skip-seen --no-tbox-only --no-detached-probes --no-reuse-model

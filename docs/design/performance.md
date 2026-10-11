@@ -178,6 +178,26 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
 
+### 11 October: Horn accounting recovery and closeout
+
+The [run record](../../benches/runs/2026-10-11-horn-recovery.toml) identifies retained
+candidate K and all separate cohorts. Context-owned capacity summaries and periodic
+aggregate observations replace per-message shared reservations; existing mutation and
+stop owners replace duplicate bookkeeping. This is a sampled configurable contract,
+not an allocator ceiling. In three Phuoc pairs, original/K saturation is 790.2/841.5 ms
+at 16 threads and 4921.6/5217.4 ms serial; store classification is 1351.675/1318.520 ms.
+The earlier published-head store regression was 1399.408/9315.034 ms in ten separate
+pairs. The large regression is recovered on this input, but serial overhead remains;
+these different cohorts cannot be pooled or called complete v2 acceptance.
+
+Rejected attempts include borrowed reservation ownership E, adjacent-destination batching I,
+successor delta accounting L, and activation load-before-exchange M. M passes its
+correctness gates but loses to K in all three 16-thread groups (+12.78% median) and
+has +7.38% median store time. Its source/tests are removed; raw evidence remains.
+No empty-Remote lifetime experiment or retained-result API redesign was implemented.
+The owner ended this round. See the [handover](../plan/2026-10-10-performance-campaign.md#closeout-and-maintainer-handover-11-october)
+for open contracts, memory-measurement limits, cleanup and reproduction paths.
+
 ### 10 October: retained DL probes follow merged individuals
 
 The normal push gate for `da4465d` finds a missing type in brute-force seed 5358,

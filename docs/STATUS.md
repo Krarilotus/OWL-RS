@@ -8,7 +8,17 @@ in the branch), **deferred** (not done, with the reason and where it went), or *
   [capability matrix](spec/06-target-capability-matrix.md).
 - Why and in which order: [the roadmap](ROADMAP.md); the designs in [design/](design/).
 
-Branch update: 10 October 2026. Implementation and [draft PR #23](https://github.com/Krarilotus/OWL-RS/pull/23)
+Branch update: 11 October 2026. The owner ended this optimisation round for takeover.
+The [closeout and benchmark handover](plan/2026-10-10-performance-campaign.md#closeout-and-maintainer-handover-11-october)
+supersedes historical continuation instructions below. Horn candidate K replaces
+per-message shared accounting with sampled local capacity observations. It recovers
+most of the confirmed regression but retains roughly 6% serial overhead in two
+separate small cohorts; full performance acceptance remains open. Rejected experiments
+are removed from production, with evidence preserved. Public rebudgeting/retained-result
+ownership, explicit-pool progress, ANN recall and competitor qualification gaps remain
+documented; no new design or experiment is queued automatically.
+
+Implementation and [draft PR #23](https://github.com/Krarilotus/OWL-RS/pull/23)
 to `refactor/engine-v2` are authorised; **performance acceptance remains blocked**.
 The implementation comparison base is `0f46563`, including the independently authored
 DL number-module merge. Individual experiments below use their own identified revisions;

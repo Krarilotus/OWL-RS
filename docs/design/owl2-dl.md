@@ -812,26 +812,35 @@ rejection evidence without claiming completed minimisation or verification.
 The context core's `Budget::max_memory` measures the **whole process** and remains a
 separate opt-in guard. Server startup owns the global process fallback; opening a store
 does not change it. Store-local watches also reach DL bounds and diagnostics, with explicit
-zero disabling the local limit. `Budget::task_memory` accounts saturation-owned capacity: compiled
-program, context arena and registry, clauses and indexes, queued payloads, assertion state
-and worker buffers. Owners retain their reservations when moved and release them on drop;
-incremental capacity totals avoid rescanning all contexts at each checkpoint. Hash-table
-backing capacity and assertion B-tree nodes are estimated, not allocator telemetry.
+zero disabling the local limit. `Budget::task_memory` checks a sampled estimate of
+saturation-owned capacity: compiled program, context arena and registry, clauses and
+indexes, queued payloads, assertion state and worker buffers. Context activations publish
+their local capacity at work checkpoints; inbox writers publish queued capacity under
+the existing inbox lock. The aggregate sampler reads these publications without acquiring
+context locks, using the process watch's sampling cadence and a forced sample after each
+saturation round. Main Horn payload handoffs and recursive inference no longer reserve
+shared task capacity per message; Eq auxiliary buffers still use shared charges.
+Hash-table backing capacity and assertion B-tree nodes are estimates, not allocator telemetry.
 
 `dl.memory` configures context saturation and the tableau's existing capacity checks.
-Zero means unlimited; the standalone context API defaults to no accounting. Classification
+Zero means unlimited; the standalone context API defaults to no observations. Classification
 uses this configured value rather than its standalone driver's fixed tableau default,
 dividing the tableau allowance among actual workers. Checks happen at growth/work
-boundaries, so in-flight work can temporarily exceed a budget. Exhaustion yields an
+boundaries. Context observations can lag growth and overlap during transfers; an operation
+near its configured envelope can therefore stop earlier or later than continuous capacity
+accounting would. In-flight work can exceed the envelope. Exhaustion yields an
 incomplete/budget outcome, never a classification inferred from truncated work. There is
 no allocation-by-allocation ceiling.
 
-Normalisation and compilation temporaries, input snapshots, result/proof assembly,
-allocator metadata and scheduler stacks are outside context accounting. Retained native
+Retained classification class/query buffers use auxiliary charges. Other result/proof
+assembly, normalisation and compilation temporaries, input snapshots,
+short-lived recursive temporaries, allocator metadata and scheduler stacks are outside
+context observations. Retained native
 bounds now share query accounting, and exact work uses runtime dispatch allowances; DL
 compilation and per-engine task budgets still lack a shared end-to-end memory envelope. The
-context profile's `task_memory_peak` reports successfully reserved saturation capacity,
-not RSS or unreserved overshoot, and is zero when accounting is disabled.
+context profile's `task_memory_peak` reports the peak sampled capacity estimate, including
+an observation that exceeds the envelope. It is neither RSS nor an exact simultaneous
+capacity peak, and is zero when observations are disabled.
 
 | Setting | Values | Default |
 |---|---|---|
