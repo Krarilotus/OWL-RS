@@ -185,20 +185,40 @@ console() {
   fi
 }
 
+# The files a commit or push changes. A merge commit: a file the same as on one side was
+# tested on that side; new is what differs from both (resolved conflicts, files both sides
+# changed). A push: everything since the upstream branch.
+changed_files() {
+  if [ "$1" = commit ] && git rev-parse -q --verify MERGE_HEAD > /dev/null; then
+    comm -12 <(git diff --name-only --cached HEAD | sort) <(git diff --name-only --cached MERGE_HEAD | sort)
+  elif [ "$1" = commit ]; then
+    git diff --name-only HEAD
+  else
+    local base
+    base=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || echo HEAD~1)
+    git diff --name-only "$base"...HEAD
+    git diff --name-only HEAD
+  fi
+  git ls-files --others --exclude-standard
+}
+
+# With a build host (scripts/lib/remote.sh), this machine only selects the changed files; the
+# host runs every step on a snapshot of this working tree.
+if [ -z "${NRESE_ON_BUILD_HOST:-}" ] && [ -n "${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}" ]; then
+  list=$(mktemp)
+  [ "$mode" = all ] || changed_files "$mode" > "$list"
+  bash scripts/lib/remote.sh check "$mode" "$list"
+  code=$?
+  rm -f "$list"
+  exit $code
+fi
+
 case "$mode" in
   commit | push)
-    if [ "$mode" = commit ] && git rev-parse -q --verify MERGE_HEAD > /dev/null; then
-      # A merge: a file the same as on one side was tested on that side. New is what
-      # differs from both: the resolved conflicts and the files both sides changed.
-      mapfile -t files < <(comm -12 <(git diff --name-only --cached HEAD | sort) \
-                                    <(git diff --name-only --cached MERGE_HEAD | sort);
-                           git ls-files --others --exclude-standard)
-    elif [ "$mode" = commit ]; then
-      mapfile -t files < <(git diff --name-only HEAD; git ls-files --others --exclude-standard)
+    if [ -n "${NRESE_FILES_FROM:-}" ]; then
+      mapfile -t files < "$NRESE_FILES_FROM"
     else
-      base=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || echo HEAD~1)
-      mapfile -t files < <(git diff --name-only "$base"...HEAD; git diff --name-only HEAD;
-                           git ls-files --others --exclude-standard)
+      mapfile -t files < <(changed_files "$mode")
     fi
     mapfile -t changed < <(crates_of "${files[@]}")
     mapfile -t dependents < <([ ${#changed[@]} -gt 0 ] && dependents_of "${changed[@]}")
