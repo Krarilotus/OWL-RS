@@ -6,28 +6,29 @@ mod tests;
 use std::sync::Arc;
 
 use nrese_engine::Snapshot;
-use nrese_exec::{Budget, IdTable, UNDEF, computed_id, computed_index};
+use nrese_exec::{Budget, IdTable, Reservation, UNDEF, computed_id, computed_index};
 use nrese_rdf::{Term, Triple, Variable};
 
+use super::{Holding, Outcome};
 use crate::{QueryEvaluationError, QueryResults, QuerySolutionIter, QueryTripleIter};
 
 /// An evaluated query, retaining encoded solutions until their consumer needs terms.
 pub enum TypedResults {
     Boolean(bool),
     Solutions(SolutionTable),
-    Graph(Vec<Triple>, Arc<Budget>),
+    Graph(Vec<Triple>, Reservation),
 }
 
 /// An ID table and its complete decoding context. Row order and multiplicity are kept.
-/// The evaluation's reservation remains live until this result is dropped.
+/// What it holds stays reserved until it drops.
 pub struct SolutionTable {
     pub(super) snapshot: Snapshot,
     pub(super) variables: Arc<[Variable]>,
     pub(super) table: IdTable,
     pub(super) computed: Arc<Vec<Term>>,
-    pub(super) budget: Arc<Budget>,
-    // Comparison/output additions retain their own reservation beside the evaluation.
-    extra_budgets: Vec<Arc<Budget>>,
+    pub(super) held: Reservation,
+    /// What alignment added, on the budget it was given.
+    aligned: Option<Reservation>,
 }
 
 impl SolutionTable {
@@ -54,13 +55,9 @@ impl SolutionTable {
         super::decode(&self.snapshot, &self.computed, id)
     }
 
-    /// Bytes still reserved by this evaluation, including retained intermediate state.
+    /// Bytes reserved for this result.
     pub fn reserved_bytes(&self) -> usize {
-        self.extra_budgets
-            .iter()
-            .fold(self.budget.used(), |used, budget| {
-                used.saturating_add(budget.used())
-            })
+        self.held.bytes() + self.aligned.as_ref().map_or(0, Reservation::bytes)
     }
 
     /// Align both results to one dictionary/computed-value domain. O(cells + computed
@@ -84,7 +81,8 @@ impl SolutionTable {
             .chain(upper.computed.iter())
             .map(|t| crate::cache::term_heap(t).saturating_add(128))
             .sum::<usize>();
-        budget.charge(computed_bytes.saturating_mul(3))?;
+        let mut held = Reservation::new(budget);
+        held.charge(computed_bytes.saturating_mul(3))?;
         let mut values = std::collections::HashMap::new();
         let mut computed = Vec::new();
         let mut remap = |terms: &[Term]| {
@@ -137,11 +135,10 @@ impl SolutionTable {
         upper.computed = computed;
         // Upper may know newly interned dictionary terms absent at lower's revision.
         self.snapshot = upper.snapshot.clone();
-        self.extra_budgets.push(Arc::clone(&budget));
         Ok(AlignedSolutions {
             lower: self,
             upper,
-            budget,
+            held,
         })
     }
 }
@@ -151,7 +148,7 @@ impl SolutionTable {
 pub struct AlignedSolutions {
     lower: SolutionTable,
     upper: SolutionTable,
-    budget: Arc<Budget>,
+    held: Reservation,
 }
 
 impl AlignedSolutions {
@@ -179,37 +176,35 @@ impl AlignedSolutions {
             .table
             .memory_bytes()
             .saturating_add(self.upper.len().saturating_mul(24));
-        self.budget.charge(scratch)?;
+        self.held.charge(scratch)?;
         self.upper.table.dedup();
-        self.budget.release(scratch);
+        self.held.release(scratch);
+        Ok(())
+    }
+
+    /// Makes room for `rows` appended rows at once; the old and the new allocation
+    /// coexist while the rows move.
+    pub fn reserve_appends(&mut self, rows: usize) -> Result<(), QueryEvaluationError> {
+        let table = &mut self.lower.table;
+        let old = table.memory_bytes();
+        let more = rows.saturating_mul(table.width()).saturating_mul(8);
+        self.held.charge(old.saturating_add(more))?;
+        table.reserve_exact(rows);
+        self.held.release(old);
         Ok(())
     }
 
     /// Appends a proved candidate once, preserving every original lower row in place.
     pub fn append_upper(&mut self, row: usize) -> Result<(), QueryEvaluationError> {
-        // Vec growth temporarily coexists with its old allocation. Reserve the full
-        // prospective allocation before push, then release the replaced capacity.
-        let (new, old) = self
-            .lower
-            .table
-            .columns()
-            .iter()
-            .filter(|c| c.len() == c.capacity())
-            .fold((0usize, 0usize), |(new, old), c| {
-                (
-                    new.saturating_add(c.capacity().saturating_mul(2).max(4).saturating_mul(8)),
-                    old.saturating_add(c.capacity().saturating_mul(8)),
-                )
-            });
-        self.budget
-            .charge(new.saturating_add(self.lower.table.width().saturating_mul(8)))?;
+        if self.lower.table.spare_rows() == 0 {
+            self.reserve_appends(self.lower.len().max(4))?;
+        }
         self.lower.table.push_row(&self.upper.table.row(row));
-        self.budget
-            .release(old.saturating_add(self.lower.table.width().saturating_mul(8)));
         Ok(())
     }
 
-    pub fn into_lower(self) -> SolutionTable {
+    pub fn into_lower(mut self) -> SolutionTable {
+        self.lower.aligned = Some(self.held);
         self.lower
     }
 }
@@ -219,9 +214,10 @@ impl TypedResults {
     pub fn into_results(self) -> QueryResults<'static> {
         match self {
             Self::Boolean(value) => QueryResults::Boolean(value),
-            Self::Graph(triples, budget) => QueryResults::Graph(
-                QueryTripleIter::new(triples.into_iter().map(Ok)).with_budget(budget),
-            ),
+            Self::Graph(triples, held) => QueryResults::Graph(QueryTripleIter::new(Holding::new(
+                triples.into_iter().map(Ok),
+                held,
+            ))),
             Self::Solutions(solutions) => {
                 let variables = Arc::clone(&solutions.variables);
                 let rows = (0..solutions.len()).map(move |row| Ok(solutions.row(row)));
@@ -231,66 +227,32 @@ impl TypedResults {
     }
 }
 
-/// Evaluates through the same native entry as ordinary result delivery.
+/// Evaluates through the same native step as ordinary result delivery. The solutions
+/// keep their IDs and snapshot, and their computed terms are reserved too.
 pub(crate) fn evaluate(
     snapshot: Snapshot,
     query: &nrese_sparql_syntax::Query,
     options: &crate::QueryOptions,
 ) -> Result<TypedResults, QueryEvaluationError> {
-    use super::{Context, Form, construct, native_pattern, query_base, query_dataset, substitute};
-
-    let ctx = Context::new(&snapshot, options, query_dataset(query), query_base(query));
-    let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
-    let pattern = match &options.pre_bound {
-        Some(values) => {
-            for term in values.values() {
-                if let Term::BlankNode(b) = term
-                    && let Some(id) = snapshot.lookup(term.as_ref())
-                {
-                    ctx.register_alias(substitute::alias(b.as_str()).as_str(), id.raw());
-                }
-            }
-            substitute::Values { terms: values }.top(&pattern)
+    let (outcome, mut held) = super::run(&snapshot, query, options)?;
+    Ok(match outcome {
+        Outcome::Boolean(value) => TypedResults::Boolean(value),
+        Outcome::Graph(triples) => TypedResults::Graph(triples, held),
+        Outcome::Solutions(solutions, computed) => {
+            held.charge(
+                computed
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Term>())
+                    .saturating_add(computed.iter().map(crate::cache::term_heap).sum()),
+            )?;
+            TypedResults::Solutions(SolutionTable {
+                snapshot,
+                variables: solutions.vars.into(),
+                table: solutions.table,
+                computed: Arc::new(computed),
+                held,
+                aligned: None,
+            })
         }
-        None => pattern,
-    };
-    let (_, results) = ctx.on_workers(options.workers.as_ref(), |ctx| {
-        let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
-        ctx.check()?;
-        match form {
-            Form::Ask => Ok(TypedResults::Boolean(!solutions.table.is_empty())),
-            Form::Describe => Ok(TypedResults::Graph(
-                ctx.describe(&solutions)?,
-                Arc::clone(&ctx.budget),
-            )),
-            Form::Construct(template) => {
-                let triples =
-                    construct(&snapshot, ctx.computed.take(), solutions, template, || {
-                        ctx.check()
-                    })
-                    .collect::<super::NativeResult<Vec<_>>>()?;
-                Ok(TypedResults::Graph(triples, Arc::clone(&ctx.budget)))
-            }
-            Form::Select => {
-                let computed = ctx.computed.take();
-                ctx.budget
-                    .charge(
-                        computed
-                            .capacity()
-                            .saturating_mul(std::mem::size_of::<Term>())
-                            .saturating_add(computed.iter().map(crate::cache::term_heap).sum()),
-                    )
-                    .map_err(QueryEvaluationError::MemoryLimit)?;
-                Ok(TypedResults::Solutions(SolutionTable {
-                    snapshot: snapshot.clone(),
-                    variables: solutions.vars.into(),
-                    table: solutions.table,
-                    computed: Arc::new(computed),
-                    budget: Arc::clone(&ctx.budget),
-                    extra_budgets: Vec::new(),
-                }))
-            }
-        }
-    })?;
-    Ok(results)
+    })
 }

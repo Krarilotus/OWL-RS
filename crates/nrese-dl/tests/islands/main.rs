@@ -200,7 +200,7 @@ fn a_spent_budget_leaves_the_islands_undecided() {
 
 #[test]
 fn shared_island_limits_preserve_verdicts_and_never_raise_tiny_memory() {
-    let physical = nrese_exec::workers::Workers::pooled(4).unwrap();
+    let physical = nrese_exec::workers::Workers::new(4);
     for width in [1, 2, 4] {
         let config = Config {
             workers: Some(physical.limited(width)),

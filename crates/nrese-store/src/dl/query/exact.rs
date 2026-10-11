@@ -32,7 +32,7 @@ pub(super) fn decide_until(
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Decided {
-    let workers = store.runtime().workers().limited(store.config().dl.threads);
+    let workers = nrese_exec::workers::Workers::current().limited(store.config().dl.threads);
     workers.install(|| {
         let unresolved = |why: &str| Decided {
             verdicts: rows

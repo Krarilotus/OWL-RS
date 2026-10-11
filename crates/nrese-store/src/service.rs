@@ -94,21 +94,18 @@ impl fmt::Debug for StoreService {
 
 impl StoreService {
     pub fn new(config: StoreConfig) -> StoreResult<Self> {
-        let runtime = std::sync::Arc::new(crate::Runtime::new(
-            config.execution_threads,
-            config.total_query_memory_bytes,
-        )?);
+        let runtime = std::sync::Arc::new(crate::Runtime::new(config.total_query_memory_bytes));
         Self::with_runtime(config, runtime)
     }
 
     /// Opens a store on resources shared with other stores. A catalog uses this for
     /// every repository; embedded applications can supply the same owner explicitly.
+    /// The runtime's budget applies, not `config.total_query_memory_bytes`.
     pub fn with_runtime(
         config: StoreConfig,
         runtime: std::sync::Arc<crate::Runtime>,
     ) -> StoreResult<Self> {
         config.validate()?;
-        runtime.validate(&config)?;
         nrese_engine::set_index_encoding(config.index_encoding);
         nrese_engine::set_vocabulary_encoding(config.vocabulary);
         // Only switched off: on leaves what the process was started with (an operator's
