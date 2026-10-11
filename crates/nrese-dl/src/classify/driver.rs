@@ -25,7 +25,6 @@ use nrese_owl::{Normalised, Ontology, Term};
 use super::consistency::{self, Verdict};
 use super::known::{self, Lower};
 use super::{Classification, Deadline, Options, Profile, Taxonomy, Workers};
-use crate::tableau::budget::RunBudget;
 use crate::tableau::{Answer, At, Base, From, Labels, Prepared, Probe, ProbeOutcome, Want};
 
 /// A class's state.
@@ -171,8 +170,7 @@ impl<'a> Driver<'a> {
         });
         let mut base = None;
         match by_core {
-            Some(Verdict::Inconsistent) => return self.inconsistent(),
-            Some(Verdict::Consistent) => self.profile.consistency_by = "context-core",
+            Some(_) => self.profile.consistency_by = "context-core",
             None => {
                 let program = full.as_ref().expect("tableau consistency program");
                 let (out, retained) = program.consistency_with_base(
@@ -332,7 +330,6 @@ impl<'a> Driver<'a> {
             first,
             base,
             full,
-            deadline: self.deadline,
             detached: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
             from_model: AtomicU64::new(0),
@@ -687,7 +684,6 @@ struct Tests<'p, 't> {
     first: Option<(&'t Prepared, bool)>,
     base: Option<Base<'p>>,
     full: &'p Prepared,
-    deadline: Deadline,
     /// Tests the terminology answered with a detached model, tests that went on with the
     /// individuals, and of those, how many the base answered from the model or from the
     /// deterministic state.
@@ -704,49 +700,51 @@ impl Tests<'_, '_> {
         config: &crate::tableau::Config,
         want: Want,
     ) -> ProbeOutcome {
-        // A worker may start after its wave was queued. Both the detached attempt
-        // and its full fallback consume this one remaining operation allowance.
-        let config = self.deadline.config(config);
-        let budget = RunBudget::new(&config);
-        budget.probe(&config, |remaining| {
-            let mut previous = crate::tableau::Telemetry::default();
-            if let Some((terminology, check)) = self.first {
-                let want_first = Want {
-                    detached: check,
-                    ..want
-                };
-                let out = terminology.probe(probe, remaining, want_first);
-                if !check {
-                    return out;
-                }
-                match &out.answer {
-                    // Refuted without the assertions: refuted with them.
-                    Answer::Inconsistent => return out,
-                    Answer::Consistent if out.labels.as_ref().is_some_and(|l| l.detached) => {
-                        self.detached.fetch_add(1, Relaxed);
-                        return out;
-                    }
-                    _ => {}
-                }
-                self.fallbacks.fetch_add(1, Relaxed);
-                previous = out.telemetry;
+        // The detached attempt and its fallback share the test's one deadline; a test
+        // whose wave was queued past it does no work.
+        let config = &*config.started();
+        if let Some(why) = config.stopped() {
+            return ProbeOutcome::stopped(why);
+        }
+        let mut previous = crate::tableau::Telemetry::default();
+        if let Some((terminology, check)) = self.first {
+            let want_first = Want {
+                detached: check,
+                ..want
+            };
+            let out = terminology.probe(probe, config, want_first);
+            if !check {
+                return out;
             }
-            let mut out = budget.probe(&config, |remaining| {
-                if let Some(base) = &self.base
-                    && let Some((out, from)) = base.probe(probe, remaining, want)
-                {
-                    let counter = match from {
-                        From::Model => &self.from_model,
-                        From::Deterministic => &self.from_deterministic,
-                    };
-                    counter.fetch_add(1, Relaxed);
+            match &out.answer {
+                // Refuted without the assertions: refuted with them.
+                Answer::Inconsistent => return out,
+                Answer::Consistent if out.labels.as_ref().is_some_and(|l| l.detached) => {
+                    self.detached.fetch_add(1, Relaxed);
                     return out;
                 }
-                self.full.probe(probe, remaining, want)
-            });
-            out.telemetry.accumulate(&previous);
-            out
-        })
+                _ => {}
+            }
+            self.fallbacks.fetch_add(1, Relaxed);
+            previous = out.telemetry;
+        }
+        let mut out = match self
+            .base
+            .as_ref()
+            .and_then(|b| b.probe(probe, config, want))
+        {
+            Some((out, from)) => {
+                let counter = match from {
+                    From::Model => &self.from_model,
+                    From::Deterministic => &self.from_deterministic,
+                };
+                counter.fetch_add(1, Relaxed);
+                out
+            }
+            None => self.full.probe(probe, config, want),
+        };
+        out.telemetry.accumulate(&previous);
+        out
     }
 }
 
@@ -831,7 +829,6 @@ pub(crate) fn insert_sorted(a: &mut Vec<u32>, x: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn a_queued_probe_observes_the_operation_deadline_even_with_a_base() {
@@ -847,7 +844,6 @@ mod tests {
             first: Some((&prepared, true)),
             base,
             full: &prepared,
-            deadline: Deadline::new(Some(Duration::ZERO)),
             detached: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
             from_model: AtomicU64::new(0),
@@ -858,7 +854,11 @@ mod tests {
             positive: &[0],
             negative: &[],
         };
-        let out = tests.probe(&probe, &config, Want::default());
+        let expired = crate::tableau::Config {
+            deadline: Some(Instant::now()),
+            ..config
+        };
+        let out = tests.probe(&probe, &expired, Want::default());
         assert!(matches!(out.answer, Answer::GaveUp(_)));
         assert!(out.labels.is_none());
         assert_eq!(out.telemetry.nodes_created, 0);

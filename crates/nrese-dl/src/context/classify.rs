@@ -131,13 +131,10 @@ pub fn saturate(ontology: &Ontology, options: &Options) -> Result<Saturated, Uns
 pub fn saturate_with_workers(
     ontology: &Ontology,
     options: &Options,
-    cancel: Option<crate::tableau::Cancel>,
+    cancel: Option<crate::Cancel>,
     workers: &nrese_exec::workers::Workers,
 ) -> Result<Saturated, Unsupported> {
-    if cancel
-        .as_ref()
-        .is_some_and(crate::tableau::Cancel::is_cancelled)
-    {
+    if cancel.as_ref().is_some_and(crate::Cancel::is_cancelled) {
         return Err(Unsupported::Budget);
     }
     let started = Instant::now();
@@ -156,14 +153,11 @@ pub fn saturate_normalised(
     normalised: &nrese_owl::Normalised,
     classes: &[Term],
     options: &Options,
-    cancel: Option<crate::tableau::Cancel>,
+    cancel: Option<crate::Cancel>,
     workers: &nrese_exec::workers::Workers,
 ) -> Result<Saturated, Unsupported> {
     let workers = workers.limited(options.threads.max(1));
-    if cancel
-        .as_ref()
-        .is_some_and(crate::tableau::Cancel::is_cancelled)
-    {
+    if cancel.as_ref().is_some_and(crate::Cancel::is_cancelled) {
         return Err(Unsupported::Budget);
     }
     let mut profile = Profile {

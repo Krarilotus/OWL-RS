@@ -59,7 +59,7 @@ pub fn horn_lower_bound(
     classes: &[Term],
     core: &crate::context::Options,
     workers: &nrese_exec::workers::Workers,
-    cancel: Option<crate::tableau::Cancel>,
+    cancel: Option<crate::Cancel>,
 ) -> Option<Lower> {
     let all = &normalised.clauses;
     let budget = core.budget;
@@ -114,7 +114,7 @@ fn saturate(
     classes: &[Term],
     options: &crate::context::Options,
     workers: &nrese_exec::workers::Workers,
-    cancel: Option<crate::tableau::Cancel>,
+    cancel: Option<crate::Cancel>,
 ) -> Option<Lower> {
     let build = |part: &[usize]| Normalised {
         clauses: part.iter().map(|&i| n.clauses[i].clone()).collect(),

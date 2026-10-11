@@ -115,7 +115,7 @@ fn cancellation_drops_queued_work(task_memory: Option<usize>) {
     let normalised = nrese_owl::normalise_with(&ontology, Default::default());
     let compiled = super::super::compile::compile(&normalised, &[1, 2], false).unwrap();
     let flag = Arc::new(AtomicBool::new(false));
-    let cancel = crate::tableau::Cancel::from_flag(Arc::clone(&flag));
+    let cancel = crate::Cancel::from_flag(Arc::clone(&flag));
     let budget = Budget {
         task_memory,
         ..Budget::default()

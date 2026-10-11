@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 
 use nrese_owl::{Concept, Normalised, Ontology, Term};
 
-use super::budget::RunBudget;
 use super::depset::DepSetId;
 use super::engine::Engine;
 use super::graph::{NONE, flag};
@@ -107,6 +106,17 @@ pub struct ProbeOutcome {
     pub labels: Option<Labels>,
 }
 
+impl ProbeOutcome {
+    /// A probe stopped before it started (`why`).
+    pub(crate) fn stopped(why: &str) -> Self {
+        Self {
+            answer: Answer::GaveUp(why.into()),
+            telemetry: Telemetry::default(),
+            labels: None,
+        }
+    }
+}
+
 impl Prepared {
     /// Compiles `normalised` (of `ontology`) for probes over `classes` and `individuals`.
     pub fn new(
@@ -172,13 +182,15 @@ impl Prepared {
 
     /// Runs `probe`; a model's labels as `want` asks.
     pub fn probe(&self, probe: &Probe<'_>, config: &Config, want: Want) -> ProbeOutcome {
-        let budget = RunBudget::new(config);
-        budget.probe(config, |config| {
-            let seed = self.seed(probe);
-            let mut engine = Engine::new(&self.program, config);
-            let end = engine.run(&seed);
-            self.outcome(&mut engine, end, want, budget.started, None)
-        })
+        let started = Instant::now();
+        let config = &*config.started();
+        if let Some(why) = config.stopped() {
+            return ProbeOutcome::stopped(why);
+        }
+        let seed = self.seed(probe);
+        let mut engine = Engine::new(&self.program, config);
+        let end = engine.run(&seed);
+        self.outcome(&mut engine, end, want, started, None)
     }
 
     /// The engine's test for `probe`.
@@ -237,22 +249,22 @@ impl Prepared {
         want: Want,
         retain: bool,
     ) -> (ProbeOutcome, Option<Base<'_>>) {
-        let budget = RunBudget::new(config);
+        let started = Instant::now();
+        let config = &*config.started();
+        if let Some(why) = config.stopped() {
+            return (ProbeOutcome::stopped(why), None);
+        }
         let retain = retain && self.has_individuals();
         // Without a source of choices, the completed graph is itself the
         // deterministic start. Move it into Base instead of copying the ABox.
         let choices =
             self.features.disjunctions || self.features.numbers || self.features.datatypes;
         let mut deterministic = None;
-        let mut completed = None;
-        let out = budget.probe(config, |config| {
-            let mut engine = Engine::new(&self.program, config);
-            let capture = (retain && choices).then_some(&mut deterministic);
-            let end = engine.run_with_checkpoint(&Seed::none(), capture);
-            let out = self.outcome(&mut engine, end, want, budget.started, None);
-            completed = Some(engine);
-            out
-        });
+        let mut engine = Engine::new(&self.program, config);
+        let capture = (retain && choices).then_some(&mut deterministic);
+        let end = engine.run_with_checkpoint(&Seed::none(), capture);
+        let out = self.outcome(&mut engine, end, want, started, None);
+        let mut completed = Some(engine);
         if retain && !choices && out.answer == Answer::Consistent {
             deterministic = completed.take();
         }
@@ -440,7 +452,7 @@ pub enum From {
     Deterministic,
 }
 
-impl Base<'_> {
+impl<'p> Base<'p> {
     /// Keep only the deterministic start when every planned probe contradicts the
     /// model's choices. There is no value in retaining a model and a rollback pool
     /// whose attempts would all cross the floor.
@@ -454,85 +466,62 @@ impl Base<'_> {
         self
     }
 
-    /// Runs with current time/cancellation controls. `None` means an incompatible
-    /// strategy or resource configuration; no work has run. Unknown is always `Some`.
+    /// Runs `probe` from the base under `config`'s deadline and cancellation. `None`
+    /// where `config` searches differently from the base; then no work has run.
     pub fn probe(
         &self,
         probe: &Probe<'_>,
         config: &Config,
         want: Want,
     ) -> Option<(ProbeOutcome, From)> {
-        let mut compatible = config.clone();
-        compatible.timeout = self.deterministic.config.timeout;
-        compatible
-            .cancel
-            .clone_from(&self.deterministic.config.cancel);
-        if compatible != self.deterministic.config {
+        let started = Instant::now();
+        let config = config.started();
+        if !config.same_search(&self.deterministic.config) {
             return None;
         }
-        let budget = RunBudget::new(config);
-        let mut from = From::Deterministic;
-        let out = budget.probe(config, |_| {
-            let seed = self.prepared.seed(probe);
-            let mut previous = Telemetry::default();
-            if let (Some(model), Some((point, frames))) = (&self.model, &self.point) {
-                let pooled = self
-                    .pool
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .pop();
-                let mut engine = pooled.unwrap_or_else(|| model.clone());
-                let remaining = match budget.remaining(config) {
-                    Ok(remaining) => remaining,
-                    Err(why) => {
-                        self.pool
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push(engine);
-                        return budget.stopped_probe(why);
-                    }
-                };
-                engine.config = remaining;
-                engine.started = Instant::now();
-                engine.stats = Telemetry::default();
-                let approximate = engine.data_approximate.clone();
-                // The base's levels: its top frame's and below.
-                engine.floor = engine.frames.last().map_or(0, |f| f.id);
-                let since = (model.g.nodes.len() as u32, model.g.unary.len() as u32);
-                let end = engine.resume(&seed);
-                let done = end != End::GaveUp(super::search::FLOOR.into());
-                let out = done.then(|| {
-                    self.prepared
-                        .outcome(&mut engine, end, want, budget.started, Some(since))
-                });
-                previous = engine.stats.clone();
-                engine.rollback(point, *frames);
-                engine.data_approximate = approximate;
-                engine.floor = 0;
-                self.pool
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(engine);
-                if let Some(out) = out {
-                    from = From::Model;
-                    return out;
-                }
-            }
-            let mut out = budget.probe(config, |_| {
-                let mut engine = self.deterministic.clone();
-                engine.config = match budget.remaining(config) {
-                    Ok(remaining) => remaining,
-                    Err(why) => return budget.stopped_probe(why),
-                };
-                engine.started = Instant::now();
-                engine.stats = Telemetry::default();
-                let end = engine.resume(&seed);
+        if let Some(why) = config.stopped() {
+            return Some((ProbeOutcome::stopped(why), From::Deterministic));
+        }
+        let seed = self.prepared.seed(probe);
+        let fresh = |mut engine: Engine<'p>| -> Engine<'p> {
+            engine.config = config.clone().into_owned();
+            engine.stats = Telemetry::default();
+            engine
+        };
+        let mut previous = Telemetry::default();
+        if let (Some(model), Some((point, frames))) = (&self.model, &self.point) {
+            let pooled = self
+                .pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop();
+            let mut engine = fresh(pooled.unwrap_or_else(|| model.clone()));
+            let approximate = engine.data_approximate.clone();
+            // The base's levels: its top frame's and below.
+            engine.floor = engine.frames.last().map_or(0, |f| f.id);
+            let since = (model.g.nodes.len() as u32, model.g.unary.len() as u32);
+            let end = engine.resume(&seed);
+            let done = end != End::GaveUp(super::search::FLOOR.into());
+            let out = done.then(|| {
                 self.prepared
-                    .outcome(&mut engine, end, want, budget.started, None)
+                    .outcome(&mut engine, end, want, started, Some(since))
             });
-            out.telemetry.accumulate(&previous);
-            out
-        });
-        Some((out, from))
+            previous = engine.stats.clone();
+            engine.rollback(point, *frames);
+            engine.data_approximate = approximate;
+            engine.floor = 0;
+            self.pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(engine);
+            if let Some(out) = out {
+                return Some((out, From::Model));
+            }
+        }
+        let mut engine = fresh(self.deterministic.clone());
+        let end = engine.resume(&seed);
+        let mut out = self.prepared.outcome(&mut engine, end, want, started, None);
+        out.telemetry.accumulate(&previous);
+        Some((out, From::Deterministic))
     }
 }

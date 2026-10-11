@@ -217,7 +217,7 @@ mod tests {
                 ..Budget::default()
             };
             let engine = Engine::new(Program::default(), Strategy::Cautious, false, budget)
-                .with_cancel(Some(crate::tableau::Cancel::from_flag(flag.clone())));
+                .with_cancel(Some(crate::Cancel::from_flag(flag.clone())));
             let (root, _) = engine.context_for(&[]);
             let mut state = lock(&engine.context(root).state);
             for head in 0..2 {

@@ -224,13 +224,18 @@ fn retained_probes_use_the_requested_controls_and_decline_changed_strategy() {
             max_memory: 0,
             ..current.clone()
         },
-        Config {
-            workers: Some(nrese_exec::workers::Workers::serial()),
-            ..current.clone()
-        },
     ] {
         assert!(base.probe(&probe, &request, want()).is_none());
     }
+    // A narrower worker allowance searches the same way.
+    let narrow = Config {
+        workers: Some(nrese_exec::workers::Workers::serial()),
+        ..current.clone()
+    };
+    assert_eq!(
+        base.probe(&probe, &narrow, want()).unwrap().0.answer,
+        Answer::Consistent
+    );
     assert_eq!(
         base.probe(&probe, &current, want()).unwrap().0.answer,
         Answer::Consistent

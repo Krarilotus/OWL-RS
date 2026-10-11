@@ -225,14 +225,16 @@ impl Deadline {
         }
     }
 
-    /// The tableau's per-test configuration within the deadline.
+    /// The tableau's per-test configuration within the deadline (each test's own
+    /// `timeout` counts from its start).
     pub(crate) fn config(&self, base: &tableau::Config) -> tableau::Config {
-        let mut c = base.clone();
-        if let Some(d) = self.0 {
-            let left = d.saturating_duration_since(Instant::now());
-            c.timeout = Some(c.timeout.map_or(left, |t| t.min(left)));
+        tableau::Config {
+            deadline: match (base.deadline, self.0) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+            ..base.clone()
         }
-        c
     }
 }
 
