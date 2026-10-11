@@ -1,0 +1,21 @@
+# A run record (benches/runs/README.md). Answers only: no times.
+id = "2026-10-11-answer-replay-dc2114a"
+level = "focused"
+kit = "suite (answers.py)"
+purpose = "The 10 October competitor answer captures reclassified with the committed recorder: each system against one reference, strict and value matches apart"
+started = "2026-10-11"
+host = "office-pc"
+candidate = { commit = "133ac6d", dirty = false, note = "suitekit/answers.py; the captures come from the dc2114a competitor queue" }
+protocol = { groups = 49, distinct_queries = 37, systems = ["nrese", "jena", "oxigraph", "qlever", "virtuoso"], references = ["jena", "oxigraph"], note = "the campaign captured no unlimited answer, so the one unordered LIMIT can't be decided from these captures" }
+results = { root = "office-pc:/home/krarilotus/nrese-prep-20261009-4e8bd38/finish-20261010-dc2114a/competitors", captures = "*-audit.json, each capture with its SHA-256" }
+publishable = "all"
+cases = [
+  { case = "nrese against jena", verdict = "match", note = "43 of 49 strict matches; 5 incomplete (reference or every system timed out or missing); 1 undecided (limit-join)" },
+  { case = "nrese against oxigraph", verdict = "match", note = "45 strict matches; 3 incomplete; 1 undecided (limit-join)" },
+  { case = "qlever against jena", verdict = "match", note = "18 strict; 24 value matches whose only difference is xsd:int for xsd:integer (COUNT results and stored integers); 6 incomplete; 1 undecided" },
+  { case = "virtuoso against jena", verdict = "mismatch", note = "40 strict; top-scores (a total ORDER BY) returns other rows, not only another order; 3 incomplete; 1 undecided" },
+]
+findings = [
+  "No NRESE answer differs from either reference. With per-system comparison and the xsd:int value match, 44 of 49 groups are decidable against Jena (the review's inference, now measured).",
+  "COUNT and stored integers typed xsd:int by QLever are value matches; the strict datatype difference stays recorded.",
+]
