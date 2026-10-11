@@ -9,12 +9,9 @@ use crate::results::{
 };
 use crate::view::ReadView;
 
-/// Per-request query options (the transport layer fills these from the protocol request).
+/// What an evaluation may use while it runs, for queries and update `WHERE` clauses.
 #[derive(Clone, Default)]
-pub struct QueryOptions {
-    /// Protocol `default-graph-uri` / `named-graph-uri`. When set, it replaces the query's
-    /// own `FROM` / `FROM NAMED` clauses, as the SPARQL 1.1 Protocol requires.
-    pub dataset: Option<QueryDatasetSpecification>,
+pub struct Resources {
     /// Checked by the evaluator while it runs; the transport layer cancels it at the
     /// request deadline.
     pub cancellation: Option<CancellationToken>,
@@ -23,9 +20,25 @@ pub struct QueryOptions {
     /// The server's budget for all running queries together, which this query's memory
     /// counts against as well.
     pub shared_memory: Option<std::sync::Arc<nrese_exec::SharedBudget>>,
-    /// Physical CPU workers supplied by the operation owner. Native evaluation and
-    /// direct-result encoding enter this pool; output writes stay on the caller.
-    pub workers: Option<nrese_exec::workers::Workers>,
+    /// The width of parallel kernels and result encoding; the work stays on the caller.
+    pub workers: nrese_exec::workers::Workers,
+}
+
+impl Resources {
+    pub fn check(&self) -> Result<(), QueryEvaluationError> {
+        self.cancellation
+            .as_ref()
+            .map_or(Ok(()), CancellationToken::check)
+    }
+}
+
+/// Per-request query options (the transport layer fills these from the protocol request).
+#[derive(Clone, Default)]
+pub struct QueryOptions {
+    /// Protocol `default-graph-uri` / `named-graph-uri`. When set, it replaces the query's
+    /// own `FROM` / `FROM NAMED` clauses, as the SPARQL 1.1 Protocol requires.
+    pub dataset: Option<QueryDatasetSpecification>,
+    pub resources: Resources,
     /// Which statements the query reads: asserted and inferred (the default), or one
     /// stack (GraphDB's `infer=false`, `FROM onto:explicit` / `onto:implicit`).
     pub read_model: nrese_engine::ReadModel,

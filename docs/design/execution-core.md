@@ -51,22 +51,10 @@ OWL datatype semantics retain their separate owners. Owned ID-table projection m
 selected column buffers and preserves the surviving sort prefix; selecting a column
 more than once copies only its additional occurrences.
 
-### Physical workers and resource lifetime
+### Workers and resource lifetime
 
-The store's `Runtime` owns execution policy and the shared query budget. A catalog and
-its system store share this owner. Default execution keeps serial work on the caller and
-reuses existing parallel kernels through `Workers::current`; it creates no dedicated
-pool and imposes no catalog-wide CPU cap. An explicit positive `execution.threads`
-selects a shared physical pool. Native computation then moves its context into that
-pool and returns it with the result and computed-ID domain. Writers, liveness callbacks
-and transactions stay on their caller; encoding windows return owned bytes before I/O.
-A slow writer does not occupy an explicitly selected pool while waiting for backpressure.
-
-This encoding ownership covers native direct-result ID blocks. Generic serializers
-(including XML and retained DL result delivery), ASK documents and headers still encode
-on their caller. An explicitly selected pool does not cover all output CPU work.
-`SERVICE` callbacks run inside native evaluation and
-have no caller-affinity guarantee.
+Queries run on their caller; parallel kernels use the current Rayon registry. The
+store's `Runtime` owns the query budget a catalog and its system store share.
 
 DL classification, realisation and saturation reuse their execution handle across phases
 and rounds. A smaller `Workers::limited` handle bounds participating batch dispatch; it is
@@ -84,8 +72,7 @@ the same catalog budget. These are accounted capacities, not process RSS or a st
 allocation ceiling: decoded graph payloads, encoder buffers and runtime overhead still
 have separate lifetimes. DL task accounting remains distinct from the shared native
 query budget. Rule materialisation, bulk spilling and background storage retain their
-existing execution owners. See [configuration](../ops/config-reference.md#cpu-execution)
-for the precise control surface and standalone embedding behavior.
+existing execution owners.
 
 SPARQL's [`SolutionTable`](../../crates/nrese-sparql/src/native/typed_results.rs) retains
 its snapshot, computed terms and capacity reservations. Alignment rejects unrelated

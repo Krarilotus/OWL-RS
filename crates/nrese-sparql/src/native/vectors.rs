@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 
 use nrese_engine::vector::Metric;
 use nrese_engine::{TermId, VectorQuery, VectorSearchReport, VectorStrategy};
-use nrese_exec::{IdTable, UNDEF};
+use nrese_exec::{Budget, IdTable, Reservation, UNDEF};
 use nrese_rdf::{Literal, Term, Variable};
 use nrese_sparql_syntax::algebra::GraphPattern;
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
@@ -236,7 +236,6 @@ impl Context<'_> {
                         .or_insert_with(|| self.used_as_object(id)))
                     .then_some(()))
                 },
-                |_| {},
             )?;
             rows.push(
                 self,
@@ -294,9 +293,8 @@ impl Context<'_> {
                     self.consumed(&rows);
                     return Ok(None);
                 }
-                Ok(Some(rows))
+                Ok(Some(Probed::new(self, rows)))
             },
-            |rows| self.consumed(&rows),
         )?;
         let mut rows = Rows::new(&search);
         rows.push(
@@ -305,23 +303,16 @@ impl Context<'_> {
             found.iter().map(|(id, d, _)| (*id, *d)),
             None,
         );
-        let mut winners = found.into_iter();
-        let combined: NativeResult<Option<Solutions>> = (|| {
-            let mut probed = None;
-            for (_, _, rows) in winners.by_ref() {
-                probed = Some(match probed.take() {
-                    Some(earlier) => self.union(earlier, rows)?,
-                    None => rows,
-                });
-            }
-            Ok(probed)
-        })();
-        // Union consumes the handed-off inputs even on failure; only pending winners
-        // are still ours to release.
-        for (_, _, rows) in winners {
-            self.consumed(&rows);
+        // Union consumes its inputs, also when it fails; the winners not yet handed to it
+        // are released as they drop.
+        let mut probed = None;
+        for (_, _, winner) in found {
+            let rows = winner.take();
+            probed = Some(match probed.take() {
+                Some(earlier) => self.union(earlier, rows)?,
+                None => rows,
+            });
         }
-        let probed = combined?;
         let local = match probed {
             Some(rows) => rows,
             None => {
@@ -346,8 +337,8 @@ impl Context<'_> {
     }
 
     /// Merge sorted search rounds with retained, successfully probed candidates.
-    /// O(fetched + k) per round, probing each ID at most once. Keep at most k payloads
-    /// between probes, plus one incoming probe; immediately dispose displaced rows.
+    /// O(fetched + k) per round, probing each ID at most once. Keeps at most k payloads
+    /// between probes, plus one incoming probe; a displaced payload drops at once.
     fn nearest<T>(
         &self,
         search: &Search,
@@ -355,7 +346,6 @@ impl Context<'_> {
         accepted: Option<usize>,
         mut fetch: impl FnMut(&VectorQuery) -> (Vec<(TermId, f32)>, VectorSearchReport),
         mut keep: impl FnMut(TermId) -> NativeResult<Option<T>>,
-        mut discard: impl FnMut(T),
     ) -> NativeResult<Vec<(TermId, f32, T)>> {
         let mut query = VectorQuery {
             metric: search.metric,
@@ -369,61 +359,68 @@ impl Context<'_> {
         let mut seen: HashSet<u64> = HashSet::new();
         let mut kept: Vec<(TermId, f32, T)> = Vec::new();
         let mut next = Vec::new();
-        let result: NativeResult<()> = (|| {
-            loop {
+        loop {
+            self.check()?;
+            let (hits, report) = fetch(&query);
+            let fetched = hits.len();
+            let mut hits = hits.into_iter().peekable();
+            let mut pending = kept.drain(..);
+            while next.len() < search.k {
                 self.check()?;
-                let (hits, report) = fetch(&query);
-                let fetched = hits.len();
-                let mut hits = hits.into_iter().peekable();
-                let mut pending = kept.drain(..);
-                let round = (|| {
-                    while next.len() < search.k {
-                        self.check()?;
-                        let old_first = pending.as_slice().first().is_some_and(|old| {
-                            hits.peek().is_none_or(|hit| {
-                                old.1.total_cmp(&hit.1).then(old.0.cmp(&hit.0)).is_le()
-                            })
-                        });
-                        if old_first {
-                            next.push(pending.next().expect("pending candidate"));
-                        } else if let Some((id, distance)) = hits.next() {
-                            if seen.insert(id.raw())
-                                && let Some(rows) = keep(id)?
-                            {
-                                next.push((id, distance, rows));
-                                // These old tail candidates cannot enter the best k even
-                                // if all remaining probes fail. Free them before probing.
-                                while pending.len() + next.len() > search.k {
-                                    discard(pending.next_back().expect("displaced candidate").2);
-                                }
-                            }
-                        } else {
-                            break;
+                let old_first = pending.as_slice().first().is_some_and(|old| {
+                    hits.peek()
+                        .is_none_or(|hit| old.1.total_cmp(&hit.1).then(old.0.cmp(&hit.0)).is_le())
+                });
+                if old_first {
+                    next.push(pending.next().expect("pending candidate"));
+                } else if let Some((id, distance)) = hits.next() {
+                    if seen.insert(id.raw())
+                        && let Some(rows) = keep(id)?
+                    {
+                        next.push((id, distance, rows));
+                        // These old tail candidates cannot enter the best k even if all
+                        // remaining probes fail. Free them before probing.
+                        while pending.len() + next.len() > search.k {
+                            drop(pending.next_back());
                         }
                     }
-                    self.check()
-                })();
-                // Drain explicitly: dropping T alone need not release its reservation.
-                for (_, _, rows) in pending {
-                    discard(rows);
+                } else {
+                    break;
                 }
-                round?;
-                std::mem::swap(&mut kept, &mut next);
-                // Enough, or nothing more to fetch.
-                if kept.len() == search.k || fetched < query.k || query.k >= report.space {
-                    return Ok(());
-                }
-                query.k = (query.k * 4).min(report.space.max(1));
-                query.ef = query.ef.max(query.k);
             }
-        })();
-        if let Err(error) = result {
-            for (_, _, rows) in kept.drain(..).chain(next.drain(..)) {
-                discard(rows);
+            drop(pending);
+            self.check()?;
+            std::mem::swap(&mut kept, &mut next);
+            // Enough, or nothing more to fetch.
+            if kept.len() == search.k || fetched < query.k || query.k >= report.space {
+                return Ok(kept);
             }
-            return Err(error);
+            query.k = (query.k * 4).min(report.space.max(1));
+            query.ef = query.ef.max(query.k);
         }
-        Ok(kept)
+    }
+}
+
+/// Probe rows charged to the query's budget: released if they drop, handed on by
+/// [`Probed::take`].
+struct Probed<'b> {
+    rows: Solutions,
+    held: Reservation<&'b Budget>,
+}
+
+impl<'b> Probed<'b> {
+    fn new(ctx: &'b Context<'_>, rows: Solutions) -> Self {
+        let bytes = rows.table.memory_bytes();
+        Self {
+            rows,
+            held: Reservation::adopt(&*ctx.budget, bytes),
+        }
+    }
+
+    /// The rows, whose new holder releases them.
+    fn take(self) -> Solutions {
+        self.held.transfer();
+        self.rows
     }
 }
 
@@ -544,14 +541,16 @@ mod tests {
         let snapshot = engine.snapshot();
         let shared = SharedBudget::new(1 << 20);
         let options = QueryOptions {
-            shared_memory: Some(shared.clone()),
+            resources: crate::Resources {
+                shared_memory: Some(shared.clone()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let ctx = Context::new(&snapshot, &options, None, None);
         let unrelated = payload(&ctx, 99);
         let bytes = unrelated.table.memory_bytes();
         let probes = RefCell::new(Vec::new());
-        let disposed = RefCell::new(Vec::new());
         let buffers = RefCell::new(HashMap::new());
         let rounds = Cell::new(0);
         let found = ctx
@@ -590,36 +589,32 @@ mod tests {
                         return Ok(None);
                     }
                     if id == 3 {
-                        assert_eq!(*disposed.borrow(), [9]);
+                        assert_eq!(shared.used(), bytes * 4, "9 is released before 3 is probed");
                     }
                     assert!(matches!(id, 1 | 2 | 3 | 8 | 9), "dominated suffix probed");
                     let rows = payload(&ctx, id);
                     buffers
                         .borrow_mut()
                         .insert(id, rows.table.column(0).as_ptr());
-                    Ok(Some(rows))
-                },
-                |rows| {
-                    disposed.borrow_mut().push(rows.table.get(0, 0));
-                    ctx.consumed(&rows);
+                    Ok(Some(Probed::new(&ctx, rows)))
                 },
             )
             .map_err(QueryEvaluationError::from)
             .unwrap();
         assert_eq!(rounds.get(), 2);
         assert_eq!(*probes.borrow(), [0, 8, 9, 1, 2, 3]);
-        assert_eq!(*disposed.borrow(), [9, 8]);
         assert_eq!(
             found.iter().map(|(id, _, _)| id.raw()).collect::<Vec<_>>(),
             [1, 2, 3]
         );
-        assert_eq!(shared.used(), bytes * 4);
+        assert_eq!(shared.used(), bytes * 4, "8 is released");
         assert_eq!(
             shared.peak(),
             bytes * 5,
             "one incoming probe may overlap the k retained bags"
         );
         for (id, _, rows) in found {
+            let rows = rows.take();
             assert_eq!(
                 rows.table.column(0).as_ptr(),
                 buffers.borrow()[&id.raw()],
@@ -681,7 +676,6 @@ mod tests {
                         assert!(seen.insert(id.raw()), "each ID probed once");
                         Ok((id.raw() != 0).then_some(()))
                     },
-                    |_| {},
                 )
                 .map_err(QueryEvaluationError::from)
                 .unwrap();
@@ -711,7 +705,6 @@ mod tests {
                         (hits(&values), report(space))
                     },
                     |id| Ok((id.raw() != 0).then_some(())),
-                    |_| {},
                 )
                 .map_err(QueryEvaluationError::from)
                 .unwrap();
@@ -730,8 +723,11 @@ mod tests {
             let token = CancellationToken::new();
             let shared = SharedBudget::new(1 << 20);
             let options = QueryOptions {
-                cancellation: Some(token.clone()),
-                shared_memory: Some(shared.clone()),
+                resources: crate::Resources {
+                    cancellation: Some(token.clone()),
+                    shared_memory: Some(shared.clone()),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let ctx = Context::new(&snapshot, &options, None, None);
@@ -766,9 +762,8 @@ mod tests {
                     if id.raw() == 2 && stop == "probe_cancel" {
                         token.cancel();
                     }
-                    Ok(Some(rows))
+                    Ok(Some(Probed::new(&ctx, rows)))
                 },
-                |rows| ctx.consumed(&rows),
             );
             assert!(result.is_err(), "{stop}");
             assert_eq!(
@@ -823,7 +818,10 @@ mod tests {
         );
         const UNRELATED: usize = 128;
         let options = QueryOptions {
-            memory_limit: Some(UNRELATED + 8192 - 1),
+            resources: crate::Resources {
+                memory_limit: Some(UNRELATED + 8192 - 1),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let ctx = Context::new(&snapshot, &options, None, None);
