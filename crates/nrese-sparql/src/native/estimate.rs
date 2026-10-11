@@ -113,7 +113,8 @@ impl Context<'_> {
             // Paths joined to triple patterns, ordered with them as the executor does.
             Plan::Join(_)
                 if !self.as_written
-                    && let Some(join) = PathJoin::of_plan(plan) =>
+                    && let lowered = plan.lower()
+                    && let Some(join) = PathJoin::of(&lowered) =>
             {
                 let rows = self.path_join_steps(&join, depth + 1, steps);
                 let detail = format!(
