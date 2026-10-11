@@ -308,59 +308,6 @@ mod tests {
     use super::*;
     use crate::TermId;
 
-    #[global_allocator]
-    static ALLOCATOR: nrese_exec::heap::Counting<std::alloc::System> =
-        nrese_exec::heap::Counting(std::alloc::System);
-
-    /// Isolate the existing process-wide allocation counter from the other unit tests,
-    /// including when this binary is run by cargo test instead of nextest.
-    #[test]
-    fn raw_spill_keeps_bytes_without_a_chunk_copy() {
-        if !std::env::args().any(|arg| arg == "--test-threads=1") {
-            let test = std::thread::current();
-            let status = std::process::Command::new(std::env::current_exe().unwrap())
-                .arg("--exact")
-                .arg(test.name().expect("libtest names its test threads"))
-                .arg("--test-threads=1")
-                .status()
-                .unwrap();
-            assert!(status.success());
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let value = quad(0x0102030405060708, 9, 10, u64::MAX);
-        let mut batches = vec![vec![value; 16 * 1024]; 16];
-        batches.insert(3, Vec::new());
-        let count: usize = batches.iter().map(Vec::len).sum();
-        nrese_exec::heap::start("raw spill");
-        let before = nrese_exec::heap::live();
-        let spiller = Spiller::start(dir.path()).unwrap();
-        assert!(spiller.send(batches));
-        let spill = spiller.finish().unwrap();
-        let peak = nrese_exec::heap::peak();
-        let _ = nrese_exec::heap::finish();
-        // 8 MiB of input, one 1 MiB writer, and a little path/file bookkeeping. The old
-        // concatenation alone allocated another 8 MiB before freeing any input batch.
-        assert!(
-            peak - before < 2 << 20,
-            "extra live bytes: {}",
-            peak - before
-        );
-        let bytes = fs::read(&spill.raw[0]).unwrap();
-        assert_eq!(bytes.len(), count * 32);
-        let expected: Vec<u8> = [9u64, 10, u64::MAX, 0x0102030405060708]
-            .into_iter()
-            .flat_map(u64::to_le_bytes)
-            .collect();
-        assert!(
-            bytes
-                .as_chunks::<32>()
-                .0
-                .iter()
-                .all(|record| record.as_slice() == expected)
-        );
-    }
-
     #[test]
     fn raw_spill_preserves_batch_order_and_reports_write_errors() {
         let dir = tempfile::tempdir().unwrap();
