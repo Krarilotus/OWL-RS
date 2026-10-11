@@ -48,8 +48,7 @@ more than once copies only its additional occurrences.
 
 ### Execution and resource lifetime
 
-This section owns the execution policy; configuration keys are listed in
-[config-reference.md](../ops/config-reference.md#cpu-execution).
+This section owns the execution policy; there is no setting for it besides `dl.threads`.
 
 - **Queries run on their caller.** Native evaluation, update `WHERE`, result encoding and
   output stay on the thread that asked; a parallel kernel (joins, sorts, closures, spill)
@@ -58,14 +57,17 @@ This section owns the execution policy; configuration keys are listed in
   `SERVICE` callbacks run inside evaluation, on whichever thread evaluates.
 - **The store's `Runtime` owns the native query budget.** A catalog and its system store
   share one; each query and update `WHERE` reserves from it. Live native results keep
-  their reservation until they are dropped.
-- **One reservation type.** `nrese_exec::Budget` hands out RAII reservations: a charge is
-  returned when its owner drops, on every path including errors and unwinding. Query
-  tables, retained results, the DL gap's scratch and the DL engines' charged buffers use
-  it; there is no second charge-on-drop mechanism.
+  their reservation until they are dropped. `QueryOptions` and `UpdateOptions` carry one
+  `Resources`: the cancellation token, the memory limit, the shared budget and a
+  `Workers` handle (the current Rayon registry by default).
+- **One reservation type.** `nrese_exec::Reservation` returns its charge to its `Budget`
+  when it drops, on every path including errors and unwinding. Query tables, retained
+  solution tables and their appended bound rows, the DL gap's scratch and the vector
+  collector's candidates use it; there is no second charge-on-drop mechanism.
 - **`Workers` is the DL batch width.** DL classification, realisation and exact
-  candidate batches take a `Workers` handle sized by `dl.threads` (0: Rayon's
-  parallelism). A narrower handle bounds the batch's own dispatch; it is not a semaphore
+  candidate batches take a `Workers` handle sized by `dl.threads` (0: every core;
+  `Workers::new(n)` with `n` ≤ 1, or a pool that can't start, runs serially). A narrower
+  handle bounds the batch's own dispatch; it is not a semaphore
   inherited by nested Rayon work, so child work partitions its allowance explicitly.
   Full-width batches keep Rayon's work stealing; narrow ones use bounded lanes, an idle
   lane claiming the next probe while results keep their order.

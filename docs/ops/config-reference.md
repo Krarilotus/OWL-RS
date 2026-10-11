@@ -243,7 +243,7 @@ api_key = "replace-me"
   - file key `dl.timeout`, env `NRESE_DL_TIMEOUT_MS` (default 30min): the time one DL task may take (a commit's consistency check, a query's exact services, a classification); what isn't decided by then is reported, never guessed
   - file key `dl.memory`, env `NRESE_DL_MEMORY` (default 4GiB; `0` unlimited): the capacity one DL task's saturation and search may hold, checked at work boundaries; exhaustion is reported as incomplete, never as an answer. What it covers, and how it can overshoot: [owl2-dl.md §13](../design/owl2-dl.md#13-configuration)
   - file key `dl.max_candidates`, env `NRESE_DL_MAX_CANDIDATES` (default 1000): the candidate answers (in the upper bound, not the lower) a query checks with the exact services at most; the rest are reported unresolved
-  - file key `dl.threads`, env `NRESE_DL_THREADS` (default 0, Rayon's parallelism): the width of one DL operation's classification, realisation and exact-candidate batches
+  - file key `dl.threads`, env `NRESE_DL_THREADS` (default 0, every core): the maximum workers of a DL operation
   - file key `dl.max_nodes`, env `NRESE_DL_MAX_NODES` (default 2000000), and `dl.max_branch_points`, env `NRESE_DL_MAX_BRANCH_POINTS` (default 1000000): the deterministic budgets of one hypertableau run (a consistency check, an entailment test, a class test), beside `dl.timeout`. A run past a budget decides nothing: its candidate stays unresolved, its class untested, its commit's status `unknown`, never a wrong answer
 - with any mode but `disabled`:
   - `nrese-server load` and startup materialise the closure (startup skips it when `reasoning.state` in the data directory records that the inferred stack is current for this build's semantics; `/version` reports them as `reasoning_semantics`, e.g. `owl2-rl v2 <fingerprint>`)
@@ -269,13 +269,6 @@ Read replicas ([replication.md](replication.md)); both sides need an on-disk sto
 - `federation.timeout` (env `NRESE_FEDERATION_TIMEOUT_MS`, units as in [Budgets](#budgets)): per request to an endpoint; default `30s`
 - `federation.max_rows` (env `NRESE_FEDERATION_MAX_ROWS`): rows one request may return; default 1,000,000
 - a `SERVICE` joined to a pattern sends the pattern's distinct values as `VALUES`, 200 rows per request (up to 20,000 values; beyond, the block goes once, unbound); redirects are not followed; queries with `SERVICE` are never answered from the result cache
-
-## CPU execution
-
-Queries, updates and their output run on the thread that asked; parallel kernels use
-Rayon's global pool, which has one thread per logical CPU unless `RAYON_NUM_THREADS` says
-otherwise. There is no query pool and no catalog-wide CPU cap; `dl.threads` sets the width
-of DL batches. The policy and what it covers: [execution-core.md](../design/execution-core.md#execution-and-resource-lifetime).
 
 ## Budgets
 

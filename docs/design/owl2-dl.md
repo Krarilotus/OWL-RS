@@ -833,7 +833,7 @@ consistency are designed, not yet settings.
 | `dl.timeout`, `dl.memory` | per operation | 30 min, 4 GiB |
 | `dl.fallback.clauses`, `dl.fallback.equalities`, `dl.fallback.contexts` | budgets of §4 | from the ORE and Oxford runs |
 | `dl.race` | `on`, `off` | `on` above a module size |
-| `dl.threads` | batch width; 0: Rayon's parallelism | 0 |
+| `dl.threads` | batch width; 0: every core | 0 |
 | `dl.cache` | `sat`, `completion-graph`, `off` | `sat` |
 | `dl.explanations` | `proofs` (record derivations), `off` | `proofs` |
 
