@@ -763,8 +763,9 @@ adaptation. SPARQL owns each retained solution table's snapshot, computed terms 
 reservation. Lower and upper results must share a dictionary; query-local computed IDs
 are remapped before raw IDs are compared. Lower bags and delivery order survive, and a
 true lower ASK skips the upper evaluation. The upper ID table is materialised; decoded
-exact-candidate rows are batched. Under a finite `dl.max_candidates` the candidates
-checked first are a deterministic prefix; the rest are reported unresolved.
+exact-candidate rows are batched. Under a finite `dl.max_candidates` the capped
+candidate prefix is admitted in term-id order (deterministic, not by meaning); the rest
+are reported unresolved.
 
 Eligible exact tests use the existing `tableau::Prepared` probe engine. One immutable
 program per candidate batch holds a fresh selector per test that implies its assumption;
