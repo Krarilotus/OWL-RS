@@ -38,9 +38,12 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
   identity; a total order additionally permits exact sequence comparison. Unordered
   `LIMIT`, tied ordering and other permitted nondeterminism need case-specific
   legal-output checks. Different permitted outputs alone are not a wrong answer.
-  Keep strict mismatches and their adjudication visible. Do not silently coerce
-  numeric terms, add an ordering to the measured query, or treat equal counts as
-  complete validation. An approximate task declares its quality target before timing.
+  Each system is compared with one reference, never by majority, and the strict and
+  the value comparison are recorded apart: an integer typed `xsd:int` where the
+  reference has `xsd:integer` is a value match with its datatype difference kept
+  ([suite/suitekit/answers.py](suite/suitekit/answers.py)). Don't add an ordering to
+  the measured query, or treat equal counts as complete validation. An approximate
+  task declares its quality target before timing.
 - **Timeouts aren't answers.** An exact service never turns a timeout into "not entailed" or an empty result.
 
 ## 3. Fairness
@@ -128,18 +131,12 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
 - **Per query:** the median of the measured repeats within a repetition, then the median over the repetitions.
 - **Spread:** the range of the per-repetition medians relative to their median. With one repetition, the interquartile range of the repeats. The spread is reported next to every comparison.
 - **Per pair:** the sum of the query medians (first and repeated executions apart), the load time, store size, restart time and peak memory, each as a median over the repetitions.
-- **Comparing two runs or two systems:**
-  - the ratio per query;
-  - the geometric mean of the ratios, beside the ratio of the sums;
-  - a change counts only beyond `max(10 %, the measured spread of both sides)` and beyond 2 ms (`suite.py compare`).
-  - For declared microcase comparisons, record an explicitly lower `--min-ms` floor
-    (zero is supported). Keep the repetition and noise checks. Exploratory reanalysis
-    with a new floor is labelled as such; choose the acceptance thresholds before the
-    next measurement. A below-floor change is not evidence of equivalent performance.
-  - Compare throughput directly, with lower QPS as worse, at each client width.
-    A latency floor in milliseconds cannot qualify throughput. Missing cases, widths,
-    repetitions or answers cannot disappear into an intersection of successful work;
-    expected boundary outcomes receive no timing credit.
+- **Comparing two runs or two systems:** the ratio per query, and the geometric mean of
+  the ratios beside the ratio of the sums. A change counts only beyond a relative
+  threshold, the measured spread of both sides and an absolute floor; throughput is
+  judged per client width; lost cases and answers come first and never vanish into the
+  work both sides finished. Thresholds are chosen before measuring, and their values and
+  exceptions have one owner: [fast/README.md](fast/README.md#comparing).
 - **Corpora** (ORE, the W3C suites, generated ontologies):
   - solved counts;
   - median, p90, p95 and p99;
@@ -157,10 +154,9 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
   - the machine (CPU, threads, RAM, OS) and Docker's own limits;
   - the protocol settings and the relevant environment;
   - every image's content id and every dataset's size.
-- **Run record.** `runs/<run>.toml`, committed:
-  - the scope, commit, machine and protocol;
-  - the outcome of each pair, but no times;
-  - by hand: the purpose, the baseline it is compared with, and the findings.
+- **Run record.** `runs/<run>.toml`, committed ([runs/README.md](runs/README.md)): the
+  builds compared and their identities, the host and scenario, the protocol, the inputs
+  and results by SHA-256, and a verdict per case; the raw samples stay with the results.
 - **Status.** `STATUS.md` is generated from the registries and the records.
 - **Baselines.** `baselines/` holds committed NRESE numbers that later work is compared against. A change that makes a tier's sum more than 5% slower, beyond the noise, explains why or doesn't merge.
 
@@ -177,13 +173,11 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
 - **Before a milestone.** NRESE runs on its standard tiers and is compared against the last baseline run. The other systems rerun only where their pairs are missing or their versions changed.
 - **Cleanup**, on every machine:
   - Containers, stores and scratch go after every run.
-  - Verified shared input snapshots, seeds, hashes, unique fixtures, reference
-    answers and retained results stay. Reuse these across campaigns; neither a
-    completed run nor low disk space authorizes deleting preservation copies.
-  - Remove only identified owned disposable stores, containers, scratch and
-    obsolete builds after final use. Keep caches/images needed by planned runs.
-    Legacy `batch.sh`/`bench-cleanup.sh` broad or low-disk cleanup must not manage
-    preserved inputs or another campaign's resources.
+  - Verified shared inputs ([hosts.toml](hosts.toml)), seeds, hashes, unique fixtures,
+    reference answers and retained results stay; neither a finished run nor low disk
+    space authorizes deleting them.
+  - Remove only identified owned disposable stores, containers, scratch and obsolete
+    builds after final use. Keep caches and images planned runs need.
   - Installed tools and the `nrese-bench/*` images stay.
 
 ## 9. Threats to validity, and what answers them
