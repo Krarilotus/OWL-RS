@@ -26,6 +26,17 @@ GIT_INDEX_FILE=$index git add -A
 tree=$(GIT_INDEX_FILE=$index git write-tree)
 snapshot=$(git commit-tree "$tree" -p HEAD -m "snapshot of $name")
 
+# A host whose users need it back (its guard wrote ~/owlrs/RETREAT, tools/office-guard) takes no
+# builds: use the fallback host (git config nrese.buildHostFallback) or stop here.
+if ssh -o BatchMode=yes "$host" "test -f $root/RETREAT"; then
+  fallback=$(git config --get nrese.buildHostFallback)
+  if [ -z "$fallback" ] || ssh -o BatchMode=yes "$fallback" "test -f $root/RETREAT"; then
+    echo "$host is in use by its owners (RETREAT); no build host free, try again later" >&2
+    exit 75
+  fi
+  echo "$host is in use by its owners; building on $fallback" >&2
+  host=$fallback
+fi
 ssh -o BatchMode=yes "$host" "[ -d $root/repo.git ] || git init -q --bare $root/repo.git" || exit 2
 # Transport only: the hooks of this repository would start the gate again on this push.
 git -c core.hooksPath=/dev/null push -q -f "$host:$root/repo.git" "$snapshot:refs/heads/snapshot/$name" || exit 2
