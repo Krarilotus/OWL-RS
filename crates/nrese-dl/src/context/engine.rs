@@ -173,7 +173,7 @@ pub struct Engine {
     contexts: Arena,
     registry: Mutex<HashMap<CoreKey, ContextId>>,
     budget: Budget,
-    cancel: Option<crate::tableau::Cancel>,
+    cancel: Option<crate::Cancel>,
     /// Pred joins stop where the body so far already makes the conclusion redundant.
     pub prune_pred: bool,
     /// The budget ran out: the workers drop what is left (the saturation is then
@@ -235,7 +235,7 @@ impl Engine {
         self
     }
 
-    pub(super) fn with_cancel(mut self, cancel: Option<crate::tableau::Cancel>) -> Self {
+    pub(super) fn with_cancel(mut self, cancel: Option<crate::Cancel>) -> Self {
         self.cancel = cancel;
         self
     }
@@ -318,7 +318,7 @@ impl Engine {
         if self
             .cancel
             .as_ref()
-            .is_some_and(crate::tableau::Cancel::is_cancelled)
+            .is_some_and(crate::Cancel::is_cancelled)
         {
             self.exhaust();
             return true;
