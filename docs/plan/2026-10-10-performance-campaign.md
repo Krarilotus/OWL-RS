@@ -13,6 +13,105 @@ or treat an earlier revision's results as current-head qualification.
   [host/data guide](../../benches/README.md#remote-hosts-and-shared-data).
 - Prior evidence: [status](../STATUS.md), [performance log](../design/performance.md).
 
+## Closeout and maintainer handover, 11 October
+
+The owner ended this optimisation round and will take over. **Do not resume the
+historical run instructions below automatically.** No further optimisation or new
+benchmark architecture is selected. This is a documented recovery checkpoint, not
+evidence that further gains are impossible or that v2 passes performance acceptance.
+
+The retained Horn candidate is K: `dc2114a` plus patch SHA256
+`392e314c31f0c1c15436cefa6e4234d38f191b2f064ad1e83246da6c7a44f2a2`.
+The closeout adds comments/documentation only to that measured implementation.
+The [Horn run record](../../benches/runs/2026-10-11-horn-recovery.toml) owns source,
+fixture, output identities and separate cohorts. The branch tip identifies the
+published closeout; preserved binaries retain their original patch identities.
+
+| Horn3000, Phuoc-Yu, K primary cohort | Original `0f46563` | Retained K | Change |
+|---|---:|---:|---:|
+| 16-thread saturation | 790.2 ms | 841.5 ms | +6.49% |
+| Serial saturation | 4,921.6 ms | 5,217.4 ms | +6.01% |
+| Store classification | 1,351.675 ms | 1,318.520 ms | -2.45% |
+
+These are three alternating pairs per scenario, not ten-pair final qualification.
+A later independent three-group cohort measured original/K at 792.5/813.7 ms,
+4,886.7/5,189.5 ms and 1,377.498/1,334.010 ms respectively. Both cohorts retain
+all runs and memory observations; do not pool them or claim a general store speedup.
+The earlier ten-pair original/published-`dc2114a` store result remains 1,399.408 /
+9,315.034 ms (6.66x slower). K removes that large observed regression on this input,
+but the serial gap remains. The complete 95-case exact-start matrix is still the
+`dc2114a` matrix, not a final-K matrix.
+
+The recovery belongs to `nrese-dl` context state and work boundaries: plain message
+payloads, local capacity summaries, periodic aggregate observations, one shared stop
+flag, borrowed registry lookup and existing mutation paths for capacity deltas.
+It removes per-message shared reservation bookkeeping and duplicate hot stop checks.
+It adds no scheduler, routing framework or new fixed limit. The configurable memory
+envelope is sampled, can lag/overlap or miss transient peaks, and is not a strict
+allocator ceiling. Eq and other auxiliary owners still use charges. See the
+[configuration contract](../design/owl2-dl.md#13-configuration).
+
+Rejected E/I/L/M implementations are absent. M's activation-load shortcut passed
+81 focused tests; the original/K/M comparison completed 27 correct native invocations.
+M was slower than K in every 16-thread group;
+its median was +12.78% versus K. Its code and tests were removed, while patches,
+binaries and failed performance evidence remain. The final cleanup review found no
+additional executable leftovers in the K recovery diff; four misleading accounting
+comments/docs were corrected. This scoped review is not a claim of zero technical debt.
+
+### Open issues for the next owner
+
+- **Resource ownership:** public `context::Engine::with_budget` after contexts exist
+  does not rebuild all accounting consistently. Detached `Individuals` retain their
+  original accounting owner; public mutation of `Individuals.contexts` is not tracked.
+  Current store callers configure a fresh engine, so the measured path does not
+  exercise rebudgeting. Retained results, changed policy, historical peaks and sticky
+  exhaustion need an explicit API contract before repair; no silent policy change landed.
+- **Performance/progress:** the residual Horn serial cost, explicit-pool cache/worker
+  progress and callback reentry remain open. Default caller execution recovery does
+  not certify every explicit-pool configuration. Empty-body Pred records may have a
+  shorter useful lifetime than their containing context; this is an unimplemented,
+  unmeasured follow-up, not a promised gain. No N experiment was started.
+- **Correctness/qualification:** approximate vector recall still fails the existing
+  gate; large-answer replay and numeric/datatype adjudication remain incomplete.
+  The intermittent Horn reference taxonomy omission and comparable reference timings
+  remain unresolved. Preserve failed/unsupported rows rather than ranking them.
+- **Measurement infrastructure:** kernel container peak-memory accounting and the
+  streaming/offline large-answer recorder remain unfinished design work. No workload
+  reduction, new benchmark cap, host privilege rule or SQLite recorder was introduced.
+
+### Handover locations and operating procedure
+
+- `benches/README.md` maps the kits; `benches/PROTOCOL.md` owns fairness and publication.
+  `benches/fast/fast.py` / `cases.toml` own focused native checks and the 95-case matrix;
+  `benches/suite/suite.py` owns end-to-end and competitor tracks;
+  `benches/reasoning/dl/reference.py` owns DL reference comparisons. Select a kit by
+  the property being tested; keep native-capacity and matched-resource scenarios separate.
+- Private portable report: `tmp/finish-20261010/export/index.html`, with `README.md`,
+  `REPRODUCE.md` and `SHA256SUMS`. It retains the full original campaign, losses,
+  exclusions and separate recovery evidence. Licensed numbers stay private; public
+  PR/docs give GraphDB/RDFox/Stardog/AnzoGraph coverage/status only. No licence keys,
+  proprietary binaries or benchmark datasets belong in a shared export.
+- Remote evidence root on Office/Phuoc: `/home/krarilotus/nrese-prep-20261009-4e8bd38`;
+  full matrix `finish-20261010-dc2114a`, Horn evidence `horn-repair-20261011/attempt-*`.
+  Reusable verified inputs remain under `/home/krarilotus/nrese-assets/kraris-gptler-20261009`.
+  Host paths and verification receipts are in the private handover; use shared inputs
+  read-only, never duplicate them into each worktree.
+- Office remains the Rust build/test/hook owner, using `candidate-c888a20` and its
+  existing `target-candidate-c888a20`. Phuoc runs verified compatible release binaries.
+  Rebuild for a friend's CPU and record the new toolchain/flags/hashes; historical
+  native-CPU binaries are provenance, not portable performance guarantees.
+- Verify source, fixture and output hashes before timing. Interleave original/candidate
+  on one quiet host, check exact outputs and completeness first, then compare speed
+  and memory within that cohort. Existing full-workload failures remain visible.
+  The final validation/publication receipt and gate logs accompany the private export
+  and PR; historical focused-test passes do not replace the publication gates.
+
+Cleanup already retired 30 verified redundant Office example binaries (259,481,600
+bytes, 247.46 MiB), after verifying their retained Phuoc copies. Reusable target/cache,
+original/K/rejected control artifacts, raw answers, seeds, manifests and shared inputs
+are retained for takeover. No local Rust target or additional worktree was created.
+
 ## Execution contract
 
 1. Freeze source, binaries, inputs, seeds, settings and machine identities before

@@ -88,8 +88,8 @@ pub struct Options {
     /// The most memory the process may hold while the context core runs (bytes; `None`:
     /// three quarters of what the machine or container has; `Some(0)`: disabled).
     pub max_memory: Option<u64>,
-    /// Capacity budget of each context saturation, independent of the process ceiling.
-    /// `None` disables task accounting. The tableau's per-worker limit remains in `tableau`.
+    /// Sampled capacity envelope of each context saturation, independent of the process
+    /// ceiling. `None` disables observations. Tableau limits remain in `tableau`.
     pub task_memory: Option<usize>,
     /// The context core takes functional properties with its Eq rule
     /// ([`crate::context::Options::equality`]).

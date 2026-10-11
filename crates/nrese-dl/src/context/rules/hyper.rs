@@ -1,7 +1,6 @@
 //! Hyperresolution joins over one context, using its worker-owned scratch buffers.
 
 use super::super::atoms::{Atom, CTerm, Kind, is_subset, union_into};
-use super::super::memory;
 use super::super::program::{BodyPat, DlClause, HeadPat, Slot, TermPat, Var};
 use super::super::state::{ClauseId, ClauseRef, Rule};
 use super::{Found, Item, Worker};
@@ -13,7 +12,7 @@ impl Worker<'_> {
         let program = &self.engine.program;
         let mut s = std::mem::take(&mut self.scratch);
         program.slots(head, &self.state.clauses.concepts, &mut s.slots);
-        if !s.check_memory() || s.slots.is_empty() {
+        if s.slots.is_empty() {
             self.scratch = s;
             return;
         }
@@ -25,6 +24,9 @@ impl Worker<'_> {
         self.state.clauses.counters.slots += s.slots.len() as u64;
         let present = &self.state.clauses.present;
         for at in 0..s.slots.len() {
+            if self.engine.exhausted() {
+                break;
+            }
             let Slot {
                 clause: dl,
                 guard,
@@ -44,15 +46,17 @@ impl Worker<'_> {
             s.bind.clear();
             s.bind.resize(program.vars[dl as usize] as usize, None);
             // At most one premise per body atom, including the fixed trigger. Reserve
-            // once before recursion, so the worker owns and accounts this buffer there.
+            // once before recursion, so its capacity is stable in the checkpoint view.
             s.premises
                 .reserve(clause.body.len().saturating_sub(s.premises.len()));
-            if !s.check_memory() {
-                break;
-            }
             if !unify(clause.body[pos as usize], head, &mut s.bind) {
                 continue;
             }
+            let scratch_bytes = if self.state.clauses.observe_memory {
+                s.bytes() - s.found.bytes()
+            } else {
+                0
+            };
             self.hyper_join(
                 (clause, dl),
                 (pos as usize, c),
@@ -61,10 +65,10 @@ impl Worker<'_> {
                 &s.body,
                 &mut s.premises,
                 &mut s.found,
+                scratch_bytes,
             );
         }
         self.conclude(&s.found);
-        s.check_memory();
         self.scratch = s;
     }
 
@@ -80,9 +84,10 @@ impl Worker<'_> {
         acc: &[Atom],
         premises: &mut Vec<ClauseId>,
         found: &mut Found,
+        scratch_bytes: usize,
     ) {
         let (clause, id) = dl;
-        if self.engine.task_memory_exhausted() {
+        if self.engine.exhausted() {
             return;
         }
         if i == clause.body.len() {
@@ -106,17 +111,18 @@ impl Worker<'_> {
                     body: b,
                     premises: (p, found.premises.len() as u32 - p),
                 });
-                found.check_memory();
+                if found.len().is_multiple_of(4096) {
+                    self.checkpoint_extra(scratch_bytes + found.bytes());
+                }
             }
             return;
         }
         if i == fixed.0 {
-            return self.hyper_join(dl, fixed, i + 1, bind, acc, premises, found);
+            return self.hyper_join(dl, fixed, i + 1, bind, acc, premises, found, scratch_bytes);
         }
         let clauses = &self.state.clauses;
         let mut each = |atom: Atom, bind: &mut [Option<CTerm>]| {
             let mut union = Vec::new();
-            let mut memory = self.engine.memory_charge();
             for p in clauses.premises_for(atom, fixed.1) {
                 let body = clauses.body(p);
                 let next: &[Atom] = if body.is_empty() || is_subset(body, acc) {
@@ -126,10 +132,7 @@ impl Worker<'_> {
                     &union
                 };
                 premises.push(p);
-                if !memory.set(memory::vec(&union)) {
-                    return;
-                }
-                self.hyper_join(dl, fixed, i + 1, bind, next, premises, found);
+                self.hyper_join(dl, fixed, i + 1, bind, next, premises, found, scratch_bytes);
                 premises.pop();
             }
         };
@@ -195,4 +198,84 @@ pub(super) fn instantiate(head: Option<HeadPat>, bind: &[Option<CTerm>]) -> Opti
         TermPat::Func(f) => CTerm::func(f),
     };
     Some(Atom::of(h.kind.kind(), h.pred, t))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::{
+        engine::{Budget, Engine, Strategy, lock},
+        program::Program,
+        rules::{Out, Scratch},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[test]
+    fn hyper_join_stops_at_its_checkpoint_and_observes_detached_scratch() {
+        // 66 independent premises for each atom yield 4356 conclusions. Cancellation
+        // or memory pressure is first observed inside the join, after 4096 conclusions.
+        for stop in 0..3 {
+            let flag = Arc::new(AtomicBool::new(false));
+            let engine = Engine::new(Program::default(), Strategy::Cautious, false)
+                .with_budget(Budget {
+                    task_memory: (stop == 2).then_some(4 << 20),
+                    ..Budget::default()
+                })
+                .with_cancel(Some(crate::tableau::Cancel::from_flag(flag.clone())));
+            let (root, _) = engine.context_for(&[]);
+            let mut state = lock(&engine.context(root).state);
+            for head in 0..2 {
+                for i in 0..66 {
+                    let id = state
+                        .clauses
+                        .derive(
+                            &[Atom::concept(10 + head * 66 + i, CTerm::X)],
+                            Atom::concept(head, CTerm::X),
+                            (Rule::Core, 0, &[]),
+                            false,
+                        )
+                        .unwrap();
+                    state.clauses.recs[id as usize].processed = true;
+                }
+            }
+            let clause = DlClause {
+                body: vec![BodyPat::Concept(0), BodyPat::Concept(1)].into_boxed_slice(),
+                head: None,
+                sources: Box::default(),
+            };
+            let mut out = Out::new(root);
+            let worker = Worker {
+                engine: &engine,
+                state: &mut state,
+                out: &mut out,
+                scratch: Scratch::default(),
+                input_bytes: 0,
+            };
+            let mut scratch = Scratch::default();
+            scratch.waiting.reserve(2 << 20);
+            scratch.premises.reserve(2);
+            let detached = scratch.bytes() - scratch.found.bytes();
+            if stop == 1 {
+                flag.store(true, Ordering::Release);
+            }
+            worker.hyper_join(
+                (&clause, 0),
+                (usize::MAX, u32::MAX),
+                0,
+                &mut [],
+                &[],
+                &mut scratch.premises,
+                &mut scratch.found,
+                detached,
+            );
+            assert_eq!(scratch.found.len(), if stop == 0 { 4356 } else { 4096 });
+            assert_eq!(engine.exhausted(), stop != 0);
+            if stop == 2 {
+                assert!(engine.task_memory_bytes().1 >= detached);
+            }
+        }
+    }
 }

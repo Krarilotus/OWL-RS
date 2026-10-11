@@ -9,7 +9,7 @@
 //!   --threads N       saturation workers (default 1)
 //!   --strategy S      `cautious` (default), `eager` or `split`
 //!   --no-proofs       don't record derivations
-//!   --task-memory-mib N  optional saturation capacity budget; 0 is unlimited
+//!   --task-memory-mib N  sampled saturation-capacity envelope; 0 is unlimited
 //!   --repeat N        classify N times; times are the median of the runs
 //!   --compare-el      also classify with the EL classifier (`nrese_reasoner::classify`) on
 //!                     the same triples, runs interleaved (ABAB), and compare the taxonomies
