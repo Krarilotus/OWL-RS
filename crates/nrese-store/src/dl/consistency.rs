@@ -5,6 +5,7 @@
 use std::time::{Duration, Instant};
 
 use nrese_dl::tableau;
+use nrese_exec::workers::Workers;
 use nrese_owl::Ontology;
 
 /// What a consistency check found.
@@ -49,14 +50,25 @@ pub struct Checked {
 pub struct Budget {
     pub timeout: Duration,
     pub memory_bytes: usize,
-    pub threads: usize,
-    /// The operation's physical owner; `threads` may narrow its dispatch allowance.
-    pub workers: Option<nrese_exec::workers::Workers>,
+    /// The operation's allowance within its physical owner.
+    pub workers: Workers,
     /// Stops the context core and hypertableau at their next budget check.
     pub cancel: Option<tableau::Cancel>,
     /// The deterministic budgets of a hypertableau run.
     pub max_nodes: usize,
     pub max_branch_points: u64,
+}
+
+impl Budget {
+    /// A nested check spends the operation's remaining time, never a fresh full timeout.
+    pub(crate) fn remaining(&self, deadline: Instant) -> Self {
+        Self {
+            timeout: self
+                .timeout
+                .min(deadline.saturating_duration_since(Instant::now())),
+            ..self.clone()
+        }
+    }
 }
 
 /// The most conclusions one join of the context core may produce (its deterministic
@@ -83,18 +95,10 @@ pub fn left_out(ontology: &Ontology) -> Option<String> {
 /// source was left out ([`left_out`]).
 pub fn check(ontology: &Ontology, budget: &Budget) -> Checked {
     let started = Instant::now();
-    let workers = budget.workers.as_ref().map_or_else(
-        || {
-            nrese_exec::workers::Workers::new(budget.threads.max(1))
-                .unwrap_or_else(|_| nrese_exec::workers::Workers::serial())
-        },
-        |workers| workers.limited(budget.threads.max(1)),
-    );
-    let mut checked = workers.install(|| {
-        let mut remaining = budget.clone();
-        remaining.timeout = budget.timeout.saturating_sub(started.elapsed());
-        check_read(ontology, &remaining, &workers)
-    });
+    let deadline = started + budget.timeout;
+    let mut checked = budget
+        .workers
+        .install(|| check_read(ontology, &budget.remaining(deadline)));
     checked.elapsed = started.elapsed();
     if checked.verdict == Verdict::Consistent
         && let Some(why) = left_out(ontology)
@@ -104,12 +108,9 @@ pub fn check(ontology: &Ontology, budget: &Budget) -> Checked {
     checked
 }
 
-fn check_read(
-    ontology: &Ontology,
-    budget: &Budget,
-    workers: &nrese_exec::workers::Workers,
-) -> Checked {
+fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
     let started = Instant::now();
+    let deadline = started + budget.timeout;
     if budget.timeout.is_zero() {
         return Checked {
             verdict: Verdict::Unknown("timeout".to_owned()),
@@ -118,10 +119,10 @@ fn check_read(
         };
     }
     let options = nrese_dl::context::Options {
-        threads: workers.width(),
+        threads: budget.workers.width(),
         proofs: false,
         budget: nrese_dl::context::Budget {
-            deadline: Some(started + budget.timeout),
+            deadline: Some(deadline),
             max_join: Some(MAX_JOIN),
             task_memory: (budget.memory_bytes != usize::MAX).then_some(budget.memory_bytes),
             ..nrese_dl::context::Budget::default()
@@ -132,7 +133,7 @@ fn check_read(
         ontology,
         &options,
         budget.cancel.clone(),
-        workers,
+        &budget.workers,
     ) {
         let verdict = match saturated.consistent() {
             true => Verdict::Consistent,
@@ -156,12 +157,12 @@ fn check_read(
         };
     }
     let config = tableau::Config {
-        timeout: Some(budget.timeout.saturating_sub(started.elapsed())),
+        timeout: Some(budget.remaining(deadline).timeout),
         max_memory: budget.memory_bytes,
         max_nodes: budget.max_nodes,
         max_branch_points: Some(budget.max_branch_points),
         cancel: budget.cancel.clone(),
-        workers: Some(workers.clone()),
+        workers: Some(budget.workers.clone()),
         ..tableau::Config::default()
     };
     // Island by island where the ABox splits (`nrese_dl::islands`).
@@ -187,8 +188,7 @@ mod tests {
         Budget {
             timeout: Duration::from_secs(10),
             memory_bytes: usize::MAX,
-            threads: 1,
-            workers: None,
+            workers: Workers::serial(),
             cancel: None,
             max_nodes: 10_000,
             max_branch_points: 10_000,

@@ -115,14 +115,20 @@ pub(super) fn decide_until(
         }
         let compiled = entailment::Batch::new(&mut ontology, &tests);
         let ontology = &ontology;
-        let cancel = nrese_dl::tableau::Cancel::from_flag(cancellation.flag());
         let width = workers.for_items(
             jobs.iter()
                 .filter(|job| job.as_ref().is_ok_and(|range| !range.is_empty()))
                 .count(),
         );
         let workers = workers.limited(width);
-        let child = workers.limited(1);
+        let budget = consistency::Budget {
+            timeout: config.timeout,
+            memory_bytes: config.memory_per_worker(width),
+            workers: workers.limited(1),
+            cancel: Some(nrese_dl::tableau::Cancel::from_flag(cancellation.flag())),
+            max_nodes: config.max_nodes,
+            max_branch_points: config.max_branch_points,
+        };
         let verdicts = workers.map(&jobs, |job| {
             let range = match job {
                 Ok(range) => range,
@@ -136,25 +142,8 @@ pub(super) fn decide_until(
                 if Instant::now() >= deadline {
                     return Entailed::Unknown("past dl.timeout".to_owned());
                 }
-                let budget = consistency::Budget {
-                    timeout: deadline.saturating_duration_since(Instant::now()),
-                    memory_bytes: config.memory_per_worker(width),
-                    threads: 1,
-                    workers: Some(child.clone()),
-                    cancel: Some(cancel.clone()),
-                    max_nodes: config.max_nodes,
-                    max_branch_points: config.max_branch_points,
-                };
-                let found = compiled.check(i, &budget).unwrap_or_else(|| {
-                    let budget = consistency::Budget {
-                        timeout: deadline.saturating_duration_since(Instant::now()),
-                        ..budget
-                    };
-                    match &tests[i] {
-                        Test::Axiom(axiom) => entailment::entails(ontology, axiom, &fresh, &budget),
-                        Test::Nonempty(class) => entailment::nonempty(ontology, *class, &budget),
-                    }
-                });
+                let found =
+                    compiled.check(i, &tests[i], ontology, &fresh, &budget.remaining(deadline));
                 match found {
                     Entailed::Yes => {}
                     other => {

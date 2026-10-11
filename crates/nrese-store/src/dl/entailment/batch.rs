@@ -109,60 +109,65 @@ impl Batch {
         }
     }
 
-    pub(crate) fn check(&self, index: usize, budget: &Budget) -> Option<Entailed> {
-        let started = std::time::Instant::now();
-        let check = || self.check_admitted(index, budget, started);
-        match &budget.workers {
-            Some(workers) => workers.install(check),
-            None => check(),
-        }
-    }
-
-    fn check_admitted(
+    /// Decides `tests[index]` of [`Self::new`] over its premise `ontology`: by the
+    /// compiled probe, or by the scalar reduction where the test has no probe form.
+    pub(crate) fn check(
         &self,
         index: usize,
+        test: &Test,
+        ontology: &Ontology,
+        fresh: &[u64],
         budget: &Budget,
-        started: std::time::Instant,
-    ) -> Option<Entailed> {
-        let (class, at) = self.probes[index]?;
-        if budget
-            .cancel
-            .as_ref()
-            .is_some_and(tableau::Cancel::is_cancelled)
-        {
-            return Some(Entailed::Unknown("cancelled".to_owned()));
-        }
-        let remaining = budget.timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            return Some(Entailed::Unknown("past dl.timeout".to_owned()));
-        }
-        let config = tableau::Config {
-            timeout: Some(remaining),
-            max_memory: budget.memory_bytes,
-            max_nodes: budget.max_nodes,
-            max_branch_points: Some(budget.max_branch_points),
-            cancel: budget.cancel.clone(),
-            workers: budget.workers.as_ref().map(|workers| workers.limited(1)),
-            portfolio: false,
-            ..tableau::Config::default()
+    ) -> Entailed {
+        let (Some(prepared), Some((class, at))) = (&self.prepared, self.probes[index]) else {
+            return match test {
+                Test::Axiom(axiom) => super::entails(ontology, axiom, fresh, budget),
+                Test::Nonempty(class) => super::nonempty(ontology, *class, budget),
+            };
         };
-        let outcome = self.prepared.as_ref()?.probe(
-            &Probe {
-                at,
-                positive: &[class],
-                negative: &[],
-            },
-            &config,
-            Want::default(),
-        );
-        Some(match outcome.answer {
-            tableau::Answer::Inconsistent => Entailed::Yes,
-            tableau::Answer::Consistent => match &self.left_out {
-                Some(why) => Entailed::Unknown(why.clone()),
-                None => Entailed::No,
-            },
-            tableau::Answer::Unsupported(_) => return None,
-            tableau::Answer::GaveUp(why) => Entailed::Unknown(format!("gave up: {why}")),
+        let deadline = std::time::Instant::now() + budget.timeout;
+        budget.workers.install(|| {
+            let budget = budget.remaining(deadline);
+            if budget
+                .cancel
+                .as_ref()
+                .is_some_and(tableau::Cancel::is_cancelled)
+            {
+                return Entailed::Unknown("cancelled".to_owned());
+            }
+            if budget.timeout.is_zero() {
+                return Entailed::Unknown("past dl.timeout".to_owned());
+            }
+            let config = tableau::Config {
+                timeout: Some(budget.timeout),
+                max_memory: budget.memory_bytes,
+                max_nodes: budget.max_nodes,
+                max_branch_points: Some(budget.max_branch_points),
+                cancel: budget.cancel.clone(),
+                workers: Some(budget.workers.limited(1)),
+                portfolio: false,
+                ..tableau::Config::default()
+            };
+            let outcome = prepared.probe(
+                &Probe {
+                    at,
+                    positive: &[class],
+                    negative: &[],
+                },
+                &config,
+                Want::default(),
+            );
+            match outcome.answer {
+                tableau::Answer::Inconsistent => Entailed::Yes,
+                tableau::Answer::Consistent => match &self.left_out {
+                    Some(why) => Entailed::Unknown(why.clone()),
+                    None => Entailed::No,
+                },
+                tableau::Answer::Unsupported(why) => {
+                    Entailed::Unknown(format!("unsupported: {why}"))
+                }
+                tableau::Answer::GaveUp(why) => Entailed::Unknown(format!("gave up: {why}")),
+            }
         })
     }
 }
