@@ -1,7 +1,6 @@
 # Execution core and native query engine (XC, Pf3, Pf4)
 
-As built on the performance/architecture branch (9 October 2026). Ownership follows
-[ARCHITECTURE.md](../ARCHITECTURE.md); the remaining query-plan migration is in
+Ownership follows [ARCHITECTURE.md](../ARCHITECTURE.md); the remaining query-plan migration is in
 [query-plan.md](query-plan.md). Measured wins and their guards live in
 [performance.md §0](performance.md#0-wins-to-keep-check-these-before-a-rewrite-and-guard-them).
 
@@ -31,14 +30,10 @@ nrese-engine   dictionary, permutations, snapshots, probe cursors, counts, stati
 - **Reuse is at the kernel boundary.** The reasoner's rule joins remain its own; it
   reuses sort, search, closures and memory monitoring where applicable. A query's BGP
   planner and worst-case-optimal join remain in `nrese-sparql`, not `nrese-exec`.
-- **The reference independently evaluates the algebra.** Tests compare native answers
-  with `nrese-sparql-reference`, which uses neither the native optimiser nor its
-  algebra execution. It shares expression evaluation and value helpers, including
-  `SUM`, `AVG` and `GROUP_CONCAT`, with production; agreement does not independently
-  validate that arithmetic. Shared value semantics need expected-result tests such
-  as the W3C suites and independent engines such as [Jena](../../benches/oracle/README.md).
-  Comparing optimised and `as_written` execution is an additional check, not a
-  replacement for reference algebra evaluation.
+- **The reference evaluates the algebra independently.** Tests compare native answers
+  with `nrese-sparql-reference`, which uses neither the native optimiser nor its algebra
+  execution; it shares expression evaluation and aggregate values with production, so
+  those need the W3C suites and an independent engine ([Jena](../../benches/oracle/README.md)).
 
 The kernel boundary is described in
 [`nrese-exec/src/lib.rs`](../../crates/nrese-exec/src/lib.rs); the query entry points and
@@ -51,41 +46,40 @@ OWL datatype semantics retain their separate owners. Owned ID-table projection m
 selected column buffers and preserves the surviving sort prefix; selecting a column
 more than once copies only its additional occurrences.
 
-### Physical workers and resource lifetime
+### Execution and resource lifetime
 
-The store's `Runtime` owns execution policy and the shared query budget. A catalog and
-its system store share this owner. Default execution keeps serial work on the caller and
-reuses existing parallel kernels through `Workers::current`; it creates no dedicated
-pool and imposes no catalog-wide CPU cap. An explicit positive `execution.threads`
-selects a shared physical pool. Native computation then moves its context into that
-pool and returns it with the result and computed-ID domain. Writers, liveness callbacks
-and transactions stay on their caller; encoding windows return owned bytes before I/O.
-A slow writer does not occupy an explicitly selected pool while waiting for backpressure.
+This section owns the execution policy; configuration keys are listed in
+[config-reference.md](../ops/config-reference.md#cpu-execution).
 
-This encoding ownership covers native direct-result ID blocks. Generic serializers
-(including XML and retained DL result delivery), ASK documents and headers still encode
-on their caller. An explicitly selected pool does not cover all output CPU work.
-`SERVICE` callbacks run inside native evaluation and
-have no caller-affinity guarantee.
-
-DL classification, realisation and saturation reuse their execution handle across phases
-and rounds. A smaller `Workers::limited` handle bounds participating batch dispatch; it is
-not a semaphore or a quota automatically inherited by arbitrary nested Rayon work.
-Child work must partition its allowance explicitly. Full-width batches retain Rayon
-work stealing; narrow batches use bounded lanes. Context activation uses nonblocking
-drains when narrowed, with enqueue and drain retirement under the same lock. Tableau
-portfolio siblings share a cancellation child and cannot cancel their request parent.
-A decision signals sibling cancellation immediately, but dispatch waits for every run to
-finish. If several runs decide concurrently, the returned outcome is the first decided
-one in input order; its telemetry does not identify the earliest wall-clock decision.
-
-Live native results retain their capacity reservation until drop. Update WHERE consumes
-the same catalog budget. These are accounted capacities, not process RSS or a strict
-allocation ceiling: decoded graph payloads, encoder buffers and runtime overhead still
-have separate lifetimes. DL task accounting remains distinct from the shared native
-query budget. Rule materialisation, bulk spilling and background storage retain their
-existing execution owners. See [configuration](../ops/config-reference.md#cpu-execution)
-for the precise control surface and standalone embedding behavior.
+- **Queries run on their caller.** Native evaluation, update `WHERE`, result encoding and
+  output stay on the thread that asked; a parallel kernel (joins, sorts, closures, spill)
+  forks into Rayon's global pool and joins before it returns. There is no dedicated query
+  pool and no catalog-wide CPU cap. Writers and liveness callbacks run on the caller, and
+  `SERVICE` callbacks run inside evaluation, on whichever thread evaluates.
+- **The store's `Runtime` owns the native query budget.** A catalog and its system store
+  share one; each query and update `WHERE` reserves from it. Live native results keep
+  their reservation until they are dropped.
+- **One reservation type.** `nrese_exec::Budget` hands out RAII reservations: a charge is
+  returned when its owner drops, on every path including errors and unwinding. Query
+  tables, retained results, the DL gap's scratch and the DL engines' charged buffers use
+  it; there is no second charge-on-drop mechanism.
+- **`Workers` is the DL batch width.** DL classification, realisation and exact
+  candidate batches take a `Workers` handle sized by `dl.threads` (0: Rayon's
+  parallelism). A narrower handle bounds the batch's own dispatch; it is not a semaphore
+  inherited by nested Rayon work, so child work partitions its allowance explicitly.
+  Full-width batches keep Rayon's work stealing; narrow ones use bounded lanes, an idle
+  lane claiming the next probe while results keep their order.
+- **One absolute deadline per DL operation.** A DL operation computes its deadline once;
+  every phase (consistency, gate evidence, entailment batches, classification) measures
+  what remains from it rather than restarting a timeout, and checks the request's
+  cancellation token at the same points. Tableau portfolio siblings share a child token
+  that cannot cancel their request; the first decided outcome in input order is returned.
+- **What the budgets don't cover.** Accounted capacities are not process RSS or a strict
+  allocation ceiling: decoded graph payloads, encoder buffers, DL compilation scratch and
+  runtime overhead have their own lifetimes, and DL task capacity is separate from the
+  query budget. Rule materialisation, bulk spill and background storage keep their own
+  execution owners. Cache waits and their progress are discussed in
+  [research-designs.md §8](research-designs.md#8-query-progress-under-shared-cache-waits-proposal).
 
 SPARQL's [`SolutionTable`](../../crates/nrese-sparql/src/native/typed_results.rs) retains
 its snapshot, computed terms and capacity reservations. Alignment rejects unrelated
@@ -157,7 +151,4 @@ An estimated logical plan must not be presented as a fully selected physical pla
   performance.md §0 protect retained algorithms and work bounds. Refactoring a caller
   must preserve its semantics and these guards; moving code alone establishes no speedup.
 - Performance measurements follow [CONTRIBUTING.md](../../CONTRIBUTING.md) and the
-  [benchmark protocol](../../benches/PROTOCOL.md). This document records architecture,
-  not a fresh benchmark result or a completed performance gate. Current runtime performance
-  acceptance is **BLOCKED**; see [STATUS.md](../STATUS.md) for the initial regression and
-  outstanding integration evidence.
+  [benchmark protocol](../../benches/PROTOCOL.md); their state is in [STATUS.md](../STATUS.md).

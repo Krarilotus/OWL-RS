@@ -241,9 +241,9 @@ api_key = "replace-me"
   - file key `dl.answers`, env `NRESE_DL_ANSWERS`: `certain-where-complete` (the default: the certain answers where the store can prove them complete, else the sound ones, the status saying which), `sound` (the lower bound alone, never checked against the upper bound) or `exact` (certain answers, or the query fails with 422, problem type `incomplete-answer`, naming the reasons and the unresolved candidates)
   - file key `dl.consistency`, env `NRESE_DL_CONSISTENCY`: `inline` (the default: a commit that makes the data inconsistent under OWL 2 DL is rejected, as the RL gate rejects) or `off` (not checked; every answer's status then says the consistency is unknown)
   - file key `dl.timeout`, env `NRESE_DL_TIMEOUT_MS` (default 30min): the time one DL task may take (a commit's consistency check, a query's exact services, a classification); what isn't decided by then is reported, never guessed
-  - file key `dl.memory`, env `NRESE_DL_MEMORY` (default 4GiB; `0` disables the envelope): context saturation checks sampled capacity estimates; tableau checks its owned capacity at work boundaries. Context estimates can lag or overlap during transfers, and temporary overshoot is possible; exhaustion is reported as incomplete/unknown. Participating batches divide the tableau allowance by actual concurrent work. Retained classification class/query buffers are charged; other result/proof assembly, input, compilation temporaries, short-lived recursive temporaries and a shared end-to-end query envelope are outside this contract. This is not a strict allocator or process ceiling ([scope](../design/owl2-dl.md#13-configuration)).
+  - file key `dl.memory`, env `NRESE_DL_MEMORY` (default 4GiB; `0` unlimited): the capacity one DL task's saturation and search may hold, checked at work boundaries; exhaustion is reported as incomplete, never as an answer. What it covers, and how it can overshoot: [owl2-dl.md §13](../design/owl2-dl.md#13-configuration)
   - file key `dl.max_candidates`, env `NRESE_DL_MAX_CANDIDATES` (default 1000): the candidate answers (in the upper bound, not the lower) a query checks with the exact services at most; the rest are reported unresolved
-  - file key `dl.threads`, env `NRESE_DL_THREADS` (default 0, available runtime workers): the maximum workers of a DL operation, narrowed by `execution.threads`
+  - file key `dl.threads`, env `NRESE_DL_THREADS` (default 0, Rayon's parallelism): the width of one DL operation's classification, realisation and exact-candidate batches
   - file key `dl.max_nodes`, env `NRESE_DL_MAX_NODES` (default 2000000), and `dl.max_branch_points`, env `NRESE_DL_MAX_BRANCH_POINTS` (default 1000000): the deterministic budgets of one hypertableau run (a consistency check, an entailment test, a class test), beside `dl.timeout`. A run past a budget decides nothing: its candidate stays unresolved, its class untested, its commit's status `unknown`, never a wrong answer
 - with any mode but `disabled`:
   - `nrese-server load` and startup materialise the closure (startup skips it when `reasoning.state` in the data directory records that the inferred stack is current for this build's semantics; `/version` reports them as `reasoning_semantics`, e.g. `owl2-rl v2 <fingerprint>`)
@@ -272,28 +272,10 @@ Read replicas ([replication.md](replication.md)); both sides need an on-disk sto
 
 ## CPU execution
 
-`execution.threads` (`NRESE_EXECUTION_THREADS`, default `0`) selects execution policy.
-With `0`, serial native evaluation and encoding stay on their caller; existing parallel
-kernels use the current Rayon registry (the global registry outside a worker). Opening
-a store does not create a dedicated pool. This mode has no catalog-wide CPU cap.
-Positive values select a physical pool shared by native SPARQL execution, direct-result
-ID-block encoding, update WHERE and DL search across the catalog. `1` serialises this
-participating work on one shared worker. DL operations may narrow either policy with
-`dl.threads`. Configured pool creation retries with one worker on failure; if that also
-fails, opening the runtime fails instead of silently changing execution policy.
-
-An explicit pool is not a ceiling on every server thread. Request parsing,
-planning, rule materialisation, bulk spill and background storage retain their existing
-owners. The separate spill pool avoids waiting for its own producer. No tenant fairness,
-NUMA placement or distributed admission policy is implied. Embedded applications may
-share `nrese_store::Runtime` explicitly; independent stores with positive limits otherwise
-own separate pools. Algorithm selection and kernel parallelism remain with their owners;
-selecting automatic execution is not a new adaptive cost model.
-Worker handles limit participating dispatch, not arbitrary nested Rayon work. Writers and
-liveness callbacks remain on their caller; direct encoding returns owned byte windows before
-output can block. Generic serializers (including XML and retained DL results), ASK documents
-and headers still encode on the caller: the explicit pool does not cover all output CPU work.
-`SERVICE` callbacks run inside evaluation, without a caller-affinity guarantee.
+Queries, updates and their output run on the thread that asked; parallel kernels use
+Rayon's global pool, which has one thread per logical CPU unless `RAYON_NUM_THREADS` says
+otherwise. There is no query pool and no catalog-wide CPU cap; `dl.threads` sets the width
+of DL batches. The policy and what it covers: [execution-core.md](../design/execution-core.md#execution-and-resource-lifetime).
 
 ## Budgets
 

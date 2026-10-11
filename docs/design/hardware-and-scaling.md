@@ -9,13 +9,13 @@ that cost no performance.
 
 ## Where NRESE stands
 
-Verified against `0f46563` (9 October 2026). The plan below retains the owner's direction;
-it is not a list of implemented backends.
+What exists; the plan below is direction, not built backends.
 
 - **Cores.** Bulk load, index building, joins, filters, aggregates and closures run in
-  parallel where their operators support it (Rayon). There are no independently
-  configured pools for queries, rule reasoning, loading and compaction. DL classification
-  has a worker setting of its own.
+  parallel where their operators support it, on Rayon's global pool; queries run on their
+  caller ([execution-core.md](execution-core.md#execution-and-resource-lifetime)). There
+  are no separately configured pools for queries, rule reasoning, loading and compaction.
+  DL batches have a width setting of their own (`dl.threads`).
 - **Memory.** Per-query, shared-query and process limits exist. On-disk checkpoints map
   compressed indexes and dictionary entries; the OS can page them. Empty/replacement
   bulk loads can spill quad chunks, but the dictionary and other working state still
@@ -51,7 +51,7 @@ Rust option or a hard-coded heuristic is not automatically a server setting.
 | Query strategies: SPARQL | `QueryOptions` carries budgets, cancellation and `as_written`; `stream_rows` and `cross_chunk_rows` are Rust options used by tests, not server configuration keys | Join order, index/merge/hash/WCOJ paths and aggregation routes follow data estimates and shape. DP limit 12, probe factor 32 and probe cost 4 are code constants. A complete physical plan and hardware-calibrated strategy controls remain unfinished |
 | Shared kernels: exec; index building: engine | Callers supply data, sortedness and applicable limits | Joins choose merge/hash from sortedness; sort chooses packed radix/comparison from key width and input size. Exec's sort cutoff (4,096 keys), sort chunks (65,536 keys), parallel join threshold (16,384 rows) and the engine's parallel index-build threshold are code constants, not measured cache/core settings |
 | Rule reasoning and its store integration | `ReasonerConfig`, `StoreConfig`; `reasoner.mode`, `rules`, `equality`, `equality_answers`, `equality_expansion`, `ql_rewriting`, `support_sets` | QL `auto` follows reasoning mode; rule evaluation and equality handling retain their own algorithms. Rule-evaluation morsels are fixed at 4,096 in `eval.rs`; no per-workload pool or hardware-derived morsel control |
-| DL services: store task policy, DL search | `DlConfig`: `dl.answers`, `consistency`, `timeout`, `memory`, `max_candidates`, `threads`, `max_nodes`, `max_branch_points` | `threads = 0` inherits the store runtime; explicit DL widths are narrowed to its actual workers. Standalone callers resolve their own owner. Bounds and search portfolios choose semantic routes within their owners; this is not a CPU/GPU placement policy |
+| DL services: store task policy, DL search | `DlConfig`: `dl.answers`, `consistency`, `timeout`, `memory`, `max_candidates`, `threads`, `max_nodes`, `max_branch_points` | `threads` is the DL batch width (0: Rayon's parallelism). Bounds and search portfolios choose semantic routes within their owners; this is not a CPU/GPU placement policy |
 | Vector search: engine dictionary integration, vector kernels | Rust `VectorQuery` carries `strategy` (`Auto`, `Exact`, `Approximate`), metric, `k` and `ef` | `Auto` uses space size and accepted-filter share to choose exact scan or HNSW. Cutoffs (20,000 vectors, 2% accepted) are code constants. This CPU strategy does not provide a GPU backend |
 | CPU: build tooling and engine feature check | `NRESE_TARGET_CPU` at build time, including `native` and `portable` | Compiler target selection and startup compatibility checks exist; runtime kernel multiversion dispatch, installation calibration and NUMA topology/pinning remain planned |
 | Replication and federation: server transport, store operations, engine WAL / SPARQL `SERVICE` | `ReplicationConfig` with `replication.mode`, `primary`, `token`, `poll`, `batch_bytes`; `FederationConfig` with `federation.allow`, `timeout`, `max_rows` | Replica bootstrap and WAL following are implemented. Automatic failover/re-bootstrap, sharding, distributed operator exchange and distributed reasoning are not |
@@ -70,6 +70,15 @@ Source contracts: [`StoreConfig`](../../crates/nrese-store/src/config.rs),
 [`vector strategy`](../../crates/nrese-engine/src/term/vectors.rs). See also
 [read-replica operations and limits](../ops/replication.md).
 
+Rules for an automatic choice: the owner that has the semantics chooses (SPARQL its
+operators, the reasoner its maintenance, DL its route, engine and exec their kernel
+variants), from inexpensive evidence and measured crossover points, never from a
+benchmark's name; with too little evidence it keeps the current valid strategy. A setting
+with a real trade-off is typed in its owner with one documented default and a bounded
+expert override that a request can't raise past policy. EXPLAIN reports the route, the
+deciding estimates, the limits and any fallback. An automatic route is validated against
+each eligible forced one on the same checked cases, including unseen workloads.
+
 Hardware/distributed extensions must preserve these owners: settings describe policy,
 the owning planner or algorithm makes the choice, and kernels implement the work.
 Existing id columns, engine access APIs and workload-specific executors are reuse points;
@@ -78,9 +87,9 @@ H1/H3/H5/H6 below identify that unfinished work without introducing a universal 
 
 ## Readiness at the existing boundaries
 
-The [architecture readiness exercise](../plan/2026-10-09-performance-architecture.md#extension-boundaries-for-hardware-and-distributed-deployments)
-tests where three future workloads would cross today's contracts. It does not establish
-a distributed or accelerator backend, or require new production interfaces.
+Three future workloads, walked through today's contracts: what suffices locally and what
+must still be decided. This is a design exercise, not a distributed or accelerator
+backend, and it asks for no new production interface.
 
 | Workload | Existing contracts that suffice locally | Semantic decisions still required |
 |---|---|---|
