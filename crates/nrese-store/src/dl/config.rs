@@ -136,15 +136,6 @@ impl DlConfig {
             ..nrese_dl::tableau::Config::default()
         }
     }
-
-    /// Standalone worker count. Store operations instead narrow their existing
-    /// runtime owner, which can have fewer workers than this configured maximum.
-    pub fn workers(&self) -> usize {
-        match self.threads {
-            0 => std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
-            n => n,
-        }
-    }
 }
 
 #[cfg(test)]
