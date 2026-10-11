@@ -75,14 +75,19 @@ impl Inbox {
     }
 }
 
+/// An inbox publishes what it holds at its first message and every `QUEUED`th after it.
+const QUEUED: usize = 16;
+
 impl Context {
     fn push(&self, message: Message, observe: bool) {
         let mut inbox = lock(&self.inbox);
-        if observe {
-            inbox.payload_bytes += message.heap_bytes();
+        if !observe {
+            inbox.messages.push(message);
+            return;
         }
+        inbox.payload_bytes += message.heap_bytes();
         inbox.messages.push(message);
-        if observe {
+        if inbox.messages.len() % QUEUED == 1 {
             self.queued.store(inbox.bytes(), Relaxed);
         }
     }
@@ -416,9 +421,6 @@ impl Engine {
                 let mut state = lock(&context.state);
                 let mut worker = Worker::new(self, &mut state, &mut out, batch.bytes());
                 for (i, message) in batch.messages.into_iter().enumerate() {
-                    if observe {
-                        worker.input_bytes -= message.heap_bytes();
-                    }
                     worker.handle(message);
                     if (i + 1).is_multiple_of(256) && !worker.checkpoint(0) {
                         break;

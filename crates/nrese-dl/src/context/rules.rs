@@ -275,7 +275,8 @@ pub struct Worker<'w> {
     pub state: &'w mut State,
     pub out: &'w mut Out,
     pub scratch: Scratch,
-    /// The payloads of the batch's messages not yet handled (observed capacity).
+    /// The batch's messages, until it ends (observed capacity; payloads handled so far
+    /// count twice where the state keeps them).
     pub(super) input_bytes: usize,
     /// This batch's budget checks and capacity publications (into the counters at its end).
     checks: Cell<u64>,
@@ -324,14 +325,16 @@ impl<'w> Worker<'w> {
         state
     }
 
-    /// Ends the batch: its counts, and a publication if none was made since the latest
-    /// sampling election (a context's publication lags its work by at most one interval;
-    /// a round ends with exact ones, [`Engine::run`]). Returns the state's capacity
-    /// published, which stays once the batch's buffers are gone.
+    /// Ends the batch: its counts, and a publication where a checkpoint published
+    /// within it or none was made since the latest sampling election (a publication lags
+    /// its context's work by at most one interval; a round ends with exact ones,
+    /// [`Engine::run`]). Returns the state's capacity published, which stays once the
+    /// batch's buffers are gone.
     pub(super) fn finish(self) -> Option<usize> {
         let election = self.engine.election();
+        let due = self.observations.get() > 0 || self.state.published != election;
         let mut state = None;
-        if self.engine.observing() && self.state.published != election {
+        if self.engine.observing() && due {
             self.state.published = election;
             state = Some(self.publish(0));
         }

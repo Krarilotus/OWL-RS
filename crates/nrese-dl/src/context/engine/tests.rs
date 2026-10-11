@@ -81,13 +81,13 @@ fn queued_payloads_are_visible_before_the_receiver_runs() {
     engine.sample();
     let base = engine.task_memory_bytes().0;
     let mut queue = Vec::new();
-    for _ in 0..20 {
+    for _ in 0..=QUEUED {
         engine.deliver_seq(&mut queue, root, payload());
     }
     engine.sample();
     let inbox = lock(&engine.context(root).inbox);
     assert_eq!(engine.task_memory_bytes().0, base + inbox.bytes());
-    assert_eq!(inbox.payload_bytes, 20 * payload().heap_bytes());
+    assert_eq!(inbox.payload_bytes, (QUEUED + 1) * payload().heap_bytes());
     assert_eq!(queue, [root], "one activation for many messages");
 }
 
