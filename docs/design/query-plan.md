@@ -21,18 +21,13 @@ operator plan. The current stage boundaries are summarised in
 | Owner in `nrese-sparql/src/` | Responsibility |
 |---|---|
 | [`plan/mod.rs`](../../crates/nrese-sparql/src/plan/mod.rs) | Logical node representation and conversion: `Plan::of` builds from borrowed algebra; `into_pattern` consumes the plan, moving its payloads into algebra. `lower` remains a borrowing compatibility wrapper |
-| [`plan/properties.rs`](../../crates/nrese-sparql/src/plan/properties.rs) | In-scope variables, blank-node join dependencies and order sensitivity, read directly from nodes. Scope preserves lowering's variable order, including ordered scan runs |
+| [`plan/properties.rs`](../../crates/nrese-sparql/src/plan/properties.rs) | In-scope variables (a join lists its scans' first), blank-node join dependencies and order sensitivity, read directly from nodes |
 | [`plan/rewrite.rs`](../../crates/nrese-sparql/src/plan/rewrite.rs) | Join flattening and eager aggregation, their eligibility rules and shared child traversal. The native caller supplies the statistics-based decision about whether pre-aggregation pays |
 | [`native/estimate.rs`](../../crates/nrese-sparql/src/native/estimate.rs), [`native/plan.rs`](../../crates/nrese-sparql/src/native/plan.rs) | Logical row estimates and BGP join ordering. Estimates and runtime strategies are not a fully selected physical tree |
-| [`native/path_joins.rs`](../../crates/nrese-sparql/src/native/path_joins.rs) | Path/triple join eligibility and ordering. Estimation reads logical nodes directly; execution still reads algebra. Both entries share filter-scope eligibility and final validation |
+| [`native/path_joins.rs`](../../crates/nrese-sparql/src/native/path_joins.rs) | Path/triple join eligibility and ordering, on the algebra; estimation lowers the join it inspects |
 
-Property inspection no longer lowers subtrees to inspect them. Path-join estimation's
-lower-then-inspect adapter and the separate estimate-variable adapter are retired.
-Production lowering moves owned data instead of cloning it; join flattening reuses the
-rewrite child traversal. The previous lowering implementation remains only in
-[`plan/tests/lowering_oracle.rs`](../../crates/nrese-sparql/src/plan/tests/lowering_oracle.rs).
-It checks representation equivalence, not query semantics; the independent reference
-algebra evaluator remains the semantic oracle.
+Property inspection reads plan nodes without lowering them. Lowering moves owned data
+instead of cloning it; join flattening reuses the rewrite child traversal.
 
 These properties are not a general physical-property record: cardinality estimates,
 ID-table sortedness and runtime resource accounting still live with their existing

@@ -109,6 +109,12 @@ impl IdTable {
         self.sorted_by.clear();
     }
 
+    /// Adds a column, one value per row.
+    pub fn push_column(&mut self, column: Vec<u64>) {
+        assert_eq!(column.len(), self.len, "push_column: rows differ");
+        self.columns.push(column);
+    }
+
     /// The rows that fit before the table reallocates.
     pub fn spare_rows(&self) -> usize {
         self.columns

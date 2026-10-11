@@ -2,11 +2,8 @@
 //! operators with joins and unions as lists, so that rewrites (step 2) can reorder and
 //! merge them; a basic graph pattern is a join of its triple patterns.
 //!
-//! [`Plan::of`] builds it from the algebra; [`Plan::into_pattern`] moves its owned
-//! data back into the algebra that the executor still runs. Property inspection reads
-//! plan nodes directly, without this execution adapter. Until a rewrite changes a plan, lowering is the identity:
-//! `Plan::of(p).lower() == p` for every pattern (a test checks it on the differential
-//! tests' queries).
+//! [`Plan::of`] builds it from the algebra; [`Plan::into_pattern`] moves it back.
+//! Without a rewrite, lowering is the identity: `Plan::of(p).lower() == p`.
 //!
 //! The rewrites (step 2), each a method of [`Plan`]:
 //! - [`Plan::flatten_joins`]: joins inside joins become one join, so the triple patterns

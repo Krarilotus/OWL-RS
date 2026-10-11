@@ -3990,32 +3990,23 @@ impl<'a> Context<'a> {
 
     // --- modifiers -----------------------------------------------------------------------
 
+    /// The columns of `variables`: bound ones move, an unbound one is UNDEF.
     fn project(&self, solutions: Solutions, variables: &[Variable]) -> Solutions {
-        if let Some(columns) = variables
-            .iter()
-            .map(|variable| solutions.column(variable))
-            .collect::<Option<Vec<_>>>()
-        {
-            return Solutions {
-                vars: variables.to_vec(),
-                table: solutions.table.project(&columns),
-                ordered: solutions.ordered,
-            };
-        }
-        let columns: Vec<Vec<u64>> = variables
-            .iter()
-            .map(|v| match solutions.column(v) {
-                Some(c) => solutions.table.column(c).to_vec(),
-                None => vec![UNDEF; solutions.table.len()],
-            })
-            .collect();
-        let mut table = IdTable::from_columns(columns);
-        if variables.is_empty() {
-            table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], solutions.table.len()));
+        let mut table = solutions.table;
+        let mut undef = None;
+        let mut columns = Vec::with_capacity(variables.len());
+        for variable in variables {
+            columns.push(match solutions.vars.iter().position(|v| v == variable) {
+                Some(column) => column,
+                None => *undef.get_or_insert_with(|| {
+                    table.push_column(vec![UNDEF; table.len()]);
+                    table.width() - 1
+                }),
+            });
         }
         Solutions {
             vars: variables.to_vec(),
-            table,
+            table: table.project(&columns),
             ordered: solutions.ordered,
         }
     }
