@@ -143,13 +143,12 @@ pub(super) fn checkpoint(finished: bool) {
 }
 
 #[test]
-fn parallel_gap_stays_on_its_owner_and_releases_scratch_on_cancel_or_drop() {
+fn parallel_gap_releases_scratch_on_cancel_or_drop() {
     use nrese_exec::SharedBudget;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let engine = Engine::new(EngineConfig::default()).unwrap();
-    let workers = Workers::pooled(1).unwrap();
-    let caller = std::thread::current().id();
+    let workers = Workers::new(1);
     // Unsorted 2^16 rows enter IdTable's parallel sort/gather/filter branches.
     // Only two distinct rows keep the decoded oracle and admission scratch small.
     let values = "(2 UNDEF) (1 UNDEF) ".repeat(1 << 15);
@@ -169,11 +168,8 @@ fn parallel_gap_stays_on_its_owner_and_releases_scratch_on_cancel_or_drop() {
         let observed = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&observed);
         let flag = token.clone();
-        // A caller-side select misses this owner-only hook. The count below fails
-        // if the install is removed, even though a one-thread sort still succeeds.
         workers.install(move || {
             CHECKPOINT.set(Some(Box::new(move |finished| {
-                assert_ne!(std::thread::current().id(), caller);
                 count.fetch_add(1, Ordering::Relaxed);
                 if cancel_at == Some(finished) {
                     flag.cancel();

@@ -21,7 +21,7 @@ fn decided(config: &Config, answer: Answer) -> Outcome {
 
 #[test]
 fn nested_islands_share_the_owner_and_partition_only_concurrent_capacity() {
-    let physical = Workers::pooled(4).unwrap();
+    let physical = Workers::new(4);
     // allowance, batches, capacity, child allowance, child capacity
     for (allowance, count, memory, child_width, child_memory) in [
         (1, 5, 1, 1, 1),
@@ -74,7 +74,7 @@ fn queued_islands_observe_parent_cancellation_before_entering_the_solver() {
     let cancel = Cancel::default();
     let config = Config {
         cancel: Some(cancel.clone()),
-        workers: Some(Workers::pooled(1).unwrap()),
+        workers: Some(Workers::new(1)),
         ..Config::default()
     };
     let calls = AtomicUsize::new(0);

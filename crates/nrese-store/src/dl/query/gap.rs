@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use std::hash::{BuildHasher, Hasher};
 
-use nrese_exec::{Budget, IdTable, workers::Workers};
+use nrese_exec::{Budget, IdTable, Reservation, workers::Workers};
 use nrese_sparql::{AlignedSolutions, CancellationToken, QueryEvaluationError};
 
 use crate::StoreResult;
@@ -19,32 +19,7 @@ pub(super) struct Gap<'a> {
     pub rows: Vec<usize>,
     /// Conservative decoded-row bytes, for reserving each decision batch before decoding.
     pub bytes: Vec<usize>,
-    _memory: Scratch<'a>,
-}
-
-/// Scratch reservations are released on every exit, including errors/cancellation.
-pub(super) struct Scratch<'a> {
-    budget: &'a Budget,
-    bytes: usize,
-}
-
-impl<'a> Scratch<'a> {
-    pub fn new(budget: &'a Budget) -> Self {
-        Self { budget, bytes: 0 }
-    }
-    pub fn charge(&mut self, bytes: usize) -> StoreResult<()> {
-        self.budget
-            .charge(bytes)
-            .map_err(QueryEvaluationError::MemoryLimit)?;
-        self.bytes += bytes;
-        Ok(())
-    }
-}
-
-impl Drop for Scratch<'_> {
-    fn drop(&mut self) {
-        self.budget.release(self.bytes);
-    }
+    _memory: Reservation<&'a Budget>,
 }
 
 fn alive(cancel: &CancellationToken) -> StoreResult<()> {
@@ -119,7 +94,7 @@ pub(super) fn select<'a>(
         #[cfg(test)]
         tests::checkpoint(false);
         alive(cancel)?;
-        let mut memory = Scratch::new(budget);
+        let mut memory = Reservation::new(budget);
         let (lower, upper) = (pair.lower(), pair.upper());
         memory.charge(lower.len().saturating_mul(40))?;
         let state = std::collections::hash_map::RandomState::new();
@@ -220,8 +195,7 @@ pub(super) fn select<'a>(
         drop(ranks);
         let retained =
             (rows.capacity() + bytes.capacity()).saturating_mul(std::mem::size_of::<usize>());
-        budget.release(memory.bytes - retained);
-        memory.bytes = retained;
+        memory.release(memory.bytes() - retained);
         #[cfg(test)]
         tests::checkpoint(true);
         alive(cancel)?;

@@ -101,7 +101,7 @@ pub struct Options {
 impl Options {
     pub(crate) fn workers(&self) -> nrese_exec::workers::Workers {
         self.workers.as_ref().map_or_else(
-            || Workers::new(self.threads.max(1)).unwrap_or_else(|_| Workers::serial()),
+            || Workers::new(self.threads),
             |workers| workers.limited(self.threads.max(1)),
         )
     }
