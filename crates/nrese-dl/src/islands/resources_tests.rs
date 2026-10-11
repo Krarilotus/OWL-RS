@@ -13,8 +13,8 @@ fn batches(n: usize) -> Islands {
     }
 }
 
-fn decided(config: &Config, answer: Answer) -> Outcome {
-    let mut out = RunBudget::new(config).stopped("unused");
+fn decided(_: &Config, answer: Answer) -> Outcome {
+    let mut out = Outcome::stopped("unused");
     out.answer = answer;
     out
 }
@@ -41,25 +41,20 @@ fn nested_islands_share_the_owner_and_partition_only_concurrent_capacity() {
         let active = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
         let out = workers.install(|| {
-            decide(
-                &batches(count),
-                &config,
-                &RunBudget::new(&config),
-                |_, child| {
-                    calls.fetch_add(1, Ordering::Relaxed);
-                    assert_eq!(child.max_memory, child_memory);
-                    let child_workers = child.workers.as_ref().unwrap();
-                    // Equality compares the physical owner too, not just its size.
-                    assert_eq!(child_workers, &physical.limited(child_width));
-                    child_workers.map(&[0; 8], |_| {
-                        let n = active.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak.fetch_max(n, Ordering::SeqCst);
-                        std::thread::yield_now();
-                        active.fetch_sub(1, Ordering::SeqCst);
-                    });
-                    decided(child, Answer::Consistent)
-                },
-            )
+            decide(&batches(count), &config, |_, child| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(child.max_memory, child_memory);
+                let child_workers = child.workers.as_ref().unwrap();
+                // Equality compares the physical owner too, not just its size.
+                assert_eq!(child_workers, &physical.limited(child_width));
+                child_workers.map(&[0; 8], |_| {
+                    let n = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(n, Ordering::SeqCst);
+                    std::thread::yield_now();
+                    active.fetch_sub(1, Ordering::SeqCst);
+                });
+                decided(child, Answer::Consistent)
+            })
             .unwrap()
         });
         assert_eq!(out.answer, Answer::Consistent);
@@ -78,16 +73,11 @@ fn queued_islands_observe_parent_cancellation_before_entering_the_solver() {
         ..Config::default()
     };
     let calls = AtomicUsize::new(0);
-    let out = decide(
-        &batches(3),
-        &config,
-        &RunBudget::new(&config),
-        |_, child| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            cancel.cancel();
-            decided(child, Answer::Consistent)
-        },
-    )
+    let out = decide(&batches(3), &config, |_, child| {
+        calls.fetch_add(1, Ordering::Relaxed);
+        cancel.cancel();
+        decided(child, Answer::Consistent)
+    })
     .unwrap();
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert!(matches!(out.answer, Answer::GaveUp(_)));
@@ -99,7 +89,7 @@ fn expired_islands_start_no_solver_and_a_refuted_island_still_wins() {
         timeout: Some(std::time::Duration::ZERO),
         ..Config::default()
     };
-    let out = decide(&batches(2), &config, &RunBudget::new(&config), |_, _| {
+    let out = decide(&batches(2), &config.started(), |_, _| {
         panic!("expired island entered the solver")
     })
     .unwrap();
@@ -110,19 +100,14 @@ fn expired_islands_start_no_solver_and_a_refuted_island_still_wins() {
         ..Config::default()
     };
     let calls = AtomicUsize::new(0);
-    let out = decide(
-        &batches(2),
-        &config,
-        &RunBudget::new(&config),
-        |_, child| {
-            let answer = if calls.fetch_add(1, Ordering::Relaxed) == 0 {
-                Answer::GaveUp("one island exceeded its capacity".into())
-            } else {
-                Answer::Inconsistent
-            };
-            decided(child, answer)
-        },
-    )
+    let out = decide(&batches(2), &config, |_, child| {
+        let answer = if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+            Answer::GaveUp("one island exceeded its capacity".into())
+        } else {
+            Answer::Inconsistent
+        };
+        decided(child, answer)
+    })
     .unwrap();
     assert_eq!(out.answer, Answer::Inconsistent);
 }

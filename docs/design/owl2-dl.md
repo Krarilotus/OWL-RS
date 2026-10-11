@@ -530,14 +530,16 @@ the base when the initial labels leave no candidates. Otherwise its candidates n
 unproven classes in that initial model: it retains the deterministic start and releases
 the model that those probes would contradict, avoiding a redundant model attempt.
 
-Every retained probe receives its current configuration. Only timeout and cancellation
-may differ from the base; another strategy or capacity configuration declines reuse
-before execution and uses the existing fresh search. `None` means incompatibility,
-never timeout or unknown. An initially unknown search can retain its deterministic
-checkpoint without acquiring model status. Model rollback and its deterministic
-fallback use one `RunBudget`, as do detached terminology and full-ontology attempts.
-Workers refresh the absolute operation deadline on entry. Preparation, state copies,
-labels and cleanup consume the allowance; checks remain cooperative, not preemptive.
+Every retained probe receives its current configuration. Only the deadline,
+cancellation and workers may differ from the base; another strategy or capacity
+configuration declines reuse before execution and uses the existing fresh search. `None`
+means incompatibility, never timeout or unknown. An initially unknown search can retain
+its deterministic checkpoint without acquiring model status. An operation's `timeout`
+becomes one absolute deadline at its start, which its parts inherit unchanged: model
+rollback and its deterministic fallback, detached terminology and full-ontology
+attempts, queued island batches and portfolio variants. Each solver checks it before it
+starts and while it runs; preparation, state copies, labels and cleanup consume it;
+checks remain cooperative, not preemptive.
 Probe telemetry includes both fallback attempts; the profile now adds initial and
 realisation work. Existing top/subsumption aggregate-counter gaps remain; historical
 counters with narrower coverage are not directly comparable work savings.
@@ -776,8 +778,8 @@ interned expressions remain operation-local. Scalar reductions remain for
 unsupported forms and as a differential oracle. This removes repeated premise copying and
 compilation inside eligible batches; it does not change store/OWL semantic ownership.
 There is no cross-query compiled cache: the batch owns the program and assumptions.
-Admission checkpoints charge waiting time against the remaining timeout and observe
-cancellation; normalisation and compilation themselves are not preemptible.
+Waiting counts against the operation's deadline, and a queued probe checks it and
+cancellation before it starts; normalisation and compilation are not preemptible.
 
 The shared runtime schedules independent candidates with one-worker child allowances.
 Classification and realisation reuse the same physical owner, and context fixpoint rounds

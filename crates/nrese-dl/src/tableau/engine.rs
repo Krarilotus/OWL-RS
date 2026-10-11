@@ -129,7 +129,6 @@ pub struct Engine<'a> {
     /// The root node of each individual (follow merges with `find`).
     pub roots: Vec<u32>,
     pub stats: Telemetry,
-    pub started: Instant,
     pub firings: Vec<Firing>,
     pub blocking: super::blocking::Blocking,
     pub ni: super::ni::Ni,
@@ -165,7 +164,7 @@ impl<'a> Engine<'a> {
     pub fn new(p: &'a Program, config: &Config) -> Self {
         Self {
             p,
-            config: config.clone(),
+            config: config.started().into_owned(),
             g: Graph::default(),
             deps: DepSets::default(),
             done: Done::default(),
@@ -182,7 +181,6 @@ impl<'a> Engine<'a> {
             restart_point: None,
             roots: Vec::new(),
             stats: Telemetry::default(),
-            started: Instant::now(),
             firings: Vec::new(),
             blocking: super::blocking::Blocking::default(),
             ni: super::ni::Ni::default(),
@@ -589,19 +587,9 @@ impl<'a> Engine<'a> {
     }
 
     pub fn check_time(&self) -> Step<()> {
-        if self
-            .config
-            .cancel
-            .as_ref()
-            .is_some_and(|c| c.is_cancelled())
-        {
-            return Err(Stop::GaveUp("cancelled".into()));
+        match self.config.stopped() {
+            Some(why) => Err(Stop::GaveUp(why.into())),
+            None => Ok(()),
         }
-        if let Some(limit) = self.config.timeout
-            && self.started.elapsed() > limit
-        {
-            return Err(Stop::GaveUp(format!("the time budget ({limit:?}) ran out")));
-        }
-        Ok(())
     }
 }
