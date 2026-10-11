@@ -257,7 +257,7 @@ impl Program {
             ..Program::default()
         };
         p.weakened = left_out(ontology, normalised);
-        p.refuted = crate::numbers::refute(normalised).map(|r| r.why);
+        p.refuted = crate::numbers::refute(ontology).map(|r| r.why);
         let facts = &normalised.facts;
         if normalised.clauses.iter().any(|c| c.flags.datatype)
             || !facts.data.is_empty()
