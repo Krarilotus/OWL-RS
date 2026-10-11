@@ -125,50 +125,44 @@ impl Batch {
                 Test::Nonempty(class) => super::nonempty(ontology, *class, budget),
             };
         };
-        let deadline = std::time::Instant::now() + budget.timeout;
-        budget.workers.install(|| {
-            let budget = budget.remaining(deadline);
-            if budget
-                .cancel
-                .as_ref()
-                .is_some_and(tableau::Cancel::is_cancelled)
-            {
-                return Entailed::Unknown("cancelled".to_owned());
-            }
-            if budget.timeout.is_zero() {
-                return Entailed::Unknown("past dl.timeout".to_owned());
-            }
-            let config = tableau::Config {
-                timeout: Some(budget.timeout),
-                max_memory: budget.memory_bytes,
-                max_nodes: budget.max_nodes,
-                max_branch_points: Some(budget.max_branch_points),
-                cancel: budget.cancel.clone(),
-                workers: Some(budget.workers.limited(1)),
-                portfolio: false,
-                ..tableau::Config::default()
-            };
-            let outcome = prepared.probe(
-                &Probe {
-                    at,
-                    positive: &[class],
-                    negative: &[],
-                },
-                &config,
-                Want::default(),
-            );
-            match outcome.answer {
-                tableau::Answer::Inconsistent => Entailed::Yes,
-                tableau::Answer::Consistent => match &self.left_out {
-                    Some(why) => Entailed::Unknown(why.clone()),
-                    None => Entailed::No,
-                },
-                tableau::Answer::Unsupported(why) => {
-                    Entailed::Unknown(format!("unsupported: {why}"))
-                }
-                tableau::Answer::GaveUp(why) => Entailed::Unknown(format!("gave up: {why}")),
-            }
-        })
+        if budget
+            .cancel
+            .as_ref()
+            .is_some_and(tableau::Cancel::is_cancelled)
+        {
+            return Entailed::Unknown("cancelled".to_owned());
+        }
+        if budget.timeout.is_zero() {
+            return Entailed::Unknown("past dl.timeout".to_owned());
+        }
+        let config = tableau::Config {
+            timeout: Some(budget.timeout),
+            max_memory: budget.memory_bytes,
+            max_nodes: budget.max_nodes,
+            max_branch_points: Some(budget.max_branch_points),
+            cancel: budget.cancel.clone(),
+            workers: Some(budget.workers.limited(1)),
+            portfolio: false,
+            ..tableau::Config::default()
+        };
+        let outcome = prepared.probe(
+            &Probe {
+                at,
+                positive: &[class],
+                negative: &[],
+            },
+            &config,
+            Want::default(),
+        );
+        match outcome.answer {
+            tableau::Answer::Inconsistent => Entailed::Yes,
+            tableau::Answer::Consistent => match &self.left_out {
+                Some(why) => Entailed::Unknown(why.clone()),
+                None => Entailed::No,
+            },
+            tableau::Answer::Unsupported(why) => Entailed::Unknown(format!("unsupported: {why}")),
+            tableau::Answer::GaveUp(why) => Entailed::Unknown(format!("gave up: {why}")),
+        }
     }
 }
 

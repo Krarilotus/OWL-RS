@@ -237,9 +237,7 @@ pub(crate) fn write_statements(
     let mut written = 0;
     for engine_pattern in pattern.patterns(view, scope) {
         for quad in decoded_quads(view, model, &engine_pattern) {
-            if cancel.is_cancelled() {
-                return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
-            }
+            cancel.check()?;
             let quad = quad?;
             match quads_kept {
                 true => writer.serialize_quad(&quad)?,

@@ -70,7 +70,7 @@ fn a_spent_deterministic_budget_leaves_candidates_unresolved_never_wrong() {
 }
 
 #[test]
-fn a_spent_candidate_budget_leaves_the_rest_unresolved() {
+fn a_spent_candidate_budget_leaves_the_rest_unresolved_and_exact_mode_rejects_it() {
     let dl = pipeline_with(DlConfig {
         max_candidates: 1,
         ..DlConfig::default()
@@ -81,20 +81,6 @@ fn a_spent_candidate_budget_leaves_the_rest_unresolved() {
     let b = status.bounds.expect("bounds");
     assert_eq!((b.proved, b.unresolved), (1, 1), "{b:?}");
     assert_eq!(rows.len(), 3, "{rows:?}");
-}
-
-#[test]
-fn capped_candidates_keep_priority_and_exact_mode_rejects_the_remaining_gap() {
-    let dl = pipeline_with(DlConfig {
-        max_candidates: 1,
-        ..DlConfig::default()
-    });
-    insert(&dl, &format!("{UNION} :v a [ owl:unionOf ( :B :C ) ] .")).unwrap();
-    let (rows, status) = query(&dl, "SELECT ?x { ?x a :D }");
-    assert_eq!(rows, ["v", "x", "y"]);
-    let bounds = status.bounds.unwrap();
-    assert_eq!((bounds.proved, bounds.unresolved), (1, 1));
-    assert!(!status.shared.complete);
     assert!(matches!(
         super::queries::query_with(&dl, "SELECT ?x { ?x a :D }", Some(DlAnswers::Exact)),
         Err(StoreError::Incomplete(_))

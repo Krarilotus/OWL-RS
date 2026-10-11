@@ -239,13 +239,9 @@ pub(crate) fn answer(
     cancellation: &CancellationToken,
     mode: DlAnswers,
 ) -> StoreResult<Outcome> {
-    if cancellation.is_cancelled() {
-        return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
-    }
+    cancellation.check()?;
     let outcome = decide_answers(store, prepared, cancellation, mode)?;
-    if cancellation.is_cancelled() {
-        return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
-    }
+    cancellation.check()?;
     let status = match &outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => status,
     };
@@ -313,9 +309,7 @@ fn decide_answers(
     let analysis = analyse(prepared.query());
     let mut status = Status::complete();
     let consistency = consistency_at(store, &snapshot, &view, cancellation, deadline);
-    if cancellation.is_cancelled() {
-        return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
-    }
+    cancellation.check()?;
     match consistency {
         Verdict::Consistent => {}
         Verdict::Inconsistent => status
@@ -448,7 +442,6 @@ fn decide_answers(
                 limit.saturating_add(super::UNRESOLVED_SHOWN),
                 &budget,
                 cancellation,
-                &nrese_exec::workers::Workers::current(),
             )?;
             let mut counts = Counts {
                 lower: gap.lower,
