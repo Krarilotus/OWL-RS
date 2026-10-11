@@ -422,12 +422,10 @@ fn open_access(
 ) -> anyhow::Result<nrese_store::access::AccessControl> {
     use anyhow::Context;
     use nrese_store::access::{AccessControl, Change, Principal};
-    let mut config = match template.mode {
+    let config = match template.mode {
         StoreMode::OnDisk => nrese_store::StoreConfig::on_disk(template.data_dir.join("system")),
         StoreMode::InMemory => nrese_store::StoreConfig::in_memory(),
     };
-    config.execution_threads = template.execution_threads;
-    config.total_query_memory_bytes = template.total_query_memory_bytes;
     let store = StoreService::with_runtime(config, Arc::clone(runtime))
         .context("the system store (access state)")?;
     let access = AccessControl::open(store, &policy.workspace_base)

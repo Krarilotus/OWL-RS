@@ -146,7 +146,7 @@ mod tests {
                     .0
             })
             .collect();
-        let workers = Workers::pooled(4).unwrap();
+        let workers = Workers::new(4);
         {
             let agenda = Agenda {
                 engine: &engine,

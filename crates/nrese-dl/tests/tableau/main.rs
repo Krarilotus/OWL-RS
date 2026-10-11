@@ -37,7 +37,7 @@ fn answer(o: &nrese_owl::Ontology) -> Answer {
 
 #[test]
 fn shared_portfolio_matches_plain_search_without_cancelling_its_parent() {
-    let physical = nrese_exec::workers::Workers::pooled(4).unwrap();
+    let physical = nrese_exec::workers::Workers::new(4);
     let mut b = Build::default();
     let (a, bb, c) = (b.class(1), b.class(2), b.class(3));
     let not_b = b.not(bb);

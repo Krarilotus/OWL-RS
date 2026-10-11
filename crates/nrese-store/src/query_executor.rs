@@ -545,7 +545,8 @@ pub(crate) fn evaluate_bound(
     #[cfg(test)]
     BOUND_EVALUATIONS.with(|n| n.set(n.get() + 1));
     let mut options = query_options(prepared, store, cancellation);
-    options.memory_limit = options
+    options.resources.memory_limit = options
+        .resources
         .memory_limit
         .map(|limit| limit.saturating_sub(retained));
     Ok(nrese_sparql::evaluate_query_typed(
@@ -627,12 +628,14 @@ fn query_options(
 ) -> QueryOptions {
     QueryOptions {
         dataset: prepared.dataset.clone(),
-        cancellation: Some(cancellation.clone()),
+        resources: nrese_sparql::Resources {
+            cancellation: Some(cancellation.clone()),
+            memory_limit: prepared.memory_limit,
+            shared_memory: store.runtime.query_memory(),
+            ..Default::default()
+        },
         read_model: prepared.read_model,
-        memory_limit: prepared.memory_limit,
         as_written: prepared.as_written,
-        shared_memory: store.runtime.query_memory(),
-        workers: Some(store.runtime.workers()),
         union_default_graph: store.union_default_graph,
         geosparql_stated_only: store.geosparql_stated_only,
         services: store.services.get().cloned(),
