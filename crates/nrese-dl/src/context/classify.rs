@@ -122,8 +122,7 @@ pub fn classify(
 
 /// Normalises, compiles and saturates `ontology`.
 pub fn saturate(ontology: &Ontology, options: &Options) -> Result<Saturated, Unsupported> {
-    let workers = nrese_exec::workers::Workers::new(options.threads.max(1))
-        .unwrap_or_else(|_| nrese_exec::workers::Workers::serial());
+    let workers = nrese_exec::workers::Workers::new(options.threads);
     saturate_with_workers(ontology, options, None, &workers)
 }
 

@@ -446,7 +446,7 @@ fn decide_answers(
                 limit.saturating_add(super::UNRESOLVED_SHOWN),
                 &budget,
                 cancellation,
-                &store.runtime().workers(),
+                &nrese_exec::workers::Workers::current(),
             )?;
             let mut counts = Counts {
                 lower: gap.lower,
@@ -457,10 +457,11 @@ fn decide_answers(
             let variables = pair.variables().to_vec();
             let mut why = None;
             let admitted = limit.min(gap.rows.len());
+            pair.reserve_appends(admitted)?;
             // Bounds, candidate production and all batches share the entry deadline.
             for start in (0..admitted).step_by(64) {
                 let end = (start + 64).min(admitted);
-                let mut batch_memory = gap::Scratch::new(&budget);
+                let mut batch_memory = nrese_exec::Reservation::new(&*budget);
                 batch_memory.charge(gap.bytes[start..end].iter().sum())?;
                 let rows: Vec<_> = gap.rows[start..end]
                     .iter()

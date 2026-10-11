@@ -39,7 +39,6 @@ fn fixture() -> (Engine, PreparedQuery, StoreSettings) {
     ))
     .unwrap();
     let store = crate::StoreService::new(crate::StoreConfig {
-        execution_threads: 1,
         ..crate::StoreConfig::in_memory()
     })
     .unwrap();

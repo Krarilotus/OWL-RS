@@ -9,10 +9,10 @@ fn table(snapshot: &Snapshot, rows: &[&[u64]], computed: Vec<Term>) -> SolutionT
     SolutionTable {
         snapshot: snapshot.clone(),
         variables: vec![Variable::new_unchecked("x")].into(),
+        held: Reservation::adopt(budget, table.memory_bytes()),
         table,
         computed: Arc::new(computed),
-        budget,
-        extra_budgets: Vec::new(),
+        aligned: None,
     }
 }
 
@@ -68,7 +68,10 @@ fn retained_results_keep_shared_reservations_and_original_bags_until_delivery() 
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let shared = nrese_exec::SharedBudget::new(1 << 20);
     let options = crate::QueryOptions {
-        shared_memory: Some(Arc::clone(&shared)),
+        resources: crate::Resources {
+            shared_memory: Some(Arc::clone(&shared)),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let query = nrese_sparql_syntax::SparqlParser::new()

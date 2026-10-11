@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn a_decided_variant_stops_a_queued_sibling_before_its_solver_starts() {
         use std::sync::atomic::AtomicUsize;
-        let workers = Workers::pooled(1).unwrap();
+        let workers = Workers::new(1);
         let request = Cancel::default();
         let config = Config {
             cancel: Some(request.clone()),
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn cancelled_or_expired_portfolios_start_no_solvers() {
         use std::time::Duration;
-        let workers = Workers::pooled(2).unwrap();
+        let workers = Workers::new(2);
         let request = Cancel::default();
         request.cancel();
         let ontology = Ontology::default();

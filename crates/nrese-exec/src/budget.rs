@@ -9,6 +9,7 @@
 //! all queries that run at the same time: each query's budget charges it too, and returns
 //! what it holds when the query ends, however it ends.
 
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -211,9 +212,74 @@ impl Drop for Budget {
     }
 }
 
+/// Bytes charged to a budget that outlive the operation which charged them: released when
+/// the reservation drops, however its holder ends. `B` borrows or shares the budget.
+#[derive(Debug)]
+pub struct Reservation<B: Deref<Target = Budget> = Arc<Budget>> {
+    budget: B,
+    bytes: usize,
+}
+
+impl<B: Deref<Target = Budget>> Reservation<B> {
+    pub fn new(budget: B) -> Self {
+        Self { budget, bytes: 0 }
+    }
+
+    /// Takes over `bytes` already charged to `budget`.
+    pub fn adopt(budget: B, bytes: usize) -> Self {
+        Self { budget, bytes }
+    }
+
+    /// Reserves `bytes` more, or fails without reserving anything.
+    pub fn charge(&mut self, bytes: usize) -> Result<(), BudgetExceeded> {
+        self.budget.charge(bytes)?;
+        self.bytes += bytes;
+        Ok(())
+    }
+
+    /// Returns up to `bytes` of this reservation to the budget.
+    pub fn release(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.bytes);
+        self.budget.release(bytes);
+        self.bytes -= bytes;
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Hands the bytes to a holder that releases them itself; nothing is released.
+    pub fn transfer(mut self) -> usize {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl<B: Deref<Target = Budget>> Drop for Reservation<B> {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reservation_releases_what_it_holds_when_dropped() {
+        let budget = Arc::new(Budget::new(100));
+        let mut held = Reservation::new(Arc::clone(&budget));
+        held.charge(60).unwrap();
+        assert!(held.charge(50).is_err());
+        assert_eq!(held.bytes(), 60);
+        held.release(20);
+        assert_eq!(budget.used(), 40);
+        budget.charge(10).unwrap();
+        let adopted = Reservation::adopt(&*budget, 10);
+        drop(held);
+        assert_eq!(budget.used(), 10);
+        assert_eq!(adopted.transfer(), 10);
+        assert_eq!(budget.used(), 10, "a transfer releases nothing");
+    }
 
     #[test]
     fn charges_up_to_the_limit_and_tracks_the_peak() {
