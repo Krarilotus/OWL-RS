@@ -3,6 +3,7 @@
 
 use super::atoms::{Atom, CTerm, FuncId, is_subset, union_into};
 use super::engine::Strategy;
+use super::memory::push;
 use super::rules::{Edge, Incomplete, Message, Scratch, Worker};
 use super::state::{ClauseId, ClauseRef, ContextId, Rule};
 
@@ -97,9 +98,11 @@ impl Worker<'_> {
             s.left = true;
             return;
         }
-        let found = s.found.len();
-        if self.engine.budget().max_join.is_some_and(|m| found >= m)
-            || (found % 4096 == 4095 && self.engine.out_of_budget())
+        if self
+            .engine
+            .budget()
+            .max_join
+            .is_some_and(|m| s.found.len() >= m)
         {
             self.engine.exhaust();
             return;
@@ -157,8 +160,9 @@ impl Worker<'_> {
                 }
             }
             s.found.push(acc, remote.head, Rule::Pred, NONE, &s.refs);
-            if s.found.len().is_multiple_of(4096) && !self.checkpoint_extra(s.bytes()) {
-                return;
+            // A spent budget stops the join at its next step.
+            if s.found.len().is_multiple_of(4096) {
+                self.checkpoint(s.bytes());
             }
             return;
         }
@@ -190,34 +194,14 @@ impl Worker<'_> {
         let Some(f) = head.func() else {
             return;
         };
-        let before = self.state.clauses.observe_memory.then(|| {
-            self.state
-                .succ
-                .get(&f)
-                .map_or(0, super::rules::Successor::bytes)
-        });
-        self.succ_inner(c, head);
-        if let Some(before) = before {
-            self.state.successor_bytes += self
-                .state
-                .succ
-                .get(&f)
-                .map_or(0, super::rules::Successor::bytes)
-                - before;
-        }
-    }
-
-    fn succ_inner(&mut self, c: ClauseId, head: Atom) {
-        let Some(f) = head.func() else {
-            return;
-        };
         let program = &self.engine.program;
         let unconditional = self.state.clauses.recs[c as usize].body == 0;
         let entry = self.state.succ.entry(f).or_default();
+        let bytes = &mut self.state.successor_bytes;
         let mut grew = false;
         if let Some(a) = head.down().filter(|&a| program.is_su(a)) {
             if !entry.k2.contains(&a) {
-                entry.k2.push(a);
+                push(&mut entry.k2, a, bytes);
                 grew = true;
                 for e in &mut entry.edges {
                     if !e.core.contains(&a) && !e.sent.contains(&a) {
@@ -226,7 +210,7 @@ impl Worker<'_> {
                 }
             }
             if unconditional && !entry.k1.contains(&a) {
-                entry.k1.push(a);
+                push(&mut entry.k1, a, bytes);
             }
         }
         if (!grew && !entry.edges.is_empty()) || entry.edges.iter().any(|e| e.complete) {
@@ -260,12 +244,14 @@ impl Worker<'_> {
         let at = match entry.edges.iter().position(|e| e.to == to) {
             Some(at) => at,
             None => {
-                entry.edges.push(Edge {
+                *bytes += std::mem::size_of_val(core.as_slice());
+                let edge = Edge {
                     to,
                     core: core.into_boxed_slice(),
                     sent: Vec::new(),
                     complete: false,
-                });
+                };
+                push(&mut entry.edges, edge, bytes);
                 self.state.clauses.counters.edges += 1;
                 self.out.send(
                     to,
@@ -280,7 +266,7 @@ impl Worker<'_> {
         let edge = &mut entry.edges[at];
         for &a in &entry.k2 {
             if !edge.core.contains(&a) && !edge.sent.contains(&a) {
-                edge.sent.push(a);
+                push(&mut edge.sent, a, bytes);
                 self.out.send(to, Message::Possible(a));
             }
         }

@@ -13,12 +13,13 @@
 //! - **Termination:** the scope ends when no context is active or has mail.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use hashbrown::HashMap;
 
 use super::atoms::Atom;
+use super::memory::{Interval, Observer};
 use super::program::Program;
 use super::rules::{Message, Out, State, Worker};
 use super::state::ContextId;
@@ -52,7 +53,7 @@ pub struct Context {
     active: AtomicBool,
     core: OnceLock<Box<[Atom]>>,
     pub(super) state: Mutex<State>,
-    // Distinct writers: the activation owns working, inbox writers own queued.
+    /// Capacity publications: the activation writes `working`, the inbox's writers `queued`.
     working: AtomicUsize,
     queued: AtomicUsize,
 }
@@ -147,7 +148,6 @@ impl Arena {
     }
 }
 
-/// The program and the contexts saturating it.
 /// A context's key in the registry: its core and its tag ([`Engine::context_tagged`]).
 type CoreKey = (Box<[Atom]>, u32);
 
@@ -161,6 +161,7 @@ impl hashbrown::Equivalent<CoreKey> for CoreLookup<'_> {
     }
 }
 
+/// The program and the contexts saturating it.
 pub struct Engine {
     pub program: Program,
     pub strategy: Strategy,
@@ -174,12 +175,12 @@ pub struct Engine {
     pub prune_pred: bool,
     /// The budget ran out: the workers drop what is left (the saturation is then
     /// incomplete and says so).
-    exhausted: Arc<AtomicBool>,
-    memory: Option<nrese_exec::memory::MemoryWatch>,
-    task_memory: Option<std::sync::Arc<super::memory::Task>>,
-    owned_memory: Mutex<super::memory::Charge>,
-    /// Program, arena segments, registry table and the two copies of context cores.
-    owned_bytes: AtomicUsize,
+    exhausted: AtomicBool,
+    /// Whether a budget check reads the clock (a deadline, a memory limit or an envelope).
+    timed: bool,
+    interval: Interval,
+    /// The capacity envelope's observations (`None`: off).
+    observer: Option<Observer>,
 }
 
 /// What a saturation may use (the dynamic fallback's budgets, design §4, in their first
@@ -196,30 +197,33 @@ pub struct Budget {
     /// The most memory the process may hold (bytes, `nrese_exec::memory`): a saturation
     /// that grows past it stops instead of taking the machine.
     pub max_memory: Option<u64>,
-    /// Estimated saturation capacity; `None` is unlimited and disables observations.
-    /// Contexts publish at work checkpoints; their sampled sum may lag or overlap at
-    /// handoffs. This is not an allocation ceiling. Compilation, short-lived recursive
-    /// temporaries, allocator metadata and worker stacks are outside the observation.
+    /// The saturation's estimated capacity, sampled (docs/design/owl2-dl.md §13); `None`:
+    /// unlimited, and nothing is observed.
     pub task_memory: Option<usize>,
 }
 
 impl Engine {
-    pub fn new(program: Program, strategy: Strategy, proofs: bool) -> Self {
-        Self {
+    pub fn new(program: Program, strategy: Strategy, proofs: bool, budget: Budget) -> Self {
+        let engine = Self {
             program,
             strategy,
             proofs,
             contexts: Arena::new(),
             registry: Mutex::new(HashMap::new()),
-            budget: Budget::default(),
+            budget,
             cancel: None,
             prune_pred: true,
-            exhausted: Arc::new(AtomicBool::new(false)),
-            memory: None,
-            task_memory: None,
-            owned_memory: Mutex::new(Default::default()),
-            owned_bytes: AtomicUsize::new(0),
+            exhausted: AtomicBool::new(false),
+            timed: budget.deadline.is_some()
+                || budget.max_memory.is_some()
+                || budget.task_memory.is_some(),
+            interval: Interval::new(),
+            observer: budget.task_memory.map(Observer::new),
+        };
+        if engine.observing() {
+            engine.own(engine.program.bytes(), 0);
         }
+        engine
     }
 
     /// The engine with Pred's pruning on or off (on by default; off only for A/B runs).
@@ -228,50 +232,52 @@ impl Engine {
         self
     }
 
-    /// The engine with a budget. Changing it does not revive an exhausted run:
-    /// interrupted saturation may already have discarded unfinished work.
-    pub fn with_budget(mut self, budget: Budget) -> Self {
-        self.budget = budget;
-        self.memory = budget.max_memory.map(nrese_exec::memory::MemoryWatch::new);
-        self.task_memory = budget
-            .task_memory
-            .map(|limit| super::memory::Task::new(limit, Arc::clone(&self.exhausted)));
-        if self.task_memory.is_some() {
-            let bytes = self.program.bytes();
-            let mut charge = self.memory_charge();
-            charge.set(bytes);
-            self.owned_bytes.store(bytes, Relaxed);
-            self.owned_memory = Mutex::new(charge);
-        }
+    pub(super) fn with_cancel(mut self, cancel: Option<crate::tableau::Cancel>) -> Self {
+        self.cancel = cancel;
         self
     }
 
-    pub(super) fn memory_charge(&self) -> super::memory::Charge {
-        super::memory::Charge::new(self.task_memory.as_ref())
+    pub fn budget(&self) -> Budget {
+        self.budget
     }
 
-    /// Latest capacity estimate and sampled peak; zero when observations are disabled.
+    pub(super) fn observing(&self) -> bool {
+        self.observer.is_some()
+    }
+
+    /// Latest capacity estimate and sampled peak; zero when observations are off.
     pub fn task_memory_bytes(&self) -> (usize, usize) {
-        self.task_memory
+        self.observer
             .as_ref()
-            .map_or((0, 0), |m| (m.used(), m.peak()))
+            .map_or((0, 0), |o| (o.used(), o.peak()))
     }
 
-    pub(super) fn observe_context(&self, id: ContextId, bytes: usize) {
-        self.context(id).working.store(bytes, Relaxed);
-        self.sample_memory(false);
+    /// Replaces `release` bytes the engine holds with `add` (exhausted past the envelope).
+    fn own(&self, add: usize, release: usize) {
+        if let Some(observer) = &self.observer
+            && !observer.own(add, release)
+        {
+            self.exhaust();
+        }
     }
 
-    /// Reads only publications, never another context's locks. The final sample
-    /// observes remaining capacity even when the timer gate skipped a short run;
-    /// transient peaks may already have disappeared.
-    pub(super) fn sample_memory(&self, force: bool) {
-        let Some(task) = &self.task_memory else {
+    /// Updates an engine-held estimate `held` to `bytes`; false once the budget ran out.
+    pub(super) fn hold(&self, held: &mut usize, bytes: usize) -> bool {
+        self.own(bytes, std::mem::replace(held, bytes));
+        !self.exhausted()
+    }
+
+    /// Publishes context `c`'s capacity (by the worker holding it).
+    pub(super) fn publish(&self, c: ContextId, bytes: usize) {
+        self.context(c).working.store(bytes, Relaxed);
+    }
+
+    /// Sums the contexts' publications, never taking their locks (exhausted past the
+    /// envelope).
+    pub(super) fn sample(&self) {
+        let Some(observer) = &self.observer else {
             return;
         };
-        if !task.sample_due(force) {
-            return;
-        }
         let mut bytes = 0usize;
         for id in 0..self.count() as ContextId {
             let context = self.context(id);
@@ -279,16 +285,9 @@ impl Engine {
                 .saturating_add(context.working.load(Relaxed))
                 .saturating_add(context.queued.load(Relaxed));
         }
-        task.observe(bytes);
-    }
-
-    pub fn budget(&self) -> Budget {
-        self.budget
-    }
-
-    pub(super) fn with_cancel(mut self, cancel: Option<crate::tableau::Cancel>) -> Self {
-        self.cancel = cancel;
-        self
+        if !observer.sample(bytes) {
+            self.exhaust();
+        }
     }
 
     /// Whether the budget ran out (then the saturation is incomplete).
@@ -301,23 +300,38 @@ impl Engine {
         self.exhausted.store(true, Relaxed);
     }
 
-    /// Whether cancelled, the deadline passed or the memory limit is exceeded (marks
-    /// the budget spent if so).
+    /// Whether cancelled, the deadline passed or the memory limit or envelope is exceeded
+    /// (marks the budget spent if so). One clock read; the process memory and the
+    /// contexts' capacity are read once per interval, by whichever check it elects.
     pub(super) fn out_of_budget(&self) -> bool {
         if self.exhausted() {
             return true;
         }
-        if self.budget.deadline.is_some_and(|d| Instant::now() >= d)
-            || self
-                .cancel
-                .as_ref()
-                .is_some_and(crate::tableau::Cancel::is_cancelled)
-            || self.memory.as_ref().is_some_and(|m| m.exceeded())
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(crate::tableau::Cancel::is_cancelled)
         {
             self.exhaust();
             return true;
         }
-        false
+        if !self.timed {
+            return false;
+        }
+        let now = Instant::now();
+        if self.budget.deadline.is_some_and(|d| now >= d) {
+            self.exhaust();
+            return true;
+        }
+        if self.interval.due(now) {
+            if let Some(limit) = self.budget.max_memory
+                && nrese_exec::memory::process_bytes().is_some_and(|held| held > limit)
+            {
+                self.exhaust();
+            }
+            self.sample();
+        }
+        self.exhausted()
     }
 
     pub fn count(&self) -> usize {
@@ -350,19 +364,15 @@ impl Engine {
             return (id, false);
         }
         let before = self
-            .task_memory
-            .as_ref()
-            .map(|_| self.contexts.bytes() + super::memory::map(&*registry));
+            .observing()
+            .then(|| self.contexts.bytes() + super::memory::map(&*registry));
         let id = self.contexts.push().expect("the context arena has room");
         let _ = self.context(id).core.set(core.into());
         registry.insert((core.into(), tag), id);
         if let Some(before) = before {
-            let more = self.contexts.bytes() + super::memory::map(&*registry) - before
-                + 2 * std::mem::size_of_val(core);
-            let bytes = self.owned_bytes.fetch_add(more, Relaxed) + more;
-            lock(&self.owned_memory).set(bytes);
-            let mut state = lock(&self.context(id).state);
-            state.clauses.observe_memory = true;
+            // The arena's and the registry's growth, and the core's two copies.
+            let after = self.contexts.bytes() + super::memory::map(&*registry);
+            self.own(after - before + 2 * std::mem::size_of_val(core), 0);
         }
         (id, true)
     }
@@ -371,60 +381,48 @@ impl Engine {
     /// contexts go out through `deliver` after each batch.
     fn work(&self, c: ContextId, deliver: &mut dyn FnMut(ContextId, Message)) {
         let context = self.context(c);
-        let observe = self.task_memory.is_some();
+        let observe = self.observing();
         loop {
             let mut batch = {
                 let mut inbox = lock(&context.inbox);
-                let batch = std::mem::take(&mut *inbox);
                 if observe {
                     context.queued.store(0, Relaxed);
                 }
-                batch
+                std::mem::take(&mut *inbox)
             };
             if !batch.is_empty() && self.out_of_budget() {
-                // Incomplete runs discard remaining messages, never report an answer.
-                batch.messages.clear();
-                batch.payload_bytes = 0;
+                // Out of budget: the messages are dropped, the run reports it.
+                batch = Inbox::default();
             }
             if batch.is_empty() {
-                // No old activation may publish after a new worker acquires it.
                 context.active.store(false, SeqCst);
+                // A message delivered between the take and the store found the context
+                // still active and scheduled nothing: take it up here.
                 if lock(&context.inbox).is_empty() || context.active.swap(true, SeqCst) {
                     return;
                 }
                 continue;
             }
             let mut out = Out::new(c);
-            let state_bytes;
-            {
+            let state_bytes = {
                 let mut state = lock(&context.state);
-                let mut worker = Worker {
-                    engine: self,
-                    state: &mut state,
-                    out: &mut out,
-                    scratch: super::rules::Scratch::default(),
-                    input_bytes: batch.bytes(),
-                };
+                let mut worker = Worker::new(self, &mut state, &mut out, batch.bytes());
                 for (i, message) in batch.messages.into_iter().enumerate() {
-                    worker.input_bytes -= message.heap_bytes();
+                    if observe {
+                        worker.input_bytes -= message.heap_bytes();
+                    }
                     worker.handle(message);
-                    if self.exhausted() || (i.is_multiple_of(256) && !worker.checkpoint()) {
+                    if (i + 1).is_multiple_of(256) && !worker.checkpoint(0) {
                         break;
                     }
                 }
-                // IntoIter has now released its backing allocation and any leftovers.
                 worker.input_bytes = 0;
-                worker.checkpoint();
-                state_bytes = if observe { worker.state.bytes() } else { 0 };
-            }
+                worker.finish()
+            };
             for (to, message) in out.sends {
-                if self.exhausted() {
-                    break;
-                }
                 deliver(to, message);
             }
             if observe {
-                // Scratch, detached input and outgoing payloads have left this owner.
                 context.working.store(state_bytes, Relaxed);
             }
         }
@@ -433,14 +431,6 @@ impl Engine {
     /// The contexts' states, after the run.
     pub fn states(&self) -> impl Iterator<Item = (ContextId, MutexGuard<'_, State>)> {
         (0..self.count() as ContextId).map(|id| (id, lock(&self.context(id).state)))
-    }
-}
-
-impl Drop for Engine {
-    fn drop(&mut self) {
-        if let Some(task) = &self.task_memory {
-            task.observe(0);
-        }
     }
 }
 

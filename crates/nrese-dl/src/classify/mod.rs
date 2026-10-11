@@ -270,7 +270,7 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
     if options.context_core {
         let core = options.core(deadline.budget(options, None));
         let t = Instant::now();
-        if let Ok(saturated) = crate::context::classify::saturate_normalised_with_workers(
+        if let Ok(saturated) = crate::context::saturate_normalised(
             &normalised,
             &classes,
             &core,

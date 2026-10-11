@@ -8,6 +8,7 @@
 use hashbrown::HashMap;
 
 use super::atoms::{Atom, CTerm, Kind, RoleId, is_subset, signature};
+use super::memory::push;
 
 /// A context, by its index in the arena of contexts.
 pub type ContextId = u32;
@@ -131,13 +132,17 @@ pub struct Counters {
     /// The Eq rule's merges, and its copies.
     pub merges: u64,
     pub eq: u64,
+    /// Message batches the context took, budget checks its workers made, and capacity
+    /// publications (where observed).
+    pub batches: u64,
+    pub checks: u64,
+    pub observations: u64,
 }
 
 /// A context's clauses and indexes.
 #[derive(Debug, Default)]
 pub struct Clauses {
-    pub(super) observe_memory: bool,
-    /// Capacity of nested index buffers, updated only for the head being changed.
+    /// The capacity of the indexes' lists and tries (kept up to date where they grow).
     index_bytes: usize,
     pub recs: Vec<ClauseRec>,
     pub bodies: Bodies,
@@ -197,7 +202,6 @@ impl Clauses {
             + set(&self.unconditional_heads)
     }
 
-    /// Capacity summary; nested indexes are maintained by their single context owner.
     pub(super) fn bytes(&self) -> usize {
         self.flat_bytes() + self.index_bytes
     }
@@ -299,7 +303,7 @@ impl Clauses {
             copy: false,
         });
         for &a in body {
-            index_push(
+            push(
                 self.occurrences.entry((head, a)).or_default(),
                 id,
                 &mut self.index_bytes,
@@ -322,7 +326,7 @@ impl Clauses {
             hashbrown::hash_map::Entry::Occupied(entry) => (entry.into_mut(), false),
             hashbrown::hash_map::Entry::Vacant(entry) => (entry.insert(Vec::new()), true),
         };
-        index_push(list, id, &mut self.index_bytes);
+        push(list, id, &mut self.index_bytes);
         if new && !head.is_bottom() {
             self.index_role(head);
         }
@@ -424,19 +428,19 @@ impl Clauses {
             Kind::Out => {
                 let terms = self.out_terms.entry(r).or_default();
                 if !terms.contains(&t) {
-                    index_push(terms, t, &mut self.index_bytes);
+                    push(terms, t, &mut self.index_bytes);
                 }
                 if t == CTerm::X {
                     let terms = self.in_terms.entry(r).or_default();
                     if !terms.contains(&t) {
-                        index_push(terms, t, &mut self.index_bytes);
+                        push(terms, t, &mut self.index_bytes);
                     }
                 }
             }
             Kind::In => {
                 let terms = self.in_terms.entry(r).or_default();
                 if !terms.contains(&t) {
-                    index_push(terms, t, &mut self.index_bytes);
+                    push(terms, t, &mut self.index_bytes);
                 }
             }
         }
@@ -485,14 +489,6 @@ impl Clauses {
     }
 }
 
-/// Update the owning context's nested capacity at the existing mutation, without
-/// looking up the same index again before and after every derived clause.
-fn index_push<T>(list: &mut Vec<T>, value: T, bytes: &mut usize) {
-    let before = super::memory::vec(list);
-    list.push(value);
-    *bytes += super::memory::vec(list) - before;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,15 +499,7 @@ mod tests {
 
     #[test]
     fn incremental_capacity_matches_a_full_index_walk() {
-        check_incremental_capacity(false);
-        check_incremental_capacity(true);
-    }
-
-    fn check_incremental_capacity(observe_memory: bool) {
-        let mut c = Clauses {
-            observe_memory,
-            ..Clauses::default()
-        };
+        let mut c = Clauses::default();
         for head in [
             Atom::into(3, CTerm::Y),
             Atom::out(3, CTerm::X),
