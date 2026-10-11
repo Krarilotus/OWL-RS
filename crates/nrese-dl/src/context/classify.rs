@@ -89,7 +89,6 @@ pub fn signature(ontology: &Ontology) -> Vec<Term> {
 
 /// A saturated context structure, with what it was built for.
 pub struct Saturated {
-    _memory: super::memory::Charge,
     engine: Engine,
     classes: Vec<Term>,
     /// The query context of each named concept.
@@ -146,27 +145,15 @@ pub fn saturate_with_workers(
     let normalised = normalise_with(ontology, options.normalise);
     let normalise = started.elapsed();
     let classes = signature(ontology);
-    let mut saturated =
-        saturate_normalised_with_workers(&normalised, &classes, options, cancel, workers)?;
+    let mut saturated = saturate_normalised(&normalised, &classes, options, cancel, workers)?;
     saturated.profile.normalise = normalise;
     Ok(saturated)
 }
 
 /// Compiles and saturates DL-clauses for the named classes `classes` (the classification
-/// driver's Horn lower bound runs it on the Horn part of an ontology's clauses).
+/// driver's Horn lower bound runs it on the Horn part of an ontology's clauses), on
+/// `workers` narrowed to `options.threads`.
 pub fn saturate_normalised(
-    normalised: &nrese_owl::Normalised,
-    classes: &[Term],
-    options: &Options,
-) -> Result<Saturated, Unsupported> {
-    let workers = nrese_exec::workers::Workers::new(options.threads.max(1))
-        .unwrap_or_else(|_| nrese_exec::workers::Workers::serial());
-    saturate_normalised_with_workers(normalised, classes, options, None, &workers)
-}
-
-/// Saturates using caller-owned workers. The pool survives all ABox rounds and is not
-/// retained by the returned logical state.
-pub fn saturate_normalised_with_workers(
     normalised: &nrese_owl::Normalised,
     classes: &[Term],
     options: &Options,
@@ -195,13 +182,12 @@ pub fn saturate_normalised_with_workers(
     let started = Instant::now();
     let Compiled { program, abox, .. } = compiled;
     let named = program.named();
-    let engine = Engine::new(program, options.strategy, options.proofs)
-        .with_budget(options.budget)
+    let engine = Engine::new(program, options.strategy, options.proofs, options.budget)
         .with_cancel(cancel)
         .with_prune_pred(options.prune_pred);
-    let mut input_memory = engine.memory_charge();
-    if input_memory.enabled() {
-        input_memory.set(abox.bytes());
+    let mut held = 0;
+    if engine.observing() {
+        engine.hold(&mut held, abox.bytes());
     }
     if engine.out_of_budget() {
         return Err(Unsupported::Budget);
@@ -216,13 +202,11 @@ pub fn saturate_normalised_with_workers(
     let (top, _) = engine.context_for(&[]);
     let mut seeds = query.clone();
     seeds.push(top);
-    let mut memory = engine.memory_charge();
-    memory.set(super::memory::vec(&query) + super::memory::vec(&seeds));
-    engine.run_with_workers(&seeds, &workers);
+    engine.run(&seeds, &workers);
     if engine.out_of_budget() {
         return Err(Unsupported::Budget);
     }
-    let individuals = Individuals::saturate_with_workers(&engine, &abox, &workers);
+    let assertions_consistent = Individuals::saturate(&engine, &abox, &workers).release(&engine);
     if engine.out_of_budget() {
         return Err(Unsupported::Budget);
     }
@@ -243,18 +227,18 @@ pub fn saturate_normalised_with_workers(
     }
     // The program's named concepts: the signature's classes and any the clauses add.
     let classes = engine.program.names.clone();
-    drop(seeds);
-    if !memory.set(super::memory::vec(&query) + super::memory::vec(&classes)) {
+    // The retained results replace the compiled input.
+    let results = super::memory::vec(&query) + super::memory::vec(&classes);
+    if !engine.hold(&mut held, results) {
         return Err(Unsupported::Budget);
     }
     profile.task_memory_peak = engine.task_memory_bytes().1;
     Ok(Saturated {
-        _memory: memory,
         engine,
         classes,
         query,
         top,
-        assertions_consistent: individuals.consistent,
+        assertions_consistent,
         profile,
     })
 }

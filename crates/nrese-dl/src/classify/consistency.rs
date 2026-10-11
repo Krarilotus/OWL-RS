@@ -44,14 +44,9 @@ pub(crate) fn by_context_core(
     }
     let mut rest = normalised.clone();
     rest.facts.data.clear();
-    let saturated = crate::context::classify::saturate_normalised_with_workers(
-        &rest,
-        classes,
-        core,
-        config.cancel.clone(),
-        workers,
-    )
-    .ok()?;
+    let saturated =
+        crate::context::saturate_normalised(&rest, classes, core, config.cancel.clone(), workers)
+            .ok()?;
     if !saturated.consistent() {
         return Some(Verdict::Inconsistent);
     }
