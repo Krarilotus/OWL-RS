@@ -7,9 +7,15 @@ use super::{ContextId, Engine, Message, Mutex, SeqCst, lock};
 
 impl Engine {
     /// Starts `seeds` and saturates until no context has work, within the allowance of
-    /// `workers`; then takes the final capacity sample.
+    /// `workers`; then publishes every context's exact capacity and samples it.
     pub fn run(&self, seeds: &[ContextId], workers: &Workers) {
         workers.install(|| self.run_on_workers(seeds, workers));
+        if self.observing() {
+            for id in 0..self.count() as ContextId {
+                let bytes = lock(&self.context(id).state).bytes();
+                self.publish(id, bytes);
+            }
+        }
         self.sample();
     }
 

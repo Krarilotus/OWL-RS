@@ -71,6 +71,11 @@ impl Interval {
         }
     }
 
+    /// The latest election (0: none yet); it changes once per interval at most.
+    pub fn last(&self) -> u64 {
+        self.last.load(Relaxed)
+    }
+
     pub fn due(&self, now: Instant) -> bool {
         let now = u64::try_from(now.saturating_duration_since(self.started).as_micros())
             .unwrap_or(u64::MAX)
