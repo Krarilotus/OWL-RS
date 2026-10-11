@@ -151,7 +151,7 @@ fn renaming_reordering_and_redundancy_keep_the_taxonomy() {
 fn the_switches_keep_the_taxonomy() {
     let n = cases(300);
     let mut rng = Rng::new(0x2026_1003_3103);
-    let shared = nrese_exec::workers::Workers::new(4).unwrap();
+    let shared = nrese_exec::workers::Workers::new(4);
     for i in 0..n {
         let (_, _, o, _) = case(&mut rng, i);
         let Some(base) = run(&o, defaults()) else {

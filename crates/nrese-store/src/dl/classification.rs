@@ -30,7 +30,7 @@ type Slot<T> = Mutex<Option<(u64, Arc<T>)>>;
 /// How the engines run under the store's settings.
 pub(super) fn options(store: &StoreService) -> classify::Options {
     let config = &store.config().dl;
-    let workers = store.runtime().workers().limited(config.threads);
+    let workers = nrese_exec::workers::Workers::current().limited(config.threads);
     let mut options = config.classification_options(workers);
     options.max_memory = Some(store.config().process_memory_bytes);
     options
@@ -120,7 +120,6 @@ mod tests {
 
     fn store(timeout: Duration) -> StoreService {
         let store = StoreService::new(StoreConfig {
-            execution_threads: 1,
             process_memory_bytes: 0,
             dl: DlConfig {
                 timeout,

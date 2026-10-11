@@ -149,7 +149,7 @@ mod memory_tests {
             threads: 4,
             ..DlConfig::default()
         };
-        let workers = nrese_exec::workers::Workers::new(4).unwrap().limited(2);
+        let workers = nrese_exec::workers::Workers::new(4).limited(2);
         let options = config.classification_options(workers.clone());
         assert_eq!(options.threads, 2);
         assert_eq!(options.workers.as_ref(), Some(&workers));

@@ -67,7 +67,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
-use crate::results::{CancellationToken, QueryEvaluationError, QueryResults};
+use crate::results::{
+    CancellationToken, QueryEvaluationError, QueryResults, QuerySolutionIter, QueryTripleIter,
+};
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
@@ -75,7 +77,8 @@ use nrese_exec::join::{
     outer_join_with_undef,
 };
 use nrese_exec::{
-    Budget, BudgetExceeded, IdTable, UNDEF, computed_id, computed_index, group::group_rows,
+    Budget, BudgetExceeded, IdTable, Reservation, UNDEF, computed_id, computed_index,
+    group::group_rows,
 };
 use nrese_rdf::{Term, Variable};
 use nrese_sparql_syntax::Query;
@@ -158,7 +161,99 @@ pub(crate) fn evaluate<'a>(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<QueryResults<'a>, QueryEvaluationError> {
-    Ok(typed_results::evaluate(snapshot.into_owned(), query, options)?.into_results())
+    let (outcome, held) = run(&snapshot, query, options)?;
+    Ok(match outcome {
+        Outcome::Boolean(value) => QueryResults::Boolean(value),
+        Outcome::Graph(triples) => QueryResults::Graph(QueryTripleIter::new(Holding::new(
+            triples.into_iter().map(Ok),
+            held,
+        ))),
+        Outcome::Solutions(solutions, computed) => {
+            let table = solutions.table;
+            let rows = (0..table.len()).map(move |row| {
+                Ok((0..table.width())
+                    .map(|column| decode(&snapshot, &computed, table.get(row, column)))
+                    .collect::<Vec<_>>())
+            });
+            QueryResults::Solutions(QuerySolutionIter::new(
+                solutions.vars.into(),
+                Holding::new(rows, held),
+            ))
+        }
+    })
+}
+
+/// What evaluating a query gives before delivery.
+enum Outcome {
+    Boolean(bool),
+    Graph(Vec<nrese_rdf::Triple>),
+    /// The solutions and the query's computed terms.
+    Solutions(Solutions, Vec<Term>),
+}
+
+/// Evaluates `query` to its [`Outcome`], with the reservation of what that holds.
+fn run(
+    snapshot: &Snapshot,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<(Outcome, Reservation), QueryEvaluationError> {
+    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
+    let pattern = match &options.pre_bound {
+        Some(values) => {
+            // A blank node is put in as an alias IRI that stands for the node.
+            for term in values.values() {
+                if let Term::BlankNode(b) = term
+                    && let Some(id) = snapshot.lookup(term.as_ref())
+                {
+                    ctx.register_alias(substitute::alias(b.as_str()).as_str(), id.raw());
+                }
+            }
+            substitute::Values { terms: values }.top(&pattern)
+        }
+        None => pattern,
+    };
+    let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
+    ctx.check()?;
+    let outcome = match form {
+        Form::Ask => Outcome::Boolean(!solutions.table.is_empty()),
+        Form::Describe => Outcome::Graph(ctx.describe(&solutions)?),
+        Form::Construct(template) => Outcome::Graph(
+            construct(snapshot, ctx.computed.take(), solutions, template, || {
+                ctx.check()
+            })
+            .collect::<NativeResult<_>>()?,
+        ),
+        Form::Select => Outcome::Solutions(solutions, ctx.computed.take()),
+    };
+    Ok((
+        outcome,
+        Reservation::adopt(Arc::clone(&ctx.budget), ctx.budget.used()),
+    ))
+}
+
+/// An iterator that holds a reservation until it drops.
+struct Holding<I> {
+    items: I,
+    _held: Reservation,
+}
+
+impl<I> Holding<I> {
+    fn new(items: I, held: Reservation) -> Self {
+        Self { items, _held: held }
+    }
+}
+
+impl<I: Iterator> Iterator for Holding<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<I::Item> {
+        self.items.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.items.size_hint()
+    }
 }
 
 /// Runs `query`, recording each operator ([`PlanStep`]); returns the rewrites that changed
@@ -172,23 +267,20 @@ pub(crate) fn explain(
     let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let (pattern, form, rewrites, ql) = native_pattern(query, options, &ctx)?;
     ctx.trace = Some(RefCell::default());
-    let (_, (steps, rows)) = ctx.on_workers(options.workers.as_ref(), |ctx| {
-        let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
-        ctx.check()?;
-        let steps = ctx.trace.as_ref().map(RefCell::take).unwrap_or_default();
-        // CONSTRUCT and DESCRIBE count triples, without retaining a constructed graph.
-        let rows = match form {
-            Form::Select | Form::Ask => solutions.table.len(),
-            Form::Describe => ctx.describe(&solutions)?.len(),
-            Form::Construct(template) => {
-                construct(snapshot, ctx.computed.take(), solutions, template, || {
-                    ctx.check()
-                })
-                .try_fold(0usize, |count, triple| triple.map(|_| count + 1))?
-            }
-        };
-        Ok((steps, rows))
-    })?;
+    let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
+    ctx.check()?;
+    let steps = ctx.trace.take().unwrap_or_default().into_inner();
+    // CONSTRUCT and DESCRIBE count triples, without retaining a constructed graph.
+    let rows = match form {
+        Form::Select | Form::Ask => solutions.table.len(),
+        Form::Describe => ctx.describe(&solutions)?.len(),
+        Form::Construct(template) => {
+            construct(snapshot, ctx.computed.take(), solutions, template, || {
+                ctx.check()
+            })
+            .try_fold(0usize, |count, triple| triple.map(|_| count + 1))?
+        }
+    };
     Ok((rewrites, steps, rows as u64, ql))
 }
 
@@ -256,25 +348,19 @@ pub(crate) fn write_results(
         Ok(native) => native,
         Err(error) => return Some(Err(error.into())),
     };
-    let (ctx, solutions) = match ctx.on_workers(options.workers.as_ref(), |ctx| {
-        ctx.eval_root(&pattern, options.pin.as_ref())
-    }) {
-        Ok(result) => result,
+    let solutions = match ctx.eval_root(&pattern, options.pin.as_ref()) {
+        Ok(solutions) => solutions,
         Err(error) => return Some(Err(QueryEvaluationError::from(error).into())),
     };
-    if let Err(error) = ctx.check() {
-        return Some(Err(QueryEvaluationError::from(error).into()));
-    }
     if matches!(form, Form::Ask) {
         let bytes = output::boolean(!solutions.table.is_empty(), version);
-        return Some(out.write_all(&bytes).map_err(Into::into).and_then(|()| {
-            ctx.check()
-                .map_err(|error| QueryEvaluationError::from(error).into())
-        }));
+        return Some(match ctx.check() {
+            Ok(()) => out.write_all(&bytes).map_err(Into::into),
+            Err(error) => Err(QueryEvaluationError::from(error).into()),
+        });
     }
     let computed = ctx.computed.into_inner();
-    let token = options.cancellation.clone();
-    let cancelled = || token.as_ref().is_some_and(CancellationToken::is_cancelled);
+    let cancelled = || options.resources.check().is_err();
     let alive = || {
         if cancelled() {
             Err(std::io::Error::other("query cancelled"))
@@ -295,7 +381,7 @@ pub(crate) fn write_results(
                 &solutions.table,
                 out,
                 &alive,
-                options.workers.as_ref(),
+                &options.resources.workers,
             )
             .map_err(|error| {
                 if cancelled() {
@@ -339,7 +425,7 @@ pub(crate) fn delete_insert(
     }
     let ctx = Context::new(snapshot, options, using, base);
     let pattern = optimise(pattern.clone(), &mut Vec::new(), &ctx);
-    let (ctx, solutions) = ctx.on_workers(options.workers.as_ref(), |ctx| ctx.eval(&pattern))?;
+    let solutions = ctx.eval(&pattern)?;
     let computed = ctx.computed.into_inner();
     let table = &solutions.table;
     let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
@@ -585,87 +671,83 @@ fn construct<'a>(
     let mut emitted: HashSet<nrese_rdf::Triple> = HashSet::new();
     let mut buffer: Vec<nrese_rdf::Triple> = Vec::new();
     let mut row = 0;
-    let mut stopped = false;
     std::iter::from_fn(move || {
-        if stopped {
-            return None;
-        }
-        let next = (|| {
-            loop {
-                check()?;
-                if let Some(triple) = buffer.pop() {
-                    return Ok(Some(triple));
-                }
-                if row >= table.len() {
-                    return Ok(None);
-                }
-                let fresh: Vec<nrese_rdf::BlankNode> = (0..fresh_count)
-                    .map(|_| nrese_rdf::BlankNode::default())
-                    .collect();
-                fn template_value(
-                    term: &TemplateTerm,
-                    column: &dyn Fn(usize) -> Option<Term>,
-                    fresh: &[nrese_rdf::BlankNode],
-                ) -> Option<Term> {
-                    match term {
-                        TemplateTerm::Constant(term) => Some(term.clone()),
-                        TemplateTerm::Column(c) => column(*c),
-                        TemplateTerm::Unbound => None,
-                        TemplateTerm::Fresh(i) => Some(fresh[*i].clone().into()),
-                        TemplateTerm::Triple(parts) => {
-                            let subject = match template_value(&parts[0], column, fresh)? {
-                                Term::NamedNode(n) => nrese_rdf::NamedOrBlankNode::from(n),
-                                Term::BlankNode(b) => b.into(),
-                                Term::Literal(_) | Term::Triple(_) => return None,
-                            };
-                            let Term::NamedNode(predicate) =
-                                template_value(&parts[1], column, fresh)?
-                            else {
-                                return None;
-                            };
-                            let object = template_value(&parts[2], column, fresh)?;
-                            Some(nrese_rdf::Triple::new(subject, predicate, object).into())
-                        }
-                    }
-                }
-                let column = |c: usize| decode(snapshot, &computed, table.get(row, c));
-                let value = |term: &TemplateTerm| template_value(term, &column, &fresh);
-                for (index, [s, p, o]) in resolved.iter().enumerate() {
-                    if index % 256 == 0 {
-                        check()?;
-                    }
-                    let subject = match value(s) {
-                        Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
-                        Some(Term::BlankNode(b)) => nrese_rdf::NamedOrBlankNode::from(b),
-                        _ => continue,
-                    };
-                    let Some(Term::NamedNode(predicate)) = value(p) else {
-                        continue;
-                    };
-                    let Some(object) = value(o) else {
-                        continue;
-                    };
-                    let triple = nrese_rdf::Triple::new(subject, predicate, object);
-                    let new = triple.subject.is_blank_node()
-                        || triple.object.is_blank_node()
-                        || emitted.insert(triple.clone());
-                    if new {
-                        buffer.push(triple);
-                        if emitted.len() > 1024 * 1024 {
-                            emitted.clear();
-                        }
-                    }
-                }
-                buffer.reverse();
-                row += 1;
+        loop {
+            if let Some(triple) = buffer.pop() {
+                return Some(Ok(triple));
             }
-        })();
-        match next {
-            Ok(triple) => triple.map(Ok),
-            Err(error) => {
-                stopped = true;
-                Some(Err(error))
+            if row >= table.len() {
+                return None;
             }
+            // One check per row, and one per 256 entries of a wide template; an error
+            // ends the iteration.
+            if let Err(error) = check() {
+                row = table.len();
+                return Some(Err(error));
+            }
+            let fresh: Vec<nrese_rdf::BlankNode> = (0..fresh_count)
+                .map(|_| nrese_rdf::BlankNode::default())
+                .collect();
+            fn template_value(
+                term: &TemplateTerm,
+                column: &dyn Fn(usize) -> Option<Term>,
+                fresh: &[nrese_rdf::BlankNode],
+            ) -> Option<Term> {
+                match term {
+                    TemplateTerm::Constant(term) => Some(term.clone()),
+                    TemplateTerm::Column(c) => column(*c),
+                    TemplateTerm::Unbound => None,
+                    TemplateTerm::Fresh(i) => Some(fresh[*i].clone().into()),
+                    TemplateTerm::Triple(parts) => {
+                        let subject = match template_value(&parts[0], column, fresh)? {
+                            Term::NamedNode(n) => nrese_rdf::NamedOrBlankNode::from(n),
+                            Term::BlankNode(b) => b.into(),
+                            Term::Literal(_) | Term::Triple(_) => return None,
+                        };
+                        let Term::NamedNode(predicate) = template_value(&parts[1], column, fresh)?
+                        else {
+                            return None;
+                        };
+                        let object = template_value(&parts[2], column, fresh)?;
+                        Some(nrese_rdf::Triple::new(subject, predicate, object).into())
+                    }
+                }
+            }
+            let current = row;
+            let column = |c: usize| decode(snapshot, &computed, table.get(current, c));
+            let value = |term: &TemplateTerm| template_value(term, &column, &fresh);
+            for (index, [s, p, o]) in resolved.iter().enumerate() {
+                if index % 256 == 255
+                    && let Err(error) = check()
+                {
+                    buffer.clear();
+                    row = table.len();
+                    return Some(Err(error));
+                }
+                let subject = match value(s) {
+                    Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
+                    Some(Term::BlankNode(b)) => nrese_rdf::NamedOrBlankNode::from(b),
+                    _ => continue,
+                };
+                let Some(Term::NamedNode(predicate)) = value(p) else {
+                    continue;
+                };
+                let Some(object) = value(o) else {
+                    continue;
+                };
+                let triple = nrese_rdf::Triple::new(subject, predicate, object);
+                let new = triple.subject.is_blank_node()
+                    || triple.object.is_blank_node()
+                    || emitted.insert(triple.clone());
+                if new {
+                    buffer.push(triple);
+                    if emitted.len() > 1024 * 1024 {
+                        emitted.clear();
+                    }
+                }
+            }
+            buffer.reverse();
+            row += 1;
         }
     })
 }
@@ -1140,24 +1222,6 @@ enum GraphScope {
 }
 
 impl<'a> Context<'a> {
-    /// Transfers only native computation to its physical owner. The context is Send,
-    /// not Sync; it moves as a whole and returns with its computed-term ID domain.
-    /// Caller-owned writers and reporting callbacks never cross the thread boundary.
-    fn on_workers<R: Send>(
-        self,
-        workers: Option<&nrese_exec::workers::Workers>,
-        run: impl FnOnce(&Self) -> NativeResult<R> + Send,
-    ) -> NativeResult<(Self, R)> {
-        let compute = move || {
-            let result = run(&self)?;
-            Ok((self, result))
-        };
-        match workers {
-            Some(workers) => workers.install(compute),
-            None => compute(),
-        }
-    }
-
     /// Whether `triple` is a GeoSPARQL relation computed from geometries
     /// ([`spatial`]): not when only stated relations are read.
     fn is_spatial(&self, triple: &TriplePattern) -> bool {
@@ -1223,12 +1287,13 @@ impl<'a> Context<'a> {
             computed_ids: RefCell::default(),
             decoded: RefCell::default(),
             numbers: RefCell::default(),
-            cancellation: options.cancellation.clone(),
+            cancellation: options.resources.cancellation.clone(),
             budget: Arc::new(
                 options
+                    .resources
                     .memory_limit
                     .map_or_else(Budget::unlimited, Budget::new)
-                    .within(options.shared_memory.clone()),
+                    .within(options.resources.shared_memory.clone()),
             ),
             trace: None,
             depth: Cell::new(0),
@@ -1300,14 +1365,10 @@ impl<'a> Context<'a> {
     }
 
     fn check(&self) -> NativeResult<()> {
-        if self
+        Ok(self
             .cancellation
             .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return Err(QueryEvaluationError::Cancelled.into());
-        }
-        Ok(())
+            .map_or(Ok(()), CancellationToken::check)?)
     }
 
     /// Charges a produced table against the query's memory budget.

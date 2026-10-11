@@ -34,8 +34,6 @@ impl std::fmt::Display for IncompleteAnswer {
 pub enum StoreError {
     #[error("invalid store configuration: {0}")]
     Configuration(String),
-    #[error("execution workers could not be started: {0}")]
-    ExecutionUnavailable(#[source] rayon::ThreadPoolBuildError),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error("storage engine error: {0}")]
@@ -100,6 +98,12 @@ pub enum Refusal {
     WriteAll(String),
 }
 
+impl From<nrese_exec::BudgetExceeded> for StoreError {
+    fn from(exceeded: nrese_exec::BudgetExceeded) -> Self {
+        QueryEvaluationError::MemoryLimit(exceeded).into()
+    }
+}
+
 impl StoreError {
     /// The evaluation error, of a query or of an update's pattern: both are classified
     /// alike (the review of 3 October 2026, A6).
@@ -154,7 +158,6 @@ impl StoreError {
             | Self::FileParse { .. } => true,
             Self::SparqlEvaluation(_) => unreachable!("classified above"),
             Self::Configuration(_)
-            | Self::ExecutionUnavailable(_)
             | Self::Io(_)
             | Self::Engine(_)
             | Self::OntologyFileNotFound { .. }
