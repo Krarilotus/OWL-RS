@@ -10,7 +10,7 @@ impl Engine {
     /// Saturates with a standalone pool, falling back to the calling thread on failure.
     /// Repeated rounds should use [`Self::run_with_workers`] with one reusable owner.
     pub fn run(&self, seeds: &[ContextId], threads: usize) {
-        let workers = Workers::new(threads.max(1)).unwrap_or_else(|_| Workers::serial());
+        let workers = Workers::new(threads);
         self.run_with_workers(seeds, &workers);
     }
 
@@ -162,7 +162,7 @@ mod tests {
                     .0
             })
             .collect();
-        let workers = Workers::pooled(4).unwrap();
+        let workers = Workers::new(4);
         {
             let agenda = Agenda {
                 engine: &engine,

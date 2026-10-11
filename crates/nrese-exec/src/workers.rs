@@ -1,5 +1,5 @@
-//! Execution handles and bounded batches. The policy owner chooses current execution
-//! or an owned pool. A clone shares that choice; a smaller allowance creates no pool.
+//! Execution handles and bounded batches: the caller's current execution, serial, or an
+//! owned pool. A clone shares that choice; a smaller allowance creates no pool.
 
 use std::sync::Arc;
 
@@ -37,10 +37,15 @@ impl std::fmt::Debug for Workers {
     }
 }
 
+impl Default for Workers {
+    fn default() -> Self {
+        Self::current()
+    }
+}
+
 impl Workers {
-    /// Keeps serial work on its caller and parallel batches in the current Rayon
-    /// registry (the global registry outside a worker). Creates no pool or admission
-    /// queue. This is an operation allowance, not a cap across concurrent callers.
+    /// Serial work on its caller, parallel batches in the current Rayon registry (the
+    /// global one outside a worker).
     pub fn current() -> Self {
         Self {
             pool: None,
@@ -48,30 +53,21 @@ impl Workers {
         }
     }
 
-    /// Creates a reusable pool; zero requests the machine's available parallelism.
-    /// Failure is returned to the policy owner, never redirected to an ambient pool.
-    pub fn new(threads: usize) -> Result<Self, rayon::ThreadPoolBuildError> {
-        if threads == 1 {
-            return Ok(Self::serial());
+    /// A pool of `threads` workers. Up to one thread, or when the system cannot start
+    /// the pool, the work runs serially on its caller.
+    pub fn new(threads: usize) -> Self {
+        if threads <= 1 {
+            return Self::serial();
         }
-        Self::pooled(threads)
+        match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+            Ok(pool) => Self {
+                width: pool.current_num_threads(),
+                pool: Some(Arc::new(pool)),
+            },
+            Err(_) => Self::serial(),
+        }
     }
 
-    /// A physical execution owner, including a one-thread pool. Serial tasks submitted
-    /// by different callers then share that thread instead of running on every caller.
-    pub fn pooled(threads: usize) -> Result<Self, rayon::ThreadPoolBuildError> {
-        let width = match threads {
-            0 => std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
-            n => n,
-        };
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(width).build()?;
-        Ok(Self {
-            width: pool.current_num_threads(),
-            pool: Some(Arc::new(pool)),
-        })
-    }
-
-    /// Runs serially on the caller, including the explicit pool-failure fallback.
     pub fn serial() -> Self {
         Self {
             pool: None,
@@ -80,8 +76,7 @@ impl Workers {
     }
 
     /// An allowance within this pool. Zero keeps the current allowance; a child may
-    /// narrow its parent but cannot increase it. No owned pool is created; resolving
-    /// a wider current allowance may initialise Rayon's global registry.
+    /// narrow its parent but cannot increase it.
     pub fn limited(&self, requested: usize) -> Self {
         Self {
             pool: self.pool.clone(),
@@ -121,10 +116,8 @@ impl Workers {
         self.width().min(items).max(1)
     }
 
-    /// Enters an owned pool, or runs inline for current/serial execution. The body
-    /// is responsible for respecting its allowance
-    /// when spawning work; use [`Self::map`] for independent bounded tasks. In particular,
-    /// arbitrary nested Rayon iterators do not inherit a smaller allowance automatically.
+    /// Enters an owned pool, or runs inline. Nested Rayon iterators do not inherit a
+    /// smaller allowance; use [`Self::map`] for bounded tasks.
     pub fn install<F: FnOnce() -> R + Send, R: Send>(&self, f: F) -> R {
         match &self.pool {
             Some(pool) => pool.install(f),
@@ -154,8 +147,6 @@ impl Workers {
                 })
                 .collect()
         });
-        // Dense input indices avoid sorting and unsafe shared result writes. The extra
-        // O(n) slots are used only by narrowed irregular batches, never regular kernels.
         let mut ordered: Vec<Option<R>> =
             std::iter::repeat_with(|| None).take(items.len()).collect();
         for (i, value) in lanes.into_iter().flatten() {
@@ -206,7 +197,7 @@ mod tests {
         let current = Workers::current();
         let caller = std::thread::current().id();
         assert_eq!(current.install(|| std::thread::current().id()), caller);
-        let owner = Workers::pooled(4).unwrap();
+        let owner = Workers::new(4);
         let narrowed = owner.install(|| {
             assert_eq!(current.width(), 4);
             let narrowed = current.limited(2);
@@ -232,12 +223,16 @@ mod tests {
             );
             narrowed
         });
-        Workers::pooled(3).unwrap().install(|| {
+        Workers::new(3).install(|| {
             assert_eq!(current.width(), 3);
             assert_eq!(narrowed.width(), 2);
             assert_eq!(narrowed.limited(3).width(), 2);
         });
-        Workers::pooled(1).unwrap().install(|| {
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        one.install(|| {
             assert_eq!(narrowed.width(), 1);
             assert_eq!(narrowed.map(&[1, 2], |n| n * 2), [2, 4]);
         });
@@ -245,7 +240,7 @@ mod tests {
 
     #[test]
     fn narrowed_batches_keep_order_and_do_not_start_more_workers() {
-        let physical = Workers::new(4).unwrap();
+        let physical = Workers::new(4);
         let workers = physical.limited(2);
         let active = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
@@ -272,7 +267,7 @@ mod tests {
     #[test]
     fn a_free_narrow_lane_can_take_work_behind_a_busy_lane() {
         use std::sync::{Condvar, Mutex};
-        let workers = Workers::pooled(4).unwrap().limited(2);
+        let workers = Workers::new(4).limited(2);
         let progress = (Mutex::new(false), Condvar::new());
         let items: Vec<_> = (0..8).collect();
         let output = workers.map(&items, |&i| {
@@ -297,19 +292,13 @@ mod tests {
 
     #[test]
     fn serial_allowances_use_the_owner_and_standalone_work_stays_on_the_caller() {
-        let workers = Workers::new(2).unwrap().limited(1);
+        let workers = Workers::new(2).limited(1);
         let caller = std::thread::current().id();
         let threads = workers.map(&[0, 1], |_| std::thread::current().id());
         assert_eq!(threads[0], threads[1]);
         assert_ne!(threads[0], caller);
         assert_eq!(
             Workers::serial().install(|| std::thread::current().id()),
-            caller
-        );
-        assert_ne!(
-            Workers::pooled(1)
-                .unwrap()
-                .install(|| std::thread::current().id()),
             caller
         );
         assert!(workers.map::<u8, u8>(&[], |_| unreachable!()).is_empty());

@@ -59,8 +59,7 @@ pub fn horn_lower_bound(
     classes: &[Term],
     core: &crate::context::Options,
 ) -> Option<Lower> {
-    let workers = nrese_exec::workers::Workers::new(core.threads.max(1))
-        .unwrap_or_else(|_| nrese_exec::workers::Workers::serial());
+    let workers = nrese_exec::workers::Workers::new(core.threads);
     horn_lower_bound_with_workers(normalised, classes, core, &workers, None)
 }
 
