@@ -62,6 +62,27 @@ pub struct StoreService {
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
 const REASONING_MARKER: &str = "reasoning.state";
 
+/// The memory stop of one operation ([`StoreService::memory_stop`]).
+pub(crate) struct MemoryStop(Option<nrese_exec::memory::MemoryWatch>);
+
+impl MemoryStop {
+    pub(crate) fn exceeded(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(nrese_exec::memory::MemoryWatch::exceeded)
+    }
+
+    /// The error of a stop this caused, if it caused one.
+    pub(crate) fn error(&self) -> Option<crate::StoreError> {
+        self.0
+            .as_ref()
+            .filter(|watch| watch.exceeded())
+            .map(|watch| crate::StoreError::ProcessMemoryLimit {
+                limit: watch.limit(),
+            })
+    }
+}
+
 impl fmt::Debug for StoreService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StoreService")
@@ -73,7 +94,6 @@ impl fmt::Debug for StoreService {
 
 impl StoreService {
     pub fn new(config: StoreConfig) -> StoreResult<Self> {
-        config.validate()?;
         let runtime = std::sync::Arc::new(crate::Runtime::new(
             config.execution_threads,
             config.total_query_memory_bytes,
@@ -660,26 +680,14 @@ impl StoreService {
                 }
                 // Streamed over the snapshot the status was decided on (L's view where
                 // L adds memberships, kept per revision, whose identity is its own),
-                // never a later revision's.
-                Outcome::Stream(status, Read::Lower(snapshot) | Read::At(snapshot), detail) => {
+                // never a later revision's; or, for a status that holds whatever the
+                // revision (sound only), over the latest.
+                Outcome::Stream(status, read, detail) => {
+                    let snapshot = match read {
+                        Read::Lower(snapshot) | Read::At(snapshot) => snapshot,
+                        Read::Latest => self.read_snapshot(prepared.access()),
+                    };
                     let context = format!("{dl} {status:?}");
-                    run_query(
-                        &snapshot,
-                        prepared,
-                        &self.settings,
-                        cancellation,
-                        out,
-                        |_| {
-                            report(Some(status));
-                            context
-                        },
-                    )?;
-                    detail
-                }
-                // A status that holds whatever the revision (sound only).
-                Outcome::Stream(status, Read::Latest, detail) => {
-                    let context = format!("{dl} {status:?}");
-                    let snapshot = self.read_snapshot(prepared.access());
                     run_query(
                         &snapshot,
                         prepared,
@@ -1398,18 +1406,18 @@ impl StoreService {
         }
     }
 
-    /// A watch over this store's process-memory policy; `None` disables its watch.
+    /// An operation's stop under this store's process-memory policy; zero disables it.
     /// Opening a store never changes the process owner's global safety fallback.
-    pub(crate) fn memory_watch(&self) -> Option<nrese_exec::memory::MemoryWatch> {
+    pub(crate) fn memory_stop(&self) -> MemoryStop {
         let limit = self.config.process_memory_bytes;
-        (limit > 0).then(|| nrese_exec::memory::MemoryWatch::new(limit))
+        MemoryStop((limit > 0).then(|| nrese_exec::memory::MemoryWatch::new(limit)))
     }
 
     /// The closure's size with equality replicated and over representatives, for
     /// `program` on the asserted data, or an explicit diagnostic if stopped.
     pub fn equality_report(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> String {
-        let watch = self.memory_watch();
-        let stop = || watch.as_ref().is_some_and(|watch| watch.exceeded());
+        let memory = self.memory_stop();
+        let stop = || memory.exceeded();
         let tx = self.engine.transaction();
         let program = crate::reasoning::Program::compile(&program.into(), &|term| tx.intern(term));
         nrese_reasoner::engine::equality_report_until(&program, tx.base(), &stop)
@@ -1447,13 +1455,12 @@ impl StoreService {
                 .hiding_unnamed_classes(self.config.hide_unnamed_classes)
                 .by_representatives(self.config.equality_by_representatives)
                 .storing_representatives(self.config.equality_compact);
-        let watch = self.memory_watch();
-        let stop = || stop() || watch.as_ref().is_some_and(|watch| watch.exceeded());
-        let stopped = || match &watch {
-            Some(watch) if watch.exceeded() => crate::StoreError::ProcessMemoryLimit {
-                limit: watch.limit(),
-            },
-            _ => crate::StoreError::MaterialisationCancelled,
+        let memory = self.memory_stop();
+        let stop = || stop() || memory.exceeded();
+        let stopped = || {
+            memory
+                .error()
+                .unwrap_or(crate::StoreError::MaterialisationCancelled)
         };
         let closure =
             crate::reasoning::materialise_until(&program, rematerialisation.base(), &stop)

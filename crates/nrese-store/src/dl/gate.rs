@@ -72,24 +72,13 @@ pub(super) fn cancellable<T>(
     })
 }
 
-/// A nested check spends the operation's remaining time, never a fresh full timeout.
-pub(super) fn remaining_budget(base: &Budget, deadline: Instant) -> Budget {
-    let mut remaining = base.clone();
-    remaining.timeout = base
-        .timeout
-        .min(deadline.saturating_duration_since(Instant::now()));
-    remaining
-}
-
 /// The budget of a check under `store`'s settings.
 pub(crate) fn budget(store: &StoreService, cancel: Option<Cancel>) -> Budget {
     let dl = &store.config().dl;
-    let workers = store.runtime().workers().limited(dl.threads);
     Budget {
         timeout: dl.timeout,
         memory_bytes: dl.memory_per_worker(1),
-        threads: workers.width(),
-        workers: Some(workers),
+        workers: store.runtime().workers().limited(dl.threads),
         cancel,
         max_nodes: dl.max_nodes,
         max_branch_points: dl.max_branch_points,
@@ -157,7 +146,7 @@ fn check_with_budget(
             source::read_pending(tx)
         }
     };
-    let checked = consistency::check(&ontology, &remaining_budget(operation, deadline));
+    let checked = consistency::check(&ontology, &operation.remaining(deadline));
     if checked.verdict != Verdict::Inconsistent {
         return Gate {
             checked,
@@ -174,7 +163,7 @@ fn check_with_budget(
         }) if revision == before => consistency.verdict == Verdict::Inconsistent,
         _ => {
             let ontology = source::read_snapshot(tx.base());
-            let checked = consistency::check(&ontology, &remaining_budget(operation, deadline));
+            let checked = consistency::check(&ontology, &operation.remaining(deadline));
             checked.verdict == Verdict::Inconsistent
         }
     };
@@ -201,7 +190,7 @@ fn rejection(
         ontology,
         &super::explain::Goal::Inconsistent,
         &[],
-        &remaining_budget(operation, deadline),
+        &operation.remaining(deadline),
         deadline,
     );
     let decode = |t: u64| {
@@ -276,9 +265,9 @@ mod tests {
         base.timeout = Duration::from_secs(30);
         let now = Instant::now();
         let deadline = now + Duration::from_secs(10);
-        let pending = remaining_budget(&base, deadline);
-        let prior = remaining_budget(&pending, deadline);
-        let evidence = remaining_budget(&prior, deadline);
+        let pending = base.remaining(deadline);
+        let prior = pending.remaining(deadline);
+        let evidence = prior.remaining(deadline);
         assert!(pending.timeout <= Duration::from_secs(10));
         assert!(prior.timeout <= pending.timeout && evidence.timeout <= prior.timeout);
         cancel.cancel();
@@ -286,7 +275,7 @@ mod tests {
             assert!(phase.cancel.as_ref().unwrap().is_cancelled());
         }
         assert_eq!(
-            remaining_budget(&base, now - Duration::from_secs(1)).timeout,
+            base.remaining(now - Duration::from_secs(1)).timeout,
             Duration::ZERO
         );
     }
