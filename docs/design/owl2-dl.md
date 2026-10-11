@@ -817,11 +817,13 @@ does not change it. Store-local watches also reach DL bounds and diagnostics, wi
 zero disabling the local limit. `Budget::task_memory` bounds a sampled estimate of what a
 saturation holds. The engine holds the compiled program, the context arena and registry,
 the assertions' state and the retained results; each context publishes its clauses,
-indexes, links and worker buffers at its work checkpoints (once per message batch, every
-256 messages or given clauses, every 4096 conclusions of a join), and its inbox's writers
-publish what is queued. A budget check reads the clock once; once per 10 ms one check also
-reads the process memory and sums the publications without taking a context's lock, and
-each saturation round ends with a sample. Hash tables and B-tree nodes are estimated.
+indexes, links and worker buffers at its work checkpoints (every 256 messages or given
+clauses, every 4096 conclusions of a join) and at the end of its first batch in each
+sampling interval, and its inbox publishes what is queued at its first and every 16th
+message. A budget check reads the clock once; once per 10 ms one check also reads the
+process memory and sums the publications without taking a context's lock, and each
+saturation round ends with exact publications and a sample. Hash tables and B-tree nodes
+are estimated.
 
 `dl.memory` configures context saturation and the tableau's existing capacity checks.
 Zero means unlimited; the standalone context API defaults to no observations. Classification
