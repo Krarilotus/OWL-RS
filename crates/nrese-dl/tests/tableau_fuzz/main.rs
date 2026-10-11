@@ -428,6 +428,92 @@ fn a_backtrack_never_restores_a_point_older_than_a_retraction() {
     assert_eq!(tally.inconsistent, 1, "{tally:?}");
 }
 
+/// The number module's family (docs/design/owl2-dl.md#number-reasoning-layers):
+/// `(n, m, n·m)` is consistent by a validated compressed model, with no tableau node; that
+/// model, expanded to an explicit interpretation, is a model by the semantics' own check
+/// (the expansion is this test's oracle, never the answer); the search, where it decides,
+/// agrees. `(n, m, n·m ± 1)` is refuted.
+#[test]
+fn counted_products_agree_with_the_semantics() {
+    use nrese_dl::numbers::{candidate, closure, problem};
+    use nrese_owl::fuzz::multiplication;
+    let search = Config {
+        keep_model: true,
+        max_branch_points: Some(20_000),
+        timeout: Some(std::time::Duration::from_secs(300)),
+        ..Config::default()
+    };
+    for n in 1..=5u32 {
+        for m in 1..=5u32 {
+            let k = n * m;
+            let o = multiplication(n, m, k);
+            let out = consistency(&o, &Config::default());
+            assert_eq!(out.answer, Answer::Consistent, "({n}, {m}, {k})");
+            assert_eq!(
+                out.telemetry.nodes_created, 0,
+                "({n}, {m}, {k}): {}",
+                out.telemetry
+            );
+            let p = problem::extract(&o);
+            let counts = closure::close(&p).expect("closes");
+            let c = candidate::construct(&p, &counts).expect("a candidate");
+            let mut i = expand(&c);
+            semantics::close(&o, &mut i);
+            assert!(semantics::model_of(&o, &i), "({n}, {m}, {k}): not a model");
+            if k <= 6 {
+                let s = consistency(&o, &search);
+                assert!(
+                    matches!(s.answer, Answer::Consistent | Answer::GaveUp(_)),
+                    "({n}, {m}, {k}): the search says {:?}",
+                    s.answer
+                );
+            }
+            for wrong in [k + 1, k - 1] {
+                let out = consistency(&multiplication(n, m, wrong), &Config::default());
+                assert_eq!(out.answer, Answer::Inconsistent, "({n}, {m}, {wrong})");
+            }
+        }
+    }
+}
+
+/// A compressed model as an explicit interpretation: each proxy its elements, each block
+/// the edges `e` from element `e / out` to element `e mod |to|` (every element of `from`
+/// gets `out` distinct neighbours, every element of `to` gets `in`).
+fn expand(c: &nrese_dl::numbers::candidate::CompressedModelCandidate) -> Interp {
+    let mut start = Vec::new();
+    let mut n = 0u32;
+    for p in &c.proxies {
+        start.push(n);
+        n += u32::try_from(p.multiplicity).expect("small");
+    }
+    let mut i = Interp {
+        n,
+        ..Interp::default()
+    };
+    for (x, p) in c.proxies.iter().enumerate() {
+        let bits = (0..p.multiplicity as u32).fold(0u128, |b, e| b | 1 << (start[x] + e));
+        for &class in &p.classes {
+            *i.concepts.entry(class).or_default() |= bits;
+        }
+        if let Some(a) = p.individual {
+            i.individuals.insert(a, start[x]);
+        }
+    }
+    for b in &c.blocks {
+        let (fm, tm) = (c.proxies[b.from].multiplicity, c.proxies[b.to].multiplicity);
+        let rows = i
+            .roles
+            .entry(b.property)
+            .or_insert_with(|| vec![0; n as usize]);
+        for e in 0..fm * b.out_degree {
+            let from = start[b.from] + (e / b.out_degree) as u32;
+            let to = start[b.to] + (e % tm) as u32;
+            rows[from as usize] |= 1 << to;
+        }
+    }
+    i
+}
+
 /// The random cases of `seed` (`only`: that one alone), each checked against the semantics.
 fn campaign(seed: u64, cases: u64, only: Option<u64>) -> Tally {
     let mut rng = Rng::new(seed);

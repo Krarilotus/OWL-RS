@@ -464,6 +464,43 @@ fn hard_search_tests_are_decided() {
     }
 }
 
+/// Guard (the number module, docs/design/owl2-dl.md#number-reasoning-layers): the
+/// integer-multiplication tests lie in its fragment as the RDF reader gives them, and
+/// counting decides them before any search: DL-906 and 907 consistent by a validated
+/// compressed model (907's 60,000 witnesses never built: no tableau node), DL-910 refuted.
+#[test]
+fn the_multiplication_tests_are_decided_by_counting() {
+    let Ok(text) = std::fs::read_to_string(suite_path()) else {
+        return;
+    };
+    let cases = read_cases(&text);
+    for name in [
+        "WebOnt-description-logic-906",
+        "WebOnt-description-logic-907",
+        "WebOnt-description-logic-910",
+    ] {
+        let case = cases
+            .iter()
+            .find(|c| c.name == name)
+            .expect("the suite has it");
+        let mut table = Table::default();
+        let premise = document(case, &["Premise", "Input"], &mut table)
+            .expect("a premise")
+            .expect("it reads");
+        let problem = nrese_dl::numbers::problem::extract(&premise);
+        assert!(problem.complete(), "{name}: {:?}", problem.outside);
+        let out = consistency(&premise, &config());
+        let expected = if name.ends_with("910") {
+            Answer::Inconsistent
+        } else {
+            Answer::Consistent
+        };
+        assert_eq!(out.answer, expected, "{name}");
+        assert_eq!(out.telemetry.nodes_created, 0, "{name}: {}", out.telemetry);
+        assert_eq!(out.telemetry.branch_points, 0, "{name}: {}", out.telemetry);
+    }
+}
+
 /// The witness of every disputed test is a model of its premise.
 #[test]
 fn disputed_witnesses_are_models() {
