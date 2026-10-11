@@ -67,7 +67,8 @@ pub struct DlConfig {
     /// Per DL task: a commit's consistency check, a query's exact services together, a
     /// classification (`dl.timeout`).
     pub timeout: Duration,
-    /// The capacity budget of one DL task, in bytes (`dl.memory`); 0 is unlimited.
+    /// DL memory envelope in bytes (`dl.memory`); 0 is unlimited. Context saturation
+    /// checks sampled capacity estimates; tableau checks its owned capacity at checkpoints.
     pub memory_bytes: usize,
     /// Candidate answers a query checks with the exact services at most; the rest are
     /// reported unresolved (`dl.max_candidates`).

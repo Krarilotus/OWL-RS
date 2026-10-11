@@ -17,6 +17,7 @@ impl Engine {
     /// Starts `seeds` and saturates on an existing pool within its worker allowance.
     pub fn run_with_workers(&self, seeds: &[ContextId], workers: &Workers) {
         workers.install(|| self.run_on_workers(seeds, workers));
+        self.sample_memory(true);
     }
 
     fn run_on_workers(&self, seeds: &[ContextId], workers: &Workers) {
@@ -30,8 +31,10 @@ impl Engine {
             while let Some(context) = queue.pop() {
                 self.work(context, &mut |to, message| {
                     self.deliver_seq(&mut queue, to, message);
-                    charge.set(memory::vec(&queue));
                 });
+                // Capacity cannot shrink during an activation; observe once at its
+                // boundary instead of after every message to an already active peer.
+                charge.set(memory::vec(&queue));
             }
             return;
         }
@@ -61,7 +64,7 @@ impl Engine {
 
     pub(super) fn deliver_seq(&self, queue: &mut Vec<ContextId>, to: ContextId, message: Message) {
         let context = self.context(to);
-        lock(&context.inbox).push(message);
+        context.push(message, self.task_memory.is_some());
         if !context.active.swap(true, SeqCst) {
             queue.push(to);
         }
@@ -69,7 +72,7 @@ impl Engine {
 
     fn deliver_par<'s>(&'s self, scope: &rayon::Scope<'s>, to: ContextId, message: Message) {
         let context = self.context(to);
-        lock(&context.inbox).push(message);
+        context.push(message, self.task_memory.is_some());
         if !context.active.swap(true, SeqCst) {
             scope.spawn(move |scope| self.work(to, &mut |t, m| self.deliver_par(scope, t, m)));
         }
@@ -91,7 +94,7 @@ struct Agenda<'a> {
 impl Agenda<'_> {
     fn deliver<'s>(&'s self, scope: &rayon::Scope<'s>, to: ContextId, message: Message) {
         let context = self.engine.context(to);
-        lock(&context.inbox).push(message);
+        context.push(message, self.engine.task_memory.is_some());
         if context.active.swap(true, SeqCst) {
             return;
         }

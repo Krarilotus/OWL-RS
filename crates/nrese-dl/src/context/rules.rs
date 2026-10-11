@@ -99,7 +99,6 @@ impl Successor {
 /// A context's state: its clauses and its links.
 #[derive(Debug, Default)]
 pub struct State {
-    pub(super) memory: super::memory::Charge,
     pub(super) remote_bytes: usize,
     pub(super) successor_bytes: usize,
     pub(super) merge_bytes: usize,
@@ -121,24 +120,20 @@ pub struct State {
 }
 
 impl State {
-    pub(super) fn check_memory(&mut self) -> bool {
-        if !self.memory.enabled() {
-            return true;
-        }
+    pub(super) fn bytes(&self) -> usize {
         use super::memory::{map, vec};
-        self.memory.set(
-            vec(&self.preds)
-                + vec(&self.pr)
-                + vec(&self.remote)
-                + vec(&self.merges)
-                + map(&self.remote_by_atom)
-                + map(&self.succ)
-                + map(&self.merges_by_term)
-                + map(&self.merges_by_pair)
-                + self.remote_bytes
-                + self.successor_bytes
-                + self.merge_bytes,
-        )
+        self.clauses.bytes()
+            + vec(&self.preds)
+            + vec(&self.pr)
+            + vec(&self.remote)
+            + vec(&self.merges)
+            + map(&self.remote_by_atom)
+            + map(&self.succ)
+            + map(&self.merges_by_term)
+            + map(&self.merges_by_pair)
+            + self.remote_bytes
+            + self.successor_bytes
+            + self.merge_bytes
     }
 }
 
@@ -157,7 +152,6 @@ pub struct Out {
     pub me: ContextId,
     pub local: Vec<Message>,
     pub sends: Vec<(ContextId, Message)>,
-    pub(super) memory: super::memory::Charge,
     pub(super) payload_bytes: usize,
 }
 
@@ -167,7 +161,6 @@ impl Out {
             me,
             local: Vec::new(),
             sends: Vec::new(),
-            memory: Default::default(),
             payload_bytes: 0,
         }
     }
@@ -179,20 +172,10 @@ impl Out {
         } else {
             self.sends.push((to, message));
         }
-        self.check_memory();
     }
 
-    fn pop_local(&mut self) -> Option<Message> {
-        let message = self.local.pop()?;
-        self.payload_bytes -= message.heap_bytes();
-        self.check_memory();
-        Some(message)
-    }
-
-    fn check_memory(&mut self) {
-        self.memory.set(
-            super::memory::vec(&self.local) + super::memory::vec(&self.sends) + self.payload_bytes,
-        );
+    pub(super) fn bytes(&self) -> usize {
+        super::memory::vec(&self.local) + super::memory::vec(&self.sends) + self.payload_bytes
     }
 }
 
@@ -203,7 +186,6 @@ pub struct Found {
     items: Vec<Item>,
     atoms: Vec<Atom>,
     premises: Vec<ClauseRef>,
-    pub(super) memory: super::memory::Charge,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -216,10 +198,9 @@ struct Item {
 }
 
 impl Found {
-    fn check_memory(&mut self) -> bool {
+    fn bytes(&self) -> usize {
         use super::memory::vec;
-        self.memory
-            .set(vec(&self.items) + vec(&self.atoms) + vec(&self.premises))
+        vec(&self.items) + vec(&self.atoms) + vec(&self.premises)
     }
     /// Conclusions so far.
     pub(super) fn len(&self) -> usize {
@@ -252,14 +233,12 @@ impl Found {
             body: b,
             premises: p,
         });
-        self.check_memory();
     }
 }
 
 /// A worker's buffers, reused across inferences.
 #[derive(Debug, Default)]
 pub struct Scratch {
-    pub(super) memory: super::memory::Charge,
     pub(super) slots: Vec<Slot>,
     pub(super) found: Found,
     pub(super) bind: Vec<Option<CTerm>>,
@@ -278,36 +257,23 @@ pub struct Scratch {
 }
 
 impl Scratch {
-    pub(super) fn new(engine: &Engine) -> Self {
-        Self {
-            memory: engine.memory_charge(),
-            found: Found {
-                memory: engine.memory_charge(),
-                ..Found::default()
-            },
-            ..Self::default()
-        }
-    }
-
-    pub(super) fn check_memory(&mut self) -> bool {
+    pub(super) fn bytes(&self) -> usize {
         use super::memory::{map, vec};
-        self.memory.set(
-            vec(&self.slots)
-                + vec(&self.bind)
-                + vec(&self.premises)
-                + vec(&self.refs)
-                + vec(&self.body)
-                + vec(&self.waiting)
-                + vec(&self.preds)
-                + map(&self.batch)
-                + self.batch_bytes,
-        )
+        self.found.bytes()
+            + vec(&self.slots)
+            + vec(&self.bind)
+            + vec(&self.premises)
+            + vec(&self.refs)
+            + vec(&self.body)
+            + vec(&self.waiting)
+            + vec(&self.preds)
+            + map(&self.batch)
+            + self.batch_bytes
     }
 
     pub(super) fn clear_batch(&mut self) {
         self.batch.clear();
         self.batch_bytes = 0;
-        self.check_memory();
     }
 }
 
@@ -317,11 +283,32 @@ pub struct Worker<'w> {
     pub state: &'w mut State,
     pub out: &'w mut Out,
     pub scratch: Scratch,
+    pub(super) input_bytes: usize,
 }
 
 const NONE: u32 = u32::MAX;
 
 impl Worker<'_> {
+    /// Publish only at work checkpoints. The activation owns all these buffers;
+    /// publishing never takes another context's lock or updates a shared byte ledger.
+    pub(super) fn checkpoint(&self) -> bool {
+        self.checkpoint_extra(0)
+    }
+
+    pub(super) fn checkpoint_extra(&self, extra: usize) -> bool {
+        if self.state.clauses.observe_memory {
+            self.engine.observe_context(
+                self.me(),
+                self.state.bytes()
+                    + self.out.bytes()
+                    + self.scratch.bytes()
+                    + self.input_bytes
+                    + extra,
+            );
+        }
+        !self.engine.out_of_budget()
+    }
+
     fn me(&self) -> ContextId {
         self.out.me
     }
@@ -341,14 +328,16 @@ impl Worker<'_> {
                 // One context's agenda can run for minutes (its redundancy checks grow with
                 // its clauses): the budget is checked inside it too. Stopping leaves the
                 // run exhausted, which ends it as `Unsupported::Budget`, never an answer.
-                if self.engine.task_memory_exhausted()
-                    || (given.is_multiple_of(256) && self.engine.out_of_budget())
-                {
+                if self.engine.exhausted() || (given.is_multiple_of(256) && !self.checkpoint()) {
                     return;
                 }
             }
-            match self.out.pop_local() {
+            if self.engine.exhausted() {
+                return;
+            }
+            match self.out.local.pop() {
                 Some(m) => {
+                    self.out.payload_bytes -= m.heap_bytes();
                     self.state.clauses.counters.messages += 1;
                     self.message(m);
                 }
@@ -365,7 +354,7 @@ impl Worker<'_> {
                     return;
                 }
                 for &a in self.engine.core(self.me()) {
-                    if self.engine.task_memory_exhausted() {
+                    if self.engine.exhausted() {
                         return;
                     }
                     self.state
@@ -374,7 +363,7 @@ impl Worker<'_> {
                 }
                 let program = &self.engine.program;
                 for &dl in &program.facts {
-                    if self.engine.task_memory_exhausted() {
+                    if self.engine.exhausted() {
                         return;
                     }
                     let head = instantiate(program.clauses[dl as usize].head, &[]);
@@ -395,7 +384,6 @@ impl Worker<'_> {
                     return;
                 }
                 self.state.preds.push((from, func));
-                self.state.check_memory();
                 let replay: Vec<ClauseId> = self
                     .state
                     .pr
@@ -403,10 +391,6 @@ impl Worker<'_> {
                     .copied()
                     .filter(|&c| self.state.clauses.recs[c as usize].live)
                     .collect();
-                let mut memory = self.engine.memory_charge();
-                if !memory.set(super::memory::vec(&replay)) {
-                    return;
-                }
                 for c in replay {
                     self.send_pred(c, from, func);
                 }
@@ -434,9 +418,6 @@ impl Worker<'_> {
                     body,
                     head,
                 });
-                if !self.state.check_memory() {
-                    return;
-                }
                 let mut s = std::mem::take(&mut self.scratch);
                 s.found.clear();
                 s.clear_batch();
@@ -459,24 +440,15 @@ impl Worker<'_> {
         let head = self.state.clauses.recs[c as usize].head;
         if !head.is_bottom() && head.kind() == Kind::Concept && head.term() == CTerm::X {
             self.state.clauses.present.insert(head.pred());
-            if !self.state.clauses.check_memory() {
-                return;
-            }
         }
         if !head.is_bottom() {
             self.hyper(c, head);
         }
         if self.engine.program.is_pr(head) {
             self.state.pr.push(c);
-            if !self.state.check_memory() {
-                return;
-            }
             let mut s = std::mem::take(&mut self.scratch);
             s.preds.clear();
             s.preds.extend_from_slice(&self.state.preds);
-            if !s.check_memory() {
-                return;
-            }
             for &(u, f) in &s.preds {
                 self.send_pred(c, u, f);
             }
@@ -492,7 +464,7 @@ impl Worker<'_> {
     pub(super) fn conclude(&mut self, found: &Found) {
         let proofs = self.engine.proofs;
         for item in &found.items {
-            if self.engine.task_memory_exhausted() {
+            if self.engine.exhausted() {
                 return;
             }
             let counters = &mut self.state.clauses.counters;

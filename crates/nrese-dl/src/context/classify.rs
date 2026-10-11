@@ -260,7 +260,7 @@ pub fn saturate_normalised_with_workers(
 }
 
 impl Saturated {
-    /// Accounted task capacity and peak (zero when accounting was disabled).
+    /// Latest saturation-capacity estimate and sampled peak (zero when disabled).
     pub fn task_memory_bytes(&self) -> (usize, usize) {
         self.engine.task_memory_bytes()
     }

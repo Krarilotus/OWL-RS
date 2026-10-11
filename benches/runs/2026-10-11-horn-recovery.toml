@@ -1,0 +1,91 @@
+id = "2026-10-11-horn-recovery"
+kit = "reasoning/dl and fast/classify-store-horn"
+purpose = "Recover Horn performance by moving accounting out of per-message shared ownership; retain losses and rejected experiments"
+host = "Phuoc-Yu"
+build_host = "Office-PC"
+commit = "dc2114a0f0f5379441722a212a492ef2fd3c8e24"
+dirty = true
+original = "0f465633d33374bc56ab9ec33157cfa10ebf2d40"
+candidate = "K; final closeout adds comments/docs only"
+candidate_patch_sha256 = "392e314c31f0c1c15436cefa6e4234d38f191b2f064ad1e83246da6c7a44f2a2"
+candidate_dl_classify_sha256 = "154d4ff9d47721c03515a88868cf603dfc971a36ae2e184eea2bd0309543f90e"
+original_dl_classify_sha256 = "a113d3f61209e4246e52f5a859e434dd4f0b1523bd449c499758527f04e74d8c"
+publishable = "all"
+status = "Partial recovery retained for maintainer takeover; full performance acceptance remains open"
+task = "docs/plan/2026-10-10-performance-campaign.md#closeout-and-maintainer-handover-11-october"
+results = "/home/krarilotus/nrese-prep-20261009-4e8bd38/horn-repair-20261011/attempt-k"
+local_evidence = "tmp/horn-attempt-k-measurement-20261011/report.txt"
+
+[input]
+name = "horn-classes3000.nt"
+sha256 = "0b156b9241392633b258b2188f1857d2ad2893a7f4a7c85d66f8c000881c3d9e"
+triples = 12014
+classes = 3000
+subsumptions = 1161634
+unsatisfiable = 0
+taxonomy_sha256 = "f4cd5c2eaea7839d9c6f3a24429a60bd1badc740ae1d5b246478cd8509186d29"
+context_closure_sha256 = "aa60553efd0edd6bfd8c7d6fe13ca3f9000ffc7616af5902e0e2bf76fb13de23"
+
+[contract]
+memory = "K standalone uses --task-memory-mib 4096; store uses existing default 4GiB. Original predates task observations. Zero disables observations."
+observations = "Context-local capacity publications with periodic aggregate samples and forced final sample; mixed-time estimates can overlap/lag, miss transient peaks and exceed the envelope"
+preserved = "Inference rules, message order, scheduler, search settings, no new fixed limits"
+cleanup = "Removed per-message shared accounting and duplicate stop flags; rejected E/I/L/M code absent"
+known_gap = "Changing an existing engine budget and accounting for retained/publicly mutable results remain unresolved"
+
+[primary_cohort]
+outer_pairs_per_scenario = 3
+invocations = 18
+order = "Alternating original/K within each 16-thread, serial and store scenario"
+original_16t_ms = 790.2
+candidate_16t_ms = 841.5
+original_1t_ms = 4921.6
+candidate_1t_ms = 5217.4
+original_store_ms = 1351.675
+candidate_store_ms = 1318.520
+original_16t_lifetime_rss_kib = 3271304
+candidate_16t_lifetime_rss_kib = 3243120
+original_1t_lifetime_rss_kib = 2943040
+candidate_1t_lifetime_rss_kib = 2943136
+original_store_sampled_rss_kib = 3433604
+candidate_store_sampled_rss_kib = 3430736
+result = "All complete/context-core/consistent; standalone taxonomies exact. Residual +6.49% parallel and +6.01% serial time; store -2.45%, not a general speedup claim."
+
+[later_independent_cohort]
+source = "tmp/horn-attempt-m-measurement-20261011/report.txt"
+invocations = 27
+outer_groups_per_scenario = 3
+order = "original/K/M; M/original/K; K/M/original"
+original_16t_ms = 792.5
+candidate_k_16t_ms = 813.7
+rejected_m_16t_ms = 917.7
+original_1t_ms = 4886.7
+candidate_k_1t_ms = 5189.5
+rejected_m_1t_ms = 5182.6
+original_store_ms = 1377.498
+candidate_k_store_ms = 1334.010
+rejected_m_store_ms = 1432.463
+verdict = "All correct; M rejected: every 16-thread group slower than K, median +12.78%; store median +7.38%. No pooling with primary cohort."
+not_run = "Six memory-off diagnostics and two M context-counter invocations"
+
+[diagnostics]
+serial_toggle = "Separate nine-run cohort: original 4906.2ms, K-off 4995.9ms, K-on 5211.0ms. Same K binary off/on; not a universal accounting tax."
+work = "Original/K-off/K-on all recorded non-memory counters identical; messages 29572135, generated clauses 2977855, kept clauses 2265294, contexts 3001, edges 345093"
+profiling = "Six saturation-delimited GDB samples: original102/K-off105/K-on104 snapshots. Symbol/PC attribution only, no DWARF. Debugger timings are not performance evidence."
+unimplemented = "Shorten empty-body Pred Remote lifetime after synchronous processing; plausible follow-up only, no N experiment or measured gain"
+
+[validation]
+focused_tests_k = 80
+focused_tests_rejected_m = 81
+release_examples = 3
+scope = "Focused K tests and frozen binaries; normal commit/push and closeout all-tier outcomes recorded separately with the final commit. No claim these focused tests qualify the whole branch."
+toolchain = "Rust 1.98.1, release fat LTO, codegen-units1, Office native CPU; compatibility verified on Phuoc"
+measurement = "Existing quiet-slot, no new pinning, OS tuning, cap or cache flush"
+limits = "Three pairs are screening evidence; standalone GNU time RSS is lifetime peak, store 10ms samples can miss peaks. perf_lab resets HWM, so store GNU time RSS is not lifetime peak."
+full_matrix = "95-case exact-start comparison still describes dc2114a; not rerun or relabelled as K"
+
+[preservation]
+rejected = ["E", "I", "L", "M"]
+evidence = "Patches, source/binary manifests, raw outputs, failures and controls retained on benchmark hosts; portable private export has reproduction guide and checksums"
+retired_redundant_office_binary_bytes = 259481600
+retained = "Verified Phuoc binary copies, shared inputs, raw answers, seeds, existing Office target/cache"

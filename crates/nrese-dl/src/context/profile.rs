@@ -58,8 +58,9 @@ pub struct Profile {
     pub threads: usize,
     /// The most clauses one context holds (a context shared by many successors grows).
     pub largest_context: u64,
-    /// Peak successfully accounted saturation capacity; zero when accounting is off.
-    /// Excludes compilation, result assembly and allocator metadata; not process RSS.
+    /// Peak sampled saturation-capacity estimate; zero when observations are off.
+    /// Handoffs may overlap or lag. Excludes compilation, result assembly, short-lived
+    /// recursive temporaries and allocator metadata; not process RSS or a ceiling.
     pub task_memory_peak: usize,
 }
 
