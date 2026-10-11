@@ -61,6 +61,7 @@ pub struct Context {
 #[derive(Default)]
 struct Inbox {
     messages: Vec<Message>,
+    /// The messages' payloads, where observed.
     payload_bytes: usize,
 }
 
@@ -77,7 +78,9 @@ impl Inbox {
 impl Context {
     fn push(&self, message: Message, observe: bool) {
         let mut inbox = lock(&self.inbox);
-        inbox.payload_bytes += message.heap_bytes();
+        if observe {
+            inbox.payload_bytes += message.heap_bytes();
+        }
         inbox.messages.push(message);
         if observe {
             self.queued.store(inbox.bytes(), Relaxed);
@@ -267,6 +270,11 @@ impl Engine {
         !self.exhausted()
     }
 
+    /// The latest sampling election ([`Interval::last`]).
+    pub(super) fn election(&self) -> u64 {
+        self.interval.last()
+    }
+
     /// Publishes context `c`'s capacity (by the worker holding it).
     pub(super) fn publish(&self, c: ContextId, bytes: usize) {
         self.context(c).working.store(bytes, Relaxed);
@@ -422,8 +430,8 @@ impl Engine {
             for (to, message) in out.sends {
                 deliver(to, message);
             }
-            if observe {
-                context.working.store(state_bytes, Relaxed);
+            if let Some(bytes) = state_bytes {
+                context.working.store(bytes, Relaxed);
             }
         }
     }

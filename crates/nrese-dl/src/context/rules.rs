@@ -92,6 +92,8 @@ pub struct State {
     pub(super) remote_bytes: usize,
     pub(super) successor_bytes: usize,
     pub(super) merge_bytes: usize,
+    /// The sampling election of the last end-of-batch publication ([`Worker::finish`]).
+    pub(super) published: u64,
     pub clauses: Clauses,
     pub started: bool,
     pub preds: Vec<(ContextId, FuncId)>,
@@ -142,7 +144,6 @@ pub struct Out {
     pub me: ContextId,
     pub local: Vec<Message>,
     pub sends: Vec<(ContextId, Message)>,
-    pub(super) payload_bytes: usize,
 }
 
 impl Out {
@@ -151,12 +152,10 @@ impl Out {
             me,
             local: Vec::new(),
             sends: Vec::new(),
-            payload_bytes: 0,
         }
     }
 
     pub(super) fn send(&mut self, to: ContextId, message: Message) {
-        self.payload_bytes += message.heap_bytes();
         if to == self.me {
             self.local.push(message);
         } else {
@@ -165,7 +164,10 @@ impl Out {
     }
 
     pub(super) fn bytes(&self) -> usize {
-        super::memory::vec(&self.local) + super::memory::vec(&self.sends) + self.payload_bytes
+        let payloads = self.local.iter().chain(self.sends.iter().map(|(_, m)| m));
+        super::memory::vec(&self.local)
+            + super::memory::vec(&self.sends)
+            + payloads.map(Message::heap_bytes).sum::<usize>()
     }
 }
 
@@ -322,10 +324,17 @@ impl<'w> Worker<'w> {
         state
     }
 
-    /// Ends the batch: one publication, and the batch's counts. Returns the state's
-    /// capacity, which stays published once the batch's buffers are gone.
-    pub(super) fn finish(self) -> usize {
-        let state = self.publish(0);
+    /// Ends the batch: its counts, and a publication if none was made since the latest
+    /// sampling election (a context's publication lags its work by at most one interval;
+    /// a round ends with exact ones, [`Engine::run`]). Returns the state's capacity
+    /// published, which stays once the batch's buffers are gone.
+    pub(super) fn finish(self) -> Option<usize> {
+        let election = self.engine.election();
+        let mut state = None;
+        if self.engine.observing() && self.state.published != election {
+            self.state.published = election;
+            state = Some(self.publish(0));
+        }
         let counters = &mut self.state.clauses.counters;
         counters.batches += 1;
         counters.checks += self.checks.get();
@@ -355,7 +364,6 @@ impl<'w> Worker<'w> {
             }
             match self.out.local.pop() {
                 Some(m) => {
-                    self.out.payload_bytes -= m.heap_bytes();
                     self.state.clauses.counters.messages += 1;
                     self.message(m);
                 }
