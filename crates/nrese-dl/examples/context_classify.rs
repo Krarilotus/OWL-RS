@@ -28,6 +28,10 @@ use nrese_dl::context::{self, Classification, Options, Strategy};
 use nrese_owl::{Statement, Term, TermKind, Terms};
 use nrese_rdf_io::{RdfFormat, RdfParser};
 
+#[path = "support/task_memory.rs"]
+mod support;
+use support::task_memory;
+
 /// Terms by their N-Triples form (what the EL classifier's vocabulary keys by, too).
 #[derive(Default, Clone)]
 struct Table {
@@ -164,15 +168,7 @@ fn args() -> Result<Args, String> {
             "--tax" => a.tax = it.next(),
             "--no-proofs" => a.options.proofs = false,
             "--task-memory-mib" => {
-                let mib = number("--task-memory-mib")?;
-                a.options.budget.task_memory = if mib == 0 {
-                    None
-                } else {
-                    Some(
-                        mib.checked_mul(1024 * 1024)
-                            .ok_or("memory budget overflow")?,
-                    )
-                };
+                a.options.budget.task_memory = task_memory(number("--task-memory-mib")? as u64)?;
             }
             "--compare-el" => a.compare = true,
             "--strategy" => {

@@ -24,7 +24,7 @@ use nrese_owl::{Normalised, Ontology, Term};
 
 use super::consistency::{self, Verdict};
 use super::known::{self, Lower};
-use super::{Classification, Deadline, Options, Profile, Taxonomy, Workers};
+use super::{Classification, Deadline, Options, Profile, Taxonomy};
 use crate::tableau::{Answer, At, Base, From, Labels, Prepared, Probe, ProbeOutcome, Want};
 
 /// A class's state.
@@ -55,7 +55,6 @@ pub(crate) struct Driver<'a> {
     top_possible: Option<Vec<u32>>,
     /// `owl:Thing`'s subsumers where the Horn part has all of them.
     top_known: Option<Vec<u32>>,
-    workers: Workers,
 }
 
 impl<'a> Driver<'a> {
@@ -76,7 +75,7 @@ impl<'a> Driver<'a> {
             profile: Profile {
                 path: "tableau",
                 classes: n,
-                threads: options.threads,
+                threads: options.workers.width(),
                 ..Profile::default()
             },
             incomplete: Vec::new(),
@@ -85,7 +84,6 @@ impl<'a> Driver<'a> {
             possible: vec![None; n],
             top_possible: None,
             top_known: None,
-            workers: options.workers(),
         }
     }
 
@@ -109,7 +107,7 @@ impl<'a> Driver<'a> {
                 self.normalised,
                 self.classes,
                 &core,
-                &self.workers,
+                &self.options.workers,
                 self.options.tableau.cancel.clone(),
             ) {
                 if lower.inconsistent {
@@ -155,7 +153,7 @@ impl<'a> Driver<'a> {
                 self.classes,
                 &self.config(),
                 &self.options.core(self.deadline.budget(self.options, None)),
-                &self.workers,
+                &self.options.workers,
             )
         } else {
             None
@@ -427,7 +425,7 @@ impl<'a> Driver<'a> {
         // Most specific first: their models show their superclasses.
         let mut order: Vec<u32> = (0..n as u32).collect();
         order.sort_by_key(|&c| std::cmp::Reverse(self.known[c as usize].len()));
-        let wave = (self.options.threads * 2).max(1);
+        let wave = self.options.workers.width() * 2;
         let mut at = 0;
         while at < order.len() {
             if self.deadline.passed() {
@@ -457,7 +455,7 @@ impl<'a> Driver<'a> {
                 individuals: false,
                 detached: false,
             };
-            let outcomes: Vec<(u32, ProbeOutcome)> = self.workers.map(&batch, |&c| {
+            let outcomes: Vec<(u32, ProbeOutcome)> = self.options.workers.map(&batch, |&c| {
                 let probe = Probe {
                     at: At::Fresh,
                     positive: std::slice::from_ref(&c),
@@ -577,7 +575,7 @@ impl<'a> Driver<'a> {
             .filter(|&c| self.status[c as usize] == Status::Sat)
             .collect();
         let this = &*self;
-        let results: Vec<(u32, Vec<u32>, Stats)> = this.workers.map(&todo, |&c| {
+        let results: Vec<(u32, Vec<u32>, Stats)> = this.options.workers.map(&todo, |&c| {
             let (s, stats) = this.subsumers_of(tests, c, top, &unsat, &config);
             (c, s, stats)
         });

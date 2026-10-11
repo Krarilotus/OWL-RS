@@ -249,7 +249,7 @@ fn variants() -> Vec<(&'static str, Options)> {
             Options {
                 context_core: false,
                 exact_lower_bound: false,
-                threads: 3,
+                workers: nrese_exec::workers::Workers::new(3),
                 ..base
             },
         ),
@@ -491,7 +491,7 @@ fn types_equal_brute_force() {
             let r = classify::realise(
                 &o,
                 &Options {
-                    threads,
+                    workers: nrese_exec::workers::Workers::new(threads),
                     reuse_model,
                     ..options()
                 },
