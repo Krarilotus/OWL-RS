@@ -51,7 +51,7 @@ pub(crate) fn taxonomy(store: &StoreService, snapshot: &Snapshot) -> Arc<Taxonom
     let started = Instant::now();
     let ontology = source::read_snapshot(snapshot);
     let mut options = options(store);
-    let workers = options.workers.as_ref().unwrap().clone();
+    let workers = options.workers.clone();
     let taxonomy = Arc::new(workers.install(|| {
         options.timeout = options
             .timeout
@@ -76,7 +76,7 @@ pub(crate) fn realisation(store: &StoreService, snapshot: &Snapshot) -> Arc<Real
     let started = Instant::now();
     let ontology = source::read_snapshot(snapshot);
     let mut options = options(store);
-    let workers = options.workers.as_ref().unwrap().clone();
+    let workers = options.workers.clone();
     let realisation = Arc::new(workers.install(|| {
         options.timeout = options
             .timeout
