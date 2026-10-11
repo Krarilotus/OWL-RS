@@ -13,8 +13,8 @@ use nrese_reasoner::lists::ListDiagnostic;
 pub use nrese_reasoner::RuleProgram;
 pub use nrese_reasoner::engine::{
     Closure, InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
-    JustifiedStatement, Program, decoded, equality_report, explain_fact, explain_violation,
-    justify_fact, materialise, materialise_until,
+    JustifiedStatement, Program, decoded, explain_fact, explain_violation, justify_fact,
+    materialise, materialise_until,
 };
 
 /// The most diagnostics a report lists; `diagnostics_total` counts them all.
