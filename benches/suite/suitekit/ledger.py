@@ -24,10 +24,11 @@ from pathlib import Path
 from .schema import read
 from .summary import summarise
 
-HAND_FIELDS = ("purpose", "baseline", "findings")
+HAND_FIELDS = ("purpose", "baseline", "findings", "level", "scenario", "candidate", "inputs", "cases")
 FALLBACK_FIELDS = ("commit", "machine", "host", "started", "finished", "protocol")
-ORDER = ["id", "kit", "purpose", "baseline", "findings", "started", "finished", "host", "machine",
-         "commit", "dirty", "protocol", "commands", "results", "publishable"]
+ORDER = ["id", "level", "kit", "purpose", "started", "finished", "host", "machine", "scenario", "baseline",
+         "candidate", "commit", "dirty", "protocol", "inputs", "commands", "results", "publishable", "cases",
+         "findings"]
 
 
 def toml_value(value) -> str:
