@@ -5,8 +5,8 @@
 mod tests;
 
 use super::{
-    CancellationToken, Cow, Form, GraphPattern, Query, QueryEvaluationError, QueryOptions,
-    ReadModel, Snapshot, pattern_and_form, ql, query_dataset, triple_terms,
+    Cow, Form, GraphPattern, Query, QueryEvaluationError, QueryOptions, ReadModel, Snapshot,
+    pattern_and_form, ql, query_dataset, triple_terms,
 };
 
 #[cfg(test)]
@@ -18,7 +18,7 @@ pub(crate) fn prepare_ql_query<'q>(
     query: &'q Query,
     options: &QueryOptions,
 ) -> Result<(Cow<'q, Query>, Option<crate::ql::QlReport>), QueryEvaluationError> {
-    preparation_alive(options)?;
+    options.resources.check()?;
     if ql_rewriting(query, options).is_none() {
         return Ok((Cow::Borrowed(query), None));
     }
@@ -61,18 +61,6 @@ pub(crate) fn prepare_ql_query<'q>(
     Ok((Cow::Owned(query), report))
 }
 
-pub(super) fn preparation_alive(options: &QueryOptions) -> Result<(), QueryEvaluationError> {
-    if options
-        .cancellation
-        .as_ref()
-        .is_some_and(CancellationToken::is_cancelled)
-    {
-        Err(QueryEvaluationError::Cancelled)
-    } else {
-        Ok(())
-    }
-}
-
 /// Semantic rewrites shared by preparation and standalone execution/EXPLAIN.
 pub(super) fn semantic_pattern<'q>(
     snapshot: &Snapshot,
@@ -80,7 +68,7 @@ pub(super) fn semantic_pattern<'q>(
     options: &QueryOptions,
     rewrites: &mut Vec<&'static str>,
 ) -> Result<(Cow<'q, GraphPattern>, Option<crate::ql::QlReport>), QueryEvaluationError> {
-    preparation_alive(options)?;
+    options.resources.check()?;
     let (pattern, form) = pattern_and_form(query);
     let pattern = if triple_terms::has_open(pattern) {
         rewrites.push("triple-terms");
@@ -89,7 +77,7 @@ pub(super) fn semantic_pattern<'q>(
         Cow::Borrowed(pattern)
     };
     let (rewritten, report) = ql_stage(query, options, snapshot, &pattern, &form);
-    preparation_alive(options)?;
+    options.resources.check()?;
     if let Some(report) = &report {
         if report.patterns > 0 {
             rewrites.push("ql-tree-witness");

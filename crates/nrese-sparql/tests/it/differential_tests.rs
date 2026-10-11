@@ -375,7 +375,10 @@ fn cancelled_updates_stop_before_the_next_operation() {
     let token = nrese_sparql::CancellationToken::new();
     token.cancel();
     let options = UpdateOptions {
-        cancellation: Some(token),
+        resources: nrese_sparql::Resources {
+            cancellation: Some(token),
+            ..Default::default()
+        },
         ..UpdateOptions::default()
     };
     let update = SparqlParser::new()

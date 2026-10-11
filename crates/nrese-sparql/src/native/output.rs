@@ -15,8 +15,6 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use rayon::prelude::*;
-
 use nrese_engine::{Snapshot, TermId, TermView};
 use nrese_exec::{IdTable, UNDEF, computed_index};
 use nrese_rdf::{BlankNodeRef, LiteralRef, NamedNodeRef, Term, TermRef, Variable};
@@ -205,17 +203,16 @@ impl DirectResults<'_> {
         });
     }
 
-    /// Writes the result document; `alive` is polled every few thousand rows (it fails
-    /// the write when the query is cancelled).
+    /// Writes the result document; `alive` is checked before each write and each window
+    /// of blocks (it fails the write when the query is cancelled).
     pub fn write(
         &self,
         vars: &[Variable],
         table: &IdTable,
         out: &mut dyn Write,
         alive: &dyn Fn() -> std::io::Result<()>,
-        workers: Option<&nrese_exec::workers::Workers>,
+        workers: &nrese_exec::workers::Workers,
     ) -> std::io::Result<()> {
-        alive()?;
         let mut buffer: Vec<u8> = Vec::with_capacity(CHUNK + 4096);
         let json = self.format == ResultsFormat::Json;
         let (separator, end_of_row): (u8, &[u8]) = match self.format {
@@ -268,29 +265,18 @@ impl DirectResults<'_> {
         let blocks = rows.div_ceil(BLOCK_ROWS);
         let block = |b: usize| b * BLOCK_ROWS..((b + 1) * BLOCK_ROWS).min(rows);
         if blocks <= 1 {
-            let mut encode = || self.rows(table, 0..rows, &keys, &mut buffer);
-            match workers {
-                Some(workers) => workers.install(encode),
-                None => encode(),
-            }
+            self.rows(table, 0..rows, &keys, &mut buffer);
         } else {
             // A window of blocks serialised in parallel, then written in order. A
             // cancelled query stops within one chunk of output (and one window of work).
-            let window =
-                workers.map_or_else(rayon::current_num_threads, |w| w.width()) * BLOCKS_PER_THREAD;
+            let window = workers.width() * BLOCKS_PER_THREAD;
             for start in (0..blocks).step_by(window) {
                 alive()?;
-                let range = start..(start + window).min(blocks);
-                let encode = |b| {
+                let parts = workers.map_range(start..(start + window).min(blocks), |b| {
                     let mut part = Vec::with_capacity(CHUNK);
                     self.rows(table, block(b), &keys, &mut part);
                     part
-                };
-                let parts: Vec<Vec<u8>> = match workers {
-                    Some(workers) => workers.map_range(range, encode),
-                    None => range.into_par_iter().map(encode).collect(),
-                };
-                alive()?;
+                });
                 for part in parts {
                     let mut rest = part.as_slice();
                     while !rest.is_empty() {
@@ -301,7 +287,6 @@ impl DirectResults<'_> {
                             alive()?;
                             out.write_all(&buffer)?;
                             buffer.clear();
-                            alive()?;
                         }
                     }
                 }
@@ -311,8 +296,7 @@ impl DirectResults<'_> {
             buffer.extend_from_slice(b"]}}");
         }
         alive()?;
-        out.write_all(&buffer)?;
-        alive()
+        out.write_all(&buffer)
     }
 }
 
@@ -340,7 +324,6 @@ mod tests {
     fn cancelled_completed_tables_write_no_bytes_even_when_empty_or_small() {
         let engine = nrese_engine::Engine::new(Default::default()).unwrap();
         let snapshot = engine.snapshot();
-        let workers = nrese_exec::workers::Workers::pooled(1).unwrap();
         for rows in [0, 1, BLOCK_ROWS] {
             let table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows));
             for format in [ResultsFormat::Json, ResultsFormat::Tsv, ResultsFormat::Csv] {
@@ -361,7 +344,7 @@ mod tests {
                         format,
                         version: None,
                     }
-                    .write(&[], &table, &mut bytes, &alive, Some(&workers))
+                    .write(&[], &table, &mut bytes, &alive, &Default::default())
                     .is_err()
                 );
                 assert!(bytes.is_empty());
@@ -370,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn a_large_table_checks_cancellation_after_its_only_output_write() {
+    fn an_answer_cancelled_during_its_final_write_is_written() {
         struct CancelOnWrite {
             token: CancellationToken,
             writes: usize,
@@ -389,7 +372,7 @@ mod tests {
         }
         let engine = nrese_engine::Engine::new(Default::default()).unwrap();
         let snapshot = engine.snapshot();
-        let workers = nrese_exec::workers::Workers::pooled(1).unwrap();
+        let workers = nrese_exec::workers::Workers::current();
         // Two row blocks, but their zero-column JSON rows fit in the final byte buffer.
         let table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], BLOCK_ROWS + 1));
         let token = CancellationToken::new();
@@ -406,7 +389,7 @@ mod tests {
         };
         let mut expected = Vec::new();
         output
-            .write(&[], &table, &mut expected, &|| Ok(()), Some(&workers))
+            .write(&[], &table, &mut expected, &|| Ok(()), &workers)
             .unwrap();
         let decoded: serde_json::Value = serde_json::from_slice(&expected).unwrap();
         assert_eq!(
@@ -425,9 +408,9 @@ mod tests {
                     Ok(())
                 }
             },
-            Some(&workers),
+            &workers,
         );
-        assert!(result.is_err());
+        assert!(result.is_ok());
         assert_eq!(writer.writes, 1, "cancellation occurs in the final write");
         assert_eq!(writer.bytes, expected.len());
     }

@@ -165,10 +165,11 @@ pub(crate) fn apply_sparql_update(
             &request.using_graphs,
             &request.using_named_graphs,
         )?,
-        cancellation: Some(context.cancellation.clone()),
-        workers: Some(context.runtime.workers()),
-        shared_memory: context.runtime.query_memory(),
-        memory_limit: None,
+        resources: nrese_sparql::Resources {
+            cancellation: Some(context.cancellation.clone()),
+            shared_memory: context.runtime.query_memory(),
+            ..Default::default()
+        },
         union_default_graph: context.union_default_graph,
         services: context.services.clone(),
         access: requester.read.access().cloned(),

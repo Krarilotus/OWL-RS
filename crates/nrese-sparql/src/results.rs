@@ -53,6 +53,15 @@ impl CancellationToken {
         self.0.store(true, Ordering::Release);
     }
 
+    /// [`QueryEvaluationError::Cancelled`] once cancelled.
+    pub fn check(&self) -> Result<(), QueryEvaluationError> {
+        if self.is_cancelled() {
+            Err(QueryEvaluationError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
@@ -260,20 +269,13 @@ impl fmt::Debug for QuerySolutionIter<'_> {
 /// The triples of a CONSTRUCT or DESCRIBE, as they are computed.
 pub struct QueryTripleIter<'a> {
     triples: Box<dyn Iterator<Item = Result<Triple, QueryEvaluationError>> + 'a>,
-    budget: Option<Arc<nrese_exec::Budget>>,
 }
 
 impl<'a> QueryTripleIter<'a> {
     pub fn new(triples: impl Iterator<Item = Result<Triple, QueryEvaluationError>> + 'a) -> Self {
         Self {
             triples: Box::new(triples),
-            budget: None,
         }
-    }
-
-    pub(crate) fn with_budget(mut self, budget: Arc<nrese_exec::Budget>) -> Self {
-        self.budget = Some(budget);
-        self
     }
 }
 

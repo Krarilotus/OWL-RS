@@ -180,8 +180,7 @@ impl Individuals {
     /// Saturates the individuals' contexts on `engine` and evaluates the clauses on the
     /// edges until nothing changes.
     pub fn saturate(engine: &Engine, abox: &Abox, threads: usize) -> Self {
-        let workers = nrese_exec::workers::Workers::new(threads.max(1))
-            .unwrap_or_else(|_| nrese_exec::workers::Workers::serial());
+        let workers = nrese_exec::workers::Workers::new(threads);
         Self::saturate_with_workers(engine, abox, &workers)
     }
 

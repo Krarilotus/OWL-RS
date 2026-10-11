@@ -109,6 +109,22 @@ impl IdTable {
         self.sorted_by.clear();
     }
 
+    /// The rows that fit before the table reallocates.
+    pub fn spare_rows(&self) -> usize {
+        self.columns
+            .iter()
+            .map(|c| c.capacity() - c.len())
+            .min()
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Room for `rows` more rows, allocated exactly.
+    pub fn reserve_exact(&mut self, rows: usize) {
+        for column in &mut self.columns {
+            column.reserve_exact(rows);
+        }
+    }
+
     /// Appends all rows of `other`, which must have the same width. Sortedness is lost.
     pub fn append(&mut self, other: &IdTable) {
         assert_eq!(self.width(), other.width(), "append: widths differ");
