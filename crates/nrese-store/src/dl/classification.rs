@@ -92,9 +92,9 @@ fn latest<T>(slot: &Slot<T>, revision: u64) -> Option<Arc<T>> {
     }
 }
 
-/// `engine` over `snapshot`'s asserted ontology on the store's workers, within one
-/// timeout that includes reading the ontology.
-fn run<T: Send>(
+/// `engine` over `snapshot`'s asserted ontology, within one timeout that includes
+/// reading the ontology.
+fn run<T>(
     store: &StoreService,
     snapshot: &Snapshot,
     engine: fn(&nrese_owl::Ontology, &classify::Options) -> T,
@@ -105,11 +105,7 @@ fn run<T: Send>(
     options.timeout = options
         .timeout
         .map(|limit| limit.saturating_sub(started.elapsed()));
-    let workers = options
-        .workers
-        .clone()
-        .expect("the store supplies its workers");
-    workers.install(|| engine(&ontology, &options))
+    engine(&ontology, &options)
 }
 
 #[cfg(test)]

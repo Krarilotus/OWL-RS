@@ -95,10 +95,7 @@ pub fn left_out(ontology: &Ontology) -> Option<String> {
 /// source was left out ([`left_out`]).
 pub fn check(ontology: &Ontology, budget: &Budget) -> Checked {
     let started = Instant::now();
-    let deadline = started + budget.timeout;
-    let mut checked = budget
-        .workers
-        .install(|| check_read(ontology, &budget.remaining(deadline)));
+    let mut checked = check_read(ontology, budget);
     checked.elapsed = started.elapsed();
     if checked.verdict == Verdict::Consistent
         && let Some(why) = left_out(ontology)
