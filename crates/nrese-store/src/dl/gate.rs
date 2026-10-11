@@ -78,7 +78,7 @@ pub(crate) fn budget(store: &StoreService, cancel: Option<Cancel>) -> Budget {
     Budget {
         timeout: dl.timeout,
         memory_bytes: dl.memory_per_worker(1),
-        workers: store.runtime().workers().limited(dl.threads),
+        workers: nrese_exec::workers::Workers::current().limited(dl.threads),
         cancel,
         max_nodes: dl.max_nodes,
         max_branch_points: dl.max_branch_points,

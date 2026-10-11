@@ -5411,7 +5411,10 @@ fn groups_over_joins_larger_than_memory_answer() {
     );
     let query = SparqlParser::new().parse_query(&text).unwrap();
     let limited = QueryOptions {
-        memory_limit: Some(4 << 20),
+        resources: nrese_sparql::Resources {
+            memory_limit: Some(4 << 20),
+            ..Default::default()
+        },
         ..QueryOptions::default()
     };
     let native = rows(evaluate_query(&snapshot, &query, &limited).unwrap(), false);
