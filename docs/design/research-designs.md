@@ -238,6 +238,49 @@ QLever's delta triples suit small deltas.
   permutations locally, a coordinator for atomic updates, an entity-stream mode for
   Wikidata-style replays.
 
+## 8. Query progress under shared cache waits (proposal)
+
+**Problem.** The result cache shares an unfinished part through a `Flight`
+(`nrese-sparql/src/cache.rs`): the first query to claim a part computes it, later ones
+block on the flight's condition variable until it is published. A blocked thread is safe
+only if it holds nothing the producer needs. A thread that holds the stack of another
+computation while it waits can close a cycle. Flight ownership is a `ThreadId`, so a
+producer that re-enters its own part on the same thread bypasses the cache, but one that
+continues on another thread can't be told apart from a stranger.
+
+**The cycle, reproduced.** With a shared physical pool for queries (the removed
+`execution.threads > 0`): query A claims a flight and starts a parallel kernel; a worker
+helping that kernel steals query B; B waits for A's flight on that worker's stack; A can't
+publish until its kernel returns, and the kernel can't return until B does. A forced
+two-worker test on office-pc hung until a watchdog cancelled B (`flight-diagnostic.patch`,
+`-test.log`, `-exit.txt` under the campaign root of [hosts.toml](../../benches/hosts.toml)
+`assets.evidence`, `campaign-20261010-bebada2/`; SHA-256 `8227cf96…`, `89f1fc58…`,
+`39b8dc3f…`). It shows the dependency, not how often it happens. Rayon documents the hazard
+([join](https://docs.rs/rayon/1.12.0/rayon/fn.join.html)); a timeout or yield doesn't remove it.
+
+**What remains reachable.** Queries now run on their caller, and a caller isn't a Rayon
+worker, so A and B can no longer meet that way. A wait inside a Rayon job still can: work
+that evaluates a cacheable query from within a parallel kernel (the vector bind join's
+keep callback), a `SERVICE` callback (application code that may call the query API), and
+an embedding application calling the store from inside its own Rayon jobs.
+
+**Candidates.**
+
+| Candidate | What it costs |
+|---|---|
+| A waiter on a Rayon worker computes the part itself instead of waiting (`Bypass` when `rayon::current_thread_index()` is set) | a few lines in `claim`; duplicate work and memory only where a worker would have waited |
+| A query becomes a task that returns `Waiting` to its synchronous caller and resumes from its saved operator position on the existing flight (claims owned by the producer, not a `ThreadId`) | low thousands of lines replacing recursive control flow in `native`; size may grow; no second executor |
+| `SERVICE` callbacks run on the caller, between evaluation segments | changes who pays the callback's CPU; needs the task form above |
+| Recompute every contended part, or serialise cached queries | relaxes sharing, or loses independent-query throughput |
+
+**Decision needed.** Whether the bounded rule (a worker never blocks on a flight) is
+enough now that queries run on their caller, or the continuation design is wanted for
+explicit embedding; and who owns `SERVICE` callback CPU. Either way the acceptance checks
+are the same: the forced reproduction plus one-worker and nested-kernel variants
+progress without a watchdog; compute-once, pinning, renamed-variable sharing and
+snapshot isolation hold; cancellation at each wait releases reservations; the no-wait
+path gains no hop per operator (QPS per width, p50/p99, memory by phase).
+
 ## Order of work
 
 1. Equality stage B with class ids, strict and canonical answers (the reasoning
