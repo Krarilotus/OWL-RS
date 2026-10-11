@@ -106,7 +106,7 @@ impl<'a> Driver<'a> {
                 self.deadline
                     .budget(self.options, Some(self.options.lower_bound_timeout)),
             );
-            if let Some(lower) = known::horn_lower_bound_with_workers(
+            if let Some(lower) = known::horn_lower_bound(
                 self.normalised,
                 self.classes,
                 &core,

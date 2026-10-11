@@ -53,18 +53,8 @@ fn admissible(c: &Clause, equality: bool) -> bool {
 }
 
 /// The Horn part's consequences over `classes` (sorted), or `None` if the context core
-/// takes none of it; the context core runs with `core` (its proofs off).
+/// takes none of it; the context core runs with `core` (its proofs off) on `workers`.
 pub fn horn_lower_bound(
-    normalised: &Normalised,
-    classes: &[Term],
-    core: &crate::context::Options,
-) -> Option<Lower> {
-    let workers = nrese_exec::workers::Workers::new(core.threads.max(1))
-        .unwrap_or_else(|_| nrese_exec::workers::Workers::serial());
-    horn_lower_bound_with_workers(normalised, classes, core, &workers, None)
-}
-
-pub(crate) fn horn_lower_bound_with_workers(
     normalised: &Normalised,
     classes: &[Term],
     core: &crate::context::Options,
@@ -134,7 +124,7 @@ fn saturate(
         ..Normalised::default()
     };
     for _ in 0..RETRIES {
-        let why = match crate::context::classify::saturate_normalised_with_workers(
+        let why = match crate::context::saturate_normalised(
             &build(&part),
             classes,
             options,

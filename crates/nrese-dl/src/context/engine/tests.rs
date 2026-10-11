@@ -18,30 +18,27 @@ fn payload_engine() -> Engine {
     let program = super::super::compile::compile(&normalised, &[1], false)
         .unwrap()
         .program;
-    Engine::new(program, Strategy::Cautious, false).with_budget(Budget {
+    let budget = Budget {
         task_memory: Some(64 << 20),
         ..Budget::default()
-    })
+    };
+    Engine::new(program, Strategy::Cautious, false, budget)
 }
 
 #[test]
-fn engine_and_memory_observations_share_one_sticky_stop() {
+fn the_envelope_stops_its_engine_alone_and_for_good() {
     let engine = payload_engine();
     let other = payload_engine();
-    let mut owner = engine.memory_charge();
-    assert!(owner.set(20));
-    engine.exhaust();
-    assert!(!owner.set(20));
-    assert!(!other.exhausted());
-
-    let engine = payload_engine();
-    engine.task_memory.as_ref().unwrap().observe(usize::MAX);
-    assert!(engine.exhausted());
-    let engine = engine.with_budget(Budget::default());
+    let mut held = 0;
+    assert!(engine.hold(&mut held, 20));
+    assert!(!engine.hold(&mut held, 64 << 20));
+    assert!(engine.exhausted() && engine.out_of_budget());
     assert!(
-        engine.exhausted(),
-        "changing policy cannot restore discarded work"
+        !engine.hold(&mut held, 0),
+        "released capacity restores no work"
     );
+    assert_eq!(engine.task_memory_bytes().0, other.task_memory_bytes().0);
+    assert!(engine.task_memory_bytes().1 > 64 << 20);
     assert!(!other.exhausted());
 }
 
@@ -81,13 +78,13 @@ fn borrowed_context_keys_reuse_only_equal_cores_and_tags() {
 fn queued_payloads_are_visible_before_the_receiver_runs() {
     let engine = payload_engine();
     let (root, _) = engine.context_for(&[]);
-    engine.sample_memory(true);
+    engine.sample();
     let base = engine.task_memory_bytes().0;
     let mut queue = Vec::new();
     for _ in 0..20 {
         engine.deliver_seq(&mut queue, root, payload());
     }
-    engine.sample_memory(true);
+    engine.sample();
     let inbox = lock(&engine.context(root).inbox);
     assert_eq!(engine.task_memory_bytes().0, base + inbox.bytes());
     assert_eq!(inbox.payload_bytes, 20 * payload().heap_bytes());
@@ -97,11 +94,11 @@ fn queued_payloads_are_visible_before_the_receiver_runs() {
 #[test]
 fn cancellation_stops_nested_context_work_after_messages_have_run() {
     for task_memory in [None, Some(64 * 1024 * 1024)] {
-        cancellation_releases_task(task_memory);
+        cancellation_drops_queued_work(task_memory);
     }
 }
 
-fn cancellation_releases_task(task_memory: Option<usize>) {
+fn cancellation_drops_queued_work(task_memory: Option<usize>) {
     use nrese_owl::{Axiom, ClassExpr, ExprId, ObjProp, Ontology};
     use std::sync::Arc;
 
@@ -119,13 +116,12 @@ fn cancellation_releases_task(task_memory: Option<usize>) {
     let compiled = super::super::compile::compile(&normalised, &[1, 2], false).unwrap();
     let flag = Arc::new(AtomicBool::new(false));
     let cancel = crate::tableau::Cancel::from_flag(Arc::clone(&flag));
-    let engine = Engine::new(compiled.program, Strategy::Cautious, false)
-        .with_budget(Budget {
-            task_memory,
-            ..Budget::default()
-        })
-        .with_cancel(Some(cancel));
-    let ledger = engine.task_memory.clone();
+    let budget = Budget {
+        task_memory,
+        ..Budget::default()
+    };
+    let engine =
+        Engine::new(compiled.program, Strategy::Cautious, false, budget).with_cancel(Some(cancel));
     let concept = engine.program.names.iter().position(|&t| t == 1).unwrap() as u32;
     let (root, _) = engine.context_for(&[Atom::concept(concept, super::super::atoms::CTerm::X)]);
     let mut queue = Vec::new();
@@ -151,11 +147,11 @@ fn cancellation_releases_task(task_memory: Option<usize>) {
         "cancellation must reach a budget checkpoint"
     );
     assert!(engine.states().any(|(_, s)| !s.started));
-    drop(engine);
-    if let Some(ledger) = ledger {
-        assert!(ledger.peak() > 0);
-        assert_eq!(ledger.used(), 0, "cancelled tasks release every owner");
+    for id in 0..engine.count() as ContextId {
+        assert!(lock(&engine.context(id).inbox).is_empty());
+        assert_eq!(engine.context(id).queued.load(Relaxed), 0);
     }
+    assert_eq!(engine.task_memory_bytes().1 > 0, task_memory.is_some());
 }
 
 #[test]
