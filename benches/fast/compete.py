@@ -17,7 +17,11 @@ Who runs what:
   in benches/fast/results/ (git-ignored) and are printed as restricted.
 
 Answer counts must match NRESE's before a time counts: a differing count is reported as
-`differs`, never as a time. Results: benches/fast/results/<stamp>/compete.json.
+`differs`, never as a time. Every suite run also captures each system's full answers and
+classifies them against the reference systems (ANSWER_REFERENCES, in order; the case's own
+checks of single answers are the known answers): benches/suite/suitekit/answers.py. Results:
+benches/fast/results/<stamp>/compete.json, and answers.json with one verdict per distinct
+query over all the runs.
 """
 from __future__ import annotations
 
@@ -45,7 +49,11 @@ SUITE_SYSTEMS = {"qlever", "oxigraph", "virtuoso", "jena", "rdf4j", "nemo", "owl
                  "graphdb", "rdfox", "anzograph", "stardog"}
 DL_SYSTEMS = {"hermit", "openllet", "konclude", "elk"}
 LICENSED = {"graphdb", "rdfox", "stardog", "anzograph"}
-RESULTS = fast.HERE / "results"
+# A queue job's results directory when it runs as one (benches/suite/queue.py), else here.
+RESULTS = Path(os.environ["QUEUE_RESULTS"]) if os.environ.get("QUEUE_RESULTS") else fast.HERE / "results"
+# The systems whose answers the others are compared with, in order (answers.py): Jena's ARQ
+# (the oracle kit's), then the next that answered; never NRESE.
+ANSWER_REFERENCES = "jena,oxigraph,virtuoso,qlever"
 
 
 # How far the stores without reasoning can be given a reasoning case's queries as SPARQL
@@ -165,7 +173,7 @@ def export_closure(case: dict) -> str | None:
 
 def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: str,
               queries: Path | None = None, track: str = "", settings: dict | None = None,
-              cache: str = "off") -> list[dict]:
+              cache: str = "off", expect: dict | None = None) -> list[dict]:
     """The suite's driver on tier CASE~SEMANTICS for NRESE and `systems`; its rows. A track
     (the case's `tracks`) adds its settings, such as how many queries a store answers at
     once; `cache` the result-cache modes of the systems that have one (`off,on` for a
@@ -179,12 +187,19 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
            "CARGO_TARGET_DIR": str(fast.ROOT / "target")}
     if queries:
         env["FAST_QUERIES"] = str(queries)
+    if expect:
+        # The generator's answers, for the case's checks of single answers (workloads.fast_answers).
+        out.parent.mkdir(parents=True, exist_ok=True)
+        known = out.with_suffix(".expect.json")
+        known.write_text(json.dumps(expect), encoding="utf-8")
+        env["FAST_EXPECT"] = str(known)
     env.update(settings or {})
     command = [sys.executable, str(fast.ROOT / "benches/suite/suite.py"), "run",
                "--systems", ",".join(["nrese", *systems]), "--workloads", "fast", "--tier", f"fast={tier}",
                "--runs", str(runs), "--query-runs", "2", "--cache", cache, "--skip-build",
                "--data", f"volume:{fast.DATA_VOLUME}", "--results", str(out), "--query-timeout-s", "120",
-               "--timeout-s", "900"]
+               "--timeout-s", "900", "--answers", "full",
+               "--answers-reference", ",".join((case.get("expect") or {}).get("answers") or [ANSWER_REFERENCES])]
     print(f"  suite: {tier} on nrese, {', '.join(systems)}", flush=True)
     log = out.with_suffix(".log")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -310,7 +325,7 @@ def dl_run(case: dict, systems: list[str], nrese_ms: float | None, stamp: str) -
         with fast.quiet_slot(f"compete {case['name']} dl"):
             done = fast.docker(["run", "--rm", "--name", f"{work}-{fast.ROOT.name}", f"--memory={DL_MEMORY_GB}g",
                                 f"--memory-swap={DL_MEMORY_GB}g", *fast.cpu_args(), "-v", f"{fast.DATA_VOLUME}:/work",
-                                "nrese-bench/dl-reference", "batch", f"/work/{work}.rest.tsv", f"/work/{work}.part.tsv",
+                                fast.dl_image(), "batch", f"/work/{work}.rest.tsv", f"/work/{work}.part.tsv",
                                 f"/work/{work}-tax", str(timeout_s)], timeout=timeout_s * len(systems) + 300)
         # Results so far, and a timeout for the task the runner stopped at.
         merge = (f"cat /work/{work}.part.tsv >> /work/{work}.results.tsv 2>/dev/null; rm -f /work/{work}.part.tsv; "
@@ -385,7 +400,7 @@ def nemo_custom(case: dict) -> dict:
         started = time.monotonic()
         done = fast.docker(["run", "--rm", f"--memory={case['cap_gb']}g", f"--memory-swap={case['cap_gb']}g",
                             *fast.cpu_args(), "-v", f"{fast.DATA_VOLUME}:/fast", "-v", f"{rules.parent.as_posix()}:/rules:ro",
-                            "--entrypoint", "sh", "nrese-bench/nemo", "-c", script], timeout=900)
+                            "--entrypoint", "sh", fast.hosts.image("nrese-bench/nemo"), "-c", script], timeout=900)
         wall = time.monotonic() - started
     text = done.stdout
     import re
@@ -443,12 +458,13 @@ def compete(args) -> int:
 
     # Suite jobs, grouped: the cases on the same data and semantics load it once per system.
     groups: dict[tuple, dict] = {}
+    expects: dict[str, dict] = {}
     for case in cases:
         entries = comparators(case, only)
         if not entries:
             continue
         print(f"\n{case['name']} ({case['semantics']})", flush=True)
-        fast.ensure_data(case["data"])
+        expects[case["name"]] = fast.ensure_data(case["data"])
         result = report["cases"].setdefault(case["name"], {"semantics": case["semantics"], "comparisons": {},
                                                             "no_runner": []})
         dl: list[str] = []
@@ -519,7 +535,8 @@ def compete(args) -> int:
                     result["no_runner"].append(f"rewritten-{form}: no printed query with NRESE's rows")
                     continue
                 copy_volume_files(case)
-                rows = suite_run(case, "plain", rewritten, args.runs, stamp, directory, f"rewritten-{form}")
+                rows = suite_run(case, "plain", rewritten, args.runs, stamp, directory, f"rewritten-{form}",
+                                 expect=expects.get(case["name"]))
                 summary = summarise_suite(rows)
                 result["comparisons"][f"rewritten-{form}"] = {"summary": summary, "verdicts": verdicts(summary)}
         if "nemo:custom" in result["comparisons"]:
@@ -544,7 +561,8 @@ def compete(args) -> int:
         for track, settings in tracks.items():
             rows = suite_run(first, semantics, sorted(group["systems"]), args.runs, stamp, queries,
                              track, {k: str(v) for k, v in settings.items()},
-                             "off,on" if first.get("queries") == "@cache-log" else "off")
+                             "off,on" if first.get("queries") == "@cache-log" else "off",
+                             expect=expects.get(first["name"]))
             summary = summarise_suite(rows)
             label = f"{semantics}@{track}" if track else semantics
             for case in group["cases"]:
@@ -555,7 +573,17 @@ def compete(args) -> int:
                                           "no_runner": []})
         save()
     save()
-    print(f"\nresults: {(RESULTS / stamp / 'compete.json').relative_to(fast.ROOT)}")
+    runs = sorted((RESULTS / stamp).glob("*/answers.json"))
+    if runs:
+        # One verdict per distinct query over every run of this batch (restricted systems left out).
+        from suitekit import answers
+        print()
+        answers.main([*map(str, runs), "--write", str(RESULTS / stamp / "answers.json")])
+    batch = RESULTS / stamp
+    shown = batch.relative_to(fast.ROOT).as_posix() if batch.is_relative_to(fast.ROOT) else batch.as_posix()
+    print(f"\nresults: {shown}/compete.json")
+    print(f"record: python benches/suite/suite.py ledger {shown}"
+          " (then standings --write)")
     return 0
 
 

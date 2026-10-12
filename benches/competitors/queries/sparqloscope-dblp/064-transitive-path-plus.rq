@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 64: transitive-path-plus
+# Transitive path with plus
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (COUNT(*) AS ?count) { ?s dblp:relatedStream+ ?o }

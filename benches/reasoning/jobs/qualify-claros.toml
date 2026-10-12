@@ -1,0 +1,18 @@
+id = "reasoning-qualify-claros"
+group = "reasoning"
+host = "office-pc"
+checkout = "suite/reasoning"
+workload = "claros"
+window = "any"
+priority = 1
+est_min = 150
+needs = ["docker"]
+env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server", NRESE_VERSION = "16c3bfb", DOCKER_MEMORY = "28g" }
+# Claros-L with the 2014 program (owl:sameAs axiomatised) and without the axiomatisation (the
+# 2019 maintenance study's setup): every engine counts every relation; NRESE's closure is
+# checked against the papers' 95.5 M and 73.8 M triples. LE derives about 549 M facts: its
+# one run in timed-claros-le is its qualification.
+commands = [
+  ["python3", "benches/reasoning/datalog/datalog.py", "prepare", "--cases", "claros-l,claros-le,claros-l-noeq,claros-le-noeq"],
+  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --qualify --runs 1 --threads 4 --timeout-s 7200 --cases claros-l,claros-l-noeq --results \"$QUEUE_RESULTS/qualify\""],
+]

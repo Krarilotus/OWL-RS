@@ -1,0 +1,106 @@
+# Group sparql: the SPARQL stores on their home turf: QLever, Virtuoso, MillenniumDB, Oxigraph, Jena;
+# Sparqloscope, BSBM, WatDiv, SP2Bench, WDBench, G-CARE.
+# The schema: benches/cases/README.md; validated by benches/suite/suite.py --check.
+#
+# Each case is a competitor's own benchmark at its published scale: its data (prepared by
+# benches/sparql/prepare.sh, frozen in benches/datasets.toml), its queries, its published
+# answers where there are any, and each system in its documented best configuration
+# (benches/sparql/README.md, "Configurations"). The cases run through the suite's driver
+# (`suite.py run --workloads WORKLOAD --tier WORKLOAD=CASE`; a tier is named after its case,
+# so that the run's versus entries count it for its home turf), and the answers of every
+# system are captured and checked before any time counts.
+
+[[case]]
+name = "sparqloscope-dblp"
+area = "query"
+what = "Sparqloscope on DBLP's knowledge graph (dblp_KG_with_associated_data, release of 11 Oct 2026): 105 queries, one SPARQL feature each; QLever's published geometric mean 0.18 s is the bar"
+workload = "sparqloscope"
+tier = "sparqloscope-dblp"
+levels = ["full"]
+semantics = "none"
+data = "volume:dblp-kg-20261011.nt"
+queries = "@sparqloscope-dblp"
+metric = "sum_p50_ms"
+expect = { answers = ["jena", "millenniumdb", "virtuoso", "qlever"] }
+systems = ["qlever:plain", "virtuoso:plain", "millenniumdb:plain", "jena:plain"]
+home_turf = "qlever"
+scenario = "native"
+needs = ["docker"]
+cap_gb = 28
+est_min = 600
+
+[[case]]
+name = "watdiv-10m"
+area = "query"
+what = "WatDiv's basic testing workload on its authors' 10 M dataset: 20 templates (linear, star, snowflake, complex), instantiated from the generator's saved state"
+workload = "watdiv"
+tier = "watdiv-10m"
+levels = ["full"]
+semantics = "none"
+data = "volume:watdiv-10m.nt"
+queries = "@watdiv-10m"
+metric = "sum_p50_ms"
+expect = { answers = ["jena", "oxigraph", "virtuoso", "qlever"] }
+systems = ["oxigraph:plain", "jena:plain", "qlever:plain", "virtuoso:plain"]
+home_turf = "oxigraph"
+scenario = "native"
+needs = ["docker"]
+cap_gb = 16
+est_min = 90
+
+[[case]]
+name = "bsbm-explore-100m"
+area = "concurrency"
+what = "BSBM V3.1 explore mix at 100 M triples with BIBM's driver: 1, 4, 8 and 64 clients by the published procedure; Virtuoso 7's 47179 to 216119 QMpH are the bar"
+workload = "bsbm"
+tier = "bsbm-explore-100m"
+levels = ["full"]
+semantics = "none"
+data = "volume:bsbm-100m.nt"
+queries = ""
+metric = "ms per mix (3,600,000 / QMpH) per client level"
+expect = { answers = ["jena", "virtuoso"] }
+systems = ["virtuoso:plain", "qlever:plain", "oxigraph:plain", "jena:plain"]
+home_turf = "virtuoso"
+scenario = "native"
+needs = ["docker", "java"]
+cap_gb = 28
+est_min = 120
+
+[[case]]
+name = "bsbm-bi-100m"
+area = "concurrency"
+what = "BSBM V3.1 business-intelligence mix at 100 M triples with BIBM's driver: 1, 4, 8 and 64 clients by the published procedure; Virtuoso 7's 997 to 7132 QMpH are the bar"
+workload = "bsbm"
+tier = "bsbm-bi-100m"
+levels = ["full"]
+semantics = "none"
+data = "volume:bsbm-100m.nt"
+queries = ""
+metric = "ms per mix (3,600,000 / QMpH) per client level"
+expect = { answers = ["jena", "virtuoso"] }
+systems = ["virtuoso:plain", "qlever:plain", "oxigraph:plain", "jena:plain"]
+home_turf = "virtuoso"
+scenario = "native"
+needs = ["docker", "java"]
+cap_gb = 28
+est_min = 120
+
+[[case]]
+name = "watdiv-100m"
+area = "query"
+what = "WatDiv's basic testing workload on its authors' 100 M dataset: 20 templates instantiated from the generator's saved state (196 distinct queries)"
+workload = "watdiv"
+tier = "watdiv-100m"
+levels = ["full"]
+semantics = "none"
+data = "volume:watdiv-100m.nt"
+queries = "@watdiv-100m"
+metric = "sum_p50_ms"
+expect = { answers = ["jena", "oxigraph", "virtuoso", "qlever"] }
+systems = ["jena:plain", "oxigraph:plain", "qlever:plain", "virtuoso:plain"]
+home_turf = "jena"
+scenario = "native"
+needs = []
+cap_gb = 24
+est_min = 240

@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 66: transitive-path-large-join-and-plus
+# Transitive path with a large join and plus
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (COUNT(*) AS ?count) { ?s dblp:publishedInStream/dblp:relatedStream+ ?o }

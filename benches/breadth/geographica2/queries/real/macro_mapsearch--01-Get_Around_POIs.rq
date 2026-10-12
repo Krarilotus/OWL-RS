@@ -1,0 +1,15 @@
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
+PREFIX geonames: <http://www.geonames.org/ontology#>
+
+SELECT ?f ?name ?fGeo ?code ?parent ?class ?fGeoWKT 
+WHERE { 
+   GRAPH <http://geographica.di.uoa.gr/dataset/geonames> { 
+      ?f geonames:name ?name; 
+         <http://www.geonames.org/ontology#hasGeometry> ?fGeo; 
+         geonames:featureCode ?code;  
+         geonames:parentFeature ?parent; 
+         geonames:featureClass ?class. 
+      ?fGeo <http://www.geonames.org/ontology#asWKT> ?fGeoWKT. 
+      FILTER(geof:sfIntersects(?fGeoWKT, "null"^^<http://www.opengis.net/ont/geosparql#wktLiteral>)).
+   }
+}

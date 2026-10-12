@@ -1,0 +1,13 @@
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+
+SELECT ?s1 ?s2 
+WHERE { 
+	GRAPH <http://geographica.di.uoa.gr/dataset/gag> {
+		?s1 <http://geo.linkedopendata.gr/gag/ontology/asWKT> ?o1
+	} 
+	GRAPH <http://geographica.di.uoa.gr/dataset/gag> {
+		?s2 <http://geo.linkedopendata.gr/gag/ontology/asWKT> ?o2
+	} 
+ 	FILTER(?s1 != ?s2).  
+ 	FILTER(geof:sfTouches(?o1, ?o2)).  
+}

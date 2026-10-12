@@ -1,0 +1,23 @@
+PREFIX clc: <http://geo.linkedopendata.gr/corine/ontology#> 
+PREFIX noa: <http://teleios.di.uoa.gr/ontologies/noaOntology.owl#> 
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> 
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/>  
+
+SELECT ?h ?hWKT 
+WHERE { 
+  GRAPH <http://geographica.di.uoa.gr/dataset/hotspots> { 
+    ?h  rdf:type noa:Hotspot ; 
+        <http://teleios.di.uoa.gr/ontologies/noaOntology.owl#hasGeometry> ?hGeo ; 
+        noa:hasAcquisitionTime "2007-07-26T00:45:00"^^xsd:dateTime . 
+    ?hGeo <http://teleios.di.uoa.gr/ontologies/noaOntology.owl#asWKT> ?hWKT. 
+  } 
+  GRAPH <http://geographica.di.uoa.gr/dataset/clc> { 
+    ?a  a clc:Area ; 
+        <http://geo.linkedopendata.gr/corine/ontology#hasGeometry> ?aGeo ; 
+        clc:hasLandUse clc:coniferousForest . 
+    ?aGeo <http://geo.linkedopendata.gr/corine/ontology#asWKT> ?aWKT . 
+  } 
+  FILTER(geof:sfIntersects(?hWKT, ?aWKT)) . 
+  FILTER(geof:sfIntersects(?aWKT, "POLYGON((20.7858013633644 36.9947301001973,20.6070018260972 40.8452031365591,26.111857027467 40.875795540161,26.0004221014641 37.02141161985,20.7858013633644 36.9947301001973))"^^<http://www.opengis.net/ont/geosparql#wktLiteral>))
+}

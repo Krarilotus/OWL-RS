@@ -6,6 +6,8 @@ has been measured so far. Start here.
 | Question | Answer |
 |---|---|
 | What is measured, what isn't, and how did it last come out? | [STATUS.md](STATUS.md), generated: `python benches/suite/suite.py status --write` |
+| Where does NRESE stand against each contender, on its home turf and elsewhere? | [STANDINGS.md](STANDINGS.md), generated from the run records: `python benches/suite/suite.py standings --write` |
+| How is a case written, for any group? | [cases/README.md](cases/README.md): one schema, a file per group |
 | How is it measured, and why can the numbers be trusted? | [PROTOCOL.md](PROTOCOL.md): the rules every kit follows |
 | Which benchmarks exist in each field, what do they cost, and which do we run? | [CATALOG.md](CATALOG.md) |
 | What did a given run cover, on which commit and host? | [runs/](runs/README.md): one record per run |
@@ -66,20 +68,29 @@ and every run ends in the same record.
   anything else. Its thresholds are in [fast/README.md](fast/README.md#comparing).
 
 Answers are compared by [suite/suitekit/answers.py](suite/suitekit/answers.py)
-(`suite.py run --answers full --answers-reference SYSTEM`): each system against one
-reference, never by majority; `strict_match` and `value_match` apart (a `COUNT` typed
-`xsd:int` is the same value as `xsd:integer`, and the datatype difference is recorded);
-an unordered final `LIMIT` checked as a legal subset of the reference's unlimited answer.
+(`suite.py run --answers full --answers-reference jena,oxigraph,…`): each system against
+one reference, never by majority. The reference is the first listed system with a complete,
+stable answer, confirmed by the next one or by a known answer (an adjudicated count, a fast
+case's own check); two references that disagree leave the query to adjudication.
+`strict_match` and `value_match` are kept apart (a `COUNT` typed `xsd:int` is the same
+value as `xsd:integer`, and the datatype difference is recorded); an unordered final
+`LIMIT` is checked as a legal subset of the reference's unlimited answer. Each distinct
+query on the same data is one group, classified `ok`, `wrong` (whose), `incomplete` or
+`unsupported`; `suite.py answers DIR...` classifies captured runs again, without running.
 
 ### Where this stands
 
 | Step | State |
 |---|---|
-| Hosts as declared roles: [hosts.toml](hosts.toml), read by `suitekit/hosts.py`; the fast suite takes its inputs from there and refuses a host without Docker | done |
+| Hosts as declared roles: [hosts.toml](hosts.toml), read by `suitekit/hosts.py`: inputs, volumes, preserved image aliases | done |
 | Run records in one schema | done |
-| The answer recorder in the suite | done |
-| One case registry: `fast/cases.toml` grows `levels`, `needs`, `expect` and `data = "dataset:…"`; the fast runner moves into `suitekit` as the native plan kind; `fast.py` becomes `suite.py run --level focused` | next |
-| One `compare` over result rows (generalising `fast.py compare`); `suitekit/compare.py`, `perf-lab-compare.py` and `fast/compete.py` retire, the suite running comparators on any case | next |
+| The answer recorder in the suite: an adjudicated reference per query, a verdict per group (`suite.py answers`) | done |
+| A native runtime for the fast suite: host processes in capped scopes, on a measure host without Docker (`NRESE_FAST_RUNTIME=native`, [fast/README.md](fast/README.md#how-it-measures)) | done |
+| One case registry: [cases/](cases/README.md), a file per group, one schema validated by `suite.py --check` (`levels`, `needs`, `expect`, `scenario`, `workload`) | done |
+| the fast runner moves into `suitekit` as the native plan kind; `fast.py` becomes `suite.py run --level focused` | next |
+| One `compare` over result rows: `suitekit/compare.py` reads fast reports, perf-lab reports and suite results, in the order missing, answers, time, memory by kind, disk; `fast.py compare` and `suite.py compare` are it. Suite pairs still use `summary.py`'s estimator: the bootstrap for them is the next step | started |
+| `perf-lab.sh` and `perf-lab-compare.py` retired: the `lab-*` fast cases (rows pinned; the same rows and times within the old runs' spread on Phuoc-Yu, 12 Oct 2026) and the one `compare` | done |
+| `fast/compete.py` folds into the suite, the suite running comparators on any case | next |
 | Checkpointed chunks for level 3: resume after a pause, keep the order, never rerun a finished case | next |
 | The result row's answer and memory-kind fields | next |
 | Level 4: `runtime = "apptainer"` on `draco`, Zebratlas as a workload | later |
@@ -90,7 +101,10 @@ an unordered final `LIMIT` checked as a legal subset of the reference's unlimite
 `measure`, `cluster`), what it has (Docker, Java, Apptainer), and the verified inputs under
 the preservation root on the hosts that hold it. Only a `build` host compiles Rust and runs
 the gate (`scripts/lib/remote.sh`, `git config nrese.buildHost`); a `measure`-only host runs
-binaries a build host made, with their source revision and SHA-256 recorded. Inputs are
+binaries a build host made, with their source revision and SHA-256 recorded. What changes
+timings on a host (toolchain, CPU governor, profiling, page-cache control) is its `config`,
+dated: a change starts a new configuration, and `compare` refuses to set runs of two
+configurations side by side; earlier records stay valid. Inputs are
 used read-only and shared across worktrees; generated data, stores, scratch and results
 live elsewhere. `~/.config/nrese-bench.env` on a host names only what changes per campaign
 (the binaries under test, the results directory), and is sourced explicitly.
@@ -106,7 +120,8 @@ benches/
 ├── hosts.toml           the hosts, their roles, the verified inputs
 ├── runs/                one record per run (committed)
 ├── baselines/           committed NRESE reference numbers the regression gates compare against
-├── fast/                the fast cases (levels 2 and 3): checked and route-checked, each its own container
+├── cases/               every case, a file per group, one schema (cases/README.md)
+├── fast/                the fast runner (levels 2 and 3): each case checked and route-checked, in a container or natively
 ├── suite/               the registries and the driver
 │   ├── systems.toml     systems, capabilities, publishing rule, how they start
 │   ├── workloads.toml   workloads, needs, standard tiers, source, licence, check, state
@@ -124,7 +139,6 @@ benches/
     ├── oracle/          Jena's ARQ as a second oracle for SPARQL answers
     ├── oxigraph-comparison/  NRESE's RDF bundle against Oxigraph's libraries
     ├── nrese-bench-harness/  the Rust HTTP client: query-mix, write-scaling, compatibility packs
-    ├── perf-lab.sh, perf-lab-compare.py  NRESE's store and query engine alone, in Docker (to fold into fast cases)
     ├── probes/          single measurements: HTTP latency, large results, memory, autocompletion
     └── cluster/         the same suite on a SLURM cluster (Apptainer)
 ```
@@ -132,7 +146,7 @@ benches/
 | Layer | What | Where | Changes when |
 |---|---|---|---|
 | Rules | how anything is measured, checked, recorded and published | `PROTOCOL.md`, `competitors/README.md` (licences) | rarely, by decision |
-| Registries | what exists: systems, workloads, cases, hosts | `suite/*.toml`, `fast/cases.toml`, `hosts.toml` | a system, workload, case or host is added |
+| Registries | what exists: systems, workloads, cases, hosts | `suite/*.toml`, `cases/*.toml`, `hosts.toml` | a system, workload, case or host is added |
 | Drivers | how a pair or case runs | `suite/suitekit/`, `fast/fast.py`, the kits | a new kind of measurement |
 | Evidence | what came out: raw results (local), run records, STATUS, baselines (committed) | `suite/results/`, `runs/`, `STATUS.md`, `baselines/` | every run |
 
@@ -150,7 +164,7 @@ benches/
 | [clients](clients/README.md) | client libraries end to end | `run-all.sh` | stdout | — |
 | [oracle](oracle/README.md) | NRESE's SPARQL answers against Jena's | its script | `oracle/results/` | — |
 | [oxigraph-comparison](oxigraph-comparison/README.md) | parsers, serialisers and evaluators against Oxigraph's | `cargo test`, `cargo run --bin bench` | `oxigraph-comparison/results/` | — |
-| perf lab | the store and query engine without HTTP, per query p50; the fast suite's measuring tool | `perf-lab.sh` | — | `baselines/perf-lab/*.json` |
+| perf lab | the store and query engine without HTTP, per query p50; the fast suite's measuring tool, on the perf lab's datasets the `lab-*` cases | `fast.py run --cases lab-…` | — | `baselines/perf-lab/*.json` (until 27 Sep 2026; `compare` reads them) |
 | [probes](probes/README.md) | one property at a time | one script each | stdout | — |
 | [cluster](cluster/README.md) | the suite on Draco | `suite.sbatch` | the job's directory | record in `runs/` |
 
@@ -173,6 +187,34 @@ Single measurements and diagnoses outside the kits, run with
 | DL | `nrese-dl`: `tableau_consistency` (per-phase times, search counters), `context_classify`, `bounds_eval` (the L and U1 bounds), `tableau_fuzz`; `nrese-owl`: `fuzz` (random OWL 2 DL ontologies), `ofn_speed` (the functional-syntax reader's speed gate) |
 | Studies kept for open targets | `nrese-engine`'s ignored tests `compression_study` and `vocabulary_study` (store-size options, P2 in [performance.md](../docs/design/performance.md) §6) |
 | Office PC | `scripts/office/`: dataset preparation (`dbpedia.sh`, `wikidata.sh`) and the perf lab there (`perflab.sh`) |
+
+## The measurement queue
+
+Timed runs don't start by hand: they are jobs in a measure host's queue
+([suite/queue.py](suite/queue.py)), run one at a time, so that no two timings share a
+machine and every system of a comparison runs on the same host under the same limits. A
+host's `queue` in [hosts.toml](hosts.toml) says when a timed job may start: the office PC
+at night or while its owner leaves `~/owlrs/FREE`, never while its owners are present
+(`~/owlrs/RETREAT`; a job they stop runs again); Phuoc-Yu whenever no compiler runs;
+Khaleesi (64 GiB, Windows) at night, for runs that need RAM and whole comparisons whose
+every contender runs there, its results fetched the day they end (`queue.py fetch`);
+GamerGrill (WSL) any time, but never a timing: downloads, data preparation, answer checks
+(`window = "any"`). The main PC builds and prepares, never times.
+
+```text
+python benches/suite/queue.py submit JOB.toml        the job's checkout pushed to its host, the job queued
+python benches/suite/queue.py status                 every host's pending, running, done and failed jobs
+python benches/suite/queue.py cancel ID --host HOST  a pending job back out
+python benches/suite/queue.py fetch ID --host HOST --to DIR   its results here (removed there on a same-day host)
+python benches/suite/queue.py work                   on the host: its runner (one per host, detached)
+```
+
+A job names its group, host, checkout and commands (a build first where it needs one), the
+environment (binaries, a matched scenario's limits), what the host must have, its window
+(`quiet` for timings, `any` for counts), priority and expected minutes. Its results land in
+`~/owlrs/results/<id>` on the host; its record is written from them (`suite.py ledger`).
+Answers come before time: compete captures every answer, a timed `suite.py run` must ask for
+them (`--answers full`), or the job is refused.
 
 ## A run, step by step
 
