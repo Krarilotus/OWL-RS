@@ -15,6 +15,8 @@ results = { root = "office-pc:/home/krarilotus/owlrs/results", suite = "union-ab
 publishable = "all"
 cases = [
   { case = "the 20 fast cases, candidate", verdict = "same", note = "every time and peak within the thresholds; parse-large's 500 UNIONs 1,500 -> 1,002 plan steps (fewer); plan-estimates' within-2x share 0.667 -> 0.687 only because two consecutive BIND estimates are one n-ary Extend now (bind operators 6 -> 4, 69 -> 67 estimates, every other operator kind equal)" },
+  { case = "the 20 fast cases, final", verdict = "same", note = "every time same but parse-large; no query-phase peak changed. Three cases flagged more memory (op-group 1311 -> 2051, op-negation 1337 -> 2083, q-cycles 1351 -> 2092 MiB): each a single repetition's container peak of the four, its load, query and process peaks equal to the base's (queries op-group 606-661 against 610-619, op-negation 609-615 against 583-635, q-cycles 648-667 against 631-663 MiB); the base has the same outlier (q-star rep 3: 2139 MiB). plan-estimates as in the candidate" },
+  { case = "parse-large, final", verdict = "faster", note = "0.32x [0.31, 0.32]; series medians bgp-1000 62.7 -> 14.3 ms, union-500 1.25 -> 1.09, path-alternatives-300 0.34 -> 0.28, subqueries-50-deep 0.040 -> 0.048 (the post-parse depth walk), filter-or-2000 1.92 -> 2.08, the others equal; 1,500 -> 1,002 plan steps" },
   { case = "1,000-step path (planning)", verdict = "faster", note = "old 6.99, 7.00, 7.18, 7.16 s; final 0.55, 0.56 s (A-B-B-A); with the shares 0.54-0.58 s; before the effort bound 0.66, 0.68 s" },
   { case = "1,000-pattern star (planning)", verdict = "faster", note = "old 457.2 s (one run); before the effort bound 2.88, 2.88 s; final 0.58-0.59 s (4 runs); with the shares 0.59-0.61 s" },
   { case = "250 triple-term patterns (planning)", verdict = "faster", note = "old 9.52 s (one run); final 0.29 s (4 runs); with the shares 0.26-0.30 s" },
@@ -24,5 +26,5 @@ findings = [
   "The old star's 457 s: the orderer read every star predicate in every candidate set, twice per candidate, from 16 starts of n^2/2 candidates; the path's 7 s: the result cache keyed each prefix of the join order by spelling it out, O(n^3) per pattern with linear variable lookups.",
   "Test profile, the guard (depth_tests::large_patterns_plan_in_time_or_stop_at_the_deadline): path 28 s -> 0.28 s, star 4.9 s (effort unbounded) -> 0.48 s, 250 triple terms 114 s -> 0.50 s; all four shapes together 2.15 s against a 5 s deadline.",
   "Old runs of the star and the checks were not repeated: at these ratios one run decides, and each held the shared quiet slot for minutes.",
-  "The suite A/B of the final arm (union-ab2-20261012) had round 1 of 2 done when this was written (80 of 160 passes, waiting on the shared slot); its verdicts follow in this record.",
+  "The final arm's suite A/B (union-ab2-20261012) ran 13:06-17:12 around the PC's owners: the guard stopped one pass (op-group, round 2, pass 2) at 14:47 and the driver redid it at 17:11, after the retreat lifted.",
 ]
