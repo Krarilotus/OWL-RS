@@ -2366,7 +2366,7 @@ fn run(
         // What the last round freed (its candidates, the runs a fold replaced) goes back
         // before this one allocates. mimalloc holds a freed large block 100 ms, about a
         // round, so a round's resident peak held the last one's buffers or not by timing:
-        // LUBM 100 2,016-2,148 MiB over ten runs, 1,592-1,675 with this, its heap 1,233.
+        // LUBM 100 2,041-2,148 MiB over ten runs, 1,599-1,704 with this, its heap 1,233.
         nrese_engine::memory::release_all();
         heap::phase("reasoner: grounding");
         let clock = std::time::Instant::now();

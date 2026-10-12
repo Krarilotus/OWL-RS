@@ -962,7 +962,7 @@ def spread(entry: dict) -> float:
 
 
 # A case's peak varies between repetitions by what the allocator still holds of memory freed
-# shortly before (up to 26 % in a small parallel load, 12 Oct 2026); beyond this, something
+# shortly before (up to 32 % in a small parallel load, 12 Oct 2026); beyond this, something
 # not the process's is counted (the page cache in the container's peak: 49-98 %).
 UNSTABLE_PEAK = 0.40
 

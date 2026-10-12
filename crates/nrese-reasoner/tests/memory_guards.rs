@@ -155,8 +155,8 @@ static RELEASES: AtomicUsize = AtomicUsize::new(0);
 
 /// What a round freed goes back before the next round allocates, and after the last one.
 /// mimalloc holds a freed large block 100 ms, about a round of LUBM 100, so without the
-/// releases the resident peak held the last round's buffers or not by timing: 2,016-2,148
-/// MiB over ten runs of one build, 1,592-1,675 with them (12 Oct 2026, heap 1,233 MiB).
+/// releases the resident peak held the last round's buffers or not by timing: 2,041-2,148
+/// MiB over ten runs of one build, 1,599-1,704 with them (12 Oct 2026, heap 1,233 MiB).
 #[test]
 fn every_round_begins_with_the_last_rounds_memory_given_back() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());

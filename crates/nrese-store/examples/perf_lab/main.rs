@@ -1162,9 +1162,11 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         phases.push(("commits", phase.json()));
     }
     if args.classify {
+        let phase = Phase::start();
         report
             .sections
             .push(("classification", modes::classification(&store, args.runs)?));
+        phases.push(("classification", phase.json()));
     }
     if !args.clients.is_empty() {
         // One level per count of clients, each with its own peak memory.

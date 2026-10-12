@@ -107,7 +107,7 @@ comparator also `hangs`, `unsupported` and `not expressible`.
    spread of peaks, and by at least 64 MiB is a regression. The case's peak and each
    phase's peak are compared apart; a phase peak is not a lifetime peak. Case peaks that
    vary by more than 40 % between repetitions are not compared and fail the comparison:
-   the allocator moves them by up to 26 %, more is a measurement counting what is not the
+   the allocator moves them by up to 32 %, more is a measurement counting what is not the
    process's.
 
 ## What is kept
