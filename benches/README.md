@@ -205,6 +205,7 @@ GamerGrill (WSL) any time, but never a timing: downloads, data preparation, answ
 python benches/suite/queue.py submit JOB.toml        the job's checkout pushed to its host, the job queued
 python benches/suite/queue.py status                 every host's pending, running, done and failed jobs
 python benches/suite/queue.py cancel ID --host HOST  a pending job back out
+python benches/suite/queue.py fetch ID --host HOST --to DIR   its results here (removed there on a same-day host)
 python benches/suite/queue.py work                   on the host: its runner (one per host, detached)
 ```
 
