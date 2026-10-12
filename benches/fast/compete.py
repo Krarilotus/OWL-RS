@@ -578,7 +578,9 @@ def compete(args) -> int:
         from suitekit import answers
         print()
         answers.main([*map(str, runs), "--write", str(RESULTS / stamp / "answers.json")])
-    print(f"\nresults:{(RESULTS / stamp / 'compete.json').relative_to(fast.ROOT)}")
+    print(f"\nresults: {(RESULTS / stamp / 'compete.json').relative_to(fast.ROOT)}")
+    print(f"record: python benches/suite/suite.py ledger {(RESULTS / stamp).relative_to(fast.ROOT).as_posix()}"
+          " (then standings --write)")
     return 0
 
 
