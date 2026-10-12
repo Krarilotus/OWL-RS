@@ -61,15 +61,18 @@ class Rootfs(unittest.TestCase):
             runtime = RootfsRuntime(Path(d), 18950, Path(d))
             self.assertTrue(runtime.image_present("vendor/store:1.0"))
             spec = Spec("s", "vendor/store:1.0", ["serve", "--port", "7"], {"K": "v"},
-                        [Mount("/host/data", "/data"), Mount("/host/store", "/store", readonly=False)],
+                        [Mount("/host/data", "/data"), Mount(str(Path(d) / "store"), "/store", readonly=False)],
                         entrypoint=True, memory="12g")
             argv = runtime.argv(spec)
+            store = str(Path(d) / "store")
+            # Docker creates a missing bind source; so does this runtime.
+            self.assertTrue(Path(store).is_dir())
         self.assertEqual(argv[:7], ["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=12G", "-p"])
         self.assertIn("--tmp-overlay", argv)
         self.assertEqual(argv[argv.index("--overlay-src") + 1], str(image / "rootfs"))
         joined = " ".join(argv)
         for part in ("--setenv PATH /usr/bin", "--setenv K v", "--ro-bind /host/data /data",
-                     "--bind /host/store /store", "--chdir /srv", "-- /entry.sh serve --port 7"):
+                     f"--bind {store} /store", "--chdir /srv", "-- /entry.sh serve --port 7"):
             self.assertIn(part, joined)
 
 
