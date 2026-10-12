@@ -195,7 +195,9 @@ def summarise(rows: list[dict], source: str = "", settled: dict[tuple, str] | No
             continue
         run = f"{source}:{r['run']}"
         task, status, ms = r["task"], r["status"], number(r["ms"])
-        if task == "query":
+        # A relation's count (`count:REL`, a rule kit's check) is an answer like a query's:
+        # compared across the systems, disputed where they differ; it carries no time.
+        if task == "query" or (task == "count" and r["item"]):
             item = pair.items[r.get("cache") or "-"][r["item"]]
             item.statuses[status] += 1
             if status == "ok" and ms is not None:

@@ -12,7 +12,7 @@ An entry, per case (or workload tier) and comparator:
 |---|---|
 | `case`, `semantics`, `system`, `run`, `home_turf` | what ran, under what, against whom, in which run (a track is a run of its own); whose home turf the case is |
 | `answers` | the comparator's answers against the references: `ok`, or what is wrong, missing or `unchecked` (no reference answered) and whose (NRESE's own answers are judged alike); only queries both answered right are timed |
-| `timed` | queries both answered right and completely, of those both ran |
+| `timed` | queries both answered right and completely, of those both ran; for a rule engine, `reason` (its materialisation), timed only where its relation counts (`count:REL`) passed their checks |
 | `time` | NRESE / comparator: the sum of the timed queries' medians, its 95 % bootstrap interval |
 | `verdict` | `win` (NRESE faster beyond max(10 %, spread) and 2 ms, the interval below 1), `loss` (the other way round), `tie`, or `no-verdict` (nothing timed both answered right) |
 | `load`, `memory` | NRESE / comparator: the median load time; the median serve peak, with its kind |
@@ -66,8 +66,8 @@ def side(rows: list[dict], cache: str) -> dict:
     """One system's rows of one tier: per run its ok query latencies in the cache mode
     `cache` (or without a cache); the statuses per query; load times; serve peaks and their
     kind."""
-    out = {"runs": defaultdict(dict), "status": defaultdict(set), "load": [], "peaks": [], "kind": set(),
-           "publish": "free"}
+    out = {"runs": defaultdict(dict), "status": defaultdict(set), "checks": defaultdict(set), "load": [], "peaks": [],
+           "kind": set(), "publish": "free"}
     for r in rows:
         out["publish"] = r.get("publish") or out["publish"]
         if (r["task"] == "query" and not r["item"].startswith("clients-") and r["item"] != "*"
@@ -76,6 +76,15 @@ def side(rows: list[dict], cache: str) -> dict:
             ms = number(r["ms"])
             if r["status"] == "ok" and ms is not None and str(r["repeat"]) not in ("0", ""):
                 out["runs"][r["run"]].setdefault(r["item"], []).append(ms)
+        elif r["task"] == "reason":
+            # A rule engine's materialisation: one timed item per run, as the engine reports it.
+            out["status"]["reason"].add(r["status"])
+            ms = number(r["ms"])
+            if r["status"] == "ok" and ms is not None:
+                out["runs"][r["run"]].setdefault("reason", []).append(ms)
+        elif r["task"] == "count" and r["item"]:
+            # A derived relation's count against the known one: a check, never timed.
+            out["checks"][r["item"]].add(r["status"])
         elif r["task"] == "load" and r["status"] == "ok" and number(r["ms"]) is not None:
             out["load"].append(number(r["ms"]))
         elif r["task"] == "serve" and number(r["peak_mib"]) is not None:
@@ -137,6 +146,12 @@ def versus(directory: Path, home_turfs: dict[str, str] | None = None) -> list[di
                     problems.append(f"{q} {verdict} ({who})")
                 elif s["status"][q] != {"ok"}:
                     problems.append(f"{q} {'/'.join(sorted(s['status'][q] - {'ok'}))} ({who})")
+            # Answers before time: a rule engine whose counts failed their check isn't timed.
+            failed = sorted(c for c, statuses in s["checks"].items() if statuses != {"ok"})
+            for c in failed:
+                problems.append(f"{c} {'/'.join(sorted(s['checks'][c] - {'ok'}))} ({who})")
+            if failed and "reason" in both:
+                problems.append(f"reason unchecked ({who})")
         bad = {p.split()[0] for p in problems}
         timed = [q for q in both if q not in bad]
         verdict, time = judge(nrese, other, timed)

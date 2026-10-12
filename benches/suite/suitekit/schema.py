@@ -5,15 +5,15 @@
 | date | when the run started (ISO 8601, minutes) |
 | host, runtime | the machine and how the system ran (docker, apptainer, process) |
 | system, version, publish | the system (systems.toml key), its version where it says, and whether its results may be published (free) or need the vendor's permission |
-| workload, tier, regime | the workload (workloads.toml key), its size, and the entailment regime the system ran (none, rdfs, owl-horst, owl2-rl, owl2-ql) |
+| workload, tier, regime | the workload (workloads.toml key), its size, and the entailment regime the system ran (none, rdfs, owl-horst, owl2-rl, owl2-ql), or custom: a named rule program (the tier names it), so that its results compare only with the same program's |
 | run | the repetition (a fresh store each) |
 | task | load, reason, size, restart, count, query, update, serve, conformance (a skipped pair: load, status skipped) |
-| item | the query or test the row is about (task query, conformance) |
+| item | the query or test the row is about (task query, conformance); task count: `count:REL`, the facts of one derived relation (empty: the whole closure) |
 | repeat | the measured repetition of a query within a run; 0 is its first execution on the fresh server (a warm-up run, not in the medians) |
 | status | ok, failed, timeout, wrong (an answer count differs from the expected one), skipped |
 | ms | wall time |
 | peak_mib | peak resident memory of the step |
-| rows | answers (query), statements (load: asserted; reason: inferred; count: all answered) |
+| rows | answers (query), statements (load: asserted; reason: inferred; count: all answered, or a relation's facts), checked before any time counts: a count that differs from the known one is `wrong` |
 | bytes | store size (task size) |
 | note | what else the row needs to be read right |
 | cache | the system's result cache while the queries ran: off, on (the system's default), or - (it has none) |
@@ -31,7 +31,7 @@ from pathlib import Path
 
 TASKS = {"load", "reason", "size", "restart", "count", "query", "update", "serve", "conformance"}
 STATUSES = {"ok", "failed", "timeout", "wrong", "skipped"}
-REGIMES = {"none", "rdfs", "owl-horst", "owl2-rl", "owl2-ql", "-"}
+REGIMES = {"none", "rdfs", "owl-horst", "owl2-rl", "owl2-ql", "custom", "-"}
 
 
 @dataclass

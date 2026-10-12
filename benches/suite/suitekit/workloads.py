@@ -22,7 +22,7 @@ from .runtime import Mount
 class Plan:
     workload: str
     tier: str
-    kind: str = "cycle"  # cycle, kit, writes
+    kind: str = "cycle"  # cycle, kit, writes, driver
     inputs: list[str] = field(default_factory=list)
     mounts: list[Mount] = field(default_factory=list)
     queries: Path | None = None
@@ -42,6 +42,14 @@ class Plan:
     # file to write), `{system}` and `{run}` substituted. It writes to {out} a JSON list of
     # result rows (task, item, repeat, status, ms, rows, note), which the suite emits as its own.
     external: list[str] | None = None
+    # driver: a kit's own driver runs the systems the suite doesn't serve (Soufflé, VLog, GLog,
+    # Nemo's programs, the maintenance kit), once per tier for all the selected systems it can
+    # run (`systems`): its steps in order, from the repository root, with `{results}` (a
+    # directory of the run to write), `{systems}` (comma-separated keys), `{tier}` and `{runs}`
+    # substituted. Every results.csv the steps write below {results} joins the run's own. It is
+    # SPARQL's `external` turned inside out: there a driver runs inside the suite's cycle
+    # against a served endpoint. A timed step needs the quiet slot around `suite.py run`.
+    driver: list[list[str]] | None = None
     # Known answers per query (its file's stem): {"value": the one value} or {"rows": n}, from
     # an independent source (a fast case's generator or a pinned check); the answer recorder's oracle.
     answers: dict[str, dict] = field(default_factory=dict)
@@ -268,8 +276,9 @@ DEFINITIONS = {
 
 def _groups():
     """The groups' workloads, each in a module of its own (benches/cases/README.md)."""
-    from . import sparql_plans
+    from . import reasoning_plans, sparql_plans
     DEFINITIONS.update(sparql_plans.DEFINITIONS)
+    DEFINITIONS.update(reasoning_plans.definitions(DEFINITIONS))
 
 
 _groups()

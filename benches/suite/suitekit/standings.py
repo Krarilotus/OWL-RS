@@ -61,7 +61,8 @@ def render(records: list[dict], systems: dict, root: Path) -> str:
         "reference systems; a wrong, missing or unchecked answer is never timed), then NRESE's time over the "
         "queries both answered right, as NRESE / contender with its 95 % bootstrap interval (below 1: NRESE "
         "faster). **win**: faster beyond max(10 %, the spread) and 2 ms, the interval below 1; **loss**: the "
-        "other way round; **tie**: neither; **no-verdict**: nothing both answered right. Load and memory "
+        "other way round; **tie**: neither; **no-verdict**: nothing both answered right. A rule engine's time is its "
+        "materialisation (`reason`), timed only where its derived relations' counts passed their checks. Load and memory "
         "(serve peak, with its kind) as the same ratio. A case marked ★ is the contender's home turf "
         "([cases/](cases/README.md) `home_turf`).",
         "",
@@ -84,7 +85,8 @@ def render(records: list[dict], systems: dict, root: Path) -> str:
             if found:
                 sections += ["", f"## {system}: reported, not measured by us", "",
                              "As the source reports it, on the source's hardware: not comparable with our "
-                             "measurements as if it were one ([competitors/reported.toml](competitors/reported.toml)).",
+                             "measurements as if it were one ([competitors/reported.toml](competitors/reported.toml), "
+                             "[reasoning/reported](reasoning/reported/README.md)).",
                              "", "| Benchmark | Tier | Metric | Value | Threads | Hardware | Source | Date |",
                              "|---|---|---|---|---|---|---|---|"]
                 for e in found:
