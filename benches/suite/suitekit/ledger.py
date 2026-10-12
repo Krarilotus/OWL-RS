@@ -134,7 +134,7 @@ def from_results(directory: Path, root: Path) -> dict:
     from . import cases
     from .versus import versus
     turfs = {c["name"]: c.get("home_turf", "") for c in cases.load(root / "benches/cases")}
-    entries = [e for run in runs for e in versus(run, turfs)]
+    entries = versus(directory, turfs)
     record["versus"] = [{k: v for k, v in e.items() if k != "publish"} for e in entries if e["publish"] == "free"]
     return record
 

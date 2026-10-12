@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 86: numeric-ceil
+# CEIL function
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (SUM(CEIL(?o)) AS ?sum) WHERE { ?s dblp:numberOfCreators ?o }

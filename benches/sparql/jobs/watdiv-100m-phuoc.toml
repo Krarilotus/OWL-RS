@@ -1,0 +1,20 @@
+# WatDiv's basic testing at 100 M, Jena's and Oxigraph's home turf (benches/sparql/README.md),
+# on phuoc-yu under the rootfs runtime. Three fresh stores per system, shuffled rounds, three
+# measured runs, the result caches off and then on; answers against Jena's, then Oxigraph's.
+id = "sparql-watdiv-100m-phuoc-1"
+group = "sparql"
+host = "phuoc-yu"
+checkout = "suite/sparql"
+commands = [
+  ["bash", "scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--runtime", "rootfs",
+   "--rootfs-dir", "/home/krarilotus/owlrs/rootfs", "--systems", "jena,oxigraph,nrese", "--workloads", "watdiv",
+   "--tier", "watdiv=watdiv-100m", "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build",
+   "--runs", "3", "--query-runs", "3", "--cache", "off,on", "--timeout-s", "7200", "--query-timeout-s", "300",
+   "--answers", "full", "--answers-reference", "jena,oxigraph",
+   "--results", "/home/krarilotus/owlrs/results/sparql-watdiv-100m-phuoc-1"],
+]
+env = { NRESE_QUIET_DRAIN_S = "3600", NRESE_BIN = "/home/krarilotus/owlrs/sparql-bin/1b611e7/nrese-server", HARNESS = "/home/krarilotus/owlrs/sparql-bin/1b611e7/nrese-bench-harness", NRESE_BENCH_SCRATCH = "/home/krarilotus/owlrs/sparql-scratch", DOCKER_MEMORY = "26g", JAVA_HEAP = "20g" }
+needs = []
+window = "quiet"
+priority = 3
+est_min = 300

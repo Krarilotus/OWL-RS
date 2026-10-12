@@ -93,5 +93,21 @@ class Refused(unittest.TestCase):
         self.assertEqual(reported.problems(systems, [{**entry, "hardware": ""}])[0][:22], "reported.toml entry 1:")
 
 
+
+class Batch(unittest.TestCase):
+    """A queue job's chunks, one system each, pooled: the comparator's chunk pairs with NRESE's,
+    and the answers are classified together (the reference answered in another chunk)."""
+
+    def test_chunks_of_a_job_are_one_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            batch = Path(tmp)
+            for system, ms in (("qlever", 40), ("nrese", 10)):
+                (batch / f"r1-{system}").mkdir()
+                run(batch / f"r1-{system}", {system: {"q1": ms, "q2": ms * 2}})
+            found = {e["system"]: e for e in versus.versus(batch, {"c": "qlever"})}
+        self.assertEqual(found["qlever"]["verdict"], "win")
+        self.assertEqual(found["qlever"]["timed"], "2/2")
+
+
 if __name__ == "__main__":
     unittest.main()

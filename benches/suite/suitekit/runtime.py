@@ -13,6 +13,7 @@ a run fails; nothing else is touched.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -175,6 +176,39 @@ def reap(process: subprocess.Popen, timeout: float) -> tuple[int | None, int | N
 
 def larger(a: int | None, b: int | None) -> int | None:
     return b if a is None else a if b is None else max(a, b)
+
+
+def scope_argv(unit: str, memory: str) -> list[str]:
+    """A command's prefix to run it in its own systemd user scope capped as Docker's --memory
+    and --memory-swap cap a container: `memory` in Docker's notation (12g, 900m), which
+    systemd reads with upper-case units only. At the cap the kernel kills the command alone
+    (exit 137, as in a container), not systemd the whole scope, so what runs after it in the
+    scope (fast's wrapper) can still read the peak. The rootfs runtime and fast's native
+    runtime share it."""
+    return ["systemd-run", "--user", "--scope", "-q", f"--unit={unit}", "-p", f"MemoryMax={memory.upper()}",
+            "-p", "MemorySwapMax=0", "-p", "OOMPolicy=continue", "--"]
+
+
+class ScopePeak:
+    """A running scope's memory.peak in MiB: everything the cap counts, the page cache charged
+    to it included, so that a run killed at the cap shows the cap. Its cgroup is asked of
+    systemd until the scope exists, then only the file is read (a sample costs no process)."""
+
+    def __init__(self, unit: str):
+        self.unit, self.peak_file = unit, None
+
+    def __call__(self) -> int | None:
+        if self.peak_file is None:
+            shown = run_quiet(["systemctl", "--user", "show", "-p", "ControlGroup", "--value", f"{self.unit}.scope"],
+                              timeout=10)
+            group = shown.stdout.strip() if shown.returncode == 0 else ""
+            if not group:
+                return None
+            self.peak_file = Path("/sys/fs/cgroup" + group) / "memory.peak"
+        try:
+            return int(self.peak_file.read_text()) // (1024 * 1024)
+        except (OSError, ValueError):
+            return None
 
 
 def tree_rss_mib(pid: int) -> int | None:
@@ -547,6 +581,138 @@ class ApptainerRuntime(ProcessRuntime):
 
     def image_present(self, image):
         return Path(self.sif(image)).exists()
+
+
+def inside(rootfs: Path, target: str) -> str:
+    """A mount target with the image's own symlinks resolved, as Docker resolves them
+    (Virtuoso's /database links to /opt/virtuoso-opensource/database); bubblewrap doesn't
+    follow an absolute link inside the new root."""
+    parts, resolved, hops = [p for p in target.split("/") if p], [], 0
+    while parts:
+        part = parts.pop(0)
+        candidate = rootfs.joinpath(*resolved, part)
+        if candidate.is_symlink() and hops < 40:
+            hops += 1
+            link = os.readlink(candidate)
+            parts = [p for p in link.split("/") if p] + parts
+            if link.startswith("/"):
+                resolved = []
+            continue
+        if part == "..":
+            resolved = resolved[:-1]
+        elif part != ".":
+            resolved.append(part)
+    return "/" + "/".join(resolved)
+
+
+class RootfsRuntime(ProcessRuntime):
+    """The systems' Docker images unpacked into directories and run with bubblewrap, for a
+    measure host without Docker (phuoc-yu): every system from the same image as under Docker,
+    on the host's network and kernel, under a systemd scope with the container's memory cap.
+    `<rootfs_dir>/<image with / and : as _>/` holds the image's filesystem in `rootfs/` and its
+    `docker image inspect` in `config.json` (benches/sparql/images.sh export). The image is
+    read-only below a throwaway overlay; the mounts are bound as Docker binds them; the user is
+    root inside a user namespace (files written are the caller's outside)."""
+
+    kind = "rootfs"
+
+    def __init__(self, scratch, port, rootfs_dir: Path, echo=print):
+        super().__init__(scratch, port, echo)
+        self.rootfs_dir = rootfs_dir
+        self.units: dict[str, str] = {}  # spec name -> its scope, while it runs
+
+    def image_dir(self, image: str) -> Path:
+        return self.rootfs_dir / image.replace("/", "_").replace(":", "_")
+
+    def config(self, image: str) -> dict:
+        data = json.loads((self.image_dir(image) / "config.json").read_text(encoding="utf-8"))
+        entry = data[0] if isinstance(data, list) else data
+        return entry.get("Config", entry)
+
+    def prefix(self, spec: Spec, command: list[str]) -> list[str]:
+        config = self.config(spec.image)
+        if spec.entrypoint:
+            command = list(config.get("Entrypoint") or []) + (command or list(config.get("Cmd") or []))
+        args = []
+        if spec.memory:
+            unit = f"nrese-{spec.name}-{os.getpid()}-{int(time.monotonic() * 1000)}"
+            self.units[spec.name] = unit
+            args += scope_argv(unit, spec.memory)
+        args += ["bwrap", "--overlay-src", str(self.image_dir(spec.image) / "rootfs"), "--tmp-overlay", "/",
+                 "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--unshare-user", "--uid", "0", "--gid", "0",
+                 "--die-with-parent", "--clearenv"]
+        for pair in config.get("Env") or []:
+            key, _, value = pair.partition("=")
+            args += ["--setenv", key, value]
+        for key, value in spec.env.items():
+            args += ["--setenv", key, value]
+        rootfs = self.image_dir(spec.image) / "rootfs"
+        for m in spec.mounts:
+            if not m.readonly:
+                # Docker creates a missing bind source (a store the system makes on first start).
+                Path(m.source).mkdir(parents=True, exist_ok=True)
+            args += ["--ro-bind" if m.readonly else "--bind", m.source, inside(rootfs, m.target)]
+        args += ["--chdir", spec.workdir or config.get("WorkingDir") or "/"]
+        return args + ["--", *command]
+
+    def argv(self, spec):
+        if spec.image is None:
+            return ProcessRuntime.argv(self, spec)
+        return self.prefix(spec, list(spec.command))
+
+    def environment(self, spec):
+        return dict(os.environ) if spec.image is not None else ProcessRuntime.environment(self, spec)
+
+    def cwd(self, spec):
+        return None if spec.image is not None else ProcessRuntime.cwd(self, spec)
+
+    def peak(self, spec) -> "Sampler | None":
+        """The scope's memory.peak, sampled while it lives (the scope goes when its command ends)."""
+        unit = self.units.get(spec.name)
+        return Sampler(ScopePeak(unit)) if unit else None
+
+    def run(self, spec, log, timeout_s):
+        if spec.image is None or not spec.memory:
+            return ProcessRuntime.run(self, spec, log, timeout_s)
+        started = time.monotonic()
+        process = self.popen(self.argv(spec), spec, log)
+        scope = self.peak(spec)
+        rc, _ = reap(process, timeout_s)
+        timed_out = rc is None
+        if timed_out:
+            self.kill(process)
+            if reap(process, 30)[0] is None:
+                self.kill(process, signal.SIGKILL)
+                reap(process, 30)
+            rc = 124
+        # The scope's peak, not wait4's: the command runs below systemd-run, not as our child.
+        peak = scope.stop() if scope else None
+        self.units.pop(spec.name, None)
+        return Measured((time.monotonic() - started) * 1000, peak, rc, timed_out)
+
+    def start(self, spec, log):
+        server = ProcessRuntime.start(self, spec, log)
+        scope = self.peak(spec) if spec.image is not None else None
+        if scope:
+            server.sampler.stop()
+            server.sampler = scope
+        return server
+
+    def stop(self, server):
+        peak = ProcessRuntime.stop(self, server)
+        self.units.pop(server.spec.name, None)
+        return peak
+
+    def exec(self, server, command, timeout_s=3600):
+        spec = server.spec
+        if spec.image is None:
+            return ProcessRuntime.exec(self, server, command, timeout_s)
+        plain = Spec(spec.name, spec.image, [], spec.env, spec.mounts, workdir=spec.workdir)
+        out = subprocess.run(self.prefix(plain, command), capture_output=True, text=True, timeout=timeout_s)
+        return out.returncode, out.stdout + out.stderr
+
+    def image_present(self, image):
+        return (self.image_dir(image) / "rootfs").is_dir()
 
 
 class DryRuntime(Runtime):
