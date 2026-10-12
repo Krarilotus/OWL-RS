@@ -266,10 +266,6 @@ class FastComparison(unittest.TestCase):
         self.assertIn("within noise", text)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class FastVerdicts(unittest.TestCase):
     def test_every_run_has_a_verdict_and_names_whose_failure(self):
         case = {"name": "c", "known": "the budget bounds the quads"}
@@ -285,3 +281,27 @@ class FastVerdicts(unittest.TestCase):
         self.assertEqual((missing["verdict"], missing["whose"]), ("incomplete", "harness"))
         self.assertEqual(of("failed", notes=["exit 101"])["whose"], "unknown")
         self.assertNotIn("issue", of("wrong", "ok"))
+
+
+class FastNative(unittest.TestCase):
+    DIRS = {"/target": Path("/bin/t"), "/fast": Path("/g"), "/data": Path("/assets/data"), "/src": Path("/repo"),
+            "/out": Path("/repo/tmp/fast"), "/inputs": Path("/assets/fast"), "/ore": Path("/assets/ore")}
+
+    def test_container_paths_map_to_the_hosts_directories_and_nothing_else(self):
+        self.assertEqual(fast.native("/target/release/examples/perf_lab --load /data/lubm-10.nt --json /out/c.json",
+                                     self.DIRS),
+                         "/bin/t/release/examples/perf_lab --load /assets/data/lubm-10.nt --json /repo/tmp/fast/c.json")
+        script = "rm -rf /fast/scratch/c && mkdir -p /fast/scratch/c && cp '/inputs/x.nt' /fast/"
+        self.assertEqual(fast.native(script, self.DIRS),
+                         "rm -rf /g/scratch/c && mkdir -p /g/scratch/c && cp '/assets/fast/x.nt' /g/")
+        # Not a container path: inside another path, a URL, or a longer name.
+        for text in ("/home/u/data/x", "http://example.org/data/x", "/database", "a/fast/b"):
+            self.assertEqual(fast.native(text, self.DIRS), text)
+
+    def test_the_scopes_peak_is_read_from_the_wrappers_line(self):
+        self.assertEqual(fast.scope_peak_mib("warning\nfast-scope-peak 2147483648\n"), 2048)
+        self.assertIsNone(fast.scope_peak_mib("Killed\n"))
+
+
+if __name__ == "__main__":
+    unittest.main()

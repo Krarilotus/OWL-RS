@@ -91,7 +91,51 @@ def select(cases: list[dict], args) -> list[dict]:
     return cases
 
 
-# --- docker ----------------------------------------------------------------------------------
+# --- where cases run -------------------------------------------------------------------------
+
+# docker: each case in a container of the pinned Rust image, its files in the volumes above.
+# native: each case a host process in a capped user scope (systemd-run), on a host without
+# Docker (benches/hosts.toml): the binaries a build host made (NRESE_FAST_BIN, laid out as a
+# target directory), the datasets from the verified inputs (read-only), generated data in a
+# directory of the host's (NRESE_FAST_DATA), peak memory from the scope's cgroup.
+RUNTIME = os.environ.get("NRESE_FAST_RUNTIME") or ("native" if hosts.lacking(["docker"]) else "docker")
+FAST_DATA = Path(os.environ.get("NRESE_FAST_DATA") or Path.home() / "nrese-bench" / "fast-data")
+# A container path at the start of a word: the native runtime's directory for it.
+CONTAINER_PATH = re.compile(r"(?<![\w./:-])(/target|/fast|/data|/src|/out|/inputs|/ore)(?=/|\s|'|\"|;|$)")
+# The scope's peak, printed by the native runtime's wrapper after the command.
+SCOPE_PEAK = re.compile(r"^fast-scope-peak (\d+)$", re.M)
+
+
+def native_dirs() -> dict[str, Path]:
+    """The native runtime's directory for each container path."""
+    binaries = os.environ.get("NRESE_FAST_BIN")
+    if not binaries:
+        raise RuntimeError("missing input: the native runtime needs NRESE_FAST_BIN, a build host's target "
+                           "directory (release/examples/perf_lab, release/nrese-server, ...)")
+    data = hosts.input_path("general")
+    return {"/target": Path(binaries), "/fast": FAST_DATA, "/data": data or FAST_DATA / "no-datasets",
+            "/src": ROOT, "/out": SCRATCH, "/inputs": FAST_INPUTS or FAST_DATA / "no-inputs",
+            "/ore": ORE_DIR or FAST_DATA / "no-ore"}
+
+
+def native(text: str, dirs: dict[str, Path] | None = None) -> str:
+    """`text` with its container paths as the native runtime's directories."""
+    dirs = dirs or native_dirs()
+    return CONTAINER_PATH.sub(lambda m: dirs[m.group(1)].as_posix(), text)
+
+
+def files(script: str) -> subprocess.CompletedProcess:
+    """A shell script over the fast data (/fast), the datasets (/data, read-only) and the
+    verified inputs (/inputs, read-only): in an Alpine container, or natively."""
+    if RUNTIME == "native":
+        FAST_DATA.mkdir(parents=True, exist_ok=True)
+        return subprocess.run(["sh", "-c", native(script)], capture_output=True, text=True, encoding="utf-8",
+                              errors="replace")
+    mounts = ["-v", f"{DATA_VOLUME}:/fast", "-v", f"{BENCH_VOLUME}:/data:ro"]
+    if FAST_INPUTS is not None:
+        mounts += ["-v", f"{host_path(FAST_INPUTS)}:/inputs:ro"]
+    return docker(["run", "--rm", *mounts, "alpine", "sh", "-c", script])
+
 
 def docker(args: list[str], timeout: float | None = None, capture: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], capture_output=capture, text=True, timeout=timeout, env=ENV,
@@ -135,11 +179,13 @@ def quiet_slot(what: str):
 
 def container(name: str, cap_gb: float, command: list[str], env: dict | None = None,
               timeout: float = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
-    """Runs `command` in the Rust image under a memory cap without swap; (exit code,
-    stdout, stderr, wall seconds). Exit 137: killed at the cap."""
+    """Runs `command` under a memory cap without swap, in the Rust image or natively; (exit
+    code, stdout, stderr, wall seconds). Exit 137: killed at the cap."""
     cap_gb = capped(cap_gb)
     SCRATCH.mkdir(parents=True, exist_ok=True)
-    argv = ["run", "--rm", "--name", name, f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g", *cpu_args(),
+    if RUNTIME == "native":
+        return process(name, cap_gb, command, env, timeout)
+    argv =["run", "--rm", "--name", name, f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g", *cpu_args(),
             "-v", f"{TARGET_VOLUME}:/target:ro", "-v", f"{DATA_VOLUME}:/fast",
             "-v", f"{BENCH_VOLUME}:/data:ro", "-v", f"{host_path(ROOT)}:/src:ro",
             "-v", f"{host_path(SCRATCH)}:/out"]
@@ -155,6 +201,48 @@ def container(name: str, cap_gb: float, command: list[str], env: dict | None = N
     return done.returncode, done.stdout, done.stderr, time.monotonic() - started
 
 
+def process(name: str, cap_gb: float, command: list[str], env: dict | None = None,
+            timeout: float = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
+    """`container` natively: the command, its container paths mapped (native_dirs), in a user
+    scope capped at `cap_gb` without swap (as Docker's --memory and --memory-swap). A wrapper
+    shell in the scope prints the scope's memory.peak after the command (`fast-scope-peak`
+    on stderr); a kill at the cap may take the wrapper too, and then there is no peak."""
+    dirs = native_dirs()
+    FAST_DATA.mkdir(parents=True, exist_ok=True)
+    unit = f"{name}-{os.getpid()}-{int(time.monotonic() * 1000)}"
+    wrapper = ('g=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); "$@"; rc=$?; '
+               'echo "fast-scope-peak $(cat "$g/memory.peak" 2>/dev/null)" >&2; exit $rc')
+    argv = ["systemd-run", "--user", "--scope", "-q", f"--unit={unit}", "-p", f"MemoryMax={int(cap_gb * 1024)}M",
+            "-p", "MemorySwapMax=0", "--", "sh", "-c", wrapper, "sh", *(native(c, dirs) for c in command)]
+    started = time.monotonic()
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
+                              errors="replace", env={**ENV, **{k: str(v) for k, v in (env or {}).items()}})
+    except subprocess.TimeoutExpired:
+        subprocess.run(["systemctl", "--user", "kill", "--signal=KILL", f"{unit}.scope"], capture_output=True)
+        return 124, "", f"timed out after {timeout} s", time.monotonic() - started
+    return done.returncode, done.stdout, done.stderr, time.monotonic() - started
+
+
+def scope_peak_mib(stderr: str) -> int | None:
+    """The native runtime's scope peak, in MiB, if the wrapper printed it."""
+    found = SCOPE_PEAK.findall(stderr or "")
+    return int(found[-1]) // 1048576 if found else None
+
+
+def binaries() -> dict:
+    """The native runtime's binaries: their directory, the source revision a build host
+    states (NRESE_FAST_REVISION), and each one's SHA-256."""
+    target = native_dirs()["/target"]
+    out = {"dir": target.as_posix(), "revision": os.environ.get("NRESE_FAST_REVISION", ""), "sha256": {}}
+    for relative in ("release/examples/perf_lab", "release/examples/tableau_consistency",
+                     "release/examples/context_classify", "release/examples/classify", "release/nrese-server"):
+        path = target / relative
+        if path.is_file():
+            out["sha256"][relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return out
+
+
 # --- build -----------------------------------------------------------------------------------
 
 BUILD = [
@@ -166,7 +254,10 @@ BUILD = [
 
 
 def build(args) -> int:
-    jobs = os.environ.get("CARGO_BUILD_JOBS", "4")
+    if RUNTIME == "native":
+        sys.exit("the native runtime builds nothing: a build host's binaries come in NRESE_FAST_BIN "
+                 "(scripts/cargo-guarded.sh build --release --locked with the packages of fast.py BUILD)")
+    jobs =os.environ.get("CARGO_BUILD_JOBS", "4")
     cap = os.environ.get("NRESE_MEMORY_CAP_GB", "8")
     for volume in (TARGET_VOLUME, CARGO_VOLUME):
         docker(["volume", "create", volume])
@@ -203,21 +294,24 @@ FAST_INPUTS = hosts.input_path("fast")
 
 
 def seed_from_inputs(target: str) -> bool:
-    """Copies `/fast/<relative>` from the verified inputs into the data volume when the volume
-    lacks it and the inputs have it; whether the volume has it now."""
-    if docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "test", "-s", target]).returncode == 0:
+    """Copies `/fast/<relative>` and its sidecars (`<relative>.*`: the generator's answers,
+    commit files) from the verified inputs into the fast data when it lacks the file and the
+    inputs have it; whether the fast data has it now."""
+    if files(f"test -s {target}").returncode == 0:
         return True
     relative = target.removeprefix("/fast/")
     if FAST_INPUTS is None or not (FAST_INPUTS / relative).is_file():
         return False
     print(f"  copying {relative} from {FAST_INPUTS}", flush=True)
-    docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "-v", f"{host_path(FAST_INPUTS)}:/inputs:ro", "alpine",
-            "sh", "-c", f"mkdir -p {Path(target).parent.as_posix()} && cp /inputs/{relative} {target}"])
-    return docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "test", "-s", target]).returncode == 0
+    parent = Path(target).parent.as_posix()
+    files(f"mkdir -p {parent} && for f in /inputs/{relative} /inputs/{relative}.*; do "
+          f"[ -e \"$f\" ] && cp -r \"$f\" {parent}/; done; true")
+    return files(f"test -s {target}").returncode == 0
 
 
 def ensure_data(spec: str) -> dict:
-    """Generates `spec` once; its `expect` (the generator's own answers)."""
+    """Generates `spec` once (or takes it from the verified inputs); its `expect` (the
+    generator's own answers)."""
     if spec.startswith("volume:") or spec == "none":
         return {}
     if spec.startswith("ore:"):
@@ -226,11 +320,11 @@ def ensure_data(spec: str) -> dict:
     if spec.startswith("concat:"):
         target = data_file(spec)
         parts = " ".join(data_file(part) for part in spec[len("concat:"):].split("+"))
-        docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "-v", f"{BENCH_VOLUME}:/data:ro", "alpine", "sh", "-c",
-                f"test -s {target} || cat {parts} > {target}"])
+        files(f"test -s {target} || cat {parts} > {target}")
         return {}
     path = data_file(spec)
-    found = docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "cat", f"{path}.expect.json"])
+    seed_from_inputs(path)
+    found = files(f"cat {path}.expect.json")
     if found.returncode == 0 and found.stdout.strip():
         return json.loads(found.stdout)["expect"]
     kind, *params = spec.split()
@@ -258,16 +352,17 @@ def ensure_ore(name: str):
     if ORE_DIR is None or not (ORE_DIR / f"{name}.owl").exists():
         raise RuntimeError(f"missing input: {name}.owl, ORE 2015 corpus at {ORE_DIR or 'no path'} "
                            "(benches/hosts.toml inputs.ore, or NRESE_ORE_DIR)")
-    source = ORE_DIR / f"{name}.owl"
+    if RUNTIME == "native":
+        raise RuntimeError(f"missing input: ore/{name}.nt (the native runtime converts no ontology: the DL kit's "
+                           "converter runs in Docker; the verified inputs, hosts.toml inputs.fast, hold the converted ones)")
     print(f"  converting {name} to N-Triples", flush=True)
     script = (f"mkdir -p /fast/ore && cp /ore/{name}.owl /fast/ore/{name}.owl && "
               f"printf '{name}\\tconvert\\tntriples\\t/fast/ore/{name}.owl\\n' > /fast/ore/{name}.manifest.tsv")
     docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "-v", f"{host_path(ORE_DIR)}:/ore:ro", "alpine", "sh", "-c", script])
     docker(["run", "--rm", "--memory=10g", "-v", f"{DATA_VOLUME}:/fast", dl_image(), "batch",
             f"/fast/ore/{name}.manifest.tsv", f"/fast/ore/{name}.results.tsv", "/fast/ore", "600"], timeout=900)
-    docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "sh", "-c",
-            f"rm -f /fast/ore/{name}.owl /fast/ore/{name}.manifest.tsv /fast/ore/{name}.results.tsv"])
-    if docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "test", "-s", target]).returncode != 0:
+    files(f"rm -f /fast/ore/{name}.owl /fast/ore/{name}.manifest.tsv /fast/ore/{name}.results.tsv")
+    if files(f"test -s {target}").returncode != 0:
         raise RuntimeError(f"converting {name} failed")
 
 
@@ -575,6 +670,9 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
                 record["status"] = "failed"
                 record["notes"].append(f"missing input: reference taxonomy {case['reference']} "
                                        "(fast.py compete writes it; benches/hosts.toml inputs.fast)")
+    # Natively, the case's scope is its container: its peak is the cgroup's.
+    if not result.get("cgroup_peak_mib") and (peak := scope_peak_mib(err)):
+        result["cgroup_peak_mib"] = peak
     record["metric"] = metric_value(case, result)
     record["samples"] = samples(case, result)
     record["counters"] = counters(case, result)
@@ -582,6 +680,8 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         record["throughput"] = levels
     record["phase_peaks"] = {k: v.get("peak_mib") for k, v in (result.get("phases") or {}).items()}
     record["peak_mib"] = result.get("cgroup_peak_mib") or result.get("peak_mib")
+    record["memory_kind"] = ("cgroup" if result.get("cgroup_peak_mib")
+                             else "lifetime" if result.get("peak_mib") else "unknown")
     if case.get("queries", "").startswith("@vectors") and record["status"] == "ok":
         result["recall"] = vector_recall(case, expect)
     record["checks"] = [check(path, want, result, expect, alt_expect) for path, want in case.get("check", {}).items()]
@@ -638,7 +738,7 @@ def same_taxonomy(case: dict) -> str | None:
     into the fast volume (`fast.py compete` keeps ELK's); None if it isn't there."""
     sys.path.insert(0, str(ROOT / "benches" / "reasoning" / "dl"))
     import canonical
-    found = docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "cat", case["reference"]])
+    found = files(f"cat {case['reference']}")
     closure = SCRATCH / f"{case['name']}.tsv"
     if found.returncode != 0 or not closure.exists():
         return None
@@ -809,8 +909,14 @@ def vector_recall(case: dict, expect: dict) -> float:
 # --- run -------------------------------------------------------------------------------------
 
 def run(args) -> int:
-    if lacking := hosts.lacking(["docker"]):
-        sys.exit(f"this host lacks {', '.join(lacking)} (benches/hosts.toml): the fast suite runs every case in Docker")
+    if RUNTIME == "native":
+        try:
+            native_dirs()
+        except RuntimeError as error:
+            sys.exit(str(error))
+    elif lacking := hosts.lacking(["docker"]):
+        sys.exit(f"this host lacks {', '.join(lacking)} (benches/hosts.toml): NRESE_FAST_RUNTIME=native runs "
+                 "the cases as host processes")
     cases = select(load_cases(), args)
     label = args.label or (manifest.git(ROOT).get("commit") or "nrese")[:8]
     started = datetime.datetime.now()
@@ -819,8 +925,13 @@ def run(args) -> int:
     BASELINES.mkdir(parents=True, exist_ok=True)
     out = (Path(args.out) if args.out else REPORTS / f"{started:%Y-%m-%d}-{label}.json").resolve()
     report = {"label": label, "started": started.isoformat(timespec="seconds"),
-              "git": manifest.git(ROOT), "machine": manifest.machine("docker"), "image": rust_image(),
+              "git": manifest.git(ROOT), "machine": manifest.machine(RUNTIME), "runtime": RUNTIME,
               "reps": args.reps, "records": []}
+    if RUNTIME == "native":
+        # What the binaries are: they come from a build host, not from this checkout.
+        report["binaries"] = binaries()
+    else:
+        report["image"] = rust_image()
     order = list(cases)
     for rep in range(1, args.reps + 1):
         # Interleaved, each round in an order rotated by one.
@@ -973,6 +1084,13 @@ def clean(args) -> int:
     `--data`, and never while a container uses it: the volume is shared by every worktree and
     campaign on the host, and holds copies of the verified inputs besides the generated data."""
     import shutil
+    if RUNTIME == "native":
+        shutil.rmtree(SCRATCH, ignore_errors=True)
+        print(f"removed {SCRATCH}")
+        if args.data:
+            shutil.rmtree(FAST_DATA, ignore_errors=True)
+            print(f"removed the generated data {FAST_DATA}")
+        return 0
     stale = docker(["ps", "-a", "--filter", "status=exited", "--filter", f"name=-{ROOT.name}$",
                     "--format", "{{.Names}}"]).stdout.split()
     for name in stale:
