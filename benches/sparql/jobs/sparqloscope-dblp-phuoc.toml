@@ -1,7 +1,7 @@
 # Sparqloscope on DBLP's knowledge graph, QLever's home turf (benches/sparql/README.md), on
 # phuoc-yu under the rootfs runtime (owner, 12 Oct 2026), every system from its image.
 #
-# 1. The paper's protocol, to reproduce QLever's published figure here first: every query
+# 1. (sparqloscope-reproduce-phuoc.toml) The paper's protocol, to reproduce QLever's published figure first: every query
 #    once in the benchmark's order on a freshly started server with its cache on (the
 #    suite's first executions, `repeat` 0), 180 s per query; NRESE likewise.
 # 2. The suite's protocol: three fresh stores per system, shuffled rounds, three measured
@@ -14,12 +14,6 @@ group = "sparql"
 host = "phuoc-yu"
 checkout = "suite/sparql"
 commands = [
-  ["bash", "scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--runtime", "rootfs",
-   "--rootfs-dir", "/home/krarilotus/owlrs/rootfs", "--systems", "qlever,nrese", "--workloads", "sparqloscope",
-   "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build", "--runs", "1", "--query-runs", "1",
-   "--cache", "on", "--order", "fixed", "--timeout-s", "7200", "--query-timeout-s", "180",
-   "--answers", "full", "--answers-reference", "jena,qlever",
-   "--results", "/home/krarilotus/owlrs/results/sparql-sparqloscope-dblp-phuoc-1/paper-protocol"],
   ["bash", "scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--runtime", "rootfs",
    "--rootfs-dir", "/home/krarilotus/owlrs/rootfs", "--systems", "qlever,nrese", "--workloads", "sparqloscope",
    "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build", "--runs", "3", "--query-runs", "3",
