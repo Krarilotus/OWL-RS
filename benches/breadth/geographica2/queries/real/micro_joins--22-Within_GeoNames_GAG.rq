@@ -1,0 +1,12 @@
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+
+SELECT ?s1 ?s2 
+WHERE { 
+	GRAPH <http://geographica.di.uoa.gr/dataset/geonames> {
+		?s1 <http://www.geonames.org/ontology#asWKT> ?o1
+	} 
+	GRAPH <http://geographica.di.uoa.gr/dataset/gag> {
+		?s2 <http://geo.linkedopendata.gr/gag/ontology/asWKT> ?o2
+	} 
+  	FILTER(geof:sfWithin(?o1, ?o2)).  
+}
