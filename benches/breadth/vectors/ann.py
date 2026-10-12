@@ -7,7 +7,7 @@ in its own container as upstream runs them (benches/breadth/README.md, "Vector s
     ann.py images [--algorithms ...]   upstream's images (base first), versions pinned below
     ann.py run --dataset sift-128-euclidean [--algorithms nrese,qdrant,pgvector,hnswlib]
                [--runs 5] [--batch]
-    ann.py export [--label NAME]       upstream's metrics to RESULTS/<label>/: its CSV, the
+    ann.py export [--results DIR]      upstream's metrics to DIR (default RESULTS/ann-benchmarks): its CSV, the
                                        suite's rows, and QPS at recall 0.90/0.95/0.99 per system
 
 Upstream's protocol stands: k = 10, each container on one CPU (batch mode: all), every
@@ -44,6 +44,10 @@ def checkout() -> Path:
     target = src / "ann_benchmarks/algorithms/nrese"
     shutil.rmtree(target, ignore_errors=True)
     shutil.copytree(HERE / "ann-benchmarks/nrese", target)
+    # The run groups compared (configs/: M 16 for every system, NRESE's fixed value), over
+    # upstream's own sweeps of the build parameters.
+    for config in (HERE / "ann-benchmarks/configs").glob("*.yml"):
+        shutil.copy(config, src / "ann_benchmarks/algorithms" / config.stem / "config.yml")
     dockerfile = src / "ann_benchmarks/algorithms/pgvector/Dockerfile"
     text = dockerfile.read_text(encoding="utf-8")
     pinned = text.replace("git clone https://github.com/pgvector/pgvector /tmp/pgvector",
@@ -111,7 +115,7 @@ def frontier(points: list[tuple[float, float]], target: float) -> float | None:
 
 def export(args) -> int:
     src = checkout()
-    out = kit.RESULTS / args.label
+    out = Path(args.results) if args.results else kit.RESULTS / args.label
     out.mkdir(parents=True, exist_ok=True)
     table = out / "ann-benchmarks.csv"
     kit.run([python(), "data_export.py", "--output", str(table)], cwd=src)
@@ -125,7 +129,7 @@ def export(args) -> int:
         by.setdefault((r["dataset"], r["algorithm"]), []).append((recall, qps))
         writer.write(kit.Result(
             date=kit.manifest.now()[:16], host=host, runtime="docker", system=SYSTEM.get(r["algorithm"], r["algorithm"]),
-            version=r.get("library", "-"), publish="free", workload="vector-ann", tier=r["dataset"], regime="none",
+            version=r.get("library", "-"), publish="free", workload="ann-benchmarks", tier=r["dataset"], regime="none",
             run=1, task="query", item=r["parameters"], repeat=1, status="ok", ms=1000.0 / qps if qps else "",
             rows=10, note=f"recall@10 {recall:.4f}; {qps:.1f} QPS; build {float(r.get('build', 0)):.1f} s; "
                           f"index {float(r.get('indexsize', 0)) / 1024:.0f} MiB; commit {git.get('commit', '')[:10]}"))
@@ -150,7 +154,8 @@ def main(argv: list[str]) -> int:
     r.add_argument("--batch", action="store_true")
     r.add_argument("--force", action="store_true")
     e = sub.add_parser("export")
-    e.add_argument("--label", default="vector-ann")
+    e.add_argument("--label", default="ann-benchmarks")
+    e.add_argument("--results", help="the results directory (default RESULTS/<label>)")
     args = p.parse_args(argv)
     return {"setup": setup, "images": images, "run": run, "export": export}[args.command](args)
 
