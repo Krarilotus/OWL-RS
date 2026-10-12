@@ -1,0 +1,28 @@
+# A run record (benches/runs/README.md). Outcomes and identities; samples stay under results.
+id = "2026-10-12-v2-union"
+level = "focused"
+kit = "fast, and depth_tests' probe (nrese-sparql) for planning"
+purpose = "v2/union against takeover/pr23: no time or memory regression on the fast suite's SPARQL, planning and cache cases from the n-ary algebra (ADR-0012) and from the planning fixes; and the time to plan large basic graph patterns before and after"
+started = "2026-10-12"
+host = "office-pc"
+build_host = "office-pc"
+scenario = "native"
+baseline = { commit = "ee854a085a3b59da1754b909a96048f6340d6439", dirty = false, binary_sha256 = "4a34f670efb4ac6118daeed9d4e20d0208119ffb76fb27f3c69e1cefdb6e024f", note = "takeover/pr23; perf_lab, fast.py's docker build" }
+candidate = { commit = "1d0884e8cf75f71ac802d134bd84b9b146ce750a", dirty = false, binary_sha256 = "8c594a6d69159c862a7514c5af4252228f34f7d0456397b5882132bcfb01c9b5", note = "the n-ary algebra (d939ad8) merged with takeover/pr23" }
+final = { commit = "1d0884e8cf75f71ac802d134bd84b9b146ce750a", dirty = true, snapshot = "18fd44f82a304136310b7cdb5fc9e628cd080326", patch_sha256 = "9b7e726609490b2bef304f98dcfb9292e89b30b8ee0bd78098da214db40269f3", binary_sha256 = "dfa64ed4d21d2e580443067e5cf62efc4bc054a8ea51ec7e35fbf0741c0dbbad", note = "the planning fixes, committed next; the shares change after it (snapshot 76bc3afe, patch b5b7925c0f4d9735620fc68ba9f45862fd3bbde12c06d7d679c168ef831aeb8b) leaves every estimate equal and was timed by the probe only" }
+protocol = { suite = "fast.py run --cases C --reps 1 per pass; per case A-B-B-A, two rounds: 4 repetitions a side; passes merged per side for fast.py compare", cases = ["q-star", "q-chain", "q-cycles", "q-snowflake", "q-paths", "q-sideways", "q-large-result", "q-topk", "op-group", "op-aggregates", "op-optional", "op-negation", "op-strings", "op-dates", "index-join-keys", "parse-large", "plan-estimates", "cache-replay", "rdf12-annotations", "shacl-lubm"], planning = "release nrese-sparql test binary, depth_tests::stack_probe (parse, plan, EXPLAIN and evaluation with the result cache, 256 MiB stack) per shape, one process per run; old = 1d0884e with the new depth_tests.rs (public API only)", slot = "every build and timing in office-pc's quiet slot, shared with the B3a agent; the PC freed by its owner until 14:46" }
+results = { root = "office-pc:/home/krarilotus/owlrs/results", suite = "union-ab-20261012 (candidate), union-ab2-20261012 (final): runs/ per pass, union-ab-*.json merged, compare.txt", planning = "plan-ab-20261012: log, timings t-*, u-*, v-*" }
+publishable = "all"
+cases = [
+  { case = "the 20 fast cases, candidate", verdict = "same", note = "every time and peak within the thresholds; parse-large's 500 UNIONs 1,500 -> 1,002 plan steps (fewer); plan-estimates' within-2x share 0.667 -> 0.687 only because two consecutive BIND estimates are one n-ary Extend now (bind operators 6 -> 4, 69 -> 67 estimates, every other operator kind equal)" },
+  { case = "1,000-step path (planning)", verdict = "faster", note = "old 6.99, 7.00, 7.18, 7.16 s; final 0.55, 0.56 s (A-B-B-A); with the shares 0.54-0.58 s; before the effort bound 0.66, 0.68 s" },
+  { case = "1,000-pattern star (planning)", verdict = "faster", note = "old 457.2 s (one run); before the effort bound 2.88, 2.88 s; final 0.58-0.59 s (4 runs); with the shares 0.59-0.61 s" },
+  { case = "250 triple-term patterns (planning)", verdict = "faster", note = "old 9.52 s (one run); final 0.29 s (4 runs); with the shares 0.26-0.30 s" },
+  { case = "1,000 single-variable checks on one subject (planning)", verdict = "faster", note = "old stopped after 112.5 s (to free the shared slot); with the shares 0.35-0.36 s (3 runs)" },
+]
+findings = [
+  "The old star's 457 s: the orderer read every star predicate in every candidate set, twice per candidate, from 16 starts of n^2/2 candidates; the path's 7 s: the result cache keyed each prefix of the join order by spelling it out, O(n^3) per pattern with linear variable lookups.",
+  "Test profile, the guard (depth_tests::large_patterns_plan_in_time_or_stop_at_the_deadline): path 28 s -> 0.28 s, star 4.9 s (effort unbounded) -> 0.48 s, 250 triple terms 114 s -> 0.50 s; all four shapes together 2.15 s against a 5 s deadline.",
+  "Old runs of the star and the checks were not repeated: at these ratios one run decides, and each held the shared quiet slot for minutes.",
+  "The suite A/B of the final arm (union-ab2-20261012) had round 1 of 2 done when this was written (80 of 160 passes, waiting on the shared slot); its verdicts follow in this record.",
+]

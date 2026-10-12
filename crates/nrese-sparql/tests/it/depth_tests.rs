@@ -6,15 +6,19 @@
 //! answer; what nests (OPTIONAL, MINUS, LATERAL and a BIND after a triple each wrapping the
 //! group before them, groups, subqueries, EXISTS, GRAPH, arithmetic) answers up to the
 //! nesting limit and is refused past it.
+//!
+//! Large basic graph patterns plan within a bound or stop at their deadline: planning
+//! observes the query's cancellation as evaluating does.
 
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf::{GraphName, NamedNode, Quad};
 use nrese_sparql::{
-    QueryOptions, QueryResults, ResultCache, UpdateOptions, apply_update, evaluate_query,
-    explain_query, plan_query,
+    CancellationToken, QueryEvaluationError, QueryOptions, QueryResults, Resources, ResultCache,
+    UpdateOptions, apply_update, evaluate_query, explain_query, plan_query,
 };
 use nrese_sparql_syntax::SparqlParser;
 
@@ -141,6 +145,21 @@ fn query(shape: &str, n: usize) -> String {
             "SELECT * WHERE {{ ?s ?q ?o FILTER({}?o{}) }}",
             "(".repeat(n),
             ")".repeat(n)
+        ),
+        // A path spelled out as a chain of triple patterns through fresh blank nodes.
+        "chain" => format!("SELECT * WHERE {{ ?s {} ?o }}", joined(&p, "/")),
+        "star" => format!(
+            "SELECT * WHERE {{ {} }}",
+            repeat(&|i| format!("?s {} ?o{i} . ", p(i)))
+        ),
+        // Patterns with one variable each, on the same one: their common values counted.
+        "checks" => format!(
+            "SELECT * WHERE {{ {} }}",
+            repeat(&|i| format!("?s {} <http://e/s{}> . ", p(i), i % 5))
+        ),
+        "triple-terms" => format!(
+            "SELECT * WHERE {{ ?s ?q ?o . {} }}",
+            repeat(&|i| format!("?s {} <<( ?a{i} {} ?o )>> . ", p(i), p(i + 1)))
         ),
         "sum" => format!(
             "SELECT * WHERE {{ ?s ?q ?o BIND(1{} AS ?sum) }}",
@@ -276,6 +295,75 @@ fn an_update_of_a_long_union_applies() {
         ),
         Ok(5)
     );
+}
+
+/// The deadline the planning guard gives a query, and the time past it a stop may take.
+const DEADLINE: Duration = Duration::from_secs(5);
+const STOP: Duration = Duration::from_secs(2);
+
+/// Large basic graph patterns (a path of 1,000 steps spelled out as triple patterns, stars
+/// of 1,000 patterns, of 1,000 single-variable checks and of 250 triple terms) plan and
+/// answer within the deadline, or are refused with `Cancelled` at it: the join orderer asks
+/// for the query's cancellation at every step (a 1,000-step path planned for 28 s, a
+/// 250-pattern star for 114 s, unable to stop: 12 October 2026). A query cancelled before
+/// it starts is refused.
+#[test]
+fn large_patterns_plan_in_time_or_stop_at_the_deadline() {
+    let engine = engine();
+    let snapshot = engine.snapshot();
+    for (shape, n) in [
+        ("chain", 1_000),
+        ("star", 1_000),
+        ("checks", 1_000),
+        ("triple-terms", 250),
+    ] {
+        let query = SparqlParser::new().parse_query(&query(shape, n)).unwrap();
+        let token = CancellationToken::new();
+        let options = QueryOptions {
+            resources: Resources {
+                cancellation: Some(token.clone()),
+                ..Resources::default()
+            },
+            ..QueryOptions::default()
+        };
+        let (done, finished) = mpsc::channel::<()>();
+        let watchdog = std::thread::spawn({
+            let token = token.clone();
+            move || {
+                if finished.recv_timeout(DEADLINE).is_err() {
+                    token.cancel();
+                }
+            }
+        });
+        let begun = Instant::now();
+        let outcome = plan_query(&snapshot, &query, &options).and_then(|_| {
+            match evaluate_query(&snapshot, &query, &options)? {
+                QueryResults::Solutions(solutions) => {
+                    for solution in solutions {
+                        solution?;
+                    }
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        });
+        let took = begun.elapsed();
+        let _ = done.send(());
+        watchdog.join().unwrap();
+        assert!(
+            matches!(outcome, Ok(()) | Err(QueryEvaluationError::Cancelled)),
+            "{shape} of {n}: {outcome:?}"
+        );
+        assert!(took < DEADLINE + STOP, "{shape} of {n}: {took:?}");
+        token.cancel();
+        assert!(
+            matches!(
+                plan_query(&snapshot, &query, &options),
+                Err(QueryEvaluationError::Cancelled)
+            ),
+            "{shape} of {n}: planned once cancelled"
+        );
+    }
 }
 
 /// The probe's child: `NRESE_STACK_PROBE=shape,n,bytes` runs that query with no nesting

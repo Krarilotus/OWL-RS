@@ -136,8 +136,10 @@ is a separate, implemented engine path. Controls and limitations are mapped in
 | 4. Execute the physical plan | Unfinished: `native::Context::eval_operator` still dispatches on algebra nodes |
 
 [`native/plan.rs`](../../crates/nrese-sparql/src/native/plan.rs) chooses BGP join order
-by dynamic programming through 12 patterns, then greedy search. These and the probe-cost
-thresholds are code heuristics, not hardware-calibrated settings.
+by dynamic programming through 12 patterns, then greedy search, from fewer starts where
+their estimates would exceed a fixed effort. The search asks for the query's cancellation
+at every step, so planning ends at the request deadline as evaluation does. These and the
+probe-cost thresholds are code heuristics, not hardware-calibrated settings.
 [`native/estimate.rs`](../../crates/nrese-sparql/src/native/estimate.rs) supplies
 pre-execution estimates; `explain_query` executes and records actual operator work.
 An estimated logical plan must not be presented as a fully selected physical plan.

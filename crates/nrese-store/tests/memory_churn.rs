@@ -14,9 +14,9 @@ use std::sync::Arc;
 use nrese_exec::heap;
 use nrese_reasoner::{ReasonerConfig, ReasonerService};
 use nrese_store::{
-    GraphResultFormat, GraphTarget, GraphWriteRequest, MutationCommand, MutationPipeline,
-    MutationTicket, Requester, SparqlQueryRequest, SparqlUpdateRequest, StatementOp,
-    StatementsRequest, StoreConfig, StoreService,
+    CancellationToken, GraphResultFormat, GraphTarget, GraphWriteRequest, MutationCommand,
+    MutationPipeline, MutationTicket, Requester, SparqlQueryRequest, SparqlUpdateRequest,
+    StatementOp, StatementsRequest, StoreConfig, StoreService,
 };
 
 #[global_allocator]
@@ -100,7 +100,9 @@ impl Soak {
         let prepared = store
             .prepare_query(&SparqlQueryRequest::all(query))
             .expect("parsed");
-        store.plan_query(&prepared).expect("planned");
+        store
+            .plan_query(&prepared, &CancellationToken::new())
+            .expect("planned");
         // A client transaction: committed seven times in ten, else rolled back.
         let session = store.sessions().begin(None).expect("began");
         let update = format!(
