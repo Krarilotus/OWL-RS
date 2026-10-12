@@ -58,12 +58,12 @@ from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
 
-SYSTEMS = ("nrese", "souffle", "nemo", "vlog", "glog", "rdfox")
+# RDFox isn't among them: its evaluation licence was refused (owner, 12 Oct 2026). Its
+# home turf runs NRESE against VLog and GLog on RDFox's own programs; RDFox's published
+# numbers are reported rows (benches/reasoning/reported), never measured.
+SYSTEMS = ("nrese", "souffle", "nemo", "vlog", "glog")
 IMAGES = {"souffle": "nrese-bench/souffle:2.5", "nemo": "nrese-bench/nemo",
-          "vlog": "nrese-bench/vlog:1.3.7", "glog": "nrese-bench/glog:69d4842",
-          "rdfox": "oxfordsemantic/rdfox:7.6b"}
-# Systems whose results may be published only with the vendor's consent (systems.toml).
-RESTRICTED = {"rdfox"}
+          "vlog": "nrese-bench/vlog:1.3.7", "glog": "nrese-bench/glog:69d4842"}
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -101,19 +101,16 @@ def program_path(case: dict) -> Path:
 
 def load_program(case: dict) -> P.Program:
     text = program_path(case).read_text(encoding="utf-8")
-    return P.parse_triples(text) if case.get("format") == "triples" else P.parse(text)
-
-
-def publish(system: str) -> str:
-    return "permission" if system in RESTRICTED else "free"
-
-
-def rdfox_licence() -> str:
-    """RDFOX_LICENSE, else RDFox.lic in the licences directory; "" if neither."""
-    if setting("RDFOX_LICENSE"):
-        return setting("RDFOX_LICENSE")
-    path = Path(setting("NRESE_LICENSES", str(Path.home() / "nrese-bench" / "licenses"))) / "RDFox.lic"
-    return str(path) if path.is_file() else ""
+    program = P.parse_triples(text) if case.get("format") == "triples" else P.parse(text)
+    if case.get("drop_rules_using"):
+        # A paper's variant of the program: e.g. RDFox's 2019 maintenance study ran Claros L
+        # and LE with equality off, without the 2014 programs' explicit owl:sameAs
+        # axiomatisation (the rules that read owl:sameAs in their body).
+        iri = case["drop_rules_using"]
+        using = {rel for rel, (kind, p) in program.patterns.items() if kind == "prop" and p == iri}
+        program.rules = [r for r in program.rules
+                         if not any(isinstance(b, P.Atom) and b.rel in using for b in r.body)]
+    return program
 
 
 def expressible(case: dict, system: str) -> str | None:
@@ -122,8 +119,6 @@ def expressible(case: dict, system: str) -> str | None:
     try:
         if system == "nrese":
             P.to_n3(program)
-        elif system == "rdfox":
-            P.to_rdfox(program)
         elif system in ("vlog", "glog"):
             P.to_vlog(program, "/data")
     except P.NotExpressible as e:
@@ -165,7 +160,7 @@ def docker_as_user(image: str, args: list[str], mounts: dict[str, str], entrypoi
     command = ["docker", "run", "--rm", "-u", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp",
                "-w", next(iter(mounts.values()))]
     for source, target in mounts.items():
-        command += ["-v", f"{source}:{target}"]
+        command += ["-v", f"{source}:{target}" + (":ro" if source == target else "")]
     if entrypoint:
         command += ["--entrypoint", entrypoint]
     subprocess.run(command + [image, *args], check=True)
@@ -192,11 +187,20 @@ def prepare(case: dict):
         prepare_oxford(case, target)
     elif kind == "lubm":
         prepare_lubm(case, target)
+    elif kind == "frozen":
+        # A frozen dataset of benches/datasets.toml (BENCH_DATA), linked, never copied.
+        source = Path(setting("BENCH_DATA", "/home/krarilotus/nrese-assets/kraris-gptler-20261009/snapshots/windows/nrese-data")) / case["file"]
+        got = sha256(source) if not (target / "facts.nt").exists() else case["sha256"]
+        if got != case["sha256"]:
+            raise SystemExit(f"{source}: SHA-256 {got}, the registry pins {case['sha256']}")
+        target.mkdir(parents=True, exist_ok=True)
+        if not (target / "facts.nt").exists():
+            (target / "facts.nt").symlink_to(source)
     else:
         raise SystemExit(f"no preparation for source {kind}")
     program = load_program(case)
     if program.over_triples:
-        prepare_triples(target)
+        prepare_triples(target, case_systems(case))
     facts = target / "facts.nt"
     if not program.over_triples and expressible(case, "nrese") is None and not facts.exists():
         print(f"writing {facts}")
@@ -207,7 +211,9 @@ def prepare(case: dict):
                     rows = (line.rstrip("\n").split(",") for line in f if line.strip())
                     out.writelines(P.ntriples(rel, rows, program.arity[rel]))
         partial.rename(facts)
-    manifest = {f.name: {"bytes": f.stat().st_size, "sha256": sha256(f)} for f in sorted(target.iterdir()) if f.is_file()}
+    # A linked frozen file is pinned in the registry already.
+    manifest = {f.name: {"bytes": f.stat().st_size, "sha256": case["sha256"] if f.is_symlink() else sha256(f)}
+                for f in sorted(target.iterdir()) if f.is_file()}
     (target.parent / f"{case['data']}.files.json").write_text(json.dumps(manifest, indent=1) + "\n", encoding="utf-8")
 
 
@@ -258,12 +264,13 @@ def prepare_lubm(case: dict, target: Path):
     shutil.rmtree(staging, ignore_errors=True)
 
 
-def prepare_triples(target: Path):
+def prepare_triples(target: Path, systems: list[str]):
     """The facts of a program over triples in each engine's input form: N-Triples (NRESE,
     Nemo), a tab-separated table of N-Triples terms (Soufflé; a tab inside a literal is
-    escaped) and a Trident store (VLog, GLog: `vlog load`)."""
+    escaped) and a Trident store (VLog, GLog: `vlog load`); only the forms the case's
+    engines read."""
     table = target / "triples.tsv"
-    if not table.exists():
+    if "souffle" in systems and not table.exists():
         print(f"writing {table}")
         with open(target / "facts.nt", encoding="utf-8") as f, \
                 open(table.with_suffix(".tsv.partial"), "w", encoding="utf-8", newline="\n") as out:
@@ -273,11 +280,27 @@ def prepare_triples(target: Path):
                     out.write("\t".join(t.replace("\t", "\\t") for t in terms) + "\n")
         table.with_suffix(".tsv.partial").rename(table)
     trident = target / "trident"
-    if not trident.exists():
+    if {"vlog", "glog"} & set(systems) and not trident.exists():
         print(f"building the Trident store {trident}")
         docker_as_user(IMAGES["vlog"], ["load", "-i", "/data/facts.nt", "-o", "/data/trident.partial", "--maxThreads", "8"],
-                       {str(target): "/data"})
+                       {str(target): "/data", **{str(m.source): m.target for m in linked(target)}})
         (target / "trident.partial").rename(trident)
+
+
+def case_systems(case: dict) -> list[str]:
+    """The engines a case runs on: its `systems`, else all (LUBM(1000) leaves out Soufflé and
+    Nemo, whose inputs there would be a 25 GB table and hours of work off their home turf)."""
+    return case.get("systems", list(SYSTEMS))
+
+
+def linked(target: Path) -> list[Mount]:
+    """A frozen dataset is linked, not copied: its directory, mounted read-only at the same
+    path, so the link resolves inside a container too."""
+    facts = target / "facts.nt"
+    if facts.is_symlink():
+        real = facts.resolve().parent
+        return [Mount(str(real), str(real))]
+    return []
 
 
 # --- one engine, one repetition ---------------------------------------------------------------------
@@ -304,12 +327,13 @@ class Run:
         # As the invoking user: what the engines write in /work stays removable.
         user = f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else None
         return Spec(f"nrese-suite-datalog-{self.name}", image, command, {"HOME": "/tmp", **(env or {})},
-                    [self.data, Mount(str(self.work), "/work", readonly=False), *(extra or [])],
+                    [self.data, Mount(str(self.work), "/work", readonly=False), *linked(data_dir(self.case)),
+                     *(extra or [])],
                     entrypoint=entrypoint, user=user, memory=None if self.memory == "0" else self.memory)
 
     def row(self, task: str, **fields) -> Result:
         return Result(date=self.args.date, host=self.args.host, runtime="docker", system=self.system,
-                      version=self.args.versions.get(self.system, "-"), publish=publish(self.system), workload=workload(self.case),
+                      version=self.args.versions.get(self.system, "-"), publish="free", workload=workload(self.case),
                       tier=tier(self.case), regime="-", run=self.rep, task=task, **fields)
 
     def write(self, result: Result):
@@ -422,9 +446,34 @@ class Run:
                         counts[rel] = int(next(iter(binding.values()))["value"])
                 except (OSError, ValueError, KeyError, IndexError):
                     counts[rel] = None
+            total = None
+            body = urllib.parse.urlencode({"query": "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }"}).encode()
+            request = urllib.request.Request(f"{base}/dataset/query", data=body,
+                                             headers={"Accept": "application/sparql-results+json"})
+            try:
+                with urllib.request.urlopen(request, timeout=self.args.timeout_s) as r:
+                    total = int(next(iter(json.loads(r.read())["results"]["bindings"][0].values()))["value"])
+            except (OSError, ValueError, KeyError, IndexError, StopIteration):
+                pass
         finally:
             self.runtime.stop(server)
         self.counts(counts, "SPARQL COUNT over the closure")
+        self.total_facts(total)
+
+    def total_facts(self, total: int | None):
+        """The closure's size, input included, against the size a paper reports for the same
+        setup (`papers_facts` in cases.toml, rounded as the paper rounds): whether this case
+        is the paper's, not whether an engine is right (the relation counts decide that)."""
+        papers = self.case.get("papers_facts", {})
+        notes = []
+        for source, value in papers.items():
+            if total is None:
+                continue
+            digits = len(str(value).split(".")[1]) if "." in str(value) else 0
+            ours = round(total / 1e6, digits)
+            notes.append(f"{source}: {value} M, ours {ours} M ({'the same' if ours == float(value) else 'differs'})")
+        self.write(self.row("count", status="ok" if total is not None else "failed", rows=total if total is not None else "",
+                            note="every triple of the closure, input included" + ("; " + "; ".join(notes) if notes else "")))
 
     # --- Soufflé ---
     def run_souffle(self):
@@ -466,72 +515,6 @@ class Run:
                                    qlog, self.args.timeout_s)
             counts = {rel: line_count(self.work / "out" / f"{rel}.csv") if out.ok else None for rel in self.program.derived}
             self.counts(counts, "the exported relation's lines")
-
-    # --- RDFox (UNVERIFIED until a licensed run) ---
-    def run_rdfox(self):
-        """RDFox 7.6 in its sandbox: the facts imported, then the rules (one materialisation),
-        `threads N` as every engine's CPUs; the time is the container's, start-up included
-        (RDFox is native code, its start-up is small). The derived total is the store's
-        triples less the input's, as RDFox's own SPARQL counts them; the qualifying run
-        serves the endpoint and counts every relation over HTTP, as NRESE's does. Its rows
-        carry publish = permission: they stay on the machine."""
-        licence = rdfox_licence()
-        if not licence:
-            self.write(self.row("load", status="skipped",
-                                note="needs RDFox.lic in the licences directory, or RDFOX_LICENSE=/path"))
-            return
-        (self.work / "program.dlog").write_text(P.to_rdfox(self.program), encoding="utf-8")
-        script = ["dstore create bench", "active bench", f"threads {self.args.threads}",
-                  "import /data/facts.nt", "import /work/program.dlog"]
-        image = IMAGES["rdfox"]
-        lic = Mount(licence, "/license/RDFox.lic")
-        args = ["-license-file", "/license/RDFox.lic", "sandbox", "/work", "exec /work/run.rdfox"]
-        inputs = line_count(data_dir(self.case) / "facts.nt") or 0
-        if not self.args.qualify:
-            (self.work / "run.rdfox").write_text("\n".join(
-                script + ["SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }", "quit"]) + "\n", encoding="utf-8")
-            log = self.logs / "run.log"
-            measured = self.runtime.run(self.spec(image, args, extra=[lic]), log, self.args.timeout_s)
-            text = log.read_text(encoding="utf-8", errors="replace")
-            found = re.findall(r"^\s*(\d+)\s*$", text, re.M)
-            derived = int(found[-1]) - inputs if found else None
-            self.finish(measured, None, derived, "RDFox sandbox: import facts, import rules, threads as the CPUs; UNVERIFIED")
-            return
-        port = 12110
-        (self.work / "run.rdfox").write_text("\n".join(
-            script + [f"set endpoint.port {port}", "endpoint start"]) + "\n", encoding="utf-8")
-        spec = self.spec(image, args, extra=[lic])
-        spec.keep_stdin, spec.port = True, port
-        started = time.monotonic()
-        server = self.runtime.start(spec, self.logs / "serve.log")
-        base = f"http://127.0.0.1:{self.args.port}/datastores/bench/sparql"
-        counts: dict[str, int | None] = {}
-        total = None
-        try:
-            def count(query: str) -> int | None:
-                body = urllib.parse.urlencode({"query": query}).encode()
-                request = urllib.request.Request(base, data=body, headers={"Accept": "application/sparql-results+json"})
-                try:
-                    with urllib.request.urlopen(request, timeout=self.args.timeout_s) as r:
-                        binding = json.loads(r.read())["results"]["bindings"][0]
-                        return int(next(iter(binding.values()))["value"])
-                except (OSError, ValueError, KeyError, IndexError):
-                    return None
-            while time.monotonic() - started < self.args.timeout_s:
-                total = count("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }")
-                if total is not None or not self.runtime.alive(server):
-                    break
-                time.sleep(1)
-            elapsed = (time.monotonic() - started) * 1000
-            for rel in self.program.derived:
-                counts[rel] = count(P.count_query(self.program, rel))
-        finally:
-            peak = self.runtime.stop(server)
-        from suitekit.runtime import Measured
-        measured = Measured(elapsed, peak, 0 if total is not None else 1)
-        self.finish(measured, None, total - inputs if total is not None else None,
-                    "RDFox sandbox, qualifying run (time includes serving the endpoint); UNVERIFIED")
-        self.counts(counts, "SPARQL COUNT over RDFox's store")
 
     # --- VLog and GLog ---
     def run_vlog(self):
@@ -598,7 +581,7 @@ def cmd_list(args):
         if not program_path(case).exists():
             print(f"{name:<22} {case['program']:<32} (the program is fetched by `prepare`)")
             continue
-        why = {s: expressible(case, s) for s in SYSTEMS}
+        why = {s: expressible(case, s) for s in case_systems(case)}
         runs = ", ".join(s for s, w in why.items() if w is None)
         print(f"{name:<22} {case['program']:<32} runs on: {runs}")
         for s, w in why.items():
@@ -685,16 +668,16 @@ def cmd_run(args):
         for name in selected(args.cases):
             case = cases()[name]
             runnable = []
-            for system in systems:
+            for system in [s for s in systems if s in case_systems(case)]:
                 why = expressible(case, system)
                 if why:
                     writer.write(Result(date=args.date, host=args.host, runtime="docker", system=system,
-                                        version=args.versions[system], publish=publish(system), workload=workload(case), tier=tier(case),
+                                        version=args.versions[system], publish="free", workload=workload(case), tier=tier(case),
                                         regime="-", run=0, task="load", status="skipped",
                                         note=f"not expressible: {why}"))
                 elif args.qualified and not qualified_for(args, case, system):
                     writer.write(Result(date=args.date, host=args.host, runtime="docker", system=system,
-                                        version=args.versions[system], publish=publish(system), workload=workload(case),
+                                        version=args.versions[system], publish="free", workload=workload(case),
                                         tier=tier(case), regime="-", run=0, task="load", status="skipped",
                                         note="not qualified: its qualifying run gave no checked total"))
                 else:

@@ -11,9 +11,9 @@ env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-se
 # Two scenarios, reported apart (benches/PROTOCOL.md §3):
 # - matched: one CPU for both, GraphDB Free's allocation (its licence: 1 core, two concurrent
 #   queries; at 8 and 64 readers its numbers are Free's queueing, not GraphDB's scaling);
-# - 8 CPUs: NRESE's own capacity, beside RDFox's the day its licence exists (until then
-#   RDFox's pair is a skipped row naming the missing licence).
+# - 8 CPUs: NRESE's own capacity, a line of its own. (RDFox's licence was refused; its
+#   maintenance numbers are reported rows, benches/reasoning/reported.)
 commands = [
   ["sh", "-c", "test -f /home/krarilotus/owlrs/queue/done/reasoning-qualify-commit-latency.toml && DOCKER_CPUS=1 python3 benches/reasoning/maintenance/maintenance.py run --systems nrese,graphdb --tier lubm-10 --runs 3 --readers 0,1,2,8,64 --duration-s 60 --results \"$QUEUE_RESULTS/matched-1cpu\""],
-  ["sh", "-c", "DOCKER_CPUS=8 python3 benches/reasoning/maintenance/maintenance.py run --systems nrese,rdfox --tier lubm-10 --runs 3 --readers 0,1,2,8,64 --duration-s 60 --results \"$QUEUE_RESULTS/8cpu\""],
+  ["sh", "-c", "DOCKER_CPUS=8 python3 benches/reasoning/maintenance/maintenance.py run --systems nrese --tier lubm-10 --runs 3 --readers 0,1,2,8,64 --duration-s 60 --results \"$QUEUE_RESULTS/8cpu\""],
 ]

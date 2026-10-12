@@ -205,10 +205,13 @@ capabilities = [
   "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
 ]
 
+# Its evaluation licence was refused (owner, 12 Oct 2026; AllegroGraph's too): it runs
+# nowhere, now or later. Its home turf compares NRESE with VLog and GLog on RDFox's own
+# programs, and RDFox's published numbers are reported rows (benches/reasoning/reported).
 [rdfox]
 name = "RDFox"
 publish = "permission"
-runs = ["docker", "apptainer"]
+runs = []
 capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-custom-rules",

@@ -377,36 +377,6 @@ def to_n3(program: Program) -> str:
     return "\n".join(lines) + "\n"
 
 
-def rdfox_pattern(program: Program, rel: str, args: list[str]) -> str:
-    """An atom as an RDFox triple pattern `[s, p, o]`: the same triple NRESE's rules match."""
-    s, p, o = n3_pattern(program, rel, args).split(" ", 2)
-    return f"[{s}, {p}, {o}]"
-
-
-def to_rdfox(program: Program) -> str:
-    """The program as RDFox rules over the triples (RDFox's Datalog: `head :- body .`),
-    the relations as NRESE's triples: unary ones rdf:type, binary ones properties, `!=` a
-    FILTER. Refused where NRESE's form is (arity beyond 2, negation), so both run the same
-    rules on the same facts."""
-    check_triples(program)
-    lines = []
-    for rule in program.rules:
-        fresh = (f"_w{i}" for i in range(10**6))
-        bound = {b.left: constant_iri(b.right) for b in rule.body
-                 if isinstance(b, Compare) and b.op == "=" and is_constant(b.right) and is_variable(b.left)}
-        body = []
-        for literal in rule.body:
-            if isinstance(literal, Atom):
-                body.append(rdfox_pattern(program, literal.rel, [n3_term(a, fresh, bound) for a in literal.args]))
-            elif literal.op == "!=":
-                body.append(f"FILTER({n3_term(literal.left, fresh, bound)} != {n3_term(literal.right, fresh, bound)})")
-            elif not (literal.left in bound and is_constant(literal.right)):
-                raise NotExpressible(f"the comparison {literal.left} = {literal.right}")
-        head = rdfox_pattern(program, rule.head.rel, [n3_term(a, fresh, bound) for a in rule.head.args])
-        lines.append(f"{head} :- {', '.join(body)} .")
-    return "\n".join(lines) + "\n"
-
-
 def ntriples(rel: str, rows, arity: int):
     """The N-Triples lines of one input relation's rows (lists of integer strings)."""
     if arity == 1:

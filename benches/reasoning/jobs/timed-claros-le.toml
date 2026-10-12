@@ -1,0 +1,18 @@
+id = "reasoning-timed-claros-le"
+group = "reasoning"
+host = "office-pc"
+checkout = "suite/reasoning"
+workload = "claros"
+window = "quiet"
+priority = 3
+est_min = 420
+needs = ["docker"]
+env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server", NRESE_VERSION = "16c3bfb", DOCKER_MEMORY = "28g" }
+# Claros-LE, about 549 M derived facts: a frontier on Office-PC's 31 GiB (GLog's own log
+# peaks at 9.4 GB, RDFox's 2014 store at 18.0 GB). One qualifying run per engine at one
+# thread (GLog's Table 4: RDFox timed out after 1 h there; 2014: 4,989 s at 1 thread), a
+# 2 h limit per step, then NRESE at 32 CPUs (2014: 285 s).
+commands = [
+  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --qualify --runs 1 --threads 1 --timeout-s 7200 --cases claros-le --results \"$QUEUE_RESULTS/threads-1\" || true"],
+  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --qualify --runs 1 --systems nrese --threads 32 --timeout-s 7200 --cases claros-le --results \"$QUEUE_RESULTS/threads-32\""],
+]

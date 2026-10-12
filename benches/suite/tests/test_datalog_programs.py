@@ -60,12 +60,6 @@ class FlowLogPrograms(unittest.TestCase):
                           ".rule\nR(t) :- E(t, s), t = 7.\n")
         self.assertIn("{ <n:7> <r:E> ?s } => { <n:7> " + TYPE + " <r:R> } .", P.to_n3(program))
 
-    def test_rdfox_runs_the_same_triples_as_nrese(self):
-        rules = P.to_rdfox(flowlog("sg"))
-        self.assertIn("[?x, <r:Sg>, ?y] :- [?a, <r:Arc>, ?x], [?a, <r:Arc>, ?y], FILTER(?x != ?y) .", rules)
-        with self.assertRaises(P.NotExpressible):
-            P.to_rdfox(flowlog("galen"))
-
     def test_input_rows_become_triples(self):
         self.assertEqual(list(P.ntriples("Arc", [["1", "2"]], 2)), ["<n:1> <r:Arc> <n:2> .\n"])
         self.assertEqual(list(P.ntriples("Source", [["5"]], 1)), [f"<n:5> {TYPE} <r:Source> .\n"])
@@ -92,8 +86,6 @@ class TriplePrograms(unittest.TestCase):
         self.assertIn(f"=> {{ <http://e/contradiction> {TYPE} <http://e/Nothing> }} .", n3)
         self.assertEqual(P.count_query(self.program, "RP1"),
                          "SELECT (COUNT(*) AS ?n) WHERE { ?a <http://e/knows> ?b }")
-        self.assertIn(f"[<http://e/contradiction>, {TYPE}, <http://e/Nothing>] :- [?X, <http://e/knows>, ?X] .",
-                      P.to_rdfox(self.program))
 
     def test_the_other_engines_bind_each_relation_to_its_pattern(self):
         self.assertIn(f'RP0(a) :- TE(a, "{TYPE}", "<http://e/Person>").', P.to_souffle(self.program))
