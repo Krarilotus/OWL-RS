@@ -303,7 +303,7 @@ pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
     // The request's compilation scratch, held until the runs end: its copy of the
     // ontology, where preparing made one, and the clauses.
     let mut scratch = crate::memory::Scratch::new(config.memory.as_ref());
-    let copied = match &ontology {
+    let copied = || match &ontology {
         std::borrow::Cow::Owned(copy) => crate::memory::ontology_bytes(copy),
         std::borrow::Cow::Borrowed(_) => 0,
     };
@@ -312,7 +312,7 @@ pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
     }
     let mut normalise = |lazy_definitions| {
         let normalised = normalise_with(&ontology, options(lazy_definitions));
-        let bytes = crate::memory::normalised_bytes(&normalised);
+        let bytes = || crate::memory::normalised_bytes(&normalised);
         scratch.charge(bytes).is_ok().then_some(normalised)
     };
     if !config.lazy_definitions || config.keep_model {
@@ -441,7 +441,7 @@ fn run(
     program.ensure_tables();
     // The program is the run's compilation scratch, held from the request's envelope.
     let mut scratch = crate::memory::Scratch::new(config.memory.as_ref());
-    if scratch.charge(program.bytes()).is_err() {
+    if scratch.charge(|| program.bytes()).is_err() {
         return Outcome::stopped(crate::memory::EXHAUSTED);
     }
     let compiled = started.elapsed();

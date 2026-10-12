@@ -144,7 +144,7 @@ pub fn saturate_with_workers(
     // compiled program is the engine's, which its observer holds).
     let mut scratch = crate::memory::Scratch::new(options.budget.memory.as_ref());
     if scratch
-        .charge(crate::memory::normalised_bytes(&normalised))
+        .charge(|| crate::memory::normalised_bytes(&normalised))
         .is_err()
     {
         return Err(Unsupported::Budget);

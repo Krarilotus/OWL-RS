@@ -63,7 +63,7 @@ pub(super) fn decide_until(
     let base = ontology_at(store, snapshot);
     let mut scratch = nrese_dl::memory::Scratch::new(Some(memory));
     if scratch
-        .charge(nrese_dl::memory::ontology_bytes(&base))
+        .charge(|| nrese_dl::memory::ontology_bytes(&base))
         .is_err()
     {
         return unresolved(nrese_dl::memory::EXHAUSTED);

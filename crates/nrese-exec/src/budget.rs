@@ -116,6 +116,12 @@ impl Envelope {
         Self::new(None, None)
     }
 
+    /// This envelope, if a charge to it can ever fail: holders that only exist to be
+    /// refused (an engine's observation, a size estimate) skip an unbounded one.
+    pub fn bounded(&self) -> Option<&Self> {
+        self.0.is_bounded().then_some(self)
+    }
+
     /// A budget for one part of the request: what the part holds, counted on its own and
     /// drawn from this envelope.
     pub fn part(&self) -> Budget {
@@ -201,6 +207,15 @@ impl Budget {
 
     pub fn limit(&self) -> usize {
         self.limit
+    }
+    /// Whether a charge can ever fail: a finite limit here or above.
+    pub fn is_bounded(&self) -> bool {
+        self.limit != usize::MAX
+            || match &self.parent {
+                Some(Parent::Server(_)) => true,
+                Some(Parent::Envelope(envelope)) => envelope.0.is_bounded(),
+                None => false,
+            }
     }
 
     /// Reserves `bytes`, or fails without reserving anything.
@@ -486,6 +501,15 @@ mod tests {
         assert_eq!((err.shared, err.limit, err.used), (false, 60, 40));
         assert_eq!((second.used(), request.used()), (0, 40), "nothing charged");
         assert!(second.refused() && request.refused() && !first.refused());
+        assert!(request.bounded().is_some() && second.is_bounded());
+        assert!(
+            Envelope::unlimited().bounded().is_none() && !Envelope::unlimited().part().is_bounded()
+        );
+        assert!(
+            Envelope::new(None, Some(Arc::clone(&server)))
+                .bounded()
+                .is_some()
+        );
         // The server's limit, reached through another request, is reported as the server's.
         let other = Envelope::new(None, Some(Arc::clone(&server)));
         other.charge(50).unwrap();

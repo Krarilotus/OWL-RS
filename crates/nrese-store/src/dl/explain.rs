@@ -250,7 +250,7 @@ impl crate::StoreService {
         let memory = self.envelope(None);
         let mut scratch = nrese_dl::memory::Scratch::new(Some(&memory));
         scratch
-            .charge(nrese_dl::memory::ontology_bytes(&base))
+            .charge(|| nrese_dl::memory::ontology_bytes(&base))
             .ok()?;
         let mut ontology = (*base).clone();
         let ids = super::query::Ids::of(&snapshot);

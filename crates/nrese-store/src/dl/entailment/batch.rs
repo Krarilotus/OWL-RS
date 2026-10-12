@@ -98,11 +98,16 @@ impl Batch {
             #[cfg(test)]
             COMPILATIONS.set(COMPILATIONS.get() + 1);
             let prepared = tableau::prepared(ontology);
-            let copied = match &prepared {
-                std::borrow::Cow::Owned(copy) => ontology_bytes(copy),
-                std::borrow::Cow::Borrowed(_) => 0,
-            };
-            scratch.charge(copied).ok()?;
+            let mut copied = 0;
+            scratch
+                .charge(|| {
+                    copied = match &prepared {
+                        std::borrow::Cow::Owned(copy) => ontology_bytes(copy),
+                        std::borrow::Cow::Borrowed(_) => 0,
+                    };
+                    copied
+                })
+                .ok()?;
             let normalised = nrese_owl::normalise_with(
                 &prepared,
                 nrese_owl::Options {
@@ -110,10 +115,15 @@ impl Batch {
                     ..nrese_owl::Options::default()
                 },
             );
-            let clauses = normalised_bytes(&normalised);
-            scratch.charge(clauses).ok()?;
+            let mut clauses = 0;
+            scratch
+                .charge(|| {
+                    clauses = normalised_bytes(&normalised);
+                    clauses
+                })
+                .ok()?;
             let program = Prepared::new(&prepared, &normalised, &classes, &individuals);
-            scratch.charge(program.bytes()).ok()?;
+            scratch.charge(|| program.bytes()).ok()?;
             // The copy and the clauses go; the program stays for the probes.
             scratch.release(copied + clauses);
             Some(program)
