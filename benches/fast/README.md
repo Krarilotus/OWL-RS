@@ -1,11 +1,12 @@
 # The fast suite
 
 Performance tests that run like unit tests: many small cases, one bottleneck or use case
-each, 10-300 s per case, the whole suite in under an hour on the main PC. Each case is
-checked before its time counts, asserts the plan or engine path it must take, and records
-its time and peak memory under a memory cap. A run is compared with an earlier one beyond a
-confidence interval, so a regression or a win shows at once. The full benchmarks
-([../CATALOG.md](../CATALOG.md)) still run in bulk; this suite doesn't replace them.
+each, seconds to a few minutes per case. A selection by `--cases` or `--areas` is level 2
+of [the four levels](../README.md#four-levels); all of them, with their comparators, are
+part of level 3. Each case is checked before its time counts, asserts the plan or engine
+path it must take, and records its time and peak memory under a memory cap. A run is
+compared with an earlier one on the same host beyond a confidence interval, so a
+regression or a win shows at once.
 
 ```sh
 python benches/fast/fast.py list                          the cases: area, semantics, comparators
@@ -61,24 +62,53 @@ comparator also `hangs`, `unsupported` and `not expressible`.
 - **A quiet slot per case.** Each case's timed repetitions, and each comparison's runs, hold
   the machine's quiet slot (`scripts/quiet-slot.sh`: one timing at a time, no build running,
   new builds waiting), taken per case so other builds wait minutes, not the whole run.
-  Waiting for the slot doesn't count against a case's timeout. `NRESE_QUIET_SLOT=0` skips it.
+  Waiting for the slot doesn't count against a case's timeout. If compilers remain after
+  `NRESE_QUIET_DRAIN_S` (default 600 seconds), the guard exits 124, releases the slot and
+  does not start the measurement; the driver fails that slot acquisition. Zero checks
+  without waiting. Process-inspection failures also abort (exit 2). `NRESE_QUIET_SLOT=0`
+  skips the slot for counts; it is not a way to accept timings under compiler contention.
 - **Memory:** the container's peak (cgroup `memory.peak`) and the process's (`VmHWM`), after
   the load, after reasoning and at the end.
+  In-process client cases retain latency samples per completed request. Their peaks
+  include the harness and grow with completed work; lower throughput can lower the
+  measured peak without reducing engine memory. Interpret these alongside QPS.
+  Single-level clients and client sweeps both retain per-width throughput in compact
+  reports. Older full reports can recover single-level QPS from the raw result;
+  older compact records without that result require their verified full report.
 - **Repetitions:** `--reps 2` by default, interleaved: every case once, then every case
   again in an order rotated by one. Within a repetition the perf lab repeats its
   measurements (`--runs`, `--reason-runs`, `repeat`) and keeps every sample.
-- **Comparing:** per case, the samples of all repetitions are pooled per series (a query,
-  the rematerialisations, the commits); the metric is the sum of the series' medians.
-  `compare` resamples each series (bootstrap, 2,000 rounds, seeded) for a 95 % interval of
-  the ratio new/base. A change counts when the interval excludes 1, the ratio is at least
-  10 % and the difference at least 2 ms (as PROTOCOL.md §5); 10 % more peak memory (and
-  64 MiB) is a regression too. A status change (an `ok` case now `wrong`) comes first.
+
+## Comparing
+
+`compare BASE NEW` owns the thresholds every comparison of this directory uses
+([PROTOCOL.md §5](../PROTOCOL.md#5-statistics) states the rules they implement).
+
+1. **Lost work first:** cases, repetitions, series or client widths missing on one side,
+   and failed checks, are listed before any time. A matching expected boundary outcome
+   (memory limit, unsupported) tracks a frontier and earns no timing verdict; a failure
+   on both sides is no valid comparison.
+2. **Work counters** are compared exactly: one that grows by more than 2 % is a
+   regression; one that varies between repetitions of a run isn't judged.
+3. **Time:** per case, the samples of all repetitions are pooled per series (a query, the
+   rematerialisations, the commits); the metric is the sum of the series' medians. Each
+   series is resampled (bootstrap, 2,000 rounds, seeded) for a 95 % interval of the ratio
+   new/base. A change counts when the interval excludes 1, the ratio is at least 10 % and
+   beyond both sides' spread, and the difference is at least 2 ms. `--min-ms 0` removes
+   the absolute floor for a declared microcase comparison (declared before measuring);
+   a supported change below the floor is labelled as such, never as equal performance.
+4. **Throughput** is compared at every client width on its own, by the same interval and
+   threshold: lower QPS is worse, with no millisecond floor, and needs at least two
+   independent repetitions.
+5. **Memory:** a peak higher by the time threshold (at least 10 %) and by at least 64 MiB
+   is a regression. The case's peak and each phase's peak are compared apart; a phase
+   peak is not a lifetime peak.
 
 ## What is kept
 
 A run writes two files:
 - **The full report**, outside git: `~/nrese-bench/reports/fast/<date>-<label>.json`
-  (`NRESE_BENCH_REPORTS` moves it; the same path on the main and the office PC). It holds
+  (`NRESE_BENCH_REPORTS` moves it). It holds
   every sample and each case's raw result, 1-3 MB a run.
 - **The compact record**, committed: `../baselines/fast/<date>-<label>.json`, 0.1-0.3 MB. It
   holds the run's commit, machine and configuration. Per case and repetition it holds the

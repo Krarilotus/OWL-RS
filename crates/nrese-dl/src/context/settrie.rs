@@ -22,12 +22,14 @@ struct Node {
 #[derive(Debug)]
 pub struct SetTrie {
     nodes: Vec<Node>,
+    nested_bytes: usize,
 }
 
 impl Default for SetTrie {
     fn default() -> Self {
         Self {
             nodes: vec![Node::default()],
+            nested_bytes: 0,
         }
     }
 }
@@ -43,12 +45,19 @@ impl SetTrie {
                 Err(i) => {
                     let id = self.nodes.len() as u32;
                     self.nodes.push(Node::default());
-                    self.nodes[at as usize].children.insert(i, (a, id));
+                    let children = &mut self.nodes[at as usize].children;
+                    let before = super::memory::vec(children);
+                    children.insert(i, (a, id));
+                    self.nested_bytes += super::memory::vec(children) - before;
                     id
                 }
             };
         }
-        self.nodes[at as usize].clauses.push(c);
+        super::memory::push(
+            &mut self.nodes[at as usize].clauses,
+            c,
+            &mut self.nested_bytes,
+        );
     }
 
     /// Whether a stored body is a subset of `query` (sorted) with a clause `live` says
@@ -96,12 +105,9 @@ impl SetTrie {
         false
     }
 
-    /// Memory in bytes, roughly.
+    /// O(1) owned capacity, including spare node slots and nested buffers.
     pub fn bytes(&self) -> usize {
-        self.nodes
-            .iter()
-            .map(|n| 48 + n.children.capacity() * 8 + n.clauses.capacity() * 4)
-            .sum()
+        super::memory::vec(&self.nodes) + self.nested_bytes
     }
 }
 
@@ -109,6 +115,30 @@ impl SetTrie {
 mod tests {
     use super::*;
     use crate::context::atoms::CTerm;
+
+    #[test]
+    fn capacity_counts_spare_nodes_and_every_nested_buffer() {
+        let mut trie = SetTrie::default();
+        for i in 0..300 {
+            trie.insert(
+                &[
+                    Atom::concept(i % 17, CTerm::X),
+                    Atom::concept(i + 18, CTerm::X),
+                ],
+                i,
+            );
+            let walked = super::super::memory::vec(&trie.nodes)
+                + trie
+                    .nodes
+                    .iter()
+                    .map(|n| {
+                        super::super::memory::vec(&n.children)
+                            + super::super::memory::vec(&n.clauses)
+                    })
+                    .sum::<usize>();
+            assert_eq!(trie.bytes(), walked);
+        }
+    }
 
     fn atoms(ids: &[u32]) -> Vec<Atom> {
         let mut v: Vec<Atom> = ids.iter().map(|&i| Atom::concept(i, CTerm::X)).collect();

@@ -58,6 +58,13 @@ pub struct Profile {
     pub threads: usize,
     /// The most clauses one context holds (a context shared by many successors grows).
     pub largest_context: u64,
+    /// The peak of the sampled capacity estimate (docs/design/owl2-dl.md §13); zero when
+    /// nothing is observed.
+    pub task_memory_peak: usize,
+    /// Message batches, budget checks and capacity publications of the contexts' workers.
+    pub batches: u64,
+    pub budget_checks: u64,
+    pub observations: u64,
 }
 
 impl Profile {
@@ -74,6 +81,9 @@ impl Profile {
         self.equality_literals_generated += c.eq;
         self.merges += c.merges;
         self.subset_checks += c.subset_checks;
+        self.batches += c.batches;
+        self.budget_checks += c.checks;
+        self.observations += c.observations;
         self.peak_agenda_size = self.peak_agenda_size.max(c.peak_agenda);
         self.max_clause_body_width = self.max_clause_body_width.max(c.max_body);
         if c.kept > 0 {
@@ -92,7 +102,8 @@ impl Profile {
              contexts_saturated={} clauses_generated={} clauses_kept={} redundant_forward={} \
              redundant_backward={} hyper={} pred={} max_head={} max_body={} edges={} \
              peak_agenda={} messages={} slots={} proof_steps={} threads={} largest_context={} \
-             merges={} eq={} unmerged={} joins_left={} subset_checks={}",
+             merges={} eq={} unmerged={} joins_left={} subset_checks={} task_memory_peak={} \
+             batches={} budget_checks={} observations={}",
             ms(self.normalise),
             ms(self.compile),
             ms(self.saturate),
@@ -127,6 +138,10 @@ impl Profile {
             self.contexts_unmerged,
             self.contexts_joins_left,
             self.subset_checks,
+            self.task_memory_peak,
+            self.batches,
+            self.budget_checks,
+            self.observations,
         );
         out
     }

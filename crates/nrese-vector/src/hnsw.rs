@@ -335,6 +335,16 @@ impl Hnsw {
         chosen
     }
 
+    /// O(degree): copies ordered links into reusable storage, releasing the lock before
+    /// the caller processes neighbours.
+    fn snapshot_links(&self, node: u32, level: u8, out: &mut Vec<u32>) {
+        let links = self.links[node as usize].read();
+        match links.get(usize::from(level)) {
+            Some(neighbours) => out.clone_from(neighbours),
+            None => out.clear(),
+        }
+    }
+
     /// The nearest node to `query` reachable from `start` by steps that get nearer, at
     /// `level`.
     fn greedy(
@@ -345,14 +355,11 @@ impl Hnsw {
         level: u8,
     ) -> (f32, u32) {
         let mut nearest = start;
+        let mut links = Vec::new();
         loop {
             let mut improved = false;
-            let links = self.links[nearest.1 as usize]
-                .read()
-                .get(usize::from(level))
-                .cloned()
-                .unwrap_or_default();
-            for neighbour in links {
+            self.snapshot_links(nearest.1, level, &mut links);
+            for &neighbour in &links {
                 let distance = self.distance(vectors, query, neighbour);
                 if distance < nearest.0 {
                     nearest = (distance, neighbour);
@@ -379,6 +386,7 @@ impl Hnsw {
         with_visited(self.links.len(), |visited| {
             let mut candidates: BinaryHeap<Reverse<Ordered<u32>>> = BinaryHeap::new();
             let mut results: BinaryHeap<Ordered<u32>> = BinaryHeap::new();
+            let mut links = Vec::new();
             for &(distance, node) in entries {
                 if visited.insert(node) {
                     candidates.push(Reverse(Ordered(distance, node)));
@@ -395,12 +403,8 @@ impl Hnsw {
                 if full && results.peek().is_some_and(|worst| distance > worst.0) {
                     break;
                 }
-                let links = self.links[node as usize]
-                    .read()
-                    .get(usize::from(level))
-                    .cloned()
-                    .unwrap_or_default();
-                for neighbour in links {
+                self.snapshot_links(node, level, &mut links);
+                for &neighbour in &links {
                     if !visited.insert(neighbour) {
                         continue;
                     }
@@ -471,6 +475,42 @@ fn with_visited<R>(nodes: usize, f: impl FnOnce(&mut Visited<'_>) -> R) -> R {
 mod tests {
     use super::*;
     use crate::{exact, tests::random_vectors};
+
+    #[test]
+    fn adjacency_snapshots_reuse_storage_and_release_the_lock() {
+        let ordered = vec![2, 1, 2, 0, 1, 0, 2, 1];
+        let graph = Hnsw::from_parts(HnswParts {
+            parameters: HnswParameters::default(),
+            metric: Metric::L2,
+            entry: Some((0, 0)),
+            links: vec![vec![ordered.clone()], vec![vec![0]], vec![Vec::new()]],
+        })
+        .expect("sound parts");
+        let mut snapshot = Vec::new();
+        graph.snapshot_links(0, 0, &mut snapshot);
+        let pointer = snapshot.as_ptr();
+        let capacity = snapshot.capacity();
+        for (node, level, expected) in [
+            (0, 0, ordered.as_slice()),
+            (1, 0, &[0]),
+            (2, 0, &[]),
+            (0, 0, ordered.as_slice()),
+            (1, 1, &[]),
+        ] {
+            graph.snapshot_links(node, level, &mut snapshot);
+            assert_eq!(snapshot, expected);
+            assert_eq!(snapshot.as_ptr(), pointer);
+            assert_eq!(snapshot.capacity(), capacity);
+            let mut levels = graph.links[node as usize]
+                .try_write()
+                .expect("snapshot released its read lock");
+            if let Some(neighbours) = levels.get_mut(usize::from(level)) {
+                neighbours.reverse();
+                assert_eq!(snapshot, expected, "snapshot owns its copied links");
+                neighbours.reverse();
+            }
+        }
+    }
 
     /// The share of the exact `k` nearest that HNSW finds, over `queries` queries.
     fn recall(

@@ -47,6 +47,11 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    /// Installs the process's memory limit, once at startup, before opening stores.
+    pub fn install_process_memory_policy(&self) {
+        nrese_exec::memory::set_process_limit(self.store.process_memory_bytes);
+    }
+
     /// The effective settings, one `key = value` per line, for `check-config`. Credentials
     /// are never printed: authentication and AI show their mode and provider only.
     pub fn summary(&self) -> String {

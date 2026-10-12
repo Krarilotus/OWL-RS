@@ -53,12 +53,21 @@ impl CancellationToken {
         self.0.store(true, Ordering::Release);
     }
 
+    /// [`QueryEvaluationError::Cancelled`] once cancelled.
+    pub fn check(&self) -> Result<(), QueryEvaluationError> {
+        if self.is_cancelled() {
+            Err(QueryEvaluationError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
 
     /// The flag itself, for loops that check it without knowing the token.
-    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+    pub fn flag(&self) -> Arc<AtomicBool> {
         self.0.clone()
     }
 }

@@ -14,7 +14,9 @@ pub mod dl;
 pub mod draft_check;
 mod entailment;
 pub mod error;
-/// The process's memory and the limit long operations stop at ([`StoreConfig::process_memory_bytes`]).
+/// Process-memory measurements and explicit host policy helpers. Store operations use
+/// [`StoreConfig::process_memory_bytes`] for their own watches; opening a store does not
+/// install a process-wide limit. An embedding host may install that fallback explicitly.
 pub use nrese_exec::memory;
 pub mod graph_store;
 mod graph_store_executor;
@@ -29,6 +31,7 @@ mod rdf_io;
 pub mod reasoning;
 pub mod reasoning_state;
 pub mod running;
+mod runtime;
 pub mod scope;
 pub mod service;
 pub mod sessions;
@@ -89,6 +92,7 @@ pub use rdf_io::{convert_file, parse_payload, parse_payload_preserving_blank_nod
 pub use reasoning::{InferenceStep, MaterialisationReport, OntologyDiagnostic};
 pub use reasoning_state::{ConsistencyStatus, ReasoningState};
 pub use running::{RunningQueries, RunningQuery};
+pub use runtime::Runtime;
 pub use scope::{ReadContext, ReadScope, Requester, WriteScope};
 pub use service::StoreService;
 pub use sessions::{SESSION_IDLE, Sessions};

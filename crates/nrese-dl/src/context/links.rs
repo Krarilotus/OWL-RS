@@ -3,6 +3,7 @@
 
 use super::atoms::{Atom, CTerm, FuncId, is_subset, union_into};
 use super::engine::Strategy;
+use super::memory::push;
 use super::rules::{Edge, Incomplete, Message, Scratch, Worker};
 use super::state::{ClauseId, ClauseRef, ContextId, Rule};
 
@@ -51,9 +52,9 @@ impl Worker<'_> {
         s.waiting.clear();
         s.waiting.extend_from_slice(waiting);
         s.found.clear();
-        s.batch.clear();
-        let waiting = std::mem::take(&mut s.waiting);
-        for &r in &waiting {
+        s.clear_batch();
+        for index in 0..s.waiting.len() {
+            let r = s.waiting[index];
             let at = self.state.remote[r as usize]
                 .body
                 .iter()
@@ -67,7 +68,6 @@ impl Worker<'_> {
                 self.state.incomplete.get_or_insert(Incomplete::Join);
             }
         }
-        s.waiting = waiting;
         self.conclude(&s.found);
         self.scratch = s;
     }
@@ -98,9 +98,11 @@ impl Worker<'_> {
             s.left = true;
             return;
         }
-        let found = s.found.len();
-        if self.engine.budget().max_join.is_some_and(|m| found >= m)
-            || (found % 4096 == 4095 && self.engine.out_of_budget())
+        if self
+            .engine
+            .budget()
+            .max_join
+            .is_some_and(|m| s.found.len() >= m)
         {
             self.engine.exhaust();
             return;
@@ -126,7 +128,14 @@ impl Worker<'_> {
         }
         if last {
             if self.engine.prune_pred {
-                s.batch.entry(remote.head).or_default().insert(acc, 0);
+                let trie = s.batch.entry(remote.head).or_insert_with(|| {
+                    let trie = super::settrie::SetTrie::default();
+                    s.batch_bytes += trie.bytes();
+                    trie
+                });
+                let before = trie.bytes();
+                trie.insert(acc, 0);
+                s.batch_bytes += trie.bytes() - before;
             }
             s.refs.clear();
             if self.engine.proofs {
@@ -151,6 +160,10 @@ impl Worker<'_> {
                 }
             }
             s.found.push(acc, remote.head, Rule::Pred, NONE, &s.refs);
+            // A spent budget stops the join at its next step.
+            if s.found.len().is_multiple_of(4096) {
+                self.checkpoint(s.bytes());
+            }
             return;
         }
         let clauses = &self.state.clauses;
@@ -184,10 +197,11 @@ impl Worker<'_> {
         let program = &self.engine.program;
         let unconditional = self.state.clauses.recs[c as usize].body == 0;
         let entry = self.state.succ.entry(f).or_default();
+        let bytes = &mut self.state.successor_bytes;
         let mut grew = false;
         if let Some(a) = head.down().filter(|&a| program.is_su(a)) {
             if !entry.k2.contains(&a) {
-                entry.k2.push(a);
+                push(&mut entry.k2, a, bytes);
                 grew = true;
                 for e in &mut entry.edges {
                     if !e.core.contains(&a) && !e.sent.contains(&a) {
@@ -196,7 +210,7 @@ impl Worker<'_> {
                 }
             }
             if unconditional && !entry.k1.contains(&a) {
-                entry.k1.push(a);
+                push(&mut entry.k1, a, bytes);
             }
         }
         if (!grew && !entry.edges.is_empty()) || entry.edges.iter().any(|e| e.complete) {
@@ -230,12 +244,14 @@ impl Worker<'_> {
         let at = match entry.edges.iter().position(|e| e.to == to) {
             Some(at) => at,
             None => {
-                entry.edges.push(Edge {
+                *bytes += std::mem::size_of_val(core.as_slice());
+                let edge = Edge {
                     to,
                     core: core.into_boxed_slice(),
                     sent: Vec::new(),
                     complete: false,
-                });
+                };
+                push(&mut entry.edges, edge, bytes);
                 self.state.clauses.counters.edges += 1;
                 self.out.send(
                     to,
@@ -250,7 +266,7 @@ impl Worker<'_> {
         let edge = &mut entry.edges[at];
         for &a in &entry.k2 {
             if !edge.core.contains(&a) && !edge.sent.contains(&a) {
-                edge.sent.push(a);
+                push(&mut edge.sent, a, bytes);
                 self.out.send(to, Message::Possible(a));
             }
         }

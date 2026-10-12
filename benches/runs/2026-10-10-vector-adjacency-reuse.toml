@@ -1,0 +1,20 @@
+# A run record (benches/runs/README.md). Outcomes and identities; samples stay under results.
+id = "2026-10-10-vector-adjacency-reuse"
+level = "focused"
+kit = "perf lab"
+purpose = "HNSW traversal reuses one adjacency buffer per search routine instead of cloning each node's list"
+started = "2026-10-10"
+host = "phuoc-yu"
+build_host = "office-pc"
+scenario = "matched"
+baseline = { commit = "62ae2e0faeafea162f3a4dbf58cee9a56e8254d5", dirty = true, patch_sha256 = "b9777281354c08e509572f265b73e975e65c329f03308951f829452b474843b1", binary_sha256 = "730383abc043a5acab304b1515f2c0bf5935779fb0f6202079d25fd817490bf5", note = "the collector candidate" }
+candidate = { commit = "62ae2e0faeafea162f3a4dbf58cee9a56e8254d5", dirty = true, patch_sha256 = "a6a643962ae268969320bdc10f92a178a03c90a7dffa581626a8e5aa1948ccdc", binary_sha256 = "ebf996415404aa05259d9707a37f8545f6b2cdd230b81e2cdf5f9f180696572c" }
+protocol = { pairs = 10, processes = 100, allocation_processes = 16, frozen_graphs = 432, cpus = "workload 1-7,9-15; controller 0,8", limits = "6 GiB, no swap, cache off", statistic = "two-level bootstrap, 1000 rounds, seed 1; max(10%, both spreads), no absolute floor" }
+results = { root = "phuoc-yu:/home/krarilotus/nrese-prep-20261009-4e8bd38/adjacency-qualification-20261010", raw_answers = 730 }
+publishable = "all"
+cases = [
+  { case = "frozen-graph traversal", verdict = "pass", note = "432 configurations: ordered IDs, distance bits and acceptance traces equal" },
+  { case = "graph preparation allocations", verdict = "fewer", note = "81.18-81.44% fewer allocations, 44.62-44.68% less allocation traffic" },
+  { case = "service-exact, probe-exact, filtered-exact, filtered-ranked-exact, highfanout-exact", verdict = "same", note = "25 query and 25 first-execution comparisons, no flag; bags, ranks and scores equal" },
+  { case = "filtered-auto, filtered-ranked-auto, highfanout-auto", verdict = "wrong", note = "recall below 0.90 on both sides: no timing" },
+]

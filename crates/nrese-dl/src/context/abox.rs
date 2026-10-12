@@ -37,6 +37,14 @@ pub struct Abox {
     pub clash: bool,
 }
 
+impl Abox {
+    pub(super) fn bytes(&self) -> usize {
+        super::memory::nested(&self.types)
+            + super::memory::vec(&self.edges)
+            + super::memory::table::<u32, ConceptId>(self.existential.capacity())
+    }
+}
+
 impl Compiler {
     /// The assertions over individuals, `SameIndividual` merged: their concepts, the edges
     /// between them, and, for each DL-clause that a named edge can fire and whose head is
@@ -143,6 +151,9 @@ impl Compiler {
 
 /// The individuals' contexts and what is known of them, to a fixpoint.
 pub struct Individuals {
+    /// The estimate held with the engine ([`Engine::hold`]).
+    held: usize,
+    type_count: usize,
     types: Vec<BTreeSet<ConceptId>>,
     edges: HashSet<(RoleId, u32, u32)>,
     pub contexts: Vec<ContextId>,
@@ -150,10 +161,35 @@ pub struct Individuals {
 }
 
 impl Individuals {
+    /// Reports the estimate of what this holds to the engine; false once the budget ran
+    /// out.
+    fn report(&mut self, engine: &Engine) -> bool {
+        // A `BTreeSet` doesn't say its capacity: 64 bytes an entry.
+        let bytes = super::memory::vec(&self.types)
+            + self.type_count * 64
+            + super::memory::table::<(RoleId, u32, u32), ()>(self.edges.capacity())
+            + super::memory::vec(&self.contexts);
+        engine.hold(&mut self.held, bytes)
+    }
+
+    /// Whether the assertions are consistent; gives the estimate back to the engine.
+    pub fn release(mut self, engine: &Engine) -> bool {
+        engine.hold(&mut self.held, 0);
+        self.consistent
+    }
+
+    fn insert_type(&mut self, at: usize, concept: ConceptId) -> bool {
+        let new = self.types[at].insert(concept);
+        self.type_count += usize::from(new);
+        new
+    }
+
     /// Saturates the individuals' contexts on `engine` and evaluates the clauses on the
     /// edges until nothing changes.
-    pub fn saturate(engine: &Engine, abox: &Abox, threads: usize) -> Self {
+    pub fn saturate(engine: &Engine, abox: &Abox, workers: &nrese_exec::workers::Workers) -> Self {
         let mut me = Self {
+            held: 0,
+            type_count: abox.types.iter().map(Vec::len).sum(),
             types: abox
                 .types
                 .iter()
@@ -163,14 +199,18 @@ impl Individuals {
             contexts: Vec::new(),
             consistent: !abox.clash,
         };
-        if abox.clash {
+        if abox.clash || !me.report(engine) {
             return me;
         }
         loop {
+            if engine.out_of_budget() {
+                return me;
+            }
             let mut seeds = Vec::new();
             me.contexts = me
                 .types
                 .iter()
+                .take_while(|_| !engine.exhausted())
                 .map(|types| {
                     let core: Vec<Atom> =
                         types.iter().map(|&c| Atom::concept(c, CTerm::X)).collect();
@@ -181,16 +221,19 @@ impl Individuals {
                     id
                 })
                 .collect();
-            engine.run(&seeds, threads);
+            if !me.report(engine) {
+                return me;
+            }
+            engine.run(&seeds, workers);
             let mut changed = false;
-            for (a, &context) in me.contexts.iter().enumerate() {
-                let state = lock(&engine.context(context).state);
+            for a in 0..me.contexts.len() {
+                let state = lock(&engine.context(me.contexts[a]).state);
                 if state.clauses.unsat {
                     me.consistent = false;
                     return me;
                 }
                 for s in state.clauses.subsumers() {
-                    changed |= me.types[a].insert(s);
+                    changed |= me.insert_type(a, s);
                 }
                 for r in state.clauses.self_loops() {
                     changed |= me.edges.insert((r, a as u32, a as u32));
@@ -203,24 +246,29 @@ impl Individuals {
                 }
                 Some(more) => changed |= more,
             }
-            if !changed {
+            if !me.report(engine) || !changed {
                 return me;
             }
         }
     }
 
     /// One pass of the clauses over the edges; `None` if one derives `⊥`, else whether
-    /// anything was new.
+    /// anything was new. Stops early where the budget ran out.
     fn edges_round(&mut self, engine: &Engine, abox: &Abox) -> Option<bool> {
         let program = &engine.program;
         let mut changed = false;
         let mut todo: Vec<(RoleId, u32, u32)> = self.edges.iter().copied().collect();
+        let mut step = 0u32;
         while let Some((r, a, b)) = todo.pop() {
+            step = step.wrapping_add(1);
+            if step.is_multiple_of(256) && (!self.report(engine) || engine.out_of_budget()) {
+                return Some(changed);
+            }
             let slots = program.by_out[r as usize]
                 .iter()
                 .map(|&s| (s, a, b))
                 .chain(program.by_in[r as usize].iter().map(|&s| (s, b, a)));
-            for (slot, x, z) in slots.collect::<Vec<_>>() {
+            for (slot, x, z) in slots {
                 let (clause, pos) = (slot.clause, slot.pos);
                 let dl = &program.clauses[clause as usize];
                 // The slot binds the neighbour: S(x, z) from x's side, S(z, x) from z's.
@@ -239,12 +287,12 @@ impl Individuals {
                     TermPat::Var(Var::Z(_)) => (z, z),
                     TermPat::Func(_) => {
                         let e = abox.existential[&clause];
-                        changed |= self.types[x as usize].insert(e);
+                        changed |= self.insert_type(x as usize, e);
                         continue;
                     }
                 };
                 match h.kind {
-                    KindPat::Concept => changed |= self.types[at as usize].insert(h.pred),
+                    KindPat::Concept => changed |= self.insert_type(at as usize, h.pred),
                     KindPat::Out | KindPat::In => {
                         // S(x, v) or S(v, x) with v the head's term.
                         let edge = match (h.kind, at == x) {

@@ -18,6 +18,7 @@
 //!   --max-join N          the most conclusions one context-core join may make
 //!   --max-join-steps N    the most steps one context-core Pred join may take
 //!   --max-memory-mb N     the most memory the process may hold while the context core runs
+//!   --task-memory-mib N   sampled saturation-capacity envelope; 0 disables observations
 //!   --clauses             print the DL-clauses with more than one head atom, then stop
 //!   --no-context-core --no-inline --no-lower-bound --no-exact-shortcut --no-model-pruning
 //!   --no-skip-seen --no-tbox-only --no-detached-probes --no-reuse-model
@@ -31,9 +32,14 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use nrese_dl::classify::{self, Options};
+use nrese_exec::workers::Workers;
 use nrese_owl::{FunctionalReader, Intern, Statement, Term, TermKind, Terms};
 use nrese_rdf::{BlankNode, Literal, NamedNode, Term as RdfTerm, Triple};
 use nrese_rdf_io::{RdfFormat, RdfParser};
+
+#[path = "support/task_memory.rs"]
+mod support;
+use support::task_memory;
 
 /// The terms of the triples, by id.
 #[derive(Default)]
@@ -195,7 +201,7 @@ fn args() -> Result<Args, String> {
                 .ok_or(format!("{what} N"))
         };
         match arg.as_str() {
-            "--threads" => a.options.threads = number("--threads")?.max(1) as usize,
+            "--threads" => a.options.workers = Workers::new(number("--threads")? as usize),
             "--repeat" => a.repeat = number("--repeat")?.max(1) as usize,
             "--timeout" => a.options.timeout = Some(Duration::from_secs(number("--timeout")?)),
             "--lower-bound-timeout" => {
@@ -230,6 +236,9 @@ fn args() -> Result<Args, String> {
             }
             "--max-memory-mb" => {
                 a.options.max_memory = Some(number("--max-memory-mb")? << 20);
+            }
+            "--task-memory-mib" => {
+                a.options.task_memory = task_memory(number("--task-memory-mib")?)?;
             }
             "--expand-at-most" => {
                 let n = number("--expand-at-most")? as u32;

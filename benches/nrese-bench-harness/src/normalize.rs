@@ -86,6 +86,29 @@ pub fn extract_binding_count(value: &Value) -> Result<usize> {
         .ok_or_else(|| anyhow!("missing SPARQL bindings array"))
 }
 
+/// A COUNT scalar is one typed integer binding, not the number of result rows.
+pub fn extract_unsigned_count(value: &Value, variable: &str) -> Result<u64> {
+    let rows = value
+        .pointer("/results/bindings")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("missing SPARQL bindings array"))?;
+    let [row] = rows.as_slice() else {
+        return Err(anyhow!("COUNT requires exactly one binding row"));
+    };
+    if row.as_object().is_none_or(|bindings| bindings.len() != 1) {
+        return Err(anyhow!("COUNT requires exactly one scalar binding"));
+    }
+    let term = &row[variable];
+    if term["type"] != "literal" || term["datatype"] != "http://www.w3.org/2001/XMLSchema#integer" {
+        return Err(anyhow!("COUNT requires an xsd:integer literal"));
+    }
+    term["value"]
+        .as_str()
+        .ok_or_else(|| anyhow!("missing COUNT lexical value"))?
+        .parse()
+        .context("COUNT is not a nonnegative u64 integer")
+}
+
 pub fn canonicalize_bindings_set(value: &Value) -> Result<BTreeSet<String>> {
     let bindings = value
         .get("results")
@@ -215,6 +238,34 @@ mod tests {
         normalize_content_type, percentile,
     };
     use std::collections::BTreeSet;
+
+    #[test]
+    fn count_scalar_is_a_typed_integer_not_a_result_row_count() {
+        use serde_json::json;
+        let result = |term| json!({"results":{"bindings":[{"c":term}]}});
+        let integer = |value: String| json!({"type":"literal", "datatype":"http://www.w3.org/2001/XMLSchema#integer", "value":value});
+        for value in [0, 5, u64::MAX] {
+            assert_eq!(
+                super::extract_unsigned_count(&result(integer(value.to_string())), "c").unwrap(),
+                value
+            );
+        }
+        for value in ["-1", "1.5", "18446744073709551616", "", "NaN"] {
+            assert!(
+                super::extract_unsigned_count(&result(integer(value.to_owned())), "c").is_err()
+            );
+        }
+        for malformed in [
+            json!({}),
+            json!({"results":{"bindings":[]}}),
+            json!({"results":{"bindings":[{"c":integer("1".into())},{"c":integer("1".into())}]}}),
+            result(json!({"type":"uri","value":"1"})),
+            result(json!({"type":"literal","value":"1"})),
+            json!({"results":{"bindings":[{"wrong":integer("1".into())}]}}),
+        ] {
+            assert!(super::extract_unsigned_count(&malformed, "c").is_err());
+        }
+    }
 
     #[test]
     fn canonicalizes_ntriples_lines() {

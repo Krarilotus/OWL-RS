@@ -1,0 +1,24 @@
+# A run record (benches/runs/README.md). Outcomes and identities; samples stay under results.
+id = "2026-10-10-dl-alias-da4465d"
+level = "focused"
+kit = "reasoning/dl"
+purpose = "Retained DL probes apply assumptions to an individual's current representative: the cost of the correctness fix"
+started = "2026-10-09"
+finished = "2026-10-09T23:42:55Z"
+host = "office-pc"
+scenario = "native"
+baseline = { commit = "a60e482", dirty = false, binary_sha256 = "71d9fb89d5aa9acf01bfcdff9ce5cb1100b849bf3b96f4eb2f58a23bf9e77b4a", note = "the preserved be5c3d7 candidate binary, committed as a60e482" }
+candidate = { commit = "da4465d245a513b6b9c7fd2e2e392f6434eacc36", dirty = true, patch_sha256 = "2b60cf28e68ca75dde5be7793f9a0ca4a3027349453e02bef82a084c191847da", binary_sha256 = "afdc3d275c37c43718c28eb36d8312bf187f97efa354ecbdb666ebedb3f93e9c" }
+protocol = { pairs = 10, order = "BC/CB", widths = [1, 4], invocations = 280, repeats = "as 2026-10-09-dl-reuse-be5c3d7", checks = "canonical answers equal the earlier record before times" }
+results = { root = "office-pc:/home/krarilotus/nrese-prep-20261009-4e8bd38/dl-alias-da4465d", measurements_sha256 = "ecc02588a0660abec8c5feb2c928e001442cb9df5706f1b124046cd071b84e78", guards_before_sha256 = "a215d752b4c1bb23ce4a55f48824967bcb9a07388d76ec589a37ecf182350f77", guards_fixed_sha256 = "1e6519a2a2921dda12b6c3f3d9e92eff5d9eebfab0caf54c77409a9ae76adc71", seed_fixed_sha256 = "e8b0281dcc2d3bb98e3a764fd581e41d3729fbfcafa1f328bd6b5ba89d343917" }
+publishable = "all"
+cases = [
+  { case = "brute-force seed 5358 case 63", verdict = "pass", note = "failed on da4465d with model reuse (types [[0], []] for [[0], [0]]); passes with the fix; be5c3d7 passes" },
+  { case = "choice-real-300", verdict = "same", note = "47.35/19.10 -> 47.70/19.00 ms at widths 1/4; ranges overlap" },
+  { case = "horn-real-30000", verdict = "same", note = "43.35/43.45 -> 43.00/43.40 ms; peak RSS ranges overlap" },
+  { case = "ore-9881", verdict = "same", note = "397.00/288.70 -> 395.85/287.55 ms" },
+  { case = "ore-16542", verdict = "same", note = "1372.45/1212.75 -> 1377.60/1208.45 ms" },
+]
+findings = [
+  "Both alias guards fail before the fix and pass after it. The fix costs nothing measurable on these cases.",
+]

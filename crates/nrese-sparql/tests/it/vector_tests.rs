@@ -318,4 +318,50 @@ fn searches_go_first_when_the_pattern_is_large() {
         [["item/180", "1"], ["item/183", "2"], ["item/177", "3"]]
             .map(|r| r.map(str::to_owned).to_vec())
     );
+
+    // Two subjects share the best vector, and each has duplicate probe rows. Rank is
+    // per vector, while all RDF matches and their bag multiplicities must survive.
+    let angle = 90f32.to_radians();
+    let mut tx = engine.transaction();
+    tx.insert(
+        Quad::new(
+            ex("alias"),
+            ex("embedding"),
+            vector(&[angle.cos(), angle.sin()]),
+            GraphName::DefaultGraph,
+        )
+        .as_ref(),
+    );
+    tx.insert(
+        Quad::new(
+            ex("alias"),
+            ex("kind"),
+            ex("wanted"),
+            GraphName::DefaultGraph,
+        )
+        .as_ref(),
+    );
+    tx.commit().unwrap();
+    let found = rows(
+        &engine,
+        &format!(
+            "SELECT ?item ?r WHERE {{
+           {{ ?item ex:kind ex:wanted ; ex:embedding ?v }}
+           UNION {{ ?item ex:kind ex:wanted ; ex:embedding ?v }}
+           SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k 3 ; nrv:rank ?r }}
+         }} ORDER BY ?r ?item",
+            near(90.2)
+        ),
+        &QueryOptions::default(),
+    );
+    let expected: Vec<_> = [
+        ("alias", "1"),
+        ("item/180", "1"),
+        ("item/183", "2"),
+        ("item/177", "3"),
+    ]
+    .into_iter()
+    .flat_map(|(item, rank)| std::iter::repeat_n([item, rank].map(str::to_owned).to_vec(), 2))
+    .collect();
+    assert_eq!(found, expected);
 }

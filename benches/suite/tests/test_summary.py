@@ -13,6 +13,7 @@ import io
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -20,6 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from suitekit import compare, report, status  # noqa: E402
 from suitekit.schema import Result  # noqa: E402
 from suitekit.summary import summarise  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fast"))
+import compete  # noqa: E402
 
 FIELDS = list(Result.__dataclass_fields__)
 
@@ -59,7 +62,9 @@ def output(main, argv) -> str:
 
 class Contracts(unittest.TestCase):
     def setUp(self):
-        self.dir = Path(tempfile.mkdtemp())
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.dir = Path(temporary.name)
 
     def test_b1_a_failed_load_and_lost_queries_stay_visible(self):
         base = write(self.dir / "base", [load(), query("q1", 10), query("q2", 20)])
@@ -104,6 +109,24 @@ class Contracts(unittest.TestCase):
         text = output(report.main, [str(write(self.dir / "r", rows))])
         self.assertIn("| 2.0 |", text)
 
+    def test_distinct_records_paths_preserve_unequal_run_medians(self):
+        first = write(self.dir / "first" / "records",
+                      [load()] + [query("q1", 1, repeat=i) for i in range(1, 6)])
+        second = write(self.dir / "second" / "records", [load(), query("q1", 101)])
+        pair = compare.collect([first, second], None, False)[("w", "t", "nrese")]
+        item = pair.items["-"]["q1"]
+        self.assertEqual(len(pair.ok_runs()), 2)
+        self.assertEqual(sorted(map(len, item.repeats.values())), [1, 5])
+        self.assertEqual(item.estimate(), (51, 100 / 51))
+
+    def test_duplicate_resolved_csv_is_read_once(self):
+        path = write(self.dir / "records", [load(), query("q1", 1), query("q1", 3, repeat=2)])
+        alias = path.parent / ".." / "records" / path.name
+        paths = compare.files(f"{path.parent},{path},{alias}")
+        pair = compare.collect(paths, None, False)[("w", "t", "nrese")]
+        self.assertEqual(len(pair.ok_runs()), 1)
+        self.assertEqual(list(pair.items["-"]["q1"].repeats.values()), [[1, 3]])
+
     def test_b5_the_newest_of_a_day_is_the_latest(self):
         early = {"id": "early", "started": "2026-10-03T09:00",
                  "pairs": [{"workload": "w", "tier": "t", "system": "nrese", "outcome": "ok"}]}
@@ -132,6 +155,86 @@ class Contracts(unittest.TestCase):
         rows = [row(task="update", run=r, ms=100) for r in (1, 2, 3)]
         outcome = summarise(rows)[("w", "t", "nrese")].outcome()
         self.assertEqual((outcome["outcome"], outcome["runs"]), ("ok", 3))
+
+
+class CompetitorCompleteness(unittest.TestCase):
+    def verdict(self, rows):
+        # Pin the fixture's adjudications independently of the repository's datasets.
+        with patch("suitekit.summary.adjudications", return_value={}):
+            summary = compete.summarise_suite(rows)
+        return summary, compete.verdicts(summary)["other"]
+
+    def test_no_winner_from_an_incomplete_shared_intersection(self):
+        rows = [load(), load(system="other"), query("q1", 100), query("q2", 100),
+                query("q1", 1, system="other")]
+        _, verdict = self.verdict(rows)
+        self.assertIsNone(verdict["query_winner"])
+        self.assertNotIn("load_winner", verdict)
+        self.assertIn("incomplete", verdict["answers"])
+
+    def test_failure_wrong_answer_and_cold_timeout_exclude_winners(self):
+        for status, repeat in [("failed", 1), ("wrong", 1), ("timeout", 0)]:
+            rows = [load(), load(system="other"), query("q1", 100),
+                    query("q1", 1, system="other"),
+                    query("q1", 0.1, system="other", status=status, repeat=repeat)]
+            with self.subTest(status=status, repeat=repeat):
+                _, verdict = self.verdict(rows)
+                self.assertIsNone(verdict["query_winner"])
+                self.assertNotIn("load_winner", verdict)
+
+    def test_nrese_failure_or_count_dispute_also_excludes_winners(self):
+        for bad in (load(status="failed"), query("q1", 1, rows=2)):
+            rows = [load(), load(system="other"), query("q1", 100),
+                    query("q1", 1, system="other"), bad]
+            _, verdict = self.verdict(rows)
+            self.assertIsNone(verdict["query_winner"])
+
+    def test_missing_query_run_or_repeat_excludes_winners(self):
+        for missing in [(2, 1), (1, 2), (2, None)]:
+            rows = []
+            for system in ("nrese", "other"):
+                for run in (1, 2):
+                    rows.append(load(run=run, system=system))
+                    for repeat in (1, 2):
+                        if system == "other" and run == missing[0] and (missing[1] is None or repeat == missing[1]):
+                            continue
+                        rows.append(query("q1", 1, run=run, repeat=repeat, system=system))
+            _, verdict = self.verdict(rows)
+            self.assertIsNone(verdict["query_winner"])
+
+    def test_estimator_and_noise_are_the_suite_contract(self):
+        rows = []
+        for system in ("nrese", "other"):
+            for run, values in ((1, [1, 1, 1000]), (2, [2, 2, 1000]), (3, [100, 1000, 1000])):
+                rows.append(load(run=run, system=system))
+                rows += [query("q1", ms, run=run, repeat=i + 1, system=system)
+                         for i, ms in enumerate(values)]
+        summary, _ = self.verdict(rows)
+        self.assertEqual(summary["other"]["queries"]["q1"]["median_ms"], 2)
+        self.assertEqual(summary["other"]["queries"]["q1"]["noise"], 499.5)
+
+    def test_complete_answer_only_comparator_keeps_counts_without_query_winner(self):
+        rows = [load(), load(system="other"), query("q1", 10), query("q1", "", system="other")]
+        summary, verdict = self.verdict(rows)
+        self.assertTrue(summary["other"]["queries"]["q1"]["complete"])
+        self.assertEqual(verdict["answers"], "match")
+        self.assertIsNone(verdict["query_winner"])
+
+    def test_client_completion_counts_are_not_answer_disputes(self):
+        rows = [load(), load(system="other"), query("q1", 10), query("q1", 1, system="other"),
+                query("clients-8", 10, rows=100), query("clients-8", 1, rows=1000, system="other")]
+        _, verdict = self.verdict(rows)
+        self.assertEqual(verdict["query_winner"], "other")
+
+    def test_publication_permission_is_preserved_separately_from_completeness(self):
+        rows = [load(), load(system="other"), query("q1", 10), query("q1", 1, system="other")]
+        for r in rows:
+            if r["system"] == "other":
+                r["publish"] = "permission"
+        summary, verdict = self.verdict(rows)
+        self.assertTrue(summary["other"]["complete"])
+        self.assertEqual(verdict["query_winner"], "other")
+        self.assertEqual(verdict["publish"], "permission")
 
 
 if __name__ == "__main__":

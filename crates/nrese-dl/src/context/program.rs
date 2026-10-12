@@ -157,6 +157,47 @@ pub struct Program {
 }
 
 impl Program {
+    pub(super) fn bytes(&self) -> usize {
+        use super::memory::{lists, map, nested, vec};
+        let sources = |s: &Sources| {
+            std::mem::size_of_val(&**s)
+                + s.iter().map(|s| std::mem::size_of_val(&**s)).sum::<usize>()
+        };
+        vec(&self.clauses)
+            + self
+                .clauses
+                .iter()
+                .map(|c| std::mem::size_of_val(&*c.body) + sources(&c.sources))
+                .sum::<usize>()
+            + vec(&self.facts)
+            + vec(&self.vars)
+            + nested(&self.by_concept)
+            + nested(&self.by_out)
+            + nested(&self.by_in)
+            + self
+                .bare
+                .iter()
+                .chain(&self.keyed_all)
+                .map(nested)
+                .sum::<usize>()
+            + lists(&self.keyed)
+            + vec(&self.funcs)
+            + vec(&self.at_most_one)
+            + self
+                .at_most_one
+                .iter()
+                .map(|a| std::mem::size_of_val(&*a.guard) + sources(&a.sources))
+                .sum::<usize>()
+            + lists(&self.at_most_one_by_role)
+            + lists(&self.at_most_one_by_guard)
+            + vec(&self.su_concept)
+            + vec(&self.su_out)
+            + vec(&self.su_in)
+            + vec(&self.names)
+            + vec(&self.flipped)
+            + map(&self.role_ids)
+    }
+
     /// Whether `atom`, an atom of a successor context, is a successor trigger: the
     /// predecessor sends it as a possible atom (`K₂` of the Succ rule).
     pub fn is_su(&self, atom: Atom) -> bool {

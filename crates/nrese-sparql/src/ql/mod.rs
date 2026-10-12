@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
+use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, SnapshotIdentity, TermId};
 use nrese_owl::ql::Tbox;
 use nrese_rdf::{NamedNodeRef, Term};
 
@@ -18,6 +18,8 @@ pub use nrese_owl::ql::{Closure, Limits};
 pub use print::{PrintForm, Printed, print};
 
 mod print;
+#[cfg(test)]
+mod tests;
 
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
@@ -112,8 +114,8 @@ pub struct QlRewriting {
     limits: Limits,
     cached: Mutex<Vec<Cached>>,
     /// Whether the data has a witness's tree wherever it folds, per probe, for one
-    /// snapshot revision (design §3).
-    realised: Mutex<(u64, HashMap<String, bool>)>,
+    /// snapshot view (design §3).
+    realised: Mutex<(Option<SnapshotIdentity>, HashMap<String, bool>)>,
 }
 
 /// Schemas compiled for different readers kept at once.
@@ -124,10 +126,14 @@ struct Cached {
     /// The graphs the schema was read from: every graph (`None`), or a reader's who sees
     /// only the inferences its graphs support.
     access: Option<GraphAccess>,
-    /// The snapshot it was read from: revision and sizes of the two stacks.
-    key: (u64, u64, u64),
-    /// A hash of the schema statements: a snapshot with the same schema reuses the TBox.
-    schema: u64,
+    /// The exact snapshot view it was read from, including pending changes and masks.
+    key: SnapshotIdentity,
+    /// The exact sorted input, moved from the schema scan. Equality is linear in the
+    /// schema size, as hashing was; a hash collision must never select another TBox.
+    schema: Box<[nrese_owl::Statement]>,
+    /// Compilation also needs the dictionary's id of Thing, even if no schema axiom
+    /// mentions it. Ordinary data can introduce that id without changing the schema.
+    thing: Option<nrese_owl::Term>,
     tbox: Arc<Tbox>,
 }
 
@@ -138,22 +144,23 @@ impl QlRewriting {
             closure,
             limits: Limits::default(),
             cached: Mutex::new(Vec::new()),
-            realised: Mutex::new((u64::MAX, HashMap::new())),
+            realised: Mutex::new((None, HashMap::new())),
         }
     }
 
-    /// Whether the data at snapshot revision `revision` has the tree of probe `key`
-    /// wherever it folds: `compute`d once per revision and probe (`None`: not asked, the
-    /// query's questions spent; `false` then, and nothing kept).
+    /// Whether the data at snapshot `identity` has the tree of probe `key`
+    /// wherever it folds, memoised per view and probe (`None`: not asked, the query's
+    /// questions spent; `false` then, and nothing kept). Concurrent misses may compute
+    /// independently; the query itself runs outside the cache lock.
     pub(crate) fn realised(
         &self,
-        revision: u64,
+        identity: SnapshotIdentity,
         key: &str,
         compute: impl FnOnce() -> Option<bool>,
     ) -> bool {
         {
             let cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
-            if cache.0 == revision
+            if cache.0 == Some(identity)
                 && let Some(&known) = cache.1.get(key)
             {
                 return known;
@@ -164,8 +171,8 @@ impl QlRewriting {
             return false;
         };
         let mut cache = self.realised.lock().unwrap_or_else(|p| p.into_inner());
-        if cache.0 != revision {
-            *cache = (revision, HashMap::new());
+        if cache.0 != Some(identity) {
+            *cache = (Some(identity), HashMap::new());
         }
         cache.1.insert(key.to_owned(), known);
         known
@@ -193,7 +200,7 @@ impl QlRewriting {
     }
 
     /// The QL part of `snapshot`'s schema, compiled. Read once per snapshot, and compiled
-    /// only when the schema statements changed: data commits reuse it.
+    /// only when the schema or compiler vocabulary changes; other data commits reuse it.
     ///
     /// Graph access (design §1) matches what the reader sees of the RL closure: a reader
     /// who sees only the inferences its graphs support (`inferred = "supported"`) gets the
@@ -201,31 +208,29 @@ impl QlRewriting {
     /// schema, as the closure it reads was computed with it.
     pub(crate) fn tbox(&self, snapshot: &Snapshot, access: Option<&GraphAccess>) -> Arc<Tbox> {
         let access = access.filter(|a| a.inferred_by_support);
-        let key = (
-            snapshot.revision(),
-            snapshot.len_in(ReadModel::Asserted),
-            snapshot.len_in(ReadModel::Inferred),
-        );
+        let key = snapshot.identity();
         let mut cached = self.cached.lock().unwrap_or_else(|p| p.into_inner());
         let at = cached.iter().position(|c| c.access.as_ref() == access);
         if let Some(c) = at.map(|i| &cached[i]).filter(|c| c.key == key) {
             return Arc::clone(&c.tbox);
         }
+        // A snapshot bounds its dictionary reads, so an identity hit above needs no
+        // lookup. Across identities, unchanged statements alone are not sufficient.
+        let thing = snapshot
+            .lookup(nrese_rdf::vocab::owl::THING.into())
+            .map(TermId::raw);
         let mut statements = schema_statements(snapshot);
         if let Some(access) = access {
             statements.retain(|s| access.allows_id(snapshot, TermId::from_raw(s.graph)));
         }
-        let schema = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            statements.hash(&mut hasher);
-            hasher.finish()
-        };
-        if let Some(c) = at.map(|i| &mut cached[i]).filter(|c| c.schema == schema) {
+        if let Some(c) = at
+            .map(|i| &mut cached[i])
+            .filter(|c| c.thing == thing && c.schema.as_ref() == statements)
+        {
             c.key = key;
             return Arc::clone(&c.tbox);
         }
-        let tbox = Arc::new(compile(snapshot, &statements, self.closure));
+        let tbox = Arc::new(compile(snapshot, &statements, self.closure, thing));
         if let Some(i) = at {
             cached.remove(i);
         }
@@ -235,7 +240,8 @@ impl QlRewriting {
         cached.push(Cached {
             access: access.cloned(),
             key,
-            schema,
+            schema: statements.into_boxed_slice(),
+            thing,
             tbox: Arc::clone(&tbox),
         });
         tbox
@@ -362,9 +368,13 @@ impl nrese_owl::Terms for SnapshotTerms<'_> {
     }
 }
 
-fn compile(snapshot: &Snapshot, statements: &[nrese_owl::Statement], closure: Closure) -> Tbox {
+fn compile(
+    snapshot: &Snapshot,
+    statements: &[nrese_owl::Statement],
+    closure: Closure,
+    thing: Option<nrese_owl::Term>,
+) -> Tbox {
     let terms = SnapshotTerms(snapshot);
     let ontology = nrese_owl::read(statements, &terms);
-    let thing = iri(snapshot, OWL, "Thing").map(TermId::raw);
     Tbox::compile(&ontology, closure, thing)
 }
