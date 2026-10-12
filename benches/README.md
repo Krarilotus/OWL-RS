@@ -86,7 +86,8 @@ query on the same data is one group, classified `ok`, `wrong` (whose), `incomple
 | A native runtime for the fast suite: host processes in capped scopes, on a measure host without Docker (`NRESE_FAST_RUNTIME=native`, [fast/README.md](fast/README.md#how-it-measures)) | done |
 | One case registry: `fast/cases.toml` grows `levels`, `needs`, `expect` and `data = "dataset:…"`; the fast runner moves into `suitekit` as the native plan kind; `fast.py` becomes `suite.py run --level focused` | next |
 | One `compare` over result rows: `suitekit/compare.py` reads fast reports, perf-lab reports and suite results, in the order missing, answers, time, memory by kind, disk; `fast.py compare` and `suite.py compare` are it. Suite pairs still use `summary.py`'s estimator: the bootstrap for them is the next step | started |
-| `perf-lab.sh`, `perf-lab-compare.py` and `fast/compete.py` retire, the suite running comparators on any case | next |
+| `perf-lab.sh` and `perf-lab-compare.py` retired: the `lab-*` fast cases (rows pinned; the same rows and times within the old runs' spread on Phuoc-Yu, 12 Oct 2026) and the one `compare` | done |
+| `fast/compete.py` folds into the suite, the suite running comparators on any case | next |
 | Checkpointed chunks for level 3: resume after a pause, keep the order, never rerun a finished case | next |
 | The result row's answer and memory-kind fields | next |
 | Level 4: `runtime = "apptainer"` on `draco`, Zebratlas as a workload | later |
@@ -131,7 +132,6 @@ benches/
     ├── oracle/          Jena's ARQ as a second oracle for SPARQL answers
     ├── oxigraph-comparison/  NRESE's RDF bundle against Oxigraph's libraries
     ├── nrese-bench-harness/  the Rust HTTP client: query-mix, write-scaling, compatibility packs
-    ├── perf-lab.sh, perf-lab-compare.py  NRESE's store and query engine alone, in Docker (to fold into fast cases)
     ├── probes/          single measurements: HTTP latency, large results, memory, autocompletion
     └── cluster/         the same suite on a SLURM cluster (Apptainer)
 ```
@@ -157,7 +157,7 @@ benches/
 | [clients](clients/README.md) | client libraries end to end | `run-all.sh` | stdout | — |
 | [oracle](oracle/README.md) | NRESE's SPARQL answers against Jena's | its script | `oracle/results/` | — |
 | [oxigraph-comparison](oxigraph-comparison/README.md) | parsers, serialisers and evaluators against Oxigraph's | `cargo test`, `cargo run --bin bench` | `oxigraph-comparison/results/` | — |
-| perf lab | the store and query engine without HTTP, per query p50; the fast suite's measuring tool | `perf-lab.sh` | — | `baselines/perf-lab/*.json` |
+| perf lab | the store and query engine without HTTP, per query p50; the fast suite's measuring tool, on the perf lab's datasets the `lab-*` cases | `fast.py run --cases lab-…` | — | `baselines/perf-lab/*.json` (until 27 Sep 2026; `compare` reads them) |
 | [probes](probes/README.md) | one property at a time | one script each | stdout | — |
 | [cluster](cluster/README.md) | the suite on Draco | `suite.sbatch` | the job's directory | record in `runs/` |
 
