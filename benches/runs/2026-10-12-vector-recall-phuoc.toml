@@ -1,0 +1,21 @@
+# A run record (benches/runs/README.md). Written by hand: a diagnosis through the queue.
+id = "2026-10-12-vector-recall-phuoc"
+level = "focused"
+kit = "fast (vector-knn-filtered's queries in variants; tmp diagnosis script through queue.py)"
+purpose = "Why vector-knn-filtered's approximate recall fails its 0.9 gate: the graph's own recall, the filter's share, the search beam"
+started = "2026-10-12T14:00"
+host = "phuoc-yu"
+scenario = "native"
+candidate = { commit = "aabd47a732c64c12b7721c44c2409dee6523993d", dirty = false, binary_sha256 = "64ffedfd2eb8d423a57b3d668ff7d1f8805cbdcc5b59426c306a3ed18d4a6a9c", note = "binary_sha256: perf_lab, built on office-pc" }
+protocol = { data = "vectors items=200000 dim=64 kinds=10 (the case's), its five query vectors and the generator's true ten nearest of kind k3", runs = "20 per query, k = 10, cosine", variants = "unfiltered exact and approximate (truth: the exact search); filtered by kind with beam 64 (default), 256, 1024 and exact (truth: the generator's)", graph = "prepared before timing (--prepare-vector-graph 64:cosine), and built in the background as the case did until now", host_config = "phuoc-yu since 2026-10-12T13:00" }
+results = { root = "phuoc-yu:/home/krarilotus/owlrs/results/vector-diag-aabd47a", files_sha256 = "5ed9536bbe6732036aeb3fff0ef140530769d352152c5971e5ce17a79b7a868f" }
+publishable = "all"
+cases = [
+  { case = "unfiltered, graph prepared", verdict = "wrong", note = "recall@10 0.48 at beam 64 (0.44 ms for the five queries); the exact scan 1.00 (2.7 ms)" },
+  { case = "filtered, graph prepared", verdict = "wrong", note = "recall@10 0.56 at beam 64 (2.4 ms), 0.56 at 256 (3.5 ms), 0.96 at 1024 (11.1 ms); filtered exact 1.00 (10.7 ms)" },
+  { case = "graph built in the background", verdict = "wrong", note = "unfiltered 0.60, filtered 0.50 / 0.64 / 0.94 at beam 64 / 256 / 1024: searches before the graph is ready scan exactly, so the result depends on timing" },
+]
+findings = [
+  "A product issue, two causes. The HNSW graph's own recall on these random 64-dimensional vectors is about half at the default beam (0.48 unfiltered); and a filter passing 10 % of the vectors sends the search through the graph (exact only below 2 %), where reaching 0.9 needs beam 1024 at the exact scan's cost. Candidates: build quality (M, ef_construction) for such data; an exact scan when the graph's expected recall at the beam falls short of the request; the selectivity threshold from cost, not a fixed 2 %.",
+  "The case's check stays at 0.9. It now prepares the graph before timing, so it measures the graph alone and not a mix of exact scans and graph searches depending on when the background build finished.",
+]
