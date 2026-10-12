@@ -1,0 +1,30 @@
+# A run record (benches/runs/README.md). Coverage only: GraphDB's measurements stay private
+# (competitors/README.md, licence rules).
+id = "2026-10-09-graphdb-coverage"
+level = "full"
+kit = "competitors"
+purpose = "Which registered workloads GraphDB Free can be compared on, and what each still lacks"
+started = "2026-10-09"
+host = "office-pc"
+scenario = "matched"
+protocol = { edition = "GraphDB Free 11.5: one core, two concurrent queries, five repositories, 32-bit entity IDs", resources = "the same one-CPU and total-memory allocation for both engines; one and two clients reported apart", repetitions = "3 interleaved to qualify, 10 for a claim" }
+publishable = "free systems only"
+findings = [
+  "Private: write-scaling 100k setup and the numeric COUNT check qualified; full 1M/10M, sustained timing and incremental reasoning open.",
+]
+coverage = [
+  { workload = "lubm", state = "suite path", gap = "qualify licensed inference and answers" },
+  { workload = "lubm-materialised", state = "suite path", gap = "inference off on both" },
+  { workload = "owl2bench", state = "suite path", gap = "QL semantic exceptions documented apart" },
+  { workload = "basics-mix", state = "suite path", gap = "qualify each size and its resource settings" },
+  { workload = "fast", state = "partial bridge", gap = "commit, SHACL and canonicalisation modes not replayed" },
+  { workload = "write-scaling", state = "GraphDB route and numeric checks", gap = "1M/10M and sustained timing" },
+  { workload = "integration-rg-gs-gnd", state = "partial", gap = "GraphDB adapter, cohort and full tiers; publication permission" },
+  { workload = "w3c-owl2-rl, w3c-sparql11", state = "NRESE kit", gap = "GraphDB endpoint execution" },
+  { workload = "w3c-shacl", state = "NRESE kit", gap = "GraphDB validation adapter" },
+  { workload = "geosparql", state = "partial NRESE compliance kit", gap = "GraphDB adapter, Geographica performance track" },
+  { workload = "clients", state = "NRESE smoke tools", gap = "GraphDB-compatible operations apart from NRESE-only APIs" },
+  { workload = "ore-2015, w3c-owl2-dl, owl2bench-classify", state = "not comparable", gap = "GraphDB has no full-DL classification" },
+  { workload = "ldbc-spb, real-ontologies, consistency, sparqloscope, bsbm, watdiv, era-shacl, fulltext-search, federation", state = "planned", gap = "official generators, drivers and qualification" },
+  { workload = "incremental maintenance", state = "planned", gap = "insert/delete ABox, schema changes, sameAs split/merge, checked before recomputation" },
+]

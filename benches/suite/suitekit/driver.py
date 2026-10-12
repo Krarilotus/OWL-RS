@@ -27,11 +27,13 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all
+from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all, post
+from .answers import Recorder
 from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime,
                       run_quiet, shell)
 from .manifest import Manifest, image_ids
 from .schema import Result, Writer
+from .summary import adjudications
 from .workloads import plans
 
 EXE = ".exe" if os.name == "nt" else ""
@@ -69,7 +71,13 @@ def arguments(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--keep", action="store_true",
                    help="keep datasets, the NRESE build and images for the next run of a batch")
     p.add_argument("--skip-build", action="store_true", help="use the existing NRESE and harness builds")
+    p.add_argument("--answers", choices=["off", "full"], default="off",
+                   help="full: capture every query's complete answer, untimed, and compare each system "
+                        "with --answers-reference (answers.py; writes answers.json)")
+    p.add_argument("--answers-reference", metavar="SYSTEM", help="the system the answers are compared with")
     args = p.parse_args(argv)
+    if args.answers == "full" and not args.answers_reference:
+        p.error("--answers full needs --answers-reference SYSTEM")
     args.cache = [m.strip() for m in args.cache.split(",") if m.strip()]
     if not args.cache or any(m not in ("off", "on") for m in args.cache) or len(set(args.cache)) != len(args.cache):
         p.error("--cache is off, on, or both in some order (off,on)")
@@ -154,6 +162,8 @@ class Suite:
         self.written: list[Result] = []
         self.skips: list[str] = []
         self.manifest: Manifest | None = None
+        self.answers = (Recorder(self.results, args.answers_reference, adjudications())
+                        if args.answers == "full" and not args.dry_run else None)
 
     # --- helpers ---
     def say(self, text: str):
@@ -427,6 +437,9 @@ class Suite:
         report = ctx.logs / f"queries{suffix}.json"
         # A log is replayed as it is: each entry once, in order, without a warm-up.
         warmup, runs = ("0", "1") if plan.replay else ("1", str(self.args.query_runs))
+        if self.answers and not plan.replay:
+            for query in plan.queries.glob("*.rq"):
+                self.answers.expect((plan.workload, plan.tier, base["regime"], query.name), key)
         command = [self.harness(), "query-mix", "--endpoint", endpoint.query, "--queries", str(plan.queries),
                    "--label", key, "--warmup", warmup, "--runs", runs,
                    "--timeout-s", str(self.args.query_timeout_s), "--report-json", str(report)]
@@ -486,6 +499,10 @@ class Suite:
                 self.emit(base, task="query", item=q["id"], repeat=i, status="wrong" if wrong else "ok",
                           ms="" if system.answers_only or latency is None else latency,
                           rows=q.get("rows") if q.get("rows") is not None else "", note=note)
+        if self.answers and not plan.replay:
+            for query in sorted(plan.queries.glob("*.rq")):
+                self.answers.capture(post, endpoint.query, (plan.workload, plan.tier, base["regime"], query.name),
+                                     key, base["cache"], run, query, ctx.logs, self.args.query_timeout_s)
 
     def writes(self, ctx: Context, endpoint: Endpoint, base: dict):
         report = ctx.logs / "write-scaling.json"
@@ -721,6 +738,8 @@ def main(argv: list[str], systems: dict, workloads: dict, root: Path) -> int:
         code = 130
         return code
     finally:
+        if suite.answers:
+            print(f"answers: {suite.answers.write()}")
         if suite.manifest:
             suite.manifest.finish(code)
         suite.cleanup()

@@ -40,10 +40,7 @@ working rules on top of them.
 ## Finishing a change
 
 The gate is [`scripts/check.sh`](../../scripts/check.sh); its tiers are described in
-[CONTRIBUTING.md](../../CONTRIBUTING.md):
-
-Use that definition rather than maintaining a second tier list here. Benchmarks never
-run in a gate.
+[CONTRIBUTING.md](../../CONTRIBUTING.md), and only there. Benchmarks never run in a gate.
 
 Test placement follows the invariant's owner, not which tier happens to run it. A narrow
 commit gate does not establish that cross-component invariants passed; the push and full
