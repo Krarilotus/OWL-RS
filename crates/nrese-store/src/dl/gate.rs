@@ -10,9 +10,17 @@
 //!   accepts the commit and records the status `unknown` with the reason: answers are
 //!   then never reported complete. Rejecting would make hard ontologies unwritable.
 //!
+//! - **Incremental** (docs/design/owl2-dl.md §9). Where the revision before was
+//!   consistent and the commit changes assertions only (no statement that may change the
+//!   schema: `bounds::changes_schema`), a commit that only removes them leaves it
+//!   consistent, unchecked (a subset of a consistent ontology is consistent; engine
+//!   `monotone`), and one that adds some is decided on the ABox islands with an individual
+//!   it mentions (`touched-islands`); the whole ontology where the ABox doesn't split.
+//!
 //! The pending-state check, prior-state check and rejection evidence share one deadline
 //! and cancellation token. Evidence cannot restart a spent gate's reasoning budget.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -131,6 +139,38 @@ pub(crate) fn check_commit(
     })
 }
 
+/// What the commit changes, where the revision before was consistent and it changes
+/// assertions only: the individuals its added statements mention (empty: it only
+/// removes). `None` otherwise.
+fn assertion_change(store: &StoreService, tx: &Transaction<'_>) -> Option<HashSet<u64>> {
+    let before = tx.base().revision();
+    match store.dl().status() {
+        Some(DlStatus {
+            revision,
+            consistency,
+        }) if revision == before && consistency.verdict == Verdict::Consistent => {}
+        _ => return None,
+    }
+    let mut touched = HashSet::new();
+    for quad in tx.deleted() {
+        if super::bounds::changes_schema(tx, super::bounds::quad_triple(quad)) {
+            return None;
+        }
+    }
+    for quad in tx.inserted() {
+        let triple = super::bounds::quad_triple(quad);
+        if super::bounds::changes_schema(tx, triple) {
+            return None;
+        }
+        let [s, _, o] = triple;
+        touched.insert(s);
+        if nrese_engine::TermId::from_raw(o).kind() == nrese_engine::TermKind::Iri {
+            touched.insert(o);
+        }
+    }
+    Some(touched)
+}
+
 fn check_with_budget(
     store: &StoreService,
     tx: &Transaction<'_>,
@@ -139,6 +179,19 @@ fn check_with_budget(
     operation: &Budget,
     deadline: Instant,
 ) -> Gate {
+    let started = Instant::now();
+    let change = assertion_change(store, tx);
+    if change.as_ref().is_some_and(HashSet::is_empty) {
+        return Gate {
+            checked: Checked {
+                verdict: Verdict::Consistent,
+                engine: "monotone",
+                elapsed: started.elapsed(),
+            },
+            reject: None,
+            evidence: Vec::new(),
+        };
+    }
     let ontology = match preparation.ontology.take() {
         Some(ontology) => ontology,
         None => {
@@ -146,7 +199,10 @@ fn check_with_budget(
             source::read_pending(tx)
         }
     };
-    let checked = consistency::check(&ontology, &operation.remaining(deadline));
+    let budget = operation.remaining(deadline);
+    let checked = change
+        .and_then(|touched| consistency::check_after_assertions(&ontology, &touched, &budget))
+        .unwrap_or_else(|| consistency::check(&ontology, &budget));
     if checked.verdict != Verdict::Inconsistent {
         return Gate {
             checked,

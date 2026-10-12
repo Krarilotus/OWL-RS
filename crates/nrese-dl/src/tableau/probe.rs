@@ -497,6 +497,7 @@ impl<'p> Base<'p> {
                 .pop();
             let mut engine = fresh(pooled.unwrap_or_else(|| model.clone()));
             let approximate = engine.data_approximate.clone();
+            let limited = engine.data_limited.clone();
             // The base's levels: its top frame's and below.
             engine.floor = engine.frames.last().map_or(0, |f| f.id);
             let since = (model.g.nodes.len() as u32, model.g.unary.len() as u32);
@@ -509,6 +510,7 @@ impl<'p> Base<'p> {
             previous = engine.stats.clone();
             engine.rollback(point, *frames);
             engine.data_approximate = approximate;
+            engine.data_limited = limited;
             engine.floor = 0;
             self.pool
                 .lock()

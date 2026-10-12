@@ -167,7 +167,10 @@ pub struct DataProgram {
 /// each object property and a value by each data property are equal.
 #[derive(Debug, Clone)]
 pub struct KeyRule {
-    pub class: Option<ConceptId>,
+    /// What both individuals must be: the key's class (a name, or the normalisation's
+    /// fresh name of a complex one) and, for a non-simple property, the name of reaching
+    /// one named individual along it.
+    pub classes: Vec<ConceptId>,
     pub objects: Vec<RoleExpr>,
     pub data: Vec<RoleId>,
     pub source: u32,
@@ -283,6 +286,14 @@ impl Program {
                     .push(format!("a key left out (axiom {}): {why}", rule.source)),
             }
         }
+        // A key applies to every named individual, those no assertion or clause mentions
+        // too (a key of no property left, `owl:topObjectProperty`'s, makes them one: the
+        // small-scope case 1267640, 12 October 2026).
+        if !p.keys.is_empty() {
+            for t in ontology.named_individuals() {
+                p.individual(t);
+            }
+        }
         p.anonymous = p
             .individuals
             .iter()
@@ -345,7 +356,8 @@ impl Program {
         if rule.head != [HeadAtom::Equal(x, y)] {
             return Err("a DL-safe rule other than a key's".into());
         }
-        let mut class: Option<(Option<Concept>, Option<Concept>)> = None;
+        // Per concept, whether it is asked of x and of y.
+        let mut classes: std::collections::BTreeMap<Concept, [bool; 2]> = Default::default();
         let mut objects: std::collections::BTreeMap<Var, [Option<RoleExpr>; 2]> =
             Default::default();
         let mut data: std::collections::BTreeMap<Var, [Option<Term>; 2]> = Default::default();
@@ -359,12 +371,7 @@ impl Program {
         for atom in &rule.body {
             match *atom {
                 BodyAtom::Concept(c, v) => {
-                    let entry = class.get_or_insert((None, None));
-                    if side(v)? == 0 {
-                        entry.0 = Some(c);
-                    } else {
-                        entry.1 = Some(c);
-                    }
+                    classes.entry(c).or_default()[side(v)?] = true;
                 }
                 BodyAtom::Role(r, a, b) => {
                     let (from, to, inverse) = match (a, b) {
@@ -383,13 +390,15 @@ impl Program {
                 BodyAtom::Nominal(..) => return Err("a nominal in a key".into()),
             }
         }
-        let class = match class {
-            None => None,
-            Some((Some(a), Some(b))) if a == b => Some(self.concept(ConceptName::Clause(a))),
-            Some(_) => return Err("a key's class differs between x and y".into()),
-        };
+        if classes.values().any(|&sides| sides != [true, true]) {
+            return Err("a key's class differs between x and y".into());
+        }
+        let classes = classes
+            .into_keys()
+            .map(|c| self.concept(ConceptName::Clause(c)))
+            .collect();
         let mut key = KeyRule {
-            class,
+            classes,
             objects: Vec::new(),
             data: Vec::new(),
             source: rule.source as u32,
@@ -988,7 +997,9 @@ fn plan(clause: &HtClause, trigger: usize) -> Vec<Step> {
 /// transitive properties, up the hierarchy (with inverses read as their property).
 pub fn non_simple(ontology: &Ontology) -> BTreeSet<Term> {
     let mut subs: Vec<(Term, Term)> = Vec::new();
-    let mut seeds: Vec<Term> = Vec::new();
+    // `owl:topObjectProperty` is composite (OWL 2 Structural Specification §11.1): a
+    // property above it is universal through the hub's chain.
+    let mut seeds: Vec<Term> = ontology.builtin.top_object.into_iter().collect();
     for axiom in &ontology.axioms {
         match axiom {
             Axiom::SubObjectPropertyOf(chain, sup) if chain.len() > 1 => seeds.push(sup.named()),
