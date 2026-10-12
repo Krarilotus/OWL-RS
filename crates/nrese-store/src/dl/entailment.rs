@@ -342,30 +342,22 @@ pub fn entails_ontology(
 ) -> Entailed {
     let mut o = premise.clone();
     o.data.extend(&conclusion.data);
-    let axioms: Vec<Axiom> = {
+    let tests: Vec<Test> = {
         let mut import = Import {
             from: conclusion,
             to: &mut o,
         };
-        conclusion.axioms.iter().map(|a| import.axiom(a)).collect()
+        conclusion
+            .axioms
+            .iter()
+            .map(|a| Test::Axiom(import.axiom(a)))
+            .collect()
     };
-    let tests: Vec<_> = axioms.iter().cloned().map(Test::Axiom).collect();
-    let started = std::time::Instant::now();
+    let deadline = std::time::Instant::now() + budget.timeout;
     let compiled = Batch::new(&mut o, &tests);
     let mut answer = Entailed::Yes;
-    for (index, axiom) in axioms.iter().enumerate() {
-        let remaining = Budget {
-            timeout: budget.timeout.saturating_sub(started.elapsed()),
-            ..budget.clone()
-        };
-        let found = compiled.check(index, &remaining).unwrap_or_else(|| {
-            let remaining = Budget {
-                timeout: budget.timeout.saturating_sub(started.elapsed()),
-                ..budget.clone()
-            };
-            entails(&o, axiom, fresh, &remaining)
-        });
-        answer = answer.and(found);
+    for (index, test) in tests.iter().enumerate() {
+        answer = answer.and(compiled.check(index, test, &o, fresh, &budget.remaining(deadline)));
         if answer == Entailed::No {
             break;
         }
