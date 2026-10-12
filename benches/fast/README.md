@@ -73,6 +73,11 @@ timeout) to run once more past it, so that its record says what it needs.
   data goes to `NRESE_FAST_DATA` (default `~/nrese-bench/fast-data`), seeded from the
   verified fast inputs. The peak is the scope's `memory.peak`, the same kind (`cgroup`)
   as a container's. It builds nothing and converts no ontology.
+- **Page cache warm and cold.** A cold-start case (`page_cache = ["warm", "cold"]`:
+  `open-first-query`, `reopen-dbpedia`) alternates fresh processes that meet the page cache
+  warm and emptied (the host's `cold_cache` command in [hosts.toml](../hosts.toml), run
+  before each cold one); each mode is a series of its own and the metric is the sum of
+  their medians. A host without the command runs warm only and notes it.
 - **A quiet slot per case.** Each case's timed repetitions, and each comparison's runs, hold
   the machine's quiet slot (`scripts/quiet-slot.sh`: one timing at a time, no build running,
   new builds waiting), taken per case so other builds wait minutes, not the whole run.
