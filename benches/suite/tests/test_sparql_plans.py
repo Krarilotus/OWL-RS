@@ -2,6 +2,7 @@
 and the servers stop a query at the suite's query limit."""
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -90,6 +91,51 @@ class RootfsLinks(unittest.TestCase):
             self.assertEqual(inside(root, "/database"), "/opt/store/database")
             self.assertEqual(inside(root, "/opt/data/x"), "/opt/store/database/x")
             self.assertEqual(inside(root, "/index"), "/index")
+
+
+class AnswerCap(unittest.TestCase):
+    def test_an_answer_past_the_cap_is_never_held(self):
+        import http.server
+        import os
+        import threading
+        from suitekit import answers
+        body = json.dumps({"head": {"vars": ["s"]},
+                           "results": {"bindings": [{"s": {"type": "literal", "value": "x" * 100}}] * 50000}}).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/sparql-results+json")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{server.server_address[1]}/"
+        old = os.environ.get("NRESE_ANSWER_CAP_MB")
+        try:
+            os.environ["NRESE_ANSWER_CAP_MB"] = "1"
+            code, why = answers.capped_post(url, {"query": "SELECT * {}"}, timeout=10)
+            self.assertEqual(code, -1)
+            self.assertIn("cap of 1 MiB", why)
+            with tempfile.TemporaryDirectory() as d:
+                capture = answers.Recorder.post(answers.capped_post, url, ("w", "t", "none", "q.rq"), "s", "off", 1,
+                                                "SELECT * {}", Path(d) / "q.json", 10)
+                self.assertIsNone(capture.answer)
+                self.assertIn("not compared", capture.error)
+            os.environ["NRESE_ANSWER_CAP_MB"] = "16"
+            code, text = answers.capped_post(url, {"query": "SELECT * {}"}, timeout=10)
+            self.assertEqual((code, len(text)), (200, len(body)))
+        finally:
+            server.shutdown()
+            if old is None:
+                os.environ.pop("NRESE_ANSWER_CAP_MB", None)
+            else:
+                os.environ["NRESE_ANSWER_CAP_MB"] = old
 
 
 class QueryLimit(unittest.TestCase):

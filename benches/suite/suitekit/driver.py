@@ -29,7 +29,7 @@ from pathlib import Path
 
 from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all, post
 from . import hosts
-from .answers import Recorder
+from .answers import Recorder, capped_post
 from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime, RootfsRuntime,
                       run_quiet, shell)
 from .manifest import Manifest, image_ids
@@ -535,7 +535,7 @@ class Suite:
                           rows=q.get("rows") if q.get("rows") is not None else "", note=note)
         if self.answers and not plan.replay:
             for query in sorted(plan.queries.glob("*.rq")):
-                self.answers.capture(post, endpoint.query, (plan.workload, plan.tier, base["regime"], query.name),
+                self.answers.capture(capped_post, endpoint.query, (plan.workload, plan.tier, base["regime"], query.name),
                                      key, base["cache"], run, query, ctx.logs, self.args.query_timeout_s)
 
     def writes(self, ctx: Context, endpoint: Endpoint, base: dict):
