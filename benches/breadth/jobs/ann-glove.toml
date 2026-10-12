@@ -1,0 +1,15 @@
+# ann-benchmarks on GloVe-100 (angular): as ann-sift.
+id = "breadth-ann-glove"
+group = "breadth"
+host = "office-pc"
+checkout = "suite/breadth"
+workload = "ann-benchmarks"
+window = "quiet"
+priority = 2
+est_min = 360
+needs = ["docker"]
+env = { PYTHONIOENCODING = "utf-8", NRESE_QUIET_DRAIN_S = "1800" }
+commands = [
+  ["scripts/quiet-slot.sh", "python3", "benches/breadth/vectors/ann.py", "run", "--dataset", "glove-100-angular", "--algorithms", "nrese,qdrant,pgvector,hnswlib"],
+  ["sh", "-c", "python3 benches/breadth/vectors/ann.py export --results \"$QUEUE_RESULTS\""],
+]

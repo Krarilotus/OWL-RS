@@ -148,6 +148,26 @@ def post(url: str, data: dict, accept: str = "application/sparql-results+json", 
         return 0, ""
 
 
+def upload(url: str, data_source: str, path: str, content_type: str, timeout: float) -> tuple[int, str]:
+    """POSTs a data file (`/data/...` under `data_source`, a host directory) as the body,
+    streamed from the host; a Docker volume isn't a host path, so it needs --data DIR."""
+    relative = path[len("/data/"):]
+    source = Path(data_source)
+    if source.is_dir():
+        with open(source / relative, "rb") as body:
+            request = urllib.request.Request(url, data=body, method="POST",
+                                             headers={"Content-Type": content_type,
+                                                      "Content-Length": str((source / relative).stat().st_size)})
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return response.status, response.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode("utf-8", "replace")
+            except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+                return 0, str(e)
+    return 0, f"{path}: uploading from a Docker volume isn't supported; run with --data DIR"
+
+
 def put(url: str, body: str, content_type: str, timeout: float = 60) -> int:
     request = urllib.request.Request(url, data=body.encode(), method="PUT",
                                      headers={"Content-Type": content_type})
@@ -421,7 +441,7 @@ class Qlever(Adapter):
         return [ctx.setting("QLEVER_IMAGE", "adfreiburg/qlever:latest")]
 
     def load(self, ctx, store, inputs, regime):
-        fmt = "nt" if all_ntriples(inputs) else "ttl"
+        fmt = "nt" if all_ntriples(inputs) else "nq" if all(i.endswith(".nq") for i in inputs) else "ttl"
         # One input stream: the Turtle files concatenated are one Turtle document.
         script = ('cat "$@" | /qlever/qlever-index -i /index/idx -f /dev/stdin -F ' + fmt +
                   ' -p true --stxxl-memory ' + ctx.setting("QLEVER_SORT_MEMORY", "8G"))
@@ -684,8 +704,13 @@ class Rdf4j(Adapter):
         for path in inputs:
             if rc != 0:
                 break
-            status, text = post(endpoint.update, {"update": f"LOAD <file://{path}>"},
-                                timeout=ctx.timeout_s)
+            if path.endswith(".nq"):
+                # SPARQL LOAD reads into one graph; quads keep theirs through the REST API.
+                status, text = upload(endpoint.update, ctx.data.source, path, "application/n-quads",
+                                      ctx.timeout_s)
+            else:
+                status, text = post(endpoint.update, {"update": f"LOAD <file://{path}>"},
+                                    timeout=ctx.timeout_s)
             log.append(f"LOAD {path}: HTTP {status} {text[:500]}")
             rc = 0 if status in (200, 204) else 1
         ms = (time.monotonic() - started) * 1000
