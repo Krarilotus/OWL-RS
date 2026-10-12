@@ -29,7 +29,8 @@ job file moves to done/ or failed/ with its exit status, times and log. A job st
 while the host's retreat file appeared goes back to pending to run again (at most three
 times). Timings come only from a quiet window: the host's `queue` in hosts.toml says when
 (`windows` of local time, or while its `free` file exists, never while `retreat` exists,
-never while a compiler runs). Answers before time: a timed suite or compete command
+never while a compiler runs); its `path` comes first on a job's PATH (the host's Python 3.11
+or later, cargo). Answers before time: a timed suite or compete command
 captures every answer (compete always does; `suite.py run` needs `--answers full`).
 """
 from __future__ import annotations
@@ -131,8 +132,9 @@ def open_for(job: dict, queue: dict, now: datetime.datetime, busy=compilers) -> 
 # --- the runner ------------------------------------------------------------------------------
 
 class Queue:
-    def __init__(self, directory: Path, repo: Path, results: Path, worktrees: Path):
+    def __init__(self, directory: Path, repo: Path, results: Path, worktrees: Path, path: list[str] = ()):
         self.directory, self.repo, self.results, self.worktrees = directory, repo, results, worktrees
+        self.path = list(path)
         for state in STATES:
             (directory / state).mkdir(parents=True, exist_ok=True)
 
@@ -173,6 +175,8 @@ class Queue:
                                    f"queue/{job['id']}"], stdout=out, stderr=subprocess.STDOUT)
             env = {**os.environ, **{k: str(v) for k, v in job.get("env", {}).items()},
                    "QUEUE_JOB": job["id"], "QUEUE_RESULTS": str(results)}
+            # The host's tools first (hosts.toml queue.path: its Python, cargo).
+            env["PATH"] = os.pathsep.join([*(str(expand(p)) for p in self.path), env.get("PATH", "")])
             code = made.returncode
             for command in job["commands"] if code == 0 else []:
                 out.write(f"=== {datetime.datetime.now().isoformat(timespec='seconds')} {' '.join(command)}\n")
@@ -206,7 +210,7 @@ def here() -> tuple[str, dict]:
 def work(args) -> int:
     key, queue = here()
     q = Queue(expand(queue["dir"]), expand(queue.get("repo", "~/owlrs/repo.git")),
-              expand(queue.get("results", "~/owlrs/results")), expand(queue["dir"]) / "wt")
+              expand(queue.get("results", "~/owlrs/results")), expand(queue["dir"]) / "wt", queue.get("path", []))
     retreat = expand(queue["retreat"]) if queue.get("retreat") else None
     print(f"{datetime.datetime.now():%F %T} queue of {key}: {q.directory}", flush=True)
     said = ""
