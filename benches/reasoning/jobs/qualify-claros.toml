@@ -1,0 +1,16 @@
+id = "reasoning-qualify-claros"
+group = "reasoning"
+host = "office-pc"
+checkout = "suite/reasoning"
+workload = "claros"
+window = "any"
+priority = 1
+est_min = 120
+needs = ["docker"]
+env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server", NRESE_VERSION = "16c3bfb", DOCKER_MEMORY = "28g" }
+# Claros-L only: LE derives about 549 M facts, a run of its own is its qualification
+# (timed-claros-le, one repetition).
+commands = [
+  ["python3", "benches/reasoning/datalog/datalog.py", "prepare", "--cases", "claros-l,claros-le"],
+  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --qualify --runs 1 --threads 4 --timeout-s 7200 --cases claros-l --results \"$QUEUE_RESULTS/qualify\""],
+]
