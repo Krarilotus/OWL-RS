@@ -1,0 +1,22 @@
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> 
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> 
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> 
+PREFIX strdf: <http://strdf.di.uoa.gr/ontology#> 
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+PREFIX geo: <http://www.opengis.net/ont/geosparql#> 
+PREFIX geo-sf: <http://www.opengis.net/ont/sf#> 
+PREFIX state: <http://geographica.di.uoa.gr/generator/state/>
+PREFIX pointOfInterest: <http://geographica.di.uoa.gr/generator/pointOfInterest/>
+
+SELECT ?s1 ?s2 
+WHERE {
+	?s1 pointOfInterest:hasGeometry ?s1Geo . 
+	?s1Geo pointOfInterest:asWKT ?geo1 . 
+	?s1 pointOfInterest:hasTag ?tag1 . 
+	?tag1 pointOfInterest:hasKey "512" .  
+	?s2 state:hasGeometry ?s2Geo . 
+	?s2Geo state:asWKT ?geo2 . 
+	?s2 state:hasTag ?tag2 . 
+	?tag2 state:hasKey "512" .  
+	FILTER(geof:sfWithin(?geo1, ?geo2)) .
+}

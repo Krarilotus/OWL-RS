@@ -1,0 +1,19 @@
+id = "reasoning-timed-lubm-rdfox"
+group = "reasoning"
+host = "office-pc"
+checkout = "suite/reasoning"
+workload = "lubm"
+window = "quiet"
+priority = 2
+est_min = 240
+needs = ["docker"]
+env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server", NRESE_VERSION = "16c3bfb", DOCKER_MEMORY = "28g" }
+# RDFox's LUBM programs in the setups its papers report (benches/reasoning/reported):
+# - LUBM with 125 universities, one thread for every engine (GLog's VLDB 2021 Table 4);
+# - LUBM(1000), the AAAI 2014 paper's 01K: one thread for NRESE, VLog and GLog, then NRESE at
+#   2, 8, 16 and 32 CPUs (the paper's thread counts on the same 16-core, 32-thread topology).
+commands = [
+  ["bash", "scripts/quiet-slot.sh", "sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --runs 3 --threads 1 --cases lubm-l-125,lubm-le-125 --qualified /home/krarilotus/owlrs/results/reasoning-qualify-lubm-rdfox-2/qualify/qualified.json --results \"$QUEUE_RESULTS/125-threads-1\""],
+  ["bash", "scripts/quiet-slot.sh", "sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --runs 3 --threads 1 --timeout-s 7200 --cases lubm-l-1000,lubm-le-1000 --qualified /home/krarilotus/owlrs/results/reasoning-qualify-lubm-rdfox-2/qualify/qualified.json --results \"$QUEUE_RESULTS/1000-threads-1\""],
+  ["bash", "scripts/quiet-slot.sh", "sh", "-c", "for t in 2 8 16 32; do python3 benches/reasoning/datalog/datalog.py run --systems nrese --runs 3 --threads $t --timeout-s 7200 --cases lubm-l-1000,lubm-le-1000 --qualified /home/krarilotus/owlrs/results/reasoning-qualify-lubm-rdfox-2/qualify/qualified.json --results \"$QUEUE_RESULTS/1000-threads-$t\" || exit 1; done"],
+]

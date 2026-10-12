@@ -22,8 +22,12 @@ from .runtime import Mount
 class Plan:
     workload: str
     tier: str
-    kind: str = "cycle"  # cycle, kit, writes
+    kind: str = "cycle"  # cycle, kit, writes, driver
     inputs: list[str] = field(default_factory=list)
+    # A system that reads the data in another form (system key -> its inputs): the same
+    # content, in the syntax that system's best configuration loads (StarBench: RDF-star for
+    # GraphDB and Stardog, RDF 1.2 for the others). Answers stay comparable across forms.
+    inputs_for: dict[str, list[str]] = field(default_factory=dict)
     mounts: list[Mount] = field(default_factory=list)
     queries: Path | None = None
     expected: dict[str, int] | None = None
@@ -37,6 +41,29 @@ class Plan:
     clients: list[int] = field(default_factory=list)  # the queries again from this many concurrent clients each (throughput, p99)
     duration_s: int = 20
     replay: bool = False  # the queries are a log: each run once, in name order, no warm-up
+    # A benchmark's own driver instead of the queries (BSBM's test driver): a host command run
+    # against the served endpoint in each cache mode, `{endpoint}`, `{update}`, `{out}` (a
+    # file to write), `{system}` and `{run}` substituted. It writes to {out} a JSON list of
+    # result rows (task, item, repeat, status, ms, rows, note), which the suite emits as its own.
+    external: list[str] | None = None
+    # driver: a kit's own driver runs the systems the suite doesn't serve (Soufflé, VLog, GLog,
+    # Nemo's programs, the maintenance kit), once per tier for all the selected systems it can
+    # run (`systems`): its steps in order, from the repository root, with `{results}` (a
+    # directory of the run to write), `{systems}` (comma-separated keys), `{tier}` and `{runs}`
+    # substituted. Every results.csv the steps write below {results} joins the run's own. It is
+    # SPARQL's `external` turned inside out: there a driver runs inside the suite's cycle
+    # against a served endpoint. A timed step needs the quiet slot around `suite.py run`.
+    driver: list[list[str]] | None = None
+    # Known answers per query (its file's stem): {"value": the one value} or {"rows": n}, from
+    # an independent source (a fast case's generator or a pinned check); the answer recorder's oracle.
+    answers: dict[str, dict] = field(default_factory=dict)
+    services: list[str] = field(default_factory=list)  # geosparql, fulltext: Context.services
+
+    def inputs_of(self, system: str) -> list[str]:
+        return self.inputs_for.get(system, self.inputs)
+
+    def all_inputs(self) -> list[str]:
+        return list(dict.fromkeys([*self.inputs, *(i for form in self.inputs_for.values() for i in form)]))
 
 
 def expected_counts(path: Path) -> dict[str, int] | None:
@@ -120,6 +147,35 @@ def basics(root: Path, tier: str, settings: dict) -> Plan:
                 note="answer counts cross-checked between systems")
 
 
+def starbench(root: Path, tier: str, settings: dict) -> Plan:
+    """StarBench (QuWeDa 2023): 56 SPARQL-star queries on BKR, 61 M statements as RDF-star.
+    GraphDB and Stardog load the published RDF-star, as the paper ran them; the RDF 1.2
+    systems load it with one reifier per distinct quoted triple, which keeps every answer
+    (benches/breadth/starbench)."""
+    queries = root / "benches/breadth/starbench/queries"
+    star = ["/data/starbench/bkr-star.ttls"]
+    return Plan("starbench", tier, inputs=["/data/starbench/bkr-rdf12.nt"],
+                inputs_for={"graphdb": star, "stardog": star}, queries=queries,
+                expected=expected_counts(queries / "expected.tsv"),
+                prepare=["bash", "benches/breadth/starbench/prepare.sh"],
+                note="answer counts cross-checked between systems; RDF-star (GraphDB, Stardog) and RDF 1.2 forms")
+
+
+def geographica2(root: Path, tier: str, settings: dict) -> Plan:
+    """Geographica 2: GeoSPARQL on the real-world sets in their named graphs (the micro and
+    most macro queries), New York's streets (geocoding), the generated set and a 10 M
+    slice of the scalability set (benches/breadth/geographica2)."""
+    files = {"real": "real.nq", "census": "census.nt", "synthetic": "synthetic.nt",
+             "scalability": "scalability-10m.nt"}
+    plan = Plan("geographica2", tier, inputs=[f"/data/geographica2/{files.get(tier, tier)}"],
+                queries=root / "benches/breadth/geographica2/queries" / tier, services=["geosparql"],
+                prepare=["bash", "benches/breadth/geographica2/prepare.sh"],
+                note="answer counts cross-checked between systems; queries as published (Strabon's dialect included)")
+    if tier not in files:
+        plan.unavailable = f"no tier {tier}: {', '.join(files)}"
+    return plan
+
+
 def w3c_sparql(root: Path, tier: str, settings: dict) -> Plan:
     return Plan("w3c-sparql11", tier, kind="kit", systems={"nrese"},
                 command=["bash", "scripts/cargo-guarded.sh", "test", "--locked", "-p", "nrese-sparql",
@@ -159,7 +215,7 @@ def clients(root: Path, tier: str, settings: dict) -> Plan:
 
 
 def fast_data_name(spec: str) -> str:
-    """The file a fast-suite data spec names (benches/fast/cases.toml): `volume:FILE` is the
+    """The file a case's data spec names (benches/cases/README.md): `volume:FILE` is the
     dataset volume's FILE; `KIND key=value ...` the generator's output, by its parameters."""
     if spec.startswith("volume:"):
         return spec[len("volume:"):]
@@ -178,14 +234,13 @@ def fast(root: Path, tier: str, settings: dict) -> Plan:
     closure, `~plain` the case's data without reasoning, `~owl-horst` and the like the data
     under the system's own reasoner. benches/fast/compete.py prepares the files in the
     volume nrese-fast-data, which it passes as --data."""
-    import tomllib
+    from . import cases as registry
     name, _, semantics = tier.partition("~")
-    cases = {c["name"]: c for c in
-             tomllib.loads((root / "benches/fast/cases.toml").read_text(encoding="utf-8"))["case"]}
+    cases = {c["name"]: c for c in registry.load(root / "benches/cases")}
     case = cases.get(name)
     plan = Plan("fast", tier, note="a fast-suite case on its comparators (benches/fast/compete.py)")
     if case is None:
-        plan.unavailable = f"no case {name} in benches/fast/cases.toml"
+        plan.unavailable = f"no case {name} in benches/cases/"
         return plan
     semantics = semantics or case["semantics"]
     if semantics not in FAST_REGIMES:
@@ -206,11 +261,40 @@ def fast(root: Path, tier: str, settings: dict) -> Plan:
     if settings.get("FAST_QUERIES"):
         # Several cases on the same data in one run: their queries merged (compete.py).
         plan.queries = Path(settings["FAST_QUERIES"])
+    plan.answers = fast_answers(case, semantics, settings)
     args = case.get("args", [])
     if "--clients" in args:
         plan.clients = [int(n) for n in args[args.index("--clients") + 1].split(",")]
         plan.duration_s = int(float(args[args.index("--duration-s") + 1])) if "--duration-s" in args else 20
     return plan
+
+
+def fast_answers(case: dict, semantics: str, settings: dict) -> dict[str, dict]:
+    """A fast case's checks of single query answers (`q.NAME.value`, `q.NAME.rows`) as known
+    answers, where they hold for the comparator: under the case's own semantics, or on NRESE's
+    closure of it. `expect.KEY` is the generator's answer, read from the file FAST_EXPECT names
+    (compete.py writes it); without that file those checks are left out."""
+    import json
+    if semantics != "closure" and FAST_REGIMES.get(semantics) != FAST_REGIMES.get(case["semantics"], case["semantics"]):
+        return {}
+    expect = {}
+    if settings.get("FAST_EXPECT"):
+        try:
+            expect = json.loads(Path(settings["FAST_EXPECT"]).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            expect = {}
+    out: dict[str, dict] = {}
+    for path, want in case.get("check", {}).items():
+        parts = path.split(".")
+        if len(parts) != 3 or parts[0] != "q" or parts[2] not in ("value", "rows"):
+            continue
+        if isinstance(want, str) and want.startswith("expect."):
+            want = expect.get(want[len("expect."):])
+        elif isinstance(want, str) and not re.fullmatch(r"-?\d+(\.\d+)?", want.strip()):
+            continue  # a comparison (">= 0.9"), not an answer
+        if want is not None:
+            out.setdefault(parts[1], {})[parts[2]] = want
+    return out
 
 
 # workload -> (the plan of a tier, the default tiers)
@@ -220,6 +304,8 @@ DEFINITIONS = {
     "owl2bench": (owl2bench, ["rl-1"]),
     "integration-rg-gs-gnd": (integration, ["example"]),
     "basics-mix": (basics, ["olympics"]),
+    "starbench": (starbench, ["bkr"]),
+    "geographica2": (geographica2, ["real"]),
     "w3c-sparql11": (w3c_sparql, ["-"]),
     "w3c-shacl": (w3c_shacl, ["-"]),
     "w3c-owl2-rl": (w3c_owl2_rl, ["-"]),
@@ -228,6 +314,16 @@ DEFINITIONS = {
     "clients": (clients, ["-"]),
     "fast": (fast, []),
 }
+
+
+def _groups():
+    """The groups' workloads, each in a module of its own (benches/cases/README.md)."""
+    from . import reasoning_plans, sparql_plans
+    DEFINITIONS.update(sparql_plans.DEFINITIONS)
+    DEFINITIONS.update(reasoning_plans.definitions(DEFINITIONS))
+
+
+_groups()
 
 
 def plans(root: Path, workload: str, tiers: list[str] | None, settings: dict) -> list[Plan] | None:

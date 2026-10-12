@@ -6,7 +6,28 @@
 # run records that use it.
 
 budget_gb = 300
-volume = "nrese-bench-data"
+
+[[dataset]]
+file = "ann/glove-100-angular.hdf5"
+workload = "ann-benchmarks"
+tier = "glove-100-angular"
+role = "core"
+made_by = "curl http://ann-benchmarks.com/glove-100-angular.hdf5"
+source = "http://ann-benchmarks.com/glove-100-angular.hdf5"
+bytes = 485413888
+sha256 = "544af1d5e84e112cd4749571dcfd8ca109818a572f850af75a3a09e093a953c4"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "ann/sift-128-euclidean.hdf5"
+workload = "ann-benchmarks"
+tier = "sift-128-euclidean"
+role = "core"
+made_by = "curl http://ann-benchmarks.com/sift-128-euclidean.hdf5"
+source = "http://ann-benchmarks.com/sift-128-euclidean.hdf5"
+bytes = 525128288
+sha256 = "dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984"
+frozen = "2026-10-12"
 
 [[dataset]]
 file = "dbpedia-core.nt"
@@ -27,6 +48,120 @@ made_by = "bash benches/competitors/prepare-entities.sh 10000000"
 bytes = 1088333340
 sha256 = "f6d2d939942c002ae38f42d571eda3c1e5d13739038f93cd4c08e01b26345643"
 frozen = "2026-10-03"
+
+[[dataset]]
+file = "era-shacl/2025-01-05-rinf-xml-combined.nq.xz"
+workload = "era-shacl"
+tier = "-"
+role = "source"
+source = "https://zenodo.org/records/14605744 (md5 d4cc6012a3193408916de0c96cfc609c)"
+bytes = 407615816
+sha256 = "3b9f4e14892ad8fee51f323b369dda6ba8eab98928bda69ba6c1486f607d956b"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "era-shacl/ERA.ttl"
+workload = "era-shacl"
+tier = "ERA"
+role = "core"
+made_by = "bash benches/breadth/era-shacl/prepare.sh (data under $NRESE_BREADTH/data)"
+bytes = 13621068262
+sha256 = "28a7cfae482fe8358b490bb9a238fa49d79124c4cc079a8460885321f8c29535"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "era-shacl/ES.ttl"
+workload = "era-shacl"
+tier = "ES"
+role = "core"
+made_by = "bash benches/breadth/era-shacl/prepare.sh (data under $NRESE_BREADTH/data)"
+bytes = 257045697
+sha256 = "f88964ed364b9daa7c58e12f1a822ee6a8bb955a9544c25964b8c63d3d5ea990"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "era-shacl/FR.ttl"
+workload = "era-shacl"
+tier = "FR"
+role = "core"
+made_by = "bash benches/breadth/era-shacl/prepare.sh (data under $NRESE_BREADTH/data)"
+bytes = 2875826504
+sha256 = "759ad892cc66ea9194bee1dcf131e54bad3a52a07a799c3e2419f0b5739a5782"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "era-shacl/shapes/core_shapes.ttl"
+workload = "era-shacl"
+tier = "-"
+role = "core"
+made_by = "bash benches/breadth/era-shacl/prepare.sh (data under $NRESE_BREADTH/data)"
+bytes = 193439
+sha256 = "184ffddefff1c4027a15b962874bf6e44d5b6916cac669efac18531e87db6025"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "era-shacl/shapes/era_shapes.ttl"
+workload = "era-shacl"
+tier = "-"
+role = "core"
+made_by = "bash benches/breadth/era-shacl/prepare.sh (data under $NRESE_BREADTH/data)"
+bytes = 267483
+sha256 = "660c203e00c22268ef3db9e304c443f8b371279cb24b8308be0ea71850fd556b"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "era-shacl/shapes/tds_shapes.ttl"
+workload = "era-shacl"
+tier = "-"
+role = "core"
+made_by = "bash benches/breadth/era-shacl/prepare.sh (data under $NRESE_BREADTH/data)"
+bytes = 27809
+sha256 = "68ea89a9ce281931317d959c79fa9d3773bd16a40f5b7859a628631d5b93e7f2"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "geographica2/census.nt"
+workload = "geographica2"
+tier = "census"
+role = "core"
+made_by = "bash benches/breadth/geographica2/prepare.sh (data under $NRESE_BREADTH/data)"
+source = "https://geographica2.di.uoa.gr/datasets/ (fetched 2026-10-12; archive SHA-256s in the kit's fetch log)"
+bytes = 3455110190
+sha256 = "e4880dcde336255da817a622c60545c07556b97246457b1af58484bcc8916b51"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "geographica2/real.nq"
+workload = "geographica2"
+tier = "real"
+role = "core"
+made_by = "bash benches/breadth/geographica2/prepare.sh (data under $NRESE_BREADTH/data)"
+source = "https://geographica2.di.uoa.gr/datasets/ (fetched 2026-10-12; archive SHA-256s in the kit's fetch log)"
+bytes = 821070891
+sha256 = "9af00c5e1bbb2da674d8048195e5a3e6d18599835f0c763531afc4ea6ea349b2"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "geographica2/scalability-10m.nt"
+workload = "geographica2"
+tier = "scalability"
+role = "core"
+made_by = "bash benches/breadth/geographica2/prepare.sh (data under $NRESE_BREADTH/data)"
+source = "https://geographica2.di.uoa.gr/datasets/ (fetched 2026-10-12; archive SHA-256s in the kit's fetch log)"
+bytes = 1973293653
+sha256 = "54533e142447ef79696c2602070ed0e9619fce6066fc6f2b0440524c1d0436fb"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "geographica2/synthetic.nt"
+workload = "geographica2"
+tier = "synthetic"
+role = "core"
+made_by = "bash benches/breadth/geographica2/prepare.sh (data under $NRESE_BREADTH/data)"
+source = "https://geographica2.di.uoa.gr/datasets/ (fetched 2026-10-12; archive SHA-256s in the kit's fetch log)"
+bytes = 779992913
+sha256 = "b5e7b1e1ab2cb352246e6b77461d65d125180f0f58138e57596ac99926893bb6"
+frozen = "2026-10-12"
 
 [[dataset]]
 file = "lubm-1-materialised.nt"
@@ -207,3 +342,133 @@ made_by = "bash benches/competitors/prepare-datasets.sh yago-tiny"
 bytes = 3246565946
 sha256 = "e65eef7eb720be730d24ca088699089c21f9ddf002667449fa519f9abe311bb3"
 frozen = "2026-10-03"
+
+[[dataset]]
+file = "dblp-2025-04-01.nt"
+role = "source"
+made_by = "bash benches/sparql/prepare.sh dblp"
+source = "superseded as Sparqloscope's data by dblp-kg-20261011.nt: the monthly dump lacks the stream records several of its queries are about; https://drops.dagstuhl.de/storage/artifacts/dblp/rdf/2025/dblp-2025-04-01.nt.gz (doi:10.4230/dblp.rdf.ntriples.2025-04-01; MD5 6c5628d88b8e1b27eef918239a7e9802 as published)"
+bytes = 65928101649
+sha256 = "5c4bf68b74468d1ee06489b0f6be33c5130ef502c3ec1700afecd955e12639b9"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "watdiv-10m.nt"
+workload = "watdiv"
+tier = "watdiv-10m"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh watdiv-10m"
+source = "https://dsg.uwaterloo.ca/watdiv/watdiv.10M.tar.bz2 (benches/sparql/sources.sha256)"
+bytes = 1542624409
+sha256 = "7cfe0341d578a677d3b5d562eaaf94d67aff8587d9e0ef3d83cc82765b77cddd"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "gcare-aids.nt"
+workload = "gcare"
+tier = "gcare-aids"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh gcare"
+source = "G-CARE dataset.tar.gz (benches/sparql/sources.sha256), converted by benches/sparql/gcare/convert.py"
+bytes = 61363136
+sha256 = "db545106419cfd74f6073cedd954b8704d923b788f0531b43c22fa4361a5d27b"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "gcare-human.nt"
+workload = "gcare"
+tier = "gcare-human"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh gcare"
+source = "G-CARE dataset.tar.gz (benches/sparql/sources.sha256), converted by benches/sparql/gcare/convert.py"
+bytes = 13056596
+sha256 = "57ed179a77b138e1011296b93c6d9329f5f7e5c1227fcf3afef6e3e95ea3932e"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "gcare-lubm80.nt"
+workload = "gcare"
+tier = "gcare-lubm80"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh gcare"
+source = "G-CARE dataset.tar.gz (benches/sparql/sources.sha256), converted by benches/sparql/gcare/convert.py"
+bytes = 1633320120
+sha256 = "9052fb59c9fe67ac0b8d566625a1d9b669b04ddef1c4959cbb25e4f9ef46559e"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "gcare-yago.nt"
+workload = "gcare"
+tier = "gcare-yago"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh gcare"
+source = "G-CARE dataset.tar.gz (benches/sparql/sources.sha256), converted by benches/sparql/gcare/convert.py"
+bytes = 5378920003
+sha256 = "00702282d0c8c8a55af9589b7860d74601dacc6b310d10c2c3c26b57c133a0e6"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "sp2bench-1m.nt"
+workload = "sp2bench"
+tier = "sp2bench-1m"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh sp2bench-1m"
+source = "SP2B v1.01 sp2b_gen -t 1000000 (sp2b-v1_01-full.tar.gz), written as N-Triples by Jena riot 6.2.0"
+bytes = 151475662
+sha256 = "ca79ba9656734edbe99f5e29d0d2281fb1dc1102ad146e135166bc880154dd55"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "sp2bench-25m.nt"
+workload = "sp2bench"
+tier = "sp2bench-25m"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh sp2bench-25m"
+source = "SP2B v1.01 sp2b_gen -t 25000000 (sp2b-v1_01-full.tar.gz), written as N-Triples by Jena riot 6.2.0"
+bytes = 3857628983
+sha256 = "a7f3adddda60f436fe263e997437b168ca3ff0fc62b411f003e1ad8b33cf6271"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "bsbm-10m.nt"
+workload = "bsbm"
+tier = "bsbm-10m"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh bsbm-10m"
+source = "BIBM 0.7.8 generator -fc -pareto -pc 28480 -s nt: the BSBM V3.1 report's 10119864 triples"
+bytes = 2178369495
+sha256 = "3977a61ff3992889e6576d399b7f292007b6f14f9472d5ed0f59316f50cf0505"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "bsbm-100m.nt"
+workload = "bsbm"
+tier = "bsbm-100m"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh bsbm-100m"
+source = "BIBM 0.7.8 generator -fc -pareto -pc 284800 -s nt: the BSBM V3.1 report's 100062249 triples"
+bytes = 21813398098
+sha256 = "0d57a6136c6feff181f52d70d93690250d67429edb01fc707c3aa7be59b68fed"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "watdiv-100m.nt"
+workload = "watdiv"
+tier = "watdiv-100m"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh watdiv-100m"
+source = "https://dsg.uwaterloo.ca/watdiv/watdiv.100M.tar.bz2 (benches/sparql/sources.sha256)"
+bytes = 15599074048
+sha256 = "4ec85f2a5d2100cd4e4d201b577a0fb72fba1fcc97ec1cf968cbc1bff4bbbddc"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "dblp-kg-20261011.nt"
+workload = "sparqloscope"
+tier = "sparqloscope-dblp"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh dblp-kg"
+source = "https://sparql.dblp.org/download/dblp_KG_with_associated_data.tar fetched 2026-10-12 (sha256 519a7c61..., dblp's release of 11 Oct 2026): its dblp.ttl.gz with @base <https://dblp.org/rdf/schema>, written as N-Triples by Jena riot 6.2.0"
+bytes = 77730471996
+sha256 = "8541232ced4933f65e2f8b4ef01cea8cd6b39975b2764dd801f7df48bad93934"
+frozen = "2026-10-12"

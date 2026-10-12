@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 80: result-size-small
+# Export 1000 tuples
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> SELECT ?s ?o WHERE { ?s rdf:type ?o } LIMIT 1000

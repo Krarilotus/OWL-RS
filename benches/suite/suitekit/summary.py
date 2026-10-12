@@ -195,12 +195,15 @@ def summarise(rows: list[dict], source: str = "", settled: dict[tuple, str] | No
             continue
         run = f"{source}:{r['run']}"
         task, status, ms = r["task"], r["status"], number(r["ms"])
-        if task == "query":
+        # A relation's count (`count:REL`, a rule kit's check) is an answer like a query's:
+        # compared across the systems, disputed where they differ; it carries no time.
+        if task in ("query", "validate") or (task == "count" and r["item"]):
             item = pair.items[r.get("cache") or "-"][r["item"]]
             item.statuses[status] += 1
             if status == "ok" and ms is not None:
                 (item.first if str(r["repeat"]) == "0" else item.repeats)[run].append(ms)
-            if r["rows"] != "":
+            # A clients-N item's rows are the requests its clients completed: throughput, not an answer.
+            if r["rows"] != "" and not r["item"].startswith("clients-"):
                 (item.answers if status == "ok" else item.wrong_answers if status == "wrong" else set()).add(r["rows"])
             continue
         if task in ("load", "conformance"):
