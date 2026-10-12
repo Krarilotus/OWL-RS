@@ -206,14 +206,17 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     """`container` natively: the command, its container paths mapped (native_dirs), in a user
     scope capped at `cap_gb` without swap (as Docker's --memory and --memory-swap). A wrapper
     shell in the scope prints the scope's memory.peak after the command (`fast-scope-peak`
-    on stderr); a kill at the cap may take the wrapper too, and then there is no peak."""
+    on stderr), also after a kill at the cap."""
     dirs = native_dirs()
     FAST_DATA.mkdir(parents=True, exist_ok=True)
     unit = f"{name}-{os.getpid()}-{int(time.monotonic() * 1000)}"
     wrapper = ('g=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); "$@"; rc=$?; '
                'echo "fast-scope-peak $(cat "$g/memory.peak" 2>/dev/null)" >&2; exit $rc')
     argv = ["systemd-run", "--user", "--scope", "-q", f"--unit={unit}", "-p", f"MemoryMax={int(cap_gb * 1024)}M",
-            "-p", "MemorySwapMax=0", "--", "sh", "-c", wrapper, "sh", *(native(c, dirs) for c in command)]
+            # At the cap the kernel kills the command alone (exit 137, as in a container), not
+            # systemd the whole scope (SIGTERM): the wrapper then still prints the peak.
+            "-p", "MemorySwapMax=0", "-p", "OOMPolicy=continue", "--", "sh", "-c", wrapper, "sh",
+            *(native(c, dirs) for c in command)]
     started = time.monotonic()
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
