@@ -4,37 +4,31 @@
 use nrese_exec::workers::Workers;
 
 use super::{ContextId, Engine, Message, Mutex, SeqCst, lock};
-use crate::context::memory;
 
 impl Engine {
-    /// Saturates with a standalone pool, falling back to the calling thread on failure.
-    /// Repeated rounds should use [`Self::run_with_workers`] with one reusable owner.
-    pub fn run(&self, seeds: &[ContextId], threads: usize) {
-        let workers = Workers::new(threads);
-        self.run_with_workers(seeds, &workers);
-    }
-
-    /// Starts `seeds` and saturates on an existing pool within its worker allowance.
-    pub fn run_with_workers(&self, seeds: &[ContextId], workers: &Workers) {
+    /// Starts `seeds` and saturates until no context has work, within the allowance of
+    /// `workers`; then publishes every context's exact capacity and samples it.
+    pub fn run(&self, seeds: &[ContextId], workers: &Workers) {
         workers.install(|| self.run_on_workers(seeds, workers));
-        self.sample_memory(true);
+        if self.observing() {
+            for id in 0..self.count() as ContextId {
+                let bytes = lock(&self.context(id).state).bytes();
+                self.publish(id, bytes);
+            }
+        }
+        self.sample();
     }
 
     fn run_on_workers(&self, seeds: &[ContextId], workers: &Workers) {
         if workers.width() == 1 {
             let mut queue = Vec::new();
-            let mut charge = self.memory_charge();
             for &seed in seeds {
                 self.deliver_seq(&mut queue, seed, Message::Init);
             }
-            charge.set(memory::vec(&queue));
             while let Some(context) = queue.pop() {
                 self.work(context, &mut |to, message| {
                     self.deliver_seq(&mut queue, to, message);
                 });
-                // Capacity cannot shrink during an activation; observe once at its
-                // boundary instead of after every message to an already active peer.
-                charge.set(memory::vec(&queue));
             }
             return;
         }
@@ -51,7 +45,6 @@ impl Engine {
                 ready: Mutex::new(Ready {
                     queue: Vec::new(),
                     drains: 0,
-                    charge: self.memory_charge(),
                 }),
             };
             rayon::scope(|scope| {
@@ -64,7 +57,7 @@ impl Engine {
 
     pub(super) fn deliver_seq(&self, queue: &mut Vec<ContextId>, to: ContextId, message: Message) {
         let context = self.context(to);
-        context.push(message, self.task_memory.is_some());
+        context.push(message, self.observing());
         if !context.active.swap(true, SeqCst) {
             queue.push(to);
         }
@@ -72,7 +65,7 @@ impl Engine {
 
     fn deliver_par<'s>(&'s self, scope: &rayon::Scope<'s>, to: ContextId, message: Message) {
         let context = self.context(to);
-        context.push(message, self.task_memory.is_some());
+        context.push(message, self.observing());
         if !context.active.swap(true, SeqCst) {
             scope.spawn(move |scope| self.work(to, &mut |t, m| self.deliver_par(scope, t, m)));
         }
@@ -82,7 +75,6 @@ impl Engine {
 struct Ready {
     queue: Vec<ContextId>,
     drains: usize,
-    charge: memory::Charge,
 }
 
 struct Agenda<'a> {
@@ -94,14 +86,12 @@ struct Agenda<'a> {
 impl Agenda<'_> {
     fn deliver<'s>(&'s self, scope: &rayon::Scope<'s>, to: ContextId, message: Message) {
         let context = self.engine.context(to);
-        context.push(message, self.engine.task_memory.is_some());
+        context.push(message, self.engine.observing());
         if context.active.swap(true, SeqCst) {
             return;
         }
         let mut ready = lock(&self.ready);
         ready.queue.push(to);
-        let capacity = memory::vec(&ready.queue);
-        ready.charge.set(capacity);
         if ready.drains < self.width {
             ready.drains += 1;
             drop(ready);
@@ -140,7 +130,7 @@ mod tests {
     use nrese_owl::{Axiom, ClassExpr, ExprId, Ontology};
 
     #[test]
-    fn concurrent_delivery_restarts_retired_drains_and_releases_capacity() {
+    fn concurrent_delivery_restarts_retired_drains_and_empties_inboxes() {
         let mut ontology = Ontology::default();
         let a = ExprId(ontology.classes.intern(ClassExpr::Class(1)));
         let b = ExprId(ontology.classes.intern(ClassExpr::Class(2)));
@@ -149,11 +139,11 @@ mod tests {
         let program = compile::compile(&normalised, &[1, 2], false)
             .unwrap()
             .program;
-        let engine = Engine::new(program, Strategy::Cautious, false).with_budget(Budget {
+        let budget = Budget {
             task_memory: Some(64 << 20),
             ..Budget::default()
-        });
-        let ledger = engine.task_memory.clone().unwrap();
+        };
+        let engine = Engine::new(program, Strategy::Cautious, false, budget);
         let concept = engine.program.names.iter().position(|&t| t == 1).unwrap() as u32;
         let roots: Vec<_> = (0..32)
             .map(|tag| {
@@ -170,7 +160,6 @@ mod tests {
                 ready: Mutex::new(Ready {
                     queue: Vec::new(),
                     drains: 0,
-                    charge: engine.memory_charge(),
                 }),
             };
             for round in 0..3 {
@@ -191,13 +180,12 @@ mod tests {
                     let context = engine.context(root);
                     assert!(!context.active.load(SeqCst));
                     assert!(lock(&context.inbox).is_empty());
+                    assert_eq!(context.queued.load(SeqCst), 0);
                     assert!(lock(&context.state).started);
                 }
             }
         }
         assert!(!engine.exhausted());
-        drop(engine);
-        assert!(ledger.peak() > 0);
-        assert_eq!(ledger.used(), 0);
+        assert!(engine.task_memory_bytes().1 > 0);
     }
 }

@@ -116,8 +116,7 @@ impl DlConfig {
         let memory = self.memory_per_worker(1);
         let width = workers.width();
         nrese_dl::classify::Options {
-            threads: width,
-            workers: Some(workers),
+            workers,
             timeout: Some(self.timeout),
             task_memory: (memory != usize::MAX).then_some(memory),
             tableau: self.tableau(self.timeout, self.memory_per_worker(width)),
@@ -151,8 +150,7 @@ mod memory_tests {
         };
         let workers = nrese_exec::workers::Workers::new(4).limited(2);
         let options = config.classification_options(workers.clone());
-        assert_eq!(options.threads, 2);
-        assert_eq!(options.workers.as_ref(), Some(&workers));
+        assert_eq!(options.workers, workers);
         assert_eq!(options.task_memory, Some(1024));
         assert_eq!(options.tableau.max_memory, 512);
         config.memory_bytes = 0;

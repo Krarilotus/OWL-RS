@@ -530,14 +530,16 @@ the base when the initial labels leave no candidates. Otherwise its candidates n
 unproven classes in that initial model: it retains the deterministic start and releases
 the model that those probes would contradict, avoiding a redundant model attempt.
 
-Every retained probe receives its current configuration. Only timeout and cancellation
-may differ from the base; another strategy or capacity configuration declines reuse
-before execution and uses the existing fresh search. `None` means incompatibility,
-never timeout or unknown. An initially unknown search can retain its deterministic
-checkpoint without acquiring model status. Model rollback and its deterministic
-fallback use one `RunBudget`, as do detached terminology and full-ontology attempts.
-Workers refresh the absolute operation deadline on entry. Preparation, state copies,
-labels and cleanup consume the allowance; checks remain cooperative, not preemptive.
+Every retained probe receives its current configuration. Only the deadline,
+cancellation and workers may differ from the base; another strategy or capacity
+configuration declines reuse before execution and uses the existing fresh search. `None`
+means incompatibility, never timeout or unknown. An initially unknown search can retain
+its deterministic checkpoint without acquiring model status. An operation's `timeout`
+becomes one absolute deadline at its start, which its parts inherit unchanged: model
+rollback and its deterministic fallback, detached terminology and full-ontology
+attempts, queued island batches and portfolio variants. Each solver checks it before it
+starts and while it runs; preparation, state copies, labels and cleanup consume it;
+checks remain cooperative, not preemptive.
 Probe telemetry includes both fallback attempts; the profile now adds initial and
 realisation work. Existing top/subsumption aggregate-counter gaps remain; historical
 counters with narrower coverage are not directly comparable work savings.
@@ -776,8 +778,8 @@ interned expressions remain operation-local. Scalar reductions remain for
 unsupported forms and as a differential oracle. This removes repeated premise copying and
 compilation inside eligible batches; it does not change store/OWL semantic ownership.
 There is no cross-query compiled cache: the batch owns the program and assumptions.
-Admission checkpoints charge waiting time against the remaining timeout and observe
-cancellation; normalisation and compilation themselves are not preemptible.
+Waiting counts against the operation's deadline, and a queued probe checks it and
+cancellation before it starts; normalisation and compilation are not preemptible.
 
 The shared runtime schedules independent candidates with one-worker child allowances.
 Classification and realisation reuse the same physical owner, and context fixpoint rounds
@@ -812,15 +814,16 @@ rejection evidence without claiming completed minimisation or verification.
 The context core's `Budget::max_memory` measures the **whole process** and remains a
 separate opt-in guard. Server startup owns the global process fallback; opening a store
 does not change it. Store-local watches also reach DL bounds and diagnostics, with explicit
-zero disabling the local limit. `Budget::task_memory` checks a sampled estimate of
-saturation-owned capacity: compiled program, context arena and registry, clauses and
-indexes, queued payloads, assertion state and worker buffers. Context activations publish
-their local capacity at work checkpoints; inbox writers publish queued capacity under
-the existing inbox lock. The aggregate sampler reads these publications without acquiring
-context locks, using the process watch's sampling cadence and a forced sample after each
-saturation round. Main Horn payload handoffs and recursive inference no longer reserve
-shared task capacity per message; Eq auxiliary buffers still use shared charges.
-Hash-table backing capacity and assertion B-tree nodes are estimates, not allocator telemetry.
+zero disabling the local limit. `Budget::task_memory` bounds a sampled estimate of what a
+saturation holds. The engine holds the compiled program, the context arena and registry,
+the assertions' state and the retained results; each context publishes its clauses,
+indexes, links and worker buffers at its work checkpoints (every 256 messages or given
+clauses, every 4096 conclusions of a join) and at the end of its first batch in each
+sampling interval, and its inbox publishes what is queued at its first and every 16th
+message. A budget check reads the clock once; once per 10 ms one check also reads the
+process memory and sums the publications without taking a context's lock, and each
+saturation round ends with exact publications and a sample. Hash tables and B-tree nodes
+are estimated.
 
 `dl.memory` configures context saturation and the tableau's existing capacity checks.
 Zero means unlimited; the standalone context API defaults to no observations. Classification
@@ -832,11 +835,9 @@ accounting would. In-flight work can exceed the envelope. Exhaustion yields an
 incomplete/budget outcome, never a classification inferred from truncated work. There is
 no allocation-by-allocation ceiling.
 
-Retained classification class/query buffers use auxiliary charges. Other result/proof
-assembly, normalisation and compilation temporaries, input snapshots,
-short-lived recursive temporaries, allocator metadata and scheduler stacks are outside
-context observations. Retained native
-bounds now share query accounting, and exact work uses runtime dispatch allowances; DL
+Result and proof assembly, normalisation and compilation temporaries, short-lived
+recursive temporaries, allocator metadata and worker stacks are outside the estimate.
+Retained native bounds now share query accounting, and exact work uses runtime dispatch allowances; DL
 compilation and per-engine task budgets still lack a shared end-to-end memory envelope. The
 context profile's `task_memory_peak` reports the peak sampled capacity estimate, including
 an observation that exceeds the envelope. It is neither RSS nor an exact simultaneous

@@ -151,7 +151,8 @@ impl Compiler {
 
 /// The individuals' contexts and what is known of them, to a fixpoint.
 pub struct Individuals {
-    memory: super::memory::Charge,
+    /// The estimate held with the engine ([`Engine::hold`]).
+    held: usize,
     type_count: usize,
     types: Vec<BTreeSet<ConceptId>>,
     edges: HashSet<(RoleId, u32, u32)>,
@@ -160,15 +161,21 @@ pub struct Individuals {
 }
 
 impl Individuals {
-    fn check_memory(&mut self) -> bool {
-        // BTreeSet does not expose node capacity. 64 bytes per entry accounts for
-        // sparse nodes conservatively; this is an estimate, not allocator telemetry.
-        self.memory.set(
-            super::memory::vec(&self.types)
-                + self.type_count * 64
-                + super::memory::table::<(RoleId, u32, u32), ()>(self.edges.capacity())
-                + super::memory::vec(&self.contexts),
-        )
+    /// Reports the estimate of what this holds to the engine; false once the budget ran
+    /// out.
+    fn report(&mut self, engine: &Engine) -> bool {
+        // A `BTreeSet` doesn't say its capacity: 64 bytes an entry.
+        let bytes = super::memory::vec(&self.types)
+            + self.type_count * 64
+            + super::memory::table::<(RoleId, u32, u32), ()>(self.edges.capacity())
+            + super::memory::vec(&self.contexts);
+        engine.hold(&mut self.held, bytes)
+    }
+
+    /// Whether the assertions are consistent; gives the estimate back to the engine.
+    pub fn release(mut self, engine: &Engine) -> bool {
+        engine.hold(&mut self.held, 0);
+        self.consistent
     }
 
     fn insert_type(&mut self, at: usize, concept: ConceptId) -> bool {
@@ -179,18 +186,9 @@ impl Individuals {
 
     /// Saturates the individuals' contexts on `engine` and evaluates the clauses on the
     /// edges until nothing changes.
-    pub fn saturate(engine: &Engine, abox: &Abox, threads: usize) -> Self {
-        let workers = nrese_exec::workers::Workers::new(threads);
-        Self::saturate_with_workers(engine, abox, &workers)
-    }
-
-    pub fn saturate_with_workers(
-        engine: &Engine,
-        abox: &Abox,
-        workers: &nrese_exec::workers::Workers,
-    ) -> Self {
+    pub fn saturate(engine: &Engine, abox: &Abox, workers: &nrese_exec::workers::Workers) -> Self {
         let mut me = Self {
-            memory: engine.memory_charge(),
+            held: 0,
             type_count: abox.types.iter().map(Vec::len).sum(),
             types: abox
                 .types
@@ -201,7 +199,7 @@ impl Individuals {
             contexts: Vec::new(),
             consistent: !abox.clash,
         };
-        if abox.clash || !me.check_memory() {
+        if abox.clash || !me.report(engine) {
             return me;
         }
         loop {
@@ -213,36 +211,29 @@ impl Individuals {
                 .types
                 .iter()
                 .take_while(|_| !engine.exhausted())
-                .map_while(|types| {
+                .map(|types| {
                     let core: Vec<Atom> =
                         types.iter().map(|&c| Atom::concept(c, CTerm::X)).collect();
-                    let mut memory = engine.memory_charge();
-                    if !memory.set(super::memory::vec(&core)) {
-                        return None;
-                    }
                     let (id, created) = engine.context_for(&core);
                     if created {
                         seeds.push(id);
                     }
-                    Some(id)
+                    id
                 })
                 .collect();
-            let mut memory = engine.memory_charge();
-            if !memory.set(super::memory::vec(&seeds)) || !me.check_memory() {
+            if !me.report(engine) {
                 return me;
             }
-            engine.run_with_workers(&seeds, workers);
+            engine.run(&seeds, workers);
             let mut changed = false;
-            for (a, &context) in me.contexts.iter().enumerate() {
-                let state = lock(&engine.context(context).state);
+            for a in 0..me.contexts.len() {
+                let state = lock(&engine.context(me.contexts[a]).state);
                 if state.clauses.unsat {
                     me.consistent = false;
                     return me;
                 }
                 for s in state.clauses.subsumers() {
-                    let inserted = me.types[a].insert(s);
-                    me.type_count += usize::from(inserted);
-                    changed |= inserted;
+                    changed |= me.insert_type(a, s);
                 }
                 for r in state.clauses.self_loops() {
                     changed |= me.edges.insert((r, a as u32, a as u32));
@@ -255,27 +246,22 @@ impl Individuals {
                 }
                 Some(more) => changed |= more,
             }
-            if !me.check_memory() {
-                return me;
-            }
-            if !changed {
+            if !me.report(engine) || !changed {
                 return me;
             }
         }
     }
 
     /// One pass of the clauses over the edges; `None` if one derives `⊥`, else whether
-    /// anything was new.
+    /// anything was new. Stops early where the budget ran out.
     fn edges_round(&mut self, engine: &Engine, abox: &Abox) -> Option<bool> {
         let program = &engine.program;
         let mut changed = false;
         let mut todo: Vec<(RoleId, u32, u32)> = self.edges.iter().copied().collect();
-        let mut memory = engine.memory_charge();
+        let mut step = 0u32;
         while let Some((r, a, b)) = todo.pop() {
-            if !memory.set(super::memory::vec(&todo))
-                || !self.check_memory()
-                || engine.out_of_budget()
-            {
+            step = step.wrapping_add(1);
+            if step.is_multiple_of(256) && (!self.report(engine) || engine.out_of_budget()) {
                 return Some(changed);
             }
             let slots = program.by_out[r as usize]

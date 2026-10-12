@@ -1,45 +1,32 @@
-//! Checkpoint observations of saturation capacity. Contexts publish locally; a sampled
-//! sum guides the configured task envelope without synchronising every inference.
-//! Observations can overlap or lag at handoffs, so their peak is an estimate, not an
-//! allocation ceiling or process RSS. Auxiliary owners report their live capacities.
+//! The saturation's capacity envelope ([`super::Budget::task_memory`]): what it observes
+//! and how (docs/design/owl2-dl.md §13).
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed},
-};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
+/// One engine's observations: the capacity the engine itself holds (program, arena,
+/// registry, cores, inputs and results) and the latest sum of its contexts' publications.
 #[derive(Debug)]
-pub(super) struct Task {
-    budget: nrese_exec::Budget,
+pub(super) struct Observer {
     limit: usize,
+    owned: AtomicUsize,
     contexts: AtomicUsize,
     peak: AtomicUsize,
-    started: Instant,
-    last: AtomicU64,
-    exhausted: Arc<AtomicBool>,
 }
 
-impl Task {
-    pub fn new(limit: usize, exhausted: Arc<AtomicBool>) -> Arc<Self> {
-        Arc::new(Self {
-            budget: nrese_exec::Budget::new(usize::MAX),
+impl Observer {
+    pub fn new(limit: usize) -> Self {
+        Self {
             limit,
+            owned: AtomicUsize::new(0),
             contexts: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
-            started: Instant::now(),
-            last: AtomicU64::new(0),
-            exhausted,
-        })
-    }
-
-    pub fn exhausted(&self) -> bool {
-        self.exhausted.load(Relaxed)
+        }
     }
 
     pub fn used(&self) -> usize {
-        self.budget
-            .used()
+        self.owned
+            .load(Relaxed)
             .saturating_add(self.contexts.load(Relaxed))
     }
 
@@ -47,91 +34,70 @@ impl Task {
         self.peak.load(Relaxed)
     }
 
-    /// Elect at most one aggregate scan per process-watch interval. This is a sampling
-    /// cadence, not a memory allowance. A quiescent run forces its final observation.
-    pub fn sample_due(&self, force: bool) -> bool {
-        let now = u64::try_from(self.started.elapsed().as_micros())
-            .unwrap_or(u64::MAX)
-            .max(1);
-        let last = self.last.load(Relaxed);
-        if !force
-            && last != 0
-            && now.saturating_sub(last) < nrese_exec::memory::MemoryWatch::INTERVAL_MICROS
-        {
-            return false;
-        }
-        self.last
-            .compare_exchange(last, now, Relaxed, Relaxed)
-            .is_ok()
+    /// Replaces `release` bytes the engine holds with `add`; false past the limit.
+    pub fn own(&self, add: usize, release: usize) -> bool {
+        self.owned.fetch_add(add, Relaxed);
+        self.owned.fetch_sub(release, Relaxed);
+        self.record()
     }
 
-    pub fn observe(&self, contexts: usize) {
+    /// The contexts' sum; false past the limit.
+    pub fn sample(&self, contexts: usize) -> bool {
         self.contexts.store(contexts, Relaxed);
-        self.record();
+        self.record()
     }
 
     fn record(&self) -> bool {
         let used = self.used();
         self.peak.fetch_max(used, Relaxed);
-        if used > self.limit {
-            self.exhausted.store(true, Relaxed);
-        }
-        !self.exhausted()
+        used <= self.limit
     }
 }
 
-/// One auxiliary owner's capacity (preparation, result or scheduler buffers). Context
-/// inference uses local observations instead. Over-limit observations remain visible.
-#[derive(Debug, Default)]
-pub(super) struct Charge {
-    task: Option<Arc<Task>>,
-    bytes: usize,
+/// Elects one caller per [`nrese_exec::memory::MemoryWatch::INTERVAL_MICROS`] for the
+/// engine's periodic readings (process memory, the capacity sample).
+#[derive(Debug)]
+pub(super) struct Interval {
+    started: Instant,
+    /// Microseconds after `started` of the last election (0: none yet).
+    last: AtomicU64,
 }
 
-impl Charge {
-    pub fn new(task: Option<&Arc<Task>>) -> Self {
+impl Interval {
+    pub fn new() -> Self {
         Self {
-            task: task.cloned(),
-            bytes: 0,
+            started: Instant::now(),
+            last: AtomicU64::new(0),
         }
     }
 
-    pub fn enabled(&self) -> bool {
-        self.task.is_some()
+    /// The latest election (0: none yet); it changes once per interval at most.
+    pub fn last(&self) -> u64 {
+        self.last.load(Relaxed)
     }
 
-    pub fn set(&mut self, bytes: usize) -> bool {
-        let Some(task) = &self.task else {
-            return true;
-        };
-        if bytes == self.bytes {
-            return !task.exhausted();
-        }
-        if bytes > self.bytes {
-            if task.budget.charge(bytes - self.bytes).is_err() {
-                task.exhausted.store(true, Relaxed);
-                return false;
-            }
-        } else if bytes < self.bytes {
-            task.budget.release(self.bytes - bytes);
-        }
-        self.bytes = bytes;
-        task.record()
-    }
-}
-
-impl Drop for Charge {
-    fn drop(&mut self) {
-        if self.bytes != 0
-            && let Some(task) = &self.task
-        {
-            task.budget.release(self.bytes);
-        }
+    pub fn due(&self, now: Instant) -> bool {
+        let now = u64::try_from(now.saturating_duration_since(self.started).as_micros())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let last = self.last.load(Relaxed);
+        (last == 0 || now.saturating_sub(last) >= nrese_exec::memory::MemoryWatch::INTERVAL_MICROS)
+            && self
+                .last
+                .compare_exchange(last, now, Relaxed, Relaxed)
+                .is_ok()
     }
 }
 
 pub(super) fn vec<T>(v: &Vec<T>) -> usize {
     v.capacity() * size_of::<T>()
+}
+
+/// Pushes `value`, adding the list's capacity growth to `bytes`.
+pub(super) fn push<T>(list: &mut Vec<T>, value: T, bytes: &mut usize) {
+    let before = vec(list);
+    list.push(value);
+    *bytes += vec(list) - before;
 }
 
 pub(super) fn nested<T>(v: &Vec<Vec<T>>) -> usize {
@@ -140,7 +106,6 @@ pub(super) fn nested<T>(v: &Vec<Vec<T>>) -> usize {
 
 /// Hash table capacity excludes control bytes and spare buckets. Estimate the backing
 /// allocation from its 7/8 load factor, rounding up to a power of two, plus a control group.
-/// Allocator bookkeeping and thread stacks are outside this capacity contract.
 pub(super) fn table<K, V>(capacity: usize) -> usize {
     if capacity == 0 {
         return 0;
@@ -168,55 +133,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sampled_contexts_and_auxiliary_owners_share_the_envelope() {
-        let task = Task::new(100, Arc::new(AtomicBool::new(false)));
-        let mut owner = Charge::new(Some(&task));
-        assert!(owner.set(20));
-        task.observe(70);
-        assert_eq!((task.used(), task.peak()), (90, 90));
-        assert!(!task.exhausted());
-        task.observe(90);
-        assert_eq!((task.used(), task.peak()), (110, 110));
-        assert!(task.exhausted());
-        drop(owner);
-        task.observe(0);
-        assert_eq!((task.used(), task.peak()), (0, 110));
-        assert!(
-            task.exhausted(),
-            "a stopped run cannot become complete again"
-        );
+    fn owned_capacity_and_context_samples_share_the_envelope() {
+        let observer = Observer::new(100);
+        assert!(observer.own(20, 0));
+        assert!(observer.sample(70));
+        assert_eq!((observer.used(), observer.peak()), (90, 90));
+        assert!(!observer.sample(90));
+        assert_eq!((observer.used(), observer.peak()), (110, 110));
+        assert!(observer.own(5, 20));
+        assert!(observer.sample(0));
+        assert_eq!((observer.used(), observer.peak()), (5, 110));
     }
 
     #[test]
-    fn stopping_still_reconciles_owned_capacity() {
-        let stopped = Arc::new(AtomicBool::new(false));
-        let task = Task::new(100, Arc::clone(&stopped));
-        let mut owner = Charge::new(Some(&task));
-        assert!(owner.set(60));
-        stopped.store(true, Relaxed);
-        assert!(!owner.set(60));
-        assert!(!owner.set(20));
-        assert_eq!((task.used(), task.peak()), (20, 60));
-        drop(owner);
-        assert_eq!(task.used(), 0);
-        assert!(task.exhausted());
-    }
-
-    #[test]
-    fn auxiliary_owners_move_release_and_keep_tasks_independent() {
-        let first = Task::new(100, Arc::new(AtomicBool::new(false)));
-        let second = Task::new(100, Arc::new(AtomicBool::new(false)));
-        let mut owner = Charge::new(Some(&first));
-        assert!(owner.set(60));
-        let mut moved = owner;
-        assert!(moved.set(40));
-        let mut other = Charge::new(Some(&second));
-        assert!(other.set(100));
-        assert!(!moved.set(101));
-        assert_eq!((first.used(), first.peak()), (101, 101));
-        assert!(!second.exhausted());
-        drop(moved);
-        drop(other);
-        assert_eq!((first.used(), second.used()), (0, 0));
+    fn one_caller_is_elected_per_interval() {
+        let interval = Interval::new();
+        let now = Instant::now();
+        assert!(interval.due(now));
+        assert!(!interval.due(now));
+        let later = now
+            + std::time::Duration::from_micros(
+                2 * nrese_exec::memory::MemoryWatch::INTERVAL_MICROS,
+            );
+        assert!(interval.due(later));
+        assert!(!interval.due(later));
     }
 }

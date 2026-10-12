@@ -73,11 +73,6 @@ pub fn individuals(ontology: &Ontology) -> Vec<Term> {
 
 /// Classifies `ontology` and realises its individuals.
 pub fn realise(ontology: &Ontology, options: &Options) -> Realisation {
-    let mut owned = options.clone();
-    let workers = options.workers();
-    owned.threads = workers.width();
-    owned.workers = Some(workers);
-    let options = &owned;
     let started = Instant::now();
     let deadline = Deadline::new(options.timeout);
     let taxonomy = classify(ontology, options);
@@ -249,7 +244,7 @@ impl<'a> Work<'a> {
                 p.iter().filter(|d| types.binary_search(d).is_err()).count()
             }) as u64;
         }
-        let workers = self.options.workers();
+        let workers = &self.options.workers;
         if self.stats.candidates == 0 {
             base = None;
         } else {
@@ -259,7 +254,7 @@ impl<'a> Work<'a> {
             base = base.map(tableau::Base::into_deterministic);
         }
         // Waves: each individual's most general open candidate, over the workers.
-        let wave = (self.options.threads * 4).max(1);
+        let wave = workers.width() * 4;
         let mut cursor = 0usize;
         loop {
             if self.deadline.passed() {

@@ -32,6 +32,7 @@ pub mod realise;
 
 use std::time::{Duration, Instant};
 
+use nrese_exec::workers::Workers;
 use nrese_owl::{Normalised, Ontology, Term, normalise_with};
 
 pub use crate::context::Classification;
@@ -43,11 +44,8 @@ pub use realise::{Realisation, realise};
 /// taxonomy).
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Worker allowance; 1 runs on the caller only when no physical owner is supplied.
-    pub threads: usize,
-    /// Reusable physical workers supplied by an embedding runtime. `threads` narrows
-    /// their allowance. Without an owner, classification creates one pool for its run.
-    pub workers: Option<nrese_exec::workers::Workers>,
+    /// The workers the tests and saturations run on (serial by default).
+    pub workers: Workers,
     /// Classify Horn ontologies with the context core (else the tableau driver only).
     pub context_core: bool,
     /// Eliminate the fresh names resolution can eliminate ([`inline`]).
@@ -99,17 +97,10 @@ pub struct Options {
 }
 
 impl Options {
-    pub(crate) fn workers(&self) -> nrese_exec::workers::Workers {
-        self.workers.as_ref().map_or_else(
-            || Workers::new(self.threads),
-            |workers| workers.limited(self.threads.max(1)),
-        )
-    }
-
     /// The context core's options for a run of the driver within `budget` (no proofs).
     pub(crate) fn core(&self, budget: crate::context::Budget) -> crate::context::Options {
         crate::context::Options {
-            threads: self.threads,
+            threads: self.workers.width(),
             proofs: false,
             budget,
             strategy: self.lower_bound_strategy,
@@ -122,8 +113,7 @@ impl Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            threads: 1,
-            workers: None,
+            workers: Workers::serial(),
             context_core: true,
             inline: true,
             horn_lower_bound: true,
@@ -225,14 +215,16 @@ impl Deadline {
         }
     }
 
-    /// The tableau's per-test configuration within the deadline.
+    /// The tableau's per-test configuration within the deadline (each test's own
+    /// `timeout` counts from its start).
     pub(crate) fn config(&self, base: &tableau::Config) -> tableau::Config {
-        let mut c = base.clone();
-        if let Some(d) = self.0 {
-            let left = d.saturating_duration_since(Instant::now());
-            c.timeout = Some(c.timeout.map_or(left, |t| t.min(left)));
+        tableau::Config {
+            deadline: match (base.deadline, self.0) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+            ..base.clone()
         }
-        c
     }
 }
 
@@ -249,15 +241,8 @@ pub(crate) fn trace(what: &str) {
     }
 }
 
-use nrese_exec::workers::Workers;
-
 /// Classifies `ontology`.
 pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
-    let mut owned = options.clone();
-    let workers = options.workers();
-    owned.threads = workers.width();
-    owned.workers = Some(workers.clone());
-    let options = &owned;
     let started = Instant::now();
     let deadline = Deadline::new(options.timeout);
     let classes = crate::context::signature(ontology);
@@ -270,12 +255,12 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
     if options.context_core {
         let core = options.core(deadline.budget(options, None));
         let t = Instant::now();
-        if let Ok(saturated) = crate::context::classify::saturate_normalised_with_workers(
+        if let Ok(saturated) = crate::context::saturate_normalised(
             &normalised,
             &classes,
             &core,
             options.tableau.cancel.clone(),
-            &workers,
+            &options.workers,
         ) && saturated.complete()
         {
             let classification = saturated.classification();
@@ -286,7 +271,7 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
                 lower_bound: t.elapsed(),
                 classes: classes.len(),
                 total: started.elapsed(),
-                threads: options.threads,
+                threads: options.workers.width(),
                 ..Profile::default()
             };
             return Taxonomy {

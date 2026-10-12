@@ -24,8 +24,7 @@ use nrese_owl::{Normalised, Ontology, Term};
 
 use super::consistency::{self, Verdict};
 use super::known::{self, Lower};
-use super::{Classification, Deadline, Options, Profile, Taxonomy, Workers};
-use crate::tableau::budget::RunBudget;
+use super::{Classification, Deadline, Options, Profile, Taxonomy};
 use crate::tableau::{Answer, At, Base, From, Labels, Prepared, Probe, ProbeOutcome, Want};
 
 /// A class's state.
@@ -56,7 +55,6 @@ pub(crate) struct Driver<'a> {
     top_possible: Option<Vec<u32>>,
     /// `owl:Thing`'s subsumers where the Horn part has all of them.
     top_known: Option<Vec<u32>>,
-    workers: Workers,
 }
 
 impl<'a> Driver<'a> {
@@ -77,7 +75,7 @@ impl<'a> Driver<'a> {
             profile: Profile {
                 path: "tableau",
                 classes: n,
-                threads: options.threads,
+                threads: options.workers.width(),
                 ..Profile::default()
             },
             incomplete: Vec::new(),
@@ -86,7 +84,6 @@ impl<'a> Driver<'a> {
             possible: vec![None; n],
             top_possible: None,
             top_known: None,
-            workers: options.workers(),
         }
     }
 
@@ -106,11 +103,11 @@ impl<'a> Driver<'a> {
                 self.deadline
                     .budget(self.options, Some(self.options.lower_bound_timeout)),
             );
-            if let Some(lower) = known::horn_lower_bound_with_workers(
+            if let Some(lower) = known::horn_lower_bound(
                 self.normalised,
                 self.classes,
                 &core,
-                &self.workers,
+                &self.options.workers,
                 self.options.tableau.cancel.clone(),
             ) {
                 if lower.inconsistent {
@@ -156,7 +153,7 @@ impl<'a> Driver<'a> {
                 self.classes,
                 &self.config(),
                 &self.options.core(self.deadline.budget(self.options, None)),
-                &self.workers,
+                &self.options.workers,
             )
         } else {
             None
@@ -171,8 +168,7 @@ impl<'a> Driver<'a> {
         });
         let mut base = None;
         match by_core {
-            Some(Verdict::Inconsistent) => return self.inconsistent(),
-            Some(Verdict::Consistent) => self.profile.consistency_by = "context-core",
+            Some(_) => self.profile.consistency_by = "context-core",
             None => {
                 let program = full.as_ref().expect("tableau consistency program");
                 let (out, retained) = program.consistency_with_base(
@@ -332,7 +328,6 @@ impl<'a> Driver<'a> {
             first,
             base,
             full,
-            deadline: self.deadline,
             detached: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
             from_model: AtomicU64::new(0),
@@ -430,7 +425,7 @@ impl<'a> Driver<'a> {
         // Most specific first: their models show their superclasses.
         let mut order: Vec<u32> = (0..n as u32).collect();
         order.sort_by_key(|&c| std::cmp::Reverse(self.known[c as usize].len()));
-        let wave = (self.options.threads * 2).max(1);
+        let wave = self.options.workers.width() * 2;
         let mut at = 0;
         while at < order.len() {
             if self.deadline.passed() {
@@ -460,7 +455,7 @@ impl<'a> Driver<'a> {
                 individuals: false,
                 detached: false,
             };
-            let outcomes: Vec<(u32, ProbeOutcome)> = self.workers.map(&batch, |&c| {
+            let outcomes: Vec<(u32, ProbeOutcome)> = self.options.workers.map(&batch, |&c| {
                 let probe = Probe {
                     at: At::Fresh,
                     positive: std::slice::from_ref(&c),
@@ -580,7 +575,7 @@ impl<'a> Driver<'a> {
             .filter(|&c| self.status[c as usize] == Status::Sat)
             .collect();
         let this = &*self;
-        let results: Vec<(u32, Vec<u32>, Stats)> = this.workers.map(&todo, |&c| {
+        let results: Vec<(u32, Vec<u32>, Stats)> = this.options.workers.map(&todo, |&c| {
             let (s, stats) = this.subsumers_of(tests, c, top, &unsat, &config);
             (c, s, stats)
         });
@@ -687,7 +682,6 @@ struct Tests<'p, 't> {
     first: Option<(&'t Prepared, bool)>,
     base: Option<Base<'p>>,
     full: &'p Prepared,
-    deadline: Deadline,
     /// Tests the terminology answered with a detached model, tests that went on with the
     /// individuals, and of those, how many the base answered from the model or from the
     /// deterministic state.
@@ -704,49 +698,51 @@ impl Tests<'_, '_> {
         config: &crate::tableau::Config,
         want: Want,
     ) -> ProbeOutcome {
-        // A worker may start after its wave was queued. Both the detached attempt
-        // and its full fallback consume this one remaining operation allowance.
-        let config = self.deadline.config(config);
-        let budget = RunBudget::new(&config);
-        budget.probe(&config, |remaining| {
-            let mut previous = crate::tableau::Telemetry::default();
-            if let Some((terminology, check)) = self.first {
-                let want_first = Want {
-                    detached: check,
-                    ..want
-                };
-                let out = terminology.probe(probe, remaining, want_first);
-                if !check {
-                    return out;
-                }
-                match &out.answer {
-                    // Refuted without the assertions: refuted with them.
-                    Answer::Inconsistent => return out,
-                    Answer::Consistent if out.labels.as_ref().is_some_and(|l| l.detached) => {
-                        self.detached.fetch_add(1, Relaxed);
-                        return out;
-                    }
-                    _ => {}
-                }
-                self.fallbacks.fetch_add(1, Relaxed);
-                previous = out.telemetry;
+        // The detached attempt and its fallback share the test's one deadline; a test
+        // whose wave was queued past it does no work.
+        let config = &*config.started();
+        if let Some(why) = config.stopped() {
+            return ProbeOutcome::stopped(why);
+        }
+        let mut previous = crate::tableau::Telemetry::default();
+        if let Some((terminology, check)) = self.first {
+            let want_first = Want {
+                detached: check,
+                ..want
+            };
+            let out = terminology.probe(probe, config, want_first);
+            if !check {
+                return out;
             }
-            let mut out = budget.probe(&config, |remaining| {
-                if let Some(base) = &self.base
-                    && let Some((out, from)) = base.probe(probe, remaining, want)
-                {
-                    let counter = match from {
-                        From::Model => &self.from_model,
-                        From::Deterministic => &self.from_deterministic,
-                    };
-                    counter.fetch_add(1, Relaxed);
+            match &out.answer {
+                // Refuted without the assertions: refuted with them.
+                Answer::Inconsistent => return out,
+                Answer::Consistent if out.labels.as_ref().is_some_and(|l| l.detached) => {
+                    self.detached.fetch_add(1, Relaxed);
                     return out;
                 }
-                self.full.probe(probe, remaining, want)
-            });
-            out.telemetry.accumulate(&previous);
-            out
-        })
+                _ => {}
+            }
+            self.fallbacks.fetch_add(1, Relaxed);
+            previous = out.telemetry;
+        }
+        let mut out = match self
+            .base
+            .as_ref()
+            .and_then(|b| b.probe(probe, config, want))
+        {
+            Some((out, from)) => {
+                let counter = match from {
+                    From::Model => &self.from_model,
+                    From::Deterministic => &self.from_deterministic,
+                };
+                counter.fetch_add(1, Relaxed);
+                out
+            }
+            None => self.full.probe(probe, config, want),
+        };
+        out.telemetry.accumulate(&previous);
+        out
     }
 }
 
@@ -831,7 +827,6 @@ pub(crate) fn insert_sorted(a: &mut Vec<u32>, x: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn a_queued_probe_observes_the_operation_deadline_even_with_a_base() {
@@ -847,7 +842,6 @@ mod tests {
             first: Some((&prepared, true)),
             base,
             full: &prepared,
-            deadline: Deadline::new(Some(Duration::ZERO)),
             detached: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
             from_model: AtomicU64::new(0),
@@ -858,7 +852,11 @@ mod tests {
             positive: &[0],
             negative: &[],
         };
-        let out = tests.probe(&probe, &config, Want::default());
+        let expired = crate::tableau::Config {
+            deadline: Some(Instant::now()),
+            ..config
+        };
+        let out = tests.probe(&probe, &expired, Want::default());
         assert!(matches!(out.answer, Answer::GaveUp(_)));
         assert!(out.labels.is_none());
         assert_eq!(out.telemetry.nodes_created, 0);
