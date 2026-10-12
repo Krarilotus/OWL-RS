@@ -281,6 +281,9 @@ class DockerRuntime(Runtime):
         # A measurement's own container: the quiet slot's watcher pauses the others.
         if os.environ.get("NRESE_QUIET_TOKEN"):
             args += ["--label", f"nrese.quiet={os.environ['NRESE_QUIET_TOKEN']}"]
+        # A queue job's containers: its host's guard stops them with the job (suite/queue.py).
+        if os.environ.get("QUEUE_JOB"):
+            args += ["--label", f"nrese.queue={os.environ['QUEUE_JOB']}"]
         if detached:
             args.append("-d")
         if spec.keep_stdin:
