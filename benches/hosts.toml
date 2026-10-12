@@ -5,7 +5,8 @@
 # (the binaries under test, the results directory).
 #
 # Roles: build (compiles Rust, runs the gate and build-triggering hooks), test (runs the
-# test suites), measure (runs benchmarks), cluster (runs the suite under SLURM).
+# test suites), measure (runs timed benchmarks), prepare (downloads, data preparation, answer
+# checks: no timing), cluster (runs the suite under SLURM).
 # has: what cases may need (docker, java, apptainer); a driver refuses a case whose
 # needs the host lacks.
 # config: the host's configurations, newest first, each from `since` (the host's local
@@ -15,6 +16,8 @@
 # queue: the host's measurement queue (benches/suite/queue.py): its directory, and when a
 # timed job may start: within `windows` (local time) or while the `free` file exists, never
 # while the `retreat` file exists (the owners are present) and never while a compiler runs.
+# `timing = false`: the host takes no timed job at all (window "quiet"); `keep = "same-day"`:
+# a job's results are fetched the day it ends (queue.py fetch) and removed there.
 
 [assets]
 # Immutable preservation copies, SHA-256-verified on office-pc and phuoc-yu (receipts in
@@ -53,7 +56,7 @@ machine = "AMD Ryzen 9 5950X, 32 threads, 31 GiB"
 roles = ["build", "test", "measure"]
 has = ["docker", "java"]
 assets = true
-queue = { dir = "~/owlrs/queue", windows = ["21:00-06:00"], free = "~/owlrs/FREE", retreat = "~/owlrs/RETREAT", path = ["~/nrese-bench/py312/bin", "~/.cargo/bin"] }
+queue = { dir = "~/owlrs/queue", windows = ["21:00-06:00"], free = "~/owlrs/FREE", retreat = "~/owlrs/RETREAT", path = ["~/nrese-bench/py312/bin", "~/.cargo/bin"], python = "~/nrese-bench/py312/bin/python3" }
 
 [host.phuoc-yu]
 ssh = "Phuoc-Yu"
@@ -82,17 +85,39 @@ note = "the runs of 9 to 12 October 2026 (the PR #23 acceptance A/B ended 12:14)
 
 [host.khaleesi]
 ssh = "Khaleesi"
+hostname = "KHALEESI"
 os = "windows"
+machine = "AMD Ryzen 9 5950X, 32 threads (the CPU of office-pc), 64 GiB"
 roles = ["measure"]
 has = []
 assets = false
+note = "the owner's machine, the owner's session active: runs that need RAM, and whole comparisons whose every contender runs there (the DL reasoners); its own baseline, never compared with another host's. No Docker, no WSL distribution. Rust 1.98.1 (MSVC), git, Python 3.14: a job builds the binaries of its own runs there"
+scratch = "S:/nrese-scratch: at most 1 TB, emptied the same day"
+queue = { dir = "S:/nrese-scratch/queue", repo = "S:/nrese-scratch/repo.git", results = "S:/nrese-scratch/results", windows = ["21:00-06:00"], keep = "same-day", python = "python", receive_pack = "powershell -NoProfile -Command git-receive-pack" }
+
+[[host.khaleesi.config]]
+since = "2026-10-12"
+toolchain = "Rust 1.98.1 (MSVC); Windows 11"
 
 [host.gamergrill]
 ssh = "GamerGrill"
+hostname = "GamerGrill"
 os = "windows"
-roles = ["measure"]
+machine = "AMD Ryzen 5 3600X, 12 threads, 16 GiB (WSL sees 7 GiB)"
+roles = ["prepare"]
 has = []
 assets = false
+note = "a user is logged in: light tasks only, in its WSL Ubuntu (wsl -e bash -lc ...): downloads, data preparation, answer checks; no timing. No Rust, no Docker, no Java"
+queue = { dir = "/home/schmiddihhh/owlrs/queue", repo = "/home/schmiddihhh/owlrs/repo.git", results = "/home/schmiddihhh/owlrs/results", windows = ["00:00-24:00"], timing = false, python = "wsl -e python3", receive_pack = "wsl git-receive-pack" }
+
+[host.kraris-gptler]
+hostname = "Kraris-GPTler"
+os = "windows"
+machine = "16 threads"
+roles = ["build", "prepare"]
+has = ["docker"]
+assets = false
+note = "the main PC, where the owner works: builds and the gate when office-pc is busy (NRESE_BUILD_HOST=local, tooling/build-hosts), data preparation; no timing"
 
 [host.draco]
 os = "linux"
