@@ -5412,7 +5412,7 @@ fn groups_over_joins_larger_than_memory_answer() {
     let query = SparqlParser::new().parse_query(&text).unwrap();
     let limited = QueryOptions {
         resources: nrese_sparql::Resources {
-            memory_limit: Some(4 << 20),
+            memory: nrese_exec::Envelope::new(Some(4 << 20), None),
             ..Default::default()
         },
         ..QueryOptions::default()

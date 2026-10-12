@@ -346,15 +346,12 @@ pub(super) fn check_closed_for_answers(
     prepared: &PreparedQuery,
     settings: &crate::query_executor::StoreSettings,
     cancellation: &CancellationToken,
+    memory: &nrese_exec::Envelope,
 ) -> StoreResult<Answers> {
     let upper = view.upper.as_ref().expect("closed_for_answers needs U1");
     use crate::query_executor::evaluate_bound;
-    let lower = evaluate_bound(&view.lower, prepared, settings, cancellation, 0)?;
-    let retained = match &lower {
-        Answers::Solutions(rows) => rows.reserved_bytes(),
-        _ => 0,
-    };
-    let upper = evaluate_bound(upper, prepared, settings, cancellation, retained)?;
+    let lower = evaluate_bound(&view.lower, prepared, settings, cancellation, memory)?;
+    let upper = evaluate_bound(upper, prepared, settings, cancellation, memory)?;
     match (&lower, &upper) {
         (Answers::Boolean(l), Answers::Boolean(u)) => {
             assert_eq!(l, u, "skolem-only-gap: {}", prepared.text());

@@ -69,7 +69,7 @@ fn retained_results_keep_shared_reservations_and_original_bags_until_delivery() 
     let shared = nrese_exec::SharedBudget::new(1 << 20);
     let options = crate::QueryOptions {
         resources: crate::Resources {
-            shared_memory: Some(Arc::clone(&shared)),
+            memory: nrese_exec::Envelope::new(None, Some(Arc::clone(&shared))),
             ..Default::default()
         },
         ..Default::default()

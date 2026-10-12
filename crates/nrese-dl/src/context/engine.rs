@@ -193,7 +193,7 @@ pub struct Engine {
 
 /// What a saturation may use (the dynamic fallback's budgets, design §4, in their first
 /// form): past it, the run stops and is reported, never answered.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Budget {
     pub deadline: Option<Instant>,
     /// The most conclusions one join of the Pred rule may produce (its premises'
@@ -206,27 +206,35 @@ pub struct Budget {
     /// that grows past it stops instead of taking the machine.
     pub max_memory: Option<u64>,
     /// The saturation's estimated capacity, sampled (docs/design/owl2-dl.md §13); `None`:
-    /// unlimited, and nothing is observed.
+    /// unlimited.
     pub task_memory: Option<usize>,
+    /// The request's memory envelope: the sampled capacity is reserved from it as it
+    /// grows, and the saturation stops where it has no room, as past `task_memory`.
+    /// Without either, nothing is observed.
+    pub memory: Option<nrese_exec::Envelope>,
 }
 
 impl Engine {
     pub fn new(program: Program, strategy: Strategy, proofs: bool, budget: Budget) -> Self {
+        let observer = (budget.task_memory.is_some() || budget.memory.is_some()).then(|| {
+            Observer::new(
+                budget.task_memory.unwrap_or(usize::MAX),
+                budget.memory.clone(),
+            )
+        });
         let engine = Self {
             program,
             strategy,
             proofs,
             contexts: Arena::new(),
             registry: Mutex::new(HashMap::new()),
-            budget,
             cancel: None,
             prune_pred: true,
             exhausted: AtomicBool::new(false),
-            timed: budget.deadline.is_some()
-                || budget.max_memory.is_some()
-                || budget.task_memory.is_some(),
+            timed: budget.deadline.is_some() || budget.max_memory.is_some() || observer.is_some(),
+            budget,
             interval: Interval::new(),
-            observer: budget.task_memory.map(Observer::new),
+            observer,
         };
         if engine.observing() {
             engine.own(engine.program.bytes(), 0);
@@ -245,8 +253,8 @@ impl Engine {
         self
     }
 
-    pub fn budget(&self) -> Budget {
-        self.budget
+    pub fn budget(&self) -> &Budget {
+        &self.budget
     }
 
     pub(super) fn observing(&self) -> bool {
