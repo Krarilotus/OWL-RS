@@ -1,0 +1,16 @@
+# ann-benchmarks on SIFT-1M: NRESE, Qdrant, pgvector and hnswlib in upstream's harness (one
+# CPU per container, k = 10, 5 passes), then upstream's metrics as the suite's rows.
+id = "breadth-ann-sift"
+group = "breadth"
+host = "office-pc"
+checkout = "suite/breadth"
+workload = "ann-benchmarks"
+window = "quiet"
+priority = 1
+est_min = 360
+needs = ["docker"]
+env = { PYTHONIOENCODING = "utf-8", NRESE_QUIET_DRAIN_S = "1800" }
+commands = [
+  ["scripts/quiet-slot.sh", "python3", "benches/breadth/vectors/ann.py", "run", "--dataset", "sift-128-euclidean", "--algorithms", "nrese,qdrant,pgvector,hnswlib"],
+  ["sh", "-c", "python3 benches/breadth/vectors/ann.py export --results \"$QUEUE_RESULTS\""],
+]

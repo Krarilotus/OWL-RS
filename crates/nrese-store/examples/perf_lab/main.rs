@@ -4,7 +4,8 @@
 //! cargo run --release -p nrese-store --example perf_lab -- \
 //!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] \
 //!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
-//!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE] [--reason MODE]
+//!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE]
+//!     [--shacl-report FILE] [--reason MODE]
 //!     [--rules FILE.n3] [--reason-runs 1] [--results DIR] [--routes] [--commits FILE]
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
 //!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC]
@@ -20,7 +21,8 @@
 //! - **Report:** rows, p50, min and max per query, peak memory (Linux), and a JSON file
 //!   for `benches/baselines/`. `--baseline` adds the ratio against an earlier JSON report.
 //!   `--shapes` loads a SHACL shapes file into the shapes graph and times validating the
-//!   data against it (`--runs` times), before the queries.
+//!   data against it (`--runs` times), before the queries; `--shacl-report FILE` writes
+//!   the last validation's report there as N-Triples (after the timing).
 //!   `--format` serialises SELECT results in another format than TSV (JSON is what most
 //!   clients ask for).
 //!   `--reason` materialises a ruleset (`owl2-rl`, `rdfs`, ...) after the load, timed, and
@@ -192,6 +194,7 @@ struct Args {
     qerror: bool,
     format: SolutionsResultFormat,
     shapes: Option<PathBuf>,
+    shacl_report: Option<PathBuf>,
     reason: Option<ReasoningMode>,
     rules: Option<PathBuf>,
     reason_runs: usize,
@@ -229,6 +232,7 @@ fn parse_args() -> Result<Args, String> {
         qerror: false,
         format: SolutionsResultFormat::Tsv,
         shapes: None,
+        shacl_report: None,
         reason: None,
         rules: None,
         reason_runs: 1,
@@ -270,6 +274,7 @@ fn parse_args() -> Result<Args, String> {
             "--results" => args.results = Some(value()?.into()),
             "--qerror" => args.qerror = true,
             "--shapes" => args.shapes = Some(value()?.into()),
+            "--shacl-report" => args.shacl_report = Some(value()?.into()),
             "--reason" => {
                 let name = value()?;
                 args.reason = Some(
@@ -1095,6 +1100,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         })?;
         let mut times = Vec::new();
         let mut results = 0;
+        let mut last = None;
         for _ in 0..args.runs {
             let started = Instant::now();
             let validation = store.validate_shacl(
@@ -1103,6 +1109,13 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             )?;
             times.push(started.elapsed());
             results = validation.report.results.len();
+            last = Some(validation);
+        }
+        if let (Some(path), Some(validation)) = (&args.shacl_report, &last) {
+            std::fs::write(
+                path,
+                validation.serialize(nrese_store::GraphResultFormat::NTriples)?,
+            )?;
         }
         let samples: Vec<String> = times
             .iter()

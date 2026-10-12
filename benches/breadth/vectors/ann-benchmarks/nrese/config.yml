@@ -1,0 +1,14 @@
+float:
+  any:
+  - base_args: ['@metric']
+    constructor: Nrese
+    disabled: false
+    docker_tag: ann-benchmarks-nrese
+    module: ann_benchmarks.algorithms.nrese
+    name: nrese
+    run_groups:
+      # The HNSW parameters NRESE ships (M 16, ef_construction 200) aren't settable through the
+      # server; the search beam is (nrv:searchBudget), swept as hnswlib's ef is.
+      shipped:
+        args: []
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 600, 800]]

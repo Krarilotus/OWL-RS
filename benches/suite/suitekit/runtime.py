@@ -79,7 +79,9 @@ def shell(command: list[str]) -> str:
 
 
 def run_quiet(command: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    # UTF-8 whatever the console's code page (Windows): a container's log is the system's bytes.
+    return subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          timeout=timeout)
 
 
 def mib(text: str) -> int | None:

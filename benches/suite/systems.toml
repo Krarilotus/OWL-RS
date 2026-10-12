@@ -20,6 +20,9 @@
 #   classify                     TBox classification (OWL 2 EL or DL)
 #   shacl-core, shacl-sparql     SHACL validation
 #   fulltext, geosparql, federation
+#   rdf12                        statements about statements: RDF 1.2 triple terms and
+#                                reifiers, or RDF-star's quoted triples (SPARQL-star)
+#   vector                       k-nearest-neighbour search over embeddings
 #
 # `publish`: free = results may be published; permission = only with the vendor's written
 # consent (benches/competitors/README.md). `runs`: how the suite can start it
@@ -42,6 +45,7 @@ capabilities = [
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
   "reason-custom-rules", "reason-incremental", "consistency", "explain",
   "shacl-core", "shacl-sparql", "fulltext", "federation", "geosparql", "classify",
+  "rdf12", "vector",
 ]
 # What the suite needs and NRESE lacks; each names its step in the parity plan.
 # (reason-custom-rules: user rules in Notation3 since 2026-10-01; builtins and .pie import
@@ -66,6 +70,7 @@ capabilities = [
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
   "reason-custom-rules", "reason-incremental", "consistency", "explain",
   "shacl-core", "shacl-sparql", "fulltext", "federation", "geosparql", "classify",
+  "rdf12", "vector",
 ]
 missing = {}
 
@@ -94,7 +99,7 @@ capabilities = ["load", "query", "update", "fulltext", "geosparql", "federation"
 name = "Oxigraph"
 publish = "free"
 runs = ["docker", "rootfs", "apptainer"]
-capabilities = ["load", "query", "update", "federation"]
+capabilities = ["load", "query", "update", "federation", "rdf12"]
 
 [virtuoso]
 name = "Virtuoso Open Source 7"
@@ -110,7 +115,7 @@ runs = ["docker", "rootfs", "apptainer"]
 capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-custom-rules",
-  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
+  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation", "rdf12",
 ]
 
 # Built by benches/sparql/images.sh from the commit of the Sparqloscope paper's results
@@ -125,7 +130,7 @@ capabilities = ["load", "query"]
 name = "Eclipse RDF4J (native store)"
 publish = "free"
 runs = ["docker"]
-capabilities = ["load", "query", "update", "reason-rdfs", "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation"]
+capabilities = ["load", "query", "update", "reason-rdfs", "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation", "rdf12"]
 
 [nemo]
 name = "Nemo (datalog), general OWL 2 RL encoding (benches/reasoning/nemo/owl2rl.rls)"
@@ -211,7 +216,7 @@ capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql", "reason-custom-rules",
   "reason-incremental", "consistency", "explain",
-  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
+  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation", "rdf12",
 ]
 
 # Its evaluation licence was refused (owner, 12 Oct 2026; AllegroGraph's too): it runs
@@ -247,7 +252,7 @@ capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl2-rl", "reason-owl2-ql", "reason-custom-rules",
   "consistency", "explain",
-  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
+  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation", "rdf12",
 ]
 
 [anzograph]
@@ -255,3 +260,55 @@ name = "AnzoGraph DB (Altair Graph Lakehouse)"
 publish = "permission"
 runs = ["docker"]
 capabilities = ["load", "query", "update", "reason-rdfs", "reason-owl-horst", "federation"]
+
+# The vector databases (benches/breadth/vectors): each runs on its own benchmarks' ground
+# (VectorDBBench, its ann-benchmarks module) through the vectors kit, not the SPARQL cycle.
+[qdrant]
+name = "Qdrant"
+publish = "free"
+runs = ["kit"]
+capabilities = ["vector"]
+
+[milvus]
+name = "Milvus (standalone, with etcd and MinIO)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["vector"]
+
+[pgvector]
+name = "PostgreSQL with pgvector"
+publish = "free"
+runs = ["kit"]
+capabilities = ["vector"]
+
+[lancedb]
+name = "LanceDB (embedded)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["vector"]
+
+# SHACL engines of ERA-SHACL (benches/breadth/era-shacl): each in memory in its own
+# container, as that benchmark builds them.
+[topbraid]
+name = "TopBraid SHACL (the reference implementation of the spec's editor)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["shacl-core", "shacl-sparql"]
+
+[pyshacl]
+name = "pySHACL (rdflib)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["shacl-core", "shacl-sparql"]
+
+[maplib]
+name = "maplib (Rust, Polars)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["shacl-core"]
+
+[corese]
+name = "Corese"
+publish = "free"
+runs = ["kit"]
+capabilities = ["shacl-core", "shacl-sparql"]

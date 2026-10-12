@@ -365,3 +365,75 @@ fn searches_go_first_when_the_pattern_is_large() {
     .collect();
     assert_eq!(found, expected);
 }
+
+/// Uniform random vectors in [-1, 1]^dimension (hard for any graph index), from a seed.
+struct Rng(u64);
+
+impl Rng {
+    fn vector(&mut self, dimension: usize) -> Vec<f32> {
+        (0..dimension)
+            .map(|_| {
+                self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                ((z >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+}
+
+/// A filtered search that goes first (the joined pattern binds far more than
+/// PROBE_ABOVE · k rows) searches the graph without the filter and probes its hits. The
+/// index must be told the pattern's share of the vectors, or the first `k` hits that pass
+/// come from the tail of an approximate list: on this data recall 0.86 without it (the fast
+/// suite's `vector-knn-filtered`: 0.40-0.60), 0.99 with it
+/// (crates/nrese-vector/examples/filtered_recall.rs).
+#[test]
+fn a_filtered_search_that_goes_first_finds_the_true_nearest() {
+    // Past nrese_engine::vector::EXACT_BELOW (the graph is used), below SYNC_BUILD (it is
+    // built at the first search, not on a thread).
+    const ITEMS: usize = 24_000;
+    const DIMENSION: usize = 64;
+    const QUERIES: usize = 20;
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut rng = Rng(7);
+    let mut tx = engine.transaction();
+    for i in 0..ITEMS {
+        let item = ex(&format!("item/{i}"));
+        tx.insert(
+            Quad::new(
+                item.clone(),
+                ex("embedding"),
+                vector(&rng.vector(DIMENSION)),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+        let kind = ex(&format!("k{}", i % 10));
+        tx.insert(Quad::new(item, ex("kind"), kind, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let mut found = 0;
+    for _ in 0..QUERIES {
+        let near = format!("\"{}\"^^nrv:vector", lexical(&rng.vector(DIMENSION)));
+        let search = |exact: &str| {
+            let query = format!(
+                "SELECT ?item WHERE {{ ?item ex:kind ex:k3 ; ex:embedding ?v .
+                   SERVICE nrv:search {{ ?v nrv:near {near} ; nrv:k 10{exact} }} }}"
+            );
+            rows(&engine, &query, &QueryOptions::default())
+        };
+        let truth = search(" ; nrv:exact true");
+        assert_eq!(truth.len(), 10);
+        let approximate = search("");
+        assert_eq!(approximate.len(), 10);
+        found += approximate.iter().filter(|i| truth.contains(i)).count();
+    }
+    let recall = found as f64 / (QUERIES * 10) as f64;
+    assert!(
+        recall >= 0.95,
+        "recall@10 {recall:.3} under a one-in-ten filter"
+    );
+}

@@ -28,6 +28,14 @@ Per case and contender, the newest comparison on each host: answers first (each 
 | allegrograph | refused | refused | - | no evaluation licence (12 Oct 2026): its published numbers only, as reported; 0 published numbers below |
 | stardog | restricted | restricted | - | not run |
 | anzograph | restricted | restricted | - | not run |
+| qdrant | - | - | - | not measured yet |
+| milvus | - | - | - | not measured yet |
+| pgvector | - | - | - | not measured yet |
+| lancedb | - | - | - | not measured yet |
+| topbraid | - | - | - | not measured yet |
+| pyshacl | - | - | - | not measured yet |
+| maplib | - | - | - | not measured yet |
+| corese | - | - | - | not measured yet |
 
 ## qlever
 
