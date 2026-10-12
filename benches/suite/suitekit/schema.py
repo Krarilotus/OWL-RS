@@ -7,7 +7,7 @@
 | system, version, publish | the system (systems.toml key), its version where it says, and whether its results may be published (free) or need the vendor's permission |
 | workload, tier, regime | the workload (workloads.toml key), its size, and the entailment regime the system ran (none, rdfs, owl-horst, owl2-rl, owl2-ql) |
 | run | the repetition (a fresh store each) |
-| task | load, reason, size, restart, count, query, update, serve, conformance (a skipped pair: load, status skipped) |
+| task | load, reason, size, restart, count, query, update, serve, conformance, validate (SHACL; item = the shape set, rows = validation results), index (a service index built after the server started) (a skipped pair: load, status skipped) |
 | item | the query or test the row is about (task query, conformance) |
 | repeat | the measured repetition of a query within a run; 0 is its first execution on the fresh server (a warm-up run, not in the medians) |
 | status | ok, failed, timeout, wrong (an answer count differs from the expected one), skipped |
@@ -29,7 +29,7 @@ import csv
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
-TASKS = {"load", "reason", "size", "restart", "count", "query", "update", "serve", "conformance"}
+TASKS = {"load", "reason", "size", "restart", "count", "query", "update", "serve", "conformance", "validate", "index"}
 STATUSES = {"ok", "failed", "timeout", "wrong", "skipped"}
 REGIMES = {"none", "rdfs", "owl-horst", "owl2-rl", "owl2-ql", "-"}
 
@@ -72,8 +72,8 @@ def problems(result: Result) -> list[str]:
         out.append(f"unknown regime {result.regime!r}")
     if result.publish not in ("free", "permission"):
         out.append(f"publish must be free or permission, not {result.publish!r}")
-    if result.task == "query" and not result.item:
-        out.append("a query row names its query (item)")
+    if result.task in ("query", "validate") and not result.item:
+        out.append(f"a {result.task} row names its query or shape set (item)")
     return out
 
 

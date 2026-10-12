@@ -43,8 +43,9 @@ each with its run record.
 - **Memory envelope:** DL compilation scratch, task budgets and the query budget are
   separate; one request has no shared end-to-end envelope.
 - **Query progress:** see the proposal above; a decision is needed.
-- **Vector search:** approximate recall under a filter fails its gate (0.40 at k = 10);
-  candidate-first routing finds the missing hits, its cost unqualified.
+- **Vector search:** the filtered search that goes first now widens its beam by the
+  joined pattern's share (12 October; it didn't, so recall under a one-in-ten filter was
+  0.40–0.60): `vector-knn-filtered` to re-measure against its 0.9 gate.
 - **Competitor answers:** rerun with the committed recorder to decide the unordered
   `LIMIT` case; Konclude intermittently drops 107 asserted pairs from the Horn reference
   taxonomy, cause unknown.

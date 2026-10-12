@@ -1,0 +1,14 @@
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> 
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> 
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/>  
+
+SELECT ?r ?rName ?rGeo ?rGeoWKT 
+WHERE { 
+  GRAPH <http://geographica.di.uoa.gr/dataset/lgd> { 
+    ?r rdf:type lgdo:HighwayThing ; 
+       rdfs:label ?rName ; 
+       <http://linkedgeodata.org/ontology/hasGeometry> ?rGeo . 
+    ?rGeo <http://linkedgeodata.org/ontology/asWKT> ?rGeoWKT. 
+  } 
+  FILTER(geof:sfIntersects(?rGeoWKT, "POLYGON((20.7858013633644 36.9947301001973,20.6070018260972 40.8452031365591,26.111857027467 40.875795540161,26.0004221014641 37.02141161985,20.7858013633644 36.9947301001973))"^^<http://www.opengis.net/ont/geosparql#wktLiteral>))
+}

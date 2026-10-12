@@ -8,6 +8,28 @@
 budget_gb = 300
 
 [[dataset]]
+file = "ann/glove-100-angular.hdf5"
+workload = "vector-ann"
+tier = "glove-100-angular"
+role = "core"
+made_by = "curl http://ann-benchmarks.com/glove-100-angular.hdf5"
+source = "http://ann-benchmarks.com/glove-100-angular.hdf5"
+bytes = 485413888
+sha256 = "544af1d5e84e112cd4749571dcfd8ca109818a572f850af75a3a09e093a953c4"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "ann/sift-128-euclidean.hdf5"
+workload = "vector-ann"
+tier = "sift-128-euclidean"
+role = "core"
+made_by = "curl http://ann-benchmarks.com/sift-128-euclidean.hdf5"
+source = "http://ann-benchmarks.com/sift-128-euclidean.hdf5"
+bytes = 525128288
+sha256 = "dd6f0a6ed6b7ebb8934680f861a33ed01ff33991eaee4fd60914d854a0ca5984"
+frozen = "2026-10-12"
+
+[[dataset]]
 file = "dbpedia-core.nt"
 workload = "basics-mix"
 tier = "dbpedia-core"
@@ -26,6 +48,76 @@ made_by = "bash benches/competitors/prepare-entities.sh 10000000"
 bytes = 1088333340
 sha256 = "f6d2d939942c002ae38f42d571eda3c1e5d13739038f93cd4c08e01b26345643"
 frozen = "2026-10-03"
+
+[[dataset]]
+file = "era-shacl/2025-01-05-rinf-xml-combined.nq.xz"
+workload = "era-shacl"
+tier = "-"
+role = "source"
+source = "https://zenodo.org/records/14605744 (md5 d4cc6012a3193408916de0c96cfc609c)"
+bytes = 407615816
+sha256 = "3b9f4e14892ad8fee51f323b369dda6ba8eab98928bda69ba6c1486f607d956b"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "era-shacl/ERA.ttl"
+workload = "era-shacl"
+tier = "ERA"
+role = "core"
+made_by = "bash benches/breadth/era-shacl/prepare.sh (data under $NRESE_BREADTH/data)"
+bytes = 13621068262
+sha256 = "28a7cfae482fe8358b490bb9a238fa49d79124c4cc079a8460885321f8c29535"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "era-shacl/ES.ttl"
+workload = "era-shacl"
+tier = "ES"
+role = "core"
+made_by = "bash benches/breadth/era-shacl/prepare.sh (data under $NRESE_BREADTH/data)"
+bytes = 257045697
+sha256 = "f88964ed364b9daa7c58e12f1a822ee6a8bb955a9544c25964b8c63d3d5ea990"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "era-shacl/FR.ttl"
+workload = "era-shacl"
+tier = "FR"
+role = "core"
+made_by = "bash benches/breadth/era-shacl/prepare.sh (data under $NRESE_BREADTH/data)"
+bytes = 2875826504
+sha256 = "759ad892cc66ea9194bee1dcf131e54bad3a52a07a799c3e2419f0b5739a5782"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "era-shacl/shapes/core_shapes.ttl"
+workload = "era-shacl"
+tier = "-"
+role = "core"
+made_by = "bash benches/breadth/era-shacl/prepare.sh (data under $NRESE_BREADTH/data)"
+bytes = 193439
+sha256 = "184ffddefff1c4027a15b962874bf6e44d5b6916cac669efac18531e87db6025"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "era-shacl/shapes/era_shapes.ttl"
+workload = "era-shacl"
+tier = "-"
+role = "core"
+made_by = "bash benches/breadth/era-shacl/prepare.sh (data under $NRESE_BREADTH/data)"
+bytes = 267483
+sha256 = "660c203e00c22268ef3db9e304c443f8b371279cb24b8308be0ea71850fd556b"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "era-shacl/shapes/tds_shapes.ttl"
+workload = "era-shacl"
+tier = "-"
+role = "core"
+made_by = "bash benches/breadth/era-shacl/prepare.sh (data under $NRESE_BREADTH/data)"
+bytes = 27809
+sha256 = "68ea89a9ce281931317d959c79fa9d3773bd16a40f5b7859a628631d5b93e7f2"
+frozen = "2026-10-12"
 
 [[dataset]]
 file = "lubm-1-materialised.nt"

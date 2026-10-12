@@ -24,6 +24,10 @@ class Plan:
     tier: str
     kind: str = "cycle"  # cycle, kit, writes
     inputs: list[str] = field(default_factory=list)
+    # A system that reads the data in another form (system key -> its inputs): the same
+    # content, in the syntax that system's best configuration loads (StarBench: RDF-star for
+    # GraphDB and Stardog, RDF 1.2 for the others). Answers stay comparable across forms.
+    inputs_for: dict[str, list[str]] = field(default_factory=dict)
     mounts: list[Mount] = field(default_factory=list)
     queries: Path | None = None
     expected: dict[str, int] | None = None
@@ -40,6 +44,13 @@ class Plan:
     # Known answers per query (its file's stem): {"value": the one value} or {"rows": n}, from
     # an independent source (a fast case's generator or a pinned check); the answer recorder's oracle.
     answers: dict[str, dict] = field(default_factory=dict)
+    services: list[str] = field(default_factory=list)  # geosparql, fulltext: Context.services
+
+    def inputs_of(self, system: str) -> list[str]:
+        return self.inputs_for.get(system, self.inputs)
+
+    def all_inputs(self) -> list[str]:
+        return list(dict.fromkeys([*self.inputs, *(i for form in self.inputs_for.values() for i in form)]))
 
 
 def expected_counts(path: Path) -> dict[str, int] | None:
@@ -121,6 +132,35 @@ def basics(root: Path, tier: str, settings: dict) -> Plan:
                 if tier.startswith("entities-") else
                 ["bash", "benches/competitors/prepare-datasets.sh", tier],
                 note="answer counts cross-checked between systems")
+
+
+def starbench(root: Path, tier: str, settings: dict) -> Plan:
+    """StarBench (QuWeDa 2023): 56 SPARQL-star queries on BKR, 61 M statements as RDF-star.
+    GraphDB and Stardog load the published RDF-star, as the paper ran them; the RDF 1.2
+    systems load it with one reifier per distinct quoted triple, which keeps every answer
+    (benches/breadth/starbench)."""
+    queries = root / "benches/breadth/starbench/queries"
+    star = ["/data/starbench/bkr-star.ttls"]
+    return Plan("starbench", tier, inputs=["/data/starbench/bkr-rdf12.nt"],
+                inputs_for={"graphdb": star, "stardog": star}, queries=queries,
+                expected=expected_counts(queries / "expected.tsv"),
+                prepare=["bash", "benches/breadth/starbench/prepare.sh"],
+                note="answer counts cross-checked between systems; RDF-star (GraphDB, Stardog) and RDF 1.2 forms")
+
+
+def geographica2(root: Path, tier: str, settings: dict) -> Plan:
+    """Geographica 2: GeoSPARQL on the real-world sets in their named graphs (the micro and
+    most macro queries), New York's streets (geocoding), the generated set and a 10 M
+    slice of the scalability set (benches/breadth/geographica2)."""
+    files = {"real": "real.nq", "census": "census.nt", "synthetic": "synthetic.nt",
+             "scalability": "scalability-10m.nt"}
+    plan = Plan("geographica2", tier, inputs=[f"/data/geographica2/{files.get(tier, tier)}"],
+                queries=root / "benches/breadth/geographica2/queries" / tier, services=["geosparql"],
+                prepare=["bash", "benches/breadth/geographica2/prepare.sh"],
+                note="answer counts cross-checked between systems; queries as published (Strabon's dialect included)")
+    if tier not in files:
+        plan.unavailable = f"no tier {tier}: {', '.join(files)}"
+    return plan
 
 
 def w3c_sparql(root: Path, tier: str, settings: dict) -> Plan:
@@ -251,6 +291,8 @@ DEFINITIONS = {
     "owl2bench": (owl2bench, ["rl-1"]),
     "integration-rg-gs-gnd": (integration, ["example"]),
     "basics-mix": (basics, ["olympics"]),
+    "starbench": (starbench, ["bkr"]),
+    "geographica2": (geographica2, ["real"]),
     "w3c-sparql11": (w3c_sparql, ["-"]),
     "w3c-shacl": (w3c_shacl, ["-"]),
     "w3c-owl2-rl": (w3c_owl2_rl, ["-"]),

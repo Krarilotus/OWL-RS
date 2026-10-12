@@ -1,0 +1,22 @@
+PREFIX clc: <http://geo.linkedopendata.gr/corine/ontology#> 
+PREFIX noa: <http://teleios.di.uoa.gr/ontologies/noaOntology.owl#> 
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> 
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+PREFIX lgdo: <http://linkedgeodata.org/ontology/> 
+
+SELECT ?r (geof:difference(?rWKT, ?hWKT) AS ?diff) 
+WHERE { 
+  GRAPH <http://geographica.di.uoa.gr/dataset/hotspots> { 
+    ?h  rdf:type noa:Hotspot ; 
+        <http://teleios.di.uoa.gr/ontologies/noaOntology.owl#hasGeometry> ?hGeo ; 
+        noa:hasAcquisitionTime ?hAcqTime . 
+	  ?hGeo <http://teleios.di.uoa.gr/ontologies/noaOntology.owl#asWKT> ?hWKT. 
+  } 
+  GRAPH <http://geographica.di.uoa.gr/dataset/lgd> { 
+    ?r  rdf:type lgdo:HighwayThing ; 
+        <http://linkedgeodata.org/ontology/hasGeometry> ?rGeo . 
+	  ?rGeo	<http://linkedgeodata.org/ontology/asWKT> ?rWKT. 
+  } 
+  FILTER(geof:sfIntersects(?rWKT, ?hWKT)) .  
+  FILTER(geof:sfIntersects(?rWKT, "POLYGON((20.7858013633644 36.9947301001973,20.6070018260972 40.8452031365591,26.111857027467 40.875795540161,26.0004221014641 37.02141161985,20.7858013633644 36.9947301001973))"^^<http://www.opengis.net/ont/geosparql#wktLiteral>))
+}

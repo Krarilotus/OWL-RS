@@ -195,7 +195,7 @@ def summarise(rows: list[dict], source: str = "", settled: dict[tuple, str] | No
             continue
         run = f"{source}:{r['run']}"
         task, status, ms = r["task"], r["status"], number(r["ms"])
-        if task == "query":
+        if task in ("query", "validate"):
             item = pair.items[r.get("cache") or "-"][r["item"]]
             item.statuses[status] += 1
             if status == "ok" and ms is not None:
