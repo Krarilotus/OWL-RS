@@ -43,9 +43,11 @@ each with its run record.
 - **Memory envelope:** DL compilation scratch, task budgets and the query budget are
   separate; one request has no shared end-to-end envelope.
 - **Query progress:** see the proposal above; a decision is needed.
-- **Vector search:** the filtered search that goes first now widens its beam by the
-  joined pattern's share (12 October; it didn't, so recall under a one-in-ten filter was
-  0.40–0.60): `vector-knn-filtered` to re-measure against its 0.9 gate.
+- **Vector search:** the filtered search that goes first widens its beam by the joined
+  pattern's share (12 October): `vector-knn-filtered`'s recall 0.56 → 0.98, its gate passes
+  ([record](../benches/runs/2026-10-12-vector-filtered-fix-phuoc.toml)). On its uniform 64-d
+  vectors the graph search now costs what the exact scan does (10.5 against 10.4 ms): open,
+  the scan chosen by cost, and the graph's own recall at the default beam (0.44).
 - **Competitor answers:** rerun with the committed recorder to decide the unordered
   `LIMIT` case; Konclude intermittently drops 107 asserted pairs from the Horn reference
   taxonomy, cause unknown.

@@ -531,7 +531,7 @@ tiers = ["generated-200k", "yfcc-10m"]
 state = "partial"
 kit = "benches/fast"
 check = "recall@10 against the exact search"
-note = "The fast cases vector-knn-exact and vector-knn-filtered; why the filtered recall failed: runs/2026-10-12-vector-recall-phuoc.toml, and the probe-first route's beam not widened for the filter (fixed 12 Oct, docs/design/performance.md lab log)"
+note = "The fast cases vector-knn-exact and vector-knn-filtered; why the filtered recall failed: runs/2026-10-12-vector-recall-phuoc.toml, and the probe-first route's beam not widened for the filter (fixed 12 Oct: recall 0.98, runs/2026-10-12-vector-filtered-fix-phuoc.toml)"
 
 [ann-benchmarks]
 title = "ann-benchmarks: recall and throughput curves of approximate k-NN"
