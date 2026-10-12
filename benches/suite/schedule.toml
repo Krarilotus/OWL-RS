@@ -66,8 +66,6 @@ last = [
 
 # Benchmarks of benches/CATALOG.md without a workload entry yet: the section that describes each.
 [catalogue]
-wdbench = "3.2: WDBench, Wikidata's query log (MillenniumDB's home turf)"
-sp2bench = "3.2: SP2Bench, DBLP-shaped data and 17 queries"
 npd = "3.6: NPD, OBDA over the Norwegian Petroleum Directorate (Ontop's home turf)"
 lubm-exists = "3.6: LUBM∃, LUBM with existential rules (Ontop, Stardog, PAGOdA)"
 starbench = "3.10: StarBench, RDF-star queries"

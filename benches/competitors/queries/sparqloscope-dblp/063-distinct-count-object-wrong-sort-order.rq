@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 63: distinct-count-object-wrong-sort-order
+# COUNT DISTINCT, for object but not sorted by object
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (COUNT(DISTINCT ?o1) AS ?count) { ?s dblp:bibtexType ?o1 . ?s dblp:hasSignature ?o2 . }

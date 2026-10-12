@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 51: group-by-complex-aggregate
+# GROUP BY with COUNT and MIN and MAX and SAMPLE
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT ?o1 (COUNT(?s) AS ?count) (MIN(?s) AS ?min) (MAX(?s) AS ?max) (SAMPLE(?s) AS ?sample) { ?s dblp:bibtexType ?o1 . ?s dblp:hasSignature ?o2 . } GROUP BY ?o1 ORDER BY DESC(?count) LIMIT 10

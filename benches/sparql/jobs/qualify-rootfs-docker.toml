@@ -1,0 +1,21 @@
+# The rootfs runtime qualified against Docker (owner, 12 Oct 2026): WatDiv 10 M on every
+# contender and NRESE under Docker on office-pc, answers captured; the same under rootfs on
+# phuoc-yu (qualify-rootfs-phuoc.toml). Each system's answers must be equal query by query
+# across the two runtimes. Answers only: its times are not used, so it may run outside the
+# night window.
+id = "sparql-qualify-rootfs-docker"
+group = "sparql"
+host = "office-pc"
+checkout = "suite/sparql"
+commands = [
+  ["python3", "benches/suite/suite.py", "run", "--systems", "qlever,oxigraph,virtuoso,jena,nrese",
+   "--workloads", "watdiv", "--tier", "watdiv=watdiv-10m", "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build",
+   "--runs", "1", "--query-runs", "1", "--cache", "off", "--timeout-s", "3600", "--query-timeout-s", "300",
+   "--answers", "full", "--answers-reference", "jena,oxigraph",
+   "--results", "/home/krarilotus/owlrs/results/sparql-qualify-rootfs-docker"],
+]
+env = { NRESE_TARGET_VOLUME = "/home/krarilotus/owlrs/sparql-bin/1b611e7", HARNESS = "/home/krarilotus/owlrs/sparql-bin/1b611e7/nrese-bench-harness", NRESE_BENCH_SCRATCH = "/home/krarilotus/owlrs/sparql-scratch", DOCKER_MEMORY = "12g", JAVA_HEAP = "8g" }
+needs = ["docker"]
+window = "any"
+priority = 2
+est_min = 60

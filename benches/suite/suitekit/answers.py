@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from collections import Counter
@@ -203,6 +204,36 @@ class Capture:
     unlimited: bool = False  # the query without its final LIMIT (a reference's pool)
 
 
+def capped_post(url: str, data: dict, timeout: float = 30) -> tuple[int, str]:
+    """A query's answer as the recorder may hold it: streamed and read at most up to
+    NRESE_ANSWER_CAP_MB (default 256 MiB) of JSON, else (-1, why) and the connection closed.
+    An answer past the cap isn't compared here; holding it would let one unlimited answer
+    (a LIMIT query's reference without its LIMIT: on DBLP every typed statement) exhaust the
+    host's memory, as it did on 12 Oct 2026 (the queue service of phuoc-yu killed at 25.6 GB)."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    cap = int(float(os.environ.get("NRESE_ANSWER_CAP_MB", "256")) * 1048576)
+    request = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode(),
+                                     headers={"Accept": "application/sparql-results+json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            chunks, size = [], 0
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > cap:
+                    return -1, f"an answer past the recorder's cap of {cap // 1048576} MiB (NRESE_ANSWER_CAP_MB): not compared"
+                chunks.append(chunk)
+            return response.status, b"".join(chunks).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read(65536).decode("utf-8", "replace")
+    except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
+        return 0, ""
+
+
 def same_value(term: dict, known) -> bool:
     """A term against a known value: numerically when both are numbers, else as written."""
     text = term.get("value", "")
@@ -296,6 +327,8 @@ class Recorder:
         started = time.monotonic()
         try:
             code, body = post(url, {"query": text}, timeout=timeout)
+            if code == -1:
+                raise ValueError(body)
             path.write_text(body, encoding="utf-8")
             capture.sha256 = hashlib.sha256(body.encode()).hexdigest()
             if code == 0:
