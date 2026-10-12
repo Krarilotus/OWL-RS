@@ -409,7 +409,7 @@ class Suite:
                 self.emit(base, task="count", status="failed" if error else "ok",
                           ms="" if system.answers_only else ms, rows=n if n is not None else "",
                           note=error or ("the rules run at this first query" if system.lazy(regime) else ""))
-            if plan.queries:
+            if plan.queries or plan.external:
                 for i, mode in enumerate(modes):
                     if i > 0:
                         # A restart in the next mode: the cache starts empty, so each
@@ -423,7 +423,10 @@ class Suite:
                                       note="server peak over the run")
                         ctx.cache = mode
                         endpoint = system.serve(ctx, store, regime)
-                    self.queries(ctx, plan, key, system, endpoint, {**base, "cache": mode}, run)
+                    if plan.external:
+                        self.external(ctx, plan, key, endpoint, {**base, "cache": mode}, run)
+                    else:
+                        self.queries(ctx, plan, key, system, endpoint, {**base, "cache": mode}, run)
                 base["cache"] = modes[-1]
         except Exception as e:  # a system that fails mustn't stop the suite
             self.emit(base, task="load" if endpoint is None else "serve", status="failed", note=str(e)[:300])
@@ -434,6 +437,25 @@ class Suite:
             if store is not None:
                 self.runtime.remove_store(store)
             shutil.rmtree(work, ignore_errors=True)
+
+    def external(self, ctx: Context, plan, key: str, endpoint: Endpoint, base: dict, run: int):
+        """A benchmark's own driver (Plan.external) against the endpoint; its rows as ours."""
+        suffix = "" if base["cache"] == "-" else f"-cache-{base['cache']}"
+        out = ctx.logs / f"external{suffix}.json"
+        values = {"endpoint": endpoint.query, "update": endpoint.update or "", "out": str(out),
+                  "system": key, "run": str(run)}
+        command = [part.format(**values) for part in plan.external]
+        rc = self.host_command(command, ctx.logs / f"external{suffix}.txt")
+        if self.args.dry_run:
+            return
+        try:
+            rows = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            self.emit(base, task="query", item="*", status="failed", note=f"driver exit {rc}, no rows: {e}")
+            return
+        allowed = {"task", "item", "repeat", "status", "ms", "rows", "note", "peak_mib"}
+        for row in rows:
+            self.emit(base, **{k: v for k, v in row.items() if k in allowed})
 
     def queries(self, ctx: Context, plan, key: str, system, endpoint: Endpoint, base: dict, run: int):
         suffix = "" if base["cache"] == "-" else f"-cache-{base['cache']}"

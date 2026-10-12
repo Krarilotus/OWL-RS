@@ -105,6 +105,14 @@ capabilities = [
   "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
 ]
 
+# Built by benches/sparql/images.sh from the commit of the Sparqloscope paper's results
+# (benches/competitors/millenniumdb/Dockerfile): no published image exists.
+[millenniumdb]
+name = "MillenniumDB"
+publish = "free"
+runs = ["docker"]
+capabilities = ["load", "query"]
+
 [rdf4j]
 name = "Eclipse RDF4J (native store)"
 publish = "free"
