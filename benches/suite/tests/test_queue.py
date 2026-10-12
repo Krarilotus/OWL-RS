@@ -100,7 +100,7 @@ class Running(unittest.TestCase):
         subprocess.run([*git, "-C", str(source), "commit", "-q", "-m", "c"], check=True)
         subprocess.run(["git", "clone", "-q", "--bare", str(source), str(self.repo)], check=True)
         subprocess.run(["git", "-C", str(self.repo), "branch", "queue/j", "HEAD"], check=True)
-        self.q = queue.Queue(root / "queue", self.repo, root / "results", root / "queue" / "wt")
+        self.q = queue.Queue(root / "queue", self.repo, root / "results", root / "queue" / "wt", watch=False)
         self.retreat = root / "RETREAT"
 
     def tearDown(self):
