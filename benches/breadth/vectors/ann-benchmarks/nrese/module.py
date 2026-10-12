@@ -21,6 +21,7 @@ from ..base.module import BaseANN
 PORT = 18080
 PREFIX = "PREFIX nrv: <urn:nrese:vector:>\n"
 CHUNK = 50_000
+ANSI = re.compile(r"\x1b\[[0-9;]*m")  # the server's log is coloured
 
 
 def literal(vector) -> str:
@@ -66,7 +67,8 @@ class Nrese(BaseANN):
         self._search(X[0], 1)
         deadline = time.time() + 6 * 3600
         while n > 20_000 and time.time() < deadline:
-            built = re.findall(r"vector graph built.*?vectors=(\d+)", open(self._log.name, errors="replace").read())
+            log = ANSI.sub("", open(self._log.name, errors="replace").read())
+            built = re.findall(r"vector graph built.*?vectors=(\d+)", log)
             if built and int(built[-1]) >= n:
                 break
             time.sleep(1)
