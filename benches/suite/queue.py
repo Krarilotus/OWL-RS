@@ -271,7 +271,7 @@ def status(args) -> int:
         if not host.get("queue") or (args.host and key != args.host):
             continue
         listing = ssh(host, "for s in " + " ".join(STATES) + f"; do for f in {host['queue']['dir']}/$s/*.toml; do "
-                      "[ -e \"$f\" ] && echo \"== $s $f\" && cat \"$f\"; done; done", timeout=60)
+                      "[ -e \"$f\" ] && echo \"== $s $f\" && cat \"$f\"; done; done; true", timeout=60)
         print(f"# {key}")
         if listing.returncode != 0:
             print(f"  unreachable: {listing.stderr.strip()[:200]}")

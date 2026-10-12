@@ -49,7 +49,8 @@ SUITE_SYSTEMS = {"qlever", "oxigraph", "virtuoso", "jena", "rdf4j", "nemo", "owl
                  "graphdb", "rdfox", "anzograph", "stardog"}
 DL_SYSTEMS = {"hermit", "openllet", "konclude", "elk"}
 LICENSED = {"graphdb", "rdfox", "stardog", "anzograph"}
-RESULTS = fast.HERE / "results"
+# A queue job's results directory when it runs as one (benches/suite/queue.py), else here.
+RESULTS = Path(os.environ["QUEUE_RESULTS"]) if os.environ.get("QUEUE_RESULTS") else fast.HERE / "results"
 # The systems whose answers the others are compared with, in order (answers.py): Jena's ARQ
 # (the oracle kit's), then the next that answered; never NRESE.
 ANSWER_REFERENCES = "jena,oxigraph,virtuoso,qlever"
@@ -578,8 +579,10 @@ def compete(args) -> int:
         from suitekit import answers
         print()
         answers.main([*map(str, runs), "--write", str(RESULTS / stamp / "answers.json")])
-    print(f"\nresults: {(RESULTS / stamp / 'compete.json').relative_to(fast.ROOT)}")
-    print(f"record: python benches/suite/suite.py ledger {(RESULTS / stamp).relative_to(fast.ROOT).as_posix()}"
+    batch = RESULTS / stamp
+    shown = batch.relative_to(fast.ROOT).as_posix() if batch.is_relative_to(fast.ROOT) else batch.as_posix()
+    print(f"\nresults: {shown}/compete.json")
+    print(f"record: python benches/suite/suite.py ledger {shown}"
           " (then standings --write)")
     return 0
 
