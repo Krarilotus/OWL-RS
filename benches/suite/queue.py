@@ -53,6 +53,9 @@ from suitekit import hosts, schedule  # noqa: E402
 STATES = ("pending", "running", "done", "failed")
 MAX_ATTEMPTS = 3
 POLL_S = 60
+# A timed job holds its host's timings for one chunk of about this many minutes, then yields
+# (hosts.toml queue.chunk_min overrides; a chunk past 1.5 times it is stopped).
+CHUNK_MIN = 30
 # On Windows, a job's processes and git open no console window (the runner is a scheduled
 # task in the owner's session).
 QUIET_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -109,6 +112,17 @@ def job_problems(job: dict, registry: dict | None = None) -> list[str]:
         out.append("window is quiet or any")
     if not all(isinstance(c, list) and c and all(isinstance(a, str) for a in c) for c in job["commands"]):
         out.append("commands is a list of argument lists")
+    # Fair share of a host's timings: chunks of about chunk_min minutes, and no day-long
+    # series where a host takes none (hosts.toml queue).
+    settings = entry.get("queue", {})
+    est = job.get("est_min")
+    if timed and est and settings.get("max_job_min") and est > settings["max_job_min"]:
+        out.append(f"{job['host']} takes timed jobs of at most {settings['max_job_min']} min (est_min {est}): "
+                   "a day-long series goes to khaleesi or office-pc at night")
+    chunk = settings.get("chunk_min", CHUNK_MIN)
+    if timed and est and chunk and est / max(len(job["commands"]), 1) > 1.5 * chunk:
+        out.append(f"{len(job['commands'])} chunks for {est} min: split it into chunks of about {chunk} min "
+                   "(each entry of commands is a chunk; a long series resumes chunk by chunk)")
     for command in job["commands"]:
         text = " ".join(command)
         if "suite.py run" in text and "--dry-run" not in text and "--answers" not in command:
@@ -179,14 +193,21 @@ class Queue:
         return sorted(found, key=lambda pj: (schedule.rank(workload_of(pj[1])), pj[1].get("priority", 5),
                                              pj[1].get("submitted", ""), pj[0].name))
 
-    def next(self, queue: dict, now: datetime.datetime, busy=compilers) -> tuple[Path, dict] | tuple[None, str]:
-        why = []
+    def next(self, queue: dict, now: datetime.datetime, busy=compilers,
+             last_group: str | None = None) -> tuple[Path, dict] | tuple[None, str]:
+        """The job whose chunk runs next: the first in the schedule's order that may start, a
+        job of another group than the last chunk's first (fair turns between the groups)."""
+        why, ready = [], []
         for path, job in self.jobs("pending"):
             reason = open_for(job, queue, now, busy)
             if reason is None:
-                return path, job
-            why.append(f"{job['id']}: {reason}")
-        return None, "; ".join(why)
+                ready.append((path, job))
+            else:
+                why.append(f"{job['id']}: {reason}")
+        if not ready:
+            return None, "; ".join(why)
+        others = [pj for pj in ready if pj[1].get("group") != last_group]
+        return (others or ready)[0]
 
     def expire(self, today: datetime.date, days: int = 0):
         """Results kept `days` days after their job ended (0: the same day only), then
@@ -209,17 +230,24 @@ class Queue:
             path.unlink()
         return target
 
-    def run(self, path: Path, job: dict, retreat: Path | None) -> str:
-        """Runs one job; the state it ends in."""
-        job["attempts"] = job.get("attempts", 0) + 1
-        job["started"] = datetime.datetime.now().isoformat(timespec="seconds")
+    def run(self, path: Path, job: dict, retreat: Path | None, chunk_min: float = 0) -> str:
+        """Runs a job's next chunk (one entry of its commands) and returns the state the job is
+        in after it: pending (more chunks to come, or stopped for the host's owners), done or
+        failed. A chunk past 1.5 x `chunk_min` minutes is stopped, its partial results kept,
+        and the job fails: it has to be split (fair share of a host's timings)."""
+        index = job.get("next", 0)
+        commands = job["commands"]
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        job["turns"] = job.get("turns", 0) + 1
+        job.setdefault("started", now)
+        job["chunk_started"] = now
         path = self.move(path, job, "running")
         results = self.results / job["id"]
         results.mkdir(parents=True, exist_ok=True)
         tree = self.worktrees / job["id"]
-        log = results / f"queue-{job['attempts']}.log"
-        code = 0
+        log = results / f"queue-{job['turns']}.log"
         pidfile = self.directory / "running" / f"{job['id']}.pid"
+        over = False
         with open(log, "w", encoding="utf-8") as out:
             subprocess.run(["git", "-C", str(self.repo), "worktree", "remove", "--force", str(tree)],
                            capture_output=True, creationflags=QUIET_WINDOW)
@@ -227,30 +255,34 @@ class Queue:
                                    f"queue/{job['id']}"], stdout=out, stderr=subprocess.STDOUT,
                                   creationflags=QUIET_WINDOW)
             env = {**os.environ, **{k: str(v) for k, v in job.get("env", {}).items()},
-                   "QUEUE_JOB": job["id"], "QUEUE_RESULTS": str(results)}
+                   "QUEUE_JOB": job["id"], "QUEUE_RESULTS": str(results), "QUEUE_CHUNK": str(index + 1)}
             # The host's tools first (hosts.toml queue.path: its Python, cargo).
             env["PATH"] = os.pathsep.join([*(str(expand(p)) for p in self.path), env.get("PATH", "")])
             code = made.returncode
             timed = job.get("window", "quiet") == "quiet" and self.watch
-            for command in job["commands"] if code == 0 else []:
-                out.write(f"=== {datetime.datetime.now().isoformat(timespec='seconds')} {' '.join(command)}\n")
+            if code == 0:
+                command = commands[index]
+                out.write(f"=== {now} chunk {index + 1} of {len(commands)}: {' '.join(command)}\n")
                 out.flush()
+                # Its own process group (session): a host's guard stops the whole chunk by the
+                # pid file (scripts/hosts/), and so does the chunk limit.
                 process = subprocess.Popen(command, cwd=tree, env=env, stdout=out, stderr=subprocess.STDOUT,
-                                           creationflags=QUIET_WINDOW)
-                # A host's guard stops the job by it (scripts/hosts/khaleesi-guard.py).
+                                           creationflags=QUIET_WINDOW, start_new_session=os.name != "nt")
                 pidfile.write_text(str(process.pid), encoding="utf-8")
                 # A timed job keeps its host quiet while it runs, whatever its commands do
                 # themselves (scripts/lib/quiet-watch.py): its verdict goes into the job.
                 watcher = quiet_watch(results / "quiet", process.pid, job["id"]) if timed else None
-                code = process.wait()
+                try:
+                    code = process.wait(timeout=chunk_min * 90 if chunk_min else None)
+                except subprocess.TimeoutExpired:
+                    stop(process)
+                    code, over = process.wait(), True
                 if watcher is not None:
                     watcher.terminate()
                     watcher.wait(timeout=120)
-                    log = results / "quiet" / "watch.log"
-                    verdict = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
-                    job["quiet"] = verdict[-1] if verdict else "no verdict"
-                if code != 0:
-                    break
+                    verdicts = results / "quiet" / "watch.log"
+                    lines = verdicts.read_text(encoding="utf-8").splitlines() if verdicts.exists() else []
+                    job["quiet"] = lines[-1] if lines else "no verdict"
             pidfile.unlink(missing_ok=True)
             if code == 0:
                 head = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"], capture_output=True, text=True,
@@ -258,24 +290,53 @@ class Queue:
                 job["commit"] = head.stdout.strip()
         subprocess.run(["git", "-C", str(self.repo), "worktree", "remove", "--force", str(tree)], capture_output=True,
                        creationflags=QUIET_WINDOW)
-        job["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
         job["exit"] = code
         job["results"] = str(results)
-        if code != 0 and retreat is not None and retreat.exists():
-            # Stopped because the host's owners came back: not the job's failure, so not an
-            # attempt; its partial results stay, and it runs again.
-            job["attempts"] -= 1
+        if over:
+            job["note"] = (f"chunk {index + 1} ran past {chunk_min * 1.5:g} min and was stopped, its partial results "
+                           f"kept: split it into chunks of about {chunk_min:g} min")
+            state = "failed"
+        elif code != 0 and retreat is not None and retreat.exists():
+            # Stopped because the host's owners came back: not the job's failure; the chunk
+            # runs again, the partial results stay.
             job["stops"] = job.get("stops", 0) + 1
-            job["note"] = "stopped when the host's owners came back; queued again, its partial results kept"
+            job["note"] = f"chunk {index + 1} stopped when the host's owners came back; queued again, partial results kept"
+            state = "pending"
+        elif code != 0:
+            job["note"] = f"chunk {index + 1} of {len(commands)} failed (exit {code})"
+            state = "failed"
+        elif index + 1 < len(commands):
+            # The next chunk waits its turn: other jobs, another group's first, may go between.
+            job["next"] = index + 1
+            job["note"] = f"chunk {index + 1} of {len(commands)} done"
             state = "pending"
         else:
-            state = "done" if code == 0 else "failed"
+            job["note"] = f"all {len(commands)} chunks done"
+            state = "done"
         if state != "pending":
+            job["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
             # The job's checkout ref goes with it: the host's repository keeps nothing stale.
             subprocess.run(["git", "-C", str(self.repo), "branch", "-D", f"queue/{job['id']}"], capture_output=True,
                            creationflags=QUIET_WINDOW)
         self.move(path, job, state)
         return state
+
+
+def stop(process: subprocess.Popen, grace_s: float = 30):
+    """Stops a chunk and all it runs: SIGTERM to its process group, SIGKILL after `grace_s`
+    (Windows: taskkill /T /F)."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True,
+                       creationflags=QUIET_WINDOW)
+        return
+    import signal
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=grace_s)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def quiet_watch(state: Path, pid: int, token: str) -> subprocess.Popen | None:
@@ -319,7 +380,7 @@ def work(args) -> int:
         job["note"] = "its runner stopped while it ran; queued again"
         q.move(path, job, "pending")
         print(f"{datetime.datetime.now():%F %T} {job['id']}: queued again (left running)", flush=True)
-    said = ""
+    said, last_group = "", None
     reload = q.directory / "RELOAD"
     while True:
         # A new runner's code takes over between jobs: RELOAD in the queue directory.
@@ -329,7 +390,7 @@ def work(args) -> int:
             os.execv(sys.executable, [sys.executable, *sys.argv])
         if keep_days(queue) is not None:
             q.expire(datetime.date.today(), keep_days(queue))
-        path, job = q.next(queue, datetime.datetime.now())
+        path, job = q.next(queue, datetime.datetime.now(), last_group=last_group)
         if path is None:
             if job and job != said:
                 print(f"{datetime.datetime.now():%F %T} waiting: {job}", flush=True)
@@ -339,8 +400,10 @@ def work(args) -> int:
             time.sleep(POLL_S)
             continue
         said = ""
-        print(f"{datetime.datetime.now():%F %T} start {job['id']} (attempt {job.get('attempts', 0) + 1})", flush=True)
-        state = q.run(path, job, retreat)
+        print(f"{datetime.datetime.now():%F %T} start {job['id']} chunk {job.get('next', 0) + 1} of "
+              f"{len(job['commands'])}", flush=True)
+        state = q.run(path, job, retreat, queue.get("chunk_min", CHUNK_MIN) if job.get("window", "quiet") == "quiet" else 0)
+        last_group = job.get("group")
         print(f"{datetime.datetime.now():%F %T} {job['id']}: {state}", flush=True)
         if args.once:
             return 0

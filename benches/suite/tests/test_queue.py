@@ -10,6 +10,7 @@ import importlib.util
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -143,10 +144,51 @@ class Running(unittest.TestCase):
         self.retreat.touch()
         self.assertEqual(self.q.run(path, found, self.retreat), "pending")
         again = queue.read_job(self.q.directory / "pending" / "j.toml")
-        self.assertEqual((again["attempts"], again["stops"]), (0, 1))
+        self.assertEqual((again.get("next", 0), again["stops"]), (0, 1))
         self.assertIn("partial results kept", again["note"])
         self.retreat.unlink()
         self.assertEqual(self.q.run(self.q.directory / "pending" / "j.toml", again, self.retreat), "failed")
+
+    def test_a_job_runs_chunk_by_chunk_each_its_own_turn(self):
+        path, found = self.submit([[sys.executable, "-c", "print(1)"], [sys.executable, "-c", "print(2)"]])
+        self.assertEqual(self.q.run(path, found, self.retreat), "pending")
+        again = queue.read_job(self.q.directory / "pending" / "j.toml")
+        self.assertEqual(again["next"], 1)
+        self.assertEqual(self.q.run(self.q.directory / "pending" / "j.toml", again, self.retreat), "done")
+        done = queue.read_job(self.q.directory / "done" / "j.toml")
+        self.assertEqual(done["turns"], 2)
+        self.assertIn("2", (Path(done["results"]) / "queue-2.log").read_text())
+
+    def test_a_chunk_past_its_limit_is_stopped_and_the_job_must_be_split(self):
+        path, found = self.submit([[sys.executable, "-c", "import time; time.sleep(30)"]])
+        started = time.monotonic()
+        self.assertEqual(self.q.run(path, found, self.retreat, chunk_min=0.02), "failed")
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertIn("split it", queue.read_job(self.q.directory / "failed" / "j.toml")["note"])
+
+
+class Fairness(unittest.TestCase):
+    def test_the_next_turn_goes_to_another_group_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            q = queue.Queue(Path(tmp) / "q", Path(tmp), Path(tmp), Path(tmp))
+            for name, group in (("dl-ore", "dl"), ("dl-pagoda", "dl"), ("sparql-bsbm", "sparql")):
+                (q.directory / "pending" / f"{name}.toml").write_text(
+                    queue.toml({"id": name, "group": group, "workload": "ore-2015", "commands": [["true"]]}),
+                    encoding="utf-8")
+            settings = {"windows": ["00:00-24:00"]}
+            self.assertEqual(q.next(settings, AT, lambda: False)[1]["id"], "dl-ore")
+            self.assertEqual(q.next(settings, AT, lambda: False, last_group="dl")[1]["id"], "sparql-bsbm")
+            self.assertEqual(q.next(settings, AT, lambda: False, last_group="sparql")[1]["id"], "dl-ore")
+
+    def test_long_jobs_are_split_and_day_long_ones_go_elsewhere(self):
+        registry = {"host": {"phuoc-yu": {"roles": ["measure"], "has": [], "queue": {
+            "dir": "~/q", "chunk_min": 30, "max_job_min": 240}}}}
+        one = job(host="phuoc-yu", needs=[], est_min=120)
+        self.assertTrue(any("split it" in p for p in queue.job_problems(one, registry)))
+        four = {**one, "commands": one["commands"] * 4}
+        self.assertEqual(queue.job_problems(four, registry), [])
+        day = {**one, "est_min": 600, "commands": one["commands"] * 20}
+        self.assertTrue(any("day-long" in p for p in queue.job_problems(day, registry)))
 
 
 class Order(unittest.TestCase):

@@ -18,6 +18,10 @@
 # while the `retreat` file exists (the owners are present) and never while a compiler runs.
 # `timing = false`: the host takes no timed job at all (window "quiet"); `keep = "same-day"`:
 # a job's results are fetched the day it ends (queue.py fetch) and removed there.
+# Fair share: a timed job runs one chunk (an entry of its commands) of about `chunk_min`
+# minutes (default 30) per turn, then the next turn goes to another group first; a chunk past
+# 1.5 times it is stopped. `max_job_min`: no timed job longer than that here (day-long series
+# go to khaleesi or office-pc at night).
 
 [assets]
 # Immutable preservation copies, SHA-256-verified on office-pc and phuoc-yu (receipts in
@@ -67,7 +71,7 @@ roles = ["measure"]
 has = []
 assets = true
 binaries = "office-pc builds; record the source revision and binary SHA-256 and check CPU features and glibc symbols before use"
-queue = { dir = "~/owlrs/queue", windows = ["00:00-24:00"], path = ["~/.cargo/bin"] }
+queue = { dir = "~/owlrs/queue", windows = ["00:00-24:00"], path = ["~/.cargo/bin"], chunk_min = 30, max_job_min = 240 }
 
 [[host.phuoc-yu.config]]
 since = "2026-10-12T13:00"
