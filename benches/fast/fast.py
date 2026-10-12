@@ -46,6 +46,8 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import hosts, manifest  # noqa: E402
+from suitekit.compare import (KEPT_POINTS, bootstrap_ratio, client_throughput, compare_reports,  # noqa: E402,F401
+                              counter_changes, load_report, pooled, series_ratios, spread, statistic, thin)
 from suitekit.workloads import fast_data_name  # noqa: E402
 
 # The volumes (benches/hosts.toml [volumes]; NRESE_FAST_VOLUME and NRESE_BENCH_VOLUME name others).
@@ -599,23 +601,6 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
 DL_PHASES = ("parse", "read", "normalise", "compile", "saturate", "blocking", "expand", "search", "datatypes")
 
 
-def client_throughput(result: dict) -> list[dict]:
-    """One client level and a sweep share the same throughput contract.
-
-    These peaks include the in-process harness's latency samples; they are not
-    isolated engine memory. Unknown memory must not become a synthetic QPS/GB win.
-    """
-    levels = result.get("client_sweep") or ([result["clients"]] if result.get("clients") else [])
-    out = []
-    for level in levels:
-        peak = (level.get("memory") or {}).get("peak_mib")
-        qps = level.get("qps")
-        out.append({"clients": level.get("clients"), "qps": qps, "p99_ms": level.get("p99_ms"),
-                    "peak_mib": peak,
-                    "qps_per_gb": round(qps / peak * 1024, 1)
-                    if isinstance(qps, (int, float)) and isinstance(peak, (int, float)) and peak > 0 else None})
-    return out
-
 # Deterministic work counters, recorded for every case and compared exactly: a change in
 # them is a change in the work done, whatever the machine's noise.
 COUNTERS = ("reason.new_facts", "reason.inferred", "reason.rounds",
@@ -890,10 +875,6 @@ def run(args) -> int:
 
 # --- what is kept ----------------------------------------------------------------------------
 
-# Order statistics per series in a compact record (every 2.5th percentile): compare's
-# verdicts on the two runs of 6 Oct 2026 were the full reports' with 41; with 21, two of 80
-# borderline cases flipped.
-KEPT_POINTS = 41
 
 
 def write_compact(full: Path, target: Path) -> Path:
@@ -928,267 +909,12 @@ def compact_record(r: dict) -> dict:
     return out
 
 
-def load_report(path: Path) -> dict:
-    """A run's report: the full one when a compact record names it and it is here with its
-    hash, else the compact record (its KEPT_POINTS points per series)."""
-    report = json.loads(path.read_text(encoding="utf-8"))
-    full = report.get("full_report")
-    if full:
-        candidate = Path(full["path"].replace("~", str(Path.home()), 1))
-        if candidate.exists() and hashlib.sha256(candidate.read_bytes()).hexdigest() == full["sha256"]:
-            return json.loads(candidate.read_text(encoding="utf-8"))
-        print(f"note: {path.name}: the full report isn't here ({full['path']} on {full['host']}); "
-              f"comparing its {KEPT_POINTS} points per series")
-    return report
-
-
-# --- compare ---------------------------------------------------------------------------------
-
-def pooled(report: dict) -> dict[str, dict]:
-    """Per case: its samples per repetition, statuses, peak memory, the metric per repetition."""
-    out: dict[str, dict] = {}
-    for r in report["records"]:
-        entry = out.setdefault(r["case"], {"reps": [], "status": [], "peaks": [], "metrics": [],
-                                           "counters": {}, "phase_peaks": {}, "qps": [], "client_case": False,
-                                           "expected": [], "invalid": False, "expected_reps": report.get("reps", 0),
-                                           "checks": {}, "frontiers": []})
-        entry["expected"].append(r.get("expected_outcome", "ok"))
-        entry["invalid"] |= any(not c.get("ok") for c in r.get("checks", []) + r.get("routes", []))
-        # Older full reports retain single-level clients only in their raw result.
-        # An explicitly empty throughput list remains missing evidence, not a fallback.
-        raw = r.get("result") or {}
-        levels = r["throughput"] if "throughput" in r else client_throughput(raw)
-        # Old compact client reports lost the raw QPS. Their case/series still
-        # identifies the missing evidence; a latency-only pass would be misleading.
-        entry["client_case"] |= ("throughput" in r or "clients" in raw or "client_sweep" in raw
-                                 or r["case"] in ("clients-lookups", "clients-sweep")
-                                 or any(s.endswith(" clients p99") for s in r.get("samples", {})))
-        widths = {}
-        for level in levels or []:
-            width = str(level.get("clients"))
-            # A duplicate in this repetition must not replace a missing observation
-            # in another repetition. Keep invalid observations explicitly missing.
-            widths[width] = None if width in widths else level.get("qps")
-        raw_levels = raw.get("client_sweep") or ([raw["clients"]] if raw.get("clients") else [])
-        for level in raw_levels:
-            widths.setdefault(str(level.get("clients")), None)
-        for series in r.get("samples", {}):
-            if match := re.fullmatch(r"(\d+) clients p99", series):
-                widths.setdefault(match[1], None)
-        entry["qps"].append(widths)
-        for path, value in (r.get("counters") or {}).items():
-            entry["counters"].setdefault(path, []).append(value)
-        for phase, peak in (r.get("phase_peaks") or {}).items():
-            if peak:
-                entry["phase_peaks"].setdefault(phase, []).append(peak)
-        entry["status"].append(r["status"])
-        for c in r.get("checks", []):
-            entry["checks"].setdefault(c.get("path", "?"), []).append(c.get("got"))
-        if r.get("frontier"):
-            entry["frontiers"].append(r["frontier"])
-        if r.get("peak_mib"):
-            entry["peaks"].append(r["peak_mib"])
-        if isinstance(r.get("metric"), (int, float)):
-            entry["metrics"].append(r["metric"])
-        samples = {k: thin(sorted(v for v in vs if v is not None)) for k, vs in (r.get("samples") or {}).items()}
-        if any(samples.values()):
-            entry["reps"].append(samples)
-    return out
-
-
-def thin(values: list[float], at_most: int = 200) -> list[float]:
-    """At most `at_most` evenly spaced order statistics of sorted `values`: the same
-    distribution, small enough to resample quickly."""
-    if len(values) <= at_most:
-        return values
-    step = (len(values) - 1) / (at_most - 1)
-    return [values[round(i * step)] for i in range(at_most)]
-
-
-def statistic(reps: list[dict[str, list[float]]], series: list[str]) -> float:
-    """The sum over series of the median of their samples, pooled over `reps`."""
-    total = 0.0
-    for s in series:
-        values = [v for rep in reps for v in rep.get(s, [])]
-        if values:
-            total += statistics.median(values)
-    return total
-
-
-def spread(entry: dict) -> float:
-    """The range of the per-repetition metrics relative to their median (PROTOCOL.md §5)."""
-    m = [v for v in entry["metrics"] if v]
-    if len(m) < 2:
-        return 0.0
-    return (max(m) - min(m)) / statistics.median(m)
-
-
-def bootstrap_ratio(base: list[dict], new: list[dict], rounds: int = 1000, seed: int = 1) -> tuple[float, float, float]:
-    """The ratio new/base of the summed medians and its 95 % interval, by a two-level
-    bootstrap: repetitions drawn with replacement, then samples within each, so that the
-    spread between runs widens the interval as much as the spread within them."""
-    rng = random.Random(seed)
-    series = sorted({s for rep in base for s in rep} & {s for rep in new for s in rep})
-    if not series or not base or not new:
-        return float("nan"), float("nan"), float("nan")
-
-    def draw(reps):
-        chosen = [rng.choice(reps) for _ in reps]
-        return statistic([{s: rng.choices(rep[s], k=len(rep[s])) for s in series if rep.get(s)}
-                          for rep in chosen], series)
-
-    point = statistic(new, series) / max(statistic(base, series), 1e-9)
-    ratios = sorted(draw(new) / max(draw(base), 1e-9) for _ in range(rounds))
-    return point, ratios[int(0.025 * rounds)], ratios[int(0.975 * rounds) - 1]
-
-
-def counter_changes(base: dict, new: dict) -> tuple[bool, list[str]]:
-    """Whether a work counter grew beyond 2 %, and a note per changed counter. A counter
-    whose repetitions differ within one run is not deterministic and isn't judged."""
-    grew, notes = False, []
-    for path in sorted(set(base) & set(new)):
-        b, n = base[path], new[path]
-        if any(value != b[0] for value in b[1:]) or any(value != n[0] for value in n[1:]):
-            continue
-        before, after = b[0], n[0]
-        if before == after:
-            continue
-        if not all(isinstance(value, (int, float)) and not isinstance(value, bool)
-                   for value in (before, after)):
-            notes.append(f"{path}: {json.dumps(before, sort_keys=True)} -> "
-                         f"{json.dumps(after, sort_keys=True)} (metadata changed)")
-            continue
-        change = (after - before) / before if before else float("inf")
-        mark = ""
-        if change > 0.02:
-            grew, mark = True, "  MORE WORK"
-        elif change < -0.02:
-            mark = "  less work"
-        notes.append(f"{path}: {before:g} -> {after:g} ({change:+.1%}){mark}")
-    return grew, notes
-
-
-def series_ratios(base: list[dict], new: list[dict], series: list[str]) -> list[str]:
-    """The series of a case sorted by how far their median moved, as `name ratio`."""
-    out = []
-    for s in series:
-        b, n = statistic(base, [s]), statistic(new, [s])
-        if b > 0:
-            out.append((abs(n / b - 1), f"{s} {n / b:.2f}x"))
-    return [text for _, text in sorted(out, reverse=True)]
-
-
 def compare(args) -> int:
+    """`compare BASE NEW`: the one compare (benches/suite/suitekit/compare.py) on two reports."""
     min_ms = getattr(args, "min_ms", 2.0)
     if not math.isfinite(min_ms) or min_ms < 0:
         raise ValueError("--min-ms must be finite and nonnegative")
-    base_report, new_report = load_report(Path(args.base)), load_report(Path(args.new))
-    base, new = pooled(base_report), pooled(new_report)
-    for name, report in (("base", base_report), ("new", new_report)):
-        if report.get("reps", 2) < 2:
-            print(f"warning: the {name} run has one repetition: its spread is unknown, so a verdict "
-                  "rests on the 10 % floor alone (run --reps 2 or more)")
-    print(f"{'case':<26} {'base ms':>11} {'new ms':>11} {'ratio':>7} {'95% CI':>15} {'spread':>7} {'peak MiB':>17}  verdict")
-    regressions = 0
-    spreads = []
-    for case in sorted(set(base) | set(new)):
-        b, n = base.get(case), new.get(case)
-        if not b or not n:
-            print(f"{case:<26} {'LOST case' if b else 'new case without baseline':>45}")
-            regressions += int(b is not None)
-            continue
-        if set(n["status"]) != set(b["status"]):
-            print(f"{case:<26} status {','.join(sorted(set(b['status'])))} -> {','.join(sorted(set(n['status'])))}  CHANGED")
-            regressions += 1
-            continue
-        if any(len(e["status"]) < e["expected_reps"] for e in (b, n)):
-            print(f"{case:<26} NOT COMPARABLE: missing/invalid timing series or repetitions")
-            regressions += 1
-            continue
-        if any(e["invalid"] or set(e["status"]) != {"ok"} for e in (b, n)):
-            # A known product issue (the status the case declares, on both sides) tracks its
-            # values and its frontier; anything else is no valid comparison.
-            known = all(e["status"] == e["expected"] and "ok" not in e["expected"] for e in (b, n))
-            print(f"{case:<26} {'known issue' if known else 'NOT COMPARABLE: failed checks/status'}; no timing verdict")
-            regressions += int(not known)
-            for path in sorted(set(b["checks"]) & set(n["checks"])):
-                if b["checks"][path] != n["checks"][path]:
-                    print(f"{'':<28}{path}: {'/'.join(map(str, b['checks'][path]))} -> {'/'.join(map(str, n['checks'][path]))}")
-            if b["frontiers"] and n["frontiers"]:
-                fb, fn = b["frontiers"][0], n["frontiers"][0]
-                worse = fb["status"] == "ok" and fn["status"] != "ok"
-                pb, pn = fb.get("peak_mib"), fn.get("peak_mib")
-                worse |= bool(pb and pn and pn > pb * 1.10 and pn - pb > 64)
-                print(f"{'':<28}past its limit: {fb['status']} -> {fn['status']}, metric {fb.get('metric')} -> "
-                      f"{fn.get('metric')}, peak {pb} -> {pn} MiB" + ("  WORSE" if worse else ""))
-                regressions += int(worse)
-            continue
-        shapes = [set(rep) for e in (b, n) for rep in e["reps"]]
-        if (any(len(e["reps"]) != len(e["status"]) for e in (b, n)) or not shapes
-                or not shapes[0] or any(s != shapes[0] for s in shapes)
-                or any(not vs or any(not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in vs)
-                       for e in (b, n) for rep in e["reps"] for vs in rep.values())):
-            print(f"{case:<26} NOT COMPARABLE: missing/invalid timing series or repetitions")
-            regressions += 1
-            continue
-        ratio, low, high = bootstrap_ratio(b["reps"], n["reps"])
-        series = sorted({s for rep in b["reps"] for s in rep} & {s for rep in n["reps"] for s in rep})
-        bm, nm = statistic(b["reps"], series), statistic(n["reps"], series)
-        # A change counts beyond max(10 %, the measured spread of both sides), the chosen floor,
-        # and with the interval excluding 1.
-        threshold = max(0.10, spread(b), spread(n))
-        spreads.append(max(spread(b), spread(n)))
-        verdict = "same"
-        if low > 1.0 and ratio >= 1 + threshold:
-            verdict = "SLOWER" if nm - bm >= min_ms else "slower, below absolute floor"
-            regressions += int(nm - bm >= min_ms)
-        elif high < 1.0 and ratio <= 1 / (1 + threshold):
-            verdict = "faster" if bm - nm >= min_ms else "faster, below absolute floor"
-        bp, np_ = (max(b["peaks"]) if b["peaks"] else None), (max(n["peaks"]) if n["peaks"] else None)
-        if bp and np_ and np_ > bp * (1 + max(0.10, threshold)) and np_ - bp > 64:
-            verdict += ", MORE MEMORY"
-            regressions += 1
-        for phase in sorted(set(b["phase_peaks"]) & set(n["phase_peaks"])):
-            before, after = max(b["phase_peaks"][phase]), max(n["phase_peaks"][phase])
-            if after > before * (1 + max(0.10, threshold)) and after - before > 64:
-                verdict += f", MORE MEMORY in {phase} ({before} -> {after} MiB)"
-                regressions += 1
-        work, notes = counter_changes(b["counters"], n["counters"])
-        if work:
-            verdict += ", MORE WORK"
-            regressions += 1
-        peaks = f"{bp or '-'} -> {np_ or '-'}"
-        print(f"{case:<26} {bm:>11.4g} {nm:>11.4g} {ratio:>7.2f} {f'[{low:.2f}, {high:.2f}]':>15} "
-              f"{threshold:>6.0%} {peaks:>17}  {verdict}")
-        widths = {width for e in (b, n) for rep in e["qps"] for width in rep}
-        if not widths and any(e["client_case"] for e in (b, n)):
-            print("  clients QPS: NOT COMPARABLE (throughput missing; retrieve the verified full reports)")
-            regressions += 1
-        for clients in sorted(widths, key=lambda w: (len(w), w)):
-            values = [[rep.get(clients) for rep in e["qps"]] for e in (b, n)]
-            if not clients.isdecimal() or int(clients) <= 0 or any(len(vs) != len(e["status"]) or len(vs) < 2
-                   or any(not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in vs)
-                   for e, vs in zip((b, n), values)) or statistics.median(values[0]) <= 0:
-                print(f"  {clients} clients QPS: NOT COMPARABLE (missing/invalid samples or fewer than two repetitions)")
-                regressions += 1
-                continue
-            qr, ql, qh = bootstrap_ratio(*[[{"qps": [v]} for v in vs] for vs in values])
-            qt = max(0.10, *(spread({"metrics": vs}) for vs in values))
-            qv = "LOWER QPS" if qh < 1 and qr <= 1 / (1 + qt) else (
-                "higher QPS" if ql > 1 and qr >= 1 + qt else "within noise")
-            regressions += int(qv == "LOWER QPS")
-            print(f"  {clients} clients QPS: {statistics.median(values[0]):.4g} -> {statistics.median(values[1]):.4g}; "
-                  f"ratio {qr:.3f}, 95% CI [{ql:.3f}, {qh:.3f}], spread threshold {qt:.1%}; {qv}")
-        for note in notes:
-            print(f"{'':<28}{note}")
-        if verdict.startswith(("SLOWER", "faster")) and len(series) > 1:
-            print(f"{'':<28}by series: " + ", ".join(series_ratios(b["reps"], n["reps"], series)[:3]))
-    if spreads:
-        print(f"\nspread between repetitions: median {statistics.median(spreads):.0%}, max {max(spreads):.0%}")
-    print(f"{regressions} regression(s)/acceptance failure(s): latency floor {min_ms:g} ms (default 2); "
-          "changes require max(10 %, spread) and a 95 % ratio interval excluding 1; "
-          "QPS is higher-is-better, judged per client width without a millisecond floor")
-    return 1 if regressions else 0
+    return compare_reports(load_report(Path(args.base)), load_report(Path(args.new)), min_ms)
 
 
 # --- list, clean -----------------------------------------------------------------------------
