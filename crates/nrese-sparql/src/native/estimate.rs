@@ -190,11 +190,14 @@ impl Context<'_> {
             }
             Plan::Extend {
                 input: inner,
-                variable,
-                expression,
+                bindings,
             } => (
                 "extend",
-                format!("{variable} := {expression}"),
+                bindings
+                    .iter()
+                    .map(|(variable, expression)| format!("{variable} := {expression}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
                 input(inner, steps),
             ),
             Plan::Values { variables, rows } => {
@@ -384,8 +387,15 @@ impl Context<'_> {
             PropertyPathExpression::Reverse(p) | PropertyPathExpression::ZeroOrOne(p) => {
                 self.path_open(p)
             }
-            PropertyPathExpression::Sequence(a, b) => self.path_open(a) * self.path_fanout(b, true),
-            PropertyPathExpression::Alternative(a, b) => self.path_open(a) + self.path_open(b),
+            PropertyPathExpression::Sequence(steps) => match steps.split_first() {
+                Some((first, rest)) => rest.iter().fold(self.path_open(first), |rows, step| {
+                    rows * self.path_fanout(step, true)
+                }),
+                None => 0.0,
+            },
+            PropertyPathExpression::Alternative(paths) => {
+                paths.iter().map(|p| self.path_open(p)).sum()
+            }
             PropertyPathExpression::OneOrMore(p) | PropertyPathExpression::ZeroOrMore(p) => {
                 let (pairs, fanout) = (self.path_open(p), self.path_fanout(p, true));
                 let starts = if fanout > 0.0 { pairs / fanout } else { 0.0 };
@@ -418,11 +428,11 @@ impl Context<'_> {
                 count as f64 / distinct as f64
             }
             PropertyPathExpression::Reverse(p) => self.path_fanout(p, !forward),
-            PropertyPathExpression::Sequence(a, b) => {
-                self.path_fanout(a, forward) * self.path_fanout(b, forward)
+            PropertyPathExpression::Sequence(steps) => {
+                steps.iter().map(|p| self.path_fanout(p, forward)).product()
             }
-            PropertyPathExpression::Alternative(a, b) => {
-                self.path_fanout(a, forward) + self.path_fanout(b, forward)
+            PropertyPathExpression::Alternative(paths) => {
+                paths.iter().map(|p| self.path_fanout(p, forward)).sum()
             }
             PropertyPathExpression::ZeroOrOne(p) => 1.0 + self.path_fanout(p, forward),
             PropertyPathExpression::OneOrMore(p) => {

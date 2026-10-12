@@ -172,9 +172,8 @@ impl Values<'_> {
                 left: p(left),
                 right: p(right),
             },
-            GraphPattern::Join { left, right } => GraphPattern::Join {
-                left: p(left),
-                right: p(right),
+            GraphPattern::Join { inputs } => GraphPattern::Join {
+                inputs: inputs.iter().map(|input| *p(input)).collect(),
             },
             GraphPattern::LeftJoin {
                 left,
@@ -189,33 +188,31 @@ impl Values<'_> {
                 expr: self.expression(expr),
                 inner: p(inner),
             },
-            GraphPattern::Union { left, right } => GraphPattern::Union {
-                left: p(left),
-                right: p(right),
+            GraphPattern::Union { inputs } => GraphPattern::Union {
+                inputs: inputs.iter().map(|input| *p(input)).collect(),
             },
             GraphPattern::Graph { name, inner } => GraphPattern::Graph {
                 name: self.named_node_pattern(name),
                 inner: p(inner),
             },
             // Binding a variable the outer solution binds: the value must be the same.
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => match self.constant(variable) {
-                Some(constant) => GraphPattern::Filter {
-                    expr: Expression::SameTerm(
-                        Box::new(self.expression(expression)),
-                        Box::new(constant.expression()),
-                    ),
-                    inner: p(inner),
-                },
-                None => GraphPattern::Extend {
-                    inner: p(inner),
-                    variable: variable.clone(),
-                    expression: self.expression(expression),
-                },
-            },
+            GraphPattern::Extend { inner, bindings } => {
+                bindings
+                    .iter()
+                    .fold(*p(inner), |extended, (variable, expression)| {
+                        let expression = self.expression(expression);
+                        match self.constant(variable) {
+                            Some(constant) => GraphPattern::Filter {
+                                expr: Expression::SameTerm(
+                                    Box::new(expression),
+                                    Box::new(constant.expression()),
+                                ),
+                                inner: Box::new(extended),
+                            },
+                            None => extended.extend(variable.clone(), expression),
+                        }
+                    })
+            }
             GraphPattern::Minus { left, right } => GraphPattern::Minus {
                 left: p(left),
                 right: p(right),
@@ -297,11 +294,7 @@ impl Values<'_> {
             } => GraphPattern::Group {
                 inner: Box::new(variables.iter().fold(self.pattern(inner), |grouped, v| {
                     match self.constant(v) {
-                        Some(constant) => GraphPattern::Extend {
-                            inner: Box::new(grouped),
-                            variable: v.clone(),
-                            expression: constant.expression(),
-                        },
+                        Some(constant) => grouped.extend(v.clone(), constant.expression()),
                         None => grouped,
                     }
                 })),

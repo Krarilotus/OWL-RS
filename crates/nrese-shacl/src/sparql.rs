@@ -50,18 +50,19 @@ pub(crate) fn prebinding_problem(pattern: &GraphPattern, pre_bound: &[String]) -
             GraphPattern::Minus { .. } => Some("uses MINUS".into()),
             GraphPattern::Values { .. } => Some("uses VALUES".into()),
             GraphPattern::Service { .. } => Some("uses SERVICE".into()),
-            GraphPattern::Extend {
-                inner: p,
-                variable,
-                expression,
-            } => {
-                if pre_bound.iter().any(|v| v == variable.as_str()) {
-                    return Some(format!(
-                        "binds the pre-bound variable ?{}",
-                        variable.as_str()
-                    ));
+            GraphPattern::Extend { inner: p, bindings } => {
+                for (variable, expression) in bindings {
+                    if pre_bound.iter().any(|v| v == variable.as_str()) {
+                        return Some(format!(
+                            "binds the pre-bound variable ?{}",
+                            variable.as_str()
+                        ));
+                    }
+                    if let Some(problem) = expression_problem(expression, pre_bound) {
+                        return Some(problem);
+                    }
                 }
-                expression_problem(expression, pre_bound).or_else(|| inner(p))
+                inner(p)
             }
             GraphPattern::Project {
                 inner: p,
@@ -91,8 +92,8 @@ pub(crate) fn prebinding_problem(pattern: &GraphPattern, pre_bound: &[String]) -
                 .and_then(|e| expression_problem(e, pre_bound))
                 .or_else(|| inner(left))
                 .or_else(|| inner(right)),
-            GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
-                inner(left).or_else(|| inner(right))
+            GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+                inputs.iter().find_map(&inner)
             }
             GraphPattern::Graph { inner: p, .. }
             | GraphPattern::Distinct { inner: p }

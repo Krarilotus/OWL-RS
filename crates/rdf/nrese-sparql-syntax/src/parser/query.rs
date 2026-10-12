@@ -352,8 +352,7 @@ impl<'a> Parser<'a> {
             };
             self.aggregates_allowed = allowed;
             result?;
-            let having = (!conditions.is_empty())
-                .then(|| super::expr::balanced(conditions, Expression::And));
+            let having = Expression::balanced(conditions, Expression::And);
             if having.is_none() {
                 return Err(self.expected("a HAVING condition"));
             }
@@ -461,11 +460,7 @@ impl<'a> Parser<'a> {
                         format!("GROUP BY binds {variable}, which is bound already"),
                     ));
                 }
-                p = GraphPattern::Extend {
-                    inner: Box::new(p),
-                    variable,
-                    expression,
-                };
+                p = p.extend(variable, expression);
             }
             p = GraphPattern::Group {
                 inner: Box::new(p),
@@ -483,6 +478,7 @@ impl<'a> Parser<'a> {
             p = new_join(p, values);
         }
         let mut projection = Vec::new();
+        let mut expressions = Vec::new();
         match selection {
             Selection::Members(members) => {
                 let mut visible = HashSet::new();
@@ -515,11 +511,7 @@ impl<'a> Parser<'a> {
                                     format!("the expression for {v} uses a variable neither grouped nor aggregated"),
                                 ));
                             }
-                            p = GraphPattern::Extend {
-                                inner: Box::new(p),
-                                variable: v.clone(),
-                                expression,
-                            };
+                            expressions.push((v.clone(), expression));
                             v
                         }
                     };
@@ -543,6 +535,9 @@ impl<'a> Parser<'a> {
                 });
                 projection.sort();
             }
+        }
+        for (variable, expression) in expressions {
+            p = p.extend(variable, expression);
         }
         if let Some(expression) = modifiers.order {
             p = GraphPattern::OrderBy {
@@ -727,8 +722,8 @@ impl<'a> Parser<'a> {
                             },
                         }
                     })
-                    .reduce(new_join)
-                    .unwrap_or_default();
+                    .collect::<Vec<_>>();
+                let pattern = GraphPattern::join_all(pattern);
                 let delete = ground_quads(quads)
                     .map_err(|()| self.error_at(at, "DELETE WHERE can't hold blank nodes"))?;
                 vec![GraphUpdateOperation::DeleteInsert {

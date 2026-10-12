@@ -83,3 +83,12 @@ codegen-units = 16
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"
+
+# The SPARQL crates recurse as deep as a query nests. At opt-level 1 a level takes 0.8 to
+# 1.4 times the stack it takes in release (ADR-0012's measurements), so the depth tests'
+# 2 MiB thread represents the server's; the differential tests run faster too.
+[profile.dev.package.nrese-sparql]
+opt-level = 1
+
+[profile.dev.package.nrese-sparql-syntax]
+opt-level = 1

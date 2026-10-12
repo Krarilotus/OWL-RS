@@ -93,9 +93,10 @@ fn path_reads(path: &PropertyPathExpression, out: &mut Vec<(Option<String>, Opti
         | PropertyPathExpression::ZeroOrMore(p)
         | PropertyPathExpression::OneOrMore(p)
         | PropertyPathExpression::ZeroOrOne(p) => path_reads(p, out),
-        PropertyPathExpression::Sequence(a, b) | PropertyPathExpression::Alternative(a, b) => {
-            path_reads(a, out);
-            path_reads(b, out);
+        PropertyPathExpression::Sequence(paths) | PropertyPathExpression::Alternative(paths) => {
+            for p in paths {
+                path_reads(p, out);
+            }
         }
         PropertyPathExpression::NegatedPropertySet(_) => out.push((None, None)),
     }
@@ -217,8 +218,10 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
                         analysis.atoms.extend(steps);
                         None
                     }
-                    GraphPattern::Extend { expression, .. } => {
-                        variables_of(expression, &mut analysis.computed);
+                    GraphPattern::Extend { bindings, .. } => {
+                        for (_, expression) in bindings {
+                            variables_of(expression, &mut analysis.computed);
+                        }
                         None
                     }
                     GraphPattern::LeftJoin { .. } => Some("OPTIONAL"),

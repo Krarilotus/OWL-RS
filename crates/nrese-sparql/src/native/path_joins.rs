@@ -94,7 +94,7 @@ impl<'q> PathJoin<'q> {
                 self.conjuncts.extend(conjuncts);
                 true
             }
-            GraphPattern::Join { left, right } => self.add(left) && self.add(right),
+            GraphPattern::Join { inputs } => inputs.iter().all(|input| self.add(input)),
             _ => false,
         }
     }

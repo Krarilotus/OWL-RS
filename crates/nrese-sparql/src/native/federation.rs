@@ -227,11 +227,13 @@ fn bind_values(
     Some(
         rows.chunks(BIND_CHUNK)
             .map(|chunk| GraphPattern::Join {
-                left: Box::new(GraphPattern::Values {
-                    variables: variables.clone(),
-                    bindings: chunk.to_vec(),
-                }),
-                right: Box::new(inner.clone()),
+                inputs: vec![
+                    GraphPattern::Values {
+                        variables: variables.clone(),
+                        bindings: chunk.to_vec(),
+                    },
+                    inner.clone(),
+                ],
             })
             .collect(),
     )
