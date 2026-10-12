@@ -28,6 +28,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all, post
+from . import hosts
 from .answers import Recorder
 from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime,
                       run_quiet, shell)
@@ -146,7 +147,7 @@ class Suite:
         else:
             runtime = ProcessRuntime(self.scratch, args.port)
         self.runtime = DryRuntime(runtime) if args.dry_run else runtime
-        data = args.data or ("volume:nrese-bench-data" if args.runtime == "docker" else None)
+        data = args.data or (f"volume:{hosts.volume('data')}" if args.runtime == "docker" else None)
         if data is None:
             sys.exit(f"--runtime {args.runtime} needs --data DIR (the datasets)")
         if data.startswith("volume:"):
