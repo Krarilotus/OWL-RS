@@ -2,6 +2,7 @@
 //! closure, negative ones by refutation in a speculative transaction that is never
 //! committed.
 
+use crate::support::Writes;
 use nrese_rdf::Triple;
 use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_reasoner::rulesets::Ruleset;

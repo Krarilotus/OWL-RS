@@ -106,13 +106,9 @@ fn with_the_check_off_commits_pass_and_the_status_is_unknown() {
 #[test]
 fn inconsistent_data_loaded_past_the_gate_is_quarantined_not_locked() {
     let dl = pipeline();
-    // Loaded past the pipeline (as a bulk load or restore would).
-    dl.store()
-        .execute_update_str(&format!(
-            "{} INSERT DATA {{ {UNION} :x a :A , :D . }}",
-            super::PREFIXES
-        ))
-        .expect("direct write");
+    // Loaded past the pipeline, by a bulk load.
+    let data = format!("{}\n{UNION} :x a :A , :D .", super::PREFIXES);
+    crate::support::load_past_the_pipeline(dl.store(), &data);
     // A commit that leaves it inconsistent is accepted, and says so.
     insert(&dl, ":z a :B .").expect("accepted in quarantine");
     assert_eq!(status(&dl).consistency.verdict.as_str(), "inconsistent");

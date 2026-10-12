@@ -2,6 +2,7 @@
 //! inferred statement when one of its derivations uses graphs it may read alone (support
 //! graph sets, `nrese_store::support`), in every read path.
 
+use crate::support::Writes;
 use std::sync::Arc;
 
 use crate::support::in_memory_store_config;
@@ -136,11 +137,9 @@ fn support_follows_the_latest_revision() {
     let store = store();
     let supported = reader(true);
     assert!(classes(&store, &supported, "c").is_empty());
-    store
-        .execute_update(&SparqlUpdateRequest::new(format!(
-            "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH ex:open {{ ex:c a ex:C }} }}"
-        )))
-        .unwrap();
+    // Loaded past the pipeline, which would maintain the closure and the sets itself.
+    let data = format!("PREFIX ex: <{EX}> ex:open {{ ex:c a ex:C }}");
+    crate::support::load_past_the_pipeline(&store, &data);
     // The rematerialisation prepares the new revision's sets in the background (they
     // were in use); the read waits for that computation instead of starting another.
     store.rematerialise(Ruleset::Owl2Rl).unwrap();

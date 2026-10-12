@@ -19,6 +19,7 @@
 //! `NRESE_QL_CASES` sets the number of cases (default 150 per test), `NRESE_QL_SEED` the
 //! seed.
 
+use crate::support::Writes;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use nrese_reasoner::rulesets::Ruleset;

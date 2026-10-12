@@ -1,3 +1,4 @@
+use crate::support::Writes;
 use std::fs;
 use std::path::PathBuf;
 
