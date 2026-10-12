@@ -26,8 +26,8 @@ interleaved across the systems, each round in an order rotated by one):
   `.printsize`; Nemo and VLog: the exported relation), checked against the published count.
 
 Rows follow the suite's schema (benches/suite/suitekit/schema.py), workload
-`datalog-programs` (FlowLog's programs) or `materialisation-programs` (programs over RDF),
-tier = the case, regime `-`; `suite.py report` and `compare` read them.
+the case's `workload` and `tier` in cases.toml (default `datalog-graphs` and the case's name:
+FlowLog's programs; RDFox's are tiers of `claros` and `lubm`), regime `-`; `suite.py report` and `compare` read them.
 A derived count that differs from the expected one is `wrong`, never a time.
 """
 from __future__ import annotations
@@ -73,8 +73,13 @@ def cases() -> dict[str, dict]:
 
 
 def workload(case: dict) -> str:
-    """The workload of workloads.toml a case is a tier of."""
-    return "materialisation-programs" if case.get("format") == "triples" else "datalog-programs"
+    """The workload of workloads.toml a case is a tier of (default datalog-graphs)."""
+    return case.get("workload", "datalog-graphs")
+
+
+def tier(case: dict) -> str:
+    """The case's tier in its workload (default its name)."""
+    return case.get("tier", case["name"])
 
 
 def downloads() -> Path:
@@ -286,7 +291,7 @@ class Run:
     def row(self, task: str, **fields) -> Result:
         return Result(date=self.args.date, host=self.args.host, runtime="docker", system=self.system,
                       version=self.args.versions.get(self.system, "-"), publish="free", workload=workload(self.case),
-                      tier=self.case["name"], regime="-", run=self.rep, task=task, **fields)
+                      tier=tier(self.case), regime="-", run=self.rep, task=task, **fields)
 
     def write(self, result: Result):
         self.writer.write(result)
@@ -565,7 +570,7 @@ def cmd_run(args):
                 why = expressible(case, system)
                 if why:
                     writer.write(Result(date=args.date, host=args.host, runtime="docker", system=system,
-                                        version=args.versions[system], publish="free", workload=workload(case), tier=name,
+                                        version=args.versions[system], publish="free", workload=workload(case), tier=tier(case),
                                         regime="-", run=0, task="load", status="skipped",
                                         note=f"not expressible: {why}"))
                 else:
