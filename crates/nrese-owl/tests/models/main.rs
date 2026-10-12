@@ -494,7 +494,14 @@ fn clauses_and_ontologies_have_the_same_models() {
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
     let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x2026_1003_0222));
     let (mut compared, mut models) = (0u64, 0u64);
-    for case in 0..cases {
+    let covered = |models: u64, compared: u64| models > 0 && models < compared;
+    // Draw on (up to ten times as many cases) until the run covers what the assertion
+    // below asks for, so that coverage never depends on the seed (the NI fuzz test's
+    // fix, a901e34; seed 66810 of the SPARQL differential tests, 12 October 2026).
+    for case in 0..cases * 10 {
+        if case >= cases && covered(models, compared) {
+            break;
+        }
         // Terms: classes 0..3, roles 10 (may be transitive) and 11 (simple), individuals 20, 21.
         let classes: Vec<Term> = vec![0, 1, 2];
         let (chained, simple) = (10, 11);
@@ -846,7 +853,7 @@ fn clauses_and_ontologies_have_the_same_models() {
         }
     }
     eprintln!("{compared} interpretations compared, {models} models");
-    assert!(models > 0 && models < compared, "{models} of {compared}");
+    assert!(covered(models, compared), "{models} of {compared}");
 }
 
 /// A transitive role over forty transitive subroles, under thirty universals (the shape of

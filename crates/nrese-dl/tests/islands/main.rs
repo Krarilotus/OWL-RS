@@ -272,7 +272,21 @@ fn islands_decide_as_the_whole_abox_does() {
     };
     let (mut split, mut compared, mut inconsistent) = (0u64, 0u64, 0u64);
     let mut failures = Vec::new();
-    for case in 0..cases {
+    // Most drawn cases split, three quarters are decided by both, both verdicts occur.
+    let covered = |drawn: u64, split: u64, compared: u64, inconsistent: u64| {
+        split * 2 >= drawn
+            && compared * 4 >= drawn * 3
+            && inconsistent > 0
+            && inconsistent < compared
+    };
+    // Draw on (up to ten times as many cases) until the run covers that, so that coverage
+    // never depends on the seed (the NI fuzz test's fix, a901e34).
+    let mut drawn = 0;
+    for case in 0..cases * 10 {
+        if case >= cases && covered(drawn, split, compared, inconsistent) {
+            break;
+        }
+        drawn += 1;
         let mut rng = Rng::new(seed.wrapping_add(case));
         let mut names: HashMap<String, Term> = HashMap::new();
         let mut intern = |n: &Name| {
@@ -316,17 +330,12 @@ fn islands_decide_as_the_whole_abox_does() {
         }
     }
     eprintln!(
-        "{cases} cases: {split} split, {compared} decided by both, {inconsistent} inconsistent"
+        "{drawn} cases: {split} split, {compared} decided by both, {inconsistent} inconsistent"
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    // The test exercises the islands: most cases split, both verdicts occur.
-    assert!(split * 2 >= cases, "only {split} of {cases} cases split");
+    // The test exercises the islands.
     assert!(
-        compared * 4 >= cases * 3,
-        "only {compared} of {cases} decided by both"
-    );
-    assert!(
-        inconsistent > 0 && inconsistent < compared,
-        "{inconsistent} of {compared} inconsistent: both verdicts must occur"
+        covered(drawn, split, compared, inconsistent),
+        "{drawn} cases: {split} split, {compared} decided by both, {inconsistent} inconsistent"
     );
 }
