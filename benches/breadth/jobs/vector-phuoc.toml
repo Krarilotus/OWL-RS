@@ -1,0 +1,17 @@
+# vector-knn-filtered after the probe-first fix, on Phuoc-Yu without Docker: perf_lab built
+# from bfc2b2f9 on office-pc (x86-64-v3, glibc 2.35; SHA-256 a53cf52dae11d24e...), on the
+# case's generated data (vectors items=200000 dim=64 kinds=10), the graph prepared before
+# timing as the case does. The same variants as runs/2026-10-12-vector-recall-phuoc.toml.
+id = "breadth-vector-phuoc-bfc2b2f9"
+group = "breadth"
+host = "phuoc-yu"
+checkout = "suite/breadth"
+workload = "vector-recall"
+window = "quiet"
+priority = 1
+est_min = 10
+needs = []
+env = { PYTHONIOENCODING = "utf-8", NRESE_QUIET_DRAIN_S = "1800" }
+commands = [
+  ["scripts/quiet-slot.sh", "python3", "benches/breadth/vectors/knn_filtered.py", "/home/krarilotus/nrese-breadth/bin/bfc2b2f9/perf_lab", "/home/krarilotus/owlrs/ab/fast-data/vectors-items200000-dim64-kinds10.nt", "/home/krarilotus/owlrs/ab/fast-data/vectors-items200000-dim64-kinds10.nt.expect.json", "/home/krarilotus/owlrs/results/breadth-vector-phuoc-bfc2b2f9", "--runs", "20", "--prepare-vector-graph", "64:cosine"],
+]
