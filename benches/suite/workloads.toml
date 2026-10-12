@@ -66,9 +66,10 @@ scales = "50 M, 256 M, 1 B statements"
 source = "github.com/ldbc/ldbc_spb_bm_2.0"
 licence = "Apache-2.0; unaudited results are \"not an LDBC benchmark result\" (LDBC fair-use policy)"
 tiers = ["50m", "256m"]
-state = "planned"
 check = "the benchmark's own validation of query results and of its OWL 2 RL rules"
-note = "The industry's audited reasoning benchmark (GraphDB publishes audited results). Its advanced query mix also needs fulltext and geosparql"
+state = "partial"
+kit = "benches/reasoning/spb"
+note = "The industry's audited reasoning benchmark (GraphDB publishes audited results). Its advanced query mix also needs fulltext and geosparql; the kit runs the basic mix with the benchmark's own ruleset on both systems. Office-PC's GraphDB licence is Free (1 CPU core, two concurrent queries; checked 12 Oct 2026): the comparison is the matched one-CPU scenario, and the audited Enterprise results can't be reproduced with it"
 
 [integration-rg-gs-gnd]
 title = "RG x GS x GND integration: identity reasoning over real links, 10 competency questions"
@@ -370,7 +371,7 @@ note = "The worst case for proof-based deletion; GLog's single-thread result (Cl
 title = "SSPE: single-source path graphs where one deletion invalidates long derivations"
 kind = "performance"
 tasks = ["RT2"]
-needs = ["load", "reason-incremental"]
+needs = ["load", "reason-incremental", "rules-nary", "rules-arithmetic"]
 scales = "millions of edges; 1 to 1,000 deletions"
 source = "generated from the description of Hu, Motik and Horrocks (counting against B/F)"
 licence = "ours (generated)"

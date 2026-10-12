@@ -1,0 +1,16 @@
+id = "reasoning-profile-cspa-httpd"
+group = "reasoning"
+host = "phuoc-yu"
+checkout = "suite/reasoning"
+workload = "datalog-graphs"
+window = "quiet"
+priority = 3
+est_min = 15
+# The attribution of CSPA's loss to Soufflé (3.5x the time, 2.3x the memory, 12 Oct 2026):
+# where NRESE's 139 s of rule evaluation go. NRESE as a host process under perf (Phuoc-Yu
+# allows profiling); the binary and the case's facts were copied from Office-PC
+# (bin/16c3bfb/SHA256SUMS; data/datalog/cspa-httpd/facts.nt, SHA-256 in cspa-httpd.files.json).
+env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server" }
+commands = [
+  ["sh", "-c", "bash benches/reasoning/datalog/profile-nrese.sh cspa-httpd /home/krarilotus/nrese-reasoning-suite/data/datalog/cspa-httpd/facts.nt \"$QUEUE_RESULTS\""],
+]
