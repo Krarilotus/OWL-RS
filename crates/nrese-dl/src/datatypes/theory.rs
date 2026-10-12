@@ -14,8 +14,11 @@
 //!   variable, a minimal subset of its constraints (by deletion); for a component, those
 //!   of the searched variables and the inequalities between them. Backjumping over a
 //!   choice only a facet combination refutes stays sound.
-//! - Where a set is only bounded (`Eval::approximate`), a clash found with its superset is
-//!   a clash, and a solution that relied on it is reported as approximate.
+//! - Where a set is only bounded (`Eval::approximate`, `Eval::limited`), a clash found with
+//!   its superset is a clash, and a solution that relied on it is reported, by the kind
+//!   of the bound: outside OWL 2 DL (`approximate`) or a resource limit (`limited`).
+//! - The search for distinct values is exact: it runs until it decides, or until the
+//!   operation's deadline or cancellation stops it ([`Verdict::Stopped`]).
 
 use std::collections::{HashMap, HashSet};
 
@@ -31,11 +34,17 @@ pub struct DataVar(pub u32);
 /// The answer for a component.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
-    /// The variables can take values; `approximate`: only as far as approximated ranges
-    /// tell (why), so not an answer for a model.
-    Sat { approximate: Option<String> },
+    /// The variables can take values; `approximate`, `limited`: only as far as bounded
+    /// ranges tell (why: outside OWL 2 DL, a resource limit), so not an answer for a
+    /// model.
+    Sat {
+        approximate: Option<String>,
+        limited: Option<String>,
+    },
     /// No values: the union of what the clash depends on.
     Clash(DepSetId),
+    /// The operation stopped the search (its deadline passed, or it was cancelled).
+    Stopped,
 }
 
 #[derive(Debug, Clone)]
@@ -72,8 +81,8 @@ impl Local {
     }
 }
 
-/// The most variable assignments one component's search may try.
-const SEARCH_BUDGET: u64 = 200_000;
+/// How many assignments the search tries between two looks at whether to stop.
+const STOP_EVERY: u64 = 4096;
 
 /// Constraints over data variables.
 #[derive(Debug, Clone, Default)]
@@ -90,6 +99,7 @@ struct Values {
     over: ValueSet,
     under: ValueSet,
     approximate: Option<String>,
+    limited: Option<String>,
 }
 
 impl DatatypeTheory {
@@ -255,6 +265,7 @@ impl DatatypeTheory {
             over: ValueSet::all(),
             under: ValueSet::all(),
             approximate: None,
+            limited: None,
         };
         for c in constraints {
             let eval: Eval = match &c.of {
@@ -264,15 +275,31 @@ impl DatatypeTheory {
                         over: s.clone(),
                         under: s,
                         approximate: None,
+                        limited: None,
                     }
                 }
                 Of::Range(r) => ranges.eval(*r).clone(),
             };
             let eval = if c.positive { eval } else { eval.not() };
-            v.over = v.over.intersection(&eval.over);
-            v.under = v.under.intersection(&eval.under);
+            if v.over.combines(&eval.over) {
+                v.over = v.over.intersection(&eval.over);
+            } else {
+                // Past the patterns one set holds: the superset without this constraint.
+                v.limited
+                    .get_or_insert_with(|| super::ranges::TOO_MANY_PATTERNS.into());
+            }
+            if v.under.combines(&eval.under) {
+                v.under = v.under.intersection(&eval.under);
+            } else {
+                v.under = ValueSet::empty();
+                v.limited
+                    .get_or_insert_with(|| super::ranges::TOO_MANY_PATTERNS.into());
+            }
             if v.approximate.is_none() {
                 v.approximate = eval.approximate;
+            }
+            if v.limited.is_none() {
+                v.limited = eval.limited;
             }
         }
         v
@@ -298,10 +325,23 @@ impl DatatypeTheory {
             .fold(DepSetId::EMPTY, |acc, c| deps.union(acc, c.dep))
     }
 
-    /// Whether the variables of `component` can take values.
+    /// Whether the variables of `component` can take values (never stopped).
     pub fn check(&self, component: &[DataVar], ranges: &Ranges, deps: &mut DepSets) -> Verdict {
+        self.check_until(component, ranges, deps, &|| false)
+    }
+
+    /// Whether the variables of `component` can take values; the search for distinct
+    /// values asks `stop` from time to time whether to give up.
+    pub fn check_until(
+        &self,
+        component: &[DataVar],
+        ranges: &Ranges,
+        deps: &mut DepSets,
+        stop: &dyn Fn() -> bool,
+    ) -> Verdict {
         let n = component.len() as u64;
         let mut approximate: Option<String> = None;
+        let mut limited: Option<String> = None;
         let members = self.members(deps);
         let mut vars: Vec<(Vec<Constraint>, Values)> = Vec::with_capacity(component.len());
         for &DataVar(v) in component {
@@ -323,12 +363,20 @@ impl DatatypeTheory {
         // A variable is certain if its subset has a value for everyone, uncertain
         // otherwise where it is approximated.
         for (_, values) in &vars {
-            if values.approximate.is_some() && !values.under.count().at_least(n.max(1)) {
-                approximate = approximate.or_else(|| values.approximate.clone());
+            if !values.under.count().at_least(n.max(1)) {
+                if values.approximate.is_some() {
+                    approximate = approximate.or_else(|| values.approximate.clone());
+                }
+                if values.limited.is_some() {
+                    limited = limited.or_else(|| values.limited.clone());
+                }
             }
         }
         if n <= 1 {
-            return Verdict::Sat { approximate };
+            return Verdict::Sat {
+                approximate,
+                limited,
+            };
         }
         // The dependencies of a set of variables' constraints and inequalities.
         let core = |within: &dyn Fn(usize) -> bool, deps: &mut DepSets| {
@@ -367,15 +415,21 @@ impl DatatypeTheory {
             }
             match values.over.values(n) {
                 Some(list) => small.push((i, list)),
+                // Fewer values than variables, but too many to list: only in a component
+                // of more pairwise-unequal values than a region of texts of one length
+                // has (over a million).
                 None => {
-                    approximate.get_or_insert_with(|| {
-                        "a variable with an uncounted number of values".to_owned()
+                    limited.get_or_insert_with(|| {
+                        "a component of more data values than are listed".to_owned()
                     });
                 }
             }
         }
         if small.is_empty() {
-            return Verdict::Sat { approximate };
+            return Verdict::Sat {
+                approximate,
+                limited,
+            };
         }
         small.sort_by_key(|(_, list)| list.len());
         let position: HashMap<usize, usize> = small
@@ -393,33 +447,36 @@ impl DatatypeTheory {
             })
             .collect();
         let mut chosen: Vec<Option<usize>> = vec![None; small.len()];
-        let mut budget = SEARCH_BUDGET;
-        match Self::search(0, &small, &neighbours, &mut chosen, &mut budget) {
-            Some(true) => Verdict::Sat { approximate },
-            None => Verdict::Sat {
-                approximate: Some("the search for distinct values ran out of steps".into()),
+        let mut steps = 0u64;
+        match Self::search(0, &small, &neighbours, &mut chosen, &mut steps, stop) {
+            Some(true) => Verdict::Sat {
+                approximate,
+                limited,
             },
+            None => Verdict::Stopped,
             Some(false) => Verdict::Clash(core(&|i| position.contains_key(&i), deps)),
         }
     }
 
     /// Values for `small[at..]` unequal to their neighbours' chosen ones: whether there
-    /// are (`None`: the budget ran out).
+    /// are (`None`: stopped). Exponential in the worst case (list colouring); `stop` is
+    /// asked every [`STOP_EVERY`] steps.
     fn search(
         at: usize,
         small: &[(usize, Vec<Value>)],
         neighbours: &[Vec<usize>],
         chosen: &mut [Option<usize>],
-        budget: &mut u64,
+        steps: &mut u64,
+        stop: &dyn Fn() -> bool,
     ) -> Option<bool> {
         if at == small.len() {
             return Some(true);
         }
         for (i, value) in small[at].1.iter().enumerate() {
-            if *budget == 0 {
+            *steps += 1;
+            if (*steps).is_multiple_of(STOP_EVERY) && stop() {
                 return None;
             }
-            *budget -= 1;
             let taken = neighbours[at]
                 .iter()
                 .any(|&o| chosen[o].is_some_and(|j| small[o].1[j] == *value));
@@ -427,7 +484,7 @@ impl DatatypeTheory {
                 continue;
             }
             chosen[at] = Some(i);
-            match Self::search(at + 1, small, neighbours, chosen, budget) {
+            match Self::search(at + 1, small, neighbours, chosen, steps, stop) {
                 Some(false) => {}
                 other => return other,
             }
