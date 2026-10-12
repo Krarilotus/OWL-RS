@@ -197,7 +197,8 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
                "--systems", ",".join(["nrese", *systems]), "--workloads", "fast", "--tier", f"fast={tier}",
                "--runs", str(runs), "--query-runs", "2", "--cache", cache, "--skip-build",
                "--data", f"volume:{fast.DATA_VOLUME}", "--results", str(out), "--query-timeout-s", "120",
-               "--timeout-s", "900", "--answers", "full", "--answers-reference", ANSWER_REFERENCES]
+               "--timeout-s", "900", "--answers", "full",
+               "--answers-reference", ",".join((case.get("expect") or {}).get("answers") or [ANSWER_REFERENCES])]
     print(f"  suite: {tier} on nrese, {', '.join(systems)}", flush=True)
     log = out.with_suffix(".log")
     out.parent.mkdir(parents=True, exist_ok=True)

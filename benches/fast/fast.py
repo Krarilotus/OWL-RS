@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The fast suite: many small performance cases, each 10-300 s, all of them in under an
-hour, run like unit tests for performance (README.md here; cases.toml).
+hour, run like unit tests for performance (README.md here; the cases: benches/cases/).
 
     python benches/fast/fast.py list                     the cases, their semantics and comparators
     python benches/fast/fast.py build                    perf lab and DL tools, Linux, in a capped container
@@ -45,7 +45,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
-from suitekit import hosts, manifest  # noqa: E402
+from suitekit import cases as cases_registry, hosts, manifest  # noqa: E402
 from suitekit.compare import (KEPT_POINTS, bootstrap_ratio, client_throughput, compare_reports,  # noqa: E402,F401
                               counter_changes, load_report, pooled, series_ratios, spread, statistic, thin)
 from suitekit.workloads import fast_data_name  # noqa: E402
@@ -73,10 +73,8 @@ def host_path(path: Path) -> str:
 
 
 def load_cases() -> list[dict]:
-    cases = tomllib.loads((HERE / "cases.toml").read_text(encoding="utf-8"))["case"]
-    names = [c["name"] for c in cases]
-    assert len(names) == len(set(names)), "case names must be unique"
-    return cases
+    """Every case of every group (benches/cases/, suitekit/cases.py)."""
+    return cases_registry.load()
 
 
 def select(cases: list[dict], args) -> list[dict]:

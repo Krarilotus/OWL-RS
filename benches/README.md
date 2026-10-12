@@ -84,7 +84,8 @@ query on the same data is one group, classified `ok`, `wrong` (whose), `incomple
 | Run records in one schema | done |
 | The answer recorder in the suite: an adjudicated reference per query, a verdict per group (`suite.py answers`) | done |
 | A native runtime for the fast suite: host processes in capped scopes, on a measure host without Docker (`NRESE_FAST_RUNTIME=native`, [fast/README.md](fast/README.md#how-it-measures)) | done |
-| One case registry: `fast/cases.toml` grows `levels`, `needs`, `expect` and `data = "dataset:…"`; the fast runner moves into `suitekit` as the native plan kind; `fast.py` becomes `suite.py run --level focused` | next |
+| One case registry: [cases/](cases/README.md), a file per group, one schema validated by `suite.py --check` (`levels`, `needs`, `expect`, `scenario`, `workload`) | done |
+| the fast runner moves into `suitekit` as the native plan kind; `fast.py` becomes `suite.py run --level focused` | next |
 | One `compare` over result rows: `suitekit/compare.py` reads fast reports, perf-lab reports and suite results, in the order missing, answers, time, memory by kind, disk; `fast.py compare` and `suite.py compare` are it. Suite pairs still use `summary.py`'s estimator: the bootstrap for them is the next step | started |
 | `perf-lab.sh` and `perf-lab-compare.py` retired: the `lab-*` fast cases (rows pinned; the same rows and times within the old runs' spread on Phuoc-Yu, 12 Oct 2026) and the one `compare` | done |
 | `fast/compete.py` folds into the suite, the suite running comparators on any case | next |
@@ -117,7 +118,8 @@ benches/
 ├── hosts.toml           the hosts, their roles, the verified inputs
 ├── runs/                one record per run (committed)
 ├── baselines/           committed NRESE reference numbers the regression gates compare against
-├── fast/                the fast cases (levels 2 and 3): checked and route-checked, each its own container
+├── cases/               every case, a file per group, one schema (cases/README.md)
+├── fast/                the fast runner (levels 2 and 3): each case checked and route-checked, in a container or natively
 ├── suite/               the registries and the driver
 │   ├── systems.toml     systems, capabilities, publishing rule, how they start
 │   ├── workloads.toml   workloads, needs, standard tiers, source, licence, check, state
@@ -142,7 +144,7 @@ benches/
 | Layer | What | Where | Changes when |
 |---|---|---|---|
 | Rules | how anything is measured, checked, recorded and published | `PROTOCOL.md`, `competitors/README.md` (licences) | rarely, by decision |
-| Registries | what exists: systems, workloads, cases, hosts | `suite/*.toml`, `fast/cases.toml`, `hosts.toml` | a system, workload, case or host is added |
+| Registries | what exists: systems, workloads, cases, hosts | `suite/*.toml`, `cases/*.toml`, `hosts.toml` | a system, workload, case or host is added |
 | Drivers | how a pair or case runs | `suite/suitekit/`, `fast/fast.py`, the kits | a new kind of measurement |
 | Evidence | what came out: raw results (local), run records, STATUS, baselines (committed) | `suite/results/`, `runs/`, `STATUS.md`, `baselines/` | every run |
 
