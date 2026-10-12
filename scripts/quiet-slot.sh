@@ -75,7 +75,11 @@ watcher=""
 if [ -d /proc ] && command -v python3 >/dev/null 2>&1; then
   # The measurement is whoever asked for the slot and all it runs (fast.py holds the slot with
   # a stand-in command and measures itself, beside this shell): this shell's parent.
-  python3 "$WATCH" "$LOCK" "$PPID" "$NRESE_QUIET_TOKEN" &
+  # A caller that is init (detached, or gone already) would make every process the
+  # measurement: then the measurement is this shell's own command.
+  root=$PPID
+  if [ "$root" -le 1 ] || ! kill -0 "$root" 2>/dev/null; then root=$$; fi
+  python3 "$WATCH" "$LOCK" "$root" "$NRESE_QUIET_TOKEN" &
   watcher=$!
 fi
 stop_watch() {
