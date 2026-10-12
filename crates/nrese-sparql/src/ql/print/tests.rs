@@ -121,7 +121,7 @@ fn classes_print_with_their_hierarchy_and_rl_rules_unfolded() {
     );
     assert!(
         text.contains(
-            "rdf-syntax-ns#type> / ((((<http://www.w3.org/2000/01/rdf-schema#subClassOf>"
+            "rdf-syntax-ns#type> / ((<http://www.w3.org/2000/01/rdf-schema#subClassOf> | "
         ),
         "{text}"
     );
@@ -132,7 +132,7 @@ fn classes_print_with_their_hierarchy_and_rl_rules_unfolded() {
         &["<gil>", "<pat>", "<sam>"],
     );
     assert!(
-        text.contains("intersectionOf> / ((<http://www.w3.org/1999/02/22-rdf-syntax-ns#rest>)*"),
+        text.contains("intersectionOf> / (<http://www.w3.org/1999/02/22-rdf-syntax-ns#rest>)* / "),
         "{text}"
     );
     assert!(!text.contains("type> <http://e/"), "{text}");

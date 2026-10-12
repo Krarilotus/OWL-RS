@@ -9,7 +9,7 @@
 //!
 //! [`children`]: GraphPattern::children
 
-use crate::algebra::{AggregateExpression, Expression, GraphPattern};
+use crate::algebra::{AggregateExpression, Expression, GraphPattern, PropertyPathExpression};
 
 /// A node of the algebra.
 #[derive(Debug, Clone, Copy)]
@@ -24,10 +24,12 @@ impl GraphPattern {
     pub fn children(&self) -> Vec<Node<'_>> {
         match self {
             Self::Bgp { .. } | Self::Path { .. } | Self::Values { .. } => Vec::new(),
-            Self::Join { left, right }
-            | Self::Lateral { left, right }
-            | Self::Union { left, right }
-            | Self::Minus { left, right } => vec![Node::Pattern(left), Node::Pattern(right)],
+            Self::Join { inputs } | Self::Union { inputs } => {
+                inputs.iter().map(Node::Pattern).collect()
+            }
+            Self::Lateral { left, right } | Self::Minus { left, right } => {
+                vec![Node::Pattern(left), Node::Pattern(right)]
+            }
             Self::LeftJoin {
                 left,
                 right,
@@ -38,9 +40,9 @@ impl GraphPattern {
                 nodes
             }
             Self::Filter { expr, inner } => vec![Node::Pattern(inner), Node::Expression(expr)],
-            Self::Extend {
-                inner, expression, ..
-            } => vec![Node::Pattern(inner), Node::Expression(expression)],
+            Self::Extend { inner, bindings } => std::iter::once(Node::Pattern(inner))
+                .chain(bindings.iter().map(|(_, e)| Node::Expression(e)))
+                .collect(),
             Self::OrderBy { inner, expression } => std::iter::once(Node::Pattern(inner))
                 .chain(
                     expression
@@ -120,15 +122,68 @@ impl Expression {
     }
 }
 
+/// Depth first and left to right, with a stack of its own: any tree can be searched.
 fn find(node: Node<'_>, f: &mut impl FnMut(Node<'_>) -> bool) -> bool {
-    if f(node) {
-        return true;
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if f(node) {
+            return true;
+        }
+        stack.extend(node.children().into_iter().rev());
     }
-    let children = match node {
-        Node::Pattern(pattern) => pattern.children(),
-        Node::Expression(expression) => expression.children(),
-    };
-    children.into_iter().any(|child| find(child, f))
+    false
+}
+
+impl<'a> Node<'a> {
+    fn children(self) -> Vec<Node<'a>> {
+        match self {
+            Node::Pattern(pattern) => pattern.children(),
+            Node::Expression(expression) => expression.children(),
+        }
+    }
+}
+
+impl GraphPattern {
+    /// How deep the algebra nests: patterns, the expressions attached to them, the
+    /// patterns of `EXISTS`, and the steps of property paths, one level each. The passes
+    /// over the algebra recurse this deep, so the parser refuses a query deeper than its
+    /// nesting limit ([`crate::SparqlParser::with_max_nesting`]). Measured with a stack of
+    /// its own: any tree can be measured.
+    pub fn depth(&self) -> usize {
+        let mut deepest = 0;
+        let mut stack = vec![(Node::Pattern(self), 1)];
+        while let Some((node, level)) = stack.pop() {
+            let path = match node {
+                Node::Pattern(Self::Path { path, .. }) => path_depth(path),
+                _ => 0,
+            };
+            deepest = deepest.max(level + path);
+            stack.extend(node.children().into_iter().map(|child| (child, level + 1)));
+        }
+        deepest
+    }
+}
+
+/// How deep a property path nests.
+fn path_depth(path: &PropertyPathExpression) -> usize {
+    let mut deepest = 0;
+    let mut stack = vec![(path, 1)];
+    while let Some((path, level)) = stack.pop() {
+        deepest = deepest.max(level);
+        match path {
+            PropertyPathExpression::NamedNode(_)
+            | PropertyPathExpression::NegatedPropertySet(_) => {}
+            PropertyPathExpression::Reverse(p)
+            | PropertyPathExpression::ZeroOrMore(p)
+            | PropertyPathExpression::OneOrMore(p)
+            | PropertyPathExpression::ZeroOrOne(p) => stack.push((p, level + 1)),
+            PropertyPathExpression::Sequence(paths)
+            | PropertyPathExpression::Alternative(paths) => {
+                stack.extend(paths.iter().map(|p| (p, level + 1)));
+            }
+        }
+    }
+    deepest
 }
 
 #[cfg(test)]

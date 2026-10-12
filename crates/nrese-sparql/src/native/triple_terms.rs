@@ -69,17 +69,15 @@ impl Rewriter {
         match pattern {
             GraphPattern::Bgp { patterns } => self.bgp(patterns),
             GraphPattern::Path { .. } | GraphPattern::Values { .. } => pattern.clone(),
-            GraphPattern::Join { left, right } => GraphPattern::Join {
-                left: b(self, left),
-                right: b(self, right),
+            GraphPattern::Join { inputs } => GraphPattern::Join {
+                inputs: inputs.iter().map(|input| self.pattern(input)).collect(),
             },
             GraphPattern::Lateral { left, right } => GraphPattern::Lateral {
                 left: b(self, left),
                 right: b(self, right),
             },
-            GraphPattern::Union { left, right } => GraphPattern::Union {
-                left: b(self, left),
-                right: b(self, right),
+            GraphPattern::Union { inputs } => GraphPattern::Union {
+                inputs: inputs.iter().map(|input| self.pattern(input)).collect(),
             },
             GraphPattern::Minus { left, right } => GraphPattern::Minus {
                 left: b(self, left),
@@ -98,14 +96,12 @@ impl Rewriter {
                 expr: self.expression(expr),
                 inner: b(self, inner),
             },
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => GraphPattern::Extend {
+            GraphPattern::Extend { inner, bindings } => GraphPattern::Extend {
                 inner: b(self, inner),
-                variable: variable.clone(),
-                expression: self.expression(expression),
+                bindings: bindings
+                    .iter()
+                    .map(|(variable, expression)| (variable.clone(), self.expression(expression)))
+                    .collect(),
             },
             GraphPattern::Graph { name, inner } => GraphPattern::Graph {
                 name: name.clone(),
@@ -242,17 +238,11 @@ impl Rewriter {
         let mut pattern = GraphPattern::Bgp {
             patterns: rewritten,
         };
+        // One `Extend` and one balanced conjunction, however many parts (ADR-0012).
         for (variable, expression) in parts.extends {
-            pattern = GraphPattern::Extend {
-                inner: Box::new(pattern),
-                variable,
-                expression,
-            };
+            pattern = pattern.extend(variable, expression);
         }
-        let filter = parts
-            .filters
-            .into_iter()
-            .reduce(|a, b| Expression::And(Box::new(a), Box::new(b)));
+        let filter = Expression::balanced(parts.filters, Expression::And);
         match filter {
             Some(expr) => GraphPattern::Filter {
                 expr,
@@ -340,4 +330,24 @@ fn constant_triple(t: &TriplePattern) -> Expression {
         Function::Triple,
         vec![part(&t.subject), predicate, part(&t.object)],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use nrese_sparql_syntax::{Query, SparqlParser};
+
+    /// The parts of thousands of triple terms in one basic graph pattern are one `Extend`
+    /// and a balanced conjunction, not a chain as long as the pattern (ADR-0012).
+    #[test]
+    fn the_rewrite_of_a_long_pattern_stays_shallow() {
+        let triples: String = (0..5_000)
+            .map(|i| format!("?s <http://e/p> <<( ?a{i} <http://e/q> ?o )>> . "))
+            .collect();
+        let text = format!("SELECT * WHERE {{ ?s <http://e/r> ?o . {triples} }}");
+        let Query::Select { pattern, .. } = SparqlParser::new().parse_query(&text).unwrap() else {
+            unreachable!("a SELECT")
+        };
+        let rewritten = super::rewrite(&pattern);
+        assert!(rewritten.depth() < 24, "{} deep", rewritten.depth());
+    }
 }

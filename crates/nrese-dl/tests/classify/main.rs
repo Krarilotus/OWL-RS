@@ -308,7 +308,20 @@ fn taxonomies_equal_brute_force() {
     let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x0020_2610_0534);
     let mut rng = Rng::new(seed);
     let mut tally = Tally::default();
-    for case in 0..cases {
+    let covered = |t: &Tally| {
+        t.compared * 4 >= t.cases * 3
+            && t.with_subsumptions > 0
+            && t.inconsistent > 0
+            && t.candidate_tests > 0
+            && t.exact_classes > 0
+    };
+    // Draw on (up to ten times as many cases) until the run covers what the assertion
+    // below asks for, so that coverage never depends on the seed (the NI fuzz test's
+    // fix, a901e34; seed 66810 of the SPARQL differential tests, 12 October 2026).
+    for case in 0..cases * 10 {
+        if case >= cases && covered(&tally) {
+            break;
+        }
         let (o, _) = signature(case, &mut rng);
         let shuffled = fuzz::shuffle(&o, &mut rng);
         if env("NRESE_FUZZ_ONLY").is_some_and(|only| only != case) {
@@ -430,22 +443,9 @@ fn taxonomies_equal_brute_force() {
         }
     }
     eprintln!("{tally:?} in {:?}", started.elapsed());
-    assert!(
-        tally.compared * 4 >= tally.cases * 3,
-        "too few cases decided: {tally:?}"
-    );
-    assert!(
-        tally.with_subsumptions > 0 && tally.inconsistent > 0,
-        "{tally:?}"
-    );
-    assert!(
-        tally.candidate_tests > 0,
-        "no candidate was ever tested: {tally:?}"
-    );
-    assert!(
-        tally.exact_classes > 0,
-        "no class was ever exact: {tally:?}"
-    );
+    // Three quarters of the cases decided; subsumptions, an inconsistency, a candidate
+    // tested and an exact class seen.
+    assert!(covered(&tally), "{tally:?}");
 }
 
 #[test]
@@ -455,7 +455,14 @@ fn types_equal_brute_force() {
     let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x0020_2610_0535);
     let mut rng = Rng::new(seed);
     let mut tally = Tally::default();
-    for case in 0..cases {
+    let covered = |t: &Tally| t.realised > 0 && t.with_types > 0;
+    // Draw on (up to ten times as many cases) until the run covers what the assertion
+    // below asks for, so that coverage never depends on the seed (the NI fuzz test's
+    // fix, a901e34; seed 66810 of the SPARQL differential tests, 12 October 2026).
+    for case in 0..cases * 10 {
+        if case >= cases && covered(&tally) {
+            break;
+        }
         let (o, _) = signature(case, &mut rng);
         if env("NRESE_FUZZ_ONLY").is_some_and(|only| only != case) {
             continue;
@@ -512,7 +519,7 @@ fn types_equal_brute_force() {
         tally.with_types += u64::from(expected.iter().any(|t| !t.is_empty()));
     }
     eprintln!("{tally:?} in {:?}", started.elapsed());
-    assert!(tally.realised > 0 && tally.with_types > 0, "{tally:?}");
+    assert!(covered(&tally), "{tally:?}");
 }
 
 /// A taxonomy only a test of a candidate shows: `A ⊑ B ⊔ C`, `B ⊑ D`, `C ⊑ D` gives
