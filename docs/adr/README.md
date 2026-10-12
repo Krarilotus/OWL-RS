@@ -15,3 +15,4 @@ One file per decision that is expensive to reverse. Format: context → decision
 | [0009](0009-owl2-dl-reasoning.md) | OWL 2 DL reasoning: one OWL model, hypertableau, consequence-based classification, certain answers with datalog bounds | proposed |
 | [0010](0010-standing-product-decisions.md) | Standing product decisions: reasoning leads, configurable defaults, one execution core, Rust natively, no C/C++ speed dependencies, licence | accepted |
 | [0011](0011-equality-one-contract-three-backends.md) | Equality: one contract (reasons, deltas, owner domains), backends per lifetime (monotone, persistent, rollback) | proposed |
+| [0012](0012-query-depth.md) | Query depth: sequences (UNION, joins, paths, BIND runs) n-ary in the algebra, so no pass recurses in proportion to a query's length; one nesting limit counting the algebra; queries on their caller's stack | proposed |

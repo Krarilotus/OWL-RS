@@ -65,10 +65,10 @@ pub enum Plan {
         name: NamedNodePattern,
         input: Box<Plan>,
     },
+    /// Its bindings in order, each seeing the ones before it.
     Extend {
         input: Box<Plan>,
-        variable: Variable,
-        expression: Expression,
+        bindings: Vec<(Variable, Expression)>,
     },
     Values {
         variables: Vec<Variable>,
@@ -118,7 +118,7 @@ impl Plan {
                 path: path.clone(),
                 object: object.clone(),
             },
-            GraphPattern::Join { left, right } => Self::Join(vec![Self::of(left), Self::of(right)]),
+            GraphPattern::Join { inputs } => Self::Join(inputs.iter().map(Self::of).collect()),
             GraphPattern::LeftJoin {
                 left,
                 right,
@@ -136,9 +136,7 @@ impl Plan {
                 condition: expr.clone(),
                 input: of(inner),
             },
-            GraphPattern::Union { left, right } => {
-                Self::Union(vec![Self::of(left), Self::of(right)])
-            }
+            GraphPattern::Union { inputs } => Self::Union(inputs.iter().map(Self::of).collect()),
             GraphPattern::Minus { left, right } => Self::Minus {
                 left: of(left),
                 right: of(right),
@@ -147,14 +145,9 @@ impl Plan {
                 name: name.clone(),
                 input: of(inner),
             },
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => Self::Extend {
+            GraphPattern::Extend { inner, bindings } => Self::Extend {
                 input: of(inner),
-                variable: variable.clone(),
-                expression: expression.clone(),
+                bindings: bindings.clone(),
             },
             GraphPattern::Values {
                 variables,
@@ -209,7 +202,7 @@ impl Plan {
     }
 
     /// The algebra the executor runs: a join of scans only is a basic graph pattern, a
-    /// join of other inputs nests binary joins from the left, a union likewise.
+    /// join of other inputs one n-ary join, a union likewise (ADR-0012).
     pub fn into_pattern(self) -> GraphPattern {
         #[cfg(test)]
         LOWERED_NODES.with(|count| count.set(count.get() + 1));
@@ -265,7 +258,7 @@ impl Plan {
                     }
                     runs.extend(others);
                 }
-                nested(runs, |left, right| GraphPattern::Join { left, right })
+                n_ary(runs, |inputs| GraphPattern::Join { inputs })
             }
             Self::LeftJoin {
                 left,
@@ -284,9 +277,7 @@ impl Plan {
                 expr: condition,
                 inner: lower(input),
             },
-            Self::Union(inputs) => {
-                nested(inputs, |left, right| GraphPattern::Union { left, right })
-            }
+            Self::Union(inputs) => n_ary(inputs, |inputs| GraphPattern::Union { inputs }),
             Self::Minus { left, right } => GraphPattern::Minus {
                 left: lower(left),
                 right: lower(right),
@@ -295,14 +286,9 @@ impl Plan {
                 name,
                 inner: lower(input),
             },
-            Self::Extend {
-                input,
-                variable,
-                expression,
-            } => GraphPattern::Extend {
+            Self::Extend { input, bindings } => GraphPattern::Extend {
                 inner: lower(input),
-                variable,
-                expression,
+                bindings,
             },
             Self::Values { variables, rows } => GraphPattern::Values {
                 variables,
@@ -353,19 +339,15 @@ impl Plan {
     }
 }
 
-/// `inputs` lowered and combined from the left by `combine`; one input is itself, none an
-/// empty basic graph pattern (the join's identity; an empty union never arises).
-fn nested(
-    inputs: Vec<Plan>,
-    combine: impl Fn(Box<GraphPattern>, Box<GraphPattern>) -> GraphPattern,
-) -> GraphPattern {
-    let mut lowered = inputs.into_iter().map(Plan::into_pattern);
-    let Some(first) = lowered.next() else {
-        return GraphPattern::Bgp {
+/// `inputs` lowered into one n-ary node (ADR-0012); one input is itself, none an empty
+/// basic graph pattern (the join's identity; an empty union never arises).
+fn n_ary(inputs: Vec<Plan>, node: impl Fn(Vec<GraphPattern>) -> GraphPattern) -> GraphPattern {
+    let mut lowered: Vec<GraphPattern> = inputs.into_iter().map(Plan::into_pattern).collect();
+    match lowered.len() {
+        0 => GraphPattern::Bgp {
             patterns: Vec::new(),
-        };
-    };
-    lowered.fold(first, |left, right| {
-        combine(Box::new(left), Box::new(right))
-    })
+        },
+        1 => lowered.pop().expect("one"),
+        _ => node(lowered),
+    }
 }

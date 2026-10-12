@@ -75,16 +75,42 @@ impl<'a> Parser<'a> {
         Ok(pattern)
     }
 
+    /// A group's content (ADR-0012). Its parts are one n-ary join, however many, and BINDs
+    /// in a row one `Extend`. Each OPTIONAL, LATERAL and MINUS, and a BIND after another
+    /// element, wraps everything before it: a level of the algebra, counted as a nesting
+    /// level (as [`Self::additive_expression`] counts its operands), so that a long chain of
+    /// them is refused before the variables before each are checked.
     fn group_graph_pattern_sub(&mut self) -> ParseResult<GraphPattern> {
-        let mut g = if self.at_triples_start() {
-            build_bgp(self.triples_block()?)
-        } else {
-            GraphPattern::default()
-        };
+        let mut levels = 0;
+        let result = self.group_parts(&mut levels);
+        for _ in 0..levels {
+            self.leave();
+        }
+        result
+    }
+
+    fn group_parts(&mut self, levels: &mut usize) -> ParseResult<GraphPattern> {
+        // The parts joined since the last wrapping element.
+        let mut parts: Vec<GraphPattern> = Vec::new();
+        if self.at_triples_start() {
+            parts.extend(bgp_elements(self.triples_block()?));
+        }
+        let mut g = GraphPattern::default();
         // A group's filters, joined by `&&` as a balanced tree (as a chain of `&&` is).
         let mut filters: Vec<Expression> = Vec::new();
         while !matches!(self.peek(), Some(b'}') | None) {
-            match self.graph_pattern_not_triples()? {
+            let element = self.graph_pattern_not_triples()?;
+            if !matches!(element, Element::Filter(_) | Element::Other(_)) {
+                parts.insert(0, take(&mut g));
+                g = GraphPattern::join_all(take(&mut parts));
+                let continued = matches!(element, Element::Bind(..))
+                    && matches!(g, GraphPattern::Extend { .. });
+                if !continued {
+                    self.enter()?;
+                    *levels += 1;
+                }
+            }
+            match element {
                 Element::Optional(p, expression) => {
                     g = GraphPattern::LeftJoin {
                         left: Box::new(g),
@@ -121,14 +147,10 @@ impl<'a> Parser<'a> {
                             "BIND assigns {variable}, which the group already binds"
                         )));
                     }
-                    g = GraphPattern::Extend {
-                        inner: Box::new(g),
-                        variable,
-                        expression,
-                    };
+                    g = take(&mut g).extend(variable, expression);
                 }
                 Element::Filter(expr) => filters.push(expr),
-                Element::Other(p) => g = new_join(g, p),
+                Element::Other(p) => parts.push(p),
             }
             self.eat(".");
             if self.at_triples_start() {
@@ -137,12 +159,12 @@ impl<'a> Parser<'a> {
                 // may span it), also when the block holds paths (found by fuzzing,
                 // `nrese-fuzz`: printed, `Join(g, Join(bgp, path))` became a group of its own,
                 // across which the label was refused).
-                for element in bgp_elements(self.triples_block()?) {
-                    g = new_join(g, element);
-                }
+                parts.extend(bgp_elements(self.triples_block()?));
             }
         }
-        let filter = (!filters.is_empty()).then(|| super::expr::balanced(filters, Expression::And));
+        parts.insert(0, g);
+        let g = GraphPattern::join_all(parts);
+        let filter = Expression::balanced(filters, Expression::And);
         Ok(match filter {
             Some(expr) => GraphPattern::Filter {
                 expr,
@@ -154,14 +176,12 @@ impl<'a> Parser<'a> {
 
     fn graph_pattern_not_triples(&mut self) -> ParseResult<Element> {
         if self.peek() == Some(b'{') {
-            let mut pattern = self.group_graph_pattern()?;
+            // The arms of a UNION: one n-ary node however many there are (ADR-0012).
+            let mut arms = vec![self.group_graph_pattern()?];
             while self.keyword("UNION") {
-                pattern = GraphPattern::Union {
-                    left: Box::new(pattern),
-                    right: Box::new(self.group_graph_pattern()?),
-                };
+                arms.push(self.group_graph_pattern()?);
             }
-            return Ok(Element::Other(pattern));
+            return Ok(Element::Other(GraphPattern::union_all(arms)));
         }
         let word = self.peek_word();
         let element = match word.to_ascii_uppercase().as_str() {
@@ -714,29 +734,31 @@ impl<'a> Parser<'a> {
                 },
                 out,
             ),
-            PropertyPathExpression::Sequence(a, b) => {
+            PropertyPathExpression::Sequence(steps) => {
                 if !object.reifiers.is_empty() {
                     return Err(self.error("a path of several steps can't be reified"));
                 }
-                let middle = TermPattern::from(self.fresh_blank_node());
-                self.add_path(
-                    subject,
-                    *a,
-                    ReifiedTerm {
-                        term: middle.clone(),
-                        reifiers: Vec::new(),
-                    },
-                    out,
-                )?;
-                self.add_path(
-                    middle,
-                    *b,
-                    ReifiedTerm {
-                        term: object.term,
-                        reifiers: Vec::new(),
-                    },
-                    out,
-                )
+                // Step by step, a fresh blank node between two: a loop, however long.
+                let last = steps.len().saturating_sub(1);
+                let mut from = subject;
+                let mut end = Some(object.term);
+                for (i, step) in steps.into_iter().enumerate() {
+                    let to = match i == last {
+                        true => end.take().expect("the last step ends at the object"),
+                        false => TermPattern::from(self.fresh_blank_node()),
+                    };
+                    self.add_path(
+                        from,
+                        step,
+                        ReifiedTerm {
+                            term: to.clone(),
+                            reifiers: Vec::new(),
+                        },
+                        out,
+                    )?;
+                    from = to;
+                }
+                Ok(())
             }
             path => {
                 if !object.reifiers.is_empty() {
@@ -756,25 +778,19 @@ impl<'a> Parser<'a> {
 
     /// `Path`: alternatives of sequences.
     fn path(&mut self) -> ParseResult<PropertyPathExpression> {
-        let mut path = self.path_sequence()?;
+        let mut alternatives = vec![self.path_sequence()?];
         while self.eat("|") {
-            path = PropertyPathExpression::Alternative(
-                Box::new(path),
-                Box::new(self.path_sequence()?),
-            );
+            alternatives.push(self.path_sequence()?);
         }
-        Ok(path)
+        Ok(PropertyPathExpression::alternative(alternatives))
     }
 
     fn path_sequence(&mut self) -> ParseResult<PropertyPathExpression> {
-        let mut path = self.path_elt_or_inverse()?;
+        let mut steps = vec![self.path_elt_or_inverse()?];
         while self.eat("/") {
-            path = PropertyPathExpression::Sequence(
-                Box::new(path),
-                Box::new(self.path_elt_or_inverse()?),
-            );
+            steps.push(self.path_elt_or_inverse()?);
         }
-        Ok(path)
+        Ok(PropertyPathExpression::sequence(steps))
     }
 
     fn path_elt_or_inverse(&mut self) -> ParseResult<PropertyPathExpression> {
@@ -855,10 +871,10 @@ impl<'a> Parser<'a> {
         } else if forward.is_empty() {
             reverse(inverse)
         } else {
-            PropertyPathExpression::Alternative(
-                Box::new(PropertyPathExpression::NegatedPropertySet(forward)),
-                Box::new(reverse(inverse)),
-            )
+            PropertyPathExpression::Alternative(vec![
+                PropertyPathExpression::NegatedPropertySet(forward),
+                reverse(inverse),
+            ])
         })
     }
 
@@ -984,14 +1000,6 @@ fn add_triple(
     out.push(TripleOrPath::Triple(triple));
 }
 
-/// The triples of a block as a basic graph pattern, paths joined in between.
-pub(super) fn build_bgp(patterns: Vec<TripleOrPath>) -> GraphPattern {
-    bgp_elements(patterns)
-        .into_iter()
-        .reduce(new_join)
-        .unwrap_or_default()
-}
-
 /// A triples block's basic graph patterns and paths, in order.
 fn bgp_elements(patterns: Vec<TripleOrPath>) -> Vec<GraphPattern> {
     let mut bgp = Vec::new();
@@ -1023,23 +1031,10 @@ fn bgp_elements(patterns: Vec<TripleOrPath>) -> Vec<GraphPattern> {
     elements
 }
 
-/// `Join`, dropping empty basic graph patterns and merging adjacent ones.
+/// `Join`, dropping empty basic graph patterns and merging adjacent ones
+/// ([`GraphPattern::join_all`]).
 pub(super) fn new_join(left: GraphPattern, right: GraphPattern) -> GraphPattern {
-    match (left, right) {
-        (GraphPattern::Bgp { patterns }, other) | (other, GraphPattern::Bgp { patterns })
-            if patterns.is_empty() =>
-        {
-            other
-        }
-        (GraphPattern::Bgp { patterns: mut left }, GraphPattern::Bgp { patterns: right }) => {
-            left.extend(right);
-            GraphPattern::Bgp { patterns: left }
-        }
-        (left, right) => GraphPattern::Join {
-            left: Box::new(left),
-            right: Box::new(right),
-        },
-    }
+    GraphPattern::join_all(vec![left, right])
 }
 
 /// The variables a pattern assigns with `AS`, `BIND` or `VALUES` (what `LATERAL` may not
@@ -1047,18 +1042,19 @@ pub(super) fn new_join(left: GraphPattern, right: GraphPattern) -> GraphPattern 
 fn defined_variables<'p>(pattern: &'p GraphPattern, set: &mut HashSet<&'p Variable>) {
     match pattern {
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } => {}
-        GraphPattern::Join { left, right }
-        | GraphPattern::LeftJoin { left, right, .. }
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            for input in inputs {
+                defined_variables(input, set);
+            }
+        }
+        GraphPattern::LeftJoin { left, right, .. }
         | GraphPattern::Lateral { left, right }
-        | GraphPattern::Union { left, right }
         | GraphPattern::Minus { left, right } => {
             defined_variables(left, set);
             defined_variables(right, set);
         }
-        GraphPattern::Extend {
-            inner, variable, ..
-        } => {
-            set.insert(variable);
+        GraphPattern::Extend { inner, bindings } => {
+            set.extend(bindings.iter().map(|(variable, _)| variable));
             defined_variables(inner, set);
         }
         GraphPattern::Group {

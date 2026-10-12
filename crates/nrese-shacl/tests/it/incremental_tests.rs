@@ -91,7 +91,14 @@ fn keys(report: &ValidationReport) -> BTreeSet<String> {
 fn incremental_validation_equals_the_difference_of_full_validations() {
     let mut rng = Rng(fuzz(20_261_002));
     let mut checked = 0;
-    for round in 0..200 {
+    let covered = |checked: usize| checked > 20;
+    // Draw on (up to ten times as many cases) until the run covers what the assertion
+    // below asks for, so that coverage never depends on the seed (the NI fuzz test's
+    // fix, a901e34; seed 66810 of the SPARQL differential tests, 12 October 2026).
+    for round in 0..200 * 10 {
+        if round >= 200 && covered(checked) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         let shapes_graph = ex("shapes");
@@ -152,5 +159,5 @@ fn incremental_validation_equals_the_difference_of_full_validations() {
         );
         checked += usize::from(!expected.is_empty());
     }
-    assert!(checked > 20, "only {checked} rounds introduced results");
+    assert!(covered(checked), "only {checked} rounds introduced results");
 }

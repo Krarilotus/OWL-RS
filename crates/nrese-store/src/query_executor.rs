@@ -610,8 +610,9 @@ pub(crate) fn plan_prepared(
     view: &impl ReadView,
     prepared: &PreparedQuery,
     store: &StoreSettings,
+    cancellation: &CancellationToken,
 ) -> StoreResult<PlannedQuery> {
-    let options = query_options(prepared, store, &CancellationToken::new());
+    let options = query_options(prepared, store, cancellation);
     Ok(plan_query(view, &prepared.query, &options)?)
 }
 

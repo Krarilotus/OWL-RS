@@ -106,28 +106,6 @@ fn is_special_builtin(word: &str) -> bool {
     )
 }
 
-/// `operands` joined by an associative operator (`||`, `&&`: associative in SPARQL's
-/// logic of true, false and error) as a balanced tree: a chain of n operands is log n deep,
-/// not n, since evaluating, printing and dropping an expression recurse on its depth. Two
-/// and three operands give the left-deep tree of the grammar.
-pub(super) fn balanced(
-    mut operands: Vec<Expression>,
-    join: fn(Box<Expression>, Box<Expression>) -> Expression,
-) -> Expression {
-    while operands.len() > 1 {
-        let mut next = Vec::with_capacity(operands.len().div_ceil(2));
-        let mut pairs = operands.into_iter();
-        while let Some(a) = pairs.next() {
-            next.push(match pairs.next() {
-                Some(b) => join(Box::new(a), Box::new(b)),
-                None => a,
-            });
-        }
-        operands = next;
-    }
-    operands.pop().expect("an expression has an operand")
-}
-
 impl<'a> Parser<'a> {
     pub(super) fn expression(&mut self) -> ParseResult<Expression> {
         self.enter()?;
@@ -136,7 +114,7 @@ impl<'a> Parser<'a> {
             operands.push(self.and_expression()?);
         }
         self.leave();
-        Ok(balanced(operands, Expression::Or))
+        Ok(Expression::balanced(operands, Expression::Or).expect("an operand"))
     }
 
     fn and_expression(&mut self) -> ParseResult<Expression> {
@@ -144,7 +122,7 @@ impl<'a> Parser<'a> {
         while self.eat("&&") {
             operands.push(self.relational_expression()?);
         }
-        Ok(balanced(operands, Expression::And))
+        Ok(Expression::balanced(operands, Expression::And).expect("an operand"))
     }
 
     fn relational_expression(&mut self) -> ParseResult<Expression> {
