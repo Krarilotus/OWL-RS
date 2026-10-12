@@ -80,8 +80,11 @@ This section owns the execution policy; there is no setting for it besides `dl.t
   allocation ceiling: decoded graph payloads, encoder buffers, DL compilation scratch and
   runtime overhead have their own lifetimes, and DL task capacity is separate from the
   query budget. Rule materialisation, bulk spill and background storage keep their own
-  execution owners. Cache waits and their progress are discussed in
-  [research-designs.md §8](research-designs.md#8-query-progress-under-shared-cache-waits-proposal).
+  execution owners.
+- **A Rayon worker never waits on a cache flight.** A part another query computes is
+  waited for only off the pool; a request on a worker computes it itself, so no wait can
+  hold a stack its producer needs ([research-designs.md
+  §8](research-designs.md#8-query-progress-under-shared-cache-waits-decided-the-bounded-rule)).
 
 SPARQL's [`SolutionTable`](../../crates/nrese-sparql/src/native/typed_results.rs) retains
 its snapshot, computed terms and capacity reservations. Alignment rejects unrelated

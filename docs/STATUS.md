@@ -22,7 +22,7 @@ each with its run record.
 |---|---|---|
 | QL preparation and cache identity | One preparation per execution snapshot, its report kept with the result; compiler input identified by the exact schema; failed probes never cached as negative answers | Schema reading and rewriting don't poll cancellation |
 | Cancellation and deadlines | A request's flag reaches nested DL work; one absolute deadline covers pending and prior consistency checks and rejection evidence | Normalisation and compilation don't poll |
-| Execution | Queries run on their caller; parallel kernels on Rayon's global pool; one catalog-wide native query budget; `Workers` sets only the DL batch width; one RAII reservation type | Query progress when a Rayon worker would wait on a cache flight ([proposal](design/research-designs.md#8-query-progress-under-shared-cache-waits-proposal)) |
+| Execution | Queries run on their caller; parallel kernels on Rayon's global pool; one catalog-wide native query budget; `Workers` sets only the DL batch width; one RAII reservation type; a Rayon worker never waits on a cache flight, it computes the part itself (the bounded rule, [decided](design/research-designs.md#8-query-progress-under-shared-cache-waits-decided-the-bounded-rule) 12 October) | The continuation design, only if embedding needs it |
 | Context task memory | Optional owner-based capacity estimates sampled at work checkpoints, incremental index totals, message payloads that carry their charge; `dl.memory = 0` is unlimited | Can overshoot; excluded allocations; no whole-operation envelope |
 | Atomic reasoning updates | Split and revival closure run in the pending transaction and its gates; the post-commit repair is gone | The whole-dataset fallback holds the writer slot (unmeasured; `eq-giant-split` times it); incremental split maintenance |
 | Kernels and allocation | Moving projection, shared forward search, direct raw spill, ordered dedup without a sort; one SPARQL numeric implementation | Work and copy savings carry no end-to-end timing claim |
@@ -42,7 +42,6 @@ each with its run record.
   historical peaks and sticky exhaustion need an API contract first.
 - **Memory envelope:** DL compilation scratch, task budgets and the query budget are
   separate; one request has no shared end-to-end envelope.
-- **Query progress:** see the proposal above; a decision is needed.
 - **Vector search:** approximate recall under a filter fails its gate (0.40 at k = 10);
   candidate-first routing finds the missing hits, its cost unqualified.
 - **Competitor answers:** rerun with the committed recorder to decide the unordered
