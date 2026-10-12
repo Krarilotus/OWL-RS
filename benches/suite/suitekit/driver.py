@@ -33,7 +33,7 @@ from .answers import Recorder, capped_post
 from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime, RootfsRuntime,
                       run_quiet, shell)
 from .manifest import Manifest, image_ids
-from .schema import Result, Writer
+from .schema import FIELDS, Result, Writer, problems, read
 from .summary import adjudications
 from .workloads import plans
 
@@ -610,6 +610,38 @@ class Suite:
         self.emit(base, task="conformance", item=plan.workload, status="ok" if rc == 0 else "failed",
                   ms=(time.monotonic() - started) * 1000, note=f"log: {log.relative_to(self.results)}")
 
+    def driver(self, plan, keys: list[str]):
+        """A kit's own driver (Plan.driver) for `keys` on one tier: its steps in order, then
+        every results.csv they wrote below {results} into the run's results.csv."""
+        out = self.results / "driver" / slug(f"{plan.workload}-{plan.tier}")
+        logs = self.results / "logs" / slug(f"{self.stamp}-driver-{plan.workload}-{plan.tier}")
+        values = {"results": str(out), "systems": ",".join(keys), "tier": plan.tier, "runs": str(self.args.runs)}
+        self.say(f"\n{','.join(keys)} / {plan.workload} {plan.tier}: the kit's driver")
+        failed = None
+        for n, step in enumerate(plan.driver, start=1):
+            rc = self.host_command([part.format(**values) for part in step], logs / f"step-{n}.txt")
+            if rc != 0:
+                failed = f"step {n} exit {rc}: log {(logs / f'step-{n}.txt').relative_to(self.results)}"
+                break
+        if self.args.dry_run:
+            return
+        imported = 0
+        for path in sorted(out.rglob("results.csv")) if out.exists() else []:
+            for row in read(path):
+                result = Result(**{k: row.get(k, "") for k in FIELDS})
+                if problems(result):
+                    self.say(f"    {path}: a row the schema refuses ({'; '.join(problems(result))}): left out")
+                    continue
+                self.writer.write(result)
+                self.written.append(result)
+                imported += 1
+        if failed or not imported:
+            for key in keys:
+                base = dict(date=self.date, host=self.host, runtime="process", system=key, version="-",
+                            publish=self.publish(key), workload=plan.workload, tier=plan.tier, regime="custom", run=1)
+                self.emit(base, task="conformance", item=plan.workload, status="failed",
+                          note=failed or "the kit's driver wrote no rows")
+
     def skip(self, key: str, plan, reason: str, regime: str = "-", unsupported: bool = True):
         """A pair that doesn't run: `unsupported` when the system can't run it, else (a missing
         input) incomplete, for the answers as for the row."""
@@ -654,7 +686,7 @@ class Suite:
                     if missing:
                         self.skip(key, plan, f"lacks {missing}")
                         continue
-                    if plan.kind == "kit":
+                    if plan.kind in ("kit", "driver"):
                         chosen.append((plan, key, None, "-"))
                         continue
                     system = adapter(key)
@@ -719,14 +751,18 @@ class Suite:
             groups.setdefault(id(entry[0]), []).append(entry)
         for group in groups.values():
             plan = group[0][0]
-            runnable = []
+            runnable, drivers = [], []
             for _, key, system, regime in group:
                 if unavailable.get(id(plan)):
                     self.skip(key, plan, unavailable[id(plan)], regime, unsupported=False)
                 elif plan.kind == "kit":
                     self.kit(plan, key)
+                elif plan.kind == "driver":
+                    drivers.append(key)
                 else:
                     runnable.append((key, system, regime))
+            if drivers:
+                self.driver(plan, drivers)
             for run in range(1, self.args.runs + 1):
                 shift = (run - 1) % max(1, len(runnable))
                 for key, system, regime in runnable[shift:] + runnable[:shift]:
