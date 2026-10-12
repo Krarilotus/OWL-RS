@@ -322,6 +322,13 @@ impl StoreService {
         Ok(rematerialisation.finish(Vec::new())?.inferred_deleted)
     }
 
+    /// Waits until the engine's background maintenance has nothing requested or running
+    /// ([`Engine::settle`]): for measurements of what the store holds.
+    #[doc(hidden)]
+    pub fn settle(&self) {
+        self.engine.settle();
+    }
+
     pub(crate) fn engine(&self) -> &Engine {
         &self.engine
     }
