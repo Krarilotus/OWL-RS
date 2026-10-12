@@ -435,7 +435,11 @@ class Qlever(Adapter):
             extra += " -s /index/settings.json"
         if ctx.setting("QLEVER_VOCABULARY_TYPE"):
             extra += " --vocabulary-type " + ctx.setting("QLEVER_VOCABULARY_TYPE")
-        # One input stream: the Turtle files concatenated are one Turtle document.
+        # The open-files limit raised as qlever-control's `qlever index` raises it for inputs
+        # past 10 GB (ulimit -Sn 500000): the index builder writes a partial vocabulary per
+        # batch, past the default 1024 (DBLP: 592 batches). One input stream: the Turtle files
+        # concatenated are one Turtle document.
+        prefix = 'ulimit -Sn 500000 2>/dev/null || ulimit -Sn "$(ulimit -Hn)"; ' + prefix
         script = (prefix + 'cat "$@" | /qlever/qlever-index -i /index/idx -f /dev/stdin -F ' + fmt +
                   ' -p true --stxxl-memory ' + ctx.setting("QLEVER_SORT_MEMORY", "8G") + extra)
         spec = Spec(ctx.name("load"), self.images(ctx)[0], ["sh", "-c", script, "sh", *inputs], env,
