@@ -40,6 +40,13 @@ step() {
   echo "=== $name: exit $code"
 }
 nextest() { cargo nextest --version > /dev/null 2>&1; }
+# Python under either name: Windows has `python`, some Linux hosts only `python3`. A missing
+# interpreter fails the gate; it must never shrink the gate to nothing.
+python() {
+  if command -v python > /dev/null 2>&1; then command python "$@"
+  elif command -v python3 > /dev/null 2>&1; then command python3 "$@"
+  else echo "the gate needs python (or python3)" >&2; return 127; fi
+}
 
 # The workspace crates (directories with a Cargo.toml under crates/) that `files` touch.
 crates_of() {
@@ -96,7 +103,8 @@ run_tests() {
     for arg in "${fast_only[@]}"; do fast[$arg]=1; done
     for arg in "${all[@]}"; do
       if [ -n "${fast[$arg]:-}" ]; then
-        line=$(python scripts/lib/test-targets.py fast "$arg" | tr -d '\r')
+        line=$(python scripts/lib/test-targets.py fast "$arg") || return 2
+        line=$(printf '%s' "$line" | tr -d '\r')
         [ -n "$line" ] || continue
         # shellcheck disable=SC2086
         "$guarded" test --locked --no-fail-fast $line || code=$?
@@ -251,6 +259,7 @@ case "$mode" in
     mapfile -t everything < <(cargo metadata --no-deps --format-version 1 --offline \
       | python -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))" \
       | tr -d '\r')
+    [ ${#everything[@]} -gt 0 ] || { echo "no workspace packages found" >&2; exit 2; }
     step test run_tests "${everything[@]}"
     step "doc tests" "$guarded" test --locked --workspace --doc
     harness
