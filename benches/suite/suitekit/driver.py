@@ -30,7 +30,7 @@ from pathlib import Path
 from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all, post
 from . import hosts
 from .answers import Recorder
-from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime,
+from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime, RootfsRuntime,
                       run_quiet, shell)
 from .manifest import Manifest, image_ids
 from .schema import Result, Writer
@@ -63,7 +63,8 @@ def arguments(argv: list[str]) -> argparse.Namespace:
                    help="the shuffle seed; repetition r uses seed*1000+r, the same for every system")
     p.add_argument("--timeout-s", type=int, default=3600, help="per load (default 3600)")
     p.add_argument("--query-timeout-s", type=int, default=300, help="per query run (default 300)")
-    p.add_argument("--runtime", choices=["docker", "apptainer", "process"], default="docker")
+    p.add_argument("--runtime", choices=["docker", "apptainer", "rootfs", "process"], default="docker")
+    p.add_argument("--rootfs-dir", help="rootfs: the images unpacked for bubblewrap (benches/sparql/images.sh export)")
     p.add_argument("--sif-dir", help="Apptainer: the directory of the SIF images")
     p.add_argument("--data", help="the datasets: a directory, or volume:NAME with Docker (default volume:nrese-bench-data)")
     p.add_argument("--results", help="the result directory (default benches/suite/results/<date>)")
@@ -144,6 +145,10 @@ class Suite:
             if not args.sif_dir:
                 sys.exit("--runtime apptainer needs --sif-dir")
             runtime = ApptainerRuntime(self.scratch, args.port, Path(args.sif_dir).resolve())
+        elif args.runtime == "rootfs":
+            if not args.rootfs_dir:
+                sys.exit("--runtime rootfs needs --rootfs-dir")
+            runtime = RootfsRuntime(self.scratch, args.port, Path(args.rootfs_dir).resolve())
         else:
             runtime = ProcessRuntime(self.scratch, args.port)
         self.runtime = DryRuntime(runtime) if args.dry_run else runtime
@@ -337,10 +342,12 @@ class Suite:
         return f"preparing the inputs failed; see {log}" if rc != 0 or still else None
 
     def sif_missing(self, system, ctx: Context) -> str | None:
-        if self.args.runtime != "apptainer":
+        if self.args.runtime not in ("apptainer", "rootfs"):
             return None
         images = system.images(ctx) + [image for image, _ in system.builds()]
         missing = [i for i in images if not self.runtime.image_present(i)]
+        if missing and self.args.runtime == "rootfs":
+            return f"no unpacked image for {', '.join(missing)} in --rootfs-dir (benches/sparql/images.sh export)"
         if missing:
             return f"no SIF image for {', '.join(missing)} in --sif-dir (benches/cluster/build-sif.sh)"
         return None
