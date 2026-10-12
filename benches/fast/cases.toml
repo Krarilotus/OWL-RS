@@ -1529,3 +1529,59 @@ route = { "commits.error" = "has hypertableau" }
 cap_gb = 4
 systems = []
 guards = ["DL in the store: a commit's consistency proved by U1, a clash sent to a DL engine"]
+
+# --- the perf lab's datasets (formerly benches/perf-lab.sh): the store and query engine on
+# real data, each query's row count pinned from the perf-lab records of 27 Sep 2026
+# (benches/baselines/perf-lab/, the same in every build there)
+
+[[case]]
+name = "lab-olympics"
+area = "query"
+what = "the Olympics dataset (1.8 M triples) loaded in memory, its 13 queries of the basics mix: lookups, stars, aggregates, text, a hierarchy, negation"
+semantics = "none"
+data = "volume:olympics.nt"
+queries = "@olympics"
+metric = "sum_p50_ms"
+check = { "q.q01-point-lookup.rows" = 5, "q.q02-star-team.rows" = 7155, "q.q03-gold-by-team.rows" = 20, "q.q04-top-medallists.rows" = 10, "q.q05-numeric-range.rows" = 1527, "q.q06-text-filter.rows" = 1033, "q.q07-games-by-year.rows" = 51, "q.q08-event-hierarchy.rows" = 765, "q.q09-no-medal.rows" = 1, "q.q10-ask.rows" = 1, "q.q11-count-all.rows" = 1, "q.q12-all-labels.rows" = 137026, "q.q13-avg-age-by-games.rows" = 51 }
+route = {}
+cap_gb = 4
+systems = []
+
+[[case]]
+name = "lab-yago-tiny"
+area = "query"
+what = "YAGO tiny (23 M triples) in memory, its 10 queries: lookups, paths through the taxonomy, counts, all English labels"
+semantics = "none"
+data = "volume:yago-tiny.nt"
+queries = "@yago-tiny"
+metric = "sum_p50_ms"
+check = { "q.q01-label-lookup.rows" = 0, "q.q02-persons-born.rows" = 21, "q.q03-taxon-path.rows" = 1, "q.q04-movie-actors.rows" = 203, "q.q05-population.rows" = 20, "q.q06-alt-names.rows" = 564, "q.q07-class-count.rows" = 20, "q.q08-subclass-path.rows" = 1, "q.q09-count-all.rows" = 1, "q.q10-labels-en.rows" = 407456 }
+route = {}
+cap_gb = 12
+systems = []
+
+[[case]]
+name = "lab-dbpedia-core"
+area = "query"
+what = "DBpedia core (67 M triples) in memory, its 13 queries: lookups, joins, date ranges, a property path, an optional over 100,000 rows, counts"
+semantics = "none"
+data = "volume:dbpedia-core.nt"
+queries = "@dbpedia-core"
+metric = "sum_p50_ms"
+check = { "q.q01-point-lookup.rows" = 31, "q.q02-born-in-berlin.rows" = 2126, "q.q03-top-birthplaces.rows" = 20, "q.q04-date-range.rows" = 1, "q.q05-population.rows" = 50, "q.q06-film-cast.rows" = 1587, "q.q07-subdivision-path.rows" = 21, "q.q08-label-text.rows" = 445, "q.q09-optional-death.rows" = 100000, "q.q10-types-count.rows" = 25, "q.q11-count-all.rows" = 1, "q.q12-goals-per-team.rows" = 20, "q.q13-no-death.rows" = 1 }
+route = {}
+cap_gb = 20
+systems = []
+
+[[case]]
+name = "lab-entities-10m"
+area = "query"
+what = "10 M generated entity statements in memory, 9 queries: lookups, a two-hop join, counts, a date range, a group, label prefixes, a 100,000-row scan"
+semantics = "none"
+data = "volume:entities-10000000.nt"
+queries = "@entities"
+metric = "sum_p50_ms"
+check = { "q.q01-point-lookup.rows" = 4, "q.q02-two-hop.rows" = 1, "q.q03-count-type.rows" = 1, "q.q04-date-range.rows" = 1, "q.q05-group-born.rows" = 10, "q.q06-label-prefix.rows" = 11, "q.q07-inbound.rows" = 1, "q.q08-count-all.rows" = 1, "q.q09-labels-limit.rows" = 100000 }
+route = {}
+cap_gb = 6
+systems = []
