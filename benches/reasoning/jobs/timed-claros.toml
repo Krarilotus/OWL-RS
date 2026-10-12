@@ -5,12 +5,16 @@ checkout = "suite/reasoning"
 workload = "claros"
 window = "quiet"
 priority = 2
-est_min = 240
+est_min = 300
 needs = ["docker"]
 env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server", NRESE_VERSION = "16c3bfb", DOCKER_MEMORY = "28g" }
-# Claros-L three times; then Claros-LE once with its own qualification (about 549 M facts:
-# a frontier on a 31 GiB host; a step past its 2 h limit is a timeout, never a time).
+# RDFox's home turf in the setups its papers report (benches/reasoning/reported):
+# - one thread for every engine, as GLog's VLDB 2021 Table 4 ran RDFox, VLog and GLog, and
+#   the 1-thread column of Motik et al., AAAI 2014 (VLog, GLog and Nemo use one thread by
+#   design; Soufflé -j 1);
+# - NRESE at 2, 8, 16 and 32 CPUs, the 2014 paper's thread counts on the same topology
+#   (16 cores, 32 hardware threads).
 commands = [
-  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --runs 3 --threads 4 --timeout-s 7200 --cases claros-l --qualified /home/krarilotus/owlrs/results/reasoning-qualify-claros/qualify/qualified.json --results \"$QUEUE_RESULTS\""],
-  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --qualify --runs 1 --threads 4 --timeout-s 7200 --cases claros-le --results \"$QUEUE_RESULTS/claros-le\" || true"],
+  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --runs 3 --threads 1 --timeout-s 7200 --cases claros-l --qualified /home/krarilotus/owlrs/results/reasoning-qualify-claros/qualify/qualified.json --results \"$QUEUE_RESULTS/threads-1\""],
+  ["sh", "-c", "for t in 2 8 16 32; do python3 benches/reasoning/datalog/datalog.py run --systems nrese --runs 3 --threads $t --timeout-s 7200 --cases claros-l --qualified /home/krarilotus/owlrs/results/reasoning-qualify-claros/qualify/qualified.json --results \"$QUEUE_RESULTS/threads-$t\" || exit 1; done"],
 ]

@@ -23,8 +23,9 @@ python benches/suite/queue.py submit benches/reasoning/jobs/qualify-lubm-rdfox.t
   product `GRAPHDB_LITE`, valid, no expiry, at most 1 CPU core and 5 repositories, two
   concurrent queries). Its comparisons are the matched one-CPU scenario of
   [../../competitors/README.md](../../competitors/README.md); NRESE's own capacity is a line of
-  its own. Results of GraphDB and RDFox stay on the host (`publish = permission`).
-- **RDFox** has no licence: its pairs are skipped rows that name the missing licence, so the
-  same jobs run it the day `RDFox.lic` is in the licences directory.
+  its own. Results of GraphDB stay on the host (`publish = permission`).
+- **RDFox** runs nowhere: its evaluation licence was refused (owner, 12 Oct 2026). Its home
+  turf is NRESE against VLog and GLog on RDFox's own programs, at the setups RDFox's papers
+  report, beside the papers' numbers as reported rows ([../reported](../reported/README.md)).
 - **`profile-cspa`** (Phuoc-Yu, where profiling is allowed): perf over NRESE's CSPA
   materialisation, the attribution of its loss to Soufflé.
