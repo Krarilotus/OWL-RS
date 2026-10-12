@@ -1,0 +1,78 @@
+# The order the benchmark families are measured in (the owner, 12 Oct 2026): what completes
+# the suite this week first, in this order; then the backlog; last the families not
+# expected to give data for polishing or optimisation. Every workload of workloads.toml is
+# in exactly one list, and so is every catalogued benchmark without a workload yet
+# (`catalogue`), so that nothing gets lost (suite.py --check). The measurement queue starts
+# jobs in this order (suite/queue.py: a job's workload, or its cases' workload), and
+# benches/STATUS.md shows it.
+
+now = [
+  # SPARQL
+  "sparqloscope",     # QLever's home turf
+  "bsbm",             # multi-client: Virtuoso's
+  "watdiv",
+  "gcare",
+  # reasoning
+  "owl2bench",        # the QL rerun first
+  "lubm",
+  "claros",           # RDFox's
+  "sspe",             # RDFox's
+  "ldbc-spb",         # GraphDB's
+  "datalog-graphs",   # TC, SG, CSPA: Nemo's, VLog's, Soufflé's
+  "commit-latency",   # under readers
+  # DL
+  "ore-2015",         # in full
+  "elk-ontologies",   # ELK on GO, ChEBI, NCIt, GALEN
+  "pagoda-suite",
+  # breadth
+  "vector-recall",    # filtered
+  "ann-benchmarks",
+  "geographica2",
+  "era-shacl",
+  # the fast cases on their comparators: the answer qualification
+  "fast",
+]
+
+backlog = [
+  "lubm-materialised",
+  "owl2bench-classify",
+  "real-ontologies",
+  "consistency",
+  "integration-rg-gs-gnd",
+  "fulltext-search",
+  "federation",
+  "write-scaling",
+  "basics-mix",
+  "wdbench",
+  "sp2bench",
+  "npd",
+  "lubm-exists",
+  "starbench",
+  "fedshop",
+  "beir",
+  "vibe",
+  "soak",
+  "larger-than-memory",
+]
+
+last = [
+  "w3c-owl2-rl",
+  "w3c-owl2-dl",
+  "w3c-sparql11",
+  "w3c-shacl",
+  "geosparql",
+  "clients",
+]
+
+# Benchmarks of benches/CATALOG.md without a workload entry yet: the section that describes each.
+[catalogue]
+wdbench = "3.2: WDBench, Wikidata's query log (MillenniumDB's home turf)"
+sp2bench = "3.2: SP2Bench, DBLP-shaped data and 17 queries"
+npd = "3.6: NPD, OBDA over the Norwegian Petroleum Directorate (Ontop's home turf)"
+lubm-exists = "3.6: LUBM∃, LUBM with existential rules (Ontop, Stardog, PAGOdA)"
+starbench = "3.10: StarBench, RDF-star queries"
+fedshop = "3.11: FedShop, federated queries over many shops"
+beir = "3.9: BEIR, retrieval quality and time"
+vibe = "3.13: VIBE, vector index benchmark"
+soak = "3.16: soak, hours of mixed load"
+larger-than-memory = "3.17: larger than memory, store sizes past the RAM"

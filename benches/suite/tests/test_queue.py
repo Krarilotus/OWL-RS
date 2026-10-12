@@ -109,5 +109,18 @@ class Running(unittest.TestCase):
         self.assertEqual(self.q.run(self.q.directory / "pending" / "j.toml", again, self.retreat), "failed")
 
 
+class Order(unittest.TestCase):
+    def test_jobs_run_in_the_schedules_order_then_priority(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            q = queue.Queue(Path(tmp) / "q", Path(tmp), Path(tmp), Path(tmp))
+            for name, fields in (("a", {"workload": "w3c-shacl", "priority": 1}), ("b", {"workload": "bsbm"}),
+                                 ("c", {"workload": "sparqloscope", "priority": 7}),
+                                 ("d", {"commands": [["python3", "benches/fast/fast.py", "compete", "--cases", "q-star"]]}),
+                                 ("e", {"workload": "something-new"})):
+                (q.directory / "pending" / f"{name}.toml").write_text(
+                    queue.toml({"id": name, "commands": [["true"]], **fields}), encoding="utf-8")
+            self.assertEqual([j["id"] for _, j in q.jobs("pending")], ["c", "b", "d", "e", "a"])
+
+
 if __name__ == "__main__":
     unittest.main()

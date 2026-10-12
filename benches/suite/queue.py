@@ -18,7 +18,8 @@ A job (TOML):
     env = { DOCKER_CPUS = "8", FAST_MAX_GB = "24" }   # a matched scenario's limits, the binaries
     needs = ["docker"]                  # what the host must have
     window = "quiet"                    # quiet: only when the host is free for timings; any: also else
-    priority = 5                        # lower first; then the order of submission
+    workload = "bsbm"                   # its family: its place in suite/schedule.toml orders the queue
+    priority = 5                        # within a family, lower first; then the order of submission
     est_min = 90
 
 `work` runs on the host (not as suite.py: the office PC's guard stops suite.py and fast.py
@@ -46,7 +47,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from suitekit import hosts  # noqa: E402
+from suitekit import hosts, schedule  # noqa: E402
 
 STATES = ("pending", "running", "done", "failed")
 MAX_ATTEMPTS = 3
@@ -63,6 +64,23 @@ def read_job(path: Path) -> dict:
 def toml(job: dict) -> str:
     from suitekit.ledger import toml_value
     return "".join(f"{k} = {toml_value(v)}\n" for k, v in job.items())
+
+
+def workload_of(job: dict) -> str | None:
+    """The benchmark family a job measures: its `workload`, else its cases' (benches/cases/),
+    else `fast` for a fast-suite command."""
+    if job.get("workload"):
+        return job["workload"]
+    for command in job.get("commands", []):
+        if "--cases" in command and command.index("--cases") + 1 < len(command):
+            from suitekit import cases
+            names = set(command[command.index("--cases") + 1].split(","))
+            found = {c.get("workload") for c in cases.load() if c["name"] in names} - {None}
+            if found:
+                return min(found, key=schedule.rank)
+        if any(part.endswith("fast/fast.py") for part in command):
+            return "fast"
+    return None
 
 
 def job_problems(job: dict, registry: dict | None = None) -> list[str]:
@@ -139,8 +157,11 @@ class Queue:
             (directory / state).mkdir(parents=True, exist_ok=True)
 
     def jobs(self, state: str) -> list[tuple[Path, dict]]:
+        """A state's jobs in the order they run: by their family's place in the schedule
+        (schedule.toml), then priority, then submission."""
         found = [(p, read_job(p)) for p in (self.directory / state).glob("*.toml")]
-        return sorted(found, key=lambda pj: (pj[1].get("priority", 5), pj[1].get("submitted", ""), pj[0].name))
+        return sorted(found, key=lambda pj: (schedule.rank(workload_of(pj[1])), pj[1].get("priority", 5),
+                                             pj[1].get("submitted", ""), pj[0].name))
 
     def next(self, queue: dict, now: datetime.datetime, busy=compilers) -> tuple[Path, dict] | tuple[None, str]:
         why = []
@@ -255,6 +276,7 @@ def submit(args) -> int:
         print(f"push failed: {pushed.stderr.strip()}", file=sys.stderr)
         return 2
     job["submitted"] = datetime.datetime.now().isoformat(timespec="seconds")
+    job.setdefault("workload", workload_of(job) or "")
     job["source"] = subprocess.run(["git", "rev-parse", job["checkout"]], capture_output=True, text=True).stdout.strip()
     pending = f"{queue['dir']}/pending/{job['id']}.toml"
     done = ssh(host, f"mkdir -p {queue['dir']}/pending && test ! -e {pending} && cat > {pending}", input=toml(job))

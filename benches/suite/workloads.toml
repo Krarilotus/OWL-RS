@@ -335,3 +335,140 @@ tiers = ["-"]
 state = "ready"
 kit = "scripts"
 check = "the scripts' assertions"
+
+# --- the home-turf benchmarks scheduled first (12 Oct 2026; suite/schedule.toml) ----------
+
+[gcare]
+title = "G-CARE: subgraph queries for cardinality estimation on real and generated graphs"
+kind = "performance"
+tasks = ["basics"]
+needs = ["load", "query"]
+scales = "YAGO, LUBM 80, AIDS, human, HPRD, DBLP and their query sets"
+source = "github.com/SNUCSE-CTA/G-CARE (Park et al., SIGMOD 2020)"
+licence = "to check before use"
+tiers = ["yago", "lubm80"]
+state = "planned"
+check = "the exact counts the benchmark ships; result counts across systems"
+note = "Measures the planner's estimates (q-error per query) besides the queries' times; the fast case plan-estimates measures q-error on LUBM 10 today"
+
+[claros]
+title = "Claros (L, LE): RDFox's and GLog's datasets, rules that build large cliques"
+kind = "performance"
+tasks = ["RT1", "RT2"]
+needs = ["load"]
+any = ["reason-owl2-rl", "reason-custom-rules"]
+scales = "about 19 M facts in; LE's closure many times that"
+source = "RDFox's test datasets (Oxford)"
+licence = "unstated: ask Oxford before use"
+tiers = ["l", "le"]
+state = "planned"
+check = "inferred counts across systems"
+note = "The worst case for proof-based deletion; GLog's single-thread result (Claros-L 119 s against RDFox's 2,512 s, reported). Size LE on Draco first"
+
+[sspe]
+title = "SSPE: single-source path graphs where one deletion invalidates long derivations"
+kind = "performance"
+tasks = ["RT2"]
+needs = ["load", "reason-incremental"]
+scales = "millions of edges; 1 to 1,000 deletions"
+source = "generated from the description of Hu, Motik and Horrocks (counting against B/F)"
+licence = "ours (generated)"
+tiers = ["1000"]
+state = "planned"
+check = "the incremental closure equals the rematerialised one"
+note = "Counting beat B/F 10.5 s to 253 s for 1,000 deletions (reported); the fast case deletes-layered is its small cousin"
+
+[datalog-graphs]
+title = "Datalog graph programs: transitive closure, same generation, CSPA"
+kind = "performance"
+tasks = ["RT1"]
+needs = ["load", "reason-custom-rules"]
+scales = "1 to 100 M edges; closures to billions (capped)"
+source = "generated graphs, SNAP graphs where needed; the programs of the RecStep, FlowLog and Soufflé papers"
+licence = "ours (generated); SNAP per graph"
+tiers = ["tc", "sg", "cspa"]
+state = "planned"
+check = "counts against Soufflé or Nemo"
+note = "The batch executor beyond OWL: plain Datalog as N3 rules; Nemo, VLog and Soufflé on their home turf"
+
+[commit-latency]
+title = "Commit latency under 0, 1, 8 and 64 readers, the closure complete at every commit"
+kind = "performance"
+tasks = ["RT2"]
+needs = ["load", "update", "reason-incremental"]
+scales = "LUBM 10 under OWL 2 RL, commits of 1 to 10 k statements"
+source = "ours (report item 20): nobody publishes it"
+licence = "ours"
+tiers = ["lubm-10"]
+state = "partial"
+kit = "benches/fast"
+check = "the committed state equals the rematerialisation"
+note = "The fast cases commits-readers and writes-under-readers cover it on NRESE; GraphDB and RDFox are the comparators"
+
+[elk-ontologies]
+title = "Classification of large EL and near-EL ontologies: GO, ChEBI, NCIt, GALEN"
+kind = "performance"
+tasks = ["RT6"]
+needs = ["classify"]
+scales = "50 to 500 MB each"
+source = "release-pinned files of GO, ChEBI, NCIt and GALEN"
+licence = "GO and ChEBI CC-BY 4.0; NCIt CC-BY 4.0; GALEN free (SNOMED CT stays internal)"
+tiers = ["go", "chebi", "ncit", "galen"]
+state = "planned"
+kit = "benches/reasoning/el-classification"
+check = "taxonomies against ELK's and Konclude's, by canonical hash"
+note = "ELK's home turf: EL classification speed"
+
+[pagoda-suite]
+title = "PAGOdA's test suite: query answering beyond OWL 2 RL"
+kind = "performance"
+tasks = ["RT3"]
+needs = ["load", "query"]
+any = ["reason-owl2-rl", "classify"]
+scales = "to 10 M facts: LUBM, UOBM, FLY, NPD, DBpedia+, ChEMBL, Reactome, UniProt with their queries"
+source = "PAGOdA's site (the datasets and queries it publishes)"
+licence = "per dataset; PAGOdA's code to check"
+tiers = ["lubm", "uobm", "fly", "npd", "dbpedia"]
+state = "planned"
+check = "answers against a complete reasoner (HermiT, Konclude)"
+note = "Query answering by lower and upper bounds, as NRESE's DL mode answers"
+
+[vector-recall]
+title = "Filtered k-NN: recall and time of vector search under a filter"
+kind = "performance"
+tasks = ["vector"]
+needs = ["load", "query"]
+scales = "generated: 200 k vectors of 64 dimensions, a filter of one kind in ten; big-ann-benchmarks' filtered track (YFCC-10M)"
+source = "ours (perf_lab's vectors generator); github.com/harsha-simhadri/big-ann-benchmarks"
+licence = "ours; big-ann MIT, YFCC CC-BY variants"
+tiers = ["generated-200k", "yfcc-10m"]
+state = "partial"
+kit = "benches/fast"
+check = "recall@10 against the exact search"
+note = "The fast cases vector-knn-exact and vector-knn-filtered; why the filtered recall fails: runs/2026-10-12-vector-recall-phuoc.toml"
+
+[ann-benchmarks]
+title = "ann-benchmarks: recall and throughput curves of approximate k-NN"
+kind = "performance"
+tasks = ["vector"]
+needs = ["load", "query"]
+scales = "SIFT-1M, GloVe-100, Fashion-MNIST (0.1 to 1 GB)"
+source = "github.com/erikbern/ann-benchmarks"
+licence = "MIT; data sets per set"
+tiers = ["sift-1m", "glove-100", "fashion-mnist"]
+state = "planned"
+check = "recall against the sets' ground truth"
+note = "Comparability with every published index"
+
+[geographica2]
+title = "Geographica 2: spatial selections, joins and aggregates on real and synthetic data"
+kind = "performance"
+tasks = ["space"]
+needs = ["load", "query", "geosparql"]
+scales = "real (OSM, CORINE land cover, GADM: a few GB) and a synthetic scalable set"
+source = "geographica2.di.uoa.gr"
+licence = "not stated; internal use only: ask the authors before publishing (owner, 5 Oct 2026)"
+tiers = ["real", "synthetic"]
+state = "planned"
+check = "answers across systems"
+note = "Strabon, uSeekM, Parliament published on it; Jena and GraphDB's GeoSPARQL are the comparators here"
