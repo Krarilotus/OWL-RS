@@ -1303,10 +1303,13 @@ fn equality_module_equals_the_generic_rules() {
 }
 
 /// The delta executor's equality module under random deletes and re-inserts of an
-/// equality-heavy ontology: equal to rematerialisation after every change.
+/// equality-heavy ontology: equal to rematerialisation after every change, under each
+/// plan of the maintenance policy (B3a: classes a deletion splits recomputed, or DRed
+/// over them).
 #[test]
 fn delta_equality_equals_rematerialisation() {
-    use super::delta::{MemoryBase, Rules, update};
+    use super::delta::policy::{Plan, Policy};
+    use super::delta::{MemoryBase, Rules, update_with};
 
     let mut lines = Vec::new();
     for i in 0..7 {
@@ -1346,44 +1349,57 @@ fn delta_equality_equals_rematerialisation() {
     };
     let closure =
         |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema).derived;
-    let mut next = rng(7);
-    let mut asserted: Vec<Triple> = pool.clone();
-    asserted.sort_unstable();
-    let mut inferred = closure(&asserted);
-    for step in 0..60 {
-        let fact = pool[next(pool.len())];
-        let deleting = asserted.binary_search(&fact).is_ok();
-        let mut after: Vec<Triple> = asserted.iter().copied().filter(|&t| t != fact).collect();
-        if !deleting {
-            after.push(fact);
-            after.sort_unstable();
+    for policy in [
+        Policy::default(),
+        Policy::forcing(Plan::Dred),
+        Policy::forcing(Plan::Recompute),
+    ] {
+        let mut next = rng(7);
+        let mut asserted: Vec<Triple> = pool.clone();
+        asserted.sort_unstable();
+        let mut inferred = closure(&asserted);
+        let mut recomputed = 0;
+        for step in 0..60 {
+            let fact = pool[next(pool.len())];
+            let deleting = asserted.binary_search(&fact).is_ok();
+            let mut after: Vec<Triple> = asserted.iter().copied().filter(|&t| t != fact).collect();
+            if !deleting {
+                after.push(fact);
+                after.sort_unstable();
+            }
+            let stack: Vec<Triple> = inferred
+                .iter()
+                .copied()
+                .filter(|t| after.binary_search(t).is_err())
+                .collect();
+            let base = MemoryBase::new(&after, &stack);
+            let new = !deleting && inferred.binary_search(&fact).is_err();
+            let (ins, del): (&[Triple], &[Triple]) = if deleting {
+                (&[], std::slice::from_ref(&fact))
+            } else if new {
+                (std::slice::from_ref(&fact), &[])
+            } else {
+                (&[], &[])
+            };
+            let result = update_with(&base, ins, del, compiled, None, crate::eval::NEVER, policy)
+                .expect("never stopped");
+            recomputed += usize::from(result.policy.plan == Plan::Recompute);
+            let removal: HashSet<Triple> = result.remove.iter().copied().collect();
+            let mut maintained: Vec<Triple> = stack
+                .into_iter()
+                .filter(|t| !removal.contains(t))
+                .chain(result.insert)
+                .collect();
+            maintained.sort_unstable();
+            maintained.dedup();
+            assert_eq!(maintained, closure(&after), "{policy:?}, step {step}");
+            inferred = maintained;
+            asserted = after;
         }
-        let stack: Vec<Triple> = inferred
-            .iter()
-            .copied()
-            .filter(|t| after.binary_search(t).is_err())
-            .collect();
-        let base = MemoryBase::new(&after, &stack);
-        let new = !deleting && inferred.binary_search(&fact).is_err();
-        let (ins, del): (&[Triple], &[Triple]) = if deleting {
-            (&[], std::slice::from_ref(&fact))
-        } else if new {
-            (std::slice::from_ref(&fact), &[])
-        } else {
-            (&[], &[])
-        };
-        let result = update(&base, ins, del, compiled, None);
-        let removal: HashSet<Triple> = result.remove.iter().copied().collect();
-        let mut maintained: Vec<Triple> = stack
-            .into_iter()
-            .filter(|t| !removal.contains(t))
-            .chain(result.insert)
-            .collect();
-        maintained.sort_unstable();
-        maintained.dedup();
-        assert_eq!(maintained, closure(&after), "step {step}");
-        inferred = maintained;
-        asserted = after;
+        match policy.force {
+            Some(Plan::Dred) => assert_eq!(recomputed, 0),
+            _ => assert!(recomputed > 0, "{policy:?}: no change recomputed a class"),
+        }
     }
 }
 
@@ -1881,7 +1897,8 @@ pub(super) fn support_set_updates_against_recomputation() {
 /// violations it reports are exactly the new ones.
 #[test]
 fn delta_equals_rematerialisation_under_random_changes() {
-    use super::delta::{MemoryBase, Rules, update};
+    use super::delta::policy::{Plan, Policy};
+    use super::delta::{MemoryBase, Rules, update_with};
 
     // NRESE_FUZZ_CASES and NRESE_FUZZ_SEED widen the sweep locally.
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
@@ -1943,8 +1960,22 @@ fn delta_equals_rematerialisation_under_random_changes() {
                 .filter(|f| after.binary_search(f).is_err())
                 .collect();
             let base = MemoryBase::new(&after, &stack);
+            // Every other run of rulesets recomputes each class a deletion touches.
+            let policy = match (case / 3) % 2 {
+                0 => Policy::default(),
+                _ => Policy::forcing(Plan::Recompute),
+            };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                update(&base, &insert, &delete, compiled, cache.as_ref())
+                update_with(
+                    &base,
+                    &insert,
+                    &delete,
+                    compiled,
+                    cache.as_ref(),
+                    crate::eval::NEVER,
+                    policy,
+                )
+                .expect("never stopped")
             }));
             let context = || {
                 let text = |t: &Triple| {
@@ -2079,5 +2110,155 @@ fn in_place_drivers_visit_what_a_scan_visits() {
                 assert_eq!(ranged, scanned, "{pattern:?} {seg:?} morsel {morsel}");
             }
         }
+    }
+}
+
+/// The B3a sweep's `NRESE_FUZZ_SEED=7` (case 211, step 1), kept as it was found: a
+/// change deletes an equality of one class and inserts one that links it to another (with
+/// its own members, unrelated to the deletion). The region a recompute takes must cover
+/// both classes whole, followed through `owl:sameAs` in the state; one hop from the deleted
+/// equality's ends missed the other class's members, and their reflexive `sameAs` stayed.
+#[test]
+fn a_recomputed_region_takes_in_the_classes_a_change_links() {
+    use super::delta::policy::{Plan, Policy};
+    use super::delta::{MemoryBase, Rules, update_with};
+    let mut vocabulary = LocalVocabulary::default();
+    let before = load(
+        &mut vocabulary,
+        r#"ex:C3 owl:equivalentClass ex:C2
+ex:C0 owl:onProperty ex:p1
+ex:C0 owl:someValuesFrom ex:C1
+ex:p0 owl:propertyDisjointWith ex:p0
+ex:p0 rdf:type owl:TransitiveProperty
+ex:p0 rdf:type owl:AsymmetricProperty
+ex:p0 owl:propertyChainAxiom _:l5a
+ex:i0 owl:sameAs ex:i0
+ex:i0 rdf:type ex:C3
+ex:i0 ex:p3 ex:i4
+ex:i2 ex:p1 ex:i4
+ex:p1 rdf:type owl:FunctionalProperty
+ex:p1 owl:propertyChainAxiom _:l7a
+ex:p1 rdfs:domain ex:C3
+ex:i4 rdf:type ex:C3
+ex:i4 ex:p3 ex:i2
+ex:i4 owl:differentFrom ex:i5
+ex:p3 rdf:type owl:SymmetricProperty
+ex:p2 rdfs:range ex:C3
+ex:p2 owl:inverseOf ex:p2
+ex:p2 owl:equivalentProperty ex:p1
+_:l7a rdf:first ex:p3
+_:l7a rdf:rest _:l7b
+_:l7b rdf:rest rdf:nil
+ex:C1 owl:intersectionOf _:l18a
+ex:C1 owl:intersectionOf _:l33a
+ex:C4 rdfs:subClassOf ex:C0
+ex:C4 owl:complementOf ex:C1
+_:l18a rdf:first ex:C3
+_:l18a rdf:rest _:l18b
+ex:i5 ex:p2 ex:i4
+ex:i3 ex:p3 ex:i5
+_:l33a rdf:rest _:l33b
+_:l33b rdf:first ex:C4
+_:l33b rdf:rest rdf:nil
+ex:i1 ex:p1 ex:i2"#,
+    );
+    let insert = load(
+        &mut vocabulary,
+        r#"_:l7b rdf:first ex:p1
+ex:C0 owl:allValuesFrom ex:C2
+ex:p3 rdfs:subPropertyOf ex:p0
+_:l18b rdf:rest rdf:nil
+ex:C1 owl:onProperty ex:p3
+ex:C1 owl:equivalentClass ex:C2
+ex:i1 owl:sameAs ex:i2"#,
+    );
+    let delete = load(
+        &mut vocabulary,
+        r#"ex:p0 owl:propertyDisjointWith ex:p0
+ex:p0 owl:propertyChainAxiom _:l5a
+ex:i0 owl:sameAs ex:i0
+ex:i2 ex:p1 ex:i4
+ex:p1 owl:propertyChainAxiom _:l7a
+ex:p2 rdfs:range ex:C3
+_:l7a rdf:rest _:l7b
+_:l7b rdf:rest rdf:nil
+ex:C4 owl:complementOf ex:C1
+ex:i3 ex:p3 ex:i5
+_:l33a rdf:rest _:l33b"#,
+    );
+    let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let schema = Schema::owl(&mut vocabulary);
+    let compiled = Rules {
+        rules: &rules,
+        lists: Some(&lists),
+        schema: &schema,
+    };
+    let closure = |a: &[Triple]| batch::materialise(a, &rules, Some(&lists), &schema).derived;
+    let mut asserted = before.clone();
+    asserted.sort_unstable();
+    asserted.dedup();
+    let inferred = closure(&asserted);
+    let mut after: Vec<Triple> = asserted
+        .iter()
+        .copied()
+        .filter(|f| !delete.contains(f))
+        .chain(insert.iter().copied())
+        .collect();
+    after.sort_unstable();
+    after.dedup();
+    let insert: Vec<Triple> = insert
+        .into_iter()
+        .filter(|f| !delete.contains(f) && inferred.binary_search(f).is_err())
+        .collect();
+    let stack: Vec<Triple> = inferred
+        .iter()
+        .copied()
+        .filter(|f| after.binary_search(f).is_err())
+        .collect();
+    let base = MemoryBase::new(&after, &stack);
+    for policy in [
+        Policy::default(),
+        Policy::forcing(Plan::Dred),
+        Policy::forcing(Plan::Recompute),
+    ] {
+        let result = update_with(
+            &base,
+            &insert,
+            &delete,
+            compiled,
+            None,
+            crate::eval::NEVER,
+            policy,
+        )
+        .unwrap();
+        let removal: HashSet<Triple> = result.remove.iter().copied().collect();
+        let mut maintained: Vec<Triple> = stack
+            .iter()
+            .copied()
+            .filter(|f| !removal.contains(f))
+            .chain(result.insert.iter().copied())
+            .collect();
+        maintained.sort_unstable();
+        maintained.dedup();
+        let expected = closure(&after);
+        let text = |t: &Triple| {
+            let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
+            format!("{s} {p} {o}")
+        };
+        let extra: Vec<String> = maintained
+            .iter()
+            .filter(|f| expected.binary_search(f).is_err())
+            .map(text)
+            .collect();
+        let missing: Vec<String> = expected
+            .iter()
+            .filter(|f| maintained.binary_search(f).is_err())
+            .map(text)
+            .collect();
+        assert!(
+            extra.is_empty() && missing.is_empty(),
+            "{policy:?}: extra {extra:?}, missing {missing:?}"
+        );
     }
 }

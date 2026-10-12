@@ -65,18 +65,42 @@ The 6 October report adds what §1 left open: why one shared data structure is w
 
 **The persistent backend:**
 
-- Equality edges with support counts. Only a count dropping from 1 to 0 can change a
-  class.
-- A spanning forest per class, plus the non-tree edges. Deleting a forest edge triggers a
-  connectivity test inside that class. Fully dynamic connectivity (HDT) is the upgrade
-  only if profiles demand it.
+- Support counts on the asserted equality edges only. A derived equality can be
+  supported by copies made through itself (a `prp-fp` equality whose premises are such
+  copies), so its count never drops to 0: counting is unsound for recursive supports.
+  Derived edges carry no count; a change in their class re-validates them by B/F.
+  Only an asserted edge's count dropping from 1 to 0 can change a class.
+- A spanning forest per class over its asserted edges, plus the non-tree edges. Deleting
+  a forest edge triggers a connectivity test inside that class. Fully dynamic
+  connectivity (HDT) is the upgrade only if profiles demand it.
 - The asserted facts stay exact, beneath the canonical ones (already decided in §1), so a
   split can restore them.
 - A split returns a `SplitDelta`. Fact maintenance is driven from it:
   - counting first, B/F where support is ambiguous;
-  - a switch to rematerialising the affected part when the estimated work exceeds its
-    measured cost.
+  - the maintenance policy's switch, inside the commit: it estimates, in facts touched,
+    DRed's work over the class (its members' facts, copied through every member),
+    recomputing the affected part (the members' facts and their consequences overdeleted
+    at once and derived again from what remains), and rebuilding the whole state (its
+    stored facts, offered only to a change that inserts nothing, as deletions introduce
+    no violations), and takes the cheapest. A rebuild runs no delta at all and applies
+    only the difference to the stack. The switch lives with the maintenance policy
+    (`delta::policy`), not with the equality code, so other maintenance cases (large
+    deletes, long chains) use it too.
 - A stable class id, apart from the union-find root and the displayed representative (§1).
+  For B3 it stays internal to the backend: storage keeps the smallest member as the
+  representative, and a merge or split rewrites the stored facts of the side that loses
+  it (counted, so the cost of a large side losing it is measured).
+
+**Built (B3a):** the switch, without the backend. A deletion estimates the plans for the
+classes it touches; recomputing re-derives the part in bulk (the copies of a remaining
+fact within the classes the remaining equalities make, and what the other rules derive
+in one step, to a fixpoint). Over a stack kept over representatives (compact mode) a
+split is always rebuilt: the delta executor reads the old classes through the expanded
+view, and translating its result into the split classes misses copies when a commit
+splits and merges at once (the differential test found it on about a third of 60 seeds), so
+the policy knows that any delta plan there ends in a rebuild and skips it. The backend
+itself (origins, the forest, B/F re-validation, the representative view for the delta
+executor, which lets compact mode recompute a part too) is B3b.
 
 **Datatype equality is a producer:** the datatype theory computes value equality and
 asserts it into the owning domain. It never makes two lexical terms one id.
