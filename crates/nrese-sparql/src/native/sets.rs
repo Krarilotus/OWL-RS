@@ -152,30 +152,54 @@ impl Context<'_> {
             {
                 self.eval(pattern)?
             }
-            GraphPattern::Join { left, right } => {
-                let (left_scope, right_scope) = (in_scope(left), in_scope(right));
+            GraphPattern::Join { inputs } => {
+                // Each input keeps what the consumer reads and what it shares with another
+                // input (a fold of binary joins keeps the same: at each step, what the
+                // two sides share).
+                let scopes: Vec<Vec<Variable>> = inputs.iter().map(in_scope).collect();
                 let mut keep = needed.to_vec();
-                add(
-                    &mut keep,
-                    left_scope.into_iter().filter(|v| right_scope.contains(v)),
-                );
-                match (as_path(left), as_path(right)) {
-                    (_, Some(path)) => {
-                        let bound = self.eval_set(left, &keep)?;
-                        let reached = self.path_from(&bound, &path)?;
-                        self.join(bound, reached)?
-                    }
-                    (Some(path), None) => {
-                        let bound = self.eval_set(right, &keep)?;
-                        let reached = self.path_from(&bound, &path)?;
-                        self.join(reached, bound)?
-                    }
-                    (None, None) => {
-                        let (left, right) =
-                            (self.eval_set(left, &keep)?, self.eval_set(right, &keep)?);
-                        self.join(left, right)?
-                    }
+                for (i, scope) in scopes.iter().enumerate() {
+                    add(
+                        &mut keep,
+                        scope
+                            .iter()
+                            .filter(|v| scopes[i + 1..].iter().any(|later| later.contains(v)))
+                            .cloned(),
+                    );
                 }
+                // From the left; a path is followed from the rows before it, paths before
+                // the first other input from what that input binds.
+                let first_bound = inputs
+                    .iter()
+                    .position(|input| as_path(input).is_none())
+                    .unwrap_or(0);
+                let mut leading = Vec::new();
+                let mut joined: Option<Solutions> = None;
+                for (i, input) in inputs.iter().enumerate() {
+                    let path = (i != first_bound).then(|| as_path(input)).flatten();
+                    joined = Some(match (path, joined.take()) {
+                        (Some(path), Some(bound)) => {
+                            let reached = self.path_from(&bound, &path)?;
+                            self.join(bound, reached)?
+                        }
+                        (Some(path), None) => {
+                            leading.push(path);
+                            continue;
+                        }
+                        (None, bound) => {
+                            let mut rows = self.eval_set(input, &keep)?;
+                            for path in leading.drain(..) {
+                                let reached = self.path_from(&rows, &path)?;
+                                rows = self.join(reached, rows)?;
+                            }
+                            match bound {
+                                Some(bound) => self.join(bound, rows)?,
+                                None => rows,
+                            }
+                        }
+                    });
+                }
+                joined.unwrap_or_else(Solutions::unit)
             }
             GraphPattern::LeftJoin {
                 left,
@@ -196,25 +220,43 @@ impl Context<'_> {
                 };
                 self.left_join(left, right, expression.as_ref())?
             }
-            GraphPattern::Union { left, right } => {
-                let (left, right) = (self.eval_set(left, needed)?, self.eval_set(right, needed)?);
-                self.union(left, right)?
+            GraphPattern::Union { inputs } => {
+                let mut rows: Option<Solutions> = None;
+                for input in inputs {
+                    let next = self.eval_set(input, needed)?;
+                    rows = Some(match rows.take() {
+                        Some(before) => self.union(before, next)?,
+                        None => next,
+                    });
+                }
+                rows.unwrap_or_else(|| Solutions {
+                    vars: needed.to_vec(),
+                    table: IdTable::new(needed.len()),
+                    ordered: false,
+                })
             }
             // A value per row (RAND, BNODE, ...) differs between rows that are otherwise
             // duplicates: such a BIND or FILTER sees every row.
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } if !pushdown::per_solution(expression) && joins(inner) => {
-                if !needed.contains(variable) {
-                    // Nothing reads the value, and a BIND neither adds nor removes rows.
-                    return self.eval_set(inner, needed);
-                }
+            GraphPattern::Extend { inner, bindings }
+                if !bindings.iter().any(|(_, e)| pushdown::per_solution(e)) && joins(inner) =>
+            {
+                // From the last: a binding nothing reads is left out (a BIND neither adds
+                // nor removes rows), and one that is read needs what it reads.
                 let mut keep = needed.to_vec();
-                add(&mut keep, expression_variables(expression));
-                let solutions = self.eval_set(inner, &keep)?;
-                self.extend(solutions, variable, expression)?
+                let mut read = vec![false; bindings.len()];
+                for (i, (variable, expression)) in bindings.iter().enumerate().rev() {
+                    if keep.contains(variable) {
+                        read[i] = true;
+                        add(&mut keep, expression_variables(expression));
+                    }
+                }
+                let mut solutions = self.eval_set(inner, &keep)?;
+                for ((variable, expression), read) in bindings.iter().zip(read) {
+                    if read {
+                        solutions = self.extend(solutions, variable, expression)?;
+                    }
+                }
+                solutions
             }
             GraphPattern::Filter { expr, inner }
                 if !pushdown::per_solution(expr) && joins(inner) =>

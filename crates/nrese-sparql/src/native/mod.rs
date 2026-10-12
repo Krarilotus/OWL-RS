@@ -822,9 +822,10 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
         GraphPattern::Path {
             subject, object, ..
         } => supported_term(subject) && supported_term(object),
-        GraphPattern::Join { left, right }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => supported(left) && supported(right),
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            inputs.iter().all(supported)
+        }
+        GraphPattern::Minus { left, right } => supported(left) && supported(right),
         GraphPattern::LeftJoin {
             left,
             right,
@@ -844,12 +845,16 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
             bound_variables(inner, &mut outer);
             supported(inner) && exists::supported_expression(expr, &outer)
         }
-        GraphPattern::Extend {
-            inner, expression, ..
-        } => {
+        // Each binding over the inner pattern's variables and the bindings before it.
+        GraphPattern::Extend { inner, bindings } => {
             let mut outer = Vec::new();
             bound_variables(inner, &mut outer);
-            supported(inner) && exists::supported_expression(expression, &outer)
+            supported(inner)
+                && bindings.iter().all(|(variable, expression)| {
+                    let supported = exists::supported_expression(expression, &outer);
+                    outer.push(variable.clone());
+                    supported
+                })
         }
         GraphPattern::Values { .. } => true,
         GraphPattern::OrderBy { inner, expression } => {
@@ -900,8 +905,8 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
     fn only_scans(pattern: &GraphPattern, graph: &Variable) -> bool {
         match pattern {
             GraphPattern::Bgp { .. } => true,
-            GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
-                only_scans(left, graph) && only_scans(right, graph)
+            GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+                inputs.iter().all(|input| only_scans(input, graph))
             }
             GraphPattern::LeftJoin {
                 left,
@@ -913,11 +918,12 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
                     && expression.as_ref().is_none_or(|e| filter(e, graph))
             }
             GraphPattern::Filter { inner, expr } => only_scans(inner, graph) && filter(expr, graph),
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => variable != graph && only_scans(inner, graph) && filter(expression, graph),
+            GraphPattern::Extend { inner, bindings } => {
+                only_scans(inner, graph)
+                    && bindings.iter().all(|(variable, expression)| {
+                        variable != graph && filter(expression, graph)
+                    })
+            }
             _ => false,
         }
     }
@@ -936,8 +942,8 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
     fn rows_from_scans(pattern: &GraphPattern) -> bool {
         match pattern {
             GraphPattern::Bgp { patterns } => !patterns.is_empty(),
-            GraphPattern::Join { left, right } => rows_from_scans(left) || rows_from_scans(right),
-            GraphPattern::Union { left, right } => rows_from_scans(left) && rows_from_scans(right),
+            GraphPattern::Join { inputs } => inputs.iter().any(rows_from_scans),
+            GraphPattern::Union { inputs } => inputs.iter().all(rows_from_scans),
             GraphPattern::LeftJoin { left, .. } | GraphPattern::Minus { left, .. } => {
                 rows_from_scans(left)
             }
@@ -952,8 +958,8 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
     // sees it unbound, which only the graph-by-graph evaluation gives.
     fn read_by_expressions(pattern: &GraphPattern, graph: &Variable) -> bool {
         match pattern {
-            GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
-                read_by_expressions(left, graph) || read_by_expressions(right, graph)
+            GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+                inputs.iter().any(|input| read_by_expressions(input, graph))
             }
             GraphPattern::LeftJoin {
                 left,
@@ -966,12 +972,15 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
                         .as_ref()
                         .is_some_and(|e| exists::deep_variables(e).contains(graph))
             }
-            GraphPattern::Filter { inner, expr: e }
-            | GraphPattern::Extend {
-                inner,
-                expression: e,
-                ..
-            } => read_by_expressions(inner, graph) || exists::deep_variables(e).contains(graph),
+            GraphPattern::Filter { inner, expr: e } => {
+                read_by_expressions(inner, graph) || exists::deep_variables(e).contains(graph)
+            }
+            GraphPattern::Extend { inner, bindings } => {
+                read_by_expressions(inner, graph)
+                    || bindings
+                        .iter()
+                        .any(|(_, e)| exists::deep_variables(e).contains(graph))
+            }
             _ => false,
         }
     }
@@ -983,8 +992,8 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
                     .any(|term| matches!(term, TermPattern::Variable(v) if v == graph))
                     || matches!(&t.predicate, NamedNodePattern::Variable(v) if v == graph)
             }),
-            GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
-                bound_by_scans(left, graph) || bound_by_scans(right, graph)
+            GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+                inputs.iter().any(|input| bound_by_scans(input, graph))
             }
             GraphPattern::LeftJoin { left, .. }
             | GraphPattern::Filter { inner: left, .. }
@@ -1613,26 +1622,35 @@ impl<'a> Context<'a> {
                 silent,
             } => self.service(name, inner, *silent, None),
             // A SERVICE joined to a pattern gets the values the pattern binds.
-            GraphPattern::Join { left, right }
-                if matches!(**right, GraphPattern::Service { .. })
-                    || matches!(**left, GraphPattern::Service { .. }) =>
+            GraphPattern::Join { inputs }
+                if inputs
+                    .iter()
+                    .any(|input| matches!(input, GraphPattern::Service { .. })) =>
             {
-                let (local, remote) = match &**right {
-                    GraphPattern::Service { .. } => (left, right),
-                    _ => (right, left),
-                };
+                // The last SERVICE gets what the other inputs bind, joined.
+                let at = inputs
+                    .iter()
+                    .rposition(|input| matches!(input, GraphPattern::Service { .. }))
+                    .expect("matched above");
                 let GraphPattern::Service {
                     name,
                     inner,
                     silent,
-                } = &**remote
+                } = &inputs[at]
                 else {
                     unreachable!("matched above")
                 };
+                let others: Vec<GraphPattern> = inputs
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i != at)
+                    .map(|(_, input)| input.clone())
+                    .collect();
+                let local = GraphPattern::join_all(others);
                 if vectors::is_search(name) {
-                    return self.vector_join(local, inner);
+                    return self.vector_join(&local, inner);
                 }
-                let bound = self.eval(local)?;
+                let bound = self.eval(&local)?;
                 let found = self.service(name, inner, *silent, Some(&bound))?;
                 self.join(bound, found)
             }
@@ -1658,33 +1676,16 @@ impl<'a> Context<'a> {
                 path,
                 object,
             } => self.path(subject, path, object),
-            GraphPattern::Join { left, right } => {
+            GraphPattern::Join { inputs } => {
                 // Paths joined to triple patterns: ordered with them (`path_joins`).
                 if !self.as_written
                     && let Some(join) = path_joins::PathJoin::of(pattern)
                 {
                     return self.join_with_paths(&join);
                 }
-                // A path joined to another pattern is evaluated second, from the values
-                // the pattern binds to one of its ends.
-                match (as_path(left), as_path(right)) {
-                    (_, Some(path)) => {
-                        let bound = self.eval(left)?;
-                        let reached = self.path_from(&bound, &path)?;
-                        self.join(bound, reached)
-                    }
-                    (Some(path), None) => {
-                        let bound = self.eval(right)?;
-                        let reached = self.path_from(&bound, &path)?;
-                        self.join(reached, bound)
-                    }
-                    (None, None) if self.as_written => {
-                        let (left, right) = (self.eval(left)?, self.eval(right)?);
-                        self.join(left, right)
-                    }
-                    // The smaller side first; the other from its rows (`sideways`).
-                    (None, None) => self.join_sideways(left, right),
-                }
+                // The most selective input first, the others from its rows (`sideways`);
+                // a path from the values the inputs before it bind to one of its ends.
+                self.join_inputs(inputs)
             }
             GraphPattern::LeftJoin {
                 left,
@@ -1751,17 +1752,23 @@ impl<'a> Context<'a> {
                     self.filter(solutions, expr)
                 }
             },
-            GraphPattern::Union { left, right } => {
-                let (left, right) = (self.eval(left)?, self.eval(right)?);
-                self.union(left, right)
+            GraphPattern::Union { inputs } => {
+                let mut united: Option<Solutions> = None;
+                for input in inputs {
+                    let rows = self.eval(input)?;
+                    united = Some(match united.take() {
+                        Some(before) => self.union(before, rows)?,
+                        None => rows,
+                    });
+                }
+                Ok(united.unwrap_or_else(Solutions::unit))
             }
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => {
-                let solutions = self.eval(inner)?;
-                self.extend(solutions, variable, expression)
+            GraphPattern::Extend { inner, bindings } => {
+                let mut solutions = self.eval(inner)?;
+                for (variable, expression) in bindings {
+                    solutions = self.extend(solutions, variable, expression)?;
+                }
+                Ok(solutions)
             }
             GraphPattern::Minus { left, right } => {
                 let (left, right) = (self.eval(left)?, self.eval(right)?);
@@ -4527,15 +4534,18 @@ impl<'a> Context<'a> {
             filters.push(expr);
             pattern = inner;
         }
-        let GraphPattern::Join { left, right } = pattern else {
+        let GraphPattern::Join { inputs } = pattern else {
+            return Ok(None);
+        };
+        let [left, right] = inputs.as_slice() else {
             return Ok(None);
         };
         let (left_vars, right_vars) = (sets::in_scope(left), sets::in_scope(right));
         if sets::shares(&left_vars, &right_vars)
             || as_path(left).is_some()
             || as_path(right).is_some()
-            || matches!(**left, GraphPattern::Service { .. })
-            || matches!(**right, GraphPattern::Service { .. })
+            || matches!(left, GraphPattern::Service { .. })
+            || matches!(right, GraphPattern::Service { .. })
         {
             return Ok(None);
         }
@@ -4972,11 +4982,14 @@ fn describe(pattern: &GraphPattern) -> (&'static str, String) {
         ),
         GraphPattern::Filter { expr, .. } => ("filter", expr.to_string()),
         GraphPattern::Union { .. } => ("union", String::new()),
-        GraphPattern::Extend {
-            variable,
-            expression,
-            ..
-        } => ("bind", format!("{expression} AS {variable}")),
+        GraphPattern::Extend { bindings, .. } => (
+            "bind",
+            bindings
+                .iter()
+                .map(|(variable, expression)| format!("{expression} AS {variable}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
         GraphPattern::Minus { .. } => ("minus", String::new()),
         GraphPattern::Values { variables, .. } => ("values", list(variables)),
         GraphPattern::OrderBy { expression, .. } => (

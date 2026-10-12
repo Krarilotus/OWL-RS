@@ -183,10 +183,24 @@ impl Rewriter<'_> {
         }
         match pattern {
             P::Bgp { patterns } => self.bgp(patterns, needed, set),
-            P::Join { left, right } => P::Join {
-                left: boxed(self.walk(left, &needed.with(mentioned(right)), set)),
-                right: boxed(self.walk(right, &needed.with(mentioned(left)), set)),
-            },
+            // Each input needs what the others mention.
+            P::Join { inputs } => {
+                let mentions: Vec<Vec<Variable>> = inputs.iter().map(mentioned).collect();
+                P::Join {
+                    inputs: inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, input)| {
+                            let others = mentions
+                                .iter()
+                                .enumerate()
+                                .filter(|&(j, _)| j != i)
+                                .flat_map(|(_, m)| m.iter().cloned());
+                            self.walk(input, &needed.with(others), set)
+                        })
+                        .collect(),
+                }
+            }
             P::LeftJoin {
                 left,
                 right,
@@ -218,18 +232,26 @@ impl Rewriter<'_> {
                 expr: self.expression(expr, &Outer::of(&[inner]), Polarity::Positive),
                 inner: boxed(self.walk(inner, &needed.with(used(expr)), set)),
             },
-            P::Union { left, right } => P::Union {
-                left: boxed(self.walk(left, needed, set)),
-                right: boxed(self.walk(right, needed, set)),
+            P::Union { inputs } => P::Union {
+                inputs: inputs
+                    .iter()
+                    .map(|input| self.walk(input, needed, set))
+                    .collect(),
             },
-            P::Extend {
-                inner,
-                variable,
-                expression,
-            } => P::Extend {
-                expression: self.expression(expression, &Outer::of(&[inner]), Polarity::Both),
-                inner: boxed(self.walk(inner, &needed.with(used(expression)), set)),
-                variable: variable.clone(),
+            P::Extend { inner, bindings } => P::Extend {
+                bindings: bindings
+                    .iter()
+                    .map(|(variable, expression)| {
+                        let outer = Outer::of(&[inner]);
+                        let expression = self.expression(expression, &outer, Polarity::Both);
+                        (variable.clone(), expression)
+                    })
+                    .collect(),
+                inner: boxed(self.walk(
+                    inner,
+                    &needed.with(bindings.iter().flat_map(|(_, e)| used(e))),
+                    set,
+                )),
             },
             P::Minus { left, right } => {
                 // The right side removes what it is compatible with: read as a set, the
@@ -495,12 +517,10 @@ impl Rewriter<'_> {
             pattern: self.report.patterns,
         };
         let union = |this: &Self, branches: &mut dyn Iterator<Item = &Branch>| {
-            branches
+            let branches: Vec<GraphPattern> = branches
                 .map(|b| this.branch(b, patterns, &names, &cq))
-                .reduce(|left, right| GraphPattern::Union {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
+                .collect();
+            (!branches.is_empty()).then(|| GraphPattern::union_all(branches))
         };
         if set {
             return union(self, &mut rewriting.branches.iter()).unwrap_or(original);
@@ -533,10 +553,7 @@ impl Rewriter<'_> {
                 }),
             }),
         };
-        GraphPattern::Union {
-            left: Box::new(original),
-            right: Box::new(added),
-        }
+        GraphPattern::union_all(vec![original, added])
     }
 
     /// Whether the data the query reads has the tree of `probe` at every individual of
@@ -883,27 +900,23 @@ impl Rewriter<'_> {
                 }
                 Part::Atom(atom) => triples.push(self.triple(atom, names)),
                 Part::Any(alternatives) => {
-                    let union = alternatives
-                        .iter()
-                        .map(|a| GraphPattern::Bgp {
-                            patterns: vec![self.triple(a, names)],
-                        })
-                        .reduce(|left, right| GraphPattern::Union {
-                            left: Box::new(left),
-                            right: Box::new(right),
-                        })
-                        .expect("an alternative");
+                    let union = GraphPattern::union_all(
+                        alternatives
+                            .iter()
+                            .map(|a| GraphPattern::Bgp {
+                                patterns: vec![self.triple(a, names)],
+                            })
+                            .collect(),
+                    );
                     unions.push(union);
                 }
             }
         }
-        let mut pattern = GraphPattern::Bgp { patterns: triples };
-        for union in unions {
-            pattern = GraphPattern::Join {
-                left: Box::new(pattern),
-                right: Box::new(union),
-            };
-        }
+        let mut pattern = GraphPattern::join_all(
+            std::iter::once(GraphPattern::Bgp { patterns: triples })
+                .chain(unions)
+                .collect(),
+        );
         // The variables the context reads that this branch made one with another term.
         for &(v, to) in &branch.merged {
             if cq.existential[v as usize] {
@@ -918,11 +931,7 @@ impl Rewriter<'_> {
                 TermPattern::Literal(l) => Expression::Literal(l),
                 _ => continue,
             };
-            pattern = GraphPattern::Extend {
-                inner: Box::new(pattern),
-                variable: variable.clone(),
-                expression,
-            };
+            pattern = pattern.extend(variable.clone(), expression);
         }
         pattern
     }
@@ -995,9 +1004,10 @@ fn path_names(
         E::Reverse(p) | E::ZeroOrMore(p) | E::OneOrMore(p) | E::ZeroOrOne(p) => {
             path_names(p, out)?;
         }
-        E::Sequence(a, b) | E::Alternative(a, b) => {
-            path_names(a, out)?;
-            path_names(b, out)?;
+        E::Sequence(paths) | E::Alternative(paths) => {
+            for p in paths {
+                path_names(p, out)?;
+            }
         }
         E::NegatedPropertySet(_) => return None,
     }

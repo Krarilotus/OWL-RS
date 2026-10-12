@@ -41,8 +41,9 @@ use nrese_sparql_syntax::algebra::PropertyPathExpression;
 pub(crate) enum Path {
     Link(Option<u64>),
     Reverse(Box<Path>),
-    Sequence(Box<Path>, Box<Path>),
-    Alternative(Box<Path>, Box<Path>),
+    /// The steps in order (ADR-0012: a list, walked in a loop however long).
+    Sequence(Vec<Path>),
+    Alternative(Vec<Path>),
     ZeroOrMore(Box<Path>),
     OneOrMore(Box<Path>),
     ZeroOrOne(Box<Path>),
@@ -57,8 +58,12 @@ impl Path {
         match path {
             PropertyPathExpression::NamedNode(n) => Self::Link(id(n)),
             PropertyPathExpression::Reverse(p) => Self::Reverse(boxed(p)),
-            PropertyPathExpression::Sequence(a, b) => Self::Sequence(boxed(a), boxed(b)),
-            PropertyPathExpression::Alternative(a, b) => Self::Alternative(boxed(a), boxed(b)),
+            PropertyPathExpression::Sequence(steps) => {
+                Self::Sequence(steps.iter().map(|p| Self::resolve(p, snapshot)).collect())
+            }
+            PropertyPathExpression::Alternative(paths) => {
+                Self::Alternative(paths.iter().map(|p| Self::resolve(p, snapshot)).collect())
+            }
             PropertyPathExpression::ZeroOrMore(p) => Self::ZeroOrMore(boxed(p)),
             PropertyPathExpression::OneOrMore(p) => Self::OneOrMore(boxed(p)),
             PropertyPathExpression::ZeroOrOne(p) => Self::ZeroOrOne(boxed(p)),
@@ -325,17 +330,8 @@ impl PathEvaluator<'_> {
                 .map(|(_, _, o)| o)
                 .collect(),
             Path::Reverse(p) => self.to(p, start),
-            Path::Sequence(a, b) => self
-                .from(a, start)
-                .into_iter()
-                .take_while(|_| !self.stopped())
-                .flat_map(|m| self.from(b, m))
-                .collect(),
-            Path::Alternative(a, b) => {
-                let mut ends = self.from(a, start);
-                ends.extend(self.from(b, start));
-                ends
-            }
+            Path::Sequence(steps) => self.ends_through(steps, vec![start]),
+            Path::Alternative(paths) => paths.iter().flat_map(|p| self.from(p, start)).collect(),
             Path::OneOrMore(p) => reachable(start, false, |n, out| self.step_from(p, n, out)),
             Path::ZeroOrMore(p) => {
                 if !self.is_node(start) {
@@ -359,6 +355,20 @@ impl PathEvaluator<'_> {
         }
     }
 
+    /// The ends reached from each of `starts` through `steps` in sequence (a bag: one
+    /// end per way through), step by step.
+    fn ends_through(&self, steps: &[Path], starts: Vec<u64>) -> Vec<u64> {
+        let mut nodes = starts;
+        for step in steps {
+            nodes = nodes
+                .into_iter()
+                .take_while(|_| !self.stopped())
+                .flat_map(|m| self.from(step, m))
+                .collect();
+        }
+        nodes
+    }
+
     /// Starts that reach `end` (a bag).
     pub(crate) fn to(&self, path: &Path, end: u64) -> Vec<u64> {
         match path {
@@ -368,17 +378,18 @@ impl PathEvaluator<'_> {
                 .map(|(s, _, _)| s)
                 .collect(),
             Path::Reverse(p) => self.from(p, end),
-            Path::Sequence(a, b) => self
-                .to(b, end)
-                .into_iter()
-                .take_while(|_| !self.stopped())
-                .flat_map(|m| self.to(a, m))
-                .collect(),
-            Path::Alternative(a, b) => {
-                let mut starts = self.to(a, end);
-                starts.extend(self.to(b, end));
-                starts
+            Path::Sequence(steps) => {
+                let mut nodes = vec![end];
+                for step in steps.iter().rev() {
+                    nodes = nodes
+                        .into_iter()
+                        .take_while(|_| !self.stopped())
+                        .flat_map(|m| self.to(step, m))
+                        .collect();
+                }
+                nodes
             }
+            Path::Alternative(paths) => paths.iter().flat_map(|p| self.to(p, end)).collect(),
             Path::OneOrMore(p) => reachable(end, false, |n, out| self.step_to(p, n, out)),
             Path::ZeroOrMore(p) => {
                 if !self.is_node(end) {
@@ -411,13 +422,16 @@ impl PathEvaluator<'_> {
             Path::Link(None) => 0,
             Path::Link(Some(p)) => self.quads(Some(start), Some(*p), Some(end)).count(),
             Path::Reverse(p) => self.multiplicity(p, end, start),
-            Path::Sequence(a, b) => self
-                .from(a, start)
-                .into_iter()
-                .map(|m| self.multiplicity(b, m, end))
-                .sum(),
-            Path::Alternative(a, b) => {
-                self.multiplicity(a, start, end) + self.multiplicity(b, start, end)
+            Path::Sequence(steps) => match steps.split_last() {
+                None => usize::from(start == end),
+                Some((last, before)) => self
+                    .ends_through(before, vec![start])
+                    .into_iter()
+                    .map(|m| self.multiplicity(last, m, end))
+                    .sum(),
+            },
+            Path::Alternative(paths) => {
+                paths.iter().map(|p| self.multiplicity(p, start, end)).sum()
             }
             Path::ZeroOrMore(_) | Path::OneOrMore(_) | Path::ZeroOrOne(_) => {
                 usize::from(self.connects(path, start, end))
@@ -438,11 +452,16 @@ impl PathEvaluator<'_> {
                 .next()
                 .is_some(),
             Path::Reverse(p) => self.connects(p, end, start),
-            Path::Sequence(a, b) => self
-                .from(a, start)
-                .into_iter()
-                .any(|m| self.connects(b, m, end)),
-            Path::Alternative(a, b) => self.connects(a, start, end) || self.connects(b, start, end),
+            Path::Sequence(steps) => match steps.split_last() {
+                None => start == end,
+                Some((last, before)) => {
+                    let mut middle = self.ends_through(before, vec![start]);
+                    middle.sort_unstable();
+                    middle.dedup();
+                    middle.into_iter().any(|m| self.connects(last, m, end))
+                }
+            },
+            Path::Alternative(paths) => paths.iter().any(|p| self.connects(p, start, end)),
             Path::ZeroOrMore(p) => {
                 if start == end {
                     self.is_node(start)
@@ -531,17 +550,21 @@ impl PathEvaluator<'_> {
                 .map(|(s, _, o)| (s, o))
                 .collect(),
             Path::Reverse(p) => self.open(p).into_iter().map(|(s, o)| (o, s)).collect(),
-            Path::Sequence(a, b) => self
-                .open(a)
-                .into_iter()
-                .take_while(|_| !self.stopped())
-                .flat_map(|(s, m)| self.from(b, m).into_iter().map(move |o| (s, o)))
-                .collect(),
-            Path::Alternative(a, b) => {
-                let mut pairs = self.open(a);
-                pairs.extend(self.open(b));
+            Path::Sequence(steps) => {
+                let Some((first, rest)) = steps.split_first() else {
+                    return self.nodes().into_iter().map(|n| (n, n)).collect();
+                };
+                let mut pairs = self.open(first);
+                for step in rest {
+                    pairs = pairs
+                        .into_iter()
+                        .take_while(|_| !self.stopped())
+                        .flat_map(|(s, m)| self.from(step, m).into_iter().map(move |o| (s, o)))
+                        .collect();
+                }
                 pairs
             }
+            Path::Alternative(paths) => paths.iter().flat_map(|p| self.open(p)).collect(),
             Path::OneOrMore(p) => self.closure_of(&self.open(p)),
             Path::ZeroOrMore(p) => {
                 let mut pairs = self.closure_of(&self.open(p));
@@ -636,7 +659,7 @@ mod tests {
             &snapshot,
         );
         let two = Path::resolve(
-            &PropertyPathExpression::Sequence(Box::new(step.clone()), Box::new(step)),
+            &PropertyPathExpression::Sequence(vec![step.clone(), step]),
             &snapshot,
         );
         let token = crate::CancellationToken::new();

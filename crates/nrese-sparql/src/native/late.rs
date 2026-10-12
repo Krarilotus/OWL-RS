@@ -49,9 +49,7 @@ pub(super) fn safe(pattern: &GraphPattern) -> bool {
                 && super::search::split(patterns).is_none()
                 && patterns.iter().all(super::supported_triple)
         }
-        GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
-            safe(left) && safe(right)
-        }
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => inputs.iter().all(safe),
         GraphPattern::LeftJoin {
             left,
             right,
