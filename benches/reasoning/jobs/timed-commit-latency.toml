@@ -1,0 +1,13 @@
+id = "reasoning-timed-commit-latency"
+group = "reasoning"
+host = "office-pc"
+checkout = "suite/reasoning"
+workload = "commit-latency"
+window = "quiet"
+priority = 2
+est_min = 90
+needs = ["docker"]
+env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server", NRESE_VERSION = "16c3bfb", HARNESS = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-bench-harness", NRESE_LICENSES = "/home/krarilotus/nrese-assets/kraris-gptler-20261009/snapshots/windows/nrese-bench/licenses", DOCKER_MEMORY = "20g", DOCKER_CPUS = "4" }
+commands = [
+  ["sh", "-c", "test -f /home/krarilotus/owlrs/queue/done/reasoning-qualify-commit-latency.toml && python3 benches/reasoning/maintenance/maintenance.py run --systems nrese,graphdb --tier lubm-10 --runs 3 --readers 0,1,8,64 --duration-s 60 --results \"$QUEUE_RESULTS\""],
+]

@@ -364,7 +364,7 @@ def cmd_run(args):
     protocol = argparse.Namespace(runs=args.runs, query_runs=0, cache="-", order="rotated", seed=SEED,
                                   timeout_s=args.timeout_s, query_timeout_s=args.timeout_s)
     manifest = Manifest(results, ROOT, sys.argv[1:], protocol, "docker", dict(os.environ))
-    writer = Writer(results / "results.csv", echo=print)
+    writer = CountingWriter(results / "results.csv", echo=print)
     runtime = DockerRuntime(Path(setting("MAINTENANCE_SCRATCH", str(Path.home() / "nrese-reasoning-suite/scratch"))),
                             args.port)
     code = 0
@@ -383,6 +383,23 @@ def cmd_run(args):
         runtime.cleanup()
         manifest.finish(code)
     print(f"results: {results / 'results.csv'}")
+    if writer.bad:
+        print(f"{writer.bad} rows wrong, failed or timed out")
+        return 1
+    return 0
+
+
+class CountingWriter(Writer):
+    """The suite's writer, counting the rows that went wrong: a queue job stops after one."""
+
+    def __init__(self, path: Path, echo=None):
+        super().__init__(path, echo)
+        self.bad = 0
+
+    def write(self, result: Result):
+        super().write(result)
+        if result.status in ("wrong", "failed", "timeout"):
+            self.bad += 1
 
 
 def main(argv=None):
@@ -402,7 +419,7 @@ def main(argv=None):
     pr.add_argument("--port", type=int, default=19352)
     pr.add_argument("--results", required=True)
     args = p.parse_args(argv)
-    {"prepare": prepare, "run": cmd_run}[args.command](args)
+    sys.exit({"prepare": prepare, "run": cmd_run}[args.command](args) or 0)
 
 
 if __name__ == "__main__":

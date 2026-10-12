@@ -309,7 +309,8 @@ class Run:
         return self.qualified().get(f"{self.case['name']}/{self.system}")
 
     def qualified(self) -> dict:
-        path = Path(self.args.results) / "qualified.json"
+        """The qualified totals: --qualified, else qualified.json in the results directory."""
+        path = Path(self.args.qualified) if self.args.qualified else Path(self.args.results) / "qualified.json"
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
     def finish(self, measured, reason_ms: float | None, derived: int | None, note: str):
@@ -319,22 +320,32 @@ class Run:
         if not measured.ok:
             return
         expected = self.total_expected()
-        if self.args.qualify and derived is not None:
-            known = self.qualified() | {f"{self.case['name']}/{self.system}": derived}
-            (Path(self.args.results) / "qualified.json").write_text(json.dumps(known, indent=1) + "\n", encoding="utf-8")
+        self.derived = derived
         status = "ok" if derived is not None and (expected is None or derived == expected) else "wrong"
         problem = "" if status == "ok" else f"derived {derived}, expected {expected}"
+        if status == "ok" and expected is None and not self.args.qualify:
+            # Checked before timed: without a published or qualified total, no time counts.
+            status, problem = "failed", "not qualified: no checked total to compare with (run --qualify first)"
         self.write(self.row("reason", status=status, ms=reason_ms if reason_ms is not None else "",
                             rows=derived if derived is not None else "", note=problem or "derived facts; time as the engine reports it"))
 
     def counts(self, counts: dict[str, int | None], note: str):
+        """The qualifying counts, one row per derived relation; where every count is there
+        and none contradicts a published one, the engine's total becomes the one its timed
+        runs must reproduce (qualified.json). Counts that differ between engines without a
+        published one are the suite's disputes (benches/suite/suitekit/summary.py)."""
+        passed = True
         for rel in self.program.derived:
             n = counts.get(rel)
             expected = self.expected.get(rel)
             status = "failed" if n is None else "ok" if expected is None or n == expected else "wrong"
+            passed &= status == "ok"
             self.write(self.row("query", item=f"count:{rel}", repeat=1, status=status,
                                 rows=n if n is not None else "",
                                 note=note + ("" if status != "wrong" else f"; expected {expected}")))
+        if passed and getattr(self, "derived", None) is not None:
+            known = self.qualified() | {f"{self.case['name']}/{self.system}": self.derived}
+            (Path(self.args.results) / "qualified.json").write_text(json.dumps(known, indent=1) + "\n", encoding="utf-8")
 
     def go(self):
         getattr(self, f"run_{self.system}")()
@@ -533,6 +544,18 @@ def selected(spec: str | None) -> list[str]:
     return names
 
 
+def qualified_for(args, case: dict, system: str) -> bool:
+    """Whether a timed run of `system` on `case` has a total to check against: the case's
+    published counts for every derived relation (FlowLog's programs), or the system's
+    qualified total."""
+    program = load_program(case)
+    expected = case.get("expected", {})
+    if not program.over_triples and all(rel in expected for rel in program.derived):
+        return True
+    known = json.loads(Path(args.qualified).read_text(encoding="utf-8"))
+    return f"{case['name']}/{system}" in known
+
+
 def version(system: str) -> str:
     if system == "nrese":
         return setting("NRESE_VERSION", "-")
@@ -544,6 +567,8 @@ def cmd_run(args):
     import platform
     if "nrese" in args.systems.split(",") and not setting("NRESE_BIN"):
         raise SystemExit("set NRESE_BIN to the nrese-server binary")
+    if args.qualified and not Path(args.qualified).is_file():
+        raise SystemExit(f"no qualified totals at {args.qualified}: the qualifying run hasn't passed; nothing timed")
     results = Path(args.results)
     results.mkdir(parents=True, exist_ok=True)
     args.date = datetime.datetime.now().isoformat(timespec="minutes")
@@ -558,7 +583,7 @@ def cmd_run(args):
     manifest.update(images={s: IMAGES.get(s, setting("NRESE_IMAGE", "ubuntu:24.04")) for s in systems},
                     settings={"DOCKER_CPUS": str(args.threads), "DOCKER_MEMORY": setting("DOCKER_MEMORY", "28g"),
                               "NRESE_BIN": setting("NRESE_BIN")})
-    writer = Writer(results / "results.csv", echo=print)
+    writer = CountingWriter(results / "results.csv", echo=print)
     runtime = DockerRuntime(Path(setting("DATALOG_SCRATCH", str(Path.home() / "nrese-reasoning-suite/scratch"))),
                             args.port)
     code = 0
@@ -573,6 +598,11 @@ def cmd_run(args):
                                         version=args.versions[system], publish="free", workload=workload(case), tier=tier(case),
                                         regime="-", run=0, task="load", status="skipped",
                                         note=f"not expressible: {why}"))
+                elif args.qualified and not qualified_for(args, case, system):
+                    writer.write(Result(date=args.date, host=args.host, runtime="docker", system=system,
+                                        version=args.versions[system], publish="free", workload=workload(case),
+                                        tier=tier(case), regime="-", run=0, task="load", status="skipped",
+                                        note="not qualified: its qualifying run gave no checked total"))
                 else:
                     runnable.append(system)
             for rep in range(1, args.runs + 1):
@@ -594,6 +624,24 @@ def cmd_run(args):
         runtime.cleanup()
         manifest.finish(code)
     print(f"results: {results / 'results.csv'}")
+    if writer.bad:
+        # A queue job stops here: nothing after a wrong or failed step should be timed.
+        print(f"{writer.bad} rows wrong, failed or timed out")
+        return 1
+    return 0
+
+
+class CountingWriter(Writer):
+    """The suite's writer, counting the rows that went wrong (a skipped pair isn't one)."""
+
+    def __init__(self, path: Path, echo=None):
+        super().__init__(path, echo)
+        self.bad = 0
+
+    def write(self, result: Result):
+        super().write(result)
+        if result.status in ("wrong", "failed", "timeout"):
+            self.bad += 1
 
 
 def main(argv=None):
@@ -614,10 +662,11 @@ def main(argv=None):
     pr.add_argument("--results", required=True)
     pr.add_argument("--port", type=int, default=19351)
     pr.add_argument("--qualify", action="store_true", help="also count every derived relation (untimed check)")
+    pr.add_argument("--qualified", help="the qualifying run's qualified.json, when it wrote another results directory")
     pr.add_argument("--keep", action="store_true", help="keep each run's scratch")
     pr.add_argument("--vlog-threads", action="store_true", help="VLog and GLog in their multithreaded mode")
     args = p.parse_args(argv)
-    {"list": cmd_list, "prepare": cmd_prepare, "translate": cmd_translate, "run": cmd_run}[args.command](args)
+    sys.exit({"list": cmd_list, "prepare": cmd_prepare, "translate": cmd_translate, "run": cmd_run}[args.command](args) or 0)
 
 
 if __name__ == "__main__":

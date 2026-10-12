@@ -1,0 +1,15 @@
+id = "reasoning-qualify-lubm-rdfox"
+group = "reasoning"
+host = "office-pc"
+checkout = "suite/reasoning"
+workload = "lubm"
+window = "any"
+priority = 1
+est_min = 60
+needs = ["docker"]
+env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server", NRESE_VERSION = "16c3bfb", DOCKER_MEMORY = "28g" }
+commands = [
+  ["python3", "benches/reasoning/datalog/datalog.py", "prepare", "--cases", "lubm-l-1,lubm-le-1,lubm-l-125,lubm-le-125"],
+  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --qualify --runs 1 --threads 4 --cases lubm-l-1,lubm-le-1 --results \"$QUEUE_RESULTS/qualify\""],
+  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --qualify --runs 1 --threads 4 --cases lubm-l-125,lubm-le-125 --results \"$QUEUE_RESULTS/qualify\""],
+]
