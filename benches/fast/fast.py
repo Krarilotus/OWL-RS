@@ -224,7 +224,11 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     except subprocess.TimeoutExpired:
         subprocess.run(["systemctl", "--user", "kill", "--signal=KILL", f"{unit}.scope"], capture_output=True)
         return 124, "", f"timed out after {timeout} s", time.monotonic() - started
-    return done.returncode, done.stdout, done.stderr, time.monotonic() - started
+    # The peak first: a record's note is the last line of stderr, the command's own.
+    peaks = SCOPE_PEAK.findall(done.stderr)
+    err = SCOPE_PEAK.sub("", done.stderr).rstrip("\n")
+    err = (f"fast-scope-peak {peaks[-1]}\n" if peaks else "") + err
+    return done.returncode, done.stdout, err, time.monotonic() - started
 
 
 def scope_peak_mib(stderr: str) -> int | None:
