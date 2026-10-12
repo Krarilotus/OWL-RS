@@ -2,7 +2,7 @@
 # every contender and NRESE under the rootfs runtime on phuoc-yu, answers captured, to be
 # compared query by query with the Docker run. Inside the quiet slot, so that it never runs
 # beside another thread's timing on this host; its own times are not used.
-id = "sparql-qualify-rootfs-phuoc"
+id = "sparql-qualify-rootfs-phuoc-2"
 group = "sparql"
 host = "phuoc-yu"
 checkout = "suite/sparql"
@@ -12,7 +12,7 @@ commands = [
    "--workloads", "watdiv", "--tier", "watdiv=watdiv-10m", "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build",
    "--runs", "1", "--query-runs", "1", "--cache", "off", "--timeout-s", "3600", "--query-timeout-s", "300",
    "--answers", "full", "--answers-reference", "jena,oxigraph",
-   "--results", "/home/krarilotus/owlrs/results/sparql-qualify-rootfs-phuoc"],
+   "--results", "/home/krarilotus/owlrs/results/sparql-qualify-rootfs-phuoc-2"],
 ]
 env = { NRESE_QUIET_DRAIN_S = "3600", NRESE_BIN = "/home/krarilotus/owlrs/sparql-bin/1b611e7/nrese-server", HARNESS = "/home/krarilotus/owlrs/sparql-bin/1b611e7/nrese-bench-harness", NRESE_BENCH_SCRATCH = "/home/krarilotus/owlrs/sparql-scratch", DOCKER_MEMORY = "12g", JAVA_HEAP = "8g" }
 needs = []
