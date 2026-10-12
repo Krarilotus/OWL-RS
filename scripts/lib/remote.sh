@@ -26,16 +26,18 @@ GIT_INDEX_FILE=$index git add -A
 tree=$(GIT_INDEX_FILE=$index git write-tree)
 snapshot=$(git commit-tree "$tree" -p HEAD -m "snapshot of $name")
 
-# A host whose users need it back (its guard wrote ~/owlrs/RETREAT, tools/office-guard) takes no
-# builds: use the fallback host (git config nrese.buildHostFallback) or stop here.
-if ssh -o BatchMode=yes "$host" "test -f $root/RETREAT"; then
+# While the host's owners use it (its guard wrote ~/owlrs/RETREAT, tools/office-guard), a build
+# runs capped: 8 threads, 6 GB, the lowest CPU and I/O priority, in a scope the guard spares.
+# An unreachable host falls back to nrese.buildHostFallback.
+capped=""
+if ! ssh -o BatchMode=yes -o ConnectTimeout=8 "$host" true 2>/dev/null; then
   fallback=$(git config --get nrese.buildHostFallback)
-  if [ -z "$fallback" ] || ssh -o BatchMode=yes "$fallback" "test -f $root/RETREAT"; then
-    echo "$host is in use by its owners (RETREAT); no build host free, try again later" >&2
-    exit 75
-  fi
-  echo "$host is in use by its owners; building on $fallback" >&2
+  [ -n "$fallback" ] || { echo "$host unreachable and no fallback host" >&2; exit 75; }
+  echo "$host unreachable; building on $fallback" >&2
   host=$fallback
+elif ssh -o BatchMode=yes "$host" "test -f $root/RETREAT"; then
+  echo "$host is in use by its owners; building capped" >&2
+  capped="systemd-run --user --scope -q --unit=owlrs-capped-$name-$$ -p MemoryMax=6G -p CPUQuota=800% nice -n 19 ionice -c3 env CARGO_BUILD_JOBS=8"
 fi
 ssh -o BatchMode=yes "$host" "[ -d $root/repo.git ] || git init -q --bare $root/repo.git" || exit 2
 # Transport only: the hooks of this repository would start the gate again on this push.
@@ -46,12 +48,12 @@ prepare="export PATH=\$HOME/.cargo/bin:\$PATH NRESE_ON_BUILD_HOST=1 && cd $root 
   cd wt/$name && git checkout -q -f --detach $snapshot && git clean -q -fd"
 case ${1:-} in
   check)
-    ssh -o BatchMode=yes "$host" "$prepare && NRESE_FILES_FROM=/dev/stdin bash scripts/check.sh $2" \
+    ssh -o BatchMode=yes "$host" "$prepare && NRESE_FILES_FROM=/dev/stdin $capped bash scripts/check.sh $2" \
       < "${3:-/dev/null}"
     ;;
   run)
     shift
-    ssh -o BatchMode=yes "$host" "$prepare && $*"
+    ssh -o BatchMode=yes "$host" "$prepare && $capped bash -c $(printf %q "$*")"
     ;;
   *)
     echo "usage: scripts/lib/remote.sh check MODE [FILES] | run CMD..." >&2
