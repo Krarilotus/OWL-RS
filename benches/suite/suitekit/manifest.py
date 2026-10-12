@@ -123,6 +123,14 @@ def machine(runtime: str) -> dict:
         "memory_gib": round((memory_bytes() or 0) / 2**30, 1),
         "python": platform.python_version(),
     }
+    # What changes timings on the host, as the run found it (hosts.toml `config` records the
+    # intended configuration; compare checks both).
+    for key, path in (("governor", "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+                      ("perf_event_paranoid", "/proc/sys/kernel/perf_event_paranoid")):
+        try:
+            out[key] = Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
     if runtime == "docker":
         out["container_start_ms"] = container_start_ms()
         info = _out(["docker", "info", "--format", "{{.ServerVersion}}|{{.NCPU}}|{{.MemTotal}}|{{.OperatingSystem}}"])

@@ -122,5 +122,6 @@ findings = [
   "Space: no cgroup peak grew beyond +10 % and +64 MiB. classify-store-horn's process peak (VmHWM) is bimodal: base 273/289/530/625 MiB, pr23 605/637/666/841 MiB, its cgroup peak 3,444 -> 3,430 MiB (page cache dominates it); a watch item, not a regression.",
   "Known issues unchanged: mem-load-20m-2g needs 5.1 GiB past its 2 GiB cap on both sides (median of 4 runs at 8 GB), dl-transitive-400 gives up at 300 s too, vector-knn-filtered's recall 0.40-0.60 against a 0.9 gate.",
   "compare first read only one run past a limit per side and flagged mem-load-20m-2g's (4,032 -> 5,201 MiB, base's first run an outlier); it now takes the medians of all of them.",
+  "Host configuration: phuoc-yu as configured since 2026-10-09 (Zig cc wrappers, powersave governor; hosts.toml config). Phuoc-Yu changed at 13:00 (gcc 15.2, performance governor): these timings don't compare with runs from then on.",
   "rl-hierarchy's 54 % spread is base's first pass (2,668 ms, while its data was copied in); the other seven passes 1,729-1,846 ms.",
 ]

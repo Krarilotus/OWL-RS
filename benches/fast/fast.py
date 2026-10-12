@@ -1034,7 +1034,8 @@ def compare(args) -> int:
     min_ms = getattr(args, "min_ms", 2.0)
     if not math.isfinite(min_ms) or min_ms < 0:
         raise ValueError("--min-ms must be finite and nonnegative")
-    return compare_reports(load_report(Path(args.base)), load_report(Path(args.new)), min_ms)
+    return compare_reports(load_report(Path(args.base)), load_report(Path(args.new)), min_ms,
+                           getattr(args, "allow_host_change", False))
 
 
 # --- list, clean -----------------------------------------------------------------------------
@@ -1153,6 +1154,8 @@ def main() -> int:
     c.add_argument("new")
     c.add_argument("--min-ms", type=float, default=2.0,
                    help="absolute latency floor in ms (default 2); explicitly lower for microcase comparisons")
+    c.add_argument("--allow-host-change", action="store_true",
+                   help="compare runs of different hosts or host configurations anyway, flagged")
     args = p.parse_args()
     if args.command == "compete":
         from compete import compete

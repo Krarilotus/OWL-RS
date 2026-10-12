@@ -98,6 +98,10 @@ timeout) to run once more past it, so that its record says what it needs.
 `compare BASE NEW` owns the thresholds every comparison of this directory uses
 ([PROTOCOL.md §5](../PROTOCOL.md#5-statistics) states the rules they implement).
 
+0. **One host, one configuration:** runs of different hosts, or of one host under different
+   configurations (its `config` in [hosts.toml](../hosts.toml) when each run started, or
+   the CPU governor the runs read), are refused (exit 2); `--allow-host-change` compares
+   them anyway, flagged as no evidence of a code change.
 1. **Lost work first:** cases, repetitions, series or client widths missing on one side,
    and failed checks, are listed before any time. A known issue (the outcome a case
    declares, such as a memory limit, on both sides) earns no timing verdict: its checked
