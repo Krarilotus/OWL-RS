@@ -16,7 +16,7 @@ metric = "reason.p50_ms"
 check = { "q.root.value" = "expect.instances_of_root", "q.spine-middle.value" = "expect.instances_of_spine_middle", "q.h1.value" = "expect.instances_of_h1" }
 route = { "reason.rounds" = "<= 3" }
 cap_gb = 8
-systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:closure", "oxigraph:closure", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
+systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "qlever:closure", "oxigraph:closure", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["schema compiled first: sup⁺(c) dispatch, hierarchy module by SCC and bitsets"]
 pinned = "the generator's counts"
 [[case]]
@@ -31,7 +31,7 @@ metric = "reason.p50_ms"
 check = { "q.root.value" = "expect.instances_of_root", "q.spine-middle.value" = "expect.instances_of_spine_middle", "q.h1.value" = "expect.instances_of_h1" }
 route = { "reason.rounds" = "<= 3" }
 cap_gb = 8
-systems = ["jena:rdfs", "rdf4j:rdfs", "graphdb:rdfs", "rdfox:rdfs", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
+systems = ["jena:rdfs", "rdf4j:rdfs", "graphdb:rdfs", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 rewrite = "expressible"
 [[case]]
 name = "rl-clique"
@@ -45,7 +45,7 @@ metric = "reason.p50_ms"
 check = { "q.pairs.value" = "expect.pairs", "q.one-component.value" = "300" }
 route = { "reason.rounds" = "<= 3" }
 cap_gb = 6
-systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
+systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 hangs = { "jena:owl-horst" = "6 Oct 2026: Jena's OWL rules gave no answer to the count within 900 s, and both queries timed out at 120 s (lazy reasoning over 3.6 M clique pairs); recorded, not run again" }
 guards = ["modules for recursive shapes: an equivalence property by union-find"]
 rewrite = "expressible"
@@ -61,7 +61,7 @@ metric = "reason.p50_ms"
 check = { "q.values.value" = "expect.values", "q.same-as.value" = "expect.same_as_pairs", "q.knows.value" = "expect.knows", "q.group-values.rows" = 10 }
 route = {}
 cap_gb = 6
-systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
+systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["equality by representatives: facts over each class's smallest id, expanded at read time"]
 rewrite = "not-expressible"
 [[case]]
@@ -92,7 +92,7 @@ metric = "reason.p50_ms"
 check = { "q.pairs.value" = "expect.pairs", "q.from-start.value" = "2499" }
 route = { "reason.rounds" = "<= 3" }
 cap_gb = 6
-systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
+systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["transitive properties by SCC condensation and bitset reachability"]
 rewrite = "expressible"
 hangs = { "jena:owl-horst" = "6 Oct 2026: Jena's OWL rules gave no answer to the count within 16 min (lazy reasoning over a 6.2 M-pair transitive closure); recorded, not run again" }
@@ -110,7 +110,7 @@ metric = "reason.p50_ms"
 check = { "reason.inferred" = 8726942, "q.q06.rows" = 1048532, "q.q14.rows" = 795970, "q.q09.rows" = 27247 }
 route = { "reason.rounds" = "<= 6" }
 cap_gb = 12
-systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:closure", "oxigraph:closure", "virtuoso:closure", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
+systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "qlever:closure", "oxigraph:closure", "virtuoso:closure", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["P1-F1 drivers read in place", "P1-F4 no list of derived facts", "P1-F8 candidates deduplicated and probed in order"]
 pinned = "NRESE 5 Oct 2026; to equal Nemo's closure plus NRESE's 32 axiomatic statements (fast.py compete)"
 
@@ -126,7 +126,7 @@ metric = "reason.p50_ms"
 check = { "reason.inferred" = 1399563, "q.q20.rows" = 1311932 }
 route = { "reason.rounds" = "<= 6" }
 cap_gb = 6
-systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
+systems = ["nemo:owl2-rl", "jena:owl-horst", "graphdb:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 hangs = { "jena:owl-horst" = "6 Oct 2026: Jena's OWL rules gave no answer to the count within 900 s nor to q01 after 27 min in all (lazy reasoning over a 1.3 M-pair clique); stopped, recorded, not run again" }
 pinned = "NRESE 5 Oct 2026, the closure Nemo and owlrl agree with (run record office-b)"
 [[case]]
@@ -235,7 +235,7 @@ metric = "commits.p50_ms"
 check = { "closure_after_commits.equal" = "true", "commits.commits" = 4000, "q.students.value" = "200500" }
 route = { "commits.incremental" = "== true" }
 cap_gb = 6
-systems = ["graphdb:owl2-rl", "rdfox:owl2-rl"]
+systems = ["graphdb:owl2-rl"]
 
 [[case]]
 name = "commits-rdfs"
@@ -249,7 +249,7 @@ metric = "commits.p50_ms"
 check = { "closure_after_commits.equal" = "true", "commits.commits" = 4000 }
 route = { "commits.incremental" = "== true" }
 cap_gb = 6
-systems = ["graphdb:rdfs", "rdfox:rdfs"]
+systems = ["graphdb:rdfs"]
 
 [[case]]
 name = "commits-plain"
@@ -278,7 +278,7 @@ metric = "commits.p50_ms"
 check = { "closure_after_commits.equal" = "true", "q.pairs.value" = "expect.pairs_after_commits", "q.from-source.value" = "expect.from_source_after_commits" }
 route = { "commits.incremental" = "== true" }
 cap_gb = 6
-systems = ["graphdb:owl2-rl", "rdfox:owl2-rl"]
+systems = ["graphdb:owl2-rl"]
 
 [[case]]
 name = "deletes-clique"
@@ -292,7 +292,7 @@ metric = "commits.p50_ms"
 check = { "closure_after_commits.equal" = "true", "q.pairs.value" = "expect.pairs_after_commits" }
 route = { "commits.incremental" = "== true" }
 cap_gb = 6
-systems = ["graphdb:owl2-rl", "rdfox:owl2-rl"]
+systems = ["graphdb:owl2-rl"]
 
 # --- OWL 2 DL and EL ---------------------------------------------------------------------------
 
@@ -1016,7 +1016,7 @@ metric = "reason.p50_ms"
 check = { "closure_after_commits.equal" = "true", "q.values.value" = "expect.values_after_split" }
 route = {}
 cap_gb = 8
-systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
+systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["Store-2: equality by class ids; a deletion splits a class (B/F style)"]
 rewrite = "not-expressible"
 [[case]]
@@ -1031,7 +1031,7 @@ metric = "commits.p99_ms"
 check = { "closure_after_commits.equal" = "true", "commits.commits" = 3000 }
 route = { "commits.incremental" = "== true" }
 cap_gb = 6
-systems = ["graphdb:owl2-rl", "rdfox:owl2-rl"]
+systems = ["graphdb:owl2-rl"]
 
 [[case]]
 name = "dl-pipeline"

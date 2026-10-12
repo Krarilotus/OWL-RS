@@ -90,6 +90,8 @@ def problems(cases: list[dict], systems: dict, workloads: dict | None = None,
             system, _, semantics = entry.partition(":")
             if system not in systems:
                 out.append(f"{where}: comparator {system!r} is not in suite/systems.toml")
+            elif systems[system].get("refused"):
+                out.append(f"{where}: comparator {system!r} is never measured ({systems[system]['refused']})")
             if semantics not in COMPARATOR_SEMANTICS:
                 out.append(f"{where}: comparator {entry!r}: semantics {semantics!r} is not one of "
                            f"{', '.join(sorted(COMPARATOR_SEMANTICS))}")
