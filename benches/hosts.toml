@@ -8,6 +8,10 @@
 # test suites), measure (runs benchmarks), cluster (runs the suite under SLURM).
 # has: what cases may need (docker, java, apptainer); a driver refuses a case whose
 # needs the host lacks.
+# config: the host's configurations, newest first, each from `since` (the host's local
+# time): what changes timings (toolchain, CPU governor, profiling, page-cache control).
+# compare refuses to set two runs of different configurations side by side
+# (suitekit/compare.py); a run's configuration is the one in force when it started.
 
 [assets]
 # Immutable preservation copies, SHA-256-verified on office-pc and phuoc-yu (receipts in
@@ -56,6 +60,20 @@ roles = ["measure"]
 has = []
 assets = true
 binaries = "office-pc builds; record the source revision and binary SHA-256 and check CPU features and glibc symbols before use"
+
+[[host.phuoc-yu.config]]
+since = "2026-10-12T13:00"
+toolchain = "gcc 15.2 as cc and linker (Ubuntu 15.2.0-16ubuntu1); Rust 1.98.1 (rustup)"
+governor = "performance"
+perf_event_paranoid = 1
+cold_cache = "sudo -n /usr/local/sbin/owlrs-drop-caches"
+note = "profiling allowed; the page cache can be emptied before a cold run; measure only, builds on office-pc"
+
+[[host.phuoc-yu.config]]
+since = "2026-10-09"
+toolchain = "Zig cc wrappers (~/.local/bin/cc) as cc and linker; Rust 1.98.1 (rustup)"
+governor = "powersave"
+note = "the runs of 9 to 12 October 2026 (the PR #23 acceptance A/B ended 12:14)"
 
 [host.khaleesi]
 ssh = "Khaleesi"

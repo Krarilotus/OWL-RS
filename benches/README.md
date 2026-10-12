@@ -98,7 +98,10 @@ query on the same data is one group, classified `ok`, `wrong` (whose), `incomple
 `measure`, `cluster`), what it has (Docker, Java, Apptainer), and the verified inputs under
 the preservation root on the hosts that hold it. Only a `build` host compiles Rust and runs
 the gate (`scripts/lib/remote.sh`, `git config nrese.buildHost`); a `measure`-only host runs
-binaries a build host made, with their source revision and SHA-256 recorded. Inputs are
+binaries a build host made, with their source revision and SHA-256 recorded. What changes
+timings on a host (toolchain, CPU governor, profiling, page-cache control) is its `config`,
+dated: a change starts a new configuration, and `compare` refuses to set runs of two
+configurations side by side; earlier records stay valid. Inputs are
 used read-only and shared across worktrees; generated data, stores, scratch and results
 live elsewhere. `~/.config/nrese-bench.env` on a host names only what changes per campaign
 (the binaries under test, the results directory), and is sourced explicitly.

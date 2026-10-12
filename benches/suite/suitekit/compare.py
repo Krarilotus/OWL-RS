@@ -14,7 +14,11 @@ order, so that nothing lost hides behind a time:
 5. **Disk:** store sizes.
 
     suite.py compare BASE NEW [--min-ms 2] [--threshold 0.10] [--systems S] [--include-restricted]
-    fast.py compare BASE.json NEW.json [--min-ms 2]
+    fast.py compare BASE.json NEW.json [--min-ms 2] [--allow-host-change]
+
+Runs of different hosts, or of one host under different configurations (benches/hosts.toml
+`config`, or a different CPU governor read by the runs), are not compared: compare exits 2
+unless --allow-host-change, and then flags every verdict as no evidence of a code change.
 
 BASE and NEW are fast-suite reports (`.json`: the full report, or a compact record that
 names it), perf-lab reports (`.json` with `queries`), or suite results (directories or
@@ -33,6 +37,7 @@ import re
 import statistics
 from pathlib import Path
 
+from . import hosts
 from .schema import read
 from .summary import Item, Pair, estimate, summarise
 
@@ -374,10 +379,58 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
     return spreads
 
 
-def compare_reports(base_report: dict, new_report: dict, min_ms: float = 2.0) -> int:
+# --- the hosts a comparison spans ------------------------------------------------------------
+
+def identity(machine: dict | None, started: str | None) -> dict | None:
+    """A run's host, the configuration in force when it started (hosts.toml `config`), and
+    the governor it read; None for a report that doesn't say (a perf-lab report)."""
+    if not machine or not started:
+        return None
+    return hosts.run_identity(machine, started)
+
+
+def host_check(base: list[dict | None], new: list[dict | None], allow: bool) -> int | None:
+    """Prints what differs between the hosts and configurations of the two sides (and within
+    a side). A difference refuses the comparison (exit 2) unless `allow`: then it is flagged
+    and the comparison goes on. None when nothing stands in the way."""
+    problems = []
+    known = [i for i in base + new if i is not None]
+    if len(known) < len(base) + len(new):
+        problems.append("unknown host for some runs (a report without its machine): not checked")
+    hosts_seen = {(i["host"], i["config"]) for i in known}
+    if len({h for h, _ in hosts_seen}) > 1:
+        problems.append("different hosts: " + ", ".join(sorted({h for h, _ in hosts_seen})))
+    elif len(hosts_seen) > 1:
+        problems.append(f"{known[0]['host']} changed its configuration between the runs (hosts.toml config since "
+                        + " and ".join(sorted(c for _, c in hosts_seen)) + ")")
+    governors = {i["governor"] for i in known if i.get("governor")}
+    if len(governors) > 1:
+        problems.append("the runs read different CPU governors: " + ", ".join(sorted(governors)))
+    blocking = [p for p in problems if not p.startswith("unknown host")]
+    if not problems:
+        return None
+    print("## Host configuration\n")
+    for problem in problems:
+        print(f"- {problem}")
+    if blocking and not allow:
+        print("\nREFUSED: timings of different hosts or host configurations don't compare "
+              "(--allow-host-change compares them anyway, flagged)")
+        return 2
+    if blocking:
+        print("\nFLAGGED: compared across a host change on request; no time or memory verdict below is "
+              "evidence of a code change")
+    print()
+    return None
+
+
+def compare_reports(base_report: dict, new_report: dict, min_ms: float = 2.0, allow_host_change: bool = False) -> int:
     """Two fast-suite (or perf-lab) reports; the exit status."""
     if not math.isfinite(min_ms) or min_ms < 0:
         raise ValueError("--min-ms must be finite and nonnegative")
+    refused = host_check([identity(base_report.get("machine"), base_report.get("started"))],
+                         [identity(new_report.get("machine"), new_report.get("started"))], allow_host_change)
+    if refused:
+        return refused
     for name, report in (("base", base_report), ("new", new_report)):
         if report.get("reps", 2) < 2:
             print(f"warning: the {name} run has one repetition: its spread is unknown, so a verdict "
@@ -426,6 +479,19 @@ def memory_kinds(paths: list[Path]) -> dict[tuple, str]:
                 continue
             kind = r.get("memory_kind") or ("sampled" if r.get("runtime") == "docker" else "lifetime")
             out[(r["workload"], r["tier"], r["system"], r["task"])] = kind
+    return out
+
+
+def manifest_identities(paths: list[Path]) -> list[dict | None]:
+    """The host identity of every invocation in the manifest.json beside each results file."""
+    out = []
+    for path in dict.fromkeys(p.resolve() for p in paths):
+        try:
+            invocations = json.loads((path.parent / "manifest.json").read_text(encoding="utf-8"))["invocations"]
+        except (OSError, ValueError, KeyError):
+            out.append(None)
+            continue
+        out += [identity(i.get("machine"), i.get("started")) for i in invocations] or [None]
     return out
 
 
@@ -576,11 +642,17 @@ def main(argv: list[str]) -> int:
     p.add_argument("--threshold", type=float, default=0.10, help="relative change that counts (default 0.10)")
     p.add_argument("--min-ms", type=float, default=2.0, help="absolute change that counts, ms (default 2)")
     p.add_argument("--include-restricted", action="store_true")
+    p.add_argument("--allow-host-change", action="store_true",
+                   help="compare runs of different hosts or host configurations anyway, flagged")
     args = p.parse_args(argv)
     if args.base.endswith(".json") and args.new.endswith(".json"):
-        return compare_reports(load_report(Path(args.base)), load_report(Path(args.new)), args.min_ms)
+        return compare_reports(load_report(Path(args.base)), load_report(Path(args.new)), args.min_ms,
+                               args.allow_host_change)
     systems = set(args.systems.split(",")) if args.systems else None
     base_files, new_files = files(args.base), files(args.new)
+    refused = host_check(manifest_identities(base_files), manifest_identities(new_files), args.allow_host_change)
+    if refused:
+        return refused
     base = collect(base_files, systems, args.include_restricted)
     new = collect(new_files, systems, args.include_restricted)
     print(f"# {args.new} against {args.base}\n")

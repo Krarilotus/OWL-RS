@@ -257,6 +257,26 @@ class FastComparison(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("QPS: NOT COMPARABLE", text)
 
+    def test_runs_across_a_host_configuration_change_are_refused_unless_flagged(self):
+        def on(started, governor=None):
+            data = report(1)
+            data["machine"] = {"host": "Phuoc-Yu", **({"governor": governor} if governor else {})}
+            data["started"] = started
+            return data
+        before, after = on("2026-10-12T10:51:30"), on("2026-10-12T14:00:00")
+        code, text = comparison(before, after)
+        self.assertEqual(code, 2)
+        self.assertIn("changed its configuration", text)
+        self.assertIn("REFUSED", text)
+        code, text = comparison(before, after, allow_host_change=True)
+        self.assertEqual(code, 0)
+        self.assertIn("FLAGGED", text)
+        # One configuration: compared; a governor the runs read differently: refused.
+        self.assertEqual(comparison(on("2026-10-12T14:00:00"), after)[0], 0)
+        code, text = comparison(on("2026-10-12T14:00:00", "powersave"), on("2026-10-12T15:00:00", "performance"))
+        self.assertEqual(code, 2)
+        self.assertIn("governors", text)
+
     def test_qps_noise_is_taken_from_qps_not_latency(self):
         new = report(qps={1: 50})
         for r, value in zip(new["records"], (20, 50, 150)):
