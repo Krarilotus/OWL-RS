@@ -239,3 +239,31 @@ data = "lubm-125"
 published = { vlog = "208.7 s, 3,133 MB", glog = "18.1 s, 1,467 MB" }
 derived = { glog = 38891063 }
 home = "glog, rdfox"
+
+# The qualifiers of the programs over triples: LUBM(1) with the same L and LE programs, small
+# enough to check every engine's path in a minute.
+[[case]]
+name = "lubm-l-1"
+workload = "lubm"
+tier = "rdfox-l-1"
+format = "triples"
+program = "LUBM_L.dlog"
+program_url = "https://drive.usercontent.google.com/download?id=1PPlb43Z5_3FlD4lKmkbLp3fskMkp8L5p&export=download&confirm=t"
+program_sha256 = "d29db99e5221f6598701523651de32ce7673a0fd64aa8139989ee4fe62c3b520"
+source = "lubm"
+universities = 1
+data = "lubm-1"
+home = "glog, vlog, rdfox"
+
+[[case]]
+name = "lubm-le-1"
+workload = "lubm"
+tier = "rdfox-le-1"
+format = "triples"
+program = "LUBM_LE.dlog"
+program_url = "https://drive.usercontent.google.com/download?id=1mZwaWgKPslYMYx7UIxy0CQVBU_M2ytGa&export=download&confirm=t"
+program_sha256 = "6f1312cff49bc2850537d96f2d1dfd41cedd9c0cbd1f1d0c1d48073a2b4489df"
+source = "lubm"
+universities = 1
+data = "lubm-1"
+home = "glog, rdfox"

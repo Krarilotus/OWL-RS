@@ -1,0 +1,16 @@
+id = "reasoning-timed-claros"
+group = "reasoning"
+host = "office-pc"
+checkout = "suite/reasoning"
+workload = "claros"
+window = "quiet"
+priority = 2
+est_min = 240
+needs = ["docker"]
+env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server", NRESE_VERSION = "16c3bfb", DOCKER_MEMORY = "28g" }
+# Claros-L three times; then Claros-LE once with its own qualification (about 549 M facts:
+# a frontier on a 31 GiB host; a step past its 2 h limit is a timeout, never a time).
+commands = [
+  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --runs 3 --threads 4 --timeout-s 7200 --cases claros-l --qualified /home/krarilotus/owlrs/results/reasoning-qualify-claros/qualify/qualified.json --results \"$QUEUE_RESULTS\""],
+  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --qualify --runs 1 --threads 4 --timeout-s 7200 --cases claros-le --results \"$QUEUE_RESULTS/claros-le\" || true"],
+]

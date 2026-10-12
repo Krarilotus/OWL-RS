@@ -1,0 +1,15 @@
+id = "reasoning-timed-datalog-graphs"
+group = "reasoning"
+host = "office-pc"
+checkout = "suite/reasoning"
+workload = "datalog-graphs"
+window = "quiet"
+priority = 2
+est_min = 300
+needs = ["docker"]
+env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server", NRESE_VERSION = "16c3bfb", DOCKER_MEMORY = "28g" }
+# FlowLog's Table 1 has Soufflé at 4 threads: the matched scenario is 4 CPUs for every engine
+# (Nemo, VLog and GLog use one by design).
+commands = [
+  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --runs 3 --threads 4 --cases tc-G10K,sg-G10K,cspa-httpd,cspa-linux,cspa-postgresql --qualified /home/krarilotus/owlrs/results/reasoning-qualify-datalog-graphs/qualify/qualified.json --results \"$QUEUE_RESULTS\""],
+]
