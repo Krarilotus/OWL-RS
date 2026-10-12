@@ -16,7 +16,7 @@ case ${1:-} in millenniumdb|gcare) build=1 ;; *) build=0 ;; esac
 [ "$build" = 1 ] && while [ -d "$lock" ] && kill -0 "$(cat "$lock/pid" 2>/dev/null || echo 0)" 2>/dev/null; do
   echo "quiet slot held by $(cat "$lock/who" 2>/dev/null): waiting"; sleep 60
 done
-[ "$build" = 0 ] || docker buildx inspect "$BUILDER" >/dev/null 2>&1 || docker buildx create -q --name "$BUILDER" --driver docker-container \
+[ "$build" = 0 ] || docker buildx inspect "$BUILDER" >/dev/null 2>&1 || docker buildx create --name "$BUILDER" --driver docker-container \
   --driver-opt cpuset-cpus=0-7 --driver-opt cpu-shares=2 --driver-opt memory=8g --driver-opt memory-swap=8g >/dev/null
 case ${1:-} in
   millenniumdb)
