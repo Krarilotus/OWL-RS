@@ -228,7 +228,7 @@ def all_ntriples(inputs: list[str]) -> bool:
 class Adapter:
     key = ""
     regimes: dict[str, str] = {"none": ""}
-    runtimes = {"docker", "apptainer"}
+    runtimes = {"docker", "apptainer", "rootfs"}
     answers_only = False
     serves_from_load = False
     persistent = True  # the store is on disk (a size and a restart are measured)
@@ -295,7 +295,7 @@ class Nrese(Adapter):
     result_cache = True
     regimes = {"none": "disabled", "rdfs": "rdfs", "owl-horst": "owl-horst",
                "owl2-rl": "owl2-rl", "owl2-ql": "owl2-ql"}
-    runtimes = {"docker", "apptainer", "process"}
+    runtimes = {"docker", "apptainer", "rootfs", "process"}
     # The Docker build's output, mounted at /target (NRESE_TARGET_VOLUME: a worktree's own).
     target_volume = os.environ.get("NRESE_TARGET_VOLUME", "nrese-target")
     bin_setting = "NRESE_BIN"
@@ -365,6 +365,10 @@ class Nrese(Adapter):
             env["NRESE_QUERY_CACHE_BYTES"] = "0"
         if ctx.setting("QUERY_MEMORY_MIB"):
             env["NRESE_MAX_QUERY_MEMORY_BYTES"] = str(int(ctx.setting("QUERY_MEMORY_MIB")) * 1048576)
+        # All queries together (default half the memory): TOTAL_QUERY_MEMORY_MIB, set to what a
+        # competitor's documented configuration gives its queries (QLever's 26 GB on DBLP).
+        if ctx.setting("TOTAL_QUERY_MEMORY_MIB"):
+            env["NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES"] = str(int(ctx.setting("TOTAL_QUERY_MEMORY_MIB")) * 1048576)
         spec = self.spec(ctx, ctx.name("serve"), store, [], env)
         spec.port = port
         base = ctx.runtime.url(spec)
@@ -611,6 +615,10 @@ class Virtuoso(Adapter):
                                    ("VIRTUOSO_THREADS_PER_QUERY", "THREADSPERQUERY")):
             if ctx.setting(setting):
                 env[f"VIRT_PARAMETERS_{parameter}"] = ctx.setting(setting)
+        # The HTTP listener's own threads ([HTTPServer] ServerThreads; 30 in the V3.1 report's
+        # virtuoso.ini): VIRTUOSO_HTTP_THREADS.
+        if ctx.setting("VIRTUOSO_HTTP_THREADS"):
+            env["VIRT_HTTPSERVER_SERVERTHREADS"] = ctx.setting("VIRTUOSO_HTTP_THREADS")
         return Spec(name, self.images(ctx)[0], [], env,
                     ctx.mounts(Mount(store, "/database", readonly=False)), port=port, entrypoint=True,
                     memory=ctx.memory)
@@ -658,7 +666,7 @@ class MillenniumDB(Adapter):
     buffers MDB_IMPORT_BUFFER (4GB each for strings and tensors)."""
 
     key = "millenniumdb"
-    runtimes = {"docker"}
+    runtimes = {"docker", "rootfs"}
 
     def images(self, ctx):
         return [ctx.setting("MILLENNIUMDB_IMAGE", "nrese-bench/millenniumdb:ecbf6dd")]
