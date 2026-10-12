@@ -186,7 +186,7 @@ class FastComparison(unittest.TestCase):
             r["expected_outcome"] = "memory-limit"
         code, text = comparison(base, copy.deepcopy(base))
         self.assertEqual(code, 0)
-        self.assertIn("expected boundary; no timing verdict", text)
+        self.assertIn("known issue; no timing verdict", text)
 
     def test_failed_check_or_route_excludes_an_ok_record(self):
         for key in ("checks", "routes"):
@@ -268,3 +268,20 @@ class FastComparison(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FastVerdicts(unittest.TestCase):
+    def test_every_run_has_a_verdict_and_names_whose_failure(self):
+        case = {"name": "c", "known": "the budget bounds the quads"}
+        def of(status, expected="ok", notes=()):
+            return fast.verdict(case, {"status": status, "expected_outcome": expected, "notes": list(notes)})
+        self.assertEqual(of("ok"), {"verdict": "ok", "whose": "-"})
+        self.assertEqual(of("off-route")["verdict"], "wrong")
+        # A known limit is the product's issue, named, though it fails no gate.
+        limit = of("memory-limit", "memory-limit")
+        self.assertEqual((limit["verdict"], limit["whose"], limit["issue"]),
+                         ("incomplete", "product", "the budget bounds the quads"))
+        missing = of("failed", notes=["missing input: ore_ont_9724.owl"])
+        self.assertEqual((missing["verdict"], missing["whose"]), ("incomplete", "harness"))
+        self.assertEqual(of("failed", notes=["exit 101"])["whose"], "unknown")
+        self.assertNotIn("issue", of("wrong", "ok"))
