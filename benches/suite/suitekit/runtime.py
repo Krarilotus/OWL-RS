@@ -13,6 +13,7 @@ a run fails; nothing else is touched.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -541,6 +542,73 @@ class ApptainerRuntime(ProcessRuntime):
 
     def image_present(self, image):
         return Path(self.sif(image)).exists()
+
+
+class RootfsRuntime(ProcessRuntime):
+    """The systems' Docker images unpacked into directories and run with bubblewrap, for a
+    measure host without Docker (phuoc-yu): every system from the same image as under Docker,
+    on the host's network and kernel, under a systemd scope with the container's memory cap.
+    `<rootfs_dir>/<image with / and : as _>/` holds the image's filesystem in `rootfs/` and its
+    `docker image inspect` in `config.json` (benches/sparql/images.sh export). The image is
+    read-only below a throwaway overlay; the mounts are bound as Docker binds them; the user is
+    root inside a user namespace (files written are the caller's outside)."""
+
+    kind = "rootfs"
+
+    def __init__(self, scratch, port, rootfs_dir: Path, echo=print):
+        super().__init__(scratch, port, echo)
+        self.rootfs_dir = rootfs_dir
+
+    def image_dir(self, image: str) -> Path:
+        return self.rootfs_dir / image.replace("/", "_").replace(":", "_")
+
+    def config(self, image: str) -> dict:
+        data = json.loads((self.image_dir(image) / "config.json").read_text(encoding="utf-8"))
+        entry = data[0] if isinstance(data, list) else data
+        return entry.get("Config", entry)
+
+    def prefix(self, spec: Spec, command: list[str]) -> list[str]:
+        config = self.config(spec.image)
+        if spec.entrypoint:
+            command = list(config.get("Entrypoint") or []) + (command or list(config.get("Cmd") or []))
+        args = []
+        if spec.memory:
+            args += ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={spec.memory}",
+                     "-p", "MemorySwapMax=0"]
+        args += ["bwrap", "--overlay-src", str(self.image_dir(spec.image) / "rootfs"), "--tmp-overlay", "/",
+                 "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--unshare-user", "--uid", "0", "--gid", "0",
+                 "--die-with-parent", "--clearenv"]
+        for pair in config.get("Env") or []:
+            key, _, value = pair.partition("=")
+            args += ["--setenv", key, value]
+        for key, value in spec.env.items():
+            args += ["--setenv", key, value]
+        for m in spec.mounts:
+            args += ["--ro-bind" if m.readonly else "--bind", m.source, m.target]
+        args += ["--chdir", spec.workdir or config.get("WorkingDir") or "/"]
+        return args + ["--", *command]
+
+    def argv(self, spec):
+        if spec.image is None:
+            return ProcessRuntime.argv(self, spec)
+        return self.prefix(spec, list(spec.command))
+
+    def environment(self, spec):
+        return dict(os.environ) if spec.image is not None else ProcessRuntime.environment(self, spec)
+
+    def cwd(self, spec):
+        return None if spec.image is not None else ProcessRuntime.cwd(self, spec)
+
+    def exec(self, server, command, timeout_s=3600):
+        spec = server.spec
+        if spec.image is None:
+            return ProcessRuntime.exec(self, server, command, timeout_s)
+        plain = Spec(spec.name, spec.image, [], spec.env, spec.mounts, workdir=spec.workdir)
+        out = subprocess.run(self.prefix(plain, command), capture_output=True, text=True, timeout=timeout_s)
+        return out.returncode, out.stdout + out.stderr
+
+    def image_present(self, image):
+        return (self.image_dir(image) / "rootfs").is_dir()
 
 
 class DryRuntime(Runtime):
