@@ -165,13 +165,14 @@ Later goals, from QLever's other strengths (catalogue rows only; no work now):
 | Benchmark | Measures; who publishes | Check | Shows about NRESE | Mark | Now |
 |---|---|---|---|---|---|
 | LUBM | materialisation and 14 queries; RDFox, GraphDB, VLog, Nemo, RDFox's papers | inferred set against owlrl or Nemo; published answers (LUBM 1) | the headline speed and memory (item 1-6 of the report) | core | ready, 1 to 1000 |
-| OWL2Bench RL, QL | one TBox per profile, 22 queries; ISWC 2020; extends UOBM | inferred set; counts across systems | symmetric-transitive cliques (RL-1); QL's existentials (wrong today) | core | ready; QL-1 WRONG |
+| OWL2Bench RL, QL | one TBox per profile, 22 queries; ISWC 2020; extends UOBM | inferred set; counts across systems | symmetric-transitive cliques (RL-1); QL's existentials | core | ready; QL-1 right since a83724c (rechecked on 16c3bfb, 12 Oct: q01 5,104 as adjudicated, the other 21 as every system) |
 | UOBM | LUBM with richer OWL (cycles, sameAs) | counts | covered by OWL2Bench | later | – |
 | Real ontologies: DBpedia and YAGO with their schemas | materialisation over large real hierarchies | inferred set against Nemo | whether the 96 % schema share of LUBM holds (merge checklist item 1) | representative | planned |
-| Claros (L, LE), Reactome, UniProt | RDFox's and GLog's datasets: Claros-LE's rules build huge cliques | inferred counts across systems | the worst case for proof-based deletion; GLog's single-thread result (Claros-L 119 s vs RDFox 2,512 s, reported) | core (Claros) | – |
-| SSPE (Hu, Motik, Horrocks) | single-source path graphs where one deletion invalidates long derivations; counting beat B/F (10.5 s vs 253 s for 1,000 deletions, reported) | incremental equals rematerialised | whether proofs or counts should handle a deletion (report item 9) | core | – |
-| LUBM insert and delete batches (RT2) | 1, 100, 10 k ABox changes and TBox changes after the closure | incremental equals rematerialised | the common case | core | commit latency only |
-| Datalog graph programs: TC, same generation, CSPA | recursive joins on graphs; RecStep, FlowLog, DCDatalog, Soufflé papers | counts against Soufflé or Nemo | the batch executor beyond OWL: plain Datalog in N3 rules | representative | – |
+| Claros (L, LE), Reactome, UniProt | RDFox's and GLog's datasets: Claros-LE's rules build huge cliques; the programs (L, LE, also for LUBM, DBpedia, UOBM) in VLog's syntax and the authors' own run logs are in GLog's VLDB 2021 package | facts per relation across the engines; GLog's totals (Claros-L 89.1 M, LE 548.7 M derived) | the worst case for proof-based deletion; GLog's single-thread result (Claros-L 119 s vs RDFox 2,512 s, reported; its package's logs: GLog 134 s, VLog 537 s) | core (Claros) | Claros L/LE and LUBM L/LE in `reasoning/datalog` (RDFox waits for a licence); Reactome, UniProt backlog |
+| SSPE (Hu, Motik, Horrocks) | single-source path graphs where one deletion invalidates long derivations; counting beat B/F (10.5 s vs 253 s for 1,000 deletions, reported) | incremental equals rematerialised | whether proofs or counts should handle a deletion (report item 9) | core | blocked as published: its rules add path lengths over a ternary relation, NRESE's user rules have neither arithmetic nor relations beyond triples; no RDFox licence |
+| LUBM insert and delete batches (RT2) | 1, 100, 10 k ABox changes and TBox changes after the closure | incremental equals rematerialised | the common case | core | `reasoning/maintenance` (with commit latency under readers): NRESE and GraphDB over SPARQL Update |
+| Datalog graph programs: TC, same generation, CSPA | recursive joins on graphs; RecStep, FlowLog, DCDatalog, Soufflé papers; FlowLog's suite (VLDB 2026) has the programs, the data and Soufflé's times at 4 and 64 threads | counts against Soufflé's published counts | the batch executor beyond OWL: plain Datalog in N3 rules | representative | `reasoning/datalog`: NRESE, Soufflé, Nemo, VLog, GLog |
+| Doop on DaCapo (batik, xalan, …) | Java points-to analysis, Soufflé's own workload: 136 rules, relations up to arity 7, stratified negation; in FlowLog's suite | Soufflé's published counts | not expressible in NRESE's user rules today (arity, negation): a capability gap, not a time | backlog | programs vendored, batik prepared |
 | ChaseBench | existential rules (Doctors, STB-128, ONT-256); Nemo, VLog, RDFox | counts across chase engines | only if existential rules come; NRESE has none | later | – |
 | Injected contradictions (RT4) | detection and explanation of each contradiction kind | all found, none on clean data | the consistency gate and explanations | representative | planned |
 
@@ -182,7 +183,8 @@ Later goals, from QLever's other strengths (catalogue rows only; no work now):
 | Real ontologies | as the basics mix | DBpedia core + ontology: 9.2 GB; closure est. 100-150 M statements, 15 GB peak | 1 | NRESE minutes; Nemo hours (est. from LUBM) | NRESE, Nemo, Jena, GraphDB, RDFox |
 | Claros, Reactome, UniProt | Claros: research data from RDFox's test sets, licence unstated (ask Oxford); Reactome CC-BY 4.0; UniProt CC-BY 4.0 | Claros: about 19 M facts in (reported); LE's closure is many times that: size it on Draco first | 2 | Claros-L minutes; LE hours | NRESE, Nemo, VLog, RDFox, GraphDB |
 | SSPE | ours to generate, from the paper's description | small: millions of edges | 1 | seconds to minutes per batch | NRESE, RDFox, GraphDB |
-| TC, SG, CSPA | ours (generated graphs); SNAP graphs where needed (licences per graph) | 1-100 M edges, closures to billions: capped | 1 | seconds to minutes | NRESE, Nemo, Soufflé (UPL-1.0), VLog |
+| TC, SG, CSPA | FlowLog's datasets (Hugging Face, no licence stated: fetched, never committed); programs Apache-2.0 | TC/SG on G10K: 100 M facts each; CSPA httpd: 324.5 M facts, NRESE 22.9 GB, Soufflé 9.8 GB (measured, 4 CPUs) | 0 (built) | CSPA httpd at 4 CPUs (measured, one run): Soufflé 56.5 s, NRESE 195 s, Nemo 612 s | NRESE, Nemo, Soufflé (UPL-1.0), VLog, GLog |
+| Doop | as FlowLog's datasets | batik: 106 MB zipped | 0 (vendored) | Soufflé 651 s at 4 threads (reported) | Soufflé, Nemo |
 | ChaseBench | no licence stated; internal use only: ask the authors before publishing (owner, 5 Oct 2026) | to 1 GB | 3 | – | Nemo, VLog, RDFox |
 
 ### 3.5 OWL 2 DL: consistency, classification, realisation
@@ -411,8 +413,8 @@ through an adapter.
 | MillenniumDB | GPL-2.0 | free | SPARQL, paths (WDBench's authors) | 1 | | to add (WDBench) |
 | Tentris | Apache-2.0 | free | SPARQL (WCOJ, hypertries) | 1 | in-memory | to add (WatDiv) |
 | Ontop | Apache-2.0 | free | OWL 2 QL, OBDA | 2 | needs PostgreSQL | to add (NPD) |
-| VLog / GLog | Apache-2.0 | free | Datalog | 1.5 | GLog's single-thread lead (reported) | to add (Claros) |
-| Soufflé | UPL-1.0 | free | Datalog | 1 | compiled programs | to add (TC, SG, CSPA) |
+| VLog / GLog | Apache-2.0 | free | Datalog | done | GLog's single-thread lead (reported); images from pinned commits (`reasoning/datalog/vlog`) | in the Datalog kit |
+| Soufflé | UPL-1.0 | free | Datalog | done | compiled programs; 2.5 from the checksummed release (`reasoning/datalog/souffle`) | in the Datalog kit |
 | PAGOdA | to check | free | QA beyond RL | 1.5 | JVM | to add |
 | Rust rivals: maplib, whelk-rs, horned-owl, froGQL; sparq | Apache-2.0; MIT; LGPL-3.0; MIT; MIT (vendored encoding) | free | SPARQL/Datalog; EL; OWL I/O; GQL | 1 each | | sparq's encoding in Nemo |
 | Neo4j Community | GPL-3.0 | free | Cypher | 1 | JVM | to add (SNB) |
