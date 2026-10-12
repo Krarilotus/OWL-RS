@@ -377,6 +377,76 @@ fn selective_paths_join_first() {
     );
 }
 
+/// The property-graph mapping's store: 3,000 nodes, each `knows` three others, and every
+/// edge reified (RDF 1.2) with a `since` among 1,000 values: 9,000 reifiers.
+fn reified_engine() -> Engine {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let reifies = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies");
+    let mut insert = |s: NamedNode, p: NamedNode, o: nrese_rdf::Term| {
+        tx.insert(Quad::new(s, p, o, GraphName::DefaultGraph).as_ref());
+    };
+    for i in 0..3000u32 {
+        for (k, step) in [1, 7, 31].into_iter().enumerate() {
+            let (a, b) = (ex(&format!("n{i}")), ex(&format!("n{}", (i + step) % 3000)));
+            insert(a.clone(), ex("knows"), b.clone().into());
+            let r = ex(&format!("r{i}_{k}"));
+            let edge = nrese_rdf::Triple::new(a, ex("knows"), b);
+            insert(r.clone(), reifies.clone(), edge.into());
+            let since = Literal::from(i64::from((i * 3 + k as u32) % 1000));
+            insert(r, ex("since"), since.into());
+        }
+    }
+    tx.commit().unwrap();
+    engine
+}
+
+/// A hop through a triple term costs probes per edge, not a scan of every reifier
+/// (review v2 §2.2.1): the joins compose the triple term from the edge's bound parts by one
+/// hash probe and probe its reifiers by the index, or take a reifier's triple term apart
+/// into the edge; every step keeps to the edges of the start, and nothing is decoded.
+/// Without the link the reifiers are a cross product with the edges (27,000 rows here,
+/// past 6 GiB on `rdf12-join`), without ids every triple term is decoded.
+#[test]
+fn a_hop_through_a_triple_term_costs_probes_per_edge() {
+    let engine = reified_engine();
+    let explain = |query: &str| {
+        let text = format!(
+            "PREFIX e: <{EX}> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> {query}"
+        );
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        explain_query(&engine.snapshot(), &query, &QueryOptions::default()).unwrap()
+    };
+    // Composed: from n1's three edges to their reifiers.
+    let hop = explain(
+        "SELECT * WHERE { e:n1 e:knows ?b . ?r rdf:reifies <<( e:n1 e:knows ?b )>> . \
+         ?r e:since ?s }",
+    );
+    // Taken apart: from the nine reifiers since 0 to their edges.
+    let back = explain(
+        "SELECT * WHERE { ?r e:since 0 . ?r rdf:reifies <<( ?a e:knows ?b )>> . \
+         ?a e:knows ?b }",
+    );
+    for (explanation, edges) in [(&hop, 3), (&back, 9)] {
+        assert_eq!(explanation.rows, edges);
+        assert!(
+            explanation
+                .steps
+                .iter()
+                .any(|s| s.operator == "triple term join" && s.rows == edges),
+            "{:#?}",
+            explanation.steps
+        );
+        let widest = explanation.steps.iter().map(|s| s.rows).max();
+        assert_eq!(widest, Some(edges), "{:#?}", explanation.steps);
+        assert_eq!(explanation.decoded, 0, "{:#?}", explanation.steps);
+    }
+    // Without the edge in the pattern the reifiers are read, but on ids.
+    let reifiers = explain("SELECT * WHERE { ?r rdf:reifies <<( e:n1 e:knows ?b )>> }");
+    assert_eq!(reifiers.rows, 3);
+    assert_eq!(reifiers.decoded, 0, "{:#?}", reifiers.steps);
+}
+
 /// Plan parts cached and shared across queries (the result cache, QLever's level): a
 /// query whose join another query computed before, under other variable names, gets the
 /// join from the cache, and EXPLAIN marks it; the answer is the one computed afresh. The
