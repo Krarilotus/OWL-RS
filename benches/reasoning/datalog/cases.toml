@@ -26,6 +26,10 @@ url = "http://krr-nas.cs.ox.ac.uk/2015/ISWC/TestCases/{name}"
 what = "RDFox's test data of the ISWC 2015 paper (Nenov et al., 'RDFox: a highly-scalable RDF store'), Information Systems Group, Oxford"
 licence = "not stated (catalogue: ask Oxford before publishing results). Fetched, never committed"
 
+[source.frozen]
+what = "a frozen dataset of benches/datasets.toml (BENCH_DATA), linked read-only"
+licence = "as its datasets.toml entry"
+
 [source.lubm]
 what = "LUBM(N) from the pinned UBA generator (benches/reasoning/lubm, rvesse/lubm-uba), instance data only"
 licence = "generator GPL-2.0; the data is generated"
@@ -191,6 +195,9 @@ data = "claros"
 sha256 = "693e88cd20844126698cd9da6257a40f61767477fefda3c178b75b82ada6229f"
 published = { vlog = "537.0 s, 3,590 MB", glog = "133.7 s, 5,608 MB", glog_paper = "119 s, 6,078 MB (Table 4)", rdfox_paper = "2,512 s, 5,491 MB (single thread; GLog's Table 4)" }
 derived = { glog = 89102259 }
+# The 2014 programs with the explicit owl:sameAs axiomatisation (2,174 rules), as Motik et al.,
+# AAAI 2014, Fig. 2: 95.5 M triples after materialisation.
+papers_facts = { motik2014 = 95.5 }
 home = "glog, rdfox"
 
 [[case]]
@@ -207,6 +214,7 @@ data = "claros"
 sha256 = "693e88cd20844126698cd9da6257a40f61767477fefda3c178b75b82ada6229f"
 published = { vlog = "3,351.7 s, 9,633 MB", glog = "1,211.6 s, 9,418 MB" }
 derived = { glog = 548652593 }
+papers_facts = { motik2014 = 555.1 }
 note = "the cliques of a symmetric and transitive relatedPlaces: the worst case for maintenance (Motik et al. 2019)"
 home = "glog, rdfox"
 
@@ -267,3 +275,74 @@ source = "lubm"
 universities = 1
 data = "lubm-1"
 home = "glog, rdfox"
+
+# --- RDFox's papers' setups, matched where the papers allow (benches/reasoning/reported) ----
+# Motik et al., AIJ 2019 (maintenance) ran Claros L and LE with equality off: the 2014
+# programs without their owl:sameAs axiomatisation (1,310 and 1,337 rules there; these
+# variants keep 1,312 and 1,339), materialising to 73.8 M and 533.3 M facts.
+[[case]]
+name = "claros-l-noeq"
+workload = "claros"
+tier = "l-noeq"
+format = "triples"
+program = "Claros_L.dlog"
+program_url = "https://drive.usercontent.google.com/download?id=1SAnLwAr0h7xtyWXlP1_BbyFo0zCXo6OI&export=download&confirm=t"
+program_sha256 = "0d93c717aabae3bfadb5ba27ca6a9b91b91f531bf07d36d9c4d174c549c4b8c3"
+drop_rules_using = "<http://www.w3.org/2002/07/owl#sameAs>"
+source = "oxford"
+archive = "Claros.zip"
+data = "claros"
+sha256 = "693e88cd20844126698cd9da6257a40f61767477fefda3c178b75b82ada6229f"
+papers_facts = { motik2019 = 73.8 }
+home = "rdfox"
+
+[[case]]
+name = "claros-le-noeq"
+workload = "claros"
+tier = "le-noeq"
+format = "triples"
+program = "Claros_LE.dlog"
+program_url = "https://drive.usercontent.google.com/download?id=1ATnqOQ2PoCi3bPM7Fiy1NU7pUlxoYH2P&export=download&confirm=t"
+program_sha256 = "f7c3f9114b0a65a7860786bcd0d4f6f6e8688a1a23cb3dcb3bae54a69d581e98"
+drop_rules_using = "<http://www.w3.org/2002/07/owl#sameAs>"
+source = "oxford"
+archive = "Claros.zip"
+data = "claros"
+sha256 = "693e88cd20844126698cd9da6257a40f61767477fefda3c178b75b82ada6229f"
+papers_facts = { motik2019 = 533.3 }
+home = "rdfox"
+
+# Motik et al., AAAI 2014, ran LUBM L and LE on LUBM 01K (133.6 M triples); ours is the frozen
+# LUBM(1000) of benches/datasets.toml (138.3 M: the same generator family, another version),
+# so the comparison is close, not identical. 182.4 M and 332.6 M triples after materialisation.
+[[case]]
+name = "lubm-l-1000"
+workload = "lubm"
+tier = "rdfox-l-1000"
+format = "triples"
+program = "LUBM_L.dlog"
+program_url = "https://drive.usercontent.google.com/download?id=1PPlb43Z5_3FlD4lKmkbLp3fskMkp8L5p&export=download&confirm=t"
+program_sha256 = "d29db99e5221f6598701523651de32ce7673a0fd64aa8139989ee4fe62c3b520"
+source = "frozen"
+file = "lubm-1000.nt"
+data = "lubm-1000"
+sha256 = "8563ef20d5ff129e7d5597130317f6636b3f5b15503d544b7958477ec6ac3720"
+papers_facts = { motik2014 = 182.4 }
+systems = ["nrese", "vlog", "glog"]
+home = "rdfox, glog, vlog"
+
+[[case]]
+name = "lubm-le-1000"
+workload = "lubm"
+tier = "rdfox-le-1000"
+format = "triples"
+program = "LUBM_LE.dlog"
+program_url = "https://drive.usercontent.google.com/download?id=1mZwaWgKPslYMYx7UIxy0CQVBU_M2ytGa&export=download&confirm=t"
+program_sha256 = "6f1312cff49bc2850537d96f2d1dfd41cedd9c0cbd1f1d0c1d48073a2b4489df"
+source = "frozen"
+file = "lubm-1000.nt"
+data = "lubm-1000"
+sha256 = "8563ef20d5ff129e7d5597130317f6636b3f5b15503d544b7958477ec6ac3720"
+papers_facts = { motik2014 = 332.6 }
+systems = ["nrese", "vlog", "glog"]
+home = "rdfox, glog"
