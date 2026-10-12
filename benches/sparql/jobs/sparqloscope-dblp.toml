@@ -13,18 +13,18 @@ group = "sparql"
 host = "office-pc"
 checkout = "suite/sparql"
 commands = [
-  ["python3", "benches/suite/suite.py", "run", "--systems", "qlever,nrese", "--workloads", "sparqloscope",
+  ["bash", "scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--systems", "qlever,nrese", "--workloads", "sparqloscope",
    "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build", "--runs", "1", "--query-runs", "1",
    "--cache", "on", "--order", "fixed", "--timeout-s", "7200", "--query-timeout-s", "180",
    "--answers", "full", "--answers-reference", "jena,qlever",
    "--results", "/home/krarilotus/owlrs/results/sparql-sparqloscope-dblp-1/paper-protocol"],
-  ["python3", "benches/suite/suite.py", "run", "--systems", "qlever,nrese", "--workloads", "sparqloscope",
+  ["bash", "scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--systems", "qlever,nrese", "--workloads", "sparqloscope",
    "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build", "--runs", "3", "--query-runs", "3",
    "--cache", "off,on", "--timeout-s", "7200", "--query-timeout-s", "180",
    "--answers", "full", "--answers-reference", "jena,qlever",
    "--results", "/home/krarilotus/owlrs/results/sparql-sparqloscope-dblp-1/suite-protocol"],
 ]
-env = { NRESE_TARGET_VOLUME = "/home/krarilotus/owlrs/sparql-bin/1b611e7", HARNESS = "/home/krarilotus/owlrs/sparql-bin/1b611e7/nrese-bench-harness", NRESE_BENCH_SCRATCH = "/home/krarilotus/owlrs/sparql-scratch", DOCKER_MEMORY = "28g", QUERY_MEMORY_MIB = "20000", QLEVER_MEMORY = "26G", QLEVER_CACHE_MAX_SIZE = "6G", QLEVER_SORT_MEMORY = "10G", QLEVER_SIMULTANEOUS_QUERIES = "1", QLEVER_VOCABULARY_TYPE = "in-memory-compressed", QLEVER_INDEX_SETTINGS = '{"num-triples-per-batch": 1000000}', QLEVER_RUNTIME = "group-by-hash-map-enabled=true" }
+env = { NRESE_QUIET_DRAIN_S = "3600", NRESE_TARGET_VOLUME = "/home/krarilotus/owlrs/sparql-bin/1b611e7", HARNESS = "/home/krarilotus/owlrs/sparql-bin/1b611e7/nrese-bench-harness", NRESE_BENCH_SCRATCH = "/home/krarilotus/owlrs/sparql-scratch", DOCKER_MEMORY = "28g", QUERY_MEMORY_MIB = "26624", TOTAL_QUERY_MEMORY_MIB = "26624", QLEVER_MEMORY = "26G", QLEVER_CACHE_MAX_SIZE = "6G", QLEVER_SORT_MEMORY = "10G", QLEVER_SIMULTANEOUS_QUERIES = "1", QLEVER_VOCABULARY_TYPE = "in-memory-compressed", QLEVER_INDEX_SETTINGS = '{"num-triples-per-batch": 1000000}', QLEVER_RUNTIME = "group-by-hash-map-enabled=true" }
 needs = ["docker"]
 window = "quiet"
 priority = 1

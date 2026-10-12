@@ -13,15 +13,14 @@
 [[case]]
 name = "sparqloscope-dblp"
 area = "query"
-what = "Sparqloscope on DBLP of 1 April 2025 (515 M lines): 105 queries, one SPARQL feature each; QLever's published geometric mean 0.18 s is the bar"
+what = "Sparqloscope on DBLP's knowledge graph (dblp_KG_with_associated_data, release of 11 Oct 2026): 105 queries, one SPARQL feature each; QLever's published geometric mean 0.18 s is the bar"
 workload = "sparqloscope"
 tier = "sparqloscope-dblp"
 levels = ["full"]
 semantics = "none"
-data = "volume:dblp-2025-04-01.nt"
+data = "volume:dblp-kg-20261011.nt"
 queries = "@sparqloscope-dblp"
 metric = "sum_p50_ms"
-pinned = "the 66 queries whose answer every engine of the paper published alike (benches/sparql/sparqloscope/dblp-checks.toml) are known answers through the workload's plan"
 expect = { answers = ["jena", "millenniumdb", "virtuoso", "qlever"] }
 systems = ["qlever:plain", "virtuoso:plain", "millenniumdb:plain", "jena:plain"]
 home_turf = "qlever"
@@ -86,3 +85,22 @@ scenario = "native"
 needs = ["docker", "java"]
 cap_gb = 28
 est_min = 120
+
+[[case]]
+name = "watdiv-100m"
+area = "query"
+what = "WatDiv's basic testing workload on its authors' 100 M dataset: 20 templates instantiated from the generator's saved state (196 distinct queries)"
+workload = "watdiv"
+tier = "watdiv-100m"
+levels = ["full"]
+semantics = "none"
+data = "volume:watdiv-100m.nt"
+queries = "@watdiv-100m"
+metric = "sum_p50_ms"
+expect = { answers = ["jena", "oxigraph", "virtuoso", "qlever"] }
+systems = ["jena:plain", "oxigraph:plain", "qlever:plain", "virtuoso:plain"]
+home_turf = "jena"
+scenario = "native"
+needs = []
+cap_gb = 24
+est_min = 240
