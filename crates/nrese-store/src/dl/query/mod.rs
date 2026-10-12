@@ -77,7 +77,8 @@ pub(crate) fn ontology_at(store: &StoreService, snapshot: &Snapshot) -> Arc<Onto
 }
 
 /// The data's consistency at `snapshot`'s revision: recorded by its commit, proved by U1,
-/// or checked now (once per revision).
+/// or checked now (once per revision). A recorded or proved verdict survives the request's
+/// expiry, not its cancellation.
 fn consistency_at(
     store: &StoreService,
     snapshot: &Snapshot,
@@ -99,25 +100,26 @@ fn consistency_at(
     if view.proves_consistency {
         return Verdict::Consistent;
     }
-    if Instant::now() >= deadline {
-        return Verdict::Unknown("past dl.timeout".to_owned());
+    let stopped = || {
+        if cancellation.is_cancelled() {
+            Some(Verdict::Unknown("cancelled".to_owned()))
+        } else {
+            (Instant::now() >= deadline).then(|| Verdict::Unknown("past dl.timeout".to_owned()))
+        }
+    };
+    if let Some(stopped) = stopped() {
+        return stopped;
     }
     let cancel = nrese_dl::tableau::Cancel::from_flag(cancellation.flag());
     let ontology = ontology_at(store, snapshot);
-    if cancellation.is_cancelled() {
-        return Verdict::Unknown("cancelled".to_owned());
-    }
-    let budget = gate::remaining_budget(&gate::budget(store, Some(cancel)), deadline);
-    if budget.timeout.is_zero() {
-        return Verdict::Unknown("past dl.timeout".to_owned());
+    let budget = gate::budget(store, Some(cancel)).remaining(deadline);
+    if let Some(stopped) = stopped() {
+        return stopped;
     }
     let checked = consistency::check(&ontology, &budget);
     // Request-local cancellation or expiry must not replace shared revision status.
-    if cancellation.is_cancelled() {
-        return Verdict::Unknown("cancelled".to_owned());
-    }
-    if Instant::now() >= deadline {
-        return Verdict::Unknown("past dl.timeout".to_owned());
+    if let Some(stopped) = stopped() {
+        return stopped;
     }
     store.dl().record(DlStatus {
         revision: snapshot.revision(),
@@ -237,13 +239,9 @@ pub(crate) fn answer(
     cancellation: &CancellationToken,
     mode: DlAnswers,
 ) -> StoreResult<Outcome> {
-    if cancellation.is_cancelled() {
-        return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
-    }
+    cancellation.check()?;
     let outcome = decide_answers(store, prepared, cancellation, mode)?;
-    if cancellation.is_cancelled() {
-        return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
-    }
+    cancellation.check()?;
     let status = match &outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => status,
     };
@@ -311,9 +309,7 @@ fn decide_answers(
     let analysis = analyse(prepared.query());
     let mut status = Status::complete();
     let consistency = consistency_at(store, &snapshot, &view, cancellation, deadline);
-    if cancellation.is_cancelled() {
-        return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
-    }
+    cancellation.check()?;
     match consistency {
         Verdict::Consistent => {}
         Verdict::Inconsistent => status
@@ -446,7 +442,6 @@ fn decide_answers(
                 limit.saturating_add(super::UNRESOLVED_SHOWN),
                 &budget,
                 cancellation,
-                &nrese_exec::workers::Workers::current(),
             )?;
             let mut counts = Counts {
                 lower: gap.lower,

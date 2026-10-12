@@ -4,10 +4,9 @@ use std::time::Duration;
 
 fn budget() -> Budget {
     Budget {
-        workers: None,
+        workers: nrese_exec::workers::Workers::serial(),
         timeout: Duration::from_secs(10),
         memory_bytes: usize::MAX,
-        threads: 1,
         cancel: None,
         max_nodes: 10_000,
         max_branch_points: 10_000,
@@ -54,14 +53,18 @@ fn one_program_matches_independent_reductions_without_leaking_assumptions() {
         compiled.prepared.is_some(),
         "one compiled input for the whole batch"
     );
+    assert!(
+        compiled.probes.iter().all(Option::is_some),
+        "every form is probed, not reduced"
+    );
     assert_eq!(o.axioms, original, "selectors never enter the premise");
     for i in (0..tests.len())
         .chain((0..tests.len()).rev())
         .chain(0..tests.len())
     {
         assert_eq!(
-            compiled.check(i, &budget()),
-            Some(expected[i].clone()),
+            compiled.check(i, &tests[i], &o, &[100, 101, 102], &budget()),
+            expected[i],
             "test {i}"
         );
     }
@@ -82,12 +85,10 @@ fn cancellation_and_fresh_class_name_collisions_stay_local() {
     let mut cancelled = budget();
     cancelled.cancel = Some(tableau::Cancel::from_flag(token.flag()));
     token.cancel();
-    assert!(matches!(
-        compiled.check(0, &cancelled),
-        Some(Entailed::Unknown(_))
-    ));
-    assert_eq!(compiled.check(0, &budget()), Some(Entailed::Yes));
-    assert_eq!(compiled.check(1, &budget()), Some(Entailed::No));
+    let check = |i: usize, budget: &Budget| compiled.check(i, &tests[i], &o, &[], budget);
+    assert!(matches!(check(0, &cancelled), Entailed::Unknown(_)));
+    assert_eq!(check(0, &budget()), Entailed::Yes);
+    assert_eq!(check(1, &budget()), Entailed::No);
 }
 
 #[test]
@@ -105,6 +106,12 @@ fn transitive_role_values_use_the_existing_non_simple_role_normalisation() {
         Test::Axiom(Axiom::ObjectPropertyAssertion(7, 3, 1)),
     ];
     let compiled = Batch::new(&mut o, &tests);
-    assert_eq!(compiled.check(0, &budget()), Some(Entailed::Yes));
-    assert_eq!(compiled.check(1, &budget()), Some(Entailed::No));
+    assert_eq!(
+        compiled.check(0, &tests[0], &o, &[], &budget()),
+        Entailed::Yes
+    );
+    assert_eq!(
+        compiled.check(1, &tests[1], &o, &[], &budget()),
+        Entailed::No
+    );
 }

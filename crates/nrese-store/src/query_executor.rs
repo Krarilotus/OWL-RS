@@ -16,8 +16,8 @@ use nrese_rdf::{GraphName, NamedNode, NamedOrBlankNode};
 use nrese_rdf_io::RdfSerializer;
 use nrese_sparql::{
     CachedOutput, CancellationToken, Explanation, PlannedQuery, QueryDatasetSpecification,
-    QueryEvaluationError, QueryOptions, QueryResults, ReadView, ResultsFormat, WriteResultsError,
-    evaluate_query, explain_query, plan_query, write_results,
+    QueryOptions, QueryResults, ReadView, ResultsFormat, WriteResultsError, evaluate_query,
+    explain_query, plan_query, write_results,
 };
 use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
 use nrese_sparql_syntax::Query;
@@ -381,7 +381,7 @@ pub(crate) fn run_query(
     let mut options = query_options(prepared, store, cancellation);
     let (query, ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
     let context = report(ql.as_ref());
-    check_cancelled(cancellation)?;
+    cancellation.check()?;
     // A repeated query's answer as written before, in this format; else written, and its
     // bytes offered to the cache with the time writing them took (`nrese_sparql::cache`).
     let mut out = out;
@@ -393,9 +393,9 @@ pub(crate) fn run_query(
         &context,
     ) {
         CachedOutput::Hit(bytes) => {
-            check_cancelled(cancellation)?;
+            cancellation.check()?;
             out.write_all(&bytes)?;
-            check_cancelled(cancellation)?;
+            cancellation.check()?;
             return Ok(ql);
         }
         CachedOutput::Miss(slot) => Some(slot),
@@ -449,13 +449,6 @@ impl<W: Write> Write for Tee<W> {
     }
 }
 
-fn check_cancelled(cancellation: &CancellationToken) -> StoreResult<()> {
-    if cancellation.is_cancelled() {
-        return Err(QueryEvaluationError::Cancelled.into());
-    }
-    Ok(())
-}
-
 /// Evaluates `prepared` on `view` with `options` and writes its serialised results to
 /// `out` as they are produced.
 fn serialize(
@@ -466,7 +459,6 @@ fn serialize(
     cancellation: &CancellationToken,
     out: impl Write,
 ) -> StoreResult<()> {
-    let alive = || check_cancelled(cancellation);
     let mut out = out;
     let version = prepared.rdf12.then_some("1.2");
     let format = match prepared.solutions_format {
@@ -484,16 +476,21 @@ fn serialize(
             WriteResultsError::Io(error) => StoreError::Io(error),
         });
     }
-    serialize_answers(prepared, evaluate_query(view, query, options)?, out, alive)
+    serialize_answers(
+        prepared,
+        evaluate_query(view, query, options)?,
+        out,
+        cancellation,
+    )
 }
 
 fn serialize_answers(
     prepared: &PreparedQuery,
     answers: QueryResults<'_>,
     out: impl Write,
-    alive: impl Fn() -> StoreResult<()>,
+    cancellation: &CancellationToken,
 ) -> StoreResult<()> {
-    alive()?;
+    cancellation.check()?;
     let version = prepared.rdf12.then_some("1.2");
     match answers {
         QueryResults::Boolean(value) => {
@@ -503,10 +500,10 @@ fn serialize_answers(
             let mut writer = results_serializer(prepared, version)
                 .serialize_solutions_to_writer(out, solutions.variables().to_vec())?;
             for solution in solutions {
-                alive()?;
+                cancellation.check()?;
                 writer.serialize(&solution?)?;
             }
-            alive()?;
+            cancellation.check()?;
             writer.finish()?;
         }
         QueryResults::Graph(triples) => {
@@ -516,14 +513,14 @@ fn serialize_answers(
             }
             let mut writer = serializer.for_writer(out);
             for triple in triples {
-                alive()?;
+                cancellation.check()?;
                 writer.serialize_triple(&triple?)?;
             }
-            alive()?;
+            cancellation.check()?;
             writer.finish()?;
         }
     }
-    alive()
+    Ok(cancellation.check()?)
 }
 
 pub(crate) use nrese_sparql::TypedResults as Answers;
@@ -579,9 +576,7 @@ pub(crate) fn write_answers(
     cancellation: &CancellationToken,
     out: impl Write,
 ) -> StoreResult<()> {
-    serialize_answers(prepared, answers.into_results(), out, || {
-        check_cancelled(cancellation)
-    })
+    serialize_answers(prepared, answers.into_results(), out, cancellation)
 }
 
 /// The results serializer of `prepared`'s format, announcing `version`.

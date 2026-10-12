@@ -119,8 +119,8 @@ impl StoreService {
     /// Whether adding `opposite` to the data makes it inconsistent under `program`: the
     /// reasoner maintains the closure over a speculative transaction, which is dropped.
     fn refutes(&self, program: &RuleProgram, opposite: &[Triple]) -> StoreResult<bool> {
-        let watch = self.memory_watch();
-        let stop = || watch.as_ref().is_some_and(|watch| watch.exceeded());
+        let memory = self.memory_stop();
+        let stop = || memory.exceeded();
         let config = self.config();
         let mut tx = self.engine().speculative();
         for t in opposite {
@@ -138,12 +138,9 @@ impl StoreService {
             .storing_representatives(config.equality_compact);
         let done =
             nrese_reasoner::engine::maintain(&compiled, None, &mut tx, &stop).map_err(|_| {
-                StoreError::ProcessMemoryLimit {
-                    limit: watch.as_ref().filter(|w| w.exceeded()).map_or_else(
-                        || nrese_exec::memory::process_limit().unwrap_or(0),
-                        |w| w.limit(),
-                    ),
-                }
+                memory.error().unwrap_or(StoreError::ProcessMemoryLimit {
+                    limit: nrese_exec::memory::process_limit().unwrap_or(0),
+                })
             })?;
         Ok(!done.violations.is_empty())
     }

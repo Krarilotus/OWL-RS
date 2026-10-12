@@ -21,9 +21,11 @@ use crate::StoreService;
 /// The latest complete results, by revision.
 #[derive(Debug, Default)]
 pub(crate) struct Cache {
-    taxonomy: Mutex<Option<(u64, Arc<Taxonomy>)>>,
-    realisation: Mutex<Option<(u64, Arc<Realisation>)>>,
+    taxonomy: Slot<Taxonomy>,
+    realisation: Slot<Realisation>,
 }
+
+type Slot<T> = Mutex<Option<(u64, Arc<T>)>>;
 
 /// How the engines run under the store's settings.
 pub(super) fn options(store: &StoreService) -> classify::Options {
@@ -34,68 +36,76 @@ pub(super) fn options(store: &StoreService) -> classify::Options {
     options
 }
 
-/// The taxonomy of `snapshot`'s asserted ontology (from the cache if it is current).
+/// The taxonomy of `snapshot`'s asserted ontology (from the cache if it is current,
+/// or from a current realisation).
 pub(crate) fn taxonomy(store: &StoreService, snapshot: &Snapshot) -> Arc<Taxonomy> {
-    let revision = snapshot.revision();
     let cache = &store.dl().classification;
-    if let Some((at, taxonomy)) = &*cache.taxonomy.lock().unwrap_or_else(|p| p.into_inner())
-        && *at == revision
-    {
-        return Arc::clone(taxonomy);
-    }
-    if let Some((at, realisation)) = &*cache.realisation.lock().unwrap_or_else(|p| p.into_inner())
-        && *at == revision
-    {
-        return Arc::new(realisation.taxonomy.clone());
-    }
-    let started = Instant::now();
-    let ontology = source::read_snapshot(snapshot);
-    let mut options = options(store);
-    let workers = options.workers.as_ref().unwrap().clone();
-    let taxonomy = Arc::new(workers.install(|| {
-        options.timeout = options
-            .timeout
-            .map(|limit| limit.saturating_sub(started.elapsed()));
-        classify::classify(&ontology, &options)
-    }));
-    if taxonomy.complete() {
-        remember(&cache.taxonomy, revision, &taxonomy);
-    }
-    taxonomy
+    let revision = snapshot.revision();
+    cached(
+        &cache.taxonomy,
+        revision,
+        Taxonomy::complete,
+        || match latest(&cache.realisation, revision) {
+            Some(realisation) => realisation.taxonomy.clone(),
+            None => run(store, snapshot, classify::classify),
+        },
+    )
 }
 
 /// The realisation of `snapshot`'s asserted ontology (from the cache if it is current).
 pub(crate) fn realisation(store: &StoreService, snapshot: &Snapshot) -> Arc<Realisation> {
-    let revision = snapshot.revision();
-    let cache = &store.dl().classification;
-    if let Some((at, realisation)) = &*cache.realisation.lock().unwrap_or_else(|p| p.into_inner())
-        && *at == revision
-    {
-        return Arc::clone(realisation);
+    let complete = |r: &Realisation| r.incomplete.is_empty() && r.taxonomy.complete();
+    cached(
+        &store.dl().classification.realisation,
+        snapshot.revision(),
+        complete,
+        || run(store, snapshot, classify::realise),
+    )
+}
+
+/// The cached result at `revision`, else `compute`'s, kept if `complete`. Publishing never
+/// lets an older in-flight request evict a newer revision; same-revision races keep the
+/// first complete result. No solver runs locked.
+fn cached<T>(
+    slot: &Slot<T>,
+    revision: u64,
+    complete: impl Fn(&T) -> bool,
+    compute: impl FnOnce() -> T,
+) -> Arc<T> {
+    if let Some(result) = latest(slot, revision) {
+        return result;
     }
+    let result = Arc::new(compute());
+    if complete(&result) {
+        let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_none_or(|(at, _)| *at < revision) {
+            *slot = Some((revision, Arc::clone(&result)));
+        }
+    }
+    result
+}
+
+fn latest<T>(slot: &Slot<T>, revision: u64) -> Option<Arc<T>> {
+    match &*slot.lock().unwrap_or_else(|p| p.into_inner()) {
+        Some((at, result)) if *at == revision => Some(Arc::clone(result)),
+        _ => None,
+    }
+}
+
+/// `engine` over `snapshot`'s asserted ontology, within one timeout that includes
+/// reading the ontology.
+fn run<T>(
+    store: &StoreService,
+    snapshot: &Snapshot,
+    engine: fn(&nrese_owl::Ontology, &classify::Options) -> T,
+) -> T {
     let started = Instant::now();
     let ontology = source::read_snapshot(snapshot);
     let mut options = options(store);
-    let workers = options.workers.as_ref().unwrap().clone();
-    let realisation = Arc::new(workers.install(|| {
-        options.timeout = options
-            .timeout
-            .map(|limit| limit.saturating_sub(started.elapsed()));
-        classify::realise(&ontology, &options)
-    }));
-    if realisation.incomplete.is_empty() && realisation.taxonomy.complete() {
-        remember(&cache.realisation, revision, &realisation);
-    }
-    realisation
-}
-
-/// Publish a complete result without letting an older in-flight request evict a newer
-/// revision. Same-revision races keep the first complete result. No solver runs locked.
-fn remember<T>(cache: &Mutex<Option<(u64, Arc<T>)>>, revision: u64, result: &Arc<T>) {
-    let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
-    if cache.as_ref().is_none_or(|(at, _)| *at < revision) {
-        *cache = Some((revision, Arc::clone(result)));
-    }
+    options.timeout = options
+        .timeout
+        .map(|limit| limit.saturating_sub(started.elapsed()));
+    engine(&ontology, &options)
 }
 
 #[cfg(test)]

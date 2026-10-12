@@ -46,7 +46,7 @@ fn embedded_low_memory_bounds_are_unavailable_on_every_build_path() {
 #[test]
 fn embedded_zero_memory_policy_leaves_bounds_enabled() {
     let store = store(0);
-    assert!(store.memory_watch().is_none());
+    assert!(!store.memory_stop().exceeded(), "a zero limit never stops");
     assert_eq!(
         super::super::classification::options(&store).max_memory,
         Some(0)
