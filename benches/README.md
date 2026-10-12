@@ -195,7 +195,11 @@ Timed runs don't start by hand: they are jobs in a measure host's queue
 machine and every system of a comparison runs on the same host under the same limits. A
 host's `queue` in [hosts.toml](hosts.toml) says when a timed job may start: the office PC
 at night or while its owner leaves `~/owlrs/FREE`, never while its owners are present
-(`~/owlrs/RETREAT`; a job they stop runs again); Phuoc-Yu whenever no compiler runs.
+(`~/owlrs/RETREAT`; a job they stop runs again); Phuoc-Yu whenever no compiler runs;
+Khaleesi (64 GiB, Windows) at night, for runs that need RAM and whole comparisons whose
+every contender runs there, its results fetched the day they end (`queue.py fetch`);
+GamerGrill (WSL) any time, but never a timing: downloads, data preparation, answer checks
+(`window = "any"`). The main PC builds and prepares, never times.
 
 ```text
 python benches/suite/queue.py submit JOB.toml        the job's checkout pushed to its host, the job queued
