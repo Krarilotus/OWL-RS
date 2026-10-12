@@ -76,10 +76,10 @@ impl Plan {
                 }
                 input.in_scope(add);
             }
-            Self::Extend {
-                variable, input, ..
-            } => {
-                add(variable);
+            Self::Extend { input, bindings } => {
+                for (variable, _) in bindings {
+                    add(variable);
+                }
                 input.in_scope(add);
             }
             Self::Group {
@@ -143,12 +143,15 @@ impl Plan {
             Self::Filter {
                 input,
                 condition: expression,
-            }
-            | Self::Extend {
-                input, expression, ..
             } => {
                 input.blank_nodes(out);
                 expression_blanks(expression, out);
+            }
+            Self::Extend { input, bindings } => {
+                input.blank_nodes(out);
+                for (_, expression) in bindings {
+                    expression_blanks(expression, out);
+                }
             }
             Self::OrderBy { input, keys } => {
                 input.blank_nodes(out);

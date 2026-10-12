@@ -54,14 +54,9 @@ impl Plan {
                 name,
                 input: boxed(input),
             },
-            Self::Extend {
-                input,
-                variable,
-                expression,
-            } => Self::Extend {
+            Self::Extend { input, bindings } => Self::Extend {
                 input: boxed(input),
-                variable,
-                expression,
+                bindings,
             },
             Self::OrderBy { input, keys } => Self::OrderBy {
                 input: boxed(input),
@@ -342,16 +337,19 @@ fn pre_aggregated(
         return Some(group);
     }
     // The averages from the totals and counts, and the group's own variables only.
-    let averaged = quotients
-        .into_iter()
-        .fold(group, |input, (variable, total, count)| Plan::Extend {
-            input: Box::new(input),
-            variable,
-            expression: Expression::Divide(
-                Box::new(Expression::Variable(total)),
-                Box::new(Expression::Variable(count)),
-            ),
-        });
+    let averaged = Plan::Extend {
+        input: Box::new(group),
+        bindings: quotients
+            .into_iter()
+            .map(|(variable, total, count)| {
+                let quotient = Expression::Divide(
+                    Box::new(Expression::Variable(total)),
+                    Box::new(Expression::Variable(count)),
+                );
+                (variable, quotient)
+            })
+            .collect(),
+    };
     let mut variables = keys.to_vec();
     variables.extend(aggregates.iter().map(|(variable, _)| variable.clone()));
     Some(Plan::Project {

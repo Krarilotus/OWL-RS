@@ -551,17 +551,15 @@ impl Printer<'_> {
             } if crate::compat::names_default_graph(name.as_str()) => self.pattern(inner),
             // Named graphs and remote endpoints have no inferences.
             GraphPattern::Graph { .. } | GraphPattern::Service { .. } => pattern.clone(),
-            GraphPattern::Join { left, right } => GraphPattern::Join {
-                left: b(self, left),
-                right: b(self, right),
+            GraphPattern::Join { inputs } => GraphPattern::Join {
+                inputs: inputs.iter().map(|input| *b(self, input)).collect(),
             },
             GraphPattern::Lateral { left, right } => GraphPattern::Lateral {
                 left: b(self, left),
                 right: b(self, right),
             },
-            GraphPattern::Union { left, right } => GraphPattern::Union {
-                left: b(self, left),
-                right: b(self, right),
+            GraphPattern::Union { inputs } => GraphPattern::Union {
+                inputs: inputs.iter().map(|input| *b(self, input)).collect(),
             },
             GraphPattern::Minus { left, right } => GraphPattern::Minus {
                 left: b(self, left),
@@ -580,14 +578,12 @@ impl Printer<'_> {
                 expr: self.expression(expr),
                 inner: b(self, inner),
             },
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => GraphPattern::Extend {
+            GraphPattern::Extend { inner, bindings } => GraphPattern::Extend {
                 inner: b(self, inner),
-                variable: variable.clone(),
-                expression: self.expression(expression),
+                bindings: bindings
+                    .iter()
+                    .map(|(variable, expression)| (variable.clone(), self.expression(expression)))
+                    .collect(),
             },
             GraphPattern::OrderBy { inner, expression } => GraphPattern::OrderBy {
                 inner: b(self, inner),
@@ -677,14 +673,11 @@ impl Printer<'_> {
                 }
             }
         }
-        let mut out = GraphPattern::Bgp { patterns: plain };
-        for p in expanded {
-            out = GraphPattern::Join {
-                left: Box::new(out),
-                right: Box::new(p),
-            };
-        }
-        out
+        joined(
+            std::iter::once(GraphPattern::Bgp { patterns: plain })
+                .chain(expanded)
+                .collect(),
+        )
     }
 
     /// One atom expanded (a `SELECT DISTINCT` of what the closure holds of it); `None` if
@@ -786,10 +779,7 @@ impl Printer<'_> {
                 if reversed {
                     steps.reverse();
                 }
-                let sequence = steps
-                    .into_iter()
-                    .reduce(|a, b| PathExpr::Sequence(Box::new(a), Box::new(b)))
-                    .expect("a chain has links");
+                let sequence = PathExpr::sequence(steps);
                 push(sequence, &mut out);
             }
         }
@@ -934,10 +924,10 @@ impl Printer<'_> {
                 };
                 branches.push(GraphPattern::Path {
                     subject: subject.clone(),
-                    path: PathExpr::Sequence(
-                        Box::new(PathExpr::NamedNode(rdf_type.clone())),
-                        Box::new(PathExpr::ZeroOrMore(Box::new(subclass_step()))),
-                    ),
+                    path: PathExpr::Sequence(vec![
+                        PathExpr::NamedNode(rdf_type.clone()),
+                        PathExpr::ZeroOrMore(Box::new(subclass_step())),
+                    ]),
                     object: TermPattern::NamedNode(node),
                 });
                 for &c in &named {
@@ -1005,19 +995,14 @@ impl Printer<'_> {
             ClassExpr::Thing => Ok(Some(GraphPattern::default())),
             ClassExpr::Nothing => Ok(None),
             ClassExpr::And(parts) => {
-                let mut out: Option<GraphPattern> = Some(GraphPattern::default());
+                let mut inputs = vec![GraphPattern::default()];
                 for p in parts {
                     match self.unfold(p, subject, active)? {
-                        Some(x) => {
-                            out = out.map(|left| GraphPattern::Join {
-                                left: Box::new(left),
-                                right: Box::new(x),
-                            });
-                        }
+                        Some(x) => inputs.push(x),
                         None => return Ok(None),
                     }
                 }
-                Ok(out)
+                Ok(Some(joined(inputs)))
             }
             ClassExpr::Or(parts) => {
                 let mut branches = Vec::new();
@@ -1034,8 +1019,7 @@ impl Printer<'_> {
                 let edge = self.role_pattern(subject, alternatives, &y);
                 match self.unfold(filler, &y, active)? {
                     Some(f) => Ok(Some(GraphPattern::Join {
-                        left: Box::new(edge),
-                        right: Box::new(f),
+                        inputs: vec![edge, f],
                     })),
                     None => Ok(None),
                 }
@@ -1093,13 +1077,11 @@ fn subclass_step() -> PathExpr {
     let named = |namespace: &str, local: &str| {
         PathExpr::NamedNode(NamedNode::new_unchecked(format!("{namespace}{local}")))
     };
-    let member = PathExpr::Sequence(
-        Box::new(named(OWL, "intersectionOf")),
-        Box::new(PathExpr::Sequence(
-            Box::new(PathExpr::ZeroOrMore(Box::new(named(RDF, "rest")))),
-            Box::new(named(RDF, "first")),
-        )),
-    );
+    let member = PathExpr::Sequence(vec![
+        named(OWL, "intersectionOf"),
+        PathExpr::ZeroOrMore(Box::new(named(RDF, "rest"))),
+        named(RDF, "first"),
+    ]);
     alternation(vec![
         named(RDFS, "subClassOf"),
         named(OWL, "equivalentClass"),
@@ -1116,20 +1098,24 @@ fn atomic(role: Role, node: NamedNode) -> PathExpr {
 }
 
 fn alternation(paths: Vec<PathExpr>) -> PathExpr {
-    paths
-        .into_iter()
-        .reduce(|a, b| PathExpr::Alternative(Box::new(a), Box::new(b)))
-        .expect("a role has itself as an alternative")
+    assert!(!paths.is_empty(), "a role has itself as an alternative");
+    PathExpr::alternative(paths)
 }
 
 fn union(branches: Vec<GraphPattern>) -> GraphPattern {
-    branches
-        .into_iter()
-        .reduce(|a, b| GraphPattern::Union {
-            left: Box::new(a),
-            right: Box::new(b),
-        })
-        .unwrap_or_else(nothing)
+    match branches.is_empty() {
+        true => nothing(),
+        false => GraphPattern::union_all(branches),
+    }
+}
+
+/// `inputs` as one join, as they are (n-ary, ADR-0012): one input is itself.
+fn joined(mut inputs: Vec<GraphPattern>) -> GraphPattern {
+    match inputs.len() {
+        0 => GraphPattern::default(),
+        1 => inputs.pop().expect("one"),
+        _ => GraphPattern::Join { inputs },
+    }
 }
 
 /// A pattern without solutions.
@@ -1143,14 +1129,16 @@ fn nothing() -> GraphPattern {
 /// `VALUES ?v { names }` joined with `pattern`.
 fn values_join(v: &Variable, names: Vec<NamedNode>, pattern: GraphPattern) -> GraphPattern {
     GraphPattern::Join {
-        left: Box::new(GraphPattern::Values {
-            variables: vec![v.clone()],
-            bindings: names
-                .into_iter()
-                .map(|n| vec![Some(GroundTerm::NamedNode(n))])
-                .collect(),
-        }),
-        right: Box::new(pattern),
+        inputs: vec![
+            GraphPattern::Values {
+                variables: vec![v.clone()],
+                bindings: names
+                    .into_iter()
+                    .map(|n| vec![Some(GroundTerm::NamedNode(n))])
+                    .collect(),
+            },
+            pattern,
+        ],
     }
 }
 
@@ -1214,9 +1202,10 @@ fn path_names(path: &PathExpr, out: &mut Vec<Option<NamedNode>>) {
         | PathExpr::ZeroOrMore(p)
         | PathExpr::OneOrMore(p)
         | PathExpr::ZeroOrOne(p) => path_names(p, out),
-        PathExpr::Sequence(a, b) | PathExpr::Alternative(a, b) => {
-            path_names(a, out);
-            path_names(b, out);
+        PathExpr::Sequence(paths) | PathExpr::Alternative(paths) => {
+            for p in paths {
+                path_names(p, out);
+            }
         }
         PathExpr::NegatedPropertySet(_) => out.push(None),
     }
