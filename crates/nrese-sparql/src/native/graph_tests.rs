@@ -1,8 +1,7 @@
-//! Deterministic graph-phase ownership and cancellation guards; no sleeps or timing.
+//! Deterministic graph-phase cancellation guards; no sleeps or timing.
 
 use super::*;
-use nrese_exec::{SharedBudget, workers::Workers};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use nrese_exec::SharedBudget;
 
 thread_local! {
     static CHECKPOINT: RefCell<Option<Box<dyn Fn()>>> = RefCell::new(None);
@@ -17,16 +16,18 @@ pub(super) fn checkpoint() {
 }
 
 #[test]
-fn graph_completion_and_explain_stay_on_the_owner_and_cancel_after_algebra() {
+fn graph_completion_and_explain_cancel_after_algebra() {
     let engine = nrese_engine::Engine::new(Default::default()).unwrap();
     let snapshot = engine.snapshot();
-    let workers = Workers::pooled(1).unwrap();
-    let caller = std::thread::current().id();
-    for text in [
-        "CONSTRUCT { ?s <urn:p> 1 } WHERE { VALUES ?s { <urn:a> <urn:b> } }",
-        "DESCRIBE ?s WHERE { VALUES ?s { <urn:a> <urn:b> } }",
-        "CONSTRUCT { ?s <urn:p> 1 } WHERE { VALUES ?s {} }",
-        "DESCRIBE ?s WHERE { VALUES ?s {} }",
+    // CONSTRUCT checks per row: without rows, its empty graph is complete.
+    for (text, stops) in [
+        (
+            "CONSTRUCT { ?s <urn:p> 1 } WHERE { VALUES ?s { <urn:a> <urn:b> } }",
+            true,
+        ),
+        ("DESCRIBE ?s WHERE { VALUES ?s { <urn:a> <urn:b> } }", true),
+        ("CONSTRUCT { ?s <urn:p> 1 } WHERE { VALUES ?s {} }", false),
+        ("DESCRIBE ?s WHERE { VALUES ?s {} }", true),
     ] {
         let query = nrese_sparql_syntax::SparqlParser::new()
             .parse_query(text)
@@ -35,24 +36,22 @@ fn graph_completion_and_explain_stay_on_the_owner_and_cancel_after_algebra() {
             for cancel in [false, true] {
                 let token = CancellationToken::new();
                 let shared = SharedBudget::new(1 << 20);
-                let observed = Arc::new(AtomicUsize::new(0));
-                let count = Arc::clone(&observed);
+                let observed = std::rc::Rc::new(Cell::new(0));
+                let count = std::rc::Rc::clone(&observed);
                 let flag = token.clone();
-                // Install only on the physical owner. A caller-side graph phase misses
-                // this hook, so the count below detects a misplaced completion stage.
-                workers.install(move || {
-                    CHECKPOINT.set(Some(Box::new(move || {
-                        assert_ne!(std::thread::current().id(), caller);
-                        count.fetch_add(1, Ordering::Relaxed);
-                        if cancel {
-                            flag.cancel();
-                        }
-                    })))
-                });
+                // The graph phase passes this hook once, after the algebra.
+                CHECKPOINT.set(Some(Box::new(move || {
+                    count.set(count.get() + 1);
+                    if cancel {
+                        flag.cancel();
+                    }
+                })));
                 let options = QueryOptions {
-                    workers: Some(workers.clone()),
-                    shared_memory: Some(shared.clone()),
-                    cancellation: Some(token),
+                    resources: crate::Resources {
+                        shared_memory: Some(shared.clone()),
+                        cancellation: Some(token),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 };
                 let result = if explaining {
@@ -60,9 +59,9 @@ fn graph_completion_and_explain_stay_on_the_owner_and_cancel_after_algebra() {
                 } else {
                     typed_results::evaluate(snapshot.clone(), &query, &options).map(drop)
                 };
-                workers.install(|| CHECKPOINT.set(None));
-                assert_eq!(observed.load(Ordering::Relaxed), 1, "{text}");
-                if cancel {
+                CHECKPOINT.set(None);
+                assert_eq!(observed.get(), 1, "{text}");
+                if cancel && stops {
                     assert!(
                         matches!(result, Err(QueryEvaluationError::Cancelled)),
                         "{result:?}"

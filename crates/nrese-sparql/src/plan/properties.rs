@@ -30,8 +30,8 @@ impl Plan {
         }
     }
 
-    /// Variables in scope, in their execution-algebra order, without lowering the tree.
-    /// Deduplication costs O(occurrences * variables); joins also inspect ordering.
+    /// Variables in scope, without lowering the tree; a join lists its scans' variables
+    /// first. Deduplication costs O(occurrences * variables).
     pub fn variables(&self) -> Vec<Variable> {
         let mut variables = Vec::new();
         self.in_scope(&mut |v| {
@@ -51,7 +51,15 @@ impl Plan {
                 term_variables(subject, add);
                 term_variables(object, add);
             }
-            Self::Join(inputs) => Self::join_scope(&inputs.iter().collect::<Vec<_>>(), add),
+            Self::Join(inputs) => {
+                for scans in [true, false] {
+                    for input in inputs {
+                        if matches!(input, Self::Scan(_)) == scans {
+                            input.in_scope(add);
+                        }
+                    }
+                }
+            }
             Self::Union(inputs) => {
                 for input in inputs {
                     input.in_scope(add);
@@ -95,40 +103,6 @@ impl Plan {
             | Self::Distinct(input)
             | Self::Reduced(input)
             | Self::Slice { input, .. } => input.in_scope(add),
-        }
-    }
-
-    fn join_scope(inputs: &[&Self], add: &mut impl FnMut(&Variable)) {
-        if !inputs.iter().any(|input| input.ordered()) {
-            // Lowering gathers scans before other inputs, preserving each partition.
-            for scans in [true, false] {
-                for input in inputs {
-                    if matches!(input, Self::Scan(_)) == scans {
-                        input.in_scope(add);
-                    }
-                }
-            }
-            return;
-        }
-        let mut i = 0;
-        while i < inputs.len() {
-            let input = inputs[i];
-            i += 1;
-            if let Self::Join(inner) = input {
-                // Ordered lowering appends adjacent scans to the preceding join run.
-                // Borrow that combined run to retain exactly the same variable order.
-                let start = i;
-                while i < inputs.len() && matches!(inputs[i], Self::Scan(_)) {
-                    i += 1;
-                }
-                if i > start {
-                    let mut run: Vec<_> = inner.iter().collect();
-                    run.extend_from_slice(&inputs[start..i]);
-                    Self::join_scope(&run, add);
-                    continue;
-                }
-            }
-            input.in_scope(add);
         }
     }
 

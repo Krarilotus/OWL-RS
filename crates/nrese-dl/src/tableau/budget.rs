@@ -113,7 +113,7 @@ pub(crate) fn workers(config: &Config, tasks: usize) -> Workers {
     config.workers.as_ref().map_or_else(
         || {
             let available = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-            Workers::new(available.min(tasks).max(1)).unwrap_or_else(|_| Workers::serial())
+            Workers::new(available.min(tasks))
         },
         |workers| workers.limited(tasks.max(1)),
     )

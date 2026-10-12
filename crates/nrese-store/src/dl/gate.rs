@@ -84,7 +84,7 @@ pub(super) fn remaining_budget(base: &Budget, deadline: Instant) -> Budget {
 /// The budget of a check under `store`'s settings.
 pub(crate) fn budget(store: &StoreService, cancel: Option<Cancel>) -> Budget {
     let dl = &store.config().dl;
-    let workers = store.runtime().workers().limited(dl.threads);
+    let workers = nrese_exec::workers::Workers::current().limited(dl.threads);
     Budget {
         timeout: dl.timeout,
         memory_bytes: dl.memory_per_worker(1),

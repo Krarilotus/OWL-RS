@@ -1,0 +1,20 @@
+id = "2026-10-12-sparql-consolidation"
+kit = "fast"
+purpose = "PR #23 SPARQL/exec consolidation: the base comparison of the cases the 11 Oct A/B flagged (open-first-query +12 %, kernel-intersect and op-negation memory), and whether the generic evaluate path through SolutionTable caused them"
+baseline = "157931a (v2 before the PR); the PR head 111d47d (snapshot a57e11c) as a third arm for open-first-query"
+findings = "open-first-query: the PR's first query is slower again here (+11.4 % cold median over 80 runs), the consolidated branch is within the base's interquartile range (+1.1 %). The case writes through the direct writer, so the typed SolutionTable path was not on it. Counts: whole-process user instructions equal within 1 % in all three (perf stat, 15 runs each, twice), syscalls equal (486/488/488, 5 thread clones each, no pool start); page faults base 319-326, PR 335-337, consolidated 322-334, first-query faults base 43-45, PR 47-50: the PR's extra time is first-touch faults, not extra work. op-negation and kernel-intersect: equal query times; their memory differences sit in the load phase, which varies as much between base runs (kernel-intersect load peak 826-916 MiB in the base alone); query-phase peaks equal within that noise. Screen of 17 cases on the touched paths (direct output, CONSTRUCT, paths, aggregates, client lookups, vector search, QL, DL bounds, result cache), two interleaved pairs: no case slower beyond the 10 % floor in either pair; ratios 0.90-1.07, q-star once faster (0.90). 32-client lookup QPS equal (base 960k/966k, consolidated 981k/965k). vector-knn-filtered fails its recall check in both arms (approximate recall 0.40-0.54, the known open failure), so it has no timing verdict; its times are not slower."
+host = "Office-PC"
+commit = "e9eb4ee"
+dirty = false
+publishable = "all"
+results = "/home/krarilotus/owlrs/results/reports/fast/2026-10-12-sparql-{ab,ofq,screen}-*; compact records in /home/krarilotus/owlrs/results/sparql-ab-20261012"
+baseline_binary_sha256 = "fd35137016ac846141852b239cdbe7ed6a5a4132976cf36c38e2b6e8ac7cffdf"
+pr_binary_sha256 = "53880b9c5832f6685584bfee3af79fa4fb1bcb271fed0312cd31ef7d6941852f"
+candidate_binary_sha256 = "553465ef525b77496e1b30f72c63cfae5dce715624908f0b4ce45ac987d6ba7c"
+
+[protocol]
+cases = ["open-first-query", "op-negation", "kernel-intersect"]
+runs = "fast.py run, one repetition per invocation, arms interleaved: 3 rounds of all three cases (base, consolidated), then 4 rounds of open-first-query (base, PR, consolidated)"
+binaries = "Release perf_lab from each worktree's target volume (fast.py build); base built from the clean 157931a worktree, PR from a57e11c, consolidated from e9eb4ee; the compact records' git field names the driver's worktree, the hashes above name the binaries"
+screen = ["q-star", "q-chain", "q-paths", "q-large-result", "q-topk", "op-group", "op-aggregates", "op-optional", "op-strings", "clients-lookups", "vector-knn-exact", "vector-knn-filtered", "ql-lubm10", "ql-owl2bench", "plan-estimates", "dlmode-lubm1", "cache-replay"]
+counts = "strace -f -c and perf stat -e instructions:u,page-faults in a throwaway container over the same store and lookups, outside the quiet slot (counts only)"
