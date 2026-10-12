@@ -6,7 +6,6 @@
 # run records that use it.
 
 budget_gb = 300
-volume = "nrese-bench-data"
 
 [[dataset]]
 file = "dbpedia-core.nt"

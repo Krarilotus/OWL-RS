@@ -11,8 +11,8 @@ budget, each with its size and SHA-256, and checked before a comparison.
     suite.py data verify [--quick]     every catalogued file against its hash (or size)
     suite.py data files                the catalogued file names (for scripts/bench-cleanup.sh)
 
-FILE is a path under /data (`lubm-100.nt`, `real/wikidata-lexemes.nt.gz`). Uses the volume
-`nrese-bench-data` unless --data DIR.
+FILE is a path under /data (`lubm-100.nt`, `real/wikidata-lexemes.nt.gz`). Uses the datasets'
+volume (benches/hosts.toml [volumes] data) unless --data DIR.
 """
 from __future__ import annotations
 
@@ -38,13 +38,13 @@ HEADER = """# The frozen benchmark datasets (benches/PROTOCOL.md §6; `suite.py 
 def load(root: Path) -> dict:
     path = root / "benches/datasets.toml"
     if not path.exists():
-        return {"budget_gb": 300, "volume": "nrese-bench-data", "dataset": []}
+        return {"budget_gb": 300, "dataset": []}
     with open(path, "rb") as f:
         return tomllib.load(f)
 
 
 def save(root: Path, catalog: dict):
-    lines = [HEADER, f"budget_gb = {catalog['budget_gb']}", f"volume = {toml_value(catalog['volume'])}", ""]
+    lines = [HEADER, f"budget_gb = {catalog['budget_gb']}", ""]
     for d in sorted(catalog["dataset"], key=lambda d: d["file"]):
         lines.append("[[dataset]]")
         for key in ("file", "workload", "tier", "role", "made_by", "source", "bytes", "sha256", "frozen"):
@@ -126,7 +126,8 @@ def main(argv: list[str], workloads: dict, root: Path) -> int:
     p.add_argument("--quick", action="store_true", help="verify sizes only")
     args = p.parse_args(argv)
     catalog = load(root)
-    store = Store(None if args.data else catalog["volume"], args.data)
+    from . import hosts
+    store = Store(None if args.data else hosts.volume("data"), args.data)
     by_file = {d["file"]: d for d in catalog["dataset"]}
     if args.command == "files":
         print("\n".join(sorted(by_file)))
