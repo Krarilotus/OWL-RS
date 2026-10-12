@@ -66,10 +66,15 @@ and every run ends in the same record.
   anything else. Its thresholds are in [fast/README.md](fast/README.md#comparing).
 
 Answers are compared by [suite/suitekit/answers.py](suite/suitekit/answers.py)
-(`suite.py run --answers full --answers-reference SYSTEM`): each system against one
-reference, never by majority; `strict_match` and `value_match` apart (a `COUNT` typed
-`xsd:int` is the same value as `xsd:integer`, and the datatype difference is recorded);
-an unordered final `LIMIT` checked as a legal subset of the reference's unlimited answer.
+(`suite.py run --answers full --answers-reference jena,oxigraph,…`): each system against
+one reference, never by majority. The reference is the first listed system with a complete,
+stable answer, confirmed by the next one or by a known answer (an adjudicated count, a fast
+case's own check); two references that disagree leave the query to adjudication.
+`strict_match` and `value_match` are kept apart (a `COUNT` typed `xsd:int` is the same
+value as `xsd:integer`, and the datatype difference is recorded); an unordered final
+`LIMIT` is checked as a legal subset of the reference's unlimited answer. Each distinct
+query on the same data is one group, classified `ok`, `wrong` (whose), `incomplete` or
+`unsupported`; `suite.py answers DIR...` classifies captured runs again, without running.
 
 ### Where this stands
 

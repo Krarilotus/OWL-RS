@@ -37,6 +37,9 @@ class Plan:
     clients: list[int] = field(default_factory=list)  # the queries again from this many concurrent clients each (throughput, p99)
     duration_s: int = 20
     replay: bool = False  # the queries are a log: each run once, in name order, no warm-up
+    # Known answers per query (its file's stem): {"value": the one value} or {"rows": n}, from
+    # an independent source (a fast case's generator or a pinned check); the answer recorder's oracle.
+    answers: dict[str, dict] = field(default_factory=dict)
 
 
 def expected_counts(path: Path) -> dict[str, int] | None:
@@ -206,11 +209,40 @@ def fast(root: Path, tier: str, settings: dict) -> Plan:
     if settings.get("FAST_QUERIES"):
         # Several cases on the same data in one run: their queries merged (compete.py).
         plan.queries = Path(settings["FAST_QUERIES"])
+    plan.answers = fast_answers(case, semantics, settings)
     args = case.get("args", [])
     if "--clients" in args:
         plan.clients = [int(n) for n in args[args.index("--clients") + 1].split(",")]
         plan.duration_s = int(float(args[args.index("--duration-s") + 1])) if "--duration-s" in args else 20
     return plan
+
+
+def fast_answers(case: dict, semantics: str, settings: dict) -> dict[str, dict]:
+    """A fast case's checks of single query answers (`q.NAME.value`, `q.NAME.rows`) as known
+    answers, where they hold for the comparator: under the case's own semantics, or on NRESE's
+    closure of it. `expect.KEY` is the generator's answer, read from the file FAST_EXPECT names
+    (compete.py writes it); without that file those checks are left out."""
+    import json
+    if semantics != "closure" and FAST_REGIMES.get(semantics) != FAST_REGIMES.get(case["semantics"], case["semantics"]):
+        return {}
+    expect = {}
+    if settings.get("FAST_EXPECT"):
+        try:
+            expect = json.loads(Path(settings["FAST_EXPECT"]).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            expect = {}
+    out: dict[str, dict] = {}
+    for path, want in case.get("check", {}).items():
+        parts = path.split(".")
+        if len(parts) != 3 or parts[0] != "q" or parts[2] not in ("value", "rows"):
+            continue
+        if isinstance(want, str) and want.startswith("expect."):
+            want = expect.get(want[len("expect."):])
+        elif isinstance(want, str) and not re.fullmatch(r"-?\d+(\.\d+)?", want.strip()):
+            continue  # a comparison (">= 0.9"), not an answer
+        if want is not None:
+            out.setdefault(parts[1], {})[parts[2]] = want
+    return out
 
 
 # workload -> (the plan of a tier, the default tiers)
