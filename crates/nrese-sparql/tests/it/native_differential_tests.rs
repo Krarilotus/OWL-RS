@@ -106,6 +106,16 @@ impl Rng {
     }
 }
 
+/// Whether a random test that has drawn `drawn` cases draws another: every one of the
+/// `cases` it plans, then more (up to ten times as many) while it lacks the coverage its last
+/// assertion asks for, so that its coverage never depends on the seed's luck. Seed 66810
+/// drew 1,333 queries with solutions in 4,000 where more than a third were asked: every
+/// answer right, the gate red (12 October 2026). The NI fuzz test's fix, `a901e34`, did so
+/// first.
+pub(crate) fn draws_on(drawn: usize, cases: usize, covered: bool) -> bool {
+    drawn < cases || (!covered && drawn < cases * 10)
+}
+
 /// Cases for a second oracle (benches/oracle/README.md): with `NRESE_ORACLE_DUMP=<dir>`, a
 /// test writes `<dir>/<test>/d<N>/data.nq` per dataset and `q<M>.rq` with `q<M>.nrese` (a
 /// line of the variables, then the native rows, one per line, terms separated by tabs;
@@ -750,7 +760,17 @@ fn native_results_equal_the_reference_on_random_queries() {
     let (mut checked, mut fallbacks) = (0, Vec::new());
     let mut with_solutions = 0;
     let dump = Dump::new("random");
-    for dataset_case in 0..150 {
+    let covered = |checked: usize, with_solutions: usize, fallbacks: usize| {
+        with_solutions * 6 > checked && fallbacks * 20 < checked
+    };
+    for dataset_case in 0.. {
+        if !draws_on(
+            dataset_case,
+            150,
+            covered(checked, with_solutions, fallbacks.len()),
+        ) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         let quads = random_dataset(&mut rng);
@@ -851,17 +871,12 @@ fn native_results_equal_the_reference_on_random_queries() {
     }
     // Agreement on empty results proves little: a fair share of the queries must have
     // solutions. It is a fifth (a tenth before the generator got its connected patterns);
-    // the tests with their own generators below reach a quarter to three quarters.
+    // the tests with their own generators below reach a quarter to three quarters. And the
+    // generator's shapes must be almost all native (the executor refuses the rest).
     assert!(
-        with_solutions * 6 > checked,
-        "only {with_solutions} of {checked} queries have solutions"
-    );
-    // The generator's shapes must be almost all native (the executor refuses the rest).
-    assert!(
-        fallbacks.len() * 20 < checked,
-        "{} of {} generated queries not native, e.g. {:#?}",
+        covered(checked, with_solutions, fallbacks.len()),
+        "{checked} checked, {with_solutions} with solutions, {} not native, e.g. {:#?}",
         fallbacks.len(),
-        checked + fallbacks.len(),
         &fallbacks[..fallbacks.len().min(3)]
     );
 }
@@ -955,7 +970,17 @@ fn pushed_filters_equal_the_reference() {
         ..QueryOptions::default()
     };
     let dump = Dump::new("pushed-filters");
-    for dataset_case in 0..60 {
+    let covered = |checked: usize, with_solutions: usize, fallbacks: usize| {
+        fallbacks * 5 < checked && with_solutions * 5 > checked
+    };
+    for dataset_case in 0.. {
+        if !draws_on(
+            dataset_case,
+            60,
+            covered(checked, with_solutions, fallbacks),
+        ) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         let quads = random_dataset(&mut rng);
@@ -1007,15 +1032,10 @@ fn pushed_filters_equal_the_reference() {
             with_solutions += usize::from(!expected.is_empty());
         }
     }
-    assert!(
-        fallbacks * 5 < checked,
-        "{fallbacks} of {} queries not native",
-        checked + fallbacks
-    );
     // A filter that drops everything proves little: enough queries must keep solutions.
     assert!(
-        with_solutions * 5 > checked,
-        "only {with_solutions} of {checked} queries have solutions"
+        covered(checked, with_solutions, fallbacks),
+        "{checked} checked, {with_solutions} with solutions, {fallbacks} not native"
     );
 }
 
@@ -1096,7 +1116,11 @@ fn paths_from_bound_values_equal_the_reference() {
     ];
     let mut rng = Rng::seeded(20_261_001);
     let (mut checked, mut with_solutions) = (0, 0);
-    for dataset_case in 0..50 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions * 2 > checked;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 50, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         let quads = random_dataset(&mut rng);
@@ -1173,7 +1197,7 @@ fn paths_from_bound_values_equal_the_reference() {
         }
     }
     assert!(
-        with_solutions * 2 > checked,
+        covered(checked, with_solutions),
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
@@ -1751,7 +1775,17 @@ fn computed_values_equal_the_reference() {
         ..QueryOptions::default()
     };
     let dump = Dump::new("computed-values");
-    for dataset_case in 0..60 {
+    let covered = |checked: usize, with_solutions: usize, fallbacks: usize| {
+        fallbacks * 5 < checked && with_solutions * 4 > checked * 3
+    };
+    for dataset_case in 0.. {
+        if !draws_on(
+            dataset_case,
+            60,
+            covered(checked, with_solutions, fallbacks),
+        ) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         let quads = random_dataset(&mut rng);
@@ -1807,13 +1841,8 @@ fn computed_values_equal_the_reference() {
         }
     }
     assert!(
-        fallbacks * 5 < checked,
-        "{fallbacks} of {} queries not native",
-        checked + fallbacks
-    );
-    assert!(
-        with_solutions * 4 > checked * 3,
-        "only {with_solutions} of {checked} queries have solutions"
+        covered(checked, with_solutions, fallbacks),
+        "{checked} checked, {with_solutions} with solutions, {fallbacks} not native"
     );
 }
 
@@ -1926,7 +1955,11 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
     let oracle = QueryOptions {
         ..QueryOptions::default()
     };
-    for dataset_case in 0..60 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions * 4 > checked * 3;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 60, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -1984,7 +2017,7 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
         }
     }
     assert!(
-        with_solutions * 4 > checked * 3,
+        covered(checked, with_solutions),
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
@@ -2002,7 +2035,11 @@ fn joins_on_unbound_variables_equal_the_reference() {
     let oracle = QueryOptions {
         ..QueryOptions::default()
     };
-    for dataset_case in 0..60 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions * 4 > checked * 3;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 60, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -2047,7 +2084,7 @@ fn joins_on_unbound_variables_equal_the_reference() {
         }
     }
     assert!(
-        with_solutions * 4 > checked * 3,
+        covered(checked, with_solutions),
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
@@ -2689,7 +2726,11 @@ fn construct_equals_the_reference() {
         },
     ];
     let mut checked = 0;
-    for _ in 0..60 {
+    let covered = |checked: usize| checked > 1000;
+    for drawn in 0.. {
+        if !draws_on(drawn, 60, covered(checked)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -2729,7 +2770,7 @@ fn construct_equals_the_reference() {
             checked += 1;
         }
     }
-    assert!(checked > 1000, "{checked}");
+    assert!(covered(checked), "{checked}");
 }
 
 /// GRAPH patterns (a graph variable or constant, mixed with default-graph patterns, the
@@ -2738,7 +2779,11 @@ fn construct_equals_the_reference() {
 fn graph_patterns_equal_the_reference() {
     let mut rng = Rng::seeded(20_260_930);
     let (mut checked, mut fallbacks) = (0, 0);
-    for _ in 0..80 {
+    let covered = |checked: usize, fallbacks: usize| checked > 1500 && fallbacks * 4 < checked;
+    for drawn in 0.. {
+        if !draws_on(drawn, 80, covered(checked, fallbacks)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -2797,7 +2842,7 @@ fn graph_patterns_equal_the_reference() {
         }
     }
     assert!(
-        checked > 1500 && fallbacks * 4 < checked,
+        covered(checked, fallbacks),
         "{checked} checked, {fallbacks} fallbacks"
     );
 }
@@ -3075,7 +3120,11 @@ fn direct_results_equal_the_results_serialiser() {
     ];
     let mut rng = Rng::seeded(20_260_933);
     let mut checked = 0;
-    for _ in 0..60 {
+    let covered = |checked: usize| checked > 3000;
+    for drawn in 0.. {
+        if !draws_on(drawn, 60, covered(checked)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -3135,7 +3184,7 @@ fn direct_results_equal_the_results_serialiser() {
             }
         }
     }
-    assert!(checked > 3000, "{checked}");
+    assert!(covered(checked), "{checked}");
 }
 
 /// Results of many blocks are serialised in parallel ([`nrese_sparql::write_results`]):
@@ -3266,7 +3315,21 @@ fn load_spread_over_graphs(engine: &Engine, rng: &mut Rng) {
 fn the_merged_default_graph_equals_the_reference() {
     let mut rng = Rng::seeded(20_260_933);
     let (mut checked, mut fallbacks, mut native_runs, mut native_runs_plain) = (0, 0, 0, 0);
-    for dataset_case in 0..120 {
+    let covered =
+        |checked: usize, fallbacks: usize, native_runs: usize, native_runs_plain: usize| {
+            checked > 4000
+                && fallbacks * 20 < checked
+                && native_runs * 4 > checked * 3
+                && native_runs * 20 > native_runs_plain * 19
+        };
+    for dataset_case in 0.. {
+        if !draws_on(
+            dataset_case,
+            120,
+            covered(checked, fallbacks, native_runs, native_runs_plain),
+        ) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         load_spread_over_graphs(&engine, &mut rng);
         let snapshot = engine.snapshot();
@@ -3351,12 +3414,8 @@ fn the_merged_default_graph_equals_the_reference() {
     // the plain default graph:
     // what hands a query back at run time (unbound join keys) isn't the merge.
     assert!(
-        checked > 4000
-            && fallbacks * 20 < checked
-            && native_runs * 4 > checked * 3
-            && native_runs * 20 > native_runs_plain * 19,
-        "{checked} checked, {fallbacks} not native by shape, {native_runs} ran natively, \
-         {native_runs_plain} with the plain default graph"
+        covered(checked, fallbacks, native_runs, native_runs_plain),
+        "{checked} checked, {fallbacks} not native by shape, {native_runs} ran natively, {native_runs_plain} with the plain default graph"
     );
 }
 
@@ -3513,7 +3572,11 @@ fn updates_over_the_merged_default_graph_equal_the_reference() {
         ("DELETE { ?a ?p ?b }", ""),
     ];
     let mut changed = 0;
-    for _ in 0..60 {
+    let covered = |changed: usize| changed > 100;
+    for drawn in 0.. {
+        if !draws_on(drawn, 60, covered(changed)) {
+            break;
+        }
         let engines = [
             Engine::new(EngineConfig::default()).unwrap(),
             Engine::new(EngineConfig::default()).unwrap(),
@@ -3548,7 +3611,7 @@ fn updates_over_the_merged_default_graph_equal_the_reference() {
             changed += usize::from(native != before);
         }
     }
-    assert!(changed > 100, "only {changed} updates changed anything");
+    assert!(covered(changed), "only {changed} updates changed anything");
 }
 
 /// A `WHERE` body for the dataset tests: what the default graph of the dataset holds,
@@ -3734,7 +3797,17 @@ fn protocol_dataset(rng: &mut Rng) -> Option<nrese_sparql::QueryDatasetSpecifica
 fn datasets_and_graph_patterns_equal_the_reference() {
     let mut rng = Rng::seeded(20_260_935);
     let (mut checked, mut with_solutions, mut with_dataset, mut fallbacks) = (0, 0, 0, 0);
-    for dataset_case in 0..100 {
+    let covered = |checked: usize, with_solutions: usize, with_dataset: usize, fallbacks: usize| {
+        fallbacks * 50 < checked && with_solutions * 3 > checked && with_dataset * 2 > checked
+    };
+    for dataset_case in 0.. {
+        if !draws_on(
+            dataset_case,
+            100,
+            covered(checked, with_solutions, with_dataset, fallbacks),
+        ) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         load_spread_over_graphs(&engine, &mut rng);
         let snapshot = engine.snapshot();
@@ -3786,9 +3859,8 @@ fn datasets_and_graph_patterns_equal_the_reference() {
         }
     }
     assert!(
-        fallbacks * 50 < checked && with_solutions * 3 > checked && with_dataset * 2 > checked,
-        "{checked} checked, {fallbacks} not native by shape, {with_solutions} with solutions, \
-         {with_dataset} with a dataset"
+        covered(checked, with_solutions, with_dataset, fallbacks),
+        "{checked} checked, {fallbacks} not native by shape, {with_solutions} with solutions, {with_dataset} with a dataset"
     );
 }
 
@@ -4031,7 +4103,11 @@ fn updates_with_a_dataset_equal_the_reference() {
     use nrese_sparql::UpdateOptions;
     let mut rng = Rng::seeded(20_260_936);
     let (mut checked, mut changed) = (0, 0);
-    for _ in 0..60 {
+    let covered = |checked: usize, changed: usize| checked >= 480 && changed * 4 > checked;
+    for drawn in 0.. {
+        if !draws_on(drawn, 60, covered(checked, changed)) {
+            break;
+        }
         let engines = [
             Engine::new(EngineConfig::default()).unwrap(),
             Engine::new(EngineConfig::default()).unwrap(),
@@ -4088,7 +4164,7 @@ fn updates_with_a_dataset_equal_the_reference() {
         }
     }
     assert!(
-        checked == 480 && changed * 4 > checked,
+        covered(checked, changed),
         "{changed} of {checked} updates changed something"
     );
 }
@@ -4203,7 +4279,13 @@ fn exists_pattern(rng: &mut Rng) -> String {
 fn exists_equal_the_reference() {
     let mut rng = Rng::seeded(20_260_937);
     let (mut checked, mut native_runs, mut with_solutions) = (0, 0, 0);
-    for _ in 0..80 {
+    let covered = |checked: usize, native_runs: usize, with_solutions: usize| {
+        native_runs * 10 > checked * 7 && with_solutions * 2 > checked
+    };
+    for drawn in 0.. {
+        if !draws_on(drawn, 80, covered(checked, native_runs, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         load_spread_over_graphs(&engine, &mut rng);
         let snapshot = engine.snapshot();
@@ -4266,10 +4348,8 @@ fn exists_equal_the_reference() {
         }
     }
     assert!(
-        // A quarter of the EXISTS patterns are correlated deeper than the native executor
-        // takes.
-        native_runs * 10 > checked * 7 && with_solutions * 2 > checked,
-        "{checked} checked, {native_runs} native, {with_solutions} with solutions"
+        covered(checked, native_runs, with_solutions),
+        "{checked} checked, {native_runs} native (a quarter of the EXISTS patterns are correlated deeper than the native executor takes), {with_solutions} with solutions"
     );
 }
 
@@ -4645,7 +4725,11 @@ fn skewed_dataset(rng: &mut Rng) -> Vec<Quad> {
 fn sideways_joins_equal_the_reference() {
     let mut rng = Rng::seeded(20_260_940);
     let (mut checked, mut probed) = (0, 0);
-    for _ in 0..4 {
+    let covered = |checked: usize, probed: usize| probed * 3 > checked;
+    for drawn in 0.. {
+        if !draws_on(drawn, 4, covered(checked, probed)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in skewed_dataset(&mut rng) {
@@ -4712,7 +4796,7 @@ fn sideways_joins_equal_the_reference() {
         }
     }
     assert!(
-        probed * 3 > checked,
+        covered(checked, probed),
         "{probed} of {checked} probed the index"
     );
 }
@@ -4724,7 +4808,11 @@ fn multi_operation_updates_equal_the_reference() {
     use nrese_sparql::UpdateOptions;
     let mut rng = Rng::seeded(20_260_941);
     let mut changed = 0;
-    for _ in 0..40 {
+    let covered = |changed: usize| changed > 150;
+    for drawn in 0.. {
+        if !draws_on(drawn, 40, covered(changed)) {
+            break;
+        }
         let data = random_dataset(&mut rng);
         let engines = [
             Engine::new(EngineConfig::default()).unwrap(),
@@ -4778,7 +4866,7 @@ fn multi_operation_updates_equal_the_reference() {
             changed += usize::from(native != before);
         }
     }
-    assert!(changed > 150, "only {changed} requests changed anything");
+    assert!(covered(changed), "only {changed} requests changed anything");
 }
 
 /// Data closed under `owl:sameAs` (every fact replicated over identity classes, the
@@ -4790,7 +4878,11 @@ fn identity_classes_shrink_detached_optionals() {
     let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
     let mut rng = Rng::seeded(20_260_942);
     let (mut checked, mut shrunk) = (0, 0);
-    for _ in 0..12 {
+    let covered = |checked: usize, shrunk: usize| shrunk * 3 > checked;
+    for drawn in 0.. {
+        if !draws_on(drawn, 12, covered(checked, shrunk)) {
+            break;
+        }
         // Classes of 1 to 5 identities; facts between classes, replicated.
         let mut classes: Vec<Vec<NamedNode>> = Vec::new();
         for c in 0..12 {
@@ -4906,7 +4998,10 @@ fn identity_classes_shrink_detached_optionals() {
             checked += 1;
         }
     }
-    assert!(shrunk * 3 > checked, "{shrunk} of {checked} joins shrank");
+    assert!(
+        covered(checked, shrunk),
+        "{shrunk} of {checked} joins shrank"
+    );
 }
 
 /// A selective filter makes its pattern count as smaller when the join order is planned:
@@ -5033,7 +5128,11 @@ fn triple_terms_and_base_directions_equal_the_reference() {
     let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
     let mut checked = 0;
     let mut with_solutions = 0;
-    for dataset_case in 0..60 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions > checked / 4;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 60, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for _ in 0..10 + rng.below(30) {
@@ -5131,7 +5230,7 @@ fn triple_terms_and_base_directions_equal_the_reference() {
     }
     assert_eq!(checked, 60 * 40);
     assert!(
-        with_solutions > checked / 4,
+        covered(checked, with_solutions),
         "{with_solutions} of {checked} with solutions"
     );
 }
@@ -5145,7 +5244,11 @@ fn triple_terms_and_base_directions_equal_the_reference() {
 fn grouped_cross_products_equal_the_reference() {
     let mut rng = Rng::seeded(20_261_002);
     let (mut checked, mut with_solutions) = (0, 0);
-    for dataset_case in 0..40 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions * 2 > checked;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 40, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -5226,7 +5329,7 @@ fn grouped_cross_products_equal_the_reference() {
         }
     }
     assert!(
-        with_solutions * 2 > checked,
+        covered(checked, with_solutions),
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
@@ -5239,7 +5342,11 @@ fn grouped_cross_products_equal_the_reference() {
 fn equalities_across_patterns_equal_the_reference() {
     let mut rng = Rng::seeded(20_261_005);
     let (mut checked, mut with_solutions) = (0, 0);
-    for dataset_case in 0..40 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions * 2 > checked;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 40, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -5288,7 +5395,7 @@ fn equalities_across_patterns_equal_the_reference() {
         }
     }
     assert!(
-        with_solutions * 2 > checked,
+        covered(checked, with_solutions),
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
@@ -5301,7 +5408,11 @@ fn equalities_across_patterns_equal_the_reference() {
 fn streamed_groups_equal_the_reference() {
     let mut rng = Rng::seeded(20_261_006);
     let (mut checked, mut with_solutions) = (0, 0);
-    for dataset_case in 0..40 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions * 2 > checked;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 40, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -5380,7 +5491,7 @@ fn streamed_groups_equal_the_reference() {
         }
     }
     assert!(
-        with_solutions * 2 > checked,
+        covered(checked, with_solutions),
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
@@ -5925,7 +6036,13 @@ fn eager_value(rng: &mut Rng, kinds: u64) -> Term {
 fn eager_aggregation_equals_the_reference_on_random_groups() {
     let mut rng = Rng::seeded(20_261_005);
     let (mut checked, mut rewritten, mut bound) = (0, 0, 0);
-    for _ in 0..40 {
+    let covered = |checked: usize, rewritten: usize, bound: usize| {
+        rewritten * 2 > checked && bound * 2 > checked
+    };
+    for drawn in 0.. {
+        if !draws_on(drawn, 40, covered(checked, rewritten, bound)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         let kinds = rng.below(4);
@@ -6046,12 +6163,8 @@ fn eager_aggregation_equals_the_reference_on_random_groups() {
     }
     // The comparison must cover the rewrite, and answers that aren't all unbound.
     assert!(
-        rewritten * 2 > checked,
-        "{rewritten} of {checked} rewritten"
-    );
-    assert!(
-        bound * 2 > checked,
-        "{bound} of {checked} with bound aggregates"
+        covered(checked, rewritten, bound),
+        "{rewritten} of {checked} rewritten, {bound} with bound aggregates"
     );
 }
 
@@ -6064,7 +6177,13 @@ fn eager_aggregation_equals_the_reference_on_random_groups() {
 fn paths_ordered_with_patterns_equal_the_reference() {
     let mut rng = Rng::seeded(20_261_006);
     let (mut checked, mut planned, mut path_first) = (0, 0, 0);
-    for _ in 0..40 {
+    let covered = |checked: usize, planned: usize, path_first: usize| {
+        planned * 2 > checked && path_first * 10 > planned
+    };
+    for drawn in 0.. {
+        if !draws_on(drawn, 40, covered(checked, planned, path_first)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         let nodes = 4 + rng.below(30);
@@ -6149,11 +6268,7 @@ fn paths_ordered_with_patterns_equal_the_reference() {
         }
     }
     assert!(
-        planned * 2 > checked,
-        "{planned} of {checked} planned with their paths"
-    );
-    assert!(
-        path_first * 10 > planned,
-        "a path first in {path_first} of {planned}"
+        covered(checked, planned, path_first),
+        "{planned} of {checked} planned with their paths, a path first in {path_first}"
     );
 }
