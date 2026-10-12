@@ -44,10 +44,10 @@ def checkout() -> Path:
     target = src / "ann_benchmarks/algorithms/nrese"
     shutil.rmtree(target, ignore_errors=True)
     shutil.copytree(HERE / "ann-benchmarks/nrese", target)
-    # The run groups compared (configs/: M 16 for every system, NRESE's fixed value), over
-    # upstream's own sweeps of the build parameters.
-    for config in (HERE / "ann-benchmarks/configs").glob("*.yml"):
-        shutil.copy(config, src / "ann_benchmarks/algorithms" / config.stem / "config.yml")
+    # overrides/<algorithm>/: the run groups compared (M 16 for every system, NRESE's fixed
+    # value) and an image that no longer builds as upstream wrote it, copied over upstream's.
+    for override in (HERE / "ann-benchmarks/overrides").glob("*/*"):
+        shutil.copy(override, src / "ann_benchmarks/algorithms" / override.parent.name / override.name)
     dockerfile = src / "ann_benchmarks/algorithms/pgvector/Dockerfile"
     text = dockerfile.read_text(encoding="utf-8")
     pinned = text.replace("git clone https://github.com/pgvector/pgvector /tmp/pgvector",
