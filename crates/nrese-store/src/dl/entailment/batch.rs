@@ -110,7 +110,8 @@ impl Batch {
     }
 
     /// Decides `tests[index]` of [`Self::new`] over its premise `ontology`: by the
-    /// compiled probe, or by the scalar reduction where the test has no probe form.
+    /// compiled probe, or by the scalar reduction where the test has no probe form or the
+    /// probe can't express it.
     pub(crate) fn check(
         &self,
         index: usize,
@@ -160,7 +161,12 @@ impl Batch {
                 Some(why) => Entailed::Unknown(why.clone()),
                 None => Entailed::No,
             },
-            tableau::Answer::Unsupported(why) => Entailed::Unknown(format!("unsupported: {why}")),
+            // The scalar reduction can still decide what the compiled probe can't express
+            // (its Horn stage, for one): slower, but it keeps every answer the store had.
+            tableau::Answer::Unsupported(_) => match test {
+                Test::Axiom(axiom) => super::entails(ontology, axiom, fresh, budget),
+                Test::Nonempty(class) => super::nonempty(ontology, *class, budget),
+            },
             tableau::Answer::GaveUp(why) => Entailed::Unknown(format!("gave up: {why}")),
         }
     }
