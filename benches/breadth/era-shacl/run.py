@@ -7,6 +7,7 @@ container of its own (benches/breadth/README.md, "ERA-SHACL").
     run.py run [--subsets ES,FR] [--shapes tds,core,era] [--engines ...] [--runs 3]
                [--memory 28g] [--heap 24g] [--label NAME]
     run.py check RESULTS_DIR [--reference topbraid]
+    run.py reproduce RESULTS_DIR       our medians beside upstream's published ones
 
 Each step is one container: load, validate, write the report. The times are the engine's
 own (upstream's contract: its load and validation timers, in seconds); the peak memory is
@@ -27,6 +28,7 @@ import hashlib
 import json
 import re
 import shutil
+import statistics
 import time
 import sys
 from pathlib import Path
@@ -264,6 +266,56 @@ def check(args) -> int:
     return 0
 
 
+def published(src: Path, engine: str, subset: str, shape: str) -> tuple[float, float] | None:
+    """Upstream's published medians (results/<engine>/<subset>_<shape>_results.csv: load,
+    validation seconds, peak GB per run): (load s, validation s), or None if it has none."""
+    path = src / "results" / engine / f"{subset}_{shape}_results.csv"
+    if not path.exists():
+        return None
+    loads, validations = [], []
+    for line in path.read_text(encoding="utf-8").splitlines()[1:]:
+        cells = [c.strip() for c in line.split(",")]
+        if len(cells) >= 2 and cells[0] and cells[1]:
+            loads.append(float(cells[0]))
+            validations.append(float(cells[1]))
+    if not loads:
+        return None
+    return statistics.median(loads), statistics.median(validations)
+
+
+def reproduce(args) -> int:
+    """Our medians beside upstream's published ones, per engine, subset and shape set: the
+    ratio shows whether an engine runs here as it ran there (another machine, so the
+    engines' ratios to each other count, not the absolute numbers)."""
+    src = kit.checkout(REPO, COMMIT)
+    rows = list(csv.DictReader(open(Path(args.results) / "results.csv", encoding="utf-8")))
+    ours: dict[tuple, dict[str, list[float]]] = collections.defaultdict(lambda: collections.defaultdict(list))
+    shapes_of = {}
+    for row in rows:
+        if row["status"] != "ok" or not row["ms"]:
+            continue
+        engine = next((e for e in ENGINES if SYSTEM.get(e, e) == row["system"]), row["system"])
+        if row["task"] == "validate":
+            ours[(engine, row["tier"], row["item"])]["validate"].append(float(row["ms"]) / 1000)
+            shapes_of.setdefault((engine, row["tier"], row["run"]), []).append(row["item"])
+    for row in rows:  # each load row belongs to the step of the validate row after it
+        if row["task"] == "load" and row["status"] == "ok" and row["ms"]:
+            engine = next((e for e in ENGINES if SYSTEM.get(e, e) == row["system"]), row["system"])
+            for shape in set(shapes_of.get((engine, row["tier"], row["run"]), [])):
+                ours[(engine, row["tier"], shape)]["load"].append(float(row["ms"]) / 1000)
+    print("| engine | subset | shapes | load s ours / published | validation s ours / published |")
+    print("|---|---|---|---|---|")
+    for (engine, subset, shape), got in sorted(ours.items()):
+        pub = published(src, engine, subset, shape)
+        load = statistics.median(got["load"]) if got["load"] else None
+        valid = statistics.median(got["validate"]) if got["validate"] else None
+        cell = lambda mine, theirs: ("-" if mine is None else f"{mine:,.1f}") + " / " + \
+            ("-" if theirs is None else f"{theirs:,.1f}") + \
+            (f" ({mine / theirs:.2f}x)" if mine is not None and theirs else "")
+        print(f"| {engine} | {subset} | {shape} | {cell(load, pub and pub[0])} | {cell(valid, pub and pub[1])} |")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
@@ -283,8 +335,10 @@ def main(argv: list[str]) -> int:
     c = sub.add_parser("check")
     c.add_argument("results")
     c.add_argument("--reference", default="topbraid")
+    e = sub.add_parser("reproduce")
+    e.add_argument("results")
     args = p.parse_args(argv)
-    return {"images": images, "run": steps, "check": check}[args.command](args)
+    return {"images": images, "run": steps, "check": check, "reproduce": reproduce}[args.command](args)
 
 
 if __name__ == "__main__":
