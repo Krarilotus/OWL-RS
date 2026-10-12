@@ -1,14 +1,14 @@
 # Benchmark status
 
-Generated 2026-10-06 by `python benches/suite/suite.py status --write` from [suite/systems.toml](suite/systems.toml), [suite/workloads.toml](suite/workloads.toml) and the run records in [runs/](runs/README.md). Don't edit it by hand: change those and regenerate. How to read and extend it: [README.md](README.md).
+Generated 2026-10-11 by `python benches/suite/suite.py status --write` from [suite/systems.toml](suite/systems.toml), [suite/workloads.toml](suite/workloads.toml) and the run records in [runs/](runs/README.md). Don't edit it by hand: change those and regenerate. How to read and extend it: [README.md](README.md).
 
 ## At a glance
 
 - **Workloads:** 24 (4 partial, 10 planned, 10 ready)
 - **Systems:** 20 (16 free to publish, 4 only with the vendor's permission)
-- **Pairs** (standard tier × system that can run it; build variants apart): 290; run at least once: 97; ok on their newest run: 78
-- **NRESE:** 19 of its 47 standard tiers ok on their newest run
-- **Run records:** 12, newest 2026-10-06
+- **Pairs** (standard tier × system that can run it; build variants apart): 292; run at least once: 98; ok on their newest run: 76
+- **NRESE:** 17 of its 47 standard tiers ok on their newest run
+- **Run records:** 28, newest 2026-10-11
 
 ## Coverage
 
@@ -23,25 +23,25 @@ Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome 
 | integration-rg-gs-gnd | partial | · | · | · | – | – | – | · | – | – | – | – | – | – | – | – | – | · | · | n/a | n/a |
 | real-ontologies | planned | · | · | · | – | – | – | · | · | · | · | · | · | – | – | – | – | · | · | n/a | · |
 | consistency | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | – |
-| w3c-owl2-rl | ready | 1/1 | n/a | n/a | – | – | – | – | – | n/a | n/a | n/a | n/a | – | – | – | – | n/a | n/a | n/a | – |
+| w3c-owl2-rl | ready | 0/1 ! | n/a | n/a | – | – | – | – | – | n/a | n/a | n/a | n/a | – | – | – | – | n/a | n/a | n/a | – |
 | ore-2015 | partial | 0/2 ! | · | · | – | – | – | – | – | – | – | – | – | 1/2 | 0/2 ! | 0/2 ! | 1/2 | – | · | – | – |
-| w3c-owl2-dl | ready | · | · | · | – | – | – | – | – | – | – | – | – | 0/1 ! | 0/1 ! | 0/1 ! | 0/1 ! | – | · | – | – |
+| w3c-owl2-dl | ready | 0/1 ! | · | · | – | – | – | – | – | – | – | – | – | 0/1 ! | 0/1 ! | 0/1 ! | 0/1 ! | – | · | – | – |
 | owl2bench-classify | planned | · | · | · | – | – | – | – | – | – | – | – | – | · | · | · | · | – | · | – | – |
 | basics-mix | ready | 5/5 | · | 3/5 ! | 4/5 ! | 4/5 ! | 2/5 ! | 5/5 | 2/5 ! | – | – | – | – | – | – | – | – | 5/5 | · | n/a | · |
 | sparqloscope | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
 | bsbm | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
 | watdiv | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| write-scaling | ready | 2/2 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
+| write-scaling | ready | 2/2 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | · | n/a | n/a | n/a |
 | w3c-sparql11 | ready | 1/1 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
 | w3c-shacl | ready | 1/1 | n/a | n/a | – | – | – | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | – |
 | era-shacl | planned | · | · | · | – | – | – | · | · | – | – | – | – | – | – | – | – | · | · | n/a | – |
 | fulltext-search | planned | · | · | · | · | – | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | – |
-| geosparql | partial | 1/1 | n/a | n/a | n/a | – | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | – |
+| geosparql | partial | 0/1 ! | n/a | n/a | n/a | – | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | – |
 | federation | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
 | fast | partial | · | · | · | 1/3 | 1/3 | · | · | · | n/a | n/a | n/a | n/a | – | – | – | – | · | · | n/a | · |
 | clients | ready | · | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
 
-`ok` every repetition loaded, every step and query execution ok · `part` a load, step or query execution failed or timed out in some repetition · `WRONG` an answer count differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the suite skipped it (reason in the record) · `≠?` its answers differ from another system's, not yet adjudicated · `ran*` ran; a licensed system whose outcome stays local · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit for it
+`ok` every repetition loaded, every step and query execution ok · `part` a load, step or query execution failed or timed out in some repetition · `WRONG` an answer count differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the suite skipped it (reason in the record) · `≠?` its answers differ from another system's, not yet adjudicated · `hang` a comparator gave no answer in a past run · `ran*` ran; a licensed system whose outcome stays local · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit for it
 
 ## Workloads, tier by tier
 
@@ -51,10 +51,14 @@ ready, performance; tasks RT1, RT3, RT2, RT5; kit `benches/reasoning` (suite dri
 
 | Tier | nrese | nrese-fsst | nrese-oxigraph | jena | nemo | nemo-schemafirst | nemo-sparq | owlrl | graphdb | rdfox |
 |---|---|---|---|---|---|---|---|---|---|---|
-| 1 | ok 10-04 | · | ok 10-02 | ok 10-04 | ok 10-04 | ok 10-04 | ok 10-04 | ok 10-04 | ran* 10-04 | skip 10-02 |
+| 1 | ok 10-09 | · | ok 10-02 | ok 10-04 | ok 10-04 | ok 10-04 | ok 10-04 | ok 10-04 | ran* 10-04 | skip 10-02 |
 | 10 | ok 10-04 | · | ok 10-02 | part 10-04 | ok 10-04 | ok 10-04 | ok 10-04 | skip 10-04 | ran* 10-04 | skip 10-02 |
 | 100 | ok 10-04 | · | ok 10-02 | part 10-04 | ok 10-04 | ok 10-04 | ok 10-04 | skip 10-02 | ran* 10-04 | skip 10-02 |
 | 1000 | ok 10-04 | · | · | · | · | · | FAIL 10-04 | · | ran* 10-04 | · |
+| diagnostic-1-Office-PC-client-sweep (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · |
+| diagnostic-1-Office-PC-queries (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · |
+| diagnostic-1-Phuoc-Yu-client-sweep (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · |
+| diagnostic-1-Phuoc-Yu-queries (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · |
 
 ### lubm-materialised: LUBM with the closure precomputed: the 14 queries on every SPARQL engine
 
@@ -72,7 +76,7 @@ ready, performance; tasks RT1, RT3; kit `benches/reasoning` (suite driver); chec
 
 | Tier | nrese | nrese-fsst | nrese-oxigraph | jena | nemo | nemo-schemafirst | nemo-sparq | owlrl | graphdb | rdfox |
 |---|---|---|---|---|---|---|---|---|---|---|
-| rl-1 | ok 10-04 | · | ok 10-02 | ok 10-04 | ok 10-04 | ok 10-04 | skip 10-04 | T/O 10-04 | ran* 10-04 | skip 10-02 |
+| rl-1 | ok 10-09 | · | ok 10-02 | ok 10-04 | ok 10-04 | ok 10-04 | skip 10-04 | T/O 10-04 | ran* 10-04 | skip 10-02 |
 | ql-1 | WRONG 10-04 | · | · | skip 10-04 | ok 10-04 | ok 10-04 | skip 10-04 | ok 10-04 | ran* 10-04 | · |
 
 ### ldbc-spb: LDBC Semantic Publishing Benchmark 2.0 (BBC): queries under inference with continuous updates
@@ -118,7 +122,7 @@ ready, conformance; tasks RT1, RT4; kit `crates/nrese-store/tests/w3c_owl2_rl` (
 
 | Tier | nrese |
 |---|---|
-| - | ok 10-03 |
+| - | part 10-09 |
 
 ### ore-2015: ORE 2015: classification of 1,920 real ontologies
 
@@ -135,7 +139,7 @@ ready, conformance; tasks RT4, RT6; kit `benches/reasoning/dl` (outside the driv
 
 | Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk | rdfox |
 |---|---|---|---|---|---|---|---|---|
-| - | · | · | · | part 10-03 | WRONG 10-03 | WRONG 10-03 | part 10-03 | · |
+| - | part 10-09 | · | · | part 10-03 | WRONG 10-03 | WRONG 10-03 | part 10-03 | · |
 
 ### owl2bench-classify: OWL2Bench EL and DL: classification and consistency of the generated ontologies
 
@@ -189,10 +193,12 @@ planned, performance; tasks basics; kit `-` (outside the driver); checked by: ro
 
 ready, performance; tasks basics, RT5; kit `benches/nrese-bench-harness` (suite driver); checked by: the written statements are read back.
 
-| Tier | nrese |
-|---|---|
-| 1m | ok 10-03 |
-| 10m | ok 10-03 |
+| Tier | nrese | graphdb |
+|---|---|---|
+| 1m | ok 10-03 | · |
+| 10m | ok 10-03 | · |
+| diagnostic-http-10m (extra) | ok 10-09 | · |
+| diagnostic-http-1m (extra) | ok 10-09 | · |
 
 ### w3c-sparql11: W3C SPARQL 1.1 test suite: query, update, syntax, result formats
 
@@ -200,7 +206,7 @@ ready, conformance; tasks basics; kit `crates/nrese-sparql/tests/w3c_sparql11` (
 
 | Tier | nrese |
 |---|---|
-| - | ok 10-03 |
+| - | ok 10-09 |
 
 ### w3c-shacl: W3C SHACL test suite
 
@@ -208,7 +214,7 @@ ready, conformance; tasks validation; kit `crates/nrese-shacl/tests` (suite driv
 
 | Tier | nrese |
 |---|---|
-| - | ok 10-03 |
+| - | ok 10-09 |
 
 ### era-shacl: ERA-SHACL-Benchmark: validation time and memory on a real railway knowledge graph
 
@@ -232,7 +238,7 @@ partial, conformance; tasks space; kit `crates/nrese-sparql/tests/geosparql_comp
 
 | Tier | nrese |
 |---|---|
-| compliance | ok 10-03 |
+| compliance | part 10-09 |
 
 ### federation: FedBench / W3C federation tests
 
@@ -251,10 +257,21 @@ partial, performance; tasks basics, RT1, RT3; kit `benches/fast` (suite driver);
 | q-cycles~plain | · | · | · | · | · | · | · | · | · | · | · |
 | rl-hierarchy~closure | · | · | · | ok 10-06 | ok 10-06 | · | · | · | · | · | · |
 | rl-clique | · | · | · | · | · | · | · | · | · | · | · |
+| 6 plain cases (extra) | · | · | · | ok 10-06 | part 10-06 | ok 10-06 | part 10-06 | · | · | · | · |
 | 84 cases (extra) | ok 10-06 | · | · | · | · | · | · | · | · | · | · |
+| custom-tc~custom (extra) | · | · | · | · | · | · | · | · | · | · | · |
 | dl cases (extra) | · | · | · | · | · | · | · | · | · | · | · |
+| dl-roles, el-classify (extra) | · | · | · | · | · | · | · | · | · | · | · |
 | el-classify (extra) | · | · | · | · | · | · | · | · | · | · | · |
-| rdfs-hierarchy~rdfs (extra) | · | · | · | · | · | · | part 10-06 | · | · | · | · |
+| horst-lubm10~owl-horst (extra) | · | · | · | · | · | · | FAIL 10-06 | · | · | · | · |
+| native-cli-cache-replay (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · | · |
+| native-cli-classify-store-horn (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · | · |
+| native-cli-clients-sweep (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · | · |
+| native-cli-commits-readers (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · | · |
+| native-cli-dlmode-lubm1 (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · | · |
+| native-cli-writes-under-readers (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · | · |
+| rdfs-hierarchy~rdfs (extra) | · | · | · | · | · | · | ok 10-06 | · | · | · | · |
+| rl-clique, rl-chain, rl-owl2bench~owl-horst (extra) | · | · | · | · | · | · | hang 10-06 | · | · | · | · |
 | rl-clique~owl-horst (extra) | · | · | · | · | · | · | part 10-06 | · | · | · | · |
 | rule cases~owl2-rl (extra) | · | · | · | · | · | · | · | · | · | · | · |
 
@@ -278,12 +295,13 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - **real-ontologies:** nrese (dbpedia-core, yago-tiny); jena (dbpedia-core, yago-tiny); rdf4j (dbpedia-core, yago-tiny); nemo (dbpedia-core, yago-tiny); owlrl (dbpedia-core, yago-tiny); graphdb (dbpedia-core, yago-tiny); rdfox (dbpedia-core, yago-tiny); anzograph (dbpedia-core, yago-tiny)
 - **consistency:** nrese (lubm-1, owl2bench-rl-1); graphdb (lubm-1, owl2bench-rl-1); rdfox (lubm-1, owl2bench-rl-1)
 - **ore-2015:** nrese (full); hermit (full); openllet (full); konclude (full); elk (full); rdfox (dev, full)
-- **w3c-owl2-dl:** nrese (-); rdfox (-)
+- **w3c-owl2-dl:** rdfox (-)
 - **owl2bench-classify:** nrese (el-1, dl-1, dl-10); hermit (el-1, dl-1, dl-10); openllet (el-1, dl-1, dl-10); konclude (el-1, dl-1, dl-10); elk (el-1, dl-1, dl-10); rdfox (el-1, dl-1, dl-10)
 - **basics-mix:** rdfox (olympics, yago-tiny, entities-10000000, dbpedia-core, wikidata-lexemes-60m); anzograph (olympics, yago-tiny, entities-10000000, dbpedia-core, wikidata-lexemes-60m)
 - **sparqloscope:** nrese (dblp); qlever (dblp); oxigraph (dblp); virtuoso (dblp); jena (dblp); rdf4j (dblp); graphdb (dblp); rdfox (dblp); anzograph (dblp)
 - **bsbm:** nrese (10m, 100m); qlever (10m, 100m); oxigraph (10m, 100m); virtuoso (10m, 100m); jena (10m, 100m); rdf4j (10m, 100m); graphdb (10m, 100m); rdfox (10m, 100m); anzograph (10m, 100m)
 - **watdiv:** nrese (10m, 100m); qlever (10m, 100m); oxigraph (10m, 100m); virtuoso (10m, 100m); jena (10m, 100m); rdf4j (10m, 100m); graphdb (10m, 100m); rdfox (10m, 100m); anzograph (10m, 100m)
+- **write-scaling:** graphdb (1m, 10m)
 - **era-shacl:** nrese (-); jena (-); rdf4j (-); graphdb (-); rdfox (-)
 - **fulltext-search:** nrese (-); qlever (-); virtuoso (-); jena (-); rdf4j (-); graphdb (-); rdfox (-)
 - **federation:** nrese (-); qlever (-); oxigraph (-); virtuoso (-); jena (-); rdf4j (-); graphdb (-); rdfox (-); anzograph (-)
@@ -322,11 +340,17 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - basics-mix olympics on virtuoso: wrong (2026-10-03-office-a): wrong answer counts: q12-all-labels; incomplete: q08-event-hierarchy (q08-event-hierarchy: 3 failed of 3)
 - basics-mix wikidata-lexemes-60m on rdf4j: failed (2026-10-03-office-a): server start-up excluded; SPARQL LOAD per file
 - basics-mix yago-tiny on virtuoso: partial (2026-10-03-office-a): incomplete: q01-label-lookup, q03-taxon-path, q08-subclass-path (q01-label-lookup: 3 failed of 3)
+- fast 6 plain cases on jena: partial (2026-10-06-fast-compete): 4-cycles timed out
+- fast 6 plain cases on oxigraph: partial (2026-10-06-fast-compete): 4-cycles timed out
 - fast dl cases on hermit: partial (2026-10-06-fast-suite): timeouts at 120 s on most generated ontologies; parse and classify ok on the others
 - fast dl cases on konclude: partial (2026-10-06-fast-suite): an error on dl-number; timeouts on nominals and Horn classification
 - fast dl cases on openllet: partial (2026-10-06-fast-suite): timeouts on most
-- fast rdfs-hierarchy~rdfs on jena: partial (2026-10-06-fast-suite)
+- fast dl-roles, el-classify on hermit: partial (2026-10-06-fast-compete): el-classify timed out
+- fast dl-roles, el-classify on openllet: partial (2026-10-06-fast-compete): el-classify timed out
+- fast horst-lubm10~owl-horst on jena: failed (2026-10-06-fast-compete): count out of heap; rerun without it tonight
 - fast rl-clique~owl-horst on jena: partial (2026-10-06-fast-suite)
+- fast rule cases~owl2-rl on nemo: partial (2026-10-06-fast-compete): answers equal NRESE's where it finished
+- geosparql compliance on nrese: partial (2026-10-09-office-conformance-a633): 18 disputed reference differences
 - lubm 10 on jena: partial (2026-10-03-office-b): incomplete: q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14 (q01: 3 timeout of 3); steps: count failed
 - lubm 100 on jena: partial (2026-10-03-office-b): incomplete: q01, q02, q03, q04, q05, q06, q07, q08, q09, q10, q11, q12, q13, q14 (q01: 1 timeout of 1); steps: count failed
 - lubm 1000 on nemo-sparq: failed (2026-10-03-office-b): encoding sparq/owl-rl.rls sha256 9012609fe35f25b7; load time includes concatenating the inputs
@@ -338,7 +362,9 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - w3c-owl2-dl - on elk: partial (2026-10-03-dl-reference): EL tasks only; the rest use constructs outside its fragment
 - w3c-owl2-dl - on hermit: partial (2026-10-03-dl-reference): 27 timeouts, 1 crash (WebOnt-Thing-003), no wrong result
 - w3c-owl2-dl - on konclude: wrong (2026-10-03-dl-reference): 30 wrong results, 100 unsupported (datatypes, keys)
+- w3c-owl2-dl - on nrese: partial (2026-10-09-office-conformance-a633): DL-909 disputed
 - w3c-owl2-dl - on openllet: wrong (2026-10-03-dl-reference): 6 wrong results, 10 timeouts
+- w3c-owl2-rl - on nrese: partial (2026-10-09-office-conformance-a633): two import skips, one functional-only premise skip
 
 ### Workloads not ready
 
@@ -363,6 +389,22 @@ Newest first; the records are in [runs/](runs/).
 
 | Run | Started | Kit | Host | Commit | Pairs | Purpose |
 |---|---|---|---|---|---|---|
+| [2026-10-11-fast-inputs-office](runs/2026-10-11-fast-inputs-office.toml) | 2026-10-11T23:40 | fast | office-pc | 133ac6d | 0 | Why nine fast cases failed their checks on the base and the PR alike in the 11 October A/B on office-pc, and the harness fix |
+| [2026-10-11-answer-replay-dc2114a](runs/2026-10-11-answer-replay-dc2114a.toml) | 2026-10-11 | suite (answers.py) | office-pc | 133ac6d | 0 | The 10 October competitor answer captures reclassified with the committed recorder: each system against one reference, strict and value matches apart |
+| [2026-10-11-horn-recovery](runs/2026-10-11-horn-recovery.toml) | 2026-10-11 | reasoning/dl and fast classify-store-horn | phuoc-yu | dc2114a0f0 | 0 | Horn context accounting by sampled local capacity instead of per-message shared reservations (candidate K), against the original base |
+| [2026-10-10-cache-replay-profile-77478d1](runs/2026-10-10-cache-replay-profile-77478d1.toml) | 2026-10-10 | perf lab | office-pc | 77478d195c | 0 | Where the cache-on replay spends its CPU, to attribute its regression |
+| [2026-10-10-checkpoint-bebada2](runs/2026-10-10-checkpoint-bebada2.toml) | 2026-10-10 | fast | office-pc, phuoc-yu | bebada2e66 | 0 | The frozen v2 checkpoint against the preceding revision: all fast cases on both hosts, then a ten-pair follow-up of the regressed cases |
+| [2026-10-10-default-execution-recovery](runs/2026-10-10-default-execution-recovery.toml) | 2026-10-10 | fast | phuoc-yu, office-pc | 62ae2e0fae | 0 | Default execution back on the caller (no physical pool unless configured): recovery against the original baseline |
+| [2026-10-10-vector-adjacency-reuse](runs/2026-10-10-vector-adjacency-reuse.toml) | 2026-10-10 | perf lab | phuoc-yu | 62ae2e0fae | 0 | HNSW traversal reuses one adjacency buffer per search routine instead of cloning each node's list |
+| [2026-10-10-vector-collector-repair](runs/2026-10-10-vector-collector-repair.toml) | 2026-10-10 | perf lab | phuoc-yu | 62ae2e0fae | 0 | The SPARQL vector collector merges sorted rounds, keeps only the winners' probe rows and releases the displaced rows' charges |
+| [2026-10-09-dl-reuse-be5c3d7](runs/2026-10-09-dl-reuse-be5c3d7.toml) | 2026-10-09T21:28 | reasoning/dl | office-pc | be5c3d7ea9 | 0 | Bounded Base reuse in DL classification and realisation, with one deadline and cancellation owner |
+| [2026-10-09-office-conformance-a633](runs/2026-10-09-office-conformance-a633.toml) | 2026-10-09T17:25 | conformance | office-pc | 6f22e85da5 | 5 | The corpus-backed conformance tests on the repaired sources |
+| [2026-10-09-phuoc-partial-77478d1](runs/2026-10-09-phuoc-partial-77478d1.toml) | 2026-10-09T15:58 | fast, suite and perf lab | phuoc-yu | 77478d195c | 10 | The runtime and reuse revision against the preceding one on selected fast cases, client and cache workloads, and native suite cycles |
+| [2026-10-09-initial-runtime-c888a20](runs/2026-10-09-initial-runtime-c888a20.toml) | 2026-10-09T14:40 | perf lab | office-pc, phuoc-yu | c888a203ea | 4 | The shared physical worker pool and plan inspection against the preceding revision: LUBM 1 queries, a short client sweep, Horn classification |
+| [2026-10-09-graphdb-coverage](runs/2026-10-09-graphdb-coverage.toml) | 2026-10-09 | competitors | office-pc | ? | 0 | Which registered workloads GraphDB Free can be compared on, and what each still lacks |
+| [2026-10-10-cache-contracts-d31010c](runs/2026-10-10-cache-contracts-d31010c.toml) | 2026-10-09 | probe | office-pc | d31010c95e | 0 | QL compiler-input identity by the exact schema; complete-only caching of explicit DL classification and realisation |
+| [2026-10-10-dl-alias-da4465d](runs/2026-10-10-dl-alias-da4465d.toml) | 2026-10-09 | reasoning/dl | office-pc | da4465d245 | 0 | Retained DL probes apply assumptions to an individual's current representative: the cost of the correctness fix |
+| [2026-10-06-fast-compete](runs/2026-10-06-fast-compete.toml) | 2026-10-06 | fast | Kraris-GPTler | 96a679d (N | 13 | The fast suite's comparisons after Phase 2: Nemo and Jena's rules rerun, the plain SPARQL cases, the printer's rewritten queries (counts), the QL and DL-mode cases, dl-roles' reference, el-classify regenerated |
 | [2026-10-06-fast-suite](runs/2026-10-06-fast-suite.toml) | 2026-10-06 | fast | Kraris-GPTler | 8233ea5 (f | 9 | Phase 2 of the benchmark work: the fast suite's first baselines (NRESE on every case) and its first comparisons with the systems each case declares |
 | [2026-10-03-office-b](runs/2026-10-03-office-b.toml) | 2026-10-04T02:28 | suite | sus-ai | fb8c0cbb76 | 33 | The reasoning batch on the office PC: OWL 2 RL / QL / OWL-Horst materialisation on LUBM 1-1000 and OWL2Bench RL-1 and QL-1, against Nemo (three encodings), owlrl, Jena and a licensed system whose outcomes stay local. |
 | [2026-10-03-office-a](runs/2026-10-03-office-a.toml) | 2026-10-03T17:19 | suite | sus-ai | 5ccf8dbb2e | 62 | The first comparison batch on the office PC, the benchmark machine since 3 October: query engines without reasoning (basics-mix on five datasets, materialised LUBM 1-100), and NRESE's W3C conformance, write scaling and GeoSPARQL. |

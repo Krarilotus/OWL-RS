@@ -1,0 +1,30 @@
+# A run record (benches/runs/README.md). Checks only: no times compared.
+id = "2026-10-11-fast-inputs-office"
+level = "focused"
+kit = "fast"
+purpose = "Why nine fast cases failed their checks on the base and the PR alike in the 11 October A/B on office-pc, and the harness fix"
+started = "2026-10-11T23:40:00+02:00"
+host = "office-pc"
+scenario = "native"
+baseline = { commit = "157931a", dirty = false, note = "the A/B's base side; reports under ~/owlrs/results/reports/fast" }
+candidate = { commit = "133ac6d", dirty = false, note = "Python only; perf_lab binaries reused from the A/B's takeover target volume (111d47d)" }
+protocol = { reps = 1, quiet_slot = "off: checks only", cases = "el-classify, el-classify-irregular, ctx-ore-2738/7914/9724/9835" }
+inputs = [
+  { name = "ref/el-classes20000-roles12.elk.tax", sha256 = "f7123b93e9eb089c9f4ee01547defaadd795e480d01b9cc3d65c17fd3e4b1209" },
+  { name = "ref/el-classes20000-roles12-irregular1.elk.tax", sha256 = "e09d25676c77aecb6c764bef075733c3db68a097eb71bbe189cd03ab5bdb30e0" },
+  { name = "ore/ore_ont_2738.nt", sha256 = "531e4d1a8b44aabb116621e48ad55266fded4e526c52ce48f9c4a68c84adc326" },
+  { name = "ore/ore_ont_7914.nt", sha256 = "2acabe252c22ced611d1ecedc8c8894cf30d532b3095ccdabec4abf78614855b" },
+  { name = "ore/ore_ont_9724.nt", sha256 = "36b0b916c16e98085fcf315963597d7d14569f12e0205177201fe7116dc13358" },
+  { name = "ore/ore_ont_9835.nt", sha256 = "8b5a496ce11ffaf160ceec43c6d28c6f5dbfa3deb9132db5dd3b4be59ebe5fb2" },
+]
+results = { root = "office-pc:/home/krarilotus/owlrs/results/reports-docs/fast/2026-10-11-docs-inputs.json", ab = "office-pc:/home/krarilotus/owlrs/results/ab-fast-20261011" }
+publishable = "all"
+cases = [
+  { case = "el-classify, el-classify-irregular", verdict = "pass", note = "were wrong (taxonomy_equal None): the fresh data volume lacked ELK's reference taxonomy; now seeded from the verified inputs, taxonomies equal" },
+  { case = "ctx-ore-2738, ctx-ore-7914, ctx-ore-9724, ctx-ore-9835", verdict = "boundary", note = "were failed: the ORE path was guessed from the checkout layout (~/owlrs/OWL-RS/.cache) and the run didn't source nrese-bench.env; now seeded, they reach their declared unsupported outcome" },
+  { case = "dl-transitive-400, mem-load-20m-2g, vector-knn-filtered", verdict = "boundary", note = "not rerun: declared frontiers (cases.toml outcome gave-up, memory-limit, wrong), as expected in the A/B" },
+]
+findings = [
+  "The copied inputs equal the preservation receipt (manifests/nrese-fast-data-verified.json).",
+  "Office has no nrese-bench/dl-reference tag (only nrese-preserved/dl-reference:kraris-20261009-2c3672943bc8), so converting a new ORE ontology would still fail; the four cases need no conversion.",
+]

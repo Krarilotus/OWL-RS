@@ -37,19 +37,19 @@ owns its tests, and benchmarks never run in a gate.
 
 ## Building and measuring
 
-Build through `scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most
-`NRESE_BUILD_SLOTS` builds at once per machine). Validate in batches: quick checks while
+Rust builds run on the build host ([benches/hosts.toml](benches/hosts.toml)): with
+`git config nrese.buildHost <ssh alias>`, the hooks and `scripts/lib/remote.sh check|run`
+send the working tree there and run the command in a worktree of its own. Build through
+`scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most `NRESE_BUILD_SLOTS`
+builds at once per machine). Validate in batches: quick checks while
 working, the push tier once per batch. Measure counts first; time only to answer a stated
 question, inside `scripts/quiet-slot.sh`, on `release` (`--profile lab` to iterate). A slot
 holds one short measurement, since builds wait for it; long comparison runs go to a machine of
 their own. Every number names the commit its binary was built from and whether the tree was
 clean; a binary kept for comparison is rebuilt after its source changes or is reverted.
 
-Keep a separate Cargo target directory for each worktree. Share downloaded registry
-dependencies through `CARGO_HOME`, not local-package artifacts from different revisions.
-On 9 October, a shared target reused an incompatible local API across worktrees; final
-validation therefore rebuilt in isolated targets. Baseline binaries need recorded source
-and binary identities before their target is cleaned.
+Keep a separate Cargo target directory for each worktree; share downloaded registry
+dependencies through `CARGO_HOME`, never build artifacts of different revisions.
 
 CI (`.github/workflows/ci.yml`, the same steps on Linux) runs at milestones and on merges to
 `main`: `gh workflow run ci.yml --ref <branch>`; the Jena oracle likewise (`oracle.yml`).

@@ -82,19 +82,18 @@ The target for large TBox changes over big extensions is a **reasoning job** whe
 work exceeds a configured budget: a long transaction holding the writer slot, visible
 in operator status and cancellable, with its cost reported (T7).
 
-**Current split/revival fallback (9 October 2026):** compact equality deletions and
-newly consumed hidden classes can still require a whole-dataset batch rebuild. The
-existing batch executor now runs inside the mutation transaction, before consistency,
+**The split/revival fallback.** Compact equality deletions and newly consumed hidden
+classes can require a whole-dataset batch rebuild. The batch executor runs inside the
+mutation transaction, before consistency,
 DL and SHACL gates and the single publication. Revived facts feed the delta executor's
 introduced-only checks, preserving quarantine semantics. The prospective ground program
 is installed only after commit. Cancellation publishes neither stack; grounding itself
 does not poll internally, so a final stop check restores the inferred delta before returning.
 The separate quarantine revalidation remains unchanged.
 
-This repairs atomicity, not the delta-proportional cost target. The fallback holds the
-writer for the rebuild and refreshes grounding; affected-component maintenance and
-cost-based fallback selection remain unfinished. The old post-commit split/revival repair
-and its `needs_rematerialisation` flag are removed.
+This keeps the commit atomic, not delta-proportional: the fallback holds the writer for
+the rebuild and refreshes grounding; affected-component maintenance and cost-based
+fallback selection are unfinished.
 
 Other timings are configurable (§2.2).
 
@@ -246,7 +245,7 @@ Generic semi-naive evaluation of transitive or equality rules makes O(n·closure
 |---|---|---|
 | Hierarchy | `scm-sco`, `scm-spo`, `scm-eqc*`, `scm-eqp*`, `cax-sco` fan-out | As built: `scm-sco` and `scm-spo` are transitivity rules, so the transitive module below closes `subClassOf` and `subPropertyOf` (no bitset reachability), and `cax-sco` is grounded into one ground rule per edge of the closed hierarchy (`c ↦ sup⁺(c)` as dispatch entries). Since R13 (6 October 2026), what `cax-sco` (and `prp-spo1` over the property hierarchy) derived is a part of the delta of its own, which their instances don't read: a derived type already has all its ancestors, so a deep hierarchy costs one binding per inherited type, not one per ancestor of each. Deletes go through DRed/B/F like other rules. |
 | Transitive property | `prp-trp` per transitive property | SCC condensation (`nrese-exec::graph`); the closure is materialised (GraphDB semantics) but computed without redundant joins. As built, the batch executor recomputes a predicate's closure in each round other rules added edges to it; the delta executor closes per new edge. Deletes: the affected components only. |
-| Equality | `eq-sym`, `eq-trans`, `eq-rep-*`, and `prp-fp`, `prp-ifp` and `prp-key` as producers | Union-find over `TermId`s with **rewriting** (Motik et al., AAAI 2015), the smallest id representing its class. The batch executor merges classes within its semi-naive rounds: a round's new `sameAs` merges representatives, and only facts mentioning the losing representative are rewritten into the next delta (egglog's rebuild). Stored over representatives with reads expanding members (`equality = "compact"`), or expanded. The commit delta executor reads the expanded view; compact merges rewrite affected stored facts in the same transaction. Possible splits and hidden-class revival use the transaction-local batch fallback described in §2.1 (9 October 2026). Incremental split maintenance remains planned (Motik et al., IJCAI 2015). |
+| Equality | `eq-sym`, `eq-trans`, `eq-rep-*`, and `prp-fp`, `prp-ifp` and `prp-key` as producers | Union-find over `TermId`s with **rewriting** (Motik et al., AAAI 2015), the smallest id representing its class. The batch executor merges classes within its semi-naive rounds: a round's new `sameAs` merges representatives, and only facts mentioning the losing representative are rewritten into the next delta (egglog's rebuild). Stored over representatives with reads expanding members (`equality = "compact"`), or expanded. The commit delta executor reads the expanded view; compact merges rewrite affected stored facts in the same transaction. Possible splits and hidden-class revival use the transaction-local batch fallback described in §2.1. Incremental split maintenance remains planned (Motik et al., IJCAI 2015). |
 | Symmetric / inverse | `prp-symp`, `prp-inv1/2` | As built: ground one-atom rules (`(?x p ?y) → (?y q ?x)`), no module |
 | Equivalence property | `prp-trp` + `prp-symp` on the same property (plus reflexivity if declared): an equivalence relation | Union-find over the property's edges gives the components in O(n + m). The closure is every pair within a component. It's either materialised in one pass without joins, or stored as components and expanded at read time like sameAs. That choice is a profile setting (D7): `materialise` by default for GraphDB parity, `compact` for large components. |
 
