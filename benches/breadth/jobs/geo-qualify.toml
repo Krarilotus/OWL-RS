@@ -1,0 +1,15 @@
+# Geographica 2, the real-world tier: one repetition, every answer captured and compared with
+# Jena's (then RDF4J's), before any time counts.
+id = "breadth-geo-qualify"
+group = "breadth"
+host = "office-pc"
+checkout = "suite/breadth"
+workload = "geographica2"
+window = "any"
+priority = 1
+est_min = 120
+needs = ["docker"]
+env = { PYTHONIOENCODING = "utf-8", DOCKER_MEMORY = "28g", JAVA_HEAP = "20g", NRESE_TARGET_VOLUME = "nrese-target-breadth", NRESE_LICENSES = "/home/krarilotus/nrese-assets/kraris-gptler-20261009/snapshots/windows/nrese-bench/licenses" }
+commands = [
+  ["python3", "benches/suite/suite.py", "run", "--data", "/home/krarilotus/nrese-breadth/data", "--results", "/home/krarilotus/owlrs/results/breadth-geo-qualify", "--workloads", "geographica2", "--tier", "geographica2=real", "--systems", "nrese,jena,rdf4j,graphdb,qlever,virtuoso", "--runs", "1", "--query-runs", "1", "--cache", "off", "--query-timeout-s", "600", "--answers", "full", "--answers-reference", "jena,rdf4j"],
+]

@@ -49,6 +49,16 @@ ENGINES = {
 }
 SYSTEM = {"nrese": "nrese", "jena": "jena", "rdf4j": "rdf4j"}  # systems.toml keys where one exists
 DATA = kit.DATA / "era-shacl"
+# Pairs whose published peak (upstream's results/, GB, the largest of its six runs) exceeds a
+# memory cap without a heap of its own to fit in: they would run for an hour before the
+# kernel kills them. Below that cap they are reported as blocked on this host, with the
+# number, never run. (The JVM engines' published peaks reflect their fixed heaps, e.g.
+# RDF4J's -Xms32G, not their need: they run with the cap's heap.)
+PUBLISHED_PEAK_GB = {("pyshacl", "FR"): 34.1, ("pyshacl", "ERA"): 119.6, ("maplib", "ERA"): 85.7}
+
+
+def gigabytes(size: str) -> float:
+    return float(size[:-1]) * {"g": 1, "m": 1 / 1024}[size[-1].lower()] if size[-1].isalpha() else float(size) / 2**30
 
 
 def tag(engine: str) -> str:
@@ -104,6 +114,15 @@ def steps(args) -> int:
     try:
         for rep, (subset, shape, engine) in plan:
             name = f"{engine}-{subset}-{shape}-r{rep}"
+            peak = PUBLISHED_PEAK_GB.get((engine, subset))
+            if peak and peak > gigabytes(args.memory):
+                if rep == 1:
+                    writer.write(kit.Result(date=date, host=entry["machine"].get("host", ""), runtime="docker",
+                                            system=SYSTEM.get(engine, engine), version=ENGINES[engine][2],
+                                            publish="free", workload="era-shacl", tier=subset, regime="none",
+                                            run=0, task="load", status="skipped",
+                                            note=f"blocked on this host: published peak {peak} GB, cap {args.memory}"))
+                continue
             report = f"/reports/{name}.ttl"
             env = {"JAVA_OPTS": f"-Xms1g -Xmx{args.heap}"} if ENGINES[engine][1] == "java" else {}
             spec = kit.Spec(name=f"nrese-suite-era-{name}".lower(), image=tag(engine), entrypoint=True,
