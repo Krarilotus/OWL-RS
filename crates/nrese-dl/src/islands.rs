@@ -189,8 +189,14 @@ fn decide(
     }
     // The batches are the request's compilation scratch while they are decided.
     let mut scratch = crate::memory::Scratch::new(config.memory.as_ref());
-    let bytes = islands.batches.iter().map(crate::memory::ontology_bytes);
-    if scratch.charge(bytes.sum()).is_err() {
+    let bytes = || {
+        islands
+            .batches
+            .iter()
+            .map(crate::memory::ontology_bytes)
+            .sum()
+    };
+    if scratch.charge(bytes).is_err() {
         return Some(tableau::Outcome::stopped(crate::memory::EXHAUSTED));
     }
     // An island has at most two portfolio variants. With fewer islands than workers,

@@ -170,8 +170,9 @@ impl<'a> Engine<'a> {
             config: config.started().into_owned(),
             memory: config
                 .memory
-                .clone()
-                .map(|envelope| std::sync::Arc::new(nrese_exec::Gauge::new(envelope))),
+                .as_ref()
+                .and_then(nrese_exec::Envelope::bounded)
+                .map(|envelope| std::sync::Arc::new(nrese_exec::Gauge::new(envelope.clone()))),
             g: Graph::default(),
             deps: DepSets::default(),
             done: Done::default(),
