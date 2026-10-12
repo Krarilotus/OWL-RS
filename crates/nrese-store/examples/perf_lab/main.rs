@@ -927,6 +927,8 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         equality_compact,
         equality_early_expansion: setting("NRESE_REASONING_EQUALITY_EXPANSION") == "early",
         equality_canonical_answers: setting("NRESE_REASONING_EQUALITY_ANSWERS") == "canonical",
+        // Memory given back between a materialisation's rounds (`NRESE_REASONING_RELEASE`).
+        reasoning_release: setting("NRESE_REASONING_RELEASE") == "on",
         // The OWL 2 QL rewriting as the server takes it (`NRESE_REASONING_QL_REWRITING`).
         ql_rewriting: nrese_store::QlRewritingMode::from_name(&setting(
             "NRESE_REASONING_QL_REWRITING",
