@@ -211,8 +211,9 @@ changed_files() {
 }
 
 # With a build host (scripts/lib/remote.sh), this machine only selects the changed files; the
-# host runs every step on a snapshot of this working tree.
-if [ -z "${NRESE_ON_BUILD_HOST:-}" ] && [ -n "${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}" ]; then
+# host runs every step on a snapshot of this working tree. NRESE_BUILD_HOST=local builds here.
+build_host=${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}
+if [ -z "${NRESE_ON_BUILD_HOST:-}" ] && [ -n "$build_host" ] && [ "$build_host" != local ]; then
   list=$(mktemp)
   [ "$mode" = all ] || changed_files "$mode" > "$list"
   # A tier that passed for this exact tree and file list doesn't run again. So the gate can
