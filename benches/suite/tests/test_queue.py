@@ -64,6 +64,28 @@ class Admission(unittest.TestCase):
                 self.assertTrue(any(words in p for p in queue.job_problems(job(**changes), REGISTRY)))
 
 
+class Hosts(unittest.TestCase):
+    def test_a_host_without_timing_takes_counts_and_preparation_only(self):
+        registry = {"host": {"gamergrill": {"roles": ["prepare"], "has": [], "queue": {"dir": "~/q", "timing": False}}}}
+        timed = job(host="gamergrill", needs=[])
+        self.assertTrue(any("no timed job" in p for p in queue.job_problems(timed, registry)))
+        self.assertEqual(queue.job_problems({**timed, "window": "any"}, registry), [])
+
+    def test_results_of_an_earlier_day_are_removed_on_a_same_day_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            q = queue.Queue(Path(tmp) / "q", Path(tmp), Path(tmp), Path(tmp))
+            for name, day in (("old", "2026-10-11"), ("new", "2026-10-12")):
+                results = Path(tmp) / "results" / name
+                results.mkdir(parents=True)
+                (q.directory / "done" / f"{name}.toml").write_text(queue.toml(
+                    {"id": name, "commands": [["true"]], "finished": f"{day}T23:00:00", "results": str(results)}),
+                    encoding="utf-8")
+            q.expire(datetime.date(2026, 10, 12))
+            self.assertFalse((Path(tmp) / "results" / "old").exists())
+            self.assertTrue((Path(tmp) / "results" / "new").exists())
+            self.assertIn("unfetched", queue.read_job(q.directory / "done" / "old.toml")["note"])
+
+
 class Running(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

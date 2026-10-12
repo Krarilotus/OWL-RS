@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -92,10 +93,12 @@ def job_problems(job: dict, registry: dict | None = None) -> list[str]:
     entry = registry.get("host", {}).get(job["host"])
     if entry is None:
         return [f"host {job['host']!r} is not in hosts.toml"]
-    if "measure" not in entry.get("roles", []):
-        out.append(f"{job['host']} doesn't measure (hosts.toml roles)")
     if not entry.get("queue"):
         out.append(f"{job['host']} has no queue (hosts.toml [host.{job['host']}.queue])")
+    timed = job.get("window", "quiet") == "quiet"
+    if timed and ("measure" not in entry.get("roles", []) or entry.get("queue", {}).get("timing") is False):
+        out.append(f"{job['host']} takes no timed job (hosts.toml roles, queue.timing): window = \"any\" for counts, "
+                   "downloads and preparation")
     lacking = sorted(set(job.get("needs", [])) - set(entry.get("has", [])))
     if lacking:
         out.append(f"{job['host']} lacks {', '.join(lacking)}")
@@ -129,6 +132,10 @@ def in_windows(windows: list[str], now: datetime.datetime) -> bool:
 
 
 def compilers() -> bool:
+    """Whether a compiler runs on this host (anyone's: a timing waits for all of them)."""
+    if os.name == "nt":
+        tasks = subprocess.run(["tasklist"], capture_output=True, text=True).stdout.lower()
+        return any(line.startswith(("rustc.exe", "cargo.exe")) for line in tasks.splitlines())
     return subprocess.run(["pgrep", "-x", "rustc|cargo"], capture_output=True).returncode == 0
 
 
@@ -171,6 +178,16 @@ class Queue:
                 return path, job
             why.append(f"{job['id']}: {reason}")
         return None, "; ".join(why)
+
+    def expire(self, today: datetime.date):
+        """On a host that keeps results only the day they end: those of earlier days, which
+        nobody fetched, are removed; their job says so."""
+        for path, job in self.jobs("done") + self.jobs("failed"):
+            results = Path(job.get("results", ""))
+            if job.get("finished", "")[:10] < today.isoformat() and job.get("results") and results.is_dir():
+                shutil.rmtree(results, ignore_errors=True)
+                job["note"] = "results removed unfetched at the end of their day (keep = same-day)"
+                path.write_text(toml(job), encoding="utf-8")
 
     def move(self, path: Path, job: dict, state: str) -> Path:
         target = self.directory / state / path.name
@@ -236,6 +253,8 @@ def work(args) -> int:
     print(f"{datetime.datetime.now():%F %T} queue of {key}: {q.directory}", flush=True)
     said = ""
     while True:
+        if queue.get("keep") == "same-day":
+            q.expire(datetime.date.today())
         path, job = q.next(queue, datetime.datetime.now())
         if path is None:
             if job and job != said:
@@ -253,11 +272,32 @@ def work(args) -> int:
             return 0
 
 
-# --- submitting, from anywhere ---------------------------------------------------------------
+# --- from anywhere: the host's side through its Python --------------------------------------
 
-def ssh(host: dict, command: str, **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.run(["ssh", "-o", "BatchMode=yes", host["ssh"], command], capture_output=True, text=True,
-                          **kwargs)
+MARK = b"#--queue-data--#"
+
+def remote(host: dict, script: str, data: bytes | None = None, binary: bool = False, timeout: float = 120):
+    """Runs a Python script on the host through ssh (its queue's `python`: python3, python on
+    Windows, `wsl -e python3` in a WSL distribution), the same on every kind of host."""
+    python = host.get("queue", {}).get("python", "python3")
+    # The script, then DATA after a marker; the bootstrap has neither a backslash nor a
+    # double quote, so cmd, a POSIX shell and wsl pass it alike.
+    payload = script.encode() + MARK + (data or b"")
+    bootstrap = "import sys;s,_,DATA=sys.stdin.buffer.read().partition(b'" + MARK.decode() + "');exec(s)"
+    done = subprocess.run(["ssh", "-o", "BatchMode=yes", host["ssh"], f'{python} -c "{bootstrap}"'],
+                          input=payload, capture_output=True, timeout=timeout)
+    if not binary:
+        done.stdout = done.stdout.decode("utf-8", "replace")
+    done.stderr = done.stderr.decode("utf-8", "replace")
+    return done
+
+
+def script(body: str, **values) -> str:
+    """A remote script with `values` bound as Python literals (paths expanded on the host)."""
+    head = "import os, pathlib, shutil, sys, tarfile\n"
+    head += "def here(p): return pathlib.Path(os.path.expanduser(p))\n"
+    head += "".join(f"{k} = {v!r}\n" for k, v in values.items())
+    return head + body
 
 
 def submit(args) -> int:
@@ -269,34 +309,52 @@ def submit(args) -> int:
         return 2
     host = registry["host"][job["host"]]
     queue = host["queue"]
-    repo = queue.get("repo", "~/owlrs/repo.git").replace("~/", "")
-    pushed = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "push", "-q", "-f", f"{host['ssh']}:{repo}",
-                             f"{job['checkout']}:refs/heads/queue/{job['id']}"], capture_output=True, text=True)
+    repo = queue.get("repo", "~/owlrs/repo.git")
+    made = remote(host, script("r = here(repo)\nif not r.exists():\n    import subprocess\n"
+                               "    subprocess.run(['git', 'init', '-q', '--bare', str(r)], check=True)\n", repo=repo))
+    if made.returncode != 0:
+        print(f"no repository on {job['host']}: {made.stderr.strip()[-300:]}", file=sys.stderr)
+        return 2
+    target = repo.replace("~/", "")
+    push = ["git", "-c", "core.hooksPath=/dev/null", "push", "-q", "-f"]
+    if queue.get("receive_pack"):
+        push.append(f"--receive-pack={queue['receive_pack']}")
+    pushed = subprocess.run([*push, f"{host['ssh']}:{target}", f"{job['checkout']}:refs/heads/queue/{job['id']}"],
+                            capture_output=True, text=True)
     if pushed.returncode != 0:
         print(f"push failed: {pushed.stderr.strip()}", file=sys.stderr)
         return 2
     job["submitted"] = datetime.datetime.now().isoformat(timespec="seconds")
     job.setdefault("workload", workload_of(job) or "")
     job["source"] = subprocess.run(["git", "rev-parse", job["checkout"]], capture_output=True, text=True).stdout.strip()
-    pending = f"{queue['dir']}/pending/{job['id']}.toml"
-    done = ssh(host, f"mkdir -p {queue['dir']}/pending && test ! -e {pending} && cat > {pending}", input=toml(job))
+    done = remote(host, script("p = here(d) / 'pending' / (i + '.toml')\np.parent.mkdir(parents=True, exist_ok=True)\n"
+                               "if p.exists(): sys.exit('already pending')\n"
+                               "p.write_bytes(DATA)\n",
+                               d=queue["dir"], i=job["id"]), data=toml(job).encode())
     if done.returncode != 0:
-        print(f"not queued (a job {job['id']} is already pending there?): {done.stderr.strip()}", file=sys.stderr)
+        print(f"not queued: {done.stderr.strip()[-300:]}", file=sys.stderr)
         return 2
     print(f"queued {job['id']} on {job['host']} ({job['checkout']} at {job['source'][:10]})")
     return 0
 
 
+LISTING = """
+for s in states:
+    for f in sorted((here(d) / s).glob('*.toml')):
+        print('== ' + s + ' ' + f.name)
+        print(f.read_text(encoding='utf-8'))
+"""
+
+
 def status(args) -> int:
     registry = hosts.load()
     for key, host in registry.get("host", {}).items():
-        if not host.get("queue") or (args.host and key != args.host):
+        if not host.get("queue") or not host.get("ssh") or (args.host and key != args.host):
             continue
-        listing = ssh(host, "for s in " + " ".join(STATES) + f"; do for f in {host['queue']['dir']}/$s/*.toml; do "
-                      "[ -e \"$f\" ] && echo \"== $s $f\" && cat \"$f\"; done; done; true", timeout=60)
+        listing = remote(host, script(LISTING, d=host["queue"]["dir"], states=list(STATES)), timeout=60)
         print(f"# {key}")
         if listing.returncode != 0:
-            print(f"  unreachable: {listing.stderr.strip()[:200]}")
+            print(f"  unreachable: {listing.stderr.strip()[-200:]}")
             continue
         for block in listing.stdout.split("== ")[1:]:
             head, _, body = block.partition("\n")
@@ -310,9 +368,41 @@ def status(args) -> int:
 
 def cancel(args) -> int:
     host = hosts.load()["host"][args.host]
-    done = ssh(host, f"rm {host['queue']['dir']}/pending/{args.id}.toml")
-    print("cancelled" if done.returncode == 0 else f"not pending: {done.stderr.strip()}")
+    done = remote(host, script("p = here(d) / 'pending' / (i + '.toml')\nif not p.exists(): sys.exit('not pending')\n"
+                               "p.unlink()\n", d=host["queue"]["dir"], i=args.id))
+    print("cancelled" if done.returncode == 0 else done.stderr.strip()[-200:])
     return done.returncode
+
+
+FETCH = """
+r = here(results) / i
+if not r.is_dir(): sys.exit('no results for ' + i)
+with tarfile.open(fileobj=sys.stdout.buffer, mode='w|gz') as t:
+    t.add(str(r), arcname=i)
+"""
+
+
+def fetch(args) -> int:
+    """A job's results here (`--to`), then removed there on a host that keeps them only the
+    day they end (`keep = "same-day"`)."""
+    import io
+    host = hosts.load()["host"][args.host]
+    queue = host["queue"]
+    results = queue.get("results", "~/owlrs/results")
+    done = remote(host, script(FETCH, results=results, i=args.id), binary=True, timeout=3600)
+    if done.returncode != 0:
+        print(done.stderr.strip()[-300:], file=sys.stderr)
+        return 2
+    import tarfile
+    target = Path(args.to)
+    target.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(done.stdout), mode="r:gz") as t:
+        t.extractall(target, filter="data")
+    print(f"fetched {args.id} into {target / args.id}")
+    if queue.get("keep") == "same-day":
+        removed = remote(host, script("shutil.rmtree(here(results) / i)\n", results=results, i=args.id))
+        print("removed there (same-day host)" if removed.returncode == 0 else removed.stderr.strip()[-200:])
+    return 0
 
 
 def main() -> int:
@@ -325,10 +415,14 @@ def main() -> int:
     s = sub.add_parser("cancel")
     s.add_argument("id")
     s.add_argument("--host", required=True)
+    s = sub.add_parser("fetch")
+    s.add_argument("id")
+    s.add_argument("--host", required=True)
+    s.add_argument("--to", required=True, help="the directory the job's results go to")
     s = sub.add_parser("work")
     s.add_argument("--once", action="store_true", help="run at most one job, then stop")
     args = p.parse_args()
-    return {"submit": submit, "status": status, "cancel": cancel, "work": work}[args.command](args)
+    return {"submit": submit, "status": status, "cancel": cancel, "fetch": fetch, "work": work}[args.command](args)
 
 
 if __name__ == "__main__":
