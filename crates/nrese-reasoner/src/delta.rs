@@ -33,6 +33,8 @@
 //! DRed overdeletes whole transitive components on deletes inside them; B/F (R5) replaces
 //! it.
 
+pub mod policy;
+
 use std::borrow::Cow;
 
 use hashbrown::HashSet;
@@ -57,6 +59,15 @@ pub trait Base: Sync {
     fn contains(&self, fact: Triple) -> bool;
     /// Whether `fact` is asserted (after the change).
     fn is_asserted(&self, fact: Triple) -> bool;
+    /// Calls `f` with every asserted fact matching `pattern` (after the change), as
+    /// [`Base::scan`] does: a base whose asserted facts are apart reads them alone.
+    fn scan_asserted(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
+        self.scan(pattern, &mut |fact| {
+            if self.is_asserted(fact) {
+                f(fact);
+            }
+        });
+    }
 }
 
 /// The rules an update runs, compiled against the vocabulary.
@@ -127,6 +138,8 @@ pub struct Update {
     /// The ground program of the state after the change, if it differs from the one given
     /// (or none was given); `None` means the given program still applies.
     pub program: Option<GroundProgram>,
+    /// What the maintenance policy weighed and did ([`policy`]).
+    pub policy: policy::Counts,
 }
 
 impl std::fmt::Debug for Update {
@@ -225,10 +238,53 @@ pub fn update_until<B: Base + ?Sized>(
     cache: Option<&GroundProgram>,
     stop: Stop<'_>,
 ) -> Result<Update, Interrupted> {
+    update_with(
+        base,
+        inserted,
+        deleted,
+        rules,
+        cache,
+        stop,
+        policy::Policy::default(),
+    )
+}
+
+/// [`update_until`] with the plans `policy` allows ([`policy::Policy`]).
+pub fn update_with<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    deleted: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+    stop: Stop<'_>,
+    policy: policy::Policy,
+) -> Result<Update, Interrupted> {
     // The process's memory limit stops it too, whatever the caller polls.
     let stop: Stop<'_> = &|| stop() || super::eval::over_memory_limit();
     let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
     let mut result = Update::default();
+    if policy.rebuilds_at_once() {
+        result.policy.plan = policy::Plan::Rebuild;
+        return Ok(result);
+    }
+    // The region the maintenance policy recomputes ([`policy::Plan::Recompute`]): the
+    // terms whose facts are overdeleted at once and derived again. Deleted equalities
+    // may split classes; the policy decides from the classes' size, before any other
+    // work, as a rebuild needs none of it.
+    let same_as = super::batch::same_as_of(rules.rules);
+    let is_equality = |t: &Triple| Some(t[1]) == same_as && t[0] != t[2];
+    let mut region: HashSet<u64> = HashSet::new();
+    if let Some(same_as) = same_as {
+        let equalities = deleted.iter().copied().filter(is_equality);
+        match policy::plan_for_equalities(base, same_as, equalities, policy, &mut result.policy) {
+            policy::Decision::Keep => {}
+            policy::Decision::Recompute(terms) => region = terms,
+            policy::Decision::Rebuild => {
+                result.policy.plan = policy::Plan::Rebuild;
+                return Ok(result);
+            }
+        }
+    }
     let mut clock = std::time::Instant::now();
     let mut lap = |phase: usize, result: &mut Update| {
         result.phases[phase] += clock.elapsed();
@@ -253,7 +309,6 @@ pub fn update_until<B: Base + ?Sized>(
     // that derivation (its premises are below it: if one goes later in the commit, its
     // loss brings the candidate back), without a proof search.
     let non_recursive = {
-        let same_as = super::batch::same_as_of(rules.rules);
         let before = Overlay {
             base,
             hidden: &inserted_set,
@@ -273,10 +328,24 @@ pub fn update_until<B: Base + ?Sized>(
     // Transitive properties whose closure lost pairs: re-closed in phase 3.
     let mut recloses: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let mut backward = !deleted.iter().any(|&f| rules.is_program_fact(f));
+    let mut region_facts: Vec<Triple> = Vec::new();
+    let mut region_asserted: HashSet<Triple> = HashSet::new();
     'overdelete: while !deleted.is_empty() {
         overdeleted.clear();
         recloses.clear();
-        let mut extra = Store::new(deleted.to_vec());
+        // The region's facts, overdeleted at once: every inferred fact that mentions one
+        // of its terms (the asserted ones are what phase 2 settles it from).
+        region_asserted = asserted_mentioning(base, &region);
+        region_facts = facts_mentioning(base, &region);
+        region_facts.retain(|f| !region_asserted.contains(f) && !inserted_set.contains(f));
+        if region_facts.iter().any(|&f| rules.is_program_fact(f)) {
+            // Ground instances that bake those facts in are no proofs any more.
+            backward = false;
+        }
+        overdeleted.extend(region_facts.iter().copied());
+        let mut seed = deleted.to_vec();
+        seed.extend(region_facts.iter().copied());
+        let mut extra = Store::new(seed);
         let (fact_schema_rules, old_lists) = {
             let old = Overlay {
                 base,
@@ -348,9 +417,21 @@ pub fn update_until<B: Base + ?Sized>(
                     }
                 }
             }
-            let mut jobs = Vec::new();
+            // The equality rules read the delta without the region's facts: what they
+            // derive from them mentions the region's terms too, so it is overdeleted
+            // already (and running them over a class costs a copy per pair of members).
+            let outside = Outside {
+                source: &old,
+                region: &region,
+            };
+            let (mut jobs, mut equality_jobs) = (Vec::new(), Vec::new());
             for (r, i) in old_program.variants(&extra) {
-                jobs.extend(Job::variant(&old, &old_program.rules[r], i));
+                let rule = &old_program.rules[r];
+                if !region.is_empty() && is_equality_rule(rule) {
+                    equality_jobs.extend(Job::variant(&outside, rule, i));
+                } else {
+                    jobs.extend(Job::variant(&old, rule, i));
+                }
             }
             // Transitive properties, by component: a lost edge (a, b) may support every pair
             // from a predecessor of a (or a) to a successor of b (or b). The relation is
@@ -358,8 +439,11 @@ pub fn update_until<B: Base + ?Sized>(
             for &p in &old_program.transitive {
                 let (mut sources, mut targets) = (Vec::new(), Vec::new());
                 extra.scan([None, Some(p), None], Seg::Delta, &mut |t| {
-                    sources.push(t[0]);
-                    targets.push(t[2]);
+                    // The region's equalities are all overdeleted already.
+                    if Some(p) != same_as || !mentions(&region, t) {
+                        sources.push(t[0]);
+                        targets.push(t[2]);
+                    }
                 });
                 if sources.is_empty() {
                     continue;
@@ -428,10 +512,47 @@ pub fn update_until<B: Base + ?Sized>(
                     && !inserted_set.contains(&f)
             };
             let mut candidates = run_jobs_acyclic(&old, &jobs, &overdeletable, stop);
+            candidates.extend(run_jobs_acyclic(
+                &outside,
+                &equality_jobs,
+                &overdeletable,
+                stop,
+            ));
             check_stop()?;
             candidates.extend(bodiless.into_iter().filter(|&f| overdeletable(f)));
             candidates.extend(component.into_iter().filter(|&f| overdeletable(f)));
+            candidates.retain(|&f| !mentions(&region, f));
             drop(jobs);
+            // Equalities about to be overdeleted (their premises gone) may split classes
+            // too: the policy may recompute them, from the start.
+            if let Some(same_as) = same_as {
+                let equalities = candidates
+                    .iter()
+                    .copied()
+                    .filter(is_equality)
+                    .filter(|&t| !mentions(&region, t));
+                match policy::plan_for_equalities(
+                    base,
+                    same_as,
+                    equalities,
+                    policy,
+                    &mut result.policy,
+                ) {
+                    policy::Decision::Keep => {}
+                    policy::Decision::Recompute(terms) => {
+                        region.extend(terms);
+                        continue 'overdelete;
+                    }
+                    policy::Decision::Rebuild => {
+                        result = Update {
+                            policy: result.policy,
+                            ..Update::default()
+                        };
+                        result.policy.plan = policy::Plan::Rebuild;
+                        return Ok(result);
+                    }
+                }
+            }
             if backward {
                 let mut gone: HashSet<Triple> = inserted_set.clone();
                 gone.extend(overdeleted.iter().copied());
@@ -486,6 +607,14 @@ pub fn update_until<B: Base + ?Sized>(
         break;
     }
 
+    // A recomputed region's pairs of a transitive property (other than `owl:sameAs`, whose
+    // closure phase 2 settles) were overdeleted at once, around the component path: their
+    // closure is computed again in phase 3.
+    for f in &region_facts {
+        if Some(f[1]) != same_as && old_program.transitive.contains(&f[1]) {
+            recloses.insert(f[1]);
+        }
+    }
     lap(1, &mut result);
     // 2. Rederive: overdeleted and deleted facts with a derivation from what remains. The
     // program is that of the settled state, without the inserted facts: rule instances
@@ -494,23 +623,116 @@ pub fn update_until<B: Base + ?Sized>(
     hidden.extend(deleted.iter().copied());
     let mut unsettled = hidden.clone();
     unsettled.extend(inserted.iter().copied());
+    let program_changed = deleted
+        .iter()
+        .chain(&overdeleted)
+        .any(|&f| rules.is_program_fact(f));
+    let settle = |unsettled: &HashSet<Triple>| -> Cow<'_, GroundProgram> {
+        if program_changed {
+            Cow::Owned(rules.program(&Overlay {
+                base,
+                hidden: unsettled,
+                extra: &empty,
+            }))
+        } else {
+            Cow::Borrowed(old_program)
+        }
+    };
+    let mut program: Cow<'_, GroundProgram> = settle(&unsettled);
+    // A recomputed region first, in bulk ([`policy::Plan::Recompute`]): its facts that
+    // the other rules derive in one step from what remains, and every copy of a remaining
+    // fact within the classes the remaining equalities make (what the equality rules
+    // derive, all at once), until nothing more comes back. What doesn't can only come
+    // back in phase 3. Its facts don't seed phase 3: their copies are back already.
+    let mut put_back: HashSet<Triple> = HashSet::new();
+    let mut rederived: Vec<Triple> = Vec::new();
+    if !region.is_empty() {
+        // Overdeleted facts only: a deleted one is no longer in the state, so it comes
+        // back as a seed of phase 3 (below), not by staying.
+        let mut open: Vec<Triple> = region_facts.clone();
+        let mut sources: Vec<Triple> = region_asserted
+            .iter()
+            .copied()
+            .filter(|f| !inserted_set.contains(f))
+            .collect();
+        loop {
+            check_stop()?;
+            let remaining = Overlay {
+                base,
+                hidden: &unsettled,
+                extra: &empty,
+            };
+            let not_equality: Vec<bool> = program
+                .rules
+                .iter()
+                .map(|rule| !is_equality_rule(rule))
+                .collect();
+            let by_rules: Vec<Triple> = open
+                .par_iter()
+                .copied()
+                .filter(|&f| !stop() && program.derivable_by(&remaining, f, &not_equality))
+                .collect();
+            let by_rules: HashSet<Triple> = by_rules.into_iter().collect();
+            check_stop()?;
+            // The classes of the remaining equalities: the region's, and those of the
+            // other terms its facts mention (a fact of a member may be copied through
+            // the class of its predicate too).
+            let mut classes = nrese_exec::classes::Classes::default();
+            for f in sources.iter().chain(&by_rules).filter(|f| is_equality(f)) {
+                classes.union(f[0], f[2]);
+            }
+            if let Some(same_as) = same_as {
+                let mut others: HashSet<u64> = HashSet::new();
+                for f in sources.iter().chain(&by_rules).chain(&open) {
+                    others.extend(f.iter().copied().filter(|t| !region.contains(t)));
+                }
+                for term in others {
+                    remaining.scan([Some(term), Some(same_as), None], Seg::All, &mut |f| {
+                        if f[0] != f[2] {
+                            classes.union(f[0], f[2]);
+                        }
+                    });
+                }
+            }
+            let keys: HashSet<Triple> = sources
+                .iter()
+                .chain(&by_rules)
+                .map(|&f| classes.rewrite(f))
+                .collect();
+            let (back, still): (Vec<Triple>, Vec<Triple>) = open
+                .into_iter()
+                .partition(|f| by_rules.contains(f) || keys.contains(&classes.rewrite(*f)));
+            open = still;
+            if back.is_empty() {
+                break;
+            }
+            for f in &back {
+                unsettled.remove(f);
+                hidden.remove(f);
+            }
+            if program_changed && back.iter().any(|&f| rules.is_program_fact(f)) {
+                program = settle(&unsettled);
+            }
+            rederived.extend(by_rules);
+            put_back.extend(back.iter().copied());
+            sources.extend(back);
+        }
+    }
+    // The rest: overdeleted and deleted facts with a one-step derivation from what
+    // remains.
     let remaining = Overlay {
         base,
         hidden: &unsettled,
         extra: &empty,
     };
-    let program_changed = deleted
+    let candidates: Vec<Triple> = overdeleted
         .iter()
-        .chain(&overdeleted)
-        .any(|&f| rules.is_program_fact(f));
-    let mut program: Cow<'_, GroundProgram> = if program_changed {
-        Cow::Owned(rules.program(&remaining))
-    } else {
-        Cow::Borrowed(old_program)
-    };
-    let candidates: Vec<Triple> = overdeleted.iter().chain(deleted).copied().collect();
+        .copied()
+        .filter(|f| !mentions(&region, *f))
+        .chain(deleted.iter().copied())
+        .collect();
     let settled: &GroundProgram = &program;
-    let rederived: Vec<Triple> = candidates
+    let others: Vec<Triple> = candidates
         .par_iter()
         .copied()
         .filter(|&fact| {
@@ -519,12 +741,14 @@ pub fn update_until<B: Base + ?Sized>(
                 && settled.derivable_with(&remaining, fact, !recloses.contains(&fact[1]))
         })
         .collect();
+    rederived.extend(others);
     check_stop()?;
     let settled_consistency = program.consistency.len();
 
     lap(2, &mut result);
     // 3. Insert: semi-naive from the rederived and inserted facts.
     let schema_rules = rules.schema_rules();
+    result.policy.rederived = (rederived.len() + put_back.len()) as u64;
     let mut seeds = rederived;
     seeds.extend_from_slice(inserted);
     let mut extra = Store::new(seeds);
@@ -636,9 +860,17 @@ pub fn update_until<B: Base + ?Sized>(
     result.remove = overdeleted
         .iter()
         .copied()
-        .filter(|f| !kept.contains(f))
+        .filter(|f| !kept.contains(f) && !put_back.contains(f))
         .collect();
     result.remove.sort_unstable();
+    result.policy.plan = if region.is_empty() {
+        policy::Plan::Dred
+    } else {
+        policy::Plan::Recompute
+    };
+    result.policy.region_terms = region.len() as u64;
+    result.policy.region_facts = region_facts.len() as u64;
+    result.policy.overdeleted = overdeleted.len() as u64;
 
     // Consistency through the facts the change added. The overlay holds every fact of
     // phase 3 (rederived ones are hidden in `base`), with the new ones as its delta:
@@ -681,6 +913,84 @@ pub fn update_until<B: Base + ?Sized>(
     }
     .or(computed);
     Ok(result)
+}
+
+/// The facts of `base` that mention one of `terms`, in any position: each through its
+/// first position that holds one of them, so once (more often only if the base reports it
+/// more often, asserted in several graphs; every use takes it as a set).
+fn facts_mentioning<B: Base + ?Sized>(base: &B, terms: &HashSet<u64>) -> Vec<Triple> {
+    let mut facts: Vec<Triple> = Vec::new();
+    for &term in terms {
+        for position in 0..3 {
+            let mut pattern = [None; 3];
+            pattern[position] = Some(term);
+            base.scan(pattern, &mut |t| {
+                if !t[..position].iter().any(|earlier| terms.contains(earlier)) {
+                    facts.push(t);
+                }
+            });
+        }
+    }
+    facts
+}
+
+/// The asserted facts of `base` that mention one of `terms`.
+fn asserted_mentioning<B: Base + ?Sized>(base: &B, terms: &HashSet<u64>) -> HashSet<Triple> {
+    let mut facts = HashSet::new();
+    for &term in terms {
+        for pattern in [
+            [Some(term), None, None],
+            [None, Some(term), None],
+            [None, None, Some(term)],
+        ] {
+            base.scan_asserted(pattern, &mut |t| {
+                facts.insert(t);
+            });
+        }
+    }
+    facts
+}
+
+/// Whether `fact` mentions one of `terms`.
+fn mentions(terms: &HashSet<u64>, fact: Triple) -> bool {
+    !terms.is_empty() && fact.iter().any(|term| terms.contains(term))
+}
+
+/// The equality rules, which a recomputed region leaves out of overdeletion and
+/// rederivation ([`policy::Plan::Recompute`]).
+fn is_equality_rule(rule: &Rule) -> bool {
+    matches!(
+        rule.name.as_str(),
+        "eq-rep-s" | "eq-rep-p" | "eq-rep-o" | "eq-sym" | "eq-trans"
+    )
+}
+
+/// A source whose delta leaves out the facts of the region being recomputed: what the
+/// equality rules read during overdeletion.
+struct Outside<'a, S: ?Sized> {
+    source: &'a S,
+    region: &'a HashSet<u64>,
+}
+
+impl<S: Source + ?Sized> Source for Outside<'_, S> {
+    fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
+        if seg.plain() != Seg::Delta {
+            return self.source.scan(pattern, seg, f);
+        }
+        self.source.scan(pattern, seg, &mut |fact| {
+            if !mentions(self.region, fact) {
+                f(fact);
+            }
+        });
+    }
+
+    fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
+        self.source.estimate(pattern, seg)
+    }
+
+    fn contains(&self, fact: Triple) -> bool {
+        self.source.contains(fact)
+    }
 }
 
 /// Backward proofs for B/F deletion (Motik et al., AAAI 2015): a fact is kept if it has a
