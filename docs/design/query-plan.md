@@ -77,7 +77,9 @@ reading, the base IRI and the executor's options. A basic graph pattern is one n
 algebra but several joins of the plan: each prefix of its join order (two patterns or
 more, the whole pattern included) is a part, keyed by its triples, their range hints and
 the filter conjuncts applied within it, and a pattern starts from the longest prefix
-cached. Single patterns are scans, not parts: an index read costs what a copy would.
+cached. The prefixes' keys are chained (`cached::PrefixKeys`): prefix k's key holds a
+SHA-256 digest of prefix k − 1's, the k-th triple and the conjuncts that apply from it,
+so a pattern's keys are linear in its length. Single patterns are scans, not parts: an index read costs what a copy would.
 `native/cached.rs` and `cache_key.rs` still consume algebra, with special treatment for
 trivial, volatile and limited evaluations. A node migration must retain those contracts
 and sharing across variable renamings; replacing cache keys or adding finer invalidation
