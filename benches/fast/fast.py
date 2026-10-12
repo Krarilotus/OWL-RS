@@ -623,8 +623,10 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         command = ["/target/release/examples/tableau_consistency", "--timeout", timeout, *files]
         code, out, err, wall = container(name, case["cap_gb"], command)
         rows = parse_tableau(out)
-        main = [r for r in rows if r["file"] == data]
-        alt = [r for r in rows if r["file"] != data]
+        # The tool names each file as it was given: natively, by its host path.
+        named = native(data) if RUNTIME == "native" else data
+        main = [r for r in rows if r["file"] == named]
+        alt = [r for r in rows if r["file"] != named]
         result = dict(main[0]) if main else {}
         result["samples_ms"] = [r.get("whole_ms", 0.0) for r in rows]
         # The pipeline's phases, one series each (reading, normalising, then the tableau's).
