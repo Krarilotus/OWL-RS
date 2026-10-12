@@ -174,7 +174,7 @@ fn the_switches_keep_the_taxonomy() {
                 ..Options::default()
             };
             assert_eq!(
-                run(&o, options).as_ref(),
+                run(&o, options.clone()).as_ref(),
                 Some(&base),
                 "case {i}: {threads} threads, {strategy:?}, proofs {proofs}"
             );

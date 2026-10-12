@@ -70,6 +70,18 @@ pub(crate) struct StoreSettings {
 }
 
 impl StoreSettings {
+    /// A request's memory envelope: `limit` bytes (`None`: none of its own) within the
+    /// catalog's budget. Everything the request holds draws from it: its evaluations and
+    /// retained results, and its DL work (compilation scratch, the engines' capacity).
+    pub(crate) fn envelope(&self, limit: Option<usize>) -> nrese_exec::Envelope {
+        nrese_exec::Envelope::new(limit, self.runtime.query_memory())
+    }
+
+    /// The envelope of a query request: its memory limit within the catalog's budget.
+    pub(crate) fn query_envelope(&self, prepared: &PreparedQuery) -> nrese_exec::Envelope {
+        self.envelope(prepared.memory_limit)
+    }
+
     /// The QL rewriting queries get now.
     fn ql(&self) -> Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>> {
         self.ql.read().unwrap_or_else(|p| p.into_inner()).clone()
@@ -375,10 +387,11 @@ pub(crate) fn run_query(
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
+    memory: &nrese_exec::Envelope,
     out: impl Write,
     report: impl FnOnce(Option<&nrese_sparql::ql::QlReport>) -> String,
 ) -> StoreResult<Option<nrese_sparql::ql::QlReport>> {
-    let mut options = query_options(prepared, store, cancellation);
+    let mut options = query_options(prepared, store, cancellation, memory);
     let (query, ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
     let context = report(ql.as_ref());
     cancellation.check()?;
@@ -530,43 +543,23 @@ thread_local! {
     pub(crate) static BOUND_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Retains bound results in IDs. An earlier live result reduces this evaluation's
-/// available local memory; its reservation already counts against the shared budget.
+/// Retains bound results in IDs, reserved from the request's envelope `memory`: a result
+/// retained earlier leaves this evaluation what the envelope has left.
 pub(crate) fn evaluate_bound(
     view: &impl ReadView,
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
-    retained: usize,
+    memory: &nrese_exec::Envelope,
 ) -> StoreResult<nrese_sparql::TypedResults> {
     #[cfg(test)]
     BOUND_EVALUATIONS.with(|n| n.set(n.get() + 1));
-    let mut options = query_options(prepared, store, cancellation);
-    options.resources.memory_limit = options
-        .resources
-        .memory_limit
-        .map(|limit| limit.saturating_sub(retained));
+    let options = query_options(prepared, store, cancellation, memory);
     Ok(nrese_sparql::evaluate_query_typed(
         view,
         &prepared.query,
         &options,
     )?)
-}
-
-pub(crate) fn bound_budget(
-    prepared: &PreparedQuery,
-    store: &StoreSettings,
-    retained: usize,
-) -> std::sync::Arc<nrese_exec::Budget> {
-    std::sync::Arc::new(
-        nrese_exec::Budget::new(
-            prepared
-                .memory_limit
-                .unwrap_or(usize::MAX)
-                .saturating_sub(retained),
-        )
-        .within(store.runtime.query_memory()),
-    )
 }
 
 /// Writes retained bound answers through the ordinary result serializer.
@@ -599,8 +592,9 @@ pub(crate) fn explain_prepared(
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
+    memory: &nrese_exec::Envelope,
 ) -> StoreResult<Explanation> {
-    let options = query_options(prepared, store, cancellation);
+    let options = query_options(prepared, store, cancellation, memory);
     Ok(explain_query(view, &prepared.query, &options)?)
 }
 
@@ -611,22 +605,28 @@ pub(crate) fn plan_prepared(
     prepared: &PreparedQuery,
     store: &StoreSettings,
 ) -> StoreResult<PlannedQuery> {
-    let options = query_options(prepared, store, &CancellationToken::new());
+    let options = query_options(
+        prepared,
+        store,
+        &CancellationToken::new(),
+        &nrese_exec::Envelope::unlimited(),
+    );
     Ok(plan_query(view, &prepared.query, &options)?)
 }
 
-/// The options `prepared` runs with, for execution and explanation alike.
+/// The options `prepared` runs with, for execution and explanation alike, drawing from
+/// the request's envelope `memory` ([`StoreSettings::envelope`]).
 fn query_options(
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
+    memory: &nrese_exec::Envelope,
 ) -> QueryOptions {
     QueryOptions {
         dataset: prepared.dataset.clone(),
         resources: nrese_sparql::Resources {
             cancellation: Some(cancellation.clone()),
-            memory_limit: prepared.memory_limit,
-            shared_memory: store.runtime.query_memory(),
+            memory: memory.clone(),
             ..Default::default()
         },
         read_model: prepared.read_model,
