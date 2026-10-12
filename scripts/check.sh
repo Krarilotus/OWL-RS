@@ -43,8 +43,8 @@ nextest() { cargo nextest --version > /dev/null 2>&1; }
 # Python under either name: Windows has `python`, some Linux hosts only `python3`. A missing
 # interpreter fails the gate; it must never shrink the gate to nothing.
 python() {
-  if command -v python > /dev/null 2>&1; then command python "$@"
-  elif command -v python3 > /dev/null 2>&1; then command python3 "$@"
+  if type -P python > /dev/null; then command python "$@"
+  elif type -P python3 > /dev/null; then command python3 "$@"
   else echo "the gate needs python (or python3)" >&2; return 127; fi
 }
 
