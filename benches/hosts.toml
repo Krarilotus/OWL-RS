@@ -16,6 +16,10 @@
 root = "/home/krarilotus/nrese-assets/kraris-gptler-20261009"
 # Earlier campaigns' results, binaries and evidence, kept where run records point.
 evidence = "/home/krarilotus/nrese-prep-20261009-4e8bd38"
+# The benchmark images loaded from inputs.images under verified aliases (nrese-preserved/*):
+# each alias with its original tags and image ID. A driver asking for an original tag that
+# Docker lacks gets the alias whose ID matches (suitekit/hosts.py image()).
+images = "manifests/image-load-verification.json"
 
 [inputs]
 # Paths under assets.root, on every host with assets = true; the variable overrides.
@@ -27,6 +31,12 @@ ore_archive = { path = "snapshots/windows/original-cache-ore2015/ore2015_sample.
 licences = { path = "snapshots/windows/nrese-bench/licenses", env = "NRESE_LICENSES", what = "licence files of restricted systems (never committed)" }
 fuseki = { path = "snapshots/windows/original-cache-tools/apache-jena-fuseki-6.0.0", env = "FUSEKI_HOME", what = "Apache Jena Fuseki for the Jena oracle" }
 images = { path = "images/nrese-bench-source-tags.docker.tar", env = "", what = "the benchmark images; loaded on office-pc as nrese-preserved/*" }
+
+[volumes]
+# The Docker volumes the drivers use on a host with Docker; the variable names another for a
+# run (a campaign's own copy). Both are working copies, never the preserved inputs.
+data = { name = "nrese-bench-data", env = "NRESE_BENCH_VOLUME", what = "the datasets (/data), prepared by the kits; runs mount it read-only" }
+fast = { name = "nrese-fast-data", env = "NRESE_FAST_VOLUME", what = "the fast suite's generated data, converted ontologies and reference taxonomies (/fast)" }
 
 [host.office-pc]
 ssh = "Office-PC"

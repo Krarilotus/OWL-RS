@@ -299,6 +299,30 @@ class Hosts(unittest.TestCase):
         self.assertEqual(hosts.lacking(["docker"], self.REGISTRY, "sus-ai"), [])
         self.assertEqual(hosts.lacking(["docker"], self.REGISTRY, "laptop"), [])
 
+    def test_a_missing_image_resolves_to_its_verified_preserved_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "images.json").write_text(json.dumps({"images": [
+                {"original_tags": ["nrese-bench/dl-reference:latest"], "loaded_id": "sha256:aa",
+                 "preserved_tag": "nrese-preserved/dl-reference:kraris-aa"}]}), encoding="utf-8")
+            registry = {**self.REGISTRY, "assets": {"root": tmp, "images": "images.json"}}
+            local = {"nrese-preserved/dl-reference:kraris-aa": "sha256:aa"}
+            self.assertEqual(hosts.image("nrese-bench/dl-reference", registry, "sus-ai", local.get),
+                             "nrese-preserved/dl-reference:kraris-aa")
+            # The tag itself when Docker has it; the tag when the alias's ID isn't the verified one.
+            self.assertEqual(hosts.image("nrese-bench/dl-reference", registry, "sus-ai",
+                                         {"nrese-bench/dl-reference": "sha256:bb"}.get), "nrese-bench/dl-reference")
+            self.assertEqual(hosts.image("nrese-bench/dl-reference", registry, "sus-ai",
+                                         {"nrese-preserved/dl-reference:kraris-aa": "sha256:cc"}.get),
+                             "nrese-bench/dl-reference")
+            self.assertEqual(hosts.image("nrese-bench/dl-reference", registry, "khaleesi", local.get),
+                             "nrese-bench/dl-reference")
+
+    def test_volumes_come_from_the_registry_or_their_variable(self):
+        registry = {"volumes": {"fast": {"name": "nrese-fast-data", "env": "NRESE_FAST_VOLUME"}}}
+        self.assertEqual(hosts.volume("fast", registry, {}), "nrese-fast-data")
+        self.assertEqual(hosts.volume("fast", registry, {"NRESE_FAST_VOLUME": "mine"}), "mine")
+        self.assertEqual(hosts.volume("data", environ={}), "nrese-bench-data")
+
     def test_the_repository_registry_reads(self):
         registry = hosts.load()
         self.assertIn("build", registry["host"]["office-pc"]["roles"])

@@ -8,9 +8,9 @@ hour, run like unit tests for performance (README.md here; cases.toml).
     python benches/fast/fast.py compare BASE.json NEW.json
     python benches/fast/fast.py compete [--cases A,B] [--systems S,T]   NRESE beside its comparators
     python benches/fast/fast.py table [--baseline R] [--write]   the cases as CATALOG.md's table
-    python benches/fast/fast.py clean                    removes the generated data and scratch
+    python benches/fast/fast.py clean [--data]           this worktree's scratch; --data the shared data volume too
 
-`run` generates each case's data once (deterministic; kept in the volume nrese-fast-data),
+`run` generates each case's data once (deterministic; kept in the fast volume, hosts.toml),
 runs each case in its own container under the case's memory cap, checks the answers
 before a time counts, asserts the plan or engine path the case must take, and writes
 benches/baselines/fast/<date>-<label>.json. Repetitions are interleaved: every case once,
@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime
+import functools
 import hashlib
 import json
 import math
@@ -47,8 +48,9 @@ sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import hosts, manifest  # noqa: E402
 from suitekit.workloads import fast_data_name  # noqa: E402
 
-DATA_VOLUME = "nrese-fast-data"
-BENCH_VOLUME = "nrese-bench-data"
+# The volumes (benches/hosts.toml [volumes]; NRESE_FAST_VOLUME and NRESE_BENCH_VOLUME name others).
+DATA_VOLUME = hosts.volume("fast")
+BENCH_VOLUME = hosts.volume("data")
 TARGET_VOLUME = os.environ.get("NRESE_TARGET_VOLUME", f"nrese-target-{ROOT.name}")
 CARGO_VOLUME = "nrese-cargo"
 SCRATCH = ROOT / "tmp" / "fast"
@@ -239,6 +241,12 @@ def ensure_data(spec: str) -> dict:
     return json.loads(out)["expect"]
 
 
+@functools.cache
+def dl_image() -> str:
+    """The DL kit's reference image (benches/reasoning/dl), or its verified preserved alias here."""
+    return hosts.image("nrese-bench/dl-reference")
+
+
 def ensure_ore(name: str):
     """An ORE 2015 ontology (functional syntax, from the corpus cache; CC BY-NC-ND, never
     committed) converted once to N-Triples by the DL kit's runner, for the NRESE tools."""
@@ -253,7 +261,7 @@ def ensure_ore(name: str):
     script = (f"mkdir -p /fast/ore && cp /ore/{name}.owl /fast/ore/{name}.owl && "
               f"printf '{name}\\tconvert\\tntriples\\t/fast/ore/{name}.owl\\n' > /fast/ore/{name}.manifest.tsv")
     docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "-v", f"{host_path(ORE_DIR)}:/ore:ro", "alpine", "sh", "-c", script])
-    docker(["run", "--rm", "--memory=10g", "-v", f"{DATA_VOLUME}:/fast", "nrese-bench/dl-reference", "batch",
+    docker(["run", "--rm", "--memory=10g", "-v", f"{DATA_VOLUME}:/fast", dl_image(), "batch",
             f"/fast/ore/{name}.manifest.tsv", f"/fast/ore/{name}.results.tsv", "/fast/ore", "600"], timeout=900)
     docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "sh", "-c",
             f"rm -f /fast/ore/{name}.owl /fast/ore/{name}.manifest.tsv /fast/ore/{name}.results.tsv"])
@@ -1155,11 +1163,26 @@ def table(args) -> int:
 
 
 def clean(args) -> int:
-    docker(["volume", "rm", DATA_VOLUME])
+    """This worktree's scratch and its stopped containers; the fast data volume only with
+    `--data`, and never while a container uses it: the volume is shared by every worktree and
+    campaign on the host, and holds copies of the verified inputs besides the generated data."""
     import shutil
+    stale = docker(["ps", "-a", "--filter", "status=exited", "--filter", f"name=-{ROOT.name}$",
+                    "--format", "{{.Names}}"]).stdout.split()
+    for name in stale:
+        docker(["rm", name])
     shutil.rmtree(SCRATCH, ignore_errors=True)
-    print(f"removed {DATA_VOLUME} and {SCRATCH}")
-    return 0
+    print(f"removed {SCRATCH}" + (f" and {len(stale)} stopped containers of this worktree" if stale else ""))
+    if not args.data:
+        print(f"kept the volume {DATA_VOLUME} (shared; `clean --data` removes it)")
+        return 0
+    users = docker(["ps", "-a", "--filter", f"volume={DATA_VOLUME}", "--format", "{{.Names}}"]).stdout.split()
+    if users:
+        print(f"kept the volume {DATA_VOLUME}: in use by {', '.join(users)}")
+        return 1
+    done = docker(["volume", "rm", DATA_VOLUME])
+    print(f"removed the volume {DATA_VOLUME}" if done.returncode == 0 else f"volume {DATA_VOLUME}: {done.stderr.strip()}")
+    return done.returncode
 
 
 def main() -> int:
@@ -1189,7 +1212,9 @@ def main() -> int:
     t.add_argument("--baseline", help="a run's report, for each case's time and peak")
     t.add_argument("--write", action="store_true", help="into benches/CATALOG.md between its markers")
     sub.add_parser("build")
-    sub.add_parser("clean")
+    k = sub.add_parser("clean")
+    k.add_argument("--data", action="store_true",
+                   help="also the shared fast data volume (refused while a container uses it)")
     c = sub.add_parser("compare")
     c.add_argument("base")
     c.add_argument("new")
