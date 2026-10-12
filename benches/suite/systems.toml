@@ -180,6 +180,9 @@ capabilities = [
 [rdfox]
 name = "RDFox"
 publish = "permission"
+# No evaluation licence for us (Oxford Semantic Technologies, 12 Oct 2026): never measured;
+# its published numbers are listed as reported (benches/competitors/reported.toml).
+refused = "no evaluation licence (12 Oct 2026): its published numbers only, as reported"
 runs = ["docker", "apptainer"]
 capabilities = [
   "load", "query", "update",
@@ -187,6 +190,13 @@ capabilities = [
   "reason-incremental", "consistency", "explain",
   "shacl-core", "fulltext", "federation", "geosparql", "classify",
 ]
+
+[allegrograph]
+name = "AllegroGraph"
+publish = "permission"
+refused = "no evaluation licence (12 Oct 2026): its published numbers only, as reported"
+runs = []
+capabilities = ["load", "query", "update", "reason-rdfs", "fulltext", "geosparql"]
 
 [stardog]
 name = "Stardog"

@@ -53,6 +53,9 @@ from suitekit import hosts, schedule  # noqa: E402
 STATES = ("pending", "running", "done", "failed")
 MAX_ATTEMPTS = 3
 POLL_S = 60
+# On Windows, a job's processes and git open no console window (the runner is a scheduled
+# task in the owner's session).
+QUIET_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 # --- jobs ------------------------------------------------------------------------------------
@@ -149,9 +152,13 @@ def open_for(job: dict, queue: dict, now: datetime.datetime, busy=compilers) -> 
         return "a compiler is running"
     if queue.get("free") and expand(queue["free"]).exists():
         return None
-    if in_windows(queue.get("windows", []), now):
+    # Saturday and Sunday may have windows of their own (weekend_windows).
+    windows = queue.get("windows", [])
+    if now.weekday() >= 5:
+        windows = queue.get("weekend_windows", windows)
+    if in_windows(windows, now):
         return None
-    return f"outside the windows {', '.join(queue.get('windows', [])) or '(none)'}"
+    return f"outside the windows {', '.join(windows) or '(none)'}"
 
 
 # --- the runner ------------------------------------------------------------------------------
@@ -181,14 +188,18 @@ class Queue:
             why.append(f"{job['id']}: {reason}")
         return None, "; ".join(why)
 
-    def expire(self, today: datetime.date):
-        """On a host that keeps results only the day they end: those of earlier days, which
-        nobody fetched, are removed; their job says so."""
+    def expire(self, today: datetime.date, days: int = 0):
+        """Results kept `days` days after their job ended (0: the same day only), then
+        removed, fetched or not; their job says so."""
+        limit = (today - datetime.timedelta(days=days)).isoformat()
         for path, job in self.jobs("done") + self.jobs("failed"):
             results = Path(job.get("results", ""))
-            if job.get("finished", "")[:10] < today.isoformat() and job.get("results") and results.is_dir():
+            if job.get("finished", "")[:10] < limit and job.get("results") and results.is_dir():
                 shutil.rmtree(results, ignore_errors=True)
-                job["note"] = "results removed unfetched at the end of their day (keep = same-day)"
+                if days:
+                    job["note"] = f"results removed after {days} days (hosts.toml queue.keep)"
+                else:
+                    job["note"] = "results removed unfetched at the end of their day (keep = same-day)"
                 path.write_text(toml(job), encoding="utf-8")
 
     def move(self, path: Path, job: dict, state: str) -> Path:
@@ -208,11 +219,13 @@ class Queue:
         tree = self.worktrees / job["id"]
         log = results / f"queue-{job['attempts']}.log"
         code = 0
+        pidfile = self.directory / "running" / f"{job['id']}.pid"
         with open(log, "w", encoding="utf-8") as out:
             subprocess.run(["git", "-C", str(self.repo), "worktree", "remove", "--force", str(tree)],
-                           capture_output=True)
+                           capture_output=True, creationflags=QUIET_WINDOW)
             made = subprocess.run(["git", "-C", str(self.repo), "worktree", "add", "-q", "--detach", str(tree),
-                                   f"queue/{job['id']}"], stdout=out, stderr=subprocess.STDOUT)
+                                   f"queue/{job['id']}"], stdout=out, stderr=subprocess.STDOUT,
+                                  creationflags=QUIET_WINDOW)
             env = {**os.environ, **{k: str(v) for k, v in job.get("env", {}).items()},
                    "QUEUE_JOB": job["id"], "QUEUE_RESULTS": str(results)}
             # The host's tools first (hosts.toml queue.path: its Python, cargo).
@@ -222,7 +235,10 @@ class Queue:
             for command in job["commands"] if code == 0 else []:
                 out.write(f"=== {datetime.datetime.now().isoformat(timespec='seconds')} {' '.join(command)}\n")
                 out.flush()
-                process = subprocess.Popen(command, cwd=tree, env=env, stdout=out, stderr=subprocess.STDOUT)
+                process = subprocess.Popen(command, cwd=tree, env=env, stdout=out, stderr=subprocess.STDOUT,
+                                           creationflags=QUIET_WINDOW)
+                # A host's guard stops the job by it (scripts/hosts/khaleesi-guard.py).
+                pidfile.write_text(str(process.pid), encoding="utf-8")
                 # A timed job keeps its host quiet while it runs, whatever its commands do
                 # themselves (scripts/lib/quiet-watch.py): its verdict goes into the job.
                 watcher = quiet_watch(results / "quiet", process.pid, job["id"]) if timed else None
@@ -235,18 +251,29 @@ class Queue:
                     job["quiet"] = verdict[-1] if verdict else "no verdict"
                 if code != 0:
                     break
+            pidfile.unlink(missing_ok=True)
             if code == 0:
-                head = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"], capture_output=True, text=True)
+                head = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"], capture_output=True, text=True,
+                                      creationflags=QUIET_WINDOW)
                 job["commit"] = head.stdout.strip()
-        subprocess.run(["git", "-C", str(self.repo), "worktree", "remove", "--force", str(tree)], capture_output=True)
+        subprocess.run(["git", "-C", str(self.repo), "worktree", "remove", "--force", str(tree)], capture_output=True,
+                       creationflags=QUIET_WINDOW)
         job["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
         job["exit"] = code
         job["results"] = str(results)
-        if code != 0 and retreat is not None and retreat.exists() and job["attempts"] < MAX_ATTEMPTS:
-            job["note"] = "stopped when the host's owners came back; queued again"
+        if code != 0 and retreat is not None and retreat.exists():
+            # Stopped because the host's owners came back: not the job's failure, so not an
+            # attempt; its partial results stay, and it runs again.
+            job["attempts"] -= 1
+            job["stops"] = job.get("stops", 0) + 1
+            job["note"] = "stopped when the host's owners came back; queued again, its partial results kept"
             state = "pending"
         else:
             state = "done" if code == 0 else "failed"
+        if state != "pending":
+            # The job's checkout ref goes with it: the host's repository keeps nothing stale.
+            subprocess.run(["git", "-C", str(self.repo), "branch", "-D", f"queue/{job['id']}"], capture_output=True,
+                           creationflags=QUIET_WINDOW)
         self.move(path, job, state)
         return state
 
@@ -268,16 +295,40 @@ def here() -> tuple[str, dict]:
     return found[0], found[1]["queue"]
 
 
+def keep_days(queue: dict) -> int | None:
+    """How many days a host keeps a job's results (hosts.toml queue.keep: same-day, N-days)."""
+    keep = queue.get("keep")
+    if keep == "same-day":
+        return 0
+    if keep and keep.endswith("-days") and keep[:-len("-days")].isdigit():
+        return int(keep[:-len("-days")])
+    return None
+
+
 def work(args) -> int:
+    if args.log:
+        # A scheduled task without a console (pythonw): the runner's own lines go to a file.
+        sys.stdout = sys.stderr = open(args.log, "a", encoding="utf-8", buffering=1)
     key, queue = here()
     q = Queue(expand(queue["dir"]), expand(queue.get("repo", "~/owlrs/repo.git")),
               expand(queue.get("results", "~/owlrs/results")), expand(queue["dir"]) / "wt", queue.get("path", []))
     retreat = expand(queue["retreat"]) if queue.get("retreat") else None
     print(f"{datetime.datetime.now():%F %T} queue of {key}: {q.directory}", flush=True)
+    # A job a dead runner left running goes back to the queue, said so.
+    for path, job in q.jobs("running"):
+        job["note"] = "its runner stopped while it ran; queued again"
+        q.move(path, job, "pending")
+        print(f"{datetime.datetime.now():%F %T} {job['id']}: queued again (left running)", flush=True)
     said = ""
+    reload = q.directory / "RELOAD"
     while True:
-        if queue.get("keep") == "same-day":
-            q.expire(datetime.date.today())
+        # A new runner's code takes over between jobs: RELOAD in the queue directory.
+        if reload.exists():
+            reload.unlink()
+            print(f"{datetime.datetime.now():%F %T} reloading", flush=True)
+            os.execv(sys.executable, [sys.executable, *sys.argv])
+        if keep_days(queue) is not None:
+            q.expire(datetime.date.today(), keep_days(queue))
         path, job = q.next(queue, datetime.datetime.now())
         if path is None:
             if job and job != said:
@@ -407,7 +458,8 @@ with tarfile.open(fileobj=sys.stdout.buffer, mode='w|gz') as t:
 
 def fetch(args) -> int:
     """A job's results here (`--to`), then removed there on a host that keeps them only the
-    day they end (`keep = "same-day"`)."""
+    day they end (`keep = "same-day"`). A running job's results so far: long jobs write
+    theirs per case or chunk as they go, so they can be read before the job ends."""
     import io
     host = hosts.load()["host"][args.host]
     queue = host["queue"]
@@ -422,7 +474,13 @@ def fetch(args) -> int:
     with tarfile.open(fileobj=io.BytesIO(done.stdout), mode="r:gz") as t:
         t.extractall(target, filter="data")
     print(f"fetched {args.id} into {target / args.id}")
-    if queue.get("keep") == "same-day":
+    # A running job's results are fetched as far as they go (each case or chunk as it ends),
+    # and stay there; a finished job's go on a same-day host.
+    ended = remote(host, script("print(any((here(d) / s / (i + '.toml')).exists() for s in ('done', 'failed')))\n",
+                                d=queue["dir"], i=args.id))
+    if ended.stdout.strip() != "True":
+        print("the job still runs: these are its results so far; fetch again later")
+    elif queue.get("keep") == "same-day":
         removed = remote(host, script("shutil.rmtree(here(results) / i)\n", results=results, i=args.id))
         print("removed there (same-day host)" if removed.returncode == 0 else removed.stderr.strip()[-200:])
     return 0
@@ -444,6 +502,7 @@ def main() -> int:
     s.add_argument("--to", required=True, help="the directory the job's results go to")
     s = sub.add_parser("work")
     s.add_argument("--once", action="store_true", help="run at most one job, then stop")
+    s.add_argument("--log", help="the runner's lines to this file (a scheduled task without a console)")
     args = p.parse_args()
     return {"submit": submit, "status": status, "cancel": cancel, "fetch": fetch, "work": work}[args.command](args)
 

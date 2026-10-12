@@ -1,0 +1,19 @@
+# Published numbers of systems we don't measure: vendors that refused us an evaluation
+# licence (RDFox, AllegroGraph: 12 Oct 2026; systems.toml `refused`), and any other figure the
+# standings show beside our measurements. Every entry is as its source reports it, on its
+# source's hardware, never as measured by us, and never compared with our numbers as if it
+# were: benches/STANDINGS.md lists them apart ("reported"). suite.py --check refuses an
+# entry without its hardware or source.
+#
+# [[reported]]
+# system = "rdfox"                     # a key of suite/systems.toml
+# benchmark = "claros"                 # a workload of suite/workloads.toml, or a catalogue name
+# tier = "l"                           # the size, as the source names it
+# metric = "materialisation"           # what was measured
+# value = 2512.0                       # the number, as reported
+# unit = "s"
+# threads = 1                          # as reported, where it says
+# hardware = "..."                     # the source's machine: CPU, cores, memory
+# source = "..."                       # paper, page or table; URL
+# reported_by = "..."                  # who reported it, if not the vendor
+# date = "2021"                        # of the source

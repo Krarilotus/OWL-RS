@@ -32,6 +32,19 @@ def job(**changes):
 
 
 class Windows(unittest.TestCase):
+    def test_weekends_have_windows_of_their_own(self):
+        settings = {"windows": ["04:30-21:30"], "weekend_windows": []}
+        monday, saturday = datetime.datetime(2026, 10, 12, 10, 0), datetime.datetime(2026, 10, 17, 10, 0)
+        self.assertIsNone(queue.open_for(job(), settings, monday, lambda: False))
+        self.assertIn("outside", queue.open_for(job(), settings, monday.replace(hour=23), lambda: False))
+        self.assertIn("outside", queue.open_for(job(), settings, saturday, lambda: False))
+        self.assertIsNone(queue.open_for(job(), {"windows": ["04:30-21:30"]}, saturday, lambda: False))
+
+    def test_how_long_a_host_keeps_results(self):
+        self.assertEqual(queue.keep_days({"keep": "same-day"}), 0)
+        self.assertEqual(queue.keep_days({"keep": "7-days"}), 7)
+        self.assertIsNone(queue.keep_days({}))
+
     def test_a_window_across_midnight(self):
         self.assertTrue(queue.in_windows(["21:00-06:00"], AT))
         self.assertTrue(queue.in_windows(["21:00-06:00"], AT.replace(hour=5, minute=59)))
@@ -120,13 +133,18 @@ class Running(unittest.TestCase):
         self.assertEqual(done["exit"], 0)
         self.assertEqual((Path(done["results"]) / "out").read_text(), "hi\n")
         self.assertFalse((self.q.worktrees / "j").exists())
+        # Nothing stale stays: the job's checkout ref and its pid file are gone.
+        refs = subprocess.run(["git", "-C", str(self.repo), "branch", "--list", "queue/j"], capture_output=True, text=True)
+        self.assertEqual(refs.stdout.strip(), "")
+        self.assertFalse((self.q.directory / "running" / "j.pid").exists())
 
-    def test_a_failure_fails_unless_the_owners_came_back(self):
+    def test_an_owners_stop_is_no_attempt_a_failure_fails(self):
         path, found = self.submit([[sys.executable, "-c", "raise SystemExit(3)"]])
         self.retreat.touch()
         self.assertEqual(self.q.run(path, found, self.retreat), "pending")
         again = queue.read_job(self.q.directory / "pending" / "j.toml")
-        self.assertEqual(again["attempts"], 1)
+        self.assertEqual((again["attempts"], again["stops"]), (0, 1))
+        self.assertIn("partial results kept", again["note"])
         self.retreat.unlink()
         self.assertEqual(self.q.run(self.q.directory / "pending" / "j.toml", again, self.retreat), "failed")
 

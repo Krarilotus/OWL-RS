@@ -20,7 +20,8 @@ Per case and contender, the newest comparison on each host: answers first (each 
 | konclude | - | - | - | not measured yet |
 | elk | - | - | - | not measured yet |
 | graphdb | restricted | restricted | - | ran in 7 runs; results stay local |
-| rdfox | restricted | restricted | - | not run |
+| rdfox | refused | refused | - | no evaluation licence (12 Oct 2026): its published numbers only, as reported; 0 published numbers below |
+| allegrograph | refused | refused | - | no evaluation licence (12 Oct 2026): its published numbers only, as reported; 0 published numbers below |
 | stardog | restricted | restricted | - | not run |
 | anzograph | restricted | restricted | - | not run |
 

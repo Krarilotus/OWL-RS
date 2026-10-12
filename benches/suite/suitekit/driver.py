@@ -593,6 +593,10 @@ class Suite:
                 for key in systems:
                     if plan.systems is not None and key not in plan.systems:
                         continue
+                    # A vendor that refused us an evaluation is never measured (systems.toml refused).
+                    if self.systems[key].get("refused"):
+                        self.skip(key, plan, self.systems[key]["refused"])
+                        continue
                     missing = verdict(self.systems[key], workload)
                     if missing:
                         self.skip(key, plan, f"lacks {missing}")

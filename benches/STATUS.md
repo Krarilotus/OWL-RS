@@ -5,7 +5,7 @@ Generated 2026-10-12 by `python benches/suite/suite.py status --write` from [sui
 ## At a glance
 
 - **Workloads:** 34 (6 partial, 18 planned, 10 ready)
-- **Systems:** 20 (16 free to publish, 4 only with the vendor's permission)
+- **Systems:** 21 (16 free to publish, 5 only with the vendor's permission)
 - **Pairs** (standard tier × system that can run it; build variants apart): 441; run at least once: 103; ok on their newest run: 79
 - **NRESE:** 18 of its 72 standard tiers ok on their newest run
 - **Run records:** 33, newest 2026-10-12
@@ -77,42 +77,42 @@ The order the families are measured in ([suite/schedule.toml](suite/schedule.tom
 
 Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome / standard tiers. A `!` marks a newest outcome that is `FAIL`, `T/O`, `WRONG` or `part` on some tier.
 
-| Workload | State | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | nemo | nemo-schemafirst | nemo-sparq | owlrl | hermit | openllet | konclude | elk | graphdb | rdfox | stardog | anzograph |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| lubm | ready | 4/4 | · | 3/4 | – | – | – | 1/4 ! | – | 3/4 | 3/4 | 3/4 ! | 1/4 | – | – | – | – | 4/4 | · | n/a | n/a |
-| lubm-materialised | ready | 3/3 | · | · | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | – | – | – | – | – | – | – | – | 3/3 | · | n/a | · |
-| owl2bench | ready | 1/2 ! | · | 1/2 | – | – | – | 1/2 | – | 2/2 | 2/2 | · | 1/2 ! | – | – | – | – | 2/2 | · | n/a | n/a |
-| ldbc-spb | planned | · | · | · | – | – | – | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| integration-rg-gs-gnd | partial | · | · | · | – | – | – | · | – | – | – | – | – | – | – | – | – | · | · | n/a | n/a |
-| real-ontologies | planned | · | · | · | – | – | – | · | · | · | · | · | · | – | – | – | – | · | · | n/a | · |
-| consistency | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | – |
-| w3c-owl2-rl | ready | 0/1 ! | n/a | n/a | – | – | – | – | – | n/a | n/a | n/a | n/a | – | – | – | – | n/a | n/a | n/a | – |
-| ore-2015 | partial | 0/2 ! | · | · | – | – | – | – | – | – | – | – | – | 1/2 | 0/2 ! | 0/2 ! | 1/2 | – | · | – | – |
-| w3c-owl2-dl | ready | 0/1 ! | · | · | – | – | – | – | – | – | – | – | – | 0/1 ! | 0/1 ! | 0/1 ! | 0/1 ! | – | · | – | – |
-| owl2bench-classify | planned | · | · | · | – | – | – | – | – | – | – | – | – | · | · | · | · | – | · | – | – |
-| basics-mix | ready | 5/5 | · | 3/5 ! | 4/5 ! | 4/5 ! | 2/5 ! | 5/5 | 2/5 ! | – | – | – | – | – | – | – | – | 5/5 | · | n/a | · |
-| sparqloscope | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| bsbm | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| watdiv | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| write-scaling | ready | 2/2 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | · | n/a | n/a | n/a |
-| w3c-sparql11 | ready | 1/1 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
-| w3c-shacl | ready | 1/1 | n/a | n/a | – | – | – | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | – |
-| era-shacl | planned | · | · | · | – | – | – | · | · | – | – | – | – | – | – | – | – | · | · | n/a | – |
-| fulltext-search | planned | · | · | · | · | – | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | – |
-| geosparql | partial | 0/1 ! | n/a | n/a | n/a | – | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | – |
-| federation | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| fast | partial | 1/3 | · | · | 2/3 | 1/3 ! | 1/3 | 0/3 ! | · | n/a | n/a | n/a | n/a | – | – | – | – | · | · | n/a | · |
-| clients | ready | · | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
-| gcare | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| claros | planned | · | · | · | – | – | – | · | – | · | · | · | · | – | – | – | – | · | · | n/a | – |
-| sspe | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | – | – |
-| datalog-graphs | planned | · | · | – | – | – | – | · | – | · | · | · | – | – | – | – | – | · | · | n/a | – |
-| commit-latency | partial | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | – | – |
-| elk-ontologies | planned | · | · | · | – | – | – | – | – | – | – | – | – | · | · | · | · | – | · | – | – |
-| pagoda-suite | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | – |
-| vector-recall | partial | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| ann-benchmarks | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| geographica2 | planned | · | · | · | · | – | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | – |
+| Workload | State | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | nemo | nemo-schemafirst | nemo-sparq | owlrl | hermit | openllet | konclude | elk | graphdb | rdfox | allegrograph | stardog | anzograph |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| lubm | ready | 4/4 | · | 3/4 | – | – | – | 1/4 ! | – | 3/4 | 3/4 | 3/4 ! | 1/4 | – | – | – | – | 4/4 | · | – | n/a | n/a |
+| lubm-materialised | ready | 3/3 | · | · | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | – | – | – | – | – | – | – | – | 3/3 | · | n/a | n/a | · |
+| owl2bench | ready | 1/2 ! | · | 1/2 | – | – | – | 1/2 | – | 2/2 | 2/2 | · | 1/2 ! | – | – | – | – | 2/2 | · | – | n/a | n/a |
+| ldbc-spb | planned | · | · | · | – | – | – | · | · | – | – | – | – | – | – | – | – | · | · | n/a | n/a | · |
+| integration-rg-gs-gnd | partial | · | · | · | – | – | – | · | – | – | – | – | – | – | – | – | – | · | · | – | n/a | n/a |
+| real-ontologies | planned | · | · | · | – | – | – | · | · | · | · | · | · | – | – | – | – | · | · | n/a | n/a | · |
+| consistency | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | – | n/a | – |
+| w3c-owl2-rl | ready | 0/1 ! | n/a | n/a | – | – | – | – | – | n/a | n/a | n/a | n/a | – | – | – | – | n/a | n/a | – | n/a | – |
+| ore-2015 | partial | 0/2 ! | · | · | – | – | – | – | – | – | – | – | – | 1/2 | 0/2 ! | 0/2 ! | 1/2 | – | · | – | – | – |
+| w3c-owl2-dl | ready | 0/1 ! | · | · | – | – | – | – | – | – | – | – | – | 0/1 ! | 0/1 ! | 0/1 ! | 0/1 ! | – | · | – | – | – |
+| owl2bench-classify | planned | · | · | · | – | – | – | – | – | – | – | – | – | · | · | · | · | – | · | – | – | – |
+| basics-mix | ready | 5/5 | · | 3/5 ! | 4/5 ! | 4/5 ! | 2/5 ! | 5/5 | 2/5 ! | – | – | – | – | – | – | – | – | 5/5 | · | n/a | n/a | · |
+| sparqloscope | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | n/a | · |
+| bsbm | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | n/a | · |
+| watdiv | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | n/a | · |
+| write-scaling | ready | 2/2 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | · | n/a | n/a | n/a | n/a |
+| w3c-sparql11 | ready | 1/1 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a | n/a |
+| w3c-shacl | ready | 1/1 | n/a | n/a | – | – | – | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | – | n/a | – |
+| era-shacl | planned | · | · | · | – | – | – | · | · | – | – | – | – | – | – | – | – | · | · | – | n/a | – |
+| fulltext-search | planned | · | · | · | · | – | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | n/a | – |
+| geosparql | partial | 0/1 ! | n/a | n/a | n/a | – | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a | – |
+| federation | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | – | n/a | · |
+| fast | partial | 1/3 | · | · | 2/3 | 1/3 ! | 1/3 | 0/3 ! | · | n/a | n/a | n/a | n/a | – | – | – | – | · | · | n/a | n/a | · |
+| clients | ready | · | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a | n/a |
+| gcare | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | n/a | · |
+| claros | planned | · | · | · | – | – | – | · | – | · | · | · | · | – | – | – | – | · | · | – | n/a | – |
+| sspe | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | – | – | – |
+| datalog-graphs | planned | · | · | – | – | – | – | · | – | · | · | · | – | – | – | – | – | · | · | – | n/a | – |
+| commit-latency | partial | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | – | – | – |
+| elk-ontologies | planned | · | · | · | – | – | – | – | – | – | – | – | – | · | · | · | · | – | · | – | – | – |
+| pagoda-suite | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | – | n/a | – |
+| vector-recall | partial | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | n/a | · |
+| ann-benchmarks | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | n/a | · |
+| geographica2 | planned | · | · | · | · | – | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | n/a | – |
 
 `ok` every repetition loaded, every step and query execution ok · `part` a load, step or query execution failed or timed out in some repetition · `WRONG` an answer count differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the suite skipped it (reason in the record) · `≠?` its answers differ from another system's, not yet adjudicated · `hang` a comparator gave no answer in a past run · `ran*` ran; a licensed system whose outcome stays local · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit for it
 

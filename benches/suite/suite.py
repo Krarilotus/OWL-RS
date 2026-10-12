@@ -66,6 +66,9 @@ def check(systems, workloads):
         for key in ("title", "kind", "tasks", "source", "licence", "check"):
             if key not in workload:
                 errors.append(f"workloads.toml [{name}]: {key} is missing")
+    # Published numbers of systems we don't measure (competitors/reported.toml).
+    from suitekit import reported
+    errors += reported.problems(systems)
     # The order the families are measured in (schedule.toml).
     from suitekit import schedule
     errors += schedule.problems(workloads)
