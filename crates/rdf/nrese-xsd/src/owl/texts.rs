@@ -22,7 +22,8 @@ use super::set::{Base, Count, count_integers};
 use super::text;
 
 /// Patterns one set can combine at most: its cells are `2^patterns` per region. Callers
-/// keep to it (the datatype theory approximates an ontology with more).
+/// keep to it ([`super::ValueSet::combines`] says whether two sets do; the datatype
+/// theory bounds a combination of more and says it gave up).
 pub const MAX_PATTERNS: usize = 12;
 
 /// A text value: a string or IRI, or a tagged string.
@@ -126,6 +127,20 @@ impl<V: Member> Texts<V> {
                 .collect(),
             marker: PhantomData,
         }
+    }
+
+    /// Whether this set and `o` mention at most [`MAX_PATTERNS`] patterns together: what
+    /// combining them needs.
+    pub(super) fn combines(&self, o: &Self) -> bool {
+        let mut ids: Vec<u32> = self
+            .patterns
+            .iter()
+            .chain(&o.patterns)
+            .map(|p| p.id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len() <= MAX_PATTERNS
     }
 
     /// The same cells for another kind of value (strings' cells for tagged strings).

@@ -43,26 +43,7 @@ fn witness(
     let name = |t: Term| names.get(t as usize).cloned().unwrap_or(format!("t{t}"));
     match answer {
         Answer::Consistent => {
-            let checked = model
-                .filter(|m| m.size > 0 && m.size <= 128)
-                .is_some_and(|m| {
-                    let mut i = semantics::Interp {
-                        n: m.size as u32,
-                        ..semantics::Interp::default()
-                    };
-                    for &(c, e) in &m.concepts {
-                        if let nrese_owl::Concept::Named(t) = c {
-                            *i.concepts.entry(t).or_default() |= 1 << e;
-                        }
-                    }
-                    for &(r, a, b) in &m.roles {
-                        i.add_edge(r, a as u32, b as u32);
-                    }
-                    for &(t, e) in &m.individuals {
-                        i.individuals.insert(t, e as u32);
-                    }
-                    semantics::confirms(o, i) == Some(true)
-                });
+            let checked = model.is_some_and(|m| nrese_dl::certificate::certify(o, m).is_model());
             eprintln!(
                 "witness: the folded model {}",
                 if checked {

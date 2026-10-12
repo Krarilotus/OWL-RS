@@ -1,6 +1,7 @@
-//! The direct semantics on finite interpretations, independent of the clauses: the slow,
-//! obviously correct reference (adapted from nrese-owl's model-equivalence test). Sets of
-//! elements are bitmasks, so domains have at most 128 elements.
+//! The small-model search's evaluation: the direct semantics over interpretations of at
+//! most 128 elements, sets as bitmasks, fast enough to enumerate a million of them. The
+//! engine's models are checked by `nrese_dl::certificate`, the reference checker; this
+//! is the search's own (no data values, no keys: the fuzzed ontologies have neither).
 
 use std::collections::HashMap;
 
@@ -46,14 +47,6 @@ impl Interp {
         self.roles
             .get(&role)
             .is_some_and(|r| r[a as usize] & (1 << b) != 0)
-    }
-
-    pub fn add_edge(&mut self, role: Term, a: u32, b: u32) -> bool {
-        let n = self.n as usize;
-        let row = &mut self.roles.entry(role).or_insert_with(|| vec![0; n])[a as usize];
-        let new = *row & (1 << b) == 0;
-        *row |= 1 << b;
-        new
     }
 }
 
@@ -177,57 +170,6 @@ pub fn model_of(o: &Ontology, i: &Interp) -> bool {
     o.axioms.iter().all(|a| holds(o, a, i))
 }
 
-/// Closes the roles under the role inclusions (chains, transitivity, inverses, symmetry):
-/// the clauses encode these by automata, exact on closed interpretations.
-pub fn close(o: &Ontology, i: &mut Interp) {
-    let mut rias: Vec<(Vec<ObjProp>, ObjProp)> = Vec::new();
-    for a in &o.axioms {
-        match a {
-            Axiom::SubObjectPropertyOf(chain, sup) => rias.push((chain.clone(), *sup)),
-            Axiom::ObjectCharacteristic(Characteristic::Transitive, r) => {
-                rias.push((vec![*r, *r], *r))
-            }
-            Axiom::ObjectCharacteristic(Characteristic::Symmetric, r) => {
-                rias.push((vec![r.inverse()], *r))
-            }
-            Axiom::InverseObjectProperties(a, b) => {
-                rias.push((vec![*a], b.inverse()));
-                rias.push((vec![*b], a.inverse()));
-            }
-            Axiom::EquivalentObjectProperties(ps) => {
-                for &a in ps {
-                    for &b in ps {
-                        if a != b {
-                            rias.push((vec![a], b));
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    loop {
-        let mut changed = false;
-        for (chain, sup) in &rias {
-            let got = compose(i, chain);
-            for d in 0..i.n {
-                for e in 0..i.n {
-                    if got[d as usize] & (1 << e) != 0 {
-                        let (a, b, p) = match sup {
-                            ObjProp::Named(p) => (d, e, *p),
-                            ObjProp::Inverse(p) => (e, d, *p),
-                        };
-                        changed |= i.add_edge(p, a, b);
-                    }
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-}
-
 /// A model of `o` over at most `max` elements, by exhaustive search where the space is
 /// small and by `samples` random interpretations where it isn't.
 pub fn find_model(
@@ -280,133 +222,4 @@ pub fn find_model(
         }
     }
     None
-}
-
-/// Whether a folded model `i` of the engine's confirms `o`, closed under the role
-/// inclusions, as it is or lifted ([`lift`], loops broken or kept): `Some(true)` it does,
-/// `Some(false)` neither is a model, `None` the lift doesn't fit in 128 elements (no
-/// verdict).
-pub fn confirms(o: &Ontology, mut i: Interp) -> Option<bool> {
-    close(o, &mut i);
-    if model_of(o, &i) {
-        return Some(true);
-    }
-    // Whether to keep a property's loops is decided per property: a reflexive one needs
-    // them where an asymmetric one beside it forbids its own (seeds 182, 200, 268 and 403
-    // of the office campaign: no single choice for all properties was a model).
-    let named: Vec<bool> = (0..i.n)
-        .map(|e| i.individuals.values().any(|&v| v == e))
-        .collect();
-    let mut looped: Vec<Term> = i
-        .roles
-        .iter()
-        .filter(|(_, rows)| (0..i.n as usize).any(|u| !named[u] && rows[u] & (1 << u) != 0))
-        .map(|(&p, _)| p)
-        .collect();
-    looped.sort_unstable();
-    looped.truncate(8);
-    let mut checked = false;
-    for mask in 0u32..(1 << looped.len()) {
-        let keep = |p: Term| {
-            looped
-                .iter()
-                .position(|&q| q == p)
-                .is_some_and(|k| mask & (1 << k) != 0)
-        };
-        if let Some(mut l) = lift(&i, &keep) {
-            checked = true;
-            close(o, &mut l);
-            if model_of(o, &l) {
-                return Some(true);
-            }
-        }
-    }
-    checked.then_some(false)
-}
-
-/// The 3-fold covering lift of a folded model: each element that isn't an individual
-/// becomes three copies with its concepts, an edge between two such elements runs from
-/// copy `j` to copy `j + 1`, and an individual stays one element, joined to every copy
-/// of its neighbours. Every copy's successors and predecessors have the concepts its
-/// original's have, so every constraint that doesn't count holds as before; a cycle
-/// through anonymous elements gets a length divisible by three, so no loop or 2-cycle a
-/// fold closed is left (an irreflexive or asymmetric property, or one disjoint with its
-/// inverse, forbids them, while the unravelled model the fold stands for is a model:
-/// seed 94543 case 143, seed 2007 case 299). `keep_loops`: the properties whose loops on
-/// an anonymous element stay loops on each copy (a `∃R.Self` or a reflexive property needs
-/// them). `None` past 128 elements.
-fn lift(i: &Interp, keep_loops: &dyn Fn(Term) -> bool) -> Option<Interp> {
-    let named: Vec<bool> = (0..i.n)
-        .map(|e| i.individuals.values().any(|&v| v == e))
-        .collect();
-    // Each element's copies in the lift.
-    let mut copies: Vec<[u32; 3]> = Vec::with_capacity(i.n as usize);
-    let mut n = 0u32;
-    for &individual in &named {
-        if individual {
-            copies.push([n; 3]);
-            n += 1;
-        } else {
-            copies.push([n, n + 1, n + 2]);
-            n += 3;
-        }
-    }
-    if n > 128 {
-        return None;
-    }
-    let mut out = Interp {
-        n,
-        individuals: i
-            .individuals
-            .iter()
-            .map(|(&t, &e)| (t, copies[e as usize][0]))
-            .collect(),
-        ..Interp::default()
-    };
-    for (&c, &set) in &i.concepts {
-        let mut lifted = 0u128;
-        for (e, of) in copies.iter().enumerate() {
-            if set & (1 << e) != 0 {
-                for &x in of {
-                    lifted |= 1 << x;
-                }
-            }
-        }
-        out.concepts.insert(c, lifted);
-    }
-    for (&p, rows) in &i.roles {
-        let mut lifted = vec![0u128; n as usize];
-        for u in 0..i.n as usize {
-            for v in 0..i.n as usize {
-                if rows[u] & (1 << v) == 0 {
-                    continue;
-                }
-                match (named[u], named[v]) {
-                    (true, true) => lifted[copies[u][0] as usize] |= 1 << copies[v][0],
-                    (true, false) => {
-                        for &x in &copies[v] {
-                            lifted[copies[u][0] as usize] |= 1 << x;
-                        }
-                    }
-                    (false, true) => {
-                        for &x in &copies[u] {
-                            lifted[x as usize] |= 1 << copies[v][0];
-                        }
-                    }
-                    (false, false) => {
-                        for j in 0..3 {
-                            let to = if u == v && keep_loops(p) {
-                                j
-                            } else {
-                                (j + 1) % 3
-                            };
-                            lifted[copies[u][j] as usize] |= 1 << copies[v][to];
-                        }
-                    }
-                }
-            }
-        }
-        out.roles.insert(p, lifted);
-    }
-    Some(out)
 }
