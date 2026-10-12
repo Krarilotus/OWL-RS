@@ -53,10 +53,11 @@ impl SetTrie {
                 }
             };
         }
-        let clauses = &mut self.nodes[at as usize].clauses;
-        let before = super::memory::vec(clauses);
-        clauses.push(c);
-        self.nested_bytes += super::memory::vec(clauses) - before;
+        super::memory::push(
+            &mut self.nodes[at as usize].clauses,
+            c,
+            &mut self.nested_bytes,
+        );
     }
 
     /// Whether a stored body is a subset of `query` (sorted) with a clause `live` says

@@ -47,6 +47,53 @@ fn run(o: &Ontology, strategy: Strategy, prune: bool) -> (Classification, contex
     context::classify(o, &options).expect("Horn")
 }
 
+/// Guard (Horn recovery, 11 October): with every budget on, the workers check the budget
+/// and publish their capacity per batch, per 256 messages or given clauses and per 4096
+/// conclusions of a join, never per message (that cost Horn3000 6.66 times its time).
+#[test]
+fn budget_checks_and_observations_stay_per_batch() {
+    // `A ⊑ ∃r.B`, `B ⊑ Cⱼ`, `∃r.Cⱼ ⊑ Dⱼ`: `B`'s context sends `A`'s a batch of 600 Pred
+    // messages.
+    let mut table = Table::default();
+    let mut b = Build::new(&mut table);
+    let r = b.r("r");
+    let (a, bb) = (b.c("A"), b.c("B"));
+    let to_b = b.some(r, bb);
+    b.sub(a, to_b);
+    for j in 0..600 {
+        let c = b.c(&format!("C{j}"));
+        let d = b.c(&format!("D{j}"));
+        b.sub(bb, c);
+        let to_c = b.some(r, c);
+        b.sub(to_c, d);
+    }
+    let ontology = b.done();
+    let options = Options {
+        proofs: false,
+        strategy: Strategy::Split,
+        budget: context::Budget {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(3600)),
+            max_memory: Some(u64::MAX),
+            task_memory: Some(1 << 40),
+            ..Default::default()
+        },
+        ..Options::default()
+    };
+    let p = context::saturate(&ontology, &options)
+        .unwrap()
+        .profile()
+        .clone();
+    let bound =
+        p.batches + p.messages / 256 + p.clauses_kept / 256 + p.clauses_generated / 4096 + p.merges;
+    assert!(p.budget_checks <= bound, "{}", p.line());
+    assert!(p.observations <= bound, "{}", p.line());
+    assert!(p.observations > 0, "{}", p.line());
+    assert!(
+        p.messages > bound,
+        "per-message checks must break the bound"
+    );
+}
+
 #[test]
 fn task_memory_is_optional_and_exhaustion_never_becomes_a_classification() {
     let ontology = pattern(&mut Table::default(), 12);

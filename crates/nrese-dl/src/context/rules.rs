@@ -14,6 +14,8 @@
 //!   picks the successor, which gets `A → A` for the atoms it lacks.
 //! - **Eq** ([`super::equality`]) merges neighbours under at-most-one clauses.
 
+use std::cell::Cell;
+
 use hashbrown::HashMap;
 
 mod hyper;
@@ -82,26 +84,16 @@ pub struct Successor {
     pub edges: Vec<Edge>,
 }
 
-impl Successor {
-    pub(super) fn bytes(&self) -> usize {
-        use super::memory::vec;
-        vec(&self.k1)
-            + vec(&self.k2)
-            + vec(&self.edges)
-            + self
-                .edges
-                .iter()
-                .map(|e| std::mem::size_of_val(&*e.core) + vec(&e.sent))
-                .sum::<usize>()
-    }
-}
-
 /// A context's state: its clauses and its links.
 #[derive(Debug, Default)]
 pub struct State {
+    /// The capacity of the remote clauses, successors and merges below their tables
+    /// (kept up to date where they grow).
     pub(super) remote_bytes: usize,
     pub(super) successor_bytes: usize,
     pub(super) merge_bytes: usize,
+    /// The sampling election of the last end-of-batch publication ([`Worker::finish`]).
+    pub(super) published: u64,
     pub clauses: Clauses,
     pub started: bool,
     pub preds: Vec<(ContextId, FuncId)>,
@@ -152,7 +144,6 @@ pub struct Out {
     pub me: ContextId,
     pub local: Vec<Message>,
     pub sends: Vec<(ContextId, Message)>,
-    pub(super) payload_bytes: usize,
 }
 
 impl Out {
@@ -161,12 +152,10 @@ impl Out {
             me,
             local: Vec::new(),
             sends: Vec::new(),
-            payload_bytes: 0,
         }
     }
 
     pub(super) fn send(&mut self, to: ContextId, message: Message) {
-        self.payload_bytes += message.heap_bytes();
         if to == self.me {
             self.local.push(message);
         } else {
@@ -175,7 +164,10 @@ impl Out {
     }
 
     pub(super) fn bytes(&self) -> usize {
-        super::memory::vec(&self.local) + super::memory::vec(&self.sends) + self.payload_bytes
+        let payloads = self.local.iter().chain(self.sends.iter().map(|(_, m)| m));
+        super::memory::vec(&self.local)
+            + super::memory::vec(&self.sends)
+            + payloads.map(Message::heap_bytes).sum::<usize>()
     }
 }
 
@@ -283,30 +275,74 @@ pub struct Worker<'w> {
     pub state: &'w mut State,
     pub out: &'w mut Out,
     pub scratch: Scratch,
+    /// The batch's messages, until it ends (observed capacity; payloads handled so far
+    /// count twice where the state keeps them).
     pub(super) input_bytes: usize,
+    /// This batch's budget checks and capacity publications (into the counters at its end).
+    checks: Cell<u64>,
+    observations: Cell<u64>,
 }
 
 const NONE: u32 = u32::MAX;
 
-impl Worker<'_> {
-    /// Publish only at work checkpoints. The activation owns all these buffers;
-    /// publishing never takes another context's lock or updates a shared byte ledger.
-    pub(super) fn checkpoint(&self) -> bool {
-        self.checkpoint_extra(0)
+impl<'w> Worker<'w> {
+    /// A batch's worker; its take was the batch's first budget check.
+    pub(super) fn new(
+        engine: &'w Engine,
+        state: &'w mut State,
+        out: &'w mut Out,
+        input_bytes: usize,
+    ) -> Self {
+        Self {
+            engine,
+            state,
+            out,
+            scratch: Scratch::default(),
+            input_bytes,
+            checks: Cell::new(1),
+            observations: Cell::new(0),
+        }
     }
 
-    pub(super) fn checkpoint_extra(&self, extra: usize) -> bool {
-        if self.state.clauses.observe_memory {
-            self.engine.observe_context(
-                self.me(),
-                self.state.bytes()
-                    + self.out.bytes()
-                    + self.scratch.bytes()
-                    + self.input_bytes
-                    + extra,
-            );
-        }
+    /// A work checkpoint: publishes this context's capacity, `detached` scratch included,
+    /// and checks the budget.
+    pub(super) fn checkpoint(&self, detached: usize) -> bool {
+        self.publish(detached);
+        self.checks.set(self.checks.get() + 1);
         !self.engine.out_of_budget()
+    }
+
+    /// Publishes this context's capacity where it is observed: one store, no other
+    /// context's lock or shared ledger. Returns the state's part.
+    fn publish(&self, detached: usize) -> usize {
+        if !self.engine.observing() {
+            return 0;
+        }
+        self.observations.set(self.observations.get() + 1);
+        let state = self.state.bytes();
+        let bytes = state + self.out.bytes() + self.scratch.bytes() + detached + self.input_bytes;
+        self.engine.publish(self.me(), bytes);
+        state
+    }
+
+    /// Ends the batch: its counts, and a publication where a checkpoint published
+    /// within it or none was made since the latest sampling election (a publication lags
+    /// its context's work by at most one interval; a round ends with exact ones,
+    /// [`Engine::run`]). Returns the state's capacity published, which stays once the
+    /// batch's buffers are gone.
+    pub(super) fn finish(self) -> Option<usize> {
+        let election = self.engine.election();
+        let due = self.observations.get() > 0 || self.state.published != election;
+        let mut state = None;
+        if self.engine.observing() && due {
+            self.state.published = election;
+            state = Some(self.publish(0));
+        }
+        let counters = &mut self.state.clauses.counters;
+        counters.batches += 1;
+        counters.checks += self.checks.get();
+        counters.observations += self.observations.get();
+        state
     }
 
     fn me(&self) -> ContextId {
@@ -315,9 +351,6 @@ impl Worker<'_> {
 
     /// Handles a message, then the agenda and the messages to itself, to a fixpoint.
     pub fn handle(&mut self, message: Message) {
-        if self.engine.exhausted() {
-            return;
-        }
         self.state.clauses.counters.messages += 1;
         self.message(message);
         let mut given = 0u32;
@@ -328,16 +361,12 @@ impl Worker<'_> {
                 // One context's agenda can run for minutes (its redundancy checks grow with
                 // its clauses): the budget is checked inside it too. Stopping leaves the
                 // run exhausted, which ends it as `Unsupported::Budget`, never an answer.
-                if self.engine.exhausted() || (given.is_multiple_of(256) && !self.checkpoint()) {
+                if given.is_multiple_of(256) && !self.checkpoint(0) {
                     return;
                 }
             }
-            if self.engine.exhausted() {
-                return;
-            }
             match self.out.local.pop() {
                 Some(m) => {
-                    self.out.payload_bytes -= m.heap_bytes();
                     self.state.clauses.counters.messages += 1;
                     self.message(m);
                 }
@@ -354,18 +383,12 @@ impl Worker<'_> {
                     return;
                 }
                 for &a in self.engine.core(self.me()) {
-                    if self.engine.exhausted() {
-                        return;
-                    }
                     self.state
                         .clauses
                         .derive(&[], a, (Rule::Core, NONE, &[]), proofs);
                 }
                 let program = &self.engine.program;
                 for &dl in &program.facts {
-                    if self.engine.exhausted() {
-                        return;
-                    }
                     let head = instantiate(program.clauses[dl as usize].head, &[]);
                     if let Some(head) = head {
                         self.state
@@ -407,9 +430,7 @@ impl Worker<'_> {
                 let id = self.state.remote.len() as u32;
                 for &a in body.iter() {
                     let list = self.state.remote_by_atom.entry(a).or_default();
-                    let before = super::memory::vec(list);
-                    list.push(id);
-                    self.state.remote_bytes += super::memory::vec(list) - before;
+                    super::memory::push(list, id, &mut self.state.remote_bytes);
                 }
                 self.state.remote_bytes += std::mem::size_of_val(&*body);
                 self.state.remote.push(Remote {
@@ -464,9 +485,6 @@ impl Worker<'_> {
     pub(super) fn conclude(&mut self, found: &Found) {
         let proofs = self.engine.proofs;
         for item in &found.items {
-            if self.engine.exhausted() {
-                return;
-            }
             let counters = &mut self.state.clauses.counters;
             match item.rule {
                 Rule::Pred => counters.pred += 1,

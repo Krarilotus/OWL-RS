@@ -42,7 +42,7 @@ use nrese_owl::{
 use nrese_xsd::owl::{Datatype, Value};
 
 use crate::tableau;
-use crate::tableau::budget::{RunBudget, memory_share, workers};
+use crate::tableau::budget::{memory_share, workers};
 
 #[cfg(test)]
 #[path = "islands/resources_tests.rs"]
@@ -137,20 +137,17 @@ fn split_into(ontology: &Ontology, batch: usize) -> Split {
 /// (LUBM(1): whole 149–160 ms, by islands 167–204 ms; OWL2Bench QL-1: 189–217 against
 /// 256–434 ms); it pays where one model of the whole ABox exceeds the budget.
 pub fn consistency(ontology: &Ontology, config: &tableau::Config) -> tableau::Outcome {
-    let budget = RunBudget::new(config);
-    let whole = budget.run(config, |remaining| {
-        tableau::consistency(ontology, remaining)
-    });
+    let config = &*config.started();
+    let whole = tableau::consistency(ontology, config);
     if !matches!(whole.answer, tableau::Answer::GaveUp(_)) {
         return whole;
     }
-    let split = match budget.stage(config, || split_into(ontology, batch_for(config))) {
-        Ok(split) => split,
-        Err(why) => return budget.stopped(why),
-    };
-    match split {
+    if let Some(why) = config.stopped() {
+        return tableau::Outcome::stopped(why);
+    }
+    match split_into(ontology, batch_for(config)) {
         Split::Whole(_) => whole,
-        Split::Islands(islands) => match decide(&islands, config, &budget, tableau::consistency) {
+        Split::Islands(islands) => match decide(&islands, config, tableau::consistency) {
             Some(outcome)
                 if matches!(
                     outcome.answer,
@@ -169,30 +166,22 @@ pub fn consistency(ontology: &Ontology, config: &tableau::Config) -> tableau::Ou
 /// otherwise the first island's reason for not deciding. `config`'s timeout holds for the
 /// whole check.
 pub fn by_islands(ontology: &Ontology, config: &tableau::Config) -> tableau::Outcome {
-    let budget = RunBudget::new(config);
-    let split = match budget.stage(config, || split_into(ontology, batch_for(config))) {
-        Ok(split) => split,
-        Err(why) => return budget.stopped(why),
-    };
-    match split {
-        Split::Whole(_) => budget.run(config, |remaining| {
-            tableau::consistency(ontology, remaining)
-        }),
-        Split::Islands(islands) => decide(&islands, config, &budget, tableau::consistency)
-            .unwrap_or_else(|| {
-                budget.run(config, |remaining| {
-                    tableau::consistency(ontology, remaining)
-                })
-            }),
+    let config = &*config.started();
+    if let Some(why) = config.stopped() {
+        return tableau::Outcome::stopped(why);
+    }
+    match split_into(ontology, batch_for(config)) {
+        Split::Whole(_) => tableau::consistency(ontology, config),
+        Split::Islands(islands) => decide(&islands, config, tableau::consistency)
+            .unwrap_or_else(|| tableau::consistency(ontology, config)),
     }
 }
 
-/// The islands' verdict (`None` without a batch: no assertion).
-/// O(batches) dispatch over bounded independent checks, preserving input order.
+/// The islands' verdict (`None` without a batch: no assertion), under the started
+/// `config`'s deadline.
 fn decide(
     islands: &Islands,
     config: &tableau::Config,
-    budget: &RunBudget,
     check: impl Fn(&Ontology, &tableau::Config) -> tableau::Outcome + Sync + Send,
 ) -> Option<tableau::Outcome> {
     if islands.batches.is_empty() {
@@ -200,18 +189,17 @@ fn decide(
     }
     // An island has at most two portfolio variants. With fewer islands than workers,
     // retain their useful nested race; otherwise give each concurrent island one slot.
-    let workers = match budget.stage(config, || {
-        workers(config, islands.batches.len().saturating_mul(2))
-    }) {
-        Ok(workers) => workers,
-        Err(why) => return Some(budget.stopped(why)),
-    };
+    let workers = workers(config, islands.batches.len().saturating_mul(2));
     let concurrent = workers.for_items(islands.batches.len());
     let mut batch_config = config.clone();
     batch_config.max_memory = memory_share(config.max_memory, concurrent);
     batch_config.workers = Some(workers.limited(workers.width() / concurrent));
     let outcomes = workers.limited(concurrent).map(&islands.batches, |batch| {
-        budget.run(&batch_config, |remaining| check(batch, remaining))
+        // A queued batch doesn't start once the check is stopped.
+        match batch_config.stopped() {
+            Some(why) => tableau::Outcome::stopped(why),
+            None => check(batch, &batch_config),
+        }
     });
     let mut undecided: Option<tableau::Outcome> = None;
     let mut last = None;

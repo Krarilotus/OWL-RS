@@ -77,6 +77,7 @@ benchmark runs.
 | DL: a model from the counts (the number module's layers 3 and 4: proxies with multiplicities, role blocks, an independent validator) answers "consistent" before the search | W3C DL-906 gave up (merges) → 1 ms, DL-907 out of memory (60,000 successors) → 1 ms (the W3C suite's times, debug build); no node, no branch point | `the_multiplication_tests_are_decided_by_counting` (no node, no branch point); `counted_products_agree_with_the_semantics` (the expanded models checked by the semantics, n, m ≤ 5) | none yet: the W3C tests aren't a fast case |
 | DL context core: Pred joins stop where the body so far is already subsumed for the head (every conclusion below would be dropped) | ore_ont_9835's Horn part: 18.6 M Pred conclusions (99 % redundant) → 0.2 M | `no_hub_context_and_pruned_pred_joins` (Pred conclusions at most half without it) | none yet: an ORE dev task, not a fast case |
 | DL context core: a Pred join also stops where its body so far contains a body it found earlier in the same batch (those are derived after the joins, so the context's own check can't see them) | Pred conclusions: ore_ont_9835 361 k → 129 k, ore_ont_7914 323 k → 58 k; a join of 9835 that had reached the 1 M cap (12 premises for each of 6 body atoms) no longer does | `pred_joins_prune_by_the_bodies_they_found` (64 → at most 4) | none yet: an ORE dev task, not a fast case |
+| DL context core: budget checks and capacity publications at work boundaries (a batch's take, 256 messages or given clauses, 4096 conclusions of a join; a context's batch end once per sampling interval), never per message | Horn3000 (Phuoc-Yu): store classification 9,315 → 1,319 ms with per-message reservations gone (K); serial saturation 5,157 → 4,985 ms (original 4,919), budget checks per batch 3 → 1.007 | `budget_checks_and_observations_stay_per_batch` (checks and publications ≤ batches + messages/256 + kept/256 + generated/4096, below the message count) | Horn3000 ([record](../../benches/runs/2026-10-12-horn-takeover-dl.toml)) |
 | DL context core: forward redundancy by a set-trie per head (Savnik's subset query), backward by occurrence lists per (head, atom) from the rarest atom, with 64-bit body signatures (SatELite's) | ore_ont_9835: conclusions per second about 1.7× (the subset scans had been 54-73 % of the saturation) | the set-trie's unit test and the brute-force campaigns; missing: a count of subset tests per derived clause | none yet: an ORE dev task, not a fast case |
 | DL classification: the lower bound's context core with the split strategy (an empty-core context per Skolem function, not one for all) | the shared one held 99 % of the clauses (ore_ont_9835, 3.0 M); 78 tableau-path ORE dev tasks: 231.8 → 109.5 s over the 74 every run solves (10212 7.1 s → 47 ms, 15536 1.8 → 0.49 s, 11207 26 → 1.2 s), small ones unchanged in-process | `no_hub_context_and_pruned_pred_joins` (largest context ≤ 16 clauses split, ≥ 200 cautious) | none yet: an ORE dev task, not a fast case |
 | DL: the universal property's hub only where an axiom goes through it (`R ⊑ U` holds and is left out) | ore_ont_2738: the hub's nominal had reached every class's saturation (no class could be exact) | `a_subproperty_of_the_universal_property_needs_no_hub` | none yet: an ORE dev task, not a fast case |
@@ -178,25 +179,17 @@ shuffled order, 300 s per query, 3,600 s per load. Run records:
 
 ## 6. Lab log of the performance phase (from 5 October 2026)
 
-### 11 October: Horn accounting recovery and closeout
+### 11–12 October: Horn accounting recovery
 
-The [run record](../../benches/runs/2026-10-11-horn-recovery.toml) identifies retained
-candidate K and all separate cohorts. Context-owned capacity summaries and periodic
-aggregate observations replace per-message shared reservations; existing mutation and
-stop owners replace duplicate bookkeeping. This is a sampled configurable contract,
-not an allocator ceiling. In three Phuoc pairs, original/K saturation is 790.2/841.5 ms
-at 16 threads and 4921.6/5217.4 ms serial; store classification is 1351.675/1318.520 ms.
-The earlier published-head store regression was 1399.408/9315.034 ms in ten separate
-pairs. The large regression is recovered on this input, but serial overhead remains;
-these different cohorts cannot be pooled or called complete v2 acceptance.
-
-Rejected attempts include borrowed reservation ownership E, adjacent-destination batching I,
-successor delta accounting L, and activation load-before-exchange M. M passes its
-correctness gates but loses to K in all three 16-thread groups (+12.78% median) and
-has +7.38% median store time. Its source/tests are removed; raw evidence remains.
-No empty-Remote lifetime experiment or retained-result API redesign was implemented.
-The owner ended this round. See the [handover](../plan/2026-10-10-performance-campaign.md#closeout-and-maintainer-handover-11-october)
-for open contracts, memory-measurement limits, cleanup and reproduction paths.
+Per-message shared reservations (6.66× on store Horn classification) gave way to
+context-owned capacity summaries (K, [record](../../benches/runs/2026-10-11-horn-recovery.toml),
+with the rejected attempts E, I, L and M and the
+[handover](../plan/2026-10-10-performance-campaign.md#closeout-and-maintainer-handover-11-october)),
+then to one budget check per batch and one publication per context and sampling interval
+([record](../../benches/runs/2026-10-12-horn-takeover-dl.toml)): Horn3000 serial
+saturation 4,919 / 5,157 / 4,985 ms for the original, K and `8b2dee9`, 16 threads
+820 / 809 / 803 ms, with the same work (29,572,135 messages) and 1.007 budget checks per
+batch instead of 3.
 
 ### 10 October: retained DL probes follow merged individuals
 

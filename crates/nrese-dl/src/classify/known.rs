@@ -53,22 +53,13 @@ fn admissible(c: &Clause, equality: bool) -> bool {
 }
 
 /// The Horn part's consequences over `classes` (sorted), or `None` if the context core
-/// takes none of it; the context core runs with `core` (its proofs off).
+/// takes none of it; the context core runs with `core` (its proofs off) on `workers`.
 pub fn horn_lower_bound(
     normalised: &Normalised,
     classes: &[Term],
     core: &crate::context::Options,
-) -> Option<Lower> {
-    let workers = nrese_exec::workers::Workers::new(core.threads);
-    horn_lower_bound_with_workers(normalised, classes, core, &workers, None)
-}
-
-pub(crate) fn horn_lower_bound_with_workers(
-    normalised: &Normalised,
-    classes: &[Term],
-    core: &crate::context::Options,
     workers: &nrese_exec::workers::Workers,
-    cancel: Option<crate::tableau::Cancel>,
+    cancel: Option<crate::Cancel>,
 ) -> Option<Lower> {
     let all = &normalised.clauses;
     let budget = core.budget;
@@ -123,7 +114,7 @@ fn saturate(
     classes: &[Term],
     options: &crate::context::Options,
     workers: &nrese_exec::workers::Workers,
-    cancel: Option<crate::tableau::Cancel>,
+    cancel: Option<crate::Cancel>,
 ) -> Option<Lower> {
     let build = |part: &[usize]| Normalised {
         clauses: part.iter().map(|&i| n.clauses[i].clone()).collect(),
@@ -133,7 +124,7 @@ fn saturate(
         ..Normalised::default()
     };
     for _ in 0..RETRIES {
-        let why = match crate::context::classify::saturate_normalised_with_workers(
+        let why = match crate::context::saturate_normalised(
             &build(&part),
             classes,
             options,
