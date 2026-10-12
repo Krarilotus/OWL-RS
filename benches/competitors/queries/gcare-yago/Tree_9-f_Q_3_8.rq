@@ -1,0 +1,12 @@
+# G-CARE yago: Tree_9/f_Q_3_8.txt
+SELECT (COUNT(*) AS ?count) WHERE {
+  ?v1 <http://gcare/e/17> ?v0 .
+  ?v1 <http://gcare/e/17> ?v4 .
+  ?v1 <http://gcare/e/17> ?v7 .
+  ?v2 <http://gcare/e/17> ?v0 .
+  ?v3 <http://gcare/e/5> ?v1 .
+  ?v3 <http://gcare/e/39> ?v5 .
+  ?v6 <http://gcare/e/17> ?v0 .
+  ?v8 <http://gcare/e/46> ?v1 .
+  ?v9 <http://gcare/e/36> ?v5 .
+}

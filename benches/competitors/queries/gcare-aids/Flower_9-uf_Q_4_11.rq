@@ -1,0 +1,12 @@
+# G-CARE aids: Flower_9/uf_Q_4_11.txt
+SELECT (COUNT(*) AS ?count) WHERE {
+  ?v0 <http://gcare/e/0> ?v1 .
+  ?v0 <http://gcare/e/1> ?v3 .
+  ?v0 <http://gcare/e/0> ?v4 .
+  ?v0 <http://gcare/e/1> ?v5 .
+  ?v0 <http://gcare/e/1> ?v6 .
+  ?v0 <http://gcare/e/1> ?v7 .
+  ?v1 <http://gcare/e/3> ?v2 .
+  ?v8 <http://gcare/e/0> ?v6 .
+  ?v8 <http://gcare/e/0> ?v7 .
+}

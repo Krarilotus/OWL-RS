@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 45: union-constraint-filter-restrictive
+# UNION of two large predicates, constraint by restrictive FILTER
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (COUNT(*) AS ?count) WHERE { { ?s rdf:type ?o } UNION { ?s dblp:hasSignature ?o } FILTER (?s = ?o) }

@@ -1,0 +1,6 @@
+# G-CARE human: Graph_3/uf_Q_0_3.txt
+SELECT (COUNT(*) AS ?count) WHERE {
+  ?v0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://gcare/l/69> .
+  ?v1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://gcare/l/69> .
+  ?v0 <http://gcare/e/0> ?v1 .
+}
