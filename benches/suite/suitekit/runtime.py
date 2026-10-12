@@ -573,7 +573,8 @@ class RootfsRuntime(ProcessRuntime):
             command = list(config.get("Entrypoint") or []) + (command or list(config.get("Cmd") or []))
         args = []
         if spec.memory:
-            args += ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={spec.memory}",
+            # systemd reads sizes with upper-case units (12G); Docker's settings are lower-case (12g).
+            args += ["systemd-run", "--user", "--scope", "-q", "-p", f"MemoryMax={spec.memory.upper()}",
                      "-p", "MemorySwapMax=0"]
         args += ["bwrap", "--overlay-src", str(self.image_dir(spec.image) / "rootfs"), "--tmp-overlay", "/",
                  "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--unshare-user", "--uid", "0", "--gid", "0",
