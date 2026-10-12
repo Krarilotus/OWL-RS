@@ -544,6 +544,28 @@ class ApptainerRuntime(ProcessRuntime):
         return Path(self.sif(image)).exists()
 
 
+def inside(rootfs: Path, target: str) -> str:
+    """A mount target with the image's own symlinks resolved, as Docker resolves them
+    (Virtuoso's /database links to /opt/virtuoso-opensource/database); bubblewrap doesn't
+    follow an absolute link inside the new root."""
+    parts, resolved, hops = [p for p in target.split("/") if p], [], 0
+    while parts:
+        part = parts.pop(0)
+        candidate = rootfs.joinpath(*resolved, part)
+        if candidate.is_symlink() and hops < 40:
+            hops += 1
+            link = os.readlink(candidate)
+            parts = [p for p in link.split("/") if p] + parts
+            if link.startswith("/"):
+                resolved = []
+            continue
+        if part == "..":
+            resolved = resolved[:-1]
+        elif part != ".":
+            resolved.append(part)
+    return "/" + "/".join(resolved)
+
+
 class RootfsRuntime(ProcessRuntime):
     """The systems' Docker images unpacked into directories and run with bubblewrap, for a
     measure host without Docker (phuoc-yu): every system from the same image as under Docker,
@@ -584,11 +606,12 @@ class RootfsRuntime(ProcessRuntime):
             args += ["--setenv", key, value]
         for key, value in spec.env.items():
             args += ["--setenv", key, value]
+        rootfs = self.image_dir(spec.image) / "rootfs"
         for m in spec.mounts:
             if not m.readonly:
                 # Docker creates a missing bind source (a store the system makes on first start).
                 Path(m.source).mkdir(parents=True, exist_ok=True)
-            args += ["--ro-bind" if m.readonly else "--bind", m.source, m.target]
+            args += ["--ro-bind" if m.readonly else "--bind", m.source, inside(rootfs, m.target)]
         args += ["--chdir", spec.workdir or config.get("WorkingDir") or "/"]
         return args + ["--", *command]
 
