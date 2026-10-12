@@ -135,6 +135,13 @@ class Contracts(unittest.TestCase):
         for records in ([early, later], [later, early]):
             self.assertEqual(status.newest(records)[("w", "t", "nrese")][1]["outcome"], "failed")
 
+    def test_completed_client_requests_are_no_answers(self):
+        rows = [load(system="a"), load(system="b"), query("clients-32", 5, rows=1000, system="a"),
+                query("clients-32", 5, rows=1200, system="b")]
+        pairs = summarise(rows)
+        for system in ("a", "b"):
+            self.assertEqual(pairs[("w", "t", system)].outcome()["outcome"], "ok")
+
     def test_answers_that_differ_between_systems_are_disputed(self):
         rows = [load(system="a"), load(system="b"), query("q1", 5, rows=1, system="a"),
                 query("q1", 5, rows=2, system="b")]

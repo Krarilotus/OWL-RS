@@ -200,7 +200,8 @@ def summarise(rows: list[dict], source: str = "", settled: dict[tuple, str] | No
             item.statuses[status] += 1
             if status == "ok" and ms is not None:
                 (item.first if str(r["repeat"]) == "0" else item.repeats)[run].append(ms)
-            if r["rows"] != "":
+            # A clients-N item's rows are the requests its clients completed: throughput, not an answer.
+            if r["rows"] != "" and not r["item"].startswith("clients-"):
                 (item.answers if status == "ok" else item.wrong_answers if status == "wrong" else set()).add(r["rows"])
             continue
         if task in ("load", "conformance"):
