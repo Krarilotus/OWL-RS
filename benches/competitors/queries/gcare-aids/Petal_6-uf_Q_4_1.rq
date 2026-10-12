@@ -1,0 +1,9 @@
+# G-CARE aids: Petal_6/uf_Q_4_1.txt
+SELECT (COUNT(*) AS ?count) WHERE {
+  ?v0 <http://gcare/e/0> ?v4 .
+  ?v1 <http://gcare/e/0> ?v3 .
+  ?v1 <http://gcare/e/0> ?v5 .
+  ?v2 <http://gcare/e/0> ?v0 .
+  ?v2 <http://gcare/e/1> ?v3 .
+  ?v5 <http://gcare/e/1> ?v4 .
+}

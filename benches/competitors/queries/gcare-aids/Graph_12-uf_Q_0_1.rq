@@ -1,0 +1,15 @@
+# G-CARE aids: Graph_12/uf_Q_0_1.txt
+SELECT (COUNT(*) AS ?count) WHERE {
+  ?v0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://gcare/l/22> .
+  ?v2 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://gcare/l/21> .
+  ?v3 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://gcare/l/22> .
+  ?v0 <http://gcare/e/0> ?v1 .
+  ?v0 <http://gcare/e/0> ?v2 .
+  ?v0 <http://gcare/e/0> ?v5 .
+  ?v0 <http://gcare/e/0> ?v7 .
+  ?v3 <http://gcare/e/0> ?v1 .
+  ?v3 <http://gcare/e/0> ?v8 .
+  ?v4 <http://gcare/e/0> ?v1 .
+  ?v6 <http://gcare/e/0> ?v1 .
+  ?v9 <http://gcare/e/0> ?v1 .
+}

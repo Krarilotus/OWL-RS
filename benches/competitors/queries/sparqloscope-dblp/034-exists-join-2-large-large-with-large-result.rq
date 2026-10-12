@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 34: exists-join-2-large-large-with-large-result
+# EXISTS JOIN of two large predicates with a reasonably large join result
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (COUNT(*) AS ?count) WHERE { ?s dblp:hasSignature ?o1 . FILTER EXISTS { ?s dblp:createdBy ?o2 } }

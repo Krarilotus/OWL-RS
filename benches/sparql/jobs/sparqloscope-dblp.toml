@@ -1,0 +1,31 @@
+# Sparqloscope on DBLP, QLever's home turf (benches/sparql/README.md): office-pc, at night.
+#
+# 1. The paper's protocol, to reproduce QLever's published figure on this hardware: every
+#    query once, in the benchmark's order, on a freshly started server with its cache on
+#    (the suite's first executions, `repeat` 0), 180 s per query.
+# 2. The suite's protocol: three fresh stores per system, the queries in shuffled rounds,
+#    three measured runs each, the result caches off and then on (PROTOCOL.md §4).
+# Answers are captured in both; the 66 known answers and the reference systems decide
+# before any time counts. NRESE runs the binary of 1b611e7 (sha256 a516ba52...), staged
+# in ~/owlrs/sparql-bin/1b611e7.
+id = "sparql-sparqloscope-dblp-1"
+group = "sparql"
+host = "office-pc"
+checkout = "suite/sparql"
+commands = [
+  ["python3", "benches/suite/suite.py", "run", "--systems", "qlever,nrese", "--workloads", "sparqloscope",
+   "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build", "--runs", "1", "--query-runs", "1",
+   "--cache", "on", "--order", "fixed", "--timeout-s", "7200", "--query-timeout-s", "180",
+   "--answers", "full", "--answers-reference", "jena,qlever",
+   "--results", "/home/krarilotus/owlrs/results/sparql-sparqloscope-dblp-1/paper-protocol"],
+  ["python3", "benches/suite/suite.py", "run", "--systems", "qlever,nrese", "--workloads", "sparqloscope",
+   "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build", "--runs", "3", "--query-runs", "3",
+   "--cache", "off,on", "--timeout-s", "7200", "--query-timeout-s", "180",
+   "--answers", "full", "--answers-reference", "jena,qlever",
+   "--results", "/home/krarilotus/owlrs/results/sparql-sparqloscope-dblp-1/suite-protocol"],
+]
+env = { NRESE_TARGET_VOLUME = "/home/krarilotus/owlrs/sparql-bin/1b611e7", HARNESS = "/home/krarilotus/owlrs/sparql-bin/1b611e7/nrese-bench-harness", NRESE_BENCH_SCRATCH = "/home/krarilotus/owlrs/sparql-scratch", DOCKER_MEMORY = "28g", QUERY_MEMORY_MIB = "20000", QLEVER_MEMORY = "26G", QLEVER_CACHE_MAX_SIZE = "6G", QLEVER_SORT_MEMORY = "10G", QLEVER_SIMULTANEOUS_QUERIES = "1", QLEVER_VOCABULARY_TYPE = "in-memory-compressed", QLEVER_INDEX_SETTINGS = '{"num-triples-per-batch": 1000000}', QLEVER_RUNTIME = "group-by-hash-map-enabled=true" }
+needs = ["docker"]
+window = "quiet"
+priority = 1
+est_min = 360

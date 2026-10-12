@@ -1,0 +1,12 @@
+# G-CARE yago: Tree_9/f_Q_0_3.txt
+SELECT (COUNT(*) AS ?count) WHERE {
+  ?v0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://gcare/l/24450> .
+  ?v1 <http://gcare/e/2> ?v0 .
+  ?v1 <http://gcare/e/2> ?v2 .
+  ?v1 <http://gcare/e/2> ?v3 .
+  ?v4 <http://gcare/e/2> ?v3 .
+  ?v4 <http://gcare/e/2> ?v5 .
+  ?v4 <http://gcare/e/2> ?v6 .
+  ?v4 <http://gcare/e/2> ?v8 .
+  ?v7 <http://gcare/e/2> ?v2 .
+}
