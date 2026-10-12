@@ -413,8 +413,54 @@ def run_case(case: dict, label: str, rep: int) -> dict:
     with quiet_slot(f"fast {case['name']}"):
         waited = time.monotonic() - waited
         record = measure(case, label, rep, expect, alt_expect, data)
+        if rep == 1 and case.get("frontier") and record["status"] in LIMITS:
+            record["frontier"] = frontier(case, label, rep, expect, alt_expect, data)
     record["slot_wait_s"] = round(waited, 1)
     return record
+
+
+# A run that ended at one of these stopped at a limit of the case (its memory cap, its time),
+# not with a wrong answer.
+LIMITS = ("memory-limit", "timeout", "gave-up")
+
+
+def frontier(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
+    """A case stopped at its limit, run once more past it (`frontier`: a larger `cap_gb`, a
+    longer `timeout_s`), so that its record says what it needs rather than only that it
+    didn't fit: that run's status, metric, peak and checks. Not a timing of the case."""
+    relaxed = {**case, **case["frontier"]}
+    print(f"      at its limit: once more with {', '.join(f'{k} = {v}' for k, v in case['frontier'].items())}",
+          flush=True)
+    record = measure(relaxed, label, rep, expect, alt_expect, data)
+    return {"settings": case["frontier"], "status": record["status"], "metric": record.get("metric"),
+            "peak_mib": record.get("peak_mib"), "phase_peaks": record.get("phase_peaks"),
+            "checks": record.get("checks"), "notes": record.get("notes", [])[:2]}
+
+
+HARNESS_FAILURES = ("missing input", "Unable to find image", "No such image", "pull access denied",
+                    "No such container", "quiet slot not taken")
+
+
+def verdict(case: dict, record: dict) -> dict:
+    """What a run says, whatever was expected: `ok`; `wrong` (a check or a route failed);
+    `incomplete` (stopped at a limit, or without its input); `unsupported`; or `failed`.
+    `whose`: the product's, or the harness's (an input or image missing). A known issue the
+    case declares (`known`) is named when the run repeats it."""
+    status = record["status"]
+    kind = {"ok": "ok", "wrong": "wrong", "off-route": "wrong", "unsupported": "unsupported"}.get(
+        status, "incomplete" if status in LIMITS else "failed")
+    notes = " ".join(record.get("notes", []))
+    if kind == "ok":
+        whose = "-"
+    elif any(marker in notes for marker in HARNESS_FAILURES):
+        kind, whose = "incomplete", "harness"
+    else:
+        # A failure without a known cause (an exit status) is nobody's yet: its notes say more.
+        whose = "unknown" if kind == "failed" else "product"
+    out = {"verdict": kind, "whose": whose}
+    if kind != "ok" and status == record.get("expected_outcome") and case.get("known"):
+        out["issue"] = case["known"]
+    return out
 
 
 def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
@@ -545,6 +591,7 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         elif any(not r["ok"] for r in record["routes"]):
             record["status"] = "off-route"
     record["expected_outcome"] = wanted
+    record["verdict"] = verdict(case, record)
     record["result"] = slim(result)
     return record
 
@@ -799,7 +846,9 @@ def run(args) -> int:
                 record = run_case(case, label, rep)
             except Exception as error:  # a case that breaks mustn't stop the suite
                 record = {"case": case["name"], "rep": rep, "status": "failed", "notes": [str(error)[:300]],
-                          "checks": [], "routes": [], "samples": {}, "metric": None}
+                          "checks": [], "routes": [], "samples": {}, "metric": None,
+                          "expected_outcome": case.get("outcome", "ok")}
+            record["verdict"] = verdict(case, record)
             # The case's own time, without the wait for the quiet slot.
             record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
             report["records"].append(record)
@@ -813,14 +862,27 @@ def run(args) -> int:
                     print(f"      {c['path']}: expected {c['expected']}, got {c['got']}")
             for note in record.get("notes", []):
                 print(f"      {note}")
-            if case.get("known") and record["status"] == record.get("expected_outcome"):
-                print(f"      known: {case['known']}")
+            v = record["verdict"]
+            if v["verdict"] != "ok":
+                print(f"      verdict: {v['verdict']} ({v['whose']})" + (f"; known: {v['issue']}" if v.get("issue") else ""))
+            if record.get("frontier"):
+                f = record["frontier"]
+                print(f"      past its limit ({', '.join(f'{k} = {x}' for k, x in f['settings'].items())}): {f['status']}, "
+                      f"metric {f['metric']}, peak {f['peak_mib']} MiB")
             out.write_text(json.dumps(report, indent=1), encoding="utf-8")
     report["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
     report["duration_s"] = round((datetime.datetime.now() - started).total_seconds(), 1)
     out.write_text(json.dumps(report, indent=1), encoding="utf-8")
     kept = write_compact(out, BASELINES / out.name)
     bad = [r for r in report["records"] if r["status"] != r.get("expected_outcome", "ok")]
+    # Every case's verdict, the known issues included: an expected limit is still no answer.
+    by_verdict: dict[str, set] = {}
+    for r in report["records"]:
+        v = r.get("verdict", {})
+        by_verdict.setdefault(f"{v.get('verdict', '?')} ({v.get('whose', '?')})", set()).add(r["case"])
+    for key in sorted(by_verdict, key=lambda k: (k.startswith("ok"), k)):
+        names = sorted(by_verdict[key])
+        print(f"{key}: {len(names)}" + ("" if key.startswith("ok") else ": " + ", ".join(names)))
     print(f"\n{len(report['records'])} runs of {len(cases)} cases in {report['duration_s'] / 60:.1f} min; "
           f"{len(bad)} not as expected; report: {out}; kept: {kept.relative_to(ROOT)}")
     return 1 if bad else 0
@@ -888,7 +950,8 @@ def pooled(report: dict) -> dict[str, dict]:
     for r in report["records"]:
         entry = out.setdefault(r["case"], {"reps": [], "status": [], "peaks": [], "metrics": [],
                                            "counters": {}, "phase_peaks": {}, "qps": [], "client_case": False,
-                                           "expected": [], "invalid": False, "expected_reps": report.get("reps", 0)})
+                                           "expected": [], "invalid": False, "expected_reps": report.get("reps", 0),
+                                           "checks": {}, "frontiers": []})
         entry["expected"].append(r.get("expected_outcome", "ok"))
         entry["invalid"] |= any(not c.get("ok") for c in r.get("checks", []) + r.get("routes", []))
         # Older full reports retain single-level clients only in their raw result.
@@ -919,6 +982,10 @@ def pooled(report: dict) -> dict[str, dict]:
             if peak:
                 entry["phase_peaks"].setdefault(phase, []).append(peak)
         entry["status"].append(r["status"])
+        for c in r.get("checks", []):
+            entry["checks"].setdefault(c.get("path", "?"), []).append(c.get("got"))
+        if r.get("frontier"):
+            entry["frontiers"].append(r["frontier"])
         if r.get("peak_mib"):
             entry["peaks"].append(r["peak_mib"])
         if isinstance(r.get("metric"), (int, float)):
@@ -1039,9 +1106,22 @@ def compare(args) -> int:
             regressions += 1
             continue
         if any(e["invalid"] or set(e["status"]) != {"ok"} for e in (b, n)):
-            expected = all(not e["invalid"] and e["status"] == e["expected"] for e in (b, n))
-            print(f"{case:<26} {'expected boundary' if expected else 'NOT COMPARABLE: failed checks/status'}; no timing verdict")
-            regressions += int(not expected)
+            # A known product issue (the status the case declares, on both sides) tracks its
+            # values and its frontier; anything else is no valid comparison.
+            known = all(e["status"] == e["expected"] and "ok" not in e["expected"] for e in (b, n))
+            print(f"{case:<26} {'known issue' if known else 'NOT COMPARABLE: failed checks/status'}; no timing verdict")
+            regressions += int(not known)
+            for path in sorted(set(b["checks"]) & set(n["checks"])):
+                if b["checks"][path] != n["checks"][path]:
+                    print(f"{'':<28}{path}: {'/'.join(map(str, b['checks'][path]))} -> {'/'.join(map(str, n['checks'][path]))}")
+            if b["frontiers"] and n["frontiers"]:
+                fb, fn = b["frontiers"][0], n["frontiers"][0]
+                worse = fb["status"] == "ok" and fn["status"] != "ok"
+                pb, pn = fb.get("peak_mib"), fn.get("peak_mib")
+                worse |= bool(pb and pn and pn > pb * 1.10 and pn - pb > 64)
+                print(f"{'':<28}past its limit: {fb['status']} -> {fn['status']}, metric {fb.get('metric')} -> "
+                      f"{fn.get('metric')}, peak {pb} -> {pn} MiB" + ("  WORSE" if worse else ""))
+                regressions += int(worse)
             continue
         shapes = [set(rep) for e in (b, n) for rep in e["reps"]]
         if (any(len(e["reps"]) != len(e["status"]) for e in (b, n)) or not shapes

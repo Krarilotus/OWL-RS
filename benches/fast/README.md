@@ -50,8 +50,13 @@ Every case names, in `cases.toml`:
 - **comparators:** `system:semantics`, each run only under a semantics it supports;
 - **home turf:** the competitor whose documented strength the case is.
 
-Statuses: `ok`, `wrong`, `off-route`, `memory-limit`, `timeout`, `failed`; for a
-comparator also `hangs`, `unsupported` and `not expressible`.
+Statuses: `ok`, `wrong`, `off-route`, `memory-limit`, `timeout`, `gave-up`, `failed`; for
+a comparator also `hangs`, `unsupported` and `not expressible`. Every run also gets a
+**verdict**, whatever its case expected: `ok`, `wrong` (a check or route), `incomplete`
+(stopped at a limit, or a missing input), `unsupported` or `failed`, with whose it is: the
+product's, the harness's (an input or image missing) or unknown. A case expected to stop at
+its limit names the issue (`known`), and may declare a `frontier` (a larger cap, a longer
+timeout) to run once more past it, so that its record says what it needs.
 
 ## How it measures
 
@@ -85,9 +90,10 @@ comparator also `hangs`, `unsupported` and `not expressible`.
 ([PROTOCOL.md §5](../PROTOCOL.md#5-statistics) states the rules they implement).
 
 1. **Lost work first:** cases, repetitions, series or client widths missing on one side,
-   and failed checks, are listed before any time. A matching expected boundary outcome
-   (memory limit, unsupported) tracks a frontier and earns no timing verdict; a failure
-   on both sides is no valid comparison.
+   and failed checks, are listed before any time. A known issue (the outcome a case
+   declares, such as a memory limit, on both sides) earns no timing verdict: its checked
+   values and its run past the limit (`frontier`) are compared instead, and a frontier
+   that got worse counts. Any other failure on both sides is no valid comparison.
 2. **Work counters** are compared exactly: one that grows by more than 2 % is a
    regression; one that varies between repetitions of a run isn't judged.
 3. **Time:** per case, the samples of all repetitions are pooled per series (a query, the

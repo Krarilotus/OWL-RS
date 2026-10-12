@@ -18,8 +18,11 @@
 # route      path = "OP VALUE": the plan or engine path the case must take (OP: ==, <=,
 #            >=, has, lacks)
 # cap_gb     the container's memory cap (no swap)
-# outcome    what the run is expected to end as: ok (default) or a known limit
-#            (`memory-limit`): tracked, not failed
+# outcome    what the run is expected to end as: ok (default) or a known product issue
+#            (`memory-limit`, `gave-up`, `wrong`, `unsupported`), named in `known`: the run's
+#            verdict still says it (fast.py verdict()), but it fails no gate
+# frontier   for a case expected to stop at its limit: the settings to run it with once more
+#            (`cap_gb`, `timeout_s`), so that its record says what it needs
 # systems    the comparators, `system:semantics`, each run only where it supports that
 #            semantics (fast.py compete): plain = the same SPARQL on the same data;
 #            closure = the same queries on NRESE's exported closure (stores without
@@ -367,6 +370,7 @@ check = { "answer" = "expect.answer" }
 route = {}
 cap_gb = 4
 outcome = "gave-up"
+frontier = { timeout_s = 300 }
 known = "gives up from 50 definitions on 6 Oct 2026 (25: 27 s); Konclude 0.6 s, Openllet and HermiT time out at 120 s"
 systems = ["konclude:dl", "openllet:dl", "hermit:dl"]
 home_turf = "konclude"
@@ -529,6 +533,7 @@ check = { "loaded" = 20000000 }
 route = {}
 cap_gb = 2
 outcome = "memory-limit"
+frontier = { cap_gb = 8 }
 known = "peaks at 2.5 GB resident (4.7 GB with the page cache) on 6 Oct 2026: the budget bounds the quads, not the terms"
 systems = []
 [[case]]
