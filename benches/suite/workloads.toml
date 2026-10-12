@@ -98,34 +98,6 @@ tiers = ["dbpedia-core", "yago-tiny"]
 state = "planned"
 check = "inferred set against Nemo"
 
-[datalog-programs]
-title = "Datalog programs: transitive closure, same generation, program analysis (CSPA, CSDA, Doop), Galen"
-kind = "performance"
-tasks = ["RT1"]
-needs = ["load", "reason-custom-rules"]
-scales = "graphs of 5 k to 40 k nodes (TC and SG: 25 M to 400 M derived facts); Graspan's httpd, Linux and PostgreSQL graphs; Doop on DaCapo's batik"
-source = "FlowLog's benchmark suite (Zhao et al., VLDB 2026): programs from github.com/flowlog-rs/vldb26-artifact (Apache-2.0, vendored), data from its Hugging Face dataset"
-licence = "programs Apache-2.0; datasets without a stated licence (fetched, never committed)"
-tiers = ["tc-G10K", "sg-G10K", "cspa-httpd", "cspa-linux", "cspa-postgresql", "csda-httpd", "csda-linux", "csda-postgresql", "reach-livejournal", "galen", "doop-batik"]
-state = "partial"
-kit = "benches/reasoning/datalog"
-check = "derived facts per relation against Soufflé's published counts (FlowLog's reproduction logs); counts across engines"
-note = "Soufflé's, Nemo's and VLog's home turf. NRESE runs the programs as Notation3 user rules over triples: Galen (ternary relations) and Doop (arity up to 7, negation) are not expressible there"
-
-[materialisation-programs]
-title = "RDFox's materialisation programs over RDF: Claros L and LE, LUBM L and LE"
-kind = "performance"
-tasks = ["RT1"]
-needs = ["load", "reason-custom-rules"]
-scales = "Claros (19 M triples; LE: about 550 M derived), LUBM 125 universities"
-source = "the RDFox benchmark programs in VLog's syntax from GLog's VLDB 2021 package (fetched by hash); Claros from RDFox's ISWC 2015 test data (Oxford); LUBM from the pinned UBA generator"
-licence = "programs and Claros: no licence stated (ask before publishing); LUBM generated"
-tiers = ["claros-l", "claros-le", "lubm-l-125", "lubm-le-125"]
-state = "partial"
-kit = "benches/reasoning/datalog"
-check = "facts per relation (each relation is one triple pattern) across engines; GLog's published totals where the data is the same"
-note = "GLog's, VLog's and RDFox's home turf (single-threaded materialisation, GLog's Table 4). RDFox waits for a licence"
-
 [consistency]
 title = "Injected contradictions: detection and explanation"
 kind = "performance"
@@ -385,13 +357,14 @@ kind = "performance"
 tasks = ["RT1", "RT2"]
 needs = ["load"]
 any = ["reason-owl2-rl", "reason-custom-rules"]
-scales = "about 19 M facts in; LE's closure many times that"
-source = "RDFox's test datasets (Oxford)"
-licence = "unstated: ask Oxford before use"
+scales = "18.8 M triples in; L derives about 89 M, LE about 549 M facts (GLog's counts)"
+source = "Claros from RDFox's ISWC 2015 test data (Oxford); the L and LE programs in VLog's syntax from GLog's VLDB 2021 package (fetched by hash)"
+licence = "unstated: ask Oxford and GLog's authors before publishing"
 tiers = ["l", "le"]
-state = "planned"
-check = "inferred counts across systems"
-note = "The worst case for proof-based deletion; GLog's single-thread result (Claros-L 119 s against RDFox's 2,512 s, reported). Size LE on Draco first"
+state = "partial"
+kit = "benches/reasoning/datalog"
+check = "facts per relation (each relation is one triple pattern) across the engines; GLog's published totals"
+note = "The worst case for proof-based deletion; GLog's single-thread result (Claros-L 119 s against RDFox's 2,512 s, reported). The kit runs NRESE (the program as user rules), Soufflé, Nemo, VLog and GLog; RDFox waits for a licence. LE's closure may not fit Office-PC's 31 GiB on every engine"
 
 [sspe]
 title = "SSPE: single-source path graphs where one deletion invalidates long derivations"
@@ -404,20 +377,21 @@ licence = "ours (generated)"
 tiers = ["1000"]
 state = "planned"
 check = "the incremental closure equals the rematerialised one"
-note = "Counting beat B/F 10.5 s to 253 s for 1,000 deletions (reported); the fast case deletes-layered is its small cousin"
+note = "Counting beat B/F 10.5 s to 253 s for 1,000 deletions (reported); the fast case deletes-layered is its small cousin. Blocked as published on both sides: its rules add path lengths (`z := z1 + z2`) over a ternary relation, and NRESE's user rules have neither arithmetic nor relations beyond triples; RDFox has no licence here"
 
 [datalog-graphs]
 title = "Datalog graph programs: transitive closure, same generation, CSPA"
 kind = "performance"
 tasks = ["RT1"]
 needs = ["load", "reason-custom-rules"]
-scales = "1 to 100 M edges; closures to billions (capped)"
-source = "generated graphs, SNAP graphs where needed; the programs of the RecStep, FlowLog and Soufflé papers"
-licence = "ours (generated); SNAP per graph"
-tiers = ["tc", "sg", "cspa"]
-state = "planned"
-check = "counts against Soufflé or Nemo"
-note = "The batch executor beyond OWL: plain Datalog as N3 rules; Nemo, VLog and Soufflé on their home turf"
+scales = "BigDatalog's graphs of 5 k to 40 k nodes (TC and SG: 25 M to 400 M derived facts); Graspan's httpd, Linux and PostgreSQL graphs (CSPA: 3.7 to 5.5 M ValueFlow facts, 324 M facts in all on httpd)"
+source = "FlowLog's benchmark suite (Zhao et al., VLDB 2026): programs from github.com/flowlog-rs/vldb26-artifact (Apache-2.0, vendored), data from its Hugging Face dataset"
+licence = "programs Apache-2.0; datasets without a stated licence (fetched, never committed)"
+tiers = ["tc-G10K", "sg-G10K", "cspa-httpd", "cspa-linux", "cspa-postgresql"]
+state = "partial"
+kit = "benches/reasoning/datalog"
+check = "derived facts per relation against Soufflé's published counts (FlowLog's reproduction logs); counts across the engines"
+note = "The batch executor beyond OWL: plain Datalog as N3 rules; Nemo, VLog and Soufflé on their home turf. Extra tiers: tc-G5K (the qualifier), tc-G20K (400 M facts), CSDA, reachability on LiveJournal, Galen (ternary relations: not expressible on NRESE)"
 
 [commit-latency]
 title = "Commit latency under 0, 1, 8 and 64 readers, the closure complete at every commit"
@@ -429,9 +403,9 @@ source = "ours (report item 20): nobody publishes it"
 licence = "ours"
 tiers = ["lubm-10"]
 state = "partial"
-kit = "benches/fast"
-check = "the committed state equals the rematerialisation"
-note = "The fast cases commits-readers and writes-under-readers cover it on NRESE; GraphDB and RDFox are the comparators"
+kit = "benches/reasoning/maintenance"
+check = "every change is undone, so the closure must hash back to the one the load materialised"
+note = "Over the SPARQL protocol on every system (the suite's adapters): batches of 1, 100 and 10,000 inserts and deletes, a schema axiom removed and restored, single-triple commits under 0, 1, 8 and 64 readers. GraphDB Free serves two queries at once, so more readers measure its queueing; RDFox waits for a licence. The fast cases commits-readers and writes-under-readers cover NRESE in process"
 
 [elk-ontologies]
 title = "Classification of large EL and near-EL ontologies: GO, ChEBI, NCIt, GALEN"

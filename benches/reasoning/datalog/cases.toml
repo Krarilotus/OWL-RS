@@ -179,6 +179,8 @@ home = "souffle"
 
 [[case]]
 name = "claros-l"
+workload = "claros"
+tier = "l"
 format = "triples"
 program = "Claros_L.dlog"
 program_url = "https://drive.usercontent.google.com/download?id=1SAnLwAr0h7xtyWXlP1_BbyFo0zCXo6OI&export=download&confirm=t"
@@ -193,6 +195,8 @@ home = "glog, rdfox"
 
 [[case]]
 name = "claros-le"
+workload = "claros"
+tier = "le"
 format = "triples"
 program = "Claros_LE.dlog"
 program_url = "https://drive.usercontent.google.com/download?id=1ATnqOQ2PoCi3bPM7Fiy1NU7pUlxoYH2P&export=download&confirm=t"
@@ -208,6 +212,8 @@ home = "glog, rdfox"
 
 [[case]]
 name = "lubm-l-125"
+workload = "lubm"
+tier = "rdfox-l-125"
 format = "triples"
 program = "LUBM_L.dlog"
 program_url = "https://drive.usercontent.google.com/download?id=1PPlb43Z5_3FlD4lKmkbLp3fskMkp8L5p&export=download&confirm=t"
@@ -221,6 +227,8 @@ home = "glog, vlog, rdfox"
 
 [[case]]
 name = "lubm-le-125"
+workload = "lubm"
+tier = "rdfox-le-125"
 format = "triples"
 program = "LUBM_LE.dlog"
 program_url = "https://drive.usercontent.google.com/download?id=1mZwaWgKPslYMYx7UIxy0CQVBU_M2ytGa&export=download&confirm=t"

@@ -23,7 +23,7 @@ NRESE from NRESE_BIN, GraphDB with its licence, RDFox once licensed):
    again. Otherwise the run is `wrong`, and its times don't count.
 
 Rows follow the suite's schema (benches/suite/suitekit/schema.py): workload
-`lubm-maintenance`, tier = the base, regime `owl2-rl`; `update` rows per commit (`repeat` =
+`commit-latency`, tier = the base, regime `owl2-rl`; `update` rows per commit (`repeat` =
 the commit's number within its item), `query` rows for the readers, a `count` row for the
 check. Restricted systems' rows carry publish = permission and stay on the machine.
 
@@ -63,7 +63,7 @@ from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
 
-WORKLOAD = "lubm-maintenance"
+WORKLOAD = "commit-latency"
 REGIME = "owl2-rl"
 SEED = 20261012
 UB = "http://www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#"
