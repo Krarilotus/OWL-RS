@@ -145,16 +145,15 @@ fn allocations() -> (u64, u64) {
     )
 }
 
-/// The memory a phase used: its peak resident memory (Linux: the high-water mark reset at
-/// the phase's start through /proc/self/clear_refs) and, when counted, its allocations.
+/// The memory a phase used: its peak (Linux: the resident set's, in a window started with
+/// the phase; elsewhere the process's so far) and, when counted, its allocations.
 struct Phase {
     allocations: (u64, u64),
 }
 
 impl Phase {
     fn start() -> Self {
-        // Writing 5 resets the peak resident set size to the current one (Linux 4.0 on).
-        let _ = std::fs::write("/proc/self/clear_refs", "5");
+        nrese_exec::memory::start_peak_window();
         Self {
             allocations: allocations(),
         }
@@ -163,7 +162,8 @@ impl Phase {
     /// `{"peak_mib": .., "allocations": .., "allocated_mib": ..}` since `start`.
     fn json(&self) -> String {
         let (count, bytes) = allocations();
-        let peak = memory_mib().map_or("null".to_owned(), |(peak, _)| peak.to_string());
+        let peak = nrese_exec::memory::window_peak_bytes()
+            .map_or("null".to_owned(), |peak| (peak / 1048576).to_string());
         if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
             format!(
                 "{{\"peak_mib\": {peak}, \"allocations\": {}, \"allocated_mib\": {}}}",
@@ -672,32 +672,16 @@ fn heap_profile(phases: Vec<nrese_exec::heap::Phase>) {
     );
 }
 
-/// Peak and current memory in MiB, where the OS reports it: on Linux the resident set, on
-/// Windows the committed private bytes.
-#[cfg(windows)]
+/// The process's peak since it started and its memory now, in MiB, where the OS reports
+/// them: on Linux the resident set, on Windows the committed private bytes.
 fn memory_mib() -> Option<(u64, u64)> {
-    let mib = |bytes: u64| bytes / 1048576;
-    Some((
-        mib(nrese_exec::memory::peak_process_bytes()?),
-        mib(nrese_exec::memory::process_bytes()?),
-    ))
-}
-
-/// Peak and current resident memory in MiB, where the OS reports it (Linux).
-#[cfg(not(windows))]
-fn memory_mib() -> Option<(u64, u64)> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let field = |name: &str| {
-        status
-            .lines()
-            .find(|l| l.starts_with(name))?
-            .split_whitespace()
-            .nth(1)?
-            .parse::<u64>()
-            .ok()
-            .map(|kib| kib / 1024)
+    use nrese_exec::memory;
+    let now = if cfg!(windows) {
+        memory::process_bytes()
+    } else {
+        memory::resident_bytes()
     };
-    Some((field("VmHWM:")?, field("VmRSS:")?))
+    Some((memory::peak_process_bytes()? / 1048576, now? / 1048576))
 }
 
 /// `query -> p50 ms` from an earlier `--json` report.
@@ -984,8 +968,10 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         report
             .sections
             .push(("loaded", loaded.inserted.to_string()));
-        if let Some((peak, _)) = memory_mib() {
-            report.sections.push(("load_peak_mib", peak.to_string()));
+        if let Some(peak) = nrese_exec::memory::window_peak_bytes() {
+            report
+                .sections
+                .push(("load_peak_mib", (peak / 1048576).to_string()));
         }
         phases.push(("load", phase.json()));
     }
@@ -1081,8 +1067,10 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
                 done.phases.passes,
             ),
         ));
-        if let Some((peak, _)) = memory_mib() {
-            report.sections.push(("reason_peak_mib", peak.to_string()));
+        if let Some(peak) = nrese_exec::memory::window_peak_bytes() {
+            report
+                .sections
+                .push(("reason_peak_mib", (peak / 1048576).to_string()));
         }
         phases.push(("reason", phase.json()));
     }

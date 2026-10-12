@@ -1,0 +1,45 @@
+# A run record (benches/runs/README.md). Outcomes and identities; samples stay under results.
+id = "2026-10-12-memory-variance"
+level = "focused"
+kit = "perf_lab (fast case rl-lubm100 run natively), fast rl-owl2bench, kernel-intersect, commits-rdfs"
+purpose = "Why one build's rl-lubm100 peak varied 2,375-4,700 MiB in the fast suite on office-pc, whether the measurement or the engine, and the fix"
+started = "2026-10-12T09:40:00+02:00"
+finished = "2026-10-12T13:30:00+02:00"
+host = "phuoc-yu"
+build_host = ["office-pc", "phuoc-yu"]
+scenario = "native"
+baseline = { commit = "aabd47a", dirty = false, binary_sha256 = "77e6b07b634041a2162ce40bed8309d49bbc8700203c40c93d3e342013d6f5f9", note = "perf_lab built on office-pc (glibc 2.39; Phuoc-Yu has 2.43). The first series used e2dda19 built on phuoc-yu, 41299b9b616a1d325ececfc922eaccf531ff280f187bc3f7266738f875c178cd, and its alloc_profile build 84cfa2c66da7725a233f064dec32fdc2cad0002669997eabb781eb9948e40505 (heap counts)" }
+candidate = { commit = "aabd47a", dirty = true, binary_sha256 = "71b74f1e22e93144b29787669a1a71a8477f46a65d1ef98f5392c19f4bd8c785", note = "the branch's change: peak windows in nrese_exec::memory and perf_lab, release_all at each round's start, after the last round and before the inferred stack; committed on v2/memory-variance. Beside it: measurement changes only b6b922996157aa9fa8b3749f34315e105dd645100fef0bd3f779c2c3fbc798b6, release_thread instead 43aa8e248d956d5aac1b5324455a038cffd943f6e92b43fa3aff2f19a419cbe0; mimalloc options by environment on the baseline" }
+protocol = { order = "variants rotated per round (A-B-C, B-C-A, C-A-B), 10 rounds (8 for the small cases, 5 for diagnostics)", threads = "16 (one series 1)", gate = "each run in the machine's quiet slot (scripts/quiet-slot.sh) and after 2 s with under 5 % of the CPUs busy; the busy share is logged per sample, none was above", measures = "VmHWM per phase window (perf_lab phases), cgroup memory.peak and memory.stat file of a systemd scope with MemoryMax=12G, page-cache residency of the input by mincore", superseded = "the series before 10:30 ran beside other agents' builds (sar ldavg-1: 16.6 at 09:50, 11.4 at 10:00, 8.3 at 10:10, 5.1 at 10:20); only their page-cache bytes and heap counts are kept, which timing does not move" }
+inputs = [
+  { name = "lubm-100.nt", sha256 = "61f43e3fb8fbe6b090223b187e1b1204b6c2c2cb5fbd657230e416ab230a4a0d" },
+  { name = "univ-bench.nt", source = "assets snapshots/docker-volumes/nrese-fast-data" },
+  { name = "owl2bench-rl-1.nt", source = "assets snapshots/docker-volumes/nrese-bench-data" },
+  { name = "dense nodes=50000 degree=12, churn people=200000 changes=2000", source = "perf_lab generate" },
+]
+results = { root = "phuoc-yu:/home/krarilotus/nrese-prep-20261009-4e8bd38/memory-variance-20261012", manifest_sha256 = "38ec51244508173a1d367769d5fbe48f460c523c35381603acf2ae77c140c1b0", quiet = "quiet/ (the verdicts below)", under_load = "the top level (UNDER-LOAD.txt)", office = "office-pc:/home/krarilotus/owlrs/results/reports/fast/2026-10-11-ab-*.json (the finding)" }
+publishable = "all"
+cases = [
+  { case = "rl-lubm100 cgroup peak, input evicted from the page cache", verdict = "no-verdict", note = "4,561-4,705 MiB over 10 runs; 2,345 MiB of it the input's page cache (memory.stat file)" },
+  { case = "rl-lubm100 cgroup peak, input cached by another cgroup", verdict = "no-verdict", note = "2,093-2,298 MiB over 10 runs; page cache charged 0" },
+  { case = "rl-lubm100 office A/B, the finding", verdict = "no-verdict", note = "container 2,729 / 3,510 / 4,697 / 4,700 MiB; process (highest phase window) 2,023 / 2,099 / 2,109 / 2,105" },
+  { case = "rl-lubm100 heap peak (alloc_profile, 5 runs)", verdict = "same", note = "load 1,208.8-1,209.0 MiB, materialisation 1,232.8-1,233.0 MiB: the engine's logical peak is deterministic" },
+  { case = "rl-lubm100 allocator diagnostics on the baseline (5 rounds)", verdict = "no-verdict", note = "peak: default 2,048-2,117 MiB, THP off 1,678-1,732 (reasoning +20 %), purge_delay 0 1,322-1,366 (reasoning +7 %, queries +11 %), both 1,186-1,203 (reasoning +47 %)" },
+  { case = "rl-lubm100 arena_purge_mult 0 (10 rounds)", verdict = "slower", note = "rejected: peak 2,066.5 -> 1,350 MiB, but query sets 128.2 -> 156.5 ms (+22 %), load +16 %, reasoning +3 %" },
+  { case = "kernel-intersect arena_purge_mult 0 (8 rounds)", verdict = "slower", note = "rejected: query sets 158.1 -> 183.7 ms (+16 %)" },
+  { case = "rl-lubm100 round-boundary releases (3 series of 10 rounds)", verdict = "same", note = "kept: process peak 2,066.5 / 2,032.5 / 2,081.5 -> 1,665.0 / 1,666.0 / 1,668.5 MiB (medians), 10 of 10 lower in each; reasoning peak 2,016-2,148 -> 1,592-1,675; reasoning -1.1 % (5 of 10 faster; baseline outliers), +2.7 % (1 of 10), +2.5 % (0 of 10); query sets same" },
+  { case = "rl-owl2bench round-boundary releases (2 series of 10 rounds)", verdict = "same", note = "kept: reasoning peak 437.5 / 439.5 -> 303.0 / 299.0 MiB, 10 of 10 lower; reasoning 384.8 -> 408.0 ms (+6.0 %), 384.6 -> 403.8 (+5.0 %), 0 of 10 faster in each" },
+  { case = "commits-rdfs round-boundary releases (8 and 10 rounds)", verdict = "same", note = "kept: reasoning peak 200 -> 137 and 198.5 -> 131.5 MiB, commits peak 243.5 -> 165 and 239 -> 169.5; RDFS reasoning 66.8 -> 73.0 ms (+9.2 %, 0 of 8) and 71.1 -> 74.6 (+5.0 %, 4 of 10); commits same" },
+  { case = "rl-lubm100 one thread (5 rounds)", verdict = "same", note = "process peak 1,574-1,575 -> 1,576-1,577 MiB (the load's); reasoning peak 1,400-1,514 -> 1,347-1,349; reasoning 6,321 -> 6,290 ms" },
+  { case = "release_thread instead of release_all (10 rounds)", verdict = "same", note = "rejected: LUBM 100 peak 1,713 MiB against 1,666, reasoning +3.1 % against +2.7 %; RL-1 359 MiB against 299, +3.4 % against +5.0 %" },
+  { case = "rl-lubm100 load-boundary releases (10 pairs, under build load)", verdict = "same", note = "rejected: load peak 1,629.5 -> 1,523.5 MiB, process peak unchanged (1,644 -> 1,647.5), load +4.9 % (1 of 10 faster)" },
+  { case = "rl-lubm100 load time, measurement changes only (10 rounds)", verdict = "no-verdict", note = "open: 3.7 % slower load (1 of 10 faster), the candidate 2.7 % (0 of 10), +3.2 % on one thread; the timed load runs none of the changed code: layout suspected (fat LTO), no perf counters on phuoc-yu" },
+  { case = "kernel-intersect, commits-rdfs load (16 threads, 8 rounds)", verdict = "no-verdict", note = "open: load peaks 444-516 and 396-490 MiB (up to 26 % apart, the case peak's allocator spread); dense load heap peak 172-204 MiB (batches in flight vary with the schedule), resident 2.3 times the heap" },
+]
+findings = [
+  "The fast suite took the container's memory.peak as the case's peak; it counts the page cache charged to the container's reads, so the input's cache state decided 0 to 2.3 GB of rl-lubm100's peak. The process's peak was 2.0-2.1 GB in every run.",
+  "perf_lab's per-phase resets of the kernel's high-water mark (clear_refs) also reset ru_maxrss: its report's peak_mib and time -v's maximum resident set were the last phase's alone (1,111 MiB for a process that peaked at 1,864).",
+  "The remaining spread of the process's peak is mimalloc's: a freed large block stays resident 100 ms (purge_delay 10 ms times arena_purge_mult 10), about a materialisation round, so whether a round's freed buffers count in the next round's peak depends on timing. It is there on a quiet host too (baseline 1,878-2,165 MiB) and grows with threads and host load.",
+  "rdf12-annotations' swing (container 1,033-1,543 MiB, process 971-984) was the page cache alone; kernel-intersect and commits-rdfs vary in the process too (office, 32 threads: 743-916 and 494-602 MiB).",
+  "The PR #23 A/B running on phuoc-yu at the same time (driver 15a18ff, v2-bench-ab) records the scope's memory.peak as the case's peak, so its memory verdicts carry the page cache too.",
+]
