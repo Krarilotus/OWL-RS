@@ -1,0 +1,6 @@
+# G-CARE aids: Star_3/uf_Q_4_10.txt
+SELECT (COUNT(*) AS ?count) WHERE {
+  ?v1 <http://gcare/e/1> ?v0 .
+  ?v2 <http://gcare/e/0> ?v0 .
+  ?v3 <http://gcare/e/1> ?v0 .
+}

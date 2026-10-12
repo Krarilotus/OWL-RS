@@ -1,0 +1,6 @@
+# G-CARE yago: Cycle_3/f_Q_1_11.txt
+SELECT (COUNT(*) AS ?count) WHERE {
+  ?v1 <http://gcare/e/46> ?v0 .
+  ?v2 <http://gcare/e/46> ?v0 .
+  ?v2 <http://gcare/e/46> ?v1 .
+}

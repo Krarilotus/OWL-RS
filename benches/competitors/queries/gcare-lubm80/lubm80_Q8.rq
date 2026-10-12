@@ -1,0 +1,8 @@
+# G-CARE lubm80: lubm80_Q8.txt
+SELECT (COUNT(*) AS ?count) WHERE {
+  ?v0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://gcare/l/23> .
+  ?v1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://gcare/l/0> .
+  ?v0 <http://gcare/e/11> ?v1 .
+  ?v1 <http://gcare/e/12> <http://gcare/v/23352> .
+  ?v0 <http://gcare/e/3> ?v3 .
+}

@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 43: union-constraint-small-join
+# UNION of two large predicates, constrained by a join with a small result
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (COUNT(*) AS ?count) WHERE { { ?s dblp:publishedAsPartOf ?o1 } UNION { ?s dblp:publishedInStream ?o1 } ?s dblp:publishedInJournalVolume ?o2 }

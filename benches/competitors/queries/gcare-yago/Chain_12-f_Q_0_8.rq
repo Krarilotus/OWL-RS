@@ -1,0 +1,15 @@
+# G-CARE yago: Chain_12/f_Q_0_8.txt
+SELECT (COUNT(*) AS ?count) WHERE {
+  ?v1 <http://gcare/e/2> ?v0 .
+  ?v1 <http://gcare/e/2> ?v2 .
+  ?v2 <http://gcare/e/40> ?v3 .
+  ?v4 <http://gcare/e/62> ?v3 .
+  ?v5 <http://gcare/e/2> ?v4 .
+  ?v5 <http://gcare/e/2> ?v6 .
+  ?v7 <http://gcare/e/2> ?v6 .
+  ?v7 <http://gcare/e/2> ?v8 .
+  ?v8 <http://gcare/e/50> ?v9 .
+  ?v10 <http://gcare/e/32> ?v9 .
+  ?v11 <http://gcare/e/17> ?v10 .
+  ?v11 <http://gcare/e/58> ?v12 .
+}

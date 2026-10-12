@@ -1,0 +1,12 @@
+# G-CARE yago: Graph_9/f_Q_0_1.txt
+SELECT (COUNT(*) AS ?count) WHERE {
+  ?v0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://gcare/l/186407> .
+  ?v0 <http://gcare/e/0> ?v7 .
+  ?v1 <http://gcare/e/2> ?v0 .
+  ?v1 <http://gcare/e/2> ?v2 .
+  ?v1 <http://gcare/e/2> ?v3 .
+  ?v4 <http://gcare/e/2> ?v2 .
+  ?v4 <http://gcare/e/2> ?v3 .
+  ?v5 <http://gcare/e/2> ?v0 .
+  ?v6 <http://gcare/e/2> ?v0 .
+}

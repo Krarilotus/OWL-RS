@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 103: number-of-objects
+# Total number of distinct objects
+SELECT (COUNT(DISTINCT ?o) AS ?count) WHERE { ?s ?p ?o }

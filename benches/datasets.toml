@@ -206,3 +206,113 @@ made_by = "bash benches/competitors/prepare-datasets.sh yago-tiny"
 bytes = 3246565946
 sha256 = "e65eef7eb720be730d24ca088699089c21f9ddf002667449fa519f9abe311bb3"
 frozen = "2026-10-03"
+
+[[dataset]]
+file = "dblp-2025-04-01.nt"
+workload = "sparqloscope"
+tier = "sparqloscope-dblp"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh dblp"
+source = "https://drops.dagstuhl.de/storage/artifacts/dblp/rdf/2025/dblp-2025-04-01.nt.gz (doi:10.4230/dblp.rdf.ntriples.2025-04-01; MD5 6c5628d88b8e1b27eef918239a7e9802 as published)"
+bytes = 65928101649
+sha256 = "5c4bf68b74468d1ee06489b0f6be33c5130ef502c3ec1700afecd955e12639b9"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "watdiv-10m.nt"
+workload = "watdiv"
+tier = "watdiv-10m"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh watdiv-10m"
+source = "https://dsg.uwaterloo.ca/watdiv/watdiv.10M.tar.bz2 (benches/sparql/sources.sha256)"
+bytes = 1542624409
+sha256 = "7cfe0341d578a677d3b5d562eaaf94d67aff8587d9e0ef3d83cc82765b77cddd"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "gcare-aids.nt"
+workload = "gcare"
+tier = "gcare-aids"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh gcare"
+source = "G-CARE dataset.tar.gz (benches/sparql/sources.sha256), converted by benches/sparql/gcare/convert.py"
+bytes = 61363136
+sha256 = "db545106419cfd74f6073cedd954b8704d923b788f0531b43c22fa4361a5d27b"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "gcare-human.nt"
+workload = "gcare"
+tier = "gcare-human"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh gcare"
+source = "G-CARE dataset.tar.gz (benches/sparql/sources.sha256), converted by benches/sparql/gcare/convert.py"
+bytes = 13056596
+sha256 = "57ed179a77b138e1011296b93c6d9329f5f7e5c1227fcf3afef6e3e95ea3932e"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "gcare-lubm80.nt"
+workload = "gcare"
+tier = "gcare-lubm80"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh gcare"
+source = "G-CARE dataset.tar.gz (benches/sparql/sources.sha256), converted by benches/sparql/gcare/convert.py"
+bytes = 1633320120
+sha256 = "9052fb59c9fe67ac0b8d566625a1d9b669b04ddef1c4959cbb25e4f9ef46559e"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "gcare-yago.nt"
+workload = "gcare"
+tier = "gcare-yago"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh gcare"
+source = "G-CARE dataset.tar.gz (benches/sparql/sources.sha256), converted by benches/sparql/gcare/convert.py"
+bytes = 5378920003
+sha256 = "00702282d0c8c8a55af9589b7860d74601dacc6b310d10c2c3c26b57c133a0e6"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "sp2bench-1m.nt"
+workload = "sp2bench"
+tier = "sp2bench-1m"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh sp2bench-1m"
+source = "SP2B v1.01 sp2b_gen -t 1000000 (sp2b-v1_01-full.tar.gz), written as N-Triples by Jena riot 6.2.0"
+bytes = 151475662
+sha256 = "ca79ba9656734edbe99f5e29d0d2281fb1dc1102ad146e135166bc880154dd55"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "sp2bench-25m.nt"
+workload = "sp2bench"
+tier = "sp2bench-25m"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh sp2bench-25m"
+source = "SP2B v1.01 sp2b_gen -t 25000000 (sp2b-v1_01-full.tar.gz), written as N-Triples by Jena riot 6.2.0"
+bytes = 3857628983
+sha256 = "a7f3adddda60f436fe263e997437b168ca3ff0fc62b411f003e1ad8b33cf6271"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "bsbm-10m.nt"
+workload = "bsbm"
+tier = "bsbm-10m"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh bsbm-10m"
+source = "BIBM 0.7.8 generator -fc -pareto -pc 28480 -s nt: the BSBM V3.1 report's 10119864 triples"
+bytes = 2178369495
+sha256 = "3977a61ff3992889e6576d399b7f292007b6f14f9472d5ed0f59316f50cf0505"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "bsbm-100m.nt"
+workload = "bsbm"
+tier = "bsbm-100m"
+role = "core"
+made_by = "bash benches/sparql/prepare.sh bsbm-100m"
+source = "BIBM 0.7.8 generator -fc -pareto -pc 284800 -s nt: the BSBM V3.1 report's 100062249 triples"
+bytes = 21813398098
+sha256 = "0d57a6136c6feff181f52d70d93690250d67429edb01fc707c3aa7be59b68fed"
+frozen = "2026-10-12"

@@ -184,26 +184,28 @@ title = "Sparqloscope: 105 generated queries covering the SPARQL 1.1 features on
 kind = "performance"
 tasks = ["basics"]
 needs = ["load", "query"]
-scales = "DBLP (about 500 M statements), Wikidata truthy (about 8 B)"
-source = "github.com/ad-freiburg/sparqloscope (ISWC 2025)"
-licence = "Apache-2.0"
-tiers = ["dblp"]
-state = "planned"
-check = "result sizes across systems"
-note = "The current cross-engine query benchmark; its authors publish QLever, Virtuoso, MillenniumDB, GraphDB, Blazegraph and Jena on it"
+scales = "DBLP of 1 April 2025 (515 M lines of N-Triples), Wikidata truthy (about 8 B)"
+source = "github.com/ad-freiburg/sparqloscope 61ad92f (ISWC 2025); DBLP doi:10.4230/dblp.rdf.ntriples.2025-04-01"
+licence = "Apache-2.0 (queries); DBLP CC0"
+tiers = ["sparqloscope-dblp"]
+state = "ready"
+kit = "benches/sparql"
+check = "the answers every engine of the paper published alike (66 of 105), the others against the reference systems"
+note = "QLever's home turf: its paper's Table 2 (QLever 0.18 s geometric mean on DBLP) is the bar; Wikidata truthy waits for Draco"
 
 [bsbm]
-title = "Berlin SPARQL Benchmark: e-commerce explore, business intelligence, explore and update"
+title = "Berlin SPARQL Benchmark V3.1: e-commerce explore and business intelligence mixes, 1 to 64 clients"
 kind = "performance"
 tasks = ["basics"]
-needs = ["load", "query", "update"]
-scales = "1 M to 1 B statements"
-source = "wbsg.informatik.uni-mannheim.de/bizer/berlinsparqlbenchmark (generator and driver)"
+needs = ["load", "query"]
+scales = "10 M and 100 M (the V3.1 report's 10119864 and 100062249 triples), up to 150 B published"
+source = "BIBM 0.7.8 (sourceforge.net/projects/bibm): the generator and test driver of the V3.1 results (April 2013)"
 licence = "Apache-2.0"
-tiers = ["10m", "100m"]
-state = "planned"
-check = "the driver's qualification mode"
-note = "The classic mixed query and update workload; most vendors publish numbers on it"
+tiers = ["bsbm-explore-100m", "bsbm-bi-100m"]
+state = "ready"
+kit = "benches/sparql/bsbm"
+check = "the driver's qualification: each system's answers against a reference system's"
+note = "Virtuoso's home turf: its V3.1 figures at 100 M (explore 47179 to 216119 QMpH, BI 997 to 7132 QMpH at 1 to 64 clients) are the bar"
 
 [watdiv]
 title = "WatDiv: diverse query shapes (linear, star, snowflake, complex) as a stress test"
@@ -211,11 +213,55 @@ kind = "performance"
 tasks = ["basics"]
 needs = ["load", "query"]
 scales = "10 M to 1 B statements"
-source = "dsg.uwaterloo.ca/watdiv"
-licence = "none stated (generator on GitHub); data generated, not redistributed"
-tiers = ["10m", "100m"]
+source = "dsg.uwaterloo.ca/watdiv: its authors' datasets (watdiv.10M, watdiv.100M) and v0.6 query templates"
+licence = "none stated: internal use until its authors agree (owner, 5 Oct 2026)"
+tiers = ["watdiv-10m", "watdiv-100m"]
+state = "partial"
+kit = "benches/sparql"
+check = "answers against the reference systems"
+note = "Oxigraph's and Jena's home turf (owner, 12 Oct 2026), with BSBM and SP2Bench; the queries are instantiated from the generator's saved state of each dataset"
+
+[sp2bench]
+title = "SP2Bench: DBLP-shaped documents, 17 queries (OPTIONAL, negation, long chains, ASK)"
+kind = "performance"
+tasks = ["basics"]
+needs = ["load", "query"]
+scales = "10 k to 25 M triples published; any size generated"
+source = "dbis.informatik.uni-freiburg.de SP2B v1.01 (generator and queries)"
+licence = "BSD"
+tiers = ["sp2bench-1m", "sp2bench-25m"]
+state = "ready"
+kit = "benches/sparql"
+check = "the result sizes of the SP2Bench paper (Table V)"
+note = "Oxigraph's and Jena's home turf, with BSBM and WatDiv"
+
+[gcare]
+title = "G-CARE: cardinality estimation for subgraph queries (SIGMOD 2020)"
+kind = "performance"
+tasks = ["basics"]
+needs = ["load", "query"]
+scales = "AIDS, HUMAN, LUBM80, YAGO: 0.2 M to 58 M statements as RDF; 2,201 queries with true cardinalities"
+source = "github.com/yspark-dblab/gcare and its published data and query sets"
+licence = "none stated: internal use until its authors agree"
+tiers = ["gcare-aids", "gcare-human", "gcare-lubm80", "gcare-yago"]
 state = "planned"
-check = "row counts across systems"
+kit = "benches/sparql/gcare"
+check = "the published true cardinalities; q-errors of the planner's estimates (explain=plan) against G-CARE's estimators"
+note = "The planner's estimates on the cardinality-estimation benchmark; G-CARE's estimators (characteristic sets, SumRDF, BoundSketch, WanderJoin, JSUB, ...) are the comparators"
+
+[wdbench]
+title = "WDBench: about 2,650 real queries from Wikidata's logs (BGPs, OPTIONAL, paths, C2RPQs)"
+kind = "performance"
+tasks = ["basics"]
+needs = ["load", "query"]
+scales = "Wikidata truthy 2021-06-23, direct properties: about 1.25 B statements"
+source = "github.com/MillenniumDB/WDBench; data on Figshare"
+licence = "CC0 (data); queries no licence stated"
+tiers = ["wdbench"]
+state = "planned"
+kit = "benches/sparql"
+check = "answers against the reference systems"
+note = "MillenniumDB's home turf; larger than office-pc and phuoc-yu hold for the competitors: khaleesi S: or Draco"
 
 [write-scaling]
 title = "Single-statement and batch writes at 1 M, 10 M, 100 M; writes under read load"

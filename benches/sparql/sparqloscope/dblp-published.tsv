@@ -1,0 +1,107 @@
+# Sparqloscope DBLP (ad-freiburg/sparqloscope 61ad92f, ISWC 2025): the answer every engine that answered published alike (value= one value, rows= a row count; else the distinct answers, disputed), how many published it, and their times in seconds (fail: failed or timed out at 180 s). Written by import.py.
+query	answer	agree	qlever	virtuoso	mdb	graphdb	blazegraph	jena	oxigraph
+001-join-2-small-large	value=1996	7	0.0089	0.1982	0.0078	2.6589	0.2915	0.1476	0.2059
+002-join-2-large-small	value=1996	6	0.0054	0.0053	0.0053	0.0155	0.0522	0.0173	fail
+003-join-2-large-large	value=51891252	6	0.1811	0.5361	3.6751	15.5409	53.4919	38.9394	fail
+004-join-2-largest-result	value=126720580	6	0.0048	0.9272	4.7222	21.8359	84.1374	44.6940	fail
+005-join-2-large-large-with-large-result	value=126720580	6	0.0051	0.4849	4.7508	20.5243	85.5452	44.8770	fail
+006-join-2-large-large-with-small-result	value=2143	6	0.0057	0.3490	0.0075	1.1403	4.5702	7.6209	fail
+007-join-3-star-largest-sum-of-join-sizes	disputed: value=51891005 | value=51891251 | value=51891252	0	1.1258	1.3405	12.6804	24.5779	81.2332	63.1555	fail
+008-join-3-chain-largest-sum-of-join-sizes	value=275319852	5	0.5026	1.6549	14.2245	81.5245	96.6507	fail	fail
+009-join-xlarge-star-on-small-predicates	value=0	7	0.0381	0.1869	0.0046	0.0174	0.0980	0.0113	0.2574
+010-join-xlarge-chain-on-small-predicates	value=0	7	0.4923	0.0871	0.0044	0.0134	0.0218	0.0115	0.0317
+011-optional-join-small-large	value=1996	7	0.0337	0.0052	0.0065	0.0149	0.0290	0.1122	0.2311
+012-optional-join-large-small	disputed: value=113787960 | value=113787990 | value=113788231	0	0.2312	0.6351	25.9461	83.3572	198.8681	fail	fail
+013-optional-join-large-large	disputed: value=150254678 | value=150254708 | value=150254949	0	0.3685	0.7531	26.2421	88.8802	209.4318	fail	fail
+014-optional-join-2-large-large-with-large-result	value=126720580	6	0.2490	0.5437	7.3329	32.0211	54.2200	85.2958	fail
+015-optional-join-2-large-large-with-small-join-result-1	value=3725467	6	0.7636	0.0218	1.5680	2.9898	5.7229	19.8779	fail
+016-optional-join-2-large-large-with-small-join-result-2	value=3803982	6	0.0406	0.0351	2.5218	3.0295	6.6688	19.9482	fail
+017-optional-join-3-star-1	disputed: value=51891127 | value=51891251 | value=51891252	0	0.9754	0.5553	20.3113	53.2855	80.3745	fail	fail
+018-optional-join-3-star-2	disputed: value=51891116 | value=51891251 | value=51891252	0	0.9136	0.5553	12.2353	36.2859	129.9796	163.2243	fail
+019-optional-join-3-chain-1	value=275319852	6	0.8917	2.3421	16.0328	74.9910	28.4521	124.9791	fail
+020-optional-join-3-chain-2	value=275319852	5	3.4590	2.1447	35.5691	67.7675	56.6938	fail	fail
+021-minus-join-small-large	value=0	5	0.0356	0.0062	0.0053	10.8004	0.0321	fail	fail
+022-minus-join-large-small	disputed: value=113785964 | value=113785994 | value=113786235 | value=204529732	0	0.2875	0.6339	24.7497	11.6960	fail	fail	44.4018
+023-minus-join-large-large	disputed: value=189107194 | value=98363426 | value=98363456 | value=98363697	0	0.3966	0.7152	24.6898	20.3912	fail	fail	139.0057
+024-minus-join-2-large-large-with-large-result	value=0	7	0.2385	0.4712	5.1722	5.6816	36.4213	102.3725	81.8827
+025-minus-join-2-large-large-with-small-join-result-1	value=3723324	7	0.0329	0.0307	1.5866	1.4447	8.9993	22.9753	4.8783
+026-minus-join-2-large-large-with-small-join-result-2	value=3801839	7	0.0349	0.0356	2.5366	1.7555	9.5356	22.9425	4.7363
+027-minus-join-3-star-1	value=0	4	0.9460	0.6999	19.4340	20.2096	fail	fail	fail
+028-minus-join-3-star-2	disputed: value=0 | value=111	0	0.8807	0.6463	11.1994	19.8081	149.4476	fail	fail
+029-minus-join-3-chain-1	value=0	5	0.8763	1.4967	11.5969	11.3873	fail	31.4092	fail
+030-minus-join-3-chain-2	value=0	5	3.3419	1.5052	13.9380	32.8268	164.2939	fail	fail
+031-exists-join-small-large	value=998	7	0.1944	0.0053	0.0053	0.0211	0.0404	0.0150	0.2888
+032-exists-join-large-small	value=1630	5	0.2547	0.0045	23.0269	190.2394	fail	141.4301	fail
+033-exists-join-large-large	value=15424168	5	0.5633	0.6917	23.7320	192.8402	fail	140.8239	fail
+034-exists-join-2-large-large-with-large-result	value=25945626	6	0.5020	0.4817	5.3021	43.5723	47.8764	38.1601	fail
+035-exists-join-2-large-large-with-small-join-result-1	value=2143	6	0.0380	0.0213	1.4980	6.4838	8.3691	7.6614	fail
+036-exists-join-2-large-large-with-small-join-result-2	value=2143	6	0.0400	0.0392	2.4461	6.5709	8.5262	7.4134	fail
+037-exists-join-3-star-1	disputed: value=51891005 | value=51891251 | value=51891252	0	1.8331	0.6703	19.8058	56.0098	188.5152	93.7784	fail
+038-exists-join-3-star-2	disputed: value=25945515 | value=25945626	0	1.2315	0.5769	11.4899	59.0744	141.7646	139.1180	fail
+039-exists-join-3-chain-1	value=51891252	5	4.3799	4.6837	12.0582	96.8051	fail	85.7751	fail
+040-exists-join-3-chain-2	value=25945626	6	4.5738	1.5079	14.6786	56.3731	57.3644	75.7297	fail
+041-union-no-constraint	disputed: value=139733220 | value=139733250 | value=139733491 | value=256422614	0	0.1277	1.0753	1.8597	13.5658	69.3840	12.5566	52.2823
+042-union-constraint-from-star	disputed: value=77836570 | value=77836877 | value=77836878	0	0.7130	0.4942	15.6168	49.8910	94.3685	160.0859	fail
+043-union-constraint-small-join	value=3833938	6	0.0531	0.4165	1.1275	6.1675	9.3749	22.5939	fail
+044-union-constraint-large-join	value=178610994	6	1.3235	1.1439	8.6127	60.1548	92.2906	168.5936	fail
+045-union-constraint-filter-restrictive	disputed: value=0 | value=139733250	0	0.4786	2.5723	1.7965	30.0813	66.3259	6.7383	fail
+046-multicolumn-join-small	value=1198	7	0.0074	0.0109	0.0045	0.0107	0.0432	0.0088	0.2457
+047-multicolumn-join-large	value=25788228	6	2.0115	0.7664	8.3864	14.0625	69.1162	36.5437	fail
+048-group-by-count-object-high-multiplicity	rows=10	6	0.0099	0.2270	1.8075	13.9379	0.0582	fail	43.5724
+049-group-by-count-object-low-multiplicity	rows=10	7	0.8172	29.3397	8.7314	19.0542	96.6587	139.5797	87.7874
+050-group-by-count-object-wrong-sort-order	rows=8	6	0.3300	0.3387	3.4031	6.6041	17.0529	39.6887	fail
+051-group-by-complex-aggregate	rows=8	6	0.6592	14.5279	8.8238	15.5065	18.4264	44.0411	fail
+052-group-by-implicit-numeric-baseline	value=7770097	7	0.0056	0.3949	0.1055	1.1187	3.5208	1.3595	2.1270
+053-group-by-implicit-numeric-sum	value=25945626	7	0.0475	0.1804	0.1123	1.7001	4.3610	1.5467	2.1072
+054-group-by-implicit-numeric-min	value=0	7	0.0465	0.1010	0.1183	1.4148	3.8708	1.6568	2.0607
+055-group-by-implicit-numeric-max	value=450	7	0.0456	0.0991	0.1075	1.3777	3.7439	1.4216	2.2305
+056-group-by-implicit-numeric-avg	disputed: value=3.33916 | value=3.3391637195 | value=3.33916371957776074 | value=3.33916371957776074095 | value=3.339163719577760740953427 | value=3.339163719577761	0	0.0480	0.3641	0.1115	1.7962	3.6518	1.4849	2.2031
+057-group-by-implicit-string-baseline	disputed: value=25945626 | value=51891252	0	0.0055	0.0385	0.3669	3.8287	13.6723	16.5459	10.0437
+058-group-by-implicit-string-min	disputed: rows=1 | value="Johann" Sebastian Rudolph | value='Anau Mesui	0	0.1529	0.1911	0.8029	29.1089	17.2295	16.4220	78.3191
+059-group-by-implicit-string-max	disputed: value=Mamadou Tahirou Bah 0002 | value=Þröstur Pétursson | value=þorgerður Pálsdóttir	0	0.1395	0.3609	0.7982	21.1053	15.4675	15.8006	74.9752
+060-group-by-string-groupconcat	value=368125377	5	18.0184	60.8948	24.7102	40.3639	fail	123.6503	fail
+061-distinct-count-object-high-multiplicity	disputed: value=32 | value=35 | value=45	0	0.8341	5.0851	2.4039	12.9839	fail	15.2770	43.5637
+062-distinct-count-object-low-multiplicity	disputed: value=25945626 | value=51891252	0	5.0705	19.0993	24.3425	11.5814	23.3514	85.1364	30.6108
+063-distinct-count-object-wrong-sort-order	value=8	6	0.3932	1.4755	3.6137	6.3731	22.5797	14.9438	fail
+064-transitive-path-plus	value=300322	6	0.0696	fail	0.0959	0.3158	11.8857	0.6456	1.4280
+065-transitive-path-plus-fixed-subject	value=582	6	0.0058	fail	0.0050	0.0101	0.2766	0.0102	0.2931
+066-transitive-path-large-join-and-plus	value=135729769	4	13.4744	fail	39.0467	12.4374	12.3218	fail	fail
+067-transitive-path-small-join-and-plus	value=302786	6	0.0429	fail	0.0952	0.2431	3.2633	0.5745	1.3810
+068-regex-3-contains	value=465862	7	6.1594	2.2001	1.6009	10.9671	18.6724	34.8498	70.8973
+069-regex-3-fixed	value=465862	7	6.5655	1.6355	11.0477	12.9280	19.2030	35.4498	70.2606
+070-regex-3	disputed: value=727568 | value=727657	0	6.8157	4.8602	10.9457	12.9632	19.1047	32.6810	83.0107
+071-regex-prefix-1	disputed: value=560014 | value=560854	0	0.0103	1.6487	10.1861	10.6104	17.5887	31.3199	73.9527
+072-regex-prefix-2	disputed: value=36428 | value=36592	0	0.0073	1.6320	10.6573	10.7081	16.8030	33.1195	76.5820
+073-regex-prefix-3	disputed: value=1061 | value=987	0	0.0059	1.5634	10.8902	10.7365	16.6979	33.0435	72.2793
+074-strlen	disputed: value=914706385 | value=914707130 | value=914707144	0	3.8576	1.5913	2.7479	11.1781	5.4137	33.2476	77.4091
+075-strbefore	disputed: value=68444965 | value=68444968	0	5.0290	1.5907	6.5575	12.6554	5.5353	34.1843	76.0423
+076-strafter	disputed: value=825474569 | value=825475311 | value=825475325	0	5.3926	1.7002	17.7240	12.8782	5.4773	34.4516	74.3600
+077-strstarts	value=40	7	3.8109	1.5224	1.4453	11.9081	7.5987	33.5186	71.7307
+078-strends	value=379856	7	3.7631	1.5152	1.4931	12.1215	5.4493	33.6283	77.3652
+079-result-size-tiny	rows=10	7	0.0055	0.0044	0.0046	0.0087	0.0175	0.0083	0.0232
+080-result-size-small	rows=1000	7	0.0475	0.0097	0.0037	0.0120	0.0097	0.0185	0.0336
+081-result-size-medium	disputed: rows=10000 | rows=100000	0	0.1030	0.0641	0.0296	0.1225	0.0705	0.6588	1.7803
+082-result-size-large	disputed: rows=10000 | rows=1000000	0	0.9289	0.0611	0.2630	0.8170	0.4660	6.0260	18.4856
+083-result-size-xlarge	disputed: rows=10000 | rows=10000000	0	9.2615	0.0608	2.5520	8.2815	6.0577	64.1973	80.2092
+084-numeric-baseline	value=25945626	7	0.0058	0.1756	0.1118	2.1370	4.2197	1.6827	2.2173
+085-numeric-abs	value=25945626	7	0.0948	0.0715	0.1355	2.5149	3.6170	1.6750	2.5767
+086-numeric-ceil	value=25945626	7	0.0923	0.0791	0.1361	2.5026	4.0020	1.8047	2.3106
+087-numeric-floor	value=25945626	7	0.0924	0.0806	0.1379	2.5065	3.8541	1.6493	2.1835
+088-numeric-round	value=25945626	7	0.0925	0.0826	0.1370	2.4275	3.6762	1.6650	2.4420
+089-numeric-add	value=51891252	7	0.1367	0.0422	0.1514	2.2287	3.8419	2.5413	2.2431
+090-numeric-greater	disputed: rows=1 | value=7712084	0	0.0772	0.0289	0.1006	0.8817	14.1501	2.8263	2.1483
+091-numeric-filter-bin-search-fifty-fifty	value=6607384	7	0.0285	0.0323	0.1481	1.4108	3.7846	19.4935	2.2437
+092-numeric-filter-bin-search-seventy-thirty	value=4784144	7	0.0221	0.0310	0.1373	0.9815	3.8061	14.9638	2.2409
+093-numeric-filter-bin-search-ninetyfive-five	value=468421	7	0.0085	0.0053	0.1137	0.1094	3.4327	2.7778	2.3490
+094-filter-few-results	value=0	6	0.3994	0.2948	1.4512	11.4589	81.0757	5.8681	fail
+095-filter-many-results	disputed: value=113787594 | value=113787624 | value=113787865 | value=23043826	0	0.6518	0.3313	2.2996	12.8302	87.7712	fail	fail
+096-filter-language-en	value=0	7	0.0050	7.7877	0.3781	5.9085	45.0313	14.2386	82.1254
+097-date-year	disputed: rows=1 | value=15637633984	0	0.0855	0.4565	0.1024	3.4344	14.1924	4.1117	2.4888
+098-date-month	disputed: rows=1 | value=0 | value=7766690	0	0.1037	0.0994	0.0967	4.3468	14.2599	3.3223	2.0218
+099-date-day	disputed: rows=1 | value=0 | value=7766690	0	0.1044	0.0987	0.0966	4.3469	14.3694	3.3256	2.0081
+100-number-of-triples	disputed: value=502361507 | value=502361577 | value=502364007 | value=788855835	0	0.0065	0.4017	6.8612	73.6663	fail	fail	154.0848
+101-number-of-subjects	disputed: value=57397952 | value=57397982 | value=57398246	0	0.0062	174.3851	100.4917	206.6425	fail	fail	fail
+102-number-of-predicates	disputed: value=188 | value=90 | value=91	0	0.0059	13.6827	13.5365	78.5500	fail	79.9961	160.9937
+103-number-of-objects	disputed: value=115203457 | value=115203476	0	0.0058	fail	221.1395	210.1277	fail	fail	fail
+104-number-of-literals	disputed: value=101728877 | value=146848983 | value=146850472	0	2.0707	1.2775	8.5251	75.2350	fail	fail	fail
+105-number-of-blank-nodes	value=240618326	4	3.9730	0.8202	7.6202	81.5955	fail	fail	fail

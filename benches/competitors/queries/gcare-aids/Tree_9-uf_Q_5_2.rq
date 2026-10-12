@@ -1,0 +1,12 @@
+# G-CARE aids: Tree_9/uf_Q_5_2.txt
+SELECT (COUNT(*) AS ?count) WHERE {
+  ?v1 <http://gcare/e/0> ?v0 .
+  ?v1 <http://gcare/e/0> ?v3 .
+  ?v2 <http://gcare/e/1> ?v1 .
+  ?v4 <http://gcare/e/0> ?v1 .
+  ?v4 <http://gcare/e/0> ?v9 .
+  ?v5 <http://gcare/e/0> ?v2 .
+  ?v6 <http://gcare/e/0> ?v4 .
+  ?v7 <http://gcare/e/0> ?v1 .
+  ?v8 <http://gcare/e/1> ?v5 .
+}

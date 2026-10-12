@@ -1,0 +1,9 @@
+# G-CARE aids: Tree_6/uf_Q_3_9.txt
+SELECT (COUNT(*) AS ?count) WHERE {
+  ?v3 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://gcare/l/19> .
+  ?v0 <http://gcare/e/0> ?v1 .
+  ?v2 <http://gcare/e/0> ?v0 .
+  ?v2 <http://gcare/e/0> ?v3 .
+  ?v2 <http://gcare/e/0> ?v4 .
+  ?v5 <http://gcare/e/0> ?v4 .
+}

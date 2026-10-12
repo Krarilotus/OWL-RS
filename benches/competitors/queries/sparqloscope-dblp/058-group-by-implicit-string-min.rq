@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 58: group-by-implicit-string-min
+# Implicit GROUP BY with MIN on string predicate
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (MIN(?o) AS ?min) { ?s dblp:signatureDblpName ?o. }
