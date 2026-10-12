@@ -213,6 +213,11 @@ changed_files() {
 # With a build host (scripts/lib/remote.sh), this machine only selects the changed files; the
 # host runs every step on a snapshot of this working tree. NRESE_BUILD_HOST=local builds here.
 build_host=${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}
+# A machine's guard marks it busy (low memory or disk); then a local build goes to the build host.
+if [ "$build_host" = local ] && [ -f "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}" ]; then
+  echo "this machine is busy ($(cat "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}")); building on the build host" >&2
+  build_host=$(git config --get nrese.buildHost)
+fi
 if [ -z "${NRESE_ON_BUILD_HOST:-}" ] && [ -n "$build_host" ] && [ "$build_host" != local ]; then
   list=$(mktemp)
   [ "$mode" = all ] || changed_files "$mode" > "$list"
