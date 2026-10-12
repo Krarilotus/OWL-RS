@@ -1053,6 +1053,29 @@ impl Snapshot {
             .lookup_quad_bounded(quad, self.version.dictionary_len)
     }
 
+    /// The triple term `<<( subject predicate object )>>` of these ids as of this snapshot:
+    /// one hash probe, nothing decoded. `None` if the snapshot has no such triple term (so
+    /// no statement uses it).
+    pub fn triple_term(
+        &self,
+        subject: TermId,
+        predicate: TermId,
+        object: TermId,
+    ) -> Option<TermId> {
+        self.dictionary
+            .triple_term_bounded([subject, predicate, object], self.version.dictionary_len)
+    }
+
+    /// The subject, predicate and object ids of the triple term `id`, nothing decoded.
+    /// `None` for another kind of term, one this snapshot doesn't know, and a triple term
+    /// the first RDF 1.2 version keyed by its text ([`crate::Dictionary::components`]).
+    pub fn components(&self, id: TermId) -> Option<[TermId; 3]> {
+        if id.payload() >= self.version.dictionary_len {
+            return None;
+        }
+        self.dictionary.components(id)
+    }
+
     pub fn decode(&self, id: TermId) -> Option<Term> {
         self.dictionary.decode(id)
     }

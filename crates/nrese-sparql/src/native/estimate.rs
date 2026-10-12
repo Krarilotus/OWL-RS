@@ -292,7 +292,7 @@ impl Context<'_> {
             .map(|scan| self.snapshot.estimate_in(self.model, &scan.quad_pattern()))
             .collect();
         // Cancelled: no estimate; the caller reports the cancellation.
-        let plan = self.join_order(&scans, &counts, true).ok()?;
+        let plan = self.join_order(&scans, &counts, &[], true).ok()?;
         for &i in &plan.order {
             steps.push(PlannedStep {
                 depth,

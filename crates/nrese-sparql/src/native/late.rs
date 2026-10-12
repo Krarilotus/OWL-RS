@@ -87,6 +87,9 @@ impl super::Context<'_> {
         };
         let child = self.canonical_child();
         let solutions = child.eval(pattern)?;
+        let decodes = child.decodes.load(std::sync::atomic::Ordering::Relaxed);
+        self.decodes
+            .fetch_add(decodes, std::sync::atomic::Ordering::Relaxed);
         let rows = solutions.table.len();
         let expanded = self.expand_classes(solutions, classes, limit)?;
         if self.trace.is_some() {
@@ -114,6 +117,7 @@ impl super::Context<'_> {
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
             decoded: RefCell::default(),
+            decodes: std::sync::atomic::AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: self.cancellation.clone(),
             budget: std::sync::Arc::clone(&self.budget),
