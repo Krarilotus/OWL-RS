@@ -12,6 +12,9 @@
 # time): what changes timings (toolchain, CPU governor, profiling, page-cache control).
 # compare refuses to set two runs of different configurations side by side
 # (suitekit/compare.py); a run's configuration is the one in force when it started.
+# queue: the host's measurement queue (benches/suite/queue.py): its directory, and when a
+# timed job may start: within `windows` (local time) or while the `free` file exists, never
+# while the `retreat` file exists (the owners are present) and never while a compiler runs.
 
 [assets]
 # Immutable preservation copies, SHA-256-verified on office-pc and phuoc-yu (receipts in
@@ -50,6 +53,7 @@ machine = "AMD Ryzen 9 5950X, 32 threads, 31 GiB"
 roles = ["build", "test", "measure"]
 has = ["docker", "java"]
 assets = true
+queue = { dir = "~/owlrs/queue", windows = ["21:00-06:00"], free = "~/owlrs/FREE", retreat = "~/owlrs/RETREAT" }
 
 [host.phuoc-yu]
 ssh = "Phuoc-Yu"
@@ -60,6 +64,7 @@ roles = ["measure"]
 has = []
 assets = true
 binaries = "office-pc builds; record the source revision and binary SHA-256 and check CPU features and glibc symbols before use"
+queue = { dir = "~/owlrs/queue", windows = ["00:00-24:00"] }
 
 [[host.phuoc-yu.config]]
 since = "2026-10-12T13:00"
