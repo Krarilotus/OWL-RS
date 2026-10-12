@@ -348,7 +348,7 @@ class Suite:
         if (self.data_volume and not self.args.dry_run and self.data_volume not in self.made_volumes
                 and run_quiet(["docker", "volume", "inspect", self.data_volume]).returncode != 0):
             self.made_volumes.append(self.data_volume)
-        missing = self.data_missing(plan.inputs)
+        missing = self.data_missing(plan.all_inputs())
         if not missing:
             return None
         if not (self.data_volume and plan.prepare):
@@ -357,7 +357,7 @@ class Suite:
         log = self.results / "logs" / f"prepare-{slug(plan.workload)}-{slug(plan.tier)}-{self.stamp}.log"
         rc = self.host_command(plan.prepare, log)
         self.made_files += missing
-        still = self.data_missing(plan.inputs)
+        still = self.data_missing(plan.all_inputs())
         return f"preparing the inputs failed; see {log}" if rc != 0 or still else None
 
     def sif_missing(self, system, ctx: Context) -> str | None:
@@ -384,6 +384,7 @@ class Suite:
         work.mkdir(parents=True, exist_ok=True)
         ctx = Context(self.runtime, self.root, work, logs, self.data, plan.mounts, self.args.timeout_s,
                       {**self.settings, "QUERY_TIMEOUT_S": str(self.args.query_timeout_s)}, run_id, plan.small)
+        ctx.services = tuple(plan.services)
         base = dict(date=self.date, host=self.host, runtime=self.runtime.kind, system=key, version="-",
                     publish=self.publish(key), workload=plan.workload, tier=plan.tier, regime=regime, run=run)
         self.say(f"\n{key} / {plan.workload} {plan.tier} / {regime} / run {run}")
@@ -405,7 +406,7 @@ class Suite:
                 base["version"] = system.version(ctx, endpoint)
                 self.writes(ctx, endpoint, base)
                 return
-            step = system.load(ctx, store, plan.inputs, regime)
+            step = system.load(ctx, store, plan.inputs_of(key), regime)
             m = step.measured
             status = "ok" if m.ok else ("timeout" if m.timed_out else "failed")
             self.emit(base, task="load", status=status, ms=m.ms, peak_mib=m.peak_mib if m.peak_mib is not None else "",
@@ -424,6 +425,8 @@ class Suite:
             ctx.cache = modes[0] if modes[0] != "-" else "off"
             endpoint = system.serve(ctx, store, regime)
             base["version"] = system.version(ctx, endpoint)
+            if endpoint.index_ms is not None:
+                self.emit(base, task="index", ms=endpoint.index_ms, note=endpoint.index_note)
             if system.persistent and not in_memory:
                 self.emit(base, task="restart", ms=endpoint.restart_ms if endpoint.restart_ms is not None else "")
             if self.settings.get("SKIP_COUNT") == "1":
@@ -496,7 +499,7 @@ class Suite:
         if self.answers and not plan.replay:
             for query in plan.queries.glob("*.rq"):
                 item = (plan.workload, plan.tier, base["regime"], query.name)
-                self.answers.expect(item, key, tuple(plan.inputs))
+                self.answers.expect(item, key, tuple(plan.all_inputs()))
                 self.answers.check(item, plan.answers.get(query.stem))
         command = [self.harness(), "query-mix", "--endpoint", endpoint.query, "--queries", str(plan.queries),
                    "--label", key, "--warmup", warmup, "--runs", runs,
@@ -649,7 +652,7 @@ class Suite:
             answered = regime if regime != "-" else plan.regimes[0]
             for query in plan.queries.glob("*.rq"):
                 self.answers.skip((plan.workload, plan.tier, answered, query.name), key, reason,
-                                  "unsupported" if unsupported else "incomplete", tuple(plan.inputs))
+                                  "unsupported" if unsupported else "incomplete", tuple(plan.all_inputs()))
         base = dict(date=self.date, host=self.host, runtime=self.runtime.kind, system=key, version="-",
                     publish=self.publish(key), workload=plan.workload, tier=plan.tier, regime=regime, run=0)
         self.emit(base, task="load", status="skipped", note=reason[:300])
@@ -699,7 +702,7 @@ class Suite:
                         continue
                     ctx = self.context_for_images()
                     ctx.tier_small = plan.small
-                    reason = system.supports(ctx, plan.inputs, regime)
+                    reason = system.supports(ctx, plan.inputs_of(key), regime)
                     if reason:
                         self.skip(key, plan, reason, regime)
                         continue
@@ -740,7 +743,7 @@ class Suite:
                 unavailable[id(plan)] = self.ensure_data(plan) or ""
         if self.manifest:
             self.manifest.update(datasets=self.data_sizes(
-                [i for plan, _, system, _ in chosen if system is not None for i in plan.inputs]),
+                [i for plan, key, system, _ in chosen if system is not None for i in plan.inputs_of(key)]),
                 sources=self.data_sources())
         # Per workload tier, the repetitions are interleaved across the systems: every
         # system's first run, then every system's second, each round in an order rotated by

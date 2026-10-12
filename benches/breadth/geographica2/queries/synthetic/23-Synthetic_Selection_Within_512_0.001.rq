@@ -1,0 +1,17 @@
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> 
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> 
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> 
+PREFIX strdf: <http://strdf.di.uoa.gr/ontology#> 
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+PREFIX geo: <http://www.opengis.net/ont/geosparql#> 
+PREFIX geo-sf: <http://www.opengis.net/ont/sf#> 
+PREFIX pointOfInterest: <http://geographica.di.uoa.gr/generator/pointOfInterest/>
+
+SELECT ?s1 
+WHERE {
+	?s1 pointOfInterest:hasGeometry ?s1Geo . 
+	?s1Geo pointOfInterest:asWKT ?geo1 . 
+	?s1 pointOfInterest:hasTag ?tag1 . 
+	?tag1 pointOfInterest:hasKey "512" .  
+	FILTER(geof:sfWithin(?geo1, "POLYGON ((0.0 0.0, 0.032769571270841485 0.0, 0.032769571270841485 90.0, 0.0 90.0, 0.0 0.0))"^^geo:wktLiteral)) .
+}

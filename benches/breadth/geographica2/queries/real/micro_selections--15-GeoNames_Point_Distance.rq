@@ -1,0 +1,9 @@
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+
+SELECT ?s1 
+WHERE { 
+	GRAPH <http://geographica.di.uoa.gr/dataset/geonames> {
+		?s1 <http://www.geonames.org/ontology#asWKT> ?o1
+	} 
+	FILTER(geof:distance(?o1, "POINT(23.71622 37.97945)"^^<http://www.opengis.net/ont/geosparql#wktLiteral>, <http://www.opengis.net/def/uom/OGC/1.0/metre>) <= 3000).  
+}

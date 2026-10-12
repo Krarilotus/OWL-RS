@@ -60,6 +60,9 @@ class Context:
     tier_small: bool = False
     # The result cache of a system that has one (`result_cache`): off, or on (its default).
     cache: str = "off"
+    # The services the workload needs beyond SPARQL (`geosparql`, `fulltext`): an adapter
+    # configures its own index for each, as its documentation recommends for the workload.
+    services: tuple[str, ...] = ()
 
     @property
     def dry(self) -> bool:
@@ -125,6 +128,10 @@ class Endpoint:
     ready: str | None = None  # a GET URL that answers 200 when ready (else ASK {} on query)
     server: Server | None = None
     restart_ms: float | None = None
+    # A service index built after the server started (GraphDB's GeoSPARQL plugin), apart
+    # from the restart: its time and what it was.
+    index_ms: float | None = None
+    index_note: str = ""
 
 
 # --- HTTP -----------------------------------------------------------------------------------
@@ -139,6 +146,26 @@ def post(url: str, data: dict, accept: str = "application/sparql-results+json", 
         return e.code, e.read().decode("utf-8", "replace")
     except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
         return 0, ""
+
+
+def upload(url: str, data_source: str, path: str, content_type: str, timeout: float) -> tuple[int, str]:
+    """POSTs a data file (`/data/...` under `data_source`, a host directory) as the body,
+    streamed from the host; a Docker volume isn't a host path, so it needs --data DIR."""
+    relative = path[len("/data/"):]
+    source = Path(data_source)
+    if source.is_dir():
+        with open(source / relative, "rb") as body:
+            request = urllib.request.Request(url, data=body, method="POST",
+                                             headers={"Content-Type": content_type,
+                                                      "Content-Length": str((source / relative).stat().st_size)})
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return response.status, response.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode("utf-8", "replace")
+            except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+                return 0, str(e)
+    return 0, f"{path}: uploading from a Docker volume isn't supported; run with --data DIR"
 
 
 def put(url: str, body: str, content_type: str, timeout: float = 60) -> int:
@@ -425,7 +452,7 @@ class Qlever(Adapter):
         return [ctx.setting("QLEVER_IMAGE", "adfreiburg/qlever:latest")]
 
     def load(self, ctx, store, inputs, regime):
-        fmt = "nt" if all_ntriples(inputs) else "ttl"
+        fmt = "nt" if all_ntriples(inputs) else "nq" if all(i.endswith(".nq") for i in inputs) else "ttl"
         # A dataset's documented index configuration (its Qleverfile): QLEVER_INDEX_SETTINGS,
         # the settings JSON (SETTINGS_JSON), and QLEVER_VOCABULARY_TYPE (VOCABULARY_TYPE).
         env, extra, prefix = {}, "", ""
@@ -570,11 +597,29 @@ class Jena(Adapter):
         if regime != "none":
             return self.endpoint
         port = ctx.listen(3030)
-        spec = Spec(ctx.name("serve"), self.image(ctx),
-                    # --timeout: Fuseki stops a query at the suite's limit, as the harness does, so
-                    # that a query past it doesn't run on beside the next ones.
-                    ["fuseki-server", "--update", "--tdb2", "--loc=/store/db", f"--port={port}",
-                     f"--timeout={query_limit(ctx) * 1000}", "/ds"],
+        # --timeout: Fuseki stops a query at the suite's limit, as the harness does, so that a
+        # query past it doesn't run on beside the next ones.
+        timeout = f"--timeout={query_limit(ctx) * 1000}"
+        command = ["fuseki-server", "--update", "--tdb2", "--loc=/store/db", f"--port={port}", timeout, "/ds"]
+        if "geosparql" in ctx.services:
+            # Jena's GeoSPARQL dataset over the TDB2 store, its documented defaults
+            # (inference, query rewriting, the spatial index), the index kept in the store:
+            # built at the first start, so the restart includes it.
+            (ctx.work / "fuseki.ttl").write_text("""\
+@prefix fuseki: <http://jena.apache.org/fuseki#> .
+@prefix tdb2: <http://jena.apache.org/2016/tdb#> .
+@prefix geosparql: <http://jena.apache.org/geosparql#> .
+<#service> a fuseki:Service ; fuseki:name "ds" ;
+  fuseki:endpoint [ fuseki:operation fuseki:query ; fuseki:name "query" ] ,
+                  [ fuseki:operation fuseki:update ; fuseki:name "update" ] ;
+  fuseki:dataset <#geo> .
+<#geo> a geosparql:GeosparqlDataset ;
+  geosparql:spatialIndexFile "/store/spatial.index" ;
+  geosparql:dataset <#tdb> .
+<#tdb> a tdb2:DatasetTDB2 ; tdb2:location "/store/db" .
+""", encoding="utf-8")
+            command = ["fuseki-server", "--config=/work/fuseki.ttl", f"--port={port}", timeout]
+        spec = Spec(ctx.name("serve"), self.image(ctx), command,
                     {"JVM_ARGS": f"-Xmx{ctx.heap}"}, ctx.mounts(Mount(store, "/store", readonly=False)),
                     port=port, memory=ctx.memory)
         base = ctx.runtime.url(spec)
@@ -750,8 +795,13 @@ class Rdf4j(Adapter):
         for path in inputs:
             if rc != 0:
                 break
-            status, text = post(endpoint.update, {"update": f"LOAD <file://{path}>"},
-                                timeout=ctx.timeout_s)
+            if path.endswith(".nq"):
+                # SPARQL LOAD reads into one graph; quads keep theirs through the REST API.
+                status, text = upload(endpoint.update, ctx.data.source, path, "application/n-quads",
+                                      ctx.timeout_s)
+            else:
+                status, text = post(endpoint.update, {"update": f"LOAD <file://{path}>"},
+                                    timeout=ctx.timeout_s)
             log.append(f"LOAD {path}: HTTP {status} {text[:500]}")
             rc = 0 if status in (200, 204) else 1
         ms = (time.monotonic() - started) * 1000
@@ -897,8 +947,20 @@ class Graphdb(Adapter):
                     entrypoint=True, memory=ctx.memory)
         self.record_configuration(ctx, spec, "serve")
         base = ctx.runtime.url(spec)
-        return self.start(ctx, spec, Endpoint(f"{base}/repositories/bench",
-                                              f"{base}/repositories/bench/statements"))
+        endpoint = self.start(ctx, spec, Endpoint(f"{base}/repositories/bench",
+                                                  f"{base}/repositories/bench/statements"))
+        if "geosparql" in ctx.services and not ctx.dry:
+            # 11.5 geosparql-support.html: the plugin is enabled by an update, which builds
+            # its index (the defaults: quad prefix tree, precision 11) before it returns.
+            started = time.monotonic()
+            status, text = post(endpoint.update, {"update": "INSERT DATA { [] "
+                                "<http://www.ontotext.com/plugins/geosparql#enabled> \"true\" . }"},
+                                timeout=ctx.timeout_s)
+            endpoint.index_ms = (time.monotonic() - started) * 1000
+            endpoint.index_note = f"GeoSPARQL plugin enabled (HTTP {status})"
+            if not 200 <= status < 300:
+                raise RuntimeError(f"graphdb: enabling GeoSPARQL failed: {status} {text[:200]}")
+        return endpoint
 
     def version(self, ctx, endpoint):
         if endpoint is None or ctx.dry:
