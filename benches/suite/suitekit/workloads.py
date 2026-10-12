@@ -37,6 +37,11 @@ class Plan:
     clients: list[int] = field(default_factory=list)  # the queries again from this many concurrent clients each (throughput, p99)
     duration_s: int = 20
     replay: bool = False  # the queries are a log: each run once, in name order, no warm-up
+    # A benchmark's own driver instead of the queries (BSBM's test driver): a host command run
+    # against the served endpoint in each cache mode, `{endpoint}`, `{update}`, `{out}` (a
+    # file to write), `{system}` and `{run}` substituted. It writes to {out} a JSON list of
+    # result rows (task, item, repeat, status, ms, rows, note), which the suite emits as its own.
+    external: list[str] | None = None
     # Known answers per query (its file's stem): {"value": the one value} or {"rows": n}, from
     # an independent source (a fast case's generator or a pinned check); the answer recorder's oracle.
     answers: dict[str, dict] = field(default_factory=dict)
@@ -259,6 +264,15 @@ DEFINITIONS = {
     "clients": (clients, ["-"]),
     "fast": (fast, []),
 }
+
+
+def _groups():
+    """The groups' workloads, each in a module of its own (benches/cases/README.md)."""
+    from . import sparql_plans
+    DEFINITIONS.update(sparql_plans.DEFINITIONS)
+
+
+_groups()
 
 
 def plans(root: Path, workload: str, tiers: list[str] | None, settings: dict) -> list[Plan] | None:

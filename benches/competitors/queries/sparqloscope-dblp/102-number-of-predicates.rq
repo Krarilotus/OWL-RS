@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 102: number-of-predicates
+# Total number of distinct predicates
+SELECT (COUNT(DISTINCT ?p) AS ?count) WHERE { ?s ?p ?o }

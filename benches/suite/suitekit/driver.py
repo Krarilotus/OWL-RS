@@ -29,8 +29,8 @@ from pathlib import Path
 
 from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all, post
 from . import hosts
-from .answers import Recorder
-from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime,
+from .answers import Recorder, capped_post
+from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime, RootfsRuntime,
                       run_quiet, shell)
 from .manifest import Manifest, image_ids
 from .schema import Result, Writer
@@ -63,7 +63,8 @@ def arguments(argv: list[str]) -> argparse.Namespace:
                    help="the shuffle seed; repetition r uses seed*1000+r, the same for every system")
     p.add_argument("--timeout-s", type=int, default=3600, help="per load (default 3600)")
     p.add_argument("--query-timeout-s", type=int, default=300, help="per query run (default 300)")
-    p.add_argument("--runtime", choices=["docker", "apptainer", "process"], default="docker")
+    p.add_argument("--runtime", choices=["docker", "apptainer", "rootfs", "process"], default="docker")
+    p.add_argument("--rootfs-dir", help="rootfs: the images unpacked for bubblewrap (benches/sparql/images.sh export)")
     p.add_argument("--sif-dir", help="Apptainer: the directory of the SIF images")
     p.add_argument("--data", help="the datasets: a directory, or volume:NAME with Docker (default volume:nrese-bench-data)")
     p.add_argument("--results", help="the result directory (default benches/suite/results/<date>)")
@@ -119,6 +120,25 @@ def slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", text).strip("-").lower()
 
 
+def external_rows(rows: list[dict], captured: bool) -> list[dict]:
+    """An external driver's rows as the suite's. Answers before time: its timings count only
+    after its own qualification passed (a `conformance` row `...-qualification`, ok), or with
+    the plan's qualification queries captured by the answer recorder (`captured`); otherwise
+    its query rows are `failed`, without a time."""
+    allowed = {"task", "item", "repeat", "status", "ms", "rows", "note", "peak_mib"}
+    qualified = captured or any(
+        r.get("task") == "conformance" and str(r.get("item", "")).endswith("qualification") and r.get("status") == "ok"
+        for r in rows)
+    out = []
+    for row in rows:
+        row = {k: v for k, v in row.items() if k in allowed}
+        if not qualified and row.get("task") == "query" and row.get("status") == "ok":
+            row.update(status="failed", ms="",
+                       note=("answers unqualified: no time; " + str(row.get("note", ""))).strip("; "))
+        out.append(row)
+    return out
+
+
 class Suite:
     def __init__(self, args, systems: dict, workloads: dict, root: Path):
         self.args = args
@@ -144,6 +164,10 @@ class Suite:
             if not args.sif_dir:
                 sys.exit("--runtime apptainer needs --sif-dir")
             runtime = ApptainerRuntime(self.scratch, args.port, Path(args.sif_dir).resolve())
+        elif args.runtime == "rootfs":
+            if not args.rootfs_dir:
+                sys.exit("--runtime rootfs needs --rootfs-dir")
+            runtime = RootfsRuntime(self.scratch, args.port, Path(args.rootfs_dir).resolve())
         else:
             runtime = ProcessRuntime(self.scratch, args.port)
         self.runtime = DryRuntime(runtime) if args.dry_run else runtime
@@ -337,10 +361,12 @@ class Suite:
         return f"preparing the inputs failed; see {log}" if rc != 0 or still else None
 
     def sif_missing(self, system, ctx: Context) -> str | None:
-        if self.args.runtime != "apptainer":
+        if self.args.runtime not in ("apptainer", "rootfs"):
             return None
         images = system.images(ctx) + [image for image, _ in system.builds()]
         missing = [i for i in images if not self.runtime.image_present(i)]
+        if missing and self.args.runtime == "rootfs":
+            return f"no unpacked image for {', '.join(missing)} in --rootfs-dir (benches/sparql/images.sh export)"
         if missing:
             return f"no SIF image for {', '.join(missing)} in --sif-dir (benches/cluster/build-sif.sh)"
         return None
@@ -409,7 +435,7 @@ class Suite:
                 self.emit(base, task="count", status="failed" if error else "ok",
                           ms="" if system.answers_only else ms, rows=n if n is not None else "",
                           note=error or ("the rules run at this first query" if system.lazy(regime) else ""))
-            if plan.queries:
+            if plan.queries or plan.external:
                 for i, mode in enumerate(modes):
                     if i > 0:
                         # A restart in the next mode: the cache starts empty, so each
@@ -423,7 +449,10 @@ class Suite:
                                       note="server peak over the run")
                         ctx.cache = mode
                         endpoint = system.serve(ctx, store, regime)
-                    self.queries(ctx, plan, key, system, endpoint, {**base, "cache": mode}, run)
+                    if plan.external:
+                        self.external(ctx, plan, key, endpoint, {**base, "cache": mode}, run)
+                    else:
+                        self.queries(ctx, plan, key, system, endpoint, {**base, "cache": mode}, run)
                 base["cache"] = modes[-1]
         except Exception as e:  # a system that fails mustn't stop the suite
             self.emit(base, task="load" if endpoint is None else "serve", status="failed", note=str(e)[:300])
@@ -434,6 +463,30 @@ class Suite:
             if store is not None:
                 self.runtime.remove_store(store)
             shutil.rmtree(work, ignore_errors=True)
+
+    def external(self, ctx: Context, plan, key: str, endpoint: Endpoint, base: dict, run: int):
+        """A benchmark's own driver (Plan.external) against the endpoint; its rows as ours."""
+        suffix = "" if base["cache"] == "-" else f"-cache-{base['cache']}"
+        out = ctx.logs / f"external{suffix}.json"
+        values = {"endpoint": endpoint.query, "update": endpoint.update or "", "out": str(out),
+                  "system": key, "run": str(run)}
+        command = [part.format(**values) for part in plan.external]
+        rc = self.host_command(command, ctx.logs / f"external{suffix}.txt")
+        if self.args.dry_run:
+            return
+        try:
+            rows = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            self.emit(base, task="query", item="*", status="failed", note=f"driver exit {rc}, no rows: {e}")
+            return
+        for row in external_rows(rows, plan.queries is not None):
+            self.emit(base, **row)
+        if self.answers and plan.queries and not plan.replay:
+            for query in sorted(plan.queries.glob("*.rq")):
+                item = (plan.workload, plan.tier, base["regime"], query.name)
+                self.answers.expect(item, key, tuple(plan.inputs))
+                self.answers.capture(capped_post, endpoint.query, item,
+                                     key, base["cache"], run, query, ctx.logs, self.args.query_timeout_s)
 
     def queries(self, ctx: Context, plan, key: str, system, endpoint: Endpoint, base: dict, run: int):
         suffix = "" if base["cache"] == "-" else f"-cache-{base['cache']}"
@@ -506,7 +559,7 @@ class Suite:
                           rows=q.get("rows") if q.get("rows") is not None else "", note=note)
         if self.answers and not plan.replay:
             for query in sorted(plan.queries.glob("*.rq")):
-                self.answers.capture(post, endpoint.query, (plan.workload, plan.tier, base["regime"], query.name),
+                self.answers.capture(capped_post, endpoint.query, (plan.workload, plan.tier, base["regime"], query.name),
                                      key, base["cache"], run, query, ctx.logs, self.args.query_timeout_s)
 
     def writes(self, ctx: Context, endpoint: Endpoint, base: dict):

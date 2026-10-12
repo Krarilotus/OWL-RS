@@ -46,6 +46,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import cases as cases_registry, hosts, manifest  # noqa: E402
+from suitekit.runtime import scope_argv  # noqa: E402
 from suitekit.compare import (KEPT_POINTS, bootstrap_ratio, client_throughput, compare_reports,  # noqa: E402,F401
                               counter_changes, load_report, pooled, series_ratios, spread, statistic, thin)
 from suitekit.workloads import fast_data_name  # noqa: E402
@@ -226,10 +227,8 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     unit = f"{name}-{os.getpid()}-{int(time.monotonic() * 1000)}"
     wrapper = ('g=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); "$@"; rc=$?; '
                'echo "fast-scope-peak $(cat "$g/memory.peak" 2>/dev/null)" >&2; exit $rc')
-    argv = ["systemd-run", "--user", "--scope", "-q", f"--unit={unit}", "-p", f"MemoryMax={int(cap_gb * 1024)}M",
-            # At the cap the kernel kills the command alone (exit 137, as in a container), not
-            # systemd the whole scope (SIGTERM): the wrapper then still prints the peak.
-            "-p", "MemorySwapMax=0", "-p", "OOMPolicy=continue", "--", "sh", "-c", wrapper, "sh",
+    # At the cap the kernel kills the command alone (OOMPolicy=continue): the wrapper then still prints the peak.
+    argv = [*scope_argv(unit, f"{int(cap_gb * 1024)}m"), "sh", "-c", wrapper, "sh",
             *(native(c, dirs) for c in command)]
     started = time.monotonic()
     try:

@@ -1,0 +1,73 @@
+# BSBM V3.1 at 100 M, Virtuoso's home turf (benches/sparql/README.md), on phuoc-yu under the
+# rootfs runtime (owner, 12 Oct 2026). BIBM 0.7.8's driver with the published procedure
+# (benches/sparql/bsbm/drive.py): 1, 4, 8 and 64 clients, explore then BI, each system from a
+# fresh store. Answers before time: Oxigraph qualifies first, untimed (BSBM_CLIENTS empty:
+# drive.py qualifies only); then every system's qualification answers are checked against both
+# references' (BSBM_REFERENCES: Virtuoso and Oxigraph), and only answers that agree with both
+# are timed. Virtuoso as the V3.1 report's virtuoso.ini sets it (ServerThreads 100,
+# ThreadsPerQuery 8, HTTP threads 30) with virtuoso.ini's buffers for 32 GB; NRESE with the same
+# 23 GB for queries as in the Sparqloscope job.
+# Fair share of the quiet slot (benches/suite/queue.py): one chunk per mix, repetition and
+# system (about 25 min), Virtuoso before NRESE in each; the three repetitions in two jobs
+# (phuoc-yu takes timed jobs of at most 240 min). Every chunk writes into one batch directory,
+# which `suite.py standings` and the run record pool (each chunk a repetition of its own).
+# This job: the second and third repetitions, after bsbm-100m-phuoc.toml.
+id = "sparql-bsbm-100m-phuoc-2"
+group = "sparql"
+host = "phuoc-yu"
+checkout = "suite/sparql"
+commands = [
+  ["bash", "scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--runtime", "rootfs",
+   "--rootfs-dir", "/home/krarilotus/owlrs/rootfs", "--systems", "virtuoso", "--workloads", "bsbm",
+   "--tier", "bsbm=bsbm-explore-100m", "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build",
+   "--runs", "1", "--cache", "off,on", "--timeout-s", "7200", "--query-timeout-s", "300",
+   "--answers", "full", "--answers-reference", "virtuoso,oxigraph",
+   "--results", "/home/krarilotus/owlrs/results/sparql-bsbm-100m-phuoc/explore-r2-virtuoso"],
+  ["bash", "scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--runtime", "rootfs",
+   "--rootfs-dir", "/home/krarilotus/owlrs/rootfs", "--systems", "nrese", "--workloads", "bsbm",
+   "--tier", "bsbm=bsbm-explore-100m", "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build",
+   "--runs", "1", "--cache", "off,on", "--timeout-s", "7200", "--query-timeout-s", "300",
+   "--answers", "full", "--answers-reference", "virtuoso,oxigraph",
+   "--results", "/home/krarilotus/owlrs/results/sparql-bsbm-100m-phuoc/explore-r2-nrese"],
+  ["bash", "scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--runtime", "rootfs",
+   "--rootfs-dir", "/home/krarilotus/owlrs/rootfs", "--systems", "virtuoso", "--workloads", "bsbm",
+   "--tier", "bsbm=bsbm-bi-100m", "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build",
+   "--runs", "1", "--cache", "off,on", "--timeout-s", "7200", "--query-timeout-s", "300",
+   "--answers", "full", "--answers-reference", "virtuoso,oxigraph",
+   "--results", "/home/krarilotus/owlrs/results/sparql-bsbm-100m-phuoc/bi-r2-virtuoso"],
+  ["bash", "scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--runtime", "rootfs",
+   "--rootfs-dir", "/home/krarilotus/owlrs/rootfs", "--systems", "nrese", "--workloads", "bsbm",
+   "--tier", "bsbm=bsbm-bi-100m", "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build",
+   "--runs", "1", "--cache", "off,on", "--timeout-s", "7200", "--query-timeout-s", "300",
+   "--answers", "full", "--answers-reference", "virtuoso,oxigraph",
+   "--results", "/home/krarilotus/owlrs/results/sparql-bsbm-100m-phuoc/bi-r2-nrese"],
+  ["bash", "scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--runtime", "rootfs",
+   "--rootfs-dir", "/home/krarilotus/owlrs/rootfs", "--systems", "virtuoso", "--workloads", "bsbm",
+   "--tier", "bsbm=bsbm-explore-100m", "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build",
+   "--runs", "1", "--cache", "off,on", "--timeout-s", "7200", "--query-timeout-s", "300",
+   "--answers", "full", "--answers-reference", "virtuoso,oxigraph",
+   "--results", "/home/krarilotus/owlrs/results/sparql-bsbm-100m-phuoc/explore-r3-virtuoso"],
+  ["bash", "scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--runtime", "rootfs",
+   "--rootfs-dir", "/home/krarilotus/owlrs/rootfs", "--systems", "nrese", "--workloads", "bsbm",
+   "--tier", "bsbm=bsbm-explore-100m", "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build",
+   "--runs", "1", "--cache", "off,on", "--timeout-s", "7200", "--query-timeout-s", "300",
+   "--answers", "full", "--answers-reference", "virtuoso,oxigraph",
+   "--results", "/home/krarilotus/owlrs/results/sparql-bsbm-100m-phuoc/explore-r3-nrese"],
+  ["bash", "scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--runtime", "rootfs",
+   "--rootfs-dir", "/home/krarilotus/owlrs/rootfs", "--systems", "virtuoso", "--workloads", "bsbm",
+   "--tier", "bsbm=bsbm-bi-100m", "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build",
+   "--runs", "1", "--cache", "off,on", "--timeout-s", "7200", "--query-timeout-s", "300",
+   "--answers", "full", "--answers-reference", "virtuoso,oxigraph",
+   "--results", "/home/krarilotus/owlrs/results/sparql-bsbm-100m-phuoc/bi-r3-virtuoso"],
+  ["bash", "scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--runtime", "rootfs",
+   "--rootfs-dir", "/home/krarilotus/owlrs/rootfs", "--systems", "nrese", "--workloads", "bsbm",
+   "--tier", "bsbm=bsbm-bi-100m", "--data", "/home/krarilotus/owlrs/sparql-data", "--skip-build",
+   "--runs", "1", "--cache", "off,on", "--timeout-s", "7200", "--query-timeout-s", "300",
+   "--answers", "full", "--answers-reference", "virtuoso,oxigraph",
+   "--results", "/home/krarilotus/owlrs/results/sparql-bsbm-100m-phuoc/bi-r3-nrese"],
+]
+env = { PATH = "/home/krarilotus/owlrs/tools/jre21/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", NRESE_QUIET_DRAIN_S = "3600", SPARQL_DATA = "/home/krarilotus/owlrs/sparql-data", BSBM_REFERENCES = "virtuoso,oxigraph", NRESE_BIN = "/home/krarilotus/owlrs/sparql-bin/1b611e7/nrese-server", HARNESS = "/home/krarilotus/owlrs/sparql-bin/1b611e7/nrese-bench-harness", NRESE_BENCH_SCRATCH = "/home/krarilotus/owlrs/sparql-scratch", DOCKER_MEMORY = "26g", QUERY_MEMORY_MIB = "23552", TOTAL_QUERY_MEMORY_MIB = "23552", VIRTUOSO_NUMBER_OF_BUFFERS = "2720000", VIRTUOSO_MAX_DIRTY_BUFFERS = "2000000", VIRTUOSO_SERVER_THREADS = "100", VIRTUOSO_THREADS_PER_QUERY = "8", VIRTUOSO_HTTP_THREADS = "30" }
+needs = []
+window = "quiet"
+priority = 2
+est_min = 200

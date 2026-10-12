@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 65: transitive-path-plus-fixed-subject
+# Transitive path with plus and a fixed subject
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (COUNT(*) AS ?count) { <https://dblp.org/streams/conf/damp> dblp:relatedStream+ ?o }

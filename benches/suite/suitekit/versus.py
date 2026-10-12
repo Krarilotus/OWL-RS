@@ -2,7 +2,9 @@
 first, then time over what both answered right, then load and memory by kind. The run
 records carry these entries (`versus`), and `suite.py standings` sets them side by side.
 
-    versus(directory)   the entries of one suite run (results.csv, answers.json beside it)
+    versus(directory)   the entries of one suite run (results.csv, answers.json beside it), or
+                        of a batch: the runs in it pooled (a queue job's chunks, one
+                        system or repetition each), each run's repetitions its own
 
 An entry, per case (or workload tier) and comparator:
 
@@ -40,17 +42,21 @@ def number(text) -> float | None:
 
 def answer_verdicts(directory: Path) -> dict[tuple, str]:
     """(tier, query file stem, system) -> the answer verdict, from answers.json; `unchecked`
-    where no reference answered (the answer may be right; nothing showed it)."""
-    path = directory / "answers.json"
-    if not path.exists():
+    where no reference answered (the answer may be right; nothing showed it). A batch's
+    captures are classified together: the references may have answered in another run."""
+    from .ledger import run_directories
+    paths = [d / "answers.json" for d in run_directories(directory) if (d / "answers.json").exists()]
+    if not paths:
         return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    found = data.get("verdicts")
-    if found is None:
+    from .answers import Recorder
+    from .summary import adjudications
+    data = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+    if len(paths) > 1 and all("captures" in d for d in data):
+        found = Recorder.load(paths, None, adjudications()).verdicts()
+    else:
         # Captures without their classification: classify them (answers.py).
-        from .answers import Recorder
-        from .summary import adjudications
-        found = Recorder.load([path], None, adjudications()).verdicts()
+        found = [v for d, path in zip(data, paths)
+                 for v in (d["verdicts"] if "verdicts" in d else Recorder.load([path], None, adjudications()).verdicts())]
     return {(v["tier"], Path(v["query"]).stem, v["system"]):
             "unchecked" if v["verdict"] == "incomplete" and v.get("note", "").startswith("no reference")
             else v["verdict"] for v in found}
@@ -104,7 +110,10 @@ def judge(nrese: dict, other: dict, timed: list[str]) -> tuple[str, dict]:
 
 def versus(directory: Path, home_turfs: dict[str, str] | None = None) -> list[dict]:
     """The entries of one suite run: each comparator against NRESE on each tier they share."""
-    rows = read(directory / "results.csv") if (directory / "results.csv").exists() else []
+    from .ledger import run_directories
+    runs = run_directories(directory) if directory.is_dir() else []
+    # Runs of a batch number their repetitions alike: each keeps its own.
+    rows = [r | {"run": f"{run.name}:{r['run']}"} if len(runs) > 1 else r for run in runs for r in read(run / "results.csv")]
     verdicts = answer_verdicts(directory)
     by: dict[tuple, list[dict]] = defaultdict(list)
     for r in rows:

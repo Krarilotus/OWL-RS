@@ -1,0 +1,23 @@
+# SP2Bench's published result sizes (Schmidt, Hornung, Lausen, Pinkel: SP2Bench, ICDE 2009;
+# arXiv:0806.4627v2, Table V) for documents of the v1.01 generator: rows=N for a SELECT,
+# value=true/false for an ASK. Q12a and Q12b are the ASK forms of Q5a and Q8, true where
+# those have results; Q12c asks for a person no document contains. `-` where the paper has
+# none (Q4 at 25M).
+query	1m	25m
+q1	rows=1	rows=1
+q2	rows=32770	rows=1876999
+q3a	rows=52676	rows=594890
+q3b	rows=379	rows=4075
+q3c	rows=0	rows=0
+q4	rows=2586733	-
+q5a	rows=35241	rows=696681
+q5b	rows=35241	rows=696681
+q6	rows=62795	rows=1945167
+q7	rows=292	rows=5099
+q8	rows=400	rows=493
+q9	rows=4	rows=4
+q10	rows=572	rows=656
+q11	rows=10	rows=10
+q12a	value=true	value=true
+q12b	value=true	value=true
+q12c	value=false	value=false

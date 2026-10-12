@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 62: distinct-count-object-low-multiplicity
+# COUNT DISTINCT, for object with low multiplicity
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (COUNT(DISTINCT ?object) AS ?count) { ?subject dblp:hasSignature ?object . }
