@@ -154,23 +154,30 @@ pub(super) fn plan_for_equalities<B: Base + ?Sized>(
     policy: Policy,
     counts: &mut Counts,
 ) -> Decision {
+    let mut equalities = equalities.peekable();
+    if equalities.peek().is_none() {
+        return Decision::Keep;
+    }
+    counts.rebuild_estimate = policy.rebuild.unwrap_or(0);
+    let may_rebuild = matches!(policy.force, None | Some(Plan::Rebuild));
+    if may_rebuild && policy.split_rebuilds && policy.rebuild.is_some() {
+        // Any delta plan ends in the rebuild: no estimate (over the expanded view, the
+        // class's walk was 52 of a 500-member split's 115 ms).
+        return Decision::Rebuild;
+    }
     let Some((terms, facts, dred)) = equality_region(base, same_as, equalities) else {
         return Decision::Keep;
     };
     let recompute = RECOMPUTE_PER_FACT * facts;
     counts.dred_estimate += dred;
     counts.recompute_estimate += recompute;
-    counts.rebuild_estimate = policy.rebuild.unwrap_or(0);
     match policy.force {
         Some(Plan::Dred) => Decision::Keep,
         Some(Plan::Recompute) => Decision::Recompute(terms),
         None | Some(Plan::Rebuild) => {
             // The update's regions so far, this one included, against one rebuild.
             let cheapest = counts.dred_estimate.min(counts.recompute_estimate);
-            let rebuilds = policy
-                .rebuild
-                .is_some_and(|rebuild| policy.split_rebuilds || rebuild < cheapest);
-            if rebuilds {
+            if policy.rebuild.is_some_and(|rebuild| rebuild < cheapest) {
                 Decision::Rebuild
             } else if dred > recompute {
                 Decision::Recompute(terms)
