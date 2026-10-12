@@ -285,7 +285,7 @@ pub fn parse_and_plan(
     for _ in 0..runs {
         let at = Instant::now();
         let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(text))?;
-        let plan = store.plan_query(&prepared)?;
+        let plan = store.plan_query(&prepared, &CancellationToken::new())?;
         times.push(at.elapsed());
         steps = plan.steps.len();
         rewrites = plan.rewrites.len();

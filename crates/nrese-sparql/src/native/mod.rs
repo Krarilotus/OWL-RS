@@ -295,6 +295,9 @@ pub(crate) fn plan(
     let (pattern, _, rewrites, ql) = native_pattern(query, options, &ctx)?;
     let mut steps = Vec::new();
     ctx.estimate_plan(&crate::plan::Plan::of(&pattern), 0, &mut steps);
+    // The orderer stops when the query is cancelled, leaving estimates out: a plan cut short
+    // is the cancellation, not an answer.
+    options.resources.check()?;
     Ok((rewrites, steps, ql))
 }
 
@@ -2464,7 +2467,7 @@ impl<'a> Context<'a> {
                 }
             })
             .collect();
-        let plan = self.join_order(&scans, &planned, self.trace.is_some());
+        let plan = self.join_order(&scans, &planned, self.trace.is_some())?;
         let estimate = |step: usize| Some(plan.rows[step].max(0.0).round() as u64);
         let order = &plan.order;
         // Each prefix of the order is a part of the result cache ([`cached::Joins`]): the
@@ -2476,6 +2479,7 @@ impl<'a> Context<'a> {
             ranged: &ranged,
             order,
             filters: &given,
+            keys: Default::default(),
         };
         let reused = self.cached_prefix(&joins, filters, limit.is_some())?;
         let first = order[0];
@@ -2884,19 +2888,25 @@ impl<'a> Context<'a> {
     /// The order in which to join a BGP's patterns ([`plan`]; `counts` are exact). Two
     /// patterns start with the smaller one; larger BGPs are planned with distinct counts.
     /// The rows after each step are estimated where `estimated` asks (or the order
-    /// depends on them): a two-pattern BGP run without EXPLAIN skips its model.
-    fn join_order(&self, scans: &[ScanPattern], counts: &[u64], estimated: bool) -> plan::Plan {
+    /// depends on them): a two-pattern BGP run without EXPLAIN skips its model. Planning
+    /// observes the query's cancellation as evaluating does ([`Self::order_inputs`]).
+    fn join_order(
+        &self,
+        scans: &[ScanPattern],
+        counts: &[u64],
+        estimated: bool,
+    ) -> NativeResult<plan::Plan> {
         if scans.is_empty() {
-            return plan::Plan {
+            return Ok(plan::Plan {
                 order: Vec::new(),
                 rows: Vec::new(),
-            };
+            });
         }
         let mut order: Vec<usize> = (0..scans.len()).collect();
         order.sort_by_key(|&i| counts[i]);
         if scans.len() <= 2 && !estimated {
             let rows = vec![f64::NAN; order.len()];
-            return plan::Plan { order, rows };
+            return Ok(plan::Plan { order, rows });
         }
         let mut vars: Vec<Variable> = Vec::new();
         let inputs = self.plan_inputs(scans, counts, &mut vars);
@@ -2909,20 +2919,28 @@ impl<'a> Context<'a> {
                 .any(|i| i.star.is_some())
                 .then(|| self.snapshot.characteristic_sets_in(self.model))
                 .flatten();
-            return plan::along(&inputs, vars.len(), PROBE_FACTOR, sets.as_deref(), &order);
+            let plan = plan::along(&inputs, vars.len(), PROBE_FACTOR, sets.as_deref(), &order);
+            return Ok(plan);
         }
         self.order_inputs(&inputs, vars.len())
     }
 
     /// The join orderer's order of `inputs` over `variables` variables, with the
-    /// characteristic sets where an input is part of a star.
-    fn order_inputs(&self, inputs: &[plan::Input], variables: usize) -> plan::Plan {
+    /// characteristic sets where an input is part of a star. Cancelled with the query: the
+    /// orderer asks at every step, so a large pattern's planning ends at the deadline.
+    fn order_inputs(&self, inputs: &[plan::Input], variables: usize) -> NativeResult<plan::Plan> {
         let sets = inputs
             .iter()
             .any(|i| i.star.is_some())
             .then(|| self.snapshot.characteristic_sets_in(self.model))
             .flatten();
-        plan::order(inputs, variables, PROBE_FACTOR, sets.as_deref())
+        let cancelled = || {
+            self.cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        };
+        plan::order(inputs, variables, PROBE_FACTOR, sets.as_deref(), &cancelled)
+            .ok_or_else(|| QueryEvaluationError::Cancelled.into())
     }
 
     /// The join orderer's inputs for `scans` with their `counts`: distinct values per
@@ -2991,6 +3009,15 @@ impl<'a> Context<'a> {
             .collect();
         let mut lists: Vec<Option<Vec<u64>>> = vec![None; scans.len()];
         for i in 0..scans.len() {
+            // Pairs of patterns: cancelled, the rest is left out, and the orderer that
+            // reads them reports the cancellation.
+            if self
+                .cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+            {
+                break;
+            }
             for j in i + 1..scans.len() {
                 let (Some((a, _)), Some((b, _))) = (&single[i], &single[j]) else {
                     continue;

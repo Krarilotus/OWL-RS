@@ -13,6 +13,8 @@
 //! what a part computes, given the context in which it is evaluated, which the key
 //! includes too ([`super::Context::cache_key`]).
 
+use std::collections::HashMap;
+
 use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, Expression, Function, GraphPattern, OrderExpression,
@@ -26,6 +28,8 @@ pub(super) struct Encoder {
     /// The part's variables in the order they first occur: a variable's number is its
     /// position.
     pub(super) vars: Vec<Variable>,
+    /// Each variable's number: a lookup, so that a key is linear in its part.
+    numbers: HashMap<Variable, usize>,
 }
 
 /// Why a part has no key.
@@ -49,10 +53,11 @@ impl Encoder {
 
     /// A variable by its number.
     pub(super) fn var(&mut self, variable: &Variable) {
-        let number = match self.vars.iter().position(|v| v == variable) {
-            Some(number) => number,
+        let number = match self.numbers.get(variable) {
+            Some(&number) => number,
             None => {
                 self.vars.push(variable.clone());
+                self.numbers.insert(variable.clone(), self.vars.len() - 1);
                 self.vars.len() - 1
             }
         };
