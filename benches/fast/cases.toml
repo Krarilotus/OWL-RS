@@ -21,6 +21,9 @@
 # outcome    what the run is expected to end as: ok (default) or a known product issue
 #            (`memory-limit`, `gave-up`, `wrong`, `unsupported`), named in `known`: the run's
 #            verdict still says it (fast.py verdict()), but it fails no gate
+# page_cache the page cache each fresh process meets: ["warm"] (default), or ["warm", "cold"]
+#            alternating, emptied before each cold one by the host's cold_cache command
+#            (hosts.toml config); a host without one runs warm only and says so
 # frontier   for a case expected to stop at its limit: the settings to run it with once more
 #            (`cap_gb`, `timeout_s`), so that its record says what it needs
 # systems    the comparators, `system:semantics`, each run only where it supports that
@@ -595,6 +598,7 @@ setup = ["--store", "{scratch}/store", "--load", "{data}"]
 args = ["--store", "{scratch}/store", "--warmup", "0", "--runs", "1"]
 queries = "lookups"
 repeat = 20
+page_cache = ["warm", "cold"]
 metric = "cold_ms"
 check = { "q.name.rows" = 1 }
 route = {}
@@ -1260,6 +1264,7 @@ setup = ["--store", "{scratch}/store", "--load", "{data}"]
 args = ["--store", "{scratch}/store", "--warmup", "0", "--runs", "3"]
 queries = "@dbpedia-core"
 repeat = 3
+page_cache = ["warm", "cold"]
 metric = "cold_ms"
 check = {}
 route = {}

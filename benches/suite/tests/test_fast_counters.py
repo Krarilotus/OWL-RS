@@ -323,5 +323,26 @@ class FastNative(unittest.TestCase):
         self.assertIsNone(fast.scope_peak_mib("Killed\n"))
 
 
+class FastPageCache(unittest.TestCase):
+    def test_warm_and_cold_are_series_of_their_own_and_the_metric_sums_their_medians(self):
+        runs = [{"open_s": 0.010, "queries": [{"first_ms": 1.0}], "_page_cache": mode}
+                for mode in ("warm", "cold", "warm", "cold", "warm", "cold")]
+        for run, extra in zip(runs, (0, 30, 0, 50, 0, 40)):
+            run["queries"][0]["first_ms"] += extra
+        result = {**runs[-1], "_repeats": runs}
+        self.assertEqual(fast.cold_series(result), {"warm": [11.0] * 3, "cold": [41.0, 61.0, 51.0]})
+        self.assertEqual(fast.metric_value({"metric": "cold_ms"}, result), 11.0 + 51.0)
+        one = {**runs[0], "_repeats": [runs[0], runs[2]]}
+        self.assertEqual(fast.samples({"metric": "cold_ms"}, one), {"_": [11.0, 11.0]})
+
+    def test_a_host_without_a_cold_cache_command_runs_warm_and_says_so(self):
+        with patch.object(fast, "cold_cache_command", lambda: None):
+            modes, why = fast.page_cache_modes({"page_cache": ["warm", "cold"]})
+        self.assertEqual(modes, ["warm"])
+        self.assertIn("cold_cache", why)
+        with patch.object(fast, "cold_cache_command", lambda: "true"):
+            self.assertEqual(fast.page_cache_modes({"page_cache": ["warm", "cold"]}), (["warm", "cold"], ""))
+
+
 if __name__ == "__main__":
     unittest.main()

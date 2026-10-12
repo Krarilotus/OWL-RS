@@ -599,8 +599,15 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         err = ""
         wall = 0.0
         sweep = case.get("sweep", [[]])
-        runs = [(entry, i) for entry in sweep for i in range(repeat)]
-        for index, (entry, _) in enumerate(runs):
+        modes, why = page_cache_modes(case)
+        if why:
+            record["notes"].append(why)
+        record["page_cache"] = modes
+        # Warm and cold alternate, so that drift over the case touches both alike.
+        runs = [(entry, mode) for entry in sweep for _ in range(repeat) for mode in modes]
+        for index, (entry, mode) in enumerate(runs):
+            if mode == "cold" and index > 0 and not drop_page_cache(record):
+                break
             # The setup (a store on disk) runs once; each repeat is a fresh process opening it.
             shell = (script if index == 0 else "") + " ".join(f"'{c}'" for c in [*command, *entry])
             code, _, err, w = container(name, case["cap_gb"], ["bash", "-c", shell], case.get("env"))
@@ -611,6 +618,7 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
             result = json.loads(path.read_text(encoding="utf-8"))
             path.unlink()
             result["_sweep"] = " ".join(entry)
+            result["_page_cache"] = mode
             samples_runs.append(result)
             if code != 0:
                 break
@@ -849,6 +857,47 @@ def route(path: str, want: str, result: dict) -> dict:
     return {"path": path, "expected": want, "got": got, "ok": compare_op(got, want)}
 
 
+def cold_series(result: dict) -> dict[str, list[float]]:
+    """cold_ms of each fresh process, by the page cache it met: `_` when the case ran in one
+    mode, else `warm` and `cold`."""
+    runs = result.get("_repeats", [result])
+    modes = {r.get("_page_cache", "warm") for r in runs}
+    out: dict[str, list[float]] = {}
+    for r in runs:
+        value = cold_ms(r)
+        if value is not None:
+            out.setdefault("_" if len(modes) == 1 else r.get("_page_cache", "warm"), []).append(value)
+    return out
+
+
+def page_cache_modes(case: dict) -> tuple[list[str], str]:
+    """The page-cache modes a case runs in here (`page_cache`, default warm only), and why a
+    declared one is left out: emptying the cache needs the host's command (hosts.toml
+    config `cold_cache`)."""
+    wanted = case.get("page_cache", ["warm"])
+    if "cold" in wanted and not cold_cache_command():
+        why = "page cache: warm only (this host's configuration names no cold_cache command, hosts.toml)"
+        return [m for m in wanted if m != "cold"] or ["warm"], why
+    return wanted, ""
+
+
+@functools.cache
+def cold_cache_command() -> str | None:
+    found = hosts.current()
+    config = hosts.configuration(found[0]) if found else None
+    return (config or {}).get("cold_cache")
+
+
+def drop_page_cache(record: dict) -> bool:
+    """Empties the page cache (the host's cold_cache command); a failure ends the case's
+    runs as a harness failure."""
+    done = subprocess.run(["sh", "-c", cold_cache_command()], capture_output=True, text=True)
+    if done.returncode != 0:
+        record["status"] = "failed"
+        record["notes"].append(f"missing input: the cold-cache command failed: {(done.stderr or '').strip()[:200]}")
+    return done.returncode == 0
+
+
 def cold_ms(result: dict) -> float | None:
     """Opening the store and the first execution of each query, in ms."""
     if "open_s" not in result:
@@ -859,9 +908,12 @@ def cold_ms(result: dict) -> float | None:
 
 def metric_value(case: dict, result: dict):
     if case["metric"] == "cold_ms":
-        values = [cold_ms(r) for r in result.get("_repeats", [result])]
-        values = [v for v in values if v is not None]
-        return statistics.median(values) if values else None
+        # With the page cache warm and emptied: the sum of the two modes' medians.
+        total = None
+        for values in cold_series(result).values():
+            if values:
+                total = (total or 0.0) + statistics.median(values)
+        return total
     value = lookup(case["metric"], result)
     if case["metric"] in ("load_s", "open_s") and value is not None:
         value = value * 1000.0
@@ -888,7 +940,7 @@ def samples(case: dict, result: dict) -> dict:
     if result.get("phase_samples") and any(result["phase_samples"].values()):
         return {k: v for k, v in result["phase_samples"].items() if v}
     if metric == "cold_ms":
-        return {"_": [v for v in (cold_ms(r) for r in result.get("_repeats", [result])) if v is not None]}
+        return cold_series(result)
     if metric == "sum_p50_ms":
         return {q["name"]: q["samples_ms"] for q in result.get("queries", []) if "samples_ms" in q}
     section = metric.split(".")[0]
