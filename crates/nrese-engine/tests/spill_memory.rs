@@ -9,7 +9,13 @@ use nrese_rdf::{GraphName, NamedNode, Quad};
 static ALLOCATOR: heap::Counting<std::alloc::System> = heap::Counting(std::alloc::System);
 
 /// A full chunk goes to the spilling thread as its batches, each freed once written, while
-/// the next chunk fills.
+/// the next chunk fills. Two properties, apart:
+/// - **Written without a copy:** the spilling thread holds no more than its I/O buffer
+///   beyond the chunk it was handed while it writes one, counted for that thread alone
+///   ([`heap::Step`]), so however far it falls behind the loader.
+/// - **Within the budget:** the load holds at most `bulk_load_memory`. A chunk filling, one
+///   being written and, where the spilling thread falls behind, the next waiting for it;
+///   the budget allows a third chunk (its sorted copy, at the end).
 #[test]
 fn a_spilled_chunk_is_written_without_a_copy() {
     const CHUNK: usize = 4 << 20;
@@ -42,8 +48,31 @@ fn a_spilled_chunk_is_written_without_a_copy() {
         load.add(&batch);
     }
     let peak = heap::peak() - before;
-    let _ = heap::finish();
     load.finish().unwrap();
-    // 5,953,497 bytes on 11 Oct 2026; copying the chunk being written made it 9,099,197.
-    assert!(peak < CHUNK * 7 / 4, "{peak} bytes live");
+    let written = heap::steps();
+    let _ = heap::finish();
+    let written: Vec<usize> = written
+        .iter()
+        .filter(|step| step.label == "spill: a chunk written")
+        .map(|step| step.peak)
+        .collect();
+    assert!(
+        written.len() >= 3,
+        "{written:?}: the chunks weren't spilled"
+    );
+    // 1,048,692 bytes each on 13 Oct 2026 (the 1 MiB I/O buffer), also with the spilling
+    // thread held back 400 ms a chunk; concatenating the chunk to write it, 5,243,020,
+    // while the load's peak stayed within its budget (10,945,526).
+    for &held in &written {
+        assert!(
+            held < CHUNK / 2,
+            "a chunk written with {held} bytes held: {written:?}"
+        );
+    }
+    // 5,953,886 bytes on 13 Oct 2026 with the spilling thread keeping up; 9,452,478 held
+    // back 400 ms a chunk (9,452,410 under three builds' load on 12 Oct).
+    assert!(
+        peak < 3 * CHUNK,
+        "{peak} bytes live, past the load's budget"
+    );
 }
