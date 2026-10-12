@@ -813,13 +813,27 @@ their duration.
 - *The tableau* checks the capacity it owns; a batch divides the allowance among the
   probes actually running.
 
+**The request's envelope.** Within a request (a query's exact services and its
+consistency check, a commit's gate, an entailment check, an explanation) both engines
+also reserve what they observe from the request's one memory envelope
+([execution-core.md](execution-core.md#execution-and-resource-lifetime)): context
+saturation through its observer (`context::Budget::memory`), the tableau at its memory
+checks (`tableau::Config::memory`), shared by a batch's probes, a portfolio's variants and
+the islands. Compiling reserves its scratch there too ([`nrese_dl::memory`](../../crates/nrese-dl/src/memory.rs)):
+a premise's copy before it is made, the normalised clauses, the compiled program and the
+island batches as each exists, estimated by capacity (within 0.1 % of the allocator on the
+guard's ABox, `tests/scratch_memory.rs`). Where the envelope has no room the run stops as
+past `dl.memory`, its candidates unresolved because "the request's memory envelope ran
+out"; a verdict so limited isn't recorded for the revision. `dl.memory` bounds each run
+inside the envelope. Classification and realisation, cached per revision and shared by
+the lower bound, aren't a request's: they keep `dl.memory` and the process limit.
+
 Exhaustion yields an incomplete outcome, never a classification inferred from truncated
 work. Retained classification buffers are charged; result and proof assembly,
-normalisation and compilation temporaries, input snapshots, short-lived recursive
-temporaries, allocator metadata and stacks are not. DL task capacity is separate from the
-native query budget, so one request has no shared end-to-end envelope. `0` disables the
-checks; the standalone context API defaults to none. The profile's `task_memory_peak` is
-the highest sampled estimate (zero when disabled), neither RSS nor an exact peak.
+short-lived recursive temporaries, the tableau's checkpoints, allocator metadata and
+stacks are not. `0` disables the `dl.memory` checks; the standalone context API defaults to
+none. The profile's `task_memory_peak` is the highest sampled estimate (zero when nothing
+is observed), neither RSS nor an exact peak.
 
 `Budget::max_memory` in the context core measures the **whole process** and is a separate
 opt-in guard; who installs the process limit and which watches reach DL work is in

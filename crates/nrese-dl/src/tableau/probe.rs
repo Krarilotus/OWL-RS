@@ -161,6 +161,13 @@ impl Prepared {
         self.features
     }
 
+    /// What the compiled program and its maps hold (an estimate: [`crate::memory`]).
+    pub fn bytes(&self) -> usize {
+        self.program.bytes()
+            + (self.class_of.capacity() + self.individual_of.capacity()) * size_of::<u32>()
+            + self.concept_of.capacity() * size_of::<ConceptId>()
+    }
+
     /// What was left out of the program (an empty list: nothing).
     pub fn weakened(&self) -> &[String] {
         &self.program.weakened

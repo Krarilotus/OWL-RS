@@ -124,7 +124,9 @@ impl MutationCommand {
 
 /// What updates are evaluated with besides their transaction and requester.
 pub(crate) struct UpdateContext<'a> {
-    pub runtime: &'a crate::Runtime,
+    /// The request's memory envelope within the catalog's budget: the `WHERE` clauses
+    /// draw from it, as the request's DL gate does.
+    pub memory: nrese_exec::Envelope,
     /// Stops a long-running `WHERE` clause.
     pub cancellation: &'a CancellationToken,
     pub union_default_graph: bool,
@@ -167,7 +169,7 @@ pub(crate) fn apply_sparql_update(
         )?,
         resources: nrese_sparql::Resources {
             cancellation: Some(context.cancellation.clone()),
-            shared_memory: context.runtime.query_memory(),
+            memory: context.memory.clone(),
             ..Default::default()
         },
         union_default_graph: context.union_default_graph,

@@ -212,6 +212,7 @@ impl Deadline {
                 .or_else(|| nrese_exec::memory::available_bytes().map(|b| b / 4 * 3))
                 .filter(|&bytes| bytes != 0),
             task_memory: options.task_memory,
+            memory: options.tableau.memory.clone(),
         }
     }
 
