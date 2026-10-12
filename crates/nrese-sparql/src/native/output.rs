@@ -15,8 +15,6 @@
 use std::collections::HashMap;
 use std::io::Write;
 
-use rayon::prelude::*;
-
 use nrese_engine::{Snapshot, TermId, TermView};
 use nrese_exec::{IdTable, UNDEF, computed_index};
 use nrese_rdf::{BlankNodeRef, LiteralRef, NamedNodeRef, Term, TermRef, Variable};
@@ -205,14 +203,15 @@ impl DirectResults<'_> {
         });
     }
 
-    /// Writes the result document; `alive` is polled every few thousand rows (it fails
-    /// the write when the query is cancelled).
+    /// Writes the result document; `alive` is checked before each write and each window
+    /// of blocks (it fails the write when the query is cancelled).
     pub fn write(
         &self,
         vars: &[Variable],
         table: &IdTable,
         out: &mut dyn Write,
         alive: &dyn Fn() -> std::io::Result<()>,
+        workers: &nrese_exec::workers::Workers,
     ) -> std::io::Result<()> {
         let mut buffer: Vec<u8> = Vec::with_capacity(CHUNK + 4096);
         let json = self.format == ResultsFormat::Json;
@@ -270,17 +269,14 @@ impl DirectResults<'_> {
         } else {
             // A window of blocks serialised in parallel, then written in order. A
             // cancelled query stops within one chunk of output (and one window of work).
-            let window = rayon::current_num_threads() * BLOCKS_PER_THREAD;
+            let window = workers.width() * BLOCKS_PER_THREAD;
             for start in (0..blocks).step_by(window) {
                 alive()?;
-                let parts: Vec<Vec<u8>> = (start..(start + window).min(blocks))
-                    .into_par_iter()
-                    .map(|b| {
-                        let mut part = Vec::with_capacity(CHUNK);
-                        self.rows(table, block(b), &keys, &mut part);
-                        part
-                    })
-                    .collect();
+                let parts = workers.map_range(start..(start + window).min(blocks), |b| {
+                    let mut part = Vec::with_capacity(CHUNK);
+                    self.rows(table, block(b), &keys, &mut part);
+                    part
+                });
                 for part in parts {
                     let mut rest = part.as_slice();
                     while !rest.is_empty() {
@@ -288,9 +284,9 @@ impl DirectResults<'_> {
                         buffer.extend_from_slice(now);
                         rest = later;
                         if buffer.len() >= CHUNK {
+                            alive()?;
                             out.write_all(&buffer)?;
                             buffer.clear();
-                            alive()?;
                         }
                     }
                 }
@@ -299,6 +295,7 @@ impl DirectResults<'_> {
         if json {
             buffer.extend_from_slice(b"]}}");
         }
+        alive()?;
         out.write_all(&buffer)
     }
 }
@@ -320,7 +317,103 @@ pub(super) fn boolean(value: bool, version: Option<&str>) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::escaped;
+    use super::*;
+    use crate::CancellationToken;
+
+    #[test]
+    fn cancelled_completed_tables_write_no_bytes_even_when_empty_or_small() {
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let snapshot = engine.snapshot();
+        for rows in [0, 1, BLOCK_ROWS] {
+            let table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows));
+            for format in [ResultsFormat::Json, ResultsFormat::Tsv, ResultsFormat::Csv] {
+                let token = CancellationToken::new();
+                token.cancel();
+                let alive = || {
+                    if token.is_cancelled() {
+                        Err(std::io::Error::other("cancelled"))
+                    } else {
+                        Ok(())
+                    }
+                };
+                let mut bytes = Vec::new();
+                assert!(
+                    DirectResults {
+                        snapshot: &snapshot,
+                        computed: &[],
+                        format,
+                        version: None,
+                    }
+                    .write(&[], &table, &mut bytes, &alive, &Default::default())
+                    .is_err()
+                );
+                assert!(bytes.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn an_answer_cancelled_during_its_final_write_is_written() {
+        struct CancelOnWrite {
+            token: CancellationToken,
+            writes: usize,
+            bytes: usize,
+        }
+        impl Write for CancelOnWrite {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                self.bytes += bytes.len();
+                self.token.cancel();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let snapshot = engine.snapshot();
+        let workers = nrese_exec::workers::Workers::current();
+        // Two row blocks, but their zero-column JSON rows fit in the final byte buffer.
+        let table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], BLOCK_ROWS + 1));
+        let token = CancellationToken::new();
+        let mut writer = CancelOnWrite {
+            token: token.clone(),
+            writes: 0,
+            bytes: 0,
+        };
+        let output = DirectResults {
+            snapshot: &snapshot,
+            computed: &[],
+            format: ResultsFormat::Json,
+            version: None,
+        };
+        let mut expected = Vec::new();
+        output
+            .write(&[], &table, &mut expected, &|| Ok(()), &workers)
+            .unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&expected).unwrap();
+        assert_eq!(
+            decoded["results"]["bindings"].as_array().unwrap().len(),
+            BLOCK_ROWS + 1
+        );
+        assert!(expected.len() < CHUNK);
+        let result = output.write(
+            &[],
+            &table,
+            &mut writer,
+            &|| {
+                if token.is_cancelled() {
+                    Err(std::io::Error::other("cancelled"))
+                } else {
+                    Ok(())
+                }
+            },
+            &workers,
+        );
+        assert!(result.is_ok());
+        assert_eq!(writer.writes, 1, "cancellation occurs in the final write");
+        assert_eq!(writer.bytes, expected.len());
+    }
 
     #[test]
     fn escaping_matches_json_event_parser() {

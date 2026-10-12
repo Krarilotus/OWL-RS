@@ -14,11 +14,16 @@
 //!   picks the successor, which gets `A → A` for the atoms it lacks.
 //! - **Eq** ([`super::equality`]) merges neighbours under at-most-one clauses.
 
+use std::cell::Cell;
+
 use hashbrown::HashMap;
 
-use super::atoms::{Atom, CTerm, FuncId, Kind, is_subset, union_into};
+mod hyper;
+use hyper::instantiate;
+
+use super::atoms::{Atom, CTerm, FuncId, Kind};
 use super::engine::Engine;
-use super::program::{BodyPat, DlClause, HeadPat, Slot, TermPat, Var};
+use super::program::Slot;
 use super::state::{ClauseId, ClauseRef, Clauses, ContextId, Rule};
 
 /// A message between contexts. Messages a context sends itself stay in its own batch.
@@ -38,6 +43,15 @@ pub enum Message {
         body: Box<[Atom]>,
         head: Atom,
     },
+}
+
+impl Message {
+    pub(super) fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Pred { body, .. } => std::mem::size_of_val(&**body),
+            _ => 0,
+        }
+    }
 }
 
 /// A successor's clause received for Pred.
@@ -73,6 +87,13 @@ pub struct Successor {
 /// A context's state: its clauses and its links.
 #[derive(Debug, Default)]
 pub struct State {
+    /// The capacity of the remote clauses, successors and merges below their tables
+    /// (kept up to date where they grow).
+    pub(super) remote_bytes: usize,
+    pub(super) successor_bytes: usize,
+    pub(super) merge_bytes: usize,
+    /// The sampling election of the last end-of-batch publication ([`Worker::finish`]).
+    pub(super) published: u64,
     pub clauses: Clauses,
     pub started: bool,
     pub preds: Vec<(ContextId, FuncId)>,
@@ -88,6 +109,24 @@ pub struct State {
     /// Why the saturation here may miss consequences, if it may: what it derived still
     /// holds, but the context is no complete answer and not exact.
     pub incomplete: Option<Incomplete>,
+}
+
+impl State {
+    pub(super) fn bytes(&self) -> usize {
+        use super::memory::{map, vec};
+        self.clauses.bytes()
+            + vec(&self.preds)
+            + vec(&self.pr)
+            + vec(&self.remote)
+            + vec(&self.merges)
+            + map(&self.remote_by_atom)
+            + map(&self.succ)
+            + map(&self.merges_by_term)
+            + map(&self.merges_by_pair)
+            + self.remote_bytes
+            + self.successor_bytes
+            + self.merge_bytes
+    }
 }
 
 /// Why a context's saturation may miss consequences.
@@ -123,6 +162,13 @@ impl Out {
             self.sends.push((to, message));
         }
     }
+
+    pub(super) fn bytes(&self) -> usize {
+        let payloads = self.local.iter().chain(self.sends.iter().map(|(_, m)| m));
+        super::memory::vec(&self.local)
+            + super::memory::vec(&self.sends)
+            + payloads.map(Message::heap_bytes).sum::<usize>()
+    }
 }
 
 /// Conclusions waiting to be derived (the joins only read the state), flat, in buffers
@@ -144,6 +190,10 @@ struct Item {
 }
 
 impl Found {
+    fn bytes(&self) -> usize {
+        use super::memory::vec;
+        vec(&self.items) + vec(&self.atoms) + vec(&self.premises)
+    }
     /// Conclusions so far.
     pub(super) fn len(&self) -> usize {
         self.items.len()
@@ -192,9 +242,31 @@ pub struct Scratch {
     /// The bodies Pred found in this batch, per head (they are derived after the joins,
     /// so the context's own redundancy check doesn't see them yet).
     pub(super) batch: HashMap<Atom, super::settrie::SetTrie>,
+    pub(super) batch_bytes: usize,
     /// The current Pred join's steps (calls), and whether it went past its budget.
     pub(super) steps: usize,
     pub(super) left: bool,
+}
+
+impl Scratch {
+    pub(super) fn bytes(&self) -> usize {
+        use super::memory::{map, vec};
+        self.found.bytes()
+            + vec(&self.slots)
+            + vec(&self.bind)
+            + vec(&self.premises)
+            + vec(&self.refs)
+            + vec(&self.body)
+            + vec(&self.waiting)
+            + vec(&self.preds)
+            + map(&self.batch)
+            + self.batch_bytes
+    }
+
+    pub(super) fn clear_batch(&mut self) {
+        self.batch.clear();
+        self.batch_bytes = 0;
+    }
 }
 
 /// The rules on one context, by the worker holding it.
@@ -203,11 +275,76 @@ pub struct Worker<'w> {
     pub state: &'w mut State,
     pub out: &'w mut Out,
     pub scratch: Scratch,
+    /// The batch's messages, until it ends (observed capacity; payloads handled so far
+    /// count twice where the state keeps them).
+    pub(super) input_bytes: usize,
+    /// This batch's budget checks and capacity publications (into the counters at its end).
+    checks: Cell<u64>,
+    observations: Cell<u64>,
 }
 
 const NONE: u32 = u32::MAX;
 
-impl Worker<'_> {
+impl<'w> Worker<'w> {
+    /// A batch's worker; its take was the batch's first budget check.
+    pub(super) fn new(
+        engine: &'w Engine,
+        state: &'w mut State,
+        out: &'w mut Out,
+        input_bytes: usize,
+    ) -> Self {
+        Self {
+            engine,
+            state,
+            out,
+            scratch: Scratch::default(),
+            input_bytes,
+            checks: Cell::new(1),
+            observations: Cell::new(0),
+        }
+    }
+
+    /// A work checkpoint: publishes this context's capacity, `detached` scratch included,
+    /// and checks the budget.
+    pub(super) fn checkpoint(&self, detached: usize) -> bool {
+        self.publish(detached);
+        self.checks.set(self.checks.get() + 1);
+        !self.engine.out_of_budget()
+    }
+
+    /// Publishes this context's capacity where it is observed: one store, no other
+    /// context's lock or shared ledger. Returns the state's part.
+    fn publish(&self, detached: usize) -> usize {
+        if !self.engine.observing() {
+            return 0;
+        }
+        self.observations.set(self.observations.get() + 1);
+        let state = self.state.bytes();
+        let bytes = state + self.out.bytes() + self.scratch.bytes() + detached + self.input_bytes;
+        self.engine.publish(self.me(), bytes);
+        state
+    }
+
+    /// Ends the batch: its counts, and a publication where a checkpoint published
+    /// within it or none was made since the latest sampling election (a publication lags
+    /// its context's work by at most one interval; a round ends with exact ones,
+    /// [`Engine::run`]). Returns the state's capacity published, which stays once the
+    /// batch's buffers are gone.
+    pub(super) fn finish(self) -> Option<usize> {
+        let election = self.engine.election();
+        let due = self.observations.get() > 0 || self.state.published != election;
+        let mut state = None;
+        if self.engine.observing() && due {
+            self.state.published = election;
+            state = Some(self.publish(0));
+        }
+        let counters = &mut self.state.clauses.counters;
+        counters.batches += 1;
+        counters.checks += self.checks.get();
+        counters.observations += self.observations.get();
+        state
+    }
+
     fn me(&self) -> ContextId {
         self.out.me
     }
@@ -224,7 +361,7 @@ impl Worker<'_> {
                 // One context's agenda can run for minutes (its redundancy checks grow with
                 // its clauses): the budget is checked inside it too. Stopping leaves the
                 // run exhausted, which ends it as `Unsupported::Budget`, never an answer.
-                if given.is_multiple_of(256) && self.engine.out_of_budget() {
+                if given.is_multiple_of(256) && !self.checkpoint(0) {
                     return;
                 }
             }
@@ -245,8 +382,7 @@ impl Worker<'_> {
                 if std::mem::replace(&mut self.state.started, true) {
                     return;
                 }
-                let core = self.engine.core(self.me()).to_vec();
-                for a in core {
+                for &a in self.engine.core(self.me()) {
                     self.state
                         .clauses
                         .derive(&[], a, (Rule::Core, NONE, &[]), proofs);
@@ -293,8 +429,10 @@ impl Worker<'_> {
                 }
                 let id = self.state.remote.len() as u32;
                 for &a in body.iter() {
-                    self.state.remote_by_atom.entry(a).or_default().push(id);
+                    let list = self.state.remote_by_atom.entry(a).or_default();
+                    super::memory::push(list, id, &mut self.state.remote_bytes);
                 }
+                self.state.remote_bytes += std::mem::size_of_val(&*body);
                 self.state.remote.push(Remote {
                     from,
                     func,
@@ -303,7 +441,7 @@ impl Worker<'_> {
                 });
                 let mut s = std::mem::take(&mut self.scratch);
                 s.found.clear();
-                s.batch.clear();
+                s.clear_batch();
                 s.premises.clear();
                 s.steps = 0;
                 s.left = false;
@@ -366,185 +504,4 @@ impl Worker<'_> {
             );
         }
     }
-
-    // Hyper ------------------------------------------------------------------------------
-
-    fn hyper(&mut self, c: ClauseId, head: Atom) {
-        let program = &self.engine.program;
-        let mut s = std::mem::take(&mut self.scratch);
-        let Scratch {
-            slots,
-            found,
-            bind,
-            premises,
-            body,
-            ..
-        } = &mut s;
-        program.slots(head, &self.state.clauses.concepts, slots);
-        if slots.is_empty() {
-            self.scratch = s;
-            return;
-        }
-        found.clear();
-        premises.clear();
-        premises.push(c);
-        body.clear();
-        body.extend_from_slice(self.state.clauses.body(c));
-        self.state.clauses.counters.slots += slots.len() as u64;
-        let present = &self.state.clauses.present;
-        for &Slot {
-            clause: dl,
-            guard,
-            pos,
-        } in slots.iter()
-        {
-            if guard != Slot::NO_GUARD && !present.contains(&guard) {
-                continue;
-            }
-            let clause = &program.clauses[dl as usize];
-            // The other concept atoms must be there: a probe each, before any join.
-            let missing = clause.body.iter().enumerate().any(|(i, b)| {
-                i != pos as usize && matches!(*b, BodyPat::Concept(k) if !present.contains(&k))
-            });
-            if missing {
-                continue;
-            }
-            bind.clear();
-            bind.resize(program.vars[dl as usize] as usize, None);
-            if !unify(clause.body[pos as usize], head, bind) {
-                continue;
-            }
-            self.hyper_join(
-                (clause, dl),
-                (pos as usize, c),
-                0,
-                bind,
-                body,
-                premises,
-                found,
-            );
-        }
-        self.conclude(found);
-        self.scratch = s;
-    }
-
-    /// Joins the body atoms of `dl` from position `i` on with the context's clauses;
-    /// `fixed` is the trigger's position and clause.
-    #[expect(clippy::too_many_arguments, reason = "the join's recursion state")]
-    fn hyper_join(
-        &self,
-        dl: (&DlClause, u32),
-        fixed: (usize, ClauseId),
-        i: usize,
-        bind: &mut [Option<CTerm>],
-        acc: &[Atom],
-        premises: &mut Vec<ClauseId>,
-        found: &mut Found,
-    ) {
-        let (clause, id) = dl;
-        if i == clause.body.len() {
-            if let Some(head) = instantiate(clause.head, bind) {
-                let b = (found.atoms.len() as u32, acc.len() as u32);
-                found.atoms.extend_from_slice(acc);
-                let p = found.premises.len() as u32;
-                if self.engine.proofs {
-                    let me = self.me();
-                    found
-                        .premises
-                        .extend(premises.iter().map(|&clause| ClauseRef {
-                            context: me,
-                            clause,
-                        }));
-                }
-                found.items.push(Item {
-                    head,
-                    rule: Rule::Hyper,
-                    dl: id,
-                    body: b,
-                    premises: (p, found.premises.len() as u32 - p),
-                });
-            }
-            return;
-        }
-        if i == fixed.0 {
-            return self.hyper_join(dl, fixed, i + 1, bind, acc, premises, found);
-        }
-        let clauses = &self.state.clauses;
-        let mut each = |atom: Atom, bind: &mut [Option<CTerm>]| {
-            let mut union = Vec::new();
-            for p in clauses.premises_for(atom, fixed.1) {
-                let body = clauses.body(p);
-                let next: &[Atom] = if body.is_empty() || is_subset(body, acc) {
-                    acc
-                } else {
-                    union_into(acc, body, &mut union);
-                    &union
-                };
-                premises.push(p);
-                self.hyper_join(dl, fixed, i + 1, bind, next, premises, found);
-                premises.pop();
-            }
-        };
-        match clause.body[i] {
-            BodyPat::Concept(b) => each(Atom::concept(b, CTerm::X), bind),
-            BodyPat::Out(r, Var::X) => each(Atom::out(r, CTerm::X), bind),
-            BodyPat::Out(r, Var::Z(z)) => match bind[z as usize] {
-                Some(t) => each(Atom::out(r, t), bind),
-                None => {
-                    for &t in clauses.out_terms.get(&r).into_iter().flatten() {
-                        bind[z as usize] = Some(t);
-                        each(Atom::out(r, t), bind);
-                    }
-                    bind[z as usize] = None;
-                }
-            },
-            BodyPat::In(r, z) => match bind[z as usize] {
-                Some(t) => each(Atom::into(r, t), bind),
-                None => {
-                    for &t in clauses.in_terms.get(&r).into_iter().flatten() {
-                        bind[z as usize] = Some(t);
-                        each(Atom::into(r, t), bind);
-                    }
-                    bind[z as usize] = None;
-                }
-            },
-        }
-    }
-}
-
-/// Whether the context atom `atom` matches the DL-clause body atom `pat` with `σ(x) = x`,
-/// extending `bind`.
-fn unify(pat: BodyPat, atom: Atom, bind: &mut [Option<CTerm>]) -> bool {
-    let (kind, pred, t) = (atom.kind(), atom.pred(), atom.term());
-    let mut set = |z: u8, t: CTerm| match bind[z as usize] {
-        Some(b) => b == t,
-        None => {
-            bind[z as usize] = Some(t);
-            true
-        }
-    };
-    match pat {
-        BodyPat::Concept(b) => atom == Atom::concept(b, CTerm::X),
-        BodyPat::Out(r, Var::X) => atom == Atom::out(r, CTerm::X),
-        BodyPat::Out(r, Var::Z(z)) => kind == Kind::Out && pred == r && set(z, t),
-        BodyPat::In(r, z) => match kind {
-            Kind::In if pred == r => set(z, t),
-            Kind::Out if pred == r && t == CTerm::X => set(z, t),
-            _ => false,
-        },
-    }
-}
-
-/// The head atom of a DL-clause under `bind` (`⊥` for no head); `None` if a variable is
-/// unbound (no DL-clause has one).
-fn instantiate(head: Option<HeadPat>, bind: &[Option<CTerm>]) -> Option<Atom> {
-    let Some(h) = head else {
-        return Some(Atom::BOTTOM);
-    };
-    let t = match h.term {
-        TermPat::Var(Var::X) => CTerm::X,
-        TermPat::Var(Var::Z(z)) => (*bind.get(z as usize)?)?,
-        TermPat::Func(f) => CTerm::func(f),
-    };
-    Some(Atom::of(h.kind.kind(), h.pred, t))
 }

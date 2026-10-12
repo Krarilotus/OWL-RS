@@ -1,0 +1,35 @@
+# A run record (benches/runs/README.md). Outcomes and identities; samples stay under results.
+id = "2026-10-09-initial-runtime-c888a20"
+level = "focused"
+kit = "perf lab"
+purpose = "The shared physical worker pool and plan inspection against the preceding revision: LUBM 1 queries, a short client sweep, Horn classification"
+started = "2026-10-09T14:40:08Z"
+host = ["office-pc", "phuoc-yu"]
+build_host = "office-pc"
+scenario = "native"
+baseline = { commit = "4e8bd38e0733055c06d77f9fdd7cd36c6d89bd7c", dirty = false }
+candidate = { commit = "c888a203ea69cdceac032deec5be56fe998a9cc1", dirty = false }
+protocol = { pairs = 3, order = "AB/BA/AB", per_host = true, perf_lab = "owl2-rl, cache off, runs 5, warm-up 1, --threads omitted on both", clients = "1/2/4/8, 3 s each", classifiers = "Horn 20 and 1500 at widths 1 and 4", limits = "8 GiB memory.max, no swap, no CPU quota" }
+inputs = [
+  { name = "lubm-1.nt", sha256_prefix = "299677a2e26b9317" },
+  { name = "univ-bench.nt", sha256_prefix = "2c42947cd544da0b" },
+]
+results = { root = "office-pc and phuoc-yu:/home/krarilotus/nrese-prep-20261009-4e8bd38/initial-c888a20", office_archive_sha256 = "00803b4bb72a882ead467892fb46cbdae8f462c4a41ed301e49ae3a476fabcd5", phuoc_archive_sha256 = "ff9bf29dbf37268de592878084d64deec4f50b1c62056c4aa440bf024ec20486", report_sha256 = "ef578a377c0361fe1a0e3269859a642215d196f435390075b6ce7fdb91a40ef6" }
+publishable = "all"
+cases = [
+  { case = "lubm-1 clients, office-pc", verdict = "slower", note = "QPS 2652.7/4639.0/7640.0/11288.0 -> 2312.0/4167.0/7137.0/10506.0 at 1/2/4/8 clients (-12.8/-10.2/-6.6/-6.9%), every pair lower" },
+  { case = "lubm-1 clients, phuoc-yu", verdict = "slower", note = "-7.2/-8.1/-5.5/-4.1%, every pair lower" },
+  { case = "lubm-1 queries", verdict = "same", note = "q01-q14 bags and bytes equal; no query beyond 10% and 2 ms; office sum 4.662 -> 5.083 ms" },
+  { case = "horn-20, horn-1500", verdict = "same", note = "canonical taxonomies equal on both classifiers, widths and revisions" },
+]
+findings = [
+  "The pool's extra submissions cost tiny queries 20-30 us; an empty store opens 1-2 ms slower; Office client-phase RSS 288 -> 367 MiB at two clients.",
+  "Follow-up diagnostics (not promoted): small-result encoding inside the pool, -10.8%/-7.8%; one pool entry per query with buffered output, -11.6% at 1 and 2 clients; context switches per query 0.027 (base), 6.27, 3.14.",
+]
+
+pairs = [
+  { workload = "lubm", tier = "diagnostic-1-Office-PC-queries", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, items = "14/14 per process" },
+  { workload = "lubm", tier = "diagnostic-1-Phuoc-Yu-queries", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, items = "14/14 per process" },
+  { workload = "lubm", tier = "diagnostic-1-Office-PC-client-sweep", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, items = "4/4 client widths per process" },
+  { workload = "lubm", tier = "diagnostic-1-Phuoc-Yu-client-sweep", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, items = "4/4 client widths per process" },
+]

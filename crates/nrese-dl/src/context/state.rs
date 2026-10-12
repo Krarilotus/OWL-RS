@@ -8,6 +8,7 @@
 use hashbrown::HashMap;
 
 use super::atoms::{Atom, CTerm, Kind, RoleId, is_subset, signature};
+use super::memory::push;
 
 /// A context, by its index in the arena of contexts.
 pub type ContextId = u32;
@@ -70,6 +71,7 @@ pub struct Bodies {
     atoms: Vec<Atom>,
     spans: Vec<(u32, u32)>,
     ids: HashMap<Box<[Atom]>, BodyId>,
+    keys_bytes: usize,
 }
 
 impl Bodies {
@@ -93,7 +95,13 @@ impl Bodies {
         self.atoms.extend_from_slice(body);
         let id = self.spans.len() as BodyId;
         self.ids.insert(body.into(), id);
+        self.keys_bytes += std::mem::size_of_val(body);
         id
+    }
+
+    fn bytes(&self) -> usize {
+        use super::memory::{map, vec};
+        vec(&self.atoms) + vec(&self.spans) + map(&self.ids) + self.keys_bytes
     }
 }
 
@@ -124,11 +132,18 @@ pub struct Counters {
     /// The Eq rule's merges, and its copies.
     pub merges: u64,
     pub eq: u64,
+    /// Message batches the context took, budget checks its workers made, and capacity
+    /// publications (where observed).
+    pub batches: u64,
+    pub checks: u64,
+    pub observations: u64,
 }
 
 /// A context's clauses and indexes.
 #[derive(Debug, Default)]
 pub struct Clauses {
+    /// The capacity of the indexes' lists and tries (kept up to date where they grow).
+    index_bytes: usize,
     pub recs: Vec<ClauseRec>,
     pub bodies: Bodies,
     /// Live clauses by head literal (the paper's `hyperIndex` and `predHeadIndex`, which
@@ -168,6 +183,42 @@ pub struct Clauses {
 }
 
 impl Clauses {
+    fn flat_bytes(&self) -> usize {
+        use super::memory::{map, set, vec};
+        self.bodies.bytes()
+            + vec(&self.recs)
+            + vec(&self.concepts)
+            + vec(&self.agenda)
+            + vec(&self.agenda_conditional)
+            + vec(&self.derivations)
+            + vec(&self.premises)
+            + map(&self.heads)
+            + map(&self.out_terms)
+            + map(&self.in_terms)
+            + map(&self.tries)
+            + map(&self.occurrences)
+            + map(&self.dead)
+            + set(&self.present)
+            + set(&self.unconditional_heads)
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.flat_bytes() + self.index_bytes
+    }
+
+    fn index_bytes(&self) -> usize {
+        use super::memory::vec;
+        self.heads.values().map(vec).sum::<usize>()
+            + self
+                .tries
+                .values()
+                .map(super::settrie::SetTrie::bytes)
+                .sum::<usize>()
+            + self.occurrences.values().map(vec).sum::<usize>()
+            + self.out_terms.values().map(vec).sum::<usize>()
+            + self.in_terms.values().map(vec).sum::<usize>()
+    }
+
     pub fn body(&self, c: ClauseId) -> &[Atom] {
         self.bodies.get(self.recs[c as usize].body)
     }
@@ -252,7 +303,11 @@ impl Clauses {
             copy: false,
         });
         for &a in body {
-            self.occurrences.entry((head, a)).or_default().push(id);
+            push(
+                self.occurrences.entry((head, a)).or_default(),
+                id,
+                &mut self.index_bytes,
+            );
         }
         self.counters.kept += 1;
         self.counters.max_body = self.counters.max_body.max(body.len() as u64);
@@ -267,14 +322,26 @@ impl Clauses {
             self.premises.extend_from_slice(premises);
         }
         // A head seen for the first time: its role term, if any, is new too.
-        if !head.is_bottom() && !self.heads.contains_key(&head) {
+        let (list, new) = match self.heads.entry(head) {
+            hashbrown::hash_map::Entry::Occupied(entry) => (entry.into_mut(), false),
+            hashbrown::hash_map::Entry::Vacant(entry) => (entry.insert(Vec::new()), true),
+        };
+        push(list, id, &mut self.index_bytes);
+        if new && !head.is_bottom() {
             self.index_role(head);
         }
-        self.heads.entry(head).or_default().push(id);
         if body.is_empty() {
             self.unconditional_heads.insert(head);
         } else {
-            self.tries.entry(head).or_default().insert(body, id);
+            let bytes = &mut self.index_bytes;
+            let trie = self.tries.entry(head).or_insert_with(|| {
+                let trie = super::settrie::SetTrie::default();
+                *bytes += trie.bytes();
+                trie
+            });
+            let before = trie.bytes();
+            trie.insert(body, id);
+            *bytes += trie.bytes() - before;
         }
         if head.is_bottom() && body.is_empty() {
             self.unsat = true;
@@ -291,6 +358,7 @@ impl Clauses {
             self.dead.clear();
             self.unconditional_heads.clear();
             self.unconditional_heads.insert(Atom::BOTTOM);
+            self.index_bytes = self.index_bytes();
         }
         if body.is_empty() {
             self.agenda.push(id);
@@ -360,19 +428,19 @@ impl Clauses {
             Kind::Out => {
                 let terms = self.out_terms.entry(r).or_default();
                 if !terms.contains(&t) {
-                    terms.push(t);
+                    push(terms, t, &mut self.index_bytes);
                 }
                 if t == CTerm::X {
                     let terms = self.in_terms.entry(r).or_default();
                     if !terms.contains(&t) {
-                        terms.push(t);
+                        push(terms, t, &mut self.index_bytes);
                     }
                 }
             }
             Kind::In => {
                 let terms = self.in_terms.entry(r).or_default();
                 if !terms.contains(&t) {
-                    terms.push(t);
+                    push(terms, t, &mut self.index_bytes);
                 }
             }
         }
@@ -427,6 +495,52 @@ mod tests {
 
     fn derive(c: &mut Clauses, body: &[Atom], head: Atom) -> Option<ClauseId> {
         c.derive(body, head, (Rule::Hyper, 0, &[]), false)
+    }
+
+    #[test]
+    fn incremental_capacity_matches_a_full_index_walk() {
+        let mut c = Clauses::default();
+        for head in [
+            Atom::into(3, CTerm::Y),
+            Atom::out(3, CTerm::X),
+            Atom::concept(4, CTerm::Y),
+        ] {
+            derive(&mut c, &[Atom::concept(1, CTerm::X)], head);
+            assert_eq!(c.bytes(), c.flat_bytes() + c.index_bytes());
+            derive(&mut c, &[], head);
+            assert_eq!(c.bytes(), c.flat_bytes() + c.index_bytes());
+        }
+        for i in 0..500 {
+            let body = [
+                Atom::concept(i % 31, CTerm::X),
+                Atom::into(100 + i % 17, CTerm::Y),
+            ];
+            let head = if i % 3 == 0 {
+                Atom::out(i % 23, CTerm::func(i % 7))
+            } else {
+                Atom::concept(100 + i % 47, CTerm::X)
+            };
+            c.derive(
+                &body,
+                head,
+                (
+                    Rule::Hyper,
+                    i,
+                    &[ClauseRef {
+                        context: 0,
+                        clause: 0,
+                    }],
+                ),
+                true,
+            );
+            assert_eq!(c.bytes(), c.flat_bytes() + c.index_bytes());
+            if i % 7 == 0 {
+                derive(&mut c, &[], head);
+                assert_eq!(c.bytes(), c.flat_bytes() + c.index_bytes());
+            }
+        }
+        derive(&mut c, &[], Atom::BOTTOM);
+        assert_eq!(c.bytes(), c.flat_bytes() + c.index_bytes());
     }
 
     #[test]

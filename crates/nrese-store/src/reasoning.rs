@@ -13,8 +13,8 @@ use nrese_reasoner::lists::ListDiagnostic;
 pub use nrese_reasoner::RuleProgram;
 pub use nrese_reasoner::engine::{
     Closure, InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
-    JustifiedStatement, Program, decoded, equality_report, explain_fact, explain_violation,
-    justify_fact, materialise, materialise_until,
+    JustifiedStatement, Program, decoded, explain_fact, explain_violation, justify_fact,
+    materialise, materialise_until,
 };
 
 /// The most diagnostics a report lists; `diagnostics_total` counts them all.
@@ -94,9 +94,6 @@ pub struct MaterialisationReport {
     /// hierarchies, transitive and equivalence properties and equality, merging,
     /// consistency); zero for a commit.
     pub phases: nrese_reasoner::batch::Phases,
-    /// A commit made an unnamed class that was left out consumable: its memberships are
-    /// missing until the store rematerialises.
-    pub needs_rematerialisation: bool,
 }
 
 impl MaterialisationReport {
@@ -132,11 +129,96 @@ pub(crate) fn apply_delta(
         violations: done.violations.len(),
         rounds: done.rounds,
         elapsed: started.elapsed(),
-        needs_rematerialisation: done.needs_rematerialisation,
         ..MaterialisationReport::default()
     }
     .with_diagnostics(&done.diagnostics, &|id| {
         decoded(tx.decode(TermId::from_raw(id)), id)
     });
     Ok((done.violations, report, done.program))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{StoreConfig, StoreService};
+    use nrese_engine::{EncodedTriple, QuadPattern};
+    use nrese_rdf::{GraphName, Literal, NamedNode, Quad, vocab::owl};
+    use nrese_reasoner::rulesets::Ruleset;
+    use std::collections::HashSet;
+
+    /// `eq-giant-split`'s shape: a class of `size` members (two `owl:sameAs` chains and a
+    /// bridge) beside classes of ten. Deleting the bridge splits the class; over a compact
+    /// stack the commit rebuilds the closure in its transaction (B3). Its stack is the
+    /// fresh closure, and the commit changes it by the split class's facts over
+    /// representatives, linear in the class, never by the class's pairs. Counts, not
+    /// times. The delta run before the rebuild is still quadratic (performance.md §6, B3).
+    #[test]
+    fn a_split_commit_changes_the_compact_stack_linearly_in_the_class() {
+        let size = 40;
+        let store = StoreService::new(StoreConfig {
+            equality_by_representatives: true,
+            equality_compact: true,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap();
+        let ex = |s: String| NamedNode::new_unchecked(format!("http://example.com/{s}"));
+        let mut facts = Vec::new();
+        let mut class = |name: &str, members: usize| {
+            let same = |j: usize| {
+                let [a, b] = [j, j + 1].map(|j| ex(format!("{name}{j}")));
+                Quad::new(a, owl::SAME_AS, b, GraphName::DefaultGraph)
+            };
+            for j in 0..members {
+                let value = Literal::new_simple_literal(format!("{name}{j}"));
+                let member = ex(format!("{name}{j}"));
+                facts.push(Quad::new(
+                    member,
+                    ex("val".into()),
+                    value,
+                    GraphName::DefaultGraph,
+                ));
+                if j + 1 < members {
+                    facts.push(same(j));
+                }
+            }
+            same(members / 2 - 1)
+        };
+        let bridge = class("g", size);
+        for g in 0..20 {
+            class(&format!("s{g}_"), 10);
+        }
+        let mut tx = store.engine().transaction();
+        for quad in &facts {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        store.rematerialise(Ruleset::Owl2Rl).unwrap();
+
+        let mut tx = store.engine().transaction();
+        let config = store.config();
+        let program = Program::compile(&Ruleset::Owl2Rl.into(), &|term| tx.intern(term))
+            .hiding_unnamed_classes(config.hide_unnamed_classes)
+            .by_representatives(config.equality_by_representatives)
+            .storing_representatives(config.equality_compact);
+        assert!(program.stores_representatives());
+        tx.remove(bridge.as_ref());
+        let (violations, report, _) = apply_delta(&program, None, &mut tx, &|| false).unwrap();
+        assert!(violations.is_empty());
+        let pending = tx.pending_snapshot();
+        let stored: HashSet<EncodedTriple> = pending
+            .stored()
+            .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+            .map(Into::into)
+            .collect();
+        let fresh: HashSet<EncodedTriple> = materialise(&program, &pending)
+            .inferred
+            .into_iter()
+            .filter(|t| !pending.contains_in(ReadModel::Asserted, &t.in_default_graph()))
+            .collect();
+        assert_eq!(stored, fresh, "the split's stack is the fresh closure");
+        assert!(
+            report.inferred_inserted + report.inferred_deleted < 2 * size as u64,
+            "{report:?}"
+        );
+    }
 }

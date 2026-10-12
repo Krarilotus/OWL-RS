@@ -165,7 +165,10 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
         }),
         "write-scaling" => Ok(Cli {
             command: Command::WriteScaling(WriteScalingConfig {
-                nrese: nrese_connection(&options)?,
+                nrese: options
+                    .get("--nrese-base-url")
+                    .cloned()
+                    .map(ServiceConnectionConfig::new),
                 reference: optional_reference_connection(&options)?,
                 steps: options
                     .get("--steps")
@@ -475,7 +478,7 @@ USAGE:
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- pack-matrix [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--connection-profiles <PATH>] [--connection-profile <NAME>] [--catalog <PATH>] [--packs-dir <DIR>] [--ontology <name>] [--execution-mode <full|compat-only>] [--tier <small|medium|broad>] [--semantic-dialect <dialect>] [--reasoning-feature <feature>] [--service-coverage <surface>] [--iterations <N>] [--report-dir <DIR>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- generate --out <PATH> [--triples <N>]
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- query-mix --endpoint <URL> --queries <DIR> [--label <NAME>] [--warmup <N>] [--runs <N>] [--order fixed|shuffled [--seed <N>]] [--timeout-s <S>] [--clients <N> --duration-s <S> --interactive-ms <MS> [--update-endpoint <URL> --write-interval-ms <MS> --write-graph <IRI>]] [--report-json <PATH>]
-  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- write-scaling --nrese-base-url <URL> [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--steps <triples,...>] [--chunk-triples <N>] [--samples <N>] [--reset <true|false>] [--report-json <PATH>]
+  cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- write-scaling [--nrese-base-url <URL>] [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--steps <triples,...>] [--chunk-triples <N>] [--samples <N>] [--reset <true|false>] [--report-json <PATH>] (at least one target required)
   cargo run --manifest-path benches/nrese-bench-harness/Cargo.toml -- seed --nrese-base-url <URL> [--reference-kind <fuseki|graphdb|qlever> --reference-base-url <URL>] [--reference-basic-auth <user:pass>] [--dataset <PATH>] [--dataset-base-iri <IRI>] [--content-type <TYPE>] [--replace <true|false>]
 "
     );
@@ -486,6 +489,29 @@ mod tests {
     use crate::model::{Command, PackExecutionMode};
 
     use super::{DEFAULT_COMPAT_CASES_PATH, DEFAULT_QUERY_WORKLOAD_PATH, parse_cli};
+
+    #[test]
+    fn write_scaling_accepts_reference_only_and_both_targets() {
+        for both in [false, true] {
+            let mut args = vec![
+                "bench",
+                "write-scaling",
+                "--reference-kind",
+                "graphdb",
+                "--reference-base-url",
+                "http://localhost:7200/repositories/bench",
+            ];
+            if both {
+                args.extend(["--nrese-base-url", "http://localhost:8080"]);
+            }
+            let cli = parse_cli(args.into_iter().map(str::to_owned).collect()).unwrap();
+            let Command::WriteScaling(config) = cli.command else {
+                panic!("wrong command");
+            };
+            assert_eq!(config.nrese.is_some(), both);
+            assert!(config.reference.is_some());
+        }
+    }
 
     #[test]
     fn parses_bench_defaults() {

@@ -67,12 +67,13 @@ pub struct DlConfig {
     /// Per DL task: a commit's consistency check, a query's exact services together, a
     /// classification (`dl.timeout`).
     pub timeout: Duration,
-    /// The most memory one DL task may hold, in bytes (`dl.memory`).
+    /// DL memory envelope in bytes (`dl.memory`); 0 is unlimited. Context saturation
+    /// checks sampled capacity estimates; tableau checks its owned capacity at checkpoints.
     pub memory_bytes: usize,
     /// Candidate answers a query checks with the exact services at most; the rest are
     /// reported unresolved (`dl.max_candidates`).
     pub max_candidates: usize,
-    /// Workers of a classification (`dl.threads`; 0: every core).
+    /// Maximum workers of a DL operation (`dl.threads`; 0: inherit its runtime).
     pub threads: usize,
     /// The most nodes one hypertableau run may hold (`dl.max_nodes`): a deterministic
     /// budget beside `timeout`.
@@ -99,6 +100,30 @@ impl Default for DlConfig {
 }
 
 impl DlConfig {
+    /// Divide a configured task budget among its workers; preserve unlimited rather
+    /// than turning it into an arbitrary finite quotient. A too-small share stays zero.
+    pub(crate) fn memory_per_worker(&self, workers: usize) -> usize {
+        match self.memory_bytes {
+            0 | usize::MAX => usize::MAX,
+            bytes => bytes / workers.max(1),
+        }
+    }
+
+    pub(crate) fn classification_options(
+        &self,
+        workers: nrese_exec::workers::Workers,
+    ) -> nrese_dl::classify::Options {
+        let memory = self.memory_per_worker(1);
+        let width = workers.width();
+        nrese_dl::classify::Options {
+            workers,
+            timeout: Some(self.timeout),
+            task_memory: (memory != usize::MAX).then_some(memory),
+            tableau: self.tableau(self.timeout, self.memory_per_worker(width)),
+            ..nrese_dl::classify::Options::default()
+        }
+    }
+
     /// The hypertableau's configuration of a DL task under these settings, each test
     /// within `timeout` and `memory`.
     pub fn tableau(&self, timeout: Duration, memory: usize) -> nrese_dl::tableau::Config {
@@ -110,12 +135,34 @@ impl DlConfig {
             ..nrese_dl::tableau::Config::default()
         }
     }
+}
 
-    /// The workers a task gets.
-    pub fn workers(&self) -> usize {
-        match self.threads {
-            0 => std::thread::available_parallelism().map_or(1, std::num::NonZero::get),
-            n => n,
-        }
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn configured_memory_is_shared_by_the_existing_paths_and_zero_is_unlimited() {
+        let mut config = DlConfig {
+            memory_bytes: 1024,
+            threads: 4,
+            ..DlConfig::default()
+        };
+        let workers = nrese_exec::workers::Workers::new(4).limited(2);
+        let options = config.classification_options(workers.clone());
+        assert_eq!(options.workers, workers);
+        assert_eq!(options.task_memory, Some(1024));
+        assert_eq!(options.tableau.max_memory, 512);
+        config.memory_bytes = 0;
+        let options = config.classification_options(workers);
+        assert_eq!(options.task_memory, None);
+        assert_eq!(options.tableau.max_memory, usize::MAX);
+        assert_eq!(config.memory_per_worker(4000), usize::MAX);
+        config.memory_bytes = 1;
+        assert_eq!(
+            config.memory_per_worker(4),
+            0,
+            "a tiny share is not unlimited"
+        );
     }
 }

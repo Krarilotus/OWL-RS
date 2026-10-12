@@ -83,6 +83,7 @@ async fn run() -> Result<()> {
         return print_query(&store, print.clone());
     }
     let mut config = ServerConfig::load_with(cli.config_path.as_deref(), &cli.overrides)?;
+    config.install_process_memory_policy();
     // The default repository's reasoning as changed through the engine API overrides the
     // configuration's (it is kept in the data directory).
     if let Some(settings) = nrese_server::repositories::stored_default_settings(&config.store)

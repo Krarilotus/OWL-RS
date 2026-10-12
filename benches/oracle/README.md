@@ -1,6 +1,12 @@
 # A second oracle: Jena
 
-The differential tests (`crates/nrese-sparql/tests/native_differential_tests.rs`) compare NRESE's native executor with spareval, Oxigraph's evaluator, on the same data. Where both deviate from the standard in the same way, they agree, and the tests can't see it. This kit asks a second, independent engine: Apache Jena's ARQ answers the same queries over the same data, and every difference is either explained or reported.
+The differential tests (`crates/nrese-sparql/tests/it/native_differential_tests.rs`)
+compare NRESE's native executor with `nrese-sparql-reference` on the same data. The
+reference independently evaluates algebra but shares expression and aggregate-value
+helpers; agreement cannot independently validate those helpers. This kit asks a second,
+independent engine: Apache Jena's ARQ answers the same queries over the same data, and
+every difference is either explained or reported. The dated results below retain their
+historical evaluator and dependency names.
 
 ```sh
 benches/oracle/run.sh                     # dump, answer, compare; the report in benches/oracle/results/<date>.md
@@ -40,7 +46,7 @@ The last run (2 October 2026): 9,390 queries, 9,077 agree, 313 differ for a know
 
 **Found and fixed (2 October):** an integer-derived literal outside its datatype's range (`"300"^^xsd:byte`) is ill-typed, but NRESE's executor and its reference evaluator took it for the number 300, so `?b * 1.5`, `?b + 1`, `SUM`, `MIN`, `MAX` and comparisons computed with it where the standard (and Jena) have an error. The value ranges of the thirteen derived types are checked now.
 
-**Found and fixed (30 September):** decimal multiplication and division with a zero operand (`0 * 1.5`, `0 / 1.5`) were errors in `oxsdatatypes`, which both NRESE's executor and spareval use, so `BIND(?x * 1.5 AS ?k)` left `?k` unbound and joined it with everything. The workspace carries a patched copy (`vendor/oxsdatatypes/NRESE-PATCH.md`).
+**Found and fixed (30 September):** decimal multiplication and division with a zero operand (`0 * 1.5`, `0 / 1.5`) were errors in `oxsdatatypes`, which NRESE's executor and spareval both used then, so `BIND(?x * 1.5 AS ?k)` left `?k` unbound and joined it with everything. This was fixed in the then-vendored dependency. The current workspace uses `crates/rdf/nrese-xsd`; it no longer carries that vendor patch.
 
 The three NRESE deviations are on the completion plan (4.3, 4.6). Once one is fixed, its rule goes, and with the lexical forms fixed, the canonical copy goes too. A rule that explains a difference only says the difference is one of a known kind; `compare.py` applies the narrowest test it can (the rows of one engine contained in the other's, the columns of MIN and MAX masked). The report lists every explained query, for review.
 

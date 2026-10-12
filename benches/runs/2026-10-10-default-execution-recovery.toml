@@ -1,0 +1,26 @@
+# A run record (benches/runs/README.md). Outcomes and identities; samples stay under results.
+id = "2026-10-10-default-execution-recovery"
+level = "full"
+kit = "fast"
+purpose = "Default execution back on the caller (no physical pool unless configured): recovery against the original baseline"
+started = "2026-10-10"
+host = ["phuoc-yu", "office-pc"]
+build_host = "office-pc"
+scenario = "native"
+baseline = { commit = "4e8bd38e0733055c06d77f9fdd7cd36c6d89bd7c", dirty = false }
+candidate = { commit = "62ae2e0faeafea162f3a4dbf58cee9a56e8254d5", dirty = true, patch_sha256 = "adc69dc6e323b708fd6db12004ec12529d4501fb00dade840cc4188ed5044c43", note = "+56/-22 production lines; committed in dc2114a" }
+protocol = { screen = "phuoc-yu, 3 pairs, 4 cases, 24 invocations", qualification = "phuoc-yu, 10 pairs, 14 cases, 280 reports, 340 native calls", full = "office-pc, 95 cases, 3 pairs, 570 reports", min_ms = 0, threads = "no --threads: default policy" }
+results = { root = "office-pc and phuoc-yu:/home/krarilotus/nrese-prep-20261009-4e8bd38/recovery-current-20261010", manifest = "full/SHA256SUMS", manifest_sha256 = "7bba791c669cfa0a8e808f2046291e8208d1d7d1d7d99da4fcd1e0d351e4b05d", office_transport_sha256 = "de02d169ceeaef80618a47bc842db58fa9b78ef6964feb03e812a8ba16b0c225" }
+publishable = "all"
+cases = [
+  { case = "clients-lookups", verdict = "same", note = "10 pairs: QPS 1892315 -> 1922537 (+1.6%, below the threshold)" },
+  { case = "commits-plain", verdict = "same", note = "p50 6.9 -> 6.8 us" },
+  { case = "kernel-intersect", verdict = "same", note = "skewed p50 96.402 -> 95.529 ms" },
+  { case = "op-aggregates", verdict = "same", note = "query-phase RSS max 596 -> 581 MiB" },
+  { case = "clients-sweep, writes-under-readers, cache-replay, ql-lubm10, rdfs-full-lubm10, q-large-result, op-negation, plan-estimates, op-group, rdf12-annotations", verdict = "same", note = "10 pairs, no flag" },
+  { case = "95 cases on office-pc", verdict = "same", note = "85 valid, 6 expected boundaries, 4 failing on both sides (dl-transitive-400, mem-load-20m-2g, ql-owl2bench, vector-knn-filtered); no new flag" },
+]
+findings = [
+  "The rewind recovers the bebada2 losses (2026-10-10-checkpoint-bebada2) on every recorded case.",
+  "The candidate still had the configurable pool (execution.threads > 0); 4c60c62 removed it, so these runs measured the default path that remains.",
+]

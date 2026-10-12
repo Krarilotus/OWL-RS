@@ -5,7 +5,7 @@ expected answer counts, the regimes it prefers, and how its data is made.
 A workload is one of three kinds:
 - a cycle (load, reason, serve, queries) on every system that can run it;
 - a kit command (a conformance suite of NRESE's, run on the host);
-- a write benchmark (the harness's write-scaling, against NRESE).
+- a write benchmark (the harness's write-scaling, against NRESE or GraphDB).
 Workloads without a definition here are planned: the driver skips them and says so.
 """
 from __future__ import annotations
@@ -148,8 +148,8 @@ def geosparql(root: Path, tier: str, settings: dict) -> Plan:
 
 
 def write_scaling(root: Path, tier: str, settings: dict) -> Plan:
-    return Plan("write-scaling", tier, kind="writes", systems={"nrese"},
-                note="the harness drives NRESE's graph store API")
+    return Plan("write-scaling", tier, kind="writes", systems={"nrese", "graphdb"},
+                note="Graph Store uploads and SPARQL inserts with checked Person/probe counts")
 
 
 def clients(root: Path, tier: str, settings: dict) -> Plan:

@@ -472,6 +472,13 @@ impl Snapshot {
         &self.dictionary
     }
 
+    /// Whether dictionary IDs denote the same terms in both snapshots. This is distinct
+    /// from content identity: derived views can share a dictionary while reading different
+    /// statements. It says nothing about query-local computed IDs.
+    pub fn shares_dictionary_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.dictionary, &other.dictionary)
+    }
+
     /// Dictionary entries visible to this snapshot.
     pub(crate) fn dictionary_len(&self) -> u64 {
         self.version.dictionary_len

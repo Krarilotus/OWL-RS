@@ -122,24 +122,46 @@ pub fn classify(
 
 /// Normalises, compiles and saturates `ontology`.
 pub fn saturate(ontology: &Ontology, options: &Options) -> Result<Saturated, Unsupported> {
+    let workers = nrese_exec::workers::Workers::new(options.threads);
+    saturate_with_workers(ontology, options, None, &workers)
+}
+
+/// Normalises and saturates on caller-owned physical workers, observing cancellation
+/// at budget checkpoints. Normalisation and compilation are checked at their boundaries.
+pub fn saturate_with_workers(
+    ontology: &Ontology,
+    options: &Options,
+    cancel: Option<crate::Cancel>,
+    workers: &nrese_exec::workers::Workers,
+) -> Result<Saturated, Unsupported> {
+    if cancel.as_ref().is_some_and(crate::Cancel::is_cancelled) {
+        return Err(Unsupported::Budget);
+    }
     let started = Instant::now();
     let normalised = normalise_with(ontology, options.normalise);
     let normalise = started.elapsed();
     let classes = signature(ontology);
-    let mut saturated = saturate_normalised(&normalised, &classes, options)?;
+    let mut saturated = saturate_normalised(&normalised, &classes, options, cancel, workers)?;
     saturated.profile.normalise = normalise;
     Ok(saturated)
 }
 
 /// Compiles and saturates DL-clauses for the named classes `classes` (the classification
-/// driver's Horn lower bound runs it on the Horn part of an ontology's clauses).
+/// driver's Horn lower bound runs it on the Horn part of an ontology's clauses), on
+/// `workers` narrowed to `options.threads`.
 pub fn saturate_normalised(
     normalised: &nrese_owl::Normalised,
     classes: &[Term],
     options: &Options,
+    cancel: Option<crate::Cancel>,
+    workers: &nrese_exec::workers::Workers,
 ) -> Result<Saturated, Unsupported> {
+    let workers = workers.limited(options.threads.max(1));
+    if cancel.as_ref().is_some_and(crate::Cancel::is_cancelled) {
+        return Err(Unsupported::Budget);
+    }
     let mut profile = Profile {
-        threads: options.threads.max(1),
+        threads: workers.width(),
         ..Profile::default()
     };
     let started = Instant::now();
@@ -153,18 +175,32 @@ pub fn saturate_normalised(
     let started = Instant::now();
     let Compiled { program, abox, .. } = compiled;
     let named = program.named();
-    let engine = Engine::new(program, options.strategy, options.proofs)
-        .with_budget(options.budget)
+    let engine = Engine::new(program, options.strategy, options.proofs, options.budget)
+        .with_cancel(cancel)
         .with_prune_pred(options.prune_pred);
+    let mut held = 0;
+    if engine.observing() {
+        engine.hold(&mut held, abox.bytes());
+    }
+    if engine.out_of_budget() {
+        return Err(Unsupported::Budget);
+    }
     let query: Vec<ContextId> = (0..named)
+        .take_while(|_| !engine.exhausted())
         .map(|c| engine.context_for(&[Atom::concept(c, CTerm::X)]).0)
         .collect();
+    if engine.out_of_budget() {
+        return Err(Unsupported::Budget);
+    }
     let (top, _) = engine.context_for(&[]);
     let mut seeds = query.clone();
     seeds.push(top);
-    engine.run(&seeds, options.threads);
-    let individuals = Individuals::saturate(&engine, &abox, options.threads);
-    if engine.exhausted() {
+    engine.run(&seeds, &workers);
+    if engine.out_of_budget() {
+        return Err(Unsupported::Budget);
+    }
+    let assertions_consistent = Individuals::saturate(&engine, &abox, &workers).release(&engine);
+    if engine.out_of_budget() {
         return Err(Unsupported::Budget);
     }
     profile.saturate = started.elapsed();
@@ -184,17 +220,28 @@ pub fn saturate_normalised(
     }
     // The program's named concepts: the signature's classes and any the clauses add.
     let classes = engine.program.names.clone();
+    // The retained results replace the compiled input.
+    let results = super::memory::vec(&query) + super::memory::vec(&classes);
+    if !engine.hold(&mut held, results) {
+        return Err(Unsupported::Budget);
+    }
+    profile.task_memory_peak = engine.task_memory_bytes().1;
     Ok(Saturated {
         engine,
         classes,
         query,
         top,
-        assertions_consistent: individuals.consistent,
+        assertions_consistent,
         profile,
     })
 }
 
 impl Saturated {
+    /// Latest saturation-capacity estimate and sampled peak (zero when disabled).
+    pub fn task_memory_bytes(&self) -> (usize, usize) {
+        self.engine.task_memory_bytes()
+    }
+
     pub fn profile(&self) -> &Profile {
         &self.profile
     }

@@ -202,6 +202,7 @@ pub struct Catalog {
     default: Repository,
     /// The default store's settings, for the others.
     template: StoreConfig,
+    runtime: Arc<crate::Runtime>,
     reasoner: ReasonerService,
     /// Where on-disk repositories live; `None` for an in-memory server.
     root: Option<PathBuf>,
@@ -255,6 +256,7 @@ impl Catalog {
     /// out).
     pub fn open(store: StoreService, reasoner: ReasonerService) -> Result<Self, CatalogError> {
         let template = store.config().clone();
+        let runtime = Arc::clone(store.runtime());
         let default_settings = stored_default_settings(&template)
             .map_err(CatalogError::Store)?
             .unwrap_or_default();
@@ -270,6 +272,7 @@ impl Catalog {
         let repositories = Self {
             default,
             template,
+            runtime,
             reasoner,
             root,
             others: RwLock::default(),
@@ -344,7 +347,8 @@ impl Catalog {
                 .unwrap_or(self.template.ql_rewriting),
             ..self.template.clone()
         };
-        let store = StoreService::new(config).map_err(|error| error.to_string())?;
+        let store = StoreService::with_runtime(config, Arc::clone(&self.runtime))
+            .map_err(|error| error.to_string())?;
         match reasoner.config().materialised_program() {
             Some(program) if !store.reasoning_is_current(&program) => {
                 store

@@ -11,6 +11,9 @@
 //!
 //! Each module is its own package with its own gates (owl2-dl-performance.md §6).
 
+mod cancel;
+pub use cancel::Cancel;
+
 pub mod bounds;
 pub mod classify;
 pub mod context;

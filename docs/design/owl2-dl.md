@@ -510,6 +510,39 @@ disagreement that isn't adjudicated.
 
 ## 7. Classification and realisation
 
+**Explicit-result caching.** The store caches only complete results of explicit
+classification and realisation requests, by asserted revision. A later request retries
+an incomplete attempt under the configured budget (an unsupported ontology repeats its
+work); nothing retries in the background. Publication keeps the first complete result for a revision and prevents
+an older in-flight request from displacing a newer cached revision. Each request still
+receives the result for its own snapshot. Query lower bounds retain their separate
+schema-lifetime taxonomy cache, including sound partial knowledge.
+
+**Completion-state ownership.** Each stage owns its compiled `Prepared`.
+`consistency_with_base` runs the search once and can retain its deterministic checkpoint
+and exact model in `Base`. Where the existing feature analysis rules
+out choices, the completed graph becomes the deterministic base without a copy.
+Classification and realisation keep their
+different individual maps; no cross-stage cache is introduced. Realisation releases
+the base when the initial labels leave no candidates. Otherwise its candidates negate
+unproven classes in that initial model: it retains the deterministic start and releases
+the model that those probes would contradict, avoiding a redundant model attempt.
+
+Every retained probe receives its current configuration. Only the deadline,
+cancellation and workers may differ from the base; another strategy or capacity
+configuration declines reuse before execution and uses the existing fresh search. `None`
+means incompatibility, never timeout or unknown. An initially unknown search can retain
+its deterministic checkpoint without acquiring model status. An operation's `timeout`
+becomes one absolute deadline at its start, which its parts inherit unchanged: model
+rollback and its deterministic fallback, detached terminology and full-ontology
+attempts, queued island batches and portfolio variants. Each solver checks it before it
+starts and while it runs; preparation, state copies, labels and cleanup consume it;
+checks remain cooperative, not preemptive.
+Probe telemetry includes both fallback attempts; the profile now adds initial and
+realisation work. Existing top/subsumption aggregate-counter gaps remain; historical
+counters with narrower coverage are not directly comparable work savings.
+Per-engine capacity checks do not become an aggregate Base-plus-pool memory ceiling.
+
 Never one test per pair of classes:
 - `known_subsumers(C)`: told subsumers, the EL path's, the context core's, and those read from deterministic hypertableau labels. On deterministic ontologies the hierarchy can be read off the labels in a linear number of tests† (HermiT on GALEN).
 - `possible_subsumers(C)`: the candidates the model of `C` leaves; only these are tested, in hierarchy order, by the algorithm of Glimm, Horrocks, Motik, Shearer and Stoilos (*A Novel Approach to Ontology Classification*, JWS 2012)†, which improved some ontologies by one to two orders of magnitude over enhanced traversal†.
@@ -725,17 +758,85 @@ optimisations"), per level:
 | Layout | interning; arenas; trails; persistent dependency sets; split labels | Store `TermId`s throughout (no string decoding on any path); 64-byte hot nodes; bitset labels; clause arenas; mapped checkpointed caches with axiom footprints (the derived-index mechanism of 3 October). |
 | Machine | coarse parallelism over tests, modules and contexts | Morsel parallelism and work stealing as in the query engine; SIMD for label subset and clash tests, blocking signatures and the candidate-subsumer matrix, **only where profiles show it** (D: no published evidence either way); GPU off the critical path (all reports). |
 
+### Bound results and exact-test reuse
+
+The store's `dl/query` modules separate query analysis, ID-level gaps and exact-test
+adaptation. SPARQL owns each retained solution table's snapshot, computed terms and
+reservation. Lower and upper results must share a dictionary; query-local computed IDs
+are remapped before raw IDs are compared. Lower bags and delivery order survive, and a
+true lower ASK skips the upper evaluation. The upper ID table is materialised; decoded
+exact-candidate rows are batched. Under a finite `dl.max_candidates` the capped
+candidate prefix is admitted in term-id order (deterministic, not by meaning); the rest
+are reported unresolved.
+
+Eligible exact tests use the existing `tableau::Prepared` probe engine. One immutable
+program per candidate batch holds a fresh selector per test that implies its assumption;
+only the selected probe asserts its selector, and the unselected definitions are
+conservative extensions of the premise. Each probe owns fresh search state; temporary
+selector axioms are removed from the operation's scratch ontology afterwards. Test forms
+the batch can't express (where no assumption exists) use the scalar reduction, which also
+serves as the batch's differential oracle. There is no cross-query compiled cache: the
+batch owns its program.
+
+Candidates run as a batch of the operation's `Workers` width, each with a one-worker
+child allowance; classification and realisation reuse the same handle across stages and
+context rounds. Finite search memory is divided among the probes actually running.
+Portfolio siblings share a child cancellation token that cannot cancel their request; the
+returned outcome is the first decided one in input order, so its telemetry does not name
+the earliest wall-clock winner.
+
 ## 13. Configuration
+
+This section owns what the DL settings mean; [config-reference.md](../ops/config-reference.md)
+lists the keys and their defaults.
+
+**Time.** A DL operation (a commit's consistency check with its evidence, a query's exact
+services, a classification or realisation) takes one absolute deadline from `dl.timeout`
+when it starts. Every phase measures what remains from that deadline instead of starting
+its own timeout, and checks the request's cancellation flag at the same work boundaries.
+A cancelled query publishes no consistency status for its revision. Exhausted gate
+evidence keeps the sound rejection evidence found so far without claiming it minimal.
+Normalisation and compilation don't poll; schema reading may overrun the deadline by
+their duration.
+
+**Memory (`dl.memory`).** Two checks, both at work boundaries, both cooperative:
+
+- *Context saturation* samples an estimate of the capacity it owns: the compiled program,
+  the context arena and registry, clauses and their indexes, queued payloads, assertion
+  state and worker buffers. Each context publishes its local capacity at its work
+  checkpoints and inbox writers publish queued capacity under the inbox lock; a sampler
+  reads these without taking context locks, on the process watch's cadence and once
+  after each round. Hash-table capacity and B-tree nodes are estimates, not allocator
+  telemetry. Observations can lag growth and overlap during transfers, so an operation
+  near its envelope may stop earlier or later than exact accounting would, and in-flight
+  work can exceed the envelope.
+- *The tableau* checks the capacity it owns; a batch divides the allowance among the
+  probes actually running.
+
+Exhaustion yields an incomplete outcome, never a classification inferred from truncated
+work. Retained classification buffers are charged; result and proof assembly,
+normalisation and compilation temporaries, input snapshots, short-lived recursive
+temporaries, allocator metadata and stacks are not. DL task capacity is separate from the
+native query budget, so one request has no shared end-to-end envelope. `0` disables the
+checks; the standalone context API defaults to none. The profile's `task_memory_peak` is
+the highest sampled estimate (zero when disabled), neither RSS nor an exact peak.
+
+`Budget::max_memory` in the context core measures the **whole process** and is a separate
+opt-in guard; who installs the process limit and which watches reach DL work is in
+[config-reference.md](../ops/config-reference.md#budgets).
+
+The settings; `dl.race`, `dl.cache`, `dl.fallback.*`, `dl.explanations` and `async`
+consistency are designed, not yet settings.
 
 | Setting | Values | Default |
 |---|---|---|
 | `reasoner.mode` | … `owl2-dl` | — |
 | `dl.answers` | `certain-where-complete`, `sound`, `exact` | `certain-where-complete` |
 | `dl.consistency` | `inline`, `async`, `off` | `inline` |
-| `dl.timeout`, `dl.memory` | per task | 30 min, 75% of RAM |
+| `dl.timeout`, `dl.memory` | per operation | 30 min, 4 GiB |
 | `dl.fallback.clauses`, `dl.fallback.equalities`, `dl.fallback.contexts` | budgets of §4 | from the ORE and Oxford runs |
 | `dl.race` | `on`, `off` | `on` above a module size |
-| `dl.threads` | count | every core |
+| `dl.threads` | batch width; 0: every core | 0 |
 | `dl.cache` | `sat`, `completion-graph`, `off` | `sat` |
 | `dl.explanations` | `proofs` (record derivations), `off` | `proofs` |
 

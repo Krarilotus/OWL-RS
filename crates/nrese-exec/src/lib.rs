@@ -34,8 +34,9 @@ pub mod memory;
 pub mod search;
 pub mod sort;
 pub mod table;
+pub mod workers;
 
-pub use budget::{Budget, BudgetExceeded, SharedBudget};
+pub use budget::{Budget, BudgetExceeded, Reservation, SharedBudget};
 pub use join::RowLimit;
 pub use table::IdTable;
 

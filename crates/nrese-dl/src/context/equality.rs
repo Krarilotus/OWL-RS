@@ -30,6 +30,7 @@
 //! complete answer ([`super::Saturated::complete`]) and is not exact for the driver.
 
 use super::atoms::{Atom, CTerm, Kind, union_into};
+use super::memory::push;
 use super::rules::Worker;
 use super::state::{ClauseId, ClauseRef, Rule};
 
@@ -187,6 +188,9 @@ impl Worker<'_> {
                     .copied()
             })
             .collect();
+        self.state.merge_bytes += std::mem::size_of_val(body.as_slice())
+            + std::mem::size_of_val(by.as_slice())
+            + std::mem::size_of_val(premises.as_slice());
         self.state.merges.push(Merge {
             a: t0,
             b: t1,
@@ -195,10 +199,14 @@ impl Worker<'_> {
             premises: premises.into_boxed_slice(),
         });
         self.state.clauses.counters.merges += 1;
+        let bytes = &mut self.state.merge_bytes;
         for t in [t0, t1] {
-            self.state.merges_by_term.entry(t).or_default().push(id);
+            push(self.state.merges_by_term.entry(t).or_default(), id, bytes);
         }
-        self.state.merges_by_pair.entry(key).or_default().push(id);
+        push(self.state.merges_by_pair.entry(key).or_default(), id, bytes);
+        if !self.checkpoint(0) {
+            return;
+        }
         let clauses = &self.state.clauses;
         let about: Vec<ClauseId> = clauses
             .heads
@@ -255,7 +263,9 @@ impl Worker<'_> {
         let Some(ids) = self.state.merges_by_term.get(&head.term()) else {
             return;
         };
-        for m in ids.clone() {
+        let count = ids.len();
+        for at in 0..count {
+            let m = self.state.merges_by_term[&head.term()][at];
             self.copy(c, m);
         }
     }
@@ -339,7 +349,7 @@ fn join(
     for p in candidates {
         union_into(acc, clauses.body(p), &mut union);
         premises.push(p);
-        join(clauses, want, i + 1, &union.clone(), premises, emit);
+        join(clauses, want, i + 1, &union, premises, emit);
         premises.pop();
     }
 }
