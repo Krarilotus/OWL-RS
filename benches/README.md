@@ -188,6 +188,29 @@ Single measurements and diagnoses outside the kits, run with
 | Studies kept for open targets | `nrese-engine`'s ignored tests `compression_study` and `vocabulary_study` (store-size options, P2 in [performance.md](../docs/design/performance.md) §6) |
 | Office PC | `scripts/office/`: dataset preparation (`dbpedia.sh`, `wikidata.sh`) and the perf lab there (`perflab.sh`) |
 
+## The measurement queue
+
+Timed runs don't start by hand: they are jobs in a measure host's queue
+([suite/queue.py](suite/queue.py)), run one at a time, so that no two timings share a
+machine and every system of a comparison runs on the same host under the same limits. A
+host's `queue` in [hosts.toml](hosts.toml) says when a timed job may start: the office PC
+at night or while its owner leaves `~/owlrs/FREE`, never while its owners are present
+(`~/owlrs/RETREAT`; a job they stop runs again); Phuoc-Yu whenever no compiler runs.
+
+```text
+python benches/suite/queue.py submit JOB.toml        the job's checkout pushed to its host, the job queued
+python benches/suite/queue.py status                 every host's pending, running, done and failed jobs
+python benches/suite/queue.py cancel ID --host HOST  a pending job back out
+python benches/suite/queue.py work                   on the host: its runner (one per host, detached)
+```
+
+A job names its group, host, checkout and commands (a build first where it needs one), the
+environment (binaries, a matched scenario's limits), what the host must have, its window
+(`quiet` for timings, `any` for counts), priority and expected minutes. Its results land in
+`~/owlrs/results/<id>` on the host; its record is written from them (`suite.py ledger`).
+Answers come before time: compete captures every answer, a timed `suite.py run` must ask for
+them (`--answers full`), or the job is refused.
+
 ## A run, step by step
 
 ```text
