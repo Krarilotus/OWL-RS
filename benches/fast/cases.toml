@@ -1520,7 +1520,7 @@ args = ["--reason", "owl2-dl", "--commits", "{data}.commits.ru"]
 queries = ""
 metric = "commits.p50_ms"
 check = { "commits.commits" = 200, "commits.error" = "has inconsistent under OWL 2 DL" }
-route = { "commits.error" = "has hypertableau" }
+route = { "commits.error" = "has touched-islands" }
 cap_gb = 4
 systems = []
-guards = ["DL in the store: a commit's consistency proved by U1, a clash sent to a DL engine"]
+guards = ["DL in the store: a commit's consistency proved by U1, a clash sent to a DL engine; after the 200 consistent commits, the adding commit decided on the ABox islands it touches (docs/design/owl2-dl.md §9)"]

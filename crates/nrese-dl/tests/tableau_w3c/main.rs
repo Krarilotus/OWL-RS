@@ -28,12 +28,6 @@
 mod negate;
 mod rdf;
 mod rollup;
-#[allow(
-    dead_code,
-    reason = "the fuzz test's semantics; the witness check uses a part"
-)]
-#[path = "../tableau_fuzz/semantics.rs"]
-mod semantics;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -522,18 +516,18 @@ fn disputed_witnesses_are_models() {
         let mut table = Table::default();
         let o = table.ontology(premise, &case.imports).expect("reads");
         let i = witness(model, &table);
-        let failing: Vec<String> = o
-            .axioms
-            .iter()
-            .filter(|a| !semantics::holds(&o, a, &i))
-            .map(|a| o.functional(a, &|t| table.name(t)))
+        // By the certificate checker, the direct semantics on finite interpretations.
+        let failing: Vec<String> = nrese_dl::certificate::failures(&o, &i)
+            .unwrap_or_else(|why| panic!("{id}: the witness can't be checked: {why}"))
+            .into_iter()
+            .map(|k| o.functional(&o.axioms[k], &|t| table.name(t)))
             .collect();
         assert!(failing.is_empty(), "{id}: the witness fails {failing:#?}");
     }
 }
 
 /// The interpretation a `disputed.txt` model line describes.
-fn witness(line: &str, table: &Table) -> semantics::Interp {
+fn witness(line: &str, table: &Table) -> nrese_dl::certificate::Interpretation {
     use nrese_owl::Terms;
     let mut parts = line.split("; ");
     let n: u32 = parts
@@ -541,9 +535,9 @@ fn witness(line: &str, table: &Table) -> semantics::Interp {
         .and_then(|p| p.split(' ').next())
         .and_then(|k| k.parse().ok())
         .expect("N elements");
-    let mut i = semantics::Interp {
-        n,
-        ..semantics::Interp::default()
+    let mut i = nrese_dl::certificate::Interpretation {
+        size: n as usize,
+        ..nrese_dl::certificate::Interpretation::default()
     };
     for part in parts {
         let (iri, value) = part.split_once(" = ").expect("<iri> = value");
@@ -558,14 +552,18 @@ fn witness(line: &str, table: &Table) -> semantics::Interp {
                     .map(|p| p.trim_matches(|c| " ()".contains(c)))
                 {
                     let (a, b) = pair.split_once(',').expect("(j, k)");
-                    i.add_edge(term, a.trim().parse().unwrap(), b.trim().parse().unwrap());
+                    i.roles
+                        .entry(term)
+                        .or_default()
+                        .push((a.trim().parse().unwrap(), b.trim().parse().unwrap()));
                 }
             } else {
-                let mask = set
+                let members = set
                     .split(',')
                     .filter(|k| !k.trim().is_empty())
-                    .fold(0u128, |m, k| m | 1 << k.trim().parse::<u32>().unwrap());
-                i.concepts.insert(term, mask);
+                    .map(|k| k.trim().parse::<usize>().unwrap())
+                    .collect();
+                i.classes.insert(term, members);
             }
         } else {
             i.individuals

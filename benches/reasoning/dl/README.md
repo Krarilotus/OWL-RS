@@ -15,6 +15,8 @@ The correctness infrastructure of [docs/design/owl2-dl.md](../../../docs/design/
 | `cargo run -p nrese-owl --example fuzz` | random OWL 2 DL ontologies (`nrese_owl::fuzz`, within the global restrictions) as functional-syntax files with a manifest: differential fuzz campaigns on the references, `ore.py compare` lists disagreements |
 | `canonical.py` | the canonical taxonomy from any subsumption closure (NRESE's EL classifier, later `nrese-dl`), with the reference run's signature |
 | `disputed.tsv` | differences settled by hand: `test/task<TAB>reasoner<TAB>result<TAB>why` |
+| `scope.py` | the small-scope campaign (docs/design/owl2-dl.md §11): every OWL 2 DL ontology up to a bound (`nrese_owl::scope`, `cargo run -p nrese-owl --example scope`) or a covering array (`cover:3`), answered by NRESE (`cargo run -p nrese-dl --example scope_check`) and the references (`runner`'s `nrese.dl.Scope`, many ontologies per JVM, one functional-syntax document a line); `run`, `second` (Openllet where HermiT doesn't decide or differs from NRESE), `compare`, `record` (the gate's answers, `crates/nrese-dl/tests/scope`) |
+| `scope-adjudicated.tsv` | the small-scope cases of the gate's scope the references don't settle, each with the answer the semantics gives and why |
 
 ## The canonical taxonomy
 
@@ -66,6 +68,60 @@ rm -rf ../../../tmp/dlw3c
 - **A differential fuzz campaign** (60 random SROIQ(D) ontologies from
   `cargo run -p nrese-owl --example fuzz`): 57 agree; in 3, Konclude differs from HermiT
   and Openllet.
+
+## The small scope (12 October 2026, main PC)
+
+```bash
+cargo build --release -p nrese-owl --example scope -p nrese-dl --example scope_check
+python scope.py run 4,4,4 DIR --reasoners hermit --jobs 6   # NRESE and HermiT, in slices
+python scope.py second 4,4,4 DIR                             # Openllet on the rest
+python scope.py compare DIR
+python scope.py record 3,3 DIR ../../../crates/nrese-dl/tests/scope/reference-3-3.txt \
+  --adjudicated scope-adjudicated.tsv                        # the gate's answers
+```
+
+The runner's jar from the image (`docker cp`) and `nrese.dl.Scope` compiled against it run
+on any JDK 21+ (`DL_RUNNER_JAR`, `DL_RUNNER_CLASSES`). Each case is answered with a code:
+`i` (inconsistent), or `c` and ten bits (A, B satisfiable, `A ⊑ B`, `B ⊑ A`, `⊤ ⊑ A`,
+`⊤ ⊑ B`, `a : A`, `a : B`, `b : A`, `b : B`).
+
+| Campaign | Cases | NRESE and every answering reference agree | NRESE differs from references that agree | references differ | none answered |
+|---|---|---|---|---|---|
+| scope `4,4,4` (every ontology of 1 axiom up to size 4, of 2 and 3 up to total size 4) | 2,761,335 | 2,760,771 | 421 | 139 (NRESE with Openllet 82, HermiT 57) | 4 (2 with every claim certified) |
+| scope `3,3` (the gate's) | 35,505 | 35,454 | 3 | 48 | 0 |
+| covering array of triples (`cover:3`, 3 to 6 axioms of up to size 4; every one of the 47,905 triples of the 67 features) | 3,354 | 3,312 | 3 | 38 (NRESE with HermiT 37, Openllet 1) | 0; 1 NRESE gave up at the campaign's 20 s |
+
+**Every disagreement is settled by the semantics, in NRESE's favour:**
+- *NRESE differs from both references* (421 + 3 + 3): every one involves
+  `owl:topObjectProperty` or a property it makes universal, the forms NRESE answered
+  `unsupported` before 12 October: 348 a key over U (any two named members of the key's
+  class share a named U-value, each other, so the key makes them one; both references apply
+  keys to property assertions only), 73 U as a subproperty, in a chain, an equivalence or
+  an inverse (`U ⊑ r⁻` with `¬r(a, b)`, `U ∘ U ⊑ r` with `r ⊑ ⊥`: inconsistent; both
+  answer consistent).
+- *The references differ:* Openllet reads U as an ordinary property (`∃U.{a}` is `⊤`),
+  misses `owl:bottomDataProperty` (`d ⊑ ⊥D` with a value of `d`), answers `≥ 0 r.⊥`
+  inconsistent and `≥ 2 r.{a}` consistent, and doesn't see that `Self(r)` and `Self(r⁻)`
+  are one class; HermiT errs on a disjoint union with a nominal (`DisjointUnion(A, ∀U.X,
+  {a})` makes `A ≡ {a}`, HermiT entails `b : A`; for 13 such cases NRESE's checked model has
+  `b ∉ A`) and with a complement (`DisjointUnion(A, B, ¬B)`: HermiT entails `⊤ ⊑ A` but not
+  `a : A`). NRESE agrees with one reference in every one of them.
+- *None answered* (HermiT's time-outs, Openllet's errors): `⊤ ⊑ =2 r⁻.(=2 r.∃r.{a})` has the
+  model of two elements with `r` the whole relation; NRESE answers consistent.
+- The gate's 51 are in `scope-adjudicated.tsv`, one line each.
+
+**What the campaign found in NRESE** (each fixed with a guard, 12 October): operands of a
+disjointness the U rewriting made equal were dropped (cases 623, 677, 732, 786: answered
+consistent, inconsistent); keys over a transitive property read asserted edges only
+(found by the review the campaign prompted; HermiT reads them so too, Openllet doesn't);
+the context core took keys to need role assertions, and the classifier called an
+ontology with a key over U alone consistent (1219488); realisation took an individual no
+assertion mentions for a fresh element, past a key (1267640).
+
+**Reference failures** (scope `4,4,4`): HermiT throws on 344 (333 "operands cannot be null or
+empty", on inconsistent inputs such as `⊤ ⊑ ⊥`; 11 stack overflows) and times out on 4;
+Openllet answers unsupported on 414 (reflexive properties, U in domains and ranges),
+throws on 57 (56 "Nominal FunValue … is not found in the KB") and times out on 46.
 
 ## Adjudication
 

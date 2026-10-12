@@ -121,3 +121,72 @@ fn inconsistent_data_loaded_past_the_gate_is_quarantined_not_locked() {
     assert_eq!(status(&dl).consistency.verdict.as_str(), "consistent");
     rejected(insert(&dl, ":x a :D ."));
 }
+
+/// The gate's incremental paths (docs/design/owl2-dl.md §9) against a cold rebuild: after
+/// each commit of a random sequence of assertion changes, the gate accepts exactly what a
+/// fresh store given the same data in one commit accepts. The schema needs the
+/// hypertableau (a union U1 can't decide: `:r`'s ends are `:A` and `:E`, consistent
+/// through `:B`, a clash in U1, which derives `:C` too) and splits the ABox into islands
+/// (`:r` carries nothing between its ends, `:s` does). The
+/// test counts the commits each path decided, so it can't pass by checking everything
+/// whole.
+#[test]
+fn incremental_consistency_on_commit_is_the_cold_check() {
+    const SCHEMA: &str = ":A owl:equivalentClass [ owl:unionOf ( :B :C ) ] . \
+         :B owl:disjointWith :D . :C owl:disjointWith :D . :C owl:disjointWith :E . \
+         :r rdfs:domain :A . :r rdfs:range :E . \
+         :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :s ; owl:allValuesFrom :D ] .";
+    let classes = ["A", "B", "C", "D", "E", "F"];
+    let mut engines: std::collections::HashMap<&'static str, usize> = Default::default();
+    let (mut accepted, mut refused) = (0, 0);
+    let seeds = std::env::var("NRESE_FUZZ_CASES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(8u64);
+    for seed in 0..seeds {
+        let dl = pipeline();
+        insert(&dl, SCHEMA).expect("schema");
+        let mut rng = nrese_owl::fuzz::Rng::new(seed);
+        let mut asserted: Vec<String> = Vec::new();
+        for step in 0..16 {
+            let removal = !asserted.is_empty() && rng.one_in(4);
+            let (command, candidate) = if removal {
+                let gone = asserted[rng.below(asserted.len() as u64) as usize].clone();
+                let rest: Vec<String> = asserted.iter().filter(|f| **f != gone).cloned().collect();
+                (format!("DELETE DATA {{ {gone} }}"), rest)
+            } else {
+                let fact = if rng.one_in(2) {
+                    format!(":i{} a :{} .", rng.below(6), classes[rng.below(6) as usize])
+                } else {
+                    let p = if rng.one_in(2) { "r" } else { "s" };
+                    format!(":i{} :{p} :i{} .", rng.below(6), rng.below(6))
+                };
+                let mut with = asserted.clone();
+                with.push(fact.clone());
+                (format!("INSERT DATA {{ {fact} }}"), with)
+            };
+            // The cold check: a fresh store, the schema and the data in one commit.
+            let cold = pipeline();
+            let cold_ok = insert(&cold, &format!("{SCHEMA} {}", candidate.join(" "))).is_ok();
+            let warm_ok = super::update(&dl, &command).is_ok();
+            assert_eq!(warm_ok, cold_ok, "seed {seed}, step {step}: {command}");
+            if warm_ok {
+                accepted += 1;
+                asserted = candidate;
+                *engines.entry(status(&dl).consistency.engine).or_default() += 1;
+            } else {
+                refused += 1;
+            }
+        }
+    }
+    eprintln!("{accepted} accepted, {refused} refused, by engine {engines:?}");
+    assert!(refused > 0, "no commit was refused");
+    assert!(
+        engines.get("touched-islands").copied().unwrap_or(0) > 0,
+        "{engines:?}"
+    );
+    assert!(
+        engines.get("monotone").copied().unwrap_or(0) > 0,
+        "{engines:?}"
+    );
+}
