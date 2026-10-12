@@ -33,150 +33,136 @@ pub(super) fn decide_until(
     deadline: Instant,
 ) -> Decided {
     let workers = nrese_exec::workers::Workers::current().limited(store.config().dl.threads);
-    workers.install(|| {
-        let unresolved = |why: &str| Decided {
-            verdicts: rows
-                .iter()
-                .map(|_| Entailed::Unknown(why.to_owned()))
-                .collect(),
-            paths: Vec::new(),
-            why: Some(why.to_owned()),
-        };
-        let Some(shape) = &analysis.shape else {
-            return unresolved(
-                "the exact services take one basic graph pattern with filters, not this query",
-            );
-        };
+    let unresolved = |why: &str| Decided {
+        verdicts: rows
+            .iter()
+            .map(|_| Entailed::Unknown(why.to_owned()))
+            .collect(),
+        paths: Vec::new(),
+        why: Some(why.to_owned()),
+    };
+    let Some(shape) = &analysis.shape else {
+        return unresolved(
+            "the exact services take one basic graph pattern with filters, not this query",
+        );
+    };
+    if cancellation.is_cancelled() {
+        return unresolved("cancelled");
+    }
+    if Instant::now() >= deadline {
+        return unresolved("past dl.timeout");
+    }
+    let config = &store.config().dl;
+    let base = ontology_at(store, snapshot);
+    let mut ontology = (*base).clone();
+    let ids = Ids::of(snapshot);
+    let data_properties = data_properties(&ontology);
+    let mut paths = Vec::new();
+    let mut tests = Vec::new();
+    let mut jobs = Vec::with_capacity(rows.len());
+    for (i, row) in rows.iter().enumerate() {
         if cancellation.is_cancelled() {
             return unresolved("cancelled");
         }
         if Instant::now() >= deadline {
             return unresolved("past dl.timeout");
         }
-        let config = &store.config().dl;
-        let base = ontology_at(store, snapshot);
-        let mut ontology = (*base).clone();
-        let ids = Ids::of(snapshot);
-        let data_properties = data_properties(&ontology);
-        let mut paths = Vec::new();
-        let mut tests = Vec::new();
-        let mut jobs = Vec::with_capacity(rows.len());
-        for (i, row) in rows.iter().enumerate() {
+        if i >= config.max_candidates {
+            jobs.push(Err(format!(
+                "past dl.max_candidates ({})",
+                config.max_candidates
+            )));
+            continue;
+        }
+        let instantiated = instantiate(shape, variables, row, snapshot);
+        let built = instantiated.and_then(|atoms| {
+            tests_of(
+                &mut ontology,
+                snapshot,
+                &atoms,
+                ids,
+                &data_properties,
+                &mut paths,
+            )
+        });
+        jobs.push(built.map(|built| {
+            let start = tests.len();
+            tests.extend(built);
+            start..tests.len()
+        }));
+    }
+    let tx = store.engine().speculative();
+    let replica = store.dl().replica();
+    let fresh: Option<Vec<u64>> = (0..source::FRESH)
+        .map(|i| {
+            source::resolve(
+                replica,
+                &tx,
+                NamedNodeRef::new_unchecked(&source::fresh_iri(i)).into(),
+            )
+            .map(TermId::raw)
+        })
+        .collect();
+    let Some(fresh) = fresh else {
+        return unresolved("the entailment tests' terms haven't reached this replica yet");
+    };
+    if cancellation.is_cancelled() {
+        return unresolved("cancelled");
+    }
+    if Instant::now() >= deadline {
+        return unresolved("past dl.timeout");
+    }
+    let compiled = entailment::Batch::new(&mut ontology, &tests);
+    let ontology = &ontology;
+    let width = workers.for_items(
+        jobs.iter()
+            .filter(|job| job.as_ref().is_ok_and(|range| !range.is_empty()))
+            .count(),
+    );
+    let workers = workers.limited(width);
+    let budget = consistency::Budget {
+        timeout: config.timeout,
+        memory_bytes: config.memory_per_worker(width),
+        workers: workers.limited(1),
+        cancel: Some(nrese_dl::tableau::Cancel::from_flag(cancellation.flag())),
+        max_nodes: config.max_nodes,
+        max_branch_points: config.max_branch_points,
+    };
+    let verdicts = workers.map(&jobs, |job| {
+        let range = match job {
+            Ok(range) => range,
+            Err(why) => return Entailed::Unknown(why.clone()),
+        };
+        let mut answer = Entailed::Yes;
+        for i in range.clone() {
             if cancellation.is_cancelled() {
-                return unresolved("cancelled");
+                return Entailed::Unknown("cancelled".to_owned());
             }
             if Instant::now() >= deadline {
-                return unresolved("past dl.timeout");
+                return Entailed::Unknown("past dl.timeout".to_owned());
             }
-            if i >= config.max_candidates {
-                jobs.push(Err(format!(
-                    "past dl.max_candidates ({})",
-                    config.max_candidates
-                )));
-                continue;
-            }
-            let instantiated = instantiate(shape, variables, row, snapshot);
-            let built = instantiated.and_then(|atoms| {
-                tests_of(
-                    &mut ontology,
-                    snapshot,
-                    &atoms,
-                    ids,
-                    &data_properties,
-                    &mut paths,
-                )
-            });
-            jobs.push(built.map(|built| {
-                let start = tests.len();
-                tests.extend(built);
-                start..tests.len()
-            }));
-        }
-        let tx = store.engine().speculative();
-        let replica = store.dl().replica();
-        let fresh: Option<Vec<u64>> = (0..source::FRESH)
-            .map(|i| {
-                source::resolve(
-                    replica,
-                    &tx,
-                    NamedNodeRef::new_unchecked(&source::fresh_iri(i)).into(),
-                )
-                .map(TermId::raw)
-            })
-            .collect();
-        let Some(fresh) = fresh else {
-            return unresolved("the entailment tests' terms haven't reached this replica yet");
-        };
-        if cancellation.is_cancelled() {
-            return unresolved("cancelled");
-        }
-        if Instant::now() >= deadline {
-            return unresolved("past dl.timeout");
-        }
-        let compiled = entailment::Batch::new(&mut ontology, &tests);
-        let ontology = &ontology;
-        let cancel = nrese_dl::tableau::Cancel::from_flag(cancellation.flag());
-        let width = workers.for_items(
-            jobs.iter()
-                .filter(|job| job.as_ref().is_ok_and(|range| !range.is_empty()))
-                .count(),
-        );
-        let workers = workers.limited(width);
-        let child = workers.limited(1);
-        let verdicts = workers.map(&jobs, |job| {
-            let range = match job {
-                Ok(range) => range,
-                Err(why) => return Entailed::Unknown(why.clone()),
-            };
-            let mut answer = Entailed::Yes;
-            for i in range.clone() {
-                if cancellation.is_cancelled() {
-                    return Entailed::Unknown("cancelled".to_owned());
-                }
-                if Instant::now() >= deadline {
-                    return Entailed::Unknown("past dl.timeout".to_owned());
-                }
-                let budget = consistency::Budget {
-                    timeout: deadline.saturating_duration_since(Instant::now()),
-                    memory_bytes: config.memory_per_worker(width),
-                    threads: 1,
-                    workers: Some(child.clone()),
-                    cancel: Some(cancel.clone()),
-                    max_nodes: config.max_nodes,
-                    max_branch_points: config.max_branch_points,
-                };
-                let found = compiled.check(i, &budget).unwrap_or_else(|| {
-                    let budget = consistency::Budget {
-                        timeout: deadline.saturating_duration_since(Instant::now()),
-                        ..budget
-                    };
-                    match &tests[i] {
-                        Test::Axiom(axiom) => entailment::entails(ontology, axiom, &fresh, &budget),
-                        Test::Nonempty(class) => entailment::nonempty(ontology, *class, &budget),
-                    }
-                });
-                match found {
-                    Entailed::Yes => {}
-                    other => {
-                        answer = other;
-                        if answer == Entailed::No {
-                            break;
-                        }
+            let found = compiled.check(i, &tests[i], ontology, &fresh, &budget.remaining(deadline));
+            match found {
+                Entailed::Yes => {}
+                other => {
+                    answer = other;
+                    if answer == Entailed::No {
+                        break;
                     }
                 }
             }
-            answer
-        });
-        let why = verdicts.iter().find_map(|v| match v {
-            Entailed::Unknown(why) => Some(why.clone()),
-            _ => None,
-        });
-        Decided {
-            verdicts,
-            paths,
-            why,
         }
-    })
+        answer
+    });
+    let why = verdicts.iter().find_map(|v| match v {
+        Entailed::Unknown(why) => Some(why.clone()),
+        _ => None,
+    });
+    Decided {
+        verdicts,
+        paths,
+        why,
+    }
 }
 
 /// The ontology's data properties (an existential value of one is `DataSomeValuesFrom`).

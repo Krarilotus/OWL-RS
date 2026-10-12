@@ -1,6 +1,7 @@
 use super::*;
 use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf_io::{RdfFormat, RdfParser};
+use nrese_sparql::QueryEvaluationError;
 use nrese_sparql::ql::{Closure, QlRewriting};
 use std::sync::Arc;
 
@@ -210,7 +211,7 @@ fn generic_serialization_checks_empty_and_boolean_delivery_cancellation() {
                     bytes: Vec::new(),
                 };
                 assert!(matches!(
-                    serialize_answers(&prepared, answers, &mut writer, || check_cancelled(&token)),
+                    serialize_answers(&prepared, answers, &mut writer, &token),
                     Err(StoreError::SparqlEvaluation(
                         QueryEvaluationError::Cancelled
                     ))

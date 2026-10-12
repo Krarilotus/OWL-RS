@@ -84,7 +84,7 @@ impl Search<'_> {
             o.axioms.push(self.ontology.axioms[i].clone());
             o.sources.push(Vec::new());
         }
-        let budget = super::gate::remaining_budget(self.budget, self.deadline);
+        let budget = self.budget.remaining(self.deadline);
         match self.goal {
             Goal::Inconsistent => match consistency::check(&o, &budget).verdict {
                 Verdict::Inconsistent => true,

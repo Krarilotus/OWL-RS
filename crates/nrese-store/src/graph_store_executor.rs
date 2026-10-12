@@ -23,8 +23,8 @@ pub fn execute_graph_read(
     let mut triples: Vec<nrese_rdf::Triple> = Vec::new();
     if let Some(pattern) = request.target.pattern_in(view)? {
         for (index, quad) in decoded_quads(view, model, &pattern).enumerate() {
-            if index % 4096 == 0 && cancel.is_cancelled() {
-                return Err(nrese_sparql::QueryEvaluationError::Cancelled.into());
+            if index % 4096 == 0 {
+                cancel.check()?;
             }
             triples.push(quad?.into());
         }
