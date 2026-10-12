@@ -39,12 +39,13 @@ mod retract;
 mod search;
 mod telemetry;
 
-use std::time::Duration;
+use std::borrow::Cow;
+use std::time::{Duration, Instant};
 
 use nrese_owl::{Concept, Normalised, Ontology, Options, Term, normalise_with};
 
+pub use crate::Cancel;
 pub use model::Model;
-pub use portfolio::Cancel;
 pub use probe::{At, Base, From, Label, Labels, Prepared, Probe, ProbeOutcome, Want};
 pub use program::left_out;
 pub use telemetry::Telemetry;
@@ -107,9 +108,12 @@ pub struct Config {
     /// Sizes of counted classes compared before the search ([`crate::numbers`]): a class
     /// with two sizes refutes the program without a branch.
     pub counting: bool,
-    /// Elapsed allowance, including preparation, compilation and queued portfolio work.
-    /// These stages check before and after running; compilation is not preemptible.
+    /// The time an operation may take from its start, preparation, compilation and
+    /// queueing included: at its start it becomes [`Config::deadline`].
     pub timeout: Option<Duration>,
+    /// The deadline the operation's parts share (an embedding operation's, or the one
+    /// `timeout` gave). Each solver checks it before it starts and while it runs.
+    pub deadline: Option<Instant>,
     /// The most memory a run may hold (its tables, indexes and arenas), in bytes.
     pub max_memory: usize,
     /// Keep the model a consistent run found ([`Outcome::model`]).
@@ -156,6 +160,7 @@ impl Default for Config {
             check_retraction: cfg!(debug_assertions),
             counting: true,
             timeout: None,
+            deadline: None,
             max_memory: 4 << 30,
             keep_model: false,
             lazy_definitions: true,
@@ -167,6 +172,48 @@ impl Default for Config {
         }
     }
 }
+
+impl Config {
+    /// The configuration of an operation starting now: `timeout` folded into the
+    /// deadline its parts share.
+    pub(crate) fn started(&self) -> Cow<'_, Self> {
+        let Some(timeout) = self.timeout else {
+            return Cow::Borrowed(self);
+        };
+        let end = Instant::now() + timeout;
+        Cow::Owned(Self {
+            timeout: None,
+            deadline: Some(self.deadline.map_or(end, |d| d.min(end))),
+            ..self.clone()
+        })
+    }
+
+    /// Why a started operation must not run on, if it must not: cancelled, or past its
+    /// deadline.
+    pub(crate) fn stopped(&self) -> Option<&'static str> {
+        if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+            Some("cancelled")
+        } else if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            Some(TIME_BUDGET)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the two run the same search: they may differ in their deadlines,
+    /// cancellation and workers.
+    pub(crate) fn same_search(&self, other: &Self) -> bool {
+        let mut this = self.clone();
+        this.timeout = other.timeout;
+        this.deadline = other.deadline;
+        this.cancel.clone_from(&other.cancel);
+        this.workers.clone_from(&other.workers);
+        this == *other
+    }
+}
+
+/// Why a run gave up when its deadline passed.
+pub const TIME_BUDGET: &str = "the time budget ran out";
 
 /// Why a run gave up when [`Config::max_branch_points`] ran out.
 pub const BRANCH_BUDGET: &str = "the branch-point budget ran out";
@@ -222,18 +269,25 @@ pub struct Outcome {
     pub features: Features,
 }
 
-/// Whether `ontology` is consistent.
-pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
-    let budget = budget::RunBudget::new(config);
-    consistency_with_budget(ontology, config, &budget).unwrap_or_else(|why| budget.stopped(why))
+impl Outcome {
+    /// A run stopped before it started (`why`).
+    pub(crate) fn stopped(why: &str) -> Self {
+        Self {
+            answer: Answer::GaveUp(why.into()),
+            telemetry: Telemetry::default(),
+            model: None,
+            features: Features::default(),
+        }
+    }
 }
 
-fn consistency_with_budget(
-    ontology: &Ontology,
-    config: &Config,
-    budget: &budget::RunBudget,
-) -> Result<Outcome, &'static str> {
-    let ontology = budget.stage(config, || prepared(ontology))?;
+/// Whether `ontology` is consistent.
+pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
+    let config = &*config.started();
+    if let Some(why) = config.stopped() {
+        return Outcome::stopped(why);
+    }
+    let ontology = prepared(ontology);
     // The engine reads no provenance: minimal automata.
     let options = |lazy_definitions| Options {
         expand_at_most_up_to: config.expand_at_most_up_to,
@@ -242,27 +296,19 @@ fn consistency_with_budget(
         exact_provenance: false,
     };
     if !config.lazy_definitions || config.keep_model {
-        let plain = budget.stage(config, || normalise_with(&ontology, options(false)))?;
-        return Ok(budget.run(config, |remaining| {
-            consistency_of(&ontology, &plain, remaining)
-        }));
+        let plain = normalise_with(&ontology, options(false));
+        return consistency_of(&ontology, &plain, config);
     }
-    let unfolded = budget.stage(config, || normalise_with(&ontology, options(true)))?;
+    let unfolded = normalise_with(&ontology, options(true));
     if unfolded.unfolded == 0 || !config.portfolio {
-        return Ok(budget.run(config, |remaining| {
-            consistency_of(&ontology, &unfolded, remaining)
-        }));
+        return consistency_of(&ontology, &unfolded, config);
     }
-    let plain = budget.stage(config, || normalise_with(&ontology, options(false)))?;
-    let workers = budget.stage(config, || budget::workers(config, 2))?;
+    let plain = normalise_with(&ontology, options(false));
+    let workers = budget::workers(config, 2);
     if workers.width() < 2 {
-        return Ok(budget.run(config, |remaining| {
-            consistency_of(&ontology, &plain, remaining)
-        }));
+        return consistency_of(&ontology, &plain, config);
     }
-    Ok(budget.run(config, |remaining| {
-        portfolio::race(&ontology, &[&plain, &unfolded], remaining, &workers)
-    }))
+    portfolio::race(&ontology, &[&plain, &unfolded], config, &workers)
 }
 
 /// `ontology` with each negative assertion over a non-simple property `¬R(a, b)` as the
@@ -345,26 +391,16 @@ fn run(
     test: Option<Concept>,
     config: &Config,
 ) -> Outcome {
-    let budget = budget::RunBudget::new(config);
-    run_with_budget(ontology, normalised, test, config, &budget)
-        .unwrap_or_else(|why| budget.stopped(why))
-}
-
-fn run_with_budget(
-    ontology: &Ontology,
-    normalised: &Normalised,
-    test: Option<Concept>,
-    config: &Config,
-    budget: &budget::RunBudget,
-) -> Result<Outcome, &'static str> {
-    let started = budget.started;
+    let started = Instant::now();
+    let config = &*config.started();
+    if let Some(why) = config.stopped() {
+        return Outcome::stopped(why);
+    }
     // A model from the counts (docs/design/owl2-dl.md#number-reasoning-layers), checked
     // against every axiom, answers before any search; it is compressed, so not where the
     // caller wants the model.
-    if budget.stage(config, || {
-        test.is_none() && !config.keep_model && crate::numbers::model(ontology).is_some()
-    })? {
-        return Ok(Outcome {
+    if test.is_none() && !config.keep_model && crate::numbers::model(ontology).is_some() {
+        return Outcome {
             answer: Answer::Consistent,
             telemetry: Telemetry {
                 total: started.elapsed(),
@@ -372,16 +408,14 @@ fn run_with_budget(
             },
             model: None,
             features: Features::default(),
-        });
+        };
     }
-    let mut program = budget.stage(config, || Program::compile(ontology, normalised))?;
+    let mut program = Program::compile(ontology, normalised);
     let test = test.map(|c| program.concept(ConceptName::Clause(c)));
-    budget.stage(config, || program.ensure_tables())?;
+    program.ensure_tables();
     let compiled = started.elapsed();
     let features = features(&program);
-    let mut engine = budget.stage(config, || Engine::new(&program, config))?;
-    // Search uses the same clock as compilation, not a fresh timeout after it.
-    engine.started = started;
+    let mut engine = Engine::new(&program, config);
     engine.stats.compile = compiled;
     let seed = match test {
         Some(c) => Seed {
@@ -399,12 +433,12 @@ fn run_with_budget(
     telemetry.bytes_per_hot_node = std::mem::size_of::<graph::HotNode>() as u64;
     telemetry.bytes_per_node = (engine.g.bytes() as u64) / telemetry.peak_nodes.max(1);
     telemetry.dependency_sets = engine.deps.len() as u64;
-    Ok(Outcome {
+    Outcome {
         answer,
         telemetry,
         model,
         features,
-    })
+    }
 }
 
 fn end_is_model(answer: &Answer, _program: &Program) -> bool {

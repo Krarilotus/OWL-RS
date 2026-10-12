@@ -105,8 +105,8 @@ pub struct Maintenance {
 /// given that it was before the transaction's changes: runs the delta executor and applies
 /// its result.
 ///
-/// `stop` is polled throughout the reasoning; when it fires, nothing has been applied to
-/// `tx`'s inferred stack and [`delta::Interrupted`] is returned.
+/// `stop` is polled throughout the reasoning; when it fires, [`delta::Interrupted`] is
+/// returned and `tx`'s inferred stack may be partly updated: the caller drops `tx`.
 pub fn maintain(
     program: &Program,
     ground: Option<&GroundProgram>,
@@ -225,8 +225,7 @@ pub fn maintain(
         };
         // O(stored closure + rebuilt closure) visits, with indexed transaction updates.
         // A stored snapshot shares the old runs and avoids expanding compact equality.
-        // Keep the pre-maintenance inferred view for rollback if the final grounding
-        // (which does not poll stop internally) crosses cancellation or a memory limit.
+        // An interruption drops the transaction, these changes with it.
         if stop() {
             return Err(delta::Interrupted);
         }
@@ -245,13 +244,6 @@ pub fn maintain(
         // the caller commits. Existing unrelated violations remain tolerated.
         update.program = Some(program.ground_program(&tx.pending_snapshot()));
         if stop() {
-            let pending = tx.pending_snapshot().stored();
-            for quad in pending.quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all()) {
-                tx.remove_inferred(quad.into());
-            }
-            for quad in before.quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all()) {
-                tx.insert_inferred(quad.into());
-            }
             return Err(delta::Interrupted);
         }
     }
@@ -471,7 +463,7 @@ mod tests {
                 }
             };
             // Count the cancellation checkpoints, including the final one after
-            // grounding, which must roll inferred content back; no timing or race.
+            // grounding; no timing or race.
             let polls = AtomicUsize::new(0);
             let mut tx = engine.transaction();
             change(&mut tx);
@@ -491,7 +483,6 @@ mod tests {
                     polls.fetch_add(1, Ordering::Relaxed) >= at
                 });
                 assert!(result.is_err(), "revive={revive}, checkpoint={at}");
-                assert_eq!(tx.inferred_pending(), (0, 0));
                 drop(tx);
                 assert_eq!(engine.snapshot().revision(), before.revision());
             }

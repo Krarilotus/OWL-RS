@@ -1,0 +1,66 @@
+id = "2026-10-12-horn-takeover-dl"
+kit = "reasoning/dl (dl_classify, context_classify)"
+purpose = "Horn saturation after consolidating the context engine's budget checks and capacity observations (review tmp/pr23-review/dl-reasoner.md section 2)"
+host = "Phuoc-Yu"
+build_host = "Office-PC"
+commit = "8b2dee9"
+dirty = false
+original = "0f465633d33374bc56ab9ec33157cfa10ebf2d40"
+pr_start = "K of 2026-10-11-horn-recovery (119c191 source; binary 154d4ff9...)"
+candidate_dl_classify_sha256 = "36fc311a5ffb049602c748a792665776a2342ebca3ccceaef3e6e93e20388904"
+original_dl_classify_sha256 = "a113d3f61209e4246e52f5a859e434dd4f0b1523bd449c499758527f04e74d8c"
+k_dl_classify_sha256 = "154d4ff9d47721c03515a88868cf603dfc971a36ae2e184eea2bd0309543f90e"
+toolchain = "Rust 1.98.1 (rust-toolchain.toml), release (fat LTO, one codegen unit), Office native CPU, as the original and K binaries"
+publishable = "all"
+results = "Phuoc-Yu:/home/krarilotus/nrese-takeover-dl-20261011 (8b2dee9-t1, 8b2dee9-t16 and the earlier cohorts)"
+
+[input]
+name = "horn-classes3000.nt"
+sha256 = "0b156b9241392633b258b2188f1857d2ad2893a7f4a7c85d66f8c000881c3d9e"
+taxonomy_sha256 = "f4cd5c2eaea7839d9c6f3a24429a60bd1badc740ae1d5b246478cd8509186d29"
+
+[method]
+command = "dl_classify --threads T --repeat 1 [--task-memory-mib 4096|0] --tax OUT INPUT, inside the existing quiet-slot and /usr/bin/time -v; saturation = profile lower_bound"
+order = "Rotating order per round: original, K (4096 MiB), candidate on (4096 MiB), candidate off (0)"
+rounds = 9
+accepted = "every taxonomy byte-exact (72 of 72)"
+
+[counts]
+# context_classify --strategy split --no-proofs --task-memory-mib 4096, Office; deterministic serially
+messages = 29572135
+clauses_generated = 2977855
+clauses_kept = 2265294
+batches_serial = 1636681
+budget_checks_serial = 1647313
+budget_checks_k = "three per batch (take, i == 0 checkpoint, batch end), plus a clock read per publication"
+observations_serial = 515480
+observations_k = "two summaries per batch and one per 256 messages or given clauses"
+task_memory_peak_serial = 2461891973
+batches_16t = 243916
+budget_checks_16t = 321129
+
+[serial]
+original_ms = [4888.5, 4893.9, 4902.4, 4903.7, 4919.3, 4987.5, 5194.3, 5197.8, 5206.8]
+k_ms = [5150.5, 5153.3, 5153.5, 5154.9, 5156.5, 5157.0, 5168.7, 5259.0, 5294.0]
+candidate_on_ms = [4980.0, 4983.3, 4984.7, 4984.8, 4985.3, 4999.6, 5011.9, 5015.5, 5165.4]
+candidate_off_ms = [4949.5, 4955.2, 4957.7, 4962.9, 4985.7, 4996.3, 5082.2, 5129.6, 5303.1]
+medians_ms = { original = 4919.3, k = 5156.5, candidate_on = 4985.3, candidate_off = 4985.7 }
+rss_median_kib = { original = 2943016, k = 2943276, candidate_on = 2944400, candidate_off = 2944692 }
+
+[threads16]
+original_ms = [778.4, 804.0, 805.1, 807.9, 820.3, 821.8, 824.0, 826.9, 841.4]
+k_ms = [796.4, 797.0, 804.1, 804.8, 808.6, 824.7, 837.6, 885.0, 905.4]
+candidate_on_ms = [774.6, 796.3, 797.9, 798.6, 803.2, 813.6, 814.4, 827.1, 842.9]
+candidate_off_ms = [776.7, 791.2, 798.7, 798.9, 807.7, 810.2, 811.2, 814.5, 815.5]
+medians_ms = { original = 820.3, k = 808.6, candidate_on = 803.2, candidate_off = 807.7 }
+rss_median_kib = { original = 3279988, k = 3239912, candidate_on = 3258876, candidate_off = 3239120 }
+
+[earlier_cohorts]
+# Same host and protocol, separate cohorts; not pooled.
+first_step_7469ce9 = "serial medians original 4940 / on 5039 / off 4954 ms (5 rounds): the remaining cost was the per-batch publication"
+interval_publication_5ef368b = "serial medians original 4912 / on 4945 / off 4901 ms (5 rounds)"
+deadline_626e993 = "serial medians original 4912 / K 5168 / on 4975 / off 4902 ms; 16 threads 819 / 807 / 819 / 804 ms (7 and 9 rounds)"
+queued_every_16th_8b2dee9 = "serial medians original 4895 / 626e993 4997 / this 4935 ms (7 rounds)"
+
+[verdict]
+result = "Serial with observations on: +1.3% over the original (K: +4.8%); 16 threads: 2% under the original. The candidate's off path, unchanged code, measured -0.2% (626e993) and +1.4% (8b2dee9) against the original in two cohorts: about 1.5% is this host's build-to-build spread, so the serial result is at the original within that spread, not below it."

@@ -32,9 +32,14 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use nrese_dl::classify::{self, Options};
+use nrese_exec::workers::Workers;
 use nrese_owl::{FunctionalReader, Intern, Statement, Term, TermKind, Terms};
 use nrese_rdf::{BlankNode, Literal, NamedNode, Term as RdfTerm, Triple};
 use nrese_rdf_io::{RdfFormat, RdfParser};
+
+#[path = "support/task_memory.rs"]
+mod support;
+use support::task_memory;
 
 /// The terms of the triples, by id.
 #[derive(Default)]
@@ -196,7 +201,7 @@ fn args() -> Result<Args, String> {
                 .ok_or(format!("{what} N"))
         };
         match arg.as_str() {
-            "--threads" => a.options.threads = number("--threads")?.max(1) as usize,
+            "--threads" => a.options.workers = Workers::new(number("--threads")? as usize),
             "--repeat" => a.repeat = number("--repeat")?.max(1) as usize,
             "--timeout" => a.options.timeout = Some(Duration::from_secs(number("--timeout")?)),
             "--lower-bound-timeout" => {
@@ -233,16 +238,7 @@ fn args() -> Result<Args, String> {
                 a.options.max_memory = Some(number("--max-memory-mb")? << 20);
             }
             "--task-memory-mib" => {
-                let mib = usize::try_from(number("--task-memory-mib")?)
-                    .map_err(|_| "memory budget overflow")?;
-                a.options.task_memory = if mib == 0 {
-                    None
-                } else {
-                    Some(
-                        mib.checked_mul(1024 * 1024)
-                            .ok_or("memory budget overflow")?,
-                    )
-                };
+                a.options.task_memory = task_memory(number("--task-memory-mib")?)?;
             }
             "--expand-at-most" => {
                 let n = number("--expand-at-most")? as u32;
