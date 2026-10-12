@@ -323,6 +323,16 @@ class Hosts(unittest.TestCase):
         self.assertEqual(hosts.volume("fast", registry, {"NRESE_FAST_VOLUME": "mine"}), "mine")
         self.assertEqual(hosts.volume("data", environ={}), "nrese-bench-data")
 
+    def test_a_hosts_configuration_is_the_one_in_force_when_a_run_started(self):
+        registry = {"host": {"phuoc-yu": {"hostname": "Phuoc-Yu", "config": [
+            {"since": "2026-10-12T13:00", "governor": "performance"}, {"since": "2026-10-09", "governor": "powersave"}]}}}
+        self.assertEqual(hosts.configuration("phuoc-yu", "2026-10-12T12:14:30", registry)["governor"], "powersave")
+        self.assertEqual(hosts.configuration("phuoc-yu", "2026-10-12T13:00:00+02:00", registry)["governor"], "performance")
+        self.assertIsNone(hosts.configuration("phuoc-yu", "2026-10-01", registry))
+        self.assertEqual(hosts.run_identity({"host": "Phuoc-Yu"}, "2026-10-12T10:51:30", registry),
+                         {"host": "phuoc-yu", "config": "2026-10-09", "governor": None})
+        self.assertEqual(hosts.run_identity({"host": "laptop"}, "2026-10-12", registry)["config"], "-")
+
     def test_the_repository_registry_reads(self):
         registry = hosts.load()
         self.assertIn("build", registry["host"]["office-pc"]["roles"])
