@@ -23,14 +23,20 @@ pub const EXHAUSTED: &str = "the request's memory envelope ran out";
 pub struct Scratch(Option<Reservation<Envelope>>);
 
 impl Scratch {
-    /// Scratch drawing from `envelope`; with none, nothing is counted.
+    /// Scratch drawing from `envelope`; with none, or one that can't refuse, nothing is
+    /// counted (and no size estimated).
     pub fn new(envelope: Option<&Envelope>) -> Self {
-        Self(envelope.map(|envelope| Reservation::new(envelope.clone())))
+        Self(
+            envelope
+                .and_then(Envelope::bounded)
+                .map(|envelope| Reservation::new(envelope.clone())),
+        )
     }
 
-    /// Reserves `bytes` more, or fails without reserving them.
-    pub fn charge(&mut self, bytes: usize) -> Result<(), BudgetExceeded> {
-        self.0.as_mut().map_or(Ok(()), |held| held.charge(bytes))
+    /// Reserves the `bytes` it estimates more, or fails without reserving them; estimates
+    /// only where something is counted.
+    pub fn charge(&mut self, bytes: impl FnOnce() -> usize) -> Result<(), BudgetExceeded> {
+        self.0.as_mut().map_or(Ok(()), |held| held.charge(bytes()))
     }
 
     /// Returns up to `bytes` of what this holds (a stage's output dropped).

@@ -142,29 +142,32 @@ fn a_request_past_its_envelope_through_any_end_ends_within_it() {
         ends.push((limit, end));
         limit += limit / 4;
     }
-    // The smallest envelope that answers: a byte less, and the engines are refused, the
-    // last of the request's parts to grow.
+    // Every end is reached in order as the envelope grows (in steps of a quarter, far
+    // from the few bytes parallel kernels vary by).
+    let reached: Vec<End> = ends.iter().map(|&(_, end)| end).collect();
+    assert!(reached.is_sorted(), "{ends:?}");
+    // Near the smallest envelope that answers, the engines are refused: the last of the
+    // request's parts to grow.
     let below = ends.iter().rev().find(|&&(_, end)| end != End::Answered);
     let above = ends.iter().find(|&&(_, end)| end == End::Answered);
-    let (Some(&(mut low, _)), Some(&(mut high, _))) = (below, above) else {
+    let (Some(&(mut low, mut low_end)), Some(&(mut high, _))) = (below, above) else {
         panic!("{ends:?}")
     };
     while high - low > 1 {
         let mid = low + (high - low) / 2;
         match run(&store, &store.envelope(Some(mid))) {
             End::Answered => high = mid,
-            _ => low = mid,
+            end => (low, low_end) = (mid, end),
         }
     }
-    let at = ends.partition_point(|&(limit, _)| limit < low);
-    ends.insert(at, (low, run(&store, &store.envelope(Some(low)))));
-    ends.insert(at + 1, (high, run(&store, &store.envelope(Some(high)))));
-    // Every end is reached, and a larger envelope gets no earlier.
-    let reached: Vec<End> = ends.iter().map(|&(_, end)| end).collect();
+    let mut reached = reached;
+    reached.push(low_end);
     for end in [End::Bounds, End::Compilation, End::Engines, End::Answered] {
-        assert!(reached.contains(&end), "{end:?} never reached: {ends:?}");
+        assert!(
+            reached.contains(&end),
+            "{end:?} never reached: {ends:?}, {low}: {low_end:?}"
+        );
     }
-    assert!(reached.is_sorted(), "{ends:?}");
     // The store answers the next request in full.
     assert_eq!(run(&store, &store.envelope(None)), End::Answered);
 }

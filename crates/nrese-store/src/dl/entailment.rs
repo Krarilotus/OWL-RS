@@ -296,7 +296,7 @@ fn copy(
 ) -> Result<(Ontology, nrese_dl::memory::Scratch), Entailed> {
     let mut scratch = nrese_dl::memory::Scratch::new(budget.memory.as_ref());
     scratch
-        .charge(nrese_dl::memory::ontology_bytes(premise))
+        .charge(|| nrese_dl::memory::ontology_bytes(premise))
         .map_err(|_| Entailed::Unknown(nrese_dl::memory::EXHAUSTED.to_owned()))?;
     Ok((premise.clone(), scratch))
 }

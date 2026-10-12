@@ -216,12 +216,12 @@ pub struct Budget {
 
 impl Engine {
     pub fn new(program: Program, strategy: Strategy, proofs: bool, budget: Budget) -> Self {
-        let observer = (budget.task_memory.is_some() || budget.memory.is_some()).then(|| {
-            Observer::new(
-                budget.task_memory.unwrap_or(usize::MAX),
-                budget.memory.clone(),
-            )
-        });
+        let envelope = budget
+            .memory
+            .as_ref()
+            .and_then(nrese_exec::Envelope::bounded);
+        let observer = (budget.task_memory.is_some() || envelope.is_some())
+            .then(|| Observer::new(budget.task_memory.unwrap_or(usize::MAX), envelope.cloned()));
         let engine = Self {
             program,
             strategy,
