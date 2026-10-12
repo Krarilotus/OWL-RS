@@ -19,12 +19,12 @@ the backlog.
 
 | Benchmark | Home turf of | Contenders as run | Published numbers | NRESE's support | State |
 |---|---|---|---|---|---|
-| Filtered vector search (`vector-recall`) | – (NRESE's own gate) | the fast cases `vector-knn-exact`, `vector-knn-filtered` | – | `SERVICE nrv:search` | **fixed** (the probe-first route's beam); jobs queued |
+| Filtered vector search (`vector-recall`) | – (NRESE's own gate) | the fast cases `vector-knn-exact`, `vector-knn-filtered` | – | `SERVICE nrv:search` | **fixed**: recall 0.56 → 0.98 on Phuoc-Yu ([record](../runs/2026-10-12-vector-filtered-fix-phuoc.toml)); Office-PC's jobs queued |
 | [ann-benchmarks](vectors/) | Qdrant, pgvector; hnswlib as the library reference | upstream's harness at 2e081ad, NRESE as a module (its server in the container, SPARQL per query); all at M 16; Qdrant 1.19.2, pgvector v0.8.7 | ann-benchmarks.com | HNSW over vector literals, through SPARQL | images and SIFT, GloVe jobs queued |
 | [Geographica 2](geographica2/) | Jena GeoSPARQL, GraphDB (GeoSPARQL plugin), RDF4J; QLever and Virtuoso as far as they go | the suite's adapters, each system's spatial setup when a workload needs `geosparql` | RDF4J 2.4.3, GraphDB 8.6.1, Strabon, uSeekM, Parliament (2019, the paper's Tables 13/14) | GeoSPARQL 1.1 | data pinned; jobs queued |
 | [ERA-SHACL](era-shacl/) | Jena, TopBraid, RDF4J, pySHACL; maplib (the Rust rival) | upstream's engines at fe109c9, their versions, prebuilt; one memory cap and heap for all | per engine in upstream's `results/` | SHACL Core and SHACL-SPARQL, in memory | data pinned; jobs queued |
 | [StarBench](starbench/) | GraphDB, Stardog (RDF-star); Jena, Oxigraph | the suite's adapters; GraphDB and Stardog load RDF-star, the others RDF 1.2 | Jena 4.7.0, Oxigraph 0.3.16, GraphDB 10.0.2, Stardog 8.1 (paper, Table 1) | RDF 1.2, SPARQL 1.2 | backlog: data fetched, workload defined |
-| LUBMft (`fulltext-search`) | Jena text, Virtuoso, QLever | – | ESWC 2009 | `bds:`, `text:query`, `luc:` | backlog, **blocked: the generator is lost** |
+| LUBMft (`fulltext-search`) | Jena text, Virtuoso, QLever | – | ESWC 2009 | `bds:`, `text:query`, `luc:` | backlog: the generator and query template are lost |
 | FedShop | FedX, CostFed, Semagrow, HeFQUIN, FedUP | – | Zenodo `eval-model.zip` | `SERVICE`; **no source selection** | backlog: data fetched |
 | VIBE, big-ann filtered, VectorDBBench | index libraries; filter-aware indexes; the vector databases | – | their sites | as above | backlog |
 | Larger than memory | NRESE's budgets against JVM heaps and QLever's sort memory | – | – | load and materialisation budgets | backlog |
@@ -73,12 +73,12 @@ Licensed systems (GraphDB, Stardog) run on our machines only; their rows carry
 - **Docs:** `docs/ops/http-api.md` says SHACL validation is "SHACL Core only", while
   `systems.toml` and the fast suite's `shacl-lubm` case run SHACL-SPARQL.
 
-## Decisions needed
+## Decisions (the owner, 12 October 2026)
 
-- **LUBMft:** reconstruct its generator from the paper (names from the 1990 census, text
-  from a topic model of the NIPS papers; the 20 queries are fully specified), or replace it
-  as the full-text benchmark (BEIR for ranking, QLever's own text workloads for speed).
-- **Interface changes to the suite** (with the framework's thread): the tasks `validate` and
-  `index`; `Plan.inputs_for` (a system's own form of the same data) and `Plan.services` (the
-  index a workload needs, which each adapter configures); the capabilities `rdf12` and
-  `vector`; a recall field for approximate search (ann-benchmarks' recall is in `note`).
+- **LUBMft** stays in the backlog with its note: the generator and the query template are lost.
+- **The interface changes** (the tasks `validate` and `index`, `Plan.inputs_for` and
+  `Plan.services`, the capabilities `rdf12` and `vector`, a recall field for approximate
+  search) are the framework thread's to integrate into `v2/bench`; this kit follows what it
+  changes.
+- The vector findings (the exact scan chosen by cost; the graph's own recall at the default
+  beam) go to the optimisation round.
