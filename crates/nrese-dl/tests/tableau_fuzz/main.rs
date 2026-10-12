@@ -383,8 +383,11 @@ fn check_case(
 fn answers_agree_with_the_semantics() {
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
     let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x0020_2610_0333);
-    let tally = campaign(seed, cases, env("NRESE_FUZZ_ONLY"));
-    assert!(tally.inconsistent > 0 && tally.consistent > 0, "{tally:?}");
+    let only = env("NRESE_FUZZ_ONLY");
+    // Both kinds of answer; a single case asked for alone can't have both.
+    let covered = |t: &Tally| only.is_some() || (t.inconsistent > 0 && t.consistent > 0);
+    let tally = campaign(seed, cases, only, &covered);
+    assert!(covered(&tally), "{tally:?}");
 }
 
 /// Guard (the oracle): seed 94543, case 143 is consistent (a 3-cycle along a property
@@ -393,7 +396,7 @@ fn answers_agree_with_the_semantics() {
 /// new seeds as "consistent, but no model", a confirmation the oracle couldn't make.
 #[test]
 fn a_loop_folded_onto_its_blocker_is_untied() {
-    let tally = campaign(94543, 144, Some(143));
+    let tally = campaign(94543, 144, Some(143), &|_| true);
     assert_eq!(tally.consistent, 1, "{tally:?}");
 }
 
@@ -405,7 +408,7 @@ fn a_loop_folded_onto_its_blocker_is_untied() {
 /// folded model fails and no small model exists").
 #[test]
 fn a_lift_keeps_some_properties_loops_and_unties_others() {
-    let tally = campaign(182, 20, Some(19));
+    let tally = campaign(182, 20, Some(19), &|_| true);
     assert_eq!(tally.consistent, 1, "{tally:?}");
     assert_eq!(
         tally.confirmed_by_model + tally.confirmed_by_search,
@@ -424,7 +427,7 @@ fn a_lift_keeps_some_properties_loops_and_unties_others() {
 /// changes the answer".
 #[test]
 fn a_backtrack_never_restores_a_point_older_than_a_retraction() {
-    let tally = campaign(131, 139, Some(138));
+    let tally = campaign(131, 139, Some(138), &|_| true);
     assert_eq!(tally.inconsistent, 1, "{tally:?}");
 }
 
@@ -514,13 +517,17 @@ fn expand(c: &nrese_dl::numbers::candidate::CompressedModelCandidate) -> Interp 
     i
 }
 
-/// The random cases of `seed` (`only`: that one alone), each checked against the semantics.
-fn campaign(seed: u64, cases: u64, only: Option<u64>) -> Tally {
+/// The random cases of `seed` (`only`: that one alone), each checked against the semantics:
+/// `cases` of them, and more (up to ten times as many) until `covered` holds.
+fn campaign(seed: u64, cases: u64, only: Option<u64>, covered: &dyn Fn(&Tally) -> bool) -> Tally {
     let mut rng = Rng::new(seed);
     let mut check = Rng::new(seed ^ 0xA5A5);
     let mut tally = Tally::default();
     let mut unconfirmed = Vec::new();
-    for case in 0..cases {
+    for case in 0..cases * 10 {
+        if case >= cases && covered(&tally) {
+            break;
+        }
         let mut names: HashMap<String, Term> = HashMap::new();
         let mut intern = |n: &Name| {
             let key = format!("{n:?}");

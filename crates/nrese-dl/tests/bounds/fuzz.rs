@@ -256,7 +256,14 @@ fn u1_is_a_model_when_clash_free_and_contains_l() {
     let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x2026_1003_0322);
     let mut tally = Tally::default();
     let mut failures = Vec::new();
-    for case in 0..cases {
+    let covered = |t: &Tally| t.models * 3 >= t.cases;
+    // Draw on (up to ten times as many cases) until the run covers what the assertion
+    // below asks for, so that coverage never depends on the seed (the NI fuzz test's
+    // fix, a901e34; seed 66810 of the SPARQL differential tests, 12 October 2026).
+    for case in 0..cases * 10 {
+        if case >= cases && covered(&tally) {
+            break;
+        }
         let mut rng = Rng::new(seed.wrapping_add(case));
         let mut table = Table::default();
         let sizes = Sizes {
@@ -348,8 +355,5 @@ fn u1_is_a_model_when_clash_free_and_contains_l() {
     }
     eprintln!("{tally:?}");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    assert!(
-        tally.models * 3 >= tally.cases,
-        "too few clash-free cases: {tally:?}"
-    );
+    assert!(covered(&tally), "too few clash-free cases: {tally:?}");
 }
