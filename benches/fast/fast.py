@@ -147,6 +147,12 @@ def capped(gb: float) -> float:
     return min(gb, float(limit)) if limit else gb
 
 
+def quiet_label() -> list[str]:
+    """The quiet slot's token as a container label: the measurement's own containers."""
+    token = ENV.get("NRESE_QUIET_TOKEN") or os.environ.get("NRESE_QUIET_TOKEN")
+    return ["--label", f"nrese.quiet={token}"] if token else []
+
+
 def cpu_args() -> list[str]:
     """`--cpus N` when a run gives every container the same CPUs (DOCKER_CPUS, as the suite)."""
     cpus = os.environ.get("DOCKER_CPUS")
@@ -163,14 +169,19 @@ def quiet_slot(what: str):
         yield
         return
     bash = os.environ.get("NRESE_BASH") or (r"C:\Program Files\Git\bin\bash.exe" if os.name == "nt" else "bash")
-    holder = subprocess.Popen([bash, str(ROOT / "scripts" / "quiet-slot.sh"), "bash", "-c", "echo held; read _", what],
+    holder = subprocess.Popen([bash, str(ROOT / "scripts" / "quiet-slot.sh"), "bash", "-c",
+                               'echo "held $NRESE_QUIET_TOKEN"; read _', what],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=ENV)
-    if holder.stdout.readline().strip() != "held":
+    said = holder.stdout.readline().split()
+    if not said or said[0] != "held":
         holder.kill()
         raise RuntimeError(f"quiet slot not taken for {what}")
+    # The slot's token labels the measurement's containers: the slot's watcher pauses others.
+    ENV["NRESE_QUIET_TOKEN"] = said[1] if len(said) > 1 else ""
     try:
         yield
     finally:
+        ENV.pop("NRESE_QUIET_TOKEN", None)
         holder.stdin.close()
         holder.wait(timeout=60)
 
@@ -183,7 +194,8 @@ def container(name: str, cap_gb: float, command: list[str], env: dict | None = N
     SCRATCH.mkdir(parents=True, exist_ok=True)
     if RUNTIME == "native":
         return process(name, cap_gb, command, env, timeout)
-    argv =["run", "--rm", "--name", name, f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g", *cpu_args(),
+    argv = ["run", "--rm", "--name", name, f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g", *cpu_args(),
+            *quiet_label(),
             "-v", f"{TARGET_VOLUME}:/target:ro", "-v", f"{DATA_VOLUME}:/fast",
             "-v", f"{BENCH_VOLUME}:/data:ro", "-v", f"{host_path(ROOT)}:/src:ro",
             "-v", f"{host_path(SCRATCH)}:/out"]
