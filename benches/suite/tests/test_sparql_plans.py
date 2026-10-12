@@ -64,7 +64,7 @@ class Rootfs(unittest.TestCase):
                         [Mount("/host/data", "/data"), Mount("/host/store", "/store", readonly=False)],
                         entrypoint=True, memory="12g")
             argv = runtime.argv(spec)
-        self.assertEqual(argv[:7], ["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=12g", "-p"])
+        self.assertEqual(argv[:7], ["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=12G", "-p"])
         self.assertIn("--tmp-overlay", argv)
         self.assertEqual(argv[argv.index("--overlay-src") + 1], str(image / "rootfs"))
         joined = " ".join(argv)
