@@ -844,8 +844,6 @@ metric = "sum_p50_ms"
 check = { "recall" = ">= 0.9" }
 route = {}
 cap_gb = 6
-outcome = "wrong"
-known = "recall 0.56 with the graph prepared (aabd47a, 12 Oct 2026, runs/2026-10-12-vector-recall-phuoc.toml): the HNSW graph finds 0.48 of the true ten even unfiltered at the default beam on these random 64-dimensional vectors, and the filtered search takes the graph at 10 % selectivity, where beam 1024 reaches 0.96 at the exact scan's cost (11.1 against 10.7 ms)"
 systems = []
 
 [[case]]
