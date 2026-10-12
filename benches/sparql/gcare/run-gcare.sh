@@ -3,7 +3,7 @@
 # (scripts/run-build.sh and run-accuracy-exps.sh at d603d2b): p = 0.03, seed 0; 30 trials for
 # the sampling estimators (wj, cs, jsub, impr), one for the deterministic ones (cset, sumrdf,
 # bsk with budget 4096, sumrdf with threshold 0.15). Compiled and run in a capped container
-# (4 CPUs, 16 GB), after any timed measurement holding the host's quiet slot.
+# (4 CPUs, 16 GB). Its estimation times are timings: run it inside scripts/quiet-slot.sh.
 #
 #   benches/sparql/gcare/run-gcare.sh OUT-DIR [DATASET...] [-- METHOD...]
 #
@@ -25,8 +25,6 @@ DATA=${SPARQL_DATA:-$HOME/owlrs/sparql-data}
 code=$DATA/src/gcare-code
 [ "$(git -C "$code" rev-parse --short=7 HEAD)" = d603d2b ] || { echo "$code is not G-CARE d603d2b" >&2; exit 1; }
 mkdir -p "$OUTDIR"
-lock=${NRESE_QUIET_DIR:-$HOME/.nrese-quiet-slot}
-while [ -d "$lock" ] && kill -0 "$(cat "$lock/pid" 2>/dev/null || echo 0)" 2>/dev/null; do sleep 60; done
 docker run --rm --name sparql-gcare --cpus 4 --memory 16g --memory-swap 16g --cpu-shares 2 \
   -v "$code:/gcare" -v "$DATA/src/gcare:/published:ro" -v "$OUTDIR:/out" \
   -e DATASETS="${datasets[*]}" -e METHODS="${methods[*]}" -e UID_GID="$(id -u):$(id -g)" ubuntu:24.04 sh -c '

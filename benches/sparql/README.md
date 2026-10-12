@@ -40,7 +40,7 @@ Ryzen 9 5950X), every system in Docker under the same container memory limit:
 | Virtuoso | 7.2.17; `NumberOfBuffers` 2720000, `MaxDirtyBuffers` 2000000 (virtuoso.ini's values for 32 GB, the paper's) | the same buffers; `ServerThreads` 100 and `ThreadsPerQuery` 8 as the report's virtuoso.ini |
 | MillenniumDB | built from ecbf6dd (the paper's commit) on Ubuntu 24.04 ([../competitors/millenniumdb/Dockerfile](../competitors/millenniumdb/Dockerfile)); `--threads 2 --versioned-buffer 22GB --unversioned-buffer 2GB --strings-static 4GB --strings-dynamic 4GB --timeout 180` | - |
 | Jena | 6.2.0, `tdb2.xloader` as the paper loads DBLP; Fuseki `--timeout` at the query limit; heap within the container | `tdb2.tdbloader` |
-| NRESE | on-disk store; query memory 20 GB (`QUERY_MEMORY_MIB`, NRESE's equivalent of QLever's 26 GB for queries) | the same |
+| NRESE | on-disk store; 26 GB for queries, per query and in all (`QUERY_MEMORY_MIB`, `TOTAL_QUERY_MEMORY_MIB`), what QLever's configuration gives its queries | the same |
 
 The settings are environment variables of the suite's adapters (`QLEVER_INDEX_SETTINGS`,
 `QLEVER_VOCABULARY_TYPE`, `QLEVER_CACHE_MAX_SIZE`, `QLEVER_RUNTIME`,

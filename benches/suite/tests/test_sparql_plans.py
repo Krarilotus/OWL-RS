@@ -33,9 +33,44 @@ class KnownAnswers(unittest.TestCase):
         plan = workloads.plans(ROOT, "sparqloscope", None, {})[0]
         self.assertEqual(plan.tier, "sparqloscope-dblp")
         self.assertEqual(len(list(plan.queries.glob("*.rq"))), 105)
-        self.assertEqual(plan.answers["003-join-2-large-large"], {"value": 51891252})
-        # Disputed in the paper's results: no known answer, the references decide.
-        self.assertNotIn("071-regex-prefix-1", plan.answers)
+        self.assertEqual(plan.inputs, ["/data/dblp-kg-20261011.nt"])
+        # The paper's answers are of another release of DBLP: the references decide here.
+        self.assertEqual(plan.answers, {})
+        known = sparql_plans.known_from_checks(ROOT / "benches/sparql/sparqloscope/dblp-checks.toml")
+        self.assertEqual(known["003-join-2-large-large"], {"value": 51891252})
+        self.assertNotIn("071-regex-prefix-1", known)  # disputed among the paper's engines
+
+    def test_bsbm_runs_its_own_driver(self):
+        plan = workloads.plans(ROOT, "bsbm", ["bsbm-bi-100m"], {"SPARQL_DATA": "/d"})[0]
+        self.assertEqual(plan.inputs, ["/data/bsbm-100m.nt"])
+        self.assertIn("{endpoint}", plan.external)
+        self.assertEqual(plan.external[plan.external.index("--mix") + 1], "bi")
+        unset = workloads.plans(ROOT, "bsbm", ["bsbm-bi-100m"], {})[0]
+        self.assertIn("SPARQL_DATA", unset.unavailable)
+
+
+class Rootfs(unittest.TestCase):
+    def test_an_image_runs_unpacked_as_under_docker(self):
+        from suitekit.runtime import RootfsRuntime, Spec
+        with tempfile.TemporaryDirectory() as d:
+            image = Path(d) / "vendor_store_1.0"
+            (image / "rootfs").mkdir(parents=True)
+            (image / "config.json").write_text(
+                '[{"Config": {"Env": ["PATH=/usr/bin"], "Entrypoint": ["/entry.sh"], "WorkingDir": "/srv"}}]',
+                encoding="utf-8")
+            runtime = RootfsRuntime(Path(d), 18950, Path(d))
+            self.assertTrue(runtime.image_present("vendor/store:1.0"))
+            spec = Spec("s", "vendor/store:1.0", ["serve", "--port", "7"], {"K": "v"},
+                        [Mount("/host/data", "/data"), Mount("/host/store", "/store", readonly=False)],
+                        entrypoint=True, memory="12g")
+            argv = runtime.argv(spec)
+        self.assertEqual(argv[:7], ["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=12g", "-p"])
+        self.assertIn("--tmp-overlay", argv)
+        self.assertEqual(argv[argv.index("--overlay-src") + 1], str(image / "rootfs"))
+        joined = " ".join(argv)
+        for part in ("--setenv PATH /usr/bin", "--setenv K v", "--ro-bind /host/data /data",
+                     "--bind /host/store /store", "--chdir /srv", "-- /entry.sh serve --port 7"):
+            self.assertIn(part, joined)
 
 
 class QueryLimit(unittest.TestCase):

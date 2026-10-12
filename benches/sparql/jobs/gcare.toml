@@ -1,0 +1,16 @@
+# G-CARE's own estimators on its four graphs by the paper's accuracy procedure
+# (benches/sparql/gcare/run-gcare.sh): office-pc, in the quiet slot, since their estimation
+# times are timings. NRESE's estimates come from estimates.py against a server on each graph.
+id = "sparql-gcare-1"
+group = "sparql"
+host = "office-pc"
+checkout = "suite/sparql"
+commands = [
+  ["bash", "scripts/quiet-slot.sh", "bash", "benches/sparql/gcare/run-gcare.sh",
+   "/home/krarilotus/owlrs/results/sparql-gcare-1/gcare", "human", "aids", "lubm80", "yago"],
+]
+env = { NRESE_QUIET_DRAIN_S = "3600", SPARQL_DATA = "/home/krarilotus/owlrs/sparql-data" }
+needs = ["docker"]
+window = "quiet"
+priority = 4
+est_min = 240

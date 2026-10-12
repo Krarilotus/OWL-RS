@@ -6,7 +6,7 @@
 #
 #   benches/sparql/prepare.sh DATASET... [--out DIR]     (Linux with Docker; DIR default ~/owlrs/sparql-data)
 #
-# DATASET: dblp | watdiv-10m | watdiv-100m | bsbm-10m | bsbm-100m | sp2bench-1m | sp2bench-25m
+# DATASET: dblp | dblp-kg | watdiv-10m | watdiv-100m | bsbm-10m | bsbm-100m | sp2bench-1m | sp2bench-25m
 #          | gcare | wdbench (the last needs 1 TB free: khaleesi S: or Draco, not office-pc)
 #
 # Downloads go to DIR/src/ (untrusted: unpacked there, never run from the repository);
@@ -67,6 +67,28 @@ dblp() {
   check "$f" md5 6c5628d88b8e1b27eef918239a7e9802
   quiet; [ -s "$OUT/dblp-2025-04-01.nt" ] || { gunzip -c "$f" > "$OUT/dblp-2025-04-01.nt.part" && mv "$OUT/dblp-2025-04-01.nt.part" "$OUT/dblp-2025-04-01.nt"; }
   record "$OUT/dblp-2025-04-01.nt"
+}
+
+# DBLP's knowledge graph as Sparqloscope's Qleverfile downloads it (dblp_KG_with_associated_data.tar,
+# a snapshot dblp replaces as it updates; pinned by the SHA-256 of the copy fetched on 12 Oct
+# 2026, dblp's release of 11 Oct 2026): its dblp.ttl.gz, the KG proper (the published triple
+# counts are its size; the archive's other files are OpenCitations' links), read as the
+# Qleverfile reads it (`@base <https://dblp.org/rdf/schema>` first) and written as N-Triples by
+# Jena's riot. The monthly N-Triples dump (dblp above) lacks the stream records several queries
+# are about (dblp:relatedStream has no instance there).
+dblp_kg() {
+  local f=$SRC/dblp-kg/dblp_KG_with_associated_data.tar
+  mkdir -p "$SRC/dblp-kg"
+  fetch https://sparql.dblp.org/download/dblp_KG_with_associated_data.tar "$f"
+  check "$f" sha256 "$(grep "dblp_KG_with_associated_data.tar" "$HERE/sources.sha256" | cut -d' ' -f1)"
+  [ -s "$SRC/dblp-kg/dblp.ttl.gz" ] || tar -xf "$f" -C "$SRC/dblp-kg" dblp.ttl.gz
+  if [ ! -s "$OUT/dblp-kg-20261011.nt" ]; then
+    quiet
+    box dblp-kg-riot nrese-bench/jena:6.2.0 sh -c \
+      "{ echo '@base <https://dblp.org/rdf/schema> .'; gunzip -c /out/src/dblp-kg/dblp.ttl.gz; } \
+       | riot --syntax=ttl --output=nt > /out/dblp-kg-20261011.nt.part && mv /out/dblp-kg-20261011.nt.part /out/dblp-kg-20261011.nt"
+  fi
+  record "$OUT/dblp-kg-20261011.nt"
 }
 
 # WatDiv's own datasets (University of Waterloo; no licence stated: internal use until its
@@ -169,6 +191,7 @@ for s in "${sets[@]}"; do
   say "== $s"
   case $s in
     dblp) dblp ;;
+    dblp-kg) dblp_kg ;;
     watdiv-10m) watdiv 10M ;;
     watdiv-100m) watdiv 100M ;;
     bsbm-*) bsbm "${s#bsbm-}" ;;
