@@ -6,6 +6,8 @@ has been measured so far. Start here.
 | Question | Answer |
 |---|---|
 | What is measured, what isn't, and how did it last come out? | [STATUS.md](STATUS.md), generated: `python benches/suite/suite.py status --write` |
+| Where does NRESE stand against each contender, on its home turf and elsewhere? | [STANDINGS.md](STANDINGS.md), generated from the run records: `python benches/suite/suite.py standings --write` |
+| How is a case written, for any group? | [cases/README.md](cases/README.md): one schema, a file per group |
 | How is it measured, and why can the numbers be trusted? | [PROTOCOL.md](PROTOCOL.md): the rules every kit follows |
 | Which benchmarks exist in each field, what do they cost, and which do we run? | [CATALOG.md](CATALOG.md) |
 | What did a given run cover, on which commit and host? | [runs/](runs/README.md): one record per run |

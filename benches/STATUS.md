@@ -6,9 +6,9 @@ Generated 2026-10-12 by `python benches/suite/suite.py status --write` from [sui
 
 - **Workloads:** 24 (4 partial, 10 planned, 10 ready)
 - **Systems:** 20 (16 free to publish, 4 only with the vendor's permission)
-- **Pairs** (standard tier × system that can run it; build variants apart): 292; run at least once: 98; ok on their newest run: 76
-- **NRESE:** 17 of its 47 standard tiers ok on their newest run
-- **Run records:** 31, newest 2026-10-12
+- **Pairs** (standard tier × system that can run it; build variants apart): 292; run at least once: 103; ok on their newest run: 79
+- **NRESE:** 18 of its 47 standard tiers ok on their newest run
+- **Run records:** 32, newest 2026-10-12
 
 ## Coverage
 
@@ -38,7 +38,7 @@ Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome 
 | fulltext-search | planned | · | · | · | · | – | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | – |
 | geosparql | partial | 0/1 ! | n/a | n/a | n/a | – | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | – |
 | federation | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| fast | partial | · | · | · | 1/3 | 1/3 | · | · | · | n/a | n/a | n/a | n/a | – | – | – | – | · | · | n/a | · |
+| fast | partial | 1/3 | · | · | 2/3 | 1/3 ! | 1/3 | 0/3 ! | · | n/a | n/a | n/a | n/a | – | – | – | – | · | · | n/a | · |
 | clients | ready | · | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
 
 `ok` every repetition loaded, every step and query execution ok · `part` a load, step or query execution failed or timed out in some repetition · `WRONG` an answer count differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the suite skipped it (reason in the record) · `≠?` its answers differ from another system's, not yet adjudicated · `hang` a comparator gave no answer in a past run · `ran*` ran; a licensed system whose outcome stays local · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit for it
@@ -254,22 +254,37 @@ partial, performance; tasks basics, RT1, RT3; kit `benches/fast` (suite driver);
 
 | Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| q-cycles~plain | · | · | · | · | · | · | · | · | · | · | · |
+| q-cycles~plain | ok 10-10 | · | · | ok 10-10 | part 10-10 | ok 10-10 | part 10-10 | · | · | · | · |
 | rl-hierarchy~closure | · | · | · | ok 10-06 | ok 10-06 | · | · | · | · | · | · |
 | rl-clique | · | · | · | · | · | · | · | · | · | · | · |
 | 6 plain cases (extra) | · | · | · | ok 10-06 | part 10-06 | ok 10-06 | part 10-06 | · | · | · | · |
 | 84 cases (extra) | ok 10-06 | · | · | · | · | · | · | · | · | · | · |
+| clients-lookups~plain (extra) | ok 10-10 | · | · | ok 10-10 | ok 10-10 | ok 10-10 | ok 10-10 | · | · | · | · |
+| clients-sweep~plain (extra) | ok 10-10 | · | · | ok 10-10 | ok 10-10 | part 10-10 | ok 10-10 | · | · | · | · |
 | custom-tc~custom (extra) | · | · | · | · | · | · | · | · | · | · | · |
 | dl cases (extra) | · | · | · | · | · | · | · | · | · | · | · |
 | dl-roles, el-classify (extra) | · | · | · | · | · | · | · | · | · | · | · |
 | el-classify (extra) | · | · | · | · | · | · | · | · | · | · | · |
 | horst-lubm10~owl-horst (extra) | · | · | · | · | · | · | FAIL 10-06 | · | · | · | · |
+| index-join-keys~plain (extra) | ok 10-10 | · | · | ok 10-10 | ok 10-10 | · | · | · | · | · | · |
+| kernel-intersect~plain (extra) | ok 10-10 | · | · | ok 10-10 | ok 10-10 | · | ok 10-10 | · | · | · | · |
 | native-cli-cache-replay (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · | · |
 | native-cli-classify-store-horn (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · | · |
 | native-cli-clients-sweep (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · | · |
 | native-cli-commits-readers (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · | · |
 | native-cli-dlmode-lubm1 (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · | · |
 | native-cli-writes-under-readers (extra) | ok 10-09 | · | · | · | · | · | · | · | · | · | · |
+| op-dates~plain (extra) | ok 10-10 | · | · | ok 10-10 | ok 10-10 | ok 10-10 | ok 10-10 | · | · | · | · |
+| op-group~plain (extra) | ok 10-10 | · | · | ok 10-10 | ok 10-10 | ok 10-10 | ok 10-10 | · | · | · | · |
+| op-negation~plain (extra) | ok 10-10 | · | · | ok 10-10 | ok 10-10 | ok 10-10 | ok 10-10 | · | · | · | · |
+| op-optional~plain (extra) | ok 10-10 | · | · | ok 10-10 | ok 10-10 | ok 10-10 | ok 10-10 | · | · | · | · |
+| op-strings~plain (extra) | ok 10-10 | · | · | ok 10-10 | ok 10-10 | ok 10-10 | ok 10-10 | · | · | · | · |
+| q-chain~plain (extra) | ok 10-10 | · | · | ok 10-10 | ok 10-10 | ok 10-10 | ok 10-10 | · | · | · | · |
+| q-paths~plain (extra) | ok 10-10 | · | · | part 10-10 | part 10-10 | part 10-10 | part 10-10 | · | · | · | · |
+| q-sideways~plain (extra) | ok 10-10 | · | · | ok 10-10 | part 10-10 | ok 10-10 | ok 10-10 | · | · | · | · |
+| q-snowflake~plain (extra) | ok 10-10 | · | · | ok 10-10 | ok 10-10 | ok 10-10 | ok 10-10 | · | · | · | · |
+| q-star~plain (extra) | ok 10-10 | · | · | ok 10-10 | ok 10-10 | ok 10-10 | ok 10-10 | · | · | · | · |
+| q-topk~plain (extra) | ok 10-10 | · | · | ok 10-10 | ok 10-10 | ok 10-10 | ok 10-10 | · | · | · | · |
 | rdfs-hierarchy~rdfs (extra) | · | · | · | · | · | · | ok 10-06 | · | · | · | · |
 | rl-clique, rl-chain, rl-owl2bench~owl-horst (extra) | · | · | · | · | · | · | hang 10-06 | · | · | · | · |
 | rl-clique~owl-horst (extra) | · | · | · | · | · | · | part 10-06 | · | · | · | · |
@@ -305,7 +320,7 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - **era-shacl:** nrese (-); jena (-); rdf4j (-); graphdb (-); rdfox (-)
 - **fulltext-search:** nrese (-); qlever (-); virtuoso (-); jena (-); rdf4j (-); graphdb (-); rdfox (-)
 - **federation:** nrese (-); qlever (-); oxigraph (-); virtuoso (-); jena (-); rdf4j (-); graphdb (-); rdfox (-); anzograph (-)
-- **fast:** nrese (q-cycles~plain, rl-hierarchy~closure, rl-clique); qlever (q-cycles~plain, rl-clique); oxigraph (q-cycles~plain, rl-clique); virtuoso (q-cycles~plain, rl-hierarchy~closure, rl-clique); jena (q-cycles~plain, rl-hierarchy~closure, rl-clique); rdf4j (q-cycles~plain, rl-hierarchy~closure, rl-clique); graphdb (q-cycles~plain, rl-hierarchy~closure, rl-clique); rdfox (q-cycles~plain, rl-hierarchy~closure, rl-clique); anzograph (q-cycles~plain, rl-hierarchy~closure, rl-clique)
+- **fast:** nrese (rl-hierarchy~closure, rl-clique); qlever (rl-clique); oxigraph (rl-clique); virtuoso (rl-hierarchy~closure, rl-clique); jena (rl-hierarchy~closure, rl-clique); rdf4j (q-cycles~plain, rl-hierarchy~closure, rl-clique); graphdb (q-cycles~plain, rl-hierarchy~closure, rl-clique); rdfox (q-cycles~plain, rl-hierarchy~closure, rl-clique); anzograph (q-cycles~plain, rl-hierarchy~closure, rl-clique)
 - **clients:** nrese (-)
 
 ### Build variants without an outcome (nrese-fsst, nrese-oxigraph, nemo-schemafirst, nemo-sparq; optional)
@@ -342,12 +357,20 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - basics-mix yago-tiny on virtuoso: partial (2026-10-03-office-a): incomplete: q01-label-lookup, q03-taxon-path, q08-subclass-path (q01-label-lookup: 3 failed of 3)
 - fast 6 plain cases on jena: partial (2026-10-06-fast-compete): 4-cycles timed out
 - fast 6 plain cases on oxigraph: partial (2026-10-06-fast-compete): 4-cycles timed out
+- fast clients-sweep~plain on virtuoso: partial (2026-10-10-competitors-dc2114a): incomplete: clients-64 (clients-64: 5 failed of 6)
 - fast dl cases on hermit: partial (2026-10-06-fast-suite): timeouts at 120 s on most generated ontologies; parse and classify ok on the others
 - fast dl cases on konclude: partial (2026-10-06-fast-suite): an error on dl-number; timeouts on nominals and Horn classification
 - fast dl cases on openllet: partial (2026-10-06-fast-suite): timeouts on most
 - fast dl-roles, el-classify on hermit: partial (2026-10-06-fast-compete): el-classify timed out
 - fast dl-roles, el-classify on openllet: partial (2026-10-06-fast-compete): el-classify timed out
 - fast horst-lubm10~owl-horst on jena: failed (2026-10-06-fast-compete): count out of heap; rerun without it tonight
+- fast q-cycles~plain on jena: partial (2026-10-10-competitors-dc2114a): incomplete: four-cycles (four-cycles: 3 timeout of 3)
+- fast q-cycles~plain on oxigraph: partial (2026-10-10-competitors-dc2114a): incomplete: four-cycles (four-cycles: 3 timeout of 3)
+- fast q-paths~plain on jena: partial (2026-10-10-competitors-dc2114a): incomplete: follows-closure-count, follows-reach (follows-closure-count: 3 failed of 3)
+- fast q-paths~plain on oxigraph: partial (2026-10-10-competitors-dc2114a): incomplete: follows-closure-count (follows-closure-count: 3 timeout of 3)
+- fast q-paths~plain on qlever: partial (2026-10-10-competitors-dc2114a): incomplete: follows-closure-count (follows-closure-count: 3 timeout of 3; 3 timeout of 3)
+- fast q-paths~plain on virtuoso: partial (2026-10-10-competitors-dc2114a): incomplete: follows-closure-count, follows-reach (follows-closure-count: 3 failed of 3)
+- fast q-sideways~plain on oxigraph: partial (2026-10-10-competitors-dc2114a): incomplete: exists (exists: 3 timeout of 3)
 - fast rl-clique~owl-horst on jena: partial (2026-10-06-fast-suite)
 - fast rule cases~owl2-rl on nemo: partial (2026-10-06-fast-compete): answers equal NRESE's where it finished
 - geosparql compliance on nrese: partial (2026-10-09-office-conformance-a633): 18 disputed reference differences
@@ -393,6 +416,7 @@ Newest first; the records are in [runs/](runs/).
 | [2026-10-11-fast-inputs-office](runs/2026-10-11-fast-inputs-office.toml) | 2026-10-11T23:40 | fast | office-pc | 133ac6d | 0 | Why nine fast cases failed their checks on the base and the PR alike in the 11 October A/B on office-pc, and the harness fix |
 | [2026-10-11-answer-replay-dc2114a](runs/2026-10-11-answer-replay-dc2114a.toml) | 2026-10-11 | suite (answers.py) | office-pc | 133ac6d | 0 | The 10 October competitor answer captures reclassified with the committed recorder: each system against one reference, strict and value matches apart |
 | [2026-10-11-horn-recovery](runs/2026-10-11-horn-recovery.toml) | 2026-10-11 | reasoning/dl and fast classify-store-horn | phuoc-yu | dc2114a0f0 | 0 | Horn context accounting by sampled local capacity instead of per-message shared reservations (candidate K), against the original base |
+| [2026-10-10-competitors-dc2114a](runs/2026-10-10-competitors-dc2114a.toml) | 2026-10-10T18:25 | suite | office-pc | dc2114a0f0 | 77 | The free SPARQL stores beside NRESE on 16 fast cases (the plain query and client cases), each answer captured and checked before its time: the first data of the standings, on dc2114a (before PR #23's last changes) |
 | [2026-10-10-cache-replay-profile-77478d1](runs/2026-10-10-cache-replay-profile-77478d1.toml) | 2026-10-10 | perf lab | office-pc | 77478d195c | 0 | Where the cache-on replay spends its CPU, to attribute its regression |
 | [2026-10-10-checkpoint-bebada2](runs/2026-10-10-checkpoint-bebada2.toml) | 2026-10-10 | fast | office-pc, phuoc-yu | bebada2e66 | 0 | The frozen v2 checkpoint against the preceding revision: all fast cases on both hosts, then a ten-pair follow-up of the regressed cases |
 | [2026-10-10-default-execution-recovery](runs/2026-10-10-default-execution-recovery.toml) | 2026-10-10 | fast | phuoc-yu, office-pc | 62ae2e0fae | 0 | Default execution back on the caller (no physical pool unless configured): recovery against the original baseline |

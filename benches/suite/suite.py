@@ -8,6 +8,7 @@
     benches/suite/suite.py report ...  results as tables (suite.py report --help)
     benches/suite/suite.py compare BASE NEW   a run against a baseline: regressions beyond noise
     benches/suite/suite.py answers DIR...     the runs' captured answers classified per group (answers.py)
+    benches/suite/suite.py standings [--write]  NRESE against every contender (benches/STANDINGS.md)
     benches/suite/suite.py ledger DIR...      the run records under benches/runs/ (outcomes, no numbers)
     benches/suite/suite.py status [--write]   what is measured and what isn't (benches/STATUS.md)
     benches/suite/suite.py data [freeze|verify]  the frozen datasets (benches/datasets.toml)
@@ -104,6 +105,9 @@ def main(argv):
     if argv[1:2] == ["compare"]:
         from suitekit import compare
         return compare.main(argv[2:])
+    if argv[1:2] == ["standings"]:
+        from suitekit import standings
+        return standings.main(argv[2:], systems, HERE.parent.parent)
     if argv[1:2] == ["answers"]:
         from suitekit import answers
         return answers.main(argv[2:])
