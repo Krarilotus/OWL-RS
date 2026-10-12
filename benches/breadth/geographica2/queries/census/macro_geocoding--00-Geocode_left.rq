@@ -1,0 +1,21 @@
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> 
+PREFIX census: <http://geographica.di.uoa.gr/cencus/ontology#> 
+
+SELECT ?lfromhn ?ltohn ?wkt 
+((430-?lfromhn)*((?x1-?x0)/(?ltohn-?lfromhn))+?x1 AS ?x) 
+((430-?lfromhn)*((?y1-?y0)/(?ltohn-?lfromhn))+?y1 AS ?y) 
+WHERE { 
+	?f census:lfromhn ?lfromhn. 
+	?f census:ltohn ?ltohn. 
+	?f census:parityl "O". 
+	?f census:fullname "Hickory Bush Rd". 
+	?f census:zipl "12401"^^xsd:integer. 
+	?f census:hasGeometry ?geo. 
+	?f census:minx ?x0. 
+	?f census:miny ?y0. 
+	?f census:maxx ?x1. 
+	?f census:maxy ?y1. 
+	?geo census:asWKT ?wkt. 
+	FILTER( (?lfromhn <= "430"^^xsd:integer && "430"^^xsd:integer <= ?ltohn) 
+		 || (?ltohn <= "430"^^xsd:integer && "430"^^xsd:integer <= ?lfromhn) ). 
+}

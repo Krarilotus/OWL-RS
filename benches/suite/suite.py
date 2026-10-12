@@ -7,6 +7,8 @@
     benches/suite/suite.py run ...     run the matrix (suite.py run --help)
     benches/suite/suite.py report ...  results as tables (suite.py report --help)
     benches/suite/suite.py compare BASE NEW   a run against a baseline: regressions beyond noise
+    benches/suite/suite.py answers DIR...     the runs' captured answers classified per group (answers.py)
+    benches/suite/suite.py standings [--write]  NRESE against every contender (benches/STANDINGS.md)
     benches/suite/suite.py ledger DIR...      the run records under benches/runs/ (outcomes, no numbers)
     benches/suite/suite.py status [--write]   what is measured and what isn't (benches/STATUS.md)
     benches/suite/suite.py data [freeze|verify]  the frozen datasets (benches/datasets.toml)
@@ -25,7 +27,8 @@ CAPABILITIES = {
     "load", "query", "update",
     "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
     "reason-custom-rules", "reason-incremental", "consistency", "explain", "classify",
-    "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
+    "rules-nary", "rules-negation", "rules-arithmetic",
+    "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation", "rdf12", "vector",
 }
 STATES = {"ready", "partial", "planned", "blocked"}
 
@@ -64,6 +67,20 @@ def check(systems, workloads):
         for key in ("title", "kind", "tasks", "source", "licence", "check"):
             if key not in workload:
                 errors.append(f"workloads.toml [{name}]: {key} is missing")
+    # Published numbers of systems we don't measure (competitors/reported.toml).
+    from suitekit import reported
+    errors += reported.problems(systems)
+    # The order the families are measured in (schedule.toml).
+    from suitekit import schedule
+    errors += schedule.problems(workloads)
+    # The cases of every group (benches/cases/README.md).
+    from suitekit import cases
+    with open(HERE.parent / "datasets.toml", "rb") as f:
+        frozen = {d["file"] for d in tomllib.load(f).get("dataset", [])}
+    try:
+        errors += cases.problems(cases.load(), systems, workloads, frozen)
+    except ValueError as error:
+        errors.append(str(error))
     return errors
 
 
@@ -95,6 +112,12 @@ def main(argv):
     if argv[1:2] == ["compare"]:
         from suitekit import compare
         return compare.main(argv[2:])
+    if argv[1:2] == ["standings"]:
+        from suitekit import standings
+        return standings.main(argv[2:], systems, HERE.parent.parent)
+    if argv[1:2] == ["answers"]:
+        from suitekit import answers
+        return answers.main(argv[2:])
     if argv[1:2] == ["ledger"]:
         from suitekit import ledger
         return ledger.main(argv[2:], HERE.parent.parent)
@@ -105,7 +128,8 @@ def main(argv):
         from suitekit import status
         return status.main(argv[2:], systems, workloads, HERE.parent.parent)
     if argv[1:] == ["--check"]:
-        print(f"{len(systems)} systems, {len(workloads)} workloads: ok")
+        from suitekit import cases
+        print(f"{len(systems)} systems, {len(workloads)} workloads, {len(cases.load())} cases: ok")
         return 0
     if len(argv) == 2:
         system = systems.get(argv[1])

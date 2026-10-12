@@ -1,0 +1,12 @@
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+
+SELECT ?s1 ?s2 
+ WHERE { 
+	GRAPH <http://geographica.di.uoa.gr/dataset/geonames> {
+		?s1 <http://www.geonames.org/ontology#asWKT> ?o1
+	} 
+	GRAPH <http://geographica.di.uoa.gr/dataset/lgd> {
+		?s2 <http://linkedgeodata.org/ontology/asWKT> ?o2
+	} 
+  	FILTER(geof:sfIntersects(?o1, ?o2)).  
+}

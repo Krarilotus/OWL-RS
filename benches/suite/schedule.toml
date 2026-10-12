@@ -1,0 +1,87 @@
+# The order the benchmark families are measured in (the owner, 12 Oct 2026): what completes
+# the suite this week first, in this order; then the backlog; last the families not
+# expected to give data for polishing or optimisation. Every workload of workloads.toml is
+# in exactly one list, and so is every catalogued benchmark without a workload yet
+# (`catalogue`), so that nothing gets lost (suite.py --check). The measurement queue starts
+# jobs in this order (suite/queue.py: a job's workload, or its cases' workload), and
+# benches/STATUS.md shows it.
+
+now = [
+  # SPARQL
+  "sparqloscope",     # QLever's home turf
+  "bsbm",             # multi-client: Virtuoso's
+  "watdiv",
+  "gcare",
+  # reasoning
+  "owl2bench",        # the QL rerun first
+  "lubm",
+  "claros",           # RDFox's
+  "ldbc-spb",         # GraphDB's
+  "datalog-graphs",   # TC, SG, CSPA: Nemo's, VLog's, Soufflé's
+  "commit-latency",   # under readers
+  # DL
+  "ore-2015",         # in full
+  "elk-ontologies",   # ELK on GO, ChEBI, NCIt, GALEN
+  "pagoda-suite",
+  # breadth
+  "vector-recall",    # filtered
+  "ann-benchmarks",
+  "geographica2",
+  "era-shacl",
+  # the fast cases on their comparators: the answer qualification
+  "fast",
+]
+
+backlog = [
+  "lubm-materialised",
+  "owl2bench-classify",
+  "real-ontologies",
+  "consistency",
+  "integration-rg-gs-gnd",
+  "fulltext-search",
+  "federation",
+  "write-scaling",
+  "basics-mix",
+  "wdbench",
+  "sp2bench",
+  "npd",
+  "lubm-exists",
+  "starbench",
+  "fedshop",
+  "beir",
+  "vibe",
+  "vector-dbbench",   # the vector databases' own ground (Qdrant, Milvus, pgvector, LanceDB)
+  "soak",
+  "larger-than-memory",
+  # reasoning, moved here on 12 Oct 2026: not expressible in NRESE's user rules (relations
+  # beyond triples, negation, arithmetic: systems.toml [nrese] missing), a scope question
+  # for the owner; SSPE also lacks its RDFox licence
+  "sspe",
+  "doop",
+  "galen",
+  # reasoning, the owner's backlog of 12 Oct 2026
+  "reactome-uniprot",
+  "chasebench",
+  "uobm",
+]
+
+last = [
+  "w3c-owl2-rl",
+  "w3c-owl2-dl",
+  "w3c-sparql11",
+  "w3c-shacl",
+  "geosparql",
+  "clients",
+]
+
+# Benchmarks of benches/CATALOG.md without a workload entry yet: the section that describes each.
+[catalogue]
+npd = "3.6: NPD, OBDA over the Norwegian Petroleum Directorate (Ontop's home turf)"
+lubm-exists = "3.6: LUBM∃, LUBM with existential rules (Ontop, Stardog, PAGOdA)"
+beir = "3.9: BEIR, retrieval quality and time"
+soak = "3.16: soak, hours of mixed load"
+doop = "3.4: Doop on DaCapo, Soufflé's own workload (programs vendored in benches/reasoning/datalog)"
+galen = "3.4: Galen as Datalog, FlowLog's suite (a case of benches/reasoning/datalog)"
+reactome-uniprot = "3.4: Reactome and UniProt, RDFox's and GLog's datasets"
+chasebench = "3.4: ChaseBench, existential rules (Nemo, VLog, RDFox)"
+uobm = "3.4: UOBM, LUBM with richer OWL (GLog's package has its L program)"

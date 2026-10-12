@@ -1,0 +1,8 @@
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+
+SELECT (geof:buffer(?o1,0.04) AS ?ret) 
+WHERE { 
+	GRAPH <http://geographica.di.uoa.gr/dataset/geonames> {
+		?s1 <http://www.geonames.org/ontology#asWKT> ?o1
+	}
+}

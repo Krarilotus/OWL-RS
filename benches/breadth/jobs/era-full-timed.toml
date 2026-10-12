@@ -1,0 +1,16 @@
+# ERA-SHACL, the whole graph (55 M statements), timed: the engines that fit the host's 28 GiB
+# cap by their published peaks (pySHACL and maplib are reported as blocked by the runner).
+id = "breadth-era-full"
+group = "breadth"
+host = "office-pc"
+checkout = "suite/breadth"
+workload = "era-shacl"
+window = "quiet"
+priority = 3
+est_min = 480
+needs = ["docker"]
+env = { PYTHONIOENCODING = "utf-8", NRESE_QUIET_DRAIN_S = "1800" }
+commands = [
+  ["sh", "-c", "scripts/quiet-slot.sh python3 benches/breadth/era-shacl/run.py run --subsets ERA --runs 3 --results \"$QUEUE_RESULTS\""],
+  ["sh", "-c", "python3 benches/breadth/era-shacl/run.py check \"$QUEUE_RESULTS\""],
+]

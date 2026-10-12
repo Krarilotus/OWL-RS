@@ -1,0 +1,3 @@
+# Group dl: the DL reasoners and OBDA on their home turf: Konclude, HermiT, Openllet, ELK, PAGOdA,
+# Ontop; ORE 2015 in full, OWL2Bench EL and DL, NPD.
+# The schema: benches/cases/README.md; validated by benches/suite/suite.py --check.

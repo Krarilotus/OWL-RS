@@ -1,0 +1,18 @@
+id = "reasoning-maintain-claros"
+group = "reasoning"
+host = "office-pc"
+checkout = "suite/reasoning"
+workload = "claros"
+window = "quiet"
+priority = 2
+est_min = 120
+needs = ["docker"]
+env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server", NRESE_VERSION = "16c3bfb", DOCKER_MEMORY = "28g" }
+# The setup of Motik et al., AIJ 2019 (Tables 3 and 6): Claros L and LE with equality off,
+# one thread, 1,000 facts deleted and added back by uniform sampling, 30 samples (LE: 5, since
+# RDFox's DRed and FBF took 472 s to 5,450 s per sample there). NRESE only: no other engine of
+# the kit maintains a materialisation; RDFox's numbers are reported rows.
+commands = [
+  ["bash", "scripts/quiet-slot.sh", "sh", "-c", "test -f /home/krarilotus/owlrs/queue/done/reasoning-qualify-claros.toml && python3 benches/reasoning/datalog/maintain.py run --cases claros-l-noeq --samples 30 --size 1000 --cpus 1 --results \"$QUEUE_RESULTS/l-noeq\""],
+  ["bash", "scripts/quiet-slot.sh", "sh", "-c", "python3 benches/reasoning/datalog/maintain.py run --cases claros-le-noeq --samples 5 --size 1000 --cpus 1 --timeout-s 7200 --results \"$QUEUE_RESULTS/le-noeq\""],
+]

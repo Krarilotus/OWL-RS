@@ -9,6 +9,11 @@ every machine.
     suite.py ledger RESULTS-DIR [RESULTS-DIR ...]   write or refresh their records
     suite.py ledger --all                           every directory under benches/suite/results
 
+A directory of runs (a `fast.py compete` batch: one results directory per case) is one
+record. A record's `versus` holds NRESE against each free comparator, case by case
+(suitekit/versus.py: answers, then time with its interval, load, memory): what
+benches/STANDINGS.md is made of. A licensed system's entries never enter a record.
+
 Hand-written fields (purpose, baseline, findings, and commit or machine where a run
 predates manifests) are kept when a record is refreshed. Records of kits outside the suite
 (benches/reasoning/dl, the perf lab) are written by hand in the same format
@@ -24,11 +29,11 @@ from pathlib import Path
 from .schema import read
 from .summary import summarise
 
-HAND_FIELDS = ("purpose", "baseline", "findings", "level", "scenario", "candidate", "inputs", "cases")
+HAND_FIELDS = ("purpose", "baseline", "findings", "level", "scenario", "candidate", "inputs", "cases", "results")
 FALLBACK_FIELDS = ("commit", "machine", "host", "started", "finished", "protocol")
 ORDER = ["id", "level", "kit", "purpose", "started", "finished", "host", "machine", "scenario", "baseline",
          "candidate", "commit", "dirty", "protocol", "inputs", "commands", "results", "publishable", "cases",
-         "findings"]
+         "findings", "versus"]
 
 
 def toml_value(value) -> str:
@@ -36,9 +41,13 @@ def toml_value(value) -> str:
         return "true" if value else "false"
     if isinstance(value, int):
         return str(value)
+    if isinstance(value, float):
+        return repr(value)
     if isinstance(value, list):
         if not value:
             return "[]"
+        if not any(isinstance(v, (list, dict)) for v in value) and len(value) <= 4:
+            return "[" + ", ".join(toml_value(v) for v in value) + "]"
         return "[\n" + "".join(f"  {toml_value(v)},\n" for v in value) + "]"
     if isinstance(value, dict):
         return "{ " + ", ".join(f"{k} = {toml_value(v)}" for k, v in value.items()) + " }"
@@ -70,23 +79,36 @@ def load_records(runs_dir: Path) -> list[dict]:
     return records
 
 
+def run_directories(directory: Path) -> list[Path]:
+    """The results directories a record covers: the directory, or the runs in it (a batch)."""
+    if (directory / "results.csv").exists():
+        return [directory]
+    return sorted(d for d in directory.iterdir() if (d / "results.csv").exists())
+
+
 def from_results(directory: Path, root: Path) -> dict:
-    rows = read(directory / "results.csv") if (directory / "results.csv").exists() else []
-    manifest = {}
-    if (directory / "manifest.json").exists():
-        manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
-    invocations = manifest.get("invocations", [])
+    runs = run_directories(directory)
+    rows, invocations = [], []
+    for run in runs:
+        # Runs of a batch number their repetitions alike: each keeps its own.
+        rows += [r | {"run": f"{run.name}:{r['run']}"} if len(runs) > 1 else r for r in read(run / "results.csv")]
+        if (run / "manifest.json").exists():
+            invocations += json.loads((run / "manifest.json").read_text(encoding="utf-8")).get("invocations", [])
     try:
         shown = directory.resolve().relative_to(root.resolve()).as_posix()
     except ValueError:
         shown = directory.name
     record: dict = {"id": directory.name, "kit": "suite", "results": f"{shown} (local, git-ignored)"}
     if invocations:
-        first, last = invocations[0], invocations[-1]
+        invocations = sorted(invocations, key=lambda i: i.get("started") or "")
+        first = invocations[0]
         record["started"] = first["started"]
-        record["finished"] = last.get("finished") or "unfinished"
+        finished = [i.get("finished") for i in invocations]
+        record["finished"] = max(finished) if all(finished) else "unfinished"
         m = first.get("machine", {})
-        record["host"] = m.get("host", "")
+        from . import hosts
+        found = hosts.current(name=m.get("host", "")) if m.get("host") else None
+        record["host"] = found[0] if found else m.get("host", "")
         docker = m.get("docker")
         record["machine"] = (f"{m.get('cpu')}, {m.get('logical_cores')} threads, {m.get('memory_gib')} GiB; "
                              f"{m.get('os')}" + (f"; Docker {docker['version']} ({docker['cpus']} CPUs, "
@@ -98,7 +120,7 @@ def from_results(directory: Path, root: Path) -> dict:
         record["protocol"] = (f"{p['runs']} runs, {p['query_runs']} measured query runs, cache {p['cache']}, "
                               f"order {p['order']} (seed {p['seed']}), load limit {p['timeout_s']} s, "
                               f"query limit {p['query_timeout_s']} s, {p['runtime']}")
-        record["commands"] = ["suite.py run " + " ".join(i["argv"]) for i in invocations]
+        record["commands"] = list(dict.fromkeys("suite.py run " + " ".join(i["argv"]) for i in invocations))
     elif rows:
         record["started"] = rows[0]["date"]
         record["host"] = rows[0]["host"]
@@ -109,6 +131,11 @@ def from_results(directory: Path, root: Path) -> dict:
     record["pairs"] = pairs
     restricted = any(p["outcome"] == "restricted" for p in pairs)
     record["publishable"] = "free systems only" if restricted else "all"
+    from . import cases
+    from .versus import versus
+    turfs = {c["name"]: c.get("home_turf", "") for c in cases.load(root / "benches/cases")}
+    entries = versus(directory, turfs)
+    record["versus"] = [{k: v for k, v in e.items() if k != "publish"} for e in entries if e["publish"] == "free"]
     return record
 
 

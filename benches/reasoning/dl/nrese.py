@@ -29,6 +29,7 @@ import sys
 import time
 
 import canonical
+import reference
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -54,7 +55,7 @@ def el(args):
             f"{t}\tconvert\tntriples\t/work/files/{t.split('-el-')[0]}.owl\n" for t in missing),
             encoding="utf-8")
         subprocess.run(["docker", "run", "--rm", "-v", f"{cases.as_posix()}:/work",
-                        "nrese-bench/dl-reference", "batch", "/work/manifest.nt.tsv",
+                        reference.IMAGE, "batch", "/work/manifest.nt.tsv",
                         "/work/results.nt.tsv", "/work/tax", "600"], check=True)
         manifest.unlink()
         (cases / "results.nt.tsv").unlink()

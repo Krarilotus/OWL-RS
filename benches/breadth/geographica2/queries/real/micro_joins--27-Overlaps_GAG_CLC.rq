@@ -1,0 +1,12 @@
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+
+SELECT ?s1 ?s2 
+WHERE { 
+	GRAPH <http://geographica.di.uoa.gr/dataset/gag> {
+		?s1 <http://geo.linkedopendata.gr/gag/ontology/asWKT> ?o1
+	} 
+	GRAPH <http://geographica.di.uoa.gr/dataset/clc> {
+		?s2 <http://geo.linkedopendata.gr/corine/ontology#asWKT> ?o2
+	} 
+	FILTER(geof:sfOverlaps(?o1, ?o2)).  
+}

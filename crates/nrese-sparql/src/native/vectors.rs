@@ -251,7 +251,8 @@ impl Context<'_> {
     /// many rows and the query vector is given, the search goes first: its hits, nearest
     /// first, are kept while `local` evaluated from the hit has rows (a probe per hit
     /// through the indexes), until `k` are kept; `local` is then the rows of those
-    /// probes. Otherwise `local` goes first and its values of the matched variable are
+    /// probes. The index is given `local`'s estimated rows as the vectors it accepts, so
+    /// its beam is as wide as for a filter it applied. Otherwise `local` goes first and its values of the matched variable are
     /// the candidates ([`Self::vector_service`]).
     pub(super) fn vector_join(
         &self,
@@ -259,8 +260,9 @@ impl Context<'_> {
         inner: &GraphPattern,
     ) -> NativeResult<Solutions> {
         let search = parse(inner)?;
+        let estimate = self.estimate(local);
         let probe_first = match &search.near {
-            Near::Vector(_) => self.estimate(local) >= (PROBE_ABOVE * search.k) as f64,
+            Near::Vector(_) => estimate >= (PROBE_ABOVE * search.k) as f64,
             Near::Variable(_) => false,
         };
         if !probe_first {
@@ -272,10 +274,15 @@ impl Context<'_> {
             unreachable!("checked above")
         };
         self.check()?;
+        // The hits are probed against `local` after the search, so the index sees no
+        // filter; it is told how many vectors `local` is estimated to accept, so that its
+        // beam is widened by the inverse share as for a filter it applies itself. Without
+        // it the first `k` hits that pass come from an approximate list whose tail misses
+        // them (recall 0.50 against 0.98, one kind in ten of 200,000 vectors).
         let found = self.nearest(
             &search,
             vector.clone(),
-            None,
+            Some(estimate.ceil() as usize),
             |query| self.snapshot.vector_search(query, &|_| true),
             |id| {
                 if !self.used_as_object(id) {
