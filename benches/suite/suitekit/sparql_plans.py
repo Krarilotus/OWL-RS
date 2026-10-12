@@ -54,14 +54,16 @@ def known_from_table(path: Path, column: str) -> dict[str, dict]:
 
 
 def sparqloscope(root: Path, tier: str, settings: dict) -> Plan:
-    """Sparqloscope (ISWC 2025) on DBLP of 1 April 2025: its 105 queries, QLever's home turf."""
-    plan = Plan("sparqloscope", tier, inputs=["/data/dblp-2025-04-01.nt"],
+    """Sparqloscope (ISWC 2025) on DBLP's knowledge graph as its Qleverfile downloads it
+    (dblp's release of 11 Oct 2026): its 105 queries, QLever's home turf. The paper's answers
+    are of the April 2025 release, so the reference systems decide the answers here
+    (`known_from_checks` reads them where the data is the paper's)."""
+    plan = Plan("sparqloscope", tier, inputs=["/data/dblp-kg-20261011.nt"],
                 queries=root / "benches/competitors/queries/sparqloscope-dblp",
-                prepare=["bash", PREPARE, "dblp"],
-                note="known answers: those every engine of the paper published alike (dblp-published.tsv)")
+                prepare=["bash", PREPARE, "dblp-kg"],
+                note="answers against the reference systems; the paper's are of another release")
     if tier != "sparqloscope-dblp":
         plan.unavailable = f"no tier {tier}: sparqloscope-dblp (Wikidata truthy waits for Draco)"
-    plan.answers = known_from_checks(root / "benches/sparql/sparqloscope/dblp-checks.toml")
     return plan
 
 
