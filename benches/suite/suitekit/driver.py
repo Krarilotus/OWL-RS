@@ -74,7 +74,9 @@ def arguments(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--answers", choices=["off", "full"], default="off",
                    help="full: capture every query's complete answer, untimed, and compare each system "
                         "with --answers-reference (answers.py; writes answers.json)")
-    p.add_argument("--answers-reference", metavar="SYSTEM", help="the system the answers are compared with")
+    p.add_argument("--answers-reference", metavar="SYSTEM[,SYSTEM]",
+                   help="the reference systems the answers are compared with, in order: per query the first "
+                        "with a complete, stable answer, confirmed by the next (answers.py)")
     args = p.parse_args(argv)
     if args.answers == "full" and not args.answers_reference:
         p.error("--answers full needs --answers-reference SYSTEM")
@@ -439,7 +441,9 @@ class Suite:
         warmup, runs = ("0", "1") if plan.replay else ("1", str(self.args.query_runs))
         if self.answers and not plan.replay:
             for query in plan.queries.glob("*.rq"):
-                self.answers.expect((plan.workload, plan.tier, base["regime"], query.name), key)
+                item = (plan.workload, plan.tier, base["regime"], query.name)
+                self.answers.expect(item, key, tuple(plan.inputs))
+                self.answers.check(item, plan.answers.get(query.stem))
         command = [self.harness(), "query-mix", "--endpoint", endpoint.query, "--queries", str(plan.queries),
                    "--label", key, "--warmup", warmup, "--runs", runs,
                    "--timeout-s", str(self.args.query_timeout_s), "--report-json", str(report)]
@@ -552,7 +556,14 @@ class Suite:
         self.emit(base, task="conformance", item=plan.workload, status="ok" if rc == 0 else "failed",
                   ms=(time.monotonic() - started) * 1000, note=f"log: {log.relative_to(self.results)}")
 
-    def skip(self, key: str, plan, reason: str, regime: str = "-"):
+    def skip(self, key: str, plan, reason: str, regime: str = "-", unsupported: bool = True):
+        """A pair that doesn't run: `unsupported` when the system can't run it, else (a missing
+        input) incomplete, for the answers as for the row."""
+        if self.answers and plan.queries and not plan.replay:
+            answered = regime if regime != "-" else plan.regimes[0]
+            for query in plan.queries.glob("*.rq"):
+                self.answers.skip((plan.workload, plan.tier, answered, query.name), key, reason,
+                                  "unsupported" if unsupported else "incomplete", tuple(plan.inputs))
         base = dict(date=self.date, host=self.host, runtime=self.runtime.kind, system=key, version="-",
                     publish=self.publish(key), workload=plan.workload, tier=plan.tier, regime=regime, run=0)
         self.emit(base, task="load", status="skipped", note=reason[:300])
@@ -598,9 +609,13 @@ class Suite:
                         continue
                     ctx = self.context_for_images()
                     ctx.tier_small = plan.small
-                    reason = system.supports(ctx, plan.inputs, regime) or self.sif_missing(system, ctx)
+                    reason = system.supports(ctx, plan.inputs, regime)
                     if reason:
                         self.skip(key, plan, reason, regime)
+                        continue
+                    missing = self.sif_missing(system, ctx)
+                    if missing:
+                        self.skip(key, plan, missing, regime, unsupported=False)
                         continue
                     chosen.append((plan, key, system, regime))
         if not chosen:
@@ -649,7 +664,7 @@ class Suite:
             runnable = []
             for _, key, system, regime in group:
                 if unavailable.get(id(plan)):
-                    self.skip(key, plan, unavailable[id(plan)], regime)
+                    self.skip(key, plan, unavailable[id(plan)], regime, unsupported=False)
                 elif plan.kind == "kit":
                     self.kit(plan, key)
                 else:
