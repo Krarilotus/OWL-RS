@@ -732,6 +732,17 @@ impl ValueSet {
         }
     }
 
+    /// Whether `self` and `o` can be combined ([`ValueSet::union`],
+    /// [`ValueSet::intersection`]): their sets of texts mention at most [`MAX_PATTERNS`]
+    /// patterns together, each kind of text apart. O(patterns).
+    ///
+    /// [`MAX_PATTERNS`]: super::MAX_PATTERNS
+    pub fn combines(&self, o: &Self) -> bool {
+        self.strings.base.combines(&o.strings.base)
+            && self.tagged.base.combines(&o.tagged.base)
+            && self.iris.base.combines(&o.iris.base)
+    }
+
     pub fn union(&self, o: &Self) -> Self {
         Self {
             real: std::array::from_fn(|c| self.real[c].union(&o.real[c])),

@@ -339,3 +339,112 @@ fn islands_decide_as_the_whole_abox_does() {
         "{drawn} cases: {split} split, {compared} decided by both, {inconsistent} inconsistent"
     );
 }
+
+/// The incremental path (docs/design/owl2-dl.md §9): after a change that removes
+/// assertions and adds some about a few individuals, deciding only the islands with one
+/// of them gives what a cold check of the whole ontology gives. Counts the cases the
+/// incremental path decided, so the test can't pass by falling back.
+#[test]
+fn touched_islands_decide_as_a_cold_check_does() {
+    let cases = env("NRESE_FUZZ_CASES").unwrap_or(240);
+    let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x2026_1012_1700);
+    let config = Config {
+        max_nodes: 20_000,
+        max_branch_points: Some(20_000),
+        timeout: Some(std::time::Duration::from_secs(60)),
+        ..Config::default()
+    };
+    let (mut incremental, mut inconsistent) = (0u64, 0u64);
+    let mut failures = Vec::new();
+    for case in 0..cases {
+        let mut rng = Rng::new(seed.wrapping_add(case));
+        let mut names: HashMap<String, Term> = HashMap::new();
+        let mut intern = |n: &Name| {
+            let key = format!("{n:?}");
+            let len = names.len() as Term;
+            *names.entry(key).or_insert(len)
+        };
+        let sizes = Sizes {
+            classes: 4,
+            object_properties: 4,
+            simple: 3,
+            data_properties: 1,
+            individuals: 12,
+            literals: 3,
+        };
+        let sig = Signature::new(sizes, &mut intern);
+        let profile = Profile {
+            axioms: 3 + (case % 6) as usize,
+            nominals: case.is_multiple_of(3),
+            abox: false,
+            ..Profile::sroiq()
+        };
+        let mut before = fuzz::ontology(&mut rng, &sig, profile);
+        propagation(&mut rng, &mut before, &sig);
+        abox(&mut rng, &mut before, &sig);
+        if decided(&tableau::consistency(&before, &config).answer) != Some(true) {
+            continue;
+        }
+        // The change: some assertions removed, a few added (another ABox's).
+        let mut after = before.clone();
+        let assertions: Vec<usize> = (0..after.axioms.len())
+            .filter(|&i| after.axioms[i].is_assertion())
+            .collect();
+        for &i in assertions.iter().rev() {
+            if rng.one_in(4) {
+                after.axioms.remove(i);
+            }
+        }
+        let mut more = after.clone();
+        more.axioms.retain(|a| !a.is_assertion());
+        abox(&mut rng, &mut more, &sig);
+        let added: Vec<Axiom> = more
+            .axioms
+            .into_iter()
+            .filter(|a| a.is_assertion())
+            .take(1 + rng.below(3) as usize)
+            .collect();
+        let mut touched = std::collections::HashSet::new();
+        for a in &added {
+            match a {
+                Axiom::ClassAssertion(_, x)
+                | Axiom::DataPropertyAssertion(_, x, _)
+                | Axiom::NegativeDataPropertyAssertion(_, x, _) => {
+                    touched.insert(*x);
+                }
+                Axiom::ObjectPropertyAssertion(_, x, y)
+                | Axiom::NegativeObjectPropertyAssertion(_, x, y) => {
+                    touched.extend([*x, *y]);
+                }
+                Axiom::SameIndividual(xs) | Axiom::DifferentIndividuals(xs) => {
+                    touched.extend(xs.iter().copied());
+                }
+                _ => {}
+            }
+        }
+        after.axioms.extend(added);
+        after.axioms.sort();
+        after.axioms.dedup();
+        after.sources = vec![Vec::new(); after.axioms.len()];
+        let cold = decided(&tableau::consistency(&after, &config).answer);
+        let Some(outcome) = islands::after_assertions(&after, &touched, &config) else {
+            continue;
+        };
+        if let (Some(c), Some(i)) = (cold, decided(&outcome.answer)) {
+            incremental += 1;
+            inconsistent += u64::from(!c);
+            if c != i {
+                failures.push(format!(
+                    "case {case} (seed {seed}): cold {c}, touched islands {i}"
+                ));
+            }
+        }
+    }
+    eprintln!("{cases} cases: {incremental} decided incrementally, {inconsistent} inconsistent");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        incremental * 5 >= cases,
+        "only {incremental} of {cases} decided incrementally"
+    );
+    assert!(inconsistent > 0, "no change made the ontology inconsistent");
+}

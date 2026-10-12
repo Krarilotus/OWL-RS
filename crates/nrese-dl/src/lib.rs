@@ -7,7 +7,10 @@
 //! - [`datatypes`]: the datatype theory the hypertableau calls (package 3.5);
 //! - [`classify`]: classification and realisation over the engines (§7, package 3.4);
 //! - [`islands`]: the ABox split into islands the hypertableau decides apart;
-//! - [`numbers`]: sizes of counted classes compared before any search.
+//! - [`numbers`]: sizes of counted classes compared before any search;
+//! - [`certificate`]: models of "consistent" answers checked against the ontology by the
+//!   direct semantics, independently of the engines;
+//! - [`scope`]: the answers and certificates of the small-scope check (§11).
 //!
 //! Each module is its own package with its own gates (owl2-dl-performance.md §6).
 
@@ -15,9 +18,11 @@ mod cancel;
 pub use cancel::Cancel;
 
 pub mod bounds;
+pub mod certificate;
 pub mod classify;
 pub mod context;
 pub mod datatypes;
 pub mod islands;
 pub mod numbers;
+pub mod scope;
 pub mod tableau;

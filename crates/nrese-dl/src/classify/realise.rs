@@ -17,7 +17,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
-use nrese_owl::{Axiom, ClassExpr, EntityKind, Ontology, Term};
+use nrese_owl::{Ontology, Term};
 
 use super::driver::{insert_sorted, intersect_opt, reason, union_into};
 use super::{Classification, Deadline, Options, Profile, Taxonomy, classify};
@@ -42,33 +42,7 @@ pub struct Realisation {
 
 /// The named individuals of an ontology: declared or used (blank nodes left out).
 pub fn individuals(ontology: &Ontology) -> Vec<Term> {
-    let mut out: Vec<Term> = Vec::new();
-    for a in &ontology.axioms {
-        match a {
-            Axiom::Declaration(EntityKind::NamedIndividual, t) | Axiom::ClassAssertion(_, t) => {
-                out.push(*t);
-            }
-            Axiom::ObjectPropertyAssertion(_, a, b)
-            | Axiom::NegativeObjectPropertyAssertion(_, a, b) => out.extend([*a, *b]),
-            Axiom::DataPropertyAssertion(_, a, _)
-            | Axiom::NegativeDataPropertyAssertion(_, a, _) => {
-                out.push(*a);
-            }
-            Axiom::SameIndividual(v) | Axiom::DifferentIndividuals(v) => out.extend(v),
-            _ => {}
-        }
-    }
-    for id in 0..ontology.classes.len() {
-        match ontology.classes.get(id as u32) {
-            ClassExpr::OneOf(v) => out.extend(v),
-            ClassExpr::HasValue(_, t) => out.push(*t),
-            _ => {}
-        }
-    }
-    out.retain(|t| !ontology.anonymous.contains(t));
-    out.sort_unstable();
-    out.dedup();
-    out
+    ontology.named_individuals()
 }
 
 /// Classifies `ontology` and realises its individuals.

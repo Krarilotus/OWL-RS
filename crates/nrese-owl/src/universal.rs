@@ -14,15 +14,23 @@
 //!
 //! The other axioms over U: an assertion `U(a, b)` holds (left out); `¬U(a, b)` is
 //! inconsistent; `R ⊑ U` and the characteristics U has (transitive, symmetric,
-//! reflexive) hold; a domain or range of U holds of everything. What makes U a
-//! subproperty, a cardinality over U, and the characteristics U lacks are reported
-//! unsupported.
+//! reflexive) hold; a domain or range of U holds of everything. U in a chain, as the
+//! subproperty of `R`, equivalent to `R` or the inverse of `R` is `u ∘ u⁻` in the chain:
+//! `R` is then universal (`u ∘ u⁻ ⊑ R`), through `R`'s automaton. U in a key is a
+//! condition every pair of named individuals meets (each is U-related to the other), so
+//! it is left out of the key.
+//!
+//! What stays unsupported is what OWL 2 DL rules out: U is composite (*OWL 2 Structural
+//! Specification* §11.1), so it isn't simple, and §11.2's restriction on simple roles
+//! keeps it out of cardinalities, `Self`, and functional, inverse-functional,
+//! irreflexive, asymmetric and disjoint property axioms. (`Self` over U holds of
+//! everything and is kept.)
 
 use crate::mapping::Ontology;
 use crate::model::{Axiom, Characteristic, ClassExpr, ExprId, ObjProp, Term};
 
-/// What can't be encoded.
-pub(crate) const UNSUPPORTED: &str = "the universal object property as a subproperty, in a cardinality, or with a characteristic it lacks";
+/// What can't be encoded: what OWL 2 DL rules out.
+pub(crate) const UNSUPPORTED: &str = "the universal object property where OWL 2 DL requires a simple property (a cardinality; functional, inverse-functional, irreflexive, asymmetric or disjoint properties: OWL 2 Structural Specification §11.1, §11.2)";
 
 /// The rewriting of an ontology that uses `owl:topObjectProperty`.
 pub(crate) struct Rewritten {
@@ -36,6 +44,10 @@ pub(crate) struct Rewritten {
     pub uses: Vec<usize>,
     /// The hub's role and individual.
     pub hub: Term,
+    /// Roles an axiom makes universal beyond its rewritten form (an equivalence of U with
+    /// two or more properties keeps their equivalence and makes the first universal):
+    /// `u ∘ u⁻ ⊑ R` from the axiom.
+    pub universal: Vec<(ObjProp, usize)>,
 }
 
 struct Rw<'a> {
@@ -43,6 +55,8 @@ struct Rw<'a> {
     top: Term,
     /// The axiom being rewritten went through the hub.
     hubbed: bool,
+    /// The roles the axiom being rewritten makes universal beyond its rewritten form.
+    universal: Vec<ObjProp>,
 }
 
 impl Rw<'_> {
@@ -65,6 +79,26 @@ impl Rw<'_> {
             let inner = self.e(ClassExpr::All(back, c));
             self.e(ClassExpr::All(u, inner))
         }
+    }
+
+    /// `chain` with each U (or its inverse, U again) as `u ∘ u⁻`.
+    fn chain(&mut self, chain: &[ObjProp]) -> Vec<ObjProp> {
+        let mut out = Vec::with_capacity(chain.len() + 1);
+        for &r in chain {
+            if self.is_top(r) {
+                self.hubbed = true;
+                out.extend([ObjProp::Named(self.top), ObjProp::Inverse(self.top)]);
+            } else {
+                out.push(r);
+            }
+        }
+        out
+    }
+
+    /// `u ∘ u⁻ ⊑ r`: `r` is universal.
+    fn universal(&mut self, r: ObjProp) -> Axiom {
+        let top = ObjProp::Named(self.top);
+        Axiom::SubObjectPropertyOf(self.chain(&[top]), r)
     }
 
     /// `e` with U encoded; `None` where it can't be.
@@ -136,6 +170,15 @@ impl Rw<'_> {
         })
     }
 
+    /// `xs` rewritten, sorted, repeats kept: two operands of a disjointness that become
+    /// one (`∃U.{a}` and `⊤` are both `⊤`) say that it is empty, which dropping the repeat
+    /// would lose (the normaliser takes the pair as `X ⊑ ⊥`).
+    fn disjoint(&mut self, xs: &[ExprId]) -> Option<Vec<ExprId>> {
+        let mut out: Vec<ExprId> = xs.iter().map(|&x| self.expr(x)).collect::<Option<_>>()?;
+        out.sort();
+        Some(out)
+    }
+
     fn exprs(&mut self, xs: &[ExprId]) -> Option<Vec<ExprId>> {
         let mut out: Vec<ExprId> = xs.iter().map(|&x| self.expr(x)).collect::<Option<_>>()?;
         out.sort();
@@ -153,15 +196,13 @@ impl Rw<'_> {
         Some(Some(match axiom {
             Axiom::SubClassOf(a, b) => Axiom::SubClassOf(self.expr(*a)?, self.expr(*b)?),
             Axiom::EquivalentClasses(xs) => Axiom::EquivalentClasses(self.exprs(xs)?),
-            Axiom::DisjointClasses(xs) => Axiom::DisjointClasses(self.exprs(xs)?),
-            Axiom::DisjointUnion(c, xs) => Axiom::DisjointUnion(*c, self.exprs(xs)?),
+            Axiom::DisjointClasses(xs) => Axiom::DisjointClasses(self.disjoint(xs)?),
+            Axiom::DisjointUnion(c, xs) => Axiom::DisjointUnion(*c, self.disjoint(xs)?),
             Axiom::ClassAssertion(c, a) => Axiom::ClassAssertion(self.expr(*c)?, *a),
             Axiom::DataPropertyDomain(d, c) => Axiom::DataPropertyDomain(*d, self.expr(*c)?),
             Axiom::HasKey(c, rs, ds) => {
-                if rs.iter().any(top) {
-                    return None;
-                }
-                Axiom::HasKey(self.expr(*c)?, rs.clone(), ds.clone())
+                let rs: Vec<ObjProp> = rs.iter().copied().filter(|r| !top(r)).collect();
+                Axiom::HasKey(self.expr(*c)?, rs, ds.clone())
             }
             Axiom::ObjectPropertyDomain(r, c) | Axiom::ObjectPropertyRange(r, c) => {
                 let c = self.expr(*c)?;
@@ -181,10 +222,7 @@ impl Rw<'_> {
                 if top(sup) {
                     return Some(None);
                 }
-                if chain.iter().any(top) {
-                    return None;
-                }
-                axiom.clone()
+                Axiom::SubObjectPropertyOf(self.chain(chain), *sup)
             }
             Axiom::ObjectCharacteristic(kind, r) if top(r) => match kind {
                 Characteristic::Transitive
@@ -192,12 +230,26 @@ impl Rw<'_> {
                 | Characteristic::Reflexive => return Some(None),
                 _ => return None,
             },
-            Axiom::EquivalentObjectProperties(rs) | Axiom::DisjointObjectProperties(rs)
-                if rs.iter().any(top) =>
-            {
-                return None;
+            Axiom::EquivalentObjectProperties(rs) if rs.iter().any(top) => {
+                let rest: Vec<ObjProp> = rs.iter().copied().filter(|r| !top(r)).collect();
+                match rest[..] {
+                    [] => return Some(None),
+                    [r] => self.universal(r),
+                    _ => {
+                        self.hubbed = true;
+                        self.universal.push(rest[0]);
+                        Axiom::EquivalentObjectProperties(rest)
+                    }
+                }
             }
-            Axiom::InverseObjectProperties(a, b) if top(a) || top(b) => return None,
+            Axiom::DisjointObjectProperties(rs) if rs.iter().any(top) => return None,
+            // `R ≡ U⁻ = U`.
+            Axiom::InverseObjectProperties(a, b) if top(a) || top(b) => {
+                if top(a) && top(b) {
+                    return Some(None);
+                }
+                self.universal(if top(a) { *b } else { *a })
+            }
             other => other.clone(),
         }))
     }
@@ -211,7 +263,9 @@ pub(crate) fn rewrite(ontology: &Ontology, top: Term) -> Rewritten {
         o: &mut o,
         top,
         hubbed: false,
+        universal: Vec::new(),
     };
+    let mut universal = Vec::new();
     let mut axioms = Vec::with_capacity(ontology.axioms.len());
     for (index, axiom) in ontology.axioms.iter().enumerate() {
         if !crate::properties::mentions(ontology, axiom, &|t| t == top) {
@@ -221,6 +275,7 @@ pub(crate) fn rewrite(ontology: &Ontology, top: Term) -> Rewritten {
         let thing = rw.e(ClassExpr::Thing);
         rw.hubbed = false;
         let rewritten = rw.axiom(axiom);
+        universal.extend(rw.universal.drain(..).map(|r| (r, index)));
         // Only an axiom that goes through the hub needs it: `R ⊑ U`, a domain of U and
         // the like hold or become plain axioms, and a hub there would only add a nominal
         // to every element (no class of such an ontology could be decided by
@@ -243,6 +298,7 @@ pub(crate) fn rewrite(ontology: &Ontology, top: Term) -> Rewritten {
         unsupported,
         uses,
         hub: top,
+        universal,
     }
 }
 

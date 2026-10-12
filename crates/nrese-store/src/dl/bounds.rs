@@ -112,7 +112,7 @@ fn triple(q: EncodedTriple) -> Triple {
     [q.subject.raw(), q.predicate.raw(), q.object.raw()]
 }
 
-fn quad_triple(q: EncodedQuad) -> Triple {
+pub(crate) fn quad_triple(q: EncodedQuad) -> Triple {
     [q.subject.raw(), q.predicate.raw(), q.object.raw()]
 }
 
@@ -260,7 +260,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
 /// Whether a changed statement may change the ontology's schema (and so U1's rules),
 /// judged without U1's signature: a blank node, OWL's, RDF's or RDFS's vocabulary as
 /// predicate (but `rdf:type` with another class, and `owl:sameAs`).
-fn changes_schema(tx: &Transaction<'_>, [s, p, o]: Triple) -> bool {
+pub(crate) fn changes_schema(tx: &Transaction<'_>, [s, p, o]: Triple) -> bool {
     use nrese_engine::TermKind;
     let kind = |t: u64| TermId::from_raw(t).kind();
     if kind(s) == TermKind::BlankNode || kind(o) == TermKind::BlankNode {

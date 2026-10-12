@@ -125,6 +125,35 @@ impl Ontology {
         self.ranges.get(id.0)
     }
 
+    /// The named individuals: declared, asserted about, or in a nominal (blank nodes, the
+    /// anonymous individuals, left out). Sorted. O(axioms + class expressions).
+    pub fn named_individuals(&self) -> Vec<Term> {
+        let mut out: Vec<Term> = Vec::new();
+        for a in &self.axioms {
+            match a {
+                Axiom::Declaration(crate::model::EntityKind::NamedIndividual, t)
+                | Axiom::ClassAssertion(_, t)
+                | Axiom::DataPropertyAssertion(_, t, _)
+                | Axiom::NegativeDataPropertyAssertion(_, t, _) => out.push(*t),
+                Axiom::ObjectPropertyAssertion(_, a, b)
+                | Axiom::NegativeObjectPropertyAssertion(_, a, b) => out.extend([*a, *b]),
+                Axiom::SameIndividual(v) | Axiom::DifferentIndividuals(v) => out.extend(v),
+                _ => {}
+            }
+        }
+        for id in 0..self.classes.len() as u32 {
+            match self.classes.get(id) {
+                ClassExpr::OneOf(v) => out.extend(v),
+                ClassExpr::HasValue(_, t) => out.push(*t),
+                _ => {}
+            }
+        }
+        out.retain(|t| !self.anonymous.contains(t));
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// The axioms of a kind, by a test.
     pub fn axioms_where(&self, test: impl Fn(&Axiom) -> bool) -> impl Iterator<Item = &Axiom> {
         self.axioms.iter().filter(move |a| test(a))
