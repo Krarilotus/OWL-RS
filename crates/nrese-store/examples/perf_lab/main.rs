@@ -57,8 +57,8 @@
 //!   its `error`.
 //!
 //! This is the loop every Phase 2–5 work package is measured with before the Docker
-//! scorecard confirms it against other systems. It runs anywhere the data is; the wrapper
-//! `benches/perf-lab.sh` runs it on Linux in Docker against the benchmark volume.
+//! scorecard confirms it against other systems. It runs anywhere the data is; the fast
+//! suite (`benches/fast/fast.py`) runs it per case, in Docker or as a capped host process.
 
 use std::collections::BTreeMap;
 use std::io::Write;
