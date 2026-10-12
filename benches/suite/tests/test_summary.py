@@ -149,6 +149,16 @@ class Contracts(unittest.TestCase):
         for system in ("a", "b"):
             self.assertEqual(pairs[("w", "t", system)].outcome()["outcome"], "disputed")
 
+    def test_validations_are_items_whose_result_counts_are_cross_checked(self):
+        validate = lambda shapes, results, system: row(task="validate", item=shapes, ms=7, rows=results,
+                                                       system=system)
+        rows = [load(system="a"), load(system="b"), validate("core", 3, "a"), validate("core", 4, "b"),
+                validate("tds", 1, "a"), validate("tds", 1, "b")]
+        pairs = summarise(rows)
+        for system in ("a", "b"):
+            items = pairs[("w", "t", system)].items["-"]
+            self.assertEqual(sorted(items), ["core", "tds"])
+            self.assertEqual(pairs[("w", "t", system)].disputed, {"core"})
 
     def test_an_adjudication_settles_a_dispute(self):
         rows = [load(system="a"), load(system="b"), query("q1", 5, rows=1, system="a"),

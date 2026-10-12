@@ -28,7 +28,7 @@ CAPABILITIES = {
     "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
     "reason-custom-rules", "reason-incremental", "consistency", "explain", "classify",
     "rules-nary", "rules-negation", "rules-arithmetic",
-    "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
+    "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation", "rdf12", "vector",
 }
 STATES = {"ready", "partial", "planned", "blocked"}
 

@@ -1,0 +1,25 @@
+# A run record (benches/runs/README.md). Written by hand: a re-measurement through the queue.
+id = "2026-10-12-vector-filtered-fix-phuoc"
+level = "focused"
+kit = "benches/breadth/vectors/knn_filtered.py through queue.py (vector-knn-filtered's queries in variants)"
+purpose = "vector-knn-filtered after the probe-first route widens its beam by the joined pattern's share (99026108): recall against the 0.9 gate, and its time against the exact scan"
+started = "2026-10-12T15:02"
+host = "phuoc-yu"
+build_host = "office-pc"
+scenario = "native"
+baseline = { record = "2026-10-12-vector-recall-phuoc", commit = "aabd47a732c64c12b7721c44c2409dee6523993d", note = "the same data, queries and variants before the change" }
+candidate = { commit = "bfc2b2f990", dirty = false, binary_sha256 = "a53cf52dae11d24e7f4d9991320675b2918a7ce8ac077eed4accf557ad29ba23", note = "perf_lab built on office-pc for x86-64-v3, glibc 2.35" }
+protocol = { data = "vectors items=200000 dim=64 kinds=10 (the case's), its five query vectors and the generator's true ten nearest of kind k3", runs = "20 per query, k = 10, cosine", variants = "filtered by kind at the default beam, at nrv:searchBudget 256, and exact (truth: the generator's); unfiltered approximate and exact (truth: the exact search)", graph = "prepared before timing (--prepare-vector-graph 64:cosine)", host_config = "phuoc-yu since 2026-10-12T13:00", slot = "scripts/quiet-slot.sh (waited for the DL group's runs)" }
+results = { root = "phuoc-yu:/home/krarilotus/owlrs/results/breadth-vector-phuoc-bfc2b2f9", files_sha256 = "ae9e0fd254606899a30f3568a7e0d8494551cdb13c66fcdde11f0f3256fdda28" }
+publishable = "all"
+cases = [
+  { case = "filtered, default beam", verdict = "pass", note = "recall@10 0.98 (was 0.56); sum of the five p50s 10.49 ms" },
+  { case = "filtered, nrv:searchBudget 256", verdict = "pass", note = "recall@10 1.00; 24.96 ms (the beam widened tenfold to 2,560)" },
+  { case = "filtered, exact", verdict = "pass", note = "recall@10 1.00; 10.37 ms" },
+  { case = "unfiltered, default beam", verdict = "wrong", note = "recall@10 0.44 (0.48 before: the graph's own recall on these vectors, unchanged by the change); 0.37 ms" },
+  { case = "unfiltered, exact", verdict = "pass", note = "recall@10 1.00; 2.21 ms" },
+]
+findings = [
+  "The gate passes: recall 0.98 under the one-in-ten filter, from 0.56 at the same beam before the change.",
+  "On these uniform 64-dimensional vectors the widened graph search costs what the exact scan of the accepted vectors does (10.49 against 10.37 ms): correct now, not faster. For the optimisation round: choose the exact scan when the widened beam would cost more (the selectivity threshold from cost, not a fixed 2 %), and the graph's own recall at the default beam (0.44 unfiltered), which makes the wide beam necessary.",
+]

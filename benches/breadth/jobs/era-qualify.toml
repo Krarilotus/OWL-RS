@@ -1,0 +1,16 @@
+# ERA-SHACL: one repetition of every engine on Spain and France, then every report against
+# TopBraid's, before any time counts.
+id = "breadth-era-qualify"
+group = "breadth"
+host = "office-pc"
+checkout = "suite/breadth"
+workload = "era-shacl"
+window = "any"
+priority = 1
+est_min = 240
+needs = ["docker"]
+env = { PYTHONIOENCODING = "utf-8" }
+commands = [
+  ["sh", "-c", "python3 benches/breadth/era-shacl/run.py run --subsets ES,FR --runs 1 --results \"$QUEUE_RESULTS\""],
+  ["sh", "-c", "python3 benches/breadth/era-shacl/run.py check \"$QUEUE_RESULTS\""],
+]
