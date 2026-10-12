@@ -6,7 +6,7 @@ Generated 2026-10-12 by `python benches/suite/suite.py status --write` from [sui
 
 - **Workloads:** 34 (9 partial, 15 planned, 10 ready)
 - **Systems:** 23 (19 free to publish, 4 only with the vendor's permission)
-- **Pairs** (standard tier × system that can run it; build variants apart): 469; run at least once: 103; ok on their newest run: 80
+- **Pairs** (standard tier × system that can run it; build variants apart): 423; run at least once: 103; ok on their newest run: 80
 - **NRESE:** 19 of its 73 standard tiers ok on their newest run
 - **Run records:** 34, newest 2026-10-12
 
@@ -87,37 +87,37 @@ Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome 
 | lubm | ready | 4/4 | · | 3/4 | – | – | – | 1/4 ! | – | 3/4 | 3/4 | 3/4 ! | – | – | – | 1/4 | – | – | – | – | 4/4 | · | n/a | n/a |
 | lubm-materialised | ready | 3/3 | · | · | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | – | – | – | – | – | – | – | – | – | – | – | 3/3 | · | n/a | · |
 | owl2bench | ready | 2/2 | · | 1/2 | – | – | – | 1/2 | – | 2/2 | 2/2 | · | – | – | – | 1/2 ! | – | – | – | – | 2/2 | · | n/a | n/a |
-| ldbc-spb | partial | · | · | · | – | – | – | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | · |
+| ldbc-spb | partial | · | · | · | – | – | – | · | · | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | · |
 | integration-rg-gs-gnd | partial | · | · | · | – | – | – | · | – | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | n/a |
-| real-ontologies | planned | · | · | · | – | – | – | · | · | · | · | · | – | – | – | · | – | – | – | – | · | · | n/a | · |
-| consistency | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | – |
+| real-ontologies | planned | · | · | · | – | – | – | · | · | · | · | · | – | – | – | · | – | – | – | – | · | n/a | n/a | · |
+| consistency | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | – |
 | w3c-owl2-rl | ready | 0/1 ! | n/a | n/a | – | – | – | – | – | n/a | n/a | n/a | – | – | – | n/a | – | – | – | – | n/a | n/a | n/a | – |
-| ore-2015 | partial | 0/2 ! | · | · | – | – | – | – | – | – | – | – | – | – | – | – | 1/2 | 0/2 ! | 0/2 ! | 1/2 | – | · | – | – |
-| w3c-owl2-dl | ready | 0/1 ! | · | · | – | – | – | – | – | – | – | – | – | – | – | – | 0/1 ! | 0/1 ! | 0/1 ! | 0/1 ! | – | · | – | – |
-| owl2bench-classify | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | · | · | · | · | – | · | – | – |
+| ore-2015 | partial | 0/2 ! | · | · | – | – | – | – | – | – | – | – | – | – | – | – | 1/2 | 0/2 ! | 0/2 ! | 1/2 | – | n/a | – | – |
+| w3c-owl2-dl | ready | 0/1 ! | · | · | – | – | – | – | – | – | – | – | – | – | – | – | 0/1 ! | 0/1 ! | 0/1 ! | 0/1 ! | – | n/a | – | – |
+| owl2bench-classify | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | · | · | · | · | – | n/a | – | – |
 | basics-mix | ready | 5/5 | · | 3/5 ! | 4/5 ! | 4/5 ! | 2/5 ! | 5/5 | 2/5 ! | – | – | – | – | – | – | – | – | – | – | – | 5/5 | · | n/a | · |
-| sparqloscope | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| bsbm | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| watdiv | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | · |
+| sparqloscope | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | · |
+| bsbm | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | · |
+| watdiv | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | · |
 | write-scaling | ready | 2/2 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | n/a |
 | w3c-sparql11 | ready | 1/1 | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
 | w3c-shacl | ready | 1/1 | n/a | n/a | – | – | – | n/a | n/a | – | – | – | – | – | – | – | – | – | – | – | n/a | n/a | n/a | – |
-| era-shacl | planned | · | · | · | – | – | – | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | – |
-| fulltext-search | planned | · | · | · | · | – | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | – |
+| era-shacl | planned | · | · | · | – | – | – | · | · | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | – |
+| fulltext-search | planned | · | · | · | · | – | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | – |
 | geosparql | partial | 0/1 ! | n/a | n/a | n/a | – | n/a | n/a | n/a | – | – | – | – | – | – | – | – | – | – | – | n/a | n/a | n/a | – |
-| federation | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | · |
+| federation | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | · |
 | fast | partial | 1/3 | · | · | 2/3 | 1/3 ! | 1/3 | 0/3 ! | · | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | · | · | n/a | · |
 | clients | ready | · | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
-| gcare | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| claros | partial | · | · | · | – | – | – | · | – | · | · | · | · | · | · | · | – | – | – | – | · | · | n/a | – |
+| gcare | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | · |
+| claros | partial | · | · | · | – | – | – | · | – | · | · | · | · | · | · | · | – | – | – | – | · | n/a | n/a | – |
 | sspe | planned | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – |
-| datalog-graphs | partial | · | · | – | – | – | – | · | – | · | · | · | · | · | · | – | – | – | – | – | · | · | n/a | – |
-| commit-latency | partial | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | – | – |
-| elk-ontologies | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | · | · | · | · | – | · | – | – |
-| pagoda-suite | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | – |
-| vector-recall | partial | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| ann-benchmarks | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | · |
-| geographica2 | planned | · | · | · | · | – | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | – |
+| datalog-graphs | partial | · | · | – | – | – | – | · | – | · | · | · | · | · | · | – | – | – | – | – | · | n/a | n/a | – |
+| commit-latency | partial | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | · | n/a | – | – |
+| elk-ontologies | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | · | · | · | · | – | n/a | – | – |
+| pagoda-suite | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | – |
+| vector-recall | partial | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | · |
+| ann-benchmarks | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | · |
+| geographica2 | planned | · | · | · | · | – | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | n/a | n/a | – |
 
 `ok` every repetition loaded, every step and query execution ok · `part` a load, step or query execution failed or timed out in some repetition · `WRONG` an answer count differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the suite skipped it (reason in the record) · `≠?` its answers differ from another system's, not yet adjudicated · `hang` a comparator gave no answer in a past run · `ran*` ran; a licensed system whose outcome stays local · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit for it
 
@@ -161,10 +161,10 @@ ready, performance; tasks RT1, RT3; kit `benches/reasoning` (suite driver); chec
 
 partial, performance; tasks RT3, RT5; kit `benches/reasoning/spb` (outside the driver); checked by: the benchmark's own validation of query results and of its OWL 2 RL rules.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | jena | rdf4j | graphdb | rdfox | anzograph |
-|---|---|---|---|---|---|---|---|---|
-| 50m | · | · | · | · | · | · | · | · |
-| 256m | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | jena | rdf4j | graphdb | anzograph |
+|---|---|---|---|---|---|---|---|
+| 50m | · | · | · | · | · | · | · |
+| 256m | · | · | · | · | · | · | · |
 
 ### integration-rg-gs-gnd: RG x GS x GND integration: identity reasoning over real links, 10 competency questions
 
@@ -180,19 +180,19 @@ partial, performance; tasks RT1, RT3; kit `benches/integration` (suite driver); 
 
 planned, performance; tasks RT1, RT3; kit `-` (outside the driver); checked by: inferred set against Nemo.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | jena | rdf4j | nemo | nemo-schemafirst | nemo-sparq | owlrl | graphdb | rdfox | anzograph |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| dbpedia-core | · | · | · | · | · | · | · | · | · | · | · | · |
-| yago-tiny | · | · | · | · | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | jena | rdf4j | nemo | nemo-schemafirst | nemo-sparq | owlrl | graphdb | anzograph |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| dbpedia-core | · | · | · | · | · | · | · | · | · | · | · |
+| yago-tiny | · | · | · | · | · | · | · | · | · | · | · |
 
 ### consistency: Injected contradictions: detection and explanation
 
 planned, performance; tasks RT4, RT7; kit `-` (outside the driver); checked by: every injected contradiction found, none on clean data.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | graphdb | rdfox |
-|---|---|---|---|---|---|
-| lubm-1 | · | · | · | · | · |
-| owl2bench-rl-1 | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | graphdb |
+|---|---|---|---|---|
+| lubm-1 | · | · | · | · |
+| owl2bench-rl-1 | · | · | · | · |
 
 ### w3c-owl2-rl: W3C OWL 2 test cases, RL profile: entailment and consistency
 
@@ -206,28 +206,28 @@ ready, conformance; tasks RT1, RT4; kit `crates/nrese-store/tests/w3c_owl2_rl` (
 
 partial, performance; tasks RT6; kit `benches/reasoning/dl` (outside the driver); checked by: canonical taxonomies compared by hash across the reference reasoners; differences adjudicated (disputed.tsv).
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk | rdfox |
-|---|---|---|---|---|---|---|---|---|
-| dev | part 10-03 | · | · | ok 10-03 | part 10-03 | part 10-03 | ok 10-03 | · |
-| full | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk |
+|---|---|---|---|---|---|---|---|
+| dev | part 10-03 | · | · | ok 10-03 | part 10-03 | part 10-03 | ok 10-03 |
+| full | · | · | · | · | · | · | · |
 
 ### w3c-owl2-dl: W3C OWL 2 test cases, species DL, direct semantics: consistency, entailment, non-entailment
 
 ready, conformance; tasks RT4, RT6; kit `benches/reasoning/dl` (outside the driver); checked by: the test types; the working group's published results of 2009 (published-2009.tsv); disputed.tsv.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk | rdfox |
-|---|---|---|---|---|---|---|---|---|
-| - | part 10-09 | · | · | part 10-03 | WRONG 10-03 | WRONG 10-03 | part 10-03 | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk |
+|---|---|---|---|---|---|---|---|
+| - | part 10-09 | · | · | part 10-03 | WRONG 10-03 | WRONG 10-03 | part 10-03 |
 
 ### owl2bench-classify: OWL2Bench EL and DL: classification and consistency of the generated ontologies
 
 planned, performance; tasks RT4, RT6; kit `benches/reasoning/dl` (outside the driver); checked by: canonical taxonomies across the reference reasoners.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk | rdfox |
-|---|---|---|---|---|---|---|---|---|
-| el-1 | · | · | · | · | · | · | · | · |
-| dl-1 | · | · | · | · | · | · | · | · |
-| dl-10 | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk |
+|---|---|---|---|---|---|---|---|
+| el-1 | · | · | · | · | · | · | · |
+| dl-1 | · | · | · | · | · | · | · |
+| dl-10 | · | · | · | · | · | · | · |
 
 ### basics-mix: Load, store size, restart and a query mix on real datasets
 
@@ -245,27 +245,27 @@ ready, performance; tasks basics; kit `benches/competitors` (suite driver); chec
 
 planned, performance; tasks basics; kit `-` (outside the driver); checked by: result sizes across systems.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| dblp | · | · | · | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | anzograph |
+|---|---|---|---|---|---|---|---|---|---|---|
+| dblp | · | · | · | · | · | · | · | · | · | · |
 
 ### bsbm: Berlin SPARQL Benchmark: e-commerce explore, business intelligence, explore and update
 
 planned, performance; tasks basics; kit `-` (outside the driver); checked by: the driver's qualification mode.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 10m | · | · | · | · | · | · | · | · | · | · | · |
-| 100m | · | · | · | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | anzograph |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 10m | · | · | · | · | · | · | · | · | · | · |
+| 100m | · | · | · | · | · | · | · | · | · | · |
 
 ### watdiv: WatDiv: diverse query shapes (linear, star, snowflake, complex) as a stress test
 
 planned, performance; tasks basics; kit `-` (outside the driver); checked by: row counts across systems.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| 10m | · | · | · | · | · | · | · | · | · | · | · |
-| 100m | · | · | · | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | anzograph |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 10m | · | · | · | · | · | · | · | · | · | · |
+| 100m | · | · | · | · | · | · | · | · | · | · |
 
 ### write-scaling: Single-statement and batch writes at 1 M, 10 M, 100 M; writes under read load
 
@@ -298,17 +298,17 @@ ready, conformance; tasks validation; kit `crates/nrese-shacl/tests` (suite driv
 
 planned, performance; tasks validation; kit `-` (outside the driver); checked by: the validation reports across engines.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | jena | rdf4j | graphdb | rdfox |
-|---|---|---|---|---|---|---|---|
-| - | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | jena | rdf4j | graphdb |
+|---|---|---|---|---|---|---|
+| - | · | · | · | · | · | · |
 
 ### fulltext-search: Keyword search: ResearchSpace's search queries; LUBMft
 
 planned, performance; tasks search; kit `-` (outside the driver); checked by: result sets across systems.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | virtuoso | jena | rdf4j | graphdb | rdfox |
-|---|---|---|---|---|---|---|---|---|---|
-| - | · | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | virtuoso | jena | rdf4j | graphdb |
+|---|---|---|---|---|---|---|---|---|
+| - | · | · | · | · | · | · | · | · |
 
 ### geosparql: GeoSPARQL compliance benchmark (206 queries); Geographica 2 for performance
 
@@ -322,9 +322,9 @@ partial, conformance; tasks space; kit `crates/nrese-sparql/tests/geosparql_comp
 
 planned, performance; tasks federation; kit `-` (outside the driver); checked by: answers against the single-store run.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| - | · | · | · | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | anzograph |
+|---|---|---|---|---|---|---|---|---|---|---|
+| - | · | · | · | · | · | · | · | · | · | · |
 
 ### fast: The fast suite's cases on their comparators: each case under the semantics a system supports
 
@@ -380,19 +380,19 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 
 planned, performance; tasks basics; kit `-` (outside the driver); checked by: the exact counts the benchmark ships; result counts across systems.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| yago | · | · | · | · | · | · | · | · | · | · | · |
-| lubm80 | · | · | · | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | anzograph |
+|---|---|---|---|---|---|---|---|---|---|---|
+| yago | · | · | · | · | · | · | · | · | · | · |
+| lubm80 | · | · | · | · | · | · | · | · | · | · |
 
 ### claros: Claros (L, LE): RDFox's and GLog's datasets, rules that build large cliques
 
 partial, performance; tasks RT1, RT2; kit `benches/reasoning/datalog` (outside the driver); checked by: facts per relation (each relation is one triple pattern) across the engines; GLog's published totals.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | jena | nemo | nemo-schemafirst | nemo-sparq | souffle | vlog | glog | owlrl | graphdb | rdfox |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| l | · | · | · | · | · | · | · | · | · | · | · | · | · |
-| le | · | · | · | · | · | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | jena | nemo | nemo-schemafirst | nemo-sparq | souffle | vlog | glog | owlrl | graphdb |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| l | · | · | · | · | · | · | · | · | · | · | · | · |
+| le | · | · | · | · | · | · | · | · | · | · | · | · |
 
 ### sspe: SSPE: single-source path graphs where one deletion invalidates long derivations
 
@@ -404,72 +404,72 @@ No system can run it yet.
 
 partial, performance; tasks RT1; kit `benches/reasoning/datalog` (outside the driver); checked by: derived facts per relation against Soufflé's published counts (FlowLog's reproduction logs); counts across the engines.
 
-| Tier | nrese | nrese-fsst | jena | nemo | nemo-schemafirst | nemo-sparq | souffle | vlog | glog | graphdb | rdfox |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| tc-G10K | · | · | · | · | · | · | · | · | · | · | · |
-| sg-G10K | · | · | · | · | · | · | · | · | · | · | · |
-| cspa-httpd | · | · | · | · | · | · | · | · | · | · | · |
-| cspa-linux | · | · | · | · | · | · | · | · | · | · | · |
-| cspa-postgresql | · | · | · | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | jena | nemo | nemo-schemafirst | nemo-sparq | souffle | vlog | glog | graphdb |
+|---|---|---|---|---|---|---|---|---|---|---|
+| tc-G10K | · | · | · | · | · | · | · | · | · | · |
+| sg-G10K | · | · | · | · | · | · | · | · | · | · |
+| cspa-httpd | · | · | · | · | · | · | · | · | · | · |
+| cspa-linux | · | · | · | · | · | · | · | · | · | · |
+| cspa-postgresql | · | · | · | · | · | · | · | · | · | · |
 
 ### commit-latency: Commit latency under 0, 1, 8 and 64 readers, the closure complete at every commit
 
 partial, performance; tasks RT2; kit `benches/reasoning/maintenance` (outside the driver); checked by: every change is undone, so the closure must hash back to the one the load materialised.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | graphdb | rdfox |
-|---|---|---|---|---|---|
-| lubm-10 | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | graphdb |
+|---|---|---|---|---|
+| lubm-10 | · | · | · | · |
 
 ### elk-ontologies: Classification of large EL and near-EL ontologies: GO, ChEBI, NCIt, GALEN
 
 planned, performance; tasks RT6; kit `benches/reasoning/el-classification` (outside the driver); checked by: taxonomies against ELK's and Konclude's, by canonical hash.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk | rdfox |
-|---|---|---|---|---|---|---|---|---|
-| go | · | · | · | · | · | · | · | · |
-| chebi | · | · | · | · | · | · | · | · |
-| ncit | · | · | · | · | · | · | · | · |
-| galen | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk |
+|---|---|---|---|---|---|---|---|
+| go | · | · | · | · | · | · | · |
+| chebi | · | · | · | · | · | · | · |
+| ncit | · | · | · | · | · | · | · |
+| galen | · | · | · | · | · | · | · |
 
 ### pagoda-suite: PAGOdA's test suite: query answering beyond OWL 2 RL
 
 planned, performance; tasks RT3; kit `-` (outside the driver); checked by: answers against a complete reasoner (HermiT, Konclude).
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | graphdb | rdfox |
-|---|---|---|---|---|---|
-| lubm | · | · | · | · | · |
-| uobm | · | · | · | · | · |
-| fly | · | · | · | · | · |
-| npd | · | · | · | · | · |
-| dbpedia | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | graphdb |
+|---|---|---|---|---|
+| lubm | · | · | · | · |
+| uobm | · | · | · | · |
+| fly | · | · | · | · |
+| npd | · | · | · | · |
+| dbpedia | · | · | · | · |
 
 ### vector-recall: Filtered k-NN: recall and time of vector search under a filter
 
 partial, performance; tasks vector; kit `benches/fast` (outside the driver); checked by: recall@10 against the exact search.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| generated-200k | · | · | · | · | · | · | · | · | · | · | · |
-| yfcc-10m | · | · | · | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | anzograph |
+|---|---|---|---|---|---|---|---|---|---|---|
+| generated-200k | · | · | · | · | · | · | · | · | · | · |
+| yfcc-10m | · | · | · | · | · | · | · | · | · | · |
 
 ### ann-benchmarks: ann-benchmarks: recall and throughput curves of approximate k-NN
 
 planned, performance; tasks vector; kit `-` (outside the driver); checked by: recall against the sets' ground truth.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| sift-1m | · | · | · | · | · | · | · | · | · | · | · |
-| glove-100 | · | · | · | · | · | · | · | · | · | · | · |
-| fashion-mnist | · | · | · | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | anzograph |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sift-1m | · | · | · | · | · | · | · | · | · | · |
+| glove-100 | · | · | · | · | · | · | · | · | · | · |
+| fashion-mnist | · | · | · | · | · | · | · | · | · | · |
 
 ### geographica2: Geographica 2: spatial selections, joins and aggregates on real and synthetic data
 
 planned, performance; tasks space; kit `-` (outside the driver); checked by: answers across systems.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | virtuoso | jena | rdf4j | graphdb | rdfox |
-|---|---|---|---|---|---|---|---|---|---|
-| real | · | · | · | · | · | · | · | · | · |
-| synthetic | · | · | · | · | · | · | · | · | · |
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | virtuoso | jena | rdf4j | graphdb |
+|---|---|---|---|---|---|---|---|---|
+| real | · | · | · | · | · | · | · | · |
+| synthetic | · | · | · | · | · | · | · | · |
 
 ## Gaps
 
@@ -478,32 +478,31 @@ planned, performance; tasks space; kit `-` (outside the driver); checked by: ans
 - **lubm:** jena (1000); nemo (1000); owlrl (10, 100, 1000); rdfox (1, 10, 100, 1000)
 - **lubm-materialised:** rdfox (1, 10, 100); anzograph (1, 10, 100)
 - **owl2bench:** jena (ql-1); rdfox (rl-1, ql-1)
-- **ldbc-spb:** nrese (50m, 256m); jena (50m, 256m); rdf4j (50m, 256m); graphdb (50m, 256m); rdfox (50m, 256m); anzograph (50m, 256m)
+- **ldbc-spb:** nrese (50m, 256m); jena (50m, 256m); rdf4j (50m, 256m); graphdb (50m, 256m); anzograph (50m, 256m)
 - **integration-rg-gs-gnd:** nrese (example, cohort, full); jena (example, cohort, full); graphdb (example, cohort, full); rdfox (example, cohort, full)
-- **real-ontologies:** nrese (dbpedia-core, yago-tiny); jena (dbpedia-core, yago-tiny); rdf4j (dbpedia-core, yago-tiny); nemo (dbpedia-core, yago-tiny); owlrl (dbpedia-core, yago-tiny); graphdb (dbpedia-core, yago-tiny); rdfox (dbpedia-core, yago-tiny); anzograph (dbpedia-core, yago-tiny)
-- **consistency:** nrese (lubm-1, owl2bench-rl-1); graphdb (lubm-1, owl2bench-rl-1); rdfox (lubm-1, owl2bench-rl-1)
-- **ore-2015:** nrese (full); hermit (full); openllet (full); konclude (full); elk (full); rdfox (dev, full)
-- **w3c-owl2-dl:** rdfox (-)
-- **owl2bench-classify:** nrese (el-1, dl-1, dl-10); hermit (el-1, dl-1, dl-10); openllet (el-1, dl-1, dl-10); konclude (el-1, dl-1, dl-10); elk (el-1, dl-1, dl-10); rdfox (el-1, dl-1, dl-10)
+- **real-ontologies:** nrese (dbpedia-core, yago-tiny); jena (dbpedia-core, yago-tiny); rdf4j (dbpedia-core, yago-tiny); nemo (dbpedia-core, yago-tiny); owlrl (dbpedia-core, yago-tiny); graphdb (dbpedia-core, yago-tiny); anzograph (dbpedia-core, yago-tiny)
+- **consistency:** nrese (lubm-1, owl2bench-rl-1); graphdb (lubm-1, owl2bench-rl-1)
+- **ore-2015:** nrese (full); hermit (full); openllet (full); konclude (full); elk (full)
+- **owl2bench-classify:** nrese (el-1, dl-1, dl-10); hermit (el-1, dl-1, dl-10); openllet (el-1, dl-1, dl-10); konclude (el-1, dl-1, dl-10); elk (el-1, dl-1, dl-10)
 - **basics-mix:** rdfox (olympics, yago-tiny, entities-10000000, dbpedia-core, wikidata-lexemes-60m); anzograph (olympics, yago-tiny, entities-10000000, dbpedia-core, wikidata-lexemes-60m)
-- **sparqloscope:** nrese (dblp); qlever (dblp); oxigraph (dblp); virtuoso (dblp); jena (dblp); rdf4j (dblp); graphdb (dblp); rdfox (dblp); anzograph (dblp)
-- **bsbm:** nrese (10m, 100m); qlever (10m, 100m); oxigraph (10m, 100m); virtuoso (10m, 100m); jena (10m, 100m); rdf4j (10m, 100m); graphdb (10m, 100m); rdfox (10m, 100m); anzograph (10m, 100m)
-- **watdiv:** nrese (10m, 100m); qlever (10m, 100m); oxigraph (10m, 100m); virtuoso (10m, 100m); jena (10m, 100m); rdf4j (10m, 100m); graphdb (10m, 100m); rdfox (10m, 100m); anzograph (10m, 100m)
+- **sparqloscope:** nrese (dblp); qlever (dblp); oxigraph (dblp); virtuoso (dblp); jena (dblp); rdf4j (dblp); graphdb (dblp); anzograph (dblp)
+- **bsbm:** nrese (10m, 100m); qlever (10m, 100m); oxigraph (10m, 100m); virtuoso (10m, 100m); jena (10m, 100m); rdf4j (10m, 100m); graphdb (10m, 100m); anzograph (10m, 100m)
+- **watdiv:** nrese (10m, 100m); qlever (10m, 100m); oxigraph (10m, 100m); virtuoso (10m, 100m); jena (10m, 100m); rdf4j (10m, 100m); graphdb (10m, 100m); anzograph (10m, 100m)
 - **write-scaling:** graphdb (1m, 10m)
-- **era-shacl:** nrese (-); jena (-); rdf4j (-); graphdb (-); rdfox (-)
-- **fulltext-search:** nrese (-); qlever (-); virtuoso (-); jena (-); rdf4j (-); graphdb (-); rdfox (-)
-- **federation:** nrese (-); qlever (-); oxigraph (-); virtuoso (-); jena (-); rdf4j (-); graphdb (-); rdfox (-); anzograph (-)
+- **era-shacl:** nrese (-); jena (-); rdf4j (-); graphdb (-)
+- **fulltext-search:** nrese (-); qlever (-); virtuoso (-); jena (-); rdf4j (-); graphdb (-)
+- **federation:** nrese (-); qlever (-); oxigraph (-); virtuoso (-); jena (-); rdf4j (-); graphdb (-); anzograph (-)
 - **fast:** nrese (rl-hierarchy~closure, rl-clique); qlever (rl-clique); oxigraph (rl-clique); virtuoso (rl-hierarchy~closure, rl-clique); jena (rl-hierarchy~closure, rl-clique); rdf4j (q-cycles~plain, rl-hierarchy~closure, rl-clique); graphdb (q-cycles~plain, rl-hierarchy~closure, rl-clique); rdfox (q-cycles~plain, rl-hierarchy~closure, rl-clique); anzograph (q-cycles~plain, rl-hierarchy~closure, rl-clique)
 - **clients:** nrese (-)
-- **gcare:** nrese (yago, lubm80); qlever (yago, lubm80); oxigraph (yago, lubm80); virtuoso (yago, lubm80); jena (yago, lubm80); rdf4j (yago, lubm80); graphdb (yago, lubm80); rdfox (yago, lubm80); anzograph (yago, lubm80)
-- **claros:** nrese (l, le); jena (l, le); nemo (l, le); souffle (l, le); vlog (l, le); glog (l, le); owlrl (l, le); graphdb (l, le); rdfox (l, le)
-- **datalog-graphs:** nrese (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); jena (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); nemo (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); souffle (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); vlog (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); glog (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); graphdb (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); rdfox (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql)
-- **commit-latency:** nrese (lubm-10); graphdb (lubm-10); rdfox (lubm-10)
-- **elk-ontologies:** nrese (go, chebi, ncit, galen); hermit (go, chebi, ncit, galen); openllet (go, chebi, ncit, galen); konclude (go, chebi, ncit, galen); elk (go, chebi, ncit, galen); rdfox (go, chebi, ncit, galen)
-- **pagoda-suite:** nrese (lubm, uobm, fly, npd, dbpedia); graphdb (lubm, uobm, fly, npd, dbpedia); rdfox (lubm, uobm, fly, npd, dbpedia)
-- **vector-recall:** nrese (generated-200k, yfcc-10m); qlever (generated-200k, yfcc-10m); oxigraph (generated-200k, yfcc-10m); virtuoso (generated-200k, yfcc-10m); jena (generated-200k, yfcc-10m); rdf4j (generated-200k, yfcc-10m); graphdb (generated-200k, yfcc-10m); rdfox (generated-200k, yfcc-10m); anzograph (generated-200k, yfcc-10m)
-- **ann-benchmarks:** nrese (sift-1m, glove-100, fashion-mnist); qlever (sift-1m, glove-100, fashion-mnist); oxigraph (sift-1m, glove-100, fashion-mnist); virtuoso (sift-1m, glove-100, fashion-mnist); jena (sift-1m, glove-100, fashion-mnist); rdf4j (sift-1m, glove-100, fashion-mnist); graphdb (sift-1m, glove-100, fashion-mnist); rdfox (sift-1m, glove-100, fashion-mnist); anzograph (sift-1m, glove-100, fashion-mnist)
-- **geographica2:** nrese (real, synthetic); qlever (real, synthetic); virtuoso (real, synthetic); jena (real, synthetic); rdf4j (real, synthetic); graphdb (real, synthetic); rdfox (real, synthetic)
+- **gcare:** nrese (yago, lubm80); qlever (yago, lubm80); oxigraph (yago, lubm80); virtuoso (yago, lubm80); jena (yago, lubm80); rdf4j (yago, lubm80); graphdb (yago, lubm80); anzograph (yago, lubm80)
+- **claros:** nrese (l, le); jena (l, le); nemo (l, le); souffle (l, le); vlog (l, le); glog (l, le); owlrl (l, le); graphdb (l, le)
+- **datalog-graphs:** nrese (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); jena (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); nemo (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); souffle (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); vlog (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); glog (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); graphdb (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql)
+- **commit-latency:** nrese (lubm-10); graphdb (lubm-10)
+- **elk-ontologies:** nrese (go, chebi, ncit, galen); hermit (go, chebi, ncit, galen); openllet (go, chebi, ncit, galen); konclude (go, chebi, ncit, galen); elk (go, chebi, ncit, galen)
+- **pagoda-suite:** nrese (lubm, uobm, fly, npd, dbpedia); graphdb (lubm, uobm, fly, npd, dbpedia)
+- **vector-recall:** nrese (generated-200k, yfcc-10m); qlever (generated-200k, yfcc-10m); oxigraph (generated-200k, yfcc-10m); virtuoso (generated-200k, yfcc-10m); jena (generated-200k, yfcc-10m); rdf4j (generated-200k, yfcc-10m); graphdb (generated-200k, yfcc-10m); anzograph (generated-200k, yfcc-10m)
+- **ann-benchmarks:** nrese (sift-1m, glove-100, fashion-mnist); qlever (sift-1m, glove-100, fashion-mnist); oxigraph (sift-1m, glove-100, fashion-mnist); virtuoso (sift-1m, glove-100, fashion-mnist); jena (sift-1m, glove-100, fashion-mnist); rdf4j (sift-1m, glove-100, fashion-mnist); graphdb (sift-1m, glove-100, fashion-mnist); anzograph (sift-1m, glove-100, fashion-mnist)
+- **geographica2:** nrese (real, synthetic); qlever (real, synthetic); virtuoso (real, synthetic); jena (real, synthetic); rdf4j (real, synthetic); graphdb (real, synthetic)
 
 ### Build variants without an outcome (nrese-fsst, nrese-oxigraph, nemo-schemafirst, nemo-sparq; optional)
 
