@@ -3,7 +3,7 @@
 railway knowledge graph, three subsets x three shape sets, each engine in-memory in a
 container of its own (benches/breadth/README.md, "ERA-SHACL").
 
-    run.py images                      build the engine images (NRESE from this worktree)
+    run.py images [--prebuilt]         build the engine images (NRESE from this worktree)
     run.py run [--subsets ES,FR] [--shapes tds,core,era] [--engines ...] [--runs 3]
                [--memory 28g] [--heap 24g] [--label NAME]
     run.py check RESULTS_DIR [--reference topbraid]
@@ -47,6 +47,11 @@ ENGINES = {
     "pyshacl": ("engines/pyshacl", "upstream", "pyshacl 0.30.1, rdflib 7.1.3"),
     "maplib": ("engines/maplib", "upstream", "maplib 0.15.15"),
 }
+# Engines upstream's repository can't build as published: maplib's image copies a 0.15.15 wheel
+# the repository doesn't ship, and PyPI never had that version (0.20 validates through a renamed
+# API, `Model.validate`: a wrapper of our own would be needed).
+UNBUILDABLE = {"maplib": "the image copies maplib-0.15.15-cp39-abi3-manylinux_2_24_x86_64.whl, which the repository "
+                         "doesn't ship and PyPI never had"}
 SYSTEM = {"nrese": "nrese", "jena": "jena", "rdf4j": "rdf4j"}  # systems.toml keys where one exists
 DATA = kit.DATA / "era-shacl"
 # Pairs whose published peak (upstream's results/, GB, the largest of its six runs) exceeds a
@@ -70,7 +75,8 @@ def images(args) -> int:
     for engine in args.engines.split(","):
         directory, how, _ = ENGINES[engine]
         if how == "nrese":
-            made = kit.build_nrese([["-p", "nrese-store", "--example", "perf_lab"]])
+            made = ({"perf_lab": kit.sha256(kit.BIN / "perf_lab")} if args.prebuilt
+                    else kit.build_nrese([["-p", "nrese-store", "--example", "perf_lab"]]))
             context = kit.SCRATCH / "era-nrese-image"
             shutil.rmtree(context, ignore_errors=True)
             context.mkdir(parents=True)
@@ -262,11 +268,12 @@ def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
     i = sub.add_parser("images")
-    i.add_argument("--engines", default=",".join(ENGINES))
+    i.add_argument("--engines", default=",".join(e for e in ENGINES if e not in UNBUILDABLE and e != "corese"))
+    i.add_argument("--prebuilt", action="store_true", help="NRESE's perf_lab from the kit's bin/, not built")
     r = sub.add_parser("run")
     r.add_argument("--subsets", default="ES,FR,ERA")
     r.add_argument("--shapes", default="tds,core,era")
-    r.add_argument("--engines", default="nrese,jena,topbraid,rdf4j,pyshacl,maplib")
+    r.add_argument("--engines", default="nrese,jena,topbraid,rdf4j,pyshacl")
     r.add_argument("--runs", type=int, default=3)
     r.add_argument("--memory", default="28g")
     r.add_argument("--heap", default="24g")
