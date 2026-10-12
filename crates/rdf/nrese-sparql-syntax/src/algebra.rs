@@ -14,8 +14,11 @@ use crate::writer;
 pub enum PropertyPathExpression {
     NamedNode(NamedNode),
     Reverse(Box<Self>),
-    Sequence(Box<Self>, Box<Self>),
-    Alternative(Box<Self>, Box<Self>),
+    /// The steps in order (two or more; [`Self::sequence`] flattens nested sequences):
+    /// n-ary, so a path of thousands of steps is not thousands deep (ADR-0012).
+    Sequence(Vec<Self>),
+    /// The alternatives (two or more; [`Self::alternative`] flattens nested ones).
+    Alternative(Vec<Self>),
     ZeroOrMore(Box<Self>),
     OneOrMore(Box<Self>),
     ZeroOrOne(Box<Self>),
@@ -26,6 +29,51 @@ impl From<NamedNode> for PropertyPathExpression {
     fn from(node: NamedNode) -> Self {
         Self::NamedNode(node)
     }
+}
+
+impl PropertyPathExpression {
+    /// `steps` in sequence, nested sequences flattened; one step is itself.
+    pub fn sequence(steps: Vec<Self>) -> Self {
+        let mut steps = flatten(steps, |path| match path {
+            Self::Sequence(steps) => Some(std::mem::take(steps)),
+            _ => None,
+        });
+        match steps.len() {
+            1 => steps.pop().expect("one"),
+            _ => Self::Sequence(steps),
+        }
+    }
+
+    /// `paths` as alternatives, nested alternatives flattened; one path is itself.
+    pub fn alternative(paths: Vec<Self>) -> Self {
+        let mut paths = flatten(paths, |path| match path {
+            Self::Alternative(paths) => Some(std::mem::take(paths)),
+            _ => None,
+        });
+        match paths.len() {
+            1 => paths.pop().expect("one"),
+            _ => Self::Alternative(paths),
+        }
+    }
+}
+
+/// The operands of an n-ary node, the operands of nested nodes of its kind spliced in
+/// (`open` takes a node's operands out, `None` for a node of another kind). Spliced with a
+/// stack of iterators: nested nodes of any depth open without recursion.
+fn flatten<T>(items: Vec<T>, open: impl Fn(&mut T) -> Option<Vec<T>>) -> Vec<T> {
+    let mut flat = Vec::with_capacity(items.len());
+    let mut pending: Vec<std::vec::IntoIter<T>> = vec![items.into_iter()];
+    while let Some(iter) = pending.last_mut() {
+        let Some(mut item) = iter.next() else {
+            pending.pop();
+            continue;
+        };
+        match open(&mut item) {
+            Some(inner) => pending.push(inner.into_iter()),
+            None => flat.push(item),
+        }
+    }
+    flat
 }
 
 impl fmt::Display for PropertyPathExpression {
@@ -87,6 +135,31 @@ impl From<NamedNodePattern> for Expression {
             NamedNodePattern::NamedNode(n) => n.into(),
             NamedNodePattern::Variable(v) => v.into(),
         }
+    }
+}
+
+impl Expression {
+    /// `operands` joined by an associative operator ([`Self::And`], [`Self::Or`]:
+    /// associative in SPARQL's logic of true, false and error) as a balanced tree: n
+    /// operands are log n deep, not n, since evaluating, printing and dropping an
+    /// expression recurse on its depth (ADR-0012). Two and three operands give the
+    /// left-deep tree of the grammar. `None` for none.
+    pub fn balanced(
+        mut operands: Vec<Self>,
+        join: fn(Box<Self>, Box<Self>) -> Self,
+    ) -> Option<Self> {
+        while operands.len() > 1 {
+            let mut next = Vec::with_capacity(operands.len().div_ceil(2));
+            let mut pairs = operands.into_iter();
+            while let Some(a) = pairs.next() {
+                next.push(match pairs.next() {
+                    Some(b) => join(Box::new(a), Box::new(b)),
+                    None => a,
+                });
+            }
+            operands = next;
+        }
+        operands.pop()
     }
 }
 
@@ -304,9 +377,10 @@ pub enum GraphPattern {
         path: PropertyPathExpression,
         object: TermPattern,
     },
+    /// Its inputs joined (two or more; [`Self::join_all`] flattens nested joins): n-ary,
+    /// so a group of thousands of parts is not thousands deep (ADR-0012).
     Join {
-        left: Box<Self>,
-        right: Box<Self>,
+        inputs: Vec<Self>,
     },
     LeftJoin {
         left: Box<Self>,
@@ -322,18 +396,21 @@ pub enum GraphPattern {
         expr: Expression,
         inner: Box<Self>,
     },
+    /// Its inputs' solutions together (two or more; [`Self::union_all`] flattens nested
+    /// unions).
     Union {
-        left: Box<Self>,
-        right: Box<Self>,
+        inputs: Vec<Self>,
     },
     Graph {
         name: NamedNodePattern,
         inner: Box<Self>,
     },
+    /// Its bindings in order, each extending the solutions of the ones before it (one or
+    /// more; [`Self::extend`] continues an `Extend` below): a run of `BIND`s, or a
+    /// SELECT's expressions, is one node, not a level each (ADR-0012).
     Extend {
         inner: Box<Self>,
-        variable: Variable,
-        expression: Expression,
+        bindings: Vec<(Variable, Expression)>,
     },
     Minus {
         left: Box<Self>,
@@ -383,6 +460,67 @@ impl Default for GraphPattern {
     }
 }
 
+impl GraphPattern {
+    /// `self` extended by `variable` bound to `expression`: one more binding of an
+    /// `Extend` at the top, else a new `Extend`.
+    pub fn extend(self, variable: Variable, expression: Expression) -> Self {
+        match self {
+            Self::Extend {
+                inner,
+                mut bindings,
+            } => {
+                bindings.push((variable, expression));
+                Self::Extend { inner, bindings }
+            }
+            inner => Self::Extend {
+                inner: Box::new(inner),
+                bindings: vec![(variable, expression)],
+            },
+        }
+    }
+
+    /// The union of `patterns`, nested unions flattened; one pattern is itself, none the
+    /// empty basic graph pattern.
+    pub fn union_all(patterns: Vec<Self>) -> Self {
+        let mut inputs = flatten(patterns, |pattern| match pattern {
+            Self::Union { inputs } => Some(std::mem::take(inputs)),
+            _ => None,
+        });
+        match inputs.len() {
+            0 => Self::default(),
+            1 => inputs.pop().expect("one"),
+            _ => Self::Union { inputs },
+        }
+    }
+
+    /// `patterns` joined as the parser joins a group's parts: nested joins flattened,
+    /// empty basic graph patterns dropped (the join's identity), and a basic graph pattern
+    /// following one that is all so far continues it. One pattern is itself, none the
+    /// empty basic graph pattern.
+    pub fn join_all(patterns: Vec<Self>) -> Self {
+        let flat = flatten(patterns, |pattern| match pattern {
+            Self::Join { inputs } => Some(std::mem::take(inputs)),
+            _ => None,
+        });
+        let mut inputs: Vec<Self> = Vec::with_capacity(flat.len());
+        for pattern in flat {
+            match pattern {
+                Self::Bgp { patterns } if patterns.is_empty() => {}
+                Self::Bgp { patterns } => match inputs.as_mut_slice() {
+                    [Self::Bgp { patterns: first }] => first.extend(patterns),
+                    _ => inputs.push(Self::Bgp { patterns }),
+                },
+                pattern => inputs.push(pattern),
+            }
+        }
+        match inputs.len() {
+            0 => Self::default(),
+            1 => inputs.pop().expect("one"),
+            _ => Self::Join { inputs },
+        }
+    }
+}
+
 /// Prints the content of a group: `{ ` + this + ` }` parses back to the pattern.
 impl fmt::Display for GraphPattern {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -410,10 +548,12 @@ impl GraphPattern {
                 term_pattern_variables(subject, callback);
                 term_pattern_variables(object, callback);
             }
-            Self::Join { left, right }
-            | Self::LeftJoin { left, right, .. }
-            | Self::Lateral { left, right }
-            | Self::Union { left, right } => {
+            Self::Join { inputs } | Self::Union { inputs } => {
+                for input in inputs {
+                    input.in_scope(callback);
+                }
+            }
+            Self::LeftJoin { left, right, .. } | Self::Lateral { left, right } => {
                 left.in_scope(callback);
                 right.in_scope(callback);
             }
@@ -423,10 +563,10 @@ impl GraphPattern {
                 }
                 inner.in_scope(callback);
             }
-            Self::Extend {
-                inner, variable, ..
-            } => {
-                callback(variable);
+            Self::Extend { inner, bindings } => {
+                for (variable, _) in bindings {
+                    callback(variable);
+                }
                 inner.in_scope(callback);
             }
             Self::Minus { left, .. } => left.in_scope(callback),
@@ -461,10 +601,12 @@ impl GraphPattern {
     pub fn on_used_variable<'a>(&'a self, callback: &mut impl FnMut(&'a Variable)) {
         match self {
             Self::Bgp { .. } | Self::Path { .. } | Self::Values { .. } => self.in_scope(callback),
-            Self::Join { left, right }
-            | Self::Lateral { left, right }
-            | Self::Union { left, right }
-            | Self::Minus { left, right } => {
+            Self::Join { inputs } | Self::Union { inputs } => {
+                for input in inputs {
+                    input.on_used_variable(callback);
+                }
+            }
+            Self::Lateral { left, right } | Self::Minus { left, right } => {
                 left.on_used_variable(callback);
                 right.on_used_variable(callback);
             }
@@ -489,13 +631,11 @@ impl GraphPattern {
                 }
                 inner.on_used_variable(callback);
             }
-            Self::Extend {
-                inner,
-                variable,
-                expression,
-            } => {
-                callback(variable);
-                expression.on_used_variable(callback);
+            Self::Extend { inner, bindings } => {
+                for (variable, expression) in bindings {
+                    callback(variable);
+                    expression.on_used_variable(callback);
+                }
                 inner.on_used_variable(callback);
             }
             Self::OrderBy { inner, expression } => {

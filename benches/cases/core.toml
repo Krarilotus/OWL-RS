@@ -1012,7 +1012,7 @@ args = ["--reason", "owl2-rl", "--reason-runs", "3", "--commits", "{data}.commit
 queries = "sameas-giant"
 metric = "reason.p50_ms"
 check = { "closure_after_commits.equal" = "true", "q.values.value" = "expect.values_after_split" }
-route = {}
+route = { "commits.work.recomputed" = "== 1", "commits.work.rebuilt" = "== 0" }
 cap_gb = 8
 systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["Store-2: equality by class ids; a deletion splits a class (B/F style)"]
@@ -1483,10 +1483,10 @@ args = ["--reason", "owl2-dl", "--commits", "{data}.commits.ru"]
 queries = ""
 metric = "commits.p50_ms"
 check = { "commits.commits" = 200, "commits.error" = "has inconsistent under OWL 2 DL" }
-route = { "commits.error" = "has hypertableau" }
+route = { "commits.error" = "has touched-islands" }
 cap_gb = 4
 systems = []
-guards = ["DL in the store: a commit's consistency proved by U1, a clash sent to a DL engine"]
+guards = ["DL in the store: a commit's consistency proved by U1, a clash sent to a DL engine; after the 200 consistent commits, the adding commit decided on the ABox islands it touches (docs/design/owl2-dl.md §9)"]
 
 # --- the perf lab's datasets (formerly benches/perf-lab.sh): the store and query engine on
 # real data, each query's row count pinned from the perf-lab records of 27 Sep 2026

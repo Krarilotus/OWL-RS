@@ -308,7 +308,20 @@ fn taxonomies_equal_brute_force() {
     let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x0020_2610_0534);
     let mut rng = Rng::new(seed);
     let mut tally = Tally::default();
-    for case in 0..cases {
+    let covered = |t: &Tally| {
+        t.compared * 4 >= t.cases * 3
+            && t.with_subsumptions > 0
+            && t.inconsistent > 0
+            && t.candidate_tests > 0
+            && t.exact_classes > 0
+    };
+    // Draw on (up to ten times as many cases) until the run covers what the assertion
+    // below asks for, so that coverage never depends on the seed (the NI fuzz test's
+    // fix, a901e34; seed 66810 of the SPARQL differential tests, 12 October 2026).
+    for case in 0..cases * 10 {
+        if case >= cases && covered(&tally) {
+            break;
+        }
         let (o, _) = signature(case, &mut rng);
         let shuffled = fuzz::shuffle(&o, &mut rng);
         if env("NRESE_FUZZ_ONLY").is_some_and(|only| only != case) {
@@ -430,22 +443,9 @@ fn taxonomies_equal_brute_force() {
         }
     }
     eprintln!("{tally:?} in {:?}", started.elapsed());
-    assert!(
-        tally.compared * 4 >= tally.cases * 3,
-        "too few cases decided: {tally:?}"
-    );
-    assert!(
-        tally.with_subsumptions > 0 && tally.inconsistent > 0,
-        "{tally:?}"
-    );
-    assert!(
-        tally.candidate_tests > 0,
-        "no candidate was ever tested: {tally:?}"
-    );
-    assert!(
-        tally.exact_classes > 0,
-        "no class was ever exact: {tally:?}"
-    );
+    // Three quarters of the cases decided; subsumptions, an inconsistency, a candidate
+    // tested and an exact class seen.
+    assert!(covered(&tally), "{tally:?}");
 }
 
 #[test]
@@ -455,7 +455,14 @@ fn types_equal_brute_force() {
     let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x0020_2610_0535);
     let mut rng = Rng::new(seed);
     let mut tally = Tally::default();
-    for case in 0..cases {
+    let covered = |t: &Tally| t.realised > 0 && t.with_types > 0;
+    // Draw on (up to ten times as many cases) until the run covers what the assertion
+    // below asks for, so that coverage never depends on the seed (the NI fuzz test's
+    // fix, a901e34; seed 66810 of the SPARQL differential tests, 12 October 2026).
+    for case in 0..cases * 10 {
+        if case >= cases && covered(&tally) {
+            break;
+        }
         let (o, _) = signature(case, &mut rng);
         if env("NRESE_FUZZ_ONLY").is_some_and(|only| only != case) {
             continue;
@@ -512,7 +519,7 @@ fn types_equal_brute_force() {
         tally.with_types += u64::from(expected.iter().any(|t| !t.is_empty()));
     }
     eprintln!("{tally:?} in {:?}", started.elapsed());
-    assert!(tally.realised > 0 && tally.with_types > 0, "{tally:?}");
+    assert!(covered(&tally), "{tally:?}");
 }
 
 /// A taxonomy only a test of a candidate shows: `A ⊑ B ⊔ C`, `B ⊑ D`, `C ⊑ D` gives
@@ -771,4 +778,46 @@ fn left_out_axioms_answer_from_the_lower_bound_at_once() {
         t.incomplete
     );
     assert!(t.classification.subsumptions.contains(&(1, 4)));
+}
+
+/// Guard (small-scope case 1219488, 12 October 2026): a key over `owl:topObjectProperty`
+/// alone makes any two named individuals of its class one; with them different, the
+/// ontology is inconsistent. The context core took keys to need role assertions, and the
+/// classification reported it consistent.
+#[test]
+fn a_key_of_no_property_left_merges_without_assertions() {
+    let mut o = nrese_owl::Ontology::default();
+    o.builtin.top_object = Some(50);
+    let thing = nrese_owl::ExprId(o.classes.intern(nrese_owl::ClassExpr::Thing));
+    o.axioms = vec![
+        nrese_owl::Axiom::HasKey(thing, vec![nrese_owl::ObjProp::Named(50)], Vec::new()),
+        nrese_owl::Axiom::DifferentIndividuals(vec![100, 101]),
+    ];
+    o.sources = vec![Vec::new(); 2];
+    let taxonomy = nrese_dl::classify::classify(&o, &nrese_dl::classify::Options::default());
+    assert!(taxonomy.complete());
+    assert!(!taxonomy.classification.consistent);
+}
+
+/// Guard (small-scope case 1267640, 12 October 2026): a key applies to every named
+/// individual, one no assertion mentions too. With `owl:topObjectProperty` the key's only
+/// property, `a` and `b` are one, so `b` is an `A` because `a` is; realisation took `b` for
+/// a fresh element of no type.
+#[test]
+fn a_key_reaches_individuals_no_assertion_mentions() {
+    use nrese_owl::{Axiom, ClassExpr, EntityKind, ExprId, ObjProp, Ontology};
+    let mut o = Ontology::default();
+    o.builtin.top_object = Some(50);
+    let thing = ExprId(o.classes.intern(ClassExpr::Thing));
+    let a = ExprId(o.classes.intern(ClassExpr::Class(1)));
+    o.axioms = vec![
+        Axiom::Declaration(EntityKind::NamedIndividual, 101),
+        Axiom::HasKey(thing, vec![ObjProp::Named(50)], Vec::new()),
+        Axiom::ClassAssertion(a, 100),
+    ];
+    o.sources = vec![Vec::new(); 3];
+    let r = nrese_dl::classify::realise(&o, &nrese_dl::classify::Options::default());
+    assert!(r.incomplete.is_empty(), "{:?}", r.incomplete);
+    let b = r.individuals.iter().position(|&t| t == 101).expect("b");
+    assert!(r.types[b].contains(&1), "{:?}", r.types);
 }

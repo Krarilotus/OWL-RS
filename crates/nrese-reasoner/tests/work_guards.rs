@@ -5,7 +5,7 @@
 use nrese_reasoner::batch::{self, Materialisation, Schema};
 use nrese_reasoner::delta::{self, MemoryBase};
 use nrese_reasoner::eval::GroundProgram;
-use nrese_reasoner::ir::{Head, OWL, RDF, RDFS, Rule, Vocabulary};
+use nrese_reasoner::ir::{Head, OWL, RDF, RDFS, Rule, Triple, Vocabulary};
 use nrese_reasoner::lists::ListVocabulary;
 use nrese_reasoner::rulesets::Ruleset;
 use nrese_reasoner::vocabulary::LocalVocabulary;
@@ -209,3 +209,86 @@ fn a_deep_hierarchy_derives_each_inherited_type_once() {
 
 /// See [`a_deep_hierarchy_derives_each_inherited_type_once`].
 const SPINE_BINDINGS: u64 = 428_000;
+
+/// B3a: a deletion that splits an `owl:sameAs` class recomputes the class's facts at once
+/// (overdeleted, and every copy within the parts the equalities left put back in bulk)
+/// instead of running DRed's equality rules over every pair of members. The fast suite's
+/// shape at 200 members: two chains joined by a bridge, a value per member. With DRed,
+/// a 500-member split took 68 s in the store (75 s, 7.7 GB on 7 October 2026); recomputed,
+/// 0.45 s in memory, a rematerialisation of everything 1.18 s.
+#[test]
+fn a_split_class_is_recomputed_not_copied_through() {
+    use nrese_reasoner::delta::policy::{Plan, Policy};
+    use nrese_reasoner::eval::NEVER;
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = Ruleset::Owl2Rl
+        .rules(&mut vocabulary)
+        .expect("OWL 2 RL parses");
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let schema = Schema::owl(&mut vocabulary);
+    let same_as = vocabulary.iri(&format!("{OWL}sameAs"));
+    let val = vocabulary.iri(&format!("{}val", lubm::EX));
+    let size = 200;
+    let member = |v: &mut LocalVocabulary, j: usize| v.iri(&format!("{}g{j}", lubm::EX));
+    let mut asserted = Vec::new();
+    for j in 0..size {
+        let x = member(&mut vocabulary, j);
+        let value = vocabulary.literal(&format!("g{j}"), "http://www.w3.org/2001/XMLSchema#string");
+        asserted.push([x, val, value]);
+        if j + 1 < size {
+            asserted.push([x, same_as, member(&mut vocabulary, j + 1)]);
+        }
+    }
+    let bridge = [
+        member(&mut vocabulary, size / 2 - 1),
+        same_as,
+        member(&mut vocabulary, size / 2),
+    ];
+    asserted.sort_unstable();
+    let before = batch::materialise(&asserted, &rules, Some(&lists), &schema);
+    let after: Vec<Triple> = asserted.iter().copied().filter(|&t| t != bridge).collect();
+    let base = MemoryBase::new(&after, &before.derived);
+    let compiled = delta::Rules {
+        rules: &rules,
+        lists: Some(&lists),
+        schema: &schema,
+    };
+    let update = delta::update_with(
+        &base,
+        &[],
+        &[bridge],
+        compiled,
+        None,
+        NEVER,
+        Policy::default(),
+    )
+    .expect("never stopped");
+    let fresh = batch::materialise(&after, &rules, Some(&lists), &schema);
+    // The class's inferred facts: every pair of members, and every member's value on each.
+    let region = (size * size - (size - 1) + size * size - size) as u64;
+    let kept = fresh.derived.len() as u64;
+    let policy = &update.policy;
+    assert_eq!(policy.plan, Plan::Recompute, "{policy:?}");
+    assert!(
+        policy.dred_estimate > policy.recompute_estimate,
+        "{policy:?}"
+    );
+    assert_eq!(
+        (policy.region_terms, policy.region_facts, policy.overdeleted),
+        (size as u64, region, region),
+        "the class's facts overdeleted, and nothing copied through it: {policy:?}"
+    );
+    assert_eq!(
+        policy.rederived, kept,
+        "what the parts keep, put back: {policy:?}"
+    );
+    let removal: std::collections::HashSet<Triple> = update.remove.iter().copied().collect();
+    let mut maintained: Vec<Triple> = before
+        .derived
+        .into_iter()
+        .filter(|t| !removal.contains(t))
+        .chain(update.insert)
+        .collect();
+    maintained.sort_unstable();
+    assert_eq!(maintained, fresh.derived);
+}

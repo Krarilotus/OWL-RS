@@ -1,5 +1,5 @@
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::Response;
 use nrese_store::{
     CancellationToken, GraphResultFormat, MutationCommand, QueryResultKind, SolutionsResultFormat,
     SparqlQueryRequest, SparqlUpdateRequest, StoreError,
@@ -61,12 +61,22 @@ pub async fn execute_query_in(
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
     if explain == Explain::Plan {
-        // Statistics only, nothing evaluated; off the async threads all the same.
-        let planned = tokio::task::spawn_blocking(move || store.plan_query(&prepared))
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?
-            .map_err(|error| map_query_error(&policy, error))?;
-        return Ok(axum::Json(plan_json(&planned)).into_response());
+        // Statistics only, nothing evaluated; under the deadline as evaluation is: planning
+        // a large pattern stops when the deadline cancels it.
+        return stream_blocking(
+            deadline,
+            cancellation,
+            "application/json",
+            QUERY_TIMEOUT_MESSAGE,
+            move |out| {
+                let planned = store
+                    .plan_query(&prepared, &token)
+                    .map_err(|error| map_query_error(&policy, error))?;
+                serde_json::to_writer(out, &plan_json(&planned))
+                    .map_err(|error| ApiError::internal(error.to_string()))
+            },
+        )
+        .await;
     }
     if explain == Explain::Analyze {
         return stream_blocking(
