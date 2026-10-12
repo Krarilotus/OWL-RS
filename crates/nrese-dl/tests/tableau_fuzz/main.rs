@@ -587,7 +587,14 @@ fn ni_pattern_answers_agree_with_the_semantics() {
     let mut check = Rng::new(seed ^ 0x5A5A);
     let mut tally = Tally::default();
     let mut unconfirmed = Vec::new();
-    for case in 0..cases {
+    // The pattern makes the NI rule likely, not certain: a seed can draw `cases` cases in
+    // which it never fires, or only one kind of answer. Draw on (up to ten times as many)
+    // until the run has covered both, so coverage never depends on the seed.
+    let covered = |t: &Tally| t.ni_firings > 0 && t.inconsistent > 0 && t.consistent > 0;
+    for case in 0..cases * 10 {
+        if case >= cases && covered(&tally) {
+            break;
+        }
         let mut names: HashMap<String, Term> = HashMap::new();
         let mut intern = |n: &Name| {
             let key = format!("{n:?}");
