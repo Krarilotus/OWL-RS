@@ -1,6 +1,7 @@
 //! E5 gate (store side): bulk loading files through parallel parsing and the engine's bulk
 //! path.
 
+use crate::support::Writes;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;

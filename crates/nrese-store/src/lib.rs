@@ -68,9 +68,9 @@ pub use image_backup::{
     ImageManifest, prune_wal_archive, read_manifest, restore_image, restore_until,
 };
 pub use mutation::{
-    MutationCommand, MutationCommitReport, MutationError, MutationKind, MutationPipeline,
-    MutationReject, MutationTicket, ReasoningRunRecord, RejectAttribution,
-    RejectAttributionCandidate,
+    DeltaPlanner, MutationCommand, MutationCommitReport, MutationError, MutationKind,
+    MutationPipeline, MutationReject, MutationTicket, ReasoningRunRecord, RejectAttribution,
+    RejectAttributionCandidate, UpdateContext,
 };
 pub use namespaces::{NamespaceMap, Namespaces};
 /// The CPU the binary was built for against the one it runs on, for the server's start.
