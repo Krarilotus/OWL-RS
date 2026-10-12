@@ -210,15 +210,16 @@ changed_files() {
   git ls-files --others --exclude-standard
 }
 
-# With a build host (scripts/lib/remote.sh), this machine only selects the changed files; the
-# host runs every step on a snapshot of this working tree. NRESE_BUILD_HOST=local builds here.
+# This machine selects the changed files. With a build host (scripts/lib/remote.sh), the host
+# runs every step on a snapshot of this working tree; without one, or with NRESE_BUILD_HOST=local,
+# this script runs them here. Either way a passed tier is remembered.
 build_host=${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}
 # A machine's guard marks it busy (low memory or disk); then a local build goes to the build host.
 if [ "$build_host" = local ] && [ -f "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}" ]; then
   echo "this machine is busy ($(cat "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}")); building on the build host" >&2
   build_host=$(git config --get nrese.buildHost)
 fi
-if [ -z "${NRESE_ON_BUILD_HOST:-}" ] && [ -n "$build_host" ] && [ "$build_host" != local ]; then
+if [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
   list=$(mktemp)
   [ "$mode" = all ] || changed_files "$mode" > "$list"
   # A tier that passed for this exact tree and file list doesn't run again. So the gate can
@@ -230,7 +231,11 @@ if [ -z "${NRESE_ON_BUILD_HOST:-}" ] && [ -n "$build_host" ] && [ "$build_host" 
     rm -f "$list"
     exit 0
   fi
-  bash scripts/lib/remote.sh check "$mode" "$list"
+  if [ -n "$build_host" ] && [ "$build_host" != local ]; then
+    bash scripts/lib/remote.sh check "$mode" "$list"
+  else
+    NRESE_ON_BUILD_HOST=1 NRESE_FILES_FROM="$list" bash scripts/check.sh "$mode"
+  fi
   code=$?
   [ $code -eq 0 ] && echo "$key" >> "$passed"
   rm -f "$list"
