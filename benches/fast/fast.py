@@ -150,7 +150,11 @@ def capped(gb: float) -> float:
 def quiet_label() -> list[str]:
     """The quiet slot's token as a container label: the measurement's own containers."""
     token = ENV.get("NRESE_QUIET_TOKEN") or os.environ.get("NRESE_QUIET_TOKEN")
-    return ["--label", f"nrese.quiet={token}"] if token else []
+    labels = ["--label", f"nrese.quiet={token}"] if token else []
+    # A queue job's containers: its host's guard stops them with the job (benches/suite/queue.py).
+    if os.environ.get("QUEUE_JOB"):
+        labels += ["--label", f"nrese.queue={os.environ['QUEUE_JOB']}"]
+    return labels
 
 
 def cpu_args() -> list[str]:
