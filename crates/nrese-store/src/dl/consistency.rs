@@ -84,10 +84,7 @@ pub fn left_out(ontology: &Ontology) -> Option<String> {
 pub fn check(ontology: &Ontology, budget: &Budget) -> Checked {
     let started = Instant::now();
     let workers = budget.workers.as_ref().map_or_else(
-        || {
-            nrese_exec::workers::Workers::new(budget.threads.max(1))
-                .unwrap_or_else(|_| nrese_exec::workers::Workers::serial())
-        },
+        || nrese_exec::workers::Workers::new(budget.threads),
         |workers| workers.limited(budget.threads.max(1)),
     );
     let mut checked = workers.install(|| {

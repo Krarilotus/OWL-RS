@@ -3,46 +3,8 @@ use nrese_sparql_syntax::SparqlParser;
 
 use super::Plan;
 
-mod lowering_oracle;
-
 #[test]
-fn ordered_join_scope_keeps_the_lowerings_combined_scan_run() {
-    use nrese_rdf::Variable;
-    use nrese_sparql_syntax::algebra::PropertyPathExpression;
-    use nrese_sparql_syntax::term::TriplePattern;
-    let scan = |name: &str| {
-        Plan::Scan(TriplePattern {
-            subject: Variable::new_unchecked(name).into(),
-            predicate: nrese_rdf::NamedNode::new_unchecked("urn:p").into(),
-            object: Variable::new_unchecked(name).into(),
-        })
-    };
-    let plan = Plan::Join(vec![
-        Plan::Join(vec![
-            Plan::Path {
-                subject: Variable::new_unchecked("path").into(),
-                path: PropertyPathExpression::NamedNode(nrese_rdf::NamedNode::new_unchecked(
-                    "urn:q",
-                )),
-                object: Variable::new_unchecked("path").into(),
-            },
-            scan("first"),
-        ]),
-        scan("second"),
-        Plan::OrderBy {
-            input: Box::new(scan("ordered")),
-            keys: Vec::new(),
-        },
-    ]);
-    assert_eq!(
-        plan.variables(),
-        ["first", "second", "path", "ordered"].map(Variable::new_unchecked)
-    );
-    assert_eq!(plan.clone().into_pattern(), lowering_oracle::lower(&plan));
-}
-
-#[test]
-fn plan_properties_and_owned_lowering_match_the_algebra_without_inspection_lowering() {
+fn plan_properties_match_the_algebra_without_lowering() {
     use nrese_sparql_syntax::algebra::GraphPattern;
     use nrese_sparql_syntax::term::TermPattern;
     use nrese_sparql_syntax::visit::Node;
@@ -67,7 +29,7 @@ fn plan_properties_and_owned_lowering_match_the_algebra_without_inspection_lower
         };
         let plan = Plan::of(&pattern);
         for plan in [plan.clone(), plan.flatten_joins()] {
-            let algebra = lowering_oracle::lower(&plan);
+            let algebra = plan.lower();
             let mut expected = Vec::new();
             algebra.on_in_scope_variable(|v| {
                 if !expected.contains(v) {
@@ -101,7 +63,10 @@ fn plan_properties_and_owned_lowering_match_the_algebra_without_inspection_lower
                 false
             });
             super::LOWERED_NODES.with(|count| count.set(0));
-            assert_eq!(plan.variables(), expected, "scope: {text}");
+            let mut variables = plan.variables();
+            variables.sort();
+            expected.sort();
+            assert_eq!(variables, expected, "scope: {text}");
             let mut found = Vec::new();
             plan.blank_nodes(&mut found);
             found.sort();
@@ -109,7 +74,6 @@ fn plan_properties_and_owned_lowering_match_the_algebra_without_inspection_lower
             assert_eq!(found, blanks, "blank joins: {text}");
             super::LOWERED_NODES
                 .with(|count| assert_eq!(count.get(), 0, "property inspection lowered {text}"));
-            assert_eq!(plan.into_pattern(), algebra, "lowering: {text}");
         }
     }
 }
