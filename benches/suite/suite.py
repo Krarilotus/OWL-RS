@@ -66,6 +66,9 @@ def check(systems, workloads):
         for key in ("title", "kind", "tasks", "source", "licence", "check"):
             if key not in workload:
                 errors.append(f"workloads.toml [{name}]: {key} is missing")
+    # The order the families are measured in (schedule.toml).
+    from suitekit import schedule
+    errors += schedule.problems(workloads)
     # The cases of every group (benches/cases/README.md).
     from suitekit import cases
     with open(HERE.parent / "datasets.toml", "rb") as f:

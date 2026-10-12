@@ -4,11 +4,74 @@ Generated 2026-10-12 by `python benches/suite/suite.py status --write` from [sui
 
 ## At a glance
 
-- **Workloads:** 24 (4 partial, 10 planned, 10 ready)
+- **Workloads:** 34 (6 partial, 18 planned, 10 ready)
 - **Systems:** 20 (16 free to publish, 4 only with the vendor's permission)
-- **Pairs** (standard tier × system that can run it; build variants apart): 292; run at least once: 103; ok on their newest run: 79
-- **NRESE:** 18 of its 47 standard tiers ok on their newest run
+- **Pairs** (standard tier × system that can run it; build variants apart): 441; run at least once: 103; ok on their newest run: 79
+- **NRESE:** 18 of its 72 standard tiers ok on their newest run
 - **Run records:** 33, newest 2026-10-12
+
+## Schedule
+
+The order the families are measured in ([suite/schedule.toml](suite/schedule.toml), the owner's of 12 Oct 2026): the measurement queue starts jobs in it. A family without a workload entry yet is a benchmark of [CATALOG.md](CATALOG.md), named by its section.
+
+### This week, in this order
+
+| # | Family | State | Newest run | What |
+|---|---|---|---|---|
+| 1 | sparqloscope | planned | - | Sparqloscope: 105 generated queries covering the SPARQL 1.1 features one by one |
+| 2 | bsbm | planned | - | Berlin SPARQL Benchmark: e-commerce explore, business intelligence, explore and update |
+| 3 | watdiv | planned | - | WatDiv: diverse query shapes (linear, star, snowflake, complex) as a stress test |
+| 4 | gcare | planned | - | G-CARE: subgraph queries for cardinality estimation on real and generated graphs |
+| 5 | owl2bench | ready | 2026-10-09 | OWL2Bench: one TBox per OWL 2 profile, 22 queries |
+| 6 | lubm | ready | 2026-10-09 | LUBM: universities, 14 queries |
+| 7 | claros | planned | - | Claros (L, LE): RDFox's and GLog's datasets, rules that build large cliques |
+| 8 | sspe | planned | - | SSPE: single-source path graphs where one deletion invalidates long derivations |
+| 9 | ldbc-spb | planned | - | LDBC Semantic Publishing Benchmark 2.0 (BBC): queries under inference with continuous updates |
+| 10 | datalog-graphs | planned | - | Datalog graph programs: transitive closure, same generation, CSPA |
+| 11 | commit-latency | partial | - | Commit latency under 0, 1, 8 and 64 readers, the closure complete at every commit |
+| 12 | ore-2015 | partial | 2026-10-03 | ORE 2015: classification of 1,920 real ontologies |
+| 13 | elk-ontologies | planned | - | Classification of large EL and near-EL ontologies: GO, ChEBI, NCIt, GALEN |
+| 14 | pagoda-suite | planned | - | PAGOdA's test suite: query answering beyond OWL 2 RL |
+| 15 | vector-recall | partial | - | Filtered k-NN: recall and time of vector search under a filter |
+| 16 | ann-benchmarks | planned | - | ann-benchmarks: recall and throughput curves of approximate k-NN |
+| 17 | geographica2 | planned | - | Geographica 2: spatial selections, joins and aggregates on real and synthetic data |
+| 18 | era-shacl | planned | - | ERA-SHACL-Benchmark: validation time and memory on a real railway knowledge graph |
+| 19 | fast | partial | 2026-10-10 | The fast suite's cases on their comparators: each case under the semantics a system supports |
+
+### Backlog
+
+| # | Family | State | Newest run | What |
+|---|---|---|---|---|
+| 1 | lubm-materialised | ready | 2026-10-03 | LUBM with the closure precomputed: the 14 queries on every SPARQL engine |
+| 2 | owl2bench-classify | planned | - | OWL2Bench EL and DL: classification and consistency of the generated ontologies |
+| 3 | real-ontologies | planned | - | DBpedia and YAGO with their ontologies: materialisation over real hierarchies |
+| 4 | consistency | planned | - | Injected contradictions: detection and explanation |
+| 5 | integration-rg-gs-gnd | partial | - | RG x GS x GND integration: identity reasoning over real links, 10 competency questions |
+| 6 | fulltext-search | planned | - | Keyword search: ResearchSpace's search queries; LUBMft |
+| 7 | federation | planned | - | FedBench / W3C federation tests |
+| 8 | write-scaling | ready | 2026-10-09 | Single-statement and batch writes at 1 M, 10 M, 100 M; writes under read load |
+| 9 | basics-mix | ready | 2026-10-03 | Load, store size, restart and a query mix on real datasets |
+| 10 | wdbench | catalogue only | - | CATALOG.md §3.2: WDBench, Wikidata's query log (MillenniumDB's home turf) |
+| 11 | sp2bench | catalogue only | - | CATALOG.md §3.2: SP2Bench, DBLP-shaped data and 17 queries |
+| 12 | npd | catalogue only | - | CATALOG.md §3.6: NPD, OBDA over the Norwegian Petroleum Directorate (Ontop's home turf) |
+| 13 | lubm-exists | catalogue only | - | CATALOG.md §3.6: LUBM∃, LUBM with existential rules (Ontop, Stardog, PAGOdA) |
+| 14 | starbench | catalogue only | - | CATALOG.md §3.10: StarBench, RDF-star queries |
+| 15 | fedshop | catalogue only | - | CATALOG.md §3.11: FedShop, federated queries over many shops |
+| 16 | beir | catalogue only | - | CATALOG.md §3.9: BEIR, retrieval quality and time |
+| 17 | vibe | catalogue only | - | CATALOG.md §3.13: VIBE, vector index benchmark |
+| 18 | soak | catalogue only | - | CATALOG.md §3.16: soak, hours of mixed load |
+| 19 | larger-than-memory | catalogue only | - | CATALOG.md §3.17: larger than memory, store sizes past the RAM |
+
+### Last: not expected to give data for polishing or optimisation
+
+| # | Family | State | Newest run | What |
+|---|---|---|---|---|
+| 1 | w3c-owl2-rl | ready | 2026-10-09 | W3C OWL 2 test cases, RL profile: entailment and consistency |
+| 2 | w3c-owl2-dl | ready | 2026-10-09 | W3C OWL 2 test cases, species DL, direct semantics: consistency, entailment, non-entailment |
+| 3 | w3c-sparql11 | ready | 2026-10-09 | W3C SPARQL 1.1 test suite: query, update, syntax, result formats |
+| 4 | w3c-shacl | ready | 2026-10-09 | W3C SHACL test suite |
+| 5 | geosparql | partial | 2026-10-09 | GeoSPARQL compliance benchmark (206 queries); Geographica 2 for performance |
+| 6 | clients | ready | - | ResearchSpace on the store; the Datamodel Workflow's export protocol |
 
 ## Coverage
 
@@ -40,6 +103,16 @@ Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome 
 | federation | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
 | fast | partial | 1/3 | · | · | 2/3 | 1/3 ! | 1/3 | 0/3 ! | · | n/a | n/a | n/a | n/a | – | – | – | – | · | · | n/a | · |
 | clients | ready | · | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
+| gcare | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
+| claros | planned | · | · | · | – | – | – | · | – | · | · | · | · | – | – | – | – | · | · | n/a | – |
+| sspe | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | – | – |
+| datalog-graphs | planned | · | · | – | – | – | – | · | – | · | · | · | – | – | – | – | – | · | · | n/a | – |
+| commit-latency | partial | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | – | – |
+| elk-ontologies | planned | · | · | · | – | – | – | – | – | – | – | – | – | · | · | · | · | – | · | – | – |
+| pagoda-suite | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | – |
+| vector-recall | partial | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
+| ann-benchmarks | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | · |
+| geographica2 | planned | · | · | · | · | – | · | · | · | – | – | – | – | – | – | – | – | · | · | n/a | – |
 
 `ok` every repetition loaded, every step and query execution ok · `part` a load, step or query execution failed or timed out in some repetition · `WRONG` an answer count differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the suite skipped it (reason in the record) · `≠?` its answers differ from another system's, not yet adjudicated · `hang` a comparator gave no answer in a past run · `ran*` ran; a licensed system whose outcome stays local · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit for it
 
@@ -298,6 +371,101 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 |---|---|
 | - | · |
 
+### gcare: G-CARE: subgraph queries for cardinality estimation on real and generated graphs
+
+planned, performance; tasks basics; kit `-` (outside the driver); checked by: the exact counts the benchmark ships; result counts across systems.
+
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| yago | · | · | · | · | · | · | · | · | · | · | · |
+| lubm80 | · | · | · | · | · | · | · | · | · | · | · |
+
+### claros: Claros (L, LE): RDFox's and GLog's datasets, rules that build large cliques
+
+planned, performance; tasks RT1, RT2; kit `-` (outside the driver); checked by: inferred counts across systems.
+
+| Tier | nrese | nrese-fsst | nrese-oxigraph | jena | nemo | nemo-schemafirst | nemo-sparq | owlrl | graphdb | rdfox |
+|---|---|---|---|---|---|---|---|---|---|---|
+| l | · | · | · | · | · | · | · | · | · | · |
+| le | · | · | · | · | · | · | · | · | · | · |
+
+### sspe: SSPE: single-source path graphs where one deletion invalidates long derivations
+
+planned, performance; tasks RT2; kit `-` (outside the driver); checked by: the incremental closure equals the rematerialised one.
+
+| Tier | nrese | nrese-fsst | nrese-oxigraph | graphdb | rdfox |
+|---|---|---|---|---|---|
+| 1000 | · | · | · | · | · |
+
+### datalog-graphs: Datalog graph programs: transitive closure, same generation, CSPA
+
+planned, performance; tasks RT1; kit `-` (outside the driver); checked by: counts against Soufflé or Nemo.
+
+| Tier | nrese | nrese-fsst | jena | nemo | nemo-schemafirst | nemo-sparq | graphdb | rdfox |
+|---|---|---|---|---|---|---|---|---|
+| tc | · | · | · | · | · | · | · | · |
+| sg | · | · | · | · | · | · | · | · |
+| cspa | · | · | · | · | · | · | · | · |
+
+### commit-latency: Commit latency under 0, 1, 8 and 64 readers, the closure complete at every commit
+
+partial, performance; tasks RT2; kit `benches/fast` (outside the driver); checked by: the committed state equals the rematerialisation.
+
+| Tier | nrese | nrese-fsst | nrese-oxigraph | graphdb | rdfox |
+|---|---|---|---|---|---|
+| lubm-10 | · | · | · | · | · |
+
+### elk-ontologies: Classification of large EL and near-EL ontologies: GO, ChEBI, NCIt, GALEN
+
+planned, performance; tasks RT6; kit `benches/reasoning/el-classification` (outside the driver); checked by: taxonomies against ELK's and Konclude's, by canonical hash.
+
+| Tier | nrese | nrese-fsst | nrese-oxigraph | hermit | openllet | konclude | elk | rdfox |
+|---|---|---|---|---|---|---|---|---|
+| go | · | · | · | · | · | · | · | · |
+| chebi | · | · | · | · | · | · | · | · |
+| ncit | · | · | · | · | · | · | · | · |
+| galen | · | · | · | · | · | · | · | · |
+
+### pagoda-suite: PAGOdA's test suite: query answering beyond OWL 2 RL
+
+planned, performance; tasks RT3; kit `-` (outside the driver); checked by: answers against a complete reasoner (HermiT, Konclude).
+
+| Tier | nrese | nrese-fsst | nrese-oxigraph | graphdb | rdfox |
+|---|---|---|---|---|---|
+| lubm | · | · | · | · | · |
+| uobm | · | · | · | · | · |
+| fly | · | · | · | · | · |
+| npd | · | · | · | · | · |
+| dbpedia | · | · | · | · | · |
+
+### vector-recall: Filtered k-NN: recall and time of vector search under a filter
+
+partial, performance; tasks vector; kit `benches/fast` (outside the driver); checked by: recall@10 against the exact search.
+
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| generated-200k | · | · | · | · | · | · | · | · | · | · | · |
+| yfcc-10m | · | · | · | · | · | · | · | · | · | · | · |
+
+### ann-benchmarks: ann-benchmarks: recall and throughput curves of approximate k-NN
+
+planned, performance; tasks vector; kit `-` (outside the driver); checked by: recall against the sets' ground truth.
+
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | rdfox | anzograph |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| sift-1m | · | · | · | · | · | · | · | · | · | · | · |
+| glove-100 | · | · | · | · | · | · | · | · | · | · | · |
+| fashion-mnist | · | · | · | · | · | · | · | · | · | · | · |
+
+### geographica2: Geographica 2: spatial selections, joins and aggregates on real and synthetic data
+
+planned, performance; tasks space; kit `-` (outside the driver); checked by: answers across systems.
+
+| Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | virtuoso | jena | rdf4j | graphdb | rdfox |
+|---|---|---|---|---|---|---|---|---|---|
+| real | · | · | · | · | · | · | · | · | · |
+| synthetic | · | · | · | · | · | · | · | · | · |
+
 ## Gaps
 
 ### Pairs that can run and have no outcome yet
@@ -322,6 +490,16 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - **federation:** nrese (-); qlever (-); oxigraph (-); virtuoso (-); jena (-); rdf4j (-); graphdb (-); rdfox (-); anzograph (-)
 - **fast:** nrese (rl-hierarchy~closure, rl-clique); qlever (rl-clique); oxigraph (rl-clique); virtuoso (rl-hierarchy~closure, rl-clique); jena (rl-hierarchy~closure, rl-clique); rdf4j (q-cycles~plain, rl-hierarchy~closure, rl-clique); graphdb (q-cycles~plain, rl-hierarchy~closure, rl-clique); rdfox (q-cycles~plain, rl-hierarchy~closure, rl-clique); anzograph (q-cycles~plain, rl-hierarchy~closure, rl-clique)
 - **clients:** nrese (-)
+- **gcare:** nrese (yago, lubm80); qlever (yago, lubm80); oxigraph (yago, lubm80); virtuoso (yago, lubm80); jena (yago, lubm80); rdf4j (yago, lubm80); graphdb (yago, lubm80); rdfox (yago, lubm80); anzograph (yago, lubm80)
+- **claros:** nrese (l, le); jena (l, le); nemo (l, le); owlrl (l, le); graphdb (l, le); rdfox (l, le)
+- **sspe:** nrese (1000); graphdb (1000); rdfox (1000)
+- **datalog-graphs:** nrese (tc, sg, cspa); jena (tc, sg, cspa); nemo (tc, sg, cspa); graphdb (tc, sg, cspa); rdfox (tc, sg, cspa)
+- **commit-latency:** nrese (lubm-10); graphdb (lubm-10); rdfox (lubm-10)
+- **elk-ontologies:** nrese (go, chebi, ncit, galen); hermit (go, chebi, ncit, galen); openllet (go, chebi, ncit, galen); konclude (go, chebi, ncit, galen); elk (go, chebi, ncit, galen); rdfox (go, chebi, ncit, galen)
+- **pagoda-suite:** nrese (lubm, uobm, fly, npd, dbpedia); graphdb (lubm, uobm, fly, npd, dbpedia); rdfox (lubm, uobm, fly, npd, dbpedia)
+- **vector-recall:** nrese (generated-200k, yfcc-10m); qlever (generated-200k, yfcc-10m); oxigraph (generated-200k, yfcc-10m); virtuoso (generated-200k, yfcc-10m); jena (generated-200k, yfcc-10m); rdf4j (generated-200k, yfcc-10m); graphdb (generated-200k, yfcc-10m); rdfox (generated-200k, yfcc-10m); anzograph (generated-200k, yfcc-10m)
+- **ann-benchmarks:** nrese (sift-1m, glove-100, fashion-mnist); qlever (sift-1m, glove-100, fashion-mnist); oxigraph (sift-1m, glove-100, fashion-mnist); virtuoso (sift-1m, glove-100, fashion-mnist); jena (sift-1m, glove-100, fashion-mnist); rdf4j (sift-1m, glove-100, fashion-mnist); graphdb (sift-1m, glove-100, fashion-mnist); rdfox (sift-1m, glove-100, fashion-mnist); anzograph (sift-1m, glove-100, fashion-mnist)
+- **geographica2:** nrese (real, synthetic); qlever (real, synthetic); virtuoso (real, synthetic); jena (real, synthetic); rdf4j (real, synthetic); graphdb (real, synthetic); rdfox (real, synthetic)
 
 ### Build variants without an outcome (nrese-fsst, nrese-oxigraph, nemo-schemafirst, nemo-sparq; optional)
 
@@ -343,6 +521,16 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - **fulltext-search:** nrese-fsst (-); nrese-oxigraph (-)
 - **federation:** nrese-fsst (-); nrese-oxigraph (-)
 - **fast:** nrese-fsst (q-cycles~plain, rl-hierarchy~closure, rl-clique); nrese-oxigraph (q-cycles~plain, rl-hierarchy~closure, rl-clique)
+- **gcare:** nrese-fsst (yago, lubm80); nrese-oxigraph (yago, lubm80)
+- **claros:** nrese-fsst (l, le); nrese-oxigraph (l, le); nemo-schemafirst (l, le); nemo-sparq (l, le)
+- **sspe:** nrese-fsst (1000); nrese-oxigraph (1000)
+- **datalog-graphs:** nrese-fsst (tc, sg, cspa); nemo-schemafirst (tc, sg, cspa); nemo-sparq (tc, sg, cspa)
+- **commit-latency:** nrese-fsst (lubm-10); nrese-oxigraph (lubm-10)
+- **elk-ontologies:** nrese-fsst (go, chebi, ncit, galen); nrese-oxigraph (go, chebi, ncit, galen)
+- **pagoda-suite:** nrese-fsst (lubm, uobm, fly, npd, dbpedia); nrese-oxigraph (lubm, uobm, fly, npd, dbpedia)
+- **vector-recall:** nrese-fsst (generated-200k, yfcc-10m); nrese-oxigraph (generated-200k, yfcc-10m)
+- **ann-benchmarks:** nrese-fsst (sift-1m, glove-100, fashion-mnist); nrese-oxigraph (sift-1m, glove-100, fashion-mnist)
+- **geographica2:** nrese-fsst (real, synthetic); nrese-oxigraph (real, synthetic)
 
 ### Problems on the newest run
 
@@ -405,6 +593,16 @@ ready, conformance; tasks integration; kit `scripts` (suite driver); checked by:
 - **geosparql** (partial): GeoSPARQL compliance benchmark (206 queries); Geographica 2 for performance. The compliance part runs on NRESE in CI: 175 of 212; the 37 others are reference answers that contradict GeoSPARQL's definitions or each other (expected-failures.txt). Geographica 2 (performance) is to add
 - **federation** (planned): FedBench / W3C federation tests.
 - **fast** (partial): The fast suite's cases on their comparators: each case under the semantics a system supports. Tier = CASE~SEMANTICS (benches/fast/compete.py prepares the data in the volume nrese-fast-data). NRESE runs every case in benches/fast/fast.py; this workload is the comparison
+- **gcare** (planned): G-CARE: subgraph queries for cardinality estimation on real and generated graphs. Measures the planner's estimates (q-error per query) besides the queries' times; the fast case plan-estimates measures q-error on LUBM 10 today
+- **claros** (planned): Claros (L, LE): RDFox's and GLog's datasets, rules that build large cliques. The worst case for proof-based deletion; GLog's single-thread result (Claros-L 119 s against RDFox's 2,512 s, reported). Size LE on Draco first
+- **sspe** (planned): SSPE: single-source path graphs where one deletion invalidates long derivations. Counting beat B/F 10.5 s to 253 s for 1,000 deletions (reported); the fast case deletes-layered is its small cousin
+- **datalog-graphs** (planned): Datalog graph programs: transitive closure, same generation, CSPA. The batch executor beyond OWL: plain Datalog as N3 rules; Nemo, VLog and Soufflé on their home turf
+- **commit-latency** (partial): Commit latency under 0, 1, 8 and 64 readers, the closure complete at every commit. The fast cases commits-readers and writes-under-readers cover it on NRESE; GraphDB and RDFox are the comparators
+- **elk-ontologies** (planned): Classification of large EL and near-EL ontologies: GO, ChEBI, NCIt, GALEN. ELK's home turf: EL classification speed
+- **pagoda-suite** (planned): PAGOdA's test suite: query answering beyond OWL 2 RL. Query answering by lower and upper bounds, as NRESE's DL mode answers
+- **vector-recall** (partial): Filtered k-NN: recall and time of vector search under a filter. The fast cases vector-knn-exact and vector-knn-filtered; why the filtered recall fails: runs/2026-10-12-vector-recall-phuoc.toml
+- **ann-benchmarks** (planned): ann-benchmarks: recall and throughput curves of approximate k-NN. Comparability with every published index
+- **geographica2** (planned): Geographica 2: spatial selections, joins and aggregates on real and synthetic data. Strabon, uSeekM, Parliament published on it; Jena and GraphDB's GeoSPARQL are the comparators here
 
 ## Runs
 
