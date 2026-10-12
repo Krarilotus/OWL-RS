@@ -1064,8 +1064,18 @@ mod tests {
         };
         let ((outcomes, waited), rescued) = watched(|cancel| {
             std::thread::scope(|scope| {
-                // A caller, not a worker: it waits for the computation.
+                // A caller, not a worker: it waits for the computation. It claims before
+                // the kernels run, which may store the part beside the flight.
                 let waiting = scope.spawn(|| request(&cache, &key, None, cancel));
+                while cache
+                    .state()
+                    .flights
+                    .get(&key)
+                    .is_some_and(|flight| flight.waiters.load(Ordering::Acquire) == 0)
+                    && !cancel.load(Ordering::SeqCst)
+                {
+                    std::thread::yield_now();
+                }
                 let outcomes = pool(2).install(|| {
                     let ((a, b), c) = rayon::join(
                         || {
@@ -1078,14 +1088,6 @@ mod tests {
                     );
                     [a, b, c]
                 });
-                while cache
-                    .state()
-                    .flights
-                    .get(&key)
-                    .is_some_and(|flight| flight.waiters.load(Ordering::Acquire) == 0)
-                {
-                    std::thread::yield_now();
-                }
                 computing.finish(Some(part(10)), SLOW).unwrap();
                 (outcomes, waiting.join().unwrap())
             })
