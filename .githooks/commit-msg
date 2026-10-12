@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Commit messages carry no AI co-author trailers (owner, 12 Oct 2026): this hook removes any
+# `Co-Authored-By:` line naming an AI assistant before the commit is recorded.
+sed -i -E '/^[Cc]o-[Aa]uthored-[Bb]y:.*([Cc]laude|[Aa]nthropic|[Oo]pen[Aa][Ii]|[Cc]hat[Gg][Pp][Tt]|[Cc]odex|[Cc]opilot|[Gg]emini)/d' "$1"
+# A trailing blank line left behind is harmless; git strips it.

@@ -98,6 +98,12 @@ pub enum Refusal {
     WriteAll(String),
 }
 
+impl From<nrese_exec::BudgetExceeded> for StoreError {
+    fn from(exceeded: nrese_exec::BudgetExceeded) -> Self {
+        QueryEvaluationError::MemoryLimit(exceeded).into()
+    }
+}
+
 impl StoreError {
     /// The evaluation error, of a query or of an update's pattern: both are classified
     /// alike (the review of 3 October 2026, A6).

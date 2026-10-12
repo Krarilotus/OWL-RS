@@ -24,7 +24,7 @@ use nrese_owl::{Normalised, Ontology, Term};
 
 use super::consistency::{self, Verdict};
 use super::known::{self, Lower};
-use super::{Classification, Deadline, Options, Profile, Taxonomy, Workers};
+use super::{Classification, Deadline, Options, Profile, Taxonomy};
 use crate::tableau::{Answer, At, Base, From, Labels, Prepared, Probe, ProbeOutcome, Want};
 
 /// A class's state.
@@ -55,7 +55,6 @@ pub(crate) struct Driver<'a> {
     top_possible: Option<Vec<u32>>,
     /// `owl:Thing`'s subsumers where the Horn part has all of them.
     top_known: Option<Vec<u32>>,
-    workers: Workers,
 }
 
 impl<'a> Driver<'a> {
@@ -76,7 +75,7 @@ impl<'a> Driver<'a> {
             profile: Profile {
                 path: "tableau",
                 classes: n,
-                threads: options.threads,
+                threads: options.workers.width(),
                 ..Profile::default()
             },
             incomplete: Vec::new(),
@@ -85,7 +84,6 @@ impl<'a> Driver<'a> {
             possible: vec![None; n],
             top_possible: None,
             top_known: None,
-            workers: Workers::new(options.threads),
         }
     }
 
@@ -105,7 +103,13 @@ impl<'a> Driver<'a> {
                 self.deadline
                     .budget(self.options, Some(self.options.lower_bound_timeout)),
             );
-            if let Some(lower) = known::horn_lower_bound(self.normalised, self.classes, &core) {
+            if let Some(lower) = known::horn_lower_bound(
+                self.normalised,
+                self.classes,
+                &core,
+                &self.options.workers,
+                self.options.tableau.cancel.clone(),
+            ) {
                 if lower.inconsistent {
                     return self.inconsistent();
                 }
@@ -149,31 +153,36 @@ impl<'a> Driver<'a> {
                 self.classes,
                 &self.config(),
                 &self.options.core(self.deadline.budget(self.options, None)),
+                &self.options.workers,
             )
         } else {
             None
         };
-        let mut full = None;
+        if matches!(by_core, Some(Verdict::Inconsistent)) {
+            return self.inconsistent();
+        }
+        let full = (by_core.is_none() || !exact).then(|| {
+            let program = Prepared::new(self.ontology, self.normalised, self.classes, &[]);
+            self.profile.compile += program.compile_time();
+            program
+        });
+        let mut base = None;
         match by_core {
-            Some(Verdict::Inconsistent) => return self.inconsistent(),
-            Some(Verdict::Consistent) => self.profile.consistency_by = "context-core",
+            Some(_) => self.profile.consistency_by = "context-core",
             None => {
-                let program = Prepared::new(self.ontology, self.normalised, self.classes, &[]);
-                self.profile.compile += program.compile_time();
-                let out = program.probe(
-                    &Probe {
-                        at: At::Nothing,
-                        positive: &[],
-                        negative: &[],
-                    },
+                let program = full.as_ref().expect("tableau consistency program");
+                let (out, retained) = program.consistency_with_base(
                     &self.config(),
                     Want {
                         elements: self.options.model_pruning && !exact,
                         individuals: false,
                         detached: false,
                     },
+                    !exact && self.needs_base(program),
                 );
+                base = retained;
                 self.profile.tests += 1;
+                self.profile.add(&out.telemetry);
                 self.profile.consistency_by = "tableau";
                 match &out.answer {
                     Answer::Inconsistent => return self.inconsistent(),
@@ -187,7 +196,6 @@ impl<'a> Driver<'a> {
                 if let Some(labels) = &out.labels {
                     self.observe(labels, None);
                 }
-                full = Some(program);
             }
         }
         self.profile.consistency = t.elapsed();
@@ -202,7 +210,11 @@ impl<'a> Driver<'a> {
             }
             (self.known.clone(), lower_top)
         } else {
-            self.tableau_phases(full)
+            self.tableau_phases(
+                full.as_ref().expect("non-exact program"),
+                base,
+                by_core.is_some(),
+            )
         };
         self.finish(&subsumers, &top, started)
     }
@@ -260,34 +272,45 @@ impl<'a> Driver<'a> {
     }
 
     /// Phases 2 to 4 on the hypertableau: the subsumers of each class and `owl:Thing`'s.
-    fn tableau_phases(&mut self, full: Option<Prepared>) -> (Vec<Vec<u32>>, Vec<u32>) {
-        super::trace("tableau programs");
-        let has_nominals = |p: &Prepared| p.features().nominals;
-        let full = full.unwrap_or_else(|| {
-            let p = Prepared::new(self.ontology, self.normalised, self.classes, &[]);
-            self.profile.compile += p.compile_time();
-            p
-        });
-        let tbox;
-        let nominals = has_nominals(&full);
-        let terminology_first = self.options.tbox_only
+    fn terminology_first(&self, full: &Prepared) -> bool {
+        self.options.tbox_only
             && has_facts(self.normalised)
-            && (!nominals || self.options.detached_probes);
-        // The individuals' part, built once, where tests run with the assertions.
-        let base_config = self.config();
-        let needs_full = !terminology_first || nominals;
-        let base = (needs_full && self.options.reuse_model)
-            .then(|| full.base(&base_config))
-            .flatten();
-        if self.options.model_pruning
-            && let Some(labels) = base.as_ref().and_then(|b| {
-                b.labels(Want {
-                    elements: true,
+            && (!full.features().nominals || self.options.detached_probes)
+    }
+
+    fn needs_base(&self, full: &Prepared) -> bool {
+        self.options.reuse_model
+            && full.has_individuals()
+            && (!self.terminology_first(full) || full.features().nominals)
+    }
+
+    fn tableau_phases<'p>(
+        &mut self,
+        full: &'p Prepared,
+        mut base: Option<Base<'p>>,
+        consistency_by_core: bool,
+    ) -> (Vec<Vec<u32>>, Vec<u32>) {
+        super::trace("tableau programs");
+        let tbox;
+        let nominals = full.features().nominals;
+        let terminology_first = self.terminology_first(full);
+        // The context verdict had no tableau state to retain. Build it once only
+        // where full probes can use it; an auxiliary unknown is not a refutation.
+        if consistency_by_core && self.needs_base(full) {
+            let (out, retained) = full.consistency_with_base(
+                &self.config(),
+                Want {
+                    elements: self.options.model_pruning,
                     ..Want::default()
-                })
-            })
-        {
-            self.observe(&labels, None);
+                },
+                true,
+            );
+            base = retained;
+            self.profile.tests += 1;
+            self.profile.add(&out.telemetry);
+            if let Some(labels) = &out.labels {
+                self.observe(labels, None);
+            }
         }
         let first = if terminology_first {
             let mut terminology = self.normalised.clone();
@@ -304,7 +327,7 @@ impl<'a> Driver<'a> {
         let tests = Tests {
             first,
             base,
-            full: &full,
+            full,
             detached: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
             from_model: AtomicU64::new(0),
@@ -397,12 +420,12 @@ impl<'a> Driver<'a> {
         self.profile.labels_seen += 1;
     }
 
-    fn satisfiability(&mut self, tests: &Tests<'_>) {
+    fn satisfiability(&mut self, tests: &Tests<'_, '_>) {
         let n = self.classes.len();
         // Most specific first: their models show their superclasses.
         let mut order: Vec<u32> = (0..n as u32).collect();
         order.sort_by_key(|&c| std::cmp::Reverse(self.known[c as usize].len()));
-        let wave = (self.options.threads * 2).max(1);
+        let wave = self.options.workers.width() * 2;
         let mut at = 0;
         while at < order.len() {
             if self.deadline.passed() {
@@ -432,7 +455,7 @@ impl<'a> Driver<'a> {
                 individuals: false,
                 detached: false,
             };
-            let outcomes: Vec<(u32, ProbeOutcome)> = self.workers.map(&batch, |&c| {
+            let outcomes: Vec<(u32, ProbeOutcome)> = self.options.workers.map(&batch, |&c| {
                 let probe = Probe {
                     at: At::Fresh,
                     positive: std::slice::from_ref(&c),
@@ -472,7 +495,7 @@ impl<'a> Driver<'a> {
     }
 
     /// The classes equivalent to `owl:Thing`.
-    fn top(&mut self, tests: &Tests<'_>) -> Vec<u32> {
+    fn top(&mut self, tests: &Tests<'_, '_>) -> Vec<u32> {
         let config = self.config();
         let out = tests.probe(
             &Probe {
@@ -544,7 +567,7 @@ impl<'a> Driver<'a> {
     }
 
     /// The subsumers of every satisfiable class.
-    fn subsumptions(&mut self, tests: &Tests<'_>, top: &[u32]) -> Vec<Vec<u32>> {
+    fn subsumptions(&mut self, tests: &Tests<'_, '_>, top: &[u32]) -> Vec<Vec<u32>> {
         let n = self.classes.len();
         let unsat: Vec<bool> = self.status.iter().map(|s| *s == Status::Unsat).collect();
         let config = self.config();
@@ -552,7 +575,7 @@ impl<'a> Driver<'a> {
             .filter(|&c| self.status[c as usize] == Status::Sat)
             .collect();
         let this = &*self;
-        let results: Vec<(u32, Vec<u32>, Stats)> = this.workers.map(&todo, |&c| {
+        let results: Vec<(u32, Vec<u32>, Stats)> = this.options.workers.map(&todo, |&c| {
             let (s, stats) = this.subsumers_of(tests, c, top, &unsat, &config);
             (c, s, stats)
         });
@@ -574,7 +597,7 @@ impl<'a> Driver<'a> {
     /// `C`'s subsumers: the known ones, `owl:Thing`'s, and the candidates the tests prove.
     fn subsumers_of(
         &self,
-        tests: &Tests<'_>,
+        tests: &Tests<'_, '_>,
         c: u32,
         top: &[u32],
         unsat: &[bool],
@@ -654,9 +677,9 @@ impl<'a> Driver<'a> {
 /// 2. the individuals' part built once ([`Base`]): from their model, else from their
 ///    deterministic state;
 /// 3. the whole program from scratch (no base).
-struct Tests<'p> {
+struct Tests<'p, 't> {
     /// The terminology's program, and whether its models must be detached.
-    first: Option<(&'p Prepared, bool)>,
+    first: Option<(&'t Prepared, bool)>,
     base: Option<Base<'p>>,
     full: &'p Prepared,
     /// Tests the terminology answered with a detached model, tests that went on with the
@@ -668,13 +691,20 @@ struct Tests<'p> {
     from_deterministic: AtomicU64,
 }
 
-impl Tests<'_> {
+impl Tests<'_, '_> {
     fn probe(
         &self,
         probe: &Probe<'_>,
         config: &crate::tableau::Config,
         want: Want,
     ) -> ProbeOutcome {
+        // The detached attempt and its fallback share the test's one deadline; a test
+        // whose wave was queued past it does no work.
+        let config = &*config.started();
+        if let Some(why) = config.stopped() {
+            return ProbeOutcome::stopped(why);
+        }
+        let mut previous = crate::tableau::Telemetry::default();
         if let Some((terminology, check)) = self.first {
             let want_first = Want {
                 detached: check,
@@ -694,17 +724,25 @@ impl Tests<'_> {
                 _ => {}
             }
             self.fallbacks.fetch_add(1, Relaxed);
+            previous = out.telemetry;
         }
-        if let Some(base) = &self.base {
-            let (out, from) = base.probe(probe, want);
-            let counter = match from {
-                From::Model => &self.from_model,
-                From::Deterministic => &self.from_deterministic,
-            };
-            counter.fetch_add(1, Relaxed);
-            return out;
-        }
-        self.full.probe(probe, config, want)
+        let mut out = match self
+            .base
+            .as_ref()
+            .and_then(|b| b.probe(probe, config, want))
+        {
+            Some((out, from)) => {
+                let counter = match from {
+                    From::Model => &self.from_model,
+                    From::Deterministic => &self.from_deterministic,
+                };
+                counter.fetch_add(1, Relaxed);
+                out
+            }
+            None => self.full.probe(probe, config, want),
+        };
+        out.telemetry.accumulate(&previous);
+        out
     }
 }
 
@@ -783,5 +821,46 @@ pub(crate) fn intersect_opt(a: &mut Option<Vec<u32>>, b: &[u32]) {
 pub(crate) fn insert_sorted(a: &mut Vec<u32>, x: u32) {
     if let Err(i) = a.binary_search(&x) {
         a.insert(i, x);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_queued_probe_observes_the_operation_deadline_even_with_a_base() {
+        use nrese_owl::{Axiom, ClassExpr, ExprId};
+        let mut ontology = Ontology::default();
+        let class = ExprId(ontology.classes.intern(ClassExpr::Class(1)));
+        ontology.axioms.push(Axiom::ClassAssertion(class, 100));
+        let prepared = Prepared::new(&ontology, &nrese_owl::normalise(&ontology), &[1], &[100]);
+        let config = crate::tableau::Config::default();
+        let (_, base) = prepared.consistency_with_base(&config, Want::default(), true);
+        assert!(base.is_some());
+        let tests = Tests {
+            first: Some((&prepared, true)),
+            base,
+            full: &prepared,
+            detached: AtomicU64::new(0),
+            fallbacks: AtomicU64::new(0),
+            from_model: AtomicU64::new(0),
+            from_deterministic: AtomicU64::new(0),
+        };
+        let probe = Probe {
+            at: At::Fresh,
+            positive: &[0],
+            negative: &[],
+        };
+        let expired = crate::tableau::Config {
+            deadline: Some(Instant::now()),
+            ..config
+        };
+        let out = tests.probe(&probe, &expired, Want::default());
+        assert!(matches!(out.answer, Answer::GaveUp(_)));
+        assert!(out.labels.is_none());
+        assert_eq!(out.telemetry.nodes_created, 0);
+        assert_eq!(tests.fallbacks.load(Relaxed), 0);
+        assert_eq!(tests.from_model.load(Relaxed), 0);
     }
 }

@@ -1,0 +1,20 @@
+# A run record (benches/runs/README.md). A CPU profile: no times compared.
+id = "2026-10-10-cache-replay-profile-77478d1"
+level = "focused"
+kit = "perf lab"
+purpose = "Where the cache-on replay spends its CPU, to attribute its regression"
+started = "2026-10-10"
+host = "office-pc"
+scenario = "native"
+candidate = { commit = "77478d195cb073b263b1eac8661034a09bfbbf20", dirty = false, binary_sha256 = "047d9eaec886e71c170edc3874be3a33ca1df90187d8462654d85cdfe9511a1b" }
+protocol = { workload = "social300k, the archived seed-7 log of 1000 queries, --routes, warm-up 0, runs 1, cache 256 MiB", profiles = "cycles:u whole process; cpu-clock:u from the held: marker on", limits = "6 GiB, no swap, systemd scope" }
+inputs = [ { name = "social300k", sha256 = "4e040318e5e9eb923cf6d12e6930330775f37034c5580e9beca678edc0118c07" } ]
+results = { root = "office-pc:/home/krarilotus/nrese-prep-20261009-4e8bd38/cache-profile-77478d1-20261010{,-focused}", trace_sha256 = ["a44afee411b7c2d46d66c689ee1f1ac8aa87ac87d18d4ccce7110ffcf41b94c0", "45b07f7ece23097eeaf4abbfd6b8c2d8acc0f7bf3f53dbca12455ec9a4218125"] }
+publishable = "all"
+cases = [
+  { case = "cache-replay profile", verdict = "no-verdict", note = "1000 queries, no errors; hot leaves: index Header::component, snapshot merging, sorting, WCOJ" },
+]
+findings = [
+  "Loading dominates the whole-process profile; user callchains are mostly unusable, and route work can't be told from timed queries.",
+  "Key construction, ranking, ID copies, encoding and blocked mutex time are not identified as the cause.",
+]

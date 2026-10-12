@@ -1,0 +1,29 @@
+# A run record (benches/runs/README.md). Outcomes and identities; samples stay under results.
+id = "2026-10-09-dl-reuse-be5c3d7"
+level = "focused"
+kit = "reasoning/dl"
+purpose = "Bounded Base reuse in DL classification and realisation, with one deadline and cancellation owner"
+started = "2026-10-09T21:28:18Z"
+host = "office-pc"
+scenario = "native"
+baseline = { commit = "be5c3d7ea981faf9b538498e5be89dcd831a1129", dirty = false, binary_sha256 = "ef8e5f32f5d4dad9bc9ac3cc09c833837191ad2f95d73b478e8bd010d70fd98e" }
+candidate = { commit = "be5c3d7ea981faf9b538498e5be89dcd831a1129", dirty = true, patch_sha256 = "98b4000466f51dabfd7359c8f5634533b089afa168c7b3c2c7a01a338fe021a8", binary_sha256 = "71d9fb89d5aa9acf01bfcdff9ce5cb1100b849bf3b96f4eb2f58a23bf9e77b4a", committed_as = "a60e482" }
+protocol = { pairs = 3, order = "BC/CB/BC", widths = [1, 4], invocations = 84, controls = 24, repeats = "generated cases 3 inside each process, ORE 1", checks = "canonical taxonomy and type SHA-256, completeness and exit status before times", memory = "GNU time peak RSS, parsing included" }
+inputs = [
+  { name = "ORE 9881, 16542", source = "assets: snapshots/windows/original-cache-ore2015" },
+  { name = "choice-real-32/300, horn-real-3000/30000, nominal-classify-300", source = "dl_classify generators, deterministic; contents hashed under results" },
+]
+results = { root = "office-pc:/home/krarilotus/nrese-prep-20261009-4e8bd38/dl-reuse-pair-be5c3d7", files = "measurements-no-copy.json, fresh-controls.json, SHA256SUMS-no-copy", tableau_consistency_sha256 = "56b6b6783708d9ab0eecf57e51a3ff690c4c021f8bb53bc547cff43d9f91214f" }
+publishable = "all"
+cases = [
+  { case = "ore-9881", verdict = "faster", note = "width 1: 543.8 -> 398.2 ms; width 4: 432.0 -> 288.6 ms" },
+  { case = "ore-16542", verdict = "faster", note = "width 1: 2254.3 -> 1358.6 ms; width 4: 2100.3 -> 1188.5 ms" },
+  { case = "choice-real-300", verdict = "faster", note = "width 1: 57.2 -> 47.2 ms; width 4: 21.5 -> 18.5 ms" },
+  { case = "horn-real-30000", verdict = "same", note = "43.1 -> 42.7 / 44.3 -> 44.2 ms; peak RSS 37856 -> 38208 / 38332 -> 38084 KiB" },
+  { case = "choice-real-32, horn-real-3000, nominal-classify-300", verdict = "no-verdict", note = "below 2 ms" },
+  { case = "fresh-consistency controls", verdict = "same", note = "4 inputs, answers agree, ranges overlap" },
+]
+findings = [
+  "All answers match across sides and repetitions.",
+  "Superseded intermediate candidates (a model every negative candidate contradicts; a copied choice-free Horn graph, +6 MiB) are kept under results; their timings qualify nothing.",
+]

@@ -23,6 +23,7 @@ use nrese_xsd::{
 };
 
 use super::calendar;
+use super::numeric::{Numeric, Operator};
 use super::value::{
     Value, boolean_term, canonical, compare, effective_boolean, equals, is_lang_string,
 };
@@ -772,82 +773,7 @@ pub fn compile_regex(pattern: &str, flags: &str) -> Option<Regex> {
         .ok()
 }
 
-#[derive(Clone, Copy)]
-enum Operator {
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-}
-
-/// A numeric value, for arithmetic with SPARQL's type promotion
-/// (integer → decimal → float → double); results print in the XSD value's string form.
-#[derive(Clone, Copy)]
-enum Numeric {
-    Integer(Integer),
-    Decimal(Decimal),
-    Float(Float),
-    Double(Double),
-}
-
-impl Numeric {
-    fn of(value: &Value) -> Option<Self> {
-        Some(match value {
-            Value::Integer(i) => Self::Integer(*i),
-            Value::Decimal(d) => Self::Decimal(*d),
-            Value::Float(f) => Self::Float(*f),
-            Value::Double(d) => Self::Double(*d),
-            _ => return None,
-        })
-    }
-
-    fn term(self) -> Term {
-        match self {
-            Self::Integer(i) => Literal::new_typed_literal(i.to_string(), xsd::INTEGER),
-            Self::Decimal(d) => Literal::new_typed_literal(d.to_string(), xsd::DECIMAL),
-            Self::Float(f) => Literal::new_typed_literal(f.to_string(), xsd::FLOAT),
-            Self::Double(d) => Literal::new_typed_literal(d.to_string(), xsd::DOUBLE),
-        }
-        .into()
-    }
-
-    fn negate(self) -> Option<Term> {
-        Some(
-            match self {
-                Self::Integer(i) => Self::Integer(i.checked_neg()?),
-                Self::Decimal(d) => Self::Decimal(d.checked_neg()?),
-                Self::Float(f) => Self::Float(-f),
-                Self::Double(d) => Self::Double(-d),
-            }
-            .term(),
-        )
-    }
-
-    fn rounding(self, function: &Function) -> Option<Term> {
-        Some(
-            match (self, function) {
-                (Self::Integer(i), Function::Abs) => Self::Integer(i.checked_abs()?),
-                (Self::Integer(i), _) => Self::Integer(i),
-                (Self::Decimal(d), Function::Abs) => Self::Decimal(d.checked_abs()?),
-                (Self::Decimal(d), Function::Ceil) => Self::Decimal(d.checked_ceil()?),
-                (Self::Decimal(d), Function::Floor) => Self::Decimal(d.checked_floor()?),
-                (Self::Decimal(d), _) => Self::Decimal(d.checked_round()?),
-                (Self::Float(f), Function::Abs) => Self::Float(f.abs()),
-                (Self::Float(f), Function::Ceil) => Self::Float(f.ceil()),
-                (Self::Float(f), Function::Floor) => Self::Float(f.floor()),
-                (Self::Float(f), _) => Self::Float(f.round()),
-                (Self::Double(d), Function::Abs) => Self::Double(d.abs()),
-                (Self::Double(d), Function::Ceil) => Self::Double(d.ceil()),
-                (Self::Double(d), Function::Floor) => Self::Double(d.floor()),
-                (Self::Double(d), _) => Self::Double(d.round()),
-            }
-            .term(),
-        )
-    }
-}
-
 fn arithmetic(operator: Operator, (x, y): (Value, Value)) -> Option<Term> {
-    use Numeric::{Decimal as D, Double as Db, Float as F, Integer as I};
     let (Some(a), Some(b)) = (Numeric::of(&x), Numeric::of(&y)) else {
         // Dates, times and durations (SEP-0002).
         return match operator {
@@ -857,60 +783,7 @@ fn arithmetic(operator: Operator, (x, y): (Value, Value)) -> Option<Term> {
             Operator::Divide => calendar::divide(&x, &y),
         };
     };
-    let decimal = |n: Numeric| match n {
-        I(i) => Some(Decimal::from(i)),
-        D(d) => Some(d),
-        _ => None,
-    };
-    let float = |n: Numeric| match n {
-        I(i) => Some(Float::from(i)),
-        D(d) => Some(Float::from(d)),
-        F(f) => Some(f),
-        Db(_) => None,
-    };
-    let double = |n: Numeric| match n {
-        I(i) => Double::from(i),
-        D(d) => Double::from(d),
-        F(f) => Double::from(f),
-        Db(d) => d,
-    };
-    let result = match (a, b) {
-        (I(x), I(y)) => match operator {
-            Operator::Add => I(x.checked_add(y)?),
-            Operator::Subtract => I(x.checked_sub(y)?),
-            Operator::Multiply => I(x.checked_mul(y)?),
-            // Integer division is decimal division in SPARQL.
-            Operator::Divide => D(Decimal::from(x).checked_div(Decimal::from(y))?),
-        },
-        (I(_) | D(_), I(_) | D(_)) => {
-            let (x, y) = (decimal(a)?, decimal(b)?);
-            D(match operator {
-                Operator::Add => x.checked_add(y)?,
-                Operator::Subtract => x.checked_sub(y)?,
-                Operator::Multiply => x.checked_mul(y)?,
-                Operator::Divide => x.checked_div(y)?,
-            })
-        }
-        (I(_) | D(_) | F(_), I(_) | D(_) | F(_)) => {
-            let (x, y) = (float(a)?, float(b)?);
-            F(match operator {
-                Operator::Add => x + y,
-                Operator::Subtract => x - y,
-                Operator::Multiply => x * y,
-                Operator::Divide => x / y,
-            })
-        }
-        _ => {
-            let (x, y) = (double(a), double(b));
-            Db(match operator {
-                Operator::Add => x + y,
-                Operator::Subtract => x - y,
-                Operator::Multiply => x * y,
-                Operator::Divide => x / y,
-            })
-        }
-    };
-    Some(result.term())
+    Some(a.arithmetic(operator, b)?.term())
 }
 
 /// `name(term)` for a cast (XPath §19): the value read from the literal, converted, in

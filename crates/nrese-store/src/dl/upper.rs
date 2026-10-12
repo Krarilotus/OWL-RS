@@ -412,6 +412,17 @@ impl Change {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GaveUp(pub String);
 
+/// Poll the caller's store watch as well as the process owner's safety fallback.
+fn check_stop(stop: Stop<'_>) -> Result<(), GaveUp> {
+    if stop() || nrese_reasoner::eval::over_memory_limit() {
+        Err(GaveUp(
+            "the upper bound's evaluation was stopped".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 /// U1: the compiled program, its rules as the reasoner's, and its stack.
 pub struct Upper {
     pub program: bounds::Program,
@@ -484,14 +495,17 @@ fn reasoner_rules(program: &bounds::Program, values: &Values) -> Vec<ir::Rule> {
 }
 
 /// The materialised view's facts (every graph, each once).
-fn view_facts(view: &Snapshot) -> Vec<Triple> {
-    let mut facts: Vec<Triple> = view
-        .quads_for_pattern_in(ReadModel::Materialised, &pattern([None, None, None]))
-        .map(|q| [q.subject.raw(), q.predicate.raw(), q.object.raw()])
-        .collect();
+fn view_facts(view: &Snapshot, stop: Stop<'_>) -> Result<Vec<Triple>, GaveUp> {
+    let mut facts = Vec::new();
+    for q in view.quads_for_pattern_in(ReadModel::Materialised, &pattern([None, None, None])) {
+        if facts.len() % 1024 == 0 {
+            check_stop(stop)?;
+        }
+        facts.push([q.subject.raw(), q.predicate.raw(), q.object.raw()]);
+    }
     facts.sort_unstable();
     facts.dedup();
-    facts
+    Ok(facts)
 }
 
 impl Upper {
@@ -506,6 +520,7 @@ impl Upper {
         resolve: &dyn Fn(TermRef<'_>) -> Option<TermId>,
         stop: Stop<'_>,
     ) -> Result<Self, GaveUp> {
+        check_stop(stop)?;
         let started = Instant::now();
         let mut vocabulary = Interner {
             resolve,
@@ -524,7 +539,7 @@ impl Upper {
         // The literals U1 compares, by value: of the view, the program's facts, its rules.
         let compared = compared_predicates(&program);
         let mut values = Values::default();
-        let mut input = view_facts(view);
+        let mut input = view_facts(view, stop)?;
         values.add_objects(view, &input, &compared);
         let program_facts: Vec<Triple> = program.facts.iter().map(|(f, _)| *f).collect();
         values.add_objects(view, &program_facts, &compared);
@@ -559,11 +574,17 @@ impl Upper {
         .map_err(|_| GaveUp("the upper bound's evaluation was stopped".to_owned()))?;
         let same_as = program.names.same_as;
         let mut stack = Stack::default();
-        for t in m.derived {
+        for (i, t) in m.derived.into_iter().enumerate() {
+            if i % 1024 == 0 {
+                check_stop(stop)?;
+            }
             stack.insert(t);
         }
         for (representative, members) in m.classes.classes() {
-            for &member in members.iter().filter(|&&m| m != representative) {
+            for (i, &member) in members.iter().filter(|&&m| m != representative).enumerate() {
+                if i % 1024 == 0 {
+                    check_stop(stop)?;
+                }
                 stack.insert([member, same_as, representative]);
             }
         }
@@ -623,6 +644,7 @@ impl Upper {
         deleted: &[Triple],
         stop: Stop<'_>,
     ) -> Result<Change, GaveUp> {
+        check_stop(stop)?;
         let started = Instant::now();
         let mut values = self.values.lock().unwrap_or_else(|p| p.into_inner());
         values.add_objects(view, inserted, &self.compared);

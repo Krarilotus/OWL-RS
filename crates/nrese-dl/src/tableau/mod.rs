@@ -17,9 +17,11 @@
 //!
 //! Datatypes (package 3.5) are concrete nodes checked by the datatype theory
 //! (`data.rs`, `crate::datatypes`); keys are DL-safe rules over the named individuals
-//! (`keys.rs`). Not yet: satisfiability caching and completion-graph reuse (3.7).
+//! (`keys.rs`). [`Base`] reuses deterministic completion state and models with rollback
+//! and fresh probe controls. General cross-probe satisfiability caching is not yet built.
 
 mod blocking;
+pub(crate) mod budget;
 mod data;
 pub(crate) mod depset;
 mod engine;
@@ -37,12 +39,13 @@ mod retract;
 mod search;
 mod telemetry;
 
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use nrese_owl::{Concept, Normalised, Ontology, Options, Term, normalise_with};
 
+pub use crate::Cancel;
 pub use model::Model;
-pub use portfolio::Cancel;
 pub use probe::{At, Base, From, Label, Labels, Prepared, Probe, ProbeOutcome, Want};
 pub use program::left_out;
 pub use telemetry::Telemetry;
@@ -105,7 +108,12 @@ pub struct Config {
     /// Sizes of counted classes compared before the search ([`crate::numbers`]): a class
     /// with two sizes refutes the program without a branch.
     pub counting: bool,
+    /// The time an operation may take from its start, preparation, compilation and
+    /// queueing included: at its start it becomes [`Config::deadline`].
     pub timeout: Option<Duration>,
+    /// The deadline the operation's parts share (an embedding operation's, or the one
+    /// `timeout` gave). Each solver checks it before it starts and while it runs.
+    pub deadline: Option<Instant>,
     /// The most memory a run may hold (its tables, indexes and arenas), in bytes.
     pub max_memory: usize,
     /// Keep the model a consistent run found ([`Outcome::model`]).
@@ -125,6 +133,9 @@ pub struct Config {
     /// the unfolded clauses (`portfolio`), each with half the memory budget; else the
     /// unfolded clauses alone if this is off, the plain ones if cores are short.
     pub portfolio: bool,
+    /// Reusable physical workers and this operation's allowance. Portfolio variants
+    /// share them; without an owner, a standalone race creates its own workers.
+    pub workers: Option<nrese_exec::workers::Workers>,
     /// Stops the run at its next budget check, answering `GaveUp`.
     pub cancel: Option<Cancel>,
 }
@@ -149,16 +160,60 @@ impl Default for Config {
             check_retraction: cfg!(debug_assertions),
             counting: true,
             timeout: None,
+            deadline: None,
             max_memory: 4 << 30,
             keep_model: false,
             lazy_definitions: true,
             complements: true,
             portfolio: true,
+            workers: None,
             cancel: None,
             expand_at_most_up_to: Options::default().expand_at_most_up_to,
         }
     }
 }
+
+impl Config {
+    /// The configuration of an operation starting now: `timeout` folded into the
+    /// deadline its parts share.
+    pub(crate) fn started(&self) -> Cow<'_, Self> {
+        let Some(timeout) = self.timeout else {
+            return Cow::Borrowed(self);
+        };
+        let end = Instant::now() + timeout;
+        Cow::Owned(Self {
+            timeout: None,
+            deadline: Some(self.deadline.map_or(end, |d| d.min(end))),
+            ..self.clone()
+        })
+    }
+
+    /// Why a started operation must not run on, if it must not: cancelled, or past its
+    /// deadline.
+    pub(crate) fn stopped(&self) -> Option<&'static str> {
+        if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+            Some("cancelled")
+        } else if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            Some(TIME_BUDGET)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the two run the same search: they may differ in their deadlines,
+    /// cancellation and workers.
+    pub(crate) fn same_search(&self, other: &Self) -> bool {
+        let mut this = self.clone();
+        this.timeout = other.timeout;
+        this.deadline = other.deadline;
+        this.cancel.clone_from(&other.cancel);
+        this.workers.clone_from(&other.workers);
+        this == *other
+    }
+}
+
+/// Why a run gave up when its deadline passed.
+pub const TIME_BUDGET: &str = "the time budget ran out";
 
 /// Why a run gave up when [`Config::max_branch_points`] ran out.
 pub const BRANCH_BUDGET: &str = "the branch-point budget ran out";
@@ -214,8 +269,24 @@ pub struct Outcome {
     pub features: Features,
 }
 
+impl Outcome {
+    /// A run stopped before it started (`why`).
+    pub(crate) fn stopped(why: &str) -> Self {
+        Self {
+            answer: Answer::GaveUp(why.into()),
+            telemetry: Telemetry::default(),
+            model: None,
+            features: Features::default(),
+        }
+    }
+}
+
 /// Whether `ontology` is consistent.
 pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
+    let config = &*config.started();
+    if let Some(why) = config.stopped() {
+        return Outcome::stopped(why);
+    }
     let ontology = prepared(ontology);
     // The engine reads no provenance: minimal automata.
     let options = |lazy_definitions| Options {
@@ -225,21 +296,19 @@ pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
         exact_provenance: false,
     };
     if !config.lazy_definitions || config.keep_model {
-        return consistency_of(
-            &ontology,
-            &normalise_with(&ontology, options(false)),
-            config,
-        );
+        let plain = normalise_with(&ontology, options(false));
+        return consistency_of(&ontology, &plain, config);
     }
     let unfolded = normalise_with(&ontology, options(true));
     if unfolded.unfolded == 0 || !config.portfolio {
         return consistency_of(&ontology, &unfolded, config);
     }
     let plain = normalise_with(&ontology, options(false));
-    if !portfolio::cores_to_spare() {
+    let workers = budget::workers(config, 2);
+    if workers.width() < 2 {
         return consistency_of(&ontology, &plain, config);
     }
-    portfolio::race(&ontology, &[&plain, &unfolded], config)
+    portfolio::race(&ontology, &[&plain, &unfolded], config, &workers)
 }
 
 /// `ontology` with each negative assertion over a non-simple property `¬R(a, b)` as the
@@ -323,6 +392,10 @@ fn run(
     config: &Config,
 ) -> Outcome {
     let started = Instant::now();
+    let config = &*config.started();
+    if let Some(why) = config.stopped() {
+        return Outcome::stopped(why);
+    }
     // A model from the counts (docs/design/owl2-dl.md#number-reasoning-layers), checked
     // against every axiom, answers before any search; it is compressed, so not where the
     // caller wants the model.

@@ -25,7 +25,7 @@ use nrese_sparql_syntax::term::{GraphName, GroundQuad, Quad as DataQuad};
 use nrese_sparql_syntax::{GraphUpdateOperation, Update};
 use thiserror::Error;
 
-use crate::results::{CancellationToken, QueryDatasetSpecification, QueryEvaluationError};
+use crate::results::{QueryDatasetSpecification, QueryEvaluationError};
 
 #[derive(Clone, Default)]
 pub struct UpdateOptions {
@@ -35,7 +35,8 @@ pub struct UpdateOptions {
     /// The default graph of `WHERE` clauses without a dataset is the merge of all graphs
     /// ([`QueryOptions::union_default_graph`](crate::QueryOptions)).
     pub union_default_graph: bool,
-    pub cancellation: Option<CancellationToken>,
+    /// Its cancellation, and what each `WHERE` evaluation may use.
+    pub resources: crate::Resources,
     /// Who answers `SERVICE` calls in `WHERE` clauses ([`crate::service`]).
     pub services: Option<crate::Services>,
     /// The graphs `WHERE` clauses may read ([`crate::QueryOptions::access`]).
@@ -100,11 +101,7 @@ pub fn apply_update(
     options: &UpdateOptions,
 ) -> Result<(), UpdateError> {
     for operation in &update.operations {
-        if options
-            .cancellation
-            .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
+        if options.resources.check().is_err() {
             return Err(UpdateError::Cancelled);
         }
         apply_operation(tx, operation, update, options)?;
@@ -147,7 +144,7 @@ fn apply_operation(
             let pending = (tx.pending() != (0, 0) || tx.inferred_pending() != (0, 0))
                 .then(|| tx.pending_snapshot());
             let query_options = crate::query::QueryOptions {
-                cancellation: options.cancellation.clone(),
+                resources: options.resources.clone(),
                 union_default_graph: options.union_default_graph,
                 dataset: options.using.clone(),
                 services: options.services.clone(),

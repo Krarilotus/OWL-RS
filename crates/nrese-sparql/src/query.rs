@@ -9,12 +9,9 @@ use crate::results::{
 };
 use crate::view::ReadView;
 
-/// Per-request query options (the transport layer fills these from the protocol request).
+/// What an evaluation may use while it runs, for queries and update `WHERE` clauses.
 #[derive(Clone, Default)]
-pub struct QueryOptions {
-    /// Protocol `default-graph-uri` / `named-graph-uri`. When set, it replaces the query's
-    /// own `FROM` / `FROM NAMED` clauses, as the SPARQL 1.1 Protocol requires.
-    pub dataset: Option<QueryDatasetSpecification>,
+pub struct Resources {
     /// Checked by the evaluator while it runs; the transport layer cancels it at the
     /// request deadline.
     pub cancellation: Option<CancellationToken>,
@@ -23,6 +20,25 @@ pub struct QueryOptions {
     /// The server's budget for all running queries together, which this query's memory
     /// counts against as well.
     pub shared_memory: Option<std::sync::Arc<nrese_exec::SharedBudget>>,
+    /// The width of parallel kernels and result encoding; the work stays on the caller.
+    pub workers: nrese_exec::workers::Workers,
+}
+
+impl Resources {
+    pub fn check(&self) -> Result<(), QueryEvaluationError> {
+        self.cancellation
+            .as_ref()
+            .map_or(Ok(()), CancellationToken::check)
+    }
+}
+
+/// Per-request query options (the transport layer fills these from the protocol request).
+#[derive(Clone, Default)]
+pub struct QueryOptions {
+    /// Protocol `default-graph-uri` / `named-graph-uri`. When set, it replaces the query's
+    /// own `FROM` / `FROM NAMED` clauses, as the SPARQL 1.1 Protocol requires.
+    pub dataset: Option<QueryDatasetSpecification>,
+    pub resources: Resources,
     /// Which statements the query reads: asserted and inferred (the default), or one
     /// stack (GraphDB's `infer=false`, `FROM onto:explicit` / `onto:implicit`).
     pub read_model: nrese_engine::ReadModel,
@@ -93,6 +109,19 @@ pub fn evaluate_query<'a, V: ReadView>(
     options: &QueryOptions,
 ) -> Result<QueryResults<'a>, QueryEvaluationError> {
     crate::native::evaluate(view.evaluation_snapshot(), query, &for_view(view, options))
+}
+
+/// Retains the evaluator's ID columns and their decoding context for bound comparison.
+pub fn evaluate_query_typed(
+    view: &impl ReadView,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<crate::TypedResults, QueryEvaluationError> {
+    crate::native::typed_results::evaluate(
+        view.evaluation_snapshot().into_owned(),
+        query,
+        &for_view(view, options),
+    )
 }
 
 /// `options` for evaluating on `view`: a transaction's pending state is read once, so its
@@ -289,7 +318,19 @@ pub fn ql_report<V: ReadView>(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<Option<crate::ql::QlReport>, QueryEvaluationError> {
-    crate::native::ql_report(&view.evaluation_snapshot(), query, options)
+    prepare_ql_query(view, query, options).map(|(_, report)| report)
+}
+
+/// Prepares the semantic QL rewriting once, before planning or evaluating. Execute the
+/// returned query on the same view with `options.ql = None`; retain the original query
+/// and options for whole-output cache keys. The report describes these prepared answers.
+/// Borrows unchanged queries; work is bounded by the configured QL rewriting limits.
+pub fn prepare_ql_query<'q, V: ReadView>(
+    view: &V,
+    query: &'q Query,
+    options: &QueryOptions,
+) -> Result<(Cow<'q, Query>, Option<crate::ql::QlReport>), QueryEvaluationError> {
+    crate::native::prepare_ql_query(&view.evaluation_snapshot(), query, options)
 }
 
 /// True if `query` would run on the native executor over a snapshot with default options.

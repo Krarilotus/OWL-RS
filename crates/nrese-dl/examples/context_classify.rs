@@ -9,6 +9,7 @@
 //!   --threads N       saturation workers (default 1)
 //!   --strategy S      `cautious` (default), `eager` or `split`
 //!   --no-proofs       don't record derivations
+//!   --task-memory-mib N  sampled saturation-capacity envelope; 0 is unlimited
 //!   --repeat N        classify N times; times are the median of the runs
 //!   --compare-el      also classify with the EL classifier (`nrese_reasoner::classify`) on
 //!                     the same triples, runs interleaved (ABAB), and compare the taxonomies
@@ -26,6 +27,10 @@ use std::time::{Duration, Instant};
 use nrese_dl::context::{self, Classification, Options, Strategy};
 use nrese_owl::{Statement, Term, TermKind, Terms};
 use nrese_rdf_io::{RdfFormat, RdfParser};
+
+#[path = "support/task_memory.rs"]
+mod support;
+use support::task_memory;
 
 /// Terms by their N-Triples form (what the EL classifier's vocabulary keys by, too).
 #[derive(Default, Clone)]
@@ -162,6 +167,9 @@ fn args() -> Result<Args, String> {
             "--out" => a.out = it.next(),
             "--tax" => a.tax = it.next(),
             "--no-proofs" => a.options.proofs = false,
+            "--task-memory-mib" => {
+                a.options.budget.task_memory = task_memory(number("--task-memory-mib")? as u64)?;
+            }
             "--compare-el" => a.compare = true,
             "--strategy" => {
                 a.options.strategy = match it.next().as_deref() {

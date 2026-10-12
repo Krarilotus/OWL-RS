@@ -1,0 +1,38 @@
+# A run record (benches/runs/README.md). Outcomes and identities; samples stay under results.
+id = "2026-10-09-phuoc-partial-77478d1"
+level = "focused"
+kit = "fast, suite and perf lab"
+purpose = "The runtime and reuse revision against the preceding one on selected fast cases, client and cache workloads, and native suite cycles"
+started = "2026-10-09T15:58:55Z"
+host = "phuoc-yu"
+build_host = "office-pc"
+scenario = "native"
+baseline = { commit = "4e8bd38e0733055c06d77f9fdd7cd36c6d89bd7c", dirty = false, binary_sha256 = "cb9df2d14ddc6b3e01df6b4bc0475521282d0ff4da95fd71cf7de8a81aa55e77" }
+candidate = { commit = "77478d195cb073b263b1eac8661034a09bfbbf20", dirty = false, binary_sha256 = "047d9eaec886e71c170edc3874be3a33ca1df90187d8462654d85cdfe9511a1b", note = "production code equals 881119d" }
+protocol = { pairs = 3, order = "AB/BA/AB", records = 222, clients = "social300000, 4 lookup queries, widths 1-64, 4 s each, default workers", cache = "seed-7 log of 1000 queries, warm-up 0, runs 1, cache 0 or 256 MiB", limits = "4-8 GiB, no swap, no CPU quota", harness_sha256 = "6d0f692f6af0f77782986c9906f4eba5f7a41404f5ddf4a9803db3ab5e4daa64" }
+results = { root = "phuoc-yu:/home/krarilotus/nrese-prep-20261009-4e8bd38/phuoc-qualification", archive_sha256 = "86ee18f44ef53b9e92c5e23df15792f95113a546200ad38d063b96b982024c62", final_report_sha256 = "39dc06e97c8a0c64f5d8c372ec001e5624ce2dfc2963f25ba0de8f69f9f9a3d4", verification_sha256 = "ebdb29b9e448ca104a90b0461ff206370942ac38493f34e682bdb93c06577109", horn_memory_correction_sha256 = "207b54ce6ca16c0ef6013c7ae253a59ecc815e7ce29a5cdb42976858eb17d305" }
+publishable = "all"
+cases = [
+  { case = "clients-sweep", verdict = "slower", note = "QPS 20.1/19.5/20.0/23.2/33.5/32.9/31.9% of base at 1/2/4/8/16/32/64 clients, every pair lower" },
+  { case = "cache-replay", verdict = "slower", note = "cache on 296.0 -> 375.2 ms (+26.7%); cache off 2572.2 -> 2694.9 ms (+4.8%); 1000 bags equal" },
+  { case = "exact-gap N512 (supplemental)", verdict = "faster", note = "352.4 -> 283.7 ms at 1 CPU (-19.5%), 93.1 -> 80.7 ms at 4 (-13.3%); proof and refutation bags equal" },
+  { case = "dlmode-lubm1, commits-readers, writes-under-readers, classify-store-horn", verdict = "same", note = "checks pass; no change beyond 10% and 2 ms" },
+  { case = "lubm 1, owl2bench rl-1, write-scaling (suite)", verdict = "same", note = "answers and checks pass; write-scaling checks HTTP success, not the COUNT" },
+]
+findings = [
+  "The store's Horn 'process peak' readings were late-phase high-water marks after a reset (Phase::start writes clear_refs again); the pre-reset peaks overlap. No memory regression is established.",
+  "Store Horn classification checks consistency, 1161634 subsumptions and the context-core route, not the taxonomy's content.",
+]
+
+pairs = [
+  { workload = "lubm", tier = "1", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, items = "14/14 queries; both cache modes" },
+  { workload = "owl2bench", tier = "rl-1", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, items = "22/22 queries; both cache modes" },
+  { workload = "write-scaling", tier = "diagnostic-http-1m", system = "nrese", regime = "none", outcome = "ok", runs = 6, note = "HTTP success only; COUNT not checked" },
+  { workload = "write-scaling", tier = "diagnostic-http-10m", system = "nrese", regime = "none", outcome = "ok", runs = 6, note = "HTTP success only; COUNT not checked" },
+  { workload = "fast", tier = "native-cli-dlmode-lubm1", system = "nrese", regime = "owl2-dl", outcome = "ok", runs = 36 },
+  { workload = "fast", tier = "native-cli-commits-readers", system = "nrese", regime = "owl2-rl", outcome = "ok", runs = 6, note = "maintained closure checked by size" },
+  { workload = "fast", tier = "native-cli-writes-under-readers", system = "nrese", regime = "none", outcome = "ok", runs = 18 },
+  { workload = "fast", tier = "native-cli-classify-store-horn", system = "nrese", regime = "dl", outcome = "ok", runs = 30, note = "no taxonomy oracle" },
+  { workload = "fast", tier = "native-cli-clients-sweep", system = "nrese", regime = "none", outcome = "ok", runs = 6 },
+  { workload = "fast", tier = "native-cli-cache-replay", system = "nrese", regime = "none", outcome = "ok", runs = 12 },
+]

@@ -106,6 +106,17 @@ pub struct ProbeOutcome {
     pub labels: Option<Labels>,
 }
 
+impl ProbeOutcome {
+    /// A probe stopped before it started (`why`).
+    pub(crate) fn stopped(why: &str) -> Self {
+        Self {
+            answer: Answer::GaveUp(why.into()),
+            telemetry: Telemetry::default(),
+            labels: None,
+        }
+    }
+}
+
 impl Prepared {
     /// Compiles `normalised` (of `ontology`) for probes over `classes` and `individuals`.
     pub fn new(
@@ -165,9 +176,17 @@ impl Prepared {
         self.individual_of[individual as usize] != NONE
     }
 
+    pub(crate) fn has_individuals(&self) -> bool {
+        !self.program.individuals.is_empty()
+    }
+
     /// Runs `probe`; a model's labels as `want` asks.
     pub fn probe(&self, probe: &Probe<'_>, config: &Config, want: Want) -> ProbeOutcome {
         let started = Instant::now();
+        let config = &*config.started();
+        if let Some(why) = config.stopped() {
+            return ProbeOutcome::stopped(why);
+        }
         let seed = self.seed(probe);
         let mut engine = Engine::new(&self.program, config);
         let end = engine.run(&seed);
@@ -221,30 +240,54 @@ impl Prepared {
         }
     }
 
-    /// The base of probes on this program's individuals ([`Base`]); `None` where the
-    /// program has none, or their consistency isn't a model (refuted, out of budget).
-    pub fn base<'p>(&'p self, config: &'p Config) -> Option<Base<'p>> {
-        if self.program.individuals.is_empty() {
-            return None;
+    /// Run consistency once, optionally retaining its state for later probes.
+    /// An unknown result may retain deterministic state, never a proven model.
+    /// No state is retained for a refutation or a program without individuals.
+    pub fn consistency_with_base(
+        &self,
+        config: &Config,
+        want: Want,
+        retain: bool,
+    ) -> (ProbeOutcome, Option<Base<'_>>) {
+        let started = Instant::now();
+        let config = &*config.started();
+        if let Some(why) = config.stopped() {
+            return (ProbeOutcome::stopped(why), None);
         }
+        let retain = retain && self.has_individuals();
+        // Without a source of choices, the completed graph is itself the
+        // deterministic start. Move it into Base instead of copying the ABox.
+        let choices =
+            self.features.disjunctions || self.features.numbers || self.features.datatypes;
+        let mut deterministic = None;
         let mut engine = Engine::new(&self.program, config);
-        engine.init(&Seed::none()).ok()?;
-        engine.saturate().ok()?;
-        let deterministic = engine.clone();
-        let end = engine.search(None);
-        let model = (end == End::Model).then_some(engine);
-        let point = model.as_ref().map(|m| (m.checkpoint(), m.frames.len()));
-        Some(Base {
-            prepared: self,
-            deterministic,
-            model,
-            point,
-            pool: std::sync::Mutex::new(Vec::new()),
-        })
+        let capture = (retain && choices).then_some(&mut deterministic);
+        let end = engine.run_with_checkpoint(&Seed::none(), capture);
+        let out = self.outcome(&mut engine, end, want, started, None);
+        let mut completed = Some(engine);
+        if retain && !choices && out.answer == Answer::Consistent {
+            deterministic = completed.take();
+        }
+        let base = deterministic
+            .filter(|_| out.answer != Answer::Inconsistent)
+            .map(|deterministic| {
+                let model = (out.answer == Answer::Consistent)
+                    .then_some(completed)
+                    .flatten();
+                let point = model.as_ref().map(|m| (m.checkpoint(), m.frames.len()));
+                Base {
+                    prepared: self,
+                    deterministic,
+                    model,
+                    point,
+                    pool: std::sync::Mutex::new(Vec::new()),
+                }
+            });
+        (out, base)
     }
     /// The labels of the model `engine` ended in. With `since` (a base's node and
     /// unary-fact counts), the other elements are only those the run added or gave new
-    /// facts: the base's own elements were read once ([`Base::labels`]), and leaving
+    /// facts: the base's own elements were read with its initial outcome, and leaving
     /// labels out only prunes less.
     fn labels_since(
         &self,
@@ -409,42 +452,50 @@ pub enum From {
     Deterministic,
 }
 
-impl Base<'_> {
-    /// The labels of the individuals' model (`None` if it isn't one): read once, so
-    /// that probes from it read only what they change.
-    pub fn labels(&self, want: Want) -> Option<Labels> {
-        let mut engine = self.model.as_ref()?.clone();
-        let started = Instant::now();
-        let out = self
-            .prepared
-            .outcome(&mut engine, End::Model, want, started, None);
-        out.labels
+impl<'p> Base<'p> {
+    /// Keep only the deterministic start when every planned probe contradicts the
+    /// model's choices. There is no value in retaining a model and a rollback pool
+    /// whose attempts would all cross the floor.
+    pub(crate) fn into_deterministic(mut self) -> Self {
+        self.model = None;
+        self.point = None;
+        self.pool
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self
     }
 
-    /// Runs `probe` from the base (its configuration is the base's).
-    pub fn probe(&self, probe: &Probe<'_>, want: Want) -> (ProbeOutcome, From) {
+    /// Runs `probe` from the base under `config`'s deadline and cancellation. `None`
+    /// where `config` searches differently from the base; then no work has run.
+    pub fn probe(
+        &self,
+        probe: &Probe<'_>,
+        config: &Config,
+        want: Want,
+    ) -> Option<(ProbeOutcome, From)> {
         let started = Instant::now();
+        let config = config.started();
+        if !config.same_search(&self.deterministic.config) {
+            return None;
+        }
+        if let Some(why) = config.stopped() {
+            return Some((ProbeOutcome::stopped(why), From::Deterministic));
+        }
         let seed = self.prepared.seed(probe);
-        fn fresh<'q>(base: &Engine<'q>) -> Engine<'q> {
-            let mut engine = base.clone();
-            engine.started = Instant::now();
+        let fresh = |mut engine: Engine<'p>| -> Engine<'p> {
+            engine.config = config.clone().into_owned();
             engine.stats = Telemetry::default();
             engine
-        }
+        };
+        let mut previous = Telemetry::default();
         if let (Some(model), Some((point, frames))) = (&self.model, &self.point) {
             let pooled = self
                 .pool
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pop();
-            let mut engine = match pooled {
-                Some(mut e) => {
-                    e.started = Instant::now();
-                    e.stats = Telemetry::default();
-                    e
-                }
-                None => fresh(model),
-            };
+            let mut engine = fresh(pooled.unwrap_or_else(|| model.clone()));
             let approximate = engine.data_approximate.clone();
             // The base's levels: its top frame's and below.
             engine.floor = engine.frames.last().map_or(0, |f| f.id);
@@ -455,6 +506,7 @@ impl Base<'_> {
                 self.prepared
                     .outcome(&mut engine, end, want, started, Some(since))
             });
+            previous = engine.stats.clone();
             engine.rollback(point, *frames);
             engine.data_approximate = approximate;
             engine.floor = 0;
@@ -463,12 +515,13 @@ impl Base<'_> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(engine);
             if let Some(out) = out {
-                return (out, From::Model);
+                return Some((out, From::Model));
             }
         }
-        let mut engine = fresh(&self.deterministic);
+        let mut engine = fresh(self.deterministic.clone());
         let end = engine.resume(&seed);
-        let out = self.prepared.outcome(&mut engine, end, want, started, None);
-        (out, From::Deterministic)
+        let mut out = self.prepared.outcome(&mut engine, end, want, started, None);
+        out.telemetry.accumulate(&previous);
+        Some((out, From::Deterministic))
     }
 }

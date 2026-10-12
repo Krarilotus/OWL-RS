@@ -32,6 +32,7 @@ pub mod realise;
 
 use std::time::{Duration, Instant};
 
+use nrese_exec::workers::Workers;
 use nrese_owl::{Normalised, Ontology, Term, normalise_with};
 
 pub use crate::context::Classification;
@@ -43,8 +44,8 @@ pub use realise::{Realisation, realise};
 /// taxonomy).
 #[derive(Debug, Clone)]
 pub struct Options {
-    /// Workers; 1 runs everything on the calling thread.
-    pub threads: usize,
+    /// The workers the tests and saturations run on (serial by default).
+    pub workers: Workers,
     /// Classify Horn ontologies with the context core (else the tableau driver only).
     pub context_core: bool,
     /// Eliminate the fresh names resolution can eliminate ([`inline`]).
@@ -83,8 +84,11 @@ pub struct Options {
     /// left, and the classes whose saturation reaches its context aren't exact.
     pub max_join_steps: usize,
     /// The most memory the process may hold while the context core runs (bytes; `None`:
-    /// three quarters of what the machine or container has).
+    /// three quarters of what the machine or container has; `Some(0)`: disabled).
     pub max_memory: Option<u64>,
+    /// Sampled capacity envelope of each context saturation, independent of the process
+    /// ceiling. `None` disables observations. Tableau limits remain in `tableau`.
+    pub task_memory: Option<usize>,
     /// The context core takes functional properties with its Eq rule
     /// ([`crate::context::Options::equality`]).
     pub equality: bool,
@@ -96,7 +100,7 @@ impl Options {
     /// The context core's options for a run of the driver within `budget` (no proofs).
     pub(crate) fn core(&self, budget: crate::context::Budget) -> crate::context::Options {
         crate::context::Options {
-            threads: self.threads,
+            threads: self.workers.width(),
             proofs: false,
             budget,
             strategy: self.lower_bound_strategy,
@@ -109,7 +113,7 @@ impl Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            threads: 1,
+            workers: Workers::serial(),
             context_core: true,
             inline: true,
             horn_lower_bound: true,
@@ -138,6 +142,7 @@ impl Default for Options {
             max_join: 1 << 20,
             max_join_steps: 1 << 16,
             max_memory: None,
+            task_memory: None,
             equality: false,
             // No lazy unfolding: it under-approximates the unfolded classes in a model, and
             // the driver reads its subsumers off model labels. No proofs are read here, so
@@ -204,18 +209,22 @@ impl Deadline {
             // allocation failure would end the process (ore_ont_9724 under equality).
             max_memory: options
                 .max_memory
-                .or_else(|| nrese_exec::memory::available_bytes().map(|b| b / 4 * 3)),
+                .or_else(|| nrese_exec::memory::available_bytes().map(|b| b / 4 * 3))
+                .filter(|&bytes| bytes != 0),
+            task_memory: options.task_memory,
         }
     }
 
-    /// The tableau's per-test configuration within the deadline.
+    /// The tableau's per-test configuration within the deadline (each test's own
+    /// `timeout` counts from its start).
     pub(crate) fn config(&self, base: &tableau::Config) -> tableau::Config {
-        let mut c = base.clone();
-        if let Some(d) = self.0 {
-            let left = d.saturating_duration_since(Instant::now());
-            c.timeout = Some(c.timeout.map_or(left, |t| t.min(left)));
+        tableau::Config {
+            deadline: match (base.deadline, self.0) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+            ..base.clone()
         }
-        c
     }
 }
 
@@ -229,37 +238,6 @@ pub(crate) fn trace(what: &str) {
             "trace {:>9.1} ms {what}",
             start.elapsed().as_secs_f64() * 1000.0
         );
-    }
-}
-
-/// The workers of a run: the calling thread alone for one, else a pool of their own
-/// (never rayon's global pool, so a run uses the threads it was given).
-pub(crate) struct Workers(Option<rayon::ThreadPool>);
-
-impl Workers {
-    pub(crate) fn new(threads: usize) -> Self {
-        if threads <= 1 {
-            return Self(None);
-        }
-        Self(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .ok(),
-        )
-    }
-
-    /// `f` of each item, in order.
-    pub(crate) fn map<T: Sync, R: Send>(
-        &self,
-        items: &[T],
-        f: impl Fn(&T) -> R + Sync + Send,
-    ) -> Vec<R> {
-        use rayon::prelude::*;
-        match &self.0 {
-            Some(pool) => pool.install(|| items.par_iter().map(&f).collect()),
-            None => items.iter().map(f).collect(),
-        }
     }
 }
 
@@ -277,8 +255,13 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
     if options.context_core {
         let core = options.core(deadline.budget(options, None));
         let t = Instant::now();
-        if let Ok(saturated) = crate::context::saturate_normalised(&normalised, &classes, &core)
-            && saturated.complete()
+        if let Ok(saturated) = crate::context::saturate_normalised(
+            &normalised,
+            &classes,
+            &core,
+            options.tableau.cancel.clone(),
+            &options.workers,
+        ) && saturated.complete()
         {
             let classification = saturated.classification();
             let profile = Profile {
@@ -288,7 +271,7 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
                 lower_bound: t.elapsed(),
                 classes: classes.len(),
                 total: started.elapsed(),
-                threads: options.threads,
+                threads: options.workers.width(),
                 ..Profile::default()
             };
             return Taxonomy {
@@ -326,4 +309,28 @@ pub(crate) fn classify_normalised(
     deadline: Deadline,
 ) -> Taxonomy {
     driver::Driver::new(ontology, normalised, classes, options, deadline).classify()
+}
+
+#[cfg(test)]
+mod memory_policy_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_zero_disables_the_watch_instead_of_selecting_the_auto_default() {
+        let deadline = Deadline::new(None);
+        let mut options = Options {
+            max_memory: Some(0),
+            ..Options::default()
+        };
+        assert_eq!(deadline.budget(&options, None).max_memory, None);
+        options.max_memory = Some(1);
+        assert_eq!(deadline.budget(&options, None).max_memory, Some(1));
+        options.max_memory = None;
+        assert_eq!(
+            deadline.budget(&options, None).max_memory,
+            nrese_exec::memory::available_bytes()
+                .map(|b| b / 4 * 3)
+                .filter(|&b| b != 0)
+        );
+    }
 }

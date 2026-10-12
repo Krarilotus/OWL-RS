@@ -19,9 +19,13 @@ use std::time::Instant;
 use hashbrown::HashMap;
 
 use super::atoms::Atom;
+use super::memory::{Interval, Observer};
 use super::program::Program;
 use super::rules::{Message, Out, State, Worker};
 use super::state::ContextId;
+
+#[path = "scheduling.rs"]
+mod scheduling;
 
 /// How the Succ rule picks a successor's context (Bate et al., §4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -45,10 +49,48 @@ pub enum Strategy {
 /// A context: its inbox, activation flag, core and state.
 #[derive(Default)]
 pub struct Context {
-    inbox: Mutex<Vec<Message>>,
+    inbox: Mutex<Inbox>,
     active: AtomicBool,
     core: OnceLock<Box<[Atom]>>,
     pub(super) state: Mutex<State>,
+    /// Capacity publications: the activation writes `working`, the inbox's writers `queued`.
+    working: AtomicUsize,
+    queued: AtomicUsize,
+}
+
+#[derive(Default)]
+struct Inbox {
+    messages: Vec<Message>,
+    /// The messages' payloads, where observed.
+    payload_bytes: usize,
+}
+
+impl Inbox {
+    fn bytes(&self) -> usize {
+        super::memory::vec(&self.messages) + self.payload_bytes
+    }
+
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+}
+
+/// An inbox publishes what it holds at its first message and every `QUEUED`th after it.
+const QUEUED: usize = 16;
+
+impl Context {
+    fn push(&self, message: Message, observe: bool) {
+        let mut inbox = lock(&self.inbox);
+        if !observe {
+            inbox.messages.push(message);
+            return;
+        }
+        inbox.payload_bytes += message.heap_bytes();
+        inbox.messages.push(message);
+        if inbox.messages.len() % QUEUED == 1 {
+            self.queued.store(inbox.bytes(), Relaxed);
+        }
+    }
 }
 
 /// A poisoned lock means a worker panicked; the scope re-raises that panic anyway.
@@ -69,6 +111,13 @@ struct Arena {
 }
 
 impl Arena {
+    fn bytes(&self) -> usize {
+        self.segments
+            .iter()
+            .filter_map(OnceLock::get)
+            .map(|segment| std::mem::size_of_val(&**segment))
+            .sum()
+    }
     fn new() -> Self {
         Self {
             segments: std::array::from_fn(|_| OnceLock::new()),
@@ -107,10 +156,20 @@ impl Arena {
     }
 }
 
-/// The program and the contexts saturating it.
 /// A context's key in the registry: its core and its tag ([`Engine::context_tagged`]).
 type CoreKey = (Box<[Atom]>, u32);
 
+/// Hashes like the owned tuple, so registry hits need no temporary allocation.
+#[derive(Hash)]
+struct CoreLookup<'a>(&'a [Atom], u32);
+
+impl hashbrown::Equivalent<CoreKey> for CoreLookup<'_> {
+    fn equivalent(&self, key: &CoreKey) -> bool {
+        self.0 == &*key.0 && self.1 == key.1
+    }
+}
+
+/// The program and the contexts saturating it.
 pub struct Engine {
     pub program: Program,
     pub strategy: Strategy,
@@ -119,12 +178,17 @@ pub struct Engine {
     contexts: Arena,
     registry: Mutex<HashMap<CoreKey, ContextId>>,
     budget: Budget,
+    cancel: Option<crate::Cancel>,
     /// Pred joins stop where the body so far already makes the conclusion redundant.
     pub prune_pred: bool,
     /// The budget ran out: the workers drop what is left (the saturation is then
     /// incomplete and says so).
     exhausted: AtomicBool,
-    memory: Option<nrese_exec::memory::MemoryWatch>,
+    /// Whether a budget check reads the clock (a deadline, a memory limit or an envelope).
+    timed: bool,
+    interval: Interval,
+    /// The capacity envelope's observations (`None`: off).
+    observer: Option<Observer>,
 }
 
 /// What a saturation may use (the dynamic fallback's budgets, design §4, in their first
@@ -141,21 +205,33 @@ pub struct Budget {
     /// The most memory the process may hold (bytes, `nrese_exec::memory`): a saturation
     /// that grows past it stops instead of taking the machine.
     pub max_memory: Option<u64>,
+    /// The saturation's estimated capacity, sampled (docs/design/owl2-dl.md §13); `None`:
+    /// unlimited, and nothing is observed.
+    pub task_memory: Option<usize>,
 }
 
 impl Engine {
-    pub fn new(program: Program, strategy: Strategy, proofs: bool) -> Self {
-        Self {
+    pub fn new(program: Program, strategy: Strategy, proofs: bool, budget: Budget) -> Self {
+        let engine = Self {
             program,
             strategy,
             proofs,
             contexts: Arena::new(),
             registry: Mutex::new(HashMap::new()),
-            budget: Budget::default(),
+            budget,
+            cancel: None,
             prune_pred: true,
             exhausted: AtomicBool::new(false),
-            memory: None,
+            timed: budget.deadline.is_some()
+                || budget.max_memory.is_some()
+                || budget.task_memory.is_some(),
+            interval: Interval::new(),
+            observer: budget.task_memory.map(Observer::new),
+        };
+        if engine.observing() {
+            engine.own(engine.program.bytes(), 0);
         }
+        engine
     }
 
     /// The engine with Pred's pruning on or off (on by default; off only for A/B runs).
@@ -164,15 +240,67 @@ impl Engine {
         self
     }
 
-    /// The engine with a budget.
-    pub fn with_budget(mut self, budget: Budget) -> Self {
-        self.budget = budget;
-        self.memory = budget.max_memory.map(nrese_exec::memory::MemoryWatch::new);
+    pub(super) fn with_cancel(mut self, cancel: Option<crate::Cancel>) -> Self {
+        self.cancel = cancel;
         self
     }
 
     pub fn budget(&self) -> Budget {
         self.budget
+    }
+
+    pub(super) fn observing(&self) -> bool {
+        self.observer.is_some()
+    }
+
+    /// Latest capacity estimate and sampled peak; zero when observations are off.
+    pub fn task_memory_bytes(&self) -> (usize, usize) {
+        self.observer
+            .as_ref()
+            .map_or((0, 0), |o| (o.used(), o.peak()))
+    }
+
+    /// Replaces `release` bytes the engine holds with `add` (exhausted past the envelope).
+    fn own(&self, add: usize, release: usize) {
+        if let Some(observer) = &self.observer
+            && !observer.own(add, release)
+        {
+            self.exhaust();
+        }
+    }
+
+    /// Updates an engine-held estimate `held` to `bytes`; false once the budget ran out.
+    pub(super) fn hold(&self, held: &mut usize, bytes: usize) -> bool {
+        self.own(bytes, std::mem::replace(held, bytes));
+        !self.exhausted()
+    }
+
+    /// The latest sampling election ([`Interval::last`]).
+    pub(super) fn election(&self) -> u64 {
+        self.interval.last()
+    }
+
+    /// Publishes context `c`'s capacity (by the worker holding it).
+    pub(super) fn publish(&self, c: ContextId, bytes: usize) {
+        self.context(c).working.store(bytes, Relaxed);
+    }
+
+    /// Sums the contexts' publications, never taking their locks (exhausted past the
+    /// envelope).
+    pub(super) fn sample(&self) {
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        let mut bytes = 0usize;
+        for id in 0..self.count() as ContextId {
+            let context = self.context(id);
+            bytes = bytes
+                .saturating_add(context.working.load(Relaxed))
+                .saturating_add(context.queued.load(Relaxed));
+        }
+        if !observer.sample(bytes) {
+            self.exhaust();
+        }
     }
 
     /// Whether the budget ran out (then the saturation is incomplete).
@@ -185,19 +313,38 @@ impl Engine {
         self.exhausted.store(true, Relaxed);
     }
 
-    /// Whether the deadline passed or the memory limit is exceeded (marks the budget
-    /// spent if so).
+    /// Whether cancelled, the deadline passed or the memory limit or envelope is exceeded
+    /// (marks the budget spent if so). One clock read; the process memory and the
+    /// contexts' capacity are read once per interval, by whichever check it elects.
     pub(super) fn out_of_budget(&self) -> bool {
         if self.exhausted() {
             return true;
         }
-        if self.budget.deadline.is_some_and(|d| Instant::now() >= d)
-            || self.memory.as_ref().is_some_and(|m| m.exceeded())
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(crate::Cancel::is_cancelled)
         {
             self.exhaust();
             return true;
         }
-        false
+        if !self.timed {
+            return false;
+        }
+        let now = Instant::now();
+        if self.budget.deadline.is_some_and(|d| now >= d) {
+            self.exhaust();
+            return true;
+        }
+        if self.interval.due(now) {
+            if let Some(limit) = self.budget.max_memory
+                && nrese_exec::memory::process_bytes().is_some_and(|held| held > limit)
+            {
+                self.exhaust();
+            }
+            self.sample();
+        }
+        self.exhausted()
     }
 
     pub fn count(&self) -> usize {
@@ -226,68 +373,39 @@ impl Engine {
     /// several with one core keep the calculus sound and complete; `Strategy::Split`).
     pub fn context_tagged(&self, core: &[Atom], tag: u32) -> (ContextId, bool) {
         let mut registry = lock(&self.registry);
-        let key = (core.into(), tag);
-        if let Some(&id) = registry.get(&key) {
+        if let Some(&id) = registry.get(&CoreLookup(core, tag)) {
             return (id, false);
         }
+        let before = self
+            .observing()
+            .then(|| self.contexts.bytes() + super::memory::map(&*registry));
         let id = self.contexts.push().expect("the context arena has room");
         let _ = self.context(id).core.set(core.into());
-        registry.insert(key, id);
+        registry.insert((core.into(), tag), id);
+        if let Some(before) = before {
+            // The arena's and the registry's growth, and the core's two copies.
+            let after = self.contexts.bytes() + super::memory::map(&*registry);
+            self.own(after - before + 2 * std::mem::size_of_val(core), 0);
+        }
         (id, true)
-    }
-
-    /// Starts `seeds` and saturates until no context has work, on `threads` workers.
-    pub fn run(&self, seeds: &[ContextId], threads: usize) {
-        if threads <= 1 {
-            let mut queue = Vec::new();
-            for &s in seeds {
-                self.deliver_seq(&mut queue, s, Message::Init);
-            }
-            while let Some(c) = queue.pop() {
-                let mut next = Vec::new();
-                self.work(c, &mut |to, m| self.deliver_seq(&mut next, to, m));
-                queue.extend(next);
-            }
-            return;
-        }
-        let run = || {
-            rayon::scope(|scope| {
-                for &s in seeds {
-                    self.deliver_par(scope, s, Message::Init);
-                }
-            });
-        };
-        match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
-            Ok(pool) => pool.install(run),
-            Err(_) => run(),
-        }
-    }
-
-    fn deliver_seq(&self, queue: &mut Vec<ContextId>, to: ContextId, message: Message) {
-        let context = self.context(to);
-        lock(&context.inbox).push(message);
-        if !context.active.swap(true, SeqCst) {
-            queue.push(to);
-        }
-    }
-
-    fn deliver_par<'s>(&'s self, scope: &rayon::Scope<'s>, to: ContextId, message: Message) {
-        let context = self.context(to);
-        lock(&context.inbox).push(message);
-        if !context.active.swap(true, SeqCst) {
-            scope.spawn(move |scope| self.work(to, &mut |t, m| self.deliver_par(scope, t, m)));
-        }
     }
 
     /// Processes a context's messages until its inbox stays empty; messages for other
     /// contexts go out through `deliver` after each batch.
     fn work(&self, c: ContextId, deliver: &mut dyn FnMut(ContextId, Message)) {
         let context = self.context(c);
+        let observe = self.observing();
         loop {
-            let mut batch = std::mem::take(&mut *lock(&context.inbox));
+            let mut batch = {
+                let mut inbox = lock(&context.inbox);
+                if observe {
+                    context.queued.store(0, Relaxed);
+                }
+                std::mem::take(&mut *inbox)
+            };
             if !batch.is_empty() && self.out_of_budget() {
                 // Out of budget: the messages are dropped, the run reports it.
-                batch.clear();
+                batch = Inbox::default();
             }
             if batch.is_empty() {
                 context.active.store(false, SeqCst);
@@ -299,20 +417,23 @@ impl Engine {
                 continue;
             }
             let mut out = Out::new(c);
-            {
+            let state_bytes = {
                 let mut state = lock(&context.state);
-                let mut worker = Worker {
-                    engine: self,
-                    state: &mut state,
-                    out: &mut out,
-                    scratch: Default::default(),
-                };
-                for message in batch {
+                let mut worker = Worker::new(self, &mut state, &mut out, batch.bytes());
+                for (i, message) in batch.messages.into_iter().enumerate() {
                     worker.handle(message);
+                    if (i + 1).is_multiple_of(256) && !worker.checkpoint(0) {
+                        break;
+                    }
                 }
-            }
+                worker.input_bytes = 0;
+                worker.finish()
+            };
             for (to, message) in out.sends {
                 deliver(to, message);
+            }
+            if let Some(bytes) = state_bytes {
+                context.working.store(bytes, Relaxed);
             }
         }
     }
@@ -324,20 +445,4 @@ impl Engine {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_arena_locates_ids_in_growing_segments() {
-        assert_eq!(Arena::locate(0), (0, 0));
-        assert_eq!(Arena::locate(BASE - 1), (0, BASE - 1));
-        assert_eq!(Arena::locate(BASE), (1, 0));
-        assert_eq!(Arena::locate(3 * BASE - 1), (1, 2 * BASE - 1));
-        assert_eq!(Arena::locate(3 * BASE), (2, 0));
-        let arena = Arena::new();
-        for i in 0..(BASE * 3 + 5) as u32 {
-            assert_eq!(arena.push(), Some(i));
-        }
-        let _ = arena.get(BASE as u32 * 3 + 4);
-    }
-}
+mod tests;

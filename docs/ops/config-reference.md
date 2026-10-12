@@ -241,9 +241,9 @@ api_key = "replace-me"
   - file key `dl.answers`, env `NRESE_DL_ANSWERS`: `certain-where-complete` (the default: the certain answers where the store can prove them complete, else the sound ones, the status saying which), `sound` (the lower bound alone, never checked against the upper bound) or `exact` (certain answers, or the query fails with 422, problem type `incomplete-answer`, naming the reasons and the unresolved candidates)
   - file key `dl.consistency`, env `NRESE_DL_CONSISTENCY`: `inline` (the default: a commit that makes the data inconsistent under OWL 2 DL is rejected, as the RL gate rejects) or `off` (not checked; every answer's status then says the consistency is unknown)
   - file key `dl.timeout`, env `NRESE_DL_TIMEOUT_MS` (default 30min): the time one DL task may take (a commit's consistency check, a query's exact services, a classification); what isn't decided by then is reported, never guessed
-  - file key `dl.memory`, env `NRESE_DL_MEMORY` (default 4GiB): the memory one DL task may hold
+  - file key `dl.memory`, env `NRESE_DL_MEMORY` (default 4GiB; `0` unlimited): the capacity one DL task's saturation and search may hold, checked at work boundaries; exhaustion is reported as incomplete, never as an answer. What it covers, and how it can overshoot: [owl2-dl.md §13](../design/owl2-dl.md#13-configuration)
   - file key `dl.max_candidates`, env `NRESE_DL_MAX_CANDIDATES` (default 1000): the candidate answers (in the upper bound, not the lower) a query checks with the exact services at most; the rest are reported unresolved
-  - file key `dl.threads`, env `NRESE_DL_THREADS` (default 0, every core): the workers of a classification
+  - file key `dl.threads`, env `NRESE_DL_THREADS` (default 0, every core): the maximum workers of a DL operation
   - file key `dl.max_nodes`, env `NRESE_DL_MAX_NODES` (default 2000000), and `dl.max_branch_points`, env `NRESE_DL_MAX_BRANCH_POINTS` (default 1000000): the deterministic budgets of one hypertableau run (a consistency check, an entailment test, a class test), beside `dl.timeout`. A run past a budget decides nothing: its candidate stays unresolved, its class untested, its commit's status `unknown`, never a wrong answer
 - with any mode but `disabled`:
   - `nrese-server load` and startup materialise the closure (startup skips it when `reasoning.state` in the data directory records that the inferred stack is current for this build's semantics; `/version` reports them as `reasoning_semantics`, e.g. `owl2-rl v2 <fingerprint>`)
@@ -277,7 +277,7 @@ Every limit on memory, time and request size is in one table, `[budgets]`. Value
 | Key | Environment | Default | What it bounds |
 |---|---|---|---|
 | `budgets.query_memory` | `NRESE_MAX_QUERY_MEMORY_BYTES` | 4 GiB | Intermediate results of one query. A query that needs more is answered `413`. `0` = unlimited |
-| `budgets.total_query_memory` | `NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES` | 50 % of the machine's memory | Intermediate results of all running queries together. A query that asks for more than is left is answered `503` and may succeed later. `0` = unlimited |
+| `budgets.total_query_memory` | `NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES` | 50 % of the machine's memory | Accounted native intermediates and retained results across the catalog, including update WHERE evaluation. A query that asks for more than is left is answered `503` and may succeed later. `0` = unlimited |
 | `budgets.process_memory` | `NRESE_PROCESS_MEMORY_BYTES` | 75 % of the machine's memory (the container's limit where there is one) | The private memory (mapped store files excluded) the server may hold before a long operation stops instead of taking the machine: a materialisation (load, startup, change of rules) or the reasoning of a commit ends with an error and applies nothing. A size (`48 GiB`) or a share (`60%`); `0` = unlimited |
 | `budgets.huge_pages` | `NRESE_HUGE_PAGES` | `on` | Whether transparent huge pages may back the server's memory (Linux; elsewhere nothing changes). `on`: work over large heaps runs faster (LUBM 100's materialisation 26 % faster), but while serving many small requests the allocator holds about 2.7 times the memory (a whole 2 MiB page resident for a touched byte). `off`: less memory held while serving, slower materialisation. See [server-setup.md](server-setup.md) §12.1 |
 | `budgets.bulk_load_memory` | `NRESE_BULK_LOAD_MEMORY` | 25 % of the machine's memory | The quads of a bulk load (`nrese-server load`, or a load into an empty store). Past it they are sorted in chunks of a third of it (one filling, one being sorted, its sorted copy), spilled to `bulk-spill/` in the data directory and merged into each index permutation while the checkpoint is written: one more pass over the disk, but the load's quads take this much plus one packed permutation whatever the data's size. The dictionary is apart (it grows with the distinct terms). Needs `store.map_checkpoints`. `0` = unlimited |
@@ -291,11 +291,18 @@ Every limit on memory, time and request size is in one table, `[budgets]`. Value
 | `budgets.result_cache` | `NRESE_QUERY_CACHE_BYTES` | 2% of memory (64 MiB to 8 GiB) | Results of query parts (id columns) kept for repeated queries and shared sub-patterns ([the result cache](#store)); a size or a share (`5%`). `0` switches the cache off |
 | `budgets.result_cache_pins` | `NRESE_PINNED_QUERIES` | none | Query files whose results are pinned in the result cache at startup |
 
-How the two memory budgets work:
-- They count what queries hold between their operators: the tables of joins, groups and sorts, and the hash tables of joins. A table that is being built may take half of what is left, because growing it, and merging the parts of a parallel join, holds its rows twice for a moment.
+How query memory accounting works:
+
+- Per-query and shared query budgets count operator tables and scratch, including joins, groups and sorts. Retained native results and DL bound tables keep their reservations until drop; update WHERE uses the same catalog owner. A table that is being built may take half of what is left, because growing it, and merging the parts of a parallel join, holds its rows twice for a moment. Decoded graph payloads, encoder buffers and DL compilation scratch are not a shared whole-request envelope.
 - The machine's memory is the container's limit where there is one (cgroups), else the machine's. It is known on Linux; elsewhere a share such as `50%` means "no limit", so set a size.
 - The store's own memory (the data and its indexes) is not part of either budget.
 - A request over a size limit is answered `413`. Requests are held in memory while they are handled, so a size limit is also memory a request may take.
+
+Server startup installs `budgets.process_memory` as the process fallback. Opening an
+embedded store never replaces that global policy; embedding hosts may install it explicitly.
+Store-local watches cover participating operations, including DL bounds and diagnostics;
+an explicit zero remains disabled. These are cooperative checkpoints, not allocator limits
+or preemption of schema reading, normalisation and compilation.
 
 The same settings have older names, which still work: `policy.limits.max_query_bytes`, `max_query_memory_bytes`, `max_update_bytes`, `max_rdf_upload_bytes`; `policy.timeouts.query_ms`, `update_ms`, `graph_read_ms`, `graph_write_ms`; `store.query_cache_bytes`. A setting under both names is a startup error.
 
@@ -312,7 +319,11 @@ A write that times out before its commit starts is never committed, and the requ
 - the `WHERE` evaluation of an update;
 - commit-path reasoning, polled between rounds and per work unit.
 
-A cancelled reasoning run discards the asserted and the inferred changes and frees the writer at once. Two steps don't poll the deadline:
+Once a reasoning run observes cancellation and finishes unwinding, it discards the asserted
+and inferred changes and releases the writer. The DL gate shares its deadline and token
+across pending/prior consistency checks and rejection evidence. Cancellation is cooperative;
+schema reading, normalisation and compilation are not all internally interruptible.
+Two rule-reasoning steps also don't poll the deadline:
 - the one-off full materialisation that runs when no current reasoning state is recorded;
 - closing a newly declared transitive property.
 

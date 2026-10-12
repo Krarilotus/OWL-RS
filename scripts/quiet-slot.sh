@@ -7,7 +7,10 @@
 #
 # It takes a machine-wide lock (NRESE_QUIET_DIR, default ~/.nrese-quiet-slot), waits until no
 # rustc or cargo of ours is running (at most NRESE_QUIET_DRAIN_S, default 600 s), runs the
-# command and releases the lock. While the lock is held, scripts/cargo-guarded.sh waits
+# command and releases the lock. If compilers remain at the drain deadline, it releases
+# the lock and exits 124 without starting the command (0 s means check without waiting).
+# Failure to inspect processes exits 2; otherwise the command's exit status is preserved.
+# While the lock is held, scripts/cargo-guarded.sh waits
 # before starting a build, so the slot stays quiet. A lock whose owner died is taken over.
 # Counts and other deterministic measures need no slot; only times do.
 set -u
@@ -18,9 +21,13 @@ DRAIN="${NRESE_QUIET_DRAIN_S:-600}"
 alive() { kill -0 "$1" 2>/dev/null; }
 compilers() {
   if command -v tasklist >/dev/null 2>&1; then
-    tasklist 2>/dev/null | grep -ciE '^(rustc|cargo)\.exe'
+    local tasks
+    tasks=$(tasklist 2>/dev/null) || return 2
+    printf '%s\n' "$tasks" | grep -qiE '^(rustc|cargo)\.exe'
   else
-    pgrep -c -x 'rustc|cargo' 2>/dev/null || echo 0
+    # pgrep returns 1 for no matches, not a failed inspection. Use its status rather
+    # than a count: `pgrep -c ... || echo 0` prints two zeros when nothing matches.
+    pgrep -x 'rustc|cargo' >/dev/null 2>&1
   fi
 }
 
@@ -39,9 +46,18 @@ trap 'rm -rf "$LOCK"' EXIT
 
 start=$SECONDS
 # Our own cargo (this script's parent shell's) isn't running; others' may be.
-while [ "$(compilers)" -gt 0 ] && [ $((SECONDS - start)) -lt "$DRAIN" ]; do
+while :; do
+  compilers
+  case $? in
+    0) ;;
+    1) break ;;
+    *) echo 'quiet slot: cannot inspect compiler processes; measurement not started' >&2; exit 2 ;;
+  esac
+  if [ $((SECONDS - start)) -ge "$DRAIN" ]; then
+    echo "quiet slot: compilers still running after ${DRAIN} s; measurement not started" >&2
+    exit 124
+  fi
   sleep 5
 done
-[ "$(compilers)" -gt 0 ] && echo "quiet slot: compilers still running after ${DRAIN} s; measuring anyway" >&2
 # What the measurement builds itself doesn't wait for the slot it holds.
 NRESE_QUIET_HOLDER=1 "$@"

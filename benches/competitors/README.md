@@ -52,6 +52,12 @@ Results: one record per run in [../runs/](../runs/README.md).
 
 ## Fairness checklist
 
+The settings below describe the legacy scorecard. New comparisons use the
+[suite protocol](../PROTOCOL.md) and the GraphDB qualification below; a fixed JVM
+heap is not an equal total-memory budget. The current campaigns run on Office-PC,
+with Phuoc-Yu reserved for compatible Office-built native binaries. Never compare
+a GraphDB result from Office with an NRESE result from Phuoc.
+
 - **Same input and host.** Every system reads the same file from the same Docker volume and writes to a fresh volume.
 - **Each vendor's own bulk loader and tuning guidance:**
   - JVM tools get a 16 GB heap.
@@ -60,21 +66,35 @@ Results: one record per run in [../runs/](../runs/README.md).
   - Everything else runs with defaults.
 - **Timing.** Wall-clock from the start of the load until the store is durable and queryable. Container and JVM start-up are included (≈ 0.3–1 s); Virtuoso's server start-up is not.
 - **Vendor defaults changed for fairness:**
-  - QLever's query-result cache is off (`-k 0`: a 1 MB cap alone still kept every small result, such as a count, so until 1 October 2026 repeated runs of small-result queries were cache hits), so repeated runs measure evaluation. This scorecard measures that cold mode only. The suite (`benches/suite`) runs every system that has a result cache (QLever, NRESE) both ways: with it off, and on with the system's defaults. It also shuffles the query order and reports each query's first execution apart.
+  - QLever's query-result cache is off (`-k 0`: a 1 MB cap alone still kept every small result, such as a count, so until 1 October 2026 repeated runs of small-result queries were cache hits), so repeated runs measure evaluation. This is cache-disabled evaluation, not proof of cold memory or storage. The suite (`benches/suite`) runs systems with supported result-cache modes (QLever, NRESE) both ways: off and on. It also shuffles the query order and reports each query's first execution apart.
   - Virtuoso's result-row cap and cost-based query rejection are disabled, so it returns complete results.
   - NRESE's rate limits are lifted.
   - All systems use the same per-query timeout (`QUERY_TIMEOUT_S`, default 120 s).
 - **Same data.** Real dumps contain a few lines strict parsers reject: 29 k of 229 M in Wikidata lexemes, plus some in DBpedia. They are dropped once for all systems (`nt-filter.py`).
 - **The stores differ.** Each builds different indexes: QLever 6 permutations plus a pattern index, Virtuoso 2 full plus 3 partial indexes, TDB2 triple and quad indexes, NRESE 6 permutations plus a checkpoint. Load time alone doesn't say which store is better. It has to be read together with store size, peak memory, restart time and query speed.
-- **Still missing:**
-  - throughput with concurrent clients, and write latency under read load
-  - LUBM and BSBM generators, for reasoning and mixed workloads
-  - full Wikidata, which needs a large server
-  - runs on a dedicated Linux reference machine instead of Docker Desktop
+- **Coverage:** LUBM, concurrent-client tools and Linux Office runs now exist in the
+  wider suite. Their presence does not complete every competitor pair. BSBM and
+  full Wikidata remain separate uncompleted scale work; consult the workload
+  registry and dated run records instead of this legacy scorecard's scope.
+
+## GraphDB
+
+The comparison uses GraphDB Free 11.5 (one core, two concurrent queries, five
+repositories, 32-bit entity IDs) beside NRESE under the same one-CPU and total-memory
+allocation, one and two clients reported apart; more offered concurrency measures Free's
+queueing, not Enterprise scaling. GraphDB gets its documented native paths: offline
+`importrdf preload` for plain data, parallel `importrdf load` (inference and plugin
+indexes finished before the repository counts as ready) for reasoning, native `sameAs`
+handling kept on, indexes sized for the data, default and tuned variants recorded apart.
+The settings and their defaults are in the `Graphdb` adapter
+([`adapters.py`](../suite/suitekit/adapters.py)); which workloads it covers and what each
+lacks is in the run record [2026-10-09-graphdb-coverage](../runs/2026-10-09-graphdb-coverage.toml).
+Correctness comes first, then load and inference time, latency, throughput, update cost,
+memory and disk; nothing is ranked on only the queries both happened to finish.
 
 ## Cleaning up after a run
 
-A run leaves nothing behind but its results. The scorecard scripts call `scripts/bench-cleanup.sh` when they exit, also when they fail or are interrupted. It removes:
+The legacy scorecard scripts call `scripts/bench-cleanup.sh` when they exit, also when they fail or are interrupted. Its broad name-based cleanup removes:
 - the run's containers and store volumes;
 - the dataset volume `nrese-bench-data` and local datasets under `~/nrese-bench`;
 - the images built here (`nrese-bench/*`) and the images the run pulled itself (an image that was already on the machine stays);
@@ -82,10 +102,17 @@ A run leaves nothing behind but its results. The scorecard scripts call `scripts
 
 Scorecards (CSV), logs and reports stay.
 
-For several runs in a row, set `NRESE_BENCH_KEEP=1` so datasets and images survive between them, and run `scripts/bench-cleanup.sh` once at the end. `--dry-run` shows what it would remove. It only removes things by the names these scripts use, never "everything unused", so other projects' containers, volumes and images are safe.
+On a host with preserved inputs ([hosts.toml](../hosts.toml)) don't use that cleanup:
+run the suite directly with `NRESE_BENCH_KEEP=1`, the inputs mounted read-only and
+fresh writable stores outside the preservation root, and afterwards remove only the
+run's own containers, stores and scratch by exact identity.
 
 ## Getting licences
 
 - **RDFox:** <https://www.oxfordsemantic.tech/free-trial>. It requires an institutional email and acceptance of the [evaluation licence](https://www.oxfordsemantic.tech/rdfox-evaluation-license).
 - **GraphDB Free licence (required since GraphDB 11.0):** request GraphDB Free on the Graphwise download page and the licence arrives by email. Run the scorecard with `GRAPHDB_LICENSE=/path/graphdb.license`. Without it, GraphDB still bulk-loads but answers every query with "No license was set".
-- **GraphDB Enterprise evaluation:** email `graphdb-info@ontotext.com` and ask for an evaluation licence. It's only needed to compare against Enterprise's parallel inference in M3. Ask about publishing permission in the same email.
+- **GraphDB Enterprise:** a comparison requires an existing valid licence for the
+  measured host and core count. Enterprise also differs in concurrency, connectors,
+  entity-ID capacity and clustering; it is not only a parallel-inference option.
+  Acquiring a licence or requesting publication permission is a separate maintainer
+  decision. The current campaign uses the existing Free key.

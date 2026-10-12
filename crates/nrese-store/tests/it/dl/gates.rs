@@ -5,7 +5,9 @@
 use std::sync::Arc;
 
 use nrese_sparql::GraphAccess;
-use nrese_store::{DlConfig, MutationPipeline, ReadScope, SparqlQueryRequest};
+use nrese_store::{
+    DlAnswers, DlConfig, MutationPipeline, ReadScope, SparqlQueryRequest, StoreError,
+};
 
 use super::queries::query;
 use super::{PREFIXES, insert, pipeline, pipeline_with};
@@ -68,7 +70,7 @@ fn a_spent_deterministic_budget_leaves_candidates_unresolved_never_wrong() {
 }
 
 #[test]
-fn a_spent_candidate_budget_leaves_the_rest_unresolved() {
+fn a_spent_candidate_budget_leaves_the_rest_unresolved_and_exact_mode_rejects_it() {
     let dl = pipeline_with(DlConfig {
         max_candidates: 1,
         ..DlConfig::default()
@@ -79,6 +81,10 @@ fn a_spent_candidate_budget_leaves_the_rest_unresolved() {
     let b = status.bounds.expect("bounds");
     assert_eq!((b.proved, b.unresolved), (1, 1), "{b:?}");
     assert_eq!(rows.len(), 3, "{rows:?}");
+    assert!(matches!(
+        super::queries::query_with(&dl, "SELECT ?x { ?x a :D }", Some(DlAnswers::Exact)),
+        Err(StoreError::Incomplete(_))
+    ));
 }
 
 const EX: &str = "http://example.com/";

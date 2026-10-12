@@ -27,11 +27,13 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all
+from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all, post
+from .answers import Recorder
 from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime,
                       run_quiet, shell)
 from .manifest import Manifest, image_ids
 from .schema import Result, Writer
+from .summary import adjudications
 from .workloads import plans
 
 EXE = ".exe" if os.name == "nt" else ""
@@ -69,7 +71,13 @@ def arguments(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--keep", action="store_true",
                    help="keep datasets, the NRESE build and images for the next run of a batch")
     p.add_argument("--skip-build", action="store_true", help="use the existing NRESE and harness builds")
+    p.add_argument("--answers", choices=["off", "full"], default="off",
+                   help="full: capture every query's complete answer, untimed, and compare each system "
+                        "with --answers-reference (answers.py; writes answers.json)")
+    p.add_argument("--answers-reference", metavar="SYSTEM", help="the system the answers are compared with")
     args = p.parse_args(argv)
+    if args.answers == "full" and not args.answers_reference:
+        p.error("--answers full needs --answers-reference SYSTEM")
     args.cache = [m.strip() for m in args.cache.split(",") if m.strip()]
     if not args.cache or any(m not in ("off", "on") for m in args.cache) or len(set(args.cache)) != len(args.cache):
         p.error("--cache is off, on, or both in some order (off,on)")
@@ -154,6 +162,8 @@ class Suite:
         self.written: list[Result] = []
         self.skips: list[str] = []
         self.manifest: Manifest | None = None
+        self.answers = (Recorder(self.results, args.answers_reference, adjudications())
+                        if args.answers == "full" and not args.dry_run else None)
 
     # --- helpers ---
     def say(self, text: str):
@@ -252,8 +262,11 @@ class Suite:
         return self.settings.get("HARNESS") or str(target / "release" / f"nrese-bench-harness{EXE}")
 
     def build_harness(self) -> bool:
-        if self.args.skip_build and Path(self.harness()).exists():
-            return True
+        if self.args.skip_build:
+            if Path(self.harness()).is_file():
+                return True
+            self.say(f"--skip-build requires an existing harness: {self.harness()} (set HARNESS)")
+            return False
         self.say("building the harness (release)")
         log = self.results / "logs" / f"harness-build-{self.stamp}.log"
         rc = self.host_command(["bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked", "--quiet",
@@ -350,7 +363,17 @@ class Suite:
         try:
             store = self.runtime.new_store(ctx.name("store"))
             if plan.kind == "writes":
+                if key == "graphdb":
+                    # Serving a fresh GraphDB home does not create its repository.
+                    # Reuse its configured loader; setup is outside write timings.
+                    (ctx.work / "empty.nt").write_bytes(b"")
+                    setup = system.load(ctx, store, ["/work/empty.nt"], regime)
+                    self.emit(base, task="load", status="ok" if setup.measured.ok else "failed",
+                              ms=setup.measured.ms, note="empty repository setup; " + setup.note)
+                    if not setup.measured.ok:
+                        return
                 endpoint = system.serve(ctx, store, regime)
+                base["version"] = system.version(ctx, endpoint)
                 self.writes(ctx, endpoint, base)
                 return
             step = system.load(ctx, store, plan.inputs, regime)
@@ -414,6 +437,9 @@ class Suite:
         report = ctx.logs / f"queries{suffix}.json"
         # A log is replayed as it is: each entry once, in order, without a warm-up.
         warmup, runs = ("0", "1") if plan.replay else ("1", str(self.args.query_runs))
+        if self.answers and not plan.replay:
+            for query in plan.queries.glob("*.rq"):
+                self.answers.expect((plan.workload, plan.tier, base["regime"], query.name), key)
         command = [self.harness(), "query-mix", "--endpoint", endpoint.query, "--queries", str(plan.queries),
                    "--label", key, "--warmup", warmup, "--runs", runs,
                    "--timeout-s", str(self.args.query_timeout_s), "--report-json", str(report)]
@@ -473,17 +499,48 @@ class Suite:
                 self.emit(base, task="query", item=q["id"], repeat=i, status="wrong" if wrong else "ok",
                           ms="" if system.answers_only or latency is None else latency,
                           rows=q.get("rows") if q.get("rows") is not None else "", note=note)
+        if self.answers and not plan.replay:
+            for query in sorted(plan.queries.glob("*.rq")):
+                self.answers.capture(post, endpoint.query, (plan.workload, plan.tier, base["regime"], query.name),
+                                     key, base["cache"], run, query, ctx.logs, self.args.query_timeout_s)
 
     def writes(self, ctx: Context, endpoint: Endpoint, base: dict):
         report = ctx.logs / "write-scaling.json"
         steps = {"100k": "10000,100000", "1m": "10000,100000,500000,1000000",
                  "10m": "1000000,10000000"}.get(base["tier"], base["tier"])
+        if base["system"] == "nrese":
+            connection = ["--nrese-base-url", endpoint.query.rsplit("/dataset/", 1)[0]]
+        elif base["system"] == "graphdb":
+            connection = ["--reference-kind", "graphdb", "--reference-base-url", endpoint.query]
+        else:
+            raise ValueError("write-scaling has no route for " + base["system"])
         started = time.monotonic()
-        rc = self.host_command([self.harness(), "write-scaling", "--nrese-base-url",
-                                endpoint.query.rsplit("/dataset/", 1)[0], "--steps", steps,
+        rc = self.host_command([self.harness(), "write-scaling", *connection, "--steps", steps,
+                                "--reset", "true",
                                 "--report-json", str(report)], ctx.logs / "write-scaling.txt")
-        self.emit(base, task="update", status="ok" if rc == 0 else "failed", ms=(time.monotonic() - started) * 1000,
-                  note=f"steps {steps}; per-step figures in {report.name}")
+        checked = False
+        try:
+            result = json.loads(report.read_text(encoding="utf-8"))
+            services = result["services"]
+            records = services[0]["steps"]
+            requested = [int(n) for n in steps.split(",")]
+            samples = result["samples_per_step"]
+            checked = (result["mode"] == "write-scaling" and len(services) == 1
+                       and services[0]["label"].lower() == base["system"] and services[0]["reset"] is True
+                       and type(samples) is int and samples > 0 and len(records) == len(requested))
+            previous = 0
+            for i, (row, size) in enumerate(zip(records, requested)):
+                actual = size // 4 * 4
+                expected = dict(triples=size, asserted_entity_triples=actual, loaded_triples=actual - previous,
+                                expected_persons=size // 4, observed_persons=size // 4,
+                                expected_probes=(i + 1) * samples, observed_probes=(i + 1) * samples)
+                checked &= all(type(row[k]) is int and row[k] == v for k, v in expected.items())
+                previous = actual
+        except (OSError, ValueError, KeyError, IndexError, TypeError):
+            checked = False
+        self.emit(base, task="update", status="ok" if rc == 0 and checked else "failed",
+                  ms=(time.monotonic() - started) * 1000,
+                  note=f"steps {steps}; numeric checks {'passed' if checked else 'missing/failed'}; per-step figures in {report.name}")
 
     def kit(self, plan, key: str):
         base = dict(date=self.date, host=self.host, runtime="process", system=key, version="-",
@@ -681,6 +738,8 @@ def main(argv: list[str], systems: dict, workloads: dict, root: Path) -> int:
         code = 130
         return code
     finally:
+        if suite.answers:
+            print(f"answers: {suite.answers.write()}")
         if suite.manifest:
             suite.manifest.finish(code)
         suite.cleanup()

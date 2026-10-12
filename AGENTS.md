@@ -21,13 +21,16 @@ Read [docs/README.md](docs/README.md) (which document answers what),
 ## Boundaries
 
 - Work in your own branch and worktree. The maintainer merges and pushes. Never skip the hooks.
-- Delete only what you created; stop processes by PID. Large datasets live once, read-only,
-  in `C:\Users\Johannes\nrese-data\` on the main PC; point to them, never copy them into a
-  worktree.
+- Delete only what you created unless the user authorizes a wider cleanup; stop
+  processes by PID.
+- Hosts and roles: [benches/hosts.toml](benches/hosts.toml); verified shared inputs are
+  read-only. Only the build host compiles, tests and formats Rust and runs the
+  build-triggering hooks: elsewhere `scripts/lib/remote.sh` sends the working tree to it
+  (`git config nrese.buildHost`).
 - `literature/` is read-only. Results of licensed systems are never committed.
 - Write files with the editor tools; the shell mangles backslashes.
-- A commit written by an AI agent ends with its `Co-Authored-By` trailer (Claude's:
-  `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`).
+- Commit messages carry no AI co-author trailers (`Co-Authored-By: Claude …` and the like);
+  the `commit-msg` hook removes them.
 
 ## Reporting
 

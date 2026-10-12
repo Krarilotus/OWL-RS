@@ -1,83 +1,124 @@
-//! Runs of one test with different clauses, raced: the first decided answer wins and the
-//! others are cancelled. Both answers are right; which run decides first depends on the
-//! ontology (lazily unfolded definitions decide the DL98 test k_grz at once and slow
-//! k_d4 down to a timeout; the plain clauses the other way round).
+//! Runs of one test with different clauses, raced. Which run decides depends on the
+//! ontology (lazily unfolded definitions decide the DL98 test k_grz at once and slow k_d4
+//! down to a timeout; the plain clauses the other way round).
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::time::Duration;
-
+use nrese_exec::workers::Workers;
 use nrese_owl::{Normalised, Ontology};
 
-use super::{Answer, Config, Outcome, consistency_of};
+use super::budget::memory_share;
+use super::{Answer, Cancel, Config, Outcome, consistency_of};
 
-/// A flag that stops a run at its next budget check ([`Config::cancel`]).
-#[derive(Debug, Clone, Default)]
-pub struct Cancel(Arc<AtomicBool>);
-
-impl Cancel {
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
-    }
+/// The consistency of `ontology`, each variant on one worker with an equal share of the
+/// memory budget. The first decision cancels the siblings (not the request) and the
+/// race waits for them; where several decide, the first in input order is returned.
+pub fn race(
+    ontology: &Ontology,
+    variants: &[&Normalised],
+    config: &Config,
+    workers: &Workers,
+) -> Outcome {
+    race_with(ontology, variants, config, workers, consistency_of)
 }
 
-impl PartialEq for Cancel {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl Eq for Cancel {}
-
-/// Whether two runs can go side by side.
-pub fn cores_to_spare() -> bool {
-    std::thread::available_parallelism().is_ok_and(|n| n.get() >= 2)
-}
-
-/// The consistency of `ontology` by whichever of `variants` decides first, each run on a
-/// thread of its own with an equal share of the memory budget.
-pub fn race(ontology: &Ontology, variants: &[&Normalised], config: &Config) -> Outcome {
-    let stop = Cancel::default();
-    let (tx, rx) = mpsc::channel();
-    std::thread::scope(|scope| {
-        for (i, normalised) in variants.iter().enumerate() {
-            let mut c = config.clone();
-            c.cancel = Some(stop.clone());
-            c.max_memory = config.max_memory / variants.len();
-            let tx = tx.clone();
-            scope.spawn(move || {
-                let _ = tx.send((i, consistency_of(ontology, normalised, &c)));
-            });
+fn race_with(
+    ontology: &Ontology,
+    variants: &[&Normalised],
+    config: &Config,
+    workers: &Workers,
+    run: impl Fn(&Ontology, &Normalised, &Config) -> Outcome + Sync + Send,
+) -> Outcome {
+    let stop = Cancel::child(config.cancel.as_ref());
+    let width = workers.for_items(variants.len());
+    let c = Config {
+        cancel: Some(stop.clone()),
+        workers: Some(workers.limited(1)),
+        max_memory: memory_share(config.max_memory, width),
+        ..config.started().into_owned()
+    };
+    let mut outcomes = workers.map(variants, |normalised| {
+        // A queued variant whose sibling decided, or past the deadline, doesn't start.
+        let out = match c.stopped() {
+            Some(why) => Outcome::stopped(why),
+            None => run(ontology, normalised, &c),
+        };
+        if matches!(out.answer, Answer::Consistent | Answer::Inconsistent) {
+            stop.cancel();
         }
-        drop(tx);
-        let mut undecided: Option<Outcome> = None;
-        let mut left = variants.len();
-        while left > 0 {
-            // The caller's flag reaches the runs through ours.
-            let (_, out) = match rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(r) => r,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if config.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
-                        stop.cancel();
-                    }
-                    continue;
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            };
-            left -= 1;
-            if matches!(out.answer, Answer::Consistent | Answer::Inconsistent) {
-                stop.cancel();
-                return out;
-            }
-            if undecided.is_none() {
-                undecided = Some(out);
-            }
+        out
+    });
+    let decided = outcomes
+        .iter()
+        .position(|out| matches!(out.answer, Answer::Consistent | Answer::Inconsistent));
+    if outcomes.is_empty() {
+        Outcome::stopped("no portfolio variants")
+    } else {
+        outcomes.swap_remove(decided.unwrap_or(0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn a_decided_variant_stops_a_queued_sibling_before_its_solver_starts() {
+        use std::sync::atomic::AtomicUsize;
+        let workers = Workers::new(1);
+        let request = Cancel::default();
+        let config = Config {
+            cancel: Some(request.clone()),
+            ..Config::default()
+        };
+        let ontology = Ontology::default();
+        let normalised = Normalised::default();
+        let calls = AtomicUsize::new(0);
+        let out = workers.install(|| {
+            race_with(
+                &ontology,
+                &[&normalised, &normalised],
+                &config,
+                &workers,
+                |_, _, child| {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(child.workers.as_ref().unwrap().width(), 1);
+                    let mut out = Outcome::stopped("unused");
+                    out.answer = Answer::Consistent;
+                    out
+                },
+            )
+        });
+        assert_eq!(out.answer, Answer::Consistent);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(!request.is_cancelled());
+    }
+
+    #[test]
+    fn cancelled_or_expired_portfolios_start_no_solvers() {
+        use std::time::Duration;
+        let workers = Workers::new(2);
+        let request = Cancel::default();
+        request.cancel();
+        let ontology = Ontology::default();
+        let normalised = Normalised::default();
+        for config in [
+            Config {
+                cancel: Some(request),
+                ..Config::default()
+            },
+            Config {
+                timeout: Some(Duration::ZERO),
+                ..Config::default()
+            },
+        ] {
+            let out = race_with(
+                &ontology,
+                &[&normalised, &normalised],
+                &config,
+                &workers,
+                |_, _, _| panic!("stopped variant entered its solver"),
+            );
+            assert!(matches!(out.answer, Answer::GaveUp(_)));
         }
-        undecided.unwrap_or_else(|| unreachable!("every run sends its outcome"))
-    })
+    }
 }

@@ -88,7 +88,7 @@ pub struct CompatConfig {
 /// `write-scaling`: grow the dataset in steps and measure write/query latency per step.
 #[derive(Debug, Clone)]
 pub struct WriteScalingConfig {
-    pub nrese: ServiceConnectionConfig,
+    pub nrese: Option<ServiceConnectionConfig>,
     pub reference: Option<ReferenceConnection>,
     /// Strictly increasing dataset sizes in triples.
     pub steps: Vec<u64>,

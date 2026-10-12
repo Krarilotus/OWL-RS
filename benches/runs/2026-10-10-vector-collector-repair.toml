@@ -1,0 +1,22 @@
+# A run record (benches/runs/README.md). Outcomes and identities; samples stay under results.
+id = "2026-10-10-vector-collector-repair"
+level = "focused"
+kit = "perf lab"
+purpose = "The SPARQL vector collector merges sorted rounds, keeps only the winners' probe rows and releases the displaced rows' charges"
+started = "2026-10-10"
+host = "phuoc-yu"
+build_host = "office-pc"
+scenario = "matched"
+baseline = { commit = "62ae2e0faeafea162f3a4dbf58cee9a56e8254d5", dirty = false, binary_sha256 = "a1f8656ded75bf799b43d71dd86313cc8194bb0c0a270fae108aa84c36b12614" }
+candidate = { commit = "62ae2e0faeafea162f3a4dbf58cee9a56e8254d5", dirty = true, patch_sha256 = "b9777281354c08e509572f265b73e975e65c329f03308951f829452b474843b1", binary_sha256 = "730383abc043a5acab304b1515f2c0bf5935779fb0f6202079d25fd817490bf5", note = "+133/-59 production lines" }
+protocol = { diagnostic_pairs = 3, pairs = 10, processes = 100, saved_answers = 500, graph = "dimension 64, cosine, 200000 vectors, prepared before timing (--prepare-vector-graph)", cpus = "workload 1-7,9-15; controller 0,8; performance governor, restored after", limits = "6 GiB, no swap, cache off" }
+results = { root = "phuoc-yu:/home/krarilotus/nrese-prep-20261009-4e8bd38/vector-qualification-20261010", artifacts = "office-pc:/home/krarilotus/nrese-prep-20261009-4e8bd38/vector-repair-20261010", raw_outputs = 730 }
+publishable = "all"
+cases = [
+  { case = "service-exact, probe-exact, filtered-exact, filtered-ranked-exact, highfanout-exact", verdict = "same", note = "25 query comparisons within the thresholds; bags, ranks and scores equal" },
+  { case = "filtered-auto, filtered-ranked-auto, highfanout-auto", verdict = "wrong", note = "recall below 0.90 on both sides (first filtered pair 0.54 and 0.46, separately built graphs): no timing" },
+  { case = "recall diagnostic, one graph", verdict = "no-verdict", note = "the collector keeps all 24 available winners; 26 never reach it. Second graph: Auto 24/50, effort 256 34/50, candidate-first 50/50" },
+]
+findings = [
+  "Missing approximate hits are lost before the collector, in the search; candidate-first routing finds them at a different effort, so its cost is still to qualify.",
+]

@@ -54,7 +54,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use nrese_owl::{Axiom, Characteristic, ClassExpr, Concept, Normalised, ObjProp, Ontology, Term};
+use nrese_owl::{Axiom, Characteristic, ClassExpr, Normalised, ObjProp, Ontology, Term};
 
 use super::program::{
     Approximations, Atom, Names, Origin, Program, Provenance, Rule, Signature, Slot,
@@ -152,7 +152,7 @@ pub fn compile_with(
     for (index, axiom) in ontology.axioms.iter().enumerate() {
         c.axiom(index, axiom);
     }
-    c.assertions();
+    c.assertions(ontology);
     c.thing(named_individual);
     c.bottom([bottom_object, bottom_data]);
     c.equality();
@@ -353,7 +353,7 @@ impl Compiler<'_> {
     }
 
     /// The ABox axioms whose meaning the input triples don't state in U1's vocabulary.
-    fn assertions(&mut self) {
+    fn assertions(&mut self, ontology: &Ontology) {
         let facts = &self.normalised.facts;
         let bottom = |source: usize| Provenance {
             origin: Origin::Assertion,
@@ -364,11 +364,17 @@ impl Compiler<'_> {
             },
         };
         for &(concept, a, source) in &facts.concepts {
-            if let Concept::Fresh(q) = concept {
-                let class = self.program.names.fresh[q as usize];
-                let fact = [a, self.program.names.rdf_type, class];
-                self.program.facts.push((fact, assertion(source)));
+            let class = self.concept(concept);
+            // Only the original named assertion is already in the input RDF. A complex
+            // expression may normalise to a named concept whose membership is missing.
+            if let Axiom::ClassAssertion(expr, individual) = &ontology.axioms[source]
+                && *individual == a
+                && matches!(ontology.classes.get(expr.0), ClassExpr::Class(c) if *c == class)
+            {
+                continue;
             }
+            let fact = [a, self.program.names.rdf_type, class];
+            self.program.facts.push((fact, assertion(source)));
         }
         // Differences and negative assertions as facts over U1's own predicates, with
         // one `⊥` rule per predicate: linear in the assertions (a rule per pair made

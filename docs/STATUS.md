@@ -8,10 +8,53 @@ in the branch), **deferred** (not done, with the reason and where it went), or *
   [capability matrix](spec/06-target-capability-matrix.md).
 - Why and in which order: [the roadmap](ROADMAP.md); the designs in [design/](design/).
 
-Last updated: 6 October 2026, branch `refactor/engine-v2`. What is left before v2 goes to
-`main`, with owners and state, is the status table of the
-[merge checklist](plan/2026-10-05-v2-merge-checklist.md) §1; the rows below are the record
-by goal.
+What is left before v2 goes to `main`, with owners and state, is the status table of the
+[merge checklist](plan/2026-10-05-v2-merge-checklist.md) §1; the sections from "Audit
+work" on are the record by goal.
+
+## Execution and performance (PR #23)
+
+The PR's implementation base is `0f46563`. The measurements are rows of the
+[lab log](design/performance.md#6-lab-log-of-the-performance-phase-from-5-october-2026),
+each with its run record.
+
+| Area | Implemented | Open |
+|---|---|---|
+| QL preparation and cache identity | One preparation per execution snapshot, its report kept with the result; compiler input identified by the exact schema; failed probes never cached as negative answers | Schema reading and rewriting don't poll cancellation |
+| Cancellation and deadlines | A request's flag reaches nested DL work; one absolute deadline covers pending and prior consistency checks and rejection evidence | Normalisation and compilation don't poll |
+| Execution | Queries run on their caller; parallel kernels on Rayon's global pool; one catalog-wide native query budget; `Workers` sets only the DL batch width; one RAII reservation type | Query progress when a Rayon worker would wait on a cache flight ([proposal](design/research-designs.md#8-query-progress-under-shared-cache-waits-proposal)) |
+| Context task memory | Optional owner-based capacity estimates sampled at work checkpoints, incremental index totals, message payloads that carry their charge; `dl.memory = 0` is unlimited | Can overshoot; excluded allocations; no whole-operation envelope |
+| Atomic reasoning updates | Split and revival closure run in the pending transaction and its gates; the post-commit repair is gone | The whole-dataset fallback holds the writer slot (unmeasured; `eq-giant-split` times it); incremental split maintenance |
+| Kernels and allocation | Moving projection, shared forward search, direct raw spill, ordered dedup without a sort; one SPARQL numeric implementation | Work and copy savings carry no end-to-end timing claim |
+| DL bounds and exact work | ID-level results with dictionary checks; a true lower ASK skips the upper evaluation; one compiled program per candidate batch | Base search and compilation repeated between batches; the upper table is materialised; no whole-request memory ceiling |
+| DL classification and realisation | The initial search kept as Base; one fallback allowance; realisation reuses the deterministic start; only complete results cached | Stages compile separately; cooperative checkpoints; partial aggregate counters |
+| Process memory | The server installs the process limit; store-local watches reach bounds and diagnostics | Cooperative only; task capacity and process memory are separate contracts |
+| Benchmarks | Fast suite with exact counters and QPS per width; [hosts.toml](../benches/hosts.toml); one run-record schema; the answer recorder (strict and value matches, legal `LIMIT` subsets) | One case registry, one result row and one `compare` ([benches/README.md](../benches/README.md#where-this-stands)); checkpointed level-3 chunks |
+
+### Open work
+
+- **Performance acceptance against `0f46563`:** Horn context saturation is about 6 %
+  slower, serial and at 16 threads, with the retained accounting; there is no 95-case
+  matrix of the final revision ([run record](../benches/runs/2026-10-11-horn-recovery.toml)).
+- **Resource ownership in `nrese-dl`:** `context::Engine::with_budget` after contexts exist
+  doesn't rebuild accounting; detached `Individuals` keep their original owner; public
+  mutation of `Individuals.contexts` isn't tracked. Retained results, changed policy,
+  historical peaks and sticky exhaustion need an API contract first.
+- **Memory envelope:** DL compilation scratch, task budgets and the query budget are
+  separate; one request has no shared end-to-end envelope.
+- **Query progress:** see the proposal above; a decision is needed.
+- **Vector search:** approximate recall under a filter fails its gate (0.40 at k = 10);
+  candidate-first routing finds the missing hits, its cost unqualified.
+- **Competitor answers:** rerun with the committed recorder to decide the unordered
+  `LIMIT` case; Konclude intermittently drops 107 asserted pairs from the Horn reference
+  taxonomy, cause unknown.
+- **Measurement:** container lifetime peaks (cgroup) on office-pc need system-manager
+  permissions; a large-answer recorder that streams instead of retaining; the result
+  cache's overhead (keys, ranking, ID copies, encoding) is unattributed.
+- **Later structure:** the physical plan executed directly ([query-plan.md](design/query-plan.md)),
+  calibrated routing, NUMA, GPU and distribution ([hardware-and-scaling.md](design/hardware-and-scaling.md)).
+- **GraphDB:** 1M/10M writes, sustained timing and incremental reasoning
+  ([coverage](../benches/runs/2026-10-09-graphdb-coverage.toml)).
 
 ## Audit work (the outside audit of 2 October)
 

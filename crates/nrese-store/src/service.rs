@@ -62,6 +62,27 @@ pub struct StoreService {
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
 const REASONING_MARKER: &str = "reasoning.state";
 
+/// The memory stop of one operation ([`StoreService::memory_stop`]).
+pub(crate) struct MemoryStop(Option<nrese_exec::memory::MemoryWatch>);
+
+impl MemoryStop {
+    pub(crate) fn exceeded(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(nrese_exec::memory::MemoryWatch::exceeded)
+    }
+
+    /// The error of a stop this caused, if it caused one.
+    pub(crate) fn error(&self) -> Option<crate::StoreError> {
+        self.0
+            .as_ref()
+            .filter(|watch| watch.exceeded())
+            .map(|watch| crate::StoreError::ProcessMemoryLimit {
+                limit: watch.limit(),
+            })
+    }
+}
+
 impl fmt::Debug for StoreService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StoreService")
@@ -73,12 +94,20 @@ impl fmt::Debug for StoreService {
 
 impl StoreService {
     pub fn new(config: StoreConfig) -> StoreResult<Self> {
+        let runtime = std::sync::Arc::new(crate::Runtime::new(config.total_query_memory_bytes));
+        Self::with_runtime(config, runtime)
+    }
+
+    /// Opens a store on resources shared with other stores. A catalog uses this for
+    /// every repository; embedded applications can supply the same owner explicitly.
+    /// The runtime's budget applies, not `config.total_query_memory_bytes`.
+    pub fn with_runtime(
+        config: StoreConfig,
+        runtime: std::sync::Arc<crate::Runtime>,
+    ) -> StoreResult<Self> {
         config.validate()?;
         nrese_engine::set_index_encoding(config.index_encoding);
         nrese_engine::set_vocabulary_encoding(config.vocabulary);
-        // Reasoning stops at the process's memory limit on every path, the DL bounds'
-        // own evaluations included, not only where the store passes its watch.
-        nrese_exec::memory::set_process_limit(config.process_memory_bytes);
         // Only switched off: on leaves what the process was started with (an operator's
         // `MIMALLOC_ALLOW_THP=0` switches them off the same way).
         if !config.huge_pages {
@@ -109,8 +138,7 @@ impl StoreService {
         let settings = crate::query_executor::StoreSettings {
             union_default_graph: config.union_default_graph,
             geosparql_stated_only: config.geosparql_stated_only,
-            query_memory: (config.total_query_memory_bytes > 0)
-                .then(|| nrese_sparql::SharedBudget::new(config.total_query_memory_bytes)),
+            runtime,
             services: std::sync::Arc::default(),
             equality_closed: std::sync::Arc::default(),
             equality_canonical: config.equality_canonical_answers,
@@ -333,10 +361,11 @@ impl StoreService {
 
     /// What this store's updates are evaluated with.
     fn update_context<'a>(
-        &self,
+        &'a self,
         cancellation: &'a CancellationToken,
     ) -> crate::mutation::command::UpdateContext<'a> {
         crate::mutation::command::UpdateContext {
+            runtime: self.runtime(),
             cancellation,
             union_default_graph: self.config.union_default_graph,
             geosparql_stated_only: self.config.geosparql_stated_only,
@@ -466,20 +495,10 @@ impl StoreService {
         let prepared = self.prepare_query(request)?;
         let mut payload = Vec::new();
         let mut completeness = None;
-        self.run_query_reporting(
-            &prepared,
-            &CancellationToken::new(),
-            &mut payload,
-            |status| completeness = status,
-        )?;
-        let ql = match self.dl_mode(&prepared) {
-            Some(_) => None,
-            None => crate::query_executor::ql_status(
-                &self.read_snapshot(prepared.access()),
-                &prepared,
-                &self.settings,
-            ),
-        };
+        let cancellation = CancellationToken::new();
+        let (_, ql) = self.run_reporting(&prepared, &cancellation, &mut payload, |status| {
+            completeness = status
+        })?;
         Ok(SerializedQueryResult {
             kind: prepared.kind(),
             media_type: prepared.media_type(),
@@ -630,7 +649,7 @@ impl StoreService {
         out: impl std::io::Write,
     ) -> StoreResult<Option<(nrese_sparql::Completeness, crate::dl::DlDetail)>> {
         let mut status = None;
-        let detail = self.run_reporting(prepared, cancellation, out, |s| status = s)?;
+        let (detail, _) = self.run_reporting(prepared, cancellation, out, |s| status = s)?;
         Ok(status.map(|s| (s, detail.unwrap_or_default())))
     }
 
@@ -640,70 +659,65 @@ impl StoreService {
         cancellation: &CancellationToken,
         out: impl std::io::Write,
         report: impl FnOnce(Option<nrese_sparql::Completeness>),
-    ) -> StoreResult<Option<crate::dl::DlDetail>> {
+    ) -> StoreResult<(
+        Option<crate::dl::DlDetail>,
+        Option<nrese_sparql::ql::QlReport>,
+    )> {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         if let Some(mode) = self.dl_mode(prepared) {
             use crate::dl::query::{Outcome, Read};
             let dl = format!("owl2-dl {mode:?}");
-            return Ok(Some(
-                match crate::dl::query::answer(self, prepared, cancellation, mode)? {
-                    Outcome::Answers(answers, status, detail) => {
-                        report(Some(status));
-                        crate::query_executor::write_answers(prepared, answers, out)?;
-                        detail
-                    }
-                    // Streamed over the snapshot the status was decided on (L's view where
-                    // L adds memberships, kept per revision, whose identity is its own),
-                    // never a later revision's.
-                    Outcome::Stream(status, Read::Lower(snapshot) | Read::At(snapshot), detail) => {
-                        let context = format!("{dl} {status:?}");
-                        report(Some(status));
-                        run_query(
-                            &snapshot,
-                            prepared,
-                            &self.settings,
-                            cancellation,
-                            out,
-                            &context,
-                        )?;
-                        detail
-                    }
-                    // A status that holds whatever the revision (sound only).
-                    Outcome::Stream(status, Read::Latest, detail) => {
-                        let context = format!("{dl} {status:?}");
-                        report(Some(status));
-                        let snapshot = self.read_snapshot(prepared.access());
-                        run_query(
-                            &snapshot,
-                            prepared,
-                            &self.settings,
-                            cancellation,
-                            out,
-                            &context,
-                        )?;
-                        detail
-                    }
-                },
-            ));
+            let detail = match crate::dl::query::answer(self, prepared, cancellation, mode)? {
+                Outcome::Answers(answers, status, detail) => {
+                    report(Some(status));
+                    crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
+                    detail
+                }
+                // Streamed over the snapshot the status was decided on (L's view where
+                // L adds memberships, kept per revision, whose identity is its own),
+                // never a later revision's; or, for a status that holds whatever the
+                // revision (sound only), over the latest.
+                Outcome::Stream(status, read, detail) => {
+                    let snapshot = match read {
+                        Read::Lower(snapshot) | Read::At(snapshot) => snapshot,
+                        Read::Latest => self.read_snapshot(prepared.access()),
+                    };
+                    let context = format!("{dl} {status:?}");
+                    run_query(
+                        &snapshot,
+                        prepared,
+                        &self.settings,
+                        cancellation,
+                        out,
+                        |_| {
+                            report(Some(status));
+                            context
+                        },
+                    )?;
+                    detail
+                }
+            };
+            return Ok((Some(detail), None));
         }
         let snapshot = self.read_snapshot(prepared.access());
-        let status = match crate::query_executor::ql_status(&snapshot, prepared, &self.settings) {
-            Some(ql) => Some(ql.completeness),
-            None => self.status_without_dl(prepared),
-        };
-        let context = format!("{status:?}");
-        report(status);
-        run_query(
+        let ql = run_query(
             &snapshot,
             prepared,
             &self.settings,
             cancellation,
             out,
-            &context,
+            |ql| {
+                let status = ql
+                    .map(|ql| ql.completeness.clone())
+                    .or_else(|| self.status_without_dl(prepared));
+                let context = format!("{status:?}");
+                report(status);
+                context
+            },
         )?;
-        Ok(None)
+        Ok((None, ql))
     }
 
     /// Outside `owl2-dl`, the status of answers that read a ruleset's closure (`None`
@@ -747,6 +761,10 @@ impl StoreService {
     /// What every query gets from the store.
     pub(crate) fn query_settings(&self) -> &crate::query_executor::StoreSettings {
         &self.settings
+    }
+
+    pub fn runtime(&self) -> &std::sync::Arc<crate::Runtime> {
+        &self.settings.runtime
     }
 
     /// Runs a prepared query on the latest snapshot to completion and reports how it ran:
@@ -815,7 +833,7 @@ impl StoreService {
     /// once, and the limit; `None` without a limit
     /// ([`StoreConfig::total_query_memory_bytes`]).
     pub fn query_memory(&self) -> Option<(usize, usize, usize)> {
-        let budget = self.settings.query_memory.as_ref()?;
+        let budget = self.settings.runtime.query_memory()?;
         Some((budget.used(), budget.peak(), budget.limit()))
     }
 
@@ -944,33 +962,43 @@ impl StoreService {
             .iter()
             .any(|op| !matches!(op, crate::StatementOp::Add { .. }));
         self.with_pending(pending, &scope, cancellation, |snapshot| {
-            let mut status = match in_dl {
-                true => {
-                    let mut status =
-                        nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
-                    status.incomplete(
+            run_query(
+                snapshot,
+                prepared,
+                &self.settings,
+                cancellation,
+                out,
+                |ql| {
+                    let mut status = match in_dl {
+                        true => {
+                            let mut status =
+                                nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
+                            status.incomplete(
                         "dl",
                         "a read inside a transaction: its pending operations aren't reasoned \
                          over before the commit (the committed closure, no DL bounds)"
                             .to_owned(),
                     );
-                    Some(status)
-                }
-                false => crate::query_executor::ql_status(snapshot, prepared, &self.settings)
-                    .map(|ql| ql.completeness)
-                    .or_else(|| self.status_without_dl(prepared)),
-            };
-            if deletes && let Some(status) = &mut status {
-                status.unsound(
-                    "transaction",
-                    "the pending operations may delete statements whose inferences remain \
+                            Some(status)
+                        }
+                        false => ql
+                            .map(|ql| ql.completeness.clone())
+                            .or_else(|| self.status_without_dl(prepared)),
+                    };
+                    if deletes && let Some(status) = &mut status {
+                        status.unsound(
+                            "transaction",
+                            "the pending operations may delete statements whose inferences remain \
                      until the commit"
-                        .to_owned(),
-                );
-            }
-            // A transaction's pending state: never answered from the cache.
-            report(status);
-            run_query(snapshot, prepared, &self.settings, cancellation, out, "")
+                                .to_owned(),
+                        );
+                    }
+                    // A transaction's pending state: never answered from the cache.
+                    report(status);
+                    String::new()
+                },
+            )
+            .map(|_| ())
         })
     }
 
@@ -1375,18 +1403,22 @@ impl StoreService {
         }
     }
 
-    /// The closure's size with equality replicated and over representatives, for
-    /// `program` on the asserted data ([`crate::reasoning::equality_report`]).
-    /// A watch over the process's memory limit; `None` without a limit.
-    pub(crate) fn memory_watch(&self) -> Option<nrese_exec::memory::MemoryWatch> {
+    /// An operation's stop under this store's process-memory policy; zero disables it.
+    /// Opening a store never changes the process owner's global safety fallback.
+    pub(crate) fn memory_stop(&self) -> MemoryStop {
         let limit = self.config.process_memory_bytes;
-        (limit > 0).then(|| nrese_exec::memory::MemoryWatch::new(limit))
+        MemoryStop((limit > 0).then(|| nrese_exec::memory::MemoryWatch::new(limit)))
     }
 
+    /// The closure's size with equality replicated and over representatives, for
+    /// `program` on the asserted data, or an explicit diagnostic if stopped.
     pub fn equality_report(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> String {
+        let memory = self.memory_stop();
+        let stop = || memory.exceeded();
         let tx = self.engine.transaction();
         let program = crate::reasoning::Program::compile(&program.into(), &|term| tx.intern(term));
-        crate::reasoning::equality_report(&program, tx.base())
+        nrese_reasoner::engine::equality_report_until(&program, tx.base(), &stop)
+            .unwrap_or_else(|_| "equality: stopped by the process memory limit".to_owned())
     }
 
     /// Replaces the inferred stack with `program`'s closure over the asserted data, as one
@@ -1420,13 +1452,12 @@ impl StoreService {
                 .hiding_unnamed_classes(self.config.hide_unnamed_classes)
                 .by_representatives(self.config.equality_by_representatives)
                 .storing_representatives(self.config.equality_compact);
-        let watch = self.memory_watch();
-        let stop = || stop() || watch.as_ref().is_some_and(|watch| watch.exceeded());
-        let stopped = || match &watch {
-            Some(watch) if watch.exceeded() => crate::StoreError::ProcessMemoryLimit {
-                limit: watch.limit(),
-            },
-            _ => crate::StoreError::MaterialisationCancelled,
+        let memory = self.memory_stop();
+        let stop = || stop() || memory.exceeded();
+        let stopped = || {
+            memory
+                .error()
+                .unwrap_or(crate::StoreError::MaterialisationCancelled)
         };
         let closure =
             crate::reasoning::materialise_until(&program, rematerialisation.base(), &stop)

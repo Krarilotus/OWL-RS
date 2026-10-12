@@ -155,6 +155,7 @@ impl MutationPipeline {
             return Err(MutationError::Cancelled);
         }
         let context = crate::mutation::command::UpdateContext {
+            runtime: self.store.runtime(),
             cancellation: ticket.evaluation_token(),
             union_default_graph: self.store.config().union_default_graph,
             geosparql_stated_only: self.store.config().geosparql_stated_only,
@@ -184,19 +185,13 @@ impl MutationPipeline {
             // A cancelled request stops the reasoning; dropping `tx` then discards both
             // the asserted and the inferred changes, and releases the writer.
             // So does the process's memory limit: the commit is refused, not the machine.
-            let watch = self.store.memory_watch();
-            let over = || watch.as_ref().is_some_and(|watch| watch.exceeded());
-            let stop = || ticket.is_cancelled() || over();
+            let memory = self.store.memory_stop();
+            let stop = || ticket.is_cancelled() || memory.exceeded();
             let (violations, materialisation, changed) =
                 crate::reasoning::apply_delta(program, cached, &mut tx, &stop).map_err(|_| {
-                    match &watch {
-                        Some(watch) if watch.exceeded() => {
-                            store_error(StoreError::ProcessMemoryLimit {
-                                limit: watch.limit(),
-                            })
-                        }
-                        _ => MutationError::Cancelled,
-                    }
+                    memory
+                        .error()
+                        .map_or(MutationError::Cancelled, &store_error)
                 })?;
             tracing::debug!(?materialisation, "commit-path materialisation");
             crate::reasoning::log_diagnostics(
@@ -316,12 +311,6 @@ impl MutationPipeline {
                 }
             }
             drop(ground);
-            // A class left out became consumable: its memberships are computed in full.
-            if materialisation.needs_rematerialisation
-                && let Err(error) = self.store.rematerialise(&rules)
-            {
-                tracing::error!(%error, "rematerialisation for an unnamed class that became used failed");
-            }
             // In quarantine the commit checked only its own facts: revalidate everything, so
             // the store leaves quarantine once the data is repaired. The commit itself stands.
             if matches!(

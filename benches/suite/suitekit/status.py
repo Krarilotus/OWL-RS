@@ -20,11 +20,11 @@ from .ledger import load_records
 from .workloads import DEFINITIONS, plans
 
 MARK = {"ok": "ok", "partial": "part", "wrong": "WRONG", "failed": "FAIL", "timeout": "T/O",
-        "skipped": "skip", "restricted": "ran*", "disputed": "≠?"}
+        "skipped": "skip", "restricted": "ran*", "disputed": "≠?", "hangs": "hang"}
 LEGEND = ("`ok` every repetition loaded, every step and query execution ok · `part` a load, step or query execution failed or timed out in some repetition · `WRONG` an answer count "
           "differs from the expected one · `FAIL`/`T/O` the load failed or timed out · `skip` the "
           "suite skipped it (reason in the record) · `≠?` its answers differ from another system's, "
-          "not yet adjudicated · `ran*` ran; a licensed system whose outcome "
+          "not yet adjudicated · `hang` a comparator gave no answer in a past run · `ran*` ran; a licensed system whose outcome "
           "stays local · `·` can run, never run · `–` lacks a capability · `n/a` no adapter or kit "
           "for it")
 
@@ -211,11 +211,13 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
     out += ["## Runs", "", "Newest first; the records are in [runs/](runs/).", "",
             "| Run | Started | Kit | Host | Commit | Pairs | Purpose |", "|---|---|---|---|---|---|---|"]
     for r in sorted(records, key=lambda r: str(r.get("started", "")), reverse=True):
-        commit = str(r.get("commit", "?"))
+        commit = str(r.get("commit") or (r.get("candidate") or {}).get("commit", "?"))
         commit = commit[:10] if len(commit) >= 40 else commit
+        host = r.get("host", "")
+        host = ", ".join(host) if isinstance(host, list) else host
         pairs = [p for p in r.get("pairs", []) if p["outcome"] != "skipped"]
         out.append(f"| [{r['id']}](runs/{r['id']}.toml) | {str(r.get('started', ''))[:16]} | {r.get('kit', 'suite')} | "
-                   f"{r.get('host', '')} | {commit} | {len(pairs)} | {r.get('purpose', '')} |")
+                   f"{host} | {commit} | {len(pairs)} | {r.get('purpose', '')} |")
     out.append("")
     return "\n".join(out)
 
