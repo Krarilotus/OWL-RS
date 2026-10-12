@@ -293,13 +293,20 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
                     out.add("Answers and completeness", f"{'':<28}{path}: {'/'.join(map(str, b['checks'][path]))} -> "
                             f"{'/'.join(map(str, n['checks'][path]))}")
             if b["frontiers"] and n["frontiers"]:
-                fb, fn = b["frontiers"][0], n["frontiers"][0]
-                worse = fb["status"] == "ok" and fn["status"] != "ok"
-                pb, pn = fb.get("peak_mib"), fn.get("peak_mib")
+                # Every repetition's run past the limit: its statuses, the medians of its metric and
+                # peak (one run alone is one sample; the A/B of 12 Oct 2026 had a 4,032 MiB first
+                # run beside three of 5,112-5,153).
+                def past(entry):
+                    runs = entry["frontiers"]
+                    numbers = [[f.get(k) for f in runs if isinstance(f.get(k), (int, float))] for k in ("metric", "peak_mib")]
+                    return ({f["status"] for f in runs}, *(statistics.median(v) if v else None for v in numbers))
+                (sb, mb, pb), (sn, mn, pn) = past(b), past(n)
+                worse = "ok" in sb and sn != {"ok"}
                 worse |= bool(pb and pn and pn > pb * 1.10 and pn - pb > 64)
                 out.add("Answers and completeness",
-                        f"{'':<28}past its limit: {fb['status']} -> {fn['status']}, metric {fb.get('metric')} -> "
-                        f"{fn.get('metric')}, peak {pb} -> {pn} MiB" + ("  WORSE" if worse else ""), worse)
+                        f"{'':<28}past its limit ({len(b['frontiers'])} and {len(n['frontiers'])} runs, medians): "
+                        f"{','.join(sorted(sb))} -> {','.join(sorted(sn))}, metric {mb} -> {mn}, peak {pb} -> {pn} MiB"
+                        + ("  WORSE" if worse else ""), worse)
             continue
         shapes = [set(rep) for e in (b, n) for rep in e["reps"]]
         if (any(len(e["reps"]) != len(e["status"]) for e in (b, n)) or not shapes

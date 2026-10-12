@@ -1,6 +1,6 @@
 # Benchmark status
 
-Generated 2026-10-11 by `python benches/suite/suite.py status --write` from [suite/systems.toml](suite/systems.toml), [suite/workloads.toml](suite/workloads.toml) and the run records in [runs/](runs/README.md). Don't edit it by hand: change those and regenerate. How to read and extend it: [README.md](README.md).
+Generated 2026-10-12 by `python benches/suite/suite.py status --write` from [suite/systems.toml](suite/systems.toml), [suite/workloads.toml](suite/workloads.toml) and the run records in [runs/](runs/README.md). Don't edit it by hand: change those and regenerate. How to read and extend it: [README.md](README.md).
 
 ## At a glance
 
@@ -8,7 +8,7 @@ Generated 2026-10-11 by `python benches/suite/suite.py status --write` from [sui
 - **Systems:** 20 (16 free to publish, 4 only with the vendor's permission)
 - **Pairs** (standard tier × system that can run it; build variants apart): 292; run at least once: 98; ok on their newest run: 76
 - **NRESE:** 17 of its 47 standard tiers ok on their newest run
-- **Run records:** 28, newest 2026-10-11
+- **Run records:** 31, newest 2026-10-12
 
 ## Coverage
 
@@ -389,6 +389,7 @@ Newest first; the records are in [runs/](runs/).
 
 | Run | Started | Kit | Host | Commit | Pairs | Purpose |
 |---|---|---|---|---|---|---|
+| [2026-10-12-pr23-acceptance-ab-phuoc](runs/2026-10-12-pr23-acceptance-ab-phuoc.toml) | 2026-10-12T10:51 | fast | phuoc-yu | aabd47a732 | 0 | PR #23's acceptance: the whole fast suite on base 157931a and the consolidated takeover/pr23 (aabd47a), no regression in time or space allowed |
 | [2026-10-11-fast-inputs-office](runs/2026-10-11-fast-inputs-office.toml) | 2026-10-11T23:40 | fast | office-pc | 133ac6d | 0 | Why nine fast cases failed their checks on the base and the PR alike in the 11 October A/B on office-pc, and the harness fix |
 | [2026-10-11-answer-replay-dc2114a](runs/2026-10-11-answer-replay-dc2114a.toml) | 2026-10-11 | suite (answers.py) | office-pc | 133ac6d | 0 | The 10 October competitor answer captures reclassified with the committed recorder: each system against one reference, strict and value matches apart |
 | [2026-10-11-horn-recovery](runs/2026-10-11-horn-recovery.toml) | 2026-10-11 | reasoning/dl and fast classify-store-horn | phuoc-yu | dc2114a0f0 | 0 | Horn context accounting by sampled local capacity instead of per-message shared reservations (candidate K), against the original base |
@@ -417,3 +418,5 @@ Newest first; the records are in [runs/](runs/).
 | [2026-10-02-nrese-current](runs/2026-10-02-nrese-current.toml) | 2026-10-02T06:03 | suite | Kraris-GPTler | unknown (before run manifests) | 9 | NRESE at the head of 2 October on the standard tiers (one run): the baseline for the regression checks |
 | [2026-10-02](runs/2026-10-02.toml) | 2026-10-02T00:06 | suite | Kraris-GPTler | unknown (before run manifests) | 48 | The comparison batch: the basics mix on five datasets, LUBM 1/10/100 and OWL2Bench RL-1 on every system with an adapter (YAGO tiny's data was missing: rerun in 2026-10-02-yago) |
 | [2026-10-01](runs/2026-10-01.toml) | 2026-10-01T19:44 | suite | Kraris-GPTler | unknown (before run manifests) | 15 | First full suite run: LUBM, OWL2Bench RL and the olympics mix on every system with an adapter; NRESE on Oxigraph as the pre-migration baseline |
+| [2026-10-12-horn-takeover-dl](runs/2026-10-12-horn-takeover-dl.toml) |  | reasoning/dl (dl_classify, context_classify) | Phuoc-Yu | 8b2dee9 | 0 | Horn saturation after consolidating the context engine's budget checks and capacity observations (review tmp/pr23-review/dl-reasoner.md section 2) |
+| [2026-10-12-sparql-consolidation](runs/2026-10-12-sparql-consolidation.toml) |  | fast | Office-PC | e9eb4ee | 0 | PR #23 SPARQL/exec consolidation: the base comparison of the cases the 11 Oct A/B flagged (open-first-query +12 %, kernel-intersect and op-negation memory), and whether the generic evaluate path through SolutionTable caused them |
