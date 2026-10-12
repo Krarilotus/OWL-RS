@@ -44,7 +44,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
-from suitekit import manifest  # noqa: E402
+from suitekit import hosts, manifest  # noqa: E402
 from suitekit.workloads import fast_data_name  # noqa: E402
 
 DATA_VOLUME = "nrese-fast-data"
@@ -192,7 +192,24 @@ def data_file(spec: str) -> str:
     return ("/data/" if spec.startswith("volume:") else "/fast/") + fast_data_name(spec)
 
 
-ORE_DIR = Path(os.environ.get("NRESE_ORE_DIR", ROOT.parent.parent / "OWL-RS" / ".cache" / "ore2015" / "pool_sample" / "files"))
+# Verified inputs on this host (benches/hosts.toml; the variables override): the ORE corpus,
+# and a read-only copy of the data volume's converted ontologies and reference taxonomies.
+ORE_DIR = hosts.input_path("ore")
+FAST_INPUTS = hosts.input_path("fast")
+
+
+def seed_from_inputs(target: str) -> bool:
+    """Copies `/fast/<relative>` from the verified inputs into the data volume when the volume
+    lacks it and the inputs have it; whether the volume has it now."""
+    if docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "test", "-s", target]).returncode == 0:
+        return True
+    relative = target.removeprefix("/fast/")
+    if FAST_INPUTS is None or not (FAST_INPUTS / relative).is_file():
+        return False
+    print(f"  copying {relative} from {FAST_INPUTS}", flush=True)
+    docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "-v", f"{host_path(FAST_INPUTS)}:/inputs:ro", "alpine",
+            "sh", "-c", f"mkdir -p {Path(target).parent.as_posix()} && cp /inputs/{relative} {target}"])
+    return docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "test", "-s", target]).returncode == 0
 
 
 def ensure_data(spec: str) -> dict:
@@ -226,12 +243,12 @@ def ensure_ore(name: str):
     """An ORE 2015 ontology (functional syntax, from the corpus cache; CC BY-NC-ND, never
     committed) converted once to N-Triples by the DL kit's runner, for the NRESE tools."""
     target = f"/fast/ore/{name}.nt"
-    found = docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "alpine", "test", "-s", target])
-    if found.returncode == 0:
+    if seed_from_inputs(target):
         return
+    if ORE_DIR is None or not (ORE_DIR / f"{name}.owl").exists():
+        raise RuntimeError(f"missing input: {name}.owl, ORE 2015 corpus at {ORE_DIR or 'no path'} "
+                           "(benches/hosts.toml inputs.ore, or NRESE_ORE_DIR)")
     source = ORE_DIR / f"{name}.owl"
-    if not source.exists():
-        raise RuntimeError(f"{source} is missing: set NRESE_ORE_DIR to the ORE 2015 corpus (benches/reasoning/dl/ore.py)")
     print(f"  converting {name} to N-Triples", flush=True)
     script = (f"mkdir -p /fast/ore && cp /ore/{name}.owl /fast/ore/{name}.owl && "
               f"printf '{name}\\tconvert\\tntriples\\t/fast/ore/{name}.owl\\n' > /fast/ore/{name}.manifest.tsv")
@@ -496,7 +513,12 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
             record["status"] = classify_failure(code, err, result)
             record["notes"].append(err.strip()[-300:])
         elif case.get("reference"):
-            result["taxonomy_equal"] = same_taxonomy(case)
+            if seed_from_inputs(case["reference"]):
+                result["taxonomy_equal"] = same_taxonomy(case)
+            else:  # no oracle is a missing input, not a wrong answer
+                record["status"] = "failed"
+                record["notes"].append(f"missing input: reference taxonomy {case['reference']} "
+                                       "(fast.py compete writes it; benches/hosts.toml inputs.fast)")
     record["metric"] = metric_value(case, result)
     record["samples"] = samples(case, result)
     record["counters"] = counters(case, result)
@@ -747,6 +769,8 @@ def vector_recall(case: dict, expect: dict) -> float:
 # --- run -------------------------------------------------------------------------------------
 
 def run(args) -> int:
+    if lacking := hosts.lacking(["docker"]):
+        sys.exit(f"this host lacks {', '.join(lacking)} (benches/hosts.toml): the fast suite runs every case in Docker")
     cases = select(load_cases(), args)
     label = args.label or (manifest.git(ROOT).get("commit") or "nrese")[:8]
     started = datetime.datetime.now()

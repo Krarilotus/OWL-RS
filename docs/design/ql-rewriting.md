@@ -87,12 +87,10 @@ known through a source read; *ours* = measured or tested here).
 
 ## 2. What it reads, and how it combines with the closure
 
-**Current lifecycle (9 October).** Realised-witness results are scoped to the same
-snapshot identity. A failed or budget-skipped probe is not cached as a negative answer;
-a later request can retry it. Preparation, reporting and execution share the lifecycle
-in §1; the old separate status preparation and error-swallowing wrapper are removed.
-Cancellation at evaluator boundaries does not yet make every schema scan or rewriting
-loop interruptible.
+**Lifecycle.** Realised-witness results are scoped to the same snapshot identity. A
+failed or budget-skipped probe is not cached as a negative answer; a later request can
+retry it. Preparation, reporting and execution share the lifecycle in §1. Cancellation
+is checked at evaluator boundaries; schema scans and rewriting loops don't poll it.
 
 **The QL part of the TBox.** From every axiom, what OWL 2 QL can say (with three harmless
 generalisations):

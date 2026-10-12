@@ -8,27 +8,110 @@ has been measured so far. Start here.
 | What is measured, what isn't, and how did it last come out? | [STATUS.md](STATUS.md), generated: `python benches/suite/suite.py status --write` |
 | How is it measured, and why can the numbers be trusted? | [PROTOCOL.md](PROTOCOL.md): the rules every kit follows |
 | Which benchmarks exist in each field, what do they cost, and which do we run? | [CATALOG.md](CATALOG.md) |
-| What did a given run cover, on which commit and machine? | [runs/](runs/README.md): one record per run |
+| What did a given run cover, on which commit and host? | [runs/](runs/README.md): one record per run |
 | Which workloads and systems exist, and which pair can run? | [suite/workloads.toml](suite/workloads.toml), [suite/systems.toml](suite/systems.toml); `suite.py` prints the matrix |
-| How do I run something? | §"A run, step by step" below |
-| Did a change make NRESE slower? | `fast/fast.py run` then `fast/fast.py compare BASE NEW` (the fast suite, under an hour); `suite.py compare BASE NEW` (suite runs), `perf-lab-compare.py` (perf lab), the kits' own `compare` |
+| Which host does what, and where are the verified inputs? | [hosts.toml](hosts.toml) |
+| Did a change make NRESE slower? | level 2 below: `fast/fast.py run`, then `fast/fast.py compare BASE NEW` |
 
-## The hierarchy
+## Four levels
+
+Each level answers its own question, at its own cost. A change goes down the levels as far
+as its risk needs; a level's evidence never stands in for a lower one's.
+
+| Level | Question | Size | Driver | Runs on |
+|---|---|---|---|---|
+| 1. Unit | Does each function keep its contract and its work bound? | seconds per crate | `cargo test`; the guards of [performance.md §0](../docs/design/performance.md#0-wins-to-keep-check-these-before-a-rewrite-and-guard-them) (exact counts, plan shapes) | every commit (the gate, [CONTRIBUTING.md](../CONTRIBUTING.md)) |
+| 2. Focused | Did this change make its area faster, slower or wrong? | minutes to an hour: the cases of one area, chainable | `fast.py run --cases …` / `--areas …`, then `compare` against the same host's baseline | a `measure` host |
+| 3. Full | Where does a build stand, against its base and against the competitors? | everything, up to a day, in checkpointed chunks | every fast case, every suite workload × system, the DL corpora | a `measure` host, one comparison per host |
+| 4. Cluster | How does it scale past one machine? | later: the Draco cluster with the Zebratlas graph | the suite under Apptainer (`cluster/`) | `draco` |
+
+A level-2 case is cut to one bottleneck (an operator, a ruleset, a kernel) and checks its
+answers and route before its time counts; level 3 runs the same cases and the realistic
+workloads in full, with competitors. Native-capacity, matched-resource and frontier
+scenarios answer different questions ([PROTOCOL.md §3](PROTOCOL.md#3-fairness)): a run
+declares one and reports it apart.
+
+## One model
+
+Every level shares four things, so a case written for level 2 runs unchanged at level 3,
+and every run ends in the same record.
+
+- **A case.** One registry entry: its data (an id in `datasets.toml`, with its SHA-256, or a
+  generator), its task (queries, load, reason, classify, commits, clients), its regime, the
+  systems that may run it, the scenario, what a right answer is (`expect`: an oracle, a
+  count, bag, sequence or legal `LIMIT` subset) and its exact work checks (`guards`: routes
+  and counters), the metric, a timeout and an estimate of its minutes:
+
+  ```toml
+  [[case]]
+  id = "op-group"; areas = ["query", "aggregates"]; levels = ["focused", "full"]
+  data = "dataset:social-people300000"
+  task = "queries:fast/queries/op-group"
+  regime = "none"; scenario = "native"
+  systems = ["nrese", "qlever", "oxigraph", "jena", "virtuoso"]
+  expect = { answers = "oracle:jena", complete = true, order = "bag" }
+  guards = { route = { groups = "has group count" }, counters = {} }
+  metric = "sum_p50_ms"; timeout_s = 120; est_min = 3
+  needs = ["docker"]
+  ```
+
+- **A result row.** [suite/suitekit/schema.py](suite/suitekit/schema.py): identity (run,
+  case, system, version, host, scenario, item, repeat), then the answer (status, complete,
+  rows, answer SHA-256, verdict), then time (ms, phase), memory (peak MiB and its kind:
+  lifetime, cgroup, sampled) and disk (bytes), and the case's counters.
+- **A run record.** [runs/README.md](runs/README.md): the builds compared, the host, the
+  scenario, the inputs and results by SHA-256, a verdict per case.
+- **One `compare`.** Answers and completeness first (status and verdict changes), then
+  time, then memory by its kind, then disk; lost and missing cases are reported before
+  anything else. Its thresholds are in [fast/README.md](fast/README.md#comparing).
+
+Answers are compared by [suite/suitekit/answers.py](suite/suitekit/answers.py)
+(`suite.py run --answers full --answers-reference SYSTEM`): each system against one
+reference, never by majority; `strict_match` and `value_match` apart (a `COUNT` typed
+`xsd:int` is the same value as `xsd:integer`, and the datatype difference is recorded);
+an unordered final `LIMIT` checked as a legal subset of the reference's unlimited answer.
+
+### Where this stands
+
+| Step | State |
+|---|---|
+| Hosts as declared roles: [hosts.toml](hosts.toml), read by `suitekit/hosts.py`; the fast suite takes its inputs from there and refuses a host without Docker | done |
+| Run records in one schema | done |
+| The answer recorder in the suite | done |
+| One case registry: `fast/cases.toml` grows `levels`, `needs`, `expect` and `data = "dataset:…"`; the fast runner moves into `suitekit` as the native plan kind; `fast.py` becomes `suite.py run --level focused` | next |
+| One `compare` over result rows (generalising `fast.py compare`); `suitekit/compare.py`, `perf-lab-compare.py` and `fast/compete.py` retire, the suite running comparators on any case | next |
+| Checkpointed chunks for level 3: resume after a pause, keep the order, never rerun a finished case | next |
+| The result row's answer and memory-kind fields | next |
+| Level 4: `runtime = "apptainer"` on `draco`, Zebratlas as a workload | later |
+
+## Hosts
+
+[hosts.toml](hosts.toml) owns the host facts: each host's roles (`build`, `test`,
+`measure`, `cluster`), what it has (Docker, Java, Apptainer), and the verified inputs under
+the preservation root on the hosts that hold it. Only a `build` host compiles Rust and runs
+the gate (`scripts/lib/remote.sh`, `git config nrese.buildHost`); a `measure`-only host runs
+binaries a build host made, with their source revision and SHA-256 recorded. Inputs are
+used read-only and shared across worktrees; generated data, stores, scratch and results
+live elsewhere. `~/.config/nrese-bench.env` on a host names only what changes per campaign
+(the binaries under test, the results directory), and is sourced explicitly.
+
+## The directory
 
 ```text
 benches/
-├── README.md            this map
+├── README.md            this map and the design
 ├── PROTOCOL.md          the rules: fairness, correctness first, repetitions, statistics, records, publishing
 ├── CATALOG.md           the benchmarks per field: what each measures, its cost, core / representative / later
 ├── STATUS.md            generated: coverage matrix, tier tables, gaps, problems, runs
-├── runs/                one record per run: scope, commit, machine, protocol, outcome per pair (committed)
+├── hosts.toml           the hosts, their roles, the verified inputs
+├── runs/                one record per run (committed)
 ├── baselines/           committed NRESE reference numbers the regression gates compare against
-├── fast/                the fast suite: many small cases, checked and route-checked, under an hour
+├── fast/                the fast cases (levels 2 and 3): checked and route-checked, each its own container
 ├── suite/               the registries and the driver
 │   ├── systems.toml     systems, capabilities, publishing rule, how they start
 │   ├── workloads.toml   workloads, needs, standard tiers, source, licence, check, state
 │   ├── suite.py         CLI: matrix, run, report, compare, ledger, status, images
-│   ├── suitekit/        driver, adapters, runtimes, workload plans, schema, manifest, ledger, status, compare
+│   ├── suitekit/        driver, adapters, runtimes, workload plans, schema, answers, hosts, manifest, ledger, status
 │   ├── batch.sh         several runs from a worktree of one commit, then the cleanup
 │   └── results/         raw results, one directory per run (git-ignored)
 └── kits                 data, queries and drivers for what the suite's cycle doesn't cover
@@ -40,59 +123,25 @@ benches/
     ├── clients/         RDF4J, Jena, rdflib and DMW clients against NRESE
     ├── oracle/          Jena's ARQ as a second oracle for SPARQL answers
     ├── oxigraph-comparison/  NRESE's RDF bundle against Oxigraph's libraries
-    ├── nrese-bench-harness/  the Rust client: query-mix, write-scaling, compatibility packs
-    ├── perf-lab.sh, perf-lab-compare.py  NRESE's store and query engine alone, in Docker
+    ├── nrese-bench-harness/  the Rust HTTP client: query-mix, write-scaling, compatibility packs
+    ├── perf-lab.sh, perf-lab-compare.py  NRESE's store and query engine alone, in Docker (to fold into fast cases)
     ├── probes/          single measurements: HTTP latency, large results, memory, autocompletion
     └── cluster/         the same suite on a SLURM cluster (Apptainer)
 ```
 
-**Four layers.** Each layer only depends on the ones above it:
-
 | Layer | What | Where | Changes when |
 |---|---|---|---|
-| 0. Rules | how anything is measured, checked, recorded and published | `PROTOCOL.md`, `competitors/README.md` (licences) | rarely, by decision |
-| 1. Registries | what exists: systems with capabilities, workloads with needs and standard tiers | `suite/*.toml` | a system or workload is added, a capability lands |
-| 2. Drivers | how a pair runs: the suite's cycle (load → size → restart → count → queries → serve) or a kit's own driver | `suite/suitekit/`, the kits | a new kind of measurement |
-| 3. Evidence | what came out: raw results (local), run records (committed), STATUS (generated), baselines (committed) | `suite/results/`, `runs/`, `STATUS.md`, `baselines/` | every run |
+| Rules | how anything is measured, checked, recorded and published | `PROTOCOL.md`, `competitors/README.md` (licences) | rarely, by decision |
+| Registries | what exists: systems, workloads, cases, hosts | `suite/*.toml`, `fast/cases.toml`, `hosts.toml` | a system, workload, case or host is added |
+| Drivers | how a pair or case runs | `suite/suitekit/`, `fast/fast.py`, the kits | a new kind of measurement |
+| Evidence | what came out: raw results (local), run records, STATUS, baselines (committed) | `suite/results/`, `runs/`, `STATUS.md`, `baselines/` | every run |
 
 ## Kits
 
-### Feedback cadence and scenario selection
-
-The owner's 10 October campaign direction keeps the existing kits and registries
-as the source of truth. These are scheduling targets, not measured duration
-guarantees or permission to terminate a case early:
-
-| Selection | Target | Existing owner | Purpose |
-|---|---|---|---|
-| Focused | Seconds to minutes where the case permits | Named fast cases, probes, semantic guards | Isolate a changed kernel, operator or contract; compare with its pinned baseline |
-| Area | 1–4 hours | Related fast cases plus the relevant reasoning/query/write/vector kit | Cover an area's mechanisms, realistic shapes, neighboring regressions and applicable competitors |
-| Full benchable profile | About one day across the runnable systems | Registry-selected standard tiers and existing kit drivers | Complete coverage of the declared profile, including preparation, failures and answer validation |
-| Scale extension | Estimated separately before launch | Larger existing tiers and planned kits as they become runnable | Establish capacity and scaling beyond the daily profile |
-
-Choose the complete case/system/semantic matrix and resource scenario before
-execution. Native-capacity, matched-resource and scaling/frontier scenarios answer
-different questions ([PROTOCOL.md §3](PROTOCOL.md#3-fairness)); report them separately.
-The daily profile does not claim to include every planned external benchmark or
-every scale. Full-size cases remain available and visible when a smaller declared
-tier supplies faster feedback. Do not silently replace their inputs or checks.
-
-Estimate from retained per-case elapsed times, including loads, validation and
-teardown, and revise estimates after each completed area. A once-through campaign
-provides coverage and diagnostic evidence. Repetition requirements for regression
-checks and published claims still apply; request the additional time rather than
-calling a single run a reliable speed ranking. Split independent comparisons across
-Office and Phuoc-Yu, keeping all systems or revisions of each comparison on one host.
-
-The 9 October inventory contains **95 fast cases** and **24 registered workloads**:
-10 ready, four partial and 10 planned. The `fast` registry entry bridges those same
-95 cases; it is not another independent campaign. The 20 system entries include
-build/rule variants and unavailable adapters. `ready` describes runnable machinery,
-not a completed or successful workload × system × tier measurement.
-
 | Kit | Measures | Driver | Raw results | Committed |
 |---|---|---|---|---|
-| [suite](suite/README.md) | every workload × system pair the cycle can run: load, size, restart, count, queries, memory | `suite.py run`, `batch.sh` | `suite/results/<run>/` | record in `runs/` |
+| [fast](fast/README.md) | many small cases: every reasoning profile, maintenance, DL, memory caps, query shapes and operators, services, kernels, layout, plans; checks and route checks before times; home-turf cases per competitor | `fast/fast.py run`, `compare`, `compete` | `~/nrese-bench/reports/fast/` (full reports) | `baselines/fast/*.json` (compact records) |
+| [suite](suite/README.md) | every workload × system pair the cycle can run: load, size, restart, count, queries, answers, memory | `suite.py run`, `batch.sh` | `suite/results/<run>/` | record in `runs/` |
 | [reasoning](reasoning/README.md) | inferred sets fact by fact against a reference closure (precision, recall); the LUBM and OWL2Bench data | `reasoning-scorecard.sh` | `reasoning/results/` | — |
 | [reasoning/dl](reasoning/dl/README.md) | OWL 2 DL correctness and classification speed; the reference reasoners | `reference.py`, `w3c.py`, `ore.py`, `nrese.py` | `reasoning/dl/results/` | the TSVs (free systems only) and a record |
 | [reasoning/el-classification](reasoning/el-classification/README.md) | NRESE's EL classifier against ELK on random ontologies | `run_elk.sh`, `el_check.py` | scratch | — |
@@ -101,37 +150,21 @@ not a completed or successful workload × system × tier measurement.
 | [clients](clients/README.md) | client libraries end to end | `run-all.sh` | stdout | — |
 | [oracle](oracle/README.md) | NRESE's SPARQL answers against Jena's | its script | `oracle/results/` | — |
 | [oxigraph-comparison](oxigraph-comparison/README.md) | parsers, serialisers and evaluators against Oxigraph's | `cargo test`, `cargo run --bin bench` | `oxigraph-comparison/results/` | — |
-| [fast](fast/README.md) | many small cases (10-300 s each, under an hour): every reasoning profile, maintenance, DL, memory caps, query shapes and operators, services; checks and route checks before times; home-turf cases per competitor | `fast/fast.py run`, `compare`, `compete` | `~/nrese-bench/reports/fast/` (full reports), `tmp/fast/`, `fast/results/` | `baselines/fast/*.json` (compact records) |
 | perf lab | the store and query engine without HTTP, per query p50; the fast suite's measuring tool | `perf-lab.sh` | — | `baselines/perf-lab/*.json` |
 | [probes](probes/README.md) | one property at a time | one script each | stdout | — |
 | [cluster](cluster/README.md) | the suite on Draco | `suite.sbatch` | the job's directory | record in `runs/` |
 
-The fast suite covers reasoning, maintenance, DL, memory, load, query operators,
-services, kernels, layout, rules, parsing, planning, concurrency and caches. Its
-10–300 seconds per case / under-an-hour description is a design budget, not a
-verified duration for the current full campaign. Some cases have no independent
-answer check; consult the case's checks before treating a timing as validated.
-
-Correctness has additional owners: crate conformance tests cover RDF, SPARQL, OWL,
-SHACL and GeoSPARQL; the Jena oracle compares SPARQL result content; EL and DL kits
-compare canonical reasoning answers. General cross-system row counts alone do not
-prove equal bindings. QL/OBDA's [NPD probes](reasoning/queries/npd-stress/README.md)
-compare Ontop certain-answer counts and stress rewriting; these are not a separate
-completed scale campaign. The HTTP harness and perf lab are shared measuring tools;
-probes diagnose individual properties, and the cluster directory supplies an
-execution wrapper rather than evidence of distributed performance.
-
-The registry still marks integration, ORE, GeoSPARQL and the fast competitor bridge
-partial. LDBC SPB, real ontologies, consistency, OWL2Bench classification,
-SPARQLoscope, BSBM, WatDiv, ERA SHACL, full-text search and federation remain planned
-entries. Existing probes or test coverage in these areas do not complete those
-campaigns. [Run records](runs/README.md) identify actual coverage and known disputes.
+A case without an answer check times only that it ran: consult its checks before reading
+its time as validated. Correctness also has owners outside these kits: crate conformance
+tests (RDF, SPARQL, OWL, SHACL, GeoSPARQL), the Jena oracle, and the EL and DL kits'
+canonical taxonomies. Equal row counts across systems don't prove equal bindings; the
+answer recorder compares the bindings.
 
 ## Lab tools
 
 Single measurements and diagnoses outside the kits, run with
-`scripts/cargo-guarded.sh run --release -p <crate> --example <name> -- …` (each file's
-header says how). `benches/probes/` has the HTTP-level probes.
+`scripts/cargo-guarded.sh run --release -p <crate> --example <name> -- …` on a build host
+(each file's header says how). `benches/probes/` has the HTTP-level probes.
 
 | Area | Examples |
 |---|---|
@@ -141,96 +174,6 @@ header says how). `benches/probes/` has the HTTP-level probes.
 | Studies kept for open targets | `nrese-engine`'s ignored tests `compression_study` and `vocabulary_study` (store-size options, P2 in [performance.md](../docs/design/performance.md) §6) |
 | Office PC | `scripts/office/`: dataset preparation (`dbpedia.sh`, `wikidata.sh`) and the perf lab there (`perflab.sh`) |
 
-## Remote hosts and shared data
-
-The benchmark **data transfer from KRARIS-GPTLER is verified on both hosts**
-(9 October 2026): 30,739 file paths, 145,052,843,247 logical bytes, including
-Windows inputs/results, ORE and tool caches, eight Docker volumes and the restored
-Office conformance corpus. Every source/destination file has a matching SHA-256.
-The four local Windows source groups and eight local benchmark volumes have been
-retired after verification; the Office conformance source remains reusable there.
-Logical totals include duplicate paths and are not physical disk usage. Both
-MongoDB containers and all their volumes remain outside benchmark cleanup.
-All eight source benchmark images are also preserved in the SHA-256-verified
-`images/nrese-bench-source-tags.docker.tar` under the same root on both hosts.
-Office has the same image IDs loaded under `nrese-preserved/*` aliases; its existing
-tags were retained. `manifests/image-load-verification.json` maps original tags and
-IDs to those aliases. Phuoc retains the archive without installing Docker. The eight
-local source image tags were removed only after these checks; no blanket prune ran.
-Office-PC alone builds/tests/formats Rust and executes build-triggering hooks.
-Phuoc-Yu runs verified Office-built native binaries; it currently has no Docker,
-Java or Apptainer. The kit table above and [CATALOG.md](CATALOG.md) remain the suite
-overview; host availability does not imply every kit can run there.
-
-Both hosts preserve source snapshots under
-`/home/krarilotus/nrese-assets/kraris-gptler-20261009/snapshots`: `windows/nrese-data`,
-`windows/nrese-bench`, `docker-volumes/nrese-bench-data`, `docker-volumes/nrese-fast-data`,
-`docker-volumes/nrese-classify-data`, and the transferred build volumes. Check the
-transfer manifest for the actual layout. These are immutable preservation copies,
-not writable data, build or cleanup targets. Keep existing remote campaign paths;
-do not merge same-named files/volumes or assume their contents match.
-
-Before selecting an input, verify the completed transfer on **each host** against
-the source inventory (relative paths, sizes and checksums), recording missing files
-and mismatches. Map each workload to its verified input directory explicitly. Share
-that directory across worktrees, read-only; keep generated data, stores, scratch and
-results outside preservation roots. Local-copy cleanup waits for verified remote
-preservation and rerun needs to be settled; transfer progress alone is insufficient.
-
-Both hosts now have `~/.config/nrese-bench.env` (mode 0600), explicitly sourced rather
-than autoloaded. It names the existing checkout/campaign paths, Python interpreter,
-shared Windows input snapshot (`BENCH_DATA`), general Docker-data snapshot
-(`BENCH_GENERAL_DATA`), fast snapshot (`BENCH_FAST_DATA`),
-results parent (`BENCH_RESULTS_ROOT`), mutable scratch (`NRESE_BENCH_SCRATCH`),
-native binaries (`NRESE_BIN`/`HARNESS`) and preserved licences (`NRESE_LICENSES`).
-The `BENCH_*` names are shell conveniences, not new suite settings. The current
-profiles identify measured binaries from `77478d1` through `BENCH_BINARY_REVISION`;
-the checkout revision can differ and must be recorded separately. They do not select
-latest-source binaries or start runs. Both profiles also set `NRESE_ORE_DIR` to the
-preserved ontology directory and `BENCH_ORE_ARCHIVE` to its original ZIP. Office
-sets `FUSEKI_HOME` to the preserved distribution; Phuoc lacks its Java runtime.
-Use `--data "$BENCH_GENERAL_DATA"` explicitly for inputs from the general snapshot;
-do not infer input identity from matching names across snapshots.
-For the verified LUBM 1 input directory:
-
-```sh
-ssh Phuoc-Yu 'bash -se' <<'REMOTE'
-source "$HOME/.config/nrese-bench.env"
-: "${BENCH_PYTHON:?}" "${BENCH_CHECKOUT:?}" "${BENCH_DATA:?}" "${BENCH_RESULTS_ROOT:?}"
-: "${NRESE_BENCH_SCRATCH:?}" "${NRESE_BIN:?}" "${HARNESS:?}"
-BENCH_RESULTS="$BENCH_RESULTS_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$$"
-test ! -e "$BENCH_RESULTS"
-cd "$BENCH_CHECKOUT"
-test -f "$NRESE_BIN"
-test -x "$NRESE_BIN"
-test -f "$HARNESS"
-test -x "$HARNESS"
-test -s "$BENCH_DATA/univ-bench.nt"
-test -s "$BENCH_DATA/lubm-1.nt"
-"$BENCH_PYTHON" benches/suite/suite.py run --runtime process --systems nrese \
-  --workloads lubm --tier lubm=1 --data "$BENCH_DATA" \
-  --skip-build --keep --results "$BENCH_RESULTS" --dry-run
-REMOTE
-```
-
-Review the printed commands before repeating without `--dry-run`; the same template
-can target Office-PC. `--data DIR` skips missing inputs instead of preparing them.
-Docker mounts these inputs read-only; process mode needs host-enforced read-only
-permissions. This branch's `--skip-build` refuses a missing harness; Phuoc's frozen
-`77478d1` driver predates that guard, so retain the explicit file/executable checks.
-`--skip-build` does not suppress Cargo
-in kit workloads, so select explicit native workloads on Phuoc-Yu. Verify binary
-checksums, source revision, CPU/ABI compatibility and dependencies; record these
-alongside results. `--keep` retains reusable assets, not per-run stores/scratch.
-
-The fast driver still hardcodes `DATA_VOLUME`/`BENCH_VOLUME`, writes generated
-inputs/references to `/fast`, and `clean` removes its data volume. Do not bind a
-preservation snapshot writable there. Its `--out`/`NRESE_BENCH_REPORTS` and
-`NRESE_ORE_DIR` knobs do not relocate all data/scratch. Use direct suite invocations
-for shared preserved inputs: `batch.sh` and `bench-cleanup.sh` have legacy cleanup
-policies, including name-based and low-disk cleanup, and must not manage preservation
-copies or existing campaigns. The generic lifecycle below applies to disposable runs.
-
 ## A run, step by step
 
 ```text
@@ -239,18 +182,21 @@ plan       suite.py status                      what is missing; pick workloads,
 run        suite/batch.sh NAME -- ARGS [-- ARGS]  from a worktree of HEAD; writes suite/results/NAME/
                                                   results.csv   one row per measured step (suitekit/schema.py)
                                                   manifest.json commit, machine, Docker limits, protocol, images, dataset sizes
+                                                  answers.json  with --answers full: every answer and its verdict
                                                   logs/         per pair and repetition
 check      suite.py report suite/results/NAME   tables (restricted systems left out)
            suite.py compare BASE NEW            regressions and changed answers against a baseline run
-record     suite.py ledger suite/results/NAME   writes runs/NAME.toml; then fill in purpose, baseline, findings
+record     suite.py ledger suite/results/NAME   writes runs/NAME.toml; then fill in purpose, cases, findings
            suite.py status --write              regenerates STATUS.md
 commit     runs/NAME.toml and STATUS.md         never the raw results
 clean      batch.sh: containers, stores, scratch go; datasets stay until the results are concluded
-           scripts/bench-cleanup.sh             then removes the datasets (batch.sh does it at once below 100 GB free)
 ```
 
-A kit with its own driver ends the same way: its results where its README says, and a
-record in `runs/` written by hand in the same format, with `kit` set to the kit's directory.
+On a host with preserved inputs, pass them with `--data` (the path from
+[hosts.toml](hosts.toml)) and `--skip-build` with the binaries named in the host's
+`nrese-bench.env`; `--data DIR` skips a missing input instead of preparing it. Neither
+`batch.sh` nor `scripts/bench-cleanup.sh` may manage preserved inputs or another
+campaign's resources: both clean by name and on low disk.
 
 ## Adding things
 
@@ -259,7 +205,9 @@ record in `runs/` written by hand in the same format, with `kit` set to the kit'
   1. An entry in `suite/workloads.toml`: `needs`, `tiers`, `source`, `licence`, `check`, `state = "planned"`.
   2. Its data and queries in a kit.
   3. A plan in `suite/suitekit/workloads.py` (then `state = "ready"`), or a kit driver that writes a run record.
+- **A fast case:** [fast/README.md](fast/README.md#adding-a-case).
+- **A host:** an entry in `hosts.toml`; its inputs verified against the preservation receipts before first use.
 - **A capability:** add it to `CAPABILITIES` in `suite.py` and to the vocabulary at the top of `systems.toml`.
 
-`suite.py --check` validates the registries. The pre-commit hooks don't run benchmarks:
-benchmarks run in bulk at the end of a batch of work (PROTOCOL.md §8).
+`suite.py --check` validates the registries. The hooks don't run benchmarks: they run in
+bulk at the end of a batch of work (PROTOCOL.md §8).
