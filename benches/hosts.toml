@@ -93,7 +93,12 @@ has = []
 assets = false
 note = "the owner's machine, the owner's session active: runs that need RAM, and whole comparisons whose every contender runs there (the DL reasoners); its own baseline, never compared with another host's. No Docker, no WSL distribution. Rust 1.98.1 (MSVC), git, Python 3.14: a job builds the binaries of its own runs there"
 scratch = "S:/nrese-scratch: at most 1 TB, emptied the same day"
-queue = { dir = "S:/nrese-scratch/queue", repo = "S:/nrese-scratch/repo.git", results = "S:/nrese-scratch/results", windows = ["21:00-06:00"], keep = "same-day", python = "python", receive_pack = "powershell -NoProfile -Command git-receive-pack" }
+# The owner (12 Oct 2026): at it usually 22:00-04:00 on weekdays, more often by day on
+# weekends. Timed jobs on weekdays 04:30-21:30, on weekends only while nobody uses it; and on
+# any day never while the console session isn't idle: scripts/hosts/khaleesi-guard.py
+# (Task Scheduler, every minute) writes the retreat file and stops a running timed job, its
+# partial results kept. The runner is a scheduled task too (pythonw queue.py work --log).
+queue = { dir = "S:/nrese-scratch/queue", repo = "S:/nrese-scratch/repo.git", results = "S:/nrese-scratch/results", windows = ["04:30-21:30"], weekend_windows = ["00:00-24:00"], retreat = "S:/nrese-scratch/RETREAT", keep = "same-day", python = "python", receive_pack = "powershell -NoProfile -Command git-receive-pack" }
 
 [[host.khaleesi.config]]
 since = "2026-10-12"
@@ -108,7 +113,7 @@ roles = ["prepare"]
 has = []
 assets = false
 note = "a user is logged in: light tasks only, in its WSL Ubuntu (wsl -e bash -lc ...): downloads, data preparation, answer checks; no timing. No Rust, no Docker, no Java"
-queue = { dir = "/home/schmiddihhh/owlrs/queue", repo = "/home/schmiddihhh/owlrs/repo.git", results = "/home/schmiddihhh/owlrs/results", windows = ["00:00-24:00"], timing = false, python = "wsl -e python3", receive_pack = "wsl git-receive-pack" }
+queue = { dir = "/home/schmiddihhh/owlrs/queue", repo = "/home/schmiddihhh/owlrs/repo.git", results = "/home/schmiddihhh/owlrs/results", windows = ["00:00-24:00"], timing = false, keep = "7-days", python = "wsl -e python3", receive_pack = "wsl git-receive-pack" }
 
 [host.kraris-gptler]
 hostname = "Kraris-GPTler"

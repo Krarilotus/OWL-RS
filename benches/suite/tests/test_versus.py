@@ -78,5 +78,20 @@ class Standings(unittest.TestCase):
         self.assertIn("| jena | - | - | - | not measured yet |", text)
 
 
+class Refused(unittest.TestCase):
+    def test_a_refused_system_shows_its_published_numbers_apart_never_as_measured(self):
+        systems = {"nrese": {}, "rdfox": {"publish": "permission", "refused": "no evaluation licence"}}
+        entry = {"system": "rdfox", "benchmark": "claros", "tier": "l", "metric": "materialisation", "value": 1.0,
+                 "unit": "s", "hardware": "the paper's machine", "source": "a paper", "date": "2021"}
+        from unittest.mock import patch
+        from suitekit import reported
+        with patch.object(reported, "load", lambda: [entry]):
+            text = standings.render([], systems, Path("."))
+        self.assertIn("| rdfox | refused | refused | - | no evaluation licence; 1 published numbers below |", text)
+        self.assertIn("## rdfox: reported, not measured by us", text)
+        self.assertIn("the paper's machine", text)
+        self.assertEqual(reported.problems(systems, [{**entry, "hardware": ""}])[0][:22], "reported.toml entry 1:")
+
+
 if __name__ == "__main__":
     unittest.main()

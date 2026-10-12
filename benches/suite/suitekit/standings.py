@@ -71,7 +71,28 @@ def render(records: list[dict], systems: dict, root: Path) -> str:
         "|---|---|---|---|---|",
     ]
     sections = []
+    from . import reported as published
+    by_system: dict[str, list[dict]] = defaultdict(list)
+    for entry in published.load():
+        by_system[entry["system"]].append(entry)
     for system in contenders:
+        if systems[system].get("refused"):
+            # Never measured by us: its published numbers, as reported, on their hardware.
+            found = by_system.get(system, [])
+            lines.append(f"| {system} | refused | refused | - | {systems[system]['refused']}; "
+                         f"{len(found)} published numbers below |")
+            if found:
+                sections += ["", f"## {system}: reported, not measured by us", "",
+                             "As the source reports it, on the source's hardware: not comparable with our "
+                             "measurements as if it were one ([competitors/reported.toml](competitors/reported.toml)).",
+                             "", "| Benchmark | Tier | Metric | Value | Threads | Hardware | Source | Date |",
+                             "|---|---|---|---|---|---|---|---|"]
+                for e in found:
+                    sections.append(f"| {e['benchmark']} | {e.get('tier', '-')} | {e['metric']} | "
+                                    f"{e['value']} {e['unit']} | {e.get('threads', '-')} | {e['hardware']} | "
+                                    f"{e['source']}" + (f" (reported by {e['reported_by']})" if e.get('reported_by') else "")
+                                    + f" | {e['date']} |")
+            continue
         if system in restricted:
             runs = sorted(ran_restricted.get(system, set()))
             lines.append(f"| {system} | restricted | restricted | - | "
