@@ -21,10 +21,31 @@ pub fn process_bytes() -> Option<u64> {
 
 /// The most [`process_bytes`] has been since the process started, where the platform
 /// keeps it (Windows: the peak committed private bytes; Linux: the peak resident set,
-/// mapped files included).
+/// mapped files included). A [`start_peak_window`] doesn't lower it.
 pub fn peak_process_bytes() -> Option<u64> {
+    let window = imp::peak_process_bytes()?;
+    let before = PEAK_BEFORE_WINDOW.fetch_max(window, Ordering::Relaxed);
+    Some(before.max(window))
+}
+
+/// Starts a window for [`window_peak_bytes`], the peak of one phase of a long run. On Linux
+/// the kernel's high-water mark is kept for [`peak_process_bytes`] and then reset to the
+/// resident set (`/proc/self/clear_refs`), which also resets what `getrusage` and
+/// `time -v` report as the maximum resident set; elsewhere no window starts and `false`
+/// is returned. Starting a window by writing `clear_refs` directly loses the peak before it.
+pub fn start_peak_window() -> bool {
+    peak_process_bytes();
+    imp::reset_peak()
+}
+
+/// The most the process has held since the last [`start_peak_window`] (since the start
+/// without one); `None` where the platform doesn't say.
+pub fn window_peak_bytes() -> Option<u64> {
     imp::peak_process_bytes()
 }
+
+/// The highest mark the kernel had when a peak window started.
+static PEAK_BEFORE_WINDOW: AtomicU64 = AtomicU64::new(0);
 
 /// The page faults the process has taken since it started (soft and hard: a mapped file's
 /// pages count as they are first touched), where the platform keeps them.
@@ -209,6 +230,11 @@ mod imp {
         counters().map(|counters| counters.PeakPagefileUsage as u64)
     }
 
+    /// Windows keeps the peak for the process's lifetime.
+    pub fn reset_peak() -> bool {
+        false
+    }
+
     pub fn page_faults() -> Option<u64> {
         counters().map(|counters| u64::from(counters.PageFaultCount))
     }
@@ -327,6 +353,11 @@ mod imp {
         Some(kib * 1024)
     }
 
+    /// Writing 5 resets the high-water mark to the resident set (Linux 4.0 on).
+    pub fn reset_peak() -> bool {
+        std::fs::write("/proc/self/clear_refs", "5").is_ok()
+    }
+
     pub fn available_bytes() -> Option<u64> {
         let read = |path: &str| std::fs::read_to_string(path).ok();
         let machine = read("/proc/meminfo").and_then(|text| {
@@ -351,6 +382,10 @@ mod imp {
 
     pub fn peak_process_bytes() -> Option<u64> {
         None
+    }
+
+    pub fn reset_peak() -> bool {
+        false
     }
 
     pub fn page_faults() -> Option<u64> {
@@ -522,6 +557,26 @@ mod tests {
         let watch = MemoryWatch::new(1);
         assert!(watch.exceeded());
         assert!(watch.exceeded());
+    }
+
+    /// A phase's window starts at what the process holds, and the lifetime peak keeps what
+    /// came before it: perf lab reports reset the kernel's mark per phase, and a fast
+    /// suite's case peak read after the last phase was that phase's alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_peak_window_keeps_the_lifetime_peak() {
+        const HELD: usize = 256 << 20;
+        let pages = std::hint::black_box(vec![1u8; HELD]);
+        drop(pages);
+        let before = peak_process_bytes().unwrap();
+        assert!(start_peak_window());
+        let window = window_peak_bytes().unwrap();
+        assert!(peak_process_bytes().unwrap() >= before);
+        // Other tests of this binary hold at most 64 MiB at once.
+        assert!(
+            window + (HELD as u64) / 2 < before,
+            "window {window} B, lifetime {before} B"
+        );
     }
 
     /// Switched off, the kernel shows the process's huge pages off, and on again.

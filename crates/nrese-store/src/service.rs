@@ -1478,6 +1478,9 @@ impl StoreService {
         if stop() {
             return Err(stopped());
         }
+        // What the reasoner freed goes back before the inferred stack, the heap's peak, is
+        // built (as between the reasoner's rounds).
+        nrese_engine::memory::release_all();
         nrese_exec::heap::phase("store: inferred stack");
         let summary = rematerialisation.finish(closure.inferred)?;
         nrese_exec::heap::phase("store: done");
