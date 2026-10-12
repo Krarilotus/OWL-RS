@@ -336,9 +336,12 @@ fn in_scope(pattern: &GraphPattern, out: &mut Vec<Variable>) {
             term(subject, out);
             term(object, out);
         }
-        GraphPattern::Join { left, right }
-        | GraphPattern::LeftJoin { left, right, .. }
-        | GraphPattern::Union { left, right } => {
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            for input in inputs {
+                in_scope(input, out);
+            }
+        }
+        GraphPattern::LeftJoin { left, right, .. } => {
             in_scope(left, out);
             in_scope(right, out);
         }
@@ -349,11 +352,11 @@ fn in_scope(pattern: &GraphPattern, out: &mut Vec<Variable>) {
             }
             in_scope(inner, out);
         }
-        GraphPattern::Extend {
-            inner, variable, ..
-        } => {
+        GraphPattern::Extend { inner, bindings } => {
             in_scope(inner, out);
-            push(variable, out);
+            for (variable, _) in bindings {
+                push(variable, out);
+            }
         }
         GraphPattern::Values { variables, .. } | GraphPattern::Project { variables, .. } => {
             for v in variables {
@@ -590,10 +593,14 @@ impl<'d> Context<'d> {
                 }
                 out
             }
-            GraphPattern::Join { left, right } => {
-                let left = self.eval(left, graph, outer)?;
-                let right = self.eval(right, graph, outer)?;
-                join(&left, &right)
+            GraphPattern::Join { inputs } => {
+                // From the left, as the definition joins two at a time.
+                let mut out = vec![Solution::default()];
+                for input in inputs {
+                    let right = self.eval(input, graph, outer)?;
+                    out = join(&out, &right);
+                }
+                out
             }
             GraphPattern::LeftJoin {
                 left,
@@ -633,9 +640,11 @@ impl<'d> Context<'d> {
                 }
                 out
             }
-            GraphPattern::Union { left, right } => {
-                let mut out = self.eval(left, graph, outer)?;
-                out.extend(self.eval(right, graph, outer)?);
+            GraphPattern::Union { inputs } => {
+                let mut out = Vec::new();
+                for input in inputs {
+                    out.extend(self.eval(input, graph, outer)?);
+                }
                 out
             }
             GraphPattern::Graph { name, inner } => {
@@ -669,19 +678,18 @@ impl<'d> Context<'d> {
                 }
                 out
             }
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => {
-                let mut out = Vec::new();
-                for (i, mut s) in self.eval(inner, graph, outer)?.into_iter().enumerate() {
-                    if !s.contains_key(variable)
-                        && let Some(value) = self.value(expression, &s, graph, outer, i as u64)?
-                    {
-                        s.insert(variable.clone(), value);
+            // Each binding as an `Extend` of its own, from the first.
+            GraphPattern::Extend { inner, bindings } => {
+                let mut out = self.eval(inner, graph, outer)?;
+                for (variable, expression) in bindings {
+                    for (i, s) in out.iter_mut().enumerate() {
+                        if !s.contains_key(variable)
+                            && let Some(value) =
+                                self.value(expression, s, graph, outer, i as u64)?
+                        {
+                            s.insert(variable.clone(), value);
+                        }
                     }
-                    out.push(s);
                 }
                 out
             }
@@ -1053,24 +1061,38 @@ impl<'d> Context<'d> {
                 .into_iter()
                 .map(|(s, o)| (o, s))
                 .collect(),
-            PropertyPathExpression::Sequence(a, b) => {
-                let left = self.pairs(a, graph, start, None);
-                let right = self.pairs(b, graph, None, end);
-                let mut out = Vec::new();
-                // One pair per path: a pair two intermediate nodes connect comes twice.
-                for (x, m) in &left {
-                    for (n, y) in &right {
-                        if m == n {
-                            out.push((x.clone(), y.clone()));
+            PropertyPathExpression::Sequence(steps) => {
+                // Step by step, the start bound on the first and the end on the last. One
+                // pair per path: a pair two intermediate nodes connect comes twice.
+                let last = steps.len().saturating_sub(1);
+                let mut out: Option<Vec<(Term, Term)>> = None;
+                for (i, step) in steps.iter().enumerate() {
+                    let from = if i == 0 { start } else { None };
+                    let to = if i == last { end } else { None };
+                    let right = self.pairs(step, graph, from, to);
+                    out = Some(match out {
+                        None => right,
+                        Some(left) => {
+                            let mut joined = Vec::new();
+                            for (x, m) in &left {
+                                for (n, y) in &right {
+                                    if m == n {
+                                        joined.push((x.clone(), y.clone()));
+                                    }
+                                }
+                            }
+                            joined
                         }
-                    }
+                    });
                 }
-                out
+                out.unwrap_or_default()
             }
-            PropertyPathExpression::Alternative(a, b) => {
-                // A UNION: a pair both sides give comes twice.
-                let mut out = self.pairs(a, graph, start, end);
-                out.extend(self.pairs(b, graph, start, end));
+            PropertyPathExpression::Alternative(paths) => {
+                // A UNION: a pair several give comes as often.
+                let mut out = Vec::new();
+                for path in paths {
+                    out.extend(self.pairs(path, graph, start, end));
+                }
                 out
             }
             PropertyPathExpression::NegatedPropertySet(excluded) => graph

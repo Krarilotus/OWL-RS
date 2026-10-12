@@ -33,6 +33,7 @@
 use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{Expression, Function, GraphPattern};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
+use nrese_sparql_syntax::visit::Node;
 
 use super::expression_variables;
 
@@ -88,13 +89,11 @@ pub(super) fn push_filters(pattern: GraphPattern) -> GraphPattern {
                 expression: conjunction(kept),
             }
         }
-        GraphPattern::Join { left, right } => GraphPattern::Join {
-            left: boxed(left),
-            right: boxed(right),
+        GraphPattern::Join { inputs } => GraphPattern::Join {
+            inputs: inputs.into_iter().map(push_filters).collect(),
         },
-        GraphPattern::Union { left, right } => GraphPattern::Union {
-            left: boxed(left),
-            right: boxed(right),
+        GraphPattern::Union { inputs } => GraphPattern::Union {
+            inputs: inputs.into_iter().map(push_filters).collect(),
         },
         GraphPattern::Minus { left, right } => GraphPattern::Minus {
             left: boxed(left),
@@ -104,14 +103,9 @@ pub(super) fn push_filters(pattern: GraphPattern) -> GraphPattern {
             name,
             inner: boxed(inner),
         },
-        GraphPattern::Extend {
-            inner,
-            variable,
-            expression,
-        } => GraphPattern::Extend {
+        GraphPattern::Extend { inner, bindings } => GraphPattern::Extend {
             inner: boxed(inner),
-            variable,
-            expression,
+            bindings,
         },
         GraphPattern::OrderBy { inner, expression } => GraphPattern::OrderBy {
             inner: boxed(inner),
@@ -172,23 +166,20 @@ fn sink(
 ) -> Result<GraphPattern, Unmoved> {
     let placed = |inner: Box<GraphPattern>, conjunct| Box::new(place(conjunct, variables, *inner));
     match pattern {
-        GraphPattern::Join { left, right } => {
-            let (in_left, in_right) = (covers(&left, variables), covers(&right, variables));
-            match (in_left, in_right) {
-                (true, true) => Ok(GraphPattern::Join {
-                    left: placed(left, conjunct.clone()),
-                    right: placed(right, conjunct),
-                }),
-                (true, false) => Ok(GraphPattern::Join {
-                    left: placed(left, conjunct),
-                    right,
-                }),
-                (false, true) => Ok(GraphPattern::Join {
-                    left,
-                    right: placed(right, conjunct),
-                }),
-                (false, false) => Err(Box::new((conjunct, GraphPattern::Join { left, right }))),
+        // Into every input that binds all its variables; above the join if none does.
+        GraphPattern::Join { inputs } => {
+            if !inputs.iter().any(|input| covers(input, variables)) {
+                return Err(Box::new((conjunct, GraphPattern::Join { inputs })));
             }
+            Ok(GraphPattern::Join {
+                inputs: inputs
+                    .into_iter()
+                    .map(|input| match covers(&input, variables) {
+                        true => place(conjunct.clone(), variables, input),
+                        false => input,
+                    })
+                    .collect(),
+            })
         }
         GraphPattern::LeftJoin {
             left,
@@ -203,9 +194,11 @@ fn sink(
             left: placed(left, conjunct),
             right,
         }),
-        GraphPattern::Union { left, right } => Ok(GraphPattern::Union {
-            left: placed(left, conjunct.clone()),
-            right: placed(right, conjunct),
+        GraphPattern::Union { inputs } => Ok(GraphPattern::Union {
+            inputs: inputs
+                .into_iter()
+                .map(|input| place(conjunct.clone(), variables, input))
+                .collect(),
         }),
         // Conjuncts that end at the same place make one filter: the executor reads the
         // value ranges of a filter directly above a basic graph pattern.
@@ -214,23 +207,28 @@ fn sink(
                 expr,
                 inner: Box::new(inner),
             },
+            // Balanced (ADR-0012): thousands of conjuncts ending here, each added as
+            // `And(filter, conjunct)`, made a chain as deep as they were many.
             Err(back) => {
                 let (conjunct, inner) = *back;
+                let mut all = conjuncts(expr);
+                all.push(conjunct);
                 GraphPattern::Filter {
-                    expr: Expression::And(Box::new(expr), Box::new(conjunct)),
+                    expr: Expression::balanced(all, Expression::And).expect("two conjuncts"),
                     inner: Box::new(inner),
                 }
             }
         }),
-        GraphPattern::Extend {
-            inner,
-            variable,
-            expression,
-        } if !variables.contains(&variable) => Ok(GraphPattern::Extend {
-            inner: placed(inner, conjunct),
-            variable,
-            expression,
-        }),
+        GraphPattern::Extend { inner, bindings }
+            if bindings
+                .iter()
+                .all(|(variable, _)| !variables.contains(variable)) =>
+        {
+            Ok(GraphPattern::Extend {
+                inner: placed(inner, conjunct),
+                bindings,
+            })
+        }
         GraphPattern::Graph { name, inner } if !matches!(&name, NamedNodePattern::Variable(v) if variables.contains(v)) => {
             Ok(GraphPattern::Graph {
                 name,
@@ -271,9 +269,7 @@ fn conjuncts(expression: Expression) -> Vec<Expression> {
 }
 
 fn conjunction(conjuncts: Vec<Expression>) -> Option<Expression> {
-    conjuncts
-        .into_iter()
-        .reduce(|a, b| Expression::And(Box::new(a), Box::new(b)))
+    Expression::balanced(conjuncts, Expression::And)
 }
 
 /// The conjuncts of `a && b && …`, by reference.
@@ -314,39 +310,21 @@ pub(super) fn movable(conjunct: &Expression) -> bool {
     !expression_variables(conjunct).is_empty() && !per_solution(conjunct)
 }
 
-/// Whether the expression reads the whole solution (`EXISTS`) or draws a value per row.
+/// Whether the expression reads the whole solution (`EXISTS`) or draws a value per row: a
+/// search, so by the shared walker (ADR-0012), which stops at the first.
 pub(crate) fn per_solution(expression: &Expression) -> bool {
-    match expression {
-        Expression::Exists(_) => true,
-        Expression::NamedNode(_)
-        | Expression::Literal(_)
-        | Expression::Variable(_)
-        | Expression::Bound(_) => false,
-        Expression::Or(a, b)
-        | Expression::And(a, b)
-        | Expression::Equal(a, b)
-        | Expression::SameTerm(a, b)
-        | Expression::Greater(a, b)
-        | Expression::GreaterOrEqual(a, b)
-        | Expression::Less(a, b)
-        | Expression::LessOrEqual(a, b)
-        | Expression::Add(a, b)
-        | Expression::Subtract(a, b)
-        | Expression::Multiply(a, b)
-        | Expression::Divide(a, b) => per_solution(a) || per_solution(b),
-        Expression::In(a, list) => per_solution(a) || list.iter().any(per_solution),
-        Expression::UnaryPlus(a) | Expression::UnaryMinus(a) | Expression::Not(a) => {
-            per_solution(a)
-        }
-        Expression::If(a, b, c) => per_solution(a) || per_solution(b) || per_solution(c),
-        Expression::Coalesce(list) => list.iter().any(per_solution),
-        Expression::FunctionCall(function, arguments) => {
-            matches!(
-                function,
-                Function::Rand | Function::Uuid | Function::StrUuid | Function::BNode
-            ) || arguments.iter().any(per_solution)
-        }
-    }
+    expression.find(&mut |node| {
+        matches!(
+            node,
+            Node::Expression(
+                Expression::Exists(_)
+                    | Expression::FunctionCall(
+                        Function::Rand | Function::Uuid | Function::StrUuid | Function::BNode,
+                        _,
+                    )
+            )
+        )
+    })
 }
 
 /// Whether `pattern` binds all of `variables` in every solution.
@@ -383,16 +361,20 @@ pub(super) fn certain(pattern: &GraphPattern) -> Vec<Variable> {
             term(subject).iter().for_each(&mut add);
             term(object).iter().for_each(&mut add);
         }
-        GraphPattern::Join { left, right } => {
-            certain(left).iter().for_each(&mut add);
-            certain(right).iter().for_each(&mut add);
+        GraphPattern::Join { inputs } => {
+            for input in inputs {
+                certain(input).iter().for_each(&mut add);
+            }
         }
-        GraphPattern::Union { left, right } => {
-            let right = certain(right);
-            certain(left)
-                .iter()
-                .filter(|v| right.contains(v))
-                .for_each(&mut add);
+        // What every input binds.
+        GraphPattern::Union { inputs } => {
+            if let Some((first, rest)) = inputs.split_first() {
+                let rest: Vec<Vec<Variable>> = rest.iter().map(certain).collect();
+                certain(first)
+                    .iter()
+                    .filter(|v| rest.iter().all(|other| other.contains(v)))
+                    .for_each(&mut add);
+            }
         }
         GraphPattern::Graph { name, inner } => {
             if let NamedNodePattern::Variable(v) = name {

@@ -31,10 +31,12 @@ use super::{Context, NativeResult, PROBE_FACTOR, Solutions, as_path, bound_varia
 fn ordered(pattern: &GraphPattern) -> bool {
     match pattern {
         GraphPattern::OrderBy { .. } => true,
-        GraphPattern::Join { left, right }
-        | GraphPattern::LeftJoin { left, right, .. }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => ordered(left) || ordered(right),
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            inputs.iter().any(ordered)
+        }
+        GraphPattern::LeftJoin { left, right, .. } | GraphPattern::Minus { left, right } => {
+            ordered(left) || ordered(right)
+        }
         GraphPattern::Filter { inner, .. }
         | GraphPattern::Extend { inner, .. }
         | GraphPattern::Graph { inner, .. }
@@ -74,8 +76,11 @@ impl Context<'_> {
                     })
                     .fold(f64::INFINITY, f64::min)
             }
-            GraphPattern::Join { left, right } => self.estimate(left).min(self.estimate(right)),
-            GraphPattern::Union { left, right } => self.estimate(left) + self.estimate(right),
+            GraphPattern::Join { inputs } => inputs
+                .iter()
+                .map(|input| self.estimate(input))
+                .fold(f64::INFINITY, f64::min),
+            GraphPattern::Union { inputs } => inputs.iter().map(|input| self.estimate(input)).sum(),
             GraphPattern::LeftJoin { left, .. } | GraphPattern::Minus { left, .. } => {
                 self.estimate(left)
             }
@@ -105,19 +110,56 @@ impl Context<'_> {
     /// `VALUES` against a star whose smallest pattern had 7 statements stayed second, and
     /// the star was evaluated for all 673,884 provenance chains of the Zebratlas release
     /// before the one edge was joined (4 October 2026).
-    pub(super) fn join_sideways(
-        &self,
-        left: &GraphPattern,
-        right: &GraphPattern,
-    ) -> NativeResult<Solutions> {
+    /// The join of `inputs` (an n-ary join of the algebra, ADR-0012), in a loop. Each
+    /// input after the first is evaluated from the rows so far: a path followed from the
+    /// values they bind, a pattern probed from them where that pays ([`Self::eval_from`]).
+    /// The first is the most selective input that isn't a path, a `VALUES` before all
+    /// (the smaller side first, the others probed from it); the written order where
+    /// an `ORDER BY` inside fixes the rows' order, or as written.
+    pub(super) fn join_inputs(&self, inputs: &[GraphPattern]) -> NativeResult<Solutions> {
         let values = |p: &GraphPattern| matches!(p, GraphPattern::Values { .. });
-        let swap = !ordered(left)
-            && !ordered(right)
-            && !values(left)
-            && (values(right) || self.estimate(right) * PROBE_FACTOR as f64 <= self.estimate(left));
-        let (first, second) = if swap { (right, left) } else { (left, right) };
-        let bound = self.eval(first)?;
-        self.eval_from(bound, second)
+        let candidates = || {
+            inputs
+                .iter()
+                .enumerate()
+                .filter(|(_, input)| as_path(input).is_none())
+        };
+        let written = candidates().next().map_or(0, |(i, _)| i);
+        let start = if self.as_written || inputs.iter().any(ordered) {
+            written
+        } else if let Some((i, _)) = candidates().find(|(_, input)| values(input)) {
+            i
+        } else {
+            // The smallest estimate, ahead of the written first only by the factor a
+            // probe must pay for itself.
+            let first = self.estimate(&inputs[written]);
+            candidates()
+                .map(|(i, input)| (i, self.estimate(input)))
+                .filter(|&(i, estimate)| i == written || estimate * PROBE_FACTOR as f64 <= first)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map_or(written, |(i, _)| i)
+        };
+        let Some(first) = inputs.get(start) else {
+            return Ok(Solutions::unit());
+        };
+        let mut rows = self.eval(first)?;
+        for (i, input) in inputs.iter().enumerate() {
+            if i == start {
+                continue;
+            }
+            rows = match (self.as_written, as_path(input)) {
+                (_, Some(path)) => {
+                    let reached = self.path_from(&rows, &path)?;
+                    self.join(rows, reached)?
+                }
+                (true, None) => {
+                    let other = self.eval(input)?;
+                    self.join(rows, other)?
+                }
+                (false, None) => self.eval_from(rows, input)?,
+            };
+        }
+        Ok(rows)
     }
 
     /// `Join(seed, pattern)`, with `pattern` evaluated from the seed where it can be.
@@ -173,19 +215,36 @@ impl Context<'_> {
                 let solutions = self.eval_from(seed, inner)?;
                 self.filter(solutions, expr)
             }
-            GraphPattern::Join { left, right } => {
-                let solutions = self.eval_from(seed, left)?;
-                self.eval_from(solutions, right)
+            GraphPattern::Join { inputs } => {
+                let mut solutions = seed;
+                for input in inputs {
+                    solutions = self.eval_from(solutions, input)?;
+                }
+                Ok(solutions)
             }
-            GraphPattern::Union { left, right } => {
-                let copy = Solutions {
-                    vars: seed.vars.clone(),
-                    table: seed.table.clone(),
-                    ordered: seed.ordered,
+            GraphPattern::Union { inputs } => {
+                // Each input from the seed's rows: a copy for all but the last.
+                let Some((last, rest)) = inputs.split_last() else {
+                    return Ok(seed);
                 };
-                let copy = self.produced(copy)?;
-                let (a, b) = (self.eval_from(copy, left)?, self.eval_from(seed, right)?);
-                self.union(a, b)
+                let mut united: Option<Solutions> = None;
+                for input in rest {
+                    let copy = Solutions {
+                        vars: seed.vars.clone(),
+                        table: seed.table.clone(),
+                        ordered: seed.ordered,
+                    };
+                    let rows = self.eval_from(self.produced(copy)?, input)?;
+                    united = Some(match united.take() {
+                        Some(before) => self.union(before, rows)?,
+                        None => rows,
+                    });
+                }
+                let rows = self.eval_from(seed, last)?;
+                match united {
+                    Some(before) => self.union(before, rows),
+                    None => Ok(rows),
+                }
             }
             GraphPattern::LeftJoin {
                 left,
@@ -202,19 +261,21 @@ impl Context<'_> {
                 let left = self.eval_from(seed, left)?;
                 self.optional(left, right, expression.as_ref())
             }
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } if seed.column(variable).is_none()
-                && reads_only_bound(
-                    &deep_variables(expression),
-                    &pushdown::certain(inner),
-                    &seed,
-                ) =>
+            GraphPattern::Extend { inner, bindings }
+                if bindings.iter().all(|(variable, expression)| {
+                    seed.column(variable).is_none()
+                        && reads_only_bound(
+                            &deep_variables(expression),
+                            &pushdown::certain(inner),
+                            &seed,
+                        )
+                }) =>
             {
-                let solutions = self.eval_from(seed, inner)?;
-                self.extend(solutions, variable, expression)
+                let mut solutions = self.eval_from(seed, inner)?;
+                for (variable, expression) in bindings {
+                    solutions = self.extend(solutions, variable, expression)?;
+                }
+                Ok(solutions)
             }
             _ => self.join_alone(seed, pattern),
         }
