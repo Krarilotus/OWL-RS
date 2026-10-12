@@ -64,6 +64,15 @@ timeout) to run once more past it, so that its record says what it needs.
   its memory cap, with the build from the worktree's own target volume. The build is
   `scripts/cargo-guarded.sh` inside that image (`CARGO_BUILD_JOBS`, default 4;
   `NRESE_MEMORY_CAP_GB`, default 8; the container capped to match).
+- **Or natively,** on a measure host without Docker (`NRESE_FAST_RUNTIME=native`, the
+  default where [hosts.toml](../hosts.toml) lists no `docker`): each case a host process in
+  a user scope (`systemd-run --user --scope`) capped at the case's memory without swap, the
+  same checks and report. The binaries come from a build host (`NRESE_FAST_BIN`, laid out
+  as a target directory; `NRESE_FAST_REVISION` names their source; both and each binary's
+  SHA-256 go into the report); the datasets are the verified inputs (read-only); generated
+  data goes to `NRESE_FAST_DATA` (default `~/nrese-bench/fast-data`), seeded from the
+  verified fast inputs. The peak is the scope's `memory.peak`, the same kind (`cgroup`)
+  as a container's. It builds nothing and converts no ontology.
 - **A quiet slot per case.** Each case's timed repetitions, and each comparison's runs, hold
   the machine's quiet slot (`scripts/quiet-slot.sh`: one timing at a time, no build running,
   new builds waiting), taken per case so other builds wait minutes, not the whole run.
