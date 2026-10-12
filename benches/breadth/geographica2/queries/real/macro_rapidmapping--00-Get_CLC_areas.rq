@@ -1,0 +1,15 @@
+PREFIX clc: <http://geo.linkedopendata.gr/corine/ontology#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> 
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+
+SELECT ?a ?aID ?aLandUse ?aGeo ?aGeoWKT 
+WHERE { 
+  GRAPH <http://geographica.di.uoa.gr/dataset/clc> { 
+    ?a rdf:type clc:Area ; 
+       clc:hasID ?aID ; 
+       clc:hasLandUse ?aLandUse ; 
+       <http://geo.linkedopendata.gr/corine/ontology#hasGeometry> ?aGeo . 
+    ?aGeo <http://geo.linkedopendata.gr/corine/ontology#asWKT> ?aGeoWKT. 
+  }  
+  FILTER(geof:sfIntersects(?aGeoWKT, "POLYGON((20.7858013633644 36.9947301001973,20.6070018260972 40.8452031365591,26.111857027467 40.875795540161,26.0004221014641 37.02141161985,20.7858013633644 36.9947301001973))"^^<http://www.opengis.net/ont/geosparql#wktLiteral>))
+}

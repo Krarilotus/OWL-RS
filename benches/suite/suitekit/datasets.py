@@ -111,7 +111,7 @@ def standard_inputs(root: Path, workloads: dict) -> dict[str, tuple[str, str, li
             continue
         tiers = [str(t) for t in workload.get("tiers", [])] or DEFINITIONS[name][1]
         for plan in plans(root, name, tiers, {}) or []:
-            for i in plan.inputs:
+            for i in plan.all_inputs():
                 if i.startswith("/data/"):
                     out.setdefault(i[len("/data/"):], (name, plan.tier, plan.prepare))
     return out

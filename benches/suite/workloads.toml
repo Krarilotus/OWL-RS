@@ -261,13 +261,14 @@ title = "ERA-SHACL-Benchmark: validation time and memory on a real railway knowl
 kind = "performance"
 tasks = ["validation"]
 needs = ["load", "shacl-core"]
-scales = "three sizes up to 55 M statements, three shape sets"
-source = "github.com/oeg-upm/ERA-SHACL-Benchmark (2025)"
-licence = "to check before use"
-tiers = ["-"]
-state = "planned"
-check = "the validation reports across engines"
-note = "Parts of its shapes use SHACL-SPARQL"
+scales = "ES 1.2 M, FR 11.3 M, ERA 55 M statements (plus the vocabularies); shape sets tds, core, era"
+source = "github.com/oeg-upm/ERA-SHACL-Benchmark at fe109c9 (2025); data Zenodo 14605744 (the RINF dump of 2025-01-05)"
+licence = "data CC-BY-4.0 (Zenodo); the repository states none: internal use until its authors agree"
+tiers = ["ES", "FR", "ERA"]
+state = "partial"
+kit = "benches/breadth/era-shacl"
+check = "every report against TopBraid's (the reference implementation of the spec's editor): results as (focus, path, value, component, severity) bags"
+note = "Engines in memory, each in its own container (upstream's CLI contract); the published numbers per engine are in the repository's results/. The era shape set uses SHACL-SPARQL"
 
 [fulltext-search]
 title = "Keyword search: ResearchSpace's search queries; LUBMft"
@@ -303,6 +304,132 @@ licence = "to check before use"
 tiers = ["-"]
 state = "planned"
 check = "answers against the single-store run"
+
+# --- breadth: each feature's benchmark, its competitors on their home turf (benches/breadth) ---
+[starbench]
+title = "StarBench: 56 SPARQL-star queries over BKR (61 M statements as RDF-star)"
+kind = "performance"
+tasks = ["basics"]
+needs = ["load", "query", "rdf12"]
+scales = "BKR, one size"
+source = "github.com/dkw-aau/SPARQL-star-Benchmark at 34e8aab (queries, CC-BY-4.0, in benches/breadth/starbench/queries); data Zenodo 4148888"
+licence = "queries CC-BY-4.0; data Apache-2.0"
+tiers = ["bkr"]
+state = "partial"
+kit = "benches/breadth/starbench"
+check = "answer counts across systems; GraphDB (the paper's fastest) as the reference"
+note = "GraphDB and Stardog load the RDF-star file; the RDF 1.2 systems one reifier per distinct quoted triple (rdfstar_to_rdf12.py), which keeps the answers. Published: Jena 4.7.0, Oxigraph 0.3.16, GraphDB 10.0.2 and a commercial 'Engine X' (Stardog 8.1, by the repository)"
+
+[geographica2]
+title = "Geographica 2: GeoSPARQL micro and macro workloads on real data, synthetic and scalability sets"
+kind = "performance"
+tasks = ["space"]
+needs = ["load", "query", "geosparql"]
+scales = "real-world sets (GAG, CORINE, LGD, GeoNames, DBpedia, Hotspots, Census), synthetic, scalability 10 K to 500 M"
+source = "github.com/AI-team-UoA/Geographica2 at 8bc1fe1; data and query lists at geographica2.di.uoa.gr"
+licence = "code Apache-2.0; datasets per source (CORINE, LinkedGeoData ODbL, GeoNames CC-BY): internal until checked"
+tiers = ["real", "census", "synthetic", "scalability"]
+state = "planned"
+kit = "benches/breadth/geographica2"
+check = "answer counts across systems; a dispute settled by a minimised witness"
+note = "Published: Strabon, uSeekM, Parliament, GraphDB 8.6.1, RDF4J 2.4.3 and a proprietary System X; Jena GeoSPARQL and QLever added here"
+
+[lubmft]
+title = "LUBMft: full-text and hybrid structured and full-text queries on LUBM with generated names and text"
+kind = "performance"
+tasks = ["search"]
+needs = ["load", "query", "fulltext"]
+scales = "LUBMft(1) to LUBMft(100): 0.13 M to 18 M statements, 6 M to 813 M terms"
+source = "Minack, Siberski, Nejdl, ESWC 2009; the generator and the query template are lost (l3s.de answers 404 since April 2024 and the archive kept only the page and the paper)"
+licence = "GPL (inherited from LUBM's UBA) for the lost code; a reconstruction would be ours"
+tiers = ["1", "10", "100"]
+state = "planned"
+check = "result sets across systems"
+note = "Needs a decision: reconstruct the generator from the paper (1990 census names, a topic model of the NIPS papers) or replace the benchmark"
+
+[fedshop]
+title = "FedShop200: federated BSBM-like shops, 20 to 200 members, 120 queries"
+kind = "performance"
+tasks = ["federation"]
+needs = ["query", "federation"]
+scales = "batches of 20, 40, ... 200 members"
+source = "github.com/GDD-Nantes/FedShop at 37f2e15; data, queries, reference source assignments and published results Zenodo 7919872"
+licence = "data CC-BY-4.0; code GPL-3.0 (run, never shipped)"
+tiers = ["20", "100", "200"]
+state = "planned"
+kit = "benches/breadth/fedshop"
+check = "answers against the reference source assignment's"
+note = "NRESE runs only the SERVICE-annotated reference source assignments: it has no source selection over a federation (a finding). FedX, CostFed, Semagrow, HeFQUIN, FedUP published"
+
+[vector-ann]
+title = "ann-benchmarks: recall against queries per second (SIFT-1M, GloVe-100, Fashion-MNIST, GIST-960)"
+kind = "performance"
+tasks = ["search"]
+needs = ["vector"]
+scales = "60 K to 1.2 M vectors, 100 to 960 dimensions"
+source = "github.com/erikbern/ann-benchmarks at 2e081ad; data ann-benchmarks.com"
+licence = "MIT; per dataset"
+tiers = ["sift-128-euclidean", "glove-100-angular"]
+state = "planned"
+kit = "benches/breadth/vectors"
+check = "recall@10 against the published exact neighbours"
+note = "Qdrant, Milvus and pgvector have upstream modules; NRESE's index runs as a library (the subprocess protocol) and through SPARQL"
+
+[vector-vibe]
+title = "VIBE: recall against throughput on modern embeddings, in and out of distribution"
+kind = "performance"
+tasks = ["search"]
+needs = ["vector"]
+scales = "0.5 M to 21 M vectors, 200 to 2,048 dimensions"
+source = "github.com/vector-index-bench/vibe at 7ac76c1; data huggingface.co/datasets/vector-index-bench/vibe"
+licence = "MIT; per dataset"
+tiers = ["agnews-mxbai-1024-euclidean", "arxiv-nomic-768-normalized"]
+state = "planned"
+kit = "benches/breadth/vectors"
+check = "recall@10 against the dataset's exact neighbours"
+note = "Algorithm level, one core, under Apptainer; the database systems aren't VIBE methods (their own ground is vector-dbbench)"
+
+[vector-filtered]
+title = "big-ann-benchmarks, NeurIPS'23 filtered track: YFCC-10M CLIP embeddings with tag filters"
+kind = "performance"
+tasks = ["search"]
+needs = ["vector"]
+scales = "10 M x 192 uint8, 100 K queries with one or two tags"
+source = "github.com/harsha-simhadri/big-ann-benchmarks at 89a3aba"
+licence = "MIT; data CC-BY-4.0"
+tiers = ["yfcc-10M"]
+state = "planned"
+kit = "benches/breadth/vectors"
+check = "recall@10 against the published ground truth; QPS at recall 0.9, as the track ranks"
+note = "Published on an Azure D8lds v5 (8 vCPU): parlayivf 37,902 QPS, puck 19,193, faiss 3,033 at recall 0.9"
+
+[vector-dbbench]
+title = "VectorDBBench: load, recall, QPS and p99 of vector databases, with and without filters"
+kind = "performance"
+tasks = ["search"]
+needs = ["vector"]
+scales = "Cohere 1 M and 10 M x 768; OpenAI 0.5 M and 5 M x 1,536; filters at 1 % and 99 %"
+source = "github.com/zilliztech/VectorDBBench at 139f8a3"
+licence = "MIT; datasets per source"
+tiers = ["performance768d1m", "performance768d1m1p", "performance768d1m99p"]
+state = "planned"
+kit = "benches/breadth/vectors"
+check = "recall against the case's ground truth"
+note = "The database vendors' own ground: Qdrant, Milvus, pgvector and LanceDB have clients there; NRESE needs one (SPARQL with nrv:search)"
+
+[memory-budget]
+title = "LUBM 1000 under memory caps: load, OWL 2 RL closure and the 14 queries at 16, 12, 8, 6, 4 and 2 GB"
+kind = "performance"
+tasks = ["RT1", "RT5"]
+needs = ["load", "query"]
+scales = "LUBM 1000: 138 M asserted"
+source = "the lubm workload's data (benches/datasets.toml, lubm-1000.nt)"
+licence = "GPL-2.0 (generator); data is generated"
+tiers = ["16g", "12g", "8g", "6g", "4g", "2g"]
+state = "planned"
+kit = "benches/breadth/memory-budget"
+check = "the same closure size and answers as uncapped"
+note = "Systems with a memory budget of their own degrade (NRESE's budgets, QLever's sort memory, JVM heaps); the others are killed at the cap: failed, never a time"
 
 # --- the fast suite -----------------------------------------------------------------------
 
