@@ -9,7 +9,7 @@ budget_gb = 300
 
 [[dataset]]
 file = "ann/glove-100-angular.hdf5"
-workload = "vector-ann"
+workload = "ann-benchmarks"
 tier = "glove-100-angular"
 role = "core"
 made_by = "curl http://ann-benchmarks.com/glove-100-angular.hdf5"
@@ -20,7 +20,7 @@ frozen = "2026-10-12"
 
 [[dataset]]
 file = "ann/sift-128-euclidean.hdf5"
-workload = "vector-ann"
+workload = "ann-benchmarks"
 tier = "sift-128-euclidean"
 role = "core"
 made_by = "curl http://ann-benchmarks.com/sift-128-euclidean.hdf5"
@@ -117,6 +117,50 @@ role = "core"
 made_by = "bash benches/breadth/era-shacl/prepare.sh (data under $NRESE_BREADTH/data)"
 bytes = 27809
 sha256 = "68ea89a9ce281931317d959c79fa9d3773bd16a40f5b7859a628631d5b93e7f2"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "geographica2/census.nt"
+workload = "geographica2"
+tier = "census"
+role = "core"
+made_by = "bash benches/breadth/geographica2/prepare.sh (data under $NRESE_BREADTH/data)"
+source = "https://geographica2.di.uoa.gr/datasets/ (fetched 2026-10-12; archive SHA-256s in the kit's fetch log)"
+bytes = 3455110190
+sha256 = "e4880dcde336255da817a622c60545c07556b97246457b1af58484bcc8916b51"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "geographica2/real.nq"
+workload = "geographica2"
+tier = "real"
+role = "core"
+made_by = "bash benches/breadth/geographica2/prepare.sh (data under $NRESE_BREADTH/data)"
+source = "https://geographica2.di.uoa.gr/datasets/ (fetched 2026-10-12; archive SHA-256s in the kit's fetch log)"
+bytes = 821070891
+sha256 = "9af00c5e1bbb2da674d8048195e5a3e6d18599835f0c763531afc4ea6ea349b2"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "geographica2/scalability-10m.nt"
+workload = "geographica2"
+tier = "scalability"
+role = "core"
+made_by = "bash benches/breadth/geographica2/prepare.sh (data under $NRESE_BREADTH/data)"
+source = "https://geographica2.di.uoa.gr/datasets/ (fetched 2026-10-12; archive SHA-256s in the kit's fetch log)"
+bytes = 1973293653
+sha256 = "54533e142447ef79696c2602070ed0e9619fce6066fc6f2b0440524c1d0436fb"
+frozen = "2026-10-12"
+
+[[dataset]]
+file = "geographica2/synthetic.nt"
+workload = "geographica2"
+tier = "synthetic"
+role = "core"
+made_by = "bash benches/breadth/geographica2/prepare.sh (data under $NRESE_BREADTH/data)"
+source = "https://geographica2.di.uoa.gr/datasets/ (fetched 2026-10-12; archive SHA-256s in the kit's fetch log)"
+bytes = 779992913
+sha256 = "b5e7b1e1ab2cb352246e6b77461d65d125180f0f58138e57596ac99926893bb6"
 frozen = "2026-10-12"
 
 [[dataset]]
