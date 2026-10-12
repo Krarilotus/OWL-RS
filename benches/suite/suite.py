@@ -65,6 +65,14 @@ def check(systems, workloads):
         for key in ("title", "kind", "tasks", "source", "licence", "check"):
             if key not in workload:
                 errors.append(f"workloads.toml [{name}]: {key} is missing")
+    # The cases of every group (benches/cases/README.md).
+    from suitekit import cases
+    with open(HERE.parent / "datasets.toml", "rb") as f:
+        frozen = {d["file"] for d in tomllib.load(f).get("dataset", [])}
+    try:
+        errors += cases.problems(cases.load(), systems, workloads, frozen)
+    except ValueError as error:
+        errors.append(str(error))
     return errors
 
 
@@ -109,7 +117,8 @@ def main(argv):
         from suitekit import status
         return status.main(argv[2:], systems, workloads, HERE.parent.parent)
     if argv[1:] == ["--check"]:
-        print(f"{len(systems)} systems, {len(workloads)} workloads: ok")
+        from suitekit import cases
+        print(f"{len(systems)} systems, {len(workloads)} workloads, {len(cases.load())} cases: ok")
         return 0
     if len(argv) == 2:
         system = systems.get(argv[1])

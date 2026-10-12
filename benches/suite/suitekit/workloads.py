@@ -162,7 +162,7 @@ def clients(root: Path, tier: str, settings: dict) -> Plan:
 
 
 def fast_data_name(spec: str) -> str:
-    """The file a fast-suite data spec names (benches/fast/cases.toml): `volume:FILE` is the
+    """The file a case's data spec names (benches/cases/README.md): `volume:FILE` is the
     dataset volume's FILE; `KIND key=value ...` the generator's output, by its parameters."""
     if spec.startswith("volume:"):
         return spec[len("volume:"):]
@@ -181,14 +181,13 @@ def fast(root: Path, tier: str, settings: dict) -> Plan:
     closure, `~plain` the case's data without reasoning, `~owl-horst` and the like the data
     under the system's own reasoner. benches/fast/compete.py prepares the files in the
     volume nrese-fast-data, which it passes as --data."""
-    import tomllib
+    from . import cases as registry
     name, _, semantics = tier.partition("~")
-    cases = {c["name"]: c for c in
-             tomllib.loads((root / "benches/fast/cases.toml").read_text(encoding="utf-8"))["case"]}
+    cases = {c["name"]: c for c in registry.load(root / "benches/cases")}
     case = cases.get(name)
     plan = Plan("fast", tier, note="a fast-suite case on its comparators (benches/fast/compete.py)")
     if case is None:
-        plan.unavailable = f"no case {name} in benches/fast/cases.toml"
+        plan.unavailable = f"no case {name} in benches/cases/"
         return plan
     semantics = semantics or case["semantics"]
     if semantics not in FAST_REGIMES:

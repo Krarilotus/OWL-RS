@@ -467,7 +467,7 @@ interval.
   only per query; `sameAs`, DL and recursive RL/EL rules are not, and are reported per system
   as "not expressible" (QLever has no reasoning, per its maintainers on 1 February 2026; three
   RDFS/RL pull requests, #2904, #2905 and #2907, are open and unmerged).
-- **Each case declares its comparators** (`system: semantics`) in `fast/cases.toml`; the
+- **Each case declares its comparators** (`system: semantics`) in its group's file under `cases/`; the
   table below is generated from it (`fast.py table --write`), and `fast.py compete` picks
   the comparators from it. A case only NRESE can run has no comparator: its own column.
 - **Home turf:** a win counts only where NRESE beats each competitor on what that
