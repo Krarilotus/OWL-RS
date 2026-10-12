@@ -29,8 +29,8 @@ Read [docs/README.md](docs/README.md) (which document answers what),
   (`git config nrese.buildHost`).
 - `literature/` is read-only. Results of licensed systems are never committed.
 - Write files with the editor tools; the shell mangles backslashes.
-- A commit written by an AI agent ends with its `Co-Authored-By` trailer (Claude's:
-  `Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>`).
+- Commit messages carry no AI co-author trailers (`Co-Authored-By: Claude …` and the like);
+  the `commit-msg` hook removes them.
 
 ## Reporting
 
