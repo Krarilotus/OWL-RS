@@ -9,8 +9,12 @@
 //! computed terms by position, so a hit in another query is renamed and renumbered into
 //! that query's own.
 
+use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+
+use sha2::{Digest, Sha256};
 
 use nrese_engine::SnapshotIdentity;
 use nrese_exec::{IdTable, computed_index};
@@ -385,60 +389,110 @@ pub(super) struct Joins<'p, 'e> {
     pub(super) order: &'p [usize],
     /// The conjuncts as given, before the joins applied any.
     pub(super) filters: &'p [(&'e Expression, Vec<Variable>)],
+    /// The prefixes' keys, made when the cache is first asked ([`PrefixKeys`]).
+    pub(super) keys: OnceCell<Option<PrefixKeys>>,
 }
 
-impl Joins<'_, '_> {
-    /// The variables the first `length` patterns of the order bind.
-    fn bound(&self, length: usize) -> Vec<Variable> {
-        let mut bound = Vec::new();
-        for &i in &self.order[..length] {
-            for v in self.scans[i].vars() {
-                if !bound.contains(&v) {
-                    bound.push(v);
-                }
-            }
-        }
-        bound
+/// The keys of a basic graph pattern's prefixes, chained: prefix k's key holds the digest
+/// of prefix k − 1's, the k-th triple with its range hint, and the conjuncts that apply
+/// from k on. Each key is a few dozen bytes and all of them O(n) to make, where each
+/// spelled out its whole prefix: a pattern of n triples took O(n²) bytes and O(n³) time to
+/// key, before and after every join (a path of 1,000 steps, 12 October 2026). Equal
+/// prefixes still share an entry: the chain is a function of the prefix, its variables
+/// numbered as they first occur; a SHA-256 link keeps distinct prefixes apart.
+pub(super) struct PrefixKeys {
+    /// Prefix k's key at k − 1; none from a triple or conjunct that can't be keyed on.
+    keys: Vec<Option<Key>>,
+    /// The variables by number, in the order they are first written.
+    vars: Vec<Variable>,
+    /// How many of them prefix k's key has numbered, at k − 1.
+    numbered: Vec<usize>,
+    /// The prefix length from which each variable is bound.
+    bound_at: HashMap<Variable, usize>,
+}
+
+impl PrefixKeys {
+    /// Prefix `length`'s key and its variables by number.
+    fn key(&self, length: usize) -> Option<(&Key, &[Variable])> {
+        let key = self.keys.get(length.checked_sub(1)?)?.as_ref()?;
+        Some((key, &self.vars[..self.numbered[length - 1]]))
+    }
+
+    /// The prefix length from which a conjunct reading `read` applies; `None` if no
+    /// prefix binds them all.
+    fn applies_from(&self, read: &[Variable]) -> Option<usize> {
+        read.iter()
+            .try_fold(1, |from: usize, v| Some(from.max(*self.bound_at.get(v)?)))
     }
 }
 
 impl Context<'_> {
-    /// The key of the first `length` patterns of `joins`' order; `None` if it isn't
-    /// cached.
-    fn prefix_key(
-        &self,
-        scope: &CacheScope,
-        joins: &Joins<'_, '_>,
-        length: usize,
-    ) -> Option<(Key, Vec<Variable>)> {
-        let mut encoder = self.key_start(scope);
-        encoder.tag(b'Q');
-        encoder.number(length as u64);
-        for &i in &joins.order[..length] {
-            encoder.triple(&joins.triples[i]).ok()?;
-            match joins.ranged[i] {
-                Some((_, ranges)) => {
-                    encoder.number(ranges.len() as u64);
-                    for (low, high) in ranges {
-                        encoder.number(low.raw());
-                        encoder.number(high.raw());
+    /// [`PrefixKeys`] for `joins`, made once, in one pass over its order: O(n + the
+    /// conjuncts).
+    fn prefix_keys<'j>(&self, joins: &'j Joins<'_, '_>) -> Option<&'j PrefixKeys> {
+        joins
+            .keys
+            .get_or_init(|| {
+                let scope = self.cache.as_ref()?;
+                let mut bound_at = HashMap::new();
+                for (step, &i) in joins.order.iter().enumerate() {
+                    for v in joins.scans[i].vars() {
+                        bound_at.entry(v).or_insert(step + 1);
                     }
                 }
-                None => encoder.number(u64::MAX),
-            }
-        }
-        let bound = joins.bound(length);
-        for (conjunct, read) in joins.filters {
-            if read.iter().all(|v| bound.contains(v)) {
-                encoder.tag(b'F');
-                encoder.expression(conjunct).ok()?;
-            }
-        }
-        let key = Key {
-            snapshot: scope.snapshot,
-            part: encoder.bytes.into(),
-        };
-        Some((key, encoder.vars))
+                let mut keys = PrefixKeys {
+                    keys: Vec::with_capacity(joins.order.len()),
+                    vars: Vec::new(),
+                    numbered: Vec::with_capacity(joins.order.len()),
+                    bound_at,
+                };
+                let applies: Vec<Option<usize>> = joins
+                    .filters
+                    .iter()
+                    .map(|(_, read)| keys.applies_from(read))
+                    .collect();
+                let mut encoder = self.key_start(scope);
+                encoder.tag(b'Q');
+                let start = encoder.bytes.len();
+                let mut link = [0u8; 32];
+                let mut keyed = true;
+                for (step, &i) in joins.order.iter().enumerate() {
+                    let length = step + 1;
+                    encoder.bytes.truncate(start);
+                    encoder.number(length as u64);
+                    encoder.bytes.extend_from_slice(&link);
+                    keyed = keyed && encoder.triple(&joins.triples[i]).is_ok();
+                    match joins.ranged[i] {
+                        Some((_, ranges)) => {
+                            encoder.number(ranges.len() as u64);
+                            for (low, high) in ranges {
+                                encoder.number(low.raw());
+                                encoder.number(high.raw());
+                            }
+                        }
+                        None => encoder.number(u64::MAX),
+                    }
+                    for ((conjunct, _), from) in joins.filters.iter().zip(&applies) {
+                        if keyed && *from == Some(length) {
+                            encoder.tag(b'F');
+                            keyed = encoder.expression(conjunct).is_ok();
+                        }
+                    }
+                    keys.keys.push(keyed.then(|| {
+                        #[cfg(test)]
+                        KEY_BYTES.with(|bytes| bytes.set(bytes.get() + encoder.bytes.len()));
+                        link = Sha256::digest(&encoder.bytes).into();
+                        Key {
+                            snapshot: scope.snapshot,
+                            part: encoder.bytes.as_slice().into(),
+                        }
+                    }));
+                    keys.numbered.push(encoder.vars.len());
+                }
+                keys.vars = encoder.vars;
+                Some(keys)
+            })
+            .as_ref()
     }
 
     /// The longest prefix of `joins`' order (of at least two patterns) that the result
@@ -451,7 +505,7 @@ impl Context<'_> {
         filters: &mut Vec<(&Expression, Vec<Variable>)>,
         whole: bool,
     ) -> NativeResult<Option<(Solutions, usize)>> {
-        let Some(scope) = &self.cache else {
+        let (Some(scope), Some(keys)) = (&self.cache, self.prefix_keys(joins)) else {
             return Ok(None);
         };
         let shortest = match whole {
@@ -459,16 +513,15 @@ impl Context<'_> {
             false => 2,
         };
         for length in (shortest..=joins.order.len()).rev() {
-            let Some((key, vars)) = self.prefix_key(scope, joins, length) else {
-                return Ok(None);
+            let Some((key, vars)) = keys.key(length) else {
+                continue;
             };
-            let Some(part) = scope.cache.lookup(&key) else {
+            let Some(part) = scope.cache.lookup(key) else {
                 continue;
             };
             let start = Instant::now();
-            let solutions = self.solutions_of(&part, &vars, None, "hit")?;
-            let bound = joins.bound(length);
-            filters.retain(|(_, read)| !read.iter().all(|v| bound.contains(v)));
+            let solutions = self.solutions_of(&part, vars, None, "hit")?;
+            filters.retain(|(_, read)| keys.applies_from(read).is_none_or(|from| from > length));
             if let Some(trace) = &self.trace {
                 let detail = joins.order[..length]
                     .iter()
@@ -499,20 +552,80 @@ impl Context<'_> {
         solutions: &Solutions,
         cost: std::time::Duration,
     ) {
-        let Some(scope) = &self.cache else {
+        let (Some(scope), Some(keys)) = (&self.cache, self.prefix_keys(joins)) else {
             return;
         };
         if length < 2 {
             return;
         }
-        let Some((key, vars)) = self.prefix_key(scope, joins, length) else {
+        let Some((key, vars)) = keys.key(length) else {
             return;
         };
         scope
             .cache
-            .offer(&key, solutions.table.memory_bytes(), cost, || {
-                let part = self.to_part(solutions, &vars)?;
+            .offer(key, solutions.table.memory_bytes(), cost, || {
+                let part = self.to_part(solutions, vars)?;
                 Some(crate::cache::Payload::Part(Arc::new(part)))
             });
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The bytes of the prefix keys made ([`PrefixKeys`]): the guard that they are linear in
+    /// a pattern's length.
+    static KEY_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use nrese_rdf::{GraphName, NamedNode, Quad};
+    use nrese_sparql_syntax::SparqlParser;
+
+    use crate::{QueryOptions, QueryResults, ResultCache, evaluate_query};
+
+    /// A path of n steps is a basic graph pattern of n triples, and each prefix of its join
+    /// order a part: their keys are linear in n (each spelled out its whole prefix, O(n²)
+    /// bytes and O(n³) time: 12 October 2026).
+    #[test]
+    fn prefix_keys_grow_linearly_with_the_pattern() {
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let node = |name: String| NamedNode::new_unchecked(format!("http://e/{name}"));
+        let mut tx = engine.transaction();
+        for s in 0..5 {
+            for p in 0..7 {
+                let quad = Quad::new(
+                    node(format!("s{s}")),
+                    node(format!("p{p}")),
+                    node(format!("s{}", (s + p) % 5)),
+                    GraphName::DefaultGraph,
+                );
+                tx.insert(quad.as_ref());
+            }
+        }
+        tx.commit().unwrap();
+        let options = QueryOptions {
+            result_cache: Some(std::sync::Arc::new(
+                ResultCache::new(1 << 24).admitting_all(),
+            )),
+            ..QueryOptions::default()
+        };
+        let bytes = |n: usize| {
+            let steps: Vec<String> = (0..n).map(|i| format!("<http://e/p{}>", i % 7)).collect();
+            let text = format!("SELECT * WHERE {{ ?s {} ?o }}", steps.join("/"));
+            let query = SparqlParser::new().parse_query(&text).unwrap();
+            super::KEY_BYTES.with(|bytes| bytes.set(0));
+            let snapshot = engine.snapshot();
+            let QueryResults::Solutions(solutions) =
+                evaluate_query(&snapshot, &query, &options).unwrap()
+            else {
+                unreachable!("a SELECT")
+            };
+            assert_eq!(solutions.count(), 5);
+            super::KEY_BYTES.with(|bytes| bytes.get())
+        };
+        let (short, long) = (bytes(100), bytes(400));
+        assert!(short > 0, "the prefixes were keyed");
+        assert!(long < 5 * short, "100 steps: {short} bytes, 400: {long}");
     }
 }

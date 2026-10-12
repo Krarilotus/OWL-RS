@@ -72,8 +72,8 @@ pub(super) fn correlation_safe(pattern: &GraphPattern, outer: &[Variable]) -> bo
     };
     match pattern {
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => true,
-        GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
-            correlation_safe(left, outer) && correlation_safe(right, outer)
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            inputs.iter().all(|input| correlation_safe(input, outer))
         }
         GraphPattern::Graph { inner, .. }
         | GraphPattern::Distinct { inner }
@@ -82,9 +82,12 @@ pub(super) fn correlation_safe(pattern: &GraphPattern, outer: &[Variable]) -> bo
         GraphPattern::Filter { expr, inner } => {
             correlation_safe(inner, outer) && covered(&deep_variables(expr), inner)
         }
-        GraphPattern::Extend {
-            inner, expression, ..
-        } => correlation_safe(inner, outer) && covered(&deep_variables(expression), inner),
+        GraphPattern::Extend { inner, bindings } => {
+            correlation_safe(inner, outer)
+                && bindings
+                    .iter()
+                    .all(|(_, expression)| covered(&deep_variables(expression), inner))
+        }
         GraphPattern::LeftJoin {
             left,
             right,
@@ -175,10 +178,12 @@ fn walk_pattern(pattern: &GraphPattern, out: &mut Vec<Variable>) {
             }
             walk_pattern(inner, out);
         }
-        GraphPattern::Join { left, right }
-        | GraphPattern::Lateral { left, right }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => {
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            for input in inputs {
+                walk_pattern(input, out);
+            }
+        }
+        GraphPattern::Lateral { left, right } | GraphPattern::Minus { left, right } => {
             walk_pattern(left, out);
             walk_pattern(right, out);
         }
@@ -197,14 +202,12 @@ fn walk_pattern(pattern: &GraphPattern, out: &mut Vec<Variable>) {
             walk_pattern(inner, out);
             walk_expression(expr, out);
         }
-        GraphPattern::Extend {
-            inner,
-            variable,
-            expression,
-        } => {
+        GraphPattern::Extend { inner, bindings } => {
             walk_pattern(inner, out);
-            push(out, variable);
-            walk_expression(expression, out);
+            for (variable, expression) in bindings {
+                push(out, variable);
+                walk_expression(expression, out);
+            }
         }
         GraphPattern::Values { variables, .. } => {
             for v in variables {

@@ -140,12 +140,21 @@ impl Engine<'_> {
             }
         }
         let ranges = &self.p.data.as_ref().expect("a program with data").ranges;
-        let verdict = theory.check(&vars, ranges, &mut self.deps);
+        let config = &self.config;
+        let verdict = theory.check_until(&vars, ranges, &mut self.deps, &|| {
+            config.stopped().is_some()
+        });
         self.theory = theory;
         match verdict {
-            Verdict::Sat { approximate } => {
+            Verdict::Sat {
+                approximate,
+                limited,
+            } => {
                 if let Some(why) = approximate {
                     self.data_approximate.get_or_insert(why);
+                }
+                if let Some(why) = limited {
+                    self.data_limited.get_or_insert(why);
                 }
                 Ok(())
             }
@@ -153,6 +162,9 @@ impl Engine<'_> {
                 self.stats.clashes += 1;
                 Err(Stop::Clash(dep))
             }
+            Verdict::Stopped => Err(Stop::GaveUp(
+                config.stopped().unwrap_or(super::TIME_BUDGET).to_owned(),
+            )),
         }
     }
 

@@ -7,6 +7,8 @@ use nrese_engine::{
     Transaction,
 };
 
+use rayon::prelude::*;
+
 use super::{Program, encode, pattern, storable, triple};
 use crate::delta::{self, Base, MemoryBase};
 use crate::eval::GroundProgram;
@@ -85,6 +87,27 @@ impl Base for EngineBase<'_> {
             || self.axioms.binary_search(&fact).is_ok()
             || self.committed(ReadModel::Asserted, fact)
     }
+
+    fn scan_asserted(&self, bound: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
+        for quad in self
+            .snapshot
+            .quads_for_pattern_in(ReadModel::Asserted, &pattern(bound, GraphSelector::Any))
+        {
+            if !self.deletes.contains(&quad) {
+                f(triple(quad));
+            }
+        }
+        self.inserts.scan(bound, f);
+        let matches = |fact: &Triple| {
+            bound
+                .iter()
+                .zip(fact)
+                .all(|(want, have)| want.is_none_or(|want| want == *have))
+        };
+        for axiom in self.axioms.iter().filter(|axiom| matches(axiom)) {
+            f(*axiom);
+        }
+    }
 }
 
 /// What [`maintain`] did to a transaction's inferred stack.
@@ -99,6 +122,8 @@ pub struct Maintenance {
     pub diagnostics: Vec<ListDiagnostic>,
     /// The ground program after the change, to reuse for the next commit.
     pub program: Option<GroundProgram>,
+    /// What the maintenance policy weighed and did ([`delta::policy`]).
+    pub work: delta::policy::Counts,
 }
 
 /// Keeps the transaction's inferred stack equal to the closure of its asserted state,
@@ -176,10 +201,20 @@ pub fn maintain(
             .collect();
         deleted.sort_unstable();
         deleted.dedup();
+        // A rebuild reads the asserted facts and writes the closure, both about the size
+        // of the stored state; the policy offers it to a change that inserts nothing
+        // ([`delta::policy::Plan::Rebuild`]).
+        let policy = delta::policy::Policy {
+            force: program.plan,
+            rebuild: inserted
+                .is_empty()
+                .then(|| tx.base().len_in(ReadModel::Materialised)),
+            split_rebuilds: program.stores_representatives(),
+        };
         if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
         } else {
-            delta::update_until(&base, &inserted, &deleted, rules, ground, stop)?
+            delta::update_with(&base, &inserted, &deleted, rules, ground, stop, policy)?
         }
     };
     let mut update = update;
@@ -190,15 +225,15 @@ pub fn maintain(
         &|id| tx.decode(TermId::from_raw(id)),
     ));
     let (mut inserted, mut removed) = (0, 0);
-    let mut recompute = false;
-    if revived {
-        recompute = true;
-    } else if program.stores_representatives() {
+    // Over representatives, a change that may split a class is rebuilt (B3a: the
+    // translation can't follow it; the representative view for the delta executor is B3b).
+    let mut rebuild = revived || update.policy.plan == delta::policy::Plan::Rebuild;
+    if !rebuild && program.stores_representatives() {
         match store_over_representatives(program, &update, &missing_axioms, tx) {
             Some((added, dropped)) => (inserted, removed) = (added, dropped),
-            None => recompute = true,
+            None => rebuild = true,
         }
-    } else {
+    } else if !rebuild {
         // A statement asserted in any graph is explicit, never also inferred (the engine
         // enforces that for the default graph only).
         let asserted_now: Vec<EncodedTriple> = tx.inserted().map(EncodedTriple::from).collect();
@@ -218,31 +253,62 @@ pub fn maintain(
             }
         }
     }
-    if recompute {
-        let closure = match rebuilt.take() {
+    if rebuild {
+        let mut closure = match rebuilt.take() {
             Some(closure) => closure,
             None => super::materialise_until(program, &tx.pending_snapshot(), stop)?,
         };
-        // O(stored closure + rebuilt closure) visits, with indexed transaction updates.
-        // A stored snapshot shares the old runs and avoids expanding compact equality.
         // An interruption drops the transaction, these changes with it.
         if stop() {
             return Err(delta::Interrupted);
         }
-        let before = tx.pending_snapshot().stored();
-        for quad in before.quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all()) {
-            tx.remove_inferred(quad.into());
+        // Only the difference is applied: O(stored + rebuilt closure) to sort and walk,
+        // and a transaction update per fact that changed. A stored snapshot shares the old
+        // runs and avoids expanding compact equality.
+        let mut before: Vec<EncodedTriple> = tx
+            .pending_snapshot()
+            .stored()
+            .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+            .map(EncodedTriple::from)
+            .collect();
+        before.par_sort_unstable();
+        before.dedup();
+        closure.inferred.par_sort_unstable();
+        closure.inferred.dedup();
+        // One merge walk over both (a binary search per fact cost 130 ms of a 1.4 M-fact
+        // stack's rebuild, against 70 for its materialisation).
+        let (old, new) = (&before, &closure.inferred);
+        let (mut i, mut j) = (0, 0);
+        while i < old.len() || j < new.len() {
+            if j == new.len() || (i < old.len() && old[i] < new[j]) {
+                removed += u64::from(tx.remove_inferred(old[i]));
+                i += 1;
+            } else if i == old.len() || new[j] < old[i] {
+                inserted += u64::from(tx.insert_inferred(new[j]));
+                j += 1;
+            } else {
+                (i, j) = (i + 1, j + 1);
+            }
         }
-        for fact in closure.inferred {
-            tx.insert_inferred(fact);
-        }
-        let counts = tx.inferred_pending();
-        (inserted, removed) = (counts.0 as u64, counts.1 as u64);
         update.rounds += closure.rounds;
         // The delta cache may still contain heads rewritten for a formerly hidden
         // class. Ground the final prospective state, and publish this cache only if
         // the caller commits. Existing unrelated violations remain tolerated.
-        update.program = Some(program.ground_program(&tx.pending_snapshot()));
+        let after = program.ground_program(&tx.pending_snapshot());
+        if update.policy.plan == delta::policy::Plan::Rebuild {
+            // No delta ran: the list axioms the change left unusable, as it reports them.
+            let before = match ground {
+                Some(ground) => std::borrow::Cow::Borrowed(ground),
+                None => std::borrow::Cow::Owned(program.ground_program(tx.base())),
+            };
+            update.diagnostics = after
+                .list_diagnostics
+                .iter()
+                .filter(|d| !before.list_diagnostics.contains(d))
+                .copied()
+                .collect();
+        }
+        update.program = Some(after);
         if stop() {
             return Err(delta::Interrupted);
         }
@@ -254,6 +320,7 @@ pub fn maintain(
         rounds: update.rounds,
         diagnostics: update.diagnostics,
         program: update.program,
+        work: update.policy,
     })
 }
 
@@ -304,6 +371,10 @@ fn store_over_representatives(
     let mut moved: Vec<Triple> = Vec::new();
     if !lost.is_empty() {
         let stored = tx.base().stored();
+        // What the commit deletes stays deleted: its asserted statements, and the inferred
+        // facts the update removes (over every identity, so their stored form too).
+        let deleted: HashSet<EncodedQuad> = tx.deleted().collect();
+        let removal: HashSet<Triple> = update.remove.iter().copied().collect();
         let mut stale: Vec<Triple> = Vec::new();
         for &term in &lost {
             for position in 0..3 {
@@ -318,6 +389,7 @@ fn store_over_representatives(
                 moved.extend(
                     stored
                         .quads_for_pattern_in(ReadModel::Asserted, &pattern)
+                        .filter(|quad| !deleted.contains(quad))
                         .map(|quad| rewrite(triple(quad))),
                 );
             }
@@ -335,7 +407,9 @@ fn store_over_representatives(
         stale.sort_unstable();
         stale.dedup();
         for fact in stale {
-            moved.push(rewrite(fact));
+            if !removal.contains(&fact) {
+                moved.push(rewrite(fact));
+            }
             if tx.remove_inferred(encode(fact)) {
                 removed += 1;
             }
@@ -413,6 +487,231 @@ mod tests {
     use nrese_engine::{Engine, EngineConfig};
     use nrese_rdf::{BlankNodeRef, NamedNodeRef};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// B3a: random commits that merge and split `owl:sameAs` classes (asserted equalities,
+    /// functional and inverse-functional properties) leave the inferred stack equal to a
+    /// fresh closure, under each plan of the maintenance policy forced and the cheapest, in
+    /// both store modes (every copy, or over representatives). Varied by `NRESE_FUZZ_SEED`.
+    #[test]
+    fn every_maintenance_plan_keeps_the_stack_equal_to_recomputation() {
+        use crate::delta::policy::Plan;
+        let fuzz: u64 = std::env::var("NRESE_FUZZ_SEED")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0);
+        let plans = [
+            None,
+            Some(Plan::Dred),
+            Some(Plan::Recompute),
+            Some(Plan::Rebuild),
+        ];
+        let mut failures: Vec<String> = Vec::new();
+        for compact in [false, true] {
+            for plan in plans {
+                let mut taken: HashSet<Plan> = HashSet::new();
+                for seed in 1..=6u64 {
+                    let mut state = (seed ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15)).max(1);
+                    let mut below = move |n: usize| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        (state % n as u64) as usize
+                    };
+                    let engine = Engine::new(EngineConfig {
+                        background_maintenance: false,
+                        ..EngineConfig::default()
+                    })
+                    .unwrap();
+                    let mut tx = engine.transaction();
+                    let program =
+                        Program::compile(&crate::rulesets::Ruleset::Owl2Rl.into(), &|t| {
+                            tx.intern(t)
+                        })
+                        .storing_representatives(compact)
+                        .maintaining_by(plan);
+                    if compact {
+                        engine.set_equality(program.same_as.map(TermId::from_raw));
+                    }
+                    let iri = |s: &str| {
+                        let name = format!("http://example.com/{s}");
+                        tx.intern(NamedNodeRef::new_unchecked(&name).into()).raw()
+                    };
+                    let entities: Vec<u64> = (0..8).map(|i| iri(&format!("e{i}"))).collect();
+                    let [p, q, f, i, c, d] = ["p", "q", "f", "i", "C", "D"].map(iri);
+                    let same_as = program.same_as.unwrap();
+                    let vocabulary =
+                        |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+                    let rdf_type = vocabulary("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+                    let functional = vocabulary("http://www.w3.org/2002/07/owl#FunctionalProperty");
+                    let inverse =
+                        vocabulary("http://www.w3.org/2002/07/owl#InverseFunctionalProperty");
+                    let sub_property =
+                        vocabulary("http://www.w3.org/2000/01/rdf-schema#subPropertyOf");
+                    let sub_class = vocabulary("http://www.w3.org/2000/01/rdf-schema#subClassOf");
+                    let schema = [
+                        [f, rdf_type, functional],
+                        [i, rdf_type, inverse],
+                        [q, sub_property, p],
+                        [c, sub_class, d],
+                    ];
+                    // Equalities half the time: classes form, merge and split.
+                    let fact = |below: &mut dyn FnMut(usize) -> usize| -> Triple {
+                        let predicate = [same_as, same_as, same_as, p, q, f, i, rdf_type];
+                        let predicate = predicate[below(predicate.len())];
+                        let object = match predicate == rdf_type {
+                            true => c,
+                            false => entities[below(entities.len())],
+                        };
+                        [entities[below(entities.len())], predicate, object]
+                    };
+                    let mut asserted: Vec<Triple> = schema.to_vec();
+                    for _ in 0..14 {
+                        asserted.push(fact(&mut below));
+                    }
+                    for &fact in &asserted {
+                        tx.insert_encoded(encode(fact).in_default_graph());
+                    }
+                    tx.commit().unwrap();
+                    let remat = engine.rematerialisation();
+                    let closure = super::super::materialise(&program, remat.base());
+                    remat.finish(closure.inferred).unwrap();
+                    let mut ground = program.ground_program(&engine.snapshot());
+                    for step in 0..12 {
+                        // Every other commit deletes only (what a rebuild is offered for).
+                        let changes: Vec<(Triple, bool)> = (0..1 + below(3))
+                            .map(|_| match step % 2 == 0 && !asserted.is_empty() {
+                                true => (asserted[below(asserted.len())], false),
+                                false => {
+                                    let fact = fact(&mut below);
+                                    (fact, !asserted.contains(&fact))
+                                }
+                            })
+                            .collect();
+                        let mut tx = engine.transaction();
+                        for &(fact, insert) in &changes {
+                            let quad = encode(fact).in_default_graph();
+                            if insert {
+                                tx.insert_encoded(quad);
+                                asserted.push(fact);
+                            } else {
+                                tx.remove_encoded(quad);
+                                asserted.retain(|&a| a != fact);
+                            }
+                        }
+                        let done =
+                            maintain(&program, Some(&ground), &mut tx, crate::eval::NEVER).unwrap();
+                        assert!(done.violations.is_empty(), "no inconsistency is possible");
+                        let took = done.work.plan;
+                        taken.insert(took);
+                        tx.commit().unwrap();
+                        let snapshot = engine.snapshot();
+                        if let Some(program) = done.program {
+                            ground = program;
+                        }
+                        let stored: HashSet<EncodedTriple> = snapshot
+                            .stored()
+                            .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+                            .map(Into::into)
+                            .collect();
+                        let fresh: HashSet<EncodedTriple> =
+                            super::super::materialise(&program, &snapshot)
+                                .inferred
+                                .into_iter()
+                                .filter(|t| {
+                                    !snapshot
+                                        .contains_in(ReadModel::Asserted, &t.in_default_graph())
+                                })
+                                .collect();
+                        if stored != fresh {
+                            let text = |t: &EncodedTriple| {
+                                let [s, p, o] = triple(t.in_default_graph()).map(|id| {
+                                    super::super::decoded(snapshot.decode(TermId::from_raw(id)), id)
+                                });
+                                format!("{s} {p} {o}")
+                            };
+                            let extra: Vec<String> = stored.difference(&fresh).map(text).collect();
+                            let missing: Vec<String> =
+                                fresh.difference(&stored).map(text).collect();
+                            let changes: Vec<String> = changes
+                                .iter()
+                                .map(|(fact, insert)| {
+                                    let sign = if *insert { "+" } else { "-" };
+                                    format!("{sign}{}", text(&encode(*fact)))
+                                })
+                                .collect();
+                            failures.push(format!(
+                                "compact {compact}, plan {plan:?} (took {took:?}), seed {seed}, step {step}: \
+                                 {changes:?}; extra {extra:?}; missing {missing:?}"
+                            ));
+                            break;
+                        }
+                    }
+                }
+                if let Some(plan) = plan {
+                    assert!(
+                        taken.contains(&plan),
+                        "compact {compact}: {plan:?} never taken"
+                    );
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{}",
+            failures.join(
+                "
+"
+            )
+        );
+    }
+
+    /// A rebuild runs no delta, and still reports the list axioms a deletion leaves
+    /// unusable, as the delta does.
+    #[test]
+    fn a_rebuild_reports_the_list_axioms_a_deletion_breaks() {
+        use crate::delta::policy::Plan;
+        let mut reported = Vec::new();
+        for plan in [Plan::Dred, Plan::Rebuild] {
+            let engine = Engine::new(EngineConfig {
+                background_maintenance: false,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let mut tx = engine.transaction();
+            let program =
+                Program::compile(&crate::rulesets::Ruleset::Owl2Rl.into(), &|t| tx.intern(t))
+                    .maintaining_by(Some(plan));
+            let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+            let [x, c, d] = ["X", "C", "D"].map(|s| iri(&format!("http://example.com/{s}")));
+            let intersection = iri("http://www.w3.org/2002/07/owl#intersectionOf");
+            let first = iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#first");
+            let rest = iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#rest");
+            let nil = iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#nil");
+            let [l, m] = ["l", "m"].map(|s| tx.intern(BlankNodeRef::new_unchecked(s).into()).raw());
+            let tail = [m, rest, nil];
+            for fact in [
+                [x, intersection, l],
+                [l, first, c],
+                [l, rest, m],
+                [m, first, d],
+                tail,
+            ] {
+                tx.insert_encoded(encode(fact).in_default_graph());
+            }
+            tx.commit().unwrap();
+            let remat = engine.rematerialisation();
+            let closure = super::super::materialise(&program, remat.base());
+            remat.finish(closure.inferred).unwrap();
+            let ground = program.ground_program(&engine.snapshot());
+            let mut tx = engine.transaction();
+            tx.remove_encoded(encode(tail).in_default_graph());
+            let done = maintain(&program, Some(&ground), &mut tx, crate::eval::NEVER).unwrap();
+            assert_eq!(done.work.plan, plan);
+            reported.push(done.diagnostics);
+        }
+        assert!(!reported[0].is_empty(), "the list lost its end");
+        assert_eq!(reported[0], reported[1]);
+    }
 
     #[test]
     fn cancelling_a_split_or_revival_discards_the_prospective_closure() {

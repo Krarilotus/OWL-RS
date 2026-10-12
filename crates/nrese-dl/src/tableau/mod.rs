@@ -372,8 +372,18 @@ pub(crate) fn answer_of(end: End, program: &Program, engine: &Engine<'_>) -> Ans
     match end {
         End::Refuted => Answer::Inconsistent,
         End::GaveUp(why) => Answer::GaveUp(why),
-        End::Model if program.weakened.is_empty() && engine.data_approximate.is_none() => {
+        End::Model
+            if program.weakened.is_empty()
+                && engine.data_approximate.is_none()
+                && engine.data_limited.is_none() =>
+        {
             Answer::Consistent
+        }
+        End::Model if program.weakened.is_empty() && engine.data_approximate.is_none() => {
+            Answer::GaveUp(format!(
+                "datatypes: {}",
+                engine.data_limited.as_deref().unwrap_or_default()
+            ))
         }
         End::Model => {
             let mut why = program.weakened.clone();

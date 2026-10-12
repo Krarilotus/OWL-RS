@@ -33,6 +33,12 @@
 //! budget is smaller: a quarter of it, so a batch fits where the whole ABox didn't), each
 //! decided as one
 //! ontology: the TBox, the batch's assertions, the stubs of its split edges.
+//!
+//! **After a change of assertions** ([`after_assertions`], docs/design/owl2-dl.md §9): of
+//! a consistent ontology whose change removed assertions and added some about a set of
+//! individuals, the TBox as it was, an island without such an individual holds only
+//! assertions the ontology held before, so it is consistent (a subset of a consistent
+//! ontology is); only the islands with one are decided.
 
 use std::collections::{HashMap, HashSet};
 
@@ -70,7 +76,7 @@ pub struct Islands {
 
 /// The ABox of `ontology` in islands, or why it is decided whole.
 pub fn split(ontology: &Ontology) -> Split {
-    split_into(ontology, BATCH)
+    split_into(ontology, BATCH, None)
 }
 
 /// The batch size for `config`: [`BATCH`] assertions, at most a quarter of its node budget.
@@ -78,8 +84,9 @@ fn batch_for(config: &tableau::Config) -> usize {
     BATCH.min((config.max_nodes / 4).max(16))
 }
 
-/// [`split`] with batches of about `batch` assertions.
-fn split_into(ontology: &Ontology, batch: usize) -> Split {
+/// [`split`] with batches of about `batch` assertions; `touched`: only the islands with
+/// one of these individuals.
+fn split_into(ontology: &Ontology, batch: usize, touched: Option<&HashSet<Term>>) -> Split {
     // What the tableau decides: a negative assertion over a non-simple property is a
     // universal there (`tableau::prepared`), which reads the edges the property's chains
     // compose, so the analysis must see it too.
@@ -128,7 +135,7 @@ fn split_into(ontology: &Ontology, batch: usize) -> Split {
             }
         }
     }
-    parts.islands(ontology, &roles, batch)
+    parts.islands(ontology, &roles, batch, touched)
 }
 
 /// Whether `ontology` is consistent: the whole ABox first, and island by island
@@ -145,7 +152,7 @@ pub fn consistency(ontology: &Ontology, config: &tableau::Config) -> tableau::Ou
     if let Some(why) = config.stopped() {
         return tableau::Outcome::stopped(why);
     }
-    match split_into(ontology, batch_for(config)) {
+    match split_into(ontology, batch_for(config), None) {
         Split::Whole(_) => whole,
         Split::Islands(islands) => match decide(&islands, config, tableau::consistency) {
             Some(outcome)
@@ -170,10 +177,37 @@ pub fn by_islands(ontology: &Ontology, config: &tableau::Config) -> tableau::Out
     if let Some(why) = config.stopped() {
         return tableau::Outcome::stopped(why);
     }
-    match split_into(ontology, batch_for(config)) {
+    match split_into(ontology, batch_for(config), None) {
         Split::Whole(_) => tableau::consistency(ontology, config),
         Split::Islands(islands) => decide(&islands, config, tableau::consistency)
             .unwrap_or_else(|| tableau::consistency(ontology, config)),
+    }
+}
+
+/// Whether `ontology` is consistent, given that it was before a change that removed
+/// assertions and added assertions about `touched`, its TBox unchanged: only the islands
+/// with a touched individual are decided (the module docs). `None` where the ABox doesn't
+/// split (the caller decides the whole). O(the split + the touched islands' runs).
+pub fn after_assertions(
+    ontology: &Ontology,
+    touched: &HashSet<Term>,
+    config: &tableau::Config,
+) -> Option<tableau::Outcome> {
+    let config = &*config.started();
+    if let Some(why) = config.stopped() {
+        return Some(tableau::Outcome::stopped(why));
+    }
+    match split_into(ontology, batch_for(config), Some(touched)) {
+        Split::Whole(_) => None,
+        Split::Islands(islands) => Some(
+            decide(&islands, config, tableau::consistency).unwrap_or_else(|| tableau::Outcome {
+                // No island is touched: nothing the ontology says is new.
+                answer: tableau::Answer::Consistent,
+                telemetry: tableau::Telemetry::default(),
+                model: None,
+                features: tableau::Features::default(),
+            }),
+        ),
     }
 }
 
@@ -487,8 +521,15 @@ impl Parts {
         }
     }
 
-    /// The islands of the assertions, packed into batches.
-    fn islands(mut self, ontology: &Ontology, roles: &HashSet<Term>, batch: usize) -> Split {
+    /// The islands of the assertions, packed into batches; `touched`: only those with one
+    /// of these individuals.
+    fn islands(
+        mut self,
+        ontology: &Ontology,
+        roles: &HashSet<Term>,
+        batch: usize,
+        touched: Option<&HashSet<Term>>,
+    ) -> Split {
         let n = self.parent.len();
         let roots: Vec<usize> = (0..n).map(|i| self.find(i)).collect();
         let mut island_of: HashMap<usize, usize> = HashMap::new();
@@ -501,6 +542,13 @@ impl Parts {
             return Split::Whole("the ABox is one island".into());
         }
         let island = |t: &Term| island_of[&roots[self.index[t]]];
+        let kept: Option<HashSet<usize>> = touched.map(|touched| {
+            touched
+                .iter()
+                .filter(|t| self.index.contains_key(t))
+                .map(island)
+                .collect()
+        });
         let mut sizes = vec![0usize; count];
         for &r in &roots {
             sizes[island_of[&r]] += 1;
@@ -549,7 +597,9 @@ impl Parts {
             }
         }
         // Largest islands first, packed into batches of about `batch` assertions.
-        let mut order: Vec<usize> = (0..count).collect();
+        let mut order: Vec<usize> = (0..count)
+            .filter(|i| kept.as_ref().is_none_or(|k| k.contains(i)))
+            .collect();
         order.sort_by_key(|&i| std::cmp::Reverse(per[i].len()));
         let mut batches = Vec::new();
         let mut current: Vec<Axiom> = Vec::new();

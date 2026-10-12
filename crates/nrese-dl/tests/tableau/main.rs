@@ -9,7 +9,7 @@ mod sat;
 
 use build::Build;
 use nrese_dl::tableau::{Answer, Config, consistency, satisfiable};
-use nrese_owl::{Axiom, Characteristic, ClassExpr, ObjProp, normalise};
+use nrese_owl::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, ObjProp, RangeId, normalise};
 
 /// The answer under every combination of the switches; they must agree.
 fn answer(o: &nrese_owl::Ontology) -> Answer {
@@ -740,6 +740,84 @@ fn the_universal_property_relates_everything() {
     assert!(matches!(answer(&b.o), Answer::Unsupported(_)));
 }
 
+/// Guard: U as a subproperty (a chain, an equivalence, an inverse) and in a key is
+/// decided; each was unsupported before (OWL 2 DL allows them: §11.2 restricts only
+/// simple-role positions).
+#[test]
+fn the_universal_property_as_a_subproperty_and_in_keys() {
+    let top = ObjProp::Named(501);
+    let r = ObjProp::Named(200);
+    let s = ObjProp::Named(201);
+    let universal = |b: &mut Build| b.o.builtin.top_object = Some(501);
+    // `U ⊑ R`, written as each form: R relates everything, so `¬R(a, b)` is inconsistent
+    // and `a: ∀R.C, b: ¬C` too; without either, consistent.
+    let forms: [&dyn Fn(&mut Build); 4] = [
+        &|b| b.axiom(Axiom::SubObjectPropertyOf(vec![top], r)),
+        &|b| b.axiom(Axiom::EquivalentObjectProperties(vec![r, top])),
+        &|b| b.axiom(Axiom::EquivalentObjectProperties(vec![r, s, top])),
+        &|b| b.axiom(Axiom::InverseObjectProperties(r, top)),
+    ];
+    for (k, form) in forms.iter().enumerate() {
+        let mut b = Build::default();
+        universal(&mut b);
+        form(&mut b);
+        let c = b.class(1);
+        let all = b.all(r, c);
+        b.assert(all, 100);
+        assert_eq!(answer(&b.o), Answer::Consistent, "form {k}");
+        let nc = b.not(c);
+        b.assert(nc, 101);
+        assert_eq!(answer(&b.o), Answer::Inconsistent, "form {k}");
+        let mut b = Build::default();
+        universal(&mut b);
+        form(&mut b);
+        b.role_assertion(201, 100, 101);
+        assert_eq!(answer(&b.o), Answer::Consistent, "form {k}");
+        b.axiom(Axiom::NegativeObjectPropertyAssertion(200, 100, 101));
+        assert_eq!(answer(&b.o), Answer::Inconsistent, "form {k}");
+    }
+    // `R ∘ U ⊑ S`: what has an R-successor is S-related to everything.
+    let mut b = Build::default();
+    universal(&mut b);
+    b.axiom(Axiom::SubObjectPropertyOf(vec![r, top], s));
+    let c = b.class(1);
+    let all = b.all(s, c);
+    b.assert(all, 100);
+    let nc = b.not(c);
+    b.assert(nc, 102);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.role_assertion(200, 100, 101);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // A key over U alone: every two named instances of C are one; a key over U and R
+    // asks R too.
+    for with_r in [false, true] {
+        let mut b = Build::default();
+        universal(&mut b);
+        let c = b.class(1);
+        let key = if with_r { vec![top, r] } else { vec![top] };
+        b.axiom(Axiom::HasKey(c, key, Vec::new()));
+        b.assert(c, 100);
+        b.assert(c, 101);
+        b.different(100, 101);
+        let expected = if with_r {
+            Answer::Consistent
+        } else {
+            Answer::Inconsistent
+        };
+        assert_eq!(answer(&b.o), expected, "with R: {with_r}");
+        if with_r {
+            b.role_assertion(200, 100, 102);
+            b.role_assertion(200, 101, 102);
+            assert_eq!(answer(&b.o), Answer::Inconsistent);
+        }
+    }
+    // What OWL 2 DL rules out stays unsupported: U is composite, not simple (§11.1).
+    let mut b = Build::default();
+    universal(&mut b);
+    b.characteristic(Characteristic::Functional, top);
+    assert!(matches!(answer(&b.o), Answer::Unsupported(_)));
+}
+
 #[test]
 fn horn_encodings_keep_their_answers() {
     // Man ⊔ Woman ⊑ Person, Person ⊓ ∃worksFor.Org ⊑ Employee with worksFor transitive;
@@ -971,4 +1049,82 @@ fn keyed_plans_run_on_a_self_loop() {
     b.assert(x, 1000);
     let out = consistency(&b.o, &Config::default());
     assert_eq!(out.answer, Answer::Inconsistent, "{}", out.telemetry);
+}
+
+/// Guard (small-scope cases 623, 677, 732, 786, 12 October 2026): operands of a
+/// disjointness that the universal property's rewriting makes equal (`∃U.{a}` and `⊤`
+/// are both `⊤`) make it empty; dropping the repeat answered "consistent".
+#[test]
+fn disjoint_operands_the_universal_property_makes_equal() {
+    let top = ObjProp::Named(501);
+    let mut b = Build::default();
+    b.o.builtin.top_object = Some(501);
+    let a_value = b.e(ClassExpr::HasValue(top, 100));
+    let thing = b.e(ClassExpr::Thing);
+    b.disjoint(a_value, thing);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    let mut b = Build::default();
+    b.o.builtin.top_object = Some(501);
+    let b_value = b.e(ClassExpr::HasValue(top, 101));
+    let a_value = b.e(ClassExpr::HasValue(top, 100));
+    let mut parts = vec![a_value, b_value];
+    parts.sort();
+    b.axiom(Axiom::DisjointUnion(1, parts));
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+/// Guard: fourteen distinct patterns in the ontology, each range with one, are decided
+/// (the limit of patterns one set of values combines is per combination, not per
+/// ontology; past twelve in the ontology every pattern was left undecided); a variable
+/// whose own constraints combine fourteen gives up, never answers.
+#[test]
+fn many_patterns_are_decided_where_each_range_has_few() {
+    let mut b = Build::default();
+    let d = 300;
+    let string = b.term(Some("http://www.w3.org/2001/XMLSchema#string".into()));
+    let pattern = b.term(Some("http://www.w3.org/2001/XMLSchema#pattern".into()));
+    let mut ranges = Vec::new();
+    for k in 0..14 {
+        let source = b.literal(&format!("x{k}[a-z]*"), "string");
+        ranges.push(b.range(DataRange::Restriction(string, vec![(pattern, source)])));
+    }
+    for (k, &r) in ranges.iter().enumerate() {
+        let c = b.class(1 + k as u64);
+        let some = b.e(ClassExpr::DataSome(d, r));
+        b.sub(c, some);
+    }
+    let first = b.class(1);
+    b.assert(first, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    // One value in all fourteen: past what a set combines, the theory gives up (it
+    // never says consistent or inconsistent on a bound).
+    let mut all = b.o.clone();
+    let and = RangeId(all.ranges.intern(DataRange::And(ranges.clone())));
+    let some = ExprId(all.classes.intern(ClassExpr::DataSome(d, and)));
+    all.axioms.push(Axiom::ClassAssertion(some, 101));
+    all.sources.push(Vec::new());
+    assert!(matches!(
+        consistency(&all, &Config::default()).answer,
+        Answer::GaveUp(_) | Answer::Inconsistent
+    ));
+}
+
+/// A key over a non-simple property reads the pairs the property's chains compose, not
+/// only the asserted edges: with `r` transitive, `r(a, b)`, `r(b, c)` and `r(d, c)`, the
+/// named individuals `a` and `d` of `C` share the `r`-value `c`, so the key makes them one.
+#[test]
+fn keys_read_the_pairs_a_transitive_property_composes() {
+    let r = ObjProp::Named(200);
+    let mut b = Build::default();
+    let c = b.class(1);
+    b.characteristic(Characteristic::Transitive, r);
+    b.axiom(Axiom::HasKey(c, vec![r], Vec::new()));
+    b.role_assertion(200, 100, 101);
+    b.role_assertion(200, 101, 102);
+    b.role_assertion(200, 103, 102);
+    b.assert(c, 100);
+    b.assert(c, 103);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.different(100, 103);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
 }

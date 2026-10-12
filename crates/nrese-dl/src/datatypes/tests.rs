@@ -259,7 +259,10 @@ fn the_theory_agrees_with_brute_force_and_its_clashes_suffice() {
             let d = dep(p, &mut deps);
             theory.merge(vs[a], vs[b], d, &mut deps);
         }
-        let mut verdict = Verdict::Sat { approximate: None };
+        let mut verdict = Verdict::Sat {
+            approximate: None,
+            limited: None,
+        };
         for component in theory.components(&mut deps) {
             let v = theory.check(&component, &ranges, &mut deps);
             if matches!(v, Verdict::Clash(_)) {
@@ -267,8 +270,10 @@ fn the_theory_agrees_with_brute_force_and_its_clashes_suffice() {
                 break;
             }
             if let Verdict::Sat {
-                approximate: Some(why),
-            } = v
+                approximate,
+                limited,
+            } = &v
+                && let Some(why) = approximate.as_ref().or(limited.as_ref())
             {
                 panic!("round {round}: approximate on exact ranges: {why}");
             }
@@ -282,6 +287,7 @@ fn the_theory_agrees_with_brute_force_and_its_clashes_suffice() {
                 );
                 sat += 1;
             }
+            Verdict::Stopped => unreachable!("never stopped"),
             Verdict::Clash(d) => {
                 assert!(
                     !expected,

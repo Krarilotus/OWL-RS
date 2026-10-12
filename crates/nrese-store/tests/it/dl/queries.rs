@@ -288,7 +288,9 @@ fn explain_and_plan_carry_the_status() {
     let status = explained.completeness.expect("a status");
     assert!(status.complete);
     assert!(explained.decided_by.contains(&"exact-ground-entailment"));
-    let planned = store.plan_query(&prepared).expect("plan");
+    let planned = store
+        .plan_query(&prepared, &CancellationToken::new())
+        .expect("plan");
     assert!(!planned.completeness.expect("a status").complete);
 }
 

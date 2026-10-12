@@ -8,7 +8,9 @@
 //! nodes, the rule says the individuals are equal unless the values differ (HermiT's
 //! encoding): a choice the datatype theory then decides. A class that isn't a name is
 //! the normalisation's fresh name `Q` with `C ⊑ Q`, which holds wherever `C` does in the
-//! model the graph stands for.
+//! model the graph stands for. A non-simple property is read as a class too: the name
+//! that holds where a path along the property reaches one named individual (the
+//! normalisation's rule per individual).
 
 use super::depset::DepSetId;
 use super::engine::{Engine, Lit, Step};
@@ -66,12 +68,15 @@ impl Engine<'_> {
                 continue;
             }
             named.push(x);
-            let class = match key.class {
-                None => Some(DepSetId::EMPTY),
-                Some(c) => self.g.concept(x, c).map(|f| self.g.unary[f as usize].dep),
-            };
-            if let Some(d) = class {
-                members.push((x, self.deps.union(d, merges)));
+            let mut dep = Some(merges);
+            for &c in &key.classes {
+                dep = match (dep, self.g.concept(x, c)) {
+                    (Some(d), Some(f)) => Some(self.deps.union(d, self.g.unary[f as usize].dep)),
+                    _ => None,
+                };
+            }
+            if let Some(d) = dep {
+                members.push((x, d));
             }
         }
         named.sort_unstable();

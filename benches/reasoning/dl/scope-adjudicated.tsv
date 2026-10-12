@@ -1,0 +1,53 @@
+# Small-scope cases the references don't settle (docs/design/owl2-dl.md §11; scope.py record --adjudicated):
+# scope:index<TAB>code (scope.py's)<TAB>why. Each by the Direct Semantics; where NRESE's answer has a checked model, the reference that differs is refuted by it.
+3,3:406	c1101101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:515	c1101101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:612	c0110000000	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:645	i	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:721	c1001101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:742	c1101101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:754	i	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:775	c1101101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:776	c1101101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:787	c1101101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:788	c1101101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:789	c1101101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:790	c1101101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:791	c1101101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:792	c1101101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:793	c1101101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:8068	c1101101010	∃U.{x} is owl:Thing and ∀U.C at a named individual makes C everything (U relates every pair, Direct Semantics Table 3); Openllet reads U as an ordinary property
+3,3:800	c0110000000	Self(r) and Self(r⁻) are one class (r(x, x) iff r⁻(x, x)), so their disjointness empties both and A with them; Openllet misses it
+3,3:1695	c1100000000	≥ 0 r.⊥ and = 0 r.⊥ hold of every element; Openllet answers inconsistent (NRESE's model is checked)
+3,3:1697	c1100000000	≥ 0 r.⊥ and = 0 r.⊥ hold of every element; Openllet answers inconsistent (NRESE's model is checked)
+3,3:3395	c1100000000	≥ 0 r.⊥ and = 0 r.⊥ hold of every element; Openllet answers inconsistent (NRESE's model is checked)
+3,3:3397	c1100000000	≥ 0 r.⊥ and = 0 r.⊥ hold of every element; Openllet answers inconsistent (NRESE's model is checked)
+3,3:8103	c1100000000	≥ 0 r.⊥ and = 0 r.⊥ hold of every element; Openllet answers inconsistent (NRESE's model is checked)
+3,3:8105	c1100000000	≥ 0 r.⊥ and = 0 r.⊥ hold of every element; Openllet answers inconsistent (NRESE's model is checked)
+3,3:8138	i	≥ 2 r.{a} needs two r-successors in a one-element class: inconsistent; Openllet answers consistent
+3,3:8139	i	≥ 2 r.{a} needs two r-successors in a one-element class: inconsistent; Openllet answers consistent
+3,3:8142	i	≥ 2 r.{a} needs two r-successors in a one-element class: inconsistent; Openllet answers consistent
+3,3:8143	i	≥ 2 r.{a} needs two r-successors in a one-element class: inconsistent; Openllet answers consistent
+3,3:11190	i	U ∘ U ⊑ r makes r the universal relation, which r ⊑ ⊥R (r ≡ ⊥R, r⁻ ≡ ⊥R) empties: inconsistent; Openllet ignores U in a chain
+3,3:11191	i	U ∘ U ⊑ r makes r the universal relation, which r ⊑ ⊥R (r ≡ ⊥R, r⁻ ≡ ⊥R) empties: inconsistent; Openllet ignores U in a chain
+3,3:15308	i	U ∘ U ⊑ r makes r the universal relation, which r ⊑ ⊥R (r ≡ ⊥R, r⁻ ≡ ⊥R) empties: inconsistent; Openllet ignores U in a chain
+3,3:15309	i	U ∘ U ⊑ r makes r the universal relation, which r ⊑ ⊥R (r ≡ ⊥R, r⁻ ≡ ⊥R) empties: inconsistent; Openllet ignores U in a chain
+3,3:18735	i	U ∘ U ⊑ r makes r the universal relation, which r ⊑ ⊥R (r ≡ ⊥R, r⁻ ≡ ⊥R) empties: inconsistent; Openllet ignores U in a chain
+3,3:18736	i	U ∘ U ⊑ r makes r the universal relation, which r ⊑ ⊥R (r ≡ ⊥R, r⁻ ≡ ⊥R) empties: inconsistent; Openllet ignores U in a chain
+3,3:11681	i	U ⊑ r (U ≡ r, r ≡ U⁻) makes r universal, against ¬r(a, b): inconsistent; Openllet ignores U as a subproperty
+3,3:14756	i	U ⊑ r (U ≡ r, r ≡ U⁻) makes r universal, against ¬r(a, b): inconsistent; Openllet ignores U as a subproperty
+3,3:18198	i	U ⊑ r (U ≡ r, r ≡ U⁻) makes r universal, against ¬r(a, b): inconsistent; Openllet ignores U as a subproperty
+3,3:21335	c1100000000	the key over U makes every two named individuals one, which is consistent (a and b one element; NRESE's model is checked); Openllet answers inconsistent
+3,3:28133	c1100000000	the key over U makes every two named individuals one, which is consistent (a and b one element; NRESE's model is checked); Openllet answers inconsistent
+3,3:28956	c1100000000	the key over U makes every two named individuals one, which is consistent (a and b one element; NRESE's model is checked); Openllet answers inconsistent
+3,3:25688	i	d ⊑ ⊥D (d ≡ ⊥D) leaves d no value, against a value of d: inconsistent; Openllet misses the bottom data property
+3,3:25689	i	d ⊑ ⊥D (d ≡ ⊥D) leaves d no value, against a value of d: inconsistent; Openllet misses the bottom data property
+3,3:25936	i	d ⊑ ⊥D (d ≡ ⊥D) leaves d no value, against a value of d: inconsistent; Openllet misses the bottom data property
+3,3:25937	i	d ⊑ ⊥D (d ≡ ⊥D) leaves d no value, against a value of d: inconsistent; Openllet misses the bottom data property
+3,3:26762	i	d ⊑ ⊥D (d ≡ ⊥D) leaves d no value, against a value of d: inconsistent; Openllet misses the bottom data property
+3,3:26763	i	d ⊑ ⊥D (d ≡ ⊥D) leaves d no value, against a value of d: inconsistent; Openllet misses the bottom data property
+3,3:27010	i	d ⊑ ⊥D (d ≡ ⊥D) leaves d no value, against a value of d: inconsistent; Openllet misses the bottom data property
+3,3:27011	i	d ⊑ ⊥D (d ≡ ⊥D) leaves d no value, against a value of d: inconsistent; Openllet misses the bottom data property
+3,3:35423	i	a key over U alone: any two named members of its class share a named U-value (each other), so the key makes a and b one (Direct Semantics, HasKey), against DifferentIndividuals(a, b): inconsistent; both references apply keys to property assertions only
+3,3:35438	i	a key over U alone: any two named members of its class share a named U-value (each other), so the key makes a and b one (Direct Semantics, HasKey), against DifferentIndividuals(a, b): inconsistent; both references apply keys to property assertions only
+3,3:35452	i	a key over U alone: any two named members of its class share a named U-value (each other), so the key makes a and b one (Direct Semantics, HasKey), against DifferentIndividuals(a, b): inconsistent; both references apply keys to property assertions only

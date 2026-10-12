@@ -99,7 +99,16 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
         .then(|| crate::complements::rewrite(ontology))
         .flatten();
     let ontology = complemented.as_ref().unwrap_or(ontology);
-    let mut n = Normaliser::new(ontology);
+    // `u ∘ u⁻ ⊑ R` for each role an axiom makes universal beyond its rewritten form.
+    let universal: Vec<(Vec<ObjProp>, ObjProp, usize)> =
+        rewritten.as_ref().map_or_else(Vec::new, |r| {
+            let hub = [ObjProp::Named(r.hub), ObjProp::Inverse(r.hub)];
+            r.universal
+                .iter()
+                .map(|&(role, index)| (hub.to_vec(), role, index))
+                .collect()
+        });
+    let mut n = Normaliser::new(ontology, &universal);
     n.expand_up_to = options.expand_at_most_up_to.min(Options::MAX_EXPANSION);
     n.exact_provenance = options.exact_provenance;
     if options.lazy_definitions {
@@ -202,7 +211,8 @@ struct Normaliser<'a> {
 }
 
 impl<'a> Normaliser<'a> {
-    fn new(ontology: &'a Ontology) -> Self {
+    /// `extra`: role inclusions beside the ontology's, each with its axiom.
+    fn new(ontology: &'a Ontology, extra: &[(Vec<ObjProp>, ObjProp, usize)]) -> Self {
         let mut n = Self {
             ontology,
             classes: ontology.classes.clone(),
@@ -224,7 +234,7 @@ impl<'a> Normaliser<'a> {
             expand_up_to: Options::default().expand_at_most_up_to,
             unfolded: Default::default(),
         };
-        n.role_inclusions();
+        n.role_inclusions(extra);
         n
     }
 
@@ -683,7 +693,16 @@ impl<'a> Normaliser<'a> {
         }
     }
 
-    /// A key as a DL-safe rule (`SafeRule`).
+    /// A key as DL-safe rules (`SafeRule`).
+    ///
+    /// The key's pairs are the property's whole extension (OWL 2 Direct Semantics: `(x, z)
+    /// ∈ (OPE)^OP`), which for a non-simple property includes what its chains and
+    /// transitivity compose, not only its edges. So for a non-simple property `P` the rule
+    /// reads, for each named individual `z`, the fresh name `Q` of `∃P.{z} ⊑ Q`, derived
+    /// through `P`'s automaton (`{z} ⊑ ∀P⁻.Q`, deterministic: `Q` holds exactly where a
+    /// `P`-path reaches `z`): a rule per combination of such individuals, O(individuals ×
+    /// the automaton) per non-simple key property. An edge alone missed `r(a, c)` from
+    /// `r(a, b)`, `r(b, c)` with `r` transitive (HermiT reads edges too; Openllet doesn't).
     fn key(&mut self, index: usize, class: ExprId, objects: &[ObjProp], data: &[Term]) {
         let (x, y) = (Var::X, Var::Y(0));
         let mut body = Vec::new();
@@ -697,21 +716,49 @@ impl<'a> Normaliser<'a> {
             body.push(BodyAtom::Concept(concept, x));
             body.push(BodyAtom::Concept(concept, y));
         }
-        for (i, &p) in objects.iter().enumerate() {
-            let z = Var::Y(i as u16 + 1);
-            body.push(Self::edge(p, x, z));
-            body.push(Self::edge(p, y, z));
-        }
         for (j, &d) in data.iter().enumerate() {
             let v = Var::V(j as u16);
             body.push(BodyAtom::Data(d, x, v));
             body.push(BodyAtom::Data(d, y, v));
         }
-        self.out.rules.push(SafeRule {
-            body,
-            head: vec![HeadAtom::Equal(x, y)],
-            source: index,
-        });
+        // Each object property's alternatives: its edges, or one reach name per named
+        // individual.
+        let mut alternatives: Vec<Vec<Vec<BodyAtom>>> = Vec::new();
+        for (i, &p) in objects.iter().enumerate() {
+            if self.non_simple.contains(&p.named()) {
+                let mut each = Vec::new();
+                for z in self.ontology.named_individuals() {
+                    let one = self.e(ClassExpr::OneOf(vec![z]));
+                    let some = self.e(ClassExpr::Some(p, one));
+                    let q = Concept::Fresh(self.fresh_negative(some, index));
+                    each.push(vec![BodyAtom::Concept(q, x), BodyAtom::Concept(q, y)]);
+                }
+                alternatives.push(each);
+            } else {
+                let z = Var::Y(i as u16 + 1);
+                alternatives.push(vec![vec![Self::edge(p, x, z), Self::edge(p, y, z)]]);
+            }
+        }
+        let mut rules: Vec<Vec<BodyAtom>> = vec![body];
+        for each in alternatives {
+            rules = rules
+                .iter()
+                .flat_map(|r| {
+                    each.iter().map(move |atoms| {
+                        let mut r = r.clone();
+                        r.extend(atoms.iter().cloned());
+                        r
+                    })
+                })
+                .collect();
+        }
+        for body in rules {
+            self.out.rules.push(SafeRule {
+                body,
+                head: vec![HeadAtom::Equal(x, y)],
+                source: index,
+            });
+        }
     }
 
     // Fresh names ----------------------------------------------------------------------
@@ -1095,8 +1142,8 @@ impl<'a> Normaliser<'a> {
 
     /// The role inclusions of the RBox, each over a named superrole, and the non-simple
     /// roles.
-    fn role_inclusions(&mut self) {
-        let mut rias: Vec<(Vec<ObjProp>, ObjProp, usize)> = Vec::new();
+    fn role_inclusions(&mut self, extra: &[(Vec<ObjProp>, ObjProp, usize)]) {
+        let mut rias: Vec<(Vec<ObjProp>, ObjProp, usize)> = extra.to_vec();
         for (index, axiom) in self.ontology.axioms.iter().enumerate() {
             if self.uses_top(axiom) {
                 continue;
