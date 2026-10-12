@@ -7,7 +7,6 @@ fn lower_true_store() -> Arc<StoreService> {
     use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
     let store = Arc::new(
         StoreService::new(crate::StoreConfig {
-            execution_threads: 1,
             ..crate::StoreConfig::in_memory()
         })
         .unwrap(),
