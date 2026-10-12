@@ -1050,7 +1050,7 @@ args = ["--reason", "owl2-rl", "--reason-runs", "3", "--commits", "{data}.commit
 queries = "sameas-giant"
 metric = "reason.p50_ms"
 check = { "closure_after_commits.equal" = "true", "q.values.value" = "expect.values_after_split" }
-route = {}
+route = { "commits.work.recomputed" = "== 1", "commits.work.rebuilt" = "== 0" }
 cap_gb = 8
 systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "rdfox:owl2-rl", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["Store-2: equality by class ids; a deletion splits a class (B/F style)"]
