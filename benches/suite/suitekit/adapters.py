@@ -163,6 +163,13 @@ def get(url: str, timeout: float = 10) -> int:
         return 0
 
 
+def query_limit(ctx: "Context") -> int:
+    """A server's own limit per query: the suite's query timeout (QUERY_TIMEOUT_S, which the
+    driver sets), so that a query the client gave up on doesn't run on in the server beside
+    the next ones; the load timeout where none is set."""
+    return int(ctx.setting("QUERY_TIMEOUT_S", "0") or 0) or ctx.timeout_s
+
+
 def wait_ready(ctx: Context, endpoint: Endpoint, timeout_s: float) -> bool:
     if ctx.dry:
         return True
@@ -349,7 +356,7 @@ class Nrese(Adapter):
         env = {
             "NRESE_REASONING_MODE": self.regimes[regime],
             "NRESE_BIND_ADDR": f"{host}:{port}",
-            "NRESE_QUERY_TIMEOUT_MS": str(ctx.timeout_s * 1000),
+            "NRESE_QUERY_TIMEOUT_MS": str(query_limit(ctx) * 1000),
             # No rate limits.
             "NRESE_READ_REQUESTS_PER_WINDOW": "100000000",
         }
@@ -415,10 +422,19 @@ class Qlever(Adapter):
 
     def load(self, ctx, store, inputs, regime):
         fmt = "nt" if all_ntriples(inputs) else "ttl"
+        # A dataset's documented index configuration (its Qleverfile): QLEVER_INDEX_SETTINGS,
+        # the settings JSON (SETTINGS_JSON), and QLEVER_VOCABULARY_TYPE (VOCABULARY_TYPE).
+        env, extra, prefix = {}, "", ""
+        if ctx.setting("QLEVER_INDEX_SETTINGS"):
+            env["QLEVER_INDEX_SETTINGS"] = ctx.setting("QLEVER_INDEX_SETTINGS")
+            prefix = 'printf "%s" "$QLEVER_INDEX_SETTINGS" > /index/settings.json && '
+            extra += " -s /index/settings.json"
+        if ctx.setting("QLEVER_VOCABULARY_TYPE"):
+            extra += " --vocabulary-type " + ctx.setting("QLEVER_VOCABULARY_TYPE")
         # One input stream: the Turtle files concatenated are one Turtle document.
-        script = ('cat "$@" | /qlever/qlever-index -i /index/idx -f /dev/stdin -F ' + fmt +
-                  ' -p true --stxxl-memory ' + ctx.setting("QLEVER_SORT_MEMORY", "8G"))
-        spec = Spec(ctx.name("load"), self.images(ctx)[0], ["sh", "-c", script, "sh", *inputs],
+        script = (prefix + 'cat "$@" | /qlever/qlever-index -i /index/idx -f /dev/stdin -F ' + fmt +
+                  ' -p true --stxxl-memory ' + ctx.setting("QLEVER_SORT_MEMORY", "8G") + extra)
+        spec = Spec(ctx.name("load"), self.images(ctx)[0], ["sh", "-c", script, "sh", *inputs], env,
                     mounts=ctx.mounts(Mount(store, "/index", readonly=False)), workdir="/index",
                     user="root", memory=ctx.memory)
         return Step(ctx.runtime.run(spec, ctx.logs / "load.log", ctx.timeout_s))
@@ -433,13 +449,25 @@ class Qlever(Adapter):
         # is 1): QLEVER_SIMULTANEOUS_QUERIES, 8 unless set (the concurrency case's defaults
         # track sets 1, its best-configuration track the core count).
         simultaneous = ctx.setting("QLEVER_SIMULTANEOUS_QUERIES", "8")
+        # The cache's size with the cache on (`-c`, CACHE_MAX_SIZE of a Qleverfile):
+        # QLEVER_CACHE_MAX_SIZE, else QLever's default.
+        if ctx.cache != "off" and ctx.setting("QLEVER_CACHE_MAX_SIZE"):
+            cache = ["-c", ctx.setting("QLEVER_CACHE_MAX_SIZE")]
         spec = Spec(ctx.name("serve"), self.images(ctx)[0],
                     ["/qlever/qlever-server", "-i", "/index/idx", "-p", str(port), "-n", "-j", simultaneous,
-                     "-m", ctx.setting("QLEVER_MEMORY", "16G"), *cache, "-s", f"{ctx.timeout_s}s"],
+                     "-m", ctx.setting("QLEVER_MEMORY", "16G"), *cache, "-s", f"{query_limit(ctx)}s"],
                     mounts=ctx.mounts(Mount(store, "/index", readonly=False)), port=port,
                     workdir="/index", user="root", memory=ctx.memory)
         base = ctx.runtime.url(spec) + "/"
-        return self.start(ctx, spec, Endpoint(base, base))
+        endpoint = self.start(ctx, spec, Endpoint(base, base))
+        # Runtime parameters a dataset's documentation sets after the start (`qlever settings
+        # KEY=VALUE`, e.g. group-by-hash-map-enabled=true for Sparqloscope): QLEVER_RUNTIME,
+        # space-separated KEY=VALUE pairs, each sent as the server's own settings request.
+        for pair in ctx.setting("QLEVER_RUNTIME").split():
+            key, _, value = pair.partition("=")
+            if not ctx.dry and get(f"{base}?{urllib.parse.urlencode({key: value})}") != 200:
+                raise RuntimeError(f"qlever: the runtime parameter {pair} was not accepted")
+        return endpoint
 
 
 class Oxigraph(Adapter):
@@ -492,8 +520,12 @@ class Jena(Adapter):
     def load(self, ctx, store, inputs, regime):
         env = {"JVM_ARGS": f"-Xmx{ctx.heap}"}
         if regime == "none":
-            spec = Spec(ctx.name("load"), self.image(ctx),
-                        ["tdb2.tdbloader", "--loader=parallel", "--loc", "/store/db", *inputs], env,
+            # JENA_LOADER=xloader: tdb2.xloader, Jena's loader for large data (as Sparqloscope
+            # loads DBLP); else tdb2.tdbloader's parallel loader.
+            command = (["tdb2.xloader", "--loc", "/store/db", "--tmpdir", "/store/tmp", *inputs]
+                       if ctx.setting("JENA_LOADER") == "xloader" else
+                       ["tdb2.tdbloader", "--loader=parallel", "--loc", "/store/db", *inputs])
+            spec = Spec(ctx.name("load"), self.image(ctx), command, env,
                         ctx.mounts(Mount(store, "/store", readonly=False)), memory=ctx.memory)
             return Step(ctx.runtime.run(spec, ctx.logs / "load.log", ctx.timeout_s))
         # A rule reasoner over an in-memory model: Fuseki reads the data at start-up, the
@@ -531,7 +563,10 @@ class Jena(Adapter):
             return self.endpoint
         port = ctx.listen(3030)
         spec = Spec(ctx.name("serve"), self.image(ctx),
-                    ["fuseki-server", "--update", "--tdb2", "--loc=/store/db", f"--port={port}", "/ds"],
+                    # --timeout: Fuseki stops a query at the suite's limit, as the harness does, so
+                    # that a query past it doesn't run on beside the next ones.
+                    ["fuseki-server", "--update", "--tdb2", "--loc=/store/db", f"--port={port}",
+                     f"--timeout={query_limit(ctx) * 1000}", "/ds"],
                     {"JVM_ARGS": f"-Xmx{ctx.heap}"}, ctx.mounts(Mount(store, "/store", readonly=False)),
                     port=port, memory=ctx.memory)
         base = ctx.runtime.url(spec)
@@ -567,6 +602,15 @@ class Virtuoso(Adapter):
         # set by the concurrency case's tracks.
         if ctx.setting("VIRTUOSO_SERVER_THREADS"):
             env["VIRT_PARAMETERS_SERVERTHREADS"] = ctx.setting("VIRTUOSO_SERVER_THREADS")
+        # The buffers of virtuoso.ini's table for the machine's memory (16 GB above; 32 GB:
+        # 2720000 and 2000000, as Sparqloscope's DBLP setup): VIRTUOSO_NUMBER_OF_BUFFERS and
+        # VIRTUOSO_MAX_DIRTY_BUFFERS; VIRTUOSO_THREADS_PER_QUERY (ThreadsPerQuery) as the
+        # BSBM V3.1 configuration sets it.
+        for setting, parameter in (("VIRTUOSO_NUMBER_OF_BUFFERS", "NUMBEROFBUFFERS"),
+                                   ("VIRTUOSO_MAX_DIRTY_BUFFERS", "MAXDIRTYBUFFERS"),
+                                   ("VIRTUOSO_THREADS_PER_QUERY", "THREADSPERQUERY")):
+            if ctx.setting(setting):
+                env[f"VIRT_PARAMETERS_{parameter}"] = ctx.setting(setting)
         return Spec(name, self.images(ctx)[0], [], env,
                     ctx.mounts(Mount(store, "/database", readonly=False)), port=port, entrypoint=True,
                     memory=ctx.memory)
@@ -603,6 +647,41 @@ class Virtuoso(Adapter):
         endpoint = self.start(ctx, spec, Endpoint(f"{base}/sparql", f"{base}/sparql", write_graph="http://bench"))
         self.isql(ctx, "GRANT SPARQL_UPDATE TO \"SPARQL\"; DB.DBA.RDF_DEFAULT_USER_PERMS_SET('nobody', 7);")
         return endpoint
+
+
+class MillenniumDB(Adapter):
+    """MillenniumDB (benches/competitors/millenniumdb): `mdb import` builds the database,
+    `mdb server` answers SPARQL at /sparql. The buffers are its documented configuration for a
+    32 GB machine (Sparqloscope's docs/setup.md, DBLP): MDB_VERSIONED_BUFFER 22GB,
+    MDB_UNVERSIONED_BUFFER 2GB, MDB_STRINGS_STATIC and MDB_STRINGS_DYNAMIC 4GB, and
+    MDB_THREADS 2 worker threads as there (a concurrency track sets the core count); the import
+    buffers MDB_IMPORT_BUFFER (4GB each for strings and tensors)."""
+
+    key = "millenniumdb"
+    runtimes = {"docker"}
+
+    def images(self, ctx):
+        return [ctx.setting("MILLENNIUMDB_IMAGE", "nrese-bench/millenniumdb:ecbf6dd")]
+
+    def load(self, ctx, store, inputs, regime):
+        buffer = ctx.setting("MDB_IMPORT_BUFFER", "4GB")
+        spec = Spec(ctx.name("load"), self.images(ctx)[0],
+                    ["mdb", "import", *inputs, "/store/db", "--buffer-strings", buffer, "--buffer-tensors", buffer],
+                    mounts=ctx.mounts(Mount(store, "/store", readonly=False)), memory=ctx.memory)
+        return Step(ctx.runtime.run(spec, ctx.logs / "load.log", ctx.timeout_s))
+
+    def serve(self, ctx, store, regime):
+        port = ctx.listen(1234)
+        spec = Spec(ctx.name("serve"), self.images(ctx)[0],
+                    ["mdb", "server", "/store/db", "--port", str(port), "--timeout", str(query_limit(ctx)),
+                     "--threads", ctx.setting("MDB_THREADS", "2"),
+                     "--versioned-buffer", ctx.setting("MDB_VERSIONED_BUFFER", "22GB"),
+                     "--unversioned-buffer", ctx.setting("MDB_UNVERSIONED_BUFFER", "2GB"),
+                     "--strings-static", ctx.setting("MDB_STRINGS_STATIC", "4GB"),
+                     "--strings-dynamic", ctx.setting("MDB_STRINGS_DYNAMIC", "4GB")],
+                    mounts=ctx.mounts(Mount(store, "/store", readonly=False)), port=port, memory=ctx.memory)
+        base = ctx.runtime.url(spec)
+        return self.start(ctx, spec, Endpoint(f"{base}/sparql"))
 
 
 def server_log(ctx: Context, server: Server) -> str:
@@ -1032,8 +1111,8 @@ class Owlrl(ClosureAdapter):
                     reason_ms=float(seconds[-1]) * 1000 if seconds else None)
 
 
-ADAPTERS = {a.key: a for a in (Nrese, NreseOxigraph, NreseFsst, Qlever, Oxigraph, Jena, Virtuoso, Rdf4j, Graphdb, Rdfox, Anzograph,
-                                 Nemo, NemoSchemaFirst, NemoSparq, Owlrl)}
+ADAPTERS = {a.key: a for a in (Nrese, NreseOxigraph, NreseFsst, Qlever, Oxigraph, Jena, Virtuoso, MillenniumDB, Rdf4j,
+                                 Graphdb, Rdfox, Anzograph, Nemo, NemoSchemaFirst, NemoSparq, Owlrl)}
 
 
 def adapter(key: str) -> Adapter | None:
