@@ -80,11 +80,13 @@ query on the same data is one group, classified `ok`, `wrong` (whose), `incomple
 
 | Step | State |
 |---|---|
-| Hosts as declared roles: [hosts.toml](hosts.toml), read by `suitekit/hosts.py`; the fast suite takes its inputs from there and refuses a host without Docker | done |
+| Hosts as declared roles: [hosts.toml](hosts.toml), read by `suitekit/hosts.py`: inputs, volumes, preserved image aliases | done |
 | Run records in one schema | done |
-| The answer recorder in the suite | done |
+| The answer recorder in the suite: an adjudicated reference per query, a verdict per group (`suite.py answers`) | done |
+| A native runtime for the fast suite: host processes in capped scopes, on a measure host without Docker (`NRESE_FAST_RUNTIME=native`, [fast/README.md](fast/README.md#how-it-measures)) | done |
 | One case registry: `fast/cases.toml` grows `levels`, `needs`, `expect` and `data = "dataset:…"`; the fast runner moves into `suitekit` as the native plan kind; `fast.py` becomes `suite.py run --level focused` | next |
-| One `compare` over result rows (generalising `fast.py compare`); `suitekit/compare.py`, `perf-lab-compare.py` and `fast/compete.py` retire, the suite running comparators on any case | next |
+| One `compare` over result rows: `suitekit/compare.py` reads fast reports, perf-lab reports and suite results, in the order missing, answers, time, memory by kind, disk; `fast.py compare` and `suite.py compare` are it. Suite pairs still use `summary.py`'s estimator: the bootstrap for them is the next step | started |
+| `perf-lab.sh`, `perf-lab-compare.py` and `fast/compete.py` retire, the suite running comparators on any case | next |
 | Checkpointed chunks for level 3: resume after a pause, keep the order, never rerun a finished case | next |
 | The result row's answer and memory-kind fields | next |
 | Level 4: `runtime = "apptainer"` on `draco`, Zebratlas as a workload | later |
