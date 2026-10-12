@@ -1,0 +1,233 @@
+# The cases of the Datalog kit (datalog.py): a program, the pinned data it runs on, the
+# derived counts a right answer has, and the published numbers a contender's configuration
+# is checked against before anything is compared.
+#
+# expected: facts per derived relation, from Soufflé's own runs in the FlowLog
+#   reproduction logs (github.com/HarukiMoriarty/FlowLog-Reproduction at 66c88af,
+#   log/variant_benchmark/4/souffle_<program>_<dataset>.log); a relation without a
+#   published count is cross-checked between the engines.
+# published: the FlowLog paper's Table 1 (Zhao et al., VLDB 2026, arXiv 2511.00865v4):
+#   seconds at 4 | 64 threads, end to end, Soufflé compiled, on 2 x AMD EPYC 7543 (64 cores),
+#   256 GB, 900 s limit.
+# home: the contender whose documented strength the case is.
+#
+# The programs over RDF triples (format = "triples") are GLog's VLDB 2021 package
+# (Tsamoura et al., 'Materializing knowledge bases via trigger graphs'; the authors' Google
+# Drive folder linked from github.com/karmaresearch/glog): RDFox's benchmark programs in
+# VLog's syntax, L (the OWL 2 RL part of each ontology) and LE (L extended with rules that
+# make large cliques). Their files state no licence, so they are fetched by hash, not
+# committed. `published` there is the authors' own logs in that folder: single-threaded
+# `vlog mat` (VLog) and `tgchase --querycont 1 --edbcheck 1` (GLog), seconds and peak MB,
+# on their machine; `derived` the total GLog reports (every IDB fact, the pattern-bound
+# copies of the input included), which our runs reproduce only where the data is the same.
+
+[source.oxford]
+url = "http://krr-nas.cs.ox.ac.uk/2015/ISWC/TestCases/{name}"
+what = "RDFox's test data of the ISWC 2015 paper (Nenov et al., 'RDFox: a highly-scalable RDF store'), Information Systems Group, Oxford"
+licence = "not stated (catalogue: ask Oxford before publishing results). Fetched, never committed"
+
+[source.lubm]
+what = "LUBM(N) from the pinned UBA generator (benches/reasoning/lubm, rvesse/lubm-uba), instance data only"
+licence = "generator GPL-2.0; the data is generated"
+
+[source.flowlog]
+url = "https://huggingface.co/datasets/NemoYuu/flowlog_benchmark/resolve/main/dataset/csv/{name}.zip"
+what = "FlowLog's benchmark datasets (VLDB 2026): graphs from BigDatalog's and RecStep's suites, Graspan's program-analysis graphs, Doop's facts of the DaCapo programs"
+licence = "not stated on the dataset; the graphs and Graspan's inputs come from public benchmark suites. Fetched, never committed"
+
+# --- transitive closure and same generation: BigDatalog's synthetic graphs -----------------
+
+[[case]]
+name = "tc-G5K"
+program = "programs/flowlog/tc.dl"
+source = "flowlog"
+data = "G5K-0.001"
+sha256 = "6a0ef2be90774decaa2199b4fff68155001cb1bbbcfb0b8b9b41ecc7a24f84dc"
+expected = {}
+note = "the qualifier: small enough for every engine; counts cross-checked"
+home = "souffle"
+
+[[case]]
+name = "tc-G10K"
+program = "programs/flowlog/tc.dl"
+source = "flowlog"
+data = "G10K-0.001"
+sha256 = "9246b18ffaa016e5bb05c4562fe2066c66448219def36f0b13cd6de1a6192764"
+expected = { Tc = 100000000 }
+published = { souffle = "112.7 | 39.7", flowlog = "78.2 | 8.5" }
+home = "souffle"
+
+[[case]]
+name = "tc-G20K"
+program = "programs/flowlog/tc.dl"
+source = "flowlog"
+data = "G20K-0.001"
+sha256 = "5bf571ed9787619c85e1db9396f6ea3daffa65d947159367fb67013484a27e0c"
+expected = { Tc = 400000000 }
+published = { souffle = "629.6 | 249.2", flowlog = "542.8 | 42.4" }
+note = "a frontier: 400 M derived facts"
+home = "souffle"
+
+[[case]]
+name = "sg-G10K"
+program = "programs/flowlog/sg.dl"
+source = "flowlog"
+data = "G10K-0.001"
+sha256 = "9246b18ffaa016e5bb05c4562fe2066c66448219def36f0b13cd6de1a6192764"
+expected = { Sg = 100000000 }
+published = { souffle = "379.0 | 41.3", flowlog = "177.6 | 18.6" }
+home = "souffle"
+
+# --- program analysis: Graspan's graphs (httpd, Linux, PostgreSQL) ----------------------------
+
+[[case]]
+name = "cspa-httpd"
+program = "programs/flowlog/cspa.dl"
+source = "flowlog"
+data = "cspa-httpd"
+sha256 = "881ab8a5c1bd654a82806b4b618a94ac2f5b02cee18caed77cd2d81c736b8f5a"
+expected = { ValueFlow = 1365306 }
+published = { souffle = "67.8 | 50.9", flowlog = "112.6 | 14.4" }
+home = "souffle"
+
+[[case]]
+name = "cspa-linux"
+program = "programs/flowlog/cspa.dl"
+source = "flowlog"
+data = "cspa-linux"
+sha256 = "c4f3f9bc393b34e04ccbef5864e2dbbb82b9fe57cc26ed9b4aac73b9ac85877d"
+expected = { ValueFlow = 5509641 }
+published = { souffle = "20.9 | 14.3", flowlog = "25.1 | 4.8" }
+home = "souffle"
+
+[[case]]
+name = "cspa-postgresql"
+program = "programs/flowlog/cspa.dl"
+source = "flowlog"
+data = "cspa-postgresql"
+sha256 = "567bc58b4c0fe50f74774208ebcc75956260b9671073d1082ccd378d95748d9c"
+expected = { ValueFlow = 3712452 }
+published = { souffle = "76.7 | 56.1", flowlog = "120.4 | 15.0" }
+home = "souffle"
+
+[[case]]
+name = "csda-httpd"
+program = "programs/flowlog/csda.dl"
+source = "flowlog"
+data = "csda-httpd"
+sha256 = "99102df4e19886098bd2966db9ab43445ea7e8c5b95a9b1ebb5d9265ac6e0c5b"
+expected = { NullNode = 9393283 }
+published = { souffle = "15.2 | 9.8", flowlog = "4.1 | 1.3" }
+home = "souffle"
+
+[[case]]
+name = "csda-linux"
+program = "programs/flowlog/csda.dl"
+source = "flowlog"
+data = "csda-linux"
+sha256 = "564c6d5ff496999a58d0e77f83d8ccb889ea407e861a882a63034cb28e492f54"
+expected = { NullNode = 55751178 }
+published = { souffle = "145.2 | 77.4", flowlog = "22.5 | 6.4" }
+home = "souffle"
+
+[[case]]
+name = "csda-postgresql"
+program = "programs/flowlog/csda.dl"
+source = "flowlog"
+data = "csda-postgresql"
+sha256 = "351448ea5efc95195b13ccea149de217a293bc2eb7fb35685deed6bdafae173e"
+expected = { NullNode = 21503813 }
+published = { souffle = "125.1 | 40.4", flowlog = "11.4 | 4.9" }
+home = "souffle"
+
+# --- reachability on a real social graph -------------------------------------------------------
+
+[[case]]
+name = "reach-livejournal"
+program = "programs/flowlog/reach.dl"
+source = "flowlog"
+data = "livejournal"
+sha256 = "4e9c8c20c46224f4b991ed1fd2999768e68bf427cb144c7c0343deaafacdcb96"
+expected = { Reach = 4400347 }
+published = { souffle = "21.5 | 19.1", flowlog = "11.3 | 5.1" }
+home = "souffle"
+
+# --- Galen (EL as Datalog) and Doop: ternary and wider relations, negation ----------------------
+
+[[case]]
+name = "galen"
+program = "programs/flowlog/galen.dl"
+source = "flowlog"
+data = "galen"
+sha256 = "b83fe4aba9562351227d34368acec0e671352398dc24c3c0ac30790a3eda02df"
+expected = { OutP = 7560179, OutQ = 16595494 }
+published = { souffle = "59.3 | 36.8", flowlog = "32.2 | 8.7" }
+home = "souffle"
+
+[[case]]
+name = "doop-batik"
+program = "programs/flowlog/batik.dl"
+source = "flowlog"
+data = "batik"
+sha256 = "0e66c095e6a65e765e0481bb1cc878f1d4d9845bbd11e744dea80be9470adda2"
+expected = { MethodImplemented = 77313, ClassInitializer = 1940, DirectSubclass = 8453, Subclass = 17499, Superclass = 17499, MethodLookup = 407629, Superinterface = 16501, MainMethodDeclaration = 1, SubtypeOf = 48824, SupertypeOf = 48824, SubtypeOfDifferent = 38437, ArrayIndexPointsTo = 314695, Assign = 155849, CallGraphEdge = 85000, InitializedClass = 3488, InstanceFieldPointsTo = 14110900, Reachable = 16806, StaticFieldPointsTo = 61324, VarPointsTo = 39498905 }
+published = { souffle = "651.1 | 160.2", flowlog = "65.2 | 22.9" }
+note = "Doop, Soufflé's own workload: 136 rules, relations up to arity 7, stratified negation"
+home = "souffle"
+
+# --- RDFox's and GLog's materialisation programs over RDF ----------------------------------
+
+[[case]]
+name = "claros-l"
+format = "triples"
+program = "Claros_L.dlog"
+program_url = "https://drive.usercontent.google.com/download?id=1SAnLwAr0h7xtyWXlP1_BbyFo0zCXo6OI&export=download&confirm=t"
+program_sha256 = "0d93c717aabae3bfadb5ba27ca6a9b91b91f531bf07d36d9c4d174c549c4b8c3"
+source = "oxford"
+archive = "Claros.zip"
+data = "claros"
+sha256 = "693e88cd20844126698cd9da6257a40f61767477fefda3c178b75b82ada6229f"
+published = { vlog = "537.0 s, 3,590 MB", glog = "133.7 s, 5,608 MB", glog_paper = "119 s, 6,078 MB (Table 4)", rdfox_paper = "2,512 s, 5,491 MB (single thread; GLog's Table 4)" }
+derived = { glog = 89102259 }
+home = "glog, rdfox"
+
+[[case]]
+name = "claros-le"
+format = "triples"
+program = "Claros_LE.dlog"
+program_url = "https://drive.usercontent.google.com/download?id=1ATnqOQ2PoCi3bPM7Fiy1NU7pUlxoYH2P&export=download&confirm=t"
+program_sha256 = "f7c3f9114b0a65a7860786bcd0d4f6f6e8688a1a23cb3dcb3bae54a69d581e98"
+source = "oxford"
+archive = "Claros.zip"
+data = "claros"
+sha256 = "693e88cd20844126698cd9da6257a40f61767477fefda3c178b75b82ada6229f"
+published = { vlog = "3,351.7 s, 9,633 MB", glog = "1,211.6 s, 9,418 MB" }
+derived = { glog = 548652593 }
+note = "the cliques of a symmetric and transitive relatedPlaces: the worst case for maintenance (Motik et al. 2019)"
+home = "glog, rdfox"
+
+[[case]]
+name = "lubm-l-125"
+format = "triples"
+program = "LUBM_L.dlog"
+program_url = "https://drive.usercontent.google.com/download?id=1PPlb43Z5_3FlD4lKmkbLp3fskMkp8L5p&export=download&confirm=t"
+program_sha256 = "d29db99e5221f6598701523651de32ce7673a0fd64aa8139989ee4fe62c3b520"
+source = "lubm"
+universities = 125
+data = "lubm-125"
+published = { vlog = "1.7 s, 373 MB", glog = "1.4 s, 274 MB" }
+derived = { glog = 20056630 }
+home = "glog, vlog, rdfox"
+
+[[case]]
+name = "lubm-le-125"
+format = "triples"
+program = "LUBM_LE.dlog"
+program_url = "https://drive.usercontent.google.com/download?id=1mZwaWgKPslYMYx7UIxy0CQVBU_M2ytGa&export=download&confirm=t"
+program_sha256 = "6f1312cff49bc2850537d96f2d1dfd41cedd9c0cbd1f1d0c1d48073a2b4489df"
+source = "lubm"
+universities = 125
+data = "lubm-125"
+published = { vlog = "208.7 s, 3,133 MB", glog = "18.1 s, 1,467 MB" }
+derived = { glog = 38891063 }
+home = "glog, rdfox"

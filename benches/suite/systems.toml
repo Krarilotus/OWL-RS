@@ -134,6 +134,26 @@ publish = "free"
 runs = ["docker", "apptainer"]
 capabilities = ["load", "reason-owl2-rl", "reason-custom-rules"]
 
+# The Datalog engines of the rule-reasoning home turf (benches/reasoning/datalog): each runs
+# the same program on the same facts in its own language, under the kit's driver.
+[souffle]
+name = "Soufflé 2.5 (compiled programs; UPL-1.0)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["load", "reason-custom-rules"]
+
+[vlog]
+name = "VLog 1.3.7 (karmaresearch; Apache-2.0)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["load", "reason-custom-rules"]
+
+[glog]
+name = "GLog (VLog with trigger graphs, VLDB 2021; Apache-2.0), commit 69d4842"
+publish = "free"
+runs = ["kit"]
+capabilities = ["load", "reason-custom-rules"]
+
 [owlrl]
 name = "owlrl (reference OWL 2 RL closure; correctness only)"
 publish = "free"

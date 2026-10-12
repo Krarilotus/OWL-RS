@@ -98,6 +98,34 @@ tiers = ["dbpedia-core", "yago-tiny"]
 state = "planned"
 check = "inferred set against Nemo"
 
+[datalog-programs]
+title = "Datalog programs: transitive closure, same generation, program analysis (CSPA, CSDA, Doop), Galen"
+kind = "performance"
+tasks = ["RT1"]
+needs = ["load", "reason-custom-rules"]
+scales = "graphs of 5 k to 40 k nodes (TC and SG: 25 M to 400 M derived facts); Graspan's httpd, Linux and PostgreSQL graphs; Doop on DaCapo's batik"
+source = "FlowLog's benchmark suite (Zhao et al., VLDB 2026): programs from github.com/flowlog-rs/vldb26-artifact (Apache-2.0, vendored), data from its Hugging Face dataset"
+licence = "programs Apache-2.0; datasets without a stated licence (fetched, never committed)"
+tiers = ["tc-G10K", "sg-G10K", "cspa-httpd", "cspa-linux", "cspa-postgresql", "csda-httpd", "csda-linux", "csda-postgresql", "reach-livejournal", "galen", "doop-batik"]
+state = "partial"
+kit = "benches/reasoning/datalog"
+check = "derived facts per relation against Soufflé's published counts (FlowLog's reproduction logs); counts across engines"
+note = "Soufflé's, Nemo's and VLog's home turf. NRESE runs the programs as Notation3 user rules over triples: Galen (ternary relations) and Doop (arity up to 7, negation) are not expressible there"
+
+[materialisation-programs]
+title = "RDFox's materialisation programs over RDF: Claros L and LE, LUBM L and LE"
+kind = "performance"
+tasks = ["RT1"]
+needs = ["load", "reason-custom-rules"]
+scales = "Claros (19 M triples; LE: about 550 M derived), LUBM 125 universities"
+source = "the RDFox benchmark programs in VLog's syntax from GLog's VLDB 2021 package (fetched by hash); Claros from RDFox's ISWC 2015 test data (Oxford); LUBM from the pinned UBA generator"
+licence = "programs and Claros: no licence stated (ask before publishing); LUBM generated"
+tiers = ["claros-l", "claros-le", "lubm-l-125", "lubm-le-125"]
+state = "partial"
+kit = "benches/reasoning/datalog"
+check = "facts per relation (each relation is one triple pattern) across engines; GLog's published totals where the data is the same"
+note = "GLog's, VLog's and RDFox's home turf (single-threaded materialisation, GLog's Table 4). RDFox waits for a licence"
+
 [consistency]
 title = "Injected contradictions: detection and explanation"
 kind = "performance"
