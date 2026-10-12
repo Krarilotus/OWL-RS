@@ -18,36 +18,14 @@ mod semantics;
 
 use std::collections::HashMap;
 
-use nrese_dl::tableau::{Answer, Config, Model, consistency};
+use nrese_dl::certificate::{self, Certificate};
+use nrese_dl::tableau::{Answer, Config, consistency};
 use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
-use nrese_owl::{Concept, Ontology, Term};
-use semantics::{Interp, confirms, find_model};
+use nrese_owl::{Ontology, Term};
+use semantics::{Interp, find_model};
 
 fn env(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
-}
-
-/// The model as an interpretation of the original signature.
-fn interp(m: &Model) -> Option<Interp> {
-    if m.size > 128 || m.size == 0 {
-        return None;
-    }
-    let mut i = Interp {
-        n: m.size as u32,
-        ..Interp::default()
-    };
-    for &(c, e) in &m.concepts {
-        if let Concept::Named(t) = c {
-            *i.concepts.entry(t).or_default() |= 1 << e;
-        }
-    }
-    for &(r, a, b) in &m.roles {
-        i.add_edge(r, a as u32, b as u32);
-    }
-    for &(t, e) in &m.individuals {
-        i.individuals.insert(t, e as u32);
-    }
-    Some(i)
 }
 
 fn configs() -> Vec<(&'static str, Config)> {
@@ -253,13 +231,10 @@ fn check_case(
         // Every configuration's answer is checked against the semantics.
         match &out.answer {
             Answer::Consistent => {
-                // No verdict where the model doesn't fit the reference's 128 elements.
-                let verdict = out
-                    .model
-                    .as_ref()
-                    .and_then(interp)
-                    .and_then(|i| confirms(o, i));
-                let ok = verdict == Some(true);
+                // The certificate checker's verdict on the engine's model (folded,
+                // lifted, unravelled; `nrese_dl::certificate`).
+                let verdict = out.model.as_ref().map(|m| certificate::certify(o, m));
+                let ok = verdict.as_ref().is_some_and(Certificate::is_model);
                 if *name == "default" {
                     tally.consistent += 1;
                 }
@@ -392,7 +367,7 @@ fn answers_agree_with_the_semantics() {
 
 /// Guard (the oracle): seed 94543, case 143 is consistent (a 3-cycle along a property
 /// disjoint with its inverse), and its folded model closes a loop on the blocker; lifted
-/// into three copies it is a model (`semantics::lift`). It failed the push gate's
+/// into three copies it is a model (`nrese_dl::certificate`'s lift). It failed the push gate's
 /// new seeds as "consistent, but no model", a confirmation the oracle couldn't make.
 #[test]
 fn a_loop_folded_onto_its_blocker_is_untied() {
@@ -461,8 +436,12 @@ fn counted_products_agree_with_the_semantics() {
             let counts = closure::close(&p).expect("closes");
             let c = candidate::construct(&p, &counts).expect("a candidate");
             let mut i = expand(&c);
-            semantics::close(&o, &mut i);
-            assert!(semantics::model_of(&o, &i), "({n}, {m}, {k}): not a model");
+            certificate::close(&o, &mut i);
+            assert_eq!(
+                certificate::check(&o, &i),
+                Ok(()),
+                "({n}, {m}, {k}): not a model"
+            );
             if k <= 6 {
                 let s = consistency(&o, &search);
                 assert!(
@@ -482,21 +461,25 @@ fn counted_products_agree_with_the_semantics() {
 /// A compressed model as an explicit interpretation: each proxy its elements, each block
 /// the edges `e` from element `e / out` to element `e mod |to|` (every element of `from`
 /// gets `out` distinct neighbours, every element of `to` gets `in`).
-fn expand(c: &nrese_dl::numbers::candidate::CompressedModelCandidate) -> Interp {
+fn expand(
+    c: &nrese_dl::numbers::candidate::CompressedModelCandidate,
+) -> certificate::Interpretation {
     let mut start = Vec::new();
-    let mut n = 0u32;
+    let mut n = 0usize;
     for p in &c.proxies {
         start.push(n);
-        n += u32::try_from(p.multiplicity).expect("small");
+        n += usize::try_from(p.multiplicity).expect("small");
     }
-    let mut i = Interp {
-        n,
-        ..Interp::default()
+    let mut i = certificate::Interpretation {
+        size: n,
+        ..certificate::Interpretation::default()
     };
     for (x, p) in c.proxies.iter().enumerate() {
-        let bits = (0..p.multiplicity as u32).fold(0u128, |b, e| b | 1 << (start[x] + e));
         for &class in &p.classes {
-            *i.concepts.entry(class).or_default() |= bits;
+            i.classes
+                .entry(class)
+                .or_default()
+                .extend((0..p.multiplicity as usize).map(|e| start[x] + e));
         }
         if let Some(a) = p.individual {
             i.individuals.insert(a, start[x]);
@@ -504,14 +487,11 @@ fn expand(c: &nrese_dl::numbers::candidate::CompressedModelCandidate) -> Interp 
     }
     for b in &c.blocks {
         let (fm, tm) = (c.proxies[b.from].multiplicity, c.proxies[b.to].multiplicity);
-        let rows = i
-            .roles
-            .entry(b.property)
-            .or_insert_with(|| vec![0; n as usize]);
+        let pairs = i.roles.entry(b.property).or_default();
         for e in 0..fm * b.out_degree {
-            let from = start[b.from] + (e / b.out_degree) as u32;
-            let to = start[b.to] + (e % tm) as u32;
-            rows[from as usize] |= 1 << to;
+            let from = start[b.from] + (e / b.out_degree) as usize;
+            let to = start[b.to] + (e % tm) as usize;
+            pairs.push((from, to));
         }
     }
     i

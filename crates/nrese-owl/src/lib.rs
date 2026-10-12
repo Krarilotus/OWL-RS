@@ -22,6 +22,7 @@ pub mod profile;
 pub mod proof;
 mod properties;
 pub mod ql;
+pub mod scope;
 mod universal;
 pub mod vocab;
 pub mod write;
