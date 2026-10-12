@@ -347,7 +347,7 @@ impl super::AccessControl {
             ));
         }
         self.store
-            .execute_update(&SparqlUpdateRequest::new(update))
+            .update_ungated(&SparqlUpdateRequest::new(update))
             .map(drop)
             .map_err(|error| AccessError::Store(error.to_string()))
     }

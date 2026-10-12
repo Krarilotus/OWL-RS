@@ -60,7 +60,7 @@ candidate batches. Resource lifetimes, reservations and the kernel boundary are 
 
 **Read:** `server` parses and authorises → `store::query` takes a snapshot (lock-free `Arc` clone) → `sparql` evaluates against the snapshot with a cancellation token → results are serialised → `server` sends the response.
 
-**Write (mutation pipeline, owned by `nrese-store`):**
+**Write (mutation pipeline, owned by `nrese-store`):** every public write enters here: the protocols' commands, and `MutationCommand::Delta` with a `DeltaPlanner` for any other front-end (a GQL or Cypher update), which plans its delta into the transaction and is gated like the rest. The store has no public method that commits around the pipeline (`write_path_tests`): its own writes to its system graphs and scratch stores are crate-private (`*_ungated`); bulk loads, rematerialisation and a replica's log are explicit operations of their own.
 1. Acquire the single writer slot and a snapshot of the latest revision.
 2. **Plan:** turn the request into a `Delta` (exact inserts and deletes relative to the snapshot). For SPARQL Update this evaluates `WHERE` clauses against *snapshot + pending delta*, so later operations in a request see earlier ones. Nothing is written.
 3. **Validate:** gates run against `(snapshot, delta)`: the reasoner first derives the inferred delta and checks consistency, then SHACL validates. Gates are *delta-aware*; a gate that can't be incremental says so explicitly in its capability report.

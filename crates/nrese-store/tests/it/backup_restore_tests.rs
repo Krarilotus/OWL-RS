@@ -1,3 +1,4 @@
+use crate::support::Writes;
 use nrese_store::{
     DatasetBackupFormat, DatasetRestoreRequest, GraphReadRequest, GraphResultFormat, GraphTarget,
     GraphWriteRequest, QueryResultKind, SparqlUpdateRequest, StoreConfig, StoreService,

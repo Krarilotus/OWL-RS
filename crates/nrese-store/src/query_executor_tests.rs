@@ -230,7 +230,7 @@ fn collected_response_keeps_the_first_preparation_report() {
     })
     .unwrap();
     store
-        .execute_update_str(
+        .update_str_ungated(
             "PREFIX : <http://example.org/>
         PREFIX owl: <http://www.w3.org/2002/07/owl#>
         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>

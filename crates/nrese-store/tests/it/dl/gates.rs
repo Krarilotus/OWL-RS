@@ -152,9 +152,7 @@ fn dl_answers_derive_nothing_from_graphs_the_reader_cannot_read() {
 #[test]
 fn a_replica_interns_nothing_and_says_when_the_bounds_are_missing() {
     let dl = pipeline();
-    dl.store()
-        .execute_update_str(&format!("{PREFIXES} INSERT DATA {{ {UNION} }}"))
-        .expect("written past the pipeline");
+    crate::support::load_past_the_pipeline(dl.store(), &format!("{PREFIXES}\n{UNION}"));
     dl.store().mark_replica();
     let terms = dl.store().engine_stats().dictionary.terms;
     let (rows, status) = query(&dl, "SELECT ?x { ?x a :D }");

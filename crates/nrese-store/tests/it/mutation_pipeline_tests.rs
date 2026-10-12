@@ -1,3 +1,4 @@
+use crate::support::Writes;
 use std::sync::Arc;
 
 use crate::support::in_memory_store_config;
@@ -481,7 +482,7 @@ fn reasoning_state_tracks_whether_inferences_are_current() {
             )
             .expect("commit");
         assert!(current(&store));
-        // An ungated write drops it; rematerialisation restores it.
+        // A write without reasoning drops it; rematerialisation restores it.
         store
             .execute_update(&SparqlUpdateRequest::new(format!(
                 "INSERT DATA {{ <{EX}tom> a <{EX}Cat> }}"

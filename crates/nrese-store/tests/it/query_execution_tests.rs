@@ -1,6 +1,7 @@
 //! Q1 gate (store side): queries stream into their writer, stop promptly when cancelled,
 //! and honour protocol dataset parameters.
 
+use crate::support::Writes;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 

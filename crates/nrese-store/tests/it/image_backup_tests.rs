@@ -1,6 +1,7 @@
 //! Image backups (image_backup.rs): written from a running store, restored into an empty
 //! data directory, checked against their manifest.
 
+use crate::support::Writes;
 use std::fs;
 
 use nrese_store::{StoreConfig, StoreService, read_manifest, restore_image};

@@ -1,6 +1,7 @@
 //! Why an inferred statement holds (`StoreService::explain_statement`): a derivation from
 //! asserted statements, each step naming its rule and premises.
 
+use crate::support::Writes;
 use crate::support::in_memory_store_config;
 use nrese_rdf::{NamedNode, Term};
 use nrese_reasoner::rulesets::Ruleset;

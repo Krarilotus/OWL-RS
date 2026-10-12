@@ -221,7 +221,7 @@ impl AccessControl {
         }
         update.push_str(&format!("INSERT DATA {{\n{}\n}}", data(&inserts)));
         self.store
-            .execute_update(&SparqlUpdateRequest::new(update))
+            .update_ungated(&SparqlUpdateRequest::new(update))
             .map_err(|error| AccessError::Store(error.to_string()))?;
         *self.state.write().expect("state") = Arc::new(after);
         *next += 1;

@@ -2,6 +2,7 @@
 //! Results JSON §3.1.3): `version=1.2` in the media type, `"version"` in JSON's head,
 //! `VERSION "1.2"` first in Turtle and N-Triples. Results that can't don't.
 
+use crate::support::Writes;
 use nrese_store::{
     GraphResultFormat, SerializedQueryResult, SparqlQueryRequest, StoreConfig, StoreService,
 };
