@@ -542,7 +542,7 @@ args = ["--reason", "owl2-rl", "--reason-runs", "30", "--runs", "10"]
 queries = "lubm"
 metric = "reason.p50_ms"
 check = {}
-route = { "cgroup_peak_mib" = "<= 2048" }
+route = { "peak_mib" = "<= 2048" }
 cap_gb = 2
 systems = []
 

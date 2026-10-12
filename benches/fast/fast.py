@@ -525,7 +525,8 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
     if levels := client_throughput(result):
         record["throughput"] = levels
     record["phase_peaks"] = {k: v.get("peak_mib") for k, v in (result.get("phases") or {}).items()}
-    record["peak_mib"] = result.get("cgroup_peak_mib") or result.get("peak_mib")
+    record["peak_mib"] = process_peak(result.get("peak_mib"), record["phase_peaks"])
+    record["container_peak_mib"] = result.get("cgroup_peak_mib")
     if case.get("queries", "").startswith("@vectors") and record["status"] == "ok":
         result["recall"] = vector_recall(case, expect)
     record["checks"] = [check(path, want, result, expect, alt_expect) for path, want in case.get("check", {}).items()]
@@ -616,6 +617,15 @@ def classify_failure(code: int, err: str, result: dict) -> str:
     if "unsupported:" in text:
         return "unsupported"
     return "failed"
+
+
+def process_peak(peak, phase_peaks: dict):
+    """The case's peak: the process's since it started. A perf lab before 12 Oct 2026 reported
+    as `peak_mib` the last phase's alone, so the highest phase peak counts too. The container's
+    (cgroup `memory.peak`) is not it: that counts the page cache the container's reads were
+    charged, which depends on what the host had cached (rl-lubm100: 2.3 GB of 4.7)."""
+    values = [v for v in (peak, *phase_peaks.values()) if isinstance(v, (int, float)) and v > 0]
+    return max(values) if values else None
 
 
 def slim(result: dict) -> dict:
@@ -911,8 +921,11 @@ def pooled(report: dict) -> dict[str, dict]:
             if peak:
                 entry["phase_peaks"].setdefault(phase, []).append(peak)
         entry["status"].append(r["status"])
-        if r.get("peak_mib"):
-            entry["peaks"].append(r["peak_mib"])
+        # A record before 12 Oct 2026 holds the container's peak; its process's is recovered.
+        peak = r.get("peak_mib") if "container_peak_mib" in r else \
+            process_peak((r.get("result") or {}).get("peak_mib"), r.get("phase_peaks") or {}) or r.get("peak_mib")
+        if peak:
+            entry["peaks"].append(peak)
         if isinstance(r.get("metric"), (int, float)):
             entry["metrics"].append(r["metric"])
         samples = {k: thin(sorted(v for v in vs if v is not None)) for k, vs in (r.get("samples") or {}).items()}
@@ -946,6 +959,17 @@ def spread(entry: dict) -> float:
     if len(m) < 2:
         return 0.0
     return (max(m) - min(m)) / statistics.median(m)
+
+
+# A case's peak varies between repetitions by what the allocator still holds of memory freed
+# shortly before (up to 26 % in a small parallel load, 12 Oct 2026); beyond this, something
+# not the process's is counted (the page cache in the container's peak: 49-98 %).
+UNSTABLE_PEAK = 0.40
+
+
+def peak_spread(peaks: list) -> float:
+    """The range of the per-repetition peaks relative to the smallest."""
+    return (max(peaks) - min(peaks)) / min(peaks) if len(peaks) > 1 and min(peaks) > 0 else 0.0
 
 
 def bootstrap_ratio(base: list[dict], new: list[dict], rounds: int = 1000, seed: int = 1) -> tuple[float, float, float]:
@@ -1057,12 +1081,18 @@ def compare(args) -> int:
         elif high < 1.0 and ratio <= 1 / (1 + threshold):
             verdict = "faster" if bm - nm >= min_ms else "faster, below absolute floor"
         bp, np_ = (max(b["peaks"]) if b["peaks"] else None), (max(n["peaks"]) if n["peaks"] else None)
-        if bp and np_ and np_ > bp * (1 + max(0.10, threshold)) and np_ - bp > 64:
+        # A peak counts beyond either side's spread of peaks too, as a time beyond its spread.
+        memory_spread = max(peak_spread(b["peaks"]), peak_spread(n["peaks"]))
+        if memory_spread > UNSTABLE_PEAK:
+            verdict += f", memory NOT COMPARABLE (peaks vary {memory_spread:.0%} between repetitions)"
+            regressions += 1
+        elif bp and np_ and np_ > bp * (1 + max(0.10, threshold, memory_spread)) and np_ - bp > 64:
             verdict += ", MORE MEMORY"
             regressions += 1
         for phase in sorted(set(b["phase_peaks"]) & set(n["phase_peaks"])):
             before, after = max(b["phase_peaks"][phase]), max(n["phase_peaks"][phase])
-            if after > before * (1 + max(0.10, threshold)) and after - before > 64:
+            phase_spread = max(peak_spread(b["phase_peaks"][phase]), peak_spread(n["phase_peaks"][phase]))
+            if after > before * (1 + max(0.10, threshold, phase_spread)) and after - before > 64:
                 verdict += f", MORE MEMORY in {phase} ({before} -> {after} MiB)"
                 regressions += 1
         work, notes = counter_changes(b["counters"], n["counters"])

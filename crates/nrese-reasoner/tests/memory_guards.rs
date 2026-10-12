@@ -4,6 +4,7 @@
 //! test binary of its own, and its tests run one at a time.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nrese_exec::heap;
 use nrese_reasoner::batch::{self, Materialisation, Schema};
@@ -145,6 +146,31 @@ fn relations_keep_no_object_order_their_rules_never_use() {
     assert!(
         store <= facts * BYTES_PER_FACT,
         "{store} bytes for {facts} facts, at most {BYTES_PER_FACT} each"
+    );
+}
+
+/// Releases of the allocator's unused memory (`nrese_engine::memory::release_all`): once on
+/// the one pool thread, once on the calling thread.
+static RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+/// What a round freed goes back before the next round allocates, and after the last one.
+/// mimalloc holds a freed large block 100 ms, about a round of LUBM 100, so without the
+/// releases the resident peak held the last round's buffers or not by timing: 2,016-2,148
+/// MiB over ten runs of one build, 1,592-1,675 with them (12 Oct 2026, heap 1,233 MiB).
+#[test]
+fn every_round_begins_with_the_last_rounds_memory_given_back() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    nrese_engine::memory::set_release(|_| {
+        RELEASES.fetch_add(1, Ordering::Relaxed);
+    });
+    let before = RELEASES.load(Ordering::Relaxed);
+    let (result, _, _) = materialise(DEPARTMENTS);
+    let releases = RELEASES.load(Ordering::Relaxed) - before;
+    let rounds = result.rounds;
+    assert!(rounds > 1, "{rounds} rounds: too few to tell");
+    assert!(
+        releases >= 2 * (rounds + 1),
+        "{releases} releases over {rounds} rounds"
     );
 }
 
