@@ -76,6 +76,22 @@ class Rootfs(unittest.TestCase):
             self.assertIn(part, joined)
 
 
+class RootfsLinks(unittest.TestCase):
+    def test_mount_targets_follow_the_images_links(self):
+        from suitekit.runtime import inside
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "opt/store/database").mkdir(parents=True)
+            try:
+                (root / "database").symlink_to("/opt/store/database")
+                (root / "opt/data").symlink_to("store/database")
+            except (OSError, NotImplementedError):
+                self.skipTest("no symlinks here")
+            self.assertEqual(inside(root, "/database"), "/opt/store/database")
+            self.assertEqual(inside(root, "/opt/data/x"), "/opt/store/database/x")
+            self.assertEqual(inside(root, "/index"), "/index")
+
+
 class QueryLimit(unittest.TestCase):
     def context(self, settings):
         return adapters.Context(None, ROOT, ROOT, ROOT, Mount("-", "/data"), [], 3600, settings, "t")
