@@ -278,6 +278,9 @@ class DockerRuntime(Runtime):
 
     def args(self, spec: Spec, detached: bool) -> list[str]:
         args = ["docker", "run", "--name", spec.name, "--init"]
+        # A measurement's own container: the quiet slot's watcher pauses the others.
+        if os.environ.get("NRESE_QUIET_TOKEN"):
+            args += ["--label", f"nrese.quiet={os.environ['NRESE_QUIET_TOKEN']}"]
         if detached:
             args.append("-d")
         if spec.keep_stdin:

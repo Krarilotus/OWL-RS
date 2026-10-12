@@ -157,9 +157,11 @@ def open_for(job: dict, queue: dict, now: datetime.datetime, busy=compilers) -> 
 # --- the runner ------------------------------------------------------------------------------
 
 class Queue:
-    def __init__(self, directory: Path, repo: Path, results: Path, worktrees: Path, path: list[str] = ()):
+    def __init__(self, directory: Path, repo: Path, results: Path, worktrees: Path, path: list[str] = (),
+                 watch: bool = True):
         self.directory, self.repo, self.results, self.worktrees = directory, repo, results, worktrees
         self.path = list(path)
+        self.watch = watch  # a timed job's host kept quiet (off in tests: it would stop the host's work)
         for state in STATES:
             (directory / state).mkdir(parents=True, exist_ok=True)
 
@@ -216,10 +218,21 @@ class Queue:
             # The host's tools first (hosts.toml queue.path: its Python, cargo).
             env["PATH"] = os.pathsep.join([*(str(expand(p)) for p in self.path), env.get("PATH", "")])
             code = made.returncode
+            timed = job.get("window", "quiet") == "quiet" and self.watch
             for command in job["commands"] if code == 0 else []:
                 out.write(f"=== {datetime.datetime.now().isoformat(timespec='seconds')} {' '.join(command)}\n")
                 out.flush()
-                code = subprocess.run(command, cwd=tree, env=env, stdout=out, stderr=subprocess.STDOUT).returncode
+                process = subprocess.Popen(command, cwd=tree, env=env, stdout=out, stderr=subprocess.STDOUT)
+                # A timed job keeps its host quiet while it runs, whatever its commands do
+                # themselves (scripts/lib/quiet-watch.py): its verdict goes into the job.
+                watcher = quiet_watch(results / "quiet", process.pid, job["id"]) if timed else None
+                code = process.wait()
+                if watcher is not None:
+                    watcher.terminate()
+                    watcher.wait(timeout=120)
+                    log = results / "quiet" / "watch.log"
+                    verdict = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+                    job["quiet"] = verdict[-1] if verdict else "no verdict"
                 if code != 0:
                     break
             if code == 0:
@@ -236,6 +249,16 @@ class Queue:
             state = "done" if code == 0 else "failed"
         self.move(path, job, state)
         return state
+
+
+def quiet_watch(state: Path, pid: int, token: str) -> subprocess.Popen | None:
+    """The watcher over a timed command (Linux): this user's other busy processes stopped,
+    other containers paused, until it ends."""
+    watch = HERE.parents[1] / "scripts" / "lib" / "quiet-watch.py"
+    if not Path("/proc").is_dir() or not watch.exists():
+        return None
+    state.mkdir(parents=True, exist_ok=True)
+    return subprocess.Popen([sys.executable, str(watch), str(state), str(pid), token])
 
 
 def here() -> tuple[str, dict]:
