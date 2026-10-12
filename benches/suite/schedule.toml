@@ -51,6 +51,7 @@ backlog = [
   "fedshop",
   "beir",
   "vibe",
+  "vector-dbbench",   # the vector databases' own ground (Qdrant, Milvus, pgvector, LanceDB)
   "soak",
   "larger-than-memory",
 ]
@@ -70,9 +71,5 @@ wdbench = "3.2: WDBench, Wikidata's query log (MillenniumDB's home turf)"
 sp2bench = "3.2: SP2Bench, DBLP-shaped data and 17 queries"
 npd = "3.6: NPD, OBDA over the Norwegian Petroleum Directorate (Ontop's home turf)"
 lubm-exists = "3.6: LUBM∃, LUBM with existential rules (Ontop, Stardog, PAGOdA)"
-starbench = "3.10: StarBench, RDF-star queries"
-fedshop = "3.11: FedShop, federated queries over many shops"
 beir = "3.9: BEIR, retrieval quality and time"
-vibe = "3.13: VIBE, vector index benchmark"
 soak = "3.16: soak, hours of mixed load"
-larger-than-memory = "3.17: larger than memory, store sizes past the RAM"

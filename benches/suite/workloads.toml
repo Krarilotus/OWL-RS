@@ -275,7 +275,7 @@ title = "Keyword search: ResearchSpace's search queries; LUBMft"
 kind = "performance"
 tasks = ["search"]
 needs = ["load", "query", "fulltext"]
-source = "ResearchSpace's templates; l3s.de/~minack/rdf-fulltext-benchmark"
+source = "ResearchSpace's templates; LUBMft (Minack, Siberski, Nejdl, ESWC 2009): its generator and query template are lost (l3s.de answers 404 since April 2024, the archive kept only the page and the paper); the paper's 20 queries remain"
 licence = "to check before use"
 tiers = ["-"]
 state = "planned"
@@ -334,19 +334,6 @@ kit = "benches/breadth/geographica2"
 check = "answer counts across systems; a dispute settled by a minimised witness"
 note = "Published: Strabon, uSeekM, Parliament, GraphDB 8.6.1, RDF4J 2.4.3 and a proprietary System X; Jena GeoSPARQL and QLever added here"
 
-[lubmft]
-title = "LUBMft: full-text and hybrid structured and full-text queries on LUBM with generated names and text"
-kind = "performance"
-tasks = ["search"]
-needs = ["load", "query", "fulltext"]
-scales = "LUBMft(1) to LUBMft(100): 0.13 M to 18 M statements, 6 M to 813 M terms"
-source = "Minack, Siberski, Nejdl, ESWC 2009; the generator and the query template are lost (l3s.de answers 404 since April 2024 and the archive kept only the page and the paper)"
-licence = "GPL (inherited from LUBM's UBA) for the lost code; a reconstruction would be ours"
-tiers = ["1", "10", "100"]
-state = "planned"
-check = "result sets across systems"
-note = "Needs a decision: reconstruct the generator from the paper (1990 census names, a topic model of the NIPS papers) or replace the benchmark"
-
 [fedshop]
 title = "FedShop200: federated BSBM-like shops, 20 to 200 members, 120 queries"
 kind = "performance"
@@ -361,21 +348,7 @@ kit = "benches/breadth/fedshop"
 check = "answers against the reference source assignment's"
 note = "NRESE runs only the SERVICE-annotated reference source assignments: it has no source selection over a federation (a finding). FedX, CostFed, Semagrow, HeFQUIN, FedUP published"
 
-[vector-ann]
-title = "ann-benchmarks: recall against queries per second (SIFT-1M, GloVe-100, Fashion-MNIST, GIST-960)"
-kind = "performance"
-tasks = ["search"]
-needs = ["vector"]
-scales = "60 K to 1.2 M vectors, 100 to 960 dimensions"
-source = "github.com/erikbern/ann-benchmarks at 2e081ad; data ann-benchmarks.com"
-licence = "MIT; per dataset"
-tiers = ["sift-128-euclidean", "glove-100-angular"]
-state = "planned"
-kit = "benches/breadth/vectors"
-check = "recall@10 against the published exact neighbours"
-note = "Qdrant, Milvus and pgvector have upstream modules; NRESE's index runs as a library (the subprocess protocol) and through SPARQL"
-
-[vector-vibe]
+[vibe]
 title = "VIBE: recall against throughput on modern embeddings, in and out of distribution"
 kind = "performance"
 tasks = ["search"]
@@ -388,20 +361,6 @@ state = "planned"
 kit = "benches/breadth/vectors"
 check = "recall@10 against the dataset's exact neighbours"
 note = "Algorithm level, one core, under Apptainer; the database systems aren't VIBE methods (their own ground is vector-dbbench)"
-
-[vector-filtered]
-title = "big-ann-benchmarks, NeurIPS'23 filtered track: YFCC-10M CLIP embeddings with tag filters"
-kind = "performance"
-tasks = ["search"]
-needs = ["vector"]
-scales = "10 M x 192 uint8, 100 K queries with one or two tags"
-source = "github.com/harsha-simhadri/big-ann-benchmarks at 89a3aba"
-licence = "MIT; data CC-BY-4.0"
-tiers = ["yfcc-10M"]
-state = "planned"
-kit = "benches/breadth/vectors"
-check = "recall@10 against the published ground truth; QPS at recall 0.9, as the track ranks"
-note = "Published on an Azure D8lds v5 (8 vCPU): parlayivf 37,902 QPS, puck 19,193, faiss 3,033 at recall 0.9"
 
 [vector-dbbench]
 title = "VectorDBBench: load, recall, QPS and p99 of vector databases, with and without filters"
@@ -417,7 +376,7 @@ kit = "benches/breadth/vectors"
 check = "recall against the case's ground truth"
 note = "The database vendors' own ground: Qdrant, Milvus, pgvector and LanceDB have clients there; NRESE needs one (SPARQL with nrv:search)"
 
-[memory-budget]
+[larger-than-memory]
 title = "LUBM 1000 under memory caps: load, OWL 2 RL closure and the 14 queries at 16, 12, 8, 6, 4 and 2 GB"
 kind = "performance"
 tasks = ["RT1", "RT5"]
@@ -566,13 +525,13 @@ kind = "performance"
 tasks = ["vector"]
 needs = ["load", "query"]
 scales = "generated: 200 k vectors of 64 dimensions, a filter of one kind in ten; big-ann-benchmarks' filtered track (YFCC-10M)"
-source = "ours (perf_lab's vectors generator); github.com/harsha-simhadri/big-ann-benchmarks"
+source = "ours (perf_lab's vectors generator); github.com/harsha-simhadri/big-ann-benchmarks at 89a3aba (filtered track; published on an Azure D8lds v5: parlayivf 37,902 QPS, puck 19,193, faiss 3,033 at recall 0.9)"
 licence = "ours; big-ann MIT, YFCC CC-BY variants"
 tiers = ["generated-200k", "yfcc-10m"]
 state = "partial"
 kit = "benches/fast"
 check = "recall@10 against the exact search"
-note = "The fast cases vector-knn-exact and vector-knn-filtered; why the filtered recall fails: runs/2026-10-12-vector-recall-phuoc.toml"
+note = "The fast cases vector-knn-exact and vector-knn-filtered; why the filtered recall failed: runs/2026-10-12-vector-recall-phuoc.toml, and the probe-first route's beam not widened for the filter (fixed 12 Oct, docs/design/performance.md lab log)"
 
 [ann-benchmarks]
 title = "ann-benchmarks: recall and throughput curves of approximate k-NN"
@@ -580,22 +539,11 @@ kind = "performance"
 tasks = ["vector"]
 needs = ["load", "query"]
 scales = "SIFT-1M, GloVe-100, Fashion-MNIST (0.1 to 1 GB)"
-source = "github.com/erikbern/ann-benchmarks"
+source = "github.com/erikbern/ann-benchmarks at 2e081ad; data ann-benchmarks.com (pinned in benches/datasets.toml)"
 licence = "MIT; data sets per set"
-tiers = ["sift-1m", "glove-100", "fashion-mnist"]
-state = "planned"
-check = "recall against the sets' ground truth"
-note = "Comparability with every published index"
+tiers = ["sift-128-euclidean", "glove-100-angular", "fashion-mnist-784-euclidean"]
+state = "partial"
+kit = "benches/breadth/vectors"
+check = "recall@10 against the sets' ground truth"
+note = "Comparability with every published index. NRESE as a module in upstream's harness (its server in the container, SPARQL per query); Qdrant 1.19.2 and pgvector v0.8.7 pinned (upstream pins Qdrant 1.5.1 and builds pgvector's master); hnswlib as the library reference"
 
-[geographica2]
-title = "Geographica 2: spatial selections, joins and aggregates on real and synthetic data"
-kind = "performance"
-tasks = ["space"]
-needs = ["load", "query", "geosparql"]
-scales = "real (OSM, CORINE land cover, GADM: a few GB) and a synthetic scalable set"
-source = "geographica2.di.uoa.gr"
-licence = "not stated; internal use only: ask the authors before publishing (owner, 5 Oct 2026)"
-tiers = ["real", "synthetic"]
-state = "planned"
-check = "answers across systems"
-note = "Strabon, uSeekM, Parliament published on it; Jena and GraphDB's GeoSPARQL are the comparators here"
