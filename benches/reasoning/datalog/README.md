@@ -43,6 +43,12 @@ NRESE_BIN=.../nrese-server python3 datalog.py run --cases cspa-httpd --threads 4
 | Nemo 0.10.1 | CSV, or the N-Triples | `nmo -e none` | one, by design |
 | VLog 1.3.7 | CSV in memory, or a Trident store (`vlog load`) | `vlog mat` | one (its default; `--vlog-threads` runs `--multithreaded 1 --nthreads N`) |
 | GLog | as VLog | `vlog tgchase --querycont 1 --edbcheck 1 --rewritecliques 0 --delProofs 0` (`GLOG_OPTIONS`) | one |
+| RDFox 7.6 (UNVERIFIED until a licensed run) | the N-Triples, as NRESE | sandbox: `threads N`, import the facts, import the rules (RDFox's triple rules, the same as NRESE's) | N |
+
+VLog and GLog print no count of what they derived: every run stores the materialisation
+(`--storemat`) and the files are counted afterwards; the storing time VLog logs comes off the
+wall time. RDFox without `RDFox.lic` is a skipped row naming the licence; its rows carry
+`publish = permission`.
 
 Every engine runs in a container capped at the same CPUs (`--threads`, as `DOCKER_CPUS`) and
 memory (`DOCKER_MEMORY`, default 28g), as the invoking user, from fresh scratch; the

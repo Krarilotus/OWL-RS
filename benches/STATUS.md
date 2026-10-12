@@ -4,10 +4,10 @@ Generated 2026-10-12 by `python benches/suite/suite.py status --write` from [sui
 
 ## At a glance
 
-- **Workloads:** 34 (8 partial, 16 planned, 10 ready)
+- **Workloads:** 34 (9 partial, 15 planned, 10 ready)
 - **Systems:** 23 (19 free to publish, 4 only with the vendor's permission)
-- **Pairs** (standard tier × system that can run it; build variants apart): 472; run at least once: 103; ok on their newest run: 80
-- **NRESE:** 19 of its 74 standard tiers ok on their newest run
+- **Pairs** (standard tier × system that can run it; build variants apart): 469; run at least once: 103; ok on their newest run: 80
+- **NRESE:** 19 of its 73 standard tiers ok on their newest run
 - **Run records:** 34, newest 2026-10-12
 
 ## Schedule
@@ -25,18 +25,17 @@ The order the families are measured in ([suite/schedule.toml](suite/schedule.tom
 | 5 | owl2bench | ready | 2026-10-12 | OWL2Bench: one TBox per OWL 2 profile, 22 queries |
 | 6 | lubm | ready | 2026-10-09 | LUBM: universities, 14 queries |
 | 7 | claros | partial | - | Claros (L, LE): RDFox's and GLog's datasets, rules that build large cliques |
-| 8 | sspe | planned | - | SSPE: single-source path graphs where one deletion invalidates long derivations |
-| 9 | ldbc-spb | planned | - | LDBC Semantic Publishing Benchmark 2.0 (BBC): queries under inference with continuous updates |
-| 10 | datalog-graphs | partial | - | Datalog graph programs: transitive closure, same generation, CSPA |
-| 11 | commit-latency | partial | - | Commit latency under 0, 1, 8 and 64 readers, the closure complete at every commit |
-| 12 | ore-2015 | partial | 2026-10-03 | ORE 2015: classification of 1,920 real ontologies |
-| 13 | elk-ontologies | planned | - | Classification of large EL and near-EL ontologies: GO, ChEBI, NCIt, GALEN |
-| 14 | pagoda-suite | planned | - | PAGOdA's test suite: query answering beyond OWL 2 RL |
-| 15 | vector-recall | partial | - | Filtered k-NN: recall and time of vector search under a filter |
-| 16 | ann-benchmarks | planned | - | ann-benchmarks: recall and throughput curves of approximate k-NN |
-| 17 | geographica2 | planned | - | Geographica 2: spatial selections, joins and aggregates on real and synthetic data |
-| 18 | era-shacl | planned | - | ERA-SHACL-Benchmark: validation time and memory on a real railway knowledge graph |
-| 19 | fast | partial | 2026-10-10 | The fast suite's cases on their comparators: each case under the semantics a system supports |
+| 8 | ldbc-spb | partial | - | LDBC Semantic Publishing Benchmark 2.0 (BBC): queries under inference with continuous updates |
+| 9 | datalog-graphs | partial | - | Datalog graph programs: transitive closure, same generation, CSPA |
+| 10 | commit-latency | partial | - | Commit latency under 0, 1, 8 and 64 readers, the closure complete at every commit |
+| 11 | ore-2015 | partial | 2026-10-03 | ORE 2015: classification of 1,920 real ontologies |
+| 12 | elk-ontologies | planned | - | Classification of large EL and near-EL ontologies: GO, ChEBI, NCIt, GALEN |
+| 13 | pagoda-suite | planned | - | PAGOdA's test suite: query answering beyond OWL 2 RL |
+| 14 | vector-recall | partial | - | Filtered k-NN: recall and time of vector search under a filter |
+| 15 | ann-benchmarks | planned | - | ann-benchmarks: recall and throughput curves of approximate k-NN |
+| 16 | geographica2 | planned | - | Geographica 2: spatial selections, joins and aggregates on real and synthetic data |
+| 17 | era-shacl | planned | - | ERA-SHACL-Benchmark: validation time and memory on a real railway knowledge graph |
+| 18 | fast | partial | 2026-10-10 | The fast suite's cases on their comparators: each case under the semantics a system supports |
 
 ### Backlog
 
@@ -61,6 +60,12 @@ The order the families are measured in ([suite/schedule.toml](suite/schedule.tom
 | 17 | vibe | catalogue only | - | CATALOG.md §3.13: VIBE, vector index benchmark |
 | 18 | soak | catalogue only | - | CATALOG.md §3.16: soak, hours of mixed load |
 | 19 | larger-than-memory | catalogue only | - | CATALOG.md §3.17: larger than memory, store sizes past the RAM |
+| 20 | sspe | planned | - | SSPE: single-source path graphs where one deletion invalidates long derivations |
+| 21 | doop | catalogue only | - | CATALOG.md §3.4: Doop on DaCapo, Soufflé's own workload (programs vendored in benches/reasoning/datalog) |
+| 22 | galen | catalogue only | - | CATALOG.md §3.4: Galen as Datalog, FlowLog's suite (a case of benches/reasoning/datalog) |
+| 23 | reactome-uniprot | catalogue only | - | CATALOG.md §3.4: Reactome and UniProt, RDFox's and GLog's datasets |
+| 24 | chasebench | catalogue only | - | CATALOG.md §3.4: ChaseBench, existential rules (Nemo, VLog, RDFox) |
+| 25 | uobm | catalogue only | - | CATALOG.md §3.4: UOBM, LUBM with richer OWL (GLog's package has its L program) |
 
 ### Last: not expected to give data for polishing or optimisation
 
@@ -82,7 +87,7 @@ Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome 
 | lubm | ready | 4/4 | · | 3/4 | – | – | – | 1/4 ! | – | 3/4 | 3/4 | 3/4 ! | – | – | – | 1/4 | – | – | – | – | 4/4 | · | n/a | n/a |
 | lubm-materialised | ready | 3/3 | · | · | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | – | – | – | – | – | – | – | – | – | – | – | 3/3 | · | n/a | · |
 | owl2bench | ready | 2/2 | · | 1/2 | – | – | – | 1/2 | – | 2/2 | 2/2 | · | – | – | – | 1/2 ! | – | – | – | – | 2/2 | · | n/a | n/a |
-| ldbc-spb | planned | · | · | · | – | – | – | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | · |
+| ldbc-spb | partial | · | · | · | – | – | – | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | · |
 | integration-rg-gs-gnd | partial | · | · | · | – | – | – | · | – | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | n/a |
 | real-ontologies | planned | · | · | · | – | – | – | · | · | · | · | · | – | – | – | · | – | – | – | – | · | · | n/a | · |
 | consistency | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | – |
@@ -105,7 +110,7 @@ Per workload and system: standard tiers with an `ok` (or `ran*`) newest outcome 
 | clients | ready | · | n/a | n/a | n/a | n/a | n/a | n/a | n/a | – | – | – | – | – | – | – | – | – | – | – | n/a | n/a | n/a | n/a |
 | gcare | planned | · | · | · | · | · | · | · | · | – | – | – | – | – | – | – | – | – | – | – | · | · | n/a | · |
 | claros | partial | · | · | · | – | – | – | · | – | · | · | · | · | · | · | · | – | – | – | – | · | · | n/a | – |
-| sspe | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | – | – |
+| sspe | planned | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – |
 | datalog-graphs | partial | · | · | – | – | – | – | · | – | · | · | · | · | · | · | – | – | – | – | – | · | · | n/a | – |
 | commit-latency | partial | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | – | · | · | – | – |
 | elk-ontologies | planned | · | · | · | – | – | – | – | – | – | – | – | – | – | – | – | · | · | · | · | – | · | – | – |
@@ -154,7 +159,7 @@ ready, performance; tasks RT1, RT3; kit `benches/reasoning` (suite driver); chec
 
 ### ldbc-spb: LDBC Semantic Publishing Benchmark 2.0 (BBC): queries under inference with continuous updates
 
-planned, performance; tasks RT3, RT5; kit `-` (outside the driver); checked by: the benchmark's own validation of query results and of its OWL 2 RL rules.
+partial, performance; tasks RT3, RT5; kit `benches/reasoning/spb` (outside the driver); checked by: the benchmark's own validation of query results and of its OWL 2 RL rules.
 
 | Tier | nrese | nrese-fsst | nrese-oxigraph | jena | rdf4j | graphdb | rdfox | anzograph |
 |---|---|---|---|---|---|---|---|---|
@@ -393,9 +398,7 @@ partial, performance; tasks RT1, RT2; kit `benches/reasoning/datalog` (outside t
 
 planned, performance; tasks RT2; kit `-` (outside the driver); checked by: the incremental closure equals the rematerialised one.
 
-| Tier | nrese | nrese-fsst | nrese-oxigraph | graphdb | rdfox |
-|---|---|---|---|---|---|
-| 1000 | · | · | · | · | · |
+No system can run it yet.
 
 ### datalog-graphs: Datalog graph programs: transitive closure, same generation, CSPA
 
@@ -494,7 +497,6 @@ planned, performance; tasks space; kit `-` (outside the driver); checked by: ans
 - **clients:** nrese (-)
 - **gcare:** nrese (yago, lubm80); qlever (yago, lubm80); oxigraph (yago, lubm80); virtuoso (yago, lubm80); jena (yago, lubm80); rdf4j (yago, lubm80); graphdb (yago, lubm80); rdfox (yago, lubm80); anzograph (yago, lubm80)
 - **claros:** nrese (l, le); jena (l, le); nemo (l, le); souffle (l, le); vlog (l, le); glog (l, le); owlrl (l, le); graphdb (l, le); rdfox (l, le)
-- **sspe:** nrese (1000); graphdb (1000); rdfox (1000)
 - **datalog-graphs:** nrese (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); jena (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); nemo (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); souffle (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); vlog (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); glog (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); graphdb (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); rdfox (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql)
 - **commit-latency:** nrese (lubm-10); graphdb (lubm-10); rdfox (lubm-10)
 - **elk-ontologies:** nrese (go, chebi, ncit, galen); hermit (go, chebi, ncit, galen); openllet (go, chebi, ncit, galen); konclude (go, chebi, ncit, galen); elk (go, chebi, ncit, galen); rdfox (go, chebi, ncit, galen)
@@ -525,7 +527,6 @@ planned, performance; tasks space; kit `-` (outside the driver); checked by: ans
 - **fast:** nrese-fsst (q-cycles~plain, rl-hierarchy~closure, rl-clique); nrese-oxigraph (q-cycles~plain, rl-hierarchy~closure, rl-clique)
 - **gcare:** nrese-fsst (yago, lubm80); nrese-oxigraph (yago, lubm80)
 - **claros:** nrese-fsst (l, le); nrese-oxigraph (l, le); nemo-schemafirst (l, le); nemo-sparq (l, le)
-- **sspe:** nrese-fsst (1000); nrese-oxigraph (1000)
 - **datalog-graphs:** nrese-fsst (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); nemo-schemafirst (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql); nemo-sparq (tc-G10K, sg-G10K, cspa-httpd, cspa-linux, cspa-postgresql)
 - **commit-latency:** nrese-fsst (lubm-10); nrese-oxigraph (lubm-10)
 - **elk-ontologies:** nrese-fsst (go, chebi, ncit, galen); nrese-oxigraph (go, chebi, ncit, galen)
@@ -580,7 +581,7 @@ planned, performance; tasks space; kit `-` (outside the driver); checked by: ans
 
 ### Workloads not ready
 
-- **ldbc-spb** (planned): LDBC Semantic Publishing Benchmark 2.0 (BBC): queries under inference with continuous updates. The industry's audited reasoning benchmark (GraphDB publishes audited results). Its advanced query mix also needs fulltext and geosparql
+- **ldbc-spb** (partial): LDBC Semantic Publishing Benchmark 2.0 (BBC): queries under inference with continuous updates. The industry's audited reasoning benchmark (GraphDB publishes audited results). Its advanced query mix also needs fulltext and geosparql; the kit runs the basic mix with the benchmark's own ruleset on both systems. Office-PC's GraphDB licence is Free (1 CPU core, two concurrent queries; checked 12 Oct 2026): the comparison is the matched one-CPU scenario, and the audited Enterprise results can't be reproduced with it
 - **integration-rg-gs-gnd** (partial): RG x GS x GND integration: identity reasoning over real links, 10 competency questions. NRESE and Fuseki run; cohort and full tiers and the other systems are open
 - **real-ontologies** (planned): DBpedia and YAGO with their ontologies: materialisation over real hierarchies.
 - **consistency** (planned): Injected contradictions: detection and explanation.
@@ -604,6 +605,12 @@ planned, performance; tasks space; kit `-` (outside the driver); checked by: ans
 - **vector-recall** (partial): Filtered k-NN: recall and time of vector search under a filter. The fast cases vector-knn-exact and vector-knn-filtered; why the filtered recall fails: runs/2026-10-12-vector-recall-phuoc.toml
 - **ann-benchmarks** (planned): ann-benchmarks: recall and throughput curves of approximate k-NN. Comparability with every published index
 - **geographica2** (planned): Geographica 2: spatial selections, joins and aggregates on real and synthetic data. Strabon, uSeekM, Parliament published on it; Jena and GraphDB's GeoSPARQL are the comparators here
+
+### Capabilities NRESE lacks
+
+- rules-nary: not planned: user rules are over triples (Galen, Doop, SSPE need ternary and wider relations); owner's scope decision
+- rules-negation: not planned: no negation in user rules (Doop's stratified negation); owner's scope decision
+- rules-arithmetic: not planned: math builtins are B2's rest (SSPE adds path lengths); owner's scope decision
 
 ## Runs
 

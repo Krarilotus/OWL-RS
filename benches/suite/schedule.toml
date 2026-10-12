@@ -16,7 +16,6 @@ now = [
   "owl2bench",        # the QL rerun first
   "lubm",
   "claros",           # RDFox's
-  "sspe",             # RDFox's
   "ldbc-spb",         # GraphDB's
   "datalog-graphs",   # TC, SG, CSPA: Nemo's, VLog's, Soufflé's
   "commit-latency",   # under readers
@@ -53,6 +52,16 @@ backlog = [
   "vibe",
   "soak",
   "larger-than-memory",
+  # reasoning, moved here on 12 Oct 2026: not expressible in NRESE's user rules (relations
+  # beyond triples, negation, arithmetic: systems.toml [nrese] missing), a scope question
+  # for the owner; SSPE also lacks its RDFox licence
+  "sspe",
+  "doop",
+  "galen",
+  # reasoning, the owner's backlog of 12 Oct 2026
+  "reactome-uniprot",
+  "chasebench",
+  "uobm",
 ]
 
 last = [
@@ -76,3 +85,8 @@ beir = "3.9: BEIR, retrieval quality and time"
 vibe = "3.13: VIBE, vector index benchmark"
 soak = "3.16: soak, hours of mixed load"
 larger-than-memory = "3.17: larger than memory, store sizes past the RAM"
+doop = "3.4: Doop on DaCapo, Soufflé's own workload (programs vendored in benches/reasoning/datalog)"
+galen = "3.4: Galen as Datalog, FlowLog's suite (a case of benches/reasoning/datalog)"
+reactome-uniprot = "3.4: Reactome and UniProt, RDFox's and GLog's datasets"
+chasebench = "3.4: ChaseBench, existential rules (Nemo, VLog, RDFox)"
+uobm = "3.4: UOBM, LUBM with richer OWL (GLog's package has its L program)"

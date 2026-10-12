@@ -39,7 +39,9 @@ import os
 import re
 import shutil
 import sys
+import time
 import tomllib
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -56,9 +58,12 @@ from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
 
-SYSTEMS = ("nrese", "souffle", "nemo", "vlog", "glog")
+SYSTEMS = ("nrese", "souffle", "nemo", "vlog", "glog", "rdfox")
 IMAGES = {"souffle": "nrese-bench/souffle:2.5", "nemo": "nrese-bench/nemo",
-          "vlog": "nrese-bench/vlog:1.3.7", "glog": "nrese-bench/glog:69d4842"}
+          "vlog": "nrese-bench/vlog:1.3.7", "glog": "nrese-bench/glog:69d4842",
+          "rdfox": "oxfordsemantic/rdfox:7.6b"}
+# Systems whose results may be published only with the vendor's consent (systems.toml).
+RESTRICTED = {"rdfox"}
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -99,12 +104,26 @@ def load_program(case: dict) -> P.Program:
     return P.parse_triples(text) if case.get("format") == "triples" else P.parse(text)
 
 
+def publish(system: str) -> str:
+    return "permission" if system in RESTRICTED else "free"
+
+
+def rdfox_licence() -> str:
+    """RDFOX_LICENSE, else RDFox.lic in the licences directory; "" if neither."""
+    if setting("RDFOX_LICENSE"):
+        return setting("RDFOX_LICENSE")
+    path = Path(setting("NRESE_LICENSES", str(Path.home() / "nrese-bench" / "licenses"))) / "RDFox.lic"
+    return str(path) if path.is_file() else ""
+
+
 def expressible(case: dict, system: str) -> str | None:
     """None, or why the system can't run the case's program as written."""
     program = load_program(case)
     try:
         if system == "nrese":
             P.to_n3(program)
+        elif system == "rdfox":
+            P.to_rdfox(program)
         elif system in ("vlog", "glog"):
             P.to_vlog(program, "/data")
     except P.NotExpressible as e:
@@ -290,7 +309,7 @@ class Run:
 
     def row(self, task: str, **fields) -> Result:
         return Result(date=self.args.date, host=self.args.host, runtime="docker", system=self.system,
-                      version=self.args.versions.get(self.system, "-"), publish="free", workload=workload(self.case),
+                      version=self.args.versions.get(self.system, "-"), publish=publish(self.system), workload=workload(self.case),
                       tier=tier(self.case), regime="-", run=self.rep, task=task, **fields)
 
     def write(self, result: Result):
@@ -448,6 +467,72 @@ class Run:
             counts = {rel: line_count(self.work / "out" / f"{rel}.csv") if out.ok else None for rel in self.program.derived}
             self.counts(counts, "the exported relation's lines")
 
+    # --- RDFox (UNVERIFIED until a licensed run) ---
+    def run_rdfox(self):
+        """RDFox 7.6 in its sandbox: the facts imported, then the rules (one materialisation),
+        `threads N` as every engine's CPUs; the time is the container's, start-up included
+        (RDFox is native code, its start-up is small). The derived total is the store's
+        triples less the input's, as RDFox's own SPARQL counts them; the qualifying run
+        serves the endpoint and counts every relation over HTTP, as NRESE's does. Its rows
+        carry publish = permission: they stay on the machine."""
+        licence = rdfox_licence()
+        if not licence:
+            self.write(self.row("load", status="skipped",
+                                note="needs RDFox.lic in the licences directory, or RDFOX_LICENSE=/path"))
+            return
+        (self.work / "program.dlog").write_text(P.to_rdfox(self.program), encoding="utf-8")
+        script = ["dstore create bench", "active bench", f"threads {self.args.threads}",
+                  "import /data/facts.nt", "import /work/program.dlog"]
+        image = IMAGES["rdfox"]
+        lic = Mount(licence, "/license/RDFox.lic")
+        args = ["-license-file", "/license/RDFox.lic", "sandbox", "/work", "exec /work/run.rdfox"]
+        inputs = line_count(data_dir(self.case) / "facts.nt") or 0
+        if not self.args.qualify:
+            (self.work / "run.rdfox").write_text("\n".join(
+                script + ["SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }", "quit"]) + "\n", encoding="utf-8")
+            log = self.logs / "run.log"
+            measured = self.runtime.run(self.spec(image, args, extra=[lic]), log, self.args.timeout_s)
+            text = log.read_text(encoding="utf-8", errors="replace")
+            found = re.findall(r"^\s*(\d+)\s*$", text, re.M)
+            derived = int(found[-1]) - inputs if found else None
+            self.finish(measured, None, derived, "RDFox sandbox: import facts, import rules, threads as the CPUs; UNVERIFIED")
+            return
+        port = 12110
+        (self.work / "run.rdfox").write_text("\n".join(
+            script + [f"set endpoint.port {port}", "endpoint start"]) + "\n", encoding="utf-8")
+        spec = self.spec(image, args, extra=[lic])
+        spec.keep_stdin, spec.port = True, port
+        started = time.monotonic()
+        server = self.runtime.start(spec, self.logs / "serve.log")
+        base = f"http://127.0.0.1:{self.args.port}/datastores/bench/sparql"
+        counts: dict[str, int | None] = {}
+        total = None
+        try:
+            def count(query: str) -> int | None:
+                body = urllib.parse.urlencode({"query": query}).encode()
+                request = urllib.request.Request(base, data=body, headers={"Accept": "application/sparql-results+json"})
+                try:
+                    with urllib.request.urlopen(request, timeout=self.args.timeout_s) as r:
+                        binding = json.loads(r.read())["results"]["bindings"][0]
+                        return int(next(iter(binding.values()))["value"])
+                except (OSError, ValueError, KeyError, IndexError):
+                    return None
+            while time.monotonic() - started < self.args.timeout_s:
+                total = count("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }")
+                if total is not None or not self.runtime.alive(server):
+                    break
+                time.sleep(1)
+            elapsed = (time.monotonic() - started) * 1000
+            for rel in self.program.derived:
+                counts[rel] = count(P.count_query(self.program, rel))
+        finally:
+            peak = self.runtime.stop(server)
+        from suitekit.runtime import Measured
+        measured = Measured(elapsed, peak, 0 if total is not None else 1)
+        self.finish(measured, None, total - inputs if total is not None else None,
+                    "RDFox sandbox, qualifying run (time includes serving the endpoint); UNVERIFIED")
+        self.counts(counts, "SPARQL COUNT over RDFox's store")
+
     # --- VLog and GLog ---
     def run_vlog(self):
         self.run_karma("vlog")
@@ -471,23 +556,32 @@ class Run:
                        *setting("GLOG_OPTIONS", "--querycont 1 --edbcheck 1 --rewritecliques 0 --delProofs 0").split()]
         if self.args.vlog_threads:
             command += ["--multithreaded", "1", "--nthreads", str(self.args.threads)]
-        if self.args.qualify:
-            command += ["--storemat_path", "/work/out", "--storemat_format", "csv"]
+        # VLog reports no count of what it derived, so every run stores its materialisation
+        # and the files are counted afterwards, untimed; the time VLog logs for storing them
+        # comes off the wall time.
+        command += ["--storemat_path", "/work/out", "--storemat_format", "csv"]
         log = self.logs / "run.log"
         measured = self.runtime.run(self.spec(image, command, extra=[]), log, self.args.timeout_s)
         text = log.read_text(encoding="utf-8", errors="replace")
         runtime = re.findall(r"Runtime materialization = ([0-9.]+) milliseconds", text)
-        derived = re.findall(r"(?:Derived|derived) (?:tuples|facts)\D*(\d+)", text)
+        storing = re.findall(r"Time to index and store the materialization on disk = ([0-9.]+) seconds", text)
+        if storing and measured.ok:
+            measured.ms -= float(storing[-1]) * 1000
         counts = {}
-        if self.args.qualify and measured.ok:
+        if measured.ok:
+            files = [f for f in (self.work / "out").iterdir() if f.is_file()]
             for rel in self.program.derived:
-                files = list((self.work / "out").glob(f"{rel}*"))
-                counts[rel] = sum(line_count(f) for f in files) if files else None
-            self.counts(counts, "the stored materialisation's lines")
-        total = int(derived[-1]) if derived else (sum(v for v in counts.values() if v) if counts else None)
+                # RP1's files, not RP10's: the name goes on with a non-digit, or ends.
+                own = [f for f in files if re.fullmatch(rf"{re.escape(rel)}(\D.*)?", f.name)]
+                counts[rel] = sum(line_count(f) for f in own) if own else 0
+            if self.args.qualify:
+                self.counts(counts, "the stored materialisation's lines")
+        total = sum(counts.values()) if counts else None
         mode = f"--multithreaded 1 --nthreads {self.args.threads}" if self.args.vlog_threads else "single-threaded (the default)"
-        self.finish(measured, float(runtime[-1]) if runtime else None, total,
-                    f"{' '.join(command[:1] + command[5:])}, {mode}" + ("; with --storemat (qualifying run)" if self.args.qualify else ""))
+        note = f"{' '.join(command[:1] + command[5:-4])}, {mode}"
+        if storing:
+            note += f"; storing the materialisation ({float(storing[-1]):.1f} s, for the count) taken off the time"
+        self.finish(measured, float(runtime[-1]) if runtime else None, total, note)
 
 
 def line_count(path: Path) -> int | None:
@@ -595,12 +689,12 @@ def cmd_run(args):
                 why = expressible(case, system)
                 if why:
                     writer.write(Result(date=args.date, host=args.host, runtime="docker", system=system,
-                                        version=args.versions[system], publish="free", workload=workload(case), tier=tier(case),
+                                        version=args.versions[system], publish=publish(system), workload=workload(case), tier=tier(case),
                                         regime="-", run=0, task="load", status="skipped",
                                         note=f"not expressible: {why}"))
                 elif args.qualified and not qualified_for(args, case, system):
                     writer.write(Result(date=args.date, host=args.host, runtime="docker", system=system,
-                                        version=args.versions[system], publish="free", workload=workload(case),
+                                        version=args.versions[system], publish=publish(system), workload=workload(case),
                                         tier=tier(case), regime="-", run=0, task="load", status="skipped",
                                         note="not qualified: its qualifying run gave no checked total"))
                 else:
