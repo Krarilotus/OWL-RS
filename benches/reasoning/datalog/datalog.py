@@ -10,7 +10,9 @@
 Settings (environment): DATALOG_DOWNLOADS (the pinned zips), DATALOG_DATA (unpacked data,
 written by `prepare`), NRESE_BIN (the server binary; it runs in the image NRESE_IMAGE,
 default ubuntu:24.04, which must match the binary's C library), DATALOG_SCRATCH, DOCKER_MEMORY
-(every container's cap, default 28g).
+(every container's cap, default 28g; a step
+starts only when that much memory is available and the host's owners don't need it:
+../hostguard.py).
 
 A run measures, per case, repetition and system, from fresh scratch (the repetitions
 interleaved across the systems, each round in an order rotated by one):
@@ -45,8 +47,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 sys.path.insert(0, str(HERE))
+sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(ROOT / "benches/suite"))
 
+import hostguard  # noqa: E402
 import program as P  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
@@ -131,8 +135,11 @@ def fetch(url: str, path: Path, digest: str):
 
 
 def docker_as_user(image: str, args: list[str], mounts: dict[str, str], entrypoint: str | None = None):
+    """A preparation step in a container, as the invoking user, working in the first mount
+    (UBA writes its log into its working directory)."""
     import subprocess
-    command = ["docker", "run", "--rm", "-u", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp"]
+    command = ["docker", "run", "--rm", "-u", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp",
+               "-w", next(iter(mounts.values()))]
     for source, target in mounts.items():
         command += ["-v", f"{source}:{target}"]
     if entrypoint:
@@ -244,7 +251,7 @@ def prepare_triples(target: Path):
     trident = target / "trident"
     if not trident.exists():
         print(f"building the Trident store {trident}")
-        docker_as_user(IMAGES["vlog"], ["load", "-i", "/data/facts.nt", "-o", "/data/trident.partial"],
+        docker_as_user(IMAGES["vlog"], ["load", "-i", "/data/facts.nt", "-o", "/data/trident.partial", "--maxThreads", "8"],
                        {str(target): "/data"})
         (target / "trident.partial").rename(trident)
 
@@ -491,7 +498,9 @@ def cmd_list(args):
 
 def cmd_prepare(args):
     for name in selected(args.cases):
-        prepare(cases()[name])
+        hostguard.wait()
+        with hostguard.slot(f"datalog prepare {name}", timed=False):
+            prepare(cases()[name])
 
 
 def cmd_translate(args):
@@ -564,10 +573,12 @@ def cmd_run(args):
             for rep in range(1, args.runs + 1):
                 k = (rep - 1) % max(1, len(runnable))
                 for system in runnable[k:] + runnable[:k]:
+                    hostguard.wait(hostguard.gib(setting("DOCKER_MEMORY", "28g")))
                     print(f"{name} / {system} / {args.threads} threads / run {rep}")
                     run = Run(args, case, system, rep, runtime, writer, results)
                     try:
-                        run.go()
+                        with hostguard.slot(f"datalog {name} {system} t{args.threads} r{rep}", timed=not args.qualify):
+                            run.go()
                     finally:
                         if not args.keep:
                             shutil.rmtree(run.work, ignore_errors=True)
