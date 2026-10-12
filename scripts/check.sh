@@ -215,8 +215,18 @@ changed_files() {
 if [ -z "${NRESE_ON_BUILD_HOST:-}" ] && [ -n "${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}" ]; then
   list=$(mktemp)
   [ "$mode" = all ] || changed_files "$mode" > "$list"
+  # A tier that passed for this exact tree and file list doesn't run again. So the gate can
+  # run before `git push`, whose hook then needn't hold the remote's connection open for it.
+  key="$mode $(bash scripts/lib/remote.sh tree) $(git hash-object "$list")"
+  passed="$(git rev-parse --git-common-dir)/nrese-gate-passed"
+  if grep -qxF "$key" "$passed" 2> /dev/null; then
+    echo "=== $mode: passed before for this tree and these files"
+    rm -f "$list"
+    exit 0
+  fi
   bash scripts/lib/remote.sh check "$mode" "$list"
   code=$?
+  [ $code -eq 0 ] && echo "$key" >> "$passed"
   rm -f "$list"
   exit $code
 fi

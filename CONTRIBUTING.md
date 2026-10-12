@@ -39,7 +39,9 @@ owns its tests, and benchmarks never run in a gate.
 
 Rust builds run on the build host ([benches/hosts.toml](benches/hosts.toml)): with
 `git config nrese.buildHost <ssh alias>`, the hooks and `scripts/lib/remote.sh check|run`
-send the working tree there and run the command in a worktree of its own. Build through
+send the working tree there and run the command in a worktree of its own. A tier that passed
+for the same tree and files doesn't run again, so run `scripts/check.sh push` before a long
+push: the hook then passes at once. Build through
 `scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most `NRESE_BUILD_SLOTS`
 builds at once per machine). Validate in batches: quick checks while
 working, the push tier once per batch. Measure counts first; time only to answer a stated
