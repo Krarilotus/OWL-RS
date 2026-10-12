@@ -94,7 +94,7 @@ impl<'q> PathJoin<'q> {
                 self.conjuncts.extend(conjuncts);
                 true
             }
-            GraphPattern::Join { left, right } => self.add(left) && self.add(right),
+            GraphPattern::Join { inputs } => inputs.iter().all(|input| self.add(input)),
             _ => false,
         }
     }
@@ -140,9 +140,11 @@ impl Context<'_> {
     /// The order of `join`'s inputs (triple patterns, then paths) by the join orderer, with
     /// the estimated rows after each; `None` if a triple pattern names a term the store
     /// doesn't have (no matches).
-    pub(super) fn path_join_order(&self, join: &PathJoin<'_>) -> Option<plan::Plan> {
+    pub(super) fn path_join_order(&self, join: &PathJoin<'_>) -> NativeResult<Option<plan::Plan>> {
         let scans: Option<Vec<_>> = join.triples.iter().map(|t| self.scan_pattern(t)).collect();
-        let scans = scans?;
+        let Some(scans) = scans else {
+            return Ok(None);
+        };
         let counts: Vec<u64> = scans
             .iter()
             .map(|scan| self.snapshot.estimate_in(self.model, &scan.quad_pattern()))
@@ -182,13 +184,13 @@ impl Context<'_> {
                 overlaps: Vec::new(),
             });
         }
-        Some(self.order_inputs(&inputs, vars.len()))
+        self.order_inputs(&inputs, vars.len()).map(Some)
     }
 
     /// `join` evaluated in the order of [`Self::path_join_order`].
     pub(super) fn join_with_paths(&self, join: &PathJoin<'_>) -> NativeResult<Solutions> {
         let start = Instant::now();
-        let Some(order) = self.path_join_order(join) else {
+        let Some(order) = self.path_join_order(join)? else {
             let vars = join.variables();
             let width = vars.len();
             return Ok(Solutions {
@@ -267,7 +269,8 @@ impl Context<'_> {
         depth: usize,
         steps: &mut Vec<PlannedStep>,
     ) -> f64 {
-        let Some(order) = self.path_join_order(join) else {
+        // Cancelled: no estimate; the caller reports the cancellation.
+        let Ok(Some(order)) = self.path_join_order(join) else {
             return 0.0;
         };
         for &i in &order.order {

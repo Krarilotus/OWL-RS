@@ -105,6 +105,50 @@ pub fn check(ontology: &Ontology, budget: &Budget) -> Checked {
     checked
 }
 
+/// Whether `ontology` is consistent, given that it was before a change that removed
+/// assertions and added assertions about the individuals `touched`, its schema as it was
+/// (docs/design/owl2-dl.md §9): only the ABox islands with a touched individual are
+/// decided ([`nrese_dl::islands::after_assertions`]). `None` where the ABox doesn't split;
+/// the caller checks the whole ([`check`]).
+pub(crate) fn check_after_assertions(
+    ontology: &Ontology,
+    touched: &std::collections::HashSet<u64>,
+    budget: &Budget,
+) -> Option<Checked> {
+    let started = Instant::now();
+    if left_out(ontology).is_some() {
+        return None;
+    }
+    let outcome = nrese_dl::islands::after_assertions(ontology, touched, &tableau_config(budget))?;
+    Some(Checked {
+        verdict: verdict(outcome.answer),
+        engine: "touched-islands",
+        elapsed: started.elapsed(),
+    })
+}
+
+/// The hypertableau's configuration within `budget`.
+fn tableau_config(budget: &Budget) -> tableau::Config {
+    tableau::Config {
+        timeout: Some(budget.timeout),
+        max_memory: budget.memory_bytes,
+        max_nodes: budget.max_nodes,
+        max_branch_points: Some(budget.max_branch_points),
+        cancel: budget.cancel.clone(),
+        workers: Some(budget.workers.clone()),
+        ..tableau::Config::default()
+    }
+}
+
+fn verdict(answer: tableau::Answer) -> Verdict {
+    match answer {
+        tableau::Answer::Consistent => Verdict::Consistent,
+        tableau::Answer::Inconsistent => Verdict::Inconsistent,
+        tableau::Answer::Unsupported(why) => Verdict::Unknown(format!("unsupported: {why}")),
+        tableau::Answer::GaveUp(why) => Verdict::Unknown(format!("gave up: {why}")),
+    }
+}
+
 fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
     let started = Instant::now();
     let deadline = started + budget.timeout;
@@ -153,25 +197,11 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
             elapsed: started.elapsed(),
         };
     }
-    let config = tableau::Config {
-        timeout: Some(budget.remaining(deadline).timeout),
-        max_memory: budget.memory_bytes,
-        max_nodes: budget.max_nodes,
-        max_branch_points: Some(budget.max_branch_points),
-        cancel: budget.cancel.clone(),
-        workers: Some(budget.workers.clone()),
-        ..tableau::Config::default()
-    };
+    let config = tableau_config(&budget.remaining(deadline));
     // Island by island where the ABox splits (`nrese_dl::islands`).
     let outcome = nrese_dl::islands::consistency(ontology, &config);
-    let verdict = match outcome.answer {
-        tableau::Answer::Consistent => Verdict::Consistent,
-        tableau::Answer::Inconsistent => Verdict::Inconsistent,
-        tableau::Answer::Unsupported(why) => Verdict::Unknown(format!("unsupported: {why}")),
-        tableau::Answer::GaveUp(why) => Verdict::Unknown(format!("gave up: {why}")),
-    };
     Checked {
-        verdict,
+        verdict: verdict(outcome.answer),
         engine: "hypertableau",
         elapsed: started.elapsed(),
     }

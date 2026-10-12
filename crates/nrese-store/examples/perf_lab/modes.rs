@@ -96,6 +96,8 @@ pub fn commits(
     let stop = Arc::new(AtomicBool::new(false));
     let handles = spawn_readers(&store, queries, readers, &stop);
     let (mut times, mut inserted, mut deleted, mut rounds) = (Vec::new(), 0u64, 0u64, 0usize);
+    // The maintenance's work over the commits, in counts (equality cases compare these).
+    let mut work = [0u64; 9];
     let started = Instant::now();
     let mut failure = None;
     for update in &updates {
@@ -116,6 +118,22 @@ pub fn commits(
             inserted += run.inferred_inserted;
             deleted += run.inferred_deleted;
             rounds = rounds.max(run.rounds);
+            let w = &run.work;
+            let plan = |plan| u64::from(w.plan == plan);
+            let counts = [
+                plan(nrese_reasoner::delta::policy::Plan::Recompute),
+                plan(nrese_reasoner::delta::policy::Plan::Rebuild),
+                w.region_terms,
+                w.region_facts,
+                w.overdeleted,
+                w.rederived,
+                w.dred_estimate,
+                w.recompute_estimate,
+                w.rebuild_estimate,
+            ];
+            for (total, count) in work.iter_mut().zip(counts) {
+                *total = total.saturating_add(count);
+            }
         }
     }
     let whole = started.elapsed();
@@ -135,15 +153,32 @@ pub fn commits(
         whole.as_secs_f64(),
         reads.len(),
     );
+    let names = [
+        "recomputed",
+        "rebuilt",
+        "region_terms",
+        "region_facts",
+        "overdeleted",
+        "rederived",
+        "dred_estimate",
+        "recompute_estimate",
+        "rebuild_estimate",
+    ];
+    let work: Vec<String> = names
+        .iter()
+        .zip(work)
+        .map(|(name, count)| format!("\"{name}\": {count}"))
+        .collect();
     Ok(format!(
         "{{\"commits\": {}, \"whole_s\": {:.3}, \"p50_ms\": {p50:.4}, \"p99_ms\": {p99:.4}, \"max_ms\": {max:.3}, \
          \"inferred_inserted\": {inserted}, \"inferred_deleted\": {deleted}, \"max_rounds\": {rounds}, \
          \"incremental\": {incremental}, \"readers\": {readers}, \"reads\": {}, \"read_p50_ms\": {r50:.3}, \
-         \"read_p99_ms\": {r99:.3}, \"samples_ms\": [{}]{}}}",
+         \"read_p99_ms\": {r99:.3}, \"samples_ms\": [{}], \"work\": {{{}}}{}}}",
         times.len(),
         whole.as_secs_f64(),
         reads.len(),
         samples.join(", "),
+        work.join(", "),
         failure.map_or(String::new(), |f| format!(", \"error\": {f:?}"))
     ))
 }
@@ -285,7 +320,7 @@ pub fn parse_and_plan(
     for _ in 0..runs {
         let at = Instant::now();
         let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(text))?;
-        let plan = store.plan_query(&prepared)?;
+        let plan = store.plan_query(&prepared, &CancellationToken::new())?;
         times.push(at.elapsed());
         steps = plan.steps.len();
         rewrites = plan.rewrites.len();
