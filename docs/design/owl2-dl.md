@@ -978,10 +978,10 @@ performance gate for each package are in [owl2-dl-performance.md](owl2-dl-perfor
 | 3.1 | Context core, Horn stage, parallel from the start (lock-free context activation, work stealing); dispatch and modules; the EL classifier becomes its EL mode (chains kept explicit for EL: the automata of §3 make `∃(r∘s).B ⊑ C` non-Horn) | §5's Horn gate; EL taxonomies unchanged; ≥ 2× faster than ELK at equal threads on the EL track |
 | 3.2 | Bounds for large ABoxes: U1 compiled and maintained per commit, the gap, consistency through L, U1 and the Horn core | the incremental track against cold rebuilds; LUBM(800) and UOBM(500) ≥ 10× faster than Konclude |
 | 3.3 | Hypertableau, ALC → SHIQ → SROIQ: absorption, lazy unfolding, blocking, NI, merges (rollback union-find with reasons), dependency sets over stable decision literals, backjumping, semantic branching, (un)satisfiability caching, watch lists, a native cardinality propagator with explanations | the W3C DL suite green without datatypes; within 3× of Konclude on the development set |
-| 3.4 | Classification and realisation driver (known/possible subsumers, parallel tests, model merging) | taxonomies equal to the references'; within 1.5× of Konclude's sum |
+| 3.4 | Classification and realisation driver (known/possible subsumers, parallel tests, model merging) | taxonomies equal to the references'; total time at most Konclude's ([performance plan](owl2-dl-performance.md) row 5) |
 | 3.5 | The datatype theory | the W3C DL suite green |
-| 3.6 | Context core, SRIQ and SROIQ stages; dynamic fallback, racing, telemetry | §5's gates; the Oxford sample at Konclude's solved count |
-| 3.7 | Caches with footprints, completion-graph reuse, saturation coupling; profiled SIMD | metamorphic on/off tests; the full ORE run at Konclude's level (Draco) |
+| 3.6 | Context core, SRIQ and SROIQ stages; dynamic fallback, racing, telemetry | §5's gates; the Oxford sample: every task Konclude solves and more |
+| 3.7 | Caches with footprints, completion-graph reuse, saturation coupling; profiled SIMD | metamorphic on/off tests; first in every category of the full ORE run (Draco) |
 | 3.8 | Black-box justifications over the hypertableau; glass-box certificates | equal to the glass-box results where both apply |
 | 3.9 | Conflict-driven hypertableau (research): learned nogoods, activity order, restarts ([performance plan](owl2-dl-performance.md) §6) | no answer changes on or off; a robust gain on the holdout or the switch stays off |
 
