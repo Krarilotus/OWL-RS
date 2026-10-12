@@ -20,6 +20,7 @@
 //! | `CONTAINS/STRSTARTS/STRENDS(?v or STR(?v), "text")`, `REGEX(…, "pattern", "flags")` | the borrowed lexical form |
 //! | `?v < > <= >= = 42` (and mirrored) | inline integer ids by value |
 //! | `?v < > <= >= = "2000-01-01"^^xsd:date` (or `xsd:dateTime`, and mirrored) | inline ids of the constant's kind and timezone by id (their order is the value order); other values to the generic evaluator |
+//! | `sameTerm(a, b)`, `isTRIPLE(a)` over variables, constants, `SUBJECT`/`PREDICATE`/`OBJECT` and `TRIPLE` ([`IdTerm`]) | ids: a triple term's parts read from its key, `TRIPLE` one hash probe ([`Snapshot::components`], [`Snapshot::triple_term`]) |
 //! | `&&`, `||`, `!` | SPARQL's three-valued logic |
 
 use std::cmp::Ordering;
@@ -74,6 +75,138 @@ pub(crate) enum Fast {
     IntCompare(Variable, Vec<Ordering>, i64),
     /// `?v <op> date` (or dateTime), the constant's inline id: as [`Self::IntCompare`].
     DateCompare(Variable, Vec<Ordering>, TermId),
+    /// `sameTerm(a, b)` by ids.
+    SameTerm(IdTerm, IdTerm),
+    /// `isTRIPLE(a)` by the id's kind.
+    IsTriple(IdTerm),
+}
+
+/// An operand evaluated on ids, nothing decoded: what the rewritten triple term patterns
+/// compare and bind (`triple_terms`).
+#[derive(Debug, Clone)]
+pub(crate) enum IdTerm {
+    Var(Variable),
+    /// A constant, as [`IdTerm::value`] gives it.
+    Const(Id),
+    /// `SUBJECT`, `PREDICATE` or `OBJECT` (component 0, 1 or 2) of a triple term.
+    Part(Box<IdTerm>, usize),
+    /// `TRIPLE(s, p, o)`.
+    Triple(Box<[IdTerm; 3]>),
+}
+
+/// An [`IdTerm`]'s value in one row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Id {
+    /// A term of the snapshot: its id is its identity.
+    Stored(TermId),
+    /// A term the snapshot doesn't have: no stored term is it.
+    Absent,
+    /// An error (an unbound variable, `SUBJECT` of no triple term, a literal subject).
+    Error,
+    /// Not decided on ids: a value the query computed, a triple term keyed by its text.
+    Unknown,
+}
+
+impl IdTerm {
+    /// The variables the operand reads.
+    pub(crate) fn variables<'a>(&'a self, out: &mut Vec<&'a Variable>) {
+        match self {
+            Self::Var(v) => out.push(v),
+            Self::Const(_) => {}
+            Self::Part(inner, _) => inner.variables(out),
+            Self::Triple(parts) => parts.iter().for_each(|part| part.variables(out)),
+        }
+    }
+
+    /// The value in the row `value` gives the variables of (UNDEF if unbound).
+    pub(crate) fn value(&self, value: &dyn Fn(&Variable) -> u64, snapshot: &Snapshot) -> Id {
+        match self {
+            Self::Var(v) => match value(v) {
+                UNDEF => Id::Error,
+                id if computed_index(id).is_some() => Id::Unknown,
+                id => Id::Stored(TermId::from_raw(id)),
+            },
+            Self::Const(id) => *id,
+            Self::Part(inner, at) => match inner.value(value, snapshot) {
+                Id::Stored(id) if id.kind() != TermKind::Triple => Id::Error,
+                Id::Stored(id) => snapshot
+                    .components(id)
+                    .map_or(Id::Unknown, |parts| Id::Stored(parts[*at])),
+                Id::Error => Id::Error,
+                Id::Absent | Id::Unknown => Id::Unknown,
+            },
+            Self::Triple(parts) => {
+                let [s, p, o] = [0, 1, 2].map(|i| parts[i].value(value, snapshot));
+                if [s, p, o].contains(&Id::Error) {
+                    return Id::Error;
+                }
+                let (Id::Stored(s), Id::Stored(p), Id::Stored(o)) = (s, p, o) else {
+                    return Id::Unknown;
+                };
+                // RDF 1.2: an IRI or blank node subject, an IRI predicate.
+                if !matches!(s.kind(), TermKind::Iri | TermKind::BlankNode)
+                    || p.kind() != TermKind::Iri
+                {
+                    return Id::Error;
+                }
+                snapshot.triple_term(s, p, o).map_or(Id::Absent, Id::Stored)
+            }
+        }
+    }
+}
+
+/// `sameTerm` of two values on ids.
+pub(crate) fn same_term(a: Id, b: Id, snapshot: &Snapshot) -> Tri {
+    match (a, b) {
+        (Id::Error, _) | (_, Id::Error) => Tri::Error,
+        (Id::Stored(a), Id::Stored(b)) if a == b => Tri::True,
+        // Two triple terms may be one in two keys if one has the first RDF 1.2 version's.
+        (Id::Stored(a), Id::Stored(b))
+            if a.kind() == TermKind::Triple
+                && b.kind() == TermKind::Triple
+                && (snapshot.components(a).is_none() || snapshot.components(b).is_none()) =>
+        {
+            Tri::Unknown
+        }
+        (Id::Stored(_), Id::Stored(_) | Id::Absent) | (Id::Absent, Id::Stored(_)) => Tri::False,
+        _ => Tri::Unknown,
+    }
+}
+
+/// `expr` as an operand on ids, if it is one: a variable, a constant whose id is its
+/// identity, `SUBJECT`/`PREDICATE`/`OBJECT` and `TRIPLE` of such.
+pub(crate) fn compile_term(expr: &Expression, snapshot: &Snapshot) -> Option<IdTerm> {
+    Some(match expr {
+        Expression::Variable(v) => IdTerm::Var(v.clone()),
+        // An alias stands for a blank node of the query (`substitute`): the context knows it.
+        Expression::NamedNode(n) if n.as_str().starts_with(super::substitute::ALIAS) => {
+            return None;
+        }
+        Expression::NamedNode(n) => IdTerm::Const(
+            snapshot
+                .lookup(n.as_ref().into())
+                .map_or(Id::Absent, Id::Stored),
+        ),
+        // Only a literal that is its id's term: an inline id may stand for other lexical
+        // forms of its value ("01" and "1"), which are other terms.
+        Expression::Literal(l) => IdTerm::Const(match snapshot.lookup(l.as_ref().into()) {
+            None => Id::Absent,
+            Some(id) if snapshot.decode(id).as_ref() == Some(&l.clone().into()) => Id::Stored(id),
+            Some(_) => Id::Unknown,
+        }),
+        Expression::FunctionCall(function, args) => match (function, args.as_slice()) {
+            (Function::Subject, [a]) => IdTerm::Part(Box::new(compile_term(a, snapshot)?), 0),
+            (Function::Predicate, [a]) => IdTerm::Part(Box::new(compile_term(a, snapshot)?), 1),
+            (Function::Object, [a]) => IdTerm::Part(Box::new(compile_term(a, snapshot)?), 2),
+            (Function::Triple, [s, p, o]) => IdTerm::Triple(Box::new([
+                compile_term(s, snapshot)?,
+                compile_term(p, snapshot)?,
+                compile_term(o, snapshot)?,
+            ])),
+            _ => return None,
+        },
+        _ => return None,
+    })
 }
 
 fn variable(expr: &Expression) -> Option<&Variable> {
@@ -192,7 +325,7 @@ pub(crate) fn compile(expr: &Expression, snapshot: &Snapshot) -> Option<Fast> {
             } else if matches!(expr, Expression::Equal(..)) {
                 comparison(a, b, &[Ordering::Equal])?
             } else {
-                return None;
+                Fast::SameTerm(compile_term(a, snapshot)?, compile_term(b, snapshot)?)
             }
         }
         Expression::Greater(a, b) => comparison(a, b, &[Ordering::Greater])?,
@@ -205,6 +338,7 @@ pub(crate) fn compile(expr: &Expression, snapshot: &Snapshot) -> Option<Fast> {
             (Function::IsIri, [a]) => Fast::IsIri(variable(a)?.clone()),
             (Function::IsBlank, [a]) => Fast::IsBlank(variable(a)?.clone()),
             (Function::IsLiteral, [a]) => Fast::IsLiteral(variable(a)?.clone()),
+            (Function::IsTriple, [a]) => Fast::IsTriple(compile_term(a, snapshot)?),
             (Function::LangMatches, [a, b]) => {
                 Fast::LangMatches(lang_of(a)?.clone(), simple(b)?.to_owned())
             }
@@ -238,6 +372,7 @@ impl Fast {
         &self,
         value: &dyn Fn(&Variable) -> u64,
         view: &'v dyn Fn(TermId) -> Option<TermView<'v>>,
+        snapshot: &Snapshot,
     ) -> Tri {
         // The stored id of `v` in this row. `Err` is the answer without one: an error for
         // an unbound variable, and "not decided here" for a term the query computed.
@@ -265,19 +400,22 @@ impl Fast {
             _ => Tri::of(test("")),
         };
         match self {
-            Self::And(a, b) => match (a.eval(value, view), b.eval(value, view)) {
+            Self::And(a, b) => match (a.eval(value, view, snapshot), b.eval(value, view, snapshot))
+            {
                 (Tri::False, _) | (_, Tri::False) => Tri::False,
                 (Tri::True, Tri::True) => Tri::True,
                 (Tri::Unknown, _) | (_, Tri::Unknown) => Tri::Unknown,
                 _ => Tri::Error,
             },
-            Self::Or(a, b) => match (a.eval(value, view), b.eval(value, view)) {
-                (Tri::True, _) | (_, Tri::True) => Tri::True,
-                (Tri::False, Tri::False) => Tri::False,
-                (Tri::Unknown, _) | (_, Tri::Unknown) => Tri::Unknown,
-                _ => Tri::Error,
-            },
-            Self::Not(a) => match a.eval(value, view) {
+            Self::Or(a, b) => {
+                match (a.eval(value, view, snapshot), b.eval(value, view, snapshot)) {
+                    (Tri::True, _) | (_, Tri::True) => Tri::True,
+                    (Tri::False, Tri::False) => Tri::False,
+                    (Tri::Unknown, _) | (_, Tri::Unknown) => Tri::Unknown,
+                    _ => Tri::Error,
+                }
+            }
+            Self::Not(a) => match a.eval(value, view, snapshot) {
                 Tri::True => Tri::False,
                 Tri::False => Tri::True,
                 other => other,
@@ -331,6 +469,14 @@ impl Fast {
                 }
                 Ok(_) => Tri::Unknown,
                 Err(undecided) => undecided,
+            },
+            Self::SameTerm(a, b) => {
+                same_term(a.value(value, snapshot), b.value(value, snapshot), snapshot)
+            }
+            Self::IsTriple(a) => match a.value(value, snapshot) {
+                Id::Stored(id) => Tri::of(id.kind() == TermKind::Triple),
+                Id::Error => Tri::Error,
+                Id::Absent | Id::Unknown => Tri::Unknown,
             },
         }
     }

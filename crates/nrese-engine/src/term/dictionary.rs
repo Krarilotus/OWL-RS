@@ -453,16 +453,6 @@ fn heap_key<'a>(bytes: &'a [u8], ends: &[u64], local: usize) -> &'a [u8] {
     &bytes[start..ends[local] as usize]
 }
 
-/// The triple terms of the dictionary by their components, built lazily from the arena (the
-/// dictionary only grows): what matching `<<( ?s :p ?o )>>` scans.
-#[derive(Default)]
-struct TripleIndex {
-    /// Dictionary entries up to here are in `rows`.
-    covered: u64,
-    /// `[subject, predicate, object, triple term]` ids.
-    rows: Vec<[TermId; 4]>,
-}
-
 #[derive(Default)]
 pub struct Dictionary {
     inner: RwLock<Inner>,
@@ -471,8 +461,6 @@ pub struct Dictionary {
     /// IRIs by the words of their local names ([`super::text::local_name_text`]), built at
     /// the first autocompletion and extended at later ones.
     iri_text: RwLock<super::text::TextIndex>,
-    /// Built at the first triple-term match, extended at later ones.
-    triples: RwLock<TripleIndex>,
     /// The vector literals, built at the first vector search and extended at later ones
     /// ([`super::vectors`]).
     vectors: std::sync::Arc<RwLock<super::vectors::VectorIndex>>,
@@ -750,19 +738,16 @@ impl Dictionary {
         if let Some(id) = self.inline_id(term) {
             return Some(id);
         }
+        if let TermRef::Triple(triple) = term {
+            let ids = [
+                self.lookup_bounded(triple.subject.as_ref().into(), limit)?,
+                self.lookup_bounded(triple.predicate.as_ref().into(), limit)?,
+                self.lookup_bounded(triple.object.as_ref(), limit)?,
+            ];
+            return self.triple_term_bounded(ids, limit);
+        }
         let mut key = Vec::with_capacity(64);
-        let kind = match term {
-            TermRef::Triple(triple) => {
-                let ids = [
-                    self.lookup_bounded(triple.subject.as_ref().into(), limit)?,
-                    self.lookup_bounded(triple.predicate.as_ref().into(), limit)?,
-                    self.lookup_bounded(triple.object.as_ref(), limit)?,
-                ];
-                triple_key(ids, &mut key);
-                TermKind::Triple
-            }
-            _ => encode_key(term, &mut key),
-        };
+        let kind = encode_key(term, &mut key);
         let hash = key_hash(&key);
         self.inner
             .read()
@@ -810,43 +795,33 @@ impl Dictionary {
         TermId::new(kind, self.intern_key_locked(inner, key))
     }
 
-    /// The triple terms matching the given components (`None`: any) among the entries below
-    /// `limit` (a snapshot's dictionary length): `[subject, predicate, object, triple term]`.
-    pub fn triple_terms(
-        &self,
-        subject: Option<TermId>,
-        predicate: Option<TermId>,
-        object: Option<TermId>,
-        limit: u64,
-    ) -> Vec<[TermId; 4]> {
-        let len = self.len();
-        if self.triples.read().covered < len {
-            let mut index = self.triples.write();
-            let inner = self.inner.read();
-            let end = inner.len();
-            for entry in index.covered..end {
-                if let Some(ids) = triple_ids(&inner.key(entry)) {
-                    let [s, p, o] = ids;
-                    index
-                        .rows
-                        .push([s, p, o, TermId::new(TermKind::Triple, entry)]);
-                }
-            }
-            index.covered = end;
+    /// The triple term with these component ids among the entries below `limit` (a
+    /// snapshot's dictionary length): one hash probe with the key the ids make, nothing
+    /// decoded. `None` if no such triple term was interned (a triple term written by the
+    /// first RDF 1.2 version is keyed by its text, and found by [`Self::lookup`] only).
+    pub fn triple_term_bounded(&self, components: [TermId; 3], limit: u64) -> Option<TermId> {
+        let mut key = Vec::with_capacity(TRIPLE_KEY_LEN);
+        triple_key(components, &mut key);
+        // Recursive: callers may hold a read lock already (`with_views`).
+        self.inner
+            .read_recursive()
+            .find(key_hash(&key), &key)
+            .filter(|&index| index < limit)
+            .map(|index| TermId::new(TermKind::Triple, index))
+    }
+
+    /// The subject, predicate and object ids of the triple term `id`, read from its key:
+    /// nothing decoded. `None` for another kind of term, an id the dictionary doesn't
+    /// have, and a triple term keyed by its text (the first RDF 1.2 version's; decode it).
+    pub fn components(&self, id: TermId) -> Option<[TermId; 3]> {
+        if id.kind() != TermKind::Triple {
+            return None;
         }
-        let matches = |want: Option<TermId>, have: TermId| want.is_none_or(|w| w == have);
-        self.triples
-            .read()
-            .rows
-            .iter()
-            .filter(|[s, p, o, id]| {
-                id.payload() < limit
-                    && matches(subject, *s)
-                    && matches(predicate, *p)
-                    && matches(object, *o)
-            })
-            .copied()
-            .collect()
+        let inner = self.inner.read_recursive();
+        if id.payload() >= inner.len() {
+            return None;
+        }
+        triple_ids(&inner.key(id.payload()))
     }
 
     fn intern_key_locked(&self, inner: &mut Inner, key: &[u8]) -> u64 {
@@ -1948,20 +1923,24 @@ mod tests {
         for (id, term) in ids.iter().zip([&directional, &plain, &triple]) {
             assert_eq!(dict.decode(*id).as_ref(), Some(term));
         }
-        // Found by its predicate among the triple terms.
+        // Taken apart and found again by ids alone, the nested one included.
+        let id = |iri: &str| {
+            dict.lookup(NamedNodeRef::new_unchecked(iri).into())
+                .unwrap()
+        };
+        let [s, p, o] = dict.components(ids[2]).unwrap();
+        assert_eq!(dict.decode(s), Some(BlankNode::new_unchecked("b").into()));
+        assert_eq!(p, id("http://e/p"));
+        assert_eq!(o.kind(), TermKind::Triple);
+        assert_eq!(dict.components(o).unwrap()[2], ids[0]);
+        assert_eq!(dict.triple_term_bounded([s, p, o], u64::MAX), Some(ids[2]));
+        // Not a triple term the dictionary holds, or not below the limit.
         assert_eq!(
-            dict.triple_terms(
-                None,
-                Some(
-                    dict.lookup(NamedNodeRef::new_unchecked("http://e/p").into())
-                        .unwrap()
-                ),
-                None,
-                u64::MAX
-            )
-            .len(),
-            1
+            dict.triple_term_bounded([s, id("http://e/q"), o], u64::MAX),
+            None
         );
+        assert_eq!(dict.triple_term_bounded([s, p, o], ids[2].payload()), None);
+        assert_eq!(dict.components(ids[0]), None);
         assert_eq!(
             dict.with_view(ids[2], |v| format!("{v:?}")).unwrap(),
             "Triple"
