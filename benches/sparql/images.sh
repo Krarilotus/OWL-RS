@@ -5,22 +5,27 @@
 # compilers inside the daemon, where neither `nice` nor the client's limits reach them.
 #
 #   benches/sparql/images.sh millenniumdb [COMMIT]     (default: the Sparqloscope paper's ecbf6dd)
+#   benches/sparql/images.sh gcare                     G-CARE's estimators at d603d2b
 #   benches/sparql/images.sh export IMAGE DEST         an image for a host without Docker
 #   benches/sparql/images.sh unpack NAME.tar ROOTFS-DIR  there, for the rootfs runtime
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BUILDER=sparql-capped
 lock=${NRESE_QUIET_DIR:-$HOME/.nrese-quiet-slot}
-[ "${1:-}" = millenniumdb ] && while [ -d "$lock" ] && kill -0 "$(cat "$lock/pid" 2>/dev/null || echo 0)" 2>/dev/null; do
+case ${1:-} in millenniumdb|gcare) build=1 ;; *) build=0 ;; esac
+[ "$build" = 1 ] && while [ -d "$lock" ] && kill -0 "$(cat "$lock/pid" 2>/dev/null || echo 0)" 2>/dev/null; do
   echo "quiet slot held by $(cat "$lock/who" 2>/dev/null): waiting"; sleep 60
 done
-[ "${1:-}" != millenniumdb ] || docker buildx inspect "$BUILDER" >/dev/null 2>&1 || docker buildx create -q --name "$BUILDER" --driver docker-container \
+[ "$build" = 0 ] || docker buildx inspect "$BUILDER" >/dev/null 2>&1 || docker buildx create -q --name "$BUILDER" --driver docker-container \
   --driver-opt cpuset-cpus=0-7 --driver-opt cpu-shares=2 --driver-opt memory=8g --driver-opt memory-swap=8g >/dev/null
 case ${1:-} in
   millenniumdb)
     commit=${2:-ecbf6dde5a5864f088eee3b0836ad6adba1d623b}
     docker buildx build --builder "$BUILDER" --load --build-arg "MDB_COMMIT=$commit" --build-arg JOBS=8 \
       -t "nrese-bench/millenniumdb:${commit:0:7}" "$ROOT/benches/competitors/millenniumdb"
+    ;;
+  gcare)
+    docker buildx build --builder "$BUILDER" --load -t nrese-bench/gcare:d603d2b "$ROOT/benches/competitors/gcare"
     ;;
   export)
     # An image for the rootfs runtime (suitekit/runtime.py RootfsRuntime) of a host without
