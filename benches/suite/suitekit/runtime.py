@@ -585,6 +585,9 @@ class RootfsRuntime(ProcessRuntime):
         for key, value in spec.env.items():
             args += ["--setenv", key, value]
         for m in spec.mounts:
+            if not m.readonly:
+                # Docker creates a missing bind source (a store the system makes on first start).
+                Path(m.source).mkdir(parents=True, exist_ok=True)
             args += ["--ro-bind" if m.readonly else "--bind", m.source, m.target]
         args += ["--chdir", spec.workdir or config.get("WorkingDir") or "/"]
         return args + ["--", *command]
