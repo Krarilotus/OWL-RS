@@ -49,6 +49,18 @@ fn fixture() -> (Engine, PreparedQuery, StoreSettings) {
 }
 
 #[test]
+fn planner_effort_survives_request_preparation_and_query_options() {
+    let (_, _, settings) = fixture();
+    for effort in [Some(1), None] {
+        let mut request = SparqlQueryRequest::all("SELECT * WHERE { ?s ?p ?o }");
+        request.planner.greedy_effort = effort;
+        let prepared = PreparedQuery::parse(&request).unwrap();
+        let options = query_options(&prepared, &settings, &CancellationToken::new());
+        assert_eq!(options.resources.planner.greedy_effort, effort);
+    }
+}
+
+#[test]
 fn preparation_cancellation_is_an_error_and_the_original_report_is_retained() {
     let (engine, prepared, settings) = fixture();
     let snapshot = engine.snapshot();
