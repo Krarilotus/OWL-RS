@@ -157,12 +157,46 @@ is a separate, implemented engine path. Controls and limitations are mapped in
 
 [`native/plan.rs`](../../crates/nrese-sparql/src/native/plan.rs) chooses BGP join order
 by dynamic programming through 12 patterns, then greedy search, from fewer starts where
-their estimates would exceed a fixed effort. The search asks for the query's cancellation
+their estimates would exceed `PlannerOptions::greedy_effort` (default 524288 candidate
+estimates, `None` unlimited; server `budgets.planner_effort = 0`). The bound reduces
+starts, always permitting one complete start; it is not a strict instruction count.
+The existing DP/greedy strategy stays the same. The search asks for the query's cancellation
 at every step, so planning ends at the request deadline as evaluation does. These and the
-probe-cost thresholds are code heuristics, not hardware-calibrated settings.
+probe-cost thresholds are heuristics, not a calibrated model of every machine.
 [`native/estimate.rs`](../../crates/nrese-sparql/src/native/estimate.rs) supplies
 pre-execution estimates; `explain_query` executes and records actual operator work.
 An estimated logical plan must not be presented as a fully selected physical plan.
+
+### Vector join direction and physical search
+
+The semantic planner owns the choice between binding RDF candidates and probing RDF
+patterns with search hits. The vector index owns its dimensions, graph coverage and
+physical kernels. The experimental cost route connects these owners through the small
+`Snapshot::vector_estimate` (space and available kernel); it does not create another executor or scheduler.
+
+| Owner | Decision or invariant |
+|---|---|
+| SPARQL vector join | Selective exact routes bind candidates first. Broad exact searches retain search-first when enumeration predicts no distance savings, avoiding a large RDF table just to keep k hits. Estimated rows are hints; bound IDs are deduplicated before physical selection. Unbound rows leave the candidate set unrestricted. Bag multiplicities remain in the RDF join. |
+| Engine vector index | Price exact accepted-distance work against estimated graph work plus its uncovered tail. Maintenance prices the completed graph, so a costly stale tail cannot prevent extension. |
+| `nrese-vector` | HNSW topology, traversal and exact distance kernels. Both routes use the existing kernels; graph parameters come from the actual graph, including after reopening. |
+| Query caller | `nrv:exact true` requires exact search. Positive `k` and `searchBudget` values are preserved, or rejected explicitly if unrepresentable; they are not clamped. |
+
+`VectorQuery::accepted` describes an index filter; `probe_accepted` estimates survivors
+of a later filter. Both may widen the beam, but only an index filter can save exact
+distance calculations. A selected probe-first kernel stays fixed while it widens: an
+ANN route cannot turn into repeated unfiltered exact scans, and explicit exact cannot
+turn approximate. Graph absence uses exact work while ordinary maintenance can still
+prepare the graph. The join planner can bind a selective candidate set or probe a broad
+one; the index's kernel choice alone does not determine the join direction.
+
+The crossover uses beam times level-zero degree as an **estimate**, not a work bound or
+a recall guarantee. HNSW's beam limits retained candidates, not all visited nodes (Malkov
+and Yashunin, Algorithm 2; corpus key `malkov2018hnsw`). Exact scans also check every ID;
+predicate cost, SIMD, parallelism, locality and inaccurate row estimates can change the
+winner. This candidate needs paired, same-host measurements before acceptance. Numeric
+recall targets and hardware-calibrated costs remain planned; `nrv:recallTarget` is not
+an implemented option. The forced-ANN recall guard is retained separately from Auto,
+so Auto selecting exact cannot make ANN coverage disappear.
 
 ## 6. Evidence and maintenance
 

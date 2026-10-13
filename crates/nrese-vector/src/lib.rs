@@ -200,9 +200,10 @@ pub fn exact_from(
     let parts: Vec<Vec<Hit>> = (start / CHUNK..vectors.chunks.len())
         .into_par_iter()
         .map(|c| {
-            let mut best = TopK::new(k);
             let first = (c * CHUNK).max(start);
-            for position in first..((c + 1) * CHUNK).min(vectors.len()) {
+            let end = ((c + 1) * CHUNK).min(vectors.len());
+            let mut best = TopK::new(k, end - first);
+            for position in first..end {
                 let position = position as u32;
                 let id = vectors.id(position);
                 if accept(id) {
@@ -212,16 +213,16 @@ pub fn exact_from(
             best.into_sorted()
         })
         .collect();
-    merge(parts.into_iter().flatten(), k)
+    let candidates = parts.iter().map(Vec::len).sum();
+    TopK::new(k, candidates).collect(parts.into_iter().flatten())
 }
 
 /// The `k` nearest of `hits`, nearest first.
 pub fn merge(hits: impl IntoIterator<Item = Hit>, k: usize) -> Vec<Hit> {
-    let mut best = TopK::new(k);
-    for hit in hits {
-        best.offer(hit.id, hit.distance);
-    }
-    best.into_sorted()
+    let hits = hits.into_iter();
+    // Reserve for known candidates, not an arbitrarily large requested k. Unknown
+    // iterator lengths grow with the candidates actually offered.
+    TopK::new(k, hits.size_hint().0).collect(hits)
 }
 
 /// The `k` best hits offered, kept in a max-heap by distance.
@@ -231,11 +232,18 @@ struct TopK {
 }
 
 impl TopK {
-    fn new(k: usize) -> Self {
+    fn new(k: usize, candidates: usize) -> Self {
         Self {
             k,
-            heap: std::collections::BinaryHeap::with_capacity(k + 1),
+            heap: std::collections::BinaryHeap::with_capacity(k.min(candidates)),
         }
+    }
+
+    fn collect(mut self, hits: impl Iterator<Item = Hit>) -> Vec<Hit> {
+        for hit in hits {
+            self.offer(hit.id, hit.distance);
+        }
+        self.into_sorted()
     }
 
     fn offer(&mut self, id: u64, distance: f32) {
@@ -281,6 +289,24 @@ impl<T: Ord> Ord for Ordered<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_large_k_allocates_for_candidates_and_returns_all_available_hits() {
+        let vectors = random_vectors(7, 3, 7);
+        let query = vectors.get(0);
+        let truth = exact(&vectors, query, vectors.len(), Metric::L2, &|_| true);
+        assert_eq!(
+            exact(&vectors, query, usize::MAX, Metric::L2, &|_| true),
+            truth
+        );
+        // Both exact-size and unknown-size iterators, without reserving usize::MAX.
+        assert_eq!(merge(truth.clone(), usize::MAX), truth);
+        assert_eq!(
+            merge(truth.iter().copied().filter(|_| true), usize::MAX),
+            truth
+        );
+        assert!(merge(std::iter::empty(), usize::MAX).is_empty());
+    }
 
     /// Pseudo-random vectors, the same every run.
     pub(crate) fn random_vectors(n: usize, dimension: usize, seed: u64) -> Vectors {
