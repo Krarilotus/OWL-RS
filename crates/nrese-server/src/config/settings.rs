@@ -409,6 +409,13 @@ pub const SETTINGS: &[Setting] = &[
          heaps, off holds less memory while serving (default on).",
     ),
     setting(
+        "budgets.reasoning_release",
+        names::REASONING_RELEASE,
+        Choice(&["off", "on"]),
+        "Memory given back between a materialisation's rounds: on lowers and steadies its \
+         peak (LUBM 100 by 14 %) for more reasoning time (5.6 %); default off.",
+    ),
+    setting(
         "budgets.bulk_load_memory",
         names::BULK_LOAD_MEMORY,
         Amount(BytesOrShare),

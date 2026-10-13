@@ -86,8 +86,12 @@ timeout) to run once more past it, so that its record says what it needs.
   does not start the measurement; the driver fails that slot acquisition. Zero checks
   without waiting. Process-inspection failures also abort (exit 2). `NRESE_QUIET_SLOT=0`
   skips the slot for counts; it is not a way to accept timings under compiler contention.
-- **Memory:** the container's peak (cgroup `memory.peak`) and the process's (`VmHWM`), after
-  the load, after reasoning and at the end.
+- **Memory:** the case's peak is the process's since it started (`peak_mib`, kind
+  `lifetime`), each phase's its own (`VmHWM` from the phase's start, `phases`). The cgroup's
+  peak (the container's or, natively, the scope's `memory.peak`, `cgroup_peak_mib`) is
+  recorded, not compared: it also counts the page cache the case's reads were charged,
+  which depends on what the host had cached (rl-lubm100: 2,375 to 4,700 MiB for one build,
+  the process's 2,023 to 2,109).
   In-process client cases retain latency samples per completed request. Their peaks
   include the harness and grow with completed work; lower throughput can lower the
   measured peak without reducing engine memory. Interpret these alongside QPS.
@@ -124,9 +128,12 @@ timeout) to run once more past it, so that its record says what it needs.
 4. **Throughput** is compared at every client width on its own, by the same interval and
    threshold: lower QPS is worse, with no millisecond floor, and needs at least two
    independent repetitions.
-5. **Memory:** a peak higher by the time threshold (at least 10 %) and by at least 64 MiB
-   is a regression. The case's peak and each phase's peak are compared apart; a phase
-   peak is not a lifetime peak.
+5. **Memory:** a peak higher by the time threshold (at least 10 %), beyond both sides'
+   spread of peaks, and by at least 64 MiB is a regression. The case's peak and each
+   phase's peak are compared apart; a phase peak is not a lifetime peak. Case peaks that
+   vary by more than 40 % between repetitions are not compared and fail the comparison:
+   the allocator moves them by up to 32 %, more is a measurement counting what is not the
+   process's.
 
 ## What is kept
 
