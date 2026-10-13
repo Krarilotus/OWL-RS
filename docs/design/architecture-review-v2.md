@@ -305,3 +305,38 @@ Gremlin; SQL/PGQ together with G10's SQL endpoint.
    crates published to crates.io.
 5. **The AI assistant:** stays in the core server, or moves to the product repositories
    (recommended).
+
+### Decided by the owner (13 October 2026)
+
+1. **Distribution:** v2.0 builds the foundation; distribution follows on it, in two tracks:
+   - containers in the cloud, against the managed graph services;
+   - volunteer computing across end-user machines worldwide (the Folding@home model).
+
+   Both are informed by distributed-systems and parallel-computing research; the
+   estimate is to be checked against it. Specific hardware is optimised wherever it
+   helps. The direction is NRESE as a distributed world memory for AI agents (user story
+   to be derived). Re-encoding stores is no concern before the first release, so the id
+   layout follows the design, not compatibility.
+2. **Property graphs:** in the default graph, so the reasoner applies, with every synergy
+   between property graphs and reasoning used. Before the format is fixed, the
+   named-graph option is to be evaluated as a mapping onto one physical layout (graph ids
+   carried by inferred statements; per-dataset reasoning scope as a setting) rather than
+   a separate format, for maximal flexibility.
+3. **Languages:** the newest standards of every query language, each for its use cases:
+   GQL, openCypher, Gremlin, SQL/PGQ, Bolt and SPARQL. Each at the best speed and
+   memory footprint.
+4. **Interfaces:** a clean Rust interface, defined feature-complete first, plus HTTP and
+   language bindings (Python and others) for using the store. Publishing crates on
+   crates.io is decided at v2.3, once the specification and its first implementation
+   exist.
+5. **AI:** AI first. Agents are a service layer, not one assistant. The core exposes what
+   agents need (introspection, explanations, provenance, cost estimates, a function
+   registry for LLM and embedding functions), and the LLM client leaves the server
+   binary for that service layer.
+
+**Rules (owner):** user rules grow into full logic programming in v2.2: n-ary relations,
+negation, arithmetic, aggregation, and what constraint logic programming and Prolog
+offer, across the standards (N3, SWRL, RIF, SHACL rules, Datalog). It is built on the
+whole stack, so its synergies compound, and extensions such as macros or unification are
+proposed where they serve users. **Every version from v2.1 to v2.3 ends with an
+optimisation round.**
