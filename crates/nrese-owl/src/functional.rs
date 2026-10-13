@@ -19,6 +19,19 @@ impl Ontology {
         f.axiom(axiom)
     }
 
+    /// A DL-safe rule in the functional syntax (the OWL API's `DLSafeRule`).
+    pub fn functional_rule(
+        &self,
+        rule: &crate::rules::Rule,
+        name: &dyn Fn(Term) -> String,
+    ) -> String {
+        let f = Functional {
+            ontology: self,
+            name,
+        };
+        f.rule(rule)
+    }
+
     /// The ontology as a functional-syntax document: the standard prefixes, then
     /// `Ontology(<iri>` and an axiom per line. `name` must write terms as the syntax does
     /// ([`iri_text`], [`literal_text`], `_:label` for an anonymous individual).
@@ -39,6 +52,10 @@ impl Ontology {
         out.push('\n');
         for axiom in &self.axioms {
             out.push_str(&self.functional(axiom, name));
+            out.push('\n');
+        }
+        for rule in &self.rules {
+            out.push_str(&self.functional_rule(rule, name));
             out.push('\n');
         }
         out.push_str(")\n");
@@ -167,6 +184,49 @@ impl Functional<'_> {
         let mut parts: Vec<String> = xs.iter().map(|&x| self.r(x)).collect();
         parts.sort();
         parts.join(" ")
+    }
+
+    fn rule(&self, rule: &crate::rules::Rule) -> String {
+        use crate::rules::{Atom, DArg, IArg};
+        let var = |v: u32| format!("Variable({})", self.n(rule.variables[v as usize]));
+        let i = |a: &IArg| match *a {
+            IArg::Var(v) => var(v),
+            IArg::Individual(t) => self.n(t),
+        };
+        let d = |a: &DArg| match *a {
+            DArg::Var(v) => var(v),
+            DArg::Literal(t) => self.n(t),
+        };
+        let atoms = |atoms: &[Atom]| -> String {
+            atoms
+                .iter()
+                .map(|a| match a {
+                    Atom::Class(c, x) => format!("ClassAtom({} {})", self.c(*c), i(x)),
+                    Atom::Range(r, v) => format!("DataRangeAtom({} {})", self.r(*r), d(v)),
+                    Atom::Object(p, x, y) => {
+                        format!("ObjectPropertyAtom({} {} {})", self.p(*p), i(x), i(y))
+                    }
+                    Atom::Data(p, x, v) => {
+                        format!("DataPropertyAtom({} {} {})", self.n(*p), i(x), d(v))
+                    }
+                    Atom::Same(x, y) => format!("SameIndividualAtom({} {})", i(x), i(y)),
+                    Atom::Different(x, y) => {
+                        format!("DifferentIndividualsAtom({} {})", i(x), i(y))
+                    }
+                    Atom::BuiltIn(b, xs) => format!(
+                        "BuiltInAtom({} {})",
+                        self.n(*b),
+                        xs.iter().map(d).collect::<Vec<_>>().join(" ")
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        format!(
+            "DLSafeRule(Body({}) Head({}))",
+            atoms(&rule.body),
+            atoms(&rule.head)
+        )
     }
 
     fn axiom(&self, axiom: &Axiom) -> String {

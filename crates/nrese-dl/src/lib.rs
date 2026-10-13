@@ -10,13 +10,15 @@
 //! - [`numbers`]: sizes of counted classes compared before any search;
 //! - [`certificate`]: models of "consistent" answers checked against the ontology by the
 //!   direct semantics, independently of the engines;
-//! - [`scope`]: the answers and certificates of the small-scope check (§11).
+//! - [`scope`]: the answers and certificates of the small-scope check (§11);
+//! - [`beyond`]: inputs outside OWL 2 DL, decided where that is sound (§16).
 //!
 //! Each module is its own package with its own gates (owl2-dl-performance.md §6).
 
 mod cancel;
 pub use cancel::Cancel;
 
+pub mod beyond;
 pub mod bounds;
 pub mod certificate;
 pub mod classify;

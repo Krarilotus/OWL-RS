@@ -45,6 +45,8 @@ const TEST: &str = "http://www.w3.org/2007/OWL/testOntology#";
 const EXPECTED_WRONG: &str = include_str!("expected-wrong.txt");
 const DISPUTED: &str = include_str!("disputed.txt");
 const OVER_BUDGET: &str = include_str!("over-budget.txt");
+const UNCERTIFIED: &str = include_str!("uncertified.txt");
+const FULL_WRONG: &str = include_str!("full-wrong.txt");
 
 thread_local! {
     /// Set while a test of `over-budget.txt` runs: [`config`] gives it a small budget.
@@ -350,7 +352,16 @@ fn run_case(case: &Case, kind: &str) -> (Verdict, Features) {
                 Some(Err(why)) => return (Verdict::Open(format!("not-run: {why}")), features),
                 Some(Ok(o)) => o,
             };
+            // A conclusion the reader couldn't read whole isn't entailed by its read part
+            // (a structure no axiom uses says something in OWL 2 Full, if not in DL).
+            let partial = conclusion
+                .diagnostics
+                .iter()
+                .any(|d| d.is_fatal() || matches!(d, nrese_owl::Diagnostic::Unused { .. }));
             match entailed(&premise, &conclusion, &table, &mut features) {
+                Ok(true) if partial => {
+                    Verdict::Open("unsupported: the conclusion isn't OWL 2 DL as a whole".into())
+                }
                 Ok(e) if e == positive => Verdict::Pass,
                 Ok(e) => Verdict::Wrong(format!("entailed: {e}")),
                 Err(why) => Verdict::Open(why),
@@ -361,6 +372,12 @@ fn run_case(case: &Case, kind: &str) -> (Verdict, Features) {
 }
 
 fn read_cases(text: &str) -> Vec<Case> {
+    read_cases_of(text, true)
+}
+
+/// The cases under the direct semantics of species DL (`dl`) or of the others (OWL 2 Full
+/// graphs the suite gives direct-semantics answers for).
+fn read_cases_of(text: &str, dl: bool) -> Vec<Case> {
     let triples = parse_rdf_xml(text).expect("the test case collection parses");
     let mut cases: HashMap<NamedOrBlankNode, Case> = HashMap::new();
     for t in &triples {
@@ -417,7 +434,7 @@ fn read_cases(text: &str) -> Vec<Case> {
         .collect();
     let mut out: Vec<Case> = cases
         .into_values()
-        .filter(|c| c.dl && c.direct && !c.name.is_empty())
+        .filter(|c| c.dl == dl && c.direct && !c.name.is_empty())
         .map(|mut c| {
             c.imports = library.clone();
             c
@@ -493,6 +510,74 @@ fn the_multiplication_tests_are_decided_by_counting() {
         assert_eq!(out.telemetry.nodes_created, 0, "{name}: {}", out.telemetry);
         assert_eq!(out.telemetry.branch_points, 0, "{name}: {}", out.telemetry);
     }
+}
+
+/// Every consistent answer to a consistency test with a model from the engine, data
+/// values included, is certified (`nrese_dl::certificate`) but those listed in
+/// `uncertified.txt` with the reason.
+#[test]
+fn consistent_answers_are_certified() {
+    let Ok(text) = std::fs::read_to_string(suite_path()) else {
+        return;
+    };
+    let listed_uncertified: Vec<(&str, &str)> = listed(UNCERTIFIED);
+    let (mut certified, mut declined) = (0usize, Vec::new());
+    for case in read_cases(&text) {
+        if !case.types.iter().any(|t| t == "ConsistencyTest") {
+            continue;
+        }
+        let mut table = Table::default();
+        let Some(Ok(premise)) = document(&case, &["Premise", "Input"], &mut table) else {
+            continue;
+        };
+        let over = listed(OVER_BUDGET).iter().any(|(id, _)| *id == case.name);
+        SMALL.with(|s| s.set(over));
+        // The hard search tests (`hard_search_tests_are_decided`) need the portfolio, which
+        // keeps no model: within this budget they give up and are skipped.
+        let config = Config {
+            keep_model: true,
+            max_branch_points: Some(50_000),
+            ..config()
+        };
+        SMALL.with(|s| s.set(false));
+        let started = std::time::Instant::now();
+        let out = consistency(&premise, &config);
+        if std::env::var_os("NRESE_W3C_TRACE").is_some() {
+            eprintln!("{}: {:?} in {:?}", case.name, out.answer, started.elapsed());
+        }
+        let (Answer::Consistent, Some(model)) = (&out.answer, &out.model) else {
+            continue;
+        };
+        match nrese_dl::certificate::certify(&premise, model) {
+            nrese_dl::certificate::Certificate::Model { .. } => certified += 1,
+            nrese_dl::certificate::Certificate::Declined(why) => {
+                if std::env::var_os("NRESE_W3C_TRACE").is_some() {
+                    let mut i = nrese_dl::certificate::interpretation(model);
+                    nrese_dl::certificate::close(&premise, &mut i);
+                    eprintln!("{}: {model:?}", case.name);
+                    for k in nrese_dl::certificate::failures(&premise, &i).unwrap_or_default() {
+                        eprintln!(
+                            "  fails {}",
+                            premise.functional(&premise.axioms[k], &|t| table.name(t))
+                        );
+                    }
+                }
+                declined.push((case.name.clone(), why));
+            }
+        }
+    }
+    eprintln!(
+        "certified {certified}, declined {}: {declined:#?}",
+        declined.len()
+    );
+    let unlisted: Vec<&(String, String)> = declined
+        .iter()
+        .filter(|(name, _)| !listed_uncertified.iter().any(|(id, _)| id == name))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "consistent without a certificate: {unlisted:#?}"
+    );
 }
 
 /// The witness of every disputed test is a model of its premise.
@@ -680,5 +765,59 @@ fn the_w3c_dl_suite() {
     assert!(
         unlisted.is_empty() && fixed.is_empty(),
         "wrong answers not listed:\n{unlisted:#?}\nlisted but no longer wrong:\n{fixed:#?}"
+    );
+}
+
+/// The suite's tests of species OWL 2 Full it gives direct-semantics answers for
+/// (docs/design/owl2-dl.md §16): read with the reader's repairs (a property typed by its
+/// use, a shared blank node), what it can't read left out, and answered only as far as
+/// that is sound (monotonicity: "inconsistent" and "entailed" from what was read; a
+/// conclusion read in part is entailed by nothing). No wrong answer but those listed in
+/// `full-wrong.txt`.
+#[test]
+fn the_w3c_full_tests_with_direct_answers() {
+    let Ok(text) = std::fs::read_to_string(suite_path()) else {
+        return;
+    };
+    let listed_wrong: Vec<(&str, &str)> = listed(FULL_WRONG);
+    let kinds = [
+        "ConsistencyTest",
+        "InconsistencyTest",
+        "PositiveEntailmentTest",
+        "NegativeEntailmentTest",
+    ];
+    let mut tally: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut wrong, mut rows) = (Vec::new(), String::new());
+    for case in read_cases_of(&text, false) {
+        for kind in kinds.iter().filter(|k| case.types.iter().any(|t| t == *k)) {
+            let (verdict, _) = run_case(&case, kind);
+            let id = format!("{} ({kind})", case.name);
+            let class = match &verdict {
+                Verdict::Pass => "pass",
+                Verdict::Wrong(why) => {
+                    wrong.push(format!("{id}: {why}"));
+                    "wrong"
+                }
+                Verdict::Open(why) => {
+                    *reasons.entry(reason_class(why)).or_default() += 1;
+                    "open"
+                }
+            };
+            *tally.entry((kind.to_string(), class.into())).or_default() += 1;
+            let _ = writeln!(rows, "{}\t{kind}\t{class}\t{verdict:?}", case.name);
+        }
+    }
+    eprintln!("species Full, direct semantics: {tally:#?}\nopen, by reason: {reasons:#?}");
+    if let Some(out) = std::env::var_os("NRESE_W3C_FULL_OUT") {
+        std::fs::write(out, rows).expect("writes the results");
+    }
+    let unlisted: Vec<&String> = wrong
+        .iter()
+        .filter(|w| !listed_wrong.iter().any(|(id, _)| w.starts_with(id)))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "wrong answers not listed: {unlisted:#?}"
     );
 }
