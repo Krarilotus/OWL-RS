@@ -523,18 +523,12 @@ impl Context<'_> {
         let key_table = IdTable::from_columns(key_columns);
         let groups = group_rows(&key_table, &(0..variables.len()).collect::<Vec<_>>());
         let group_count = groups.len();
-        let members_of = |group_of: &mut dyn Iterator<Item = usize>| {
-            let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
-            for (row, group) in group_of.enumerate() {
-                members[group].push(row);
-            }
-            members
-        };
+
         // Aggregates in the caller's order; each column is filled by the part that
         // computes it.
         let mut values: Vec<Option<Vec<u64>>> = vec![None; aggregates.len()];
         let compute = |solutions: &Solutions,
-                       members: &[Vec<usize>],
+                       members: &nrese_exec::group::Members,
                        selected: &[usize],
                        values: &mut Vec<Option<Vec<u64>>>|
          -> NativeResult<()> {
@@ -557,7 +551,10 @@ impl Context<'_> {
         let core_aggregates: Vec<usize> = (0..aggregates.len())
             .filter(|&a| branch_of(&arguments[a]).is_none())
             .collect();
-        let members = members_of(&mut groups.group_of.iter().map(|&g| g as usize));
+        let members = nrese_exec::group::Members::of(
+            groups.group_of.iter().map(|&g| g as usize),
+            group_count,
+        );
         let start = std::time::Instant::now();
         compute(&core, &members, &core_aggregates, &mut values)?;
         if self.trace.is_some() {
@@ -694,7 +691,10 @@ impl Context<'_> {
             let estimate = Some(left.table.len().max(right.table.len()) as u64);
             let joined = self.left_join(left, right, *expression)?;
             let column = joined.column(&group).expect("the left side's first column");
-            let members = members_of(&mut joined.table.column(column).iter().map(|&g| g as usize));
+            let members = nrese_exec::group::Members::of(
+                joined.table.column(column).iter().map(|&g| g as usize),
+                group_count,
+            );
             if self.trace.is_some() {
                 let detail = format!(
                     "a detached OPTIONAL joined to {} kept group(s)",
