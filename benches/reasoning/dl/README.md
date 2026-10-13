@@ -149,9 +149,19 @@ ontology but datatype definitions in one (which they decide). Of the 22:
 | 714 (the owner's question) | consistent, a certified model of 5 elements satisfying all 8 rules (Openllet: consistent; HermiT, Konclude: no answer) | exact (the TBox names no individual) |
 | 237 and 7 like it (15516, 8280, 5539, 2669, 10906, 5206, 13880) | inconsistent by the DL part alone (Openllet agrees; HermiT rejects a literal typed `rdfs:Literal`); each has a four-axiom justification: `DBNonKeyAttribute(x)`, `DBNonPrimaryKeyAttribute ≡ DBNonKeyAttribute ⊔ …`, `DBNonPrimaryKeyAttribute ⊑ DBKeyAttribute`, `DBKeyAttribute` disjoint from `DBNonKeyAttribute` | exact (inconsistent) |
 | 3726, 7278, 15753 (SQWRL queries among the rules) | consistent, certified (the queries assert nothing) | exact |
-| 15993, 16630, 2526, 6615, 8250, 12451, 15063, 7345 | consistent, certified (12451: HermiT times out, Openllet overflows its stack) | see `classify.tsv` of the job |
-| 13129 | undecided: an ill-typed literal (`"…"^^rdfs:Literal`, *Structural Specification* §5.7) in a rule's data | the DL part's subsumptions |
-| 10860 | undecided: SWRLTab's `abox:hasClass` (a built-in over individuals and classes, not SWRL's) | the DL part's subsumptions |
+| 15993, 16630, 2526, 6615, 8250, 15063, 7345 | consistent, certified | exact (by the disjoint union, or refined by certified models where the TBox names individuals) |
+| 12451 | consistent, certified (HermiT times out at 300 s, Openllet overflows its stack) | sound, not exact: 27,223 subsumptions; the refinement's 25 minutes leave most of its 2,000 classes' pairs open |
+| 10860 | inconsistent: the DL part with 7 instances of its SWRL rules; one rule uses SWRLTab's `abox:hasClass` (over individuals and classes, not a SWRL built-in) and is left out, named (Openllet: inconsistent) | exact (inconsistent) |
+| 13129 | undecided: an ill-typed literal (`"…"^^rdfs:Literal`, *Structural Specification* §5.7) in its rules' data | the DL part's subsumptions, sound |
+
+10860's justification (10 axioms, 2 rules): a situation with exactly zero
+`hasR2RRelation`s, whose requester's working department and patient's supervision clinic
+are either different or the same individual; one rule gives the situation such a relation
+in each case. A model must choose a case, which is why it took grounding.
+
+So of the 22: consistency decided for 21 (12 consistent, 9 inconsistent), classification
+exact for 20. Jobs `dl-beyond-runs-1` to `-3` (Office-PC, release, binaries of
+`v15/dl-beyond`).
 
 **The rule campaigns** (`rules_campaign`, 1,000 cases each, 20 s per decision; HermiT and
 Openllet by `nrese.dl.Scope`):
