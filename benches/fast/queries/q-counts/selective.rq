@@ -1,0 +1,2 @@
+PREFIX e: <http://example.org/fast/>
+SELECT (COUNT(*) AS ?n) WHERE { ?u e:city e:c7 . ?u e:follows ?v }

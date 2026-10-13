@@ -1,0 +1,2 @@
+PREFIX e: <http://example.org/fast/>
+SELECT (COUNT(*) AS ?n) WHERE { ?p e:author ?u MINUS { ?p e:title ?t } }

@@ -21,6 +21,101 @@ use super::{ScanPattern, Solutions, calendar, expression_variables, pushdown, va
 /// keep them all.
 const MEMO_ENTRIES: usize = 1 << 16;
 
+/// Whether `aggregate` folds a row at a time into a [`Fold`] that merges with the next
+/// rows': COUNT, SAMPLE, MIN, MAX and GROUP_CONCAT without DISTINCT.
+pub(super) fn foldable(aggregate: &AggregateExpression) -> bool {
+    match aggregate {
+        AggregateExpression::CountSolutions { distinct } => !distinct,
+        AggregateExpression::FunctionCall { name, distinct, .. } => {
+            !distinct
+                && matches!(
+                    name,
+                    AggregateFunction::Count
+                        | AggregateFunction::Sample
+                        | AggregateFunction::Min
+                        | AggregateFunction::Max
+                        | AggregateFunction::GroupConcat { .. }
+                )
+        }
+    }
+}
+
+/// Whether `value` replaces `best` as `name`'s extreme (the first of equal ones stays).
+fn better(name: &AggregateFunction, value: &Term, best: &Term) -> bool {
+    let wanted = match name {
+        AggregateFunction::Min => std::cmp::Ordering::Less,
+        _ => std::cmp::Ordering::Greater,
+    };
+    value::order(Some(value), Some(best)) == wanted
+}
+
+/// An aggregate folded over some of a group's rows ([`Aggregator::fold`]).
+pub(super) enum Fold {
+    /// An error made it unbound (MIN, MAX, GROUP_CONCAT).
+    Unbound,
+    Count(u64),
+    Sample(Option<Term>),
+    Extreme(Option<Term>, AggregateFunction),
+    Concat {
+        text: String,
+        values: u64,
+        separator: String,
+    },
+}
+
+impl Fold {
+    /// This part's fold followed by the next part's.
+    pub(super) fn merge(self, next: Fold) -> Fold {
+        match (self, next) {
+            (Fold::Unbound, _) | (_, Fold::Unbound) => Fold::Unbound,
+            (Fold::Count(a), Fold::Count(b)) => Fold::Count(a + b),
+            (Fold::Sample(a), Fold::Sample(b)) => Fold::Sample(a.or(b)),
+            (Fold::Extreme(a, name), Fold::Extreme(b, _)) => {
+                let best = match (a, b) {
+                    (Some(a), Some(b)) => Some(if better(&name, &b, &a) { b } else { a }),
+                    (a, b) => a.or(b),
+                };
+                Fold::Extreme(best, name)
+            }
+            (
+                Fold::Concat {
+                    mut text,
+                    values,
+                    separator,
+                },
+                Fold::Concat {
+                    text: more,
+                    values: added,
+                    ..
+                },
+            ) => {
+                if values > 0 && added > 0 {
+                    text.push_str(&separator);
+                }
+                text.push_str(&more);
+                Fold::Concat {
+                    text,
+                    values: values + added,
+                    separator,
+                }
+            }
+            _ => unreachable!("parts of one aggregate fold alike"),
+        }
+    }
+
+    /// The aggregate's value.
+    pub(super) fn finish(self) -> Agg {
+        match self {
+            Fold::Unbound => Agg::Id(UNDEF),
+            Fold::Count(n) => Agg::Term(integer(n)),
+            Fold::Sample(value) | Fold::Extreme(value, _) => {
+                value.map_or(Agg::Id(UNDEF), Agg::Term)
+            }
+            Fold::Concat { text, .. } => Agg::Term(Literal::new_simple_literal(text).into()),
+        }
+    }
+}
+
 /// An aggregate's value: a stored or computed id, or a new term the query interns.
 pub(super) enum Agg {
     Id(u64),
@@ -253,15 +348,50 @@ impl Aggregator<'_> {
         expr: &Expression,
         name: &AggregateFunction,
     ) -> Option<Agg> {
-        if !matches!(
-            name,
-            AggregateFunction::Count
-                | AggregateFunction::Sample
-                | AggregateFunction::Min
-                | AggregateFunction::Max
-                | AggregateFunction::GroupConcat { .. }
-        ) {
-            return None;
+        let aggregate = AggregateExpression::FunctionCall {
+            name: name.clone(),
+            expr: expr.clone(),
+            distinct: false,
+        };
+        foldable(&aggregate).then(|| self.fold(solutions, rows, &aggregate).finish())
+    }
+
+    /// `aggregate` ([`foldable`]) over `rows`, a part of its group: merged in row order
+    /// with the other parts' ([`Fold::merge`]), the group's value.
+    pub(super) fn fold(
+        &self,
+        solutions: &Solutions,
+        rows: &[usize],
+        aggregate: &AggregateExpression,
+    ) -> Fold {
+        let AggregateExpression::FunctionCall { name, expr, .. } = aggregate else {
+            return Fold::Count(rows.len() as u64);
+        };
+        // COUNT of a variable counts its bound ids, nothing decoded; MIN and MAX of inline
+        // integers compare them by id.
+        if let Expression::Variable(variable) = expr {
+            let ids = || -> Vec<u64> {
+                match solutions.column(variable) {
+                    Some(column) => rows
+                        .iter()
+                        .map(|&row| solutions.table.get(row, column))
+                        .collect(),
+                    None => vec![UNDEF; rows.len()],
+                }
+            };
+            match name {
+                AggregateFunction::Count => {
+                    return Fold::Count(ids().into_iter().filter(|&id| id != UNDEF).count() as u64);
+                }
+                AggregateFunction::Min | AggregateFunction::Max => {
+                    match self.aggregate_ids(name, ids(), false) {
+                        Some(Agg::Id(UNDEF)) => return Fold::Unbound,
+                        Some(Agg::Id(id)) => return Fold::Extreme((self.term)(id), name.clone()),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
         }
         // COUNT skips errors and SAMPLE takes the first value, but one error makes the
         // others unbound.
@@ -271,31 +401,23 @@ impl Aggregator<'_> {
         for &row in rows {
             let Some(value) = self.value_at(solutions, row, expr, column) else {
                 if fails_on_error {
-                    return Some(Agg::Id(UNDEF));
+                    return Fold::Unbound;
                 }
                 continue;
             };
             match name {
-                AggregateFunction::Sample => return Some(Agg::Term(value)),
-                // The first of equal extremes.
+                AggregateFunction::Sample => return Fold::Sample(Some(value)),
                 AggregateFunction::Min | AggregateFunction::Max => {
-                    let wanted = match name {
-                        AggregateFunction::Min => std::cmp::Ordering::Less,
-                        _ => std::cmp::Ordering::Greater,
-                    };
-                    if best
-                        .as_ref()
-                        .is_none_or(|b| value::order(Some(&value), Some(b)) == wanted)
-                    {
+                    if best.as_ref().is_none_or(|b| better(name, &value, b)) {
                         best = Some(value);
                     }
                 }
                 AggregateFunction::GroupConcat { separator } => {
                     let Term::Literal(literal) = &value else {
-                        return Some(Agg::Id(UNDEF));
+                        return Fold::Unbound;
                     };
                     if literal.language().is_none() && literal.datatype() != xsd::STRING {
-                        return Some(Agg::Id(UNDEF));
+                        return Fold::Unbound;
                     }
                     if count > 0 {
                         concat.push_str(separator.as_deref().unwrap_or(" "));
@@ -306,13 +428,16 @@ impl Aggregator<'_> {
             }
             count += 1;
         }
-        Some(match name {
-            AggregateFunction::Count => Agg::Term(integer(count)),
-            AggregateFunction::GroupConcat { .. } => {
-                Agg::Term(Literal::new_simple_literal(concat).into())
-            }
-            _ => best.map_or(Agg::Id(UNDEF), Agg::Term),
-        })
+        match name {
+            AggregateFunction::Count => Fold::Count(count),
+            AggregateFunction::Sample => Fold::Sample(None),
+            AggregateFunction::GroupConcat { separator } => Fold::Concat {
+                text: concat,
+                values: count,
+                separator: separator.clone().unwrap_or_else(|| " ".to_owned()),
+            },
+            _ => Fold::Extreme(best, name.clone()),
+        }
     }
 
     /// The expression's value for each of `rows`. With `distinct`, only for the first row

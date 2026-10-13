@@ -115,13 +115,19 @@ an RDF term for every output cell.
 | `nrese-exec::join` | Merge/galloping joins on sorted keys, hash joins otherwise; left, semi and anti joins; explicit handling of unbound keys and output limits |
 | `nrese-exec::group`, `table` | Grouping and column operations, with value-dependent operations supplied by the caller |
 | `nrese-exec::sort`, `search`, `graph` | Sorting id keys, forward searches, adjacency and component-based closures |
-| `nrese-sparql::native` | Scans, index probes, cyclic BGP joins, expression evaluation, paths, aggregation strategies, ordering, streaming and result writing |
+| `nrese-sparql::native` | Scans, index probes, cyclic BGP joins, expression evaluation, paths, aggregation strategies (counts of join trees by message passing without their rows, `count`; counts of one pattern from the index's counts, ranges and groups), ordering, streaming and result writing |
 | `nrese-reasoner` | Rule plans, semi-naive rounds, candidate admission, equality and incremental maintenance |
 
 Batch sizes and parallel thresholds vary by operator; there is no universal 64 k-row
 pipeline. Some paths stream and others materialise tables. Per-query and shared budgets
 bound accounted intermediates, with cancellation checked by the executor and participating
-kernels. They do not imply that every allocation is charged or every kernel is interruptible.
+kernels: tables, a scan before it is read (the index knows its size), sort keys and the
+values decoded for them, group arrays, computed and cached decoded terms; aggregates fold a
+row at a time. What no budget accounts is bounded by the process's memory limit
+(`nrese_exec::memory::process_limit_exceeded`), which the executor's checks and the join
+kernels' row checks read: a query past it ends with a memory error. The guard
+`a_query_holds_no_more_than_its_memory_limit` (`nrese-sparql/tests/query_memory.rs`)
+measures each shape's heap with the allocator against its limit.
 Query sort/distinct/group disk spilling remains unfinished; on-disk bulk-load spilling
 is a separate, implemented engine path. Controls and limitations are mapped in
 [hardware-and-scaling.md](hardware-and-scaling.md#configuration-and-strategy-ownership).

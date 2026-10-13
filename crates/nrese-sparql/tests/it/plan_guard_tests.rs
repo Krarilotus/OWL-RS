@@ -190,6 +190,40 @@ fn joins_are_counted_without_their_rows() {
     let (walks, listed, pairs, read) = counted(&chain.detail);
     assert_eq!((walks, pairs, read), (2, 0, 9_000), "{}", chain.detail);
     assert!(listed <= 9_000, "{}", chain.detail);
+    // Query 1's shape: 300 subjects of one kind meet `knows`' 9,000 matches, looked up for
+    // those 300 instead of walked whole (3 K subjects met `rdf:type`'s 66.5 M on DBLP).
+    let selective = step("SELECT (COUNT(*) AS ?n) WHERE { ?s e:kind e:k1 . ?s e:knows ?o }");
+    let (walks, listed, _, _) = counted(&selective.detail);
+    assert!(
+        walks == 1 && listed <= 300 && selective.detail.contains(" 300 values looked up"),
+        "{}",
+        selective.detail
+    );
+    // Query 66's and 67's shape: a closure joined to a pattern, weighed by each node's
+    // closure size (3,000 nodes, each reaching all 3,000), no pair of it made.
+    let closure = step("SELECT (COUNT(*) AS ?n) WHERE { ?s e:kind e:k1 . ?s e:knows+ ?o }");
+    let (walks, listed, pairs, _) = counted(&closure.detail);
+    assert!(
+        walks == 2 && listed <= 3_300 && pairs == 0,
+        "{}",
+        closure.detail
+    );
+    // Query 11's and 31's shapes: an OPTIONAL and an EXISTS hanging off those 300 values
+    // are solved for them alone (OPTIONAL `rdf:type` of 3 K subjects walked its 66.5 M).
+    for part in [
+        "OPTIONAL { ?s e:knows ?o }",
+        "FILTER EXISTS { ?s e:knows ?o }",
+    ] {
+        let seeded = step(&format!(
+            "SELECT (COUNT(*) AS ?n) WHERE {{ ?s e:kind e:k1 {part} }}"
+        ));
+        let (walks, _, _, _) = counted(&seeded.detail);
+        assert!(
+            walks == 1 && seeded.detail.contains(" 300 values looked up"),
+            "{part}: {}",
+            seeded.detail
+        );
+    }
 }
 
 /// `COUNT` of one pattern under a FILTER that bounds a variable to id ranges is a sum of

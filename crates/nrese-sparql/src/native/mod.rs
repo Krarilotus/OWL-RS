@@ -3485,6 +3485,12 @@ impl<'a> Context<'a> {
             .map(|v| (0..4).filter(|&i| scan.slots[i].is_var(v)).collect())
             .collect();
         let merged = scan.merged();
+        // The table's size is known before it is read (the index's count, an estimate where
+        // equality classes are expanded): charged first, so a scan past the budget allocates
+        // nothing (Sparqloscope 101 decoded 605 M rows in one call and took the process to
+        // its cap). The table's own charge replaces this one.
+        let expected = self.snapshot.estimate_in(self.model, &pattern) as usize;
+        let precharge = self.working(expected.saturating_mul(vars.len().max(1) * 8))?;
         // One run, no deletions, nothing to merge: whole columns, decoded a block at a time.
         if !merged && !scan.repeats_variable() {
             let components: Vec<usize> = columns_of.iter().map(|positions| positions[0]).collect();
@@ -3492,6 +3498,7 @@ impl<'a> Context<'a> {
                 self.snapshot
                     .scan_columns_in(self.model, &pattern, permutation, &components)
             {
+                drop(precharge);
                 let table = if vars.is_empty() {
                     let rows = self.snapshot.count_in(self.model, &pattern) as usize;
                     IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
@@ -3541,6 +3548,7 @@ impl<'a> Context<'a> {
             table.push_row(&row);
         }
         let table = table.assume_sorted_by(sorted_columns(scan, permutation, &vars));
+        drop(precharge);
         self.produced(Solutions {
             vars,
             table,
@@ -4105,6 +4113,22 @@ impl<'a> Context<'a> {
                 .map(|(_, aggregate)| aggregator.aggregate(solutions, rows, aggregate))
                 .collect()
         };
+        // A large group whose aggregates all fold (COUNT, SAMPLE, MIN, MAX, GROUP_CONCAT)
+        // is folded in parallel parts of its rows, merged in order (Sparqloscope 058: MIN
+        // of 30.5 M names, one group, 3.9 s on one thread).
+        if aggregates
+            .iter()
+            .all(|(_, aggregate)| aggregate::foldable(aggregate))
+            && members
+                .iter()
+                .any(|rows| rows.len() >= 2 * PARALLEL_EXPRESSION_ROWS)
+        {
+            let mut out = Vec::with_capacity(members.len());
+            for rows in members {
+                out.push(self.fold_in_parts(solutions, rows, aggregates)?);
+            }
+            return Ok(out);
+        }
         if solutions.table.len() < 2 * PARALLEL_EXPRESSION_ROWS || members.len() < 2 {
             let term = |id: u64| self.term(id);
             let aggregator = Aggregator {
@@ -4165,6 +4189,75 @@ impl<'a> Context<'a> {
             out.extend(part);
         }
         Ok(out)
+    }
+
+    /// `aggregates` ([`aggregate::foldable`]) of one group, its `rows` folded in parallel
+    /// parts each with a decoder of its own and merged in row order; serially where the
+    /// group is small.
+    fn fold_in_parts(
+        &self,
+        solutions: &Solutions,
+        rows: &[usize],
+        aggregates: &[(Variable, AggregateExpression)],
+    ) -> NativeResult<Vec<Agg>> {
+        if rows.len() < 2 * PARALLEL_EXPRESSION_ROWS {
+            let term = |id: u64| self.term(id);
+            let aggregator = Aggregator {
+                evaluator: &self.evaluator,
+                term: &term,
+                memo: RefCell::default(),
+                numbers: RefCell::default(),
+            };
+            return Ok(aggregates
+                .iter()
+                .map(|(_, aggregate)| aggregator.fold(solutions, rows, aggregate).finish())
+                .collect());
+        }
+        let computed = self.computed.borrow();
+        let computed: &[Term] = &computed;
+        let token = self.cancellation.as_ref();
+        let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
+        let parts: Vec<Option<Vec<aggregate::Fold>>> = rows
+            .par_chunks(PARALLEL_EXPRESSION_ROWS)
+            .map(|part| {
+                if token.is_some_and(CancellationToken::is_cancelled) {
+                    return None;
+                }
+                let decoder = Decoder::new(snapshot, computed);
+                let term = |id: u64| decoder.term(id);
+                let aggregator = Aggregator {
+                    evaluator,
+                    term: &term,
+                    memo: RefCell::default(),
+                    numbers: RefCell::default(),
+                };
+                Some(
+                    aggregates
+                        .iter()
+                        .map(|(_, aggregate)| aggregator.fold(solutions, part, aggregate))
+                        .collect(),
+                )
+            })
+            .collect();
+        let mut folds: Option<Vec<aggregate::Fold>> = None;
+        for part in parts {
+            let Some(part) = part else {
+                return Err(QueryEvaluationError::Cancelled.into());
+            };
+            folds = Some(match folds {
+                None => part,
+                Some(before) => before
+                    .into_iter()
+                    .zip(part)
+                    .map(|(a, b)| a.merge(b))
+                    .collect(),
+            });
+        }
+        Ok(folds
+            .expect("a large group has parts")
+            .into_iter()
+            .map(aggregate::Fold::finish)
+            .collect())
     }
 
     /// Ranks of `column`'s values in SPARQL's order. With `top = (k, descending)` only the
@@ -5211,6 +5304,8 @@ impl<'a> Context<'a> {
         variables: &[Variable],
         aggregates: &[(Variable, AggregateExpression)],
     ) -> NativeResult<Solutions> {
+        // Per row: its keys' copy, its group and its place in the group's members.
+        let _working = self.working(solutions.table.len() * (4 + 8 * variables.len() + 8))?;
         let key_table = if variables.is_empty() {
             IdTable::from_rows(0, std::iter::repeat_n(&[][..], solutions.table.len()))
         } else {
