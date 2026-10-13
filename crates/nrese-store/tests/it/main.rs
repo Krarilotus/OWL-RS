@@ -28,3 +28,4 @@ mod scope_tests;
 mod shacl_gate_tests;
 mod store_service_tests;
 mod user_rules_tests;
+mod write_path_tests;

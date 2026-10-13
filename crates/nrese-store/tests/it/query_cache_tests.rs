@@ -2,6 +2,7 @@
 //! until the next commit, every user gets the answer of their own access, concurrent
 //! requests compute a query once, pinned results stay, and a zero budget turns it off.
 
+use crate::support::Writes;
 use std::sync::Arc;
 
 use nrese_sparql::GraphAccess;

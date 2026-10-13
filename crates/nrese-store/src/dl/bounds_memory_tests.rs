@@ -11,7 +11,7 @@ fn store(limit: u64) -> StoreService {
     .unwrap();
     // An existential conclusion takes the U1 route, not the OWL 2 RL shortcut.
     store
-        .execute_update_str(
+        .update_str_ungated(
             "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
          PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
          INSERT DATA { :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ;

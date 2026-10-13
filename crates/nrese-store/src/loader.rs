@@ -14,7 +14,10 @@ use crate::rdf_io::{BlankNodes, file_base_iri, parse_graph};
 /// Loads the configured ontology file into the default graph, if one is configured. A
 /// configured but missing file is an error. Idempotent: the file's own blank-node labels
 /// are kept, so loading it again after a restart adds nothing.
-pub fn preload_ontology(engine: &Engine, config: &StoreConfig) -> StoreResult<Option<PathBuf>> {
+pub(crate) fn preload_ontology(
+    engine: &Engine,
+    config: &StoreConfig,
+) -> StoreResult<Option<PathBuf>> {
     let Some(ontology_path) = config.ontology_path.clone() else {
         return Ok(None);
     };

@@ -218,6 +218,9 @@ pub struct Explanation {
     pub steps: Vec<PlanStep>,
     /// Solutions (1 or 0 for ASK); CONSTRUCT and DESCRIBE count triples.
     pub rows: u64,
+    /// Stored terms the executor decoded to evaluate expressions, orders and aggregates
+    /// (the output's terms aren't counted): what id-level evaluation saves.
+    pub decoded: u64,
     pub micros: u64,
     /// What the OWL 2 QL rewriting did, and whether the answers are complete; `None` where
     /// it doesn't apply.
@@ -252,13 +255,14 @@ pub fn explain_query<V: ReadView>(
 ) -> Result<Explanation, QueryEvaluationError> {
     let start = std::time::Instant::now();
     let snapshot = view.evaluation_snapshot();
-    let (rewrites, steps, rows, ql) =
+    let (rewrites, steps, rows, decoded, ql) =
         crate::native::explain(&snapshot, query, &for_view(view, options))?;
     Ok(Explanation {
         executor: "native",
         rewrites,
         steps,
         rows,
+        decoded,
         micros: start.elapsed().as_micros() as u64,
         ql,
         completeness: None,

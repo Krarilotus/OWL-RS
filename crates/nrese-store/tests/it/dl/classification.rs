@@ -172,9 +172,7 @@ fn the_store_classifies_as_the_tableau_driver_on_random_ontologies() {
             .iter()
             .map(|t| t.map(|x| table.text[x as usize].clone()).join(" ") + " .\n")
             .collect();
-        dl.store()
-            .execute_update_str(&format!("INSERT DATA {{ {data} }}"))
-            .expect("load");
+        crate::support::load_past_the_pipeline(dl.store(), &data);
         let report = dl
             .store()
             .classify(&ReadScope::All)

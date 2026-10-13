@@ -3,12 +3,24 @@
 //!
 //! RDF 1.2 allows a triple term only as an object, so the scan of the triple pattern it
 //! stands in always binds it. A triple term pattern with variables (or blank nodes) inside
-//! becomes a fresh variable in that scan, and its parts are taken apart with `SUBJECT`,
-//! `PREDICATE` and `OBJECT`: a `BIND` where a variable is first bound, a
-//! `FILTER(sameTerm(…))` where it is bound already, and `isTRIPLE` on the fresh variable.
-//! Nested triple term patterns get fresh variables of their own the same way. Every
-//! operator and optimisation of the executor then applies unchanged; ground triple terms
-//! stay constants (dictionary lookups).
+//! becomes a fresh variable in that scan, and either:
+//!
+//! - **composed**, where the basic graph pattern binds every variable of it elsewhere (an
+//!   edge `?a :knows ?b` beside its reifier's `?r rdf:reifies <<( ?a :knows ?b )>>`): one
+//!   condition `sameTerm(?t, TRIPLE(?a, :knows, ?b))`. The joins use it both ways
+//!   (`triple_joins`): from bound parts to the triple term by one hash probe, then the
+//!   reifier by the index; or from the triple term to its parts, read from its key. A hop
+//!   costs a few probes per edge, not a scan of every reifier;
+//! - **taken apart** otherwise, with `SUBJECT`, `PREDICATE` and `OBJECT`: a `BIND` where a
+//!   variable is first bound, a `FILTER(sameTerm(…))` where it is bound already, and
+//!   `isTRIPLE` on the fresh variable. Nested triple term patterns get fresh variables of
+//!   their own the same way.
+//!
+//! The conditions that read only what the pattern binds itself go into it, so the joins
+//! apply them as soon as their variables are bound; the others follow the `BIND`s. They
+//! are evaluated on ids, nothing decoded (`fast`). Every operator and optimisation of the
+//! executor then applies unchanged; ground triple terms stay constants (dictionary
+//! lookups).
 
 use std::collections::HashSet;
 
@@ -209,6 +221,7 @@ impl Rewriter {
                 bound.insert(v.clone());
             }
         }
+        let plain = bound.clone();
         let mut parts = Parts {
             bound,
             extends: Vec::new(),
@@ -221,7 +234,11 @@ impl Rewriter {
                     TermPattern::Triple(inner) if !ground(inner) => {
                         let v = r.fresh();
                         parts.bound.insert(v.clone());
-                        r.take_apart(&v, inner, &mut parts);
+                        if within(inner, &plain) {
+                            parts.same(v.clone().into(), composed(inner));
+                        } else {
+                            r.take_apart(&v, inner, &mut parts);
+                        }
                         v.into()
                     }
                     other => other.clone(),
@@ -238,18 +255,32 @@ impl Rewriter {
         let mut pattern = GraphPattern::Bgp {
             patterns: rewritten,
         };
-        // One `Extend` and one balanced conjunction, however many parts (ADR-0012).
+        // The conditions on what the pattern binds itself inside it, the others after the
+        // parts' `BIND`s: one `Extend` and two balanced conjunctions, however many parts
+        // (ADR-0012).
+        let extended: HashSet<&Variable> = parts.extends.iter().map(|(v, _)| v).collect();
+        let (late, early): (Vec<Expression>, Vec<Expression>) =
+            parts.filters.into_iter().partition(|condition| {
+                super::expression_variables(condition)
+                    .iter()
+                    .any(|v| extended.contains(v))
+            });
+        let filtered =
+            |pattern: GraphPattern, conditions: Vec<Expression>| match Expression::balanced(
+                conditions,
+                Expression::And,
+            ) {
+                Some(expr) => GraphPattern::Filter {
+                    expr,
+                    inner: Box::new(pattern),
+                },
+                None => pattern,
+            };
+        pattern = filtered(pattern, early);
         for (variable, expression) in parts.extends {
             pattern = pattern.extend(variable, expression);
         }
-        let filter = Expression::balanced(parts.filters, Expression::And);
-        match filter {
-            Some(expr) => GraphPattern::Filter {
-                expr,
-                inner: Box::new(pattern),
-            },
-            None => pattern,
-        }
+        filtered(pattern, late)
     }
 
     /// The conditions that make the term bound to `whole` match `pattern`.
@@ -275,7 +306,7 @@ impl Rewriter {
                 TermPattern::NamedNode(n) => parts.same(value, n.clone().into()),
                 TermPattern::Literal(l) => parts.same(value, l.clone().into()),
                 TermPattern::Triple(inner) if ground(inner) => {
-                    parts.same(value, constant_triple(inner));
+                    parts.same(value, composed(inner));
                 }
                 TermPattern::Triple(inner) => {
                     let v = self.fresh();
@@ -310,14 +341,29 @@ impl Parts {
     }
 }
 
-/// A ground triple term pattern as an expression: `TRIPLE(s, p, o)` of its constants.
-fn constant_triple(t: &TriplePattern) -> Expression {
+/// Whether every variable and blank node of `t` is among `bound`.
+fn within(t: &TriplePattern, bound: &HashSet<Variable>) -> bool {
+    let part = |p: &TermPattern| match p {
+        TermPattern::Variable(v) => bound.contains(v),
+        TermPattern::BlankNode(b) => bound.contains(&blank_variable(b)),
+        TermPattern::NamedNode(_) | TermPattern::Literal(_) => true,
+        TermPattern::Triple(t) => within(t, bound),
+    };
+    let predicate = match &t.predicate {
+        NamedNodePattern::Variable(v) => bound.contains(v),
+        NamedNodePattern::NamedNode(_) => true,
+    };
+    part(&t.subject) && predicate && part(&t.object)
+}
+
+/// A triple term pattern as an expression: `TRIPLE(s, p, o)` of its parts, nested ones
+/// composed the same way.
+fn composed(t: &TriplePattern) -> Expression {
     let part = |p: &TermPattern| -> Expression {
         match p {
             TermPattern::NamedNode(n) => n.clone().into(),
             TermPattern::Literal(l) => l.clone().into(),
-            TermPattern::Triple(t) => constant_triple(t),
-            // Not reached: the pattern is ground.
+            TermPattern::Triple(t) => composed(t),
             TermPattern::Variable(v) => v.clone().into(),
             TermPattern::BlankNode(b) => blank_variable(b).into(),
         }

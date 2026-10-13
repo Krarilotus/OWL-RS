@@ -5235,6 +5235,150 @@ fn triple_terms_and_base_directions_equal_the_reference() {
     );
 }
 
+/// Edges with properties as RDF 1.2 reifiers (the property-graph mapping) against the
+/// reference: hops whose triple terms the joins compose from the edge or take apart into
+/// it (`triple_joins`), edges without their base triple, several reifiers of one edge,
+/// literal objects, nested triple terms, parts bound by `VALUES` (a node the store lacks
+/// included), `OPTIONAL` and `EXISTS`, and `SUBJECT`/`OBJECT`/`TRIPLE` on ids in `BIND`
+/// and `FILTER`. Enough queries must join through a triple term to say so.
+#[test]
+fn reified_edges_hop_through_triple_terms_as_the_reference() {
+    let mut rng = Rng::seeded(20_261_013);
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+    let reifies_node = NamedNode::new_unchecked(&reifies[1..reifies.len() - 1]);
+    let mut checked = 0;
+    let mut with_solutions = 0;
+    let mut linked = 0;
+    let covered = |checked: usize, with_solutions: usize| with_solutions > checked / 3;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 40, covered(checked, with_solutions)) {
+            break;
+        }
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let mut insert = |s: NamedNode, p: NamedNode, o: Term| {
+            tx.insert(Quad::new(s, p, o, GraphName::DefaultGraph).as_ref());
+        };
+        for i in 0..8 {
+            if rng.below(3) != 0 {
+                let name = Literal::new_simple_literal(format!("n{i}"));
+                insert(ex(&format!("n{i}")), ex("name"), name.into());
+            }
+        }
+        for edge in 0..10 + rng.below(30) {
+            let a = ex(&format!("n{}", rng.below(8)));
+            let p = ex(rng.pick(&["knows", "likes"]));
+            let b: Term = match rng.below(6) {
+                0 => Literal::new_simple_literal(format!("v{}", rng.below(3))).into(),
+                _ => ex(&format!("n{}", rng.below(8))).into(),
+            };
+            if rng.below(5) != 0 {
+                insert(a.clone(), p.clone(), b.clone());
+            }
+            let triple = nrese_rdf::Triple::new(a, p, b);
+            for k in 0..rng.below(3) {
+                let r = ex(&format!("r{edge}_{k}"));
+                insert(r.clone(), reifies_node.clone(), triple.clone().into());
+                let since = Literal::new_typed_literal(rng.below(5).to_string(), xsd::INTEGER);
+                insert(r.clone(), ex("since"), since.into());
+                if rng.below(3) == 0 {
+                    let source = ex(&format!("src{}", rng.below(2)));
+                    insert(r, ex("source"), source.into());
+                }
+            }
+            // A statement about the edge, itself reified.
+            if rng.below(5) == 0 {
+                let witness = ex(&format!("n{}", rng.below(8)));
+                let says = nrese_rdf::Triple::new(witness, ex("says"), triple);
+                insert(ex(&format!("w{edge}")), reifies_node.clone(), says.into());
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for query_case in 0..30 {
+            let pattern = match rng.below(12) {
+                0 => format!("?a ?p ?b . ?r {reifies} <<( ?a ?p ?b )>> . ?r <{EX}since> ?s ."),
+                1 => format!(
+                    "<{EX}n1> <{EX}knows> ?b . ?r {reifies} <<( <{EX}n1> <{EX}knows> ?b )>> . \
+                     ?r <{EX}since> ?s ."
+                ),
+                2 => format!(
+                    "?r <{EX}since> {} . ?r {reifies} <<( ?a <{EX}knows> ?b )>> . \
+                     ?a <{EX}knows> ?b .",
+                    rng.below(5)
+                ),
+                3 => format!(
+                    "?a <{EX}knows> ?b . ?r1 {reifies} <<( ?a <{EX}knows> ?b )>> . \
+                     ?b <{EX}knows> ?c . ?r2 {reifies} <<( ?b <{EX}knows> ?c )>> . \
+                     ?r2 <{EX}since> ?s ."
+                ),
+                4 => format!("?r {reifies} <<( <{EX}n2> ?p ?b )>> . ?r <{EX}since> ?s ."),
+                5 => format!("?r {reifies} <<( ?a <{EX}knows> ?b )>> . ?a <{EX}name> ?n ."),
+                6 => format!(
+                    "?w {reifies} <<( ?x <{EX}says> <<( ?a ?p ?b )>> )>> . ?a ?p ?b . \
+                     ?x <{EX}name> ?n ."
+                ),
+                7 => format!(
+                    "VALUES ?b {{ <{EX}n1> <{EX}n3> <{EX}nowhere> }} ?a <{EX}knows> ?b . \
+                     ?r {reifies} <<( ?a <{EX}knows> ?b )>> ."
+                ),
+                8 => format!(
+                    "?a <{EX}likes> ?b . OPTIONAL {{ ?r {reifies} <<( ?a <{EX}likes> ?b )>> . \
+                     ?r <{EX}source> ?src }}"
+                ),
+                9 => format!(
+                    "?a <{EX}knows> ?b . FILTER({} EXISTS {{ ?r {reifies} <<( ?a <{EX}knows> ?b )>> }})",
+                    rng.pick(&["", "NOT"])
+                ),
+                10 => format!(
+                    "?r {reifies} ?t . BIND(SUBJECT(?t) AS ?a) BIND(OBJECT(?t) AS ?b) \
+                     ?a <{EX}knows> ?b . FILTER(sameTerm(?t, TRIPLE(?a, <{EX}knows>, ?b)))"
+                ),
+                _ => format!(
+                    "?r {reifies} ?t . ?a ?p ?b . FILTER(sameTerm(?t, TRIPLE(?a, ?p, ?b)) {})",
+                    rng.pick(&["", "&& isIRI(?b)", "|| sameTerm(SUBJECT(?t), ?b)"])
+                ),
+            };
+            let (projection, modifier) = match rng.below(3) {
+                0 => ("(COUNT(*) AS ?count)", ""),
+                1 => ("*", " ORDER BY ?a ?b ?c ?p ?r ?r1 ?r2 ?s ?n ?w ?x ?t ?src"),
+                _ => ("*", ""),
+            };
+            let text = format!("SELECT {projection} WHERE {{ {pattern} }}{modifier}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            assert!(runs_natively(&query), "runs natively: {text}");
+            let options = QueryOptions::default();
+            let ordered = !modifier.is_empty();
+            let native = rows(
+                evaluate_query(&snapshot, &query, &options).unwrap(),
+                ordered,
+            );
+            let expected = rows(reference(&snapshot, &query, &options).unwrap(), ordered);
+            assert_eq!(
+                native, expected,
+                "dataset {dataset_case}, query {query_case}: {text}"
+            );
+            let explained = explain_query(&snapshot, &query, &options).unwrap();
+            linked += usize::from(
+                explained
+                    .steps
+                    .iter()
+                    .any(|step| step.operator == "triple term join"),
+            );
+            checked += 1;
+            // A count of none is no solution.
+            with_solutions += usize::from(expected.iter().any(|row| !row.starts_with("\"0\"^^")));
+        }
+    }
+    assert!(
+        covered(checked, with_solutions),
+        "{with_solutions} of {checked} with solutions"
+    );
+    assert!(linked > checked / 5, "{linked} of {checked} through a link");
+}
+
 /// GROUP BY over a cross product (`Context::group_crossed`), grouped in chunks of one row
 /// of the keyed side: keys from a subquery or a pattern (repeated keys stay in one chunk),
 /// NOT EXISTS and comparisons across the sides, an OPTIONAL on the other side, and the

@@ -54,6 +54,7 @@ mod spatial;
 mod stream;
 mod strings;
 mod substitute;
+mod triple_joins;
 mod triple_terms;
 pub(crate) mod typed_results;
 pub(crate) mod value;
@@ -64,7 +65,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use crate::results::{
@@ -281,7 +282,8 @@ pub(crate) fn explain(
             .try_fold(0usize, |count, triple| triple.map(|_| count + 1))?
         }
     };
-    Ok((rewrites, steps, rows as u64, ql))
+    let decoded = ctx.decodes.load(AtomicOrdering::Relaxed);
+    Ok((rewrites, steps, rows as u64, decoded, ql))
 }
 
 /// The plan `query` would run as, after the rewrites, with estimated rows per node
@@ -301,10 +303,12 @@ pub(crate) fn plan(
     Ok((rewrites, steps, ql))
 }
 
-/// The rewrites, the steps with their rows, the rows, and what the QL rewriting did.
+/// The rewrites, the steps with their rows, the rows, the terms decoded, and what the QL
+/// rewriting did.
 type ExplainParts = (
     Vec<&'static str>,
     Vec<PlanStep>,
+    u64,
     u64,
     Option<crate::ql::QlReport>,
 );
@@ -1168,6 +1172,9 @@ struct Context<'a> {
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
     decoded: RefCell<HashMap<u64, Option<Term>>>,
+    /// Stored terms decoded for expressions, orders and aggregates (EXPLAIN's `decoded`;
+    /// the output's aren't counted).
+    decodes: AtomicU64,
     /// Per aggregate argument, the variable it reads and id: its number for SUM and AVG
     /// ([`Context::numeric_pass`]), kept for the whole evaluation. Keyed by the expression
     /// itself, not its address: patterns made during the evaluation (substituted
@@ -1298,6 +1305,7 @@ impl<'a> Context<'a> {
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
             decoded: RefCell::default(),
+            decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
             // What this evaluation holds, counted on its own (what it leaves behind is
@@ -1447,6 +1455,7 @@ impl<'a> Context<'a> {
         if let Some(term) = decoded.get(&id) {
             return term.clone();
         }
+        self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
         let term = self.snapshot.decode(TermId::from_raw(id));
         // Bounded: a scan over millions of distinct labels must not keep them all.
         if decoded.len() < DECODE_CACHE_ENTRIES {
@@ -1586,8 +1595,24 @@ impl<'a> Context<'a> {
         } else {
             (solutions, expression.clone(), 0)
         };
+        // A triple term's part or `TRIPLE(…)` on ids ([`fast::IdTerm`]); other rows and
+        // expressions by the generic evaluator.
+        let on_ids = fast::compile_term(&plain, &self.snapshot)
+            .filter(|term| matches!(term, fast::IdTerm::Part(..) | fast::IdTerm::Triple(_)));
         let values: Vec<u64> = (0..solutions.table.len())
             .map(|row| {
+                if let Some(term) = &on_ids {
+                    let value = |v: &Variable| {
+                        solutions
+                            .column(v)
+                            .map_or(UNDEF, |c| solutions.table.get(row, c))
+                    };
+                    match term.value(&value, &self.snapshot) {
+                        fast::Id::Stored(id) => return id.raw(),
+                        fast::Id::Error => return UNDEF,
+                        fast::Id::Absent | fast::Id::Unknown => {}
+                    }
+                }
                 self.evaluator
                     .in_solution(row as u64, || {
                         self.evaluator.eval(&plain, &self.binding(&solutions, row))
@@ -2463,7 +2488,8 @@ impl<'a> Context<'a> {
                 }
             })
             .collect();
-        let plan = self.join_order(&scans, &planned, self.trace.is_some())?;
+        let links = triple_joins::planned(filters);
+        let plan = self.join_order(&scans, &planned, &links, self.trace.is_some())?;
         let estimate = |step: usize| Some(plan.rows[step].max(0.0).round() as u64);
         let order = &plan.order;
         // Each prefix of the order is a part of the result cache ([`cached::Joins`]): the
@@ -2528,12 +2554,24 @@ impl<'a> Context<'a> {
                 let probe = !shared.is_empty()
                     && self.merge_set.is_none()
                     && (result.table.len() as u64).saturating_mul(PROBE_FACTOR) < counts[next];
+                // A triple term between them: composed from the bound parts or taken apart
+                // into the pattern's (`triple_joins`).
+                let through = (!self.as_written && ranged[next].is_none())
+                    .then(|| triple_joins::link(filters, &result, &scans[next], &self.snapshot))
+                    .flatten()
+                    .and_then(|link| self.linked_rows(&result, &link).map(|rows| (link, rows)));
                 // No shared variable, but `?a = ?b` between them: a join, not a cross
                 // product (`equijoin`).
-                let linked = (shared.is_empty() && !self.as_written && ranged[next].is_none())
-                    .then(|| equijoin::link(filters, &result, &scans[next].vars()))
-                    .flatten();
-                result = if let Some((a, b, same_term)) = &linked {
+                let linked = (through.is_none()
+                    && shared.is_empty()
+                    && !self.as_written
+                    && ranged[next].is_none())
+                .then(|| equijoin::link(filters, &result, &scans[next].vars()))
+                .flatten();
+                let triple = through.is_some();
+                result = if let Some((link, rows)) = through {
+                    self.triple_join(result, &scans[next], counts[next], &link, rows)?
+                } else if let Some((a, b, same_term)) = &linked {
                     self.equality_join(result, &scans[next], counts[next], a, b, *same_term)?
                 } else if probe {
                     self.probe_join(result, &scans[next], &shared)?
@@ -2548,13 +2586,14 @@ impl<'a> Context<'a> {
                 };
                 if self.trace.is_some() {
                     let operator = match (probe, shared.is_empty()) {
+                        _ if triple => "triple term join",
                         _ if linked.is_some() => "equality join",
                         (true, _) => "index join",
                         (false, true) => "cross product",
                         (false, false) => "join",
                     };
                     let mut detail = triples[next].to_string();
-                    if probe && linked.is_none() {
+                    if probe && linked.is_none() && !triple {
                         detail = self.probed_detail(detail);
                     }
                     self.note(operator, detail, estimate(step), result.table.len(), start);
@@ -2730,7 +2769,10 @@ impl<'a> Context<'a> {
             .collect();
         let mut left: Vec<usize> = (0..scans.len()).collect();
         while !left.is_empty() {
-            let connected = |i: &usize| scans[*i].vars().iter().any(|v| result.column(v).is_some());
+            let connected = |i: &usize| {
+                scans[*i].vars().iter().any(|v| result.column(v).is_some())
+                    || triple_joins::link(filters, &result, &scans[*i], &self.snapshot).is_some()
+            };
             let at = left
                 .iter()
                 .enumerate()
@@ -2779,18 +2821,27 @@ impl<'a> Context<'a> {
                     *d = d.min(estimated.max(1.0));
                 }
             }
-            result = if probe {
+            let through = triple_joins::link(filters, &result, &scans[next], &self.snapshot)
+                .and_then(|link| self.linked_rows(&result, &link).map(|rows| (link, rows)));
+            let triple = through.is_some();
+            result = if let Some((link, rows)) = through {
+                self.triple_join(result, &scans[next], counts[next], &link, rows)?
+            } else if probe {
                 self.probe_join(result, &scans[next], &shared)?
             } else {
                 let scanned = self.scan(&scans[next], shared.first())?;
                 self.join(result, scanned)?
             };
             if self.trace.is_some() {
-                let operator = if probe { "index join" } else { "join" };
+                let operator = match (triple, probe) {
+                    (true, _) => "triple term join",
+                    (false, true) => "index join",
+                    (false, false) => "join",
+                };
                 let rows = result.table.len();
                 let estimate = Some(estimated.round() as u64);
                 let mut detail = triples[next].to_string();
-                if probe {
+                if probe && !triple {
                     detail = self.probed_detail(detail);
                 }
                 self.note(operator, detail, estimate, rows, start);
@@ -2890,6 +2941,7 @@ impl<'a> Context<'a> {
         &self,
         scans: &[ScanPattern],
         counts: &[u64],
+        links: &[(Variable, Vec<Variable>)],
         estimated: bool,
     ) -> NativeResult<plan::Plan> {
         if scans.is_empty() {
@@ -2905,7 +2957,7 @@ impl<'a> Context<'a> {
             return Ok(plan::Plan { order, rows });
         }
         let mut vars: Vec<Variable> = Vec::new();
-        let inputs = self.plan_inputs(scans, counts, &mut vars);
+        let inputs = self.plan_inputs(scans, counts, links, &mut vars);
         if scans.len() <= 2 {
             // The smaller pattern first; the join's rows by the orderer's model (a star's
             // pair by the characteristic sets, an edge and a star on its object by the
@@ -2941,11 +2993,14 @@ impl<'a> Context<'a> {
 
     /// The join orderer's inputs for `scans` with their `counts`: distinct values per
     /// variable (numbered by their place in `vars`, which gets the new ones), stars and
-    /// edges for the characteristic sets and pairs.
+    /// edges for the characteristic sets and pairs. A pattern that binds every variable a
+    /// link's other side reads (`triple_joins::planned`) also has the link's variable, as
+    /// many values as matches: the link joins it to the patterns that bind that variable.
     fn plan_inputs(
         &self,
         scans: &[ScanPattern],
         counts: &[u64],
+        links: &[(Variable, Vec<Variable>)],
         vars: &mut Vec<Variable>,
     ) -> Vec<plan::Input> {
         let mut index_of = |v: Variable| variable_index(vars, v);
@@ -2965,17 +3020,29 @@ impl<'a> Context<'a> {
                     }
                     _ => None,
                 };
+                let own = scan.vars();
+                let linked: Vec<Variable> = links
+                    .iter()
+                    .filter(|(v, read)| !own.contains(v) && read.iter().all(|r| own.contains(r)))
+                    .map(|(v, _)| v.clone())
+                    .collect();
+                let mut input_vars: Vec<(usize, u64)> = own
+                    .into_iter()
+                    .map(|v| {
+                        let d = self.distinct(scan, &v, count).min(count);
+                        (index_of(v), d)
+                    })
+                    .collect();
+                for v in linked {
+                    let at = index_of(v);
+                    if input_vars.iter().all(|&(i, _)| i != at) {
+                        input_vars.push((at, count));
+                    }
+                }
                 plan::Input {
                     count,
                     edge_object,
-                    vars: scan
-                        .vars()
-                        .into_iter()
-                        .map(|v| {
-                            let d = self.distinct(scan, &v, count).min(count);
-                            (index_of(v), d)
-                        })
-                        .collect(),
+                    vars: input_vars,
                     star,
                     overlaps,
                 }
@@ -3968,13 +4035,14 @@ impl<'a> Context<'a> {
         let computed: &[Term] = &computed;
         let token = self.cancellation.as_ref();
         let snapshot: &Snapshot = &self.snapshot;
+        let decodes = &self.decodes;
         let parts: Vec<Option<Vec<bool>>> = (0..rows.div_ceil(PARALLEL_EXPRESSION_ROWS))
             .into_par_iter()
             .map(|i| {
                 if token.is_some_and(CancellationToken::is_cancelled) {
                     return None;
                 }
-                let decoder = Decoder::new(snapshot, computed);
+                let decoder = Decoder::new(snapshot, computed, decodes);
                 let range =
                     i * PARALLEL_EXPRESSION_ROWS..((i + 1) * PARALLEL_EXPRESSION_ROWS).min(rows);
                 Some(mask.rows(range, &|id| decoder.term(id)))
@@ -4091,13 +4159,14 @@ impl<'a> Context<'a> {
         let computed: &[Term] = &computed;
         let token = self.cancellation.as_ref();
         let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
+        let decodes = &self.decodes;
         let parts: Vec<Option<Vec<Vec<Agg>>>> = bounds
             .par_windows(2)
             .map(|window| {
                 if token.is_some_and(CancellationToken::is_cancelled) {
                     return None;
                 }
-                let decoder = Decoder::new(snapshot, computed);
+                let decoder = Decoder::new(snapshot, computed, decodes);
                 let term = |id: u64| decoder.term(id);
                 let aggregator = Aggregator {
                     evaluator,
@@ -4161,6 +4230,8 @@ impl<'a> Context<'a> {
             && distinct.iter().all(|&id| computed_index(id).is_none())
         {
             let snapshot = &*self.snapshot;
+            self.decodes
+                .fetch_add(distinct.len() as u64, AtomicOrdering::Relaxed);
             distinct
                 .par_iter()
                 .map(|&id| {
@@ -4780,10 +4851,11 @@ impl<'a> Context<'a> {
                 let computed = self.computed.borrow();
                 let computed: &[Term] = &computed;
                 let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
+                let decodes = &self.decodes;
                 missing
                     .par_chunks(PARALLEL_EXPRESSION_ROWS)
                     .flat_map_iter(|part| {
-                        let decoder = Decoder::new(snapshot, computed);
+                        let decoder = Decoder::new(snapshot, computed, decodes);
                         let term = |id: u64| decoder.term(id);
                         let aggregator = Aggregator {
                             evaluator,
@@ -5052,20 +5124,26 @@ struct Decoder<'a> {
     snapshot: &'a Snapshot,
     computed: &'a [Term],
     cache: RefCell<HashMap<u64, Option<Term>>>,
+    /// The query's count of decoded terms ([`Context::decodes`]).
+    decodes: &'a AtomicU64,
 }
 
 impl<'a> Decoder<'a> {
-    fn new(snapshot: &'a Snapshot, computed: &'a [Term]) -> Self {
+    fn new(snapshot: &'a Snapshot, computed: &'a [Term], decodes: &'a AtomicU64) -> Self {
         Self {
             snapshot,
             computed,
             cache: RefCell::default(),
+            decodes,
         }
     }
 
     fn term(&self, id: u64) -> Option<Term> {
         if let Some(term) = self.cache.borrow().get(&id) {
             return term.clone();
+        }
+        if id != UNDEF && computed_index(id).is_none() {
+            self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
         }
         let term = decode(self.snapshot, self.computed, id);
         let mut cache = self.cache.borrow_mut();
@@ -5099,7 +5177,7 @@ impl FilterMask<'_> {
                             .column(v)
                             .map_or(UNDEF, |c| table.get(row, c))
                     };
-                    fast.eval(&value, view)
+                    fast.eval(&value, view, self.snapshot)
                 });
                 match decided {
                     Some(fast::Tri::True) => true,
