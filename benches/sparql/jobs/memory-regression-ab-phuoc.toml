@@ -1,0 +1,23 @@
+# No regression elsewhere: the fast suite's query and operator cases on the base e0f84185
+# and the branch at 1d6dca4e, A-B-B-A per group of cases (two groups, so each chunk stays
+# within the queue's 30 minutes), 2 repetitions each, natively on Phuoc-Yu; compared with
+# fast.py compare. Generated data read through links in a directory of this job's own.
+id = "sparql-memory-regression-ab-phuoc-1"
+group = "sparql"
+host = "phuoc-yu"
+checkout = "opt/sparql-memory"
+commands = [
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/e0f84185/fast", "NRESE_FAST_REVISION=e0f84185", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-star,q-chain,q-cycles,q-snowflake,q-paths,q-sideways,q-large-result,q-topk", "--reps", "2", "--label", "base-q-a"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/1d6dca4e/fast", "NRESE_FAST_REVISION=1d6dca4e", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-star,q-chain,q-cycles,q-snowflake,q-paths,q-sideways,q-large-result,q-topk", "--reps", "2", "--label", "new-q-b"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/1d6dca4e/fast", "NRESE_FAST_REVISION=1d6dca4e", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-star,q-chain,q-cycles,q-snowflake,q-paths,q-sideways,q-large-result,q-topk", "--reps", "2", "--label", "new-q-c"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/e0f84185/fast", "NRESE_FAST_REVISION=e0f84185", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-star,q-chain,q-cycles,q-snowflake,q-paths,q-sideways,q-large-result,q-topk", "--reps", "2", "--label", "base-q-d"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/e0f84185/fast", "NRESE_FAST_REVISION=e0f84185", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "op-group,op-aggregates,op-optional,op-negation,op-strings,op-dates,index-join-keys,plan-estimates,parse-large,cache-replay", "--reps", "2", "--label", "base-op-a"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/1d6dca4e/fast", "NRESE_FAST_REVISION=1d6dca4e", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "op-group,op-aggregates,op-optional,op-negation,op-strings,op-dates,index-join-keys,plan-estimates,parse-large,cache-replay", "--reps", "2", "--label", "new-op-b"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/1d6dca4e/fast", "NRESE_FAST_REVISION=1d6dca4e", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "op-group,op-aggregates,op-optional,op-negation,op-strings,op-dates,index-join-keys,plan-estimates,parse-large,cache-replay", "--reps", "2", "--label", "new-op-c"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/e0f84185/fast", "NRESE_FAST_REVISION=e0f84185", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "op-group,op-aggregates,op-optional,op-negation,op-strings,op-dates,index-join-keys,plan-estimates,parse-large,cache-replay", "--reps", "2", "--label", "base-op-d"],
+]
+env = { NRESE_QUIET_DRAIN_S = "3600", NRESE_FAST_RUNTIME = "native", NRESE_FAST_DATA = "/home/krarilotus/owlrs/sparql-scratch/fast-data", NRESE_BENCH_REPORTS = "/home/krarilotus/owlrs/results/sparql-memory-regression-ab-phuoc-1" }
+needs = []
+window = "quiet"
+priority = 3
+est_min = 180
