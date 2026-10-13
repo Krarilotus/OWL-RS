@@ -4484,6 +4484,27 @@ impl<'a> Context<'a> {
                 ordered: false,
             });
         }
+        // COUNT of one pattern under a FILTER that only bounds a variable to id ranges:
+        // the index counts the ranges where it holds for every value, and the FILTER
+        // decides only the others' (decimals, typed literals).
+        if variables.is_empty()
+            && let [(target, aggregate)] = aggregates
+            && let GraphPattern::Filter {
+                expr,
+                inner: filtered,
+            } = inner
+            && let GraphPattern::Bgp { patterns } = &**filtered
+            && let [triple] = patterns.as_slice()
+            && let Some(count) = self.count_bounded(triple, expr, aggregate)?
+        {
+            let mut table = IdTable::new(1);
+            table.push_row(&[self.id(&integer(count))]);
+            return Ok(Solutions {
+                vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
         // COUNT(*) of a cyclic BGP: its worst-case-optimal join counts the solutions
         // instead of producing them (4-cycles of a social graph: 19.2 M two-paths
         // checked → two lists of 2-paths per node).
@@ -4510,6 +4531,54 @@ impl<'a> Context<'a> {
             table.push_row(&[self.id(&integer(count))]);
             return Ok(Solutions {
                 vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
+        // COUNT(DISTINCT ?k) of such a join: the values of ?k with solutions.
+        if variables.is_empty()
+            && let [(target, aggregate)] = aggregates
+            && let AggregateExpression::FunctionCall {
+                name: AggregateFunction::Count,
+                expr: Expression::Variable(key),
+                distinct: true,
+            } = aggregate
+            && let Some(values) = self.counts_per_value(inner, key, aggregates)?
+        {
+            let mut table = IdTable::new(1);
+            table.push_row(&[self.id(&integer(values.len() as u64))]);
+            return Ok(Solutions {
+                vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
+        // GROUP BY ?k with counts of such a join: its solutions per value of ?k.
+        if let [key] = variables
+            && let Some(values) = self.counts_per_value(inner, key, aggregates)?
+        {
+            let as_id = |n: u64| match TermId::inline_integer(n as i64) {
+                Some(id) => id.raw(),
+                None => self.id(&integer(n)),
+            };
+            let mut columns = vec![values.iter().map(|&(value, _)| value).collect::<Vec<_>>()];
+            let mut vars = vec![key.clone()];
+            for (target, aggregate) in aggregates {
+                let distinct = matches!(
+                    aggregate,
+                    AggregateExpression::FunctionCall { distinct: true, .. }
+                );
+                columns.push(
+                    values
+                        .iter()
+                        .map(|&(_, n)| as_id(if distinct { 1 } else { n }))
+                        .collect(),
+                );
+                vars.push(target.clone());
+            }
+            let table = IdTable::from_columns(columns).assume_sorted_by(vec![0]);
+            return self.produced(Solutions {
+                vars,
                 table,
                 ordered: false,
             });
@@ -4624,6 +4693,71 @@ impl<'a> Context<'a> {
             _ => self.eval(inner)?,
         };
         self.group_solutions(solutions, variables, aggregates)
+    }
+
+    /// `aggregate` (counting rows) of `triple` under `filter` where the filter only bounds
+    /// a variable to id ranges ([`ranges::bounded`]): range counts of the index, the
+    /// filter evaluated over the ranges it doesn't decide by id. `None` for other
+    /// patterns and filters.
+    fn count_bounded(
+        &self,
+        triple: &TriplePattern,
+        filter: &Expression,
+        aggregate: &AggregateExpression,
+    ) -> NativeResult<Option<u64>> {
+        if self.as_written
+            || search::is_search(triple, std::slice::from_ref(triple))
+            || self.is_spatial(triple)
+        {
+            return Ok(None);
+        }
+        let Some(scan) = self.scan_pattern(triple) else {
+            return Ok(None);
+        };
+        let Some(bounded) = ranges::bounded(filter, &self.snapshot) else {
+            return Ok(None);
+        };
+        let Some(component) = (0..3).find(|&c| scan.slots[c].is_var(&bounded.variable)) else {
+            return Ok(None);
+        };
+        if scan.repeats_variable()
+            || scan.merged()
+            || !matches!(scan.slots[3], Slot::Const(_))
+            || !counts_rows(aggregate, &scan)
+        {
+            return Ok(None);
+        }
+        let permutation = scan.permutation_for(Some(&bounded.variable));
+        if scan.first_free(permutation) != Some(component) {
+            return Ok(None);
+        }
+        let start = Instant::now();
+        let pattern = scan.quad_pattern();
+        let mut count = 0u64;
+        for &(low, high) in &bounded.exact {
+            let Some(n) =
+                self.snapshot
+                    .count_range_in(self.model, &pattern, permutation, low, high)
+            else {
+                return Ok(None);
+            };
+            count += n;
+        }
+        let mut checked = 0;
+        if !bounded.checked.is_empty() {
+            let rows = self.scan_ranges(&scan, permutation, &bounded.checked)?;
+            checked = rows.table.len();
+            count += self.filter(rows, filter)?.table.len() as u64;
+        }
+        if self.trace.is_some() {
+            let detail = format!(
+                "{triple} under {filter}: {} ranges counted by the index, {checked} values in {} more decided by the filter",
+                bounded.exact.len(),
+                bounded.checked.len()
+            );
+            self.note("range count", detail, Some(1), 1, start);
+        }
+        Ok(Some(count))
     }
 
     /// GROUP BY over a cross product: (filters over) a join of two patterns that share no
@@ -4821,6 +4955,9 @@ impl<'a> Context<'a> {
         }
         let width = plans.len();
         let table = &solutions.table;
+        // The numbers found, held while the rows are added up (and kept after only while
+        // few): charged, and a refusal ends the query at its next check.
+        let mut working = nrese_exec::Reservation::new(&*self.budget);
         // Every id's number, found once per query: the chunks of a cross product
         // ([`Self::group_crossed`]) share their values.
         for plan in &plans {
@@ -4841,6 +4978,13 @@ impl<'a> Context<'a> {
                 }
             }
             let missing: Vec<(u64, usize)> = missing.into_iter().collect();
+            let entry = 2 * std::mem::size_of::<(u64, Number)>() + 16;
+            if let Err(exceeded) = working.charge(missing.len() * entry) {
+                if self.overdrawn.get().is_none() {
+                    self.overdrawn.set(Some(exceeded));
+                }
+                return None;
+            }
             let number = |aggregator: &Aggregator<'_>, row: usize| {
                 let binding = aggregator.binding(solutions, row);
                 match aggregator.evaluator.eval(expr, &binding) {
