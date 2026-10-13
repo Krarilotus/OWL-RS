@@ -287,6 +287,53 @@ fn joins_are_counted_without_their_rows() {
     }
 }
 
+/// A measurement, not a guard: index-join-keys' queries on its data's shape (perf_lab's
+/// `entities`: a kind of 100 per entity, one random `link`), 250,000 entities, each query's
+/// EXPLAIN steps with their details and times. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn index_join_keys_explained() {
+    let n = 250_000u64;
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    for i in 0..n {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let link = (state >> 33) % n;
+        let e = ex(&format!("e{i}"));
+        let kind = ex(&format!("Kind{}", i % 100));
+        let to = ex(&format!("e{link}"));
+        let typed = Quad::new(e.clone(), rdf_type.clone(), kind, GraphName::DefaultGraph);
+        tx.insert(typed.as_ref());
+        tx.insert(Quad::new(e, ex("link"), to, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    for query in [
+        "SELECT (COUNT(*) AS ?n) WHERE { ?e a e:Kind7 . ?e e:link ?x . ?x e:link ?y }",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?e a ?k . ?e e:link ?x . ?x a e:Kind3 }",
+    ] {
+        for run in 0..3 {
+            let text = format!("PREFIX e: <{EX}> {query}");
+            let parsed = SparqlParser::new().parse_query(&text).unwrap();
+            let explained =
+                explain_query(&engine.snapshot(), &parsed, &QueryOptions::default()).unwrap();
+            eprintln!(
+                "{query} run {run}: {} µs, {} rows",
+                explained.micros, explained.rows
+            );
+            for step in &explained.steps {
+                eprintln!(
+                    "  {:>8} µs {:<16} rows {:>8} {}",
+                    step.micros, step.operator, step.rows, step.detail
+                );
+            }
+        }
+    }
+}
+
 /// `COUNT` of one pattern under a FILTER that bounds a variable to id ranges is a sum of
 /// the index's range counts (Sparqloscope 104, the literals among every statement's
 /// objects; 091-093, a number at least a bound): no match read where the ranges decide.

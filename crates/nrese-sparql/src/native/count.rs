@@ -35,6 +35,21 @@ const COMPACT_PAIRS: usize = 1 << 20;
 const CHECK_EVERY: usize = 1 << 12;
 /// Driving values per parallel chunk of a root pattern.
 const DRIVE_CHUNK: usize = 1 << 14;
+/// The fewest values a parallel part of a pass over listed values takes (its cursors
+/// cost their setup).
+const MIN_PART: usize = 1 << 8;
+
+/// Values per parallel part of a pass over `len` listed values: about four parts per
+/// thread, so a pass over few values uses every core as the index join's probes do (4,096
+/// rows a part), where parts of [`DRIVE_CHUNK`] left 25 K values to two of them (the merge
+/// gate's index-join-keys, 5.2x the base's time); between [`MIN_PART`] and [`DRIVE_CHUNK`].
+fn part_size(len: usize) -> usize {
+    parts_of(len, rayon::current_num_threads())
+}
+
+fn parts_of(len: usize, threads: usize) -> usize {
+    (len / (threads * 4).max(1)).clamp(MIN_PART, DRIVE_CHUNK)
+}
 
 /// Relative costs per index entry, for choosing the root: a group walk reads run lengths,
 /// a pattern read at the root streams its matches, a message by pairs reads, keeps and
@@ -1557,7 +1572,7 @@ impl Context<'_> {
         let reader = self.reader();
         let parts: Vec<Result<Vec<(u64, u64)>, bool>> = listed
             .entries
-            .par_chunks(DRIVE_CHUNK)
+            .par_chunks(part_size(listed.entries.len()))
             .map(|chunk| {
                 let mut partners = Partners::new(reader, atoms.len());
                 let mut buffer = Vec::new();
@@ -1831,7 +1846,7 @@ impl Context<'_> {
         // own (Sparqloscope 047: 30.5 M candidates, 4.1 s on one thread).
         let reader = self.reader();
         let parts: Vec<Result<(PerValue, usize), bool>> = candidates
-            .par_chunks(DRIVE_CHUNK)
+            .par_chunks(part_size(candidates.len()))
             .map(|chunk| {
                 let mut partners = Partners::new(reader, atoms.len());
                 let (mut buffer, mut out, mut read) = (Vec::new(), Vec::new(), 0);
@@ -2071,30 +2086,62 @@ impl Context<'_> {
         to: &Variable,
         stats: &mut Stats,
     ) -> Counted<Vec<u64>> {
+        // In parallel parts with cursors of their own, each part's partners charged while it
+        // collects them.
         let reader = self.reader();
-        let mut partners = Partners::new(reader, atoms.len());
-        let mut held = Reservation::new(&*self.budget);
-        let (mut out, mut values) = (Vec::new(), Vec::new());
-        for (n, &(value, weight)) in listing.entries.iter().enumerate() {
-            if n % CHECK_EVERY == 0 {
-                reader.check()?;
-            }
-            if weight == 0 {
-                continue;
-            }
-            if !partners.read(atoms, from, value, to, &mut values) {
-                return Err(Stop::Declined);
-            }
-            out.extend_from_slice(&values);
-            let bytes = (out.capacity() + values.capacity()) * 8;
-            if bytes > held.bytes() {
-                held.charge(bytes - held.bytes())
-                    .map_err(|e| Stop::Failed(QueryEvaluationError::MemoryLimit(e).into()))?;
+        let budget = &*self.budget;
+        let parts: Vec<Result<Vec<u64>, Halt>> = listing
+            .entries
+            .par_chunks(part_size(listing.entries.len()))
+            .map(|part| {
+                let mut partners = Partners::new(reader, atoms.len());
+                let mut held = Reservation::new(budget);
+                let (mut out, mut values) = (Vec::new(), Vec::new());
+                for (n, &(value, weight)) in part.iter().enumerate() {
+                    if n % CHECK_EVERY == 0
+                        && reader
+                            .cancellation
+                            .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        return Err(Halt::Cancelled);
+                    }
+                    if weight == 0 {
+                        continue;
+                    }
+                    if !partners.read(atoms, from, value, to, &mut values) {
+                        return Err(Halt::Declined);
+                    }
+                    out.extend_from_slice(&values);
+                    let bytes = (out.capacity() + values.capacity()) * 8;
+                    if bytes > held.bytes() {
+                        held.charge(bytes - held.bytes()).map_err(Halt::Memory)?;
+                    }
+                }
+                out.sort_unstable();
+                out.dedup();
+                Ok(out)
+            })
+            .collect();
+        reader.check()?;
+        let mut out = Vec::new();
+        for part in parts {
+            match part {
+                Ok(found) => out.extend(found),
+                Err(Halt::Cancelled) => {
+                    reader.check()?;
+                    return Err(Stop::Declined);
+                }
+                Err(Halt::Declined) => return Err(Stop::Declined),
+                Err(Halt::Memory(e)) => {
+                    return Err(Stop::Failed(QueryEvaluationError::MemoryLimit(e).into()));
+                }
             }
         }
         stats.probed += listing.entries.len();
+        let held = self.working(out.capacity() * 8)?;
         out.sort_unstable();
         out.dedup();
+        drop(held);
         Ok(out)
     }
 
@@ -2211,7 +2258,7 @@ impl Context<'_> {
         let reader = self.reader();
         let parts: Vec<Result<(u64, usize), bool>> = driver
             .entries
-            .par_chunks(DRIVE_CHUNK)
+            .par_chunks(part_size(driver.entries.len()))
             .map(|chunk| drive_chunk(reader, atoms, by, to, chunk, other))
             .collect();
         reader.check()?;
@@ -2291,6 +2338,20 @@ mod tests {
 
     /// Galloping lookups give what a search from the start gives, for ascending queries
     /// dense and sparse, hits and misses.
+    /// A pass over few values is cut into parts for every thread (the merge gate's
+    /// index-join-keys: 25 K values in two parts of 16,384 were 5.2x the index join's time);
+    /// over many, parts of at most [`DRIVE_CHUNK`]; never parts too small to pay for their
+    /// cursors.
+    #[test]
+    fn passes_take_a_part_per_thread() {
+        let parts = |len: usize, threads: usize| len.div_ceil(parts_of(len, threads));
+        assert!(parts(25_000, 16) >= 4 * 16 - 1, "{}", parts(25_000, 16));
+        assert_eq!(parts_of(100_000_000, 16), DRIVE_CHUNK);
+        assert_eq!(parts_of(1_000, 16), MIN_PART);
+        assert_eq!(parts_of(0, 16), MIN_PART);
+        assert_eq!(parts_of(25_000, 0), DRIVE_CHUNK);
+    }
+
     #[test]
     fn forward_lookups_find_what_a_full_search_finds() {
         let budget = Budget::unlimited();
