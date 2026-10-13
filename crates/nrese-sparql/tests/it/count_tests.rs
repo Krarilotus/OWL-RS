@@ -355,11 +355,18 @@ fn single_pattern_counts_equal_the_reference() {
 fn counted_joins_equal_the_reference() {
     let mut rng = Rng::seeded(20_261_013);
     let (mut checked, mut counted, mut nonzero) = (0usize, 0usize, 0usize);
-    let covered = |checked: usize, counted: usize, nonzero: usize| {
-        counted * 2 > checked && nonzero * 3 > checked
-    };
+    // Messages by pairs and from the parents' side, both.
+    let (mut paired, mut gathered) = (0usize, 0usize);
+    let covered =
+        |checked: usize, counted: usize, nonzero: usize, paired: usize, gathered: usize| {
+            counted * 2 > checked && nonzero * 3 > checked && paired > 20 && gathered > 20
+        };
     for case in 0.. {
-        if !draws_on(case, 30, covered(checked, counted, nonzero)) {
+        if !draws_on(
+            case,
+            30,
+            covered(checked, counted, nonzero, paired, gathered),
+        ) {
             break;
         }
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -400,17 +407,21 @@ fn counted_joins_equal_the_reference() {
                 options.read_model
             );
             let explained = explain_query(&snapshot, &query, &options).unwrap();
-            let by_messages = explained
+            let step = explained
                 .steps
                 .iter()
-                .any(|step| step.operator == "counted join");
-            counted += usize::from(by_messages);
+                .find(|step| step.operator == "counted join");
+            counted += usize::from(step.is_some());
+            if let Some(step) = step {
+                paired += usize::from(!step.detail.contains(" 0 pairs kept"));
+                gathered += usize::from(!step.detail.contains(" 0 matches weighed"));
+            }
             nonzero += usize::from(expected.iter().any(|row| !row.contains("n=\"0\"")));
             checked += 1;
         }
     }
     assert!(
-        covered(checked, counted, nonzero),
-        "{checked} checked, {counted} counted by message passing, {nonzero} not 0"
+        covered(checked, counted, nonzero, paired, gathered),
+        "{checked} checked, {counted} counted by message passing, {nonzero} not 0, {paired} with pairs, {gathered} gathered by parents"
     );
 }
