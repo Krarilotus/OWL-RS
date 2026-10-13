@@ -603,3 +603,41 @@ fn parts_are_shared_across_queries_through_the_result_cache() {
     );
     assert_eq!(explanation.rows, run(shared, &QueryOptions::default()).rows);
 }
+
+/// The same aggregate written differently (`WHERE`, a final dot) is the same part:
+/// Sparqloscope 084 is 053 so written, and QLever answered it from its cache (1.0 ms)
+/// where NRESE computed it again (21 ms on a first run).
+#[test]
+fn aggregates_written_differently_share_the_result_cache() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..1000u32 {
+        let number = Literal::new_typed_literal(i.to_string(), nrese_rdf::vocab::xsd::INTEGER);
+        let quad = Quad::new(
+            ex(&format!("n{i}")),
+            ex("count"),
+            number,
+            GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+    let cache = std::sync::Arc::new(nrese_sparql::ResultCache::new(16 << 20).admitting_all());
+    let cached = QueryOptions {
+        result_cache: Some(std::sync::Arc::clone(&cache)),
+        ..QueryOptions::default()
+    };
+    let run = |query: &str| {
+        let text = format!("PREFIX e: <{EX}> {query}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        explain_query(&engine.snapshot(), &query, &cached).unwrap()
+    };
+    run("SELECT (SUM(?o) AS ?sum) { ?s e:count ?o. }");
+    let again = run("SELECT (SUM(?o) AS ?sum) WHERE { ?s e:count ?o }");
+    assert!(
+        again.steps.iter().any(|s| s.cache == Some("hit")),
+        "{:?} {:#?}",
+        cache.stats(),
+        again.steps
+    );
+}
