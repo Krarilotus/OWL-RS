@@ -18,6 +18,24 @@ pub struct TextPosition {
 pub struct RdfSyntaxError {
     message: String,
     location: Range<TextPosition>,
+    /// The statement it is in, where the parser knows it.
+    statement: Option<Box<SkippedStatement>>,
+}
+
+/// The statement a syntax error is in: where it is in the document, and what reading it
+/// again on its own needs. A recovering parser ([`crate::RdfParser::recovering`]) goes
+/// on after it. Known for the line formats and for Turtle and TriG; built only for an
+/// error, so input without errors costs nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SkippedStatement {
+    /// Its text in the document: from its first character to where parsing resumed after
+    /// it (the line's end in N-Triples and N-Quads, past its `.` in Turtle and TriG).
+    pub span: Range<TextPosition>,
+    /// The directives in effect there (Turtle, TriG), as `@base` and `@prefix` lines: with
+    /// them its text reads on its own. Empty where nothing is in effect.
+    pub context: String,
+    /// The graph block it is in (TriG), in N-Triples syntax (`<iri>` or `_:label`).
+    pub graph: Option<String>,
 }
 
 impl RdfSyntaxError {
@@ -25,6 +43,7 @@ impl RdfSyntaxError {
         Self {
             message: message.into(),
             location,
+            statement: None,
         }
     }
 
@@ -36,11 +55,25 @@ impl RdfSyntaxError {
         self.location.clone()
     }
 
+    /// The statement the error is in, where the parser knows it.
+    pub fn statement(&self) -> Option<&SkippedStatement> {
+        self.statement.as_deref()
+    }
+
+    pub(crate) fn with_statement(mut self, statement: SkippedStatement) -> Self {
+        self.statement = Some(Box::new(statement));
+        self
+    }
+
     /// The error with its lines counted from `lines` earlier: a chunk's lines are numbered
     /// from its start, the document's from the first line.
     pub(crate) fn after_lines(mut self, lines: u64) -> Self {
         self.location.start.line += lines;
         self.location.end.line += lines;
+        if let Some(statement) = &mut self.statement {
+            statement.span.start.line += lines;
+            statement.span.end.line += lines;
+        }
         self
     }
 }
