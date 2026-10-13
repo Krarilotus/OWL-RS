@@ -419,6 +419,41 @@ impl IndexVersion {
         }
     }
 
+    /// Appends the values at key `position` of `plan`'s permutation at `parts - 1` even
+    /// positions of each run's range: cuts that split a walk over its groups into parts of
+    /// about equal size, read without walking anything. Unsorted across runs.
+    pub(crate) fn sample_values(
+        &self,
+        plan: &AccessPlan,
+        position: usize,
+        parts: usize,
+        out: &mut Vec<u64>,
+    ) {
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return;
+        };
+        let position = if adapted.permutation == plan.permutation {
+            position
+        } else if position == 0 {
+            // Grouped by the graph this layout leaves out: one group, nothing to cut.
+            return;
+        } else {
+            position - 1
+        };
+        for run in self.runs.iter() {
+            let perm = run.permutation(adapted.permutation);
+            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            let len = end - start;
+            if len < 2 {
+                continue;
+            }
+            out.extend(
+                (1..parts.min(len))
+                    .map(|i| perm.keys.get(start + len * i / parts.min(len))[position]),
+            );
+        }
+    }
+
     /// The number of distinct values at key `position` of `plan`'s permutation, counted
     /// while the groups are walked (in parallel parts for a large range, a group across a
     /// cut counted once) and none kept: O(d) time, O(1) memory. `None` where several runs
