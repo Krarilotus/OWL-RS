@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         files: vec![schema.into(), quads],
         replace: false,
         graph: GraphTarget::DefaultGraph,
-        skip_errors: false,
+        invalid: Some(nrese_store::InvalidStatements::Strict),
     })?;
     let report = store.rematerialise(rules)?;
     println!(

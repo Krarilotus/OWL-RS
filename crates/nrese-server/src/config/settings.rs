@@ -181,6 +181,13 @@ pub const SETTINGS: &[Setting] = &[
         "How checkpoints store the dictionary's keys (default plain).",
     ),
     setting(
+        "store.invalid_statements",
+        names::INVALID_STATEMENTS,
+        Choice(&["quarantine", "strict"]),
+        "What a bulk load does with a statement it can't read: quarantine it and load the \
+         rest, or stop (default quarantine).",
+    ),
+    setting(
         "store.ontology_path",
         names::ONTOLOGY_PATH,
         Text,
