@@ -1161,6 +1161,7 @@ impl Solutions {
 }
 
 struct Context<'a> {
+    planner: crate::PlannerOptions,
     /// The snapshot read; owned when it reads equality classes canonically
     /// ([`QueryOptions::equality_canonical`], [`Context::late_expansion`]).
     snapshot: Cow<'a, Snapshot>,
@@ -1285,6 +1286,7 @@ impl<'a> Context<'a> {
             DefaultGraph::Empty => (GraphScope::Missing, None),
         };
         let mut ctx = Self {
+            planner: options.resources.planner,
             merge_set,
             named: resolved.named,
             as_written: options.as_written,
@@ -2987,8 +2989,15 @@ impl<'a> Context<'a> {
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         };
-        plan::order(inputs, variables, PROBE_FACTOR, sets.as_deref(), &cancelled)
-            .ok_or_else(|| QueryEvaluationError::Cancelled.into())
+        plan::order(
+            inputs,
+            variables,
+            PROBE_FACTOR,
+            sets.as_deref(),
+            self.planner,
+            &cancelled,
+        )
+        .ok_or_else(|| QueryEvaluationError::Cancelled.into())
     }
 
     /// The join orderer's inputs for `scans` with their `counts`: distinct values per

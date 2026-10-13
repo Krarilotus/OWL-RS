@@ -33,9 +33,15 @@ each with its run record.
 
 ### Open work
 
-- **Performance acceptance against `0f46563`:** Horn context saturation is about 6 %
-  slower, serial and at 16 threads, with the retained accounting; there is no 95-case
-  matrix of the final revision ([run record](../benches/runs/2026-10-11-horn-recovery.toml)).
+- **Measured recovery, integrated acceptance still open:** the later Horn comparison
+  against `0f46563` records +1.3 % serial and -2.1 % at 16 threads (within the reported
+  build-to-build spread), with all 72 taxonomies byte-exact
+  ([run record](../benches/runs/2026-10-12-horn-takeover-dl.toml)). The 95-case PR comparison
+  found no regressions beyond its thresholds for `157931a` versus `aabd47a`
+  ([record](../benches/runs/2026-10-12-pr23-acceptance-ab-phuoc.toml)); it does not certify
+  the current integrated revision against `0f46563`. Its "same" verdict permits small
+  slowdowns, and its cgroup peaks include page-cache charges (see the
+  [memory investigation](../benches/runs/2026-10-12-memory-variance.toml)).
 - **Resource ownership in `nrese-dl`:** the envelope needed and has: an engine's budget is
   an owned value (no longer `Copy`), its observer and the tableau reserve from the request's
   envelope and return it when the engine drops, and exhaustion stays sticky per engine (an
@@ -51,8 +57,11 @@ each with its run record.
 - **Vector search:** the filtered search that goes first widens its beam by the joined
   pattern's share (12 October): `vector-knn-filtered`'s recall 0.56 → 0.98, its gate passes
   ([record](../benches/runs/2026-10-12-vector-filtered-fix-phuoc.toml)). On its uniform 64-d
-  vectors the graph search now costs what the exact scan does (10.5 against 10.4 ms): open,
-  the scan chosen by cost, and the graph's own recall at the default beam (0.44).
+  vectors the graph search costs what the exact scan does (10.5 against 10.4 ms).
+  The operation-contracts branch implements a cost-routing candidate, with separate
+  index-filter and later-probe estimates and a forced-ANN guard; its same-host A/B is
+  still required before acceptance ([design](design/execution-core.md#vector-join-direction-and-physical-search)).
+  The graph's own recall at the default beam (0.44) remains open.
 - **Competitor answers:** rerun with the committed recorder to decide the unordered
   `LIMIT` case; Konclude intermittently drops 107 asserted pairs from the Horn reference
   taxonomy, cause unknown.
@@ -66,9 +75,11 @@ each with its run record.
 
 ## OWL 2 DL (v1.5, branch `v15/dl-complete`, 12 October)
 
-**Coverage.** Every construct OWL 2 DL has is decided by the engines; an answer is
-`unknown` only for what the specification rules out, a resource limit, or a reader
-diagnostic ([design](design/owl2-dl.md) §3, §6):
+**Implemented coverage.** The engines have decision paths for the OWL 2 DL constructs
+covered by the campaigns below. Those finite campaigns are strong evidence, not a proof
+of correctness or termination for arbitrary ontologies. The documented boundaries
+include unsupported input, resource limits and reader diagnostics
+([design](design/owl2-dl.md) §3, §6):
 - *ruled out by OWL 2 DL, answered `unsupported`:* `owl:topObjectProperty` where a simple
   property is required (it is composite, *Structural Specification* §11.1, §11.2: in a
   cardinality; functional, inverse-functional, irreflexive, asymmetric, disjoint);
@@ -90,7 +101,7 @@ diagnostic ([design](design/owl2-dl.md) §3, §6):
   pair, and in keys; the datatype theory's search for distinct values (exact to the
   deadline) and its pattern limit (per combination).
 
-**The coverage proof** ([design](design/owl2-dl.md) §11; [the campaigns](../benches/reasoning/dl/README.md#the-small-scope-12-october-2026-main-pc)):
+**Measured finite coverage** ([design](design/owl2-dl.md) §11; [the campaigns](../benches/reasoning/dl/README.md#the-small-scope-12-october-2026-main-pc)):
 every OWL 2 DL ontology of the small scope `4,4,4` (2,761,335 after symmetry reduction:
 every constructor and axiom type, one axiom up to size 4, two and three up to total size
 4) and a covering array of every pair and triple of the 67 features beyond it (3,354
@@ -111,7 +122,8 @@ non-entailments of the hypertableau come with a model the independent checker
 (`nrese_dl::certificate`) verifies: 99.84 % of such claims on the small scope without data
 values (8,990,815 of 9,005,280); the number module's validated models likewise. Not yet:
 data values in models; "inconsistent" and entailments (the references decide them in the
-campaigns).
+campaigns). A checked certificate establishes its individual claim; the percentage is
+coverage of this campaign's positive claims, not a proof that every engine path is correct.
 
 **Incrementality** ([design](design/owl2-dl.md) §9): U1 and the RL closure maintained per
 commit; the consistency gate after a commit of assertions only, from a consistent

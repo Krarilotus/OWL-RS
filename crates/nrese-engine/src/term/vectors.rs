@@ -28,7 +28,8 @@ pub const EXACT_BELOW: usize = 20_000;
 /// Spaces with fewer vectors get their graph built at once, not on a thread.
 pub const SYNC_BUILD: usize = 50_000;
 
-/// A filter that accepts less than this share of a space is searched exactly.
+/// The smallest share used to widen the beam. This is a search heuristic, not a
+/// work ceiling or a recall guarantee.
 const EXACT_SHARE: f64 = 0.02;
 
 /// How a search finds its vectors.
@@ -52,9 +53,12 @@ pub struct VectorQuery {
     pub strategy: VectorStrategy,
     /// The graph search's beam (at least `k`).
     pub ef: usize,
-    /// How many vectors the filter accepts, if the caller knows (it chooses the
-    /// strategy).
+    /// How many vectors the index's filter accepts, if known (or an estimate while
+    /// planning). A later filter belongs in `probe_accepted` instead.
     pub accepted: Option<usize>,
+    /// Estimated final survivors of a later filter, not applied by this search. Widens
+    /// the beam without pretending that an exact scan skips rejected distances.
+    pub probe_accepted: Option<usize>,
 }
 
 impl VectorQuery {
@@ -66,6 +70,7 @@ impl VectorQuery {
             strategy: VectorStrategy::default(),
             ef: 64,
             accepted: None,
+            probe_accepted: None,
         }
     }
 }
@@ -81,6 +86,13 @@ pub struct VectorSearchReport {
     pub scanned: usize,
 }
 
+/// Physical facts and a kernel choice for a caller planning its surrounding work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorSearchEstimate {
+    pub space: usize,
+    pub strategy: VectorStrategy,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct VectorIndex {
     /// Dictionary entries up to here are in the spaces.
@@ -92,6 +104,16 @@ pub(crate) struct VectorIndex {
 struct Space {
     vectors: Vectors,
     graphs: Vec<Slot>,
+}
+
+impl Space {
+    fn graph(&self, metric: Metric) -> Option<&Arc<Hnsw>> {
+        self.graphs
+            .iter()
+            .find(|slot| slot.metric == metric)?
+            .graph
+            .as_ref()
+    }
 }
 
 /// A space's graph for one metric.
@@ -118,6 +140,25 @@ impl VectorIndex {
         self.covered
     }
 
+    /// The route available now. Maintenance eligibility is separate: a missing
+    /// graph may be building while the current search uses the exact kernel.
+    pub(crate) fn estimate(&self, query: &VectorQuery) -> VectorSearchEstimate {
+        let space = self.spaces.get(&query.vector.len());
+        let graph = space.is_some_and(|space| {
+            space
+                .graph(query.metric)
+                .is_some_and(|graph| graph_preferred(space, query, graph.len()))
+        });
+        VectorSearchEstimate {
+            space: space.map_or(0, |space| space.vectors.len()),
+            strategy: if graph {
+                VectorStrategy::Approximate
+            } else {
+                VectorStrategy::Exact
+            },
+        }
+    }
+
     /// Takes in the vector literals among `entries` (id, lexical form), up to entry `end`.
     pub(crate) fn extend(&mut self, entries: &[(u64, &str)], end: u64) {
         for &(id, lexical) in entries {
@@ -142,7 +183,7 @@ impl VectorIndex {
         let Some(space) = self.spaces.get_mut(&query.vector.len()) else {
             return Work::None;
         };
-        if !uses_graph(space, query) {
+        if !graph_preferred(space, query, space.vectors.len()) {
             return Work::None;
         }
         let len = space.vectors.len();
@@ -166,11 +207,7 @@ impl VectorIndex {
     /// The vectors and graph to build on (a cheap copy of the vectors, shared chunks).
     pub(crate) fn build_inputs(&self, query: &VectorQuery) -> Option<(Vectors, Option<Arc<Hnsw>>)> {
         let space = self.spaces.get(&query.vector.len())?;
-        let graph = space
-            .graphs
-            .iter()
-            .find(|slot| slot.metric == query.metric)
-            .and_then(|slot| slot.graph.clone());
+        let graph = space.graph(query.metric).cloned();
         Some((space.vectors.clone(), graph))
     }
 
@@ -193,7 +230,7 @@ impl VectorIndex {
         let Some(space) = self.spaces.get(&query.vector.len()) else {
             return false;
         };
-        uses_graph(space, query)
+        graph_preferred(space, query, space.vectors.len())
             && !space.graphs.iter().any(|slot| {
                 slot.metric == query.metric
                     && (slot.building
@@ -229,11 +266,8 @@ impl VectorIndex {
         };
         let len = space.vectors.len();
         let graph = space
-            .graphs
-            .iter()
-            .find(|slot| slot.metric == query.metric)
-            .and_then(|slot| slot.graph.as_ref())
-            .filter(|_| uses_graph(space, query));
+            .graph(query.metric)
+            .filter(|graph| graph_preferred(space, query, graph.len()));
         let Some(graph) = graph else {
             let hits =
                 nrese_vector::exact(&space.vectors, &query.vector, query.k, query.metric, accept);
@@ -248,8 +282,7 @@ impl VectorIndex {
         };
         // Over-fetch for the filter: the beam keeps accepted vectors only, so a filter
         // that rejects many needs a wider one.
-        let share = query.accepted.map_or(1.0, |n| n as f64 / len.max(1) as f64);
-        let ef = ((query.ef.max(query.k) as f64) / share.clamp(EXACT_SHARE, 1.0)).ceil() as usize;
+        let ef = search_beam(query, len);
         let from_graph = graph.search(&space.vectors, &query.vector, query.k, ef, accept);
         let tail = nrese_vector::exact_from(
             &space.vectors,
@@ -451,17 +484,37 @@ fn slot(space: &mut Space, metric: Metric) -> &mut Slot {
     &mut space.graphs[at]
 }
 
-/// Whether `query` is answered through a graph of `space`.
-fn uses_graph(space: &Space, query: &VectorQuery) -> bool {
+/// The same beam is used by route estimation and search, including when the caller
+/// applies its filter after the graph search.
+fn search_beam(query: &VectorQuery, size: usize) -> usize {
+    let accepted = match (query.accepted, query.probe_accepted) {
+        (Some(index), Some(final_survivors)) => Some(index.min(final_survivors)),
+        (index, final_survivors) => index.or(final_survivors),
+    };
+    let share = accepted.map_or(1.0, |n| n as f64 / size.max(1) as f64);
+    ((query.ef.max(query.k) as f64) / share.clamp(EXACT_SHARE, 1.0)).ceil() as usize
+}
+
+/// Whether a graph covering `covered` vectors is worth using. Maintenance estimates
+/// a fully extended graph, so a stale graph's tail cannot prevent its own repair.
+/// Distance work is an advisory cost,
+/// not a bound on HNSW expansions: ef limits retained candidates, not visits. The
+/// exact scan checks every ID but only computes accepted distances. Unknown tail
+/// selectivity is charged conservatively as a full scan of the tail.
+fn graph_preferred(space: &Space, query: &VectorQuery, covered: usize) -> bool {
     match query.strategy {
         VectorStrategy::Exact => false,
         VectorStrategy::Approximate => true,
         VectorStrategy::Auto => {
             let size = space.vectors.len();
-            let selective = query
-                .accepted
-                .is_some_and(|n| (n as f64) < EXACT_SHARE * size as f64);
-            size >= EXACT_BELOW && !selective
+            let accepted = query.accepted.unwrap_or(size).min(size);
+            let graph = space.graph(query.metric);
+            let parameters = graph.map_or_else(HnswParameters::default, |graph| graph.parameters());
+            let graph_work = search_beam(query, size)
+                .saturating_mul(parameters.max_links(0))
+                .min(covered)
+                .saturating_add(size - covered);
+            size >= EXACT_BELOW && accepted > query.k && graph_work < accepted
         }
     }
 }
@@ -494,17 +547,186 @@ pub(crate) fn build(index: &RwLock<VectorIndex>, query: &VectorQuery) {
 
 /// [`build`] on a thread of its own.
 pub(crate) fn build_in_background(index: Arc<RwLock<VectorIndex>>, query: VectorQuery) {
-    let spawned = std::thread::Builder::new()
-        .name("nrese-vector-graph".to_owned())
-        .spawn(move || {
-            let built =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&index, &query)));
-            if built.is_err() {
-                tracing::error!("building a vector graph failed; searches stay exact");
-                index.write().release(query.vector.len(), query.metric);
-            }
-        });
-    if let Err(error) = spawned {
+    launch_build(index, query, |index, query| {
+        std::thread::Builder::new()
+            .name("nrese-vector-graph".to_owned())
+            .spawn(move || {
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    build(&index, &query)
+                }));
+                if built.is_err() {
+                    tracing::error!("building a vector graph failed; searches stay exact");
+                    index.write().release(query.vector.len(), query.metric);
+                }
+            })
+    });
+}
+
+/// The launcher owns the pending mark until a worker accepts it. A failed launch must
+/// return it just as a failed worker does; otherwise searches can never schedule a retry.
+fn launch_build<T>(
+    index: Arc<RwLock<VectorIndex>>,
+    query: VectorQuery,
+    spawn: impl FnOnce(Arc<RwLock<VectorIndex>>, VectorQuery) -> std::io::Result<T>,
+) {
+    let dimension = query.vector.len();
+    let metric = query.metric;
+    if let Err(error) = spawn(Arc::clone(&index), query) {
+        index.write().release(dimension, metric);
         tracing::warn!(%error, "vector graph not built");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn route(index: &VectorIndex, query: &VectorQuery) -> VectorStrategy {
+        index.estimate(query).strategy
+    }
+
+    #[test]
+    fn routing_separates_filter_cost_probe_selectivity_and_graph_availability() {
+        let mut vectors = Vectors::new(1);
+        for id in 0..SYNC_BUILD {
+            vectors.push(id as u64, &[id as f32]);
+        }
+        let mut index = VectorIndex::default();
+        index.spaces.insert(
+            1,
+            Space {
+                vectors,
+                graphs: Vec::new(),
+            },
+        );
+        let query = VectorQuery::new(vec![1.0], 10);
+        assert_eq!(route(&index, &query), VectorStrategy::Exact);
+        assert!(
+            matches!(index.work_for(&query), Work::Background),
+            "exact fallback still prepares a graph"
+        );
+        // Only the metadata is used by this route test, not the synthetic links.
+        let graph = |n, m| {
+            Hnsw::from_parts(HnswParts {
+                parameters: HnswParameters {
+                    m,
+                    ..Default::default()
+                },
+                metric: query.metric,
+                entry: Some((0, 0)),
+                links: vec![vec![Vec::new()]; n],
+            })
+            .unwrap()
+        };
+        index.install(1, query.metric, graph(SYNC_BUILD, 16));
+        assert_eq!(route(&index, &query), VectorStrategy::Approximate);
+        let filtered = VectorQuery {
+            accepted: Some(SYNC_BUILD / 10),
+            ..query.clone()
+        };
+        assert_eq!(route(&index, &filtered), VectorStrategy::Exact);
+        let probed = VectorQuery {
+            probe_accepted: filtered.accepted,
+            ..query.clone()
+        };
+        assert_eq!(
+            search_beam(&filtered, SYNC_BUILD),
+            search_beam(&probed, SYNC_BUILD)
+        );
+        assert_eq!(search_beam(&probed, SYNC_BUILD), 640);
+        assert_eq!(
+            route(&index, &probed),
+            VectorStrategy::Approximate,
+            "later probes cannot save scan distances"
+        );
+        for accepted in [Some(0), Some(1)] {
+            assert_eq!(
+                route(
+                    &index,
+                    &VectorQuery {
+                        accepted,
+                        ..query.clone()
+                    }
+                ),
+                VectorStrategy::Exact
+            );
+        }
+        assert_eq!(
+            route(
+                &index,
+                &VectorQuery {
+                    ef: SYNC_BUILD,
+                    ..query.clone()
+                }
+            ),
+            VectorStrategy::Exact
+        );
+        assert_eq!(
+            route(
+                &index,
+                &VectorQuery {
+                    strategy: VectorStrategy::Exact,
+                    ..query.clone()
+                }
+            ),
+            VectorStrategy::Exact
+        );
+        // Cost uses the parameters actually persisted, not the default graph's degree.
+        index.spaces.get_mut(&1).unwrap().graphs[0].graph = Some(Arc::new(graph(SYNC_BUILD, 2)));
+        assert_eq!(route(&index, &filtered), VectorStrategy::Approximate);
+        // A large uncovered tail can dominate the graph's savings.
+        index.spaces.get_mut(&1).unwrap().graphs[0].graph = Some(Arc::new(graph(100, 2)));
+        assert_eq!(route(&index, &filtered), VectorStrategy::Exact);
+        assert!(
+            index.may_need_work(&filtered),
+            "the fully extended graph is worthwhile"
+        );
+        assert!(matches!(index.work_for(&filtered), Work::Background));
+        assert_eq!(
+            route(
+                &index,
+                &VectorQuery {
+                    strategy: VectorStrategy::Approximate,
+                    ..filtered
+                }
+            ),
+            VectorStrategy::Approximate
+        );
+    }
+
+    #[test]
+    fn failed_launch_returns_only_its_build_slot_for_retry() {
+        let mut vectors = Vectors::new(1);
+        for id in 0..SYNC_BUILD {
+            vectors.push(id as u64, &[1.0]);
+        }
+        let mut index = VectorIndex::default();
+        index.spaces.insert(
+            1,
+            Space {
+                vectors,
+                graphs: Vec::new(),
+            },
+        );
+        let query = VectorQuery {
+            strategy: VectorStrategy::Approximate,
+            ..VectorQuery::new(vec![1.0], 1)
+        };
+        let other = VectorQuery {
+            metric: Metric::L2,
+            ..query.clone()
+        };
+        assert!(matches!(index.work_for(&query), Work::Background));
+        assert!(matches!(index.work_for(&other), Work::Background));
+        let index = Arc::new(RwLock::new(index));
+        launch_build(Arc::clone(&index), query.clone(), |_, _| {
+            Err::<(), _>(std::io::Error::other("thread unavailable"))
+        });
+        assert!(index.read().may_need_work(&query));
+        assert!(!index.read().may_need_work(&other));
+        assert!(matches!(index.write().work_for(&query), Work::Background));
+        launch_build(Arc::clone(&index), query.clone(), |_, _| Ok(()));
+        assert!(!index.read().may_need_work(&query));
+        assert!(matches!(index.write().work_for(&query), Work::None));
     }
 }

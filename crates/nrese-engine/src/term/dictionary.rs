@@ -898,6 +898,22 @@ impl Dictionary {
         known: u64,
         accept: &(dyn Fn(TermId) -> bool + Sync),
     ) -> (Vec<nrese_vector::Hit>, super::VectorSearchReport) {
+        self.prepare_vectors(query);
+        let accept = |raw: u64| {
+            let id = TermId::from_raw(raw);
+            id.payload() < known && accept(id)
+        };
+        self.vectors.read().search(query, &accept)
+    }
+
+    /// The physical route available after requesting ordinary graph maintenance.
+    /// Cardinalities are hints; the search still applies its snapshot and ID filter.
+    pub fn vector_estimate(&self, query: &super::VectorQuery) -> super::VectorSearchEstimate {
+        self.prepare_vectors(query);
+        self.vectors.read().estimate(query)
+    }
+
+    fn prepare_vectors(&self, query: &super::VectorQuery) {
         self.cover_vectors();
         if self.vectors.read().may_need_work(query) {
             let work = self.vectors.write().work_for(query);
@@ -910,11 +926,6 @@ impl Dictionary {
                 ),
             }
         }
-        let accept = |raw: u64| {
-            let id = TermId::from_raw(raw);
-            id.payload() < known && accept(id)
-        };
-        self.vectors.read().search(query, &accept)
     }
 
     /// Builds the graph a search like `query` uses, covering every vector, before
