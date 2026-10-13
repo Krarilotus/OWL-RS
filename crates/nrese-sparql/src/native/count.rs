@@ -459,28 +459,7 @@ impl<'b> Weights<'b> {
     /// O(log gap), so a merge of two lists of similar size is linear (a binary search of
     /// the whole remainder per value made it n log n).
     fn weight(&self, value: u64, from: &mut usize) -> u64 {
-        let entries = &self.entries;
-        let n = entries.len();
-        let mut lo = *from;
-        let k = if lo >= n || entries[lo].0 >= value {
-            lo
-        } else {
-            // entries[lo] < value: double the step until an entry not below it.
-            let mut step = 1;
-            let mut hi = lo + 1;
-            while hi < n && entries[hi].0 < value {
-                lo = hi;
-                step *= 2;
-                hi = lo + step;
-            }
-            let hi = hi.min(n);
-            lo + 1 + entries[lo + 1..hi].partition_point(|&(v, _)| v < value)
-        };
-        *from = k;
-        match entries.get(k) {
-            Some(&(v, w)) if v == value => w,
-            _ => self.default,
-        }
+        gallop(&self.entries, value, from).unwrap_or(self.default)
     }
 
     /// Their sum over every listed value (the default must be 0).
@@ -491,6 +470,43 @@ impl<'b> Weights<'b> {
             .try_fold(0u64, |sum, &(_, w)| sum.checked_add(w))
             .ok_or(Stop::Declined)
     }
+}
+
+/// A factor of a star counted whole ([`Context::streamed_total`]): the patterns whose
+/// groups at the root it adds up (a union's branches, else one), and what it does to that
+/// sum.
+struct StarFactor {
+    sources: Vec<(QuadPattern, Permutation)>,
+    /// `None` for a pattern of the star; else the kind of the part.
+    kind: Option<Kind>,
+    /// Its matches: the smallest listing factor drives.
+    estimate: u64,
+}
+
+impl StarFactor {
+    /// Whether a value it has no group for weighs 0.
+    fn lists(&self) -> bool {
+        matches!(self.kind, None | Some(Kind::Exists | Kind::Union))
+    }
+
+    /// A value's weight from its matches here: OPTIONAL keeps a value without any once,
+    /// MINUS and NOT EXISTS keep only those.
+    fn weight(&self, count: u64) -> u64 {
+        match self.kind {
+            None | Some(Kind::Union) => count,
+            Some(Kind::Exists) => count.min(1),
+            Some(Kind::Optional) => count.max(1),
+            Some(Kind::Minus | Kind::NotExists) => u64::from(count == 0),
+        }
+    }
+}
+
+/// Why a part of a parallel count stopped.
+enum Halt {
+    Cancelled,
+    /// The index can't answer as asked, or a count passed `u64`: the other path decides.
+    Declined,
+    Memory(BudgetExceeded),
 }
 
 /// What a count did, for EXPLAIN and the guards.
@@ -505,6 +521,9 @@ struct Stats {
     /// Matches read by messages from the parent's side, weighed and not kept
     /// ([`Context::message_from_parents`]).
     gathered: usize,
+    /// Groups of a star's patterns multiplied part by part and not kept
+    /// ([`Context::streamed_total`]).
+    streamed: usize,
     /// Values whose matches in a leaf were looked up ([`Context::probe`]).
     probed: usize,
     /// Matches of root patterns read and not kept.
@@ -526,6 +545,33 @@ fn mul(a: u64, b: u64) -> Counted<u64> {
 /// Sorts `pairs` by value and adds the weights of each value. The pairs come as runs
 /// already sorted (each value's partners in index order): a stable sort finds and merges
 /// them, O(n log runs) (Sparqloscope 020: 56.9 M pairs in a few runs per class).
+/// The count of `value` in `entries` (sorted by value), searched forward from `from` by
+/// galloping: O(log gap), so a merge of two lists of similar size is linear (a binary search
+/// of the whole remainder per value made it n log n). `None` where it isn't listed.
+fn gallop(entries: &[(u64, u64)], value: u64, from: &mut usize) -> Option<u64> {
+    let n = entries.len();
+    let mut lo = *from;
+    let k = if lo >= n || entries[lo].0 >= value {
+        lo
+    } else {
+        // entries[lo] < value: double the step until an entry not below it.
+        let mut step = 1;
+        let mut hi = lo + 1;
+        while hi < n && entries[hi].0 < value {
+            lo = hi;
+            step *= 2;
+            hi = lo + step;
+        }
+        let hi = hi.min(n);
+        lo + 1 + entries[lo + 1..hi].partition_point(|&(v, _)| v < value)
+    };
+    *from = k;
+    match entries.get(k) {
+        Some(&(v, w)) if v == value => Some(w),
+        _ => None,
+    }
+}
+
 fn combine(pairs: &mut Vec<(u64, u64)>) -> Counted<()> {
     pairs.sort_by_key(|&(v, _)| v);
     let mut overflow = false;
@@ -864,13 +910,14 @@ impl Context<'_> {
         };
         if self.trace.is_some() {
             let detail = format!(
-                "{}rooted at {}; {} group walks, {} weights listed, {} pairs kept, {} matches weighed from the parents, {} values looked up, {} matches read at the roots; no row made",
+                "{}rooted at {}; {} group walks, {} weights listed, {} pairs kept, {} matches weighed from the parents, {} groups streamed, {} values looked up, {} matches read at the roots; no row made",
                 key.map_or_else(String::new, |k| format!("per {k}, ")),
                 stats.roots.join(", "),
                 stats.walks,
                 stats.listed,
                 stats.pairs,
                 stats.gathered,
+                stats.streamed,
                 stats.probed,
                 stats.driven,
             );
@@ -1098,8 +1145,16 @@ impl Context<'_> {
                     format!("the pattern of {} and {}", graph.vars[x], graph.vars[y])
                 }
             });
-            match root {
-                Root::Var(v) => {
+            // A star counted whole: its patterns' groups multiplied part by part.
+            let streamed = match root {
+                Root::Var(v) if Some(v) != key => {
+                    self.streamed_total(&graph, &pending, v, stats)?
+                }
+                _ => None,
+            };
+            match (root, streamed) {
+                (_, Some(total)) => scale = mul(scale, total)?,
+                (Root::Var(v), None) => {
                     let seed = seed.filter(|_| Some(v) == key);
                     let weights = self.weights_at(&graph, &mut pending, v, None, seed, stats)?;
                     if Some(v) == key {
@@ -1108,7 +1163,7 @@ impl Context<'_> {
                         scale = mul(scale, weights.total()?)?;
                     }
                 }
-                Root::Edge(e) => {
+                (Root::Edge(e), None) => {
                     let (x, y) = graph.ends(e);
                     let wx = self.weights_at(&graph, &mut pending, x, Some(e), None, stats)?;
                     let wy = self.weights_at(&graph, &mut pending, y, Some(e), None, stats)?;
@@ -1447,6 +1502,198 @@ impl Context<'_> {
         stats.walks += 1;
         stats.listed += groups.len();
         Ok(groups.into_iter().map(|(id, n)| (id.raw(), n)).collect())
+    }
+
+    /// The count of a star rooted at `var` (every child a leaf of one pattern, every part
+    /// hanging off it one pattern per branch): the sum over `var`'s values of the product of
+    /// each factor's weight, its patterns' groups read one part of the value range at a
+    /// time, in parallel, none kept past its part (QLever's join output in blocks, for a
+    /// count: Sparqloscope 012 and 013 listed 66.5 and 82.8 M weights, up to 1.3 GB, before
+    /// their product). `None` where the star has another shape, or where the values of its
+    /// smallest listing factor would rather be looked up in the others, as
+    /// [`Self::weights_at`] does (001: 845 values against `rdf:type`'s 66.5 M).
+    fn streamed_total(
+        &self,
+        graph: &Graph<'_>,
+        pending: &Hanging<'_, '_>,
+        var: usize,
+        stats: &mut Stats,
+    ) -> Counted<Option<u64>> {
+        if !pending.factors[var].is_empty() {
+            return Ok(None);
+        }
+        let name = &graph.vars[var];
+        let source = |atom: &Atom| -> Option<(QuadPattern, Permutation)> {
+            let permutation = atom.scan.permutation_for(Some(name));
+            (atom.scan.first_free(permutation) == Some(atom.component(name)))
+                .then(|| (atom.scan.quad_pattern(), permutation))
+        };
+        let mut factors: Vec<StarFactor> = Vec::new();
+        let leaves = graph.adjacent[var].iter().map(|&(child, e)| {
+            let leaf = !graph.listed(child, Some(e))
+                && pending.parts[child].is_empty()
+                && pending.factors[child].is_empty()
+                && graph.edges[e].len() == 1;
+            leaf.then(|| graph.edges[e][0])
+        });
+        for atom in graph.unary[var].iter().map(|&a| Some(a)).chain(leaves) {
+            let Some(atom) = atom.map(|a| &graph.atoms[a]) else {
+                return Ok(None);
+            };
+            let Some(source) = source(atom) else {
+                return Ok(None);
+            };
+            factors.push(StarFactor {
+                sources: vec![source],
+                kind: None,
+                estimate: atom.estimate,
+            });
+        }
+        for part in &pending.parts[var] {
+            let mut factor = StarFactor {
+                sources: Vec::new(),
+                kind: Some(part.kind),
+                estimate: 0,
+            };
+            for branch in &part.branches {
+                let [triple] = branch.atoms.as_slice() else {
+                    return Ok(None);
+                };
+                if !branch.closures.is_empty() || !branch.parts.is_empty() {
+                    return Ok(None);
+                }
+                // A branch that can't match adds nothing.
+                let Some(atom) = self.count_atom(triple, &branch.atoms)? else {
+                    continue;
+                };
+                if atom.vars.iter().all(|(v, _)| v != name) {
+                    return Ok(None);
+                }
+                let Some(source) = source(&atom) else {
+                    return Ok(None);
+                };
+                factor.estimate += atom.estimate;
+                factor.sources.push(source);
+            }
+            match factor.sources.is_empty() {
+                // Nothing to list: no value weighs anything.
+                true if factor.lists() => return Ok(Some(0)),
+                // Every value weighs the same, 1 (OPTIONAL, MINUS, NOT EXISTS of nothing).
+                true => {}
+                false => factors.push(factor),
+            }
+        }
+        let Some(driver) = (0..factors.len())
+            .filter(|&i| factors[i].lists())
+            .min_by_key(|&i| factors[i].estimate)
+        else {
+            return Ok(None);
+        };
+        let (pattern, permutation) = &factors[driver].sources[0];
+        let groups = self
+            .snapshot
+            .distinct_estimate_in(self.model, pattern, *permutation)
+            .unwrap_or(factors[driver].estimate);
+        let looked_up = factors.iter().enumerate().any(|(i, f)| {
+            i != driver && groups as f64 * PROBE_COST < f.estimate as f64 * WALK_COST
+        });
+        if looked_up {
+            return Ok(None);
+        }
+        // Parts of about 65,536 groups of the driver's, at least four per thread.
+        let parts = ((groups >> 16) as usize).clamp(rayon::current_num_threads() * 4, 1 << 12);
+        let Some(cuts) = self
+            .snapshot
+            .group_cuts_in(self.model, pattern, *permutation, parts)
+        else {
+            return Ok(None);
+        };
+        let mut ranges = Vec::with_capacity(cuts.len() + 1);
+        let mut low = 0u64;
+        for cut in cuts.iter().map(|c| c.raw()) {
+            if cut > low {
+                ranges.push((low, cut - 1));
+                low = cut;
+            }
+        }
+        ranges.push((low, u64::MAX));
+        let reader = self.reader();
+        let budget = &*self.budget;
+        let factors = &factors;
+        let results: Vec<Result<(u64, usize), Halt>> = ranges
+            .par_iter()
+            .map(|&(low, high)| {
+                if reader
+                    .cancellation
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    return Err(Halt::Cancelled);
+                }
+                let mut held = Reservation::new(budget);
+                let mut lists: Vec<PerValue> = Vec::with_capacity(factors.len());
+                let mut read = 0;
+                for factor in factors {
+                    let mut list: PerValue = Vec::new();
+                    for (pattern, permutation) in &factor.sources {
+                        let groups = reader
+                            .snapshot
+                            .group_counts_range_in(
+                                reader.model,
+                                pattern,
+                                *permutation,
+                                TermId::from_raw(low),
+                                TermId::from_raw(high),
+                            )
+                            .ok_or(Halt::Declined)?;
+                        list.extend(groups.into_iter().map(|(id, n)| (id.raw(), n)));
+                    }
+                    if factor.sources.len() > 1 {
+                        combine(&mut list).map_err(|_| Halt::Declined)?;
+                    }
+                    held.charge(list.capacity() * 16).map_err(Halt::Memory)?;
+                    read += list.len();
+                    lists.push(list);
+                }
+                let mut from = vec![0usize; factors.len()];
+                let mut total = 0u64;
+                for &(value, count) in &lists[driver] {
+                    let mut weight = factors[driver].weight(count);
+                    for (i, factor) in factors.iter().enumerate() {
+                        if i == driver || weight == 0 {
+                            continue;
+                        }
+                        let count = gallop(&lists[i], value, &mut from[i]).unwrap_or(0);
+                        weight = weight
+                            .checked_mul(factor.weight(count))
+                            .ok_or(Halt::Declined)?;
+                    }
+                    total = total.checked_add(weight).ok_or(Halt::Declined)?;
+                }
+                Ok((total, read))
+            })
+            .collect();
+        reader.check()?;
+        let mut total = 0u64;
+        let mut streamed = 0;
+        for result in results {
+            match result {
+                Ok((part, read)) => {
+                    total = add(total, part)?;
+                    streamed += read;
+                }
+                Err(Halt::Cancelled) => {
+                    reader.check()?;
+                    return Ok(None);
+                }
+                Err(Halt::Declined) => return Ok(None),
+                Err(Halt::Memory(e)) => {
+                    return Err(Stop::Failed(QueryEvaluationError::MemoryLimit(e).into()));
+                }
+            }
+        }
+        stats.walks += factors.iter().map(|f| f.sources.len()).sum::<usize>();
+        stats.streamed += streamed;
+        Ok(Some(total))
     }
 
     /// An edge's matches per value of `var`, `other` its other end: one pattern's from the

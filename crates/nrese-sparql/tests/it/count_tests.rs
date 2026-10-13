@@ -355,18 +355,14 @@ fn single_pattern_counts_equal_the_reference() {
 fn counted_joins_equal_the_reference() {
     let mut rng = Rng::seeded(20_261_013);
     let (mut checked, mut counted, mut nonzero) = (0usize, 0usize, 0usize);
-    // Messages by pairs and from the parents' side, both.
-    let (mut paired, mut gathered) = (0usize, 0usize);
-    let covered =
-        |checked: usize, counted: usize, nonzero: usize, paired: usize, gathered: usize| {
-            counted * 2 > checked && nonzero * 3 > checked && paired > 20 && gathered > 20
-        };
+    // The paths each in more than 20 counts: messages by pairs, messages from the parents'
+    // side, stars streamed part by part.
+    let mut paths = [0usize; 3];
+    let covered = |checked: usize, counted: usize, nonzero: usize, paths: [usize; 3]| {
+        counted * 2 > checked && nonzero * 3 > checked && paths.iter().all(|&n| n > 20)
+    };
     for case in 0.. {
-        if !draws_on(
-            case,
-            30,
-            covered(checked, counted, nonzero, paired, gathered),
-        ) {
+        if !draws_on(case, 30, covered(checked, counted, nonzero, paths)) {
             break;
         }
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -413,15 +409,21 @@ fn counted_joins_equal_the_reference() {
                 .find(|step| step.operator == "counted join");
             counted += usize::from(step.is_some());
             if let Some(step) = step {
-                paired += usize::from(!step.detail.contains(" 0 pairs kept"));
-                gathered += usize::from(!step.detail.contains(" 0 matches weighed"));
+                for (n, unused) in paths.iter_mut().zip([
+                    " 0 pairs kept",
+                    " 0 matches weighed",
+                    " 0 groups streamed",
+                ]) {
+                    *n += usize::from(!step.detail.contains(unused));
+                }
             }
             nonzero += usize::from(expected.iter().any(|row| !row.contains("n=\"0\"")));
             checked += 1;
         }
     }
+    let [paired, gathered, streamed] = paths;
     assert!(
-        covered(checked, counted, nonzero, paired, gathered),
-        "{checked} checked, {counted} counted by message passing, {nonzero} not 0, {paired} with pairs, {gathered} gathered by parents"
+        covered(checked, counted, nonzero, paths),
+        "{checked} checked, {counted} counted by message passing, {nonzero} not 0, {paired} with pairs, {gathered} gathered by parents, {streamed} stars streamed"
     );
 }
