@@ -863,7 +863,7 @@ args = ["--runs", "20"]
 [[case]]
 name = "rdf12-join-2g"
 area = "service"
-what = "asserted statements joined to the reifiers of their own triple terms, in 2 GiB (the frontier)"
+what = "asserted statements joined to the reifiers of their own triple terms, in 2 GiB"
 semantics = "none"
 data = "rdf12 statements=1000000 sources=100"
 queries = "rdf12-join"
@@ -872,8 +872,7 @@ metric = "sum_p50_ms"
 check = {}
 route = {}
 cap_gb = 2
-outcome = "memory-limit"
-known = "a triple-term pattern with variables bound by the join is filtered, not looked up: past 6 GiB on 6 Oct 2026"
+outcome = "ok"
 systems = ["oxigraph:plain", "jena:plain"]
 
 # --- the performance phase's levels: kernels, layout, rule work, memory, parsing, plans ------
