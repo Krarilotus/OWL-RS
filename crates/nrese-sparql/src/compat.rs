@@ -85,17 +85,15 @@ fn having_under<'a>(
     aliases: &mut Vec<(Variable, Expression)>,
 ) -> Option<&'a mut Expression> {
     match pattern {
-        GraphPattern::Extend {
-            inner,
-            variable,
-            expression,
-        } => {
-            aliases.push((variable.clone(), expression.clone()));
+        // The outermost first, as a chain of them would be walked.
+        GraphPattern::Extend { inner, bindings } => {
+            aliases.extend(bindings.iter().rev().cloned());
             having_under(inner, aliases)
         }
-        GraphPattern::Join { left, right } if matches!(**right, GraphPattern::Values { .. }) => {
-            having_under(left, aliases)
-        }
+        GraphPattern::Join { inputs } => match inputs.as_mut_slice() {
+            [left, GraphPattern::Values { .. }] => having_under(left, aliases),
+            _ => None,
+        },
         GraphPattern::Filter { expr, inner } if matches!(**inner, GraphPattern::Group { .. }) => {
             Some(expr)
         }
@@ -122,9 +120,10 @@ fn having_aliases(pattern: &mut GraphPattern) {
     match pattern {
         GraphPattern::Bgp { patterns } => patterns.retain(|triple| !is_hint(triple)),
         GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
-        GraphPattern::Join { left, right }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => {
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            inputs.iter_mut().for_each(having_aliases);
+        }
+        GraphPattern::Minus { left, right } => {
             having_aliases(left);
             having_aliases(right);
         }
@@ -143,10 +142,10 @@ fn having_aliases(pattern: &mut GraphPattern) {
             in_expression(expr);
             having_aliases(inner);
         }
-        GraphPattern::Extend {
-            inner, expression, ..
-        } => {
-            in_expression(expression);
+        GraphPattern::Extend { inner, bindings } => {
+            for (_, expression) in bindings {
+                in_expression(expression);
+            }
             having_aliases(inner);
         }
         GraphPattern::OrderBy { inner, expression } => {

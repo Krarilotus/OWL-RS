@@ -144,8 +144,9 @@ impl Names {
         match p {
             S::NamedNode(n) => PP::NamedNode(nn(n)),
             S::Reverse(p) => PP::Reverse(Box::new(self.path(p))),
-            S::Sequence(a, b) => PP::Sequence(Box::new(self.path(a)), Box::new(self.path(b))),
-            S::Alternative(a, b) => PP::Alternative(Box::new(self.path(a)), Box::new(self.path(b))),
+            // Binary in spargebra, n-ary and flattened in NRESE (ADR-0012).
+            S::Sequence(a, b) => PP::sequence(vec![self.path(a), self.path(b)]),
+            S::Alternative(a, b) => PP::alternative(vec![self.path(a), self.path(b)]),
             S::ZeroOrMore(p) => PP::ZeroOrMore(Box::new(self.path(p))),
             S::OneOrMore(p) => PP::OneOrMore(Box::new(self.path(p))),
             S::ZeroOrOne(p) => PP::ZeroOrOne(Box::new(self.path(p))),
@@ -293,10 +294,7 @@ impl Names {
                 path: self.path(path),
                 object: self.tp(object),
             },
-            S::Join { left, right } => P::Join {
-                left: b(self, left),
-                right: b(self, right),
-            },
+            S::Join { left, right } => P::join_all(vec![self.pattern(left), self.pattern(right)]),
             S::LeftJoin {
                 left,
                 right,
@@ -314,23 +312,22 @@ impl Names {
                 expr: self.expr(expr),
                 inner: b(self, inner),
             },
-            S::Union { left, right } => P::Union {
-                left: b(self, left),
-                right: b(self, right),
-            },
+            S::Union { left, right } => {
+                P::union_all(vec![self.pattern(left), self.pattern(right)])
+            }
             S::Graph { name, inner } => P::Graph {
                 name: self.nnp(name),
                 inner: b(self, inner),
             },
+            // A chain in spargebra, one `Extend` in NRESE (ADR-0012).
             S::Extend {
                 inner,
                 variable,
                 expression,
-            } => P::Extend {
-                inner: b(self, inner),
-                variable: self.var(variable),
-                expression: self.expr(expression),
-            },
+            } => {
+                let inner = self.pattern(inner);
+                inner.extend(self.var(variable), self.expr(expression))
+            }
             S::Minus { left, right } => P::Minus {
                 left: b(self, left),
                 right: b(self, right),

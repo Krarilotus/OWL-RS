@@ -120,6 +120,27 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
             f"- **Run records:** {len(records)}, newest {max((str(r.get('started', ''))[:10] for r in records), default='-')}",
             ""]
 
+    # --- the schedule: what is measured first, the backlog, what comes last
+    from . import schedule as order
+    plan = order.load()
+    last_run: dict[str, str] = {}
+    for record in records:
+        for pair in record.get("pairs", []):
+            if pair.get("outcome") not in (None, "skipped"):
+                last_run[pair["workload"]] = max(last_run.get(pair["workload"], ""), str(record.get("started", ""))[:10])
+    out += ["## Schedule", "",
+            "The order the families are measured in ([suite/schedule.toml](suite/schedule.toml), the owner's of "
+            "12 Oct 2026): the measurement queue starts jobs in it. A family without a workload entry yet is a "
+            "benchmark of [CATALOG.md](CATALOG.md), named by its section.", ""]
+    for key, heading in (("now", "This week, in this order"), ("backlog", "Backlog"),
+                         ("last", "Last: not expected to give data for polishing or optimisation")):
+        out += [f"### {heading}", "", "| # | Family | State | Newest run | What |", "|---|---|---|---|---|"]
+        for n, name in enumerate(plan.get(key, []), start=1):
+            w = workloads.get(name)
+            what = w["title"] if w else f"CATALOG.md §{plan['catalogue'][name]}"
+            out.append(f"| {n} | {name} | {w['state'] if w else 'catalogue only'} | {last_run.get(name, '-')} | {what} |")
+        out.append("")
+
     # --- the matrix
     names = list(systems)
     out += ["## Coverage", "",

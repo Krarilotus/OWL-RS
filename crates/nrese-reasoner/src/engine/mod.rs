@@ -70,6 +70,9 @@ pub struct Program {
     /// The ruleset's axiomatic triples, sorted: they seed every closure, and a commit
     /// never retracts them.
     axioms: Vec<Triple>,
+    /// The maintenance plan every commit takes where it applies (the differential tests
+    /// of each plan); `None`: the cheapest ([`delta::policy`]).
+    plan: Option<delta::policy::Plan>,
 }
 
 impl std::fmt::Debug for Program {
@@ -123,6 +126,7 @@ impl Program {
             by_representatives: true,
             store_representatives: false,
             axioms,
+            plan: None,
         }
     }
 
@@ -145,6 +149,14 @@ impl Program {
     /// Whether the inferred stack holds the closure over representatives.
     pub fn stores_representatives(&self) -> bool {
         self.by_representatives && self.store_representatives && self.same_as.is_some()
+    }
+
+    /// This program maintaining every commit by `plan` where it applies, or by the
+    /// cheapest plan (`None`, the default).
+    #[must_use]
+    pub fn maintaining_by(mut self, plan: Option<delta::policy::Plan>) -> Self {
+        self.plan = plan;
+        self
     }
 
     /// This program leaving out memberships in unnamed classes nothing consumes, or not.

@@ -10,20 +10,23 @@
 #   scripts/lib/remote.sh check MODE [FILES]   the gate (scripts/check.sh MODE); FILES lists
 #                                              the changed files the local side selected
 #   scripts/lib/remote.sh run CMD...           any command, e.g. cargo test -p nrese-dl
+#   scripts/lib/remote.sh tree                 prints the working tree's id (what a run sends)
 #
 # Exit status: the remote command's.
 set -u
-host=${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}
-[ -n "$host" ] || { echo "no build host (NRESE_BUILD_HOST or git config nrese.buildHost)" >&2; exit 2; }
-root=${NRESE_BUILD_ROOT:-owlrs}
 cd "$(git rev-parse --show-toplevel)"
 name=$(basename "$PWD")
 
 index=$(mktemp)
 trap 'rm -f "$index"' EXIT
 GIT_INDEX_FILE=$index git read-tree HEAD
-GIT_INDEX_FILE=$index git add -A
+GIT_INDEX_FILE=$index git -c core.safecrlf=false add -A
 tree=$(GIT_INDEX_FILE=$index git write-tree)
+[ "${1:-}" = tree ] && { echo "$tree"; exit 0; }
+
+host=${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}
+[ -n "$host" ] || { echo "no build host (NRESE_BUILD_HOST or git config nrese.buildHost)" >&2; exit 2; }
+root=${NRESE_BUILD_ROOT:-owlrs}
 snapshot=$(git commit-tree "$tree" -p HEAD -m "snapshot of $name")
 
 # While the host's owners use it (its guard wrote ~/owlrs/RETREAT, tools/office-guard), a build
@@ -56,7 +59,7 @@ case ${1:-} in
     ssh -o BatchMode=yes "$host" "$prepare && $capped bash -c $(printf %q "$*")"
     ;;
   *)
-    echo "usage: scripts/lib/remote.sh check MODE [FILES] | run CMD..." >&2
+    echo "usage: scripts/lib/remote.sh check MODE [FILES] | run CMD... | tree" >&2
     exit 2
     ;;
 esac

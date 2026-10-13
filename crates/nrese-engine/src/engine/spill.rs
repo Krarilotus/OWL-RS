@@ -271,7 +271,9 @@ impl Spiller {
             .name("nrese-spill".into())
             .spawn(move || {
                 for batches in received {
+                    nrese_exec::heap::begin_step();
                     spill.write_raw(batches)?;
+                    nrese_exec::heap::end_step("spill: a chunk written");
                     crate::memory::release_thread();
                 }
                 Ok(spill)

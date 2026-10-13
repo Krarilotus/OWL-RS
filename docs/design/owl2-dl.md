@@ -132,7 +132,7 @@ Graphs*, §3), as a pass over the store's triples by predicate:
 **Diagnostics**, as typed values with the triples involved, never a silent drop:
 - ill-formed structures (missing `owl:onProperty`, broken lists, a blank node shared between expressions);
 - untyped entities;
-- violations of the global restrictions: non-simple roles in cardinalities, `Self`, `owl:disjointWith` of properties, irreflexive and asymmetric; and an RBox that isn't regular.
+- violations of the global restrictions: non-simple roles in cardinalities, `Self`, `owl:disjointWith` of properties, irreflexive and asymmetric; and an RBox that isn't regular. `owl:topObjectProperty` is composite (*OWL 2 Structural Specification* §11.1), so a property above it is non-simple (12 October); `owl:bottomObjectProperty`, composite too, adds no pair to what is above it and isn't counted.
 
 An ontology with violations is still loaded for the parts that are well-formed, and its
 answers are `unsupported` for the tasks the violations touch (A: `unsupported` is a result
@@ -180,6 +180,31 @@ In the order of Motik, Shearer and Horrocks (JAIR 2009)†, with every step reco
    | `trigger` | the absorbed trigger atom |
 
 7. **Interning:** clauses are flat slices of atom ids in an arena, with no pointers into the model. Equal clauses are one, with merged provenance.
+
+### The built-in properties and keys (as built, 12 October)
+
+- **`owl:topObjectProperty` (U)** goes through a hub (`universal.rs`): a fresh individual
+  `h` every element reaches by a fresh role `u`, so `∃U.C` is `∃u.∃u⁻.C` and `∀U.C` is
+  `∀u.∀u⁻.C`. U in a chain, as a subproperty, in an equivalence or an inverse pair is
+  `u ∘ u⁻` in the chain: the property above becomes universal through its automaton. U in
+  a key is a condition every two named individuals meet (each is U-related to the
+  other) and is dropped from the key. A domain or range of U, `R ⊑ U`, and the
+  characteristics U has hold. What stays `unsupported` is what OWL 2 DL rules out: U is
+  composite (§11.1), so it can't be in a cardinality or be functional, inverse-functional,
+  irreflexive, asymmetric or disjoint with another property (§11.2, simple roles).
+- **`owl:topDataProperty`** occurs only above another data property in OWL 2 DL (§11.2,
+  "Restriction on owl:topDataProperty"); that axiom holds and is left out, any other use
+  is `unsupported`.
+- **Disjointness after a rewriting:** two operands of `DisjointClasses` or `DisjointUnion`
+  that a rewriting makes equal (`∃U.{a}` and `⊤` are both `⊤`) say that the class is
+  empty; the operands keep their repeats, and the normaliser reads the pair as `X ⊑ ⊥`.
+- **Keys over non-simple properties:** a key's pairs are the property's whole extension
+  (Direct Semantics: `(x, z) ∈ (OPE)^OP`), which for a non-simple property includes what its
+  chains and transitivity compose. For such a property the key's rule reads, per named
+  individual `z`, the fresh name of `∃P.{z} ⊑ Q`, derived deterministically through `P`'s
+  automaton (`{z} ⊑ ∀P⁻.Q`); a rule per combination of individuals. A key applies to
+  every named individual, also one no assertion mentions: where an ontology has keys, the
+  hypertableau's program holds all of them.
 
 ### Tests
 
@@ -398,6 +423,23 @@ DatatypeTheory
 - **Equality:** value equality and lexical equality are kept apart.
 - **Clashes carry dependency sets,** as FaCT++'s intervals do†. Without that, backjumping over a choice whose impossibility only a facet combination shows would be wrong.
 - **Shared code:** the numeric value spaces reuse `nrese-xsd`'s parsing and comparison (one numeric semantics in the store, roadmap step 4). They don't reuse SPARQL's operator semantics, which differs for out-of-range and invalid literals (C).
+- **As built (12 October): where a range is only bounded, two kinds of reason.** A model
+  found with a bound is never an answer; the reason decides which:
+  - *outside OWL 2 DL, or what the specification lets an implementation leave out*
+    (`Eval::approximate`, the answer `unsupported`): a datatype neither in the map nor
+    defined, a facet outside its datatype's facet space or a pattern that isn't a regular
+    expression (§11.2, §7.5); a cyclic datatype definition (§11.2); a literal whose value
+    isn't represented (a number past 128 bits, more than 18 fractional digits of a
+    second: §4 asks only for XML Schema's minimal lexical forms; an XML literal not
+    decided);
+  - *a resource limit* (`Eval::limited`, the answer `gave-up`): two sets combining more
+    than `MAX_PATTERNS` (12) patterns and language ranges, each kind of text apart (the
+    limit is per combination; before, more than 12 in the whole ontology left every
+    pattern undecided); a component of more pairwise-unequal values than are listed (over
+    a million).
+- **The search for distinct values** is exact: it runs until it decides or the
+  operation's deadline or cancellation stops it (`gave-up`), no longer to a fixed step
+  budget that answered `unsupported`.
 
 <a id="number-reasoning-layers"></a>
 
@@ -638,6 +680,23 @@ Incremental deletion in SROIQ is an open research problem (B, review §3 gap 5).
 it only within a bounded cone. **Every incremental path is checked against a clean rebuild
 in the same tests** (§11), as the RL delta executor is today.
 
+**As built (12 October), in the store's `owl2-dl` mode.** What a commit maintains, what it
+recomputes, and the test that holds each maintained path to a cold rebuild:
+
+| State | On a commit of assertions only (no statement that may change the schema) | On a schema change | Against a cold rebuild |
+|---|---|---|---|
+| L: the RL closure | maintained by the reasoner's delta executor (B/F, DRed) | the same | the reasoner's maintenance tests against rematerialisation |
+| L: the taxonomy's memberships | recomputed per revision from L (one scan per subclass); the taxonomy kept per schema | taxonomy recomputed on its next read | – (no maintained state) |
+| U1 | maintained by the delta executor; afresh where it has equality classes | recompiled, evaluated afresh | `the_maintained_upper_bound_is_the_one_evaluated_afresh`, `…_with_equality_classes_…` (store) |
+| consistency, base revision consistent | U1 where it proves it; else **only removals: consistent, no check** (monotone); **additions: the ABox islands with an individual the commit mentions** (`nrese_dl::islands::after_assertions`), the whole where the ABox doesn't split | checked whole | `incremental_consistency_on_commit_is_the_cold_check` (store: every commit of random sequences accepted exactly when a fresh store given the same data accepts it; 200 seeds swept, 3,200 commits, 707 decided on islands, 220 by monotonicity), `touched_islands_decide_as_a_cold_check_does` (dl: 2,000 cases swept) |
+| consistency, base inconsistent or unknown | checked whole (quarantine) | checked whole | `inconsistent_data_loaded_past_the_gate_is_quarantined_not_locked` |
+| classification, realisation | cached per revision, recomputed on a new one | the same | – (no maintained state) |
+
+Not built: the context core's incremental saturation (ABox and TBox additions queued
+into the affected contexts), TBox deletion within a bounded cone, and caches invalidated
+by footprint. A schema change recomputes, as the table's last two rows allow for large
+cones; v1.5 maintains what the store's write path is dominated by, assertions.
+
 ## 10. Proofs and explanations
 
 ### One proof IR (E)
@@ -673,6 +732,23 @@ OWL axioms, not of triples or clauses (review §3 gap 6).
   - certificates in the differential tests;
   - regression tests for incremental updates;
   - the explanation benchmarks' ground truth.
+
+### Certificates (as built, 12 October)
+
+An answer is checkable where a small checker can verify it without trusting the
+engines, as the number module's validator verifies its compressed models
+(§ Number reasoning layers):
+
+| Answer | Certificate | Checker | Covered |
+|---|---|---|---|
+| consistent (hypertableau) | the engine's model: folded at the blocks, its 3-fold covering lift, or the graph unravelled one step at each block | `nrese_dl::certificate`: every axiom of the ontology as written, by the direct semantics on the finite interpretation (U the universal relation, keys over named individuals), closed under the role inclusions; independent of the normalisation and the engines | object properties, classes and individuals; on the small scope `4,4,4`, 99.84 % of the claims a model can show without data values (8,990,815 of 9,005,280); not yet: data values (the model has none) |
+| consistent (number module) | the validated compressed model | `numbers::validate` | the module's fragment |
+| a class satisfiable, a non-entailment | a model of the ontology with a witness (a fresh anonymous individual in the class, or `a : ¬C`) | as above | as above |
+| inconsistent, an entailment | none yet: a refutation is a search tree, not recorded as a proof; the context core's derivations are in the proof IR, but no checker validates their steps against the calculus | – | references decide (§11) |
+
+Next for "inconsistent": the context core's derivations as a checked proof (each step an
+instance of its rule over the clauses, the clauses traced to the axioms), then the
+tableau's closed branches as a refutation trace.
 
 ### Measured
 
@@ -719,6 +795,44 @@ Each runs through a runner of NRESE's own:
 
   Run times may differ.
 - **Delta debugging:** every difference is minimised automatically and checked against two complete engines and, where small, by model enumeration.
+
+### The small scope: every ontology up to a bound (as built, 12 October)
+
+Random tests sample; this enumerates. By the small-scope hypothesis, errors show on small
+inputs, so every OWL 2 DL ontology up to a bound is checked, not a sample of them:
+
+- **The universe** (`nrese_owl::scope`): classes A, B; properties r, s and their inverses,
+  `owl:topObjectProperty`, `owl:bottomObjectProperty`; a data property d with
+  `owl:topDataProperty`, `owl:bottomDataProperty`; individuals a, b; `xsd:integer`,
+  `xsd:string`, `rdfs:Literal` and a defined datatype; the literals 0 and 1; numbers 0 to
+  2. Every class expression constructor, data range constructor and axiom type of the
+  structural specification but annotations. A size per axiom: one per constructor and
+  per class or data range atom, a chain one more.
+- **The bound** `4,4,4`: every one-axiom ontology up to size 4, every two- and three-axiom
+  ontology up to total size 4: 2,761,335 ontologies after the reductions. Within OWL 2 DL
+  only (§11.2 decided exactly: simple roles; a regular hierarchy, by the least strict
+  order each choice of chain forms needs, read in the inverse-normalised form of Horrocks,
+  Kutz and Sattler that HermiT checks; `owl:topDataProperty`; defined datatypes); of each
+  class of ontologies equal up to renaming (A↔B, r↔s, r↔r⁻, s↔s⁻, a↔b: 32 renamings, a
+  group), only the least.
+- **The questions:** consistency, A and B satisfiable, `A ⊑ B`, `B ⊑ A`, `⊤ ⊑ A`, `⊤ ⊑ B`,
+  `a : A`, `a : B`, `b : A`, `b : B`, through NRESE's consistency, classification and
+  realisation (`nrese_dl::scope`), read from the functional syntax as the references read
+  it. The three entry points must agree; each claim a model can show must be shown by a
+  certificate where data values don't enter (§10).
+- **The independent decision:** HermiT on every case, Openllet where HermiT doesn't decide
+  or differs from NRESE (`benches/reasoning/dl/scope.py`, the runner's `nrese.dl.Scope`).
+  No vote: where they differ from each other or both from NRESE, the case is settled by
+  the semantics, and NRESE's model certificate refutes a reference outright.
+- **Beyond the bound:** covering arrays (`scope::covering`): ontologies of 3 to 6 axioms of
+  up to size 4, chosen greedily until every pair (349 cases) and every triple of the 67
+  features (3,354 cases, all 47,905 triples) occurs; a tuple the batches leave gets many
+  aimed tries of its own.
+- **In the gate:** the scope `3,3` (35,505 cases) against the references' recorded answers
+  (`crates/nrese-dl/tests/scope`, the push tier, 10 s), its one-axiom part (8,578 cases) in
+  the commit tier (`tests/scope_one`, 5 s).
+
+The campaigns and their adjudications are in `benches/reasoning/dl/README.md`.
 
 ### Corpora
 
@@ -864,10 +978,10 @@ performance gate for each package are in [owl2-dl-performance.md](owl2-dl-perfor
 | 3.1 | Context core, Horn stage, parallel from the start (lock-free context activation, work stealing); dispatch and modules; the EL classifier becomes its EL mode (chains kept explicit for EL: the automata of §3 make `∃(r∘s).B ⊑ C` non-Horn) | §5's Horn gate; EL taxonomies unchanged; ≥ 2× faster than ELK at equal threads on the EL track |
 | 3.2 | Bounds for large ABoxes: U1 compiled and maintained per commit, the gap, consistency through L, U1 and the Horn core | the incremental track against cold rebuilds; LUBM(800) and UOBM(500) ≥ 10× faster than Konclude |
 | 3.3 | Hypertableau, ALC → SHIQ → SROIQ: absorption, lazy unfolding, blocking, NI, merges (rollback union-find with reasons), dependency sets over stable decision literals, backjumping, semantic branching, (un)satisfiability caching, watch lists, a native cardinality propagator with explanations | the W3C DL suite green without datatypes; within 3× of Konclude on the development set |
-| 3.4 | Classification and realisation driver (known/possible subsumers, parallel tests, model merging) | taxonomies equal to the references'; within 1.5× of Konclude's sum |
+| 3.4 | Classification and realisation driver (known/possible subsumers, parallel tests, model merging) | taxonomies equal to the references'; total time at most Konclude's ([performance plan](owl2-dl-performance.md) row 5) |
 | 3.5 | The datatype theory | the W3C DL suite green |
-| 3.6 | Context core, SRIQ and SROIQ stages; dynamic fallback, racing, telemetry | §5's gates; the Oxford sample at Konclude's solved count |
-| 3.7 | Caches with footprints, completion-graph reuse, saturation coupling; profiled SIMD | metamorphic on/off tests; the full ORE run at Konclude's level (Draco) |
+| 3.6 | Context core, SRIQ and SROIQ stages; dynamic fallback, racing, telemetry | §5's gates; the Oxford sample: every task Konclude solves and more |
+| 3.7 | Caches with footprints, completion-graph reuse, saturation coupling; profiled SIMD | metamorphic on/off tests; first in every category of the full ORE run (Draco) |
 | 3.8 | Black-box justifications over the hypertableau; glass-box certificates | equal to the glass-box results where both apply |
 | 3.9 | Conflict-driven hypertableau (research): learned nogoods, activity order, restarts ([performance plan](owl2-dl-performance.md) §6) | no answer changes on or off; a robust gain on the holdout or the switch stays off |
 

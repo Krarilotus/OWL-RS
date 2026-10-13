@@ -13,6 +13,8 @@
 //! what a part computes, given the context in which it is evaluated, which the key
 //! includes too ([`super::Context::cache_key`]).
 
+use std::collections::HashMap;
+
 use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, Expression, Function, GraphPattern, OrderExpression,
@@ -26,6 +28,8 @@ pub(super) struct Encoder {
     /// The part's variables in the order they first occur: a variable's number is its
     /// position.
     pub(super) vars: Vec<Variable>,
+    /// Each variable's number: a lookup, so that a key is linear in its part.
+    numbers: HashMap<Variable, usize>,
 }
 
 /// Why a part has no key.
@@ -49,10 +53,11 @@ impl Encoder {
 
     /// A variable by its number.
     pub(super) fn var(&mut self, variable: &Variable) {
-        let number = match self.vars.iter().position(|v| v == variable) {
-            Some(number) => number,
+        let number = match self.numbers.get(variable) {
+            Some(&number) => number,
             None => {
                 self.vars.push(variable.clone());
+                self.numbers.insert(variable.clone(), self.vars.len() - 1);
                 self.vars.len() - 1
             }
         };
@@ -131,6 +136,16 @@ impl Encoder {
         Ok(())
     }
 
+    /// An n-ary node's inputs, their number first (the key stays unambiguous).
+    fn inputs(&mut self, tag: u8, inputs: &[GraphPattern]) -> Encoded {
+        self.tag(tag);
+        self.number(inputs.len() as u64);
+        for p in inputs {
+            self.pattern(p)?;
+        }
+        Ok(())
+    }
+
     /// Writes `pattern`.
     pub(super) fn pattern(&mut self, pattern: &GraphPattern) -> Encoded {
         match pattern {
@@ -153,7 +168,7 @@ impl Encoder {
                 self.display(b'p', format_args!("{path:?}"));
                 self.term(object)?;
             }
-            GraphPattern::Join { left, right } => self.patterns(b'J', &[left, right])?,
+            GraphPattern::Join { inputs } => self.inputs(b'J', inputs)?,
             GraphPattern::LeftJoin {
                 left,
                 right,
@@ -167,20 +182,19 @@ impl Encoder {
                 self.patterns(b'F', &[inner])?;
                 self.expression(expr)?;
             }
-            GraphPattern::Union { left, right } => self.patterns(b'U', &[left, right])?,
+            GraphPattern::Union { inputs } => self.inputs(b'U', inputs)?,
             GraphPattern::Graph { name, inner } => {
                 self.tag(b'G');
                 self.named(name)?;
                 self.pattern(inner)?;
             }
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => {
+            GraphPattern::Extend { inner, bindings } => {
                 self.patterns(b'E', &[inner])?;
-                self.var(variable);
-                self.expression(expression)?;
+                self.number(bindings.len() as u64);
+                for (variable, expression) in bindings {
+                    self.var(variable);
+                    self.expression(expression)?;
+                }
             }
             GraphPattern::Minus { left, right } => self.patterns(b'M', &[left, right])?,
             GraphPattern::Values {

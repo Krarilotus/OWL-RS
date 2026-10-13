@@ -66,9 +66,10 @@ scales = "50 M, 256 M, 1 B statements"
 source = "github.com/ldbc/ldbc_spb_bm_2.0"
 licence = "Apache-2.0; unaudited results are \"not an LDBC benchmark result\" (LDBC fair-use policy)"
 tiers = ["50m", "256m"]
-state = "planned"
 check = "the benchmark's own validation of query results and of its OWL 2 RL rules"
-note = "The industry's audited reasoning benchmark (GraphDB publishes audited results). Its advanced query mix also needs fulltext and geosparql"
+state = "partial"
+kit = "benches/reasoning/spb"
+note = "The industry's audited reasoning benchmark (GraphDB publishes audited results). Its advanced query mix also needs fulltext and geosparql; the kit runs the basic mix with the benchmark's own ruleset on both systems. Office-PC's GraphDB licence is Free (1 CPU core, two concurrent queries; checked 12 Oct 2026): the comparison is the matched one-CPU scenario, and the audited Enterprise results can't be reproduced with it"
 
 [integration-rg-gs-gnd]
 title = "RG x GS x GND integration: identity reasoning over real links, 10 competency questions"
@@ -184,26 +185,28 @@ title = "Sparqloscope: 105 generated queries covering the SPARQL 1.1 features on
 kind = "performance"
 tasks = ["basics"]
 needs = ["load", "query"]
-scales = "DBLP (about 500 M statements), Wikidata truthy (about 8 B)"
-source = "github.com/ad-freiburg/sparqloscope (ISWC 2025)"
-licence = "Apache-2.0"
-tiers = ["dblp"]
-state = "planned"
-check = "result sizes across systems"
-note = "The current cross-engine query benchmark; its authors publish QLever, Virtuoso, MillenniumDB, GraphDB, Blazegraph and Jena on it"
+scales = "DBLP of 1 April 2025 (515 M lines of N-Triples), Wikidata truthy (about 8 B)"
+source = "github.com/ad-freiburg/sparqloscope 61ad92f (ISWC 2025); DBLP doi:10.4230/dblp.rdf.ntriples.2025-04-01"
+licence = "Apache-2.0 (queries); DBLP CC0"
+tiers = ["sparqloscope-dblp"]
+state = "ready"
+kit = "benches/sparql"
+check = "the answers every engine of the paper published alike (66 of 105), the others against the reference systems"
+note = "QLever's home turf: its paper's Table 2 (QLever 0.18 s geometric mean on DBLP) is the bar; Wikidata truthy waits for Draco"
 
 [bsbm]
-title = "Berlin SPARQL Benchmark: e-commerce explore, business intelligence, explore and update"
+title = "Berlin SPARQL Benchmark V3.1: e-commerce explore and business intelligence mixes, 1 to 64 clients"
 kind = "performance"
 tasks = ["basics"]
-needs = ["load", "query", "update"]
-scales = "1 M to 1 B statements"
-source = "wbsg.informatik.uni-mannheim.de/bizer/berlinsparqlbenchmark (generator and driver)"
+needs = ["load", "query"]
+scales = "10 M and 100 M (the V3.1 report's 10119864 and 100062249 triples), up to 150 B published"
+source = "BIBM 0.7.8 (sourceforge.net/projects/bibm): the generator and test driver of the V3.1 results (April 2013)"
 licence = "Apache-2.0"
-tiers = ["10m", "100m"]
-state = "planned"
-check = "the driver's qualification mode"
-note = "The classic mixed query and update workload; most vendors publish numbers on it"
+tiers = ["bsbm-explore-100m", "bsbm-bi-100m"]
+state = "ready"
+kit = "benches/sparql/bsbm"
+check = "the driver's qualification: each system's answers against a reference system's"
+note = "Virtuoso's home turf: its V3.1 figures at 100 M (explore 47179 to 216119 QMpH, BI 997 to 7132 QMpH at 1 to 64 clients) are the bar"
 
 [watdiv]
 title = "WatDiv: diverse query shapes (linear, star, snowflake, complex) as a stress test"
@@ -211,11 +214,55 @@ kind = "performance"
 tasks = ["basics"]
 needs = ["load", "query"]
 scales = "10 M to 1 B statements"
-source = "dsg.uwaterloo.ca/watdiv"
-licence = "none stated (generator on GitHub); data generated, not redistributed"
-tiers = ["10m", "100m"]
+source = "dsg.uwaterloo.ca/watdiv: its authors' datasets (watdiv.10M, watdiv.100M) and v0.6 query templates"
+licence = "none stated: internal use until its authors agree (owner, 5 Oct 2026)"
+tiers = ["watdiv-10m", "watdiv-100m"]
+state = "partial"
+kit = "benches/sparql"
+check = "answers against the reference systems"
+note = "Oxigraph's and Jena's home turf (owner, 12 Oct 2026), with BSBM and SP2Bench; the queries are instantiated from the generator's saved state of each dataset"
+
+[sp2bench]
+title = "SP2Bench: DBLP-shaped documents, 17 queries (OPTIONAL, negation, long chains, ASK)"
+kind = "performance"
+tasks = ["basics"]
+needs = ["load", "query"]
+scales = "10 k to 25 M triples published; any size generated"
+source = "dbis.informatik.uni-freiburg.de SP2B v1.01 (generator and queries)"
+licence = "BSD"
+tiers = ["sp2bench-1m", "sp2bench-25m"]
+state = "ready"
+kit = "benches/sparql"
+check = "the result sizes of the SP2Bench paper (Table V)"
+note = "Oxigraph's and Jena's home turf, with BSBM and WatDiv"
+
+[gcare]
+title = "G-CARE: cardinality estimation for subgraph queries (SIGMOD 2020)"
+kind = "performance"
+tasks = ["basics"]
+needs = ["load", "query"]
+scales = "AIDS, HUMAN, LUBM80, YAGO: 0.2 M to 58 M statements as RDF; 2,201 queries with true cardinalities"
+source = "github.com/yspark-dblab/gcare and its published data and query sets"
+licence = "none stated: internal use until its authors agree"
+tiers = ["gcare-aids", "gcare-human", "gcare-lubm80", "gcare-yago"]
 state = "planned"
-check = "row counts across systems"
+kit = "benches/sparql/gcare"
+check = "the published true cardinalities; q-errors of the planner's estimates (explain=plan) against G-CARE's estimators"
+note = "The planner's estimates on the cardinality-estimation benchmark; G-CARE's estimators (characteristic sets, SumRDF, BoundSketch, WanderJoin, JSUB, ...) are the comparators"
+
+[wdbench]
+title = "WDBench: about 2,650 real queries from Wikidata's logs (BGPs, OPTIONAL, paths, C2RPQs)"
+kind = "performance"
+tasks = ["basics"]
+needs = ["load", "query"]
+scales = "Wikidata truthy 2021-06-23, direct properties: about 1.25 B statements"
+source = "github.com/MillenniumDB/WDBench; data on Figshare"
+licence = "CC0 (data); queries no licence stated"
+tiers = ["wdbench"]
+state = "planned"
+kit = "benches/sparql"
+check = "answers against the reference systems"
+note = "MillenniumDB's home turf; larger than office-pc and phuoc-yu hold for the competitors: khaleesi S: or Draco"
 
 [write-scaling]
 title = "Single-statement and batch writes at 1 M, 10 M, 100 M; writes under read load"
@@ -261,20 +308,21 @@ title = "ERA-SHACL-Benchmark: validation time and memory on a real railway knowl
 kind = "performance"
 tasks = ["validation"]
 needs = ["load", "shacl-core"]
-scales = "three sizes up to 55 M statements, three shape sets"
-source = "github.com/oeg-upm/ERA-SHACL-Benchmark (2025)"
-licence = "to check before use"
-tiers = ["-"]
-state = "planned"
-check = "the validation reports across engines"
-note = "Parts of its shapes use SHACL-SPARQL"
+scales = "ES 1.2 M, FR 11.3 M, ERA 55 M statements (plus the vocabularies); shape sets tds, core, era"
+source = "github.com/oeg-upm/ERA-SHACL-Benchmark at fe109c9 (2025); data Zenodo 14605744 (the RINF dump of 2025-01-05)"
+licence = "data CC-BY-4.0 (Zenodo); the repository states none: internal use until its authors agree"
+tiers = ["ES", "FR", "ERA"]
+state = "partial"
+kit = "benches/breadth/era-shacl"
+check = "every report against TopBraid's (the reference implementation of the spec's editor): results as (focus, path, value, component, severity) bags"
+note = "Engines in memory, each in its own container (upstream's CLI contract); the published numbers per engine are in the repository's results/. The era shape set uses SHACL-SPARQL"
 
 [fulltext-search]
 title = "Keyword search: ResearchSpace's search queries; LUBMft"
 kind = "performance"
 tasks = ["search"]
 needs = ["load", "query", "fulltext"]
-source = "ResearchSpace's templates; l3s.de/~minack/rdf-fulltext-benchmark"
+source = "ResearchSpace's templates; LUBMft (Minack, Siberski, Nejdl, ESWC 2009): its generator and query template are lost (l3s.de answers 404 since April 2024, the archive kept only the page and the paper); the paper's 20 queries remain"
 licence = "to check before use"
 tiers = ["-"]
 state = "planned"
@@ -304,6 +352,91 @@ tiers = ["-"]
 state = "planned"
 check = "answers against the single-store run"
 
+# --- breadth: each feature's benchmark, its competitors on their home turf (benches/breadth) ---
+[starbench]
+title = "StarBench: 56 SPARQL-star queries over BKR (61 M statements as RDF-star)"
+kind = "performance"
+tasks = ["basics"]
+needs = ["load", "query", "rdf12"]
+scales = "BKR, one size"
+source = "github.com/dkw-aau/SPARQL-star-Benchmark at 34e8aab (queries, CC-BY-4.0, in benches/breadth/starbench/queries); data Zenodo 4148888"
+licence = "queries CC-BY-4.0; data Apache-2.0"
+tiers = ["bkr"]
+state = "partial"
+kit = "benches/breadth/starbench"
+check = "answer counts across systems; GraphDB (the paper's fastest) as the reference"
+note = "GraphDB and Stardog load the RDF-star file; the RDF 1.2 systems one reifier per distinct quoted triple (rdfstar_to_rdf12.py), which keeps the answers. Published: Jena 4.7.0, Oxigraph 0.3.16, GraphDB 10.0.2 and a commercial 'Engine X' (Stardog 8.1, by the repository)"
+
+[geographica2]
+title = "Geographica 2: GeoSPARQL micro and macro workloads on real data, synthetic and scalability sets"
+kind = "performance"
+tasks = ["space"]
+needs = ["load", "query", "geosparql"]
+scales = "real-world sets (GAG, CORINE, LGD, GeoNames, DBpedia, Hotspots, Census), synthetic, scalability 10 K to 500 M"
+source = "github.com/AI-team-UoA/Geographica2 at 8bc1fe1; data and query lists at geographica2.di.uoa.gr"
+licence = "code Apache-2.0; datasets per source (CORINE, LinkedGeoData ODbL, GeoNames CC-BY): internal until checked"
+tiers = ["real", "census", "synthetic", "scalability"]
+state = "planned"
+kit = "benches/breadth/geographica2"
+check = "answer counts across systems; a dispute settled by a minimised witness"
+note = "Published: Strabon, uSeekM, Parliament, GraphDB 8.6.1, RDF4J 2.4.3 and a proprietary System X; Jena GeoSPARQL and QLever added here"
+
+[fedshop]
+title = "FedShop200: federated BSBM-like shops, 20 to 200 members, 120 queries"
+kind = "performance"
+tasks = ["federation"]
+needs = ["query", "federation"]
+scales = "batches of 20, 40, ... 200 members"
+source = "github.com/GDD-Nantes/FedShop at 37f2e15; data, queries, reference source assignments and published results Zenodo 7919872"
+licence = "data CC-BY-4.0; code GPL-3.0 (run, never shipped)"
+tiers = ["20", "100", "200"]
+state = "planned"
+kit = "benches/breadth/fedshop"
+check = "answers against the reference source assignment's"
+note = "NRESE runs only the SERVICE-annotated reference source assignments: it has no source selection over a federation (a finding). FedX, CostFed, Semagrow, HeFQUIN, FedUP published"
+
+[vibe]
+title = "VIBE: recall against throughput on modern embeddings, in and out of distribution"
+kind = "performance"
+tasks = ["search"]
+needs = ["vector"]
+scales = "0.5 M to 21 M vectors, 200 to 2,048 dimensions"
+source = "github.com/vector-index-bench/vibe at 7ac76c1; data huggingface.co/datasets/vector-index-bench/vibe"
+licence = "MIT; per dataset"
+tiers = ["agnews-mxbai-1024-euclidean", "arxiv-nomic-768-normalized"]
+state = "planned"
+kit = "benches/breadth/vectors"
+check = "recall@10 against the dataset's exact neighbours"
+note = "Algorithm level, one core, under Apptainer; the database systems aren't VIBE methods (their own ground is vector-dbbench)"
+
+[vector-dbbench]
+title = "VectorDBBench: load, recall, QPS and p99 of vector databases, with and without filters"
+kind = "performance"
+tasks = ["search"]
+needs = ["vector"]
+scales = "Cohere 1 M and 10 M x 768; OpenAI 0.5 M and 5 M x 1,536; filters at 1 % and 99 %"
+source = "github.com/zilliztech/VectorDBBench at 139f8a3"
+licence = "MIT; datasets per source"
+tiers = ["performance768d1m", "performance768d1m1p", "performance768d1m99p"]
+state = "planned"
+kit = "benches/breadth/vectors"
+check = "recall against the case's ground truth"
+note = "The database vendors' own ground: Qdrant, Milvus, pgvector and LanceDB have clients there; NRESE needs one (SPARQL with nrv:search)"
+
+[larger-than-memory]
+title = "LUBM 1000 under memory caps: load, OWL 2 RL closure and the 14 queries at 16, 12, 8, 6, 4 and 2 GB"
+kind = "performance"
+tasks = ["RT1", "RT5"]
+needs = ["load", "query"]
+scales = "LUBM 1000: 138 M asserted"
+source = "the lubm workload's data (benches/datasets.toml, lubm-1000.nt)"
+licence = "GPL-2.0 (generator); data is generated"
+tiers = ["16g", "12g", "8g", "6g", "4g", "2g"]
+state = "planned"
+kit = "benches/breadth/memory-budget"
+check = "the same closure size and answers as uncapped"
+note = "Systems with a memory budget of their own degrade (NRESE's budgets, QLever's sort memory, JVM heaps); the others are killed at the cap: failed, never a time"
+
 # --- the fast suite -----------------------------------------------------------------------
 
 [fast]
@@ -313,7 +446,7 @@ tasks = ["basics", "RT1", "RT3"]
 # load only: rule engines without SPARQL (Nemo) have their closure answered by Oxigraph, as
 # for LUBM; the plain cases' stores all have query.
 needs = ["load"]
-scales = "generated, 10-300 s per case (benches/fast/cases.toml)"
+scales = "generated, 10-300 s per case (benches/cases/)"
 source = "benches/fast: perf_lab generate (deterministic, seeded) and the reasoning kit's LUBM and OWL2Bench"
 licence = "ours; LUBM GPL-2.0 (generator), OWL2Bench queries CC-BY-4.0"
 tiers = ["q-cycles~plain", "rl-hierarchy~closure", "rl-clique"]
@@ -335,3 +468,118 @@ tiers = ["-"]
 state = "ready"
 kit = "scripts"
 check = "the scripts' assertions"
+
+# --- the home-turf benchmarks scheduled first (12 Oct 2026; suite/schedule.toml) ----------
+
+[claros]
+title = "Claros (L, LE): RDFox's and GLog's datasets, rules that build large cliques"
+kind = "performance"
+tasks = ["RT1", "RT2"]
+needs = ["load"]
+any = ["reason-owl2-rl", "reason-custom-rules"]
+scales = "18.8 M triples in; L derives about 89 M, LE about 549 M facts (GLog's counts)"
+source = "Claros from RDFox's ISWC 2015 test data (Oxford); the L and LE programs in VLog's syntax from GLog's VLDB 2021 package (fetched by hash)"
+licence = "unstated: ask Oxford and GLog's authors before publishing"
+tiers = ["l", "le"]
+state = "partial"
+kit = "benches/reasoning/datalog"
+check = "facts per relation (each relation is one triple pattern) across the engines; GLog's published totals"
+note = "The worst case for proof-based deletion; GLog's single-thread result (Claros-L 119 s against RDFox's 2,512 s, reported). The kit runs NRESE (the program as user rules), Soufflé, Nemo, VLog and GLog; RDFox waits for a licence. LE's closure may not fit Office-PC's 31 GiB on every engine"
+
+[sspe]
+title = "SSPE: single-source path graphs where one deletion invalidates long derivations"
+kind = "performance"
+tasks = ["RT2"]
+needs = ["load", "reason-incremental", "rules-nary", "rules-arithmetic"]
+scales = "millions of edges; 1 to 1,000 deletions"
+source = "generated from the description of Hu, Motik and Horrocks (counting against B/F)"
+licence = "ours (generated)"
+tiers = ["1000"]
+state = "planned"
+check = "the incremental closure equals the rematerialised one"
+note = "Counting beat B/F 10.5 s to 253 s for 1,000 deletions (reported); the fast case deletes-layered is its small cousin. Blocked as published on both sides: its rules add path lengths (`z := z1 + z2`) over a ternary relation, and NRESE's user rules have neither arithmetic nor relations beyond triples; RDFox has no licence here"
+
+[datalog-graphs]
+title = "Datalog graph programs: transitive closure, same generation, CSPA"
+kind = "performance"
+tasks = ["RT1"]
+needs = ["load", "reason-custom-rules"]
+scales = "BigDatalog's graphs of 5 k to 40 k nodes (TC and SG: 25 M to 400 M derived facts); Graspan's httpd, Linux and PostgreSQL graphs (CSPA: 3.7 to 5.5 M ValueFlow facts, 324 M facts in all on httpd)"
+source = "FlowLog's benchmark suite (Zhao et al., VLDB 2026): programs from github.com/flowlog-rs/vldb26-artifact (Apache-2.0, vendored), data from its Hugging Face dataset"
+licence = "programs Apache-2.0; datasets without a stated licence (fetched, never committed)"
+tiers = ["tc-G10K", "sg-G10K", "cspa-httpd", "cspa-linux", "cspa-postgresql"]
+state = "partial"
+kit = "benches/reasoning/datalog"
+check = "derived facts per relation against Soufflé's published counts (FlowLog's reproduction logs); counts across the engines"
+note = "The batch executor beyond OWL: plain Datalog as N3 rules; Nemo, VLog and Soufflé on their home turf. Extra tiers: tc-G5K (the qualifier), tc-G20K (400 M facts), CSDA, reachability on LiveJournal, Galen (ternary relations: not expressible on NRESE)"
+
+[commit-latency]
+title = "Commit latency under 0, 1, 8 and 64 readers, the closure complete at every commit"
+kind = "performance"
+tasks = ["RT2"]
+needs = ["load", "update", "reason-incremental"]
+scales = "LUBM 10 under OWL 2 RL, commits of 1 to 10 k statements"
+source = "ours (report item 20): nobody publishes it"
+licence = "ours"
+tiers = ["lubm-10"]
+state = "partial"
+kit = "benches/reasoning/maintenance"
+check = "every change is undone, so the closure must hash back to the one the load materialised"
+note = "Over the SPARQL protocol on every system (the suite's adapters): batches of 1, 100 and 10,000 inserts and deletes, a schema axiom removed and restored, single-triple commits under 0, 1, 8 and 64 readers. GraphDB Free serves two queries at once, so more readers measure its queueing; RDFox waits for a licence. The fast cases commits-readers and writes-under-readers cover NRESE in process"
+
+[elk-ontologies]
+title = "Classification of large EL and near-EL ontologies: GO, ChEBI, NCIt, GALEN"
+kind = "performance"
+tasks = ["RT6"]
+needs = ["classify"]
+scales = "50 to 500 MB each"
+source = "release-pinned files of GO, ChEBI, NCIt and GALEN"
+licence = "GO and ChEBI CC-BY 4.0; NCIt CC-BY 4.0; GALEN free (SNOMED CT stays internal)"
+tiers = ["go", "chebi", "ncit", "galen"]
+state = "planned"
+kit = "benches/reasoning/el-classification"
+check = "taxonomies against ELK's and Konclude's, by canonical hash"
+note = "ELK's home turf: EL classification speed"
+
+[pagoda-suite]
+title = "PAGOdA's test suite: query answering beyond OWL 2 RL"
+kind = "performance"
+tasks = ["RT3"]
+needs = ["load", "query"]
+any = ["reason-owl2-rl", "classify"]
+scales = "to 10 M facts: LUBM, UOBM, FLY, NPD, DBpedia+, ChEMBL, Reactome, UniProt with their queries"
+source = "PAGOdA's site (the datasets and queries it publishes)"
+licence = "per dataset; PAGOdA's code to check"
+tiers = ["lubm", "uobm", "fly", "npd", "dbpedia"]
+state = "planned"
+check = "answers against a complete reasoner (HermiT, Konclude)"
+note = "Query answering by lower and upper bounds, as NRESE's DL mode answers"
+
+[vector-recall]
+title = "Filtered k-NN: recall and time of vector search under a filter"
+kind = "performance"
+tasks = ["vector"]
+needs = ["load", "query"]
+scales = "generated: 200 k vectors of 64 dimensions, a filter of one kind in ten; big-ann-benchmarks' filtered track (YFCC-10M)"
+source = "ours (perf_lab's vectors generator); github.com/harsha-simhadri/big-ann-benchmarks at 89a3aba (filtered track; published on an Azure D8lds v5: parlayivf 37,902 QPS, puck 19,193, faiss 3,033 at recall 0.9)"
+licence = "ours; big-ann MIT, YFCC CC-BY variants"
+tiers = ["generated-200k", "yfcc-10m"]
+state = "partial"
+kit = "benches/fast"
+check = "recall@10 against the exact search"
+note = "The fast cases vector-knn-exact and vector-knn-filtered; why the filtered recall failed: runs/2026-10-12-vector-recall-phuoc.toml, and the probe-first route's beam not widened for the filter (fixed 12 Oct: recall 0.98, runs/2026-10-12-vector-filtered-fix-phuoc.toml)"
+
+[ann-benchmarks]
+title = "ann-benchmarks: recall and throughput curves of approximate k-NN"
+kind = "performance"
+tasks = ["vector"]
+needs = ["load", "query"]
+scales = "SIFT-1M, GloVe-100, Fashion-MNIST (0.1 to 1 GB)"
+source = "github.com/erikbern/ann-benchmarks at 2e081ad; data ann-benchmarks.com (pinned in benches/datasets.toml)"
+licence = "MIT; data sets per set"
+tiers = ["sift-128-euclidean", "glove-100-angular", "fashion-mnist-784-euclidean"]
+state = "partial"
+kit = "benches/breadth/vectors"
+check = "recall@10 against the sets' ground truth"
+note = "Comparability with every published index. NRESE as a module in upstream's harness (its server in the container, SPARQL per query); Qdrant 1.19.2 and pgvector v0.8.7 pinned (upstream pins Qdrant 1.5.1 and builds pgvector's master); hnswlib as the library reference"
+

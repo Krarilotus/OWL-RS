@@ -323,6 +323,13 @@ impl StoreService {
         Ok(rematerialisation.finish(Vec::new())?.inferred_deleted)
     }
 
+    /// Waits until the engine's background maintenance has nothing requested or running
+    /// ([`Engine::settle`]): for measurements of what the store holds.
+    #[doc(hidden)]
+    pub fn settle(&self) {
+        self.engine.settle();
+    }
+
     pub(crate) fn engine(&self) -> &Engine {
         &self.engine
     }
@@ -812,12 +819,18 @@ impl StoreService {
     }
 
     /// The plan `prepared` would run as, each node with its estimated rows, without
-    /// running it (EXPLAIN without ANALYZE).
-    pub fn plan_query(&self, prepared: &PreparedQuery) -> StoreResult<crate::PlannedQuery> {
+    /// running it (EXPLAIN without ANALYZE). Planning stops with
+    /// [`nrese_sparql::QueryEvaluationError::Cancelled`] once `cancellation` is cancelled.
+    pub fn plan_query(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<crate::PlannedQuery> {
         let mut planned = plan_prepared(
             &self.read_snapshot(prepared.access()),
             prepared,
             &self.settings,
+            cancellation,
         )?;
         planned.completeness = match self.dl_mode(prepared) {
             Some(_) => Some(crate::dl::query::plan_status(self, prepared)),

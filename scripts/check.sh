@@ -210,13 +210,34 @@ changed_files() {
   git ls-files --others --exclude-standard
 }
 
-# With a build host (scripts/lib/remote.sh), this machine only selects the changed files; the
-# host runs every step on a snapshot of this working tree.
-if [ -z "${NRESE_ON_BUILD_HOST:-}" ] && [ -n "${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}" ]; then
+# This machine selects the changed files. With a build host (scripts/lib/remote.sh), the host
+# runs every step on a snapshot of this working tree; without one, or with NRESE_BUILD_HOST=local,
+# this script runs them here. Either way a passed tier is remembered.
+build_host=${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}
+# A machine's guard marks it busy (low memory or disk); then a local build goes to the build host.
+if [ "$build_host" = local ] && [ -f "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}" ]; then
+  echo "this machine is busy ($(cat "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}")); building on the build host" >&2
+  build_host=$(git config --get nrese.buildHost)
+fi
+if [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
   list=$(mktemp)
   [ "$mode" = all ] || changed_files "$mode" > "$list"
-  bash scripts/lib/remote.sh check "$mode" "$list"
+  # A tier that passed for this exact tree and file list doesn't run again. So the gate can
+  # run before `git push`, whose hook then needn't hold the remote's connection open for it.
+  key="$mode $(bash scripts/lib/remote.sh tree) $(git hash-object "$list")"
+  passed="$(git rev-parse --git-common-dir)/nrese-gate-passed"
+  if grep -qxF "$key" "$passed" 2> /dev/null; then
+    echo "=== $mode: passed before for this tree and these files"
+    rm -f "$list"
+    exit 0
+  fi
+  if [ -n "$build_host" ] && [ "$build_host" != local ]; then
+    bash scripts/lib/remote.sh check "$mode" "$list"
+  else
+    NRESE_ON_BUILD_HOST=1 NRESE_FILES_FROM="$list" bash scripts/check.sh "$mode"
+  fi
   code=$?
+  [ $code -eq 0 ] && echo "$key" >> "$passed"
   rm -f "$list"
   exit $code
 fi

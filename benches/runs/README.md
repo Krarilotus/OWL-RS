@@ -9,6 +9,7 @@ SHA-256. [../STATUS.md](../STATUS.md) is generated from these records and the re
 python benches/suite/suite.py ledger benches/suite/results/<run>   # write or refresh a suite run's record
 python benches/suite/suite.py ledger --all                         # every local results directory
 python benches/suite/suite.py status --write                       # regenerate ../STATUS.md
+python benches/suite/suite.py standings --write                    # regenerate ../STANDINGS.md
 ```
 
 Refreshing a record keeps the hand-written fields. A run on another host gets its record
@@ -34,6 +35,7 @@ the same shape ([2026-10-11-horn-recovery.toml](2026-10-11-horn-recovery.toml) i
 | `cases` | one verdict per case (below), its numbers in `note` |
 | `findings` | what the verdicts don't say, a line each |
 | `pairs` | suite runs: one outcome per workload, tier and system (below), generated |
+| `versus` | suite runs with comparators: NRESE against each free comparator per case, generated ([../suite/suitekit/versus.py](../suite/suitekit/versus.py)): answers, the queries timed, NRESE / comparator time with its 95 % interval, `win`, `tie`, `loss` or `no-verdict`, load and memory ratios; [../STANDINGS.md](../STANDINGS.md) is made of them. Never a licensed system's |
 
 ## A case's verdict
 

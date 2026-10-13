@@ -10,6 +10,9 @@
 #   reason-owl2-rl               the OWL 2 RL/RDF rules
 #   reason-owl2-ql               OWL 2 QL (by rewriting or materialisation)
 #   reason-custom-rules          user-defined rules (datalog or the vendor's rule language)
+#   rules-nary                   user rules over relations of any arity, not only triples
+#   rules-negation               stratified negation in user rules
+#   rules-arithmetic             arithmetic in user rules (`z := z1 + z2`)
 #   reason-incremental           inferences maintained on insert and delete without
 #                                rematerialising
 #   consistency                  inconsistencies detected
@@ -17,11 +20,15 @@
 #   classify                     TBox classification (OWL 2 EL or DL)
 #   shacl-core, shacl-sparql     SHACL validation
 #   fulltext, geosparql, federation
+#   rdf12                        statements about statements: RDF 1.2 triple terms and
+#                                reifiers, or RDF-star's quoted triples (SPARQL-star)
+#   vector                       k-nearest-neighbour search over embeddings
 #
 # `publish`: free = results may be published; permission = only with the vendor's written
 # consent (benches/competitors/README.md). `runs`: how the suite can start it
-# (suitekit/adapters.py): docker, apptainer (the same image as a SIF file), native (a
-# host process); kit: only a kit outside the driver runs it.
+# (suitekit/adapters.py): docker, apptainer (the same image as a SIF file), rootfs (the same
+# image unpacked and run with bubblewrap, for a host without Docker), native (a host
+# process); kit: only a kit outside the driver runs it.
 # `variant-of`: another build of a system (a setting or a baseline branch); the status counts
 # its gaps apart, as optional.
 #
@@ -32,17 +39,22 @@
 [nrese]
 name = "NRESE"
 publish = "free"
-runs = ["docker", "apptainer", "native"]
+runs = ["docker", "rootfs", "apptainer", "native"]
 capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
   "reason-custom-rules", "reason-incremental", "consistency", "explain",
   "shacl-core", "shacl-sparql", "fulltext", "federation", "geosparql", "classify",
+  "rdf12", "vector",
 ]
-# What the suite needs and NRESE lacks; each names its step in the parity plan. None
-# since SHACL-SPARQL (C3, 2026-10-02). (reason-custom-rules: user rules in Notation3 since
-# 2026-10-01; builtins and .pie import are B2's rest.)
-missing = {}
+# What the suite needs and NRESE lacks; each names its step in the parity plan.
+# (reason-custom-rules: user rules in Notation3 since 2026-10-01; builtins and .pie import
+# are B2's rest.) The rule engines' home turf (benches/reasoning/datalog, 12 Oct 2026)
+# found the rest: NRESE's user rules are over triples, without negation or arithmetic, so
+# Galen (ternary relations), Doop (arity up to 7, negation) and SSPE (path lengths added
+# over a ternary relation) are not expressible. A scope question for the owner, not for
+# v1.5's week; the three families wait in the backlog (suite/schedule.toml).
+missing = { rules-nary = "not planned: user rules are over triples (Galen, Doop, SSPE need ternary and wider relations); owner's scope decision", rules-negation = "not planned: no negation in user rules (Doop's stratified negation); owner's scope decision", rules-arithmetic = "not planned: math builtins are B2's rest (SSPE adds path lengths); owner's scope decision" }
 
 # The same server with FSST-compressed vocabularies (`store.vocabulary = "fsst"`): next to
 # `nrese` (plain, the default) it shows the trade-off of a smaller store and less memory
@@ -52,12 +64,13 @@ missing = {}
 name = "NRESE (FSST vocabulary)"
 variant-of = "nrese"
 publish = "free"
-runs = ["docker", "apptainer", "native"]
+runs = ["docker", "rootfs", "apptainer", "native"]
 capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
   "reason-custom-rules", "reason-incremental", "consistency", "explain",
   "shacl-core", "shacl-sparql", "fulltext", "federation", "geosparql", "classify",
+  "rdf12", "vector",
 ]
 missing = {}
 
@@ -68,7 +81,7 @@ missing = {}
 name = "NRESE on Oxigraph (baseline/pre-oxigraph-migration)"
 variant-of = "nrese"
 publish = "free"
-runs = ["docker", "apptainer", "native"]
+runs = ["docker", "rootfs", "apptainer", "native"]
 capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
@@ -79,44 +92,52 @@ capabilities = [
 [qlever]
 name = "QLever"
 publish = "free"
-runs = ["docker", "apptainer"]
+runs = ["docker", "rootfs", "apptainer"]
 capabilities = ["load", "query", "update", "fulltext", "geosparql", "federation"]
 
 [oxigraph]
 name = "Oxigraph"
 publish = "free"
-runs = ["docker", "apptainer"]
-capabilities = ["load", "query", "update", "federation"]
+runs = ["docker", "rootfs", "apptainer"]
+capabilities = ["load", "query", "update", "federation", "rdf12"]
 
 [virtuoso]
 name = "Virtuoso Open Source 7"
 publish = "free"
-runs = ["docker", "apptainer"]
+runs = ["docker", "rootfs", "apptainer"]
 capabilities = ["load", "query", "update", "fulltext", "geosparql", "federation"]
 
 [jena]
 name = "Apache Jena (TDB2, Fuseki, rule reasoners)"
 publish = "free"
-runs = ["docker", "apptainer"]
+runs = ["docker", "rootfs", "apptainer"]
 # The rule reasoners work on an in-memory model; TDB2 itself doesn't reason.
 capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-custom-rules",
-  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
+  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation", "rdf12",
 ]
+
+# Built by benches/sparql/images.sh from the commit of the Sparqloscope paper's results
+# (benches/competitors/millenniumdb/Dockerfile): no published image exists.
+[millenniumdb]
+name = "MillenniumDB"
+publish = "free"
+runs = ["docker", "rootfs"]
+capabilities = ["load", "query"]
 
 [rdf4j]
 name = "Eclipse RDF4J (native store)"
 publish = "free"
 runs = ["docker"]
-capabilities = ["load", "query", "update", "reason-rdfs", "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation"]
+capabilities = ["load", "query", "update", "reason-rdfs", "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation", "rdf12"]
 
 [nemo]
 name = "Nemo (datalog), general OWL 2 RL encoding (benches/reasoning/nemo/owl2rl.rls)"
 publish = "free"
 runs = ["docker", "apptainer"]
 # No SPARQL: the kit answers queries over its materialisation with another engine.
-capabilities = ["load", "reason-owl2-rl", "reason-custom-rules"]
+capabilities = ["load", "reason-owl2-rl", "reason-custom-rules", "rules-nary", "rules-negation", "rules-arithmetic"]
 
 # Nemo with the other two encodings (benches/reasoning/nemo/): the same engine, so every
 # Nemo number names the rules it ran.
@@ -133,6 +154,27 @@ variant-of = "nemo"
 publish = "free"
 runs = ["docker", "apptainer"]
 capabilities = ["load", "reason-owl2-rl", "reason-custom-rules"]
+
+# The Datalog engines of the rule-reasoning home turf (benches/reasoning/datalog): each runs
+# the same program on the same facts in its own language, under the kit's driver.
+[souffle]
+name = "Soufflé 2.5 (compiled programs; UPL-1.0)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["load", "reason-custom-rules", "rules-nary", "rules-negation", "rules-arithmetic"]
+
+[vlog]
+name = "VLog 1.3.7 (karmaresearch; Apache-2.0)"
+publish = "free"
+runs = ["kit"]
+# Its negation isn't listed until a run of the kit confirms it.
+capabilities = ["load", "reason-custom-rules", "rules-nary"]
+
+[glog]
+name = "GLog (VLog with trigger graphs, VLDB 2021; Apache-2.0), commit 69d4842"
+publish = "free"
+runs = ["kit"]
+capabilities = ["load", "reason-custom-rules", "rules-nary"]
 
 [owlrl]
 name = "owlrl (reference OWL 2 RL closure; correctness only)"
@@ -174,19 +216,32 @@ capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql", "reason-custom-rules",
   "reason-incremental", "consistency", "explain",
-  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
+  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation", "rdf12",
 ]
 
+# Its evaluation licence was refused (owner, 12 Oct 2026; AllegroGraph's too): it runs
+# nowhere, now or later. Its home turf compares NRESE with VLog and GLog on RDFox's own
+# programs, and RDFox's published numbers are reported rows (benches/reasoning/reported).
 [rdfox]
 name = "RDFox"
 publish = "permission"
-runs = ["docker", "apptainer"]
+# No evaluation licence for us (Oxford Semantic Technologies, 12 Oct 2026): never measured;
+# its published numbers are listed as reported (benches/competitors/reported.toml).
+refused = "no evaluation licence (12 Oct 2026): its published numbers only, as reported"
+runs = []
 capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-custom-rules",
   "reason-incremental", "consistency", "explain",
   "shacl-core", "fulltext", "federation", "geosparql", "classify",
 ]
+
+[allegrograph]
+name = "AllegroGraph"
+publish = "permission"
+refused = "no evaluation licence (12 Oct 2026): its published numbers only, as reported"
+runs = []
+capabilities = ["load", "query", "update", "reason-rdfs", "fulltext", "geosparql"]
 
 [stardog]
 name = "Stardog"
@@ -197,7 +252,7 @@ capabilities = [
   "load", "query", "update",
   "reason-rdfs", "reason-owl2-rl", "reason-owl2-ql", "reason-custom-rules",
   "consistency", "explain",
-  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
+  "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation", "rdf12",
 ]
 
 [anzograph]
@@ -205,3 +260,55 @@ name = "AnzoGraph DB (Altair Graph Lakehouse)"
 publish = "permission"
 runs = ["docker"]
 capabilities = ["load", "query", "update", "reason-rdfs", "reason-owl-horst", "federation"]
+
+# The vector databases (benches/breadth/vectors): each runs on its own benchmarks' ground
+# (VectorDBBench, its ann-benchmarks module) through the vectors kit, not the SPARQL cycle.
+[qdrant]
+name = "Qdrant"
+publish = "free"
+runs = ["kit"]
+capabilities = ["vector"]
+
+[milvus]
+name = "Milvus (standalone, with etcd and MinIO)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["vector"]
+
+[pgvector]
+name = "PostgreSQL with pgvector"
+publish = "free"
+runs = ["kit"]
+capabilities = ["vector"]
+
+[lancedb]
+name = "LanceDB (embedded)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["vector"]
+
+# SHACL engines of ERA-SHACL (benches/breadth/era-shacl): each in memory in its own
+# container, as that benchmark builds them.
+[topbraid]
+name = "TopBraid SHACL (the reference implementation of the spec's editor)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["shacl-core", "shacl-sparql"]
+
+[pyshacl]
+name = "pySHACL (rdflib)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["shacl-core", "shacl-sparql"]
+
+[maplib]
+name = "maplib (Rust, Polars)"
+publish = "free"
+runs = ["kit"]
+capabilities = ["shacl-core"]
+
+[corese]
+name = "Corese"
+publish = "free"
+runs = ["kit"]
+capabilities = ["shacl-core", "shacl-sparql"]

@@ -25,7 +25,7 @@ AB = [(4700, 1332, {"load": 1789, "reason": 2023, "queries": 1332}),
 
 
 def old_record(container, peak, phases, rep=1):
-    """A record as fast.py wrote it before 12 Oct 2026: the container's peak as the case's."""
+    """A record as fast.py wrote it before 13 Oct 2026: the cgroup's peak as the case's."""
     return {"case": "rl-lubm100", "rep": rep, "status": "ok", "metric": 1500.0,
             "samples": {"reason": [1500.0] * 3}, "checks": [], "routes": [],
             "peak_mib": container, "phase_peaks": phases,
@@ -34,7 +34,7 @@ def old_record(container, peak, phases, rep=1):
 
 def report(peaks):
     records = [{"case": "c", "rep": rep, "status": "ok", "metric": 1.0, "samples": {"q": [1.0] * 4},
-                "checks": [], "routes": [], "peak_mib": peak, "container_peak_mib": None}
+                "checks": [], "routes": [], "peak_mib": peak, "memory_kind": "lifetime"}
                for rep, peak in enumerate(peaks, 1)]
     return {"reps": len(peaks), "records": records}
 
@@ -62,7 +62,8 @@ class FastMemory(unittest.TestCase):
             with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", measured):
                 record = fast.measure(case, "peaks", 1, {}, {}, "none")
         self.assertEqual(record["peak_mib"], 2023)
-        self.assertEqual(record["container_peak_mib"], 4700)
+        self.assertEqual(record["memory_kind"], "lifetime")
+        self.assertEqual(record["cgroup_peak_mib"], 4700)
 
     def test_old_records_give_their_processs_peak(self):
         records = [old_record(*entry, rep=i) for i, entry in enumerate(AB, 1)]
@@ -74,7 +75,7 @@ class FastMemory(unittest.TestCase):
     def test_peaks_varying_past_the_bound_are_not_compared(self):
         code, text = comparison(report([2375, 4700]), report([2400, 2410]))
         self.assertEqual(code, 1)
-        self.assertIn("memory NOT COMPARABLE (peaks vary 98% between repetitions)", text)
+        self.assertIn("NOT COMPARABLE (peaks vary 98% between repetitions)", text)
         self.assertNotIn("MORE MEMORY", text)
 
     def test_more_memory_counts_beyond_the_spread_of_peaks(self):

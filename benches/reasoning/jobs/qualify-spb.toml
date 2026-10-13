@@ -1,0 +1,17 @@
+id = "reasoning-qualify-spb"
+group = "reasoning"
+host = "office-pc"
+checkout = "suite/reasoning"
+workload = "ldbc-spb"
+window = "any"
+priority = 1
+est_min = 150
+needs = ["docker"]
+env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server", NRESE_VERSION = "16c3bfb", NRESE_LICENSES = "/home/krarilotus/nrese-assets/kraris-gptler-20261009/snapshots/windows/nrese-bench/licenses", DOCKER_MEMORY = "20g", DOCKER_CPUS = "8" }
+# The pipeline first, small: 1 M generated, then one short benchmark run on each system (its
+# log shows the driver's summary format); then the 50 M tier's data, generated once and frozen.
+commands = [
+  ["python3", "benches/reasoning/spb/spb.py", "generate", "--size", "1000000"],
+  ["sh", "-c", "python3 benches/reasoning/spb/spb.py run --systems nrese,graphdb --size 1000000 --runs 1 --agents 8,2 --duration-s 60 --warmup-s 10 --results \"$QUEUE_RESULTS/pipeline-1m\" || true"],
+  ["python3", "benches/reasoning/spb/spb.py", "generate", "--size", "50000000"],
+]
