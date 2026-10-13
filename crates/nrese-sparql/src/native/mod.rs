@@ -103,11 +103,11 @@ use std::borrow::Cow;
 
 use crate::query::{PlanStep, QueryOptions};
 use aggregate::{
-    Agg, Aggregator, Number, aggregate_in_one_pass, counts_rows, finish_total, integer, integer_agg,
+    Agg, Aggregator, Number, aggregate_in_one_pass, counts_rows, finish_total, integer,
+    integer_agg, number_of,
 };
 pub use aggregate::{average, group_concat, sum};
 use expr::Evaluator;
-use value::Value;
 
 /// A right side at least this many times larger than the running result is joined by
 /// probing the index once per result row instead of scanning it.
@@ -5158,10 +5158,7 @@ impl<'a> Context<'a> {
                 let binding = aggregator.binding(solutions, row);
                 match aggregator.evaluator.eval(expr, &binding) {
                     None => Number::Error,
-                    Some(term) => match Numeric::of(&Value::of(&term)) {
-                        Some(number) => Number::Value(number),
-                        None => Number::Other,
-                    },
+                    Some(term) => number_of(&term),
                 }
             };
             let found: Vec<(u64, Number)> = if missing.len() < 2 * PARALLEL_EXPRESSION_ROWS {
