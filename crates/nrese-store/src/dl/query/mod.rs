@@ -23,9 +23,9 @@
 //! an open gap, U1 not available, consistency not proven, a reader who sees part of the
 //! data. Bag semantics: L's rows keep their multiplicities; a proved row is added once.
 
+use nrese_dl::limits::{Deadline, Limit};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
 
 use nrese_engine::{ReadModel, Snapshot, TermId};
 use nrese_owl::{Axiom, ClassExpr, ExprId, Literal, ObjProp, Ontology};
@@ -77,14 +77,16 @@ pub(crate) fn ontology_at(store: &StoreService, snapshot: &Snapshot) -> Arc<Onto
 }
 
 /// The data's consistency at `snapshot`'s revision: recorded by its commit, proved by U1,
-/// or checked now (once per revision). A recorded or proved verdict survives the request's
-/// expiry, not its cancellation.
+/// or checked now (once per revision) within the request's envelope `memory`. A recorded
+/// or proved verdict survives the request's expiry, not its cancellation; a verdict its
+/// envelope limited isn't recorded either.
 fn consistency_at(
     store: &StoreService,
     snapshot: &Snapshot,
     view: &View,
     cancellation: &CancellationToken,
-    deadline: Instant,
+    deadline: Deadline,
+    memory: &nrese_exec::Envelope,
 ) -> Verdict {
     if cancellation.is_cancelled() {
         return Verdict::Unknown("cancelled".to_owned());
@@ -104,7 +106,9 @@ fn consistency_at(
         if cancellation.is_cancelled() {
             Some(Verdict::Unknown("cancelled".to_owned()))
         } else {
-            (Instant::now() >= deadline).then(|| Verdict::Unknown("past dl.timeout".to_owned()))
+            deadline
+                .passed()
+                .then(|| Verdict::Unknown(Limit::Time.reached("the deadline passed")))
         }
     };
     if let Some(stopped) = stopped() {
@@ -112,14 +116,18 @@ fn consistency_at(
     }
     let cancel = nrese_dl::tableau::Cancel::from_flag(cancellation.flag());
     let ontology = ontology_at(store, snapshot);
-    let budget = gate::budget(store, Some(cancel)).remaining(deadline);
+    let budget = gate::budget(store, Some(cancel), memory).remaining(deadline);
     if let Some(stopped) = stopped() {
         return stopped;
     }
     let checked = consistency::check(&ontology, &budget);
-    // Request-local cancellation or expiry must not replace shared revision status.
+    // Request-local cancellation, expiry or memory must not replace shared revision
+    // status.
     if let Some(stopped) = stopped() {
         return stopped;
+    }
+    if memory.refused() {
+        return checked.verdict;
     }
     store.dl().record(DlStatus {
         revision: snapshot.revision(),
@@ -233,14 +241,18 @@ fn plan_status_built(store: &StoreService, prepared: &PreparedQuery) -> Status {
 }
 
 /// The certain answers of `prepared` as far as they can be proven, and their status.
+/// Everything the request holds draws from its envelope `memory`: the bounds'
+/// evaluations and retained results, the gap, the exact services' compilation scratch and
+/// engines.
 pub(crate) fn answer(
     store: &StoreService,
     prepared: &PreparedQuery,
     cancellation: &CancellationToken,
+    memory: &nrese_exec::Envelope,
     mode: DlAnswers,
 ) -> StoreResult<Outcome> {
     cancellation.check()?;
-    let outcome = decide_answers(store, prepared, cancellation, mode)?;
+    let outcome = decide_answers(store, prepared, cancellation, memory, mode)?;
     cancellation.check()?;
     let status = match &outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => status,
@@ -262,6 +274,10 @@ pub(crate) fn answer(
 #[cfg(test)]
 #[path = "../query_tests.rs"]
 mod cancellation_tests;
+
+#[cfg(test)]
+#[path = "../envelope_tests.rs"]
+mod envelope_tests;
 
 /// How a query is answered: over the lower bound as it streams (its status known before
 /// it runs), or with answers collected and completed through the bounds.
@@ -287,9 +303,10 @@ fn decide_answers(
     store: &StoreService,
     prepared: &PreparedQuery,
     cancellation: &CancellationToken,
+    memory: &nrese_exec::Envelope,
     mode: DlAnswers,
 ) -> StoreResult<Outcome> {
-    let deadline = Instant::now() + store.config().dl.timeout;
+    let deadline = Deadline::after(store.config().dl.timeout);
     let settings = store.query_settings();
     if prepared.access().is_some() {
         return Ok(Status::sound_only(
@@ -308,7 +325,7 @@ fn decide_answers(
     let (snapshot, view) = super::bounds::view(store);
     let analysis = analyse(prepared.query());
     let mut status = Status::complete();
-    let consistency = consistency_at(store, &snapshot, &view, cancellation, deadline);
+    let consistency = consistency_at(store, &snapshot, &view, cancellation, deadline, memory);
     cancellation.check()?;
     match consistency {
         Verdict::Consistent => {}
@@ -349,6 +366,7 @@ fn decide_answers(
             prepared,
             settings,
             cancellation,
+            memory,
         )?));
         #[cfg(not(debug_assertions))]
         return Ok(status.stream(lower_view(&view)));
@@ -376,21 +394,18 @@ fn decide_answers(
         );
         return Ok(status.stream(lower_view(&view)));
     }
-    use crate::query_executor::{bound_budget, evaluate_bound};
+    use crate::query_executor::evaluate_bound;
     use nrese_sparql::TypedResults;
-    let lower = evaluate_bound(&view.lower, prepared, settings, cancellation, 0)?;
+    let lower = evaluate_bound(&view.lower, prepared, settings, cancellation, memory)?;
     // Sound lower truth needs neither the upper evaluation nor a candidate search.
     if matches!(lower, TypedResults::Boolean(true)) {
         status.path("lower-true-ask");
         status.set_counts(lower_counts(1));
         return Ok(status.answers(lower));
     }
-    let retained = match &lower {
-        TypedResults::Solutions(rows) => rows.reserved_bytes(),
-        _ => 0,
-    };
+    // The lower result keeps its reservation in the envelope while the upper evaluates.
     let upper_snapshot = view.upper.as_ref().expect("available");
-    let upper = evaluate_bound(upper_snapshot, prepared, settings, cancellation, retained)?;
+    let upper = evaluate_bound(upper_snapshot, prepared, settings, cancellation, memory)?;
     let (answers, counts, unresolved_why) = match (lower, upper) {
         (TypedResults::Boolean(false), TypedResults::Boolean(false)) => {
             (Answers::Boolean(false), lower_counts(0), None)
@@ -405,6 +420,7 @@ fn decide_answers(
                 &candidates,
                 cancellation,
                 deadline,
+                memory,
             );
             let mut counts = Counts {
                 lower: 0,
@@ -430,13 +446,11 @@ fn decide_answers(
             (Answers::Boolean(found), counts, decided.why)
         }
         (TypedResults::Solutions(lower), TypedResults::Solutions(upper)) => {
-            let budget = bound_budget(
-                prepared,
-                settings,
-                retained.saturating_add(upper.reserved_bytes()),
-            );
+            // The gap's work, a part of the request beside the retained bounds.
+            let budget = Arc::new(memory.part());
             let mut pair = lower.align(upper, Arc::clone(&budget))?;
-            let limit = store.config().dl.max_candidates;
+            // A query's candidate budget, unlimited where none is set.
+            let limit = store.config().dl.max_candidates.unwrap_or(usize::MAX);
             let gap = gap::select(
                 &mut pair,
                 limit.saturating_add(super::UNRESOLVED_SHOWN),
@@ -470,6 +484,7 @@ fn decide_answers(
                     &rows,
                     cancellation,
                     deadline,
+                    memory,
                 );
                 decided.paths.iter().for_each(|p| status.path(p));
                 if why.is_none() {
@@ -492,7 +507,7 @@ fn decide_answers(
                 }
             }
             if gap.total > limit as u64 {
-                why.get_or_insert_with(|| format!("past dl.max_candidates ({limit})"));
+                why.get_or_insert_with(|| Limit::Candidates.reached(limit));
                 for &index in &gap.rows[admitted..] {
                     if status.detail.unresolved.len() == super::UNRESOLVED_SHOWN {
                         break;

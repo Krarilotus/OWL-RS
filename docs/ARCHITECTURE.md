@@ -41,7 +41,7 @@ Outside the layer model: `nrese-sparql-reference` (the SPARQL evaluator written 
 |---|---|---|
 | `crates/rdf/` | The RDF model (`nrese-rdf`: IRIs, terms, quads, canonicalisation), every RDF syntax (`nrese-rdf-io`), SPARQL syntax and algebra (`nrese-sparql-syntax`), the results formats (`nrese-sparql-results`), XSD values and the OWL 2 datatype map (`nrese-xsd`), JSON (`nrese-json`). | Storage, evaluation, reasoning. |
 | `nrese-engine` | Term model and dictionary encoding (`TermId`), quad indexes in all needed permutations, LSM runs and compaction, MVCC snapshots, the commit protocol, the write-ahead log and checkpoints, bulk load, cardinality statistics. | SPARQL semantics, RDF syntax parsing, validation or reasoning rules, HTTP. |
-| `nrese-exec` | Id-level tables, joins, grouping, graph closures and capacity accounting with its one RAII reservation type; the DL batch-width handle (`Workers`). It never decodes a term and depends on no NRESE crate. | Term values, storage, SPARQL or rule semantics; server-wide admission policy. |
+| `nrese-exec` | Id-level tables, joins, grouping, graph closures and capacity accounting (the server's budget, each request's envelope) with its one RAII reservation type; the DL batch-width handle (`Workers`). It never decodes a term and depends on no NRESE crate. | Term values, storage, SPARQL or rule semantics; server-wide admission policy. |
 | `nrese-vector` | Vector literals' distances and indexes (exact scan, HNSW). | Terms, storage, SPARQL. |
 | `nrese-owl` | The OWL 2 structural model read from RDF or the functional syntax, its diagnostics, and the normaliser into DL-clauses (automata for role inclusions, lazy definitions). | Search, storage, rule evaluation. |
 | `nrese-dl` | The OWL 2 DL engines over `nrese-owl`'s clauses: context saturation, tableau search and immutable compiled probes with fresh search state, portfolio, classification and realisation. | Storage, SPARQL, HTTP; when to run (the store and reasoner decide), query-to-assumption adaptation. |
@@ -52,8 +52,8 @@ Outside the layer model: `nrese-sparql-reference` (the SPARQL evaluator written 
 | `nrese-server` | Routes, content negotiation, auth backends, policy (limits, timeouts, rate limits), deployment posture, operator/console hosting, AI suggestions, mapping store errors to HTTP. | Any data semantics. It never touches the engine directly. |
 
 Queries execute on their caller; parallel kernels run on Rayon's global pool. The store's
-`Runtime` owns the catalog-wide native query budget, and `Workers` sets the width of DL
-candidate batches. Resource lifetimes, reservations and the kernel boundary are in
+`Runtime` owns the catalog-wide budget, which each request draws on through one envelope,
+and `Workers` sets the width of DL candidate batches. Resource lifetimes, reservations and the kernel boundary are in
 [execution-core.md](design/execution-core.md#execution-and-resource-lifetime).
 
 ### 2.2 Data flow

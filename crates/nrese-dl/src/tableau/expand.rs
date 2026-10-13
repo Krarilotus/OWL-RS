@@ -8,11 +8,11 @@
 
 use std::time::Instant;
 
-use super::BRANCH_BUDGET;
 use super::depset::DepSetId;
 use super::engine::{Engine, Frame, Lit, Step, Stop, proof};
 use super::graph::{Annot, Edge, NONE, flag};
 use super::program::{Filler, Number};
+use crate::limits::Limit;
 
 impl Engine<'_> {
     /// The live neighbours of `s` along the number's role whose filler holds, each with
@@ -165,14 +165,21 @@ impl Engine<'_> {
                 let need = (n.saturating_mul(n.saturating_sub(1)) / 2)
                     .saturating_mul(48)
                     .saturating_add(n * 256);
-                if (self.bytes() as u64).saturating_add(need) > self.config.max_memory as u64 {
-                    return Err(Stop::Abandon(
-                        dep,
-                        format!(
-                            "≥ {} successors with their inequalities exceed the memory budget",
-                            number.n
-                        ),
-                    ));
+                let after = (self.bytes() as u64).saturating_add(need);
+                let limit = if self
+                    .config
+                    .max_memory
+                    .is_some_and(|most| after > most as u64)
+                {
+                    Some(Limit::Memory)
+                } else if !self.reserve(usize::try_from(after).unwrap_or(usize::MAX)) {
+                    Some(Limit::Envelope)
+                } else {
+                    None
+                };
+                if let Some(limit) = limit {
+                    let what = format_args!("≥ {} successors with their inequalities", number.n);
+                    return Err(Stop::Abandon(dep, limit.reached(what)));
                 }
                 let data = self.p.data_roles.get(number.role.role as usize) == Some(&true);
                 let mut fresh = Vec::with_capacity(number.n as usize);
@@ -342,10 +349,9 @@ impl Engine<'_> {
             .max_branch_points
             .is_some_and(|m| self.stats.branch_points >= m)
         {
-            return Err(Stop::GaveUp(format!(
-                "{BRANCH_BUDGET} ({})",
-                self.stats.branch_points
-            )));
+            return Err(Stop::GaveUp(
+                Limit::BranchPoints.reached(self.stats.branch_points),
+            ));
         }
         self.stats.branch_points += 1;
         let id = self.next_level;

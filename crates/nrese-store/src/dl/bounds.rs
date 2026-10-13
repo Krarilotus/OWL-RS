@@ -16,9 +16,9 @@
 //! embedded reads and diagnostic rebuilds. A stopped U1 is unavailable, never complete;
 //! zero disables the store's watch without changing the process owner's fallback.
 
+use nrese_dl::limits::Deadline;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use nrese_engine::{EncodedQuad, EncodedTriple, ReadModel, Snapshot, TermId, Transaction};
 use nrese_owl::Ontology;
@@ -150,9 +150,9 @@ pub(crate) struct Preparation {
 pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>) -> Preparation {
     let base = tx.base().revision();
     let pending = tx.pending_snapshot();
-    let deadline = Instant::now() + store.config().dl.timeout;
+    let deadline = Deadline::after(store.config().dl.timeout);
     let memory = store.memory_stop();
-    let stop = move || stop() || Instant::now() >= deadline || memory.exceeded();
+    let stop = move || stop() || deadline.passed() || memory.exceeded();
     let state = store
         .dl()
         .bounds
@@ -375,9 +375,9 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
             true => not_compiled(),
             false => {
                 let normalised = nrese_owl::normalise(&ontology);
-                let deadline = Instant::now() + store.config().dl.timeout;
+                let deadline = Deadline::after(store.config().dl.timeout);
                 let memory = store.memory_stop();
-                let stop = move || Instant::now() >= deadline || memory.exceeded();
+                let stop = move || deadline.passed() || memory.exceeded();
                 let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve(replica, &tx, t);
                 Upper::build(&ontology, &normalised, &snapshot, &resolve, &stop)
             }
@@ -614,8 +614,8 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
         let ontology = source::read_snapshot(&snapshot);
         let normalised = nrese_owl::normalise(&ontology);
         let memory = store.memory_stop();
-        let deadline = Instant::now() + store.config().dl.timeout;
-        let stop = || Instant::now() >= deadline || memory.exceeded();
+        let deadline = Deadline::after(store.config().dl.timeout);
+        let stop = || deadline.passed() || memory.exceeded();
         let upper = Upper::build(
             &ontology,
             &normalised,

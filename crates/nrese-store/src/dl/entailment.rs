@@ -7,6 +7,7 @@
 //! It is the oracle of the exact services (`ExactGroundEntailment`: a ground atom is an
 //! axiom), and of entailment checks of whole documents ([`crate::StoreService::entails_dl`]).
 
+use nrese_dl::limits::Deadline;
 use nrese_owl::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, ObjProp, Ontology, RangeId};
 
 use super::consistency::{self, Budget, Verdict};
@@ -288,10 +289,26 @@ fn pairs<T: Copy>(v: &[T]) -> impl Iterator<Item = (T, T)> + '_ {
         .flat_map(move |(i, &a)| v[i + 1..].iter().map(move |&b| (a, b)))
 }
 
+/// A copy of `premise` for tests to extend: compilation scratch, reserved from the
+/// request's envelope before it is made; `Unknown` where the envelope has no room.
+fn copy(
+    premise: &Ontology,
+    budget: &Budget,
+) -> Result<(Ontology, nrese_dl::memory::Scratch), Entailed> {
+    let mut scratch = nrese_dl::memory::Scratch::new(budget.memory.as_ref());
+    scratch
+        .charge(|| nrese_dl::memory::ontology_bytes(premise))
+        .map_err(|_| Entailed::Unknown(nrese_dl::memory::EXHAUSTED.to_owned()))?;
+    Ok((premise.clone(), scratch))
+}
+
 /// Whether `premise` (consistent) entails `axiom`, an axiom over `premise`'s interners.
 /// `fresh` are individuals the premise doesn't name (three or more).
 pub fn entails(premise: &Ontology, axiom: &Axiom, fresh: &[u64], budget: &Budget) -> Entailed {
-    let mut o = premise.clone();
+    let (mut o, _scratch) = match copy(premise, budget) {
+        Ok(copy) => copy,
+        Err(unknown) => return unknown,
+    };
     let tests = match negations(&mut o, axiom, fresh) {
         Ok(tests) => tests,
         Err(why) => return Entailed::Unknown(why),
@@ -321,7 +338,10 @@ pub fn entails(premise: &Ontology, axiom: &Axiom, fresh: &[u64], budget: &Budget
 /// Whether `premise` (consistent) entails that some individual is an instance of
 /// `class` (of `premise`'s interners): `class ⊑ ⊥` makes it inconsistent.
 pub fn nonempty(premise: &Ontology, class: ExprId, budget: &Budget) -> Entailed {
-    let mut o = premise.clone();
+    let (mut o, _scratch) = match copy(premise, budget) {
+        Ok(copy) => copy,
+        Err(unknown) => return unknown,
+    };
     let nothing = intern(&mut o, ClassExpr::Nothing);
     o.axioms.push(Axiom::SubClassOf(class, nothing));
     o.sources.push(Vec::new());
@@ -340,7 +360,10 @@ pub fn entails_ontology(
     fresh: &[u64],
     budget: &Budget,
 ) -> Entailed {
-    let mut o = premise.clone();
+    let (mut o, _scratch) = match copy(premise, budget) {
+        Ok(copy) => copy,
+        Err(unknown) => return unknown,
+    };
     o.data.extend(&conclusion.data);
     let tests: Vec<Test> = {
         let mut import = Import {
@@ -353,8 +376,8 @@ pub fn entails_ontology(
             .map(|a| Test::Axiom(import.axiom(a)))
             .collect()
     };
-    let deadline = std::time::Instant::now() + budget.timeout;
-    let compiled = Batch::new(&mut o, &tests);
+    let deadline = Deadline::after(budget.timeout);
+    let compiled = Batch::new(&mut o, &tests, budget.memory.as_ref());
     let mut answer = Entailed::Yes;
     for (index, test) in tests.iter().enumerate() {
         answer = answer.and(compiled.check(index, test, &o, fresh, &budget.remaining(deadline)));

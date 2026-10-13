@@ -7,9 +7,19 @@
 //!   --tax FILE            the canonical taxonomy (`benches/reasoning/dl/canonical.py`'s format)
 //!   --real FILE           realise too, and write the canonical realisation
 //!   --threads N           workers (default 1)
+//!
+//! Budgets: none is built in (`nrese_dl::limits`); each option below sets one, 0 for none.
 //!   --timeout SECS        a deadline for the whole run
-//!   --test-timeout SECS   a budget per hypertableau test
-//!   --lower-bound-timeout SECS  the Horn lower bound's budget
+//!   --memory-mib N        the run's memory envelope, shared by every engine of the run
+//!   --tableau-memory-mib N  each hypertableau test's memory of its own
+//!   --max-nodes N         the most nodes one hypertableau test may hold
+//!   --max-branch-points N the most branch points one hypertableau test may open
+//!   --max-merges N        the most merges one hypertableau test may make
+//!   --test-timeout SECS   each hypertableau test's time
+//!   --max-memory-mb N     the most memory the process may hold while the context core runs
+//!   --task-memory-mib N   sampled saturation-capacity envelope of the context core
+//! Route thresholds (past them the hypertableau decides; defaults in `classify::Options`):
+//!   --lower-bound-timeout SECS  the Horn lower bound's time
 //!   --repeat N            run N times; times are the median of the runs
 //!   --expand-at-most N    spell `≤ n` out as clauses up to this `n` (else at-most atoms)
 //!   --cautious-lower-bound  the lower bound's context core with Strategy::Cautious
@@ -17,8 +27,6 @@
 //!   --equality            the context core takes functional properties (its Eq rule)
 //!   --max-join N          the most conclusions one context-core join may make
 //!   --max-join-steps N    the most steps one context-core Pred join may take
-//!   --max-memory-mb N     the most memory the process may hold while the context core runs
-//!   --task-memory-mib N   sampled saturation-capacity envelope; 0 disables observations
 //!   --clauses             print the DL-clauses with more than one head atom, then stop
 //!   --no-context-core --no-inline --no-lower-bound --no-exact-shortcut --no-model-pruning
 //!   --no-skip-seen --no-tbox-only --no-detached-probes --no-reuse-model
@@ -203,14 +211,23 @@ fn args() -> Result<Args, String> {
         match arg.as_str() {
             "--threads" => a.options.workers = Workers::new(number("--threads")? as usize),
             "--repeat" => a.repeat = number("--repeat")?.max(1) as usize,
-            "--timeout" => a.options.timeout = Some(Duration::from_secs(number("--timeout")?)),
+            "--timeout" => a.options.timeout = seconds(number("--timeout")?),
             "--lower-bound-timeout" => {
-                a.options.lower_bound_timeout =
-                    Duration::from_secs(number("--lower-bound-timeout")?);
+                a.options.lower_bound_timeout = seconds(number("--lower-bound-timeout")?);
             }
-            "--test-timeout" => {
-                a.options.tableau.timeout = Some(Duration::from_secs(number("--test-timeout")?));
+            "--test-timeout" => a.options.tableau.timeout = seconds(number("--test-timeout")?),
+            "--memory-mib" => {
+                a.options.tableau.memory = mib(number("--memory-mib")?)?
+                    .map(|bytes| nrese_exec::Envelope::new(Some(bytes), None));
             }
+            "--tableau-memory-mib" => {
+                a.options.tableau.max_memory = mib(number("--tableau-memory-mib")?)?;
+            }
+            "--max-nodes" => a.options.tableau.max_nodes = count(number("--max-nodes")?),
+            "--max-branch-points" => {
+                a.options.tableau.max_branch_points = limit(number("--max-branch-points")?);
+            }
+            "--max-merges" => a.options.tableau.max_merges = limit(number("--max-merges")?),
             "--tax" => a.tax = it.next(),
             "--real" => a.real = it.next(),
             "--no-context-core" => a.options.context_core = false,
@@ -230,12 +247,10 @@ fn args() -> Result<Args, String> {
             "--eager-lower-bound" => {
                 a.options.lower_bound_strategy = nrese_dl::context::Strategy::Eager;
             }
-            "--max-join" => a.options.max_join = number("--max-join")? as usize,
-            "--max-join-steps" => {
-                a.options.max_join_steps = number("--max-join-steps")? as usize;
-            }
+            "--max-join" => a.options.max_join = count(number("--max-join")?),
+            "--max-join-steps" => a.options.max_join_steps = count(number("--max-join-steps")?),
             "--max-memory-mb" => {
-                a.options.max_memory = Some(number("--max-memory-mb")? << 20);
+                a.options.max_memory = limit(number("--max-memory-mb")?).map(|mb| mb << 20);
             }
             "--task-memory-mib" => {
                 a.options.task_memory = task_memory(number("--task-memory-mib")?)?;
@@ -250,6 +265,23 @@ fn args() -> Result<Args, String> {
         }
     }
     Ok(a)
+}
+
+/// A budget's value: 0 for none.
+fn limit(n: u64) -> Option<u64> {
+    (n > 0).then_some(n)
+}
+
+fn count(n: u64) -> Option<usize> {
+    limit(n).map(|n| n as usize)
+}
+
+fn seconds(n: u64) -> Option<Duration> {
+    limit(n).map(Duration::from_secs)
+}
+
+fn mib(n: u64) -> Result<Option<usize>, String> {
+    task_memory(n)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

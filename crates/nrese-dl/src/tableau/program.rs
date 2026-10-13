@@ -253,6 +253,73 @@ pub fn left_out(ontology: &Ontology, normalised: &Normalised) -> Vec<String> {
 }
 
 impl Program {
+    /// What the program holds, by capacity (an estimate: [`crate::memory`]). O(clauses +
+    /// plans).
+    pub fn bytes(&self) -> usize {
+        use crate::memory::table;
+        fn list<T>(v: &Vec<T>) -> usize {
+            v.capacity() * size_of::<T>()
+        }
+        fn plans(v: &Vec<Vec<Plan>>) -> usize {
+            list(v)
+                + v.iter()
+                    .map(|plans| {
+                        list(plans)
+                            + plans
+                                .iter()
+                                .map(|p| {
+                                    list(&p.steps)
+                                        + list(&p.heads_after)
+                                        + p.heads_after.iter().map(list).sum::<usize>()
+                                })
+                                .sum::<usize>()
+                    })
+                    .sum::<usize>()
+        }
+        let a = &self.assertions;
+        let maps = [
+            table(
+                self.concept_ids.len(),
+                size_of::<(ConceptName, ConceptId)>(),
+            ),
+            table(self.role_ids.len(), size_of::<(Term, RoleId)>()),
+            table(self.individual_ids.len(), size_of::<(Term, u32)>()),
+            table(self.numbers.len(), size_of::<((bool, Number), u32)>()),
+            table(self.annotation_ids.len(), size_of::<(Number, u32)>()),
+            table(
+                self.keyed_by.len(),
+                size_of::<((RoleId, ConceptId, bool), Vec<u32>)>(),
+            ) + self.keyed_by.values().map(list).sum::<usize>(),
+            table(self.disjoint.len(), size_of::<(ConceptId, ConceptId)>()),
+        ];
+        list(&self.concepts)
+            + list(&self.roles)
+            + list(&self.individuals)
+            + list(&self.at_least)
+            + list(&self.at_most)
+            + list(&self.annotations)
+            + list(&self.at_most_annotation)
+            + list(&self.clauses)
+            + self
+                .clauses
+                .iter()
+                .map(|c| list(&c.body) + list(&c.head))
+                .sum::<usize>()
+            + plans(&self.by_concept)
+            + plans(&self.by_role)
+            + plans(&self.keyed)
+            + list(&self.everywhere)
+            + list(&a.concepts)
+            + list(&a.roles)
+            + list(&a.same)
+            + list(&a.different)
+            + list(&a.data)
+            + list(&self.data_roles)
+            + list(&self.keys)
+            + list(&self.anonymous)
+            + maps.iter().sum::<usize>()
+    }
+
     /// The program of `normalised` (the normalisation of `ontology`).
     pub fn compile(ontology: &Ontology, normalised: &Normalised) -> Self {
         let mut p = Program {

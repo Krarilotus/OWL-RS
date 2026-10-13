@@ -30,12 +30,12 @@ const X: Term = 900_000;
 
 fn config() -> Config {
     Config {
-        max_nodes: 20_000,
+        max_nodes: Some(20_000),
         // Bounded by branch points and nodes, not the clock; the timeout is only a safety
         // net (a loaded machine must not turn a decided case into a skipped one).
         max_branch_points: Some(100_000),
         timeout: Some(Duration::from_secs(300)),
-        max_memory: 256 << 20,
+        max_memory: Some(256 << 20),
         ..Config::default()
     }
 }

@@ -254,28 +254,32 @@ impl Engine<'_> {
         }
         let (facts, edges) = self.g.live_ids(n);
         for i in facts {
+            let room = self.firing_room();
             super::hyper::join_concept(
                 self.p,
                 &self.g,
                 &mut self.deps,
                 i,
                 &mut self.firings,
+                room,
                 &mut self.stats.plans_tried,
             );
-            if let Err(stop) = self.apply_firings() {
+            if let Err(stop) = self.apply_firings(room) {
                 return Some(Err(stop));
             }
         }
         for i in edges {
+            let room = self.firing_room();
             super::hyper::join_edge(
                 self.p,
                 &self.g,
                 &mut self.deps,
                 i,
                 &mut self.firings,
+                room,
                 &mut self.stats.plans_tried,
             );
-            if let Err(stop) = self.apply_firings() {
+            if let Err(stop) = self.apply_firings(room) {
                 return Some(Err(stop));
             }
         }

@@ -238,7 +238,7 @@ QLever's delta triples suit small deltas.
   permutations locally, a coordinator for atomic updates, an entity-stream mode for
   Wikidata-style replays.
 
-## 8. Query progress under shared cache waits (proposal)
+## 8. Query progress under shared cache waits (decided: the bounded rule)
 
 **Problem.** The result cache shares an unfinished part through a `Flight`
 (`nrese-sparql/src/cache.rs`): the first query to claim a part computes it, later ones
@@ -273,13 +273,21 @@ an embedding application calling the store from inside its own Rayon jobs.
 | `SERVICE` callbacks run on the caller, between evaluation segments | changes who pays the callback's CPU; needs the task form above |
 | Recompute every contended part, or serialise cached queries | relaxes sharing, or loses independent-query throughput |
 
-**Decision needed.** Whether the bounded rule (a worker never blocks on a flight) is
-enough now that queries run on their caller, or the continuation design is wanted for
-explicit embedding; and who owns `SERVICE` callback CPU. Either way the acceptance checks
-are the same: the forced reproduction plus one-worker and nested-kernel variants
-progress without a watchdog; compute-once, pinning, renamed-variable sharing and
-snapshot isolation hold; cancellation at each wait releases reservations; the no-wait
-path gains no hop per operator (QPS per width, p50/p99, memory by phase).
+**Decision (owner, 12 October 2026): the bounded rule.** A request on a Rayon worker never
+blocks on a flight: `ResultCache::claim` gives it the part to compute itself, beside the
+flight, under a flight of its own that nobody finds; the result is offered to the cache like
+any other (so pinning holds), and requests outside a pool still wait (compute-once). Duplicate
+work and memory arise only where a worker would have waited. The continuation design is not
+for v1.5; it comes back only if embedding needs it. `SERVICE` callback CPU stays with the
+caller: callbacks run inside evaluation, on the thread that evaluates. The acceptance checks
+are the guards in `nrese-sparql/src/cache.rs`: the forced reproduction above
+(`a_request_stolen_by_its_producers_kernel_computes_the_part_itself`, the diagnostic test
+with the worker's request computing instead of waiting), the one-worker variant (a kernel on
+a pool's only worker asking for the part its caller computes) and the nested-kernel variant
+(requests in kernels nested within a kernel, one pinning, beside a caller that waits) all
+progress with their watchdog unused. Renamed-variable sharing and snapshot isolation are
+unchanged (keys and flights are as before; `tests/it/result_cache_tests.rs`); the no-wait path
+gains one thread-local read on a contended claim only.
 
 ## Order of work
 

@@ -649,7 +649,11 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
     elif tool == "tableau":
         files = [data] * repeat + ([data_file(case["data_alt"])] * repeat if case.get("data_alt") else [])
         timeout = str(case.get("timeout_s", 300))
-        command = ["/target/release/examples/tableau_consistency", "--timeout", timeout, *files]
+        # The engine's budgets are the case's limits, as any system's in its container: the
+        # time limit and the container's memory as the run's envelope, nothing tighter.
+        envelope = str(int(case["cap_gb"] * 1024))
+        command = ["/target/release/examples/tableau_consistency", "--timeout", timeout,
+                   "--memory-mib", envelope, *files]
         code, out, err, wall = container(name, case["cap_gb"], command)
         rows = parse_tableau(out)
         # The tool names each file as it was given: natively, by its host path.
