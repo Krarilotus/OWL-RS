@@ -363,3 +363,106 @@ pub fn read(document: &str) -> Result<(Ontology, Names), String> {
     }
     Ok((o, names))
 }
+
+/// A case with DL-safe rules (`nrese_owl::rules`) read as [`read`] does: its only
+/// diagnostics may be the rules'.
+pub fn read_with_rules(document: &str) -> Result<(Ontology, Names), String> {
+    let mut table = Table::default();
+    let scope = nrese_owl::scope::SCOPE;
+    let mut name = |local: &str| table.iri_id(&format!("{scope}{local}"));
+    let names = Names {
+        classes: [name("A"), name("B")],
+        individuals: [name("a"), name("b")],
+        fresh: name("x"),
+    };
+    let (o, _) = nrese_owl::read_functional(document, &mut table);
+    if let Some(d) = o
+        .diagnostics
+        .iter()
+        .find(|d| !matches!(d, nrese_owl::Diagnostic::Rule { .. }))
+    {
+        return Err(format!("a diagnostic besides the rules': {d:?}"));
+    }
+    Ok((o, names))
+}
+
+/// The answers to a case with rules, each by [`crate::beyond::consistency`]: of the case,
+/// then of the case with the test of each question (`x : A`, `x : A ⊓ ¬B`, `x : ¬A`,
+/// `a : ¬A`, …, `x` a fresh anonymous individual). Certified marks: `m` a model of the
+/// whole case (with the test) checked, `g` inconsistent by monotonicity (the DL part with
+/// rule instances); `u` with why where one isn't decided.
+pub fn answer_beyond(o: &Ontology, names: &Names, options: &crate::beyond::Options) -> Answers {
+    use crate::beyond::{Verdict, consistency};
+    let decide = |o: &Ontology| -> Result<bool, String> {
+        match consistency(o, options).verdict {
+            Verdict::Consistent { .. } => Ok(true),
+            Verdict::Inconsistent { .. } => Ok(false),
+            Verdict::Undecided(why) => Err(why),
+        }
+    };
+    match decide(o) {
+        Err(why) => return Answers::undecided('u', &why),
+        Ok(false) => {
+            return Answers {
+                code: "i".into(),
+                certified: format!("g{}", "-".repeat(10)),
+            };
+        }
+        Ok(true) => {}
+    }
+    let [a, b] = names.classes;
+    let x = names.fresh;
+    let mut code = String::from("c");
+    let mut certified = String::from("m");
+    for k in 0..10 {
+        // The test: who, in which class; and whether a model of it answers "yes".
+        let (sub, not, at, yes_if_consistent) = match k {
+            0 => (Some(a), None, x, true),
+            1 => (Some(b), None, x, true),
+            2 => (Some(a), Some(b), x, false),
+            3 => (Some(b), Some(a), x, false),
+            4 => (None, Some(a), x, false),
+            5 => (None, Some(b), x, false),
+            6 => (None, Some(a), names.individuals[0], false),
+            7 => (None, Some(b), names.individuals[0], false),
+            8 => (None, Some(a), names.individuals[1], false),
+            _ => (None, Some(b), names.individuals[1], false),
+        };
+        let mut test = o.clone();
+        let mut parts: Vec<ExprId> = Vec::new();
+        if let Some(s) = sub {
+            parts.push(ExprId(test.classes.intern(ClassExpr::Class(s))));
+        }
+        if let Some(n) = not {
+            let c = ExprId(test.classes.intern(ClassExpr::Class(n)));
+            parts.push(ExprId(test.classes.intern(ClassExpr::Not(c))));
+        }
+        parts.sort();
+        let c = match parts[..] {
+            [one] => one,
+            _ => ExprId(test.classes.intern(ClassExpr::And(parts))),
+        };
+        test.axioms.push(Axiom::ClassAssertion(c, at));
+        test.sources.push(Vec::new());
+        if at == x {
+            test.anonymous.insert(x);
+        }
+        match decide(&test) {
+            Err(why) => {
+                return Answers::undecided(
+                    'u',
+                    &format!("{}: {why}", nrese_owl::scope::QUESTIONS[k]),
+                );
+            }
+            Ok(consistent) => {
+                code.push(if consistent == yes_if_consistent {
+                    '1'
+                } else {
+                    '0'
+                });
+                certified.push(if consistent { 'm' } else { 'g' });
+            }
+        }
+    }
+    Answers { code, certified }
+}

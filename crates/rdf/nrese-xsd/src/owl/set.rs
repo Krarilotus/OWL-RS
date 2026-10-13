@@ -892,6 +892,160 @@ impl ValueSet {
         out.extend(self.xml.values(limit)?.into_iter().map(Value::XmlLiteral));
         (out.len() as u64 <= limit).then_some(out)
     }
+
+    /// Up to `k` of its values, distinct: every value where it has at most `k`, else
+    /// values found among candidates near its bounds and among small ones (each checked
+    /// with [`Self::contains`]). Fewer than `k` where the candidates miss (a pattern no
+    /// small string matches, irrational numbers): a witness search then has no answer,
+    /// never a wrong one.
+    pub fn sample(&self, k: usize) -> Vec<Value> {
+        if let Some(all) = self.values(k as u64) {
+            return all;
+        }
+        let mut found: Vec<Value> = Vec::new();
+        let take = |v: Value, found: &mut Vec<Value>| {
+            if found.len() < k && self.contains(&v) && !found.contains(&v) {
+                found.push(v);
+            }
+        };
+        let steps = k as i128 + 2;
+        // Numbers of owl:real: near each segment's ends, then around zero.
+        let mut reals: Vec<Rational> = Vec::new();
+        for line in &self.real {
+            for s in line.segments() {
+                if let Some(p) = s.point() {
+                    reals.push(*p);
+                    continue;
+                }
+                for end in [s.from.map(|c| c.at), s.to.map(|c| c.at)]
+                    .into_iter()
+                    .flatten()
+                {
+                    for j in 0..steps {
+                        for den in [1, 2, 3, 10] {
+                            for sign in [1, -1] {
+                                if let Some(step) = Rational::new(sign * (j + 1), den)
+                                    && let Some(r) = add(end, step)
+                                {
+                                    reals.push(r);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for j in 0..steps {
+            for den in [1, 2, 3, 10] {
+                for sign in [1, -1] {
+                    reals.extend(Rational::new(sign * j, den));
+                }
+            }
+        }
+        for r in reals {
+            take(Value::Real(r), &mut found);
+        }
+        // Floats and doubles: from each segment's ends inwards.
+        for (line, double) in [(&self.float, false), (&self.double, true)] {
+            for s in line.segments() {
+                let (lo, hi) = integer_range(&s);
+                let mut ordinals: Vec<i128> = Vec::new();
+                for j in 0..steps {
+                    ordinals.extend(lo.map(|lo| lo + j));
+                    ordinals.extend(hi.map(|hi| hi - j));
+                    if lo.is_none() && hi.is_none() {
+                        ordinals.push(j);
+                    }
+                }
+                for o in ordinals {
+                    take(
+                        if double {
+                            Value::Double(bits64(o))
+                        } else {
+                            Value::Float(bits32(o))
+                        },
+                        &mut found,
+                    );
+                }
+            }
+        }
+        take(Value::Float(0x7fc0_0000), &mut found);
+        take(Value::Double(0x7ff8_0000_0000_0000), &mut found);
+        take(Value::Boolean(false), &mut found);
+        take(Value::Boolean(true), &mut found);
+        // Texts: short strings over a small alphabet, shortest first.
+        let mut texts: Vec<String> = vec![String::new()];
+        let mut length = 0;
+        while texts.len() < 64 * (k + 1) && length < 4 {
+            length += 1;
+            let more: Vec<String> = texts
+                .iter()
+                .filter(|t| t.chars().count() == length - 1)
+                .flat_map(|t| ['a', 'b', 'c', '0', '1', 'A'].map(|c| format!("{t}{c}")))
+                .collect();
+            texts.extend(more);
+        }
+        for t in &texts {
+            take(Value::String(t.clone()), &mut found);
+            take(Value::LangString(t.clone(), "en".into()), &mut found);
+            take(Value::AnyUri(format!("http://example.org/{t}")), &mut found);
+        }
+        // Date-times: near each segment's ends (by seconds and by units), and whole days
+        // from the epoch; the values added to a family.
+        const SECOND: i128 = 1_000_000_000_000_000_000;
+        for (line, zone) in [
+            (&self.times.base.zoned, Some(0)),
+            (&self.times.base.local, None),
+        ] {
+            for s in line.segments() {
+                let (lo, hi) = integer_range(&s);
+                for j in 0..steps {
+                    let near = [
+                        lo.and_then(|lo| lo.checked_add(j * SECOND)),
+                        lo.and_then(|lo| lo.checked_add(j)),
+                        hi.and_then(|hi| hi.checked_sub(j * SECOND)),
+                        hi.and_then(|hi| hi.checked_sub(j)),
+                    ];
+                    for t in near.into_iter().flatten() {
+                        take(Value::DateTime(t, zone), &mut found);
+                    }
+                }
+            }
+        }
+        for j in 0..steps {
+            let at = j * 86_400 * SECOND;
+            take(Value::DateTime(at, None), &mut found);
+            take(Value::DateTime(at, Some(0)), &mut found);
+        }
+        for &(t, z) in &self.times.plus {
+            take(Value::DateTime(t, z), &mut found);
+        }
+        for t in &self.strings.plus {
+            take(Value::String(t.clone()), &mut found);
+        }
+        for (t, tag) in &self.tagged.plus {
+            take(Value::LangString(t.clone(), tag.clone()), &mut found);
+        }
+        for t in &self.iris.plus {
+            take(Value::AnyUri(t.clone()), &mut found);
+        }
+        // Binary data: short sequences.
+        for j in 0..steps.min(256) {
+            let bytes = vec![j as u8; (j % 4) as usize];
+            take(Value::HexBinary(bytes.clone()), &mut found);
+            take(Value::Base64Binary(bytes), &mut found);
+        }
+        found
+    }
+}
+
+fn add(a: Rational, b: Rational) -> Option<Rational> {
+    Rational::new(
+        a.numerator()
+            .checked_mul(b.denominator())?
+            .checked_add(b.numerator().checked_mul(a.denominator())?)?,
+        a.denominator().checked_mul(b.denominator())?,
+    )
 }
 
 fn non_negative() -> Line<i128> {

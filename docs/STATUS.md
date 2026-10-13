@@ -98,9 +98,10 @@ one-axiom cases in the commit tier.
 **Certificates** ([design](design/owl2-dl.md) §10): "consistent", satisfiable classes and
 non-entailments of the hypertableau come with a model the independent checker
 (`nrese_dl::certificate`) verifies: 99.84 % of such claims on the small scope without data
-values (8,990,815 of 9,005,280); the number module's validated models likewise. Not yet:
-data values in models; "inconsistent" and entailments (the references decide them in the
-campaigns).
+values (8,990,815 of 9,005,280); the number module's validated models likewise. Data values
+since 13 October (the models carry the values the datatype theory assigns: 196 of the W3C
+suite's 199 consistent answers with a model certified, the 3 others listed with why). Not
+yet: "inconsistent" and entailments (the references decide them in the campaigns).
 
 **Incrementality** ([design](design/owl2-dl.md) §9): U1 and the RL closure maintained per
 commit; the consistency gate after a commit of assertions only, from a consistent
