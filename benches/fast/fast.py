@@ -236,8 +236,12 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
                               errors="replace", env={**ENV, **{k: str(v) for k, v in (env or {}).items()}})
     except subprocess.TimeoutExpired:
-        subprocess.run(["systemctl", "--user", "kill", "--signal=KILL", f"{unit}.scope"], capture_output=True)
         return 124, "", f"timed out after {timeout} s", time.monotonic() - started
+    finally:
+        # Nothing outlives its case (the kit rule after the whole-host OOM of 14 Oct 2026: a
+        # process that outlived its wrapper held its scope's memory): what the scope still
+        # holds is killed, whether the case ended, failed or timed out.
+        subprocess.run(["systemctl", "--user", "kill", "--signal=KILL", f"{unit}.scope"], capture_output=True)
     # The peak first: a record's note is the last line of stderr, the command's own.
     peaks = SCOPE_PEAK.findall(done.stderr)
     err = SCOPE_PEAK.sub("", done.stderr).rstrip("\n")
