@@ -60,6 +60,16 @@ enum Source<'a, R> {
     },
 }
 
+/// Where a statement starts, as `TurtleParser::statement_start` keeps it: the document offsets
+/// of its first token and of the input's position then, and the input's line counters.
+#[derive(Clone, Copy)]
+struct Start {
+    offset: u64,
+    from: u64,
+    line: u64,
+    line_start: u64,
+}
+
 /// The input, buffered: `data()[position..]` is unconsumed. Refilling keeps the unconsumed
 /// bytes (moved to the front) and reads more.
 struct Input<'a, R> {
@@ -129,21 +139,39 @@ impl<R: Read> Input<'_, R> {
         self.position += n;
     }
 
-    /// The text position of `data()[at]`, at or after the current position, its column in
-    /// bytes: O(at - position), for marks taken on every statement.
-    fn mark(&self, at: usize) -> TextPosition {
+    /// The text position of `start`, its column in bytes. Exact while the bytes between the
+    /// position it was taken at and it are buffered (always for slices); after a reader's
+    /// buffer moved past them, its line is the one of that position (only blank lines and
+    /// comments lie between).
+    fn resolve(&self, start: Start) -> TextPosition {
+        let Some(from) = start.from.checked_sub(self.base) else {
+            return TextPosition {
+                line: start.line,
+                column: start.offset.saturating_sub(start.line_start),
+                offset: start.offset,
+            };
+        };
         let data = self.data();
-        let at = at.clamp(self.position, data.len());
-        let before = &data[self.position..at];
+        let (from, at) = (from as usize, (start.offset - self.base) as usize);
+        let before = &data[from.min(data.len())..at.min(data.len())];
         let breaks = memchr::memchr_iter(b'\n', before).count() as u64;
         let line_start = match memchr::memrchr(b'\n', before) {
-            Some(i) => self.base + (self.position + i + 1) as u64,
-            None => self.line_start,
+            Some(i) => self.base + (from + i + 1) as u64,
+            None => start.line_start,
         };
-        let offset = self.base + at as u64;
         TextPosition {
-            line: self.line + breaks,
-            column: offset.saturating_sub(line_start),
+            line: start.line + breaks,
+            column: start.offset.saturating_sub(line_start),
+            offset: start.offset,
+        }
+    }
+
+    /// The text position of the current position, its column in bytes.
+    fn here(&self) -> TextPosition {
+        let offset = self.base + self.position as u64;
+        TextPosition {
+            line: self.line,
+            column: offset.saturating_sub(self.line_start),
             offset,
         }
     }
@@ -373,6 +401,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             // Where the statement starts (its first token), for an error's statement.
             let start = self.statement_start();
             if let Err(error) = self.statement() {
+                let start = self.input.resolve(start);
                 let syntax = matches!(error, RdfParseError::Syntax(_));
                 self.done =
                     !(syntax && self.settings.recover && !self.settings.n3 && self.resync());
@@ -389,8 +418,9 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     }
 
     /// Where the next statement starts: its first token, or the position where lexing it
-    /// fails. O(whitespace before it).
-    fn statement_start(&mut self) -> TextPosition {
+    /// fails. Kept as copies of the input's counters; `Input::resolve` makes it a text
+    /// position, for an error only. (The statement reads its first token anyway.)
+    fn statement_start(&mut self) -> Start {
         let at = match self.fill() {
             Ok(()) => self
                 .lookahead
@@ -398,7 +428,12 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 .map_or(self.input.position, |token| token.start),
             Err(_) => self.input.position,
         };
-        self.input.mark(at)
+        Start {
+            offset: self.input.base + at as u64,
+            from: self.input.base + self.input.position as u64,
+            line: self.input.line,
+            line_start: self.input.line_start,
+        }
     }
 
     /// `error` with the statement it is in, from `start` to where parsing resumes, and the
@@ -417,7 +452,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             GraphLabel::Iri(iri) => format!("<{iri}>"),
             GraphLabel::Blank(label) => format!("_:{label}"),
         });
-        let end = self.input.mark(self.input.position);
+        let end = self.input.here();
         error.with_statement(SkippedStatement {
             span: start..end,
             context,
