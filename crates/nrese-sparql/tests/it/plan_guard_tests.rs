@@ -241,6 +241,11 @@ fn filters_that_bound_a_variable_count_ranges() {
             "SELECT (COUNT(?s) AS ?n) WHERE { ?s e:knows ?o FILTER(isIRI(?o)) }",
             "1 ranges",
         ),
+        // Query 96's shape: a language among labels that have none.
+        (
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s e:label ?o FILTER(LANG(?o) = \"en\") }",
+            "0 ranges",
+        ),
     ] {
         let plan = steps(&engine, query);
         let step = plan

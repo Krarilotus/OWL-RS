@@ -278,7 +278,17 @@ pub(crate) fn bounded(expr: &Expression, snapshot: &Snapshot) -> Option<Bounded>
     };
     let mut kinds: Option<Vec<(TermId, TermId)>> = None;
     let mut compared: Vec<(Variable, Option<Bounds>)> = Vec::new();
+    // A language test holds for language-tagged strings only: their range, decided by
+    // the filter (Sparqloscope 096: none among 30.5 M names, a pass over every term).
+    let mut language = false;
     for conjunct in conjuncts {
+        if let Some(v) = language_test(conjunct) {
+            if !same(&mut variable, v) {
+                return None;
+            }
+            language = true;
+            continue;
+        }
         if let Expression::FunctionCall(function, args) = conjunct
             && let [Expression::Variable(v)] = args.as_slice()
             && let Some(ranges) = kind_ranges(function)
@@ -305,6 +315,13 @@ pub(crate) fn bounded(expr: &Expression, snapshot: &Snapshot) -> Option<Bounded>
     let variable = variable?;
     let (mut exact, mut checked) = (Vec::new(), Vec::new());
     match compared.pop() {
+        None if language => {
+            let tagged = [TermId::kind_range(TermKind::LangString)];
+            checked = match &kinds {
+                Some(kinds) => intersection(kinds, &tagged),
+                None => tagged.to_vec(),
+            };
+        }
         None => exact = kinds?,
         Some((_, bounds)) => {
             for (range, holds) in ranges(bounds?)? {
@@ -319,11 +336,38 @@ pub(crate) fn bounded(expr: &Expression, snapshot: &Snapshot) -> Option<Bounded>
             }
         }
     }
+    if language {
+        // Only the language-tagged strings among them, every one decided by the filter.
+        let tagged = [TermId::kind_range(TermKind::LangString)];
+        checked = intersection(&checked, &tagged);
+        checked.extend(intersection(&exact, &tagged));
+        checked.sort_unstable();
+        exact.clear();
+    }
     Some(Bounded {
         variable,
         exact,
         checked,
     })
+}
+
+/// The variable of `LANG(?v) = "tag"` (either way round, a non-empty simple literal tag).
+fn language_test(conjunct: &Expression) -> Option<&Variable> {
+    let Expression::Equal(a, b) = conjunct else {
+        return None;
+    };
+    let (call, tag) = match (&**a, &**b) {
+        (call @ Expression::FunctionCall(..), Expression::Literal(tag))
+        | (Expression::Literal(tag), call @ Expression::FunctionCall(..)) => (call, tag),
+        _ => return None,
+    };
+    let Expression::FunctionCall(Function::Lang, args) = call else {
+        return None;
+    };
+    let [Expression::Variable(v)] = args.as_slice() else {
+        return None;
+    };
+    (tag.datatype() == xsd::STRING && !tag.value().is_empty()).then_some(v)
 }
 
 /// The ids for which the term-kind test `function` holds: literals are the kinds from

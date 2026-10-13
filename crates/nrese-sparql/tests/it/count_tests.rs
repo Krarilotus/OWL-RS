@@ -169,7 +169,8 @@ fn count(results: QueryResults<'_>) -> Vec<String> {
 /// past the inline integers on either side) and years, and their conjunctions.
 fn bounding_filter(rng: &mut Rng, v: &str) -> String {
     let test = |rng: &mut Rng| -> String {
-        match rng.below(5) {
+        match rng.below(6) {
+            5 => format!("LANG({v}) = \"{}\"", rng.pick(&["en", "de"])),
             0 => format!("{}({v})", rng.pick(&["isLITERAL", "isIRI", "isBLANK"])),
             1 | 2 => format!(
                 "{v} {} {}",
