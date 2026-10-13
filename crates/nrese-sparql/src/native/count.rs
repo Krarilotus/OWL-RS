@@ -502,6 +502,9 @@ struct Stats {
     listed: usize,
     /// Pairs read and kept for a message from a variable with weights of its own.
     pairs: usize,
+    /// Matches read by messages from the parent's side, weighed and not kept
+    /// ([`Context::message_from_parents`]).
+    gathered: usize,
     /// Values whose matches in a leaf were looked up ([`Context::probe`]).
     probed: usize,
     /// Matches of root patterns read and not kept.
@@ -861,12 +864,13 @@ impl Context<'_> {
         };
         if self.trace.is_some() {
             let detail = format!(
-                "{}rooted at {}; {} group walks, {} weights listed, {} pairs kept, {} values looked up, {} matches read at the roots; no row made",
+                "{}rooted at {}; {} group walks, {} weights listed, {} pairs kept, {} matches weighed from the parents, {} values looked up, {} matches read at the roots; no row made",
                 key.map_or_else(String::new, |k| format!("per {k}, ")),
                 stats.roots.join(", "),
                 stats.walks,
                 stats.listed,
                 stats.pairs,
+                stats.gathered,
                 stats.probed,
                 stats.driven,
             );
@@ -1524,6 +1528,15 @@ impl Context<'_> {
             }
             return Weights::new(&self.budget, entries, 0);
         }
+        // Far fewer values of the parent than the child lists: each parent value's partners
+        // read in index order and their weights added by a forward merge, no pair kept
+        // (Sparqloscope 050: 8 types against 8.7 M weighted subjects sent 8.7 M pairs). The
+        // matches read are the edge's, against a lookup and a kept pair per listed value.
+        let matches = atoms.iter().map(|atom| atom.estimate).min().unwrap_or(0) as f64;
+        let from_parents = self.distinct_of(atoms, parent) * PROBE_COST + matches * DRIVE_COST;
+        if from_parents < below.entries.len() as f64 * (PROBE_COST + PAIRS_COST) {
+            return self.message_from_parents(atoms, child, parent, below, stats);
+        }
         // The listed values' partners, weighed; for a default above 0 also the matches of
         // every value at the default, less what the listed values' matches had of it.
         let reader = self.reader();
@@ -1588,6 +1601,81 @@ impl Context<'_> {
         }
         entries.retain(|&(_, w)| w > 0);
         drop((pairs, less, held));
+        Weights::new(&self.budget, entries, 0)
+    }
+
+    /// The values `var` takes in the edge of `atoms`, estimated: the fewest of any of its
+    /// patterns (the index's cached distinct values, else its matches).
+    fn distinct_of(&self, atoms: &[&Atom], var: &Variable) -> f64 {
+        atoms
+            .iter()
+            .map(|atom| {
+                let permutation = atom.scan.permutation_for(Some(var));
+                (atom.scan.first_free(permutation) == Some(atom.component(var)))
+                    .then(|| {
+                        self.snapshot.distinct_estimate_in(
+                            self.model,
+                            &atom.scan.quad_pattern(),
+                            permutation,
+                        )
+                    })
+                    .flatten()
+                    .unwrap_or(atom.estimate) as f64
+            })
+            .fold(f64::INFINITY, f64::min)
+    }
+
+    /// [`Self::message`] from the parent's side: the parent's values with partners (a
+    /// group walk), and per value the sum of `below`'s weights over its partners, read in
+    /// index order and merged forward, in parallel parts.
+    fn message_from_parents<'b>(
+        &'b self,
+        atoms: &[&Atom],
+        child: &Variable,
+        parent: &Variable,
+        below: Weights<'b>,
+        stats: &mut Stats,
+    ) -> Counted<Weights<'b>> {
+        let listing = self.walk_edge(atoms, parent, child, stats)?;
+        let reader = self.reader();
+        let chunk = (listing.len() / (rayon::current_num_threads() * 4)).clamp(1, DRIVE_CHUNK);
+        let below = &below;
+        let parts: Vec<Result<(PerValue, usize), bool>> = listing
+            .par_chunks(chunk)
+            .map(|part| {
+                let mut partners = Partners::new(reader, atoms.len());
+                let (mut values, mut out, mut read) = (Vec::new(), Vec::new(), 0);
+                for &(value, _) in part {
+                    if reader
+                        .cancellation
+                        .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        return Err(true);
+                    }
+                    if !partners.read(atoms, parent, value, child, &mut values) {
+                        return Err(false);
+                    }
+                    read += values.len();
+                    let mut from = 0;
+                    let sum = values
+                        .iter()
+                        .try_fold(0u64, |s, &v| s.checked_add(below.weight(v, &mut from)))
+                        .ok_or(false)?;
+                    if sum > 0 {
+                        out.push((value, sum));
+                    }
+                }
+                Ok((out, read))
+            })
+            .collect();
+        reader.check()?;
+        let mut entries = Vec::with_capacity(listing.len());
+        drop(listing);
+        for part in parts {
+            let (found, read) = part.map_err(|_| Stop::Declined)?;
+            stats.gathered += read;
+            entries.extend(found);
+        }
         Weights::new(&self.budget, entries, 0)
     }
 

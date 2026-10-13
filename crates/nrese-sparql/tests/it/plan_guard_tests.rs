@@ -174,9 +174,11 @@ fn joins_are_counted_without_their_rows() {
     let engine = engine();
     let step = |query: &str| {
         let plan = steps(&engine, query);
-        plan.into_iter()
-            .find(|s| s.operator == "counted join")
-            .unwrap_or_else(|| panic!("{query}: no counted join"))
+        let at = plan
+            .iter()
+            .position(|s| s.operator == "counted join")
+            .unwrap_or_else(|| panic!("{query}: no counted join in {plan:#?}"));
+        plan.into_iter().nth(at).unwrap()
     };
     // Query 4's shape: 9,000 rows.
     let star = step("SELECT (COUNT(*) AS ?n) WHERE { ?s e:knows ?o1 . ?s e:label ?o2 }");
@@ -198,6 +200,20 @@ fn joins_are_counted_without_their_rows() {
         walks == 1 && listed <= 300 && selective.detail.contains(" 300 values looked up"),
         "{}",
         selective.detail
+    );
+    // Query 50's and 63's shape: counts per kind (10) of subjects weighed by their label
+    // (3,000): each kind's subjects read and their weights added up, no pair of the 3,000
+    // kept and sorted (8 types sent 8.7 M pairs on DBLP, 0.3 → 1.7 s).
+    let per_kind =
+        step("SELECT ?k (COUNT(?s) AS ?n) WHERE { ?s e:kind ?k . ?s e:label ?o } GROUP BY ?k");
+    let (_, _, pairs, _) = counted(&per_kind.detail);
+    assert!(
+        pairs == 0
+            && per_kind
+                .detail
+                .contains(" 3000 matches weighed from the parents"),
+        "{}",
+        per_kind.detail
     );
     // Query 66's and 67's shape: a closure joined to a pattern, weighed by each node's
     // closure size (3,000 nodes, each reaching all 3,000), no pair of it made.
