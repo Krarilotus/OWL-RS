@@ -39,9 +39,10 @@ each with its run record.
 - **Resource ownership in `nrese-dl`:** the envelope needed and has: an engine's budget is
   an owned value (no longer `Copy`), its observer and the tableau reserve from the request's
   envelope and return it when the engine drops, and exhaustion stays sticky per engine (an
-  envelope's refusal included). `context::Engine::with_budget` no longer exists. Open:
-  detached `Individuals` keep their original owner; public mutation of
-  `Individuals.contexts` isn't tracked; a result retained beyond its request keeps its
+  envelope's refusal included). `context::Engine::with_budget` no longer exists.
+  `Individuals` borrows its engine and returns its retained charge on drop, including
+  unwinding; its context list is read-only. Open: a result retained beyond its request
+  keeps its
   engine's reservation (request-scoped saturations are dropped at the request's end;
   cached classification runs without an envelope); changed policy and historical peaks
   need an API contract first.
