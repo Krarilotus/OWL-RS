@@ -264,96 +264,127 @@ fn u1_is_a_model_when_clash_free_and_contains_l() {
         if case >= cases && covered(&tally) {
             break;
         }
-        let mut rng = Rng::new(seed.wrapping_add(case));
-        let mut table = Table::default();
-        let sizes = Sizes {
-            classes: 3,
-            object_properties: 3,
-            simple: 2,
-            data_properties: 0,
-            individuals: 3,
-            literals: 0,
-        };
-        let sig = Signature::new(sizes, &mut |name| match name {
-            Name::Iri(iri) => table.named(iri),
-            Name::Integer(i) => nrese_owl::Make::literal(
-                &mut table,
-                &i.to_string(),
-                "http://www.w3.org/2001/XMLSchema#integer",
-            ),
-        });
-        let profile = Profile {
-            axioms: 2 + rng.below(6) as usize,
-            data: false,
-            ..Profile::sroiq()
-        };
-        let generated = fuzz::ontology(&mut rng, &sig, profile);
-        for (_, iri) in Vocabulary::iris() {
-            table.named(&iri);
-        }
-        let vocabulary = Vocabulary::new(&|iri| nrese_owl::Terms::iri(&table, iri));
-        let triples = nrese_owl::write(&generated, &vocabulary, &mut table);
-        let (ontology, normalised) = support::read(&mut table, &triples);
-        let program = support::compile(&mut table, &ontology, &normalised);
-        let lower = support::lower(&mut table, &triples);
-        let upper = support::upper(&mut table, &program, &triples);
-        let bounds = Bounds::new(&program, &table, lower.facts.clone(), upper.facts.clone());
-        tally.cases += 1;
-        let render = |a: &Axiom| ontology.functional(a, &|t| table.text(t));
-        // An inconsistent ontology (an RL violation) entails everything, so L may exceed U1.
-        let missing = bounds.lower_not_in_upper();
-        if !missing.is_empty() && lower.violations.is_empty() {
-            failures.push(format!(
-                "case {case}: L not in U1: {:?}\n  in {:?}",
-                missing
-                    .iter()
-                    .map(|t| t.map(|x| table.text(x)))
-                    .collect::<Vec<_>>(),
-                ontology
-                    .axioms
-                    .iter()
-                    .filter(|a| !matches!(a, Axiom::Declaration(..)))
-                    .map(render)
-                    .collect::<Vec<_>>()
-            ));
-        }
-        if !lower.violations.is_empty() {
-            tally.violations += 1;
-            if bounds.clashes().is_empty() {
-                failures.push(format!(
-                    "case {case}: L violates {:?} but U1 has no clash",
-                    lower.violations
-                ));
-            }
-        }
-        if !bounds.clashes().is_empty() {
-            tally.clashes += 1;
-            continue;
-        }
-        if !program.incomplete.is_empty() {
-            failures.push(format!("case {case}: incomplete {:?}", program.incomplete));
-        }
-        // The closure over representatives, with each individual tied to its own.
-        let mut closure = upper.representatives.clone();
-        for &a in &program.signature.individuals {
-            closure.push([a, program.names.same_as, upper.classes.representative(a)]);
-        }
-        let Some(model) = interpretation(&program, &closure) else {
-            tally.too_large += 1;
-            continue;
-        };
-        tally.models += 1;
-        let broken: Vec<String> = ontology
-            .axioms
-            .iter()
-            .filter(|a| !model.holds(&ontology, a))
-            .map(render)
-            .collect();
-        if !broken.is_empty() {
-            failures.push(format!("case {case}: U1 is no model; fails {broken:?}"));
-        }
+        check(seed, case, &mut tally, &mut failures);
     }
     eprintln!("{tally:?}");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert!(covered(&tally), "too few clash-free cases: {tally:?}");
+}
+
+/// `NRESE_FUZZ_SEED=52580`, its first case (a PR gate, 13 October 2026). U1's own rules
+/// merge two Skolem constants into `a2`'s class (`⊤ ⊑ ∃p2⁻.fresh1`, `fresh1 ⊑ {a2}`), in
+/// the round after which no class grows; that round's facts over them become `a2`'s, and
+/// `∃p2⁻.{a2} ⊑ C0 ⊔ C2` must then still apply to them (`a2 p2 sk7`, so `sk7` in `C0`
+/// and `C2`). The tests' evaluation of U1 stopped there, its closure no model; equality
+/// by copying, and the store's evaluation, reach the fixpoint.
+#[test]
+fn facts_a_merge_rewrites_in_the_last_round_are_evaluated() {
+    let (mut tally, mut failures) = (Tally::default(), Vec::new());
+    check(52580, 0, &mut tally, &mut failures);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_eq!(
+        tally.models, 1,
+        "a clash-free case whose U1 is checked: {tally:?}"
+    );
+}
+
+/// The fuzzed case `case` of `seed`: U1 checked as a model, against L and its violations;
+/// what it came to counted in `tally`, what failed pushed to `failures`.
+fn check(seed: u64, case: u64, tally: &mut Tally, failures: &mut Vec<String>) {
+    let mut rng = Rng::new(seed.wrapping_add(case));
+    let mut table = Table::default();
+    let sizes = Sizes {
+        classes: 3,
+        object_properties: 3,
+        simple: 2,
+        data_properties: 0,
+        individuals: 3,
+        literals: 0,
+    };
+    let sig = Signature::new(sizes, &mut |name| match name {
+        Name::Iri(iri) => table.named(iri),
+        Name::Integer(i) => nrese_owl::Make::literal(
+            &mut table,
+            &i.to_string(),
+            "http://www.w3.org/2001/XMLSchema#integer",
+        ),
+    });
+    let profile = Profile {
+        axioms: 2 + rng.below(6) as usize,
+        data: false,
+        ..Profile::sroiq()
+    };
+    let generated = fuzz::ontology(&mut rng, &sig, profile);
+    for (_, iri) in Vocabulary::iris() {
+        table.named(&iri);
+    }
+    let vocabulary = Vocabulary::new(&|iri| nrese_owl::Terms::iri(&table, iri));
+    let triples = nrese_owl::write(&generated, &vocabulary, &mut table);
+    let (ontology, normalised) = support::read(&mut table, &triples);
+    let program = support::compile(&mut table, &ontology, &normalised);
+    let lower = support::lower(&mut table, &triples);
+    let upper = support::upper(&mut table, &program, &triples);
+    let bounds = Bounds::new(&program, &table, lower.facts.clone(), upper.facts.clone());
+    tally.cases += 1;
+    let render = |a: &Axiom| ontology.functional(a, &|t| table.text(t));
+    // An inconsistent ontology (an RL violation) entails everything, so L may exceed U1.
+    let missing = bounds.lower_not_in_upper();
+    if !missing.is_empty() && lower.violations.is_empty() {
+        failures.push(format!(
+            "case {case}: L not in U1: {:?}\n  in {:?}",
+            missing
+                .iter()
+                .map(|t| t.map(|x| table.text(x)))
+                .collect::<Vec<_>>(),
+            ontology
+                .axioms
+                .iter()
+                .filter(|a| !matches!(a, Axiom::Declaration(..)))
+                .map(render)
+                .collect::<Vec<_>>()
+        ));
+    }
+    if !lower.violations.is_empty() {
+        tally.violations += 1;
+        if bounds.clashes().is_empty() {
+            failures.push(format!(
+                "case {case}: L violates {:?} but U1 has no clash",
+                lower.violations
+            ));
+        }
+    }
+    if !bounds.clashes().is_empty() {
+        tally.clashes += 1;
+        return;
+    }
+    if !program.incomplete.is_empty() {
+        failures.push(format!("case {case}: incomplete {:?}", program.incomplete));
+    }
+    // The closure over representatives, with each individual tied to its own.
+    let mut closure = upper.representatives.clone();
+    for &a in &program.signature.individuals {
+        closure.push([a, program.names.same_as, upper.classes.representative(a)]);
+    }
+    let Some(model) = interpretation(&program, &closure) else {
+        tally.too_large += 1;
+        return;
+    };
+    tally.models += 1;
+    let broken: Vec<String> = ontology
+        .axioms
+        .iter()
+        .filter(|a| !model.holds(&ontology, a))
+        .map(render)
+        .collect();
+    if !broken.is_empty() {
+        let axioms: Vec<String> = ontology
+            .axioms
+            .iter()
+            .filter(|a| !matches!(a, Axiom::Declaration(..)))
+            .map(render)
+            .collect();
+        failures.push(format!(
+            "case {case}: U1 is no model; fails {broken:?}\n  in {axioms:?}"
+        ));
+    }
 }
