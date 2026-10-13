@@ -46,7 +46,7 @@ use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern,
 };
-use nrese_sparql_syntax::term::TriplePattern;
+use nrese_sparql_syntax::term::{TermPattern, TriplePattern};
 
 use super::{
     Agg, Context, NativeResult, Solutions, as_path, bound_variables, expression_variables,
@@ -92,7 +92,51 @@ pub(super) fn joins(pattern: &GraphPattern) -> bool {
 pub(super) fn in_scope(pattern: &GraphPattern) -> Vec<Variable> {
     let mut variables = Vec::new();
     bound_variables(pattern, &mut variables);
+    blank_nodes(pattern, &mut variables);
     variables
+}
+
+/// The blank nodes of `pattern`'s triple patterns and paths, as the columns the executor
+/// binds them to (`_bnode_…`): the translation of a sequence path (`?a p/q+ ?b`) joins its
+/// steps on a fresh one, and a set evaluation that dropped it lost the join (the path's
+/// other end's values came back as its answers).
+fn blank_nodes(pattern: &GraphPattern, out: &mut Vec<Variable>) {
+    let mut term = |t: &TermPattern| {
+        if let TermPattern::BlankNode(b) = t {
+            let v = Variable::new_unchecked(format!("_bnode_{}", b.as_str()));
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    };
+    match pattern {
+        GraphPattern::Bgp { patterns } => {
+            for triple in patterns {
+                term(&triple.subject);
+                term(&triple.object);
+            }
+        }
+        GraphPattern::Path {
+            subject, object, ..
+        } => {
+            term(subject);
+            term(object);
+        }
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            for input in inputs {
+                blank_nodes(input, out);
+            }
+        }
+        GraphPattern::LeftJoin { left, right, .. } | GraphPattern::Lateral { left, right } => {
+            blank_nodes(left, out);
+            blank_nodes(right, out);
+        }
+        GraphPattern::Minus { left, .. } => blank_nodes(left, out),
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::Graph { inner, .. }
+        | GraphPattern::Extend { inner, .. } => blank_nodes(inner, out),
+        _ => {}
+    }
 }
 
 fn add(to: &mut Vec<Variable>, variables: impl IntoIterator<Item = Variable>) {
