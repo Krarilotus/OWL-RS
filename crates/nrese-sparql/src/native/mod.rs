@@ -4798,9 +4798,13 @@ impl<'a> Context<'a> {
             return Ok(solutions);
         }
         // Aggregates that ignore duplicates let the pattern be evaluated as a set, and
-        // OPTIONALs that only feed them be aggregated apart from the rest (`sets`).
+        // OPTIONALs that only feed them be aggregated apart from the rest (`sets`). One
+        // pattern too: its values by a group walk (Sparqloscope 058, MIN of a name, folded
+        // 30.5 M rows for their distinct names).
+        let one_pattern = variables.is_empty()
+            && matches!(inner, GraphPattern::Bgp { patterns } if patterns.len() == 1);
         let solutions = match sets::insensitive_arguments(aggregates) {
-            Some(arguments) if sets::joins(inner) && !self.as_written => {
+            Some(arguments) if (sets::joins(inner) || one_pattern) && !self.as_written => {
                 if !variables.is_empty()
                     && let Some(solutions) =
                         self.group_detached(inner, variables, aggregates, &arguments, having)?
