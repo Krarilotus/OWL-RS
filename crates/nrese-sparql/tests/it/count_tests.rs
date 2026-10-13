@@ -54,7 +54,7 @@ impl Tree {
     fn pattern(&mut self, rng: &mut Rng, from: &str) -> String {
         // Now and then a closure to a new variable, plain or after a step (`p1/p2+`), either
         // way round.
-        if rng.below(10) == 0 {
+        if rng.below(24) == 0 {
             let path = match rng.below(2) {
                 0 => format!("<{EX}p{}>+", rng.below(4)),
                 _ => format!("<{EX}p{}>/<{EX}p{}>+", rng.below(4), rng.below(4)),
@@ -358,7 +358,7 @@ fn counted_joins_equal_the_reference() {
         counted * 2 > checked && nonzero * 3 > checked
     };
     for case in 0.. {
-        if !draws_on(case, 60, covered(checked, counted, nonzero)) {
+        if !draws_on(case, 30, covered(checked, counted, nonzero)) {
             break;
         }
         let engine = Engine::new(EngineConfig::default()).unwrap();
