@@ -35,6 +35,14 @@ impl RdfSyntaxError {
     pub fn location(&self) -> Range<TextPosition> {
         self.location.clone()
     }
+
+    /// The error with its lines counted from `lines` earlier: a chunk's lines are numbered
+    /// from its start, the document's from the first line.
+    pub(crate) fn after_lines(mut self, lines: u64) -> Self {
+        self.location.start.line += lines;
+        self.location.end.line += lines;
+        self
+    }
 }
 
 impl fmt::Display for RdfSyntaxError {
