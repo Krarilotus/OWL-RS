@@ -133,15 +133,20 @@ fn count_query(rng: &mut Rng) -> String {
         });
     }
     // COUNT(*), COUNT of a variable every solution binds, counts per value of one, and the
-    // number of its values.
+    // number of its values; COUNT(*) beside COUNT of any variable of the query, one only a
+    // part binds (OPTIONAL, UNION, MINUS, EXISTS) or one no part binds alone.
     let body = body.join(" ");
     let key = rng.pick(&tree.bound).clone();
-    match rng.below(6) {
+    match rng.below(7) {
         0 => format!(
             "SELECT {key} (COUNT(*) AS ?n) (COUNT({key}) AS ?m) WHERE {{ {body} }} GROUP BY {key}"
         ),
         1 => format!("SELECT (COUNT(DISTINCT {key}) AS ?n) WHERE {{ {body} }}"),
         2 => format!("SELECT (COUNT(?v0) AS ?n) WHERE {{ {body} }}"),
+        3 => {
+            let any = format!("?v{}", rng.below(tree.next as u64));
+            format!("SELECT (COUNT(*) AS ?n) (COUNT({any}) AS ?m) WHERE {{ {body} }}")
+        }
         _ => format!("SELECT (COUNT(*) AS ?n) WHERE {{ {body} }}"),
     }
 }

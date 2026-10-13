@@ -225,6 +225,54 @@ fn bound_by(item: &Item<'_>) -> Option<Vec<Variable>> {
 
 /// Whether `aggregate` counts the solutions of `conj`: `COUNT(*)`, or `COUNT(?v)` of a
 /// variable every solution binds.
+/// Whether a solution of `conj` may bind `variable`: its patterns and closures, and the
+/// patterns of its OPTIONAL and UNION parts.
+fn binds(conj: &Conj<'_>, variable: &Variable) -> bool {
+    certain(conj, variable)
+        || conj.parts.iter().any(|part| {
+            matches!(part.kind, Kind::Optional | Kind::Union)
+                && part.branches.iter().any(|branch| binds(branch, variable))
+        })
+}
+
+/// `conj` as the conjunction whose solutions `aggregate` counts: itself for `COUNT(*)` and
+/// `COUNT(?v)` of a variable every solution binds; for `COUNT(?v)` of a variable that only
+/// one OPTIONAL binds, in every solution of its pattern, `conj` with that OPTIONAL a join
+/// (a union of one branch): the solutions that bind `?v` are those where it matched
+/// (op-optional's `COUNT(?title)`, 2.54× Virtuoso's time while its rows were made).
+/// `None` for other aggregates.
+fn counting<'p>(mut conj: Conj<'p>, aggregate: &AggregateExpression) -> Option<Conj<'p>> {
+    if counts_solutions(&conj, aggregate) {
+        return Some(conj);
+    }
+    let AggregateExpression::FunctionCall {
+        name: AggregateFunction::Count,
+        expr: Expression::Variable(v),
+        distinct: false,
+    } = aggregate
+    else {
+        return None;
+    };
+    let binding: Vec<usize> = (0..conj.parts.len())
+        .filter(|&i| {
+            let part = &conj.parts[i];
+            matches!(part.kind, Kind::Optional | Kind::Union)
+                && part.branches.iter().any(|branch| binds(branch, v))
+        })
+        .collect();
+    let [only] = binding.as_slice() else {
+        return None;
+    };
+    let part = &mut conj.parts[*only];
+    if part.kind != Kind::Optional
+        || !matches!(part.branches.as_slice(), [branch] if certain(branch, v))
+    {
+        return None;
+    }
+    part.kind = Kind::Union;
+    Some(conj)
+}
+
 fn counts_solutions(conj: &Conj<'_>, aggregate: &AggregateExpression) -> bool {
     match aggregate {
         AggregateExpression::CountSolutions { distinct: false } => true,
@@ -832,21 +880,30 @@ impl Reader<'_> {
 }
 
 impl Context<'_> {
-    /// `aggregate` (`COUNT(*)`, or `COUNT(?v)` of a variable every solution binds) of
-    /// `pattern` by message passing ([module docs](self)); `None` where it isn't a tree
-    /// counted so.
-    pub(super) fn count_tree(
+    /// Each of `aggregates` of `pattern` by message passing ([module docs](self)):
+    /// `COUNT(*)`, and `COUNT(?v)` of a variable every solution binds or one OPTIONAL binds
+    /// ([`counting`]), in their order; `None` where any of them isn't a tree counted so,
+    /// found before anything is counted.
+    pub(super) fn count_aggregates(
         &self,
         pattern: &GraphPattern,
-        aggregate: &AggregateExpression,
-    ) -> NativeResult<Option<u64>> {
-        let Some(conj) = self.countable(pattern) else {
-            return Ok(None);
-        };
-        if !counts_solutions(&conj, aggregate) {
-            return Ok(None);
+        aggregates: &[(Variable, AggregateExpression)],
+    ) -> NativeResult<Option<Vec<u64>>> {
+        let mut conjs = Vec::with_capacity(aggregates.len());
+        for (_, aggregate) in aggregates {
+            match self.countable(pattern).and_then(|c| counting(c, aggregate)) {
+                Some(conj) => conjs.push(conj),
+                None => return Ok(None),
+            }
         }
-        Ok(self.counted(&conj, None)?.map(|(count, _)| count))
+        let mut counts = Vec::with_capacity(conjs.len());
+        for conj in &conjs {
+            match self.counted(conj, None)? {
+                Some((count, _)) => counts.push(count),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(counts))
     }
 
     /// The solutions of `pattern` per value of `key`, a variable every solution binds:

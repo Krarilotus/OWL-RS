@@ -75,6 +75,15 @@ module docs). Whole serialised answers are kept beside them. Default size: 2 % o
 4. *Streamed parts.* QLever keeps a lazy subresult while it stays under 5 MB. We
    materialise every part, so every part is a candidate; when parts stream (§4), the same
    rule applies: keep a streamed part only up to a bound, abandon the copy past it.
+5. *A hit's copy* (an independent audit, 13 Oct). A hit cloned its part, or remapped its
+   computed terms column by column, and charged the query afterwards: concurrent hits of a
+   large part each allocated a copy before running out of budget was noticed, and the
+   retained-cache test didn't see the transient peak. The charge now comes first (a hit past
+   the budget allocates nothing; guard on the heap's peak in `tests/cache_memory.rs`). Still
+   open, at the cache/executor boundary: a hit that needs no remap shares the part's
+   columns instead of copying them (columns as shared immutable slices in `IdTable`,
+   copied on write; owner `nrese-exec`), charging the query nothing for what the cache
+   already holds and counts, and only the remapped columns where there are computed terms.
 
 ## 3. Index and vocabulary (owner: `nrese-engine` index and dictionary; with the v2.0 core thread)
 
@@ -178,3 +187,8 @@ a 5 GB cache (the reproduction's setting) and NRESE its default, 2 % of memory. 
 | 3 | Large streamed results | refused past the envelope where QLever answers | `native`, `nrese-exec` | §4.1, §4.2 |
 | 4 | Cache across writes | every write empties it (both) | `nrese-sparql` cache | §2.1 (beyond QLever) |
 | 5 | Metadata counts, text-ordered ids | 101–103, 071–073: up to 280× per query | engine index, dictionary | §3.3, §3.4 |
+| 6 | A cache hit's copy | each concurrent hit of a large part a full copy (now charged first) | cache, `nrese-exec` tables | §2.5 |
+
+Also on the list (an independent audit, 13 Oct): op-optional, 2.54× Virtuoso's time
+(`COUNT(?title)` of a variable only an OPTIONAL binds made its rows), counted since
+(performance.md, 13 Oct); to measure again.
