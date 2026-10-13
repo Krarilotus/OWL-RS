@@ -98,7 +98,7 @@ fn group_counts_walk_the_index() {
 fn distinct_values_walk_the_index() {
     assert_uses(
         &engine(),
-        "SELECT (COUNT(*) AS ?n) WHERE { ?s e:kind ?k FILTER NOT EXISTS { ?s e:label ?l } }",
+        "SELECT ?s WHERE { ?s e:kind ?k FILTER NOT EXISTS { ?s e:label ?l } }",
         "group walk",
     );
 }
@@ -140,6 +140,102 @@ fn cycles_are_counted_without_their_solutions() {
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("{}", order.detail));
     assert!(lookups <= 3000, "{}", order.detail);
+}
+
+/// The numbers of a `counted join` step: (group walks, weights listed, pairs kept, matches
+/// read at the roots).
+fn counted(detail: &str) -> (u64, u64, u64, u64) {
+    let number = |label: &str| -> u64 {
+        let end = detail
+            .find(label)
+            .unwrap_or_else(|| panic!("{label}: {detail}"));
+        detail[..end]
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .find(|s| !s.is_empty())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{label}: {detail}"))
+    };
+    (
+        number(" group walks"),
+        number(" weights listed"),
+        number(" pairs kept"),
+        number(" matches read"),
+    )
+}
+
+/// `COUNT(*)` of an acyclic join by message passing, without its rows (Sparqloscope's
+/// queries 4, 8, 12, 13 and 19 held 9 to over 26 GB of rows on DBLP): a star counts from
+/// two group walks of 3,000 values each; a chain whose end has an OPTIONAL of three
+/// matches per value is rooted at its middle pattern, whose 9,000 matches are read once
+/// and not kept (rooted at a variable, the OPTIONAL's values would send their 9,000
+/// partners as pairs). No row is made.
+#[test]
+fn joins_are_counted_without_their_rows() {
+    let engine = engine();
+    let step = |query: &str| {
+        let plan = steps(&engine, query);
+        plan.into_iter()
+            .find(|s| s.operator == "counted join")
+            .unwrap_or_else(|| panic!("{query}: no counted join"))
+    };
+    // Query 4's shape: 9,000 rows.
+    let star = step("SELECT (COUNT(*) AS ?n) WHERE { ?s e:knows ?o1 . ?s e:label ?o2 }");
+    let (walks, listed, pairs, read) = counted(&star.detail);
+    assert_eq!((walks, pairs, read), (2, 0, 0), "{}", star.detail);
+    assert!(listed <= 6_000, "{}", star.detail);
+    // Query 19's shape: 27,000 rows.
+    let chain = step(
+        "SELECT (COUNT(*) AS ?n) WHERE { ?a e:kind ?k . ?a e:knows ?b OPTIONAL { ?b e:knows ?c } }",
+    );
+    let (walks, listed, pairs, read) = counted(&chain.detail);
+    assert_eq!((walks, pairs, read), (2, 0, 9_000), "{}", chain.detail);
+    assert!(listed <= 9_000, "{}", chain.detail);
+}
+
+/// The count's memory is a weight per value, not the join's rows: 1,000 subjects with 20
+/// `knows` and 20 `label` each make 400,000 rows (9.6 MB as three columns of ids), counted
+/// within a budget of 1 MiB.
+#[test]
+fn a_counted_join_holds_its_values_not_its_rows() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..1000u32 {
+        for j in 0..20u32 {
+            for (p, o) in [("knows", format!("o{j}")), ("label", format!("l{j}"))] {
+                let quad = Quad::new(ex(&format!("s{i}")), ex(p), ex(&o), GraphName::DefaultGraph);
+                tx.insert(quad.as_ref());
+            }
+        }
+    }
+    tx.commit().unwrap();
+    let text = format!(
+        "PREFIX e: <{EX}> SELECT (COUNT(*) AS ?n) WHERE {{ ?s e:knows ?o1 . ?s e:label ?o2 }}"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let options = QueryOptions {
+        resources: nrese_sparql::Resources {
+            memory_limit: Some(1 << 20),
+            ..Default::default()
+        },
+        ..QueryOptions::default()
+    };
+    let snapshot = engine.snapshot();
+    let explained = explain_query(&snapshot, &query, &options).unwrap();
+    assert!(
+        explained.steps.iter().any(|s| s.operator == "counted join"),
+        "{:#?}",
+        explained.steps
+    );
+    let nrese_sparql::QueryResults::Solutions(mut solutions) =
+        nrese_sparql::evaluate_query(&snapshot, &query, &options).unwrap()
+    else {
+        panic!("a SELECT")
+    };
+    let count = solutions.next().unwrap().unwrap();
+    assert_eq!(
+        count.get("n").map(ToString::to_string).as_deref(),
+        Some("\"400000\"^^<http://www.w3.org/2001/XMLSchema#integer>")
+    );
 }
 
 /// Eager aggregation: a group over a join aggregates the side its aggregates read before
