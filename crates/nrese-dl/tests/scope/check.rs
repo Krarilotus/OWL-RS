@@ -103,9 +103,10 @@ pub fn check(axioms: usize, uncertified: usize) {
                 Ok(read) => read,
                 Err(why) => return (Some(format!("case {index}: not read: {why}")), 0, 0),
             };
-            // The limit the recorded answers were made under: a case past it is `t`.
-            let limit = Some(std::time::Duration::from_secs(20));
-            let answer = nrese_dl::scope::answer(&o, &case, limit);
+            // No time limit: the cases take milliseconds, and a wall-clock limit made the
+            // answers depend on the machine's load (three one-axiom cases past 20 s under
+            // the push tier's full load on 13 October, 0-1 ms alone).
+            let answer = nrese_dl::scope::answer(&o, &case, None);
             let want = &expected[*index as usize];
             if answer.code != *want {
                 return (
