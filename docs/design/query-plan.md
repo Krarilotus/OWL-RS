@@ -58,7 +58,10 @@ as estimation. Unconverted operators may keep lowering; no second permanent exec
 or per-row virtual dispatch is introduced.
 
 Keep metadata counts, group walks, sideways probes, eager aggregation, LIMIT pushdown,
-component closures and cyclic worst-case-optimal joins. The
+component closures, cyclic worst-case-optimal joins, counts of join trees by message
+passing (`native/count.rs`: COUNT, COUNT(DISTINCT) and GROUP BY with counts over joins
+with OPTIONAL, MINUS, EXISTS, UNION and closures, without their rows) and range counts of
+one pattern under a FILTER that bounds a variable. The
 [`plan tests`](../../crates/nrese-sparql/src/plan/tests.rs) guard scope/order and moved
 VALUES buffers; the [path-join tests](../../crates/nrese-sparql/src/native/path_joins/tests.rs)
 guard eligibility and zero inspection lowering. Native/reference differential tests and
