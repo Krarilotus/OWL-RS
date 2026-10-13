@@ -44,6 +44,9 @@ const DRIVE_COST: f64 = 3.0;
 /// A leaf's matches looked up for one value against walking one of its index entries: a
 /// forward seek per value against a sequential read.
 const PROBE_COST: f64 = 4.0;
+/// A variable's listed values seed a neighbour where they are less than this share of the
+/// values it takes in the pattern between them (1 / 8).
+const SEED_SHARE: f64 = 8.0;
 const PAIRS_COST: f64 = 8.0;
 
 /// Why a count stopped: the pattern isn't a tree this module counts, or the evaluation
@@ -1238,7 +1241,7 @@ impl Context<'_> {
                         false => (x, y),
                     };
                     let w1 = self.weights_at(&graph, &mut pending, first, Some(e), None, stats)?;
-                    let seed = match self.seeds(&graph, &w1, second, e) {
+                    let seed = match self.seeds(&graph, &w1, first, second, e) {
                         true => Some(self.partners_of(
                             &graph.atoms_of(e),
                             &graph.vars[first],
@@ -1391,13 +1394,15 @@ impl Context<'_> {
             }
             let atoms = graph.atoms_of(e);
             let seed = match listing {
-                Some(i) if self.seeds(graph, &factors[i], child, e) => Some(self.partners_of(
-                    &atoms,
-                    &graph.vars[var],
-                    &factors[i],
-                    &graph.vars[child],
-                    stats,
-                )?),
+                Some(i) if self.seeds(graph, &factors[i], var, child, e) => {
+                    Some(self.partners_of(
+                        &atoms,
+                        &graph.vars[var],
+                        &factors[i],
+                        &graph.vars[child],
+                        stats,
+                    )?)
+                }
                 _ => None,
             };
             let below = self.weights_at(graph, pending, child, Some(e), seed.as_deref(), stats)?;
@@ -2034,13 +2039,25 @@ impl Context<'_> {
         Weights::new(&self.budget, entries, 0)
     }
 
-    /// Whether the values `listing` gives a variable are few enough to solve its neighbour
-    /// `child` across `edge` for their partners alone: looking each up costs less than the
-    /// edge and what hangs below `child` read whole (the merge gate's index-join-keys: 25 K
-    /// values of a kind, and `link`'s 2.5 M subjects walked for them).
-    fn seeds(&self, graph: &Graph<'_>, listing: &Weights<'_>, child: usize, edge: usize) -> bool {
+    /// Whether the values `listing` gives `var` are few enough to solve its neighbour `child`
+    /// across `edge` for their partners alone: a small share of the values `var` takes in
+    /// that edge (else their partners are about all of the other end's, and looking them up
+    /// one by one only adds to the walk: q-counts' chain-optional, 300 K authors against
+    /// `follows`, 20x slower), and looking each up costs less than the edge and what hangs
+    /// below `child` read whole (the merge gate's index-join-keys: 25 K values of a kind,
+    /// and `link`'s 2.5 M subjects walked for them).
+    fn seeds(
+        &self,
+        graph: &Graph<'_>,
+        listing: &Weights<'_>,
+        var: usize,
+        child: usize,
+        edge: usize,
+    ) -> bool {
+        let listed = listing.entries.len() as f64;
         listing.default == 0
-            && (listing.entries.len() as f64) * PROBE_COST
+            && listed * SEED_SHARE < self.distinct_of(&graph.atoms_of(edge), &graph.vars[var])
+            && listed * PROBE_COST
                 < graph.estimate(edge) * WALK_COST + graph.cost_below(child, Some(edge))
     }
 

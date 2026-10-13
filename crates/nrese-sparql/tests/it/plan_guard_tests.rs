@@ -224,6 +224,16 @@ fn joins_are_counted_without_their_rows() {
         let (walks, listed, _, _) = counted(&chain.detail);
         assert!(walks == 1 && listed <= 1_200, "{query}: {}", chain.detail);
     }
+    // And a chain no pattern restricts seeds nothing (q-counts' chain-optional: 300 K
+    // authors' partners looked up one by one were about all of `follows`, 20x slower).
+    let open = step(
+        "SELECT (COUNT(*) AS ?n) WHERE { ?a e:knows ?b . ?b e:knows ?c OPTIONAL { ?c e:label ?l } }",
+    );
+    assert!(
+        open.detail.contains(" 0 values looked up"),
+        "{}",
+        open.detail
+    );
     // op-optional's shape (2.54× Virtuoso's time while its rows were made): COUNT(*) and
     // COUNT of a variable only an OPTIONAL binds, each counted (that OPTIONAL as a join for
     // the second), no row and no OPTIONAL evaluated.
