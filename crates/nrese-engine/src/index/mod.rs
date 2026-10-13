@@ -393,6 +393,69 @@ impl IndexVersion {
         }
     }
 
+    /// The number of distinct values at key `position` of `plan`'s permutation, counted
+    /// while the groups are walked (in parallel parts for a large range, a group across a
+    /// cut counted once) and none kept: O(d) time, O(1) memory. `None` where several runs
+    /// have matches or the run has tombstones in range: then values must be merged
+    /// ([`Self::group_counts`]).
+    pub(crate) fn count_groups(&self, plan: &AccessPlan, position: usize) -> Option<u64> {
+        let adapted = self.layout.adapt(plan)?;
+        let position = if adapted.permutation == plan.permutation {
+            position
+        } else if position == 0 {
+            // Grouped by the graph that the single-graph layout leaves out: every quad is
+            // the default graph's.
+            return Some(u64::from(self.count_plan(plan) > 0));
+        } else {
+            position - 1
+        };
+        let mut found = None;
+        for run in self.runs.iter() {
+            let perm = run.permutation(adapted.permutation);
+            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            if start < end {
+                if found.is_some() || perm.tombstones_in(start, end) > 0 {
+                    return None;
+                }
+                found = Some((perm, start, end));
+            }
+        }
+        let Some((perm, start, end)) = found else {
+            return Some(0);
+        };
+        // Per part: its groups, its first value and its last.
+        let walk = |start: usize, end: usize| {
+            let (mut groups, mut first, mut last) = (0u64, None, None);
+            perm.keys.groups(start, end, position, |value, _, _| {
+                groups += 1;
+                first.get_or_insert(value);
+                last = Some(value);
+            });
+            (groups, first, last)
+        };
+        if end - start < 2 * GROUP_PART {
+            return Some(walk(start, end).0);
+        }
+        let cuts: Vec<usize> = std::iter::once(start)
+            .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
+            .chain(std::iter::once(end))
+            .collect();
+        let parts: Vec<(u64, Option<u64>, Option<u64>)> = cuts
+            .par_windows(2)
+            .map(|cut| walk(cut[0], cut[1]))
+            .collect();
+        let mut total = 0;
+        let mut previous: Option<u64> = None;
+        for (groups, first, last) in parts {
+            total += groups;
+            if previous.is_some() && previous == first {
+                total -= 1;
+            }
+            previous = last.or(previous);
+        }
+        Some(total)
+    }
+
     /// Appends the distinct values at key `position` of each run's range for `plan` (sorted
     /// per run; values may repeat across runs). Tombstones are ignored: for estimates.
     pub(crate) fn distinct_values(&self, plan: &AccessPlan, position: usize, out: &mut Vec<u64>) {
