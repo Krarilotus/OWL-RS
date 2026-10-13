@@ -55,7 +55,12 @@ fn planner_effort_survives_request_preparation_and_query_options() {
         let mut request = SparqlQueryRequest::all("SELECT * WHERE { ?s ?p ?o }");
         request.planner.greedy_effort = effort;
         let prepared = PreparedQuery::parse(&request).unwrap();
-        let options = query_options(&prepared, &settings, &CancellationToken::new());
+        let options = query_options(
+            &prepared,
+            &settings,
+            &CancellationToken::new(),
+            &nrese_exec::Envelope::unlimited(),
+        );
         assert_eq!(options.resources.planner.greedy_effort, effort);
     }
 }

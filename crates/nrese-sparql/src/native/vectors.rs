@@ -608,7 +608,7 @@ mod tests {
             if predicate == "all" {
                 let options = QueryOptions {
                     resources: crate::Resources {
-                        memory_limit: Some(8_192),
+                        memory: nrese_exec::Envelope::new(Some(8_192), None),
                         ..Default::default()
                     },
                     ..Default::default()
