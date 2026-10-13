@@ -113,6 +113,8 @@ fn dl_part(o: &Ontology) -> Ontology {
 
 /// The classification of the input, as far as it can be told soundly (the module docs).
 pub fn classify(o: &Ontology, options: &Options, with: &classify::Options) -> Classified {
+    // The whole classification's time: the refinement's tests share what is left of it.
+    let deadline = options.timeout.map(|t| std::time::Instant::now() + t);
     let decision = consistency(o, options);
     let classes = crate::context::signature(o);
     match &decision.verdict {
@@ -153,7 +155,7 @@ pub fn classify(o: &Ontology, options: &Options, with: &classify::Options) -> Cl
                     .to_owned(),
             ];
             why.extend(t.incomplete.iter().cloned());
-            let (classification, open) = refine(o, &decision, t.classification, options);
+            let (classification, open) = refine(o, &decision, t.classification, options, deadline);
             if open > 0 {
                 why.push(format!("{open} pairs of classes open"));
             }
@@ -234,12 +236,14 @@ fn with_witness(
 /// the rule instances, entailed): a pair is refuted by the certified model of the input
 /// (an element in `A ∖ B`), then by one with a witness in `A`, then by one in `A ⊓ ¬B`; a
 /// witness that has no model makes the subsumption entailed. How many pairs stay open (the
-/// budget `options.max_tests`, undecided tests).
+/// budgets `options.max_tests` and `deadline`, the whole classification's; undecided
+/// tests).
 fn refine(
     o: &Ontology,
     decision: &Decision,
     mut lower: Classification,
     options: &Options,
+    deadline: Option<std::time::Instant>,
 ) -> (Classification, usize) {
     let classes = lower.classes.clone();
     let mut known: HashSet<(nrese_owl::Term, nrese_owl::Term)> =
@@ -272,13 +276,24 @@ fn refine(
     };
     let mut tests = 0usize;
     let budget = options.max_tests.unwrap_or(usize::MAX);
+    let spent = || deadline.is_some_and(|d| std::time::Instant::now() >= d);
+    // Each test gets what is left of the deadline, at most its own timeout.
+    let test_options = || {
+        let mut t = options.clone();
+        if let Some(d) = deadline {
+            let left = d.saturating_duration_since(std::time::Instant::now());
+            t.timeout = Some(t.timeout.map_or(left, |x| x.min(left)));
+        }
+        t
+    };
     let mut newly_unsat: Vec<nrese_owl::Term> = Vec::new();
     for &a in &classes {
-        if unsat.contains(&a) || open(&known, &refuted, a).is_empty() || tests >= budget {
+        if unsat.contains(&a) || open(&known, &refuted, a).is_empty() || tests >= budget || spent()
+        {
             continue;
         }
         tests += 1;
-        let d = with_witness(o, a, None, options);
+        let d = with_witness(o, a, None, &test_options());
         match (&d.verdict, &d.model) {
             (Verdict::Consistent { .. }, Some(m)) => {
                 if let Some(&w) = m.individuals.get(&WITNESS) {
@@ -299,11 +314,11 @@ fn refine(
             continue;
         }
         for b in open(&known, &refuted, a) {
-            if tests >= budget {
+            if tests >= budget || spent() {
                 break;
             }
             tests += 1;
-            match with_witness(o, a, Some(b), options).verdict {
+            match with_witness(o, a, Some(b), &test_options()).verdict {
                 Verdict::Consistent { .. } => {
                     refuted.insert((a, b));
                 }
