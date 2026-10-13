@@ -16,6 +16,7 @@ mod cache_key;
 mod cached;
 pub(crate) use cached::output_key;
 mod calendar;
+mod count;
 mod equality;
 mod equijoin;
 mod estimate;
@@ -4422,6 +4423,20 @@ impl<'a> Context<'a> {
             && let [(target, AggregateExpression::CountSolutions { distinct: false })] = aggregates
             && let GraphPattern::Bgp { patterns } = inner
             && let Some(count) = self.cyclic_count(patterns)?
+        {
+            let mut table = IdTable::new(1);
+            table.push_row(&[self.id(&integer(count))]);
+            return Ok(Solutions {
+                vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
+        // COUNT(*) of an acyclic join with OPTIONAL, MINUS, EXISTS and UNION parts: by
+        // message passing over the index, without its rows (`count`).
+        if variables.is_empty()
+            && let [(target, aggregate)] = aggregates
+            && let Some(count) = self.count_tree(inner, aggregate)?
         {
             let mut table = IdTable::new(1);
             table.push_row(&[self.id(&integer(count))]);
