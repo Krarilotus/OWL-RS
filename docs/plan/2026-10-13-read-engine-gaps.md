@@ -150,12 +150,22 @@ format for the base only (§3.1), and the fast paths that hold for one run only
 
 ## 6. Measurements (queue jobs)
 
+The SPARQL group runs the concurrent-read comparison for research round 6 (`suite/sparql`,
+`e2261316`, `428d62bd`), with QLever pinned to the image of the code read here
+(`adfreiburg/qlever:commit-d91db7284e@sha256:b5c135c9…`). This analysis takes its numbers from
+those jobs; the duplicates this branch had queued were cancelled.
+
 | Job | What | Host |
 |---|---|---|
-| tests of this branch (`sparql-memory-tests-1`) | the gate's tests of the round before the measurements | Office, shareable |
-| build | `nrese-server` and `perf_lab` at the measured commit, `x86-64-v3` | Office, build |
-| Sparqloscope multi-client | NRESE and QLever (`d39c3520`, `-j 16`), clients 1, 4, 16, 64, 60 s each, cache off and on, fresh connections, `anon-kernel` memory, store files listed | Phuoc, exclusive |
-| client sweep 1–64 | `clients-sweep` (lookups and small joins), fresh connections, `anon-kernel` | Office night window, exclusive |
+| `sparql-sparqloscope-clients-phuoc` | Sparqloscope on DBLP from 1, 2, 4, 8, 16, 32, 64 clients, 60 s per level, NRESE (`8c13a74f`) and QLever (`-j 16`), cache on, fresh connections | Phuoc, exclusive |
+| `sparql-clients-sweep-office` | the fast case `clients-sweep` (lookups and small joins), 1–64 clients | Office, night window |
+| `sparql-qlever-memory-yago-tiny` | QLever's serving memory taken apart: read-ahead, mapped index, vocabulary, cache at idle, cold, warm, cleared | Office |
+| `sparql-serving-memory-yago-tiny` | serving memory again, QLever pinned | Office |
+| `sparql-sparqloscope-memory-phuoc-3` | this branch at `69b21851`: round 3 of the paper protocol, and each query's `memory_peak_bytes` from diagnose's plans | Phuoc, exclusive |
+
+One difference to settle before the cache-on numbers count: the Sparqloscope job gives QLever
+a 5 GB cache (the reproduction's setting) and NRESE its default, 2 % of memory. Equal budgets:
+`NRESE_CACHE_MAX_SIZE` (`bench/read-gaps`, `dc9112b5`).
 
 ## 7. Gaps in order of cost (provisional)
 
