@@ -183,6 +183,7 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
         "rewrites": explanation.rewrites,
         "rows": explanation.rows,
         "micros": explanation.micros,
+        "memory_peak_bytes": explanation.memory_peak_bytes,
         "completeness": completeness_json(
             explanation.completeness.as_ref(),
             &explanation.decided_by,

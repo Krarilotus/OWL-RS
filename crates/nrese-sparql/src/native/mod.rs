@@ -286,7 +286,7 @@ pub(crate) fn explain(
             .try_fold(0usize, |count, triple| triple.map(|_| count + 1))?
         }
     };
-    Ok((rewrites, steps, rows as u64, ql))
+    Ok((rewrites, steps, rows as u64, ql, ctx.budget.peak() as u64))
 }
 
 /// The plan `query` would run as, after the rewrites, with estimated rows per node
@@ -306,12 +306,14 @@ pub(crate) fn plan(
     Ok((rewrites, steps, ql))
 }
 
-/// The rewrites, the steps with their rows, the rows, and what the QL rewriting did.
+/// The rewrites, the steps with their rows, the rows, what the QL rewriting did, and the
+/// most working memory the query held at once.
 type ExplainParts = (
     Vec<&'static str>,
     Vec<PlanStep>,
     u64,
     Option<crate::ql::QlReport>,
+    u64,
 );
 
 /// The rewrites, the planned steps, and what the QL rewriting did.

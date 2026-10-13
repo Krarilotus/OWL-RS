@@ -311,6 +311,12 @@ fn a_counted_join_holds_its_values_not_its_rows() {
         "{:#?}",
         explained.steps
     );
+    // What EXPLAIN reports as held: the weights of 1,000 subjects, under the budget.
+    assert!(
+        (16_000..1 << 20).contains(&explained.memory_peak_bytes),
+        "{}",
+        explained.memory_peak_bytes
+    );
     let nrese_sparql::QueryResults::Solutions(mut solutions) =
         nrese_sparql::evaluate_query(&snapshot, &query, &options).unwrap()
     else {
