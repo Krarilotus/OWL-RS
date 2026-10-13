@@ -76,7 +76,7 @@ fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, prop
             files: files.to_vec(),
             replace: false,
             graph: GraphTarget::DefaultGraph,
-            skip_errors: false,
+            invalid: Some(nrese_store::InvalidStatements::Strict),
         })
         .expect("load");
     let pipeline = MutationPipeline::new(

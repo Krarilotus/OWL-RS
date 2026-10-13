@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             files,
             replace: false,
             graph: GraphTarget::DefaultGraph,
-            skip_errors: false,
+            invalid: Some(nrese_store::InvalidStatements::Strict),
         })?;
         println!(
             "loaded {} quads in {:.2} s",

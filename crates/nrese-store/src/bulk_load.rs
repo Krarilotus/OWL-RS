@@ -11,11 +11,12 @@
 //! - **Gates.** A bulk load is an operator action on an offline or otherwise idle store. It
 //!   doesn't run the validation gates; SHACL and reasoning validate the result when they
 //!   next run in full (M2, M3).
-//! - **Bad statements.** A syntax error stops the load, unless `skip_errors`: then the
-//!   statement is skipped (a line of N-Triples or N-Quads, a statement of Turtle or TriG up
-//!   to its `.`, the rest of an RDF/XML node element below `rdf:RDF`, a top-level node
-//!   object of JSON-LD), logged (the first [`LOGGED_ERRORS`]) and counted, and the load
-//!   goes on. Other formats, malformed XML or JSON, still stop; a read error always does.
+//! - **Bad statements** ([`InvalidStatements`]). By default a statement with a syntax error
+//!   goes into the repository's quarantine ([`crate::quarantine`]) and the load goes on: a
+//!   line of N-Triples or N-Quads, a statement of Turtle or TriG up to its `.`, the rest of
+//!   an RDF/XML node element below `rdf:RDF`, a top-level node object of JSON-LD. Other
+//!   formats, malformed XML or JSON, still stop; a read error always does. Strict, the
+//!   first stops the load.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -30,6 +31,7 @@ use rayon::prelude::*;
 
 use crate::error::{StoreError, StoreResult};
 use crate::graph_store::GraphTarget;
+use crate::quarantine::{Collector, InvalidStatements, LoadFile, Quarantine, QuarantinedStatement};
 use crate::rdf_io::file_base_iri;
 
 /// Quads per interning batch: large enough to amortise the dictionary lock, small enough
@@ -39,8 +41,6 @@ const BATCH: usize = 32 * 1024;
 /// about 256 thousand quads. Each release takes well under a millisecond; at one per two
 /// million quads per thread, freed memory reached 3 GB at the end of DBpedia's parse.
 const BATCHES_PER_RELEASE: u64 = 8;
-/// Skipped statements logged one by one (the rest are only counted).
-const LOGGED_ERRORS: u64 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BulkLoadRequest {
@@ -50,11 +50,12 @@ pub struct BulkLoadRequest {
     pub replace: bool,
     /// Graph for triple formats (N-Triples, Turtle, RDF/XML); quad formats keep their own.
     pub graph: GraphTarget,
-    /// Skip statements with syntax errors (logged and counted) instead of stopping.
-    pub skip_errors: bool,
+    /// What a statement with a syntax error does; `None`: the store's setting
+    /// (`store.invalid_statements`, quarantine by default).
+    pub invalid: Option<InvalidStatements>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BulkLoadReport {
     pub revision: u64,
     /// Quads parsed, including duplicates.
@@ -62,29 +63,30 @@ pub struct BulkLoadReport {
     /// Asserted quads added and removed.
     pub inserted: u64,
     pub deleted: u64,
-    /// Statements skipped for syntax errors (`skip_errors`).
-    pub skipped: u64,
+    /// Statements quarantined for syntax errors ([`crate::quarantine`]).
+    pub quarantined: u64,
+    /// The load's id in the quarantine, if it quarantined any.
+    pub load: Option<String>,
+    /// The first of them in the files' order (at most [`crate::quarantine::EXAMPLES`]).
+    pub examples: Vec<QuarantinedStatement>,
     pub elapsed: Duration,
 }
 
-/// What `skip_errors` makes of syntax errors: `None` to stop with one.
-struct Skipping {
-    skipped: AtomicU64,
+/// Where a syntax error goes: `None` to stop with it.
+#[derive(Clone, Copy)]
+struct Skipping<'c, 'q> {
+    collector: &'c Collector<'q>,
+    /// The file's place in the load.
+    file: usize,
 }
 
-impl Skipping {
-    /// `Ok` (counted and maybe logged) for a syntax error to skip, the error otherwise.
-    fn skip(&self, path: &Path, error: RdfParseError) -> StoreResult<()> {
-        let RdfParseError::Syntax(syntax) = error else {
-            return Err(error.into());
-        };
-        let n = self.skipped.fetch_add(1, Ordering::Relaxed);
-        if n < LOGGED_ERRORS {
-            tracing::warn!(file = %path.display(), error = %syntax, "skipped a statement");
-        } else if n == LOGGED_ERRORS {
-            tracing::warn!(file = %path.display(), "more statements skipped; only counted from here");
+impl Skipping<'_, '_> {
+    /// `Ok` (quarantined) for a syntax error, the error otherwise.
+    fn skip(&self, error: RdfParseError) -> StoreResult<()> {
+        match error {
+            RdfParseError::Syntax(syntax) => self.collector.add(self.file, &syntax),
+            error => Err(error.into()),
         }
-        Ok(())
     }
 }
 
@@ -126,6 +128,8 @@ pub(crate) fn bulk_load(
     engine: &Engine,
     request: &BulkLoadRequest,
     progress: &LoadProgress,
+    invalid: InvalidStatements,
+    quarantine: &Quarantine,
 ) -> StoreResult<BulkLoadReport> {
     let started = Instant::now();
     let sources = request
@@ -140,9 +144,23 @@ pub(crate) fn bulk_load(
     };
     let load = engine.bulk_load(mode);
     let blank_nodes = BlankNodeScope::new(engine.snapshot().revision());
-    let skipping = request.skip_errors.then(|| Skipping {
-        skipped: AtomicU64::new(0),
-    });
+    let collector = match invalid {
+        InvalidStatements::Strict => None,
+        InvalidStatements::Quarantine => Some(
+            quarantine.begin(
+                sources
+                    .iter()
+                    .map(|source| LoadFile {
+                        path: source.path.to_path_buf(),
+                        format: source.format,
+                        base: file_base_iri(source.path).ok(),
+                    })
+                    .collect(),
+                &graph,
+                blank_nodes.prefix.clone(),
+            ),
+        ),
+    };
     let mut parsed = 0;
     // Chunks are numbered in input order over all files, from 1 (the engine's own `add`
     // numbers chunk 0): new terms take their ids in the order they first occur.
@@ -150,18 +168,15 @@ pub(crate) fn bulk_load(
     progress
         .files
         .store(sources.len() as u64, Ordering::Relaxed);
-    for source in &sources {
-        // Dropping the load unfinished aborts it: nothing is committed.
+    for (file, source) in sources.iter().enumerate() {
+        // Dropping the load unfinished aborts it: nothing is committed (nor quarantined).
         if progress.is_cancelled() {
             return Err(StoreError::LoadCancelled);
         }
-        let quads = source.load_into(
-            &load,
-            &mut next_chunk,
-            &graph,
-            &blank_nodes,
-            skipping.as_ref(),
-        )?;
+        let skipping = collector
+            .as_ref()
+            .map(|collector| Skipping { collector, file });
+        let quads = source.load_into(&load, &mut next_chunk, &graph, &blank_nodes, skipping)?;
         parsed += quads;
         progress.parsed.fetch_add(quads, Ordering::Relaxed);
         progress.files_done.fetch_add(1, Ordering::Relaxed);
@@ -172,12 +187,26 @@ pub(crate) fn bulk_load(
     let summary = load.finish();
     memory::release_all();
     let summary = summary?;
+    // Committed: so is its quarantine.
+    let quarantined = collector
+        .map(Collector::commit)
+        .transpose()?
+        .unwrap_or_default();
+    if quarantined.count > 0 {
+        tracing::warn!(
+            count = quarantined.count,
+            load = quarantined.load.as_deref().unwrap_or_default(),
+            "the load quarantined statements it couldn't read"
+        );
+    }
     Ok(BulkLoadReport {
         revision: summary.revision,
         parsed,
         inserted: summary.inserted,
         deleted: summary.deleted,
-        skipped: skipping.map_or(0, |s| s.skipped.into_inner()),
+        quarantined: quarantined.count,
+        load: quarantined.load,
+        examples: quarantined.examples,
         elapsed: started.elapsed(),
     })
 }
@@ -210,7 +239,7 @@ impl<'a> Source<'a> {
         next_chunk: &mut u32,
         graph: &GraphName,
         blank_nodes: &BlankNodeScope,
-        skipping: Option<&Skipping>,
+        skipping: Option<Skipping<'_, '_>>,
     ) -> StoreResult<u64> {
         let threads = rayon::current_num_threads();
         let recovering = |parser: RdfParser| match skipping {
@@ -237,7 +266,7 @@ impl<'a> Source<'a> {
                     .enumerate()
                     .map(|(i, chunk)| {
                         let chunk_number = first + i as u32;
-                        feed(load, chunk_number, chunk, blank_nodes, skipping, self.path)
+                        feed(load, chunk_number, chunk, blank_nodes, skipping)
                     })
                     .sum()
             }
@@ -261,7 +290,7 @@ impl<'a> Source<'a> {
                         let quad = match (quad, skipping) {
                             (Ok(quad), _) => quad,
                             (Err(error), Some(skipping)) => {
-                                skipping.skip(self.path, error)?;
+                                skipping.skip(error)?;
                                 continue;
                             }
                             (Err(error), None) => return Err(error.into()),
@@ -291,15 +320,14 @@ impl<'a> Source<'a> {
     }
 }
 
-/// Parses `quads` (of the file `path`, its chunk `chunk`) in batches into `load` on the
-/// current thread, the batches numbered in order; returns the count.
+/// Parses `quads` (a file's chunk `chunk`) in batches into `load` on the current thread,
+/// the batches numbered in order; returns the count.
 fn feed(
     load: &BulkLoad<'_>,
     chunk: u32,
     quads: impl Iterator<Item = Result<Quad, RdfParseError>>,
     blank_nodes: &BlankNodeScope,
-    skipping: Option<&Skipping>,
-    path: &Path,
+    skipping: Option<Skipping<'_, '_>>,
 ) -> StoreResult<u64> {
     let mut batch = Vec::with_capacity(BATCH);
     let mut parsed = 0;
@@ -308,7 +336,7 @@ fn feed(
         let quad = match (quad, skipping) {
             (Ok(quad), _) => quad,
             (Err(error), Some(skipping)) => {
-                skipping.skip(path, error)?;
+                skipping.skip(error)?;
                 continue;
             }
             (Err(error), None) => return Err(error.into()),

@@ -72,6 +72,10 @@ pub enum StoreError {
     /// committed.
     #[error("the load was cancelled; nothing of it was committed")]
     LoadCancelled,
+    /// A quarantined statement that isn't there, isn't open or can't be admitted as asked
+    /// ([`crate::quarantine`]).
+    #[error("{0}")]
+    Quarantine(String),
     /// Under `owl2-dl` with exact answers asked for (`dl.answers = exact`): the store
     /// can't prove the answers complete, for the reasons given.
     #[error("the answers can't be proven complete under OWL 2 DL: {0}")]
@@ -155,6 +159,7 @@ impl StoreError {
             | Self::RdfParse(_)
             | Self::ShaclShapes(_)
             | Self::Forbidden(_)
+            | Self::Quarantine(_)
             | Self::FileParse { .. } => true,
             Self::SparqlEvaluation(_) => unreachable!("classified above"),
             Self::Configuration(_)

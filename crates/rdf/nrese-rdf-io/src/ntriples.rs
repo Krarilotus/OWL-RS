@@ -16,7 +16,7 @@ use nrese_rdf::{
 };
 
 use crate::blank::BlankNodes;
-use crate::error::{RdfSyntaxError, TextPosition};
+use crate::error::{RdfSyntaxError, SkippedStatement, TextPosition};
 use crate::text::{NOT_IN_IRI, unicode_escape};
 
 /// Text of a term: a range of the line, or one of the parser's scratch strings.
@@ -88,8 +88,33 @@ impl LineParser {
     }
 
     /// The quad on `line` (number `line_number`, starting at byte `offset`), or `None` for a
-    /// line with only whitespace or a comment.
+    /// line with only whitespace or a comment. An error names the line as its statement.
     pub(crate) fn parse<'a>(
+        &'a mut self,
+        bytes: &'a [u8],
+        line_number: u64,
+        offset: u64,
+    ) -> Result<Option<QuadRef<'a>>, RdfSyntaxError> {
+        self.parse_line(bytes, line_number, offset)
+            .map_err(|error| {
+                let end = TextPosition {
+                    line: line_number,
+                    column: String::from_utf8_lossy(bytes).chars().count() as u64,
+                    offset: offset + bytes.len() as u64,
+                };
+                let start = TextPosition {
+                    line: line_number,
+                    column: 0,
+                    offset,
+                };
+                error.with_statement(SkippedStatement {
+                    span: start..end,
+                    ..SkippedStatement::default()
+                })
+            })
+    }
+
+    fn parse_line<'a>(
         &'a mut self,
         bytes: &'a [u8],
         line_number: u64,

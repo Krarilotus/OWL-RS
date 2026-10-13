@@ -839,7 +839,7 @@ fn store(turtle: &str, dir: &std::path::Path, ruleset: Ruleset, ql: bool) -> Sto
             files: vec![file],
             replace: false,
             graph: GraphTarget::DefaultGraph,
-            skip_errors: false,
+            invalid: Some(nrese_store::InvalidStatements::Strict),
         })
         .unwrap();
     store.rematerialise(ruleset).unwrap();
@@ -1379,7 +1379,7 @@ fn raw_store(turtle: &str, dir: &std::path::Path) -> StoreService {
             files: vec![file],
             replace: false,
             graph: GraphTarget::DefaultGraph,
-            skip_errors: false,
+            invalid: Some(nrese_store::InvalidStatements::Strict),
         })
         .unwrap();
     store

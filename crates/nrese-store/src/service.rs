@@ -49,6 +49,8 @@ pub struct StoreService {
     settings: crate::query_executor::StoreSettings,
     /// Namespace prefixes for clients ([`crate::namespaces`]).
     namespaces: std::sync::Arc<crate::namespaces::Namespaces>,
+    /// Statements bulk loads couldn't read ([`crate::quarantine`]).
+    quarantine: std::sync::Arc<crate::quarantine::Quarantine>,
     /// Client transactions ([`crate::sessions`]).
     sessions: std::sync::Arc<crate::sessions::Sessions>,
     /// The queries running now ([`crate::running`]).
@@ -152,9 +154,13 @@ impl StoreService {
         let namespaces = crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
         );
+        let quarantine = crate::quarantine::Quarantine::open(
+            (config.mode == StoreMode::OnDisk).then_some(config.data_dir.as_path()),
+        )?;
         let service = Self {
             settings,
             namespaces: std::sync::Arc::new(namespaces),
+            quarantine: std::sync::Arc::new(quarantine),
             sessions: std::sync::Arc::default(),
             running: std::sync::Arc::default(),
             supports: std::sync::Arc::default(),
@@ -240,6 +246,11 @@ impl StoreService {
     /// The store's namespace prefixes ([`crate::namespaces`]).
     pub fn namespaces(&self) -> &crate::namespaces::Namespaces {
         &self.namespaces
+    }
+
+    /// The statements bulk loads couldn't read ([`crate::quarantine`]).
+    pub fn quarantine(&self) -> &crate::quarantine::Quarantine {
+        &self.quarantine
     }
 
     /// The store's client transactions ([`crate::sessions`]).
@@ -1289,7 +1300,8 @@ impl StoreService {
         progress: &crate::LoadProgress,
     ) -> StoreResult<BulkLoadReport> {
         self.invalidate_reasoning()?;
-        bulk_load(&self.engine, request, progress)
+        let invalid = request.invalid.unwrap_or(self.config.invalid_statements);
+        bulk_load(&self.engine, request, progress, invalid, &self.quarantine)
     }
 
     /// Builds the query planner's statistics of the store as it is now and saves them

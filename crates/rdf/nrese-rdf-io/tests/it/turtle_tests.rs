@@ -403,6 +403,96 @@ fn recovering_parsers_skip_bad_statements_and_go_on() {
     );
 }
 
+/// A syntax error names the statement it is in: its span in the document (the text a
+/// quarantine keeps verbatim), the directives in effect and its TriG block, so that a fixed
+/// copy reads on its own. In N-Triples the statement is its line, also in parallel chunks.
+#[test]
+fn an_error_names_its_statement_verbatim_with_what_reading_it_again_needs() {
+    // Claros: one IRI with a `%` that starts no escape, among valid lines.
+    let lines: Vec<String> = (0..50)
+        .map(|i| match i {
+            37 => "<http://example.com/s37> <http://example.com/p> <http://example.com/x?genre=%&a=1> .".to_owned(),
+            _ => format!("<http://example.com/s{i}> <http://example.com/p> \"{i}\" ."),
+        })
+        .collect();
+    let text = lines.join("\n") + "\n";
+    let check = |results: Vec<Result<Quad, RdfParseError>>| {
+        let errors: Vec<_> = results
+            .iter()
+            .filter_map(|r| match r {
+                Err(RdfParseError::Syntax(error)) => Some(error.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 1, "{results:?}");
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 49);
+        let statement = errors[0].statement().expect("the line");
+        let span = &statement.span;
+        assert_eq!((span.start.line, span.end.line), (37, 37));
+        let verbatim = &text[span.start.offset as usize..span.end.offset as usize];
+        assert_eq!(verbatim, lines[37]);
+        assert!(statement.context.is_empty() && statement.graph.is_none());
+    };
+    check(
+        RdfParser::from_format(RdfFormat::NTriples)
+            .recovering()
+            .for_slice(text.as_bytes())
+            .collect(),
+    );
+    let parsers = RdfParser::from_format(RdfFormat::NTriples)
+        .recovering()
+        .split_slice_for_parallel_parsing(text.as_bytes(), 4)
+        .unwrap();
+    assert!(parsers.len() > 1);
+    check(parsers.into_iter().flatten().collect());
+
+    // Turtle: the statement up to its `.`, with the prefixes it needs.
+    let turtle = "@prefix ex: <http://example.com/> .\n\
+                  ex:a ex:p 1 .\n\
+                  ex:b ex:p <http://example.com/x?genre=%&a=1> .\n\
+                  ex:c ex:p 3 .\n";
+    let results: Vec<_> = RdfParser::from_format(RdfFormat::Turtle)
+        .recovering()
+        .for_slice(turtle.as_bytes())
+        .collect();
+    let Some(Err(RdfParseError::Syntax(error))) = results.iter().find(|r| r.is_err()) else {
+        panic!("{results:?}")
+    };
+    let statement = error.statement().expect("the statement");
+    let span = &statement.span;
+    assert_eq!(span.start.line, 2);
+    let verbatim = &turtle[span.start.offset as usize..span.end.offset as usize];
+    assert_eq!(verbatim, "ex:b ex:p <http://example.com/x?genre=%&a=1> .");
+    assert!(
+        statement
+            .context
+            .contains("@prefix ex: <http://example.com/> .")
+    );
+    // Fixed, with its context, it reads on its own.
+    let fixed = format!("{}{}", statement.context, verbatim.replace("%&", "%25&"));
+    let quads: Vec<Quad> = RdfParser::from_format(RdfFormat::Turtle)
+        .for_slice(fixed.as_bytes())
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(quads.len(), 1);
+    assert_eq!(quads[0].subject.to_string(), "<http://example.com/b>");
+
+    // TriG: the block's graph.
+    let trig =
+        "<http://example.com/g> { <http://example.com/a> <http://example.com/p> <bad iri> . }\n";
+    let results: Vec<_> = RdfParser::from_format(RdfFormat::TriG)
+        .recovering()
+        .for_slice(trig.as_bytes())
+        .collect();
+    let Some(Err(RdfParseError::Syntax(error))) = results.iter().find(|r| r.is_err()) else {
+        panic!("{results:?}")
+    };
+    assert_eq!(
+        error.statement().and_then(|s| s.graph.as_deref()),
+        Some("<http://example.com/g>")
+    );
+}
+
 /// An error inside a token that spans lines (an IRI with a space and a line break) gets a
 /// position, not a panic.
 #[test]

@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             files: args.load.clone(),
             replace: true,
             graph: GraphTarget::DefaultGraph,
-            skip_errors: false,
+            invalid: Some(nrese_store::InvalidStatements::Strict),
         })?;
         eprintln!(
             "loaded {} quads in {:.1} s",

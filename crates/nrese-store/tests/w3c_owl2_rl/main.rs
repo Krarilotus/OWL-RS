@@ -113,7 +113,7 @@ fn run(name: &str, case: &Case, dir: &std::path::Path) -> Result<Passed, String>
             files: vec![file],
             replace: false,
             graph: GraphTarget::DefaultGraph,
-            skip_errors: false,
+            invalid: Some(nrese_store::InvalidStatements::Strict),
         })
         .map_err(|e| format!("premise: {e}"))?;
     let report = store

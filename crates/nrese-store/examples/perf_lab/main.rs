@@ -967,7 +967,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             files: args.load.clone(),
             replace: false,
             graph: GraphTarget::DefaultGraph,
-            skip_errors: false,
+            invalid: None,
         })?;
         report.load_s = started.elapsed().as_secs_f64();
         heap_profile(nrese_exec::heap::finish());
@@ -1086,7 +1086,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             files: vec![shapes.clone()],
             replace: false,
             graph: GraphTarget::NamedGraph(nrese_store::DEFAULT_SHAPES_GRAPH.to_owned()),
-            skip_errors: false,
+            invalid: None,
         })?;
         let mut times = Vec::new();
         let mut results = 0;

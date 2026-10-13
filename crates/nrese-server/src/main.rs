@@ -353,7 +353,7 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
         graph: load
             .graph
             .map_or(GraphTarget::DefaultGraph, GraphTarget::NamedGraph),
-        skip_errors: load.skip_errors,
+        invalid: load.invalid,
     };
     let report = store.bulk_load(&request).context("bulk load failed")?;
     let seconds = report.elapsed.as_secs_f64();
@@ -364,9 +364,22 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
         deleted = report.deleted,
         seconds,
         quads_per_second = (report.parsed as f64 / seconds) as u64,
-        skipped = report.skipped,
+        quarantined = report.quarantined,
         "bulk load complete"
     );
+    if report.quarantined > 0 {
+        eprintln!(
+            "warning: {} statements could not be read and are quarantined (load {}), the first:",
+            report.quarantined,
+            report.load.as_deref().unwrap_or_default()
+        );
+        for example in &report.examples {
+            eprintln!(
+                "  {} line {}: {}",
+                example.file, example.line, example.reason
+            );
+        }
+    }
     Ok(())
 }
 
