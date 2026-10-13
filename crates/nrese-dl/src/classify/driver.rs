@@ -18,7 +18,9 @@
 //! reported, never guessed: the taxonomy then holds what was proven.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use crate::limits::Limit;
 
 use nrese_owl::{Normalised, Ontology, Term};
 
@@ -99,10 +101,11 @@ impl<'a> Driver<'a> {
         let mut lower_top = Vec::new();
         if self.options.horn_lower_bound {
             let t = Instant::now();
-            let core = self.options.core(
-                self.deadline
-                    .budget(self.options, Some(self.options.lower_bound_timeout)),
-            );
+            let core = self.options.core(self.deadline.budget(
+                self.options,
+                // Unlimited: half of what is left of the deadline.
+                Some(self.options.lower_bound_timeout.unwrap_or(Duration::MAX)),
+            ));
             if let Some(lower) = known::horn_lower_bound(
                 self.normalised,
                 self.classes,
@@ -255,7 +258,7 @@ impl<'a> Driver<'a> {
             });
             self.incomplete.push(format!(
                 "{unknown} classes not decided ({})",
-                why.unwrap_or_else(|| "the deadline".into())
+                why.unwrap_or_else(|| Limit::Time.reached("the deadline passed"))
             ));
         }
         c.top = top.iter().map(|&t| self.classes[t as usize]).collect();
@@ -558,8 +561,9 @@ impl<'a> Driver<'a> {
                 }
                 Answer::Consistent => {}
                 other => self.incomplete.push(format!(
-                    "owl:Thing ⊑ class {d} not decided ({})",
-                    other.class()
+                    "owl:Thing ⊑ class {d} not decided ({}): {}",
+                    other.class(),
+                    reason(&other)
                 )),
             }
         }

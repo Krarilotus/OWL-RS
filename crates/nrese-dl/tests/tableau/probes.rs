@@ -217,11 +217,11 @@ fn retained_probes_use_the_requested_controls_and_decline_changed_strategy() {
             ..current.clone()
         },
         Config {
-            max_nodes: 0,
+            max_nodes: Some(0),
             ..current.clone()
         },
         Config {
-            max_memory: 0,
+            max_memory: Some(0),
             ..current.clone()
         },
     ] {
@@ -278,7 +278,7 @@ fn an_unknown_resumed_probe_is_not_retried_and_does_not_poison_the_pool() {
     let b = choice();
     let p = Prepared::new(&b.o, &normalise(&b.o), &[1, 2], &[100]);
     let config = Config {
-        max_nodes: 1,
+        max_nodes: Some(1),
         ..Config::default()
     };
     let (_, base) = p.consistency_with_base(&config, want(), true);

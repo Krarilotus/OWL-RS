@@ -1,4 +1,5 @@
 use super::*;
+use nrese_dl::limits::Deadline;
 
 fn lower_true_store() -> Arc<StoreService> {
     use crate::{
@@ -41,6 +42,7 @@ fn lower_true_ask_evaluates_once_and_delivers_that_result() {
         &store,
         &prepared,
         &CancellationToken::new(),
+        &nrese_exec::Envelope::unlimited(),
         DlAnswers::Exact,
     )
     .unwrap();
@@ -88,7 +90,7 @@ fn retained_dl_answers_honor_reporting_cancellation_before_writing() {
 fn cancelled_consistency_is_not_published_or_reused_by_another_request() {
     let store = StoreService::new(crate::StoreConfig::in_memory()).unwrap();
     let snapshot = store.read_snapshot(None);
-    let deadline = Instant::now() + store.config().dl.timeout;
+    let deadline = Deadline::after(store.config().dl.timeout);
     let view = unproved_view(&snapshot);
     let token = CancellationToken::new();
     let flag = token.flag();
@@ -96,9 +98,18 @@ fn cancelled_consistency_is_not_published_or_reused_by_another_request() {
     // when cancelled. Its shared flag handle proves it passed the entry check.
     let cache = store.dl().query_ontology.0.lock().unwrap();
     std::thread::scope(|scope| {
-        let checking = scope.spawn(|| consistency_at(&store, &snapshot, &view, &token, deadline));
-        let deadline = Instant::now() + std::time::Duration::from_secs(5);
-        while Arc::strong_count(&flag) == 2 && Instant::now() < deadline {
+        let checking = scope.spawn(|| {
+            consistency_at(
+                &store,
+                &snapshot,
+                &view,
+                &token,
+                deadline,
+                &nrese_exec::Envelope::unlimited(),
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Arc::strong_count(&flag) == 2 && std::time::Instant::now() < deadline {
             std::thread::yield_now();
         }
         let entered = Arc::strong_count(&flag) > 2;
@@ -117,13 +128,27 @@ fn cancelled_consistency_is_not_published_or_reused_by_another_request() {
     );
     let fresh = CancellationToken::new();
     assert_eq!(
-        consistency_at(&store, &snapshot, &view, &fresh, deadline),
+        consistency_at(
+            &store,
+            &snapshot,
+            &view,
+            &fresh,
+            deadline,
+            &nrese_exec::Envelope::unlimited()
+        ),
         Verdict::Consistent
     );
     let recorded = store.dl().status().unwrap();
     assert_eq!(recorded.consistency.verdict, Verdict::Consistent);
     assert_eq!(
-        consistency_at(&store, &snapshot, &view, &token, deadline),
+        consistency_at(
+            &store,
+            &snapshot,
+            &view,
+            &token,
+            deadline,
+            &nrese_exec::Envelope::unlimited()
+        ),
         Verdict::Unknown("cancelled".to_owned())
     );
     assert_eq!(
@@ -156,27 +181,55 @@ fn expired_consistency_keeps_request_timeout_out_of_shared_status() {
     let snapshot = store.read_snapshot(None);
     let view = unproved_view(&snapshot);
     let fresh = CancellationToken::new();
-    let expired = Instant::now();
+    let expired = Deadline::at(std::time::Instant::now());
     assert_eq!(
-        consistency_at(&store, &snapshot, &view, &fresh, expired),
-        Verdict::Unknown("past dl.timeout".to_owned())
+        consistency_at(
+            &store,
+            &snapshot,
+            &view,
+            &fresh,
+            expired,
+            &nrese_exec::Envelope::unlimited()
+        ),
+        Verdict::Unknown(nrese_dl::limits::Limit::Time.reached("the deadline passed"))
     );
     assert!(store.dl().status().is_none());
     assert!(store.dl().query_ontology.0.lock().unwrap().is_none());
-    let deadline = Instant::now() + store.config().dl.timeout;
+    let deadline = Deadline::after(store.config().dl.timeout);
     assert_eq!(
-        consistency_at(&store, &snapshot, &view, &fresh, deadline),
+        consistency_at(
+            &store,
+            &snapshot,
+            &view,
+            &fresh,
+            deadline,
+            &nrese_exec::Envelope::unlimited()
+        ),
         Verdict::Consistent
     );
     let recorded = store.dl().status().unwrap();
     // A cached proof remains usable after a new request's reasoning budget expires.
     assert_eq!(
-        consistency_at(&store, &snapshot, &view, &fresh, expired),
+        consistency_at(
+            &store,
+            &snapshot,
+            &view,
+            &fresh,
+            expired,
+            &nrese_exec::Envelope::unlimited()
+        ),
         Verdict::Consistent
     );
     fresh.cancel();
     assert_eq!(
-        consistency_at(&store, &snapshot, &view, &fresh, expired),
+        consistency_at(
+            &store,
+            &snapshot,
+            &view,
+            &fresh,
+            expired,
+            &nrese_exec::Envelope::unlimited()
+        ),
         Verdict::Unknown("cancelled".to_owned())
     );
     assert_eq!(
@@ -192,14 +245,28 @@ fn an_upper_bound_proof_survives_expiry_but_not_request_cancellation() {
     let mut view = unproved_view(&snapshot);
     view.proves_consistency = true;
     let token = CancellationToken::new();
-    let expired = Instant::now();
+    let expired = Deadline::at(std::time::Instant::now());
     assert_eq!(
-        consistency_at(&store, &snapshot, &view, &token, expired),
+        consistency_at(
+            &store,
+            &snapshot,
+            &view,
+            &token,
+            expired,
+            &nrese_exec::Envelope::unlimited()
+        ),
         Verdict::Consistent
     );
     token.cancel();
     assert_eq!(
-        consistency_at(&store, &snapshot, &view, &token, expired),
+        consistency_at(
+            &store,
+            &snapshot,
+            &view,
+            &token,
+            expired,
+            &nrese_exec::Envelope::unlimited()
+        ),
         Verdict::Unknown("cancelled".to_owned())
     );
     assert!(store.dl().status().is_none());
@@ -218,11 +285,24 @@ fn cancellation_takes_precedence_over_partial_answers_and_incompleteness() {
         DlAnswers::Exact,
     ] {
         let token = CancellationToken::new();
-        let outcome = decide_answers(&store, &prepared, &token, mode).unwrap();
+        let outcome = decide_answers(
+            &store,
+            &prepared,
+            &token,
+            &nrese_exec::Envelope::unlimited(),
+            mode,
+        )
+        .unwrap();
         assert!(matches!(outcome, Outcome::Stream(ref status, _, _) if !status.complete));
         token.cancel();
         assert!(matches!(
-            answer(&store, &prepared, &token, mode),
+            answer(
+                &store,
+                &prepared,
+                &token,
+                &nrese_exec::Envelope::unlimited(),
+                mode,
+            ),
             Err(StoreError::SparqlEvaluation(
                 nrese_sparql::QueryEvaluationError::Cancelled
             ))

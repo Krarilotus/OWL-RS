@@ -15,6 +15,7 @@
 //! checker verifies. The rest (inconsistency, entailments) is decided by the references.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use nrese_owl::{Axiom, ClassExpr, ExprId, Intern, Ontology, Term, TermKind, Terms};
 
@@ -53,9 +54,10 @@ impl Answers {
     }
 }
 
-fn config() -> Config {
+/// The engines' configuration for a case: the caller's time limit, no other budget.
+fn config(timeout: Option<Duration>) -> Config {
     Config {
-        timeout: Some(std::time::Duration::from_secs(20)),
+        timeout,
         ..Config::default()
     }
 }
@@ -68,6 +70,7 @@ fn witnessed(
     class: impl FnOnce(&mut Ontology) -> ExprId,
     x: Term,
     anonymous: bool,
+    timeout: Option<Duration>,
 ) -> Option<bool> {
     let mut o = o.clone();
     let c = class(&mut o);
@@ -80,7 +83,7 @@ fn witnessed(
         &o,
         &Config {
             keep_model: true,
-            ..config()
+            ..config(timeout)
         },
     );
     match out.answer {
@@ -102,9 +105,10 @@ fn kind(a: &Answer) -> Option<(char, String)> {
     }
 }
 
-/// The answers to case `o` (over `names`).
-pub fn answer(o: &Ontology, names: &Names) -> Answers {
-    let plain = tableau::consistency(o, &config());
+/// The answers to case `o` (over `names`), each engine run within `timeout` (`None`: no
+/// limit).
+pub fn answer(o: &Ontology, names: &Names, timeout: Option<Duration>) -> Answers {
+    let plain = tableau::consistency(o, &config(timeout));
     if let Some((k, why)) = kind(&plain.answer) {
         return Answers::undecided(k, &why);
     }
@@ -112,7 +116,7 @@ pub fn answer(o: &Ontology, names: &Names) -> Answers {
         o,
         &Config {
             keep_model: true,
-            ..config()
+            ..config(timeout)
         },
     );
     if let Some((k, why)) = kind(&kept.answer) {
@@ -128,7 +132,7 @@ pub fn answer(o: &Ontology, names: &Names) -> Answers {
         );
     }
     let options = classify::Options {
-        timeout: Some(std::time::Duration::from_secs(20)),
+        timeout,
         ..classify::Options::default()
     };
     let taxonomy = classify::classify(o, &options);
@@ -235,7 +239,7 @@ pub fn answer(o: &Ontology, names: &Names) -> Answers {
                         _ => ExprId(o.classes.intern(ClassExpr::And(parts))),
                     }
                 };
-                match witnessed(o, build, at, at == names.fresh) {
+                match witnessed(o, build, at, at == names.fresh, timeout) {
                     Some(true) => 'm',
                     Some(false) => {
                         return Answers::undecided(

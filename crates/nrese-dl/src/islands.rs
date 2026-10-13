@@ -81,7 +81,9 @@ pub fn split(ontology: &Ontology) -> Split {
 
 /// The batch size for `config`: [`BATCH`] assertions, at most a quarter of its node budget.
 fn batch_for(config: &tableau::Config) -> usize {
-    BATCH.min((config.max_nodes / 4).max(16))
+    config
+        .max_nodes
+        .map_or(BATCH, |most| BATCH.min((most / 4).max(16)))
 }
 
 /// [`split`] with batches of about `batch` assertions; `touched`: only the islands with
@@ -220,6 +222,18 @@ fn decide(
 ) -> Option<tableau::Outcome> {
     if islands.batches.is_empty() {
         return None;
+    }
+    // The batches are the request's compilation scratch while they are decided.
+    let mut scratch = crate::memory::Scratch::new(config.memory.as_ref());
+    let bytes = || {
+        islands
+            .batches
+            .iter()
+            .map(crate::memory::ontology_bytes)
+            .sum()
+    };
+    if scratch.charge(bytes).is_err() {
+        return Some(tableau::Outcome::stopped(crate::memory::EXHAUSTED));
     }
     // An island has at most two portfolio variants. With fewer islands than workers,
     // retain their useful nested race; otherwise give each concurrent island one slot.

@@ -27,11 +27,13 @@ pub(crate) struct Cache {
 
 type Slot<T> = Mutex<Option<(u64, Arc<T>)>>;
 
-/// How the engines run under the store's settings.
+/// How the engines run under the store's settings. A classification is the store's work,
+/// shared per revision, not a request's: its memory is an envelope of its own within the
+/// catalog's budget, which every test and the context core draw from.
 pub(super) fn options(store: &StoreService) -> classify::Options {
     let config = &store.config().dl;
     let workers = nrese_exec::workers::Workers::current().limited(config.threads);
-    let mut options = config.classification_options(workers);
+    let mut options = config.classification_options(workers, Some(store.envelope(None)));
     options.max_memory = Some(store.config().process_memory_bytes);
     options
 }
@@ -118,7 +120,7 @@ mod tests {
         let store = StoreService::new(StoreConfig {
             process_memory_bytes: 0,
             dl: DlConfig {
-                timeout,
+                timeout: Some(timeout),
                 threads: 1,
                 ..DlConfig::default()
             },
