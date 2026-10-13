@@ -3,6 +3,7 @@
 //! the results, and kept by an on-disk store across a reopen (the dictionary keys a triple
 //! term by its components' ids, which the log replays in order).
 
+use crate::support::Writes;
 use std::fs;
 use std::path::Path;
 

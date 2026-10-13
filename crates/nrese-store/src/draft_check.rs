@@ -230,7 +230,7 @@ fn store_with(graphs: &[Option<&str>], limits: &DraftLimits) -> Result<StoreServ
         .map_err(|error| failed(format!("no scratch store: {error}")))?;
     for text in graphs.iter().flatten() {
         store
-            .execute_graph_write(&GraphWriteRequest {
+            .graph_write_ungated(&GraphWriteRequest {
                 target: GraphTarget::DefaultGraph,
                 format: GraphResultFormat::NTriples,
                 base_iri: None,

@@ -2,6 +2,7 @@
 //! and RDF4J repositories allow; its own declarations win, and the result cache keeps
 //! queries apart that the same text means differently under other namespaces.
 
+use crate::support::Writes;
 use nrese_store::{SparqlQueryRequest, StoreConfig, StoreService};
 
 fn answer(store: &StoreService, query: &str) -> Result<String, nrese_store::StoreError> {

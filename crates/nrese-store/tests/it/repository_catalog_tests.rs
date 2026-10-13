@@ -1,6 +1,7 @@
 //! The repository catalogue is the store's (ADR-0007): repositories are created, changed,
 //! opened again and removed without a server.
 
+use crate::support::Writes;
 use nrese_reasoner::{ReasonerConfig, ReasonerService};
 use nrese_store::catalog::{Catalog, CatalogError, DEFAULT_REPOSITORY, RepositorySettings};
 use nrese_store::{StoreConfig, StoreService};

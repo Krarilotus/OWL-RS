@@ -4,6 +4,7 @@
 //! (inferred statements, a session's pending changes, cancellation) comes with it in a
 //! `ReadContext`.
 
+use crate::support::Writes;
 use std::sync::Arc;
 
 use crate::support::in_memory_store_config;
@@ -233,8 +234,16 @@ fn public_writer() -> Requester {
     )
 }
 
-fn forbidden(result: nrese_store::StoreResult<nrese_store::MutationCommitReport>) -> bool {
-    matches!(result, Err(nrese_store::StoreError::Forbidden(_)))
+fn forbidden(
+    result: Result<nrese_store::MutationCommitReport, nrese_store::MutationError>,
+) -> bool {
+    matches!(
+        result,
+        Err(nrese_store::MutationError::Store {
+            source: nrese_store::StoreError::Forbidden(_),
+            ..
+        })
+    )
 }
 
 #[test]
@@ -257,8 +266,11 @@ fn every_write_is_checked_against_its_requesters_scope() {
     assert!(store.apply(&graph_write("urn:g:public"), &writer).is_ok());
     let delete = MutationCommand::GraphDelete(GraphTarget::DefaultGraph);
     // Refusals name what they refuse.
-    let refusal = |result: nrese_store::StoreResult<_>| match result {
-        Err(nrese_store::StoreError::Forbidden(refusal)) => refusal,
+    let refusal = |result: Result<_, nrese_store::MutationError>| match result {
+        Err(nrese_store::MutationError::Store {
+            source: nrese_store::StoreError::Forbidden(refusal),
+            ..
+        }) => refusal,
         other => panic!("not refused: {other:?}"),
     };
     assert_eq!(
