@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 52: group-by-implicit-numeric-baseline
+# Implicit GROUP BY with COUNT on numeric predicate as baseline
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (COUNT(?o) AS ?count) { ?s dblp:numberOfCreators ?o. }

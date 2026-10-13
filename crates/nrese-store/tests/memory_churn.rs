@@ -14,9 +14,9 @@ use std::sync::Arc;
 use nrese_exec::heap;
 use nrese_reasoner::{ReasonerConfig, ReasonerService};
 use nrese_store::{
-    GraphResultFormat, GraphTarget, GraphWriteRequest, MutationCommand, MutationPipeline,
-    MutationTicket, Requester, SparqlQueryRequest, SparqlUpdateRequest, StatementOp,
-    StatementsRequest, StoreConfig, StoreService,
+    CancellationToken, GraphResultFormat, GraphTarget, GraphWriteRequest, MutationCommand,
+    MutationPipeline, MutationTicket, Requester, SparqlQueryRequest, SparqlUpdateRequest,
+    StatementOp, StatementsRequest, StoreConfig, StoreService,
 };
 
 #[global_allocator]
@@ -100,7 +100,9 @@ impl Soak {
         let prepared = store
             .prepare_query(&SparqlQueryRequest::all(query))
             .expect("parsed");
-        store.plan_query(&prepared).expect("planned");
+        store
+            .plan_query(&prepared, &CancellationToken::new())
+            .expect("planned");
         // A client transaction: committed seven times in ten, else rolled back.
         let session = store.sessions().begin(None).expect("began");
         let update = format!(
@@ -171,10 +173,14 @@ fn churn_over_a_bounded_pool_of_terms_holds_the_heap_level() {
     for _ in 0..rounds {
         soak.round();
     }
+    // Each level read with background maintenance settled: a compaction or checkpoint in
+    // flight holds its buffers for a while, however far it got.
+    soak.pipeline.store().settle();
     let level = heap::live();
     for _ in 0..3 * rounds {
         soak.round();
     }
+    soak.pipeline.store().settle();
     let after = heap::live();
     let grew = after.saturating_sub(level);
     eprintln!(

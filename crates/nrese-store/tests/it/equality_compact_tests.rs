@@ -541,6 +541,11 @@ fn a_commit_that_merges_classes_publishes_its_inferences_with_it() {
         "INSERT DATA { ex:x owl:sameAs ex:y . ex:y ex:likes ex:z . ex:x owl:sameAs ex:a }",
         // A merge the rules derive.
         "INSERT DATA { ex:kim ex:hasMother ex:m2 }",
+        // A merge whose displaced representative (`ex:n`, interned after `ex:z`) loses an
+        // asserted statement in the same commit: neither it nor what it implied returns
+        // over the new representative (`ex:z a ex:Person`, `ex:z a ex:Agent`).
+        "INSERT DATA { ex:n a ex:Person . ex:n ex:likes ex:w }",
+        "DELETE DATA { ex:n a ex:Person } ; INSERT DATA { ex:n owl:sameAs ex:z }",
     ];
     for (i, step) in steps.into_iter().enumerate() {
         let before = pipelines[1].store().current_revision();
@@ -561,32 +566,49 @@ fn a_commit_that_merges_classes_publishes_its_inferences_with_it() {
     }
 }
 
+/// B3a: a commit that splits `sameAs` classes in compact mode maintains them in the same
+/// revision, as one that merges them does, by the plan the maintenance policy picks.
+/// Splits by an asserted equality, by a derived one losing its premise, and of a class
+/// whose representative leaves.
 #[test]
-fn a_commit_that_splits_classes_publishes_its_inferences_with_it() {
-    let pipelines = [Mode::Replicate, Mode::Compact].map(pipeline);
+fn a_commit_that_splits_a_class_maintains_it_in_the_same_revision() {
+    let modes = [Mode::Replicate, Mode::Compact];
+    let pipelines = modes.map(pipeline);
     let steps = [
-        "INSERT DATA { ex:a owl:sameAs ex:b . ex:b ex:knows ex:kim .
-           ex:c owl:sameAs ex:d . ex:d a ex:Person .
-           ex:Person rdfs:subClassOf ex:Agent .
-           ex:mother a owl:FunctionalProperty . ex:k ex:mother ex:m1, ex:m2 .
-           ex:m2 ex:likes ex:z }",
-        "DELETE DATA { ex:a owl:sameAs ex:b }",
-        "DELETE DATA { ex:k ex:mother ex:m2 }",
-        // Exercise the ground program cached after each fallback.
+        "INSERT DATA { ex:z ex:knows ex:w }",
+        "INSERT DATA {
+           ex:a owl:sameAs ex:b . ex:b owl:sameAs ex:c . ex:c owl:sameAs ex:d .
+           ex:a ex:knows ex:kim . ex:d a ex:Person . ex:c ex:likes ex:z .
+           ex:Person rdfs:subClassOf ex:Agent . ex:hasMother a owl:FunctionalProperty .
+           ex:kim ex:hasMother ex:m1 . ex:kim ex:hasMother ex:m2 . ex:m2 ex:livesIn ex:berlin .
+           ex:m1 owl:sameAs ex:a }",
+        // An asserted equality in the middle of a chain: two classes.
+        "DELETE DATA { ex:b owl:sameAs ex:c }",
+        // A derived equality losing its premise.
+        "DELETE DATA { ex:kim ex:hasMother ex:m2 }",
+        // The representative's own equality: it leaves its class.
+        "DELETE DATA { ex:m1 owl:sameAs ex:a }",
+        // Merged again, then split by deleting the representative's facts.
+        "INSERT DATA { ex:b owl:sameAs ex:c . ex:kim ex:hasMother ex:m2 }",
+        "DELETE WHERE { ex:a ?p ?o }",
+        // The ground program cached after a split, in use.
         "INSERT DATA { ex:d ex:knows ex:kim . ex:m1 ex:likes ex:w }",
     ];
-    for (step_index, step) in steps.into_iter().enumerate() {
+    for (i, step) in steps.into_iter().enumerate() {
         let before = pipelines[1].store().current_revision();
         for pipeline in &pipelines {
             update(pipeline, step);
         }
-        assert_eq!(observe(&pipelines[1]), observe(&pipelines[0]), "{step}");
-        if step_index > 0 {
+        if i > 0 {
             assert_eq!(
                 pipelines[1].store().current_revision(),
                 before + 1,
-                "{step}"
+                "one revision for: {step}"
             );
+        }
+        let (reference, seen) = (observe(&pipelines[0]), observe(&pipelines[1]));
+        for (i, (got, want)) in seen.iter().zip(&reference).enumerate() {
+            assert_eq!(got, want, "observation {i}, after: {step}");
         }
     }
 }

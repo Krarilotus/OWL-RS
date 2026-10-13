@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 42: union-constraint-from-star
+# UNION of two large predicates, constrained by a large predicate known to have join partners
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (COUNT(*) AS ?count) WHERE { { ?s dblp:signatureOrdinal ?o1 } UNION { ?s rdf:type ?o1 } ?s dblp:signatureDblpName ?o2 }

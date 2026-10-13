@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 90: numeric-greater
+# Greater than
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (SUM(?o > 0) AS ?sum) WHERE { ?s dblp:numberOfCreators ?o }

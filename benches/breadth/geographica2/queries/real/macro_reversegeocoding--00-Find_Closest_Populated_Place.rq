@@ -1,0 +1,14 @@
+PREFIX geonames: <http://www.geonames.org/ontology#> 
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+PREFIX geo: <http://www.opengis.net/ont/geosparql#> 
+ 
+SELECT ?f (geof:distance(?cGeoWKT, "POINT(22.099098510784867 38.46653423317906)"^^geo:wktLiteral, <http://www.opengis.net/def/uom/OGC/1.0/metre>) AS ?distance)
+WHERE { 
+   GRAPH <http://geographica.di.uoa.gr/dataset/geonames> { 
+      ?f geonames:featureCode geonames:P.PPL; 
+         <http://www.geonames.org/ontology#hasGeometry> ?cGeo. 
+      ?cGeo <http://www.geonames.org/ontology#asWKT> ?cGeoWKT. 
+   } 
+}
+ORDER BY ASC(?distance) 
+LIMIT 1

@@ -23,6 +23,8 @@ pub struct ReasoningRunRecord {
     /// [`crate::reasoning::MAX_REPORTED_DIAGNOSTICS`]), and how many there are.
     pub diagnostics: Vec<OntologyDiagnostic>,
     pub diagnostics_total: usize,
+    /// What the maintenance did, in counts.
+    pub work: nrese_reasoner::delta::policy::Counts,
 }
 
 impl ReasoningRunRecord {
@@ -49,6 +51,7 @@ impl ReasoningRunRecord {
             commit_attribution,
             diagnostics: report.diagnostics.clone(),
             diagnostics_total: report.diagnostics_total,
+            work: report.work.clone(),
         }
     }
 

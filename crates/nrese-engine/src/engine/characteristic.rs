@@ -297,15 +297,9 @@ impl CharacteristicSets {
         };
         // Statements per subject of each predicate, over a set that has them all.
         let per_subject = |set: u32, predicates: &[u64]| -> Option<f64> {
-            if predicates.is_empty() {
-                return Some(1.0);
-            }
-            let set = self.sets.get(set as usize)?;
-            let subjects = set.subjects as f64;
-            predicates.iter().try_fold(1.0, |rows, q| {
-                let at = set.predicates.binary_search_by_key(q, |&(r, _)| r).ok()?;
-                Some(rows * set.predicates[at].1 as f64 / subjects)
-            })
+            predicates
+                .iter()
+                .try_fold(1.0, |rows, &q| Some(rows * self.share(set, q)?))
         };
         Some(
             links
@@ -336,15 +330,59 @@ impl CharacteristicSets {
         };
         rarest
             .iter()
-            .map(|&i| &self.sets[i as usize])
-            .filter_map(|set| {
-                let subjects = set.subjects as f64;
-                predicates.iter().try_fold(subjects, |rows, p| {
-                    let at = set.predicates.binary_search_by_key(p, |&(q, _)| q).ok()?;
-                    Some(rows * set.predicates[at].1 as f64 / subjects)
-                })
+            .filter_map(|&i| {
+                let subjects = self.sets[i as usize].subjects as f64;
+                predicates
+                    .iter()
+                    .try_fold(subjects, |rows, &p| Some(rows * self.share(i, p)?))
             })
             .sum()
+    }
+
+    /// The star of `predicate` alone, to be extended a predicate at a time
+    /// ([`Self::star_with`]).
+    pub fn star_of(&self, predicate: u64) -> StarRows {
+        let sets = self
+            .by_predicate
+            .get(&predicate)
+            .map_or(&[][..], Vec::as_slice);
+        let sets: Vec<(u32, f64)> = sets
+            .iter()
+            .filter_map(|&i| {
+                let subjects = self.sets[i as usize].subjects as f64;
+                Some((i, subjects * self.share(i, predicate)?))
+            })
+            .collect();
+        StarRows::new(sets)
+    }
+
+    /// The rows of `star` with `predicate` added ([`Self::star`] of its predicates and
+    /// `predicate`), without keeping the sets: O(the sets that still match).
+    pub fn star_rows_with(&self, star: &StarRows, predicate: u64) -> f64 {
+        star.sets
+            .iter()
+            .filter_map(|&(i, rows)| Some(rows * self.share(i, predicate)?))
+            .sum()
+    }
+
+    /// `star` with `predicate` added.
+    pub fn star_with(&self, star: &StarRows, predicate: u64) -> StarRows {
+        let sets = star
+            .sets
+            .iter()
+            .filter_map(|&(i, rows)| Some((i, rows * self.share(i, predicate)?)))
+            .collect();
+        StarRows::new(sets)
+    }
+
+    /// The statements of `predicate` per subject of set `i`; `None` if it lacks it.
+    fn share(&self, i: u32, predicate: u64) -> Option<f64> {
+        let set = &self.sets[i as usize];
+        let at = set
+            .predicates
+            .binary_search_by_key(&predicate, |&(q, _)| q)
+            .ok()?;
+        Some(set.predicates[at].1 as f64 / set.subjects as f64)
     }
 
     /// The number of distinct sets.
@@ -359,6 +397,38 @@ impl CharacteristicSets {
     /// The number of subjects.
     pub fn subjects(&self) -> u64 {
         self.subjects
+    }
+}
+
+/// A star built up one predicate at a time, as the planner adds a star's patterns
+/// ([`CharacteristicSets::star_of`], [`CharacteristicSets::star_with`]): the sets that have
+/// every predicate so far, each with the star's rows among its subjects. Adding a predicate
+/// reads one entry of each such set, where [`CharacteristicSets::star`] reads every
+/// predicate again.
+#[derive(Debug, Clone, Default)]
+pub struct StarRows {
+    sets: Vec<(u32, f64)>,
+    rows: f64,
+}
+
+impl StarRows {
+    fn new(sets: Vec<(u32, f64)>) -> Self {
+        let rows = sets.iter().map(|&(_, rows)| rows).sum();
+        Self { sets, rows }
+    }
+
+    /// The star's estimated solutions ([`CharacteristicSets::star`] of its predicates).
+    pub fn rows(&self) -> f64 {
+        self.rows
+    }
+
+    /// The sets that still match: what adding a predicate reads.
+    pub fn len(&self) -> usize {
+        self.sets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sets.is_empty()
     }
 }
 
@@ -519,6 +589,46 @@ mod tests {
         // Independence would say 23 links × 5/13 workers among the subjects: about 9.
         let unpaired = CharacteristicSets::build(std::iter::empty()).unwrap();
         assert_eq!(unpaired.pair(&[], knows, &[]), None);
+    }
+
+    /// A star extended a predicate at a time has the rows [`CharacteristicSets::star`]
+    /// gives for its predicates, repeats and unknown predicates included.
+    #[test]
+    fn stars_extended_a_predicate_at_a_time_equal_stars_from_scratch() {
+        let mut quads = Vec::new();
+        let mut state = 7u64;
+        let mut next = |bound: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+        for s in 0..400 {
+            for p in 100..108 {
+                for o in 0..next(4) {
+                    quads.push(quad(s, p, 1000 + o));
+                }
+            }
+        }
+        quads.sort_by_key(|q| (q.subject.raw(), q.predicate.raw(), q.object.raw()));
+        quads.dedup();
+        let sets = CharacteristicSets::build(quads.into_iter()).unwrap();
+        for _ in 0..200 {
+            let predicates: Vec<u64> = (0..1 + next(6)).map(|_| 100 + next(9)).collect();
+            let mut star = sets.star_of(predicates[0]);
+            assert_eq!(star.rows(), sets.star(&predicates[..1]));
+            for (k, &p) in predicates.iter().enumerate().skip(1) {
+                let ahead = sets.star_rows_with(&star, p);
+                star = sets.star_with(&star, p);
+                assert!((ahead - star.rows()).abs() <= 1e-9 * star.rows().max(1.0));
+                let scratch = sets.star(&predicates[..=k]);
+                assert!(
+                    (star.rows() - scratch).abs() <= 1e-9 * scratch.max(1.0),
+                    "{predicates:?}: {} against {scratch}",
+                    star.rows()
+                );
+            }
+        }
     }
 
     #[test]

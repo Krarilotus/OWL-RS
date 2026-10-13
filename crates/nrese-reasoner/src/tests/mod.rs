@@ -407,7 +407,11 @@ fn every_profile_batch_equals_naive() {
     let mut next = rng(0x5851_F42D_4C95_7F2D);
     for ruleset in super::rulesets::ALL {
         let mut derived = 0;
-        for case in 0..60 {
+        let covered = |derived: usize| derived > 120;
+        for case in 0.. {
+            if !draws_on(case, 60, covered(derived)) {
+                break;
+            }
             let lines = random_ontology(&mut next);
             let mut vocabulary = LocalVocabulary::default();
             let input = load(&mut vocabulary, &lines.join("\n"));
@@ -421,7 +425,7 @@ fn every_profile_batch_equals_naive() {
         }
         // The cases must derive something (a fair share: 60 small ontologies give
         // 200 or more under the fixed seed, down to about 150 under others).
-        assert!(derived > 120, "{}: {derived}", ruleset.name());
+        assert!(covered(derived), "{}: {derived}", ruleset.name());
     }
 }
 
@@ -760,6 +764,14 @@ fn rng(seed: u64) -> impl FnMut(usize) -> usize {
     }
 }
 
+/// Whether a random test that has drawn `drawn` cases draws another: every one of the
+/// `cases` it plans, then more (up to ten times as many) while it lacks the coverage its last
+/// assertion asks for, so that its coverage never depends on the seed's luck (seed 66810 of
+/// the SPARQL differential tests, 12 October 2026; the NI fuzz test's fix, `a901e34`).
+fn draws_on(drawn: u64, cases: u64, covered: bool) -> bool {
+    drawn < cases || (!covered && drawn < cases * 10)
+}
+
 /// A random small ontology (lines for [`load`]) over a vocabulary that exercises every
 /// rule table: hierarchies, property axioms and characteristics, restrictions,
 /// cardinalities, equality, lists and the consistency rules.
@@ -889,106 +901,116 @@ fn hidden_unnamed_classes_leave_the_rest_of_the_closure() {
     use super::unnamed::{UnnamedVocabulary, hidden_classes_in};
     let mut next = rng(0x000D_DBA1_1C1A_55E5);
     let (mut hidden_total, mut dropped_total) = (0, 0);
-    for ruleset in super::rulesets::ALL {
-        for case in 0..60 {
-            let mut lines = random_ontology(&mut next);
-            for u in 0..1 + next(4) {
-                let head = format!("_:u{u}l0");
-                lines.push(format!("_:u{u} owl:unionOf {head}"));
-                for m in 0..2 {
-                    lines.push(format!("_:u{u}l{m} rdf:first ex:C{}", next(5)));
-                    let rest = if m == 1 {
-                        "rdf:nil".to_owned()
-                    } else {
-                        format!("_:u{u}l{}", m + 1)
-                    };
-                    lines.push(format!("_:u{u}l{m} rdf:rest {rest}"));
+    let covered =
+        |hidden_total: usize, dropped_total: usize| hidden_total > 300 && dropped_total > 300;
+    // Rounds over the rulesets until their cases cover enough, at most ten: coverage
+    // never depends on the seed.
+    for round in 0.. {
+        if !draws_on(round, 1, covered(hidden_total, dropped_total)) {
+            break;
+        }
+        for ruleset in super::rulesets::ALL {
+            for case in 0..60 {
+                let mut lines = random_ontology(&mut next);
+                for u in 0..1 + next(4) {
+                    let head = format!("_:u{u}l0");
+                    lines.push(format!("_:u{u} owl:unionOf {head}"));
+                    for m in 0..2 {
+                        lines.push(format!("_:u{u}l{m} rdf:first ex:C{}", next(5)));
+                        let rest = if m == 1 {
+                            "rdf:nil".to_owned()
+                        } else {
+                            format!("_:u{u}l{}", m + 1)
+                        };
+                        lines.push(format!("_:u{u}l{m} rdf:rest {rest}"));
+                    }
+                    if next(2) == 0 {
+                        lines.push(format!("_:u{u} rdf:type owl:Class"));
+                    }
+                    let axiom = ["rdfs:domain", "rdfs:range"][next(2)];
+                    lines.push(format!("ex:p{} {axiom} _:u{u}", next(4)));
+                    // Now and then a use that consumes the memberships.
+                    match next(6) {
+                        0 => lines.push(format!("_:u{u} rdfs:subClassOf ex:C{}", next(5))),
+                        1 => lines.push(format!("ex:C{} owl:disjointWith _:u{u}", next(5))),
+                        _ => {}
+                    }
                 }
-                if next(2) == 0 {
-                    lines.push(format!("_:u{u} rdf:type owl:Class"));
+                for _ in 0..next(8) {
+                    lines.push(format!("ex:i{} ex:p{} ex:i{}", next(6), next(4), next(6)));
                 }
-                let axiom = ["rdfs:domain", "rdfs:range"][next(2)];
-                lines.push(format!("ex:p{} {axiom} _:u{u}", next(4)));
-                // Now and then a use that consumes the memberships.
-                match next(6) {
-                    0 => lines.push(format!("_:u{u} rdfs:subClassOf ex:C{}", next(5))),
-                    1 => lines.push(format!("ex:C{} owl:disjointWith _:u{u}", next(5))),
-                    _ => {}
-                }
-            }
-            for _ in 0..next(8) {
-                lines.push(format!("ex:i{} ex:p{} ex:i{}", next(6), next(4), next(6)));
-            }
-            let mut vocabulary = LocalVocabulary::default();
-            let input = load(
-                &mut vocabulary,
-                &lines.join(
-                    "
-",
-                ),
-            );
-            let unnamed = UnnamedVocabulary::new(&mut vocabulary);
-            let names = vocabulary.clone();
-            let rules = ruleset.rules(&mut vocabulary).unwrap();
-            let things = rules.iter().any(|r| r.name == "scm-cls");
-            let hidden = hidden_classes_in(
-                &input,
-                &unnamed,
-                &|id| names.text(id).starts_with("_:"),
-                things,
-            );
-            let lists = ListVocabulary::new(&mut vocabulary);
-            let lists = ruleset.has_list_rules().then_some(&lists);
-            let schema = Schema::owl(&mut vocabulary);
-            let full = batch::materialise(&input, &rules, lists, &schema);
-            let rdf_type = vocabulary.iri(&format!("{}type", super::ir::RDF));
-            let expected: HashSet<Triple> = full
-                .derived
-                .iter()
-                .copied()
-                .filter(|t| !(t[1] == rdf_type && hidden.contains_key(&t[2])))
-                .collect();
-            let dropped = full.derived.len() - expected.len();
-            let schema = Schema::owl(&mut vocabulary).hiding(hidden.clone());
-            let lean = batch::materialise(&input, &rules, lists, &schema);
-            let got: HashSet<Triple> = lean.derived.iter().copied().collect();
-            if got != expected {
-                let text = |t: &Triple| {
-                    let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
-                    format!("{s} {p} {o}")
-                };
-                let missing: Vec<String> = expected.difference(&got).take(6).map(text).collect();
-                let extra: Vec<String> = got.difference(&expected).take(6).map(text).collect();
-                panic!(
-                    "{} case {case}: missing {missing:#?} extra {extra:#?}
-{}",
-                    ruleset.name(),
-                    lines.join(
+                let mut vocabulary = LocalVocabulary::default();
+                let input = load(
+                    &mut vocabulary,
+                    &lines.join(
                         "
-"
-                    )
+",
+                    ),
                 );
+                let unnamed = UnnamedVocabulary::new(&mut vocabulary);
+                let names = vocabulary.clone();
+                let rules = ruleset.rules(&mut vocabulary).unwrap();
+                let things = rules.iter().any(|r| r.name == "scm-cls");
+                let hidden = hidden_classes_in(
+                    &input,
+                    &unnamed,
+                    &|id| names.text(id).starts_with("_:"),
+                    things,
+                );
+                let lists = ListVocabulary::new(&mut vocabulary);
+                let lists = ruleset.has_list_rules().then_some(&lists);
+                let schema = Schema::owl(&mut vocabulary);
+                let full = batch::materialise(&input, &rules, lists, &schema);
+                let rdf_type = vocabulary.iri(&format!("{}type", super::ir::RDF));
+                let expected: HashSet<Triple> = full
+                    .derived
+                    .iter()
+                    .copied()
+                    .filter(|t| !(t[1] == rdf_type && hidden.contains_key(&t[2])))
+                    .collect();
+                let dropped = full.derived.len() - expected.len();
+                let schema = Schema::owl(&mut vocabulary).hiding(hidden.clone());
+                let lean = batch::materialise(&input, &rules, lists, &schema);
+                let got: HashSet<Triple> = lean.derived.iter().copied().collect();
+                if got != expected {
+                    let text = |t: &Triple| {
+                        let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
+                        format!("{s} {p} {o}")
+                    };
+                    let missing: Vec<String> =
+                        expected.difference(&got).take(6).map(text).collect();
+                    let extra: Vec<String> = got.difference(&expected).take(6).map(text).collect();
+                    panic!(
+                        "{} case {case}: missing {missing:#?} extra {extra:#?}
+{}",
+                        ruleset.name(),
+                        lines.join(
+                            "
+"
+                        )
+                    );
+                }
+                assert_eq!(
+                    lean.violations.iter().map(|v| &v.rule).collect::<Vec<_>>(),
+                    full.violations.iter().map(|v| &v.rule).collect::<Vec<_>>(),
+                    "{} case {case}",
+                    ruleset.name()
+                );
+                // A consumed class is never hidden.
+                for &class in hidden.keys() {
+                    let consumed = input.iter().any(|t| {
+                        (t[0] == class && t[1] != unnamed.union_of() && t[1] != rdf_type)
+                            || (t[2] == class && vocabulary.text(t[1]).contains("disjointWith"))
+                    });
+                    assert!(!consumed, "{}", vocabulary.text(class));
+                }
+                hidden_total += hidden.len();
+                dropped_total += dropped;
             }
-            assert_eq!(
-                lean.violations.iter().map(|v| &v.rule).collect::<Vec<_>>(),
-                full.violations.iter().map(|v| &v.rule).collect::<Vec<_>>(),
-                "{} case {case}",
-                ruleset.name()
-            );
-            // A consumed class is never hidden.
-            for &class in hidden.keys() {
-                let consumed = input.iter().any(|t| {
-                    (t[0] == class && t[1] != unnamed.union_of() && t[1] != rdf_type)
-                        || (t[2] == class && vocabulary.text(t[1]).contains("disjointWith"))
-                });
-                assert!(!consumed, "{}", vocabulary.text(class));
-            }
-            hidden_total += hidden.len();
-            dropped_total += dropped;
         }
     }
     assert!(
-        hidden_total > 300 && dropped_total > 300,
+        covered(hidden_total, dropped_total),
         "{hidden_total} {dropped_total}"
     );
 }
@@ -1001,53 +1023,76 @@ fn representatives_expand_to_the_replicated_closure() {
     use super::representatives;
     let mut next = rng(0x1234_5678_9ABC_DEF1);
     let (mut classes_seen, mut merges) = (0, 0);
-    for ruleset in [Ruleset::Owl2Rl, Ruleset::RdfsPlus, Ruleset::OwlHorst] {
-        for case in 0..120 {
-            let mut lines = random_ontology(&mut next);
-            for _ in 0..next(6) {
-                lines.push(format!("ex:i{} owl:sameAs ex:i{}", next(6), next(6)));
-            }
-            for _ in 0..next(10) {
-                lines.push(format!("ex:i{} ex:p{} ex:i{}", next(6), next(4), next(6)));
-            }
-            // Equal properties and classes (punning), now and then.
-            if next(3) == 0 {
-                lines.push(format!("ex:p{} owl:sameAs ex:p{}", next(4), next(4)));
-            }
-            if next(4) == 0 {
-                lines.push(format!("ex:C{} owl:sameAs ex:C{}", next(5), next(5)));
-            }
-            let mut vocabulary = LocalVocabulary::default();
-            let input = load(
-                &mut vocabulary,
-                &lines.join(
-                    "
+    let covered = |classes_seen: usize, merges: usize| classes_seen > 150 && merges > 150;
+    // Rounds over the rulesets until their cases cover enough, at most ten: coverage
+    // never depends on the seed.
+    for round in 0.. {
+        if !draws_on(round, 1, covered(classes_seen, merges)) {
+            break;
+        }
+        for ruleset in [Ruleset::Owl2Rl, Ruleset::RdfsPlus, Ruleset::OwlHorst] {
+            for case in 0..120 {
+                let mut lines = random_ontology(&mut next);
+                for _ in 0..next(6) {
+                    lines.push(format!("ex:i{} owl:sameAs ex:i{}", next(6), next(6)));
+                }
+                for _ in 0..next(10) {
+                    lines.push(format!("ex:i{} ex:p{} ex:i{}", next(6), next(4), next(6)));
+                }
+                // Equal properties and classes (punning), now and then.
+                if next(3) == 0 {
+                    lines.push(format!("ex:p{} owl:sameAs ex:p{}", next(4), next(4)));
+                }
+                if next(4) == 0 {
+                    lines.push(format!("ex:C{} owl:sameAs ex:C{}", next(5), next(5)));
+                }
+                let mut vocabulary = LocalVocabulary::default();
+                let input = load(
+                    &mut vocabulary,
+                    &lines.join(
+                        "
 ",
-                ),
-            );
-            let rules = ruleset.rules(&mut vocabulary).unwrap();
-            let lists = ListVocabulary::new(&mut vocabulary);
-            let lists = ruleset.has_list_rules().then_some(&lists);
-            let schema = Schema::owl(&mut vocabulary);
-            let replicated = batch::materialise(&input, &rules, lists, &schema);
-            let mut expected: HashSet<Triple> = input.iter().copied().collect();
-            expected.extend(replicated.derived.iter().copied());
-            let closure = representatives::materialise(&input, &rules, lists, &schema);
-            let expanded: HashSet<Triple> = closure
-                .facts
-                .iter()
-                .flat_map(|&f| closure.classes.expand(f))
-                .collect();
-            if expanded != expected {
-                let text = |t: &Triple| {
-                    let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
-                    format!("{s} {p} {o}")
+                    ),
+                );
+                let rules = ruleset.rules(&mut vocabulary).unwrap();
+                let lists = ListVocabulary::new(&mut vocabulary);
+                let lists = ruleset.has_list_rules().then_some(&lists);
+                let schema = Schema::owl(&mut vocabulary);
+                let replicated = batch::materialise(&input, &rules, lists, &schema);
+                let mut expected: HashSet<Triple> = input.iter().copied().collect();
+                expected.extend(replicated.derived.iter().copied());
+                let closure = representatives::materialise(&input, &rules, lists, &schema);
+                let expanded: HashSet<Triple> = closure
+                    .facts
+                    .iter()
+                    .flat_map(|&f| closure.classes.expand(f))
+                    .collect();
+                if expanded != expected {
+                    let text = |t: &Triple| {
+                        let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
+                        format!("{s} {p} {o}")
+                    };
+                    let missing: Vec<String> =
+                        expected.difference(&expanded).take(6).map(text).collect();
+                    let extra: Vec<String> =
+                        expanded.difference(&expected).take(6).map(text).collect();
+                    panic!(
+                        "{} case {case}: missing {missing:#?} extra {extra:#?}
+{}",
+                        ruleset.name(),
+                        lines.join(
+                            "
+"
+                        )
+                    );
+                }
+                let rules_fired = |v: &[Violation]| -> std::collections::BTreeSet<String> {
+                    v.iter().map(|v| v.rule.clone()).collect()
                 };
-                let missing: Vec<String> =
-                    expected.difference(&expanded).take(6).map(text).collect();
-                let extra: Vec<String> = expanded.difference(&expected).take(6).map(text).collect();
-                panic!(
-                    "{} case {case}: missing {missing:#?} extra {extra:#?}
+                assert_eq!(
+                    rules_fired(&closure.violations),
+                    rules_fired(&replicated.violations),
+                    "{} case {case}
 {}",
                     ruleset.name(),
                     lines.join(
@@ -1055,31 +1100,14 @@ fn representatives_expand_to_the_replicated_closure() {
 "
                     )
                 );
+                classes_seen += usize::from(!closure.classes.is_empty());
+                merges += closure.merges;
+                // The representative closure is never larger.
+                assert!(closure.facts.len() <= expected.len());
             }
-            let rules_fired = |v: &[Violation]| -> std::collections::BTreeSet<String> {
-                v.iter().map(|v| v.rule.clone()).collect()
-            };
-            assert_eq!(
-                rules_fired(&closure.violations),
-                rules_fired(&replicated.violations),
-                "{} case {case}
-{}",
-                ruleset.name(),
-                lines.join(
-                    "
-"
-                )
-            );
-            classes_seen += usize::from(!closure.classes.is_empty());
-            merges += closure.merges;
-            // The representative closure is never larger.
-            assert!(closure.facts.len() <= expected.len());
         }
     }
-    assert!(
-        classes_seen > 150 && merges > 150,
-        "{classes_seen} {merges}"
-    );
+    assert!(covered(classes_seen, merges), "{classes_seen} {merges}");
 }
 
 /// Equality by representatives ends when a rule head names a constant that isn't its
@@ -1303,10 +1331,13 @@ fn equality_module_equals_the_generic_rules() {
 }
 
 /// The delta executor's equality module under random deletes and re-inserts of an
-/// equality-heavy ontology: equal to rematerialisation after every change.
+/// equality-heavy ontology: equal to rematerialisation after every change, under each
+/// plan of the maintenance policy (B3a: classes a deletion splits recomputed, or DRed
+/// over them).
 #[test]
 fn delta_equality_equals_rematerialisation() {
-    use super::delta::{MemoryBase, Rules, update};
+    use super::delta::policy::{Plan, Policy};
+    use super::delta::{MemoryBase, Rules, update_with};
 
     let mut lines = Vec::new();
     for i in 0..7 {
@@ -1346,44 +1377,57 @@ fn delta_equality_equals_rematerialisation() {
     };
     let closure =
         |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema).derived;
-    let mut next = rng(7);
-    let mut asserted: Vec<Triple> = pool.clone();
-    asserted.sort_unstable();
-    let mut inferred = closure(&asserted);
-    for step in 0..60 {
-        let fact = pool[next(pool.len())];
-        let deleting = asserted.binary_search(&fact).is_ok();
-        let mut after: Vec<Triple> = asserted.iter().copied().filter(|&t| t != fact).collect();
-        if !deleting {
-            after.push(fact);
-            after.sort_unstable();
+    for policy in [
+        Policy::default(),
+        Policy::forcing(Plan::Dred),
+        Policy::forcing(Plan::Recompute),
+    ] {
+        let mut next = rng(7);
+        let mut asserted: Vec<Triple> = pool.clone();
+        asserted.sort_unstable();
+        let mut inferred = closure(&asserted);
+        let mut recomputed = 0;
+        for step in 0..60 {
+            let fact = pool[next(pool.len())];
+            let deleting = asserted.binary_search(&fact).is_ok();
+            let mut after: Vec<Triple> = asserted.iter().copied().filter(|&t| t != fact).collect();
+            if !deleting {
+                after.push(fact);
+                after.sort_unstable();
+            }
+            let stack: Vec<Triple> = inferred
+                .iter()
+                .copied()
+                .filter(|t| after.binary_search(t).is_err())
+                .collect();
+            let base = MemoryBase::new(&after, &stack);
+            let new = !deleting && inferred.binary_search(&fact).is_err();
+            let (ins, del): (&[Triple], &[Triple]) = if deleting {
+                (&[], std::slice::from_ref(&fact))
+            } else if new {
+                (std::slice::from_ref(&fact), &[])
+            } else {
+                (&[], &[])
+            };
+            let result = update_with(&base, ins, del, compiled, None, crate::eval::NEVER, policy)
+                .expect("never stopped");
+            recomputed += usize::from(result.policy.plan == Plan::Recompute);
+            let removal: HashSet<Triple> = result.remove.iter().copied().collect();
+            let mut maintained: Vec<Triple> = stack
+                .into_iter()
+                .filter(|t| !removal.contains(t))
+                .chain(result.insert)
+                .collect();
+            maintained.sort_unstable();
+            maintained.dedup();
+            assert_eq!(maintained, closure(&after), "{policy:?}, step {step}");
+            inferred = maintained;
+            asserted = after;
         }
-        let stack: Vec<Triple> = inferred
-            .iter()
-            .copied()
-            .filter(|t| after.binary_search(t).is_err())
-            .collect();
-        let base = MemoryBase::new(&after, &stack);
-        let new = !deleting && inferred.binary_search(&fact).is_err();
-        let (ins, del): (&[Triple], &[Triple]) = if deleting {
-            (&[], std::slice::from_ref(&fact))
-        } else if new {
-            (std::slice::from_ref(&fact), &[])
-        } else {
-            (&[], &[])
-        };
-        let result = update(&base, ins, del, compiled, None);
-        let removal: HashSet<Triple> = result.remove.iter().copied().collect();
-        let mut maintained: Vec<Triple> = stack
-            .into_iter()
-            .filter(|t| !removal.contains(t))
-            .chain(result.insert)
-            .collect();
-        maintained.sort_unstable();
-        maintained.dedup();
-        assert_eq!(maintained, closure(&after), "step {step}");
-        inferred = maintained;
-        asserted = after;
+        match policy.force {
+            Some(Plan::Dred) => assert_eq!(recomputed, 0),
+            _ => assert!(recomputed > 0, "{policy:?}: no change recomputed a class"),
+        }
     }
 }
 
@@ -1393,40 +1437,44 @@ fn delta_equality_equals_rematerialisation() {
 fn materialisation_stops_when_asked() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let mut next = rng(77);
-    let lines = random_ontology(&mut next);
-    let mut vocabulary = LocalVocabulary::default();
-    let input = load(
-        &mut vocabulary,
-        &lines.join(
-            "
-",
-        ),
-    );
-    let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
-    let lists = ListVocabulary::new(&mut vocabulary);
-    let schema = Schema::owl(&mut vocabulary);
-    let mut groups: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
-    let mut sorted = input.clone();
-    sorted.sort_unstable_by_key(|&[s, p, o]| (p, o, s));
-    sorted.dedup();
-    for [s, p, o] in sorted {
-        match groups.last_mut() {
-            Some((last, pairs)) if *last == p => pairs.push((o, s)),
-            _ => groups.push((p, vec![(o, s)])),
+    // An ontology whose materialisation asks often enough to be stopped at several points:
+    // most do, and a seed that draws one that doesn't draws another (at most ten), so
+    // that the test never depends on the seed's luck.
+    let mut drawn = 0;
+    let (groups, rules, lists, schema, total) = loop {
+        drawn += 1;
+        let lines = random_ontology(&mut next);
+        let mut vocabulary = LocalVocabulary::default();
+        let input = load(&mut vocabulary, &lines.join("\n"));
+        let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+        let lists = ListVocabulary::new(&mut vocabulary);
+        let schema = Schema::owl(&mut vocabulary);
+        let mut groups: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
+        let mut sorted = input.clone();
+        sorted.sort_unstable_by_key(|&[s, p, o]| (p, o, s));
+        sorted.dedup();
+        for [s, p, o] in sorted {
+            match groups.last_mut() {
+                Some((last, pairs)) if *last == p => pairs.push((o, s)),
+                _ => groups.push((p, vec![(o, s)])),
+            }
         }
-    }
-    let full = batch::materialise(&input, &rules, Some(&lists), &schema);
-    let polls = AtomicUsize::new(0);
-    let count = || {
-        polls.fetch_add(1, Ordering::Relaxed);
-        false
+        let full = batch::materialise(&input, &rules, Some(&lists), &schema);
+        let polls = AtomicUsize::new(0);
+        let count = || {
+            polls.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        let again =
+            batch::materialise_grouped_until(groups.clone(), &rules, Some(&lists), &schema, &count)
+                .expect("never stopped");
+        assert_eq!(again.derived, full.derived);
+        let total = polls.load(Ordering::Relaxed);
+        if total > 2 || drawn == 10 {
+            break (groups, rules, lists, schema, total);
+        }
     };
-    let again =
-        batch::materialise_grouped_until(groups.clone(), &rules, Some(&lists), &schema, &count)
-            .expect("never stopped");
-    assert_eq!(again.derived, full.derived);
-    let total = polls.load(Ordering::Relaxed);
-    assert!(total > 2, "{total} polls");
+    assert!(total > 2, "{total} polls in {drawn} ontologies");
     for at in [0, 1, total / 2] {
         let seen = AtomicUsize::new(0);
         let stop = || seen.fetch_add(1, Ordering::Relaxed) >= at;
@@ -1444,7 +1492,11 @@ fn batch_equals_naive_on_random_ontologies() {
     let mut next = rng(0x9E37_79B9_7F4A_7C15);
     let (mut derived, mut violations, mut rules) =
         (0, 0, std::collections::BTreeSet::<String>::new());
-    for case in 0..400 {
+    let covered = |derived: usize, rules: usize| derived > 15_000 && rules >= 8;
+    for case in 0.. {
+        if !draws_on(case, 400, covered(derived, rules.len())) {
+            break;
+        }
         let lines = random_ontology(&mut next);
         let mut vocabulary = LocalVocabulary::default();
         let input = load(&mut vocabulary, &lines.join("\n"));
@@ -1460,8 +1512,10 @@ fn batch_equals_naive_on_random_ontologies() {
     }
     // The cases exercise derivations and a spread of consistency rules (over 20 000
     // derivations under the fixed seed, down to about 19 000 under others).
-    assert!(derived > 15_000, "{derived}");
-    assert!(rules.len() >= 8, "{violations} violations of {rules:?}");
+    assert!(
+        covered(derived, rules.len()),
+        "{derived} derived, {violations} violations of {rules:?}"
+    );
 }
 
 /// List axioms edited under the delta executor (the milestone review's R1): its list
@@ -1598,7 +1652,11 @@ pub(super) fn support_sets_against_closures() {
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
     let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x6a5e_7c0d_2026_1003));
     let mut checked = 0;
-    for case in 0..cases {
+    let covered = |checked: usize| checked > 0;
+    for case in 0.. {
+        if !draws_on(case, cases, covered(checked)) {
+            break;
+        }
         let lines = random_ontology(&mut next);
         let mut vocabulary = LocalVocabulary::default();
         let pool = load(
@@ -1715,7 +1773,7 @@ pub(super) fn support_sets_against_closures() {
             checked += 1;
         }
     }
-    assert!(checked > 0);
+    assert!(covered(checked), "no case checked");
 }
 
 /// The oracle of `graph_sets::update_support_sets` (its test calls it): random
@@ -1729,7 +1787,11 @@ pub(super) fn support_set_updates_against_recomputation() {
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
     let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x5e75_d1ff_2026_1003));
     let (mut updated, mut refused) = (0, 0);
-    for case in 0..cases {
+    let covered = |updated: u64| updated > cases / 4;
+    for case in 0.. {
+        if !draws_on(case, cases, covered(updated)) {
+            break;
+        }
         let lines = random_ontology(&mut next);
         let mut vocabulary = LocalVocabulary::default();
         let pool = load(&mut vocabulary, &lines.join("\n"));
@@ -1873,7 +1935,7 @@ pub(super) fn support_set_updates_against_recomputation() {
         }
         updated += 1;
     }
-    assert!(updated > cases / 4, "updated {updated}, refused {refused}");
+    assert!(covered(updated), "updated {updated}, refused {refused}");
 }
 
 /// Random ontologies under random insert/delete sequences: after every change, the
@@ -1881,14 +1943,19 @@ pub(super) fn support_set_updates_against_recomputation() {
 /// violations it reports are exactly the new ones.
 #[test]
 fn delta_equals_rematerialisation_under_random_changes() {
-    use super::delta::{MemoryBase, Rules, update};
+    use super::delta::policy::{Plan, Policy};
+    use super::delta::{MemoryBase, Rules, update_with};
 
     // NRESE_FUZZ_CASES and NRESE_FUZZ_SEED widen the sweep locally.
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(300);
     let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x2545_F491_4F6C_DD1D));
     let (mut changes, mut inserted, mut removed) = (0, 0, 0);
-    for case in 0..cases {
+    let covered = |inserted: usize, removed: usize| inserted > 1000 && removed > 1000;
+    for case in 0.. {
+        if !draws_on(case, cases, covered(inserted, removed)) {
+            break;
+        }
         let lines = random_ontology(&mut next);
         let mut vocabulary = LocalVocabulary::default();
         let pool = load(&mut vocabulary, &lines.join("\n"));
@@ -1943,8 +2010,22 @@ fn delta_equals_rematerialisation_under_random_changes() {
                 .filter(|f| after.binary_search(f).is_err())
                 .collect();
             let base = MemoryBase::new(&after, &stack);
+            // Every other run of rulesets recomputes each class a deletion touches.
+            let policy = match (case / 3) % 2 {
+                0 => Policy::default(),
+                _ => Policy::forcing(Plan::Recompute),
+            };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                update(&base, &insert, &delete, compiled, cache.as_ref())
+                update_with(
+                    &base,
+                    &insert,
+                    &delete,
+                    compiled,
+                    cache.as_ref(),
+                    crate::eval::NEVER,
+                    policy,
+                )
+                .expect("never stopped")
             }));
             let context = || {
                 let text = |t: &Triple| {
@@ -2030,9 +2111,13 @@ fn delta_equals_rematerialisation_under_random_changes() {
             before = expected;
         }
     }
-    assert_eq!(changes, cases * 4);
+    // Four changes a case, for every case drawn (at least the planned ones).
     assert!(
-        inserted > 1000 && removed > 1000,
+        changes % 4 == 0 && changes >= cases * 4,
+        "{changes} changes"
+    );
+    assert!(
+        covered(inserted, removed),
         "{inserted} inserted, {removed} removed"
     );
 }
@@ -2079,5 +2164,155 @@ fn in_place_drivers_visit_what_a_scan_visits() {
                 assert_eq!(ranged, scanned, "{pattern:?} {seg:?} morsel {morsel}");
             }
         }
+    }
+}
+
+/// The B3a sweep's `NRESE_FUZZ_SEED=7` (case 211, step 1), kept as it was found: a
+/// change deletes an equality of one class and inserts one that links it to another (with
+/// its own members, unrelated to the deletion). The region a recompute takes must cover
+/// both classes whole, followed through `owl:sameAs` in the state; one hop from the deleted
+/// equality's ends missed the other class's members, and their reflexive `sameAs` stayed.
+#[test]
+fn a_recomputed_region_takes_in_the_classes_a_change_links() {
+    use super::delta::policy::{Plan, Policy};
+    use super::delta::{MemoryBase, Rules, update_with};
+    let mut vocabulary = LocalVocabulary::default();
+    let before = load(
+        &mut vocabulary,
+        r#"ex:C3 owl:equivalentClass ex:C2
+ex:C0 owl:onProperty ex:p1
+ex:C0 owl:someValuesFrom ex:C1
+ex:p0 owl:propertyDisjointWith ex:p0
+ex:p0 rdf:type owl:TransitiveProperty
+ex:p0 rdf:type owl:AsymmetricProperty
+ex:p0 owl:propertyChainAxiom _:l5a
+ex:i0 owl:sameAs ex:i0
+ex:i0 rdf:type ex:C3
+ex:i0 ex:p3 ex:i4
+ex:i2 ex:p1 ex:i4
+ex:p1 rdf:type owl:FunctionalProperty
+ex:p1 owl:propertyChainAxiom _:l7a
+ex:p1 rdfs:domain ex:C3
+ex:i4 rdf:type ex:C3
+ex:i4 ex:p3 ex:i2
+ex:i4 owl:differentFrom ex:i5
+ex:p3 rdf:type owl:SymmetricProperty
+ex:p2 rdfs:range ex:C3
+ex:p2 owl:inverseOf ex:p2
+ex:p2 owl:equivalentProperty ex:p1
+_:l7a rdf:first ex:p3
+_:l7a rdf:rest _:l7b
+_:l7b rdf:rest rdf:nil
+ex:C1 owl:intersectionOf _:l18a
+ex:C1 owl:intersectionOf _:l33a
+ex:C4 rdfs:subClassOf ex:C0
+ex:C4 owl:complementOf ex:C1
+_:l18a rdf:first ex:C3
+_:l18a rdf:rest _:l18b
+ex:i5 ex:p2 ex:i4
+ex:i3 ex:p3 ex:i5
+_:l33a rdf:rest _:l33b
+_:l33b rdf:first ex:C4
+_:l33b rdf:rest rdf:nil
+ex:i1 ex:p1 ex:i2"#,
+    );
+    let insert = load(
+        &mut vocabulary,
+        r#"_:l7b rdf:first ex:p1
+ex:C0 owl:allValuesFrom ex:C2
+ex:p3 rdfs:subPropertyOf ex:p0
+_:l18b rdf:rest rdf:nil
+ex:C1 owl:onProperty ex:p3
+ex:C1 owl:equivalentClass ex:C2
+ex:i1 owl:sameAs ex:i2"#,
+    );
+    let delete = load(
+        &mut vocabulary,
+        r#"ex:p0 owl:propertyDisjointWith ex:p0
+ex:p0 owl:propertyChainAxiom _:l5a
+ex:i0 owl:sameAs ex:i0
+ex:i2 ex:p1 ex:i4
+ex:p1 owl:propertyChainAxiom _:l7a
+ex:p2 rdfs:range ex:C3
+_:l7a rdf:rest _:l7b
+_:l7b rdf:rest rdf:nil
+ex:C4 owl:complementOf ex:C1
+ex:i3 ex:p3 ex:i5
+_:l33a rdf:rest _:l33b"#,
+    );
+    let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let schema = Schema::owl(&mut vocabulary);
+    let compiled = Rules {
+        rules: &rules,
+        lists: Some(&lists),
+        schema: &schema,
+    };
+    let closure = |a: &[Triple]| batch::materialise(a, &rules, Some(&lists), &schema).derived;
+    let mut asserted = before.clone();
+    asserted.sort_unstable();
+    asserted.dedup();
+    let inferred = closure(&asserted);
+    let mut after: Vec<Triple> = asserted
+        .iter()
+        .copied()
+        .filter(|f| !delete.contains(f))
+        .chain(insert.iter().copied())
+        .collect();
+    after.sort_unstable();
+    after.dedup();
+    let insert: Vec<Triple> = insert
+        .into_iter()
+        .filter(|f| !delete.contains(f) && inferred.binary_search(f).is_err())
+        .collect();
+    let stack: Vec<Triple> = inferred
+        .iter()
+        .copied()
+        .filter(|f| after.binary_search(f).is_err())
+        .collect();
+    let base = MemoryBase::new(&after, &stack);
+    for policy in [
+        Policy::default(),
+        Policy::forcing(Plan::Dred),
+        Policy::forcing(Plan::Recompute),
+    ] {
+        let result = update_with(
+            &base,
+            &insert,
+            &delete,
+            compiled,
+            None,
+            crate::eval::NEVER,
+            policy,
+        )
+        .unwrap();
+        let removal: HashSet<Triple> = result.remove.iter().copied().collect();
+        let mut maintained: Vec<Triple> = stack
+            .iter()
+            .copied()
+            .filter(|f| !removal.contains(f))
+            .chain(result.insert.iter().copied())
+            .collect();
+        maintained.sort_unstable();
+        maintained.dedup();
+        let expected = closure(&after);
+        let text = |t: &Triple| {
+            let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
+            format!("{s} {p} {o}")
+        };
+        let extra: Vec<String> = maintained
+            .iter()
+            .filter(|f| expected.binary_search(f).is_err())
+            .map(text)
+            .collect();
+        let missing: Vec<String> = expected
+            .iter()
+            .filter(|f| maintained.binary_search(f).is_err())
+            .map(text)
+            .collect();
+        assert!(
+            extra.is_empty() && missing.is_empty(),
+            "{policy:?}: extra {extra:?}, missing {missing:?}"
+        );
     }
 }

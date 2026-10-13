@@ -17,7 +17,11 @@ import subprocess
 import sys
 import time
 
-IMAGE = "nrese-bench/dl-reference"
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "suite"))
+from suitekit import hosts  # noqa: E402
+
+# The image, or its verified preserved alias on a host whose Docker has only that (hosts.toml).
+IMAGE = hosts.image("nrese-bench/dl-reference")
 GRACE = 30
 
 

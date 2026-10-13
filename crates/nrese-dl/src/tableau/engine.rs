@@ -137,8 +137,12 @@ pub struct Engine<'a> {
     /// How far the datatype stage has read the fact tables.
     pub data_done: super::data::DataDone,
     pub theory: crate::datatypes::DatatypeTheory,
-    /// Why a datatype check was only approximate, if one was: a model is then no answer.
+    /// Why a datatype check was only approximate, if one was: a model is then no answer
+    /// (the input isn't OWL 2 DL there: unsupported).
     pub data_approximate: Option<String>,
+    /// Which resource limit bounded a datatype check, if one did: a model is then no
+    /// answer either (gave up).
+    pub data_limited: Option<String>,
     /// The root the test's concepts were asserted on (`NONE`: no test).
     pub probe: u32,
     /// Per clause: how many clashes depended on a choice of it ([`Config::conflict_order`]).
@@ -188,6 +192,7 @@ impl<'a> Engine<'a> {
             data_done: super::data::DataDone::default(),
             theory: crate::datatypes::DatatypeTheory::default(),
             data_approximate: None,
+            data_limited: None,
             probe: NONE,
             activity: Vec::new(),
             floor: 0,

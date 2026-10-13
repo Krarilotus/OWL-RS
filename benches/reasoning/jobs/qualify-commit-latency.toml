@@ -1,0 +1,19 @@
+id = "reasoning-qualify-commit-latency"
+group = "reasoning"
+host = "office-pc"
+checkout = "suite/reasoning"
+workload = "commit-latency"
+window = "any"
+priority = 1
+est_min = 40
+needs = ["docker"]
+# GraphDB's licence on Office-PC is Free (checked 12 Oct 2026: product GRAPHDB_LITE, valid,
+# no expiry, at most 1 CPU core, 5 repositories, two concurrent queries), so the comparison is
+# the matched one-CPU scenario of benches/competitors/README.md.
+env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server", NRESE_VERSION = "16c3bfb", HARNESS = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-bench-harness", NRESE_LICENSES = "/home/krarilotus/nrese-assets/kraris-gptler-20261009/snapshots/windows/nrese-bench/licenses", DOCKER_MEMORY = "20g", DOCKER_CPUS = "1" }
+# One short repetition per system: every kind of commit and two reader counts, the closure
+# checked against the base at the end. The change sets: maintenance.py prepare --tier lubm-10
+# (done on the host, ~/nrese-reasoning-suite/data/maintenance/lubm-10/changes.json).
+commands = [
+  ["sh", "-c", "python3 benches/reasoning/maintenance/maintenance.py run --systems nrese,graphdb --tier lubm-10 --runs 1 --batch-reps 2 --readers 0,2 --duration-s 20 --results \"$QUEUE_RESULTS\""],
+]

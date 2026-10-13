@@ -20,10 +20,10 @@ fn expression(e: &str) -> Expression {
     let GraphPattern::Project { inner, .. } = query.pattern() else {
         panic!("no projection")
     };
-    let GraphPattern::Extend { expression, .. } = inner.as_ref() else {
+    let GraphPattern::Extend { bindings, .. } = inner.as_ref() else {
         panic!("no extension")
     };
-    expression.clone()
+    bindings[0].1.clone()
 }
 
 fn int(value: &str) -> Expression {
@@ -63,10 +63,11 @@ fn a_sign_before_digits_makes_a_literal() {
     let GraphPattern::Project { inner, .. } = query.pattern() else {
         panic!()
     };
-    let GraphPattern::Extend { expression, .. } = inner.as_ref() else {
+    let GraphPattern::Extend { bindings, .. } = inner.as_ref() else {
         panic!()
     };
-    assert_eq!(*expression, sub(x, int("1")));
+    // The select expression continues the group's `Extend`: the last binding.
+    assert_eq!(bindings.last().unwrap().1, sub(x, int("1")));
 }
 
 #[test]
@@ -205,11 +206,12 @@ fn the_writer_keeps_a_filter_where_it_was() {
         inner: Box::new(bgp("a")),
     };
     let pattern = GraphPattern::Join {
-        left: Box::new(filter.clone()),
-        right: Box::new(GraphPattern::Union {
-            left: Box::new(bgp("b")),
-            right: Box::new(bgp("c")),
-        }),
+        inputs: vec![
+            filter.clone(),
+            GraphPattern::Union {
+                inputs: vec![bgp("b"), bgp("c")],
+            },
+        ],
     };
     let query = Query::Select {
         dataset: None,

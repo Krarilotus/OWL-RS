@@ -37,7 +37,16 @@ SETTINGS = ["JAVA_HEAP", "DOCKER_MEMORY", "DOCKER_CPUS", "SKIP_COUNT", "QUERY_ME
             "GRAPHDB_IMAGE", "GRAPHDB_EDITION", "GRAPHDB_ENTITY_ID_SIZE", "GRAPHDB_ENTITY_INDEX_SIZE",
             "GRAPHDB_CONTEXT_INDEX", "GRAPHDB_CHECK_INCONSISTENCIES", "GRAPHDB_PAGE_CACHE_SIZE",
             "GRAPHDB_QUERY_MEMORY_THRESHOLD", "GRAPHDB_MAX_DIRECT_MEMORY",
-            "GRAPHDB_INFERENCE_CONCURRENCY", "GRAPHDB_INFERENCE_BUFFER"]
+            "GRAPHDB_INFERENCE_CONCURRENCY", "GRAPHDB_INFERENCE_BUFFER",
+            # the SPARQL contenders' settings: a comparison is as fair as these were
+            "NRESE_BIN", "HARNESS", "NRESE_ANSWER_CAP_MB", "TOTAL_QUERY_MEMORY_MIB", "SPARQL_DATA",
+            "BSBM_CLIENTS", "BSBM_REFERENCES", "JENA_IMAGE", "JENA_LOADER", "OXIGRAPH_IMAGE",
+            "QLEVER_IMAGE", "QLEVER_INDEX_SETTINGS", "QLEVER_VOCABULARY_TYPE", "QLEVER_CACHE_MAX_SIZE",
+            "QLEVER_RUNTIME", "QLEVER_MEMORY", "QLEVER_SORT_MEMORY", "QLEVER_SIMULTANEOUS_QUERIES",
+            "VIRTUOSO_IMAGE", "VIRTUOSO_NUMBER_OF_BUFFERS", "VIRTUOSO_MAX_DIRTY_BUFFERS",
+            "VIRTUOSO_THREADS_PER_QUERY", "VIRTUOSO_HTTP_THREADS", "VIRTUOSO_SERVER_THREADS",
+            "MILLENNIUMDB_IMAGE", "MDB_THREADS", "MDB_IMPORT_BUFFER", "MDB_STRINGS_STATIC",
+            "MDB_STRINGS_DYNAMIC", "MDB_VERSIONED_BUFFER", "MDB_UNVERSIONED_BUFFER"]
 SECRET_SETTINGS = ["NRESE_LICENSES", "GRAPHDB_LICENSE", "RDFOX_LICENSE", "RGGS_REPO"]
 
 
@@ -123,6 +132,14 @@ def machine(runtime: str) -> dict:
         "memory_gib": round((memory_bytes() or 0) / 2**30, 1),
         "python": platform.python_version(),
     }
+    # What changes timings on the host, as the run found it (hosts.toml `config` records the
+    # intended configuration; compare checks both).
+    for key, path in (("governor", "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+                      ("perf_event_paranoid", "/proc/sys/kernel/perf_event_paranoid")):
+        try:
+            out[key] = Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
     if runtime == "docker":
         out["container_start_ms"] = container_start_ms()
         info = _out(["docker", "info", "--format", "{{.ServerVersion}}|{{.NCPU}}|{{.MemTotal}}|{{.OperatingSystem}}"])

@@ -80,11 +80,14 @@ impl Diagnostic {
 }
 
 /// Reports the axioms that use non-simple properties where OWL 2 DL requires simple
-/// ones. A property is non-simple if a chain of two or more, or a transitive property,
-/// is (through the hierarchy) a subproperty of it; so is its inverse.
+/// ones. A property is non-simple if a composite one is (through the hierarchy) a
+/// subproperty of it; so is its inverse. Composite (*OWL 2 Structural Specification*
+/// §11.1): a chain's or a transitive property's superproperty, and
+/// `owl:topObjectProperty`. (§11.1 makes `owl:bottomObjectProperty` composite too; it
+/// relates nothing, so nothing above it gets a pair from it, and it isn't counted.)
 pub(crate) fn check_global_restrictions(ontology: &mut Ontology) {
     let mut supers: HashMap<Term, Vec<Term>> = HashMap::new();
-    let mut seeds: Vec<Term> = Vec::new();
+    let mut seeds: Vec<Term> = ontology.builtin.top_object.into_iter().collect();
     for axiom in &ontology.axioms {
         match axiom {
             Axiom::SubObjectPropertyOf(chain, sup) => {

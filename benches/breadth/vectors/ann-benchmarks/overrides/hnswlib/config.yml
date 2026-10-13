@@ -1,0 +1,20 @@
+# hnswlib, the library reference: M 16 at NRESE's ef_construction (200: the same index
+# parameters, so the implementations compare) and at upstream's (500). The query sweep is
+# upstream's.
+float:
+  any:
+  - base_args: ['@metric']
+    constructor: HnswLib
+    disabled: false
+    docker_tag: ann-benchmarks-hnswlib
+    module: ann_benchmarks.algorithms.hnswlib
+    name: hnswlib
+    run_groups:
+      M-16-efc200:
+        arg_groups: [{M: 16, efConstruction: 200}]
+        args: {}
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 600, 800]]
+      M-16:
+        arg_groups: [{M: 16, efConstruction: 500}]
+        args: {}
+        query_args: [[10, 20, 40, 80, 120, 200, 400, 600, 800]]

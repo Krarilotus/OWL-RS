@@ -350,6 +350,8 @@ struct Shared {
     durable: Option<Durable>,
     wants_compaction: AtomicBool,
     wants_checkpoint: AtomicBool,
+    /// The background worker is running requested maintenance ([`Engine::settle`]).
+    maintaining: AtomicBool,
     /// Checkpoints written.
     checkpoints: AtomicU64,
     /// `owl:sameAs`, when the inferred stack holds the closure over representatives
@@ -475,7 +477,10 @@ impl Worker {
             .name("nrese-maintenance".to_owned())
             .spawn(move || {
                 while wakeups.recv().is_ok() {
+                    // Set before the requests are taken, so that one is always visible.
+                    shared.maintaining.store(true, Ordering::SeqCst);
                     shared.maintain();
+                    shared.maintaining.store(false, Ordering::SeqCst);
                 }
             })?;
         Ok(Self {
@@ -600,6 +605,7 @@ impl Engine {
             durable,
             wants_compaction: AtomicBool::new(false),
             wants_checkpoint: AtomicBool::new(false),
+            maintaining: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
             equality: RwLock::new(None),
         });
@@ -674,6 +680,22 @@ impl Engine {
     pub fn rematerialisation(&self) -> Rematerialisation<'_> {
         let slot = self.inner.writer.lock();
         Rematerialisation::new(&self.inner, slot)
+    }
+
+    /// Waits until background maintenance has nothing requested or running: a compaction
+    /// or checkpoint holds memory and files while it runs. For measurements and tests;
+    /// commits may request more at any time.
+    pub fn settle(&self) {
+        if self.inner.worker.is_none() {
+            return;
+        }
+        let shared = &self.inner.shared;
+        while shared.wants_compaction.load(Ordering::SeqCst)
+            || shared.wants_checkpoint.load(Ordering::SeqCst)
+            || shared.maintaining.load(Ordering::SeqCst)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     /// Compacts until the policy is satisfied, waiting for any background merge.

@@ -174,13 +174,21 @@ fn admissible<'n>(
     if !facts.data.is_empty() || !facts.not_data.is_empty() {
         return Err(Unsupported::Assertions("data property assertions"));
     }
+    // Keys apply only to individuals with values of their properties (and then make them
+    // equal, which needs equality): without role assertions, none applies; but a key of
+    // no property (`owl:topObjectProperty`'s, after its rewriting) makes any two named
+    // members of its class one, values or not (small-scope case 1219488, 12 October
+    // 2026).
+    let keys_apply = !facts.roles.is_empty()
+        || n.rules.iter().any(|r| {
+            !r.body
+                .iter()
+                .any(|a| matches!(a, BodyAtom::Role(..) | BodyAtom::Data(..)))
+        });
     for &(axiom, why) in &n.unsupported {
         // Datatype definitions only constrain data values, of which there are none once
-        // the data clauses are dropped; keys only apply to individuals with property
-        // values (and then make them equal, which needs equality).
-        if why.starts_with("datatype definitions")
-            || (why.starts_with("keys") && facts.roles.is_empty())
-        {
+        // the data clauses are dropped.
+        if why.starts_with("datatype definitions") || (why.starts_with("keys") && !keys_apply) {
             continue;
         }
         return Err(Unsupported::Normalisation { axiom, why });

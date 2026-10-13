@@ -1,0 +1,16 @@
+# ERA-SHACL, timed: Spain and France, three interleaved repetitions of the six combinations
+# in the quiet window; the reports checked again.
+id = "breadth-era"
+group = "breadth"
+host = "office-pc"
+checkout = "suite/breadth"
+workload = "era-shacl"
+window = "quiet"
+priority = 2
+est_min = 300
+needs = ["docker"]
+env = { PYTHONIOENCODING = "utf-8", NRESE_QUIET_DRAIN_S = "1800" }
+commands = [
+  ["sh", "-c", "scripts/quiet-slot.sh python3 benches/breadth/era-shacl/run.py run --subsets ES,FR --runs 3 --results \"$QUEUE_RESULTS\""],
+  ["sh", "-c", "python3 benches/breadth/era-shacl/run.py check \"$QUEUE_RESULTS\""],
+]

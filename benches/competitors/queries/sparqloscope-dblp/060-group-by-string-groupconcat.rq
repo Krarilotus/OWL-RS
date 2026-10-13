@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 60: group-by-string-groupconcat
+# GROUP BY with GROUP_CONCAT on string predicate with high subject multiplicity
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (SUM(STRLEN(?cat)) AS ?sum) { { SELECT (GROUP_CONCAT(?o; SEPARATOR=" ") AS ?cat) { ?s dblp:signatureDblpName ?o. } GROUP BY ?s } }

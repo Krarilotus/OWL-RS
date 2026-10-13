@@ -28,11 +28,12 @@ from collections import defaultdict
 from pathlib import Path
 
 from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all, post
-from .answers import Recorder
-from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime,
+from . import hosts
+from .answers import Recorder, capped_post
+from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime, RootfsRuntime,
                       run_quiet, shell)
 from .manifest import Manifest, image_ids
-from .schema import Result, Writer
+from .schema import FIELDS, Result, Writer, problems, read
 from .summary import adjudications
 from .workloads import plans
 
@@ -62,7 +63,8 @@ def arguments(argv: list[str]) -> argparse.Namespace:
                    help="the shuffle seed; repetition r uses seed*1000+r, the same for every system")
     p.add_argument("--timeout-s", type=int, default=3600, help="per load (default 3600)")
     p.add_argument("--query-timeout-s", type=int, default=300, help="per query run (default 300)")
-    p.add_argument("--runtime", choices=["docker", "apptainer", "process"], default="docker")
+    p.add_argument("--runtime", choices=["docker", "apptainer", "rootfs", "process"], default="docker")
+    p.add_argument("--rootfs-dir", help="rootfs: the images unpacked for bubblewrap (benches/sparql/images.sh export)")
     p.add_argument("--sif-dir", help="Apptainer: the directory of the SIF images")
     p.add_argument("--data", help="the datasets: a directory, or volume:NAME with Docker (default volume:nrese-bench-data)")
     p.add_argument("--results", help="the result directory (default benches/suite/results/<date>)")
@@ -74,7 +76,9 @@ def arguments(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--answers", choices=["off", "full"], default="off",
                    help="full: capture every query's complete answer, untimed, and compare each system "
                         "with --answers-reference (answers.py; writes answers.json)")
-    p.add_argument("--answers-reference", metavar="SYSTEM", help="the system the answers are compared with")
+    p.add_argument("--answers-reference", metavar="SYSTEM[,SYSTEM]",
+                   help="the reference systems the answers are compared with, in order: per query the first "
+                        "with a complete, stable answer, confirmed by the next (answers.py)")
     args = p.parse_args(argv)
     if args.answers == "full" and not args.answers_reference:
         p.error("--answers full needs --answers-reference SYSTEM")
@@ -116,6 +120,25 @@ def slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", text).strip("-").lower()
 
 
+def external_rows(rows: list[dict], captured: bool) -> list[dict]:
+    """An external driver's rows as the suite's. Answers before time: its timings count only
+    after its own qualification passed (a `conformance` row `...-qualification`, ok), or with
+    the plan's qualification queries captured by the answer recorder (`captured`); otherwise
+    its query rows are `failed`, without a time."""
+    allowed = {"task", "item", "repeat", "status", "ms", "rows", "note", "peak_mib"}
+    qualified = captured or any(
+        r.get("task") == "conformance" and str(r.get("item", "")).endswith("qualification") and r.get("status") == "ok"
+        for r in rows)
+    out = []
+    for row in rows:
+        row = {k: v for k, v in row.items() if k in allowed}
+        if not qualified and row.get("task") == "query" and row.get("status") == "ok":
+            row.update(status="failed", ms="",
+                       note=("answers unqualified: no time; " + str(row.get("note", ""))).strip("; "))
+        out.append(row)
+    return out
+
+
 class Suite:
     def __init__(self, args, systems: dict, workloads: dict, root: Path):
         self.args = args
@@ -141,10 +164,14 @@ class Suite:
             if not args.sif_dir:
                 sys.exit("--runtime apptainer needs --sif-dir")
             runtime = ApptainerRuntime(self.scratch, args.port, Path(args.sif_dir).resolve())
+        elif args.runtime == "rootfs":
+            if not args.rootfs_dir:
+                sys.exit("--runtime rootfs needs --rootfs-dir")
+            runtime = RootfsRuntime(self.scratch, args.port, Path(args.rootfs_dir).resolve())
         else:
             runtime = ProcessRuntime(self.scratch, args.port)
         self.runtime = DryRuntime(runtime) if args.dry_run else runtime
-        data = args.data or ("volume:nrese-bench-data" if args.runtime == "docker" else None)
+        data = args.data or (f"volume:{hosts.volume('data')}" if args.runtime == "docker" else None)
         if data is None:
             sys.exit(f"--runtime {args.runtime} needs --data DIR (the datasets)")
         if data.startswith("volume:"):
@@ -321,7 +348,7 @@ class Suite:
         if (self.data_volume and not self.args.dry_run and self.data_volume not in self.made_volumes
                 and run_quiet(["docker", "volume", "inspect", self.data_volume]).returncode != 0):
             self.made_volumes.append(self.data_volume)
-        missing = self.data_missing(plan.inputs)
+        missing = self.data_missing(plan.all_inputs())
         if not missing:
             return None
         if not (self.data_volume and plan.prepare):
@@ -330,14 +357,16 @@ class Suite:
         log = self.results / "logs" / f"prepare-{slug(plan.workload)}-{slug(plan.tier)}-{self.stamp}.log"
         rc = self.host_command(plan.prepare, log)
         self.made_files += missing
-        still = self.data_missing(plan.inputs)
+        still = self.data_missing(plan.all_inputs())
         return f"preparing the inputs failed; see {log}" if rc != 0 or still else None
 
     def sif_missing(self, system, ctx: Context) -> str | None:
-        if self.args.runtime != "apptainer":
+        if self.args.runtime not in ("apptainer", "rootfs"):
             return None
         images = system.images(ctx) + [image for image, _ in system.builds()]
         missing = [i for i in images if not self.runtime.image_present(i)]
+        if missing and self.args.runtime == "rootfs":
+            return f"no unpacked image for {', '.join(missing)} in --rootfs-dir (benches/sparql/images.sh export)"
         if missing:
             return f"no SIF image for {', '.join(missing)} in --sif-dir (benches/cluster/build-sif.sh)"
         return None
@@ -355,6 +384,7 @@ class Suite:
         work.mkdir(parents=True, exist_ok=True)
         ctx = Context(self.runtime, self.root, work, logs, self.data, plan.mounts, self.args.timeout_s,
                       {**self.settings, "QUERY_TIMEOUT_S": str(self.args.query_timeout_s)}, run_id, plan.small)
+        ctx.services = tuple(plan.services)
         base = dict(date=self.date, host=self.host, runtime=self.runtime.kind, system=key, version="-",
                     publish=self.publish(key), workload=plan.workload, tier=plan.tier, regime=regime, run=run)
         self.say(f"\n{key} / {plan.workload} {plan.tier} / {regime} / run {run}")
@@ -376,7 +406,7 @@ class Suite:
                 base["version"] = system.version(ctx, endpoint)
                 self.writes(ctx, endpoint, base)
                 return
-            step = system.load(ctx, store, plan.inputs, regime)
+            step = system.load(ctx, store, plan.inputs_of(key), regime)
             m = step.measured
             status = "ok" if m.ok else ("timeout" if m.timed_out else "failed")
             self.emit(base, task="load", status=status, ms=m.ms, peak_mib=m.peak_mib if m.peak_mib is not None else "",
@@ -395,6 +425,8 @@ class Suite:
             ctx.cache = modes[0] if modes[0] != "-" else "off"
             endpoint = system.serve(ctx, store, regime)
             base["version"] = system.version(ctx, endpoint)
+            if endpoint.index_ms is not None:
+                self.emit(base, task="index", ms=endpoint.index_ms, note=endpoint.index_note)
             if system.persistent and not in_memory:
                 self.emit(base, task="restart", ms=endpoint.restart_ms if endpoint.restart_ms is not None else "")
             if self.settings.get("SKIP_COUNT") == "1":
@@ -406,7 +438,7 @@ class Suite:
                 self.emit(base, task="count", status="failed" if error else "ok",
                           ms="" if system.answers_only else ms, rows=n if n is not None else "",
                           note=error or ("the rules run at this first query" if system.lazy(regime) else ""))
-            if plan.queries:
+            if plan.queries or plan.external:
                 for i, mode in enumerate(modes):
                     if i > 0:
                         # A restart in the next mode: the cache starts empty, so each
@@ -420,7 +452,10 @@ class Suite:
                                       note="server peak over the run")
                         ctx.cache = mode
                         endpoint = system.serve(ctx, store, regime)
-                    self.queries(ctx, plan, key, system, endpoint, {**base, "cache": mode}, run)
+                    if plan.external:
+                        self.external(ctx, plan, key, endpoint, {**base, "cache": mode}, run)
+                    else:
+                        self.queries(ctx, plan, key, system, endpoint, {**base, "cache": mode}, run)
                 base["cache"] = modes[-1]
         except Exception as e:  # a system that fails mustn't stop the suite
             self.emit(base, task="load" if endpoint is None else "serve", status="failed", note=str(e)[:300])
@@ -432,6 +467,30 @@ class Suite:
                 self.runtime.remove_store(store)
             shutil.rmtree(work, ignore_errors=True)
 
+    def external(self, ctx: Context, plan, key: str, endpoint: Endpoint, base: dict, run: int):
+        """A benchmark's own driver (Plan.external) against the endpoint; its rows as ours."""
+        suffix = "" if base["cache"] == "-" else f"-cache-{base['cache']}"
+        out = ctx.logs / f"external{suffix}.json"
+        values = {"endpoint": endpoint.query, "update": endpoint.update or "", "out": str(out),
+                  "system": key, "run": str(run)}
+        command = [part.format(**values) for part in plan.external]
+        rc = self.host_command(command, ctx.logs / f"external{suffix}.txt")
+        if self.args.dry_run:
+            return
+        try:
+            rows = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            self.emit(base, task="query", item="*", status="failed", note=f"driver exit {rc}, no rows: {e}")
+            return
+        for row in external_rows(rows, plan.queries is not None):
+            self.emit(base, **row)
+        if self.answers and plan.queries and not plan.replay:
+            for query in sorted(plan.queries.glob("*.rq")):
+                item = (plan.workload, plan.tier, base["regime"], query.name)
+                self.answers.expect(item, key, tuple(plan.inputs))
+                self.answers.capture(capped_post, endpoint.query, item,
+                                     key, base["cache"], run, query, ctx.logs, self.args.query_timeout_s)
+
     def queries(self, ctx: Context, plan, key: str, system, endpoint: Endpoint, base: dict, run: int):
         suffix = "" if base["cache"] == "-" else f"-cache-{base['cache']}"
         report = ctx.logs / f"queries{suffix}.json"
@@ -439,7 +498,9 @@ class Suite:
         warmup, runs = ("0", "1") if plan.replay else ("1", str(self.args.query_runs))
         if self.answers and not plan.replay:
             for query in plan.queries.glob("*.rq"):
-                self.answers.expect((plan.workload, plan.tier, base["regime"], query.name), key)
+                item = (plan.workload, plan.tier, base["regime"], query.name)
+                self.answers.expect(item, key, tuple(plan.all_inputs()))
+                self.answers.check(item, plan.answers.get(query.stem))
         command = [self.harness(), "query-mix", "--endpoint", endpoint.query, "--queries", str(plan.queries),
                    "--label", key, "--warmup", warmup, "--runs", runs,
                    "--timeout-s", str(self.args.query_timeout_s), "--report-json", str(report)]
@@ -501,7 +562,7 @@ class Suite:
                           rows=q.get("rows") if q.get("rows") is not None else "", note=note)
         if self.answers and not plan.replay:
             for query in sorted(plan.queries.glob("*.rq")):
-                self.answers.capture(post, endpoint.query, (plan.workload, plan.tier, base["regime"], query.name),
+                self.answers.capture(capped_post, endpoint.query, (plan.workload, plan.tier, base["regime"], query.name),
                                      key, base["cache"], run, query, ctx.logs, self.args.query_timeout_s)
 
     def writes(self, ctx: Context, endpoint: Endpoint, base: dict):
@@ -552,7 +613,46 @@ class Suite:
         self.emit(base, task="conformance", item=plan.workload, status="ok" if rc == 0 else "failed",
                   ms=(time.monotonic() - started) * 1000, note=f"log: {log.relative_to(self.results)}")
 
-    def skip(self, key: str, plan, reason: str, regime: str = "-"):
+    def driver(self, plan, keys: list[str]):
+        """A kit's own driver (Plan.driver) for `keys` on one tier: its steps in order, then
+        every results.csv they wrote below {results} into the run's results.csv."""
+        out = self.results / "driver" / slug(f"{plan.workload}-{plan.tier}")
+        logs = self.results / "logs" / slug(f"{self.stamp}-driver-{plan.workload}-{plan.tier}")
+        values = {"results": str(out), "systems": ",".join(keys), "tier": plan.tier, "runs": str(self.args.runs)}
+        self.say(f"\n{','.join(keys)} / {plan.workload} {plan.tier}: the kit's driver")
+        failed = None
+        for n, step in enumerate(plan.driver, start=1):
+            rc = self.host_command([part.format(**values) for part in step], logs / f"step-{n}.txt")
+            if rc != 0:
+                failed = f"step {n} exit {rc}: log {(logs / f'step-{n}.txt').relative_to(self.results)}"
+                break
+        if self.args.dry_run:
+            return
+        imported = 0
+        for path in sorted(out.rglob("results.csv")) if out.exists() else []:
+            for row in read(path):
+                result = Result(**{k: row.get(k, "") for k in FIELDS})
+                if problems(result):
+                    self.say(f"    {path}: a row the schema refuses ({'; '.join(problems(result))}): left out")
+                    continue
+                self.writer.write(result)
+                self.written.append(result)
+                imported += 1
+        if failed or not imported:
+            for key in keys:
+                base = dict(date=self.date, host=self.host, runtime="process", system=key, version="-",
+                            publish=self.publish(key), workload=plan.workload, tier=plan.tier, regime="custom", run=1)
+                self.emit(base, task="conformance", item=plan.workload, status="failed",
+                          note=failed or "the kit's driver wrote no rows")
+
+    def skip(self, key: str, plan, reason: str, regime: str = "-", unsupported: bool = True):
+        """A pair that doesn't run: `unsupported` when the system can't run it, else (a missing
+        input) incomplete, for the answers as for the row."""
+        if self.answers and plan.queries and not plan.replay:
+            answered = regime if regime != "-" else plan.regimes[0]
+            for query in plan.queries.glob("*.rq"):
+                self.answers.skip((plan.workload, plan.tier, answered, query.name), key, reason,
+                                  "unsupported" if unsupported else "incomplete", tuple(plan.all_inputs()))
         base = dict(date=self.date, host=self.host, runtime=self.runtime.kind, system=key, version="-",
                     publish=self.publish(key), workload=plan.workload, tier=plan.tier, regime=regime, run=0)
         self.emit(base, task="load", status="skipped", note=reason[:300])
@@ -581,11 +681,15 @@ class Suite:
                 for key in systems:
                     if plan.systems is not None and key not in plan.systems:
                         continue
+                    # A vendor that refused us an evaluation is never measured (systems.toml refused).
+                    if self.systems[key].get("refused"):
+                        self.skip(key, plan, self.systems[key]["refused"])
+                        continue
                     missing = verdict(self.systems[key], workload)
                     if missing:
                         self.skip(key, plan, f"lacks {missing}")
                         continue
-                    if plan.kind == "kit":
+                    if plan.kind in ("kit", "driver"):
                         chosen.append((plan, key, None, "-"))
                         continue
                     system = adapter(key)
@@ -598,9 +702,13 @@ class Suite:
                         continue
                     ctx = self.context_for_images()
                     ctx.tier_small = plan.small
-                    reason = system.supports(ctx, plan.inputs, regime) or self.sif_missing(system, ctx)
+                    reason = system.supports(ctx, plan.inputs_of(key), regime)
                     if reason:
                         self.skip(key, plan, reason, regime)
+                        continue
+                    missing = self.sif_missing(system, ctx)
+                    if missing:
+                        self.skip(key, plan, missing, regime, unsupported=False)
                         continue
                     chosen.append((plan, key, system, regime))
         if not chosen:
@@ -635,7 +743,7 @@ class Suite:
                 unavailable[id(plan)] = self.ensure_data(plan) or ""
         if self.manifest:
             self.manifest.update(datasets=self.data_sizes(
-                [i for plan, _, system, _ in chosen if system is not None for i in plan.inputs]),
+                [i for plan, key, system, _ in chosen if system is not None for i in plan.inputs_of(key)]),
                 sources=self.data_sources())
         # Per workload tier, the repetitions are interleaved across the systems: every
         # system's first run, then every system's second, each round in an order rotated by
@@ -646,14 +754,18 @@ class Suite:
             groups.setdefault(id(entry[0]), []).append(entry)
         for group in groups.values():
             plan = group[0][0]
-            runnable = []
+            runnable, drivers = [], []
             for _, key, system, regime in group:
                 if unavailable.get(id(plan)):
-                    self.skip(key, plan, unavailable[id(plan)], regime)
+                    self.skip(key, plan, unavailable[id(plan)], regime, unsupported=False)
                 elif plan.kind == "kit":
                     self.kit(plan, key)
+                elif plan.kind == "driver":
+                    drivers.append(key)
                 else:
                     runnable.append((key, system, regime))
+            if drivers:
+                self.driver(plan, drivers)
             for run in range(1, self.args.runs + 1):
                 shift = (run - 1) % max(1, len(runnable))
                 for key, system, regime in runnable[shift:] + runnable[:shift]:
