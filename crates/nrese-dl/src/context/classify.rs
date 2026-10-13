@@ -213,7 +213,7 @@ pub fn saturate_normalised(
     if engine.out_of_budget() {
         return Err(Unsupported::Budget);
     }
-    let assertions_consistent = Individuals::saturate(&engine, &abox, &workers).release(&engine);
+    let assertions_consistent = Individuals::saturate(&engine, &abox, &workers).consistent;
     if engine.out_of_budget() {
         return Err(Unsupported::Budget);
     }
