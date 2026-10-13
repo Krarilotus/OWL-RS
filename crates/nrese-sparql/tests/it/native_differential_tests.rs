@@ -350,7 +350,9 @@ fn filter(rng: &mut Rng) -> String {
         13 => format!("FILTER(3 < {v} && {v} <= 6)"),
         14 => format!("FILTER(STRENDS({v}, \"2\") || \"de\" = LANG({v}))"),
         15 => format!("FILTER(REGEX({v}, \"S\", \"i\"))"),
-        16 => format!("FILTER({v} = 2 || sameTerm({w}, <{EX}e3>))"),
+        16 => format!(
+            "FILTER({v} = 2 || sameTerm({w}, <{EX}e3>) || ({v} = {w} && !sameTerm({w}, {v})))"
+        ),
         0 => format!("FILTER({v} > 3)"),
         1 => format!("FILTER({v} <= 2.5 || {w} = <{EX}e1>)"),
         2 => format!("FILTER(isIRI({v}))"),
@@ -1452,6 +1454,14 @@ fn dictionary_first_string_tests_equal_the_reference() {
         "CONTAINS(LCASE(?l), \"mi\")",
         "CONTAINS(LCASE(?l), \"k\")",
         "CONTAINS(LCASE(STR(?l)), \"semanticthing\")",
+        // Regexes of literal text, anchored or not, as the string tests.
+        "REGEX(?l, \"^wind\")",
+        "REGEX(?l, \"^Semantic Web$\")",
+        "REGEX(STR(?l), \"^1879\")",
+        "REGEX(?l, \"Web$\", \"\")",
+        "REGEX(?l, \"mantic\")",
+        "REGEX(STR(?l), \"Thing$\")",
+        "REGEX(?l, \"^filler 1\") && LANG(?l) = \"de\"",
     ] {
         for pattern in [
             format!("?s <{EX}label> ?l"),
@@ -6273,4 +6283,62 @@ fn paths_ordered_with_patterns_equal_the_reference() {
         covered(checked, planned, path_first),
         "{planned} of {checked} planned with their paths, a path first in {path_first}"
     );
+}
+
+/// Groups large enough to be folded in parallel parts (COUNT, SAMPLE, MIN, MAX and
+/// GROUP_CONCAT, each part with a decoder of its own, merged in row order) give the
+/// reference evaluator's answers: two groups of about 20,000 rows and one of one, over
+/// every term kind; an expression that errors on some values; one group of everything.
+#[test]
+fn large_groups_fold_in_parts_as_the_reference_does() {
+    let mut rng = Rng::seeded(20_261_016);
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let mut add = |s: NamedNode, p: &str, o: Term| {
+        tx.insert(Quad::new(s, ex(p), o, GraphName::DefaultGraph).as_ref());
+    };
+    for i in 0..40_001u32 {
+        let s = ex(&format!("s{i}"));
+        let group = if i == 40_000 { 2 } else { i % 2 };
+        add(s.clone(), "k", ex(&format!("k{group}")).into());
+        add(s.clone(), "v", random_object(&mut rng));
+        add(
+            s,
+            "l",
+            Literal::new_simple_literal(format!("l{}", rng.below(50_000))).into(),
+        );
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for text in [
+        format!(
+            "SELECT ?k (MIN(?o) AS ?a) (MAX(?o) AS ?b) (COUNT(?o) AS ?c) WHERE {{ ?s <{EX}k> ?k . ?s <{EX}v> ?o }} GROUP BY ?k"
+        ),
+        format!(
+            "SELECT (MIN(?o) AS ?a) (MAX(?o) AS ?b) (COUNT(*) AS ?c) WHERE {{ ?s <{EX}v> ?o }}"
+        ),
+        format!(
+            "SELECT ?k (MIN(STR(?o)) AS ?a) (MAX(xsd:integer(?o)) AS ?b) (COUNT(xsd:integer(?o)) AS ?c) WHERE {{ ?s <{EX}k> ?k . ?s <{EX}v> ?o }} GROUP BY ?k"
+        ),
+        format!("SELECT ?k (MIN(?s) AS ?a) (MAX(?s) AS ?b) WHERE {{ ?s <{EX}k> ?k }} GROUP BY ?k"),
+        format!(
+            "SELECT ?k (GROUP_CONCAT(?l; SEPARATOR=\"|\") AS ?c) WHERE {{ ?s <{EX}k> ?k . ?s <{EX}l> ?l }} GROUP BY ?k"
+        ),
+    ] {
+        let text = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {text}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let options = QueryOptions::default();
+        let native = rows_up_to_equal_values(
+            evaluate_query(&snapshot, &query, &options).unwrap(),
+            false,
+            true,
+        );
+        let expected =
+            rows_up_to_equal_values(reference(&snapshot, &query, &options).unwrap(), false, true);
+        assert_eq!(
+            concatenations_sorted(&native, '|'),
+            concatenations_sorted(&expected, '|'),
+            "{text}"
+        );
+    }
 }

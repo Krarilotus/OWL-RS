@@ -25,6 +25,7 @@
 
 use nrese_engine::ProbeCursor;
 use nrese_exec::Reservation;
+use nrese_sparql_syntax::algebra::PropertyPathExpression;
 
 use super::*;
 
@@ -40,6 +41,9 @@ const DRIVE_CHUNK: usize = 1 << 14;
 /// sorts them.
 const WALK_COST: f64 = 1.0;
 const DRIVE_COST: f64 = 3.0;
+/// A leaf's matches looked up for one value against walking one of its index entries: a
+/// forward seek per value against a sequential read.
+const PROBE_COST: f64 = 4.0;
 const PAIRS_COST: f64 = 8.0;
 
 /// Why a count stopped: the pattern isn't a tree this module counts, or the evaluation
@@ -73,6 +77,8 @@ enum Kind {
 /// A conjunction: triple patterns, and parts hanging off one of their variables or none.
 struct Conj<'p> {
     atoms: Vec<&'p TriplePattern>,
+    /// `?a path+ ?b`, each with an end no other pattern, closure or part has.
+    closures: Vec<&'p GraphPattern>,
     parts: Vec<Part<'p>>,
 }
 
@@ -87,6 +93,8 @@ struct Part<'p> {
 /// An element of a conjunction while it is read from the algebra.
 enum Item<'p> {
     Atom(&'p TriplePattern),
+    /// `?a path+ ?b` between two variables ([`closure_ends`]).
+    Closure(&'p GraphPattern),
     Part {
         kind: Kind,
         branches: Vec<&'p GraphPattern>,
@@ -101,6 +109,10 @@ fn items<'p>(pattern: &'p GraphPattern, out: &mut Vec<Item<'p>>) -> bool {
     match pattern {
         GraphPattern::Bgp { patterns } => {
             out.extend(patterns.iter().map(Item::Atom));
+            true
+        }
+        GraphPattern::Path { .. } if closure_ends(pattern).is_some() => {
+            out.push(Item::Closure(pattern));
             true
         }
         GraphPattern::Join { inputs } => inputs.iter().all(|input| items(input, out)),
@@ -168,11 +180,47 @@ fn items<'p>(pattern: &'p GraphPattern, out: &mut Vec<Item<'p>>) -> bool {
     }
 }
 
-/// Whether every solution of `conj` binds `variable`: one of its patterns has it.
+/// Whether every solution of `conj` binds `variable`: one of its patterns or closures has
+/// it.
 fn certain(conj: &Conj<'_>, variable: &Variable) -> bool {
     conj.atoms
         .iter()
         .any(|triple| triple_variables(triple).contains(variable))
+        || conj.closures.iter().any(|&closure| {
+            closure_ends(closure).is_some_and(|(a, b)| a == *variable || b == *variable)
+        })
+}
+
+/// The two variable ends (blank nodes as variables) of `?a path+ ?b`, where they differ:
+/// the closures counted by their sizes per node.
+fn closure_ends(pattern: &GraphPattern) -> Option<(Variable, Variable)> {
+    let GraphPattern::Path {
+        subject,
+        path: PropertyPathExpression::OneOrMore(_),
+        object,
+    } = pattern
+    else {
+        return None;
+    };
+    let end = |term: &TermPattern| match term {
+        TermPattern::Variable(v) => Some(v.clone()),
+        TermPattern::BlankNode(b) => {
+            Some(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
+        }
+        _ => None,
+    };
+    let (a, b) = (end(subject)?, end(object)?);
+    (a != b).then_some((a, b))
+}
+
+/// The variables an item binds for the rest of its conjunction where it is a pattern or a
+/// closure; `None` for a part.
+fn bound_by(item: &Item<'_>) -> Option<Vec<Variable>> {
+    match item {
+        Item::Atom(triple) => Some(triple_variables(triple)),
+        Item::Closure(path) => closure_ends(path).map(|(a, b)| vec![a, b]),
+        Item::Part { .. } => None,
+    }
 }
 
 /// Whether `aggregate` counts the solutions of `conj`: `COUNT(*)`, or `COUNT(?v)` of a
@@ -197,13 +245,14 @@ fn mentioned(pattern: &GraphPattern, out: &mut Vec<Variable>) -> bool {
         return false;
     }
     for item in found {
-        match item {
-            Item::Atom(triple) => add_all(out, triple_variables(triple)),
-            Item::Part { branches, .. } => {
-                for branch in branches {
-                    if !mentioned(branch, out) {
-                        return false;
-                    }
+        if let Some(vars) = bound_by(&item) {
+            add_all(out, vars);
+            continue;
+        }
+        if let Item::Part { branches, .. } = item {
+            for branch in branches {
+                if !mentioned(branch, out) {
+                    return false;
                 }
             }
         }
@@ -220,7 +269,9 @@ fn in_scope(pattern: &GraphPattern, out: &mut Vec<Variable>) -> bool {
     }
     for item in found {
         match item {
-            Item::Atom(triple) => add_all(out, triple_variables(triple)),
+            Item::Atom(_) | Item::Closure(_) => {
+                add_all(out, bound_by(&item).expect("a pattern or closure"))
+            }
             Item::Part { kind, branches, .. } => {
                 if matches!(kind, Kind::Optional | Kind::Union) {
                     for branch in branches {
@@ -256,8 +307,8 @@ impl<'p> Conj<'p> {
         let mut shared: Vec<Option<Variable>> = Vec::with_capacity(found.len());
         for (i, item) in found.iter().enumerate() {
             match item {
-                Item::Atom(triple) => {
-                    visible.push(triple_variables(triple));
+                Item::Atom(_) | Item::Closure(_) => {
+                    visible.push(bound_by(item).expect("a pattern or closure"));
                     shared.push(None);
                 }
                 Item::Part {
@@ -269,8 +320,8 @@ impl<'p> Conj<'p> {
                     let (mut scope, mut certain) = (Vec::new(), Vec::new());
                     for (j, earlier) in found[*left..i].iter().enumerate() {
                         add_all(&mut scope, visible[*left + j].iter().cloned());
-                        if let Item::Atom(triple) = earlier {
-                            add_all(&mut certain, triple_variables(triple));
+                        if let Some(vars) = bound_by(earlier) {
+                            add_all(&mut certain, vars);
                         }
                     }
                     let mut own = Vec::new();
@@ -306,14 +357,7 @@ impl<'p> Conj<'p> {
         }
         // A union shares what the other items bind; an OPTIONAL's and a union's own
         // variables must meet nothing else (a join on a variable they may leave unbound).
-        let certain: Vec<Variable> = found
-            .iter()
-            .filter_map(|item| match item {
-                Item::Atom(triple) => Some(triple_variables(triple)),
-                Item::Part { .. } => None,
-            })
-            .flatten()
-            .collect();
+        let certain: Vec<Variable> = found.iter().filter_map(bound_by).flatten().collect();
         for (i, item) in found.iter().enumerate() {
             let Item::Part { kind, .. } = item else {
                 continue;
@@ -337,11 +381,13 @@ impl<'p> Conj<'p> {
         }
         let mut conj = Conj {
             atoms: Vec::new(),
+            closures: Vec::new(),
             parts: Vec::new(),
         };
         for (item, at) in found.into_iter().zip(shared) {
             match item {
                 Item::Atom(triple) => conj.atoms.push(triple),
+                Item::Closure(path) => conj.closures.push(path),
                 Item::Part { kind, branches, .. } => {
                     let branches = branches
                         .into_iter()
@@ -439,6 +485,8 @@ struct Stats {
     listed: usize,
     /// Pairs read and kept for a message from a variable with weights of its own.
     pairs: usize,
+    /// Values whose matches in a leaf were looked up ([`Context::probe`]).
+    probed: usize,
     /// Matches of root patterns read and not kept.
     driven: usize,
     /// The roots: a variable or a pattern per tree.
@@ -455,9 +503,11 @@ fn mul(a: u64, b: u64) -> Counted<u64> {
     a.checked_mul(b).ok_or(Stop::Declined)
 }
 
-/// Sorts `pairs` by value and adds the weights of each value.
+/// Sorts `pairs` by value and adds the weights of each value. The pairs come as runs
+/// already sorted (each value's partners in index order): a stable sort finds and merges
+/// them, O(n log runs) (Sparqloscope 020: 56.9 M pairs in a few runs per class).
 fn combine(pairs: &mut Vec<(u64, u64)>) -> Counted<()> {
-    pairs.sort_unstable_by_key(|&(v, _)| v);
+    pairs.sort_by_key(|&(v, _)| v);
     let mut overflow = false;
     pairs.dedup_by(|later, kept| {
         let same = later.0 == kept.0;
@@ -486,6 +536,13 @@ struct Tree {
 enum Root {
     Var(usize),
     Edge(usize),
+}
+
+/// What hangs off each variable of a conjunction besides its patterns: parts to solve once
+/// the variable's values are listed, and factors already weighed (closures' sizes).
+struct Hanging<'c, 'b> {
+    parts: Vec<Vec<&'c Part<'c>>>,
+    factors: Vec<Vec<Weights<'b>>>,
 }
 
 /// A conjunction's variable graph: its edges are the patterns over two variables, those
@@ -758,10 +815,14 @@ impl Context<'_> {
         if self.as_written || self.late.is_some() {
             return None;
         }
-        // A single pattern has its counts from the index.
+        // A single pattern has its counts from the index, a lone closure from its sizes per
+        // component (`closure`).
         if let GraphPattern::Bgp { patterns } = pattern
             && patterns.len() < 2
         {
+            return None;
+        }
+        if let GraphPattern::Path { .. } = pattern {
             return None;
         }
         Conj::of(pattern)
@@ -775,7 +836,7 @@ impl Context<'_> {
     ) -> NativeResult<Option<(u64, PerValue)>> {
         let start = Instant::now();
         let mut stats = Stats::default();
-        let (count, values) = match self.solve(conj, key, &mut stats) {
+        let (count, values) = match self.solve(conj, key, None, &mut stats) {
             Ok(Solved::Count(n)) => (n, Vec::new()),
             Ok(Solved::Weights(mut weights)) => (0, std::mem::take(&mut weights.entries)),
             Err(Stop::Declined) => return Ok(None),
@@ -783,12 +844,13 @@ impl Context<'_> {
         };
         if self.trace.is_some() {
             let detail = format!(
-                "{}rooted at {}; {} group walks, {} weights listed, {} pairs kept, {} matches read at the roots; no row made",
+                "{}rooted at {}; {} group walks, {} weights listed, {} pairs kept, {} values looked up, {} matches read at the roots; no row made",
                 key.map_or_else(String::new, |k| format!("per {k}, ")),
                 stats.roots.join(", "),
                 stats.walks,
                 stats.listed,
                 stats.pairs,
+                stats.probed,
                 stats.driven,
             );
             let (rows, estimate) = match key {
@@ -870,11 +932,13 @@ impl Context<'_> {
         })
     }
 
-    /// The solutions of `conj`: their number, or with `key` their number per value of it.
+    /// The solutions of `conj`: their number, or with `key` their number per value of it,
+    /// for the values of `seed` only where it is given (the values a part hangs off).
     fn solve(
         &self,
         conj: &Conj<'_>,
         key: Option<&Variable>,
+        seed: Option<&[u64]>,
         stats: &mut Stats,
     ) -> Counted<Solved<'_>> {
         let mut atoms = Vec::with_capacity(conj.atoms.len());
@@ -934,10 +998,50 @@ impl Context<'_> {
             }
         }
         // Parts sharing no variable are factors of the count; the others weigh their
-        // variable's values.
+        // variable's values, solved once those are listed ([`Self::weights_at`]).
         let mut scale = 1u64;
-        let mut hanging: Vec<Vec<Weights<'_>>> =
-            (0..graph.vars.len()).map(|_| Vec::new()).collect();
+        let mut pending = Hanging {
+            parts: (0..graph.vars.len()).map(|_| Vec::new()).collect(),
+            factors: (0..graph.vars.len()).map(|_| Vec::new()).collect(),
+        };
+        // A closure weighs the values of its end that something else binds by how many
+        // nodes each reaches (or is reached from): its other end is free, a leaf.
+        for &closure in &conj.closures {
+            let (a, b) = closure_ends(closure).expect("a closure");
+            let free = |v: &Variable| {
+                key != Some(v)
+                    && !graph.vars.contains(v)
+                    && conj.parts.iter().all(|part| part.at.as_ref() != Some(v))
+                    && conj
+                        .closures
+                        .iter()
+                        .filter(|&&other| !std::ptr::eq(other, closure))
+                        .all(|&other| closure_ends(other).is_some_and(|(x, y)| x != *v && y != *v))
+            };
+            let (end, forward) = match (free(&a), free(&b)) {
+                (false, true) if graph.vars.contains(&a) => (Some(&a), true),
+                (true, false) if graph.vars.contains(&b) => (Some(&b), false),
+                (true, true) => (None, true),
+                _ => return Err(Stop::Declined),
+            };
+            let sizes = self.closure_sizes(closure, forward, stats)?;
+            match end {
+                Some(end) => {
+                    let var = graph.index(end);
+                    graph.restricted[var] = true;
+                    pending.factors[var].push(Weights::new(&self.budget, sizes, 0)?);
+                }
+                None => {
+                    let pairs = sizes
+                        .iter()
+                        .try_fold(0u64, |sum, &(_, n)| sum.checked_add(n));
+                    scale = mul(scale, pairs.ok_or(Stop::Declined)?)?;
+                    if scale == 0 {
+                        return self.no_solutions(key.is_some());
+                    }
+                }
+            }
+        }
         for part in &conj.parts {
             match &part.at {
                 None => {
@@ -948,10 +1052,11 @@ impl Context<'_> {
                 }
                 Some(at) => {
                     let var = graph.index(at);
-                    let weights = self.part_weights(part, at, stats)?;
-                    graph.restricted[var] |= weights.default == 0;
-                    graph.modified[var] |= weights.default != 0 && !weights.entries.is_empty();
-                    hanging[var].push(weights);
+                    match part.kind {
+                        Kind::Exists | Kind::Union => graph.restricted[var] = true,
+                        _ => graph.modified[var] = true,
+                    }
+                    pending.parts[var].push(part);
                 }
             }
         }
@@ -974,7 +1079,8 @@ impl Context<'_> {
             });
             match root {
                 Root::Var(v) => {
-                    let weights = self.weights_at(&graph, &mut hanging, v, None, stats)?;
+                    let seed = seed.filter(|_| Some(v) == key);
+                    let weights = self.weights_at(&graph, &mut pending, v, None, seed, stats)?;
                     if Some(v) == key {
                         keyed = Some(weights);
                     } else {
@@ -983,8 +1089,8 @@ impl Context<'_> {
                 }
                 Root::Edge(e) => {
                     let (x, y) = graph.ends(e);
-                    let wx = self.weights_at(&graph, &mut hanging, x, Some(e), stats)?;
-                    let wy = self.weights_at(&graph, &mut hanging, y, Some(e), stats)?;
+                    let wx = self.weights_at(&graph, &mut pending, x, Some(e), None, stats)?;
+                    let wy = self.weights_at(&graph, &mut pending, y, Some(e), None, stats)?;
                     let total = self.drive(
                         &graph.atoms_of(e),
                         &graph.vars[x],
@@ -1020,7 +1126,7 @@ impl Context<'_> {
         }
         let mut sum = 0u64;
         for branch in &part.branches {
-            let Solved::Count(n) = self.solve(branch, None, stats)? else {
+            let Solved::Count(n) = self.solve(branch, None, None, stats)? else {
                 unreachable!("no key, a count")
             };
             sum = add(sum, n)?;
@@ -1034,16 +1140,19 @@ impl Context<'_> {
         })
     }
 
-    /// The weights a part hanging off `at` gives `at`'s values.
+    /// The weights a part hanging off `at` gives `at`'s values: for those of `seed` only
+    /// where it is given (the others take the default, which the product with the listing
+    /// they came from leaves out).
     fn part_weights(
         &self,
         part: &Part<'_>,
         at: &Variable,
+        seed: Option<&[u64]>,
         stats: &mut Stats,
     ) -> Counted<Weights<'_>> {
         let mut found: Option<Weights<'_>> = None;
         for branch in &part.branches {
-            let Solved::Weights(weights) = self.solve(branch, Some(at), stats)? else {
+            let Solved::Weights(weights) = self.solve(branch, Some(at), seed, stats)? else {
                 unreachable!("a key, weights")
             };
             found = Some(match found {
@@ -1070,25 +1179,43 @@ impl Context<'_> {
     }
 
     /// The weights of `var`'s values: the product of its patterns' matches, the parts
-    /// hanging off it and what each child sends, `edge` leading to its parent.
+    /// hanging off it and what each child sends, `edge` leading to its parent; only for the
+    /// values of `seed` where it is given. The values are listed first (by its own
+    /// patterns and children, else the smaller of its smallest leaf and its smallest
+    /// restricting part); its other leaves are looked up for them where that is cheaper
+    /// than a walk, and its parts are solved for them alone.
     fn weights_at<'b>(
         &'b self,
         graph: &Graph<'_>,
-        hanging: &mut [Vec<Weights<'b>>],
+        pending: &mut Hanging<'_, 'b>,
         var: usize,
         edge: Option<usize>,
+        seed: Option<&[u64]>,
         stats: &mut Stats,
     ) -> Counted<Weights<'b>> {
-        let mut factors: Vec<Weights<'b>> = std::mem::take(&mut hanging[var]);
+        let mut parts = std::mem::take(&mut pending.parts[var]);
+        let mut factors: Vec<Weights<'b>> = std::mem::take(&mut pending.factors[var]);
+        if let Some(seed) = seed {
+            let entries = seed.iter().map(|&value| (value, 1)).collect();
+            factors.push(Weights::new(&self.budget, entries, 0)?);
+        }
         for &atom in &graph.unary[var] {
             let entries = self.walk(&graph.atoms[atom], &graph.vars[var], stats)?;
             factors.push(Weights::new(&self.budget, entries, 0)?);
         }
+        // Leaves (a child with nothing below and nothing hanging off it) send each value's
+        // matches: deferred, so the large ones can be looked up for the values the others
+        // list instead of walked whole.
+        let mut leaves: Vec<(usize, usize)> = Vec::new();
         for &(child, e) in &graph.adjacent[var] {
             if Some(e) == edge {
                 continue;
             }
-            let below = self.weights_at(graph, hanging, child, Some(e), stats)?;
+            if !graph.listed(child, Some(e)) && pending.parts[child].is_empty() {
+                leaves.push((child, e));
+                continue;
+            }
+            let below = self.weights_at(graph, pending, child, Some(e), None, stats)?;
             let atoms = graph.atoms_of(e);
             factors.push(self.message(
                 &atoms,
@@ -1097,6 +1224,40 @@ impl Context<'_> {
                 below,
                 stats,
             )?);
+        }
+        leaves.sort_by(|a, b| graph.estimate(a.1).total_cmp(&graph.estimate(b.1)));
+        let mut leaves = leaves.into_iter().peekable();
+        // Without a listing factor, the smaller of the smallest leaf and the smallest part
+        // that keeps only values with solutions (EXISTS, UNION) lists the values.
+        if !factors.iter().any(|w| w.default == 0) {
+            let leaf = leaves.peek().map(|&(_, e)| graph.estimate(e));
+            let restricting = parts
+                .iter()
+                .enumerate()
+                .filter(|(_, part)| matches!(part.kind, Kind::Exists | Kind::Union))
+                .map(|(i, part)| (i, self.part_estimate(part, &graph.vars[var])))
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            match (leaf, restricting) {
+                (Some(leaf), Some((i, part))) if part < leaf => {
+                    let part = parts.remove(i);
+                    factors.push(self.part_weights(part, &graph.vars[var], None, stats)?);
+                }
+                (Some(_), _) => {
+                    let (child, e) = leaves.next().expect("peeked");
+                    let entries = self.walk_edge(
+                        &graph.atoms_of(e),
+                        &graph.vars[var],
+                        &graph.vars[child],
+                        stats,
+                    )?;
+                    factors.push(Weights::new(&self.budget, entries, 0)?);
+                }
+                (None, Some((i, _))) => {
+                    let part = parts.remove(i);
+                    factors.push(self.part_weights(part, &graph.vars[var], None, stats)?);
+                }
+                (None, None) => {}
+            }
         }
         // The fewest listed values first: a product keeps only values listed in each.
         factors.sort_by_key(|w| (w.default != 0, w.entries.len()));
@@ -1108,7 +1269,136 @@ impl Context<'_> {
         for factor in factors {
             product = self.product(product, factor)?;
         }
+        for (child, e) in leaves {
+            let atoms = graph.atoms_of(e);
+            product = if product.default == 0
+                && product.entries.len() as f64 * PROBE_COST < graph.estimate(e) * WALK_COST
+            {
+                self.probe(&atoms, &graph.vars[var], &graph.vars[child], product, stats)?
+            } else {
+                let entries =
+                    self.walk_edge(&atoms, &graph.vars[var], &graph.vars[child], stats)?;
+                let walked = Weights::new(&self.budget, entries, 0)?;
+                self.product(product, walked)?
+            };
+        }
+        // The parts, solved for the values listed: their own leaves looked up for those
+        // (Sparqloscope 011: OPTIONAL `rdf:type` of 3 K subjects walked its 66.5 M).
+        let listed: Option<Vec<u64>> =
+            (product.default == 0).then(|| product.entries.iter().map(|&(v, _)| v).collect());
+        for part in parts {
+            let weights = self.part_weights(part, &graph.vars[var], listed.as_deref(), stats)?;
+            product = self.product(product, weights)?;
+        }
         Ok(product)
+    }
+
+    /// Per node, how many nodes `closure` (`?a path+ ?b`) reaches from it (`forward`) or
+    /// reaches it, sorted by node: the step's pairs read once, the sizes from its
+    /// components without the closure's pairs (Sparqloscope 066 made 442 M rows of
+    /// `publishedInStream/relatedStream+` to count them).
+    fn closure_sizes(
+        &self,
+        closure: &GraphPattern,
+        forward: bool,
+        stats: &mut Stats,
+    ) -> Counted<Vec<(u64, u64)>> {
+        let GraphPattern::Path {
+            path: PropertyPathExpression::OneOrMore(step),
+            ..
+        } = closure
+        else {
+            unreachable!("closures are `path+`")
+        };
+        // Read in all graphs at once (`GRAPH ?g`): not counted here.
+        let evaluator = self.path_evaluator().map_err(|_| Stop::Declined)?;
+        let step = paths::Path::resolve(step, &self.snapshot);
+        let mut edges = evaluator.open(&step);
+        if !forward {
+            edges.iter_mut().for_each(|edge| *edge = (edge.1, edge.0));
+        }
+        let held = Weights::new(&self.budget, Vec::with_capacity(edges.capacity()), 0)?;
+        let token = self.cancellation.as_ref();
+        let stop = move || token.is_some_and(CancellationToken::is_cancelled);
+        let Some(sizes) = nrese_exec::graph::closure_sizes_until(&edges, &stop) else {
+            return Err(Stop::Failed(QueryEvaluationError::Cancelled.into()));
+        };
+        drop((edges, held));
+        let mut out: Vec<(u64, u64)> = sizes
+            .into_iter()
+            .filter(|&(_, reached, _)| reached > 0)
+            .map(|(node, reached, _)| (node, reached))
+            .collect();
+        out.sort_unstable_by_key(|&(node, _)| node);
+        stats.walks += 1;
+        stats.listed += out.len();
+        Ok(out)
+    }
+
+    /// The values a part hanging off `at` may list at most, for choosing what lists a
+    /// variable's values: per branch the fewest matches of a pattern with `at` (unbounded
+    /// where none has it), summed over a union's branches.
+    fn part_estimate(&self, part: &Part<'_>, at: &Variable) -> f64 {
+        part.branches
+            .iter()
+            .map(|branch| {
+                branch
+                    .atoms
+                    .iter()
+                    .filter(|triple| triple_variables(triple).contains(at))
+                    .filter_map(|triple| self.scan_pattern(triple))
+                    .map(|scan| self.snapshot.estimate_in(self.model, &scan.quad_pattern()) as f64)
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .sum()
+    }
+
+    /// `listed`'s weights times each value's partners through the edge of `atoms` (`var`
+    /// to the leaf `child`), looked up per value by cursors reading the index forward, in
+    /// parallel chunks: a leaf whose pattern is far larger than the values it meets isn't
+    /// walked whole (Sparqloscope 001: 3 K subjects met `rdf:type`'s 66.5 M).
+    fn probe<'b>(
+        &'b self,
+        atoms: &[&Atom],
+        var: &Variable,
+        child: &Variable,
+        listed: Weights<'b>,
+        stats: &mut Stats,
+    ) -> Counted<Weights<'b>> {
+        let reader = self.reader();
+        let parts: Vec<Result<Vec<(u64, u64)>, bool>> = listed
+            .entries
+            .par_chunks(DRIVE_CHUNK)
+            .map(|chunk| {
+                let mut partners = Partners::new(reader, atoms.len());
+                let mut buffer = Vec::new();
+                let mut out = Vec::with_capacity(chunk.len());
+                for (n, &(value, weight)) in chunk.iter().enumerate() {
+                    if n % CHECK_EVERY == 0
+                        && reader
+                            .cancellation
+                            .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        return Err(true);
+                    }
+                    let matches = partners
+                        .count(atoms, var, value, child, &mut buffer)
+                        .ok_or(false)?;
+                    if matches > 0 {
+                        out.push((value, weight.checked_mul(matches).ok_or(false)?));
+                    }
+                }
+                Ok(out)
+            })
+            .collect();
+        reader.check()?;
+        stats.probed += listed.entries.len();
+        let mut entries = Vec::with_capacity(listed.entries.len());
+        drop(listed);
+        for part in parts {
+            entries.extend(part.map_err(|_| Stop::Declined)?);
+        }
+        Weights::new(&self.budget, entries, 0)
     }
 
     /// `atom`'s matches per value of `var` (the first free component of an index order),
@@ -1146,20 +1436,40 @@ impl Context<'_> {
             .min_by_key(|atom| atom.estimate)
             .expect("an edge has a pattern");
         let candidates = self.walk(first, var, stats)?;
+        // Each candidate's partners intersected, in parallel chunks with cursors of their
+        // own (Sparqloscope 047: 30.5 M candidates, 4.1 s on one thread).
         let reader = self.reader();
-        let mut partners = Partners::new(reader, atoms.len());
-        let (mut buffer, mut out) = (Vec::new(), Vec::new());
-        for (n, &(value, _)) in candidates.iter().enumerate() {
-            if n % CHECK_EVERY == 0 {
-                reader.check()?;
-            }
-            let count = partners
-                .count(atoms, var, value, other, &mut buffer)
-                .ok_or(Stop::Declined)?;
-            stats.pairs += count as usize;
-            if count > 0 {
-                out.push((value, count));
-            }
+        let parts: Vec<Result<(PerValue, usize), bool>> = candidates
+            .par_chunks(DRIVE_CHUNK)
+            .map(|chunk| {
+                let mut partners = Partners::new(reader, atoms.len());
+                let (mut buffer, mut out, mut read) = (Vec::new(), Vec::new(), 0);
+                for (n, &(value, _)) in chunk.iter().enumerate() {
+                    if n % CHECK_EVERY == 0
+                        && reader
+                            .cancellation
+                            .is_some_and(CancellationToken::is_cancelled)
+                    {
+                        return Err(true);
+                    }
+                    let count = partners
+                        .count(atoms, var, value, other, &mut buffer)
+                        .ok_or(false)?;
+                    read += count as usize;
+                    if count > 0 {
+                        out.push((value, count));
+                    }
+                }
+                Ok((out, read))
+            })
+            .collect();
+        reader.check()?;
+        let mut out = Vec::with_capacity(candidates.len());
+        drop(candidates);
+        for part in parts {
+            let (entries, read) = part.map_err(|_| Stop::Declined)?;
+            stats.pairs += read;
+            out.extend(entries);
         }
         Ok(out)
     }

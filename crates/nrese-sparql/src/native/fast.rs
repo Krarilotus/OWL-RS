@@ -16,6 +16,7 @@
 //! |---|---|
 //! | `BOUND(?v)`, `isIRI/isBlank/isLiteral(?v)` | the id's kind |
 //! | `?v = <iri>` / `!=` | id equality (a stored IRI has one id) |
+//! | `sameTerm(?a, ?b)`; `?a = ?b` / `!=` where either is an IRI or a blank node | id equality (a stored term has one id); `=` between two literals compares values: the generic evaluator |
 //! | `LANG(?v) = "tag"`, `LANGMATCHES(LANG(?v), "range")` | the language in the dictionary key |
 //! | `CONTAINS/STRSTARTS/STRENDS(?v or STR(?v), "text")`, `REGEX(…, "pattern", "flags")` | the borrowed lexical form |
 //! | `?v < > <= >= = 42` (and mirrored) | inline integer ids by value |
@@ -65,6 +66,10 @@ pub(crate) enum Fast {
     IsLiteral(Variable),
     /// `?v = <iri>`; `None` if the store doesn't know the IRI (never equal).
     SameIri(Variable, Option<u64>),
+    /// `?a = ?b` (`false`) or `sameTerm(?a, ?b)` (`true`): stored ids are equal exactly for
+    /// the same term, and `=` is that where either is an IRI or a blank node; between two
+    /// literals `=` compares values, which the generic evaluator does.
+    SameVariables(Variable, Variable, bool),
     LangEquals(Variable, String),
     LangMatches(Variable, String),
     /// Operand: the variable itself (`false`) or `STR(?v)` (`true`).
@@ -185,6 +190,12 @@ pub(crate) fn compile(expr: &Expression, snapshot: &Snapshot) -> Option<Fast> {
                     v.clone(),
                     snapshot.lookup(n.as_ref().into()).map(TermId::raw),
                 )
+            } else if let (Some(x), Some(y)) = (variable(a), variable(b)) {
+                Fast::SameVariables(
+                    x.clone(),
+                    y.clone(),
+                    matches!(expr, Expression::SameTerm(..)),
+                )
             } else if let (Some(v), Some(tag)) = (lang_of(a), simple(b)) {
                 Fast::LangEquals(v.clone(), tag.to_owned())
             } else if let (Some(tag), Some(v)) = (simple(a), lang_of(b)) {
@@ -291,6 +302,19 @@ impl Fast {
                     TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph | TermKind::Triple
                 )
             }),
+            Self::SameVariables(a, b, same_term) => match (stored(a), stored(b)) {
+                (Err(Tri::Error), _) | (_, Err(Tri::Error)) => Tri::Error,
+                (Err(_), _) | (_, Err(_)) => Tri::Unknown,
+                (Ok(x), Ok(y)) => {
+                    let node =
+                        |id: TermId| matches!(id.kind(), TermKind::Iri | TermKind::BlankNode);
+                    if *same_term || node(x) || node(y) {
+                        Tri::of(x == y)
+                    } else {
+                        Tri::Unknown
+                    }
+                }
+            },
             Self::SameIri(v, iri) => match stored(v) {
                 Ok(id) => Tri::of(Some(id.raw()) == *iri),
                 Err(undecided) => undecided,
