@@ -47,8 +47,9 @@ ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import cases as cases_registry, hosts, manifest  # noqa: E402
 from suitekit.runtime import scope_argv  # noqa: E402
-from suitekit.compare import (KEPT_POINTS, bootstrap_ratio, client_throughput, compare_reports,  # noqa: E402,F401
-                              counter_changes, load_report, pooled, series_ratios, spread, statistic, thin)
+from suitekit.compare import (KEPT_POINTS, UNSTABLE_PEAK, bootstrap_ratio, client_throughput,  # noqa: E402,F401
+                              compare_reports, counter_changes, load_report, peak_spread, pooled,
+                              process_peak, series_ratios, spread, statistic, thin)
 from suitekit.workloads import fast_data_name  # noqa: E402
 
 # The volumes (benches/hosts.toml [volumes]; NRESE_FAST_VOLUME and NRESE_BENCH_VOLUME name others).
@@ -700,7 +701,7 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
                 record["status"] = "failed"
                 record["notes"].append(f"missing input: reference taxonomy {case['reference']} "
                                        "(fast.py compete writes it; benches/hosts.toml inputs.fast)")
-    # Natively, the case's scope is its container: its peak is the cgroup's.
+    # Natively, the case's scope is its container: its cgroup peak is the scope's.
     if not result.get("cgroup_peak_mib") and (peak := scope_peak_mib(err)):
         result["cgroup_peak_mib"] = peak
     record["metric"] = metric_value(case, result)
@@ -709,9 +710,12 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
     if levels := client_throughput(result):
         record["throughput"] = levels
     record["phase_peaks"] = {k: v.get("peak_mib") for k, v in (result.get("phases") or {}).items()}
-    record["peak_mib"] = result.get("cgroup_peak_mib") or result.get("peak_mib")
-    record["memory_kind"] = ("cgroup" if result.get("cgroup_peak_mib")
-                             else "lifetime" if result.get("peak_mib") else "unknown")
+    # The case's peak is the process's since it started (a lifetime peak); the cgroup's,
+    # its container's or native scope's, is kept beside it but not compared: it counts the
+    # page cache charged to the case's reads, as the host had them cached or not.
+    record["peak_mib"] = process_peak(result.get("peak_mib"), record["phase_peaks"])
+    record["memory_kind"] = "lifetime" if record["peak_mib"] else "unknown"
+    record["cgroup_peak_mib"] = result.get("cgroup_peak_mib")
     if case.get("queries", "").startswith("@vectors") and record["status"] == "ok":
         result["recall"] = vector_recall(case, expect)
     record["checks"] = [check(path, want, result, expect, alt_expect) for path, want in case.get("check", {}).items()]

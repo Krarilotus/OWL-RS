@@ -50,6 +50,10 @@ pub struct StoreConfig {
     /// `nrese_exec::memory::set_transparent_huge_pages`): faster work over large heaps
     /// (materialisation, loads), more memory held while serving many small requests.
     pub huge_pages: bool,
+    /// Whether a materialisation gives back between its rounds what the last one freed
+    /// (`nrese_engine::memory::set_release_between_rounds`): a lower, steadier peak for
+    /// more reasoning time.
+    pub reasoning_release: bool,
     /// Which remote endpoints `SERVICE` may call.
     pub federation: FederationConfig,
     /// Reasoning leaves out memberships in unnamed union classes that nothing consumes
@@ -217,6 +221,10 @@ impl FederationConfig {
 /// without them: docs/ops/server-setup.md §12.1).
 pub const DEFAULT_HUGE_PAGES: bool = true;
 
+/// Whether a materialisation releases between its rounds by default: no, reasoning speed
+/// leads (LUBM 100 5.6 % slower with it, its peak 14 % lower: nrese_engine::memory).
+pub const DEFAULT_REASONING_RELEASE: bool = false;
+
 /// The write-ahead log's growth after which a checkpoint is written: 256 MiB.
 pub const DEFAULT_CHECKPOINT_AFTER_WAL_BYTES: u64 = 256 << 20;
 
@@ -253,6 +261,7 @@ impl StoreConfig {
             total_query_memory_bytes: 0,
             process_memory_bytes: default_process_memory_bytes(),
             huge_pages: DEFAULT_HUGE_PAGES,
+            reasoning_release: DEFAULT_REASONING_RELEASE,
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
             ql_rewriting: QlRewritingMode::Auto,
@@ -286,6 +295,7 @@ impl StoreConfig {
             total_query_memory_bytes: 0,
             process_memory_bytes: default_process_memory_bytes(),
             huge_pages: DEFAULT_HUGE_PAGES,
+            reasoning_release: DEFAULT_REASONING_RELEASE,
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
             ql_rewriting: QlRewritingMode::Auto,

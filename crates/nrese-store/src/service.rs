@@ -108,6 +108,7 @@ impl StoreService {
         if !config.huge_pages {
             nrese_exec::memory::set_transparent_huge_pages(false);
         }
+        nrese_engine::memory::set_release_between_rounds(config.reasoning_release);
         let engine = match config.mode {
             StoreMode::InMemory => Engine::new(EngineConfig::default())?,
             StoreMode::OnDisk => {
@@ -315,6 +316,13 @@ impl StoreService {
             return Ok(0);
         }
         Ok(rematerialisation.finish(Vec::new())?.inferred_deleted)
+    }
+
+    /// Waits until the engine's background maintenance has nothing requested or running
+    /// ([`Engine::settle`]): for measurements of what the store holds.
+    #[doc(hidden)]
+    pub fn settle(&self) {
+        self.engine.settle();
     }
 
     pub(crate) fn engine(&self) -> &Engine {
@@ -1472,6 +1480,9 @@ impl StoreService {
         if stop() {
             return Err(stopped());
         }
+        // Where asked, what the reasoner freed goes back before the inferred stack, the
+        // heap's peak, is built (as between the reasoner's rounds).
+        nrese_engine::memory::release_between_rounds();
         nrese_exec::heap::phase("store: inferred stack");
         let summary = rematerialisation.finish(closure.inferred)?;
         nrese_exec::heap::phase("store: done");

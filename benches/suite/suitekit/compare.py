@@ -97,6 +97,27 @@ def spread(entry: dict) -> float:
     return (max(m) - min(m)) / statistics.median(m)
 
 
+# A process's peak varies between repetitions by what the allocator still holds of memory
+# freed shortly before (up to 32 % in a small parallel load, 12 Oct 2026); beyond this,
+# something not the process's is counted (the page cache in a cgroup's peak: 49-98 %).
+UNSTABLE_PEAK = 0.40
+
+
+def peak_spread(peaks: list) -> float:
+    """The range of the per-repetition peaks relative to the smallest."""
+    return (max(peaks) - min(peaks)) / min(peaks) if len(peaks) > 1 and min(peaks) > 0 else 0.0
+
+
+def process_peak(peak, phase_peaks: dict):
+    """A perf-lab run's lifetime peak: the process's since it started. A perf lab before
+    12 Oct 2026 reported as `peak_mib` the last phase's alone, so the highest phase peak
+    counts too. The cgroup's (a container's or native scope's `memory.peak`) is not it: that
+    counts the page cache the run's reads were charged, which depends on what the host had
+    cached (rl-lubm100: 2.3 GB of 4.7)."""
+    values = [v for v in (peak, *(phase_peaks or {}).values()) if isinstance(v, (int, float)) and v > 0]
+    return max(values) if values else None
+
+
 def bootstrap_ratio(base: list[dict], new: list[dict], rounds: int = 1000, seed: int = 1) -> tuple[float, float, float]:
     """The ratio new/base of the summed medians and its 95 % interval, by a two-level
     bootstrap: repetitions drawn with replacement, then samples within each, so that the
@@ -197,8 +218,9 @@ def perf_lab_report(report: dict) -> dict:
         "case": "perf-lab", "rep": 1, "status": "ok", "metric": report.get("sum_p50_ms"),
         "samples": {q["name"]: [q["p50_ms"]] for q in queries},
         "answers": {q["name"]: q.get("rows") for q in report["queries"]},
-        "peak_mib": report.get("cgroup_peak_mib") or report.get("peak_mib"),
-        "memory_kind": "cgroup" if report.get("cgroup_peak_mib") else "lifetime",
+        "peak_mib": process_peak(report.get("peak_mib"),
+                                 {k: v.get("peak_mib") for k, v in (report.get("phases") or {}).items()}),
+        "memory_kind": "lifetime",
         "checks": [], "routes": []}]}
 
 
@@ -246,10 +268,16 @@ def pooled(report: dict) -> dict[str, dict]:
             entry["answers"].setdefault(name, []).append(rows)
         if r.get("frontier"):
             entry["frontiers"].append(r["frontier"])
-        if r.get("peak_mib"):
-            entry["peaks"].append(r["peak_mib"])
+        # A fast record before 13 Oct 2026 holds the cgroup's peak, or no kind: the process's
+        # is recovered from its perf-lab result where it has one.
+        peak, kind = r.get("peak_mib"), r.get("memory_kind")
+        if kind != "lifetime" and (recovered := process_peak((r.get("result") or {}).get("peak_mib"),
+                                                             r.get("phase_peaks") or {})):
+            peak, kind = recovered, "lifetime"
+        if peak:
+            entry["peaks"].append(peak)
             # Records before the kind was kept: unknown, compared with any kind.
-            entry["memory_kind"].add(r.get("memory_kind") or "unknown")
+            entry["memory_kind"].add(kind or "unknown")
         if isinstance(r.get("metric"), (int, float)):
             entry["metrics"].append(r["metric"])
         samples = {k: thin(sorted(v for v in vs if v is not None)) for k, vs in (r.get("samples") or {}).items()}
@@ -364,17 +392,23 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
         # Memory: the case's peak (its kind kept with it) and each phase's peak apart.
         bp, np_ = (max(b["peaks"]) if b["peaks"] else None), (max(n["peaks"]) if n["peaks"] else None)
         bk, nk = kind_of(b), kind_of(n)
+        # A peak counts beyond either side's spread of peaks too, as a time beyond its spread.
+        memory_spread = max(peak_spread(b["peaks"]), peak_spread(n["peaks"]))
         if bp and np_:
             if "unknown" not in (bk, nk) and bk != nk:
                 out.add("Memory, by kind", f"{case:<26} peak {bp} ({bk}) -> {np_} ({nk}) MiB: other kinds, not compared",
                         True)
+            elif memory_spread > UNSTABLE_PEAK:
+                out.add("Memory, by kind", f"{case:<26} peak ({nk if nk != 'unknown' else bk}) {bp} -> {np_} MiB: "
+                        f"NOT COMPARABLE (peaks vary {memory_spread:.0%} between repetitions)", True)
             else:
-                more = np_ > bp * (1 + max(0.10, threshold)) and np_ - bp > 64
+                more = np_ > bp * (1 + max(0.10, threshold, memory_spread)) and np_ - bp > 64
                 out.add("Memory, by kind", f"{case:<26} peak ({nk if nk != 'unknown' else bk}) {bp} -> {np_} MiB"
                         + ("  MORE MEMORY" if more else ""), more)
         for phase in sorted(set(b["phase_peaks"]) & set(n["phase_peaks"])):
             before, after = max(b["phase_peaks"][phase]), max(n["phase_peaks"][phase])
-            if after > before * (1 + max(0.10, threshold)) and after - before > 64:
+            phase_spread = max(peak_spread(b["phase_peaks"][phase]), peak_spread(n["phase_peaks"][phase]))
+            if after > before * (1 + max(0.10, threshold, phase_spread)) and after - before > 64:
                 out.add("Memory, by kind", f"{case:<26} peak (phase {phase}) {before} -> {after} MiB  MORE MEMORY", True)
     return spreads
 
