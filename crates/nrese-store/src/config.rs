@@ -101,6 +101,10 @@ pub struct StoreConfig {
     /// sorted in chunks spilled to the data directory (see
     /// `nrese_engine::DurabilityConfig::bulk_load_memory`).
     pub bulk_load_memory_bytes: u64,
+    /// What a bulk load does with a statement it can't read (`store.invalid_statements`):
+    /// quarantine it and load the rest, or stop ([`crate::quarantine`]). A load may ask
+    /// for either ([`crate::BulkLoadRequest::invalid`]).
+    pub invalid_statements: crate::quarantine::InvalidStatements,
     /// On disk: keep the WAL segments checkpoints cover in `wal-archive/` of the data
     /// directory (point-in-time restore; see `nrese_engine::DurabilityConfig::wal_archive`).
     pub wal_archive: bool,
@@ -274,6 +278,7 @@ impl StoreConfig {
             map_checkpoints: true,
             checkpoint_after_wal_bytes: DEFAULT_CHECKPOINT_AFTER_WAL_BYTES,
             bulk_load_memory_bytes: 0,
+            invalid_statements: crate::quarantine::InvalidStatements::Quarantine,
             wal_archive: false,
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
@@ -308,6 +313,7 @@ impl StoreConfig {
             map_checkpoints: true,
             checkpoint_after_wal_bytes: DEFAULT_CHECKPOINT_AFTER_WAL_BYTES,
             bulk_load_memory_bytes: 0,
+            invalid_statements: crate::quarantine::InvalidStatements::Quarantine,
             wal_archive: false,
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,

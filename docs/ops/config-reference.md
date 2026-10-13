@@ -202,6 +202,11 @@ api_key = "replace-me"
 - default: `plain`
 - how checkpoints store the dictionary's keys: `plain`, or `fsst` (compressed with two FSST symbol tables, one for IRIs and one for the other terms, trained on a sample when the checkpoint is written). On the office PC's stores the keys shrink to 39 % (Wikidata lexemes, 576 → 224 MiB), 45 % (DBpedia core) and 53 % (YAGO); a key read from a compressed checkpoint costs a decode (about 17 ns in order, more at random), so result-heavy and string-scanning queries pay for it. Terms interned since the last checkpoint stay plain until the next. Both forms are read whatever the setting: switching takes effect at the next checkpoint
 
+- file key: `store.invalid_statements`
+- env override: `NRESE_INVALID_STATEMENTS`
+- default: `quarantine`
+- what a bulk load (`nrese-server load`, the import endpoints) does with a statement it can't read: `quarantine` loads every valid statement and keeps each invalid one verbatim in the repository's quarantine (its text, file, line, reason and load; `quarantine/` of the data directory), invisible to queries, reasoning, exports and statistics until it is re-admitted through the commit gates or discarded (docs/design/quarantine.md); the load reports the count and the first examples. `strict` stops the load at the first, and nothing of it is committed. A load may ask for either (`--strict`, `--quarantine`; `invalid=` on the import endpoints). Writes other than bulk loads (SPARQL Update, Graph Store, statements) are always strict
+
 - file key: `store.ontology_path`
 - env override: `NRESE_ONTOLOGY_PATH`
 - optional; when set, the file is loaded at startup and a missing file is a startup error
