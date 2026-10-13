@@ -344,5 +344,23 @@ class FastPageCache(unittest.TestCase):
             self.assertEqual(fast.page_cache_modes({"page_cache": ["warm", "cold"]}), (["warm", "cold"], ""))
 
 
+class AbBase(unittest.TestCase):
+    """An A/B's base side: off its case's route is a measured run there (`--off-route-ok`),
+    a failed run never is (sparql-memory-ab-phuoc-2: every base pass failed in 0.0 s, the
+    job finished done)."""
+
+    def test_off_route_is_measured_on_the_base_only(self):
+        records = [{"case": "op-group", "status": "off-route"}, {"case": "q-star", "status": "ok"}]
+        self.assertEqual([r["case"] for r in fast.not_as_expected(records)], ["op-group"])
+        self.assertEqual(fast.not_as_expected(records, off_route_ok=True), [])
+
+    def test_failed_runs_fail_either_side(self):
+        records = [{"case": "q-star", "status": "failed"}, {"case": "q-chain", "status": "wrong"},
+                   {"case": "q-limit", "status": "failed", "expected_outcome": "failed"}]
+        for off_route_ok in (False, True):
+            bad = fast.not_as_expected(records, off_route_ok=off_route_ok)
+            self.assertEqual([r["case"] for r in bad], ["q-star", "q-chain"])
+
+
 if __name__ == "__main__":
     unittest.main()
