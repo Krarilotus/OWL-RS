@@ -23,9 +23,9 @@
 //! an open gap, U1 not available, consistency not proven, a reader who sees part of the
 //! data. Bag semantics: L's rows keep their multiplicities; a proved row is added once.
 
+use nrese_dl::limits::{Deadline, Limit};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
 
 use nrese_engine::{ReadModel, Snapshot, TermId};
 use nrese_owl::{Axiom, ClassExpr, ExprId, Literal, ObjProp, Ontology};
@@ -85,7 +85,7 @@ fn consistency_at(
     snapshot: &Snapshot,
     view: &View,
     cancellation: &CancellationToken,
-    deadline: Instant,
+    deadline: Deadline,
     memory: &nrese_exec::Envelope,
 ) -> Verdict {
     if cancellation.is_cancelled() {
@@ -106,7 +106,9 @@ fn consistency_at(
         if cancellation.is_cancelled() {
             Some(Verdict::Unknown("cancelled".to_owned()))
         } else {
-            (Instant::now() >= deadline).then(|| Verdict::Unknown("past dl.timeout".to_owned()))
+            deadline
+                .passed()
+                .then(|| Verdict::Unknown(Limit::Time.reached("the deadline passed")))
         }
     };
     if let Some(stopped) = stopped() {
@@ -304,7 +306,7 @@ fn decide_answers(
     memory: &nrese_exec::Envelope,
     mode: DlAnswers,
 ) -> StoreResult<Outcome> {
-    let deadline = Instant::now() + store.config().dl.timeout;
+    let deadline = Deadline::after(store.config().dl.timeout);
     let settings = store.query_settings();
     if prepared.access().is_some() {
         return Ok(Status::sound_only(
@@ -447,7 +449,8 @@ fn decide_answers(
             // The gap's work, a part of the request beside the retained bounds.
             let budget = Arc::new(memory.part());
             let mut pair = lower.align(upper, Arc::clone(&budget))?;
-            let limit = store.config().dl.max_candidates;
+            // A query's candidate budget, unlimited where none is set.
+            let limit = store.config().dl.max_candidates.unwrap_or(usize::MAX);
             let gap = gap::select(
                 &mut pair,
                 limit.saturating_add(super::UNRESOLVED_SHOWN),
@@ -504,7 +507,7 @@ fn decide_answers(
                 }
             }
             if gap.total > limit as u64 {
-                why.get_or_insert_with(|| format!("past dl.max_candidates ({limit})"));
+                why.get_or_insert_with(|| Limit::Candidates.reached(limit));
                 for &index in &gap.rows[admitted..] {
                     if status.detail.unresolved.len() == super::UNRESOLVED_SHOWN {
                         break;

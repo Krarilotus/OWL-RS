@@ -81,7 +81,9 @@ pub fn split(ontology: &Ontology) -> Split {
 
 /// The batch size for `config`: [`BATCH`] assertions, at most a quarter of its node budget.
 fn batch_for(config: &tableau::Config) -> usize {
-    BATCH.min((config.max_nodes / 4).max(16))
+    config
+        .max_nodes
+        .map_or(BATCH, |most| BATCH.min((most / 4).max(16)))
 }
 
 /// [`split`] with batches of about `batch` assertions; `touched`: only the islands with

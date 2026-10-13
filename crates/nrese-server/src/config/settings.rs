@@ -26,6 +26,8 @@ pub enum Kind {
     Integer,
     /// A number, or a number with a unit as text.
     Amount(Unit),
+    /// A budget: a number (with a unit, if it has one), or `0` or `"unlimited"` for none.
+    Limit(Option<Unit>),
     /// Text, or a list of texts (joined with `delimiter` for the environment).
     List {
         delimiter: &'static str,
@@ -79,7 +81,7 @@ const fn secret(mut setting: Setting) -> Setting {
     setting
 }
 
-use Kind::{Amount, Bool, Choice, Integer, List, Text};
+use Kind::{Amount, Bool, Choice, Integer, Limit, List, Text};
 use Unit::{Bytes, BytesOrShare, Duration};
 
 /// Every setting, in the order of the operator reference.
@@ -291,23 +293,26 @@ pub const SETTINGS: &[Setting] = &[
     setting(
         "dl.timeout",
         names::DL_TIMEOUT_MS,
-        Amount(Duration),
+        Limit(Some(Duration)),
         "Under owl2-dl, the time one DL task may take: a commit's consistency check, a \
-         query's exact services, a classification (default 30min).",
+         query's exact services, a classification (default 30min, the server's safety \
+         default; 0 or unlimited: none).",
     ),
     setting(
         "dl.memory",
         names::DL_MEMORY,
-        Amount(Bytes),
-        "Under owl2-dl, the task capacity budget checked at work boundaries; temporary \
-         overshoot is possible (default 4GiB, 0 disables). Not a process memory ceiling.",
+        Limit(Some(Bytes)),
+        "Under owl2-dl, what one engine run may hold of its own, checked at work \
+         boundaries (default none: a request's runs draw from its memory envelope, \
+         budgets.query_memory; 0 or unlimited: none).",
     ),
     setting(
         "dl.max_candidates",
         names::DL_MAX_CANDIDATES,
-        Integer,
+        Limit(None),
         "Under owl2-dl, the candidate answers a query checks with the exact services at \
-         most; the rest are reported unresolved (default 1000).",
+         most; the rest are reported unresolved (default 1000, so that the answer comes \
+         within the query's timeout; 0 or unlimited: none).",
     ),
     setting(
         "dl.threads",
@@ -318,14 +323,52 @@ pub const SETTINGS: &[Setting] = &[
     setting(
         "dl.max_nodes",
         names::DL_MAX_NODES,
-        Integer,
-        "Under owl2-dl, the most nodes one hypertableau run may hold (default 2000000).",
+        Limit(None),
+        "Under owl2-dl, the most nodes one hypertableau run may hold: a deterministic \
+         budget for reproducible runs (default none).",
     ),
     setting(
         "dl.max_branch_points",
         names::DL_MAX_BRANCH_POINTS,
-        Integer,
-        "Under owl2-dl, the most branch points one hypertableau run may open (default 1000000): a deterministic budget; past it the run decides nothing.",
+        Limit(None),
+        "Under owl2-dl, the most branch points one hypertableau run may open: a \
+         deterministic budget; past it the run decides nothing (default none).",
+    ),
+    setting(
+        "dl.max_merges",
+        names::DL_MAX_MERGES,
+        Limit(None),
+        "Under owl2-dl, the most merges one hypertableau run may make: a deterministic \
+         budget (default none).",
+    ),
+    setting(
+        "dl.explanation_tests",
+        names::DL_EXPLANATION_TESTS,
+        Limit(None),
+        "Under owl2-dl, the entailment tests one explanation or rejection evidence runs; \
+         past them the justification isn't minimal (default none).",
+    ),
+    setting(
+        "dl.lower_bound_timeout",
+        names::DL_LOWER_BOUND_TIMEOUT_MS,
+        Limit(Some(Duration)),
+        "Under owl2-dl, the time a classification's Horn lower bound may take, at most \
+         half of what is left: a route threshold, past it the hypertableau decides \
+         (default 60s; 0 or unlimited: only the half).",
+    ),
+    setting(
+        "dl.max_join",
+        names::DL_MAX_JOIN,
+        Limit(None),
+        "Under owl2-dl, the most conclusions one join of the context core may produce: a \
+         route threshold, past it the hypertableau decides (default 1048576).",
+    ),
+    setting(
+        "dl.max_join_steps",
+        names::DL_MAX_JOIN_STEPS,
+        Limit(None),
+        "Under owl2-dl, the most steps one Pred join of the context core may take: a \
+         route threshold, past it the hypertableau decides (default 65536).",
     ),
     // [federation]
     setting(
@@ -831,6 +874,9 @@ fn file_value(setting: &Setting, key: &str, value: &toml::Value) -> Result<Strin
         (Amount(_), V::Integer(number)) if *number >= 0 => number.to_string(),
         (Amount(_), V::String(text)) => text.clone(),
         (Amount(_), _) => return Err(wrong("a number or a number with a unit")),
+        (Limit(_), V::Integer(number)) if *number >= 0 => number.to_string(),
+        (Limit(_), V::String(text)) => text.clone(),
+        (Limit(_), _) => return Err(wrong("a number, 0 or \"unlimited\"")),
         (List { .. }, V::String(text)) => text.clone(),
         (List { delimiter }, V::Array(items)) => items
             .iter()
@@ -915,6 +961,17 @@ fn property(setting: &Setting) -> Value {
                 BytesOrShare => "bytes-or-share",
                 Duration => "milliseconds",
             },
+        }),
+        Limit(unit) => json!({
+            "type": ["integer", "string"],
+            "minimum": 0,
+            "x-unit": match unit {
+                Some(Bytes) => "bytes",
+                Some(BytesOrShare) => "bytes-or-share",
+                Some(Duration) => "milliseconds",
+                None => "count",
+            },
+            "x-unlimited": ["0", "unlimited"],
         }),
         List { .. } => json!({
             "anyOf": [

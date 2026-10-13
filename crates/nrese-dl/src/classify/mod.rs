@@ -69,22 +69,26 @@ pub struct Options {
     /// Tests with the individuals start from their model built once (else each builds it
     /// again): completion-graph reuse ([`crate::tableau::Base`]).
     pub reuse_model: bool,
-    /// Each hypertableau test's budgets (its memory budget is per worker: 256 MiB).
+    /// Each hypertableau test's budgets ([`crate::limits`]: none by default; a caller that
+    /// sets `max_memory` sets it per test, the envelope in `memory` is shared by all).
     pub tableau: tableau::Config,
     /// A deadline for the whole classification; what isn't decided by then is reported.
     pub timeout: Option<Duration>,
     /// The longest the Horn lower bound may take (it is only an optimisation), and never
-    /// more than half of what is left of [`Options::timeout`].
-    pub lower_bound_timeout: Duration,
+    /// more than half of what is left of [`Options::timeout`]; `None`: only that half. A
+    /// route threshold, not a budget: past it the classes go to the hypertableau.
+    pub lower_bound_timeout: Option<Duration>,
     /// How the lower bound's context core picks successor contexts.
     pub lower_bound_strategy: crate::context::Strategy,
-    /// The most conclusions one join of the context core may produce, per run.
-    pub max_join: usize,
+    /// The most conclusions one join of the context core may produce, per run (`None`: no
+    /// limit). A route threshold: past it the lower bound stops, the hypertableau decides.
+    pub max_join: Option<usize>,
     /// The most steps one Pred join of the context core may take; a join past them is
-    /// left, and the classes whose saturation reaches its context aren't exact.
-    pub max_join_steps: usize,
-    /// The most memory the process may hold while the context core runs (bytes; `None`:
-    /// three quarters of what the machine or container has; `Some(0)`: disabled).
+    /// left, and the classes whose saturation reaches its context go to the hypertableau
+    /// (`None`: no limit).
+    pub max_join_steps: Option<usize>,
+    /// The most memory the process may hold while the context core runs (bytes; `None`
+    /// or `Some(0)`: no watch).
     pub max_memory: Option<u64>,
     /// Sampled capacity envelope of each context saturation, independent of the process
     /// ceiling. `None` disables observations. Tableau limits remain in `tableau`.
@@ -123,24 +127,21 @@ impl Default for Options {
             tbox_only: true,
             detached_probes: true,
             reuse_model: true,
-            // A class test that needs more is lost for any deadline worth having, and the
-            // engine checks its budget only every few thousand steps: a lower budget keeps
-            // an overshoot small (on ore_ont_9724 one test overshot 1 GiB to a 5 GiB
-            // allocation).
-            tableau: tableau::Config {
-                max_memory: 256 << 20,
-                ..tableau::Config::default()
-            },
+            // No budget of its own (crate::limits): its caller's memory envelope, or a
+            // `max_memory` per test the caller sets.
+            tableau: tableau::Config::default(),
             timeout: None,
             // ore_ont_7127 (65 k classes) needs 3.9 s, and then no class needs a test: at
             // 2 s it ran out, and 65 k tests took 43 s.
-            lower_bound_timeout: Duration::from_secs(60),
+            lower_bound_timeout: Some(Duration::from_secs(60)),
             // Split: successors whose filler isn't certain get a context per Skolem
             // function, not one shared by all (where it formed, that hub held up to 99 %
             // of the clauses; ORE development A/B in the commit that made it default).
             lower_bound_strategy: crate::context::Strategy::Split,
-            max_join: 1 << 20,
-            max_join_steps: 1 << 16,
+            // Route thresholds, measured on the ORE development set: a join past them is
+            // cheaper to leave to the hypertableau than to finish.
+            max_join: Some(1 << 20),
+            max_join_steps: Some(1 << 16),
             max_memory: None,
             task_memory: None,
             equality: false,
@@ -192,10 +193,10 @@ impl Deadline {
         limit: Option<Duration>,
     ) -> crate::context::Budget {
         let now = Instant::now();
-        let limit = limit.map(|l| {
+        let limit = limit.and_then(|l| {
             // At most half of what is left: the tests still need time if it fails.
             let left = self.0.map_or(l, |d| d.saturating_duration_since(now) / 2);
-            now + l.min(left)
+            now.checked_add(l.min(left))
         });
         let deadline = match (self.0, limit) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -203,14 +204,11 @@ impl Deadline {
         };
         crate::context::Budget {
             deadline,
-            max_join: Some(options.max_join),
-            max_join_steps: Some(options.max_join_steps),
+            max_join: options.max_join,
+            max_join_steps: options.max_join_steps,
             // A saturation is only an optimisation here: past the limit it stops, where an
             // allocation failure would end the process (ore_ont_9724 under equality).
-            max_memory: options
-                .max_memory
-                .or_else(|| nrese_exec::memory::available_bytes().map(|b| b / 4 * 3))
-                .filter(|&bytes| bytes != 0),
+            max_memory: options.max_memory.filter(|&bytes| bytes != 0),
             task_memory: options.task_memory,
             memory: options.tableau.memory.clone(),
         }
@@ -317,7 +315,7 @@ mod memory_policy_tests {
     use super::*;
 
     #[test]
-    fn explicit_zero_disables_the_watch_instead_of_selecting_the_auto_default() {
+    fn the_process_watch_is_the_callers_and_none_is_built_in() {
         let deadline = Deadline::new(None);
         let mut options = Options {
             max_memory: Some(0),
@@ -327,11 +325,6 @@ mod memory_policy_tests {
         options.max_memory = Some(1);
         assert_eq!(deadline.budget(&options, None).max_memory, Some(1));
         options.max_memory = None;
-        assert_eq!(
-            deadline.budget(&options, None).max_memory,
-            nrese_exec::memory::available_bytes()
-                .map(|b| b / 4 * 3)
-                .filter(|&b| b != 0)
-        );
+        assert_eq!(deadline.budget(&options, None).max_memory, None);
     }
 }

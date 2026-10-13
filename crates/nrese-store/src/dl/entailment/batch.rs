@@ -3,6 +3,7 @@
 //! may be empty, so their definitions are a conservative extension of the premise.
 //! Search state is created by the existing probe engine and is never shared.
 
+use nrese_dl::limits::Limit;
 use nrese_dl::tableau::{self, At, Prepared, Probe, Want};
 use nrese_owl::{Axiom, ClassExpr, EntityKind, ExprId, ObjProp, Ontology};
 
@@ -174,15 +175,16 @@ impl Batch {
         {
             return Entailed::Unknown("cancelled".to_owned());
         }
-        if budget.timeout.is_zero() {
-            return Entailed::Unknown("past dl.timeout".to_owned());
+        if budget.spent() {
+            return Entailed::Unknown(Limit::Time.reached("the deadline passed"));
         }
         let config = tableau::Config {
-            timeout: Some(budget.timeout),
+            timeout: budget.timeout,
             max_memory: budget.memory_bytes,
             memory: budget.memory.clone(),
             max_nodes: budget.max_nodes,
-            max_branch_points: Some(budget.max_branch_points),
+            max_branch_points: budget.max_branch_points,
+            max_merges: budget.max_merges,
             cancel: budget.cancel.clone(),
             workers: Some(budget.workers.limited(1)),
             portfolio: false,

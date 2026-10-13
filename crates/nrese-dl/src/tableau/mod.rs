@@ -82,8 +82,9 @@ pub struct Config {
     /// against those, the W3C suite and the ORE development set take half the time and 13
     /// tests are faster, DL-202, 206 and 664 within the budget they ran out of.
     pub disjunct_learning: bool,
-    /// The most nodes a run may create at once.
-    pub max_nodes: usize,
+    /// The most nodes a run may create at once (`None`: no limit), a deterministic bound
+    /// like the next two ([`crate::limits`]: none is built in).
+    pub max_nodes: Option<usize>,
     /// The most branch points a run may open (`None`: no limit): a deterministic bound
     /// on the search, for tests that must not depend on the machine's speed.
     pub max_branch_points: Option<u64>,
@@ -114,8 +115,9 @@ pub struct Config {
     /// The deadline the operation's parts share (an embedding operation's, or the one
     /// `timeout` gave). Each solver checks it before it starts and while it runs.
     pub deadline: Option<Instant>,
-    /// The most memory a run may hold (its tables, indexes and arenas), in bytes.
-    pub max_memory: usize,
+    /// The most memory a run may hold (its tables, indexes and arenas), in bytes (`None`:
+    /// no limit of its own; the envelope's, if there is one).
+    pub max_memory: Option<usize>,
     /// The request's memory envelope: what a run holds is reserved from it as it grows
     /// (shared by the runs of a batch, a portfolio or islands), and a run it has no room
     /// for gives up as past `max_memory`. `None`: only `max_memory` bounds a run.
@@ -155,7 +157,7 @@ impl Default for Config {
             disjunct_learning: true,
             incremental_blocking: true,
             check_blocking: false,
-            max_nodes: 2_000_000,
+            max_nodes: None,
             max_branch_points: None,
             max_merges: None,
             merge_filter: true,
@@ -165,7 +167,7 @@ impl Default for Config {
             counting: true,
             timeout: None,
             deadline: None,
-            max_memory: 4 << 30,
+            max_memory: None,
             memory: None,
             keep_model: false,
             lazy_definitions: true,
@@ -199,7 +201,7 @@ impl Config {
         if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
             Some("cancelled")
         } else if self.deadline.is_some_and(|d| Instant::now() >= d) {
-            Some(TIME_BUDGET)
+            Some(TIME_BUDGET.as_str())
         } else {
             None
         }
@@ -217,14 +219,9 @@ impl Config {
     }
 }
 
-/// Why a run gave up when its deadline passed.
-pub const TIME_BUDGET: &str = "the time budget ran out";
-
-/// Why a run gave up when [`Config::max_branch_points`] ran out.
-pub const BRANCH_BUDGET: &str = "the branch-point budget ran out";
-
-/// Why a run gave up when [`Config::max_merges`] ran out.
-pub const MERGE_BUDGET: &str = "the merge budget ran out";
+/// Why a run gave up when its deadline passed ([`crate::limits::Limit::Time`]).
+pub static TIME_BUDGET: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::limits::Limit::Time.reached("the deadline passed"));
 
 /// The answer of a consistency or satisfiability test.
 #[derive(Debug, Clone, PartialEq, Eq)]

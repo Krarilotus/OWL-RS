@@ -15,8 +15,10 @@ use std::mem::size_of;
 use nrese_exec::{BudgetExceeded, Envelope, Reservation};
 use nrese_owl::{Axiom, Normalised, Ontology};
 
-/// Why a DL task stopped when the request's envelope had no room for it.
-pub const EXHAUSTED: &str = "the request's memory envelope ran out";
+/// Why a DL task stopped when the request's envelope had no room for it: as
+/// [`crate::limits::Limit::Envelope`] reports it.
+pub const EXHAUSTED: &str =
+    "the request's memory envelope (budgets.query_memory) reached (no room for what the run needs)";
 
 /// Compilation scratch held against a request's envelope: released when dropped.
 #[derive(Debug, Default)]

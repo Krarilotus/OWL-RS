@@ -77,9 +77,15 @@ diagnostic ([design](design/owl2-dl.md) §3, §6):
   definitions (§11.2, §7.5); an irregular property hierarchy (§11.2); literals beyond what
   §4 asks an implementation to support (numbers past 128 bits, more than 18 fractional
   digits of a second);
-- *a resource limit, answered `gave-up`:* the deadline, memory and node budgets; more than
-  12 patterns and language ranges in one combined set of values (per combination, no
-  longer per ontology); a component of over a million pairwise-unequal data values.
+- *a budget the configuration set, answered `gave-up` naming its setting:* none is built
+  in (13 October, branch `v15/dl-budgets`): the time, memory, nodes, branch points, merges,
+  candidates and explanation tests are settings, each accepting `unlimited`; by default the
+  server keeps its time limit and a query's candidates, memory comes from the request's
+  envelope, and the deterministic budgets are unlimited ([config
+  reference](ops/config-reference.md), `dl.*`; the guard `nrese-dl/tests/tableau/limits.rs`);
+- *a representation's capacity, answered `gave-up`:* more than 12 patterns and language
+  ranges in one combined set of values (per combination, no longer per ontology); a
+  component of over a million pairwise-unequal data values.
 - *closed on 12 October:* U as a subproperty, in a chain, an equivalence or an inverse
   pair, and in keys; the datatype theory's search for distinct values (exact to the
   deadline) and its pattern limit (per combination).

@@ -6,7 +6,7 @@
 //! envelope and the catalog's budget, and the store answers the next request in full.
 
 use super::*;
-use nrese_dl::memory::EXHAUSTED;
+use nrese_dl::limits::Limit;
 use nrese_exec::Envelope;
 
 /// How a request ended under its envelope.
@@ -88,17 +88,16 @@ fn run(store: &StoreService, memory: &Envelope) -> End {
             if detail.proved == 1 {
                 assert!(status.complete, "{reasons:?}");
                 End::Answered
-            } else if reasons
-                .iter()
-                .any(|r| r.contains(&format!("gave up: {EXHAUSTED}")))
-            {
-                End::Engines
             } else {
-                assert!(
-                    reasons.iter().any(|r| r.contains(EXHAUSTED)),
-                    "unresolved for another reason: {reasons:?}"
-                );
-                End::Compilation
+                // The envelope named as the budget reached: by an engine's run (it gave
+                // up), or before one (compiling).
+                let envelope = |r: &&&str| Limit::named_in(r) == Some(Limit::Envelope);
+                let why = reasons.iter().find(envelope);
+                match why {
+                    Some(why) if why.contains("gave up: ") => End::Engines,
+                    Some(_) => End::Compilation,
+                    None => panic!("unresolved for another reason: {reasons:?}"),
+                }
             }
         }
         Ok(Outcome::Stream(status, ..)) => panic!("the bounds decide this query: {status:?}"),

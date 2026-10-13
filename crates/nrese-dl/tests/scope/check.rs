@@ -103,7 +103,9 @@ pub fn check(axioms: usize, uncertified: usize) {
                 Ok(read) => read,
                 Err(why) => return (Some(format!("case {index}: not read: {why}")), 0, 0),
             };
-            let answer = nrese_dl::scope::answer(&o, &case);
+            // The limit the recorded answers were made under: a case past it is `t`.
+            let limit = Some(std::time::Duration::from_secs(20));
+            let answer = nrese_dl::scope::answer(&o, &case, limit);
             let want = &expected[*index as usize];
             if answer.code != *want {
                 return (

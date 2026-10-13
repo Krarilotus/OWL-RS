@@ -1,5 +1,6 @@
 use super::analysis::Shape;
 use super::*;
+use nrese_dl::limits::{Deadline, Limit};
 
 mod rollup;
 use rollup::roll_up;
@@ -36,7 +37,7 @@ pub(super) fn decide_until(
     variables: &[Variable],
     rows: &[Vec<Option<Term>>],
     cancellation: &CancellationToken,
-    deadline: Instant,
+    deadline: Deadline,
     memory: &nrese_exec::Envelope,
 ) -> Decided {
     let workers = nrese_exec::workers::Workers::current().limited(store.config().dl.threads);
@@ -56,8 +57,8 @@ pub(super) fn decide_until(
     if cancellation.is_cancelled() {
         return unresolved("cancelled");
     }
-    if Instant::now() >= deadline {
-        return unresolved("past dl.timeout");
+    if deadline.passed() {
+        return unresolved(&Limit::Time.reached("the deadline passed"));
     }
     let config = &store.config().dl;
     let base = ontology_at(store, snapshot);
@@ -78,14 +79,13 @@ pub(super) fn decide_until(
         if cancellation.is_cancelled() {
             return unresolved("cancelled");
         }
-        if Instant::now() >= deadline {
-            return unresolved("past dl.timeout");
+        if deadline.passed() {
+            return unresolved(&Limit::Time.reached("the deadline passed"));
         }
-        if i >= config.max_candidates {
-            jobs.push(Err(format!(
-                "past dl.max_candidates ({})",
-                config.max_candidates
-            )));
+        if let Some(most) = config.max_candidates
+            && i >= most
+        {
+            jobs.push(Err(Limit::Candidates.reached(most)));
             continue;
         }
         let instantiated = instantiate(shape, variables, row, snapshot);
@@ -123,8 +123,8 @@ pub(super) fn decide_until(
     if cancellation.is_cancelled() {
         return unresolved("cancelled");
     }
-    if Instant::now() >= deadline {
-        return unresolved("past dl.timeout");
+    if deadline.passed() {
+        return unresolved(&Limit::Time.reached("the deadline passed"));
     }
     let compiled = entailment::Batch::new(&mut ontology, &tests, Some(memory));
     let ontology = &ontology;
@@ -142,6 +142,9 @@ pub(super) fn decide_until(
         cancel: Some(nrese_dl::tableau::Cancel::from_flag(cancellation.flag())),
         max_nodes: config.max_nodes,
         max_branch_points: config.max_branch_points,
+        max_merges: config.max_merges,
+        max_join: config.max_join,
+        explanation_tests: config.explanation_tests,
     };
     let verdicts = workers.map(&jobs, |job| {
         let range = match job {
@@ -153,8 +156,8 @@ pub(super) fn decide_until(
             if cancellation.is_cancelled() {
                 return Entailed::Unknown("cancelled".to_owned());
             }
-            if Instant::now() >= deadline {
-                return Entailed::Unknown("past dl.timeout".to_owned());
+            if deadline.passed() {
+                return Entailed::Unknown(Limit::Time.reached("the deadline passed"));
             }
             let found = compiled.check(i, &tests[i], ontology, &fresh, &budget.remaining(deadline));
             match found {
