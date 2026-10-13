@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         files: vec![file],
         replace: false,
         graph: GraphTarget::DefaultGraph,
-        skip_errors: false,
+        invalid: Some(nrese_store::InvalidStatements::Strict),
     })?;
     println!(
         "{n} vectors of {dim}: loaded in {:.2} s",

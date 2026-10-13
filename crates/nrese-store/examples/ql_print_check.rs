@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             files: files.clone(),
             replace: false,
             graph: GraphTarget::DefaultGraph,
-            skip_errors: false,
+            invalid: Some(nrese_store::InvalidStatements::Strict),
         })?;
         Ok(store)
     };

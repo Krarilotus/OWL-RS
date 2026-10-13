@@ -48,7 +48,7 @@ fn load(service: &StoreService, dir: &Path) {
             files: vec![path],
             replace: false,
             graph: GraphTarget::DefaultGraph,
-            skip_errors: false,
+            invalid: Some(nrese_store::InvalidStatements::Strict),
         })
         .expect("load");
 }
