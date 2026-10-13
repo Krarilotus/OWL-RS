@@ -696,16 +696,19 @@ args = ["--runs", "300"]
 [[case]]
 name = "op-group"
 area = "operator"
-what = "COUNT … GROUP BY on one pattern, NOT EXISTS by a group walk, COUNT DISTINCT"
+what = "COUNT … GROUP BY on one pattern, COUNT under NOT EXISTS counted without rows, COUNT DISTINCT"
 semantics = "none"
 data = "social people=300000"
 queries = "op-group"
 metric = "sum_p50_ms"
 check = { "q.tag-counts.rows" = "expect.tags_used", "q.untitled.value" = "400000" }
-route = { "q.tag-counts.operators" = "has group count", "q.untitled.operators" = "has group walk" }
+# untitled: COUNT(*) of authors under NOT EXISTS a title, counted by the counted join (the
+# authors' groups weighed by NOT EXISTS, no row; opt/sparql-memory, 13 Oct: 19.4 -> 5.5 ms
+# for the case on phuoc-yu, the same 400,000), where a group walk fed a semi join before.
+route = { "q.tag-counts.operators" = "has group count", "q.untitled.operators" = "has counted join" }
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
-guards = ["group counts on the index", "distinct values by a group walk"]
+guards = ["group counts on the index", "distinct values by a group walk", "joins are counted without their rows"]
 args = ["--runs", "300"]
 [[case]]
 name = "op-aggregates"
