@@ -3,7 +3,7 @@
 //! `benches/reasoning/dl/scope.py`.
 //!
 //! ```text
-//! cargo run --release -p nrese-dl --example scope_check -- --scope 4,4,4 --out FILE [--from N --to M]
+//! cargo run --release -p nrese-dl --example scope_check -- --scope 4,4,4 --out FILE [--from N --to M] [--timeout SECONDS]
 //! ```
 //!
 //! Each case is rendered as the references get it (`nrese_owl::scope::document`), read
@@ -23,6 +23,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut spec, mut out) = (String::from("3,3"), None);
     let (mut from, mut to) = (0u64, u64::MAX);
     let mut strength: Option<usize> = None;
+    // Each engine run's time limit (`--timeout SECONDS`, 0: none; none by default).
+    let mut timeout: Option<std::time::Duration> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--scope" => spec = args.next().ok_or("--scope a,b,..")?,
@@ -30,6 +32,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--from" => from = args.next().ok_or("--from N")?.parse()?,
             "--to" => to = args.next().ok_or("--to N")?.parse()?,
             "--covering" => strength = Some(args.next().ok_or("--covering T")?.parse()?),
+            "--timeout" => {
+                let seconds: u64 = args.next().ok_or("--timeout SECONDS")?.parse()?;
+                timeout = (seconds > 0).then(|| std::time::Duration::from_secs(seconds));
+            }
             other => return Err(format!("unknown argument {other}").into()),
         }
     }
@@ -57,7 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let at = Instant::now();
                 let (code, certified) = match nrese_dl::scope::read(document) {
                     Ok((o, names)) => {
-                        let a = nrese_dl::scope::answer(&o, &names);
+                        let a = nrese_dl::scope::answer(&o, &names, timeout);
                         (a.code, a.certified)
                     }
                     Err(why) => (format!("p {why}"), "-".repeat(11)),

@@ -2,7 +2,7 @@
 //! consistency verdict island by island against the whole ABox's.
 //!
 //! ```text
-//! cargo run --release -p nrese-dl --example islands -- [--decide] [--nominal-clauses] FILE...
+//! cargo run --release -p nrese-dl --example islands -- [--decide] [--timeout=SECS] [--nominal-clauses] FILE...
 //! ```
 //!
 //! The FILEs (N-Triples or RDF/XML) are read as one ontology (LUBM: `univ-bench.nt` and
@@ -125,6 +125,14 @@ fn verdict(outcome: &tableau::Outcome) -> String {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let decide = args.iter().any(|a| a == "--decide");
+    // `--timeout=SECS` for each decision (none by default, 0 none).
+    let timeout = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--timeout="))
+        .map(str::parse::<u64>)
+        .transpose()?
+        .filter(|&seconds| seconds > 0)
+        .map(std::time::Duration::from_secs);
     let files: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let mut table = Table::default();
     let mut statements = Vec::new();
@@ -170,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if decide {
         let config = Config {
-            timeout: Some(std::time::Duration::from_secs(600)),
+            timeout,
             ..Config::default()
         };
         let at = Instant::now();

@@ -20,8 +20,8 @@ fn configs() -> impl Iterator<Item = Config> {
         // others 44 to 1,360).
         max_branch_points: Some(10_000),
         timeout: Some(Duration::from_secs(300)),
-        max_nodes: 100_000,
-        max_memory: 512 << 20,
+        max_nodes: Some(100_000),
+        max_memory: Some(512 << 20),
         check_blocking: true,
         ..Config::default()
     })

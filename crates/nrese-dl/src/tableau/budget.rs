@@ -5,12 +5,10 @@ use nrese_exec::workers::Workers;
 
 use super::Config;
 
-/// Finite capacity is divided by concurrent children, never raised to a minimum.
-pub(crate) fn memory_share(bytes: usize, concurrent: usize) -> usize {
-    match bytes {
-        usize::MAX => usize::MAX,
-        bytes => bytes / concurrent.max(1),
-    }
+/// Finite capacity is divided by concurrent children, never raised to a minimum; none
+/// stays none.
+pub(crate) fn memory_share(bytes: Option<usize>, concurrent: usize) -> Option<usize> {
+    bytes.map(|bytes| bytes / concurrent.max(1))
 }
 
 /// Standalone operations create one owner; embedded work only narrows its owner.
@@ -60,15 +58,18 @@ mod tests {
             timeout: Some(Duration::ZERO),
             ..Config::default()
         };
-        assert_eq!(expired.started().stopped(), Some(super::super::TIME_BUDGET));
+        assert_eq!(
+            expired.started().stopped(),
+            Some(super::super::TIME_BUDGET.as_str())
+        );
     }
 
     #[test]
     fn memory_shares_preserve_unlimited_and_tiny_finite_limits() {
-        assert_eq!(memory_share(usize::MAX, 4), usize::MAX);
-        assert_eq!(memory_share(1, 4), 0);
-        assert_eq!(memory_share(0, 4), 0);
-        assert_eq!(memory_share(101, 4), 25);
+        assert_eq!(memory_share(None, 4), None);
+        assert_eq!(memory_share(Some(1), 4), Some(0));
+        assert_eq!(memory_share(Some(0), 4), Some(0));
+        assert_eq!(memory_share(Some(101), 4), Some(25));
     }
 
     #[test]

@@ -232,7 +232,10 @@ impl<'a> Work<'a> {
         let mut cursor = 0usize;
         loop {
             if self.deadline.passed() {
-                self.incomplete.push("realisation: the deadline".into());
+                self.incomplete.push(format!(
+                    "realisation: {}",
+                    crate::limits::Limit::Time.reached("the deadline passed")
+                ));
                 break;
             }
             let mut batch: Vec<(u32, u32)> = Vec::new();
