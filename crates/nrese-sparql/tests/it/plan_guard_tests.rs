@@ -212,6 +212,18 @@ fn joins_are_counted_without_their_rows() {
         "{}",
         selective.detail
     );
+    // op-optional's shape (2.54× Virtuoso's time while its rows were made): COUNT(*) and
+    // COUNT of a variable only an OPTIONAL binds, each counted (that OPTIONAL as a join for
+    // the second), no row and no OPTIONAL evaluated.
+    let plan = steps(
+        &engine,
+        "SELECT (COUNT(*) AS ?n) (COUNT(?o) AS ?m) WHERE { ?s e:kind ?k OPTIONAL { ?s e:knows ?o } }",
+    );
+    let counts = plan.iter().filter(|s| s.operator == "counted join").count();
+    assert!(
+        counts == 2 && !plan.iter().any(|s| s.operator == "optional"),
+        "{plan:#?}"
+    );
     // Query 50's and 63's shape: counts per kind (10) of subjects weighed by their label
     // (3,000): each kind's subjects read and their weights added up, no pair of the 3,000
     // kept and sorted (8 types sent 8.7 M pairs on DBLP, 0.3 → 1.7 s).
