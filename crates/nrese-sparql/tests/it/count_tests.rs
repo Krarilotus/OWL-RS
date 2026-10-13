@@ -249,6 +249,94 @@ fn range_counts_equal_the_reference() {
     );
 }
 
+/// `COUNT(?v)` and `COUNT(DISTINCT ?v)` of one pattern from the index (its count, its
+/// groups counted as they are walked) against the reference evaluator: patterns with
+/// constants in every position, over data committed in several revisions with deletions
+/// (several runs, tombstones: the walk declines and the groups are listed), a third
+/// inferred, every read model.
+#[test]
+fn single_pattern_counts_equal_the_reference() {
+    let mut rng = Rng::seeded(20_261_015);
+    let (mut checked, mut walked) = (0usize, 0usize);
+    for case in 0..30 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        for _ in 0..1 + rng.below(3) {
+            let mut tx = engine.transaction();
+            for quad in dataset(&mut rng) {
+                match rng.below(6) {
+                    0 if quad.graph_name.is_default_graph() => {
+                        let triple = EncodedTriple::new(
+                            tx.intern(quad.subject.as_ref().into()),
+                            tx.intern(quad.predicate.as_ref().into()),
+                            tx.intern(quad.object.as_ref()),
+                        );
+                        tx.insert_inferred(triple);
+                    }
+                    1 => {
+                        tx.remove(quad.as_ref());
+                    }
+                    _ => {
+                        tx.insert(quad.as_ref());
+                    }
+                }
+            }
+            tx.commit().unwrap();
+        }
+        let snapshot = engine.snapshot();
+        for _ in 0..30 {
+            let options = QueryOptions {
+                read_model: *rng.pick(&[
+                    ReadModel::Materialised,
+                    ReadModel::Asserted,
+                    ReadModel::Inferred,
+                ]),
+                ..QueryOptions::default()
+            };
+            let term = |rng: &mut Rng, v: &str| match rng.below(3) {
+                0 => format!("<{EX}e{}>", rng.below(9)),
+                _ => v.to_owned(),
+            };
+            let (s, o) = (term(&mut rng, "?s"), term(&mut rng, "?o"));
+            let p = match rng.below(2) {
+                0 => "?p".to_owned(),
+                _ => format!("<{EX}p{}>", rng.below(5)),
+            };
+            let vars: Vec<&str> = [s.as_str(), p.as_str(), o.as_str()]
+                .into_iter()
+                .filter(|t| t.starts_with('?'))
+                .collect();
+            let Some(&v) = vars.get(rng.below(vars.len().max(1) as u64) as usize) else {
+                continue;
+            };
+            let distinct = if rng.below(2) == 0 { "DISTINCT " } else { "" };
+            let text = format!("SELECT (COUNT({distinct}{v}) AS ?n) WHERE {{ {s} {p} {o} }}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let native = count(evaluate_query(&snapshot, &query, &options).unwrap());
+            let expected =
+                count(nrese_sparql_reference::evaluate_query(&snapshot, &query, &options).unwrap());
+            assert_eq!(
+                native, expected,
+                "case {case}, {:?}: {text}",
+                options.read_model
+            );
+            let explained = explain_query(&snapshot, &query, &options).unwrap();
+            walked += usize::from(
+                explained
+                    .steps
+                    .iter()
+                    .any(|s| s.operator == "distinct count"),
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        walked * 4 > checked,
+        "{checked} checked, {walked} distinct counts"
+    );
+}
+
 #[test]
 fn counted_joins_equal_the_reference() {
     let mut rng = Rng::seeded(20_261_013);
