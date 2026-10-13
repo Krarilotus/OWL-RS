@@ -27,7 +27,7 @@ use nrese_rdf::{
 
 use super::lexer::{Kind, Lexed, Token, lex};
 use crate::blank::BlankNodes;
-use crate::error::{RdfParseError, RdfSyntaxError, TextPosition};
+use crate::error::{RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition};
 use crate::text::{NOT_IN_IRI, decode_iri, decode_string};
 
 mod n3;
@@ -127,6 +127,25 @@ impl<R: Read> Input<'_, R> {
             self.line_start = self.base + (self.position + last + 1) as u64;
         }
         self.position += n;
+    }
+
+    /// The text position of `data()[at]`, at or after the current position, its column in
+    /// bytes: O(at - position), for marks taken on every statement.
+    fn mark(&self, at: usize) -> TextPosition {
+        let data = self.data();
+        let at = at.clamp(self.position, data.len());
+        let before = &data[self.position..at];
+        let breaks = memchr::memchr_iter(b'\n', before).count() as u64;
+        let line_start = match memchr::memrchr(b'\n', before) {
+            Some(i) => self.base + (self.position + i + 1) as u64,
+            None => self.line_start,
+        };
+        let offset = self.base + at as u64;
+        TextPosition {
+            line: self.line + breaks,
+            column: offset.saturating_sub(line_start),
+            offset,
+        }
     }
 
     /// The text position of `data()[at]`: at or after the current position, or behind it
@@ -351,14 +370,59 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             self.triples.clear();
             self.triple_terms.clear();
             self.handed_out = 0;
+            // Where the statement starts (its first token), for an error's statement.
+            let start = self.statement_start();
             if let Err(error) = self.statement() {
                 let syntax = matches!(error, RdfParseError::Syntax(_));
                 self.done =
                     !(syntax && self.settings.recover && !self.settings.n3 && self.resync());
+                let error = match error {
+                    RdfParseError::Syntax(error) => {
+                        RdfParseError::Syntax(self.skipped(error, start))
+                    }
+                    other => other,
+                };
                 return Some(Err(error));
             }
             self.own_triple_terms();
         }
+    }
+
+    /// Where the next statement starts: its first token, or the position where lexing it
+    /// fails. O(whitespace before it).
+    fn statement_start(&mut self) -> TextPosition {
+        let at = match self.fill() {
+            Ok(()) => self
+                .lookahead
+                .as_ref()
+                .map_or(self.input.position, |token| token.start),
+            Err(_) => self.input.position,
+        };
+        self.input.mark(at)
+    }
+
+    /// `error` with the statement it is in, from `start` to where parsing resumes, and the
+    /// directives and graph block in effect (built on an error only).
+    fn skipped(&self, error: RdfSyntaxError, start: TextPosition) -> RdfSyntaxError {
+        let mut context = String::new();
+        if let Some(base) = &self.base {
+            let _ = writeln!(context, "@base <{}> .", base.as_str());
+        }
+        let mut prefixes: Vec<_> = self.prefixes.iter().collect();
+        prefixes.sort();
+        for (prefix, iri) in prefixes {
+            let _ = writeln!(context, "@prefix {prefix}: <{iri}> .");
+        }
+        let graph = self.graph.as_ref().map(|graph| match graph {
+            GraphLabel::Iri(iri) => format!("<{iri}>"),
+            GraphLabel::Blank(label) => format!("_:{label}"),
+        });
+        let end = self.input.mark(self.input.position);
+        error.with_statement(SkippedStatement {
+            span: start..end,
+            context,
+            graph,
+        })
     }
 
     /// After a syntax error: skips to the end of the statement, a `.` outside brackets (or
