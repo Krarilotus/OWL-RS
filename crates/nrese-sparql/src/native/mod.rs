@@ -4648,16 +4648,21 @@ impl<'a> Context<'a> {
                 ordered: false,
             });
         }
-        // COUNT(*) of an acyclic join with OPTIONAL, MINUS, EXISTS and UNION parts: by
-        // message passing over the index, without its rows (`count`).
+        // COUNT(*) of an acyclic join with OPTIONAL, MINUS, EXISTS and UNION parts, and
+        // COUNT(?v) of a variable it or one OPTIONAL binds: by message passing over the
+        // index, without its rows (`count`), each aggregate of the group.
         if variables.is_empty()
-            && let [(target, aggregate)] = aggregates
-            && let Some(count) = self.count_tree(inner, aggregate)?
+            && !aggregates.is_empty()
+            && let Some(counts) = self.count_aggregates(inner, aggregates)?
         {
-            let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))]);
+            let row: Vec<u64> = counts.iter().map(|&n| self.id(&integer(n))).collect();
+            let mut table = IdTable::new(row.len());
+            table.push_row(&row);
             return Ok(Solutions {
-                vars: vec![target.clone()],
+                vars: aggregates
+                    .iter()
+                    .map(|(target, _)| target.clone())
+                    .collect(),
                 table,
                 ordered: false,
             });
