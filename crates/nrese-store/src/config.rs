@@ -330,9 +330,9 @@ impl StoreConfig {
                     .to_owned(),
             ));
         }
-        if self.dl.max_candidates == 0 || self.dl.timeout.is_zero() {
+        if self.dl.max_candidates == Some(0) || self.dl.timeout.is_some_and(|t| t.is_zero()) {
             return Err(StoreError::Configuration(
-                "dl.max_candidates and dl.timeout must be above 0".to_owned(),
+                "dl.max_candidates and dl.timeout must be above 0; unset is unlimited".to_owned(),
             ));
         }
         if self.support_sets == 0 {

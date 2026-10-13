@@ -12,6 +12,7 @@ use super::graph::{Annot, Graph, Mark, NONE};
 use super::hyper::{Firing, join_concept, join_edge};
 use super::program::{ConceptId, Head, Program, RoleId};
 use super::telemetry::Telemetry;
+use crate::limits::Limit;
 
 /// Proofs of facts not made by a clause.
 pub mod proof {
@@ -208,11 +209,10 @@ impl<'a> Engine<'a> {
     }
 
     pub fn new_node(&mut self, parent: u32, named: u32) -> Step<u32> {
-        if self.g.nodes.len() >= self.config.max_nodes {
-            return Err(Stop::GaveUp(format!(
-                "the node budget ({}) ran out",
-                self.config.max_nodes
-            )));
+        if let Some(most) = self.config.max_nodes
+            && self.g.nodes.len() >= most
+        {
+            return Err(Stop::GaveUp(Limit::Nodes.reached(most)));
         }
         let id = self.g.new_node(parent, named);
         self.stats.nodes_created += 1;
@@ -521,15 +521,17 @@ impl<'a> Engine<'a> {
                 self.done.unary += 1;
                 let f = self.g.unary[i as usize];
                 if self.g.live(f.node) && !self.g.dead.unary[i as usize] {
+                    let room = self.firing_room();
                     join_concept(
                         self.p,
                         &self.g,
                         &mut self.deps,
                         i,
                         &mut self.firings,
+                        room,
                         &mut self.stats.plans_tried,
                     );
-                    self.apply_firings()?;
+                    self.apply_firings(room)?;
                 }
                 continue;
             }
@@ -538,15 +540,17 @@ impl<'a> Engine<'a> {
                 self.done.edges += 1;
                 let e = self.g.edges[i as usize];
                 if self.g.live(e.from) && self.g.live(e.to) && !self.g.dead.edges[i as usize] {
+                    let room = self.firing_room();
                     join_edge(
                         self.p,
                         &self.g,
                         &mut self.deps,
                         i,
                         &mut self.firings,
+                        room,
                         &mut self.stats.plans_tried,
                     );
-                    self.apply_firings()?;
+                    self.apply_firings(room)?;
                 }
                 continue;
             }
@@ -554,13 +558,40 @@ impl<'a> Engine<'a> {
         }
     }
 
-    pub(super) fn apply_firings(&mut self) -> Step<()> {
-        if self.firings.len() >= super::hyper::MAX_FIRINGS {
+    /// The clause instances a join may collect: what the run's memory leaves beside what
+    /// it holds ([`Config::max_memory`], the envelope), unlimited without either.
+    pub(super) fn firing_room(&self) -> usize {
+        if self.config.max_memory.is_none() && self.memory.is_none() {
+            return usize::MAX;
+        }
+        let held = self.bytes();
+        let own = self
+            .config
+            .max_memory
+            .map_or(usize::MAX, |most| most.saturating_sub(held));
+        let envelope = self.memory.as_ref().map_or(usize::MAX, |g| g.room(held));
+        own.min(envelope) / std::mem::size_of::<Firing>()
+    }
+
+    /// Applies the instances a join collected; gives up where they filled `room` (the
+    /// join stopped there, so instances may be missing).
+    pub(super) fn apply_firings(&mut self, room: usize) -> Step<()> {
+        if self.firings.len() >= room {
             self.firings.clear();
-            return Err(Stop::GaveUp(format!(
-                "a join reached {} clause instances",
-                super::hyper::MAX_FIRINGS
-            )));
+            // The one of the two that left less.
+            let held = self.bytes();
+            let own = self
+                .config
+                .max_memory
+                .map_or(usize::MAX, |most| most.saturating_sub(held));
+            let envelope = self.memory.as_ref().map_or(usize::MAX, |g| g.room(held));
+            let limit = match own <= envelope {
+                true => Limit::Memory,
+                false => Limit::Envelope,
+            };
+            return Err(Stop::GaveUp(
+                limit.reached(format_args!("a join's {room} clause instances")),
+            ));
         }
         let firings = std::mem::take(&mut self.firings);
         let mut out = Ok(());
@@ -590,11 +621,12 @@ impl<'a> Engine<'a> {
 
     pub fn check_memory(&self) -> Step<()> {
         let used = self.bytes();
-        if used > self.config.max_memory {
-            return Err(Stop::GaveUp(format!(
-                "the memory budget ({} MiB) ran out",
-                self.config.max_memory >> 20
-            )));
+        if let Some(most) = self.config.max_memory
+            && used > most
+        {
+            return Err(Stop::GaveUp(
+                Limit::Memory.reached(format_args!("{} MiB", most >> 20)),
+            ));
         }
         if !self.reserve(used) {
             return Err(Stop::GaveUp(crate::memory::EXHAUSTED.to_owned()));

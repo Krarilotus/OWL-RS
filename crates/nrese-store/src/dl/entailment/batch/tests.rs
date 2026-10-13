@@ -5,12 +5,15 @@ use std::time::Duration;
 fn budget() -> Budget {
     Budget {
         workers: nrese_exec::workers::Workers::serial(),
-        timeout: Duration::from_secs(10),
-        memory_bytes: usize::MAX,
+        timeout: Some(Duration::from_secs(10)),
+        memory_bytes: None,
         memory: None,
         cancel: None,
-        max_nodes: 10_000,
-        max_branch_points: 10_000,
+        max_nodes: Some(10_000),
+        max_branch_points: Some(10_000),
+        max_merges: None,
+        max_join: None,
+        explanation_tests: None,
     }
 }
 

@@ -31,7 +31,7 @@ fn env(name: &str) -> Option<u64> {
 fn configs() -> Vec<(&'static str, Config)> {
     // Every blocking pass is checked against a recomputation from scratch.
     let base = Config {
-        max_nodes: 5_000,
+        max_nodes: Some(5_000),
         max_branch_points: Some(5_000),
         timeout: Some(std::time::Duration::from_secs(300)),
         check_blocking: true,
@@ -125,7 +125,7 @@ fn render(o: &Ontology) -> String {
 /// minimal witness).
 fn shrink(o: &Ontology) {
     let config = Config {
-        max_nodes: 3000,
+        max_nodes: Some(3000),
         max_branch_points: Some(5_000),
         timeout: Some(std::time::Duration::from_secs(300)),
         ..Config::default()
@@ -201,7 +201,7 @@ fn check_case(
             ..config.clone()
         };
         if beyond {
-            config.max_nodes = config.max_nodes.min(1_000);
+            config.max_nodes = Some(config.max_nodes.map_or(1_000, |n| n.min(1_000)));
             config.max_branch_points = Some(1_000);
         }
         let out = consistency(o, &config);
@@ -316,7 +316,7 @@ fn check_case(
     }
     // Renaming and shuffling leave the answer as it is.
     let base = Config {
-        max_nodes: 5_000,
+        max_nodes: Some(5_000),
         max_branch_points: Some(5_000),
         timeout: Some(std::time::Duration::from_secs(300)),
         ..Config::default()
