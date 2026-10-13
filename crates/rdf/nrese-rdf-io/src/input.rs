@@ -1,9 +1,13 @@
 //! Input: the bytes of a document, from a slice or a reader, a line at a time.
 
+use std::fs::File;
 use std::io::{self, Read};
 use std::ops::Range;
+use std::path::PathBuf;
 
-use memchr::memchr2;
+use memchr::{memchr2, memchr2_iter};
+
+use crate::RdfParseError;
 
 /// Where the input comes from.
 enum Source<'a, R> {
@@ -18,11 +22,49 @@ enum Source<'a, R> {
     },
 }
 
+/// The lines of the document before a chunk's first line, counted only when an error has to
+/// name its line: a parallel parse cuts the document at byte offsets, and counting the line
+/// ends before every cut would put a pass over the whole input on the parse's path.
+pub(crate) enum Before<'a> {
+    /// A whole document, or a chunk whose first line is known.
+    Lines(u64),
+    /// The document's bytes before the chunk.
+    Bytes(&'a [u8]),
+    /// The file's first `.1` bytes.
+    File(PathBuf, u64),
+}
+
+impl Before<'_> {
+    /// The number of lines before the chunk: its line ends, `\n` or `\r` each, as
+    /// [`Lines::next`] counts them (a chunk starts after one).
+    fn count(&self) -> io::Result<u64> {
+        match self {
+            Before::Lines(n) => Ok(*n),
+            Before::Bytes(bytes) => Ok(memchr2_iter(b'\n', b'\r', bytes).count() as u64),
+            Before::File(path, length) => {
+                let mut file = File::open(path)?.take(*length);
+                let mut buffer = vec![0_u8; 1 << 20];
+                let mut lines = 0;
+                loop {
+                    match file.read(&mut buffer) {
+                        Ok(0) => return Ok(lines),
+                        Ok(n) => lines += memchr2_iter(b'\n', b'\r', &buffer[..n]).count() as u64,
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Lines of a document (ending at `\n` or `\r`, as N-Triples' `EOL` allows). A line is
 /// returned as a range, to borrow with [`Lines::slice`] until the next call: callers can
 /// skip lines without holding a borrow. The reader's buffer grows for a line longer than it.
 pub(crate) struct Lines<'a, R> {
     source: Source<'a, R>,
+    /// The document's lines before these: an error's line is the document's.
+    before: Before<'a>,
     /// The byte offset of the next line, and the number of lines returned so far.
     offset: u64,
     line: u64,
@@ -39,6 +81,7 @@ impl<'a> Lines<'a, io::Empty> {
     pub(crate) fn from_slice(bytes: &'a [u8], offset: u64) -> Self {
         Self {
             source: Source::Slice(bytes),
+            before: Before::Lines(0),
             offset,
             line: 0,
             line_start: offset,
@@ -58,10 +101,32 @@ impl<R: Read> Lines<'static, R> {
                 end: 0,
                 eof: false,
             },
+            before: Before::Lines(0),
             offset,
             line: 0,
             line_start: offset,
             position: 0,
+        }
+    }
+}
+
+impl<'a, R: Read> Lines<'a, R> {
+    /// These lines as a chunk after the document's lines `before`.
+    pub(crate) fn after(mut self, before: Before<'a>) -> Self {
+        self.before = before;
+        self
+    }
+
+    /// `error`, a syntax error's line counted in the document (an I/O error as it is; if the
+    /// lines before can't be counted, the chunk's own line stays, rather than no error).
+    pub(crate) fn in_document(&self, error: RdfParseError) -> RdfParseError {
+        match (error, &self.before) {
+            (RdfParseError::Syntax(syntax), Before::Lines(0)) => RdfParseError::Syntax(syntax),
+            (RdfParseError::Syntax(syntax), before) => match before.count() {
+                Ok(lines) => RdfParseError::Syntax(syntax.after_lines(lines)),
+                Err(_) => RdfParseError::Syntax(syntax),
+            },
+            (error, _) => error,
         }
     }
 }

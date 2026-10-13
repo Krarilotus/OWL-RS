@@ -13,7 +13,7 @@ use crate::binary::BinaryParser;
 use crate::blank::BlankNodes;
 use crate::error::{RdfParseError, RdfSyntaxError, TextPosition};
 use crate::format::RdfFormat;
-use crate::input::Lines;
+use crate::input::{Before, Lines};
 use crate::jsonld::JsonLdOptions;
 use crate::jsonld::parser::{JsonLdParser, JsonLdSettings};
 use crate::ntriples::LineParser;
@@ -263,8 +263,10 @@ impl RdfParser {
             .windows(2)
             .map(|w| {
                 let (start, end) = (w[0] as usize, w[1] as usize);
-                self.clone()
-                    .parser(Lines::from_slice(&bytes[start..end], w[0]))
+                self.clone().parser(
+                    Lines::from_slice(&bytes[start..end], w[0])
+                        .after(Before::Bytes(&bytes[..start])),
+                )
             })
             .collect())
     }
@@ -333,7 +335,9 @@ impl RdfParser {
                 let mut file = File::open(path)?;
                 file.seek(SeekFrom::Start(w[0]))?;
                 let reader = BufReader::with_capacity(256 * 1024, file).take(w[1] - w[0]);
-                Ok(self.clone().parser(Lines::from_reader(reader, w[0])))
+                Ok(self.clone().parser(
+                    Lines::from_reader(reader, w[0]).after(Before::File(path.to_path_buf(), w[0])),
+                ))
             })
             .collect()
     }
@@ -509,7 +513,7 @@ impl<R: Read> QuadParser<'_, R> {
                         match parser.parse(text, line, offset) {
                             Ok(None) => continue,
                             Ok(Some(_)) => unreachable!("a directive has no statement"),
-                            Err(error) => return Some(Err(error.into())),
+                            Err(error) => return Some(Err(lines.in_document(error.into()))),
                         }
                     }
                     break (range, line, offset);
@@ -524,7 +528,7 @@ impl<R: Read> QuadParser<'_, R> {
                         },
                     ),
                     Ok(None) => unreachable!("parsed to a statement above"),
-                    Err(error) => return Some(Err(error.into())),
+                    Err(error) => return Some(Err(lines.in_document(error.into()))),
                 }
             }
         };
