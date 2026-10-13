@@ -13,6 +13,7 @@ use nrese_reasoner::batch;
 use nrese_reasoner::eval::Schema;
 use nrese_reasoner::ir::{self, Vocabulary};
 use nrese_reasoner::lists::ListVocabulary;
+use nrese_reasoner::representatives::EqualityClasses;
 use nrese_reasoner::rulesets::Ruleset;
 
 pub type Triple = [u64; 3];
@@ -145,61 +146,16 @@ pub fn compile_with(
     bounds::compile_with(ontology, normalised, options, &mut |iri| table.named(iri))
 }
 
-/// `owl:sameAs` classes: each member's representative (the smallest id) and each
-/// representative's members (classes of two or more only).
-#[derive(Debug, Default, Clone)]
-pub struct Classes {
-    representative: HashMap<u64, u64>,
-    members: HashMap<u64, Vec<u64>>,
-}
-
-impl Classes {
-    /// The representative of `term` (the term itself outside every class).
-    pub fn representative(&self, term: u64) -> u64 {
-        self.representative.get(&term).copied().unwrap_or(term)
-    }
-
-    /// The members of a representative's class (empty for a term of no class).
-    pub fn members(&self, representative: u64) -> &[u64] {
-        self.members.get(&representative).map_or(&[], Vec::as_slice)
-    }
-
-    fn rewrite(&self, t: Triple) -> Triple {
-        t.map(|x| self.representative(x))
-    }
-
-    /// Merges the classes of each pair; whether any class changed.
-    fn merge(&mut self, pairs: impl Iterator<Item = (u64, u64)>) -> bool {
-        let mut changed = false;
-        for (a, b) in pairs {
-            let (ra, rb) = (self.representative(a), self.representative(b));
-            if ra == rb {
-                continue;
-            }
-            changed = true;
-            let (keep, gone) = (ra.min(rb), ra.max(rb));
-            let moved = self.members.remove(&gone).unwrap_or_else(|| vec![gone]);
-            for &m in &moved {
-                self.representative.insert(m, keep);
-            }
-            self.representative.insert(keep, keep);
-            let class = self.members.entry(keep).or_insert_with(|| vec![keep]);
-            class.extend(moved);
-            class.sort_unstable();
-        }
-        changed
-    }
-}
-
 /// A closure: the input with what was derived, and the consistency rules that fired.
-/// `representatives` and `classes` are for a closure over `owl:sameAs` representatives;
-/// with equality by copying they are the facts and no classes.
+/// `representatives` and `classes` are for a closure over `owl:sameAs` representatives
+/// (each class one term, its smallest id); with equality by copying they are the facts
+/// and no classes.
 #[derive(Default)]
 pub struct Closure {
     pub facts: Vec<Triple>,
     pub violations: Vec<String>,
     pub representatives: Vec<Triple>,
-    pub classes: Classes,
+    pub classes: EqualityClasses,
 }
 
 /// L: the OWL 2 RL closure of `input`.
@@ -267,12 +223,13 @@ pub fn upper(table: &mut Table, program: &Program, input: &[Triple]) -> Closure 
 /// class of `k` terms costs `k²` copies of each fact of it in every round its class
 /// grows, and U1 makes large classes: a split `⊤ ⊑ {d} ⊔ …` makes everything equal to
 /// `d` (W3C's `WebOnt-description-logic-906`: 4 GB and more). So the closure is over
-/// representatives (the store's way): each class is one term, the smallest id, facts
-/// are rewritten to it, and the rules run without `eq-rep-*` until no class grows.
-/// `representatives::materialise` does the same but never stops on U1: a rule head
-/// naming a constant that is no representative (a Skolem constant) derives
-/// `rep sameAs c` again in every closure, which it takes for a new equality (reported
-/// to the reasoner's owner); here only a class that grows counts.
+/// representatives, as the store evaluates U1
+/// ([`batch::materialise_representatives_until`]): each class one term, its smallest id.
+/// A head naming a constant that lost its place (a Skolem constant merged into a class)
+/// derives its representative's fact in the same run, and the rules go on over it. (The
+/// tests' own loop of plain closures stopped when no class grew, with such a head's last
+/// facts rewritten but never evaluated: on `NRESE_FUZZ_SEED=52580` that closure was no
+/// model.)
 ///
 /// `facts` is the closure expanded to every member that is no internal term of U1 (and
 /// each representative): the answers, as copying would give them, without the copies
@@ -283,10 +240,9 @@ pub fn upper_within(
     input: &[Triple],
     budget: Option<Duration>,
 ) -> Option<Closure> {
-    let same_as = program.names.same_as;
+    let input = upper_input(program, input);
     if std::env::var_os("NRESE_BOUNDS_COPYING").is_some() {
         // Equality by copying, to compare the two (small inputs only).
-        let input = upper_input(program, input);
         let facts = upper_copied(table, &reasoner_rules(program), &input);
         return Some(Closure {
             representatives: facts.clone(),
@@ -294,45 +250,22 @@ pub fn upper_within(
             ..Closure::default()
         });
     }
-    let rules: Vec<ir::Rule> = reasoner_rules(program)
-        .into_iter()
-        .filter(|r| !matches!(r.name.as_str(), "eq-rep-s" | "eq-rep-p" | "eq-rep-o"))
-        .collect();
     let schema = Schema::owl(table);
     let deadline = budget.map(|b| Instant::now() + b);
     let stop = move || deadline.is_some_and(|d| Instant::now() >= d);
-    let pairs = |facts: &[Triple]| -> Vec<(u64, u64)> {
-        facts
-            .iter()
-            .filter(|t| t[1] == same_as && t[0] != t[2])
-            .map(|t| (t[0], t[2]))
-            .collect()
-    };
-    let mut classes = Classes::default();
-    let mut facts = upper_input(program, input);
-    classes.merge(pairs(&facts).into_iter());
-    let closure = loop {
-        let mut rewritten: Vec<Triple> = facts.iter().map(|&t| classes.rewrite(t)).collect();
-        rewritten.sort_unstable();
-        rewritten.dedup();
-        let m =
-            batch::materialise_owned_until(rewritten.clone(), &rules, None, &schema, &stop).ok()?;
-        let mut closure = rewritten;
-        closure.extend(m.derived);
-        // Facts a head with a merged constant derived, over its representative.
-        if !classes.merge(pairs(&closure).into_iter()) {
-            if classes.members.is_empty() {
-                closure.sort_unstable();
-                break closure;
-            }
-            let mut closure: Vec<Triple> = closure.iter().map(|&t| classes.rewrite(t)).collect();
-            closure.sort_unstable();
-            closure.dedup();
-            break closure;
-        }
-        facts = closure;
-    };
-    if classes.members.is_empty() {
+    let m = batch::materialise_representatives_until(
+        batch::Input::Facts(input),
+        &reasoner_rules(program),
+        None,
+        &schema,
+        batch::Listing::Representatives,
+        &stop,
+    )
+    .ok()?;
+    let (mut closure, classes) = (m.derived, m.classes);
+    closure.sort_unstable();
+    closure.dedup();
+    if classes.is_empty() {
         return Some(Closure {
             facts: closure.clone(),
             violations: Vec::new(),
@@ -341,14 +274,11 @@ pub fn upper_within(
         });
     }
     let shown = |r: u64| -> Vec<u64> {
-        match classes.members(r) {
-            [] => vec![r],
-            members => members
-                .iter()
-                .copied()
-                .filter(|&m| m == r || !program.is_internal(m))
-                .collect(),
-        }
+        classes
+            .members(r)
+            .into_iter()
+            .filter(|&m| m == r || !program.is_internal(m))
+            .collect()
     };
     let mut expanded = Vec::with_capacity(closure.len());
     for &[s, p, o] in &closure {
