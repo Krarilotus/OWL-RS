@@ -1408,10 +1408,20 @@ impl Context<'_> {
         if atom.scan.first_free(permutation) != Some(atom.component(var)) {
             return Err(Stop::Declined);
         }
+        // The list's size is about known before the walk (the index's distinct values,
+        // else its matches): charged first, twice over for the walk's parts and their
+        // concatenation, so a walk past the budget allocates nothing.
+        let pattern = atom.scan.quad_pattern();
+        let expected = self
+            .snapshot
+            .distinct_estimate_in(self.model, &pattern, permutation)
+            .unwrap_or(atom.estimate);
+        let precharge = self.working(expected as usize * 2 * 16)?;
         let groups = self
             .snapshot
-            .group_counts_in(self.model, &atom.scan.quad_pattern(), permutation)
+            .group_counts_in(self.model, &pattern, permutation)
             .ok_or(Stop::Declined)?;
+        drop(precharge);
         self.check()?;
         stats.walks += 1;
         stats.listed += groups.len();
