@@ -1259,7 +1259,7 @@ fn materialisation_by_representatives_equals_replication() {
                 files: vec![file.clone()],
                 replace: false,
                 graph: nrese_store::GraphTarget::DefaultGraph,
-                skip_errors: false,
+                invalid: Some(nrese_store::InvalidStatements::Strict),
             })
             .expect("load");
         store

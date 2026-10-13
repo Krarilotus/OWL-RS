@@ -160,7 +160,9 @@ impl MutationCommand {
 
 /// What writes are evaluated with besides their transaction and requester.
 pub struct UpdateContext<'a> {
-    pub(crate) runtime: &'a crate::Runtime,
+    /// The request's memory envelope within the catalog's budget: the `WHERE` clauses (and
+    /// a front-end's patterns) draw from it, as the request's DL gate does.
+    pub(crate) memory: nrese_exec::Envelope,
     /// Stops a long-running `WHERE` clause.
     pub(crate) cancellation: &'a CancellationToken,
     pub(crate) union_default_graph: bool,
@@ -184,11 +186,11 @@ impl UpdateContext<'_> {
     }
 
     /// What the executor evaluates a write's patterns with: the cancellation and the
-    /// memory all running queries share.
+    /// request's memory envelope (within the catalog's budget, as its DL gate draws).
     pub fn resources(&self) -> nrese_sparql::Resources {
         nrese_sparql::Resources {
             cancellation: Some(self.cancellation.clone()),
-            shared_memory: self.runtime.query_memory(),
+            memory: self.memory.clone(),
             ..Default::default()
         }
     }

@@ -91,7 +91,7 @@ pub fn load_past_the_pipeline(store: &StoreService, data: &str) {
             files: vec![file],
             replace: false,
             graph: GraphTarget::DefaultGraph,
-            skip_errors: false,
+            invalid: None,
         })
         .unwrap();
 }

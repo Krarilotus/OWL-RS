@@ -1308,13 +1308,9 @@ impl<'a> Context<'a> {
             decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
-            budget: Arc::new(
-                options
-                    .resources
-                    .memory_limit
-                    .map_or_else(Budget::unlimited, Budget::new)
-                    .within(options.resources.shared_memory.clone()),
-            ),
+            // What this evaluation holds, counted on its own (what it leaves behind is
+            // its result's reservation), drawn from the request's envelope.
+            budget: Arc::new(options.resources.memory.part()),
             trace: None,
             depth: Cell::new(0),
             probed: Cell::default(),

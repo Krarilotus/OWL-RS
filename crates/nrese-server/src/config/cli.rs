@@ -6,9 +6,10 @@ use anyhow::{Result, bail};
 /// Command line: `nrese-server [--config PATH] [--set KEY=VALUE]...` serves (`--set`
 /// overrides a configuration file key, over the file and the environment; every command
 /// takes it); `nrese-server config-schema` prints the JSON Schema of the configuration file;
-/// `nrese-server load [--config PATH] [--replace] [--graph IRI] [--skip-errors] FILE...` bulk-loads files
-/// into the configured store and exits (the server must not be running on the same data
-/// directory; the engine's directory lock enforces that);
+/// `nrese-server load [--config PATH] [--replace] [--graph IRI] [--strict | --quarantine] FILE...`
+/// bulk-loads files into the configured store and exits (the server must not be running on
+/// the same data directory; the engine's directory lock enforces that); statements it can't
+/// read are quarantined, or with `--strict` stop it (`store.invalid_statements`);
 /// `nrese-server query [--config PATH] [--format F] (QUERY | --file PATH)` answers one query
 /// from the configured store on standard output (the same lock);
 /// `nrese-server print-query [--config PATH] [--form paths|values] [--schema FILE]...
@@ -156,8 +157,9 @@ pub struct LoadCommand {
     pub replace: bool,
     /// Target graph IRI for triple formats; `None` = the default graph.
     pub graph: Option<String>,
-    /// Skip statements with syntax errors (logged and counted) instead of stopping.
-    pub skip_errors: bool,
+    /// What a statement with a syntax error does (`--strict`, `--quarantine`, the older
+    /// `--skip-errors`); `None`: `store.invalid_statements`.
+    pub invalid: Option<nrese_store::InvalidStatements>,
 }
 
 impl CliConfig {
@@ -353,8 +355,10 @@ impl CliConfig {
             };
             if argument == "--replace" {
                 load.replace = true;
-            } else if argument == "--skip-errors" {
-                load.skip_errors = true;
+            } else if argument == "--strict" {
+                load.invalid = Some(nrese_store::InvalidStatements::Strict);
+            } else if argument == "--quarantine" || argument == "--skip-errors" {
+                load.invalid = Some(nrese_store::InvalidStatements::Quarantine);
             } else if argument == "--graph" {
                 let Some(graph) = args.next().and_then(|graph| graph.into_string().ok()) else {
                     bail!("missing or non-UTF-8 value for --graph");
@@ -499,9 +503,25 @@ mod tests {
                 files: vec![PathBuf::from("a.nt"), PathBuf::from("b.ttl")],
                 replace: true,
                 graph: Some("http://example.com/g".to_owned()),
-                skip_errors: false,
+                invalid: None,
             })
         );
+    }
+
+    #[test]
+    fn load_takes_what_bad_statements_do() {
+        use nrese_store::InvalidStatements::{Quarantine, Strict};
+        for (flag, invalid) in [
+            ("--strict", Strict),
+            ("--quarantine", Quarantine),
+            ("--skip-errors", Quarantine),
+        ] {
+            let config = parse(&["load", flag, "a.nt"]).expect("cli config");
+            let CliCommand::Load(load) = config.command else {
+                panic!("{flag}: not a load");
+            };
+            assert_eq!(load.invalid, Some(invalid), "{flag}");
+        }
     }
 
     #[test]

@@ -30,7 +30,9 @@ Read [docs/README.md](docs/README.md) (which document answers what),
   sends the working tree to it (`git config nrese.buildHost`). The machine you run on is the
   owner's workstation: it may build (`NRESE_BUILD_HOST=local`), but benchmarks, reasoners,
   containers and large data run on the measuring and preparing hosts. Its guard stops our
-  heavy processes when memory or disk run low.
+  heavy processes when memory or disk run low. Every run on a host goes through the
+  measurement queue (`benches/suite/queue.py`), never started by hand: the queue packs
+  shareable jobs side by side and gives timed ones the host alone.
 - `literature/` is read-only. Results of licensed systems are never committed.
 - Write files with the editor tools; the shell mangles backslashes.
 - Commit messages carry no AI co-author trailers (`Co-Authored-By: Claude …` and the like);

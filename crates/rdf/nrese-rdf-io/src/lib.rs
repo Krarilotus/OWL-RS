@@ -23,7 +23,7 @@ mod serializer;
 mod text;
 mod turtle;
 
-pub use error::{RdfParseError, RdfSyntaxError, TextPosition};
+pub use error::{RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition};
 pub use format::RdfFormat;
 pub use parser::{QuadParser, RdfParser};
 pub use serializer::{QuadSerializer, RdfSerializer};

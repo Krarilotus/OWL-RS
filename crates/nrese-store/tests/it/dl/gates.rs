@@ -19,7 +19,7 @@ const UNION: &str = ":A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :B rdfs:subC
 fn a_spent_deterministic_budget_leaves_candidates_unresolved_never_wrong() {
     // No branch point allowed: every hypertableau run that must branch gives up.
     let dl = pipeline_with(DlConfig {
-        max_branch_points: 0,
+        max_branch_points: Some(0),
         ..DlConfig::default()
     });
     insert(&dl, UNION).expect("U1 proves the data consistent");
@@ -72,7 +72,7 @@ fn a_spent_deterministic_budget_leaves_candidates_unresolved_never_wrong() {
 #[test]
 fn a_spent_candidate_budget_leaves_the_rest_unresolved_and_exact_mode_rejects_it() {
     let dl = pipeline_with(DlConfig {
-        max_candidates: 1,
+        max_candidates: Some(1),
         ..DlConfig::default()
     });
     insert(&dl, &format!("{UNION} :v a [ owl:unionOf ( :B :C ) ] .")).expect("data");

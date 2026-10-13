@@ -695,25 +695,70 @@ struct ImportReport {
     parsed: u64,
     inserted: u64,
     deleted: u64,
-    /// Statements skipped for syntax errors (`skip_errors=true`).
+    /// Statements quarantined for syntax errors (the repository's quarantine).
+    quarantined: u64,
+    /// The same count, by its older name.
     skipped: u64,
+    /// The load's id in the quarantine, if it quarantined any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    load: Option<String>,
+    /// The first quarantined statements in the files' order: where, and why.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    examples: Vec<QuarantineExample>,
     elapsed_ms: u128,
     /// The inferences recomputed after the load, where the repository reasons.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningRun>,
 }
 
+/// A quarantined statement as a load reports it.
+#[derive(Serialize, utoipa::ToSchema)]
+struct QuarantineExample {
+    id: String,
+    file: String,
+    line: u64,
+    column: u64,
+    reason: String,
+}
+
+/// What a load does with statements it can't read: `invalid=quarantine|strict`, or the
+/// older `strict=true` and `skip_errors=true`; `None`: the repository's setting.
+fn invalid_statements(
+    pairs: &[(String, String)],
+) -> Result<Option<nrese_store::InvalidStatements>, ApiError> {
+    let flag = |name: &str| {
+        pairs
+            .iter()
+            .any(|(key, value)| key == name && value.eq_ignore_ascii_case("true"))
+    };
+    if let Some((_, name)) = pairs.iter().find(|(key, _)| key == "invalid") {
+        return nrese_store::InvalidStatements::from_name(name)
+            .map(Some)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "invalid must be quarantine or strict, not '{name}'"
+                ))
+            });
+    }
+    Ok(match (flag("strict"), flag("skip_errors")) {
+        (true, _) => Some(nrese_store::InvalidStatements::Strict),
+        (false, true) => Some(nrese_store::InvalidStatements::Quarantine),
+        (false, false) => None,
+    })
+}
+
 #[utoipa::path(post, path = "/api/v1/repositories/{id}/import", tag = "data",
     params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("graph" = Option<String>, Query, description = "The graph for triple formats"),
         ("replace" = Option<bool>, Query, description = "Replace the repository's statements"),
-        ("skip_errors" = Option<bool>, Query, description = "Skip statements with syntax errors")),
+        ("invalid" = Option<String>, Query, description = "Statements with syntax errors: `quarantine` (the rest loads) or `strict` (the load stops); the repository's setting without")),
     request_body(content = String, description = "An RDF document (`Content-Type` names its format)"),
     responses((status = 200, description = "Loaded, inferences recomputed", body = ImportReport),
         (status = 400, description = "Unreadable data", body = crate::http::openapi::Problem)))]
 /// Bulk-loads the RDF document in the body (its format from `Content-Type`): into the
 /// graph `graph` for triple formats (the default graph without), replacing the
-/// repository's statements with `replace=true`, skipping statements with syntax errors
-/// with `skip_errors=true`. Then the inferences are recomputed. For large loads: the
+/// repository's statements with `replace=true`. Statements with syntax errors go into the
+/// repository's quarantine, or stop the load with `invalid=strict` (the repository's
+/// `store.invalid_statements` without). Then the inferences are recomputed. For large loads: the
 /// loader's parallel path, not one commit's; administrators only, since a bulk load
 /// replaces whole indexes and passes no commit gate.
 pub async fn import(
@@ -763,7 +808,7 @@ pub async fn import(
         files: vec![file.clone()],
         replace: flag("replace"),
         graph,
-        skip_errors: flag("skip_errors"),
+        invalid: invalid_statements(&pairs)?,
     };
     {
         let (file, body) = (file.clone(), body.clone());
@@ -803,7 +848,20 @@ fn import_report(
         parsed: loaded.parsed,
         inserted: loaded.inserted,
         deleted: loaded.deleted,
-        skipped: loaded.skipped,
+        quarantined: loaded.quarantined,
+        skipped: loaded.quarantined,
+        load: loaded.load.clone(),
+        examples: loaded
+            .examples
+            .iter()
+            .map(|example| QuarantineExample {
+                id: example.id.clone(),
+                file: example.file.clone(),
+                line: example.line,
+                column: example.column,
+                reason: example.reason.clone(),
+            })
+            .collect(),
         elapsed_ms: loaded.elapsed.as_millis(),
         reasoning: reasoning.map(ReasoningRun::from),
     }
@@ -936,6 +994,9 @@ struct ServerImport {
     graph: Option<String>,
     #[serde(default)]
     replace: bool,
+    /// `quarantine` or `strict`; the repository's setting without.
+    invalid: Option<String>,
+    /// The older form of `invalid = "quarantine"`.
     #[serde(default)]
     skip_errors: bool,
 }
@@ -996,7 +1057,18 @@ pub async fn import_server_files(
         files,
         replace: request.replace,
         graph,
-        skip_errors: request.skip_errors,
+        invalid: match request.invalid.as_deref() {
+            Some(name) => Some(nrese_store::InvalidStatements::from_name(name).ok_or_else(
+                || {
+                    ApiError::bad_request(format!(
+                        "invalid must be quarantine or strict, not '{name}'"
+                    ))
+                },
+            )?),
+            None => request
+                .skip_errors
+                .then_some(nrese_store::InvalidStatements::Quarantine),
+        },
     };
     Ok(start_import(&state, load, description, None).into_response())
 }

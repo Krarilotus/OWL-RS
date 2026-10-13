@@ -20,6 +20,7 @@
 //! The pending-state check, prior-state check and rejection evidence share one deadline
 //! and cancellation token. Evidence cannot restart a spent gate's reasoning budget.
 
+use nrese_dl::limits::Deadline;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -80,16 +81,25 @@ pub(super) fn cancellable<T>(
     })
 }
 
-/// The budget of a check under `store`'s settings.
-pub(crate) fn budget(store: &StoreService, cancel: Option<Cancel>) -> Budget {
+/// The budget of a check under `store`'s settings, drawing from the request's envelope
+/// `memory`.
+pub(crate) fn budget(
+    store: &StoreService,
+    cancel: Option<Cancel>,
+    memory: &nrese_exec::Envelope,
+) -> Budget {
     let dl = &store.config().dl;
     Budget {
         timeout: dl.timeout,
         memory_bytes: dl.memory_per_worker(1),
+        memory: Some(memory.clone()),
         workers: nrese_exec::workers::Workers::current().limited(dl.threads),
         cancel,
         max_nodes: dl.max_nodes,
         max_branch_points: dl.max_branch_points,
+        max_merges: dl.max_merges,
+        max_join: dl.max_join,
+        explanation_tests: dl.explanation_tests,
     }
 }
 
@@ -103,8 +113,9 @@ pub(crate) fn check_commit(
     cancelled: &(dyn Fn() -> bool + Sync),
     preparation: &mut super::bounds::Preparation,
     reader: &crate::ReadScope,
+    memory: &nrese_exec::Envelope,
 ) -> Gate {
-    let deadline = Instant::now() + store.config().dl.timeout;
+    let deadline = Deadline::after(store.config().dl.timeout);
     if store.config().dl.consistency == DlConsistency::Off {
         return Gate {
             checked: Checked {
@@ -127,13 +138,13 @@ pub(crate) fn check_commit(
             evidence: Vec::new(),
         };
     }
-    cancellable(&|| cancelled() || Instant::now() >= deadline, |cancel| {
+    cancellable(&|| cancelled() || deadline.passed(), |cancel| {
         check_with_budget(
             store,
             tx,
             preparation,
             reader,
-            &budget(store, Some(cancel)),
+            &budget(store, Some(cancel), memory),
             deadline,
         )
     })
@@ -177,7 +188,7 @@ fn check_with_budget(
     preparation: &mut super::bounds::Preparation,
     reader: &crate::ReadScope,
     operation: &Budget,
-    deadline: Instant,
+    deadline: Deadline,
 ) -> Gate {
     let started = Instant::now();
     let change = assertion_change(store, tx);
@@ -239,7 +250,7 @@ fn rejection(
     reader: &crate::ReadScope,
     checked: Checked,
     operation: &Budget,
-    deadline: Instant,
+    deadline: Deadline,
 ) -> Gate {
     // Why: a minimal set of axioms that has no model, each by its source triples.
     let justification = super::explain::justify(
@@ -317,23 +328,31 @@ mod tests {
     fn nested_checks_share_remaining_time_and_cancellation() {
         let store = StoreService::new(crate::StoreConfig::in_memory()).unwrap();
         let cancel = Cancel::default();
-        let mut base = budget(&store, Some(cancel.clone()));
-        base.timeout = Duration::from_secs(30);
+        let mut base = budget(
+            &store,
+            Some(cancel.clone()),
+            &nrese_exec::Envelope::unlimited(),
+        );
+        base.timeout = Some(Duration::from_secs(30));
         let now = Instant::now();
-        let deadline = now + Duration::from_secs(10);
+        let deadline = Deadline::at(now + Duration::from_secs(10));
         let pending = base.remaining(deadline);
         let prior = pending.remaining(deadline);
         let evidence = prior.remaining(deadline);
-        assert!(pending.timeout <= Duration::from_secs(10));
+        assert!(pending.timeout <= Some(Duration::from_secs(10)));
         assert!(prior.timeout <= pending.timeout && evidence.timeout <= prior.timeout);
         cancel.cancel();
         for phase in [&pending, &prior, &evidence] {
             assert!(phase.cancel.as_ref().unwrap().is_cancelled());
         }
         assert_eq!(
-            base.remaining(now - Duration::from_secs(1)).timeout,
-            Duration::ZERO
+            base.remaining(Deadline::at(now - Duration::from_secs(1)))
+                .timeout,
+            Some(Duration::ZERO)
         );
+        // No time limit and no deadline: none.
+        base.timeout = None;
+        assert_eq!(base.remaining(Deadline::NONE).timeout, None);
     }
 
     #[test]
@@ -359,11 +378,11 @@ mod tests {
             if stop == "cancelled" {
                 cancel.cancel();
             }
-            let operation = budget(&store, Some(cancel));
+            let operation = budget(&store, Some(cancel), &nrese_exec::Envelope::unlimited());
             let deadline = if stop == "deadline" {
-                Instant::now() - Duration::from_secs(1)
+                Deadline::at(Instant::now() - Duration::from_secs(1))
             } else {
-                Instant::now() + operation.timeout
+                Deadline::after(operation.timeout)
             };
             let gate = rejection(
                 &tx,

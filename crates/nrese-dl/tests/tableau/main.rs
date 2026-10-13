@@ -2,6 +2,7 @@
 //! engine handles, consistent and inconsistent, with every optimisation on and off.
 
 mod build;
+mod limits;
 mod ni;
 mod probes;
 mod resources;
@@ -577,7 +578,7 @@ fn budgets_give_up() {
     b.sub(a, some);
     b.assert(a, 100);
     let config = Config {
-        max_nodes: 1,
+        max_nodes: Some(1),
         ..Config::default()
     };
     assert!(matches!(
@@ -858,7 +859,7 @@ fn a_branch_too_large_to_expand_is_abandoned_not_the_run() {
     let config = Config {
         max_branch_points: Some(100_000),
         timeout: Some(std::time::Duration::from_secs(300)),
-        max_memory: 256 << 20,
+        max_memory: Some(256 << 20),
         ..Config::default()
     };
     assert_eq!(consistency(&b.o, &config).answer, Answer::Consistent);

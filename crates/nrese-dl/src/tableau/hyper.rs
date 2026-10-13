@@ -8,10 +8,6 @@ use super::depset::{DepSetId, DepSets};
 use super::graph::{Graph, NONE, flag};
 use super::program::{Body, Head, HtClause, MAX_VARS, Plan, Program, Step};
 
-/// The most instances one join may collect: past it the join stops, and the engine gives
-/// up (a bound on memory, never a dropped instance).
-pub const MAX_FIRINGS: usize = 1 << 20;
-
 /// A clause instance whose head doesn't hold yet.
 #[derive(Debug, Clone, Copy)]
 pub struct Firing {
@@ -20,13 +16,16 @@ pub struct Firing {
     pub dep: DepSetId,
 }
 
-/// The clause instances the concept fact `fact` completes; `tried` counts the plans run.
+/// The clause instances the concept fact `fact` completes, at most `room` in `out` (the
+/// run's memory: past it the join stops, and the engine gives up, never dropping an
+/// instance); `tried` counts the plans run.
 pub fn join_concept(
     p: &Program,
     g: &Graph,
     deps: &mut DepSets,
     fact: u32,
     out: &mut Vec<Firing>,
+    room: usize,
     tried: &mut u64,
 ) {
     let f = g.unary[fact as usize];
@@ -41,17 +40,19 @@ pub fn join_concept(
         };
         let mut bind = [NONE; MAX_VARS];
         bind[v as usize] = f.node;
-        run(g, deps, plan, clause, 0, &mut bind, f.dep, out);
+        run(g, deps, plan, clause, 0, &mut bind, f.dep, out, room);
     }
 }
 
-/// The clause instances the edge `edge` completes; `tried` counts the plans run.
+/// The clause instances the edge `edge` completes, at most `room` in `out` (as
+/// [`join_concept`]); `tried` counts the plans run.
 pub fn join_edge(
     p: &Program,
     g: &Graph,
     deps: &mut DepSets,
     edge: u32,
     out: &mut Vec<Firing>,
+    room: usize,
     tried: &mut u64,
 ) {
     let e = g.edges[edge as usize];
@@ -68,7 +69,7 @@ pub fn join_edge(
         let mut bind = [NONE; MAX_VARS];
         bind[a as usize] = e.from;
         bind[b as usize] = e.to;
-        run(g, deps, plan, clause, 0, &mut bind, e.dep, out);
+        run(g, deps, plan, clause, 0, &mut bind, e.dep, out, room);
     };
     for plan in p.by_role.get(r).into_iter().flatten() {
         start(plan);
@@ -112,8 +113,9 @@ fn run(
     bind: &mut [u32; MAX_VARS],
     dep: DepSetId,
     out: &mut Vec<Firing>,
+    room: usize,
 ) {
-    if out.len() >= MAX_FIRINGS {
+    if out.len() >= room {
         return;
     }
     if step > 0
@@ -145,7 +147,7 @@ fn run(
             };
             if let Some(d) = found {
                 let dep = deps.union(dep, d);
-                run(g, deps, plan, clause, step + 1, bind, dep, out);
+                run(g, deps, plan, clause, step + 1, bind, dep, out, room);
             }
         }
         Step::Extend {
@@ -163,7 +165,7 @@ fn run(
                     if e.role == r && g.live(e.to) {
                         bind[to as usize] = e.to;
                         let dep = deps.union(dep, e.dep);
-                        run(g, deps, plan, clause, step + 1, bind, dep, out);
+                        run(g, deps, plan, clause, step + 1, bind, dep, out, room);
                     }
                 }
             } else {
@@ -171,7 +173,7 @@ fn run(
                     if e.role == r && g.live(e.from) {
                         bind[to as usize] = e.from;
                         let dep = deps.union(dep, e.dep);
-                        run(g, deps, plan, clause, step + 1, bind, dep, out);
+                        run(g, deps, plan, clause, step + 1, bind, dep, out, room);
                     }
                 }
             }
