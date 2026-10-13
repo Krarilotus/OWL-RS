@@ -355,7 +355,10 @@ fn readmitted_statements_behave_like_loaded_ones() {
     assert_eq!(open, std::slice::from_ref(&nothing));
     assert_eq!(
         quarantine
-            .discard(std::slice::from_ref(&nothing), Some("not ours".to_owned()))
+            .discard(
+                &[nothing.clone(), nothing.clone()],
+                Some("not ours".to_owned()),
+            )
             .unwrap(),
         1
     );
