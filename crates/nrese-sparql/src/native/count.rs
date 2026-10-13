@@ -770,6 +770,15 @@ impl Graph<'_> {
             .sum()
     }
 
+    /// The values `var` can take by its own patterns at most (their fewest matches),
+    /// infinite where it has none.
+    fn own_bound(&self, var: usize) -> f64 {
+        self.unary[var]
+            .iter()
+            .map(|&a| self.atoms[a].estimate as f64)
+            .fold(f64::INFINITY, f64::min)
+    }
+
     /// An edge's matches at most: its smallest pattern's.
     fn estimate(&self, edge: usize) -> f64 {
         self.edges[edge]
@@ -1222,8 +1231,35 @@ impl Context<'_> {
                 }
                 (Root::Edge(e), None) => {
                     let (x, y) = graph.ends(e);
-                    let wx = self.weights_at(&graph, &mut pending, x, Some(e), None, stats)?;
-                    let wy = self.weights_at(&graph, &mut pending, y, Some(e), None, stats)?;
+                    // The end with fewer values of its own first; the other solved for
+                    // their partners alone where that is cheaper than all of it.
+                    let (first, second) = match graph.own_bound(y) < graph.own_bound(x) {
+                        true => (y, x),
+                        false => (x, y),
+                    };
+                    let w1 = self.weights_at(&graph, &mut pending, first, Some(e), None, stats)?;
+                    let seed = match self.seeds(&graph, &w1, second, e) {
+                        true => Some(self.partners_of(
+                            &graph.atoms_of(e),
+                            &graph.vars[first],
+                            &w1,
+                            &graph.vars[second],
+                            stats,
+                        )?),
+                        false => None,
+                    };
+                    let w2 = self.weights_at(
+                        &graph,
+                        &mut pending,
+                        second,
+                        Some(e),
+                        seed.as_deref(),
+                        stats,
+                    )?;
+                    let (wx, wy) = match first == x {
+                        true => (w1, w2),
+                        false => (w2, w1),
+                    };
                     let total = self.drive(
                         &graph.atoms_of(e),
                         &graph.vars[x],
@@ -1336,6 +1372,11 @@ impl Context<'_> {
             let entries = self.walk(&graph.atoms[atom], &graph.vars[var], stats)?;
             factors.push(Weights::new(&self.budget, entries, 0)?);
         }
+        // The fewest values `var` already lists (its seed, its own patterns): a child whose
+        // subtree costs more than looking their partners up is solved for those alone.
+        let listing = (0..factors.len())
+            .filter(|&i| factors[i].default == 0)
+            .min_by_key(|&i| factors[i].entries.len());
         // Leaves (a child with nothing below and nothing hanging off it) send each value's
         // matches: deferred, so the large ones can be looked up for the values the others
         // list instead of walked whole.
@@ -1348,8 +1389,18 @@ impl Context<'_> {
                 leaves.push((child, e));
                 continue;
             }
-            let below = self.weights_at(graph, pending, child, Some(e), None, stats)?;
             let atoms = graph.atoms_of(e);
+            let seed = match listing {
+                Some(i) if self.seeds(graph, &factors[i], child, e) => Some(self.partners_of(
+                    &atoms,
+                    &graph.vars[var],
+                    &factors[i],
+                    &graph.vars[child],
+                    stats,
+                )?),
+                _ => None,
+            };
+            let below = self.weights_at(graph, pending, child, Some(e), seed.as_deref(), stats)?;
             factors.push(self.message(
                 &atoms,
                 &graph.vars[child],
@@ -1981,6 +2032,53 @@ impl Context<'_> {
             entries.extend(found);
         }
         Weights::new(&self.budget, entries, 0)
+    }
+
+    /// Whether the values `listing` gives a variable are few enough to solve its neighbour
+    /// `child` across `edge` for their partners alone: looking each up costs less than the
+    /// edge and what hangs below `child` read whole (the merge gate's index-join-keys: 25 K
+    /// values of a kind, and `link`'s 2.5 M subjects walked for them).
+    fn seeds(&self, graph: &Graph<'_>, listing: &Weights<'_>, child: usize, edge: usize) -> bool {
+        listing.default == 0
+            && (listing.entries.len() as f64) * PROBE_COST
+                < graph.estimate(edge) * WALK_COST + graph.cost_below(child, Some(edge))
+    }
+
+    /// The values of `to` that `atoms` pair with the values `listing` gives `from` a weight,
+    /// sorted and each once: the seed `to` is solved for.
+    fn partners_of(
+        &self,
+        atoms: &[&Atom],
+        from: &Variable,
+        listing: &Weights<'_>,
+        to: &Variable,
+        stats: &mut Stats,
+    ) -> Counted<Vec<u64>> {
+        let reader = self.reader();
+        let mut partners = Partners::new(reader, atoms.len());
+        let mut held = Reservation::new(&*self.budget);
+        let (mut out, mut values) = (Vec::new(), Vec::new());
+        for (n, &(value, weight)) in listing.entries.iter().enumerate() {
+            if n % CHECK_EVERY == 0 {
+                reader.check()?;
+            }
+            if weight == 0 {
+                continue;
+            }
+            if !partners.read(atoms, from, value, to, &mut values) {
+                return Err(Stop::Declined);
+            }
+            out.extend_from_slice(&values);
+            let bytes = (out.capacity() + values.capacity()) * 8;
+            if bytes > held.bytes() {
+                held.charge(bytes - held.bytes())
+                    .map_err(|e| Stop::Failed(QueryEvaluationError::MemoryLimit(e).into()))?;
+            }
+        }
+        stats.probed += listing.entries.len();
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
     }
 
     /// The product of two variables' weights: a value listed in one only takes the

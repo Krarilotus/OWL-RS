@@ -212,6 +212,18 @@ fn joins_are_counted_without_their_rows() {
         "{}",
         selective.detail
     );
+    // index-join-keys' shapes (the merge gate, 13 Oct: 9.4× slower than the index joins it
+    // replaced, 36× the allocations): 300 subjects of a kind, a chain of two `knows` from
+    // them, or towards them. The side with few values solves the other only for their
+    // partners: `knows` (3,000 subjects) is looked up, never walked whole.
+    for query in [
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s e:kind e:k1 . ?s e:knows ?x . ?x e:knows ?y }",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s e:label ?l . ?s e:knows ?x . ?x e:kind e:k1 }",
+    ] {
+        let chain = step(query);
+        let (walks, listed, _, _) = counted(&chain.detail);
+        assert!(walks == 1 && listed <= 1_200, "{query}: {}", chain.detail);
+    }
     // op-optional's shape (2.54× Virtuoso's time while its rows were made): COUNT(*) and
     // COUNT of a variable only an OPTIONAL binds, each counted (that OPTIONAL as a join for
     // the second), no row and no OPTIONAL evaluated.
