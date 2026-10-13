@@ -128,7 +128,7 @@ mod tests {
         })
         .unwrap();
         store
-            .execute_update_str(
+            .update_str_ungated(
                 "PREFIX : <urn:cache:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
              PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
              INSERT DATA { :A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] .
@@ -161,7 +161,7 @@ mod tests {
         let store = store(Duration::from_secs(30));
         let old = store.engine().snapshot();
         store
-            .execute_update_str("INSERT DATA { <urn:cache:b> a <urn:cache:A> }")
+            .update_str_ungated("INSERT DATA { <urn:cache:b> a <urn:cache:A> }")
             .unwrap();
         let current = store.engine().snapshot();
         assert!(old.revision() < current.revision());

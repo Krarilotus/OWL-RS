@@ -4,17 +4,11 @@ use std::path::{Path, PathBuf};
 use nrese_engine::{Engine, EngineConfig, ReadModel, TermId};
 use nrese_sparql::CancellationToken;
 
-use crate::backup::{
-    DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
-    export_dataset,
-};
+use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, export_dataset};
 use crate::bulk_load::{BulkLoadReport, BulkLoadRequest, bulk_load};
 use crate::config::{StoreConfig, StoreMode};
 use crate::error::StoreResult;
-use crate::graph_store::{
-    GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
-    GraphWriteRequest,
-};
+use crate::graph_store::{GraphReadRequest, GraphReadResult, GraphWriteReport, GraphWriteRequest};
 use crate::graph_store_executor::execute_graph_read;
 use crate::loader::preload_ontology;
 use crate::mutation::{MutationCommand, MutationCommitReport};
@@ -24,9 +18,10 @@ use crate::stats::{StoreStats, collect_stats};
 use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 
 /// The dataset and the operations on it. Reads run on an engine snapshot and never wait for
-/// writers. Production writes go through [`MutationPipeline`](crate::MutationPipeline),
-/// which adds the validation gates; the `execute_*` write methods here apply commands
-/// directly (tools, tests, bootstrapping).
+/// writers. Writes go through [`MutationPipeline`](crate::MutationPipeline), which gates
+/// them (access, reasoning, consistency, SHACL); the store has no public write that
+/// commits around it. Bulk loads, rematerialisation and a replica's log are operations of
+/// their own.
 #[derive(Clone)]
 pub struct StoreService {
     config: StoreConfig,
@@ -1241,8 +1236,10 @@ impl StoreService {
         self.settings.services.get().cloned()
     }
 
-    /// Applies and commits `command` for `requester` without validation gates.
-    pub fn apply(
+    /// Applies and commits `command` for `requester` without validation gates: only for the
+    /// store's own writes (its system graphs, scratch stores) and its unit tests. Every
+    /// other write goes through [`crate::MutationPipeline`].
+    pub(crate) fn apply_ungated(
         &self,
         command: &MutationCommand,
         requester: &crate::Requester,
@@ -1256,14 +1253,14 @@ impl StoreService {
         Ok(report.committed(summary.revision))
     }
 
-    // The writes below are the server's own and tests': every graph, no gates. Requests go
-    // through the mutation pipeline with their requester.
+    // The store's own writes, every graph, no gates (see `apply`). Everything else goes
+    // through the mutation pipeline, which has the same methods, gated.
 
-    pub fn execute_update(
+    pub(crate) fn update_ungated(
         &self,
         request: &SparqlUpdateRequest,
     ) -> StoreResult<UpdateExecutionReport> {
-        match self.apply(
+        match self.apply_ungated(
             &MutationCommand::Update(request.clone()),
             &crate::Requester::all(),
         )? {
@@ -1275,30 +1272,21 @@ impl StoreService {
         }
     }
 
-    pub fn execute_update_str(&self, update: &str) -> StoreResult<UpdateExecutionReport> {
-        self.execute_update(&SparqlUpdateRequest::new(update))
+    #[cfg(test)]
+    pub(crate) fn update_str_ungated(&self, update: &str) -> StoreResult<UpdateExecutionReport> {
+        self.update_ungated(&SparqlUpdateRequest::new(update))
     }
 
-    pub fn execute_graph_write(
+    pub(crate) fn graph_write_ungated(
         &self,
         request: &GraphWriteRequest,
     ) -> StoreResult<GraphWriteReport> {
-        match self.apply(
+        match self.apply_ungated(
             &MutationCommand::GraphWrite(request.clone()),
             &crate::Requester::all(),
         )? {
             MutationCommitReport::GraphWrite(report) => Ok(report),
             other => unreachable!("graph write produced {other:?}"),
-        }
-    }
-
-    pub fn execute_graph_delete(&self, target: &GraphTarget) -> StoreResult<GraphDeleteReport> {
-        match self.apply(
-            &MutationCommand::GraphDelete(target.clone()),
-            &crate::Requester::all(),
-        )? {
-            MutationCommitReport::GraphDelete(report) => Ok(report),
-            other => unreachable!("graph delete produced {other:?}"),
         }
     }
 
@@ -1583,19 +1571,6 @@ impl StoreService {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
-    }
-
-    pub fn restore_dataset(
-        &self,
-        request: &DatasetRestoreRequest,
-    ) -> StoreResult<DatasetRestoreReport> {
-        match self.apply(
-            &MutationCommand::Restore(request.clone()),
-            &crate::Requester::all(),
-        )? {
-            MutationCommitReport::Restore(report) => Ok(report),
-            other => unreachable!("restore produced {other:?}"),
-        }
     }
 }
 

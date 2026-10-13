@@ -10,7 +10,9 @@ use super::ticket::MutationTicket;
 use crate::config::{GateSeverity, ShaclGate};
 use crate::delta::MutationDeltaPreview;
 use crate::error::StoreError;
+use crate::graph_store::{GraphDeleteReport, GraphTarget, GraphWriteReport, GraphWriteRequest};
 use crate::service::StoreService;
+use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 
 /// The single owner of write semantics: plan → validate → claim → commit.
 ///
@@ -24,7 +26,12 @@ use crate::service::StoreService;
 ///
 /// Cost: O(delta) with reasoning disabled. With reasoner v2 (`rdfs`, `owl2-rl`) the delta
 /// executor maintains the inferred stack at a cost that follows the change (plus grounding
-/// against the TBox). The v1 reasoner reads the whole dataset as strings, O(dataset).
+/// against the TBox).
+///
+/// Every public write of the store comes here: the commands of the protocols, and
+/// [`MutationCommand::Delta`] for any other front-end ([`crate::DeltaPlanner`]). The
+/// store's own writes outside it are crate-private (its system graphs, scratch stores);
+/// bulk loads, rematerialisation and a replica's log are explicit operations of their own.
 #[derive(Debug)]
 pub struct MutationPipeline {
     store: Arc<StoreService>,
@@ -100,6 +107,58 @@ impl MutationPipeline {
     /// Whether [`Self::retire`] was called.
     pub fn is_retired(&self) -> bool {
         self.retired.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Applies `command` as the store's owner ([`crate::Requester::all`]: every graph)
+    /// through every gate, to the end (no ticket cancels it): what an embedding
+    /// application, a tool or a test writes with. A user's request goes through
+    /// [`Self::apply`] with its requester and ticket.
+    pub fn apply_as_owner(
+        &self,
+        command: MutationCommand,
+    ) -> Result<MutationCommitReport, MutationError> {
+        self.apply(command, &crate::Requester::all(), &MutationTicket::new())
+    }
+
+    /// A SPARQL update, as [`Self::apply_as_owner`].
+    pub fn execute_update(
+        &self,
+        request: &SparqlUpdateRequest,
+    ) -> Result<UpdateExecutionReport, MutationError> {
+        match self.apply_as_owner(MutationCommand::Update(request.clone()))? {
+            MutationCommitReport::Applied { revision } => Ok(UpdateExecutionReport {
+                applied: true,
+                revision,
+            }),
+            other => unreachable!("update produced {other:?}"),
+        }
+    }
+
+    /// [`Self::execute_update`] of the update's text.
+    pub fn execute_update_str(&self, update: &str) -> Result<UpdateExecutionReport, MutationError> {
+        self.execute_update(&SparqlUpdateRequest::new(update))
+    }
+
+    /// A Graph Store write, as [`Self::apply_as_owner`].
+    pub fn execute_graph_write(
+        &self,
+        request: &GraphWriteRequest,
+    ) -> Result<GraphWriteReport, MutationError> {
+        match self.apply_as_owner(MutationCommand::GraphWrite(request.clone()))? {
+            MutationCommitReport::GraphWrite(report) => Ok(report),
+            other => unreachable!("graph write produced {other:?}"),
+        }
+    }
+
+    /// A Graph Store delete, as [`Self::apply_as_owner`].
+    pub fn execute_graph_delete(
+        &self,
+        target: &GraphTarget,
+    ) -> Result<GraphDeleteReport, MutationError> {
+        match self.apply_as_owner(MutationCommand::GraphDelete(target.clone()))? {
+            MutationCommitReport::GraphDelete(report) => Ok(report),
+            other => unreachable!("graph delete produced {other:?}"),
+        }
     }
 
     /// Applies `command` for `requester` unless a gate rejects it or `ticket` is cancelled
