@@ -55,15 +55,29 @@ This section owns the execution policy; there is no setting for it besides `dl.t
   forks into Rayon's global pool and joins before it returns. There is no dedicated query
   pool and no catalog-wide CPU cap. Writers and liveness callbacks run on the caller, and
   `SERVICE` callbacks run inside evaluation, on whichever thread evaluates.
-- **The store's `Runtime` owns the native query budget.** A catalog and its system store
-  share one; each query and update `WHERE` reserves from it. Live native results keep
-  their reservation until they are dropped. `QueryOptions` and `UpdateOptions` carry one
-  `Resources`: the cancellation token, the memory limit, the shared budget and a
-  `Workers` handle (the current Rayon registry by default).
+- **The store's `Runtime` owns the catalog's budget.** A catalog and its system store
+  share one (`budgets.total_query_memory`).
+- **One envelope per request.** Each request (a query, an update, a DL entailment check or
+  explanation) gets one `nrese_exec::Envelope` within the catalog's budget, its limit the
+  request's own (a query's memory limit, `budgets.query_memory`; an update has none of its
+  own). Everything the request holds draws from it: each evaluation as a part counted on
+  its own (`Envelope::part`, whose rest its live result keeps), the DL bounds' retained
+  results and the gap, the DL engines' capacity (context saturation through its observer,
+  the hypertableau at its memory checks) and DL compilation scratch (the premise's copy,
+  the normalised clauses, the compiled program, the island batches;
+  [`nrese_dl::memory`](../../crates/nrese-dl/src/memory.rs)). `dl.memory` still bounds each
+  engine run inside it. `QueryOptions` and `UpdateOptions` carry the envelope in one
+  `Resources` beside the cancellation token and a `Workers` handle (the current Rayon
+  registry by default). A charge past it fails without charging, and the request ends with
+  its status, never the process: the memory-limit error (`413`, `503` where the catalog's
+  budget binds) or DL candidates unresolved because "the request's memory envelope ran
+  out" (`422` under `dl.answers = exact`). What its envelope limited is not published
+  beyond the request (`Budget::refused`: a revision's consistency verdict).
 - **One reservation type.** `nrese_exec::Reservation` returns its charge to its `Budget`
   when it drops, on every path including errors and unwinding. Query tables, retained
-  solution tables and their appended bound rows, the DL gap's scratch and the vector
-  collector's candidates use it; there is no second charge-on-drop mechanism.
+  solution tables and their appended bound rows, the DL gap's scratch, compilation
+  scratch and the vector collector's candidates use it; a `Gauge` is a reservation that
+  follows a DL engine's sampled capacity. There is no second charge-on-drop mechanism.
 - **`Workers` is the DL batch width.** DL classification, realisation and exact
   candidate batches take a `Workers` handle sized by `dl.threads` (0: every core;
   `Workers::new(n)` with `n` ≤ 1, or a pool that can't start, runs serially). A narrower
@@ -76,12 +90,18 @@ This section owns the execution policy; there is no setting for it besides `dl.t
   what remains from it rather than restarting a timeout, and checks the request's
   cancellation token at the same points. Tableau portfolio siblings share a child token
   that cannot cancel their request; the first decided outcome in input order is returned.
-- **What the budgets don't cover.** Accounted capacities are not process RSS or a strict
-  allocation ceiling: decoded graph payloads, encoder buffers, DL compilation scratch and
-  runtime overhead have their own lifetimes, and DL task capacity is separate from the
-  query budget. Rule materialisation, bulk spill and background storage keep their own
-  execution owners. Cache waits and their progress are discussed in
-  [research-designs.md §8](research-designs.md#8-query-progress-under-shared-cache-waits-proposal).
+- **What the envelopes don't cover.** Accounted capacities are not process RSS or a strict
+  allocation ceiling: they are capacity estimates (compilation's are checked against the
+  allocator, `nrese-dl/tests/scratch_memory.rs`), a stage's output is charged once it
+  exists, and decoded graph payloads, encoder buffers, the tableau's checkpoints and
+  runtime overhead are not counted. Work the store shares between requests keeps its own
+  owner: the revision's ontology, the bounds L and U1, classification and realisation
+  (cached per revision, under `dl.memory` and the process limit), rule materialisation,
+  bulk spill and background storage.
+- **A Rayon worker never waits on a cache flight.** A part another query computes is
+  waited for only off the pool; a request on a worker computes it itself, so no wait can
+  hold a stack its producer needs ([research-designs.md
+  §8](research-designs.md#8-query-progress-under-shared-cache-waits-decided-the-bounded-rule)).
 
 SPARQL's [`SolutionTable`](../../crates/nrese-sparql/src/native/typed_results.rs) retains
 its snapshot, computed terms and capacity reservations. Alignment rejects unrelated

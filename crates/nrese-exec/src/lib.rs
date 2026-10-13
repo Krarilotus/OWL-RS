@@ -11,7 +11,7 @@
 //! - [`graph`]: adjacency, strongly connected components, reachability and closures
 //!   (property paths, hierarchies)
 //! - [`classes`]: equivalence classes by union (`owl:sameAs` classes)
-//! - [`budget`]: per-query memory accounting
+//! - [`budget`]: memory accounting: the server's budget, each request's envelope, its parts
 //! - [`memory`]: the process's memory, and a watch for limits on long operations
 //! - [`heap`]: heap profiles by phase, for memory guards and profiles
 //! - [`sort`]: sorting and deduplicating id keys by radix over their significant bits
@@ -36,7 +36,7 @@ pub mod sort;
 pub mod table;
 pub mod workers;
 
-pub use budget::{Budget, BudgetExceeded, Reservation, SharedBudget};
+pub use budget::{Budget, BudgetExceeded, Envelope, Gauge, Reservation, SharedBudget};
 pub use join::RowLimit;
 pub use table::IdTable;
 

@@ -5,22 +5,25 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
 /// One engine's observations: the capacity the engine itself holds (program, arena,
-/// registry, cores, inputs and results) and the latest sum of its contexts' publications.
+/// registry, cores, inputs and results) and the latest sum of its contexts' publications,
+/// reserved from the request's envelope where there is one.
 #[derive(Debug)]
 pub(super) struct Observer {
     limit: usize,
     owned: AtomicUsize,
     contexts: AtomicUsize,
     peak: AtomicUsize,
+    envelope: Option<nrese_exec::Gauge<nrese_exec::Envelope>>,
 }
 
 impl Observer {
-    pub fn new(limit: usize) -> Self {
+    pub fn new(limit: usize, envelope: Option<nrese_exec::Envelope>) -> Self {
         Self {
             limit,
             owned: AtomicUsize::new(0),
             contexts: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            envelope: envelope.map(nrese_exec::Gauge::new),
         }
     }
 
@@ -51,6 +54,10 @@ impl Observer {
         let used = self.used();
         self.peak.fetch_max(used, Relaxed);
         used <= self.limit
+            && self
+                .envelope
+                .as_ref()
+                .is_none_or(|envelope| envelope.follow(used))
     }
 }
 
@@ -134,7 +141,7 @@ mod tests {
 
     #[test]
     fn owned_capacity_and_context_samples_share_the_envelope() {
-        let observer = Observer::new(100);
+        let observer = Observer::new(100, None);
         assert!(observer.own(20, 0));
         assert!(observer.sample(70));
         assert_eq!((observer.used(), observer.peak()), (90, 90));

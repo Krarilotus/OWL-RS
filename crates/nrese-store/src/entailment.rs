@@ -326,7 +326,7 @@ impl StoreService {
         }
         let snapshot = self.engine().snapshot();
         let premise = source::read_snapshot(&snapshot);
-        let budget = gate::budget(self, None);
+        let budget = gate::budget(self, None, &self.envelope(None));
         let checked = consistency::check(&premise, &budget);
         if checked.verdict != Verdict::Consistent {
             let answer = match &checked.verdict {

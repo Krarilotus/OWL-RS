@@ -22,13 +22,13 @@ each with its run record.
 |---|---|---|
 | QL preparation and cache identity | One preparation per execution snapshot, its report kept with the result; compiler input identified by the exact schema; failed probes never cached as negative answers | Schema reading and rewriting don't poll cancellation |
 | Cancellation and deadlines | A request's flag reaches nested DL work; one absolute deadline covers pending and prior consistency checks and rejection evidence | Normalisation and compilation don't poll |
-| Execution | Queries run on their caller; parallel kernels on Rayon's global pool; one catalog-wide native query budget; `Workers` sets only the DL batch width; one RAII reservation type | Query progress when a Rayon worker would wait on a cache flight ([proposal](design/research-designs.md#8-query-progress-under-shared-cache-waits-proposal)) |
-| Context task memory | Optional owner-based capacity estimates sampled at work checkpoints, incremental index totals, message payloads that carry their charge; `dl.memory = 0` is unlimited | Can overshoot; excluded allocations; no whole-operation envelope |
+| Execution | Queries run on their caller; parallel kernels on Rayon's global pool; one catalog-wide native query budget; `Workers` sets only the DL batch width; one RAII reservation type; a Rayon worker never waits on a cache flight, it computes the part itself (the bounded rule, [decided](design/research-designs.md#8-query-progress-under-shared-cache-waits-decided-the-bounded-rule) 12 October) | The continuation design, only if embedding needs it |
+| Context task memory | Optional owner-based capacity estimates sampled at work checkpoints, incremental index totals, message payloads that carry their charge; `dl.memory = 0` is unlimited; within a request, reserved from its envelope | Can overshoot; excluded allocations |
 | Atomic reasoning updates | Split and revival closure run in the pending transaction and its gates; the post-commit repair is gone | The whole-dataset fallback holds the writer slot (unmeasured; `eq-giant-split` times it); incremental split maintenance |
 | Kernels and allocation | Moving projection, shared forward search, direct raw spill, ordered dedup without a sort; one SPARQL numeric implementation | Work and copy savings carry no end-to-end timing claim |
-| DL bounds and exact work | ID-level results with dictionary checks; a true lower ASK skips the upper evaluation; one compiled program per candidate batch | Base search and compilation repeated between batches; the upper table is materialised; no whole-request memory ceiling |
+| DL bounds and exact work | ID-level results with dictionary checks; a true lower ASK skips the upper evaluation; one compiled program per candidate batch; the bounds, the gap, compilation scratch and the engines in the request's one envelope | Base search and compilation repeated between batches; the upper table is materialised |
 | DL classification and realisation | The initial search kept as Base; one fallback allowance; realisation reuses the deterministic start; only complete results cached | Stages compile separately; cooperative checkpoints; partial aggregate counters |
-| Process memory | The server installs the process limit; store-local watches reach bounds and diagnostics | Cooperative only; task capacity and process memory are separate contracts |
+| Process memory | The server installs the process limit; store-local watches reach bounds and diagnostics; one envelope per request within the catalog's budget (queries, updates and their DL gate, DL entailment and explanations) | Cooperative only; a request's envelope and process memory are separate contracts; classification and realisation (shared per revision) are under `dl.memory` and the process limit, not a request's envelope |
 | Benchmarks | Fast suite with exact counters and QPS per width; [hosts.toml](../benches/hosts.toml); one run-record schema; the answer recorder (strict and value matches, legal `LIMIT` subsets) | One case registry, one result row and one `compare` ([benches/README.md](../benches/README.md#where-this-stands)); checkpointed level-3 chunks |
 
 ### Open work
@@ -36,13 +36,18 @@ each with its run record.
 - **Performance acceptance against `0f46563`:** Horn context saturation is about 6 %
   slower, serial and at 16 threads, with the retained accounting; there is no 95-case
   matrix of the final revision ([run record](../benches/runs/2026-10-11-horn-recovery.toml)).
-- **Resource ownership in `nrese-dl`:** `context::Engine::with_budget` after contexts exist
-  doesn't rebuild accounting; detached `Individuals` keep their original owner; public
-  mutation of `Individuals.contexts` isn't tracked. Retained results, changed policy,
-  historical peaks and sticky exhaustion need an API contract first.
-- **Memory envelope:** DL compilation scratch, task budgets and the query budget are
-  separate; one request has no shared end-to-end envelope.
-- **Query progress:** see the proposal above; a decision is needed.
+- **Resource ownership in `nrese-dl`:** the envelope needed and has: an engine's budget is
+  an owned value (no longer `Copy`), its observer and the tableau reserve from the request's
+  envelope and return it when the engine drops, and exhaustion stays sticky per engine (an
+  envelope's refusal included). `context::Engine::with_budget` no longer exists. Open:
+  detached `Individuals` keep their original owner; public mutation of
+  `Individuals.contexts` isn't tracked; a result retained beyond its request keeps its
+  engine's reservation (request-scoped saturations are dropped at the request's end;
+  cached classification runs without an envelope); changed policy and historical peaks
+  need an API contract first.
+- **Performance acceptance of v1.5's robustness:** the A-B-B-A `fast.py compare` of the
+  envelope and the bounded rule on the affected cases (queued on office-pc; lab log, 12
+  October).
 - **Vector search:** the filtered search that goes first widens its beam by the joined
   pattern's share (12 October): `vector-knn-filtered`'s recall 0.56 → 0.98, its gate passes
   ([record](../benches/runs/2026-10-12-vector-filtered-fix-phuoc.toml)). On its uniform 64-d

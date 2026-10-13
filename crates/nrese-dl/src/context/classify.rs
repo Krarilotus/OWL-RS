@@ -16,7 +16,7 @@ use super::profile::Profile;
 use super::state::{ClauseRef, ContextId, Rule};
 
 /// How to classify.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
     /// Workers of the saturation; 1 runs it on the calling thread.
     pub threads: usize,
@@ -140,6 +140,15 @@ pub fn saturate_with_workers(
     let started = Instant::now();
     let normalised = normalise_with(ontology, options.normalise);
     let normalise = started.elapsed();
+    // The clauses are the request's compilation scratch until the saturation ends (the
+    // compiled program is the engine's, which its observer holds).
+    let mut scratch = crate::memory::Scratch::new(options.budget.memory.as_ref());
+    if scratch
+        .charge(|| crate::memory::normalised_bytes(&normalised))
+        .is_err()
+    {
+        return Err(Unsupported::Budget);
+    }
     let classes = signature(ontology);
     let mut saturated = saturate_normalised(&normalised, &classes, options, cancel, workers)?;
     saturated.profile.normalise = normalise;
@@ -175,9 +184,14 @@ pub fn saturate_normalised(
     let started = Instant::now();
     let Compiled { program, abox, .. } = compiled;
     let named = program.named();
-    let engine = Engine::new(program, options.strategy, options.proofs, options.budget)
-        .with_cancel(cancel)
-        .with_prune_pred(options.prune_pred);
+    let engine = Engine::new(
+        program,
+        options.strategy,
+        options.proofs,
+        options.budget.clone(),
+    )
+    .with_cancel(cancel)
+    .with_prune_pred(options.prune_pred);
     let mut held = 0;
     if engine.observing() {
         engine.hold(&mut held, abox.bytes());
