@@ -181,10 +181,21 @@ fn joins_are_counted_without_their_rows() {
         plan.into_iter().nth(at).unwrap()
     };
     // Query 4's shape: 9,000 rows.
+    // Its two walks' groups multiplied part by part, none listed (Sparqloscope 012 and 013
+    // listed 66.5 and 82.8 M weights first).
     let star = step("SELECT (COUNT(*) AS ?n) WHERE { ?s e:knows ?o1 . ?s e:label ?o2 }");
     let (walks, listed, pairs, read) = counted(&star.detail);
-    assert_eq!((walks, pairs, read), (2, 0, 0), "{}", star.detail);
-    assert!(listed <= 6_000, "{}", star.detail);
+    assert_eq!(
+        (walks, listed, pairs, read),
+        (2, 0, 0, 0),
+        "{}",
+        star.detail
+    );
+    assert!(
+        star.detail.contains(" 6000 groups streamed"),
+        "{}",
+        star.detail
+    );
     // Query 19's shape: 27,000 rows.
     let chain = step(
         "SELECT (COUNT(*) AS ?n) WHERE { ?a e:kind ?k . ?a e:knows ?b OPTIONAL { ?b e:knows ?c } }",
@@ -311,9 +322,10 @@ fn a_counted_join_holds_its_values_not_its_rows() {
         "{:#?}",
         explained.steps
     );
-    // What EXPLAIN reports as held: the weights of 1,000 subjects, under the budget.
+    // What EXPLAIN reports as held: the groups of one part of the subjects at a time, under
+    // the budget.
     assert!(
-        (16_000..1 << 20).contains(&explained.memory_peak_bytes),
+        (1..1 << 20).contains(&explained.memory_peak_bytes),
         "{}",
         explained.memory_peak_bytes
     );
