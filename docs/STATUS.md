@@ -149,8 +149,11 @@ follow from their rules); nothing is assumed.
   read, and decided by grounding the instances the DL part's models break. ORE: 714
   consistent (a certified model satisfying its 8 rules; HermiT and Konclude fail on it);
   237 and seven like it inconsistent by their DL part, each with a four-axiom
-  justification; 20 of the 22 decided. Undecided, with why: 13129 (an ill-typed literal,
-  §5.7), 10860 (SWRLTab's `abox:hasClass`, not a SWRL built-in).
+  justification; 10860 inconsistent with 7 instances of its rules (its one rule with
+  SWRLTab's `abox:hasClass`, not a SWRL built-in, left out and named). Consistency decided
+  for 21 of the 22 (12 consistent, 9 inconsistent), classification exact for 20 (12451:
+  sound, its refinement's budget leaves pairs open). Undecided, with why: 13129 (an
+  ill-typed literal, §5.7).
 - *Repairs:* a disjointness repeating an operand reads as that operand being empty (it
   was deduplicated into nothing: a wrong "consistent" on four W3C tests); SQWRL queries
   assert nothing; as before, a property typed by its use.
