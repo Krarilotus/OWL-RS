@@ -186,9 +186,12 @@ def scope_argv(unit: str, memory: str) -> list[str]:
     systemd reads with upper-case units only. At the cap the kernel kills the command alone
     (exit 137, as in a container), not systemd the whole scope, so what runs after it in the
     scope (fast's wrapper) can still read the peak. The rootfs runtime and fast's native
-    runtime share it."""
-    return ["systemd-run", "--user", "--scope", "-q", f"--unit={unit}", "-p", f"MemoryMax={memory.upper()}",
-            "-p", "MemorySwapMax=0", "-p", "OOMPolicy=continue", "--"]
+    runtime share it. Under the fleet the scope joins the step's slice (FLEET_SLICE, the kit
+    rule after the whole-host OOM of 14 Oct 2026), so the step's own cap holds it too; where
+    no fleet sets one, the user's default slice, as before."""
+    slice_ = [f"--slice={os.environ['FLEET_SLICE']}"] if os.environ.get("FLEET_SLICE") else []
+    return ["systemd-run", "--user", "--scope", "-q", *slice_, f"--unit={unit}",
+            "-p", f"MemoryMax={memory.upper()}", "-p", "MemorySwapMax=0", "-p", "OOMPolicy=continue", "--"]
 
 
 class ScopePeak:
