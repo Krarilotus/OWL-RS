@@ -25,7 +25,7 @@ fn an_unconsumed_result_keeps_its_shared_capacity_until_drop() {
     let shared = SharedBudget::new(1 << 20);
     let options = QueryOptions {
         resources: Resources {
-            shared_memory: Some(shared.clone()),
+            memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
             ..Default::default()
         },
         ..QueryOptions::default()
@@ -67,7 +67,7 @@ fn graph_results_keep_shared_capacity_through_conversion_and_early_drop() {
         let shared = SharedBudget::new(1 << 20);
         let options = QueryOptions {
             resources: Resources {
-                shared_memory: Some(shared.clone()),
+                memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
                 ..Default::default()
             },
             ..Default::default()
@@ -114,7 +114,7 @@ fn update_where_uses_shared_capacity_and_reads_earlier_operations() {
         let shared = SharedBudget::new(bytes);
         let options = UpdateOptions {
             resources: Resources {
-                shared_memory: Some(shared.clone()),
+                memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
                 ..Default::default()
             },
             ..UpdateOptions::default()
@@ -185,7 +185,7 @@ fn encoding_widths_preserve_direct_output_and_caller_owned_writers() {
                 let options = QueryOptions {
                     resources: Resources {
                         workers,
-                        shared_memory: Some(shared.clone()),
+                        memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
                         ..Default::default()
                     },
                     ..QueryOptions::default()

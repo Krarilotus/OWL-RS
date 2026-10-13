@@ -927,17 +927,40 @@ their duration.
 - *The tableau* checks the capacity it owns; a batch divides the allowance among the
   probes actually running.
 
+**The request's envelope.** Within a request (a query's exact services and its
+consistency check, a commit's gate, an entailment check, an explanation) both engines
+also reserve what they observe from the request's one memory envelope
+([execution-core.md](execution-core.md#execution-and-resource-lifetime)): context
+saturation through its observer (`context::Budget::memory`), the tableau at its memory
+checks (`tableau::Config::memory`), shared by a batch's probes, a portfolio's variants and
+the islands. Compiling reserves its scratch there too ([`nrese_dl::memory`](../../crates/nrese-dl/src/memory.rs)):
+a premise's copy before it is made, the normalised clauses, the compiled program and the
+island batches as each exists, estimated by capacity (within 0.1 % of the allocator on the
+guard's ABox, `tests/scratch_memory.rs`). Where the envelope has no room the run stops as
+past `dl.memory`, its candidates unresolved because "the request's memory envelope ran
+out"; a verdict so limited isn't recorded for the revision. `dl.memory` bounds each run
+inside the envelope. Classification and realisation, cached per revision and shared by
+the lower bound, aren't a request's: they keep `dl.memory` and the process limit.
+
 Exhaustion yields an incomplete outcome, never a classification inferred from truncated
 work. Retained classification buffers are charged; result and proof assembly,
-normalisation and compilation temporaries, input snapshots, short-lived recursive
-temporaries, allocator metadata and stacks are not. DL task capacity is separate from the
-native query budget, so one request has no shared end-to-end envelope. `0` disables the
-checks; the standalone context API defaults to none. The profile's `task_memory_peak` is
-the highest sampled estimate (zero when disabled), neither RSS nor an exact peak.
+short-lived recursive temporaries, the tableau's checkpoints, allocator metadata and
+stacks are not. `0` disables the `dl.memory` checks; the standalone context API defaults to
+none. The profile's `task_memory_peak` is the highest sampled estimate (zero when nothing
+is observed), neither RSS nor an exact peak.
 
 `Budget::max_memory` in the context core measures the **whole process** and is a separate
 opt-in guard; who installs the process limit and which watches reach DL work is in
 [config-reference.md](../ops/config-reference.md#budgets).
+
+**No built-in budget.** Every budget of the engines and drivers is a setting
+([`nrese_dl::limits`](../../crates/nrese-dl/src/limits.rs)), unlimited where nobody set
+it: the engines' own defaults are none, the store's are the table's, each with its reason
+in [config-reference.md](../ops/config-reference.md). A run that reaches one says which
+(`dl.max_nodes reached (…)`). A comparison gives NRESE the limits every system gets, the
+task's time and the envelope's memory (`dl_classify --timeout --memory-mib`), nothing
+tighter. The guard is `tests/tableau/limits.rs`: the defaults set none, each budget names
+its setting when reached, and no literal budget is in the sources.
 
 The settings; `dl.race`, `dl.cache`, `dl.fallback.*`, `dl.explanations` and `async`
 consistency are designed, not yet settings.
@@ -947,7 +970,9 @@ consistency are designed, not yet settings.
 | `reasoner.mode` | … `owl2-dl` | — |
 | `dl.answers` | `certain-where-complete`, `sound`, `exact` | `certain-where-complete` |
 | `dl.consistency` | `inline`, `async`, `off` | `inline` |
-| `dl.timeout`, `dl.memory` | per operation | 30 min, 4 GiB |
+| `dl.timeout`, `dl.memory` | per operation; 0 or `unlimited`: none | 30 min, none (the request's envelope) |
+| `dl.max_candidates`, `dl.max_nodes`, `dl.max_branch_points`, `dl.max_merges`, `dl.explanation_tests` | counts; 0 or `unlimited`: none | 1000, then none |
+| `dl.lower_bound_timeout`, `dl.max_join`, `dl.max_join_steps` | route thresholds (past them the hypertableau decides) | 60 s, 2^20, 2^16 |
 | `dl.fallback.clauses`, `dl.fallback.equalities`, `dl.fallback.contexts` | budgets of §4 | from the ORE and Oxford runs |
 | `dl.race` | `on`, `off` | `on` above a module size |
 | `dl.threads` | batch width; 0: every core | 0 |

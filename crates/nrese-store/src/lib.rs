@@ -25,6 +25,7 @@ pub mod jobs;
 mod loader;
 pub mod mutation;
 pub mod namespaces;
+pub mod quarantine;
 pub mod query;
 mod query_executor;
 mod rdf_io;
@@ -82,6 +83,10 @@ pub use nrese_engine::{EngineError, IndexEncoding, ReadModel, VocabularyEncoding
 pub use nrese_shacl::{ValidationReport, ValidationResult};
 pub use nrese_sparql::{
     CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,
+};
+pub use quarantine::{
+    EntryState, InvalidStatements, Outcome, Quarantine, QuarantineFilter, QuarantineItem,
+    QuarantinedStatement, Readmission, Repair, Resolution, readmit,
 };
 pub use query::{
     GraphResultFormat, QueryResultKind, SerializedQueryResult, SolutionsResultFormat,

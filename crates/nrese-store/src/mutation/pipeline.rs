@@ -213,8 +213,10 @@ impl MutationPipeline {
         if ticket.is_cancelled() {
             return Err(MutationError::Cancelled);
         }
+        // The request's one envelope: its WHERE clauses and its DL gate draw from it.
+        let envelope = self.store.envelope(None);
         let context = crate::mutation::command::UpdateContext {
-            runtime: self.store.runtime(),
+            memory: envelope.clone(),
             cancellation: ticket.evaluation_token(),
             union_default_graph: self.store.config().union_default_graph,
             geosparql_stated_only: self.store.config().geosparql_stated_only,
@@ -318,6 +320,7 @@ impl MutationPipeline {
                     &stop,
                     &mut bounds,
                     &requester.read,
+                    &envelope,
                 );
                 (gate, bounds)
             });

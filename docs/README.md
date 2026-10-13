@@ -30,6 +30,7 @@ list wins and the lower one is corrected in the same change.
 | [ql-rewriting.md](design/ql-rewriting.md) | OWL 2 QL answers through existentials: tree-witness rewriting over the closure, and the completeness each answer reports |
 | [owl2-dl.md](design/owl2-dl.md), [owl2-dl-performance.md](design/owl2-dl-performance.md) | the OWL 2 DL engines and their performance plan |
 | [shacl.md](design/shacl.md) | SHACL compilation and validation |
+| [quarantine.md](design/quarantine.md) | what bulk loads do with statements they can't read: the quarantine, its resolution, the API |
 | [rdf-bundle.md](design/rdf-bundle.md) | NRESE's own RDF, SPARQL-syntax and XSD crates |
 | [research-designs.md](design/research-designs.md) | equality, vectors, compression, graph access, transactions: what the research of 2 October decided; the query-progress proposal (§8) |
 | [hardware-and-scaling.md](design/hardware-and-scaling.md) | using the hardware, scaling out, integration interfaces |

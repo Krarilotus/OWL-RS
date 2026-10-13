@@ -24,12 +24,12 @@ fn nested_islands_share_the_owner_and_partition_only_concurrent_capacity() {
     let physical = Workers::new(4);
     // allowance, batches, capacity, child allowance, child capacity
     for (allowance, count, memory, child_width, child_memory) in [
-        (1, 5, 1, 1, 1),
-        (2, 5, 1, 1, 0),
-        (2, 5, 101, 1, 50),
-        (4, 2, usize::MAX, 2, usize::MAX),
-        (4, 2, 101, 2, 50),
-        (4, 1, 101, 2, 101),
+        (1, 5, Some(1), 1, Some(1)),
+        (2, 5, Some(1), 1, Some(0)),
+        (2, 5, Some(101), 1, Some(50)),
+        (4, 2, None, 2, None),
+        (4, 2, Some(101), 2, Some(50)),
+        (4, 1, Some(101), 2, Some(101)),
     ] {
         let workers = physical.limited(allowance);
         let config = Config {

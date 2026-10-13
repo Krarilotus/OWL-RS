@@ -15,11 +15,10 @@ pub struct Resources {
     /// Checked by the evaluator while it runs; the transport layer cancels it at the
     /// request deadline.
     pub cancellation: Option<CancellationToken>,
-    /// Bytes of intermediate results the native executor may hold; `None` is unlimited.
-    pub memory_limit: Option<usize>,
-    /// The server's budget for all running queries together, which this query's memory
-    /// counts against as well.
-    pub shared_memory: Option<std::sync::Arc<nrese_exec::SharedBudget>>,
+    /// The request's memory envelope (within the server's budget for all requests): each
+    /// evaluation's intermediate and retained results draw from it, beside whatever else
+    /// the request holds. Unlimited by default.
+    pub memory: nrese_exec::Envelope,
     /// The width of parallel kernels and result encoding; the work stays on the caller.
     pub workers: nrese_exec::workers::Workers,
 }
