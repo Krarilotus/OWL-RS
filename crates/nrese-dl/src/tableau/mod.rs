@@ -116,6 +116,10 @@ pub struct Config {
     pub deadline: Option<Instant>,
     /// The most memory a run may hold (its tables, indexes and arenas), in bytes.
     pub max_memory: usize,
+    /// The request's memory envelope: what a run holds is reserved from it as it grows
+    /// (shared by the runs of a batch, a portfolio or islands), and a run it has no room
+    /// for gives up as past `max_memory`. `None`: only `max_memory` bounds a run.
+    pub memory: Option<nrese_exec::Envelope>,
     /// Keep the model a consistent run found ([`Outcome::model`]).
     pub keep_model: bool,
     /// `≤ n` up to this `n` is spelled out in clauses; above it, at-most atoms
@@ -162,6 +166,7 @@ impl Default for Config {
             timeout: None,
             deadline: None,
             max_memory: 4 << 30,
+            memory: None,
             keep_model: false,
             lazy_definitions: true,
             complements: true,
@@ -295,15 +300,36 @@ pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
         complements: config.complements && !config.keep_model,
         exact_provenance: false,
     };
-    if !config.lazy_definitions || config.keep_model {
-        let plain = normalise_with(&ontology, options(false));
-        return consistency_of(&ontology, &plain, config);
+    // The request's compilation scratch, held until the runs end: its copy of the
+    // ontology, where preparing made one, and the clauses.
+    let mut scratch = crate::memory::Scratch::new(config.memory.as_ref());
+    let copied = || match &ontology {
+        std::borrow::Cow::Owned(copy) => crate::memory::ontology_bytes(copy),
+        std::borrow::Cow::Borrowed(_) => 0,
+    };
+    if scratch.charge(copied).is_err() {
+        return Outcome::stopped(crate::memory::EXHAUSTED);
     }
-    let unfolded = normalise_with(&ontology, options(true));
+    let mut normalise = |lazy_definitions| {
+        let normalised = normalise_with(&ontology, options(lazy_definitions));
+        let bytes = || crate::memory::normalised_bytes(&normalised);
+        scratch.charge(bytes).is_ok().then_some(normalised)
+    };
+    if !config.lazy_definitions || config.keep_model {
+        return match normalise(false) {
+            Some(plain) => consistency_of(&ontology, &plain, config),
+            None => Outcome::stopped(crate::memory::EXHAUSTED),
+        };
+    }
+    let Some(unfolded) = normalise(true) else {
+        return Outcome::stopped(crate::memory::EXHAUSTED);
+    };
     if unfolded.unfolded == 0 || !config.portfolio {
         return consistency_of(&ontology, &unfolded, config);
     }
-    let plain = normalise_with(&ontology, options(false));
+    let Some(plain) = normalise(false) else {
+        return Outcome::stopped(crate::memory::EXHAUSTED);
+    };
     let workers = budget::workers(config, 2);
     if workers.width() < 2 {
         return consistency_of(&ontology, &plain, config);
@@ -423,6 +449,11 @@ fn run(
     let mut program = Program::compile(ontology, normalised);
     let test = test.map(|c| program.concept(ConceptName::Clause(c)));
     program.ensure_tables();
+    // The program is the run's compilation scratch, held from the request's envelope.
+    let mut scratch = crate::memory::Scratch::new(config.memory.as_ref());
+    if scratch.charge(|| program.bytes()).is_err() {
+        return Outcome::stopped(crate::memory::EXHAUSTED);
+    }
     let compiled = started.elapsed();
     let features = features(&program);
     let mut engine = Engine::new(&program, config);

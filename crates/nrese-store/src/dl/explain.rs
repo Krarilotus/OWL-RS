@@ -246,6 +246,12 @@ impl crate::StoreService {
         let [s, p, o] = statement.map(|t| snapshot.lookup(t).map(TermId::raw));
         let (s, p, o) = (s?, p?, o?);
         let base = super::query::ontology_at(self, &snapshot);
+        // The request's envelope: its copy of the premise, and the tests' engines.
+        let memory = self.envelope(None);
+        let mut scratch = nrese_dl::memory::Scratch::new(Some(&memory));
+        scratch
+            .charge(|| nrese_dl::memory::ontology_bytes(&base))
+            .ok()?;
         let mut ontology = (*base).clone();
         let ids = super::query::Ids::of(&snapshot);
         let axiom = super::query::ground_axiom(&mut ontology, &snapshot, [s, p, o], ids).ok()?;
@@ -269,7 +275,7 @@ impl crate::StoreService {
                 &ontology,
                 &Goal::Entails(axiom),
                 &fresh,
-                &super::gate::budget(self, Some(cancel)),
+                &super::gate::budget(self, Some(cancel), &memory),
                 deadline,
             )
         })?;
@@ -303,7 +309,11 @@ mod tests {
         ontology.sources.push(Vec::new());
         for stop in ["cancelled", "deadline", "tests"] {
             let cancel = Cancel::default();
-            let budget = super::super::gate::budget(&store, Some(cancel.clone()));
+            let budget = super::super::gate::budget(
+                &store,
+                Some(cancel.clone()),
+                &nrese_exec::Envelope::unlimited(),
+            );
             let mut search = Search {
                 ontology: &ontology,
                 goal: &Goal::Inconsistent,

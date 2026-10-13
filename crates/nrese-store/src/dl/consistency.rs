@@ -49,7 +49,11 @@ pub struct Checked {
 #[derive(Debug, Clone)]
 pub struct Budget {
     pub timeout: Duration,
+    /// What one engine run may hold (`dl.memory`, shared among a batch's workers).
     pub memory_bytes: usize,
+    /// The request's envelope, which the runs' capacity and their compilation scratch
+    /// draw from as well ([`nrese_dl::memory`]); `None`: `memory_bytes` alone.
+    pub memory: Option<nrese_exec::Envelope>,
     /// The operation's allowance within its physical owner.
     pub workers: Workers,
     /// Stops the context core and hypertableau at their next budget check.
@@ -132,6 +136,7 @@ fn tableau_config(budget: &Budget) -> tableau::Config {
     tableau::Config {
         timeout: Some(budget.timeout),
         max_memory: budget.memory_bytes,
+        memory: budget.memory.clone(),
         max_nodes: budget.max_nodes,
         max_branch_points: Some(budget.max_branch_points),
         cancel: budget.cancel.clone(),
@@ -166,6 +171,7 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
             deadline: Some(deadline),
             max_join: Some(MAX_JOIN),
             task_memory: (budget.memory_bytes != usize::MAX).then_some(budget.memory_bytes),
+            memory: budget.memory.clone(),
             ..nrese_dl::context::Budget::default()
         },
         ..nrese_dl::context::Options::default()
@@ -215,6 +221,7 @@ mod tests {
         Budget {
             timeout: Duration::from_secs(10),
             memory_bytes: usize::MAX,
+            memory: None,
             workers: Workers::serial(),
             cancel: None,
             max_nodes: 10_000,

@@ -7,6 +7,7 @@ fn budget() -> Budget {
         workers: nrese_exec::workers::Workers::serial(),
         timeout: Duration::from_secs(10),
         memory_bytes: usize::MAX,
+        memory: None,
         cancel: None,
         max_nodes: 10_000,
         max_branch_points: 10_000,
@@ -48,7 +49,7 @@ fn one_program_matches_independent_reductions_without_leaking_assumptions() {
         })
         .collect();
     COMPILATIONS.set(0);
-    let compiled = Batch::new(&mut o, &tests);
+    let compiled = Batch::new(&mut o, &tests, None);
     assert!(
         compiled.prepared.is_some(),
         "one compiled input for the whole batch"
@@ -80,7 +81,7 @@ fn cancellation_and_fresh_class_name_collisions_stay_local() {
         Test::Axiom(Axiom::ClassAssertion(c, 1)),
         Test::Axiom(Axiom::ClassAssertion(c, 2)),
     ];
-    let compiled = Batch::new(&mut o, &tests);
+    let compiled = Batch::new(&mut o, &tests, None);
     let token = nrese_sparql::CancellationToken::new();
     let mut cancelled = budget();
     cancelled.cancel = Some(tableau::Cancel::from_flag(token.flag()));
@@ -105,7 +106,7 @@ fn transitive_role_values_use_the_existing_non_simple_role_normalisation() {
         Test::Axiom(Axiom::ObjectPropertyAssertion(7, 1, 3)),
         Test::Axiom(Axiom::ObjectPropertyAssertion(7, 3, 1)),
     ];
-    let compiled = Batch::new(&mut o, &tests);
+    let compiled = Batch::new(&mut o, &tests, None);
     assert_eq!(
         compiled.check(0, &tests[0], &o, &[], &budget()),
         Entailed::Yes

@@ -80,12 +80,18 @@ pub(super) fn cancellable<T>(
     })
 }
 
-/// The budget of a check under `store`'s settings.
-pub(crate) fn budget(store: &StoreService, cancel: Option<Cancel>) -> Budget {
+/// The budget of a check under `store`'s settings, drawing from the request's envelope
+/// `memory`.
+pub(crate) fn budget(
+    store: &StoreService,
+    cancel: Option<Cancel>,
+    memory: &nrese_exec::Envelope,
+) -> Budget {
     let dl = &store.config().dl;
     Budget {
         timeout: dl.timeout,
         memory_bytes: dl.memory_per_worker(1),
+        memory: Some(memory.clone()),
         workers: nrese_exec::workers::Workers::current().limited(dl.threads),
         cancel,
         max_nodes: dl.max_nodes,
@@ -103,6 +109,7 @@ pub(crate) fn check_commit(
     cancelled: &(dyn Fn() -> bool + Sync),
     preparation: &mut super::bounds::Preparation,
     reader: &crate::ReadScope,
+    memory: &nrese_exec::Envelope,
 ) -> Gate {
     let deadline = Instant::now() + store.config().dl.timeout;
     if store.config().dl.consistency == DlConsistency::Off {
@@ -133,7 +140,7 @@ pub(crate) fn check_commit(
             tx,
             preparation,
             reader,
-            &budget(store, Some(cancel)),
+            &budget(store, Some(cancel), memory),
             deadline,
         )
     })
@@ -317,7 +324,11 @@ mod tests {
     fn nested_checks_share_remaining_time_and_cancellation() {
         let store = StoreService::new(crate::StoreConfig::in_memory()).unwrap();
         let cancel = Cancel::default();
-        let mut base = budget(&store, Some(cancel.clone()));
+        let mut base = budget(
+            &store,
+            Some(cancel.clone()),
+            &nrese_exec::Envelope::unlimited(),
+        );
         base.timeout = Duration::from_secs(30);
         let now = Instant::now();
         let deadline = now + Duration::from_secs(10);
@@ -359,7 +370,7 @@ mod tests {
             if stop == "cancelled" {
                 cancel.cancel();
             }
-            let operation = budget(&store, Some(cancel));
+            let operation = budget(&store, Some(cancel), &nrese_exec::Envelope::unlimited());
             let deadline = if stop == "deadline" {
                 Instant::now() - Duration::from_secs(1)
             } else {
