@@ -340,3 +340,22 @@ offer, across the standards (N3, SWRL, RIF, SHACL rules, Datalog). It is built o
 whole stack, so its synergies compound, and extensions such as macros or unification are
 proposed where they serve users. **Every version from v2.1 to v2.3 ends with an
 optimisation round.**
+
+### Further decisions (owner, 13 October 2026, later)
+
+- **Named graphs: yes,** as one physical layout. Inferred statements carry their graph id,
+  the reasoning scope is a per-dataset setting, and property graphs go in the default graph
+  or their own graphs as the use case needs.
+- **Distribution at the macro level:** named graphs, the scheduler and the query planner's
+  splitting make independent units of work (reasoning per graph scope, query parts per graph)
+  that can run on different machines without a distributed commit. The aim is to split long
+  jobs across machines, not to shave seconds. Fine-grained distribution can follow later.
+- **Modular installation:** NRESE ships as selectable components. A small installation
+  serves where space or compute is limited, and components can be added later.
+- **A transformation layer in the specification:** every storage-format change comes with a
+  specified transformation from the previous format. That is how components are added later,
+  and it settles backward compatibility.
+- **AI as a modular service,** split off from the core; its design waits for dedicated
+  research on how it connects with real-world use.
+- **Adoption:** a usability and connection layer good enough for quick adoption is a goal of
+  its own, beside the papers and the benchmark lead.
