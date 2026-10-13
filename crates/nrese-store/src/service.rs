@@ -113,6 +113,7 @@ impl StoreService {
         if !config.huge_pages {
             nrese_exec::memory::set_transparent_huge_pages(false);
         }
+        nrese_engine::memory::set_release_between_rounds(config.reasoning_release);
         let engine = match config.mode {
             StoreMode::InMemory => Engine::new(EngineConfig::default())?,
             StoreMode::OnDisk => {
@@ -1491,6 +1492,9 @@ impl StoreService {
         if stop() {
             return Err(stopped());
         }
+        // Where asked, what the reasoner freed goes back before the inferred stack, the
+        // heap's peak, is built (as between the reasoner's rounds).
+        nrese_engine::memory::release_between_rounds();
         nrese_exec::heap::phase("store: inferred stack");
         let summary = rematerialisation.finish(closure.inferred)?;
         nrese_exec::heap::phase("store: done");

@@ -120,7 +120,7 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
   - The manifest records the machine's Docker CPU and memory limits.
 
 **Claim runs on Linux** (the office PC, Draco) add what a desktop can't promise:
-- the memory limit of each system's cgroup (`memory.max`) and its peak (`memory.peak`) instead of sampled RSS;
+- the memory limit of each system's cgroup (`memory.max`) and its peak (`memory.peak`) instead of sampled RSS, beside the process's peak RSS: the cgroup's counts the page cache its reads were charged, which depends on what the host had cached (the fast suite's LUBM 100: 2,375 to 4,700 MiB for one build);
 - the system's cores pinned (`--cpuset-cpus`), the client on others;
 - the CPU governor on `performance`, turbo as configured and recorded;
 - the page cache dropped before each cold run (`echo 3 > /proc/sys/vm/drop_caches`, sudo);

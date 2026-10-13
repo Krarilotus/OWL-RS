@@ -42,6 +42,10 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             Some(on) => on == 1,
             None => defaults.huge_pages,
         },
+        reasoning_release: match choice(source, names::REASONING_RELEASE, &["off", "on"])? {
+            Some(on) => on == 1,
+            None => defaults.reasoning_release,
+        },
         process_memory_bytes: parse_process_memory(
             source.get(names::PROCESS_MEMORY_BYTES).as_deref(),
         )?,

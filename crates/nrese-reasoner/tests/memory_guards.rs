@@ -4,6 +4,7 @@
 //! test binary of its own, and its tests run one at a time.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nrese_exec::heap;
 use nrese_reasoner::batch::{self, Materialisation, Schema};
@@ -145,6 +146,38 @@ fn relations_keep_no_object_order_their_rules_never_use() {
     assert!(
         store <= facts * BYTES_PER_FACT,
         "{store} bytes for {facts} facts, at most {BYTES_PER_FACT} each"
+    );
+}
+
+/// Releases of the allocator's unused memory (`nrese_engine::memory::release_all`): once on
+/// the one pool thread, once on the calling thread.
+static RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+/// The rounds give back what the last one freed only where `budgets.reasoning_release` asks
+/// for it, then before every round and after the last. Off by default: the memory given
+/// back is soon taken and faulted in again, 5.6 % more reasoning time on LUBM 100 for a
+/// 14 % lower peak (office-pc, 13 Oct 2026); on, the peak no longer depends on whether
+/// mimalloc's 100 ms delay kept the last round's buffers.
+#[test]
+fn rounds_release_between_them_only_when_asked() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    nrese_engine::memory::set_release(|_| {
+        RELEASES.fetch_add(1, Ordering::Relaxed);
+    });
+    let releases = || {
+        let before = RELEASES.load(Ordering::Relaxed);
+        let (result, _, _) = materialise(DEPARTMENTS);
+        (RELEASES.load(Ordering::Relaxed) - before, result.rounds)
+    };
+    let (by_default, _) = releases();
+    assert_eq!(by_default, 0, "rounds released without the setting");
+    nrese_engine::memory::set_release_between_rounds(true);
+    let (asked, rounds) = releases();
+    nrese_engine::memory::set_release_between_rounds(false);
+    assert!(rounds > 1, "{rounds} rounds: too few to tell");
+    assert!(
+        asked >= 2 * (rounds + 1),
+        "{asked} releases over {rounds} rounds"
     );
 }
 
