@@ -192,6 +192,36 @@ fn joins_are_counted_without_their_rows() {
     assert!(listed <= 9_000, "{}", chain.detail);
 }
 
+/// `COUNT` of one pattern under a FILTER that bounds a variable to id ranges is a sum of
+/// the index's range counts (Sparqloscope 104, the literals among every statement's
+/// objects; 091-093, a number at least a bound): no match read where the ranges decide.
+#[test]
+fn filters_that_bound_a_variable_count_ranges() {
+    let engine = engine();
+    for (query, ranges) in [
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o FILTER(isLITERAL(?o)) }",
+            "2 ranges",
+        ),
+        (
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s e:knows ?o FILTER(isIRI(?o)) }",
+            "1 ranges",
+        ),
+    ] {
+        let plan = steps(&engine, query);
+        let step = plan
+            .iter()
+            .find(|s| s.operator == "range count")
+            .unwrap_or_else(|| panic!("{query}: {plan:#?}"));
+        assert!(
+            step.detail
+                .contains(&format!("{ranges} counted by the index, 0 values")),
+            "{}",
+            step.detail
+        );
+    }
+}
+
 /// The count's memory is a weight per value, not the join's rows: 1,000 subjects with 20
 /// `knows` and 20 `label` each make 400,000 rows (9.6 MB as three columns of ids), counted
 /// within a budget of 1 MiB.
@@ -501,7 +531,8 @@ fn parts_are_shared_across_queries_through_the_result_cache() {
         run(renamed, &QueryOptions::default()).rows
     );
     assert!(cache.stats().hits > hits, "{:?}", cache.stats());
-    let shared = "SELECT ?x (COUNT(?l) AS ?n) WHERE { ?x e:knows ?y . ?y e:kind e:k3 . ?x e:label ?l } GROUP BY ?x";
+    // MAX needs the rows (a COUNT is counted without them, `counted join`).
+    let shared = "SELECT ?x (MAX(?l) AS ?n) WHERE { ?x e:knows ?y . ?y e:kind e:k3 . ?x e:label ?l } GROUP BY ?x";
     let explanation = run(shared, &cached);
     let hit = explanation.steps.iter().find(|s| s.cache == Some("hit"));
     assert!(

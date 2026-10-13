@@ -5189,6 +5189,8 @@ fn triple_terms_and_base_directions_equal_the_reference() {
                         "",
                         "FILTER(hasLANGDIR(?t))",
                         "FILTER(sameTerm(PREDICATE(?u), ?p))",
+                        // A triple term is no literal (the id-kind test once said it was).
+                        "FILTER(isLITERAL(?t))",
                     ])
                 ),
             };
