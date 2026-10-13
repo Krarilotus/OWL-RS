@@ -88,6 +88,25 @@ fn an_inequality_of_one_individual_is_false() {
     assert!(is_consistent(&d));
 }
 
+/// A built-in outside SWRL's (SWRLTab's `abox:hasClass` in ORE's 10860) has no meaning
+/// NRESE knows: its rule is left out and named; "inconsistent" from the rest still holds,
+/// "consistent" isn't claimed.
+#[test]
+fn a_foreign_built_in_is_left_out_and_named() {
+    let rule = "DLSafeRule(Body(ClassAtom(:A Variable(:x)) \
+        BuiltInAtom(<http://example.org/hasClass> Variable(:x) Variable(:c))) \
+        Head(ClassAtom(:B Variable(:x))))";
+    let d = decide(&format!("ClassAssertion(:A :a) {rule}"));
+    match &d.verdict {
+        Verdict::Undecided(why) => assert!(why.contains("example.org/hasClass"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    let d = decide(&format!(
+        "ClassAssertion(:A :a) SubClassOf(:A owl:Nothing) {rule}"
+    ));
+    assert!(!is_consistent(&d));
+}
+
 /// A rule with a SQWRL built-in is a query: it asserts nothing (ORE's 3726, 7278, 15753),
 /// and the answer says it read it so.
 #[test]
