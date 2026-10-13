@@ -403,13 +403,24 @@ fn is_query(o: &Ontology, rule: &nrese_owl::Rule) -> bool {
     })
 }
 
+/// The first built-in of a rule that isn't SWRL's (`swrlb:`), by its IRI.
+fn foreign_built_in(o: &Ontology, rule: &nrese_owl::Rule) -> Option<String> {
+    rule.body.iter().chain(&rule.head).find_map(|a| match a {
+        nrese_owl::rules::Atom::BuiltIn(b, _) => {
+            let iri = o.data.iris.get(b).cloned().unwrap_or_default();
+            (!iri.starts_with(certificate::data::SWRLB)).then_some(iri)
+        }
+        _ => None,
+    })
+}
+
 /// Whether the input is consistent, as far as can be decided soundly (the module docs).
 pub fn consistency(o: &Ontology, options: &Options) -> Decision {
     let started = Instant::now();
     let deadline = options.timeout.map(|t| started + t);
     let mut d = Decision::new(o);
     let dropped: Vec<&LeftOut> = d.left_out.iter().filter(|l| !l.checked).collect();
-    let dropped = (!dropped.is_empty()).then(|| {
+    let mut dropped = (!dropped.is_empty()).then(|| {
         format!(
             "{} parts the reader couldn't read as OWL 2 have no direct semantics ({})",
             dropped.len(),
@@ -427,6 +438,16 @@ pub fn consistency(o: &Ontology, options: &Options) -> Decision {
                 "rule {k} (line {}) is a SQWRL query (sqwrl: built-ins): a query, it asserts nothing",
                 r.line
             ));
+        } else if let Some(iri) = foreign_built_in(o, &r) {
+            // A built-in outside SWRL's (`swrlb:`, over data values): no meaning NRESE
+            // knows. Left out: "inconsistent" from the rest still holds.
+            let why = format!(
+                "rule {k} (line {}) uses the built-in {iri}, not one of SWRL's (swrlb:, over \
+                 data values): it isn't evaluated",
+                r.line
+            );
+            d.tried.push(why.clone());
+            dropped.get_or_insert(why);
         } else {
             rules.push(r);
         }
