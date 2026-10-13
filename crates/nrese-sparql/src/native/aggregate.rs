@@ -180,10 +180,7 @@ impl Aggregator<'_> {
                 None => {
                     let number = match self.evaluator.eval(expr, &self.binding(solutions, row)) {
                         None => Number::Error,
-                        Some(term) => match Numeric::of(&Value::of(&term)) {
-                            Some(number) => Number::Value(number),
-                            None => Number::Other,
-                        },
+                        Some(term) => number_of(&term),
                     };
                     if numbers.len() < MEMO_ENTRIES {
                         numbers.insert(id, number);
@@ -571,6 +568,18 @@ impl Aggregator<'_> {
                 result.map_or(Agg::Id(UNDEF), Agg::Term)
             }
         }
+    }
+}
+
+/// A value's part in SUM and AVG: a number; a duration (`Other`: the calendar's sums
+/// decide); anything else makes them unbound whatever the other values are (`Error`:
+/// Sparqloscope 090, `SUM(?o > 0)`, decoded all 8.8 M rows to end unbound).
+pub(super) fn number_of(term: &Term) -> Number {
+    let value = Value::of(term);
+    match Numeric::of(&value) {
+        Some(number) => Number::Value(number),
+        None if calendar::is_summable_duration(&value) => Number::Other,
+        None => Number::Error,
     }
 }
 
