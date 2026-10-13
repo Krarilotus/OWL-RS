@@ -22,6 +22,7 @@ pub mod profile;
 pub mod proof;
 mod properties;
 pub mod ql;
+pub mod rules;
 pub mod scope;
 mod universal;
 pub mod vocab;
@@ -43,5 +44,6 @@ pub use normalise::{
 pub use ofn::{Document, FunctionalReader, Intern, read_functional};
 pub use profile::Profiles;
 pub use proof::{Inference, Justifications, Proof, ProofError, ProofGraph};
+pub use rules::Rule;
 pub use vocab::Vocabulary;
 pub use write::{Make, write};

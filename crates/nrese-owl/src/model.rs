@@ -235,6 +235,85 @@ impl<T: Clone + Eq + Hash> Interner<T> {
     }
 }
 
+/// The operands of a disjointness as read: classes, object or data properties, or
+/// individuals (`DifferentIndividuals`).
+pub(crate) enum Disjoint {
+    Classes(Vec<ExprId>),
+    Objects(Vec<ObjProp>),
+    Data(Vec<Term>),
+    Individuals(Vec<Term>),
+}
+
+impl Disjoint {
+    /// The axioms it stands for, and whether an operand was repeated: the n-ary axiom over
+    /// its operands without repeats (where two or more remain) and, per repeated operand,
+    /// what being disjoint from itself says (the meaning OWL 2's RDF-Based Semantics gives
+    /// `x owl:disjointWith x`, `p owl:propertyDisjointWith p`, `a owl:differentFrom a`):
+    /// a class or property is empty, an individual contradicts.
+    pub(crate) fn axioms(
+        self,
+        classes: &mut Interner<ClassExpr>,
+        ranges: &mut Interner<DataRange>,
+    ) -> (Vec<Axiom>, bool) {
+        fn split<T: Ord + Clone>(mut items: Vec<T>) -> (Vec<T>, Vec<T>) {
+            items.sort();
+            let mut repeated: Vec<T> = Vec::new();
+            for w in items.windows(2) {
+                if w[0] == w[1] && repeated.last() != Some(&w[0]) {
+                    repeated.push(w[0].clone());
+                }
+            }
+            items.dedup();
+            (items, repeated)
+        }
+        let nothing = ExprId(classes.intern(ClassExpr::Nothing));
+        let thing = ExprId(classes.intern(ClassExpr::Thing));
+        let mut out = Vec::new();
+        let repeated = match self {
+            Disjoint::Classes(xs) => {
+                let (xs, rep) = split(xs);
+                if xs.len() > 1 {
+                    out.push(Axiom::DisjointClasses(xs));
+                }
+                out.extend(rep.iter().map(|&x| Axiom::SubClassOf(x, nothing)));
+                !rep.is_empty()
+            }
+            Disjoint::Objects(ps) => {
+                let (ps, rep) = split(ps);
+                if ps.len() > 1 {
+                    out.push(Axiom::DisjointObjectProperties(ps));
+                }
+                for &p in &rep {
+                    let some = ExprId(classes.intern(ClassExpr::Some(p, thing)));
+                    out.push(Axiom::SubClassOf(some, nothing));
+                }
+                !rep.is_empty()
+            }
+            Disjoint::Data(ps) => {
+                let (ps, rep) = split(ps);
+                if ps.len() > 1 {
+                    out.push(Axiom::DisjointDataProperties(ps));
+                }
+                let literal = RangeId(ranges.intern(DataRange::Literal));
+                for &p in &rep {
+                    let some = ExprId(classes.intern(ClassExpr::DataSome(p, literal)));
+                    out.push(Axiom::SubClassOf(some, nothing));
+                }
+                !rep.is_empty()
+            }
+            Disjoint::Individuals(xs) => {
+                let (xs, rep) = split(xs);
+                if xs.len() > 1 {
+                    out.push(Axiom::DifferentIndividuals(xs));
+                }
+                out.extend(rep.iter().map(|&a| Axiom::ClassAssertion(nothing, a)));
+                !rep.is_empty()
+            }
+        };
+        (out, repeated)
+    }
+}
+
 /// Sorts and removes repeats: the canonical form of n-ary operands.
 pub(crate) fn canonical<T: Ord>(mut items: Vec<T>) -> Vec<T> {
     items.sort();

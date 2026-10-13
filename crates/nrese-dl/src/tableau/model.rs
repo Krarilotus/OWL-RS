@@ -28,6 +28,9 @@ pub struct Model {
     /// `(property, from, to)`.
     pub roles: Vec<(Term, usize, usize)>,
     pub individuals: Vec<(Term, usize)>,
+    /// `(data property, element, value)`: each data value the datatype theory gives a
+    /// concrete node ([`crate::datatypes::DatatypeTheory::assign`]).
+    pub data: Vec<(Term, usize, nrese_xsd::owl::Value)>,
     /// The graph unravelled one step at each block (the module docs), where the fold
     /// isn't that already.
     pub unravelled: Option<Box<Model>>,
@@ -37,6 +40,7 @@ impl Engine<'_> {
     /// The folded model of the graph as it is (call after a run ended in a model).
     pub fn model(&mut self) -> Model {
         self.recompute_blocking();
+        let witness = self.data_witness();
         let len = self.g.nodes.len();
         let mut element = vec![NONE; len];
         let mut size = 0usize;
@@ -85,11 +89,26 @@ impl Engine<'_> {
                 m.individuals.push((term, e));
             }
         }
+        // Data values: an element's own edges to concrete nodes (a blocked node's are its
+        // blocker's).
+        for e in &self.g.edges {
+            if element[e.from as usize] != NONE
+                && let Some(v) = witness.get(&e.to)
+            {
+                m.data.push((
+                    self.p.roles[e.role as usize],
+                    element[e.from as usize] as usize,
+                    v.clone(),
+                ));
+            }
+        }
         m.concepts.sort_unstable();
         m.concepts.dedup();
         m.roles.sort_unstable();
         m.roles.dedup();
-        let unravelled = self.unravelled_model();
+        m.data.sort_unstable();
+        m.data.dedup();
+        let unravelled = self.unravelled_model(&witness);
         if unravelled.size != m.size {
             m.unravelled = Some(Box::new(unravelled));
         }
@@ -98,7 +117,7 @@ impl Engine<'_> {
 
     /// The graph unravelled one step at each block (the module docs; after [`Self::model`]
     /// recomputed blocking). O(nodes + edges + labels).
-    fn unravelled_model(&self) -> Model {
+    fn unravelled_model(&self, witness: &hashbrown::HashMap<u32, nrese_xsd::owl::Value>) -> Model {
         use super::graph::flag;
         let len = self.g.nodes.len();
         let directly = |n: usize| self.g.nodes[n].flags & flag::DIRECTLY_BLOCKED != 0;
@@ -176,6 +195,22 @@ impl Engine<'_> {
                 m.individuals.push((term, element[root] as usize));
             }
         }
+        // Data values: a directly blocked node has its blocker's.
+        for e in &self.g.edges {
+            let Some(v) = witness.get(&e.to) else {
+                continue;
+            };
+            let role = self.p.roles[e.role as usize];
+            if element[e.from as usize] != NONE && !directly(e.from as usize) {
+                m.data
+                    .push((role, element[e.from as usize] as usize, v.clone()));
+            }
+            for &y in copies.get(&e.from).into_iter().flatten() {
+                m.data.push((role, element[y as usize] as usize, v.clone()));
+            }
+        }
+        m.data.sort_unstable();
+        m.data.dedup();
         m.concepts.sort_unstable();
         m.concepts.dedup();
         m.roles.sort_unstable();

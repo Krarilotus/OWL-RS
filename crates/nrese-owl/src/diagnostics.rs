@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::mapping::Ontology;
+use crate::mapping::{Ontology, Terms};
 use crate::model::{Axiom, Characteristic, ClassExpr, ObjProp, Term};
 
 /// A problem found while reading.
@@ -43,6 +43,16 @@ pub enum Diagnostic {
         column: u32,
         what: &'static str,
     },
+    /// A disjointness that repeats an operand (`x owl:disjointWith x`, `a owl:differentFrom
+    /// a`): OWL 2 DL's n-ary axioms take operands without repeats, so it is read as what
+    /// being disjoint from itself means (`crate::model::Disjoint`).
+    RepeatedOperand,
+    /// An IRI of the reserved vocabulary used as a class, property or individual (*OWL 2
+    /// Structural Specification* §2.4): the axioms that do are left out.
+    Reserved { term: Term },
+    /// A DL-safe rule (SWRL, not OWL 2: *OWL 2 Structural Specification* §9 has no rule
+    /// axiom), kept in [`Ontology::rules`] at this index.
+    Rule { rule: usize },
 }
 
 impl Diagnostic {
@@ -64,6 +74,9 @@ impl Diagnostic {
             Self::Syntax { line, column, what } => {
                 ((u64::from(line) << 32) | u64::from(column), what)
             }
+            Self::Rule { rule } => (rule as Term, "rule"),
+            Self::RepeatedOperand => (0, "repeated operand"),
+            Self::Reserved { term } => (term, "reserved"),
         }
     }
 
@@ -74,7 +87,10 @@ impl Diagnostic {
     pub fn is_fatal(&self) -> bool {
         !matches!(
             self,
-            Self::UndeclaredProperty { .. } | Self::SharedBlankNode { .. } | Self::Unused { .. }
+            Self::UndeclaredProperty { .. }
+                | Self::SharedBlankNode { .. }
+                | Self::Unused { .. }
+                | Self::RepeatedOperand
         )
     }
 }
@@ -231,4 +247,137 @@ fn uses_any<'a>(
         }
     }
     None
+}
+
+/// Leaves out the axioms that use an IRI of the reserved vocabulary (`rdf:`, `rdfs:`,
+/// `xsd:`, `owl:`; *OWL 2 Structural Specification* §2.4) as a class, a property or an
+/// individual, but for those §2.4 gives OWL 2 DL (`owl:Thing`, `owl:Nothing`, the top and
+/// bottom properties; datatypes are data ranges, not touched here): each with a
+/// [`Diagnostic::Reserved`]. Such a name means in OWL 2 DL nothing of what it means in
+/// RDF (`rdfs:Class`, `rdf:type`, `rdf:first` as entities belong to OWL 2 Full), so
+/// reading it as a fresh name would decide what the input doesn't say; left out, what
+/// follows from the rest still follows. Terms whose IRI the source doesn't give
+/// ([`Terms::iri_text`]) aren't checked.
+pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
+    use crate::vocab::{OWL, RDF, RDFS, XSD};
+    let b = ontology.builtin;
+    let allowed = [
+        b.top_object,
+        b.bottom_object,
+        b.top_data,
+        b.bottom_data,
+        terms.iri(&format!("{OWL}Thing")),
+        terms.iri(&format!("{OWL}Nothing")),
+    ];
+    let mut cache: HashMap<Term, bool> = HashMap::new();
+    let mut reserved = |t: Term| -> bool {
+        *cache.entry(t).or_insert_with(|| {
+            !allowed.contains(&Some(t))
+                && terms
+                    .iri_text(t)
+                    .is_some_and(|iri| [RDF, RDFS, XSD, OWL].iter().any(|ns| iri.starts_with(ns)))
+        })
+    };
+    let mut kept = Vec::with_capacity(ontology.axioms.len());
+    let mut sources = Vec::with_capacity(ontology.axioms.len());
+    let mut found = Vec::new();
+    let axioms = std::mem::take(&mut ontology.axioms);
+    let all_sources = std::mem::take(&mut ontology.sources);
+    for (axiom, source) in axioms.into_iter().zip(all_sources) {
+        let names = entities_of(ontology, &axiom);
+        match names.into_iter().find(|&t| reserved(t)) {
+            Some(term) => found.push(Diagnostic::Reserved { term }),
+            None => {
+                kept.push(axiom);
+                sources.push(source);
+            }
+        }
+    }
+    ontology.axioms = kept;
+    ontology.sources = sources;
+    for d in found {
+        if !ontology.diagnostics.contains(&d) {
+            ontology.diagnostics.push(d);
+        }
+    }
+}
+
+/// The classes, properties and individuals an axiom names (datatypes, literals and
+/// facets aside).
+fn entities_of(o: &Ontology, axiom: &Axiom) -> Vec<Term> {
+    let mut out: Vec<Term> = Vec::new();
+    let p = |q: &ObjProp| q.named();
+    match axiom {
+        Axiom::Declaration(kind, t) => {
+            // Datatypes and annotation properties of the reserved vocabulary are OWL 2's.
+            if !matches!(
+                kind,
+                crate::model::EntityKind::Datatype | crate::model::EntityKind::AnnotationProperty
+            ) {
+                out.push(*t);
+            }
+        }
+        Axiom::DisjointUnion(c, _) => out.push(*c),
+        Axiom::SubObjectPropertyOf(chain, sup) => {
+            out.extend(chain.iter().map(p));
+            out.push(sup.named());
+        }
+        Axiom::EquivalentObjectProperties(ps) | Axiom::DisjointObjectProperties(ps) => {
+            out.extend(ps.iter().map(p));
+        }
+        Axiom::InverseObjectProperties(a, b2) => out.extend([a.named(), b2.named()]),
+        Axiom::ObjectPropertyDomain(q, _)
+        | Axiom::ObjectPropertyRange(q, _)
+        | Axiom::ObjectCharacteristic(_, q) => out.push(q.named()),
+        Axiom::SubDataPropertyOf(a, b2) => out.extend([*a, *b2]),
+        Axiom::EquivalentDataProperties(ps) | Axiom::DisjointDataProperties(ps) => {
+            out.extend(ps);
+        }
+        Axiom::DataPropertyDomain(q, _)
+        | Axiom::DataPropertyRange(q, _)
+        | Axiom::FunctionalDataProperty(q) => out.push(*q),
+        Axiom::HasKey(_, os, ds) => {
+            out.extend(os.iter().map(p));
+            out.extend(ds);
+        }
+        Axiom::ClassAssertion(_, a) => out.push(*a),
+        Axiom::ObjectPropertyAssertion(q, a, b2)
+        | Axiom::NegativeObjectPropertyAssertion(q, a, b2) => out.extend([*q, *a, *b2]),
+        Axiom::DataPropertyAssertion(q, a, _) | Axiom::NegativeDataPropertyAssertion(q, a, _) => {
+            out.extend([*q, *a]);
+        }
+        Axiom::SameIndividual(xs) | Axiom::DifferentIndividuals(xs) => out.extend(xs),
+        _ => {}
+    }
+    let mut stack: Vec<u32> = expressions_of(axiom);
+    let mut seen = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        match o.classes.get(id) {
+            ClassExpr::Class(t) => out.push(*t),
+            ClassExpr::And(xs) | ClassExpr::Or(xs) => stack.extend(xs.iter().map(|x| x.0)),
+            ClassExpr::Not(x) => stack.push(x.0),
+            ClassExpr::OneOf(xs) => out.extend(xs),
+            ClassExpr::Some(q, x)
+            | ClassExpr::All(q, x)
+            | ClassExpr::Min(_, q, x)
+            | ClassExpr::Max(_, q, x)
+            | ClassExpr::Exact(_, q, x) => {
+                out.push(q.named());
+                stack.push(x.0);
+            }
+            ClassExpr::HasValue(q, a) => out.extend([q.named(), *a]),
+            ClassExpr::HasSelf(q) => out.push(q.named()),
+            ClassExpr::DataSome(q, _)
+            | ClassExpr::DataAll(q, _)
+            | ClassExpr::DataHasValue(q, _)
+            | ClassExpr::DataMin(_, q, _)
+            | ClassExpr::DataMax(_, q, _)
+            | ClassExpr::DataExact(_, q, _) => out.push(*q),
+            ClassExpr::Thing | ClassExpr::Nothing => {}
+        }
+    }
+    out
 }
