@@ -147,6 +147,35 @@ impl Layout {
 const GROUP_PART: usize = 1 << 16;
 const _: () = assert!(GROUP_PART.is_multiple_of(keys::BLOCK));
 
+/// The parts of a group walk over `start..end` at `position`: halved, in parallel, until a
+/// part is short or has one value at `position` (its first and last keys agree), cut at
+/// multiples of [`GROUP_PART`]; the boundaries from `start` to `end`. Few large groups
+/// leave O(groups · log(n / part)) parts, each read at its ends, where cutting every
+/// [`GROUP_PART`] keys read every part: on a mapped store, a page fault or two per part
+/// before its first use (Sparqloscope 102, about 70 predicates among 606 M keys: 9,200
+/// parts, 138 ms on a first run against 3 ms warm).
+fn group_cuts(keys: &keys::PackedKeys, start: usize, end: usize, position: usize) -> Vec<usize> {
+    fn inner(keys: &keys::PackedKeys, start: usize, end: usize, position: usize) -> Vec<usize> {
+        if end - start < 2 * GROUP_PART || keys.get(start)[position] == keys.get(end - 1)[position]
+        {
+            return Vec::new();
+        }
+        // Past `start` (half the range is at least a part) and before `end`.
+        let mid = (start + (end - start) / 2) / GROUP_PART * GROUP_PART;
+        let (mut left, right) = rayon::join(
+            || inner(keys, start, mid, position),
+            || inner(keys, mid, end, position),
+        );
+        left.push(mid);
+        left.extend(right);
+        left
+    }
+    let mut cuts = vec![start];
+    cuts.extend(inner(keys, start, end, position));
+    cuts.push(end);
+    cuts
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IndexVersion {
     layout: Layout,
@@ -364,12 +393,9 @@ impl IndexVersion {
                 walk(start, end, out);
                 continue;
             }
-            // Large ranges in parts on every core, cut at block boundaries; a group that
-            // spans a cut is added up where the parts meet.
-            let cuts: Vec<usize> = std::iter::once(start)
-                .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
-                .chain(std::iter::once(end))
-                .collect();
+            // Large ranges in parts on every core, cut at block boundaries where values
+            // change; a group that spans a cut is added up where the parts meet.
+            let cuts = group_cuts(&perm.keys, start, end, position);
             let parts: Vec<Vec<(u64, i64)>> = cuts
                 .par_windows(2)
                 .map(|cut| {
@@ -436,10 +462,7 @@ impl IndexVersion {
         if end - start < 2 * GROUP_PART {
             return Some(walk(start, end).0);
         }
-        let cuts: Vec<usize> = std::iter::once(start)
-            .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
-            .chain(std::iter::once(end))
-            .collect();
+        let cuts = group_cuts(&perm.keys, start, end, position);
         let parts: Vec<(u64, Option<u64>, Option<u64>)> = cuts
             .par_windows(2)
             .map(|cut| walk(cut[0], cut[1]))
