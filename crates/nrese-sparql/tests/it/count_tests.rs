@@ -119,25 +119,134 @@ fn count_query(rng: &mut Rng) -> String {
             }
         });
     }
-    let counted = match rng.below(3) {
-        0 => "?v0",
-        _ => "*",
-    };
-    format!(
-        "SELECT (COUNT({counted}) AS ?n) WHERE {{ {} }}",
-        body.join(" ")
-    )
+    // COUNT(*), COUNT of a variable every solution binds, counts per value of one, and the
+    // number of its values.
+    let body = body.join(" ");
+    let key = rng.pick(&tree.bound).clone();
+    match rng.below(6) {
+        0 => format!(
+            "SELECT {key} (COUNT(*) AS ?n) (COUNT({key}) AS ?m) WHERE {{ {body} }} GROUP BY {key}"
+        ),
+        1 => format!("SELECT (COUNT(DISTINCT {key}) AS ?n) WHERE {{ {body} }}"),
+        2 => format!("SELECT (COUNT(?v0) AS ?n) WHERE {{ {body} }}"),
+        _ => format!("SELECT (COUNT(*) AS ?n) WHERE {{ {body} }}"),
+    }
 }
 
-fn count(results: QueryResults<'_>) -> String {
+/// The rows, each as its bindings in variable order, sorted.
+fn count(results: QueryResults<'_>) -> Vec<String> {
     let QueryResults::Solutions(solutions) = results else {
         panic!("a SELECT")
     };
-    let rows: Vec<_> = solutions.map(|s| s.unwrap()).collect();
-    assert_eq!(rows.len(), 1);
-    rows[0]
-        .get("n")
-        .map_or_else(|| "unbound".to_owned(), ToString::to_string)
+    let mut rows: Vec<String> = solutions
+        .map(|s| {
+            let s = s.unwrap();
+            ["v0", "v1", "v2", "v3", "v4", "v5", "v6", "n", "m"]
+                .iter()
+                .filter_map(|v| s.get(*v).map(|t| format!("{v}={t}")))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// A FILTER that bounds one variable: term-kind tests, comparisons with integers (some
+/// past the inline integers on either side) and years, and their conjunctions.
+fn bounding_filter(rng: &mut Rng, v: &str) -> String {
+    let test = |rng: &mut Rng| -> String {
+        match rng.below(5) {
+            0 => format!("{}({v})", rng.pick(&["isLITERAL", "isIRI", "isBLANK"])),
+            1 | 2 => format!(
+                "{v} {} {}",
+                rng.pick(&["<", "<=", "=", ">=", ">"]),
+                rng.pick(&[
+                    "-3",
+                    "0",
+                    "2",
+                    "5",
+                    "7",
+                    "2305843009213693952",
+                    "-2305843009213693952",
+                    "9223372036854775807"
+                ])
+            ),
+            3 => format!("YEAR({v}) {} 2001", rng.pick(&["<", "=", ">="])),
+            _ => format!("2 < {v}"),
+        }
+    };
+    let mut conjuncts = vec![test(rng)];
+    if rng.below(3) == 0 {
+        conjuncts.push(test(rng));
+    }
+    conjuncts.join(" && ")
+}
+
+/// COUNT of one pattern under a FILTER that bounds one variable, by range counts of the
+/// index (`range count`), against the reference evaluator: over the general random data
+/// (every literal kind, non-canonical and integer-derived forms, dates with timezones, a
+/// third inferred), every read model.
+#[test]
+fn range_counts_equal_the_reference() {
+    let mut rng = Rng::seeded(20_261_014);
+    let (mut checked, mut ranged) = (0usize, 0usize);
+    for case in 0..40 {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in crate::native_differential_tests::random_dataset(&mut rng) {
+            if rng.below(3) == 0 {
+                let triple = EncodedTriple::new(
+                    tx.intern(quad.subject.as_ref().into()),
+                    tx.intern(quad.predicate.as_ref().into()),
+                    tx.intern(quad.object.as_ref()),
+                );
+                tx.insert_inferred(triple);
+            } else {
+                tx.insert(quad.as_ref());
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for _ in 0..25 {
+            let options = QueryOptions {
+                read_model: *rng.pick(&[
+                    ReadModel::Materialised,
+                    ReadModel::Asserted,
+                    ReadModel::Inferred,
+                ]),
+                ..QueryOptions::default()
+            };
+            let pattern = match rng.below(3) {
+                0 => "?s ?p ?o".to_owned(),
+                _ => format!("?s <{EX}p{}> ?o", rng.below(4)),
+            };
+            let v = *rng.pick(&["?o", "?o", "?s"]);
+            let counted = *rng.pick(&["*", "?o", "?s"]);
+            let text = format!(
+                "SELECT (COUNT({counted}) AS ?n) WHERE {{ {pattern} FILTER({}) }}",
+                bounding_filter(&mut rng, v)
+            );
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let native = count(evaluate_query(&snapshot, &query, &options).unwrap());
+            let expected =
+                count(nrese_sparql_reference::evaluate_query(&snapshot, &query, &options).unwrap());
+            assert_eq!(
+                native, expected,
+                "case {case}, {:?}: {text}",
+                options.read_model
+            );
+            let explained = explain_query(&snapshot, &query, &options).unwrap();
+            ranged += usize::from(explained.steps.iter().any(|s| s.operator == "range count"));
+            checked += 1;
+        }
+    }
+    assert!(
+        ranged * 2 > checked,
+        "{checked} checked, {ranged} by range counts"
+    );
 }
 
 #[test]
@@ -194,7 +303,7 @@ fn counted_joins_equal_the_reference() {
                 .iter()
                 .any(|step| step.operator == "counted join");
             counted += usize::from(by_messages);
-            nonzero += usize::from(!expected.starts_with("\"0\""));
+            nonzero += usize::from(expected.iter().any(|row| !row.contains("n=\"0\"")));
             checked += 1;
         }
     }

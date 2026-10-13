@@ -288,7 +288,7 @@ impl Fast {
             Self::IsLiteral(v) => on_kind(v, &|k| {
                 !matches!(
                     k,
-                    TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
+                    TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph | TermKind::Triple
                 )
             }),
             Self::SameIri(v, iri) => match stored(v) {

@@ -57,6 +57,9 @@ impl From<NativeError> for Stop {
 
 type Counted<T> = Result<T, Stop>;
 
+/// Counts per value of a variable, sorted by value.
+type PerValue = Vec<(u64, u64)>;
+
 /// What a part does to the weights of the variable it hangs off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -161,6 +164,27 @@ fn items<'p>(pattern: &'p GraphPattern, out: &mut Vec<Item<'p>>) -> bool {
             });
             true
         }
+        _ => false,
+    }
+}
+
+/// Whether every solution of `conj` binds `variable`: one of its patterns has it.
+fn certain(conj: &Conj<'_>, variable: &Variable) -> bool {
+    conj.atoms
+        .iter()
+        .any(|triple| triple_variables(triple).contains(variable))
+}
+
+/// Whether `aggregate` counts the solutions of `conj`: `COUNT(*)`, or `COUNT(?v)` of a
+/// variable every solution binds.
+fn counts_solutions(conj: &Conj<'_>, aggregate: &AggregateExpression) -> bool {
+    match aggregate {
+        AggregateExpression::CountSolutions { distinct: false } => true,
+        AggregateExpression::FunctionCall {
+            name: AggregateFunction::Count,
+            expr: Expression::Variable(v),
+            distinct: false,
+        } => certain(conj, v),
         _ => false,
     }
 }
@@ -693,53 +717,107 @@ impl Context<'_> {
         pattern: &GraphPattern,
         aggregate: &AggregateExpression,
     ) -> NativeResult<Option<u64>> {
-        if self.as_written || self.late.is_some() {
+        let Some(conj) = self.countable(pattern) else {
+            return Ok(None);
+        };
+        if !counts_solutions(&conj, aggregate) {
             return Ok(None);
         }
-        // A single pattern has its count from the index.
+        Ok(self.counted(&conj, None)?.map(|(count, _)| count))
+    }
+
+    /// The solutions of `pattern` per value of `key`, a variable every solution binds:
+    /// `GROUP BY ?key` with `COUNT(*)` (and `COUNT(?v)` of a variable every solution
+    /// binds), and `COUNT(DISTINCT ?key)` as the number of values with any. Sorted by
+    /// value; `None` where `pattern` isn't a tree counted so.
+    pub(super) fn counts_per_value(
+        &self,
+        pattern: &GraphPattern,
+        key: &Variable,
+        aggregates: &[(Variable, AggregateExpression)],
+    ) -> NativeResult<Option<Vec<(u64, u64)>>> {
+        let Some(conj) = self.countable(pattern) else {
+            return Ok(None);
+        };
+        let per_value = aggregates.iter().all(|(_, aggregate)| {
+            counts_solutions(&conj, aggregate)
+                || matches!(aggregate, AggregateExpression::FunctionCall {
+                    name: AggregateFunction::Count,
+                    expr: Expression::Variable(v),
+                    distinct: true,
+                } if v == key)
+        });
+        if !per_value || !certain(&conj, key) {
+            return Ok(None);
+        }
+        Ok(self.counted(&conj, Some(key))?.map(|(_, values)| values))
+    }
+
+    /// `pattern` as a conjunction to count, if this module counts it.
+    fn countable<'p>(&self, pattern: &'p GraphPattern) -> Option<Conj<'p>> {
+        if self.as_written || self.late.is_some() {
+            return None;
+        }
+        // A single pattern has its counts from the index.
         if let GraphPattern::Bgp { patterns } = pattern
             && patterns.len() < 2
         {
-            return Ok(None);
+            return None;
         }
-        let Some(conj) = Conj::of(pattern) else {
-            return Ok(None);
-        };
-        let counted = match aggregate {
-            AggregateExpression::CountSolutions { distinct: false } => true,
-            AggregateExpression::FunctionCall {
-                name: AggregateFunction::Count,
-                expr: Expression::Variable(v),
-                distinct: false,
-            } => conj
-                .atoms
-                .iter()
-                .any(|triple| triple_variables(triple).contains(v)),
-            _ => false,
-        };
-        if !counted {
-            return Ok(None);
-        }
+        Conj::of(pattern)
+    }
+
+    /// The count of `conj`, or with `key` its counts per value; `None` where it declines.
+    fn counted(
+        &self,
+        conj: &Conj<'_>,
+        key: Option<&Variable>,
+    ) -> NativeResult<Option<(u64, PerValue)>> {
         let start = Instant::now();
         let mut stats = Stats::default();
-        let count = match self.solve(&conj, None, &mut stats) {
-            Ok(Solved::Count(n)) => n,
-            Ok(Solved::Weights(_)) => unreachable!("a conjunction without a key counts"),
+        let (count, values) = match self.solve(conj, key, &mut stats) {
+            Ok(Solved::Count(n)) => (n, Vec::new()),
+            Ok(Solved::Weights(mut weights)) => (0, std::mem::take(&mut weights.entries)),
             Err(Stop::Declined) => return Ok(None),
             Err(Stop::Failed(error)) => return Err(error),
         };
         if self.trace.is_some() {
             let detail = format!(
-                "rooted at {}; {} group walks, {} weights listed, {} pairs kept, {} matches read at the roots; no row made",
+                "{}rooted at {}; {} group walks, {} weights listed, {} pairs kept, {} matches read at the roots; no row made",
+                key.map_or_else(String::new, |k| format!("per {k}, ")),
                 stats.roots.join(", "),
                 stats.walks,
                 stats.listed,
                 stats.pairs,
                 stats.driven,
             );
-            self.note("counted join", detail, Some(1), 1, start);
+            let (rows, estimate) = match key {
+                Some(key) => (values.len(), self.distinct_estimate(conj, key)),
+                None => (1, 1),
+            };
+            self.note("counted join", detail, Some(estimate), rows, start);
         }
-        Ok(Some(count))
+        Ok(Some((count, values)))
+    }
+
+    /// The values `key` takes, estimated: the fewest of any pattern of `conj` with it.
+    fn distinct_estimate(&self, conj: &Conj<'_>, key: &Variable) -> u64 {
+        conj.atoms
+            .iter()
+            .filter_map(|triple| {
+                let scan = self.scan_pattern(triple)?;
+                let component = (0..3).find(|&c| scan.slots[c].is_var(key))?;
+                let permutation = scan.permutation_for(Some(key));
+                let pattern = scan.quad_pattern();
+                (scan.first_free(permutation) == Some(component))
+                    .then(|| {
+                        self.snapshot
+                            .distinct_estimate_in(self.model, &pattern, permutation)
+                    })
+                    .flatten()
+            })
+            .min()
+            .unwrap_or(1)
     }
 
     fn reader(&self) -> Reader<'_> {
