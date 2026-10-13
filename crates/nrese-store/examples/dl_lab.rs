@@ -63,7 +63,7 @@ fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, prop
         .ok()
         .and_then(|ms| ms.parse().ok())
     {
-        dl.timeout = Duration::from_millis(ms);
+        dl.timeout = Some(Duration::from_millis(ms));
     }
     let store = StoreService::new(StoreConfig {
         query_cache_bytes: 0,

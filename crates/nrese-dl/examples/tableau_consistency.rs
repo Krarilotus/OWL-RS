@@ -6,8 +6,14 @@
 //!     [--no-semantic-branching] [--no-backjumping] [--ancestor-blocking] [--pairwise-always]
 //!     [--disjunctions-first] [--no-disjunct-learning] [--full-blocking] [--expand-at-most N]
 //!     [--conflict-order] [--dynamic-backtracking] [--check-retraction] [--no-merge-filter]
-//!     [--exact-provenance] [--no-lazy-definitions] [--no-complements] FILE...
+//!     [--exact-provenance] [--no-lazy-definitions] [--no-complements]
+//!     [--memory-mib N] [--max-memory-mib N] [--max-nodes N] [--max-branch-points N]
+//!     [--max-merges N] FILE...
 //! ```
+//!
+//! Budgets: none is built in (`nrese_dl::limits`); each option sets one, 0 for none:
+//! `--timeout` each file's time, `--memory-mib` a memory envelope a file's runs share,
+//! `--max-memory-mib` one run's memory of its own, and the hypertableau's counts.
 //!
 //! `NRESE_CLAUSE_STATS=1` also prints, on standard error, the clauses per kind of axiom
 //! they come from and the axioms with the most clauses; `NRESE_CLAUSE_DUMP=1` every clause
@@ -165,7 +171,8 @@ fn parse(path: &str) -> Result<Vec<Triple>, Box<dyn std::error::Error>> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let (mut timeout, mut files) = (300u64, Vec::new());
+    let (mut timeout, mut files) = (0u64, Vec::new());
+    let mut envelope_mib = 0u64;
     let mut exact_provenance = false;
     let mut config = Config::default();
     while let Some(arg) = args.next() {
@@ -189,14 +196,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--expand-at-most" => {
                 config.expand_at_most_up_to = args.next().ok_or("--expand-at-most N")?.parse()?;
             }
+            "--memory-mib" => envelope_mib = args.next().ok_or("--memory-mib N")?.parse()?,
+            "--max-memory-mib" => {
+                let mib: usize = args.next().ok_or("--max-memory-mib N")?.parse()?;
+                config.max_memory = (mib > 0).then_some(mib << 20);
+            }
+            "--max-nodes" => {
+                let n: usize = args.next().ok_or("--max-nodes N")?.parse()?;
+                config.max_nodes = (n > 0).then_some(n);
+            }
+            "--max-branch-points" => {
+                let n: u64 = args.next().ok_or("--max-branch-points N")?.parse()?;
+                config.max_branch_points = (n > 0).then_some(n);
+            }
+            "--max-merges" => {
+                let n: u64 = args.next().ok_or("--max-merges N")?.parse()?;
+                config.max_merges = (n > 0).then_some(n);
+            }
             _ => files.push(arg),
         }
     }
     let config = Config {
-        timeout: Some(Duration::from_secs(timeout)),
+        timeout: (timeout > 0).then(|| Duration::from_secs(timeout)),
         ..config
     };
     for path in files {
+        // Each file's runs in an envelope of their own.
+        let config = Config {
+            memory: (envelope_mib > 0)
+                .then(|| nrese_exec::Envelope::new(Some((envelope_mib as usize) << 20), None)),
+            ..config.clone()
+        };
         let started = Instant::now();
         let mut table = Table::default();
         let (ontology, parsed, read_time) = match load(&path, &mut table, started) {

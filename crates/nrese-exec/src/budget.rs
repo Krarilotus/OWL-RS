@@ -426,6 +426,16 @@ impl<B: Deref<Target = Budget>> Gauge<B> {
     pub fn bytes(&self) -> usize {
         self.reserved.load(Ordering::Relaxed)
     }
+
+    /// How much more than `held` the holder may come to hold: what it has reserved beyond
+    /// it, and what the budget has left.
+    pub fn room(&self, held: usize) -> usize {
+        let held_now = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        held_now
+            .bytes()
+            .saturating_sub(held)
+            .saturating_add(held_now.budget.remaining())
+    }
 }
 
 #[cfg(test)]

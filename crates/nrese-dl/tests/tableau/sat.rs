@@ -3,7 +3,8 @@
 //! `T : {l₁, l₂, l₃}`. Variable `i` is true iff `plusᵢ = T`.
 
 use super::build::Build;
-use nrese_dl::tableau::{Answer, BRANCH_BUDGET, Config, consistency};
+use nrese_dl::limits::Limit;
+use nrese_dl::tableau::{Answer, Config, consistency};
 use nrese_owl::{ClassExpr, Ontology, Term};
 
 /// The clauses of WebOnt-description-logic-501 (satisfiable: x2, x6, x7, x8 true, x1, x3,
@@ -110,8 +111,8 @@ fn configs() -> impl Iterator<Item = Config> {
         // change an answer); the timeout is only a safety net.
         max_branch_points: Some(200_000),
         timeout: Some(std::time::Duration::from_secs(300)),
-        max_nodes: 10_000,
-        max_memory: 256 << 20,
+        max_nodes: Some(10_000),
+        max_memory: Some(256 << 20),
         check_blocking: true,
         ..Config::default()
     })
@@ -134,7 +135,8 @@ fn check(vars: u8, clauses: &[Vec<i8>], thrashing: bool) {
             continue;
         }
         let got = consistency(&o, &config).answer;
-        let slow = plain && matches!(&got, Answer::GaveUp(why) if why.contains(BRANCH_BUDGET));
+        let slow = plain
+            && matches!(&got, Answer::GaveUp(why) if Limit::named_in(why) == Some(Limit::BranchPoints));
         assert!(
             got == expected || slow,
             "{clauses:?} under {config:?}: {got:?}, not {expected:?}"

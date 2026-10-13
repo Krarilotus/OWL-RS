@@ -167,7 +167,7 @@ fn chain(n: u64, clash: bool) -> Ontology {
 #[test]
 fn islands_decide_where_the_whole_abox_gives_up() {
     let config = Config {
-        max_nodes: 200,
+        max_nodes: Some(200),
         timeout: Some(std::time::Duration::from_secs(60)),
         ..Config::default()
     };
@@ -188,7 +188,7 @@ fn islands_decide_where_the_whole_abox_gives_up() {
 #[test]
 fn a_spent_budget_leaves_the_islands_undecided() {
     let config = Config {
-        max_nodes: 2,
+        max_nodes: Some(2),
         timeout: Some(std::time::Duration::from_secs(60)),
         ..Config::default()
     };
@@ -204,8 +204,8 @@ fn shared_island_limits_preserve_verdicts_and_never_raise_tiny_memory() {
     for width in [1, 2, 4] {
         let config = Config {
             workers: Some(physical.limited(width)),
-            max_nodes: 200,
-            max_memory: usize::MAX,
+            max_nodes: Some(200),
+            max_memory: None,
             keep_model: true,
             ..Config::default()
         };
@@ -219,7 +219,7 @@ fn shared_island_limits_preserve_verdicts_and_never_raise_tiny_memory() {
             assert_eq!(islands::consistency(&ontology, &config).answer, want);
         }
         let tiny = Config {
-            max_memory: 1,
+            max_memory: Some(1),
             ..config
         };
         let out = islands::by_islands(&chain(400, false), &tiny);
@@ -265,7 +265,7 @@ fn islands_decide_as_the_whole_abox_does() {
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(240);
     let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x2026_1006_1500);
     let config = Config {
-        max_nodes: 20_000,
+        max_nodes: Some(20_000),
         max_branch_points: Some(20_000),
         timeout: Some(std::time::Duration::from_secs(60)),
         ..Config::default()
@@ -349,7 +349,7 @@ fn touched_islands_decide_as_a_cold_check_does() {
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(240);
     let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x2026_1012_1700);
     let config = Config {
-        max_nodes: 20_000,
+        max_nodes: Some(20_000),
         max_branch_points: Some(20_000),
         timeout: Some(std::time::Duration::from_secs(60)),
         ..Config::default()

@@ -25,7 +25,7 @@ const SPLIT_CLASH: &str = ":A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . \
 #[test]
 fn a_spent_consistency_budget_leaves_the_status_unknown() {
     let dl = pipeline_with(DlConfig {
-        max_branch_points: 0,
+        max_branch_points: Some(0),
         ..DlConfig::default()
     });
     insert(&dl, SPLIT_CLASH).expect("an undecided check accepts the commit");
@@ -43,7 +43,7 @@ fn a_spent_consistency_budget_leaves_the_status_unknown() {
 #[test]
 fn a_spent_upper_bound_budget_leaves_the_answers_sound_only() {
     let dl = pipeline_with(DlConfig {
-        timeout: std::time::Duration::from_nanos(1),
+        timeout: Some(std::time::Duration::from_nanos(1)),
         ..DlConfig::default()
     });
     insert(
@@ -64,7 +64,7 @@ fn a_spent_upper_bound_budget_leaves_the_answers_sound_only() {
 #[test]
 fn a_spent_classification_budget_leaves_the_reports_incomplete() {
     let dl = pipeline_with(DlConfig {
-        max_branch_points: 0,
+        max_branch_points: Some(0),
         consistency: nrese_store::DlConsistency::Off,
         ..DlConfig::default()
     });
@@ -101,7 +101,7 @@ fn a_spent_explanation_budget_gives_no_explanation() {
         )
     };
     let spent = pipeline_with(DlConfig {
-        max_branch_points: 0,
+        max_branch_points: Some(0),
         consistency: nrese_store::DlConsistency::Off,
         ..DlConfig::default()
     });

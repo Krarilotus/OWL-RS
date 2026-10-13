@@ -39,6 +39,24 @@ pub(super) fn parse_millis(source: &dyn ConfigSource, name: &str, default: u64) 
     }
 }
 
+/// A budget: a value as `parse` reads it, or `0` or `unlimited` for none (`None`); unset,
+/// `default`.
+pub(super) fn parse_limit<T: PartialEq + Default>(
+    source: &dyn ConfigSource,
+    name: &str,
+    default: Option<T>,
+    parse: impl Fn(&str) -> Result<T>,
+) -> Result<Option<T>> {
+    match source.get(name) {
+        None => Ok(default),
+        Some(value) if value.trim().eq_ignore_ascii_case("unlimited") => Ok(None),
+        Some(value) => {
+            let value = parse(value.trim()).with_context(|| format!("failed to parse {name}"))?;
+            Ok((value != T::default()).then_some(value))
+        }
+    }
+}
+
 pub(super) fn parse_usize(source: &dyn ConfigSource, name: &str, default: usize) -> Result<usize> {
     match source.get(name) {
         Some(value) => value

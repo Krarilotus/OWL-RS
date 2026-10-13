@@ -953,6 +953,15 @@ is observed), neither RSS nor an exact peak.
 opt-in guard; who installs the process limit and which watches reach DL work is in
 [config-reference.md](../ops/config-reference.md#budgets).
 
+**No built-in budget.** Every budget of the engines and drivers is a setting
+([`nrese_dl::limits`](../../crates/nrese-dl/src/limits.rs)), unlimited where nobody set
+it: the engines' own defaults are none, the store's are the table's, each with its reason
+in [config-reference.md](../ops/config-reference.md). A run that reaches one says which
+(`dl.max_nodes reached (…)`). A comparison gives NRESE the limits every system gets, the
+task's time and the envelope's memory (`dl_classify --timeout --memory-mib`), nothing
+tighter. The guard is `tests/tableau/limits.rs`: the defaults set none, each budget names
+its setting when reached, and no literal budget is in the sources.
+
 The settings; `dl.race`, `dl.cache`, `dl.fallback.*`, `dl.explanations` and `async`
 consistency are designed, not yet settings.
 
@@ -961,7 +970,9 @@ consistency are designed, not yet settings.
 | `reasoner.mode` | … `owl2-dl` | — |
 | `dl.answers` | `certain-where-complete`, `sound`, `exact` | `certain-where-complete` |
 | `dl.consistency` | `inline`, `async`, `off` | `inline` |
-| `dl.timeout`, `dl.memory` | per operation | 30 min, 4 GiB |
+| `dl.timeout`, `dl.memory` | per operation; 0 or `unlimited`: none | 30 min, none (the request's envelope) |
+| `dl.max_candidates`, `dl.max_nodes`, `dl.max_branch_points`, `dl.max_merges`, `dl.explanation_tests` | counts; 0 or `unlimited`: none | 1000, then none |
+| `dl.lower_bound_timeout`, `dl.max_join`, `dl.max_join_steps` | route thresholds (past them the hypertableau decides) | 60 s, 2^20, 2^16 |
 | `dl.fallback.clauses`, `dl.fallback.equalities`, `dl.fallback.contexts` | budgets of §4 | from the ORE and Oxford runs |
 | `dl.race` | `on`, `off` | `on` above a module size |
 | `dl.threads` | batch width; 0: every core | 0 |

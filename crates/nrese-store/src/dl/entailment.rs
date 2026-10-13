@@ -7,6 +7,7 @@
 //! It is the oracle of the exact services (`ExactGroundEntailment`: a ground atom is an
 //! axiom), and of entailment checks of whole documents ([`crate::StoreService::entails_dl`]).
 
+use nrese_dl::limits::Deadline;
 use nrese_owl::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, ObjProp, Ontology, RangeId};
 
 use super::consistency::{self, Budget, Verdict};
@@ -375,7 +376,7 @@ pub fn entails_ontology(
             .map(|a| Test::Axiom(import.axiom(a)))
             .collect()
     };
-    let deadline = std::time::Instant::now() + budget.timeout;
+    let deadline = Deadline::after(budget.timeout);
     let compiled = Batch::new(&mut o, &tests, budget.memory.as_ref());
     let mut answer = Entailed::Yes;
     for (index, test) in tests.iter().enumerate() {

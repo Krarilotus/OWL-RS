@@ -163,7 +163,7 @@ impl Engine<'_> {
                 Err(Stop::Clash(dep))
             }
             Verdict::Stopped => Err(Stop::GaveUp(
-                config.stopped().unwrap_or(super::TIME_BUDGET).to_owned(),
+                config.stopped().unwrap_or(&super::TIME_BUDGET).to_owned(),
             )),
         }
     }

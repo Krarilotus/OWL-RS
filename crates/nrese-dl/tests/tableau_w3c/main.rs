@@ -111,7 +111,7 @@ fn config() -> Config {
     let small = SMALL.with(std::cell::Cell::get);
     Config {
         max_nodes: if small {
-            500
+            Some(500)
         } else {
             Config::default().max_nodes
         },
@@ -122,7 +122,7 @@ fn config() -> Config {
             number("NRESE_W3C_MERGES", 20_000)
         }),
         timeout: Some(Duration::from_secs(number("NRESE_W3C_TIMEOUT", 600))),
-        max_memory: 2 << 30,
+        max_memory: Some(2 << 30),
         disjunct_learning: !off("no-disjunct-learning"),
         incremental_blocking: !off("full-blocking"),
         lazy_definitions: !off("no-lazy-definitions"),
