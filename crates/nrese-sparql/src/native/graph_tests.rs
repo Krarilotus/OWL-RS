@@ -48,7 +48,7 @@ fn graph_completion_and_explain_cancel_after_algebra() {
                 })));
                 let options = QueryOptions {
                     resources: crate::Resources {
-                        shared_memory: Some(shared.clone()),
+                        memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
                         cancellation: Some(token),
                         ..Default::default()
                     },

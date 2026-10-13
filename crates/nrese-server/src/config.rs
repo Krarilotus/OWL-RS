@@ -85,6 +85,10 @@ impl ServerConfig {
             ),
             ("store.vocabulary", store.vocabulary.as_str().to_owned()),
             (
+                "store.invalid_statements",
+                store.invalid_statements.name().to_owned(),
+            ),
+            (
                 "store.ontology_path",
                 store
                     .ontology_path

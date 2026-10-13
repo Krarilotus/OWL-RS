@@ -13,18 +13,16 @@
 //!    the conclusion, so glass-box steps (the context core's, the RL rules') can join it.
 //!
 //! All tests, including final verification, share one deadline and cancellation token.
-//! Past `MAX_TESTS` or `dl.timeout`, return a known-entailing set marked not `minimal`
+//! Past `dl.explanation_tests` or `dl.timeout`, return a known-entailing set marked not `minimal`
 //! or `verified`; no fresh verification timeout is granted.
 
+use nrese_dl::limits::Deadline;
 use std::time::Instant;
 
 use nrese_owl::{Axiom, Ontology, ProofGraph};
 
 use super::consistency::{self, Budget, Verdict};
 use super::entailment::{self, Entailed};
-
-/// The most entailment tests one explanation runs.
-const MAX_TESTS: usize = 256;
 
 /// What is explained: an axiom the ontology entails, or its inconsistency.
 #[derive(Debug, Clone)]
@@ -55,7 +53,7 @@ struct Search<'a> {
     budget: &'a Budget,
     background: Vec<usize>,
     tests: usize,
-    deadline: Instant,
+    deadline: Deadline,
     spent: bool,
 }
 
@@ -63,8 +61,11 @@ impl Search<'_> {
     /// Whether the axioms `subset` (with the background) give the goal; a test past the
     /// budget counts as "no" (so the axioms stay in), and marks the search spent.
     fn holds(&mut self, subset: &[usize]) -> bool {
-        if self.tests >= MAX_TESTS
-            || Instant::now() >= self.deadline
+        if self
+            .budget
+            .explanation_tests
+            .is_some_and(|most| self.tests >= most)
+            || self.deadline.passed()
             || self
                 .budget
                 .cancel
@@ -157,7 +158,7 @@ pub(crate) fn justify(
     goal: &Goal,
     fresh: &[u64],
     budget: &Budget,
-    deadline: Instant,
+    deadline: Deadline,
 ) -> Option<Justification> {
     let (background, candidates): (Vec<usize>, Vec<usize>) = (0..ontology.axioms.len())
         .partition(|&i| matches!(ontology.axioms[i], Axiom::Declaration(..)));
@@ -246,6 +247,12 @@ impl crate::StoreService {
         let [s, p, o] = statement.map(|t| snapshot.lookup(t).map(TermId::raw));
         let (s, p, o) = (s?, p?, o?);
         let base = super::query::ontology_at(self, &snapshot);
+        // The request's envelope: its copy of the premise, and the tests' engines.
+        let memory = self.envelope(None);
+        let mut scratch = nrese_dl::memory::Scratch::new(Some(&memory));
+        scratch
+            .charge(|| nrese_dl::memory::ontology_bytes(&base))
+            .ok()?;
         let mut ontology = (*base).clone();
         let ids = super::query::Ids::of(&snapshot);
         let axiom = super::query::ground_axiom(&mut ontology, &snapshot, [s, p, o], ids).ok()?;
@@ -261,15 +268,15 @@ impl crate::StoreService {
                 .map(TermId::raw)
             })
             .collect::<Option<_>>()?;
-        let deadline = started + self.config().dl.timeout;
+        let deadline = Deadline::after(self.config().dl.timeout);
         // An entailment oracle can contain several consistency checks. The shared
         // token also stops those inner tests at this operation's deadline.
-        let justification = super::gate::cancellable(&|| Instant::now() >= deadline, |cancel| {
+        let justification = super::gate::cancellable(&|| deadline.passed(), |cancel| {
             justify(
                 &ontology,
                 &Goal::Entails(axiom),
                 &fresh,
-                &super::gate::budget(self, Some(cancel)),
+                &super::gate::budget(self, Some(cancel), &memory),
                 deadline,
             )
         })?;
@@ -303,7 +310,13 @@ mod tests {
         ontology.sources.push(Vec::new());
         for stop in ["cancelled", "deadline", "tests"] {
             let cancel = Cancel::default();
-            let budget = super::super::gate::budget(&store, Some(cancel.clone()));
+            let mut budget = super::super::gate::budget(
+                &store,
+                Some(cancel.clone()),
+                &nrese_exec::Envelope::unlimited(),
+            );
+            // The test budget as configured: none by default.
+            budget.explanation_tests = Some(256);
             let mut search = Search {
                 ontology: &ontology,
                 goal: &Goal::Inconsistent,
@@ -311,7 +324,7 @@ mod tests {
                 budget: &budget,
                 background: Vec::new(),
                 tests: 0,
-                deadline: Instant::now() + budget.timeout,
+                deadline: Deadline::after(budget.timeout),
                 spent: false,
             };
             assert!(
@@ -320,8 +333,10 @@ mod tests {
             );
             match stop {
                 "cancelled" => cancel.cancel(),
-                "deadline" => search.deadline = Instant::now() - Duration::from_secs(1),
-                "tests" => search.tests = MAX_TESTS,
+                "deadline" => {
+                    search.deadline = Deadline::at(Instant::now() - Duration::from_secs(1))
+                }
+                "tests" => search.tests = 256,
                 _ => unreachable!(),
             }
             let tests = search.tests;

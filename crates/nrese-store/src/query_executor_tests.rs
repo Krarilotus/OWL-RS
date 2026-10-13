@@ -61,6 +61,7 @@ fn preparation_cancellation_is_an_error_and_the_original_report_is_retained() {
             &prepared,
             &settings,
             &token,
+            &nrese_exec::Envelope::unlimited(),
             &mut bytes,
             |_| panic!("cancelled before reporting")
         ),
@@ -75,6 +76,7 @@ fn preparation_cancellation_is_an_error_and_the_original_report_is_retained() {
         &prepared,
         &settings,
         &token,
+        &nrese_exec::Envelope::unlimited(),
         &mut bytes,
         |report| {
             assert_eq!(report.unwrap().checks, 1);
@@ -92,6 +94,7 @@ fn preparation_cancellation_is_an_error_and_the_original_report_is_retained() {
         &prepared,
         &settings,
         &token,
+        &nrese_exec::Envelope::unlimited(),
         std::io::sink(),
         |_| String::new(),
     )
@@ -107,25 +110,38 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
     let snapshot = engine.snapshot();
     let token = CancellationToken::new();
     let mut first = Vec::new();
-    run_query(&snapshot, &prepared, &settings, &token, &mut first, |_| {
-        // Mutating the engine during reporting must not change the answers' view.
-        let mut tx = engine.transaction();
-        tx.insert(
-            nrese_rdf::Quad::new(
-                nrese_rdf::NamedNode::new_unchecked("http://example.org/bob"),
-                nrese_rdf::NamedNode::new_unchecked("http://example.org/worksFor"),
-                nrese_rdf::NamedNode::new_unchecked("http://example.org/acme"),
-                nrese_rdf::GraphName::DefaultGraph,
-            )
-            .as_ref(),
-        );
-        tx.commit().unwrap();
-        "same-context".to_owned()
-    })
+    run_query(
+        &snapshot,
+        &prepared,
+        &settings,
+        &token,
+        &nrese_exec::Envelope::unlimited(),
+        &mut first,
+        |_| {
+            // Mutating the engine during reporting must not change the answers' view.
+            let mut tx = engine.transaction();
+            tx.insert(
+                nrese_rdf::Quad::new(
+                    nrese_rdf::NamedNode::new_unchecked("http://example.org/bob"),
+                    nrese_rdf::NamedNode::new_unchecked("http://example.org/worksFor"),
+                    nrese_rdf::NamedNode::new_unchecked("http://example.org/acme"),
+                    nrese_rdf::GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            );
+            tx.commit().unwrap();
+            "same-context".to_owned()
+        },
+    )
     .unwrap();
     let text = std::str::from_utf8(&first).unwrap();
     assert!(text.contains("ann") && !text.contains("bob"));
-    let options = query_options(&prepared, &settings, &token);
+    let options = query_options(
+        &prepared,
+        &settings,
+        &token,
+        &nrese_exec::Envelope::unlimited(),
+    );
     assert!(
         matches!(
             nrese_sparql::cached_output(
@@ -140,10 +156,18 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
         "original key retained"
     );
     let mut bytes = Vec::new();
-    let error = run_query(&snapshot, &prepared, &settings, &token, &mut bytes, |_| {
-        token.cancel();
-        "same-context".to_owned()
-    })
+    let error = run_query(
+        &snapshot,
+        &prepared,
+        &settings,
+        &token,
+        &nrese_exec::Envelope::unlimited(),
+        &mut bytes,
+        |_| {
+            token.cancel();
+            "same-context".to_owned()
+        },
+    )
     .unwrap_err();
     assert!(matches!(
         error,
@@ -162,6 +186,7 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
         &prepared,
         &settings,
         &CancellationToken::new(),
+        &settings.query_envelope(&prepared),
         &mut second,
         |_| "same-context".to_owned(),
     )
@@ -173,9 +198,15 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
         bytes: Vec::new(),
     };
     assert!(matches!(
-        run_query(&snapshot, &prepared, &settings, &token, &mut writer, |_| {
-            "same-context".to_owned()
-        }),
+        run_query(
+            &snapshot,
+            &prepared,
+            &settings,
+            &token,
+            &nrese_exec::Envelope::unlimited(),
+            &mut writer,
+            |_| { "same-context".to_owned() }
+        ),
         Err(StoreError::SparqlEvaluation(
             QueryEvaluationError::Cancelled
         ))
@@ -289,15 +320,26 @@ fn prepared_serializers_agree_with_standalone_execution_for_every_form_and_forma
                 &snapshot,
                 &prepared,
                 &prepared.query,
-                &query_options(&prepared, &settings, &token),
+                &query_options(
+                    &prepared,
+                    &settings,
+                    &token,
+                    &nrese_exec::Envelope::unlimited(),
+                ),
                 &token,
                 &mut expected,
             )
             .unwrap();
             let mut actual = Vec::new();
-            let report = run_query(&snapshot, &prepared, &settings, &token, &mut actual, |_| {
-                String::new()
-            })
+            let report = run_query(
+                &snapshot,
+                &prepared,
+                &settings,
+                &token,
+                &nrese_exec::Envelope::unlimited(),
+                &mut actual,
+                |_| String::new(),
+            )
             .unwrap()
             .unwrap();
             assert!(report.patterns > 0, "{text}");

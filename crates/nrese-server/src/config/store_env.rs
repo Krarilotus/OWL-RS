@@ -113,6 +113,14 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         bulk_load_memory_bytes: parse_bulk_load_memory(
             source.get(names::BULK_LOAD_MEMORY).as_deref(),
         )?,
+        invalid_statements: match choice(
+            source,
+            names::INVALID_STATEMENTS,
+            &["quarantine", "strict"],
+        )? {
+            None | Some(0) => nrese_store::InvalidStatements::Quarantine,
+            Some(_) => nrese_store::InvalidStatements::Strict,
+        },
         shacl_gate: parse_shacl_gate(
             source.get(names::SHACL_GATE).as_deref(),
             source.get(names::SHACL_GATE_SEVERITY).as_deref(),
@@ -141,35 +149,53 @@ fn parse_dl(source: &dyn ConfigSource) -> Result<nrese_store::DlConfig> {
         None => defaults.consistency,
         Some(at) => [DlConsistency::Inline, DlConsistency::Off][at],
     };
-    let timeout = match source.get(names::DL_TIMEOUT_MS) {
-        Some(text) => std::time::Duration::from_millis(
-            super::units::parse_duration_ms(&text)
-                .with_context(|| format!("failed to parse {}", names::DL_TIMEOUT_MS))?,
-        ),
-        None => defaults.timeout,
+    // Every budget: a value, or 0 or `unlimited` for none.
+    use super::env_values::parse_limit;
+    let millis = |text: &str| super::units::parse_duration_ms(text);
+    let duration = |name, default: Option<std::time::Duration>| {
+        let default = default.map(|d| d.as_millis() as u64);
+        parse_limit(source, name, default, millis)
+            .map(|ms| ms.map(std::time::Duration::from_millis))
     };
-    let memory_bytes = match source.get(names::DL_MEMORY) {
-        Some(text) => super::units::parse_size(&text)
-            .with_context(|| format!("failed to parse {}", names::DL_MEMORY))?
-            as usize,
-        None => defaults.memory_bytes,
-    };
+    let bytes = |text: &str| super::units::parse_size(text).map(|b| b as usize);
+    let count = |text: &str| -> Result<usize> { Ok(text.parse()?) };
+    let count64 = |text: &str| -> Result<u64> { Ok(text.parse()?) };
     Ok(nrese_store::DlConfig {
         answers,
         consistency,
-        timeout,
-        memory_bytes,
-        max_candidates: super::env_values::parse_usize(
+        timeout: duration(names::DL_TIMEOUT_MS, defaults.timeout)?,
+        memory_bytes: parse_limit(source, names::DL_MEMORY, defaults.memory_bytes, bytes)?,
+        max_candidates: parse_limit(
             source,
             names::DL_MAX_CANDIDATES,
             defaults.max_candidates,
+            count,
         )?,
         threads: super::env_values::parse_usize(source, names::DL_THREADS, defaults.threads)?,
-        max_nodes: super::env_values::parse_usize(source, names::DL_MAX_NODES, defaults.max_nodes)?,
-        max_branch_points: super::env_values::parse_u64(
+        max_nodes: parse_limit(source, names::DL_MAX_NODES, defaults.max_nodes, count)?,
+        max_branch_points: parse_limit(
             source,
             names::DL_MAX_BRANCH_POINTS,
             defaults.max_branch_points,
+            count64,
+        )?,
+        max_merges: parse_limit(source, names::DL_MAX_MERGES, defaults.max_merges, count64)?,
+        explanation_tests: parse_limit(
+            source,
+            names::DL_EXPLANATION_TESTS,
+            defaults.explanation_tests,
+            count,
+        )?,
+        lower_bound_timeout: duration(
+            names::DL_LOWER_BOUND_TIMEOUT_MS,
+            defaults.lower_bound_timeout,
+        )?,
+        max_join: parse_limit(source, names::DL_MAX_JOIN, defaults.max_join, count)?,
+        max_join_steps: parse_limit(
+            source,
+            names::DL_MAX_JOIN_STEPS,
+            defaults.max_join_steps,
+            count,
         )?,
     })
 }
@@ -398,12 +424,66 @@ mod tests {
         let dl = parse_dl(&source).unwrap();
         assert_eq!(dl.answers, DlAnswers::Exact);
         assert_eq!(dl.consistency, DlConsistency::Off);
-        assert_eq!(dl.timeout, std::time::Duration::from_secs(90));
-        assert_eq!(dl.memory_bytes, 1 << 30);
-        assert_eq!((dl.max_candidates, dl.threads), (50, 2));
+        assert_eq!(dl.timeout, Some(std::time::Duration::from_secs(90)));
+        assert_eq!(dl.memory_bytes, Some(1 << 30));
+        assert_eq!((dl.max_candidates, dl.threads), (Some(50), 2));
         let mut source = KeyValueSource::default();
         source.insert(names::DL_ANSWERS, "complete");
         assert!(parse_dl(&source).is_err());
+    }
+
+    #[test]
+    fn every_dl_budget_takes_a_value_zero_or_unlimited() {
+        use std::time::Duration;
+        let budgets = [
+            names::DL_TIMEOUT_MS,
+            names::DL_MEMORY,
+            names::DL_MAX_CANDIDATES,
+            names::DL_MAX_NODES,
+            names::DL_MAX_BRANCH_POINTS,
+            names::DL_MAX_MERGES,
+            names::DL_EXPLANATION_TESTS,
+            names::DL_LOWER_BOUND_TIMEOUT_MS,
+            names::DL_MAX_JOIN,
+            names::DL_MAX_JOIN_STEPS,
+        ];
+        let set = |value: &str| {
+            let mut source = KeyValueSource::default();
+            for name in budgets {
+                source.insert(name, value);
+            }
+            parse_dl(&source).unwrap()
+        };
+        for none in ["0", "unlimited", "Unlimited"] {
+            let dl = set(none);
+            assert_eq!(dl.timeout, None, "{none}");
+            assert_eq!(dl.lower_bound_timeout, None);
+            assert_eq!((dl.memory_bytes, dl.max_candidates), (None, None));
+            assert_eq!(
+                (dl.max_nodes, dl.max_join, dl.max_join_steps),
+                (None, None, None)
+            );
+            assert_eq!((dl.max_branch_points, dl.max_merges), (None, None));
+            assert_eq!(dl.explanation_tests, None);
+        }
+        let dl = set("7");
+        assert_eq!(dl.timeout, Some(Duration::from_millis(7)));
+        assert_eq!((dl.memory_bytes, dl.max_nodes), (Some(7), Some(7)));
+        assert_eq!((dl.max_branch_points, dl.max_merges), (Some(7), Some(7)));
+        // The defaults: the server's time, the candidates, the route thresholds; no
+        // memory of a run's own and no deterministic budget.
+        let defaults = DlConfig::default();
+        assert_eq!(defaults.timeout, Some(Duration::from_secs(30 * 60)));
+        assert_eq!(defaults.max_candidates, Some(1_000));
+        assert_eq!(defaults.memory_bytes, None);
+        assert_eq!(
+            (defaults.max_nodes, defaults.max_branch_points),
+            (None, None)
+        );
+        assert_eq!(
+            (defaults.max_merges, defaults.explanation_tests),
+            (None, None)
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@
 
 use std::time::{Duration, Instant};
 
+use nrese_dl::limits::{Deadline, Limit};
 use nrese_dl::tableau;
 use nrese_exec::workers::Workers;
 use nrese_owl::Ontology;
@@ -48,32 +49,44 @@ pub struct Checked {
 /// The budgets of a check.
 #[derive(Debug, Clone)]
 pub struct Budget {
-    pub timeout: Duration,
-    pub memory_bytes: usize,
+    /// The check's time (`None`: unlimited).
+    pub timeout: Option<Duration>,
+    /// What one engine run may hold (`dl.memory`, shared among a batch's workers; `None`:
+    /// only the envelope).
+    pub memory_bytes: Option<usize>,
+    /// The request's envelope, which the runs' capacity and their compilation scratch
+    /// draw from as well ([`nrese_dl::memory`]); `None`: `memory_bytes` alone.
+    pub memory: Option<nrese_exec::Envelope>,
     /// The operation's allowance within its physical owner.
     pub workers: Workers,
     /// Stops the context core and hypertableau at their next budget check.
     pub cancel: Option<tableau::Cancel>,
-    /// The deterministic budgets of a hypertableau run.
-    pub max_nodes: usize,
-    pub max_branch_points: u64,
+    /// The deterministic budgets of a hypertableau run (`None`: unlimited).
+    pub max_nodes: Option<usize>,
+    pub max_branch_points: Option<u64>,
+    pub max_merges: Option<u64>,
+    /// The most conclusions one join of the context core may produce (`dl.max_join`): a
+    /// route threshold, past it the Horn stage stops and the hypertableau decides.
+    pub max_join: Option<usize>,
+    /// The entailment tests a justification of the check's verdict may run
+    /// (`dl.explanation_tests`).
+    pub explanation_tests: Option<usize>,
 }
 
 impl Budget {
     /// A nested check spends the operation's remaining time, never a fresh full timeout.
-    pub(crate) fn remaining(&self, deadline: Instant) -> Self {
+    pub(crate) fn remaining(&self, deadline: Deadline) -> Self {
         Self {
-            timeout: self
-                .timeout
-                .min(deadline.saturating_duration_since(Instant::now())),
+            timeout: deadline.within(self.timeout),
             ..self.clone()
         }
     }
-}
 
-/// The most conclusions one join of the context core may produce (its deterministic
-/// budget; past it the Horn stage gives up and the hypertableau decides).
-const MAX_JOIN: usize = 1 << 20;
+    /// Whether no time is left (a zero timeout).
+    pub(crate) fn spent(&self) -> bool {
+        self.timeout.is_some_and(|timeout| timeout.is_zero())
+    }
+}
 
 /// Why a model of `ontology` says nothing for the source: parts of the source weren't
 /// read (fatal diagnostics), so they may have no model. An inconsistency found stands.
@@ -130,10 +143,12 @@ pub(crate) fn check_after_assertions(
 /// The hypertableau's configuration within `budget`.
 fn tableau_config(budget: &Budget) -> tableau::Config {
     tableau::Config {
-        timeout: Some(budget.timeout),
+        timeout: budget.timeout,
         max_memory: budget.memory_bytes,
+        memory: budget.memory.clone(),
         max_nodes: budget.max_nodes,
-        max_branch_points: Some(budget.max_branch_points),
+        max_branch_points: budget.max_branch_points,
+        max_merges: budget.max_merges,
         cancel: budget.cancel.clone(),
         workers: Some(budget.workers.clone()),
         ..tableau::Config::default()
@@ -151,10 +166,10 @@ fn verdict(answer: tableau::Answer) -> Verdict {
 
 fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
     let started = Instant::now();
-    let deadline = started + budget.timeout;
-    if budget.timeout.is_zero() {
+    let deadline = Deadline::after(budget.timeout);
+    if budget.spent() {
         return Checked {
-            verdict: Verdict::Unknown("timeout".to_owned()),
+            verdict: Verdict::Unknown(Limit::Time.reached("no time left")),
             engine: "none",
             elapsed: started.elapsed(),
         };
@@ -163,9 +178,10 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
         threads: budget.workers.width(),
         proofs: false,
         budget: nrese_dl::context::Budget {
-            deadline: Some(deadline),
-            max_join: Some(MAX_JOIN),
-            task_memory: (budget.memory_bytes != usize::MAX).then_some(budget.memory_bytes),
+            deadline: deadline.instant(),
+            max_join: budget.max_join,
+            task_memory: budget.memory_bytes,
+            memory: budget.memory.clone(),
             ..nrese_dl::context::Budget::default()
         },
         ..nrese_dl::context::Options::default()
@@ -213,12 +229,16 @@ mod tests {
 
     fn budget() -> Budget {
         Budget {
-            timeout: Duration::from_secs(10),
-            memory_bytes: usize::MAX,
+            timeout: Some(Duration::from_secs(10)),
+            memory_bytes: None,
+            memory: None,
             workers: Workers::serial(),
             cancel: None,
-            max_nodes: 10_000,
-            max_branch_points: 10_000,
+            max_nodes: Some(10_000),
+            max_branch_points: Some(10_000),
+            max_merges: None,
+            max_join: None,
+            explanation_tests: None,
         }
     }
 

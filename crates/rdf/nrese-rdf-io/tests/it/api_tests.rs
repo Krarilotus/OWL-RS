@@ -183,6 +183,46 @@ fn chunks_of_any_size_cover_the_document_once() {
     );
 }
 
+/// A parse in chunks names an error's line in the document, not in its chunk (Claros, 13 Oct
+/// 2026: an invalid IRI on line 17,794,519 was reported at line 3,751,763 of its chunk).
+#[test]
+fn chunks_name_the_documents_line() {
+    let good = "<http://e/s> <http://e/p> <http://e/o> .\n";
+    let mut text = good.repeat(40);
+    // \r and \n each end a line, as the reader counts them: three lines here.
+    text.push_str("# a comment\r\n\n");
+    text.push_str(&good.repeat(40));
+    text.push_str("<http://e/s> <http://e/p> <http://e/a%&b> .\n");
+    text.push_str(&good.repeat(5));
+    // 40 lines, three, 40 more: the bad one is line 84, from 1.
+    fn error_line<R: std::io::Read>(chunks: Vec<nrese_rdf_io::QuadParser<'_, R>>) -> u64 {
+        let error = chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.filter_map(Result::err))
+            .next()
+            .expect("the invalid IRI is refused");
+        match error {
+            nrese_rdf_io::RdfParseError::Syntax(syntax) => syntax.location().start.line + 1,
+            other => panic!("a syntax error, not {other}"),
+        }
+    }
+    for parts in [1, 2, 3, 7, 64] {
+        let chunks = RdfParser::from_format(RdfFormat::NTriples)
+            .split_slice_for_parallel_parsing(text.as_bytes(), parts)
+            .unwrap();
+        assert_eq!(error_line(chunks), 84, "{parts} parts");
+    }
+    let path = std::env::temp_dir().join(format!("nrese-rdf-io-lines-{}.nt", std::process::id()));
+    std::fs::write(&path, &text).unwrap();
+    for parts in [1, 4, 13] {
+        let chunks = RdfParser::from_format(RdfFormat::NTriples)
+            .split_file_for_parallel_parsing(&path, parts)
+            .unwrap();
+        assert_eq!(error_line(chunks), 84, "{parts} file parts");
+    }
+    std::fs::remove_file(&path).unwrap();
+}
+
 #[test]
 fn errors_say_where() {
     let text = "<http://e/s> <http://e/p> <http://e/o> .\n# a comment\n<http://e/s> <http://e/p> \"open .\n";

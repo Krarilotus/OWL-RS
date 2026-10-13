@@ -62,7 +62,7 @@ pub fn horn_lower_bound(
     cancel: Option<crate::Cancel>,
 ) -> Option<Lower> {
     let all = &normalised.clauses;
-    let budget = core.budget;
+    let budget = core.budget.clone();
     // The clauses of the part, by index into the normalisation's.
     let kept: Vec<usize> = (0..all.len())
         .filter(|&i| admissible(&all[i], core.equality))
@@ -77,7 +77,7 @@ pub fn horn_lower_bound(
     });
     let first = crate::context::Budget {
         deadline: most,
-        ..budget
+        ..budget.clone()
     };
     let horn: Vec<usize> = kept
         .iter()
@@ -88,7 +88,7 @@ pub fn horn_lower_bound(
     let with = |budget| crate::context::Options {
         budget,
         proofs: false,
-        ..*core
+        ..core.clone()
     };
     if let Some(l) = saturate(
         normalised,

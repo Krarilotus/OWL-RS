@@ -44,6 +44,8 @@ pub struct StoreService {
     settings: crate::query_executor::StoreSettings,
     /// Namespace prefixes for clients ([`crate::namespaces`]).
     namespaces: std::sync::Arc<crate::namespaces::Namespaces>,
+    /// Statements bulk loads couldn't read ([`crate::quarantine`]).
+    quarantine: std::sync::Arc<crate::quarantine::Quarantine>,
     /// Client transactions ([`crate::sessions`]).
     sessions: std::sync::Arc<crate::sessions::Sessions>,
     /// The queries running now ([`crate::running`]).
@@ -147,9 +149,13 @@ impl StoreService {
         let namespaces = crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
         );
+        let quarantine = crate::quarantine::Quarantine::open(
+            (config.mode == StoreMode::OnDisk).then_some(config.data_dir.as_path()),
+        )?;
         let service = Self {
             settings,
             namespaces: std::sync::Arc::new(namespaces),
+            quarantine: std::sync::Arc::new(quarantine),
             sessions: std::sync::Arc::default(),
             running: std::sync::Arc::default(),
             supports: std::sync::Arc::default(),
@@ -235,6 +241,11 @@ impl StoreService {
     /// The store's namespace prefixes ([`crate::namespaces`]).
     pub fn namespaces(&self) -> &crate::namespaces::Namespaces {
         &self.namespaces
+    }
+
+    /// The statements bulk loads couldn't read ([`crate::quarantine`]).
+    pub fn quarantine(&self) -> &crate::quarantine::Quarantine {
+        &self.quarantine
     }
 
     /// The store's client transactions ([`crate::sessions`]).
@@ -368,7 +379,7 @@ impl StoreService {
         cancellation: &'a CancellationToken,
     ) -> crate::mutation::command::UpdateContext<'a> {
         crate::mutation::command::UpdateContext {
-            runtime: self.runtime(),
+            memory: self.envelope(None),
             cancellation,
             union_default_graph: self.config.union_default_graph,
             geosparql_stated_only: self.config.geosparql_stated_only,
@@ -669,39 +680,44 @@ impl StoreService {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
+        // The request's one envelope: every evaluation, retained result and DL task of
+        // the request draws from it.
+        let memory = self.settings.query_envelope(prepared);
         if let Some(mode) = self.dl_mode(prepared) {
             use crate::dl::query::{Outcome, Read};
             let dl = format!("owl2-dl {mode:?}");
-            let detail = match crate::dl::query::answer(self, prepared, cancellation, mode)? {
-                Outcome::Answers(answers, status, detail) => {
-                    report(Some(status));
-                    crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
-                    detail
-                }
-                // Streamed over the snapshot the status was decided on (L's view where
-                // L adds memberships, kept per revision, whose identity is its own),
-                // never a later revision's; or, for a status that holds whatever the
-                // revision (sound only), over the latest.
-                Outcome::Stream(status, read, detail) => {
-                    let snapshot = match read {
-                        Read::Lower(snapshot) | Read::At(snapshot) => snapshot,
-                        Read::Latest => self.read_snapshot(prepared.access()),
-                    };
-                    let context = format!("{dl} {status:?}");
-                    run_query(
-                        &snapshot,
-                        prepared,
-                        &self.settings,
-                        cancellation,
-                        out,
-                        |_| {
-                            report(Some(status));
-                            context
-                        },
-                    )?;
-                    detail
-                }
-            };
+            let detail =
+                match crate::dl::query::answer(self, prepared, cancellation, &memory, mode)? {
+                    Outcome::Answers(answers, status, detail) => {
+                        report(Some(status));
+                        crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
+                        detail
+                    }
+                    // Streamed over the snapshot the status was decided on (L's view where
+                    // L adds memberships, kept per revision, whose identity is its own),
+                    // never a later revision's; or, for a status that holds whatever the
+                    // revision (sound only), over the latest.
+                    Outcome::Stream(status, read, detail) => {
+                        let snapshot = match read {
+                            Read::Lower(snapshot) | Read::At(snapshot) => snapshot,
+                            Read::Latest => self.read_snapshot(prepared.access()),
+                        };
+                        let context = format!("{dl} {status:?}");
+                        run_query(
+                            &snapshot,
+                            prepared,
+                            &self.settings,
+                            cancellation,
+                            &memory,
+                            out,
+                            |_| {
+                                report(Some(status));
+                                context
+                            },
+                        )?;
+                        detail
+                    }
+                };
             return Ok((Some(detail), None));
         }
         let snapshot = self.read_snapshot(prepared.access());
@@ -710,6 +726,7 @@ impl StoreService {
             prepared,
             &self.settings,
             cancellation,
+            &memory,
             out,
             |ql| {
                 let status = ql
@@ -770,6 +787,12 @@ impl StoreService {
         &self.settings.runtime
     }
 
+    /// A request's memory envelope within the catalog's budget: `limit` bytes of its
+    /// own, or none.
+    pub(crate) fn envelope(&self, limit: Option<usize>) -> nrese_exec::Envelope {
+        self.settings.envelope(limit)
+    }
+
     /// Runs a prepared query on the latest snapshot to completion and reports how it ran:
     /// the executor, each operator with estimated and actual rows, and times.
     pub fn explain_query(
@@ -780,11 +803,13 @@ impl StoreService {
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
+        let memory = self.settings.query_envelope(prepared);
         let mut explanation = explain_prepared(
             &self.read_snapshot(prepared.access()),
             prepared,
             &self.settings,
             cancellation,
+            &memory,
         )?;
         if let Some(mode) = self.dl_mode(prepared) {
             // The status as the query would answer, never failing for it.
@@ -793,7 +818,7 @@ impl StoreService {
                 other => other,
             };
             let (status, detail) =
-                match crate::dl::query::answer(self, prepared, cancellation, mode)? {
+                match crate::dl::query::answer(self, prepared, cancellation, &memory, mode)? {
                     crate::dl::query::Outcome::Answers(_, status, detail)
                     | crate::dl::query::Outcome::Stream(status, _, detail) => (status, detail),
                 };
@@ -970,12 +995,14 @@ impl StoreService {
             .ops
             .iter()
             .any(|op| !matches!(op, crate::StatementOp::Add { .. }));
+        let memory = self.settings.query_envelope(prepared);
         self.with_pending(pending, &scope, cancellation, |snapshot| {
             run_query(
                 snapshot,
                 prepared,
                 &self.settings,
                 cancellation,
+                &memory,
                 out,
                 |ql| {
                     let mut status = match in_dl {
@@ -1277,7 +1304,8 @@ impl StoreService {
         progress: &crate::LoadProgress,
     ) -> StoreResult<BulkLoadReport> {
         self.invalidate_reasoning()?;
-        bulk_load(&self.engine, request, progress)
+        let invalid = request.invalid.unwrap_or(self.config.invalid_statements);
+        bulk_load(&self.engine, request, progress, invalid, &self.quarantine)
     }
 
     /// Builds the query planner's statistics of the store as it is now and saves them

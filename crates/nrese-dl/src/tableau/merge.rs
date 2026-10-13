@@ -8,10 +8,10 @@
 //! A merge the NI rule governs (two blockable neighbours of a root, one of them not its
 //! successor, raised by an at-most restriction at the root) is left to it (`ni.rs`).
 
-use super::MERGE_BUDGET;
 use super::depset::DepSetId;
 use super::engine::{Engine, Lit, Step, Stop, proof};
 use super::graph::{Annot, NONE, flag};
+use crate::limits::Limit;
 
 impl Engine<'_> {
     /// Merges what `a` and `b` stand for now, by the equality's `dep` and the merges that
@@ -34,10 +34,7 @@ impl Engine<'_> {
             .max_merges
             .is_some_and(|m| self.stats.merges >= m)
         {
-            return Err(Stop::GaveUp(format!(
-                "{MERGE_BUDGET} ({})",
-                self.stats.merges
-            )));
+            return Err(Stop::GaveUp(Limit::Merges.reached(self.stats.merges)));
         }
         let (from, into) = self.direction(a, b);
         self.stats.merges += 1;

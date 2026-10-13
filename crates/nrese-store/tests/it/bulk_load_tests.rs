@@ -18,7 +18,7 @@ fn request(files: &[&Path]) -> BulkLoadRequest {
         files: files.iter().map(|path| path.to_path_buf()).collect(),
         replace: false,
         graph: GraphTarget::DefaultGraph,
-        skip_errors: false,
+        invalid: Some(nrese_store::InvalidStatements::Strict),
     }
 }
 
@@ -176,10 +176,10 @@ fn a_parse_error_names_the_file_and_changes_nothing() {
     assert!(matches!(error, StoreError::Configuration(_)), "{error}");
 }
 
-/// With `skip_errors`, bad statements are counted and skipped and the rest loads: lines of
-/// N-Triples, statements of Turtle.
+/// By default bad statements are quarantined and the rest loads: lines of N-Triples,
+/// statements of Turtle, node elements of RDF/XML (more in quarantine_tests.rs).
 #[test]
-fn skip_errors_loads_the_good_statements() {
+fn bad_statements_are_quarantined_and_the_rest_loads() {
     let dir = tempdir().unwrap();
     let lines = dir.path().join("lines.nt");
     let mut text = ntriples(10);
@@ -202,13 +202,13 @@ fn skip_errors_loads_the_good_statements() {
     let service = service();
     let report = service
         .bulk_load(&BulkLoadRequest {
-            skip_errors: true,
+            invalid: None,
             ..request(&[&lines, &turtle, &xml])
         })
         .unwrap();
-    assert_eq!(report.skipped, 3);
+    assert_eq!(report.quarantined, 3);
     assert_eq!(report.inserted, 15);
-    // Without: the first bad statement stops the load.
+    // Strict: the first bad statement stops the load.
     let service = self::service();
     assert!(service.bulk_load(&request(&[&lines])).is_err());
 }
