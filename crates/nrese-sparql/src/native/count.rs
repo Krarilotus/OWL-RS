@@ -455,12 +455,29 @@ impl<'b> Weights<'b> {
         })
     }
 
-    /// The weight of `value`, the entries from `from` on searched (a forward walk).
+    /// The weight of `value`, the entries from `from` on searched forward by galloping:
+    /// O(log gap), so a merge of two lists of similar size is linear (a binary search of
+    /// the whole remainder per value made it n log n).
     fn weight(&self, value: u64, from: &mut usize) -> u64 {
-        let rest = &self.entries[*from..];
-        let k = rest.partition_point(|&(v, _)| v < value);
-        *from += k;
-        match rest.get(k) {
+        let entries = &self.entries;
+        let n = entries.len();
+        let mut lo = *from;
+        let k = if lo >= n || entries[lo].0 >= value {
+            lo
+        } else {
+            // entries[lo] < value: double the step until an entry not below it.
+            let mut step = 1;
+            let mut hi = lo + 1;
+            while hi < n && entries[hi].0 < value {
+                lo = hi;
+                step *= 2;
+                hi = lo + step;
+            }
+            let hi = hi.min(n);
+            lo + 1 + entries[lo + 1..hi].partition_point(|&(v, _)| v < value)
+        };
+        *from = k;
+        match entries.get(k) {
             Some(&(v, w)) if v == value => w,
             _ => self.default,
         }
@@ -1759,4 +1776,48 @@ fn drive_chunk(
 enum Solved<'b> {
     Count(u64),
     Weights(Weights<'b>),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Galloping lookups give what a search from the start gives, for ascending queries
+    /// dense and sparse, hits and misses.
+    #[test]
+    fn forward_lookups_find_what_a_full_search_finds() {
+        let budget = Budget::unlimited();
+        let mut state = 7u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            state >> 33
+        };
+        for size in [0usize, 1, 2, 5, 100, 5000] {
+            let mut entries: Vec<(u64, u64)> = (0..size)
+                .map(|_| (next() % 20_000, next() % 9 + 1))
+                .collect();
+            entries.sort_unstable();
+            entries.dedup_by_key(|e| e.0);
+            let Ok(weights) = Weights::new(&budget, entries.clone(), 3) else {
+                panic!("an unlimited budget")
+            };
+            for gap in [1u64, 3, 50, 4000] {
+                let mut from = 0;
+                let mut value = next() % 50;
+                while value < 21_000 {
+                    let expected = entries
+                        .binary_search_by_key(&value, |e| e.0)
+                        .map_or(3, |i| entries[i].1);
+                    assert_eq!(
+                        weights.weight(value, &mut from),
+                        expected,
+                        "{size} {gap} {value}"
+                    );
+                    value += 1 + next() % gap;
+                }
+            }
+        }
+    }
 }
