@@ -52,6 +52,19 @@ impl Tree {
     }
 
     fn pattern(&mut self, rng: &mut Rng, from: &str) -> String {
+        // Now and then a closure to a new variable, plain or after a step (`p1/p2+`), either
+        // way round.
+        if rng.below(10) == 0 {
+            let path = match rng.below(2) {
+                0 => format!("<{EX}p{}>+", rng.below(4)),
+                _ => format!("<{EX}p{}>/<{EX}p{}>+", rng.below(4), rng.below(4)),
+            };
+            let end = self.fresh();
+            return match rng.below(2) {
+                0 => format!("{from} {path} {end} ."),
+                _ => format!("{end} {path} {from} ."),
+            };
+        }
         let p = format!("<{EX}p{}>", rng.below(4));
         let others: Vec<String> = self.bound.iter().filter(|v| *v != from).cloned().collect();
         // A constant; a bound variable (two patterns over a pair, a cycle); the same
