@@ -128,6 +128,10 @@ const PROBE_CHUNK: usize = 4096;
 /// Decoded terms kept per query for repeated ids (ORDER BY, aggregates, expressions).
 const DECODE_CACHE_ENTRIES: usize = 1 << 18;
 
+/// The heap of a decoded term, about, where working memory holds terms by the many: the
+/// text of an IRI or a short literal.
+const ORDER_TERM_BYTES: usize = 48;
+
 pub(crate) enum NativeError {
     /// Something the executor doesn't implement.
     Unsupported(String),
@@ -1168,6 +1172,9 @@ struct Context<'a> {
     evaluator: Evaluator,
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
+    /// A charge for memory already held that the budget refused (computed terms): the
+    /// query ends with it at its next check.
+    overdrawn: Cell<Option<BudgetExceeded>>,
     decoded: RefCell<HashMap<u64, Option<Term>>>,
     /// Per aggregate argument, the variable it reads and id: its number for SUM and AVG
     /// ([`Context::numeric_pass`]), kept for the whole evaluation. Keyed by the expression
@@ -1298,6 +1305,7 @@ impl<'a> Context<'a> {
             aliases: RefCell::default(),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
+            overdrawn: Cell::new(None),
             decoded: RefCell::default(),
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
@@ -1377,11 +1385,28 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Whether the query may go on: not cancelled, and the process within its memory limit
+    /// ([`nrese_exec::memory::process_limit_exceeded`]), the bound on what the budget
+    /// doesn't account: a query past it ends with a memory error, never the process.
     fn check(&self) -> NativeResult<()> {
-        Ok(self
-            .cancellation
-            .as_ref()
-            .map_or(Ok(()), CancellationToken::check)?)
+        if let Some(token) = &self.cancellation {
+            token.check()?;
+        }
+        if let Some(exceeded) = self.overdrawn.get() {
+            return Err(QueryEvaluationError::MemoryLimit(exceeded).into());
+        }
+        if nrese_exec::memory::process_limit_exceeded() {
+            let limit = nrese_exec::memory::process_limit().unwrap_or(0);
+            let held = nrese_exec::memory::process_bytes().unwrap_or(limit);
+            return Err(QueryEvaluationError::MemoryLimit(BudgetExceeded {
+                limit: limit as usize,
+                requested: 0,
+                used: held as usize,
+                shared: true,
+            })
+            .into());
+        }
+        Ok(())
     }
 
     /// Charges a produced table against the query's memory budget.
@@ -1453,9 +1478,15 @@ impl<'a> Context<'a> {
             return term.clone();
         }
         let term = self.snapshot.decode(TermId::from_raw(id));
-        // Bounded: a scan over millions of distinct labels must not keep them all.
+        // Bounded: a scan over millions of distinct labels must not keep them all; and
+        // kept only while the budget has room for it (released when the query ends).
         if decoded.len() < DECODE_CACHE_ENTRIES {
-            decoded.insert(id, term.clone());
+            let bytes = std::mem::size_of::<(u64, Option<Term>)>()
+                + term.as_ref().map_or(0, term_heap_bytes)
+                + 16;
+            if self.budget.charge(bytes).is_ok() {
+                decoded.insert(id, term.clone());
+            }
         }
         term
     }
@@ -1474,6 +1505,14 @@ impl<'a> Context<'a> {
         let id = computed_id(computed.len() as u64);
         computed.push(term.clone());
         ids.insert(term.clone(), id);
+        // Kept until the query ends, twice (by id and by term): charged, and a charge past
+        // the budget ends the query at its next check.
+        let bytes = 2 * (std::mem::size_of::<Term>() + term_heap_bytes(term)) + 32;
+        if let Err(exceeded) = self.budget.charge(bytes)
+            && self.overdrawn.get().is_none()
+        {
+            self.overdrawn.set(Some(exceeded));
+        }
         id
     }
 
@@ -4132,7 +4171,7 @@ impl<'a> Context<'a> {
     /// `k` values that come first in that direction are told apart; the others share the
     /// rank that comes last (they cover at least `k` rows, so no row of the others is
     /// among the first `k`): a selection instead of a sort, for ORDER BY … LIMIT k.
-    fn order_ranks(&self, column: &[u64], top: Option<(usize, bool)>) -> Vec<u64> {
+    fn order_ranks(&self, column: &[u64], top: Option<(usize, bool)>) -> NativeResult<Vec<u64>> {
         // Plain inline xsd:integers only: their lexical forms are canonical, so their value
         // is their place in the total order. Integers of derived datatypes of one value
         // (`"6"^^xsd:nonNegativeInteger` and `"6"^^xsd:integer`) differ there by datatype,
@@ -4149,17 +4188,22 @@ impl<'a> Context<'a> {
             .all(|&id| id == UNDEF || integer(id).is_some())
         {
             // By value, above UNDEF, which sorts first in SPARQL.
-            return column
+            return Ok(column
                 .iter()
                 .map(|&id| match integer(id) {
                     Some(value) => (value + (1 << 62)) as u64 + 1,
                     None => 0,
                 })
-                .collect();
+                .collect());
         }
         let mut distinct = column.to_vec();
         distinct.par_sort_unstable();
         distinct.dedup();
+        // Each distinct value decoded, its order and rank: held while the ranks are made.
+        let _working = self.working(
+            distinct.len() * (std::mem::size_of::<value::Sortable>() + ORDER_TERM_BYTES + 16)
+                + column.len() * 8,
+        )?;
         // Stored terms are decoded and their values parsed on every core where there are
         // many (YAGO's 18 k populations, `"+4400"^^xsd:decimal`, are dictionary entries).
         let terms: Vec<value::Sortable> = if distinct.len() >= PARALLEL_RANKS
@@ -4224,10 +4268,10 @@ impl<'a> Context<'a> {
                 };
                 ranks.insert(distinct[d], value_rank);
             }
-            return column
+            return Ok(column
                 .iter()
                 .map(|id| ranks.get(id).copied().unwrap_or(rest))
-                .collect();
+                .collect());
         }
         by_term.par_sort_by(|&a, &b| terms[a].order(&terms[b]));
         let mut rank_of = vec![0u64; distinct.len()];
@@ -4238,10 +4282,19 @@ impl<'a> Context<'a> {
             }
             rank_of[d] = rank;
         }
-        column
+        Ok(column
             .iter()
             .map(|id| rank_of[distinct.binary_search(id).expect("id is in the column")])
-            .collect()
+            .collect())
+    }
+
+    /// Working memory an operator holds while it runs, charged to the query's budget until
+    /// the returned reservation drops.
+    fn working(&self, bytes: usize) -> NativeResult<nrese_exec::Reservation<&Budget>> {
+        let mut held = nrese_exec::Reservation::new(&*self.budget);
+        held.charge(bytes)
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        Ok(held)
     }
 
     /// The values of the sort `keys` for `rows` of `solutions`, by position in `rows`. A key
@@ -4253,7 +4306,7 @@ impl<'a> Context<'a> {
         keys: &[OrderExpression],
         rows: &[usize],
         limit: Option<usize>,
-    ) -> Vec<SortKey> {
+    ) -> NativeResult<Vec<SortKey>> {
         keys.iter()
             .enumerate()
             .map(|(i, key)| {
@@ -4269,13 +4322,13 @@ impl<'a> Context<'a> {
                     let top = limit
                         .filter(|_| i == 0 && keys.len() == 1)
                         .map(|k| (k, descending));
-                    return SortKey::Ids(self.order_ranks(&values, top));
+                    return Ok(SortKey::Ids(self.order_ranks(&values, top)?));
                 }
-                SortKey::Terms(
+                Ok(SortKey::Terms(
                     rows.iter()
                         .map(|&row| self.evaluator.eval(e, &self.binding(solutions, row)))
                         .collect(),
-                )
+                ))
             })
             .collect()
     }
@@ -4314,14 +4367,29 @@ impl<'a> Context<'a> {
             && k < n
             && keys.len() > 1
         {
-            let first = self.sort_keys(&solutions, &keys[..1], &rows, Some(k));
+            let first = self.sort_keys(&solutions, &keys[..1], &rows, Some(k))?;
             let cmp = |a: &usize, b: &usize| by_keys(&keys[..1], &first, *a, *b);
             let mut positions = rows.clone();
             positions.select_nth_unstable_by(k - 1, cmp);
             let pivot = positions[k - 1];
             rows.retain(|row| cmp(row, &pivot).is_le());
         }
-        let key_values = self.sort_keys(&solutions, keys, &rows, limit);
+        // The positions, their order and each key's value per row (a term per row for an
+        // expression), held while the rows are sorted.
+        let evaluated = keys
+            .iter()
+            .filter(|key| {
+                let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
+                !matches!(e, Expression::Variable(_))
+            })
+            .count();
+        let _working = self.working(
+            rows.len()
+                * (16
+                    + 8 * keys.len()
+                    + evaluated * (std::mem::size_of::<Option<Term>>() + ORDER_TERM_BYTES)),
+        )?;
+        let key_values = self.sort_keys(&solutions, keys, &rows, limit)?;
         let compare = |a: &usize, b: &usize| {
             by_keys(keys, &key_values, *a, *b).then_with(|| rows[*a].cmp(&rows[*b]))
         };
@@ -5399,6 +5467,25 @@ fn sorted_columns(scan: &ScanPattern, permutation: Permutation, vars: &[Variable
         }
     }
     sorted
+}
+
+/// The heap a term holds beyond its own size, about: its strings.
+fn term_heap_bytes(term: &Term) -> usize {
+    match term {
+        Term::NamedNode(node) => node.as_str().len(),
+        Term::BlankNode(node) => node.as_str().len(),
+        Term::Literal(literal) => {
+            literal.value().len()
+                + literal.language().map_or(0, str::len)
+                + literal.datatype().as_str().len()
+        }
+        Term::Triple(triple) => {
+            std::mem::size_of::<nrese_rdf::Triple>()
+                + term_heap_bytes(&triple.subject.clone().into())
+                + triple.predicate.as_str().len()
+                + term_heap_bytes(&triple.object)
+        }
+    }
 }
 
 fn triple_variables(triple: &TriplePattern) -> Vec<Variable> {

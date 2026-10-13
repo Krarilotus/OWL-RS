@@ -16,6 +16,11 @@ use super::numeric::Numeric;
 use super::value::Value;
 use super::{ScanPattern, Solutions, calendar, expression_variables, pushdown, value};
 
+/// Values an [`Aggregator`] remembers per (expression, id), at most: the groups of one
+/// aggregation share their values, but a scan over millions of distinct names must not
+/// keep them all.
+const MEMO_ENTRIES: usize = 1 << 16;
+
 /// An aggregate's value: a stored or computed id, or a new term the query interns.
 pub(super) enum Agg {
     Id(u64),
@@ -74,18 +79,23 @@ impl Aggregator<'_> {
         let mut total = Some(Numeric::Integer(Integer::from(0)));
         let mut error = false;
         for &row in rows {
-            let number =
-                *numbers
-                    .entry((key, table.get(row, column)))
-                    .or_insert_with(|| {
-                        match self.evaluator.eval(expr, &self.binding(solutions, row)) {
-                            None => Number::Error,
-                            Some(term) => match Numeric::of(&Value::of(&term)) {
-                                Some(number) => Number::Value(number),
-                                None => Number::Other,
-                            },
-                        }
-                    });
+            let id = (key, table.get(row, column));
+            let number = match numbers.get(&id) {
+                Some(&number) => number,
+                None => {
+                    let number = match self.evaluator.eval(expr, &self.binding(solutions, row)) {
+                        None => Number::Error,
+                        Some(term) => match Numeric::of(&Value::of(&term)) {
+                            Some(number) => Number::Value(number),
+                            None => Number::Other,
+                        },
+                    };
+                    if numbers.len() < MEMO_ENTRIES {
+                        numbers.insert(id, number);
+                    }
+                    number
+                }
+            };
             match number {
                 Number::Value(number) => total = total.and_then(|total| total.add(number)),
                 Number::Error => error = true,
@@ -185,6 +195,126 @@ impl Aggregator<'_> {
         }
     }
 
+    /// The expression's value at `row`: for an expression of one variable, remembered per
+    /// id across rows and groups (up to [`MEMO_ENTRIES`] of them), unless it draws a value
+    /// per row (RAND, BNODE).
+    fn value_at(
+        &self,
+        solutions: &Solutions,
+        row: usize,
+        expr: &Expression,
+        column: Option<usize>,
+    ) -> Option<Term> {
+        let eval = || self.evaluator.eval(expr, &self.binding(solutions, row));
+        // A variable's value is its term: the decoder keeps what it decoded.
+        let (Some(column), false) = (column, matches!(expr, Expression::Variable(_))) else {
+            return eval();
+        };
+        let key = (
+            expr as *const Expression as usize,
+            solutions.table.get(row, column),
+        );
+        if let Some(value) = self.memo.borrow().get(&key) {
+            return value.clone();
+        }
+        let value = eval();
+        let mut memo = self.memo.borrow_mut();
+        if memo.len() < MEMO_ENTRIES {
+            memo.insert(key, value.clone());
+        }
+        value
+    }
+
+    /// The one variable `expr` reads, where its value is the same for every row with that
+    /// variable's id (no value drawn per row).
+    fn single_column(solutions: &Solutions, expr: &Expression) -> Option<usize> {
+        if pushdown::per_solution(expr) {
+            return None;
+        }
+        let mut columns: Vec<usize> = expression_variables(expr)
+            .iter()
+            .filter_map(|v| solutions.column(v))
+            .collect();
+        columns.sort_unstable();
+        columns.dedup();
+        match columns[..] {
+            [column] => Some(column),
+            _ => None,
+        }
+    }
+
+    /// COUNT, SAMPLE, MIN, MAX and GROUP_CONCAT (without DISTINCT) of `expr` over `rows`,
+    /// folded a row at a time: a running result instead of every row's value (MIN of 30 M
+    /// names held each of them as a term). `None` for the other aggregates.
+    fn folded(
+        &self,
+        solutions: &Solutions,
+        rows: &[usize],
+        expr: &Expression,
+        name: &AggregateFunction,
+    ) -> Option<Agg> {
+        if !matches!(
+            name,
+            AggregateFunction::Count
+                | AggregateFunction::Sample
+                | AggregateFunction::Min
+                | AggregateFunction::Max
+                | AggregateFunction::GroupConcat { .. }
+        ) {
+            return None;
+        }
+        // COUNT skips errors and SAMPLE takes the first value, but one error makes the
+        // others unbound.
+        let fails_on_error = !matches!(name, AggregateFunction::Count | AggregateFunction::Sample);
+        let column = Self::single_column(solutions, expr);
+        let (mut count, mut best, mut concat) = (0u64, None::<Term>, String::new());
+        for &row in rows {
+            let Some(value) = self.value_at(solutions, row, expr, column) else {
+                if fails_on_error {
+                    return Some(Agg::Id(UNDEF));
+                }
+                continue;
+            };
+            match name {
+                AggregateFunction::Sample => return Some(Agg::Term(value)),
+                // The first of equal extremes.
+                AggregateFunction::Min | AggregateFunction::Max => {
+                    let wanted = match name {
+                        AggregateFunction::Min => std::cmp::Ordering::Less,
+                        _ => std::cmp::Ordering::Greater,
+                    };
+                    if best
+                        .as_ref()
+                        .is_none_or(|b| value::order(Some(&value), Some(b)) == wanted)
+                    {
+                        best = Some(value);
+                    }
+                }
+                AggregateFunction::GroupConcat { separator } => {
+                    let Term::Literal(literal) = &value else {
+                        return Some(Agg::Id(UNDEF));
+                    };
+                    if literal.language().is_none() && literal.datatype() != xsd::STRING {
+                        return Some(Agg::Id(UNDEF));
+                    }
+                    if count > 0 {
+                        concat.push_str(separator.as_deref().unwrap_or(" "));
+                    }
+                    concat.push_str(literal.value());
+                }
+                _ => {}
+            }
+            count += 1;
+        }
+        Some(match name {
+            AggregateFunction::Count => Agg::Term(integer(count)),
+            AggregateFunction::GroupConcat { .. } => {
+                Agg::Term(Literal::new_simple_literal(concat).into())
+            }
+            _ => best.map_or(Agg::Id(UNDEF), Agg::Term),
+        })
+    }
+
     /// The expression's value for each of `rows`. With `distinct`, only for the first row
     /// of each combination of the expression's variables: the repeats can't add a value.
     fn evaluated(
@@ -209,17 +339,11 @@ impl Aggregator<'_> {
         if let [column] = columns[..] {
             // One variable: its ids stand for the rows, and the values are remembered
             // across groups.
-            let key = expr as *const Expression as usize;
             let mut seen = HashSet::new();
-            let mut memo = self.memo.borrow_mut();
             return rows
                 .iter()
                 .filter(|&&row| !distinct || seen.insert(table.get(row, column)))
-                .map(|&row| {
-                    memo.entry((key, table.get(row, column)))
-                        .or_insert_with(|| eval(row))
-                        .clone()
-                })
+                .map(|&row| self.value_at(solutions, row, expr, Some(column)))
                 .collect();
         }
         if !distinct || columns.is_empty() {
@@ -273,6 +397,9 @@ impl Aggregator<'_> {
                     && let Some(result) =
                         self.numeric_total(solutions, rows, expr, *name == AggregateFunction::Avg)
                 {
+                    return result;
+                }
+                if !*distinct && let Some(result) = self.folded(solutions, rows, expr, name) {
                     return result;
                 }
                 let evaluated = self.evaluated(solutions, rows, expr, *distinct);
