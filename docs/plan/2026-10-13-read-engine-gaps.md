@@ -67,9 +67,11 @@ module docs). Whole serialised answers are kept beside them. Default size: 2 % o
    same algebra, so the same key); QLever answered it from its cache (1.0 ms), we computed it
    again (21 ms). It is not the spelling: 084's own second run took 2.58 ms, and 102's
    3.08 ms, against 0.25–0.41 ms for the hits around them (053, 085, 101, 103), so these
-   results were not kept at all. Next: the admission and eviction decisions per part, logged
-   in that run; the test `aggregates_written_differently_share_the_result_cache` covers the
-   key.
+   results were not kept at all. The key and the admission are not it: the test
+   `aggregates_written_differently_share_the_result_cache` keeps the part and finds it again,
+   written either way, under admit-all and under the default admission by benefit. What is
+   left is the run's cache state (2 % of memory, after 083's large result). Next: the
+   cache's counters (`nrese_query_cache_*`) read between queries of a paper-protocol run.
 4. *Streamed parts.* QLever keeps a lazy subresult while it stays under 5 MB. We
    materialise every part, so every part is a candidate; when parts stream (§4), the same
    rule applies: keep a streamed part only up to a bound, abandon the copy past it.
