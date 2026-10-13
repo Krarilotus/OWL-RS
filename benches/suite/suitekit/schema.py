@@ -5,19 +5,20 @@
 | date | when the run started (ISO 8601, minutes) |
 | host, runtime | the machine and how the system ran (docker, apptainer, process) |
 | system, version, publish | the system (systems.toml key), its version where it says, and whether its results may be published (free) or need the vendor's permission |
-| workload, tier, regime | the workload (workloads.toml key), its size, and the entailment regime the system ran (none, rdfs, owl-horst, owl2-rl, owl2-ql) |
+| workload, tier, regime | the workload (workloads.toml key), its size, and the entailment regime the system ran (none, rdfs, owl-horst, owl2-rl, owl2-ql), or custom: a named rule program (the tier names it), so that its results compare only with the same program's |
 | run | the repetition (a fresh store each) |
-| task | load, reason, size, restart, count, query, update, serve, conformance (a skipped pair: load, status skipped) |
-| item | the query or test the row is about (task query, conformance) |
+| task | load, reason, size, restart, count, query, update, serve, conformance, validate (SHACL; item = the shape set, rows = validation results), index (a service index built after the server started) (a skipped pair: load, status skipped) |
+| item | the query or test the row is about (task query, conformance); task count: `count:REL`, the facts of one derived relation (empty: the whole closure) |
 | repeat | the measured repetition of a query within a run; 0 is its first execution on the fresh server (a warm-up run, not in the medians) |
 | status | ok, failed, timeout, wrong (an answer count differs from the expected one), skipped |
 | ms | wall time |
 | peak_mib | peak resident memory of the step |
-| rows | answers (query), statements (load: asserted; reason: inferred; count: all answered) |
+| rows | answers (query), statements (load: asserted; reason: inferred; count: all answered, or a relation's facts), checked before any time counts: a count that differs from the known one is `wrong` |
 | bytes | store size (task size) |
 | note | what else the row needs to be read right |
 | cache | the system's result cache while the queries ran: off, on (the system's default), or - (it has none) |
 | order | the query order: fixed (each query's runs back to back), or shuffled:SEED (rounds over all queries, each in a new order; the same seed gives every system the same orders) |
+| recall | approximate search: the share of the true nearest found (recall@k, k = rows), 0 to 1; its times compare only at equal recall (empty: an exact answer) |
 
 The results of systems with publish = permission stay in the result files; `suite.py
 report` leaves them out unless asked (and they may not leave the machine without the
@@ -29,9 +30,9 @@ import csv
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
-TASKS = {"load", "reason", "size", "restart", "count", "query", "update", "serve", "conformance"}
+TASKS = {"load", "reason", "size", "restart", "count", "query", "update", "serve", "conformance", "validate", "index"}
 STATUSES = {"ok", "failed", "timeout", "wrong", "skipped"}
-REGIMES = {"none", "rdfs", "owl-horst", "owl2-rl", "owl2-ql", "-"}
+REGIMES = {"none", "rdfs", "owl-horst", "owl2-rl", "owl2-ql", "custom", "-"}
 
 
 @dataclass
@@ -57,6 +58,7 @@ class Result:
     note: str = ""
     cache: str = "-"
     order: str = "-"
+    recall: float | str = ""
 
 
 FIELDS = [f.name for f in fields(Result)]
@@ -72,8 +74,8 @@ def problems(result: Result) -> list[str]:
         out.append(f"unknown regime {result.regime!r}")
     if result.publish not in ("free", "permission"):
         out.append(f"publish must be free or permission, not {result.publish!r}")
-    if result.task == "query" and not result.item:
-        out.append("a query row names its query (item)")
+    if result.task in ("query", "validate") and not result.item:
+        out.append(f"a {result.task} row names its query or shape set (item)")
     return out
 
 

@@ -1,0 +1,9 @@
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+
+SELECT ?s1 
+WHERE { 
+	GRAPH <http://geographica.di.uoa.gr/dataset/geonames> {
+		?s1 <http://www.geonames.org/ontology#asWKT> ?o1
+	} 
+	FILTER(geof:sfWithin(?o1, geof:buffer("POINT(23.71622 37.97945)"^^<http://www.opengis.net/ont/geosparql#wktLiteral>, 0.03))).  
+}

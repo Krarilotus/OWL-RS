@@ -1,0 +1,22 @@
+PREFIX noa: <http://teleios.di.uoa.gr/ontologies/noaOntology.owl#> 
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+
+SELECT ?h ?sensor ?confidence ?producer ?satellite ?chain ?confirmation ?geomentry ?r ?wkt 
+WHERE {  
+  GRAPH <http://geographica.di.uoa.gr/dataset/hotspots> { 
+    ?h rdf:type noa:Hotspot; 
+       noa:isDerivedFromSensor ?sensor; 
+       noa:hasConfidence ?confidence; 
+       noa:isProducedBy ?producer; 
+       noa:isDerivedFromSatellite ?satellite; 
+       noa:producedFromProcessingChain ?chain; 
+       noa:hasConfirmation ?confirmation ; 
+       noa:hasAcquisitionTime "2007-07-26T00:45:00"^^xsd:dateTime; 
+       <http://teleios.di.uoa.gr/ontologies/noaOntology.owl#hasGeometry> ?geomentry. 
+    OPTIONAL {?h noa:refinedBy ?r} 
+    FILTER(!bound(?r)) 
+    ?geometry <http://teleios.di.uoa.gr/ontologies/noaOntology.owl#asWKT> ?wkt . 
+  FILTER(geof:sfIntersects(?wkt, "POLYGON((20.7858013633644 36.9947301001973,20.6070018260972 40.8452031365591,26.111857027467 40.875795540161,26.0004221014641 37.02141161985,20.7858013633644 36.9947301001973))"^^<http://www.opengis.net/ont/geosparql#wktLiteral>))
+  }
+}

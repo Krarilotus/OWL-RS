@@ -1,0 +1,14 @@
+# Qdrant (disabled upstream): M 16, unquantised (full-precision vectors), ef_construct 128
+# and 256 (its default is 100); the query sweep is upstream's hnsw_ef, with rescoring.
+float:
+  any:
+  - base_args: ['@metric']
+    constructor: Qdrant
+    disabled: false
+    docker_tag: ann-benchmarks-qdrant
+    module: ann_benchmarks.algorithms.qdrant
+    name: qdrant
+    run_groups:
+      M-16:
+        args: [['none'], [16], [128, 256]]
+        query_args: [[null, 8, 16, 32, 64, 128, 256, 512, 768], [True]]

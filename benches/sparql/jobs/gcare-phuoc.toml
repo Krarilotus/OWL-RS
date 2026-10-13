@@ -1,0 +1,18 @@
+# G-CARE on phuoc-yu: its own estimators by the paper's accuracy procedure (run-gcare.sh, the
+# image unpacked), then NRESE's estimates on the same queries (nrese-estimates.sh), and the
+# summary of both by G-CARE's measure (q-error percentiles over all trials).
+id = "sparql-gcare-phuoc-1"
+group = "sparql"
+host = "phuoc-yu"
+checkout = "suite/sparql"
+commands = [
+  ["bash", "scripts/quiet-slot.sh", "bash", "benches/sparql/gcare/run-gcare.sh", "/home/krarilotus/owlrs/results/sparql-gcare-phuoc-1/gcare",
+   "human", "aids", "lubm80", "yago"],
+  ["bash", "scripts/quiet-slot.sh", "bash", "benches/sparql/gcare/nrese-estimates.sh", "/home/krarilotus/owlrs/results/sparql-gcare-phuoc-1/nrese",
+   "/home/krarilotus/owlrs/results/sparql-gcare-phuoc-1/gcare", "human", "aids", "lubm80", "yago"],
+]
+env = { NRESE_QUIET_DRAIN_S = "3600", SPARQL_DATA = "/home/krarilotus/owlrs/sparql-data", ROOTFS_DIR = "/home/krarilotus/owlrs/rootfs", NRESE_BIN = "/home/krarilotus/owlrs/sparql-bin/1b611e7/nrese-server", NRESE_BENCH_SCRATCH = "/home/krarilotus/owlrs/sparql-scratch" }
+needs = []
+window = "quiet"
+priority = 3
+est_min = 240

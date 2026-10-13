@@ -1,0 +1,19 @@
+id = "reasoning-qualify-lubm-rdfox-2"
+group = "reasoning"
+host = "office-pc"
+checkout = "suite/reasoning"
+workload = "lubm"
+window = "any"
+priority = 1
+est_min = 120
+needs = ["docker"]
+env = { NRESE_BIN = "/home/krarilotus/nrese-reasoning-suite/bin/16c3bfb/nrese-server", NRESE_VERSION = "16c3bfb", DOCKER_MEMORY = "28g" }
+# RDFox's LUBM programs (L, LE): LUBM(1) first, every engine's path in a minute; then the
+# 125 universities of GLog's study; then LUBM(1000) (the AAAI 2014 paper's 01K: NRESE, VLog
+# and GLog; NRESE's closure beside the paper's 182.4 M and 332.6 M triples).
+commands = [
+  ["python3", "benches/reasoning/datalog/datalog.py", "prepare", "--cases", "lubm-l-1,lubm-le-1,lubm-l-125,lubm-le-125,lubm-l-1000,lubm-le-1000"],
+  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --qualify --runs 1 --threads 4 --cases lubm-l-1,lubm-le-1 --results \"$QUEUE_RESULTS/qualify\""],
+  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --qualify --runs 1 --threads 4 --cases lubm-l-125,lubm-le-125 --results \"$QUEUE_RESULTS/qualify\""],
+  ["sh", "-c", "python3 benches/reasoning/datalog/datalog.py run --qualify --runs 1 --threads 16 --timeout-s 7200 --cases lubm-l-1000,lubm-le-1000 --results \"$QUEUE_RESULTS/qualify\""],
+]

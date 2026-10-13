@@ -186,7 +186,7 @@ class FastComparison(unittest.TestCase):
             r["expected_outcome"] = "memory-limit"
         code, text = comparison(base, copy.deepcopy(base))
         self.assertEqual(code, 0)
-        self.assertIn("expected boundary; no timing verdict", text)
+        self.assertIn("known issue; no timing verdict", text)
 
     def test_failed_check_or_route_excludes_an_ok_record(self):
         for key in ("checks", "routes"):
@@ -257,6 +257,26 @@ class FastComparison(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("QPS: NOT COMPARABLE", text)
 
+    def test_runs_across_a_host_configuration_change_are_refused_unless_flagged(self):
+        def on(started, governor=None):
+            data = report(1)
+            data["machine"] = {"host": "Phuoc-Yu", **({"governor": governor} if governor else {})}
+            data["started"] = started
+            return data
+        before, after = on("2026-10-12T10:51:30"), on("2026-10-12T14:00:00")
+        code, text = comparison(before, after)
+        self.assertEqual(code, 2)
+        self.assertIn("changed its configuration", text)
+        self.assertIn("REFUSED", text)
+        code, text = comparison(before, after, allow_host_change=True)
+        self.assertEqual(code, 0)
+        self.assertIn("FLAGGED", text)
+        # One configuration: compared; a governor the runs read differently: refused.
+        self.assertEqual(comparison(on("2026-10-12T14:00:00"), after)[0], 0)
+        code, text = comparison(on("2026-10-12T14:00:00", "powersave"), on("2026-10-12T15:00:00", "performance"))
+        self.assertEqual(code, 2)
+        self.assertIn("governors", text)
+
     def test_qps_noise_is_taken_from_qps_not_latency(self):
         new = report(qps={1: 50})
         for r, value in zip(new["records"], (20, 50, 150)):
@@ -264,6 +284,64 @@ class FastComparison(unittest.TestCase):
         code, text = comparison(report(qps={1: 100}), new)
         self.assertEqual(code, 0)
         self.assertIn("within noise", text)
+
+
+class FastVerdicts(unittest.TestCase):
+    def test_every_run_has_a_verdict_and_names_whose_failure(self):
+        case = {"name": "c", "known": "the budget bounds the quads"}
+        def of(status, expected="ok", notes=()):
+            return fast.verdict(case, {"status": status, "expected_outcome": expected, "notes": list(notes)})
+        self.assertEqual(of("ok"), {"verdict": "ok", "whose": "-"})
+        self.assertEqual(of("off-route")["verdict"], "wrong")
+        # A known limit is the product's issue, named, though it fails no gate.
+        limit = of("memory-limit", "memory-limit")
+        self.assertEqual((limit["verdict"], limit["whose"], limit["issue"]),
+                         ("incomplete", "product", "the budget bounds the quads"))
+        missing = of("failed", notes=["missing input: ore_ont_9724.owl"])
+        self.assertEqual((missing["verdict"], missing["whose"]), ("incomplete", "harness"))
+        self.assertEqual(of("failed", notes=["exit 101"])["whose"], "unknown")
+        self.assertNotIn("issue", of("wrong", "ok"))
+
+
+class FastNative(unittest.TestCase):
+    DIRS = {"/target": Path("/bin/t"), "/fast": Path("/g"), "/data": Path("/assets/data"), "/src": Path("/repo"),
+            "/out": Path("/repo/tmp/fast"), "/inputs": Path("/assets/fast"), "/ore": Path("/assets/ore")}
+
+    def test_container_paths_map_to_the_hosts_directories_and_nothing_else(self):
+        self.assertEqual(fast.native("/target/release/examples/perf_lab --load /data/lubm-10.nt --json /out/c.json",
+                                     self.DIRS),
+                         "/bin/t/release/examples/perf_lab --load /assets/data/lubm-10.nt --json /repo/tmp/fast/c.json")
+        script = "rm -rf /fast/scratch/c && mkdir -p /fast/scratch/c && cp '/inputs/x.nt' /fast/"
+        self.assertEqual(fast.native(script, self.DIRS),
+                         "rm -rf /g/scratch/c && mkdir -p /g/scratch/c && cp '/assets/fast/x.nt' /g/")
+        # Not a container path: inside another path, a URL, or a longer name.
+        for text in ("/home/u/data/x", "http://example.org/data/x", "/database", "a/fast/b"):
+            self.assertEqual(fast.native(text, self.DIRS), text)
+
+    def test_the_scopes_peak_is_read_from_the_wrappers_line(self):
+        self.assertEqual(fast.scope_peak_mib("warning\nfast-scope-peak 2147483648\n"), 2048)
+        self.assertIsNone(fast.scope_peak_mib("Killed\n"))
+
+
+class FastPageCache(unittest.TestCase):
+    def test_warm_and_cold_are_series_of_their_own_and_the_metric_sums_their_medians(self):
+        runs = [{"open_s": 0.010, "queries": [{"first_ms": 1.0}], "_page_cache": mode}
+                for mode in ("warm", "cold", "warm", "cold", "warm", "cold")]
+        for run, extra in zip(runs, (0, 30, 0, 50, 0, 40)):
+            run["queries"][0]["first_ms"] += extra
+        result = {**runs[-1], "_repeats": runs}
+        self.assertEqual(fast.cold_series(result), {"warm": [11.0] * 3, "cold": [41.0, 61.0, 51.0]})
+        self.assertEqual(fast.metric_value({"metric": "cold_ms"}, result), 11.0 + 51.0)
+        one = {**runs[0], "_repeats": [runs[0], runs[2]]}
+        self.assertEqual(fast.samples({"metric": "cold_ms"}, one), {"_": [11.0, 11.0]})
+
+    def test_a_host_without_a_cold_cache_command_runs_warm_and_says_so(self):
+        with patch.object(fast, "cold_cache_command", lambda: None):
+            modes, why = fast.page_cache_modes({"page_cache": ["warm", "cold"]})
+        self.assertEqual(modes, ["warm"])
+        self.assertIn("cold_cache", why)
+        with patch.object(fast, "cold_cache_command", lambda: "true"):
+            self.assertEqual(fast.page_cache_modes({"page_cache": ["warm", "cold"]}), (["warm", "cold"], ""))
 
 
 if __name__ == "__main__":

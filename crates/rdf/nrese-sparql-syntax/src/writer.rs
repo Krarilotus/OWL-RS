@@ -99,8 +99,8 @@ pub(crate) fn fmt_path(path: &PropertyPathExpression, f: &mut Formatter<'_>) -> 
     match path {
         PropertyPathExpression::NamedNode(p) => p.fmt(f),
         PropertyPathExpression::Reverse(p) => write!(f, "^({p})"),
-        PropertyPathExpression::Sequence(a, b) => write!(f, "({a} / {b})"),
-        PropertyPathExpression::Alternative(a, b) => write!(f, "({a} | {b})"),
+        PropertyPathExpression::Sequence(steps) => fmt_paths(steps, " / ", f),
+        PropertyPathExpression::Alternative(paths) => fmt_paths(paths, " | ", f),
         PropertyPathExpression::ZeroOrMore(p) => write!(f, "({p})*"),
         PropertyPathExpression::OneOrMore(p) => write!(f, "({p})+"),
         PropertyPathExpression::ZeroOrOne(p) => write!(f, "({p})?"),
@@ -460,9 +460,15 @@ fn fmt_sequence(p: &GraphPattern, f: &mut Formatter<'_>) -> Result<Tail, fmt::Er
             write!(f, "{subject} {path} {object} .")?;
             Ok(Tail::Path)
         }
-        GraphPattern::Join { left, right } => {
-            let tail = fmt_prefix(left, f)?;
-            fmt_element(right, tail, f)
+        GraphPattern::Join { inputs } => {
+            let Some((first, rest)) = inputs.split_first() else {
+                return Ok(Tail::Nothing);
+            };
+            let mut tail = fmt_prefix(first, f)?;
+            for input in rest {
+                tail = fmt_element(input, tail, f)?;
+            }
+            Ok(tail)
         }
         GraphPattern::LeftJoin {
             left,
@@ -499,13 +505,14 @@ fn fmt_sequence(p: &GraphPattern, f: &mut Formatter<'_>) -> Result<Tail, fmt::Er
             fmt_braced(right, f)?;
             Ok(Tail::Other)
         }
-        GraphPattern::Extend {
-            inner,
-            variable,
-            expression,
-        } => {
+        GraphPattern::Extend { inner, bindings } => {
             space(fmt_prefix(inner, f)?, f)?;
-            write!(f, "BIND({expression} AS {variable})")?;
+            for (i, (variable, expression)) in bindings.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(" ")?;
+                }
+                write!(f, "BIND({expression} AS {variable})")?;
+            }
             Ok(Tail::Other)
         }
         GraphPattern::Filter { expr, inner } => {
@@ -605,16 +612,36 @@ fn fmt_element(p: &GraphPattern, tail: Tail, f: &mut Formatter<'_>) -> Result<Ta
     }
 }
 
-/// `{ a } UNION { b } UNION …`, left-nested unions as one chain.
+/// `{ a } UNION { b } UNION …`.
 fn fmt_union(p: &GraphPattern, f: &mut Formatter<'_>) -> fmt::Result {
     match p {
-        GraphPattern::Union { left, right } => {
-            fmt_union(left, f)?;
-            f.write_str(" UNION ")?;
-            fmt_braced(right, f)
+        GraphPattern::Union { inputs } => {
+            for (i, input) in inputs.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(" UNION ")?;
+                }
+                fmt_braced(input, f)?;
+            }
+            Ok(())
         }
         other => fmt_braced(other, f),
     }
+}
+
+/// Paths in parentheses, `separator` between them.
+fn fmt_paths(
+    paths: &[PropertyPathExpression],
+    separator: &str,
+    f: &mut Formatter<'_>,
+) -> fmt::Result {
+    f.write_str("(")?;
+    for (i, path) in paths.iter().enumerate() {
+        if i > 0 {
+            f.write_str(separator)?;
+        }
+        fmt_path(path, f)?;
+    }
+    f.write_str(")")
 }
 
 // --- Queries ----------------------------------------------------------------------------
@@ -678,25 +705,23 @@ fn fmt_select(
     let mut group = None;
     {
         let mut q = p;
+        let projected = |bindings: &[(Variable, Expression)]| {
+            projection.is_some_and(|vars| bindings.iter().all(|(v, _)| vars.contains(v)))
+        };
         let mut extends = Vec::new();
-        while let GraphPattern::Extend {
-            inner,
-            variable,
-            expression,
-        } = q
+        if let GraphPattern::Extend { inner, bindings } = q
+            && projected(bindings)
         {
-            if !projection.is_some_and(|vars| vars.contains(variable)) {
-                break;
-            }
-            extends.push((variable, expression));
+            extends.extend(bindings.iter().map(|(v, e)| (v, e)));
             q = inner;
         }
         let mut found_values = None;
-        if let GraphPattern::Join { left, right } = q
-            && matches!(right.as_ref(), GraphPattern::Values { .. })
+        if let GraphPattern::Join { inputs } = q
+            && let [left, right] = inputs.as_slice()
+            && matches!(right, GraphPattern::Values { .. })
             && leads_to_group(left)
         {
-            found_values = Some(right.as_ref());
+            found_values = Some(right);
             q = left;
         }
         let mut found_having = None;
@@ -707,7 +732,6 @@ fn fmt_select(
             q = inner;
         }
         if let GraphPattern::Group { .. } = q {
-            extends.reverse();
             expressions = extends;
             values = found_values;
             having = found_having;
@@ -715,23 +739,15 @@ fn fmt_select(
             p = q;
         } else if form == Form::Describe {
             // `DESCRIBE <iri>`: the IRI bound to a projected variable.
-            let mut q = p;
-            let mut iris = Vec::new();
-            while let GraphPattern::Extend {
-                inner,
-                variable,
-                expression: expression @ Expression::NamedNode(_),
-            } = q
+            if let GraphPattern::Extend { inner, bindings } = p
+                && projected(bindings)
+                && bindings
+                    .iter()
+                    .all(|(_, e)| matches!(e, Expression::NamedNode(_)))
             {
-                if !projection.is_some_and(|vars| vars.contains(variable)) {
-                    break;
-                }
-                iris.push((variable, expression));
-                q = inner;
+                expressions = bindings.iter().map(|(v, e)| (v, e)).collect();
+                p = inner;
             }
-            iris.reverse();
-            expressions = iris;
-            p = q;
         }
     }
     let (where_pattern, group_variables, aggregates): (&GraphPattern, &[Variable], Aggregates<'_>) =
