@@ -305,6 +305,40 @@ fn copy(
 /// Whether `premise` (consistent) entails `axiom`, an axiom over `premise`'s interners.
 /// `fresh` are individuals the premise doesn't name (three or more).
 pub fn entails(premise: &Ontology, axiom: &Axiom, fresh: &[u64], budget: &Budget) -> Entailed {
+    entails_until(
+        premise,
+        axiom,
+        fresh,
+        budget,
+        Deadline::after(budget.timeout),
+    )
+}
+
+pub(crate) fn entails_until(
+    premise: &Ontology,
+    axiom: &Axiom,
+    fresh: &[u64],
+    budget: &Budget,
+    deadline: Deadline,
+) -> Entailed {
+    entails_with(premise, axiom, fresh, budget, deadline, |o, b, d| {
+        consistency::check_until(o, b, d).verdict
+    })
+}
+
+/// The consistency boundary is injectable so reductions can be checked without timing
+/// a solver. Every reduction receives the same operation deadline.
+fn entails_with(
+    premise: &Ontology,
+    axiom: &Axiom,
+    fresh: &[u64],
+    budget: &Budget,
+    deadline: Deadline,
+    mut check: impl FnMut(&Ontology, &Budget, Deadline) -> Verdict,
+) -> Entailed {
+    if let Some(why) = budget.stopped(deadline) {
+        return Entailed::Unknown(why);
+    }
     let (mut o, _scratch) = match copy(premise, budget) {
         Ok(copy) => copy,
         Err(unknown) => return unknown,
@@ -316,13 +350,16 @@ pub fn entails(premise: &Ontology, axiom: &Axiom, fresh: &[u64], budget: &Budget
     let base = o.axioms.len();
     let mut answer = Entailed::Yes;
     for test in tests {
+        if let Some(why) = budget.stopped(deadline) {
+            return answer.and(Entailed::Unknown(why));
+        }
         o.axioms.truncate(base);
         o.sources.truncate(base);
         for a in test {
             o.axioms.push(a);
             o.sources.push(Vec::new());
         }
-        let found = match consistency::check(&o, budget).verdict {
+        let found = match check(&o, budget, deadline) {
             Verdict::Inconsistent => Entailed::Yes,
             Verdict::Consistent => Entailed::No,
             Verdict::Unknown(why) => Entailed::Unknown(why),
@@ -338,6 +375,18 @@ pub fn entails(premise: &Ontology, axiom: &Axiom, fresh: &[u64], budget: &Budget
 /// Whether `premise` (consistent) entails that some individual is an instance of
 /// `class` (of `premise`'s interners): `class ⊑ ⊥` makes it inconsistent.
 pub fn nonempty(premise: &Ontology, class: ExprId, budget: &Budget) -> Entailed {
+    nonempty_until(premise, class, budget, Deadline::after(budget.timeout))
+}
+
+pub(crate) fn nonempty_until(
+    premise: &Ontology,
+    class: ExprId,
+    budget: &Budget,
+    deadline: Deadline,
+) -> Entailed {
+    if let Some(why) = budget.stopped(deadline) {
+        return Entailed::Unknown(why);
+    }
     let (mut o, _scratch) = match copy(premise, budget) {
         Ok(copy) => copy,
         Err(unknown) => return unknown,
@@ -345,7 +394,7 @@ pub fn nonempty(premise: &Ontology, class: ExprId, budget: &Budget) -> Entailed 
     let nothing = intern(&mut o, ClassExpr::Nothing);
     o.axioms.push(Axiom::SubClassOf(class, nothing));
     o.sources.push(Vec::new());
-    match consistency::check(&o, budget).verdict {
+    match consistency::check_until(&o, budget, deadline).verdict {
         Verdict::Inconsistent => Entailed::Yes,
         Verdict::Consistent => Entailed::No,
         Verdict::Unknown(why) => Entailed::Unknown(why),
@@ -360,6 +409,25 @@ pub fn entails_ontology(
     fresh: &[u64],
     budget: &Budget,
 ) -> Entailed {
+    entails_ontology_until(
+        premise,
+        conclusion,
+        fresh,
+        budget,
+        Deadline::after(budget.timeout),
+    )
+}
+
+pub(crate) fn entails_ontology_until(
+    premise: &Ontology,
+    conclusion: &Ontology,
+    fresh: &[u64],
+    budget: &Budget,
+    deadline: Deadline,
+) -> Entailed {
+    if let Some(why) = budget.stopped(deadline) {
+        return Entailed::Unknown(why);
+    }
     let (mut o, _scratch) = match copy(premise, budget) {
         Ok(copy) => copy,
         Err(unknown) => return unknown,
@@ -376,11 +444,16 @@ pub fn entails_ontology(
             .map(|a| Test::Axiom(import.axiom(a)))
             .collect()
     };
-    let deadline = Deadline::after(budget.timeout);
+    if let Some(why) = budget.stopped(deadline) {
+        return Entailed::Unknown(why);
+    }
     let compiled = Batch::new(&mut o, &tests, budget.memory.as_ref());
     let mut answer = Entailed::Yes;
     for (index, test) in tests.iter().enumerate() {
-        answer = answer.and(compiled.check(index, test, &o, fresh, &budget.remaining(deadline)));
+        if let Some(why) = budget.stopped(deadline) {
+            return answer.and(Entailed::Unknown(why));
+        }
+        answer = answer.and(compiled.check_until(index, test, &o, fresh, budget, deadline));
         if answer == Entailed::No {
             break;
         }
