@@ -113,6 +113,9 @@ pub struct Done {
 pub struct Engine<'a> {
     pub p: &'a Program,
     pub config: Config,
+    /// What the run holds, reserved from the request's envelope ([`Config::memory`]);
+    /// shared with its checkpoints, which a restored run continues from.
+    pub memory: Option<std::sync::Arc<nrese_exec::Gauge<nrese_exec::Envelope>>>,
     pub g: Graph,
     pub deps: DepSets,
     pub done: Done,
@@ -169,6 +172,11 @@ impl<'a> Engine<'a> {
         Self {
             p,
             config: config.started().into_owned(),
+            memory: config
+                .memory
+                .as_ref()
+                .and_then(nrese_exec::Envelope::bounded)
+                .map(|envelope| std::sync::Arc::new(nrese_exec::Gauge::new(envelope.clone()))),
             g: Graph::default(),
             deps: DepSets::default(),
             done: Done::default(),
@@ -588,7 +596,16 @@ impl<'a> Engine<'a> {
                 self.config.max_memory >> 20
             )));
         }
+        if !self.reserve(used) {
+            return Err(Stop::GaveUp(crate::memory::EXHAUSTED.to_owned()));
+        }
         Ok(())
+    }
+
+    /// Reserves `bytes` for the run from the request's envelope, if it has one; false if
+    /// the envelope has no room for them.
+    pub fn reserve(&self, bytes: usize) -> bool {
+        self.memory.as_ref().is_none_or(|gauge| gauge.follow(bytes))
     }
 
     pub fn check_time(&self) -> Step<()> {

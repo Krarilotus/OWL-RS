@@ -25,17 +25,30 @@ pub(crate) struct Batch {
     prepared: Option<Prepared>,
     probes: Vec<Option<(u32, At)>>,
     left_out: Option<String>,
+    /// The compiled program, reserved from the request's envelope while the batch lives.
+    _scratch: nrese_dl::memory::Scratch,
+    /// The envelope had no room to compile: every test is unknown.
+    exhausted: bool,
 }
 
 impl Batch {
     /// Normalises/compiles at most once, regardless of the number of eligible tests.
     /// The caller already owns its local expression interner; the premise isn't cloned.
-    pub(crate) fn new(ontology: &mut Ontology, tests: &[Test]) -> Self {
+    /// What compiling holds is reserved from `memory` as each stage's output exists; the
+    /// program stays reserved while the batch lives.
+    pub(crate) fn new(
+        ontology: &mut Ontology,
+        tests: &[Test],
+        memory: Option<&nrese_exec::Envelope>,
+    ) -> Self {
+        let mut scratch = nrese_dl::memory::Scratch::new(memory);
         if tests.is_empty() {
             return Self {
                 prepared: None,
                 probes: Vec::new(),
                 left_out: None,
+                _scratch: scratch,
+                exhausted: false,
             };
         }
         let base = ontology.axioms.len();
@@ -80,12 +93,21 @@ impl Batch {
                 Some((index, at))
             })
             .collect();
-        let prepared = if classes.is_empty() {
-            None
-        } else {
+        let mut compile = || {
+            use nrese_dl::memory::{normalised_bytes, ontology_bytes};
             #[cfg(test)]
             COMPILATIONS.set(COMPILATIONS.get() + 1);
             let prepared = tableau::prepared(ontology);
+            let mut copied = 0;
+            scratch
+                .charge(|| {
+                    copied = match &prepared {
+                        std::borrow::Cow::Owned(copy) => ontology_bytes(copy),
+                        std::borrow::Cow::Borrowed(_) => 0,
+                    };
+                    copied
+                })
+                .ok()?;
             let normalised = nrese_owl::normalise_with(
                 &prepared,
                 nrese_owl::Options {
@@ -93,12 +115,26 @@ impl Batch {
                     ..nrese_owl::Options::default()
                 },
             );
-            Some(Prepared::new(
-                &prepared,
-                &normalised,
-                &classes,
-                &individuals,
-            ))
+            let mut clauses = 0;
+            scratch
+                .charge(|| {
+                    clauses = normalised_bytes(&normalised);
+                    clauses
+                })
+                .ok()?;
+            let program = Prepared::new(&prepared, &normalised, &classes, &individuals);
+            scratch.charge(|| program.bytes()).ok()?;
+            // The copy and the clauses go; the program stays for the probes.
+            scratch.release(copied + clauses);
+            Some(program)
+        };
+        let (prepared, exhausted) = match classes.is_empty() {
+            true => (None, false),
+            false => {
+                let program = compile();
+                let exhausted = program.is_none();
+                (program, exhausted)
+            }
         };
         ontology.axioms.truncate(base);
         ontology.sources.truncate(sources);
@@ -106,6 +142,8 @@ impl Batch {
             prepared,
             probes,
             left_out: consistency::left_out(ontology),
+            _scratch: scratch,
+            exhausted,
         }
     }
 
@@ -120,6 +158,9 @@ impl Batch {
         fresh: &[u64],
         budget: &Budget,
     ) -> Entailed {
+        if self.exhausted {
+            return Entailed::Unknown(nrese_dl::memory::EXHAUSTED.to_owned());
+        }
         let (Some(prepared), Some((class, at))) = (&self.prepared, self.probes[index]) else {
             return match test {
                 Test::Axiom(axiom) => super::entails(ontology, axiom, fresh, budget),
@@ -139,6 +180,7 @@ impl Batch {
         let config = tableau::Config {
             timeout: Some(budget.timeout),
             max_memory: budget.memory_bytes,
+            memory: budget.memory.clone(),
             max_nodes: budget.max_nodes,
             max_branch_points: Some(budget.max_branch_points),
             cancel: budget.cancel.clone(),

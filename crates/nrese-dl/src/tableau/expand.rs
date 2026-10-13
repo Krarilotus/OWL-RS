@@ -165,7 +165,10 @@ impl Engine<'_> {
                 let need = (n.saturating_mul(n.saturating_sub(1)) / 2)
                     .saturating_mul(48)
                     .saturating_add(n * 256);
-                if (self.bytes() as u64).saturating_add(need) > self.config.max_memory as u64 {
+                let after = (self.bytes() as u64).saturating_add(need);
+                if after > self.config.max_memory as u64
+                    || !self.reserve(usize::try_from(after).unwrap_or(usize::MAX))
+                {
                     return Err(Stop::Abandon(
                         dep,
                         format!(

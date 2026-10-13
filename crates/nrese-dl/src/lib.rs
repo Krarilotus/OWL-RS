@@ -10,7 +10,8 @@
 //! - [`numbers`]: sizes of counted classes compared before any search;
 //! - [`certificate`]: models of "consistent" answers checked against the ontology by the
 //!   direct semantics, independently of the engines;
-//! - [`scope`]: the answers and certificates of the small-scope check (§11).
+//! - [`scope`]: the answers and certificates of the small-scope check (§11);
+//! - [`memory`]: what the engines and compiling hold, drawn from a request's envelope.
 //!
 //! Each module is its own package with its own gates (owl2-dl-performance.md §6).
 
@@ -23,6 +24,7 @@ pub mod classify;
 pub mod context;
 pub mod datatypes;
 pub mod islands;
+pub mod memory;
 pub mod numbers;
 pub mod scope;
 pub mod tableau;

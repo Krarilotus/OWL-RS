@@ -549,7 +549,7 @@ mod tests {
         let shared = SharedBudget::new(1 << 20);
         let options = QueryOptions {
             resources: crate::Resources {
-                shared_memory: Some(shared.clone()),
+                memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
                 ..Default::default()
             },
             ..Default::default()
@@ -732,7 +732,7 @@ mod tests {
             let options = QueryOptions {
                 resources: crate::Resources {
                     cancellation: Some(token.clone()),
-                    shared_memory: Some(shared.clone()),
+                    memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -826,7 +826,7 @@ mod tests {
         const UNRELATED: usize = 128;
         let options = QueryOptions {
             resources: crate::Resources {
-                memory_limit: Some(UNRELATED + 8192 - 1),
+                memory: nrese_exec::Envelope::new(Some(UNRELATED + 8192 - 1), None),
                 ..Default::default()
             },
             ..Default::default()

@@ -28,7 +28,8 @@
 //!
 //! **Computed once.** A part requested while another query computes it waits for that
 //! result instead of computing it again (QLever's `computeOnce`); a waiter gets the result
-//! even if it isn't admitted, and computes it itself if the other query fails.
+//! even if it isn't admitted, and computes it itself if the other query fails. A request
+//! on a Rayon worker never waits: it computes the part itself (research-designs.md §8).
 //!
 //! **Serialised answers.** A query's whole answer is also kept as the bytes of each
 //! output format it was asked in ([`ResultCache::output`], [`CachedOutput`]), beside its
@@ -151,6 +152,15 @@ pub(crate) struct Flight {
 }
 
 impl Flight {
+    fn new(owner: ThreadId) -> Arc<Self> {
+        Arc::new(Self {
+            owner,
+            waiters: AtomicUsize::new(0),
+            done: Mutex::new(None),
+            ready: Condvar::new(),
+        })
+    }
+
     fn finish(&self, part: Option<Arc<Part>>) {
         *self.done.lock().unwrap_or_else(PoisonError::into_inner) = Some(part);
         self.ready.notify_all();
@@ -385,7 +395,8 @@ impl OutputSlot {
 /// What a query does about a part ([`ResultCache::claim`]).
 pub(crate) enum Claim<'c> {
     Hit(Arc<Part>),
-    /// Compute it; others wait for it.
+    /// Compute it; others wait for it, unless another query computes it already and this
+    /// one is on a Rayon worker, which never waits.
     Compute(Computing<'c>),
     /// Another query computes it.
     Wait(Arc<Flight>),
@@ -506,9 +517,25 @@ impl ResultCache {
             return Claim::Hit(part);
         }
         let me = std::thread::current().id();
+        let computing = |flight| {
+            Claim::Compute(Computing {
+                cache: self,
+                key: key.clone(),
+                flight,
+                finished: false,
+            })
+        };
         if let Some(flight) = state.flights.get(key) {
             if flight.owner == me {
                 return Claim::Bypass;
+            }
+            // A Rayon worker never blocks on a flight: the stack it holds may be what the
+            // flight's producer waits for (research-designs.md §8). It computes the part
+            // beside the flight, under a flight of its own that nobody finds, and offers
+            // the result like any other.
+            if rayon::current_thread_index().is_some() {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return computing(Flight::new(me));
             }
             flight.waiters.fetch_add(1, Ordering::AcqRel);
             return Claim::Wait(Arc::clone(flight));
@@ -517,19 +544,9 @@ impl ResultCache {
         if key.snapshot.revision < state.revision {
             return Claim::Bypass;
         }
-        let flight = Arc::new(Flight {
-            owner: me,
-            waiters: AtomicUsize::new(0),
-            done: Mutex::new(None),
-            ready: Condvar::new(),
-        });
+        let flight = Flight::new(me);
         state.flights.insert(key.clone(), Arc::clone(&flight));
-        Claim::Compute(Computing {
-            cache: self,
-            key: key.clone(),
-            flight,
-            finished: false,
-        })
+        computing(flight)
     }
 
     /// The part under `key`, if it is cached (for a request that won't store one).
@@ -766,6 +783,7 @@ impl ResultCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     fn identity(revision: u64) -> SnapshotIdentity {
         // Snapshots of one engine at successive revisions.
@@ -903,6 +921,182 @@ mod tests {
         assert_eq!(computed.load(Ordering::SeqCst), 1);
         let stats = cache.stats();
         assert_eq!((stats.misses, stats.entries), (1, 1));
+    }
+
+    /// Runs `f` with a watchdog that raises the flag `f`'s waits poll after five seconds;
+    /// returns `f`'s result and whether the watchdog had to raise it.
+    fn watched<R>(f: impl FnOnce(&AtomicBool) -> R) -> (R, bool) {
+        let cancel = AtomicBool::new(false);
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let flag = &cancel;
+            let watchdog = scope.spawn(move || {
+                let rescued = finished.recv_timeout(Duration::from_secs(5)).is_err();
+                flag.store(rescued, Ordering::SeqCst);
+                rescued
+            });
+            let result = f(&cancel);
+            let _ = done.send(());
+            (result, watchdog.join().unwrap())
+        })
+    }
+
+    /// A query's request for `key` (10 rows when it computes them), as `eval_cached`
+    /// makes it; `Err` if the watchdog had to stop its wait.
+    fn request(
+        cache: &ResultCache,
+        key: &Key,
+        pin: Option<&PinRequest>,
+        cancel: &AtomicBool,
+    ) -> Result<usize, ()> {
+        match cache.claim(key, pin) {
+            Claim::Hit(part) => Ok(part.table.len()),
+            Claim::Compute(computing) => {
+                computing.finish(Some(part(10)), SLOW).unwrap();
+                Ok(10)
+            }
+            Claim::Wait(flight) => flight
+                .wait(|| cancel.load(Ordering::SeqCst))
+                .map(|part| part.map_or(0, |part| part.table.len())),
+            Claim::Bypass => panic!("another query computes the part"),
+        }
+    }
+
+    fn pool(threads: usize) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+    }
+
+    /// The forced reproduction of research-designs.md §8 (`flight-diagnostic.patch`,
+    /// campaign-20261010-bebada2), which hung until its watchdog cancelled the waiter: a
+    /// producer on a worker of a two-worker pool claims a part and joins a kernel; the
+    /// kernel's helper, yielding, runs another query's request for that part. That
+    /// request now computes the part itself instead of blocking the producer's join.
+    #[test]
+    fn a_request_stolen_by_its_producers_kernel_computes_the_part_itself() {
+        use std::sync::OnceLock;
+        let workers = pool(2);
+        let cache = ResultCache::new(1 << 20);
+        let key = key(identity(1), "nested-flight");
+        let (helper_ready, waiter_entered) = (AtomicBool::new(false), AtomicBool::new(false));
+        let (producer, helper, waiter) = (OnceLock::new(), OnceLock::new(), OnceLock::new());
+        let (outcome, rescued) = watched(|cancel| {
+            let stop = || cancel.load(Ordering::SeqCst);
+            std::thread::scope(|scope| {
+                let request = scope.spawn(|| {
+                    while !helper_ready.load(Ordering::Acquire) && !stop() {
+                        std::thread::yield_now();
+                    }
+                    workers.install(|| {
+                        waiter.set(std::thread::current().id()).unwrap();
+                        waiter_entered.store(true, Ordering::Release);
+                        request(&cache, &key, None, cancel)
+                    })
+                });
+                workers.install(|| {
+                    producer.set(std::thread::current().id()).unwrap();
+                    let Claim::Compute(computing) = cache.claim(&key, None) else {
+                        panic!("the first request computes the part");
+                    };
+                    rayon::join(
+                        || {
+                            while !waiter_entered.load(Ordering::Acquire) && !stop() {
+                                std::thread::yield_now();
+                            }
+                        },
+                        || {
+                            helper.set(std::thread::current().id()).unwrap();
+                            helper_ready.store(true, Ordering::Release);
+                            while !waiter_entered.load(Ordering::Acquire) && !stop() {
+                                if rayon::yield_now() != Some(rayon::Yield::Executed) {
+                                    std::thread::yield_now();
+                                }
+                            }
+                        },
+                    );
+                    computing.finish(Some(part(10)), SLOW).unwrap();
+                });
+                request.join().unwrap()
+            })
+        });
+        assert!(!rescued, "progress needed the watchdog: {outcome:?}");
+        assert_eq!(outcome, Ok(10));
+        assert_ne!(producer.get(), helper.get());
+        assert_eq!(helper.get(), waiter.get(), "the helper ran the request");
+        assert_eq!(cache.lookup(&key).unwrap().table.len(), 10);
+        assert!(cache.state().flights.is_empty());
+    }
+
+    /// The one-worker variant: a query computing a part on its caller runs a kernel on a
+    /// pool's only worker, which asks for the same part (a callback evaluating a cacheable
+    /// query). Waiting, the worker and the caller would wait for each other.
+    #[test]
+    fn a_kernel_on_one_worker_computes_the_part_its_caller_computes() {
+        let cache = ResultCache::new(1 << 20);
+        let key = key(identity(1), "one-worker");
+        let Claim::Compute(computing) = cache.claim(&key, None) else {
+            panic!("a miss")
+        };
+        let (outcome, rescued) =
+            watched(|cancel| pool(1).install(|| request(&cache, &key, None, cancel)));
+        assert!(!rescued, "progress needed the watchdog: {outcome:?}");
+        assert_eq!(outcome, Ok(10));
+        computing.finish(Some(part(10)), SLOW).unwrap();
+        assert!(cache.state().flights.is_empty());
+        assert_eq!(cache.stats().entries, 1, "computed twice, kept once");
+    }
+
+    /// The nested-kernel variant: requests in kernels nested within a kernel, on several
+    /// workers, one of them pinning the part; and a request outside any pool still waits
+    /// for the computation (computed once).
+    #[test]
+    fn requests_in_nested_kernels_progress_and_pin() {
+        let cache = ResultCache::new(1 << 20);
+        let key = key(identity(1), "nested-kernels");
+        let pin = PinRequest {
+            name: "nested".into(),
+            query: "SELECT …".into(),
+        };
+        let Claim::Compute(computing) = cache.claim(&key, None) else {
+            panic!("a miss")
+        };
+        let ((outcomes, waited), rescued) = watched(|cancel| {
+            std::thread::scope(|scope| {
+                // A caller, not a worker: it waits for the computation. It claims before
+                // the kernels run, which may store the part beside the flight.
+                let waiting = scope.spawn(|| request(&cache, &key, None, cancel));
+                while cache
+                    .state()
+                    .flights
+                    .get(&key)
+                    .is_some_and(|flight| flight.waiters.load(Ordering::Acquire) == 0)
+                    && !cancel.load(Ordering::SeqCst)
+                {
+                    std::thread::yield_now();
+                }
+                let outcomes = pool(2).install(|| {
+                    let ((a, b), c) = rayon::join(
+                        || {
+                            rayon::join(
+                                || request(&cache, &key, None, cancel),
+                                || request(&cache, &key, Some(&pin), cancel),
+                            )
+                        },
+                        || request(&cache, &key, None, cancel),
+                    );
+                    [a, b, c]
+                });
+                computing.finish(Some(part(10)), SLOW).unwrap();
+                (outcomes, waiting.join().unwrap())
+            })
+        });
+        assert!(!rescued, "progress needed the watchdog: {outcomes:?}");
+        assert_eq!(outcomes, [Ok(10); 3]);
+        assert_eq!(waited, Ok(10));
+        assert_eq!(cache.pins()[0].rows, 10, "pinned beside the computation");
+        assert!(cache.state().flights.is_empty());
     }
 
     #[test]
