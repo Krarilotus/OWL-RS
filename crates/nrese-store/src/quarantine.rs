@@ -422,13 +422,16 @@ impl Quarantine {
             .resolving
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        for id in ids {
+        let mut ids: Vec<&String> = ids.iter().collect();
+        ids.sort();
+        ids.dedup();
+        for id in &ids {
             self.open_statement(id)?;
         }
         let at = now();
-        for id in ids {
+        for id in &ids {
             self.record(Resolution {
-                id: id.clone(),
+                id: String::clone(id),
                 outcome: Outcome::Discarded,
                 at,
                 repairs: Vec::new(),
