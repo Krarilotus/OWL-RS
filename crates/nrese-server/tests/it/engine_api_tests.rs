@@ -518,7 +518,8 @@ async fn imports_load_documents_and_reason_over_them() {
     )
     .await;
     assert_eq!(count_of(&text), 2, "the import was reasoned over");
-    // Into a named graph; then replacing everything; a broken document with skip_errors.
+    // Into a named graph; then replacing everything; a broken document (its bad
+    // statement quarantined, by the older flag too).
     let (status, text) = send(
         &app,
         Method::POST,
@@ -549,6 +550,8 @@ async fn imports_load_documents_and_reason_over_them() {
     assert_eq!(status, StatusCode::OK, "{text}");
     let report: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(report["skipped"], 1, "{text}");
+    assert_eq!(report["quarantined"], 1, "{text}");
+    assert_eq!(report["examples"][0]["line"], 2, "{text}");
     let all = "SELECT (COUNT(*) AS ?n) WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } FILTER(?p != <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>) }";
     let (_, text) = send(
         &app,
@@ -572,13 +575,37 @@ async fn imports_load_documents_and_reason_over_them() {
         0,
         "replaced: the old statements and their inferences are gone"
     );
-    // Without skipping, a broken document is refused.
-    let (status, _) = send(
+    // By default its bad statements are quarantined; strict, a broken document is
+    // refused.
+    let (status, text) = send(
         &app,
         Method::POST,
         &format!("{base}/import"),
         Some("application/n-triples"),
         "not rdf\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(report["quarantined"], 1, "{text}");
+    assert!(report["load"].is_string(), "{text}");
+    for strict in ["invalid=strict", "strict=true"] {
+        let (status, _) = send(
+            &app,
+            Method::POST,
+            &format!("{base}/import?{strict}"),
+            Some("application/n-triples"),
+            "not rdf\n",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/import?invalid=skip"),
+        Some("application/n-triples"),
+        "<http://example.com/z> <http://example.com/p> \"3\" .\n",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

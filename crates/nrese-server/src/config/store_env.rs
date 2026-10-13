@@ -113,6 +113,14 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         bulk_load_memory_bytes: parse_bulk_load_memory(
             source.get(names::BULK_LOAD_MEMORY).as_deref(),
         )?,
+        invalid_statements: match choice(
+            source,
+            names::INVALID_STATEMENTS,
+            &["quarantine", "strict"],
+        )? {
+            None | Some(0) => nrese_store::InvalidStatements::Quarantine,
+            Some(_) => nrese_store::InvalidStatements::Strict,
+        },
         shacl_gate: parse_shacl_gate(
             source.get(names::SHACL_GATE).as_deref(),
             source.get(names::SHACL_GATE_SEVERITY).as_deref(),
