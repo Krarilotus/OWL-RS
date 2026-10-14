@@ -33,6 +33,13 @@ changes from -6.51% to +3.19%, two independent processes per side. It establishe
 neither statistical significance nor query-execution performance of the integration.
 The measured text-filter and q02 losses against `main` remain release blockers.
 
+The completed [Geo component comparison](../benches/runs/2026-10-14-geo-gate-2-16ad95f2-phuoc.toml)
+(`59f66720` to `16ad95f2`, eight passes) did not pass its release gate. Aggregate Geo
+query time improved 110.346 to 97.7955 ms, but one Geo query slowed 2.56%, first-query
+time rose 14.61%, and lookup cgroup peak rose 19.88%. Five cases lacked their inputs.
+All case outcomes remain in the record. Its count checks and saved component binaries
+do not qualify complete answers or this integrated head.
+
 The shared wide/narrow rules solver is implemented in this worktree. Selection occurs
 once per operation; incremental/support stores retain the wide representation. It passes
 295 engine/reasoner tests (four skips), including both representations and the naive
