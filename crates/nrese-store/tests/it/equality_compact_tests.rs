@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use crate::support::in_memory_store_config;
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_store::{
     MutationCommand, MutationPipeline, MutationTicket, SparqlUpdateRequest, StatementPattern,
     StoreConfig, StoreService,
@@ -31,9 +31,7 @@ fn pipeline(mode: Mode) -> MutationPipeline {
     };
     MutationPipeline::new(
         Arc::new(StoreService::new(config).expect("store")),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )
 }
 
@@ -188,9 +186,7 @@ fn compact_equality_survives_a_restart() {
     let open = |compact: bool| {
         MutationPipeline::new(
             Arc::new(StoreService::new(config(compact)).expect("store")),
-            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-                ReasoningMode::Owl2Rl,
-            ))),
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
         )
     };
     let before = {
@@ -356,9 +352,7 @@ fn compact_equality_answers_as_replication_on_random_data() {
 fn pipeline_with(config: StoreConfig) -> MutationPipeline {
     MutationPipeline::new(
         Arc::new(StoreService::new(config).expect("store")),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )
 }
 

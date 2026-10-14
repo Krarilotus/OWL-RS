@@ -159,6 +159,12 @@ In the order of Motik, Shearer and Horrocks (JAIR 2009)†, with every step reco
    - Inverse roles are normalised to `(id, inverse)`.
    - Report A ranks complex RBoxes among the hard cases, and recommends role automata and propagation along the hierarchy over micro-optimising the search.
 3. **Structural transformation:** a fresh name for each nested subexpression that needs one, with polarity (Plaisted–Greenbaum style), so that the clausification is linear and Horn structure survives. In JAIR 2009† this is what keeps hypertableau deterministic on Horn parts.
+   A fresh definition is split before the ordinary distribution cutoff: `Q ⊑ ∧Ei`
+   emits `Q ⊑ Ei` for each conjunct; the negative polarity splits `¬E ∨ Q` in the same
+   way. Reusing the cached name for its own wide definition would emit `Q → Q` and lose
+   its meaning. The cutoff chooses the clause representation, never which conjuncts
+   survive. The direct-semantics guards enumerate auxiliary interpretations as well as
+   the canonical extension, which alone cannot detect a missing definition.
 4. **Absorption**, before clausification. It decides which body atom triggers a clause, so it acts as the query planner of the later hyperresolution joins (D):
    - **Role absorption:** domains, ranges and `Some(R, ⊤) ⊑ C` bind to role events, not to every node. This is the strongest isolated measurement in D: FaCT++ on NCI took 2,447.7 s without it and 63.9 s with it, and tableau operations fell from 344,142,434 to 1,580,206†.
    - **Binary absorption:** `A ⊓ B ⊑ C` with a conjunction of atoms as the trigger.

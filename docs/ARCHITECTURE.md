@@ -118,7 +118,7 @@ These apply to every change. Reviews check them explicitly.
 
 - **Functional core, imperative shell.** Planning, validation, reasoning rules, shape checks and access-plan selection are pure functions of their inputs (snapshot, delta, config) that return values. Side effects — locking, I/O, publishing a version — are confined to a thin shell: the engine's commit path, the WAL writer, the HTTP adapters.
 - **Immutable data, explicit versions.** Snapshots, runs, compiled rule sets and compiled shapes are immutable once built and shared via `Arc`. Change means building a new value, never mutating a shared one.
-- **Explicit data flow.** Inputs arrive as parameters and results leave as return values. No hidden globals, no ambient configuration lookups (`std::env::var` only in `nrese-server/src/config/`).
+- **Explicit data flow.** Inputs arrive as parameters and results leave as return values. No hidden globals, no ambient configuration lookups (`std::env::var` only in `nrese-server/src/config/`). A store's settings are its own (`EngineConfig`, `StoreConfig`): two stores of one process may differ. What belongs to the process is set by the binary, once, and named so: its memory limit (`nrese_exec::memory::set_process_limit`) and the allocator's behaviour (`nrese_engine::memory::set_release`, `set_release_between_rounds`, `nrese_exec::memory::set_transparent_huge_pages`).
 - **Parse, don't guess.** External input (config, requests) is parsed into typed values at the edge. Unknown values are errors, never silent defaults.
 - **Small modules with one reason to change.** Split a file before adding a second responsibility, not after.
 

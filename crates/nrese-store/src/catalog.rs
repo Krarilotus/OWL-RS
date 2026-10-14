@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode, UserRules};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
@@ -167,17 +167,14 @@ pub fn stored_default_settings(
 pub fn reconfigure(
     slot: &PipelineSlot,
     settings: &RepositorySettings,
-    fallback: &ReasonerService,
+    fallback: &ReasonerConfig,
 ) -> Result<&'static str, CatalogError> {
-    let reasoner = match settings.reasoner_config().map_err(CatalogError::Invalid)? {
-        Some(config) => ReasonerService::new(config),
+    let reasoning = match settings.reasoner_config().map_err(CatalogError::Invalid)? {
+        Some(config) => config,
         None => fallback.clone(),
     };
     let store = Arc::clone(slot.read().store());
-    let next = Arc::new(MutationPipeline::new(
-        Arc::clone(&store),
-        Arc::new(reasoner),
-    ));
+    let next = Arc::new(MutationPipeline::new(Arc::clone(&store), reasoning));
     let previous = std::mem::replace(&mut *slot.write(), Arc::clone(&next));
     previous.retire();
     match next.reasoner().config().materialised_program() {
@@ -203,7 +200,8 @@ pub struct Catalog {
     /// The default store's settings, for the others.
     template: StoreConfig,
     runtime: Arc<crate::Runtime>,
-    reasoner: ReasonerService,
+    /// The server's reasoning, for repositories whose settings name none.
+    reasoning: ReasonerConfig,
     /// Where on-disk repositories live; `None` for an in-memory server.
     root: Option<PathBuf>,
     others: RwLock<BTreeMap<String, Repository>>,
@@ -249,12 +247,12 @@ fn existing(id: &str) -> bool {
 const TRASH: &str = "~trash-";
 
 impl Catalog {
-    /// The repositories of a server whose default store is `store`, reasoning with
-    /// `reasoner` where a repository's settings name none: the default with its stored
+    /// The repositories of a server whose default store is `store`, reasoning as
+    /// `reasoning` says where a repository's settings name none: the default with its stored
     /// settings (those changed through the engine API), and on disk the others found under
     /// `repositories/` of its data directory (one that fails to open is logged and left
     /// out).
-    pub fn open(store: StoreService, reasoner: ReasonerService) -> Result<Self, CatalogError> {
+    pub fn open(store: StoreService, reasoning: ReasonerConfig) -> Result<Self, CatalogError> {
         let template = store.config().clone();
         let runtime = Arc::clone(store.runtime());
         let default_settings = stored_default_settings(&template)
@@ -263,7 +261,7 @@ impl Catalog {
         let default = Repository {
             pipeline: Arc::new(RwLock::new(Arc::new(MutationPipeline::new(
                 Arc::new(store),
-                Arc::new(reasoner.clone()),
+                reasoning.clone(),
             )))),
             settings: Arc::new(RwLock::new(default_settings)),
         };
@@ -273,7 +271,7 @@ impl Catalog {
             default,
             template,
             runtime,
-            reasoner,
+            reasoning,
             root,
             others: RwLock::default(),
         };
@@ -332,9 +330,9 @@ impl Catalog {
     /// Opens (or creates) repository `id`'s store and brings its inferences in line with
     /// its reasoning, as the server does for the default store at start.
     fn start(&self, id: &str, settings: RepositorySettings) -> Result<Repository, String> {
-        let reasoner = match settings.reasoner_config()? {
-            Some(config) => ReasonerService::new(config),
-            None => self.reasoner.clone(),
+        let reasoning = match settings.reasoner_config()? {
+            Some(config) => config,
+            None => self.reasoning.clone(),
         };
         let config = StoreConfig {
             data_dir: self
@@ -349,7 +347,7 @@ impl Catalog {
         };
         let store = StoreService::with_runtime(config, Arc::clone(&self.runtime))
             .map_err(|error| error.to_string())?;
-        match reasoner.config().materialised_program() {
+        match reasoning.materialised_program() {
             Some(program) if !store.reasoning_is_current(&program) => {
                 store
                     .rematerialise(&program)
@@ -363,7 +361,7 @@ impl Catalog {
         Ok(Repository {
             pipeline: Arc::new(RwLock::new(Arc::new(MutationPipeline::new(
                 Arc::new(store),
-                Arc::new(reasoner),
+                reasoning,
             )))),
             settings: Arc::new(RwLock::new(settings)),
         })
@@ -393,7 +391,7 @@ impl Catalog {
         check(&settings)?;
         let before = repository.settings.read().clone();
         if (&before.reasoning, &before.rules) != (&settings.reasoning, &settings.rules) {
-            reconfigure(&repository.pipeline, &settings, &self.reasoner)?;
+            reconfigure(&repository.pipeline, &settings, &self.reasoning)?;
         }
         if before.ql_rewriting != settings.ql_rewriting {
             let mode = settings
@@ -413,11 +411,6 @@ impl Catalog {
         }
         *repository.settings.write() = settings;
         Ok(())
-    }
-
-    /// The server's reasoning, for repositories whose settings name none.
-    pub fn server_reasoner(&self) -> &ReasonerService {
-        &self.reasoner
     }
 }
 

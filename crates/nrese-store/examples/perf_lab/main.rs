@@ -72,7 +72,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode, UserRules};
 use nrese_store::{
     BulkLoadRequest, CancellationToken, GraphTarget, MutationPipeline, PreparedQuery,
     QueryResultKind, ShaclValidationRequest, SolutionsResultFormat, SparqlQueryRequest,
@@ -994,12 +994,10 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     let program = reasoner.materialised_program();
     // Under `owl2-dl` the store enters the mode with its pipeline (the bounds, the
     // consistency gate, a status on every answer); the commits below use the same one.
-    let mut dl_pipeline = reasoner.mode().is_dl().then(|| {
-        MutationPipeline::new(
-            Arc::clone(&store),
-            Arc::new(ReasonerService::new(reasoner.clone())),
-        )
-    });
+    let mut dl_pipeline = reasoner
+        .mode()
+        .is_dl()
+        .then(|| MutationPipeline::new(Arc::clone(&store), reasoner.clone()));
     if let Some(program) = &program {
         if let Some((peak, rss)) = memory_mib() {
             eprintln!("before reasoning: memory peak {peak} MiB, resident {rss} MiB");
@@ -1143,12 +1141,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         .collect::<Result<_, _>>()?;
     if let Some(file) = &args.commits {
         let phase = Phase::start();
-        let pipeline = dl_pipeline.take().unwrap_or_else(|| {
-            MutationPipeline::new(
-                Arc::clone(&store),
-                Arc::new(ReasonerService::new(reasoner.clone())),
-            )
-        });
+        let pipeline = dl_pipeline
+            .take()
+            .unwrap_or_else(|| MutationPipeline::new(Arc::clone(&store), reasoner.clone()));
         report.sections.push((
             "commits",
             modes::commits(&pipeline, file, &texts, args.readers)?,

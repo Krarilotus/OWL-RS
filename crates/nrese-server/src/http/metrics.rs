@@ -238,7 +238,7 @@ nrese_support_seconds_total{{phase=\"view\"}} {}
 mod tests {
     use crate::ai::AiSuggestionService;
     use axum::body::to_bytes;
-    use nrese_reasoner::{ReasonerConfig, ReasonerService};
+    use nrese_reasoner::ReasonerConfig;
     use nrese_store::{StoreConfig, StoreService};
 
     use crate::policy::PolicyConfig;
@@ -249,7 +249,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_output_contains_stable_metric_names() {
         let store = StoreService::new(StoreConfig::default()).expect("store should initialize");
-        let reasoner = ReasonerService::new(ReasonerConfig::default());
+        let reasoner = ReasonerConfig::default();
         let state = AppState::new(
             store,
             reasoner,

@@ -2,7 +2,6 @@
 //! server tests, including when run by cargo test rather than nextest.
 
 use nrese_exec::memory::{process_limit, set_process_limit};
-use nrese_reasoner::ReasonerService;
 use nrese_server::ai::AiSuggestionService;
 use nrese_server::{AppState, DeploymentPosture, ServerConfig};
 use nrese_store::{StoreConfig, StoreService};
@@ -37,7 +36,7 @@ fn opening_repositories_and_system_stores_preserves_the_startup_policy() {
         assert_eq!(process_limit(), expected);
         let _state = AppState::try_new(
             store,
-            ReasonerService::new(config.reasoner.clone()),
+            config.reasoner.clone(),
             config.policy.clone(),
             AiSuggestionService::disabled(),
             config.deployment_posture,

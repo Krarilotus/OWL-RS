@@ -446,7 +446,7 @@ mod tests {
             quad(20, 5, 10),
             quad(30, 5, 1),
         ];
-        let version = Version::empty();
+        let version = Version::empty(crate::IndexEncoding::Fast);
         let expanded: Vec<EncodedQuad> = Expand::new(
             stored.into_iter(),
             Arc::clone(&classes),
