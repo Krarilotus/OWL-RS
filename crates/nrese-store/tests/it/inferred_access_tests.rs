@@ -160,14 +160,12 @@ fn without_rules_nothing_inferred_is_shown() {
 /// afresh: after every commit, a reader sees what a store forced to compute them sees.
 #[test]
 fn updated_sets_equal_fresh_ones_across_commits() {
-    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_reasoner::{ReasonerConfig, ReasoningMode};
     use nrese_store::{MutationCommand, MutationPipeline, MutationTicket, Requester};
     let pipeline = || {
         MutationPipeline::new(
             Arc::new(StoreService::new(in_memory_store_config()).unwrap()),
-            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-                ReasoningMode::Owl2Rl,
-            ))),
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
         )
     };
     let (updating, fresh) = (pipeline(), pipeline());
