@@ -1151,6 +1151,13 @@ impl Snapshot {
         (hits, report)
     }
 
+    /// Advisory physical route for a vector query, after requesting ordinary graph
+    /// maintenance. Estimates include the shared dictionary's newer vectors; they
+    /// never replace the snapshot filter applied by `vector_search`.
+    pub fn vector_estimate(&self, query: &crate::VectorQuery) -> crate::VectorSearchEstimate {
+        self.dictionary.vector_estimate(query)
+    }
+
     /// Builds the graph searches like `query` use, covering every vector of its
     /// dimension, before returning: a warm-up (searches build it themselves, a large one
     /// on a thread of its own while they scan exactly).
