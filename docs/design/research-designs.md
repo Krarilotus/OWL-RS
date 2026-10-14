@@ -83,7 +83,10 @@ L v2.0 (Apache-2.0); model licences are checked apart from runtime licences.
   a virtual `SERVICE nrv:search { … }` with the graph patterns outside it; the planner
   derives an accept set of term ids from those patterns and chooses per query: filter
   then exact scan, filter-aware ANN, or ANN with adaptive over-fetching and post-filter.
-  `nrv:exact`, `nrv:searchBudget`, `nrv:recallTarget` let a query pin the trade-off.
+  `nrv:exact` and `nrv:searchBudget` are implemented. A numeric `nrv:recallTarget`
+  remains proposed; beam size alone cannot guarantee recall. The bounded routing
+  candidate and its measurement limitations are in
+  [execution-core.md](execution-core.md#vector-join-direction-and-physical-search).
 - Index = navigation (flat | HNSW | Vamana | IVF) × codec (f32 | f16 | SQ8 | binary |
   PQ | RaBitQ) × re-rank (none | f16 | f32), behind one Rust trait with an accept-set
   predicate in its search options.

@@ -54,9 +54,9 @@ pub use native::typed_results::{AlignedSolutions, SolutionTable, TypedResults};
 pub use native::{ResultsFormat, geometry_literal};
 pub use nrese_exec::{BudgetExceeded, SharedBudget};
 pub use query::{
-    Candidates, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryOptions, Resources,
-    WriteResultsError, cached_output, evaluate_query, evaluate_query_typed, explain_query,
-    plan_query, prepare_ql_query, ql_report, runs_natively, write_results,
+    Candidates, Explanation, PlanStep, PlannedQuery, PlannedStep, PlannerOptions, QueryOptions,
+    Resources, WriteResultsError, cached_output, evaluate_query, evaluate_query_typed,
+    explain_query, plan_query, prepare_ql_query, ql_report, runs_natively, write_results,
 };
 pub use results::{
     CancellationToken, QueryDatasetSpecification, QueryEvaluationError, QueryResults,
