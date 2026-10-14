@@ -57,6 +57,8 @@ pub(crate) struct Driver<'a> {
     top_possible: Option<Vec<u32>>,
     /// `owl:Thing`'s subsumers where the Horn part has all of them.
     top_known: Option<Vec<u32>>,
+    /// When the classification began, where its phases are traced ([`Options::trace`]).
+    traced: Option<Instant>,
 }
 
 impl<'a> Driver<'a> {
@@ -66,6 +68,7 @@ impl<'a> Driver<'a> {
         classes: &'a [Term],
         options: &'a Options,
         deadline: Deadline,
+        traced: Option<Instant>,
     ) -> Self {
         let n = classes.len();
         Self {
@@ -86,6 +89,7 @@ impl<'a> Driver<'a> {
             possible: vec![None; n],
             top_possible: None,
             top_known: None,
+            traced,
         }
     }
 
@@ -95,7 +99,7 @@ impl<'a> Driver<'a> {
 
     pub(crate) fn classify(mut self) -> Taxonomy {
         let started = Instant::now();
-        super::trace("lower bound");
+        super::trace(self.traced, "lower bound");
         // Known subsumers from the Horn part (perhaps all of them).
         let mut exact = false;
         let mut lower_top = Vec::new();
@@ -106,13 +110,30 @@ impl<'a> Driver<'a> {
                 // Unlimited: half of what is left of the deadline.
                 Some(self.options.lower_bound_timeout.unwrap_or(Duration::MAX)),
             ));
-            if let Some(lower) = known::horn_lower_bound(
-                self.normalised,
-                self.classes,
-                &core,
-                &self.options.workers,
-                self.options.tableau.cancel.clone(),
-            ) {
+            let attempt = self
+                .options
+                .functional_attempt(&core, self.normalised)
+                .and_then(|route| {
+                    known::horn_lower_bound(
+                        self.normalised,
+                        self.classes,
+                        &route,
+                        &self.options.workers,
+                        self.options.tableau.cancel.clone(),
+                        self.traced,
+                    )
+                })
+                .filter(|lower| lower.inconsistent || lower.exact_for.iter().any(|&e| e));
+            if let Some(lower) = attempt.or_else(|| {
+                known::horn_lower_bound(
+                    self.normalised,
+                    self.classes,
+                    &core,
+                    &self.options.workers,
+                    self.options.tableau.cancel.clone(),
+                    self.traced,
+                )
+            }) {
                 if lower.inconsistent {
                     return self.inconsistent();
                 }
@@ -146,7 +167,7 @@ impl<'a> Driver<'a> {
             let known = self.known.clone();
             return self.finish(&known, &lower_top, started);
         }
-        super::trace("consistency");
+        super::trace(self.traced, "consistency");
         // 1. Consistency: the context core where it can, else the hypertableau.
         let t = Instant::now();
         let by_core = if self.options.context_core {
@@ -293,7 +314,7 @@ impl<'a> Driver<'a> {
         mut base: Option<Base<'p>>,
         consistency_by_core: bool,
     ) -> (Vec<Vec<u32>>, Vec<u32>) {
-        super::trace("tableau programs");
+        super::trace(self.traced, "tableau programs");
         let tbox;
         let nominals = full.features().nominals;
         let terminology_first = self.terminology_first(full);
@@ -338,12 +359,12 @@ impl<'a> Driver<'a> {
         };
         let tests = &tests;
         // 2. Satisfiability.
-        super::trace("satisfiability");
+        super::trace(self.traced, "satisfiability");
         let t = Instant::now();
         self.satisfiability(tests);
         self.profile.satisfiability = t.elapsed();
         // 3. owl:Thing.
-        super::trace("owl:Thing");
+        super::trace(self.traced, "owl:Thing");
         let t = Instant::now();
         let top = match self.top_known.take() {
             Some(top) => top,
@@ -351,7 +372,7 @@ impl<'a> Driver<'a> {
         };
         self.profile.top = t.elapsed();
         // 4. Subsumption tests.
-        super::trace("subsumption tests");
+        super::trace(self.traced, "subsumption tests");
         let t = Instant::now();
         let subsumers = self.subsumptions(tests, &top);
         self.profile.subsumption = t.elapsed();

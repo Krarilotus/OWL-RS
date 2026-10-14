@@ -16,11 +16,13 @@
 //! |---|---|
 //! | `BOUND(?v)`, `isIRI/isBlank/isLiteral(?v)` | the id's kind |
 //! | `?v = <iri>` / `!=` | id equality (a stored IRI has one id) |
+//! | `sameTerm(?a, ?b)`; `?a = ?b` / `!=` where either is an IRI or a blank node | id equality (a stored term has one id); `=` between two literals compares values: the generic evaluator |
 //! | `LANG(?v) = "tag"`, `LANGMATCHES(LANG(?v), "range")` | the language in the dictionary key |
 //! | `CONTAINS/STRSTARTS/STRENDS(?v or STR(?v), "text")`, `REGEX(…, "pattern", "flags")` | the borrowed lexical form |
 //! | `?v < > <= >= = 42` (and mirrored) | inline integer ids by value |
 //! | `?v < > <= >= = "2000-01-01"^^xsd:date` (or `xsd:dateTime`, and mirrored) | inline ids of the constant's kind and timezone by id (their order is the value order); other values to the generic evaluator |
 //! | `sameTerm(a, b)`, `isTRIPLE(a)` over variables, constants, `SUBJECT`/`PREDICATE`/`OBJECT` and `TRIPLE` ([`IdTerm`]) | ids: a triple term's parts read from its key, `TRIPLE` one hash probe ([`Snapshot::components`], [`Snapshot::triple_term`]) |
+//! | `geof:sfWithin(?v, C)` and every topological relation between a variable and a constant geometry (or the other way round; `C` may be an expression of constants such as `geof:buffer(…)`) | the store's geometry index: the boxes decide most rows, a point is its box, other geometries are read where the boxes meet ([`super::spatial::CompiledRelation`]) |
 //! | `&&`, `||`, `!` | SPARQL's three-valued logic |
 
 use std::cmp::Ordering;
@@ -44,7 +46,7 @@ pub(crate) enum Tri {
 }
 
 impl Tri {
-    fn of(b: bool) -> Self {
+    pub(crate) fn of(b: bool) -> Self {
         if b { Self::True } else { Self::False }
     }
 }
@@ -66,6 +68,10 @@ pub(crate) enum Fast {
     IsLiteral(Variable),
     /// `?v = <iri>`; `None` if the store doesn't know the IRI (never equal).
     SameIri(Variable, Option<u64>),
+    /// `?a = ?b`: id equality where either is an IRI or a blank node; between two
+    /// literals `=` compares values, which the generic evaluator does. `sameTerm`
+    /// uses `SameTerm`, including its fallback for legacy triple-term keys.
+    SameVariables(Variable, Variable),
     LangEquals(Variable, String),
     LangMatches(Variable, String),
     /// Operand: the variable itself (`false`) or `STR(?v)` (`true`).
@@ -79,6 +85,8 @@ pub(crate) enum Fast {
     SameTerm(IdTerm, IdTerm),
     /// `isTRIPLE(a)` by the id's kind.
     IsTriple(IdTerm),
+    /// A topological relation between a variable and a constant geometry.
+    Spatial(Box<super::spatial::CompiledRelation>),
 }
 
 /// An operand evaluated on ids, nothing decoded: what the rewritten triple term patterns
@@ -318,6 +326,10 @@ pub(crate) fn compile(expr: &Expression, snapshot: &Snapshot) -> Option<Fast> {
                     v.clone(),
                     snapshot.lookup(n.as_ref().into()).map(TermId::raw),
                 )
+            } else if let (Some(x), Some(y)) = (variable(a), variable(b))
+                && matches!(expr, Expression::Equal(..))
+            {
+                Fast::SameVariables(x.clone(), y.clone())
             } else if let (Some(v), Some(tag)) = (lang_of(a), simple(b)) {
                 Fast::LangEquals(v.clone(), tag.to_owned())
             } else if let (Some(tag), Some(v)) = (simple(a), lang_of(b)) {
@@ -359,6 +371,9 @@ pub(crate) fn compile(expr: &Expression, snapshot: &Snapshot) -> Option<Fast> {
                 };
                 Fast::Regex(v.clone(), str, compile_regex(simple(pattern)?, flags)?)
             }
+            (Function::Custom(_), _) => Fast::Spatial(Box::new(
+                super::spatial::CompiledRelation::compile(expr, snapshot)?,
+            )),
             _ => return None,
         },
         _ => return None,
@@ -426,9 +441,22 @@ impl Fast {
             Self::IsLiteral(v) => on_kind(v, &|k| {
                 !matches!(
                     k,
-                    TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph
+                    TermKind::Iri | TermKind::BlankNode | TermKind::DefaultGraph | TermKind::Triple
                 )
             }),
+            Self::SameVariables(a, b) => match (stored(a), stored(b)) {
+                (Err(Tri::Error), _) | (_, Err(Tri::Error)) => Tri::Error,
+                (Err(_), _) | (_, Err(_)) => Tri::Unknown,
+                (Ok(x), Ok(y)) => {
+                    let node =
+                        |id: TermId| matches!(id.kind(), TermKind::Iri | TermKind::BlankNode);
+                    if node(x) || node(y) {
+                        Tri::of(x == y)
+                    } else {
+                        Tri::Unknown
+                    }
+                }
+            },
             Self::SameIri(v, iri) => match stored(v) {
                 Ok(id) => Tri::of(Some(id.raw()) == *iri),
                 Err(undecided) => undecided,
@@ -473,6 +501,10 @@ impl Fast {
             Self::SameTerm(a, b) => {
                 same_term(a.value(value, snapshot), b.value(value, snapshot), snapshot)
             }
+            Self::Spatial(relation) => match stored(relation.variable()) {
+                Ok(id) => relation.eval(id, view),
+                Err(undecided) => undecided,
+            },
             Self::IsTriple(a) => match a.value(value, snapshot) {
                 Id::Stored(id) => Tri::of(id.kind() == TermKind::Triple),
                 Id::Error => Tri::Error,
@@ -515,4 +547,30 @@ pub(crate) fn lang_matches(tag: &str, range: &str) -> bool {
     tag.len() >= range.len()
         && tag[..range.len()].eq_ignore_ascii_case(range)
         && (tag.len() == range.len() || tag.as_bytes()[range.len()] == b'-')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_term_variables_preserve_uninspectable_triple_fallback() {
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let snapshot = engine.snapshot();
+        let a = Variable::new_unchecked("a");
+        let b = Variable::new_unchecked("b");
+        let expression = Expression::SameTerm(
+            Box::new(Expression::Variable(a.clone())),
+            Box::new(Expression::Variable(b)),
+        );
+        let fast = compile(&expression, &snapshot).unwrap();
+        // No component key is available for these ids, as for legacy text-keyed
+        // triple terms. Distinct ids alone cannot decide their RDF identity.
+        let (x, y) = TermId::kind_range(TermKind::Triple);
+        let (x, y) = (x.raw(), y.raw());
+        let value = |v: &Variable| if v == &a { x } else { y };
+        assert_eq!(fast.eval(&value, &|_| None, &snapshot), Tri::Unknown);
+        assert_eq!(fast.eval(&|_| x, &|_| None, &snapshot), Tri::True);
+        assert_eq!(fast.eval(&|_| UNDEF, &|_| None, &snapshot), Tri::Error);
+    }
 }

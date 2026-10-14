@@ -13,6 +13,58 @@ fn payload() -> Message {
     }
 }
 
+fn functional_program() -> Program {
+    let mut ontology = nrese_owl::Ontology::default();
+    ontology.axioms.push(nrese_owl::Axiom::ObjectCharacteristic(
+        nrese_owl::Characteristic::Functional,
+        nrese_owl::ObjProp::Named(1),
+    ));
+    let normalised = nrese_owl::normalise(&ontology);
+    super::super::compile::compile(&normalised, &[], true)
+        .unwrap()
+        .program
+}
+
+#[test]
+fn retained_merge_roles_use_the_existing_capacity_envelope() {
+    let program = functional_program();
+    assert_eq!(program.merge_roles.capacity(), 0);
+    // The ordinary program fits exactly; only the additional index must exceed it.
+    let envelope = nrese_exec::Envelope::new(Some(program.bytes()), None);
+    let budget = Budget {
+        memory: Some(envelope.clone()),
+        ..Budget::default()
+    };
+    let engine = Engine::new(program, Strategy::Functional, false, budget);
+    assert!(
+        engine.out_of_budget(),
+        "the retained role index must be charged"
+    );
+    assert!(envelope.refused());
+    drop(engine);
+    assert_eq!(envelope.used(), 0);
+}
+
+#[test]
+fn only_the_functional_strategy_builds_the_merge_role_index() {
+    for strategy in [Strategy::Cautious, Strategy::Split, Strategy::Eager] {
+        let program = functional_program();
+        assert!(!program.at_most_one.is_empty());
+        assert_eq!(program.merge_roles.capacity(), 0, "shared compilation");
+        let bytes = program.bytes();
+        let engine = Engine::new(program, strategy, false, Budget::default());
+        assert_eq!(engine.program.merge_roles.capacity(), 0);
+        assert_eq!(engine.program.bytes(), bytes);
+    }
+    let engine = Engine::new(
+        functional_program(),
+        Strategy::Functional,
+        false,
+        Budget::default(),
+    );
+    assert!(!engine.program.merge_roles.is_empty());
+}
+
 fn payload_engine() -> Engine {
     let normalised = nrese_owl::normalise_with(&nrese_owl::Ontology::default(), Default::default());
     let program = super::super::compile::compile(&normalised, &[1], false)

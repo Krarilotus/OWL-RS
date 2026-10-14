@@ -114,6 +114,13 @@ api_key = "replace-me"
 
 ## Store
 
+`store.inferred_merge_wave_keys` (`NRESE_INFERRED_MERGE_WAVE_KEYS`) targets the number
+of unpacked keys held by one inferred-stack merge wave. The default is 8,388,608 keys
+(256 MiB for 32-byte permutation keys); `0` or `"unlimited"` removes the target. Each
+engine owns its setting, including in-memory stores. One oversized part is taken alone
+and may exceed the target; packed output, cut tables and other scratch are apart. This
+is batching policy, not a strict memory cap. The process-memory backstop is unchanged.
+
 - file key: `store.mode`
 - env override: `NRESE_STORE_MODE`
 - values: `in-memory` (aliases `inmemory`, `memory`), `on-disk` (aliases `ondisk`, `disk`, `durable`)
@@ -292,7 +299,8 @@ Every limit on memory, time and request size is in one table, `[budgets]`. Value
 |---|---|---|---|
 | `budgets.query_memory` | `NRESE_MAX_QUERY_MEMORY_BYTES` | 4 GiB | One query's memory envelope: its intermediate and retained results and, under `owl2-dl`, its DL work (the exact services' compilation scratch and engines). A query whose evaluation needs more is answered `413`; DL candidates past it are left unresolved, the status says so (`422` under `dl.answers = exact`). `0` = unlimited |
 | `budgets.total_query_memory` | `NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES` | 50 % of the machine's memory | Every running request's envelope across the catalog: queries, updates (their WHERE evaluation and `owl2-dl` commit gate), DL entailment checks and explanations. A query that asks for more than is left is answered `503` and may succeed later. `0` = unlimited |
-| `budgets.process_memory` | `NRESE_PROCESS_MEMORY_BYTES` | 75 % of the machine's memory (the container's limit where there is one) | The private memory (mapped store files excluded) the server may hold before a long operation stops instead of taking the machine: a materialisation (load, startup, change of rules) or the reasoning of a commit ends with an error and applies nothing. A size (`48 GiB`) or a share (`60%`); `0` = unlimited |
+| `budgets.planner_effort` | `NRESE_PLANNER_EFFORT` | 524288 | Approximate candidate estimates across greedy join-order starts. `0` removes this effort bound; at least one complete start is always tried. The DP threshold and maximum greedy starts stay unchanged. Applies to queries and EXPLAIN, the `WHERE` clauses of updates (SPARQL 1.1 Protocol and RDF4J) and draft query checks |
+| `budgets.process_memory` | `NRESE_PROCESS_MEMORY_BYTES` | 75 % of the machine's memory (the container's limit where there is one) | The private memory (mapped store files excluded) the server may hold before a long operation stops instead of taking the machine: a materialisation (load, startup, change of rules) or the reasoning of a commit ends with an error and applies nothing; a query past it ends with a memory error (`503`), whatever its budget accounted. A size (`48 GiB`) or a share (`60%`); `0` = unlimited |
 | `budgets.huge_pages` | `NRESE_HUGE_PAGES` | `on` | Whether transparent huge pages may back the server's memory (Linux; elsewhere nothing changes). `on`: work over large heaps runs faster (LUBM 100's materialisation 26 % faster), but while serving many small requests the allocator holds about 2.7 times the memory (a whole 2 MiB page resident for a touched byte). `off`: less memory held while serving, slower materialisation. See [server-setup.md](server-setup.md) §12.1 |
 | `budgets.reasoning_release` | `NRESE_REASONING_RELEASE` | `off` | Whether a materialisation gives back between its rounds, after the last one and before the inferred stack what the last round freed. `on`: a lower and steadier peak, as the allocator keeps a freed large block about a round's time (office PC, LUBM 100: 2,074 → 1,776 MiB, 5.6 % more reasoning time; OWL2Bench RL-1: −25 % for 6.6 %; a small RDFS materialisation: −28 % for 14 %). `off`: the fastest materialisation. For a memory budget near its limit, or for peaks that must compare between runs |
 | `budgets.bulk_load_memory` | `NRESE_BULK_LOAD_MEMORY` | 25 % of the machine's memory | The quads of a bulk load (`nrese-server load`, or a load into an empty store). Past it they are sorted in chunks of a third of it (one filling, one being sorted, its sorted copy), spilled to `bulk-spill/` in the data directory and merged into each index permutation while the checkpoint is written: one more pass over the disk, but the load's quads take this much plus one packed permutation whatever the data's size. The dictionary is apart (it grows with the distinct terms). Needs `store.map_checkpoints`. `0` = unlimited |
@@ -309,6 +317,8 @@ Every limit on memory, time and request size is in one table, `[budgets]`. Value
 How query memory accounting works:
 
 - Each request has one envelope within the catalog's budget, and everything it holds draws from it: operator tables and scratch (joins, groups, sorts), retained native results and DL bound tables until they drop, and under `owl2-dl` the DL engines' capacity and their compilation scratch (`docs/design/execution-core.md`, "Execution and resource lifetime"). A table that is being built may take half of what is left, because growing it, and merging the parts of a parallel join, holds its rows twice for a moment. Decoded graph payloads and encoder buffers are not counted; classification and realisation, shared per revision, have an envelope of their own within the catalog's budget, and the process limit.
+- The query's computed terms, cached decoded terms and sort-key storage also draw from the envelope. The executor and its joins check `budgets.process_memory` as a separate cooperative backstop; a query past it ends with a memory error even when its accounted allocations are within its envelope.
+- `COUNT` over a join tree (with OPTIONAL, MINUS, EXISTS and UNION parts), `COUNT(DISTINCT ?x)` and `GROUP BY ?x` with counts are counted without the join's rows: their memory is a count per distinct value.
 - The machine's memory is the container's limit where there is one (cgroups), else the machine's. It is known on Linux; elsewhere a share such as `50%` means "no limit", so set a size.
 - The store's own memory (the data and its indexes) is not part of either budget.
 - A request over a size limit is answered `413`. Requests are held in memory while they are handled, so a size limit is also memory a request may take.

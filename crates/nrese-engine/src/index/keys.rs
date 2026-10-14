@@ -23,15 +23,14 @@
 //!
 //! Typical cost on LUBM: 6 to 12 bytes per key instead of 32.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use rayon::prelude::*;
 
 use crate::mapped::{Map, Mapped, Plain};
 use crate::quad::Key;
 
-/// How index blocks are encoded when they are built (`store.index_encoding`). Reading
-/// takes either, so a store can switch: blocks built after the switch take the new one.
+/// How index blocks are encoded when they are built (`EngineConfig::index_encoding`,
+/// `store.index_encoding`): each index version builds its runs in its own. Reading takes
+/// either, so a store can switch: blocks built after the switch take the new one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IndexEncoding {
     /// Frame of reference only: the fastest scans.
@@ -55,22 +54,6 @@ impl IndexEncoding {
             "compact" => Some(Self::Compact),
             _ => None,
         }
-    }
-}
-
-/// The encoding blocks are built with, for the process: the stores of one server share
-/// their settings.
-static COMPACT: AtomicBool = AtomicBool::new(false);
-
-/// Sets the encoding of the index blocks built from now on, in every store of the process.
-pub fn set_index_encoding(encoding: IndexEncoding) {
-    COMPACT.store(encoding == IndexEncoding::Compact, Ordering::Relaxed);
-}
-
-fn current_encoding() -> IndexEncoding {
-    match COMPACT.load(Ordering::Relaxed) {
-        true => IndexEncoding::Compact,
-        false => IndexEncoding::Fast,
     }
 }
 
@@ -131,15 +114,26 @@ impl Header {
         let mut header = Header::default();
         let n = block.len();
         let mut palette_words = 0;
+        // Every position's least and greatest value, in one pass over the block: their
+        // tags are the least and greatest tags, and where those are equal, their payloads
+        // the least and greatest payloads (a second pass only for a position whose tags
+        // differ).
+        let (mut low, mut high) = ([u64::MAX; 4], [0u64; 4]);
+        for key in block {
+            for c in 0..4 {
+                low[c] = low[c].min(key[c]);
+                high[c] = high[c].max(key[c]);
+            }
+        }
         for c in 0..4 {
-            let (tag_min, tag_max) = block.iter().fold((u8::MAX, 0), |(lo, hi), k| {
-                let t = (k[c] >> TAG_SHIFT) as u8;
-                (lo.min(t), hi.max(t))
-            });
-            let (payload_min, payload_max) = block.iter().fold((u64::MAX, 0), |(lo, hi), k| {
-                let p = k[c] & PAYLOAD_MASK;
-                (lo.min(p), hi.max(p))
-            });
+            let (tag_min, tag_max) = ((low[c] >> TAG_SHIFT) as u8, (high[c] >> TAG_SHIFT) as u8);
+            let (payload_min, payload_max) = match tag_min == tag_max {
+                true => (low[c] & PAYLOAD_MASK, high[c] & PAYLOAD_MASK),
+                false => block.iter().fold((u64::MAX, 0), |(lo, hi), k| {
+                    let p = k[c] & PAYLOAD_MASK;
+                    (lo.min(p), hi.max(p))
+                }),
+            };
             let (tw, pw) = (
                 width(u64::from(tag_max - tag_min)),
                 width(payload_max - payload_min),
@@ -201,17 +195,17 @@ impl Header {
                 }
                 continue;
             }
-            for (j, key) in block.iter().enumerate() {
-                let value = key[c];
-                let tag = u64::from((value >> TAG_SHIFT) as u8 - self.tag_min[c]);
-                let payload = (value & PAYLOAD_MASK) - self.payload_min[c];
-                write(bits, self.starts[2 * c] as usize + j * tw as usize, tw, tag);
-                write(
-                    bits,
-                    self.starts[2 * c + 1] as usize + j * pw as usize,
-                    pw,
-                    payload,
-                );
+            // A sub-column at a time, none where its width is 0 (a block's graph, mostly its
+            // predicate and its tags).
+            if tw > 0 {
+                let low = u64::from(self.tag_min[c]);
+                let tags = block.iter().map(|key| (key[c] >> TAG_SHIFT) - low);
+                write_column(bits, self.starts[2 * c] as usize, tw, tags);
+            }
+            if pw > 0 {
+                let low = self.payload_min[c];
+                let payloads = block.iter().map(|key| (key[c] & PAYLOAD_MASK) - low);
+                write_column(bits, self.starts[2 * c + 1] as usize, pw, payloads);
             }
         }
     }
@@ -360,6 +354,32 @@ fn read(data: &[u64], bit: usize, width: u8) -> u64 {
     value & (u64::MAX >> (64 - width))
 }
 
+/// Writes `values` (each below `2^width`, `width` in 1..64) one after another from bit
+/// `bit` of `data` (zeroed there), as [`write`] would one by one: through a word that is
+/// stored once full, where a write per value read and wrote its word (and the next) and
+/// tested its width.
+#[inline]
+fn write_column(data: &mut [u64], bit: usize, width: u8, values: impl Iterator<Item = u64>) {
+    debug_assert!((1..64).contains(&width));
+    let width = u32::from(width);
+    let (mut word, mut used) = (bit / 64, (bit % 64) as u32);
+    let mut acc = 0u64;
+    for value in values {
+        acc |= value << used;
+        used += width;
+        if used >= 64 {
+            data[word] |= acc;
+            word += 1;
+            used -= 64;
+            // The bits of `value` that didn't fit (none where it ended the word).
+            acc = if used > 0 { value >> (width - used) } else { 0 };
+        }
+    }
+    if used > 0 {
+        data[word] |= acc;
+    }
+}
+
 fn write(data: &mut [u64], bit: usize, width: u8, value: u64) {
     if width == 0 {
         return;
@@ -371,16 +391,74 @@ fn write(data: &mut [u64], bit: usize, width: u8, value: u64) {
     }
 }
 
-impl PackedKeys {
-    /// Packs `keys`, which must be sorted, in the process's encoding. Large arrays are
-    /// packed in parallel.
-    pub(crate) fn from_sorted(keys: &[Key]) -> Self {
-        Self::from_sorted_as(keys, current_encoding())
+/// Packs sorted keys handed over a slice at a time ([`Self::extend`]), whole blocks of them
+/// in parallel: a permutation built in parts (merged from sorted runs,
+/// [`super::merged`]) is never held as keys at once, only a part's packed blocks are added.
+pub(crate) struct PackedBuilder {
+    encoding: IndexEncoding,
+    len: usize,
+    headers: Vec<Header>,
+    firsts: Vec<Key>,
+    data: Vec<u64>,
+    /// The keys of a block not yet full.
+    pending: Vec<Key>,
+    /// The last key added.
+    last: Option<Key>,
+}
+
+impl PackedBuilder {
+    /// A builder in the owning index version's encoding.
+    pub(crate) fn new(encoding: IndexEncoding) -> Self {
+        Self {
+            encoding,
+            len: 0,
+            headers: Vec::new(),
+            firsts: Vec::new(),
+            data: Vec::new(),
+            pending: Vec::with_capacity(BLOCK),
+            last: None,
+        }
     }
 
-    /// Packs `keys`, which must be sorted, in `encoding`.
-    pub(crate) fn from_sorted_as(keys: &[Key], encoding: IndexEncoding) -> Self {
+    /// The keys added so far.
+    pub(crate) fn len(&self) -> usize {
+        self.len + self.pending.len()
+    }
+
+    /// Adds `keys`, sorted and each after every key added before.
+    pub(crate) fn extend(&mut self, mut keys: &[Key]) {
         debug_assert!(keys.is_sorted(), "keys must be sorted");
+        debug_assert!(
+            self.last
+                .zip(keys.first())
+                .is_none_or(|(last, first)| last < *first),
+            "keys must follow the keys added before"
+        );
+        if let Some(&last) = keys.last() {
+            self.last = Some(last);
+        }
+        if !self.pending.is_empty() {
+            let take = (BLOCK - self.pending.len()).min(keys.len());
+            self.pending.extend_from_slice(&keys[..take]);
+            keys = &keys[take..];
+            if self.pending.len() < BLOCK {
+                return;
+            }
+            let block = std::mem::replace(&mut self.pending, Vec::with_capacity(BLOCK));
+            self.pack_blocks(&block);
+        }
+        let whole = keys.len() / BLOCK * BLOCK;
+        self.pack_blocks(&keys[..whole]);
+        self.pending.extend_from_slice(&keys[whole..]);
+    }
+
+    /// Packs `keys` as blocks of [`BLOCK`] (a shorter one only at the end of the keys),
+    /// in parallel when they are many.
+    fn pack_blocks(&mut self, keys: &[Key]) {
+        if keys.is_empty() {
+            return;
+        }
+        let encoding = self.encoding;
         let parallel = keys.len() >= PARALLEL_PACK;
         let mut headers: Vec<Header> = if parallel {
             keys.par_chunks(BLOCK)
@@ -391,15 +469,15 @@ impl PackedKeys {
                 .map(|block| Header::of(block, encoding))
                 .collect()
         };
-        let mut words = 0;
+        let start = self.data.len();
+        let mut words = start;
         for (header, block) in headers.iter_mut().zip(keys.chunks(BLOCK)) {
             header.offset = words as u64;
             words += header.words(block.len());
         }
-        // One spare word, so reads never cross the end.
-        let mut data = vec![0u64; words + 1];
+        self.data.resize(words, 0);
         let mut slices: Vec<&mut [u64]> = Vec::with_capacity(headers.len());
-        let mut rest = data.as_mut_slice();
+        let mut rest = &mut self.data[start..];
         for (header, block) in headers.iter().zip(keys.chunks(BLOCK)) {
             let (bits, tail) = rest.split_at_mut(header.words(block.len()));
             slices.push(bits);
@@ -417,12 +495,33 @@ impl PackedKeys {
                 header.pack(block, bits);
             }
         }
-        Self {
-            len: keys.len(),
-            headers: Storage::Owned(headers.into_boxed_slice()),
-            firsts: Storage::Owned(keys.chunks(BLOCK).map(|block| block[0]).collect()),
-            data: Storage::Owned(data.into_boxed_slice()),
+        self.firsts.extend(keys.chunks(BLOCK).map(|block| block[0]));
+        self.headers.extend(headers);
+        self.len += keys.len();
+    }
+
+    /// The packed keys.
+    pub(crate) fn finish(mut self) -> PackedKeys {
+        let pending = std::mem::take(&mut self.pending);
+        self.pack_blocks(&pending);
+        // One spare word, so reads never cross the end.
+        self.data.push(0);
+        PackedKeys {
+            len: self.len,
+            headers: Storage::Owned(self.headers.into_boxed_slice()),
+            firsts: Storage::Owned(self.firsts.into_boxed_slice()),
+            data: Storage::Owned(self.data.into_boxed_slice()),
         }
+    }
+}
+
+impl PackedKeys {
+    /// Packs `keys`, which must be sorted, in `encoding`.
+    pub(crate) fn from_sorted(keys: &[Key], encoding: IndexEncoding) -> Self {
+        debug_assert!(keys.is_sorted(), "keys must be sorted");
+        let mut builder = PackedBuilder::new(encoding);
+        builder.pack_blocks(keys);
+        builder.finish()
     }
 
     /// Packs `len` sorted keys that `gather` produces a block at a time (it appends the
@@ -431,9 +530,9 @@ impl PackedKeys {
     /// is gathered twice, once for its header and once to pack it.
     pub(crate) fn from_sorted_gathered(
         len: usize,
+        encoding: IndexEncoding,
         gather: impl Fn(std::ops::Range<usize>, &mut Vec<Key>) + Sync,
     ) -> Self {
-        let encoding = current_encoding();
         let blocks = len.div_ceil(BLOCK);
         let range = |b: usize| b * BLOCK..((b + 1) * BLOCK).min(len);
         let block_of = |b: usize, keys: &mut Vec<Key>| {
@@ -483,42 +582,24 @@ impl PackedKeys {
         }
     }
 
-    /// Packs keys arriving in sorted order (a merged scan), without holding them all.
-    pub(crate) fn from_sorted_iter(keys: impl Iterator<Item = Key>) -> Self {
-        let mut packed = Self::default();
-        let mut data: Vec<u64> = Vec::new();
-        let (mut headers, mut firsts) = (Vec::new(), Vec::new());
-        let mut block: Vec<Key> = Vec::with_capacity(BLOCK);
-        let encoding = current_encoding();
-        let mut flush = |block: &mut Vec<Key>, data: &mut Vec<u64>| {
-            let mut header = Header::of(block, encoding);
-            header.offset = data.len() as u64;
-            let start = data.len();
-            data.resize(start + header.words(block.len()), 0);
-            header.pack(block, &mut data[start..]);
-            headers.push(header);
-            firsts.push(block[0]);
-            block.clear();
-        };
+    /// Packs keys arriving in sorted order (a merged scan), without holding them all: a
+    /// batch of them at a time, its blocks in parallel.
+    pub(crate) fn from_sorted_iter(
+        keys: impl Iterator<Item = Key>,
+        encoding: IndexEncoding,
+    ) -> Self {
+        const BATCH: usize = 1 << 16;
+        let mut builder = PackedBuilder::new(encoding);
+        let mut batch: Vec<Key> = Vec::with_capacity(BATCH);
         for key in keys {
-            debug_assert!(
-                block.last().is_none_or(|last| *last < key),
-                "keys must be sorted"
-            );
-            block.push(key);
-            packed.len += 1;
-            if block.len() == BLOCK {
-                flush(&mut block, &mut data);
+            batch.push(key);
+            if batch.len() == BATCH {
+                builder.extend(&batch);
+                batch.clear();
             }
         }
-        if !block.is_empty() {
-            flush(&mut block, &mut data);
-        }
-        data.push(0);
-        packed.headers = Storage::Owned(headers.into_boxed_slice());
-        packed.firsts = Storage::Owned(firsts.into_boxed_slice());
-        packed.data = Storage::Owned(data.into_boxed_slice());
-        packed
+        builder.extend(&batch);
+        builder.finish()
     }
 
     /// Serialises the array, little-endian; `emit` receives consecutive pieces (large
@@ -833,6 +914,11 @@ impl PackedKeys {
             return;
         }
         let mut value = self.get(start)[position];
+        // One value throughout: its ends agree (a part of a parallel walk inside one group).
+        if self.get(end - 1)[position] == value {
+            f(value, start, end);
+            return;
+        }
         let mut from = start;
         let mut i = start;
         let mut column = Vec::with_capacity(BLOCK);
@@ -1092,7 +1178,7 @@ mod tests {
         let mut state = 5;
         for n in [0, 1, 2, 127, 128, 129, 1000, 5000, 70_000] {
             let keys = random_keys(&mut state, n);
-            let packed = PackedKeys::from_sorted(&keys);
+            let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
             assert_eq!(packed.len(), keys.len());
             for (i, key) in keys.iter().enumerate() {
                 assert_eq!(packed.get(i), *key, "n {n} index {i}");
@@ -1137,7 +1223,7 @@ mod tests {
         let mut state = 41;
         for n in [1, 127, 128, 129, 5000, 70_000] {
             let keys = random_keys(&mut state, n);
-            let packed = PackedKeys::from_sorted(&keys);
+            let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
             let mut probes: Vec<Key> = (0..300)
                 .map(|_| {
                     let mut key = keys[(rng(&mut state) as usize) % keys.len()];
@@ -1180,7 +1266,7 @@ mod tests {
             random_keys(&mut state, 300),
             long,
         ] {
-            let packed = PackedKeys::from_sorted(&keys);
+            let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
             for _ in 0..100 {
                 // A range with a fixed first component, grouped on the second; or the whole
                 // array grouped on the first.
@@ -1211,8 +1297,8 @@ mod tests {
         let mut state = 17;
         for n in [0, 1, 128, 1000, 70_000] {
             let keys = random_keys(&mut state, n);
-            let packed = PackedKeys::from_sorted(&keys);
-            let streamed = PackedKeys::from_sorted_iter(keys.iter().copied());
+            let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
+            let streamed = PackedKeys::from_sorted_iter(keys.iter().copied(), IndexEncoding::Fast);
             let mut bytes = Vec::new();
             packed
                 .write(Some(0), &mut |piece| {
@@ -1252,7 +1338,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for (n, at) in [(1000, 0u64), (70_000, 3), (129, 13), (0, 5)] {
             let keys = random_keys(&mut state, n);
-            let packed = PackedKeys::from_sorted(&keys);
+            let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
             let mut bytes = vec![0xaa; at as usize];
             packed
                 .write(Some(at), &mut |piece| {
@@ -1300,9 +1386,9 @@ mod tests {
             .collect();
         keys.sort_unstable();
         keys.dedup();
-        let packed = PackedKeys::from_sorted_as(&keys, IndexEncoding::Compact);
+        let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Compact);
         assert!(
-            PackedKeys::from_sorted_as(&keys, IndexEncoding::Fast)
+            PackedKeys::from_sorted(&keys, IndexEncoding::Fast)
                 .headers
                 .iter()
                 .all(|h| (0..4).all(|c| !h.palette(c))),
@@ -1374,7 +1460,7 @@ mod tests {
             [u64::MAX >> 4, u64::MAX, 1, 2],
             [u64::MAX, u64::MAX, u64::MAX, u64::MAX],
         ];
-        let packed = PackedKeys::from_sorted(&keys);
+        let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
         for (i, key) in keys.iter().enumerate() {
             assert_eq!(packed.get(i), *key);
         }
@@ -1400,7 +1486,7 @@ mod tests {
             })
             .collect();
         keys.sort_unstable();
-        let packed = PackedKeys::from_sorted(&keys);
+        let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
         let per_key = packed.memory_bytes() as f64 / keys.len() as f64;
         assert!(per_key < 8.0, "{per_key} bytes per key");
     }
@@ -1428,7 +1514,7 @@ mod tests {
             })
             .collect();
         keys.sort_unstable();
-        let packed = PackedKeys::from_sorted(&keys);
+        let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
         let probes: Vec<Key> = (0..1_000_000)
             .map(|_| keys[(rng(&mut state) % 1_000_000) as usize])
             .collect();
@@ -1468,8 +1554,36 @@ mod tests {
                 }
             }
             let decode = start.elapsed().as_secs_f64() * 1e9 / (10 * packed.len()) as f64;
+            // Packing, one thread: headers and bits of whole blocks, below the parallel
+            // packing's threshold at a time.
+            let start = std::time::Instant::now();
+            for _ in 0..5 {
+                let mut builder = PackedBuilder::new(IndexEncoding::Fast);
+                for block in keys.chunks(PARALLEL_PACK / 2) {
+                    builder.pack_blocks(block);
+                }
+                sum = sum.wrapping_add(builder.len() as u64);
+            }
+            let pack = start.elapsed().as_secs_f64() * 1e9 / (5 * keys.len()) as f64;
+            // Its parts: the headers, and the bits given the headers.
+            let start = std::time::Instant::now();
+            let headers: Vec<Header> = keys
+                .chunks(BLOCK)
+                .map(|block| Header::of(block, IndexEncoding::Fast))
+                .collect();
+            let header = start.elapsed().as_secs_f64() * 1e9 / keys.len() as f64;
+            let start = std::time::Instant::now();
+            let mut bits = vec![0u64; 64 * BLOCK];
+            for (block, header) in keys.chunks(BLOCK).zip(&headers) {
+                let words = header.words(block.len());
+                bits[..words].fill(0);
+                header.pack(block, &mut bits[..words]);
+                sum = sum.wrapping_add(bits[0]);
+            }
+            let bits_ns = start.elapsed().as_secs_f64() * 1e9 / keys.len() as f64;
+            eprintln!("pack parts: header {header:.2} ns/key, bits {bits_ns:.2} ns/key");
             eprintln!(
-                "get {get:.1} ns | bound_in {bound:.1} ns | range {range:.1} ns | decode {decode:.2} ns/key | {sum}"
+                "get {get:.1} ns | bound_in {bound:.1} ns | range {range:.1} ns | decode {decode:.2} ns/key | pack {pack:.2} ns/key | {sum}"
             );
         }
     }

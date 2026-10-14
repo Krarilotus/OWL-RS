@@ -221,6 +221,24 @@ cap_gb = 6
 systems = ["nemo:custom", "jena:custom", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 home_turf = "nemo"
 rewrite = "expressible"
+[[case]]
+name = "custom-cspa"
+area = "reasoning"
+what = "the context-sensitive pointer analysis (CSPA) over a generated pointer graph (18,000 nodes, 12,000 dereferences in chains, 2,400 assignments) as Notation3 user rules: three mutually recursive relations, two three-way joins; 3.69 M derived facts"
+semantics = "custom"
+data = "cspa nodes=18000 assigns=2400"
+args = ["--reason", "custom", "--rules", "/src/benches/fast/rules/cspa.n3", "--reason-runs", "5"]
+queries = "cspa"
+metric = "reason.p50_ms"
+check = { "q.valueFlow.value" = "expect.value_flow", "q.memoryAlias.value" = "expect.memory_alias", "q.valueAlias.value" = "expect.value_alias" }
+route = {}
+cap_gb = 6
+# Souffle, the home turf, runs CSPA on Graspan's graphs in the Datalog kit
+# (benches/reasoning/datalog), not as a fast comparator.
+systems = []
+home_turf = "souffle"
+guards = ["the inferred stack merged from the reasoner's runs"]
+
 # --- maintenance: commits, deletions, readers -------------------------------------------------
 
 [[case]]
@@ -606,6 +624,23 @@ guards = ["worst-case-optimal joins for cyclic patterns"]
 args = ["--runs", "2"]
 pinned = "NRESE 5 Oct 2026; cross-checked in fast.py compete"
 [[case]]
+name = "q-counts"
+area = "query"
+what = "COUNT over join trees (a star, a chain with OPTIONAL, MINUS, EXISTS, a selective listing against a large leaf), COUNT(DISTINCT) of a join's variable, the literals among every statement's objects"
+semantics = "none"
+data = "social people=300000"
+queries = "q-counts"
+metric = "sum_p50_ms"
+# Each answer from the generator's structure: one author, tag and score per post; every
+# user follows 8, has one city of 1,000 (300 in c7), a name, an age and a birth date; a
+# third of the posts titled; literals: 3 per user, a label per tag, 2 per post, the titles.
+check = { "q.star.value" = "expect.posts", "q.chain-optional.value" = "4800000", "q.minus.value" = "400000", "q.exists.value" = "expect.follows", "q.selective.value" = "2400", "q.distinct.value" = "1000", "q.literals.value" = "2302000" }
+route = { "q.star.operators" = "has counted join", "q.chain-optional.operators" = "has counted join", "q.minus.operators" = "has counted join", "q.exists.operators" = "has counted join", "q.selective.operators" = "has counted join", "q.distinct.operators" = "has counted join", "q.literals.operators" = "has range count" }
+cap_gb = 6
+systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
+guards = ["COUNT of acyclic joins by message passing", "COUNT of a bounded pattern by range counts"]
+args = ["--runs", "20"]
+[[case]]
 name = "q-snowflake"
 area = "query"
 what = "a snowflake: posts with author, tag and likes, each joined further and filtered"
@@ -679,16 +714,19 @@ args = ["--runs", "300"]
 [[case]]
 name = "op-group"
 area = "operator"
-what = "COUNT … GROUP BY on one pattern, NOT EXISTS by a group walk, COUNT DISTINCT"
+what = "COUNT … GROUP BY on one pattern, COUNT under NOT EXISTS counted without rows, COUNT DISTINCT"
 semantics = "none"
 data = "social people=300000"
 queries = "op-group"
 metric = "sum_p50_ms"
 check = { "q.tag-counts.rows" = "expect.tags_used", "q.untitled.value" = "400000" }
-route = { "q.tag-counts.operators" = "has group count", "q.untitled.operators" = "has group walk" }
+# untitled: COUNT(*) of authors under NOT EXISTS a title, counted by the counted join (the
+# authors' groups weighed by NOT EXISTS, no row; opt/sparql-memory, 13 Oct: 19.4 -> 5.5 ms
+# for the case on phuoc-yu, the same 400,000), where a group walk fed a semi join before.
+route = { "q.tag-counts.operators" = "has group count", "q.untitled.operators" = "has counted join" }
 cap_gb = 6
 systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
-guards = ["group counts on the index", "distinct values by a group walk"]
+guards = ["group counts on the index", "distinct values by a group walk", "joins are counted without their rows"]
 args = ["--runs", "300"]
 [[case]]
 name = "op-aggregates"

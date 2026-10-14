@@ -98,6 +98,26 @@ This section owns the execution policy; there is no setting for it besides `dl.t
   owner: the revision's ontology, the bounds L and U1, classification and realisation
   (cached per revision, under `dl.memory` and the process limit), rule materialisation,
   bulk spill and background storage.
+- **Spatial join scratch follows the same request owner.** SPARQL shares computed CRS
+  identities across both inputs and reserves its geometry adapters, index seeds,
+  pair conversion and value-to-row maps. The Geo kernel reserves tree/order capacity,
+  parallel candidate/refinement buffers and parsed/prepared geometry estimates through
+  the supplied part budget. Buffer reservations survive parallel handoffs; final pair
+  capacity survives the kernel, and result columns transfer their charge exactly once.
+  Candidate growth charges geometrically, rather than accounting at every pair. Parsing,
+  preparation and relating are opaque library calls with cooperative checks before and
+  after them; private self-noding/relating scratch is not a strict allocation ceiling.
+  The representative counting-allocator guard is `nrese-geo/tests/join_memory.rs`.
+  Literal length is only an initial parsing allowance. Retained geometry capacities
+  are reconciled after parsing, before refinement: coordinate/collection capacities
+  are counted and the private polygon ring-list capacity is estimated from parser growth.
+  The smaller side's retained geometry adjustment is one batch reservation.
+  Index traversal uses rstar's internal stack visitor; only actual hit buffers grow and
+  draw from the request, without a full-index scratch precharge. Pair positions use
+  `usize` to preserve the full input range: on a 64-bit host each candidate pair is
+  16 bytes, versus the former `(u32, u32)`'s 8 bytes. This doubles those buffers' element
+  storage, including their phase overlap; it is not an unchanged-memory claim. The
+  allocator guard reports observed and accounted peaks for root's batch validation.
 - **A Rayon worker never waits on a cache flight.** A part another query computes is
   waited for only off the pool; a request on a worker computes it itself, so no wait can
   hold a stack its producer needs ([research-designs.md
@@ -135,13 +155,19 @@ an RDF term for every output cell.
 | `nrese-exec::join` | Merge/galloping joins on sorted keys, hash joins otherwise; left, semi and anti joins; explicit handling of unbound keys and output limits |
 | `nrese-exec::group`, `table` | Grouping and column operations, with value-dependent operations supplied by the caller |
 | `nrese-exec::sort`, `search`, `graph` | Sorting id keys, forward searches, adjacency and component-based closures |
-| `nrese-sparql::native` | Scans, index probes, cyclic BGP joins, expression evaluation, paths, aggregation strategies, ordering, streaming and result writing |
+| `nrese-sparql::native` | Scans, index probes, cyclic BGP joins, expression evaluation, paths, aggregation strategies (counts of join trees by message passing without their rows, `count`; counts of one pattern from the index's counts, ranges and groups), ordering, streaming and result writing |
 | `nrese-reasoner` | Rule plans, semi-naive rounds, candidate admission, equality and incremental maintenance |
 
 Batch sizes and parallel thresholds vary by operator; there is no universal 64 k-row
 pipeline. Some paths stream and others materialise tables. Per-query and shared budgets
 bound accounted intermediates, with cancellation checked by the executor and participating
-kernels. They do not imply that every allocation is charged or every kernel is interruptible.
+kernels: tables, a scan before it is read (the index knows its size), sort keys and the
+values decoded for them, group arrays, computed and cached decoded terms; aggregates fold a
+row at a time. What no budget accounts is bounded by the process's memory limit
+(`nrese_exec::memory::process_limit_exceeded`), which the executor's checks and the join
+kernels' row checks read: a query past it ends with a memory error. The guard
+`a_query_holds_no_more_than_its_memory_limit` (`nrese-sparql/tests/query_memory.rs`)
+measures each shape's heap with the allocator against its limit.
 Query sort/distinct/group disk spilling remains unfinished; on-disk bulk-load spilling
 is a separate, implemented engine path. Controls and limitations are mapped in
 [hardware-and-scaling.md](hardware-and-scaling.md#configuration-and-strategy-ownership).
@@ -157,12 +183,46 @@ is a separate, implemented engine path. Controls and limitations are mapped in
 
 [`native/plan.rs`](../../crates/nrese-sparql/src/native/plan.rs) chooses BGP join order
 by dynamic programming through 12 patterns, then greedy search, from fewer starts where
-their estimates would exceed a fixed effort. The search asks for the query's cancellation
+their estimates would exceed `PlannerOptions::greedy_effort` (default 524288 candidate
+estimates, `None` unlimited; server `budgets.planner_effort = 0`). The bound reduces
+starts, always permitting one complete start; it is not a strict instruction count.
+The existing DP/greedy strategy stays the same. The search asks for the query's cancellation
 at every step, so planning ends at the request deadline as evaluation does. These and the
-probe-cost thresholds are code heuristics, not hardware-calibrated settings.
+probe-cost thresholds are heuristics, not a calibrated model of every machine.
 [`native/estimate.rs`](../../crates/nrese-sparql/src/native/estimate.rs) supplies
 pre-execution estimates; `explain_query` executes and records actual operator work.
 An estimated logical plan must not be presented as a fully selected physical plan.
+
+### Vector join direction and physical search
+
+The semantic planner owns the choice between binding RDF candidates and probing RDF
+patterns with search hits. The vector index owns its dimensions, graph coverage and
+physical kernels. The experimental cost route connects these owners through the small
+`Snapshot::vector_estimate` (space and available kernel); it does not create another executor or scheduler.
+
+| Owner | Decision or invariant |
+|---|---|
+| SPARQL vector join | Selective exact routes bind candidates first. Broad exact searches retain search-first when enumeration predicts no distance savings, avoiding a large RDF table just to keep k hits. Estimated rows are hints; bound IDs are deduplicated before physical selection. Unbound rows leave the candidate set unrestricted. Bag multiplicities remain in the RDF join. |
+| Engine vector index | Price exact accepted-distance work against estimated graph work plus its uncovered tail. Maintenance prices the completed graph, so a costly stale tail cannot prevent extension. |
+| `nrese-vector` | HNSW topology, traversal and exact distance kernels. Both routes use the existing kernels; graph parameters come from the actual graph, including after reopening. |
+| Query caller | `nrv:exact true` requires exact search. Positive `k` and `searchBudget` values are preserved, or rejected explicitly if unrepresentable; they are not clamped. |
+
+`VectorQuery::accepted` describes an index filter; `probe_accepted` estimates survivors
+of a later filter. Both may widen the beam, but only an index filter can save exact
+distance calculations. A selected probe-first kernel stays fixed while it widens: an
+ANN route cannot turn into repeated unfiltered exact scans, and explicit exact cannot
+turn approximate. Graph absence uses exact work while ordinary maintenance can still
+prepare the graph. The join planner can bind a selective candidate set or probe a broad
+one; the index's kernel choice alone does not determine the join direction.
+
+The crossover uses beam times level-zero degree as an **estimate**, not a work bound or
+a recall guarantee. HNSW's beam limits retained candidates, not all visited nodes (Malkov
+and Yashunin, Algorithm 2; corpus key `malkov2018hnsw`). Exact scans also check every ID;
+predicate cost, SIMD, parallelism, locality and inaccurate row estimates can change the
+winner. This candidate needs paired, same-host measurements before acceptance. Numeric
+recall targets and hardware-calibrated costs remain planned; `nrv:recallTarget` is not
+an implemented option. The forced-ANN recall guard is retained separately from Auto,
+so Auto selecting exact cannot make ANN coverage disappear.
 
 ## 6. Evidence and maintenance
 

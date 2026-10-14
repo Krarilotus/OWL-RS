@@ -12,7 +12,7 @@ pub const DEPARTMENTS: u64 = 200;
 
 /// Facts per predicate as the store hands them over: each predicate once, its
 /// `(object, subject)` pairs sorted and distinct.
-pub type Grouped = Vec<(u64, Vec<(u64, u64)>)>;
+pub type Grouped = Vec<(u64, Vec<[u64; 2]>)>;
 
 /// A LUBM-shaped input: a class hierarchy, sub-, inverse and transitive properties,
 /// domains and ranges, and `departments` departments of people taking and teaching
@@ -208,8 +208,8 @@ pub fn grouped(mut facts: Vec<[u64; 3]>) -> Grouped {
     let mut groups: Grouped = Vec::new();
     for [s, p, o] in facts {
         match groups.last_mut() {
-            Some((last, pairs)) if *last == p => pairs.push((o, s)),
-            _ => groups.push((p, vec![(o, s)])),
+            Some((last, pairs)) if *last == p => pairs.push([o, s]),
+            _ => groups.push((p, vec![[o, s]])),
         }
     }
     groups

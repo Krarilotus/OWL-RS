@@ -85,6 +85,10 @@ impl ServerConfig {
             ),
             ("store.vocabulary", store.vocabulary.as_str().to_owned()),
             (
+                "store.inferred_merge_wave_keys",
+                store.inferred_merge_wave_keys.to_string(),
+            ),
+            (
                 "store.invalid_statements",
                 store.invalid_statements.name().to_owned(),
             ),
@@ -144,6 +148,10 @@ impl ServerConfig {
             ),
             ("policy.auth.mode", self.policy.auth.mode_name().to_owned()),
             ("budgets.query_memory", size(limits.max_query_memory_bytes)),
+            (
+                "budgets.planner_effort",
+                limits.planner.greedy_effort.unwrap_or(0).to_string(),
+            ),
             (
                 "budgets.total_query_memory",
                 size(store.total_query_memory_bytes),

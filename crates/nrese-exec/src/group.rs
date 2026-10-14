@@ -12,6 +12,60 @@ use crate::table::IdTable;
 
 type Hasher = foldhash::fast::FixedState;
 
+/// The rows of each group, in row order within a group: one list of every row ordered by
+/// group (a counting sort of the row-to-group map) and where each group's part starts. Two
+/// allocations however many groups there are: a vector per group cost a heap allocation
+/// each (Sparqloscope 060 grouped 30.5 M rows into as many groups).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Members {
+    rows: Vec<usize>,
+    starts: Vec<usize>,
+}
+
+impl Members {
+    /// The members of `groups` groups from each row's group, in row order. O(rows + groups).
+    pub fn of(group_of: impl Iterator<Item = usize> + Clone, groups: usize) -> Self {
+        let mut starts = vec![0usize; groups + 1];
+        for group in group_of.clone() {
+            starts[group + 1] += 1;
+        }
+        for g in 0..groups {
+            starts[g + 1] += starts[g];
+        }
+        let mut next = starts.clone();
+        let mut rows = vec![0usize; starts[groups]];
+        for (row, group) in group_of.enumerate() {
+            rows[next[group]] = row;
+            next[group] += 1;
+        }
+        Self { rows, starts }
+    }
+
+    /// The number of groups.
+    pub fn len(&self) -> usize {
+        self.starts.len() - 1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The rows of group `group`, ascending.
+    pub fn get(&self, group: usize) -> &[usize] {
+        &self.rows[self.starts[group]..self.starts[group + 1]]
+    }
+
+    /// The groups' rows in group order.
+    pub fn iter(&self) -> impl Iterator<Item = &[usize]> {
+        (0..self.len()).map(|group| self.get(group))
+    }
+
+    /// The bytes it holds.
+    pub fn memory_bytes(&self) -> usize {
+        (self.rows.capacity() + self.starts.capacity()) * std::mem::size_of::<usize>()
+    }
+}
+
 /// The groups of a table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Groups {
@@ -137,5 +191,17 @@ mod tests {
         let groups = group_rows(&empty, &[]);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups.counts(), vec![0]);
+    }
+
+    #[test]
+    fn members_list_each_groups_rows_in_order() {
+        let group_of = [2usize, 0, 2, 1, 0, 2];
+        let members = Members::of(group_of.iter().copied(), 4);
+        assert_eq!(members.len(), 4);
+        assert_eq!(members.get(0), &[1, 4]);
+        assert_eq!(members.get(1), &[3]);
+        assert_eq!(members.get(2), &[0, 2, 5]);
+        assert!(members.get(3).is_empty());
+        assert_eq!(members.iter().map(<[usize]>::len).sum::<usize>(), 6);
     }
 }

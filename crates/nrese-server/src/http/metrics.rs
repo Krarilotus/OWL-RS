@@ -197,6 +197,9 @@ nrese_process_resident_bytes {resident}
         "# HELP nrese_vector_index_bytes The vector index: vectors and their graphs.
 # TYPE nrese_vector_index_bytes gauge
 nrese_vector_index_bytes {}
+# HELP nrese_geometry_index_bytes The geometry index: the geometry literals' boxes (none before the first spatial query).
+# TYPE nrese_geometry_index_bytes gauge
+nrese_geometry_index_bytes {}
 # HELP nrese_derived_indexes_loaded_total Derived indexes read from their files since start.
 # TYPE nrese_derived_indexes_loaded_total counter
 nrese_derived_indexes_loaded_total {}
@@ -215,6 +218,7 @@ nrese_support_seconds_total{{phase=\"update\"}} {}
 nrese_support_seconds_total{{phase=\"view\"}} {}
 ",
         engine.dictionary.vector_bytes,
+        engine.dictionary.geometry_bytes,
         engine.dictionary.derived_loaded,
         support.computed,
         support.updated,
@@ -238,7 +242,7 @@ nrese_support_seconds_total{{phase=\"view\"}} {}
 mod tests {
     use crate::ai::AiSuggestionService;
     use axum::body::to_bytes;
-    use nrese_reasoner::{ReasonerConfig, ReasonerService};
+    use nrese_reasoner::ReasonerConfig;
     use nrese_store::{StoreConfig, StoreService};
 
     use crate::policy::PolicyConfig;
@@ -249,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_output_contains_stable_metric_names() {
         let store = StoreService::new(StoreConfig::default()).expect("store should initialize");
-        let reasoner = ReasonerService::new(ReasonerConfig::default());
+        let reasoner = ReasonerConfig::default();
         let state = AppState::new(
             store,
             reasoner,

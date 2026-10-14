@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use axum::serve::ListenerExt;
-use nrese_reasoner::ReasonerService;
 use nrese_store::{
     BulkLoadRequest, CancellationToken, GraphResultFormat, GraphTarget, SolutionsResultFormat,
     SparqlQueryRequest, StoreService,
@@ -220,14 +219,13 @@ async fn run() -> Result<()> {
         store.set_service_client(std::sync::Arc::new(client));
         tracing::info!(allow = ?config.store.federation.allow, "SERVICE may call these endpoints");
     }
-    let reasoner = ReasonerService::new(config.reasoner.clone());
     let ai = AiSuggestionService::new(config.ai.clone())?;
     let ontology_path = store
         .preloaded_ontology_path()
         .map(|path| path.to_path_buf());
     let state = AppState::try_new(
         store.clone(),
-        reasoner.clone(),
+        config.reasoner.clone(),
         config.policy.clone(),
         ai,
         config.deployment_posture,
@@ -238,6 +236,7 @@ async fn run() -> Result<()> {
         tracing::info!(primary = ?config.replication.primary, "following the primary's log");
     }
     state.mark_ready();
+    let reasoner = state.reasoner();
     let app = build_app(state);
 
     let listener = TcpListener::bind(config.bind_address)

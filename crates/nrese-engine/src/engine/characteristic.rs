@@ -39,6 +39,60 @@ pub const MAX_PAIRS: usize = 1 << 20;
 /// The set of an object that is no subject (a literal, or a node without statements).
 const NONE: u32 = u32::MAX;
 
+/// The most entries [`DirectSets`] holds (128 MiB of sets); beyond, sets are searched.
+const MAX_DIRECT: u64 = 1 << 25;
+
+/// Each subject's set by the payload of its id, for subjects that are IRIs and blank nodes
+/// whose payloads (dictionary entries) are dense.
+struct DirectSets {
+    sets: Vec<u32>,
+}
+
+impl DirectSets {
+    /// The set of the subject `id`; [`NONE`] for anything that isn't one.
+    #[inline]
+    fn set(&self, id: u64) -> u32 {
+        let id = crate::term::TermId::from_raw(id);
+        match id.kind() {
+            crate::term::TermKind::Iri | crate::term::TermKind::BlankNode => self
+                .sets
+                .get(id.payload() as usize)
+                .copied()
+                .unwrap_or(NONE),
+            _ => NONE,
+        }
+    }
+}
+
+/// [`DirectSets`] of `subject_sets` (sorted by id), where every subject is an IRI or a
+/// blank node, the two kinds' payloads never meet, and the largest is at most
+/// [`MAX_DIRECT`] and no more than 16 times the subjects; `None` otherwise.
+fn direct_sets(subject_sets: &[(u64, u32)]) -> Option<DirectSets> {
+    use crate::term::{TermId, TermKind};
+    let mut largest = 0u64;
+    for &(s, _) in subject_sets {
+        let id = TermId::from_raw(s);
+        if !matches!(id.kind(), TermKind::Iri | TermKind::BlankNode) {
+            return None;
+        }
+        largest = largest.max(id.payload());
+    }
+    let entries = largest + 1;
+    if entries > MAX_DIRECT || entries > 16 * subject_sets.len().max(1) as u64 {
+        return None;
+    }
+    let mut sets = vec![NONE; entries as usize];
+    for &(s, set) in subject_sets {
+        let slot = &mut sets[TermId::from_raw(s).payload() as usize];
+        // An IRI and a blank node with one payload: the table can't tell them apart.
+        if *slot != NONE {
+            return None;
+        }
+        *slot = set;
+    }
+    Some(DirectSets { sets })
+}
+
 /// The characteristic sets of a graph.
 #[derive(Debug, Default)]
 pub struct CharacteristicSets {
@@ -50,13 +104,17 @@ pub struct CharacteristicSets {
     subject_sets: Vec<(u64, u32)>,
     /// Per predicate, (subject set, object set, statements); `None` if not counted.
     pairs: Option<Links>,
+    /// Searches of the subjects' sets from the root while the pairs were counted: one per
+    /// subject and per subject and predicate, not one per statement (the guard's count).
+    searches: u64,
 }
 
 /// Characteristic pairs by predicate: (subject set, object set, statements).
 type Links = HashMap<u64, Vec<(u32, u32, u64)>>;
 
-/// Statements per (predicate, subject set, object set), while pairs are counted.
-type PairCounts = HashMap<(u64, u32, u32), u64>;
+/// Statements per (predicate, subject set, object set), while pairs are counted: hashed by
+/// foldhash, not SipHash (5-6 % of CSPA httpd's samples were SipHash, most of it here).
+type PairCounts = hashbrown::HashMap<(u64, u32, u32), u64>;
 
 #[derive(Debug)]
 struct Set {
@@ -150,16 +208,58 @@ impl CharacteristicSets {
         if subject_sets.is_empty() {
             return self;
         }
+        // A subject's set by a search from the root; an object's by a search from the root
+        // for the first of each subject and predicate, then forward from it, as objects
+        // ascend within them in the parts' subject-ordered scans (CSPA-shaped, 133 objects
+        // a subject: 158-165 -> 36-44 ms for 16 M statements, `pair_count_bench`).
+        let searches = std::sync::atomic::AtomicU64::new(0);
+        // Where the subjects' ids are dense (dictionary entries), a set is one load from a
+        // table by the id's payload, not a search: an object's search was most of the pair
+        // count's 38 ns of thread time a statement (`pair_count_bench`), about 3 s of CSPA
+        // httpd's 5.6 s of statistics at 4 threads (13 October 2026).
+        let direct = direct_sets(&subject_sets);
         let set_of = |id: u64| {
+            if let Some(table) = &direct {
+                return table.set(id);
+            }
+            searches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             subject_sets
                 .binary_search_by_key(&id, |&(s, _)| s)
                 .map_or(NONE, |at| subject_sets[at].1)
         };
+        let set_from = |at: &mut usize, restart: bool, id: u64| {
+            if let Some(table) = &direct {
+                return table.set(id);
+            }
+            *at = match restart {
+                true => {
+                    searches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    subject_sets.partition_point(|&(s, _)| s < id)
+                }
+                false => {
+                    nrese_exec::search::partition_point_from(&subject_sets, *at, |&(s, _)| s < id)
+                }
+            };
+            match subject_sets.get(*at) {
+                Some(&(s, set)) if s == id => set,
+                _ => NONE,
+            }
+        };
         let counted: Option<Vec<PairCounts>> = parts
             .into_par_iter()
             .map(|quads| {
-                let mut counts: PairCounts = HashMap::new();
+                let mut counts: PairCounts = PairCounts::default();
                 let mut last: Option<(u64, u32)> = None;
+                let (mut at, mut group) = (0usize, None);
+                // Runs of one key counted here, the table touched once a run.
+                let mut run: Option<((u64, u32, u32), u64)> = None;
+                let add = |counts: &mut PairCounts, key, n| {
+                    if !counts.contains_key(&key) && counts.len() >= MAX_PAIRS {
+                        return false;
+                    }
+                    *counts.entry(key).or_insert(0) += n;
+                    true
+                };
                 for quad in quads {
                     let s = quad.subject.raw();
                     let from = match last {
@@ -170,11 +270,25 @@ impl CharacteristicSets {
                             set
                         }
                     };
-                    let key = (quad.predicate.raw(), from, set_of(quad.object.raw()));
-                    if !counts.contains_key(&key) && counts.len() >= MAX_PAIRS {
-                        return None;
+                    let p = quad.predicate.raw();
+                    let restart = group != Some((s, p));
+                    group = Some((s, p));
+                    let key = (p, from, set_from(&mut at, restart, quad.object.raw()));
+                    match &mut run {
+                        Some((current, n)) if *current == key => *n += 1,
+                        _ => {
+                            if let Some((current, n)) = run.replace((key, 1))
+                                && !add(&mut counts, current, n)
+                            {
+                                return None;
+                            }
+                        }
                     }
-                    *counts.entry(key).or_insert(0) += 1;
+                }
+                if let Some((current, n)) = run
+                    && !add(&mut counts, current, n)
+                {
+                    return None;
                 }
                 Some(counts)
             })
@@ -182,7 +296,7 @@ impl CharacteristicSets {
         let Some(counted) = counted else {
             return self;
         };
-        let mut counts: PairCounts = HashMap::new();
+        let mut counts: PairCounts = PairCounts::default();
         for part in counted {
             for (key, n) in part {
                 if !counts.contains_key(&key) && counts.len() >= MAX_PAIRS {
@@ -199,6 +313,7 @@ impl CharacteristicSets {
             links.sort_unstable();
         }
         self.pairs = Some(pairs);
+        self.searches = searches.into_inner();
         self
     }
 
@@ -518,6 +633,50 @@ mod tests {
         EncodedQuad::new(id(s), id(p), id(o), TermId::DEFAULT_GRAPH)
     }
 
+    /// Pair counting over 16 M statements shaped like CSPA's closure (120 k subjects of 133
+    /// statements, three predicates, objects among 1.5 M): `cargo test --release -p nrese-engine --lib
+    /// pair_count_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark"]
+    fn pair_count_bench() {
+        let mut x = 11u64;
+        let mut next = move |n: u64| {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (x >> 33) % n
+        };
+        // IRIs (dense payloads: sets read from a table) and the same ids without a kind
+        // (sets searched).
+        for kind in [1u64 << 60, 0] {
+            let id = |n: u64| kind | n;
+            let mut quads: Vec<EncodedQuad> = (0..16_000_000u64)
+                .map(|i| quad(id(i / 133), id(2_000_000 + next(3)), id(next(1_500_000))))
+                .collect();
+            quads.sort_by_key(|q| (q.subject.raw(), q.predicate.raw(), q.object.raw()));
+            quads.dedup();
+            let sets = CharacteristicSets::build(quads.iter().copied()).unwrap();
+            for _ in 0..3 {
+                let parts: Vec<Vec<EncodedQuad>> = quads
+                    .chunks(quads.len() / 16 + 1)
+                    .map(<[_]>::to_vec)
+                    .collect();
+                let fresh = CharacteristicSets {
+                    subject_sets: sets.subject_sets.clone(),
+                    ..CharacteristicSets::default()
+                };
+                let start = std::time::Instant::now();
+                let counted = fresh.with_pairs_of(parts.into_iter().map(Vec::into_iter).collect());
+                eprintln!(
+                    "pairs counted in {:?} ({} predicates, {} searches)",
+                    start.elapsed(),
+                    counted.pairs.as_ref().map_or(0, |p| p.len()),
+                    counted.searches
+                );
+            }
+        }
+    }
+
     #[test]
     fn stars_count_only_subjects_with_every_predicate() {
         // 10 products with a label and a price (two labels each), 20 persons with a
@@ -550,6 +709,128 @@ mod tests {
             "4 label pairs per product, 1 per person"
         );
         assert_eq!(sets.star(&[999]), 0.0, "an unknown predicate");
+    }
+
+    /// The guard of the pair statistics' finger (docs/design/performance.md §0): the
+    /// subjects' sets are searched from the root once per subject and once per subject
+    /// and predicate, then forward, not once per statement. CSPA-shaped: 300 subjects of
+    /// 133 statements over three predicates, 39,900 statements; 1,200 searches on 13
+    /// October 2026, a search per statement and subject 40,200.
+    #[test]
+    fn pair_statistics_search_the_sets_from_the_root_once_a_group() {
+        let mut x = 5u64;
+        let mut next = move |n: u64| {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (x >> 33) % n
+        };
+        let mut quads: Vec<EncodedQuad> = (0..300 * 133u64)
+            .map(|i| quad(i / 133, 100 + i % 3, next(5_000)))
+            .collect();
+        quads.sort_by_key(|q| (q.subject.raw(), q.predicate.raw(), q.object.raw()));
+        quads.dedup();
+        let sets = CharacteristicSets::build(quads.iter().copied()).unwrap();
+        let counted = sets.with_pairs(quads.into_iter());
+        assert!(
+            counted.searches <= 1_200,
+            "{} searches from the root",
+            counted.searches
+        );
+    }
+
+    /// Guard: subjects that are IRIs with dense payloads (dictionary entries) have their
+    /// sets read from a table, so counting pairs searches nothing; a search per object
+    /// was most of CSPA httpd's 5.6 s of statistics (13 October 2026).
+    #[test]
+    fn pair_statistics_read_dense_subjects_sets_from_a_table() {
+        let mut x = 5u64;
+        let mut next = move |n: u64| {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (x >> 33) % n
+        };
+        let iri = |n: u64| (1u64 << 60) | n;
+        let mut quads: Vec<EncodedQuad> = (0..300 * 133u64)
+            .map(|i| quad(iri(i / 133), iri(1_000 + i % 3), iri(next(600))))
+            .collect();
+        quads.sort_by_key(|q| (q.subject.raw(), q.predicate.raw(), q.object.raw()));
+        quads.dedup();
+        let sets = CharacteristicSets::build(quads.iter().copied()).unwrap();
+        let counted = sets.with_pairs(quads.into_iter());
+        assert!(counted.pairs.is_some());
+        assert_eq!(counted.searches, 0, "searches with dense subjects");
+    }
+
+    /// The pairs counted by runs of one key and a finger over the subjects' sets equal a
+    /// count of each statement with its sets searched from the root: random graphs whose
+    /// objects are subjects or not, in parts of subject ranges.
+    #[test]
+    fn pairs_counted_by_runs_and_fingers_equal_a_plain_count() {
+        let mut x = 7u64;
+        let mut next = move |n: u64| {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (x >> 33) % n
+        };
+        for round in 0..20 {
+            // Odd rounds: subjects and objects IRIs (dense payloads, sets read from a
+            // table), every third object an integer with a subject's payload (no set).
+            let iris = round % 2 == 1;
+            let mut quads: Vec<EncodedQuad> = (0..2000)
+                .map(|_| {
+                    let (s, o) = (next(60), next(90 + round));
+                    let object = match (iris, next(3)) {
+                        (false, _) => o,
+                        (true, 0) => (4 << 60) | o,
+                        (true, _) => (1 << 60) | o,
+                    };
+                    let subject = if iris { (1 << 60) | s } else { s };
+                    quad(subject, 100 + next(4), object)
+                })
+                .collect();
+            quads.sort_by_key(|q| (q.subject.raw(), q.predicate.raw(), q.object.raw()));
+            quads.dedup();
+            let sets = CharacteristicSets::build(quads.iter().copied()).unwrap();
+            let subject_sets = sets.subject_sets.clone();
+            let set_of = |id: u64| {
+                subject_sets
+                    .binary_search_by_key(&id, |&(s, _)| s)
+                    .map_or(NONE, |at| subject_sets[at].1)
+            };
+            let mut expected: std::collections::BTreeMap<u64, Vec<(u32, u32, u64)>> =
+                std::collections::BTreeMap::new();
+            let mut plain: std::collections::BTreeMap<(u64, u32, u32), u64> =
+                std::collections::BTreeMap::new();
+            for q in &quads {
+                let key = (
+                    q.predicate.raw(),
+                    set_of(q.subject.raw()),
+                    set_of(q.object.raw()),
+                );
+                *plain.entry(key).or_insert(0) += 1;
+            }
+            for ((p, from, to), n) in plain {
+                expected.entry(p).or_default().push((from, to, n));
+            }
+            // Three parts by subject, as the statistics scan them.
+            let parts: Vec<Vec<EncodedQuad>> = [0..20, 20..40, 40..60]
+                .into_iter()
+                .map(|r| {
+                    quads
+                        .iter()
+                        .copied()
+                        .filter(|q| r.contains(&(q.subject.raw() & ((1 << 60) - 1))))
+                        .collect()
+                })
+                .collect();
+            let counted = sets.with_pairs_of(parts.into_iter().map(Vec::into_iter).collect());
+            let got: std::collections::BTreeMap<u64, Vec<(u32, u32, u64)>> =
+                counted.pairs.expect("pairs counted").into_iter().collect();
+            assert_eq!(got, expected, "round {round}");
+        }
     }
 
     #[test]

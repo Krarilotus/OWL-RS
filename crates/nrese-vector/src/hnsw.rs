@@ -43,6 +43,16 @@ impl Default for HnswParameters {
     }
 }
 
+impl HnswParameters {
+    /// The topology's degree limit at this level, also used by routing estimates.
+    pub fn max_links(&self, level: u8) -> usize {
+        match level {
+            0 => self.m.saturating_mul(2),
+            _ => self.m,
+        }
+    }
+}
+
 /// A graph's parts ([`Hnsw::to_parts`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HnswParts {
@@ -83,6 +93,11 @@ impl Hnsw {
 
     pub fn metric(&self) -> Metric {
         self.metric
+    }
+
+    /// The parameters of this graph, including graphs read from disk.
+    pub fn parameters(&self) -> HnswParameters {
+        self.parameters
     }
 
     /// The nodes linked: the first positions of the vectors.
@@ -225,13 +240,6 @@ impl Hnsw {
         ((-uniform.ln() * scale).floor() as u64).min(u64::from(MAX_LEVEL)) as u8
     }
 
-    fn max_links(&self, level: u8) -> usize {
-        match level {
-            0 => self.parameters.m * 2,
-            _ => self.parameters.m,
-        }
-    }
-
     fn distance(&self, vectors: &Vectors, query: &Query<'_>, position: u32) -> f32 {
         vectors.distance(self.metric, query, position)
     }
@@ -301,7 +309,7 @@ impl Hnsw {
         if own.contains(&new) {
             return;
         }
-        if own.len() < self.max_links(level) {
+        if own.len() < self.parameters.max_links(level) {
             own.push(new);
             return;
         }
@@ -312,7 +320,7 @@ impl Hnsw {
             .collect();
         candidates.push((distance, new));
         candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-        let chosen = self.select(vectors, &candidates, self.max_links(level));
+        let chosen = self.select(vectors, &candidates, self.parameters.max_links(level));
         *own = chosen.into_iter().map(|(_, other)| other).collect();
     }
 

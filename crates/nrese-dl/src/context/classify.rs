@@ -34,6 +34,8 @@ pub struct Options {
     /// (else they are refused as equality). Off by default: on ore_ont_9724 (Full-GALEN)
     /// its conditional copies outgrow 9 GB where the part without them saturates in 25 s.
     pub equality: bool,
+    /// With `equality`: merge on certain atoms only ([`super::program::Program::certain_merges`]).
+    pub certain_merges: bool,
 }
 
 impl Default for Options {
@@ -46,6 +48,7 @@ impl Default for Options {
             budget: Budget::default(),
             prune_pred: true,
             equality: false,
+            certain_merges: false,
         }
     }
 }
@@ -182,7 +185,10 @@ pub fn saturate_normalised(
     profile.roles = compiled.program.roles as usize;
     profile.functions = compiled.program.funcs.len();
     let started = Instant::now();
-    let Compiled { program, abox, .. } = compiled;
+    let Compiled {
+        mut program, abox, ..
+    } = compiled;
+    program.certain_merges = options.certain_merges;
     let named = program.named();
     let engine = Engine::new(
         program,
@@ -213,13 +219,19 @@ pub fn saturate_normalised(
     if engine.out_of_budget() {
         return Err(Unsupported::Budget);
     }
-    let assertions_consistent = Individuals::saturate(&engine, &abox, &workers).release(&engine);
+    let assertions_consistent = Individuals::saturate(&engine, &abox, &workers).consistent;
     if engine.out_of_budget() {
         return Err(Unsupported::Budget);
     }
     profile.saturate = started.elapsed();
     profile.contexts_created = engine.count();
     for (_, state) in engine.states() {
+        if !state.merges.is_empty() {
+            profile.contexts_merged += 1;
+            if state.merges.iter().any(|m| !m.body.is_empty()) {
+                profile.contexts_merged_conditional += 1;
+            }
+        }
         if state.started {
             profile.contexts_saturated += 1;
         }

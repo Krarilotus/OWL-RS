@@ -218,8 +218,12 @@ class WriteScalingChecks(unittest.TestCase):
         suite.scratch, suite.results, suite.root = self.path / 'scratch', self.path / 'results', self.path
         suite.data, suite.settings = Mount('/data', '/data'), {}
         suite.runtime = Mock(kind='docker')
+        suite.runtime.owned_path.side_effect = Path
+        suite.runtime.attempt.side_effect = lambda action, *args: (action(*args), True)[1]
+        suite.runtime.workers.return_value = False
+        suite.runtime.created_stores = ['owned-store']
         suite.runtime.new_store.return_value = 'owned-store'
-        suite.args = SimpleNamespace(timeout_s=30, query_timeout_s=10)
+        suite.args = SimpleNamespace(timeout_s=30, query_timeout_s=10, dry_run=False)
         suite.say, suite.writes, suite.publish = Mock(), Mock(), lambda key: 'permission'
         system = Mock()
         system.load.return_value = Step(Measured(1, None, 1), note='failed empty import')

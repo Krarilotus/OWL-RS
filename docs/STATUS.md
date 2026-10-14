@@ -12,6 +12,46 @@ What is left before v2 goes to `main`, with owners and state, is the status tabl
 [merge checklist](plan/2026-10-05-v2-merge-checklist.md) §1; the sections from "Audit
 work" on are the record by goal.
 
+## Completion integration (14 October)
+
+The review branch `integrate/v2-completion-20261014` starts at `5dcccf3c`; it has not
+been accepted into `refactor/engine-v2`. It incorporates the vector/planner and DL
+operation contracts, counted-query/memory work from `opt/sparql-memory`, and the
+existing per-store configuration and update/draft planner propagation. The store owns
+reasoner construction; engine/version settings own index and vocabulary encoding;
+updates preserve the request's existing memory envelope and planner policy.
+
+Checkpoint `a71a1dbe` passed its normal commit gate (869 tests, three skips), including
+the wide-definition repair below. `b6dc5384` adds the existing optional functional DL
+route with the current deadline and memory owners; both routing switches remain off
+by default. Its commit gate passed 164 DL tests and 202 benchmark-tool tests (seven
+environment-related skips). This is correctness evidence, not a timing claim. Final
+required-data correctness, regression and concurrency acceptance remain open. The completed
+[planner A/B](../benches/runs/2026-10-14-contracts-planner-abba.toml) compares `41052590`
+with `32ecf1e5`, parsing/planning only: summed p50 21.9115 to 21.141 ms, individual
+changes from -6.51% to +3.19%, two independent processes per side. It establishes
+neither statistical significance nor query-execution performance of the integration.
+The measured text-filter and q02 losses against `main` remain release blockers.
+
+The completed [Geo component comparison](../benches/runs/2026-10-14-geo-gate-2-16ad95f2-phuoc.toml)
+(`59f66720` to `16ad95f2`, eight passes) did not pass its release gate. Aggregate Geo
+query time improved 110.346 to 97.7955 ms, but one Geo query slowed 2.56%, first-query
+time rose 14.61%, and lookup cgroup peak rose 19.88%. Five cases lacked their inputs.
+All case outcomes remain in the record. Its count checks and saved component binaries
+do not qualify complete answers or this integrated head.
+
+The shared wide/narrow rules solver is implemented in this worktree. Selection occurs
+once per operation; incremental/support stores retain the wide representation. It passes
+295 engine/reasoner tests (four skips), including both representations and the naive
+closure oracle; the graph-capacity fallback also derives a previously absent fact in its
+guard. This does not transfer the saved packed implementation's speed claim to this head.
+Geo join integration and its retained-capacity/CRS guards pass. The combined commit-tier
+gate passed 1,062 tests (seven skips) and all 83 benchmark-harness tests. Both areas
+still require per-case speed and memory comparisons before acceptance. The consolidated
+benchmark runner passes 219 Python tests (seven environment skips) and rejects the
+reviewed stale, partial and incompletely timed report counterexamples; its checks run
+outside measured engine work. See the [handoff](../benches/fast/HANDOFF.md).
+
 ## Execution and performance (PR #23)
 
 The PR's implementation base is `0f46563`. The measurements are rows of the
@@ -33,15 +73,22 @@ each with its run record.
 
 ### Open work
 
-- **Performance acceptance against `0f46563`:** Horn context saturation is about 6 %
-  slower, serial and at 16 threads, with the retained accounting; there is no 95-case
-  matrix of the final revision ([run record](../benches/runs/2026-10-11-horn-recovery.toml)).
+- **Measured recovery, integrated acceptance still open:** the later Horn comparison
+  against `0f46563` records +1.3 % serial and -2.1 % at 16 threads (within the reported
+  build-to-build spread), with all 72 taxonomies byte-exact
+  ([run record](../benches/runs/2026-10-12-horn-takeover-dl.toml)). The 95-case PR comparison
+  found no regressions beyond its thresholds for `157931a` versus `aabd47a`
+  ([record](../benches/runs/2026-10-12-pr23-acceptance-ab-phuoc.toml)); it does not certify
+  the current integrated revision against `0f46563`. Its "same" verdict permits small
+  slowdowns, and its cgroup peaks include page-cache charges (see the
+  [memory investigation](../benches/runs/2026-10-12-memory-variance.toml)).
 - **Resource ownership in `nrese-dl`:** the envelope needed and has: an engine's budget is
   an owned value (no longer `Copy`), its observer and the tableau reserve from the request's
   envelope and return it when the engine drops, and exhaustion stays sticky per engine (an
-  envelope's refusal included). `context::Engine::with_budget` no longer exists. Open:
-  detached `Individuals` keep their original owner; public mutation of
-  `Individuals.contexts` isn't tracked; a result retained beyond its request keeps its
+  envelope's refusal included). `context::Engine::with_budget` no longer exists.
+  `Individuals` borrows its engine and returns its retained charge on drop, including
+  unwinding; its context list is read-only. Open: a result retained beyond its request
+  keeps its
   engine's reservation (request-scoped saturations are dropped at the request's end;
   cached classification runs without an envelope); changed policy and historical peaks
   need an API contract first.
@@ -51,8 +98,11 @@ each with its run record.
 - **Vector search:** the filtered search that goes first widens its beam by the joined
   pattern's share (12 October): `vector-knn-filtered`'s recall 0.56 → 0.98, its gate passes
   ([record](../benches/runs/2026-10-12-vector-filtered-fix-phuoc.toml)). On its uniform 64-d
-  vectors the graph search now costs what the exact scan does (10.5 against 10.4 ms): open,
-  the scan chosen by cost, and the graph's own recall at the default beam (0.44).
+  vectors the graph search costs what the exact scan does (10.5 against 10.4 ms).
+  The operation-contracts branch implements a cost-routing candidate, with separate
+  index-filter and later-probe estimates and a forced-ANN guard; its same-host A/B is
+  still required before acceptance ([design](design/execution-core.md#vector-join-direction-and-physical-search)).
+  The graph's own recall at the default beam (0.44) remains open.
 - **Competitor answers:** rerun with the committed recorder to decide the unordered
   `LIMIT` case; Konclude intermittently drops 107 asserted pairs from the Horn reference
   taxonomy, cause unknown.
@@ -66,9 +116,20 @@ each with its run record.
 
 ## OWL 2 DL (v1.5, branch `v15/dl-complete`, 12 October)
 
-**Coverage.** Every construct OWL 2 DL has is decided by the engines; an answer is
-`unknown` only for what the specification rules out, a resource limit, or a reader
-diagnostic ([design](design/owl2-dl.md) §3, §6):
+**Normalisation repair (14 October, completion branch):** auxiliary definitions now
+preserve every conjunct beyond the distribution cutoff. Previously a wide definition
+could name itself again and become `Q → Q`, losing entailments while classification
+reported completeness. Three direct-semantics guards fail on the old normaliser and pass
+with the repair; context-taxonomy and tableau-consistency guards also pass. NCIt and
+affected saved taxonomies still need requalification. The earlier finite-scope campaigns
+do not cover arbitrary conjunction widths; independently checked certificates keep their
+individual guarantees. Persisted RL closure semantics are unchanged.
+
+**Implemented coverage.** The engines have decision paths for the OWL 2 DL constructs
+covered by the campaigns below. Those finite campaigns are strong evidence, not a proof
+of correctness or termination for arbitrary ontologies. The documented boundaries
+include unsupported input, resource limits and reader diagnostics
+([design](design/owl2-dl.md) §3, §6):
 - *ruled out by OWL 2 DL, answered `unsupported`:* `owl:topObjectProperty` where a simple
   property is required (it is composite, *Structural Specification* §11.1, §11.2: in a
   cardinality; functional, inverse-functional, irreflexive, asymmetric, disjoint);
@@ -90,7 +151,7 @@ diagnostic ([design](design/owl2-dl.md) §3, §6):
   pair, and in keys; the datatype theory's search for distinct values (exact to the
   deadline) and its pattern limit (per combination).
 
-**The coverage proof** ([design](design/owl2-dl.md) §11; [the campaigns](../benches/reasoning/dl/README.md#the-small-scope-12-october-2026-main-pc)):
+**Measured finite coverage** ([design](design/owl2-dl.md) §11; [the campaigns](../benches/reasoning/dl/README.md#the-small-scope-12-october-2026-main-pc)):
 every OWL 2 DL ontology of the small scope `4,4,4` (2,761,335 after symmetry reduction:
 every constructor and axiom type, one axiom up to size 4, two and three up to total size
 4) and a covering array of every pair and triple of the 67 features beyond it (3,354
@@ -113,6 +174,8 @@ values (8,990,815 of 9,005,280); the number module's validated models likewise. 
 since 13 October (the models carry the values the datatype theory assigns: 196 of the W3C
 suite's 199 consistent answers with a model certified, the 3 others listed with why). Not
 yet: "inconsistent" and entailments (the references decide them in the campaigns).
+A checked certificate establishes its individual claim; the percentage is
+coverage of this campaign's positive claims, not a proof that every engine path is correct.
 
 **Incrementality** ([design](design/owl2-dl.md) §9): U1 and the RL closure maintained per
 commit; the consistency gate after a commit of assertions only, from a consistent

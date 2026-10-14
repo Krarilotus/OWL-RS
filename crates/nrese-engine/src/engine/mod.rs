@@ -40,11 +40,12 @@ use crate::durability::{DurabilityConfig, Durable, checkpoint};
 use crate::error::EngineResult;
 use crate::index::compaction::merge_runs;
 use crate::index::run::Run;
-use crate::index::{CompactionPolicy, IndexVersion, Layout};
+use crate::index::{CompactionPolicy, IndexEncoding, IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple};
+use crate::term::vocabulary::VocabularyEncoding;
 use crate::term::{Dictionary, DictionaryStats, TermId};
 
-pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
+pub use bulk::{BulkLoad, BulkMode, Rematerialisation, StackTimes};
 pub use equality::Classes as EqualityClasses;
 pub use replication::LogBatch;
 pub use snapshot::{InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity};
@@ -59,6 +60,16 @@ pub struct EngineConfig {
     pub background_maintenance: bool,
     /// Used by [`Engine::open`] only.
     pub durability: DurabilityConfig,
+    /// How the index blocks this engine builds are encoded; blocks of either encoding are
+    /// read.
+    pub index_encoding: IndexEncoding,
+    /// Target keys held unpacked by an inferred-stack merge wave (default 8,388,608).
+    /// Zero is unlimited. One oversized part may exceed the target; packed output and
+    /// other merge scratch are apart. This is batching policy, not a strict memory cap.
+    pub inferred_merge_wave_keys: usize,
+    /// How the checkpoints this engine writes store the dictionary's keys; checkpoints of
+    /// either are read.
+    pub vocabulary: VocabularyEncoding,
 }
 
 impl Default for EngineConfig {
@@ -67,6 +78,9 @@ impl Default for EngineConfig {
             compaction: CompactionPolicy::default(),
             background_maintenance: true,
             durability: DurabilityConfig::default(),
+            index_encoding: IndexEncoding::default(),
+            inferred_merge_wave_keys: 1 << 23,
+            vocabulary: VocabularyEncoding::default(),
         }
     }
 }
@@ -147,15 +161,17 @@ impl Stack {
 
 impl CommitRecord {
     /// The runs this record adds to the asserted stack, of `asserted` layout, and to the
-    /// inferred stack. Shared by commit and WAL replay, so both build identical versions.
-    pub(crate) fn runs(&self, asserted: Layout) -> [Run; 2] {
+    /// inferred stack, packed in `encoding`. Shared by commit and WAL replay, so both build
+    /// identical versions.
+    pub(crate) fn runs(&self, asserted: Layout, encoding: IndexEncoding) -> [Run; 2] {
         let in_default_graph = |triples: &[EncodedTriple]| -> Vec<EncodedQuad> {
             triples.iter().map(|t| t.in_default_graph()).collect()
         };
         [
-            Run::from_delta(asserted, &self.inserts, &self.deletes),
+            Run::from_delta(asserted, encoding, &self.inserts, &self.deletes),
             Run::from_delta(
                 Layout::DefaultGraph,
+                encoding,
                 &in_default_graph(&self.inferred_inserts),
                 &in_default_graph(&self.inferred_deletes),
             ),
@@ -208,11 +224,11 @@ impl Content {
 }
 
 impl Version {
-    /// The empty revision 0.
-    pub(crate) fn empty() -> Self {
+    /// The empty revision 0, its runs to be packed in `encoding`.
+    pub(crate) fn empty(encoding: IndexEncoding) -> Self {
         Self {
-            asserted: IndexVersion::empty(Layout::DefaultGraph),
-            inferred: IndexVersion::empty(Layout::DefaultGraph),
+            asserted: IndexVersion::empty(Layout::DefaultGraph, encoding),
+            inferred: IndexVersion::empty(Layout::DefaultGraph, encoding),
             revision: 0,
             dictionary_len: 0,
             equality: Default::default(),
@@ -357,6 +373,13 @@ struct Shared {
     /// `owl:sameAs`, when the inferred stack holds the closure over representatives
     /// ([`Engine::set_equality`]).
     equality: RwLock<Option<TermId>>,
+    /// [`EngineConfig::index_encoding`]: what fresh versions (loads, mapped checkpoints)
+    /// pack their runs in; derived versions keep their parent's.
+    index_encoding: IndexEncoding,
+    /// [`EngineConfig::inferred_merge_wave_keys`].
+    inferred_merge_wave_keys: usize,
+    /// [`EngineConfig::vocabulary`].
+    vocabulary: VocabularyEncoding,
 }
 
 impl Shared {
@@ -391,7 +414,7 @@ impl Shared {
                 wal.rotate(snapshot.revision() + 1)?;
                 snapshot
             };
-            let path = checkpoint::write(durable.root(), &snapshot)?;
+            let path = checkpoint::write(durable.root(), &snapshot, self.vocabulary)?;
             self.checkpoints.fetch_add(1, Ordering::Relaxed);
             durable.wal.lock().release_through(snapshot.revision())?;
             (snapshot, path)
@@ -414,7 +437,8 @@ impl Shared {
     /// copies in memory are freed once no snapshot holds them. A failure leaves everything
     /// in memory (the checkpoint is written either way).
     fn serve_mapped(&self, path: &Path, written: Snapshot) {
-        let (base, [asserted, inferred]) = match checkpoint::map_written(path) {
+        let (base, [asserted, inferred]) = match checkpoint::map_written(path, self.index_encoding)
+        {
             Ok(mapped) => mapped,
             Err(error) => {
                 tracing::warn!(%error, path = %path.display(), "checkpoint not mapped; data stays in memory");
@@ -554,7 +578,12 @@ impl std::fmt::Debug for Engine {
 impl Engine {
     /// An in-memory engine.
     pub fn new(config: EngineConfig) -> EngineResult<Self> {
-        Self::build(config, Arc::default(), None, Version::empty())
+        Self::build(
+            config,
+            Arc::default(),
+            None,
+            Version::empty(config.index_encoding),
+        )
     }
 
     /// Opens (or creates) a durable engine in `dir`, recovering its last committed revision.
@@ -566,6 +595,7 @@ impl Engine {
             &dictionary,
             &config.compaction,
             config.durability,
+            config.index_encoding,
         )?;
         let version = recovered.version;
         dictionary.set_derived_dir(dir.as_ref().join("derived"));
@@ -608,6 +638,9 @@ impl Engine {
             maintaining: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
             equality: RwLock::new(None),
+            index_encoding: config.index_encoding,
+            inferred_merge_wave_keys: config.inferred_merge_wave_keys,
+            vocabulary: config.vocabulary,
         });
         let worker = config
             .background_maintenance
@@ -715,7 +748,8 @@ impl Engine {
     /// data directory holding it opens at that revision.
     pub fn write_image(&self, dir: &std::path::Path) -> EngineResult<ImageInfo> {
         let snapshot = self.inner.shared.snapshot();
-        let path = crate::durability::checkpoint::write(dir, &snapshot)?;
+        let vocabulary = self.inner.shared.vocabulary;
+        let path = crate::durability::checkpoint::write(dir, &snapshot, vocabulary)?;
         let version = snapshot.version();
         Ok(ImageInfo {
             path,

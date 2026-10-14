@@ -9,9 +9,33 @@ use crate::results::{
 };
 use crate::view::ReadView;
 
+/// Effort spent choosing a join order; this changes planning work, not query answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannerOptions {
+    /// Approximate candidate estimates across greedy starts (default 524288); `None`
+    /// removes this effort bound. At least one complete greedy start is always tried.
+    /// The DP threshold and the maximum number of greedy starts are unchanged.
+    pub greedy_effort: Option<usize>,
+}
+
+impl PlannerOptions {
+    /// The established greedy effort bound, retained for default query plans.
+    pub const DEFAULT_GREEDY_EFFORT: usize = 1 << 19;
+}
+
+impl Default for PlannerOptions {
+    fn default() -> Self {
+        Self {
+            greedy_effort: Some(Self::DEFAULT_GREEDY_EFFORT),
+        }
+    }
+}
+
 /// What an evaluation may use while it runs, for queries and update `WHERE` clauses.
 #[derive(Clone, Default)]
 pub struct Resources {
+    /// Work spent choosing a join order, independently of result memory.
+    pub planner: PlannerOptions,
     /// Checked by the evaluator while it runs; the transport layer cancels it at the
     /// request deadline.
     pub cancellation: Option<CancellationToken>,
@@ -222,6 +246,10 @@ pub struct Explanation {
     /// (the output's terms aren't counted): what id-level evaluation saves.
     pub decoded: u64,
     pub micros: u64,
+    /// The most working memory the query held at once, as charged to its budget (rows,
+    /// weights, sort keys, decoded terms): its own, unlike the process's resident memory,
+    /// which keeps what the allocator held for earlier queries.
+    pub memory_peak_bytes: u64,
     /// What the OWL 2 QL rewriting did, and whether the answers are complete; `None` where
     /// it doesn't apply.
     pub ql: Option<crate::ql::QlReport>,
@@ -255,7 +283,7 @@ pub fn explain_query<V: ReadView>(
 ) -> Result<Explanation, QueryEvaluationError> {
     let start = std::time::Instant::now();
     let snapshot = view.evaluation_snapshot();
-    let (rewrites, steps, rows, decoded, ql) =
+    let (rewrites, steps, rows, decoded, ql, memory_peak_bytes) =
         crate::native::explain(&snapshot, query, &for_view(view, options))?;
     Ok(Explanation {
         executor: "native",
@@ -264,6 +292,7 @@ pub fn explain_query<V: ReadView>(
         rows,
         decoded,
         micros: start.elapsed().as_micros() as u64,
+        memory_peak_bytes,
         ql,
         completeness: None,
         decided_by: Vec::new(),

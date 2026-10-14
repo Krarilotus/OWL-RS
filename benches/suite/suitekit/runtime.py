@@ -104,7 +104,13 @@ class Sampler:
         self.peak: int | None = None
         self.stopped = threading.Event()
         self.thread = threading.Thread(target=self.loop, daemon=True)
-        self.thread.start()
+        try:
+            self.thread.start()
+        except BaseException:
+            self.stopped.set()
+            if self.thread.ident is not None:
+                self.thread.join(timeout=10)
+            raise
 
     def loop(self):
         while not self.stopped.is_set():
@@ -135,7 +141,14 @@ class DockerStats:
                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                                         errors="replace")
         self.thread = threading.Thread(target=self.read, daemon=True)
-        self.thread.start()
+        try:
+            self.thread.start()
+        except BaseException:
+            self.process.kill()
+            self.process.wait(timeout=10)
+            if self.thread.ident is not None:
+                self.thread.join(timeout=10)
+            raise
 
     def read(self):
         for line in self.process.stdout:
@@ -145,11 +158,13 @@ class DockerStats:
                     self.peak = value if self.peak is None else max(self.peak, value)
 
     def stop(self) -> int | None:
-        self.process.terminate()
+        if self.process.poll() is None:
+            self.process.terminate()
         try:
             self.process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             self.process.kill()
+            self.process.wait(timeout=10)
         self.thread.join(timeout=10)
         return self.peak
 
@@ -180,15 +195,45 @@ def larger(a: int | None, b: int | None) -> int | None:
     return b if a is None else a if b is None else max(a, b)
 
 
-def scope_argv(unit: str, memory: str) -> list[str]:
+def scope_argv(unit: str, memory: str, environ=os.environ) -> list[str]:
     """A command's prefix to run it in its own systemd user scope capped as Docker's --memory
     and --memory-swap cap a container: `memory` in Docker's notation (12g, 900m), which
     systemd reads with upper-case units only. At the cap the kernel kills the command alone
     (exit 137, as in a container), not systemd the whole scope, so what runs after it in the
-    scope (fast's wrapper) can still read the peak. The rootfs runtime and fast's native
-    runtime share it."""
-    return ["systemd-run", "--user", "--scope", "-q", f"--unit={unit}", "-p", f"MemoryMax={memory.upper()}",
+    scope (fast's wrapper) can still read the peak. Under fleet the scope goes into the step's
+    slice (FLEET_SLICE), so it counts against what the job declared (14 Oct 2026: a scope beside
+    them, counted nowhere, took Office into a whole-host OOM). The rootfs runtime and fast's
+    native runtime share it."""
+    placed = [f"--slice={environ['FLEET_SLICE']}"] if environ.get("FLEET_SLICE") else []
+    return ["systemd-run", "--user", "--scope", "-q", *placed, f"--unit={unit}", "-p", f"MemoryMax={memory.upper()}",
             "-p", "MemorySwapMax=0", "-p", "OOMPolicy=continue", "--"]
+
+
+def end_scope(unit: str) -> None:
+    """Nothing outlives its task: whatever the scope still holds after its command ended or was
+    stopped (a child its wrapper started, reparented when the wrapper died) is killed. A scope
+    already gone is no error."""
+    killed = run_quiet(["systemctl", "--user", "kill", "--signal=KILL", f"{unit}.scope"], 30)
+    deadline = time.monotonic() + 30
+    while True:
+        shown = run_quiet(["systemctl", "--user", "show", "-p", "LoadState", "-p", "ActiveState",
+                           f"{unit}.scope"], 30)
+        if shown.returncode == 0 and ("LoadState=not-found" in shown.stdout.splitlines()
+                                      or "ActiveState=inactive" in shown.stdout.splitlines()):
+            return
+        if shown.returncode or time.monotonic() >= deadline:
+            raise RuntimeError(f"scope {unit}: termination unverified: {killed.stderr or shown.stderr}")
+        time.sleep(0.05)
+
+
+def slice_limit_mib(environ=os.environ) -> int | None:
+    """The memory limit of the fleet step's slice (FLEET_SLICE: what the job declared, plus a
+    tenth), in MiB; None outside fleet or without a limit."""
+    name = environ.get("FLEET_SLICE")
+    if not name or not shutil.which("systemctl"):
+        return None
+    shown = run_quiet(["systemctl", "--user", "show", "-p", "MemoryMax", "--value", name], 30).stdout.strip()
+    return int(shown) // 1048576 if shown.isdigit() else None
 
 
 class ScopePeak:
@@ -246,11 +291,36 @@ class Runtime:
     kind = "?"
 
     def __init__(self, scratch: Path, port: int, echo=print):
-        self.scratch = scratch
+        self.scratch = scratch.resolve()
         self.port = port
         self.echo = echo
         self.dry = False
         self.created_stores: list[str] = []
+        self.cleanup_errors: list[str] = []
+
+    def attempt(self, action, *args) -> bool:
+        try:
+            action(*args)
+            return True
+        except Exception as error:
+            self.cleanup_errors.append(f"{getattr(action, '__name__', type(action).__name__)}: {error}")
+            self.echo(self.cleanup_errors[-1])
+            return False
+
+    def residuals(self) -> dict:
+        return {"stores": list(self.created_stores), "containers": sorted(getattr(self, "containers", ())),
+                "processes": list(getattr(self, "processes", ())),
+                "scopes": list(getattr(self, "units", {}).values())}
+
+    def workers(self) -> bool:
+        return any(v for k, v in self.residuals().items() if k != "stores")
+
+    def owned_path(self, source: str) -> Path:
+        path = Path(source)
+        if (path.parent != self.scratch or path.is_symlink() or path.resolve() != path
+                or not path.resolve().is_relative_to(self.scratch)):
+            raise ValueError(f"unsafe store path: {source}")
+        return path
 
     # --- steps ---
     def run(self, spec: Spec, log: Path, timeout_s: float) -> Measured:
@@ -275,9 +345,7 @@ class Runtime:
 
     # --- stores: where a system keeps its data for one run ---
     def new_store(self, name: str) -> str:
-        path = self.scratch / name
-        if path.exists():
-            shutil.rmtree(path)
+        path = self.owned_path(str(self.scratch / name))
         path.mkdir(parents=True)
         self.created_stores.append(str(path))
         return str(path)
@@ -293,16 +361,22 @@ class Runtime:
         return total
 
     def remove_store(self, source: str):
-        shutil.rmtree(source, ignore_errors=True)
-        if source in self.created_stores:
-            self.created_stores.remove(source)
+        if source not in self.created_stores or self.workers():
+            raise RuntimeError(f"store not owned or workers remain: {source}")
+        path = self.owned_path(source)
+        if path.exists():
+            shutil.rmtree(path)
+        if os.path.lexists(path):
+            raise RuntimeError(f"store remains: {source}")
+        self.created_stores.remove(source)
 
     def image_present(self, image: str) -> bool:
         return True
 
     def cleanup(self):
-        for source in list(self.created_stores):
-            self.remove_store(source)
+        if not self.workers():
+            for source in list(self.created_stores):
+                self.attempt(self.remove_store, source)
 
 
 class DockerRuntime(Runtime):
@@ -310,7 +384,7 @@ class DockerRuntime(Runtime):
 
     def __init__(self, scratch: Path, port: int, echo=print):
         super().__init__(scratch, port, echo)
-        self.containers: set[str] = set()
+        self.containers: dict[str, Server] = {}
 
     def args(self, spec: Spec, detached: bool) -> list[str]:
         args = ["docker", "run", "--name", spec.name, "--init"]
@@ -345,39 +419,63 @@ class DockerRuntime(Runtime):
         return args + [spec.image] + command
 
     def remove(self, name: str):
-        run_quiet(["docker", "rm", "-f", "-v", name])
-        self.containers.discard(name)
+        if name not in self.containers:
+            raise RuntimeError(f"container not owned: {name}")
+        server = self.containers[name]
+        self.attempt(self.save_logs, server)
+        if server.sampler:
+            server.sampler.stop()
+        self.remove_resource("container", name)
+        self.containers.pop(name)
+
+    def names(self, kind):
+        # Request names explicitly; daemon/list errors must never mean absence.
+        out = run_quiet(["docker", kind, "ls", *(["-a"] if kind == "container" else []),
+                         "--format", "{{.Names}}" if kind == "container" else "{{.Name}}"])
+        out.check_returncode()
+        return out.stdout.splitlines()
+
+    def remove_resource(self, kind, name):
+        out = run_quiet(["docker", kind, "rm", "-f", name])
+        if out.returncode and name in self.names(kind):
+            out.check_returncode()
 
     def sample(self, name: str) -> DockerStats:
         return DockerStats(name)
 
+    def save_logs(self, server):
+        if server.log:
+            server.log.write_text(self.logs(server), encoding="utf-8", errors="replace")
+
     def run(self, spec, log, timeout_s):
-        self.remove(spec.name)
-        self.containers.add(spec.name)
+        if spec.name in self.containers or spec.name in self.names("container"):
+            raise FileExistsError(spec.name)
+        server = self.containers[spec.name] = Server(spec, spec.name, log)
         started = time.monotonic()
-        subprocess.run(self.args(spec, detached=True), check=True, capture_output=True)
-        sampler = self.sample(spec.name)
-        timed_out = False
         try:
-            waited = subprocess.run(["docker", "wait", spec.name], capture_output=True, text=True,
-                                    timeout=timeout_s)
-            rc = int(waited.stdout.strip() or 1)
-        except subprocess.TimeoutExpired:
-            run_quiet(["docker", "kill", spec.name])
-            timed_out, rc = True, 124
-        ms = (time.monotonic() - started) * 1000
-        peak = sampler.stop()
-        with open(log, "w", encoding="utf-8", errors="replace") as f:
-            logs = run_quiet(["docker", "logs", spec.name])
-            f.write(logs.stdout + logs.stderr)
-        self.remove(spec.name)
-        return Measured(ms, peak, rc, timed_out)
+            subprocess.run(self.args(spec, detached=True), check=True, capture_output=True)
+            sampler = server.sampler = self.sample(spec.name)
+            timed_out = False
+            try:
+                waited = subprocess.run(["docker", "wait", spec.name], capture_output=True, text=True,
+                                        timeout=timeout_s)
+                rc = int(waited.stdout.strip() or 1)
+            except subprocess.TimeoutExpired:
+                run_quiet(["docker", "kill", spec.name])
+                timed_out, rc = True, 124
+            ms = (time.monotonic() - started) * 1000
+            peak = sampler.stop()
+            return Measured(ms, peak, rc, timed_out)
+        finally:
+            self.attempt(self.remove, spec.name)
 
     def start(self, spec, log):
-        self.remove(spec.name)
-        self.containers.add(spec.name)
+        if spec.name in self.containers or spec.name in self.names("container"):
+            raise FileExistsError(spec.name)
+        server = self.containers[spec.name] = Server(spec, spec.name, log)
         subprocess.run(self.args(spec, detached=True), check=True, capture_output=True)
-        return Server(spec, spec.name, log, sampler=self.sample(spec.name))
+        server.sampler = self.sample(spec.name)
+        return server
 
     def alive(self, server):
         out = run_quiet(["docker", "inspect", "-f", "{{.State.Running}}", server.spec.name])
@@ -385,6 +483,7 @@ class DockerRuntime(Runtime):
 
     def logs(self, server) -> str:
         out = run_quiet(["docker", "logs", server.spec.name])
+        out.check_returncode()
         return out.stdout + out.stderr
 
     def stop(self, server):
@@ -396,9 +495,6 @@ class DockerRuntime(Runtime):
         if reading:
             peak = max(peak or 0, reading)
         run_quiet(["docker", "stop", "-t", "60", server.spec.name], 120)
-        if server.log:
-            with open(server.log, "w", encoding="utf-8", errors="replace") as f:
-                f.write(self.logs(server))
         self.remove(server.spec.name)
         return peak
 
@@ -408,7 +504,8 @@ class DockerRuntime(Runtime):
         return out.returncode, out.stdout + out.stderr
 
     def new_store(self, name):
-        run_quiet(["docker", "volume", "rm", "-f", name])
+        if name in self.created_stores or name in self.names("volume"):
+            raise FileExistsError(name)
         subprocess.run(["docker", "volume", "create", name], check=True, capture_output=True)
         self.created_stores.append(name)
         return name
@@ -421,16 +518,17 @@ class DockerRuntime(Runtime):
             return None
 
     def remove_store(self, source):
-        run_quiet(["docker", "volume", "rm", "-f", source])
-        if source in self.created_stores:
-            self.created_stores.remove(source)
+        if source not in self.created_stores or self.workers():
+            raise RuntimeError(f"store not owned or workers remain: {source}")
+        self.remove_resource("volume", source)
+        self.created_stores.remove(source)
 
     def image_present(self, image):
         return run_quiet(["docker", "image", "inspect", image]).returncode == 0
 
     def cleanup(self):
         for name in list(self.containers):
-            self.remove(name)
+            self.attempt(self.remove, name)
         super().cleanup()
 
 
@@ -448,7 +546,7 @@ class ProcessRuntime(Runtime):
 
     def __init__(self, scratch, port, echo=print):
         super().__init__(scratch, port, echo)
-        self.processes: dict[str, subprocess.Popen] = {}
+        self.processes: dict[str, Server] = {}
 
     def translate(self, spec: Spec, text: str) -> str:
         for m in sorted(spec.mounts, key=lambda m: -len(m.target)):
@@ -472,16 +570,16 @@ class ProcessRuntime(Runtime):
         return self.translate(spec, spec.workdir) if spec.workdir else None
 
     def popen(self, argv, spec, log):
-        out = open(log, "w", encoding="utf-8", errors="replace")
         kwargs = {}
         if os.name == "posix":
             kwargs["start_new_session"] = True
-        return subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT, env=self.environment(spec),
-                                cwd=self.cwd(spec), stdin=subprocess.PIPE if spec.keep_stdin else subprocess.DEVNULL,
-                                **kwargs)
+        with open(log, "w", encoding="utf-8", errors="replace") as out:
+            return subprocess.Popen(argv, stdout=out, stderr=subprocess.STDOUT, env=self.environment(spec),
+                                    cwd=self.cwd(spec), stdin=subprocess.PIPE if spec.keep_stdin else subprocess.DEVNULL,
+                                    **kwargs)
 
     def kill(self, process: subprocess.Popen, sig=signal.SIGTERM):
-        if process.poll() is not None:
+        if os.name != "posix" and process.poll() is not None:
             return
         try:
             if os.name == "posix":
@@ -492,24 +590,37 @@ class ProcessRuntime(Runtime):
             pass
 
     def run(self, spec, log, timeout_s):
+        if spec.name in self.processes:
+            raise FileExistsError(spec.name)
         started = time.monotonic()
-        process = self.popen(self.argv(spec), spec, log)
-        sampler = Sampler(lambda: tree_rss_mib(process.pid))
-        timed_out = False
-        rc, rss = reap(process, timeout_s)
-        if rc is None:
-            self.kill(process)
-            if reap(process, 30)[0] is None:
-                self.kill(process, signal.SIGKILL if os.name == "posix" else signal.SIGTERM)
-                reap(process, 30)
-            timed_out, rc = True, 124
-        ms = (time.monotonic() - started) * 1000
-        return Measured(ms, larger(sampler.stop(), rss), rc, timed_out)
+        server = None
+        try:
+            server = self.start(spec, log)
+            rc, rss = reap(server.handle, timeout_s)
+            # A completed workload's time excludes sampling and harness teardown.
+            finished = time.monotonic() if rc is not None else None
+            peak = server.sampler.stop() if server.sampler else None
+            peak = self.measured_peak(spec, peak, rss)
+        finally:
+            server = server or self.processes.get(spec.name)
+            if server:
+                self.attempt(self.stop, server)
+        ms = ((finished if finished is not None else time.monotonic()) - started) * 1000
+        return Measured(ms, peak, 124 if rc is None else rc, rc is None)
 
     def start(self, spec, log):
+        if spec.name in self.processes or spec.name in getattr(self, "units", {}):
+            raise FileExistsError(spec.name)
         process = self.popen(self.argv(spec), spec, log)
-        self.processes[spec.name] = process
-        return Server(spec, process, log, sampler=Sampler(lambda: tree_rss_mib(process.pid)))
+        server = self.processes[spec.name] = Server(spec, process, log)
+        server.sampler = self.peak(spec)
+        return server
+
+    def peak(self, spec):
+        return Sampler(lambda: tree_rss_mib(self.processes[spec.name].handle.pid))
+
+    def measured_peak(self, spec, sampled, rss):
+        return larger(sampled, rss)
 
     def alive(self, server):
         return server.handle.poll() is None
@@ -522,8 +633,21 @@ class ProcessRuntime(Runtime):
         if rc is None:
             self.kill(process, signal.SIGKILL if os.name == "posix" else signal.SIGTERM)
             rc, rss = reap(process, 30)
+        if rc is None:
+            raise RuntimeError(f"process not reaped: {server.spec.name}")
+        if os.name == "posix":
+            self.kill(process, signal.SIGKILL)
+            deadline = time.monotonic() + 30
+            while True:
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"process group remains: {server.spec.name}")
+                time.sleep(0.05)
         self.processes.pop(server.spec.name, None)
-        return larger(peak, rss)
+        return self.measured_peak(server.spec, peak, rss)
 
     def exec(self, server, command, timeout_s=3600):
         spec = server.spec
@@ -535,9 +659,8 @@ class ProcessRuntime(Runtime):
         return f"http://127.0.0.1:{spec.port}"
 
     def cleanup(self):
-        for process in list(self.processes.values()):
-            self.kill(process, signal.SIGKILL if os.name == "posix" else signal.SIGTERM)
-        self.processes.clear()
+        for server in list(self.processes.values()):
+            self.attempt(self.stop, server)
         super().cleanup()
 
 
@@ -618,6 +741,10 @@ class RootfsRuntime(ProcessRuntime):
 
     kind = "rootfs"
 
+    def measured_peak(self, spec, sampled, rss):
+        # The scope owns this measurement even after its unit has been removed.
+        return sampled if spec.memory else super().measured_peak(spec, sampled, rss)
+
     def __init__(self, scratch, port, rootfs_dir: Path, echo=print):
         super().__init__(scratch, port, echo)
         self.rootfs_dir = rootfs_dir
@@ -659,7 +786,13 @@ class RootfsRuntime(ProcessRuntime):
 
     def argv(self, spec):
         if spec.image is None:
-            return ProcessRuntime.argv(self, spec)
+            # Host binaries need the same scope and cap as image-backed contenders.
+            command = ProcessRuntime.argv(self, spec)
+            if not spec.memory:
+                return command
+            unit = f"nrese-{spec.name}-{os.getpid()}-{int(time.monotonic() * 1000)}"
+            self.units[spec.name] = unit
+            return scope_argv(unit, spec.memory) + command
         return self.prefix(spec, list(spec.command))
 
     def environment(self, spec):
@@ -671,39 +804,32 @@ class RootfsRuntime(ProcessRuntime):
     def peak(self, spec) -> "Sampler | None":
         """The scope's memory.peak, sampled while it lives (the scope goes when its command ends)."""
         unit = self.units.get(spec.name)
-        return Sampler(ScopePeak(unit)) if unit else None
+        return Sampler(ScopePeak(unit)) if unit else super().peak(spec)
 
     def run(self, spec, log, timeout_s):
-        if spec.image is None or not spec.memory:
+        if spec.name in self.units or spec.name in self.processes:
+            raise FileExistsError(spec.name)
+        try:
             return ProcessRuntime.run(self, spec, log, timeout_s)
-        started = time.monotonic()
-        process = self.popen(self.argv(spec), spec, log)
-        scope = self.peak(spec)
-        rc, _ = reap(process, timeout_s)
-        timed_out = rc is None
-        if timed_out:
-            self.kill(process)
-            if reap(process, 30)[0] is None:
-                self.kill(process, signal.SIGKILL)
-                reap(process, 30)
-            rc = 124
-        # The scope's peak, not wait4's: the command runs below systemd-run, not as our child.
-        peak = scope.stop() if scope else None
-        self.units.pop(spec.name, None)
-        return Measured((time.monotonic() - started) * 1000, peak, rc, timed_out)
-
-    def start(self, spec, log):
-        server = ProcessRuntime.start(self, spec, log)
-        scope = self.peak(spec) if spec.image is not None else None
-        if scope:
-            server.sampler.stop()
-            server.sampler = scope
-        return server
+        finally:
+            self.attempt(self.end_unit, spec.name)
 
     def stop(self, server):
-        peak = ProcessRuntime.stop(self, server)
-        self.units.pop(server.spec.name, None)
-        return peak
+        try:
+            return ProcessRuntime.stop(self, server)
+        finally:
+            self.attempt(self.end_unit, server.spec.name)
+
+    def end_unit(self, name):
+        unit = self.units.get(name)
+        if unit:
+            end_scope(unit)
+            self.units.pop(name)
+
+    def cleanup(self):
+        for name in list(self.units):
+            self.attempt(self.end_unit, name)
+        super().cleanup()
 
     def exec(self, server, command, timeout_s=3600):
         spec = server.spec

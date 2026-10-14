@@ -16,6 +16,7 @@ mod cache_key;
 mod cached;
 pub(crate) use cached::output_key;
 mod calendar;
+mod count;
 mod equality;
 mod equijoin;
 mod estimate;
@@ -24,7 +25,6 @@ pub(crate) mod expr;
 mod fast;
 mod federation;
 mod geo;
-mod geo_formats;
 mod late;
 mod lateral;
 mod numeric;
@@ -51,6 +51,7 @@ mod search;
 mod sets;
 mod sideways;
 mod spatial;
+mod spatial_join;
 mod stream;
 mod strings;
 mod substitute;
@@ -103,11 +104,11 @@ use std::borrow::Cow;
 
 use crate::query::{PlanStep, QueryOptions};
 use aggregate::{
-    Agg, Aggregator, Number, aggregate_in_one_pass, counts_rows, finish_total, integer, integer_agg,
+    Agg, Aggregator, Number, aggregate_in_one_pass, counts_rows, finish_total, integer,
+    integer_agg, number_of,
 };
 pub use aggregate::{average, group_concat, sum};
 use expr::Evaluator;
-use value::Value;
 
 /// A right side at least this many times larger than the running result is joined by
 /// probing the index once per result row instead of scanning it.
@@ -127,6 +128,10 @@ const PROBE_CHUNK: usize = 4096;
 
 /// Decoded terms kept per query for repeated ids (ORDER BY, aggregates, expressions).
 const DECODE_CACHE_ENTRIES: usize = 1 << 18;
+
+/// The heap of a decoded term, about, where working memory holds terms by the many: the
+/// text of an IRI or a short literal.
+const ORDER_TERM_BYTES: usize = 48;
 
 pub(crate) enum NativeError {
     /// Something the executor doesn't implement.
@@ -283,7 +288,14 @@ pub(crate) fn explain(
         }
     };
     let decoded = ctx.decodes.load(AtomicOrdering::Relaxed);
-    Ok((rewrites, steps, rows as u64, decoded, ql))
+    Ok((
+        rewrites,
+        steps,
+        rows as u64,
+        decoded,
+        ql,
+        ctx.budget.peak() as u64,
+    ))
 }
 
 /// The plan `query` would run as, after the rewrites, with estimated rows per node
@@ -303,14 +315,15 @@ pub(crate) fn plan(
     Ok((rewrites, steps, ql))
 }
 
-/// The rewrites, the steps with their rows, the rows, the terms decoded, and what the QL
-/// rewriting did.
+/// The rewrites, the steps with their rows, the rows, the terms decoded, what the QL
+/// rewriting did, and the most working memory the query held at once.
 type ExplainParts = (
     Vec<&'static str>,
     Vec<PlanStep>,
     u64,
     u64,
     Option<crate::ql::QlReport>,
+    u64,
 );
 
 /// The rewrites, the planned steps, and what the QL rewriting did.
@@ -1161,6 +1174,7 @@ impl Solutions {
 }
 
 struct Context<'a> {
+    planner: crate::PlannerOptions,
     /// The snapshot read; owned when it reads equality classes canonically
     /// ([`QueryOptions::equality_canonical`], [`Context::late_expansion`]).
     snapshot: Cow<'a, Snapshot>,
@@ -1171,6 +1185,9 @@ struct Context<'a> {
     evaluator: Evaluator,
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
+    /// A charge for memory already held that the budget refused (computed terms): the
+    /// query ends with it at its next check.
+    overdrawn: Cell<Option<BudgetExceeded>>,
     decoded: RefCell<HashMap<u64, Option<Term>>>,
     /// Stored terms decoded for expressions, orders and aggregates (EXPLAIN's `decoded`;
     /// the output's aren't counted).
@@ -1285,6 +1302,7 @@ impl<'a> Context<'a> {
             DefaultGraph::Empty => (GraphScope::Missing, None),
         };
         let mut ctx = Self {
+            planner: options.resources.planner,
             merge_set,
             named: resolved.named,
             as_written: options.as_written,
@@ -1304,6 +1322,7 @@ impl<'a> Context<'a> {
             aliases: RefCell::default(),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
+            overdrawn: Cell::new(None),
             decoded: RefCell::default(),
             decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
@@ -1380,11 +1399,28 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Whether the query may go on: not cancelled, and the process within its memory limit
+    /// ([`nrese_exec::memory::process_limit_exceeded`]), the bound on what the budget
+    /// doesn't account: a query past it ends with a memory error, never the process.
     fn check(&self) -> NativeResult<()> {
-        Ok(self
-            .cancellation
-            .as_ref()
-            .map_or(Ok(()), CancellationToken::check)?)
+        if let Some(token) = &self.cancellation {
+            token.check()?;
+        }
+        if let Some(exceeded) = self.overdrawn.get() {
+            return Err(QueryEvaluationError::MemoryLimit(exceeded).into());
+        }
+        if nrese_exec::memory::process_limit_exceeded() {
+            let limit = nrese_exec::memory::process_limit().unwrap_or(0);
+            let held = nrese_exec::memory::process_bytes().unwrap_or(limit);
+            return Err(QueryEvaluationError::MemoryLimit(BudgetExceeded {
+                limit: limit as usize,
+                requested: 0,
+                used: held as usize,
+                shared: true,
+            })
+            .into());
+        }
+        Ok(())
     }
 
     /// Charges a produced table against the query's memory budget.
@@ -1457,9 +1493,15 @@ impl<'a> Context<'a> {
         }
         self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
         let term = self.snapshot.decode(TermId::from_raw(id));
-        // Bounded: a scan over millions of distinct labels must not keep them all.
+        // Bounded: a scan over millions of distinct labels must not keep them all; and
+        // kept only while the budget has room for it (released when the query ends).
         if decoded.len() < DECODE_CACHE_ENTRIES {
-            decoded.insert(id, term.clone());
+            let bytes = std::mem::size_of::<(u64, Option<Term>)>()
+                + term.as_ref().map_or(0, term_heap_bytes)
+                + 16;
+            if self.budget.charge(bytes).is_ok() {
+                decoded.insert(id, term.clone());
+            }
         }
         term
     }
@@ -1478,6 +1520,14 @@ impl<'a> Context<'a> {
         let id = computed_id(computed.len() as u64);
         computed.push(term.clone());
         ids.insert(term.clone(), id);
+        // Kept until the query ends, twice (by id and by term): charged, and a charge past
+        // the budget ends the query at its next check.
+        let bytes = 2 * (std::mem::size_of::<Term>() + term_heap_bytes(term)) + 32;
+        if let Err(exceeded) = self.budget.charge(bytes)
+            && self.overdrawn.get().is_none()
+        {
+            self.overdrawn.set(Some(exceeded));
+        }
         id
     }
 
@@ -1599,8 +1649,21 @@ impl<'a> Context<'a> {
         // expressions by the generic evaluator.
         let on_ids = fast::compile_term(&plain, &self.snapshot)
             .filter(|term| matches!(term, fast::IdTerm::Part(..) | fast::IdTerm::Triple(_)));
+        // `geof:envelope(?v)` of stored literals from the geometry index's boxes (`spatial`).
+        let envelope = spatial::envelope_argument(&plain)
+            .and_then(|v| solutions.column(v))
+            .map(|column| (column, self.snapshot.geometries()));
         let values: Vec<u64> = (0..solutions.table.len())
             .map(|row| {
+                if let Some((column, index)) = &envelope {
+                    let id = solutions.table.get(row, *column);
+                    if id == UNDEF {
+                        return UNDEF;
+                    }
+                    if computed_index(id).is_none() {
+                        return spatial::envelope_of(index, id).map_or(UNDEF, |t| self.id(&t));
+                    }
+                }
                 if let Some(term) = &on_ids {
                     let value = |v: &Variable| {
                         solutions
@@ -1730,6 +1793,13 @@ impl<'a> Context<'a> {
             }
             GraphPattern::Filter { expr, inner } => match &**inner {
                 GraphPattern::Bgp { patterns } => {
+                    // Parts of the pattern that share no variable, related by a spatial
+                    // conjunct: joined through the relation (`spatial_join`).
+                    let mut all = Vec::new();
+                    pushdown::conjuncts_of(expr, &mut all);
+                    if let Some(joined) = self.spatial_bgp(patterns, &all)? {
+                        return Ok(joined);
+                    }
                     // Range conjuncts on a variable narrow the scan that binds it (the
                     // conjunct still runs on every row, so the ranges only prune). Each
                     // conjunct runs as soon as the join sequence has bound its variables,
@@ -1741,17 +1811,14 @@ impl<'a> Context<'a> {
                     let (early, late): (Vec<_>, Vec<_>) = all
                         .into_iter()
                         .partition(|c| !as_written && pushdown::movable(c));
-                    let spatial_seed = self.spatial_seed(&early, patterns);
+                    let spatial_seed = self.spatial_seed(&early, patterns)?;
                     let mut early: Vec<(&Expression, Vec<Variable>)> = early
                         .into_iter()
                         .map(|c| (c, expression_variables(c)))
                         .collect();
                     // A spatial filter's candidates from the R-tree start the joins.
                     let mut solutions = match spatial_seed {
-                        Some(seed) => {
-                            let seed = self.produced(seed)?;
-                            self.bgp_from(seed, patterns, &mut early)?
-                        }
+                        Some(seed) => self.bgp_from(seed, patterns, &mut early)?,
                         None => self.bgp(patterns, &hints, &mut early)?,
                     };
                     // What the pattern couldn't place: variables it doesn't bind (the
@@ -1769,6 +1836,17 @@ impl<'a> Context<'a> {
                     aggregates,
                 } => {
                     let solutions = self.group(inner, variables, aggregates, Some(expr))?;
+                    self.filter(solutions, expr)
+                }
+                // Inputs that share no variable, related by a spatial conjunct: joined
+                // through the relation (`spatial_join`).
+                GraphPattern::Join { inputs } => {
+                    let mut all = Vec::new();
+                    pushdown::conjuncts_of(expr, &mut all);
+                    if let Some(joined) = self.spatial_inputs(inputs, &all)? {
+                        return Ok(joined);
+                    }
+                    let solutions = self.eval(inner)?;
                     self.filter(solutions, expr)
                 }
                 other => {
@@ -1972,21 +2050,24 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// The scope `GRAPH <name>` reads: the store's default graph for Jena's name of it
+    /// (`compat`), the named graph, or [`GraphScope::Missing`] for one the dataset lacks.
+    fn named_scope(&self, name: &nrese_rdf::NamedNode) -> GraphScope {
+        if crate::compat::names_default_graph(name.as_str()) {
+            return GraphScope::Default;
+        }
+        self.lookup_const(name.as_ref().into())
+            .filter(|&id| self.is_named_graph(id))
+            .map_or(GraphScope::Missing, GraphScope::Named)
+    }
+
     fn graph(&self, name: &NamedNodePattern, inner: &GraphPattern) -> NativeResult<Solutions> {
         let variable = match name {
-            // Jena's name for the default graph (`compat`): the store's default graph.
-            NamedNodePattern::NamedNode(n) if crate::compat::names_default_graph(n.as_str()) => {
-                return self.in_graph(GraphScope::Default, inner);
-            }
             NamedNodePattern::NamedNode(n) => {
-                let id = self
-                    .lookup_const(n.as_ref().into())
-                    .filter(|&id| self.is_named_graph(id));
-                return match id {
-                    Some(id) => self.in_graph(GraphScope::Named(id), inner),
+                return match self.named_scope(n) {
                     // No such graph in the dataset: no solutions, whatever the pattern
                     // would give without reading statements (VALUES, BIND).
-                    None => {
+                    GraphScope::Missing => {
                         let mut vars = Vec::new();
                         bound_variables(inner, &mut vars);
                         let table = IdTable::new(vars.len());
@@ -1996,6 +2077,7 @@ impl<'a> Context<'a> {
                             ordered: false,
                         })
                     }
+                    scope => self.in_graph(scope, inner),
                 };
             }
             NamedNodePattern::Variable(v) => v,
@@ -2987,8 +3069,15 @@ impl<'a> Context<'a> {
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         };
-        plan::order(inputs, variables, PROBE_FACTOR, sets.as_deref(), &cancelled)
-            .ok_or_else(|| QueryEvaluationError::Cancelled.into())
+        plan::order(
+            inputs,
+            variables,
+            PROBE_FACTOR,
+            sets.as_deref(),
+            self.planner,
+            &cancelled,
+        )
+        .ok_or_else(|| QueryEvaluationError::Cancelled.into())
     }
 
     /// The join orderer's inputs for `scans` with their `counts`: distinct values per
@@ -3508,6 +3597,12 @@ impl<'a> Context<'a> {
             .map(|v| (0..4).filter(|&i| scan.slots[i].is_var(v)).collect())
             .collect();
         let merged = scan.merged();
+        // The table's size is known before it is read (the index's count, an estimate where
+        // equality classes are expanded): charged first, so a scan past the budget allocates
+        // nothing (Sparqloscope 101 decoded 605 M rows in one call and took the process to
+        // its cap). The table's own charge replaces this one.
+        let expected = self.snapshot.estimate_in(self.model, &pattern) as usize;
+        let precharge = self.working(expected.saturating_mul(vars.len().max(1) * 8))?;
         // One run, no deletions, nothing to merge: whole columns, decoded a block at a time.
         if !merged && !scan.repeats_variable() {
             let components: Vec<usize> = columns_of.iter().map(|positions| positions[0]).collect();
@@ -3515,6 +3610,7 @@ impl<'a> Context<'a> {
                 self.snapshot
                     .scan_columns_in(self.model, &pattern, permutation, &components)
             {
+                drop(precharge);
                 let table = if vars.is_empty() {
                     let rows = self.snapshot.count_in(self.model, &pattern) as usize;
                     IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
@@ -3564,6 +3660,7 @@ impl<'a> Context<'a> {
             table.push_row(&row);
         }
         let table = table.assume_sorted_by(sorted_columns(scan, permutation, &vars));
+        drop(precharge);
         self.produced(Solutions {
             vars,
             table,
@@ -4120,7 +4217,7 @@ impl<'a> Context<'a> {
     fn aggregate_groups(
         &self,
         solutions: &Solutions,
-        members: &[Vec<usize>],
+        members: &nrese_exec::group::Members,
         aggregates: &[(Variable, AggregateExpression)],
     ) -> NativeResult<Vec<Vec<Agg>>> {
         let per_group = |aggregator: &Aggregator<'_>, rows: &[usize]| -> Vec<Agg> {
@@ -4129,6 +4226,22 @@ impl<'a> Context<'a> {
                 .map(|(_, aggregate)| aggregator.aggregate(solutions, rows, aggregate))
                 .collect()
         };
+        // A large group whose aggregates all fold (COUNT, SAMPLE, MIN, MAX, GROUP_CONCAT)
+        // is folded in parallel parts of its rows, merged in order (Sparqloscope 058: MIN
+        // of 30.5 M names, one group, 3.9 s on one thread).
+        if aggregates
+            .iter()
+            .all(|(_, aggregate)| aggregate::foldable(aggregate))
+            && members
+                .iter()
+                .any(|rows| rows.len() >= 2 * PARALLEL_EXPRESSION_ROWS)
+        {
+            let mut out = Vec::with_capacity(members.len());
+            for rows in members.iter() {
+                out.push(self.fold_in_parts(solutions, rows, aggregates)?);
+            }
+            return Ok(out);
+        }
         if solutions.table.len() < 2 * PARALLEL_EXPRESSION_ROWS || members.len() < 2 {
             let term = |id: u64| self.term(id);
             let aggregator = Aggregator {
@@ -4175,9 +4288,8 @@ impl<'a> Context<'a> {
                     numbers: RefCell::default(),
                 };
                 Some(
-                    members[window[0]..window[1]]
-                        .iter()
-                        .map(|rows| per_group(&aggregator, rows))
+                    (window[0]..window[1])
+                        .map(|group| per_group(&aggregator, members.get(group)))
                         .collect(),
                 )
             })
@@ -4192,11 +4304,81 @@ impl<'a> Context<'a> {
         Ok(out)
     }
 
+    /// `aggregates` ([`aggregate::foldable`]) of one group, its `rows` folded in parallel
+    /// parts each with a decoder of its own and merged in row order; serially where the
+    /// group is small.
+    fn fold_in_parts(
+        &self,
+        solutions: &Solutions,
+        rows: &[usize],
+        aggregates: &[(Variable, AggregateExpression)],
+    ) -> NativeResult<Vec<Agg>> {
+        if rows.len() < 2 * PARALLEL_EXPRESSION_ROWS {
+            let term = |id: u64| self.term(id);
+            let aggregator = Aggregator {
+                evaluator: &self.evaluator,
+                term: &term,
+                memo: RefCell::default(),
+                numbers: RefCell::default(),
+            };
+            return Ok(aggregates
+                .iter()
+                .map(|(_, aggregate)| aggregator.fold(solutions, rows, aggregate).finish())
+                .collect());
+        }
+        let computed = self.computed.borrow();
+        let computed: &[Term] = &computed;
+        let token = self.cancellation.as_ref();
+        let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
+        let decodes = &self.decodes;
+        let parts: Vec<Option<Vec<aggregate::Fold>>> = rows
+            .par_chunks(PARALLEL_EXPRESSION_ROWS)
+            .map(|part| {
+                if token.is_some_and(CancellationToken::is_cancelled) {
+                    return None;
+                }
+                let decoder = Decoder::new(snapshot, computed, decodes);
+                let term = |id: u64| decoder.term(id);
+                let aggregator = Aggregator {
+                    evaluator,
+                    term: &term,
+                    memo: RefCell::default(),
+                    numbers: RefCell::default(),
+                };
+                Some(
+                    aggregates
+                        .iter()
+                        .map(|(_, aggregate)| aggregator.fold(solutions, part, aggregate))
+                        .collect(),
+                )
+            })
+            .collect();
+        let mut folds: Option<Vec<aggregate::Fold>> = None;
+        for part in parts {
+            let Some(part) = part else {
+                return Err(QueryEvaluationError::Cancelled.into());
+            };
+            folds = Some(match folds {
+                None => part,
+                Some(before) => before
+                    .into_iter()
+                    .zip(part)
+                    .map(|(a, b)| a.merge(b))
+                    .collect(),
+            });
+        }
+        Ok(folds
+            .expect("a large group has parts")
+            .into_iter()
+            .map(aggregate::Fold::finish)
+            .collect())
+    }
+
     /// Ranks of `column`'s values in SPARQL's order. With `top = (k, descending)` only the
     /// `k` values that come first in that direction are told apart; the others share the
     /// rank that comes last (they cover at least `k` rows, so no row of the others is
     /// among the first `k`): a selection instead of a sort, for ORDER BY … LIMIT k.
-    fn order_ranks(&self, column: &[u64], top: Option<(usize, bool)>) -> Vec<u64> {
+    fn order_ranks(&self, column: &[u64], top: Option<(usize, bool)>) -> NativeResult<Vec<u64>> {
         // Plain inline xsd:integers only: their lexical forms are canonical, so their value
         // is their place in the total order. Integers of derived datatypes of one value
         // (`"6"^^xsd:nonNegativeInteger` and `"6"^^xsd:integer`) differ there by datatype,
@@ -4213,17 +4395,22 @@ impl<'a> Context<'a> {
             .all(|&id| id == UNDEF || integer(id).is_some())
         {
             // By value, above UNDEF, which sorts first in SPARQL.
-            return column
+            return Ok(column
                 .iter()
                 .map(|&id| match integer(id) {
                     Some(value) => (value + (1 << 62)) as u64 + 1,
                     None => 0,
                 })
-                .collect();
+                .collect());
         }
         let mut distinct = column.to_vec();
         distinct.par_sort_unstable();
         distinct.dedup();
+        // Each distinct value decoded, its order and rank: held while the ranks are made.
+        let _working = self.working(
+            distinct.len() * (std::mem::size_of::<value::Sortable>() + ORDER_TERM_BYTES + 16)
+                + column.len() * 8,
+        )?;
         // Stored terms are decoded and their values parsed on every core where there are
         // many (YAGO's 18 k populations, `"+4400"^^xsd:decimal`, are dictionary entries).
         let terms: Vec<value::Sortable> = if distinct.len() >= PARALLEL_RANKS
@@ -4290,10 +4477,10 @@ impl<'a> Context<'a> {
                 };
                 ranks.insert(distinct[d], value_rank);
             }
-            return column
+            return Ok(column
                 .iter()
                 .map(|id| ranks.get(id).copied().unwrap_or(rest))
-                .collect();
+                .collect());
         }
         by_term.par_sort_by(|&a, &b| terms[a].order(&terms[b]));
         let mut rank_of = vec![0u64; distinct.len()];
@@ -4304,10 +4491,19 @@ impl<'a> Context<'a> {
             }
             rank_of[d] = rank;
         }
-        column
+        Ok(column
             .iter()
             .map(|id| rank_of[distinct.binary_search(id).expect("id is in the column")])
-            .collect()
+            .collect())
+    }
+
+    /// Working memory an operator holds while it runs, charged to the query's budget until
+    /// the returned reservation drops.
+    fn working(&self, bytes: usize) -> NativeResult<nrese_exec::Reservation<&Budget>> {
+        let mut held = nrese_exec::Reservation::new(&*self.budget);
+        held.charge(bytes)
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        Ok(held)
     }
 
     /// The values of the sort `keys` for `rows` of `solutions`, by position in `rows`. A key
@@ -4319,7 +4515,7 @@ impl<'a> Context<'a> {
         keys: &[OrderExpression],
         rows: &[usize],
         limit: Option<usize>,
-    ) -> Vec<SortKey> {
+    ) -> NativeResult<Vec<SortKey>> {
         keys.iter()
             .enumerate()
             .map(|(i, key)| {
@@ -4335,13 +4531,13 @@ impl<'a> Context<'a> {
                     let top = limit
                         .filter(|_| i == 0 && keys.len() == 1)
                         .map(|k| (k, descending));
-                    return SortKey::Ids(self.order_ranks(&values, top));
+                    return Ok(SortKey::Ids(self.order_ranks(&values, top)?));
                 }
-                SortKey::Terms(
+                Ok(SortKey::Terms(
                     rows.iter()
                         .map(|&row| self.evaluator.eval(e, &self.binding(solutions, row)))
                         .collect(),
-                )
+                ))
             })
             .collect()
     }
@@ -4380,14 +4576,29 @@ impl<'a> Context<'a> {
             && k < n
             && keys.len() > 1
         {
-            let first = self.sort_keys(&solutions, &keys[..1], &rows, Some(k));
+            let first = self.sort_keys(&solutions, &keys[..1], &rows, Some(k))?;
             let cmp = |a: &usize, b: &usize| by_keys(&keys[..1], &first, *a, *b);
             let mut positions = rows.clone();
             positions.select_nth_unstable_by(k - 1, cmp);
             let pivot = positions[k - 1];
             rows.retain(|row| cmp(row, &pivot).is_le());
         }
-        let key_values = self.sort_keys(&solutions, keys, &rows, limit);
+        // The positions, their order and each key's value per row (a term per row for an
+        // expression), held while the rows are sorted.
+        let evaluated = keys
+            .iter()
+            .filter(|key| {
+                let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
+                !matches!(e, Expression::Variable(_))
+            })
+            .count();
+        let _working = self.working(
+            rows.len()
+                * (16
+                    + 8 * keys.len()
+                    + evaluated * (std::mem::size_of::<Option<Term>>() + ORDER_TERM_BYTES)),
+        )?;
+        let key_values = self.sort_keys(&solutions, keys, &rows, limit)?;
         let compare = |a: &usize, b: &usize| {
             by_keys(keys, &key_values, *a, *b).then_with(|| rows[*a].cmp(&rows[*b]))
         };
@@ -4457,11 +4668,22 @@ impl<'a> Context<'a> {
         aggregates: &[(Variable, AggregateExpression)],
         having: Option<&Expression>,
     ) -> NativeResult<Solutions> {
-        // COUNT(*) of one triple pattern without GROUP BY: the index knows the answer.
+        // COUNT(*) of one triple pattern without GROUP BY, or COUNT(?v) of a variable it
+        // binds: the index knows the answer (Sparqloscope 100, `COUNT(?s)` of every
+        // statement, read all 605 M of them).
         if variables.is_empty()
-            && let [(target, AggregateExpression::CountSolutions { distinct: false })] = aggregates
+            && let [(target, aggregate)] = aggregates
             && let GraphPattern::Bgp { patterns } = inner
             && let [triple] = patterns.as_slice()
+            && match aggregate {
+                AggregateExpression::CountSolutions { distinct: false } => true,
+                AggregateExpression::FunctionCall {
+                    name: AggregateFunction::Count,
+                    expr: Expression::Variable(v),
+                    distinct: false,
+                } => triple_variables(triple).contains(v),
+                _ => false,
+            }
             && !search::is_search(triple, patterns)
             && !self.is_spatial(triple)
         {
@@ -4482,6 +4704,49 @@ impl<'a> Context<'a> {
                 ordered: false,
             });
         }
+        // COUNT(DISTINCT ?v) of one triple pattern: the groups of the index sorted on ?v,
+        // counted as they are walked (Sparqloscope 101 to 103, the subjects, predicates and
+        // objects of every statement, read all 605 M of them, two past 26 GB).
+        if variables.is_empty()
+            && let [(target, aggregate)] = aggregates
+            && let AggregateExpression::FunctionCall {
+                name: AggregateFunction::Count,
+                expr: Expression::Variable(key),
+                distinct: true,
+            } = aggregate
+            && let GraphPattern::Bgp { patterns } = inner
+            && let [triple] = patterns.as_slice()
+            && let Some(count) = self.distinct_count(triple, key)?
+        {
+            let mut table = IdTable::new(1);
+            table.push_row(&[self.id(&integer(count))]);
+            return Ok(Solutions {
+                vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
+        // COUNT of one pattern under a FILTER that only bounds a variable to id ranges:
+        // the index counts the ranges where it holds for every value, and the FILTER
+        // decides only the others' (decimals, typed literals).
+        if variables.is_empty()
+            && let [(target, aggregate)] = aggregates
+            && let GraphPattern::Filter {
+                expr,
+                inner: filtered,
+            } = inner
+            && let GraphPattern::Bgp { patterns } = &**filtered
+            && let [triple] = patterns.as_slice()
+            && let Some(count) = self.count_bounded(triple, expr, aggregate)?
+        {
+            let mut table = IdTable::new(1);
+            table.push_row(&[self.id(&integer(count))]);
+            return Ok(Solutions {
+                vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
         // COUNT(*) of a cyclic BGP: its worst-case-optimal join counts the solutions
         // instead of producing them (4-cycles of a social graph: 19.2 M two-paths
         // checked → two lists of 2-paths per node).
@@ -4494,6 +4759,73 @@ impl<'a> Context<'a> {
             table.push_row(&[self.id(&integer(count))]);
             return Ok(Solutions {
                 vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
+        // COUNT(*) of an acyclic join with OPTIONAL, MINUS, EXISTS and UNION parts, and
+        // COUNT(?v) of a variable it or one OPTIONAL binds: by message passing over the
+        // index, without its rows (`count`), each aggregate of the group.
+        if variables.is_empty()
+            && !aggregates.is_empty()
+            && let Some(counts) = self.count_aggregates(inner, aggregates)?
+        {
+            let row: Vec<u64> = counts.iter().map(|&n| self.id(&integer(n))).collect();
+            let mut table = IdTable::new(row.len());
+            table.push_row(&row);
+            return Ok(Solutions {
+                vars: aggregates
+                    .iter()
+                    .map(|(target, _)| target.clone())
+                    .collect(),
+                table,
+                ordered: false,
+            });
+        }
+        // COUNT(DISTINCT ?k) of such a join: the values of ?k with solutions.
+        if variables.is_empty()
+            && let [(target, aggregate)] = aggregates
+            && let AggregateExpression::FunctionCall {
+                name: AggregateFunction::Count,
+                expr: Expression::Variable(key),
+                distinct: true,
+            } = aggregate
+            && let Some(values) = self.counts_per_value(inner, key, aggregates)?
+        {
+            let mut table = IdTable::new(1);
+            table.push_row(&[self.id(&integer(values.len() as u64))]);
+            return Ok(Solutions {
+                vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
+        // GROUP BY ?k with counts of such a join: its solutions per value of ?k.
+        if let [key] = variables
+            && let Some(values) = self.counts_per_value(inner, key, aggregates)?
+        {
+            let as_id = |n: u64| match TermId::inline_integer(n as i64) {
+                Some(id) => id.raw(),
+                None => self.id(&integer(n)),
+            };
+            let mut columns = vec![values.iter().map(|&(value, _)| value).collect::<Vec<_>>()];
+            let mut vars = vec![key.clone()];
+            for (target, aggregate) in aggregates {
+                let distinct = matches!(
+                    aggregate,
+                    AggregateExpression::FunctionCall { distinct: true, .. }
+                );
+                columns.push(
+                    values
+                        .iter()
+                        .map(|&(_, n)| as_id(if distinct { 1 } else { n }))
+                        .collect(),
+                );
+                vars.push(target.clone());
+            }
+            let table = IdTable::from_columns(columns).assume_sorted_by(vec![0]);
+            return self.produced(Solutions {
+                vars,
                 table,
                 ordered: false,
             });
@@ -4588,9 +4920,13 @@ impl<'a> Context<'a> {
             return Ok(solutions);
         }
         // Aggregates that ignore duplicates let the pattern be evaluated as a set, and
-        // OPTIONALs that only feed them be aggregated apart from the rest (`sets`).
+        // OPTIONALs that only feed them be aggregated apart from the rest (`sets`). One
+        // pattern too: its values by a group walk (Sparqloscope 058, MIN of a name, folded
+        // 30.5 M rows for their distinct names).
+        let one_pattern = variables.is_empty()
+            && matches!(inner, GraphPattern::Bgp { patterns } if patterns.len() == 1);
         let solutions = match sets::insensitive_arguments(aggregates) {
-            Some(arguments) if sets::joins(inner) && !self.as_written => {
+            Some(arguments) if (sets::joins(inner) || one_pattern) && !self.as_written => {
                 if !variables.is_empty()
                     && let Some(solutions) =
                         self.group_detached(inner, variables, aggregates, &arguments, having)?
@@ -4608,6 +4944,114 @@ impl<'a> Context<'a> {
             _ => self.eval(inner)?,
         };
         self.group_solutions(solutions, variables, aggregates)
+    }
+
+    /// The distinct values of `key` in `triple`'s matches, from the index's groups
+    /// ([`Snapshot::distinct_count_in`]); `None` where the index can't say.
+    fn distinct_count(&self, triple: &TriplePattern, key: &Variable) -> NativeResult<Option<u64>> {
+        if self.as_written
+            || search::is_search(triple, std::slice::from_ref(triple))
+            || self.is_spatial(triple)
+        {
+            return Ok(None);
+        }
+        if !triple_variables(triple).contains(key) {
+            return Ok(None);
+        }
+        let Some(scan) = self.scan_pattern(triple) else {
+            // A constant the store doesn't know: no matches.
+            return Ok(Some(0));
+        };
+        let Some(component) = (0..3).find(|&c| scan.slots[c].is_var(key)) else {
+            return Ok(None);
+        };
+        if scan.repeats_variable() || scan.merged() || !matches!(scan.slots[3], Slot::Const(_)) {
+            return Ok(None);
+        }
+        let permutation = scan.permutation_for(Some(key));
+        if scan.first_free(permutation) != Some(component) {
+            return Ok(None);
+        }
+        let start = Instant::now();
+        let count = self
+            .snapshot
+            .distinct_count_in(self.model, &scan.quad_pattern(), permutation);
+        self.check()?;
+        if count.is_some() && self.trace.is_some() {
+            self.note(
+                "distinct count",
+                format!("{key} of {triple}: the index's groups counted"),
+                Some(1),
+                1,
+                start,
+            );
+        }
+        Ok(count)
+    }
+
+    /// `aggregate` (counting rows) of `triple` under `filter` where the filter only bounds
+    /// a variable to id ranges ([`ranges::bounded`]): range counts of the index, the
+    /// filter evaluated over the ranges it doesn't decide by id. `None` for other
+    /// patterns and filters.
+    fn count_bounded(
+        &self,
+        triple: &TriplePattern,
+        filter: &Expression,
+        aggregate: &AggregateExpression,
+    ) -> NativeResult<Option<u64>> {
+        if self.as_written
+            || search::is_search(triple, std::slice::from_ref(triple))
+            || self.is_spatial(triple)
+        {
+            return Ok(None);
+        }
+        let Some(scan) = self.scan_pattern(triple) else {
+            return Ok(None);
+        };
+        let Some(bounded) = ranges::bounded(filter, &self.snapshot) else {
+            return Ok(None);
+        };
+        let Some(component) = (0..3).find(|&c| scan.slots[c].is_var(&bounded.variable)) else {
+            return Ok(None);
+        };
+        if scan.repeats_variable()
+            || scan.merged()
+            || !matches!(scan.slots[3], Slot::Const(_))
+            || !counts_rows(aggregate, &scan)
+        {
+            return Ok(None);
+        }
+        let permutation = scan.permutation_for(Some(&bounded.variable));
+        if scan.first_free(permutation) != Some(component) {
+            return Ok(None);
+        }
+        let start = Instant::now();
+        let pattern = scan.quad_pattern();
+        let mut count = 0u64;
+        for &(low, high) in &bounded.exact {
+            let Some(n) =
+                self.snapshot
+                    .count_range_in(self.model, &pattern, permutation, low, high)
+            else {
+                return Ok(None);
+            };
+            count += n;
+        }
+        let mut checked = 0;
+        if !bounded.checked.is_empty() {
+            let rows = self.scan_ranges(&scan, permutation, &bounded.checked)?;
+            checked = rows.table.len();
+            count += self.filter(rows, filter)?.table.len() as u64;
+        }
+        if self.trace.is_some() {
+            let detail = format!(
+                "{triple} under {filter}: {} ranges counted by the index, {checked} values in {} more decided by the filter",
+                bounded.exact.len(),
+                bounded.checked.len()
+            );
+            self.note("range count", detail, Some(1), 1, start);
+        }
+        Ok(Some(count))
     }
 
     /// GROUP BY over a cross product: (filters over) a join of two patterns that share no
@@ -4805,6 +5249,9 @@ impl<'a> Context<'a> {
         }
         let width = plans.len();
         let table = &solutions.table;
+        // The numbers found, held while the rows are added up (and kept after only while
+        // few): charged, and a refusal ends the query at its next check.
+        let mut working = nrese_exec::Reservation::new(&*self.budget);
         // Every id's number, found once per query: the chunks of a cross product
         // ([`Self::group_crossed`]) share their values.
         for plan in &plans {
@@ -4825,14 +5272,18 @@ impl<'a> Context<'a> {
                 }
             }
             let missing: Vec<(u64, usize)> = missing.into_iter().collect();
+            let entry = 2 * std::mem::size_of::<(u64, Number)>() + 16;
+            if let Err(exceeded) = working.charge(missing.len() * entry) {
+                if self.overdrawn.get().is_none() {
+                    self.overdrawn.set(Some(exceeded));
+                }
+                return None;
+            }
             let number = |aggregator: &Aggregator<'_>, row: usize| {
                 let binding = aggregator.binding(solutions, row);
                 match aggregator.evaluator.eval(expr, &binding) {
                     None => Number::Error,
-                    Some(term) => match Numeric::of(&Value::of(&term)) {
-                        Some(number) => Number::Value(number),
-                        None => Number::Other,
-                    },
+                    Some(term) => number_of(&term),
                 }
             };
             let found: Vec<(u64, Number)> = if missing.len() < 2 * PARALLEL_EXPRESSION_ROWS {
@@ -4976,6 +5427,8 @@ impl<'a> Context<'a> {
         variables: &[Variable],
         aggregates: &[(Variable, AggregateExpression)],
     ) -> NativeResult<Solutions> {
+        // Per row: its keys' copy, its group and its place in the group's members.
+        let _working = self.working(solutions.table.len() * (4 + 8 * variables.len() + 8))?;
         let key_table = if variables.is_empty() {
             IdTable::from_rows(0, std::iter::repeat_n(&[][..], solutions.table.len()))
         } else {
@@ -5006,10 +5459,10 @@ impl<'a> Context<'a> {
         let values = match one_pass {
             Some(values) => values,
             None => {
-                let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
-                for (row, &group) in groups.group_of.iter().enumerate() {
-                    members[group as usize].push(row);
-                }
+                let members = nrese_exec::group::Members::of(
+                    groups.group_of.iter().map(|&g| g as usize),
+                    group_count,
+                );
                 self.aggregate_groups(&solutions, &members, aggregates)?
             }
         };
@@ -5458,6 +5911,25 @@ fn sorted_columns(scan: &ScanPattern, permutation: Permutation, vars: &[Variable
         }
     }
     sorted
+}
+
+/// The heap a term holds beyond its own size, about: its strings.
+fn term_heap_bytes(term: &Term) -> usize {
+    match term {
+        Term::NamedNode(node) => node.as_str().len(),
+        Term::BlankNode(node) => node.as_str().len(),
+        Term::Literal(literal) => {
+            literal.value().len()
+                + literal.language().map_or(0, str::len)
+                + literal.datatype().as_str().len()
+        }
+        Term::Triple(triple) => {
+            std::mem::size_of::<nrese_rdf::Triple>()
+                + term_heap_bytes(&triple.subject.clone().into())
+                + triple.predicate.as_str().len()
+                + term_heap_bytes(&triple.object)
+        }
+    }
 }
 
 fn triple_variables(triple: &TriplePattern) -> Vec<Variable> {

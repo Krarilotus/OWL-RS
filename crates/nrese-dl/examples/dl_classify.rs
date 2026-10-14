@@ -24,7 +24,10 @@
 //!   --expand-at-most N    spell `≤ n` out as clauses up to this `n` (else at-most atoms)
 //!   --cautious-lower-bound  the lower bound's context core with Strategy::Cautious
 //!   --eager-lower-bound     ... with Strategy::Eager
+//!   --functional-lower-bound  ... with Strategy::Functional (Eager where merges may be)
 //!   --equality            the context core takes functional properties (its Eq rule)
+//!   --equality-certain    ... merging on certain atoms only
+//!   --functional-route    try the Functional strategy with certain merges first (off)
 //!   --max-join N          the most conclusions one context-core join may make
 //!   --max-join-steps N    the most steps one context-core Pred join may take
 //!   --clauses             print the DL-clauses with more than one head atom, then stop
@@ -119,8 +122,16 @@ fn args() -> Result<Args, String> {
                 a.options.lower_bound_strategy = nrese_dl::context::Strategy::Cautious;
             }
             "--equality" => a.options.equality = true,
+            "--equality-certain" => {
+                a.options.equality = true;
+                a.options.certain_merges = true;
+            }
+            "--functional-route" => a.options.functional_route = true,
             "--eager-lower-bound" => {
                 a.options.lower_bound_strategy = nrese_dl::context::Strategy::Eager;
+            }
+            "--functional-lower-bound" => {
+                a.options.lower_bound_strategy = nrese_dl::context::Strategy::Functional;
             }
             "--max-join" => a.options.max_join = count(number("--max-join")?),
             "--max-join-steps" => a.options.max_join_steps = count(number("--max-join-steps")?),

@@ -57,7 +57,10 @@ pub(crate) fn hints(expr: &Expression, snapshot: &Snapshot) -> Vec<Hint> {
         .filter_map(|(variable, bounds)| {
             Some(Hint {
                 variable,
-                ranges: ranges(bounds?)?,
+                ranges: ranges(bounds?)?
+                    .into_iter()
+                    .map(|(range, _)| range)
+                    .collect(),
             })
         })
         .collect()
@@ -187,9 +190,12 @@ fn collect<'e>(
     }
 }
 
-fn ranges(bounds: Bounds) -> Option<Vec<(TermId, TermId)>> {
+/// The id ranges of `bounds`, each with whether the comparisons hold for every id in it
+/// (exact: inline integers and integer-derived literals between the bounds, inline dates
+/// of the years) or only may (decimals, typed literals, dates within a day of a bound).
+fn ranges(bounds: Bounds) -> Option<Vec<((TermId, TermId), bool)>> {
     let kind = |k: TermKind| TermId::kind_range(k);
-    let typed = kind(TermKind::TypedLiteral);
+    let typed = (kind(TermKind::TypedLiteral), false);
     Some(match bounds.domain {
         Domain::Integer => {
             let (min, max) = kind(TermKind::Integer);
@@ -199,18 +205,27 @@ fn ranges(bounds: Bounds) -> Option<Vec<(TermId, TermId)>> {
             let high = bounds.high.map_or(max, |h| {
                 TermId::inline_integer(h).unwrap_or(if h < 0 { min } else { max })
             });
+            // A bound past the inline integers on the far side is clamped to their last
+            // (or first) value, which it excludes: then the range is wider than the values.
+            let exact = bounds
+                .low
+                .is_none_or(|l| l < 0 || TermId::inline_integer(l).is_some())
+                && bounds
+                    .high
+                    .is_none_or(|h| h > 0 || TermId::inline_integer(h).is_some());
             let mut ranges = Vec::new();
             if low <= high {
-                ranges.push((low, high));
+                ranges.push(((low, high), exact));
             }
-            ranges.push(kind(TermKind::Decimal));
+            ranges.push((kind(TermKind::Decimal), false));
             ranges.push(typed);
-            // Integer-derived literals (xsd:int, ...), inline and ordered by value.
+            // Integer-derived literals (xsd:int, ...), inline and ordered by value; bounds
+            // past their inline range are clamped to it, where no value lies.
             if let Some(range) = TermId::derived_integer_range(
                 bounds.low.unwrap_or(i64::MIN),
                 bounds.high.unwrap_or(i64::MAX),
             ) {
-                ranges.push(range);
+                ranges.push((range, true));
             }
             ranges
         }
@@ -220,7 +235,7 @@ fn ranges(bounds: Bounds) -> Option<Vec<(TermId, TermId)>> {
             let high = bounds.high_id.unwrap_or(max);
             let mut ranges = Vec::new();
             if low <= high {
-                ranges.push((low, high));
+                ranges.push(((low, high), false));
             }
             ranges.push(typed);
             ranges
@@ -234,11 +249,153 @@ fn ranges(bounds: Bounds) -> Option<Vec<(TermId, TermId)>> {
                 for kind in [TermKind::Date, TermKind::DateTime] {
                     let (first, last) = TermId::year_range(kind, low as u32, high as u32)
                         .expect("a date kind and inline years");
-                    ranges.push((first, last));
+                    ranges.push(((first, last), true));
                 }
             }
             ranges.push(typed);
             ranges
         }
     })
+}
+
+/// A FILTER whose every conjunct bounds one variable to id ranges (comparisons with a
+/// constant as [`hints`] reads them, `isIRI`, `isBlank`, `isLiteral`): the ranges where it
+/// holds for every id (`exact`) and those where it holds for some (`checked`, decided per
+/// value).
+pub(crate) struct Bounded {
+    pub(crate) variable: Variable,
+    pub(crate) exact: Vec<(TermId, TermId)>,
+    pub(crate) checked: Vec<(TermId, TermId)>,
+}
+
+/// `expr` as [`Bounded`], if it is one.
+pub(crate) fn bounded(expr: &Expression, snapshot: &Snapshot) -> Option<Bounded> {
+    let mut conjuncts = Vec::new();
+    super::pushdown::conjuncts_of(expr, &mut conjuncts);
+    let mut variable: Option<Variable> = None;
+    let same = |variable: &mut Option<Variable>, v: &Variable| -> bool {
+        variable.get_or_insert_with(|| v.clone()) == v
+    };
+    let mut kinds: Option<Vec<(TermId, TermId)>> = None;
+    let mut compared: Vec<(Variable, Option<Bounds>)> = Vec::new();
+    // A language test holds for language-tagged strings only: their range, decided by
+    // the filter (Sparqloscope 096: none among 30.5 M names, a pass over every term).
+    let mut language = false;
+    for conjunct in conjuncts {
+        if let Some(v) = language_test(conjunct) {
+            if !same(&mut variable, v) {
+                return None;
+            }
+            language = true;
+            continue;
+        }
+        if let Expression::FunctionCall(function, args) = conjunct
+            && let [Expression::Variable(v)] = args.as_slice()
+            && let Some(ranges) = kind_ranges(function)
+        {
+            if !same(&mut variable, v) {
+                return None;
+            }
+            kinds = Some(match kinds {
+                None => ranges,
+                Some(before) => intersection(&before, &ranges),
+            });
+            continue;
+        }
+        let mut alone = Vec::new();
+        collect(conjunct, snapshot, &mut alone);
+        let [(v, Some(_))] = alone.as_slice() else {
+            return None;
+        };
+        if !same(&mut variable, v) {
+            return None;
+        }
+        collect(conjunct, snapshot, &mut compared);
+    }
+    let variable = variable?;
+    let (mut exact, mut checked) = (Vec::new(), Vec::new());
+    match compared.pop() {
+        None if language => {
+            let tagged = [TermId::kind_range(TermKind::LangString)];
+            checked = match &kinds {
+                Some(kinds) => intersection(kinds, &tagged),
+                None => tagged.to_vec(),
+            };
+        }
+        None => exact = kinds?,
+        Some((_, bounds)) => {
+            for (range, holds) in ranges(bounds?)? {
+                let parts = match &kinds {
+                    Some(kinds) => intersection(kinds, &[range]),
+                    None => vec![range],
+                };
+                match holds {
+                    true => exact.extend(parts),
+                    false => checked.extend(parts),
+                }
+            }
+        }
+    }
+    if language {
+        // Only the language-tagged strings among them, every one decided by the filter.
+        let tagged = [TermId::kind_range(TermKind::LangString)];
+        checked = intersection(&checked, &tagged);
+        checked.extend(intersection(&exact, &tagged));
+        checked.sort_unstable();
+        exact.clear();
+    }
+    Some(Bounded {
+        variable,
+        exact,
+        checked,
+    })
+}
+
+/// The variable of `LANG(?v) = "tag"` (either way round, a non-empty simple literal tag).
+fn language_test(conjunct: &Expression) -> Option<&Variable> {
+    let Expression::Equal(a, b) = conjunct else {
+        return None;
+    };
+    let (call, tag) = match (&**a, &**b) {
+        (call @ Expression::FunctionCall(..), Expression::Literal(tag))
+        | (Expression::Literal(tag), call @ Expression::FunctionCall(..)) => (call, tag),
+        _ => return None,
+    };
+    let Expression::FunctionCall(Function::Lang, args) = call else {
+        return None;
+    };
+    let [Expression::Variable(v)] = args.as_slice() else {
+        return None;
+    };
+    (tag.datatype() == xsd::STRING && !tag.value().is_empty()).then_some(v)
+}
+
+/// The ids for which the term-kind test `function` holds: literals are the kinds from
+/// simple strings to typed literals and the integer-derived ones (a triple term is none).
+fn kind_ranges(function: &Function) -> Option<Vec<(TermId, TermId)>> {
+    let kind = |k: TermKind| TermId::kind_range(k);
+    Some(match function {
+        Function::IsIri => vec![kind(TermKind::Iri)],
+        Function::IsBlank => vec![kind(TermKind::BlankNode)],
+        Function::IsLiteral => vec![
+            (kind(TermKind::String).0, kind(TermKind::TypedLiteral).1),
+            kind(TermKind::DerivedInteger),
+        ],
+        _ => return None,
+    })
+}
+
+/// The ids in both lists of inclusive ranges, each sorted and disjoint.
+fn intersection(a: &[(TermId, TermId)], b: &[(TermId, TermId)]) -> Vec<(TermId, TermId)> {
+    let mut out = Vec::new();
+    for &(a_low, a_high) in a {
+        for &(b_low, b_high) in b {
+            let (low, high) = (a_low.max(b_low), a_high.min(b_high));
+            if low <= high {
+                out.push((low, high));
+            }
+        }
+    }
+    out.sort_unstable();
+    out
 }

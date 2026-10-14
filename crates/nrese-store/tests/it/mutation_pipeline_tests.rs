@@ -2,7 +2,7 @@ use crate::support::Writes;
 use std::sync::Arc;
 
 use crate::support::in_memory_store_config;
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_store::{
     MutationCommand, MutationError, MutationPipeline, MutationTicket, SparqlUpdateRequest,
     StoreService,
@@ -10,10 +10,7 @@ use nrese_store::{
 
 fn pipeline(mode: ReasoningMode) -> MutationPipeline {
     let store = StoreService::new(in_memory_store_config()).expect("store");
-    MutationPipeline::new(
-        Arc::new(store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),
-    )
+    MutationPipeline::new(Arc::new(store), ReasonerConfig::for_mode(mode))
 }
 
 fn insert(triple: &str) -> MutationCommand {
@@ -470,9 +467,7 @@ fn reasoning_state_tracks_whether_inferences_are_current() {
         // A v2 commit keeps it.
         let pipeline = MutationPipeline::new(
             Arc::clone(&store),
-            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-                ReasoningMode::Owl2Rl,
-            ))),
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
         );
         pipeline
             .apply(
@@ -535,9 +530,7 @@ fn inconsistent_baselines_are_quarantined_until_repaired() {
     );
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     );
     // An unrelated consistent write is accepted; the store stays in quarantine.
     pipeline
@@ -584,9 +577,7 @@ fn self_difference_is_rejected_on_commit() {
     let store = Arc::new(StoreService::new(nrese_store::StoreConfig::in_memory()).expect("store"));
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     );
     let result = pipeline.apply(
         insert(&format!(
@@ -608,9 +599,7 @@ fn unusable_list_axioms_are_reported() {
     let store = Arc::new(StoreService::new(nrese_store::StoreConfig::in_memory()).expect("store"));
     let plain = MutationPipeline::new(
         Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Disabled,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Disabled),
     );
     let cyclic = format!(
         "<{EX}D> <{OWL}unionOf> <{EX}c> . <{EX}c> <{RDF}first> <{EX}A> . <{EX}c> <{RDF}rest> <{EX}c> ."
@@ -648,9 +637,7 @@ fn unusable_list_axioms_are_reported() {
 
     let owl = MutationPipeline::new(
         Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     );
     let run = |data: &str| {
         owl.apply(
@@ -686,9 +673,7 @@ fn cancelled_reasoning_commits_stop_promptly_and_change_nothing() {
     let store = Arc::new(StoreService::new(nrese_store::StoreConfig::in_memory()).expect("store"));
     let plain = MutationPipeline::new(
         Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Disabled,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Disabled),
     );
     // A class chain C0 ⊑ … ⊑ C100 and 10,000 instances of D: linking D into the chain
     // derives a million types.
@@ -708,9 +693,7 @@ fn cancelled_reasoning_commits_stop_promptly_and_change_nothing() {
         .expect("rematerialise");
     let owl = MutationPipeline::new(
         Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     );
     let count = || {
         let result = store
@@ -835,9 +818,7 @@ fn unnamed_union_memberships_are_left_out_on_request() {
             .unwrap();
         let pipeline = MutationPipeline::new(
             std::sync::Arc::clone(&store),
-            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-                ReasoningMode::Owl2Rl,
-            ))),
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
         );
         pipeline
             .apply(
@@ -932,9 +913,7 @@ fn reviving_a_hidden_class_rejects_its_new_violation_before_commit() {
     );
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     );
     let prefixes = "PREFIX ex: <http://example.com/> PREFIX owl: <http://www.w3.org/2002/07/owl#> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ";
     pipeline
@@ -1006,12 +985,7 @@ fn hidden_range_pipeline(extra: &str, shacl: bool) -> MutationPipeline {
     store
         .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
         .unwrap();
-    MutationPipeline::new(
-        store,
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
-    )
+    MutationPipeline::new(store, ReasonerConfig::for_mode(ReasoningMode::Owl2Rl))
 }
 
 fn revive_hidden_range(consumer: &str) -> MutationCommand {
@@ -1095,9 +1069,7 @@ fn dl_commits_a_revival_and_split_with_its_final_closure() {
     let baseline = hidden_range_pipeline("", false);
     let pipeline = MutationPipeline::new(
         Arc::clone(baseline.store()),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Dl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
     );
     let before = pipeline.store().current_revision();
     pipeline
@@ -1314,10 +1286,7 @@ fn materialisation_by_representatives_equals_replication() {
 fn a_retired_pipeline_leaves_the_new_closure_alone() {
     let store = Arc::new(StoreService::new(in_memory_store_config()).unwrap());
     let config = |mode| ReasonerConfig::for_mode(mode);
-    let old = MutationPipeline::new(
-        Arc::clone(&store),
-        Arc::new(ReasonerService::new(config(ReasoningMode::Rdfs))),
-    );
+    let old = MutationPipeline::new(Arc::clone(&store), config(ReasoningMode::Rdfs));
     let update = |pipeline: &MutationPipeline, text: &str| {
         pipeline.apply(
             MutationCommand::Update(SparqlUpdateRequest::new(text)),
@@ -1330,10 +1299,7 @@ fn a_retired_pipeline_leaves_the_new_closure_alone() {
         "INSERT DATA { <urn:p> <http://www.w3.org/2002/07/owl#inverseOf> <urn:q> . <urn:a> <urn:p> <urn:b> }",
     )
     .unwrap();
-    let new = MutationPipeline::new(
-        Arc::clone(&store),
-        Arc::new(ReasonerService::new(config(ReasoningMode::Owl2Rl))),
-    );
+    let new = MutationPipeline::new(Arc::clone(&store), config(ReasoningMode::Owl2Rl));
     old.retire();
     update(&new, "INSERT DATA { <urn:c> <urn:p> <urn:d> }").unwrap();
     let owl = config(ReasoningMode::Owl2Rl)
@@ -1365,7 +1331,7 @@ fn a_retired_pipeline_leaves_the_new_closure_alone() {
 #[test]
 fn a_retired_pipeline_refuses_writes() {
     let store = Arc::new(StoreService::new(in_memory_store_config()).unwrap());
-    let reasoner = |mode| Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode)));
+    let reasoner = |mode| ReasonerConfig::for_mode(mode);
     let old = MutationPipeline::new(Arc::clone(&store), reasoner(ReasoningMode::Rdfs));
     let update = |pipeline: &MutationPipeline, text: &str| {
         pipeline.apply(

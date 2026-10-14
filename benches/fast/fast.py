@@ -46,7 +46,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import cases as cases_registry, hosts, manifest  # noqa: E402
-from suitekit.runtime import scope_argv  # noqa: E402
+from suitekit.runtime import end_scope, scope_argv  # noqa: E402
 from suitekit.compare import (KEPT_POINTS, UNSTABLE_PEAK, bootstrap_ratio, client_throughput,  # noqa: E402,F401
                               compare_reports, counter_changes, load_report, peak_spread, pooled,
                               process_peak, series_ratios, spread, statistic, thin)
@@ -58,7 +58,7 @@ BENCH_VOLUME = hosts.volume("data")
 TARGET_VOLUME = os.environ.get("NRESE_TARGET_VOLUME", f"nrese-target-{ROOT.name}")
 CARGO_VOLUME = "nrese-cargo"
 SCRATCH = ROOT / "tmp" / "fast"
-BASELINES = ROOT / "benches" / "baselines" / "fast"  # the compact records (committed)
+BASELINES = Path(os.environ.get("NRESE_FAST_BASELINES") or ROOT / "benches" / "baselines" / "fast")
 # The full reports, outside git (the same path on the main and the office PC).
 REPORTS = Path(os.environ.get("NRESE_BENCH_REPORTS") or Path.home() / "nrese-bench" / "reports") / "fast"
 CASE_TIMEOUT_S = 900
@@ -193,7 +193,7 @@ def quiet_slot(what: str):
 
 
 def container(name: str, cap_gb: float, command: list[str], env: dict | None = None,
-              timeout: float = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
+              timeout: float | None = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
     """Runs `command` under a memory cap without swap, in the Rust image or natively; (exit
     code, stdout, stderr, wall seconds). Exit 137: killed at the cap."""
     cap_gb = capped(cap_gb)
@@ -218,7 +218,7 @@ def container(name: str, cap_gb: float, command: list[str], env: dict | None = N
 
 
 def process(name: str, cap_gb: float, command: list[str], env: dict | None = None,
-            timeout: float = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
+            timeout: float | None = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
     """`container` natively: the command, its container paths mapped (native_dirs), in a user
     scope capped at `cap_gb` without swap (as Docker's --memory and --memory-swap). A wrapper
     shell in the scope prints the scope's memory.peak after the command (`fast-scope-peak`
@@ -232,17 +232,27 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     argv = [*scope_argv(unit, f"{int(cap_gb * 1024)}m"), "sh", "-c", wrapper, "sh",
             *(native(c, dirs) for c in command)]
     started = time.monotonic()
+    cleanup_error = ""
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
                               errors="replace", env={**ENV, **{k: str(v) for k, v in (env or {}).items()}})
     except subprocess.TimeoutExpired:
-        subprocess.run(["systemctl", "--user", "kill", "--signal=KILL", f"{unit}.scope"], capture_output=True)
-        return 124, "", f"timed out after {timeout} s", time.monotonic() - started
+        done = subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout} s")
+    finally:
+        # Nothing outlives its case: what the scope still holds (a child the command left) goes.
+        try:
+            end_scope(unit)
+        except Exception as error:
+            cleanup_error = f"scope cleanup failed ({unit}): {error}"
+            # Report a secondary cleanup failure without replacing an in-flight exception.
+            print(cleanup_error, file=sys.stderr)
     # The peak first: a record's note is the last line of stderr, the command's own.
     peaks = SCOPE_PEAK.findall(done.stderr)
     err = SCOPE_PEAK.sub("", done.stderr).rstrip("\n")
     err = (f"fast-scope-peak {peaks[-1]}\n" if peaks else "") + err
-    return done.returncode, done.stdout, err, time.monotonic() - started
+    if cleanup_error:
+        err += "\n" + cleanup_error
+    return done.returncode or (1 if cleanup_error else 0), done.stdout, err, time.monotonic() - started
 
 
 def scope_peak_mib(stderr: str) -> int | None:
@@ -252,16 +262,7 @@ def scope_peak_mib(stderr: str) -> int | None:
 
 
 def binaries() -> dict:
-    """The native runtime's binaries: their directory, the source revision a build host
-    states (NRESE_FAST_REVISION), and each one's SHA-256."""
-    target = native_dirs()["/target"]
-    out = {"dir": target.as_posix(), "revision": os.environ.get("NRESE_FAST_REVISION", ""), "sha256": {}}
-    for relative in ("release/examples/perf_lab", "release/examples/tableau_consistency",
-                     "release/examples/context_classify", "release/examples/classify", "release/nrese-server"):
-        path = target / relative
-        if path.is_file():
-            out["sha256"][relative] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return out
+    return manifest.binaries(native_dirs()["/target"], os.environ.get("NRESE_FAST_REVISION", ""))
 
 
 # --- build -----------------------------------------------------------------------------------
@@ -407,8 +408,13 @@ def parse_queries() -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     for old in directory.glob("*.rq"):
         old.unlink()
-    prefix = "PREFIX e: <http://example.org/fast/>\n"
-    queries = {
+    for name, text in parse_query_definitions().items():
+        (directory / f"{name}.rq").write_text("PREFIX e: <http://example.org/fast/>\n" + text + "\n", encoding="utf-8")
+    return directory
+
+
+def parse_query_definitions() -> dict:
+    return {
         "values-5000": "SELECT ?u ?n WHERE { VALUES ?u { " + " ".join(f"e:u{i}" for i in range(5000))
                        + " } ?u e:name ?n }",
         "bgp-1000": "SELECT * WHERE { " + " ".join(f"?x{i} e:follows ?x{i + 1} ." for i in range(1000)) + " }",
@@ -422,9 +428,6 @@ def parse_queries() -> Path:
         "path-alternatives-300": "SELECT ?y WHERE { e:u1 (" + "|".join(f"e:p{i}" for i in range(300)) + ")+ ?y }",
         "expression-depth-120": "SELECT ?v WHERE { ?u e:age ?a BIND(" + "(" * 120 + "?a" + " + 1)" * 120 + " AS ?v) }",
     }
-    for name, text in queries.items():
-        (directory / f"{name}.rq").write_text(prefix + text + "\n", encoding="utf-8")
-    return directory
 
 
 def cache_log(entries: int = 1000, seed: int = 7) -> Path:
@@ -589,6 +592,8 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
     record = {"case": case["name"], "rep": rep, "status": "ok", "notes": []}
     scratch = f"/fast/scratch/{case['name']}"
     repeat = int(case.get("repeat", 1))
+    # Each measured invocation gets the case's wall limit; 0 means unlimited in both runtimes.
+    timeout_s = case.get("timeout_s", CASE_TIMEOUT_S) or None
     result: dict = {}
     if tool == "perf_lab":
         base = ["/target/release/examples/perf_lab", "--label", label, "--routes", "--json", out_json]
@@ -624,7 +629,7 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
                 break
             # The setup (a store on disk) runs once; each repeat is a fresh process opening it.
             shell = (script if index == 0 else "") + " ".join(f"'{c}'" for c in [*command, *entry])
-            code, _, err, w = container(name, case["cap_gb"], ["bash", "-c", shell], case.get("env"))
+            code, _, err, w = container(name, case["cap_gb"], ["bash", "-c", shell], case.get("env"), timeout=timeout_s)
             wall += w
             path = SCRATCH / f"{case['name']}.json"
             if not path.exists():
@@ -654,7 +659,7 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         envelope = str(int(case["cap_gb"] * 1024))
         command = ["/target/release/examples/tableau_consistency", "--timeout", timeout,
                    "--memory-mib", envelope, *files]
-        code, out, err, wall = container(name, case["cap_gb"], command)
+        code, out, err, wall = container(name, case["cap_gb"], command, timeout=timeout_s)
         rows = parse_tableau(out)
         # The tool names each file as it was given: natively, by its host path.
         named = native(data) if RUNTIME == "native" else data
@@ -679,7 +684,7 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         out_tsv = f"/out/{case['name']}.tsv"
         command = ["bash", "-c", f"/target/release/examples/{binary} --out {out_tsv} --repeat {repeat} {data}"
                                  f" && sha256sum {out_tsv} | cut -c1-16 && wc -l < {out_tsv}"]
-        code, out, err, wall = container(name, case["cap_gb"], command)
+        code, out, err, wall = container(name, case["cap_gb"], command, timeout=timeout_s)
         result = profile_line(err, out)
         lines = out.split()
         if code == 0 and len(lines) >= 2:
@@ -977,6 +982,35 @@ def samples(case: dict, result: dict) -> dict:
     return {"_": [value]} if value is not None else {}
 
 
+def case_manifest(catalog: list[dict], root: Path = ROOT) -> dict:
+    """Existing definitions and intended series, without preparing data or writing queries."""
+    series, queries = {}, {}
+    for case in catalog:
+        name, query = case["name"], case.get("queries", "")
+        if case.get("sweep"):
+            series[name] = [" ".join(s) or "-" for s in case["sweep"]]
+        elif case.get("metric") == "sum_p50_ms":
+            if query.startswith("@vectors"):
+                series[name] = [f"knn-{q}" for q in range(5)]
+            elif query == "@parse":
+                series[name] = list(parse_query_definitions())
+            else:
+                directory = queries_path(case, {}) if not query.startswith("@cache-log") else None
+                paths = sorted((root / directory.removeprefix("/src/")).glob("*.rq")) if directory else []
+                series[name] = [p.stem for p in paths]
+                queries.update({p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths})
+        elif case.get("metric") == "cold_ms":
+            modes = case.get("page_cache", ["warm"])
+            series[name] = modes if len(modes) > 1 else ["_"]
+        elif "--clients" in case.get("args", []):
+            levels = case["args"][case["args"].index("--clients") + 1].split(",")
+            series[name] = [f"{n} clients p99" for n in levels] if len(levels) > 1 else ["_"]
+        elif case.get("tool", "perf_lab") == "perf_lab":
+            series[name] = ["_"]
+    fingerprint = hashlib.sha256(json.dumps([catalog, queries, series], sort_keys=True).encode()).hexdigest()
+    return {"fingerprint": fingerprint, "series": series}
+
+
 def vector_recall(case: dict, expect: dict) -> float:
     found = 0
     for q in range(5):
@@ -990,6 +1024,15 @@ def vector_recall(case: dict, expect: dict) -> float:
 
 # --- run -------------------------------------------------------------------------------------
 
+def not_as_expected(records: list[dict], off_route_ok: bool = False) -> list[dict]:
+    """The runs that make `run` fail: each whose status isn't its case's expected outcome,
+    except, for an A/B's base (`off_route_ok`), a case off its expected route: measured
+    without the operator the branch brings. Failed, wrong and missing runs always count."""
+    tolerated = {"off-route"} if off_route_ok else set()
+    return [r for r in records
+            if r["status"] != r.get("expected_outcome", "ok") and r["status"] not in tolerated]
+
+
 def run(args) -> int:
     if RUNTIME == "native":
         try:
@@ -999,7 +1042,8 @@ def run(args) -> int:
     elif lacking := hosts.lacking(["docker"]):
         sys.exit(f"this host lacks {', '.join(lacking)} (benches/hosts.toml): NRESE_FAST_RUNTIME=native runs "
                  "the cases as host processes")
-    cases = select(load_cases(), args)
+    catalog = load_cases()
+    cases = select(catalog, args)
     label = args.label or (manifest.git(ROOT).get("commit") or "nrese")[:8]
     started = datetime.datetime.now()
     # The full report outside git; the repository keeps its compact record (README, "What is kept").
@@ -1008,7 +1052,8 @@ def run(args) -> int:
     out = (Path(args.out) if args.out else REPORTS / f"{started:%Y-%m-%d}-{label}.json").resolve()
     report = {"label": label, "started": started.isoformat(timespec="seconds"),
               "git": manifest.git(ROOT), "machine": manifest.machine(RUNTIME), "runtime": RUNTIME,
-              "reps": args.reps, "records": []}
+              "reps": args.reps, "planned_cases": [c["name"] for c in cases],
+              "all_cases": [c["name"] for c in catalog], "case_manifest": case_manifest(catalog), "records": []}
     if RUNTIME == "native":
         # What the binaries are: they come from a build host, not from this checkout.
         report["binaries"] = binaries()
@@ -1048,11 +1093,18 @@ def run(args) -> int:
                 print(f"      past its limit ({', '.join(f'{k} = {x}' for k, x in f['settings'].items())}): {f['status']}, "
                       f"metric {f['metric']}, peak {f['peak_mib']} MiB")
             out.write_text(json.dumps(report, indent=1), encoding="utf-8")
+    report["git_finished"] = manifest.git(ROOT)
+    if RUNTIME == "native":
+        report["binaries_finished"] = binaries()
     report["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
     report["duration_s"] = round((datetime.datetime.now() - started).total_seconds(), 1)
     out.write_text(json.dumps(report, indent=1), encoding="utf-8")
     kept = write_compact(out, BASELINES / out.name)
-    bad = [r for r in report["records"] if r["status"] != r.get("expected_outcome", "ok")]
+    bad = not_as_expected(report["records"], getattr(args, "off_route_ok", False))
+    # A run of nothing measured nothing (an A/B's side whose binary refused every case).
+    if not report["records"]:
+        print("no case ran")
+        return 1
     # Every case's verdict, the known issues included: an expected limit is still no answer.
     by_verdict: dict[str, set] = {}
     for r in report["records"]:
@@ -1204,6 +1256,10 @@ def main() -> int:
             s.add_argument("--reps", type=int, default=2)
             s.add_argument("--label")
             s.add_argument("--out")
+            s.add_argument("--off-route-ok", action="store_true",
+                           help="an A/B's base: a case off its expected route (an operator the base "
+                                "hasn't) is a measured run, not a failure; failed, wrong or missing "
+                                "runs still are")
         if name == "compete":
             s.add_argument("--systems")
             s.add_argument("--runs", type=int, default=1)

@@ -103,18 +103,22 @@ impl StoreService {
         runtime: std::sync::Arc<crate::Runtime>,
     ) -> StoreResult<Self> {
         config.validate()?;
-        nrese_engine::set_index_encoding(config.index_encoding);
-        nrese_engine::set_vocabulary_encoding(config.vocabulary);
         // Only switched off: on leaves what the process was started with (an operator's
         // `MIMALLOC_ALLOW_THP=0` switches them off the same way).
         if !config.huge_pages {
             nrese_exec::memory::set_transparent_huge_pages(false);
         }
         nrese_engine::memory::set_release_between_rounds(config.reasoning_release);
+        // The encodings are this store's: another store of the process may differ.
+        let defaults = EngineConfig {
+            index_encoding: config.index_encoding,
+            inferred_merge_wave_keys: config.inferred_merge_wave_keys,
+            vocabulary: config.vocabulary,
+            ..EngineConfig::default()
+        };
         let engine = match config.mode {
-            StoreMode::InMemory => Engine::new(EngineConfig::default())?,
+            StoreMode::InMemory => Engine::new(defaults)?,
             StoreMode::OnDisk => {
-                let defaults = EngineConfig::default();
                 let engine_config = EngineConfig {
                     durability: nrese_engine::DurabilityConfig {
                         verify_on_open: config.verify_on_open,
@@ -374,7 +378,7 @@ impl StoreService {
     }
 
     /// What this store's updates are evaluated with.
-    fn update_context<'a>(
+    pub(crate) fn update_context<'a>(
         &'a self,
         cancellation: &'a CancellationToken,
     ) -> crate::mutation::command::UpdateContext<'a> {
@@ -1492,7 +1496,7 @@ impl StoreService {
         let closure =
             crate::reasoning::materialise_until(&program, rematerialisation.base(), &stop)
                 .map_err(|_| stopped())?;
-        let inferred = closure.inferred.len() as u64;
+        let inferred = closure.inferred_len() as u64;
         let base = rematerialisation.base();
         let reported = crate::reasoning::MaterialisationReport::default()
             .with_diagnostics(&closure.diagnostics, &|id| {
@@ -1512,7 +1516,9 @@ impl StoreService {
         // heap's peak, is built (as between the reasoner's rounds).
         nrese_engine::memory::release_between_rounds();
         nrese_exec::heap::phase("store: inferred stack");
-        let summary = rematerialisation.finish(closure.inferred)?;
+        let stacking = std::time::Instant::now();
+        let (summary, stack_parts) = rematerialisation.finish_runs_timed(closure.inferred)?;
+        let stack = stacking.elapsed();
         nrese_exec::heap::phase("store: done");
         nrese_engine::memory::release_all();
         self.record_reasoning(crate::ReasoningState::of_with(
@@ -1551,6 +1557,8 @@ impl StoreService {
             rounds: closure.rounds,
             elapsed: started.elapsed(),
             phases: closure.phases,
+            stack,
+            stack_parts,
             ..reported
         };
         *self

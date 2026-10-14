@@ -25,10 +25,11 @@ L4  nrese-server                  HTTP transport, auth, policy, posture, UI host
 L3  nrese-store                   application service: operations, mutation pipeline, validation gates, backup
 L2  nrese-sparql  nrese-reasoner  nrese-shacl
                                   query/update evaluation · materialisation & consistency · shape validation
-L1  nrese-engine  nrese-exec  nrese-vector  nrese-owl  nrese-dl
+L1  nrese-engine  nrese-exec  nrese-vector  nrese-geo  nrese-owl  nrese-dl
                                   term dictionary, quad indexes, MVCC snapshots, transactions, durability
                                   · id tables, joins, grouping, closures, memory budgets · vector indexes
-                                  · the OWL 2 structural model and normaliser · the DL engines
+                                  · geometries, their relations and index · the OWL 2 structural model
+                                  and normaliser · the DL engines
 L0  crates/rdf/: nrese-rdf  nrese-rdf-io  nrese-sparql-syntax  nrese-sparql-results  nrese-xsd  nrese-json
                                   the RDF model, syntaxes, SPARQL syntax and results, XSD and OWL datatypes
 ```
@@ -40,9 +41,10 @@ Outside the layer model: `nrese-sparql-reference` (the SPARQL evaluator written 
 | Crate | Owns | Must not own |
 |---|---|---|
 | `crates/rdf/` | The RDF model (`nrese-rdf`: IRIs, terms, quads, canonicalisation), every RDF syntax (`nrese-rdf-io`), SPARQL syntax and algebra (`nrese-sparql-syntax`), the results formats (`nrese-sparql-results`), XSD values and the OWL 2 datatype map (`nrese-xsd`), JSON (`nrese-json`). | Storage, evaluation, reasoning. |
-| `nrese-engine` | Term model and dictionary encoding (`TermId`), quad indexes in all needed permutations, LSM runs and compaction, MVCC snapshots, the commit protocol, the write-ahead log and checkpoints, bulk load, cardinality statistics. | SPARQL semantics, RDF syntax parsing, validation or reasoning rules, HTTP. |
+| `nrese-engine` | Term model and dictionary encoding (`TermId`), quad indexes in all needed permutations, LSM runs and compaction, MVCC snapshots, the commit protocol, the write-ahead log and checkpoints, bulk load, cardinality statistics; the indexes derived from the dictionary (full text, vector literals, geometry literals by datatype). | SPARQL semantics, RDF syntax parsing, validation or reasoning rules, HTTP. |
 | `nrese-exec` | Id-level tables, joins, grouping, graph closures and capacity accounting (the server's budget, each request's envelope) with its one RAII reservation type; the DL batch-width handle (`Workers`). It never decodes a term and depends on no NRESE crate. | Term values, storage, SPARQL or rule semantics; server-wide admission policy. |
 | `nrese-vector` | Vector literals' distances and indexes (exact scan, HNSW). | Terms, storage, SPARQL. |
+| `nrese-geo` | Geometries (GeoSPARQL 1.1): the geometry literals read (WKT, GeoJSON, GML), the topological relations and what bounding boxes decide about them, the index of a store's geometry literals by their boxes. | Terms, storage, SPARQL; the functions that construct and measure geometries (`nrese-sparql`'s `geof:`). |
 | `nrese-owl` | The OWL 2 structural model read from RDF or the functional syntax, its diagnostics, and the normaliser into DL-clauses (automata for role inclusions, lazy definitions). | Search, storage, rule evaluation. |
 | `nrese-dl` | The OWL 2 DL engines over `nrese-owl`'s clauses: context saturation, tableau search and immutable compiled probes with fresh search state, portfolio, classification and realisation. | Storage, SPARQL, HTTP; when to run (the store and reasoner decide), query-to-assumption adaptation. |
 | `nrese-sparql` | SPARQL 1.1 query and update evaluation over an engine snapshot: the native executor (the only one) and its planner (EXPLAIN), the result cache of plan parts (its keys are plan parts, its entries id tables, and only the executor knows what a part's result depends on), query cancellation, dataset specification (`FROM`, protocol `default-graph-uri`), update-to-delta planning, result serialisation. | Commit decisions, validation, persistence, HTTP; the cache's instance and budget (the store's, as with the query memory budget). |
@@ -118,7 +120,7 @@ These apply to every change. Reviews check them explicitly.
 
 - **Functional core, imperative shell.** Planning, validation, reasoning rules, shape checks and access-plan selection are pure functions of their inputs (snapshot, delta, config) that return values. Side effects — locking, I/O, publishing a version — are confined to a thin shell: the engine's commit path, the WAL writer, the HTTP adapters.
 - **Immutable data, explicit versions.** Snapshots, runs, compiled rule sets and compiled shapes are immutable once built and shared via `Arc`. Change means building a new value, never mutating a shared one.
-- **Explicit data flow.** Inputs arrive as parameters and results leave as return values. No hidden globals, no ambient configuration lookups (`std::env::var` only in `nrese-server/src/config/`).
+- **Explicit data flow.** Inputs arrive as parameters and results leave as return values. No hidden globals, no ambient configuration lookups (`std::env::var` only in `nrese-server/src/config/`). A store's settings are its own (`EngineConfig`, `StoreConfig`): two stores of one process may differ. What belongs to the process is set by the binary, once, and named so: its memory limit (`nrese_exec::memory::set_process_limit`) and the allocator's behaviour (`nrese_engine::memory::set_release`, `set_release_between_rounds`, `nrese_exec::memory::set_transparent_huge_pages`).
 - **Parse, don't guess.** External input (config, requests) is parsed into typed values at the edge. Unknown values are errors, never silent defaults.
 - **Small modules with one reason to change.** Split a file before adding a second responsibility, not after.
 

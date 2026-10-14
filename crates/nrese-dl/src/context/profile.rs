@@ -50,6 +50,12 @@ pub struct Profile {
     pub subset_checks: u64,
     /// Merges of neighbour terms the Eq rule made.
     pub merges: u64,
+    /// Merges whose premises are unconditional; copies along conditional merges.
+    pub merges_certain: u64,
+    pub eq_conditional: u64,
+    /// Contexts with any merge, and with a conditional merge.
+    pub contexts_merged: u64,
+    pub contexts_merged_conditional: u64,
     /// Contexts where a merge of `x` with a neighbour was due and not made, and where a
     /// Pred join was left past its step budget.
     pub contexts_unmerged: u64,
@@ -80,6 +86,8 @@ impl Profile {
         self.slots += c.slots;
         self.equality_literals_generated += c.eq;
         self.merges += c.merges;
+        self.merges_certain += c.merges_certain;
+        self.eq_conditional += c.eq_conditional;
         self.subset_checks += c.subset_checks;
         self.batches += c.batches;
         self.budget_checks += c.checks;
@@ -102,7 +110,8 @@ impl Profile {
              contexts_saturated={} clauses_generated={} clauses_kept={} redundant_forward={} \
              redundant_backward={} hyper={} pred={} max_head={} max_body={} edges={} \
              peak_agenda={} messages={} slots={} proof_steps={} threads={} largest_context={} \
-             merges={} eq={} unmerged={} joins_left={} subset_checks={} task_memory_peak={} \
+             merges={} merges_certain={} eq={} eq_conditional={} merged_contexts={} \
+             merged_conditional_contexts={} unmerged={} joins_left={} subset_checks={} task_memory_peak={} \
              batches={} budget_checks={} observations={}",
             ms(self.normalise),
             ms(self.compile),
@@ -134,7 +143,11 @@ impl Profile {
             self.threads,
             self.largest_context,
             self.merges,
+            self.merges_certain,
             self.equality_literals_generated,
+            self.eq_conditional,
+            self.contexts_merged,
+            self.contexts_merged_conditional,
             self.contexts_unmerged,
             self.contexts_joins_left,
             self.subset_checks,

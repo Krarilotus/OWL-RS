@@ -1,0 +1,14 @@
+# The context-sensitive pointer analysis (CSPA; Graspan's, as FlowLog's suite has it,
+# benches/reasoning/datalog/programs/flowlog/cspa.dl) as user rules: the custom-cspa case.
+@prefix e: <http://example.org/fast/> .
+
+{ ?y e:assign ?x } => { ?y e:valueFlow ?x } .
+{ ?x e:assign ?z . ?z e:memoryAlias ?y } => { ?x e:valueFlow ?y } .
+{ ?x e:valueFlow ?z . ?z e:valueFlow ?y } => { ?x e:valueFlow ?y } .
+{ ?y e:dereference ?x . ?y e:valueAlias ?z . ?z e:dereference ?w } => { ?x e:memoryAlias ?w } .
+{ ?z e:valueFlow ?x . ?z e:valueFlow ?y } => { ?x e:valueAlias ?y } .
+{ ?z e:valueFlow ?x . ?z e:memoryAlias ?w . ?w e:valueFlow ?y } => { ?x e:valueAlias ?y } .
+{ ?x e:assign ?y } => { ?x e:valueFlow ?x } .
+{ ?y e:assign ?x } => { ?x e:valueFlow ?x } .
+{ ?y e:assign ?x } => { ?x e:memoryAlias ?x } .
+{ ?x e:assign ?y } => { ?x e:memoryAlias ?x } .

@@ -159,6 +159,12 @@ In the order of Motik, Shearer and Horrocks (JAIR 2009)†, with every step reco
    - Inverse roles are normalised to `(id, inverse)`.
    - Report A ranks complex RBoxes among the hard cases, and recommends role automata and propagation along the hierarchy over micro-optimising the search.
 3. **Structural transformation:** a fresh name for each nested subexpression that needs one, with polarity (Plaisted–Greenbaum style), so that the clausification is linear and Horn structure survives. In JAIR 2009† this is what keeps hypertableau deterministic on Horn parts.
+   A fresh definition is split before the ordinary distribution cutoff: `Q ⊑ ∧Ei`
+   emits `Q ⊑ Ei` for each conjunct; the negative polarity splits `¬E ∨ Q` in the same
+   way. Reusing the cached name for its own wide definition would emit `Q → Q` and lose
+   its meaning. The cutoff chooses the clause representation, never which conjuncts
+   survive. The direct-semantics guards enumerate auxiliary interpretations as well as
+   the canonical extension, which alone cannot detect a missing definition.
 4. **Absorption**, before clausification. It decides which body atom triggers a clause, so it acts as the query planner of the later hyperresolution joins (D):
    - **Role absorption:** domains, ranges and `Some(R, ⊤) ⊑ C` bind to role events, not to every node. This is the strongest isolated measurement in D: FaCT++ on NCI took 2,447.7 s without it and 63.9 s with it, and tableau operations fell from 344,142,434 to 1,580,206†.
    - **Binary absorption:** `A ⊓ B ⊑ C` with a conjunction of atoms as the trigger.
@@ -905,13 +911,20 @@ This section owns what the DL settings mean; [config-reference.md](../ops/config
 lists the keys and their defaults.
 
 **Time.** A DL operation (a commit's consistency check with its evidence, a query's exact
-services, a classification or realisation) takes one absolute deadline from `dl.timeout`
-when it starts. Every phase measures what remains from that deadline instead of starting
+services, a document entailment check, a classification or realisation) takes one
+absolute deadline from `dl.timeout` when it starts. Every phase measures what remains
+from that deadline instead of starting
 its own timeout, and checks the request's cancellation flag at the same work boundaries.
 A cancelled query publishes no consistency status for its revision. Exhausted gate
 evidence keeps the sound rejection evidence found so far without claiming it minimal.
 Normalisation and compilation don't poll; schema reading may overrun the deadline by
 their duration.
+
+Document entailment includes premise checking and conclusion preparation in that same
+allowance. Each scalar reduction and a compiled probe's unsupported fallback inherit
+the original deadline. Exhaustion remains `unknown`; an established counterexample
+still decides `not-entailed` even if an earlier reduction was unsupported. An unlimited
+timeout stays unlimited. These are cooperative checks, not preemptive interruption.
 
 **Memory (`dl.memory`).** Two checks, both at work boundaries, both cooperative:
 
@@ -941,6 +954,12 @@ past `dl.memory`, its candidates unresolved because "the request's memory envelo
 out"; a verdict so limited isn't recorded for the revision. `dl.memory` bounds each run
 inside the envelope. Classification and realisation, cached per revision and shared by
 the lower bound, aren't a request's: they keep `dl.memory` and the process limit.
+
+`context::abox::Individuals` borrows the engine whose observer holds its estimate. Its
+estimate returns to that engine on drop, including early returns and unwinding; callers
+no longer supply an engine to release it. The observer amortizes its envelope reservations
+and releases them fully when the engine drops. The context-ID list is a
+read-only slice. This lifetime boundary adds no per-message accounting or inference rule.
 
 Exhaustion yields an incomplete outcome, never a classification inferred from truncated
 work. Retained classification buffers are charged; result and proof assembly,

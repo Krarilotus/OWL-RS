@@ -59,7 +59,7 @@ cap_gb = 16; est_min = 20
 | `queries` | a directory of `.rq` files: `NAME` (benches/fast/queries/NAME), `@FAMILY` (benches/competitors/queries/FAMILY), `lubm` or `owl2bench` (benches/reasoning/queries), or a generated set (`@vectors`, `@parse`, `@cache-log`) |
 | `tool`, `args`, `env`, `setup`, `repeat`, `sweep`, `tool_loads` | how NRESE measures it: `perf_lab` (default), `tableau`, `classify-el`, `classify-horn`; their arguments (`{data}`, `{scratch}` substituted), environment, a one-time setup, fresh-process repetitions, argument sweeps |
 | `page_cache` | `["warm"]` (default) or `["warm", "cold"]`: fresh processes alternate, the page cache emptied before each cold one by the host's `cold_cache` command; a host without one runs warm and says so |
-| `timeout_s`, `cap_gb` | the time limit of a DL tool; the memory cap without swap (required) |
+| `timeout_s`, `cap_gb` | wall time per measured invocation in Docker and native runtimes: 900 seconds when omitted, `0` unlimited; tableau also uses it for each file's search (300 seconds when omitted). The memory cap without swap (required) |
 | `metric`, `counters` | the number the case is timed by (a path in the result: `sum_p50_ms`, `reason.p50_ms`, `load_s`, `cold_ms`, `whole_ms`, `clients.p99_ms`, ...); further work counters to compare exactly. `metric` is required |
 | `check`, `pinned` | known answers, checked before a time counts: `path = value` (`expect.KEY` is the generator's answer; a number or string is pinned, with `pinned` saying where it comes from), or `">= 0.9"`, `"has X"` |
 | `route` | the plan or engine path the case must take: `path = "OP VALUE"` (`==`, `<=`, `>=`, `has`, `lacks`) |
