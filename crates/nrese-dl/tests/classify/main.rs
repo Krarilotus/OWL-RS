@@ -138,6 +138,63 @@ fn variants() -> Vec<(&'static str, Options)> {
     vec![
         ("default", base.clone()),
         (
+            "equality-certain",
+            Options {
+                equality: true,
+                certain_merges: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "equality-certain-lower-bound",
+            Options {
+                equality: true,
+                certain_merges: true,
+                context_core: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "functional-route",
+            Options {
+                functional_route: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "functional-route-lower-bound",
+            Options {
+                functional_route: true,
+                context_core: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "eager-equality",
+            Options {
+                equality: true,
+                lower_bound_strategy: nrese_dl::context::Strategy::Eager,
+                ..base.clone()
+            },
+        ),
+        (
+            "eager-equality-certain",
+            Options {
+                equality: true,
+                certain_merges: true,
+                lower_bound_strategy: nrese_dl::context::Strategy::Eager,
+                ..base.clone()
+            },
+        ),
+        (
+            "functional-strategy-equality",
+            Options {
+                equality: true,
+                lower_bound_strategy: nrese_dl::context::Strategy::Functional,
+                ..base.clone()
+            },
+        ),
+        (
             "no-context-core",
             Options {
                 context_core: false,
