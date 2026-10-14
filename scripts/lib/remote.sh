@@ -51,7 +51,8 @@ prepare="export PATH=\$HOME/.cargo/bin:\$PATH NRESE_ON_BUILD_HOST=1 && cd $root 
   cd wt/$name && git checkout -q -f --detach $snapshot && git clean -q -fd"
 case ${1:-} in
   check)
-    ssh -o BatchMode=yes "$host" "$prepare && NRESE_FILES_FROM=/dev/stdin $capped bash scripts/check.sh $2" \
+    # A local opt-out of the W3C suites' data (scripts/check.sh) holds on the build host too.
+    ssh -o BatchMode=yes "$host" "$prepare && ${NRESE_W3C_OPTIONAL:+NRESE_W3C_OPTIONAL=1 }NRESE_FILES_FROM=/dev/stdin $capped bash scripts/check.sh $2" \
       < "${3:-/dev/null}"
     ;;
   run)

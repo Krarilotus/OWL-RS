@@ -191,9 +191,40 @@ Both are covered by the parity tests.
 
 Used for initial loads, restores, ruleset changes and deltas above a size threshold.
 
-What the code does (`batch.rs`, `eval.rs`; checked against the code on 6 October 2026):
+**Working-set representation (approved design; validation pending).** The reasoner owns
+its working-set layout and temporary dense ranks; the engine owns dictionary IDs and
+persisted index encoding. One generic solver is compiled for two static pair/candidate
+layouts: dense 32-bit components packed into a `u64` pair with `u128` candidates, or two
+full `u64` components with full-width candidates. Static construction, comparison,
+range and emission operations preserve the narrow layout without a width enum per pair
+or a separate copy of the solver.
 
-- **Working set: vertical partitioning.** It is built from one snapshot scan (the store streams its POSG order, already grouped) as per-predicate binary relations of `(u64, u64)` pairs, sorted by subject. The **OS order** is kept only for relations a ground rule looks up by object alone, or grounding reads (P1-F11), so a fact costs 16–32 B. `rdf:type` is one relation like the others (no per-class sets).
+Full materialisation selects its layout once, before remapping input or program. The
+universe includes input, rule and schema constants, list vocabulary, and every member
+ID held in a `SameList` guard index, including otherwise unused members. A universe
+that exceeds narrow-rank capacity uses the wide layout. Incremental and support stores
+start wide because their eventual universe is unknown. Reserved rank zero differs from
+raw ID zero; first-after-last range boundaries are not packed ranks.
+
+Both layouts preserve exact original IDs, guards, diagnostics, violations and equality
+classes. Derived runs retain their layout through the engine handoff; axiom and listed
+output also have a wide fallback. Existing storable-term filtering still determines
+which raw IDs form valid RDF statements. Closed-family identities are disjoint from
+term IDs and from each other. Prospective grounding and support state are installed
+only after the corresponding commit.
+
+Resource budgets and stop checks govern whether an operation can execute; pair width
+is a physical representation choice. Choosing wide does not mean cancellation,
+unsupported data or a semantic failure. The graph module's inherited node-rank and CSR
+edge/offset capacities require their own checked fallback and are not removed by wide
+pairs. Correctness guards cover synthetic capacity transitions; performance and size
+comparisons remain pending integrated measurements.
+
+Historical mechanism summary from 6 October 2026. Current implementation:
+`batch/{mod,store,runs,join,modules,result}.rs` and `eval.rs`; the current representation
+is described above.
+
+- **Working set: vertical partitioning.** It is built from one snapshot scan (the store streams its POSG order, already grouped) as per-predicate binary relations, sorted by subject, using the operation-selected layout above. The **OS order** is kept only for relations a ground rule looks up by object alone, or grounding reads (P1-F11). Pair payload costs 8–16 B per fact in the narrow layout or 16–32 B in the wide layout, depending on retained orders; ID-table, metadata and temporary allocations are additional. `rdf:type` is one relation like the others (no per-class sets).
   - This is Inferray's layout, and it is also what QLever's permutations amount to per predicate.
   - Each relation holds its input in a run of its own and what was added in a base run and a small recent run, which takes each round's delta and is folded into the base once it reaches a quarter of it; runs that are merged are held in chunks of 1 Mi pairs (P1-F4, F10).
   - Sorting is comparison-based (rayon's parallel unstable sort; a sample sort into chunks for large unions), not radix (kernel #9 of the 6 October investigation is open).

@@ -1252,6 +1252,13 @@ impl Snapshot {
         self.dictionary.prepare_vector_graph(query);
     }
 
+    /// The geometry literals this snapshot's dictionary holds, by id and box
+    /// ([`crate::Dictionary::geometries`]); literals interned after this snapshot can be
+    /// in it too (whether statements use a literal is the caller's to check).
+    pub fn geometries(&self) -> nrese_geo::GeometryIndex {
+        self.dictionary.geometries()
+    }
+
     /// The IRIs this snapshot's dictionary holds whose local names match `query`, best
     /// first (whether statements still use them is the caller's to check).
     pub fn iri_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
@@ -1294,39 +1301,81 @@ where
 }
 
 /// Two column sets (`components` of quads), each sorted in `permutation`'s order, merged
-/// into one in that order: rows compared on the components by their place in the order.
+/// into one in that order: rows compared on the components by their place in the order. A
+/// side's run of rows before the other's next row is found by galloping and copied a column
+/// at a time; a side without rows is the result as it is. Row by row, a merge of a small
+/// stack into a large one (CSPA httpd's 1.5 M asserted statements among 324.5 M inferred)
+/// compared and pushed every row of both.
 fn merge_columns(
     left: Vec<Vec<u64>>,
     right: Vec<Vec<u64>>,
     permutation: Permutation,
     components: &[usize],
 ) -> Vec<Vec<u64>> {
+    let rows = |columns: &[Vec<u64>]| columns.first().map_or(0, Vec::len);
+    let (n, m) = (rows(&left), rows(&right));
+    if n == 0 {
+        return right;
+    }
+    if m == 0 {
+        return left;
+    }
     let order = permutation.order();
     let mut keys: Vec<usize> = (0..components.len()).collect();
     keys.sort_by_key(|&c| order.iter().position(|&o| o == components[c]));
-    let rows = |columns: &[Vec<u64>]| columns.first().map_or(0, Vec::len);
-    let (n, m) = (rows(&left), rows(&right));
     let mut out: Vec<Vec<u64>> = (0..components.len())
         .map(|_| Vec::with_capacity(n + m))
         .collect();
+    // Whether left row `a` comes first: before right row `b` (equal rows: the right's first).
     let less = |a: usize, b: usize| {
+        #[cfg(test)]
+        COMPARISONS.with(|count| count.set(count.get() + 1));
         keys.iter()
             .map(|&k| left[k][a].cmp(&right[k][b]))
             .find(|ordering| ordering.is_ne())
             .is_some_and(|ordering| ordering.is_le())
     };
-    let (mut i, mut j) = (0, 0);
-    while i < n || j < m {
-        let from_left = j == m || (i < n && less(i, j));
-        for (c, column) in out.iter_mut().enumerate() {
-            column.push(if from_left { left[c][i] } else { right[c][j] });
+    // The first index at or after `from` (below `len`) where `before` stops holding, `before`
+    // holding at `from`: doubling steps, then a binary search in the last one.
+    let gallop = |from: usize, len: usize, before: &dyn Fn(usize) -> bool| {
+        let (mut low, mut step) = (from, 1);
+        let mut high = from + 1;
+        while high < len && before(high) {
+            low = high;
+            step *= 2;
+            high = (low + step).min(len);
         }
-        if from_left {
-            i += 1;
+        // `before` holds at `low`; the answer is in `low + 1..=high`.
+        let (mut a, mut b) = (low + 1, high);
+        while a < b {
+            let mid = a + (b - a) / 2;
+            if before(mid) {
+                a = mid + 1;
+            } else {
+                b = mid;
+            }
+        }
+        a
+    };
+    let copy = |out: &mut Vec<Vec<u64>>, side: &[Vec<u64>], range: std::ops::Range<usize>| {
+        for (column, values) in out.iter_mut().zip(side) {
+            column.extend_from_slice(&values[range.clone()]);
+        }
+    };
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if less(i, j) {
+            let to = gallop(i, n, &|a| less(a, j));
+            copy(&mut out, &left, i..to);
+            i = to;
         } else {
-            j += 1;
+            let to = gallop(j, m, &|b| !less(i, b));
+            copy(&mut out, &right, j..to);
+            j = to;
         }
     }
+    copy(&mut out, &left, i..n);
+    copy(&mut out, &right, j..m);
     out
 }
 
@@ -1348,6 +1397,100 @@ where
         match self {
             Either::Left(left) => left.next(),
             Either::Right(right) => right.next(),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The row comparisons [`merge_columns`] made, on this thread (the guard's count).
+    static COMPARISONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod merge_columns_tests {
+    use super::*;
+
+    /// Guard: a few rows merged into many cost comparisons per run, not per row: 3 rows
+    /// into 2,000 (the row-by-row merge compared about 2,000 times).
+    #[test]
+    fn a_small_side_merges_into_a_large_one_by_runs() {
+        let column = |values: Vec<u64>| vec![values];
+        let left = column(vec![500, 1_000, 1_500]);
+        let right = column((0..2_000).map(|v| 2 * v + 1).collect());
+        COMPARISONS.with(|count| count.set(0));
+        let merged = merge_columns(left, right, Permutation::Spog, &[0]);
+        assert_eq!(merged[0].len(), 2_003);
+        assert!(merged[0].is_sorted());
+        let comparisons = COMPARISONS.with(std::cell::Cell::get);
+        assert!(comparisons <= 100, "{comparisons} comparisons");
+    }
+
+    /// The row-by-row merge the galloping one replaced.
+    fn merged_row_by_row(
+        left: &[Vec<u64>],
+        right: &[Vec<u64>],
+        permutation: Permutation,
+        components: &[usize],
+    ) -> Vec<Vec<u64>> {
+        let order = permutation.order();
+        let mut keys: Vec<usize> = (0..components.len()).collect();
+        keys.sort_by_key(|&c| order.iter().position(|&o| o == components[c]));
+        let (n, m) = (left[0].len(), right[0].len());
+        let less = |a: usize, b: usize| {
+            keys.iter()
+                .map(|&k| left[k][a].cmp(&right[k][b]))
+                .find(|ordering| ordering.is_ne())
+                .is_some_and(|ordering| ordering.is_le())
+        };
+        let mut out = vec![Vec::new(); components.len()];
+        let (mut i, mut j) = (0, 0);
+        while i < n || j < m {
+            let from_left = j == m || (i < n && less(i, j));
+            for (c, column) in out.iter_mut().enumerate() {
+                column.push(if from_left { left[c][i] } else { right[c][j] });
+            }
+            if from_left {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        out
+    }
+
+    /// The galloping merge equals the row-by-row one: sides of very different sizes, empty
+    /// sides, every component or a prefix of them, in SPOG and in POSG.
+    #[test]
+    fn galloping_merge_of_columns_equals_the_row_by_row_one() {
+        let mut x = 3u64;
+        let mut next = move |n: u64| {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (x >> 33) % n
+        };
+        for (permutation, components) in [
+            (Permutation::Spog, vec![0, 1, 2]),
+            (Permutation::Spog, vec![0, 1]),
+            (Permutation::Posg, vec![2, 0, 1]),
+        ] {
+            for (n, m) in [(0, 50), (50, 0), (3, 2_000), (2_000, 3), (400, 500), (1, 1)] {
+                let mut side = |rows: usize| -> Vec<Vec<u64>> {
+                    let mut quads: Vec<[u64; 4]> = (0..rows)
+                        .map(|_| [next(40), next(5), next(300), 0])
+                        .collect();
+                    quads.sort_by_key(|q| permutation.order().map(|c| q[c]));
+                    components
+                        .iter()
+                        .map(|&c| quads.iter().map(|q| q[c]).collect())
+                        .collect()
+                };
+                let (left, right) = (side(n), side(m));
+                let want = merged_row_by_row(&left, &right, permutation, &components);
+                let got = merge_columns(left, right, permutation, &components);
+                assert_eq!(got, want, "{permutation:?} {components:?} {n} {m}");
+            }
         }
     }
 }

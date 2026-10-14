@@ -91,6 +91,7 @@ pub fn materialise_until(
         lists,
         schema,
         batch::Listing::Representatives,
+        batch::Output::Facts,
         stop,
     )?;
     Ok(RepresentativeClosure {

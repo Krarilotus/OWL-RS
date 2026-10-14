@@ -219,18 +219,52 @@ fn both_with(
     let schema = Schema::owl(vocabulary);
     let naive = materialise(input, &rules, lists);
     let batch = batch::materialise(input, &rules, lists, &schema);
+    // Every existing profile/random/list oracle fixture also exercises the wide solver.
+    let wide = batch::materialise_test_capacity(
+        batch::Input::Facts(input.to_vec()),
+        &rules,
+        lists,
+        &schema,
+        None,
+        batch::Output::Facts,
+        crate::eval::NEVER,
+        0,
+    )
+    .expect("wide selection succeeds");
+    assert_eq!(wide.derived, batch.derived, "wide/narrow facts");
+    assert_eq!(wide.violations, batch.violations, "wide/narrow violations");
+    assert_eq!(
+        wide.diagnostics, batch.diagnostics,
+        "wide/narrow diagnostics"
+    );
     // The grouped entry point (what the store uses) derives the same.
     let mut sorted: Vec<Triple> = input.to_vec();
     sorted.sort_unstable_by_key(|&[s, p, o]| (p, o, s));
     sorted.dedup();
-    let mut groups: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
+    let mut groups: Vec<(u64, Vec<[u64; 2]>)> = Vec::new();
     for [s, p, o] in sorted {
         match groups.last_mut() {
-            Some((last, pairs)) if *last == p => pairs.push((o, s)),
-            _ => groups.push((p, vec![(o, s)])),
+            Some((last, pairs)) if *last == p => pairs.push([o, s]),
+            _ => groups.push((p, vec![[o, s]])),
         }
     }
-    let grouped = batch::materialise_grouped(groups, &rules, lists, &schema);
+    let grouped = batch::materialise_grouped(groups.clone(), &rules, lists, &schema);
+    // Handed back as the working set's runs (what the store builds its stack from), the
+    // same facts.
+    let relations = batch::materialise_grouped_until(
+        groups,
+        &rules,
+        lists,
+        &schema,
+        batch::Output::Relations,
+        crate::eval::NEVER,
+    )
+    .expect("never stopped");
+    assert_eq!(
+        relations_hold(&relations.relations),
+        batch.derived,
+        "relations"
+    );
     // Derived facts never include asserted ones (the schema pre-closure must filter).
     let asserted: HashSet<Triple> = input.iter().copied().collect();
     assert!(
@@ -269,6 +303,56 @@ fn both_with(
     violations.sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
     assert_eq!(violations, batch.violations, "violations differ");
     (naive.derived, violations)
+}
+
+/// The facts of `relations`, sorted, after checking their shape: each predicate once and
+/// in order; each run sorted, distinct, and disjoint from the others of its predicate; an
+/// object order the same pairs swapped; the numbers' table ascending.
+pub(crate) fn relations_hold(relations: &[batch::DerivedRelation]) -> Vec<Triple> {
+    assert!(
+        relations
+            .windows(2)
+            .all(|w| w[0].predicate < w[1].predicate)
+    );
+    let mut facts = Vec::new();
+    for relation in relations {
+        for run in relation
+            .by_subject
+            .iter()
+            .chain(relation.by_object.iter().flatten())
+        {
+            if let nrese_engine::PairChunks::Numbers { ids, .. } = run {
+                assert_eq!(ids[0], 0);
+                assert!(ids[1..].windows(2).all(|w| w[0] < w[1]));
+            }
+        }
+        let mut pairs: Vec<[u64; 2]> = Vec::new();
+        for run in &relation.by_subject {
+            let run: Vec<[u64; 2]> = run.pairs().collect();
+            assert!(
+                run.windows(2).all(|w| w[0] < w[1]),
+                "a run sorted and distinct"
+            );
+            pairs.extend(run);
+        }
+        let total = pairs.len();
+        pairs.sort_unstable();
+        pairs.dedup();
+        assert_eq!(pairs.len(), total, "the runs of a predicate are disjoint");
+        if let Some(by_object) = &relation.by_object {
+            let mut swapped: Vec<[u64; 2]> = Vec::new();
+            for run in by_object {
+                let run: Vec<[u64; 2]> = run.pairs().collect();
+                assert!(run.windows(2).all(|w| w[0] < w[1]), "an object run sorted");
+                swapped.extend(run.iter().map(|&[a, b]| [b, a]));
+            }
+            swapped.sort_unstable();
+            assert_eq!(swapped, pairs, "the object order holds the same pairs");
+        }
+        facts.extend(relation.facts());
+    }
+    facts.sort_unstable();
+    facts
 }
 
 fn has(vocabulary: &mut LocalVocabulary, derived: &HashSet<Triple>, fact: &str) -> bool {
@@ -1449,14 +1533,14 @@ fn materialisation_stops_when_asked() {
         let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
         let lists = ListVocabulary::new(&mut vocabulary);
         let schema = Schema::owl(&mut vocabulary);
-        let mut groups: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
+        let mut groups: Vec<(u64, Vec<[u64; 2]>)> = Vec::new();
         let mut sorted = input.clone();
         sorted.sort_unstable_by_key(|&[s, p, o]| (p, o, s));
         sorted.dedup();
         for [s, p, o] in sorted {
             match groups.last_mut() {
-                Some((last, pairs)) if *last == p => pairs.push((o, s)),
-                _ => groups.push((p, vec![(o, s)])),
+                Some((last, pairs)) if *last == p => pairs.push([o, s]),
+                _ => groups.push((p, vec![[o, s]])),
             }
         }
         let full = batch::materialise(&input, &rules, Some(&lists), &schema);
@@ -1465,9 +1549,15 @@ fn materialisation_stops_when_asked() {
             polls.fetch_add(1, Ordering::Relaxed);
             false
         };
-        let again =
-            batch::materialise_grouped_until(groups.clone(), &rules, Some(&lists), &schema, &count)
-                .expect("never stopped");
+        let again = batch::materialise_grouped_until(
+            groups.clone(),
+            &rules,
+            Some(&lists),
+            &schema,
+            batch::Output::Facts,
+            &count,
+        )
+        .expect("never stopped");
         assert_eq!(again.derived, full.derived);
         let total = polls.load(Ordering::Relaxed);
         if total > 2 || drawn == 10 {
@@ -1479,8 +1569,15 @@ fn materialisation_stops_when_asked() {
         let seen = AtomicUsize::new(0);
         let stop = || seen.fetch_add(1, Ordering::Relaxed) >= at;
         assert!(
-            batch::materialise_grouped_until(groups.clone(), &rules, Some(&lists), &schema, &stop)
-                .is_err(),
+            batch::materialise_grouped_until(
+                groups.clone(),
+                &rules,
+                Some(&lists),
+                &schema,
+                batch::Output::Facts,
+                &stop,
+            )
+            .is_err(),
             "stopped at poll {at}"
         );
     }

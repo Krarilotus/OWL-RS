@@ -180,18 +180,36 @@ def larger(a: int | None, b: int | None) -> int | None:
     return b if a is None else a if b is None else max(a, b)
 
 
-def scope_argv(unit: str, memory: str) -> list[str]:
+def scope_argv(unit: str, memory: str, environ=os.environ) -> list[str]:
     """A command's prefix to run it in its own systemd user scope capped as Docker's --memory
     and --memory-swap cap a container: `memory` in Docker's notation (12g, 900m), which
     systemd reads with upper-case units only. At the cap the kernel kills the command alone
     (exit 137, as in a container), not systemd the whole scope, so what runs after it in the
-    scope (fast's wrapper) can still read the peak. The rootfs runtime and fast's native
-    runtime share it. Under the fleet the scope joins the step's slice (FLEET_SLICE, the kit
-    rule after the whole-host OOM of 14 Oct 2026), so the step's own cap holds it too; where
-    no fleet sets one, the user's default slice, as before."""
-    slice_ = [f"--slice={os.environ['FLEET_SLICE']}"] if os.environ.get("FLEET_SLICE") else []
-    return ["systemd-run", "--user", "--scope", "-q", *slice_, f"--unit={unit}",
-            "-p", f"MemoryMax={memory.upper()}", "-p", "MemorySwapMax=0", "-p", "OOMPolicy=continue", "--"]
+    scope (fast's wrapper) can still read the peak. Under fleet the scope goes into the step's
+    slice (FLEET_SLICE), so it counts against what the job declared (14 Oct 2026: a scope beside
+    them, counted nowhere, took Office into a whole-host OOM). The rootfs runtime and fast's
+    native runtime share it."""
+    placed = [f"--slice={environ['FLEET_SLICE']}"] if environ.get("FLEET_SLICE") else []
+    return ["systemd-run", "--user", "--scope", "-q", *placed, f"--unit={unit}", "-p", f"MemoryMax={memory.upper()}",
+            "-p", "MemorySwapMax=0", "-p", "OOMPolicy=continue", "--"]
+
+
+def end_scope(unit: str) -> None:
+    """Nothing outlives its task: whatever the scope still holds after its command ended or was
+    stopped (a child its wrapper started, reparented when the wrapper died) is killed. A scope
+    already gone is no error."""
+    if shutil.which("systemctl"):
+        run_quiet(["systemctl", "--user", "kill", "--signal=KILL", f"{unit}.scope"], 30)
+
+
+def slice_limit_mib(environ=os.environ) -> int | None:
+    """The memory limit of the fleet step's slice (FLEET_SLICE: what the job declared, plus a
+    tenth), in MiB; None outside fleet or without a limit."""
+    name = environ.get("FLEET_SLICE")
+    if not name or not shutil.which("systemctl"):
+        return None
+    shown = run_quiet(["systemctl", "--user", "show", "-p", "MemoryMax", "--value", name], 30).stdout.strip()
+    return int(shown) // 1048576 if shown.isdigit() else None
 
 
 class ScopePeak:
@@ -662,7 +680,13 @@ class RootfsRuntime(ProcessRuntime):
 
     def argv(self, spec):
         if spec.image is None:
-            return ProcessRuntime.argv(self, spec)
+            # Host binaries need the same scope and cap as image-backed contenders.
+            command = ProcessRuntime.argv(self, spec)
+            if not spec.memory:
+                return command
+            unit = f"nrese-{spec.name}-{os.getpid()}-{int(time.monotonic() * 1000)}"
+            self.units[spec.name] = unit
+            return scope_argv(unit, spec.memory) + command
         return self.prefix(spec, list(spec.command))
 
     def environment(self, spec):
@@ -677,7 +701,7 @@ class RootfsRuntime(ProcessRuntime):
         return Sampler(ScopePeak(unit)) if unit else None
 
     def run(self, spec, log, timeout_s):
-        if spec.image is None or not spec.memory:
+        if not spec.memory:
             return ProcessRuntime.run(self, spec, log, timeout_s)
         started = time.monotonic()
         process = self.popen(self.argv(spec), spec, log)
@@ -692,12 +716,14 @@ class RootfsRuntime(ProcessRuntime):
             rc = 124
         # The scope's peak, not wait4's: the command runs below systemd-run, not as our child.
         peak = scope.stop() if scope else None
-        self.units.pop(spec.name, None)
+        unit = self.units.pop(spec.name, None)
+        if unit:
+            end_scope(unit)
         return Measured((time.monotonic() - started) * 1000, peak, rc, timed_out)
 
     def start(self, spec, log):
         server = ProcessRuntime.start(self, spec, log)
-        scope = self.peak(spec) if spec.image is not None else None
+        scope = self.peak(spec)
         if scope:
             server.sampler.stop()
             server.sampler = scope
@@ -705,7 +731,9 @@ class RootfsRuntime(ProcessRuntime):
 
     def stop(self, server):
         peak = ProcessRuntime.stop(self, server)
-        self.units.pop(server.spec.name, None)
+        unit = self.units.pop(server.spec.name, None)
+        if unit:
+            end_scope(unit)
         return peak
 
     def exec(self, server, command, timeout_s=3600):

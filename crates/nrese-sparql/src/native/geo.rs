@@ -1,6 +1,6 @@
 //! GeoSPARQL 1.1 filter functions over geometry literals: WKT (`geo:wktLiteral`), GeoJSON
 //! (`geo:geoJSONLiteral`) and GML (`geo:gmlLiteral`, the simple features; see
-//! [`super::geo_formats`]).
+//! [`nrese_geo`], which reads them and owns the relations).
 //!
 //! | Functions | |
 //! |---|---|
@@ -14,8 +14,8 @@
 //! as CRS84. Two geometries in different systems aren't compared (an error). In CRS84,
 //! metres are geodesic (distances between the nearest points, areas and lengths on the
 //! WGS84 ellipsoid); degrees and radians are planar. In other systems a measure is in the
-//! system's own unit. `buffer` in metres on CRS84 buffers in a plane about the geometry
-//! (true within 1% up to tens of kilometres; not near the poles). The boolean operations
+//! system's own unit. `buffer` in metres on CRS84 buffers in the azimuthal equidistant
+//! projection about the geometry (geodesic from its centre; not near the poles). The boolean operations
 //! (`intersection`, `union`, …) take polygons. Constructed coordinates are rounded to 9
 //! decimal places. Constructions return WKT; `asGeoJSON`
 //! takes CRS84 geometries.
@@ -26,112 +26,24 @@ use geo::{
     Relate,
 };
 use geo::{Geometry, MultiPolygon, Point};
+use nrese_geo::formats;
+use nrese_geo::{CRS84, GEOJSON_LITERAL, GML_LITERAL, Serialisation, Shape, WKT_LITERAL};
+pub(super) use nrese_geo::{RELATIONS, holds_apart, relation};
 use nrese_rdf::{Literal, NamedNode, Term};
-use wkt::{ToWkt, TryFromWkt};
+use wkt::ToWkt;
 
-use super::geo_formats;
 use super::value::boolean_term;
 
 /// The GeoSPARQL function namespace.
 pub(crate) const GEOF: &str = "http://www.opengis.net/def/function/geosparql/";
-const WKT_LITERAL: &str = "http://www.opengis.net/ont/geosparql#wktLiteral";
-const GEOJSON_LITERAL: &str = "http://www.opengis.net/ont/geosparql#geoJSONLiteral";
-const GML_LITERAL: &str = "http://www.opengis.net/ont/geosparql#gmlLiteral";
-const CRS84: &str = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
-const EPSG_4326: &str = "http://www.opengis.net/def/crs/EPSG/0/4326";
 const UOM: &str = "http://www.opengis.net/def/uom/OGC/1.0/";
-
-/// How a geometry literal is written.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Serialisation {
-    Wkt,
-    GeoJson,
-    Gml,
-}
-
-/// A geometry, its coordinate reference system, and how its literal was written.
-pub(super) struct Shape {
-    pub(super) geometry: Geometry<f64>,
-    pub(super) crs: String,
-    pub(super) format: Serialisation,
-}
-
-impl Shape {
-    fn geographic(&self) -> bool {
-        self.crs == CRS84
-    }
-}
-
-/// The reference system a GML `srsName` names, in GeoSPARQL's IRI form.
-fn srs_iri(name: &str) -> String {
-    let code = name
-        .strip_prefix("EPSG:")
-        .or_else(|| name.strip_prefix("urn:ogc:def:crs:EPSG::"))
-        .or_else(|| name.strip_prefix("http://www.opengis.net/def/crs/EPSG/0/"));
-    match code {
-        Some(code) => format!("http://www.opengis.net/def/crs/EPSG/0/{code}"),
-        None if name == "urn:ogc:def:crs:OGC:1.3:CRS84" || name == "urn:ogc:def:crs:OGC::CRS84" => {
-            CRS84.to_owned()
-        }
-        None => name.to_owned(),
-    }
-}
 
 /// The shape of a geometry literal (WKT, GeoJSON or GML); `None` for anything else.
 pub(super) fn parse(term: &Term) -> Option<Shape> {
     let Term::Literal(literal) = term else {
         return None;
     };
-    let text = literal.value().trim();
-    let format = match literal.datatype().as_str() {
-        GEOJSON_LITERAL => Serialisation::GeoJson,
-        GML_LITERAL => Serialisation::Gml,
-        _ => Serialisation::Wkt,
-    };
-    let (crs, geometry) = match literal.datatype().as_str() {
-        WKT_LITERAL => {
-            let (crs, text) = match text.strip_prefix('<') {
-                Some(rest) => {
-                    let (iri, rest) = rest.split_once('>')?;
-                    (iri.to_owned(), rest.trim())
-                }
-                None => (CRS84.to_owned(), text),
-            };
-            // An empty literal is the empty geometry (GeoSPARQL 1.1).
-            let geometry = if text.is_empty() {
-                Geometry::GeometryCollection(geo::GeometryCollection::default())
-            } else {
-                Geometry::<f64>::try_from_wkt_str(text).ok()?
-            };
-            (crs, geometry)
-        }
-        GEOJSON_LITERAL => (CRS84.to_owned(), geo_formats::from_geojson(text)?),
-        GML_LITERAL if text.is_empty() => (
-            CRS84.to_owned(),
-            Geometry::GeometryCollection(geo::GeometryCollection::default()),
-        ),
-        GML_LITERAL => {
-            let (srs, geometry) = geo_formats::from_gml(text)?;
-            (
-                srs.map_or_else(|| CRS84.to_owned(), |s| srs_iri(&s)),
-                geometry,
-            )
-        }
-        _ => return None,
-    };
-    Some(if crs == EPSG_4326 {
-        Shape {
-            geometry: geometry.map_coords(|c| geo::coord! { x: c.y, y: c.x }),
-            crs: CRS84.to_owned(),
-            format,
-        }
-    } else {
-        Shape {
-            geometry,
-            crs,
-            format,
-        }
-    })
+    nrese_geo::parse(literal.datatype().as_str(), literal.value())
 }
 
 /// A constructed geometry as a literal written like `like`'s: WKT, GeoJSON (only in
@@ -139,12 +51,12 @@ pub(super) fn parse(term: &Term) -> Option<Shape> {
 fn literal(geometry: &Geometry<f64>, like: &Shape) -> Term {
     match like.format {
         Serialisation::GeoJson if like.crs == CRS84 => Literal::new_typed_literal(
-            geo_formats::to_geojson(geometry),
+            formats::to_geojson(geometry),
             NamedNode::new_unchecked(GEOJSON_LITERAL),
         )
         .into(),
         Serialisation::Gml => Literal::new_typed_literal(
-            geo_formats::to_gml(geometry, &like.crs),
+            formats::to_gml(geometry, &like.crs),
             NamedNode::new_unchecked(GML_LITERAL),
         )
         .into(),
@@ -218,30 +130,42 @@ fn boundary(geometry: &Geometry<f64>) -> Geometry<f64> {
     }
 }
 
-/// A buffer of `metres` around a CRS84 geometry: buffered in an equirectangular plane
-/// about its centroid (x scaled by the cosine of the latitude), so distances in metres are
-/// true near the geometry: within 1% for buffers up to tens of kilometres. `None` within
-/// about a degree of a pole, where the plane fails.
+/// The sag of a metre buffer's arcs (the gap between an arc and its chord) as a share of
+/// the radius, and in metres at least: 222 segments a circle above 100 m, fewer below
+/// (44 at 4 m), and no point more than a ten-thousandth of the radius inside the true
+/// buffer is left out.
+const BUFFER_SAG: f64 = 1e-4;
+const BUFFER_SAG_METRES: f64 = 0.01;
+
+/// A buffer of `metres` around a CRS84 geometry: buffered in the azimuthal equidistant
+/// projection about its centroid on the WGS84 ellipsoid, whose distances and directions
+/// from the centre are the geodesic ones, so a point's buffer has its vertices on the
+/// geodesic circle (and other geometries' are true near the centre: within 0.1% to tens
+/// of kilometres). The arcs' segments sag at most [`BUFFER_SAG`] of the radius. `None`
+/// within about a degree of a pole, where the result wraps around it.
 fn metre_buffer(geometry: &Geometry<f64>, metres: f64) -> Option<MultiPolygon<f64>> {
-    // The mean radius of the WGS84 ellipsoid.
-    const R: f64 = 6_371_008.8;
+    use geo::algorithm::buffer::{BufferStyle, LineCap, LineJoin};
+    use geo::{Bearing, Destination};
     let centre = geometry.centroid()?;
-    let (lon0, lat0) = (centre.x(), centre.y());
-    let k = lat0.to_radians().cos();
-    if k < 0.02 {
+    if centre.y().abs() > 88.85 {
         return None;
     }
     let plane = geometry.map_coords(|c| {
-        geo::coord! {
-            x: (c.x - lon0).to_radians() * R * k,
-            y: (c.y - lat0).to_radians() * R,
-        }
+        let point = Point::from(c);
+        let distance = Geodesic.distance(centre, point);
+        let bearing = Geodesic.bearing(centre, point).to_radians();
+        geo::coord! { x: distance * bearing.sin(), y: distance * bearing.cos() }
     });
-    Some(plane.buffer(metres).map_coords(|c| {
-        geo::coord! {
-            x: lon0 + (c.x / (R * k)).to_degrees(),
-            y: lat0 + (c.y / R).to_degrees(),
-        }
+    let sag = (metres * BUFFER_SAG).max(BUFFER_SAG_METRES) / metres;
+    // The angle an arc's segment spans: its sag is radius × (1 − cos(angle / 2)).
+    let angle = 2.0 * (1.0 - sag.min(1.0)).acos();
+    let style = BufferStyle::new(metres)
+        .line_join(LineJoin::Round(angle))
+        .line_cap(LineCap::Round(angle));
+    Some(plane.buffer_with_style(style).map_coords(|c| {
+        let distance = c.x.hypot(c.y);
+        let bearing = c.x.atan2(c.y).to_degrees();
+        Geodesic.destination(centre, bearing, distance).0
     }))
 }
 
@@ -314,81 +238,20 @@ fn polygons(geometry: &Geometry<f64>) -> Option<MultiPolygon<f64>> {
     }
 }
 
-/// The topological relations, by their local names (functions in `geof:`, properties in
-/// `geo:`).
-pub(super) const RELATIONS: &[&str] = &[
-    "sfEquals",
-    "sfDisjoint",
-    "sfIntersects",
-    "sfTouches",
-    "sfCrosses",
-    "sfWithin",
-    "sfContains",
-    "sfOverlaps",
-    "ehEquals",
-    "ehDisjoint",
-    "ehMeet",
-    "ehOverlap",
-    "ehCovers",
-    "ehCoveredBy",
-    "ehInside",
-    "ehContains",
-    "rcc8eq",
-    "rcc8dc",
-    "rcc8ec",
-    "rcc8po",
-    "rcc8tppi",
-    "rcc8tpp",
-    "rcc8ntpp",
-    "rcc8ntppi",
-];
-
-/// Whether a relation can hold between shapes whose bounding boxes don't meet (the
-/// disjointness relations): these can't be looked up in a spatial index.
-pub(super) fn holds_apart(local: &str) -> bool {
-    matches!(local, "sfDisjoint" | "ehDisjoint" | "rcc8dc")
-}
-
-/// Whether relation `local` holds between `a` and `b`; `None` for an unknown name.
-pub(super) fn relation(local: &str, a: &Geometry<f64>, b: &Geometry<f64>) -> Option<bool> {
-    // Two empty geometries are equal (their DE-9IM matrix is all F, which no equality
-    // pattern matches).
-    if a.is_empty() && b.is_empty() && matches!(local, "sfEquals" | "ehEquals" | "rcc8eq") {
-        return Some(true);
-    }
-    let pattern = match local {
-        "sfDisjoint" | "ehDisjoint" => "FF*FF****",
-        "ehOverlap" => "T*T***T**",
-        "ehCovers" => "T*TFT*FF*",
-        "ehCoveredBy" => "TFF*TFT**",
-        "ehInside" => "TFF*FFT**",
-        "ehContains" => "T*TFF*FF*",
-        "rcc8eq" => "TFFFTFFFT",
-        "rcc8dc" => "FFTFFTTTT",
-        "rcc8ec" => "FFTFTTTTT",
-        "rcc8po" => "TTTTTTTTT",
-        "rcc8tppi" => "TTTFTTFFT",
-        "rcc8tpp" => "TFFTTFTTT",
-        "rcc8ntpp" => "TFFTFFTTT",
-        "rcc8ntppi" => "TTTFFTFFT",
-        other => {
-            let m = a.relate(b);
-            return Some(match other {
-                "sfEquals" | "ehEquals" => m.is_equal_topo(),
-                "sfIntersects" => m.is_intersects(),
-                "sfTouches" | "ehMeet" => m.is_touches(),
-                "sfCrosses" => m.is_crosses(),
-                "sfWithin" => m.is_within(),
-                "sfContains" => m.is_contains(),
-                "sfOverlaps" => m.is_overlaps(),
-                _ => return None,
-            });
-        }
+/// `geof:envelope` of a geometry whose bounding box is `rect`, in reference system `crs`,
+/// written as `format` (the geometry's own literal): the box as a polygon.
+pub(super) fn envelope(rect: &geo::Rect<f64>, crs: &str, format: Serialisation) -> Term {
+    let like = Shape {
+        geometry: Geometry::Polygon(rect.to_polygon()),
+        crs: crs.to_owned(),
+        format,
     };
-    a.relate(b).matches(pattern).ok()
+    literal(&like.geometry, &like)
 }
 
-/// `geof:name(args)`; `None` is an error (a wrong argument, systems that differ).
+/// `geof:name(args)`; `None` is an error (a wrong argument, systems that differ). The
+/// arguments that aren't geometries are checked first: a call that fails on them reads no
+/// geometry (Geographica's `geof:area(?g)` without a unit, over 44,834 polygons).
 pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
     let local = name.strip_prefix(GEOF)?;
     let shape = |i: usize| args.get(i).and_then(parse);
@@ -414,8 +277,8 @@ pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
                 .map(boolean_term)
         }
         "distance" => {
-            let (a, b) = pair()?;
             let unit = unit(args.get(2)?)?;
+            let (a, b) = pair()?;
             if a.geographic() {
                 match planar_factor(unit)? {
                     None => double(geodesic_distance(&a.geometry, &b.geometry)?),
@@ -428,8 +291,8 @@ pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
             }
         }
         "area" => {
-            let a = shape(0)?;
             let unit = unit(args.get(1)?)?;
+            let a = shape(0)?;
             match (a.geographic(), unit) {
                 (true, "metre" | "meter" | "squareMetre" | "squareMeter") => {
                     double(a.geometry.geodesic_area_unsigned())
@@ -439,8 +302,8 @@ pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
             }
         }
         "length" => {
-            let a = shape(0)?;
             let unit = unit(args.get(1)?)?;
+            let a = shape(0)?;
             let lines = |metric: &dyn Fn(&geo::LineString<f64>) -> f64| -> f64 {
                 match &a.geometry {
                     Geometry::LineString(l) => metric(l),
@@ -460,12 +323,12 @@ pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
             }
         }
         "buffer" => {
-            let a = shape(0)?;
             let radius = match args.get(1)? {
                 Term::Literal(l) => l.value().parse::<f64>().ok()?,
                 _ => return None,
             };
             let unit = unit(args.get(2)?)?;
+            let a = shape(0)?;
             let buffered = match (a.geographic(), planar_factor(unit)?) {
                 // In CRS84, metres: in a plane about the geometry.
                 (true, None) => metre_buffer(&a.geometry, radius)?,
@@ -481,8 +344,7 @@ pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
         }
         "envelope" => {
             let a = shape(0)?;
-            let rect = a.geometry.bounding_rect()?;
-            Some(literal(&Geometry::Polygon(rect.to_polygon()), &a))
+            Some(envelope(&a.geometry.bounding_rect()?, &a.crs, a.format))
         }
         "boundary" => {
             let a = shape(0)?;
@@ -531,7 +393,7 @@ pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
             let a = shape(0)?;
             a.geographic().then(|| {
                 Literal::new_typed_literal(
-                    geo_formats::to_geojson(&a.geometry),
+                    formats::to_geojson(&a.geometry),
                     NamedNode::new_unchecked(GEOJSON_LITERAL),
                 )
                 .into()

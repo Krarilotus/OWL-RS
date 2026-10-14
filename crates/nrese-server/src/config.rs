@@ -85,6 +85,10 @@ impl ServerConfig {
             ),
             ("store.vocabulary", store.vocabulary.as_str().to_owned()),
             (
+                "store.inferred_merge_wave_keys",
+                store.inferred_merge_wave_keys.to_string(),
+            ),
+            (
                 "store.invalid_statements",
                 store.invalid_statements.name().to_owned(),
             ),

@@ -50,6 +50,50 @@ pub struct ListVocabulary {
 }
 
 impl ListVocabulary {
+    /// Every id it names.
+    pub(crate) fn ids(&self) -> Vec<u64> {
+        vec![
+            self.rdf_type,
+            self.first,
+            self.rest,
+            self.nil,
+            self.same_as,
+            self.sub_class_of,
+            self.property_chain_axiom,
+            self.has_key,
+            self.intersection_of,
+            self.union_of,
+            self.one_of,
+            self.members,
+            self.distinct_members,
+            self.all_disjoint_classes,
+            self.all_disjoint_properties,
+            self.all_different,
+        ]
+    }
+
+    /// The same vocabulary over the ids `f` maps these to.
+    pub(crate) fn map_ids(&self, f: &dyn Fn(u64) -> u64) -> Self {
+        Self {
+            rdf_type: f(self.rdf_type),
+            first: f(self.first),
+            rest: f(self.rest),
+            nil: f(self.nil),
+            same_as: f(self.same_as),
+            sub_class_of: f(self.sub_class_of),
+            property_chain_axiom: f(self.property_chain_axiom),
+            has_key: f(self.has_key),
+            intersection_of: f(self.intersection_of),
+            union_of: f(self.union_of),
+            one_of: f(self.one_of),
+            members: f(self.members),
+            distinct_members: f(self.distinct_members),
+            all_disjoint_classes: f(self.all_disjoint_classes),
+            all_disjoint_properties: f(self.all_disjoint_properties),
+            all_different: f(self.all_different),
+        }
+    }
+
     pub fn new(vocabulary: &mut impl Vocabulary) -> Self {
         let mut rdf = |local: &str| vocabulary.iri(&format!("{RDF}{local}"));
         let (rdf_type, first, rest, nil) = (rdf("type"), rdf("first"), rdf("rest"), rdf("nil"));

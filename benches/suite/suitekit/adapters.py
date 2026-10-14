@@ -41,7 +41,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .manifest import docker_memory_bytes
-from .runtime import PREFIX, DockerRuntime, Measured, Mount, Runtime, Server, Spec
+from .runtime import PREFIX, DockerRuntime, Measured, Mount, Runtime, Server, Spec, slice_limit_mib
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
@@ -103,12 +103,19 @@ class Context:
         instead of making the host thrash (nemo-sparq on LUBM 1000, 5 October 2026); it
         couldn't have finished within the memory anyway."""
         setting = self.setting("DOCKER_MEMORY")
-        if setting == "0":
-            return None
-        if setting:
+        if setting and setting != "0":
             return setting
+        # Under fleet no container runs uncapped or past what the job declared: Docker can't
+        # join the step's slice, so its cap is the slice's limit less a GiB for the driver
+        # (14 Oct 2026: an uncounted 10.7 GB container in a whole-host OOM on Office).
+        declared = slice_limit_mib()
+        if setting == "0" and declared is None:
+            return None
         total = docker_memory_bytes()
-        return f"{total * 9 // 10 // 1048576}m" if total else None
+        cap = total * 9 // 10 // 1048576 if total else None
+        if declared is not None:
+            cap = min(cap or declared, max(declared - 1024, 512))
+        return f"{cap}m" if cap else None
 
 
 @dataclass

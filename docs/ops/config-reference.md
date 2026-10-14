@@ -114,6 +114,13 @@ api_key = "replace-me"
 
 ## Store
 
+`store.inferred_merge_wave_keys` (`NRESE_INFERRED_MERGE_WAVE_KEYS`) targets the number
+of unpacked keys held by one inferred-stack merge wave. The default is 8,388,608 keys
+(256 MiB for 32-byte permutation keys); `0` or `"unlimited"` removes the target. Each
+engine owns its setting, including in-memory stores. One oversized part is taken alone
+and may exceed the target; packed output, cut tables and other scratch are apart. This
+is batching policy, not a strict memory cap. The process-memory backstop is unchanged.
+
 - file key: `store.mode`
 - env override: `NRESE_STORE_MODE`
 - values: `in-memory` (aliases `inmemory`, `memory`), `on-disk` (aliases `ondisk`, `disk`, `durable`)

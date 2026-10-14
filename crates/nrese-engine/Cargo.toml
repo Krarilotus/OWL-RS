@@ -18,6 +18,8 @@ memmap2 = "0.9"
 # The kernels shared with the reasoner and the query engine: the union of the equality
 # classes (src/engine/equality.rs), the sort.
 nrese-exec = { path = "../nrese-exec" }
+# The geometry literals of the dictionary, by their boxes (src/term/dictionary.rs).
+nrese-geo = { path = "../nrese-geo" }
 nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 nrese-vector = { path = "../nrese-vector" }
@@ -28,6 +30,8 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# The geometry index's boxes in its tests.
+geo = "0.33"
 tempfile = { workspace = true }
 
 [lints]

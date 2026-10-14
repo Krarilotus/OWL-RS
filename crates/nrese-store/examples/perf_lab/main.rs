@@ -4,7 +4,7 @@
 //! cargo run --release -p nrese-store --example perf_lab -- \
 //!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] \
 //!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
-//!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE]
+//!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE] [--statistics]
 //!     [--shacl-report FILE] [--reason MODE]
 //!     [--rules FILE.n3] [--reason-runs 1] [--results DIR] [--routes] [--commits FILE]
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
@@ -29,6 +29,8 @@
 //!   the queries read the materialised data (the default read model).
 //!   `--results` writes each query's serialised answer to `DIR/<query>.out` (once, after
 //!   the measurement), to compare answers with another engine's.
+//!   `--statistics` prepares the planner's statistics after the load and the reasoning,
+//!   timed, as the server's `load` does last (`statistics_ms` in the report).
 //!   `--explain` prints each query's plan after its measurement: every operator with its
 //!   estimated and actual rows and its time (inputs included), where the time goes when a
 //!   profiler isn't at hand.
@@ -190,6 +192,7 @@ struct Args {
     json: Option<PathBuf>,
     baseline: Option<PathBuf>,
     explain: bool,
+    statistics: bool,
     faults: bool,
     qerror: bool,
     format: SolutionsResultFormat,
@@ -228,6 +231,7 @@ fn parse_args() -> Result<Args, String> {
         json: None,
         baseline: None,
         explain: false,
+        statistics: false,
         faults: false,
         qerror: false,
         format: SolutionsResultFormat::Tsv,
@@ -270,6 +274,7 @@ fn parse_args() -> Result<Args, String> {
             "--json" => args.json = Some(value()?.into()),
             "--baseline" => args.baseline = Some(value()?.into()),
             "--explain" => args.explain = true,
+            "--statistics" => args.statistics = true,
             "--faults" => args.faults = true,
             "--results" => args.results = Some(value()?.into()),
             "--qerror" => args.qerror = true,
@@ -1053,7 +1058,10 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             format!(
                 "{{\"program\": {:?}, \"asserted\": {}, \"inferred\": {}, \"violations\": {}, \"rounds\": {}, \
                  \"runs\": {}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \"samples_ms\": [{}], \"grounding_ms\": {:.3}, \
-                 \"joins_ms\": {:.3}, \"modules_ms\": {:.3}, \"merge_ms\": {:.3}, \"consistency_ms\": {:.3}, \"bindings\": {}, \"probes\": {}, \"new_facts\": {}, \"passes\": {}}}",
+                 \"joins_ms\": {:.3}, \"modules_ms\": {:.3}, \"merge_ms\": {:.3}, \"consistency_ms\": {:.3}, \"bindings\": {}, \"probes\": {}, \"new_facts\": {}, \"passes\": {}, \
+                 \"reasoner_load_ms\": {:.3}, \"stack_ms\": {:.3}, \"stack_parts_ms\": {{\"asserted\": {:.3}, \
+                 \"index\": {:.3}, \"pair_orders\": {:.3}, \"merged_orders\": {:.3}, \"changes\": {:.3}, \
+                 \"publish\": {:.3}, \"after_commit\": {:.3}}}}}",
                 done.ruleset,
                 done.asserted,
                 done.inferred,
@@ -1070,6 +1078,15 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
                 done.phases.probes,
                 done.phases.new_facts,
                 done.phases.passes,
+                ms(done.phases.load),
+                ms(done.stack),
+                ms(done.stack_parts.asserted),
+                ms(done.stack_parts.index),
+                ms(done.stack_parts.pair_orders),
+                ms(done.stack_parts.merged_orders),
+                ms(done.stack_parts.changes),
+                ms(done.stack_parts.publish),
+                ms(done.stack_parts.after_commit),
             ),
         ));
         if let Some(peak) = nrese_exec::memory::window_peak_bytes() {
@@ -1078,6 +1095,13 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
                 .push(("reason_peak_mib", (peak / 1048576).to_string()));
         }
         phases.push(("reason", phase.json()));
+    }
+    if args.statistics {
+        let started = Instant::now();
+        store.prepare_statistics();
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        eprintln!("statistics prepared in {ms:.1} ms");
+        report.sections.push(("statistics_ms", format!("{ms:.3}")));
     }
     if let Some(shapes) = &args.shapes {
         store.bulk_load(&BulkLoadRequest {
