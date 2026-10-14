@@ -168,6 +168,77 @@ impl Engine<'_> {
         }
     }
 
+    /// A value for each live concrete node (after a run ended in a model): per component
+    /// of inequalities, the theory's assignment ([`crate::datatypes::DatatypeTheory::assign`]);
+    /// a component it finds none for is left out (a certificate then has no answer).
+    pub fn data_witness(&mut self) -> hashbrown::HashMap<u32, nrese_xsd::owl::Value> {
+        let mut out = hashbrown::HashMap::new();
+        if self.p.data.is_none() {
+            return out;
+        }
+        let concrete: Vec<u32> = (0..self.g.nodes.len() as u32)
+            .filter(|&n| self.g.live(n) && self.concrete(n))
+            .collect();
+        let mut seen: HashSet<u32> = HashSet::new();
+        for start in concrete {
+            if !seen.insert(start) {
+                continue;
+            }
+            let mut component = vec![start];
+            let mut at = 0;
+            while at < component.len() {
+                let n = component[at];
+                at += 1;
+                let others: Vec<u32> = self
+                    .g
+                    .inequality_facts(n)
+                    .map(|i| if i.a == n { i.b } else { i.a })
+                    .filter(|&o| self.g.live(o))
+                    .collect();
+                for o in others {
+                    if seen.insert(o) {
+                        component.push(o);
+                    }
+                }
+            }
+            let mut theory = std::mem::take(&mut self.theory);
+            theory.clear();
+            let vars: Vec<DataVar> = component.iter().map(|_| theory.var()).collect();
+            let index: hashbrown::HashMap<u32, usize> =
+                component.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+            for (i, &n) in component.iter().enumerate() {
+                for f in self.g.labels(n) {
+                    if let Some(r) = self.range_of(f.concept) {
+                        theory.add_range(vars[i], r, true, f.dep);
+                    }
+                }
+                for f in self.g.negative_facts(n) {
+                    if let Some(r) = self.range_of(f.concept) {
+                        theory.add_range(vars[i], r, false, f.dep);
+                    }
+                }
+                for e in self.g.inequality_facts(n) {
+                    let other = if e.a == n { e.b } else { e.a };
+                    if other > n
+                        && let Some(&o) = index.get(&other)
+                    {
+                        theory.add_not_equal(vars[i], vars[o], e.dep);
+                    }
+                }
+            }
+            let ranges = &self.p.data.as_ref().expect("a program with data").ranges;
+            let config = &self.config;
+            let values = theory.assign(&vars, ranges, &mut self.deps, &|| {
+                config.stopped().is_some()
+            });
+            self.theory = theory;
+            if let Some(values) = values {
+                out.extend(component.into_iter().zip(values));
+            }
+        }
+        out
+    }
+
     /// The choice for an at-most data restriction at `s`: a `p`-value with neither its
     /// range nor the complement decided gets one of them; whether one was made.
     pub fn data_choice(&mut self, s: u32, number: &Number, premise: DepSetId) -> Step<bool> {

@@ -1,0 +1,6 @@
+# Consistency tests whose consistent answer has no certificate (crate::certificate), with the
+# reason: the engine's model, folded or unravelled one step at each block, and their lifts,
+# aren't models; the answer stands (it isn't refuted), it just isn't checked.
+WebOnt-description-logic-024	functional f with its inverse: the fold merges f-successors pairwise blocking keeps apart, and one step of unravelling doesn't separate them
+WebOnt-description-logic-025	as 024
+WebOnt-description-logic-908	the multiplication test (N·M elements by three functional properties): the fold breaks the exact cardinalities, and one step of unravelling doesn't restore them

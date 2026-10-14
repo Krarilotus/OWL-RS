@@ -18,15 +18,25 @@
 //! ([`Model::unravelled`]) and its lift. A model that passes none is no certificate:
 //! [`Certificate::Declined`], which says nothing against the answer.
 //!
-//! Not yet covered: data values (the model has none: an ontology that uses data
-//! properties or datatypes is declined), and "inconsistent" (a refutation is a search
-//! tree, not yet recorded as a proof: docs/design/owl2-dl.md §10).
+//! **Data values** are values of the datatype map (`nrese-xsd`): an element's values per
+//! data property, data ranges evaluated value by value ([`data`]); `owl:topDataProperty`
+//! (every element with every value) isn't checked here (no answer). **DL-safe rules**
+//! ([`rules`]) are checked over the named individuals; [`violations`] lists the instances
+//! an interpretation breaks, which `crate::beyond` grounds.
+//!
+//! Not yet covered: "inconsistent" (a refutation is a search tree, not yet recorded as a
+//! proof: docs/design/owl2-dl.md §10).
+
+pub mod data;
+pub mod rules;
 
 use std::collections::HashMap;
 
 use nrese_owl::{Axiom, Characteristic, ClassExpr, Concept, ExprId, ObjProp, Ontology, Term};
+use nrese_xsd::owl::Value;
 
 use crate::tableau::Model;
+pub use rules::{Binding, Violation, violations};
 
 /// A set of elements.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +128,8 @@ pub struct Interpretation {
     /// Per property, its pairs.
     pub roles: HashMap<Term, Vec<(usize, usize)>>,
     pub individuals: HashMap<Term, usize>,
+    /// Per data property, its pairs of an element and a data value.
+    pub data: HashMap<Term, Vec<(usize, Value)>>,
 }
 
 /// The checker's view: extensions as sets, successors per element both ways.
@@ -131,6 +143,11 @@ struct View<'a> {
     individuals: &'a HashMap<Term, usize>,
     top: Option<Term>,
     bottom: Option<Term>,
+    /// Per data property: each element's values, sorted.
+    data: HashMap<Term, Vec<Vec<Value>>>,
+    top_data: Option<Term>,
+    bottom_data: Option<Term>,
+    values: data::Values<'a>,
 }
 
 /// Why a certificate couldn't be given.
@@ -175,6 +192,19 @@ impl<'a> View<'a> {
                 l.dedup();
             }
         }
+        let mut data: HashMap<Term, Vec<Vec<Value>>> = HashMap::new();
+        for (&p, pairs) in &i.data {
+            let lists = data.entry(p).or_insert_with(|| vec![Vec::new(); n]);
+            for (e, v) in pairs {
+                lists[*e].push(v.clone());
+            }
+        }
+        for lists in data.values_mut() {
+            for l in lists.iter_mut() {
+                l.sort_unstable();
+                l.dedup();
+            }
+        }
         Self {
             o,
             n,
@@ -184,7 +214,54 @@ impl<'a> View<'a> {
             individuals: &i.individuals,
             top: o.builtin.top_object,
             bottom: o.builtin.bottom_object,
+            data,
+            top_data: o.builtin.top_data,
+            bottom_data: o.builtin.bottom_data,
+            values: data::Values::new(o),
         }
+    }
+
+    /// The values of `d` for the data property `p`.
+    fn data_values(&self, p: Term, d: usize) -> Result<Vec<Value>, String> {
+        if Some(p) == self.top_data {
+            return Err("owl:topDataProperty (every value) isn't checked here".into());
+        }
+        if Some(p) == self.bottom_data {
+            return Ok(Vec::new());
+        }
+        Ok(self.data.get(&p).map_or_else(Vec::new, |l| l[d].clone()))
+    }
+
+    /// The number of `d`'s `p`-values in the range `r`.
+    fn data_count(&self, p: Term, d: usize, r: nrese_owl::RangeId) -> Result<usize, String> {
+        let mut k = 0;
+        for v in self.data_values(p, d)? {
+            if self.values.member(r, &v)? {
+                k += 1;
+            }
+        }
+        Ok(k)
+    }
+
+    /// The IRI of a term the source gives (a built-in's).
+    fn iri(&self, t: Term) -> Result<String, String> {
+        self.o
+            .data
+            .iris
+            .get(&t)
+            .cloned()
+            .ok_or_else(|| format!("term {t} has no IRI the source gives"))
+    }
+
+    /// Each element where `test` holds; the first error stops it.
+    fn each_try(&self, test: impl Fn(usize) -> Result<bool, String>) -> Result<Set, String> {
+        let mut s = Set::empty(self.n);
+        for d in 0..self.n {
+            if test(d)? {
+                s.insert(d);
+            }
+        }
+        Ok(s)
     }
 
     fn ind(&self, a: Term) -> Option<usize> {
@@ -287,12 +364,22 @@ impl<'a> View<'a> {
                 let c = self.eval(*x)?;
                 self.each(|d| self.count(*r, d, &c) == *k as usize)
             }
-            ClassExpr::DataSome(..)
-            | ClassExpr::DataAll(..)
-            | ClassExpr::DataHasValue(..)
-            | ClassExpr::DataMin(..)
-            | ClassExpr::DataMax(..)
-            | ClassExpr::DataExact(..) => return Err("data values aren't certified yet".into()),
+            ClassExpr::DataSome(p, r) => self.each_try(|d| Ok(self.data_count(*p, d, *r)? > 0))?,
+            ClassExpr::DataAll(p, r) => self
+                .each_try(|d| Ok(self.data_count(*p, d, *r)? == self.data_values(*p, d)?.len()))?,
+            ClassExpr::DataHasValue(p, l) => {
+                let v = self.values.literal(*l)?;
+                self.each_try(|d| Ok(self.data_values(*p, d)?.contains(&v)))?
+            }
+            ClassExpr::DataMin(k, p, r) => {
+                self.each_try(|d| Ok(self.data_count(*p, d, *r)? >= *k as usize))?
+            }
+            ClassExpr::DataMax(k, p, r) => {
+                self.each_try(|d| Ok(self.data_count(*p, d, *r)? <= *k as usize))?
+            }
+            ClassExpr::DataExact(k, p, r) => {
+                self.each_try(|d| Ok(self.data_count(*p, d, *r)? == *k as usize))?
+            }
         })
     }
 
@@ -407,9 +494,6 @@ impl<'a> View<'a> {
                 })
             }
             Axiom::HasKey(class, objects, data) => {
-                if !data.is_empty() {
-                    return Err("data values aren't certified yet".into());
-                }
                 let members = c(*class)?;
                 // Keys apply to named individuals only (the Direct Semantics' NAMED).
                 let named: Vec<usize> = {
@@ -423,19 +507,29 @@ impl<'a> View<'a> {
                     v.dedup();
                     v
                 };
-                // Two named members that share a named value of each key property are one.
-                named.iter().all(|&x| {
-                    named.iter().all(|&y| {
-                        x == y
-                            || !members.contains(x)
-                            || !members.contains(y)
-                            || !objects.iter().all(|&r| {
-                                named
-                                    .iter()
-                                    .any(|&z| self.related(r, x, z) && self.related(r, y, z))
-                            })
-                    })
-                })
+                // Two named members that share a named value of each object property and a
+                // value of each data property are one.
+                let shares = |x: usize, y: usize| -> Result<bool, String> {
+                    for &p in data {
+                        let (a, b) = (self.data_values(p, x)?, self.data_values(p, y)?);
+                        if !a.iter().any(|v| b.contains(v)) {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(objects.iter().all(|&r| {
+                        named
+                            .iter()
+                            .any(|&z| self.related(r, x, z) && self.related(r, y, z))
+                    }))
+                };
+                for &x in &named {
+                    for &y in &named {
+                        if x != y && members.contains(x) && members.contains(y) && shares(x, y)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                true
             }
             Axiom::ClassAssertion(x, a) => {
                 let a = self.ind(*a).ok_or("an individual the model doesn't name")?;
@@ -463,16 +557,81 @@ impl<'a> View<'a> {
                     .enumerate()
                     .all(|(k, a)| es[k + 1..].iter().all(|b| a != b))
             }
-            Axiom::SubDataPropertyOf(..)
-            | Axiom::EquivalentDataProperties(..)
-            | Axiom::DisjointDataProperties(..)
-            | Axiom::DataPropertyDomain(..)
-            | Axiom::DataPropertyRange(..)
-            | Axiom::FunctionalDataProperty(..)
-            | Axiom::DatatypeDefinition(..)
-            | Axiom::DataPropertyAssertion(..)
-            | Axiom::NegativeDataPropertyAssertion(..) => {
-                return Err("data values aren't certified yet".into());
+            Axiom::SubDataPropertyOf(a, b) => {
+                if Some(*b) == self.top_data || Some(*a) == self.bottom_data {
+                    return Ok(true);
+                }
+                for d in 0..n {
+                    let have = self.data_values(*b, d)?;
+                    if !self.data_values(*a, d)?.iter().all(|v| have.contains(v)) {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            Axiom::EquivalentDataProperties(ps) => {
+                for d in 0..n {
+                    let lists: Vec<Vec<Value>> = ps
+                        .iter()
+                        .map(|&p| self.data_values(p, d))
+                        .collect::<Result<_, _>>()?;
+                    if lists.windows(2).any(|w| w[0] != w[1]) {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            Axiom::DisjointDataProperties(ps) => {
+                for d in 0..n {
+                    let lists: Vec<Vec<Value>> = ps
+                        .iter()
+                        .map(|&p| self.data_values(p, d))
+                        .collect::<Result<_, _>>()?;
+                    for (k, a) in lists.iter().enumerate() {
+                        if lists[k + 1..]
+                            .iter()
+                            .any(|b| a.iter().any(|v| b.contains(v)))
+                        {
+                            return Ok(false);
+                        }
+                    }
+                }
+                true
+            }
+            Axiom::DataPropertyDomain(p, x) => {
+                let x = c(*x)?;
+                for d in 0..n {
+                    if !x.contains(d) && !self.data_values(*p, d)?.is_empty() {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            Axiom::DataPropertyRange(p, r) => {
+                for d in 0..n {
+                    for v in self.data_values(*p, d)? {
+                        if !self.values.member(*r, &v)? {
+                            return Ok(false);
+                        }
+                    }
+                }
+                true
+            }
+            Axiom::FunctionalDataProperty(p) => {
+                for d in 0..n {
+                    if self.data_values(*p, d)?.len() > 1 {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            // The defined datatype is its range wherever a range names it (`data::Values`).
+            Axiom::DatatypeDefinition(..) => true,
+            Axiom::DataPropertyAssertion(p, a, l)
+            | Axiom::NegativeDataPropertyAssertion(p, a, l) => {
+                let a = self.ind(*a).ok_or("an individual the model doesn't name")?;
+                let has = self.data_values(*p, a)?.contains(&self.values.literal(*l)?);
+                has == matches!(axiom, Axiom::DataPropertyAssertion(..))
             }
         })
     }
@@ -521,6 +680,9 @@ pub fn interpretation(m: &Model) -> Interpretation {
     }
     for &(t, e) in &m.individuals {
         i.individuals.insert(t, e);
+    }
+    for (p, e, v) in &m.data {
+        i.data.entry(*p).or_default().push((*e, v.clone()));
     }
     i
 }
@@ -590,80 +752,96 @@ pub fn close(o: &Ontology, i: &mut Interpretation) {
     }
 }
 
-/// Whether the ontology uses what the checker doesn't certify yet (data).
-fn declines(o: &Ontology) -> Option<&'static str> {
-    let data_axiom = o.axioms.iter().any(|a| {
-        matches!(
-            a,
-            Axiom::SubDataPropertyOf(..)
-                | Axiom::EquivalentDataProperties(..)
-                | Axiom::DisjointDataProperties(..)
-                | Axiom::DataPropertyDomain(..)
-                | Axiom::DataPropertyRange(..)
-                | Axiom::FunctionalDataProperty(..)
-                | Axiom::DatatypeDefinition(..)
-                | Axiom::DataPropertyAssertion(..)
-                | Axiom::NegativeDataPropertyAssertion(..)
-        ) || matches!(a, Axiom::HasKey(_, _, data) if !data.is_empty())
-    });
-    let data_expr = (0..o.classes.len() as u32).any(|id| {
-        matches!(
-            o.classes.get(id),
-            ClassExpr::DataSome(..)
-                | ClassExpr::DataAll(..)
-                | ClassExpr::DataHasValue(..)
-                | ClassExpr::DataMin(..)
-                | ClassExpr::DataMax(..)
-                | ClassExpr::DataExact(..)
-        )
-    });
-    (data_axiom || data_expr).then_some("data values aren't certified yet")
-}
-
 /// A certificate for "consistent" from the engine's model `m` of `o`: the model as it is,
 /// closed under the role inclusions, or its covering lift (with each property's loops
-/// kept or broken; up to 2⁸ choices); else the same for the unravelled graph.
+/// kept or broken; up to 2⁸ choices); else the same for the unravelled graph. With rules,
+/// the interpretation that satisfies the axioms must satisfy the rules too.
 pub fn certify(o: &Ontology, m: &Model) -> Certificate {
-    if let Some(why) = declines(o) {
-        return Certificate::Declined(why.into());
+    match axiom_model(o, m) {
+        Err(why) => Certificate::Declined(why),
+        Ok((i, lifted)) => match violations(o, &i, 1) {
+            Err(why) => Certificate::Declined(why),
+            Ok(v) if v.is_empty() => Certificate::Model {
+                elements: i.size,
+                lifted,
+            },
+            Ok(v) => Certificate::Declined(format!(
+                "the model breaks an instance of rule {} (of {})",
+                v[0].rule,
+                o.rules.len()
+            )),
+        },
     }
-    let folded = certify_one(o, m);
-    if folded.is_model() {
+}
+
+/// The first interpretation [`certify`] tries from `m` that is a model of every axiom of
+/// `o` (rules aside), and whether it is a lift; or why there is none.
+pub fn axiom_model(o: &Ontology, m: &Model) -> Result<(Interpretation, bool), String> {
+    let folded = axiom_model_one(o, m);
+    if folded.is_ok() {
         return folded;
     }
     match &m.unravelled {
-        Some(u) => match certify_one(o, u) {
-            Certificate::Model { elements, .. } => Certificate::Model {
-                elements,
-                lifted: true,
-            },
-            declined => declined,
-        },
+        Some(u) => axiom_model_one(o, u).map(|(i, _)| (i, true)),
         None => folded,
     }
 }
 
-/// [`certify`] for one candidate.
-fn certify_one(o: &Ontology, m: &Model) -> Certificate {
+/// [`axiom_model`] for one candidate.
+fn axiom_model_one(o: &Ontology, m: &Model) -> Result<(Interpretation, bool), String> {
+    let i = candidate(o, m);
+    match check(o, &i) {
+        Ok(()) => return Ok((i, false)),
+        Err(Err(why)) => return Err(why),
+        Err(Ok(_)) => {}
+    }
+    lifted(o, i)
+}
+
+/// The interpretation the engine's model `m` stands for, every individual of `o` named in
+/// it, closed under the role inclusions: what [`axiom_model`] checks first. Not checked:
+/// where it isn't a model, it still shows which rule instances a model of its kind
+/// breaks (`crate::beyond` grounds them, sound whatever the model).
+pub fn candidate(o: &Ontology, m: &Model) -> Interpretation {
     let mut i = interpretation(m);
     // An individual the ontology names where nothing constrains it (`≥ 0 R.{a}`) is in no
-    // clause, so not in the model: it may be any element (the check decides).
+    // clause, so not in the model: it may be any element (the check decides). So may an
+    // anonymous one, and one only a rule names.
     if i.size > 0 {
-        for a in o.named_individuals() {
+        let in_rules = o
+            .rules
+            .iter()
+            .flat_map(|r| r.body.iter().chain(&r.head))
+            .flat_map(|a| {
+                use nrese_owl::rules::{Atom, IArg};
+                let of = |x: &IArg| match *x {
+                    IArg::Individual(t) => Some(t),
+                    IArg::Var(_) => None,
+                };
+                match a {
+                    Atom::Class(_, x) | Atom::Data(_, x, _) => vec![of(x)],
+                    Atom::Object(_, x, y) | Atom::Same(x, y) | Atom::Different(x, y) => {
+                        vec![of(x), of(y)]
+                    }
+                    _ => Vec::new(),
+                }
+            });
+        let all: Vec<Term> = o
+            .named_individuals()
+            .into_iter()
+            .chain(o.anonymous.iter().copied())
+            .chain(in_rules.flatten())
+            .collect();
+        for a in all {
             i.individuals.entry(a).or_insert(0);
         }
     }
     close(o, &mut i);
-    match check(o, &i) {
-        Ok(()) => {
-            return Certificate::Model {
-                elements: i.size,
-                lifted: false,
-            };
-        }
-        Err(Err(why)) => return Certificate::Declined(why),
-        Err(Ok(_)) => {}
-    }
+    i
+}
+
+/// [`axiom_model`]'s covering lifts of a candidate that isn't a model.
+fn lifted(o: &Ontology, i: Interpretation) -> Result<(Interpretation, bool), String> {
     let named: Vec<bool> = (0..i.size)
         .map(|e| i.individuals.values().any(|&v| v == e))
         .collect();
@@ -685,13 +863,10 @@ fn certify_one(o: &Ontology, m: &Model) -> Certificate {
         let mut l = lift(&i, &named, &keep);
         close(o, &mut l);
         if check(o, &l).is_ok() {
-            return Certificate::Model {
-                elements: l.size,
-                lifted: true,
-            };
+            return Ok((l, true));
         }
     }
-    Certificate::Declined("neither the folded model nor its lift is a model".into())
+    Err("neither the folded model nor its lift is a model".into())
 }
 
 /// The 3-fold covering lift of a folded model: each element that isn't an individual
@@ -730,6 +905,15 @@ fn lift(i: &Interpretation, named: &[bool], keep_loops: &dyn Fn(Term) -> bool) -
         lifted.sort_unstable();
         lifted.dedup();
         out.classes.insert(c, lifted);
+    }
+    for (&p, pairs) in &i.data {
+        let mut lifted: Vec<(usize, Value)> = Vec::new();
+        for (e, v) in pairs {
+            let mut ends = copies[*e].to_vec();
+            ends.dedup();
+            lifted.extend(ends.into_iter().map(|x| (x, v.clone())));
+        }
+        out.data.insert(p, lifted);
     }
     for (&p, pairs) in &i.roles {
         let mut lifted: Vec<(usize, usize)> = Vec::new();
@@ -811,7 +995,7 @@ mod tests {
             concepts: vec![(Concept::Named(1), 0), (Concept::Named(1), 1)],
             roles: vec![(10, 0, 1), (10, 1, 1)],
             individuals: vec![(100, 0)],
-            unravelled: None,
+            ..Model::default()
         };
         // Folded, transitive and irreflexive clash at the loop; the lift breaks it but
         // closes a 3-cycle, which transitivity makes reflexive again: no certificate.

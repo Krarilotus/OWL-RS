@@ -123,6 +123,68 @@ empty", on inconsistent inputs such as `⊤ ⊑ ⊥`; 11 stack overflows) and ti
 Openllet answers unsupported on 414 (reflexive properties, U in domains and ranges),
 throws on 57 (56 "Nominal FunValue … is not found in the KB") and times out on 46.
 
+## Inputs outside OWL 2 DL (13 October 2026, Office-PC, queue jobs)
+
+[docs/design/owl2-dl.md](../../../docs/design/owl2-dl.md) §16: DL-safe rules decided by
+grounding with certified models, repairs, monotonicity. The tools: `cargo run -p nrese-dl
+--example dl_beyond` (`--survey` the reader's diagnostics and the engines' left-out axioms;
+`--decide`, `--classify`, `--justify`), `--example rules_campaign` (random SROIQ(D)
+ontologies with random DL-safe rules over the small-scope names, NRESE's answers by
+`nrese_dl::scope::answer_beyond`), and `beyond/`:
+
+| File | What |
+|---|---|
+| `beyond/run.sh` | the campaigns and the ORE runs as one queue job (its results: cases, NRESE's and the references' answers, decisions, taxonomies, justifications) |
+| `beyond/compare.py` | NRESE against the references on the Scope runner's codes |
+| `beyond/triage.py` | each disagreement against the references' probed deviations from SWRL's semantics |
+| `beyond/probes.py` | the minimal probes of those deviations (empty heads, `x ≠ x`, declared individuals, equality-only variables, inverse property atoms) |
+| `beyond/abba-run.sh` | one run of the A-B-B-A over the DL and QL cases (a queue chunk) |
+
+**The ORE 2015 corpus** (1,920 ontologies; `dl_beyond --survey`): 22 have reader
+diagnostics, every one a DL-safe rule (SWRL); the engines leave nothing else out of any
+ontology but datatype definitions in one (which they decide). Of the 22:
+
+| | Consistency | Classification |
+|---|---|---|
+| 714 (the owner's question) | consistent, a certified model of 5 elements satisfying all 8 rules (Openllet: consistent; HermiT, Konclude: no answer) | exact (the TBox names no individual) |
+| 237 and 7 like it (15516, 8280, 5539, 2669, 10906, 5206, 13880) | inconsistent by the DL part alone (Openllet agrees; HermiT rejects a literal typed `rdfs:Literal`); each has a four-axiom justification: `DBNonKeyAttribute(x)`, `DBNonPrimaryKeyAttribute ≡ DBNonKeyAttribute ⊔ …`, `DBNonPrimaryKeyAttribute ⊑ DBKeyAttribute`, `DBKeyAttribute` disjoint from `DBNonKeyAttribute` | exact (inconsistent) |
+| 3726, 7278, 15753 (SQWRL queries among the rules) | consistent, certified (the queries assert nothing) | exact |
+| 15993, 16630, 2526, 6615, 8250, 15063, 7345 | consistent, certified | exact (by the disjoint union, or refined by certified models where the TBox names individuals) |
+| 12451 | consistent, certified (HermiT times out at 300 s, Openllet overflows its stack) | sound, not exact: 27,223 subsumptions; the refinement's 25 minutes leave most of its 2,000 classes' pairs open |
+| 10860 | inconsistent: the DL part with 7 instances of its SWRL rules; one rule uses SWRLTab's `abox:hasClass` (over individuals and classes, not a SWRL built-in) and is left out, named (Openllet: inconsistent) | exact (inconsistent) |
+| 13129 | undecided: an ill-typed literal (`"…"^^rdfs:Literal`, *Structural Specification* §5.7) in its rules' data | the DL part's subsumptions, sound |
+
+10860's justification (10 axioms, 2 rules): a situation with exactly zero
+`hasR2RRelation`s, whose requester's working department and patient's supervision clinic
+are either different or the same individual; one rule gives the situation such a relation
+in each case. A model must choose a case, which is why it took grounding.
+
+So of the 22: consistency decided for 21 (12 consistent, 9 inconsistent), classification
+exact for 20. Jobs `dl-beyond-runs-1` to `-3` (Office-PC, release, binaries of
+`v15/dl-beyond`).
+
+**The rule campaigns** (`rules_campaign`, 1,000 cases each, 20 s per decision; HermiT and
+Openllet by `nrese.dl.Scope`):
+
+| Campaign | NRESE decided | agree with every answering reference | disagreements | none answered |
+|---|---|---|---|---|
+| 1: rules, no data | 988 | 899 | 80 | 9 |
+| 2: rules and data | 983 | 906 | 73 | 4 |
+| 3: rules, data, built-ins (`swrlb:add`, `lessThan`) | 981 | 916 | 57 | 8 |
+| 4: clean rules (no `=`, `≠`, empty heads), data | 983 | 970 | 8 | 5 |
+| 5: clean rules, no data | 985 | 972 | 12 | 1 |
+
+Every disagreement is a construct a reference reads against SWRL's semantics, shown by a
+probe each (`beyond/probes.py`, both references on each probe; NRESE answers all as the
+semantics does): HermiT ignores a rule with an empty head (SWRL §3: it is false); neither
+binds a variable only `=` and `≠` mention; Openllet binds no declared individual the
+assertions don't mention, no variable only `=` mentions, and no inverse property in an
+atom. Three were settled by hand: campaign 1's case 852 (HermiT's disjoint-union error of
+the small scope: it entails `⊤ ⊑ B` but not `a : B`), campaign 4's 753 (HermiT misses
+`b : A`, which the rule `¬A(x) → B(x)` and `B ⊑ A` entail for the named `b`), and the
+hand-checked samples of each deviation. NRESE's undecided cases (80 of 5,000): 66 models
+the certificate builder can't fold into a model (counting cases, §10), 14 time budgets.
+
 ## Adjudication
 
 No majority votes (§11). A result that differs from a test's type, or a reference

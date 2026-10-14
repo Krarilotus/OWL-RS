@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::diagnostics::Diagnostic;
 use crate::model::{
-    Axiom, Characteristic, ClassExpr, DataRange, DataTerms, EntityKind, ExprId, Interner, Literal,
-    ObjProp, RangeId, Term, canonical,
+    Axiom, Characteristic, ClassExpr, DataRange, DataTerms, Disjoint, EntityKind, ExprId, Interner,
+    Literal, ObjProp, RangeId, Term, canonical,
 };
 use crate::vocab::Vocabulary;
 
@@ -87,6 +87,8 @@ pub struct Ontology {
     pub data: DataTerms,
     /// The individuals that are blank nodes (anonymous: keys don't apply to them).
     pub anonymous: BTreeSet<Term>,
+    /// DL-safe rules (`crate::rules`; not OWL 2), each with a [`Diagnostic::Rule`].
+    pub rules: Vec<crate::rules::Rule>,
 }
 
 /// The properties OWL 2 gives a fixed meaning, by their ids in the source (`None` where
@@ -172,6 +174,7 @@ pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
 /// What every reader adds to the axioms it read: the literals' parts, the anonymous
 /// individuals, and the diagnostics of OWL 2 DL's global restrictions.
 pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms) {
+    crate::diagnostics::leave_out_reserved(ontology, terms);
     ontology.data = data_terms(ontology, terms);
     ontology.anonymous = ontology
         .axioms
@@ -231,6 +234,24 @@ fn data_terms(o: &Ontology, terms: &dyn Terms) -> DataTerms {
                 iris.insert(*t);
             }
             _ => {}
+        }
+    }
+    // The rules' literals and built-ins.
+    for atom in o.rules.iter().flat_map(|r| r.body.iter().chain(&r.head)) {
+        use crate::rules::{Atom, DArg};
+        let mut args: Vec<DArg> = Vec::new();
+        match atom {
+            Atom::Range(_, v) | Atom::Data(_, _, v) => args.push(*v),
+            Atom::BuiltIn(b, xs) => {
+                iris.insert(*b);
+                args.extend(xs);
+            }
+            _ => {}
+        }
+        for a in args {
+            if let DArg::Literal(l) = a {
+                literals.insert(l);
+            }
         }
     }
     // IRIs: as the source writes them, else those of the datatype map it has ids for.
@@ -852,6 +873,17 @@ impl<'a> Reader<'a> {
 
     // Axioms ---------------------------------------------------------------------------
 
+    /// A disjointness's axioms (`Disjoint::axioms`): a repeated operand reported.
+    fn disjoint(&mut self, d: Disjoint, triple: [Term; 3]) {
+        let (axioms, repeated) = d.axioms(&mut self.classes, &mut self.ranges);
+        if repeated {
+            self.report(Diagnostic::RepeatedOperand);
+        }
+        for a in axioms {
+            self.add(a, triple);
+        }
+    }
+
     fn add(&mut self, axiom: Axiom, triple: [Term; 3]) {
         let mut triples = vec![triple];
         triples.append(&mut self.collected);
@@ -936,7 +968,7 @@ impl<'a> Reader<'a> {
             if let Some(members) = self.list(list)
                 && let Some(classes) = self.classes(&members)
             {
-                self.add(Axiom::DisjointClasses(canonical(classes)), triple);
+                self.disjoint(Disjoint::Classes(classes), triple);
             }
         } else if is(class, v.owl_all_disjoint_properties) {
             self.collect(triple);
@@ -947,16 +979,13 @@ impl<'a> Reader<'a> {
                 if members.iter().all(|&p| self.kind(p) == TermKind::Iri)
                     && members.iter().all(|&p| self.is_data_property(p))
                 {
-                    self.add(Axiom::DisjointDataProperties(canonical(members)), triple);
+                    self.disjoint(Disjoint::Data(members), triple);
                 } else if let Some(properties) = members
                     .iter()
                     .map(|&p| self.object_property(p))
                     .collect::<Option<Vec<_>>>()
                 {
-                    self.add(
-                        Axiom::DisjointObjectProperties(canonical(properties)),
-                        triple,
-                    );
+                    self.disjoint(Disjoint::Objects(properties), triple);
                 }
             }
         } else if is(class, v.owl_all_different) {
@@ -967,7 +996,7 @@ impl<'a> Reader<'a> {
             if let Some(list) = list
                 && let Some(members) = self.list(list)
             {
-                self.add(Axiom::DifferentIndividuals(canonical(members)), triple);
+                self.disjoint(Disjoint::Individuals(members), triple);
             }
         } else if is(class, v.owl_negative_property_assertion) {
             self.collect(triple);
@@ -1028,7 +1057,7 @@ impl<'a> Reader<'a> {
             }
         } else if is(p, v.owl_disjoint_with) {
             if let (Some(a), Some(b)) = (self.class(s), self.class(o)) {
-                self.add(Axiom::DisjointClasses(canonical(vec![a, b])), triple);
+                self.disjoint(Disjoint::Classes(vec![a, b]), triple);
             }
         } else if is(p, v.owl_disjoint_union_of) {
             if let Some(members) = self.list(o)
@@ -1059,25 +1088,23 @@ impl<'a> Reader<'a> {
         } else if is(p, v.owl_equivalent_property) || is(p, v.owl_property_disjoint_with) {
             let equivalent = is(p, v.owl_equivalent_property);
             if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
-                let pair = canonical(vec![s, o]);
-                self.add(
-                    if equivalent {
-                        Axiom::EquivalentDataProperties(pair)
-                    } else {
-                        Axiom::DisjointDataProperties(pair)
-                    },
-                    triple,
-                );
+                if equivalent {
+                    self.add(
+                        Axiom::EquivalentDataProperties(canonical(vec![s, o])),
+                        triple,
+                    );
+                } else {
+                    self.disjoint(Disjoint::Data(vec![s, o]), triple);
+                }
             } else if let (Some(a), Some(b)) = (self.object_property(s), self.object_property(o)) {
-                let pair = canonical(vec![a, b]);
-                self.add(
-                    if equivalent {
-                        Axiom::EquivalentObjectProperties(pair)
-                    } else {
-                        Axiom::DisjointObjectProperties(pair)
-                    },
-                    triple,
-                );
+                if equivalent {
+                    self.add(
+                        Axiom::EquivalentObjectProperties(canonical(vec![a, b])),
+                        triple,
+                    );
+                } else {
+                    self.disjoint(Disjoint::Objects(vec![a, b]), triple);
+                }
             }
         } else if is(p, v.owl_inverse_of) {
             if self.kind(s) == TermKind::Iri
@@ -1126,7 +1153,7 @@ impl<'a> Reader<'a> {
         } else if is(p, v.owl_same_as) {
             self.add(Axiom::SameIndividual(canonical(vec![s, o])), triple);
         } else if is(p, v.owl_different_from) {
-            self.add(Axiom::DifferentIndividuals(canonical(vec![s, o])), triple);
+            self.disjoint(Disjoint::Individuals(vec![s, o]), triple);
         } else if self.kind(s) == TermKind::Iri
             && [
                 v.owl_intersection_of,
@@ -1307,6 +1334,7 @@ impl<'a> Reader<'a> {
             builtin: BuiltinProperties::of(&self.v),
             data: DataTerms::default(),
             anonymous: BTreeSet::new(),
+            rules: Vec::new(),
         };
         complete(&mut ontology, self.terms);
         ontology

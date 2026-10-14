@@ -458,6 +458,55 @@ impl DatatypeTheory {
         }
     }
 
+    /// Values for the variables of `component` (in its order) under their constraints,
+    /// pairwise different where unequal, each from the certain part of its values (its
+    /// subset, sampled: `ValueSet::sample`): a model's data values. `None` where none is
+    /// found so: a set that isn't exact, a sample that misses, `stop`.
+    pub fn assign(
+        &self,
+        component: &[DataVar],
+        ranges: &Ranges,
+        deps: &mut DepSets,
+        stop: &dyn Fn() -> bool,
+    ) -> Option<Vec<Value>> {
+        let members = self.members(deps);
+        let local = self.local(component, deps);
+        if local.edges.iter().any(|&(a, b, _)| a == b) {
+            return None;
+        }
+        let mut lists: Vec<(usize, Vec<Value>)> = Vec::with_capacity(component.len());
+        for (i, &DataVar(v)) in component.iter().enumerate() {
+            let constraints =
+                self.constraints_of(members.get(&v).map_or(&[][..], Vec::as_slice), deps);
+            let values = Self::values(&constraints, ranges);
+            let list = values.under.sample(local.adjacent[i].len() + 1);
+            if list.is_empty() {
+                return None;
+            }
+            lists.push((i, list));
+        }
+        lists.sort_by_key(|(_, list)| list.len());
+        let position: HashMap<usize, usize> = lists
+            .iter()
+            .enumerate()
+            .map(|(k, &(i, _))| (i, k))
+            .collect();
+        let neighbours: Vec<Vec<usize>> = lists
+            .iter()
+            .map(|&(i, _)| local.adjacent[i].iter().map(|j| position[j]).collect())
+            .collect();
+        let mut chosen: Vec<Option<usize>> = vec![None; lists.len()];
+        let mut steps = 0u64;
+        if Self::search(0, &lists, &neighbours, &mut chosen, &mut steps, stop) != Some(true) {
+            return None;
+        }
+        let mut out: Vec<Option<Value>> = vec![None; component.len()];
+        for (k, (i, list)) in lists.iter().enumerate() {
+            out[*i] = chosen[k].map(|j| list[j].clone());
+        }
+        out.into_iter().collect()
+    }
+
     /// Values for `small[at..]` unequal to their neighbours' chosen ones: whether there
     /// are (`None`: stopped). Exponential in the worst case (list colouring); `stop` is
     /// asked every [`STOP_EVERY`] steps.

@@ -12,13 +12,15 @@
 //!   direct semantics, independently of the engines;
 //! - [`scope`]: the answers and certificates of the small-scope check (§11);
 //! - [`memory`]: what the engines and compiling hold, drawn from a request's envelope;
-//! - [`limits`]: the budgets, each a caller's setting, none built in.
+//! - [`limits`]: the budgets, each a caller's setting, none built in;
+//! - [`beyond`]: inputs outside OWL 2 DL, decided where that is sound (§16).
 //!
 //! Each module is its own package with its own gates (owl2-dl-performance.md §6).
 
 mod cancel;
 pub use cancel::Cancel;
 
+pub mod beyond;
 pub mod bounds;
 pub mod certificate;
 pub mod classify;

@@ -1,0 +1,5 @@
+# Species-Full tests whose answer differs from the direct-semantics answer the suite gives,
+# each with why NRESE's answer is the direct semantics' (the suite labels these tests with
+# both semantics; their expected answer holds under the RDF-Based Semantics only).
+WebOnt-Ontology-003 (NegativeEntailmentTest)	the non-conclusion's axioms (auto : Car, car : Automobile) follow from Car ≡ Automobile; what isn't entailed is its owl:Ontology triple, which the direct semantics doesn't interpret (Direct Semantics §2.5: entailment is of axioms)
+rdfbased-sem-eqdis-sameas-subst (PositiveEntailmentTest)	p2 owl:sameAs p1 relates two individuals; under the direct semantics a property punned with an individual stays apart from it (Structural Specification §5.9), so s1 p2 o1 isn't entailed; the substitution is the RDF-Based Semantics'
