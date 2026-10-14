@@ -136,9 +136,16 @@ pub struct Program {
     pub keyed: hashbrown::HashMap<(u8, RoleId, ConceptId), Vec<Slot>>,
     pub funcs: Vec<Func>,
     pub at_most_one: Vec<AtMostOne>,
+    /// The Eq rule merges on certain atoms only (the at-most-one clause's premises
+    /// unconditional), as Konclude's extended saturation and Kazakov's Horn-SHIQ rules do;
+    /// a merge resting on possible atoms leaves its context incomplete instead.
+    pub certain_merges: bool,
     /// The at-most-one clauses by their role atom's kind and role, and by guard concept.
     pub at_most_one_by_role: hashbrown::HashMap<(Kind, RoleId), Vec<u32>>,
     pub at_most_one_by_guard: hashbrown::HashMap<ConceptId, Vec<u32>>,
+    /// The roles (by kind) an at-most-one clause constrains, itself or through the role
+    /// inclusions below it: a successor over one may be merged ([`super::Strategy::Functional`]).
+    pub merge_roles: hashbrown::HashSet<(Kind, RoleId)>,
     /// The successor triggers `Su(O)` (Definition 2), with the fillers of existentials
     /// added: `B(x)`, `S(x, y)`, `S(y, x)`.
     pub su_concept: Vec<bool>,
@@ -158,7 +165,7 @@ pub struct Program {
 
 impl Program {
     pub(super) fn bytes(&self) -> usize {
-        use super::memory::{lists, map, nested, vec};
+        use super::memory::{lists, map, nested, table, vec};
         let sources = |s: &Sources| {
             std::mem::size_of_val(&**s)
                 + s.iter().map(|s| std::mem::size_of_val(&**s)).sum::<usize>()
@@ -190,6 +197,7 @@ impl Program {
                 .sum::<usize>()
             + lists(&self.at_most_one_by_role)
             + lists(&self.at_most_one_by_guard)
+            + table::<(Kind, RoleId), ()>(self.merge_roles.capacity())
             + vec(&self.su_concept)
             + vec(&self.su_out)
             + vec(&self.su_in)
@@ -381,6 +389,44 @@ impl Program {
                     .push(i as u32);
             }
         }
+    }
+
+    /// The roles an at-most-one clause constrains, and those below them by the role
+    /// inclusions `S(x, z) → R(x, z)` (`R(z, x)` for an inverse), both directions.
+    pub(super) fn roles_below_at_most_one(&self) -> hashbrown::HashSet<(Kind, RoleId)> {
+        let flip = |k: Kind| if k == Kind::In { Kind::Out } else { Kind::In };
+        let mut down: hashbrown::HashMap<(Kind, RoleId), Vec<(Kind, RoleId)>> =
+            hashbrown::HashMap::new();
+        for c in &self.clauses {
+            let ([b], Some(h)) = (&c.body[..], c.head) else {
+                continue;
+            };
+            let (kb, s, z) = match *b {
+                BodyPat::Out(s, Var::Z(z)) => (Kind::Out, s, z),
+                BodyPat::In(s, z) => (Kind::In, s, z),
+                _ => continue,
+            };
+            if h.term != TermPat::Var(Var::Z(z)) || h.kind == KindPat::Concept {
+                continue;
+            }
+            let kh = h.kind.kind();
+            down.entry((kh, h.pred)).or_default().push((kb, s));
+            down.entry((flip(kh), h.pred))
+                .or_default()
+                .push((flip(kb), s));
+        }
+        let mut out: hashbrown::HashSet<(Kind, RoleId)> = hashbrown::HashSet::new();
+        let mut stack: Vec<(Kind, RoleId)> = self
+            .at_most_one
+            .iter()
+            .flat_map(|a| [(a.kind, a.role), (flip(a.kind), a.role)])
+            .collect();
+        while let Some(r) = stack.pop() {
+            if out.insert(r) {
+                stack.extend(down.get(&r).into_iter().flatten().copied());
+            }
+        }
+        out
     }
 
     /// The named class of a concept, if it is one.

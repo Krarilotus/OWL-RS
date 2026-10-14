@@ -44,6 +44,11 @@ pub enum Strategy {
     /// development set the shared one held 25-80 % of all clauses, 99 % of what it
     /// derived redundant).
     Split,
+    /// As `Split`, but a successor over a role an at-most-one clause may merge it by
+    /// (`Program::merge_roles`) gets the core `K₁` (as `Eager`): its merges then rest on
+    /// certain atoms. Konclude's extended saturation extends a shared representative where
+    /// a merge needs it and shares it elsewhere (Steigmiller and Glimm, JAIR 2015, §5).
+    Functional,
 }
 
 /// A context: its inbox, activation flag, core and state.
@@ -215,7 +220,12 @@ pub struct Budget {
 }
 
 impl Engine {
-    pub fn new(program: Program, strategy: Strategy, proofs: bool, budget: Budget) -> Self {
+    pub fn new(mut program: Program, strategy: Strategy, proofs: bool, budget: Budget) -> Self {
+        // This index belongs to the Functional strategy, not the shared compilation.
+        program.merge_roles = match strategy {
+            Strategy::Functional => program.roles_below_at_most_one(),
+            _ => Default::default(),
+        };
         let envelope = budget
             .memory
             .as_ref()

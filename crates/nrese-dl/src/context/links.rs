@@ -218,7 +218,16 @@ impl Worker<'_> {
         }
         // No edge holds K₂: the strategy picks the successor.
         let mut tag = 0;
-        let core: Vec<Atom> = match self.engine.strategy {
+        let (kind, role) = program.funcs[f as usize].role;
+        let strategy = match self.engine.strategy {
+            Strategy::Functional if program.merge_roles.contains(&(kind.kind(), role)) => {
+                Strategy::Eager
+            }
+            Strategy::Functional => Strategy::Split,
+            other => other,
+        };
+        let core: Vec<Atom> = match strategy {
+            Strategy::Functional => unreachable!("resolved above"),
             Strategy::Cautious | Strategy::Split => {
                 let core: Vec<Atom> = program.funcs[f as usize]
                     .filler
@@ -226,7 +235,7 @@ impl Worker<'_> {
                     .filter(|a| entry.k1.contains(a))
                     .into_iter()
                     .collect();
-                if core.is_empty() && self.engine.strategy == Strategy::Split {
+                if core.is_empty() && strategy == Strategy::Split {
                     tag = f + 1;
                 }
                 core

@@ -96,6 +96,14 @@ pub struct Options {
     /// The context core takes functional properties with its Eq rule
     /// ([`crate::context::Options::equality`]).
     pub equality: bool,
+    /// With `equality`: merge only on certain atoms ([`crate::context::Options::certain_merges`]).
+    pub certain_merges: bool,
+    /// Try the context core's Eq rule with certain merges and the Functional strategy
+    /// before the configured run. A successor that may merge takes every trigger; other
+    /// successors share. The attempt uses half the time remaining in the core's budget,
+    /// or half `lower_bound_timeout` without a deadline, and the caller's memory budget.
+    /// `None` for both times is unlimited. Off by default.
+    pub functional_route: bool,
     /// How `nrese-owl` normalises (never with lazy definitions: see the default).
     pub normalise: nrese_owl::Options,
     /// The phases as they start, on stderr, with the time since the classification began
@@ -104,6 +112,39 @@ pub struct Options {
 }
 
 impl Options {
+    /// The existing functional route, within the configured budget; no separate envelope.
+    pub(crate) fn functional_attempt(
+        &self,
+        core: &crate::context::Options,
+        normalised: &Normalised,
+    ) -> Option<crate::context::Options> {
+        if !self.functional_route
+            || core.equality
+            || !normalised
+                .clauses
+                .iter()
+                .any(|c| crate::context::compile::at_most_one(c).is_some())
+        {
+            return None;
+        }
+        let now = Instant::now();
+        let mut budget = core.budget.clone();
+        budget.deadline = budget
+            .deadline
+            .map(|d| d.min(now + d.saturating_duration_since(now) / 2))
+            .or_else(|| {
+                self.lower_bound_timeout
+                    .and_then(|t| now.checked_add(t / 2))
+            });
+        Some(crate::context::Options {
+            equality: true,
+            certain_merges: true,
+            strategy: crate::context::Strategy::Functional,
+            budget,
+            ..core.clone()
+        })
+    }
+
     /// The context core's options for a run of the driver within `budget` (no proofs).
     pub(crate) fn core(&self, budget: crate::context::Budget) -> crate::context::Options {
         crate::context::Options {
@@ -112,6 +153,7 @@ impl Options {
             budget,
             strategy: self.lower_bound_strategy,
             equality: self.equality,
+            certain_merges: self.certain_merges,
             ..crate::context::Options::default()
         }
     }
@@ -148,6 +190,8 @@ impl Default for Options {
             max_memory: None,
             task_memory: None,
             equality: false,
+            certain_merges: false,
+            functional_route: false,
             // No lazy unfolding: it under-approximates the unfolded classes in a model, and
             // the driver reads its subsumers off model labels. No proofs are read here, so
             // the minimal automata do.
@@ -257,13 +301,21 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
     if options.context_core {
         let core = options.core(deadline.budget(options, None));
         let t = Instant::now();
-        if let Ok(saturated) = crate::context::saturate_normalised(
-            &normalised,
-            &classes,
-            &core,
-            options.tableau.cancel.clone(),
-            &options.workers,
-        ) && saturated.complete()
+        let attempts = options
+            .functional_attempt(&core, &normalised)
+            .into_iter()
+            .chain(std::iter::once(core));
+        if let Some(saturated) = attempts
+            .map(|core| {
+                crate::context::saturate_normalised(
+                    &normalised,
+                    &classes,
+                    &core,
+                    options.tableau.cancel.clone(),
+                    &options.workers,
+                )
+            })
+            .find_map(|run| run.ok().filter(crate::context::Saturated::complete))
         {
             let classification = saturated.classification();
             let profile = Profile {
@@ -318,6 +370,81 @@ pub(crate) fn classify_normalised(
 #[cfg(test)]
 mod memory_policy_tests {
     use super::*;
+
+    fn functional_normalised() -> Normalised {
+        let mut ontology = Ontology::default();
+        ontology.axioms.push(nrese_owl::Axiom::ObjectCharacteristic(
+            nrese_owl::Characteristic::Functional,
+            nrese_owl::ObjProp::Named(1),
+        ));
+        nrese_owl::normalise(&ontology)
+    }
+
+    #[test]
+    fn the_functional_attempt_keeps_the_callers_memory_and_unlimited_settings() {
+        let normalised = functional_normalised();
+        let mut options = Options {
+            lower_bound_timeout: None,
+            ..Options::default()
+        };
+        let core = options.core(Deadline::new(None).budget(&options, None));
+        assert!(options.functional_attempt(&core, &normalised).is_none());
+        options.functional_route = true;
+        let route = options.functional_attempt(&core, &normalised).unwrap();
+        assert_eq!(route.budget, core.budget);
+        assert!(route.equality && route.certain_merges);
+        assert_eq!(route.strategy, crate::context::Strategy::Functional);
+        let memory = nrese_exec::Envelope::new(Some(128), None);
+        let mut held = nrese_exec::Reservation::new(memory.clone());
+        held.charge(64).unwrap();
+        for task_memory in [None, Some(1), Some(3 << 30)] {
+            let mut core = core.clone();
+            core.budget.memory = Some(memory.clone());
+            core.budget.task_memory = task_memory;
+            let route = options.functional_attempt(&core, &normalised).unwrap();
+            assert_eq!(route.budget, core.budget);
+            let shared = route.budget.memory.as_ref().unwrap();
+            assert_eq!(shared.remaining(), 64);
+            assert!(
+                shared.charge(65).is_err(),
+                "the attempt shares the remainder"
+            );
+        }
+        assert!(options.functional_attempt(&route, &normalised).is_none());
+        assert!(
+            options
+                .functional_attempt(&core, &Normalised::default())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn the_functional_attempt_cannot_restart_or_extend_the_parent_deadline() {
+        let normalised = functional_normalised();
+        let mut options = Options {
+            functional_route: true,
+            lower_bound_timeout: None,
+            ..Options::default()
+        };
+        let expired = Instant::now();
+        for end in [expired, expired + Duration::from_secs(60)] {
+            let core = options.core(Deadline(Some(end)).budget(&options, None));
+            let route = options.functional_attempt(&core, &normalised).unwrap();
+            assert!(route.budget.deadline.unwrap() <= end);
+            if end == expired {
+                assert_eq!(route.budget.deadline, Some(end));
+            }
+        }
+        options.lower_bound_timeout = Some(Duration::ZERO);
+        let before = Instant::now();
+        let core = options.core(Deadline::new(None).budget(&options, None));
+        let route = options.functional_attempt(&core, &normalised).unwrap();
+        assert!((before..=Instant::now()).contains(&route.budget.deadline.unwrap()));
+        assert_eq!(
+            core.budget.deadline, None,
+            "fallback keeps the original budget"
+        );
+    }
 
     #[test]
     fn the_process_watch_is_the_callers_and_none_is_built_in() {
