@@ -11,7 +11,8 @@
 //! - **Metamorphic:** the answer is the same with each optimisation off, under renaming
 //!   and with the axioms shuffled.
 //!
-//! `NRESE_FUZZ_CASES` and `NRESE_FUZZ_SEED` widen or move a campaign.
+//! `NRESE_FUZZ_CASES` and `NRESE_FUZZ_SEED` widen or move a campaign;
+//! `NRESE_FUZZ_MAX_MEMORY_MB` is each run's memory budget (MiB or `unlimited`).
 
 mod ni_gen;
 mod semantics;
@@ -28,12 +29,28 @@ fn env(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
 }
 
+/// The memory one run may hold, in bytes: `NRESE_FUZZ_MAX_MEMORY_MB` (MiB, or `unlimited`;
+/// default 1024). A case past it gives up and is counted so, rather than the host killing
+/// the campaign (seed 600026: one case held about 6 GB unbounded, the answers right).
+fn max_memory() -> Option<usize> {
+    match std::env::var("NRESE_FUZZ_MAX_MEMORY_MB").ok().as_deref() {
+        Some("unlimited") => None,
+        Some(mb) => Some(
+            mb.parse::<usize>()
+                .expect("NRESE_FUZZ_MAX_MEMORY_MB: MiB or unlimited")
+                << 20,
+        ),
+        None => Some(1024 << 20),
+    }
+}
+
 fn configs() -> Vec<(&'static str, Config)> {
     // Every blocking pass is checked against a recomputation from scratch.
     let base = Config {
         max_nodes: Some(5_000),
         max_branch_points: Some(5_000),
         timeout: Some(std::time::Duration::from_secs(300)),
+        max_memory: max_memory(),
         check_blocking: true,
         ..Config::default()
     };
@@ -306,6 +323,10 @@ fn check_case(
                 if *name == "default" {
                     tally.gave_up += 1;
                     eprintln!("case {case}: gave up: {why}");
+                } else if !beyond {
+                    // A variant past a budget the default kept within (the memory budget's
+                    // case, say): reported, its answer not compared.
+                    eprintln!("case {case} ({name}): gave up: {why}");
                 }
             }
         }
@@ -319,6 +340,7 @@ fn check_case(
         max_nodes: Some(5_000),
         max_branch_points: Some(5_000),
         timeout: Some(std::time::Duration::from_secs(300)),
+        max_memory: max_memory(),
         ..Config::default()
     };
     let renamed = fuzz::rename(o, &|t| t + 1000);
@@ -419,6 +441,7 @@ fn counted_products_agree_with_the_semantics() {
         keep_model: true,
         max_branch_points: Some(20_000),
         timeout: Some(std::time::Duration::from_secs(300)),
+        max_memory: max_memory(),
         ..Config::default()
     };
     for n in 1..=5u32 {
