@@ -344,6 +344,16 @@ fn islands_decide_as_the_whole_abox_does() {
 /// assertions and adds some about a few individuals, deciding only the islands with one
 /// of them gives what a cold check of the whole ontology gives. Counts the cases the
 /// incremental path decided, so the test can't pass by falling back.
+///
+/// A case reaches the path only from a consistent ontology, and about three quarters of
+/// the generator's are not (inconsistent or over the budget): that share is the
+/// generator's, not the path's. So the coverage is counted against the cases that reach
+/// it (`eligible`): the path decides at least half of them (over 1,000 seeds at least 69 %,
+/// the rest the declines below), every decline is one the module documents (the ABox one
+/// island, a nominal in a conclusion, the universal property), and cases are drawn until
+/// a fifth of all drawn were decided incrementally (up to ten times as many), so the
+/// agreement rests on as many incremental cases whatever the seed (seeds 600006, 600012,
+/// 600055, 600061 landed 45 to 47 of 240 short of the fixed floor of 48).
 #[test]
 fn touched_islands_decide_as_a_cold_check_does() {
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(240);
@@ -354,9 +364,22 @@ fn touched_islands_decide_as_a_cold_check_does() {
         timeout: Some(std::time::Duration::from_secs(60)),
         ..Config::default()
     };
-    let (mut incremental, mut inconsistent) = (0u64, 0u64);
+    let (mut incremental, mut inconsistent, mut eligible) = (0u64, 0u64, 0u64);
     let mut failures = Vec::new();
-    for case in 0..cases {
+    let documented = [
+        "the ABox is one island",
+        "a nominal in a conclusion",
+        "the ontology uses the universal property",
+    ];
+    let covered = |drawn: u64, incremental: u64, eligible: u64, inconsistent: u64| {
+        incremental * 5 >= drawn && incremental * 2 >= eligible && inconsistent > 0
+    };
+    let mut drawn = 0;
+    for case in 0..cases * 10 {
+        if case >= cases && covered(drawn, incremental, eligible, inconsistent) {
+            break;
+        }
+        drawn += 1;
         let mut rng = Rng::new(seed.wrapping_add(case));
         let mut names: HashMap<String, Term> = HashMap::new();
         let mut intern = |n: &Name| {
@@ -385,6 +408,7 @@ fn touched_islands_decide_as_a_cold_check_does() {
         if decided(&tableau::consistency(&before, &config).answer) != Some(true) {
             continue;
         }
+        eligible += 1;
         // The change: some assertions removed, a few added (another ABox's).
         let mut after = before.clone();
         let assertions: Vec<usize> = (0..after.axioms.len())
@@ -428,6 +452,12 @@ fn touched_islands_decide_as_a_cold_check_does() {
         after.sources = vec![Vec::new(); after.axioms.len()];
         let cold = decided(&tableau::consistency(&after, &config).answer);
         let Some(outcome) = islands::after_assertions(&after, &touched, &config) else {
+            // Declined: the ABox is decided whole, for a reason the module documents.
+            if let islands::Split::Whole(why) = islands::split(&after)
+                && !documented.iter().any(|d| why.starts_with(d))
+            {
+                failures.push(format!("case {case} (seed {seed}): declined: {why}"));
+            }
             continue;
         };
         if let (Some(c), Some(i)) = (cold, decided(&outcome.answer)) {
@@ -440,11 +470,14 @@ fn touched_islands_decide_as_a_cold_check_does() {
             }
         }
     }
-    eprintln!("{cases} cases: {incremental} decided incrementally, {inconsistent} inconsistent");
+    eprintln!(
+        "{drawn} cases: {eligible} from a consistent ontology, {incremental} decided \
+         incrementally, {inconsistent} inconsistent"
+    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     assert!(
-        incremental * 5 >= cases,
-        "only {incremental} of {cases} decided incrementally"
+        covered(drawn, incremental, eligible, inconsistent),
+        "{drawn} cases: {eligible} from a consistent ontology, {incremental} decided \
+         incrementally, {inconsistent} inconsistent"
     );
-    assert!(inconsistent > 0, "no change made the ontology inconsistent");
 }
