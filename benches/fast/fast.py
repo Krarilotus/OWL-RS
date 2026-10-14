@@ -232,19 +232,27 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     argv = [*scope_argv(unit, f"{int(cap_gb * 1024)}m"), "sh", "-c", wrapper, "sh",
             *(native(c, dirs) for c in command)]
     started = time.monotonic()
+    cleanup_error = ""
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
                               errors="replace", env={**ENV, **{k: str(v) for k, v in (env or {}).items()}})
     except subprocess.TimeoutExpired:
-        return 124, "", f"timed out after {timeout} s", time.monotonic() - started
+        done = subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout} s")
     finally:
         # Nothing outlives its case: what the scope still holds (a child the command left) goes.
-        end_scope(unit)
+        try:
+            end_scope(unit)
+        except Exception as error:
+            cleanup_error = f"scope cleanup failed ({unit}): {error}"
+            # Report a secondary cleanup failure without replacing an in-flight exception.
+            print(cleanup_error, file=sys.stderr)
     # The peak first: a record's note is the last line of stderr, the command's own.
     peaks = SCOPE_PEAK.findall(done.stderr)
     err = SCOPE_PEAK.sub("", done.stderr).rstrip("\n")
     err = (f"fast-scope-peak {peaks[-1]}\n" if peaks else "") + err
-    return done.returncode, done.stdout, err, time.monotonic() - started
+    if cleanup_error:
+        err += "\n" + cleanup_error
+    return done.returncode or (1 if cleanup_error else 0), done.stdout, err, time.monotonic() - started
 
 
 def scope_peak_mib(stderr: str) -> int | None:

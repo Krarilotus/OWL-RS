@@ -42,6 +42,15 @@ For every workload tier and every system that can run it, `--runs` times (defaul
 
 Then its containers, store and scratch are removed. The run's `manifest.json` records what it was measured with (`suitekit/manifest.py`). At the end of the run, what the run made is removed too: the datasets it prepared, the NRESE build volume, images it pulled or built. `--keep` (or `NRESE_BENCH_KEEP=1`) keeps them for the next run of a batch; installed tools (`install-tools.sh`) always stay. A dry run prints every command and writes nothing that stays.
 
+Cleanup owns only resources created by that invocation. Existing stores and scratch names
+are refused; shared inputs, previously installed images and historical results stay intact.
+Workers and accounting scopes must finish before their stores can be removed. A failed
+removal stays tracked for retry, with errors and retained resources recorded in the final
+manifest. Cleanup failure makes an otherwise successful invocation fail; an earlier failure
+or interruption keeps its original outcome. `--keep` retains reusable inputs and builds,
+not per-run workers or stores. Forced termination that prevents Python cleanup requires the
+job scheduler to stop its remaining workers; retained artifacts must be reviewed before removal.
+
 **Caches and order: every system's strengths count.** No system's advantage is switched off to level the field. Systems with a result cache (QLever, NRESE) run the queries twice: with the cache off (repeated runs measure evaluation), then, after a restart that empties it, with the system's default cache (repeated runs measure what a user sending the same query again sees). Both lines are reported (`--cache off,on`, the default; `off` or `on` alone). Queries run in rounds over the whole mix, each round shuffled (`--order shuffled`, the default; `--order fixed` runs each query's runs back to back). Repetition r uses seed `seed·1000 + r` (`--seed`, default 1), the same orders for every system, recorded in the `order` column. The first execution of each query is reported apart: on a fresh server, the cold case.
 
 **Regimes.** A reasoning workload names the regimes it accepts, in order of preference (LUBM: OWL 2 RL, else OWL-Horst); each system runs the first it has. Results are compared within one regime only.

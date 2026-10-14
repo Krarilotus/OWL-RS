@@ -56,6 +56,30 @@ class CaseTimeouts(unittest.TestCase):
 
 
 class RuntimeTimeouts(unittest.TestCase):
+    def test_scope_cleanup_failure_cannot_pass_or_hide_a_primary_failure(self):
+        primary = ValueError("original failure")
+        for outcome, expected in ((0, 1), (7, 7), (subprocess.TimeoutExpired("example", 1), 124),
+                                  (primary, None)):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                with patch.object(fast, "SCRATCH", root), patch.object(fast, "FAST_DATA", root), \
+                        patch.object(fast, "native_dirs", return_value={}), \
+                        patch.object(fast, "native", side_effect=lambda text, dirs: text), \
+                        patch.object(fast, "end_scope", side_effect=RuntimeError("owned scope remains")), \
+                        patch.object(fast.subprocess, "run") as process:
+                    if isinstance(outcome, BaseException):
+                        process.side_effect = outcome
+                    else:
+                        process.return_value = SimpleNamespace(returncode=outcome, stdout="answer", stderr="")
+                    if expected is None:
+                        with self.assertRaises(ValueError) as raised:
+                            fast.process("cleanup-contract", 2, ["example"], timeout=1)
+                        self.assertIs(raised.exception, primary)
+                    else:
+                        code, _, error, _ = fast.process("cleanup-contract", 2, ["example"], timeout=1)
+                        self.assertEqual(code, expected)
+                        self.assertIn("owned scope remains", error)
+
     def test_limits_reach_docker_and_native_subprocesses(self):
         for runtime in ("docker", "native"):
             for timeout in (1800, None):

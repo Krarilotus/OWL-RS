@@ -12,7 +12,7 @@ and are judged by its `versus` and `standings` ([../suite/README.md](../suite/RE
 | Order | Benchmark | Home turf of | State |
 |---|---|---|---|
 | 1 | Sparqloscope on DBLP | QLever | data, queries, bar ready; NRESE qualified once on the monthly dump (which proved the wrong data, below); QLever's reproduction queued on phuoc-yu |
-| 1 | BSBM V3.1 explore and BI, 1 to 64 clients | Virtuoso | data (exact published sizes), driver, qualification ready; runs queued |
+| 1 | BSBM V3.1 explore and BI, 1 to 64 clients | Virtuoso | data and driver preserved; full answer qualification blocked by the driver limitations below |
 | 1 | WatDiv basic testing | Oxigraph, Jena | 10 M (56 queries) and 100 M (196 queries) ready; 10 M runs the runtime's qualification |
 | 1 | G-CARE | the planner's estimates (G-CARE's estimators) | data, queries, truths, both runners ready; NRESE measured on HUMAN |
 | backlog | SP2Bench | Oxigraph, Jena | data generated; the generated documents don't reproduce the paper's result sizes (below) |
@@ -28,6 +28,30 @@ and are judged by its `versus` and `standings` ([../suite/README.md](../suite/RE
 | WatDiv | its authors' `watdiv.10M` and `watdiv.100M` (sources.sha256) | the 20 basic-testing templates of v0.6, instantiated from each dataset's saved generator state ([watdiv/queries.sh](watdiv/queries.sh)); 56 distinct queries at 10 M | the reference systems (no published answers) | none for Oxigraph or Jena; the WatDiv paper's systems are others |
 | G-CARE | its four graphs as RDF ([gcare/convert.py](gcare/convert.py)): AIDS 0.8 M, HUMAN 0.2 M, LUBM80 20.4 M, YAGO 58.3 M statements | its 2,201 query graphs as SPARQL patterns | the published true cardinalities (G-CARE counts homomorphisms, as SPARQL does; checked on HUMAN) | G-CARE's estimators run by its own code and procedure ([gcare/run-gcare.sh](gcare/run-gcare.sh)): q-error percentiles over 30 trials per query |
 | SP2Bench | v1.01 `sp2b_gen`, 1 M and 25 M triples, written as N-Triples by Jena's riot | its 17 queries | the paper's Table V | none at 25 M (the paper's systems all failed there) |
+
+## BSBM qualification boundary (14 October 2026)
+
+The pinned BIBM 0.7.8 source archive has SHA-256
+`4f36056e99d8d2fe7dbc99efc8b80f9629dce63119ccaeffcf90c9cf0e710793`.
+Its Explore mix contains 25 requests: 20 SELECT, four q9 DESCRIBE and one q12 CONSTRUCT.
+Twenty qualification mixes therefore contain 500 executions: 400 SELECT and 100 graph
+requests. q6 is not selected by that mix. BI's drill expansion depends on the preserved
+test-data hierarchy: with L levels, twenty mixes require `80*L+20` executions.
+
+The archived driver assembles qualification answers only for SELECT. For graph requests it
+consumes the response bytes but emits empty qualification records, which its comparator
+cannot compare. XML counts and process exit zero therefore do not establish full answer
+qualification. This is a source audit; equivalence with the deployed bytecode has not been
+demonstrated. The active descriptors have no `resultKeys`: the comparator uses positional
+comparison, whose ordering assumptions also require checking for unordered queries and ties.
+
+Keep every request in the timed mix. q12 needs graph-answer comparison; byte counts are not
+equivalence. q9's description is chosen by the service under
+[SPARQL 1.1 section 16.4](https://www.w3.org/TR/sparql11-query/#describe), so different graphs
+are not automatically an engine error. Record that semantic policy separately from exact
+cross-engine answer agreement. Complete timing coverage, comparable answers and
+implementation-dependent answers must remain distinguishable; partial SELECT qualification
+must not be reported as a fully qualified Explore run. The driver consolidation is pending.
 
 ## Configurations
 
