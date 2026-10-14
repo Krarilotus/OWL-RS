@@ -198,6 +198,59 @@ fn probe_cursors_read_what_scans_read() {
     }
 }
 
+/// A walk over a pattern's groups in parts (`group_cuts_in`, then `group_counts_range_in`
+/// between the cuts) finds the groups the whole walk finds, over stacks of several runs
+/// with deletions, in both layouts, for every permutation that groups the pattern.
+#[test]
+fn group_walks_in_parts_find_the_whole_walks_groups() {
+    use nrese_engine::quad::Permutation;
+    for (seed, named) in [(4, false), (5, true)] {
+        let (engine, ids) = store(seed, named);
+        let snapshot = engine.snapshot();
+        let mut rng = Rng(seed * 11);
+        for model in MODELS {
+            for graph in graphs(&ids) {
+                for shape in 0..8u8 {
+                    let bound = [shape & 1 != 0, shape & 2 != 0, shape & 4 != 0];
+                    let p = pattern(&mut rng, &ids, bound, graph);
+                    for permutation in Permutation::ALL {
+                        let Some(whole) = snapshot.group_counts_in(model, &p, permutation) else {
+                            continue;
+                        };
+                        let parts = 1 + rng.below(6) as usize;
+                        let cuts = snapshot
+                            .group_cuts_in(model, &p, permutation, parts)
+                            .expect("cuts where the groups are");
+                        let mut low = 0u64;
+                        let mut got = Vec::new();
+                        for cut in cuts.iter().map(|c| c.raw()).chain([u64::MAX]) {
+                            if cut == 0 {
+                                continue;
+                            }
+                            let high = if cut == u64::MAX { cut } else { cut - 1 };
+                            if low <= high {
+                                got.extend(
+                                    snapshot
+                                        .group_counts_range_in(
+                                            model,
+                                            &p,
+                                            permutation,
+                                            TermId::from_raw(low),
+                                            TermId::from_raw(high),
+                                        )
+                                        .expect("the range of a grouped pattern"),
+                                );
+                            }
+                            low = cut;
+                        }
+                        assert_eq!(got, whole, "{model:?} {permutation:?} {p:?} cuts {cuts:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn leapfrog_seeks_name_the_next_value() {
     let mut skips = 0;

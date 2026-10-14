@@ -113,6 +113,9 @@ pub(crate) fn condition(conjunct: &Expression) -> Option<Condition<'_>> {
     let Expression::FunctionCall(function, args) = conjunct else {
         return None;
     };
+    if *function == Function::Regex {
+        return regex_condition(args);
+    }
     let placement = match function {
         Function::Contains => Placement::Anywhere,
         Function::StrStarts => Placement::Start,
@@ -155,6 +158,55 @@ pub(crate) fn condition(conjunct: &Expression) -> Option<Condition<'_>> {
         of_str,
         language: None,
         fold_case,
+    })
+}
+
+/// `REGEX(?v or STR(?v), "pattern")` without flags whose pattern is literal text, perhaps
+/// anchored (`^text`, `text$`, `^text$`): the prefix, suffix, whole-text or substring test
+/// of that text, on the terms `STRSTARTS` and its kin accept (simple and language-tagged
+/// literals, with `STR` every term; the others are errors for both). Sparqloscope's
+/// `^C`, `^Co`, `^Com` and `com`.
+fn regex_condition(args: &[Expression]) -> Option<Condition<'_>> {
+    let (subject, pattern) = match args {
+        [subject, Expression::Literal(pattern)] => (subject, pattern),
+        [
+            subject,
+            Expression::Literal(pattern),
+            Expression::Literal(flags),
+        ] if flags.value().is_empty() && flags.datatype() == xsd::STRING => (subject, pattern),
+        _ => return None,
+    };
+    if pattern.datatype() != xsd::STRING {
+        return None;
+    }
+    let text = pattern.value();
+    let (text, start) = match text.strip_prefix('^') {
+        Some(rest) => (rest, true),
+        None => (text, false),
+    };
+    let (needle, end) = match text.strip_suffix('$') {
+        Some(rest) => (rest, true),
+        None => (text, false),
+    };
+    const META: &[char] = &[
+        '\\', '^', '$', '.', '|', '?', '*', '+', '(', ')', '[', ']', '{', '}',
+    ];
+    if needle.is_empty() || needle.contains(META) {
+        return None;
+    }
+    let (variable, of_str) = operand(subject)?;
+    Some(Condition {
+        variable,
+        needle,
+        placement: match (start, end) {
+            (true, true) => Placement::Whole,
+            (true, false) => Placement::Start,
+            (false, true) => Placement::End,
+            (false, false) => Placement::Anywhere,
+        },
+        of_str,
+        language: None,
+        fold_case: false,
     })
 }
 

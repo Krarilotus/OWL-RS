@@ -54,8 +54,10 @@ impl std::fmt::Display for TooManyRows {
 impl std::error::Error for TooManyRows {}
 
 /// How far a join may go: at most `max_rows` output rows, and no further once `stop` is set
-/// (the query was cancelled). Both are checked every [`LIMIT_STEP`] output rows, so a
-/// join that would run for hours stops within a few thousand rows of either.
+/// (the query was cancelled) or the process holds more than its memory limit
+/// ([`crate::memory::process_limit_exceeded`]: what a query's budget doesn't account
+/// still can't take the machine). All are checked every [`LIMIT_STEP`] output rows, so a
+/// join that would run for hours stops within a few thousand rows of any.
 #[derive(Debug, Clone, Default)]
 pub struct RowLimit {
     pub max_rows: usize,
@@ -92,6 +94,7 @@ impl Limit {
         self.stop
             .as_ref()
             .is_some_and(|stop| stop.load(AtomicOrdering::Relaxed))
+            || crate::memory::process_limit_exceeded()
     }
 
     fn grow(&self, rows: usize) -> Result<(), TooManyRows> {

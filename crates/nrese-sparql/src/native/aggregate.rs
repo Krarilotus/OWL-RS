@@ -16,6 +16,106 @@ use super::numeric::Numeric;
 use super::value::Value;
 use super::{ScanPattern, Solutions, calendar, expression_variables, pushdown, value};
 
+/// Values an [`Aggregator`] remembers per (expression, id), at most: the groups of one
+/// aggregation share their values, but a scan over millions of distinct names must not
+/// keep them all.
+const MEMO_ENTRIES: usize = 1 << 16;
+
+/// Whether `aggregate` folds a row at a time into a [`Fold`] that merges with the next
+/// rows': COUNT, SAMPLE, MIN, MAX and GROUP_CONCAT without DISTINCT.
+pub(super) fn foldable(aggregate: &AggregateExpression) -> bool {
+    match aggregate {
+        AggregateExpression::CountSolutions { distinct } => !distinct,
+        AggregateExpression::FunctionCall { name, distinct, .. } => {
+            !distinct
+                && matches!(
+                    name,
+                    AggregateFunction::Count
+                        | AggregateFunction::Sample
+                        | AggregateFunction::Min
+                        | AggregateFunction::Max
+                        | AggregateFunction::GroupConcat { .. }
+                )
+        }
+    }
+}
+
+/// Whether `value` replaces `best` as `name`'s extreme (the first of equal ones stays).
+fn better(name: &AggregateFunction, value: &Term, best: &Term) -> bool {
+    let wanted = match name {
+        AggregateFunction::Min => std::cmp::Ordering::Less,
+        _ => std::cmp::Ordering::Greater,
+    };
+    value::order(Some(value), Some(best)) == wanted
+}
+
+/// An aggregate folded over some of a group's rows ([`Aggregator::fold`]).
+pub(super) enum Fold {
+    /// An error made it unbound (MIN, MAX, GROUP_CONCAT).
+    Unbound,
+    Count(u64),
+    Sample(Option<Term>),
+    Extreme(Option<Term>, AggregateFunction),
+    Concat {
+        text: String,
+        values: u64,
+        separator: String,
+    },
+}
+
+impl Fold {
+    /// This part's fold followed by the next part's.
+    pub(super) fn merge(self, next: Fold) -> Fold {
+        match (self, next) {
+            (Fold::Unbound, _) | (_, Fold::Unbound) => Fold::Unbound,
+            (Fold::Count(a), Fold::Count(b)) => Fold::Count(a + b),
+            (Fold::Sample(a), Fold::Sample(b)) => Fold::Sample(a.or(b)),
+            (Fold::Extreme(a, name), Fold::Extreme(b, _)) => {
+                let best = match (a, b) {
+                    (Some(a), Some(b)) => Some(if better(&name, &b, &a) { b } else { a }),
+                    (a, b) => a.or(b),
+                };
+                Fold::Extreme(best, name)
+            }
+            (
+                Fold::Concat {
+                    mut text,
+                    values,
+                    separator,
+                },
+                Fold::Concat {
+                    text: more,
+                    values: added,
+                    ..
+                },
+            ) => {
+                if values > 0 && added > 0 {
+                    text.push_str(&separator);
+                }
+                text.push_str(&more);
+                Fold::Concat {
+                    text,
+                    values: values + added,
+                    separator,
+                }
+            }
+            _ => unreachable!("parts of one aggregate fold alike"),
+        }
+    }
+
+    /// The aggregate's value.
+    pub(super) fn finish(self) -> Agg {
+        match self {
+            Fold::Unbound => Agg::Id(UNDEF),
+            Fold::Count(n) => Agg::Term(integer(n)),
+            Fold::Sample(value) | Fold::Extreme(value, _) => {
+                value.map_or(Agg::Id(UNDEF), Agg::Term)
+            }
+            Fold::Concat { text, .. } => Agg::Term(Literal::new_simple_literal(text).into()),
+        }
+    }
+}
+
 /// An aggregate's value: a stored or computed id, or a new term the query interns.
 pub(super) enum Agg {
     Id(u64),
@@ -74,18 +174,20 @@ impl Aggregator<'_> {
         let mut total = Some(Numeric::Integer(Integer::from(0)));
         let mut error = false;
         for &row in rows {
-            let number =
-                *numbers
-                    .entry((key, table.get(row, column)))
-                    .or_insert_with(|| {
-                        match self.evaluator.eval(expr, &self.binding(solutions, row)) {
-                            None => Number::Error,
-                            Some(term) => match Numeric::of(&Value::of(&term)) {
-                                Some(number) => Number::Value(number),
-                                None => Number::Other,
-                            },
-                        }
-                    });
+            let id = (key, table.get(row, column));
+            let number = match numbers.get(&id) {
+                Some(&number) => number,
+                None => {
+                    let number = match self.evaluator.eval(expr, &self.binding(solutions, row)) {
+                        None => Number::Error,
+                        Some(term) => number_of(&term),
+                    };
+                    if numbers.len() < MEMO_ENTRIES {
+                        numbers.insert(id, number);
+                    }
+                    number
+                }
+            };
             match number {
                 Number::Value(number) => total = total.and_then(|total| total.add(number)),
                 Number::Error => error = true,
@@ -185,6 +287,156 @@ impl Aggregator<'_> {
         }
     }
 
+    /// The expression's value at `row`: for an expression of one variable, remembered per
+    /// id across rows and groups (up to [`MEMO_ENTRIES`] of them), unless it draws a value
+    /// per row (RAND, BNODE).
+    fn value_at(
+        &self,
+        solutions: &Solutions,
+        row: usize,
+        expr: &Expression,
+        column: Option<usize>,
+    ) -> Option<Term> {
+        let eval = || self.evaluator.eval(expr, &self.binding(solutions, row));
+        // A variable's value is its term: the decoder keeps what it decoded.
+        let (Some(column), false) = (column, matches!(expr, Expression::Variable(_))) else {
+            return eval();
+        };
+        let key = (
+            expr as *const Expression as usize,
+            solutions.table.get(row, column),
+        );
+        if let Some(value) = self.memo.borrow().get(&key) {
+            return value.clone();
+        }
+        let value = eval();
+        let mut memo = self.memo.borrow_mut();
+        if memo.len() < MEMO_ENTRIES {
+            memo.insert(key, value.clone());
+        }
+        value
+    }
+
+    /// The one variable `expr` reads, where its value is the same for every row with that
+    /// variable's id (no value drawn per row).
+    fn single_column(solutions: &Solutions, expr: &Expression) -> Option<usize> {
+        if pushdown::per_solution(expr) {
+            return None;
+        }
+        let mut columns: Vec<usize> = expression_variables(expr)
+            .iter()
+            .filter_map(|v| solutions.column(v))
+            .collect();
+        columns.sort_unstable();
+        columns.dedup();
+        match columns[..] {
+            [column] => Some(column),
+            _ => None,
+        }
+    }
+
+    /// COUNT, SAMPLE, MIN, MAX and GROUP_CONCAT (without DISTINCT) of `expr` over `rows`,
+    /// folded a row at a time: a running result instead of every row's value (MIN of 30 M
+    /// names held each of them as a term). `None` for the other aggregates.
+    fn folded(
+        &self,
+        solutions: &Solutions,
+        rows: &[usize],
+        expr: &Expression,
+        name: &AggregateFunction,
+    ) -> Option<Agg> {
+        let aggregate = AggregateExpression::FunctionCall {
+            name: name.clone(),
+            expr: expr.clone(),
+            distinct: false,
+        };
+        foldable(&aggregate).then(|| self.fold(solutions, rows, &aggregate).finish())
+    }
+
+    /// `aggregate` ([`foldable`]) over `rows`, a part of its group: merged in row order
+    /// with the other parts' ([`Fold::merge`]), the group's value.
+    pub(super) fn fold(
+        &self,
+        solutions: &Solutions,
+        rows: &[usize],
+        aggregate: &AggregateExpression,
+    ) -> Fold {
+        let AggregateExpression::FunctionCall { name, expr, .. } = aggregate else {
+            return Fold::Count(rows.len() as u64);
+        };
+        // COUNT of a variable counts its bound ids, nothing decoded; MIN and MAX of inline
+        // integers compare them by id.
+        if let Expression::Variable(variable) = expr {
+            let ids = || -> Vec<u64> {
+                match solutions.column(variable) {
+                    Some(column) => rows
+                        .iter()
+                        .map(|&row| solutions.table.get(row, column))
+                        .collect(),
+                    None => vec![UNDEF; rows.len()],
+                }
+            };
+            match name {
+                AggregateFunction::Count => {
+                    return Fold::Count(ids().into_iter().filter(|&id| id != UNDEF).count() as u64);
+                }
+                AggregateFunction::Min | AggregateFunction::Max => {
+                    match self.aggregate_ids(name, ids(), false) {
+                        Some(Agg::Id(UNDEF)) => return Fold::Unbound,
+                        Some(Agg::Id(id)) => return Fold::Extreme((self.term)(id), name.clone()),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        // COUNT skips errors and SAMPLE takes the first value, but one error makes the
+        // others unbound.
+        let fails_on_error = !matches!(name, AggregateFunction::Count | AggregateFunction::Sample);
+        let column = Self::single_column(solutions, expr);
+        let (mut count, mut best, mut concat) = (0u64, None::<Term>, String::new());
+        for &row in rows {
+            let Some(value) = self.value_at(solutions, row, expr, column) else {
+                if fails_on_error {
+                    return Fold::Unbound;
+                }
+                continue;
+            };
+            match name {
+                AggregateFunction::Sample => return Fold::Sample(Some(value)),
+                AggregateFunction::Min | AggregateFunction::Max => {
+                    if best.as_ref().is_none_or(|b| better(name, &value, b)) {
+                        best = Some(value);
+                    }
+                }
+                AggregateFunction::GroupConcat { separator } => {
+                    let Term::Literal(literal) = &value else {
+                        return Fold::Unbound;
+                    };
+                    if literal.language().is_none() && literal.datatype() != xsd::STRING {
+                        return Fold::Unbound;
+                    }
+                    if count > 0 {
+                        concat.push_str(separator.as_deref().unwrap_or(" "));
+                    }
+                    concat.push_str(literal.value());
+                }
+                _ => {}
+            }
+            count += 1;
+        }
+        match name {
+            AggregateFunction::Count => Fold::Count(count),
+            AggregateFunction::Sample => Fold::Sample(None),
+            AggregateFunction::GroupConcat { separator } => Fold::Concat {
+                text: concat,
+                values: count,
+                separator: separator.clone().unwrap_or_else(|| " ".to_owned()),
+            },
+            _ => Fold::Extreme(best, name.clone()),
+        }
+    }
+
     /// The expression's value for each of `rows`. With `distinct`, only for the first row
     /// of each combination of the expression's variables: the repeats can't add a value.
     fn evaluated(
@@ -209,17 +461,11 @@ impl Aggregator<'_> {
         if let [column] = columns[..] {
             // One variable: its ids stand for the rows, and the values are remembered
             // across groups.
-            let key = expr as *const Expression as usize;
             let mut seen = HashSet::new();
-            let mut memo = self.memo.borrow_mut();
             return rows
                 .iter()
                 .filter(|&&row| !distinct || seen.insert(table.get(row, column)))
-                .map(|&row| {
-                    memo.entry((key, table.get(row, column)))
-                        .or_insert_with(|| eval(row))
-                        .clone()
-                })
+                .map(|&row| self.value_at(solutions, row, expr, Some(column)))
                 .collect();
         }
         if !distinct || columns.is_empty() {
@@ -275,6 +521,9 @@ impl Aggregator<'_> {
                 {
                     return result;
                 }
+                if !*distinct && let Some(result) = self.folded(solutions, rows, expr, name) {
+                    return result;
+                }
                 let evaluated = self.evaluated(solutions, rows, expr, *distinct);
                 // COUNT skips errors and SAMPLE takes the first value, but one error makes
                 // SUM, AVG, MIN and MAX unbound.
@@ -319,6 +568,18 @@ impl Aggregator<'_> {
                 result.map_or(Agg::Id(UNDEF), Agg::Term)
             }
         }
+    }
+}
+
+/// A value's part in SUM and AVG: a number; a duration (`Other`: the calendar's sums
+/// decide); anything else makes them unbound whatever the other values are (`Error`:
+/// Sparqloscope 090, `SUM(?o > 0)`, decoded all 8.8 M rows to end unbound).
+pub(super) fn number_of(term: &Term) -> Number {
+    let value = Value::of(term);
+    match Numeric::of(&value) {
+        Some(number) => Number::Value(number),
+        None if calendar::is_summable_duration(&value) => Number::Other,
+        None => Number::Error,
     }
 }
 

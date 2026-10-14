@@ -246,6 +246,10 @@ pub struct Explanation {
     /// (the output's terms aren't counted): what id-level evaluation saves.
     pub decoded: u64,
     pub micros: u64,
+    /// The most working memory the query held at once, as charged to its budget (rows,
+    /// weights, sort keys, decoded terms): its own, unlike the process's resident memory,
+    /// which keeps what the allocator held for earlier queries.
+    pub memory_peak_bytes: u64,
     /// What the OWL 2 QL rewriting did, and whether the answers are complete; `None` where
     /// it doesn't apply.
     pub ql: Option<crate::ql::QlReport>,
@@ -279,7 +283,7 @@ pub fn explain_query<V: ReadView>(
 ) -> Result<Explanation, QueryEvaluationError> {
     let start = std::time::Instant::now();
     let snapshot = view.evaluation_snapshot();
-    let (rewrites, steps, rows, decoded, ql) =
+    let (rewrites, steps, rows, decoded, ql, memory_peak_bytes) =
         crate::native::explain(&snapshot, query, &for_view(view, options))?;
     Ok(Explanation {
         executor: "native",
@@ -288,6 +292,7 @@ pub fn explain_query<V: ReadView>(
         rows,
         decoded,
         micros: start.elapsed().as_micros() as u64,
+        memory_peak_bytes,
         ql,
         completeness: None,
         decided_by: Vec::new(),
