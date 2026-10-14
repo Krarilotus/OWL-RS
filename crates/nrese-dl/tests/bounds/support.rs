@@ -259,6 +259,7 @@ pub fn upper_within(
         None,
         &schema,
         batch::Listing::Representatives,
+        batch::Output::Facts,
         &stop,
     )
     .ok()?;
