@@ -109,9 +109,10 @@ one-axiom cases in the commit tier.
 **Certificates** ([design](design/owl2-dl.md) §10): "consistent", satisfiable classes and
 non-entailments of the hypertableau come with a model the independent checker
 (`nrese_dl::certificate`) verifies: 99.84 % of such claims on the small scope without data
-values (8,990,815 of 9,005,280); the number module's validated models likewise. Not yet:
-data values in models; "inconsistent" and entailments (the references decide them in the
-campaigns).
+values (8,990,815 of 9,005,280); the number module's validated models likewise. Data values
+since 13 October (the models carry the values the datatype theory assigns: 196 of the W3C
+suite's 199 consistent answers with a model certified, the 3 others listed with why). Not
+yet: "inconsistent" and entailments (the references decide them in the campaigns).
 
 **Incrementality** ([design](design/owl2-dl.md) §9): U1 and the RL closure maintained per
 commit; the consistency gate after a commit of assertions only, from a consistent
@@ -145,6 +146,40 @@ The packages of [design/owl2-dl.md](design/owl2-dl.md) §14 (the performance gat
 | 4.2 Query path | done in part | closed predicates, the bounds, `ExactGroundEntailment`, `ExactInternalisableCQ`, a status on every answer; `ExactFragmentCQ`, U2 and RSA bounds open | – |
 | 4.3 Consistency gate | done | on commit, quarantine, minimal rejection evidence; incremental for assertions (12 October), tested against cold rebuilds | – |
 | 4.4 Explanations | done | DL answers' justifications through the proof IR (`/explain`'s `owl2_dl`) | – |
+
+## Beyond OWL 2 DL (branch `v15/dl-beyond`, 13 October)
+
+**Decided where it is sound, said why where it isn't** ([design](design/owl2-dl.md) §16;
+[campaigns and ORE](../benches/reasoning/dl/README.md#inputs-outside-owl-2-dl-13-october-2026-office-pc-queue-jobs)):
+`nrese_dl::beyond` answers consistency and classification of inputs the reader finds
+outside OWL 2 DL. Every "consistent" rests on a model the independent checker verifies
+against every axiom and rule (data values included since 13 October), every
+"inconsistent" and entailment on monotonicity (the DL part, with rule instances that
+follow from their rules); nothing is assumed.
+- *DL-safe rules* (SWRL; ORE's only construct outside OWL 2 DL: 22 of 1,920 ontologies):
+  read, and decided by grounding the instances the DL part's models break. ORE: 714
+  consistent (a certified model satisfying its 8 rules; HermiT and Konclude fail on it);
+  237 and seven like it inconsistent by their DL part, each with a four-axiom
+  justification; 10860 inconsistent with 7 instances of its rules (its one rule with
+  SWRLTab's `abox:hasClass`, not a SWRL built-in, left out and named). Consistency decided
+  for 21 of the 22 (12 consistent, 9 inconsistent), classification exact for 20 (12451:
+  sound, its refinement's budget leaves pairs open). Undecided, with why: 13129 (an
+  ill-typed literal, §5.7).
+- *Repairs:* a disjointness repeating an operand reads as that operand being empty (it
+  was deduplicated into nothing: a wrong "consistent" on four W3C tests); SQWRL queries
+  assert nothing; as before, a property typed by its use.
+- *Left out, said so:* the reserved vocabulary as an entity (§2.4: it was read as fresh
+  names, a wrong "non-entailment" on five W3C tests), ill-typed literals (§5.7), what the
+  reader can't map; "inconsistent" and entailments from the rest still hold.
+- *Evidence:* five differential campaigns of 1,000 random ontologies with rules against
+  HermiT and Openllet: every disagreement is a probed deviation of a reference from
+  SWRL's semantics (empty heads, unbound equality variables, declared individuals,
+  inverse atoms) or a reference error settled by hand; on the two clean campaigns 970 and
+  972 of 1,000 agree, the rest undecided or unanswered. The W3C suite's species-Full tests
+  with direct-semantics answers run in the gate: no wrong answer but two the suite
+  mislabels (listed with why).
+- *Open:* models the certificate builder can't fold (counting cases; 66 of the campaigns'
+  5,000), native rules in the hypertableau should rule-heavy inputs need many rounds.
 
 ## Audit work (the outside audit of 2 October)
 

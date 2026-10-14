@@ -473,6 +473,76 @@ fn reserved_vocabulary_is_read_by_its_meaning() {
     assert_round_trip(&ontology, &mut table);
 }
 
+/// An IRI of the reserved vocabulary as a class, property or individual is OWL 2 Full
+/// (Structural Specification §2.4): the axioms that use it are left out, each reported
+/// (the W3C tests WebOnt-I5.3-014, WebOnt-Class-001, WebOnt-I5.5-001 were answered as if
+/// they were fresh names).
+#[test]
+fn reserved_vocabulary_as_an_entity_is_left_out() {
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        r#"
+        rdf:type rdfs:domain ex:Y .
+        rdfs:Class owl:equivalentClass owl:Class .
+        rdf:first a owl:FunctionalProperty .
+        ex:x a ex:Y .
+        "#,
+    );
+    let ontology = read(&statements, &table);
+    let lines = rendered(&ontology, &table);
+    assert!(
+        lines.iter().all(|l| !l.contains("www.w3.org")),
+        "kept:\n{}",
+        lines.join("\n")
+    );
+    assert!(lines.contains(&"ClassAssertion(ex:Y ex:x)".to_owned()));
+    let reserved = ontology
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d, Diagnostic::Reserved { .. }))
+        .count();
+    assert_eq!(reserved, 3, "{:?}", ontology.diagnostics);
+    assert!(
+        ontology
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::Reserved { .. }))
+            .all(Diagnostic::is_fatal)
+    );
+}
+
+/// A disjointness that repeats an operand says that operand is empty (an individual
+/// different from itself: a contradiction), as OWL 2's RDF-Based Semantics reads it; the
+/// operands were deduplicated and the axiom said nothing (WebOnt-disjointWith-010,
+/// rdfbased-sem-eqdis-different-irrflxv).
+#[test]
+fn a_disjointness_repeating_an_operand_empties_it() {
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        r#"
+        ex:C owl:disjointWith ex:C .
+        ex:p a owl:ObjectProperty ; owl:propertyDisjointWith ex:p .
+        ex:a owl:differentFrom ex:a .
+        "#,
+    );
+    let ontology = read(&statements, &table);
+    let lines = rendered(&ontology, &table);
+    for expected in [
+        "SubClassOf(ex:C owl:Nothing)",
+        "SubClassOf(ObjectSomeValuesFrom(ex:p owl:Thing) owl:Nothing)",
+        "ClassAssertion(owl:Nothing ex:a)",
+    ] {
+        assert!(
+            lines.contains(&expected.to_owned()),
+            "missing {expected}\nread:\n{}",
+            lines.join("\n")
+        );
+    }
+    assert_eq!(ontology.diagnostics, vec![Diagnostic::RepeatedOperand]);
+}
+
 /// Statements about the ontology (its header's annotations) are annotations, an anonymous
 /// ontology's too, never assertions about an individual (the ontology node was read as an
 /// individual: found by the functional-syntax reader's comparison, FS2RDF-ontology-

@@ -12,6 +12,8 @@
 //!   ordered, `"…"@tag` and `"…@tag"^^rdf:PlainLiteral` as language-tagged literals.
 //! - **Annotations** (on the ontology, on axioms, annotation axioms) are read and counted,
 //!   not kept: they have no logical meaning (as the RDF reader does).
+//! - **Rules:** a DL-safe rule (SWRL, not OWL 2) is read into [`Ontology::rules`] with a
+//!   [`Diagnostic::Rule`].
 //! - **Never silent:** whatever can't be read is a [`Diagnostic::Syntax`] with its line
 //!   and column, and the axiom it is in is left out; reading goes on after it. What OWL 2
 //!   DL forbids is diagnosed as for RDF: a property declared or used as two of object,
@@ -66,6 +68,7 @@ pub(super) struct Model {
     pub diagnostics: Vec<Diagnostic>,
     pub annotations: usize,
     pub uses: HashMap<Term, Uses>,
+    pub rules: Vec<crate::rules::Rule>,
 }
 
 /// Reads functional-syntax documents into one ontology (a document and its imports).
@@ -107,6 +110,9 @@ impl<'a> FunctionalReader<'a> {
                 .diagnostics
                 .push(Diagnostic::AmbiguousProperty { property });
         }
+        for rule in 0..model.rules.len() {
+            model.diagnostics.push(Diagnostic::Rule { rule });
+        }
         let axioms: Vec<Axiom> = model.axioms.into_keys().collect();
         let mut ontology = Ontology {
             classes: model.classes,
@@ -118,6 +124,7 @@ impl<'a> FunctionalReader<'a> {
             builtin: BuiltinProperties::of(&Vocabulary::new(&|iri| terms.iri(iri))),
             data: Default::default(),
             anonymous: BTreeSet::new(),
+            rules: model.rules,
         };
         crate::mapping::complete(&mut ontology, terms);
         ontology
