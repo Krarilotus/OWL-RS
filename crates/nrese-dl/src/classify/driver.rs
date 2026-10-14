@@ -110,14 +110,30 @@ impl<'a> Driver<'a> {
                 // Unlimited: half of what is left of the deadline.
                 Some(self.options.lower_bound_timeout.unwrap_or(Duration::MAX)),
             ));
-            if let Some(lower) = known::horn_lower_bound(
-                self.normalised,
-                self.classes,
-                &core,
-                &self.options.workers,
-                self.options.tableau.cancel.clone(),
-                self.traced,
-            ) {
+            let attempt = self
+                .options
+                .functional_attempt(&core, self.normalised)
+                .and_then(|route| {
+                    known::horn_lower_bound(
+                        self.normalised,
+                        self.classes,
+                        &route,
+                        &self.options.workers,
+                        self.options.tableau.cancel.clone(),
+                        self.traced,
+                    )
+                })
+                .filter(|lower| lower.inconsistent || lower.exact_for.iter().any(|&e| e));
+            if let Some(lower) = attempt.or_else(|| {
+                known::horn_lower_bound(
+                    self.normalised,
+                    self.classes,
+                    &core,
+                    &self.options.workers,
+                    self.options.tableau.cancel.clone(),
+                    self.traced,
+                )
+            }) {
                 if lower.inconsistent {
                     return self.inconsistent();
                 }

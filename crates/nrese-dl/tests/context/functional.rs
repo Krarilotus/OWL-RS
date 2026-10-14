@@ -2,7 +2,7 @@
 //! merge (two successors, a successor with the predecessor, under an inverse, under a
 //! guard), and what stays refused.
 
-use nrese_dl::context::{self, Classification, Options, Unsupported};
+use nrese_dl::context::{self, Classification, Options, Strategy, Unsupported};
 use nrese_owl::{Axiom, Characteristic, ClassExpr, ObjProp, Ontology};
 
 use super::support::{Build, Table, holds};
@@ -143,4 +143,76 @@ fn what_the_eq_rule_leaves_out() {
         classify(&b.done(), 1),
         Err(Unsupported::Equality { .. })
     ));
+}
+
+/// Guard (13 Oct): the Functional strategy (Konclude's extended saturation) gives a successor
+/// over a role an at-most-one clause may merge it by every trigger of its predecessor (as
+/// Eager), so the merge rests on certain atoms; the others share a context per filler (as
+/// Split). `A_i ⊑ ∃s.B ⊓ ∀s.D_i ⊓ ∃r.C ⊓ ∃r.G ⊓ ∀r.D_i`, `B ⊓ D_i ⊑ E_i`, `r` functional,
+/// `∃r.(C ⊓ G ⊓ D_i) ⊑ H_i`: Eager makes a context per `A_i` under both roles, Split one per
+/// filler, Functional one per `A_i` under `r` alone, with every merge certain; the
+/// taxonomies agree.
+#[test]
+fn the_functional_strategy_is_eager_where_merges_may_be() {
+    const N: usize = 6;
+    let mut table = Table::default();
+    let mut b = Build::new(&mut table);
+    let (bb, c, g) = (b.c("B"), b.c("C"), b.c("G"));
+    let (r, s) = (b.r("r"), b.r("s"));
+    let (sb, rc, rg) = (b.some(s, bb), b.some(r, c), b.some(r, g));
+    for i in 0..N {
+        let (a, d, e, h) = (
+            b.c(&format!("A{i}")),
+            b.c(&format!("D{i}")),
+            b.c(&format!("E{i}")),
+            b.c(&format!("H{i}")),
+        );
+        let (sd, rd) = (b.all(s, d), b.all(r, d));
+        let all = b.and(&[sb, sd, rc, rg, rd]);
+        b.sub(a, all);
+        let bd = b.and(&[bb, d]);
+        b.sub(bd, e);
+        let cgd = b.and(&[c, g, d]);
+        let r_cgd = b.some(r, cgd);
+        b.sub(r_cgd, h);
+    }
+    b.axiom(Axiom::ObjectCharacteristic(Characteristic::Functional, r));
+    let o = b.done();
+    let run = |strategy| {
+        let options = Options {
+            threads: 1,
+            equality: true,
+            strategy,
+            ..Options::default()
+        };
+        context::classify(&o, &options).expect("Horn with equality")
+    };
+    let (split, split_profile) = run(Strategy::Split);
+    let (eager, eager_profile) = run(Strategy::Eager);
+    let (functional, profile) = run(Strategy::Functional);
+    assert_eq!(functional, eager);
+    assert_eq!(functional, split);
+    for i in 0..N {
+        assert!(holds(
+            &mut table,
+            &functional,
+            &format!("A{i}"),
+            &format!("H{i}")
+        ));
+    }
+    let contexts = |p: &context::Profile| p.contexts_created;
+    assert!(
+        contexts(&eager_profile) >= contexts(&profile) + N - 1
+            && contexts(&profile) >= contexts(&split_profile) + N - 1,
+        "contexts: Split {}, Functional {}, Eager {}",
+        contexts(&split_profile),
+        contexts(&profile),
+        contexts(&eager_profile)
+    );
+    assert!(profile.merges > 0, "the case no longer merges");
+    assert_eq!(
+        (profile.merges_certain, profile.eq_conditional),
+        (profile.merges, 0),
+        "Functional: every merge on certain atoms"
+    );
 }

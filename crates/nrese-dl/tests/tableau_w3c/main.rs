@@ -768,6 +768,73 @@ fn the_w3c_dl_suite() {
     );
 }
 
+/// The functional route (`classify::Options::functional_route`) against the default on every
+/// DL premise of the suite under the direct semantics: where both classifications are
+/// complete they are equal, consistency included. The W3C part of the envelope the route's
+/// default switch needs (owner, 13 Oct); the suite above runs the hypertableau directly,
+/// where the route never engages.
+#[test]
+fn the_functional_route_keeps_every_w3c_classification() {
+    let path = suite_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        assert!(
+            std::env::var_os("NRESE_W3C_REQUIRED").is_none(),
+            "the W3C OWL 2 test cases are required: {}",
+            path.display()
+        );
+        eprintln!("skipped: no {}", path.display());
+        return;
+    };
+    let base = nrese_dl::classify::Options {
+        tableau: config(),
+        timeout: Some(Duration::from_secs(20)),
+        ..nrese_dl::classify::Options::default()
+    };
+    let route = nrese_dl::classify::Options {
+        functional_route: true,
+        ..base.clone()
+    };
+    let (mut premises, mut compared, mut open) = (0, 0, 0);
+    let (mut differ, mut lost, mut gained) = (Vec::new(), Vec::new(), 0);
+    for case in read_cases(&text) {
+        if !case.dl || !case.direct {
+            continue;
+        }
+        let mut table = Table::default();
+        let Some(Ok(premise)) = document(&case, &["Premise", "Input"], &mut table) else {
+            continue;
+        };
+        premises += 1;
+        let a = nrese_dl::classify::classify(&premise, &base);
+        let b = nrese_dl::classify::classify(&premise, &route);
+        if !(a.complete() && b.complete()) {
+            open += 1;
+            if a.complete() {
+                lost.push(case.name.clone());
+            } else if b.complete() {
+                gained += 1;
+            }
+            continue;
+        }
+        compared += 1;
+        if a.classification != b.classification {
+            differ.push(case.name.clone());
+        }
+    }
+    eprintln!(
+        "functional route on the W3C premises: {premises} premises, {compared} compared, \
+         {open} incomplete on either side ({} only with the route, {gained} only without), {} differ",
+        lost.len(),
+        differ.len()
+    );
+    assert!(compared > 0, "no premise compared");
+    assert!(differ.is_empty(), "classifications differ: {differ:#?}");
+    assert!(
+        lost.is_empty(),
+        "complete without the route, not with it: {lost:#?}"
+    );
+}
+
 /// The suite's tests of species OWL 2 Full it gives direct-semantics answers for
 /// (docs/design/owl2-dl.md §16): read with the reader's repairs (a property typed by its
 /// use, a shared blank node), what it can't read left out, and answered only as far as

@@ -139,6 +139,13 @@ impl Worker<'_> {
             );
         }
         let me = self.out.me;
+        if engine.program.certain_merges && found.iter().any(|f| !f.2.is_empty()) {
+            // A merge on possible atoms isn't made: the context may miss its consequences.
+            self.state
+                .incomplete
+                .get_or_insert(super::rules::Incomplete::Merge);
+            found.retain(|f| f.2.is_empty());
+        }
         for (t0, t1, body, premises) in found {
             let premises = premises
                 .iter()
@@ -199,6 +206,9 @@ impl Worker<'_> {
             premises: premises.into_boxed_slice(),
         });
         self.state.clauses.counters.merges += 1;
+        if self.state.merges[id as usize].body.is_empty() {
+            self.state.clauses.counters.merges_certain += 1;
+        }
         let bytes = &mut self.state.merge_bytes;
         for t in [t0, t1] {
             push(self.state.merges_by_term.entry(t).or_default(), id, bytes);
@@ -298,6 +308,9 @@ impl Worker<'_> {
         }
         let closed = merge.body.is_empty();
         self.state.clauses.counters.eq += 1;
+        if !closed {
+            self.state.clauses.counters.eq_conditional += 1;
+        }
         let id =
             self.state
                 .clauses

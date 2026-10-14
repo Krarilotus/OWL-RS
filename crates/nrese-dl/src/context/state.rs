@@ -129,9 +129,12 @@ pub struct Counters {
     /// Inclusion tests of the redundancy checks: forward, one set-trie query per head
     /// looked up; backward, each candidate past its signature.
     pub subset_checks: u64,
-    /// The Eq rule's merges, and its copies.
+    /// The Eq rule's merges, and its copies; of them, the merges on certain atoms only
+    /// (an empty body) and the copies along conditional merges.
     pub merges: u64,
     pub eq: u64,
+    pub merges_certain: u64,
+    pub eq_conditional: u64,
     /// Message batches the context took, budget checks its workers made, and capacity
     /// publications (where observed).
     pub batches: u64,
