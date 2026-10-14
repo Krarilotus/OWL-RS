@@ -94,6 +94,10 @@ pub struct MaterialisationReport {
     /// hierarchies, transitive and equivalence properties and equality, merging,
     /// consistency); zero for a commit.
     pub phases: nrese_reasoner::batch::Phases,
+    /// Time writing the inferred stack from the closure's runs (zero for a commit).
+    pub stack: Duration,
+    /// Where writing it went (zero for a commit).
+    pub stack_parts: nrese_engine::StackTimes,
     /// What a commit's maintenance did, in counts (zero for a rematerialisation).
     pub work: nrese_reasoner::delta::policy::Counts,
 }
@@ -222,8 +226,7 @@ mod tests {
                 .map(Into::into)
                 .collect();
             let fresh: HashSet<EncodedTriple> = materialise(&program, &pending)
-                .inferred
-                .into_iter()
+                .inferred_triples()
                 .filter(|t| !pending.contains_in(ReadModel::Asserted, &t.in_default_graph()))
                 .collect();
             assert_eq!(

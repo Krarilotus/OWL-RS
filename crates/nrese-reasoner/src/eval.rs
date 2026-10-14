@@ -21,6 +21,13 @@ use super::lists::Facts;
 /// Driver matches per parallel work unit.
 const MORSEL: usize = 4096;
 
+/// Closed outputs have disjoint identities even over arbitrary full-width term IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Family {
+    Schema(u64),
+    Transitive(u64),
+}
+
 /// Which facts an atom reads in a semi-naive variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Seg {
@@ -35,7 +42,7 @@ pub enum Seg {
     /// family's own instances read, as they would derive nothing new from them (the
     /// batch executor's partitioned delta). Sources that don't partition their delta
     /// read it as [`Seg::Delta`] ([`Seg::plain`]).
-    DeltaNotBy(u64),
+    DeltaNotBy(Family),
 }
 
 impl Seg {
@@ -205,6 +212,26 @@ impl Schema {
 
     pub fn hidden(&self) -> &HashMap<u64, bool> {
         &self.hidden
+    }
+
+    /// Every id it names.
+    pub(crate) fn ids(&self) -> Vec<u64> {
+        let mut ids = vec![self.rdf_type, self.thing];
+        ids.extend(self.hidden.keys());
+        ids.extend(&self.predicates);
+        ids.extend(&self.classes);
+        ids
+    }
+
+    /// The same schema over the ids `f` maps these to.
+    pub(crate) fn map_ids(&self, f: &dyn Fn(u64) -> u64) -> Self {
+        Self {
+            rdf_type: f(self.rdf_type),
+            thing: f(self.thing),
+            hidden: self.hidden.iter().map(|(&c, &t)| (f(c), t)).collect(),
+            predicates: self.predicates.iter().map(|&p| f(p)).collect(),
+            classes: self.classes.iter().map(|&c| f(c)).collect(),
+        }
     }
 
     /// `rule` with its heads' memberships in hidden classes rewritten; `None` if nothing
@@ -700,6 +727,24 @@ impl<'r> Job<'r> {
         }
     }
 
+    /// The atoms in the order they are joined, the driver first, each with what it reads.
+    pub(crate) fn order(&self) -> &[(usize, Seg)] {
+        &self.order
+    }
+
+    /// Calls `f` with the driver's matches at positions `range`.
+    pub(crate) fn drivers_in<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        range: std::ops::Range<usize>,
+        f: &mut dyn FnMut(Triple),
+    ) {
+        match &self.drivers {
+            Drivers::Collected(drivers) => drivers[range].iter().for_each(|&fact| f(fact)),
+            Drivers::InPlace(_) => source.scan_range(self.pattern, self.seg, range, f),
+        }
+    }
+
     /// The driver positions, which [`Job::run`] takes ranges of.
     pub fn drivers(&self) -> usize {
         match &self.drivers {
@@ -783,6 +828,10 @@ pub struct Probes {
     /// binding and head): with the new facts, the bindings per derived fact.
     pub emitted: std::sync::atomic::AtomicU64,
     pub bindings: Vec<std::sync::atomic::AtomicU64>,
+    /// Nanoseconds the morsels spent (summed over threads): enumerating bindings, sorting
+    /// and deduplicating their facts, probing the source (`keep`), and handing them over
+    /// (`finish`). Where the joins' time goes, from any build (`rule_work` prints it).
+    pub nanos: [std::sync::atomic::AtomicU64; 4],
 }
 
 impl Probes {
@@ -795,21 +844,98 @@ impl Probes {
     }
 }
 
+/// A candidate fact as a morsel collects it, ordered by (predicate, subject, object): the
+/// order its sort and the membership probes read it in ([`run_morsels`]).
+pub trait Candidate: Copy + Ord + Send + Sync + 'static {
+    fn of(fact: Triple) -> Self;
+    fn fact(self) -> Triple;
+
+    /// Sorts `candidates` and removes their repetitions.
+    fn sort_distinct(candidates: &mut Vec<Self>) {
+        candidates.sort_unstable();
+        candidates.dedup();
+    }
+}
+
+/// A fact as `[predicate, subject, object]`: any ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pso(pub [u64; 3]);
+
+impl Candidate for Pso {
+    #[inline]
+    fn of([s, p, o]: Triple) -> Self {
+        Self([p, s, o])
+    }
+
+    #[inline]
+    fn fact(self) -> Triple {
+        let [p, s, o] = self.0;
+        [s, p, o]
+    }
+}
+
+/// A fact of ids below 2^32 (the batch executor's dense numbers) packed into a word pair,
+/// predicate highest: one comparison of two words per sort step, 16 bytes, where a triple
+/// sorted by a key of three takes 24 and three comparisons.
+impl Candidate for u128 {
+    #[inline]
+    fn of([s, p, o]: Triple) -> Self {
+        debug_assert!((s | p | o) >> 32 == 0, "dense numbers");
+        (u128::from(p) << 64) | (u128::from(s) << 32) | u128::from(o)
+    }
+
+    #[inline]
+    fn fact(self) -> Triple {
+        let word = self as u64;
+        [word >> 32, (self >> 64) as u64, word & 0xFFFF_FFFF]
+    }
+
+    /// A morsel's candidates of one predicate (a rule's one head: nearly every morsel's)
+    /// are sorted as their low words: a one-word sort is about three times faster than
+    /// one of word pairs (16 k keys: 9.3 against 28.8 ns a key, 13 October 2026), and
+    /// taking the words out and back reads and writes each candidate once more.
+    fn sort_distinct(candidates: &mut Vec<Self>) {
+        let Some(high) = one_predicate(candidates) else {
+            candidates.sort_unstable();
+            candidates.dedup();
+            return;
+        };
+        let mut words: Vec<u64> = candidates.iter().map(|&c| c as u64).collect();
+        words.sort_unstable();
+        words.dedup();
+        candidates.clear();
+        candidates.extend(words.iter().map(|&w| (high << 64) | u128::from(w)));
+    }
+}
+
+/// The predicate (high word) of `candidates` where they are enough and all of one, so
+/// that they sort as their low words ([`Candidate::sort_distinct`]).
+fn one_predicate(candidates: &[u128]) -> Option<u128> {
+    let high = candidates.first()? >> 64;
+    (candidates.len() >= 64 && candidates.iter().all(|&c| c >> 64 == high)).then_some(high)
+}
+
 /// [`run_jobs`] by morsel: each morsel's facts, sorted by (predicate, subject, object) and
-/// distinct, are handed to `finish` with the index of the job they come from, and its results come back in the morsels' order,
-/// not concatenated (a caller that regroups them needs no copy of all of them). `keep`
-/// removes the facts the source already holds from a morsel's facts in that order, all at
-/// once (a store reads its runs forward across them). Counts the probes into `probes`
-/// (once per morsel). `rewrite`, if given, maps each derived fact before it is checked
-/// (equality by representatives: to its representatives).
-pub fn run_jobs_by_morsel<S: Source + ?Sized, T: Send>(
+/// distinct, are handed to `finish` with the index of the job they come from, and its
+/// results come back in the morsels' order, not concatenated (a caller that regroups them
+/// needs no copy of all of them). `keep` removes the facts the source already holds from a
+/// morsel's facts in that order, all at once (a store reads its runs forward across them).
+/// Counts the probes into `probes` (once per morsel). `rewrite`, if given, maps each
+/// derived fact before it is checked (equality by representatives: to its
+/// representatives).
+/// `kernel`, if given, enumerates a job's head facts over a range of its drivers itself
+/// (a source that knows its layout: the batch executor's joins, `batch::join`) and returns
+/// the bindings it enumerated, or `None` to leave the job to the generic walk.
+#[allow(clippy::too_many_arguments)]
+pub fn run_jobs_by_morsel<S: Source + ?Sized, C: Candidate, T: Send>(
     source: &S,
     jobs: &[Job<'_>],
-    keep: &(dyn Fn(&mut Vec<Triple>) + Sync),
+    keep: &(dyn Fn(&mut Vec<C>) + Sync),
     rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)>,
+    kernel: Option<Kernel<'_, C>>,
     stop: Stop<'_>,
     probes: &Probes,
-    finish: &(dyn Fn(usize, Vec<Triple>) -> T + Sync),
+    finish: &(dyn Fn(usize, Vec<C>) -> T + Sync),
 ) -> Vec<T> {
     run_morsels(
         source,
@@ -817,11 +943,17 @@ pub fn run_jobs_by_morsel<S: Source + ?Sized, T: Send>(
         keep,
         false,
         rewrite,
+        kernel,
         stop,
         Some(probes),
         finish,
     )
 }
+
+/// Enumerates job `j`'s head facts over a range of its drivers into a morsel's candidates
+/// ([`run_jobs_by_morsel`]); returns the bindings, or `None` for the generic walk.
+pub type Kernel<'a, C> =
+    &'a (dyn Fn(usize, std::ops::Range<usize>, &mut Vec<C>) -> Option<u64> + Sync);
 
 /// [`run_jobs`] without circular derivations: those whose head is one of their own
 /// premises under the binding, such as `(?x p ?x) -> (?x p ?x)` from a symmetric `p`, or
@@ -849,26 +981,28 @@ fn run_jobs_with<S: Source + ?Sized>(
     run_morsels(
         source,
         jobs,
-        &|facts: &mut Vec<Triple>| facts.retain(|&fact| keep(fact)),
+        &|facts: &mut Vec<Pso>| facts.retain(|&fact| keep(fact.fact())),
         acyclic,
+        None,
         None,
         stop,
         probes,
-        &|_, facts| facts,
+        &|_, facts: Vec<Pso>| facts.into_iter().map(Pso::fact).collect::<Vec<Triple>>(),
     )
     .concat()
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_morsels<S: Source + ?Sized, T: Send>(
+fn run_morsels<S: Source + ?Sized, C: Candidate, T: Send>(
     source: &S,
     jobs: &[Job<'_>],
-    keep: &(dyn Fn(&mut Vec<Triple>) + Sync),
+    keep: &(dyn Fn(&mut Vec<C>) + Sync),
     acyclic: bool,
     rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)>,
+    kernel: Option<Kernel<'_, C>>,
     stop: Stop<'_>,
     probes: Option<&Probes>,
-    finish: &(dyn Fn(usize, Vec<Triple>) -> T + Sync),
+    finish: &(dyn Fn(usize, Vec<C>) -> T + Sync),
 ) -> Vec<T> {
     let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
         .iter()
@@ -889,39 +1023,53 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
             if stop() {
                 return finish(*j, Vec::new());
             }
-            let mut out = Vec::new();
+            let clock = std::time::Instant::now();
+            let mut out: Vec<C> = Vec::new();
             let mut enumerated = 0u64;
-            job.run(source, range.clone(), &mut |bindings| {
-                enumerated += 1;
-                for head in heads {
-                    let fact = instantiate_head(head, bindings);
-                    let circular = acyclic
-                        && job
-                            .rule
-                            .body
-                            .iter()
-                            .any(|atom| instantiate_head(atom, bindings) == fact);
-                    if !circular {
-                        out.push(rewrite.map_or(fact, |rewrite| rewrite(fact)));
+            if let Some(count) = kernel.and_then(|kernel| kernel(*j, range.clone(), &mut out)) {
+                enumerated = count;
+            } else {
+                job.run(source, range.clone(), &mut |bindings| {
+                    enumerated += 1;
+                    for head in heads {
+                        let fact = instantiate_head(head, bindings);
+                        let circular = acyclic
+                            && job
+                                .rule
+                                .body
+                                .iter()
+                                .any(|atom| instantiate_head(atom, bindings) == fact);
+                        if !circular {
+                            out.push(C::of(rewrite.map_or(fact, |rewrite| rewrite(fact))));
+                        }
                     }
-                }
-            });
+                });
+            }
             // The morsel's duplicates go before `keep` probes the source, and the probes
             // run in (predicate, subject, object) order: about half of an OWL 2 RL round's
             // candidates repeat within it, and sorted probes let a store read a relation's
             // sorted runs forward from the last probe's place instead of searching each
             // from the root, missing the cache at every level.
             let emitted = out.len() as u64;
-            out.sort_unstable_by_key(|&[s, p, o]| (p, s, o));
-            out.dedup();
+            let enumerating = clock.elapsed();
+            C::sort_distinct(&mut out);
+            let sorting = clock.elapsed();
             let asked = out.len() as u64;
-            let unordered = out
-                .windows(2)
-                .filter(|w| (w[0][1], w[0][0], w[0][2]) > (w[1][1], w[1][0], w[1][2]))
-                .count() as u64;
+            let unordered = out.windows(2).filter(|w| w[0] > w[1]).count() as u64;
             keep(&mut out);
+            let probing = clock.elapsed();
+            let result = finish(*j, out);
             if let Some(probes) = probes {
                 use std::sync::atomic::Ordering::Relaxed;
+                let finishing = clock.elapsed();
+                for (total, (to, from)) in probes.nanos.iter().zip([
+                    (enumerating, std::time::Duration::ZERO),
+                    (sorting, enumerating),
+                    (probing, sorting),
+                    (finishing, probing),
+                ]) {
+                    total.fetch_add((to - from).as_nanos() as u64, Relaxed);
+                }
                 probes.probes.fetch_add(asked, Relaxed);
                 probes.unordered.fetch_add(unordered, Relaxed);
                 if let Some(count) = probes.bindings.get(*j) {
@@ -929,7 +1077,7 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                 }
                 probes.emitted.fetch_add(emitted, Relaxed);
             }
-            finish(*j, out)
+            result
         })
         .collect()
 }
@@ -1126,11 +1274,15 @@ impl Dispatch {
     }
 
     /// The (rule, atom) pairs whose atom can match a fact of `delta`'s delta, sorted.
-    pub(crate) fn matching(&self, delta: &super::batch::Store) -> Vec<(usize, usize)> {
+    pub(crate) fn matching<R: super::batch::Representation>(
+        &self,
+        delta: &super::batch::WorkingStore<R>,
+    ) -> Vec<(usize, usize)> {
         let mut out: Vec<AtomRef> = Vec::new();
         let mut any_delta = false;
-        for (p, relation) in delta.delta_relations() {
+        for relation in delta.delta_relations() {
             any_delta = true;
+            let p = relation.predicate;
             if let Some(entries) = self.by_predicate.get(&p) {
                 out.extend_from_slice(entries);
             }
@@ -1138,14 +1290,14 @@ impl Dispatch {
                 continue;
             };
             // Probe whichever side is smaller: the indexed objects or the delta's.
-            if objects.len() <= relation.delta_len() {
+            if objects.len() <= relation.len() {
                 for (&o, entries) in objects {
-                    if relation.delta_has_object(o) {
+                    if relation.has_object(o) {
                         out.extend_from_slice(entries);
                     }
                 }
             } else {
-                relation.delta_objects(&mut |o| {
+                relation.objects(&mut |o| {
                     if let Some(entries) = objects.get(&o) {
                         out.extend_from_slice(entries);
                     }
@@ -1440,12 +1592,18 @@ impl GroundProgram {
     }
 
     /// The (rule, atom) variants that can match the delta of `delta`.
-    pub(crate) fn variants(&self, delta: &super::batch::Store) -> Vec<(usize, usize)> {
+    pub(crate) fn variants<R: super::batch::Representation>(
+        &self,
+        delta: &super::batch::WorkingStore<R>,
+    ) -> Vec<(usize, usize)> {
         self.dispatch.matching(delta)
     }
 
     /// The (consistency rule, atom) variants that can match the delta of `delta`.
-    pub(crate) fn consistency_variants(&self, delta: &super::batch::Store) -> Vec<(usize, usize)> {
+    pub(crate) fn consistency_variants<R: super::batch::Representation>(
+        &self,
+        delta: &super::batch::WorkingStore<R>,
+    ) -> Vec<(usize, usize)> {
         self.consistency_dispatch.matching(delta)
     }
 
@@ -1716,6 +1874,57 @@ mod tests {
 
     use super::super::ir::{Atom, Head, Rule, Term};
     use super::*;
+
+    /// A morsel's candidates sort the same packed (the batch executor's numbers) as triples
+    /// by (predicate, subject, object), and each packs and unpacks to itself.
+    /// Guard: a morsel's packed candidates of one predicate sort as their low words (one
+    /// word a comparison, 8 bytes a move). Of one predicate or of several, they come out
+    /// sorted and distinct as a sort of the word pairs.
+    #[test]
+    fn packed_candidates_sort_distinct_as_word_pairs() {
+        let mut x = 11u64;
+        for (n, predicates) in [(0, 1), (10, 1), (500, 1), (500, 3)] {
+            let candidates: Vec<u128> = (0..n)
+                .map(|_| {
+                    x = x
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    u128::of([(x >> 40) % 50, 7 + (x >> 20) % predicates, (x >> 3) % 60])
+                })
+                .collect();
+            let mut want = candidates.clone();
+            want.sort_unstable();
+            want.dedup();
+            assert_eq!(
+                one_predicate(&candidates).is_some(),
+                n >= 64 && predicates == 1,
+                "{n} candidates of {predicates} predicates sorted as words"
+            );
+            let mut got = candidates;
+            u128::sort_distinct(&mut got);
+            assert_eq!(got, want, "{n} candidates of {predicates} predicates");
+        }
+    }
+
+    #[test]
+    fn packed_candidates_sort_as_triples_by_predicate_subject_object() {
+        let mut x = 3u64;
+        let mut next = move || {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (x >> 33) % 5 + (x >> 63) * ((1 << 32) - 6)
+        };
+        let facts: Vec<Triple> = (0..2000).map(|_| [next(), next(), next()]).collect();
+        assert!(facts.iter().flatten().all(|&id| id >> 32 == 0));
+        let mut packed: Vec<u128> = facts.iter().map(|&f| u128::of(f)).collect();
+        let mut triples: Vec<Pso> = facts.iter().map(|&f| Pso::of(f)).collect();
+        packed.sort_unstable();
+        triples.sort_unstable();
+        let unpacked: Vec<Triple> = packed.iter().map(|&k| k.fact()).collect();
+        let expected: Vec<Triple> = triples.iter().map(|&t| t.fact()).collect();
+        assert_eq!(unpacked, expected);
+    }
 
     /// Facts in a list; counts the scans and matches of predicate 12.
     struct Counting {

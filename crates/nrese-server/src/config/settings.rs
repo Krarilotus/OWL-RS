@@ -171,6 +171,13 @@ pub const SETTINGS: &[Setting] = &[
         "Keep the WAL segments checkpoints cover, for point-in-time restores (default false).",
     ),
     setting(
+        "store.inferred_merge_wave_keys",
+        names::INFERRED_MERGE_WAVE_KEYS,
+        Limit(None),
+        "Inferred-stack merge-wave target in keys (default 8388608; 0 or unlimited: no \
+         target). One oversized part may exceed it; packed output and other scratch are apart.",
+    ),
+    setting(
         "store.index_encoding",
         names::INDEX_ENCODING,
         Choice(&["fast", "compact"]),

@@ -118,6 +118,14 @@ impl ListIndex {
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
+
+    /// The same lists over the ids `f` maps their members to.
+    pub fn map_ids(&self, f: &dyn Fn(u64) -> u64) -> Self {
+        Self {
+            lists: self.lists.iter().map(|(&m, l)| (f(m), l.clone())).collect(),
+            count: self.count,
+        }
+    }
 }
 
 /// A [`ListIndex`] shared by the rules that ask it; compared by its contents, so that
@@ -145,6 +153,16 @@ impl SharedListIndex {
 
     pub fn together(&self, a: u64, b: u64) -> bool {
         self.index.together(a, b)
+    }
+
+    /// Every member ID that remapping this guard must preserve, including unused ones.
+    pub(crate) fn ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.index.lists.keys().copied()
+    }
+
+    /// The same lists over the ids `f` maps their members to.
+    pub fn map_ids(&self, f: &dyn Fn(u64) -> u64) -> Self {
+        Self::new(self.index.map_ids(f))
     }
 }
 

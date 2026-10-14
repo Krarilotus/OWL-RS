@@ -34,8 +34,9 @@ use crate::durability::checkpoint;
 use crate::error::{EngineError, EngineResult};
 use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
-use crate::index::{IndexEncoding, IndexVersion, Layout};
-use crate::quad::{EncodedQuad, EncodedTriple, Permutation, QuadPattern};
+use crate::index::{IndexEncoding, IndexVersion, Layout, PairChunks, PredicateRuns};
+use crate::quad::{EncodedQuad, EncodedTriple, GraphSelector, Permutation, QuadPattern};
+use crate::term::TermId;
 use crate::term::pending::Pending;
 
 /// Batches copied between releases of their memory ([`crate::memory`]): about 256 MiB at
@@ -645,6 +646,28 @@ impl<'e> Rematerialisation<'e> {
     /// are asserted in the default graph are dropped: the stacks stay disjoint. Returns the
     /// revision and the inferred statements added and removed.
     pub fn finish(self, inferred: Vec<EncodedTriple>) -> EngineResult<CommitSummary> {
+        let triples = inferred
+            .into_iter()
+            .map(|t| [t.subject.raw(), t.predicate.raw(), t.object.raw()])
+            .collect();
+        self.finish_runs(PredicateRuns::of_triples(triples))
+    }
+
+    /// [`Self::finish`] with the inferred statements as a rule engine's working set holds
+    /// them, per predicate in sorted runs ([`PredicateRuns`]): the permutations are merged
+    /// from the runs, which are freed a predicate at a time as they are read, so the
+    /// statements are never listed or sorted all together (`index::merged`).
+    pub fn finish_runs(self, relations: Vec<PredicateRuns>) -> EngineResult<CommitSummary> {
+        self.finish_runs_timed(relations)
+            .map(|(summary, _)| summary)
+    }
+
+    /// [`Self::finish_runs`], with where its time went ([`StackTimes`]).
+    pub fn finish_runs_timed(
+        self,
+        mut relations: Vec<PredicateRuns>,
+    ) -> EngineResult<(CommitSummary, StackTimes)> {
+        let mut times = StackTimes::default();
         let Self {
             engine,
             _slot,
@@ -653,25 +676,21 @@ impl<'e> Rematerialisation<'e> {
         let shared = &engine.shared;
         let _compaction = shared.versions.compaction_slot.lock();
         let started = Instant::now();
-        let mut quads: Vec<EncodedQuad> = inferred
-            .into_par_iter()
-            .map(EncodedTriple::in_default_graph)
-            .filter(|quad| !base.stack_contains(Stack::Asserted, quad))
-            .collect();
-        quads.par_sort_unstable();
-        quads.dedup();
-        let mut old: Vec<EncodedQuad> = base
-            .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
-            .collect();
-        old.par_sort_unstable();
-        let inserted = quads
-            .par_iter()
-            .filter(|q| old.binary_search(q).is_err())
-            .count();
-        let deleted = old
-            .par_iter()
-            .filter(|q| quads.binary_search(q).is_err())
-            .count();
+        relations
+            .par_iter_mut()
+            .for_each(|relation| without_asserted(&base, relation));
+        times.asserted = started.elapsed();
+        let clock = Instant::now();
+        let (inferred, [pair_orders, merged_orders]) = IndexVersion::from_relations_timed(
+            relations,
+            shared.index_encoding,
+            shared.inferred_merge_wave_keys,
+        );
+        times.index = clock.elapsed();
+        (times.pair_orders, times.merged_orders) = (pair_orders, merged_orders);
+        let clock = Instant::now();
+        let (inserted, deleted) = changes(&base, &inferred);
+        times.changes = clock.elapsed();
         // Compaction may have replaced runs since `base` was taken, with the same content.
         let current = shared.snapshot();
         let current = current.version();
@@ -679,28 +698,29 @@ impl<'e> Rematerialisation<'e> {
             revision: current.revision + 1,
             inserted: 0,
             deleted: 0,
-            inferred_inserted: inserted as u64,
-            inferred_deleted: deleted as u64,
+            inferred_inserted: inserted,
+            inferred_deleted: deleted,
         };
         if inserted + deleted == 0 {
-            return Ok(CommitSummary {
-                revision: current.revision,
-                ..summary
-            });
+            return Ok((
+                CommitSummary {
+                    revision: current.revision,
+                    ..summary
+                },
+                times,
+            ));
         }
         let next = Version {
             content: super::Content::fresh(),
             asserted: current.asserted.clone(),
-            inferred: IndexVersion::from_quads(
-                Layout::DefaultGraph,
-                current.inferred.encoding(),
-                quads,
-            ),
+            inferred,
             revision: summary.revision,
             dictionary_len: shared.dictionary.len(),
             equality: Default::default(),
         };
+        let clock = Instant::now();
         publish(engine, Next::Built(next))?;
+        times.publish = clock.elapsed();
         drop(_compaction);
         tracing::info!(
             revision = summary.revision,
@@ -709,7 +729,158 @@ impl<'e> Rematerialisation<'e> {
             ms = started.elapsed().as_millis() as u64,
             "inferred stack replaced"
         );
+        let clock = Instant::now();
         engine.after_commit(0);
-        Ok(summary)
+        times.after_commit = clock.elapsed();
+        Ok((summary, times))
+    }
+}
+
+/// Where [`Rematerialisation::finish_runs_timed`] spent its time.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StackTimes {
+    /// Leaving the asserted statements out of the runs.
+    pub asserted: std::time::Duration,
+    /// The new stack's index; of it, PSOG and POSG from the runs, then SPOG and OSPG from
+    /// those.
+    pub index: std::time::Duration,
+    pub pair_orders: std::time::Duration,
+    pub merged_orders: std::time::Duration,
+    /// Counting what changed against the old stack.
+    pub changes: std::time::Duration,
+    /// Publishing the new version, then the work after a commit.
+    pub publish: std::time::Duration,
+    pub after_commit: std::time::Duration,
+}
+
+/// Leaves out of `relation` the statements asserted in the default graph (the stacks stay
+/// disjoint). A run is copied only if it holds one: one merge with the asserted pairs of
+/// its predicate, in order, finds out (none, for a reasoner's closure without its input).
+fn without_asserted(base: &Snapshot, relation: &mut PredicateRuns) {
+    let pattern = QuadPattern {
+        subject: None,
+        predicate: Some(relation.predicate),
+        object: None,
+        graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
+    };
+    if base.count_in(ReadModel::Asserted, &pattern) == 0 {
+        return;
+    }
+    let asserted: Vec<[u64; 2]> = base
+        .scan_sorted_in(ReadModel::Asserted, &pattern, Permutation::Gpso)
+        .expect("every layout keeps a predicate's statements of one graph by subject")
+        .map(|quad| [quad.subject.raw(), quad.object.raw()])
+        .collect();
+    let mut changed = false;
+    for run in &mut relation.by_subject {
+        if let Some(kept) = minus(run, &asserted) {
+            *run = kept;
+            changed = true;
+        }
+    }
+    if changed {
+        // Built again from the pairs kept.
+        relation.by_object = None;
+    }
+}
+
+/// The pairs of `run` not in `removed` (both sorted), in the run's form; `None` if that
+/// is all of them. O(n + m).
+fn minus(run: &PairChunks, removed: &[[u64; 2]]) -> Option<PairChunks> {
+    let found = |pair: &[u64; 2], at: &mut usize| {
+        while *at < removed.len() && removed[*at] < *pair {
+            *at += 1;
+        }
+        *at < removed.len() && removed[*at] == *pair
+    };
+    let mut at = 0;
+    if !run.pairs().any(|pair| found(&pair, &mut at)) {
+        return None;
+    }
+    let mut at = 0;
+    Some(run.retained(|pair| !found(&pair, &mut at)))
+}
+
+/// The inferred statements `inferred` holds and the base's inferred stack doesn't, and the
+/// other way round: one merge of the two in SPOG order. O(n + m).
+fn changes(base: &Snapshot, inferred: &IndexVersion) -> (u64, u64) {
+    let new = inferred.len();
+    let old = base.len_in(ReadModel::Inferred);
+    if old == 0 {
+        return (new, 0);
+    }
+    let spog = inferred.packed(Permutation::Spog);
+    let mut fresh = spog.iter().map(EncodedQuad::from_components).peekable();
+    let mut common = 0u64;
+    for quad in base
+        .scan_sorted_in(ReadModel::Inferred, &QuadPattern::all(), Permutation::Spog)
+        .expect("the inferred stack keeps SPOG")
+    {
+        while fresh.next_if(|next| *next < quad).is_some() {}
+        if fresh.next_if_eq(&quad).is_some() {
+            common += 1;
+        }
+    }
+    (new - common, old - common)
+}
+
+#[cfg(test)]
+mod merge_config_tests {
+    use super::*;
+    use crate::{Engine, EngineConfig, TermKind};
+
+    #[test]
+    fn inferred_merges_keep_each_engines_wave_and_encoding() {
+        let iri = |n| ((TermKind::Iri as u64) << 60) | n;
+        let relations = || {
+            vec![PredicateRuns {
+                predicate: TermId::from_raw(iri(7)),
+                by_subject: vec![PairChunks::Ids(vec![
+                    (0..100).map(|n| [iri((1 << 40) + n), iri(n)]).collect(),
+                ])],
+                by_object: None,
+            }]
+        };
+        let small = Engine::new(EngineConfig {
+            inferred_merge_wave_keys: 13,
+            index_encoding: IndexEncoding::Compact,
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let unlimited = Engine::new(EngineConfig {
+            inferred_merge_wave_keys: 0,
+            index_encoding: IndexEncoding::Fast,
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let mut expected = None;
+        for (engine, wave, encoding) in [
+            (&small, 13, IndexEncoding::Compact),
+            (&unlimited, 0, IndexEncoding::Fast),
+            (&small, 13, IndexEncoding::Compact),
+        ] {
+            crate::index::merged::MERGE_WAVES.with(|waves| waves.borrow_mut().clear());
+            engine.rematerialisation().finish_runs(relations()).unwrap();
+            crate::index::merged::MERGE_WAVES.with(|waves| {
+                let waves = waves.borrow();
+                assert!(!waves.is_empty());
+                assert!(waves.iter().all(|&actual| actual == wave
+                    || actual == if wave == 0 { 0 } else { (wave / 2).max(1) }));
+            });
+            let snapshot = engine.snapshot();
+            assert_eq!(snapshot.version().inferred.encoding(), encoding);
+            let quads: Vec<_> = snapshot
+                .scan_sorted_in(ReadModel::Inferred, &QuadPattern::all(), Permutation::Spog)
+                .unwrap()
+                .collect();
+            assert_eq!(quads.len(), 100);
+            match &expected {
+                Some(expected) => assert_eq!(&quads, expected),
+                None => expected = Some(quads),
+            }
+        }
+        assert_eq!(EngineConfig::default().inferred_merge_wave_keys, 1 << 23);
     }
 }

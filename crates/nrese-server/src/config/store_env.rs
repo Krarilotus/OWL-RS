@@ -88,6 +88,13 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             None => defaults.checkpoint_after_wal_bytes,
         },
         wal_archive: parse_bool(source, names::WAL_ARCHIVE, defaults.wal_archive)?,
+        inferred_merge_wave_keys: super::env_values::parse_limit(
+            source,
+            names::INFERRED_MERGE_WAVE_KEYS,
+            Some(defaults.inferred_merge_wave_keys),
+            |value| value.parse::<usize>().map_err(Into::into),
+        )?
+        .unwrap_or(0),
         index_encoding: match source.get(names::INDEX_ENCODING) {
             None => defaults.index_encoding,
             Some(name) => {
@@ -409,6 +416,28 @@ mod tests {
 
     use super::super::source::KeyValueSource;
     use super::{names, parse_dl, parse_store_mode};
+
+    #[test]
+    fn inferred_merge_wave_takes_default_value_zero_or_unlimited() {
+        let mut source = KeyValueSource::default();
+        assert_eq!(
+            super::parse_store_config(&source)
+                .unwrap()
+                .inferred_merge_wave_keys,
+            1 << 23
+        );
+        for (text, expected) in [("17", 17), ("0", 0), ("unlimited", 0)] {
+            source.insert(names::INFERRED_MERGE_WAVE_KEYS, text);
+            assert_eq!(
+                super::parse_store_config(&source)
+                    .unwrap()
+                    .inferred_merge_wave_keys,
+                expected
+            );
+        }
+        source.insert(names::INFERRED_MERGE_WAVE_KEYS, "-1");
+        assert!(super::parse_store_config(&source).is_err());
+    }
 
     #[test]
     fn dl_settings_parse_and_unknown_values_are_errors() {

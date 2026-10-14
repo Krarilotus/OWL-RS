@@ -45,7 +45,7 @@ use crate::quad::{EncodedQuad, EncodedTriple};
 use crate::term::vocabulary::VocabularyEncoding;
 use crate::term::{Dictionary, DictionaryStats, TermId};
 
-pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
+pub use bulk::{BulkLoad, BulkMode, Rematerialisation, StackTimes};
 pub use equality::Classes as EqualityClasses;
 pub use replication::LogBatch;
 pub use snapshot::{InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity};
@@ -63,6 +63,10 @@ pub struct EngineConfig {
     /// How the index blocks this engine builds are encoded; blocks of either encoding are
     /// read.
     pub index_encoding: IndexEncoding,
+    /// Target keys held unpacked by an inferred-stack merge wave (default 8,388,608).
+    /// Zero is unlimited. One oversized part may exceed the target; packed output and
+    /// other merge scratch are apart. This is batching policy, not a strict memory cap.
+    pub inferred_merge_wave_keys: usize,
     /// How the checkpoints this engine writes store the dictionary's keys; checkpoints of
     /// either are read.
     pub vocabulary: VocabularyEncoding,
@@ -75,6 +79,7 @@ impl Default for EngineConfig {
             background_maintenance: true,
             durability: DurabilityConfig::default(),
             index_encoding: IndexEncoding::default(),
+            inferred_merge_wave_keys: 1 << 23,
             vocabulary: VocabularyEncoding::default(),
         }
     }
@@ -371,6 +376,8 @@ struct Shared {
     /// [`EngineConfig::index_encoding`]: what fresh versions (loads, mapped checkpoints)
     /// pack their runs in; derived versions keep their parent's.
     index_encoding: IndexEncoding,
+    /// [`EngineConfig::inferred_merge_wave_keys`].
+    inferred_merge_wave_keys: usize,
     /// [`EngineConfig::vocabulary`].
     vocabulary: VocabularyEncoding,
 }
@@ -632,6 +639,7 @@ impl Engine {
             checkpoints: AtomicU64::new(0),
             equality: RwLock::new(None),
             index_encoding: config.index_encoding,
+            inferred_merge_wave_keys: config.inferred_merge_wave_keys,
             vocabulary: config.vocabulary,
         });
         let worker = config

@@ -8,6 +8,13 @@ path it must take, and records its time and peak memory under a memory cap. A ru
 compared with an earlier one on the same host beyond a confidence interval, so a
 regression or a win shows at once.
 
+Each measured invocation uses the case's `timeout_s` in Docker and native runtimes:
+omitted means 900 seconds, explicit `0` means unlimited (`subprocess` gets `None`).
+For perf_lab this includes the first invocation's setup; repeats and sweep entries each
+get that limit. Tableau also receives the setting for each file's search, retaining its
+300-second search default when omitted. Data preparation and scratch cleanup retain
+their existing defaults. Memory limits still apply to an unlimited-time case.
+
 ```sh
 python benches/fast/fast.py list                          the cases: area, semantics, comparators
 python benches/fast/fast.py build                         perf lab, DL tools and server, Linux, capped
@@ -22,6 +29,7 @@ python benches/fast/fast.py clean [--data]                this worktree's scratc
 |---|---|
 | [`../cases/`](../cases/README.md) | the cases of every group, one schema: data, semantics, tool and arguments, the metric, checks, route checks, memory cap, comparators, home turf |
 | `fast.py` | the driver: build, data, run, compare, list, clean |
+| [`HANDOFF.md`](HANDOFF.md) | selected completion tooling, source checks and remaining final-head acceptance through Fleet |
 | `compete.py` | `fast.py compete`: each case on its comparators, under the semantics each supports |
 | `queries/` | the cases' SPARQL (LUBM's and OWL2Bench's come from `../reasoning/queries`) |
 | `rules/`, `shapes/` | the user-rules case's N3 and Datalog programs; the SHACL case's shapes |

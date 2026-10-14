@@ -8,9 +8,14 @@ order, so that nothing lost hides behind a time:
    complete before and incomplete now, and known issues with their checked values and
    their run past the limit.
 3. **Time:** what got slower or faster beyond the thresholds; work counters; throughput.
-4. **Memory, by kind:** peaks compared only with peaks of their kind (`cgroup`, the
-   container's `memory.peak`; `lifetime`, a process's peak resident memory; `sampled`,
-   readings about a second apart; `phase`, a peak reset at each phase).
+4. **Memory, by kind:** peaks compared only with peaks of their kind, and only kinds that
+   measure memory in use, never cache (the owner's decision, 13 Oct 2026): `lifetime`, a
+   process's peak resident memory (NRESE's own A/Bs); `anon-kernel`, a container's or
+   scope's anonymous plus kernel memory from memory.stat, sampled (cross-system: a contender
+   runs several processes in its container); `sampled`, `docker stats` readings about a
+   second apart; `phase`, a peak reset at each phase. `cgroup`, the cgroup's `memory.peak`,
+   counts the page cache its reads were charged (rl-lubm100: 2.3 GB of 4.7 by what the host
+   had cached): recorded, never compared.
 5. **Disk:** store sizes.
 
     suite.py compare BASE NEW [--min-ms 2] [--threshold 0.10] [--systems S] [--include-restricted]
@@ -224,6 +229,18 @@ def perf_lab_report(report: dict) -> dict:
         "checks": [], "routes": []}]}
 
 
+def valid_series(samples: dict) -> bool:
+    return bool(isinstance(samples, dict) and samples and all(isinstance(vs, list) and vs and
+                all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in vs) for vs in samples.values()))
+
+
+def complete_timing(*entries: dict, series=None) -> bool:
+    reps = [rep for e in entries for rep in e["reps"]]
+    return bool(reps and all(len(e["reps"]) == len(e["status"]) == len(e["metrics"]) for e in entries)
+                and all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for e in entries for v in e["metrics"])
+                and all(valid_series(rep) and set(rep) == set(series if series is not None else reps[0]) for rep in reps))
+
+
 def pooled(report: dict) -> dict[str, dict]:
     """Per case: its samples per repetition, statuses, peak memory, the metric per repetition."""
     out: dict[str, dict] = {}
@@ -286,6 +303,10 @@ def pooled(report: dict) -> dict[str, dict]:
     return out
 
 
+# Kinds that count page cache: recorded beside a peak, never compared.
+CACHE_KINDS = {"cgroup"}
+
+
 def kind_of(entry: dict) -> str:
     kinds = entry["memory_kind"] - {"unknown"}
     return "/".join(sorted(kinds)) if kinds else "unknown"
@@ -341,11 +362,7 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
                         f"{','.join(sorted(sb))} -> {','.join(sorted(sn))}, metric {mb} -> {mn}, peak {pb} -> {pn} MiB"
                         + ("  WORSE" if worse else ""), worse)
             continue
-        shapes = [set(rep) for e in (b, n) for rep in e["reps"]]
-        if (any(len(e["reps"]) != len(e["status"]) for e in (b, n)) or not shapes
-                or not shapes[0] or any(s != shapes[0] for s in shapes)
-                or any(not vs or any(not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in vs)
-                       for e in (b, n) for rep in e["reps"] for vs in rep.values())):
+        if not complete_timing(b, n):
             out.add("Missing", f"{case:<26} NOT COMPARABLE: missing/invalid timing series or repetitions", True)
             continue
         ratio, low, high = bootstrap_ratio(b["reps"], n["reps"])
@@ -395,7 +412,10 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
         # A peak counts beyond either side's spread of peaks too, as a time beyond its spread.
         memory_spread = max(peak_spread(b["peaks"]), peak_spread(n["peaks"]))
         if bp and np_:
-            if "unknown" not in (bk, nk) and bk != nk:
+            if CACHE_KINDS & {bk, nk}:
+                out.add("Memory, by kind", f"{case:<26} peak {bp} ({bk}) -> {np_} ({nk}) MiB: counts page cache, "
+                        "recorded, not compared", False)
+            elif "unknown" not in (bk, nk) and bk != nk:
                 out.add("Memory, by kind", f"{case:<26} peak {bp} ({bk}) -> {np_} ({nk}) MiB: other kinds, not compared",
                         True)
             elif memory_spread > UNSTABLE_PEAK:
@@ -603,7 +623,10 @@ def compare_pairs(base: dict[tuple, Pair], new: dict[tuple, Pair], threshold: fl
                 task = metric.split()[0]
                 kb = kinds[0].get((*key, task), "unknown")
                 kn = kinds[1].get((*key, task), "unknown")
-                if "unknown" not in (kb, kn) and kb != kn:
+                if CACHE_KINDS & {kb, kn}:
+                    out.add("Memory, by kind", f"- {title}: {task} peak MiB ({kb} -> {kn}): counts page cache, "
+                            "recorded, not compared", False)
+                elif "unknown" not in (kb, kn) and kb != kn:
                     out.add("Memory, by kind", f"- {title}: {task} peak MiB ({kb} -> {kn}): other kinds, not compared",
                             True)
                 else:

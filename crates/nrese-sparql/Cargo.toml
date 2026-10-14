@@ -18,11 +18,11 @@ regex = { workspace = true }
 # RDF terms and their XSD values.
 nrese-rdf = { path = "../rdf/nrese-rdf" }
 # SPARQL functions (RAND, UUID, the hashes, IRI against BASE).
-# GeoSPARQL: geometries and their relations; WKT, GeoJSON and GML literals.
+# GeoSPARQL: geometries, their literals and relations (nrese-geo); the functions that
+# construct and measure them, and the R-tree of the relations in triple patterns.
 geo = "0.33"
-quick-xml = { workspace = true }
+nrese-geo = { path = "../nrese-geo" }
 rstar = "0.12"
-serde_json = { workspace = true }
 wkt = "0.14"
 hex = "0.4"
 md-5 = "0.10"
@@ -35,6 +35,8 @@ nrese-sparql-results = { path = "../rdf/nrese-sparql-results" }
 thiserror.workspace = true
 
 [dev-dependencies]
+# The results serialiser's JSON checked as JSON.
+serde_json = { workspace = true }
 # The GeoSPARQL compliance runner reasons over the benchmark's dataset (RDFS).
 nrese-reasoner = { path = "../nrese-reasoner" }
 # The differential tests' reference: the specification's algebra, evaluated plainly.

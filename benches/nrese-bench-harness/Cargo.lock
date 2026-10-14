@@ -1022,6 +1022,7 @@ dependencies = [
  "memchr",
  "memmap2",
  "nrese-exec",
+ "nrese-geo",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-vector",
@@ -1040,6 +1041,19 @@ dependencies = [
  "hashbrown 0.16.1",
  "rayon",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "nrese-geo"
+version = "0.1.0"
+dependencies = [
+ "geo",
+ "nrese-exec",
+ "quick-xml",
+ "rayon",
+ "rstar",
+ "serde_json",
+ "wkt",
 ]
 
 [[package]]
@@ -1118,17 +1132,16 @@ dependencies = [
  "md-5",
  "nrese-engine",
  "nrese-exec",
+ "nrese-geo",
  "nrese-owl",
  "nrese-rdf",
  "nrese-sparql-results",
  "nrese-sparql-syntax",
  "nrese-xsd",
- "quick-xml",
  "rand 0.9.2",
  "rayon",
  "regex",
  "rstar",
- "serde_json",
  "sha1",
  "sha2",
  "thiserror 2.0.21",

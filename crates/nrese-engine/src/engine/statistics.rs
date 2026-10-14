@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 
 use super::characteristic::{CharacteristicSets, Partial};
 use super::{ReadModel, Snapshot, Version};
-use crate::quad::{GraphSelector, Permutation, QuadPattern};
+use crate::quad::{EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
 
 /// Default graphs up to this size get their characteristic sets built at once.
@@ -61,6 +61,67 @@ pub(crate) struct Statistics {
 /// Slices of the subject ids for scanning a graph by subject on every core: the
 /// dictionary's IRIs and blank nodes each cut into `slices` (their payloads are dictionary
 /// indexes), then every other kind at once. In id order, together all ids.
+/// The default graph's statements in `model` with a subject in `low..=high`, in subject
+/// order: decoded a block and a column at a time where the stacks allow it (a loaded
+/// store's), read when the first is asked for, so a part not yet read holds nothing;
+/// otherwise quad by quad through the stacks' merge, which converted every statement to
+/// a key and back to compare the stacks' (CSPA httpd's subset: the statistics after its
+/// load took 30 % of the reasoning's time, 13 October 2026).
+fn statements(
+    snapshot: &Snapshot,
+    model: ReadModel,
+    low: TermId,
+    high: TermId,
+) -> Option<Box<dyn Iterator<Item = EncodedQuad> + Send + '_>> {
+    let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
+    // `None` where the range can't be scanned at all.
+    snapshot
+        .scan_range_in(model, &pattern, Permutation::Gspo, low, high)
+        .map(drop)?;
+    let read = move |()| -> Box<dyn Iterator<Item = EncodedQuad> + Send + '_> {
+        let columns = snapshot.scan_range_columns_in(
+            model,
+            &pattern,
+            Permutation::Gspo,
+            low,
+            high,
+            &[0, 1, 2],
+        );
+        #[cfg(test)]
+        READS.with(|reads| {
+            let (columns_read, quads_scanned) = reads.get();
+            reads.set(match columns {
+                Some(_) => (columns_read + 1, quads_scanned),
+                None => (columns_read, quads_scanned + 1),
+            });
+        });
+        match columns {
+            Some(columns) => {
+                let [subjects, predicates, objects]: [Vec<u64>; 3] =
+                    columns.try_into().expect("three columns");
+                let graph = TermId::DEFAULT_GRAPH.raw();
+                Box::new((0..subjects.len()).map(move |i| {
+                    EncodedQuad::from_components([subjects[i], predicates[i], objects[i], graph])
+                }))
+            }
+            None => Box::new(
+                snapshot
+                    .scan_range_in(model, &pattern, Permutation::Gspo, low, high)
+                    .into_iter()
+                    .flatten(),
+            ),
+        }
+    };
+    Some(Box::new(std::iter::once(()).flat_map(read)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The ranges [`statements`] read by columns and by the quad scan, on this thread (the
+    /// guard's count).
+    static READS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 fn subject_ranges(entries: u64, slices: u64) -> Vec<(TermId, TermId)> {
     let mut starts = vec![0u64];
     for kind in [TermKind::Iri, TermKind::BlankNode] {
@@ -186,14 +247,13 @@ impl Statistics {
     ) -> Option<Arc<CharacteristicSets>> {
         use rayon::prelude::*;
         let started = std::time::Instant::now();
-        let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
+        // Many ranges, so that the columns read at once stay small (below a byte a
+        // statement for four ranges a thread in flight).
         let ranges = subject_ranges(
             snapshot.dictionary_len(),
-            rayon::current_num_threads() as u64 * 4,
+            rayon::current_num_threads() as u64 * 32,
         );
-        let scan = |&(low, high): &(TermId, TermId)| {
-            snapshot.scan_range_in(model, &pattern, Permutation::Gspo, low, high)
-        };
+        let scan = |&(low, high): &(TermId, TermId)| statements(snapshot, model, low, high);
         let built = (|| {
             let parts: Option<Vec<Partial>> = ranges
                 .par_iter()
@@ -310,5 +370,54 @@ impl Statistics {
         }
         cache.insert(key, (distinct, count));
         Some(distinct)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BulkMode, Engine, EngineConfig};
+    use nrese_rdf::{GraphName, NamedNode, Quad};
+
+    /// Guard: a loaded store's statements are read for its statistics a block and a column
+    /// at a time, not through the quad scan's merge of the stacks, and read the same.
+    #[test]
+    fn a_loaded_store_is_read_for_its_statistics_by_columns() {
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let iri = |name: String| NamedNode::new_unchecked(format!("http://example.com/{name}"));
+        let quads: Vec<Quad> = (0..3000u64)
+            .map(|n| {
+                Quad::new(
+                    iri(format!("s{}", n % 300)),
+                    iri(format!("p{}", n % 5)),
+                    iri(format!("o{}", n % 700)),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect();
+        let load = engine.bulk_load(BulkMode::Append);
+        load.add(&quads);
+        load.finish().unwrap();
+        let snapshot = engine.snapshot();
+        let model = ReadModel::default();
+        let (low, high) = (TermId::from_raw(0), TermId::from_raw(u64::MAX));
+        READS.with(|reads| reads.set((0, 0)));
+        let read: Vec<EncodedQuad> = statements(&snapshot, model, low, high).unwrap().collect();
+        assert_eq!(
+            READS.with(std::cell::Cell::get),
+            (1, 0),
+            "columns read, quads scanned"
+        );
+        let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
+        let scanned: Vec<EncodedQuad> = snapshot
+            .scan_range_in(model, &pattern, Permutation::Gspo, low, high)
+            .unwrap()
+            .collect();
+        assert_eq!(read.len(), 2100, "the distinct statements");
+        assert_eq!(read, scanned);
     }
 }

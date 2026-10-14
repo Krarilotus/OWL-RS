@@ -19,6 +19,11 @@
 # parallel; `cargo install --locked cargo-nextest`), else under cargo test, crate by
 # crate. Builds go through scripts/cargo-guarded.sh. Every step runs; the summary lists
 # each one's exit code, and the script fails if any failed.
+#
+# The W3C suites run with their test data required (NRESE_W3C_REQUIRED=1, the data fetched
+# first by scripts/fetch-w3c-tests.sh): a suite without its data fails instead of passing by
+# skipping. NRESE_W3C_OPTIONAL=1 opts out for a local run without the data; such a pass isn't
+# remembered as the tier's.
 set -u
 cd "$(dirname "$0")/.."
 mode=${1:-all}
@@ -161,6 +166,18 @@ run_seeds() {
   return $code
 }
 
+# The W3C suites' data, required unless NRESE_W3C_OPTIONAL (the release gate's first W3C part,
+# 13 Oct 2026, skipped every suite for want of it and passed).
+w3c_data() {
+  if [ -n "${NRESE_W3C_OPTIONAL:-}" ]; then
+    unset NRESE_W3C_REQUIRED
+    echo "=== W3C suites optional (NRESE_W3C_OPTIONAL): a suite without its data skips"
+  else
+    export NRESE_W3C_REQUIRED=1
+    step "W3C data" bash scripts/fetch-w3c-tests.sh
+  fi
+}
+
 # The steps for files outside the Rust workspace.
 side_steps() {
   local files=("$@")
@@ -224,7 +241,7 @@ if [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
   [ "$mode" = all ] || changed_files "$mode" > "$list"
   # A tier that passed for this exact tree and file list doesn't run again. So the gate can
   # run before `git push`, whose hook then needn't hold the remote's connection open for it.
-  key="$mode $(bash scripts/lib/remote.sh tree) $(git hash-object "$list")"
+  key="$mode${NRESE_W3C_OPTIONAL:+ w3c-optional} $(bash scripts/lib/remote.sh tree) $(git hash-object "$list")"
   passed="$(git rev-parse --git-common-dir)/nrese-gate-passed"
   if grep -qxF "$key" "$passed" 2> /dev/null; then
     echo "=== $mode: passed before for this tree and these files"
@@ -264,6 +281,7 @@ case "$mode" in
         # shellcheck disable=SC2046
         step "dependents compile" "$guarded" check --locked -q $(package_args "${dependents[@]}") --lib
       fi
+      w3c_data
       if [ "$mode" = commit ]; then
         step test run_tests "${changed[@]}" -- "${changed[@]}"
       else
@@ -281,6 +299,7 @@ case "$mode" in
       | python -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))" \
       | tr -d '\r')
     [ ${#everything[@]} -gt 0 ] || { echo "no workspace packages found" >&2; exit 2; }
+    w3c_data
     step test run_tests "${everything[@]}"
     step "doc tests" "$guarded" test --locked --workspace --doc
     harness

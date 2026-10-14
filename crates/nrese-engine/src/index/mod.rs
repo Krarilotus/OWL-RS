@@ -24,6 +24,7 @@ pub(crate) mod cursor;
 mod derive;
 pub(crate) mod keys;
 mod merge;
+pub(crate) mod merged;
 pub(crate) mod run;
 
 use std::ops::Range;
@@ -42,6 +43,7 @@ use crate::term::TermId;
 
 pub use compaction::CompactionPolicy;
 pub use keys::IndexEncoding;
+pub use merged::{PairChunks, PredicateRuns};
 
 /// Which quads a stack of runs may hold, and therefore which permutations it maintains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -247,6 +249,20 @@ impl IndexVersion {
         quads: Vec<EncodedQuad>,
     ) -> Self {
         Self::empty(layout, encoding).with_run(Run::from_quads(layout, encoding, quads))
+    }
+
+    /// The default-graph stack of a rule engine's relations (`merged`), with the time PSOG
+    /// and POSG took, then SPOG and OSPG.
+    pub(crate) fn from_relations_timed(
+        relations: Vec<PredicateRuns>,
+        encoding: IndexEncoding,
+        wave: usize,
+    ) -> (Self, [std::time::Duration; 2]) {
+        let (permutations, times) =
+            merged::default_graph_permutations_timed(relations, encoding, wave);
+        let version = Self::from_packed(permutations, encoding)
+            .expect("the merges build every permutation of the default-graph layout");
+        (version, times)
     }
 
     /// Number of visible quads. O(1).

@@ -9,6 +9,7 @@
 //! | basic graph pattern (with its filters) | joined pattern by pattern, probing the index per seed row where the seed is small |
 //! | property path | followed from the seed's values of its ends |
 //! | `P1 . P2` | `eval_from(eval_from(seed, P1), P2)` |
+//! | `GRAPH <g> { P }` | `P` in the graph `<g>`, from the seed |
 //! | `P1 UNION P2` | the union of both, each from the seed |
 //! | `OPTIONAL`, `BIND`, `FILTER` | inside, when every seed variable the part reads is certainly bound by the part it applies to (else the seed's value would change what it computes) |
 //!
@@ -22,10 +23,13 @@ use std::collections::HashSet;
 use nrese_exec::{IdTable, UNDEF};
 use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern};
+use nrese_sparql_syntax::term::NamedNodePattern;
 
 use super::exists::deep_variables;
 use super::exists::mentioned;
-use super::{Context, NativeResult, PROBE_FACTOR, Solutions, as_path, bound_variables, pushdown};
+use super::{
+    Context, GraphScope, NativeResult, PROBE_FACTOR, Solutions, as_path, bound_variables, pushdown,
+};
 
 /// Whether an ORDER BY inside `pattern` fixes the order of its rows.
 fn ordered(pattern: &GraphPattern) -> bool {
@@ -84,6 +88,19 @@ impl Context<'_> {
             GraphPattern::LeftJoin { left, .. } | GraphPattern::Minus { left, .. } => {
                 self.estimate(left)
             }
+            // The patterns of `GRAPH <g>` read that graph: their counts there.
+            GraphPattern::Graph {
+                name: NamedNodePattern::NamedNode(name),
+                inner,
+            } => match self.named_scope(name) {
+                GraphScope::Missing => 0.0,
+                scope => {
+                    let outer = self.graph.replace(scope);
+                    let estimate = self.estimate(inner);
+                    *self.graph.borrow_mut() = outer;
+                    estimate
+                }
+            },
             GraphPattern::Filter { inner, .. }
             | GraphPattern::Extend { inner, .. }
             | GraphPattern::Graph { inner, .. }
@@ -222,6 +239,18 @@ impl Context<'_> {
                 }
                 Ok(solutions)
             }
+            GraphPattern::Graph {
+                name: NamedNodePattern::NamedNode(name),
+                inner,
+            } => match self.named_scope(name) {
+                GraphScope::Missing => self.join_alone(seed, pattern),
+                scope => {
+                    let outer = self.graph.replace(scope);
+                    let found = self.eval_from(seed, inner);
+                    *self.graph.borrow_mut() = outer;
+                    found
+                }
+            },
             GraphPattern::Union { inputs } => {
                 // Each input from the seed's rows: a copy for all but the last.
                 let Some((last, rest)) = inputs.split_last() else {

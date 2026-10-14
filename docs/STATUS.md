@@ -12,6 +12,39 @@ What is left before v2 goes to `main`, with owners and state, is the status tabl
 [merge checklist](plan/2026-10-05-v2-merge-checklist.md) §1; the sections from "Audit
 work" on are the record by goal.
 
+## Completion integration (14 October)
+
+The review branch `integrate/v2-completion-20261014` starts at `5dcccf3c`; it has not
+been accepted into `refactor/engine-v2`. It incorporates the vector/planner and DL
+operation contracts, counted-query/memory work from `opt/sparql-memory`, and the
+existing per-store configuration and update/draft planner propagation. The store owns
+reasoner construction; engine/version settings own index and vocabulary encoding;
+updates preserve the request's existing memory envelope and planner policy.
+
+Checkpoint `a71a1dbe` passed its normal commit gate (869 tests, three skips), including
+the wide-definition repair below. `b6dc5384` adds the existing optional functional DL
+route with the current deadline and memory owners; both routing switches remain off
+by default. Its commit gate passed 164 DL tests and 202 benchmark-tool tests (seven
+environment-related skips). This is correctness evidence, not a timing claim. Final
+required-data correctness, regression and concurrency acceptance remain open. The completed
+[planner A/B](../benches/runs/2026-10-14-contracts-planner-abba.toml) compares `41052590`
+with `32ecf1e5`, parsing/planning only: summed p50 21.9115 to 21.141 ms, individual
+changes from -6.51% to +3.19%, two independent processes per side. It establishes
+neither statistical significance nor query-execution performance of the integration.
+The measured text-filter and q02 losses against `main` remain release blockers.
+
+The shared wide/narrow rules solver is implemented in this worktree. Selection occurs
+once per operation; incremental/support stores retain the wide representation. It passes
+295 engine/reasoner tests (four skips), including both representations and the naive
+closure oracle; the graph-capacity fallback also derives a previously absent fact in its
+guard. This does not transfer the saved packed implementation's speed claim to this head.
+Geo join integration and its retained-capacity/CRS guards pass. The combined commit-tier
+gate passed 1,062 tests (seven skips) and all 83 benchmark-harness tests. Both areas
+still require per-case speed and memory comparisons before acceptance. The consolidated
+benchmark runner passes 219 Python tests (seven environment skips) and rejects the
+reviewed stale, partial and incompletely timed report counterexamples; its checks run
+outside measured engine work. See the [handoff](../benches/fast/HANDOFF.md).
+
 ## Execution and performance (PR #23)
 
 The PR's implementation base is `0f46563`. The measurements are rows of the

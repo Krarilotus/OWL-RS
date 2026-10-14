@@ -185,8 +185,7 @@ pub fn maintain(
         if let Some(closure) = &rebuilt {
             inserted.extend(
                 closure
-                    .inferred
-                    .iter()
+                    .inferred_triples()
                     .map(|t| triple(t.in_default_graph()))
                     .filter(|&fact| !base.known_before(fact)),
             );
@@ -254,7 +253,7 @@ pub fn maintain(
         }
     }
     if rebuild {
-        let mut closure = match rebuilt.take() {
+        let closure = match rebuilt.take() {
             Some(closure) => closure,
             None => super::materialise_until(program, &tx.pending_snapshot(), stop)?,
         };
@@ -273,11 +272,12 @@ pub fn maintain(
             .collect();
         before.par_sort_unstable();
         before.dedup();
-        closure.inferred.par_sort_unstable();
-        closure.inferred.dedup();
+        let mut fresh: Vec<EncodedTriple> = closure.inferred_triples().collect();
+        fresh.par_sort_unstable();
+        fresh.dedup();
         // One merge walk over both (a binary search per fact cost 130 ms of a 1.4 M-fact
         // stack's rebuild, against 70 for its materialisation).
-        let (old, new) = (&before, &closure.inferred);
+        let (old, new) = (&before, &fresh);
         let (mut i, mut j) = (0, 0);
         while i < old.len() || j < new.len() {
             if j == new.len() || (i < old.len() && old[i] < new[j]) {
@@ -574,7 +574,7 @@ mod tests {
                     tx.commit().unwrap();
                     let remat = engine.rematerialisation();
                     let closure = super::super::materialise(&program, remat.base());
-                    remat.finish(closure.inferred).unwrap();
+                    remat.finish_runs(closure.inferred).unwrap();
                     let mut ground = program.ground_program(&engine.snapshot());
                     for step in 0..12 {
                         // Every other commit deletes only (what a rebuild is offered for).
@@ -615,8 +615,7 @@ mod tests {
                             .collect();
                         let fresh: HashSet<EncodedTriple> =
                             super::super::materialise(&program, &snapshot)
-                                .inferred
-                                .into_iter()
+                                .inferred_triples()
                                 .filter(|t| {
                                     !snapshot
                                         .contains_in(ReadModel::Asserted, &t.in_default_graph())
@@ -701,7 +700,7 @@ mod tests {
             tx.commit().unwrap();
             let remat = engine.rematerialisation();
             let closure = super::super::materialise(&program, remat.base());
-            remat.finish(closure.inferred).unwrap();
+            remat.finish_runs(closure.inferred).unwrap();
             let ground = program.ground_program(&engine.snapshot());
             let mut tx = engine.transaction();
             tx.remove_encoded(encode(tail).in_default_graph());
@@ -752,7 +751,7 @@ mod tests {
             tx.commit().unwrap();
             let remat = engine.rematerialisation();
             let closure = super::super::materialise(&program, remat.base());
-            remat.finish(closure.inferred).unwrap();
+            remat.finish_runs(closure.inferred).unwrap();
             let before = engine.snapshot();
             let ground = program.ground_program(&before);
             let change = |tx: &mut Transaction<'_>| {

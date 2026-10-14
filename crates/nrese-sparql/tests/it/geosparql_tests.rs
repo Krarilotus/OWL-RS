@@ -742,3 +742,636 @@ fn geojson_and_gml_literals() {
     );
     assert_eq!(rows[0][0], None, "GeoJSON is CRS84 only");
 }
+
+/// The objects of a store whose geometry literals (and other terms) hang off a property of
+/// its own in a named graph, as Geographica's datasets do (`geonames:asWKT`), and the
+/// same again in a second graph: a grid of `side` × `side` points, then lines, polygons
+/// and terms that aren't geometries. Each subject has a kind, `"k0"` or `"k1"` by the
+/// parity of its position.
+fn own_property_store(side: usize) -> (Engine, Vec<(String, Term)>) {
+    let wkt = NamedNode::new_unchecked("http://www.opengis.net/ont/geosparql#wktLiteral");
+    let json = NamedNode::new_unchecked("http://www.opengis.net/ont/geosparql#geoJSONLiteral");
+    let mut objects: Vec<Term> = Vec::new();
+    for i in 0..side * side {
+        let text = format!("POINT({} {})", i % side, i / side);
+        objects.push(Literal::new_typed_literal(text, wkt.clone()).into());
+    }
+    for text in [
+        "POLYGON((0 0, 3 0, 3 3, 0 3, 0 0))",
+        "POLYGON((2 2, 5 2, 5 5, 2 5, 2 2))",
+        "POLYGON((5 5, 8 5, 8 8, 5 8, 5 5))",
+        "POLYGON((8 1, 11 1, 11 4, 8 4, 8 1))",
+        "POLYGON((1 1, 10 1, 10 10, 1 10, 1 1),(3 3, 6 3, 6 6, 3 6, 3 3))",
+        "POLYGON((3 3, 4 3, 4 4, 3 4, 3 3))",
+        "LINESTRING(0 0, 11 11)",
+        "LINESTRING(-1 5, 12 5)",
+        "LINESTRING(4 4, 4 7)",
+        "MULTIPOINT((4 4),(20 20))",
+        "<http://www.opengis.net/def/crs/EPSG/0/4326> POINT(5 4)",
+        "<http://www.opengis.net/def/crs/EPSG/0/3857> POINT(4 4)",
+        "",
+        "POINT(oops)",
+    ] {
+        objects.push(Literal::new_typed_literal(text, wkt.clone()).into());
+    }
+    objects
+        .push(Literal::new_typed_literal(r#"{"type":"Point","coordinates":[4,5]}"#, json).into());
+    objects.push(Literal::new_simple_literal("POINT(4 4)").into());
+    objects.push(NamedNode::new_unchecked("http://example.com/notAGeometry").into());
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let shape = NamedNode::new_unchecked("http://example.com/shape");
+    let mut expected = Vec::new();
+    for graph in ["g1", "g2"] {
+        let name = NamedNode::new_unchecked(format!("http://example.com/{graph}"));
+        for (i, object) in objects.iter().enumerate() {
+            let subject = format!("http://example.com/{graph}s{i}");
+            tx.insert(
+                Quad::new(
+                    NamedNode::new_unchecked(subject.as_str()),
+                    shape.clone(),
+                    object.clone(),
+                    GraphName::NamedNode(name.clone()),
+                )
+                .as_ref(),
+            );
+            tx.insert(
+                Quad::new(
+                    NamedNode::new_unchecked(subject.as_str()),
+                    NamedNode::new_unchecked("http://example.com/kind"),
+                    Literal::new_simple_literal(format!("k{}", i % 2)),
+                    GraphName::NamedNode(name.clone()),
+                )
+                .as_ref(),
+            );
+            if graph == "g1" {
+                expected.push((format!("<{subject}>"), object.clone()));
+            }
+        }
+    }
+    tx.commit().unwrap();
+    (engine, expected)
+}
+
+/// `FILTER(geof:R(?o, C))` and `geof:R(C, ?o)` where `?o` is bound by a property of the
+/// data's own (not `geo:asWKT`) in a named graph: for every relation and constants that
+/// are polygons, points, lines and a `geof:buffer` expression, the rows are those whose
+/// literal stands in the relation by its definition ([`nrese_geo::relate`], literals in
+/// another reference system, empty, unreadable or not geometries excluded). The geometry
+/// index gives the candidates by datatype, so the selective filters start from it.
+#[test]
+fn filters_on_a_property_of_the_data_equal_the_definition() {
+    let (engine, objects) = own_property_store(12);
+    let snapshot = engine.snapshot();
+    let constants = [
+        r#""POLYGON((2.5 2.5, 6.5 2.5, 6.5 6.5, 2.5 6.5, 2.5 2.5))"^^geo:wktLiteral"#,
+        r#""POLYGON((2 2, 5 2, 5 5, 2 5, 2 2))"^^geo:wktLiteral"#,
+        r#""POINT(4 4)"^^geo:wktLiteral"#,
+        r#""LINESTRING(0 3, 11 3)"^^geo:wktLiteral"#,
+        r#"geof:buffer("POINT(5 5)"^^geo:wktLiteral, 2, uom:degree)"#,
+    ];
+    let shape_of = |term: &Term| match term {
+        Term::Literal(l) => nrese_geo::parse(l.datatype().as_str(), l.value()),
+        _ => None,
+    };
+    for constant in constants {
+        let Some(Some(value)) = select(
+            &engine,
+            &format!("SELECT ?c WHERE {{ BIND({constant} AS ?c) }}"),
+        )
+        .into_iter()
+        .next()
+        .and_then(|row| row.into_iter().next()) else {
+            panic!("{constant}")
+        };
+        let fixed = shape_of(&value).expect("a geometry constant");
+        for local in nrese_geo::RELATIONS {
+            for first in [true, false] {
+                let call = if first {
+                    format!("geof:{local}(?o, {constant})")
+                } else {
+                    format!("geof:{local}({constant}, ?o)")
+                };
+                let text = format!(
+                    "{PREFIXES}SELECT ?s WHERE {{ GRAPH ex:g1 {{ ?s ex:shape ?o }} FILTER({call}) }}"
+                );
+                let query = SparqlParser::new().parse_query(&text).unwrap();
+                let QueryResults::Solutions(solutions) =
+                    evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap()
+                else {
+                    panic!()
+                };
+                let mut rows: Vec<String> = solutions.map(|s| s.unwrap()[0].to_string()).collect();
+                rows.sort();
+                let mut expected: Vec<String> = objects
+                    .iter()
+                    .filter(|(_, object)| {
+                        shape_of(object).is_some_and(|shape| {
+                            let (a, b) = if first {
+                                (&shape, &fixed)
+                            } else {
+                                (&fixed, &shape)
+                            };
+                            nrese_geo::relate(local, a, b) == Some(true)
+                        })
+                    })
+                    .map(|(subject, _)| subject.clone())
+                    .collect();
+                expected.sort();
+                assert_eq!(rows, expected, "{call}");
+            }
+        }
+    }
+    // A geometry the query computes (an id of its own) is left to the generic evaluator.
+    let text = format!(
+        "SELECT ?s WHERE {{ GRAPH ex:g1 {{ ?s ex:shape ?o }} \
+         BIND(geof:centroid(?o) AS ?c) FILTER(geof:sfWithin(?c, {})) }}",
+        constants[0]
+    );
+    let mut rows: Vec<String> = select(&engine, &text)
+        .into_iter()
+        .map(|row| row[0].as_ref().unwrap().to_string())
+        .collect();
+    rows.sort();
+    let fixed = nrese_geo::parse(
+        nrese_geo::WKT_LITERAL,
+        "POLYGON((2.5 2.5, 6.5 2.5, 6.5 6.5, 2.5 6.5, 2.5 2.5))",
+    )
+    .unwrap();
+    let mut expected: Vec<String> = objects
+        .iter()
+        .filter(|(_, object)| {
+            shape_of(object).is_some_and(|shape| {
+                use geo::Centroid;
+                shape.geometry.centroid().is_some_and(|point| {
+                    let centre = nrese_geo::Shape {
+                        geometry: geo::Geometry::Point(point),
+                        ..shape
+                    };
+                    nrese_geo::relate("sfWithin", &centre, &fixed) == Some(true)
+                })
+            })
+        })
+        .map(|(subject, _)| subject.clone())
+        .collect();
+    expected.sort();
+    assert_eq!(rows, expected);
+    // The box's 16 points and the shapes whose boxes lie in it start the joins: no step
+    // reads the 161 statements of the property in the graph.
+    let text = format!(
+        "{PREFIXES}SELECT ?s WHERE {{ GRAPH ex:g1 {{ ?s ex:shape ?o }} FILTER(geof:sfWithin(?o, {})) }}",
+        constants[0]
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let plan = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    let seeded = plan
+        .steps
+        .iter()
+        .find(|s| s.operator == "geometry index")
+        .unwrap_or_else(|| panic!("{:#?}", plan.steps));
+    // 16 points, the small square, the EPSG:4326 point and GeoJSON's point, literals both
+    // graphs share.
+    assert_eq!(seeded.rows, 19, "{:#?}", plan.steps);
+    let largest = plan.steps.iter().map(|s| s.rows).max().unwrap();
+    assert!(largest <= 19, "{:#?}", plan.steps);
+}
+
+/// `FILTER(geof:R(?o1, ?o2))` between parts that share no variable (two `GRAPH` blocks, or
+/// the two components of one basic graph pattern): for every relation, the rows are the
+/// pairs of the cross product whose literals stand in it by its definition
+/// ([`nrese_geo::relate`]); the disjointness relations, which the boxes don't narrow, as
+/// before. EXPLAIN shows the spatial join, and an index nested-loop join from a side of
+/// one row.
+#[test]
+fn spatial_joins_equal_the_definition() {
+    let (engine, objects) = own_property_store(6);
+    let snapshot = engine.snapshot();
+    let shape_of = |term: &Term| match term {
+        Term::Literal(l) => nrese_geo::parse(l.datatype().as_str(), l.value()),
+        _ => None,
+    };
+    let shapes: Vec<Option<nrese_geo::Shape>> = objects.iter().map(|(_, o)| shape_of(o)).collect();
+    let in_graph = |subject: &str, graph: &str| subject.replace("/g1s", &format!("/{graph}s"));
+    let rows = |text: &str| -> Vec<String> {
+        let query = SparqlParser::new()
+            .parse_query(&format!("{PREFIXES}{text}"))
+            .unwrap();
+        let QueryResults::Solutions(solutions) =
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap()
+        else {
+            panic!()
+        };
+        let mut rows: Vec<String> = solutions
+            .map(|s| {
+                let s = s.unwrap();
+                format!("{} {}", s[0], s[1])
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    for local in nrese_geo::RELATIONS {
+        // Two graphs, all subjects on both sides.
+        let mut expected = Vec::new();
+        // One basic graph pattern in g1, the first side's subjects of kind k0.
+        let mut expected_k0 = Vec::new();
+        for (i, (s1, _)) in objects.iter().enumerate() {
+            for (j, (s2, _)) in objects.iter().enumerate() {
+                let (Some(a), Some(b)) = (&shapes[i], &shapes[j]) else {
+                    continue;
+                };
+                if nrese_geo::relate(local, a, b) == Some(true) {
+                    expected.push(format!("{s1} {}", in_graph(s2, "g2")));
+                    if i % 2 == 0 {
+                        expected_k0.push(format!("{s1} {s2}"));
+                    }
+                }
+            }
+        }
+        expected.sort();
+        expected_k0.sort();
+        let graphs = format!(
+            "SELECT ?s1 ?s2 WHERE {{ GRAPH ex:g1 {{ ?s1 ex:shape ?o1 }} \
+             GRAPH ex:g2 {{ ?s2 ex:shape ?o2 }} FILTER(geof:{local}(?o1, ?o2)) }}"
+        );
+        assert_eq!(rows(&graphs), expected, "{graphs}");
+        let components = format!(
+            "SELECT ?s1 ?s2 WHERE {{ GRAPH ex:g1 {{ ?s1 ex:shape ?o1 ; ex:kind \"k0\" . \
+             ?s2 ex:shape ?o2 }} FILTER(geof:{local}(?o1, ?o2)) }}"
+        );
+        assert_eq!(rows(&components), expected_k0, "{components}");
+    }
+    let explain = |text: &str| {
+        let query = SparqlParser::new()
+            .parse_query(&format!("{PREFIXES}{text}"))
+            .unwrap();
+        explain_query(&snapshot, &query, &QueryOptions::default()).unwrap()
+    };
+    let plan = explain(
+        "SELECT ?s1 ?s2 WHERE { GRAPH ex:g1 { ?s1 ex:shape ?o1 } \
+         GRAPH ex:g2 { ?s2 ex:shape ?o2 } FILTER(geof:sfIntersects(?o1, ?o2)) }",
+    );
+    let join = plan
+        .steps
+        .iter()
+        .find(|s| s.operator == "spatial join")
+        .unwrap_or_else(|| panic!("{:#?}", plan.steps));
+    assert_eq!(join.rows, plan.rows, "{:#?}", plan.steps);
+    // No step holds the cross product (53 × 53 statements).
+    assert!(
+        plan.steps.iter().all(|s| s.rows < 53 * 53),
+        "{:#?}",
+        plan.steps
+    );
+    // One small square against a grid of 400 points: the 5 literals whose boxes lie in
+    // its box (its corners and itself) from the index, the other side evaluated from them.
+    let (engine, _) = own_property_store(20);
+    let snapshot = engine.snapshot();
+    let text = "SELECT ?s2 WHERE { GRAPH ex:g1 { ex:g1s405 ex:shape ?o1 } \
+                GRAPH ex:g2 { ?s2 ex:shape ?o2 } FILTER(geof:sfWithin(?o2, ?o1)) }";
+    let query = SparqlParser::new()
+        .parse_query(&format!("{PREFIXES}{text}"))
+        .unwrap();
+    let plan = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    let seeded = plan
+        .steps
+        .iter()
+        .find(|s| s.operator == "geometry index")
+        .unwrap_or_else(|| panic!("{:#?}", plan.steps));
+    assert_eq!(seeded.rows, 5, "{:#?}", plan.steps);
+    // The square is within itself (its copy in g2), nothing else.
+    assert_eq!(plan.rows, 1, "{:#?}", plan.steps);
+    assert!(plan.steps.iter().any(|s| s.operator == "spatial join"));
+}
+
+/// These query-owned geometry values have computed ids and systems absent from the index.
+/// Independent side numbering both invents false matches and loses real ones. Compare
+/// exact bags with generic execution, changing encounter order and the smaller side.
+#[test]
+fn computed_spatial_join_systems_share_identity() {
+    let engine = engine();
+    let snapshot = engine.snapshot();
+    // Non-stored VALUES literals get query-computed ids and are certainly bound.
+    // BIND expressions are nullable, so they cannot establish the join's route.
+    // Distinct lexical points ensure each side discovers the absent CRSs in its own
+    // encounter order while the geometries themselves remain equal.
+    let a = "(1 \"<urn:crs:a> POINT(0 0)\"^^geo:wktLiteral) (2 \"<urn:crs:a> POINT(0 0)\"^^geo:wktLiteral) (3 \"<urn:crs:b> POINT(0 0)\"^^geo:wktLiteral) (4 \"<urn:crs:c> POINT(0 0)\"^^geo:wktLiteral)";
+    let b = "(5 \"<urn:crs:b> POINT(0.0 0.0)\"^^geo:wktLiteral) (6 \"<urn:crs:b> POINT(0.0 0.0)\"^^geo:wktLiteral) (7 \"<urn:crs:a> POINT(0.0 0.0)\"^^geo:wktLiteral) (8 \"<urn:crs:a> POINT(0.0 0.0)\"^^geo:wktLiteral) (9 \"<urn:crs:d> POINT(0.0 0.0)\"^^geo:wktLiteral)";
+    for (left, right) in [(a, b), (b, a)] {
+        for relation in ["sfIntersects(?a, ?b)", "sfWithin(?b, ?a)"] {
+            let text = format!(
+                "{PREFIXES} SELECT ?i ?j WHERE {{ \
+                 {{ VALUES (?i ?a) {{ {left} }} }} \
+                 {{ VALUES (?j ?b) {{ {right} }} }} FILTER(geof:{relation}) }}"
+            );
+            let query = SparqlParser::new().parse_query(&text).unwrap();
+            let rows = |options: QueryOptions| {
+                let QueryResults::Solutions(solutions) =
+                    evaluate_query(&snapshot, &query, &options).unwrap()
+                else {
+                    panic!()
+                };
+                let mut rows: Vec<_> = solutions
+                    .map(|s| {
+                        let s = s.unwrap();
+                        format!("{} {}", s[0], s[1])
+                    })
+                    .collect();
+                rows.sort();
+                rows
+            };
+            let expected = rows(QueryOptions {
+                as_written: true,
+                ..QueryOptions::default()
+            });
+            assert_eq!(expected.len(), 6, "{text}");
+            assert_eq!(rows(QueryOptions::default()), expected, "{text}");
+            let plan = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+            assert!(
+                plan.steps
+                    .iter()
+                    .any(|step| step.operator == "spatial join"),
+                "{:#?}",
+                plan.steps
+            );
+        }
+    }
+}
+
+/// Repeated values expand one geometric pair into the full bag. The row maps and the
+/// result's overlap with the inputs must use the existing request/result owners.
+#[test]
+fn spatial_join_bags_and_seed_memory_keep_request_ownership() {
+    use nrese_exec::{Envelope, SharedBudget};
+    use nrese_sparql::{QueryEvaluationError, Resources};
+
+    let engine = engine();
+    let snapshot = engine.snapshot();
+    let text = format!(
+        "{PREFIXES} SELECT ?i ?j WHERE {{ \
+        {{ VALUES ?i {{ 1 1 1 1 }} BIND(\"POINT(0 0)\"^^geo:wktLiteral AS ?a) }} \
+        {{ VALUES ?j {{ 2 2 2 2 2 }} BIND(\"POINT(0 0)\"^^geo:wktLiteral AS ?b) }} \
+        FILTER(geof:sfIntersects(?a, ?b)) }}"
+    );
+    let bag = SparqlParser::new().parse_query(&text).unwrap();
+    let seed = SparqlParser::new()
+        .parse_query(&format!(
+            "{PREFIXES} SELECT ?s WHERE {{ \
+        ?s geo:asWKT ?g FILTER(geof:sfIntersects(?g, \"POINT(5 5)\"^^geo:wktLiteral)) }}"
+        ))
+        .unwrap();
+    // Build the persistent index before the request: it is owned by the dictionary.
+    snapshot.geometries();
+    for (query, count) in [(&bag, 20), (&seed, 4)] {
+        let shared = SharedBudget::new(1024 * 1024);
+        let memory = Envelope::new(None, Some(shared.clone()));
+        let options = QueryOptions {
+            resources: Resources {
+                memory: memory.clone(),
+                ..Resources::default()
+            },
+            ..QueryOptions::default()
+        };
+        let QueryResults::Solutions(solutions) =
+            evaluate_query(&snapshot, query, &options).unwrap()
+        else {
+            panic!()
+        };
+        assert!(
+            memory.used() > 0,
+            "live results retain their existing owner"
+        );
+        let rows: Vec<_> = solutions.collect::<Result<_, _>>().unwrap();
+        assert_eq!(rows.len(), count);
+        assert_eq!(memory.used(), 0);
+        assert_eq!(shared.used(), 0);
+        drop(rows);
+        for shared_limit in [false, true] {
+            let shared = SharedBudget::new(if shared_limit { 128 } else { 1024 * 1024 });
+            let memory = Envelope::new(
+                if shared_limit { None } else { Some(128) },
+                Some(shared.clone()),
+            );
+            let options = QueryOptions {
+                resources: Resources {
+                    memory: memory.clone(),
+                    ..Resources::default()
+                },
+                ..QueryOptions::default()
+            };
+            match evaluate_query(&snapshot, query, &options) {
+                Err(QueryEvaluationError::MemoryLimit(error)) => {
+                    assert_eq!(error.shared, shared_limit)
+                }
+                _ => panic!("request must refuse its finite budget"),
+            }
+            assert_eq!(memory.used(), 0);
+            assert_eq!(shared.used(), 0);
+        }
+    }
+}
+
+/// A selective seed pays for its few actual hits, not all unrelated indexed literals.
+/// The discarded full-index precharge rejects this correctly funded request.
+#[test]
+fn constant_spatial_seed_charges_hits_not_unrelated_indexed_data() {
+    use nrese_exec::Envelope;
+    use nrese_sparql::Resources;
+
+    let (engine, _) = own_property_store(40);
+    let snapshot = engine.snapshot();
+    let index = snapshot.geometries();
+    assert!(index.len() * 24 > 8 * 1024);
+    let query = SparqlParser::new().parse_query(&format!("{PREFIXES} SELECT ?s WHERE {{ \
+        GRAPH ex:g1 {{ ?s ex:shape ?g FILTER(geof:sfIntersects(?g, \"POINT(0 0)\"^^geo:wktLiteral)) }} }}")).unwrap();
+    // Determine the answers before checking the same bag under a finite envelope.
+    let QueryResults::Solutions(solutions) =
+        evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap()
+    else {
+        panic!()
+    };
+    let rows = |solutions: nrese_sparql::QuerySolutionIter<'_>| {
+        let mut rows: Vec<_> = solutions.map(|s| s.unwrap()[0].to_string()).collect();
+        rows.sort();
+        rows
+    };
+    let expected = rows(solutions);
+    assert_eq!(expected.len(), 3);
+    let memory = Envelope::new(Some(8 * 1024), None);
+    let options = QueryOptions {
+        resources: Resources {
+            memory: memory.clone(),
+            ..Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    let QueryResults::Solutions(solutions) = evaluate_query(&snapshot, &query, &options).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(rows(solutions), expected);
+    assert!(memory.peak() < index.len() * 24);
+    assert_eq!(memory.used(), 0);
+
+    // The variable-variable join's optional index seed has the same selective contract.
+    let query = SparqlParser::new()
+        .parse_query(&format!(
+            "{PREFIXES} SELECT ?s WHERE {{ \
+        GRAPH ex:g1 {{ ex:g1s1605 ex:shape ?a }} GRAPH ex:g2 {{ ?s ex:shape ?b }} \
+        FILTER(geof:sfWithin(?b, ?a)) }}"
+        ))
+        .unwrap();
+    let QueryResults::Solutions(solutions) =
+        evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap()
+    else {
+        panic!()
+    };
+    let expected = rows(solutions);
+    assert_eq!(expected.len(), 1);
+    let memory = Envelope::new(Some(16 * 1024), None);
+    let options = QueryOptions {
+        resources: Resources {
+            memory: memory.clone(),
+            ..Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    let QueryResults::Solutions(solutions) = evaluate_query(&snapshot, &query, &options).unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(rows(solutions), expected);
+    assert!(memory.peak() < index.len() * 24);
+    assert_eq!(memory.used(), 0);
+}
+
+/// Empty serialisations have no index box. A bound spatial triple must agree with
+/// the fully bound exact path, in either direction and when both sides are enumerated.
+#[test]
+fn empty_spatial_triples_equal_fully_bound_evaluation() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (name, text) in [
+        ("e1", ""),
+        ("e2", "LINESTRING EMPTY"),
+        ("other", "<urn:other:crs> LINESTRING EMPTY"),
+        ("point", "POINT(0 0)"),
+    ] {
+        tx.insert(
+            Quad::new(
+                NamedNode::new_unchecked(format!("http://example.com/{name}")),
+                NamedNode::new_unchecked(format!("{}asWKT", nrese_geo::GEO)),
+                Literal::new_typed_literal(text, NamedNode::new_unchecked(nrese_geo::WKT_LITERAL)),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    for relation in ["sfEquals", "ehEquals", "rcc8eq"] {
+        let mut expected = Vec::new();
+        for name in ["e1", "e2", "other", "point"] {
+            let query = SparqlParser::new()
+                .parse_query(&format!(
+                    "{PREFIXES} ASK {{ ex:e1 geo:{relation} ex:{name} }}"
+                ))
+                .unwrap();
+            let QueryResults::Boolean(related) =
+                evaluate_query(&engine.snapshot(), &query, &QueryOptions::default()).unwrap()
+            else {
+                panic!()
+            };
+            if related {
+                expected.push(format!("<http://example.com/{name}>"));
+            }
+        }
+        expected.sort();
+        assert_eq!(
+            expected,
+            ["<http://example.com/e1>", "<http://example.com/e2>"]
+        );
+        for text in [
+            format!("SELECT ?b WHERE {{ ex:e1 geo:{relation} ?b }}"),
+            format!("SELECT ?b WHERE {{ ?b geo:{relation} ex:e1 }}"),
+            format!("SELECT ?b WHERE {{ VALUES ?a {{ ex:e1 }} ?a geo:{relation} ?b }}"),
+            format!("SELECT ?b WHERE {{ ?a geo:{relation} ?b FILTER(?a = ex:e1) }}"),
+        ] {
+            let mut found: Vec<_> = select(&engine, &text)
+                .into_iter()
+                .map(|row| row[0].as_ref().unwrap().to_string())
+                .collect();
+            found.sort();
+            assert_eq!(found, expected, "{text}");
+        }
+    }
+}
+
+/// A buffer in metres is the geodesic disc: around Geographica Q14's point in Athens, the
+/// points half a metre inside its 3,000 m circle are within it in every direction, those
+/// half a metre outside aren't (the adjudicated answer counts a point at 2,998.8 m; the
+/// equirectangular buffer of 32 segments missed it).
+#[test]
+fn a_metre_buffer_is_the_geodesic_disc() {
+    use geo::{Destination, Geodesic};
+    let engine = engine();
+    let centre = geo::Point::new(23.71622, 37.97945);
+    let disc = "geof:buffer(\"POINT(23.71622 37.97945)\"^^geo:wktLiteral, 3000, uom:metre)";
+    for step in 0..24 {
+        let bearing = f64::from(step) * 15.0 + 7.0;
+        for (metres, inside) in [(2999.5, true), (3000.5, false)] {
+            let point = Geodesic.destination(centre, bearing, metres);
+            let rows = select(
+                &engine,
+                &format!(
+                    "SELECT ?w WHERE {{ BIND(geof:sfWithin(\"POINT({} {})\"^^geo:wktLiteral, {disc}) AS ?w) }}",
+                    point.x(),
+                    point.y()
+                ),
+            );
+            let Some(Term::Literal(within)) = &rows[0][0] else {
+                panic!("{rows:?}")
+            };
+            assert_eq!(within.value() == "true", inside, "{metres} m at {bearing}°");
+        }
+    }
+}
+
+/// Projections over stored geometry literals read each geometry once, when the index takes
+/// it in: `geof:envelope(?g)` comes from the index's boxes (equal to the function's own
+/// answer for every literal, other terms an error), and `geof:area(?g)` without its unit
+/// fails before it reads anything (Geographica Q02 and Q06 over CLC's 44,834 polygons).
+#[test]
+fn projections_read_no_geometry_the_index_holds() {
+    let (engine, objects) = own_property_store(6);
+    // The index takes the literals in (on other threads).
+    engine.snapshot().geometries();
+    let rows = |text: &str| select(&engine, text);
+    let before = nrese_geo::parses_on_this_thread();
+    let envelopes =
+        rows("SELECT ?s ?e WHERE { GRAPH ex:g1 { ?s ex:shape ?o } BIND(geof:envelope(?o) AS ?e) }");
+    let areas =
+        rows("SELECT ?a WHERE { GRAPH ex:g1 { ?s ex:shape ?o } BIND(geof:area(?o) AS ?a) }");
+    assert_eq!(
+        nrese_geo::parses_on_this_thread(),
+        before,
+        "no geometry read"
+    );
+    assert_eq!(envelopes.len(), objects.len());
+    assert!(
+        areas.iter().all(|row| row[0].is_none()),
+        "a unit is required"
+    );
+    // Each literal's envelope as the function computes it from the literal itself.
+    for (subject, object) in &objects {
+        let expected = rows(&format!(
+            "SELECT ?e WHERE {{ BIND(geof:envelope({object}) AS ?e) }}"
+        ))
+        .remove(0)
+        .remove(0);
+        let found = envelopes
+            .iter()
+            .find(|row| row[0].as_ref().map(Term::to_string).as_deref() == Some(subject.as_str()))
+            .unwrap_or_else(|| panic!("{subject}"));
+        assert_eq!(found[1], expected, "{object}");
+    }
+}

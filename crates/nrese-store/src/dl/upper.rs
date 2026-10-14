@@ -569,6 +569,7 @@ impl Upper {
             None,
             &schema,
             nrese_reasoner::batch::Listing::Stored,
+            nrese_reasoner::batch::Output::Facts,
             stop,
         )
         .map_err(|_| GaveUp("the upper bound's evaluation was stopped".to_owned()))?;

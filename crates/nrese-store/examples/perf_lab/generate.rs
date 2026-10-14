@@ -129,6 +129,7 @@ pub fn main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "vectors" => vectors(&params, &mut rng, &mut nt)?,
         "rdf12" => rdf12(&params, &mut rng, &mut nt)?,
         "graph" => graph(&params, &mut rng, &mut nt)?,
+        "cspa" => cspa(&params, &mut rng, &mut nt)?,
         "twins" => twins(&params, &mut rng, &mut nt, out)?,
         "dl-transitive" => dl_transitive(&params, &mut nt)?,
         "dl-number" => dl_number(&params, &mut nt)?,
@@ -809,6 +810,147 @@ fn graph(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     let mut e = Expect::new();
     e.insert("edges".into(), json!(edges.len()));
     e.insert("path_pairs".into(), json!(pairs));
+    Ok(e)
+}
+
+/// A program's pointer graph for the context-sensitive pointer analysis (CSPA, Graspan's
+/// benchmark, Soufflé's home turf; `benches/fast/rules/cspa.n3`): `nodes` nodes, two
+/// thirds of them dereferenced, each to its own node a third further on (so dereferences
+/// chain, and every node has at most one in and one out, as in Graspan's httpd graph),
+/// and `assigns` assignments between nodes, their sources skewed (a few are assigned from
+/// often). Its closure is computed here too, by a semi-naive evaluation of the program's
+/// ten rules over hash sets: the counts of `valueFlow`, `memoryAlias` and `valueAlias`
+/// the case checks.
+fn cspa(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
+    use std::collections::{HashMap, HashSet};
+    type Rel = HashSet<(u32, u32)>;
+    type Index = HashMap<u32, Vec<u32>>;
+    let (nodes, assigns) = (p.get("nodes", 18000) as u32, p.get("assigns", 2400));
+    let third = nodes / 3;
+    let deref: Vec<(u32, u32)> = (0..2 * third).map(|y| (y, y + third)).collect();
+    let mut assign: BTreeSet<(u32, u32)> = BTreeSet::new();
+    while (assign.len() as u64) < assigns {
+        let from = rng.skewed(u64::from(nodes)) as u32;
+        let to = rng.below(u64::from(nodes)) as u32;
+        assign.insert((from, to));
+    }
+    let node = |n: u32| ex(format!("n{n}"));
+    for &(y, x) in &deref {
+        nt.t(&node(y), &ex("dereference"), &node(x))?;
+    }
+    for &(a, b) in &assign {
+        nt.t(&node(a), &ex("assign"), &node(b))?;
+    }
+    // The closure. Each relation in full with its indexes, and the last round's delta.
+    #[derive(Default)]
+    struct Relation {
+        all: Rel,
+        out: Index,
+        into: Index,
+        delta: Vec<(u32, u32)>,
+    }
+    impl Relation {
+        fn add(&mut self, new: Rel) {
+            self.delta = new
+                .into_iter()
+                .filter(|pair| !self.all.contains(pair))
+                .collect();
+            for &(a, b) in &self.delta {
+                self.all.insert((a, b));
+                self.out.entry(a).or_default().push(b);
+                self.into.entry(b).or_default().push(a);
+            }
+        }
+    }
+    let at = |index: &Index, key: u32| index.get(&key).cloned().unwrap_or_default();
+    let mut assign_into: Index = HashMap::new();
+    for &(a, b) in &assign {
+        assign_into.entry(b).or_default().push(a);
+    }
+    let deref_out: HashMap<u32, u32> = deref.iter().copied().collect();
+    let (mut vf, mut ma, mut va) = (
+        Relation::default(),
+        Relation::default(),
+        Relation::default(),
+    );
+    // The rules without recursion: VF(y, x) :- A(y, x); VF(x, x) and MA(x, x) for each
+    // end of an assignment.
+    let mut first_vf: Rel = assign.iter().copied().collect();
+    let mut first_ma: Rel = HashSet::new();
+    for &(a, b) in &assign {
+        for n in [a, b] {
+            first_vf.insert((n, n));
+            first_ma.insert((n, n));
+        }
+    }
+    vf.add(first_vf);
+    ma.add(first_ma);
+    while !(vf.delta.is_empty() && ma.delta.is_empty() && va.delta.is_empty()) {
+        let (mut new_vf, mut new_ma, mut new_va): (Rel, Rel, Rel) = Default::default();
+        // VF(x, y) :- A(x, z), MA(z, y).
+        for &(z, y) in &ma.delta {
+            for x in at(&assign_into, z) {
+                new_vf.insert((x, y));
+            }
+        }
+        // VF(x, y) :- VF(x, z), VF(z, y).
+        for &(x, z) in &vf.delta {
+            for y in at(&vf.out, z) {
+                new_vf.insert((x, y));
+            }
+        }
+        for &(z, y) in &vf.delta {
+            for x in at(&vf.into, z) {
+                new_vf.insert((x, y));
+            }
+        }
+        // MA(x, w) :- D(y, x), VA(y, z), D(z, w).
+        for &(y, z) in &va.delta {
+            if let (Some(&x), Some(&w)) = (deref_out.get(&y), deref_out.get(&z)) {
+                new_ma.insert((x, w));
+            }
+        }
+        // VA(x, y) :- VF(z, x), VF(z, y).
+        for &(z, x) in &vf.delta {
+            for y in at(&vf.out, z) {
+                new_va.insert((x, y));
+                new_va.insert((y, x));
+            }
+        }
+        // VA(x, y) :- VF(z, x), MA(z, w), VF(w, y).
+        for &(z, x) in &vf.delta {
+            for w in at(&ma.out, z) {
+                for y in at(&vf.out, w) {
+                    new_va.insert((x, y));
+                }
+            }
+        }
+        for &(z, w) in &ma.delta {
+            for x in at(&vf.out, z) {
+                for y in at(&vf.out, w) {
+                    new_va.insert((x, y));
+                }
+            }
+        }
+        for &(w, y) in &vf.delta {
+            for z in at(&ma.into, w) {
+                for x in at(&vf.out, z) {
+                    new_va.insert((x, y));
+                }
+            }
+        }
+        vf.add(new_vf);
+        ma.add(new_ma);
+        va.add(new_va);
+    }
+    let mut e = Expect::new();
+    e.insert("value_flow".into(), json!(vf.all.len()));
+    e.insert("memory_alias".into(), json!(ma.all.len()));
+    e.insert("value_alias".into(), json!(va.all.len()));
+    e.insert(
+        "derived".into(),
+        json!(vf.all.len() + ma.all.len() + va.all.len()),
+    );
     Ok(e)
 }
 

@@ -112,6 +112,9 @@ pub struct StoreConfig {
     /// `Compact` (palettes: a smaller store, scans up to a tenth slower). Set for the
     /// process when the store opens; see `nrese_engine::IndexEncoding`.
     pub index_encoding: nrese_engine::IndexEncoding,
+    /// Inferred-stack merge-wave target in keys; zero is unlimited. Each engine owns it
+    /// ([`nrese_engine::EngineConfig::inferred_merge_wave_keys`]).
+    pub inferred_merge_wave_keys: usize,
     /// How checkpoints store the dictionary's keys (`store.vocabulary`): `Plain`, or `Fsst`
     /// (compressed to about half; a key costs a decode when read).
     pub vocabulary: nrese_engine::VocabularyEncoding,
@@ -281,6 +284,8 @@ impl StoreConfig {
             invalid_statements: crate::quarantine::InvalidStatements::Quarantine,
             wal_archive: false,
             index_encoding: nrese_engine::IndexEncoding::Fast,
+            inferred_merge_wave_keys: nrese_engine::EngineConfig::default()
+                .inferred_merge_wave_keys,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
             dl: crate::dl::DlConfig::default(),
@@ -316,6 +321,8 @@ impl StoreConfig {
             invalid_statements: crate::quarantine::InvalidStatements::Quarantine,
             wal_archive: false,
             index_encoding: nrese_engine::IndexEncoding::Fast,
+            inferred_merge_wave_keys: nrese_engine::EngineConfig::default()
+                .inferred_merge_wave_keys,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
             dl: crate::dl::DlConfig::default(),

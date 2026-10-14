@@ -6,14 +6,20 @@
 //!
 //! ```text
 //! cargo run --release -p nrese-reasoner --example rule_work -- \
-//!     [--ruleset owl2-rl] [--naive] [--runs N] [--threads N] [--by-rule] \
-//!     [--equality] [--cascade DEPTH] input.nt...
+//!     [--ruleset owl2-rl | --rules program.n3] [--naive] [--runs N] [--threads N] \
+//!     [--by-rule] [--equality] [--cascade DEPTH] [--density] input.nt...
 //! ```
 //!
+//! - `--rules` reads the rules from a Notation3 document (a Datalog program as the
+//!   Datalog kit translates it, `benches/reasoning/datalog`) instead of a ruleset.
 //! - `--naive` runs the reference evaluator too and checks that the closures agree.
 //! - `--runs` repeats the batch materialisation (times per run, counts once).
 //! - `--equality` materialises with equality by representatives
 //!   (`representatives::materialise_until`) instead of the batch executor alone.
+//! - `--density` counts, per derived relation and order, what its pairs would take as
+//!   sorted words (the working set's), as rows of roaring-style containers (16-bit
+//!   values per 65,536, a bitmap past 4,096) and as rows of Brie-style leaves (a 64-bit
+//!   word per occupied block of 64 values): what a dense layout could save.
 //! - `--cascade DEPTH` adds a functional property and `2 * DEPTH` facts over the input's
 //!   typed individuals whose `sameAs` consequences merge classes one after another:
 //!   depth d needs d merges, each found only after the previous one.
@@ -58,15 +64,15 @@ fn fingerprint(vocabulary: &LocalVocabulary, facts: &[Triple]) -> u64 {
         .fold(0u64, u64::wrapping_add)
 }
 
-fn grouped(facts: &[Triple]) -> Vec<(u64, Vec<(u64, u64)>)> {
+fn grouped(facts: &[Triple]) -> Vec<(u64, Vec<[u64; 2]>)> {
     let mut sorted = facts.to_vec();
     sorted.sort_unstable_by_key(|&[s, p, o]| (p, o, s));
     sorted.dedup();
-    let mut groups: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
+    let mut groups: Vec<(u64, Vec<[u64; 2]>)> = Vec::new();
     for [s, p, o] in sorted {
         match groups.last_mut() {
-            Some((last, pairs)) if *last == p => pairs.push((o, s)),
-            _ => groups.push((p, vec![(o, s)])),
+            Some((last, pairs)) if *last == p => pairs.push([o, s]),
+            _ => groups.push((p, vec![[o, s]])),
         }
     }
     groups
@@ -102,18 +108,79 @@ fn cascade(vocabulary: &mut LocalVocabulary, facts: &[Triple], depth: usize) -> 
     out
 }
 
+/// [`--density`](self): per predicate of `facts` and per order, bytes a pair as sorted
+/// words, as roaring-style rows and as Brie-style rows of 64-bit leaves.
+fn report_density(facts: &[[u64; 3]]) {
+    let mut by_predicate: std::collections::BTreeMap<u64, Vec<(u64, u64)>> = Default::default();
+    for &[s, p, o] in facts {
+        by_predicate.entry(p).or_default().push((s, o));
+    }
+    for (p, mut pairs) in by_predicate {
+        for order in ["subject", "object"] {
+            if order == "object" {
+                pairs.iter_mut().for_each(|(a, b)| std::mem::swap(a, b));
+            }
+            pairs.sort_unstable();
+            pairs.dedup();
+            let n = pairs.len() as f64;
+            let (rows, roaring, brie, blocks) = row_costs(&pairs, |v| v);
+            // Under predicate-local dense ranks: each value renumbered among the relation's
+            // own distinct values in this order (ranks keep the order, so rows stay sorted).
+            let mut values: Vec<u64> = pairs.iter().map(|&(_, v)| v).collect();
+            values.sort_unstable();
+            values.dedup();
+            let rank = |v: u64| values.binary_search(&v).expect("a value of the relation") as u64;
+            let (_, ranked_roaring, ranked_brie, ranked_blocks) = row_costs(&pairs, rank);
+            println!(
+                "density: predicate {p} by {order}: {} pairs, {rows} rows ({:.1} a row), {} values, words 8.0 B a pair, roaring {:.2}, brie {:.2}, a leaf's fill {:.1} of 64; under local ranks roaring {:.2}, brie {:.2}, fill {:.1}",
+                pairs.len(),
+                n / rows.max(1) as f64,
+                values.len(),
+                roaring as f64 / n,
+                brie as f64 / n,
+                n / blocks.max(1) as f64,
+                ranked_roaring as f64 / n,
+                ranked_brie as f64 / n,
+                n / ranked_blocks.max(1) as f64
+            );
+            if order == "object" {
+                pairs.iter_mut().for_each(|(a, b)| std::mem::swap(a, b));
+            }
+        }
+    }
+}
+
+/// Rows, roaring-style bytes, Brie-style bytes and occupied 64-value blocks of sorted,
+/// distinct `pairs`, their second values read through `value` (order-preserving).
+fn row_costs(pairs: &[(u64, u64)], value: impl Fn(u64) -> u64) -> (u64, u64, u64, u64) {
+    let (mut rows, mut roaring, mut brie, mut blocks) = (0u64, 0u64, 0u64, 0u64);
+    for row in pairs.chunk_by(|a, b| a.0 == b.0) {
+        rows += 1;
+        // A row: its key and where its containers start.
+        roaring += 8;
+        brie += 8;
+        let values: Vec<u64> = row.iter().map(|&(_, v)| value(v)).collect();
+        for container in values.chunk_by(|a, b| a >> 16 == b >> 16) {
+            roaring += 8 + (2 * container.len() as u64).min(8192);
+        }
+        let occupied = values.chunk_by(|a, b| a >> 6 == b >> 6).count() as u64;
+        brie += 12 * occupied;
+        blocks += occupied;
+    }
+    (rows, roaring, brie, blocks)
+}
+
 fn report(result: &Materialisation, by_rule: bool) {
     let counters = &result.counters;
     let bindings: u64 = counters.bindings.iter().sum();
     let probes: u64 = counters.probes.iter().sum();
     let bytes = counters.store_bytes.last().map_or(0, |b| b.total());
     println!(
-        "counts: rounds {} | ground rules {} | bindings {bindings} {:?} | probes {probes} {:?} | old checks {} | closure pairs {:?} | member scans {} | merged pairs {} | derived {} | store bytes {bytes}",
+        "counts: rounds {} | ground rules {} | bindings {bindings} {:?} | probes {probes} {:?} | closure pairs {:?} | member scans {} | merged pairs {} | derived {} | store bytes {bytes}",
         result.rounds,
         result.ground_rules,
         counters.bindings,
         counters.probes,
-        counters.old_checks,
         counters.closure_pairs,
         counters.member_scans,
         counters.merged_pairs,
@@ -131,7 +198,9 @@ fn report(result: &Materialisation, by_rule: bool) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let mut ruleset = Ruleset::Owl2Rl;
+    let mut program: Option<String> = None;
     let (mut naive, mut runs, mut threads, mut by_rule) = (false, 1, 0, false);
+    let mut density = false;
     let (mut equality, mut depth, mut inputs) = (false, 0, Vec::new());
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -139,8 +208,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let name = args.next().unwrap_or_default();
                 ruleset = Ruleset::from_name(&name).ok_or(format!("unknown ruleset {name}"))?;
             }
+            "--rules" => program = Some(args.next().ok_or("--rules FILE")?),
             "--naive" => naive = true,
             "--by-rule" => by_rule = true,
+            "--density" => density = true,
             "--equality" => equality = true,
             "--runs" => runs = args.next().ok_or("--runs N")?.parse()?,
             "--threads" => threads = args.next().ok_or("--threads N")?.parse()?,
@@ -154,13 +225,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .build_global()?;
     }
     let mut vocabulary = LocalVocabulary::default();
-    let rules = ruleset.rules(&mut vocabulary)?;
-    let lists = ruleset
-        .has_list_rules()
-        .then(|| ListVocabulary::new(&mut vocabulary));
+    let mut facts = Vec::new();
+    let (rules, lists) = match &program {
+        Some(path) => {
+            let name = std::path::Path::new(path)
+                .file_stem()
+                .map_or(path.clone(), |stem| stem.to_string_lossy().into_owned());
+            let n3 = nrese_reasoner::n3::compile(
+                &name,
+                &std::fs::read_to_string(path)?,
+                &mut vocabulary,
+            )?;
+            facts.extend(n3.facts);
+            (n3.rules, None)
+        }
+        None => (
+            ruleset.rules(&mut vocabulary)?,
+            ruleset
+                .has_list_rules()
+                .then(|| ListVocabulary::new(&mut vocabulary)),
+        ),
+    };
     let schema = Schema::owl(&mut vocabulary);
     let started = Instant::now();
-    let mut facts = Vec::new();
     for path in &inputs {
         for line in std::io::BufReader::new(std::fs::File::open(path)?).lines() {
             let line = line?;
@@ -212,19 +299,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let time = started.elapsed();
         let p = &result.phases;
         println!(
-            "run {run}: closure {:.3} s | grounding {:.3} joins {:.3} modules {:.3} merge {:.3} consistency {:.3} | derived {} | violations {} | fingerprint {:016x}",
+            "run {run}: closure {:.3} s | grounding {:.3} joins {:.3} modules {:.3} merge {:.3} consistency {:.3} | emitted {} new {} | derived {} | violations {} | fingerprint {:016x}",
             time.as_secs_f64(),
             p.grounding.as_secs_f64(),
             p.joins.as_secs_f64(),
             p.modules.as_secs_f64(),
             p.merge.as_secs_f64(),
             p.consistency.as_secs_f64(),
+            p.bindings,
+            p.new_facts,
             result.derived.len(),
             result.violations.len(),
             fingerprint(&vocabulary, &result.derived)
         );
+        let [enumerate, sort, probe, finish] = p.join_parts.map(|d| d.as_secs_f64());
+        println!(
+            "run {run}: join morsels (thread seconds) enumerate {enumerate:.3} sort {sort:.3} probe {probe:.3} hand over {finish:.3}"
+        );
+        let [news, orders, merges] = p.merge_parts.map(|d| d.as_secs_f64());
+        println!(
+            "run {run}: merge parts new pairs {news:.3} object orders {orders:.3} merges {merges:.3}"
+        );
         if first.is_none() {
             report(&result, by_rule);
+            if density {
+                report_density(&result.derived);
+            }
             first = Some(result);
         }
     }

@@ -47,6 +47,16 @@ def comparison(base, new):
 
 
 class FastMemory(unittest.TestCase):
+    def test_general_comparison_records_page_cache_peaks_without_comparing_them(self):
+        base, new = report([1000, 1000]), report([5000, 5000])
+        for side in (base, new):
+            for record in side["records"]:
+                record["memory_kind"] = "cgroup"
+        code, text = comparison(base, new)
+        self.assertEqual(code, 0)
+        self.assertIn("counts page cache, recorded, not compared", text)
+        self.assertNotIn("MORE MEMORY", text)
+
     def test_the_case_peak_is_the_processs_not_the_containers(self):
         container, peak, phases = AB[0]
         result = {"peak_mib": peak, "cgroup_peak_mib": container,

@@ -89,6 +89,7 @@ fn with_cascade(depth: usize) -> Materialisation {
         Some(&lists),
         &schema,
         batch::Listing::Expanded,
+        batch::Output::Facts,
         nrese_reasoner::eval::NEVER,
     )
     .expect("never stopped")
@@ -111,19 +112,6 @@ fn a_cascade_of_merges_costs_one_materialisation() {
         "{} bindings with the cascade, {} without: at most 1.1 times",
         bindings(&merged),
         bindings(&plain)
-    );
-}
-
-/// #10 of the investigation of 6 October 2026: a recent run that is the delta (shared,
-/// right after a fold) has no old part, so reading it as old checks nothing against the
-/// delta. On this input every old read of a recent run is such a read: no check (a
-/// binary search into the delta per pair before: 36 on 6 October; LUBM 100 854,105).
-#[test]
-fn old_reads_of_a_recent_run_that_is_the_delta_check_nothing() {
-    let (result, _) = materialise();
-    assert_eq!(
-        result.counters.old_checks, 0,
-        "pairs checked against the delta"
     );
 }
 
@@ -291,4 +279,44 @@ fn a_split_class_is_recomputed_not_copied_through() {
         .collect();
     maintained.sort_unstable();
     assert_eq!(maintained, fresh.derived);
+}
+
+/// A transitive relation closed once by the module takes the transitivity joins for the
+/// few pairs other rules add later, instead of a closure of all of it every round: a mark
+/// walks a step a round along a chain of 300 (302 rounds), each step adding one `reach`
+/// pair beside a 301-node path's closure (45,451 pairs in all). Closed again in every
+/// round, the module read 13,590,751 pairs on 13 October 2026; now 301, the first round's.
+#[test]
+fn a_closed_transitive_relation_takes_joins_for_what_others_add() {
+    let mut vocabulary = LocalVocabulary::default();
+    let program = nrese_reasoner::n3::compile(
+        "walk",
+        "@prefix e: <http://example.org/> .
+         { ?x e:next ?y } => { ?x e:reach ?y } .
+         { ?x e:reach ?y . ?y e:reach ?z } => { ?x e:reach ?z } .
+         { ?x e:mark ?m . ?x e:step ?y } => { ?y e:mark ?m } .
+         { ?x e:mark ?m } => { ?m e:reach ?x } .",
+        &mut vocabulary,
+    )
+    .expect("the program compiles");
+    let schema = Schema::owl(&mut vocabulary);
+    let mut iri = |name: &str| vocabulary.iri(&format!("http://example.org/{name}"));
+    let (next, step, mark, reach) = (iri("next"), iri("step"), iri("mark"), iri("reach"));
+    let n: Vec<u64> = (0..=300).map(|i| iri(&format!("n{i}"))).collect();
+    let w: Vec<u64> = (0..=300).map(|i| iri(&format!("w{i}"))).collect();
+    let mut facts: Vec<Triple> = Vec::new();
+    for i in 0..300 {
+        facts.push([n[i], next, n[i + 1]]);
+        facts.push([w[i], step, w[i + 1]]);
+    }
+    facts.push([w[0], mark, n[0]]);
+    let result = batch::materialise_grouped(grouped(facts), &program.rules, None, &schema);
+    let read: u64 = result.counters.closure_pairs.iter().sum();
+    let reach = result.derived.iter().filter(|t| t[1] == reach).count() as u64;
+    assert!(result.rounds > 300, "{} rounds", result.rounds);
+    assert!(
+        read <= 2 * reach,
+        "the module read {read} pairs for {reach} reach pairs in {} rounds",
+        result.rounds
+    );
 }

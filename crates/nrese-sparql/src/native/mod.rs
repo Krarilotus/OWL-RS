@@ -25,7 +25,6 @@ pub(crate) mod expr;
 mod fast;
 mod federation;
 mod geo;
-mod geo_formats;
 mod late;
 mod lateral;
 mod numeric;
@@ -52,6 +51,7 @@ mod search;
 mod sets;
 mod sideways;
 mod spatial;
+mod spatial_join;
 mod stream;
 mod strings;
 mod substitute;
@@ -1649,8 +1649,21 @@ impl<'a> Context<'a> {
         // expressions by the generic evaluator.
         let on_ids = fast::compile_term(&plain, &self.snapshot)
             .filter(|term| matches!(term, fast::IdTerm::Part(..) | fast::IdTerm::Triple(_)));
+        // `geof:envelope(?v)` of stored literals from the geometry index's boxes (`spatial`).
+        let envelope = spatial::envelope_argument(&plain)
+            .and_then(|v| solutions.column(v))
+            .map(|column| (column, self.snapshot.geometries()));
         let values: Vec<u64> = (0..solutions.table.len())
             .map(|row| {
+                if let Some((column, index)) = &envelope {
+                    let id = solutions.table.get(row, *column);
+                    if id == UNDEF {
+                        return UNDEF;
+                    }
+                    if computed_index(id).is_none() {
+                        return spatial::envelope_of(index, id).map_or(UNDEF, |t| self.id(&t));
+                    }
+                }
                 if let Some(term) = &on_ids {
                     let value = |v: &Variable| {
                         solutions
@@ -1780,6 +1793,13 @@ impl<'a> Context<'a> {
             }
             GraphPattern::Filter { expr, inner } => match &**inner {
                 GraphPattern::Bgp { patterns } => {
+                    // Parts of the pattern that share no variable, related by a spatial
+                    // conjunct: joined through the relation (`spatial_join`).
+                    let mut all = Vec::new();
+                    pushdown::conjuncts_of(expr, &mut all);
+                    if let Some(joined) = self.spatial_bgp(patterns, &all)? {
+                        return Ok(joined);
+                    }
                     // Range conjuncts on a variable narrow the scan that binds it (the
                     // conjunct still runs on every row, so the ranges only prune). Each
                     // conjunct runs as soon as the join sequence has bound its variables,
@@ -1791,17 +1811,14 @@ impl<'a> Context<'a> {
                     let (early, late): (Vec<_>, Vec<_>) = all
                         .into_iter()
                         .partition(|c| !as_written && pushdown::movable(c));
-                    let spatial_seed = self.spatial_seed(&early, patterns);
+                    let spatial_seed = self.spatial_seed(&early, patterns)?;
                     let mut early: Vec<(&Expression, Vec<Variable>)> = early
                         .into_iter()
                         .map(|c| (c, expression_variables(c)))
                         .collect();
                     // A spatial filter's candidates from the R-tree start the joins.
                     let mut solutions = match spatial_seed {
-                        Some(seed) => {
-                            let seed = self.produced(seed)?;
-                            self.bgp_from(seed, patterns, &mut early)?
-                        }
+                        Some(seed) => self.bgp_from(seed, patterns, &mut early)?,
                         None => self.bgp(patterns, &hints, &mut early)?,
                     };
                     // What the pattern couldn't place: variables it doesn't bind (the
@@ -1819,6 +1836,17 @@ impl<'a> Context<'a> {
                     aggregates,
                 } => {
                     let solutions = self.group(inner, variables, aggregates, Some(expr))?;
+                    self.filter(solutions, expr)
+                }
+                // Inputs that share no variable, related by a spatial conjunct: joined
+                // through the relation (`spatial_join`).
+                GraphPattern::Join { inputs } => {
+                    let mut all = Vec::new();
+                    pushdown::conjuncts_of(expr, &mut all);
+                    if let Some(joined) = self.spatial_inputs(inputs, &all)? {
+                        return Ok(joined);
+                    }
+                    let solutions = self.eval(inner)?;
                     self.filter(solutions, expr)
                 }
                 other => {
@@ -2022,21 +2050,24 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// The scope `GRAPH <name>` reads: the store's default graph for Jena's name of it
+    /// (`compat`), the named graph, or [`GraphScope::Missing`] for one the dataset lacks.
+    fn named_scope(&self, name: &nrese_rdf::NamedNode) -> GraphScope {
+        if crate::compat::names_default_graph(name.as_str()) {
+            return GraphScope::Default;
+        }
+        self.lookup_const(name.as_ref().into())
+            .filter(|&id| self.is_named_graph(id))
+            .map_or(GraphScope::Missing, GraphScope::Named)
+    }
+
     fn graph(&self, name: &NamedNodePattern, inner: &GraphPattern) -> NativeResult<Solutions> {
         let variable = match name {
-            // Jena's name for the default graph (`compat`): the store's default graph.
-            NamedNodePattern::NamedNode(n) if crate::compat::names_default_graph(n.as_str()) => {
-                return self.in_graph(GraphScope::Default, inner);
-            }
             NamedNodePattern::NamedNode(n) => {
-                let id = self
-                    .lookup_const(n.as_ref().into())
-                    .filter(|&id| self.is_named_graph(id));
-                return match id {
-                    Some(id) => self.in_graph(GraphScope::Named(id), inner),
+                return match self.named_scope(n) {
                     // No such graph in the dataset: no solutions, whatever the pattern
                     // would give without reading statements (VALUES, BIND).
-                    None => {
+                    GraphScope::Missing => {
                         let mut vars = Vec::new();
                         bound_variables(inner, &mut vars);
                         let table = IdTable::new(vars.len());
@@ -2046,6 +2077,7 @@ impl<'a> Context<'a> {
                             ordered: false,
                         })
                     }
+                    scope => self.in_graph(scope, inner),
                 };
             }
             NamedNodePattern::Variable(v) => v,

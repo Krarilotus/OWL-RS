@@ -3,11 +3,12 @@
 use std::time::Instant;
 
 use nrese_engine::quad::Permutation;
-use nrese_engine::{EncodedTriple, QuadPattern, ReadModel, Snapshot, TermId};
-use rayon::prelude::*;
+use nrese_engine::{
+    EncodedTriple, PairChunks, PredicateRuns, QuadPattern, ReadModel, Snapshot, TermId,
+};
 
 use super::{Program, encode, storable};
-use crate::batch::{self, Phases, Schema};
+use crate::batch::{self, DerivedRelation, Phases, Schema};
 use crate::delta;
 use crate::ir::{Triple, Violation};
 use crate::lists::ListDiagnostic;
@@ -15,8 +16,11 @@ use crate::lists::ListDiagnostic;
 /// A closure computed over engine term ids.
 #[derive(Debug, Default)]
 pub struct Closure {
-    /// The storable inferred statements (in the default graph).
-    pub inferred: Vec<EncodedTriple>,
+    /// The inferred statements (in the default graph), per predicate as the reasoner's
+    /// working set held them: the store builds the inferred stack from them
+    /// ([`nrese_engine::Rematerialisation::finish_runs`]), leaving out what no stack can
+    /// hold (a literal subject or predicate).
+    pub inferred: Vec<PredicateRuns>,
     pub violations: Vec<Violation>,
     /// List axioms that weren't instantiated.
     pub diagnostics: Vec<ListDiagnostic>,
@@ -45,29 +49,35 @@ pub fn materialise_until(
             &program.rules,
             program.lists.as_ref(),
             &schema,
+            batch::Output::Relations,
             stop,
         )?,
     };
     nrese_exec::heap::phase("reasoner: datatype checks");
     let mut violations = result.violations;
+    // They read facts with a literal subject: a range of each relation's runs.
+    let literal_subjects: Vec<Triple> = result
+        .relations
+        .iter()
+        .flat_map(|relation| relation.with_subjects_from(LITERALS))
+        .collect();
     violations.extend(super::datatypes::violations(
-        &result.derived,
+        &literal_subjects,
         program.rdf_type,
         program.same_as,
         &|id| snapshot.decode(TermId::from_raw(id)),
     ));
-    nrese_exec::heap::phase("store: encode");
-    // At its exact size: collected by doubling, the list held up to twice the facts, and
-    // at a doubling three times, beside them (LUBM 1000: 6.6 GB at this step's peak).
-    let mut inferred = Vec::with_capacity(result.derived.len() + axioms.len());
-    inferred.extend(
-        result
-            .derived
-            .into_iter()
-            .chain(axioms)
-            .filter(|&t| storable(t))
-            .map(encode),
-    );
+    // The relations as they are, and the axioms nothing asserts, a run per predicate.
+    let inferred = result
+        .relations
+        .into_iter()
+        .chain(DerivedRelation::of_facts(axioms))
+        .map(|relation| PredicateRuns {
+            predicate: TermId::from_raw(relation.predicate),
+            by_subject: relation.by_subject,
+            by_object: relation.by_object,
+        })
+        .collect();
     Ok(Closure {
         inferred,
         violations,
@@ -77,8 +87,33 @@ pub fn materialise_until(
     })
 }
 
+/// The smallest id of a literal (every kind after IRIs and blank nodes): a fact with a
+/// subject from it on has a literal subject (`datatypes::is_literal`).
+const LITERALS: u64 = (nrese_engine::TermKind::BlankNode as u64 + 1) << 60;
+
+impl Closure {
+    /// The inferred statements a stack can hold.
+    pub fn inferred_len(&self) -> usize {
+        self.inferred.iter().map(PredicateRuns::storable_len).sum()
+    }
+
+    /// The inferred statements a stack can hold, in no particular order.
+    pub fn inferred_triples(&self) -> impl Iterator<Item = EncodedTriple> + '_ {
+        self.inferred.iter().flat_map(|relation| {
+            let p = relation.predicate.raw();
+            relation
+                .by_subject
+                .iter()
+                .flat_map(PairChunks::pairs)
+                .map(move |[s, o]| [s, p, o])
+                .filter(|&t| storable(t))
+                .map(encode)
+        })
+    }
+}
+
 /// Facts grouped by predicate: each predicate once, its `(object, subject)` pairs sorted.
-type Grouped = Vec<(u64, Vec<(u64, u64)>)>;
+type Grouped = Vec<(u64, Vec<[u64; 2]>)>;
 
 /// The input of a full materialisation of `snapshot`: its asserted statements (any graph)
 /// grouped by predicate, with the ruleset's axioms; and the axioms nothing asserts (they
@@ -90,11 +125,11 @@ fn input_of(program: &Program, snapshot: &Snapshot) -> (Grouped, Vec<Triple>) {
         let [s, p, o] = axiom;
         let at = input.partition_point(|(predicate, _)| *predicate < p);
         match input.get_mut(at) {
-            Some((predicate, pairs)) if *predicate == p => match pairs.binary_search(&(o, s)) {
+            Some((predicate, pairs)) if *predicate == p => match pairs.binary_search(&[o, s]) {
                 Ok(_) => continue,
-                Err(position) => pairs.insert(position, (o, s)),
+                Err(position) => pairs.insert(position, [o, s]),
             },
-            _ => input.insert(at, (p, vec![(o, s)])),
+            _ => input.insert(at, (p, vec![[o, s]])),
         }
         axioms.push(axiom);
     }
@@ -125,6 +160,7 @@ fn by_representatives(
         program.lists.as_ref(),
         schema,
         listing,
+        batch::Output::Relations,
         stop,
     )?;
     if program.store_representatives && !result.classes.is_empty() {
@@ -138,9 +174,8 @@ fn by_representatives(
                     .map(move |&member| [member, same_as, representative])
             })
             .collect();
-        result.derived.extend(members);
-        result.derived.par_sort_unstable();
-        result.derived.dedup();
+        // A run of their own: the store merges a predicate's runs, each fact once.
+        result.relations.extend(DerivedRelation::of_facts(members));
     }
     Ok(result)
 }
@@ -158,7 +193,7 @@ pub fn equality_report_until(
     }
     let input: Vec<Triple> = asserted_by_predicate(snapshot)
         .into_iter()
-        .flat_map(|(p, pairs)| pairs.into_iter().map(move |(o, s)| [s, p, o]))
+        .flat_map(|(p, pairs)| pairs.into_iter().map(move |[o, s]| [s, p, o]))
         .collect();
     let started = Instant::now();
     let closure = crate::representatives::materialise_until(
@@ -204,15 +239,15 @@ pub fn equality_report_until(
 /// The asserted facts (any graph) of `snapshot` per predicate, as sorted, distinct
 /// `(object, subject)` pairs: one POSG scan, where a fact asserted in several graphs comes
 /// out adjacently.
-fn asserted_by_predicate(snapshot: &Snapshot) -> Vec<(u64, Vec<(u64, u64)>)> {
+fn asserted_by_predicate(snapshot: &Snapshot) -> Grouped {
     let scan = snapshot
         .scan_sorted_in(ReadModel::Asserted, &QuadPattern::all(), Permutation::Posg)
         .expect("the asserted stack keeps POSG");
-    let mut groups: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
+    let mut groups: Grouped = Vec::new();
     for quad in scan {
         let (p, pair) = (
             quad.predicate.raw(),
-            (quad.object.raw(), quad.subject.raw()),
+            [quad.object.raw(), quad.subject.raw()],
         );
         match groups.last_mut() {
             Some((last, pairs)) if *last == p => {
