@@ -98,7 +98,7 @@ fn group_counts_walk_the_index() {
 fn distinct_values_walk_the_index() {
     assert_uses(
         &engine(),
-        "SELECT (COUNT(*) AS ?n) WHERE { ?s e:kind ?k FILTER NOT EXISTS { ?s e:label ?l } }",
+        "SELECT ?s WHERE { ?s e:kind ?k FILTER NOT EXISTS { ?s e:label ?l } }",
         "group walk",
     );
 }
@@ -140,6 +140,286 @@ fn cycles_are_counted_without_their_solutions() {
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("{}", order.detail));
     assert!(lookups <= 3000, "{}", order.detail);
+}
+
+/// The numbers of a `counted join` step: (group walks, weights listed, pairs kept, matches
+/// read at the roots).
+fn counted(detail: &str) -> (u64, u64, u64, u64) {
+    let number = |label: &str| -> u64 {
+        let end = detail
+            .find(label)
+            .unwrap_or_else(|| panic!("{label}: {detail}"));
+        detail[..end]
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .find(|s| !s.is_empty())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{label}: {detail}"))
+    };
+    (
+        number(" group walks"),
+        number(" weights listed"),
+        number(" pairs kept"),
+        number(" matches read"),
+    )
+}
+
+/// `COUNT(*)` of an acyclic join by message passing, without its rows (Sparqloscope's
+/// queries 4, 8, 12, 13 and 19 held 9 to over 26 GB of rows on DBLP): a star counts from
+/// two group walks of 3,000 values each; a chain whose end has an OPTIONAL of three
+/// matches per value is rooted at its middle pattern, whose 9,000 matches are read once
+/// and not kept (rooted at a variable, the OPTIONAL's values would send their 9,000
+/// partners as pairs). No row is made.
+#[test]
+fn joins_are_counted_without_their_rows() {
+    let engine = engine();
+    let step = |query: &str| {
+        let plan = steps(&engine, query);
+        let at = plan
+            .iter()
+            .position(|s| s.operator == "counted join")
+            .unwrap_or_else(|| panic!("{query}: no counted join in {plan:#?}"));
+        plan.into_iter().nth(at).unwrap()
+    };
+    // Query 4's shape: 9,000 rows.
+    // Its two walks' groups multiplied part by part, none listed (Sparqloscope 012 and 013
+    // listed 66.5 and 82.8 M weights first).
+    let star = step("SELECT (COUNT(*) AS ?n) WHERE { ?s e:knows ?o1 . ?s e:label ?o2 }");
+    let (walks, listed, pairs, read) = counted(&star.detail);
+    assert_eq!(
+        (walks, listed, pairs, read),
+        (2, 0, 0, 0),
+        "{}",
+        star.detail
+    );
+    assert!(
+        star.detail.contains(" 6000 groups streamed"),
+        "{}",
+        star.detail
+    );
+    // Query 19's shape: 27,000 rows.
+    let chain = step(
+        "SELECT (COUNT(*) AS ?n) WHERE { ?a e:kind ?k . ?a e:knows ?b OPTIONAL { ?b e:knows ?c } }",
+    );
+    let (walks, listed, pairs, read) = counted(&chain.detail);
+    assert_eq!((walks, pairs, read), (2, 0, 9_000), "{}", chain.detail);
+    assert!(listed <= 9_000, "{}", chain.detail);
+    // Query 1's shape: 300 subjects of one kind meet `knows`' 9,000 matches, looked up for
+    // those 300 instead of walked whole (3 K subjects met `rdf:type`'s 66.5 M on DBLP).
+    let selective = step("SELECT (COUNT(*) AS ?n) WHERE { ?s e:kind e:k1 . ?s e:knows ?o }");
+    let (walks, listed, _, _) = counted(&selective.detail);
+    assert!(
+        walks == 1 && listed <= 300 && selective.detail.contains(" 300 values looked up"),
+        "{}",
+        selective.detail
+    );
+    // index-join-keys' shapes (the merge gate, 13 Oct: 9.4× slower than the index joins it
+    // replaced, 36× the allocations): 300 subjects of a kind, a chain of two `knows` from
+    // them, or towards them. The side with few values solves the other only for their
+    // partners: `knows` (3,000 subjects) is looked up, never walked whole.
+    for query in [
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s e:kind e:k1 . ?s e:knows ?x . ?x e:knows ?y }",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s e:label ?l . ?s e:knows ?x . ?x e:kind e:k1 }",
+    ] {
+        let chain = step(query);
+        let (walks, listed, _, _) = counted(&chain.detail);
+        assert!(walks == 1 && listed <= 1_200, "{query}: {}", chain.detail);
+    }
+    // And a chain no pattern restricts seeds nothing (q-counts' chain-optional: 300 K
+    // authors' partners looked up one by one were about all of `follows`, 20x slower).
+    let open = step(
+        "SELECT (COUNT(*) AS ?n) WHERE { ?a e:knows ?b . ?b e:knows ?c OPTIONAL { ?c e:label ?l } }",
+    );
+    assert!(
+        open.detail.contains(" 0 values looked up"),
+        "{}",
+        open.detail
+    );
+    // op-optional's shape (2.54× Virtuoso's time while its rows were made): COUNT(*) and
+    // COUNT of a variable only an OPTIONAL binds, each counted (that OPTIONAL as a join for
+    // the second), no row and no OPTIONAL evaluated.
+    let plan = steps(
+        &engine,
+        "SELECT (COUNT(*) AS ?n) (COUNT(?o) AS ?m) WHERE { ?s e:kind ?k OPTIONAL { ?s e:knows ?o } }",
+    );
+    let counts = plan.iter().filter(|s| s.operator == "counted join").count();
+    assert!(
+        counts == 2 && !plan.iter().any(|s| s.operator == "optional"),
+        "{plan:#?}"
+    );
+    // Query 50's and 63's shape: counts per kind (10) of subjects weighed by their label
+    // (3,000): each kind's subjects read and their weights added up, no pair of the 3,000
+    // kept and sorted (8 types sent 8.7 M pairs on DBLP, 0.3 → 1.7 s).
+    let per_kind =
+        step("SELECT ?k (COUNT(?s) AS ?n) WHERE { ?s e:kind ?k . ?s e:label ?o } GROUP BY ?k");
+    let (_, _, pairs, _) = counted(&per_kind.detail);
+    assert!(
+        pairs == 0
+            && per_kind
+                .detail
+                .contains(" 3000 matches weighed from the parents"),
+        "{}",
+        per_kind.detail
+    );
+    // Query 66's and 67's shape: a closure joined to a pattern, weighed by each node's
+    // closure size (3,000 nodes, each reaching all 3,000), no pair of it made.
+    let closure = step("SELECT (COUNT(*) AS ?n) WHERE { ?s e:kind e:k1 . ?s e:knows+ ?o }");
+    let (walks, listed, pairs, _) = counted(&closure.detail);
+    assert!(
+        walks == 2 && listed <= 3_300 && pairs == 0,
+        "{}",
+        closure.detail
+    );
+    // Query 11's and 31's shapes: an OPTIONAL and an EXISTS hanging off those 300 values
+    // are solved for them alone (OPTIONAL `rdf:type` of 3 K subjects walked its 66.5 M).
+    for part in [
+        "OPTIONAL { ?s e:knows ?o }",
+        "FILTER EXISTS { ?s e:knows ?o }",
+    ] {
+        let seeded = step(&format!(
+            "SELECT (COUNT(*) AS ?n) WHERE {{ ?s e:kind e:k1 {part} }}"
+        ));
+        let (walks, _, _, _) = counted(&seeded.detail);
+        assert!(
+            walks == 1 && seeded.detail.contains(" 300 values looked up"),
+            "{part}: {}",
+            seeded.detail
+        );
+    }
+}
+
+/// A measurement, not a guard: index-join-keys' queries on its data's shape (perf_lab's
+/// `entities`: a kind of 100 per entity, one random `link`), 250,000 entities, each query's
+/// EXPLAIN steps with their details and times. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "a measurement"]
+fn index_join_keys_explained() {
+    let n = 250_000u64;
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    for i in 0..n {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let link = (state >> 33) % n;
+        let e = ex(&format!("e{i}"));
+        let kind = ex(&format!("Kind{}", i % 100));
+        let to = ex(&format!("e{link}"));
+        let typed = Quad::new(e.clone(), rdf_type.clone(), kind, GraphName::DefaultGraph);
+        tx.insert(typed.as_ref());
+        tx.insert(Quad::new(e, ex("link"), to, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    for query in [
+        "SELECT (COUNT(*) AS ?n) WHERE { ?e a e:Kind7 . ?e e:link ?x . ?x e:link ?y }",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?e a ?k . ?e e:link ?x . ?x a e:Kind3 }",
+    ] {
+        for run in 0..3 {
+            let text = format!("PREFIX e: <{EX}> {query}");
+            let parsed = SparqlParser::new().parse_query(&text).unwrap();
+            let explained =
+                explain_query(&engine.snapshot(), &parsed, &QueryOptions::default()).unwrap();
+            eprintln!(
+                "{query} run {run}: {} µs, {} rows",
+                explained.micros, explained.rows
+            );
+            for step in &explained.steps {
+                eprintln!(
+                    "  {:>8} µs {:<16} rows {:>8} {}",
+                    step.micros, step.operator, step.rows, step.detail
+                );
+            }
+        }
+    }
+}
+
+/// `COUNT` of one pattern under a FILTER that bounds a variable to id ranges is a sum of
+/// the index's range counts (Sparqloscope 104, the literals among every statement's
+/// objects; 091-093, a number at least a bound): no match read where the ranges decide.
+#[test]
+fn filters_that_bound_a_variable_count_ranges() {
+    let engine = engine();
+    for (query, ranges) in [
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o FILTER(isLITERAL(?o)) }",
+            "2 ranges",
+        ),
+        (
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s e:knows ?o FILTER(isIRI(?o)) }",
+            "1 ranges",
+        ),
+        // Query 96's shape: a language among labels that have none.
+        (
+            "SELECT (COUNT(?s) AS ?n) WHERE { ?s e:label ?o FILTER(LANG(?o) = \"en\") }",
+            "0 ranges",
+        ),
+    ] {
+        let plan = steps(&engine, query);
+        let step = plan
+            .iter()
+            .find(|s| s.operator == "range count")
+            .unwrap_or_else(|| panic!("{query}: {plan:#?}"));
+        assert!(
+            step.detail
+                .contains(&format!("{ranges} counted by the index, 0 values")),
+            "{}",
+            step.detail
+        );
+    }
+}
+
+/// The count's memory is a weight per value, not the join's rows: 1,000 subjects with 20
+/// `knows` and 20 `label` each make 400,000 rows (9.6 MB as three columns of ids), counted
+/// within a budget of 1 MiB.
+#[test]
+fn a_counted_join_holds_its_values_not_its_rows() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..1000u32 {
+        for j in 0..20u32 {
+            for (p, o) in [("knows", format!("o{j}")), ("label", format!("l{j}"))] {
+                let quad = Quad::new(ex(&format!("s{i}")), ex(p), ex(&o), GraphName::DefaultGraph);
+                tx.insert(quad.as_ref());
+            }
+        }
+    }
+    tx.commit().unwrap();
+    let text = format!(
+        "PREFIX e: <{EX}> SELECT (COUNT(*) AS ?n) WHERE {{ ?s e:knows ?o1 . ?s e:label ?o2 }}"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let options = QueryOptions {
+        resources: nrese_sparql::Resources {
+            memory: nrese_exec::Envelope::new(Some(1 << 20), None),
+            ..Default::default()
+        },
+        ..QueryOptions::default()
+    };
+    let snapshot = engine.snapshot();
+    let explained = explain_query(&snapshot, &query, &options).unwrap();
+    assert!(
+        explained.steps.iter().any(|s| s.operator == "counted join"),
+        "{:#?}",
+        explained.steps
+    );
+    // What EXPLAIN reports as held: the groups of one part of the subjects at a time, under
+    // the budget.
+    assert!(
+        (1..1 << 20).contains(&explained.memory_peak_bytes),
+        "{}",
+        explained.memory_peak_bytes
+    );
+    let nrese_sparql::QueryResults::Solutions(mut solutions) =
+        nrese_sparql::evaluate_query(&snapshot, &query, &options).unwrap()
+    else {
+        panic!("a SELECT")
+    };
+    let count = solutions.next().unwrap().unwrap();
+    assert_eq!(
+        count.get("n").map(ToString::to_string).as_deref(),
+        Some("\"400000\"^^<http://www.w3.org/2001/XMLSchema#integer>")
+    );
 }
 
 /// Eager aggregation: a group over a join aggregates the side its aggregates read before
@@ -475,7 +755,8 @@ fn parts_are_shared_across_queries_through_the_result_cache() {
         run(renamed, &QueryOptions::default()).rows
     );
     assert!(cache.stats().hits > hits, "{:?}", cache.stats());
-    let shared = "SELECT ?x (COUNT(?l) AS ?n) WHERE { ?x e:knows ?y . ?y e:kind e:k3 . ?x e:label ?l } GROUP BY ?x";
+    // MAX needs the rows (a COUNT is counted without them, `counted join`).
+    let shared = "SELECT ?x (MAX(?l) AS ?n) WHERE { ?x e:knows ?y . ?y e:kind e:k3 . ?x e:label ?l } GROUP BY ?x";
     let explanation = run(shared, &cached);
     let hit = explanation.steps.iter().find(|s| s.cache == Some("hit"));
     assert!(
@@ -484,4 +765,55 @@ fn parts_are_shared_across_queries_through_the_result_cache() {
         explanation.steps
     );
     assert_eq!(explanation.rows, run(shared, &QueryOptions::default()).rows);
+}
+
+/// The same aggregate written differently (`WHERE`, a final dot) is the same part:
+/// Sparqloscope 084 is 053 so written, and QLever answered it from its cache (1.0 ms)
+/// where NRESE computed it again (21 ms on a first run, and 2.6 ms on its own repeat): kept
+/// and found again whether the cache admits every part or by benefit, the default.
+#[test]
+fn aggregates_written_differently_share_the_result_cache() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    // Enough values for the sum to cost more than the admission's floor (20 µs).
+    for i in 0..200_000u32 {
+        let number = Literal::new_typed_literal(i.to_string(), nrese_rdf::vocab::xsd::INTEGER);
+        let quad = Quad::new(
+            ex(&format!("n{i}")),
+            ex("count"),
+            number,
+            GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+    // Admitting every part, and by the default admission's benefit.
+    for cache in [
+        nrese_sparql::ResultCache::new(16 << 20).admitting_all(),
+        nrese_sparql::ResultCache::new(16 << 20),
+    ] {
+        let cache = std::sync::Arc::new(cache);
+        let cached = QueryOptions {
+            result_cache: Some(std::sync::Arc::clone(&cache)),
+            ..QueryOptions::default()
+        };
+        let run = |query: &str| {
+            let text = format!("PREFIX e: <{EX}> {query}");
+            let query = SparqlParser::new().parse_query(&text).unwrap();
+            explain_query(&engine.snapshot(), &query, &cached).unwrap()
+        };
+        run("SELECT (SUM(?o) AS ?sum) { ?s e:count ?o. }");
+        for written in [
+            "SELECT (SUM(?o) AS ?sum) WHERE { ?s e:count ?o }",
+            "SELECT (SUM(?o) AS ?sum) WHERE { ?s e:count ?o }",
+        ] {
+            let again = run(written);
+            assert!(
+                again.steps.iter().any(|s| s.cache == Some("hit")),
+                "{:?} {:#?}",
+                cache.stats(),
+                again.steps
+            );
+        }
+    }
 }

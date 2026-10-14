@@ -833,6 +833,11 @@ impl PackedKeys {
             return;
         }
         let mut value = self.get(start)[position];
+        // One value throughout: its ends agree (a part of a parallel walk inside one group).
+        if self.get(end - 1)[position] == value {
+            f(value, start, end);
+            return;
+        }
         let mut from = start;
         let mut i = start;
         let mut column = Vec::with_capacity(BLOCK);

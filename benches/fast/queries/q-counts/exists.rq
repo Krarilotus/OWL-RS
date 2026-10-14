@@ -1,0 +1,2 @@
+PREFIX e: <http://example.org/fast/>
+SELECT (COUNT(*) AS ?n) WHERE { ?u e:follows ?v FILTER EXISTS { ?v e:age ?a } }

@@ -1,0 +1,38 @@
+# opt/sparql-memory's merge gate at its head: the branch at 05c65958 against e0f84185, its merge base
+# with refactor/engine-v2 (main's perf_lab rejects the harness's --routes: every base pass of
+# sparql-memory-ab-phuoc-2 failed in 0.0 s and the job still finished done). Both built by
+# the queue on office-pc for x86-64-v3 (e0f84185 into sparql-bin/e0f84185-office/), natively on phuoc-yu.
+# Per group: q-counts (3 repetitions), the fast suite's query cases and its operator cases
+# (2 each), A then B then B then A; compared with fast.py compare.
+# Each chunk fails as fast.py does: a failed, wrong or missing run fails it, and a run of no
+# case; on the base side (--off-route-ok) a case off its expected route is a measured run
+# (the base hasn't the counted join or the range count), on the branch's side it fails.
+# Since sparql-memory-ab-phuoc-2 (the branch at ce3e697e): a COUNT of a variable only an
+# OPTIONAL binds is counted, a cache hit is charged before its copy, and op-group expects
+# the counted join for untitled (the route was outdated: the same answers, 19.4 -> 5.5 ms).
+# NRESE_QUIET_SLOT=0: the outer slot and the runner's watcher keep the host quiet.
+id = "sparql-memory-ab-phuoc-3"
+group = "sparql"
+host = "phuoc-yu"
+checkout = "opt/sparql-memory"
+commands = [
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/e0f84185-office/fast", "NRESE_FAST_REVISION=e0f84185", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-counts", "--reps", "3", "--label", "base-counts-a", "--off-route-ok"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/05c65958/fast", "NRESE_FAST_REVISION=05c65958", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-counts", "--reps", "3", "--label", "new-counts-b"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/05c65958/fast", "NRESE_FAST_REVISION=05c65958", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-counts", "--reps", "3", "--label", "new-counts-c"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/e0f84185-office/fast", "NRESE_FAST_REVISION=e0f84185", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-counts", "--reps", "3", "--label", "base-counts-d", "--off-route-ok"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/e0f84185-office/fast", "NRESE_FAST_REVISION=e0f84185", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-star,q-chain,q-cycles,q-snowflake,q-paths,q-sideways,q-large-result,q-topk", "--reps", "2", "--label", "base-q-a", "--off-route-ok"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/05c65958/fast", "NRESE_FAST_REVISION=05c65958", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-star,q-chain,q-cycles,q-snowflake,q-paths,q-sideways,q-large-result,q-topk", "--reps", "2", "--label", "new-q-b"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/05c65958/fast", "NRESE_FAST_REVISION=05c65958", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-star,q-chain,q-cycles,q-snowflake,q-paths,q-sideways,q-large-result,q-topk", "--reps", "2", "--label", "new-q-c"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/e0f84185-office/fast", "NRESE_FAST_REVISION=e0f84185", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-star,q-chain,q-cycles,q-snowflake,q-paths,q-sideways,q-large-result,q-topk", "--reps", "2", "--label", "base-q-d", "--off-route-ok"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/e0f84185-office/fast", "NRESE_FAST_REVISION=e0f84185", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "op-group,op-aggregates,op-optional,op-negation,op-strings,op-dates,index-join-keys,plan-estimates,parse-large,cache-replay", "--reps", "2", "--label", "base-op-a", "--off-route-ok"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/05c65958/fast", "NRESE_FAST_REVISION=05c65958", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "op-group,op-aggregates,op-optional,op-negation,op-strings,op-dates,index-join-keys,plan-estimates,parse-large,cache-replay", "--reps", "2", "--label", "new-op-b"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/05c65958/fast", "NRESE_FAST_REVISION=05c65958", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "op-group,op-aggregates,op-optional,op-negation,op-strings,op-dates,index-join-keys,plan-estimates,parse-large,cache-replay", "--reps", "2", "--label", "new-op-c"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/e0f84185-office/fast", "NRESE_FAST_REVISION=e0f84185", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "op-group,op-aggregates,op-optional,op-negation,op-strings,op-dates,index-join-keys,plan-estimates,parse-large,cache-replay", "--reps", "2", "--label", "base-op-d", "--off-route-ok"],
+]
+env = { NRESE_QUIET_DRAIN_S = "3600", NRESE_QUIET_SLOT = "0", NRESE_FAST_RUNTIME = "native", NRESE_FAST_DATA = "/home/krarilotus/owlrs/sparql-scratch/fast-data", NRESE_BENCH_REPORTS = "/home/krarilotus/owlrs/results/sparql-memory-ab-phuoc-3" }
+needs = []
+window = "quiet"
+class = "exclusive"
+kind = "gate"
+priority = 1
+est_min = 150

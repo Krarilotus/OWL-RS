@@ -1,0 +1,19 @@
+# The fast case q-counts (COUNT over join trees, by message passing and range counts) on
+# the base e0f84185 and the branch at 1d6dca4e, A-B-B-A, 3 repetitions each, natively on
+# Phuoc-Yu (the base runs off the route: it has no counted join). The generated social
+# data is read through links in a directory of this job's own.
+id = "sparql-q-counts-ab-phuoc-1"
+group = "sparql"
+host = "phuoc-yu"
+checkout = "opt/sparql-memory"
+commands = [
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/e0f84185/fast", "NRESE_FAST_REVISION=e0f84185", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-counts", "--reps", "3", "--label", "base-a"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/1d6dca4e/fast", "NRESE_FAST_REVISION=1d6dca4e", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-counts", "--reps", "3", "--label", "new-b"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/1d6dca4e/fast", "NRESE_FAST_REVISION=1d6dca4e", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-counts", "--reps", "3", "--label", "new-c"],
+  ["env", "NRESE_FAST_BIN=/home/krarilotus/owlrs/sparql-bin/e0f84185/fast", "NRESE_FAST_REVISION=e0f84185", "bash", "scripts/quiet-slot.sh", "python3", "benches/fast/fast.py", "run", "--cases", "q-counts", "--reps", "3", "--label", "base-d"],
+]
+env = { NRESE_QUIET_DRAIN_S = "3600", NRESE_FAST_RUNTIME = "native", NRESE_FAST_DATA = "/home/krarilotus/owlrs/sparql-scratch/fast-data", NRESE_BENCH_REPORTS = "/home/krarilotus/owlrs/results/sparql-q-counts-ab-phuoc-1" }
+needs = []
+window = "quiet"
+priority = 2
+est_min = 40
