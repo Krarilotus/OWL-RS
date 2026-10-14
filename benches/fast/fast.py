@@ -236,8 +236,12 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
                               errors="replace", env={**ENV, **{k: str(v) for k, v in (env or {}).items()}})
     except subprocess.TimeoutExpired:
-        subprocess.run(["systemctl", "--user", "kill", "--signal=KILL", f"{unit}.scope"], capture_output=True)
         return 124, "", f"timed out after {timeout} s", time.monotonic() - started
+    finally:
+        # Nothing outlives its case (the kit rule after the whole-host OOM of 14 Oct 2026: a
+        # process that outlived its wrapper held its scope's memory): what the scope still
+        # holds is killed, whether the case ended, failed or timed out.
+        subprocess.run(["systemctl", "--user", "kill", "--signal=KILL", f"{unit}.scope"], capture_output=True)
     # The peak first: a record's note is the last line of stderr, the command's own.
     peaks = SCOPE_PEAK.findall(done.stderr)
     err = SCOPE_PEAK.sub("", done.stderr).rstrip("\n")
@@ -990,6 +994,15 @@ def vector_recall(case: dict, expect: dict) -> float:
 
 # --- run -------------------------------------------------------------------------------------
 
+def not_as_expected(records: list[dict], off_route_ok: bool = False) -> list[dict]:
+    """The runs that make `run` fail: each whose status isn't its case's expected outcome,
+    except, for an A/B's base (`off_route_ok`), a case off its expected route: measured
+    without the operator the branch brings. Failed, wrong and missing runs always count."""
+    tolerated = {"off-route"} if off_route_ok else set()
+    return [r for r in records
+            if r["status"] != r.get("expected_outcome", "ok") and r["status"] not in tolerated]
+
+
 def run(args) -> int:
     if RUNTIME == "native":
         try:
@@ -1052,7 +1065,11 @@ def run(args) -> int:
     report["duration_s"] = round((datetime.datetime.now() - started).total_seconds(), 1)
     out.write_text(json.dumps(report, indent=1), encoding="utf-8")
     kept = write_compact(out, BASELINES / out.name)
-    bad = [r for r in report["records"] if r["status"] != r.get("expected_outcome", "ok")]
+    bad = not_as_expected(report["records"], getattr(args, "off_route_ok", False))
+    # A run of nothing measured nothing (an A/B's side whose binary refused every case).
+    if not report["records"]:
+        print("no case ran")
+        return 1
     # Every case's verdict, the known issues included: an expected limit is still no answer.
     by_verdict: dict[str, set] = {}
     for r in report["records"]:
@@ -1204,6 +1221,10 @@ def main() -> int:
             s.add_argument("--reps", type=int, default=2)
             s.add_argument("--label")
             s.add_argument("--out")
+            s.add_argument("--off-route-ok", action="store_true",
+                           help="an A/B's base: a case off its expected route (an operator the base "
+                                "hasn't) is a measured run, not a failure; failed, wrong or missing "
+                                "runs still are")
         if name == "compete":
             s.add_argument("--systems")
             s.add_argument("--runs", type=int, default=1)

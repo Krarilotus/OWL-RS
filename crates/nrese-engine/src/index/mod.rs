@@ -147,6 +147,35 @@ impl Layout {
 const GROUP_PART: usize = 1 << 16;
 const _: () = assert!(GROUP_PART.is_multiple_of(keys::BLOCK));
 
+/// The parts of a group walk over `start..end` at `position`: halved, in parallel, until a
+/// part is short or has one value at `position` (its first and last keys agree), cut at
+/// multiples of [`GROUP_PART`]; the boundaries from `start` to `end`. Few large groups
+/// leave O(groups · log(n / part)) parts, each read at its ends, where cutting every
+/// [`GROUP_PART`] keys read every part: on a mapped store, a page fault or two per part
+/// before its first use (Sparqloscope 102, about 70 predicates among 606 M keys: 9,200
+/// parts, 138 ms on a first run against 3 ms warm).
+fn group_cuts(keys: &keys::PackedKeys, start: usize, end: usize, position: usize) -> Vec<usize> {
+    fn inner(keys: &keys::PackedKeys, start: usize, end: usize, position: usize) -> Vec<usize> {
+        if end - start < 2 * GROUP_PART || keys.get(start)[position] == keys.get(end - 1)[position]
+        {
+            return Vec::new();
+        }
+        // Past `start` (half the range is at least a part) and before `end`.
+        let mid = (start + (end - start) / 2) / GROUP_PART * GROUP_PART;
+        let (mut left, right) = rayon::join(
+            || inner(keys, start, mid, position),
+            || inner(keys, mid, end, position),
+        );
+        left.push(mid);
+        left.extend(right);
+        left
+    }
+    let mut cuts = vec![start];
+    cuts.extend(inner(keys, start, end, position));
+    cuts.push(end);
+    cuts
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IndexVersion {
     layout: Layout,
@@ -364,12 +393,9 @@ impl IndexVersion {
                 walk(start, end, out);
                 continue;
             }
-            // Large ranges in parts on every core, cut at block boundaries; a group that
-            // spans a cut is added up where the parts meet.
-            let cuts: Vec<usize> = std::iter::once(start)
-                .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
-                .chain(std::iter::once(end))
-                .collect();
+            // Large ranges in parts on every core, cut at block boundaries where values
+            // change; a group that spans a cut is added up where the parts meet.
+            let cuts = group_cuts(&perm.keys, start, end, position);
             let parts: Vec<Vec<(u64, i64)>> = cuts
                 .par_windows(2)
                 .map(|cut| {
@@ -391,6 +417,101 @@ impl IndexVersion {
                 out.extend(groups);
             }
         }
+    }
+
+    /// Appends the values at key `position` of `plan`'s permutation at `parts - 1` even
+    /// positions of each run's range: cuts that split a walk over its groups into parts of
+    /// about equal size, read without walking anything. Unsorted across runs.
+    pub(crate) fn sample_values(
+        &self,
+        plan: &AccessPlan,
+        position: usize,
+        parts: usize,
+        out: &mut Vec<u64>,
+    ) {
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return;
+        };
+        let position = if adapted.permutation == plan.permutation {
+            position
+        } else if position == 0 {
+            // Grouped by the graph this layout leaves out: one group, nothing to cut.
+            return;
+        } else {
+            position - 1
+        };
+        for run in self.runs.iter() {
+            let perm = run.permutation(adapted.permutation);
+            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            let len = end - start;
+            if len < 2 {
+                continue;
+            }
+            out.extend(
+                (1..parts.min(len))
+                    .map(|i| perm.keys.get(start + len * i / parts.min(len))[position]),
+            );
+        }
+    }
+
+    /// The number of distinct values at key `position` of `plan`'s permutation, counted
+    /// while the groups are walked (in parallel parts for a large range, a group across a
+    /// cut counted once) and none kept: O(d) time, O(1) memory. `None` where several runs
+    /// have matches or the run has tombstones in range: then values must be merged
+    /// ([`Self::group_counts`]).
+    pub(crate) fn count_groups(&self, plan: &AccessPlan, position: usize) -> Option<u64> {
+        let adapted = self.layout.adapt(plan)?;
+        let position = if adapted.permutation == plan.permutation {
+            position
+        } else if position == 0 {
+            // Grouped by the graph that the single-graph layout leaves out: every quad is
+            // the default graph's.
+            return Some(u64::from(self.count_plan(plan) > 0));
+        } else {
+            position - 1
+        };
+        let mut found = None;
+        for run in self.runs.iter() {
+            let perm = run.permutation(adapted.permutation);
+            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            if start < end {
+                if found.is_some() || perm.tombstones_in(start, end) > 0 {
+                    return None;
+                }
+                found = Some((perm, start, end));
+            }
+        }
+        let Some((perm, start, end)) = found else {
+            return Some(0);
+        };
+        // Per part: its groups, its first value and its last.
+        let walk = |start: usize, end: usize| {
+            let (mut groups, mut first, mut last) = (0u64, None, None);
+            perm.keys.groups(start, end, position, |value, _, _| {
+                groups += 1;
+                first.get_or_insert(value);
+                last = Some(value);
+            });
+            (groups, first, last)
+        };
+        if end - start < 2 * GROUP_PART {
+            return Some(walk(start, end).0);
+        }
+        let cuts = group_cuts(&perm.keys, start, end, position);
+        let parts: Vec<(u64, Option<u64>, Option<u64>)> = cuts
+            .par_windows(2)
+            .map(|cut| walk(cut[0], cut[1]))
+            .collect();
+        let mut total = 0;
+        let mut previous: Option<u64> = None;
+        for (groups, first, last) in parts {
+            total += groups;
+            if previous.is_some() && previous == first {
+                total -= 1;
+            }
+            previous = last.or(previous);
+        }
+        Some(total)
     }
 
     /// Appends the distinct values at key `position` of each run's range for `plan` (sorted

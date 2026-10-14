@@ -117,6 +117,7 @@ impl super::Context<'_> {
             evaluator: super::Evaluator::default(),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
+            overdrawn: Cell::new(self.overdrawn.get()),
             decoded: RefCell::default(),
             decodes: std::sync::atomic::AtomicU64::new(0),
             numbers: RefCell::default(),

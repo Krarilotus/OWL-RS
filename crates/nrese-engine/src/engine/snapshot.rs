@@ -746,10 +746,25 @@ impl Snapshot {
         low: TermId,
         high: TermId,
     ) -> Option<AccessPlan> {
+        let (mut plan, bound) = self.grouped_plan(model, pattern, permutation)?;
+        plan.low[bound] = low.raw();
+        plan.high[bound] = high.raw();
+        Some(plan)
+    }
+
+    /// `pattern`'s plan in `permutation` and the position of its first unbound component;
+    /// `None` where the bound components aren't a prefix of that order, the reads expand
+    /// equality, or an included stack lacks the permutation.
+    fn grouped_plan(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+    ) -> Option<(AccessPlan, usize)> {
         if self.expanding(model, pattern).is_some() {
             return None;
         }
-        let mut plan = AccessPlan::in_permutation(pattern, permutation)?;
+        let plan = AccessPlan::in_permutation(pattern, permutation)?;
         let bound = plan
             .low
             .iter()
@@ -762,9 +777,49 @@ impl Snapshot {
         if bound >= 4 || plan.exclude_default_graph || !supported {
             return None;
         }
-        plan.low[bound] = low.raw();
-        plan.high[bound] = high.raw();
-        Some(plan)
+        Some((plan, bound))
+    }
+
+    /// The number of distinct values of the first unbound component of `pattern` in
+    /// `permutation`'s order among its matches in `model`: exact, counted while the index's
+    /// groups are walked without keeping them where one run of one stack holds the matches
+    /// and no deletion among them, else from [`Self::group_counts_in`]. `None` where that
+    /// can't answer. `COUNT(DISTINCT ?x)` of one triple pattern.
+    pub fn distinct_count_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+    ) -> Option<u64> {
+        if self.expanding(model, pattern).is_some() {
+            return None;
+        }
+        let plan = AccessPlan::in_permutation(pattern, permutation)?;
+        let bound = plan
+            .low
+            .iter()
+            .zip(&plan.high)
+            .take_while(|(l, h)| l == h)
+            .count();
+        let supported = Stack::ALL.into_iter().all(|stack| {
+            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
+        });
+        if plan.exclude_default_graph || bound >= 4 || !supported {
+            return None;
+        }
+        let with: Vec<Stack> = Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack) && self.version.stack(stack).any_plan(&plan))
+            .collect();
+        let counted = match with.as_slice() {
+            [] => Some(0),
+            [stack] => self.version.stack(*stack).count_groups(&plan, bound),
+            _ => None,
+        };
+        counted.or_else(|| {
+            self.group_counts_in(model, pattern, permutation)
+                .map(|groups| groups.len() as u64)
+        })
     }
 
     /// For each distinct value of the first unbound component of `pattern` in `permutation`'s
@@ -779,28 +834,58 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<Vec<(TermId, u64)>> {
-        if self.expanding(model, pattern).is_some() {
-            return None;
+        let (plan, bound) = self.grouped_plan(model, pattern, permutation)?;
+        Some(self.group_counts_of(model, &plan, bound))
+    }
+
+    /// [`Self::group_counts_in`] for the values from `low` to `high` (inclusive) only: one
+    /// part of a walk over all of them, its groups alone in memory.
+    pub fn group_counts_range_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        low: TermId,
+        high: TermId,
+    ) -> Option<Vec<(TermId, u64)>> {
+        let (mut plan, bound) = self.grouped_plan(model, pattern, permutation)?;
+        plan.low[bound] = low.raw();
+        plan.high[bound] = high.raw();
+        Some(self.group_counts_of(model, &plan, bound))
+    }
+
+    /// About `parts - 1` values of the first unbound component of `pattern` in
+    /// `permutation`'s order, ascending and distinct, that cut its matches into parts of
+    /// about equal size (read at even positions of each run's range, no group listed):
+    /// where a walk over its groups is split. `None` as for [`Self::group_counts_in`].
+    pub fn group_cuts_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        parts: usize,
+    ) -> Option<Vec<TermId>> {
+        let (plan, bound) = self.grouped_plan(model, pattern, permutation)?;
+        let mut values = Vec::new();
+        for stack in Stack::ALL {
+            if model.includes(stack) {
+                self.version
+                    .stack(stack)
+                    .sample_values(&plan, bound, parts, &mut values);
+            }
         }
-        let plan = AccessPlan::in_permutation(pattern, permutation)?;
-        if plan.exclude_default_graph {
-            return None;
-        }
-        let bound = plan
-            .low
-            .iter()
-            .zip(&plan.high)
-            .take_while(|(l, h)| l == h)
-            .count();
-        if bound >= 4 {
-            return None;
-        }
-        let supported = Stack::ALL.into_iter().all(|stack| {
-            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
-        });
-        if !supported {
-            return None;
-        }
+        values.sort_unstable();
+        values.dedup();
+        Some(values.into_iter().map(TermId::from_raw).collect())
+    }
+
+    fn group_counts_of(
+        &self,
+        model: ReadModel,
+        plan: &AccessPlan,
+        bound: usize,
+    ) -> Vec<(TermId, u64)> {
+        let plan = *plan;
         let mut counts = Vec::new();
         let mut sources = 0;
         for stack in Stack::ALL {
@@ -823,13 +908,11 @@ impl Snapshot {
                 same
             });
         }
-        Some(
-            counts
-                .into_iter()
-                .filter(|&(_, count)| count > 0)
-                .map(|(value, count)| (TermId::from_raw(value), count as u64))
-                .collect(),
-        )
+        counts
+            .into_iter()
+            .filter(|&(_, count)| count > 0)
+            .map(|(value, count)| (TermId::from_raw(value), count as u64))
+            .collect()
     }
 
     /// The values of `components` (subject 0, predicate 1, object 2, graph 3) of the quads

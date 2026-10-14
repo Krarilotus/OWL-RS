@@ -3,6 +3,7 @@
 
 mod access_tests;
 mod calendar_tests;
+mod count_tests;
 mod depth_tests;
 mod differential_tests;
 mod federation_tests;
