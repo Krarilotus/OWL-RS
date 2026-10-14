@@ -1151,10 +1151,12 @@ dependencies = [
  "aho-corasick",
  "crc32fast",
  "fsst-rs",
+ "geo",
  "hashbrown 0.16.1",
  "memchr",
  "memmap2",
  "nrese-exec",
+ "nrese-geo",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-vector",
@@ -1184,6 +1186,19 @@ dependencies = [
  "nrese-rdf-io",
  "nrese-sparql-results",
  "nrese-sparql-syntax",
+]
+
+[[package]]
+name = "nrese-geo"
+version = "0.1.0"
+dependencies = [
+ "geo",
+ "nrese-exec",
+ "quick-xml",
+ "rayon",
+ "rstar",
+ "serde_json",
+ "wkt",
 ]
 
 [[package]]
@@ -1301,6 +1316,7 @@ dependencies = [
  "md-5",
  "nrese-engine",
  "nrese-exec",
+ "nrese-geo",
  "nrese-owl",
  "nrese-rdf",
  "nrese-rdf-io",
@@ -1309,7 +1325,6 @@ dependencies = [
  "nrese-sparql-results",
  "nrese-sparql-syntax",
  "nrese-xsd",
- "quick-xml",
  "rand 0.9.5",
  "rayon",
  "regex",

@@ -15,7 +15,7 @@ use quick_xml::events::{BytesStart, Event};
 use serde_json::{Value, json};
 
 /// The geometry of a GeoJSON text.
-pub(super) fn from_geojson(text: &str) -> Option<Geometry<f64>> {
+pub fn from_geojson(text: &str) -> Option<Geometry<f64>> {
     geojson_geometry(&serde_json::from_str(text).ok()?)
 }
 
@@ -80,7 +80,7 @@ fn geojson_geometry(value: &Value) -> Option<Geometry<f64>> {
 }
 
 /// The GeoJSON text of a geometry (in CRS84).
-pub(super) fn to_geojson(geometry: &Geometry<f64>) -> String {
+pub fn to_geojson(geometry: &Geometry<f64>) -> String {
     geojson_value(geometry).to_string()
 }
 
@@ -131,7 +131,7 @@ fn geojson_value(geometry: &Geometry<f64>) -> Value {
 }
 
 /// The GML 3.2 text of a geometry in reference system `crs`.
-pub(super) fn to_gml(geometry: &Geometry<f64>, crs: &str) -> String {
+pub fn to_gml(geometry: &Geometry<f64>, crs: &str) -> String {
     const NS: &str = "http://www.opengis.net/ont/gml";
     fn positions(coords: impl Iterator<Item = Coord<f64>>) -> String {
         coords
@@ -299,7 +299,7 @@ fn parse_xml(text: &str) -> Option<Element> {
 }
 
 /// The geometry of a GML text and its `srsName`.
-pub(super) fn from_gml(text: &str) -> Option<(Option<String>, Geometry<f64>)> {
+pub fn from_gml(text: &str) -> Option<(Option<String>, Geometry<f64>)> {
     let root = parse_xml(text)?;
     let geometry = gml_geometry(&root, root.dimension.unwrap_or(2))?;
     Some((root.srs.clone(), geometry))

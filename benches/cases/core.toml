@@ -221,6 +221,24 @@ cap_gb = 6
 systems = ["nemo:custom", "jena:custom", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 home_turf = "nemo"
 rewrite = "expressible"
+[[case]]
+name = "custom-cspa"
+area = "reasoning"
+what = "the context-sensitive pointer analysis (CSPA) over a generated pointer graph (18,000 nodes, 12,000 dereferences in chains, 2,400 assignments) as Notation3 user rules: three mutually recursive relations, two three-way joins; 3.69 M derived facts"
+semantics = "custom"
+data = "cspa nodes=18000 assigns=2400"
+args = ["--reason", "custom", "--rules", "/src/benches/fast/rules/cspa.n3", "--reason-runs", "5"]
+queries = "cspa"
+metric = "reason.p50_ms"
+check = { "q.valueFlow.value" = "expect.value_flow", "q.memoryAlias.value" = "expect.memory_alias", "q.valueAlias.value" = "expect.value_alias" }
+route = {}
+cap_gb = 6
+# Souffle, the home turf, runs CSPA on Graspan's graphs in the Datalog kit
+# (benches/reasoning/datalog), not as a fast comparator.
+systems = []
+home_turf = "souffle"
+guards = ["the inferred stack merged from the reasoner's runs"]
+
 # --- maintenance: commits, deletions, readers -------------------------------------------------
 
 [[case]]

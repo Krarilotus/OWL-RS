@@ -71,6 +71,8 @@ pub struct DictionaryStats {
     pub mapped_bytes: u64,
     /// The vector index: the vectors and their graphs ([`super::vectors`]).
     pub vector_bytes: u64,
+    /// The geometry index: the geometry literals' boxes ([`Dictionary::geometries`]).
+    pub geometry_bytes: u64,
     /// Derived indexes read from their files since start ([`super::derived`]).
     pub derived_loaded: u64,
     /// Terms the full-text indexes cover, of literals and of IRIs' local names (none
@@ -464,6 +466,9 @@ pub struct Dictionary {
     /// The vector literals, built at the first vector search and extended at later ones
     /// ([`super::vectors`]).
     vectors: std::sync::Arc<RwLock<super::vectors::VectorIndex>>,
+    /// The geometry literals (GeoSPARQL's datatypes, [`nrese_geo::DATATYPES`]), built
+    /// at the first query that asks for them and extended at later ones.
+    geometries: RwLock<nrese_geo::GeometryIndex>,
     /// The text order of the entries the mapped base doesn't order ([`super::order`]).
     order: RwLock<super::order::TextOrder>,
     /// Integer-derived literals (`xsd:int`, ...) are dictionary entries, not inline
@@ -713,6 +718,7 @@ impl Dictionary {
         let base = inner.base.as_ref();
         DictionaryStats {
             vector_bytes: self.vectors.read().memory_bytes() as u64,
+            geometry_bytes: self.geometries.read().memory_bytes() as u64,
             text_covered: self.text.read().covered() + self.iri_text.read().covered(),
             derived_loaded: self
                 .derived
@@ -971,6 +977,41 @@ impl Dictionary {
                 start = stop;
             }
         }
+    }
+
+    /// The geometry literals: every literal of a geometry datatype that reads, by id,
+    /// with its box and reference system ([`nrese_geo::GeometryIndex`]); the index first
+    /// takes in the literals interned since it was last asked for. Nothing before the
+    /// first call: a store without spatial queries pays nothing. O(k log k) for k new
+    /// literals, read on every core.
+    pub fn geometries(&self) -> nrese_geo::GeometryIndex {
+        if self.geometries.read().covered() < self.len() {
+            let mut geometries = self.geometries.write();
+            let inner = self.inner.read();
+            let end = inner.len();
+            let mut start = geometries.covered();
+            while start < end {
+                let stop = (start + TEXT_BATCH).min(end);
+                let keys: Vec<(u64, Key<'_>)> = (start..stop)
+                    .map(|index| (index, inner.key(index)))
+                    .collect();
+                let literals: Vec<(u64, &str, &str)> = keys
+                    .iter()
+                    .filter_map(|(index, key)| match view_key(key) {
+                        TermView::Typed { value, datatype }
+                            if nrese_geo::DATATYPES.contains(&datatype) =>
+                        {
+                            let id = TermId::new(TermKind::TypedLiteral, *index).raw();
+                            Some((id, datatype, value))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                geometries.extend(&literals, stop);
+                start = stop;
+            }
+        }
+        self.geometries.read().clone()
     }
 
     /// Bytes of the vector index.

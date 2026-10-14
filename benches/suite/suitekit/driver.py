@@ -120,6 +120,33 @@ def slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", text).strip("-").lower()
 
 
+def kit_env(environ) -> dict:
+    """A kit's environment: the W3C suites require their test data (a missing suite fails, never
+    passes by skipping), unless NRESE_W3C_OPTIONAL opts out (a local run without the data)."""
+    return {} if environ.get("NRESE_W3C_OPTIONAL") else {"NRESE_W3C_REQUIRED": "1"}
+
+
+def kit_counts(log: Path) -> str:
+    """The counts a conformance kit printed (its run with --nocapture), one clause per suite,
+    so a row says what ran and passed, not only that the command exited 0; a skip shows too."""
+    try:
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    out, title = [], None
+    for line in lines:
+        header = re.match(r"W3C (.+) on engine v2: passed / failed / skipped", line)
+        total = re.match(r"\s+total: (\d+) / (\d+) / (\d+)", line)
+        if header:
+            title = header.group(1)
+        elif total and title:
+            out.append(f"{title}: {total.group(1)} passed, {total.group(2)} failed, {total.group(3)} skipped")
+            title = None
+        elif re.match(r"(\S.*: \d+ of \d+ pass$|W3C .*: \d+ passed, |GeoSPARQL .*: \d+ of \d+ |skipped: )", line):
+            out.append(line.strip())
+    return "; ".join(out)
+
+
 def external_rows(rows: list[dict], captured: bool) -> list[dict]:
     """An external driver's rows as the suite's. Answers before time: its timings count only
     after its own qualification passed (a `conformance` row `...-qualification`, ok), or with
@@ -197,7 +224,7 @@ class Suite:
         print(text, flush=True)
 
     def host_command(self, command: list[str], log: Path | None = None, timeout: float | None = None,
-                     cwd: Path | None = None) -> int:
+                     cwd: Path | None = None, env: dict | None = None) -> int:
         """Runs a command on the host, from the repository root unless `cwd` says otherwise
         (echoed in a dry run)."""
         if command[0] == "bash":
@@ -205,12 +232,13 @@ class Suite:
         if self.args.dry_run:
             self.say(f"    [host] {shell(command)}")
             return 0
+        environment = {**os.environ, **env} if env else None
         if log is None:
-            return subprocess.run(command, cwd=cwd or self.root, timeout=timeout).returncode
+            return subprocess.run(command, cwd=cwd or self.root, timeout=timeout, env=environment).returncode
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "w", encoding="utf-8", errors="replace") as f:
             return subprocess.run(command, cwd=cwd or self.root, stdout=f, stderr=subprocess.STDOUT,
-                                  timeout=timeout).returncode
+                                  timeout=timeout, env=environment).returncode
 
     def emit(self, base: dict, **fields):
         result = Result(**{**base, **fields})
@@ -607,11 +635,21 @@ class Suite:
         base = dict(date=self.date, host=self.host, runtime="process", system=key, version="-",
                     publish=self.publish(key), workload=plan.workload, tier=plan.tier, regime="-", run=1)
         log = self.results / "logs" / slug(f"{self.stamp}-{key}-{plan.workload}") / "kit.log"
+        if plan.prepare:
+            # Its test data (the W3C kits: scripts/fetch-w3c-tests.sh, pinned).
+            prepared = log.with_name("prepare.log")
+            self.say(f"\n{key} / {plan.workload}: preparing: {shell(plan.prepare)}")
+            if self.host_command(plan.prepare, prepared) != 0:
+                self.emit(base, task="conformance", item=plan.workload, status="failed",
+                          note=f"preparing its data failed: log {prepared.relative_to(self.results)}")
+                return
         self.say(f"\n{key} / {plan.workload}: {shell(plan.command)}")
         started = time.monotonic()
-        rc = self.host_command(plan.command, log)
+        rc = self.host_command(plan.command, log, env=kit_env(os.environ))
+        counts = "" if self.args.dry_run else kit_counts(log)
         self.emit(base, task="conformance", item=plan.workload, status="ok" if rc == 0 else "failed",
-                  ms=(time.monotonic() - started) * 1000, note=f"log: {log.relative_to(self.results)}")
+                  ms=(time.monotonic() - started) * 1000,
+                  note=f"{counts + '; ' if counts else ''}log: {log.relative_to(self.results)}")
 
     def driver(self, plan, keys: list[str]):
         """A kit's own driver (Plan.driver) for `keys` on one tier: its steps in order, then

@@ -1,0 +1,20 @@
+[package]
+name = "nrese-geo"
+description = "NRESE geometries: GeoSPARQL's geometry literals read (WKT, GeoJSON, GML), their topological relations, and the index and join that find the pairs a relation may hold for"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+geo = "0.33"
+nrese-exec = { path = "../nrese-exec" }
+quick-xml = { workspace = true }
+rayon = { workspace = true }
+rstar = "0.12"
+serde_json = { workspace = true }
+wkt = "0.14"
+
+[lints]
+workspace = true

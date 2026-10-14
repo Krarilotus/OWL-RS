@@ -22,6 +22,7 @@
 //! | `?v < > <= >= = 42` (and mirrored) | inline integer ids by value |
 //! | `?v < > <= >= = "2000-01-01"^^xsd:date` (or `xsd:dateTime`, and mirrored) | inline ids of the constant's kind and timezone by id (their order is the value order); other values to the generic evaluator |
 //! | `sameTerm(a, b)`, `isTRIPLE(a)` over variables, constants, `SUBJECT`/`PREDICATE`/`OBJECT` and `TRIPLE` ([`IdTerm`]) | ids: a triple term's parts read from its key, `TRIPLE` one hash probe ([`Snapshot::components`], [`Snapshot::triple_term`]) |
+//! | `geof:sfWithin(?v, C)` and every topological relation between a variable and a constant geometry (or the other way round; `C` may be an expression of constants such as `geof:buffer(…)`) | the store's geometry index: the boxes decide most rows, a point is its box, other geometries are read where the boxes meet ([`super::spatial::CompiledRelation`]) |
 //! | `&&`, `||`, `!` | SPARQL's three-valued logic |
 
 use std::cmp::Ordering;
@@ -45,7 +46,7 @@ pub(crate) enum Tri {
 }
 
 impl Tri {
-    fn of(b: bool) -> Self {
+    pub(crate) fn of(b: bool) -> Self {
         if b { Self::True } else { Self::False }
     }
 }
@@ -84,6 +85,8 @@ pub(crate) enum Fast {
     SameTerm(IdTerm, IdTerm),
     /// `isTRIPLE(a)` by the id's kind.
     IsTriple(IdTerm),
+    /// A topological relation between a variable and a constant geometry.
+    Spatial(Box<super::spatial::CompiledRelation>),
 }
 
 /// An operand evaluated on ids, nothing decoded: what the rewritten triple term patterns
@@ -368,6 +371,9 @@ pub(crate) fn compile(expr: &Expression, snapshot: &Snapshot) -> Option<Fast> {
                 };
                 Fast::Regex(v.clone(), str, compile_regex(simple(pattern)?, flags)?)
             }
+            (Function::Custom(_), _) => Fast::Spatial(Box::new(
+                super::spatial::CompiledRelation::compile(expr, snapshot)?,
+            )),
             _ => return None,
         },
         _ => return None,
@@ -495,6 +501,10 @@ impl Fast {
             Self::SameTerm(a, b) => {
                 same_term(a.value(value, snapshot), b.value(value, snapshot), snapshot)
             }
+            Self::Spatial(relation) => match stored(relation.variable()) {
+                Ok(id) => relation.eval(id, view),
+                Err(undecided) => undecided,
+            },
             Self::IsTriple(a) => match a.value(value, snapshot) {
                 Id::Stored(id) => Tri::of(id.kind() == TermKind::Triple),
                 Id::Error => Tri::Error,

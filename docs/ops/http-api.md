@@ -365,6 +365,7 @@ Every error is an `application/problem+json` document (RFC 9457), whoever answer
 | `nrese_text_index_terms` | Terms the full-text indexes cover (none until a query searches text) |
 | `nrese_wal_bytes_since_checkpoint`, `nrese_compactions_total`, `nrese_checkpoints_total` | What a restart would replay; run merges and checkpoints since start |
 | `nrese_vector_index_bytes` | The vector index (vectors and HNSW graphs) |
+| `nrese_geometry_index_bytes` | The geometry index: the boxes of the geometry literals (none until a query asks a spatial question) |
 | `nrese_derived_indexes_loaded_total` | Derived indexes (text, IRI text, vectors) read from `derived/` since start instead of built |
 | `nrese_support_sets_total{how}`, `nrese_support_views_total{how}`, `nrese_support_seconds_total{phase}` | Support graph sets for `inferred = "supported"`: computed afresh or updated for a commit, readers' views built or patched, and the time each took |
 | `nrese_process_resident_bytes` | Resident memory (Linux; mapped file pages included, which the OS can drop) |

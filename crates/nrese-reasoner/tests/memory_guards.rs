@@ -91,10 +91,12 @@ fn rule_jobs_copy_no_drivers_and_rounds_keep_no_derived_facts_list() {
 /// sorted copy of all of them, folds the recent run into the base a chunk at a time, and
 /// the derived facts are listed while the working set is taken apart. So no phase holds
 /// much beside the working set: counted in bytes per fact of the final working set
-/// above it (not as a share of it, which P1-F11 shrank). With chunks of 1,024 pairs, so
-/// that this input's runs have many: the rounds 3.55, the listing 0.52 bytes per fact on
-/// 6 October 2026; reverted, one-vector folds 8.10, a one-vector union 8.40,
-/// concatenated candidates 19.50, the listing beside the whole working set 9.74.
+/// above it (not as a share of it, which P1-F11 shrank), the table of dense ids apart.
+/// With chunks of 1,024 pairs, so that this input's runs have many: the rounds 3.55, the
+/// listing 0.52 bytes per fact on 6 October 2026; reverted, one-vector folds 8.10, a
+/// one-vector union 8.40, concatenated candidates 19.50, the listing beside the whole
+/// working set 9.74. With a pair a word (13 October): the rounds 2.30, the listing 1.74
+/// (its facts are three words each, the pairs it frees one), the id table 1.08.
 #[test]
 fn rounds_hold_no_second_copy_beside_the_working_set() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
@@ -118,7 +120,9 @@ fn rounds_hold_no_second_copy_beside_the_working_set() {
         "reasoner: merge",
         "reasoner: install",
     ]);
-    let per_fact = |bytes: usize| bytes.saturating_sub(store) as f64 / facts as f64;
+    // The table that numbers the ids is no copy of the facts: apart (`ids_bytes`).
+    let ids = result.counters.ids_bytes;
+    let per_fact = |bytes: usize| bytes.saturating_sub(store + ids) as f64 / facts as f64;
     let rounds = per_fact(rounds);
     assert!(
         rounds <= 6.0,
@@ -135,7 +139,8 @@ fn rounds_hold_no_second_copy_beside_the_working_set() {
 /// can look it up by object alone (or grounding reads it): here `takesCourse`, `advisor`,
 /// `teacherOf`, the degrees and the inverse `member`, among others, keep only their
 /// subject order. Every order kept, the final working set holds 32 bytes per fact; 22.4
-/// on 6 October 2026. No lookup by object meets a relation without that order.
+/// on 6 October 2026, 11.2 since a pair is a word of two dense numbers (13 October; with
+/// pairs of two words it fails). No lookup by object meets a relation without that order.
 #[test]
 fn relations_keep_no_object_order_their_rules_never_use() {
     let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
@@ -253,6 +258,7 @@ fn equality_keeps_the_working_set_as_the_only_copy() {
                 Some(&lists),
                 &schema,
                 batch::Listing::Expanded,
+                batch::Output::Facts,
                 nrese_reasoner::eval::NEVER,
             )
             .expect("never stopped")
@@ -269,4 +275,4 @@ fn equality_keeps_the_working_set_as_the_only_copy() {
 }
 
 /// See [`relations_keep_no_object_order_their_rules_never_use`].
-const BYTES_PER_FACT: usize = 26;
+const BYTES_PER_FACT: usize = 14;

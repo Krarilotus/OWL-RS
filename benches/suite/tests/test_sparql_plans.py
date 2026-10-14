@@ -137,6 +137,7 @@ class AnswerCap(unittest.TestCase):
             self.assertEqual((code, len(text)), (200, len(body)))
         finally:
             server.shutdown()
+            server.server_close()
             if old is None:
                 os.environ.pop("NRESE_ANSWER_CAP_MB", None)
             else:

@@ -98,6 +98,26 @@ This section owns the execution policy; there is no setting for it besides `dl.t
   owner: the revision's ontology, the bounds L and U1, classification and realisation
   (cached per revision, under `dl.memory` and the process limit), rule materialisation,
   bulk spill and background storage.
+- **Spatial join scratch follows the same request owner.** SPARQL shares computed CRS
+  identities across both inputs and reserves its geometry adapters, index seeds,
+  pair conversion and value-to-row maps. The Geo kernel reserves tree/order capacity,
+  parallel candidate/refinement buffers and parsed/prepared geometry estimates through
+  the supplied part budget. Buffer reservations survive parallel handoffs; final pair
+  capacity survives the kernel, and result columns transfer their charge exactly once.
+  Candidate growth charges geometrically, rather than accounting at every pair. Parsing,
+  preparation and relating are opaque library calls with cooperative checks before and
+  after them; private self-noding/relating scratch is not a strict allocation ceiling.
+  The representative counting-allocator guard is `nrese-geo/tests/join_memory.rs`.
+  Literal length is only an initial parsing allowance. Retained geometry capacities
+  are reconciled after parsing, before refinement: coordinate/collection capacities
+  are counted and the private polygon ring-list capacity is estimated from parser growth.
+  The smaller side's retained geometry adjustment is one batch reservation.
+  Index traversal uses rstar's internal stack visitor; only actual hit buffers grow and
+  draw from the request, without a full-index scratch precharge. Pair positions use
+  `usize` to preserve the full input range: on a 64-bit host each candidate pair is
+  16 bytes, versus the former `(u32, u32)`'s 8 bytes. This doubles those buffers' element
+  storage, including their phase overlap; it is not an unchanged-memory claim. The
+  allocator guard reports observed and accounted peaks for root's batch validation.
 - **A Rayon worker never waits on a cache flight.** A part another query computes is
   waited for only off the pool; a request on a worker computes it itself, so no wait can
   hold a stack its producer needs ([research-designs.md

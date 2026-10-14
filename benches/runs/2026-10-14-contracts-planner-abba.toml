@@ -1,0 +1,57 @@
+# Retrospective record of the completed Fleet job; no new campaign was run to write it.
+id = "2026-10-14-contracts-planner-abba"
+level = "focused"
+kit = "fast parse-large"
+purpose = "Describe parsing/planning of eight large query shapes; no query execution or integrated-head acceptance claim"
+started = "2026-10-14T03:55:22"
+finished = "2026-10-14T03:55:40"
+host = "office-pc"
+build_host = "office-pc"
+scenario = "native"
+baseline = { commit = "32ecf1e51b3739a2a183a34f9c29d3a8422ccc3e", dirty = false, binary_sha256 = "76d6441275682cdf009575e23216efe42b21973c5dee950e397816f48baf3eac", note = "baseline tree ff81a062c124bc996b0155350f577c0a59245fdb" }
+candidate = { commit = "41052590bc8936667075d0078c9c9c470d6ed99f", dirty = false, binary_sha256 = "975463c6d94789f8849fa472ff0a659fbaf7b861e898f87277f95b52fccc059d", note = "candidate and harness tree 1b68a1f55968547c660443fb02e3ede16111148c" }
+protocol = { order = "A-B-B-A; four fresh processes, two per revision", runs_per_process = 100, timed_task = "perf_lab --parse-only", configured_cores = 32, fleet_ram_gb = 14, case_cap_gb = 4, samples = "per-process p50 then median across its two processes; no confidence interval or significance test", timestamp_note = "report timestamps have no timezone offset; retained verbatim" }
+inputs = [ { name = "social-people40000.nt", sha256 = "20914e93ac45e4c6696d7f0ba84b2b2e6e507cfe25f3d9d14bb5e18a8b6ff184" }, { name = "social-people40000.nt.expect.json", sha256 = "c0ddd65316e85346f98547d03e05767b30061a9328ab0e791a9411da4d0999bc" } ]
+publishable = "all"
+cases = [
+  { case = "parse-large/bgp-1000", verdict = "no-verdict", note = "Parsing/planning only. ABBA p50_ms=[14.038,13.175,13.141,14.111]; median 14.0745 -> 13.158 ms (-6.512%); steps=[1002,1002,1002,1002]; rewrites=[0,0,0,0]. Successful statuses; rows are plan diagnostics, not executed solution rows." },
+  { case = "parse-large/expression-depth-120", verdict = "no-verdict", note = "Parsing/planning only. ABBA p50_ms=[0.078,0.078,0.079,0.078]; median 0.078 -> 0.0785 ms (0.641%); steps=[4,4,4,4]; rewrites=[0,0,0,0]. Successful statuses; rows are plan diagnostics, not executed solution rows." },
+  { case = "parse-large/filter-or-2000", verdict = "no-verdict", note = "Parsing/planning only. ABBA p50_ms=[2.024,2.052,2.072,2.018]; median 2.021 -> 2.062 ms (2.029%); steps=[4,4,4,4]; rewrites=[0,0,0,0]. Successful statuses; rows are plan diagnostics, not executed solution rows." },
+  { case = "parse-large/optional-120-nested", verdict = "no-verdict", note = "Parsing/planning only. ABBA p50_ms=[3.231,3.28,3.292,3.234]; median 3.2325 -> 3.286 ms (1.655%); steps=[360,360,360,360]; rewrites=[0,0,0,0]. Successful statuses; rows are plan diagnostics, not executed solution rows." },
+  { case = "parse-large/path-alternatives-300", verdict = "no-verdict", note = "Parsing/planning only. ABBA p50_ms=[0.274,0.28,0.282,0.275]; median 0.2745 -> 0.281 ms (2.368%); steps=[2,2,2,2]; rewrites=[0,0,0,0]. Successful statuses; rows are plan diagnostics, not executed solution rows." },
+  { case = "parse-large/subqueries-50-deep", verdict = "no-verdict", note = "Parsing/planning only. ABBA p50_ms=[0.047,0.046,0.048,0.048]; median 0.0475 -> 0.047 ms (-1.053%); steps=[53,53,53,53]; rewrites=[0,0,0,0]. Successful statuses; rows are plan diagnostics, not executed solution rows." },
+  { case = "parse-large/union-500", verdict = "no-verdict", note = "Parsing/planning only. ABBA p50_ms=[1.084,1.102,1.09,1.09]; median 1.087 -> 1.096 ms (0.828%); steps=[1002,1002,1002,1002]; rewrites=[0,0,0,0]. Successful statuses; rows are plan diagnostics, not executed solution rows." },
+  { case = "parse-large/values-5000", verdict = "no-verdict", note = "Parsing/planning only. ABBA p50_ms=[1.1,1.133,1.13,1.093]; median 1.0965 -> 1.1315 ms (3.192%); steps=[5,5,5,5]; rewrites=[1,1,1,1]. Successful statuses; rows are plan diagnostics, not executed solution rows." },
+]
+findings = [
+  "Median summed p50: 21.9115 -> 21.141 ms (-3.516%). Four summed-p50 observations in ABBA order: [21.876,21.148,21.134,21.947].",
+  "All eight query shapes and all four process observations retained. Per-query changes are descriptive; two independent processes per side cannot establish significance or a general guarantee.",
+  "All records report status ok. No execution correctness, update/draft performance, broad physical-plan migration, or final integrated-head acceptance is established.",
+  "Machine reported host sus-ai (Fleet alias office-pc), Ryzen 9 5950X, 32 logical cores, governor powersave, perf_event_paranoid 1. Both builds use rustc 1.98.1 and RUSTFLAGS=-C target-cpu=native.",
+  "Harness revision 41052590bc8936667075d0078c9c9c470d6ed99f; driver SHA256 5be7172414927233db5f696ac98e5654dbcaf10bcb3eab671732d90c768c1d3f. Binary identities come from binaries.revision, not the report git field (which identifies the harness).",
+  "Raw lifetime/cgroup peaks remain in the hashed reports; they include load and page-cache charges and are not parse-only heap measurements.",
+]
+
+[results]
+root = "kraris-gptler:C:/Users/Johannes/Documents/fleet-scheduler/state/owlrs/results/contracts-planner-abba-fleet-20261013/out"
+job = "contracts-planner-abba-fleet-20261013"
+
+[results.files]
+"1-baseline.json" = "59856312e887b6d4cb4bcc76e10a2a84e02fd005f55cbb0110eb468a0e4ba1e0"
+"2-candidate.json" = "7346151731f11cb3152b0dec174759d4f809915a1b301a1b1a08e3ef8f47a724"
+"3-candidate.json" = "15e50a5f809821fd9bef436e02575582ec1ab357fb6a50d0d3f68cd25e2fbb68"
+"4-baseline.json" = "b4877fe0723697c590248b430199b186f44bf3e724884465e915d2f8b85cbfd7"
+"driver-SHA256SUMS" = "87e69abc8fb643da745119a2e470d62b27e5544018679c98a952e1d29b6936d4"
+"input-SHA256SUMS" = "c45e77f27b98f1a1d1b2604631e98b6da9ed149343659c891f252bf5e39666e5"
+"source-revision" = "975acbbc2a1ab0f8070142e37f2e112a2ee44c4cb37525a31f46b0e6be096e21"
+"toolchain.txt" = "778fbc643a806f0dd123c056e66201d7e8a56a61928ec0a33171be8d6c2d5a37"
+"baseline-build/build-settings.txt" = "260457017c19f338f1556af534cb937778bec72510e8b09d4748963c6949e80f"
+"baseline-build/revision" = "73a611806320e1a6de87499b651eea8738ea5ad5b5cc5eee97e37d9d145647ba"
+"baseline-build/SHA256SUMS" = "c716dd22055b3ffef817ba269450cfbf833d503b29853517d8fc4742f27d0f1d"
+"baseline-build/source-SHA256SUMS" = "4c2bc3f27a6f46fc933f2a01b6352e6787f68d0b1f3c9b4e5a9d26448bfe5fdc"
+"baseline-build/tree" = "def48b434d62a5ff60bc4d68dc91120f35fa186369bafb3c3c3ae35f35ec8617"
+"candidate-build/build-settings.txt" = "260457017c19f338f1556af534cb937778bec72510e8b09d4748963c6949e80f"
+"candidate-build/revision" = "975acbbc2a1ab0f8070142e37f2e112a2ee44c4cb37525a31f46b0e6be096e21"
+"candidate-build/SHA256SUMS" = "1b86514bdb64ed1f098c3af3456ca6415cbbcf1dc3b047c91f66cacc29644cb6"
+"candidate-build/source-SHA256SUMS" = "4c2bc3f27a6f46fc933f2a01b6352e6787f68d0b1f3c9b4e5a9d26448bfe5fdc"
+"candidate-build/tree" = "3a1a974131155bbc9c19b1ad94b7878b4124360ad50bc45b9d8c37e071192bdb"
