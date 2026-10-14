@@ -16,12 +16,12 @@
 //! | Predicate | Object |
 //! |---|---|
 //! | `nrv:near` | the query vector: a vector literal, or a variable the rest of the query binds to one (a search per value) |
-//! | `nrv:k` | how many nearest vectors (default 10) |
+//! | `nrv:k` | how many nearest vectors (positive integer, default 10; no fixed maximum) |
 //! | `nrv:score` | a variable: the cosine similarity or dot product, or the Euclidean distance |
 //! | `nrv:rank` | a variable: the rank, from 1 |
 //! | `nrv:metric` | `"cosine"` (the default), `"dot"` or `"l2"` |
 //! | `nrv:exact` | `true`: compare every vector (else large spaces are searched through an HNSW graph) |
-//! | `nrv:searchBudget` | the graph search's beam (default 64): wider finds more of the true nearest |
+//! | `nrv:searchBudget` | positive base beam (default 64; no fixed maximum), widened for k and selectivity; zero is an error |
 //!
 //! The subject is the matched vector literal. Only literals the query's dataset uses as
 //! objects are found (so a user sees no vector from a graph it may not read). When the
@@ -48,9 +48,6 @@ pub(super) const SEARCH: &str = "urn:nrese:vector:search";
 /// Nearest vectors per query vector when `nrv:k` isn't given.
 const DEFAULT_K: usize = 10;
 
-/// The most `nrv:k` takes.
-const MAX_K: usize = 10_000;
-
 /// The search goes first when the pattern joined to it is estimated at more than this
 /// many rows per vector wanted.
 const PROBE_ABOVE: usize = 50;
@@ -66,6 +63,21 @@ struct Search {
     metric: Metric,
     strategy: VectorStrategy,
     ef: Option<usize>,
+}
+
+impl Search {
+    fn query(&self, vector: Vec<f32>, accepted: Option<usize>) -> VectorQuery {
+        let mut query = VectorQuery {
+            metric: self.metric,
+            strategy: self.strategy,
+            accepted,
+            ..VectorQuery::new(vector, self.k)
+        };
+        if let Some(ef) = self.ef {
+            query.ef = ef;
+        }
+        query
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -121,9 +133,19 @@ fn parse(inner: &GraphPattern) -> Result<Search, QueryEvaluationError> {
             _ => None,
         };
         let number = || -> Result<usize, QueryEvaluationError> {
-            literal
+            let value = literal
                 .and_then(|l| l.value().parse::<usize>().ok())
-                .ok_or_else(|| argument(format!("nrv:{option} takes a whole number")))
+                .ok_or_else(|| {
+                    argument(format!(
+                        "nrv:{option} takes a whole number supported by this platform"
+                    ))
+                })?;
+            if value == 0 {
+                return Err(argument(format!(
+                    "nrv:{option} takes a positive whole number"
+                )));
+            }
+            Ok(value)
         };
         match option {
             "near" => {
@@ -136,8 +158,8 @@ fn parse(inner: &GraphPattern) -> Result<Search, QueryEvaluationError> {
                     _ => return Err(argument("nrv:near takes a vector literal or a variable")),
                 });
             }
-            "k" => search.k = number()?.clamp(1, MAX_K),
-            "searchBudget" => search.ef = Some(number()?.clamp(1, 100 * MAX_K)),
+            "k" => search.k = number()?,
+            "searchBudget" => search.ef = Some(number()?),
             "score" => {
                 search.score = Some(variable.ok_or_else(|| argument("nrv:score takes a variable"))?)
             }
@@ -184,10 +206,14 @@ impl Context<'_> {
         // The candidates the rest of the query allows, if it binds the matched variable.
         let candidates: Option<HashSet<u64>> = bound
             .and_then(|b| Some((b, b.column(&search.matched)?)))
-            .map(|(b, column)| {
+            .and_then(|(b, column)| {
                 (0..b.table.len())
-                    .map(|row| b.table.get(row, column))
-                    .filter(|&id| id != UNDEF)
+                    .map(|row| {
+                        let id = b.table.get(row, column);
+                        // An unbound row can join any vector; its alternatives must
+                        // not turn an unrestricted search into a finite candidate set.
+                        (id != UNDEF).then_some(id)
+                    })
                     .collect()
             });
         // The query vectors, each with the id it is bound to (for a `nrv:near` variable).
@@ -227,8 +253,7 @@ impl Context<'_> {
             };
             let found = self.nearest(
                 &search,
-                vector,
-                candidates.as_ref().map(HashSet::len),
+                search.query(vector, candidates.as_ref().map(HashSet::len)),
                 |query| self.snapshot.vector_search(query, &accept),
                 |id| {
                     Ok((*used
@@ -247,13 +272,10 @@ impl Context<'_> {
         self.produced(rows.into_solutions())
     }
 
-    /// `Join(local, SERVICE nrv:search { inner })`. Where `local` is estimated to bind
-    /// many rows and the query vector is given, the search goes first: its hits, nearest
-    /// first, are kept while `local` evaluated from the hit has rows (a probe per hit
-    /// through the indexes), until `k` are kept; `local` is then the rows of those
-    /// probes. The index is given `local`'s estimated rows as the vectors it accepts, so
-    /// its beam is as wide as for a filter it applied. Otherwise `local` goes first and its values of the matched variable are
-    /// the candidates ([`Self::vector_service`]).
+    /// Choose the join direction before searching. Selective exact routes bind first;
+    /// broad ones retain search-first rather than materializing many RDF rows to keep
+    /// k vectors. Row estimates are hints: bound IDs are deduplicated before the
+    /// index chooses again. Dataset visibility is still checked on the hits.
     pub(super) fn vector_join(
         &self,
         local: &GraphPattern,
@@ -261,18 +283,41 @@ impl Context<'_> {
     ) -> NativeResult<Solutions> {
         let search = parse(inner)?;
         let estimate = self.estimate(local);
-        let probe_first = match &search.near {
-            Near::Vector(_) => estimate >= (PROBE_ABOVE * search.k) as f64,
-            Near::Variable(_) => false,
+        self.check()?;
+        // Price the prospective candidate-filtered route. Probe execution below
+        // instead has no index filter, and records expected final survivors separately.
+        let probe = match &search.near {
+            Near::Vector(vector) if estimate >= PROBE_ABOVE as f64 * search.k as f64 => {
+                let mut query = search.query(vector.clone(), Some(estimate.ceil() as usize));
+                let route = self.snapshot.vector_estimate(&query);
+                if route.strategy == VectorStrategy::Approximate || estimate >= route.space as f64 {
+                    // Candidate enumeration predicts no distance savings in a broad
+                    // exact search. Keep the chosen kernel stable across probe rounds.
+                    query.strategy = route.strategy;
+                    query.probe_accepted = query.accepted.take();
+                    Some(query)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         };
-        if !probe_first {
-            let bound = self.eval(local)?;
-            let found = self.vector_service(inner, Some(&bound))?;
-            return self.join(bound, found);
+        if let Some(query) = probe {
+            return self.vector_probe_join(local, &search, query);
         }
-        let Near::Vector(vector) = &search.near else {
-            unreachable!("checked above")
-        };
+        let bound = self.eval(local)?;
+        let found = self.vector_service(inner, Some(&bound))?;
+        self.join(bound, found)
+    }
+
+    /// Search then probe: the index sees no local filter. A graph's beam must still
+    /// reflect the expected survival of the later probes.
+    fn vector_probe_join(
+        &self,
+        local: &GraphPattern,
+        search: &Search,
+        query: VectorQuery,
+    ) -> NativeResult<Solutions> {
         self.check()?;
         // The hits are probed against `local` after the search, so the index sees no
         // filter; it is told how many vectors `local` is estimated to accept, so that its
@@ -280,9 +325,8 @@ impl Context<'_> {
         // it the first `k` hits that pass come from an approximate list whose tail misses
         // them (recall 0.50 against 0.98, one kind in ten of 200,000 vectors).
         let found = self.nearest(
-            &search,
-            vector.clone(),
-            Some(estimate.ceil() as usize),
+            search,
+            query,
             |query| self.snapshot.vector_search(query, &|_| true),
             |id| {
                 if !self.used_as_object(id) {
@@ -303,13 +347,8 @@ impl Context<'_> {
                 Ok(Some(Probed::new(self, rows)))
             },
         )?;
-        let mut rows = Rows::new(&search);
-        rows.push(
-            self,
-            &search,
-            found.iter().map(|(id, d, _)| (*id, *d)),
-            None,
-        );
+        let mut rows = Rows::new(search);
+        rows.push(self, search, found.iter().map(|(id, d, _)| (*id, *d)), None);
         // Union consumes its inputs, also when it fails; the winners not yet handed to it
         // are released as they drop.
         let mut probed = None;
@@ -349,20 +388,10 @@ impl Context<'_> {
     fn nearest<T>(
         &self,
         search: &Search,
-        vector: Vec<f32>,
-        accepted: Option<usize>,
+        mut query: VectorQuery,
         mut fetch: impl FnMut(&VectorQuery) -> (Vec<(TermId, f32)>, VectorSearchReport),
         mut keep: impl FnMut(TermId) -> NativeResult<Option<T>>,
     ) -> NativeResult<Vec<(TermId, f32, T)>> {
-        let mut query = VectorQuery {
-            metric: search.metric,
-            strategy: search.strategy,
-            accepted,
-            ..VectorQuery::new(vector, search.k)
-        };
-        if let Some(ef) = search.ef {
-            query.ef = ef;
-        }
         let mut seen: HashSet<u64> = HashSet::new();
         let mut kept: Vec<(TermId, f32, T)> = Vec::new();
         let mut next = Vec::new();
@@ -402,7 +431,7 @@ impl Context<'_> {
             if kept.len() == search.k || fetched < query.k || query.k >= report.space {
                 return Ok(kept);
             }
-            query.k = (query.k * 4).min(report.space.max(1));
+            query.k = query.k.saturating_mul(4).min(report.space.max(1));
             query.ef = query.ef.max(query.k);
         }
     }
@@ -504,6 +533,219 @@ mod tests {
     use nrese_exec::SharedBudget;
     use std::cell::{Cell, RefCell};
 
+    fn pattern(text: &str) -> GraphPattern {
+        let nrese_sparql_syntax::Query::Select { pattern, .. } =
+            nrese_sparql_syntax::SparqlParser::new()
+                .parse_query(&format!("SELECT * WHERE {{ {text} }}"))
+                .unwrap()
+        else {
+            panic!("select query")
+        };
+        let GraphPattern::Project { inner, .. } = pattern else {
+            panic!("project")
+        };
+        *inner
+    }
+
+    #[test]
+    fn broad_exact_avoids_full_binding_and_preserves_duplicate_bags() {
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        let engine = Engine::new(Default::default()).unwrap();
+        let mut tx = engine.transaction();
+        for i in 0..1_000 {
+            for (predicate, value) in [("all", i), ("duplicates", i % 20)] {
+                tx.insert(
+                    Quad::new(
+                        NamedNode::new_unchecked(format!("urn:item:{i}")),
+                        NamedNode::new_unchecked(format!("urn:{predicate}")),
+                        Literal::new_typed_literal(
+                            format!("[{value}]"),
+                            NamedNode::new_unchecked(nrese_engine::vector::DATATYPE),
+                        ),
+                        GraphName::DefaultGraph,
+                    )
+                    .as_ref(),
+                );
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let inner = pattern(
+            "?v <urn:nrese:vector:near> \"[0]\" ; <urn:nrese:vector:k> 10 ; <urn:nrese:vector:metric> \"l2\" ; <urn:nrese:vector:exact> true",
+        );
+        let bag = |rows: &Solutions| {
+            let item = rows.column(&Variable::new_unchecked("item")).unwrap();
+            let vector = rows.column(&Variable::new_unchecked("v")).unwrap();
+            let mut values: Vec<_> = (0..rows.table.len())
+                .map(|r| (rows.table.get(r, item), rows.table.get(r, vector)))
+                .collect();
+            values.sort_unstable();
+            values
+        };
+        for (predicate, count) in [("all", 10), ("duplicates", 500)] {
+            let local = pattern(&format!("?item <urn:{predicate}> ?v"));
+            let ctx = Context::new(&snapshot, &QueryOptions::default(), None, None);
+            let bound = ctx
+                .eval(&local)
+                .map_err(QueryEvaluationError::from)
+                .unwrap();
+            let hits = ctx
+                .vector_service(&inner, Some(&bound))
+                .map_err(QueryEvaluationError::from)
+                .unwrap();
+            let truth = ctx
+                .join(bound, hits)
+                .map_err(QueryEvaluationError::from)
+                .unwrap();
+            let found = ctx
+                .vector_join(&local, &inner)
+                .map_err(QueryEvaluationError::from)
+                .unwrap();
+            assert_eq!(found.table.len(), count);
+            assert_eq!(bag(&found), bag(&truth));
+            ctx.consumed(&truth);
+            ctx.consumed(&found);
+            if predicate == "all" {
+                let options = QueryOptions {
+                    resources: crate::Resources {
+                        memory: nrese_exec::Envelope::new(Some(8_192), None),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let ctx = Context::new(&snapshot, &options, None, None);
+                let found = ctx
+                    .vector_join(&local, &inner)
+                    .map_err(QueryEvaluationError::from)
+                    .unwrap();
+                assert_eq!(found.table.len(), 10, "full binding would exceed 8 KiB");
+                ctx.consumed(&found);
+                assert_eq!(ctx.budget.used(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn graph_probe_join_keeps_its_recall_when_auto_would_choose_exact() {
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        let engine = Engine::new(Default::default()).unwrap();
+        let mut seed = 7u64;
+        let mut vector = || {
+            (0..64)
+                .map(|_| {
+                    seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                    let mut z = seed;
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    z ^= z >> 31;
+                    ((z >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut tx = engine.transaction();
+        for i in 0..24_000 {
+            let item = NamedNode::new_unchecked(format!("urn:item:{i}"));
+            tx.insert(
+                Quad::new(
+                    item.clone(),
+                    NamedNode::new_unchecked("urn:embedding"),
+                    Literal::new_typed_literal(
+                        nrese_engine::vector::lexical(&vector()),
+                        NamedNode::new_unchecked(nrese_engine::vector::DATATYPE),
+                    ),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            );
+            tx.insert(
+                Quad::new(
+                    item,
+                    NamedNode::new_unchecked("urn:kind"),
+                    Literal::from(i % 10),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            );
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let ctx = Context::new(&snapshot, &QueryOptions::default(), None, None);
+        let local = pattern("?item <urn:embedding> ?v ; <urn:kind> 3");
+        let estimate = ctx.estimate(&local);
+        let mut shared = 0;
+        for _ in 0..20 {
+            let inner = pattern(&format!(
+                "?v <urn:nrese:vector:near> \"{}\" ; <urn:nrese:vector:k> 10 ; <urn:nrese:vector:exact> true",
+                nrese_engine::vector::lexical(&vector())
+            ));
+            let mut search = parse(&inner).unwrap();
+            let truth = ctx
+                .vector_join(&local, &inner)
+                .map_err(QueryEvaluationError::from)
+                .unwrap();
+            search.strategy = VectorStrategy::Approximate;
+            let Near::Vector(near) = &search.near else {
+                unreachable!()
+            };
+            let mut query = search.query(near.clone(), None);
+            snapshot.prepare_vector_graph(&query);
+            assert!(snapshot.vector_search(&query, &|_| true).1.graph);
+            query.probe_accepted = Some(estimate.ceil() as usize);
+            let found = ctx
+                .vector_probe_join(&local, &search, query)
+                .map_err(QueryEvaluationError::from)
+                .unwrap();
+            let item = Variable::new_unchecked("item");
+            let ids = |rows: &Solutions| {
+                let column = rows.column(&item).unwrap();
+                (0..rows.table.len())
+                    .map(|row| rows.table.get(row, column))
+                    .collect::<HashSet<_>>()
+            };
+            assert_eq!((truth.table.len(), found.table.len()), (10, 10));
+            shared += ids(&truth).intersection(&ids(&found)).count();
+            ctx.consumed(&truth);
+            ctx.consumed(&found);
+        }
+        assert!(shared >= 190, "forced ANN recall@10: {shared}/200");
+    }
+
+    #[test]
+    fn search_options_are_honored_or_rejected_never_clamped() {
+        use nrese_rdf::NamedNode;
+        use nrese_sparql_syntax::term::TriplePattern;
+
+        let block = |k: &str, beam: &str| GraphPattern::Bgp {
+            patterns: [("near", "[1]"), ("k", k), ("searchBudget", beam)]
+                .into_iter()
+                .map(|(name, value)| TriplePattern {
+                    subject: TermPattern::Variable(Variable::new_unchecked("v")),
+                    predicate: NamedNodePattern::NamedNode(NamedNode::new_unchecked(format!(
+                        "urn:nrese:vector:{name}"
+                    ))),
+                    object: TermPattern::Literal(Literal::new_simple_literal(value)),
+                })
+                .collect(),
+        };
+        for (k, beam) in [(1, 1), (10_001, 1_000_001), (usize::MAX, usize::MAX)] {
+            let parsed = parse(&block(&k.to_string(), &beam.to_string())).unwrap();
+            assert_eq!(parsed.k, k);
+            assert_eq!(parsed.ef, Some(beam));
+        }
+        for (k, beam, option) in [
+            ("0", "64", "nrv:k"),
+            ("10", "0", "nrv:searchBudget"),
+            ("-1", "64", "nrv:k"),
+            ("10", "18446744073709551616", "nrv:searchBudget"),
+        ] {
+            let error = parse(&block(k, beam)).unwrap_err().to_string();
+            assert!(
+                error.contains(option) && error.contains("whole number"),
+                "{error}"
+            );
+        }
+    }
+
     fn search(k: usize) -> Search {
         Search {
             matched: Variable::new_unchecked("v"),
@@ -563,8 +805,7 @@ mod tests {
         let found = ctx
             .nearest(
                 &search(3),
-                vec![1.0],
-                None,
+                search(3).query(vec![1.0], None),
                 |query| {
                     let round = rounds.get();
                     rounds.set(round + 1);
@@ -670,8 +911,7 @@ mod tests {
             let found = ctx
                 .nearest(
                     &search(3),
-                    vec![1.0],
-                    Some(100),
+                    search(3).query(vec![1.0], Some(100)),
                     |query| {
                         assert_eq!(query.accepted, Some(100));
                         (
@@ -704,8 +944,7 @@ mod tests {
             let found = ctx
                 .nearest(
                     &search(k),
-                    vec![1.0],
-                    None,
+                    search(k).query(vec![1.0], None),
                     |_| {
                         assert!(!fetched);
                         fetched = true;
@@ -742,8 +981,7 @@ mod tests {
             let mut round = 0;
             let result = ctx.nearest(
                 &search(3),
-                vec![1.0],
-                None,
+                search(3).query(vec![1.0], None),
                 |_| {
                     round += 1;
                     if round == 2 && stop == "fetch_cancel" {
@@ -786,19 +1024,7 @@ mod tests {
     #[test]
     fn rejected_probe_capacity_and_unhanded_winners_release_without_ending_the_query() {
         use nrese_rdf::{GraphName, NamedNode, Quad};
-        use nrese_sparql_syntax::{Query, algebra::Expression};
-        fn pattern(text: &str) -> GraphPattern {
-            let Query::Select { pattern, .. } = nrese_sparql_syntax::SparqlParser::new()
-                .parse_query(&format!("SELECT * WHERE {{ {text} }}"))
-                .unwrap()
-            else {
-                panic!()
-            };
-            let GraphPattern::Project { inner, .. } = pattern else {
-                panic!()
-            };
-            *inner
-        }
+        use nrese_sparql_syntax::algebra::Expression;
         let engine = Engine::new(Default::default()).unwrap();
         let mut tx = engine.transaction();
         for vector in 1..=6 {

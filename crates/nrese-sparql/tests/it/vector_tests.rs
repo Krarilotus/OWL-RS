@@ -116,6 +116,58 @@ fn near(degrees: f32) -> String {
 }
 
 #[test]
+fn a_large_k_returns_available_candidates_without_overflow() {
+    let engine = engine();
+    let query = |k: usize| {
+        format!(
+            "SELECT ?item WHERE {{ ?item ex:embedding ?v .
+           SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k {k} }} }} ORDER BY ?item",
+            near(92.0)
+        )
+    };
+    let options = QueryOptions::default();
+    let available = rows(&engine, &query(1_000), &options);
+    assert!(!available.is_empty());
+    assert_eq!(rows(&engine, &query(usize::MAX), &options), available);
+}
+
+#[test]
+fn an_unbound_candidate_row_keeps_the_search_unrestricted() {
+    let engine = engine();
+    let query = |values: &str| {
+        format!(
+            "SELECT ?v WHERE {{ {values} SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k 3 ; nrv:exact true }} }} ORDER BY ?v",
+            near(92.0)
+        )
+    };
+    let options = QueryOptions::default();
+    assert_eq!(
+        rows(&engine, &query("VALUES ?v { UNDEF }"), &options),
+        rows(&engine, &query(""), &options)
+    );
+    let truth = rows(&engine, &query(""), &options);
+    let selected = format!("\"{}\"^^nrv:vector", truth[0][0]);
+    let found = rows(
+        &engine,
+        &query(&format!(
+            "VALUES ?v {{ UNDEF UNDEF {selected} {selected} }}"
+        )),
+        &options,
+    );
+    assert_eq!(found.len(), 8);
+    let mut counts: Vec<_> = truth
+        .iter()
+        .map(|row| found.iter().filter(|got| *got == row).count())
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(
+        counts,
+        [2, 2, 4],
+        "wildcards and bound duplicates retain their multiplicities"
+    );
+}
+
+#[test]
 fn the_nearest_items_are_found_and_ranked() {
     let engine = engine();
     let plain = QueryOptions::default();

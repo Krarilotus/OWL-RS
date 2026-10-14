@@ -100,6 +100,7 @@ pub struct PreparedQuery {
     dataset: Option<QueryDatasetSpecification>,
     read_model: ReadModel,
     memory_limit: Option<usize>,
+    planner: nrese_sparql::PlannerOptions,
     as_written: bool,
     solutions_format: SolutionsResultFormat,
     graph_format: GraphResultFormat,
@@ -170,6 +171,7 @@ impl PreparedQuery {
                     .unwrap_or_default(),
             },
             memory_limit: request.memory_limit,
+            planner: request.planner,
             as_written: request.as_written,
             solutions_format: request.solutions_format,
             graph_format: request.graph_format,
@@ -626,6 +628,7 @@ fn query_options(
     QueryOptions {
         dataset: prepared.dataset.clone(),
         resources: nrese_sparql::Resources {
+            planner: prepared.planner,
             cancellation: Some(cancellation.clone()),
             memory: memory.clone(),
             ..Default::default()
