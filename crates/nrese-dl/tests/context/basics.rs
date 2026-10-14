@@ -6,6 +6,31 @@ use nrese_owl::{Axiom, Characteristic, ClassExpr, ObjProp};
 
 use super::support::{Build, Table, classify, holds, unsat};
 
+/// NCIt's shape: A ≡ B ⊓ ∃r.C1 ⊓ ... loses A ⊑ B when a fresh definition
+/// crosses the distribution cutoff. Both sides of the threshold must stay semantic.
+#[test]
+fn wide_definitions_keep_every_conjunct_in_the_taxonomy() {
+    for width in [15, 16, 17] {
+        let mut table = Table::default();
+        let mut b = Build::new(&mut table);
+        let (a, bb) = (b.c("A"), b.c("B"));
+        let r = b.r("r");
+        let mut parts = vec![bb];
+        for i in 1..width {
+            let c = b.c(&format!("C{i}"));
+            parts.push(b.some(r, c));
+        }
+        let definition = b.and(&parts);
+        b.axiom(Axiom::EquivalentClasses(vec![a, definition]));
+        let c = classify(&b.done(), 1).expect("the wide definition is Horn");
+        assert!(c.consistent);
+        assert!(!unsat(&mut table, &c, "A"));
+        assert!(holds(&mut table, &c, "A", "B"), "width {width}");
+        assert!(!holds(&mut table, &c, "B", "A"), "width {width}");
+        assert!(!holds(&mut table, &c, "A", "C1"), "a successor's type");
+    }
+}
+
 /// The textbook EL case (Baader et al.): pericarditis is a heart disease, through an
 /// existential, a conjunction and a role chain.
 #[test]

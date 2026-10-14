@@ -13,7 +13,7 @@ use rayon::prelude::*;
 
 use super::Layout;
 use super::derive::Ordered;
-use super::keys::PackedKeys;
+use super::keys::{IndexEncoding, PackedKeys};
 use crate::quad::{EncodedQuad, Key, Permutation};
 
 /// Deltas at least this large are sorted with all of the layout's permutations in parallel.
@@ -69,7 +69,7 @@ impl PermutationRun {
     }
 
     /// Builds a run from entries sorted by key, each flagged as tombstone or not.
-    pub(crate) fn from_sorted(entries: Vec<(Key, bool)>) -> Self {
+    pub(crate) fn from_sorted(entries: Vec<(Key, bool)>, encoding: IndexEncoding) -> Self {
         let has_tombstones = entries.iter().any(|(_, tomb)| *tomb);
         let mut tombstones = if has_tombstones {
             vec![0u64; entries.len().div_ceil(64)]
@@ -87,7 +87,7 @@ impl PermutationRun {
             })
             .collect();
         Self {
-            keys: PackedKeys::from_sorted(&keys),
+            keys: PackedKeys::from_sorted(&keys, encoding),
             tombstones: tombstones.into_boxed_slice(),
         }
     }
@@ -97,6 +97,8 @@ impl PermutationRun {
 #[derive(Debug, Default)]
 pub(crate) struct Run {
     layout: Layout,
+    /// What its blocks are built in, and what runs made from it are built in.
+    encoding: IndexEncoding,
     perms: [PermutationRun; Permutation::COUNT],
     inserts: u64,
     deletes: u64,
@@ -107,6 +109,7 @@ impl Run {
     /// duplicates (the transaction guarantees this). O(d log d).
     pub(crate) fn from_delta(
         layout: Layout,
+        encoding: IndexEncoding,
         inserts: &[EncodedQuad],
         deletes: &[EncodedQuad],
     ) -> Self {
@@ -115,10 +118,11 @@ impl Run {
             entries.extend(inserts.iter().map(|q| (permutation.to_key(q), false)));
             entries.extend(deletes.iter().map(|q| (permutation.to_key(q), true)));
             entries.sort_unstable_by_key(|entry| entry.0);
-            PermutationRun::from_sorted(entries)
+            PermutationRun::from_sorted(entries, encoding)
         };
         Self::from_permutations(
             layout,
+            encoding,
             build_all(layout, inserts.len() + deletes.len(), build),
         )
     }
@@ -126,8 +130,12 @@ impl Run {
     /// Builds a tombstone-free run from arbitrary quads, removing duplicates. Used for bulk
     /// replacement and checkpoint loading. O(n log n), parallel over permutations and within
     /// each sort.
-    pub(crate) fn from_quads(layout: Layout, quads: Vec<EncodedQuad>) -> Self {
-        let mut builder = PermutationBuilder::planned(quads, layout.permutations());
+    pub(crate) fn from_quads(
+        layout: Layout,
+        encoding: IndexEncoding,
+        quads: Vec<EncodedQuad>,
+    ) -> Self {
+        let mut builder = PermutationBuilder::planned(quads, layout.permutations(), encoding);
         let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
         for &permutation in layout.permutations() {
             perms[permutation as usize] = PermutationRun {
@@ -135,7 +143,7 @@ impl Run {
                 tombstones: Box::default(),
             };
         }
-        Self::from_permutations(layout, perms)
+        Self::from_permutations(layout, encoding, perms)
     }
 
     /// Assembles a run from the permutation runs of `layout`, which hold the same entries.
@@ -143,6 +151,7 @@ impl Run {
     /// the data.
     pub(crate) fn from_permutations(
         layout: Layout,
+        encoding: IndexEncoding,
         perms: [PermutationRun; Permutation::COUNT],
     ) -> Self {
         let spog = &perms[Permutation::Spog as usize];
@@ -150,6 +159,7 @@ impl Run {
         let inserts = spog.keys.len() as u64 - deletes;
         Self {
             layout,
+            encoding,
             perms,
             inserts,
             deletes,
@@ -158,6 +168,10 @@ impl Run {
 
     pub(crate) fn layout(&self) -> Layout {
         self.layout
+    }
+
+    pub(crate) fn encoding(&self) -> IndexEncoding {
+        self.encoding
     }
 
     #[inline]
@@ -197,6 +211,7 @@ impl Run {
                         PermutationRun {
                             keys: PackedKeys::from_sorted_iter(
                                 source.keys.iter().map(|[a, b, c, g]| [g, a, b, c]),
+                                self.encoding,
                             ),
                             tombstones: source.tombstones.clone(),
                         }
@@ -211,6 +226,7 @@ impl Run {
         }
         Self {
             layout: Layout::Quads,
+            encoding: self.encoding,
             perms,
             inserts: self.inserts,
             deletes: self.deletes,
@@ -271,6 +287,8 @@ pub(crate) struct PermutationBuilder {
     /// Full sorts of the keys so far (the first one included): what deriving saves, and
     /// what a guard test counts.
     sorts: usize,
+    /// What the permutations are packed in.
+    encoding: IndexEncoding,
 }
 
 impl PermutationBuilder {
@@ -278,11 +296,15 @@ impl PermutationBuilder {
     /// asked for in the layout's order is sorted (the tests' oracle).
     #[cfg(test)]
     pub(crate) fn new(quads: Vec<EncodedQuad>) -> Self {
-        Self::planned(quads, &[])
+        Self::planned(quads, &[], IndexEncoding::Fast)
     }
 
     /// For `quads`, to be asked for the permutations in `wanted`, in any order.
-    pub(crate) fn planned(mut quads: Vec<EncodedQuad>, wanted: &[Permutation]) -> Self {
+    pub(crate) fn planned(
+        mut quads: Vec<EncodedQuad>,
+        wanted: &[Permutation],
+        encoding: IndexEncoding,
+    ) -> Self {
         quads.par_sort_unstable();
         quads.dedup();
         Self {
@@ -291,6 +313,7 @@ impl PermutationBuilder {
             wanted: wanted.to_vec(),
             ready: Vec::new(),
             sorts: 1,
+            encoding,
         }
     }
 
@@ -307,7 +330,7 @@ impl PermutationBuilder {
             return self.ready.swap_remove(at).1;
         }
         if permutation == self.order {
-            let packed = PackedKeys::from_sorted(&self.keys);
+            let packed = PackedKeys::from_sorted(&self.keys, self.encoding);
             self.derive_ahead();
             return packed;
         }
@@ -318,7 +341,7 @@ impl PermutationBuilder {
             positions: None,
         };
         if let Some(positions) = own.partitioned(permutation) {
-            let packed = self.ordered(permutation, &positions).packed();
+            let packed = self.ordered(permutation, &positions).packed(self.encoding);
             self.derive_ahead_from(permutation, Some(&positions));
             return packed;
         }
@@ -331,13 +354,13 @@ impl PermutationBuilder {
             .unwrap_or(permutation);
         self.sort_into(source);
         if source == permutation {
-            let packed = PackedKeys::from_sorted(&self.keys);
+            let packed = PackedKeys::from_sorted(&self.keys, self.encoding);
             self.derive_ahead();
             return packed;
         }
         self.wanted.retain(|&p| p != source);
         self.ready
-            .push((source, PackedKeys::from_sorted(&self.keys)));
+            .push((source, PackedKeys::from_sorted(&self.keys, self.encoding)));
         self.derive_ahead();
         self.packed(permutation)
     }
@@ -385,7 +408,7 @@ impl PermutationBuilder {
                 positions,
             };
             if let Some(derived) = from.partitioned(permutation) {
-                let packed = self.ordered(permutation, &derived).packed();
+                let packed = self.ordered(permutation, &derived).packed(self.encoding);
                 self.wanted.retain(|&p| p != permutation);
                 self.ready.push((permutation, packed));
                 self.derive_ahead_from(permutation, Some(&derived));
