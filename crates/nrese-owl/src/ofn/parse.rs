@@ -8,10 +8,12 @@ use std::rc::Rc;
 use super::lex::{Lexer, Tok, position};
 use super::{Document, Intern, Model};
 use crate::diagnostics::Diagnostic;
+use crate::model::Disjoint;
 use crate::model::{
     Axiom, Characteristic, ClassExpr, DataRange, EntityKind, ExprId, ObjProp, RangeId, Term,
     canonical,
 };
+use crate::rules::{Atom, DArg, IArg, Rule};
 use crate::vocab::{OWL, RDF, RDFS, XSD};
 
 /// Why an axiom can't be read: where, and what.
@@ -605,7 +607,10 @@ impl<'t, 'm> Parser<'t, 'm> {
                 Some(Axiom::SubClassOf(sub, self.class()?))
             }
             "EquivalentClasses" => Some(Axiom::EquivalentClasses(canonical(self.classes()?))),
-            "DisjointClasses" => Some(Axiom::DisjointClasses(canonical(self.classes()?))),
+            "DisjointClasses" => {
+                let d = Disjoint::Classes(self.classes()?);
+                return self.disjoint(d);
+            }
             "DisjointUnion" => {
                 let class = self.entity()?;
                 Some(Axiom::DisjointUnion(class, canonical(self.classes()?)))
@@ -625,9 +630,10 @@ impl<'t, 'm> Parser<'t, 'm> {
             "EquivalentObjectProperties" => Some(Axiom::EquivalentObjectProperties(canonical(
                 self.object_properties()?,
             ))),
-            "DisjointObjectProperties" => Some(Axiom::DisjointObjectProperties(canonical(
-                self.object_properties()?,
-            ))),
+            "DisjointObjectProperties" => {
+                let d = Disjoint::Objects(self.object_properties()?);
+                return self.disjoint(d);
+            }
             "InverseObjectProperties" => {
                 let a = self.object_property()?;
                 let b = self.object_property()?;
@@ -654,9 +660,10 @@ impl<'t, 'm> Parser<'t, 'm> {
             "EquivalentDataProperties" => Some(Axiom::EquivalentDataProperties(canonical(
                 self.data_properties()?,
             ))),
-            "DisjointDataProperties" => Some(Axiom::DisjointDataProperties(canonical(
-                self.data_properties()?,
-            ))),
+            "DisjointDataProperties" => {
+                let d = Disjoint::Data(self.data_properties()?);
+                return self.disjoint(d);
+            }
             "DataPropertyDomain" => {
                 let p = self.data_property()?;
                 Some(Axiom::DataPropertyDomain(p, self.class()?))
@@ -682,7 +689,8 @@ impl<'t, 'm> Parser<'t, 'm> {
             }
             "SameIndividual" => Some(Axiom::SameIndividual(canonical(self.individuals()?))),
             "DifferentIndividuals" => {
-                Some(Axiom::DifferentIndividuals(canonical(self.individuals()?)))
+                let d = Disjoint::Individuals(self.individuals()?);
+                return self.disjoint(d);
             }
             "ClassAssertion" => {
                 let c = self.class()?;
@@ -729,7 +737,12 @@ impl<'t, 'm> Parser<'t, 'm> {
                 }
                 None
             }
-            "DLSafeRule" => return fail(at, "a DL-safe rule (SWRL, not OWL 2)"),
+            "DLSafeRule" => {
+                let rule = self.rule(at)?;
+                self.close()?;
+                self.model.rules.push(rule);
+                return Ok(());
+            }
             "DescriptionGraph" => return fail(at, "a description graph (not OWL 2)"),
             _ => return fail(at, "an axiom expected"),
         };
@@ -739,6 +752,140 @@ impl<'t, 'm> Parser<'t, 'm> {
             None => self.model.annotations += 1,
         }
         Ok(())
+    }
+
+    /// The rest of a disjointness axiom (its operands read): its axioms
+    /// (`Disjoint::axioms`), a repeated operand reported.
+    fn disjoint(&mut self, d: Disjoint) -> R<()> {
+        self.close()?;
+        let (axioms, repeated) = d.axioms(&mut self.model.classes, &mut self.model.ranges);
+        if repeated {
+            self.model.diagnostics.push(Diagnostic::RepeatedOperand);
+        }
+        for a in axioms {
+            self.add(a);
+        }
+        Ok(())
+    }
+
+    // Rules -----------------------------------------------------------------------------
+
+    /// A rule's `Body(…) Head(…)` (`crate::rules`).
+    fn rule(&mut self, at: usize) -> R<Rule> {
+        let mut variables: Vec<Term> = Vec::new();
+        let mut parts = [Vec::new(), Vec::new()];
+        for (i, part) in ["Body", "Head"].into_iter().enumerate() {
+            match self.take() {
+                (Tok::Name(n), _) if n == part => {}
+                (tok, at) => {
+                    return unexpected(&tok, at, ["Body(…) expected", "Head(…) expected"][i]);
+                }
+            }
+            self.open()?;
+            while !self.at_close() {
+                let atom = self.atom(&mut variables)?;
+                parts[i].push(atom);
+            }
+            self.close()?;
+        }
+        let [body, head] = parts;
+        let mut data = vec![false; variables.len()];
+        for atom in body.iter().chain(&head) {
+            for (v, d) in atom.variables() {
+                data[v as usize] |= d;
+            }
+        }
+        Ok(Rule {
+            body,
+            head,
+            variables,
+            data,
+            line: position(self.lex.text(), at).0,
+        })
+    }
+
+    fn atom(&mut self, variables: &mut Vec<Term>) -> R<Atom> {
+        let (tok, at) = self.take();
+        let Tok::Name(keyword) = tok else {
+            return unexpected(&tok, at, "a rule atom expected");
+        };
+        self.open()?;
+        let atom = match keyword {
+            "ClassAtom" => {
+                let c = self.class()?;
+                Atom::Class(c, self.iarg(variables)?)
+            }
+            "DataRangeAtom" => {
+                let r = self.range()?;
+                Atom::Range(r, self.darg(variables)?)
+            }
+            "ObjectPropertyAtom" => {
+                let p = self.object_property()?;
+                let x = self.iarg(variables)?;
+                Atom::Object(p, x, self.iarg(variables)?)
+            }
+            "DataPropertyAtom" => {
+                let p = self.data_property()?;
+                let x = self.iarg(variables)?;
+                Atom::Data(p, x, self.darg(variables)?)
+            }
+            "SameIndividualAtom" | "DifferentIndividualsAtom" => {
+                let x = self.iarg(variables)?;
+                let y = self.iarg(variables)?;
+                if keyword == "SameIndividualAtom" {
+                    Atom::Same(x, y)
+                } else {
+                    Atom::Different(x, y)
+                }
+            }
+            "BuiltInAtom" => {
+                let b = self.entity()?;
+                let mut args = Vec::new();
+                while !self.at_close() {
+                    args.push(self.darg(variables)?);
+                }
+                Atom::BuiltIn(b, args)
+            }
+            _ => return fail(at, "a rule atom expected"),
+        };
+        self.close()?;
+        Ok(atom)
+    }
+
+    /// `Variable(iri)` (or the older `IndividualVariable`, `DataVariable`): its index in
+    /// the rule's variables; `None` if the next token isn't one.
+    fn variable(&mut self, variables: &mut Vec<Term>) -> R<Option<u32>> {
+        if !matches!(
+            self.peek(),
+            Tok::Name("Variable" | "IndividualVariable" | "DataVariable")
+        ) {
+            return Ok(None);
+        }
+        self.take();
+        self.open()?;
+        let t = self.entity()?;
+        self.close()?;
+        Ok(Some(match variables.iter().position(|&v| v == t) {
+            Some(i) => i as u32,
+            None => {
+                variables.push(t);
+                variables.len() as u32 - 1
+            }
+        }))
+    }
+
+    fn iarg(&mut self, variables: &mut Vec<Term>) -> R<IArg> {
+        Ok(match self.variable(variables)? {
+            Some(v) => IArg::Var(v),
+            None => IArg::Individual(self.individual()?),
+        })
+    }
+
+    fn darg(&mut self, variables: &mut Vec<Term>) -> R<DArg> {
+        Ok(match self.variable(variables)? {
+            Some(v) => DArg::Var(v),
+            None => DArg::Literal(self.literal()?),
+        })
     }
 
     // The document ----------------------------------------------------------------------

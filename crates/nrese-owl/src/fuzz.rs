@@ -1112,3 +1112,231 @@ pub fn encode_complements(o: &Ontology, count: usize, fresh: &mut dyn FnMut() ->
     out.sources.resize(out.axioms.len(), Vec::new());
     out
 }
+
+// Rules ----------------------------------------------------------------------------------
+
+/// The terms random rules use beyond a [`Signature`]: variables (`{FUZZ}x0`, … for
+/// individuals, `{FUZZ}w0`, … for data values) and SWRL's built-ins `swrlb:add` and
+/// `swrlb:lessThan`.
+#[derive(Debug, Clone)]
+pub struct RuleTerms {
+    pub individuals: Vec<Term>,
+    pub data: Vec<Term>,
+    /// `swrlb:add`, `swrlb:lessThan`.
+    pub built_ins: [Term; 2],
+}
+
+impl RuleTerms {
+    pub fn new(intern: &mut dyn FnMut(&Name) -> Term) -> Self {
+        let swrlb = "http://www.w3.org/2003/11/swrlb#";
+        Self {
+            individuals: (0..2)
+                .map(|i| intern(&Name::Iri(format!("{FUZZ}x{i}"))))
+                .collect(),
+            data: (0..2)
+                .map(|i| intern(&Name::Iri(format!("{FUZZ}w{i}"))))
+                .collect(),
+            built_ins: [
+                intern(&Name::Iri(format!("{swrlb}add"))),
+                intern(&Name::Iri(format!("{swrlb}lessThan"))),
+            ],
+        }
+    }
+}
+
+/// A random DL-safe rule over `sig` (`crate::rules`), its class expressions interned into
+/// `o`: one to three body atoms (classes, possibly negated or existential, properties,
+/// possibly inverse, equality and inequality; with `data`, data property atoms and data
+/// ranges; with `built_ins` too, `swrlb:add` and `swrlb:lessThan`), zero to two head atoms
+/// over the variables the body binds. Every variable a head atom or a built-in uses is
+/// bound by the body, so the rule is DL-safe. `clean`: no equality or inequality atom and
+/// a head of at least one atom (what the reference reasoners read as SWRL does).
+pub fn rule(
+    rng: &mut Rng,
+    sig: &Signature,
+    rt: &RuleTerms,
+    o: &mut Ontology,
+    data: bool,
+    built_ins: bool,
+    clean: bool,
+) -> crate::rules::Rule {
+    use crate::rules::{Atom, DArg, IArg, Rule};
+    let mut bound_i: Vec<u32> = Vec::new();
+    let mut bound_d: Vec<u32> = Vec::new();
+    // Variable indexes: individuals 0 and 1, data values 2 and 3.
+    let ivar = |rng: &mut Rng, bound: &mut Vec<u32>| -> IArg {
+        if !bound.is_empty() && rng.one_in(2) {
+            return IArg::Var(bound[rng.below(bound.len() as u64) as usize]);
+        }
+        if rng.one_in(6) {
+            return IArg::Individual(rng.pick(&sig.individuals));
+        }
+        let v = rng.below(2) as u32;
+        if !bound.contains(&v) {
+            bound.push(v);
+        }
+        IArg::Var(v)
+    };
+    let class = |rng: &mut Rng, o: &mut Ontology| -> ExprId {
+        let c = ExprId(o.classes.intern(ClassExpr::Class(rng.pick(&sig.classes))));
+        match rng.below(5) {
+            0 => ExprId(o.classes.intern(ClassExpr::Not(c))),
+            1 => {
+                let p = ObjProp::Named(rng.pick(&sig.object_properties));
+                ExprId(o.classes.intern(ClassExpr::Some(p, c)))
+            }
+            _ => c,
+        }
+    };
+    let property = |rng: &mut Rng| -> ObjProp {
+        let p = rng.pick(&sig.object_properties);
+        if rng.one_in(4) {
+            ObjProp::Inverse(p)
+        } else {
+            ObjProp::Named(p)
+        }
+    };
+    let literal = |rng: &mut Rng| DArg::Literal(rng.pick(&sig.literals));
+    let mut body: Vec<Atom> = Vec::new();
+    for _ in 0..1 + rng.below(3) {
+        let mut kind = rng.below(if data { 9 } else { 6 });
+        if clean && (kind == 4 || kind == 5) {
+            kind = 2;
+        }
+        let atom = match kind {
+            0 | 1 => Atom::Class(class(rng, o), ivar(rng, &mut bound_i)),
+            2 | 3 => {
+                let p = property(rng);
+                let x = ivar(rng, &mut bound_i);
+                Atom::Object(p, x, ivar(rng, &mut bound_i))
+            }
+            4 => {
+                let x = ivar(rng, &mut bound_i);
+                Atom::Same(x, ivar(rng, &mut bound_i))
+            }
+            5 => {
+                let x = ivar(rng, &mut bound_i);
+                Atom::Different(x, ivar(rng, &mut bound_i))
+            }
+            6 | 7 if !sig.data_properties.is_empty() => {
+                let p = rng.pick(&sig.data_properties);
+                let x = ivar(rng, &mut bound_i);
+                let v = if rng.one_in(3) {
+                    literal(rng)
+                } else {
+                    let w = 2 + rng.below(2) as u32;
+                    if !bound_d.contains(&w) {
+                        bound_d.push(w);
+                    }
+                    DArg::Var(w)
+                };
+                Atom::Data(p, x, v)
+            }
+            _ if !bound_d.is_empty() => {
+                let from = bound_d[rng.below(bound_d.len() as u64) as usize];
+                if built_ins && rng.one_in(2) {
+                    if rng.one_in(2) {
+                        Atom::BuiltIn(rt.built_ins[1], vec![DArg::Var(from), literal(rng)])
+                    } else {
+                        // The other data variable is this one plus a literal.
+                        let to = if from == 2 { 3 } else { 2 };
+                        if !bound_d.contains(&to) {
+                            bound_d.push(to);
+                        }
+                        Atom::BuiltIn(
+                            rt.built_ins[0],
+                            vec![DArg::Var(to), DArg::Var(from), literal(rng)],
+                        )
+                    }
+                } else {
+                    let r = RangeId(o.ranges.intern(DataRange::Restriction(
+                        sig.integer,
+                        vec![(sig.facets[rng.below(2) as usize], rng.pick(&sig.literals))],
+                    )));
+                    Atom::Range(r, DArg::Var(from))
+                }
+            }
+            _ => Atom::Class(class(rng, o), ivar(rng, &mut bound_i)),
+        };
+        body.push(atom);
+    }
+    let head_i = |rng: &mut Rng, bound: &[u32]| -> IArg {
+        if bound.is_empty() || rng.one_in(6) {
+            IArg::Individual(rng.pick(&sig.individuals))
+        } else {
+            IArg::Var(bound[rng.below(bound.len() as u64) as usize])
+        }
+    };
+    let mut head: Vec<Atom> = Vec::new();
+    for _ in 0..rng.below(3).max(u64::from(clean)) {
+        let mut kind = rng.below(if data { 6 } else { 5 });
+        if clean && (kind == 3 || kind == 4) {
+            kind = 2;
+        }
+        let atom = match kind {
+            0 | 1 => Atom::Class(class(rng, o), head_i(rng, &bound_i)),
+            2 => {
+                let p = property(rng);
+                let x = head_i(rng, &bound_i);
+                Atom::Object(p, x, head_i(rng, &bound_i))
+            }
+            3 => {
+                let x = head_i(rng, &bound_i);
+                Atom::Same(x, head_i(rng, &bound_i))
+            }
+            4 => {
+                let x = head_i(rng, &bound_i);
+                Atom::Different(x, head_i(rng, &bound_i))
+            }
+            _ if !sig.data_properties.is_empty() => {
+                let v = if !bound_d.is_empty() && rng.one_in(2) {
+                    DArg::Var(bound_d[rng.below(bound_d.len() as u64) as usize])
+                } else {
+                    literal(rng)
+                };
+                let p = rng.pick(&sig.data_properties);
+                Atom::Data(p, head_i(rng, &bound_i), v)
+            }
+            _ => Atom::Class(class(rng, o), head_i(rng, &bound_i)),
+        };
+        head.push(atom);
+    }
+    // The variables used, numbered densely.
+    let all: Vec<Term> = rt.individuals.iter().chain(&rt.data).copied().collect();
+    let mut used: Vec<u32> = Vec::new();
+    for a in body.iter().chain(&head) {
+        for (v, _) in a.variables() {
+            if !used.contains(&v) {
+                used.push(v);
+            }
+        }
+    }
+    used.sort_unstable();
+    let map = |v: u32| used.iter().position(|&u| u == v).expect("used") as u32;
+    let renumber = |a: &Atom| -> Atom {
+        let i = |x: &IArg| match *x {
+            IArg::Var(v) => IArg::Var(map(v)),
+            other => other,
+        };
+        let d = |x: &DArg| match *x {
+            DArg::Var(v) => DArg::Var(map(v)),
+            other => other,
+        };
+        match a {
+            Atom::Class(c, x) => Atom::Class(*c, i(x)),
+            Atom::Range(r, v) => Atom::Range(*r, d(v)),
+            Atom::Object(p, x, y) => Atom::Object(*p, i(x), i(y)),
+            Atom::Data(p, x, v) => Atom::Data(*p, i(x), d(v)),
+            Atom::Same(x, y) => Atom::Same(i(x), i(y)),
+            Atom::Different(x, y) => Atom::Different(i(x), i(y)),
+            Atom::BuiltIn(b, xs) => Atom::BuiltIn(*b, xs.iter().map(d).collect()),
+        }
+    };
+    Rule {
+        body: body.iter().map(renumber).collect(),
+        head: head.iter().map(renumber).collect(),
+        variables: used.iter().map(|&v| all[v as usize]).collect(),
+        data: used.iter().map(|&v| v >= 2).collect(),
+        line: 0,
+    }
+}

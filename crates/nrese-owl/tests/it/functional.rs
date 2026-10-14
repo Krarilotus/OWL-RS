@@ -265,7 +265,6 @@ DataPropertyAssertion(:d :c \"open)
         (5, 1, "an axiom expected"),
         (6, 18, "')' expected"),
         (7, 39, "an IRI expected"),
-        (8, 1, "a DL-safe rule (SWRL, not OWL 2)"),
         (
             9,
             40,
@@ -276,6 +275,9 @@ DataPropertyAssertion(:d :c \"open)
         (13, 1, "the ontology's ')' is missing"),
     ];
     assert_eq!(positions, expected);
+    // The DL-safe rule is read, with its diagnostic (`nrese_owl::rules`).
+    assert_eq!(o.rules.len(), 1);
+    assert!(o.diagnostics.contains(&Diagnostic::Rule { rule: 0 }));
     assert!(o.diagnostics.iter().all(Diagnostic::is_fatal));
     let lines = rendered(&o, &table);
     assert_eq!(

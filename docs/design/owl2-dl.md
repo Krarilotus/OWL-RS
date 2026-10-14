@@ -741,7 +741,7 @@ engines, as the number module's validator verifies its compressed models
 
 | Answer | Certificate | Checker | Covered |
 |---|---|---|---|
-| consistent (hypertableau) | the engine's model: folded at the blocks, its 3-fold covering lift, or the graph unravelled one step at each block | `nrese_dl::certificate`: every axiom of the ontology as written, by the direct semantics on the finite interpretation (U the universal relation, keys over named individuals), closed under the role inclusions; independent of the normalisation and the engines | object properties, classes and individuals; on the small scope `4,4,4`, 99.84 % of the claims a model can show without data values (8,990,815 of 9,005,280); not yet: data values (the model has none) |
+| consistent (hypertableau) | the engine's model: folded at the blocks, its 3-fold covering lift, or the graph unravelled one step at each block | `nrese_dl::certificate`: every axiom of the ontology as written, by the direct semantics on the finite interpretation (U the universal relation, keys over named individuals), closed under the role inclusions; independent of the normalisation and the engines | object properties, classes and individuals; on the small scope `4,4,4`, 99.84 % of the claims a model can show without data values (8,990,815 of 9,005,280); data values since 13 October (the model carries the values the datatype theory assigns; 196 of the W3C suite's 199 consistent answers with a model certified, the 3 others listed in `tableau_w3c/uncertified.txt`); DL-safe rules (§16) |
 | consistent (number module) | the validated compressed model | `numbers::validate` | the module's fragment |
 | a class satisfiable, a non-entailment | a model of the ontology with a witness (a fresh anonymous individual in the class, or `a : ¬C`) | as above | as above |
 | inconsistent, an entailment | none yet: a refutation is a search tree, not recorded as a proof; the context core's derivations are in the proof IR, but no checker validates their steps against the calculus | – | references decide (§11) |
@@ -1031,3 +1031,71 @@ versions run anew (A, F). It is not a first milestone.
 - **Certain answers to arbitrary conjunctive queries over SROIQ(D):** open. NRESE reports completeness and offers only the exact services it can prove.
 - **Datatype coverage:** reported apart in every benchmark. Unsupported never counts as success (A).
 - **Benchmark compute:** ORE's full corpus doesn't fit on one PC. The full runs go to the Draco cluster (review §3 item 7).
+
+## 16. Inputs outside OWL 2 DL (as built, 13 October)
+
+**The question** (the owner, on ORE's `ore_ont_714`, which the reader found not OWL 2 DL
+and every reference but Openllet failed on): decide what can be decided soundly, and say
+exactly why where it can't. `nrese_dl::beyond` answers consistency
+(`beyond::consistency`) and classification (`beyond::classify`); every answer is certified by
+a model the independent checker verifies, or follows by monotonicity from part of the
+input, never assumed.
+
+**What is outside OWL 2 DL, and what is done with it:**
+
+| Input | Reader | Answer rests on |
+|---|---|---|
+| a DL-safe rule (SWRL; `DLSafeRule`, not an OWL 2 axiom, *Structural Specification* §9) | read into `Ontology::rules` with a `Diagnostic::Rule`; the engines leave it out and say so | grounding (below) |
+| a SQWRL query (a rule with `sqwrl:` built-ins) | read as a rule | reported as a repair: a query, it asserts nothing |
+| a disjointness repeating an operand (`x owl:disjointWith x`, `a owl:differentFrom a`) | **repaired**: the operand is empty (an individual: a contradiction), its RDF-Based meaning; the operands were deduplicated and the axiom said nothing before | the repaired axioms |
+| a property used without a declaration, a blank node two expressions share | repaired as before (typed by use, one expression) | as OWL 2 DL |
+| the reserved vocabulary used as a class, property or individual (`rdfs:Class`, `rdf:type`, `rdf:first`; §2.4) | the axioms left out, each with a `Diagnostic::Reserved`; they were read as fresh names, which decided what OWL 2 Full says otherwise | monotonicity only |
+| a non-simple property where a simple one is required, an irregular hierarchy (§11) | kept in the model, left out of the clauses | monotonicity; the certificate checks the axiom itself |
+| an ill-typed literal (§5.7), syntax and mapping errors | left out | monotonicity only |
+
+**Monotonicity.** What the reader reads is part of what the input says: "inconsistent"
+and every entailment of the DL part hold for the input. For an RDF graph outside OWL 2
+DL (whose meaning is the RDF-Based Semantics), the correspondence theorem (*RDF-Based
+Semantics* §7.2) carries the DL part's entailments to the graph, and that semantics is
+monotone. "Consistent" and non-entailments need a model of the whole input: they are
+claimed only where the reader left nothing out but rules and axioms the checker checks.
+
+**Rules by grounding.** An instance of a DL-safe rule over named individuals and data
+values is an OWL 2 DL axiom (`beyond::ground`): with a pivot individual `a` of the body,
+`{a} ⊓ Bₐ ⊓ ∃U.({b} ⊓ B_b) ⊑ Hₐ ⊓ …` (an empty head is `⊥`, SWRL §3; built-ins and data
+ranges on constants are evaluated), or, where the assertions state the body, the head's
+assertions. It follows from the rule, so adding it changes no model of the input. The loop:
+the chase adds the instances the assertions entail; then the hypertableau runs on the DL
+part with the instances so far, the checker evaluates every axiom and rule on its model
+(rules over the elements named individuals denote; data variables over the values the body
+binds; `swrlb:` arithmetic, comparisons and strings), and the instances the model breaks
+are added. It ends with a model that breaks none ("consistent", certified), an
+inconsistent DL part with instances ("inconsistent", by monotonicity), or a budget. A model
+the checker can't certify still shows instances to ground (sound whatever the model), so
+it can lead to "inconsistent", never to "consistent". The certificate checker now covers
+data values (`certificate::data`: the datatype map value by value; the tableau's models
+carry the values the datatype theory assigns, `DatatypeTheory::assign`).
+
+**Classification.** Inconsistent: every class unsatisfiable. Consistent, and the TBox
+names no individual and uses `owl:topObjectProperty` at most as a superproperty: the DL
+part's classification is the input's (a disjoint union of a TBox model with a model of
+the input is a model of the input, since assertions, keys and rules bind named
+individuals only). Otherwise the DL part with the instances gives the entailed
+subsumptions, and models of the whole input refute the rest: the certified model, a run
+per class with a fresh anonymous witness, a run per open pair; what stays open is said.
+
+**Why not native rules in the hypertableau.** HermiT's way (rules as DL-clauses guarded
+by `O(x)`) decides rules without built-ins; it needs value joins and built-ins inside the
+datatype theory, which the grounding loop gets from concrete values in certified models.
+Grounding reuses the engines unchanged and certifies its answers; its cost is a
+hypertableau run per round (the ORE inputs need one or two). Native rules stay the next
+step if rule-heavy inputs need many rounds.
+
+**Explanations of "inconsistent".** `beyond::justify` finds a minimal inconsistent part
+(axioms and rules) by deletion; on ORE's eight inconsistent inputs with rules, four axioms
+each, checkable by hand (§ results in [STATUS](../STATUS.md)).
+
+**Where it stays undecided, and why** (each answer says it): a model the certificate
+builder can't certify (counting cases the fold breaks, §10); a built-in NRESE doesn't
+evaluate (named); an ill-typed literal (§5.7); what the reader couldn't map (no direct
+semantics); a budget.
