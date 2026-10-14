@@ -175,10 +175,10 @@ class Suite:
         self.settings = dict(os.environ)
         now = datetime.datetime.now()
         self.date = now.isoformat(timespec="minutes")
-        self.stamp = now.strftime("%Y%m%d-%H%M%S")
+        self.stamp = now.strftime("%Y%m%d-%H%M%S-%f")
         self.host = socket.gethostname()
         scratch_root = Path(self.settings.get("NRESE_BENCH_SCRATCH") or root / "tmp")
-        self.scratch = (scratch_root / f"{PREFIX}{self.stamp}").resolve()
+        self.scratch = scratch_root.resolve() / f"{PREFIX}{self.stamp}"
         self.results = Path(args.results or root / "benches/suite/results" / now.strftime("%Y-%m-%d")).resolve()
         if args.dry_run:
             # A dry run writes nothing that stays: its rows and logs go with the scratch.
@@ -209,6 +209,8 @@ class Suite:
         else:
             self.data_volume = None
             self.data = Mount(str(Path(data).resolve()), "/data")
+        # Claim this invocation's scratch before creating anything we may later remove.
+        self.scratch.mkdir(parents=True, exist_ok=False)
         self.writer = Writer(self.results / "results.csv", echo=print)
         self.made_files: list[str] = []  # datasets this run made, as /data paths
         self.made_volumes: list[str] = []
@@ -409,7 +411,7 @@ class Suite:
         work = self.scratch / run_id
         logs = self.results / "logs" / run_id
         logs.mkdir(parents=True, exist_ok=True)
-        work.mkdir(parents=True, exist_ok=True)
+        self.runtime.owned_path(str(work)).mkdir(parents=True)
         ctx = Context(self.runtime, self.root, work, logs, self.data, plan.mounts, self.args.timeout_s,
                       {**self.settings, "QUERY_TIMEOUT_S": str(self.args.query_timeout_s)}, run_id, plan.small)
         ctx.services = tuple(plan.services)
@@ -488,12 +490,18 @@ class Suite:
         except Exception as e:  # a system that fails mustn't stop the suite
             self.emit(base, task="load" if endpoint is None else "serve", status="failed", note=str(e)[:300])
         finally:
-            peak = system.stop(ctx)
-            if endpoint is not None and peak is not None:
-                self.emit(base, task="serve", peak_mib=peak, note="server peak over the run")
-            if store is not None:
-                self.runtime.remove_store(store)
-            shutil.rmtree(work, ignore_errors=True)
+            def stop():
+                peak = system.stop(ctx)
+                if endpoint is not None and peak is not None:
+                    self.emit(base, task="serve", peak_mib=peak, note="server peak over the run")
+
+            self.runtime.attempt(stop)
+            # The runtime also owns interrupted loaders and partially started servers.
+            self.runtime.cleanup()
+            if not self.runtime.workers():
+                if store is not None and (self.args.dry_run or store in self.runtime.created_stores):
+                    self.runtime.attempt(self.runtime.remove_store, store)
+                self.runtime.attempt(lambda: shutil.rmtree(self.runtime.owned_path(str(work))))
 
     def external(self, ctx: Context, plan, key: str, endpoint: Endpoint, base: dict, run: int):
         """A benchmark's own driver (Plan.external) against the endpoint; its rows as ours."""
@@ -808,6 +816,8 @@ class Suite:
                 shift = (run - 1) % max(1, len(runnable))
                 for key, system, regime in runnable[shift:] + runnable[:shift]:
                     self.cycle(plan, key, system, regime, run)
+                    if self.runtime.workers():
+                        return 1
         self.cross_check()
         self.report_skips()
         self.say(f"\nresults: {self.writer.path}")
@@ -838,19 +848,29 @@ class Suite:
         """What this run made goes: containers, stores, scratch; and unless kept for a
         batch, datasets, build volumes and images (installed tools stay)."""
         self.runtime.cleanup()
-        shutil.rmtree(self.scratch, ignore_errors=True)
+        if self.args.dry_run and self.results.exists() and self.results == self.scratch / "dry-run-results":
+            self.runtime.attempt(shutil.rmtree, self.runtime.owned_path(str(self.results)))
+        if self.scratch.exists() and not self.runtime.workers() and not self.runtime.created_stores:
+            self.runtime.attempt(self.scratch.rmdir)
         if self.args.dry_run:
             return
-        if not self.keep:
+        if not self.keep and not self.runtime.workers():
+            def checked(command):
+                run_quiet(command).check_returncode()
+
             if self.made_files and self.data_volume and self.data_volume not in self.made_volumes:
-                run_quiet(["docker", "run", "--rm", "-v", f"{self.data_volume}:/data", "alpine", "rm", "-f",
-                           *self.made_files])
-            for volume in self.made_volumes:
-                run_quiet(["docker", "volume", "rm", "-f", volume])
+                if self.runtime.attempt(checked, ["docker", "run", "--rm", "-v", f"{self.data_volume}:/data",
+                                                 "alpine", "rm", "-f", "--", *self.made_files]):
+                    self.made_files.clear()
+            for volume in list(self.made_volumes):
+                if self.runtime.attempt(DockerRuntime.remove_resource, self.runtime, "volume", volume):
+                    self.made_volumes.remove(volume)
+                    if volume == self.data_volume:
+                        self.made_files.clear()
             if not self.tools_installed:
-                for image in self.made_images:
-                    run_quiet(["docker", "image", "rm", image])
-        self.made_files, self.made_volumes, self.made_images = [], [], []
+                for image in list(self.made_images):
+                    if self.runtime.attempt(checked, ["docker", "image", "rm", image]):
+                        self.made_images.remove(image)
 
 
 def images(argv: list[str], systems: dict, root: Path) -> int:
@@ -879,17 +899,33 @@ def main(argv: list[str], systems: dict, workloads: dict, root: Path) -> int:
         suite.manifest = Manifest(suite.results, root, argv, args, args.runtime, suite.settings)
     atexit.register(suite.cleanup)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-    code = None
+    code = 1
     try:
         code = suite.run()
-        return code
     except KeyboardInterrupt:
         print("\ninterrupted: cleaning up", file=sys.stderr)
         code = 130
-        return code
+    except SystemExit as error:
+        code = error.code if isinstance(error.code, int) else 1 if error.code else 0
+        if code:
+            raise
     finally:
         if suite.answers:
-            print(f"answers: {suite.answers.write()}")
+            suite.runtime.attempt(lambda: print(f"answers: {suite.answers.write()}"))
+        suite.runtime.attempt(suite.cleanup)
+        atexit.unregister(suite.cleanup)
+        if suite.runtime.cleanup_errors and code == 0:
+            code = 1
         if suite.manifest:
-            suite.manifest.finish(code)
-        suite.cleanup()
+            def record_cleanup():
+                suite.manifest.update(cleanup={"errors": suite.runtime.cleanup_errors,
+                                              "residuals": {**suite.runtime.residuals(),
+                                                            "scratch": str(suite.scratch) if suite.scratch.exists() else None,
+                                                            "files": suite.made_files, "volumes": suite.made_volumes,
+                                                            "images": suite.made_images}})
+
+            if not suite.runtime.attempt(record_cleanup) and code == 0:
+                code = 1
+            if not suite.runtime.attempt(suite.manifest.finish, code) and code == 0:
+                code = 1
+    return code
