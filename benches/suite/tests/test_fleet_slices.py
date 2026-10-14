@@ -11,7 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "benches/suite"))
@@ -42,13 +42,15 @@ class Scopes(unittest.TestCase):
             spec = runtime.Spec("nrese", None, ["/bin/true"], memory="1g")
             ended = []
             with patch.object(runtime, "end_scope", ended.append), \
-                    patch.object(runtime.RootfsRuntime, "popen", lambda self, argv, spec, log: None), \
+                    patch.object(runtime.RootfsRuntime, "popen", lambda self, argv, spec, log: Mock(pid=123)), \
+                    patch.object(runtime.RootfsRuntime, "kill"), \
+                    patch.object(runtime.os, "killpg", side_effect=ProcessLookupError, create=True), \
                     patch.object(runtime, "reap", lambda process, timeout: (0, None)), \
                     patch.object(runtime.RootfsRuntime, "peak", lambda self, spec: None):
-                rt.argv(spec)
-                unit = rt.units["nrese"]
                 rt.run(spec, Path(tmp) / "log", 10)
-            self.assertEqual(ended, [unit])
+            self.assertEqual(len(ended), 1)
+            self.assertTrue(ended[0].startswith("nrese-nrese-"))
+            self.assertFalse(rt.cleanup_errors)
             self.assertNotIn("nrese", rt.units)
 
 
