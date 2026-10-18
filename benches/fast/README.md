@@ -8,6 +8,15 @@ path it must take, and records its time and peak memory under a memory cap. A ru
 compared with an earlier one on the same host beyond a confidence interval, so a
 regression or a win shows at once.
 
+Each measured invocation uses the case's `timeout_s` in Docker and native runtimes:
+omitted means 900 seconds, explicit `0` means unlimited. For perf_lab this includes the
+first invocation's setup; repeats and sweep entries each get that limit. Every launched
+process leaves an observation in the record (its sweep position, repeat and cache mode, exit
+status, samples, counters, peaks and checks), so a failed or partial process is kept as
+evidence and the last process can't hide an earlier one. Natively, a case's scope is ended
+after its command (nothing it started outlives it); a scope that can't be verified gone
+fails the case.
+
 ```sh
 python benches/fast/fast.py list                          the cases: area, semantics, comparators
 python benches/fast/fast.py build                         perf lab, DL tools and server, Linux, capped

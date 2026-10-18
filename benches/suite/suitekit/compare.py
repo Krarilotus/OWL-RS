@@ -8,9 +8,14 @@ order, so that nothing lost hides behind a time:
    complete before and incomplete now, and known issues with their checked values and
    their run past the limit.
 3. **Time:** what got slower or faster beyond the thresholds; work counters; throughput.
-4. **Memory, by kind:** peaks compared only with peaks of their kind (`cgroup`, the
-   container's `memory.peak`; `lifetime`, a process's peak resident memory; `sampled`,
-   readings about a second apart; `phase`, a peak reset at each phase).
+4. **Memory, by kind:** peaks compared only with peaks of their kind, and only kinds that
+   measure memory in use, never cache (the owner's decision, 13 Oct 2026): `lifetime`, a
+   process's peak resident memory (NRESE's own A/Bs); `anon-kernel`, a container's or
+   scope's anonymous plus kernel memory from memory.stat, sampled (cross-system: a contender
+   runs several processes in its container); `sampled`, `docker stats` readings about a
+   second apart; `phase`, a peak reset at each phase. `cgroup`, the cgroup's `memory.peak`,
+   counts the page cache its reads were charged (rl-lubm100: 2.3 GB of 4.7 by what the host
+   had cached): recorded, never compared.
 5. **Disk:** store sizes.
 
     suite.py compare BASE NEW [--min-ms 2] [--threshold 0.10] [--systems S] [--include-restricted]
@@ -137,6 +142,41 @@ def bootstrap_ratio(base: list[dict], new: list[dict], rounds: int = 1000, seed:
     return point, ratios[int(0.025 * rounds)], ratios[int(0.975 * rounds) - 1]
 
 
+def strict_comparison(base: list[dict], new: list[dict], *, higher: bool = False,
+                      deterministic: bool = False) -> dict:
+    """Zero-margin release evidence; process repetitions remain the outer bootstrap unit.
+
+    Overlap (including identical observed timings) is inconclusive, never equivalence.
+    Exact deterministic counts may be unchanged; zero timing denominators are unqualified.
+    """
+    result = {"verdict": "incomplete", "ratio": None, "ci": None,
+              "processes": [len(base), len(new)], "higher_is_better": higher}
+    if min(len(base), len(new)) < 2 or not all(valid_series(r) for r in base + new):
+        return result
+    if any(set(r) != {"value"} for r in base + new):
+        return result
+    b, n = ([v for r in side for v in r["value"]] for side in (base, new))
+    result.update(base=statistics.median(b), new=statistics.median(n))
+    if deterministic and len(set(b)) == len(set(n)) == 1:
+        change = (n[0] > b[0]) - (n[0] < b[0])
+        result.update(verdict="unchanged" if not change else
+                      "regression" if (change < 0 if higher else change > 0) else "win",
+                      ratio=n[0] / b[0] if b[0] else None)
+        return result
+    if min(b) <= 0:
+        return result
+    # Keep positive tiny measurements clear of the legacy bootstrap denominator floor.
+    scale = min(b)
+    base, new = ([{"value": [v / scale for v in r["value"]]} for r in side] for side in (base, new))
+    point, low, high = bootstrap_ratio(base, new)
+    if not all(math.isfinite(v) for v in (point, low, high)):
+        return result
+    result.update(ratio=point, ci=[low, high], verdict=
+                  "regression" if (high < 1 if higher else low > 1) else
+                  "win" if (low > 1 if higher else high < 1) else "inconclusive")
+    return result
+
+
 def counter_changes(base: dict, new: dict) -> tuple[bool, list[str]]:
     """Whether a work counter grew beyond 2 %, and a note per changed counter. A counter
     whose repetitions differ within one run is not deterministic and isn't judged."""
@@ -224,12 +264,25 @@ def perf_lab_report(report: dict) -> dict:
         "checks": [], "routes": []}]}
 
 
+def valid_series(samples: dict) -> bool:
+    return bool(isinstance(samples, dict) and samples and all(isinstance(vs, list) and vs and
+                all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in vs) for vs in samples.values()))
+
+
+def complete_timing(*entries: dict, series=None) -> bool:
+    reps = [rep for e in entries for rep in e["reps"]]
+    return bool(reps and all(len(e["reps"]) == len(e["status"]) == len(e["metrics"]) for e in entries)
+                and all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for e in entries for v in e["metrics"])
+                and all(valid_series(rep) and set(rep) == set(series if series is not None else reps[0]) for rep in reps))
+
+
 def pooled(report: dict) -> dict[str, dict]:
     """Per case: its samples per repetition, statuses, peak memory, the metric per repetition."""
     out: dict[str, dict] = {}
     for r in report["records"]:
         entry = out.setdefault(r["case"], {"reps": [], "status": [], "peaks": [], "metrics": [],
-                                           "counters": {}, "phase_peaks": {}, "qps": [], "client_case": False,
+                                           "counters": {}, "phase_peaks": {}, "qps": [], "client_peaks": [],
+                                           "cache_peaks": [], "client_case": False,
                                            "expected": [], "invalid": False, "expected_reps": report.get("reps", 0),
                                            "checks": {}, "frontiers": [], "answers": {}, "memory_kind": set()})
         entry["expected"].append(r.get("expected_outcome", "ok"))
@@ -243,12 +296,13 @@ def pooled(report: dict) -> dict[str, dict]:
         entry["client_case"] |= ("throughput" in r or "clients" in raw or "client_sweep" in raw
                                  or r["case"] in ("clients-lookups", "clients-sweep")
                                  or any(s.endswith(" clients p99") for s in r.get("samples", {})))
-        widths = {}
+        widths, client_peaks = {}, {}
         for level in levels or []:
             width = str(level.get("clients"))
             # A duplicate in this repetition must not replace a missing observation
             # in another repetition. Keep invalid observations explicitly missing.
             widths[width] = None if width in widths else level.get("qps")
+            client_peaks[width] = None if width in client_peaks else level.get("peak_mib")
         raw_levels = raw.get("client_sweep") or ([raw["clients"]] if raw.get("clients") else [])
         for level in raw_levels:
             widths.setdefault(str(level.get("clients")), None)
@@ -256,6 +310,8 @@ def pooled(report: dict) -> dict[str, dict]:
             if match := re.fullmatch(r"(\d+) clients p99", series):
                 widths.setdefault(match[1], None)
         entry["qps"].append(widths)
+        entry["client_peaks"].append(client_peaks)
+        entry["cache_peaks"].append(r.get("cache_peaks") or {})
         for path, value in (r.get("counters") or {}).items():
             entry["counters"].setdefault(path, []).append(value)
         for phase, peak in (r.get("phase_peaks") or {}).items():
@@ -284,6 +340,10 @@ def pooled(report: dict) -> dict[str, dict]:
         if any(samples.values()):
             entry["reps"].append(samples)
     return out
+
+
+# Kinds that count page cache: recorded beside a peak, never compared.
+CACHE_KINDS = {"cgroup"}
 
 
 def kind_of(entry: dict) -> str:
@@ -341,11 +401,7 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
                         f"{','.join(sorted(sb))} -> {','.join(sorted(sn))}, metric {mb} -> {mn}, peak {pb} -> {pn} MiB"
                         + ("  WORSE" if worse else ""), worse)
             continue
-        shapes = [set(rep) for e in (b, n) for rep in e["reps"]]
-        if (any(len(e["reps"]) != len(e["status"]) for e in (b, n)) or not shapes
-                or not shapes[0] or any(s != shapes[0] for s in shapes)
-                or any(not vs or any(not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0 for v in vs)
-                       for e in (b, n) for rep in e["reps"] for vs in rep.values())):
+        if not complete_timing(b, n):
             out.add("Missing", f"{case:<26} NOT COMPARABLE: missing/invalid timing series or repetitions", True)
             continue
         ratio, low, high = bootstrap_ratio(b["reps"], n["reps"])
@@ -395,7 +451,10 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
         # A peak counts beyond either side's spread of peaks too, as a time beyond its spread.
         memory_spread = max(peak_spread(b["peaks"]), peak_spread(n["peaks"]))
         if bp and np_:
-            if "unknown" not in (bk, nk) and bk != nk:
+            if CACHE_KINDS & {bk, nk}:
+                out.add("Memory, by kind", f"{case:<26} peak {bp} ({bk}) -> {np_} ({nk}) MiB: counts page cache, "
+                        "recorded, not compared", False)
+            elif "unknown" not in (bk, nk) and bk != nk:
                 out.add("Memory, by kind", f"{case:<26} peak {bp} ({bk}) -> {np_} ({nk}) MiB: other kinds, not compared",
                         True)
             elif memory_spread > UNSTABLE_PEAK:
@@ -603,7 +662,10 @@ def compare_pairs(base: dict[tuple, Pair], new: dict[tuple, Pair], threshold: fl
                 task = metric.split()[0]
                 kb = kinds[0].get((*key, task), "unknown")
                 kn = kinds[1].get((*key, task), "unknown")
-                if "unknown" not in (kb, kn) and kb != kn:
+                if CACHE_KINDS & {kb, kn}:
+                    out.add("Memory, by kind", f"- {title}: {task} peak MiB ({kb} -> {kn}): counts page cache, "
+                            "recorded, not compared", False)
+                elif "unknown" not in (kb, kn) and kb != kn:
                     out.add("Memory, by kind", f"- {title}: {task} peak MiB ({kb} -> {kn}): other kinds, not compared",
                             True)
                 else:
