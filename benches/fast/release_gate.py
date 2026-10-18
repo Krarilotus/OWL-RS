@@ -598,7 +598,8 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, passes_per_si
     small = bool(cases)
     out = {f"{prefix}-build": {
         "id": f"{prefix}-build", "group": "release", "kind": "owlrs.build", "priority_class": "merge-gate",
-        "est_min": 20 if small else 100, "env": env,
+        # About 25 minutes a revision's build (skipped when its verified binaries are there).
+        "est_min": 25 * len(dict.fromkeys([base, main, candidate, harness])) + (10 if small else 30), "env": env,
         "steps": [[*gate, "build", rev] for rev in dict.fromkeys([base, main, candidate, harness])]
         + [[*gate, "prepare", harness]],
         "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": 12}, "inputs": source}}
