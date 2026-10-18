@@ -67,7 +67,7 @@ SELECT ?s ?o ?score WHERE {
 
 | Predicate | Object |
 |---|---|
-| `bds:search` | the words (a literal); a word ending in `*` matches as a prefix; words in double quotes are a phrase, matching the literals that hold them in sequence (`"\"quick brown\" fox"`); `-word` excludes the literals that have it; `word~` (two edits) or `word~1` matches words within that many insertions, deletions, substitutions or transpositions; case doesn't matter |
+| `bds:search` | the words (a literal); a word ending in `*` matches as a prefix; words in double quotes are a phrase, matching the literals that hold them in sequence (`"\"quick brown\" fox"`); `-word` excludes the literals that have it; `word~` or `word~2` permits two edits, `word~1` one, and `word~0` exact spelling, including when stemming is enabled; edits are insertions, deletions, substitutions or transpositions; case doesn't matter |
 | `bds:relevance` | a variable: an `xsd:double` in (0, 1], the best match 1 (BM25, normalised) |
 | `bds:rank` | a variable: the rank by relevance, from 1 |
 | `bds:matchAllTerms "true"` | every word must occur (else any) |
@@ -76,6 +76,10 @@ SELECT ?s ?o ?score WHERE {
 | `bds:stem "en"` | words match by their Snowball stem in that language, phrases too: `"connect"` finds *connected*, *connection*, *connecting* (an NRESE extension; Blazegraph ignores it). Languages: ar, da, de, el, en, es, fi, fr, hu, it, nl, no, pt, ro, ru, sv, ta, tr |
 
 The matched literal (the subject) is a simple or language-tagged string that is the object of a statement in the graph the pattern reads. Words are runs of letters and digits. The index is built in memory at the first search and extended with new literals at later searches; a durable store writes it to `derived/` of its data directory after each checkpoint and reads it back at the first search after a restart, so it isn't built again. Searches start the pattern's joins.
+
+Malformed fuzzy suffixes, distances outside 0–2, negated phrases or fuzzy/prefix
+terms, unclosed phrases and wildcards other than one trailing `*` are request
+errors, including on an empty store.
 
 The same index answers **Jena's `text:query`** (what Fuseki clients send) and **GraphDB's legacy `luc:` predicates**:
 
@@ -89,7 +93,16 @@ PREFIX luc: <http://www.ontotext.com/owlim/lucene#>
 SELECT ?x ?score WHERE { ?x luc:myIndex "tower bridge" ; luc:score ?score }
 ```
 
-`text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals and `"lang:xx"`. Without a property, a literal matches as the object of any property. `luc:` takes any index name (there is one index, over every string literal) and finds the resources with a matching literal. Query strings are read as Lucene's syntax as far as this index goes: words, phrases, `word*`, fuzzy `word~` and `word~1`, `AND` (every word needed, else any), `NOT` and `-` (the word is excluded; a phrase after them is dropped); `OR`, `+`, field names and boosts (`^`) are dropped. Scores are the relevance above, not Lucene's.
+`text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals and `"lang:xx"`. Without a property, a literal matches as the object of any property. Cyclic or malformed RDF argument/output lists return request errors.
+
+`luc:` takes any index name (there is one native index over every string literal)
+and finds resources with a matching literal. Jena and `luc:` query strings accept
+words, phrases, `word*`, fuzzy terms as above, flat `AND`/`&&` or `OR`/`||` groups,
+and plain-word exclusions using `NOT` or `-`. Unconnected positive terms mean OR.
+Mixed Boolean modes, parentheses, required clauses (`+`), field names, boosts,
+negated phrases and other unsupported syntax return request errors; they are
+not silently removed. Punctuation inside a phrase is tokenized as ordinary text.
+Scores are the relevance above, not Lucene's.
 
 **Vector similarity search** through a virtual `SERVICE`: the vectors are literals of the datatype `nrv:vector` (`"[0.12, -0.5, 0.33]"^^nrv:vector`, numbers as in a JSON array; what embedding services return), and the search finds the nearest ones:
 
@@ -321,7 +334,7 @@ Every error is an `application/problem+json` document (RFC 9457), whoever answer
 | `/version` | Build, enabled surfaces, reasoning semantics |
 | `/dataset/service-description` | SPARQL service description (Turtle); it names every endpoint above |
 | `/dataset/info` | Statement and graph counts |
-| `/dataset/autocomplete?q=…` | Resources whose labels' words or local names' words begin with the words of `q`, best first: `{"suggestions": [{"iri", "label", "score"}]}`. Labels are the values of `rdfs:label`, `skos:prefLabel`, `skos:altLabel`, `foaf:name`, `schema:name`, `dcterms:title` and `dc:title`; local names are split at camel case and punctuation. `limit` (default 10, at most 1000), `infer=false` for asserted statements only. The indexes are built at the first use |
+| `/dataset/autocomplete?q=…` | Resources whose labels' words or local names' words begin with the words of `q`, best first: `{"suggestions": [{"iri", "label", "score"}]}`. Input is plain typed text: punctuation separates words and never introduces search operators. Labels are the values of `rdfs:label`, `skos:prefLabel`, `skos:altLabel`, `foaf:name`, `schema:name`, `dcterms:title` and `dc:title`; local names are split at camel case and punctuation. `limit` (default 10, at most 1000), `infer=false` for asserted statements only. The indexes are built at the first use |
 | `/dataset/tell` | Adds an RDF payload to a graph (`POST`) |
 | `/metrics` | Prometheus metrics (below) |
 | `/console`, `/ops` | User console, operator UI |

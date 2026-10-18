@@ -16,8 +16,9 @@
 //! Its words find the candidates in the index; each is checked against its text.
 //!
 //! A word after `-` is excluded: literals that have it don't match. A word ending in `~`
-//! (or `~1`, `~2`) matches the indexed words within that many edits (insertions, deletions,
-//! substitutions, transpositions; `~` is two), as Lucene's fuzzy queries do.
+//! (or `~0`, `~1`, `~2`) matches the indexed words within that many edits (insertions,
+//! deletions, substitutions, transpositions; `~` is two). `~0` uses exact spelling even
+//! with stemming. Malformed or unsupported operators return `EngineError::InvalidTextQuery`.
 //!
 //! With a stemming language ([`TextQuery::stem`]), words match by their Snowball stem
 //! (`connected` finds `connection` and `connecting`), phrases too. The index keeps the
@@ -30,7 +31,11 @@ use std::collections::{BTreeMap, HashMap};
 use rayon::prelude::*;
 use rust_stemmers::{Algorithm, Stemmer};
 
-/// What to search for.
+use crate::{EngineError, EngineResult};
+
+/// What to search for. Search methods return `EngineError::InvalidTextQuery` for
+/// unsupported or malformed operators, including on an empty index. Use
+/// [`Self::plain_prefix`] for typed text whose punctuation must not introduce operators.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextQuery {
     /// The words to find; a word ending in `*` matches every word it starts, and words in
@@ -43,6 +48,18 @@ pub struct TextQuery {
     /// Match words by their stem in this language (ISO 639-1: `en`, `de`, `fr`, ...;
     /// [`stemmer`] lists them). `None`, or a language without a stemmer: as written.
     pub stem: Option<String>,
+}
+
+impl TextQuery {
+    /// Plain typed words, all matched as prefixes; punctuation never introduces operators.
+    pub fn plain_prefix(text: &str) -> Self {
+        Self {
+            text: word_slices(text).collect::<Vec<_>>().join(" "),
+            all_words: true,
+            prefix: true,
+            stem: None,
+        }
+    }
 }
 
 /// The Snowball stemmer for `language` (an ISO 639-1 code, a region after `-` ignored).
@@ -149,9 +166,12 @@ pub(crate) fn local_name_text(iri: &str) -> Option<String> {
 
 /// The words of `text`: maximal runs of letters and digits, lower-cased.
 pub fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+    word_slices(text).map(str::to_lowercase)
+}
+
+fn word_slices(text: &str) -> impl Iterator<Item = &str> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
 }
 
 /// Words go into shards by their first byte, so that a build fills the shards in parallel
@@ -488,6 +508,7 @@ impl TextIndex {
         stems: Option<(&Stemmer, &Stems)>,
     ) -> Cow<'_, [(u64, u16)]> {
         let lists: Vec<&Postings> = match (matching, stems) {
+            (Match::Fuzzy(0), _) => self.shards[shard_of(word)].get(word).into_iter().collect(),
             (Match::Fuzzy(edits), _) => self
                 .shards
                 .iter()
@@ -542,13 +563,8 @@ impl TextIndex {
         &self,
         query: &TextQuery,
         text_of: &dyn Fn(u64) -> Option<String>,
-    ) -> Vec<TextMatch> {
+    ) -> EngineResult<Vec<TextMatch>> {
         let documents = self.documents as f64;
-        if documents == 0.0 {
-            return Vec::new();
-        }
-        let average = self.total_words as f64 / documents;
-        let (k1, b) = (1.2, 0.75);
         // Stemming, where the language has a stemmer and its stems are prepared.
         let stemming = query
             .stem
@@ -566,6 +582,10 @@ impl TextIndex {
         let mut terms: Vec<(String, Match)> = Vec::new();
         let mut excluded: Vec<String> = Vec::new();
         let mut phrases: Vec<Vec<String>> = Vec::new();
+        let invalid = |message: &str| EngineError::InvalidTextQuery(message.to_owned());
+        if !query.text.matches('"').count().is_multiple_of(2) {
+            return Err(invalid("unclosed phrase"));
+        }
         for (i, part) in query.text.split('"').enumerate() {
             if i % 2 == 1 {
                 let phrase: Vec<String> = words(part).collect();
@@ -577,13 +597,34 @@ impl TextIndex {
                 continue;
             }
             for raw in part.split_whitespace() {
+                if raw == "*"
+                    || raw.contains('?')
+                    || raw.trim_end_matches('*').contains('*')
+                    || raw.ends_with("**")
+                {
+                    return Err(invalid("only a trailing prefix wildcard is supported"));
+                }
+                if raw == "-" || raw.starts_with("--") {
+                    return Err(invalid("negation requires a plain word"));
+                }
                 if let Some(rest) = raw.strip_prefix('-').filter(|rest| !rest.is_empty()) {
+                    if rest.contains(['*', '~', '?']) {
+                        return Err(invalid("negation supports plain words only"));
+                    }
                     excluded.extend(words(rest));
                     continue;
                 }
                 let (raw, matching) = match raw.split_once('~') {
                     Some((word, edits)) => {
-                        let edits = edits.parse::<u8>().unwrap_or(2).min(2);
+                        if !word.chars().any(char::is_alphanumeric) || word.contains(['*', '?']) {
+                            return Err(invalid("fuzziness requires a plain word"));
+                        }
+                        let edits = match edits {
+                            "" | "2" => 2,
+                            "1" => 1,
+                            "0" => 0,
+                            _ => return Err(invalid("fuzzy distance must be 0, 1 or 2")),
+                        };
                         (word, Match::Fuzzy(edits))
                     }
                     None if query.prefix || raw.ends_with('*') => (raw, Match::Prefix),
@@ -596,9 +637,11 @@ impl TextIndex {
                 }
             }
         }
-        if terms.is_empty() && phrases.is_empty() {
-            return Vec::new();
+        if documents == 0.0 || (terms.is_empty() && phrases.is_empty()) {
+            return Ok(Vec::new());
         }
+        let average = self.total_words as f64 / documents;
+        let (k1, b) = (1.2, 0.75);
         // Per literal: its score, and how many of the query's terms it has.
         let mut scores: HashMap<u64, (f64, usize)> = HashMap::new();
         let bm25 = |list: &[(u64, u16)], out: &mut HashMap<u64, f64>| {
@@ -693,7 +736,7 @@ impl TextIndex {
                 .total_cmp(&a.relevance)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        matches
+        Ok(matches)
     }
 }
 
@@ -726,15 +769,17 @@ mod tests {
         let index = index(&texts);
         let text_of = |id: u64| texts.get(id as usize).map(|t| (*t).to_owned());
         let query = |text: &str, all_words: bool, prefix: bool| {
-            index.search(
-                &TextQuery {
-                    text: text.to_owned(),
-                    all_words,
-                    prefix,
-                    stem: None,
-                },
-                &text_of,
-            )
+            index
+                .search(
+                    &TextQuery {
+                        text: text.to_owned(),
+                        all_words,
+                        prefix,
+                        stem: None,
+                    },
+                    &text_of,
+                )
+                .unwrap()
         };
         // A phrase: its words in sequence (punctuation between words doesn't count).
         assert_eq!(ids(&query("\"quick brown\"", false, false)), [0]);
@@ -784,21 +829,24 @@ mod tests {
         assert!(index.stems_ready("en-GB"));
         assert!(index.stems_ready("xx"));
         let query = |index: &TextIndex, text: &str, stem: Option<&str>| {
-            let mut found = ids(&index.search(
-                &TextQuery {
-                    text: text.to_owned(),
-                    all_words: false,
-                    prefix: false,
-                    stem: stem.map(str::to_owned),
-                },
-                &text_of,
-            ));
+            let mut found = ids(&index
+                .search(
+                    &TextQuery {
+                        text: text.to_owned(),
+                        all_words: false,
+                        prefix: false,
+                        stem: stem.map(str::to_owned),
+                    },
+                    &text_of,
+                )
+                .unwrap());
             found.sort_unstable();
             found
         };
         assert_eq!(query(&index, "connect", None), Vec::<u64>::new());
         assert_eq!(query(&index, "connect", Some("en")), [0, 1, 2]);
         assert_eq!(query(&index, "connections", Some("en")), [0, 1, 2]);
+        assert_eq!(query(&index, "connected~0", Some("en")), [0]);
         assert_eq!(query(&index, "\"connected system\"", Some("en")), [0]);
         assert_eq!(query(&index, "\"connecting systems\"", Some("en")), [0]);
         assert_eq!(
@@ -844,15 +892,17 @@ mod tests {
         let index = index(&texts);
         let text_of = |id: u64| texts.get(id as usize).map(|t| (*t).to_owned());
         let query = |text: &str| {
-            let mut found = ids(&index.search(
-                &TextQuery {
-                    text: text.to_owned(),
-                    all_words: false,
-                    prefix: false,
-                    stem: None,
-                },
-                &text_of,
-            ));
+            let mut found = ids(&index
+                .search(
+                    &TextQuery {
+                        text: text.to_owned(),
+                        all_words: false,
+                        prefix: false,
+                        stem: None,
+                    },
+                    &text_of,
+                )
+                .unwrap());
             found.sort_unstable();
             found
         };
@@ -863,6 +913,7 @@ mod tests {
         // Two edits: `quickly` (two letters more) and `duck` too.
         assert_eq!(query("quick~"), [0, 2, 3]);
         assert_eq!(query("quick~0"), [0]);
+        assert_eq!(query("quick~2"), query("quick~"));
         assert_eq!(query("quik~1"), [0]);
         assert!(within_edits("kitten", "sitting", 3));
         assert!(!within_edits("kitten", "sitting", 2));
@@ -909,8 +960,8 @@ mod tests {
                 prefix: false,
                 stem: None,
             };
-            let a = parallel.search(&query, &text_of);
-            let b = sequential.search(&query, &text_of);
+            let a = parallel.search(&query, &text_of).unwrap();
+            let b = sequential.search(&query, &text_of).unwrap();
             assert!(!a.is_empty(), "{text}");
             assert_eq!(a, b, "{text}");
         }

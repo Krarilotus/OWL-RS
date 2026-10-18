@@ -39,13 +39,8 @@ pub(crate) fn autocomplete(
     model: ReadModel,
     typed: &str,
     limit: usize,
-) -> Vec<Suggestion> {
-    let query = TextQuery {
-        text: typed.to_owned(),
-        all_words: true,
-        prefix: true,
-        stem: None,
-    };
+) -> nrese_engine::EngineResult<Vec<Suggestion>> {
+    let query = TextQuery::plain_prefix(typed);
     let labels: Vec<TermId> = LABELS
         .iter()
         .filter_map(|iri| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into()))
@@ -66,6 +61,7 @@ pub(crate) fn autocomplete(
         || snapshot.text_search(&query),
         || snapshot.iri_search(&query),
     );
+    let (label_hits, name_hits) = (label_hits?, name_hits?);
     // Matches come best first: the first `limit` resources of each kind are its best.
     let mut from_labels = 0;
     for hit in label_hits {
@@ -133,5 +129,5 @@ pub(crate) fn autocomplete(
             .then_with(|| a.iri.cmp(&b.iri))
     });
     suggestions.truncate(limit);
-    suggestions
+    Ok(suggestions)
 }

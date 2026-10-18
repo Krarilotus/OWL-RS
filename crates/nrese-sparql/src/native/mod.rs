@@ -2399,7 +2399,8 @@ impl<'a> Context<'a> {
             return self.filter_bound(result, filters);
         }
         // Full-text searches start the joins (`search`).
-        if let Some((searches, rest)) = search::split(triples) {
+        if let Some(searches) = search::split(triples) {
+            let (searches, rest) = searches?;
             let mut result = Solutions::unit();
             for search in &searches {
                 let start = Instant::now();
