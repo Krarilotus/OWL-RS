@@ -402,12 +402,15 @@ impl Drop for Decoded {
     }
 }
 
-/// The ids of the first `limit` entries of a compressed base whose text passes `test`,
-/// sorted: decoded a slice of entries at a time, each slice searched as a plain arena.
-fn decoded_matching(base: &Base, limit: u64, test: &super::StringTest<'_>) -> Vec<TermId> {
-    use rayon::prelude::*;
-    const SLICE: u64 = 1 << 16;
-    let entries = base.len.min(limit);
+/// Entries `first..last` of a compressed base searched by `matcher`: decoded, then
+/// searched as a plain arena (see [`super::strings::Matcher::slice`]).
+fn decoded_slice(
+    base: &Base,
+    matcher: &super::strings::Matcher<'_>,
+    test: &super::StringTest<'_>,
+    (first, last): (usize, usize),
+    out: &mut Vec<TermId>,
+) -> u64 {
     let codec = base.codec.as_ref().expect("a compressed base");
     // The tag byte is stored plain: keys of kinds the test doesn't read aren't decoded
     // (their tag alone stays, which the test rejects).
@@ -421,26 +424,26 @@ fn decoded_matching(base: &Base, limit: u64, test: &super::StringTest<'_>) -> Ve
             _ => false,
         },
     };
-    let mut ids: Vec<TermId> = (0..entries.div_ceil(SLICE))
-        .into_par_iter()
-        .flat_map_iter(|slice| {
-            let (first, last) = (slice * SLICE, ((slice + 1) * SLICE).min(entries));
-            let mut bytes = Vec::with_capacity(64 * (last - first) as usize);
-            let mut ends = Vec::with_capacity((last - first) as usize);
-            for index in first..last {
-                let stored = base.key(index);
-                match stored.first() {
-                    Some(&tag) if wanted(tag) => codec.decompress(stored, &mut bytes),
-                    Some(&tag) => bytes.push(tag),
-                    None => {}
-                }
-                ends.push(bytes.len() as u64);
-            }
-            super::strings::matching(&bytes, &ends[..], first, u64::MAX, test)
-        })
-        .collect();
-    ids.sort_unstable();
-    ids
+    let mut bytes = Vec::with_capacity(64 * (last - first));
+    let mut ends = Vec::with_capacity(last - first);
+    for index in first..last {
+        let stored = base.key(index as u64);
+        match stored.first() {
+            Some(&tag) if wanted(tag) => codec.decompress(stored, &mut bytes),
+            Some(&tag) => bytes.push(tag),
+            None => {}
+        }
+        ends.push(bytes.len() as u64);
+    }
+    matcher.slice(&bytes, &ends[..], (0, last - first), first as u64, out)
+}
+
+/// A slice of the dictionary for a string scan: entries `.1` of one arena.
+enum Part<'i> {
+    Base(&'i Base, (usize, usize)),
+    Heap(&'i Heap, (usize, usize)),
+    /// Shard `.1` of a bulk load's terms.
+    Shard(&'i Adopted, usize, (usize, usize)),
 }
 
 /// Heap entry `local` (counted from the end of the base).
@@ -1016,8 +1019,18 @@ impl Dictionary {
     }
 
     /// The ids of the entries `0..limit` whose text passes `test`, sorted: one parallel
-    /// substring search over the arena ([`super::strings`]).
+    /// substring search over the arenas ([`super::strings`]).
     pub fn matching_strings(&self, test: &super::StringTest<'_>, limit: u64) -> Vec<TermId> {
+        self.matching_strings_scan(test, limit).0
+    }
+
+    /// [`Self::matching_strings`], and what its scan did: every arena's slices (a bulk
+    /// load's 256 shards' too) in one parallel loop, with searchers built once.
+    pub fn matching_strings_scan(
+        &self,
+        test: &super::StringTest<'_>,
+        limit: u64,
+    ) -> (Vec<TermId>, super::StringScan) {
         // A prefix: a range of the text order, where it is at hand.
         if matches!(
             test.placement,
@@ -1029,11 +1042,14 @@ impl Dictionary {
             return self.prefix_matches(test, limit);
         }
         let inner = self.inner.read();
-        let mut ids = match &inner.base {
-            Some(base) if base.codec.is_some() => decoded_matching(base, limit, test),
-            Some(base) => super::strings::matching(&base.arena, &base.offsets, 0, limit, test),
-            None => Vec::new(),
-        };
+        let below = |start: u64, count: usize| (limit.saturating_sub(start) as usize).min(count);
+        let mut arenas = 0;
+        let mut parts: Vec<Part<'_>> = Vec::new();
+        if let Some(base) = &inner.base {
+            arenas += 1;
+            let entries = below(0, base.len as usize);
+            parts.extend(super::strings::slices(entries).map(|s| Part::Base(base, s)));
+        }
         let heaps = inner
             .segments
             .iter()
@@ -1043,15 +1059,9 @@ impl Dictionary {
             })
             .chain([&inner.heap]);
         for heap in heaps {
-            if limit > heap.start {
-                ids.extend(super::strings::matching(
-                    &heap.bytes,
-                    &heap.ends[..],
-                    heap.start,
-                    limit - heap.start,
-                    test,
-                ));
-            }
+            arenas += 1;
+            let entries = below(heap.start, heap.ends.len());
+            parts.extend(super::strings::slices(entries).map(|s| Part::Heap(heap, s)));
         }
         // A bulk load's terms: each shard's arena, its entries numbered to their ids
         // (an entry that existed already shows under its own id too: deduplicated).
@@ -1063,20 +1073,38 @@ impl Dictionary {
                 continue;
             }
             for (s, shard) in adopted.shards.iter().enumerate() {
-                ids.extend(
-                    super::strings::matching(&shard.bytes, &shard.ends[..], 0, u64::MAX, test)
-                        .into_iter()
-                        .map(|found| {
-                            let id = adopted.id_of(s, found.payload() as usize);
-                            TermId::new(found.kind(), id)
-                        })
-                        .filter(|id| id.payload() < limit),
+                arenas += 1;
+                parts.extend(
+                    super::strings::slices(shard.len()).map(|slice| Part::Shard(adopted, s, slice)),
                 );
             }
         }
-        ids.sort_unstable();
-        ids.dedup();
-        ids
+        let matcher = super::strings::Matcher::new(test);
+        super::strings::scan(&matcher, arenas, &parts, |part, out| match *part {
+            Part::Base(base, slice) if base.codec.is_some() => {
+                decoded_slice(base, &matcher, test, slice, out)
+            }
+            Part::Base(base, slice) => matcher.slice(&base.arena, &base.offsets, slice, 0, out),
+            Part::Heap(heap, slice) => {
+                matcher.slice(&heap.bytes, &heap.ends[..], slice, heap.start, out)
+            }
+            Part::Shard(adopted, s, slice) => {
+                let shard = &adopted.shards[s];
+                let from = out.len();
+                let tested = matcher.slice(&shard.bytes, &shard.ends[..], slice, 0, out);
+                let mut kept = from;
+                for i in from..out.len() {
+                    let found = out[i];
+                    let id = adopted.id_of(s, found.payload() as usize);
+                    if id < limit {
+                        out[kept] = TermId::new(found.kind(), id);
+                        kept += 1;
+                    }
+                }
+                out.truncate(kept);
+                tested
+            }
+        })
     }
 
     /// Whether a prefix search is a few binary searches: the entries are in text order
@@ -1099,7 +1127,11 @@ impl Dictionary {
     }
 
     /// The entries below `limit` that pass `test`, a prefix test, from the text order.
-    fn prefix_matches(&self, test: &super::StringTest<'_>, limit: u64) -> Vec<TermId> {
+    fn prefix_matches(
+        &self,
+        test: &super::StringTest<'_>,
+        limit: u64,
+    ) -> (Vec<TermId>, super::StringScan) {
         let inner = self.inner.read();
         let key = |index: u64| inner.key(index);
         let needle = test.needle.as_bytes();
@@ -1118,13 +1150,17 @@ impl Dictionary {
             let (start, end) = super::order::prefix_range(&order.order, &key, needle);
             candidates.extend_from_slice(&order.order[start..end]);
         }
+        candidates.retain(|&index| index < limit);
+        let scan = super::StringScan {
+            keys_tested: candidates.len() as u64,
+            ..super::StringScan::default()
+        };
         let mut ids: Vec<TermId> = candidates
             .into_iter()
-            .filter(|&index| index < limit)
-            .filter_map(|index| super::strings::passes(&key(index), index, 0, test))
+            .filter_map(|index| super::strings::passes(&key(index), index, None, test))
             .collect();
         ids.sort_unstable();
-        ids
+        (ids, scan)
     }
 
     /// The text order of the entries `0..len` as checkpoint indices: the mapped base's
