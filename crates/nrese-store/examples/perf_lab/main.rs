@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run --release -p nrese-store --example perf_lab -- \
-//!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] \
+//!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] [--batch 1] \
 //!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
 //!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE]
 //!     [--shacl-report FILE] [--reason MODE]
@@ -17,7 +17,10 @@
 //!   After a load (and its reasoning) the planner's statistics are prepared before the
 //!   queries, as the server's load command does, timed apart (`statistics_ms`).
 //! - **Queries:** every `*.rq` in `--queries`, in name order. Each runs `--warmup` times
-//!   unmeasured, then `--runs` times measured. The result is serialised as the server
+//!   unmeasured, then `--runs` times measured; with `--batch K` each measured sample times K
+//!   executions back to back and reports their mean, in nanoseconds (a query of a few
+//!   microseconds, timed alone, is a few steps of the report's microsecond and its timer's
+//!   overhead). The result is serialised as the server
 //!   would (TSV for SELECT, JSON for ASK, N-Triples for CONSTRUCT/DESCRIBE) into a
 //!   counting sink, so evaluation, term decoding and serialisation are all included.
 //! - **Report:** rows, p50, min and max per query, peak memory (Linux), and a JSON file
@@ -186,6 +189,7 @@ struct Args {
     queries: PathBuf,
     runs: usize,
     warmup: usize,
+    batch: usize,
     timeout: Duration,
     only: Option<String>,
     label: String,
@@ -224,6 +228,7 @@ fn parse_args() -> Result<Args, String> {
         queries: PathBuf::new(),
         runs: 5,
         warmup: 1,
+        batch: 1,
         timeout: Duration::from_secs(120),
         only: None,
         label: "nrese".into(),
@@ -263,6 +268,7 @@ fn parse_args() -> Result<Args, String> {
             "--queries" => args.queries = value()?.into(),
             "--runs" => args.runs = value()?.parse().map_err(|e| format!("--runs: {e}"))?,
             "--warmup" => args.warmup = value()?.parse().map_err(|e| format!("--warmup: {e}"))?,
+            "--batch" => args.batch = value()?.parse().map_err(|e| format!("--batch: {e}"))?,
             "--timeout-s" => {
                 args.timeout =
                     Duration::from_secs(value()?.parse().map_err(|e| format!("--timeout-s: {e}"))?)
@@ -348,8 +354,8 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if args.runs == 0 || args.reason_runs == 0 {
-        return Err("--runs and --reason-runs must be > 0".into());
+    if args.runs == 0 || args.reason_runs == 0 || args.batch == 0 {
+        return Err("--runs, --reason-runs and --batch must be > 0".into());
     }
     Ok(args)
 }
@@ -384,10 +390,13 @@ struct Measured {
     faults: Vec<u64>,
 }
 
+/// Runs the query `executions` times back to back under one timeout: the rows of an execution
+/// and the mean time of one (`--batch`; 1 times a single execution).
 fn run_once(
     store: &StoreService,
     prepared: &PreparedQuery,
     timeout: Duration,
+    executions: usize,
 ) -> Result<(u64, Duration), String> {
     let token = CancellationToken::new();
     let canceller = {
@@ -404,7 +413,14 @@ fn run_once(
     };
     let mut sink = CountingSink::default();
     let started = Instant::now();
-    let result = store.run_query(prepared, &token, &mut sink);
+    let mut result = Ok(());
+    for _ in 0..executions {
+        sink = CountingSink::default();
+        result = store.run_query(prepared, &token, &mut sink).map(|_| ());
+        if result.is_err() {
+            break;
+        }
+    }
     let elapsed = started.elapsed();
     let _ = canceller.1.send(());
     let _ = canceller.0.join();
@@ -421,7 +437,7 @@ fn run_once(
         QueryResultKind::Boolean => 1,
         QueryResultKind::Graph => sink.lines,
     };
-    Ok((rows, elapsed))
+    Ok((rows, elapsed / executions as u32))
 }
 
 /// The query's answer, serialised as the measurement does, into `path`.
@@ -477,7 +493,8 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
     };
     for i in 0..args.warmup + args.runs {
         let faults = nrese_exec::memory::page_faults();
-        match run_once(store, &prepared, args.timeout) {
+        let executions = if i >= args.warmup { args.batch } else { 1 };
+        match run_once(store, &prepared, args.timeout, executions) {
             Ok((rows, elapsed)) => {
                 if let (Some(before), Some(after)) = (faults, nrese_exec::memory::page_faults()) {
                     match measured.first_faults {
@@ -1380,15 +1397,24 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
                 operators(&store, text)
             ));
         }
-        let samples: Vec<String> = m.times.iter().map(|t| format!("{:.3}", ms(*t))).collect();
+        // Batched samples are means of several executions: reported to the nanosecond.
+        let digits = if args.batch > 1 { 6 } else { 3 };
+        let samples: Vec<String> = m
+            .times
+            .iter()
+            .map(|t| format!("{:.digits$}", ms(*t)))
+            .collect();
         report.queries.push(format!(
-            "    {{\n      \"name\": \"{name}\",\n      \"rows\": {},\n      \"p50_ms\": {p50:.3},\n      \"min_ms\": {min:.3},\n      \"max_ms\": {max:.3},\n      \"samples_ms\": [{}]{extra}\n    }}",
+            "    {{\n      \"name\": \"{name}\",\n      \"rows\": {},\n      \"p50_ms\": {p50:.digits$},\n      \"min_ms\": {min:.digits$},\n      \"max_ms\": {max:.digits$},\n      \"samples_ms\": [{}]{extra}\n    }}",
             m.rows,
             samples.join(", ")
         ));
     }
     if !files.is_empty() {
         println!("sum of p50: {:.1} ms", report.sum_p50);
+    }
+    if args.batch > 1 {
+        report.sections.push(("batch", args.batch.to_string()));
     }
     if !files.is_empty() {
         phases.push(("queries", queries_phase.json()));

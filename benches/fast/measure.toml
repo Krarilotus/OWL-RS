@@ -1,0 +1,697 @@
+# The release gate's measurement per case (fast.py --measure; benches/PROTOCOL.md §5, "Noise").
+# Written by `release_gate.py calibrate`, not by hand: 12 passes on Phuoc-Yu (2026-10-13-gate-1-base.json, 2026-10-14-gate-10-cand.json ...).
+# runs, warmup, batch: the perf lab's a process; repeat: the DL tool's files a process; passes: a side
+# (round 0), for 90% power against a 2% loss at the case's noise (the largest
+# sd of log pass medians of its series where that loss exceeds the resolution); power: at those passes;
+# seconds: a pass's. Timed part 149.7 min (budget 150.0, passes at most 10).
+
+[case.alloc-load]
+noise = 0.0142
+passes = 4
+seconds = 4.9
+power = 0.45
+
+[case.alloc-lubm10]
+noise = 0.0315
+passes = 4
+seconds = 3.4
+power = 0.056
+
+[case.bsbm-bi-100m]
+noise = 0.0
+passes = 4
+seconds = 0.0
+power = 1.0
+
+[case.bsbm-explore-100m]
+noise = 0.0
+passes = 4
+seconds = 0.0
+power = 1.0
+
+[case.cache-replay]
+noise = 0.02
+passes = 4
+seconds = 14.4
+power = 0.142
+
+[case.canon-twins]
+noise = 0.0141
+passes = 4
+seconds = 4.4
+power = 0.458
+
+[case.classify-store-horn]
+noise = 0.0439
+passes = 4
+seconds = 4.8
+power = 0.007
+
+[case.classify-store-tableau]
+noise = 0.0079
+passes = 10
+seconds = 0.9
+power = 0.98
+
+[case.clients-lookups]
+noise = 0.0
+passes = 4
+seconds = 14.4
+power = 1.0
+
+[case.clients-sweep]
+noise = 0.0248
+passes = 4
+seconds = 19.7
+power = 0.096
+
+[case.commits-plain]
+noise = 0.0
+passes = 4
+seconds = 0.2
+power = 1.0
+
+[case.commits-rdfs]
+noise = 0.0
+passes = 4
+seconds = 0.7
+power = 1.0
+
+[case.commits-readers]
+noise = 0.0266
+passes = 4
+seconds = 1.3
+power = 0.088
+
+[case.ctx-ore-2738]
+noise = 0.0
+passes = 4
+seconds = 0.9
+power = 1.0
+
+[case.ctx-ore-7914]
+noise = 0.0
+passes = 4
+seconds = 0.2
+power = 1.0
+
+[case.ctx-ore-9724]
+noise = 0.0
+passes = 4
+seconds = 0.2
+power = 1.0
+
+[case.ctx-ore-9835]
+noise = 0.0
+passes = 4
+seconds = 0.3
+power = 1.0
+
+[case.custom-tc]
+noise = 0.0062
+passes = 4
+seconds = 1.6
+power = 0.991
+
+[case.deletes-clique]
+noise = 0.004
+passes = 4
+seconds = 4.6
+power = 1.0
+
+[case.deletes-layered]
+noise = 0.0126
+passes = 4
+seconds = 12.7
+power = 0.578
+
+[case.deletes-tail]
+noise = 0.0035
+passes = 4
+seconds = 1.0
+power = 1.0
+
+[case.dl-abox-lubm1]
+noise = 0.0419
+passes = 4
+seconds = 4.3
+power = 0.011
+
+[case.dl-datatypes]
+noise = 0.1618
+passes = 4
+seconds = 2.9
+power = 0.003
+
+[case.dl-nominals]
+noise = 0.1334
+passes = 4
+seconds = 4.7
+power = 0.0
+
+[case.dl-number]
+noise = 0.054
+passes = 4
+seconds = 4.1
+power = 0.016
+
+[case.dl-pipeline]
+noise = 0.0248
+passes = 4
+seconds = 9.9
+power = 0.096
+
+[case.dl-roles]
+repeat = 30
+noise = 0.1668
+passes = 4
+seconds = 1.4
+power = 0.003
+
+[case.dl-transitive]
+noise = 0.0209
+passes = 8
+seconds = 3.8
+power = 0.197
+
+[case.dl-transitive-400]
+noise = 0.0
+passes = 4
+seconds = 118.0
+power = 1.0
+
+[case.dlmode-commits]
+noise = 0.0129
+passes = 10
+seconds = 0.9
+power = 0.689
+
+[case.dlmode-lubm1]
+runs = 635
+warmup = 3
+noise = 0.0799
+passes = 4
+seconds = 3.5
+power = 0.003
+
+[case.dlmode-reject]
+noise = 0.0112
+passes = 10
+seconds = 0.1
+power = 0.842
+
+[case.dlmode-reject-dl]
+noise = 0.0248
+passes = 8
+seconds = 0.4
+power = 0.109
+
+[case.el-classify]
+noise = 0.0499
+passes = 4
+seconds = 1.2
+power = 0.013
+
+[case.el-classify-irregular]
+noise = 0.0542
+passes = 4
+seconds = 1.4
+power = 0.017
+
+[case.eq-cascade-16]
+noise = 0.0216
+passes = 8
+seconds = 0.5
+power = 0.174
+
+[case.eq-cascade-4]
+noise = 0.0175
+passes = 10
+seconds = 1.1
+power = 0.357
+
+[case.eq-giant-split]
+noise = 0.0102
+passes = 4
+seconds = 3.8
+power = 0.769
+
+[case.eq-lubm10-one]
+noise = 0.0243
+passes = 4
+seconds = 2.3
+power = 0.098
+
+[case.eq-merge-compact]
+noise = 0.0111
+passes = 10
+seconds = 2.6
+power = 0.848
+
+[case.geo-within]
+runs = 40
+warmup = 3
+noise = 0.1364
+passes = 4
+seconds = 6.6
+power = 0.001
+
+[case.horn-classify]
+noise = 0.1919
+passes = 4
+seconds = 1.4
+power = 0.001
+
+[case.horst-lubm10]
+noise = 0.0078
+passes = 4
+seconds = 3.7
+power = 0.939
+
+[case.index-join-keys]
+runs = 480
+warmup = 3
+noise = 0.1154
+passes = 4
+seconds = 2.8
+power = 0.0
+
+[case.kernel-intersect]
+runs = 16
+warmup = 1
+noise = 0.0113
+passes = 10
+seconds = 3.9
+power = 0.837
+
+[case.kernel-sort-u128]
+noise = 0.0124
+passes = 4
+seconds = 8.7
+power = 0.595
+
+[case.lab-dbpedia-core]
+runs = 21
+warmup = 3
+noise = 0.4169
+passes = 4
+seconds = 14.8
+power = 0.0
+
+[case.lab-entities-10m]
+runs = 177
+warmup = 3
+noise = 0.1
+passes = 4
+seconds = 3.4
+power = 0.001
+
+[case.lab-olympics]
+runs = 41
+warmup = 3
+noise = 0.0533
+passes = 4
+seconds = 2.4
+power = 0.016
+
+[case.lab-yago-tiny]
+runs = 8
+warmup = 1
+noise = 0.1528
+passes = 4
+seconds = 5.6
+power = 0.002
+
+[case.layout-compact]
+runs = 800
+warmup = 3
+noise = 0.0171
+passes = 6
+seconds = 5.2
+power = 0.344
+
+[case.layout-fsst]
+runs = 800
+warmup = 3
+noise = 0.0098
+passes = 10
+seconds = 5.2
+power = 0.927
+
+[case.layout-plain]
+runs = 500
+warmup = 3
+noise = 0.0191
+passes = 6
+seconds = 3.6
+power = 0.253
+
+[case.load-entities]
+noise = 0.0048
+passes = 4
+seconds = 5.1
+power = 1.0
+
+[case.load-threads]
+noise = 0.017
+passes = 6
+seconds = 8.6
+power = 0.349
+
+[case.mem-load-20m-2g]
+noise = 0.0
+passes = 4
+seconds = 2.4
+power = 1.0
+
+[case.mem-load-2g]
+noise = 0.0121
+passes = 10
+seconds = 2.6
+power = 0.765
+
+[case.mem-reason-2g]
+noise = 0.0341
+passes = 4
+seconds = 3.1
+power = 0.038
+
+[case.mem-reason-lubm100-2g]
+noise = 0.0
+passes = 4
+seconds = 1.3
+power = 1.0
+
+[case.op-aggregates]
+runs = 300
+warmup = 3
+noise = 0.011
+passes = 10
+seconds = 6.3
+power = 0.854
+
+[case.op-dates]
+runs = 500
+warmup = 3
+noise = 0.0218
+passes = 8
+seconds = 5.0
+power = 0.167
+
+[case.op-group]
+runs = 300
+warmup = 3
+noise = 0.0087
+passes = 8
+seconds = 6.8
+power = 0.949
+
+[case.op-negation]
+runs = 1000
+warmup = 3
+noise = 0.0175
+passes = 6
+seconds = 5.1
+power = 0.327
+
+[case.op-optional]
+runs = 25
+warmup = 3
+noise = 0.035
+passes = 4
+seconds = 4.5
+power = 0.033
+
+[case.op-strings]
+runs = 400
+warmup = 3
+noise = 0.0122
+passes = 10
+seconds = 9.4
+power = 0.755
+
+[case.open-first-query]
+noise = 0.0451
+passes = 4
+seconds = 2.2
+power = 0.008
+
+[case.parse-large]
+runs = 100
+warmup = 3
+noise = 0.0117
+passes = 10
+seconds = 2.8
+power = 0.805
+
+[case.plan-estimates]
+runs = 200
+warmup = 3
+noise = 0.0281
+passes = 4
+seconds = 3.7
+power = 0.082
+
+[case.q-chain]
+runs = 2000
+warmup = 3
+batch = 2
+noise = 0.0082
+passes = 6
+seconds = 2.3
+power = 0.933
+
+[case.q-cycles]
+runs = 4
+warmup = 1
+noise = 0.0055
+passes = 4
+seconds = 9.1
+power = 0.998
+
+[case.q-large-result]
+runs = 50
+warmup = 3
+noise = 0.0206
+passes = 6
+seconds = 5.5
+power = 0.188
+
+[case.q-paths]
+runs = 10
+warmup = 1
+noise = 0.0949
+passes = 4
+seconds = 5.8
+power = 0.002
+
+[case.q-sideways]
+runs = 700
+warmup = 3
+noise = 0.0247
+passes = 4
+seconds = 4.0
+power = 0.096
+
+[case.q-snowflake]
+runs = 2000
+warmup = 3
+noise = 0.0039
+passes = 4
+seconds = 2.2
+power = 1.0
+
+[case.q-star]
+runs = 700
+warmup = 3
+noise = 0.013
+passes = 10
+seconds = 4.7
+power = 0.68
+
+[case.q-topk]
+runs = 300
+warmup = 3
+noise = 0.0031
+passes = 4
+seconds = 6.3
+power = 1.0
+
+[case.ql-lubm10]
+noise = 0.0104
+passes = 10
+seconds = 2.9
+power = 0.889
+
+[case.ql-owl2bench]
+runs = 873
+warmup = 3
+batch = 17
+noise = 0.1055
+passes = 4
+seconds = 4.4
+power = 0.0
+
+[case.rdf12-annotations]
+runs = 20
+warmup = 3
+noise = 0.159
+passes = 4
+seconds = 7.2
+power = 0.003
+
+[case.rdf12-join-2g]
+noise = 0.1128
+passes = 4
+seconds = 1.9
+power = 0.0
+
+[case.rdfs-full-lubm10]
+noise = 0.03
+passes = 4
+seconds = 2.5
+power = 0.067
+
+[case.rdfs-hierarchy]
+noise = 0.0078
+passes = 4
+seconds = 1.9
+power = 0.939
+
+[case.rdfs-plus-lubm10]
+noise = 0.0161
+passes = 6
+seconds = 3.6
+power = 0.39
+
+[case.reopen-dbpedia]
+noise = 0.0118
+passes = 4
+seconds = 16.7
+power = 0.648
+
+[case.rl-chain]
+noise = 0.0032
+passes = 4
+seconds = 2.9
+power = 1.0
+
+[case.rl-clique]
+noise = 0.0038
+passes = 4
+seconds = 1.7
+power = 1.0
+
+[case.rl-fed-chain]
+noise = 0.0115
+passes = 10
+seconds = 3.5
+power = 0.825
+
+[case.rl-hierarchy]
+noise = 0.0053
+passes = 4
+seconds = 2.4
+power = 0.998
+
+[case.rl-lubm100]
+noise = 0.0247
+passes = 4
+seconds = 4.0
+power = 0.096
+
+[case.rl-owl2bench]
+noise = 0.0035
+passes = 4
+seconds = 2.7
+power = 1.0
+
+[case.rl-sameas]
+noise = 0.0551
+passes = 4
+seconds = 5.5
+power = 0.016
+
+[case.rl-sameas-compact]
+noise = 0.0063
+passes = 4
+seconds = 4.0
+power = 0.989
+
+[case.rl-single-thread]
+noise = 0.0053
+passes = 4
+seconds = 2.8
+power = 0.998
+
+[case.rule-delta-sweep]
+noise = 0.0888
+passes = 4
+seconds = 2.5
+power = 0.003
+
+[case.rule-work-lubm10]
+noise = 0.0132
+passes = 10
+seconds = 3.0
+power = 0.661
+
+[case.rule-work-owl2bench]
+noise = 0.002
+passes = 4
+seconds = 3.9
+power = 1.0
+
+[case.shacl-lubm]
+noise = 0.0238
+passes = 4
+seconds = 8.4
+power = 0.1
+
+[case.sparqloscope-dblp]
+noise = 0.0
+passes = 4
+seconds = 0.0
+power = 1.0
+
+[case.text-search]
+runs = 45
+warmup = 3
+noise = 0.0297
+passes = 4
+seconds = 8.2
+power = 0.069
+
+[case.vector-knn-exact]
+runs = 300
+warmup = 3
+noise = 0.0093
+passes = 10
+seconds = 2.0
+power = 0.96
+
+[case.vector-knn-filtered]
+runs = 300
+warmup = 3
+noise = 0.0205
+passes = 8
+seconds = 2.2
+power = 0.211
+
+[case.watdiv-100m]
+noise = 0.0
+passes = 4
+seconds = 0.0
+power = 1.0
+
+[case.watdiv-10m]
+noise = 0.0
+passes = 4
+seconds = 0.0
+power = 1.0
+
+[case.writes-under-readers]
+noise = 0.0
+passes = 4
+seconds = 0.5
+power = 1.0
