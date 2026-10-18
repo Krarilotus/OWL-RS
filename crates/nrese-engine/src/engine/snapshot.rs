@@ -377,7 +377,7 @@ impl Snapshot {
             views: Arc::clone(&self.views),
             version,
             dictionary: Arc::clone(&self.dictionary),
-            statistics: Arc::default(),
+            statistics: Arc::new(self.statistics.for_view()),
             equality: self.equality,
             canonical: self.canonical,
         }
@@ -389,9 +389,14 @@ impl Snapshot {
     /// statistics and equality classes of its own. O(k log k) for k statements, as one
     /// more run.
     pub fn with_inferred_added(&self, added: &[EncodedQuad]) -> Snapshot {
+        // Other statements than this snapshot's, at its revision.
+        let content = super::Content::fresh();
+        let touched = added.iter().map(|quad| (quad.subject, quad.object));
+        self.statistics
+            .corpora
+            .record(self.version.content, content, touched);
         let version = Arc::new(Version {
-            // Other statements than this snapshot's, at its revision.
-            content: super::Content::fresh(),
+            content,
             asserted: self.version.asserted.clone(),
             inferred: self.version.inferred.with_delta(added, &[]),
             revision: self.version.revision,
@@ -405,7 +410,7 @@ impl Snapshot {
             views: Arc::clone(&self.views),
             version,
             dictionary: Arc::clone(&self.dictionary),
-            statistics: Arc::default(),
+            statistics: Arc::new(self.statistics.for_view()),
             equality: self.equality,
             canonical: self.canonical,
         }
@@ -434,10 +439,33 @@ impl Snapshot {
             views: Arc::clone(&self.views),
             version,
             dictionary: Arc::clone(&self.dictionary),
-            statistics: Arc::default(),
+            statistics: Arc::new(self.statistics.for_view()),
             equality: self.equality,
             canonical: self.canonical,
         })
+    }
+
+    /// Notes that this view of `base` (made by [`Self::with_inferred_subset`] or
+    /// [`Self::with_inferred_mask`]) is a reader's `earlier` view of `earlier_base` brought
+    /// forward: the commits between the bases, and `changed` (the inferred statements it
+    /// shows or hides now and didn't then), are all that differ. Full-text searches on it
+    /// then derive their corpora from the earlier view's ([`super::corpora`]) instead of
+    /// walking the store again. Nothing is noted where the engine no longer has the
+    /// commits between the bases.
+    pub fn continues(
+        &self,
+        base: &Snapshot,
+        earlier: &Snapshot,
+        earlier_base: &Snapshot,
+        changed: &[EncodedQuad],
+    ) {
+        self.statistics.corpora.record_view(
+            earlier.version.content,
+            earlier_base.version.content,
+            self.version.content,
+            base.version.content,
+            changed,
+        );
     }
 
     /// The `owl:sameAs` classes reads expand, if equality by representatives is on.
@@ -1489,19 +1517,49 @@ impl Snapshot {
         })
     }
 
-    /// How many full-text corpora ([`Self::text_search_in`]) the statistics this snapshot
-    /// shares (its engine's, or a restricted view's own) have built: a search that finds
-    /// its corpus kept builds none (performance.md §0).
-    pub fn text_corpus_builds(&self) -> u64 {
-        self.statistics.corpus_builds()
+    /// The full-text corpora this snapshot's engine keeps, and how many were built by a
+    /// walk or derived from an ancestor's ([`super::corpora`]; performance.md §0).
+    pub fn text_corpus_stats(&self) -> super::TextCorpusStats {
+        self.statistics.corpora.stats()
     }
 
-    /// The documents of a full-text index this snapshot's reader sees in `scope`: their
-    /// numbers (dictionary entries) from a walk over the groups of the object-first (or
-    /// subject-first) index, their statistics from `index`. Exact, and kept for this
-    /// version, model and scope once built, as [`Self::node_count_in`] is. The statements
-    /// are read as stored: equality classes rename individuals, never literals, and an
-    /// alias is the subject of its own `sameAs` statement.
+    /// The literal documents of [`Self::text_search_in`]'s corpus for `model` and `scope`
+    /// (dictionary entries, ascending), their number and their words: as a search finds
+    /// it (kept, derived or walked) or, with `walk`, walked afresh and not kept. For
+    /// checks that the two agree.
+    #[doc(hidden)]
+    pub fn text_corpus_members(
+        &self,
+        model: ReadModel,
+        scope: &TextScope,
+        walk: bool,
+    ) -> (Vec<u64>, u64, u64) {
+        let found = std::cell::RefCell::new(None);
+        self.dictionary.text_search(
+            &crate::TextQuery {
+                text: String::new(),
+                all_words: false,
+                prefix: false,
+                stem: None,
+            },
+            &|index| {
+                let corpus = match walk {
+                    true => Arc::new(self.walk_corpus(Documents::Literals, model, scope, index)),
+                    false => self.text_corpus(Documents::Literals, model, scope, index),
+                };
+                *found.borrow_mut() =
+                    Some((corpus.members(), corpus.documents(), corpus.total_words()));
+                corpus
+            },
+        );
+        found.into_inner().unwrap_or_default()
+    }
+
+    /// The documents of a full-text index this snapshot's reader sees in `scope`, with
+    /// their statistics from `index`; exact, kept by the statements' identity, model and
+    /// graphs ([`super::corpora`]). Derived from the nearest kept ancestor's where the
+    /// lineage has one: each term the steps since touched is probed (a member while a
+    /// statement in the scope uses it); else walked ([`Self::walk_corpus`]).
     fn text_corpus(
         &self,
         documents: Documents,
@@ -1509,30 +1567,93 @@ impl Snapshot {
         scope: &TextScope,
         index: &crate::term::text::TextIndex,
     ) -> Arc<crate::term::text::Corpus> {
-        let key = (documents, model, scope.clone());
-        self.statistics.corpus(&self.version, key, || {
-            let stored = self.stored();
-            let span = self.version.dictionary_len;
-            let kinds: &[TermKind] = match documents {
-                Documents::Literals => &[TermKind::String, TermKind::LangString],
-                Documents::Subjects => &[TermKind::Iri],
+        use super::corpora::Found;
+        let scope = scope.normalised();
+        let store = &self.statistics.corpora;
+        let (cell, from) = match store.find(&self.version, &(documents, model, scope.clone())) {
+            Found::Kept(corpus) => return corpus,
+            Found::Build { cell, from } => (cell, from),
+        };
+        let corpus = Arc::clone(cell.get_or_init(|| {
+            let corpus = match from {
+                Some((base, touched)) => {
+                    let stored = self.stored();
+                    let span = self.version.dictionary_len;
+                    let changes: Vec<(u64, bool)> = touched
+                        .into_iter()
+                        .map(TermId::from_raw)
+                        .filter(|id| documents.holds(id.kind()) && id.payload() < span)
+                        .map(|id| (id.payload(), stored.uses(model, &scope, documents, id)))
+                        .collect();
+                    store.built(true);
+                    index.derive(&base, &changes, span)
+                }
+                None => {
+                    store.built(false);
+                    self.walk_corpus(documents, model, &scope, index)
+                }
             };
-            let mut bits = vec![0u64; span.div_ceil(64) as usize];
-            for &kind in kinds {
-                match scope {
-                    TextScope::Graphs(graphs) => {
-                        stored.mark_values(model, *graphs, documents, kind, &mut bits);
-                    }
-                    TextScope::Merge(graphs) => {
-                        for &graph in graphs {
-                            let graph = GraphSelector::Exact(graph);
-                            stored.mark_values(model, graph, documents, kind, &mut bits);
-                        }
+            Arc::new(corpus)
+        }));
+        store.bound();
+        corpus
+    }
+
+    /// The corpus by a walk over the groups of the object-first (or subject-first) index
+    /// in the documents' kinds' ranges ([`Self::mark_values`]). The statements are read
+    /// as stored: equality classes rename individuals, never literals, and an alias is
+    /// the subject of its own `sameAs` statement.
+    fn walk_corpus(
+        &self,
+        documents: Documents,
+        model: ReadModel,
+        scope: &TextScope,
+        index: &crate::term::text::TextIndex,
+    ) -> crate::term::text::Corpus {
+        let stored = self.stored();
+        let span = self.version.dictionary_len;
+        let mut bits = vec![0u64; span.div_ceil(64) as usize];
+        for &kind in documents.kinds() {
+            match scope {
+                TextScope::Graphs(graphs) => {
+                    stored.mark_values(model, *graphs, documents, kind, &mut bits);
+                }
+                TextScope::Merge(graphs) => {
+                    for &graph in graphs {
+                        let graph = GraphSelector::Exact(graph);
+                        stored.mark_values(model, graph, documents, kind, &mut bits);
                     }
                 }
             }
-            index.corpus(bits, span)
-        })
+        }
+        index.corpus(bits, span)
+    }
+
+    /// Whether a statement in `scope`'s graphs in `model` has `id` at `documents`'
+    /// position (object or subject): an index probe, or for a merge of many graphs a
+    /// scan of the term's statements.
+    fn uses(&self, model: ReadModel, scope: &TextScope, documents: Documents, id: TermId) -> bool {
+        let pattern = |graph| match documents {
+            Documents::Literals => QuadPattern {
+                object: Some(id),
+                graph,
+                ..QuadPattern::all()
+            },
+            Documents::Subjects => QuadPattern {
+                subject: Some(id),
+                graph,
+                ..QuadPattern::all()
+            },
+        };
+        match scope {
+            TextScope::Graphs(graphs) => self.exists_in(model, &pattern(*graphs)),
+            TextScope::Merge(graphs) if graphs.len() <= 8 => graphs
+                .iter()
+                .any(|&graph| self.exists_in(model, &pattern(GraphSelector::Exact(graph)))),
+            TextScope::Merge(graphs) => self
+                .quads_for_pattern_in(model, &pattern(GraphSelector::Any))
+                .any(|quad| graphs.binary_search(&quad.graph).is_ok()),
+        }
     }
 
     /// Sets the bit of the dictionary entry of each term of `kind` at `documents`' position
@@ -1649,6 +1770,23 @@ pub enum TextScope {
 impl TextScope {
     /// Every graph.
     pub const EVERY: Self = Self::Graphs(GraphSelector::Any);
+
+    /// The same graphs, written one way: a merge sorted and without repeats, a merge of one
+    /// graph as that graph (so scopes of equal graph sets share a corpus).
+    fn normalised(&self) -> Self {
+        match self {
+            Self::Merge(graphs) => {
+                let mut graphs = graphs.clone();
+                graphs.sort_unstable();
+                graphs.dedup();
+                match graphs[..] {
+                    [graph] => Self::Graphs(GraphSelector::Exact(graph)),
+                    _ => Self::Merge(graphs),
+                }
+            }
+            graphs => graphs.clone(),
+        }
+    }
 }
 
 /// Which documents a full-text index holds: string literals (objects), or IRIs by their
@@ -1657,6 +1795,20 @@ impl TextScope {
 pub(crate) enum Documents {
     Literals,
     Subjects,
+}
+
+impl Documents {
+    /// The kinds of term its documents are.
+    fn kinds(self) -> &'static [TermKind] {
+        match self {
+            Self::Literals => &[TermKind::String, TermKind::LangString],
+            Self::Subjects => &[TermKind::Iri],
+        }
+    }
+
+    fn holds(self, kind: TermKind) -> bool {
+        self.kinds().contains(&kind)
+    }
 }
 
 /// Two quad streams sorted by one permutation, merged into one sorted stream. The inputs

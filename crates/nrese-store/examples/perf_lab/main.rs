@@ -57,6 +57,9 @@
 //!   stores without reasoning load). `--canonicalize` canonicalises blank nodes.
 //!   `--prepare-vector-graph 64:cosine` synchronously prepares that vector space before
 //!   query timing, recording its preparation phase and checking full graph coverage.
+//!   `--then-commit FILE` applies one SPARQL update per line as a commit after the timed
+//!   runs, then runs each query once more: the report's `after_commit` (what the first
+//!   query after a commit pays, as full-text corpora do).
 //!   `generate` writes the suite's data (`generate.rs`). A failure still writes the report, with
 //!   its `error`.
 //!
@@ -203,6 +206,7 @@ struct Args {
     results: Option<PathBuf>,
     routes: bool,
     commits: Option<PathBuf>,
+    then_commit: Option<PathBuf>,
     readers: usize,
     clients: Vec<usize>,
     cache_bytes: usize,
@@ -241,6 +245,7 @@ fn parse_args() -> Result<Args, String> {
         results: None,
         routes: false,
         commits: None,
+        then_commit: None,
         readers: 0,
         clients: Vec::new(),
         cache_bytes: 0,
@@ -292,6 +297,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--routes" => args.routes = true,
             "--commits" => args.commits = Some(value()?.into()),
+            "--then-commit" => args.then_commit = Some(value()?.into()),
             "--readers" => {
                 args.readers = value()?.parse().map_err(|e| format!("--readers: {e}"))?
             }
@@ -1389,6 +1395,44 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     }
     if !files.is_empty() {
         println!("sum of p50: {:.1} ms", report.sum_p50);
+    }
+    if let Some(file) = &args.then_commit {
+        let phase = Phase::start();
+        let pipeline = dl_pipeline.take().unwrap_or_else(|| {
+            MutationPipeline::new(
+                Arc::clone(&store),
+                Arc::new(ReasonerService::new(reasoner.clone())),
+            )
+        });
+        for update in std::fs::read_to_string(file)?.lines() {
+            if !update.trim().is_empty() {
+                pipeline.execute_update_str(update)?;
+            }
+        }
+        phases.push(("then_commit", phase.json()));
+        let mut after = Vec::new();
+        for (file, text) in files.iter().zip(&texts) {
+            let name = file.file_stem().unwrap().to_string_lossy().into_owned();
+            let mut request = SparqlQueryRequest::all(text);
+            request.solutions_format = args.format;
+            let prepared = PreparedQuery::parse(&request)?;
+            let (rows, elapsed) = run_once(&store, &prepared, args.timeout)?;
+            let value = (rows == 1)
+                .then(|| first_value(&store, text))
+                .flatten()
+                .map_or(String::new(), |value| format!(", \"value\": {value:?}"));
+            println!(
+                "{name:<28} after the commits: {rows} rows, {:.2} ms",
+                ms(elapsed)
+            );
+            after.push(format!(
+                "{{\"name\": \"{name}\", \"rows\": {rows}, \"ms\": {:.3}{value}}}",
+                ms(elapsed)
+            ));
+        }
+        report
+            .sections
+            .push(("after_commit", format!("[{}]", after.join(", "))));
     }
     if !files.is_empty() {
         phases.push(("queries", queries_phase.json()));
