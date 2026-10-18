@@ -4291,7 +4291,7 @@ impl<'a> Context<'a> {
     fn aggregate_groups(
         &self,
         solutions: &Solutions,
-        members: &[Vec<usize>],
+        members: &nrese_exec::group::Members,
         aggregates: &[(Variable, AggregateExpression)],
     ) -> NativeResult<Vec<Vec<Agg>>> {
         let per_group = |aggregator: &Aggregator<'_>, rows: &[usize]| -> Vec<Agg> {
@@ -4346,9 +4346,8 @@ impl<'a> Context<'a> {
                     numbers: RefCell::default(),
                 };
                 Some(
-                    members[window[0]..window[1]]
-                        .iter()
-                        .map(|rows| per_group(&aggregator, rows))
+                    (window[0]..window[1])
+                        .map(|group| per_group(&aggregator, members.get(group)))
                         .collect(),
                 )
             })
@@ -5168,10 +5167,10 @@ impl<'a> Context<'a> {
         let values = match one_pass {
             Some(values) => values,
             None => {
-                let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
-                for (row, &group) in groups.group_of.iter().enumerate() {
-                    members[group as usize].push(row);
-                }
+                let members = nrese_exec::group::Members::of(
+                    groups.group_of.iter().map(|&g| g as usize),
+                    group_count,
+                );
                 self.aggregate_groups(&solutions, &members, aggregates)?
             }
         };
