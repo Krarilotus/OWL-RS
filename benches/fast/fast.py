@@ -1229,10 +1229,12 @@ def samples(case: dict, result: dict) -> dict:
                     series.setdefault(q["name"], []).extend(q["samples_ms"] if "samples_ms" in q else [q["p50_ms"]])
         return series
     section = metric.split(".")[0]
+    # Repeated processes (`repeat`) pool their samples, as the queries' above.
+    runs = result.get("_repeats", [result])
     if isinstance(result.get(section), dict) and "samples_ms" in result[section]:
-        return {"_": result[section]["samples_ms"]}
+        return {"_": [s for r in runs for s in (r.get(section) or {}).get("samples_ms", [])]}
     if "samples_ms" in result:
-        return {"_": [s for s in result["samples_ms"] if s is not None]}
+        return {"_": [s for r in runs for s in r.get("samples_ms", []) if s is not None]}
     if "_repeats" in result:
         values = [lookup(metric, r) for r in result["_repeats"]]
         scale = 1000.0 if metric in ("load_s", "open_s") else 1.0
