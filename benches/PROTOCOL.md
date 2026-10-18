@@ -222,28 +222,47 @@ case's own run-to-run noise sets its width. No relative tolerance:
 - *Incomplete* (blocks): fewer than two passes on a side, or a pass without valid values.
 
 The precision of "neutral" (2 × the noise) is how exact the evidence must be, not a loss
-accepted: a clear loss of any size blocks. What it costs, from the identical binaries of 14 Oct
-2026 on phuoc-yu (693 series, ABBA halves of two passes a side) and simulations from those
-passes' measured noise (median sd 1.4 %):
+accepted: a clear loss of any size blocks.
 
-| | per series | per comparison of 400 series |
-|---|---|---|
-| A/A, 2 passes a side, the gate's judge | 5.8 % clear "losses", 15 % suspect | 23 false blocks |
-| simulated, 4 passes a side (the gate's 12 passes) | 2.7 % false losses, 13 % suspect | 11 false blocks, 52 suspects |
-| simulated, 12 passes a side | 1.8 % false losses, 0.4 % suspect | 7 false blocks |
-| simulated, 24 or 48 passes a side | about 2 % false losses | 5 to 8 false blocks |
-| at a 99.9 % interval, 12 passes a side | 0.0 %, 13 % suspect | 0 false blocks, 50 suspects |
+**Confirm on rerun** (the owner's decision, 18 Oct 2026). With a 95 % interval about 2.5 % of
+identical series fall wholly on one side by chance, at any number of passes, so one run's
+"loss" isn't proof. Every dimension a run flags (a loss, or undecided) runs again: `release-gate.sh
+confirm R/... --out jobs/` writes `rg-<h8>-confirm`, a fresh, independent A-B-B-A of just those
+cases on the same host (fresh processes, the same palindromic order, the passes a side each
+case's noise needs: the flagged rounds' estimates, 4 to 24). The verdict combines each host's
+rounds (`combine`):
 
-More passes don't bring the false losses down: with a 95 % interval about 2.5 % of identical
-series fall wholly on one side by chance (the interval's own error rate), at any number of
-passes; a comparison of 400 series has several. Only the interval's level does (99.9 %, or
-one corrected for the comparison's number of series); at 99.9 % and 12 passes a side a
-repeatable 8 % loss still blocks in every series with noise under 5 % (at 95 % and 4 passes:
-95 % of those at 2-5 %), and a 3 % loss in every series under 2 % and 79 % of those at 2-5 %;
-noisier series (115 of 621) need their noise's cause found. The level is the owner's decision (`judge(confidence=...)`). The known
-blockers, against main on the 14 Oct data, all stay regressions: olympics q06-text-filter
-3.74× [3.13, 4.02], yago q10-labels-en 3.50×, entities q06-label-prefix 4.09×, dbpedia
-q02-born-in-berlin 3.32×.
+- *confirmed*: two rounds show the loss at 95 % on the worse side: blocks (unless a trade-off
+  covers it);
+- *not confirmed*: shown once, then a round without it: reported with every round's interval,
+  doesn't block; a loss only a confirmation shows is reported so too;
+- *resolved*: undecided, then decided without a loss;
+- *pending*: another round is due (undecided again, or a first detection in a confirmation):
+  `confirm` on all the rounds' results writes `rg-<h8>-confirm2`;
+- *undecided* (after three rounds) and *missing* (a confirmation without the dimension): block.
+
+Other blocks (a case failing, lost series or answers, a pass that doesn't qualify) aren't
+retried away: they block from whichever round has them. What this gives, simulated from the
+14 Oct passes' measured noise (621 series; median sd 1.4 %, p75 4.3 %), four passes a side in
+the first round:
+
+| Identical binaries, per 400 series | |
+|---|---|
+| confirmed (false) losses | 0.48 (0.12 % a series; 400 × 0.025² would be 0.25: the first round's four passes and the undecided paths add to it) |
+| still undecided after three rounds (block) | 0.97 |
+| per gate run (two baselines, about 800 series) | about 1 false confirmed loss and 2 undecided blocks |
+
+| Repeatable loss | noise sd 0.5 % | 1.4 % (median) | 4.3 % (p75) |
+|---|---|---|---|
+| 1 % | 81 % confirmed, 6 % undecided | 7 %, 4 % | 1 %, 0.5 % |
+| 3 % | 100 % | 87 %, 3 % | 4 %, 4 % |
+| 8 % | 100 % | 100 % | 72 %, 8 % |
+
+A noisy series barely decides a small loss: those are a work list of their own
+([NOISY.md](NOISY.md), 137 series above 5 % noise, grouped by likely cause), to be fixed, not
+tolerated. The known blockers, against main on the 14 Oct data, all stay regressions in one
+round: olympics q06-text-filter 3.74× [3.13, 4.02], yago q10-labels-en 3.50×, entities
+q06-label-prefix 4.09×, dbpedia q02-born-in-berlin 3.32×.
 
 **Trade-offs.** [release-tradeoffs.toml](release-tradeoffs.toml) is the only thing that accepts a
 loss, and only the owner adds to it: a case, a dimension, optionally the baseline, the largest
@@ -267,8 +286,10 @@ and pass (a name no test has, or an ignored one, fails: docs and code disagree).
 
 ```sh
 bash scripts/release-gate.sh jobs HEAD --out jobs/   # build, timed (phuoc-yu), big (khaleesi), checks (office-pc)
-fleet submit jobs/*.toml                             # with FLEET_OWNER set
-bash scripts/release-gate.sh verdict R/rg-H8-timed R/rg-H8-big R/rg-H8-checks   # after fleet results ... --to R
+fleet submit jobs/*.toml                             # with FLEET_OWNER set; then fleet results ... --to R
+bash scripts/release-gate.sh confirm R/rg-H8-timed R/rg-H8-big --out jobs/   # rg-H8-confirm, rg-H8-big-confirm
+fleet submit jobs/rg-H8-*confirm*.toml               # then confirm again on every round's results, if pending
+bash scripts/release-gate.sh verdict R/rg-H8-timed R/rg-H8-confirm R/rg-H8-big R/rg-H8-big-confirm R/rg-H8-checks
 ```
 
 ## 6. Records: every number traceable
