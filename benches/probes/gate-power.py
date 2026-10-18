@@ -8,11 +8,14 @@ repeatable loss of a given size at that noise.
         standard deviation of their logs; a binary's passes are its group (an A/A run's sides
         are one binary, so one group). The distribution: median, p75, p90, how many above 2 %
         and 5 %.
-    gate-power.py power noise.json [--sims 400] [--passes 4 | --plan PLAN.json] [--out power.json]
+    gate-power.py power noise.json [--sims 400] [--passes 4 | --measure MEASURE.toml] [--resolution-ms 0.005]
+                       [--out power.json]
         the gate's chain simulated on each noise: round 0 at the passes a side the case gets,
         then confirmations of 4 to 24 passes; a loss is caught when two rounds show it at 95 %
         (`confirmed`). Against losses of 1, 2, 3 and 8 %: the share caught at the median and the
-        p75 noise, and the share of series caught at least 90 % of the time.
+        p75 noise, and the share of series caught at least 90 % of the time; `with resolution`:
+        the same where a series' loss below the gate's resolution (compare.RESOLUTION, 5 µs)
+        counts as never caught, as the gate judges it (the agent's simulation leaves it out).
 
 The simulation is the gate agent's of 18 Oct 2026 (the confirm-on-rerun receipts in PROTOCOL.md
 §5): one log-normal value a pass at the series' noise, the bootstrap over the passes (2,000
@@ -146,7 +149,7 @@ def at(curve: np.ndarray, sigma: float) -> float:
     return float(np.interp(math.log(max(sigma, GRID[0])), np.log(GRID), curve))
 
 
-def power(rows: list[dict], sims: int, plan: dict | None, passes: int) -> dict:
+def power(rows: list[dict], sims: int, plan: dict | None, passes: int, resolution_ms: float = 0.005) -> dict:
     """Each series' chance to be caught, at the round-0 passes its case gets."""
     n_of = lambda r: (plan or {}).get(r["case"], passes)  # noqa: E731
     table = curves({n_of(r) for r in rows} | {passes}, sims)
@@ -154,11 +157,14 @@ def power(rows: list[dict], sims: int, plan: dict | None, passes: int) -> dict:
     out = {"noise": s, "passes": passes, "planned": bool(plan), "losses": {}}
     for loss in LOSSES:
         each = [at(table[n_of(r)][loss], r["sd"]) for r in rows]
+        resolved = [p if r["median_ms"] * (loss - 1) >= resolution_ms else 0.0 for p, r in zip(each, rows)]
         out["losses"][f"{loss - 1:.0%}"] = {
             f"at median sd {s['median']:.4f} ({passes} passes)": at(table[passes][loss], s["median"]),
             f"at p75 sd {s['p75']:.4f} ({passes} passes)": at(table[passes][loss], s["p75"]),
             "series caught >= 90 %": sum(p >= 0.9 for p in each) / len(each),
-            "mean over series": sum(each) / len(each)}
+            "mean over series": sum(each) / len(each),
+            "with resolution: series caught >= 90 %": sum(p >= 0.9 for p in resolved) / len(resolved),
+            "with resolution: series below it": sum(r["median_ms"] * (loss - 1) < resolution_ms for r in rows)}
     # Identical binaries: a gate run's false blocks. Without a loss the chain doesn't depend on
     # the noise's size (every verdict compares logs), so one simulation per pass count serves.
     false = {n0: caught(0.01, 1.0, n0, 20 * sims, seed=7) for n0 in {n_of(r) for r in rows}}
@@ -179,7 +185,8 @@ def main() -> int:
     s.add_argument("noise", type=Path)
     s.add_argument("--sims", type=int, default=400)
     s.add_argument("--passes", type=int, default=4)
-    s.add_argument("--plan", type=Path, help="passes a side per case (release_gate.py passes-plan)")
+    s.add_argument("--measure", type=Path, help="passes a side per case (benches/fast/measure.toml)")
+    s.add_argument("--resolution-ms", type=float, default=0.005)
     s.add_argument("--out", type=Path)
     args = p.parse_args()
     if args.command == "noise":
@@ -189,8 +196,12 @@ def main() -> int:
             args.out.write_text(json.dumps(rows, indent=0), encoding="utf-8")
         return 0
     rows = json.loads(args.noise.read_text(encoding="utf-8"))
-    plan = json.loads(args.plan.read_text(encoding="utf-8"))["passes"] if args.plan else None
-    out = power(rows, args.sims, plan, args.passes)
+    plan = None
+    if args.measure:
+        import tomllib
+        plan = {c: int(e.get("passes", args.passes)) for c, e in
+                tomllib.loads(args.measure.read_text(encoding="utf-8")).get("case", {}).items()}
+    out = power(rows, args.sims, plan, args.passes, args.resolution_ms)
     print(json.dumps(out, indent=1))
     if args.out:
         args.out.write_text(json.dumps(out, indent=1), encoding="utf-8")
