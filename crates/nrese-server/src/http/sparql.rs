@@ -40,9 +40,7 @@ pub async fn execute_query_in(
 
     let explain = operation.explain;
     let origin = operation.origin.clone();
-    let mut request = build_query_request(operation);
-    let memory = policy.limits.max_query_memory_bytes;
-    request.memory_limit = (memory > 0).then_some(memory);
+    let request = build_query_request(operation, &policy.limits);
     // Prefixes it doesn't declare mean what the repository's namespaces say.
     let mut prepared = state
         .store()
@@ -309,13 +307,19 @@ fn negotiate_formats(
     })
 }
 
-fn build_query_request(operation: QueryOperation) -> SparqlQueryRequest {
+fn build_query_request(
+    operation: QueryOperation,
+    limits: &crate::policy::RequestLimits,
+) -> SparqlQueryRequest {
     let mut request = SparqlQueryRequest::new(
         operation.query,
         nrese_store::ReadScope::of(operation.access),
     );
     request.default_graphs = operation.default_graphs;
     request.named_graphs = operation.named_graphs;
+    let memory = limits.max_query_memory_bytes;
+    request.memory_limit = (memory > 0).then_some(memory);
+    request.planner = limits.planner;
     // GraphDB's `infer=false`: explicit statements only.
     if operation.infer == Some(false) {
         request.read_model = Some(nrese_store::ReadModel::Asserted);
@@ -329,6 +333,29 @@ mod tests {
     use nrese_store::{GraphResultFormat, QueryResultKind, SolutionsResultFormat};
 
     use super::negotiate_formats;
+
+    #[test]
+    fn planner_policy_reaches_queries_and_both_explain_modes() {
+        for effort in [Some(17), None] {
+            let mut limits = crate::policy::RequestLimits::default();
+            limits.planner.greedy_effort = effort;
+            for explain in [
+                super::Explain::No,
+                super::Explain::Plan,
+                super::Explain::Analyze,
+            ] {
+                let request = super::build_query_request(
+                    super::QueryOperation {
+                        query: "SELECT * WHERE { ?s ?p ?o }".into(),
+                        explain,
+                        ..Default::default()
+                    },
+                    &limits,
+                );
+                assert_eq!(request.planner.greedy_effort, effort);
+            }
+        }
+    }
 
     #[test]
     fn the_query_form_decides_which_formats_are_negotiated() {
