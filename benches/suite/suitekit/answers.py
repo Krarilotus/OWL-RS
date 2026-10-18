@@ -308,10 +308,16 @@ class Recorder:
             self.data.setdefault(item, tuple(data))
 
     def capture(self, post, url: str, item: tuple, system: str, cache: str, run: int, query: Path,
-                logs: Path, timeout: float):
+                logs: Path, timeout: float, *, prior_error: str | None = None):
         text = query.read_text(encoding="utf-8")
         self.queries[item] = hashlib.sha256(text.encode()).hexdigest()
         self.orders[item] = order_of(text)
+        if prior_error:
+            # Preserve this invocation's failure; answer collection is not an implicit
+            # second attempt with the same settings. A recovery run has its own identity.
+            self.captures.append(Capture(item, system, cache, run, "",
+                                         error=f"timed query failed; not recaptured: {prior_error}"))
+            return
         self.captures.append(self.post(post, url, item, system, cache, run, text,
                                        logs / f"{query.stem}-answers-{cache}.json", timeout))
         if (system in self.references and self.orders[item][0] == "limit"

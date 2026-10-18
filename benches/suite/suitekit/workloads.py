@@ -176,30 +176,38 @@ def geographica2(root: Path, tier: str, settings: dict) -> Plan:
     return plan
 
 
+# The W3C suites' kits: their test data fetched first at its pinned commits, and required (the
+# driver sets NRESE_W3C_REQUIRED: a suite without its data fails, never passes by skipping, as
+# every suite of the release gate's first W3C part did on 13 Oct 2026); --nocapture puts each
+# suite's counts into its log, from where the row's note takes them.
+W3C_DATA = ["bash", "scripts/fetch-w3c-tests.sh"]
+SHOW = ["--", "--nocapture"]
+
+
 def w3c_sparql(root: Path, tier: str, settings: dict) -> Plan:
-    return Plan("w3c-sparql11", tier, kind="kit", systems={"nrese"},
+    return Plan("w3c-sparql11", tier, kind="kit", systems={"nrese"}, prepare=W3C_DATA,
                 command=["bash", "scripts/cargo-guarded.sh", "test", "--locked", "-p", "nrese-sparql",
-                         "--test", "w3c_sparql11"],
+                         "--test", "w3c_sparql11", *SHOW],
                 note="the other systems' results are cited from their reports")
 
 
 def w3c_shacl(root: Path, tier: str, settings: dict) -> Plan:
-    return Plan("w3c-shacl", tier, kind="kit", systems={"nrese"},
+    return Plan("w3c-shacl", tier, kind="kit", systems={"nrese"}, prepare=W3C_DATA,
                 command=["bash", "scripts/cargo-guarded.sh", "test", "--locked", "-p", "nrese-shacl",
-                         "--test", "w3c_shacl"])
+                         "--test", "w3c_shacl", *SHOW])
 
 
 def w3c_owl2_rl(root: Path, tier: str, settings: dict) -> Plan:
-    return Plan("w3c-owl2-rl", tier, kind="kit", systems={"nrese"},
+    return Plan("w3c-owl2-rl", tier, kind="kit", systems={"nrese"}, prepare=W3C_DATA,
                 command=["bash", "scripts/cargo-guarded.sh", "test", "--locked", "-p", "nrese-store",
-                         "--test", "w3c_owl2_rl"],
+                         "--test", "w3c_owl2_rl", *SHOW],
                 note="the test cases come from scripts/fetch-w3c-tests.sh")
 
 
 def geosparql(root: Path, tier: str, settings: dict) -> Plan:
-    return Plan("geosparql", tier, kind="kit", systems={"nrese"},
+    return Plan("geosparql", tier, kind="kit", systems={"nrese"}, prepare=W3C_DATA,
                 command=["bash", "scripts/cargo-guarded.sh", "test", "--locked", "-p", "nrese-sparql",
-                         "--test", "geosparql_compliance"],
+                         "--test", "geosparql_compliance", *SHOW],
                 note="the compliance benchmark; the data comes from scripts/fetch-w3c-tests.sh")
 
 

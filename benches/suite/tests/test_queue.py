@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import datetime
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SUITE = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("queue_runner", SUITE / "queue.py")
@@ -30,6 +32,14 @@ def job(**changes):
     return {"id": "j", "group": "sparql", "host": "office-pc", "checkout": "suite/sparql",
             "commands": [["python3", "benches/fast/fast.py", "compete", "--cases", "c"]], "needs": ["docker"],
             **changes}
+
+
+def fixture_environment():
+    """A foreign repository must never inherit the caller's hook-local Git context."""
+    discovery = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    local = subprocess.check_output(["git", "rev-parse", "--local-env-vars"],
+                                    env=discovery, text=True).splitlines()
+    return {k: v for k, v in os.environ.items() if k not in local}
 
 
 class Windows(unittest.TestCase):
@@ -102,7 +112,11 @@ class Hosts(unittest.TestCase):
 
 class Running(unittest.TestCase):
     def setUp(self):
+        clean = patch.dict(os.environ, fixture_environment(), clear=True)
+        clean.start()
+        self.addCleanup(clean.stop)
         self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
         self.repo = root / "repo.git"
         source = root / "source"
@@ -117,9 +131,6 @@ class Running(unittest.TestCase):
         self.q = queue.Queue(root / "queue", self.repo, root / "results", root / "queue" / "wt", watch=False)
         self.retreat = root / "RETREAT"
 
-    def tearDown(self):
-        self.tmp.cleanup()
-
     def submit(self, commands):
         path = self.q.directory / "pending" / "j.toml"
         path.write_text(queue.toml({"id": "j", "group": "g", "host": "h", "checkout": "x", "commands": commands}),
@@ -127,7 +138,9 @@ class Running(unittest.TestCase):
         return path, queue.read_job(path)
 
     def test_a_job_runs_in_its_checkout_and_is_done(self):
-        script = "import os, pathlib; pathlib.Path(os.environ['QUEUE_RESULTS'], 'out').write_text(open('hello.txt').read())"
+        script = ("import os, pathlib; "
+                  "assert not any(k in os.environ for k in ('GIT_DIR', 'GIT_INDEX_FILE', 'GIT_WORK_TREE', 'GIT_COMMON_DIR')); "
+                  "pathlib.Path(os.environ['QUEUE_RESULTS'], 'out').write_text(open('hello.txt').read())")
         path, found = self.submit([[sys.executable, "-c", script]])
         self.assertEqual(self.q.run(path, found, self.retreat), "done")
         done = queue.read_job(self.q.directory / "done" / "j.toml")
@@ -165,6 +178,29 @@ class Running(unittest.TestCase):
         self.assertEqual(self.q.run(path, found, self.retreat, chunk_min=0.02), "failed")
         self.assertLess(time.monotonic() - started, 20)
         self.assertIn("split it", queue.read_job(self.q.directory / "failed" / "j.toml")["note"])
+
+
+class HookEnvironment(unittest.TestCase):
+    def test_hook_context_cannot_redirect_fixture_or_queue_git_commands(self):
+        clean = fixture_environment()
+        with tempfile.TemporaryDirectory() as tmp:
+            outer = Path(tmp)
+            subprocess.run(["git", "init", "-q", str(outer)], env=clean, check=True)
+            (outer / "sentinel").write_text("outer repository")
+            subprocess.run(["git", "-C", str(outer), "add", "sentinel"], env=clean, check=True)
+            index = (outer / ".git" / "index").read_bytes()
+            hook = {"GIT_DIR": str(outer / ".git"), "GIT_WORK_TREE": str(outer),
+                    "GIT_INDEX_FILE": str(outer / ".git" / "index"), "GIT_COMMON_DIR": str(outer / ".git")}
+            with patch.dict(os.environ, hook):
+                scrubbed = fixture_environment()
+                self.assertFalse(set(hook) & set(scrubbed))
+                result = unittest.TestResult()
+                Running("test_a_job_runs_in_its_checkout_and_is_done").run(result)
+                self.assertTrue(result.wasSuccessful(), result.errors + result.failures)
+                self.assertEqual({k: os.environ[k] for k in hook}, hook)
+            self.assertEqual((outer / ".git" / "index").read_bytes(), index)
+            self.assertFalse(list((outer / ".git" / "refs" / "heads").iterdir()))
+            self.assertEqual((outer / "sentinel").read_text(), "outer repository")
 
 
 class Fairness(unittest.TestCase):

@@ -10,7 +10,7 @@ appends one entry to `invocations`:
 | started, finished | ISO 8601 times (finished is null while it runs, or if it died) |
 | argv | the `suite.py run` arguments |
 | protocol | runs, query runs, cache modes, order, seed, timeouts: the protocol knobs |
-| git | commit, branch, dirty (number of changed tracked files), describe |
+| git | commit, branch, dirty (number of changed or untracked files), describe |
 | machine | host, OS, CPU model, logical cores, RAM; Docker's own CPU and memory limits; the start-up of a no-op container (container_start_ms), which every step timed around `docker run` includes |
 | settings | the environment variables the suite reads (JAVA_HEAP, DOCKER_MEMORY, ...) |
 | images | image -> its content id, for every image the run used |
@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime
 import functools
+import hashlib
 import json
 import os
 import platform
@@ -153,13 +154,39 @@ def machine(runtime: str) -> dict:
 
 
 def git(root: Path) -> dict:
-    status = _out(["git", "status", "--porcelain", "--untracked-files=no"], root)
+    status = _out(["git", "status", "--porcelain", "--untracked-files=normal"], root)
     return {
         "commit": _out(["git", "rev-parse", "HEAD"], root),
         "branch": _out(["git", "rev-parse", "--abbrev-ref", "HEAD"], root),
         "describe": _out(["git", "describe", "--always", "--dirty"], root),
-        "dirty": len(status.splitlines()) if status else 0,
+        "dirty": len(status.splitlines()) if status is not None else None,
     }
+
+
+def binaries(target: Path, revision: str = "") -> dict:
+    """Hash native executables; release evidence additionally verifies the existing build records."""
+    names = [f"release/examples/{n}" for n in ("perf_lab", "perf_lab.real", "ql_print_check",
+             "tableau_consistency", "context_classify", "classify")] + ["release/nrese-server"]
+    out = {"dir": target.as_posix(), "revision": revision, "sha256": {}, "verified": False}
+    try:
+        if (target / "REVISION").is_file():
+            out["revision"] = (target / "REVISION").read_text().strip()
+        sums = target / "SHA256SUMS"
+        expected = dict((line.split(maxsplit=1)[1].lstrip(" *"), line.split(maxsplit=1)[0])
+                        for line in sums.read_text().splitlines()) if sums.is_file() else {}
+        for name in sorted(set(names) | set(expected)):
+            path = target / name
+            if not path.resolve().is_relative_to(target.resolve()):
+                raise ValueError("build hash path outside binary directory")
+            if path.is_file():
+                with path.open("rb") as stream:
+                    out["sha256"][name] = hashlib.file_digest(stream, "sha256").hexdigest()
+        out["verified"] = bool(expected and out["revision"] and (target / "REVISION").is_file()
+                               and (not revision or out["revision"] == revision)
+                               and expected == out["sha256"])
+    except (OSError, ValueError, IndexError) as error:
+        out["error"] = str(error)
+    return out
 
 
 def image_ids(images: list[str]) -> dict[str, str | None]:
