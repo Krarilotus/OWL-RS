@@ -2391,9 +2391,9 @@ impl<'a> Context<'a> {
                     continue;
                 }
                 let start = Instant::now();
-                if let Some(ranges) = strings::ranges(&self.snapshot, &condition, rows) {
+                if let Some((ranges, scan)) = strings::ranges(&self.snapshot, &condition, rows) {
                     if self.trace.is_some() {
-                        let detail = format!("terms {object} can take");
+                        let detail = format!("terms {object} can take | {scan}");
                         // The object's distinct values the conjuncts on it keep (each
                         // passing term is a range of one id or more).
                         let selectivity: f64 = filters
