@@ -30,7 +30,8 @@ python benches/fast/fast.py clean [--data]                this worktree's scratc
 | File | What |
 |---|---|
 | [`../cases/`](../cases/README.md) | the cases of every group, one schema: data, semantics, tool and arguments, the metric, checks, route checks, memory cap, comparators, home turf |
-| `fast.py` | the driver: build, data, run, compare, list, clean |
+| `fast.py` | the driver: build, data, run, compare, list, clean; `prepare` and `run --prepared` for a release gate |
+| `release_gate.py`, `w3c-expected.toml` | the release gate's decision: its plan, passes, report, W3C counts, guards, verdict and fleet jobs ([PROTOCOL.md §5](../PROTOCOL.md#the-release-gate); run by `scripts/release-gate.sh`) |
 | `compete.py` | `fast.py compete`: each case on its comparators, under the semantics each supports |
 | `queries/` | the cases' SPARQL (LUBM's and OWL2Bench's come from `../reasoning/queries`) |
 | `rules/`, `shapes/` | the user-rules case's N3 and Datalog programs; the SHACL case's shapes |
@@ -113,8 +114,12 @@ timeout) to run once more past it, so that its record says what it needs.
 
 ## Comparing
 
-`compare BASE NEW` owns the thresholds every comparison of this directory uses
-([PROTOCOL.md §5](../PROTOCOL.md#5-statistics) states the rules they implement).
+`compare BASE NEW` owns the thresholds of a comparison of two runs
+([PROTOCOL.md §5](../PROTOCOL.md#5-statistics) states the rules they implement). A release is
+decided by `release_gate.py` instead, over interleaved passes of the head and both baselines,
+each query, peak and client width on its own ([PROTOCOL.md §5, "The release
+gate"](../PROTOCOL.md#the-release-gate): its margin, floors and memory policy, and the
+measurements they rest on).
 
 0. **One host, one configuration:** runs of different hosts, or of one host under different
    configurations (its `config` in [hosts.toml](../hosts.toml) when each run started, or

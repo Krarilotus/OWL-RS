@@ -1,0 +1,349 @@
+"""The release gate (benches/fast/release_gate.py) and the pass options of fast.py it relies on.
+
+The defects of the 18 Oct 2026 audit each have a test here:
+1. a gate passed with one baseline and overlapping, identical timestamps;
+2. (compare.judge, test_release_policy.py) and here: identical sides must pass;
+3. main's perf lab reports no samples: its side is compared by per-process p50s, its
+   unreported values unchecked, never wrong; the data is the gate's, not the side's;
+6. one memory policy: the process's own peak judged, the cgroup's (page cache) reported.
+"""
+from __future__ import annotations
+
+import copy
+import importlib.util
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "benches" / "suite"))
+sys.path.insert(0, str(ROOT / "benches" / "fast"))
+spec = importlib.util.spec_from_file_location("release_gate", ROOT / "benches/fast/release_gate.py")
+gate_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gate_module)
+import fast  # noqa: E402
+
+HARNESS = "h" * 40
+REVS = {"cand": "c" * 40, "base": "b" * 40, "main": "m" * 40}
+ORDER = ["base", "main", "cand", "cand", "main", "base"] * 2
+MACHINE = {"host": "phuoc-yu", "cpu": "Ryzen", "governor": "performance"}
+
+
+def observation(samples, peak=500, cgroup=900, estimator="samples", rows=None, phases=None):
+    return {"identity": {"sweep": 0, "repeat": 0, "cache": "warm"}, "exit": 0, "samples": samples,
+            "estimator": estimator, "peak_mib": peak, "phase_peaks": phases or {}, "cgroup_peak_mib": cgroup,
+            "rows": rows or {q: 5 for q in samples}, "checks": [], "routes": []}
+
+
+def record(case="lab-olympics", samples=None, status="ok", expected="ok", **kw):
+    samples = samples if samples is not None else {"q01": [10.0, 10.1, 9.9, 10.0, 10.2], "q06": [4.8, 4.9, 4.8]}
+    obs = observation(samples, **kw)
+    return {"case": case, "rep": 1, "status": status, "expected_outcome": expected, "checks": [], "routes": [],
+            "samples": samples, "observations": [obs], "peak_mib": obs["peak_mib"], "notes": [], "counters": {}}
+
+
+def report(side, n, start, records, options=None):
+    rev = REVS[side]
+    binaries = {"revision": rev, "verified": True, "sha256": {"release/examples/perf_lab": side * 8}}
+    return {"label": f"gate-{n}-{side}", "started": "2026-10-20T01:00:00", "started_ns": start,
+            "finished": "2026-10-20T01:10:00", "finished_ns": start + 600, "reps": 1,
+            "planned_cases": sorted({r["case"] for r in records}), "records": records,
+            "git": {"commit": HARNESS, "dirty": 0}, "git_finished": {"commit": HARNESS, "dirty": 0},
+            "binaries": binaries, "binaries_finished": copy.deepcopy(binaries), "machine": MACHINE,
+            "runtime": "native", "prepared": {"manifest_sha256": "p" * 64, "files": 3, "changed": []},
+            "options": options or {"prepared": True, "routes": True, "empty_queries": False}}
+
+
+def passes(records_of=None, order=ORDER, starts=None):
+    """A campaign's passes: records_of(side, n) gives a pass's records."""
+    records_of = records_of or (lambda side, n: [record()])
+    starts = starts or [1000 * (i + 1) for i in range(len(order))]
+    return [{"n": i + 1, "side": side, "path": f"pass-{i + 1}-{side}.json",
+             "report": report(side, i + 1, starts[i], records_of(side, i + 1))}
+            for i, side in enumerate(order)]
+
+
+def run_gate(ps, sides=("cand", "base", "main"), require=("base", "main"), **kw):
+    return gate_module.gate(ps, {s: REVS[s] for s in sides}, "cand", list(require), HARNESS, **kw)
+
+
+class Schedule(unittest.TestCase):
+    """Defect 1."""
+
+    def test_identical_sides_in_a_real_a_b_b_a_campaign_pass(self):
+        summary = run_gate(passes())
+        self.assertEqual(summary["errors"], [])
+        self.assertEqual(summary["blocking"], [])
+        self.assertTrue(summary["passed"])
+
+    def test_one_baseline_never_passes_a_gate_that_requires_two(self):
+        ps = passes(order=["base", "cand", "cand", "base"] * 2)
+        summary = run_gate(ps, sides=("cand", "base"))
+        self.assertIn("required baselines missing: main", summary["errors"])
+        self.assertFalse(summary["passed"])
+
+    def test_overlapping_or_identical_timestamps_refuse_the_passes(self):
+        same = passes(starts=[5000] * 12)
+        self.assertTrue(any("started at the same time" in e for e in run_gate(same)["errors"]))
+        overlap = passes(starts=[1000 + 300 * i for i in range(12)])  # each pass lasts 600
+        self.assertTrue(any("overlap" in e for e in run_gate(overlap)["errors"]))
+        self.assertFalse(run_gate(overlap)["passed"])
+
+    def test_blocks_of_one_side_are_not_interleaved(self):
+        ps = passes(order=["base"] * 4 + ["main"] * 4 + ["cand"] * 4)
+        errors = run_gate(ps)["errors"]
+        self.assertTrue(any("not a palindrome" in e for e in errors))
+        self.assertTrue(any("more than two passes in a row" in e for e in errors))
+
+    def test_fewer_passes_than_the_campaign_are_diagnostic_only(self):
+        ps = passes(order=["base", "main", "cand", "cand", "main", "base"])
+        summary = run_gate(ps)
+        self.assertTrue(any("at least 4 required" in e for e in summary["errors"]))
+        diagnostic = run_gate(ps, min_passes=2)
+        self.assertEqual(diagnostic["errors"], [])
+        self.assertTrue(diagnostic["diagnostic"])
+        self.assertFalse(diagnostic["passed"])
+
+    def test_a_pass_must_say_what_it_ran(self):
+        ps = passes()
+        ps[3]["report"]["git"]["dirty"] = 2
+        ps[4]["report"]["binaries"]["revision"] = REVS["base"]
+        ps[5]["report"]["prepared"]["changed"] = ["/fast/lubm.nt"]
+        del ps[6]["report"]["finished_ns"]
+        errors = " ".join(run_gate(ps)["errors"])
+        for text in ("dirty 2", "expected " + REVS["main"], "prepared data changed", "unfinished pass"):
+            self.assertIn(text, errors)
+
+
+class Verdicts(unittest.TestCase):
+    def test_a_slower_query_against_one_baseline_blocks(self):
+        def records_of(side, n):
+            samples = {"q01": [10.0, 10.1, 9.9], "q06": [18.0, 18.2, 18.1] if side == "cand" else [4.8, 4.9, 4.8]}
+            return [record(samples=samples)]
+        summary = run_gate(passes(records_of))
+        self.assertFalse(summary["passed"])
+        self.assertTrue(any("lab-olympics against base: time/q06: regression" in b for b in summary["blocking"]))
+        self.assertTrue(any("lab-olympics against main: time/q06: regression" in b for b in summary["blocking"]))
+
+    def test_the_candidate_failing_a_case_blocks_and_a_baseline_failing_is_reported(self):
+        def records_of(side, n):
+            if side == "main":
+                r = record(status="failed")
+                r["notes"] = ['Error: "unknown argument --reason-runs"']
+                return [r]
+            return [record()]
+        summary = run_gate(passes(records_of))
+        row = summary["comparisons"]["main"]["lab-olympics"]
+        self.assertFalse(row["comparable"])
+        self.assertIn("main can't run it (unknown argument --reason-runs", row["reason"])
+        self.assertTrue(summary["passed"])
+        failing = run_gate(passes(lambda side, n: [record(status="wrong" if side == "cand" else "ok")]))
+        self.assertIn("lab-olympics", failing["candidate_failures"])
+        self.assertFalse(failing["passed"])
+
+    def test_stopping_at_a_declared_limit_where_a_baseline_finished_blocks(self):
+        def records_of(side, n):
+            if side == "cand":
+                return [record(status="memory-limit", expected="memory-limit")]
+            return [record(expected="memory-limit")]
+        summary = run_gate(passes(records_of))
+        self.assertTrue(any("stops at its declared outcome (memory-limit) where base completed" in b
+                            for b in summary["blocking"]))
+
+    def test_cases_not_run_block_unless_the_owner_waives_them(self):
+        summary = run_gate(passes(), not_run={"bsbm-bi-100m": "its cap is 28 GB"})
+        self.assertFalse(summary["passed"])
+        waived = run_gate(passes(), not_run={"bsbm-bi-100m": "its cap is 28 GB"},
+                          waived={"bsbm-bi-100m": "the owner, 20 Oct: measured on its own"})
+        self.assertTrue(waived["passed"])
+        self.assertIn("bsbm-bi-100m", waived["waived_blocks"])
+
+    def test_a_series_the_candidate_lost_blocks(self):
+        def records_of(side, n):
+            samples = {"q01": [10.0]} if side == "cand" else {"q01": [10.0], "q06": [4.8]}
+            return [record(samples=samples)]
+        summary = run_gate(passes(records_of))
+        self.assertTrue(any("time/q06: lost" in b for b in summary["blocking"]))
+
+
+class MainAdapter(unittest.TestCase):
+    """Defect 3: main f9b515e8's perf lab emits no samples_ms."""
+
+    def main_result(self, p50=4.8):
+        return {"label": "main", "load_s": 0.2, "peak_mib": 511, "sum_p50_ms": 15.0,
+                "queries": [{"name": "q01", "rows": 5, "p50_ms": 10.0, "min_ms": 9.9, "max_ms": 10.2},
+                            {"name": "q06", "rows": 1033, "p50_ms": p50, "min_ms": p50, "max_ms": p50}]}
+
+    def test_fast_takes_main_s_p50_as_one_value_per_process(self):
+        case = {"name": "lab-olympics", "metric": "sum_p50_ms", "queries": "@olympics"}
+        result = self.main_result()
+        self.assertEqual(fast.samples(case, result), {"q01": [10.0], "q06": [4.8]})
+        self.assertEqual(fast.estimator(result), "process-p50")
+        self.assertEqual(fast.estimator({"queries": [{"name": "q", "p50_ms": 1, "samples_ms": [1]}]}), "samples")
+
+    def test_without_routes_unreported_values_are_unchecked_not_wrong(self):
+        result = self.main_result()
+        with patch.dict(fast.OPTIONS, {"routes": False}):
+            value = fast.check("q.q06.value", 1033, result, {}, {})
+            rows = fast.check("q.q06.rows", 1033, result, {}, {})
+            route = fast.route("q.q06.operators", "has dictionary string test", result)
+        self.assertIsNone(value["ok"])
+        self.assertTrue(rows["ok"])
+        self.assertIsNone(route["ok"])
+        self.assertFalse(fast.check("q.q06.value", 1033, result, {}, {})["ok"])  # with routes: wrong
+
+    def test_main_is_compared_by_process_p50s_on_both_sides(self):
+        def records_of(side, n):
+            if side == "main":
+                return [record(samples={"q01": [10.0], "q06": [4.8 + 0.01 * n]}, estimator="process-p50")]
+            return [record(samples={"q01": [10.0, 10.1, 9.9], "q06": [17.0, 18.0, 30.0]})]
+        summary = run_gate(passes(records_of))
+        row = summary["comparisons"]["main"]["lab-olympics"]
+        self.assertIn("one p50 per process", " ".join(row["notes"]))
+        q06 = row["dimensions"]["time/q06"]
+        self.assertEqual(q06["verdict"], "regression")
+        self.assertAlmostEqual(q06["new"], 18.0)  # the candidate's process p50, not its pooled samples
+        self.assertEqual(summary["comparisons"]["base"]["lab-olympics"]["dimensions"]["time/q06"]["verdict"], "neutral")
+
+    def test_answers_that_differ_from_a_baseline_block_unless_a_check_pins_them(self):
+        def records_of(side, n):
+            return [record(rows={"q01": 5, "q06": 1000 if side == "main" else 1033})]
+        unpinned = run_gate(passes(records_of))
+        self.assertTrue(any("q06: rows [1033] here, [1000] on main: answers differ" in b for b in unpinned["blocking"]))
+        pinned = run_gate(passes(records_of), catalog=[{"name": "lab-olympics", "check": {"q.q06.rows": 1033}}])
+        self.assertTrue(pinned["passed"])
+        self.assertIn("q06", " ".join(pinned["comparisons"]["main"]["lab-olympics"]["notes"]))
+
+    def test_a_prepared_pass_generates_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(fast, "FAST_DATA", Path(tmp)), \
+                patch.object(fast, "RUNTIME", "native"), patch.dict(fast.OPTIONS, {"prepared": True}), \
+                patch.object(fast, "container") as container, \
+                patch.object(fast, "native_dirs", lambda: {"/fast": Path(tmp), "/target": Path(tmp)}):
+            with self.assertRaisesRegex(RuntimeError, "missing input: social people=10 was not prepared"):
+                fast.ensure_data("social people=10")
+            container.assert_not_called()
+
+    def test_prepared_files_are_checked_by_size_and_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp) / "d.nt"
+            data.write_text("x")
+            stat = data.stat()
+            files = {data.as_posix(): {"bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": "-"}}
+            self.assertEqual(fast.changed_inputs(files), [])
+            data.write_text("xy")
+            self.assertEqual(fast.changed_inputs(files), [data.as_posix()])
+
+
+class Memory(unittest.TestCase):
+    """Defect 6: one policy. The process's own peak is judged; the cgroup's, which counts the
+    page cache charged to the case's reads, is reported beside it and never judged."""
+
+    def test_a_cgroup_peak_of_page_cache_is_reported_not_judged(self):
+        summary = run_gate(passes(lambda side, n: [record(cgroup=5000 if side == "cand" else 1000)]))
+        self.assertTrue(summary["passed"])
+        row = summary["comparisons"]["base"]["lab-olympics"]
+        self.assertEqual(row["reported"]["cgroup_peak_mib"], [1000, 5000])
+        self.assertNotIn("memory/cgroup", row["dimensions"])
+
+    def test_more_process_memory_beyond_margin_and_floor_blocks(self):
+        summary = run_gate(passes(lambda side, n: [record(peak=800 if side == "cand" else 500)]))
+        self.assertTrue(any("memory/lifetime: regression" in b for b in summary["blocking"]))
+        small = run_gate(passes(lambda side, n: [record(peak=540 if side == "cand" else 500)]))
+        self.assertTrue(small["passed"])
+
+    def test_phase_peaks_are_judged_where_both_sides_report_them(self):
+        def records_of(side, n):
+            phases = {"load": 900 if side == "cand" else 400}
+            return [record(phases=None if side == "main" else phases)]
+        summary = run_gate(passes(records_of))
+        self.assertIn("memory/phase/load", summary["comparisons"]["base"]["lab-olympics"]["dimensions"])
+        self.assertTrue(any("against base: memory/phase/load: regression" in b for b in summary["blocking"]))
+        self.assertIn("phase peaks: main's perf lab reports none", " ".join(
+            summary["comparisons"]["main"]["lab-olympics"]["notes"]))
+
+
+class Parts(unittest.TestCase):
+    def test_plan_never_lowers_a_cap(self):
+        catalog = [{"name": "small", "cap_gb": 4}, {"name": "bsbm-bi-100m", "cap_gb": 28}]
+        run, not_run = gate_module.plan(catalog, 24)
+        self.assertEqual(run, ["small"])
+        self.assertIn("its cap is 28 GB", not_run["bsbm-bi-100m"])
+
+    def test_guards_are_read_from_performance_md_and_must_each_pass(self):
+        names = gate_module.guard_names((ROOT / "docs/design/performance.md").read_text(encoding="utf-8"))
+        self.assertIn("ordered_dedup_uses_any_complete_sort_order_without_gathering", names)
+        self.assertIn("cycles_are_counted_without_their_solutions", names)
+        self.assertNotIn("nrese-exec", names)
+        log = ("test a::ordered_dedup_uses_any_complete_sort_order_without_gathering ... ok\n"
+               "test cycles_are_counted_without_their_solutions ... ignored\n")
+        errors, _ = gate_module.guards_check(["ordered_dedup_uses_any_complete_sort_order_without_gathering",
+                                              "cycles_are_counted_without_their_solutions", "a_missing_guard_name"], log)
+        self.assertEqual(len(errors), 2)
+        self.assertIn("ignored", errors[0])
+        self.assertIn("no test of that name ran", errors[1])
+
+    def test_w3c_counts_are_required_per_suite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp)
+            (logs / "w3c_owl2_rl.log").write_text(
+                "W3C OWL 2 RL test cases (RDF-based semantics): 86 passed, 0 failed (0 expected), 3 skipped\n"
+                "test result: ok. 1 passed; 0 failed; 0 ignored\n")
+            (logs / "w3c_shacl.log").write_text("W3C SHACL Core: 98 of 98 pass\n")
+            (logs / "w3c_sparql11.log").write_text(
+                "W3C SPARQL 1.1 on engine v2: passed / failed / skipped (failures shared with the reference)\n"
+                "  QueryEvaluation: 239 / 0 / 0 (0)\n  total: 505 / 0 / 0 (0)\n")
+            (logs / "tableau-w3c.tsv").write_text("a\tConsistencyTest\tAL\tpass\t0\n" * 410 +
+                                                  "b\tInconsistencyTest\tAL\tdisputed\t0\n")
+            counts = gate_module.w3c_counts(logs)
+            expected = {"OWL 2 RL": {"passed": 86, "skipped": 3}, "SHACL Core": {"passed": 98},
+                        "SPARQL 1.1": {"passed": 505}, "OWL 2 DL": {"passed": 410, "disputed": 1},
+                        "SHACL-SPARQL": {"passed": 22}}
+            errors = gate_module.w3c_check(counts, expected)
+            self.assertEqual(errors, ["SHACL-SPARQL: no counts (its kit didn't run, or its data was missing)"])
+            counts["OWL 2 RL"]["skipped"] = 89
+            self.assertIn("OWL 2 RL: 89 skipped, at most 3 known", gate_module.w3c_check(counts, expected))
+
+    def test_the_expected_w3c_counts_cover_the_merge_gate_state(self):
+        import tomllib
+        expected = tomllib.loads((ROOT / "benches/fast/w3c-expected.toml").read_text(encoding="utf-8"))["suite"]
+        self.assertEqual(expected["OWL 2 DL"], {"passed": 410, "disputed": 1})
+        self.assertEqual(expected["OWL 2 RL"]["passed"], 86)
+        self.assertEqual(expected["OWL 2 RL"]["skipped"], 3)
+
+    def test_the_jobs_run_the_whole_gate_on_its_hosts_without_a_priority_of_their_own(self):
+        found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 4, None)
+        build, timed, checks = found["rg-test-build"], found["rg-test-timed"], found["rg-test-checks"]
+        self.assertEqual((build["kind"], build["requires"]["hosts"]), ("owlrs.build", ["phuoc-yu"]))
+        self.assertEqual((timed["kind"], timed["class"], timed["after"]), ("owlrs.timed", "exclusive", ["rg-test-build"]))
+        self.assertEqual(checks["requires"]["hosts"], ["office-pc"])
+        sides = [step[4] for step in timed["steps"] if step[2] == "pass"]
+        self.assertEqual(sides, ORDER)
+        self.assertEqual(timed["steps"][-2][2:4], ["report", "c" * 40])
+        self.assertEqual([s[2] for s in checks["steps"]], ["w3c", "guards", "clean"])
+        for job in found.values():
+            self.assertNotIn("priority", job)
+            self.assertEqual(job["priority_class"], "merge-gate")
+        text = gate_module.toml_job(timed)
+        import tomllib
+        self.assertEqual(tomllib.loads(text)["steps"], timed["steps"])
+        with self.assertRaises(ValueError):
+            gate_module.schedule(3)
+
+    def test_report_writes_markdown_and_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            for p in passes():
+                (directory / p["path"]).write_text(json.dumps(p["report"]), encoding="utf-8")
+            loaded = gate_module.load_passes(directory)
+            self.assertEqual([p["side"] for p in sorted(loaded, key=lambda p: p["n"])], ORDER)
+            summary = run_gate(loaded)
+            text = gate_module.render(summary)
+            self.assertIn("**PASSED.**", text)
+            self.assertIn("## Against main", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

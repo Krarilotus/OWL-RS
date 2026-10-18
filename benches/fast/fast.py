@@ -6,6 +6,7 @@ hour, run like unit tests for performance (README.md here; the cases: benches/ca
     python benches/fast/fast.py build                    perf lab and DL tools, Linux, in a capped container
     python benches/fast/fast.py run [--cases A,B] [--areas X,Y] [--reps 2] [--label L]
     python benches/fast/fast.py compare BASE.json NEW.json
+    python benches/fast/fast.py prepare [--cases A,B]   a release gate's data, once, by one generator (native)
     python benches/fast/fast.py compete [--cases A,B] [--systems S,T]   NRESE beside its comparators
     python benches/fast/fast.py table [--baseline R] [--write]   the cases as CATALOG.md's table
     python benches/fast/fast.py clean [--data]           this worktree's scratch; --data the shared data volume too
@@ -332,6 +333,15 @@ def seed_from_inputs(target: str) -> bool:
     return files(f"test -s {target}").returncode == 0
 
 
+# A release gate's passes (release_gate.py): `run --prepared` reads data `prepare` made with
+# one generator, the gate's, before any pass, and generates nothing itself (a pass on an
+# engine's binaries would otherwise generate with that engine's perf lab: main's has no
+# generator, an older one may generate other data). `--no-routes` and `--empty-queries` run a
+# perf lab older than the harness (main's): no route report, `--queries` required.
+OPTIONS = {"prepared": False, "routes": True, "empty_queries": False}
+PREPARED = "PREPARED.json"
+
+
 def ensure_data(spec: str) -> dict:
     """Generates `spec` once (or takes it from the verified inputs); its `expect` (the
     generator's own answers)."""
@@ -343,6 +353,10 @@ def ensure_data(spec: str) -> dict:
     if spec.startswith("concat:"):
         target = data_file(spec)
         parts = " ".join(data_file(part) for part in spec[len("concat:"):].split("+"))
+        if OPTIONS["prepared"]:
+            if files(f"test -s {target}").returncode != 0:
+                raise RuntimeError(f"missing input: {spec} was not prepared (fast.py prepare)")
+            return {}
         files(f"test -s {target} || cat {parts} > {target}")
         return {}
     path = data_file(spec)
@@ -350,6 +364,8 @@ def ensure_data(spec: str) -> dict:
     found = files(f"cat {path}.expect.json")
     if found.returncode == 0 and found.stdout.strip():
         return json.loads(found.stdout)["expect"]
+    if OPTIONS["prepared"]:
+        raise RuntimeError(f"missing input: {spec} was not prepared (fast.py prepare)")
     kind, *params = spec.split()
     print(f"  generating {path}", flush=True)
     code, out, err, _ = container(f"fast-gen-{ROOT.name}", 8, [
@@ -475,7 +491,12 @@ def queries_path(case: dict, expect: dict) -> str | None:
         cache_log()
         return "/out/queries/cache-log"
     if name.startswith("@"):
-        # Another kit's query set: benches/competitors/queries/NAME.
+        # Another kit's query set: benches/competitors/queries/NAME, or, natively, a generated
+        # set kept with the data (NRESE_FAST_QUERY_SETS/NAME: WatDiv's, never committed; their
+        # SHA-256 in benches/sparql/queries.sha256, checked by release-gate.sh prepare).
+        kept = os.environ.get("NRESE_FAST_QUERY_SETS")
+        if kept and RUNTIME == "native" and (Path(kept) / name[1:]).is_dir():
+            return (Path(kept) / name[1:]).as_posix()
         return f"/src/benches/competitors/queries/{name[1:]}"
     if name in ("lubm", "owl2bench"):
         return f"/src/benches/reasoning/queries/{name}"
@@ -598,7 +619,10 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
     result: dict = {}
     observations = []
     if tool == "perf_lab":
-        base = ["/target/release/examples/perf_lab", "--label", label, "--routes", "--json", out_json]
+        base = ["/target/release/examples/perf_lab", "--label", label,
+                *(["--routes"] if OPTIONS["routes"] else []), "--json", out_json]
+        if not OPTIONS["routes"]:
+            record["notes"].append("routes unchecked: this perf lab has no --routes")
         loads = [] if "setup" in case or case["data"] == "none" else \
             [x for f in [case["data"], *case.get("extra", [])] for x in ("--load", data_file(f))]
         if case.get("tool_loads") is False:
@@ -607,6 +631,12 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         if any(a == "--canonicalize" for a in case.get("args", [])):
             loads = []
         queries = queries_path(case, expect)
+        if not queries and OPTIONS["empty_queries"]:
+            # An older perf lab requires --queries: an empty directory, no query run.
+            (SCRATCH / "queries" / "empty").mkdir(parents=True, exist_ok=True)
+            queries = "/out/queries/empty"
+        if timed_metric(case) != case["metric"]:
+            record["notes"].append(f"timed by its load: its metric ({case['metric']}) is the suite driver's")
         command = [*base, *loads, *(["--queries", queries] if queries else []),
                    *substitute(case.get("args", []), data, scratch)]
         script = ""
@@ -735,9 +765,10 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
     record["routes"] = [route(path, want, result) for path, want in case.get("route", {}).items()]
     wanted = case.get("outcome", "ok")
     if record["status"] == "ok":
-        if any(not c["ok"] for c in record["checks"] + [c for o in observations for c in o.get("checks", [])]):
+        # A check the tool can't report (ok None: --no-routes) is unchecked, not failed.
+        if any(c["ok"] is False for c in record["checks"] + [c for o in observations for c in o.get("checks", [])]):
             record["status"] = "wrong"
-        elif any(not r["ok"] for r in record["routes"] + [r for o in observations for r in o.get("routes", [])]):
+        elif any(r["ok"] is False for r in record["routes"] + [r for o in observations for r in o.get("routes", [])]):
             record["status"] = "off-route"
     record["expected_outcome"] = wanted
     record["verdict"] = verdict(case, record)
@@ -759,10 +790,31 @@ def invocation_observation(case: dict, result: dict, stderr: str, identity: dict
     phases = {k: v.get("peak_mib") for k, v in (result.get("phases") or {}).items()}
     peak = process_peak(result.get("peak_mib"), phases)
     levels = client_throughput(result)
-    return {"identity": identity, "samples": samples(case, result), "metric": metric_value(case, result),
-            "counters": counters(case, result), **({"throughput": levels} if levels else {}),
+    return {"identity": identity, "samples": samples(case, result), "estimator": estimator(result),
+            "metric": metric_value(case, result), "counters": counters(case, result),
+            **({"throughput": levels} if levels else {}),
+            "rows": {q["name"]: q.get("rows") for q in result.get("queries", []) if "name" in q},
             "phase_peaks": phases, "peak_mib": peak, "memory_kind": "lifetime" if peak else "unknown",
             "cgroup_peak_mib": result.get("cgroup_peak_mib") or scope_peak_mib(stderr)}
+
+
+def estimator(result: dict) -> str:
+    """How a process's query series were measured: every timed run (`samples`), or, from a
+    perf lab that reports only each query's p50, min and max (main's, f9b515e8), one value per
+    process (`process-p50`): its p50, the median the newer perf lab also reports
+    (`times[len / 2]` in both). A comparison with such a side compares process p50s on
+    both sides (release_gate.py), never its p50 against the other's raw samples."""
+    queries = [q for q in result.get("queries", []) if "error" not in q]
+    return "process-p50" if any("samples_ms" not in q and "p50_ms" in q for q in queries) else "samples"
+
+
+def timed_metric(case: dict) -> str:
+    """The metric a case is timed by here: its own; for a case of the suite driver's (its
+    metric a description, BIBM's `ms per mix ...`) without queries here, its load."""
+    metric = case["metric"]
+    if " " in metric and not case.get("queries") and case.get("tool", "perf_lab") == "perf_lab":
+        return "load_s"
+    return metric
 
 
 DL_PHASES = ("parse", "read", "normalise", "compile", "saturate", "blocking", "expand", "search", "datatypes")
@@ -876,15 +928,23 @@ def same(a, b) -> bool:
         return str(a).lower() == str(b).lower()
 
 
+UNCHECKED = "not reported by this perf lab (no --routes): unchecked"
+
+
 def check(path: str, want, result: dict, expect: dict, alt_expect: dict) -> dict:
     expected = resolve(want, alt_expect if path.startswith("alt.") else expect)
     got = lookup(path, result)
+    shown = (want if isinstance(want, str) and (want[:2] in (">=", "<=") or want.startswith(("has ", "lacks ")))
+             else expected)
+    if got is None and not OPTIONS["routes"]:
+        # A perf lab without --routes reports no query's value, status or operators: such a
+        # check is unchecked (ok None), not a wrong answer; its rows still are checked.
+        return {"path": path, "expected": shown, "got": None, "ok": None, "note": UNCHECKED}
     if isinstance(want, str) and (want[:2] in (">=", "<=") or want.startswith(("has ", "lacks "))):
         ok = compare_op(got, want)
     else:
         ok = got is not None and expected is not None and same(got, expected)
-    return {"path": path, "expected": want if isinstance(want, str) and (want[:2] in (">=", "<=") or want.startswith(("has ", "lacks "))) else expected,
-            "got": got, "ok": ok}
+    return {"path": path, "expected": shown, "got": got, "ok": ok}
 
 
 def compare_op(got, want: str) -> bool:
@@ -904,6 +964,8 @@ def compare_op(got, want: str) -> bool:
 
 def route(path: str, want: str, result: dict) -> dict:
     got = lookup(path, result)
+    if got is None and not OPTIONS["routes"]:
+        return {"path": path, "expected": want, "got": None, "ok": None, "note": UNCHECKED}
     return {"path": path, "expected": want, "got": got, "ok": compare_op(got, want)}
 
 
@@ -964,6 +1026,7 @@ def cold_ms(result: dict) -> float | None:
 
 
 def metric_value(case: dict, result: dict):
+    case = {**case, "metric": timed_metric(case)}
     if case["metric"] == "cold_ms":
         # With the page cache warm and emptied: the sum of the two modes' medians.
         total = None
@@ -983,6 +1046,7 @@ def metric_value(case: dict, result: dict):
 
 def samples(case: dict, result: dict) -> dict:
     """Per series, the measured samples (ms) the metric is a median or sum of medians of."""
+    case = {**case, "metric": timed_metric(case)}
     metric = case["metric"]
     if result.get("client_sweep"):
         return {f"{level['clients']} clients p99": [level["p99_ms"]] for level in result["client_sweep"]}
@@ -999,7 +1063,9 @@ def samples(case: dict, result: dict) -> dict:
     if metric == "cold_ms":
         return cold_series(result, detailed=True)
     if metric == "sum_p50_ms":
-        return {q["name"]: q["samples_ms"] for q in result.get("queries", []) if "samples_ms" in q}
+        # A perf lab without samples (main's): its p50, one value per process (estimator()).
+        return {q["name"]: q["samples_ms"] if "samples_ms" in q else [q["p50_ms"]]
+                for q in result.get("queries", []) if "error" not in q and ("samples_ms" in q or "p50_ms" in q)}
     section = metric.split(".")[0]
     if isinstance(result.get(section), dict) and "samples_ms" in result[section]:
         return {"_": result[section]["samples_ms"]}
@@ -1067,6 +1133,89 @@ def vector_recall(case: dict, expect: dict) -> float:
 
 # --- run -------------------------------------------------------------------------------------
 
+def input_files(case: dict) -> list[Path]:
+    """The host files a case reads (native runtime): its data, alternative and extra data with
+    their sidecars (the generator's answers, commit files), and its reference taxonomy."""
+    out = []
+    specs = [case["data"], *([case["data_alt"]] if case.get("data_alt") else []), *case.get("extra", [])]
+    for spec in specs:
+        if spec == "none":
+            continue
+        path = Path(native(data_file(spec)))
+        out.append(path)
+        if not spec.startswith("volume:") and path.parent.is_dir():
+            out += sorted(p for p in path.parent.glob(path.name + ".*") if p.is_file())
+    if case.get("reference"):
+        out.append(Path(native(case["reference"])))
+    return out
+
+
+def file_digest(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def prepare(args) -> int:
+    """`prepare`: the selected cases' data, generated once by this perf lab (NRESE_FAST_BIN:
+    the harness revision's, for every side of a gate), and FAST_DATA/PREPARED.json: every file
+    the cases read, generated or a dataset, with its size, modification time and SHA-256.
+    `run --prepared` then generates nothing and checks the files before and after its pass."""
+    if RUNTIME != "native":
+        sys.exit("prepare is the native runtime's (a release gate's host)")
+    cases = select(load_cases(), args)
+    entries, failed = {}, {}
+    for case in cases:
+        try:
+            for spec in [case["data"], *([case["data_alt"]] if case.get("data_alt") else []), *case.get("extra", [])]:
+                ensure_data(spec)
+            if case.get("reference") and not seed_from_inputs(case["reference"]):
+                raise RuntimeError(f"missing input: reference taxonomy {case['reference']}")
+            for path in input_files(case):
+                if not path.is_file():
+                    raise RuntimeError(f"missing input: {path}")
+                if path.as_posix() not in entries:
+                    stat = path.stat()
+                    entries[path.as_posix()] = {"bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns,
+                                                "sha256": file_digest(path)}
+            print(f"prepared {case['name']}", flush=True)
+        except Exception as error:  # a case without its data is reported, the others prepared
+            failed[case["name"]] = str(error)[:300]
+            print(f"NOT prepared {case['name']}: {failed[case['name']]}", flush=True)
+    manifest_path = FAST_DATA / PREPARED
+    manifest_path.write_text(json.dumps({"git": manifest.git(ROOT), "binaries": binaries(),
+                                         "cases": [c["name"] for c in cases if c["name"] not in failed],
+                                         "failed": failed, "files": entries}, indent=1), encoding="utf-8")
+    print(f"{len(cases) - len(failed)} of {len(cases)} cases prepared, {len(entries)} files: {manifest_path}")
+    return 1 if failed else 0
+
+
+def prepared_inputs(cases: list[dict]) -> dict:
+    """PREPARED.json, its SHA-256, and what stands in the way of a pass over `cases`: a case
+    not prepared, a file changed since (size or modification time)."""
+    path = FAST_DATA / PREPARED
+    try:
+        data = path.read_bytes()
+        recorded = json.loads(data)
+    except (OSError, ValueError) as error:
+        return {"errors": [f"no prepared data ({path}: {error}); run fast.py prepare first"], "files": {}}
+    errors = [f"{c['name']} was not prepared" for c in cases if c["name"] not in recorded["cases"]]
+    errors += [f"{file} changed since it was prepared" for file in changed_inputs(recorded["files"])]
+    return {"errors": errors, "files": recorded["files"], "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def changed_inputs(files: dict) -> list[str]:
+    changed = []
+    for file, was in files.items():
+        try:
+            stat = Path(file).stat()
+        except OSError:
+            changed.append(file)
+            continue
+        if (stat.st_size, stat.st_mtime_ns) != (was["bytes"], was["mtime_ns"]):
+            changed.append(file)
+    return changed
+
+
 def not_as_expected(records: list[dict], off_route_ok: bool = False) -> list[dict]:
     """The runs that make `run` fail: each whose status isn't its case's expected outcome,
     except, for an A/B's base (`off_route_ok`), a case off its expected route: measured
@@ -1087,16 +1236,27 @@ def run(args) -> int:
                  "the cases as host processes")
     catalog = load_cases()
     cases = select(catalog, args)
+    OPTIONS.update(prepared=getattr(args, "prepared", False), routes=not getattr(args, "no_routes", False),
+                   empty_queries=getattr(args, "empty_queries", False))
+    prepared = None
+    if OPTIONS["prepared"]:
+        prepared = prepared_inputs(cases)
+        if prepared["errors"]:
+            print("\n".join(f"prepared data: {e}" for e in prepared["errors"]), file=sys.stderr)
+            return 2
     label = args.label or (manifest.git(ROOT).get("commit") or "nrese")[:8]
     started = datetime.datetime.now()
     # The full report outside git; the repository keeps its compact record (README, "What is kept").
     REPORTS.mkdir(parents=True, exist_ok=True)
     BASELINES.mkdir(parents=True, exist_ok=True)
     out = (Path(args.out) if args.out else REPORTS / f"{started:%Y-%m-%d}-{label}.json").resolve()
-    report = {"label": label, "started": started.isoformat(timespec="seconds"),
+    report = {"label": label, "started": started.isoformat(timespec="seconds"), "started_ns": time.time_ns(),
               "git": manifest.git(ROOT), "machine": manifest.machine(RUNTIME), "runtime": RUNTIME,
               "reps": args.reps, "planned_cases": [c["name"] for c in cases],
-              "all_cases": [c["name"] for c in catalog], "case_manifest": case_manifest(catalog), "records": []}
+              "all_cases": [c["name"] for c in catalog], "case_manifest": case_manifest(catalog),
+              "options": dict(OPTIONS), "records": []}
+    if prepared:
+        report["prepared"] = {"manifest_sha256": prepared["sha256"], "files": len(prepared["files"])}
     if RUNTIME == "native":
         # What the binaries are: they come from a build host, not from this checkout.
         report["binaries"] = binaries()
@@ -1124,7 +1284,7 @@ def run(args) -> int:
                   f"{(f'{metric:,.{1 if metric >= 10 else 4}f} ms' if isinstance(metric, (int, float)) else '-'):>14} "
                   f"peak {record.get('peak_mib') or '-':>6} MiB  {record['case_s']:>6.1f} s{mark}", flush=True)
             for c in record["checks"] + record["routes"]:
-                if not c["ok"]:
+                if c["ok"] is False:
                     print(f"      {c['path']}: expected {c['expected']}, got {c['got']}")
             for note in record.get("notes", []):
                 print(f"      {note}")
@@ -1139,6 +1299,10 @@ def run(args) -> int:
     report["git_finished"] = manifest.git(ROOT)
     if RUNTIME == "native":
         report["binaries_finished"] = binaries()
+    if prepared:
+        # The prepared data must be what it was at the start of the pass, file by file.
+        report["prepared"]["changed"] = changed_inputs(prepared["files"])
+    report["finished_ns"] = time.time_ns()
     report["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
     report["duration_s"] = round((datetime.datetime.now() - started).total_seconds(), 1)
     out.write_text(json.dumps(report, indent=1), encoding="utf-8")
@@ -1291,7 +1455,7 @@ def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
-    for name in ("list", "run", "compete"):
+    for name in ("list", "run", "compete", "prepare"):
         s = sub.add_parser(name)
         s.add_argument("--cases")
         s.add_argument("--areas")
@@ -1303,6 +1467,13 @@ def main() -> int:
                            help="an A/B's base: a case off its expected route (an operator the base "
                                 "hasn't) is a measured run, not a failure; failed, wrong or missing "
                                 "runs still are")
+            s.add_argument("--prepared", action="store_true",
+                           help="a gate's pass: the data `prepare` made, nothing generated, checked before and after")
+            s.add_argument("--no-routes", action="store_true",
+                           help="a perf lab without --routes (main's): route checks and the values only it "
+                                "reports are unchecked (ok null), never failed")
+            s.add_argument("--empty-queries", action="store_true",
+                           help="a perf lab that requires --queries (main's): an empty directory where a case has none")
         if name == "compete":
             s.add_argument("--systems")
             s.add_argument("--runs", type=int, default=1)
@@ -1333,7 +1504,7 @@ def main() -> int:
         from compete import compete
         return compete(args)
     return {"list": list_cases, "build": build, "run": run, "compare": compare, "clean": clean,
-            "table": table}[args.command](args)
+            "table": table, "prepare": prepare}[args.command](args)
 
 
 if __name__ == "__main__":

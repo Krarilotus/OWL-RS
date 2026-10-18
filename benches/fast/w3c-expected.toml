@@ -1,0 +1,34 @@
+# The W3C suites the release gate requires (release_gate.py w3c; benches/PROTOCOL.md §5):
+# per suite at least `passed`, no failure beyond `failed` (0), at most the known `skipped`
+# and `disputed`. A suite without counts (its data missing, its kit not run) fails. The
+# numbers are the v2 merge gate's (docs/plan/2026-10-05-v2-merge-checklist.md §4: no wrong
+# answers), as measured on office-pc on 14 Oct 2026 (v15-gate-w3c-3, v15-gate-w3c-dl).
+# A suite that grows raises its count here in the same commit.
+
+[suite."SPARQL 1.1"]
+passed = 505
+
+[suite."SPARQL 1.2"]
+passed = 269
+
+[suite."SHACL Core"]
+passed = 98
+
+[suite."SHACL-SPARQL"]
+passed = 22
+
+# RL: 3 known skips (BJP-002's premise is in functional syntax only; imports-011 and -013
+# import another ontology).
+[suite."OWL 2 RL"]
+passed = 86
+skipped = 3
+
+# DL (tableau_w3c): every case decided; WebOnt-description-logic-909 disputed.
+[suite."OWL 2 DL"]
+passed = 410
+disputed = 1
+
+# GeoSPARQL compliance benchmark: 18 of 212 disputed with the reference.
+[suite."GeoSPARQL"]
+passed = 194
+disputed = 18
