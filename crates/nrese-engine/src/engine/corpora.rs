@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
 
@@ -55,14 +55,16 @@ pub struct TextCorpusStats {
     pub derived: u64,
 }
 
-/// A kept corpus: of which statements, of what, and built (once) by the first search.
+/// A kept corpus: of which statements, of what, and the corpus once its first search
+/// built it (`None` meanwhile: other searches build their own rather than wait, since the
+/// build runs on every core and a waiting thread may be one of its parts').
 struct Kept {
     content: Content,
     kind: CorpusKind,
     /// The latest version seen with this content (compaction gives the same content new
     /// runs): while it lives, a snapshot may still ask.
     version: Weak<Version>,
-    cell: Arc<OnceLock<Arc<Corpus>>>,
+    corpus: Option<Arc<Corpus>>,
 }
 
 /// One step of the lineage: the content it was made from and the terms it touched
@@ -97,12 +99,13 @@ impl Default for CorpusStore {
 }
 
 /// What a search finds for a corpus it needs: kept, or to derive from an ancestor's
-/// (with the terms touched since), or to walk.
+/// (with the terms touched since) or to walk; and whether to keep what it builds (not
+/// where another search is building it).
 pub(crate) enum Found {
     Kept(Arc<Corpus>),
     Build {
-        cell: Arc<OnceLock<Arc<Corpus>>>,
         from: Option<(Arc<Corpus>, Vec<u64>)>,
+        keep: bool,
     },
 }
 
@@ -238,26 +241,29 @@ impl CorpusStore {
         None
     }
 
-    /// The corpus `kind` of `version`: kept, or a cell to build it in, with the nearest
-    /// kept ancestor's corpus and the terms touched since where the lineage has one.
+    /// The corpus `kind` of `version`: kept, or to build, with the nearest kept ancestor's
+    /// corpus and the terms touched since where the lineage has one.
     pub(crate) fn find(&self, version: &Arc<Version>, kind: &CorpusKind) -> Found {
         let content = version.content;
         let mut state = self.state.lock();
-        if let Some(at) = state
+        let at = state
             .kept
             .iter()
-            .position(|k| k.content == content && k.kind == *kind)
-        {
-            // The most recently used goes last.
-            let mut kept = state.kept.remove(at);
-            kept.version = Arc::downgrade(version);
-            let cell = Arc::clone(&kept.cell);
-            state.kept.push(kept);
-            return match cell.get() {
-                Some(corpus) => Found::Kept(Arc::clone(corpus)),
-                None => Found::Build { cell, from: None },
-            };
-        }
+            .position(|k| k.content == content && k.kind == *kind);
+        let building = match at {
+            Some(at) => {
+                // The most recently used goes last.
+                let mut kept = state.kept.remove(at);
+                kept.version = Arc::downgrade(version);
+                let corpus = kept.corpus.clone();
+                state.kept.push(kept);
+                if let Some(corpus) = corpus {
+                    return Found::Kept(corpus);
+                }
+                true
+            }
+            None => false,
+        };
         // The nearest ancestor with a kept, built corpus of this kind.
         let mut from = None;
         let mut terms: Vec<u64> = Vec::new();
@@ -272,7 +278,7 @@ impl CorpusStore {
                 .kept
                 .iter()
                 .find(|k| k.content == at && k.kind == *kind)
-                .and_then(|k| k.cell.get());
+                .and_then(|k| k.corpus.as_ref());
             if let Some(corpus) = ancestor {
                 if worth_deriving(terms.len(), corpus.documents()) {
                     terms.sort_unstable();
@@ -285,7 +291,9 @@ impl CorpusStore {
                 break;
             }
         }
-        let cell = Arc::new(OnceLock::new());
+        if building {
+            return Found::Build { from, keep: false };
+        }
         // A newer corpus of this kind: the kept ones of versions no snapshot holds go.
         state
             .kept
@@ -294,10 +302,32 @@ impl CorpusStore {
             content,
             kind: kind.clone(),
             version: Arc::downgrade(version),
-            cell: Arc::clone(&cell),
+            corpus: None,
         });
         self.evict(&mut state);
-        Found::Build { cell, from }
+        Found::Build { from, keep: true }
+    }
+
+    /// Keeps `corpus`, built for `kind` of `version` by the search [`Self::find`] told to,
+    /// and keeps within the bounds.
+    pub(crate) fn keep(&self, version: &Arc<Version>, kind: &CorpusKind, corpus: Arc<Corpus>) {
+        let mut state = self.state.lock();
+        let content = version.content;
+        match state
+            .kept
+            .iter_mut()
+            .find(|k| k.content == content && k.kind == *kind)
+        {
+            Some(kept) => kept.corpus = Some(corpus),
+            // Evicted while it was built: kept again, as the most recently used.
+            None => state.kept.push(Kept {
+                content,
+                kind: kind.clone(),
+                version: Arc::downgrade(version),
+                corpus: Some(corpus),
+            }),
+        }
+        self.evict(&mut state);
     }
 
     /// Counts a corpus built, by a walk or derived.
@@ -308,17 +338,12 @@ impl CorpusStore {
         };
     }
 
-    /// Keeps within the bounds, now that a corpus is built.
-    pub(crate) fn bound(&self) {
-        self.evict(&mut self.state.lock());
-    }
-
     /// Least recently used first out, until at most [`ENTRIES`] are kept and their bytes
     /// fit the budget; the most recent stays, whatever its size (a search needs it).
     fn evict(&self, state: &mut State) {
         let bytes = |kept: &[Kept]| -> u64 {
             kept.iter()
-                .filter_map(|k| k.cell.get())
+                .filter_map(|k| k.corpus.as_ref())
                 .map(|corpus| corpus.memory_bytes() as u64)
                 .sum()
         };
@@ -337,12 +362,90 @@ impl CorpusStore {
             bytes: state
                 .kept
                 .iter()
-                .filter_map(|k| k.cell.get())
+                .filter_map(|k| k.corpus.as_ref())
                 .map(|corpus| corpus.memory_bytes() as u64)
                 .sum(),
             budget: self.budget,
             walked: self.walked.load(Ordering::Relaxed),
             derived: self.derived.load(Ordering::Relaxed),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use nrese_rdf::{GraphName, Literal, LiteralRef, NamedNode, Quad};
+
+    use crate::{Engine, EngineConfig, TextQuery};
+
+    /// A search runs no parallel part under a lock of the dictionary or of the store's
+    /// corpora: the index's build, the corpus's walk (a part per slice of the bits) and
+    /// the counting under the index's lock alone, on one thread. Each part here takes the
+    /// locks a stolen job might want, exclusively, and interns; holding one across the
+    /// parts, the search would never end (the guard fails after 30 s).
+    #[test]
+    fn searches_run_their_parallel_parts_without_the_lock() {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let documents = 3 * crate::term::text::SERIAL_DOCUMENTS;
+        for i in 0..documents {
+            tx.insert(
+                Quad::new(
+                    NamedNode::new_unchecked(format!("http://example.com/s{i}")),
+                    NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#label"),
+                    Literal::new_simple_literal(format!("label word{} {i}", i % 97)),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            );
+        }
+        tx.commit().unwrap();
+        let dictionary = Arc::clone(&engine.inner.shared.dictionary);
+        let interned = Arc::new(AtomicU64::new(0));
+        let hook: Arc<dyn Fn() + Send + Sync> = {
+            let (dictionary, interned) = (Arc::downgrade(&dictionary), Arc::clone(&interned));
+            Arc::new(move || {
+                let n = interned.fetch_add(1, Ordering::Relaxed);
+                let dictionary = dictionary.upgrade().expect("the dictionary");
+                dictionary.take_search_locks();
+                dictionary.intern(LiteralRef::new_simple_literal(&format!("stolen {n}")).into());
+            })
+        };
+        *dictionary.part_hook.lock() = Some(hook);
+        let snapshot = engine.snapshot();
+        let query = TextQuery {
+            text: "word3".to_owned(),
+            all_words: false,
+            prefix: false,
+            stem: None,
+        };
+        let (done, finished) = std::sync::mpsc::channel();
+        let searching = snapshot.clone();
+        let names = TextQuery {
+            text: "s1*".to_owned(),
+            prefix: true,
+            ..query.clone()
+        };
+        std::thread::spawn(move || {
+            let found = searching.text_search(&query).len();
+            let named = searching
+                .iri_search_in(
+                    crate::ReadModel::Materialised,
+                    &crate::TextScope::EVERY,
+                    &names,
+                )
+                .len();
+            let _ = done.send((found, named));
+        });
+        let (found, named) = finished
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the search ended: no lock held across its parallel parts");
+        *dictionary.part_hook.lock() = None;
+        assert!(interned.load(Ordering::Relaxed) >= 2, "parts ran the hook");
+        assert_eq!(found as u64, documents.div_ceil(97));
+        assert!(named > 0);
     }
 }
