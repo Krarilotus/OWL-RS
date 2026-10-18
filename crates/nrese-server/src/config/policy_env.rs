@@ -26,6 +26,16 @@ pub(super) fn parse_policy_config(source: &dyn ConfigSource) -> Result<PolicyCon
                 names::MAX_QUERY_MEMORY_BYTES,
                 DEFAULT_QUERY_MEMORY_BYTES,
             )?,
+            planner: nrese_sparql::PlannerOptions {
+                greedy_effort: match parse_usize(
+                    source,
+                    names::PLANNER_EFFORT,
+                    nrese_sparql::PlannerOptions::DEFAULT_GREEDY_EFFORT,
+                )? {
+                    0 => None,
+                    effort => Some(effort),
+                },
+            },
             max_update_bytes: parse_bytes(
                 source,
                 names::MAX_UPDATE_BYTES,
