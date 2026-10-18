@@ -279,9 +279,7 @@ pub async fn execute_update(
     state
         .policy()
         .enforce_update_bytes(operation.update.len())?;
-    let mut request = SparqlUpdateRequest::new(operation.update);
-    request.using_graphs = operation.using_graphs;
-    request.using_named_graphs = operation.using_named_graphs;
+    let request = build_update_request(operation, &state.policy().limits);
     mutation::run(
         &state,
         MutationCommand::Update(request),
@@ -305,6 +303,19 @@ fn negotiate_formats(
         QueryResultKind::Boolean => (negotiated(accept, BOOLEAN)?, graph),
         QueryResultKind::Graph => (solutions, negotiated(accept, GRAPHS)?),
     })
+}
+
+/// An update request with the server's planner setting, as [`build_query_request`] gives
+/// a query's.
+fn build_update_request(
+    operation: UpdateOperation,
+    limits: &crate::policy::RequestLimits,
+) -> SparqlUpdateRequest {
+    let mut request = SparqlUpdateRequest::new(operation.update);
+    request.using_graphs = operation.using_graphs;
+    request.using_named_graphs = operation.using_named_graphs;
+    request.planner = limits.planner;
+    request
 }
 
 fn build_query_request(
@@ -354,6 +365,32 @@ mod tests {
                 );
                 assert_eq!(request.planner.greedy_effort, effort);
             }
+        }
+    }
+
+    /// The server's planner setting reaches every update request it builds: SPARQL 1.1
+    /// Protocol updates, and RDF4J's (repository, statements and transaction updates).
+    #[test]
+    fn planner_policy_reaches_updates() {
+        for effort in [Some(17), None] {
+            let mut limits = crate::policy::RequestLimits::default();
+            limits.planner.greedy_effort = effort;
+            let request = super::build_update_request(
+                super::UpdateOperation {
+                    update: "DELETE WHERE { ?s ?p ?o }".into(),
+                    ..Default::default()
+                },
+                &limits,
+            );
+            assert_eq!(request.planner.greedy_effort, effort);
+            let request = crate::http::rdf4j::update(
+                &axum::extract::RawQuery(None),
+                &axum::http::HeaderMap::new(),
+                &axum::body::Bytes::from_static(b"DELETE WHERE { ?s ?p ?o }"),
+                limits.planner,
+            )
+            .expect("an update in the body");
+            assert_eq!(request.planner.greedy_effort, effort);
         }
     }
 
