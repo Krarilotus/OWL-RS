@@ -23,7 +23,7 @@ pub(crate) mod vocabulary;
 mod vocabulary_study;
 
 pub use dictionary::{Dictionary, DictionaryStats, TermView};
-pub use strings::{Placement, StringTest};
+pub use strings::{Placement, StringScan, StringTest};
 pub use text::{TextMatch, TextQuery};
 pub use vectors::{VectorQuery, VectorSearchReport, VectorStrategy};
 

@@ -2,7 +2,7 @@
 //! query below must still run with the operator that made it fast, read from EXPLAIN.
 //! A planner change that loses one fails here at once, not in a benchmark run.
 
-use nrese_engine::{Engine, EngineConfig};
+use nrese_engine::{BulkMode, Engine, EngineConfig};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
 use nrese_sparql::{PlanStep, QueryOptions, explain_query};
 use nrese_sparql_syntax::SparqlParser;
@@ -169,6 +169,69 @@ fn string_filters_test_the_dictionary() {
         "SELECT ?s WHERE { ?s e:label ?l FILTER(CONTAINS(?l, \"number 12\")) }",
         "dictionary string test",
     );
+}
+
+/// String filters on a bulk load's terms: the 256 shards those stay in are searched in
+/// one parallel loop, with searchers built once, and the scan reads a key per hit (at most
+/// one per searcher per filtered row; every key once for a language alone). Shard after
+/// shard, each with searchers of its own, Olympics q06 went 4.3 → 18 ms and YAGO q10
+/// 62 → 216 ms (36704d9).
+#[test]
+fn string_filters_scan_a_bulk_load_in_one_loop() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let quads: Vec<Quad> = (0..20_000u32)
+        .map(|i| {
+            let text = format!("label number {i}");
+            let label = match i % 2 {
+                0 => Literal::new_language_tagged_literal_unchecked(text, "en"),
+                _ => Literal::new_simple_literal(text),
+            };
+            Quad::new(
+                ex(&format!("n{i}")),
+                ex("label"),
+                label,
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let load = engine.bulk_load(BulkMode::Append);
+    for (b, batch) in quads.chunks(1_000).enumerate() {
+        load.add_at(1, b as u32, batch);
+    }
+    load.finish().unwrap();
+    let terms = engine.stats().dictionary.terms;
+    for (filter, searchers, filtered) in [
+        ("CONTAINS(?l, \"number 12\")", 1, 1_111),
+        ("CONTAINS(LCASE(STR(?l)), \"number 12\")", 3, 1_111),
+        ("LANG(?l) = \"en\"", 1, 10_000),
+    ] {
+        let text = format!("PREFIX e: <{EX}> SELECT ?s WHERE {{ ?s e:label ?l FILTER({filter}) }}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let explained =
+            explain_query(&engine.snapshot(), &query, &QueryOptions::default()).unwrap();
+        assert_eq!(explained.rows, filtered, "{filter}");
+        let step = explained
+            .steps
+            .iter()
+            .find(|s| s.operator == "dictionary string test")
+            .unwrap_or_else(|| panic!("{filter}: {:#?}", explained.steps));
+        let count = |what: &str| -> u64 {
+            let before = step.detail.split(what).next().unwrap();
+            let number = before.trim_end().rsplit([' ', ',']).next().unwrap();
+            number
+                .parse()
+                .unwrap_or_else(|_| panic!("{what}: {}", step.detail))
+        };
+        assert_eq!(count(" searchers"), searchers, "{}", step.detail);
+        assert_eq!(count(" parallel loops"), 1, "{}", step.detail);
+        assert!(count(" arenas") >= 256, "{}", step.detail);
+        let tested = count(" keys tested");
+        if filter.starts_with("LANG") {
+            assert!(tested <= terms, "{}", step.detail);
+        } else {
+            assert!(tested <= searchers * filtered, "{}", step.detail);
+        }
+    }
 }
 
 /// Sideways information passing: a pattern joined to rows already computed is evaluated

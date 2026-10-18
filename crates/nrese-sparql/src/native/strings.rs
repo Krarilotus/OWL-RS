@@ -21,7 +21,7 @@
 //! Many passing terms are matched by a scan of the whole pattern against a bitmap of them
 //! rather than a seek each (`Context::scan_ranges`).
 
-use nrese_engine::{Placement, Snapshot, StringTest, TermId, TermKind};
+use nrese_engine::{Placement, Snapshot, StringScan, StringTest, TermId, TermKind};
 use nrese_rdf::Variable;
 use nrese_rdf::vocab::xsd;
 use nrese_sparql_syntax::algebra::{Expression, Function};
@@ -171,12 +171,12 @@ fn operand(expression: &Expression) -> Option<(&Variable, bool)> {
 }
 
 /// The id ranges of the terms that can pass `condition`, sorted, for a pattern of `rows`
-/// rows; `None` if they would hardly prune it.
+/// rows, and what the dictionary's scan for them did; `None` if they would hardly prune it.
 pub(crate) fn ranges(
     snapshot: &Snapshot,
     condition: &Condition<'_>,
     rows: u64,
-) -> Option<Vec<(TermId, TermId)>> {
+) -> Option<(Vec<(TermId, TermId)>, StringScan)> {
     let test = StringTest {
         needle: condition.needle,
         placement: condition.placement,
@@ -187,7 +187,7 @@ pub(crate) fn ranges(
         language: condition.language,
         ascii_case_insensitive: condition.fold_case,
     };
-    let ids = snapshot.matching_strings(&test);
+    let (ids, scan) = snapshot.matching_strings_scan(&test);
     if ids.len() as u64 > rows {
         return None;
     }
@@ -213,5 +213,5 @@ pub(crate) fn ranges(
         );
         ranges.sort_unstable();
     }
-    Some(ranges)
+    Some((ranges, scan))
 }
