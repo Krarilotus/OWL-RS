@@ -47,6 +47,30 @@ pub(crate) fn shard_of(hash: u64) -> usize {
     (hash >> 32) as usize & (SHARDS - 1)
 }
 
+/// Bits of a key's length in its [`place`]: longer keys are found through their shard's
+/// ends.
+const LENGTH_BITS: u32 = 24;
+const LONG: u64 = (1 << LENGTH_BITS) - 1;
+const _: () = assert!(SHARDS <= 256, "a place's shard is 8 bits");
+
+/// Where entry `local` of `shard` (number `s`) lies: the shard (8 bits), then its key's
+/// start in the shard's arena and its length (32 and 24 bits), or for a key of 16 MiB or
+/// more its entry and [`LONG`]. One read finds a key, as a heap entry's end does; through
+/// the shard's ends it took one more dependent miss per term read.
+fn place(shard: &Shard, s: usize, local: u32) -> u64 {
+    let i = local as usize;
+    let start = match i {
+        0 => 0,
+        _ => u64::from(shard.ends[i - 1]),
+    };
+    let length = u64::from(shard.ends[i]) - start;
+    let (at, length) = match length < LONG {
+        true => (start, length),
+        false => (u64::from(local), LONG),
+    };
+    ((s as u64) << (32 + LENGTH_BITS)) | (at << LENGTH_BITS) | length
+}
+
 /// The provisional payload of entry `local` of shard `shard`.
 pub(crate) fn provisional(shard: usize, local: u32) -> u64 {
     PROVISIONAL | ((shard as u64) << 32) | u64::from(local)
@@ -247,9 +271,9 @@ impl Pending {
                 bounds
             })
             .collect();
-        let mut locals = vec![0u64; total];
+        let mut places = vec![0u64; total];
         let mut parts: Vec<(usize, &mut [u64])> = Vec::with_capacity(ranges);
-        let (mut rest, mut offset) = (&mut locals[..], 0);
+        let (mut rest, mut offset) = (&mut places[..], 0);
         for r in 0..ranges {
             let size: usize = bounds.iter().map(|b| b[r + 1] - b[r]).sum();
             let (part, tail) = std::mem::take(&mut rest).split_at_mut(size);
@@ -272,7 +296,7 @@ impl Pending {
                 while let Some(Reverse((_, s, i))) = heads.pop() {
                     let local = orders[s][i];
                     shards[s].slots[local as usize].store(start + (offset + n) as u64, Relaxed);
-                    out[n] = ((s as u64) << 32) | u64::from(local);
+                    out[n] = place(&shards[s], s, local);
                     n += 1;
                     if i + 1 < bounds[s][r + 1] {
                         heads.push(Reverse((first(s, orders[s][i + 1]), s, i + 1)));
@@ -282,7 +306,7 @@ impl Pending {
         Adopted {
             start,
             shards,
-            locals,
+            places,
         }
     }
 }
@@ -292,8 +316,8 @@ impl Pending {
 pub(crate) struct Adopted {
     pub(crate) start: u64,
     pub(crate) shards: Vec<Shard>,
-    /// Per id from `start`: its shard (high 32 bits) and entry.
-    locals: Vec<u64>,
+    /// Per id from `start`: where its key lies ([`place`]).
+    places: Vec<u64>,
 }
 
 impl Adopted {
@@ -302,19 +326,24 @@ impl Adopted {
         Self {
             start,
             shards: Vec::new(),
-            locals: Vec::new(),
+            places: Vec::new(),
         }
     }
 
     /// Entries in the segment (not counting keys that turned out to exist already).
     pub(crate) fn len(&self) -> u64 {
-        self.locals.len() as u64
+        self.places.len() as u64
     }
 
     /// The key of id `start + offset`.
     pub(crate) fn key(&self, offset: u64) -> &[u8] {
-        let local = self.locals[offset as usize];
-        self.shards[(local >> 32) as usize].key(local as u32 as usize)
+        let place = self.places[offset as usize];
+        let shard = &self.shards[(place >> (32 + LENGTH_BITS)) as usize];
+        let at = (place >> LENGTH_BITS) as u32 as usize;
+        match place & LONG {
+            LONG => shard.key(at),
+            length => &shard.bytes[at..at + length as usize],
+        }
     }
 
     /// The id of `key` (hash `hash`), if the load interned it.
@@ -362,7 +391,7 @@ impl Adopted {
                 (s.ends.capacity() * 4 + s.slots.capacity() * 8 + s.table.capacity() * 5) as u64
             })
             .sum::<u64>()
-            + self.locals.capacity() as u64 * 8;
+            + self.places.capacity() as u64 * 8;
         (keys, index)
     }
 
@@ -426,6 +455,33 @@ mod tests {
             .map(|i| format!("Iterm{i}").into_bytes())
             .collect();
         assert_eq!(a, expected);
+    }
+
+    /// A key too long for its place's length is found through its shard's ends.
+    #[test]
+    fn long_keys_are_found_through_their_ends() {
+        let pending = Pending::default();
+        let long = vec![b'S'; LONG as usize + 5];
+        let words: Vec<&[u8]> = vec![b"Sa", &long, b"Sb", b"", b"Sc"];
+        let mut arena = Vec::new();
+        let keys: Vec<NewKey> = words
+            .iter()
+            .enumerate()
+            .map(|(k, word)| {
+                let start = arena.len();
+                arena.extend_from_slice(word);
+                NewKey {
+                    start,
+                    end: arena.len(),
+                    hash: hash(word),
+                    at: position(1, 0, k),
+                }
+            })
+            .collect();
+        pending.intern(&arena, &keys);
+        let adopted = pending.number(0, |_, _| None);
+        let keys: Vec<&[u8]> = (0..adopted.len()).map(|i| adopted.key(i)).collect();
+        assert_eq!(keys, words);
     }
 
     #[test]
