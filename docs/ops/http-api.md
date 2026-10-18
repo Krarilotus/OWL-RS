@@ -338,7 +338,7 @@ Every error is an `application/problem+json` document (RFC 9457), whoever answer
 | `/version` | Build, enabled surfaces, reasoning semantics |
 | `/dataset/service-description` | SPARQL service description (Turtle); it names every endpoint above |
 | `/dataset/info` | Statement and graph counts |
-| `/dataset/autocomplete?q=…` | Resources whose labels' words or local names' words begin with the words of `q`, best first: `{"suggestions": [{"iri", "label", "score"}]}`. Input is plain typed text: punctuation separates words and never introduces search operators. Labels are the values of `rdfs:label`, `skos:prefLabel`, `skos:altLabel`, `foaf:name`, `schema:name`, `dcterms:title` and `dc:title`; local names are split at camel case and punctuation. `limit` (default 10, at most 1000), `infer=false` for asserted statements only. The indexes are built at the first use |
+| `/dataset/autocomplete?q=…` | Resources whose labels' words or local names' words begin with the words of `q`, best first: `{"suggestions": [{"iri", "label", "score"}]}`. Input is plain typed text: punctuation separates words and never introduces search operators. Labels are the values of `rdfs:label`, `skos:prefLabel`, `skos:altLabel`, `foaf:name`, `schema:name`, `dcterms:title` and `dc:title`; local names are split at camel case and punctuation. `limit` counts distinct resources (default 10, at most 1000; `0` gives none); `infer=false` reads asserted statements only. The indexes are built at the first use |
 | `/dataset/tell` | Adds an RDF payload to a graph (`POST`) |
 | `/metrics` | Prometheus metrics (below) |
 | `/console`, `/ops` | User console, operator UI |
