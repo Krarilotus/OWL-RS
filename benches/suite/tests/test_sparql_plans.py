@@ -69,11 +69,13 @@ class Rootfs(unittest.TestCase):
             # Docker creates a missing bind source; so does this runtime.
             self.assertTrue(Path(store).is_dir())
         self.assertEqual(argv[:4], ["systemd-run", "--user", "--scope", "-q"])
-        self.assertTrue(argv[4].startswith("--unit=nrese-s-"))
+        units = [arg for arg in argv[:argv.index("--")] if arg.startswith("--unit=")]
+        self.assertEqual(len(units), 1)
+        self.assertTrue(units[0].startswith("--unit=nrese-s-"))
         # systemd reads upper-case units only; at the cap the kernel kills the command, not systemd the scope.
         for part in ("MemoryMax=12G", "MemorySwapMax=0", "OOMPolicy=continue"):
             self.assertIn(part, argv)
-        self.assertEqual(runtime.units["s"], argv[4].split("=", 1)[1])
+        self.assertEqual(runtime.units["s"], units[0].split("=", 1)[1])
         self.assertIn("--tmp-overlay", argv)
         self.assertEqual(argv[argv.index("--overlay-src") + 1], str(image / "rootfs"))
         joined = " ".join(argv)
@@ -137,6 +139,7 @@ class AnswerCap(unittest.TestCase):
             self.assertEqual((code, len(text)), (200, len(body)))
         finally:
             server.shutdown()
+            server.server_close()
             if old is None:
                 os.environ.pop("NRESE_ANSWER_CAP_MB", None)
             else:

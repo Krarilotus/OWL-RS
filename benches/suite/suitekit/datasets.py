@@ -47,7 +47,8 @@ def save(root: Path, catalog: dict):
     lines = [HEADER, f"budget_gb = {catalog['budget_gb']}", ""]
     for d in sorted(catalog["dataset"], key=lambda d: d["file"]):
         lines.append("[[dataset]]")
-        for key in ("file", "workload", "tier", "role", "made_by", "source", "bytes", "sha256", "frozen"):
+        for key in ("file", "workload", "tier", "role", "made_by", "source", "bytes", "sha256", "frozen",
+                    "n_triples"):
             if d.get(key) not in (None, ""):
                 lines.append(f"{key} = {toml_value(d[key])}")
         lines.append("")

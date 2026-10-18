@@ -450,6 +450,7 @@ source = "BIBM 0.7.8 generator -fc -pareto -pc 284800 -s nt: the BSBM V3.1 repor
 bytes = 21813398098
 sha256 = "0d57a6136c6feff181f52d70d93690250d67429edb01fc707c3aa7be59b68fed"
 frozen = "2026-10-12"
+n_triples = { made_by = "python benches/sparql/nt-numbers.py", rewritten = "5696000 Turtle doubles (bsbm:price 2685.34e0) as xsd:double literals of the same lexical form", bytes = 22069718098, sha256 = "fc4b8be8d094c1e6b88dfc131026bae23100e0d6f68f504ba84c5a03de1a443e", checked = "2026-10-18, office-pc, rg-bsbm-convert-check-1" }
 
 [[dataset]]
 file = "watdiv-100m.nt"
