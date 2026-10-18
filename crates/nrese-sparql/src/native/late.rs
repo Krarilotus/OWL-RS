@@ -110,6 +110,7 @@ impl super::Context<'_> {
     fn canonical_child(&self) -> super::Context<'static> {
         use std::cell::{Cell, RefCell};
         let mut child = super::Context {
+            planner: self.planner,
             snapshot: std::borrow::Cow::Owned(self.snapshot.with_canonical_equality()),
             model: self.model,
             aliases: RefCell::new(self.aliases.borrow().clone()),
