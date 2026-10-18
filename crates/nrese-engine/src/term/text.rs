@@ -493,29 +493,41 @@ impl TextIndex {
         self.word_count += new_words;
     }
 
-    /// The corpus of `members` (document numbers, ascending, below `span`; numbers this
-    /// index has no words for are left out), with their count and words.
-    pub(crate) fn corpus(&self, members: impl IntoIterator<Item = u64>, span: u64) -> Corpus {
-        let (mut documents, mut total_words) = (0u64, 0u64);
-        let mut sorted = Vec::new();
-        for document in members {
-            let length = self.lengths.get(document as usize).copied().unwrap_or(0);
-            if length > 0 {
-                debug_assert!(sorted.last().is_none_or(|&last| last < document));
-                sorted.push(document);
-                documents += 1;
-                total_words += u64::from(length);
-            }
-        }
+    /// The corpus of the documents whose bits `bits` sets (a bit per number below `span`;
+    /// numbers this index has no words for are left out), with their count and words.
+    pub(crate) fn corpus(&self, mut bits: Vec<u64>, span: u64) -> Corpus {
+        let (documents, total_words) = bits
+            .par_iter_mut()
+            .enumerate()
+            .map(|(w, word)| {
+                let (mut documents, mut total_words) = (0u64, 0u64);
+                let mut rest = *word;
+                while rest != 0 {
+                    let bit = rest.trailing_zeros();
+                    rest &= rest - 1;
+                    match self.lengths.get(w * 64 + bit as usize) {
+                        Some(&length) if length > 0 => {
+                            documents += 1;
+                            total_words += u64::from(length);
+                        }
+                        _ => *word &= !(1 << bit),
+                    }
+                }
+                (documents, total_words)
+            })
+            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
         // A bit per number where that is smaller than eight bytes per member.
-        let members = if (sorted.len() as u64) * 64 > span {
-            let mut bits = vec![0u64; span.div_ceil(64) as usize];
-            for document in sorted {
-                bits[(document / 64) as usize] |= 1 << (document % 64);
-            }
+        let members = if documents * 64 > span {
             Members::Bits(bits)
         } else {
-            sorted.shrink_to_fit();
+            let mut sorted = Vec::with_capacity(documents as usize);
+            for (w, &word) in bits.iter().enumerate() {
+                let mut rest = word;
+                while rest != 0 {
+                    sorted.push(w as u64 * 64 + u64::from(rest.trailing_zeros()));
+                    rest &= rest - 1;
+                }
+            }
             Members::Sorted(sorted)
         };
         Corpus {
@@ -801,10 +813,19 @@ mod tests {
         matches.iter().map(|m| m.id).collect()
     }
 
+    /// The bits of `members` below `span`.
+    fn bits(members: &[u64], span: u64) -> Vec<u64> {
+        let mut bits = vec![0u64; span.div_ceil(64) as usize];
+        for &m in members {
+            bits[(m / 64) as usize] |= 1 << (m % 64);
+        }
+        bits
+    }
+
     /// Every document the index holds.
     fn every(index: &TextIndex) -> Corpus {
         let span = index.lengths.len() as u64;
-        index.corpus(0..span, span)
+        index.corpus(vec![u64::MAX; span.div_ceil(64) as usize], span)
     }
 
     #[test]
@@ -1039,8 +1060,8 @@ mod tests {
             alone.add(i, texts[i as usize]);
         }
         let text_of = |id: u64| texts.get(id as usize).map(|t| (*t).to_owned());
-        let sparse = whole.corpus(kept, 1 << 20);
-        let dense = whole.corpus(kept, texts.len() as u64);
+        let sparse = whole.corpus(bits(&kept, 1 << 20), 1 << 20);
+        let dense = whole.corpus(bits(&kept, texts.len() as u64), texts.len() as u64);
         assert!(matches!(sparse.members, Members::Sorted(_)));
         assert!(matches!(dense.members, Members::Bits(_)));
         assert_eq!((dense.documents(), dense.total_words()), (5, 10));

@@ -1512,93 +1512,112 @@ impl Snapshot {
         let key = (documents, model, scope.clone());
         self.statistics.corpus(&self.version, key, || {
             let stored = self.stored();
+            let span = self.version.dictionary_len;
             let kinds: &[TermKind] = match documents {
                 Documents::Literals => &[TermKind::String, TermKind::LangString],
                 Documents::Subjects => &[TermKind::Iri],
             };
-            let mut members: Vec<u64> = kinds
-                .iter()
-                .flat_map(|&kind| stored.scope_values(model, scope, documents, kind))
-                .map(|id| id.payload())
-                .collect();
-            members.sort_unstable();
-            members.dedup();
-            index.corpus(members, self.version.dictionary_len)
+            let mut bits = vec![0u64; span.div_ceil(64) as usize];
+            for &kind in kinds {
+                match scope {
+                    TextScope::Graphs(graphs) => {
+                        stored.mark_values(model, *graphs, documents, kind, &mut bits);
+                    }
+                    TextScope::Merge(graphs) => {
+                        for &graph in graphs {
+                            let graph = GraphSelector::Exact(graph);
+                            stored.mark_values(model, graph, documents, kind, &mut bits);
+                        }
+                    }
+                }
+            }
+            index.corpus(bits, span)
         })
     }
 
-    /// The distinct terms of `kind` at `documents`' position (object or subject) of the
-    /// statements in `scope`'s graphs in `model`, sorted.
-    fn scope_values(
-        &self,
-        model: ReadModel,
-        scope: &TextScope,
-        documents: Documents,
-        kind: TermKind,
-    ) -> Vec<TermId> {
-        let values = |counts: Vec<(TermId, u64)>| counts.into_iter().map(|(value, _)| value);
-        match scope {
-            TextScope::Graphs(GraphSelector::AnyNamed) => {
-                // Every graph's, less those only the default graph has.
-                let every = self.graph_counts(model, GraphSelector::Any, documents, kind);
-                let default = self.graph_counts(
-                    model,
-                    GraphSelector::Exact(TermId::DEFAULT_GRAPH),
-                    documents,
-                    kind,
-                );
-                let mut j = 0;
-                every
-                    .into_iter()
-                    .filter(|&(value, count)| {
-                        while j < default.len() && default[j].0 < value {
-                            j += 1;
-                        }
-                        let in_default = match default.get(j) {
-                            Some(&(v, c)) if v == value => c,
-                            _ => 0,
-                        };
-                        count > in_default
-                    })
-                    .map(|(value, _)| value)
-                    .collect()
-            }
-            TextScope::Graphs(graphs) => {
-                values(self.graph_counts(model, *graphs, documents, kind)).collect()
-            }
-            TextScope::Merge(graphs) => {
-                let mut merged: Vec<TermId> = graphs
-                    .iter()
-                    .flat_map(|&graph| {
-                        values(self.graph_counts(
-                            model,
-                            GraphSelector::Exact(graph),
-                            documents,
-                            kind,
-                        ))
-                    })
-                    .collect();
-                if graphs.len() > 1 {
-                    merged.sort_unstable();
-                    merged.dedup();
-                }
-                merged
-            }
-        }
-    }
-
-    /// Per distinct term of `kind` at `documents`' position of the statements in `graphs`
-    /// (one graph, or every graph) in `model`, how many there are, in id order: a walk over
-    /// the index's groups in the kind's range, or a scan where the index can't walk them.
-    fn graph_counts(
+    /// Sets the bit of the dictionary entry of each term of `kind` at `documents`' position
+    /// (object or subject) of the statements in `graphs` (one graph, every graph, or every
+    /// named graph) in `model`. The entries in slices of whole words, on every core: each a
+    /// walk over the index's groups in its range of ids, so no list of every term is held;
+    /// a scan of the statements where the index can't walk them.
+    fn mark_values(
         &self,
         model: ReadModel,
         graphs: GraphSelector,
         documents: Documents,
         kind: TermKind,
-    ) -> Vec<(TermId, u64)> {
-        debug_assert!(graphs != GraphSelector::AnyNamed);
-        let (low, high) = TermId::kind_range(kind);
+        bits: &mut [u64],
+    ) {
+        use rayon::prelude::*;
+        let per = bits.len().div_ceil(rayon::current_num_threads() * 4).max(1);
+        let walked = bits
+            .par_chunks_mut(per)
+            .enumerate()
+            .map(|(i, words)| {
+                let first = (i * per * 64) as u64;
+                let last = first + words.len() as u64 * 64 - 1;
+                let (low, high) = (TermId::new(kind, first), TermId::new(kind, last));
+                let counts = |graphs| self.range_counts(model, graphs, documents, low, high);
+                let mut mark = |value: TermId| {
+                    let at = value.payload() - first;
+                    words[(at / 64) as usize] |= 1 << (at % 64);
+                };
+                match graphs {
+                    GraphSelector::AnyNamed => {
+                        // Every graph's, less those only the default graph has.
+                        let every = counts(GraphSelector::Any)?;
+                        let default = counts(GraphSelector::Exact(TermId::DEFAULT_GRAPH))?;
+                        let mut j = 0;
+                        for (value, count) in every {
+                            while j < default.len() && default[j].0 < value {
+                                j += 1;
+                            }
+                            let in_default = match default.get(j) {
+                                Some(&(v, c)) if v == value => c,
+                                _ => 0,
+                            };
+                            if count > in_default {
+                                mark(value);
+                            }
+                        }
+                    }
+                    _ => counts(graphs)?
+                        .into_iter()
+                        .for_each(|(value, _)| mark(value)),
+                }
+                Some(())
+            })
+            .collect::<Option<()>>();
+        if walked.is_some() {
+            return;
+        }
+        let pattern = QuadPattern {
+            graph: graphs,
+            ..QuadPattern::all()
+        };
+        for quad in self.quads_for_pattern_in(model, &pattern) {
+            let value = match documents {
+                Documents::Literals => quad.object,
+                Documents::Subjects => quad.subject,
+            };
+            if value.kind() == kind {
+                let at = value.payload();
+                bits[(at / 64) as usize] |= 1 << (at % 64);
+            }
+        }
+    }
+
+    /// Per distinct term in `low..=high` at `documents`' position of the statements in
+    /// `graphs` (one graph, or every graph) in `model`, how many there are, in id order: a
+    /// walk over the index's groups. `None` where the index can't walk them.
+    fn range_counts(
+        &self,
+        model: ReadModel,
+        graphs: GraphSelector,
+        documents: Documents,
+        low: TermId,
+        high: TermId,
+    ) -> Option<Vec<(TermId, u64)>> {
         let (pattern, permutation) = match (graphs, documents) {
             (GraphSelector::Exact(graph), Documents::Literals) => {
                 (QuadPattern::in_graph(graph), Permutation::Gosp)
@@ -1606,26 +1625,12 @@ impl Snapshot {
             (GraphSelector::Exact(graph), Documents::Subjects) => {
                 (QuadPattern::in_graph(graph), Permutation::Gspo)
             }
-            (_, Documents::Literals) => (QuadPattern::all(), Permutation::Ospg),
-            (_, Documents::Subjects) => (QuadPattern::all(), Permutation::Spog),
+            (GraphSelector::Any, Documents::Literals) => (QuadPattern::all(), Permutation::Ospg),
+            (GraphSelector::Any, Documents::Subjects) => (QuadPattern::all(), Permutation::Spog),
+            (GraphSelector::AnyNamed, _) => return None,
         };
-        if let Some(counts) = self
-            .range_plan(model, &pattern, permutation, low, high)
-            .and_then(|plan| self.group_counts_of(model, &plan))
-        {
-            return counts;
-        }
-        let mut counts: std::collections::BTreeMap<TermId, u64> = Default::default();
-        for quad in self.quads_for_pattern_in(model, &pattern) {
-            let value = match documents {
-                Documents::Literals => quad.object,
-                Documents::Subjects => quad.subject,
-            };
-            if value.kind() == kind {
-                *counts.entry(value).or_default() += 1;
-            }
-        }
-        counts.into_iter().collect()
+        let plan = self.range_plan(model, &pattern, permutation, low, high)?;
+        self.group_counts_of(model, &plan)
     }
 }
 
