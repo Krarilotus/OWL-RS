@@ -1112,6 +1112,15 @@ impl Snapshot {
             .matching_strings(test, self.version.dictionary_len)
     }
 
+    /// [`Self::matching_strings`], and what its scan did ([`crate::StringScan`]).
+    pub fn matching_strings_scan(
+        &self,
+        test: &crate::StringTest<'_>,
+    ) -> (Vec<TermId>, crate::StringScan) {
+        self.dictionary
+            .matching_strings_scan(test, self.version.dictionary_len)
+    }
+
     /// Whether a prefix test ([`crate::Placement::Start`]) is answered from the text order
     /// by binary search, rather than by a pass over the dictionary.
     pub fn text_order_ready(&self) -> bool {
