@@ -750,6 +750,7 @@ QUERY_MS = 2000.0      # a perf-lab process's measured query time, at most (the 
 DL_MS = 3000.0         # a DL tool's process: its files' time, at most
 MAX_RUNS, MAX_REPEAT = 2000, 30
 BATCH_SAMPLE_MS = 0.05  # a batched sample lasts at least this (50 µs: the timer's steps far below)
+BATCH_BELOW_MS = 0.25   # queries batched: those whose 2 % loss is below the 5 µs resolution
 PASS_OVERHEAD_S = 40   # a pass's own time beyond its cases' (start, records, the host's state)
 
 
@@ -847,21 +848,25 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
         entry = {}
         measured_runs = e["measured"].get("runs")
         if keep is not None:
-            entry.update({k: v for k, v in keep.get(name, {}).items() if k in ("runs", "warmup", "batch", "repeat")})
+            entry.update({k: v for k, v in keep.get(name, {}).items()
+                          if k in ("runs", "warmup", "batch", "batch_queries", "repeat")})
         elif runs_adjustable(case) and "ok" in e["status"] and rows:
             runs, warmup = case_runs(case)
-            longest = max(r["median_ms"] for r in rows)
+            # The short queries batched, each sample well above the timer's steps (applied
+            # where every side's perf lab batches; otherwise the runs alone).
+            short = sorted({r["series"] for r in rows if r["median_ms"] < BATCH_BELOW_MS})
             k = 1
-            if batch and longest < 1.0:
-                # A sample of every query well above the timer's steps (applied where every
-                # side's perf lab batches; otherwise the runs alone).
-                k = min(1000, math.ceil(BATCH_SAMPLE_MS / max(min(r["median_ms"] for r in rows), 1e-4)))
+            if batch and short:
+                fastest = min(r["median_ms"] for r in rows if r["series"] in short)
+                k = min(1000, math.ceil(BATCH_SAMPLE_MS / max(fastest, 1e-4)))
             # The runs as if unbatched (a gate whose baselines can't batch runs them so); a
             # batching gate's processes take `batch` times as long.
             new_runs = min(MAX_RUNS, max(runs, math.ceil(QUERY_MS / max(per_run, 1e-3))))
             entry.update(runs=new_runs, warmup=max(warmup, 3 if new_runs >= 20 else warmup))
             if k > 1:
                 entry["batch"] = k
+                if len(short) < len({r["series"] for r in rows}):
+                    entry["batch_queries"] = short
             added = (new_runs - (measured_runs or runs)) * per_run / 1000
         elif case.get("tool") == "tableau" and "ok" in e["status"] and rows:
             whole = per_run
@@ -919,7 +924,7 @@ def write_measure(result: dict, source: str) -> str:
              f"{result['cap']}).", ""]
     for name, e in result["cases"].items():
         lines.append(f"[case.{name}]")
-        lines += [f"{k} = {v}" for k, v in e.items()]
+        lines += [f"{k} = {json.dumps(v) if isinstance(v, list) else v}" for k, v in e.items()]
         lines.append("")
     return "\n".join(lines)
 
