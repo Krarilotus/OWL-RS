@@ -749,6 +749,9 @@ TARGET_LOSS, TARGET_POWER = 0.02, 0.90
 QUERY_MS = 2000.0      # a perf-lab process's measured query time, at most (the runs it buys)
 DL_MS = 3000.0         # a DL tool's process: its files' time, at most
 MAX_RUNS, MAX_REPEAT = 2000, 30
+PROCESS_S = 8.0        # a case's fresh processes a pass, at most this long together ...
+MAX_PROCESSES = 5      # ... and at most this many (a process that started differently, outvoted)
+PROCESS_PASSES = 8     # only where this many passes alone don't reach the target
 BATCH_SAMPLE_MS = 0.05  # a batched sample lasts at least this (50 µs: the timer's steps far below)
 BATCH_BELOW_MS = 0.25   # queries batched: those whose 2 % loss is below the 5 µs resolution
 PASS_OVERHEAD_S = 40   # a pass's own time beyond its cases' (start, records, the host's state)
@@ -832,7 +835,7 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
     evens = list(range(min_passes, max_passes + 1, 2))
     table = table or power_table(evens)
     per_side = sides if len(revs) == 1 else 1
-    out, rounds, weights = {}, {}, {}
+    out, rounds, weights, processes = {}, {}, {}, {}
     for name, e in sorted(by_case.items()):
         case = cases.get(name)
         if case is None:
@@ -868,18 +871,32 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
                 if len(short) < len({r["series"] for r in rows}):
                     entry["batch_queries"] = short
             added = (new_runs - (measured_runs or runs)) * per_run / 1000
-        elif case.get("tool") == "tableau" and "ok" in e["status"] and rows:
-            whole = per_run
+        elif case.get("tool") in ("tableau", "classify-horn") and "ok" in e["status"] and rows:
+            # Files a process (the tableau's), or classifications whose median it reports
+            # (the context classifier's).
+            whole = per_run if case["tool"] == "tableau" else max(r["median_ms"] for r in rows)
             repeat = int(case.get("repeat", 1))
             limit = 0.4 * float(case.get("timeout_s", 300)) * 1000 / max(whole, 1e-3)
             new = int(min(MAX_REPEAT, limit, max(repeat, math.ceil(DL_MS / max(whole, 1e-3)))))
             if new > repeat:
                 entry["repeat"] = new
                 added = (new - (e["measured"].get("repeat") or repeat)) * whole / 1000
+        process_s = 0.0
+        if (keep is None and case.get("tool", "perf_lab") == "perf_lab" and "ok" in e["status"] and rows
+                and power_at(table, PROCESS_PASSES, judged_noise(rows)) < TARGET_POWER):
+            # Fresh processes a pass where passes alone won't do: a pass's value the median
+            # over several processes, one that started differently outvoted.
+            repeat = int(case.get("repeat", 1))
+            process_s = (statistics.mean(seconds.values()) + added) / max(e["measured"].get("repeat") or repeat, 1)
+            new = int(min(MAX_PROCESSES, max(repeat, PROCESS_S // max(process_s, 0.1))))
+            if new > repeat:
+                entry["repeat"] = new
+                added += (new - repeat) * process_s
         sigma = judged_noise(rows)
         entry.update(noise=round(sigma, 4), passes=min_passes,
                      seconds=round(statistics.mean(seconds.values()) + added, 1))
         rounds[name] = per_side * sum(s + added for s in seconds.values())  # a pass of every side
+        processes[name] = (int(case.get("repeat", 1)), process_s * per_side * len(seconds))
         weights[name] = max(1, len({r["series"] for r in rows if r["median_ms"] * TARGET_LOSS >= RESOLUTION["ms"]}))
         out[name] = entry
 
@@ -891,6 +908,17 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
             total += 2 * (sum(in_block) + sides * PASS_OVERHEAD_S)
         return total / 60
 
+    # Over the budget at the least passes: the added processes go first, the costliest first.
+    while minutes(out) > budget_min:
+        grown = [c for c, e in out.items() if "repeat" in e and processes[c][1] and e["repeat"] > processes[c][0]]
+        if not grown:
+            break
+        c = max(grown, key=lambda c: (out[c]["repeat"] - processes[c][0]) * processes[c][1])
+        out[c]["repeat"] -= 1
+        rounds[c] -= processes[c][1]
+        out[c]["seconds"] = round(out[c]["seconds"] - processes[c][1] / max(per_side * 1, 1) / max(len(revs), 1), 1)
+        if out[c]["repeat"] == processes[c][0]:
+            del out[c]["repeat"]
     power = lambda c, n: power_at(table, n, out[c]["noise"])  # noqa: E731
     spent = minutes(out)
     while True:
