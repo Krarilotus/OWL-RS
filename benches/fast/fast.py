@@ -946,7 +946,8 @@ def invocation_observation(case: dict, result: dict, stderr: str, identity: dict
     peak = process_peak(result.get("peak_mib"), phases)
     levels = client_throughput(result)
     return {"identity": identity, "samples": samples(case, result), "estimator": estimator(result),
-            **({"batch": result["batch"]} if result.get("batch") else {}),
+            **({"batched": batched} if (batched := {q["name"]: q["batch"] for r in result.get("_repeats", [result])
+                                                    for q in r.get("queries", []) if q.get("batch")}) else {}),
             "metric": metric_value(case, result), "counters": counters(case, result),
             **({"throughput": levels} if levels else {}),
             "rows": {q["name"]: q.get("rows") for q in result.get("queries", []) if "name" in q},

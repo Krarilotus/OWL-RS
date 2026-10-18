@@ -176,7 +176,7 @@ BLOCKING = ("regression", "suspect", "incomplete")
 
 
 def judge(base: list[list[float]], new: list[list[float]], *, unit: str, higher_is_better: bool = False,
-          confidence: float = CONFIDENCE, precision: float = PRECISION) -> dict:
+          confidence: float = CONFIDENCE, precision: float = PRECISION, resolution: float | None = None) -> dict:
     """One dimension: `base` and `new` are per pass, each pass a list of its values (a
     process's samples, or one value per process). The estimate is the median of the pooled
     values, its interval of new/base bootstrap_ratio's at `confidence`. In the worse direction
@@ -192,7 +192,8 @@ def judge(base: list[list[float]], new: list[list[float]], *, unit: str, higher_
     - `incomplete`: fewer than MIN_PASSES passes on a side, or a pass without valid values.
 
     `blocks`: whether the verdict stops a release (BLOCKING), unless an approved trade-off
-    covers it (release_gate.py)."""
+    covers it (release_gate.py). `resolution`: the measurement's own, where it is finer than
+    the unit's (a batched series: perf_lab --batch K on both sides, RESOLUTION / K)."""
     out = {"unit": unit, "higher_is_better": higher_is_better, "passes": [len(base), len(new)],
            "base": None, "new": None, "ratio": None, "ci": None, "spread": None, "noise": None,
            "confidence": confidence, "below_resolution": False, "needs_passes": None,
@@ -217,7 +218,8 @@ def judge(base: list[list[float]], new: list[list[float]], *, unit: str, higher_
     noise = max(noises)
     out.update(base=b, new=n, spread=max(spreads), noise=noise)
     diff = (b - n) if higher_is_better else (n - b)
-    if abs(diff) < RESOLUTION[unit] or (b <= 0 and n <= 0):
+    out["resolution"] = RESOLUTION[unit] if resolution is None else resolution
+    if abs(diff) < out["resolution"] or (b <= 0 and n <= 0):
         out.update(ratio=n / b if b > 0 else 1.0, below_resolution=abs(diff) > 0, verdict="neutral", blocks=False)
         return out
     if b <= 0 or n <= 0:
