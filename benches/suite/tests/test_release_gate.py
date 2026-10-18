@@ -252,6 +252,16 @@ class MainAdapter(unittest.TestCase):
                 fast.ensure_data("social people=10")
             container.assert_not_called()
 
+    def test_a_query_set_kept_with_the_data_is_in_the_case_manifest_by_its_name(self):
+        # 18 Oct 2026: a whole pass failed (relative_to) on WatDiv's sets, kept outside the tree.
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "watdiv-10m").mkdir()
+            (Path(tmp) / "watdiv-10m" / "C1-1.rq").write_text("SELECT * { ?s ?p ?o }", encoding="utf-8")
+            case = {"name": "watdiv", "queries": "@watdiv-10m", "metric": "sum_p50_ms", "data": "none"}
+            with patch.dict("os.environ", {"NRESE_FAST_QUERY_SETS": tmp}), patch.object(fast, "RUNTIME", "native"):
+                found = fast.case_manifest([case])
+        self.assertEqual(found["series"]["watdiv"], ["C1-1"])
+
     def test_prepared_files_are_checked_by_size_and_time(self):
         with tempfile.TemporaryDirectory() as tmp:
             data = Path(tmp) / "d.nt"
