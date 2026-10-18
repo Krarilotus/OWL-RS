@@ -89,13 +89,21 @@ pub(crate) struct Shard {
     /// Each key's end offset in `bytes` (a shard's text stays under 4 GiB: the
     /// dictionary's under 1 TiB).
     pub(crate) ends: Vec<u32>,
-    /// Each key's hash, for the table to grow by (dropped once numbered).
-    hashes: Vec<u64>,
     /// Each key's first position while loading; its final id once numbered (atomic so
     /// that the ranges of the numbering merge write their entries' ids in parallel).
     slots: Vec<AtomicU64>,
-    /// Indexes into the keys, by hash.
+    /// Indexes into the keys, by hash; grown by hashing the keys again: their hashes, kept
+    /// for it, were 8 bytes a new term at a load's peak (DBpedia core: 0.3 GB, 18 Oct 2026).
     table: HashTable<u32>,
+}
+
+/// Entry `local` of the keys `bytes` with the end offsets `ends`.
+fn entry<'b>(bytes: &'b [u8], ends: &[u32], local: usize) -> &'b [u8] {
+    let start = match local {
+        0 => 0,
+        _ => ends[local - 1] as usize,
+    };
+    &bytes[start..ends[local] as usize]
 }
 
 impl Shard {
@@ -104,11 +112,7 @@ impl Shard {
     }
 
     pub(crate) fn key(&self, local: usize) -> &[u8] {
-        let start = match local {
-            0 => 0,
-            _ => self.ends[local - 1] as usize,
-        };
-        &self.bytes[start..self.ends[local] as usize]
+        entry(&self.bytes, &self.ends, local)
     }
 
     fn find(&self, hash: u64, key: &[u8]) -> Option<u32> {
@@ -128,10 +132,13 @@ impl Shard {
         self.bytes.extend_from_slice(key);
         let end = u32::try_from(self.bytes.len()).expect("a shard's text under 4 GiB");
         self.ends.push(end);
-        self.hashes.push(hash);
         self.slots.push(AtomicU64::new(at));
-        let Shard { table, hashes, .. } = self;
-        table.insert_unique(hash, local, |&i| hashes[i as usize]);
+        let Shard {
+            table, bytes, ends, ..
+        } = self;
+        table.insert_unique(hash, local, |&i| {
+            super::hash::key_hash(entry(bytes, ends, i as usize))
+        });
         local
     }
 }
@@ -197,7 +204,7 @@ impl Pending {
     pub(crate) fn number(
         self,
         start: u64,
-        existing: impl Fn(u64, &[u8]) -> Option<u64> + Sync,
+        existing: impl Fn(&[u8]) -> Option<u64> + Sync,
     ) -> Adopted {
         let mut shards: Vec<Shard> = self
             .shards
@@ -211,16 +218,14 @@ impl Pending {
             .map(|shard| {
                 let mut order: Vec<u32> = Vec::with_capacity(shard.len());
                 for local in 0..shard.len() {
-                    match existing(shard.hashes[local], shard.key(local)) {
+                    match existing(shard.key(local)) {
                         Some(id) => *shard.slots[local].get_mut() = id,
                         None => order.push(local as u32),
                     }
                 }
                 order.sort_unstable_by_key(|&local| shard.slots[local as usize].load(Relaxed));
-                // The table finds keys without the hashes from now on, and the arrays
-                // shed what growing by doubling left over (a shard at a time, so the
-                // copies are small).
-                shard.hashes = Vec::new();
+                // The arrays shed what growing by doubling left over (a shard at a time,
+                // so the copies are small).
                 shard.bytes.shrink_to_fit();
                 shard.ends.shrink_to_fit();
                 shard.slots.shrink_to_fit();
@@ -228,13 +233,7 @@ impl Pending {
                     table, bytes, ends, ..
                 } = shard;
                 table.shrink_to_fit(|&local| {
-                    let local = local as usize;
-                    let start = if local == 0 {
-                        0
-                    } else {
-                        ends[local - 1] as usize
-                    };
-                    super::hash::key_hash(&bytes[start..ends[local] as usize])
+                    super::hash::key_hash(entry(bytes, ends, local as usize))
                 });
                 order
             })
@@ -428,7 +427,7 @@ mod tests {
                 });
                 assert!(indexes.iter().all(|&index| split(index).is_some()));
             }
-            let adopted = pending.number(10, |_, _| None);
+            let adopted = pending.number(10, |_| None);
             (0..adopted.len())
                 .map(|i| {
                     let key = adopted.key(i);
@@ -456,7 +455,7 @@ mod tests {
         let words: Vec<&[u8]> = vec![b"Sa", &long, b"Sb", b"", b"Sc"];
         let mut indexes = vec![NEW; words.len()];
         pending.intern(1, 0, &mut indexes, |k| (words[k], hash(words[k])));
-        let adopted = pending.number(0, |_, _| None);
+        let adopted = pending.number(0, |_| None);
         let keys: Vec<&[u8]> = (0..adopted.len()).map(|i| adopted.key(i)).collect();
         assert_eq!(keys, words);
     }
