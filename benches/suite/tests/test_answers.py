@@ -7,11 +7,14 @@ adjudicated count; and the host registry (suitekit/hosts.py).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -92,6 +95,112 @@ class Compare(unittest.TestCase):
 
 
 class Recording(unittest.TestCase):
+    def test_failed_measurement_is_retained_without_recapturing_or_expanding_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            query = directory / "q.rq"
+            text = "SELECT ?x { ?x ?p ?o } LIMIT 1"
+            query.write_text(text, encoding="utf-8")
+            recorder = answers.Recorder(directory, "jena")
+            item = ("w", "t", "none", query.name)
+            post = Mock(return_value=(200, select(["x"], [iri("a")])))
+            recorder.capture(post, "http://fixture", item, "jena", "off", 1, query, directory, 600,
+                             prior_error="timeout after 600 s")
+            post.assert_not_called()
+            self.assertEqual(recorder.queries[item], hashlib.sha256(text.encode()).hexdigest())
+            self.assertEqual(recorder.orders[item], ("limit", 1))
+            self.assertEqual(len(recorder.captures), 1)
+            self.assertEqual(recorder.captures[0].run, 1)
+            self.assertFalse(recorder.captures[0].unlimited)
+            self.assertIsNone(recorder.captures[0].sha256)
+            again = answers.Recorder.load([recorder.write()])
+            self.assertEqual(again.verdicts(), recorder.verdicts())
+            verdict = again.verdicts()[0]
+            self.assertEqual(verdict["verdict"], "incomplete")
+            self.assertIn("timeout after 600 s", verdict["note"])
+
+    def test_old_success_does_not_hide_a_failed_later_invocation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            query = directory / "q.rq"
+            query.write_text("SELECT ?x { ?x ?p ?o }", encoding="utf-8")
+            recorder = answers.Recorder(directory, "jena")
+            item = ("w", "t", "none", query.name)
+            post = Mock(return_value=(200, select(["x"], [iri("a")])))
+            recorder.capture(post, "http://fixture", item, "jena", "off", 1, query, directory, 600)
+            recorder.capture(post, "http://fixture", item, "jena", "off", 2, query, directory, 600,
+                             prior_error="timeout")
+            self.assertEqual(post.call_count, 1)
+            self.assertEqual([c.run for c in recorder.captures], [1, 2])
+            self.assertEqual(recorder.verdicts()[0]["verdict"], "incomplete")
+
+    def test_driver_captures_successes_but_does_not_reexecute_failed_queries(self):
+        from suitekit import driver
+        from suitekit.workloads import Plan
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            queries = directory / "queries"
+            queries.mkdir()
+            for name in ("failed", "good"):
+                (queries / f"{name}.rq").write_text("SELECT ?x { ?x ?p ?o }", encoding="utf-8")
+            suite = driver.Suite.__new__(driver.Suite)
+            suite.args = SimpleNamespace(dry_run=False, query_runs=1, query_timeout_s=600, order="fixed")
+            suite.answers = answers.Recorder(directory, "jena")
+            suite.harness = lambda: "fixture-harness"
+            suite.emit = Mock()
+            mix = {"queries": [{"id": "failed", "error": "timeout after 600 s"},
+                               {"id": "good", "rows": 1, "first_ms": 1, "latencies_ms": [1]}]}
+            suite.host_command = Mock(side_effect=lambda command, log:
+                                      (directory / "queries-cache-off.json").write_text(json.dumps(mix)))
+            post = Mock(return_value=(200, select(["x"], [iri("a")])))
+            with patch.object(driver, "capped_post", post):
+                suite.queries(SimpleNamespace(logs=directory), Plan("w", "t", queries=queries), "jena",
+                              SimpleNamespace(answers_only=False), SimpleNamespace(query="http://fixture"),
+                              {"regime": "none", "cache": "off"}, 1)
+            self.assertEqual(post.call_count, 1)
+            self.assertEqual(len(suite.answers.captures), 2)
+            verdicts = {v["query"]: v for v in suite.answers.verdicts()}
+            self.assertEqual(verdicts["failed.rq"]["verdict"], "incomplete")
+            self.assertEqual(verdicts["good.rq"]["verdict"], "reference")
+            self.assertTrue(any(call.kwargs.get("status") == "timeout" for call in suite.emit.call_args_list))
+
+    def test_invalid_reports_are_preserved_and_never_launch_answer_recapture(self):
+        from suitekit import driver
+        from suitekit.workloads import Plan
+        good = {"id": "q", "rows": 1, "first_ms": 1, "latencies_ms": [1]}
+        for case, records in (("stale", [good]), ("missing", []), ("duplicate", [good, good]),
+                              ("unfinished", [{**good, "latencies_ms": []}]), ("wrong-count", [good])):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                directory = Path(tmp)
+                query_dir = directory / "queries"
+                query_dir.mkdir()
+                (query_dir / "q.rq").write_text("SELECT ?x { ?x ?p ?o }", encoding="utf-8")
+                report = directory / "queries-cache-off.json"
+                encoded = json.dumps({"queries": records})
+                if case == "stale":
+                    report.write_text(encoded, encoding="utf-8")
+                suite = driver.Suite.__new__(driver.Suite)
+                suite.args = SimpleNamespace(dry_run=False, query_runs=1, query_timeout_s=600, order="fixed")
+                suite.answers = answers.Recorder(directory, "jena")
+                suite.harness = lambda: "fixture-harness"
+                suite.emit = Mock()
+                suite.host_command = Mock(side_effect=lambda command, log: report.write_text(encoded, encoding="utf-8"))
+                post = Mock(return_value=(200, select(["x"], [iri("a")])))
+                with patch.object(driver, "capped_post", post):
+                    suite.queries(SimpleNamespace(logs=directory),
+                                  Plan("w", "t", queries=query_dir, expected={"q": 2},
+                                       clients=(4,) if case != "wrong-count" else ()), "jena",
+                                  SimpleNamespace(answers_only=False), SimpleNamespace(query="http://fixture"),
+                                  {"regime": "none", "cache": "off"}, 1)
+                self.assertEqual(post.call_count, int(case == "wrong-count"))
+                self.assertEqual(suite.host_command.call_count, int(case != "stale"))
+                self.assertEqual(report.read_text(encoding="utf-8"), encoded)
+                self.assertEqual(len(suite.answers.captures), 1)
+                if case == "wrong-count":
+                    self.assertTrue(any(c.kwargs.get("status") == "wrong" for c in suite.emit.call_args_list))
+                else:
+                    self.assertEqual(suite.answers.verdicts()[0]["verdict"], "incomplete")
+
     def run_capture(self, bodies: dict[str, dict[str, str]], query: str, reference="jena", adjudicated=None,
                     expected=()) -> dict[str, dict]:
         """bodies: system -> query text -> response body; the verdict per system."""

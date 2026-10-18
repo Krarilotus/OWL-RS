@@ -120,6 +120,33 @@ def slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", text).strip("-").lower()
 
 
+def kit_env(environ) -> dict:
+    """A kit's environment: the W3C suites require their test data (a missing suite fails, never
+    passes by skipping), unless NRESE_W3C_OPTIONAL opts out (a local run without the data)."""
+    return {} if environ.get("NRESE_W3C_OPTIONAL") else {"NRESE_W3C_REQUIRED": "1"}
+
+
+def kit_counts(log: Path) -> str:
+    """The counts a conformance kit printed (its run with --nocapture), one clause per suite,
+    so a row says what ran and passed, not only that the command exited 0; a skip shows too."""
+    try:
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    out, title = [], None
+    for line in lines:
+        header = re.match(r"W3C (.+) on engine v2: passed / failed / skipped", line)
+        total = re.match(r"\s+total: (\d+) / (\d+) / (\d+)", line)
+        if header:
+            title = header.group(1)
+        elif total and title:
+            out.append(f"{title}: {total.group(1)} passed, {total.group(2)} failed, {total.group(3)} skipped")
+            title = None
+        elif re.match(r"(\S.*: \d+ of \d+ pass$|W3C .*: \d+ passed, |GeoSPARQL .*: \d+ of \d+ |skipped: )", line):
+            out.append(line.strip())
+    return "; ".join(out)
+
+
 def external_rows(rows: list[dict], captured: bool) -> list[dict]:
     """An external driver's rows as the suite's. Answers before time: its timings count only
     after its own qualification passed (a `conformance` row `...-qualification`, ok), or with
@@ -148,10 +175,10 @@ class Suite:
         self.settings = dict(os.environ)
         now = datetime.datetime.now()
         self.date = now.isoformat(timespec="minutes")
-        self.stamp = now.strftime("%Y%m%d-%H%M%S")
+        self.stamp = now.strftime("%Y%m%d-%H%M%S-%f")
         self.host = socket.gethostname()
         scratch_root = Path(self.settings.get("NRESE_BENCH_SCRATCH") or root / "tmp")
-        self.scratch = (scratch_root / f"{PREFIX}{self.stamp}").resolve()
+        self.scratch = scratch_root.resolve() / f"{PREFIX}{self.stamp}"
         self.results = Path(args.results or root / "benches/suite/results" / now.strftime("%Y-%m-%d")).resolve()
         if args.dry_run:
             # A dry run writes nothing that stays: its rows and logs go with the scratch.
@@ -182,6 +209,8 @@ class Suite:
         else:
             self.data_volume = None
             self.data = Mount(str(Path(data).resolve()), "/data")
+        # Claim this invocation's scratch before creating anything we may later remove.
+        self.scratch.mkdir(parents=True, exist_ok=False)
         self.writer = Writer(self.results / "results.csv", echo=print)
         self.made_files: list[str] = []  # datasets this run made, as /data paths
         self.made_volumes: list[str] = []
@@ -197,7 +226,7 @@ class Suite:
         print(text, flush=True)
 
     def host_command(self, command: list[str], log: Path | None = None, timeout: float | None = None,
-                     cwd: Path | None = None) -> int:
+                     cwd: Path | None = None, env: dict | None = None) -> int:
         """Runs a command on the host, from the repository root unless `cwd` says otherwise
         (echoed in a dry run)."""
         if command[0] == "bash":
@@ -205,12 +234,13 @@ class Suite:
         if self.args.dry_run:
             self.say(f"    [host] {shell(command)}")
             return 0
+        environment = {**os.environ, **env} if env else None
         if log is None:
-            return subprocess.run(command, cwd=cwd or self.root, timeout=timeout).returncode
+            return subprocess.run(command, cwd=cwd or self.root, timeout=timeout, env=environment).returncode
         log.parent.mkdir(parents=True, exist_ok=True)
         with open(log, "w", encoding="utf-8", errors="replace") as f:
             return subprocess.run(command, cwd=cwd or self.root, stdout=f, stderr=subprocess.STDOUT,
-                                  timeout=timeout).returncode
+                                  timeout=timeout, env=environment).returncode
 
     def emit(self, base: dict, **fields):
         result = Result(**{**base, **fields})
@@ -381,7 +411,7 @@ class Suite:
         work = self.scratch / run_id
         logs = self.results / "logs" / run_id
         logs.mkdir(parents=True, exist_ok=True)
-        work.mkdir(parents=True, exist_ok=True)
+        self.runtime.owned_path(str(work)).mkdir(parents=True)
         ctx = Context(self.runtime, self.root, work, logs, self.data, plan.mounts, self.args.timeout_s,
                       {**self.settings, "QUERY_TIMEOUT_S": str(self.args.query_timeout_s)}, run_id, plan.small)
         ctx.services = tuple(plan.services)
@@ -460,12 +490,18 @@ class Suite:
         except Exception as e:  # a system that fails mustn't stop the suite
             self.emit(base, task="load" if endpoint is None else "serve", status="failed", note=str(e)[:300])
         finally:
-            peak = system.stop(ctx)
-            if endpoint is not None and peak is not None:
-                self.emit(base, task="serve", peak_mib=peak, note="server peak over the run")
-            if store is not None:
-                self.runtime.remove_store(store)
-            shutil.rmtree(work, ignore_errors=True)
+            def stop():
+                peak = system.stop(ctx)
+                if endpoint is not None and peak is not None:
+                    self.emit(base, task="serve", peak_mib=peak, note="server peak over the run")
+
+            self.runtime.attempt(stop)
+            # The runtime also owns interrupted loaders and partially started servers.
+            self.runtime.cleanup()
+            if not self.runtime.workers():
+                if store is not None and (self.args.dry_run or store in self.runtime.created_stores):
+                    self.runtime.attempt(self.runtime.remove_store, store)
+                self.runtime.attempt(lambda: shutil.rmtree(self.runtime.owned_path(str(work))))
 
     def external(self, ctx: Context, plan, key: str, endpoint: Endpoint, base: dict, run: int):
         """A benchmark's own driver (Plan.external) against the endpoint; its rows as ours."""
@@ -494,10 +530,11 @@ class Suite:
     def queries(self, ctx: Context, plan, key: str, system, endpoint: Endpoint, base: dict, run: int):
         suffix = "" if base["cache"] == "-" else f"-cache-{base['cache']}"
         report = ctx.logs / f"queries{suffix}.json"
+        selected = sorted(plan.queries.glob("*.rq"))
         # A log is replayed as it is: each entry once, in order, without a warm-up.
         warmup, runs = ("0", "1") if plan.replay else ("1", str(self.args.query_runs))
         if self.answers and not plan.replay:
-            for query in plan.queries.glob("*.rq"):
+            for query in selected:
                 item = (plan.workload, plan.tier, base["regime"], query.name)
                 self.answers.expect(item, key, tuple(plan.all_inputs()))
                 self.answers.check(item, plan.answers.get(query.stem))
@@ -510,14 +547,30 @@ class Suite:
             base = {**base, "order": f"shuffled:{seed}"}
         else:
             base = {**base, "order": "fixed"}
-        self.host_command(command, ctx.logs / f"queries{suffix}.txt")
-        if self.args.dry_run:
-            return
         try:
+            # Each invocation owns a fresh report. Preserve old evidence rather
+            # than allowing a failed launcher to reuse it as this run's success.
+            if not self.args.dry_run and report.exists():
+                raise ValueError(f"report already exists: {report}")
+            self.host_command(command, ctx.logs / f"queries{suffix}.txt")
+            if self.args.dry_run:
+                return
             mix = json.loads(report.read_text(encoding="utf-8"))
             queries = mix["queries"]
-        except (OSError, ValueError, KeyError) as e:
-            self.emit(base, task="query", item="*", status="failed", note=f"no query report: {e}")
+            if sorted(q["id"] for q in queries) != [q.stem for q in selected]:
+                raise ValueError("query report must contain each selected case exactly once")
+            if any(not q.get("error") and (q.get("first_ms") is None or q.get("rows") is None
+                   or len(q.get("latencies_ms") or []) != int(runs)) for q in queries):
+                raise ValueError("query report contains unfinished measurements")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            error = f"invalid query report: {e}"
+            self.emit(base, task="query", item="*", status="failed", note=error)
+            if self.answers and not plan.replay:
+                for query in selected:
+                    self.answers.capture(capped_post, endpoint.query,
+                                         (plan.workload, plan.tier, base["regime"], query.name),
+                                         key, base["cache"], run, query, ctx.logs, self.args.query_timeout_s,
+                                         prior_error=error)
             return
         for clients in plan.clients:
             # Concurrent clients, one level at a time: the slowest query's p99 as the time,
@@ -561,9 +614,11 @@ class Suite:
                           ms="" if system.answers_only or latency is None else latency,
                           rows=q.get("rows") if q.get("rows") is not None else "", note=note)
         if self.answers and not plan.replay:
-            for query in sorted(plan.queries.glob("*.rq")):
+            failures = {q["id"]: q["error"] for q in queries if q.get("error")}
+            for query in selected:
                 self.answers.capture(capped_post, endpoint.query, (plan.workload, plan.tier, base["regime"], query.name),
-                                     key, base["cache"], run, query, ctx.logs, self.args.query_timeout_s)
+                                     key, base["cache"], run, query, ctx.logs, self.args.query_timeout_s,
+                                     prior_error=failures.get(query.stem))
 
     def writes(self, ctx: Context, endpoint: Endpoint, base: dict):
         report = ctx.logs / "write-scaling.json"
@@ -607,11 +662,21 @@ class Suite:
         base = dict(date=self.date, host=self.host, runtime="process", system=key, version="-",
                     publish=self.publish(key), workload=plan.workload, tier=plan.tier, regime="-", run=1)
         log = self.results / "logs" / slug(f"{self.stamp}-{key}-{plan.workload}") / "kit.log"
+        if plan.prepare:
+            # Its test data (the W3C kits: scripts/fetch-w3c-tests.sh, pinned).
+            prepared = log.with_name("prepare.log")
+            self.say(f"\n{key} / {plan.workload}: preparing: {shell(plan.prepare)}")
+            if self.host_command(plan.prepare, prepared) != 0:
+                self.emit(base, task="conformance", item=plan.workload, status="failed",
+                          note=f"preparing its data failed: log {prepared.relative_to(self.results)}")
+                return
         self.say(f"\n{key} / {plan.workload}: {shell(plan.command)}")
         started = time.monotonic()
-        rc = self.host_command(plan.command, log)
+        rc = self.host_command(plan.command, log, env=kit_env(os.environ))
+        counts = "" if self.args.dry_run else kit_counts(log)
         self.emit(base, task="conformance", item=plan.workload, status="ok" if rc == 0 else "failed",
-                  ms=(time.monotonic() - started) * 1000, note=f"log: {log.relative_to(self.results)}")
+                  ms=(time.monotonic() - started) * 1000,
+                  note=f"{counts + '; ' if counts else ''}log: {log.relative_to(self.results)}")
 
     def driver(self, plan, keys: list[str]):
         """A kit's own driver (Plan.driver) for `keys` on one tier: its steps in order, then
@@ -770,6 +835,8 @@ class Suite:
                 shift = (run - 1) % max(1, len(runnable))
                 for key, system, regime in runnable[shift:] + runnable[:shift]:
                     self.cycle(plan, key, system, regime, run)
+                    if self.runtime.workers():
+                        return 1
         self.cross_check()
         self.report_skips()
         self.say(f"\nresults: {self.writer.path}")
@@ -800,19 +867,29 @@ class Suite:
         """What this run made goes: containers, stores, scratch; and unless kept for a
         batch, datasets, build volumes and images (installed tools stay)."""
         self.runtime.cleanup()
-        shutil.rmtree(self.scratch, ignore_errors=True)
+        if self.args.dry_run and self.results.exists() and self.results == self.scratch / "dry-run-results":
+            self.runtime.attempt(shutil.rmtree, self.runtime.owned_path(str(self.results)))
+        if self.scratch.exists() and not self.runtime.workers() and not self.runtime.created_stores:
+            self.runtime.attempt(self.scratch.rmdir)
         if self.args.dry_run:
             return
-        if not self.keep:
+        if not self.keep and not self.runtime.workers():
+            def checked(command):
+                run_quiet(command).check_returncode()
+
             if self.made_files and self.data_volume and self.data_volume not in self.made_volumes:
-                run_quiet(["docker", "run", "--rm", "-v", f"{self.data_volume}:/data", "alpine", "rm", "-f",
-                           *self.made_files])
-            for volume in self.made_volumes:
-                run_quiet(["docker", "volume", "rm", "-f", volume])
+                if self.runtime.attempt(checked, ["docker", "run", "--rm", "-v", f"{self.data_volume}:/data",
+                                                 "alpine", "rm", "-f", "--", *self.made_files]):
+                    self.made_files.clear()
+            for volume in list(self.made_volumes):
+                if self.runtime.attempt(DockerRuntime.remove_resource, self.runtime, "volume", volume):
+                    self.made_volumes.remove(volume)
+                    if volume == self.data_volume:
+                        self.made_files.clear()
             if not self.tools_installed:
-                for image in self.made_images:
-                    run_quiet(["docker", "image", "rm", image])
-        self.made_files, self.made_volumes, self.made_images = [], [], []
+                for image in list(self.made_images):
+                    if self.runtime.attempt(checked, ["docker", "image", "rm", image]):
+                        self.made_images.remove(image)
 
 
 def images(argv: list[str], systems: dict, root: Path) -> int:
@@ -841,17 +918,33 @@ def main(argv: list[str], systems: dict, workloads: dict, root: Path) -> int:
         suite.manifest = Manifest(suite.results, root, argv, args, args.runtime, suite.settings)
     atexit.register(suite.cleanup)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-    code = None
+    code = 1
     try:
         code = suite.run()
-        return code
     except KeyboardInterrupt:
         print("\ninterrupted: cleaning up", file=sys.stderr)
         code = 130
-        return code
+    except SystemExit as error:
+        code = error.code if isinstance(error.code, int) else 1 if error.code else 0
+        if code:
+            raise
     finally:
         if suite.answers:
-            print(f"answers: {suite.answers.write()}")
+            suite.runtime.attempt(lambda: print(f"answers: {suite.answers.write()}"))
+        suite.runtime.attempt(suite.cleanup)
+        atexit.unregister(suite.cleanup)
+        if suite.runtime.cleanup_errors and code == 0:
+            code = 1
         if suite.manifest:
-            suite.manifest.finish(code)
-        suite.cleanup()
+            def record_cleanup():
+                suite.manifest.update(cleanup={"errors": suite.runtime.cleanup_errors,
+                                              "residuals": {**suite.runtime.residuals(),
+                                                            "scratch": str(suite.scratch) if suite.scratch.exists() else None,
+                                                            "files": suite.made_files, "volumes": suite.made_volumes,
+                                                            "images": suite.made_images}})
+
+            if not suite.runtime.attempt(record_cleanup) and code == 0:
+                code = 1
+            if not suite.runtime.attempt(suite.manifest.finish, code) and code == 0:
+                code = 1
+    return code
