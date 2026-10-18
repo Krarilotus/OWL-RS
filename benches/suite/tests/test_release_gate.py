@@ -633,6 +633,21 @@ class NoiseReduction(unittest.TestCase):
         self.assertEqual(fast.scope_stalls_ms("x\nfast-scope-pressure cpu=1500 io=250000 memory=\n"),
                          {"cpu": 1.5, "io": 250.0})
 
+    def test_a_series_batched_on_both_sides_is_judged_at_its_finer_resolution(self):
+        def records_of(side, n):
+            r = record(samples={"q01": [0.0090, 0.0091, 0.0090] if side == "cand" else [0.0088, 0.0088, 0.0089]})
+            if side != "main":
+                r["observations"][0]["batched"] = {"q01": 50}
+            return [r]
+        ps = passes(records_of)
+        summary = run_gate(ps)
+        # 2 % slower, 0.2 µs: below the unit's 5 µs; batched 50 times on v1.5's side and the
+        # head's, a loss; main can't batch, so against main the 5 µs stays.
+        self.assertEqual(summary["comparisons"]["base"]["lab-olympics"]["dimensions"]["time/q01"]["verdict"],
+                         "regression")
+        self.assertEqual(summary["comparisons"]["main"]["lab-olympics"]["dimensions"]["time/q01"]["verdict"],
+                         "neutral")
+
     def test_calibrate_buys_runs_where_cheap_and_passes_where_noise_needs_them_within_budget(self):
         # Power at 4 passes falls from 1 (sd 0.1 %) to 0 (sd 10 %); 16 passes hold it to 2.5 %.
         table = {"grid": [0.001, 0.1], **{str(n): [1.0, max(0.0, (n - 4) / 12 * 0.9)] for n in range(4, 17, 2)}}
