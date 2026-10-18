@@ -1466,11 +1466,15 @@ impl Snapshot {
 
     /// The string literals this snapshot's dictionary holds that match `query`, best first
     /// (whether statements still use them is the caller's to check).
-    pub fn text_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
+    /// Malformed or unsupported operators return [`crate::EngineError::InvalidTextQuery`].
+    pub fn text_search(
+        &self,
+        query: &crate::TextQuery,
+    ) -> crate::EngineResult<Vec<crate::TextMatch>> {
         let known = self.version.dictionary_len;
-        let mut matches = self.dictionary.text_search(query);
+        let mut matches = self.dictionary.text_search(query)?;
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
-        matches
+        Ok(matches)
     }
 
     /// The vector literals this snapshot's dictionary holds that are nearest to
@@ -1502,11 +1506,15 @@ impl Snapshot {
 
     /// The IRIs this snapshot's dictionary holds whose local names match `query`, best
     /// first (whether statements still use them is the caller's to check).
-    pub fn iri_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
+    /// Malformed or unsupported operators return [`crate::EngineError::InvalidTextQuery`].
+    pub fn iri_search(
+        &self,
+        query: &crate::TextQuery,
+    ) -> crate::EngineResult<Vec<crate::TextMatch>> {
         let known = self.version.dictionary_len;
-        let mut matches = self.dictionary.iri_search(query);
+        let mut matches = self.dictionary.iri_search(query)?;
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
-        matches
+        Ok(matches)
     }
 }
 

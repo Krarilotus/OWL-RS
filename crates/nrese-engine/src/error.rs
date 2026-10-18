@@ -10,6 +10,8 @@ pub enum EngineError {
     Corruption(String),
     #[error("invalid engine configuration: {0}")]
     Configuration(String),
+    #[error("invalid text query: {0}")]
+    InvalidTextQuery(String),
     #[error("term {0:#x} is not known to the dictionary")]
     UnknownTerm(u64),
     #[error("RDF-star triple terms are not supported by the engine")]
