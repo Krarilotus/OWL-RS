@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use nrese_reasoner::ReasonerService;
+use nrese_reasoner::{ReasonerConfig, ReasonerService};
 use nrese_store::{MutationPipeline, ReasoningRunRecord, StoreMode, StoreService};
 
 use crate::ai::AiSuggestionService;
@@ -39,12 +39,12 @@ impl AppState {
     /// [`Self::try_new`]; panics if the access state can't be opened (for tests).
     pub fn new(
         store: StoreService,
-        reasoner: ReasonerService,
+        reasoning: ReasonerConfig,
         policy: PolicyConfig,
         ai: AiSuggestionService,
         deployment_posture: DeploymentPosture,
     ) -> Self {
-        Self::try_new(store, reasoner, policy, ai, deployment_posture).expect("access state")
+        Self::try_new(store, reasoning, policy, ai, deployment_posture).expect("access state")
     }
 
     /// The server's state: the default repository's store, the others found beside it, and
@@ -52,14 +52,14 @@ impl AppState {
     /// with the store), into which a policy file is imported at the first start.
     pub fn try_new(
         store: StoreService,
-        reasoner: ReasonerService,
+        reasoning: ReasonerConfig,
         policy: PolicyConfig,
         ai: AiSuggestionService,
         deployment_posture: DeploymentPosture,
     ) -> anyhow::Result<Self> {
         let access = Arc::new(open_access(store.config(), store.runtime(), &policy)?);
         let repositories =
-            Arc::new(Catalog::open(store, reasoner).map_err(|error| anyhow::anyhow!(error))?);
+            Arc::new(Catalog::open(store, reasoning).map_err(|error| anyhow::anyhow!(error))?);
         let state = Self {
             pipeline: Arc::clone(&repositories.default_repository().pipeline),
             ready: Arc::new(AtomicBool::new(false)),

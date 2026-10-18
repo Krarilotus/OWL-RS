@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService};
+use nrese_reasoner::ReasonerConfig;
 use nrese_store::{
     DatasetRestoreReport, DatasetRestoreRequest, GraphDeleteReport, GraphTarget, GraphWriteReport,
     GraphWriteRequest, MutationCommand, MutationCommitReport, MutationError, MutationPipeline,
@@ -72,10 +72,7 @@ pub trait Writes {
 
 impl Writes for StoreService {
     fn writer(&self) -> MutationPipeline {
-        MutationPipeline::new(
-            Arc::new(self.clone()),
-            Arc::new(ReasonerService::new(ReasonerConfig::default())),
-        )
+        MutationPipeline::new(Arc::new(self.clone()), ReasonerConfig::default())
     }
 }
 

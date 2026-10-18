@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_store::{
     BulkLoadRequest, GraphTarget, MutationCommand, MutationPipeline, MutationTicket, Requester,
     SparqlUpdateRequest, StoreConfig, StoreService,
@@ -79,10 +79,7 @@ fn run(mode: ReasoningMode, files: &[PathBuf], commits: usize, class: &str, prop
             invalid: Some(nrese_store::InvalidStatements::Strict),
         })
         .expect("load");
-    let pipeline = MutationPipeline::new(
-        Arc::new(store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),
-    );
+    let pipeline = MutationPipeline::new(Arc::new(store), ReasonerConfig::for_mode(mode));
     let first = commit(
         &pipeline,
         &format!("INSERT DATA {{ <urn:lab:new0> a <{class}> }}"),
