@@ -11,9 +11,13 @@ release speed, the checks a debug build has). Each test run sits under its targe
 cap (`memory_mib` in the targets file, else --memory-mib, 4000) through scripts/capped-chunk.py;
 a run that reaches it is CAP-REACHED, the sweep's setting, never counted as a finding. A chunk's
 own cap must hold the largest target's (`run` says which). `run` writes OUT/results.tsv (seed, target,
-status, seconds) as it goes and a failure's whole output to OUT/failures/; a seed already
-there is skipped; no new seed starts past the budget. A failure is data, never the chunk's
-end: the chunk exits 0 and says FAILED with the seed (the queue goes on with the sweep).
+status, seconds, cap) as it goes and a failure's whole output to OUT/failures/. A test the
+budget stopped is INTERRUPTED (capped-chunk's exit 75), never ok. On resume a seed whose
+latest row stands is skipped: ok, FAILED, or CAP-REACHED at the target's current cap; an
+INTERRUPTED or BUILD-FAILED run, or a cap reached below a raised memory_mib, runs again. No
+new seed starts past the budget. A failure is data, never the chunk's end: the chunk exits 0
+and says FAILED with the seed, and every chunk's summary counts the sweep's findings so far,
+the earlier chunks' included (the queue goes on with the sweep).
 
 A failure found on a host under diagnosis (hosts.toml [[host.<key>.unstable]], Khaleesi since
 12 Oct 2026) is reproduced on another host before anyone acts on it.
@@ -42,6 +46,7 @@ def name(t: dict) -> str:
 
 
 CAP_REACHED = 86  # scripts/capped-chunk.py's exit status at its memory cap
+BUDGET_ENDED = 75  # and when its time budget stopped the test (not done, run again)
 
 
 def capped(t: dict, extra: list[str], default_mib: int, budget_min: float) -> list[str]:
@@ -52,15 +57,49 @@ def capped(t: dict, extra: list[str], default_mib: int, budget_min: float) -> li
 
 
 def status_of(returncode: int, stderr: str) -> str:
-    """ok, FAILED(code) (a finding), or the sweep's own problems: BUILD-FAILED (13 Oct 2026:
-    nrese-server's test binary under the memory cap) and CAP-REACHED, never counted as findings."""
+    """ok, FAILED(code) (a finding), or the sweep's own problems, never counted as findings:
+    BUILD-FAILED (13 Oct 2026: nrese-server's test binary under the memory cap), CAP-REACHED
+    and INTERRUPTED (the budget stopped the test: no answer yet)."""
     if returncode == 0:
         return "ok"
+    if returncode == BUDGET_ENDED:
+        return "INTERRUPTED"
     if "could not compile" in stderr or "process didn't exit successfully" in stderr.split("Running")[0]:
         return "BUILD-FAILED"
     if returncode == CAP_REACHED:
         return "CAP-REACHED"
     return f"FAILED({returncode})"
+
+
+def final(status: str, cap_then: str, cap_now: int) -> bool:
+    """Whether a recorded run stands: ok and findings do; a cap reached stands at the same cap
+    (raising the target's memory_mib runs it again); an interrupted run or a failed build
+    doesn't."""
+    if status == "ok" or status.startswith("FAILED("):
+        return True
+    return status == "CAP-REACHED" and cap_then == str(cap_now)
+
+
+def recorded(results: Path) -> dict[tuple[str, str], list[str]]:
+    """(seed, target) -> its latest row of results.tsv."""
+    latest = {}
+    if results.exists():
+        for line in results.read_text(encoding="utf-8").splitlines():
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                latest[(parts[0], parts[1])] = parts
+    return latest
+
+
+def summary(results: Path) -> str:
+    """Every finding in the table, from this chunk and the chunks before it."""
+    found = sorted(((int(seed), target) for (seed, target), row in recorded(results).items()
+                    if row[2].startswith("FAILED(")), key=lambda f: f)
+    if not found:
+        return "0 failures in the sweep so far"
+    shown = ", ".join(f"seed {seed} {target}" for seed, target in found[:20])
+    return f"{len(found)} failure{'s' if len(found) > 1 else ''} in the sweep so far: {shown}" + \
+        (" ..." if len(found) > 20 else "")
 
 
 def cargo(t: dict, extra: list[str]) -> list[str]:
@@ -89,12 +128,7 @@ def run(args) -> int:
     out = Path(args.out)
     (out / "failures").mkdir(parents=True, exist_ok=True)
     results = out / "results.tsv"
-    done = set()
-    if results.exists():
-        for line in results.read_text(encoding="utf-8").splitlines():
-            parts = line.split("\t")
-            if len(parts) >= 3:
-                done.add((parts[0], parts[1]))
+    latest = recorded(results)
     deadline = time.monotonic() + args.budget_min * 60
     found = 0
     largest = max(t.get("memory_mib", args.memory_mib) for t in targets(args.targets))
@@ -102,11 +136,13 @@ def run(args) -> int:
           flush=True)
     for seed in seeds(args.seeds, args.first):
         for t in targets(args.targets):
-            if (str(seed), name(t)) in done:
+            cap = t.get("memory_mib", args.memory_mib)
+            row = latest.get((str(seed), name(t)))
+            if row and final(row[2], row[4] if len(row) > 4 else "", cap):
                 continue
             if time.monotonic() > deadline:
                 print(f"budget used: stopped before seed {seed} {name(t)}; {found} failures in this chunk; "
-                      "the next chunk resumes", flush=True)
+                      f"{summary(results)}; the next chunk resumes", flush=True)
                 return 0
             env = {**os.environ, **ENV, "NRESE_FUZZ_SEED": str(seed)}
             started = time.monotonic()
@@ -116,12 +152,13 @@ def run(args) -> int:
             seconds = time.monotonic() - started
             status = status_of(r.returncode, r.stderr)
             with open(results, "a", encoding="utf-8", newline="\n") as f:
-                f.write(f"{seed}\t{name(t)}\t{status}\t{seconds:.1f}\n")
-            if status in ("BUILD-FAILED", "CAP-REACHED"):
+                f.write(f"{seed}\t{name(t)}\t{status}\t{seconds:.1f}\t{cap}\n")
+            if status in ("BUILD-FAILED", "CAP-REACHED", "INTERRUPTED"):
                 log = out / "failures" / f"{name(t).replace(':', '-')}-{seed}-{status.lower()}.log"
                 log.write_text(r.stdout + "\n" + r.stderr, encoding="utf-8")
-                why = ("the sweep's build" if status == "BUILD-FAILED"
-                       else f"the target's memory cap ({t.get('memory_mib', args.memory_mib)} MiB): raise its memory_mib")
+                why = {"BUILD-FAILED": "the sweep's build",
+                       "INTERRUPTED": "the budget stopped it; the next chunk runs it again",
+                       "CAP-REACHED": f"the target's memory cap ({cap} MiB): raise its memory_mib"}[status]
                 print(f"{status}: {name(t)} at seed {seed} ({log.name}): {why}, not a finding", flush=True)
             elif r.returncode != 0:
                 found += 1
@@ -130,7 +167,7 @@ def run(args) -> int:
                                + r.stdout + "\n" + r.stderr, encoding="utf-8")
                 print(f"FAILED: seed {seed} {name(t)} ({log.name}): reproduce on another host before acting",
                       flush=True)
-    print(f"every seed of the range done; {found} failures in this chunk", flush=True)
+    print(f"every seed of the range done; {found} failures in this chunk; {summary(results)}", flush=True)
     return 0
 
 
