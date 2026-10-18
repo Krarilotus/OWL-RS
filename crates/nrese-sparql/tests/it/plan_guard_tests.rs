@@ -548,3 +548,54 @@ fn parts_are_shared_across_queries_through_the_result_cache() {
     );
     assert_eq!(explanation.rows, run(shared, &QueryOptions::default()).rows);
 }
+
+/// DBpedia core q02's shape, `?p :birthPlace :Berlin ; :name ?n ; :birthDate ?d`, plans
+/// the same on every run, from the first query on a fresh store: the constant first, then
+/// index joins, the estimate the same each time (main: 2.0-2.1 ms; v2 ran 3.3-7.5 ms while
+/// the characteristic sets were built beside the queries, release gate 14 Oct 2026). 4,000
+/// persons born in 40 cities, all with a birth date, six in seven with a name: 85 born in
+/// `city0` have one; the estimate within a quarter of that.
+#[test]
+fn a_star_from_a_constant_plans_alike_from_the_first_run() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let mut add = |s: String, p: &str, o: nrese_rdf::Term| {
+        tx.insert(Quad::new(ex(&s), ex(p), o, GraphName::DefaultGraph).as_ref());
+    };
+    for i in 0..4_000 {
+        let person = format!("person{i}");
+        let city = ex(&format!("city{}", i % 40));
+        add(person.clone(), "birthPlace", city.into());
+        let date = Literal::new_simple_literal(format!("19{:02}", i % 100));
+        add(person.clone(), "birthDate", date.into());
+        if i % 7 != 0 {
+            let name = Literal::new_simple_literal(format!("p{i}"));
+            add(person, "name", name.into());
+        }
+    }
+    tx.commit().unwrap();
+    let query = "SELECT * WHERE { ?p e:birthPlace e:city0 ; e:name ?n ; e:birthDate ?d }";
+    let plan = |steps: Vec<PlanStep>| -> Vec<(String, String, Option<u64>, u64)> {
+        steps
+            .into_iter()
+            .map(|s| (s.operator, s.detail, s.estimated_rows, s.rows))
+            .collect()
+    };
+    let first = plan(steps(&engine, query));
+    let bgp = first.iter().position(|s| s.0 == "bgp").expect("a bgp");
+    let operators: Vec<&str> = first[bgp + 1..].iter().map(|s| s.0.as_str()).collect();
+    assert_eq!(
+        operators,
+        ["scan", "index join", "index join"],
+        "{first:#?}"
+    );
+    assert!(first[bgp + 1].1.contains("birthPlace"), "{first:#?}");
+    assert_eq!(first[bgp].3, 85);
+    assert!(
+        first[bgp].2.is_some_and(|e| (68..=106).contains(&e)),
+        "{first:#?}"
+    );
+    for _ in 0..3 {
+        assert_eq!(plan(steps(&engine, query)), first);
+    }
+}

@@ -10,27 +10,52 @@
 //! per read model, until its size drifts by a quarter. Built on every core over slices
 //! of the subjects, and saved beside the checkpoint (`derived/`), so that a restart reads
 //! them instead of scanning the store again; a load builds them before it returns
-//! ([`Statistics::prepare_sets`]). Otherwise built at once for up to [`SYNC_SETS`]
-//! statements; beyond, on a thread of their own, while queries plan without them.
+//! ([`Statistics::prepare_sets`]). No query plans on a half-built state, and no build
+//! takes every core beside the queries (DBpedia core q02 ran 3.3-7.5 ms beside one, 2.0
+//! ms after it):
+//!
+//! - Sets kept or saved but drifted: every planner goes on with them, while one rebuild
+//!   on a thread of its own, scanning on that thread alone, replaces them when done.
+//! - None at all (a first use without a load's build): the first planner builds them and
+//!   planners that arrive meanwhile wait for that build. A Rayon worker doesn't wait (the
+//!   stack it holds may be what the build waits for, as for the result cache's flights):
+//!   it plans without them. Only such a query (SHACL-SPARQL checks run on workers) can
+//!   plan by when it came, and only during that first build.
+//!
+//! A scan stops once the slices have found more than
+//! [`MAX_SETS`](super::characteristic::MAX_SETS) sets between them.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
 
-use super::characteristic::{CharacteristicSets, Partial};
+use super::characteristic::{CharacteristicSets, Partial, SetCount};
 use super::{ReadModel, Snapshot, Version};
 use crate::quad::{GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
 
-/// Default graphs up to this size get their characteristic sets built at once.
-const SYNC_SETS: u64 = 1 << 20;
+/// The characteristic sets of one read model as built at a size (`None`: there were too
+/// many to keep), and whether a rebuild is under way.
+struct Sets {
+    built: Option<Arc<CharacteristicSets>>,
+    at: u64,
+    rebuilding: bool,
+}
 
-/// The characteristic sets of one read model: being built, or built at a size (`None`:
-/// there were too many to keep).
-enum Sets {
-    Building,
-    Built(Option<Arc<CharacteristicSets>>, u64),
+impl Sets {
+    fn fits(&self, size: u64) -> bool {
+        size.abs_diff(self.at) <= self.at / 4
+    }
+}
+
+/// How a planner came by the sets ([`Statistics::kept_sets`]).
+enum Kept {
+    /// Kept for its size, or kept and drifted (a rebuild started if none was).
+    Sets(Option<Arc<CharacteristicSets>>),
+    /// None kept or saved.
+    Cold,
 }
 
 /// Cached entries; the cache is cleared when it fills up.
@@ -54,8 +79,12 @@ pub(crate) struct Statistics {
     nodes: Mutex<Vec<NodeCount>>,
     /// Per read model, the default graph's characteristic sets.
     sets: Mutex<HashMap<ReadModel, Sets>>,
+    /// Held while the sets are built: planners that need them meanwhile wait for them.
+    building: Mutex<()>,
     /// Where they are saved and read back (`derived/` of a durable engine).
     dir: Mutex<Option<std::path::PathBuf>>,
+    /// Scans of the store for the sets begun: what the tests count.
+    scans: AtomicU64,
 }
 
 /// Slices of the subject ids for scanning a graph by subject on every core: the
@@ -120,10 +149,11 @@ impl Statistics {
         Some(n)
     }
 
-    /// The characteristic sets of the default graph in `model`, as of a size within a
-    /// quarter of `snapshot`'s: kept, read from their file (written after a build, read
-    /// at the first use after a start), built now (small graphs) or started on a thread
-    /// of their own (`None` until they are there).
+    /// The characteristic sets of the default graph in `model` (see the module docs): kept
+    /// (drifted ones while one rebuild replaces them), read from their file (written
+    /// after a build, read at the first use after a start), or built now, the first
+    /// time, by one planner while the others wait; a Rayon worker that would wait gets
+    /// none.
     pub(crate) fn characteristic_sets(
         self: &Arc<Self>,
         snapshot: &Snapshot,
@@ -131,40 +161,62 @@ impl Statistics {
     ) -> Option<Arc<CharacteristicSets>> {
         let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
         let size = snapshot.count_in(model, &pattern);
-        {
-            let mut sets = self.sets.lock();
-            match sets.get(&model) {
-                Some(Sets::Built(built, at)) if size.abs_diff(*at) <= at / 4 => {
-                    return built.clone();
-                }
-                Some(Sets::Building) => return None,
-                None => {
-                    if let Some((built, at)) = self.load_sets(snapshot, model)
-                        && size.abs_diff(at) <= at / 4
-                    {
-                        sets.insert(model, Sets::Built(built.clone(), at));
-                        return built;
-                    }
-                }
-                _ => {}
-            }
-            if size > SYNC_SETS {
-                sets.insert(model, Sets::Building);
-            }
+        if let Kept::Sets(sets) = self.kept_sets(snapshot, model, size) {
+            return sets;
         }
-        if size <= SYNC_SETS {
-            return self.build_sets(snapshot, model, size);
+        let building = match rayon::current_thread_index() {
+            Some(_) => self.building.try_lock(),
+            None => Some(self.building.lock()),
+        };
+        let _building = building?;
+        match self.kept_sets(snapshot, model, size) {
+            Kept::Sets(sets) => sets,
+            Kept::Cold => self.build_sets(snapshot, model, size, true),
         }
+    }
+
+    /// The sets of `model` kept, or read from their file if none are; drifted ones by more
+    /// than a quarter from `size` too, with one rebuild started for them.
+    fn kept_sets(self: &Arc<Self>, snapshot: &Snapshot, model: ReadModel, size: u64) -> Kept {
+        let mut sets = self.sets.lock();
+        let kept = match sets.entry(model) {
+            std::collections::hash_map::Entry::Occupied(kept) => kept.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let Some((built, at)) = self.load_sets(snapshot, model) else {
+                    return Kept::Cold;
+                };
+                vacant.insert(Sets {
+                    built,
+                    at,
+                    rebuilding: false,
+                })
+            }
+        };
+        if !kept.fits(size) && !kept.rebuilding {
+            kept.rebuilding = true;
+            self.rebuild(snapshot, model);
+        }
+        Kept::Sets(kept.built.clone())
+    }
+
+    /// Rebuilds the drifted sets of `model` on a thread of its own, scanning on that
+    /// thread alone, and replaces them when done; planners go on with the old ones.
+    fn rebuild(self: &Arc<Self>, snapshot: &Snapshot, model: ReadModel) {
         let (statistics, snapshot) = (Arc::clone(self), snapshot.clone());
         let started = std::thread::Builder::new()
             .name("nrese-statistics".to_owned())
             .spawn(move || {
-                statistics.build_sets(&snapshot, model, size);
+                let _building = statistics.building.lock();
+                let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
+                let size = snapshot.count_in(model, &pattern);
+                statistics.build_sets(&snapshot, model, size, false);
             });
-        if started.is_err() {
-            self.sets.lock().remove(&model);
+        if started.is_err()
+            && let Some(kept) = self.sets.lock().get_mut(&model)
+        {
+            // Asked again at the next drifted use.
+            kept.rebuilding = false;
         }
-        None
     }
 
     /// Builds the characteristic sets of `model` now, whatever the size, keeps and saves
@@ -173,19 +225,58 @@ impl Statistics {
     pub(crate) fn prepare_sets(self: &Arc<Self>, snapshot: &Snapshot, model: ReadModel) {
         let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
         let size = snapshot.count_in(model, &pattern);
-        self.build_sets(snapshot, model, size);
+        let _building = self.building.lock();
+        self.build_sets(snapshot, model, size, true);
     }
 
-    /// The sets of `model` from two scans in subject order, each on every core over slices
-    /// of the subjects; kept as built at `size` and saved.
+    /// The sets of `model` scanned (on every core or on this thread alone), kept as built
+    /// at `size` and saved; under `building`.
     fn build_sets(
         &self,
         snapshot: &Snapshot,
         model: ReadModel,
         size: u64,
+        every_core: bool,
+    ) -> Option<Arc<CharacteristicSets>> {
+        let started = std::time::Instant::now();
+        self.scans.fetch_add(1, Ordering::Relaxed);
+        let built = Self::scan_sets(snapshot, model, every_core);
+        tracing::debug!(
+            ?model,
+            statements = size,
+            sets = built.as_ref().map_or(0, |s| s.len()),
+            pairs = built.as_ref().is_some_and(|s| s.has_pairs()),
+            every_core,
+            ms = started.elapsed().as_millis() as u64,
+            "characteristic sets built"
+        );
+        self.save_sets(snapshot, model, size, built.as_deref());
+        self.sets.lock().insert(
+            model,
+            Sets {
+                built: built.clone(),
+                at: size,
+                rebuilding: false,
+            },
+        );
+        built
+    }
+
+    /// Scans of the store for the characteristic sets begun so far.
+    #[cfg(test)]
+    pub(crate) fn scans(&self) -> u64 {
+        self.scans.load(Ordering::Relaxed)
+    }
+
+    /// The sets of `model` from two scans in subject order over slices of the subjects,
+    /// on every core or on this thread alone; the first stops once the slices have found
+    /// more than [`MAX_SETS`](super::characteristic::MAX_SETS) between them.
+    fn scan_sets(
+        snapshot: &Snapshot,
+        model: ReadModel,
+        every_core: bool,
     ) -> Option<Arc<CharacteristicSets>> {
         use rayon::prelude::*;
-        let started = std::time::Instant::now();
         let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
         let ranges = subject_ranges(
             snapshot.dictionary_len(),
@@ -194,32 +285,19 @@ impl Statistics {
         let scan = |&(low, high): &(TermId, TermId)| {
             snapshot.scan_range_in(model, &pattern, Permutation::Gspo, low, high)
         };
-        let built = (|| {
-            let parts: Option<Vec<Partial>> = ranges
-                .par_iter()
-                .map(|range| scan(range).and_then(Partial::of))
-                .collect();
-            let sets = CharacteristicSets::merge(parts?)?;
-            // The pairs need each subject's set first: a second scan.
-            let scans: Option<Vec<_>> = ranges.iter().map(scan).collect();
-            Some(Arc::new(match scans {
-                Some(scans) => sets.with_pairs_of(scans),
-                None => sets,
-            }))
-        })();
-        tracing::debug!(
-            ?model,
-            statements = size,
-            sets = built.as_ref().map_or(0, |s| s.len()),
-            pairs = built.as_ref().is_some_and(|s| s.has_pairs()),
-            ms = started.elapsed().as_millis() as u64,
-            "characteristic sets built"
-        );
-        self.save_sets(snapshot, model, size, built.as_deref());
-        self.sets
-            .lock()
-            .insert(model, Sets::Built(built.clone(), size));
-        built
+        let count = SetCount::default();
+        let part = |range: &(TermId, TermId)| scan(range).and_then(|q| Partial::of(q, &count));
+        let parts: Option<Vec<Partial>> = match every_core {
+            true => ranges.par_iter().map(part).collect(),
+            false => ranges.iter().map(part).collect(),
+        };
+        let sets = CharacteristicSets::merge(parts?)?;
+        // The pairs need each subject's set first: a second scan.
+        let scans: Option<Vec<_>> = ranges.iter().map(scan).collect();
+        Some(Arc::new(match scans {
+            Some(scans) => sets.with_pairs_of(scans),
+            None => sets,
+        }))
     }
 
     /// Where the derived files are (a durable engine's `derived/`).
@@ -310,5 +388,93 @@ impl Statistics {
         }
         cache.insert(key, (distinct, count));
         Some(distinct)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rayon::prelude::*;
+
+    use super::*;
+    use crate::{Engine, EngineConfig};
+    use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
+
+    /// Subjects `s{i}` with one to three of three predicates.
+    fn add(engine: &Engine, subjects: std::ops::Range<u32>) {
+        let mut tx = engine.transaction();
+        for i in subjects {
+            let subject = NamedNode::new_unchecked(format!("http://example.com/s{i}"));
+            for p in 0..1 + i % 3 {
+                let predicate = NamedNode::new_unchecked(format!("http://example.com/p{p}"));
+                let object = Literal::new_simple_literal(format!("{i}"));
+                let quad = Quad::new(subject.clone(), predicate, object, GraphName::DefaultGraph);
+                tx.insert(quad.as_ref());
+            }
+        }
+        tx.commit().unwrap();
+    }
+
+    /// Planners on Rayon workers (SHACL-SPARQL checks) during the first build don't each
+    /// scan the store: they plan without the sets and the build is one scan. After a drift
+    /// by more than a quarter every planner, on a worker or not, goes on with the old sets
+    /// at once, and one rebuild on a thread of its own scans once more.
+    #[test]
+    fn planners_during_a_build_scan_the_store_once() {
+        let model = ReadModel::default();
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        add(&engine, 0..3_000);
+        let statistics = Arc::clone(&engine.inner.shared.statistics);
+        let workers = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let planners = |snapshot: &Snapshot| -> Vec<Option<Arc<CharacteristicSets>>> {
+            workers.install(|| {
+                (0..64)
+                    .into_par_iter()
+                    .map(|_| snapshot.characteristic_sets_in(model))
+                    .collect()
+            })
+        };
+        let same = |found: &[Option<Arc<CharacteristicSets>>], sets: &Arc<CharacteristicSets>| {
+            found
+                .iter()
+                .all(|s| s.as_ref().is_some_and(|s| Arc::ptr_eq(s, sets)))
+        };
+        // The first build under way (held here): the workers plan without the sets.
+        let snapshot = engine.snapshot();
+        let held = statistics.building.lock();
+        assert!(planners(&snapshot).iter().all(Option::is_none));
+        assert_eq!(statistics.scans(), 0);
+        drop(held);
+        // A planner off the workers builds them, once; then the workers have them too.
+        let first = snapshot.characteristic_sets_in(model).expect("built");
+        assert_eq!(statistics.scans(), 1);
+        assert!(same(&planners(&snapshot), &first));
+        // Drifted, the rebuild held back: every planner has the old sets, none waits.
+        add(&engine, 3_000..6_000);
+        let snapshot = engine.snapshot();
+        let held = statistics.building.lock();
+        assert!(same(&planners(&snapshot), &first));
+        assert!(same(&[snapshot.characteristic_sets_in(model)], &first));
+        drop(held);
+        // One rebuild replaces them.
+        let started = std::time::Instant::now();
+        let size = snapshot.count_in(model, &QuadPattern::in_graph(TermId::DEFAULT_GRAPH));
+        while statistics
+            .sets
+            .lock()
+            .get(&model)
+            .is_none_or(|s| s.at != size)
+        {
+            assert!(started.elapsed().as_secs() < 30, "no rebuild");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(statistics.scans(), 2);
+        let rebuilt = snapshot.characteristic_sets_in(model).expect("rebuilt");
+        assert!(!Arc::ptr_eq(&rebuilt, &first));
+        assert_eq!(rebuilt.subjects(), 6_000);
+        assert!(same(&planners(&snapshot), &rebuilt));
+        assert_eq!(statistics.scans(), 2);
     }
 }

@@ -14,6 +14,8 @@
 //!
 //! - **Data:** `--load` bulk-loads files, into memory or, with `--store`, into an on-disk
 //!   store. `--store` alone reopens a store loaded earlier, which skips the load on reruns.
+//!   After a load (and its reasoning) the planner's statistics are prepared before the
+//!   queries, as the server's load command does, timed apart (`statistics_ms`).
 //! - **Queries:** every `*.rq` in `--queries`, in name order. Each runs `--warmup` times
 //!   unmeasured, then `--runs` times measured. The result is serialised as the server
 //!   would (TSV for SELECT, JSON for ASK, N-Triples for CONSTRUCT/DESCRIBE) into a
@@ -1263,6 +1265,15 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         ),
     ));
 
+    if !args.load.is_empty() {
+        // As the server's load command does: the planner's statistics belong to the
+        // loaded store, built before the first query (timed apart from the load).
+        let started = Instant::now();
+        store.prepare_statistics();
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("planner statistics prepared in {ms:.1} ms");
+        report.sections.push(("statistics_ms", format!("{ms:.3}")));
+    }
     if let Some((dimension, metric)) = args.prepare_vector_graph {
         let phase = Phase::start();
         let started = Instant::now();
