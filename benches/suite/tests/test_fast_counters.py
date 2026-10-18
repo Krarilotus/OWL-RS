@@ -82,6 +82,54 @@ def comparison(base, new, **options):
 
 
 class FastComparison(unittest.TestCase):
+    def test_missing_later_json_fails_even_after_both_cache_modes_were_observed(self):
+        case = {"name": "partial", "data": "none", "args": [], "queries": "",
+                "metric": "cold_ms", "cap_gb": 2, "repeat": 2}
+        with tempfile.TemporaryDirectory() as directory:
+            scratch, calls = Path(directory), []
+
+            def measured(*args, **kwargs):
+                calls.append(1)
+                if len(calls) <= 2:
+                    (scratch / "partial.json").write_text('{"open_s":1,"peak_mib":100}')
+                return 0, "", "", 1
+
+            with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", measured), \
+                    patch.object(fast, "page_cache_modes", return_value=(["warm", "cold"], "")), \
+                    patch.object(fast, "drop_page_cache", return_value=True):
+                record = fast.measure(case, "partial", 1, {}, {}, "none")
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(set(record["cache_peaks"]), {"warm", "cold"})
+        self.assertIn("invocation did not produce its JSON report", record["notes"])
+
+    def test_cache_mode_memory_survives_measurement_and_compaction(self):
+        case = {"name": "cache", "data": "none", "args": [], "queries": "",
+                "metric": "cold_ms", "cap_gb": 2, "repeat": 2, "page_cache": ["warm", "cold"]}
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            peaks = iter([100, 200, 110, 210])
+
+            def measured(*args, **kwargs):
+                (scratch / "cache.json").write_text(json.dumps({"open_s": 1, "peak_mib": next(peaks),
+                    "queries": [{"name": "q", "first_ms": 5, "p50_ms": 2}]}))
+                return 0, "", "", 1
+
+            with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", measured), \
+                    patch.object(fast, "page_cache_modes", return_value=(["warm", "cold"], "")), \
+                    patch.object(fast, "drop_page_cache", return_value=True):
+                record = fast.measure(case, "cache", 1, {}, {}, "none")
+        self.assertEqual(record["cache_peaks"], {"warm": [100, 110], "cold": [200, 210]})
+        self.assertEqual(fast.compact_record(record)["cache_peaks"], record["cache_peaks"])
+        self.assertEqual([o["identity"] for o in record["observations"]], fast.invocation_plan(case))
+        self.assertEqual([o["peak_mib"] for o in record["observations"]], [100, 200, 110, 210])
+        self.assertEqual(fast.compact_record(record)["observations"], record["observations"])
+        self.assertEqual(record["metric"], 2010)  # original descriptive aggregate is unchanged
+        for mode in ("warm", "cold"):
+            self.assertEqual(record["samples"][f"{mode}/open"], [1000, 1000])
+            self.assertEqual(record["samples"][f"{mode}/q/first"], [5, 5])
+            self.assertEqual(record["samples"][f"{mode}/q/repeat"], [2, 2])
+        self.assertEqual(fast.case_manifest([case])["cache_modes"], {"cache": ["warm", "cold"]})
+
     def test_single_client_level_survives_measurement_and_compaction(self):
         clients = {"clients": 32, "qps": 100, "p99_ms": 1, "memory": {"peak_mib": 64}}
         case = {"name": "single", "data": "none", "args": ["--clients", "32"],
@@ -324,8 +372,27 @@ class FastNative(unittest.TestCase):
 
 
 class FastPageCache(unittest.TestCase):
+    def test_invocation_plan_distinguishes_processes_from_internal_repeats(self):
+        case = {"name": "s", "metric": "open_s", "repeat": 2, "sweep": [["--x", "1"], ["--x", "2"]],
+                "page_cache": ["warm", "cold"]}
+        plan = fast.invocation_plan(case)
+        self.assertEqual(len(plan), 8)
+        self.assertEqual(plan[-1], {"sweep": 1, "repeat": 1, "cache": "cold"})
+        self.assertEqual(fast.case_manifest([case])["invocation_series"]["s"], [["_"]] * 8)
+        self.assertEqual(len(fast.invocation_plan({**case, "tool": "tableau"})), 1)
+
+    def test_each_invocation_keeps_its_counters_clients_and_scope_peak(self):
+        case = {"metric": "clients.p99_ms"}
+        result = {"nodes_created": 7, "clients": {"clients": 4, "qps": 30, "p99_ms": 2},
+                  "phases": {"query": {"peak_mib": 16}}}
+        observation = fast.invocation_observation(case, result, "fast-scope-peak 33554432\n", {})
+        self.assertEqual(observation["counters"]["nodes_created"], 7)
+        self.assertEqual(observation["throughput"][0]["qps"], 30)
+        self.assertEqual(observation["cgroup_peak_mib"], 32)
+        self.assertEqual(observation["phase_peaks"], {"query": 16})
+
     def test_warm_and_cold_are_series_of_their_own_and_the_metric_sums_their_medians(self):
-        runs = [{"open_s": 0.010, "queries": [{"first_ms": 1.0}], "_page_cache": mode}
+        runs = [{"open_s": 0.010, "queries": [{"name": "q", "first_ms": 1.0, "p50_ms": 0.5}], "_page_cache": mode}
                 for mode in ("warm", "cold", "warm", "cold", "warm", "cold")]
         for run, extra in zip(runs, (0, 30, 0, 50, 0, 40)):
             run["queries"][0]["first_ms"] += extra
@@ -333,7 +400,8 @@ class FastPageCache(unittest.TestCase):
         self.assertEqual(fast.cold_series(result), {"warm": [11.0] * 3, "cold": [41.0, 61.0, 51.0]})
         self.assertEqual(fast.metric_value({"metric": "cold_ms"}, result), 11.0 + 51.0)
         one = {**runs[0], "_repeats": [runs[0], runs[2]]}
-        self.assertEqual(fast.samples({"metric": "cold_ms"}, one), {"_": [11.0, 11.0]})
+        self.assertEqual(fast.samples({"metric": "cold_ms"}, one),
+                         {"warm/open": [10.0, 10.0], "warm/q/first": [1.0, 1.0], "warm/q/repeat": [0.5, 0.5]})
 
     def test_a_host_without_a_cold_cache_command_runs_warm_and_says_so(self):
         with patch.object(fast, "cold_cache_command", lambda: None):
@@ -342,6 +410,24 @@ class FastPageCache(unittest.TestCase):
         self.assertIn("cold_cache", why)
         with patch.object(fast, "cold_cache_command", lambda: "true"):
             self.assertEqual(fast.page_cache_modes({"page_cache": ["warm", "cold"]}), (["warm", "cold"], ""))
+
+
+class AbBase(unittest.TestCase):
+    """An A/B's base side: off its case's route is a measured run there (`--off-route-ok`),
+    a failed run never is (sparql-memory-ab-phuoc-2: every base pass failed in 0.0 s, the
+    job finished done)."""
+
+    def test_off_route_is_measured_on_the_base_only(self):
+        records = [{"case": "op-group", "status": "off-route"}, {"case": "q-star", "status": "ok"}]
+        self.assertEqual([r["case"] for r in fast.not_as_expected(records)], ["op-group"])
+        self.assertEqual(fast.not_as_expected(records, off_route_ok=True), [])
+
+    def test_failed_runs_fail_either_side(self):
+        records = [{"case": "q-star", "status": "failed"}, {"case": "q-chain", "status": "wrong"},
+                   {"case": "q-limit", "status": "failed", "expected_outcome": "failed"}]
+        for off_route_ok in (False, True):
+            bad = fast.not_as_expected(records, off_route_ok=off_route_ok)
+            self.assertEqual([r["case"] for r in bad], ["q-star", "q-chain"])
 
 
 if __name__ == "__main__":
