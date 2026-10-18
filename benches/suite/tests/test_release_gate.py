@@ -651,6 +651,11 @@ class NoiseReduction(unittest.TestCase):
                    {"name": "q-paths", "metric": "sum_p50_ms", "queries": "q-paths", "args": ["--runs", "10"]}]
         # Four passes a side of both cases: 2 blocks x 2 x (3 sides x 20 s + 3 x 40 s) = 12 min.
         cheap = gate_module.calibrate(catalog, ps, budget_min=13, table=table, batch=False)["cases"]
+        # Batched: only a short query of a case with long ones, its samples 50 µs at least.
+        short = [record(case="lab-olympics", samples={"q01": [10.0] * 5, "q02": [0.008] * 5})]
+        batched = gate_module.calibrate(catalog[:1], passes(lambda side, n: short), budget_min=60, table=table)
+        self.assertEqual({k: batched["cases"]["lab-olympics"][k] for k in ("batch", "batch_queries")},
+                         {"batch": 7, "batch_queries": ["q02"]})
         self.assertEqual(cheap["lab-olympics"]["runs"], 200)   # 2 s of 10 ms executions
         self.assertEqual(cheap["lab-olympics"]["warmup"], 3)
         self.assertEqual(cheap["lab-olympics"]["passes"], 4)
@@ -671,6 +676,8 @@ class NoiseReduction(unittest.TestCase):
         self.assertEqual(got["repeat"], 2)
         with patch.dict(fast.MEASURE, {"x": {"batch": 7}}, clear=True), patch.dict(fast.OPTIONS, {"batch": True}):
             self.assertEqual(fast.measured(case)["args"][-2:], ["--batch", "7"])
+        with patch.dict(fast.MEASURE, {"x": {"batch": 7, "batch_queries": ["q01", "q07"]}}, clear=True),                 patch.dict(fast.OPTIONS, {"batch": True}):
+            self.assertEqual(fast.measured(case)["args"][-4:], ["--batch", "7", "--batch-queries", "q01,q07"])
         unlisted = {"name": "y", "args": ["--runs", "5"]}
         with patch.dict(fast.MEASURE, {}, clear=True):
             self.assertIs(fast.measured(unlisted), unlisted)

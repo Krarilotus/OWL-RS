@@ -189,6 +189,8 @@ power = 0.689
 [case.dlmode-lubm1]
 runs = 635
 warmup = 3
+batch = 9
+batch_queries = ["q01", "q02", "q03", "q04", "q05", "q07", "q10", "q11", "q12", "q13"]
 noise = 0.0799
 passes = 4
 seconds = 3.5
@@ -293,6 +295,8 @@ power = 0.595
 [case.lab-dbpedia-core]
 runs = 21
 warmup = 3
+batch = 13
+batch_queries = ["q01-point-lookup", "q04-date-range", "q07-subdivision-path", "q10-types-count", "q11-count-all"]
 noise = 0.4169
 passes = 4
 seconds = 14.8
@@ -301,6 +305,8 @@ power = 0.0
 [case.lab-entities-10m]
 runs = 177
 warmup = 3
+batch = 17
+batch_queries = ["q01-point-lookup", "q02-two-hop", "q03-count-type", "q05-group-born", "q07-inbound", "q08-count-all"]
 noise = 0.1
 passes = 4
 seconds = 3.4
@@ -309,6 +315,8 @@ power = 0.001
 [case.lab-olympics]
 runs = 41
 warmup = 3
+batch = 17
+batch_queries = ["q01-point-lookup", "q05-numeric-range", "q07-games-by-year", "q10-ask", "q11-count-all"]
 noise = 0.0533
 passes = 4
 seconds = 2.4
@@ -317,6 +325,8 @@ power = 0.016
 [case.lab-yago-tiny]
 runs = 8
 warmup = 1
+batch = 25
+batch_queries = ["q01-label-lookup", "q04-movie-actors", "q07-class-count", "q09-count-all"]
 noise = 0.1528
 passes = 4
 seconds = 5.6
@@ -439,6 +449,8 @@ power = 0.008
 [case.parse-large]
 runs = 100
 warmup = 3
+batch = 2
+batch_queries = ["expression-depth-120", "path-alternatives-300", "subqueries-50-deep"]
 noise = 0.0117
 passes = 10
 seconds = 2.8
@@ -447,6 +459,8 @@ power = 0.805
 [case.plan-estimates]
 runs = 200
 warmup = 3
+batch = 2
+batch_queries = ["chain-posts", "values-star"]
 noise = 0.0281
 passes = 4
 seconds = 3.7
@@ -456,6 +470,7 @@ power = 0.082
 runs = 2000
 warmup = 3
 batch = 2
+batch_queries = ["chain-posts"]
 noise = 0.0082
 passes = 6
 seconds = 2.3
@@ -480,6 +495,8 @@ power = 0.188
 [case.q-paths]
 runs = 10
 warmup = 1
+batch = 10
+batch_queries = ["broader-closure", "tag-descendants"]
 noise = 0.0949
 passes = 4
 seconds = 5.8
@@ -488,6 +505,8 @@ power = 0.002
 [case.q-sideways]
 runs = 700
 warmup = 3
+batch = 2
+batch_queries = ["values-star"]
 noise = 0.0247
 passes = 4
 seconds = 4.0
@@ -527,6 +546,7 @@ power = 0.889
 runs = 873
 warmup = 3
 batch = 17
+batch_queries = ["q03", "q04", "q05", "q06", "q07", "q08", "q09", "q10", "q11", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22"]
 noise = 0.1055
 passes = 4
 seconds = 4.4
@@ -657,6 +677,8 @@ power = 1.0
 [case.text-search]
 runs = 45
 warmup = 3
+batch = 10
+batch_queries = ["docs-w19999"]
 noise = 0.0297
 passes = 4
 seconds = 8.2
