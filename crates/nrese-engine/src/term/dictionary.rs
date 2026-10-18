@@ -465,6 +465,9 @@ pub struct Dictionary {
     pub(crate) part_hook: parking_lot::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     /// Built at the first search, extended at later ones ([`super::text`]).
     text: RwLock<super::text::TextIndex>,
+    /// Held by the thread building a large extension of the text index (0) or the IRI
+    /// index (1) ([`Self::cover_text`]).
+    text_building: [parking_lot::Mutex<()>; 2],
     /// IRIs by the words of their local names ([`super::text::local_name_text`]), built at
     /// the first autocompletion and extended at later ones.
     iri_text: RwLock<super::text::TextIndex>,
@@ -855,18 +858,21 @@ impl Dictionary {
     }
 
     /// Extends the full-text index of literals (`iris`: of IRIs' local names) with the
-    /// entries interned since it last looked. A large batch's texts are copied under the
-    /// entries' lock alone, then indexed on every core with no lock held, as a fragment
-    /// the index takes in under its lock ([`super::text::TextIndex::absorb`]): a part's
-    /// thread may run a job meanwhile that interns, or searches, behind a writer that
-    /// would wait for a lock held across the parts. Where another search took the batch in
-    /// first, its fragment is dropped. A small batch is indexed under the locks, on this
-    /// thread alone.
+    /// entries interned since it last looked. A large extension is built apart, as one
+    /// fragment, batch after batch: each batch's texts copied under the entries' lock on
+    /// threads of their own ([`super::text::scoped`]: they take on no other job), then
+    /// indexed on every core with no lock held, since a part's thread may run a job
+    /// meanwhile that interns, or searches, behind a writer that would wait for a lock held
+    /// across the parts. The index takes the fragment in under its lock
+    /// ([`super::text::TextIndex::absorb`]). One build at a time: a thread off Rayon's pool
+    /// waits for another's; a Rayon worker doesn't (the build may be waiting for it) and
+    /// builds its own, the first taken in. A small extension is indexed under the locks, on
+    /// this thread alone.
     pub(crate) fn cover_text(&self, iris: bool) {
         use rayon::prelude::*;
-        let (which, slot) = match iris {
-            false => (TEXT, &self.text),
-            true => (IRI_TEXT, &self.iri_text),
+        let (which, slot, building) = match iris {
+            false => (TEXT, &self.text, &self.text_building[0]),
+            true => (IRI_TEXT, &self.iri_text, &self.text_building[1]),
         };
         // The text an entry is found by (a literal's value, an IRI as it is: its local
         // name is made from it with no lock held).
@@ -892,38 +898,61 @@ impl Dictionary {
             if start >= end {
                 return;
             }
-            let stop = (start + TEXT_BATCH).min(end);
-            if stop - start < super::text::SERIAL_DOCUMENTS {
+            if end - start < super::text::SERIAL_DOCUMENTS {
                 let mut index = slot.write();
                 if index.covered() != start {
                     continue;
                 }
                 let inner = self.inner.read();
-                for entry in start..stop {
+                for entry in start..end.min(inner.len()) {
                     if let Some(text) = raw(inner.key(entry)).and_then(words) {
                         index.add(entry, &text);
                     }
                 }
-                index.cover(stop);
+                index.cover(end.min(inner.len()));
                 continue;
             }
-            let texts: Vec<(u64, String)> = {
-                let inner = self.inner.read();
-                (start..stop)
-                    .filter_map(|entry| Some((entry, raw(inner.key(entry))?)))
-                    .collect()
+            let _building = match rayon::current_thread_index() {
+                Some(_) => building.try_lock(),
+                None => Some(building.lock()),
             };
-            let documents: Vec<(u64, String)> = texts
-                .into_par_iter()
-                .with_min_len(super::text::BUILD_PART)
-                .filter_map(|(entry, text)| Some((entry, words(text)?)))
-                .collect();
-            let documents: Vec<(u64, &str)> = documents
-                .iter()
-                .map(|(entry, text)| (*entry, text.as_str()))
-                .collect();
-            let fragment =
-                super::text::TextIndex::fragment(start, stop, &documents, &|| self.part_started());
+            if slot.read().covered() != start {
+                continue;
+            }
+            let mut fragment = super::text::TextIndex::starting_at(start);
+            let mut from = start;
+            while from < end {
+                let stop = (from + TEXT_BATCH).min(end);
+                let texts: Vec<(u64, String)> = {
+                    let inner = self.inner.read();
+                    let inner: &Inner = &inner;
+                    let per = (stop - from).div_ceil(super::text::threads() as u64);
+                    let ranges: Vec<(u64, u64)> = (from..stop)
+                        .step_by(per as usize)
+                        .map(|a| (a, (a + per).min(stop)))
+                        .collect();
+                    super::text::scoped(ranges, |(a, b)| {
+                        (a..b)
+                            .filter_map(|entry| Some((entry, raw(inner.key(entry))?)))
+                            .collect::<Vec<_>>()
+                    })
+                    .into_iter()
+                    .flatten()
+                    .collect()
+                };
+                let documents: Vec<(u64, String)> = texts
+                    .into_par_iter()
+                    .with_min_len(super::text::BUILD_PART)
+                    .filter_map(|(entry, text)| Some((entry, words(text)?)))
+                    .collect();
+                let documents: Vec<(u64, &str)> = documents
+                    .iter()
+                    .map(|(entry, text)| (*entry, text.as_str()))
+                    .collect();
+                fragment.extend(&documents, &|| self.part_started());
+                from = stop;
+            }
+            fragment.cover(end);
             let mut index = slot.write();
             if index.covered() == start {
                 index.absorb(fragment);
@@ -1926,6 +1955,33 @@ fn validate_key(key: &[u8]) -> EngineResult<()> {
 #[cfg(test)]
 mod tests {
     use nrese_rdf::vocab::xsd;
+
+    /// One large build at a time, but a Rayon worker never waits for another's (that build
+    /// may be waiting for the worker): with the build held elsewhere, a worker builds the
+    /// index itself.
+    #[test]
+    fn a_rayon_worker_never_waits_for_another_build() {
+        let dictionary = std::sync::Arc::new(Dictionary::default());
+        for i in 0..3 * super::super::text::SERIAL_DOCUMENTS {
+            dictionary.intern(LiteralRef::new_simple_literal(&format!("label {i}")).into());
+        }
+        let held = dictionary.text_building[0].lock();
+        let (done, finished) = std::sync::mpsc::channel();
+        let building = std::sync::Arc::clone(&dictionary);
+        std::thread::spawn(move || {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            pool.install(|| building.cover_text(false));
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the worker built the index rather than wait");
+        drop(held);
+        assert_eq!(dictionary.text.read().covered(), dictionary.len());
+    }
 
     /// The full-text indexes' builds run their parallel parts without the dictionary's
     /// lock or theirs: a job one of the parts' threads takes on meanwhile may intern, or
