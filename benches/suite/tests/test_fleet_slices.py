@@ -67,6 +67,21 @@ class Containers(unittest.TestCase):
             with patch.object(adapters, "slice_limit_mib", lambda: None):
                 self.assertEqual(self.context({}).memory, f"{30 * 1024 * 9 // 10}m")
                 self.assertIsNone(self.context({"DOCKER_MEMORY": "0"}).memory)
+                self.assertEqual(self.context({"DOCKER_MEMORY": "40g"}).memory, "40g")
+
+    def test_an_explicit_cap_never_passes_the_fleet_slice(self):
+        """Defect 5 (audit, 18 Oct 2026): an explicit DOCKER_MEMORY bypassed the slice's ceiling.
+        A container Docker can't put in the slice is counted nowhere: one past the ceiling is
+        refused, not shrunk (PROTOCOL.md §3: no silent cap)."""
+        with patch.object(adapters, "docker_memory_bytes", lambda: 30 * 2**30):
+            with patch.object(adapters, "slice_limit_mib", lambda: 17_600):
+                for setting in ("40g", "16577m", f"{16_577 * 2**20}", "20000M"):
+                    with self.assertRaisesRegex(ValueError, "slice"):
+                        self.context({"DOCKER_MEMORY": setting}).memory
+                self.assertEqual(self.context({"DOCKER_MEMORY": "16576m"}).memory, "16576m")
+                self.assertEqual(self.context({"DOCKER_MEMORY": "16g"}).memory, "16g")
+                with self.assertRaisesRegex(ValueError, "DOCKER_MEMORY"):
+                    self.context({"DOCKER_MEMORY": "lots"}).memory
 
 
 if __name__ == "__main__":
