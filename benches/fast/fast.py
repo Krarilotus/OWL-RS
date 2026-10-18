@@ -391,18 +391,19 @@ PREPARED = "PREPARED.json"
 # release_gate.py calibrate from the gate's own noise): the perf lab's runs and warm-ups a
 # process, and the case's repetitions (fresh processes for the perf lab, files a process for
 # the DL tools), the same for every side of a gate whatever the case's own arguments say.
-# `batch`: executions a timed sample (perf_lab --batch), applied only with `run --batch`, when
-# every side's perf lab has it (the gate's CAPABILITIES).
+# `batch`: executions a timed sample (perf_lab --batch), of the queries `batch_queries` names
+# (all without), applied only with `run --batch`, when every side's perf lab has it (the
+# gate's CAPABILITIES).
 MEASURE: dict[str, dict] = {}
-MEASURED_KEYS = ("runs", "warmup", "repeat", "batch")
+MEASURED_KEYS = ("runs", "warmup", "repeat", "batch", "batch_queries")
 
 
 def load_measure(path: Path) -> tuple[dict[str, dict], str]:
     """The calibration's cases (only the keys fast.py applies) and the file's SHA-256."""
     data = path.read_bytes()
     cases = tomllib.loads(data.decode("utf-8")).get("case", {})
-    return ({name: {k: int(v) for k, v in entry.items() if k in MEASURED_KEYS} for name, entry in cases.items()},
-            hashlib.sha256(data).hexdigest())
+    return ({name: {k: (v if k == "batch_queries" else int(v)) for k, v in entry.items() if k in MEASURED_KEYS}
+             for name, entry in cases.items()}, hashlib.sha256(data).hexdigest())
 
 
 def with_flag(args: list[str], flag: str, value) -> list[str]:
@@ -422,9 +423,10 @@ def measured(case: dict) -> dict:
     case = dict(case)
     if case.get("tool", "perf_lab") == "perf_lab":
         args = list(case.get("args", []))
-        for key in ("runs", "warmup") + (("batch",) if OPTIONS.get("batch") else ()):
+        for key in ("runs", "warmup") + (("batch", "batch_queries") if OPTIONS.get("batch") else ()):
             if key in m:
-                args = with_flag(args, f"--{key}", m[key])
+                value = ",".join(m[key]) if key == "batch_queries" else m[key]
+                args = with_flag(args, "--" + key.replace("_", "-"), value)
         case["args"] = args
     if "repeat" in m:
         case["repeat"] = m["repeat"]

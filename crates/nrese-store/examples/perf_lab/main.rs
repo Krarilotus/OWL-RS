@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run --release -p nrese-store --example perf_lab -- \
-//!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] [--batch 1] \
+//!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] [--batch 1 [--batch-queries A,B]] \
 //!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
 //!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE]
 //!     [--shacl-report FILE] [--reason MODE]
@@ -20,7 +20,8 @@
 //!   unmeasured, then `--runs` times measured; with `--batch K` each measured sample times K
 //!   executions back to back and reports their mean, in nanoseconds (a query of a few
 //!   microseconds, timed alone, is a few steps of the report's microsecond and its timer's
-//!   overhead). The result is serialised as the server
+//!   overhead); `--batch-queries` limits it to the queries named (the short ones of a set
+//!   that also has long ones). The result is serialised as the server
 //!   would (TSV for SELECT, JSON for ASK, N-Triples for CONSTRUCT/DESCRIBE) into a
 //!   counting sink, so evaluation, term decoding and serialisation are all included.
 //! - **Report:** rows, p50, min and max per query, peak memory (Linux), and a JSON file
@@ -190,6 +191,7 @@ struct Args {
     runs: usize,
     warmup: usize,
     batch: usize,
+    batch_queries: Option<Vec<String>>,
     timeout: Duration,
     only: Option<String>,
     label: String,
@@ -229,6 +231,7 @@ fn parse_args() -> Result<Args, String> {
         runs: 5,
         warmup: 1,
         batch: 1,
+        batch_queries: None,
         timeout: Duration::from_secs(120),
         only: None,
         label: "nrese".into(),
@@ -269,6 +272,9 @@ fn parse_args() -> Result<Args, String> {
             "--runs" => args.runs = value()?.parse().map_err(|e| format!("--runs: {e}"))?,
             "--warmup" => args.warmup = value()?.parse().map_err(|e| format!("--warmup: {e}"))?,
             "--batch" => args.batch = value()?.parse().map_err(|e| format!("--batch: {e}"))?,
+            "--batch-queries" => {
+                args.batch_queries = Some(value()?.split(',').map(str::to_owned).collect())
+            }
             "--timeout-s" => {
                 args.timeout =
                     Duration::from_secs(value()?.parse().map_err(|e| format!("--timeout-s: {e}"))?)
@@ -462,7 +468,8 @@ fn write_results(
     Ok(())
 }
 
-fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
+/// Each sample of `measure` times `batch` executions (1: one).
+fn measure(store: &StoreService, text: &str, args: &Args, batch: usize) -> Measured {
     let mut request = SparqlQueryRequest::all(text);
     request.solutions_format = args.format;
     let prepared = match PreparedQuery::parse(&request) {
@@ -493,7 +500,7 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
     };
     for i in 0..args.warmup + args.runs {
         let faults = nrese_exec::memory::page_faults();
-        let executions = if i >= args.warmup { args.batch } else { 1 };
+        let executions = if i >= args.warmup { batch } else { 1 };
         match run_once(store, &prepared, args.timeout, executions) {
             Ok((rows, elapsed)) => {
                 if let (Some(before), Some(after)) = (faults, nrese_exec::memory::page_faults()) {
@@ -1334,7 +1341,12 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             report.sum_p50 += p50;
             continue;
         }
-        let m = measure(&store, text, args);
+        // Batched where asked: every query, or those `--batch-queries` names.
+        let batch = match &args.batch_queries {
+            Some(names) if !names.contains(&name) => 1,
+            _ => args.batch,
+        };
+        let m = measure(&store, text, args, batch);
         if let Some(dir) = &args.results {
             write_results(&store, text, args, &dir.join(format!("{name}.out")))?;
         }
@@ -1398,7 +1410,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             ));
         }
         // Batched samples are means of several executions: reported to the nanosecond.
-        let digits = if args.batch > 1 { 6 } else { 3 };
+        let digits = if batch > 1 { 6 } else { 3 };
         let samples: Vec<String> = m
             .times
             .iter()
