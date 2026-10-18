@@ -258,7 +258,7 @@ pub async fn session_update(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let access = guard::update_access(&state, &authenticated).await?;
-    let request = super::rdf4j::update(&raw, &headers, &body)?;
+    let request = super::rdf4j::update(&raw, &headers, &body, state.policy().limits.planner)?;
     add(
         &state,
         &session,
