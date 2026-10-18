@@ -8,7 +8,9 @@
 //! append-only, so nothing indexed ever changes. A large extension is built apart, as an
 //! index of the new documents alone (a fragment), with no lock held, and then taken in
 //! ([`TextIndex::absorb`]): a part of the parallel build may run a job that wants the
-//! dictionary or this index. Whether a literal still occurs in the data
+//! dictionary or this index. Taking it in runs under the index's lock, on threads of its
+//! own (scoped, not Rayon's: they run nothing else, so no job they take on can wait for
+//! the lock); into an empty index it is a move. Whether a literal still occurs in the data
 //! is the query's business (it joins the matches with the statements).
 //!
 //! Scores are BM25 (k1 = 1.2, b = 0.75) summed over the query's words and divided by the
@@ -251,6 +253,28 @@ impl Postings {
     }
 }
 
+/// Threads for work under a lock ([`scoped`]).
+pub(crate) fn threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+/// `f` of each of `parts`, each on a thread of its own (scoped, not Rayon's): for work
+/// done while a lock is held, since these threads take on no other job, which might wait
+/// for that lock.
+pub(crate) fn scoped<T: Send, R: Send>(parts: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+    let f = &f;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = parts
+            .into_iter()
+            .map(|part| scope.spawn(move || f(part)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a scoped part"))
+            .collect()
+    })
+}
+
 /// The numbers whose bits `bits` sets, ascending.
 fn ones(bits: &[u64]) -> impl Iterator<Item = u64> + '_ {
     bits.iter().enumerate().flat_map(|(w, &word)| {
@@ -488,29 +512,34 @@ impl TextIndex {
         })
     }
 
-    /// An index of `documents` alone, the dictionary's entries `first..covered`, built on
-    /// every core ([`Self::extend`], `part` run at each parallel part's start) for
-    /// [`Self::absorb`] to take in.
-    pub(crate) fn fragment(
-        first: u64,
-        covered: u64,
-        documents: &[(u64, &str)],
-        part: &(dyn Fn() + Sync),
-    ) -> Self {
-        let mut fragment = Self {
+    /// An empty index of the dictionary's entries from `first` on: a fragment, extended
+    /// ([`Self::extend`]) and covered apart, for [`Self::absorb`] to take in.
+    pub(crate) fn starting_at(first: u64) -> Self {
+        Self {
             first,
+            covered: first,
             ..Self::default()
-        };
-        fragment.extend(documents, part);
-        fragment.covered = covered;
-        fragment
+        }
     }
 
     /// Takes in `fragment`, an index of the entries from this one's coverage on (built
-    /// apart, [`Self::fragment`]): its documents' lengths, its words' postings after
-    /// theirs, its coverage. One thread: it runs under the index's lock.
-    pub(crate) fn absorb(&mut self, fragment: TextIndex) {
+    /// apart, [`Self::starting_at`]): its documents' lengths, its words' postings after
+    /// theirs, its coverage. Into an empty index, a move; else the shards are merged on
+    /// threads of their own ([`scoped`]), since this runs under the index's lock.
+    pub(crate) fn absorb(&mut self, mut fragment: TextIndex) {
         debug_assert_eq!(fragment.first, self.covered);
+        if self.documents == 0 && self.word_count == 0 {
+            // Numbered from 0 again, as a whole index is (and written).
+            let mut lengths = vec![0u16; fragment.first as usize];
+            lengths.append(&mut fragment.lengths);
+            *self = Self {
+                lengths,
+                first: 0,
+                stems: std::mem::take(&mut self.stems),
+                ..fragment
+            };
+            return;
+        }
         let end = (fragment.first + fragment.lengths.len() as u64 - self.first) as usize;
         if self.lengths.len() < end {
             self.lengths.resize(end, 0);
@@ -519,17 +548,30 @@ impl TextIndex {
         self.lengths[from..end].copy_from_slice(&fragment.lengths);
         self.documents += fragment.documents;
         self.total_words += fragment.total_words;
-        for (shard, theirs) in self.shards.iter_mut().zip(fragment.shards) {
-            for (word, postings) in theirs {
-                match shard.get_mut(&word) {
-                    Some(ours) => ours.append(postings),
-                    None => {
-                        shard.insert(word, postings);
-                        self.word_count += 1;
+        let per = SHARDS.div_ceil(threads());
+        let pairs: Vec<_> = self
+            .shards
+            .chunks_mut(per)
+            .zip(fragment.shards.chunks_mut(per))
+            .collect();
+        let new_words: usize = scoped(pairs, |(ours, theirs)| {
+            let mut new_words = 0;
+            for (shard, theirs) in ours.iter_mut().zip(theirs.iter_mut()) {
+                for (word, postings) in std::mem::take(theirs) {
+                    match shard.get_mut(&word) {
+                        Some(ours) => ours.append(postings),
+                        None => {
+                            shard.insert(word, postings);
+                            new_words += 1;
+                        }
                     }
                 }
             }
-        }
+            new_words
+        })
+        .into_iter()
+        .sum();
+        self.word_count += new_words;
         self.covered = fragment.covered;
     }
 
@@ -1214,7 +1256,10 @@ mod tests {
         let count = || {
             parts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         };
-        absorbed.absorb(TextIndex::fragment(10_003, 80_003, late, &count));
+        let mut fragment = TextIndex::starting_at(10_003);
+        fragment.extend(late, &count);
+        fragment.cover(80_003);
+        absorbed.absorb(fragment);
         assert!(parts.into_inner() > 1, "built in parallel parts");
         assert_eq!(
             (
