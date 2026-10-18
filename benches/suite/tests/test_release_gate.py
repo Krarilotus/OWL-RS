@@ -269,6 +269,16 @@ class Memory(unittest.TestCase):
         small = run_gate(passes(lambda side, n: [record(peak=540 if side == "cand" else 500)]))
         self.assertTrue(small["passed"])
 
+    def test_a_tool_without_a_process_peak_on_either_side_is_noted_not_blocked(self):
+        # The dry run of 18 Oct 2026: tableau_consistency reports no peak (dl-roles).
+        summary = run_gate(passes(lambda side, n: [record(peak=None)]))
+        row = summary["comparisons"]["base"]["lab-olympics"]
+        self.assertNotIn("memory/lifetime", row["dimensions"])
+        self.assertIn("no process peak on either side", " ".join(row["notes"]))
+        self.assertTrue(summary["passed"])
+        lost = run_gate(passes(lambda side, n: [record(peak=None if side == "cand" else 500)]))
+        self.assertTrue(any("memory/lifetime: incomplete" in b for b in lost["blocking"]))
+
     def test_phase_peaks_are_judged_where_both_sides_report_them(self):
         def records_of(side, n):
             phases = {"load": 900 if side == "cand" else 400}

@@ -168,7 +168,7 @@ for name in files:
     print(f"{name}: {source} sha256 {sha} {status}")
 sys.exit(1 if failed else 0)
 EOF
-  cat "$OUT/inputs.txt" | tee -a "$OUT/gate.log"
+  cp "$OUT/inputs.txt" "$GATE/inputs.txt" && tee -a "$OUT/gate.log" < "$OUT/inputs.txt"
   # Generated query sets kept with the data (never committed): checked file by file
   # against benches/sparql/queries.sha256, then the gate reads them from there.
   for set in $(cd "$tree" && py -c 'import sys; sys.path.insert(0, "benches/suite")
@@ -242,7 +242,7 @@ report)
   IFS=';' read -ra waivers <<< "${GATE_WAIVE:-}"
   for w in "${waivers[@]}"; do [ -z "$w" ] || args+=(--waive "$w"); done
   (cd "$tree" && py benches/fast/release_gate.py report --passes "$OUT/passes" --candidate "$candidate" "${args[@]}" \
-     --require "$required" --harness-revision "$harness" --min-passes "${GATE_MIN_PASSES:-4}" \
+     --require "$required" --harness-revision "$harness" --min-passes "${GATE_MIN_PASSES:-4}" --inputs "$GATE/inputs.txt" \
      --out "$OUT/release-gate.md" --json "$OUT/release-gate.json") > "$OUT/report.log" 2>&1
   code=$?
   log "timed part: $( [ $code -eq 0 ] && echo passed || echo 'not passed') ($OUT/release-gate.md)"
