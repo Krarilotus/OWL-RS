@@ -250,8 +250,8 @@ def why_not(e: dict, side: str) -> str:
     """A baseline's case that isn't ok, in words: what it lacks, or how it ended."""
     statuses = ", ".join(f"{s} {n}" for s, n in Counter(e["status"]).items())
     for note in e["notes"]:
-        if match := CAPABILITY.search(note):
-            return f"{side} can't run it ({match.group(0)}; {statuses})"
+        if match := CAPABILITY.search(note.replace("\\n", "\n")):
+            return f"{side} can't run it ({match.group(0).strip()}; {statuses})"
     if e["failed_checks"]:
         return f"{side}'s answer is wrong ({e['failed_checks'][0]}; {statuses})"
     return f"{side}: {statuses}" + (f" ({e['notes'][-1][:120]})" if e["notes"] else "")
@@ -319,7 +319,10 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str]) -
     # Memory (one policy, PROTOCOL.md §5): the process's own peak (VmHWM, every side's perf lab)
     # and each phase's are judged; the scope's cgroup peak, which also counts the page cache
     # the case's reads were charged, is reported beside them, never judged.
-    row["dimensions"]["memory/lifetime"] = judge(per_pass(base["lifetime"]), per_pass(cand["lifetime"]), unit="MiB")
+    if any(base["lifetime"]) or any(cand["lifetime"]):
+        row["dimensions"]["memory/lifetime"] = judge(per_pass(base["lifetime"]), per_pass(cand["lifetime"]), unit="MiB")
+    else:
+        row["notes"].append("memory/lifetime: the tool reports no process peak on either side (the cgroup's is reported)")
     if any(cand["phases"]) and not any(base["phases"]):
         row["notes"].append(f"phase peaks: {side}'s perf lab reports none, not compared")
     for name, key, unit, higher in (("memory/phase", "phases", "MiB", False), ("qps", "qps", "qps", True),
@@ -433,6 +436,11 @@ def render(summary: dict) -> str:
              "with the whole interval beyond twice the margin; missing evidence blocks (benches/PROTOCOL.md §5).", ""]
     if summary["errors"]:
         lines += ["## The passes don't qualify", ""] + [f"- {e}" for e in summary["errors"]] + [""]
+    if summary.get("inputs") or summary.get("prepared_manifest"):
+        prepared = ", ".join(summary.get("prepared_manifest", []))
+        lines += ["## Inputs", "", f"Prepared data: PREPARED.json sha256 {prepared}, the same in every pass, "
+                  "unchanged during each.", ""]
+        lines += [f"- {line}" for line in summary.get("inputs", [])] + [""]
     lines += ["## Blocking", ""] + ([f"- {b}" for b in summary["blocking"]] or ["- nothing"]) + [""]
     if summary.get("waived_blocks"):
         lines += ["## Waived (the owner's decision)", ""] + \
@@ -652,6 +660,7 @@ def main() -> int:
     s.add_argument("--diagnostic", action="store_true")
     s.add_argument("--not-run", action="append", default=[], metavar="CASE=WHY")
     s.add_argument("--waive", action="append", default=[], metavar="CASE=WHY", help="the owner's decision, recorded")
+    s.add_argument("--inputs", type=Path, help="the datasets the passes read, as prepare recorded them")
     s.add_argument("--out", type=Path)
     s.add_argument("--json", type=Path)
     s = sub.add_parser("w3c")
@@ -693,6 +702,10 @@ def main() -> int:
         summary = gate(passes, sides, args.candidate, [s for s in args.require.split(",") if s], args.harness_revision,
                        args.min_passes, args.diagnostic, pairs(args.not_run, "--not-run"), pairs(args.waive, "--waive"),
                        cases_registry.load())
+        if args.inputs and args.inputs.is_file():
+            summary["inputs"] = args.inputs.read_text(encoding="utf-8").splitlines()
+        prepared = {(p["report"].get("prepared") or {}).get("manifest_sha256") for p in passes}
+        summary["prepared_manifest"] = sorted(map(str, prepared))
         text = render(summary)
         print(text)
         if args.out:
