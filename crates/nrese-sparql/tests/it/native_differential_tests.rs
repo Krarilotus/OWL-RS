@@ -6620,3 +6620,50 @@ fn sequence_paths_keep_their_join_in_sets() {
         assert_eq!(native, expected, "{text}");
     }
 }
+
+/// SUM and AVG of a group with a value that is neither a number nor a duration are
+/// unbound, as the reference has them, whether the value is met first or last; durations
+/// still sum, and numbers alone too.
+#[test]
+fn sums_of_values_neither_numeric_nor_durations_are_unbound() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let values: Vec<(&str, &str, Term)> = vec![
+        ("a", "g1", Literal::from(1).into()),
+        ("b", "g1", Literal::new_simple_literal("x").into()),
+        ("c", "g1", Literal::from(2).into()),
+        ("d", "g2", Literal::from(3).into()),
+        ("e", "g2", Literal::from(4).into()),
+        (
+            "f",
+            "g3",
+            Literal::new_typed_literal("PT1H", xsd::DAY_TIME_DURATION).into(),
+        ),
+        (
+            "g",
+            "g3",
+            Literal::new_typed_literal("PT2H", xsd::DAY_TIME_DURATION).into(),
+        ),
+        ("h", "g4", ex("i").into()),
+        ("i", "g4", Literal::from(5).into()),
+    ];
+    for (s, g, o) in values {
+        tx.insert(Quad::new(ex(s), ex("g"), ex(g), GraphName::DefaultGraph).as_ref());
+        tx.insert(Quad::new(ex(s), ex("v"), o, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for text in [
+        format!(
+            "SELECT ?g (SUM(?o) AS ?s) (AVG(?o) AS ?a) WHERE {{ ?x <{EX}g> ?g . ?x <{EX}v> ?o }} GROUP BY ?g"
+        ),
+        format!("SELECT (SUM(?o) AS ?s) (AVG(?o) AS ?a) WHERE {{ ?x <{EX}v> ?o }}"),
+        format!("SELECT (SUM(?o > 0) AS ?s) WHERE {{ ?x <{EX}v> ?o }}"),
+    ] {
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let options = QueryOptions::default();
+        let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+        assert_eq!(native, expected, "{text}");
+    }
+}
