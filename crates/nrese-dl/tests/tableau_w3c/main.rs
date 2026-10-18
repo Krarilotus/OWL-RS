@@ -24,6 +24,10 @@
 //!   they are counted apart, and the run fails if one of them changes its answer.
 //! - Tests documented as over budget are listed in `over-budget.txt` with their cause; they
 //!   run on a small budget.
+//! - Every test is decided but those listed in `undecided.txt` with the reason (none now:
+//!   docs/plan/2026-10-05-v2-merge-checklist.md §4, the DL scope): the run fails on an open
+//!   test not listed there, and on a listed one that is decided. Not checked where
+//!   `NRESE_W3C_SWITCHES` or a budget variable changes the configuration.
 
 mod negate;
 mod rdf;
@@ -47,6 +51,7 @@ const DISPUTED: &str = include_str!("disputed.txt");
 const OVER_BUDGET: &str = include_str!("over-budget.txt");
 const UNCERTIFIED: &str = include_str!("uncertified.txt");
 const FULL_WRONG: &str = include_str!("full-wrong.txt");
+const UNDECIDED: &str = include_str!("undecided.txt");
 
 thread_local! {
     /// Set while a test of `over-budget.txt` runs: [`config`] gives it a small budget.
@@ -352,12 +357,15 @@ fn run_case(case: &Case, kind: &str) -> (Verdict, Features) {
                 Some(Err(why)) => return (Verdict::Open(format!("not-run: {why}")), features),
                 Some(Ok(o)) => o,
             };
-            // A conclusion the reader couldn't read whole isn't entailed by its read part
-            // (a structure no axiom uses says something in OWL 2 Full, if not in DL).
-            let partial = conclusion
-                .diagnostics
-                .iter()
-                .any(|d| d.is_fatal() || matches!(d, nrese_owl::Diagnostic::Unused { .. }));
+            // A conclusion the reader couldn't read whole isn't entailed by its read part.
+            // A structure no axiom uses says something in OWL 2 Full, but not in a graph of
+            // species DL: the reverse mapping removes an expression's triples when it parses
+            // them, used or not (*OWL 2 Mapping to RDF Graphs* §3.2.4), and the graph is
+            // still empty at the end (§3.2.5). WebOnt-I5.26-010 and I5.5-005 state such
+            // expressions in their conclusions and are entailed by their declarations.
+            let partial = conclusion.diagnostics.iter().any(|d| {
+                d.is_fatal() || (!case.dl && matches!(d, nrese_owl::Diagnostic::Unused { .. }))
+            });
             match entailed(&premise, &conclusion, &table, &mut features) {
                 Ok(true) if partial => {
                     Verdict::Open("unsupported: the conclusion isn't OWL 2 DL as a whole".into())
@@ -680,7 +688,7 @@ fn the_w3c_dl_suite() {
     let mut by_kind: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut by_fragment: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
-    let (mut wrong, mut rows) = (Vec::new(), String::new());
+    let (mut wrong, mut open, mut rows) = (Vec::new(), Vec::new(), String::new());
     let disputed: Vec<&str> = listed(DISPUTED).into_iter().map(|(id, _)| id).collect();
     let mut changed = Vec::new();
     for case in read_cases(&text) {
@@ -714,6 +722,7 @@ fn the_w3c_dl_suite() {
                 }
                 Verdict::Open(why) => {
                     *reasons.entry(reason_class(why)).or_default() += 1;
+                    open.push((id.clone(), why.clone()));
                     ("open", why.clone())
                 }
             };
@@ -765,6 +774,32 @@ fn the_w3c_dl_suite() {
     assert!(
         unlisted.is_empty() && fixed.is_empty(),
         "wrong answers not listed:\n{unlisted:#?}\nlisted but no longer wrong:\n{fixed:#?}"
+    );
+    // Open answers, against the suite's configuration only: switches and smaller budgets
+    // are for A/B runs, and under them a test may give up.
+    let reconfigured = [
+        "NRESE_W3C_SWITCHES",
+        "NRESE_W3C_BRANCH_POINTS",
+        "NRESE_W3C_MERGES",
+        "NRESE_W3C_TIMEOUT",
+    ]
+    .iter()
+    .any(|v| std::env::var_os(v).is_some());
+    if reconfigured {
+        return;
+    }
+    let undecided: Vec<&str> = listed(UNDECIDED).into_iter().map(|(id, _)| id).collect();
+    let unlisted: Vec<&(String, String)> = open
+        .iter()
+        .filter(|(id, _)| !undecided.contains(&id.as_str()))
+        .collect();
+    let decided: Vec<&&str> = undecided
+        .iter()
+        .filter(|u| only.is_none() && !open.iter().any(|(id, _)| id == *u))
+        .collect();
+    assert!(
+        unlisted.is_empty() && decided.is_empty(),
+        "open tests not listed in undecided.txt:\n{unlisted:#?}\nlisted but decided:\n{decided:#?}"
     );
 }
 

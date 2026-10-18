@@ -1,0 +1,4 @@
+# W3C tests of species DL the run doesn't decide, with the reason: one per line,
+# "name (TestType)<TAB>why". The v2 gate decides every one (docs/plan/2026-10-05-v2-merge-checklist.md
+# §4, the DL scope; over-budget tests are decided on their small budget), so the list is empty:
+# the run fails on an open test not listed here, and on a listed one that is decided.
