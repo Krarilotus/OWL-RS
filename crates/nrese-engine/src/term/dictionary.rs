@@ -1456,7 +1456,12 @@ impl Dictionary {
             return;
         }
         let inner = self.inner.upgradable_read();
-        let adopted = pending.number(inner.len(), |hash, key| inner.find(hash, key));
+        // A load into an empty dictionary finds none of its terms there: no hashing.
+        let empty = inner.len() == 0;
+        let adopted = pending.number(inner.len(), |key| match empty {
+            true => None,
+            false => inner.find(key_hash(key), key),
+        });
         remap(&adopted);
         let mut inner = parking_lot::RwLockUpgradableReadGuard::upgrade(inner);
         inner.adopt(adopted);
