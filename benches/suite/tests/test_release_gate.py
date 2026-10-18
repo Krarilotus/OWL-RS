@@ -168,13 +168,24 @@ class Verdicts(unittest.TestCase):
         self.assertTrue(any("stops at its declared outcome (memory-limit) where base completed" in b
                             for b in summary["blocking"]))
 
-    def test_cases_not_run_block_unless_the_owner_waives_them(self):
+    def test_cases_not_run_block_and_nothing_waives_them(self):
         summary = run_gate(passes(), not_run={"bsbm-bi-100m": "its cap is 28 GB"})
         self.assertFalse(summary["passed"])
-        waived = run_gate(passes(), not_run={"bsbm-bi-100m": "its cap is 28 GB"},
-                          waived={"bsbm-bi-100m": "the owner, 20 Oct: measured on its own"})
-        self.assertTrue(waived["passed"])
-        self.assertIn("bsbm-bi-100m", waived["waived_blocks"])
+        with self.assertRaises(TypeError):
+            run_gate(passes(), waived={"bsbm-bi-100m": "no such thing"})
+
+    def test_cases_left_to_the_big_host_must_be_timed_there(self):
+        """The 28 GB cases: the timed host leaves them to khaleesi; the verdict passes only
+        when another timed part's plan has them."""
+        here = run_gate(passes(), elsewhere={"bsbm-bi-100m": "timed on khaleesi"})
+        self.assertTrue(here["passed"])
+        ok = {"passed": True, "errors": [], "guards": 81}
+        w3c = {"passed": True, "errors": []}
+        passed, text = gate_module.verdict([here], w3c, ok)
+        self.assertFalse(passed)
+        self.assertIn("NOT timed anywhere: bsbm-bi-100m", text)
+        big = {**here, "planned": ["bsbm-bi-100m"], "elsewhere": {}}
+        self.assertTrue(gate_module.verdict([here, big], w3c, ok)[0])
 
     def test_a_series_the_candidate_lost_blocks(self):
         def records_of(side, n):
@@ -266,8 +277,11 @@ class Memory(unittest.TestCase):
     def test_more_process_memory_beyond_margin_and_floor_blocks(self):
         summary = run_gate(passes(lambda side, n: [record(peak=800 if side == "cand" else 500)]))
         self.assertTrue(any("memory/lifetime: regression" in b for b in summary["blocking"]))
-        small = run_gate(passes(lambda side, n: [record(peak=540 if side == "cand" else 500)]))
-        self.assertTrue(small["passed"])
+        # No MiB tolerance: 4 % more blocks; within the 2 MiB of rounding it doesn't.
+        more = run_gate(passes(lambda side, n: [record(peak=520 if side == "cand" else 500)]))
+        self.assertTrue(any("memory/lifetime: regression" in b for b in more["blocking"]))
+        rounding = run_gate(passes(lambda side, n: [record(peak=501 if side == "cand" else 500)]))
+        self.assertTrue(rounding["passed"])
 
     def test_a_tool_without_a_process_peak_on_either_side_is_noted_not_blocked(self):
         # The dry run of 18 Oct 2026: tableau_consistency reports no peak (dl-roles).
@@ -290,12 +304,158 @@ class Memory(unittest.TestCase):
             summary["comparisons"]["main"]["lab-olympics"]["notes"]))
 
 
+class Tradeoffs(unittest.TestCase):
+    """Only an owner-approved trade-off accepts a loss (benches/release-tradeoffs.toml)."""
+
+    def campaign(self):
+        def records_of(side, n):
+            slow = {"q01": [10.0, 10.1, 9.9], "q06": [5.2, 5.25, 5.2] if side == "cand" else [4.8, 4.85, 4.8]}
+            r = record(samples=slow)
+            fast_ = record(case="kernel-intersect",
+                           samples={"triangles": [50.0, 50.2] if side == "cand" else [140.0, 140.5]})
+            return [r, fast_]
+        return passes(records_of)
+
+    def entry(self, **changes):
+        return {"case": "lab-olympics", "dimension": "time/q06", "max_ratio": 1.12, "approved": "2026-10-20",
+                "by": "the owner", "reason": "text index: 8 % slower filters for 2.8x faster triangles",
+                "pays_with": {"case": "kernel-intersect", "dimension": "time/triangles"}, **changes}
+
+    def test_without_an_entry_the_loss_blocks(self):
+        summary = run_gate(self.campaign())
+        self.assertTrue(any("lab-olympics against base: time/q06: regression" in b for b in summary["blocking"]))
+        self.assertFalse(summary["passed"])
+
+    def test_an_approved_trade_off_with_its_paying_win_is_reported_as_accepted(self):
+        summary = run_gate(self.campaign(), tradeoffs=[self.entry()])
+        self.assertTrue(summary["passed"])
+        self.assertEqual(len(summary["accepted"]), 2)  # against base and against main
+        self.assertIn("accepted trade-off", summary["accepted"][0])
+        self.assertIn("accepted trade-off", gate_module.render(summary))
+
+    def test_a_trade_off_covers_only_its_bound_its_baseline_and_with_its_win(self):
+        for entry in (self.entry(max_ratio=1.05),                                          # the loss is larger
+                      self.entry(pays_with={"case": "lab-olympics", "dimension": "time/q01"}),  # no win there
+                      self.entry(dimension="time/q01")):                                   # another dimension
+            self.assertFalse(run_gate(self.campaign(), tradeoffs=[entry])["passed"], entry)
+        only_main = run_gate(self.campaign(), tradeoffs=[self.entry(against="main")])
+        self.assertTrue(any("against base: time/q06" in b for b in only_main["blocking"]))
+        self.assertFalse(any("against main: time/q06" in b for b in only_main["blocking"]))
+
+    def test_the_list_starts_empty_and_a_malformed_entry_is_refused(self):
+        entries, errors = gate_module.load_tradeoffs(ROOT / "benches/release-tradeoffs.toml")
+        self.assertEqual((entries, errors), ([], []))
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "t.toml"
+            bad.write_text('[[tradeoff]]\ncase = "x"\ndimension = "time/q"\nmax_ratio = 1.1\n', encoding="utf-8")
+            entries, errors = gate_module.load_tradeoffs(bad)
+            self.assertEqual(entries, [])
+            self.assertIn("missing approved, by, pays_with, reason", errors[0])
+
+
+class ConfirmOnRerun(unittest.TestCase):
+    """The owner's decision (18 Oct 2026): a flagged loss or undecided case runs again in a fresh,
+    independent A-B-B-A; a loss blocks only if that confirmation shows it too."""
+
+    W3C = {"passed": True, "errors": []}
+    GUARDS = {"passed": True, "errors": [], "guards": 81}
+
+    def gate_run(self, q06_cand, q06_base=(4.8, 4.85, 4.8), round_=0, order=ORDER):
+        def records_of(side, n):
+            q06 = list(q06_cand) if side == "cand" else list(q06_base)
+            return [record(samples={"q01": [10.0, 10.1, 9.9], "q06": q06})]
+        return run_gate(passes(records_of, order=order), context={"host": "phuoc-yu", "round": round_,
+                                                                    "prefix": "rg-cccccccc", "max_gb": 24.0,
+                                                                    "ram_gb": 24.0})
+
+    def test_a_first_run_loss_is_flagged_not_final(self):
+        first = self.gate_run((5.2, 5.25, 5.2))
+        flagged = {(f["side"], f["dimension"], f["verdict"]) for f in first["flagged"]}
+        self.assertEqual(flagged, {("base", "time/q06", "regression"), ("main", "time/q06", "regression")})
+        passed, text = gate_module.verdict([first], self.W3C, self.GUARDS)
+        self.assertFalse(passed)  # pending its confirmation
+        self.assertIn("**pending**", text)
+
+    def test_a_loss_the_confirmation_repeats_blocks(self):
+        first, again = self.gate_run((5.2, 5.25, 5.2)), self.gate_run((5.21, 5.22, 5.2), round_=1)
+        states = gate_module.combine([first, again])
+        self.assertEqual({s["status"] for s in states}, {"confirmed"})
+        passed, text = gate_module.verdict([first, again], self.W3C, self.GUARDS)
+        self.assertFalse(passed)
+        self.assertIn("**confirmed**", text)
+
+    def test_a_loss_that_doesnt_repeat_is_reported_with_both_intervals_and_doesnt_block(self):
+        first, again = self.gate_run((5.2, 5.25, 5.2)), self.gate_run((4.8, 4.86, 4.8), round_=1)
+        states = gate_module.combine([first, again])
+        self.assertEqual({s["status"] for s in states}, {"not confirmed"})
+        self.assertEqual([h["verdict"] for h in states[0]["rounds"]], ["regression", "neutral"])
+        passed, text = gate_module.verdict([first, again], self.W3C, self.GUARDS)
+        self.assertTrue(passed)
+        line = next(x for x in text.splitlines() if "not confirmed" in x)
+        self.assertIn("round 0: regression", line)
+        self.assertIn("round 1: neutral", line)
+
+    def test_undecided_then_shown_once_needs_another_round_and_blocks_at_the_last(self):
+        first = self.gate_run((5.2, 5.25, 5.2))
+        flag = first["flagged"][0]
+        undecided = {**flag, "verdict": "suspect", "needs_passes": 10}
+        first = {**first, "flagged": [undecided]}
+        shown = self.gate_run((5.21, 5.22, 5.2), round_=1)
+        self.assertEqual(gate_module.combine([first, shown])[0]["status"], "pending")  # one detection
+        twice = self.gate_run((5.2, 5.2, 5.22), round_=2)
+        self.assertEqual(gate_module.combine([first, shown, twice])[0]["status"], "confirmed")
+        still = {**shown, "comparisons": {}}  # the confirmation lacks the dimension
+        self.assertEqual(gate_module.combine([first, still])[0]["status"], "missing")
+
+    def test_the_confirmation_job_runs_just_the_flagged_cases_on_the_same_host(self):
+        first = self.gate_run((5.2, 5.25, 5.2))
+        job = gate_module.confirm_job([first], "C:/repo")
+        self.assertEqual(job["id"], "rg-cccccccc-confirm")
+        self.assertEqual((job["kind"], job["class"], job["requires"]["hosts"]), ("owlrs.timed", "exclusive", ["phuoc-yu"]))
+        self.assertEqual(job["steps"][0][2:], ["plan-cases", "lab-olympics"])
+        sides = [s[4] for s in job["steps"] if s[2] == "pass"]
+        self.assertEqual(sides, sides[::-1])  # palindromic
+        n = sides.count("cand")
+        self.assertTrue(4 <= n <= 24 and n % 2 == 0)
+        self.assertEqual(job["env"]["GATE_ROUND"], "1")
+        self.assertEqual(job["env"]["GATE_MIN_PASSES"], str(n))
+        self.assertEqual([s[2] for s in job["steps"][-2:]], ["report", "clean"])
+        import tomllib
+        self.assertEqual(tomllib.loads(gate_module.toml_job(job))["steps"], job["steps"])
+        again = self.gate_run((5.21, 5.22, 5.2), round_=1)
+        self.assertIsNone(gate_module.confirm_job([first, again], "C:/repo"))  # decided: confirmed
+        undecided = {**first, "flagged": [{**f, "verdict": "suspect", "needs_passes": 9} for f in first["flagged"]]}
+        second = gate_module.confirm_job([undecided, again], "C:/repo")
+        self.assertEqual(second["id"], "rg-cccccccc-confirm2")
+
+    def test_nothing_flagged_needs_no_confirmation(self):
+        clean = self.gate_run((4.8, 4.85, 4.8))
+        self.assertEqual(clean["flagged"], [])
+        self.assertIsNone(gate_module.confirm_job([clean], "C:/repo"))
+        self.assertTrue(gate_module.verdict([clean], self.W3C, self.GUARDS)[0])
+
+    def test_a_loss_only_the_confirmation_shows_is_kept_as_not_confirmed(self):
+        first = self.gate_run((5.2, 5.25, 5.2))
+        def records_of(side, n):
+            q01 = [10.6, 10.7, 10.6] if side == "cand" else [10.0, 10.1, 9.9]
+            return [record(samples={"q01": q01, "q06": [5.2, 5.2, 5.21] if side == "cand" else [4.8, 4.85, 4.8]})]
+        again = run_gate(passes(records_of), context={"host": "phuoc-yu", "round": 1})
+        passed, text = gate_module.verdict([first, again], self.W3C, self.GUARDS)
+        self.assertIn("time/q01: **not confirmed** (only round 1", text)
+
+
 class Parts(unittest.TestCase):
     def test_plan_never_lowers_a_cap(self):
-        catalog = [{"name": "small", "cap_gb": 4}, {"name": "bsbm-bi-100m", "cap_gb": 28}]
-        run, not_run = gate_module.plan(catalog, 24)
+        catalog = [{"name": "small", "cap_gb": 4}, {"name": "bsbm-bi-100m", "cap_gb": 28},
+                   {"name": "huge", "cap_gb": 60}]
+        run, not_run, elsewhere = gate_module.plan(catalog, 24)
         self.assertEqual(run, ["small"])
         self.assertIn("its cap is 28 GB", not_run["bsbm-bi-100m"])
+        run, not_run, elsewhere = gate_module.plan(catalog, 24, big_gb=28)
+        self.assertEqual((run, sorted(not_run)), (["small"], ["huge"]))
+        self.assertIn("timed on khaleesi", elsewhere["bsbm-bi-100m"])
+        run, not_run, elsewhere = gate_module.plan(catalog, 28, min_gb=24)  # the big host's share
+        self.assertEqual(run, ["bsbm-bi-100m"])
 
     def test_guards_are_read_from_performance_md_and_must_each_pass(self):
         names = gate_module.guard_names((ROOT / "docs/design/performance.md").read_text(encoding="utf-8"))
@@ -364,6 +524,24 @@ class Parts(unittest.TestCase):
         self.assertEqual(tomllib.loads(text)["steps"], timed["steps"])
         with self.assertRaises(ValueError):
             gate_module.schedule(3)
+
+    def test_the_big_cases_run_on_khaleesi_on_the_builds_binaries(self):
+        found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 4, None)
+        build, big, timed = found["rg-test-build"], found["rg-test-big"], found["rg-test-timed"]
+        self.assertEqual(build["steps"][-1][2], "pack")
+        self.assertEqual(build["outputs"], [{"name": "binaries", "path": "binaries"}])
+        self.assertEqual((big["kind"], big["class"], big["requires"]["hosts"]), ("owlrs.timed", "exclusive", ["khaleesi"]))
+        self.assertGreaterEqual(big["requires"]["ram_gb"], 28)
+        self.assertEqual([s[2] for s in big["steps"][:2]], ["unpack", "prepare"])
+        self.assertNotIn("build", [s[2] for s in big["steps"]])  # khaleesi builds nothing
+        self.assertIn({"name": "binaries", "source": {"artifact": "rg-test-build/binaries"}}, big["inputs"])
+        self.assertEqual((big["env"]["GATE_MIN_GB"], big["env"]["GATE_MAX_GB"]), ("24", "28"))
+        self.assertEqual((timed["env"]["GATE_BIG_GB"], timed["env"]["GATE_BIG_HOST"]), ("28", "khaleesi"))
+        self.assertEqual([s[4] for s in big["steps"] if s[2] == "pass"], ORDER)
+        import tomllib
+        self.assertEqual(tomllib.loads(gate_module.toml_job(build))["outputs"], build["outputs"])
+        self.assertNotIn("rg-test-big", gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 4, None,
+                                                         big_host=None))
 
     def test_report_writes_markdown_and_json(self):
         with tempfile.TemporaryDirectory() as tmp:

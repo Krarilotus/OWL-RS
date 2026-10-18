@@ -118,8 +118,8 @@ timeout) to run once more past it, so that its record says what it needs.
 ([PROTOCOL.md §5](../PROTOCOL.md#5-statistics) states the rules they implement). A release is
 decided by `release_gate.py` instead, over interleaved passes of the head and both baselines,
 each query, peak and client width on its own ([PROTOCOL.md §5, "The release
-gate"](../PROTOCOL.md#the-release-gate): its margin, floors and memory policy, and the
-measurements they rest on).
+gate"](../PROTOCOL.md#the-release-gate): no loss tolerated, only owner-approved trade-offs;
+its resolution floors and memory policy, and the measurements they rest on).
 
 0. **One host, one configuration:** runs of different hosts, or of one host under different
    configurations (its `config` in [hosts.toml](../hosts.toml) when each run started, or

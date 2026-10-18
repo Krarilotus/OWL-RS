@@ -11,7 +11,13 @@
 #   release-gate.sh report HARNESS SIDE=REV ...   the timed part's report (the first SIDE the candidate)
 #   release-gate.sh w3c                     the W3C suites with their data required, their counts checked
 #   release-gate.sh guards                  every guard docs/design/performance.md §0 names, run and passed
-#   release-gate.sh verdict TIMED_DIR CHECKS_DIR   every part together
+#   release-gate.sh pack REV ...            the revisions' verified binaries as one tar (FLEET_OUT/binaries),
+#                                           for a host that builds nothing (the big host)
+#   release-gate.sh unpack                  that tar (FLEET_INPUT_BINARIES) into GATE_BIN, verified again
+#   release-gate.sh confirm TIMED_DIR... --out DIR   the confirmation job of each host whose run flagged
+#                                           a loss or an undecided case (rg-H8-confirm, rg-H8-confirm2)
+#   release-gate.sh plan-cases CASES        a confirmation's plan: just those cases (GATE_PLAN)
+#   release-gate.sh verdict TIMED_DIR... CHECKS_DIR   every part together, each host's rounds combined
 #   release-gate.sh jobs CAND [OPTIONS]     the fleet jobs of a whole gate (release_gate.py jobs --help)
 #   release-gate.sh clean                   the gate's worktrees and build trees (binaries and data stay)
 #
@@ -23,9 +29,11 @@
 # GATE (NRESE_GATE_DIR, default ~/owlrs/$GATE_NAME, gate-v2) keeps binaries, data and passes between
 # steps; results go to FLEET_OUT. GATE_CASES limits the cases (a dry run), GATE_MAX_GB is the
 # memory the host gives a case (default 24: a larger cap is not run, never lowered),
-# GATE_MIN_PASSES the passes per side (default 4; fewer is diagnostic), GATE_WAIVE
-# "CASE=WHY;CASE=WHY" the owner's recorded waivers. SPARQL_DATA (default ~/owlrs/sparql-data)
-# holds the SPARQL workloads' data and their generated query sets.
+# GATE_MIN_PASSES the passes per side (default 4; fewer is diagnostic). GATE_BIG_GB and
+# GATE_BIG_HOST: cases with caps up to it run on that host instead (its own job: GATE_MIN_GB
+# the timed host's limit, GATE_MAX_GB the big one's). No case is waived: only an owner-approved
+# trade-off (benches/release-tradeoffs.toml) accepts a loss. SPARQL_DATA (default
+# ~/owlrs/sparql-data) holds the SPARQL workloads' data and their generated query sets.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GATE=${NRESE_GATE_DIR:-$HOME/owlrs/${GATE_NAME:-gate-v2}}
@@ -62,7 +70,9 @@ fast_env() {
   mkdir -p "$GATE/fast-data" "$GATE/data" "$GATE/query-sets" "$GATE/compact" "$GATE/reports"
 }
 
-planned() { py -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["run"]))' "$GATE/plan.json"; }
+# The plan the passes run: the gate's (prepare), or a confirmation's (plan-cases, GATE_PLAN).
+PLAN=$GATE/${GATE_PLAN:-plan.json}
+planned() { py -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["run"]))' "$PLAN"; }
 
 case ${1:-} in
 build)
@@ -117,11 +127,12 @@ prepare)
 from suitekit import hosts; print(hosts.input_path("general") or "")')
   fast_env
   # The plan: what this host runs at the cases' declared caps.
-  (cd "$tree" && py benches/fast/release_gate.py plan --max-gb "$MAX_GB" ${GATE_CASES:+--cases "$GATE_CASES"}) \
+  (cd "$tree" && py benches/fast/release_gate.py plan --max-gb "$MAX_GB" --min-gb "${GATE_MIN_GB:-0}" \
+     ${GATE_BIG_GB:+--big-gb "$GATE_BIG_GB" --big-host "${GATE_BIG_HOST:-khaleesi}"} ${GATE_CASES:+--cases "$GATE_CASES"}) \
     > "$GATE/plan.json" || exit 2
   cp "$GATE/plan.json" "$OUT/plan.json"
   cases=$(planned)
-  log "plan: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["run"]), "cases;", len(d["not_run"]), "not run here")' "$GATE/plan.json")"
+  log "plan: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["run"]), "cases;", len(d["not_run"]), "not run;", len(d["elsewhere"]), "on the big host")' "$GATE/plan.json")"
   # The data view: each dataset a planned case reads, from the host's general inputs or the
   # SPARQL data; checked against its freeze (datasets.toml) and recorded either way.
   (cd "$tree" && py - "$cases" "$general" "$SPARQL_DATA" "$GATE/data" > "$OUT/inputs.txt") <<'EOF' || exit 2
@@ -237,12 +248,15 @@ report)
     args+=(--side "$name=$rev")
   done
   required=$(printf '%s\n' "$@" | sed 1d | cut -d= -f1 | paste -sd, -)
-  notrun=$(py -c 'import json,sys; [print(f"{k}={v}") for k, v in json.load(open(sys.argv[1]))["not_run"].items()]' "$GATE/plan.json")
-  while IFS= read -r line; do [ -z "$line" ] || args+=(--not-run "$line"); done <<< "$notrun"
-  IFS=';' read -ra waivers <<< "${GATE_WAIVE:-}"
-  for w in "${waivers[@]}"; do [ -z "$w" ] || args+=(--waive "$w"); done
+  for key in not_run elsewhere; do
+    listed=$(py -c 'import json,sys; [print(f"{k}={v}") for k, v in json.load(open(sys.argv[1]))[sys.argv[2]].items()]' \
+      "$PLAN" "$key")
+    while IFS= read -r line; do [ -z "$line" ] || args+=("--${key/_/-}" "$line"); done <<< "$listed"
+  done
   (cd "$tree" && py benches/fast/release_gate.py report --passes "$OUT/passes" --candidate "$candidate" "${args[@]}" \
      --require "$required" --harness-revision "$harness" --min-passes "${GATE_MIN_PASSES:-4}" --inputs "$GATE/inputs.txt" \
+     --context "host=${GATE_HOST:-}" --context "round=${GATE_ROUND:-0}" --context "prefix=${GATE_PREFIX:-}" \
+     --context "gate_name=${GATE_NAME:-}" --context "max_gb=$MAX_GB" --context "ram_gb=${GATE_RAM_GB:-$MAX_GB}" \
      --out "$OUT/release-gate.md" --json "$OUT/release-gate.json") > "$OUT/report.log" 2>&1
   code=$?
   log "timed part: $( [ $code -eq 0 ] && echo passed || echo 'not passed') ($OUT/release-gate.md)"
@@ -289,11 +303,79 @@ guards)
   ;;
 
 verdict)
+  # The timed parts' results directories (the timed host's, the big host's), then the checks'.
+  shift
   args=()
-  for f in "$2"/*/release-gate.json "$2"/release-gate.json; do [ -f "$f" ] && args+=(--timed "$f"); done
-  w3c=$(ls "$3"/w3c.json "$3"/*/w3c.json 2>/dev/null | head -1)
-  guards=$(ls "$3"/guards.json "$3"/*/guards.json 2>/dev/null | head -1)
+  while [ $# -gt 1 ]; do
+    for f in "$1"/*/release-gate.json "$1"/release-gate.json; do [ -f "$f" ] && args+=(--timed "$f"); done
+    shift
+  done
+  w3c=$(ls "$1"/w3c.json "$1"/*/w3c.json 2>/dev/null | head -1)
+  guards=$(ls "$1"/guards.json "$1"/*/guards.json 2>/dev/null | head -1)
   py benches/fast/release_gate.py verdict "${args[@]}" --w3c "$w3c" --guards "$guards" --out "$OUT/verdict.md"
+  ;;
+
+pack)
+  # The binaries of every revision, verified, with their modes, for a host that builds nothing.
+  shift
+  dirs=()
+  for spec in "$@"; do
+    rev=$(git rev-parse "$spec") || exit 2
+    bin=$(bin_of "$rev")
+    [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS) \
+      || { log "pack: no verified build of $rev"; exit 2; }
+    dirs+=("$(basename "$bin")")
+  done
+  mkdir -p "$OUT/binaries"
+  # shellcheck disable=SC2046
+  tar -C "$GATE_BIN" -cf "$OUT/binaries/gate-bin.tar" $(printf '%s\n' "${dirs[@]}" | sort -u) \
+    || { log "pack: tar failed"; exit 1; }
+  (cd "$OUT/binaries" && sha256sum gate-bin.tar > gate-bin.tar.sha256) || exit 1
+  log "pack: $(printf '%s\n' "${dirs[@]}" | sort -u | tr '\n' ' ')into $OUT/binaries/gate-bin.tar"
+  ;;
+
+unpack)
+  src=${FLEET_INPUT_BINARIES:?the binaries of the build job, its input named binaries}
+  tarball=$(find "$src" -name gate-bin.tar | head -1)
+  [ -n "$tarball" ] && (cd "$(dirname "$tarball")" && sha256sum -c --quiet gate-bin.tar.sha256) \
+    || { log "unpack: no verified gate-bin.tar in $src"; exit 2; }
+  tar -C "$GATE_BIN" -xpf "$tarball" || { log "unpack: tar failed"; exit 2; }
+  for bin in $(tar -tf "$tarball" | cut -d/ -f1 | sort -u); do
+    (cd "$GATE_BIN/$bin" && sha256sum -c --quiet SHA256SUMS) || { log "unpack: $bin doesn't verify"; exit 2; }
+    for f in $(cut -d' ' -f3- "$GATE_BIN/$bin/SHA256SUMS"); do
+      [ -x "$GATE_BIN/$bin/$f" ] || { log "unpack: $bin/$f lost its executable mode"; exit 2; }
+    done
+    log "unpack: $bin verified ($(cat "$GATE_BIN/$bin/REVISION"))"
+  done
+  ;;
+
+plan-cases)
+  # A confirmation runs just its cases, all prepared by the gate's own prepare before.
+  [ -n "${GATE_PLAN:-}" ] || { log "plan-cases needs GATE_PLAN"; exit 2; }
+  py - "$2" "$GATE/plan.json" "$PLAN" <<'EOF' || exit 2
+import json, sys
+cases, full, target = sys.argv[1].split(","), json.load(open(sys.argv[2])), sys.argv[3]
+unknown = [c for c in cases if c not in full["run"]]
+if unknown:
+    sys.exit(f"not in the gate's plan (not prepared here): {', '.join(unknown)}")
+json.dump({"run": cases, "not_run": {}, "elsewhere": {}}, open(target, "w"), indent=1)
+EOF
+  cp "$PLAN" "$OUT/"
+  log "confirmation round ${GATE_ROUND:-?}: $2"
+  ;;
+
+confirm)
+  # From the first run's results (and earlier confirmations'), each host's next confirmation.
+  shift
+  reports=() rest=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --out|--checkout) rest+=("$1" "$2"); shift 2 ;;
+      *) for f in "$1"/release-gate.json "$1"/*/release-gate.json; do [ -f "$f" ] && reports+=("$f"); done; shift ;;
+    esac
+  done
+  [ ${#reports[@]} -gt 0 ] || { echo "no release-gate.json in the given directories" >&2; exit 2; }
+  py benches/fast/release_gate.py confirm --reports "${reports[@]}" "${rest[@]}"
   ;;
 
 jobs)

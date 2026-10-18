@@ -1,0 +1,20 @@
+# The owner-approved trade-offs of the release gate (benches/PROTOCOL.md §5, "The release
+# gate"; benches/fast/release_gate.py). The gate tolerates no loss in time or memory: a loss is
+# accepted only when an entry here covers it, and then it is reported as an accepted trade-off.
+# Nothing else waives a loss. Only the owner adds an entry, with the date and reason of the
+# approval and the win that pays for it.
+#
+# An entry covers a loss when its case and dimension match (and its baseline, if `against`
+# names one), the worse end of the loss's interval is at most `max_ratio`, and the paying win
+# shows as `better` against the same baseline in the same report. Dimensions are as the report
+# names them: time/<series>, memory/lifetime, memory/phase/<phase>, qps/<clients>, ...
+#
+# [[tradeoff]]
+# case = "lab-olympics"
+# dimension = "memory/lifetime"
+# against = "main"                      # optional: base or main; omitted, either
+# max_ratio = 1.10                      # the loss's interval may reach at most this ratio
+# approved = "2026-10-20"
+# by = "the owner"
+# reason = "the string interner's shards: 10 % more memory at load for loads 27 % faster"
+# pays_with = { case = "load-entities", dimension = "time/_" }
