@@ -32,7 +32,7 @@ use parking_lot::RwLock;
 use super::hash::key_hash;
 use super::offsets::{Ends, Offsets};
 use super::order::Key;
-use super::pending::{Adopted, NewKey, Pending};
+use super::pending::{Adopted, NEW, Pending};
 use super::vocabulary::{Codec, Sample};
 use super::{TermId, TermKind, inline_to_literal, try_inline_literal};
 use crate::error::{EngineError, EngineResult};
@@ -1428,31 +1428,21 @@ impl Dictionary {
         let slots = keys.slots(self, quads);
         // Known keys under the shared lock; the others go to `pending`, each shard locked
         // once, at their positions in the input.
-        let found: Vec<Option<u64>> = {
+        let mut indexes: Vec<u64> = {
             let inner = self.inner.read();
             keys.keys
                 .iter()
-                .map(|key| inner.find(key.hash, &keys.arena[key.start..key.end]))
+                .map(|key| {
+                    inner
+                        .find(key.hash, &keys.arena[key.start..key.end])
+                        .unwrap_or(NEW)
+                })
                 .collect()
         };
-        let new: Vec<NewKey> = keys
-            .keys
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| found[i].is_none())
-            .map(|(i, key)| NewKey {
-                start: key.start,
-                end: key.end,
-                hash: key.hash,
-                at: super::pending::position(chunk, batch, i),
-            })
-            .collect();
-        let provisional = pending.intern(&keys.arena, &new);
-        let mut provisional = provisional.into_iter();
-        let indexes: Vec<u64> = found
-            .into_iter()
-            .map(|index| index.unwrap_or_else(|| provisional.next().expect("one per new key")))
-            .collect();
+        pending.intern(chunk, batch, &mut indexes, |i| {
+            let key = &keys.keys[i];
+            (&keys.arena[key.start..key.end], key.hash)
+        });
         keys.resolve(&slots, &indexes)
     }
 
