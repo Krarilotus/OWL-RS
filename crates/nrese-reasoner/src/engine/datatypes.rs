@@ -231,6 +231,70 @@ mod tests {
         Literal::new_typed_literal(value, NamedNode::new_unchecked(format!("{XSD}{local}")))
     }
 
+    /// The rules on a materialisation (moved from the store's mutation pipeline tests,
+    /// which keep the commit's rejection): a value outside a data property's range
+    /// datatype breaks dt-not-type, a functional data property with two different values
+    /// dt-diff; equal values under two lexical forms, and values in range, break neither.
+    #[test]
+    fn a_materialisation_reports_values_outside_their_range_and_two_functional_values() {
+        use nrese_engine::{Engine, EngineConfig};
+        use nrese_rdf_io::{RdfFormat, RdfParser};
+        let rules = |data: &str| -> Vec<String> {
+            let engine = Engine::new(EngineConfig::default()).unwrap();
+            let mut tx = engine.transaction();
+            let text = format!(
+                "@prefix ex: <http://example.com/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+                 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . @prefix xsd: <{XSD}> .
+                 ex:age a owl:DatatypeProperty, owl:FunctionalProperty ;
+                     rdfs:range xsd:nonNegativeInteger .
+                 ex:weight rdfs:range xsd:double .
+                 ex:name rdfs:range xsd:string .
+                 {data}"
+            );
+            for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
+                tx.insert(quad.unwrap().as_ref());
+            }
+            let program =
+                super::super::Program::compile(&crate::rulesets::Ruleset::Owl2Rl.into(), &|t| {
+                    tx.intern(t)
+                });
+            tx.commit().unwrap();
+            let closure = super::super::materialise(&program, &engine.snapshot());
+            let mut rules: Vec<String> = closure.violations.into_iter().map(|v| v.rule).collect();
+            rules.sort();
+            rules.dedup();
+            rules
+        };
+        let none: Vec<String> = Vec::new();
+        assert_eq!(
+            rules("ex:a ex:age 42 ; ex:weight 1.5e0 ; ex:name \"Ann\" ."),
+            none
+        );
+        // Equal values under two lexical forms are one value.
+        assert_eq!(rules("ex:a ex:age 42, \"042\"^^xsd:integer ."), none);
+        assert_eq!(rules("ex:a ex:age 42, 43 ."), ["dt-diff"], "two ages");
+        assert_eq!(
+            rules("ex:a ex:age -1 ."),
+            ["dt-not-type"],
+            "below the range"
+        );
+        assert_eq!(
+            rules("ex:a ex:age \"forty\" ."),
+            ["dt-not-type"],
+            "a string"
+        );
+        assert_eq!(
+            rules("ex:a ex:weight 70 ."),
+            ["dt-not-type"],
+            "an integer is no double"
+        );
+        assert_eq!(
+            rules("ex:a ex:name \"Ann\"@en ."),
+            ["dt-not-type"],
+            "a language string is no xsd:string"
+        );
+    }
+
     #[test]
     fn value_spaces() {
         let space =
