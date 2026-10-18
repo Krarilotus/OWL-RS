@@ -168,7 +168,8 @@ def p50(values: list[float]) -> float:
 
 def evidence(passes: list[dict], case: str) -> dict:
     """One side's evidence of a case, pass by pass."""
-    out = {"status": [], "expected": [], "failed_checks": [], "unchecked": 0, "notes": [], "samples": [],
+    out = {"status": [], "expected": [], "failed_checks": [], "failed_routes": [], "unchecked": 0, "notes": [],
+           "samples": [],
            "process": [], "estimator": set(), "lifetime": [], "phases": [], "cgroup": [], "qps": [],
            "client_peaks": [], "cache_peaks": [], "rows": [], "counters": {}}
     for p in passes:
@@ -180,11 +181,13 @@ def evidence(passes: list[dict], case: str) -> dict:
         observations = record.get("observations") or []
         out["status"].append(record.get("status"))
         out["expected"].append(record.get("expected_outcome", "ok"))
-        checks = record.get("checks", []) + record.get("routes", []) + \
-            [c for o in observations for c in o.get("checks", []) + o.get("routes", [])]
-        out["failed_checks"] += [f"{c.get('path')}: expected {c.get('expected')}, got {c.get('got')}"
-                                 for c in checks if c.get("ok") is False]
-        out["unchecked"] += sum(c.get("ok") is None for c in checks)
+        checks = record.get("checks", []) + [c for o in observations for c in o.get("checks", [])]
+        routes = record.get("routes", []) + [c for o in observations for c in o.get("routes", [])]
+        for key, items in (("failed_checks", checks), ("failed_routes", routes)):
+            out[key] += [f"{c.get('path')}: expected {c.get('expected')}, got {c.get('got')}"
+                         for c in items if c.get("ok") is False and
+                         f"{c.get('path')}: expected {c.get('expected')}, got {c.get('got')}" not in out[key]]
+        out["unchecked"] += sum(c.get("ok") is None for c in checks + routes)
         out["notes"] += [n for n in record.get("notes", []) if n not in out["notes"]]
         out["estimator"] |= {o.get("estimator", "samples") for o in observations} or {"samples"}
         out["samples"].append(record.get("samples") or {})
@@ -226,9 +229,13 @@ def evidence(passes: list[dict], case: str) -> dict:
     return out
 
 
-def state(e: dict) -> str:
-    """ok (every pass ok), known (every pass the declared outcome, not ok), or failed."""
-    if e["status"] and all(s == "ok" for s in e["status"]) and not e["failed_checks"]:
+def state(e: dict, off_route_ok: bool = False) -> str:
+    """ok (every pass ok), known (every pass the declared outcome, not ok), or failed. A
+    baseline off the route the harness asserts (an operator it hasn't) with every answer
+    right is a valid time: ok with `off_route_ok`."""
+    fine = {"ok", "off-route"} if off_route_ok else {"ok"}
+    if (e["status"] and all(s in fine for s in e["status"]) and not e["failed_checks"]
+            and (off_route_ok or not e["failed_routes"])):
         return "ok"
     if e["status"] and all(s == x != "ok" for s, x in zip(e["status"], e["expected"])):
         return "known"
@@ -262,17 +269,21 @@ def per_pass(values: list, key: str | None = None) -> list[list[float]]:
 def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str]) -> dict:
     """The candidate's case against one baseline's, dimension by dimension."""
     row = {"comparable": True, "dimensions": {}, "notes": [], "blocks": [], "reported": {}}
+    base_state = state(base, off_route_ok=True)
     if state(base) == "known" and state(cand) == "known":
         return {**row, "comparable": False, "reason": "a known issue on both sides (no timing verdict)"}
     if state(cand) == "known":
-        if state(base) == "ok":
+        if base_state == "ok":
             # The candidate stops at its declared limit where the baseline finished: that is a
             # loss, whatever the declaration says.
             row["blocks"].append(f"stops at its declared outcome ({', '.join(sorted(set(cand['status'])))}) "
                                  f"where {side} completed")
         return {**row, "comparable": False, "reason": "the candidate's known issue"}
-    if state(base) != "ok":
+    if base_state != "ok":
         return {**row, "comparable": False, "reason": why_not(base, side)}
+    if base["failed_routes"]:
+        row["notes"].append(f"{side} is off the route the harness asserts ({base['failed_routes'][0]}); "
+                            "its answers are right, its time compared")
     # Answers: each query's rows on both sides (every side reports them, main's perf lab too).
     differ = sorted(q for q in set(cand["rows"][0] if cand["rows"] else {}) &
                     set(base["rows"][0] if base["rows"] else {})
@@ -377,8 +388,8 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     for case in planned:
         cand = evidence(by_side[candidate], case)
         if state(cand) == "failed":
-            summary["candidate_failures"][case] = (f"statuses {', '.join(map(str, cand['status']))}; "
-                                                   + "; ".join(cand["failed_checks"][:3] + cand["notes"][-1:]))
+            why = cand["failed_checks"][:3] + cand["failed_routes"][:2] + cand["notes"][-1:]
+            summary["candidate_failures"][case] = f"statuses {', '.join(map(str, cand['status']))}; " + "; ".join(why)
         elif state(cand) == "known":
             summary["known_issues"][case] = ", ".join(sorted(set(cand["status"])))
         elif any(x != "ok" for x in cand["expected"]):

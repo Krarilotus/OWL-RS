@@ -144,6 +144,21 @@ class Verdicts(unittest.TestCase):
         self.assertIn("lab-olympics", failing["candidate_failures"])
         self.assertFalse(failing["passed"])
 
+    def test_a_baseline_off_its_route_with_right_answers_is_compared(self):
+        def records_of(side, n):
+            r = record()
+            if side == "base":
+                r["status"] = "off-route"
+                r["routes"] = [{"path": "q.q06.operators", "expected": "has wcoj", "got": ["join"], "ok": False}]
+            return [r]
+        summary = run_gate(passes(records_of))
+        row = summary["comparisons"]["base"]["lab-olympics"]
+        self.assertTrue(row["comparable"])
+        self.assertIn("off the route", " ".join(row["notes"]))
+        self.assertTrue(summary["passed"])
+        candidate_off = run_gate(passes(lambda side, n: records_of("base" if side == "cand" else "cand", n)))
+        self.assertIn("lab-olympics", candidate_off["candidate_failures"])
+
     def test_stopping_at_a_declared_limit_where_a_baseline_finished_blocks(self):
         def records_of(side, n):
             if side == "cand":
