@@ -106,12 +106,12 @@ SELECT ?doc ?score WHERE {
 | Predicate | Object |
 |---|---|
 | `nrv:near` | the query vector: a vector literal, or a variable the rest of the query binds to one (`?other ex:embedding ?q`: a search per value) |
-| `nrv:k` | how many nearest vectors per query vector (default 10, at most 10,000) |
+| `nrv:k` | how many nearest vectors per query vector (a positive whole number, default 10; fewer where fewer qualify). No fixed maximum: a search whose hits the query's memory budget (`budgets.query_memory`) can't hold is answered `413`, before it allocates them |
 | `nrv:score` | a variable: the cosine similarity or dot product (`xsd:double`), or the Euclidean distance with `nrv:metric "l2"` |
 | `nrv:rank` | a variable: the rank, from 1 |
 | `nrv:metric` | `"cosine"` (the default), `"dot"` or `"l2"` |
 | `nrv:exact true` | compare every vector |
-| `nrv:searchBudget` | the graph search's beam (default 64): wider finds more of the true nearest, slower |
+| `nrv:searchBudget` | the graph search's beam (a positive whole number, default 64): wider finds more of the true nearest, slower; bounded by the memory budget as `nrv:k` |
 
 The subject is the matched vector literal; only literals the query's dataset uses as objects are found, so a user finds no vector of a graph it may not read. The search returns the `k` nearest vectors that satisfy the patterns joined to it (`?doc ex:embedding ?v` with other conditions on `?doc`). Where those patterns are estimated to bind few rows, they go first and the search is among their values: an exact scan when they are few (under 2% of the vectors of that dimension), the graph with that filter otherwise. Where they bind many, the search goes first, its beam widened by the share of the vectors they are estimated to bind (as for a filter the graph applies itself), and each hit, nearest first, is checked against them through the indexes until `k` pass (100,000 vectors of 384 dimensions: 0.24 ms a query through the graph, recall@10 0.94; 1.3 ms exact). Vectors of each dimension are indexed in memory at the first search and extended with new literals at later ones; up to 20,000 of a dimension are compared exactly, beyond that through an HNSW graph per metric. The graph is built at the first search that needs it, at once up to 50,000 vectors and on a thread of its own beyond (searches scan exactly until it is there); vectors added later are scanned exactly until they pass a tenth of the graph, which is then extended on a thread. A durable store keeps the vectors and graphs in `derived/` (written after each checkpoint), so a restart doesn't rebuild them. Wrong options are client errors that name the option.
 

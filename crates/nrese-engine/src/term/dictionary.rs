@@ -895,12 +895,13 @@ impl Dictionary {
     /// The vector literals nearest to `query.vector` among the first `known` entries that
     /// `accept` takes (by id), nearest first; the index first takes in the vector literals
     /// interned since the last search, and builds or extends the graph the search uses.
+    /// Refused or stopped as [`super::VectorQuery::max_hits`] and `stop` say.
     pub fn vector_search(
         &self,
         query: &super::VectorQuery,
         known: u64,
         accept: &(dyn Fn(TermId) -> bool + Sync),
-    ) -> (Vec<nrese_vector::Hit>, super::VectorSearchReport) {
+    ) -> Result<(Vec<nrese_vector::Hit>, super::VectorSearchReport), super::VectorStop> {
         self.cover_vectors();
         if self.vectors.read().may_need_work(query) {
             let work = self.vectors.write().work_for(query);
