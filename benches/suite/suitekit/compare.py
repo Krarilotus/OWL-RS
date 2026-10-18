@@ -163,10 +163,10 @@ def bootstrap_ratio(base: list[dict], new: list[dict], rounds: int = 1000, seed:
 # reports times in 1 µs steps, and series under 10 µs move between passes by at most 5 µs
 # (p95 2.5 µs); peaks are reported in whole MiB, so two sides' differ by up to 2 MiB from
 # rounding alone. Below these a difference is the measurement's, never a verdict.
-# CONFIDENCE is the owner's 95 %. Same-binary simulations from those passes' noise (PROTOCOL.md
-# §5): about 2 % of identical series show a "clear loss" at any number of passes (the
-# interval's one-sided 2.5 %), so a comparison of 400 series has about 7 false losses at 12
-# passes a side; at 99.9 %, none in 400. A different level is the owner's decision.
+# CONFIDENCE is the owner's 95 %. About 2.5 % of identical series show a "clear loss" in one run
+# at any number of passes (the interval's one-sided error), so a run's loss is confirmed by a
+# second, independent run before it blocks (release_gate.py: confirm on rerun, the owner's
+# decision of 18 Oct 2026; PROTOCOL.md §5 has the rates).
 RESOLUTION = {"ms": 0.005, "MiB": 2.0, "qps": 0.0}
 CONFIDENCE = 0.95
 PRECISION = 2.0

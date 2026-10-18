@@ -353,6 +353,97 @@ class Tradeoffs(unittest.TestCase):
             self.assertIn("missing approved, by, pays_with, reason", errors[0])
 
 
+class ConfirmOnRerun(unittest.TestCase):
+    """The owner's decision (18 Oct 2026): a flagged loss or undecided case runs again in a fresh,
+    independent A-B-B-A; a loss blocks only if that confirmation shows it too."""
+
+    W3C = {"passed": True, "errors": []}
+    GUARDS = {"passed": True, "errors": [], "guards": 81}
+
+    def gate_run(self, q06_cand, q06_base=(4.8, 4.85, 4.8), round_=0, order=ORDER):
+        def records_of(side, n):
+            q06 = list(q06_cand) if side == "cand" else list(q06_base)
+            return [record(samples={"q01": [10.0, 10.1, 9.9], "q06": q06})]
+        return run_gate(passes(records_of, order=order), context={"host": "phuoc-yu", "round": round_,
+                                                                    "prefix": "rg-cccccccc", "max_gb": 24.0,
+                                                                    "ram_gb": 24.0})
+
+    def test_a_first_run_loss_is_flagged_not_final(self):
+        first = self.gate_run((5.2, 5.25, 5.2))
+        flagged = {(f["side"], f["dimension"], f["verdict"]) for f in first["flagged"]}
+        self.assertEqual(flagged, {("base", "time/q06", "regression"), ("main", "time/q06", "regression")})
+        passed, text = gate_module.verdict([first], self.W3C, self.GUARDS)
+        self.assertFalse(passed)  # pending its confirmation
+        self.assertIn("**pending**", text)
+
+    def test_a_loss_the_confirmation_repeats_blocks(self):
+        first, again = self.gate_run((5.2, 5.25, 5.2)), self.gate_run((5.21, 5.22, 5.2), round_=1)
+        states = gate_module.combine([first, again])
+        self.assertEqual({s["status"] for s in states}, {"confirmed"})
+        passed, text = gate_module.verdict([first, again], self.W3C, self.GUARDS)
+        self.assertFalse(passed)
+        self.assertIn("**confirmed**", text)
+
+    def test_a_loss_that_doesnt_repeat_is_reported_with_both_intervals_and_doesnt_block(self):
+        first, again = self.gate_run((5.2, 5.25, 5.2)), self.gate_run((4.8, 4.86, 4.8), round_=1)
+        states = gate_module.combine([first, again])
+        self.assertEqual({s["status"] for s in states}, {"not confirmed"})
+        self.assertEqual([h["verdict"] for h in states[0]["rounds"]], ["regression", "neutral"])
+        passed, text = gate_module.verdict([first, again], self.W3C, self.GUARDS)
+        self.assertTrue(passed)
+        line = next(x for x in text.splitlines() if "not confirmed" in x)
+        self.assertIn("round 0: regression", line)
+        self.assertIn("round 1: neutral", line)
+
+    def test_undecided_then_shown_once_needs_another_round_and_blocks_at_the_last(self):
+        first = self.gate_run((5.2, 5.25, 5.2))
+        flag = first["flagged"][0]
+        undecided = {**flag, "verdict": "suspect", "needs_passes": 10}
+        first = {**first, "flagged": [undecided]}
+        shown = self.gate_run((5.21, 5.22, 5.2), round_=1)
+        self.assertEqual(gate_module.combine([first, shown])[0]["status"], "pending")  # one detection
+        twice = self.gate_run((5.2, 5.2, 5.22), round_=2)
+        self.assertEqual(gate_module.combine([first, shown, twice])[0]["status"], "confirmed")
+        still = {**shown, "comparisons": {}}  # the confirmation lacks the dimension
+        self.assertEqual(gate_module.combine([first, still])[0]["status"], "missing")
+
+    def test_the_confirmation_job_runs_just_the_flagged_cases_on_the_same_host(self):
+        first = self.gate_run((5.2, 5.25, 5.2))
+        job = gate_module.confirm_job([first], "C:/repo")
+        self.assertEqual(job["id"], "rg-cccccccc-confirm")
+        self.assertEqual((job["kind"], job["class"], job["requires"]["hosts"]), ("owlrs.timed", "exclusive", ["phuoc-yu"]))
+        self.assertEqual(job["steps"][0][2:], ["plan-cases", "lab-olympics"])
+        sides = [s[4] for s in job["steps"] if s[2] == "pass"]
+        self.assertEqual(sides, sides[::-1])  # palindromic
+        n = sides.count("cand")
+        self.assertTrue(4 <= n <= 24 and n % 2 == 0)
+        self.assertEqual(job["env"]["GATE_ROUND"], "1")
+        self.assertEqual(job["env"]["GATE_MIN_PASSES"], str(n))
+        self.assertEqual([s[2] for s in job["steps"][-2:]], ["report", "clean"])
+        import tomllib
+        self.assertEqual(tomllib.loads(gate_module.toml_job(job))["steps"], job["steps"])
+        again = self.gate_run((5.21, 5.22, 5.2), round_=1)
+        self.assertIsNone(gate_module.confirm_job([first, again], "C:/repo"))  # decided: confirmed
+        undecided = {**first, "flagged": [{**f, "verdict": "suspect", "needs_passes": 9} for f in first["flagged"]]}
+        second = gate_module.confirm_job([undecided, again], "C:/repo")
+        self.assertEqual(second["id"], "rg-cccccccc-confirm2")
+
+    def test_nothing_flagged_needs_no_confirmation(self):
+        clean = self.gate_run((4.8, 4.85, 4.8))
+        self.assertEqual(clean["flagged"], [])
+        self.assertIsNone(gate_module.confirm_job([clean], "C:/repo"))
+        self.assertTrue(gate_module.verdict([clean], self.W3C, self.GUARDS)[0])
+
+    def test_a_loss_only_the_confirmation_shows_is_kept_as_not_confirmed(self):
+        first = self.gate_run((5.2, 5.25, 5.2))
+        def records_of(side, n):
+            q01 = [10.6, 10.7, 10.6] if side == "cand" else [10.0, 10.1, 9.9]
+            return [record(samples={"q01": q01, "q06": [5.2, 5.2, 5.21] if side == "cand" else [4.8, 4.85, 4.8]})]
+        again = run_gate(passes(records_of), context={"host": "phuoc-yu", "round": 1})
+        passed, text = gate_module.verdict([first, again], self.W3C, self.GUARDS)
+        self.assertIn("time/q01: **not confirmed** (only round 1", text)
+
+
 class Parts(unittest.TestCase):
     def test_plan_never_lowers_a_cap(self):
         catalog = [{"name": "small", "cap_gb": 4}, {"name": "bsbm-bi-100m", "cap_gb": 28},

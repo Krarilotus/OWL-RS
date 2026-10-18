@@ -14,7 +14,10 @@
 #   release-gate.sh pack REV ...            the revisions' verified binaries as one tar (FLEET_OUT/binaries),
 #                                           for a host that builds nothing (the big host)
 #   release-gate.sh unpack                  that tar (FLEET_INPUT_BINARIES) into GATE_BIN, verified again
-#   release-gate.sh verdict TIMED_DIR... CHECKS_DIR   every part together
+#   release-gate.sh confirm TIMED_DIR... --out DIR   the confirmation job of each host whose run flagged
+#                                           a loss or an undecided case (rg-H8-confirm, rg-H8-confirm2)
+#   release-gate.sh plan-cases CASES        a confirmation's plan: just those cases (GATE_PLAN)
+#   release-gate.sh verdict TIMED_DIR... CHECKS_DIR   every part together, each host's rounds combined
 #   release-gate.sh jobs CAND [OPTIONS]     the fleet jobs of a whole gate (release_gate.py jobs --help)
 #   release-gate.sh clean                   the gate's worktrees and build trees (binaries and data stay)
 #
@@ -67,7 +70,9 @@ fast_env() {
   mkdir -p "$GATE/fast-data" "$GATE/data" "$GATE/query-sets" "$GATE/compact" "$GATE/reports"
 }
 
-planned() { py -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["run"]))' "$GATE/plan.json"; }
+# The plan the passes run: the gate's (prepare), or a confirmation's (plan-cases, GATE_PLAN).
+PLAN=$GATE/${GATE_PLAN:-plan.json}
+planned() { py -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["run"]))' "$PLAN"; }
 
 case ${1:-} in
 build)
@@ -245,11 +250,13 @@ report)
   required=$(printf '%s\n' "$@" | sed 1d | cut -d= -f1 | paste -sd, -)
   for key in not_run elsewhere; do
     listed=$(py -c 'import json,sys; [print(f"{k}={v}") for k, v in json.load(open(sys.argv[1]))[sys.argv[2]].items()]' \
-      "$GATE/plan.json" "$key")
+      "$PLAN" "$key")
     while IFS= read -r line; do [ -z "$line" ] || args+=("--${key/_/-}" "$line"); done <<< "$listed"
   done
   (cd "$tree" && py benches/fast/release_gate.py report --passes "$OUT/passes" --candidate "$candidate" "${args[@]}" \
      --require "$required" --harness-revision "$harness" --min-passes "${GATE_MIN_PASSES:-4}" --inputs "$GATE/inputs.txt" \
+     --context "host=${GATE_HOST:-}" --context "round=${GATE_ROUND:-0}" --context "prefix=${GATE_PREFIX:-}" \
+     --context "gate_name=${GATE_NAME:-}" --context "max_gb=$MAX_GB" --context "ram_gb=${GATE_RAM_GB:-$MAX_GB}" \
      --out "$OUT/release-gate.md" --json "$OUT/release-gate.json") > "$OUT/report.log" 2>&1
   code=$?
   log "timed part: $( [ $code -eq 0 ] && echo passed || echo 'not passed') ($OUT/release-gate.md)"
@@ -340,6 +347,35 @@ unpack)
     done
     log "unpack: $bin verified ($(cat "$GATE_BIN/$bin/REVISION"))"
   done
+  ;;
+
+plan-cases)
+  # A confirmation runs just its cases, all prepared by the gate's own prepare before.
+  [ -n "${GATE_PLAN:-}" ] || { log "plan-cases needs GATE_PLAN"; exit 2; }
+  py - "$2" "$GATE/plan.json" "$PLAN" <<'EOF' || exit 2
+import json, sys
+cases, full, target = sys.argv[1].split(","), json.load(open(sys.argv[2])), sys.argv[3]
+unknown = [c for c in cases if c not in full["run"]]
+if unknown:
+    sys.exit(f"not in the gate's plan (not prepared here): {', '.join(unknown)}")
+json.dump({"run": cases, "not_run": {}, "elsewhere": {}}, open(target, "w"), indent=1)
+EOF
+  cp "$PLAN" "$OUT/"
+  log "confirmation round ${GATE_ROUND:-?}: $2"
+  ;;
+
+confirm)
+  # From the first run's results (and earlier confirmations'), each host's next confirmation.
+  shift
+  reports=() rest=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --out|--checkout) rest+=("$1" "$2"); shift 2 ;;
+      *) for f in "$1"/release-gate.json "$1"/*/release-gate.json; do [ -f "$f" ] && reports+=("$f"); done; shift ;;
+    esac
+  done
+  [ ${#reports[@]} -gt 0 ] || { echo "no release-gate.json in the given directories" >&2; exit 2; }
+  py benches/fast/release_gate.py confirm --reports "${reports[@]}" "${rest[@]}"
   ;;
 
 jobs)

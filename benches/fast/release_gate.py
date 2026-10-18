@@ -421,7 +421,8 @@ def fmt(x) -> str:
 
 def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: list[str], harness: str,
          min_passes: int = CAMPAIGN_PASSES, diagnostic: bool = False, not_run: dict | None = None,
-         tradeoffs: list[dict] | None = None, catalog: list[dict] | None = None, elsewhere: dict | None = None) -> dict:
+         tradeoffs: list[dict] | None = None, catalog: list[dict] | None = None, elsewhere: dict | None = None,
+         context: dict | None = None) -> dict:
     not_run, tradeoffs, elsewhere = dict(not_run or {}), list(tradeoffs or []), dict(elsewhere or {})
     if candidate not in sides:
         raise ValueError(f"the candidate {candidate} is no declared side")
@@ -433,6 +434,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                            "started": p["report"].get("started"), "finished": p["report"].get("finished")}
                           for p in sorted(passes, key=lambda p: p["n"])],
                "diagnostic": diagnostic or min_passes < CAMPAIGN_PASSES, "required": required,
+               "context": dict(context or {}), "flagged": [], "other_blocking": [],
                "not_run": not_run, "elsewhere": elsewhere, "tradeoffs": tradeoffs, "accepted": [], "errors": [],
                "candidate_failures": {},
                "known_issues": {}, "fixed": {}, "comparisons": {}, "blocking": []}
@@ -464,14 +466,23 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                 continue
             row = compare_case(cand, evidence(by_side[side], case), side, checks.get(case, set()))
             summary["comparisons"].setdefault(side, {})[case] = row
+    # Each case's time a pass, per side (the confirmation job's estimate).
+    summary["case_seconds"] = {}
+    for p in passes:
+        for r in p["report"].get("records", []):
+            summary["case_seconds"].setdefault(r["case"], {}).setdefault(p["side"], []).append(r.get("case_s") or 0)
+    summary["case_seconds"] = {c: {s: statistics.mean(v) for s, v in sides_.items()}
+                               for c, sides_ in summary["case_seconds"].items()}
     for case, why in summary["candidate_failures"].items():
         summary["blocking"].append(f"{case}: the candidate fails ({why})")
     for case, why in not_run.items():
         summary["blocking"].append(f"{case}: not run ({why})")
     needs = []
+    summary["other_blocking"] = list(summary["blocking"])
     for side, rows in summary["comparisons"].items():
         for case, row in rows.items():
             summary["blocking"] += [f"{case} against {side}: {b}" for b in row["blocks"]]
+            summary["other_blocking"] += [f"{case} against {side}: {b}" for b in row["blocks"]]
             for d, r in row["dimensions"].items():
                 if not r["blocks"]:
                     continue
@@ -485,6 +496,12 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                                                f"{t['pays_with']['dimension']})")
                     continue
                 summary["blocking"].append(f"{case} against {side}: {d}: {r['verdict']} ({describe(r)})")
+                if r["verdict"] in ("regression", "suspect"):
+                    summary["flagged"].append({"side": side, "case": case, "dimension": d, **{
+                        k: r.get(k) for k in ("verdict", "ratio", "ci", "noise", "needs_passes", "passes",
+                                              "higher_is_better", "unit", "base", "new")}})
+                else:
+                    summary["other_blocking"].append(f"{case} against {side}: {d}: {r['verdict']} ({describe(r)})")
                 if r["verdict"] == "suspect":
                     needs.append(r.get("needs_passes") or math.inf)
     summary["needs_passes"] = (None if not needs else "more than the gate can run" if math.inf in needs
@@ -701,13 +718,15 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, passes_per_si
     per_pass = {"base": 1, "main": 1, "cand": 1} if small else {"base": 14, "main": 4, "cand": 14}
     out[f"{prefix}-timed"] = {
         "id": f"{prefix}-timed", "group": "release", "kind": "owlrs.timed", "class": "exclusive",
-        "priority_class": "merge-gate", "after": [f"{prefix}-build"], "env": env,
+        "priority_class": "merge-gate", "after": [f"{prefix}-build"],
+        "env": {**env, "GATE_HOST": timed_host, "GATE_PREFIX": prefix, "GATE_RAM_GB": str(max_gb)},
         "est_min": sum(per_pass[s] for s in order) + 2, "stall_after_min": 40,
         "steps": [[*gate, "pass", str(n), side, revs[side], harness] for n, side in enumerate(order, start=1)]
         + [[*gate, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], [*gate, "clean"]],
         "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": max_gb}, "inputs": source}
     if big_host:
-        big_env = {**env, "GATE_MIN_GB": str(max_gb), "GATE_MAX_GB": str(big_gb)}
+        big_env = {**env, "GATE_MIN_GB": str(max_gb), "GATE_MAX_GB": str(big_gb), "GATE_HOST": big_host,
+                   "GATE_PREFIX": f"{prefix}-big", "GATE_RAM_GB": str(big_gb + 4)}
         big_env.pop("GATE_BIG_GB")
         per_big = 2 if small else 15
         out[f"{prefix}-big"] = {
@@ -729,14 +748,152 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, passes_per_si
     return out
 
 
+# --- confirm on rerun (the owner's decision, 18 Oct 2026) --------------------------------------
+#
+# A gate run flags each dimension whose 95 % interval shows a loss, or that it couldn't decide.
+# Those cases run again, alone, in a fresh, independent A-B-B-A on the same host (`confirm`).
+# A loss blocks only if a second round shows it too, at 95 % on the same, worse side; one that
+# doesn't repeat is "not confirmed", reported with every round's interval, and doesn't block.
+# A dimension still undecided gets another round; after CONFIRM_ROUNDS it blocks, undecided.
+
+CONFIRM_ROUNDS = 3        # the first run and two confirmations
+CONFIRM_PASSES = (4, 24)  # passes a side for a confirmation: its noise's estimate, within these
+
+
+def rounds_of(reports: list[dict]) -> list[list[dict]]:
+    """The reports of each host, first run first (`context.round`)."""
+    by_host: dict[str, list[dict]] = {}
+    for r in reports:
+        host = (r.get("context") or {}).get("host") or ",".join(map(str, r.get("host", [])))
+        by_host.setdefault(host, []).append(r)
+    return [sorted(rs, key=lambda r: (r.get("context") or {}).get("round", 0)) for rs in by_host.values()]
+
+
+def dimension_in(report: dict, side: str, case: str, dimension: str) -> dict | None:
+    return report.get("comparisons", {}).get(side, {}).get(case, {}).get("dimensions", {}).get(dimension)
+
+
+def combine(rounds: list[dict]) -> list[dict]:
+    """Every dimension the first run flagged, through the confirmation rounds: `confirmed` (two
+    rounds show the loss: blocks), `not confirmed` (shown once, then a round without it), `resolved`
+    (undecided, then decided without a loss), `pending` (another round is due), `undecided` (no
+    round left: blocks), `missing` (a confirmation lacks it: blocks)."""
+    out = []
+    for flag in rounds[0].get("flagged", []):
+        key = (flag["side"], flag["case"], flag["dimension"])
+        history, detections, status = [], 0, None
+        for k, report in enumerate(rounds):
+            r = flag if k == 0 else dimension_in(report, *key)
+            if r is None:
+                status = "missing"
+                break
+            if r.get("accepted_tradeoff"):
+                history.append({**{f: r.get(f) for f in ("verdict", "ratio", "ci", "passes")}, "verdict": "accepted"})
+                status = "resolved"
+                break
+            history.append({f: r.get(f) for f in ("verdict", "ratio", "ci", "passes", "needs_passes", "noise")})
+            if r["verdict"] == "regression":
+                detections += 1
+                if detections >= 2:
+                    status = "confirmed"
+                    break
+            elif r["verdict"] in ("neutral", "better"):
+                status = "not confirmed" if detections else "resolved"
+                break
+            elif r["verdict"] == "incomplete":
+                status = "missing"
+                break
+        if status is None:
+            status = "pending" if len(rounds) < CONFIRM_ROUNDS else "undecided"
+        out.append({**dict(zip(("side", "case", "dimension"), key)), "status": status, "rounds": history,
+                    "blocks": status in ("confirmed", "pending", "undecided", "missing")})
+    return out
+
+
+def confirm_passes(history: list[dict]) -> int:
+    """Passes a side for the next round: the last round's estimate (its interval's half-width
+    against the distance to settle), even, within CONFIRM_PASSES."""
+    last = history[-1]
+    low, high = CONFIRM_PASSES
+    if last.get("needs_passes"):
+        need = last["needs_passes"]
+    elif last["verdict"] == "regression" and last.get("ci") and last.get("ratio"):
+        half = (math.log(last["ci"][1]) - math.log(last["ci"][0])) / 2
+        gap = abs(math.log(last["ratio"]))
+        need = (last.get("passes") or [low])[0] * (half / gap) ** 2 if gap > 0 else high
+    else:
+        need = high
+    n = min(high, max(low, math.ceil(need)))
+    return n + n % 2
+
+
+def confirm_job(rounds: list[dict], checkout: str) -> dict | None:
+    """The next confirmation's fleet job for one host, or None when no dimension is pending."""
+    states = [s for s in combine(rounds) if s["status"] == "pending"]
+    if not states:
+        return None
+    first = rounds[0]
+    ctx = first.get("context") or {}
+    cases = sorted({s["case"] for s in states})
+    n = max(confirm_passes(s["rounds"]) for s in states)
+    order = schedule(n)
+    revs = {"cand": first["candidate"]["revision"], **first["baselines"]}
+    harness = first["harness"]
+    k = len(rounds)
+    prefix = ctx.get("prefix") or f"rg-{revs['cand'][:8]}"
+    name = f"{prefix}-confirm" if k == 1 else f"{prefix}-confirm{k}"
+    seconds = sum(first.get("case_seconds", {}).get(c, {}).get(side, 60) for c in cases for side in order)
+    gate = ["bash", "scripts/release-gate.sh"]
+    env = {"GATE_NAME": ctx.get("gate_name") or f"gate-v2-{revs['cand'][:8]}", "GATE_HOST": ctx.get("host", ""),
+           "GATE_ROUND": str(k), "GATE_PREFIX": prefix, "GATE_MIN_PASSES": str(n), "NRESE_QUIET_SLOT": "0",
+           "GATE_PLAN": f"plan-confirm{k}.json", "GATE_MAX_GB": str(ctx.get("max_gb", 24))}
+    return {"id": name, "group": "release", "kind": "owlrs.timed", "class": "exclusive",
+            "priority_class": "merge-gate", "env": env,
+            "est_min": round(seconds / 60 + 0.7 * len(order) + 5), "stall_after_min": 60,
+            "steps": [[*gate, "plan-cases", ",".join(cases)]]
+            + [[*gate, "pass", str(i), side, revs[side], harness] for i, side in enumerate(order, start=1)]
+            + [[*gate, "report", harness, f"cand={revs['cand']}", *(f"{s}={r}" for s, r in first["baselines"].items())],
+               [*gate, "clean"]],
+            "requires": {"hosts": [ctx.get("host") or "phuoc-yu"], "cores": 16, "ram_gb": ctx.get("ram_gb", 24)},
+            "inputs": [{"name": "checkout", "source": {"git": checkout, "rev": harness}}]}
+
+
 def verdict(timed: list[dict], w3c: dict, guards: dict) -> tuple[bool, str]:
     """Every part together: each timed part passed, every case one part left to another
     in some timed part's plan, the W3C counts and the guards."""
     lines = ["# Release verdict", ""]
-    for t in timed:
-        lines.append(f"- timed on {', '.join(map(str, t['host']))}: {'passed' if t['passed'] else 'NOT passed'} "
-                     f"({len(t['blocking'])} blocking, {len(t['errors'])} pass errors"
-                     f"{', diagnostic' if t['diagnostic'] else ''})")
+    parts_passed = []
+    for rounds in rounds_of(timed):
+        first = rounds[0]
+        states = combine(rounds)
+        errors = [e for r in rounds for e in r["errors"]]
+        # Blocks no rerun can lift (a failed case, lost answers, a pass that doesn't qualify);
+        # confirmations add their own (the case failing there).
+        other = [b for r in rounds for b in r.get("other_blocking", [])]
+        blocking = [s for s in states if s["blocks"]]
+        ok = not errors and not other and not blocking and not any(r["diagnostic"] for r in rounds)
+        parts_passed.append(ok)
+        host = (first.get("context") or {}).get("host") or ", ".join(map(str, first["host"]))
+        lines.append(f"- timed on {host}: {'passed' if ok else 'NOT passed'} ({len(rounds)} round(s); "
+                     f"{sum(s['status'] == 'confirmed' for s in states)} confirmed losses, "
+                     f"{sum(s['status'] in ('pending', 'undecided', 'missing') for s in states)} undecided, "
+                     f"{len(other)} other blocks, {len(errors)} pass errors"
+                     f"{', diagnostic' if any(r['diagnostic'] for r in rounds) else ''})")
+        for s in states:
+            shown = "; ".join(f"round {i}: {h['verdict']} {h.get('ratio') or 0:.3f} "
+                              f"[{(h.get('ci') or [0, 0])[0]:.3f}, {(h.get('ci') or [0, 0])[1]:.3f}]"
+                              for i, h in enumerate(s["rounds"]))
+            lines.append(f"  - {s['case']} against {s['side']}: {s['dimension']}: **{s['status']}** ({shown})")
+        # A loss a confirmation shows that the first run didn't: one round, not confirmed, kept.
+        first_keys = {(f["side"], f["case"], f["dimension"]) for f in first.get("flagged", [])}
+        for k, report in enumerate(rounds[1:], start=1):
+            for f in report.get("flagged", []):
+                if (f["side"], f["case"], f["dimension"]) not in first_keys:
+                    ci = f.get("ci") or [0, 0]
+                    lines.append(f"  - {f['case']} against {f['side']}: {f['dimension']}: **not confirmed** (only round "
+                                 f"{k}: {f['verdict']} {f.get('ratio') or 0:.3f} [{ci[0]:.3f}, {ci[1]:.3f}]; round 0 "
+                                 "didn't show it)")
+        lines += [f"  - {b}" for b in other] + [f"  - pass error: {e}" for e in errors]
     lines.append(f"- W3C: {'passed' if w3c['passed'] else 'NOT passed'} ({'; '.join(w3c['errors']) or 'every suite as required'})")
     lines.append(f"- §0 guards: {'passed' if guards['passed'] else 'NOT passed'} "
                  f"({'; '.join(guards['errors'][:5]) or str(guards['guards']) + ' guards ran and passed'})")
@@ -745,7 +902,7 @@ def verdict(timed: list[dict], w3c: dict, guards: dict) -> tuple[bool, str]:
     missing = sorted({c for t in timed for c in t.get("elsewhere", {})} - covered)
     if missing:
         lines.append(f"- NOT timed anywhere: {', '.join(missing)} (left to another part, which didn't run them)")
-    passed = all(t["passed"] for t in timed) and w3c["passed"] and guards["passed"] and not missing
+    passed = all(parts_passed) and w3c["passed"] and guards["passed"] and not missing
     lines += ["", f"**{'PASSED' if passed else 'NOT PASSED'}**"]
     return passed, "\n".join(lines) + "\n"
 
@@ -786,6 +943,8 @@ def main() -> int:
     s.add_argument("--tradeoffs", type=Path, default=ROOT / "benches" / "release-tradeoffs.toml",
                    help="the owner-approved trade-offs: the only way a loss is accepted")
     s.add_argument("--inputs", type=Path, help="the datasets the passes read, as prepare recorded them")
+    s.add_argument("--context", action="append", default=[], metavar="KEY=VALUE",
+                   help="the job: host (fleet's name), round (0 the first run), prefix, gate_name, max_gb, ram_gb")
     s.add_argument("--out", type=Path)
     s.add_argument("--json", type=Path)
     s = sub.add_parser("w3c")
@@ -811,6 +970,10 @@ def main() -> int:
     s.add_argument("--big-host", default="khaleesi", help="the host of the cases above --max-gb ('' for none)")
     s.add_argument("--big-gb", type=float, default=28)
     s.add_argument("--out", type=Path, default=Path("."))
+    s = sub.add_parser("confirm", help="the confirmation job of each host whose run flagged a loss or an undecided case")
+    s.add_argument("--reports", type=Path, nargs="+", required=True, help="every timed report so far (release-gate.json)")
+    s.add_argument("--checkout", default=ROOT.as_posix())
+    s.add_argument("--out", type=Path, default=Path("."))
     s = sub.add_parser("verdict")
     s.add_argument("--timed", type=Path, action="append", required=True)
     s.add_argument("--w3c", type=Path, required=True)
@@ -832,7 +995,11 @@ def main() -> int:
         passes = load_passes(args.passes)
         summary = gate(passes, sides, args.candidate, [s for s in args.require.split(",") if s], args.harness_revision,
                        args.min_passes, args.diagnostic, pairs(args.not_run, "--not-run"), tradeoffs,
-                       cases_registry.load(), pairs(args.elsewhere, "--elsewhere"))
+                       cases_registry.load(), pairs(args.elsewhere, "--elsewhere"),
+                       {k: v for k, v in pairs(args.context, "--context").items()})
+        for key in ("round", "max_gb", "ram_gb"):
+            if key in summary["context"]:
+                summary["context"][key] = float(summary["context"][key]) if "gb" in key else int(summary["context"][key])
         if args.inputs and args.inputs.is_file():
             summary["inputs"] = args.inputs.read_text(encoding="utf-8").splitlines()
         prepared = {(p["report"].get("prepared") or {}).get("manifest_sha256") for p in passes}
@@ -865,6 +1032,21 @@ def main() -> int:
         if args.json:
             args.json.write_text(json.dumps(out, indent=1), encoding="utf-8")
         return 0 if not errors else 1
+    if args.command == "confirm":
+        reports = [json.loads(path.read_text(encoding="utf-8")) for path in args.reports]
+        args.out.mkdir(parents=True, exist_ok=True)
+        written = 0
+        for rounds in rounds_of(reports):
+            job = confirm_job(rounds, args.checkout)
+            states = combine(rounds)
+            print(f"{(rounds[0].get('context') or {}).get('host')}: " +
+                  (", ".join(f"{s['case']}/{s['dimension']} against {s['side']}: {s['status']}" for s in states) or
+                   "nothing flagged"))
+            if job:
+                (args.out / f"{job['id']}.toml").write_text(toml_job(job), encoding="utf-8")
+                print(f"  {args.out / (job['id'] + '.toml')}: {len(job['steps']) - 3} passes, est {job['est_min']} min")
+                written += 1
+        return 0
     if args.command == "jobs":
         import subprocess
         rev = lambda r: subprocess.run(["git", "-C", args.checkout, "rev-parse", r], capture_output=True,  # noqa: E731
