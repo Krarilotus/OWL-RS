@@ -497,8 +497,10 @@ def w3c_counts(logs: Path) -> dict[str, dict]:
     for tsv in sorted(logs.glob("*.tsv")):
         verdicts = Counter(line.split("\t")[3] for line in tsv.read_text(encoding="utf-8").splitlines()
                            if line.count("\t") >= 3)
+        # open: undecided (gave up, unsupported); every other verdict but a pass or a
+        # recorded dispute is a failure (a wrong answer).
         out["OWL 2 DL"] = {"passed": verdicts.pop("pass", 0), "disputed": verdicts.pop("disputed", 0),
-                           "failed": sum(verdicts.values()), "other": dict(verdicts)}
+                           "open": verdicts.pop("open", 0), "failed": sum(verdicts.values()), "other": dict(verdicts)}
     return out
 
 
@@ -515,7 +517,7 @@ def w3c_check(counts: dict, expected: dict) -> list[str]:
             errors.append(f"{suite}: {got['failed']} failed")
         if got.get("passed", 0) < want["passed"]:
             errors.append(f"{suite}: {got.get('passed', 0)} passed, at least {want['passed']} required")
-        for key in ("skipped", "disputed"):
+        for key in ("skipped", "disputed", "open"):
             if got.get(key, 0) > want.get(key, 0):
                 errors.append(f"{suite}: {got[key]} {key}, at most {want.get(key, 0)} known")
     if counts.get("test results", {}).get("failed"):
