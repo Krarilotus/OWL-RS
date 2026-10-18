@@ -123,7 +123,8 @@ def process_peak(peak, phase_peaks: dict):
     return max(values) if values else None
 
 
-def bootstrap_ratio(base: list[dict], new: list[dict], rounds: int = 1000, seed: int = 1) -> tuple[float, float, float]:
+def bootstrap_ratio(base: list[dict], new: list[dict], rounds: int = 1000, seed: int = 1,
+                    level: float = 0.95) -> tuple[float, float, float]:
     """The ratio new/base of the summed medians and its 95 % interval, by a two-level
     bootstrap: repetitions drawn with replacement, then samples within each, so that the
     spread between runs widens the interval as much as the spread within them."""
@@ -139,49 +140,63 @@ def bootstrap_ratio(base: list[dict], new: list[dict], rounds: int = 1000, seed:
 
     point = statistic(new, series) / max(statistic(base, series), 1e-9)
     ratios = sorted(draw(new) / max(draw(base), 1e-9) for _ in range(rounds))
-    return point, ratios[int(0.025 * rounds)], ratios[int(0.975 * rounds) - 1]
+    tail = (1 - level) / 2
+    return point, ratios[int(tail * rounds)], ratios[min(rounds - 1, int((1 - tail) * rounds) - 1)]
 
 
 # --- the release gate's noise policy ---------------------------------------------------------
 #
 # benches/PROTOCOL.md §5 ("The release gate") states it and the measurements behind each
-# number. One dimension of one case (a query's time, a peak, a client width's QPS) is judged
-# on its own; nothing offsets anything else.
+# number. The owner's rule (18 Oct 2026): no loss is tolerated, only an owner-approved
+# trade-off (benches/release-tradeoffs.toml, release_gate.py). One dimension of one case (a
+# query's time, a peak, a client width's QPS) is judged on its own; nothing offsets anything.
 #
-# MARGIN: identical binaries in interleaved passes on phuoc-yu (14 Oct 2026, 666 series of the
-# fast suite and the perf-lab datasets, ABBA halves) differ by 0.8 % (median), 4.8 % (p90);
-# beyond 10 % only series whose own passes spread as much. A series' margin is the larger of
-# MARGIN and the spread of either side's per-pass medians, so a noisy series isn't judged on
-# a margin its own noise exceeds.
-# FLOORS: below 0.5 ms (time) or 64 MiB (memory) a difference blocks only with strong evidence
-# (the whole interval beyond twice the margin): the same binaries' sub-millisecond DL phases
-# moved by up to 0.34 ms and 3x. RESOLUTION: the perf lab reports milliseconds to three
-# decimals; a difference under 10 µs is the timer's, never a verdict.
-MARGIN = 0.10
-FLOORS = {"ms": 0.5, "MiB": 64.0, "qps": 0.0}
-RESOLUTION = {"ms": 0.01, "MiB": 1.0, "qps": 0.0}
+# - A loss: the CONFIDENCE bootstrap interval of the ratio (passes drawn, then values within
+#   them: each case's own run-to-run noise sets its width) lies entirely on the worse side,
+#   and the difference is at least the measurement's RESOLUTION. No relative tolerance.
+# - Decided without a loss: the interval's worse end within PRECISION times the case's
+#   between-pass noise (the standard deviation of the log of its per-pass medians, the larger
+#   side's; unlike their range it doesn't grow with the passes). Otherwise the passes didn't
+#   pin the ratio down: `suspect`, with the passes it would take. This is how precise the
+#   evidence must be, not a loss accepted: a clear loss of any size blocks.
+# RESOLUTION, from the identical binaries' passes of 14 Oct 2026 on phuoc-yu: the perf lab
+# reports times in 1 µs steps, and series under 10 µs move between passes by at most 5 µs
+# (p95 2.5 µs); peaks are reported in whole MiB, so two sides' differ by up to 2 MiB from
+# rounding alone. Below these a difference is the measurement's, never a verdict.
+# CONFIDENCE is the owner's 95 %. About 2.5 % of identical series show a "clear loss" in one run
+# at any number of passes (the interval's one-sided error), so a run's loss is confirmed by a
+# second, independent run before it blocks (release_gate.py: confirm on rerun, the owner's
+# decision of 18 Oct 2026; PROTOCOL.md §5 has the rates).
+RESOLUTION = {"ms": 0.005, "MiB": 2.0, "qps": 0.0}
+CONFIDENCE = 0.95
+PRECISION = 2.0
 MIN_PASSES = 2
+MAX_PASSES = 64  # an estimate beyond this: more passes won't settle it; the noise has a cause
 BLOCKING = ("regression", "suspect", "incomplete")
 
 
 def judge(base: list[list[float]], new: list[list[float]], *, unit: str, higher_is_better: bool = False,
-          margin: float = MARGIN) -> dict:
+          confidence: float = CONFIDENCE, precision: float = PRECISION) -> dict:
     """One dimension: `base` and `new` are per pass, each pass a list of its values (a
     process's samples, or one value per process). The estimate is the median of the pooled
-    values; its 95 % interval of new/base comes from bootstrap_ratio (passes drawn, then values
-    within them). Verdicts, in the worse direction (lower QPS is worse):
+    values, its interval of new/base bootstrap_ratio's at `confidence`. In the worse direction
+    (lower QPS is worse), with `noise` the larger side's sd of log per-pass medians:
 
-    - `regression`: beyond 1 + margin, at least the floor, and the interval above 1; below the
-      floor, only with the whole interval beyond 1 + 2 * margin and at least the resolution;
-    - `suspect`: beyond 1 + margin and the floor, the interval reaching 1 (rerun or bisect);
-    - `better`: below 1 / (1 + margin) with the interval below 1;
-    - `neutral`: everything else, a slowdown under the floor included (`below_floor`);
+    - `regression`: the whole interval worse than 1, the difference at least RESOLUTION;
+    - `better`: the whole interval better than 1;
+    - `neutral`: the difference below RESOLUTION, or the interval's worse end within
+      `precision` x noise (in log ratio);
+    - `suspect`: neither: not decided at these passes. `needs_passes` estimates the passes a
+      side for the interval to settle (its half-width shrinks as 1/sqrt(passes)): its worse
+      end within the precision, or, for an estimate beyond it, clear of 1; None above MAX_PASSES;
     - `incomplete`: fewer than MIN_PASSES passes on a side, or a pass without valid values.
 
-    `blocks`: whether the verdict stops a release (BLOCKING)."""
+    `blocks`: whether the verdict stops a release (BLOCKING), unless an approved trade-off
+    covers it (release_gate.py)."""
     out = {"unit": unit, "higher_is_better": higher_is_better, "passes": [len(base), len(new)],
-           "base": None, "new": None, "ratio": None, "ci": None, "spread": None, "margin": None,
-           "below_floor": False, "verdict": "incomplete", "blocks": True}
+           "base": None, "new": None, "ratio": None, "ci": None, "spread": None, "noise": None,
+           "confidence": confidence, "below_resolution": False, "needs_passes": None,
+           "verdict": "incomplete", "blocks": True}
 
     def valid(side) -> bool:
         return len(side) >= MIN_PASSES and all(
@@ -192,36 +207,46 @@ def judge(base: list[list[float]], new: list[list[float]], *, unit: str, higher_
         return out
     b = statistics.median([v for vs in base for v in vs])
     n = statistics.median([v for vs in new for v in vs])
-    spreads = []
+    spreads, noises = [], []
     for side in (base, new):
         medians = [statistics.median(vs) for vs in side]
         middle = statistics.median(medians)
         spreads.append((max(medians) - min(medians)) / middle if middle > 0 else 0.0)
-    m = max(margin, *spreads)
-    out.update(base=b, new=n, spread=max(spreads), margin=m)
-    floor, resolution = FLOORS[unit], RESOLUTION[unit]
+        logs = [math.log(v) for v in medians if v > 0]
+        noises.append(statistics.stdev(logs) if len(logs) == len(medians) else 0.0)
+    noise = max(noises)
+    out.update(base=b, new=n, spread=max(spreads), noise=noise)
     diff = (b - n) if higher_is_better else (n - b)
+    if abs(diff) < RESOLUTION[unit] or (b <= 0 and n <= 0):
+        out.update(ratio=n / b if b > 0 else 1.0, below_resolution=abs(diff) > 0, verdict="neutral", blocks=False)
+        return out
     if b <= 0 or n <= 0:
-        # A zero (below the report's resolution) has no ratio: the difference decides.
-        worse = diff >= max(floor, resolution) and diff > 0
-        out.update(ratio=float("inf") if b <= 0 < n else (0.0 if n <= 0 < b else 1.0),
-                   verdict="regression" if worse else "neutral", blocks=worse)
+        # One side below the report's resolution: no ratio, the difference decides.
+        out.update(ratio=float("inf") if b <= 0 else 0.0, verdict="regression" if diff > 0 else "better")
+        out["blocks"] = out["verdict"] in BLOCKING
         return out
     scale = max(b, n)
     point, low, high = bootstrap_ratio([{"v": [v / scale for v in vs]} for vs in base],
-                                       [{"v": [v / scale for v in vs]} for vs in new], rounds=2000)
+                                       [{"v": [v / scale for v in vs]} for vs in new], rounds=2000,
+                                       level=confidence)
     out.update(ratio=point, ci=[low, high])
+    if min(point, low, high) <= 0:
+        out.update(verdict="suspect", blocks=True)  # a resample of zeros: no interval to judge
+        return out
     worse, worse_low, worse_high = (1 / point, 1 / high, 1 / low) if higher_is_better else (point, low, high)
-    if worse > 1 + m:
-        if diff >= floor:
-            verdict = "regression" if worse_low > 1 else "suspect"
-        else:
-            out["below_floor"] = True
-            verdict = "regression" if diff >= resolution and worse_low > 1 + 2 * m else "neutral"
-    elif worse < 1 / (1 + m) and worse_high < 1:
+    bound = precision * noise
+    if worse_low > 1 and diff > 0:
+        verdict = "regression"
+    elif worse_high < 1 and diff < 0:
         verdict = "better"
-    else:
+    elif math.log(worse_high) <= bound:
         verdict = "neutral"
+    else:
+        verdict = "suspect"
+        half = (math.log(worse_high) - math.log(worse_low)) / 2
+        gap = math.log(worse) if math.log(worse) > bound else bound - math.log(worse)
+        need = min(len(base), len(new)) * (half / gap) ** 2 if gap > 0 else math.inf
+        out["needs_passes"] = max(math.ceil(need), min(len(base), len(new)) + 1) if need <= MAX_PASSES else None
     out.update(verdict=verdict, blocks=verdict in BLOCKING)
     return out
 
