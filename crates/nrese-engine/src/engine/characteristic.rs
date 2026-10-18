@@ -70,7 +70,7 @@ impl CharacteristicSets {
     /// scans them); `None` past [`MAX_SETS`] distinct sets.
     #[cfg(test)]
     pub(crate) fn build(quads: impl Iterator<Item = EncodedQuad>) -> Option<Self> {
-        Self::merge(vec![Partial::of(quads)?])
+        Self::merge(vec![Partial::of(quads, &SetCount::default())?])
     }
 
     /// The sets of the parts of a graph, each scanned by subject (the parts of [`Partial`]
@@ -444,10 +444,50 @@ pub(crate) struct Partial {
     kept_subjects: bool,
 }
 
+/// The distinct sets the parts of one scan have found between them, counted as they find
+/// them (by a hash of their predicates, in shards), so that each part stops once all are
+/// past [`MAX_SETS`] instead of at the merge after the whole scan (DBpedia core: none
+/// kept, its scan 0.37 s on phuoc-yu). A hash that collides counts once: a part may go
+/// on a little longer, the merge still decides.
+pub(crate) struct SetCount {
+    shards: Vec<parking_lot::Mutex<std::collections::HashSet<u64>>>,
+    found: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for SetCount {
+    fn default() -> Self {
+        Self {
+            shards: (0..64).map(|_| Default::default()).collect(),
+            found: Default::default(),
+        }
+    }
+}
+
+impl SetCount {
+    /// Counts a set a part found new to it: whether the parts are still within
+    /// [`MAX_SETS`].
+    fn found(&self, key: &[u64]) -> bool {
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::Ordering;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        let shard = &self.shards[(hash % self.shards.len() as u64) as usize];
+        if shard.lock().insert(hash) {
+            self.found.fetch_add(1, Ordering::Relaxed);
+        }
+        self.within()
+    }
+
+    fn within(&self) -> bool {
+        self.found.load(std::sync::atomic::Ordering::Relaxed) <= MAX_SETS
+    }
+}
+
 impl Partial {
     /// The sets of `quads`, sorted by subject and then predicate; `None` past
-    /// [`MAX_SETS`] distinct sets.
-    pub(crate) fn of(quads: impl Iterator<Item = EncodedQuad>) -> Option<Self> {
+    /// [`MAX_SETS`] distinct sets, here or among all the parts `count` counts for.
+    pub(crate) fn of(quads: impl Iterator<Item = EncodedQuad>, count: &SetCount) -> Option<Self> {
         let mut index: HashMap<Box<[u64]>, u32> = HashMap::new();
         let mut part = Partial {
             found: Vec::new(),
@@ -465,9 +505,11 @@ impl Partial {
             }
             let key: Box<[u64]> = current.iter().map(|&(p, _)| p).collect();
             let at = match index.get(&key) {
+                // Another part may have found the set past the limit.
+                Some(_) if !count.within() => return None,
                 Some(&at) => at,
                 None => {
-                    if part.found.len() >= MAX_SETS {
+                    if part.found.len() >= MAX_SETS || !count.found(&key) {
                         return None;
                     }
                     let at = part.found.len() as u32;
@@ -636,5 +678,18 @@ mod tests {
         // Every subject its own set: one predicate of its own.
         let quads = (0..MAX_SETS as u64 + 1).map(|s| quad(s, 10_000_000 + s, 1));
         assert!(CharacteristicSets::build(quads).is_none());
+    }
+
+    #[test]
+    fn parts_stop_once_past_the_limit_between_them() {
+        // Two parts with sets of their own, each within the limit, together past it: the
+        // second stops while scanning, not the merge after both.
+        let count = SetCount::default();
+        let half = MAX_SETS as u64 / 2;
+        let part = |subjects: std::ops::Range<u64>| {
+            Partial::of(subjects.map(|s| quad(s, 10_000_000 + s, 1)), &count)
+        };
+        assert!(part(0..half + 1).is_some());
+        assert!(part(half + 1..2 * half + 2).is_none());
     }
 }
