@@ -335,7 +335,8 @@ def pooled(report: dict) -> dict[str, dict]:
                                            "expected": [], "invalid": False, "expected_reps": report.get("reps", 0),
                                            "checks": {}, "frontiers": [], "answers": {}, "memory_kind": set()})
         entry["expected"].append(r.get("expected_outcome", "ok"))
-        entry["invalid"] |= any(not c.get("ok") for c in r.get("checks", []) + r.get("routes", []))
+        # ok None: a check the tool couldn't report (fast.py run --no-routes), unchecked, not failed.
+        entry["invalid"] |= any(c.get("ok") is False for c in r.get("checks", []) + r.get("routes", []))
         # Older full reports retain single-level clients only in their raw result.
         # An explicitly empty throughput list remains missing evidence, not a fallback.
         raw = r.get("result") or {}
