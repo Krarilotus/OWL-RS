@@ -494,17 +494,73 @@ pub(crate) fn build(index: &RwLock<VectorIndex>, query: &VectorQuery) {
 
 /// [`build`] on a thread of its own.
 pub(crate) fn build_in_background(index: Arc<RwLock<VectorIndex>>, query: VectorQuery) {
-    let spawned = std::thread::Builder::new()
-        .name("nrese-vector-graph".to_owned())
-        .spawn(move || {
-            let built =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&index, &query)));
-            if built.is_err() {
-                tracing::error!("building a vector graph failed; searches stay exact");
-                index.write().release(query.vector.len(), query.metric);
-            }
-        });
-    if let Err(error) = spawned {
+    launch_build(index, query, |index, query| {
+        std::thread::Builder::new()
+            .name("nrese-vector-graph".to_owned())
+            .spawn(move || {
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    build(&index, &query)
+                }));
+                if built.is_err() {
+                    tracing::error!("building a vector graph failed; searches stay exact");
+                    index.write().release(query.vector.len(), query.metric);
+                }
+            })
+    });
+}
+
+/// The launcher owns the pending mark until a worker accepts it. A failed launch must
+/// return it just as a failed worker does; otherwise searches can never schedule a retry.
+fn launch_build<T>(
+    index: Arc<RwLock<VectorIndex>>,
+    query: VectorQuery,
+    spawn: impl FnOnce(Arc<RwLock<VectorIndex>>, VectorQuery) -> std::io::Result<T>,
+) {
+    let dimension = query.vector.len();
+    let metric = query.metric;
+    if let Err(error) = spawn(Arc::clone(&index), query) {
+        index.write().release(dimension, metric);
         tracing::warn!(%error, "vector graph not built");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_launch_returns_only_its_build_slot_for_retry() {
+        let mut vectors = Vectors::new(1);
+        for id in 0..SYNC_BUILD {
+            vectors.push(id as u64, &[1.0]);
+        }
+        let mut index = VectorIndex::default();
+        index.spaces.insert(
+            1,
+            Space {
+                vectors,
+                graphs: Vec::new(),
+            },
+        );
+        let query = VectorQuery {
+            strategy: VectorStrategy::Approximate,
+            ..VectorQuery::new(vec![1.0], 1)
+        };
+        let other = VectorQuery {
+            metric: Metric::L2,
+            ..query.clone()
+        };
+        assert!(matches!(index.work_for(&query), Work::Background));
+        assert!(matches!(index.work_for(&other), Work::Background));
+        let index = Arc::new(RwLock::new(index));
+        launch_build(Arc::clone(&index), query.clone(), |_, _| {
+            Err::<(), _>(std::io::Error::other("thread unavailable"))
+        });
+        assert!(index.read().may_need_work(&query));
+        assert!(!index.read().may_need_work(&other));
+        assert!(matches!(index.write().work_for(&query), Work::Background));
+        launch_build(Arc::clone(&index), query.clone(), |_, _| Ok(()));
+        assert!(!index.read().may_need_work(&query));
+        assert!(matches!(index.write().work_for(&query), Work::None));
     }
 }

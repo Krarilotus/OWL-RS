@@ -184,10 +184,14 @@ impl Context<'_> {
         // The candidates the rest of the query allows, if it binds the matched variable.
         let candidates: Option<HashSet<u64>> = bound
             .and_then(|b| Some((b, b.column(&search.matched)?)))
-            .map(|(b, column)| {
+            .and_then(|(b, column)| {
                 (0..b.table.len())
-                    .map(|row| b.table.get(row, column))
-                    .filter(|&id| id != UNDEF)
+                    .map(|row| {
+                        let id = b.table.get(row, column);
+                        // An unbound row can join any vector; its alternatives must
+                        // not turn an unrestricted search into a finite candidate set.
+                        (id != UNDEF).then_some(id)
+                    })
                     .collect()
             });
         // The query vectors, each with the id it is bound to (for a `nrv:near` variable).
