@@ -409,6 +409,9 @@ struct Reader {
     snapshot: Snapshot,
     sets: Arc<SupportSets>,
     form: Form,
+    /// The view itself: the next view is noted as its continuation, so full-text
+    /// corpora derive from its (`Snapshot::continues`).
+    view: Snapshot,
 }
 
 /// What a reader misses: the statements it misses, as runs over the stack (when it sees
@@ -791,10 +794,15 @@ impl Supports {
             .iter()
             .find(|reader| *reader.access == **access)
             .cloned();
+        let mut continued = None;
         let form = earlier
             .and_then(|reader| {
                 let changes =
                     sets.changes_since(snapshot, &reader.sets, &reader.snapshot, access)?;
+                let mut flipped: Vec<EncodedQuad> =
+                    changes.hide.iter().chain(&changes.show).copied().collect();
+                flipped.sort_unstable();
+                continued = Some((Arc::clone(&reader), flipped));
                 Some(match &reader.form {
                     Form::Mask(mask) => {
                         let mask = mask.changed(snapshot, &changes.hide, &changes.show);
@@ -816,6 +824,9 @@ impl Supports {
                 .expect("a mask built for this stack's layout"),
             Form::Only(list) => snapshot.with_inferred_subset(InferredSubset::Only(list.to_vec())),
         };
+        if let Some((earlier, flipped)) = &continued {
+            view.continues(snapshot, &earlier.view, &earlier.snapshot, flipped);
+        }
         {
             let mut state = self.state();
             state.readers.retain(|reader| *reader.access != **access);
@@ -827,6 +838,7 @@ impl Supports {
                 snapshot: snapshot.clone(),
                 sets: Arc::clone(sets),
                 form,
+                view: view.clone(),
             }));
         }
         Counters::add(&self.counters.views, 1);

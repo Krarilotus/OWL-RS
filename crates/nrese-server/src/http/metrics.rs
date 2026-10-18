@@ -224,6 +224,22 @@ nrese_support_seconds_total{{phase=\"view\"}} {}
         support.updating_us as f64 / 1e6,
         support.viewing_us as f64 / 1e6,
     ));
+    let corpora = engine.text_corpora;
+    body.push_str(&format!(
+        "# HELP nrese_text_corpus_bytes The kept full-text corpora (the documents each search scope ranks among), and their budget.
+# TYPE nrese_text_corpus_bytes gauge
+nrese_text_corpus_bytes{{of=\"kept\"}} {}
+nrese_text_corpus_bytes{{of=\"budget\"}} {}
+# HELP nrese_text_corpora The full-text corpora kept.
+# TYPE nrese_text_corpora gauge
+nrese_text_corpora {}
+# HELP nrese_text_corpora_built_total Full-text corpora built by a walk of the store, and derived from an earlier version's.
+# TYPE nrese_text_corpora_built_total counter
+nrese_text_corpora_built_total{{how=\"walked\"}} {}
+nrese_text_corpora_built_total{{how=\"derived\"}} {}
+",
+        corpora.bytes, corpora.budget, corpora.kept, corpora.walked, corpora.derived,
+    ));
     state.request_metrics().render(&mut body);
 
     let mut response = (StatusCode::OK, body).into_response();

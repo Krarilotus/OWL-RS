@@ -170,6 +170,40 @@ fn an_unreadable_graph_changes_no_score() {
     assert_eq!(all[0].0, "alpha in h", "{all:?}");
 }
 
+/// Readers whose access is written differently but reads the same graphs rank among one
+/// corpus, built once.
+#[test]
+fn readers_of_the_same_graphs_share_a_corpus() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    base(&engine);
+    let mut tx = engine.transaction();
+    betas(&mut tx, Some("G"));
+    tx.insert(label_quad("h", "alpha in h", Some("H")).as_ref());
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let reader = |access: GraphAccess| QueryOptions {
+        union_default_graph: true,
+        access: Some(Arc::new(access)),
+        ..QueryOptions::default()
+    };
+    let by_name = reader(GraphAccess {
+        default_graph: true,
+        graphs: vec![format!("{EX}H")],
+        ..GraphAccess::default()
+    });
+    let by_prefix = reader(GraphAccess {
+        default_graph: true,
+        prefixes: vec![EX.to_owned()],
+        excluded: vec![format!("{EX}G")],
+        ..GraphAccess::default()
+    });
+    let walked = snapshot.text_corpus_stats().walked;
+    let first = rows(&snapshot, RANKED, &by_name);
+    assert_eq!(snapshot.text_corpus_stats().walked, walked + 1);
+    assert_eq!(rows(&snapshot, RANKED, &by_prefix), first);
+    assert_eq!(snapshot.text_corpus_stats().walked, walked + 1);
+}
+
 /// The result cache keys results by snapshot: a hit equals what the snapshot computes
 /// afresh, whatever was interned since.
 #[test]
