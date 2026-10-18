@@ -6667,3 +6667,52 @@ fn sums_of_values_neither_numeric_nor_durations_are_unbound() {
         assert_eq!(native, expected, "{text}");
     }
 }
+
+/// Duplicate-insensitive aggregates of one triple pattern without GROUP BY are evaluated
+/// over the pattern's distinct values (a set evaluation): the reference's answers,
+/// duplicates and mixed term kinds included, and one row of empty aggregates where the
+/// pattern matches nothing.
+#[test]
+fn insensitive_aggregates_of_one_pattern_equal_the_reference() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (s, o) in [
+        ("a", Term::from(Literal::from(3))),
+        ("b", Literal::from(3).into()),
+        ("c", Literal::from(1).into()),
+        ("d", Literal::new_simple_literal("x").into()),
+        ("e", Literal::new_simple_literal("x").into()),
+        ("f", ex("n").into()),
+    ] {
+        tx.insert(Quad::new(ex(s), ex("v"), o, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for p in ["v", "absent"] {
+        for text in [
+            format!("SELECT (MIN(?o) AS ?a) (MAX(?o) AS ?b) WHERE {{ ?s <{EX}{p}> ?o }}"),
+            format!("SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE {{ ?s <{EX}{p}> ?o }}"),
+            format!(
+                "SELECT (COUNT(DISTINCT ?s) AS ?n) (MAX(?s) AS ?m) WHERE {{ ?s <{EX}{p}> ?o }}"
+            ),
+            format!(
+                "SELECT (GROUP_CONCAT(DISTINCT STR(?o); SEPARATOR=\"|\") AS ?c) WHERE {{ ?s <{EX}{p}> ?o }}"
+            ),
+            format!("SELECT (SUM(DISTINCT ?o) AS ?t) WHERE {{ ?s <{EX}{p}> ?o }}"),
+        ] {
+            let query = SparqlParser::new().parse_query(&text).unwrap();
+            let options = QueryOptions::default();
+            let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+            let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+            if text.contains("GROUP_CONCAT") {
+                assert_eq!(
+                    concatenations_sorted(&native, '|'),
+                    concatenations_sorted(&expected, '|'),
+                    "{text}"
+                );
+            } else {
+                assert_eq!(native, expected, "{text}");
+            }
+        }
+    }
+}
