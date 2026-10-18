@@ -4,13 +4,16 @@
 
 use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
-use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query};
+use nrese_sparql::{
+    QueryEvaluationError, QueryOptions, QueryResults, evaluate_query, explain_query,
+};
 use nrese_sparql_syntax::SparqlParser;
 
 const EX: &str = "http://example.com/";
 const PREFIXES: &str = "PREFIX bds: <http://www.bigdata.com/rdf/search#> \
                         PREFIX text: <http://jena.apache.org/text#> \
                         PREFIX luc: <http://www.ontotext.com/owlim/lucene#> \
+                        PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
                         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
                         PREFIX ex: <http://example.com/> ";
 
@@ -339,5 +342,202 @@ fn graphdb_lucene_predicates() {
     assert_eq!(
         query("SELECT ?x ?s WHERE { ?x luc:labels \"tower AND bridge\" ; luc:score ?s }"),
         table(&[&["bridge", "1"]])
+    );
+}
+
+#[test]
+fn lucene_rejects_lossy_or_ambiguous_translation() {
+    let engine = engine();
+    for text in [
+        "label:tower",
+        "tower^2",
+        "+tower",
+        "tower +bridge",
+        "(tower OR bridge)",
+        "tower AND bridge OR museum",
+        "tower bridge AND museum",
+        "tower AND bridge museum",
+        "tower NOT bridge AND museum",
+        "tower -bridge AND museum",
+        "--tower",
+        "tower -AND",
+        "tower -OR",
+        "tower -NOT",
+        "AND~1",
+        "OR~",
+        "NOT~0",
+        "AND tower",
+        "tower AND",
+        "tower OR OR bridge",
+        "tower NOT",
+        "NOT NOT tower",
+        "tower OR NOT bridge",
+        "tower NOT \"london bridge\"",
+        "tower -\"london bridge\"",
+        "\"tower bridge",
+        "\"tower\"bridge",
+        "\"tower\"~1",
+        "tower && || bridge",
+    ] {
+        let literal = Literal::new_simple_literal(text).to_string();
+        for predicate in ["text:query", "luc:labels"] {
+            assert_search_argument_error(&engine, &format!("?s {predicate} {literal}"));
+        }
+    }
+    let plain = QueryOptions::default();
+    for (text, expected) in [
+        ("tower AND bridge", table(&[&["bridge"]])),
+        ("tower && bridge", table(&[&["bridge"]])),
+        (
+            "tower OR museum",
+            table(&[&["bridge"], &["museum"], &["tower"]]),
+        ),
+        (
+            "tower museum",
+            table(&[&["bridge"], &["museum"], &["tower"]]),
+        ),
+        ("tower NOT bridge", table(&[&["tower"]])),
+        ("tower AND NOT bridge", table(&[&["tower"]])),
+        ("tower -bridge", table(&[&["tower"]])),
+        ("tower AND london -bridge", table(&[&["tower"]])),
+        ("\"tower: bridge!\"", table(&[&["bridge"]])),
+        ("\"tower (bridge)^?\"", table(&[&["bridge"]])),
+        ("brigde~1", table(&[&["bells"], &["bridge"]])),
+        ("brit*", table(&[&["museum"]])),
+    ] {
+        let literal = Literal::new_simple_literal(text);
+        for predicate in ["text:query", "luc:labels"] {
+            let query = format!("SELECT ?s WHERE {{ ?s {predicate} {literal} }}");
+            assert_eq!(sorted(rows(&engine, &query, &plain)), expected, "{text}");
+        }
+    }
+}
+
+#[test]
+fn engine_text_errors_are_query_arguments_for_every_search_adapter() {
+    for engine in [Engine::new(EngineConfig::default()).unwrap(), engine()] {
+        for text in [
+            "bridge~x",
+            "bridge~3",
+            "bridge~0.5",
+            "bridge~256",
+            "bridge~1~2",
+            "~1",
+            "bridge -tow*",
+            "bridge -tower~1",
+            "bridge -\"tower bridge\"",
+            "bri?ge",
+            "bri*dge",
+            "bridge**",
+            "\"bridge",
+        ] {
+            let literal = Literal::new_simple_literal(text);
+            for body in [
+                format!("?l bds:search {literal}"),
+                format!("?l bds:search {literal} ; bds:prefixMatch true"),
+                format!("?s text:query {literal}"),
+                format!("?s luc:labels {literal}"),
+            ] {
+                assert_search_argument_error(&engine, &body);
+            }
+        }
+    }
+}
+
+fn assert_search_argument_error(engine: &Engine, body: &str) {
+    let text = format!("{PREFIXES} SELECT * WHERE {{ {body} }}");
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let result = evaluate_query(&snapshot, &query, &options).and_then(|result| {
+        if let QueryResults::Solutions(solutions) = result {
+            for solution in solutions {
+                solution?;
+            }
+        }
+        Ok(())
+    });
+    assert!(
+        matches!(result, Err(QueryEvaluationError::Argument(_))),
+        "{text}: {result:?}"
+    );
+    assert!(
+        matches!(
+            explain_query(&snapshot, &query, &options),
+            Err(QueryEvaluationError::Argument(_))
+        ),
+        "EXPLAIN: {text}"
+    );
+}
+
+/// These terminating malformed inputs also provide a safe RED check on the old code.
+#[test]
+fn jena_malformed_lists_are_query_errors() {
+    let engine = engine();
+    for links in [
+        "_:head rdf:first \"bridge\" .",
+        "_:head rdf:rest rdf:nil .",
+        "_:head rdf:first \"bridge\" ; rdf:rest _:missing .",
+        "_:head rdf:first \"bridge\" ; rdf:rest ex:tail .",
+        "_:head rdf:first \"bridge\" ; rdf:rest \"tail\" .",
+        "_:head rdf:first \"bridge\" ; rdf:rest ?tail .",
+        "_:head rdf:first \"bridge\", \"tower\" ; rdf:rest rdf:nil .",
+        "_:head rdf:first \"tower\", \"bridge\" ; rdf:rest rdf:nil .",
+        "_:head rdf:first \"bridge\" ; rdf:rest rdf:nil, _:other . _:other rdf:first 1 ; rdf:rest rdf:nil .",
+        "_:head rdf:first \"bridge\" ; rdf:rest _:other, rdf:nil . _:other rdf:first 1 ; rdf:rest rdf:nil .",
+    ] {
+        assert_search_argument_error(&engine, &format!("?s text:query _:head . {links}"));
+        assert_search_argument_error(&engine, &format!("_:head text:query \"bridge\" . {links}"));
+    }
+    for body in [
+        "?s text:query () .",
+        "() text:query \"bridge\" .",
+        "?s text:query (rdfs:label) .",
+        "?valid text:query \"bridge\" . ?s text:query _:head . _:head rdf:first \"bridge\" .",
+    ] {
+        assert_search_argument_error(&engine, body);
+    }
+}
+
+/// Run cycle coverage on the fixed build; unfixed builds need an external memory/time cap.
+#[test]
+fn jena_cyclic_lists_are_query_errors() {
+    let engine = engine();
+    for links in [
+        "_:head rdf:first \"bridge\" ; rdf:rest _:head .",
+        "_:head rdf:first \"bridge\" ; rdf:rest _:tail . _:tail rdf:first 1 ; rdf:rest _:head .",
+        "_:head rdf:first \"bridge\" ; rdf:rest _:tail . _:tail rdf:first 1 ; rdf:rest _:tail .",
+    ] {
+        assert_search_argument_error(&engine, &format!("?s text:query _:head . {links}"));
+        assert_search_argument_error(&engine, &format!("_:head text:query \"bridge\" . {links}"));
+    }
+}
+
+#[test]
+fn jena_valid_lists_keep_duplicate_items_links_and_shared_tails() {
+    let engine = engine();
+    let expected = table(&[&["bells"], &["bridge"]]);
+    for body in [
+        // Repeated identical links are all consumed, not left as data joins.
+        "?s text:query _:head . _:head rdf:first \"bridge\", \"bridge\" ; rdf:rest rdf:nil, rdf:nil .",
+        // Identical items at different cells are not cycles.
+        "?s text:query (\"bridge\" 10 10) .",
+        // Two independently parsed argument lists may share their tail.
+        "?s text:query _:head, _:other . _:head rdf:first \"bridge\" ; rdf:rest _:tail . _:other rdf:first \"bridge\" ; rdf:rest _:tail . _:tail rdf:first 10 ; rdf:rest rdf:nil .",
+        // Structural triples may precede the head, and unrelated patterns still join.
+        "_:tail rdf:rest rdf:nil ; rdf:first \"bridge\" . _:head rdf:rest _:tail ; rdf:first rdfs:label . ?s text:query _:head . ?s rdfs:label ?label .",
+    ] {
+        let query = format!("SELECT ?s WHERE {{ {body} }}");
+        let found = sorted(rows(&engine, &query, &QueryOptions::default()));
+        assert_eq!(found, expected, "{query}");
+    }
+    // A blank subject without list links remains an ordinary existential subject.
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT (COUNT(*) AS ?n) WHERE { _:subject text:query \"bridge\" }",
+            &QueryOptions::default()
+        ),
+        table(&[&["2"]])
     );
 }

@@ -40,6 +40,7 @@ fn search(engine: &Engine, text: &str) -> Vec<String> {
             prefix: false,
             stem: None,
         })
+        .unwrap()
         .into_iter()
         .filter_map(|m| snapshot.decode(nrese_engine::TermId::from_raw(m.id)))
         .map(|t| t.to_string())
@@ -50,6 +51,73 @@ fn search(engine: &Engine, text: &str) -> Vec<String> {
 
 fn vector(values: &[f32]) -> Literal {
     Literal::new_typed_literal(lexical(values), NamedNode::new_unchecked(DATATYPE))
+}
+
+#[test]
+fn text_query_errors_reach_dictionary_and_snapshot_callers() {
+    let engine = Engine::new(config()).unwrap();
+    let dictionary = nrese_engine::Dictionary::default();
+    for populated in [false, true] {
+        if populated {
+            insert(
+                &engine,
+                "quick",
+                Literal::new_simple_literal("quick brown fox"),
+            );
+            dictionary.intern(
+                Literal::new_simple_literal("quick brown fox")
+                    .as_ref()
+                    .into(),
+            );
+            dictionary.intern(
+                NamedNode::new_unchecked("http://example.com/quick")
+                    .as_ref()
+                    .into(),
+            );
+        }
+        let snapshot = engine.snapshot();
+        for text in [
+            "quick~nope",
+            "quick~0.5",
+            "quick~3",
+            "quick~256",
+            "quick~999999999999999999999",
+            "quick~-1",
+            "quick~1~2",
+            "~1",
+            "quick -fo*",
+            "quick -fox~1",
+            "quick -\"brown fox\"",
+            "quick -fox?",
+            "\"quick brown",
+        ] {
+            let query = TextQuery {
+                text: text.to_owned(),
+                all_words: false,
+                prefix: false,
+                stem: None,
+            };
+            for result in [
+                snapshot.text_search(&query),
+                snapshot.iri_search(&query),
+                dictionary.text_search(&query),
+                dictionary.iri_search(&query),
+            ] {
+                assert!(
+                    matches!(result, Err(nrese_engine::EngineError::InvalidTextQuery(_))),
+                    "{text}: {result:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        search(&engine, "quick-brown"),
+        search(&engine, "quick brown")
+    );
+    assert_eq!(search(&engine, "\"quick: brown! fox?\"").len(), 1);
+    for text in ["quick~", "quick~0", "quick~1", "quick~2"] {
+        assert_eq!(search(&engine, text).len(), 1, "{text}");
+    }
 }
 
 #[test]

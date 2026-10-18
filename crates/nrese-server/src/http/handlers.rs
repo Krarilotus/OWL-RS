@@ -336,7 +336,13 @@ pub async fn autocomplete(
         tokio::task::spawn_blocking(move || store.autocomplete(&scope, &typed, limit, infer))
             .await
             .map_err(|error| ApiError::internal(error.to_string()))?
-            .map_err(|error| ApiError::forbidden(error.to_string()))?;
+            .map_err(|error| match error {
+                error @ nrese_store::StoreError::Forbidden(_) => {
+                    ApiError::forbidden(error.to_string())
+                }
+                error if error.is_request_error() => ApiError::bad_request(error.to_string()),
+                error => ApiError::internal(error.to_string()),
+            })?;
     let suggestions: Vec<serde_json::Value> = suggestions
         .into_iter()
         .map(|s| serde_json::json!({"iri": s.iri, "label": s.label, "score": s.score}))

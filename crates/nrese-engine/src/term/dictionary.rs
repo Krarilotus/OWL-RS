@@ -841,7 +841,8 @@ impl Dictionary {
 
     /// The string literals matching `query`, best first; the text index first takes in the
     /// terms interned since the last search.
-    pub fn text_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
+    /// Malformed or unsupported operators return [`EngineError::InvalidTextQuery`].
+    pub fn text_search(&self, query: &super::TextQuery) -> EngineResult<Vec<super::TextMatch>> {
         self.load_text(TEXT, &self.text);
         if self.text.read().covered() < self.len() {
             let mut text = self.text.write();
@@ -881,7 +882,7 @@ impl Dictionary {
             _ => None,
         };
         // Matches are entry numbers: as ids, by the entry's kind.
-        let mut matches = self.text.read().search(query, &text_of);
+        let mut matches = self.text.read().search(query, &text_of)?;
         for found in &mut matches {
             let kind = match view_key(&inner.key(found.id)) {
                 TermView::LangString { .. } => TermKind::LangString,
@@ -889,7 +890,7 @@ impl Dictionary {
             };
             found.id = TermId::new(kind, found.id).raw();
         }
-        matches
+        Ok(matches)
     }
 
     /// The vector literals nearest to `query.vector` among the first `known` entries that
@@ -973,7 +974,8 @@ impl Dictionary {
 
     /// The IRIs whose local name's words match `query`, best first; the index first takes
     /// in the IRIs interned since the last search.
-    pub fn iri_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
+    /// Malformed or unsupported operators return [`EngineError::InvalidTextQuery`].
+    pub fn iri_search(&self, query: &super::TextQuery) -> EngineResult<Vec<super::TextMatch>> {
         use rayon::prelude::*;
         self.load_text(IRI_TEXT, &self.iri_text);
         if self.iri_text.read().covered() < self.len() {
@@ -1012,11 +1014,11 @@ impl Dictionary {
             TermView::Iri(iri) => super::text::local_name_text(iri),
             _ => None,
         };
-        let mut matches = self.iri_text.read().search(query, &text_of);
+        let mut matches = self.iri_text.read().search(query, &text_of)?;
         for found in &mut matches {
             found.id = TermId::new(TermKind::Iri, found.id).raw();
         }
-        matches
+        Ok(matches)
     }
 
     /// The ids of the entries `0..limit` whose text passes `test`, sorted: one parallel

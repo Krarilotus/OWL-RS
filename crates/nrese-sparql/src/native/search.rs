@@ -39,17 +39,20 @@
 //! optional property, the query string, an optional limit on the matched literals, and
 //! `"lang:xx"` for the literals' language (other `name:value` options are ignored). The
 //! query string is read as Lucene's syntax as far as the index goes: words, phrases in
-//! double quotes, `word*` prefixes and fuzzy `word~` (two edits) or `word~1`; `AND` between
-//! words makes every word needed (else any); words after `NOT` or `-` are excluded (a phrase
-//! after them is dropped); `OR`, `+`, field names and boosts (`^`) are dropped. Without a
-//! property, a literal matches as the
-//! object of any property (Jena uses the index's default field). The score is the
-//! relevance as for `bds:` (the best match has 1), not Lucene's.
+//! double quotes, `word*` prefixes and fuzzy `word~` (two edits), `word~0` (exact),
+//! `word~1` or `word~2`. Flat AND or OR groups are supported; unconnected positive
+//! terms mean OR. NOT and `-` exclude plain words. Mixed Boolean modes, required
+//! clauses, fields, boosts, grouping and negated phrases/fuzzy/prefix terms are argument
+//! errors. Quoted punctuation is ordinary phrase text. Without a property, a literal
+//! matches as the object of any property (Jena uses the index's default field). The score
+//! is the relevance as for `bds:` (the best match has 1), not Lucene's.
 //!
 //! GraphDB's legacy Lucene predicates likewise: `?x luc:anyIndex "query"` finds the
 //! resources with a literal matching the query (Lucene's syntax as above), and
 //! `?x luc:score ?s` binds the relevance. The index name is not looked up: there is one
 //! index, over every string literal.
+
+use std::collections::HashSet;
 
 use nrese_engine::{GraphSelector, QuadPattern, TermId, TextQuery};
 use nrese_rdf::{Literal, Term, Variable, vocab::rdf};
@@ -58,6 +61,7 @@ use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_exec::IdTable;
 
 use super::{Context, GraphScope, NativeResult, Solutions};
+use crate::QueryEvaluationError;
 
 const BDS: &str = "http://www.bigdata.com/rdf/search#";
 const JENA_QUERY: &str = "http://jena.apache.org/text#query";
@@ -145,12 +149,15 @@ fn luc(triple: &TriplePattern) -> Option<&str> {
     }
 }
 
-/// The searches among `triples` and the other triple patterns; `None` if there is no
-/// search.
-pub(super) fn split(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> {
+type SearchSplit = (Vec<Search>, Vec<TriplePattern>);
+
+/// The searches and remaining patterns; `None` only when there is no search. Invalid
+/// searches stay recognised by planner guards and report their error at evaluation.
+pub(super) fn split(triples: &[TriplePattern]) -> Option<NativeResult<SearchSplit>> {
     let (mut searches, triples) = match jena(triples) {
-        Some((searches, rest)) => (searches, rest),
-        None => (Vec::new(), triples.to_vec()),
+        Ok(Some(found)) => found,
+        Ok(None) => (Vec::new(), triples.to_vec()),
+        Err(error) => return Some(Err(error)),
     };
     let jena_searches = searches.len();
     for triple in &triples {
@@ -200,83 +207,139 @@ pub(super) fn split(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<Tripl
             _ => {}
         }
     }
-    Some((searches, rest))
+    Some(Ok((searches, rest)))
 }
 
 /// The items of the RDF list `head` as the parser writes `( ... )` in a pattern
 /// (`rdf:first` and `rdf:rest` triples on blank nodes), and the indexes of those triples;
-/// `None` if `head` isn't such a list.
-fn list(head: &TermPattern, triples: &[TriplePattern]) -> Option<(Vec<TermPattern>, Vec<usize>)> {
+/// `None` if `head` isn't such a list; malformed or cyclic lists are query errors.
+fn list(
+    head: &TermPattern,
+    triples: &[TriplePattern],
+) -> NativeResult<Option<(Vec<TermPattern>, Vec<usize>)>> {
     let (mut items, mut used) = (Vec::new(), Vec::new());
-    let mut node = head.clone();
+    let mut seen = HashSet::new();
+    let mut node = head;
+    let invalid = || QueryEvaluationError::Argument("malformed text:query RDF list".into());
     loop {
-        match &node {
+        match node {
             TermPattern::NamedNode(n) if n.as_str() == rdf::NIL.as_str() => {
-                return Some((items, used));
+                return Ok(Some((items, used)));
             }
-            TermPattern::BlankNode(_) => {}
-            _ => return None,
+            TermPattern::BlankNode(b) if seen.insert(b) => {}
+            _ if items.is_empty() => return Ok(None),
+            _ => return Err(invalid().into()),
         }
-        let link = |property: &str| {
-            triples.iter().position(|t| {
-                t.subject == node
+        let mut link = |property: &str| -> NativeResult<Option<&TermPattern>> {
+            let mut value = None;
+            for (index, triple) in triples.iter().enumerate().filter(|(_, t)| {
+                &t.subject == node
                     && matches!(&t.predicate, NamedNodePattern::NamedNode(p) if p.as_str() == property)
-            })
+            }) {
+                if value.is_some_and(|value| value != &triple.object) {
+                    return Err(invalid().into());
+                }
+                value = Some(&triple.object);
+                // Identical repeated links describe the same list, but all must be consumed.
+                used.push(index);
+            }
+            Ok(value)
         };
         let (first, rest) = (link(rdf::FIRST.as_str())?, link(rdf::REST.as_str())?);
-        items.push(triples[first].object.clone());
-        used.extend([first, rest]);
-        node = triples[rest].object.clone();
+        let (first, rest) = match (first, rest) {
+            (Some(first), Some(rest)) => (first, rest),
+            (None, None) if items.is_empty() => return Ok(None),
+            _ => return Err(invalid().into()),
+        };
+        items.push(first.clone());
+        node = rest;
     }
 }
 
 /// Jena's query string as this index's query (module docs), and whether every word is
 /// needed.
-fn lucene(text: &str) -> (String, bool) {
-    let (mut out, mut all_words, mut negate_next) = (Vec::new(), false, false);
-    // Phrases stay whole: split outside double quotes only.
-    for (i, part) in text.split('"').enumerate() {
-        if i % 2 == 1 {
-            // A phrase after `-` or `NOT` is dropped: the index excludes words only.
-            if !std::mem::take(&mut negate_next) {
-                out.push(format!("\"{part}\""));
-            }
-            continue;
+fn lucene(text: &str) -> NativeResult<(String, bool)> {
+    let invalid = || QueryEvaluationError::Argument("unsupported or malformed Lucene query".into());
+    let (mut out, mut mode, mut operator) = (Vec::new(), None, None);
+    let (mut negate_next, mut positive) = (false, false);
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        // Quoted punctuation is literal text, never a field, boost or Boolean operator.
+        let phrase = rest.starts_with('"');
+        let end = if phrase {
+            rest[1..].find('"').ok_or_else(invalid)? + 2
+        } else {
+            rest.find(char::is_whitespace).unwrap_or(rest.len())
+        };
+        let (token, tail) = rest.split_at(end);
+        if !tail.is_empty() && !tail.starts_with(char::is_whitespace) {
+            return Err(invalid().into());
         }
-        for token in part.split_whitespace() {
-            match token {
-                "AND" | "&&" => all_words = true,
-                "OR" | "||" => {}
-                "NOT" | "!" | "-" => negate_next = true,
-                _ => {
-                    let negated = std::mem::take(&mut negate_next) || token.starts_with('-');
-                    let token = token.trim_start_matches(['+', '-']);
-                    // A field name and boosts go; fuzziness stays.
-                    let token = token.rsplit_once(':').map_or(token, |(_, word)| word);
-                    let token = token.split('^').next().unwrap_or_default();
-                    if !token.is_empty() {
-                        out.push(match negated {
-                            true => format!("-{token}"),
-                            false => token.to_owned(),
-                        });
-                    }
+        rest = tail.trim_start();
+        match token {
+            "AND" | "&&" | "OR" | "||" => {
+                if out.is_empty() || operator.is_some() || negate_next {
+                    return Err(invalid().into());
                 }
+                operator = Some(matches!(token, "AND" | "&&"));
+                continue;
             }
+            "NOT" | "!" | "-" => {
+                if negate_next {
+                    return Err(invalid().into());
+                }
+                negate_next = true;
+                continue;
+            }
+            _ => {}
         }
-        // A `-` right before a phrase.
-        if part.ends_with('-') {
-            negate_next = true;
+        let negated = negate_next || token.starts_with('-');
+        let operand = token
+            .strip_prefix('-')
+            .unwrap_or(token)
+            .split('~')
+            .next()
+            .unwrap_or_default();
+        if (negate_next && token.starts_with('-'))
+            || token.starts_with("--")
+            || (negated && (phrase || operator == Some(false)))
+            || (!phrase && matches!(operand, "AND" | "OR" | "NOT"))
+            || (!phrase
+                && token.contains([
+                    ':', '^', '(', ')', '[', ']', '{', '}', '+', '!', '&', '|', '/', '\\', '"',
+                ]))
+        {
+            return Err(invalid().into());
         }
+        // Implicit OR between positive clauses cannot be mixed with explicit AND.
+        let link = operator
+            .take()
+            .or_else(|| (positive && (!negated || mode != Some(true))).then_some(false));
+        if let Some(link) = link {
+            if mode.is_some_and(|mode| mode != link) {
+                return Err(invalid().into());
+            }
+            mode = Some(link);
+        }
+        positive |= !negated;
+        out.push(if std::mem::take(&mut negate_next) {
+            format!("-{token}")
+        } else {
+            token.to_owned()
+        });
     }
-    (out.join(" "), all_words)
+    if operator.is_some() || negate_next {
+        return Err(invalid().into());
+    }
+    Ok((out.join(" "), mode.unwrap_or(false)))
 }
 
 /// The `text:query` patterns among `triples` as searches, each with the triple pattern
 /// that joins its literal to the subject (`?s <property> ?literal`), and the other triple
 /// patterns; `None` if there is none.
-fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> {
+fn jena(triples: &[TriplePattern]) -> NativeResult<Option<SearchSplit>> {
     if !triples.iter().any(is_jena) {
-        return None;
+        return Ok(None);
     }
     let (mut searches, mut joins, mut consumed) = (Vec::new(), Vec::new(), Vec::new());
     for (index, triple) in triples.iter().enumerate().filter(|(_, t)| is_jena(t)) {
@@ -287,14 +350,17 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
             _ => None,
         };
         // The subject: ?s, or (?s ?score ?literal ?graph ?property).
-        let (outputs, used) = match list(&triple.subject, triples) {
+        let (outputs, used) = match list(&triple.subject, triples)? {
             Some(found) => found,
             None => (vec![triple.subject.clone()], Vec::new()),
         };
         consumed.extend(used);
-        let subject = outputs.first().cloned()?;
+        let subject = outputs
+            .first()
+            .cloned()
+            .ok_or_else(|| QueryEvaluationError::Argument("text:query needs a subject".into()))?;
         // The object: "query", or (property? "query" limit? "name:value"*).
-        let (arguments, used) = match list(&triple.object, triples) {
+        let (arguments, used) = match list(&triple.object, triples)? {
             Some(found) => found,
             None => (vec![triple.object.clone()], Vec::new()),
         };
@@ -309,9 +375,11 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
             _ => None,
         };
         let Some(TermPattern::Literal(text)) = arguments.next() else {
-            return None;
+            return Err(
+                QueryEvaluationError::Argument("text:query needs a query literal".into()).into(),
+            );
         };
-        let (text, all_words) = lucene(text.value());
+        let (text, all_words) = lucene(text.value())?;
         let literal = outputs
             .get(2)
             .and_then(variable)
@@ -360,7 +428,7 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
         .map(|(_, t)| t.clone())
         .chain(joins)
         .collect();
-    Some((searches, rest))
+    Ok(Some((searches, rest)))
 }
 
 impl Context<'_> {
@@ -395,7 +463,12 @@ impl Context<'_> {
         vars.extend(search.rank.iter().cloned());
         let mut table = IdTable::new(vars.len());
         let mut rank = 0usize;
-        for found in self.snapshot.text_search(&search.query) {
+        let matches = self
+            .snapshot
+            .text_search(&search.query)
+            .map_err(QueryEvaluationError::from)?;
+        for found in matches {
+            self.check()?;
             if search
                 .min_relevance
                 .is_some_and(|min| found.relevance < min)

@@ -1218,7 +1218,8 @@ impl StoreService {
             read_model(infer),
             typed,
             limit,
-        ))
+        )
+        .map_err(nrese_sparql::QueryEvaluationError::from)?)
     }
 
     /// The named graphs `scope` reads (RDF4J's `/contexts`).
