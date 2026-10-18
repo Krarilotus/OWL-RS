@@ -6583,3 +6583,40 @@ fn paths_ordered_with_patterns_equal_the_reference() {
         "{planned} of {checked} planned with their paths, a path first in {path_first}"
     );
 }
+
+/// A sequence path is two steps joined on a fresh blank node: evaluated as a set (DISTINCT,
+/// COUNT(DISTINCT)), the join kept that blank node's column. Without it the path's other
+/// end's values came back as answers (found by the count tests' seed 4).
+#[test]
+fn sequence_paths_keep_their_join_in_sets() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (s, p, o) in [
+        ("a", "p2", "b"),
+        ("b", "p1", "c"),
+        ("c", "q", "d"),
+        ("x", "p2", "y"),
+        ("x", "q", "d"),
+        ("z", "p1", "x"),
+        ("a", "q", "d"),
+    ] {
+        tx.insert(Quad::new(ex(s), ex(p), ex(o), GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for text in [
+        format!("SELECT DISTINCT ?v0 WHERE {{ ?v1 <{EX}p2>/<{EX}p1>+ ?v0 . ?v0 <{EX}q> ?w }}"),
+        format!(
+            "SELECT (COUNT(DISTINCT ?v0) AS ?n) WHERE {{ ?v1 <{EX}p2>/<{EX}p1>+ ?v0 . ?v0 <{EX}q> ?w }}"
+        ),
+        format!(
+            "SELECT DISTINCT ?v0 WHERE {{ ?v1 <{EX}p2>/<{EX}p1>+ ?v0 . {{ ?v0 <{EX}q> ?w }} UNION {{ ?v0 <{EX}p1> ?u }} }}"
+        ),
+    ] {
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let options = QueryOptions::default();
+        let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+        assert_eq!(native, expected, "{text}");
+    }
+}
