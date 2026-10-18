@@ -38,6 +38,6 @@ pub use nrese_vector as vector;
 pub use quad::{EncodedQuad, EncodedTriple, GraphSelector, QuadPattern};
 pub use term::vocabulary::{VocabularyEncoding, set_vocabulary_encoding};
 pub use term::{
-    Dictionary, DictionaryStats, Placement, StringTest, TermId, TermKind, TermView, TextMatch,
-    TextQuery, VectorQuery, VectorSearchReport, VectorStrategy,
+    Dictionary, DictionaryStats, Placement, StringScan, StringTest, TermId, TermKind, TermView,
+    TextMatch, TextQuery, VectorQuery, VectorSearchReport, VectorStrategy,
 };
