@@ -3,7 +3,7 @@
 # runs, warmup, batch: the perf lab's a process; repeat: the DL tool's files a process; passes: a side
 # (round 0), for 90% power against a 2% loss at the case's noise (the largest
 # sd of log pass medians of its series where that loss exceeds the resolution); power: at those passes;
-# seconds: a pass's. Timed part 149.7 min (budget 150.0, passes at most 10).
+# seconds: a pass's. Timed part 149.8 min (budget 150.0, passes at most 6).
 
 [case.alloc-load]
 noise = 0.0142
@@ -12,9 +12,10 @@ seconds = 4.9
 power = 0.45
 
 [case.alloc-lubm10]
+repeat = 2
 noise = 0.0315
 passes = 4
-seconds = 3.4
+seconds = 6.8
 power = 0.056
 
 [case.bsbm-bi-100m]
@@ -49,9 +50,9 @@ power = 0.007
 
 [case.classify-store-tableau]
 noise = 0.0079
-passes = 10
+passes = 6
 seconds = 0.9
-power = 0.98
+power = 0.95
 
 [case.clients-lookups]
 noise = 0.0
@@ -78,9 +79,10 @@ seconds = 0.7
 power = 1.0
 
 [case.commits-readers]
+repeat = 5
 noise = 0.0266
 passes = 4
-seconds = 1.3
+seconds = 6.5
 power = 0.088
 
 [case.ctx-ore-2738]
@@ -109,9 +111,9 @@ power = 1.0
 
 [case.custom-tc]
 noise = 0.0062
-passes = 4
+passes = 6
 seconds = 1.6
-power = 0.991
+power = 0.993
 
 [case.deletes-clique]
 noise = 0.004
@@ -170,9 +172,9 @@ power = 0.003
 
 [case.dl-transitive]
 noise = 0.0209
-passes = 8
+passes = 6
 seconds = 3.8
-power = 0.197
+power = 0.175
 
 [case.dl-transitive-400]
 noise = 0.0
@@ -181,10 +183,11 @@ seconds = 118.0
 power = 1.0
 
 [case.dlmode-commits]
+repeat = 5
 noise = 0.0129
-passes = 10
-seconds = 0.9
-power = 0.689
+passes = 4
+seconds = 4.3
+power = 0.553
 
 [case.dlmode-lubm1]
 runs = 635
@@ -197,16 +200,18 @@ seconds = 3.5
 power = 0.003
 
 [case.dlmode-reject]
+repeat = 5
 noise = 0.0112
-passes = 10
-seconds = 0.1
-power = 0.842
+passes = 6
+seconds = 0.7
+power = 0.727
 
 [case.dlmode-reject-dl]
+repeat = 5
 noise = 0.0248
-passes = 8
-seconds = 0.4
-power = 0.109
+passes = 4
+seconds = 2.0
+power = 0.096
 
 [case.el-classify]
 noise = 0.0499
@@ -221,34 +226,39 @@ seconds = 1.4
 power = 0.017
 
 [case.eq-cascade-16]
+repeat = 5
 noise = 0.0216
-passes = 8
-seconds = 0.5
-power = 0.174
+passes = 6
+seconds = 2.7
+power = 0.146
 
 [case.eq-cascade-4]
+repeat = 5
 noise = 0.0175
-passes = 10
-seconds = 1.1
-power = 0.357
+passes = 6
+seconds = 5.4
+power = 0.327
 
 [case.eq-giant-split]
+repeat = 2
 noise = 0.0102
 passes = 4
-seconds = 3.8
+seconds = 7.7
 power = 0.769
 
 [case.eq-lubm10-one]
+repeat = 3
 noise = 0.0243
 passes = 4
-seconds = 2.3
+seconds = 6.9
 power = 0.098
 
 [case.eq-merge-compact]
+repeat = 3
 noise = 0.0111
-passes = 10
-seconds = 2.6
-power = 0.848
+passes = 4
+seconds = 7.7
+power = 0.703
 
 [case.geo-within]
 runs = 40
@@ -259,32 +269,35 @@ seconds = 6.6
 power = 0.001
 
 [case.horn-classify]
+repeat = 7
 noise = 0.1919
 passes = 4
-seconds = 1.4
+seconds = 3.4
 power = 0.001
 
 [case.horst-lubm10]
 noise = 0.0078
-passes = 4
+passes = 6
 seconds = 3.7
-power = 0.939
+power = 0.955
 
 [case.index-join-keys]
 runs = 480
 warmup = 3
+repeat = 2
 noise = 0.1154
 passes = 4
-seconds = 2.8
+seconds = 5.6
 power = 0.0
 
 [case.kernel-intersect]
 runs = 16
 warmup = 1
+repeat = 2
 noise = 0.0113
-passes = 10
-seconds = 3.9
-power = 0.837
+passes = 4
+seconds = 7.7
+power = 0.689
 
 [case.kernel-sort-u128]
 noise = 0.0124
@@ -307,9 +320,10 @@ runs = 177
 warmup = 3
 batch = 17
 batch_queries = ["q01-point-lookup", "q02-two-hop", "q03-count-type", "q05-group-born", "q07-inbound", "q08-count-all"]
+repeat = 2
 noise = 0.1
 passes = 4
-seconds = 3.4
+seconds = 6.8
 power = 0.001
 
 [case.lab-olympics]
@@ -317,9 +331,10 @@ runs = 41
 warmup = 3
 batch = 17
 batch_queries = ["q01-point-lookup", "q05-numeric-range", "q07-games-by-year", "q10-ask", "q11-count-all"]
+repeat = 3
 noise = 0.0533
 passes = 4
-seconds = 2.4
+seconds = 7.2
 power = 0.016
 
 [case.lab-yago-tiny]
@@ -344,16 +359,17 @@ power = 0.344
 runs = 800
 warmup = 3
 noise = 0.0098
-passes = 10
+passes = 6
 seconds = 5.2
-power = 0.927
+power = 0.833
 
 [case.layout-plain]
 runs = 500
 warmup = 3
+repeat = 2
 noise = 0.0191
 passes = 6
-seconds = 3.6
+seconds = 7.2
 power = 0.253
 
 [case.load-entities]
@@ -375,15 +391,17 @@ seconds = 2.4
 power = 1.0
 
 [case.mem-load-2g]
+repeat = 5
 noise = 0.0121
-passes = 10
-seconds = 2.6
-power = 0.765
+passes = 6
+seconds = 3.2
+power = 0.653
 
 [case.mem-reason-2g]
+repeat = 2
 noise = 0.0341
 passes = 4
-seconds = 3.1
+seconds = 6.3
 power = 0.038
 
 [case.mem-reason-lubm100-2g]
@@ -396,25 +414,25 @@ power = 1.0
 runs = 300
 warmup = 3
 noise = 0.011
-passes = 10
+passes = 4
 seconds = 6.3
-power = 0.854
+power = 0.71
 
 [case.op-dates]
 runs = 500
 warmup = 3
 noise = 0.0218
-passes = 8
+passes = 6
 seconds = 5.0
-power = 0.167
+power = 0.138
 
 [case.op-group]
 runs = 300
 warmup = 3
 noise = 0.0087
-passes = 8
+passes = 6
 seconds = 6.8
-power = 0.949
+power = 0.908
 
 [case.op-negation]
 runs = 1000
@@ -436,9 +454,9 @@ power = 0.033
 runs = 400
 warmup = 3
 noise = 0.0122
-passes = 10
+passes = 4
 seconds = 9.4
-power = 0.755
+power = 0.612
 
 [case.open-first-query]
 noise = 0.0451
@@ -451,19 +469,21 @@ runs = 100
 warmup = 3
 batch = 2
 batch_queries = ["expression-depth-120", "path-alternatives-300", "subqueries-50-deep"]
+repeat = 2
 noise = 0.0117
-passes = 10
-seconds = 2.8
-power = 0.805
+passes = 6
+seconds = 5.6
+power = 0.687
 
 [case.plan-estimates]
 runs = 200
 warmup = 3
 batch = 2
 batch_queries = ["chain-posts", "values-star"]
+repeat = 2
 noise = 0.0281
 passes = 4
-seconds = 3.7
+seconds = 7.4
 power = 0.082
 
 [case.q-chain]
@@ -507,9 +527,10 @@ runs = 700
 warmup = 3
 batch = 2
 batch_queries = ["values-star"]
+repeat = 2
 noise = 0.0247
 passes = 4
-seconds = 4.0
+seconds = 7.9
 power = 0.096
 
 [case.q-snowflake]
@@ -524,9 +545,9 @@ power = 1.0
 runs = 700
 warmup = 3
 noise = 0.013
-passes = 10
+passes = 6
 seconds = 4.7
-power = 0.68
+power = 0.578
 
 [case.q-topk]
 runs = 300
@@ -537,19 +558,21 @@ seconds = 6.3
 power = 1.0
 
 [case.ql-lubm10]
+repeat = 2
 noise = 0.0104
-passes = 10
-seconds = 2.9
-power = 0.889
+passes = 4
+seconds = 5.9
+power = 0.754
 
 [case.ql-owl2bench]
 runs = 873
 warmup = 3
 batch = 17
 batch_queries = ["q03", "q04", "q05", "q06", "q07", "q08", "q09", "q10", "q11", "q13", "q14", "q15", "q16", "q17", "q18", "q19", "q20", "q21", "q22"]
+repeat = 5
 noise = 0.1055
 passes = 4
-seconds = 4.4
+seconds = 5.5
 power = 0.0
 
 [case.rdf12-annotations]
@@ -561,27 +584,30 @@ seconds = 7.2
 power = 0.003
 
 [case.rdf12-join-2g]
+repeat = 4
 noise = 0.1128
 passes = 4
-seconds = 1.9
+seconds = 7.6
 power = 0.0
 
 [case.rdfs-full-lubm10]
+repeat = 3
 noise = 0.03
 passes = 4
-seconds = 2.5
+seconds = 7.6
 power = 0.067
 
 [case.rdfs-hierarchy]
 noise = 0.0078
-passes = 4
+passes = 6
 seconds = 1.9
-power = 0.939
+power = 0.955
 
 [case.rdfs-plus-lubm10]
+repeat = 2
 noise = 0.0161
 passes = 6
-seconds = 3.6
+seconds = 7.3
 power = 0.39
 
 [case.reopen-dbpedia]
@@ -603,10 +629,11 @@ seconds = 1.7
 power = 1.0
 
 [case.rl-fed-chain]
+repeat = 2
 noise = 0.0115
-passes = 10
-seconds = 3.5
-power = 0.825
+passes = 4
+seconds = 7.0
+power = 0.675
 
 [case.rl-hierarchy]
 noise = 0.0053
@@ -645,16 +672,18 @@ seconds = 2.8
 power = 0.998
 
 [case.rule-delta-sweep]
+repeat = 3
 noise = 0.0888
 passes = 4
-seconds = 2.5
+seconds = 7.4
 power = 0.003
 
 [case.rule-work-lubm10]
+repeat = 2
 noise = 0.0132
-passes = 10
-seconds = 3.0
-power = 0.661
+passes = 4
+seconds = 6.0
+power = 0.528
 
 [case.rule-work-owl2bench]
 noise = 0.002
@@ -688,17 +717,18 @@ power = 0.069
 runs = 300
 warmup = 3
 noise = 0.0093
-passes = 10
+passes = 6
 seconds = 2.0
-power = 0.96
+power = 0.875
 
 [case.vector-knn-filtered]
 runs = 300
 warmup = 3
+repeat = 3
 noise = 0.0205
-passes = 8
-seconds = 2.2
-power = 0.211
+passes = 6
+seconds = 6.7
+power = 0.192
 
 [case.watdiv-100m]
 noise = 0.0
