@@ -90,9 +90,12 @@ impl InferredMask {
     pub fn changed(&self, snapshot: &Snapshot, hide: &[EncodedQuad], show: &[EncodedQuad]) -> Self {
         let mut runs = self.runs.clone();
         if !(hide.is_empty() && show.is_empty()) {
-            let layout = snapshot.version.inferred.layout();
+            let inferred = &snapshot.version.inferred;
             runs.push(Arc::new(crate::index::run::Run::from_delta(
-                layout, show, hide,
+                inferred.layout(),
+                inferred.encoding(),
+                show,
+                hide,
             )));
         }
         Self { runs }
@@ -359,7 +362,8 @@ impl Snapshot {
         let inferred = match subset {
             InferredSubset::Without(hidden) => self.version.inferred.with_delta(&[], &hidden),
             InferredSubset::Only(kept) => {
-                crate::index::IndexVersion::from_quads(self.version.inferred.layout(), kept)
+                let inferred = &self.version.inferred;
+                crate::index::IndexVersion::from_quads(inferred.layout(), inferred.encoding(), kept)
             }
         };
         let version = Arc::new(Version {

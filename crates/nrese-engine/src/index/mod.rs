@@ -42,7 +42,7 @@ use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
 use crate::term::TermId;
 
 pub use compaction::CompactionPolicy;
-pub use keys::{IndexEncoding, set_index_encoding};
+pub use keys::IndexEncoding;
 
 /// Which quads a stack of runs may hold, and therefore which permutations it maintains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -151,14 +151,17 @@ const _: () = assert!(GROUP_PART.is_multiple_of(keys::BLOCK));
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IndexVersion {
     layout: Layout,
+    /// What runs built for this version are packed in ([`IndexEncoding`]).
+    encoding: IndexEncoding,
     runs: Arc<[Arc<Run>]>,
     len: u64,
 }
 
 impl IndexVersion {
-    pub(crate) fn empty(layout: Layout) -> Self {
+    pub(crate) fn empty(layout: Layout, encoding: IndexEncoding) -> Self {
         Self {
             layout,
+            encoding,
             ..Self::default()
         }
     }
@@ -166,7 +169,11 @@ impl IndexVersion {
     /// A version holding one base run built from packed permutations (a checkpoint): every
     /// permutation of a layout exactly once, all with the same number of keys. The layout
     /// is the one they make up.
-    pub(crate) fn from_packed(packed: Vec<(Permutation, PackedKeys)>) -> Result<Self, String> {
+    /// Runs built for it later are packed in `encoding`.
+    pub(crate) fn from_packed(
+        packed: Vec<(Permutation, PackedKeys)>,
+        encoding: IndexEncoding,
+    ) -> Result<Self, String> {
         let permutations: Vec<Permutation> = packed.iter().map(|(p, _)| *p).collect();
         let layout = Layout::of(&permutations)
             .ok_or("the checkpoint doesn't hold every permutation of a layout once")?;
@@ -181,7 +188,7 @@ impl IndexVersion {
                 tombstones: Box::default(),
             };
         }
-        Ok(Self::empty(layout).with_run(Run::from_permutations(layout, perms)))
+        Ok(Self::empty(layout, encoding).with_run(Run::from_permutations(layout, encoding, perms)))
     }
 
     /// The visible keys of `permutation` as one packed array: the run's own array when the
@@ -201,12 +208,17 @@ impl IndexVersion {
             SignedMerge::new(parts)
                 .filter(|&(_, sign)| sign > 0)
                 .map(|(key, _)| key),
+            self.encoding,
         ))
     }
 
     /// A version holding exactly the (deduplicated) `quads` in one base run.
-    pub(crate) fn from_quads(layout: Layout, quads: Vec<EncodedQuad>) -> Self {
-        Self::empty(layout).with_run(Run::from_quads(layout, quads))
+    pub(crate) fn from_quads(
+        layout: Layout,
+        encoding: IndexEncoding,
+        quads: Vec<EncodedQuad>,
+    ) -> Self {
+        Self::empty(layout, encoding).with_run(Run::from_quads(layout, encoding, quads))
     }
 
     /// Number of visible quads. O(1).
@@ -218,6 +230,10 @@ impl IndexVersion {
         self.layout
     }
 
+    pub(crate) fn encoding(&self) -> IndexEncoding {
+        self.encoding
+    }
+
     /// `self` with the exact delta `inserts` and `deletes` appended as a run. A default-graph
     /// stack that receives a quad in a named graph turns into a quad stack first
     /// ([`with_quads_layout`](Self::with_quads_layout)).
@@ -227,7 +243,7 @@ impl IndexVersion {
             true => self.with_quads_layout(),
             false => self.clone(),
         };
-        let run = Run::from_delta(base.layout, inserts, deletes);
+        let run = Run::from_delta(base.layout, base.encoding, inserts, deletes);
         base.with_run(run)
     }
 
@@ -241,6 +257,7 @@ impl IndexVersion {
         }
         Self {
             layout: Layout::Quads,
+            encoding: self.encoding,
             runs: self
                 .runs
                 .iter()
@@ -548,6 +565,7 @@ impl IndexVersion {
         let net: i64 = extra.iter().map(|run| run.net()).sum();
         Self {
             layout: self.layout,
+            encoding: self.encoding,
             runs: self.runs.iter().chain(extra).cloned().collect(),
             len: self
                 .len
@@ -569,6 +587,7 @@ impl IndexVersion {
         let runs = self.runs.iter().cloned().chain([Arc::new(run)]).collect();
         Self {
             layout: self.layout,
+            encoding: self.encoding,
             runs,
             len,
         }
@@ -586,6 +605,7 @@ impl IndexVersion {
             .collect();
         Self {
             layout: self.layout,
+            encoding: self.encoding,
             runs,
             len: self.len,
         }
@@ -602,6 +622,7 @@ impl IndexVersion {
             .collect();
         Self {
             layout: self.layout,
+            encoding: self.encoding,
             runs,
             len: self.len,
         }

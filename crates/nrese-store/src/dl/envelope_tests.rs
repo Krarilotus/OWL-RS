@@ -29,7 +29,7 @@ fn store(filler: usize) -> Arc<StoreService> {
     use crate::{
         MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlUpdateRequest,
     };
-    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_reasoner::{ReasonerConfig, ReasoningMode};
     let store = Arc::new(
         StoreService::new(crate::StoreConfig {
             total_query_memory_bytes: 1 << 30,
@@ -39,9 +39,7 @@ fn store(filler: usize) -> Arc<StoreService> {
     );
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Dl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
     );
     let mut data = String::from(
         ":A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :B rdfs:subClassOf :D . \

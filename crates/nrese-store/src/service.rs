@@ -103,18 +103,21 @@ impl StoreService {
         runtime: std::sync::Arc<crate::Runtime>,
     ) -> StoreResult<Self> {
         config.validate()?;
-        nrese_engine::set_index_encoding(config.index_encoding);
-        nrese_engine::set_vocabulary_encoding(config.vocabulary);
         // Only switched off: on leaves what the process was started with (an operator's
         // `MIMALLOC_ALLOW_THP=0` switches them off the same way).
         if !config.huge_pages {
             nrese_exec::memory::set_transparent_huge_pages(false);
         }
         nrese_engine::memory::set_release_between_rounds(config.reasoning_release);
+        // The encodings are this store's: another store of the process may differ.
+        let defaults = EngineConfig {
+            index_encoding: config.index_encoding,
+            vocabulary: config.vocabulary,
+            ..EngineConfig::default()
+        };
         let engine = match config.mode {
-            StoreMode::InMemory => Engine::new(EngineConfig::default())?,
+            StoreMode::InMemory => Engine::new(defaults)?,
             StoreMode::OnDisk => {
-                let defaults = EngineConfig::default();
                 let engine_config = EngineConfig {
                     durability: nrese_engine::DurabilityConfig {
                         verify_on_open: config.verify_on_open,
