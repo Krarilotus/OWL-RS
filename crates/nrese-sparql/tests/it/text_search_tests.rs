@@ -5,7 +5,8 @@
 use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 use nrese_sparql::{
-    QueryEvaluationError, QueryOptions, QueryResults, evaluate_query, explain_query,
+    GraphAccess, QueryDatasetSpecification, QueryEvaluationError, QueryOptions, QueryResults,
+    evaluate_query, explain_query,
 };
 use nrese_sparql_syntax::SparqlParser;
 
@@ -540,4 +541,292 @@ fn jena_valid_lists_keep_duplicate_items_links_and_shared_tails() {
         ),
         table(&[&["2"]])
     );
+}
+
+#[test]
+fn jena_property_filters_before_literal_rank_and_preserves_join_multiplicity() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (suffix, graph) in [("", None), ("1", Some("g1")), ("2", Some("g2"))] {
+        for (subject, property, text) in [
+            ("wrong", "other", "bridge"),
+            ("first", "label", "bridge tail"),
+            ("twin", "label", "bridge tail"),
+            ("first", "other", "bridge tail"),
+            ("later", "label", "bridge tail extra extra extra"),
+        ] {
+            tx.insert(
+                Quad::new(
+                    ex(&format!("{subject}{suffix}")),
+                    ex(property),
+                    Literal::new_simple_literal(text),
+                    graph.map_or(GraphName::DefaultGraph, |g| ex(g).into()),
+                )
+                .as_ref(),
+            );
+        }
+    }
+    // Property presence elsewhere must not make the wrong literal eligible locally.
+    tx.insert(
+        Quad::new(
+            ex("secret"),
+            ex("label"),
+            Literal::new_simple_literal("bridge"),
+            ex("secret"),
+        )
+        .as_ref(),
+    );
+    tx.commit().unwrap();
+    let plain = QueryOptions::default();
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT ?l WHERE { ?l bds:search \"bridge\" ; bds:maxRank 1 }",
+            &plain
+        ),
+        table(&[&["bridge"]]),
+    );
+    let body = "?s text:query (ex:label \"bridge\" 1)";
+    assert_eq!(
+        sorted(rows(
+            &engine,
+            &format!("SELECT ?s WHERE {{ {body} }}"),
+            &plain
+        )),
+        table(&[&["first"], &["twin"]]),
+    );
+    assert_eq!(
+        sorted(rows(
+            &engine,
+            &format!("SELECT ?s WHERE {{ GRAPH ex:g1 {{ {body} }} }}"),
+            &plain
+        )),
+        table(&[&["first1"], &["twin1"]]),
+    );
+    assert_eq!(
+        sorted(rows(
+            &engine,
+            &format!("SELECT ?g ?s WHERE {{ GRAPH ?g {{ {body} }} }}"),
+            &visible_search_graphs()
+        )),
+        table(&[
+            &["g1", "first1"],
+            &["g1", "twin1"],
+            &["g2", "first2"],
+            &["g2", "twin2"]
+        ]),
+    );
+    assert_eq!(
+        sorted(rows(
+            &engine,
+            &format!("SELECT ?s FROM ex:g1 FROM ex:g2 WHERE {{ {body} }}"),
+            &plain
+        )),
+        table(&[&["first1"], &["first2"], &["twin1"], &["twin2"]]),
+    );
+    assert!(
+        rows(
+            &engine,
+            "SELECT ?s WHERE { ?s text:query (ex:missing \"bridge\" 1) }",
+            &plain
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        sorted(rows(
+            &engine,
+            "SELECT ?s WHERE { ?s text:query (ex:label \"bridge\" 2) }",
+            &plain
+        )),
+        table(&[&["first"], &["later"], &["twin"]]),
+    );
+    let mut tx = engine.transaction();
+    let triple = nrese_engine::EncodedTriple::new(
+        tx.intern(ex("inferred").as_ref().into()),
+        tx.intern(ex("label").as_ref().into()),
+        tx.intern(Literal::new_simple_literal("bridge").as_ref().into()),
+    );
+    tx.insert_inferred(triple);
+    tx.commit().unwrap();
+    let asserted = QueryOptions {
+        read_model: nrese_engine::ReadModel::Asserted,
+        ..QueryOptions::default()
+    };
+    let query = format!("SELECT ?s WHERE {{ {body} }}");
+    assert_eq!(
+        sorted(rows(&engine, &query, &asserted)),
+        table(&[&["first"], &["twin"]]),
+    );
+    assert_eq!(rows(&engine, &query, &plain), table(&[&["inferred"]]));
+}
+
+fn named_search_engine() -> Engine {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (subject, literal, graph) in [
+        ("a", "shared bridge", Some("g1")),
+        ("a2", "shared bridge", Some("g1")),
+        ("a", "shared bridge", Some("g2")),
+        ("b", "second bridge", Some("g2")),
+        // The best dictionary match must not consume the visible graphs' rank limit.
+        ("secret", "bridge", Some("secret")),
+        ("default", "default bridge", None),
+    ] {
+        tx.insert(
+            Quad::new(
+                ex(subject),
+                NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#label"),
+                Literal::new_simple_literal(literal),
+                graph.map_or(GraphName::DefaultGraph, |g| ex(g).into()),
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    engine
+}
+
+fn visible_search_graphs() -> QueryOptions {
+    QueryOptions {
+        access: Some(std::sync::Arc::new(GraphAccess {
+            graphs: vec![format!("{EX}g1"), format!("{EX}g2")],
+            ..GraphAccess::default()
+        })),
+        ..QueryOptions::default()
+    }
+}
+
+#[test]
+fn standalone_search_binds_only_allowed_named_graphs() {
+    let engine = named_search_engine();
+    let query = "SELECT ?g ?lit WHERE { GRAPH ?g { ?lit bds:search \"bridge\" } }";
+    let visible = table(&[
+        &["g1", "shared bridge"],
+        &["g2", "second bridge"],
+        &["g2", "shared bridge"],
+    ]);
+    // One literal per graph, regardless of how many statements use it in that graph.
+    let mut all = visible.clone();
+    all.push(vec!["secret".into(), "bridge".into()]);
+    assert_eq!(sorted(rows(&engine, query, &QueryOptions::default())), all);
+    assert_eq!(
+        sorted(rows(&engine, query, &visible_search_graphs())),
+        visible
+    );
+    let mut dataset = QueryDatasetSpecification::new();
+    dataset.set_available_named_graphs(vec![ex("g1").into()]);
+    let protocol = QueryOptions {
+        dataset: Some(dataset),
+        ..QueryOptions::default()
+    };
+    assert_eq!(
+        rows(&engine, query, &protocol),
+        table(&[&["g1", "shared bridge"]])
+    );
+    assert_eq!(
+        sorted(rows(
+            &engine,
+            "SELECT ?g ?lit FROM NAMED ex:g1 FROM NAMED ex:g1 FROM NAMED ex:g2 WHERE { GRAPH ?g { ?lit bds:search \"bridge\" } }",
+            &QueryOptions::default(),
+        )),
+        visible,
+    );
+    let denied = QueryOptions {
+        access: Some(std::sync::Arc::new(GraphAccess::default())),
+        ..QueryOptions::default()
+    };
+    assert!(rows(&engine, query, &denied).is_empty());
+    assert!(rows(&engine, "SELECT ?g ?lit FROM NAMED ex:missing WHERE { GRAPH ?g { ?lit bds:search \"bridge\" } }", &QueryOptions::default()).is_empty());
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT ?g ?lit WHERE { GRAPH ?g { ?lit bds:search \"bridge\" } FILTER(?g = ex:g1) }",
+            &QueryOptions::default()
+        ),
+        table(&[&["g1", "shared bridge"]]),
+    );
+    // GRAPH introduces its variable after evaluating its inner pattern.
+    assert!(
+        rows(
+            &engine,
+            "SELECT ?g ?lit WHERE { GRAPH ?g { ?lit bds:search \"bridge\" . FILTER(?g = ex:g1) } }",
+            &QueryOptions::default()
+        )
+        .is_empty()
+    );
+    // Projection keeps the bag: the same literal occurs in two allowed graphs.
+    assert_eq!(
+        sorted(rows(
+            &engine,
+            "SELECT ?lit WHERE { GRAPH ?g { ?lit bds:search \"bridge\" } }",
+            &visible_search_graphs()
+        )),
+        table(&[&["second bridge"], &["shared bridge"], &["shared bridge"]]),
+    );
+}
+
+#[test]
+fn named_search_preserves_graph_joins_and_local_ranks() {
+    let engine = named_search_engine();
+    let visible = visible_search_graphs();
+    let expected = table(&[&["g1", "a"], &["g1", "a2"], &["g2", "a"], &["g2", "b"]]);
+    for pattern in [
+        "?lit bds:search \"bridge\" . ?s rdfs:label ?lit",
+        "?s text:query \"bridge\"",
+        "?s luc:labels \"bridge\"",
+    ] {
+        let query = format!("SELECT ?g ?s WHERE {{ GRAPH ?g {{ {pattern} }} }}");
+        assert_eq!(sorted(rows(&engine, &query, &visible)), expected, "{query}");
+        let query = format!(
+            "SELECT ?g ?s FROM NAMED ex:g1 FROM NAMED ex:g2 WHERE {{ GRAPH ?g {{ {pattern} }} }}"
+        );
+        assert_eq!(
+            sorted(rows(&engine, &query, &QueryOptions::default())),
+            expected,
+            "{query}"
+        );
+    }
+    assert_eq!(
+        sorted(rows(
+            &engine,
+            "SELECT ?g ?s WHERE { GRAPH ?g { ?lit bds:search \"bridge\" } GRAPH ?g { ?s rdfs:label ?lit } }",
+            &visible
+        )),
+        expected,
+    );
+    assert_eq!(
+        sorted(rows(
+            &engine,
+            "SELECT ?g ?rank WHERE { GRAPH ?g { ?lit bds:search \"bridge\" ; bds:maxRank 1 ; bds:rank ?rank } }",
+            &visible
+        )),
+        table(&[&["g1", "1"], &["g2", "1"]]),
+    );
+    assert_eq!(
+        sorted(rows(
+            &engine,
+            "SELECT ?g WHERE { GRAPH ?g { ?s text:query (\"bridge\" 1) } }",
+            &visible
+        )),
+        table(&[&["g1"], &["g1"], &["g2"]]),
+    );
+}
+
+#[test]
+fn named_search_reused_graph_variables_must_agree() {
+    let engine = named_search_engine();
+    for pattern in [
+        "?g bds:search \"bridge\"",
+        "?lit bds:search \"bridge\" ; bds:relevance ?g",
+        "?lit bds:search \"bridge\" ; bds:rank ?g",
+        "(?s ?g) text:query \"bridge\"",
+        "(?s ?score ?g) text:query \"bridge\"",
+        "?s luc:labels \"bridge\" ; luc:score ?g",
+    ] {
+        let query = format!("SELECT * WHERE {{ GRAPH ?g {{ {pattern} }} }}");
+        assert!(
+            rows(&engine, &query, &QueryOptions::default()).is_empty(),
+            "{query}"
+        );
+    }
 }

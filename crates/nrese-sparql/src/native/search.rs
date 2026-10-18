@@ -43,9 +43,12 @@
 //! `word~1` or `word~2`. Flat AND or OR groups are supported; unconnected positive
 //! terms mean OR. NOT and `-` exclude plain words. Mixed Boolean modes, required
 //! clauses, fields, boosts, grouping and negated phrases/fuzzy/prefix terms are argument
-//! errors. Quoted punctuation is ordinary phrase text. Without a property, a literal
-//! matches as the object of any property (Jena uses the index's default field). The score
-//! is the relevance as for `bds:` (the best match has 1), not Lucene's.
+//! errors. Quoted punctuation is ordinary phrase text. The property, active graph and
+//! read model restrict eligible literals before rank limits; the join retains matching
+//! subjects. Without a property, any predicate can qualify a literal. Under `GRAPH ?g` a
+//! search runs in each named graph the query may read, its rows binding `?g`, its ranks
+//! that graph's. The score is the relevance as for `bds:` (the best match has 1), not
+//! Lucene's.
 //!
 //! GraphDB's legacy Lucene predicates likewise: `?x luc:anyIndex "query"` finds the
 //! resources with a literal matching the query (Lucene's syntax as above), and
@@ -55,7 +58,7 @@
 use std::collections::HashSet;
 
 use nrese_engine::{GraphSelector, QuadPattern, TermId, TextQuery};
-use nrese_rdf::{Literal, Term, Variable, vocab::rdf};
+use nrese_rdf::{Literal, NamedNode, Term, Variable, vocab::rdf};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use nrese_exec::IdTable;
@@ -79,6 +82,8 @@ pub(super) struct Search {
     max_rank: Option<usize>,
     /// Only literals in this language (`text:query`'s `"lang:xx"`).
     language: Option<String>,
+    /// Only literals that are objects of this property (`text:query`'s property).
+    property: Option<NamedNode>,
 }
 
 impl Search {
@@ -97,6 +102,7 @@ impl Search {
             min_rank: None,
             max_rank: None,
             language: None,
+            property: None,
         }
     }
 }
@@ -387,6 +393,7 @@ fn jena(triples: &[TriplePattern]) -> NativeResult<Option<SearchSplit>> {
         let mut search = Search::new(literal.clone(), text);
         search.query.all_words = all_words;
         search.relevance = outputs.get(1).and_then(variable);
+        search.property = property.clone();
         // GraphDB: the score is a statement on the subject.
         if luc(triple).is_some()
             && let Some(score) = triples.iter().position(|t| {
@@ -434,6 +441,12 @@ fn jena(triples: &[TriplePattern]) -> NativeResult<Option<SearchSplit>> {
 impl Context<'_> {
     /// Whether `id` is the object of a statement in the active graph.
     pub(super) fn used_as_object(&self, id: TermId) -> bool {
+        self.used_as_object_for_property(id, None)
+    }
+
+    /// Whether `id` is the object of a statement in the active graph, of `property` if
+    /// given.
+    fn used_as_object_for_property(&self, id: TermId, property: Option<TermId>) -> bool {
         let graph = match &*self.graph.borrow() {
             GraphScope::Default => GraphSelector::Exact(TermId::DEFAULT_GRAPH),
             GraphScope::Named(g) => GraphSelector::Exact(*g),
@@ -443,7 +456,7 @@ impl Context<'_> {
         };
         let pattern = QuadPattern {
             subject: None,
-            predicate: None,
+            predicate: property,
             object: Some(id),
             graph,
         };
@@ -458,6 +471,15 @@ impl Context<'_> {
     /// The literals `search` matches, with their relevance and rank.
     pub(super) fn search(&self, search: &Search) -> NativeResult<Solutions> {
         self.check()?;
+        // GRAPH ?g: one search per named graph the query may read (`search_each_graph`).
+        let each = match &*self.graph.borrow() {
+            GraphScope::Variable(variable) => Some(variable.clone()),
+            _ => None,
+        };
+        if let Some(variable) = each {
+            return self.search_each_graph(search, &variable);
+        }
+        let eligible = self.search_eligible(search);
         let mut vars = vec![search.matched.clone()];
         vars.extend(search.relevance.iter().cloned());
         vars.extend(search.rank.iter().cloned());
@@ -485,7 +507,7 @@ impl Context<'_> {
                     continue;
                 }
             }
-            if !self.used_as_object(id) {
+            if !eligible(id) {
                 continue;
             }
             rank += 1;
@@ -509,5 +531,58 @@ impl Context<'_> {
             table,
             ordered: false,
         })
+    }
+
+    /// Which literals `search` may rank, decided before its rank limits: objects of a
+    /// statement in the active graph, of its property if it names one (a property the
+    /// store doesn't know: none).
+    fn search_eligible(&self, search: &Search) -> impl Fn(TermId) -> bool + '_ {
+        let property = search
+            .property
+            .as_ref()
+            .map(|p| self.snapshot.lookup(p.as_ref().into()));
+        move |id| match property {
+            None => self.used_as_object(id),
+            Some(None) => false,
+            Some(Some(property)) => self.used_as_object_for_property(id, Some(property)),
+        }
+    }
+
+    /// `search` under `GRAPH ?variable`: in each named graph the query may read (its
+    /// dataset's, else the store's), each graph's rows binding `?variable` before filters
+    /// and joins run, ranks and rank limits that graph's. A graph, literal or score
+    /// variable reused must agree with both bindings.
+    fn search_each_graph(&self, search: &Search, variable: &Variable) -> NativeResult<Solutions> {
+        let mut graphs = self
+            .named
+            .clone()
+            .unwrap_or_else(|| self.snapshot.named_graphs().collect());
+        graphs.sort_unstable();
+        graphs.dedup();
+        let mut vars = vec![search.matched.clone()];
+        vars.extend(search.relevance.iter().cloned());
+        vars.extend(search.rank.iter().cloned());
+        if !vars.contains(variable) {
+            vars.push(variable.clone());
+        }
+        let mut all = Solutions {
+            table: IdTable::new(vars.len()),
+            vars,
+            ordered: false,
+        };
+        for graph in graphs {
+            let outer = self.graph.replace(GraphScope::Named(graph));
+            let found = self.search(search);
+            self.graph.replace(outer);
+            let found = found?;
+            let binding = self.produced(Solutions {
+                vars: vec![variable.clone()],
+                table: IdTable::from_columns(vec![vec![graph.raw()]]),
+                ordered: false,
+            })?;
+            let found = self.join(found, binding)?;
+            all = self.union(all, found)?;
+        }
+        Ok(all)
     }
 }

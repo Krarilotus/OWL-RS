@@ -68,7 +68,7 @@ SELECT ?s ?o ?score WHERE {
 | Predicate | Object |
 |---|---|
 | `bds:search` | the words (a literal); a word ending in `*` matches as a prefix; words in double quotes are a phrase, matching the literals that hold them in sequence (`"\"quick brown\" fox"`); `-word` excludes the literals that have it; `word~` or `word~2` permits two edits, `word~1` one, and `word~0` exact spelling, including when stemming is enabled; edits are insertions, deletions, substitutions or transpositions; case doesn't matter |
-| `bds:relevance` | a variable: an `xsd:double` in (0, 1], the best match 1 (BM25, normalised) |
+| `bds:relevance` | a variable: an `xsd:double` in (0, 1], BM25 normalised to the best dictionary match before graph and other visibility filters |
 | `bds:rank` | a variable: the rank by relevance, from 1 |
 | `bds:matchAllTerms "true"` | every word must occur (else any) |
 | `bds:prefixMatch "true"` | every word matches as a prefix |
@@ -79,7 +79,11 @@ The matched literal (the subject) is a simple or language-tagged string that is 
 
 Malformed fuzzy suffixes, distances outside 0–2, negated phrases or fuzzy/prefix
 terms, unclosed phrases and wildcards other than one trailing `*` are request
-errors, including on an empty store.
+errors, including on an empty store. In `GRAPH ?g`, matches bind each allowed
+named graph; the same literal in two graphs can produce two rows. Ranks and
+rank limits apply within each graph. Scoring still uses dictionary-wide statistics:
+scores are not yet isolated to the visible snapshot, graph, property or language
+corpus.
 
 The same index answers **Jena's `text:query`** (what Fuseki clients send) and **GraphDB's legacy `luc:` predicates**:
 
@@ -93,7 +97,7 @@ PREFIX luc: <http://www.ontotext.com/owlim/lucene#>
 SELECT ?x ?score WHERE { ?x luc:myIndex "tower bridge" ; luc:score ?score }
 ```
 
-`text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals and `"lang:xx"`. Without a property, a literal matches as the object of any property. Cyclic or malformed RDF argument/output lists return request errors.
+`text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals and `"lang:xx"`. The property and language restrict eligible literals before the rank limit; joining those literals to resources preserves matching subjects. Without a property, a literal matches as the object of any property. Cyclic or malformed RDF argument/output lists return request errors.
 
 `luc:` takes any index name (there is one native index over every string literal)
 and finds resources with a matching literal. Jena and `luc:` query strings accept
