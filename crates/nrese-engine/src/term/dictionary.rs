@@ -459,6 +459,10 @@ fn heap_key<'a>(bytes: &'a [u8], ends: &[u64], local: usize) -> &'a [u8] {
 #[derive(Default)]
 pub struct Dictionary {
     inner: RwLock<Inner>,
+    /// Run in each parallel part of a text index's build or a corpus walk: what a job the
+    /// part's thread steals meanwhile might do (a guard takes the locks with it).
+    #[cfg(test)]
+    pub(crate) part_hook: parking_lot::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     /// Built at the first search, extended at later ones ([`super::text`]).
     text: RwLock<super::text::TextIndex>,
     /// IRIs by the words of their local names ([`super::text::local_name_text`]), built at
@@ -839,56 +843,144 @@ impl Dictionary {
         }
     }
 
-    /// The string literals of the corpus `corpus` gives for the index matching `query`,
-    /// best first; the text index first takes in the terms interned since the last search.
+    /// Run at the start of each parallel part of a text index's build or a corpus walk
+    /// (`Snapshot::text_search_in`): in tests, what a job the part's thread steals
+    /// meanwhile might do (a guard takes the locks with it).
+    #[inline]
+    pub(crate) fn part_started(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.part_hook.lock().clone() {
+            hook();
+        }
+    }
+
+    /// Extends the full-text index of literals (`iris`: of IRIs' local names) with the
+    /// entries interned since it last looked. A large batch's texts are copied under the
+    /// entries' lock alone, then indexed on every core with no lock held, as a fragment
+    /// the index takes in under its lock ([`super::text::TextIndex::absorb`]): a part's
+    /// thread may run a job meanwhile that interns, or searches, behind a writer that
+    /// would wait for a lock held across the parts. Where another search took the batch in
+    /// first, its fragment is dropped. A small batch is indexed under the locks, on this
+    /// thread alone.
+    pub(crate) fn cover_text(&self, iris: bool) {
+        use rayon::prelude::*;
+        let (which, slot) = match iris {
+            false => (TEXT, &self.text),
+            true => (IRI_TEXT, &self.iri_text),
+        };
+        // The text an entry is found by (a literal's value, an IRI as it is: its local
+        // name is made from it with no lock held).
+        let raw = |key: Key<'_>| -> Option<String> {
+            match (iris, view_key(&key)) {
+                (false, TermView::String(value) | TermView::LangString { value, .. }) => {
+                    Some(value.to_owned())
+                }
+                (true, TermView::Iri(iri)) => Some(iri.to_owned()),
+                _ => None,
+            }
+        };
+        let words = |text: String| -> Option<String> {
+            match iris {
+                false => Some(text),
+                true => super::text::local_name_text(&text),
+            }
+        };
+        self.load_text(which, slot);
+        loop {
+            let start = slot.read().covered();
+            let end = self.len();
+            if start >= end {
+                return;
+            }
+            let stop = (start + TEXT_BATCH).min(end);
+            if stop - start < super::text::SERIAL_DOCUMENTS {
+                let mut index = slot.write();
+                if index.covered() != start {
+                    continue;
+                }
+                let inner = self.inner.read();
+                for entry in start..stop {
+                    if let Some(text) = raw(inner.key(entry)).and_then(words) {
+                        index.add(entry, &text);
+                    }
+                }
+                index.cover(stop);
+                continue;
+            }
+            let texts: Vec<(u64, String)> = {
+                let inner = self.inner.read();
+                (start..stop)
+                    .filter_map(|entry| Some((entry, raw(inner.key(entry))?)))
+                    .collect()
+            };
+            let documents: Vec<(u64, String)> = texts
+                .into_par_iter()
+                .with_min_len(super::text::BUILD_PART)
+                .filter_map(|(entry, text)| Some((entry, words(text)?)))
+                .collect();
+            let documents: Vec<(u64, &str)> = documents
+                .iter()
+                .map(|(entry, text)| (*entry, text.as_str()))
+                .collect();
+            let fragment =
+                super::text::TextIndex::fragment(start, stop, &documents, &|| self.part_started());
+            let mut index = slot.write();
+            if index.covered() == start {
+                index.absorb(fragment);
+            }
+        }
+    }
+
+    /// Takes each lock a stolen job of a search might want, exclusively, and lets go: the
+    /// entries' (interning) and the full-text indexes' (extending them). For the guards
+    /// that no search holds one across its parallel parts.
+    #[cfg(test)]
+    pub(crate) fn take_search_locks(&self) {
+        drop(self.inner.write());
+        drop(self.text.write());
+        drop(self.iri_text.write());
+    }
+
+    /// `f` of the full-text index of literals (`iris`: of IRIs' local names) as it stands,
+    /// under its lock: for work on one thread.
+    pub(crate) fn with_text_index<R>(
+        &self,
+        iris: bool,
+        f: impl FnOnce(&super::text::TextIndex) -> R,
+    ) -> R {
+        match iris {
+            false => f(&self.text.read()),
+            true => f(&self.iri_text.read()),
+        }
+    }
+
+    /// Prepares the stems of the full-text index for `query`'s language, if it stems.
+    fn prepare_stems(&self, slot: &RwLock<super::text::TextIndex>, query: &super::TextQuery) {
+        if let Some(language) = query.stem.as_deref() {
+            // The read lock goes before the write lock is taken.
+            let ready = slot.read().stems_ready(language);
+            if !ready {
+                slot.write().prepare_stems(language);
+            }
+        }
+    }
+
+    /// The string literals of `corpus` matching `query`, best first; the index covers the
+    /// corpus's entries ([`Self::cover_text`] first). One thread, under the locks.
     pub(crate) fn text_search(
         &self,
         query: &super::TextQuery,
-        corpus: &dyn Fn(&super::text::TextIndex) -> std::sync::Arc<super::text::Corpus>,
+        corpus: &super::text::Corpus,
     ) -> Vec<super::TextMatch> {
-        self.load_text(TEXT, &self.text);
-        if self.text.read().covered() < self.len() {
-            let mut text = self.text.write();
-            let inner = self.inner.read();
-            let end = inner.len();
-            // In batches, each tokenised on every core (TextIndex::extend).
-            let mut start = text.covered();
-            while start < end {
-                let stop = (start + TEXT_BATCH).min(end);
-                let keys: Vec<(u64, Key<'_>)> = (start..stop)
-                    .map(|index| (index, inner.key(index)))
-                    .collect();
-                let documents: Vec<(u64, &str)> = keys
-                    .iter()
-                    .filter_map(|(index, key)| match view_key(key) {
-                        TermView::String(value) | TermView::LangString { value, .. } => {
-                            Some((*index, value))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                text.extend(&documents);
-                start = stop;
-            }
-            text.cover(end);
-        }
-        if let Some(language) = query.stem.as_deref() {
-            // The read lock goes before the write lock is taken.
-            let ready = self.text.read().stems_ready(language);
-            if !ready {
-                self.text.write().prepare_stems(language);
-            }
-        }
-        // The corpus before the entries' lock: building it may read the whole store.
+        self.prepare_stems(&self.text, query);
         let text = self.text.read();
-        let corpus = corpus(&text);
         let inner = self.inner.read();
         let text_of = |index: u64| match view_key(&inner.key(index)) {
             TermView::String(value) | TermView::LangString { value, .. } => Some(value.to_owned()),
             _ => None,
         };
         // Matches are entry numbers: as ids, by the entry's kind.
-        let mut matches = text.search(query, &corpus, &text_of);
+        let mut matches = text.search(query, corpus, &text_of);
         for found in &mut matches {
             let kind = match view_key(&inner.key(found.id)) {
                 TermView::LangString { .. } => TermKind::LangString,
@@ -977,54 +1069,21 @@ impl Dictionary {
         self.vectors.read().memory_bytes()
     }
 
-    /// The IRIs of the corpus `corpus` gives for the index whose local name's words match
-    /// `query`, best first; the index first takes in the IRIs interned since the last search.
+    /// The IRIs of `corpus` whose local name's words match `query`, best first; the index
+    /// covers the corpus's entries ([`Self::cover_text`] first). One thread, under the locks.
     pub(crate) fn iri_search(
         &self,
         query: &super::TextQuery,
-        corpus: &dyn Fn(&super::text::TextIndex) -> std::sync::Arc<super::text::Corpus>,
+        corpus: &super::text::Corpus,
     ) -> Vec<super::TextMatch> {
-        use rayon::prelude::*;
-        self.load_text(IRI_TEXT, &self.iri_text);
-        if self.iri_text.read().covered() < self.len() {
-            let mut text = self.iri_text.write();
-            let inner = self.inner.read();
-            let end = inner.len();
-            let mut start = text.covered();
-            while start < end {
-                let stop = (start + TEXT_BATCH).min(end);
-                // The local names on every core: string work per IRI (25 M in DBpedia).
-                let inner_ref: &Inner = &inner;
-                let names: Vec<(u64, String)> = (start..stop)
-                    .into_par_iter()
-                    .filter_map(|index| match view_key(&inner_ref.key(index)) {
-                        TermView::Iri(iri) => Some((index, super::text::local_name_text(iri)?)),
-                        _ => None,
-                    })
-                    .collect();
-                let documents: Vec<(u64, &str)> = names
-                    .iter()
-                    .map(|(index, words)| (*index, words.as_str()))
-                    .collect();
-                text.extend(&documents);
-                start = stop;
-            }
-            text.cover(end);
-        }
-        if let Some(language) = query.stem.as_deref() {
-            let ready = self.iri_text.read().stems_ready(language);
-            if !ready {
-                self.iri_text.write().prepare_stems(language);
-            }
-        }
+        self.prepare_stems(&self.iri_text, query);
         let text = self.iri_text.read();
-        let corpus = corpus(&text);
         let inner = self.inner.read();
         let text_of = |index: u64| match view_key(&inner.key(index)) {
             TermView::Iri(iri) => super::text::local_name_text(iri),
             _ => None,
         };
-        let mut matches = text.search(query, &corpus, &text_of);
+        let mut matches = text.search(query, corpus, &text_of);
         for found in &mut matches {
             found.id = TermId::new(TermKind::Iri, found.id).raw();
         }
@@ -1867,6 +1926,65 @@ fn validate_key(key: &[u8]) -> EngineResult<()> {
 #[cfg(test)]
 mod tests {
     use nrese_rdf::vocab::xsd;
+
+    /// The full-text indexes' builds run their parallel parts without the dictionary's
+    /// lock or theirs: a job one of the parts' threads takes on meanwhile may intern, or
+    /// extend an index, behind a writer that would wait for the build. Here each part
+    /// takes every such lock exclusively and interns a term, as such a job would; with a
+    /// lock held across the parts, the build would never end (the guard fails after 30 s).
+    #[test]
+    fn text_index_builds_run_their_parallel_parts_without_the_lock() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dictionary = std::sync::Arc::new(Dictionary::default());
+        let documents = 3 * super::super::text::SERIAL_DOCUMENTS;
+        for i in 0..documents {
+            dictionary.intern(
+                LiteralRef::new_simple_literal(&format!("label word{} {i}", i % 97)).into(),
+            );
+            dictionary.intern(
+                NamedNodeRef::new_unchecked(&format!("http://example.com/Thing{i}")).into(),
+            );
+        }
+        let interned = std::sync::Arc::new(AtomicU64::new(0));
+        let hook: std::sync::Arc<dyn Fn() + Send + Sync> = {
+            let (dictionary, interned) = (
+                std::sync::Arc::downgrade(&dictionary),
+                std::sync::Arc::clone(&interned),
+            );
+            std::sync::Arc::new(move || {
+                let n = interned.fetch_add(1, Ordering::Relaxed);
+                let dictionary = dictionary.upgrade().expect("the dictionary");
+                dictionary.take_search_locks();
+                dictionary.intern(LiteralRef::new_simple_literal(&format!("stolen {n}")).into());
+            })
+        };
+        *dictionary.part_hook.lock() = Some(hook);
+        let (done, finished) = std::sync::mpsc::channel();
+        let building = std::sync::Arc::clone(&dictionary);
+        std::thread::spawn(move || {
+            building.cover_text(false);
+            building.cover_text(true);
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the builds ended: no lock held across their parallel parts");
+        *dictionary.part_hook.lock() = None;
+        let stolen = interned.load(Ordering::Relaxed);
+        assert!(stolen >= 2, "parts ran the hook");
+        // Every literal and every IRI indexed, the terms the parts interned too.
+        let all = |iris: bool| {
+            dictionary.with_text_index(iris, |index| {
+                let span = index.covered();
+                index
+                    .corpus(vec![u64::MAX; span.div_ceil(64) as usize], span)
+                    .documents()
+            })
+        };
+        dictionary.cover_text(false);
+        assert_eq!(all(false), documents + stolen);
+        assert_eq!(all(true), documents);
+    }
     use nrese_rdf::{BlankNodeRef, LiteralRef, NamedNodeRef};
 
     use super::*;

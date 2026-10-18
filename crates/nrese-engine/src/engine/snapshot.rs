@@ -1468,9 +1468,11 @@ impl Snapshot {
         scope: &TextScope,
         query: &crate::TextQuery,
     ) -> Vec<crate::TextMatch> {
-        self.dictionary.text_search(query, &|index| {
-            self.text_corpus(Documents::Literals, model, scope, index)
-        })
+        // The index first, then the corpus, then the search: no lock held across another's
+        // parallel parts ([`Dictionary::cover_text`](crate::Dictionary)).
+        self.dictionary.cover_text(false);
+        let corpus = self.text_corpus(Documents::Literals, model, scope);
+        self.dictionary.text_search(query, &corpus)
     }
 
     /// [`Self::text_search_in`] over every graph, asserted and inferred.
@@ -1512,9 +1514,9 @@ impl Snapshot {
         scope: &TextScope,
         query: &crate::TextQuery,
     ) -> Vec<crate::TextMatch> {
-        self.dictionary.iri_search(query, &|index| {
-            self.text_corpus(Documents::Subjects, model, scope, index)
-        })
+        self.dictionary.cover_text(true);
+        let corpus = self.text_corpus(Documents::Subjects, model, scope);
+        self.dictionary.iri_search(query, &corpus)
     }
 
     /// The full-text corpora this snapshot's engine keeps, and how many were built by a
@@ -1534,81 +1536,73 @@ impl Snapshot {
         scope: &TextScope,
         walk: bool,
     ) -> (Vec<u64>, u64, u64) {
-        let found = std::cell::RefCell::new(None);
-        self.dictionary.text_search(
-            &crate::TextQuery {
-                text: String::new(),
-                all_words: false,
-                prefix: false,
-                stem: None,
-            },
-            &|index| {
-                let corpus = match walk {
-                    true => Arc::new(self.walk_corpus(Documents::Literals, model, scope, index)),
-                    false => self.text_corpus(Documents::Literals, model, scope, index),
-                };
-                *found.borrow_mut() =
-                    Some((corpus.members(), corpus.documents(), corpus.total_words()));
-                corpus
-            },
-        );
-        found.into_inner().unwrap_or_default()
+        self.dictionary.cover_text(false);
+        let corpus = match walk {
+            true => Arc::new(self.walk_corpus(Documents::Literals, model, scope)),
+            false => self.text_corpus(Documents::Literals, model, scope),
+        };
+        (corpus.members(), corpus.documents(), corpus.total_words())
     }
 
     /// The documents of a full-text index this snapshot's reader sees in `scope`, with
-    /// their statistics from `index`; exact, kept by the statements' identity, model and
-    /// graphs ([`super::corpora`]). Derived from the nearest kept ancestor's where the
-    /// lineage has one: each term the steps since touched is probed (a member while a
-    /// statement in the scope uses it); else walked ([`Self::walk_corpus`]).
+    /// their statistics from the index (which covers them: [`Dictionary::cover_text`]
+    /// first); exact, kept by the statements' identity, model and graphs
+    /// ([`super::corpora`]). Derived from the nearest kept ancestor's where the lineage has
+    /// one: each term the steps since touched is probed (a member while a statement in the
+    /// scope still uses it); else walked ([`Self::walk_corpus`]). The probes and the walk
+    /// hold no lock of the dictionary (the walk runs on every core); only the counting
+    /// does, on this thread. Nobody waits for another's build: a search that finds one
+    /// under way builds its own and doesn't keep it.
     fn text_corpus(
         &self,
         documents: Documents,
         model: ReadModel,
         scope: &TextScope,
-        index: &crate::term::text::TextIndex,
     ) -> Arc<crate::term::text::Corpus> {
         use super::corpora::Found;
         let scope = scope.normalised();
         let store = &self.statistics.corpora;
-        let (cell, from) = match store.find(&self.version, &(documents, model, scope.clone())) {
+        let kind = (documents, model, scope.clone());
+        let (from, keep) = match store.find(&self.version, &kind) {
             Found::Kept(corpus) => return corpus,
-            Found::Build { cell, from } => (cell, from),
+            Found::Build { from, keep } => (from, keep),
         };
-        let corpus = Arc::clone(cell.get_or_init(|| {
-            let corpus = match from {
-                Some((base, touched)) => {
-                    let stored = self.stored();
-                    let span = self.version.dictionary_len;
-                    let changes: Vec<(u64, bool)> = touched
-                        .into_iter()
-                        .map(TermId::from_raw)
-                        .filter(|id| documents.holds(id.kind()) && id.payload() < span)
-                        .map(|id| (id.payload(), stored.uses(model, &scope, documents, id)))
-                        .collect();
-                    store.built(true);
-                    index.derive(&base, &changes, span)
-                }
-                None => {
-                    store.built(false);
-                    self.walk_corpus(documents, model, &scope, index)
-                }
-            };
-            Arc::new(corpus)
-        }));
-        store.bound();
+        let iris = documents == Documents::Subjects;
+        let corpus = Arc::new(match from {
+            Some((base, touched)) => {
+                let stored = self.stored();
+                let span = self.version.dictionary_len;
+                let changes: Vec<(u64, bool)> = touched
+                    .into_iter()
+                    .map(TermId::from_raw)
+                    .filter(|id| documents.holds(id.kind()) && id.payload() < span)
+                    .map(|id| (id.payload(), stored.uses(model, &scope, documents, id)))
+                    .collect();
+                store.built(true);
+                self.dictionary
+                    .with_text_index(iris, |index| index.derive(&base, &changes, span))
+            }
+            None => {
+                store.built(false);
+                self.walk_corpus(documents, model, &scope)
+            }
+        });
+        if keep {
+            store.keep(&self.version, &kind, Arc::clone(&corpus));
+        }
         corpus
     }
 
     /// The corpus by a walk over the groups of the object-first (or subject-first) index
-    /// in the documents' kinds' ranges ([`Self::mark_values`]). The statements are read
-    /// as stored: equality classes rename individuals, never literals, and an alias is
-    /// the subject of its own `sameAs` statement.
+    /// in the documents' kinds' ranges ([`Self::mark_values`]), with no lock of the
+    /// dictionary held; then counted under the index's, on this thread. The statements
+    /// are read as stored: equality classes rename individuals, never literals, and an
+    /// alias is the subject of its own `sameAs` statement.
     fn walk_corpus(
         &self,
         documents: Documents,
         model: ReadModel,
         scope: &TextScope,
-        index: &crate::term::text::TextIndex,
     ) -> crate::term::text::Corpus {
         let stored = self.stored();
         let span = self.version.dictionary_len;
@@ -1626,7 +1620,9 @@ impl Snapshot {
                 }
             }
         }
-        index.corpus(bits, span)
+        let iris = documents == Documents::Subjects;
+        self.dictionary
+            .with_text_index(iris, |index| index.corpus(bits, span))
     }
 
     /// Whether a statement in `scope`'s graphs in `model` has `id` at `documents`'
@@ -1675,6 +1671,7 @@ impl Snapshot {
             .par_chunks_mut(per)
             .enumerate()
             .map(|(i, words)| {
+                self.dictionary.part_started();
                 let first = (i * per * 64) as u64;
                 let last = first + words.len() as u64 * 64 - 1;
                 let (low, high) = (TermId::new(kind, first), TermId::new(kind, last));

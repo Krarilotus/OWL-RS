@@ -5,7 +5,10 @@
 //! varint deltas, the words in 256 shards by their first byte, so that the build runs on
 //! every core (DBpedia's 40 M terms). It is built the first time a query searches, and extended
 //! with the terms the dictionary gained since before each later search: the dictionary is
-//! append-only, so nothing indexed ever changes. Whether a literal still occurs in the data
+//! append-only, so nothing indexed ever changes. A large extension is built apart, as an
+//! index of the new documents alone (a fragment), with no lock held, and then taken in
+//! ([`TextIndex::absorb`]): a part of the parallel build may run a job that wants the
+//! dictionary or this index. Whether a literal still occurs in the data
 //! is the query's business (it joins the matches with the statements).
 //!
 //! Scores are BM25 (k1 = 1.2, b = 0.75) summed over the query's words and divided by the
@@ -163,7 +166,10 @@ pub fn words(text: &str) -> impl Iterator<Item = String> + '_ {
 const SHARDS: usize = 256;
 
 /// Documents tokenised per parallel part of a build.
-const BUILD_PART: usize = 1 << 14;
+pub(crate) const BUILD_PART: usize = 1 << 14;
+
+/// Fewer documents than this are indexed one at a time, on one thread.
+pub(crate) const SERIAL_DOCUMENTS: u64 = 2 * BUILD_PART as u64;
 
 fn shard_of(word: &str) -> usize {
     usize::from(word.as_bytes()[0])
@@ -209,6 +215,25 @@ impl Postings {
         put_varint(&mut self.bytes, u64::from(count));
         self.last = document;
         self.len += 1;
+    }
+
+    /// `other`'s documents after this one's (all numbered after them).
+    fn append(&mut self, other: Postings) {
+        if self.len == 0 {
+            *self = other;
+            return;
+        }
+        // Its first number is a delta from 0: from this one's last now.
+        let mut position = 0;
+        let first = get_varint(&other.bytes, &mut position);
+        debug_assert!(other.len == 0 || first > self.last);
+        if other.len == 0 {
+            return;
+        }
+        put_varint(&mut self.bytes, first - self.last);
+        self.bytes.extend_from_slice(&other.bytes[position..]);
+        self.last = other.last;
+        self.len += other.len;
     }
 
     /// The documents of `corpus`, with their occurrences.
@@ -333,8 +358,10 @@ pub(crate) struct TextIndex {
     covered: u64,
     /// Word → its postings, in the shard of its first byte.
     shards: Vec<BTreeMap<Box<str>, Postings>>,
-    /// Words per document, by document number (0: not indexed).
+    /// Words per document, by document number from `first` (0: not indexed).
     lengths: Vec<u16>,
+    /// The number of `lengths`' first entry: 0, but for a fragment ([`Self::fragment`]).
+    first: u64,
     documents: u64,
     total_words: u64,
     /// Distinct words so far: when it changed, the stem maps are stale.
@@ -349,6 +376,7 @@ impl Default for TextIndex {
             covered: 0,
             shards: vec![BTreeMap::new(); SHARDS],
             lengths: Vec::new(),
+            first: 0,
             documents: 0,
             total_words: 0,
             word_count: 0,
@@ -395,6 +423,7 @@ impl TextIndex {
         &self,
         out: &mut super::derived::Writer<W>,
     ) -> std::io::Result<()> {
+        debug_assert_eq!(self.first, 0, "fragments aren't written");
         out.u32(TEXT_FORMAT)?;
         out.u64(self.covered)?;
         out.u64(self.documents)?;
@@ -451,6 +480,7 @@ impl TextIndex {
             covered,
             shards,
             lengths,
+            first: 0,
             documents,
             total_words,
             word_count,
@@ -458,8 +488,62 @@ impl TextIndex {
         })
     }
 
+    /// An index of `documents` alone, the dictionary's entries `first..covered`, built on
+    /// every core ([`Self::extend`], `part` run at each parallel part's start) for
+    /// [`Self::absorb`] to take in.
+    pub(crate) fn fragment(
+        first: u64,
+        covered: u64,
+        documents: &[(u64, &str)],
+        part: &(dyn Fn() + Sync),
+    ) -> Self {
+        let mut fragment = Self {
+            first,
+            ..Self::default()
+        };
+        fragment.extend(documents, part);
+        fragment.covered = covered;
+        fragment
+    }
+
+    /// Takes in `fragment`, an index of the entries from this one's coverage on (built
+    /// apart, [`Self::fragment`]): its documents' lengths, its words' postings after
+    /// theirs, its coverage. One thread: it runs under the index's lock.
+    pub(crate) fn absorb(&mut self, fragment: TextIndex) {
+        debug_assert_eq!(fragment.first, self.covered);
+        let end = (fragment.first + fragment.lengths.len() as u64 - self.first) as usize;
+        if self.lengths.len() < end {
+            self.lengths.resize(end, 0);
+        }
+        let from = (fragment.first - self.first) as usize;
+        self.lengths[from..end].copy_from_slice(&fragment.lengths);
+        self.documents += fragment.documents;
+        self.total_words += fragment.total_words;
+        for (shard, theirs) in self.shards.iter_mut().zip(fragment.shards) {
+            for (word, postings) in theirs {
+                match shard.get_mut(&word) {
+                    Some(ours) => ours.append(postings),
+                    None => {
+                        shard.insert(word, postings);
+                        self.word_count += 1;
+                    }
+                }
+            }
+        }
+        self.covered = fragment.covered;
+    }
+
+    /// Words of document `document` (0: not indexed).
+    fn length_of(&self, document: u64) -> u16 {
+        document
+            .checked_sub(self.first)
+            .and_then(|i| self.lengths.get(i as usize))
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn record_length(&mut self, document: u64, length: u16) {
-        let i = document as usize;
+        let i = (document - self.first) as usize;
         if self.lengths.len() <= i {
             self.lengths.resize(i + 1, 0);
         }
@@ -490,9 +574,10 @@ impl TextIndex {
     }
 
     /// Indexes `documents` (numbers ascending, after every one added before): tokenised in
-    /// parallel parts, then every shard filled in parallel from the parts in order.
-    pub(crate) fn extend(&mut self, documents: &[(u64, &str)]) {
-        if documents.len() < 2 * BUILD_PART {
+    /// parallel parts, then every shard filled in parallel from the parts in order, `part`
+    /// run at each part's start. Few documents: one at a time, on this thread.
+    pub(crate) fn extend(&mut self, documents: &[(u64, &str)], part: &(dyn Fn() + Sync)) {
+        if (documents.len() as u64) < SERIAL_DOCUMENTS {
             for &(document, text) in documents {
                 self.add(document, text);
             }
@@ -501,10 +586,11 @@ impl TextIndex {
         type Part = (Vec<(u64, u16)>, Vec<Vec<(Box<str>, u64, u16)>>);
         let parts: Vec<Part> = documents
             .par_chunks(BUILD_PART)
-            .map(|part| {
-                let mut lengths = Vec::with_capacity(part.len());
+            .map(|chunk| {
+                part();
+                let mut lengths = Vec::with_capacity(chunk.len());
                 let mut by_shard: Vec<Vec<(Box<str>, u64, u16)>> = vec![Vec::new(); SHARDS];
-                for &(document, text) in part {
+                for &(document, text) in chunk {
                     let (counts, length) = tokens(text);
                     if length == 0 {
                         continue;
@@ -527,6 +613,9 @@ impl TextIndex {
             .par_iter_mut()
             .enumerate()
             .map(|(s, shard)| {
+                if s % 64 == 0 {
+                    part();
+                }
                 let mut new_words = 0;
                 for (_, by_shard) in &parts {
                     for (word, document, count) in &by_shard[s] {
@@ -548,28 +637,24 @@ impl TextIndex {
     }
 
     /// The corpus of the documents whose bits `bits` sets (a bit per number below `span`;
-    /// numbers this index has no words for are left out), with their count and words.
+    /// numbers this index has no words for are left out), with their count and words. One
+    /// thread: it runs under the index's lock.
     pub(crate) fn corpus(&self, mut bits: Vec<u64>, span: u64) -> Corpus {
-        let (documents, total_words) = bits
-            .par_iter_mut()
-            .enumerate()
-            .map(|(w, word)| {
-                let (mut documents, mut total_words) = (0u64, 0u64);
-                let mut rest = *word;
-                while rest != 0 {
-                    let bit = rest.trailing_zeros();
-                    rest &= rest - 1;
-                    match self.lengths.get(w * 64 + bit as usize) {
-                        Some(&length) if length > 0 => {
-                            documents += 1;
-                            total_words += u64::from(length);
-                        }
-                        _ => *word &= !(1 << bit),
+        let (mut documents, mut total_words) = (0u64, 0u64);
+        for (w, word) in bits.iter_mut().enumerate() {
+            let mut rest = *word;
+            while rest != 0 {
+                let bit = rest.trailing_zeros();
+                rest &= rest - 1;
+                match self.length_of(w as u64 * 64 + u64::from(bit)) {
+                    0 => *word &= !(1 << bit),
+                    length => {
+                        documents += 1;
+                        total_words += u64::from(length);
                     }
                 }
-                (documents, total_words)
-            })
-            .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+            }
+        }
         Corpus::of_bits(bits, span, documents, total_words)
     }
 
@@ -582,7 +667,7 @@ impl TextIndex {
         for &(document, member) in changes {
             let (word, bit) = ((document / 64) as usize, document % 64);
             let was = bits[word] >> bit & 1 == 1;
-            let length = self.lengths.get(document as usize).copied().unwrap_or(0);
+            let length = self.length_of(document);
             if member && !was && length > 0 {
                 bits[word] |= 1 << bit;
                 documents += 1;
@@ -688,9 +773,9 @@ impl TextIndex {
 
     /// Words per document (1 where unknown).
     fn length(&self, document: u64) -> f64 {
-        match self.lengths.get(document as usize) {
-            Some(&length) if length > 0 => f64::from(length),
-            _ => 1.0,
+        match self.length_of(document) {
+            0 => 1.0,
+            length => f64::from(length),
         }
     }
 
@@ -1068,7 +1153,7 @@ mod tests {
             .map(|(i, text)| (i as u64 * 2, text.as_str()))
             .collect();
         let mut parallel = TextIndex::default();
-        parallel.extend(&documents);
+        parallel.extend(&documents, &|| {});
         let mut sequential = TextIndex::default();
         for &(document, text) in &documents {
             sequential.add(document, text);
@@ -1094,6 +1179,77 @@ mod tests {
             assert_eq!(a, b, "{text}");
         }
         assert_eq!(parallel.word_count, sequential.word_count);
+    }
+
+    /// An index extended by a fragment built apart ([`TextIndex::absorb`]) answers as one
+    /// built document by document: postings continue across the seam, lengths and counts
+    /// add up, words new to the fragment are found.
+    #[test]
+    fn an_absorbed_fragment_equals_documents_added_one_by_one() {
+        let texts: Vec<String> = (0..80_000u64)
+            .map(|i| {
+                format!(
+                    "word{} common w{} {}",
+                    i % 1000,
+                    i % 7,
+                    if i >= 50_000 { "late" } else { "" }
+                )
+            })
+            .collect();
+        let documents: Vec<(u64, &str)> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| (i as u64 + 3, text.as_str()))
+            .collect();
+        let mut sequential = TextIndex::default();
+        for &(document, text) in &documents {
+            sequential.add(document, text);
+        }
+        sequential.cover(80_003);
+        let (early, late) = documents.split_at(10_000);
+        let mut absorbed = TextIndex::default();
+        absorbed.extend(early, &|| {});
+        absorbed.cover(10_003);
+        let parts = std::sync::atomic::AtomicUsize::new(0);
+        let count = || {
+            parts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        absorbed.absorb(TextIndex::fragment(10_003, 80_003, late, &count));
+        assert!(parts.into_inner() > 1, "built in parallel parts");
+        assert_eq!(
+            (
+                absorbed.covered,
+                absorbed.documents,
+                absorbed.total_words,
+                absorbed.word_count
+            ),
+            (
+                sequential.covered,
+                sequential.documents,
+                sequential.total_words,
+                sequential.word_count
+            )
+        );
+        let text_of = |id: u64| texts.get(id as usize - 3).cloned();
+        for text in [
+            "word7",
+            "w3 late",
+            "\"common w3\"",
+            "word99*",
+            "commn~1",
+            "late -w2",
+        ] {
+            let query = TextQuery {
+                text: text.to_owned(),
+                all_words: true,
+                prefix: false,
+                stem: None,
+            };
+            let a = absorbed.search(&query, &every(&absorbed), &text_of);
+            let b = sequential.search(&query, &every(&sequential), &text_of);
+            assert!(!a.is_empty(), "{text}");
+            assert_eq!(a, b, "{text}");
+        }
     }
 
     /// A search in a corpus scores as an index of the corpus's documents alone would: the
