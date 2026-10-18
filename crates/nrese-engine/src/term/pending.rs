@@ -161,22 +161,25 @@ pub(crate) const NEW: u64 = u64::MAX;
 
 impl Pending {
     /// Interns the keys of batch `batch` of chunk `chunk` whose entry in `indexes` is
-    /// [`NEW`] (key `i`'s bytes and hash `key(i)`), each shard locked once for the batch;
-    /// their entries take their provisional payloads. In place: arrays per key, on every
-    /// thread of a load at once, were 64 bytes a key of its peak (18 Oct 2026).
+    /// [`NEW`] (key `i`'s bytes and hash `key(i)`), each shard locked once for the batch
+    /// (in the order `by_shard`, the caller's array, holds); their entries take their
+    /// provisional payloads. In place: arrays per key, on every thread of a load at once,
+    /// were 64 bytes a key of its peak (18 Oct 2026).
     pub(crate) fn intern<'a>(
         &self,
-        chunk: u32,
-        batch: u32,
+        (chunk, batch): (u32, u32),
         indexes: &mut [u64],
+        by_shard: &mut Vec<(u16, u32)>,
         key: impl Fn(usize) -> (&'a [u8], u64),
     ) {
-        let mut by_shard: Vec<(u16, u32)> = indexes
-            .iter()
-            .enumerate()
-            .filter(|&(_, &index)| index == NEW)
-            .map(|(i, _)| (shard_of(key(i).1) as u16, i as u32))
-            .collect();
+        by_shard.clear();
+        by_shard.extend(
+            indexes
+                .iter()
+                .enumerate()
+                .filter(|&(_, &index)| index == NEW)
+                .map(|(i, _)| (shard_of(key(i).1) as u16, i as u32)),
+        );
         by_shard.sort_unstable();
         for run in by_shard.chunk_by(|a, b| a.0 == b.0) {
             let shard = run[0].0 as usize;
@@ -422,7 +425,7 @@ mod tests {
             for &b in order {
                 let batch = &words[b * 100..(b + 1) * 100];
                 let mut indexes = vec![NEW; batch.len()];
-                pending.intern(1, b as u32, &mut indexes, |k| {
+                pending.intern((1, b as u32), &mut indexes, &mut Vec::new(), |k| {
                     (&batch[k][..], hash(&batch[k]))
                 });
                 assert!(indexes.iter().all(|&index| split(index).is_some()));
@@ -454,7 +457,9 @@ mod tests {
         let long = vec![b'S'; LONG as usize + 5];
         let words: Vec<&[u8]> = vec![b"Sa", &long, b"Sb", b"", b"Sc"];
         let mut indexes = vec![NEW; words.len()];
-        pending.intern(1, 0, &mut indexes, |k| (words[k], hash(words[k])));
+        pending.intern((1, 0), &mut indexes, &mut Vec::new(), |k| {
+            (words[k], hash(words[k]))
+        });
         let adopted = pending.number(0, |_| None);
         let keys: Vec<&[u8]> = (0..adopted.len()).map(|i| adopted.key(i)).collect();
         assert_eq!(keys, words);
