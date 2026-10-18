@@ -1452,6 +1452,14 @@ fn dictionary_first_string_tests_equal_the_reference() {
         "CONTAINS(LCASE(?l), \"mi\")",
         "CONTAINS(LCASE(?l), \"k\")",
         "CONTAINS(LCASE(STR(?l)), \"semanticthing\")",
+        // Regexes of literal text, anchored or not, as the string tests.
+        "REGEX(?l, \"^wind\")",
+        "REGEX(?l, \"^Semantic Web$\")",
+        "REGEX(STR(?l), \"^1879\")",
+        "REGEX(?l, \"Web$\", \"\")",
+        "REGEX(?l, \"mantic\")",
+        "REGEX(STR(?l), \"Thing$\")",
+        "REGEX(?l, \"^filler 1\") && LANG(?l) = \"de\"",
     ] {
         for pattern in [
             format!("?s <{EX}label> ?l"),
