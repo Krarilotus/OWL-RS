@@ -67,6 +67,15 @@ each with its run record.
 
 ## OWL 2 DL (v1.5, branch `v15/dl-complete`, 12 October)
 
+**Normalisation repair (14 October):** auxiliary definitions now
+preserve every conjunct beyond the distribution cutoff. Previously a wide definition
+could name itself again and become `Q → Q`, losing entailments while classification
+reported completeness. Three direct-semantics guards fail on the old normaliser and pass
+with the repair; context-taxonomy and tableau-consistency guards also pass. NCIt and
+affected saved taxonomies still need requalification. The earlier finite-scope campaigns
+do not cover arbitrary conjunction widths; independently checked certificates keep their
+individual guarantees. Persisted RL closure semantics are unchanged.
+
 **Coverage.** Every construct OWL 2 DL has is decided by the engines; an answer is
 `unknown` only for what the specification rules out, a resource limit, or a reader
 diagnostic ([design](design/owl2-dl.md) §3, §6):
