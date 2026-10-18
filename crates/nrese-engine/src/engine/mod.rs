@@ -21,6 +21,7 @@
 
 mod bulk;
 pub mod characteristic;
+mod corpora;
 mod equality;
 mod replication;
 mod snapshot;
@@ -45,6 +46,7 @@ use crate::quad::{EncodedQuad, EncodedTriple};
 use crate::term::{Dictionary, DictionaryStats, TermId};
 
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
+pub use corpora::TextCorpusStats;
 pub use equality::Classes as EqualityClasses;
 pub use replication::LogBatch;
 pub use snapshot::{
@@ -61,6 +63,9 @@ pub struct EngineConfig {
     pub background_maintenance: bool,
     /// Used by [`Engine::open`] only.
     pub durability: DurabilityConfig,
+    /// The bytes the kept full-text corpora may hold together ([`Snapshot::text_search_in`]):
+    /// beyond, the least recently used go (`corpora`).
+    pub text_corpus_bytes: usize,
 }
 
 impl Default for EngineConfig {
@@ -69,6 +74,7 @@ impl Default for EngineConfig {
             compaction: CompactionPolicy::default(),
             background_maintenance: true,
             durability: DurabilityConfig::default(),
+            text_corpus_bytes: 256 << 20,
         }
     }
 }
@@ -103,6 +109,8 @@ pub struct EngineStats {
     pub compactions: u64,
     /// Checkpoints written since the engine started (bulk loads write one each).
     pub checkpoints: u64,
+    /// The full-text corpora kept, their bytes and budget, and how they were built.
+    pub text_corpora: TextCorpusStats,
 }
 
 /// Which statements a read sees. GraphDB calls them explicit and implicit statements.
@@ -162,6 +170,17 @@ impl CommitRecord {
                 &in_default_graph(&self.inferred_deletes),
             ),
         ]
+    }
+
+    /// The subjects and objects of the statements the record adds or removes, in either
+    /// stack: what the full-text corpora look at again (`corpora`).
+    pub(crate) fn touched(&self) -> Vec<(TermId, TermId)> {
+        let quads = self.inserts.iter().chain(&self.deletes);
+        let triples = self.inferred_inserts.iter().chain(&self.inferred_deletes);
+        quads
+            .map(|quad| (quad.subject, quad.object))
+            .chain(triples.map(|triple| (triple.subject, triple.object)))
+            .collect()
     }
 
     /// Whether the record puts a quad in a named graph: then a default-graph asserted stack
@@ -607,7 +626,7 @@ impl Engine {
         };
         let shared = Arc::new(Shared {
             dictionary,
-            statistics: Arc::default(),
+            statistics: Arc::new(statistics::Statistics::new(config.text_corpus_bytes)),
             versions: Versions {
                 current: RwLock::new(Arc::new(version)),
                 compaction_slot: Mutex::new(()),
@@ -774,6 +793,7 @@ impl Engine {
                 .compactions
                 .load(Ordering::Relaxed),
             checkpoints: self.inner.shared.checkpoints.load(Ordering::Relaxed),
+            text_corpora: self.inner.shared.statistics.corpora.stats(),
         }
     }
 }

@@ -182,10 +182,14 @@ impl Engine {
                     .chain(&record.inferred_deletes)
                     .any(|t| t.predicate == same_as)
         });
+        let touched = record.touched();
+        let corpora = std::sync::Arc::clone(&shared.statistics.corpora);
         let publish = move |current: &Version| {
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
+            let content = super::Content::fresh();
+            corpora.record(current.content, content, touched);
             Version {
-                content: super::Content::fresh(),
+                content,
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,

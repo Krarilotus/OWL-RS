@@ -166,8 +166,22 @@ impl<'e> Transaction<'e> {
                 && self.base.stack_contains(Stack::Inferred, quad)
         }));
         let base = self.base.version();
+        let content = super::Content::fresh();
+        self.engine.shared.statistics.corpora.record(
+            base.content,
+            content,
+            [
+                &asserted_inserts,
+                &asserted_deletes,
+                &inferred_inserts,
+                &inferred_deletes,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|quad| (quad.subject, quad.object)),
+        );
         let version = Version {
-            content: super::Content::fresh(),
+            content,
             asserted: base
                 .asserted
                 .with_delta(&asserted_inserts, &asserted_deletes),
@@ -497,11 +511,15 @@ impl<'e> Transaction<'e> {
         drop(latest);
         let [asserted_run, inferred_run] = record.runs(asserted_layout);
         let revision = record.revision;
+        let touched = record.touched();
+        let corpora = std::sync::Arc::clone(&shared.statistics.corpora);
         let publish = move |current: &Version| {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
+            let content = super::Content::fresh();
+            corpora.record(current.content, content, touched);
             Version {
-                content: super::Content::fresh(),
+                content,
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,

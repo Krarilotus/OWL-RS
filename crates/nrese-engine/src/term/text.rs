@@ -226,6 +226,20 @@ impl Postings {
     }
 }
 
+/// The numbers whose bits `bits` sets, ascending.
+fn ones(bits: &[u64]) -> impl Iterator<Item = u64> + '_ {
+    bits.iter().enumerate().flat_map(|(w, &word)| {
+        let mut rest = word;
+        std::iter::from_fn(move || {
+            (rest != 0).then(|| {
+                let bit = rest.trailing_zeros();
+                rest &= rest - 1;
+                w as u64 * 64 + u64::from(bit)
+            })
+        })
+    })
+}
+
 /// The documents a search ranks among (by number), with the statistics BM25 takes from
 /// them: built by the caller from what a reader sees ([`TextIndex::corpus`]).
 #[derive(Debug)]
@@ -261,6 +275,46 @@ impl Corpus {
     /// Its words, counted with repetition.
     pub fn total_words(&self) -> u64 {
         self.total_words
+    }
+
+    /// Its documents, ascending.
+    pub fn members(&self) -> Vec<u64> {
+        match &self.members {
+            Members::Sorted(sorted) => sorted.clone(),
+            Members::Bits(bits) => ones(bits).collect(),
+        }
+    }
+
+    /// Its documents as a bit per number below `span` (at least its own).
+    fn bits(&self, span: u64) -> Vec<u64> {
+        match &self.members {
+            Members::Sorted(sorted) => {
+                let mut bits = vec![0u64; span.div_ceil(64) as usize];
+                for &document in sorted {
+                    bits[(document / 64) as usize] |= 1 << (document % 64);
+                }
+                bits
+            }
+            Members::Bits(bits) => {
+                let mut bits = bits.clone();
+                bits.resize((span.div_ceil(64) as usize).max(bits.len()), 0);
+                bits
+            }
+        }
+    }
+
+    /// The representation of `documents` members whose bits `bits` sets: a sorted list
+    /// where that is smaller than a bit per number below `span`.
+    fn of_bits(bits: Vec<u64>, span: u64, documents: u64, total_words: u64) -> Self {
+        let members = match documents * 64 > span {
+            true => Members::Bits(bits),
+            false => Members::Sorted(ones(&bits).collect()),
+        };
+        Self {
+            members,
+            documents,
+            total_words,
+        }
     }
 
     /// Bytes it holds.
@@ -516,25 +570,30 @@ impl TextIndex {
                 (documents, total_words)
             })
             .reduce(|| (0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
-        // A bit per number where that is smaller than eight bytes per member.
-        let members = if documents * 64 > span {
-            Members::Bits(bits)
-        } else {
-            let mut sorted = Vec::with_capacity(documents as usize);
-            for (w, &word) in bits.iter().enumerate() {
-                let mut rest = word;
-                while rest != 0 {
-                    sorted.push(w as u64 * 64 + u64::from(rest.trailing_zeros()));
-                    rest &= rest - 1;
-                }
+        Corpus::of_bits(bits, span, documents, total_words)
+    }
+
+    /// `base` with each document of `changes` a member or not (numbers below `span`;
+    /// numbers this index has no words for stay out): its counts adjusted, not counted
+    /// again.
+    pub(crate) fn derive(&self, base: &Corpus, changes: &[(u64, bool)], span: u64) -> Corpus {
+        let mut bits = base.bits(span);
+        let (mut documents, mut total_words) = (base.documents, base.total_words);
+        for &(document, member) in changes {
+            let (word, bit) = ((document / 64) as usize, document % 64);
+            let was = bits[word] >> bit & 1 == 1;
+            let length = self.lengths.get(document as usize).copied().unwrap_or(0);
+            if member && !was && length > 0 {
+                bits[word] |= 1 << bit;
+                documents += 1;
+                total_words += u64::from(length);
+            } else if !member && was {
+                bits[word] &= !(1 << bit);
+                documents -= 1;
+                total_words -= u64::from(length);
             }
-            Members::Sorted(sorted)
-        };
-        Corpus {
-            members,
-            documents,
-            total_words,
         }
+        Corpus::of_bits(bits, span, documents, total_words)
     }
 
     /// Marks the dictionary entries below `covered` as looked at.
