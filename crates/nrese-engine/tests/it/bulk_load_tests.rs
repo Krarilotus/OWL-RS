@@ -439,3 +439,81 @@ fn bulk_loaded_terms_are_found_beside_the_others() {
         }
     }
 }
+
+/// The planner's characteristic sets are there for every query from the first one after
+/// a load or a start (docs/design/performance.md §0): planners that arrive together on a
+/// store whose sets nobody built wait for one build; a restart reads them from
+/// `derived/`, or builds them at its first query if the file is gone. Above 2^20
+/// statements, where they were built on a thread of their own while queries planned
+/// without them: DBpedia core q02 then planned by arrival, 3.3-7.5 ms against main's 2.1
+/// (release gate, 14 Oct 2026).
+#[test]
+fn characteristic_sets_are_complete_for_the_first_planners() {
+    // 330,000 subjects, each with two to four of four predicates: 1,100,000 statements.
+    let star = |i: u64| -> Vec<Quad> {
+        let subject = NamedNode::new_unchecked(format!("http://example.com/s{i}"));
+        (0..4)
+            .filter(|p| *p < 2 || !(i + p).is_multiple_of(3))
+            .map(|p| {
+                Quad::new(
+                    subject.clone(),
+                    NamedNode::new_unchecked(format!("http://example.com/p{p}")),
+                    Literal::new_typed_literal(format!("{}", i % 1000), xsd::INTEGER),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect()
+    };
+    let first_planners = |engine: &Engine| -> Vec<Option<(usize, u64, bool)>> {
+        let snapshot = engine.snapshot();
+        std::thread::scope(|scope| {
+            let planners: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        snapshot
+                            .characteristic_sets_in(ReadModel::default())
+                            .map(|sets| (sets.len(), sets.subjects(), sets.has_pairs()))
+                    })
+                })
+                .collect();
+            planners.into_iter().map(|p| p.join().unwrap()).collect()
+        })
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let expected = {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        let load = engine.bulk_load(BulkMode::Append);
+        for chunk in (0..330_000u64).collect::<Vec<_>>().chunks(10_000) {
+            load.add(&chunk.iter().flat_map(|&i| star(i)).collect::<Vec<_>>());
+        }
+        load.finish().unwrap();
+        assert!(
+            engine.snapshot().count_in(
+                ReadModel::default(),
+                &QuadPattern::in_graph(TermId::DEFAULT_GRAPH)
+            ) > 1 << 20
+        );
+        let planned = first_planners(&engine);
+        let expected = planned[0].expect("the first planners have the sets");
+        assert!(planned.iter().all(|p| *p == Some(expected)), "{planned:?}");
+        expected
+    };
+    // After a start: read from their file.
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(first_planners(&engine), vec![Some(expected); 8]);
+    drop(engine);
+    // After a start without the file: built at the first query, which waits for them.
+    for entry in std::fs::read_dir(dir.path().join("derived")).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("statistics-")
+        {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(first_planners(&engine), vec![Some(expected); 8]);
+}
