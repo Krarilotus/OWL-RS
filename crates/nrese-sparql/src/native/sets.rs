@@ -261,11 +261,23 @@ impl Context<'_> {
                 );
                 add(&mut keep, expression.iter().flat_map(expression_variables));
                 let left = self.eval_set(left, &keep)?;
-                let right = match as_path(right) {
-                    Some(path) => self.path_from(&left, &path)?,
-                    None => self.eval_set(right, &keep)?,
-                };
-                self.left_join(left, right, expression.as_ref())?
+                if left.table.is_empty() {
+                    // No right row can contribute; keep its scope, including path aliases.
+                    let mut vars = left.vars.clone();
+                    add(&mut vars, right_scope);
+                    self.consumed(left);
+                    Solutions {
+                        table: IdTable::new(vars.len()),
+                        vars,
+                        ordered: false,
+                    }
+                } else {
+                    let right = match as_path(right) {
+                        Some(path) => self.path_from(&left, &path)?,
+                        None => self.eval_set(right, &keep)?,
+                    };
+                    self.left_join(left, right, expression.as_ref())?
+                }
             }
             GraphPattern::Union { inputs } => {
                 let mut rows: Option<Solutions> = None;
