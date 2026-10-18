@@ -1007,8 +1007,9 @@ impl Snapshot {
     }
 
     /// The characteristic sets of the default graph in `model`, for estimates of star
-    /// joins ([`super::characteristic`]); `None` while they are being built for a large
-    /// graph, or where the graph's subjects have too many.
+    /// joins ([`super::characteristic`]): kept, read, or built before this returns (a
+    /// caller that arrives during a build waits for it); `None` only where the graph's
+    /// subjects have too many.
     pub fn characteristic_sets_in(
         &self,
         model: ReadModel,

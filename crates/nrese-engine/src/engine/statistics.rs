@@ -10,8 +10,10 @@
 //! per read model, until its size drifts by a quarter. Built on every core over slices
 //! of the subjects, and saved beside the checkpoint (`derived/`), so that a restart reads
 //! them instead of scanning the store again; a load builds them before it returns
-//! ([`Statistics::prepare_sets`]). Otherwise built at once for up to [`SYNC_SETS`]
-//! statements; beyond, on a thread of their own, while queries plan without them.
+//! ([`Statistics::prepare_sets`]). Otherwise the first planner that needs them builds
+//! them, and planners that arrive meanwhile wait for that build: no query is planned
+//! without them because of when it came (a plan that depends on arrival is unstable:
+//! DBpedia core q02 ran 3.3-7.5 ms beside a build on every core, 2.0 ms after one).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -23,15 +25,9 @@ use super::{ReadModel, Snapshot, Version};
 use crate::quad::{GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
 
-/// Default graphs up to this size get their characteristic sets built at once.
-const SYNC_SETS: u64 = 1 << 20;
-
-/// The characteristic sets of one read model: being built, or built at a size (`None`:
-/// there were too many to keep).
-enum Sets {
-    Building,
-    Built(Option<Arc<CharacteristicSets>>, u64),
-}
+/// The characteristic sets of one read model as built at a size (`None`: there were too
+/// many to keep).
+type Sets = (Option<Arc<CharacteristicSets>>, u64);
 
 /// Cached entries; the cache is cleared when it fills up.
 const ENTRIES: usize = 1 << 14;
@@ -54,6 +50,8 @@ pub(crate) struct Statistics {
     nodes: Mutex<Vec<NodeCount>>,
     /// Per read model, the default graph's characteristic sets.
     sets: Mutex<HashMap<ReadModel, Sets>>,
+    /// Held while the sets are built: planners that need them meanwhile wait for them.
+    building: Mutex<()>,
     /// Where they are saved and read back (`derived/` of a durable engine).
     dir: Mutex<Option<std::path::PathBuf>>,
 }
@@ -122,8 +120,10 @@ impl Statistics {
 
     /// The characteristic sets of the default graph in `model`, as of a size within a
     /// quarter of `snapshot`'s: kept, read from their file (written after a build, read
-    /// at the first use after a start), built now (small graphs) or started on a thread
-    /// of their own (`None` until they are there).
+    /// at the first use after a start), or built now. One build at a time: a planner that
+    /// arrives during it waits and takes its sets. A Rayon worker doesn't wait (the stack
+    /// it holds may be what the build waits for, as for the result cache's flights): it
+    /// scans them itself, without keeping them.
     pub(crate) fn characteristic_sets(
         self: &Arc<Self>,
         snapshot: &Snapshot,
@@ -131,40 +131,41 @@ impl Statistics {
     ) -> Option<Arc<CharacteristicSets>> {
         let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
         let size = snapshot.count_in(model, &pattern);
-        {
-            let mut sets = self.sets.lock();
-            match sets.get(&model) {
-                Some(Sets::Built(built, at)) if size.abs_diff(*at) <= at / 4 => {
-                    return built.clone();
-                }
-                Some(Sets::Building) => return None,
-                None => {
-                    if let Some((built, at)) = self.load_sets(snapshot, model)
-                        && size.abs_diff(at) <= at / 4
-                    {
-                        sets.insert(model, Sets::Built(built.clone(), at));
-                        return built;
-                    }
-                }
-                _ => {}
+        if let Some(kept) = self.kept_sets(snapshot, model, size) {
+            return kept;
+        }
+        let building = match rayon::current_thread_index() {
+            Some(_) => self.building.try_lock(),
+            None => Some(self.building.lock()),
+        };
+        let Some(_building) = building else {
+            return Self::scan_sets(snapshot, model);
+        };
+        if let Some(kept) = self.kept_sets(snapshot, model, size) {
+            return kept;
+        }
+        self.build_sets(snapshot, model, size)
+    }
+
+    /// The sets of `model` kept for a size within a quarter of `size`, or read from their
+    /// file if none are kept.
+    fn kept_sets(
+        &self,
+        snapshot: &Snapshot,
+        model: ReadModel,
+        size: u64,
+    ) -> Option<Option<Arc<CharacteristicSets>>> {
+        let mut sets = self.sets.lock();
+        match sets.get(&model) {
+            Some((built, at)) => (size.abs_diff(*at) <= at / 4).then(|| built.clone()),
+            None => {
+                let (built, at) = self.load_sets(snapshot, model)?;
+                (size.abs_diff(at) <= at / 4).then(|| {
+                    sets.insert(model, (built.clone(), at));
+                    built
+                })
             }
-            if size > SYNC_SETS {
-                sets.insert(model, Sets::Building);
-            }
         }
-        if size <= SYNC_SETS {
-            return self.build_sets(snapshot, model, size);
-        }
-        let (statistics, snapshot) = (Arc::clone(self), snapshot.clone());
-        let started = std::thread::Builder::new()
-            .name("nrese-statistics".to_owned())
-            .spawn(move || {
-                statistics.build_sets(&snapshot, model, size);
-            });
-        if started.is_err() {
-            self.sets.lock().remove(&model);
-        }
-        None
     }
 
     /// Builds the characteristic sets of `model` now, whatever the size, keeps and saves
@@ -173,40 +174,19 @@ impl Statistics {
     pub(crate) fn prepare_sets(self: &Arc<Self>, snapshot: &Snapshot, model: ReadModel) {
         let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
         let size = snapshot.count_in(model, &pattern);
+        let _building = self.building.lock();
         self.build_sets(snapshot, model, size);
     }
 
-    /// The sets of `model` from two scans in subject order, each on every core over slices
-    /// of the subjects; kept as built at `size` and saved.
+    /// The sets of `model` scanned, kept as built at `size` and saved; under `building`.
     fn build_sets(
         &self,
         snapshot: &Snapshot,
         model: ReadModel,
         size: u64,
     ) -> Option<Arc<CharacteristicSets>> {
-        use rayon::prelude::*;
         let started = std::time::Instant::now();
-        let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
-        let ranges = subject_ranges(
-            snapshot.dictionary_len(),
-            rayon::current_num_threads() as u64 * 4,
-        );
-        let scan = |&(low, high): &(TermId, TermId)| {
-            snapshot.scan_range_in(model, &pattern, Permutation::Gspo, low, high)
-        };
-        let built = (|| {
-            let parts: Option<Vec<Partial>> = ranges
-                .par_iter()
-                .map(|range| scan(range).and_then(Partial::of))
-                .collect();
-            let sets = CharacteristicSets::merge(parts?)?;
-            // The pairs need each subject's set first: a second scan.
-            let scans: Option<Vec<_>> = ranges.iter().map(scan).collect();
-            Some(Arc::new(match scans {
-                Some(scans) => sets.with_pairs_of(scans),
-                None => sets,
-            }))
-        })();
+        let built = Self::scan_sets(snapshot, model);
         tracing::debug!(
             ?model,
             statements = size,
@@ -216,10 +196,33 @@ impl Statistics {
             "characteristic sets built"
         );
         self.save_sets(snapshot, model, size, built.as_deref());
-        self.sets
-            .lock()
-            .insert(model, Sets::Built(built.clone(), size));
+        self.sets.lock().insert(model, (built.clone(), size));
         built
+    }
+
+    /// The sets of `model` from two scans in subject order, each on every core over slices
+    /// of the subjects.
+    fn scan_sets(snapshot: &Snapshot, model: ReadModel) -> Option<Arc<CharacteristicSets>> {
+        use rayon::prelude::*;
+        let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
+        let ranges = subject_ranges(
+            snapshot.dictionary_len(),
+            rayon::current_num_threads() as u64 * 4,
+        );
+        let scan = |&(low, high): &(TermId, TermId)| {
+            snapshot.scan_range_in(model, &pattern, Permutation::Gspo, low, high)
+        };
+        let parts: Option<Vec<Partial>> = ranges
+            .par_iter()
+            .map(|range| scan(range).and_then(Partial::of))
+            .collect();
+        let sets = CharacteristicSets::merge(parts?)?;
+        // The pairs need each subject's set first: a second scan.
+        let scans: Option<Vec<_>> = ranges.iter().map(scan).collect();
+        Some(Arc::new(match scans {
+            Some(scans) => sets.with_pairs_of(scans),
+            None => sets,
+        }))
     }
 
     /// Where the derived files are (a durable engine's `derived/`).
