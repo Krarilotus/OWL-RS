@@ -382,7 +382,7 @@ impl StoreService {
     }
 
     /// What this store's updates are evaluated with.
-    fn update_context<'a>(
+    pub(crate) fn update_context<'a>(
         &'a self,
         cancellation: &'a CancellationToken,
     ) -> crate::mutation::command::UpdateContext<'a> {
