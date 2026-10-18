@@ -11,6 +11,12 @@
 # - RDF Dataset Canonicalization (w3c/rdf-canon) into .cache/rdf-canon
 set -euo pipefail
 
+# A hook's repository/index must not redirect Git operations on these fixture repositories.
+# This script is a child process; the gate keeps its own staged-index environment.
+while IFS= read -r variable; do
+  unset "$variable"
+done < <(git rev-parse --local-env-vars)
+
 CACHE="$(dirname "$0")/../.cache"
 
 # fetch <repository> <commit> <target directory> <sparse path>...
