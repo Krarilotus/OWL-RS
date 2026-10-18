@@ -4627,11 +4627,22 @@ impl<'a> Context<'a> {
         aggregates: &[(Variable, AggregateExpression)],
         having: Option<&Expression>,
     ) -> NativeResult<Solutions> {
-        // COUNT(*) of one triple pattern without GROUP BY: the index knows the answer.
+        // COUNT(*) of one triple pattern without GROUP BY, or COUNT(?v) of a variable it
+        // binds: the index knows the answer (Sparqloscope 100, `COUNT(?s)` of every
+        // statement, read all 605 M of them).
         if variables.is_empty()
-            && let [(target, AggregateExpression::CountSolutions { distinct: false })] = aggregates
+            && let [(target, aggregate)] = aggregates
             && let GraphPattern::Bgp { patterns } = inner
             && let [triple] = patterns.as_slice()
+            && match aggregate {
+                AggregateExpression::CountSolutions { distinct: false } => true,
+                AggregateExpression::FunctionCall {
+                    name: AggregateFunction::Count,
+                    expr: Expression::Variable(v),
+                    distinct: false,
+                } => triple_variables(triple).contains(v),
+                _ => false,
+            }
             && !search::is_search(triple, patterns)
             && !self.is_spatial(triple)
         {
@@ -4644,6 +4655,28 @@ impl<'a> Context<'a> {
                 Some(scan) => self.scan(&scan, None)?.table.len() as u64,
                 None => 0,
             };
+            let mut table = IdTable::new(1);
+            table.push_row(&[self.id(&integer(count))]);
+            return Ok(Solutions {
+                vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
+        // COUNT(DISTINCT ?v) of one triple pattern: the groups of the index sorted on ?v,
+        // counted as they are walked (Sparqloscope 101 to 103, the subjects, predicates and
+        // objects of every statement, read all 605 M of them, two past 26 GB).
+        if variables.is_empty()
+            && let [(target, aggregate)] = aggregates
+            && let AggregateExpression::FunctionCall {
+                name: AggregateFunction::Count,
+                expr: Expression::Variable(key),
+                distinct: true,
+            } = aggregate
+            && let GraphPattern::Bgp { patterns } = inner
+            && let [triple] = patterns.as_slice()
+            && let Some(count) = self.distinct_count(triple, key)?
+        {
             let mut table = IdTable::new(1);
             table.push_row(&[self.id(&integer(count))]);
             return Ok(Solutions {
@@ -4782,6 +4815,49 @@ impl<'a> Context<'a> {
             _ => self.eval(inner)?,
         };
         self.group_solutions(solutions, variables, aggregates)
+    }
+
+    /// The distinct values of `key` in `triple`'s matches, from the index's groups
+    /// ([`Snapshot::distinct_count_in`]); `None` where the index can't say.
+    fn distinct_count(&self, triple: &TriplePattern, key: &Variable) -> NativeResult<Option<u64>> {
+        if self.as_written
+            || search::is_search(triple, std::slice::from_ref(triple))
+            || self.is_spatial(triple)
+        {
+            return Ok(None);
+        }
+        if !triple_variables(triple).contains(key) {
+            return Ok(None);
+        }
+        let Some(scan) = self.scan_pattern(triple) else {
+            // A constant the store doesn't know: no matches.
+            return Ok(Some(0));
+        };
+        let Some(component) = (0..3).find(|&c| scan.slots[c].is_var(key)) else {
+            return Ok(None);
+        };
+        if scan.repeats_variable() || scan.merged() || !matches!(scan.slots[3], Slot::Const(_)) {
+            return Ok(None);
+        }
+        let permutation = scan.permutation_for(Some(key));
+        if scan.first_free(permutation) != Some(component) {
+            return Ok(None);
+        }
+        let start = Instant::now();
+        let count = self
+            .snapshot
+            .distinct_count_in(self.model, &scan.quad_pattern(), permutation);
+        self.check()?;
+        if count.is_some() && self.trace.is_some() {
+            self.note(
+                "distinct count",
+                format!("{key} of {triple}: the index's groups counted"),
+                Some(1),
+                1,
+                start,
+            );
+        }
+        Ok(count)
     }
 
     /// GROUP BY over a cross product: (filters over) a join of two patterns that share no

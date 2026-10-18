@@ -1028,6 +1028,48 @@ impl Snapshot {
         Some(plan)
     }
 
+    /// The number of distinct values of the first unbound component of `pattern` in
+    /// `permutation`'s order among its matches in `model`: exact, counted while the index's
+    /// groups are walked without keeping them where one run of one stack holds the matches
+    /// and no deletion among them, else from [`Self::group_counts_in`]. `None` where that
+    /// can't answer. `COUNT(DISTINCT ?x)` of one triple pattern.
+    pub fn distinct_count_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+    ) -> Option<u64> {
+        if self.expanding(model, pattern).is_some() {
+            return None;
+        }
+        let plan = AccessPlan::in_permutation(pattern, permutation)?;
+        let bound = plan
+            .low
+            .iter()
+            .zip(&plan.high)
+            .take_while(|(l, h)| l == h)
+            .count();
+        let supported = Stack::ALL.into_iter().all(|stack| {
+            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
+        });
+        if plan.exclude_default_graph || bound >= 4 || !supported {
+            return None;
+        }
+        let with: Vec<Stack> = Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack) && self.version.stack(stack).any_plan(&plan))
+            .collect();
+        let counted = match with.as_slice() {
+            [] => Some(0),
+            [stack] => self.version.stack(*stack).count_groups(&plan, bound),
+            _ => None,
+        };
+        counted.or_else(|| {
+            self.group_counts_in(model, pattern, permutation)
+                .map(|groups| groups.len() as u64)
+        })
+    }
+
     /// For each distinct value of the first unbound component of `pattern` in `permutation`'s
     /// order, the number of matching quads in `model`, in id order. `None` if the pattern's
     /// bound components aren't a prefix of that order, or an included stack can't answer it.
