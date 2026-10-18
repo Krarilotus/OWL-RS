@@ -91,6 +91,7 @@ class ScopeLifetime(unittest.TestCase):
             namespace.update(native_dirs=lambda: {}, FAST_DATA=Path(temporary), os=os, time=__import__("time"),
                 scope_argv=lambda *_: ["scope", "--"], native=lambda command, _: command,
                 end_scope=lambda *_: None, SCOPE_PEAK=re.compile("never-match"), sys=sys, ENV={},
+                SCOPE_PRESSURE=re.compile("never-match"),
                 pinned_cpus=lambda: None,
                 subprocess=types.SimpleNamespace(run=lambda *a, **kw: completed,
                     TimeoutExpired=TimeoutError, CompletedProcess=types.SimpleNamespace))

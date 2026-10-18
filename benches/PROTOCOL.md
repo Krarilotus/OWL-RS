@@ -180,14 +180,19 @@ the gate **converts** it with `sparql/nt-numbers.py` (typed literals of the same
 every other line unchanged; the result's SHA-256 is pinned beside the freeze); a host's copy
 that isn't the freeze (phuoc-yu's is a Jena riot conversion of a regeneration) is reported as
 such. Each timed host runs one fleet job of class *exclusive* (nothing else on the host),
-passes of one repetition in the order base, main, head, head, main, base, twice: four per side.
+passes of one repetition in blocks of base, main, head, head, main, base: the first two blocks
+run every case (four passes a side), each later block only the cases whose noise needs more
+passes ([fast/measure.toml](fast/measure.toml), "Noise: reduced, not tolerated" below).
 
 **The schedule is checked, not assumed.** Every required baseline is there with as many
 passes as the head (at least four; fewer is diagnostic, never a release verdict); the passes ran
 one at a time (each ended before the next began, by their recorded nanosecond times); their
 order is a palindrome, so a drift linear in time falls on every side alike; no side runs more
-than two passes in a row. Each pass is complete, of the gate's case plan, on the clean harness
-revision at its start and end, on its side's verified binaries, one host and configuration.
+than two passes in a row. A case of later blocks keeps the same rules over the passes that ran
+it (each side as many, at least four, a palindrome), and is judged on those. Each pass is
+complete, of its block's plan, on the clean harness revision at its start and end, on its
+side's verified binaries, one host and configuration, measured by the same calibration; the
+CPU frequency policy the passes met (each pass records the host's state) is the same in all.
 
 **main's perf lab** (f9b515e8, a single file) has no `--routes`, requires `--queries`, and
 reports per query only `p50_ms`, `min_ms`, `max_ms`, no samples. Its side runs with `fast.py
@@ -263,6 +268,43 @@ A noisy series barely decides a small loss: those are a work list of their own
 tolerated. The known blockers, against main on the 14 Oct data, all stay regressions in one
 round: olympics q06-text-filter 3.74× [3.13, 4.02], yago q10-labels-en 3.50×, entities
 q06-label-prefix 4.09×, dbpedia q02-born-in-berlin 3.32×.
+
+**Noise: reduced, not tolerated** ([NOISY.md](NOISY.md); 18-19 Oct 2026). With no tolerance
+the gate's power is its noise: at 14 Oct's, a repeatable 2 % loss was caught (confirmed) at
+least 90 % of the time in a third of the series. The harness takes the noise down where it
+arises, the same for every side:
+
+- *More executions where they are cheap.* `release_gate.py calibrate` writes
+  [fast/measure.toml](fast/measure.toml) from the gate host's own passes (an A/A run: one binary
+  as every side): a perf-lab case timed by its queries runs them until about 2 s of query time a
+  process (`--runs`, at most 2,000, warm-ups 3), a DL tableau case up to 3 s of files a process
+  (`repeat`, at most 30 and 40 % of its timeout); `fast.py run --measure` applies it to every
+  side, whatever the case's own arguments say, and records it per case. A case whose runs are
+  what it measures (a first execution, a reopened store, a replayed log, a sweep, commits) is
+  left as it is. Repeated processes pool their samples.
+- *Batched timing for the microsecond cases* (`perf_lab --batch K`: a sample times K executions,
+  reported per execution to the nanosecond): a 9 µs query is nine steps of the report's
+  microsecond, alone. It needs every side's perf lab to have it (the build's `CAPABILITIES`,
+  `GATE_BATCH`): v1.5's and main's don't, so against them a series' loss below the 5 µs
+  resolution (under 250 µs, a 2 % loss) stays undecidable, and the gate whose baselines have it
+  (v2's successors against v2) batches.
+- *Passes where the noise needs them.* Each case's noise (the largest sd of log pass medians
+  among its series whose 2 % is above the resolution) sets the passes a side for 90 % power
+  against a 2 % loss, the confirm-on-rerun chain simulated as for the table above
+  (`benches/probes/gate-power.py`); every case gets four, and the passes beyond go where they buy
+  the most power a second, until the timed part's budget (150 min on phuoc-yu). Quiet cases stay
+  at four; later blocks carry the noisy ones.
+- *Host hygiene, checked and recorded per pass* (`scripts/hosts/hygiene.py`, its state at the
+  pass's start and end in the pass report, problems in the gate's report): the frequency policy
+  (driver, governor, energy preference, boost), THP, the CPU and L3/NUMA topology, others' busy
+  processes, swap, temperature. Timings are pinned to one L3 and NUMA node where the host's
+  configuration names `cpus` (office-pc: one CCD, `8-15,24-31`); each case's inputs are read
+  into the page cache before it is timed (cold runs empty it themselves); each pass runs under the
+  quiet watcher (the fleet's native jobs had none: this user's other busy processes stopped,
+  never a desktop's compositor; others' work recorded); the gate's directories carry
+  `.trackerignore` (phuoc-yu's desktop indexer reads all of `$HOME`). Settings that need root
+  (the governor, boost, THP) are recorded, never changed: phuoc-yu's is performance with boost,
+  office-pc's powersave with energy preference balance_performance (a shared host).
 
 **Trade-offs.** [release-tradeoffs.toml](release-tradeoffs.toml) is the only thing that accepts a
 loss, and only the owner adds to it: a case, a dimension, optionally the baseline, the largest

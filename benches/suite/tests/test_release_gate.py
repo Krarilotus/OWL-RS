@@ -625,6 +625,13 @@ class NoiseReduction(unittest.TestCase):
         self.assertEqual(summary["host_notes"], ["other users busy: gnome-shell (passes 1, 2, 3, 4, 5, 6, 7, 8, 9, "
                                                  "10, 11, 12)"])
         self.assertIn("## The host as the passes met it", gate_module.render(summary))
+        # A process that waited for a CPU or I/O (its scope's pressure stalls) is named.
+        ps = passes()
+        ps[8]["report"]["records"][0].update(wall_s=10.0)
+        ps[8]["report"]["records"][0]["observations"][0]["stall_ms"] = {"cpu": 900.0, "io": 3.0, "memory": 0.0}
+        self.assertEqual(run_gate(ps)["host_notes"], ["lab-olympics in pass 9 (cand) waited cpu 900 ms of 10.0 s"])
+        self.assertEqual(fast.scope_stalls_ms("x\nfast-scope-pressure cpu=1500 io=250000 memory=\n"),
+                         {"cpu": 1.5, "io": 250.0})
 
     def test_calibrate_buys_runs_where_cheap_and_passes_where_noise_needs_them_within_budget(self):
         # Power at 4 passes falls from 1 (sd 0.1 %) to 0 (sd 10 %); 16 passes hold it to 2.5 %.

@@ -129,6 +129,9 @@ FAST_DATA = Path(os.environ.get("NRESE_FAST_DATA") or Path.home() / "nrese-bench
 CONTAINER_PATH = re.compile(r"(?<![\w./:-])(/target|/fast|/data|/src|/out|/inputs|/ore)(?=/|\s|'|\"|;|$)")
 # The scope's peak, printed by the native runtime's wrapper after the command.
 SCOPE_PEAK = re.compile(r"^fast-scope-peak (\d+)$", re.M)
+# The scope's pressure stall totals (PSI, µs): time its tasks waited for a CPU, for I/O (the page
+# cache missing), for memory (reclaim). What a process met that another didn't, per case.
+SCOPE_PRESSURE = re.compile(r"^fast-scope-pressure((?: \w+=\d*)*)$", re.M)
 
 
 def native_dirs() -> dict[str, Path]:
@@ -254,7 +257,9 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     FAST_DATA.mkdir(parents=True, exist_ok=True)
     unit = f"{name}-{os.getpid()}-{int(time.monotonic() * 1000)}"
     wrapper = ('g=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); "$@"; rc=$?; '
-               'echo "fast-scope-peak $(cat "$g/memory.peak" 2>/dev/null)" >&2; exit $rc')
+               'echo "fast-scope-peak $(cat "$g/memory.peak" 2>/dev/null)" >&2; p=; '
+               'for r in cpu io memory; do p="$p $r=$(sed -n "s/^some .*total=//p" "$g/$r.pressure" 2>/dev/null)"; done; '
+               'echo "fast-scope-pressure$p" >&2; exit $rc')
     # At the cap the kernel kills the command alone (OOMPolicy=continue): the wrapper then still prints the peak.
     # Pinned (pinned_cpus) the command and all it starts stay on one L3 and NUMA node.
     cpus = pinned_cpus()
@@ -278,8 +283,10 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
             print(cleanup_error, file=sys.stderr)
     # The peak first: a record's note is the last line of stderr, the command's own.
     peaks = SCOPE_PEAK.findall(done.stderr)
-    err = SCOPE_PEAK.sub("", done.stderr).rstrip("\n")
-    err = (f"fast-scope-peak {peaks[-1]}\n" if peaks else "") + err
+    pressures = SCOPE_PRESSURE.findall(done.stderr)
+    err = SCOPE_PRESSURE.sub("", SCOPE_PEAK.sub("", done.stderr)).rstrip("\n")
+    err = ((f"fast-scope-peak {peaks[-1]}\n" if peaks else "")
+           + (f"fast-scope-pressure{pressures[-1]}\n" if pressures else "") + err)
     if cleanup_error:
         err += "\n" + cleanup_error
     return done.returncode or (1 if cleanup_error else 0), done.stdout, err, time.monotonic() - started
@@ -289,6 +296,15 @@ def scope_peak_mib(stderr: str) -> int | None:
     """The native runtime's scope peak, in MiB, if the wrapper printed it."""
     found = SCOPE_PEAK.findall(stderr or "")
     return int(found[-1]) // 1048576 if found else None
+
+
+def scope_stalls_ms(stderr: str) -> dict | None:
+    """The native runtime's pressure stalls of the scope, ms per resource, if printed."""
+    found = SCOPE_PRESSURE.findall(stderr or "")
+    if not found:
+        return None
+    pairs = (item.split("=") for item in found[-1].split())
+    return {k: round(int(v) / 1000, 1) for k, v in pairs if v.isdigit()} or None
 
 
 def binaries() -> dict:
@@ -933,7 +949,8 @@ def invocation_observation(case: dict, result: dict, stderr: str, identity: dict
             **({"throughput": levels} if levels else {}),
             "rows": {q["name"]: q.get("rows") for q in result.get("queries", []) if "name" in q},
             "phase_peaks": phases, "peak_mib": peak, "memory_kind": "lifetime" if peak else "unknown",
-            "cgroup_peak_mib": result.get("cgroup_peak_mib") or scope_peak_mib(stderr)}
+            "cgroup_peak_mib": result.get("cgroup_peak_mib") or scope_peak_mib(stderr),
+            **({"stall_ms": stalls} if (stalls := scope_stalls_ms(stderr)) else {})}
 
 
 def estimator(result: dict) -> str:

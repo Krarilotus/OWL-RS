@@ -112,6 +112,12 @@ timeout) to run once more past it, so that its record says what it needs.
 - **Repetitions:** `--reps 2` by default, interleaved: every case once, then every case
   again in an order rotated by one. Within a repetition the perf lab repeats its
   measurements (`--runs`, `--reason-runs`, `repeat`) and keeps every sample.
+- **The release gate's measurement:** `run --measure measure.toml` (written by
+  `release_gate.py calibrate` from the gate host's passes) sets each listed case's runs,
+  warm-ups and repetitions for every side alike, `--batch` its batched timing where every
+  side's perf lab has `--batch`; each case's inputs are read into the page cache first, timed
+  processes are pinned to the host configuration's `cpus`, and the report records the host's
+  state at the start and end (`host_state`, scripts/hosts/hygiene.py).
 
 ## Comparing
 
