@@ -702,41 +702,17 @@ fn equality_gives_lists_several_member_sequences() {
     assert!(violations.is_empty(), "{violations:?}");
 }
 
-/// Runs a v1 scenario (full IRIs, `_:` blank nodes) on both executors: the expected
-/// inferences must be derived, and a violation reported iff `violation` says so.
-pub(super) fn scenario(
-    data: &[(&str, &str, &str)],
-    expected: &[(&str, &str, &str)],
-    violation: Option<bool>,
-) {
+/// Runs a v1 scenario (lines of [`load`]) on both executors: the expected inferences
+/// (lines too) must be derived, and a violation reported iff `violation` says so.
+pub(super) fn scenario(data: &str, expected: &str, violation: Option<bool>) {
     let mut vocabulary = LocalVocabulary::default();
-    let term = |v: &mut LocalVocabulary, t: &str| {
-        if t.starts_with("_:") {
-            v.term(t)
-        } else {
-            v.iri(t)
-        }
-    };
-    let input: Vec<Triple> = data
-        .iter()
-        .map(|&(s, p, o)| {
-            [
-                term(&mut vocabulary, s),
-                term(&mut vocabulary, p),
-                term(&mut vocabulary, o),
-            ]
-        })
-        .collect();
+    let input = load(&mut vocabulary, data);
     let (derived, violations) = both(&mut vocabulary, &input);
-    for &(s, p, o) in expected {
-        let fact = [
-            term(&mut vocabulary, s),
-            term(&mut vocabulary, p),
-            term(&mut vocabulary, o),
-        ];
+    let lines = expected.lines().map(str::trim).filter(|l| !l.is_empty());
+    for (line, fact) in lines.zip(load(&mut vocabulary, expected)) {
         assert!(
             derived.contains(&fact) || input.contains(&fact),
-            "missing ({s}, {p}, {o})"
+            "missing {line}"
         );
     }
     if let Some(expected) = violation {
