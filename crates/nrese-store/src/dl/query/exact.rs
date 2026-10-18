@@ -159,7 +159,7 @@ pub(super) fn decide_until(
             if deadline.passed() {
                 return Entailed::Unknown(Limit::Time.reached("the deadline passed"));
             }
-            let found = compiled.check(i, &tests[i], ontology, &fresh, &budget.remaining(deadline));
+            let found = compiled.check_until(i, &tests[i], ontology, &fresh, &budget, deadline);
             match found {
                 Entailed::Yes => {}
                 other => {
