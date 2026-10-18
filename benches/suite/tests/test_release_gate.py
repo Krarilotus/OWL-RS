@@ -320,6 +320,14 @@ class Parts(unittest.TestCase):
             self.assertEqual(errors, ["SHACL-SPARQL: no counts (its kit didn't run, or its data was missing)"])
             counts["OWL 2 RL"]["skipped"] = 89
             self.assertIn("OWL 2 RL: 89 skipped, at most 3 known", gate_module.w3c_check(counts, expected))
+            # The dry run of 18 Oct 2026: two DL cases undecided are open, not failed.
+            (logs / "tableau-w3c.tsv").write_text("a\tConsistencyTest\tAL\tpass\t0\n" * 408 +
+                                                  "b\tInconsistencyTest\tAL\tdisputed\t0\n" +
+                                                  "c\tPositiveEntailmentTest\tAL\topen\t0\tunsupported\n" * 2)
+            dl = gate_module.w3c_counts(logs)["OWL 2 DL"]
+            self.assertEqual((dl["passed"], dl["open"], dl["failed"]), (408, 2, 0))
+            errors = gate_module.w3c_check({"OWL 2 DL": dl}, {"OWL 2 DL": expected["OWL 2 DL"]})
+            self.assertEqual(errors, ["OWL 2 DL: 408 passed, at least 410 required", "OWL 2 DL: 2 open, at most 0 known"])
 
     def test_the_expected_w3c_counts_cover_the_merge_gate_state(self):
         import tomllib
