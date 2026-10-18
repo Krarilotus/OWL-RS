@@ -28,7 +28,7 @@ pub use durability::{DurabilityConfig, SyncPolicy};
 pub use engine::{
     BulkLoad, BulkMode, CommitSummary, Content, Engine, EngineConfig, EngineStats, EqualityClasses,
     ImageInfo, InferredMask, InferredSubset, LogBatch, ProbeCursor, ReadModel, Rematerialisation,
-    Seek, Snapshot, SnapshotIdentity, Transaction,
+    Seek, Snapshot, SnapshotIdentity, TextScope, Transaction,
 };
 pub use error::{EngineError, EngineResult};
 pub use index::cursor::SeekStats;

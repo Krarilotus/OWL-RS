@@ -8,7 +8,7 @@ use super::equality::{Classes as EqualityClasses, Expand, Visibility as CopyVisi
 use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
-use crate::term::{Dictionary, TermId};
+use crate::term::{Dictionary, TermId, TermKind};
 
 mod cursor;
 pub use cursor::{ProbeCursor, Seek};
@@ -1049,6 +1049,12 @@ impl Snapshot {
         if plan.exclude_default_graph {
             return None;
         }
+        self.group_counts_of(model, &plan)
+    }
+
+    /// [`Self::group_counts_in`] for `plan`: grouped by its first component not bound to
+    /// one value (the whole component, or a range of it: [`Self::range_plan`]).
+    fn group_counts_of(&self, model: ReadModel, plan: &AccessPlan) -> Option<Vec<(TermId, u64)>> {
         let bound = plan
             .low
             .iter()
@@ -1059,11 +1065,17 @@ impl Snapshot {
             return None;
         }
         let supported = Stack::ALL.into_iter().all(|stack| {
-            !model.includes(stack) || self.data(model).stack(stack).layout().supports(permutation)
+            !model.includes(stack)
+                || self
+                    .data(model)
+                    .stack(stack)
+                    .layout()
+                    .supports(plan.permutation)
         });
         if !supported {
             return None;
         }
+        let plan = *plan;
         let mut counts = Vec::new();
         let mut sources = 0;
         for stack in Stack::ALL {
@@ -1418,13 +1430,24 @@ impl Snapshot {
         self.dictionary.stats().arena_bytes
     }
 
-    /// The string literals this snapshot's dictionary holds that match `query`, best first
-    /// (whether statements still use them is the caller's to check).
+    /// The string literals that are objects of statements in `scope`'s graphs in `model`
+    /// and match `query`, best first, ranked among those literals alone
+    /// ([`Self::text_corpus`]): no literal outside them (another version's, an open
+    /// transaction's, a graph's outside the scope, one no statement uses) changes a score.
+    pub fn text_search_in(
+        &self,
+        model: ReadModel,
+        scope: &TextScope,
+        query: &crate::TextQuery,
+    ) -> Vec<crate::TextMatch> {
+        self.dictionary.text_search(query, &|index| {
+            self.text_corpus(Documents::Literals, model, scope, index)
+        })
+    }
+
+    /// [`Self::text_search_in`] over every graph, asserted and inferred.
     pub fn text_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
-        let known = self.version.dictionary_len;
-        let mut matches = self.dictionary.text_search(query);
-        matches.retain(|m| TermId::from_raw(m.id).payload() < known);
-        matches
+        self.text_search_in(ReadModel::Materialised, &TextScope::EVERY, query)
     }
 
     /// The vector literals this snapshot's dictionary holds that are nearest to
@@ -1452,14 +1475,183 @@ impl Snapshot {
         self.dictionary.prepare_vector_graph(query);
     }
 
-    /// The IRIs this snapshot's dictionary holds whose local names match `query`, best
-    /// first (whether statements still use them is the caller's to check).
-    pub fn iri_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
-        let known = self.version.dictionary_len;
-        let mut matches = self.dictionary.iri_search(query);
-        matches.retain(|m| TermId::from_raw(m.id).payload() < known);
-        matches
+    /// The IRIs that are subjects of statements in `scope`'s graphs in `model` and whose
+    /// local names match `query`, best first, ranked among those IRIs alone (as
+    /// [`Self::text_search_in`] ranks literals).
+    pub fn iri_search_in(
+        &self,
+        model: ReadModel,
+        scope: &TextScope,
+        query: &crate::TextQuery,
+    ) -> Vec<crate::TextMatch> {
+        self.dictionary.iri_search(query, &|index| {
+            self.text_corpus(Documents::Subjects, model, scope, index)
+        })
     }
+
+    /// How many full-text corpora ([`Self::text_search_in`]) the statistics this snapshot
+    /// shares (its engine's, or a restricted view's own) have built: a search that finds
+    /// its corpus kept builds none (performance.md §0).
+    pub fn text_corpus_builds(&self) -> u64 {
+        self.statistics.corpus_builds()
+    }
+
+    /// The documents of a full-text index this snapshot's reader sees in `scope`: their
+    /// numbers (dictionary entries) from a walk over the groups of the object-first (or
+    /// subject-first) index, their statistics from `index`. Exact, and kept for this
+    /// version, model and scope once built, as [`Self::node_count_in`] is. The statements
+    /// are read as stored: equality classes rename individuals, never literals, and an
+    /// alias is the subject of its own `sameAs` statement.
+    fn text_corpus(
+        &self,
+        documents: Documents,
+        model: ReadModel,
+        scope: &TextScope,
+        index: &crate::term::text::TextIndex,
+    ) -> Arc<crate::term::text::Corpus> {
+        let key = (documents, model, scope.clone());
+        self.statistics.corpus(&self.version, key, || {
+            let stored = self.stored();
+            let kinds: &[TermKind] = match documents {
+                Documents::Literals => &[TermKind::String, TermKind::LangString],
+                Documents::Subjects => &[TermKind::Iri],
+            };
+            let mut members: Vec<u64> = kinds
+                .iter()
+                .flat_map(|&kind| stored.scope_values(model, scope, documents, kind))
+                .map(|id| id.payload())
+                .collect();
+            members.sort_unstable();
+            members.dedup();
+            index.corpus(members, self.version.dictionary_len)
+        })
+    }
+
+    /// The distinct terms of `kind` at `documents`' position (object or subject) of the
+    /// statements in `scope`'s graphs in `model`, sorted.
+    fn scope_values(
+        &self,
+        model: ReadModel,
+        scope: &TextScope,
+        documents: Documents,
+        kind: TermKind,
+    ) -> Vec<TermId> {
+        let values = |counts: Vec<(TermId, u64)>| counts.into_iter().map(|(value, _)| value);
+        match scope {
+            TextScope::Graphs(GraphSelector::AnyNamed) => {
+                // Every graph's, less those only the default graph has.
+                let every = self.graph_counts(model, GraphSelector::Any, documents, kind);
+                let default = self.graph_counts(
+                    model,
+                    GraphSelector::Exact(TermId::DEFAULT_GRAPH),
+                    documents,
+                    kind,
+                );
+                let mut j = 0;
+                every
+                    .into_iter()
+                    .filter(|&(value, count)| {
+                        while j < default.len() && default[j].0 < value {
+                            j += 1;
+                        }
+                        let in_default = match default.get(j) {
+                            Some(&(v, c)) if v == value => c,
+                            _ => 0,
+                        };
+                        count > in_default
+                    })
+                    .map(|(value, _)| value)
+                    .collect()
+            }
+            TextScope::Graphs(graphs) => {
+                values(self.graph_counts(model, *graphs, documents, kind)).collect()
+            }
+            TextScope::Merge(graphs) => {
+                let mut merged: Vec<TermId> = graphs
+                    .iter()
+                    .flat_map(|&graph| {
+                        values(self.graph_counts(
+                            model,
+                            GraphSelector::Exact(graph),
+                            documents,
+                            kind,
+                        ))
+                    })
+                    .collect();
+                if graphs.len() > 1 {
+                    merged.sort_unstable();
+                    merged.dedup();
+                }
+                merged
+            }
+        }
+    }
+
+    /// Per distinct term of `kind` at `documents`' position of the statements in `graphs`
+    /// (one graph, or every graph) in `model`, how many there are, in id order: a walk over
+    /// the index's groups in the kind's range, or a scan where the index can't walk them.
+    fn graph_counts(
+        &self,
+        model: ReadModel,
+        graphs: GraphSelector,
+        documents: Documents,
+        kind: TermKind,
+    ) -> Vec<(TermId, u64)> {
+        debug_assert!(graphs != GraphSelector::AnyNamed);
+        let (low, high) = TermId::kind_range(kind);
+        let (pattern, permutation) = match (graphs, documents) {
+            (GraphSelector::Exact(graph), Documents::Literals) => {
+                (QuadPattern::in_graph(graph), Permutation::Gosp)
+            }
+            (GraphSelector::Exact(graph), Documents::Subjects) => {
+                (QuadPattern::in_graph(graph), Permutation::Gspo)
+            }
+            (_, Documents::Literals) => (QuadPattern::all(), Permutation::Ospg),
+            (_, Documents::Subjects) => (QuadPattern::all(), Permutation::Spog),
+        };
+        if let Some(counts) = self
+            .range_plan(model, &pattern, permutation, low, high)
+            .and_then(|plan| self.group_counts_of(model, &plan))
+        {
+            return counts;
+        }
+        let mut counts: std::collections::BTreeMap<TermId, u64> = Default::default();
+        for quad in self.quads_for_pattern_in(model, &pattern) {
+            let value = match documents {
+                Documents::Literals => quad.object,
+                Documents::Subjects => quad.subject,
+            };
+            if value.kind() == kind {
+                *counts.entry(value).or_default() += 1;
+            }
+        }
+        counts.into_iter().collect()
+    }
+}
+
+/// The graphs whose statements make the corpus of a full-text search
+/// ([`Snapshot::text_search_in`]): the literals that are their objects (the IRIs that are
+/// their subjects, for [`Snapshot::iri_search_in`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TextScope {
+    /// One graph, every graph, or every named graph.
+    Graphs(GraphSelector),
+    /// The merge of these graphs (sorted, without repeats): a dataset's default graph of
+    /// several graphs, or the graphs a reader may read.
+    Merge(Vec<TermId>),
+}
+
+impl TextScope {
+    /// Every graph.
+    pub const EVERY: Self = Self::Graphs(GraphSelector::Any);
+}
+
+/// Which documents a full-text index holds: string literals (objects), or IRIs by their
+/// local names (subjects).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Documents {
+    Literals,
+    Subjects,
 }
 
 /// Two quad streams sorted by one permutation, merged into one sorted stream. The inputs

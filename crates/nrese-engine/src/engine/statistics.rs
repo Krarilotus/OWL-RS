@@ -24,16 +24,22 @@
 //!
 //! A scan stops once the slices have found more than
 //! [`MAX_SETS`](super::characteristic::MAX_SETS) sets between them.
+//!
+//! The corpora of full-text searches ([`Snapshot::text_search_in`]) are kept too, per
+//! version, read model and scope: they decide results (scores), so they are exact and
+//! never carried over to another version.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::Mutex;
 
 use super::characteristic::{CharacteristicSets, Partial, SetCount};
+use super::snapshot::{Documents, TextScope};
 use super::{ReadModel, Snapshot, Version};
 use crate::quad::{GraphSelector, Permutation, QuadPattern};
+use crate::term::text::Corpus;
 use crate::term::{TermId, TermKind};
 
 /// The characteristic sets of one read model as built at a size (`None`: there were too
@@ -81,6 +87,11 @@ pub(crate) struct Statistics {
     sets: Mutex<HashMap<ReadModel, Sets>>,
     /// Held while the sets are built: planners that need them meanwhile wait for them.
     building: Mutex<()>,
+    /// Full-text corpora of versions (held weakly, as [`Self::nodes`]), oldest first; each
+    /// built once, outside the lock, by the first search that needs it.
+    corpora: Mutex<Vec<KeptCorpus>>,
+    /// Corpora built so far ([`Snapshot::text_corpus_builds`]).
+    corpus_builds: std::sync::atomic::AtomicU64,
     /// Where they are saved and read back (`derived/` of a durable engine).
     dir: Mutex<Option<std::path::PathBuf>>,
     /// Scans of the store for the sets begun: what the tests count.
@@ -122,6 +133,16 @@ type NodeCount = (Weak<Version>, ReadModel, GraphSelector, u64);
 /// Node counts kept; the cache is cleared when it fills up.
 const NODE_ENTRIES: usize = 64;
 
+/// What a full-text corpus is of: the index's documents, and the reader's model and graphs.
+type CorpusKey = (Documents, ReadModel, TextScope);
+
+/// A version (held weakly), a corpus key, and the corpus once built.
+type KeptCorpus = (Weak<Version>, CorpusKey, Arc<OnceLock<Arc<Corpus>>>);
+
+/// Corpora kept, and the bytes they may hold together; the oldest go first.
+const CORPUS_ENTRIES: usize = 64;
+const CORPUS_BYTES: usize = 256 << 20;
+
 impl Statistics {
     /// The number of distinct subjects and objects of `graphs` in `model` at `version`:
     /// cached, or computed by `count` (`None`: it can't be, and nothing is kept).
@@ -147,6 +168,55 @@ impl Statistics {
         }
         nodes.push((Arc::downgrade(version), model, graphs, n));
         Some(n)
+    }
+
+    /// The full-text corpus `key` of `version`: kept, or built by `build` (once, however
+    /// many searches ask at the same time).
+    pub(crate) fn corpus(
+        &self,
+        version: &Arc<Version>,
+        key: CorpusKey,
+        build: impl FnOnce() -> Corpus,
+    ) -> Arc<Corpus> {
+        let cell = {
+            let mut corpora = self.corpora.lock();
+            let found = corpora.iter().find_map(|(weak, k, cell)| {
+                (*k == key && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(version)))
+                    .then(|| Arc::clone(cell))
+            });
+            match found {
+                Some(cell) => cell,
+                None => {
+                    corpora.retain(|(weak, ..)| weak.strong_count() > 0);
+                    let bytes = |corpora: &[KeptCorpus]| -> usize {
+                        corpora
+                            .iter()
+                            .filter_map(|(_, _, cell)| cell.get())
+                            .map(|corpus| corpus.memory_bytes())
+                            .sum()
+                    };
+                    while !corpora.is_empty()
+                        && (corpora.len() >= CORPUS_ENTRIES || bytes(&corpora) > CORPUS_BYTES)
+                    {
+                        corpora.remove(0);
+                    }
+                    let cell = Arc::new(OnceLock::new());
+                    corpora.push((Arc::downgrade(version), key, Arc::clone(&cell)));
+                    cell
+                }
+            }
+        };
+        Arc::clone(cell.get_or_init(|| {
+            self.corpus_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Arc::new(build())
+        }))
+    }
+
+    /// Full-text corpora built so far.
+    pub(crate) fn corpus_builds(&self) -> u64 {
+        self.corpus_builds
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The characteristic sets of the default graph in `model` (see the module docs): kept

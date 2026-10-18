@@ -24,6 +24,13 @@
 //! the object of a statement in the graph the pattern reads. The matches start the
 //! pattern's joins, so the other triple patterns are read for them only.
 //!
+//! Relevance is ranked among those literals alone: the documents of the BM25 statistics
+//! (their number, average length, and each word's document frequency) are the string
+//! literals that are objects of statements in the pattern's graphs (the dataset's, as the
+//! reader's access restricts them), at the query's snapshot, in its read model. Literals
+//! of an open transaction, of a later version, of a graph the reader may not read, or that
+//! no statement uses any more, change no score and no order (`Snapshot::text_search_in`).
+//!
 //! Jena's `text:query` (what Fuseki users send) runs on the same index:
 //!
 //! ```sparql
@@ -51,7 +58,7 @@
 //! `?x luc:score ?s` binds the relevance. The index name is not looked up: there is one
 //! index, over every string literal.
 
-use nrese_engine::{GraphSelector, QuadPattern, TermId, TextQuery};
+use nrese_engine::{GraphSelector, QuadPattern, TermId, TextQuery, TextScope};
 use nrese_rdf::{Literal, Term, Variable, vocab::rdf};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 
@@ -387,6 +394,35 @@ impl Context<'_> {
             .any(|quad| merge_set.is_none_or(|graphs| graphs.contains(&quad.graph)))
     }
 
+    /// The graphs whose literals a search in the active graph ranks among: the active
+    /// graph, the merge the default graph is, or the named graphs `GRAPH ?g` may bind
+    /// (`None`: none).
+    fn text_scope(&self) -> Option<TextScope> {
+        Some(match &*self.graph.borrow() {
+            GraphScope::Default => TextScope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
+            GraphScope::Named(g) => TextScope::Graphs(GraphSelector::Exact(*g)),
+            GraphScope::Variable(_) => match &self.named {
+                Some(named) => {
+                    let mut named = named.clone();
+                    named.sort_unstable();
+                    named.dedup();
+                    TextScope::Merge(named)
+                }
+                None => TextScope::Graphs(GraphSelector::AnyNamed),
+            },
+            GraphScope::Union => match &self.merge_set {
+                Some(graphs) => {
+                    let mut graphs = graphs.clone();
+                    graphs.sort_unstable();
+                    graphs.dedup();
+                    TextScope::Merge(graphs)
+                }
+                None => TextScope::Graphs(GraphSelector::Any),
+            },
+            GraphScope::Missing => return None,
+        })
+    }
+
     /// The literals `search` matches, with their relevance and rank.
     pub(super) fn search(&self, search: &Search) -> NativeResult<Solutions> {
         self.check()?;
@@ -395,14 +431,20 @@ impl Context<'_> {
         vars.extend(search.rank.iter().cloned());
         let mut table = IdTable::new(vars.len());
         let mut rank = 0usize;
-        for found in self.snapshot.text_search(&search.query) {
+        // Every match is the object of a statement in the scope: no probe per match.
+        let found = match self.text_scope() {
+            Some(scope) => self
+                .snapshot
+                .text_search_in(self.model, &scope, &search.query),
+            None => Vec::new(),
+        };
+        for found in found {
             if search
                 .min_relevance
                 .is_some_and(|min| found.relevance < min)
             {
                 break;
             }
-            let id = TermId::from_raw(found.id);
             if let Some(language) = &search.language {
                 let in_language = matches!(
                     self.term(found.id),
@@ -411,9 +453,6 @@ impl Context<'_> {
                 if !in_language {
                     continue;
                 }
-            }
-            if !self.used_as_object(id) {
-                continue;
             }
             rank += 1;
             if search.max_rank.is_some_and(|max| rank > max) {
