@@ -103,19 +103,34 @@ class Context:
         instead of making the host thrash (nemo-sparq on LUBM 1000, 5 October 2026); it
         couldn't have finished within the memory anyway."""
         setting = self.setting("DOCKER_MEMORY")
-        if setting and setting != "0":
-            return setting
         # Under fleet no container runs uncapped or past what the job declared: Docker can't
-        # join the step's slice, so its cap is the slice's limit less a GiB for the driver
-        # (14 Oct 2026: an uncounted 10.7 GB container in a whole-host OOM on Office).
+        # join the step's slice, so its ceiling is the slice's limit less a GiB for the driver
+        # (14 Oct 2026: an uncounted 10.7 GB container in a whole-host OOM on Office). An
+        # explicit cap above that ceiling is refused, never shrunk (PROTOCOL.md §3).
         declared = slice_limit_mib()
+        ceiling = max(declared - 1024, 512) if declared is not None else None
+        if setting and setting != "0":
+            asked = docker_mib(setting)
+            if ceiling is not None and asked > ceiling:
+                raise ValueError(f"DOCKER_MEMORY={setting} ({asked} MiB) exceeds the fleet step's slice "
+                                 f"({declared} MiB, {ceiling} MiB for containers): declare more ram_gb")
+            return setting
         if setting == "0" and declared is None:
             return None
         total = docker_memory_bytes()
         cap = total * 9 // 10 // 1048576 if total else None
-        if declared is not None:
-            cap = min(cap or declared, max(declared - 1024, 512))
+        if ceiling is not None:
+            cap = min(cap or ceiling, ceiling)
         return f"{cap}m" if cap else None
+
+
+def docker_mib(setting: str) -> int:
+    """A memory size in Docker's notation (bytes, or a number with b, k, m, g), in MiB."""
+    match = re.fullmatch(r"(\d+)([bkmg]?)", setting.strip().lower())
+    if not match:
+        raise ValueError(f"DOCKER_MEMORY={setting}: not a size in Docker's notation (12g, 900m)")
+    scale = {"": 1, "b": 1, "k": 2**10, "m": 2**20, "g": 2**30}[match.group(2)]
+    return int(match.group(1)) * scale // 2**20
 
 
 @dataclass
