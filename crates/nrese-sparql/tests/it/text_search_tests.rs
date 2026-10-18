@@ -102,7 +102,10 @@ fn rows(engine: &Engine, query: &str, options: &QueryOptions) -> Vec<Vec<String>
 fn search_ranks_and_joins() {
     let engine = engine();
     let plain = QueryOptions::default();
-    // Any word; best first; the literal of another graph and the unused one are not found.
+    // Any word; best first; the literal of another graph and the unused one are not found,
+    // nor counted: over the default graph's four literals (three words on average), "Bridge,
+    // bridge and more bridges" (twice in five words) and "Tower Bridge" (once in two) score
+    // alike, and the earlier literal goes first.
     let found = rows(
         &engine,
         "SELECT ?s ?rank WHERE { ?o bds:search \"bridge\" ; bds:rank ?rank . ?s rdfs:label ?o } ORDER BY ?rank",
@@ -110,7 +113,7 @@ fn search_ranks_and_joins() {
     );
     assert_eq!(
         found,
-        [["bells", "1"], ["bridge", "2"]].map(|r| r.map(str::to_owned).to_vec())
+        [["bridge", "1"], ["bells", "2"]].map(|r| r.map(str::to_owned).to_vec())
     );
     // Relevance: the best is 1, the others less.
     let scored = rows(
@@ -153,7 +156,7 @@ fn search_ranks_and_joins() {
         "SELECT ?o WHERE { ?o bds:search \"bridge\" ; bds:minRank \"2\" }",
         &plain,
     );
-    assert_eq!(second, [vec!["Tower Bridge".to_owned()]]);
+    assert_eq!(second, [vec!["Bridge, bridge and more bridges".to_owned()]]);
     let relevant = rows(
         &engine,
         "SELECT ?o WHERE { ?o bds:search \"tower bridge\" ; bds:minRelevance \"0.99\" }",
