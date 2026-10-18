@@ -116,6 +116,21 @@ def schedule_errors(passes: list[dict], sides: list[str], min_passes: int) -> li
         if run > 2:
             errors.append(f"{x} ran more than two passes in a row ({'-'.join(order)})")
             break
+    # A case in only some passes (a later block's, its noise needing more passes): the passes
+    # that ran it keep the same rules, each side as many, at least `min_passes`, a palindrome.
+    by_case: dict[str, list[str]] = {}
+    for _, _, p in timed:
+        for case in p["report"].get("planned_cases") or []:
+            by_case.setdefault(case, []).append(p["side"])
+    for case, sub in sorted(by_case.items()):
+        if len(sub) == len(order):
+            continue
+        counts = Counter(sub)
+        if any(counts[s] < min_passes for s in sides) or len({counts[s] for s in sides}) > 1:
+            errors.append(f"{case}: " + ", ".join(f"{s} {counts[s]}" for s in sides)
+                          + f" passes; each side as many, at least {min_passes}")
+        elif sub != sub[::-1]:
+            errors.append(f"{case}: its passes ran {'-'.join(sub)}, not a palindrome")
     return errors
 
 
@@ -128,12 +143,13 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
         r, name = p["report"], p["path"]
         if r.get("reps") != 1:
             errors.append(f"{name}: {r.get('reps')} repetitions; a pass is one")
-        if sorted(r.get("planned_cases") or []) != sorted(planned):
-            errors.append(f"{name}: its cases are not the gate's plan")
+        own = r.get("planned_cases") or []
+        if not own or not set(own) <= set(planned):
+            errors.append(f"{name}: its cases are not of the gate's plan")
         seen = Counter(x.get("case") for x in r.get("records", []))
-        if seen != Counter(planned):
-            errors.append(f"{name}: records {dict(seen - Counter(planned)) or ''} beyond, "
-                          f"{sorted(set(planned) - set(seen))} missing")
+        if seen != Counter(own):
+            errors.append(f"{name}: records {dict(seen - Counter(own)) or ''} beyond, "
+                          f"{sorted(set(own) - set(seen))} missing")
         for key in ("git", "git_finished"):
             git = r.get(key) or {}
             if git.get("commit") != harness or git.get("dirty") != 0:
@@ -159,6 +175,10 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
                                    "runtime": r.get("runtime")}, sort_keys=True))
     errors += [f"{side}: different binaries in its passes" for side, shas in binaries.items() if len(shas) > 1]
     errors += [f"{side}: different options in its passes" for side, opts in options.items() if len(opts) > 1]
+    # The measurement (runs, warm-ups, repetitions: --measure's file) is the same for every side.
+    measures = {(p["report"].get("options") or {}).get("measure") for p in passes}
+    if len(measures) > 1:
+        errors.append("the passes measured with different calibrations (fast.py --measure)")
     if len(prepared) > 1:
         errors.append("the passes read different prepared data")
     if len(identities) > 1:
@@ -180,6 +200,8 @@ def evidence(passes: list[dict], case: str) -> dict:
            "process": [], "estimator": set(), "lifetime": [], "phases": [], "cgroup": [], "qps": [],
            "client_peaks": [], "cache_peaks": [], "rows": [], "counters": {}}
     for p in passes:
+        if case not in (p["report"].get("planned_cases") or [case]):
+            continue  # a later block's pass, without this case (its noise needs no more)
         record = next((r for r in p["report"]["records"] if r.get("case") == case), None)
         if record is None:
             out["status"].append("missing")
@@ -446,6 +468,8 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     planned = sorted({c for p in passes for c in p["report"].get("planned_cases", [])})
     summary["planned"] = planned
     summary["errors"] += provenance_errors(passes, sides, harness, planned)
+    host_errors, summary["host_notes"] = host_states(passes)
+    summary["errors"] += host_errors
     summary["host"] = sorted({(p["report"].get("machine") or {}).get("host") for p in passes}, key=str)
     by_side = {s: sorted([p for p in passes if p["side"] == s], key=lambda p: p["n"]) for s in sides}
     checks = {c["name"]: {path.split(".")[1] for path in c.get("check", {}) if path.startswith("q.")}
@@ -535,6 +559,8 @@ def render(summary: dict) -> str:
                   "unchanged during each.", ""]
         lines += [f"- {line}" for line in summary.get("inputs", [])] + [""]
     lines += ["## Blocking", ""] + ([f"- {b}" for b in summary["blocking"]] or ["- nothing"]) + [""]
+    if summary.get("host_notes"):
+        lines += ["## The host as the passes met it (scripts/hosts/hygiene.py)", ""] +                  [f"- {n}" for n in summary["host_notes"]] + [""]
     if summary.get("elsewhere"):
         lines += ["Timed in another part of the gate (the verdict requires it): " +
                   "; ".join(f"{k}: {v}" for k, v in summary["elsewhere"].items()), ""]
@@ -658,6 +684,231 @@ def guards_check(names: list[str], log: str) -> tuple[list[str], dict]:
     return errors, {n: results.get(n, []) for n in names}
 
 
+# --- the host each pass met --------------------------------------------------------------------
+
+POLICY_KEYS = ("driver", "governor", "epp", "boost", "amd_pstate")
+
+
+def host_states(passes: list[dict]) -> tuple[list[str], list[str]]:
+    """What the passes' host states (fast.py `host_state`, scripts/hosts/hygiene.py) say: errors
+    (the CPU frequency policy changed between passes: the passes aren't one configuration) and
+    notes (each problem a pass met at its start or end, with the passes that met it)."""
+    policies, problems = {}, {}
+    for p in sorted(passes, key=lambda p: p["n"]):
+        for key in ("host_state", "host_state_finished"):
+            state = p["report"].get(key)
+            if not state:
+                continue
+            if state.get("frequency"):
+                policies.setdefault(json.dumps({k: state["frequency"].get(k) for k in POLICY_KEYS},
+                                               sort_keys=True), []).append(p["n"])
+            for problem in state.get("problems", []):
+                # Load figures vary by the second; the problem's kind is what's reported.
+                problems.setdefault(re.sub(r" [\d.]+(?=,|$)", "", problem), set()).add(p["n"])
+    errors = ([] if len(policies) <= 1 else
+              ["the CPU frequency policy changed between passes: " +
+               " | ".join(f"{k} (passes {sorted(set(v))})" for k, v in policies.items())])
+    notes = [f"{problem} (passes {', '.join(map(str, sorted(ns)))})" for problem, ns in sorted(problems.items())]
+    return errors, notes
+
+
+# --- the measurement calibration (benches/fast/measure.toml) -----------------------------------
+#
+# The gate's power against a small loss is bounded by each series' noise between passes
+# (benches/NOISY.md). `calibrate` sets, per case and from the gate's own passes, what the
+# measurement does about it, the same for every side: more executions a process where they are
+# cheap (the perf lab's --runs, the DL tools' files a process, a batch of executions a sample
+# where every side's perf lab has --batch), and more passes for the cases whose noise needs
+# them to catch a TARGET_LOSS with TARGET_POWER (the confirm-on-rerun chain simulated as in
+# benches/probes/gate-power.py), within the timed part's budget on the gate's host.
+
+TARGET_LOSS, TARGET_POWER = 0.02, 0.90
+QUERY_MS = 2000.0      # a perf-lab process's measured query time, at most (the runs it buys)
+DL_MS = 3000.0         # a DL tool's process: its files' time, at most
+MAX_RUNS, MAX_REPEAT = 2000, 30
+BATCH_SAMPLE_MS = 0.05  # a batched sample lasts at least this (50 µs: the timer's steps far below)
+PASS_OVERHEAD_S = 40   # a pass's own time beyond its cases' (start, records, the host's state)
+
+
+def case_runs(case: dict) -> tuple[int, int]:
+    """The perf lab's runs and warm-ups a process as the case's arguments set them."""
+    args, runs, warmup = case.get("args", []), 5, 1
+    for i, a in enumerate(args[:-1]):
+        if a == "--runs":
+            runs = int(args[i + 1])
+        elif a == "--warmup":
+            warmup = int(args[i + 1])
+    return runs, warmup
+
+
+def runs_adjustable(case: dict) -> bool:
+    """A perf-lab case timed by its queries' repeated executions (not a first execution, a
+    reopened store, a replayed log or a sweep, whose runs are what they measure)."""
+    args = case.get("args", [])
+    return (case.get("tool", "perf_lab") == "perf_lab" and case.get("metric") == "sum_p50_ms"
+            and bool(case.get("queries")) and not case["queries"].startswith("@cache-log")
+            and "setup" not in case and "sweep" not in case and "--store" not in args
+            and case_runs(case)[1] > 0 and "--clients" not in args and "--commits" not in args)
+
+
+def judged_noise(rows: list[dict], resolution_ms: float = RESOLUTION["ms"]) -> float:
+    """A case's noise for its passes: the largest of its series whose TARGET_LOSS is above the
+    timing resolution (a smaller series can't show that loss at any number of passes)."""
+    judged = [r["sd"] for r in rows if r["median_ms"] * TARGET_LOSS >= resolution_ms]
+    return max(judged, default=0.0)
+
+
+def power_table(passes: list[int], sims: int = 300) -> dict[int, list[float]]:
+    """The chain's power against TARGET_LOSS on gate-power.py's noise grid, per round-0 passes."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("gate_power", ROOT / "benches/probes/gate-power.py")
+    gp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gp)
+    table = {n: [gp.caught(s, 1 + TARGET_LOSS, n, sims, seed=11 + i)["block-confirmed"]
+                 for i, s in enumerate(gp.GRID)] for n in passes}
+    return {"grid": [float(s) for s in gp.GRID], **{str(n): v for n, v in table.items()}}
+
+
+def power_at(table: dict, n: int, sigma: float) -> float:
+    grid = table["grid"]
+    xs = [math.log(s) for s in grid]
+    x = math.log(max(sigma, grid[0]))
+    ys = table[str(n)]
+    if x >= xs[-1]:
+        return ys[-1]
+    i = max(j for j in range(len(xs)) if xs[j] <= x)
+    return ys[i] + (ys[i + 1] - ys[i]) * (x - xs[i]) / (xs[i + 1] - xs[i])
+
+
+def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_passes: int = 16,
+              min_passes: int = CAMPAIGN_PASSES, sides: int = 3, table: dict | None = None,
+              batch: bool = True) -> dict:
+    """Each case's measurement from passes of the gate's host (an A/A run, or a gate's): runs,
+    warm-ups, batch and repetitions from its times, passes from its noise. Every case gets
+    `min_passes` a side; the passes beyond go where they buy the most power against TARGET_LOSS
+    a second of the timed part (weighted by the case's judged series), until `budget_min`. The
+    passes' binaries are the sides (an A/A run's one binary counts `sides` times)."""
+    cases = {c["name"]: c for c in catalog}
+    by_case: dict[str, dict] = {}
+    revs = set()
+    for p in passes:
+        rev = (p["report"].get("binaries") or {}).get("revision") or p["side"]
+        revs.add(rev)
+        for r in p["report"].get("records", []):
+            entry = by_case.setdefault(r["case"], {"seconds": {}, "series": {}, "status": set(), "measured": {}})
+            entry["seconds"].setdefault(rev, []).append(r.get("case_s") or 0)
+            entry["status"].add(r.get("status"))
+            entry["measured"] = r.get("measurement") or entry["measured"]
+            if r.get("status") == "ok":
+                for s, values in (r.get("samples") or {}).items():
+                    if values:
+                        entry["series"].setdefault((rev, s), []).append(statistics.median(values))
+    evens = list(range(min_passes, max_passes + 1, 2))
+    table = table or power_table(evens)
+    per_side = sides if len(revs) == 1 else 1
+    out, rounds, weights = {}, {}, {}
+    for name, e in sorted(by_case.items()):
+        case = cases.get(name)
+        if case is None:
+            continue
+        rows = [{"rev": rev, "series": s, "median_ms": statistics.median(m),
+                 "sd": statistics.stdev(math.log(v) for v in m)}
+                for (rev, s), m in e["series"].items() if len(m) >= 2 and min(m) > 0]
+        seconds = {rev: statistics.mean(v) for rev, v in e["seconds"].items()}
+        # One execution of every query (a DL tool's file: its phases), on the slowest side that
+        # ran the case (a baseline that can't run it has no times).
+        per_run = max((sum(r["median_ms"] for r in rows if r["rev"] == rev) for rev in revs), default=0.0)
+        added = 0.0  # a process's added measured time, on every side
+        entry = {}
+        measured_runs = e["measured"].get("runs")
+        if runs_adjustable(case) and "ok" in e["status"] and rows:
+            runs, warmup = case_runs(case)
+            longest = max(r["median_ms"] for r in rows)
+            k = 1
+            if batch and longest < 1.0:
+                # A sample of every query well above the timer's steps (applied where every
+                # side's perf lab batches; otherwise the runs alone).
+                k = min(1000, math.ceil(BATCH_SAMPLE_MS / max(min(r["median_ms"] for r in rows), 1e-4)))
+            # The runs as if unbatched (a gate whose baselines can't batch runs them so); a
+            # batching gate's processes take `batch` times as long.
+            new_runs = min(MAX_RUNS, max(runs, math.ceil(QUERY_MS / max(per_run, 1e-3))))
+            entry.update(runs=new_runs, warmup=max(warmup, 3 if new_runs >= 20 else warmup))
+            if k > 1:
+                entry["batch"] = k
+            added = (new_runs - (measured_runs or runs)) * per_run / 1000
+        elif case.get("tool") == "tableau" and "ok" in e["status"] and rows:
+            whole = per_run
+            repeat = int(case.get("repeat", 1))
+            limit = 0.4 * float(case.get("timeout_s", 300)) * 1000 / max(whole, 1e-3)
+            new = int(min(MAX_REPEAT, limit, max(repeat, math.ceil(DL_MS / max(whole, 1e-3)))))
+            if new > repeat:
+                entry["repeat"] = new
+                added = (new - (e["measured"].get("repeat") or repeat)) * whole / 1000
+        sigma = judged_noise(rows)
+        entry.update(noise=round(sigma, 4), passes=min_passes,
+                     seconds=round(statistics.mean(seconds.values()) + added, 1))
+        rounds[name] = per_side * sum(s + added for s in seconds.values())  # a pass of every side
+        weights[name] = max(1, len({r["series"] for r in rows if r["median_ms"] * TARGET_LOSS >= RESOLUTION["ms"]}))
+        out[name] = entry
+
+    def minutes(plan: dict) -> float:
+        blocks = max((e["passes"] for e in plan.values()), default=0) // 2
+        total = 0.0
+        for k in range(1, blocks + 1):
+            in_block = [rounds[c] for c, e in plan.items() if e["passes"] >= 2 * k]
+            total += 2 * (sum(in_block) + sides * PASS_OVERHEAD_S)
+        return total / 60
+
+    power = lambda c, n: power_at(table, n, out[c]["noise"])  # noqa: E731
+    spent = minutes(out)
+    while True:
+        top = max(e["passes"] for e in out.values())
+        best = None
+        for c, e in out.items():
+            for n in evens:
+                if n <= e["passes"]:
+                    continue
+                gain = weights[c] * (power(c, n) - power(c, e["passes"]))
+                cost = (n - e["passes"]) * rounds[c] * 2 / 60 + max(0, n - top) * sides * PASS_OVERHEAD_S / 60
+                if gain > 1e-3 and spent + cost <= budget_min and (best is None or gain / cost > best[0]):
+                    best = (gain / cost, c, n, cost)
+        if best is None:
+            break
+        out[best[1]]["passes"] = best[2]
+        spent = minutes(out)
+    for e in out.values():
+        e["power"] = round(power_at(table, e["passes"], e["noise"]), 3)
+    return {"cases": out, "minutes": round(minutes(out), 1), "cap": max(e["passes"] for e in out.values()),
+            "budget_min": budget_min}
+
+
+def write_measure(result: dict, source: str) -> str:
+    lines = ["# The release gate's measurement per case (fast.py --measure; benches/PROTOCOL.md §5, \"Noise\").",
+             "# Written by `release_gate.py calibrate`, not by hand: " + source + ".",
+             f"# runs, warmup, batch: the perf lab's a process; repeat: the DL tool's files a process; passes: a side",
+             f"# (round 0), for {TARGET_POWER:.0%} power against a {TARGET_LOSS:.0%} loss at the case's noise (the largest",
+             "# sd of log pass medians of its series where that loss exceeds the resolution); power: at those passes;",
+             f"# seconds: a pass's. Timed part {result['minutes']} min (budget {result['budget_min']}, passes at most "
+             f"{result['cap']}).", ""]
+    for name, e in result["cases"].items():
+        lines.append(f"[case.{name}]")
+        lines += [f"{k} = {v}" for k, v in e.items()]
+        lines.append("")
+    return "\n".join(lines)
+
+
+def blocks(plan: list[str], measure: dict, min_passes: int = CAMPAIGN_PASSES) -> list[list[str]]:
+    """The cases of each A-B-C-C-B-A block: block k (from 1) runs those whose passes a side
+    (measure.toml) reach 2k; the first min_passes / 2 blocks run the whole plan."""
+    need = {c: max(min_passes, int(measure.get(c, {}).get("passes", min_passes))) for c in plan}
+    count = max(need.values(), default=min_passes) // 2
+    return [[c for c in plan if need[c] >= 2 * k] for k in range(1, count + 1)]
+
+
+def read_measure(text: str | None) -> dict:
+    return tomllib.loads(text).get("case", {}) if text else {}
+
+
 # --- the fleet jobs ----------------------------------------------------------------------------
 
 BASE = "0f465633d33374bc56ab9ec33157cfa10ebf2d40"  # v1.5, the last recorded run's base
@@ -693,15 +944,18 @@ def toml_job(job: dict) -> str:
 def jobs(candidate: str, harness: str, checkout: str, prefix: str, passes_per_side: int, cases: str | None,
          base: str = BASE, main: str = MAIN, timed_host: str = "phuoc-yu", checks_host: str = "office-pc",
          max_gb: float = 24, checks: bool = True, big_host: str | None = "khaleesi",
-         big_gb: float = 28) -> dict[str, dict]:
+         big_gb: float = 28, measure: dict | None = None, batch: bool = False) -> dict[str, dict]:
     """The gate's fleet jobs: binaries and data, then the timed passes and their report, alone
     on the timed host; the cases whose caps exceed it on the big host (khaleesi, 64 GB) at
     their full caps, on the build's binaries (packed by the build job: the big host builds
     nothing); the W3C suites and the guards on the checks host. No priority is set: each job
-    gets its class's (merge-gate)."""
+    gets its class's (merge-gate). With `measure` (benches/fast/measure.toml) the timed passes
+    run in A-B-C-C-B-A blocks, each later block only the cases whose noise needs its passes
+    (plan-blocks); `batch`: every side's perf lab batches (fast.py --batch)."""
     env = {"GATE_NAME": f"gate-v2-{candidate[:8]}", "GATE_MAX_GB": str(max_gb), "NRESE_QUIET_SLOT": "0",
            "GATE_MIN_PASSES": str(passes_per_side), **({"GATE_CASES": cases} if cases else {}),
-           **({"GATE_BIG_GB": str(big_gb), "GATE_BIG_HOST": big_host} if big_host else {})}
+           **({"GATE_BIG_GB": str(big_gb), "GATE_BIG_HOST": big_host} if big_host else {}),
+           **({"GATE_BATCH": "1"} if batch else {})}
     source = [{"name": "checkout", "source": {"git": checkout, "rev": harness}}]
     gate = ["bash", "scripts/release-gate.sh"]
     order = schedule(passes_per_side)
@@ -716,13 +970,28 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, passes_per_si
         "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": 12}, "inputs": source,
         **({"outputs": [{"name": "binaries", "path": "binaries"}]} if big_host else {})}}
     per_pass = {"base": 1, "main": 1, "cand": 1} if small else {"base": 14, "main": 4, "cand": 14}
+    if measure:
+        # Blocks: the k-th runs the cases needing 2k passes a side; a pass's minutes, its cases'.
+        need = {c: max(passes_per_side, int(e.get("passes", passes_per_side))) for c, e in measure.items()}
+        count = max(max(need.values()) // 2, passes_per_side // 2)
+        full = sum(e.get("seconds", 0) for e in measure.values()) or 1
+        steps, est, n = [[*gate, "plan-blocks", harness]], 2.0, 0
+        for k in range(1, count + 1):
+            share = sum(e.get("seconds", 0) for c, e in measure.items() if need[c] >= 2 * k) / full
+            for side in schedule(2):
+                n += 1
+                steps.append([*gate, "pass", str(n), side, revs[side], harness, f"plan-block-{k}.json"])
+                est += (per_pass[side] if small else full * share / 60) + PASS_OVERHEAD_S / 60
+    else:
+        steps = [[*gate, "pass", str(n), side, revs[side], harness] for n, side in enumerate(order, start=1)]
+        est = sum(per_pass[s] for s in order) + 2
     out[f"{prefix}-timed"] = {
         "id": f"{prefix}-timed", "group": "release", "kind": "owlrs.timed", "class": "exclusive",
         "priority_class": "merge-gate", "after": [f"{prefix}-build"],
         "env": {**env, "GATE_HOST": timed_host, "GATE_PREFIX": prefix, "GATE_RAM_GB": str(max_gb)},
-        "est_min": sum(per_pass[s] for s in order) + 2, "stall_after_min": 40,
-        "steps": [[*gate, "pass", str(n), side, revs[side], harness] for n, side in enumerate(order, start=1)]
-        + [[*gate, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], [*gate, "clean"]],
+        "est_min": round(est), "stall_after_min": 40,
+        "steps": steps + [[*gate, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"],
+                          [*gate, "clean"]],
         "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": max_gb}, "inputs": source}
     if big_host:
         big_env = {**env, "GATE_MIN_GB": str(max_gb), "GATE_MAX_GB": str(big_gb), "GATE_HOST": big_host,
@@ -970,6 +1239,18 @@ def main() -> int:
     s.add_argument("--big-host", default="khaleesi", help="the host of the cases above --max-gb ('' for none)")
     s.add_argument("--big-gb", type=float, default=28)
     s.add_argument("--out", type=Path, default=Path("."))
+    s = sub.add_parser("calibrate", help="benches/fast/measure.toml from passes of the gate's host (an A/A run)")
+    s.add_argument("--passes", type=Path, nargs="+", required=True, help="pass reports, or directories of them")
+    s.add_argument("--budget-min", type=float, default=150, help="the timed part's minutes, at most")
+    s.add_argument("--max-passes", type=int, default=16)
+    s.add_argument("--no-batch", action="store_true", help="no batched timing for the microsecond cases")
+    s.add_argument("--table", type=Path, help="a power table written before (--write-table), not simulated again")
+    s.add_argument("--write-table", type=Path)
+    s.add_argument("--out", type=Path, default=ROOT / "benches" / "fast" / "measure.toml")
+    s = sub.add_parser("blocks", help="each block's plan of a gate (release-gate.sh plan-blocks)")
+    s.add_argument("--plan", type=Path, required=True)
+    s.add_argument("--measure", type=Path, required=True)
+    s.add_argument("--out", type=Path, required=True)
     s = sub.add_parser("confirm", help="the confirmation job of each host whose run flagged a loss or an undecided case")
     s.add_argument("--reports", type=Path, nargs="+", required=True, help="every timed report so far (release-gate.json)")
     s.add_argument("--checkout", default=ROOT.as_posix())
@@ -1032,6 +1313,37 @@ def main() -> int:
         if args.json:
             args.json.write_text(json.dumps(out, indent=1), encoding="utf-8")
         return 0 if not errors else 1
+    if args.command == "calibrate":
+        files = [f for p in args.passes for f in
+                 ((sorted(p.glob("**/pass-*.json")) or sorted(p.glob("*.json"))) if p.is_dir() else [p])]
+        found = []
+        for i, f in enumerate(files):
+            m = PASS_FILE.search(f.name)
+            found.append({"n": int(m.group(1)) if m else i, "side": m.group(2) if m else "?", "path": f.name,
+                          "report": json.loads(f.read_text(encoding="utf-8"))})
+        table = (json.loads(args.table.read_text(encoding="utf-8")) if args.table else
+                 power_table(list(range(CAMPAIGN_PASSES, args.max_passes + 1, 2))))
+        if args.write_table:
+            args.write_table.write_text(json.dumps(table), encoding="utf-8")
+        result = calibrate(cases_registry.load(), found, args.budget_min, args.max_passes, table=table,
+                           batch=not args.no_batch)
+        hosts_ = sorted({str((p["report"].get("machine") or {}).get("host")) for p in found})
+        source = f"{len(found)} passes on {', '.join(hosts_)} ({', '.join(sorted({p['path'] for p in found})[:2])} ...)"
+        args.out.write_text(write_measure(result, source), encoding="utf-8")
+        under = {c: e for c, e in result["cases"].items() if e["power"] < TARGET_POWER}
+        print(f"{len(result['cases'])} cases; timed part {result['minutes']} min; passes at most {result['cap']}; "
+              f"{len(under)} below {TARGET_POWER:.0%} power at a {TARGET_LOSS:.0%} loss: "
+              + ", ".join(f"{c} ({e['noise']:.3f}, {e['power']:.2f})" for c, e in sorted(under.items())))
+        return 0
+    if args.command == "blocks":
+        plan = json.loads(args.plan.read_text(encoding="utf-8"))
+        found = blocks(plan["run"], read_measure(args.measure.read_text(encoding="utf-8"))
+                       if args.measure.is_file() else {})
+        for k, cases in enumerate(found, start=1):
+            (args.out / f"plan-block-{k}.json").write_text(json.dumps({"run": cases, "not_run": {}, "elsewhere": {}},
+                                                                      indent=1), encoding="utf-8")
+        print("blocks: " + ", ".join(f"{k} {len(c)} cases" for k, c in enumerate(found, start=1)))
+        return 0
     if args.command == "confirm":
         reports = [json.loads(path.read_text(encoding="utf-8")) for path in args.reports]
         args.out.mkdir(parents=True, exist_ok=True)
@@ -1052,9 +1364,18 @@ def main() -> int:
         rev = lambda r: subprocess.run(["git", "-C", args.checkout, "rev-parse", r], capture_output=True,  # noqa: E731
                                        text=True, check=True).stdout.strip()
         candidate = rev(args.candidate)
-        found = jobs(candidate, rev(args.harness or candidate), args.checkout, args.id or f"rg-{candidate[:8]}",
+        harness = rev(args.harness or candidate)
+        # The harness's calibration, and batched timing only where every side's perf lab batches.
+        shown = subprocess.run(["git", "-C", args.checkout, "show", f"{harness}:benches/fast/measure.toml"],
+                               capture_output=True, text=True)
+        measure = read_measure(shown.stdout if shown.returncode == 0 else None)
+        batch = all(subprocess.run(["git", "-C", args.checkout, "grep", "-q", "-e", '"--batch"', r, "--",
+                                    "crates/nrese-store/examples"], capture_output=True).returncode == 0
+                    for r in {candidate, rev(args.base), rev(args.main)})
+        found = jobs(candidate, harness, args.checkout, args.id or f"rg-{candidate[:8]}",
                      args.passes, args.cases, rev(args.base), rev(args.main), max_gb=args.max_gb,
-                     checks=not args.no_checks, big_host=args.big_host or None, big_gb=args.big_gb)
+                     checks=not args.no_checks, big_host=args.big_host or None, big_gb=args.big_gb,
+                     measure=measure, batch=batch)
         args.out.mkdir(parents=True, exist_ok=True)
         for name, job in found.items():
             (args.out / f"{name}.toml").write_text(toml_job(job), encoding="utf-8")

@@ -17,6 +17,9 @@
 #   release-gate.sh confirm TIMED_DIR... --out DIR   the confirmation job of each host whose run flagged
 #                                           a loss or an undecided case (rg-H8-confirm, rg-H8-confirm2)
 #   release-gate.sh plan-cases CASES        a confirmation's plan: just those cases (GATE_PLAN)
+#   release-gate.sh plan-blocks HARNESS     each block's plan: the cases whose noise needs its passes
+#                                           (benches/fast/measure.toml); `pass N SIDE REV HARNESS PLAN`
+#                                           runs a block's
 #   release-gate.sh verdict TIMED_DIR... CHECKS_DIR   every part together, each host's rounds combined
 #   release-gate.sh jobs CAND [OPTIONS]     the fleet jobs of a whole gate (release_gate.py jobs --help)
 #   release-gate.sh clean                   the gate's worktrees and build trees (binaries and data stay)
@@ -44,6 +47,10 @@ OUT=${FLEET_OUT:-$GATE/results}
 SPARQL_DATA=${SPARQL_DATA:-$HOME/owlrs/sparql-data}
 MAX_GB=${GATE_MAX_GB:-24}
 mkdir -p "$GATE" "$GATE_BIN" "$OUT"
+# A desktop's file indexer (GNOME's localsearch on phuoc-yu indexes all of $HOME) reads every
+# file the gate writes, during the passes: these directories are excluded from it (Tracker's
+# ignored-directories-with-content; the file's removal undoes it).
+for dir in "$GATE" "$GATE_BIN"; do [ -e "$dir/.trackerignore" ] || echo "release gate: not indexed" > "$dir/.trackerignore"; done
 log() { echo "$(date '+%F %T') $*" | tee -a "$OUT/gate.log"; }
 short() { git rev-parse --short=8 "$1"; }
 py() { PYTHONIOENCODING=utf-8 python3 -B "$@"; }
@@ -72,9 +79,13 @@ fast_env() {
   mkdir -p "$GATE/fast-data" "$GATE/data" "$GATE/query-sets" "$GATE/compact" "$GATE/reports"
 }
 
-# The plan the passes run: the gate's (prepare), or a confirmation's (plan-cases, GATE_PLAN).
+# The plan the passes run: the gate's (prepare), or a confirmation's (plan-cases, GATE_PLAN);
+# a pass of a later block runs its block's (plan-blocks: the cases whose noise needs it).
 PLAN=$GATE/${GATE_PLAN:-plan.json}
-planned() { py -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["run"]))' "$PLAN"; }
+planned() { py -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["run"]))' "${1:-$PLAN}"; }
+# The measurement per case (runs, warm-ups, repetitions; release_gate.py calibrate), the
+# harness's, for every side alike.
+MEASURE=benches/fast/measure.toml
 
 case ${1:-} in
 build)
@@ -109,10 +120,11 @@ build)
   cp "$CARGO_TARGET_DIR/release/nrese-server" "$part/release/"
   # What the revision's perf lab can do, from its source: route reports (--routes) and
   # whether it requires --queries (main's, f9b515e8: neither, and no samples per run).
-  routes=1 empty=0
+  routes=1 empty=0 batch=0
   git grep -q -e '"--routes"' "$rev" -- crates/nrese-store/examples || routes=0
   git grep -q -e 'queries DIR is required' "$rev" -- crates/nrese-store/examples && empty=1
-  printf 'routes=%s\nempty_queries=%s\n' "$routes" "$empty" > "$part/CAPABILITIES"
+  git grep -q -e '"--batch"' "$rev" -- crates/nrese-store/examples && batch=1
+  printf 'routes=%s\nempty_queries=%s\nbatch=%s\n' "$routes" "$empty" "$batch" > "$part/CAPABILITIES"
   echo "$rev" > "$part/REVISION"
   { echo "revision $rev"; (cd "$src" && rustc -V); echo "missing at this revision: ${missing[*]:-none}";
     cat "$part/CAPABILITIES"; } > "$part/BUILD.txt"
@@ -213,6 +225,12 @@ pass)
   n=$2 side=$3
   rev=$(git rev-parse "$4") || exit 2
   harness=$(git rev-parse "$5") || exit 2
+  # A block's plan (plan-blocks), else the gate's.
+  plan=$PLAN
+  if [ -n "${6:-}" ]; then
+    plan=$GATE/$6
+    [ -f "$plan" ] || { log "pass $n: no block plan $plan (plan-blocks first)"; exit 2; }
+  fi
   tree=$(worktree "$harness") || exit 2
   bin=$(bin_of "$rev")
   [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS) \
@@ -231,14 +249,32 @@ pass)
   flags=(--prepared)
   [ "$routes" = 1 ] || flags+=(--no-routes)
   [ "$empty_queries" = 1 ] && flags+=(--empty-queries)
+  [ -f "$tree/$MEASURE" ] && flags+=(--measure "$MEASURE")
+  # Batched timing (perf_lab --batch) only when every side's perf lab has it (jobs: GATE_BATCH).
+  [ "${GATE_BATCH:-0}" = 1 ] && flags+=(--batch)
   fast_env
   # A timed pass: prepared data only (fast.py refuses to make any while it times).
   export NRESE_TIMED_GATE=1
-  log "pass $n: $side $rev on the cases of $harness (${flags[*]})"
+  log "pass $n: $side $rev on the cases of $harness, plan $(basename "$plan") (${flags[*]})"
+  # The host kept quiet while the pass runs (scripts/lib/quiet-watch.py, as the measurement
+  # queue's timed chunks: this user's other busy processes stopped, other containers paused,
+  # other users' work recorded); its verdict kept with the pass. GATE_QUIET=0: unwatched.
+  watcher=""
+  if [ "${GATE_QUIET:-1}" != 0 ] && [ -d /proc ]; then
+    rm -rf "$GATE/quiet" && mkdir -p "$GATE/quiet"
+    export NRESE_QUIET_TOKEN="gate-$n-$$"
+    python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" $$ "$NRESE_QUIET_TOKEN" &
+    watcher=$!
+  fi
   (cd "$tree" && NRESE_FAST_BIN=$bin NRESE_FAST_REVISION=$rev \
-     py benches/fast/fast.py run --reps 1 --label "gate-$n-$side" --cases "$(planned)" --out "$report" "${flags[@]}") \
+     py benches/fast/fast.py run --reps 1 --label "gate-$n-$side" --cases "$(planned "$plan")" --out "$report" "${flags[@]}") \
      > "$OUT/passes/pass-$n-$side.log" 2>&1
   code=$?
+  if [ -n "$watcher" ]; then
+    kill -TERM "$watcher" 2>/dev/null && wait "$watcher"
+    cp "$GATE/quiet/watch.log" "$OUT/passes/quiet-$n-$side.log" 2>/dev/null
+    log "pass $n ($side): $(tail -1 "$GATE/quiet/watch.log" 2>/dev/null)"
+  fi
   grep -E "^rep 1 |not as expected" "$OUT/passes/pass-$n-$side.log" | tail -4
   # The cases' failures are data, the report's to judge; a pass without its report isn't.
   py -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("finished_ns") else 1)' "$report" 2>/dev/null \
@@ -365,6 +401,16 @@ unpack)
   rm -rf "$aside"
   ;;
 
+plan-blocks)
+  # Each block's plan (release_gate.py blocks): the first blocks the gate's whole plan, each
+  # later one the cases whose measured noise needs more passes (benches/fast/measure.toml).
+  harness=$(git rev-parse "$2") || exit 2
+  tree=$(worktree "$harness") || exit 2
+  (cd "$tree" && py benches/fast/release_gate.py blocks --plan "$PLAN" --measure "$MEASURE" --out "$GATE") \
+    | tee -a "$OUT/gate.log" || exit 2
+  cp "$GATE"/plan-block-*.json "$OUT/"
+  ;;
+
 plan-cases)
   # A confirmation runs just its cases, all prepared by the gate's own prepare before.
   [ -n "${GATE_PLAN:-}" ] || { log "plan-cases needs GATE_PLAN"; exit 2; }
@@ -415,7 +461,7 @@ clean)
   ;;
 
 *)
-  sed -n '2,28p' "$0"
+  sed -n '2,31p' "$0"
   exit 2
   ;;
 esac

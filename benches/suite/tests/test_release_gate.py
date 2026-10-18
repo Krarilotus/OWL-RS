@@ -566,5 +566,111 @@ class Parts(unittest.TestCase):
             self.assertIn("## Against main", text)
 
 
+
+class NoiseReduction(unittest.TestCase):
+    """benches/NOISY.md: the noise reduced in the harness, not tolerated (18 Oct 2026)."""
+
+    def blocks_passes(self, extra_case="lab-yago-tiny", sides_in_block3=("base", "main", "cand")):
+        """Two blocks of both cases, a third of one case only (its noise needs 6 passes a side)."""
+        order = ORDER + ["base", "main", "cand", "cand", "main", "base"]
+
+        def records_of(side, n):
+            out = [record()]
+            if n <= 12 or side in sides_in_block3:
+                out.append(record(case=extra_case))
+            return out
+        return passes(records_of, order=order)
+
+    def test_a_case_whose_noise_needs_more_passes_is_judged_on_its_block_s_passes(self):
+        summary = run_gate(self.blocks_passes())
+        self.assertEqual(summary["errors"], [])
+        self.assertTrue(summary["passed"])
+        row = summary["comparisons"]["base"]
+        self.assertEqual(row["lab-yago-tiny"]["dimensions"]["time/q01"]["passes"], [6, 6])
+        self.assertEqual(row["lab-olympics"]["dimensions"]["time/q01"]["passes"], [6, 6])
+        # A pass without the case is no missing record of it.
+        self.assertEqual(gate_module.evidence(self.blocks_passes()[12:], "lab-yago-tiny")["status"],
+                         ["ok"] * 6)
+
+    def test_a_later_block_must_give_every_side_the_case_alike(self):
+        summary = run_gate(self.blocks_passes(sides_in_block3=("cand",)))
+        self.assertTrue(any(e.startswith("lab-yago-tiny: ") for e in summary["errors"]), summary["errors"])
+        self.assertFalse(summary["passed"])
+
+    def test_blocks_follow_the_calibration_and_the_jobs_run_them(self):
+        measure = {"a": {"passes": 4, "seconds": 10}, "b": {"passes": 8, "seconds": 5}, "c": {"passes": 6, "seconds": 1}}
+        self.assertEqual(gate_module.blocks(["a", "b", "c"], measure), [["a", "b", "c"], ["a", "b", "c"], ["b", "c"], ["b"]])
+        found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 4, None, measure=measure)
+        timed = found["rg-test-timed"]
+        self.assertEqual(timed["steps"][0][2:], ["plan-blocks", "c" * 40])
+        pass_steps = [s for s in timed["steps"] if s[2] == "pass"]
+        self.assertEqual([s[4] for s in pass_steps], ORDER * 2)
+        self.assertEqual({s[7] for s in pass_steps[18:]}, {"plan-block-4.json"})
+        self.assertNotIn("GATE_BATCH", timed["env"])
+        self.assertEqual(gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "x", 4, None, measure=measure,
+                                          batch=True)["x-timed"]["env"]["GATE_BATCH"], "1")
+
+    def test_the_passes_measure_alike_and_the_host_s_policy_holds(self):
+        ps = passes()
+        ps[3]["report"]["options"] = {**ps[3]["report"]["options"], "measure": "a" * 64}
+        self.assertIn("the passes measured with different calibrations (fast.py --measure)", run_gate(ps)["errors"])
+        ps = passes()
+        state = {"frequency": {"driver": ["amd-pstate-epp"], "governor": ["performance"], "boost": "1"},
+                 "problems": ["other users busy: gnome-shell 1.0"]}
+        for p in ps:
+            p["report"]["host_state"] = copy.deepcopy(state)
+        ps[5]["report"]["host_state"]["frequency"]["governor"] = ["powersave"]
+        summary = run_gate(ps)
+        self.assertTrue(any("frequency policy changed" in e for e in summary["errors"]))
+        self.assertEqual(summary["host_notes"], ["other users busy: gnome-shell (passes 1, 2, 3, 4, 5, 6, 7, 8, 9, "
+                                                 "10, 11, 12)"])
+        self.assertIn("## The host as the passes met it", gate_module.render(summary))
+
+    def test_calibrate_buys_runs_where_cheap_and_passes_where_noise_needs_them_within_budget(self):
+        # Power at 4 passes falls from 1 (sd 0.1 %) to 0 (sd 10 %); 16 passes hold it to 2.5 %.
+        table = {"grid": [0.001, 0.1], **{str(n): [1.0, max(0.0, (n - 4) / 12 * 0.9)] for n in range(4, 17, 2)}}
+        quiet = [10.0, 10.01, 9.99, 10.0]
+        noisy = [10.0, 12.0, 8.5, 11.0]
+
+        def records_of(side, n):
+            i = (n - 1) % 4
+            return [record(case="lab-olympics", samples={"q01": [quiet[i]] * 5}),
+                    record(case="q-paths", samples={"broader-closure": [noisy[i]] * 5})]
+        ps = passes(records_of)
+        for p in ps:
+            for r in p["report"]["records"]:
+                r["case_s"] = 10.0
+        catalog = [{"name": "lab-olympics", "metric": "sum_p50_ms", "queries": "@olympics", "args": []},
+                   {"name": "q-paths", "metric": "sum_p50_ms", "queries": "q-paths", "args": ["--runs", "10"]}]
+        # Four passes a side of both cases: 2 blocks x 2 x (3 sides x 20 s + 3 x 40 s) = 12 min.
+        cheap = gate_module.calibrate(catalog, ps, budget_min=13, table=table, batch=False)["cases"]
+        self.assertEqual(cheap["lab-olympics"]["runs"], 200)   # 2 s of 10 ms executions
+        self.assertEqual(cheap["lab-olympics"]["warmup"], 3)
+        self.assertEqual(cheap["lab-olympics"]["passes"], 4)
+        self.assertEqual(cheap["q-paths"]["passes"], 4)        # 13 min: no room beyond four
+        rich = gate_module.calibrate(catalog, ps, budget_min=120, table=table, batch=False)
+        self.assertEqual(rich["cases"]["lab-olympics"]["passes"], 4)
+        self.assertGreater(rich["cases"]["q-paths"]["passes"], 4)
+        self.assertLessEqual(rich["minutes"], 120)
+        text = gate_module.write_measure(rich, "a test")
+        import tomllib
+        self.assertEqual(tomllib.loads(text)["case"]["q-paths"]["passes"], rich["cases"]["q-paths"]["passes"])
+
+    def test_fast_applies_the_calibration_alike_and_pools_repeated_processes(self):
+        case = {"name": "x", "tool": "perf_lab", "args": ["--runs", "5", "--qerror"], "repeat": 1}
+        with patch.dict(fast.MEASURE, {"x": {"runs": 41, "warmup": 3, "batch": 7, "repeat": 2}}, clear=True),                 patch.dict(fast.OPTIONS, {"batch": False}):
+            got = fast.measured(case)
+        self.assertEqual(got["args"], ["--runs", "41", "--qerror", "--warmup", "3"])
+        self.assertEqual(got["repeat"], 2)
+        with patch.dict(fast.MEASURE, {"x": {"batch": 7}}, clear=True), patch.dict(fast.OPTIONS, {"batch": True}):
+            self.assertEqual(fast.measured(case)["args"][-2:], ["--batch", "7"])
+        unlisted = {"name": "y", "args": ["--runs", "5"]}
+        with patch.dict(fast.MEASURE, {}, clear=True):
+            self.assertIs(fast.measured(unlisted), unlisted)
+        result = {"queries": [{"name": "q", "samples_ms": [3.0]}],
+                  "_repeats": [{"queries": [{"name": "q", "samples_ms": [1.0, 2.0]}]},
+                               {"queries": [{"name": "q", "samples_ms": [3.0]}]}]}
+        self.assertEqual(fast.samples({"metric": "sum_p50_ms"}, result), {"q": [1.0, 2.0, 3.0]})
+
 if __name__ == "__main__":
     unittest.main()

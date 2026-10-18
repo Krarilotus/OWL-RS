@@ -256,8 +256,10 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     wrapper = ('g=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); "$@"; rc=$?; '
                'echo "fast-scope-peak $(cat "$g/memory.peak" 2>/dev/null)" >&2; exit $rc')
     # At the cap the kernel kills the command alone (OOMPolicy=continue): the wrapper then still prints the peak.
-    argv = [*scope_argv(unit, f"{int(cap_gb * 1024)}m"), "sh", "-c", wrapper, "sh",
-            *(native(c, dirs) for c in command)]
+    # Pinned (pinned_cpus) the command and all it starts stay on one L3 and NUMA node.
+    cpus = pinned_cpus()
+    argv = [*scope_argv(unit, f"{int(cap_gb * 1024)}m"), *(["taskset", "-c", cpus] if cpus else []),
+            "sh", "-c", wrapper, "sh", *(native(c, dirs) for c in command)]
     started = time.monotonic()
     cleanup_error = ""
     try:
@@ -368,6 +370,91 @@ def seed_from_inputs(target: str) -> bool:
 # perf lab older than the harness (main's): no route report, `--queries` required.
 OPTIONS = {"prepared": False, "routes": True, "empty_queries": False}
 PREPARED = "PREPARED.json"
+
+# The release gate's measurement of each case (`--measure benches/fast/measure.toml`, written by
+# release_gate.py calibrate from the gate's own noise): the perf lab's runs and warm-ups a
+# process, and the case's repetitions (fresh processes for the perf lab, files a process for
+# the DL tools), the same for every side of a gate whatever the case's own arguments say.
+# `batch`: executions a timed sample (perf_lab --batch), applied only with `run --batch`, when
+# every side's perf lab has it (the gate's CAPABILITIES).
+MEASURE: dict[str, dict] = {}
+MEASURED_KEYS = ("runs", "warmup", "repeat", "batch")
+
+
+def load_measure(path: Path) -> tuple[dict[str, dict], str]:
+    """The calibration's cases (only the keys fast.py applies) and the file's SHA-256."""
+    data = path.read_bytes()
+    cases = tomllib.loads(data.decode("utf-8")).get("case", {})
+    return ({name: {k: int(v) for k, v in entry.items() if k in MEASURED_KEYS} for name, entry in cases.items()},
+            hashlib.sha256(data).hexdigest())
+
+
+def with_flag(args: list[str], flag: str, value) -> list[str]:
+    """`args` with `flag VALUE`: the existing value replaced (every occurrence), else appended."""
+    out, found = list(args), False
+    for i, a in enumerate(out[:-1]):
+        if a == flag:
+            out[i + 1], found = str(value), True
+    return out if found else out + [flag, str(value)]
+
+
+def measured(case: dict) -> dict:
+    """The case as the calibration measures it (MEASURE): the case itself without an entry."""
+    m = MEASURE.get(case["name"])
+    if not m:
+        return case
+    case = dict(case)
+    if case.get("tool", "perf_lab") == "perf_lab":
+        args = list(case.get("args", []))
+        for key in ("runs", "warmup") + (("batch",) if OPTIONS.get("batch") else ()):
+            if key in m:
+                args = with_flag(args, f"--{key}", m[key])
+        case["args"] = args
+    if "repeat" in m:
+        case["repeat"] = m["repeat"]
+    return case
+
+
+def warm_inputs(case: dict) -> int:
+    """Reads a warm case's input files once before its timing, so that every pass meets them
+    in the page cache whatever ran before (a large case evicting them, the first pass after
+    prepare); the bytes read. Cold runs empty the cache themselves (drop_page_cache)."""
+    if RUNTIME != "native" or "cold" in case.get("page_cache", ["warm"]):
+        return 0
+    total = 0
+    for path in input_files(case):
+        try:
+            with path.open("rb") as stream:
+                while chunk := stream.read(1 << 22):
+                    total += len(chunk)
+        except OSError:
+            continue  # a missing file is the case's own failure to report
+    return total
+
+
+def pinned_cpus() -> str | None:
+    """The CPUs timings run on (taskset notation): NRESE_FAST_CPUS, else the host
+    configuration's `cpus` (benches/hosts.toml: one L3 and NUMA node), else unpinned."""
+    if os.environ.get("NRESE_FAST_CPUS") is not None:
+        return os.environ["NRESE_FAST_CPUS"] or None
+    found = hosts.current()
+    config = hosts.configuration(found[0]) if found else None
+    return (config or {}).get("cpus")
+
+
+def host_state() -> dict | None:
+    """The host's state now (scripts/hosts/hygiene.py): frequency policy, THP, load, others
+    busy; None off Linux."""
+    if RUNTIME != "native" or not Path("/proc/self").exists():
+        return None
+    cpus = pinned_cpus()
+    done = subprocess.run([sys.executable, str(ROOT / "scripts" / "hosts" / "hygiene.py"),
+                           *(["--cpus", cpus] if cpus else []), "--sample-s", "1"],
+                          capture_output=True, text=True, timeout=60)
+    try:
+        return json.loads(done.stdout)
+    except ValueError:
+        return {"problems": [f"hygiene.py failed: {done.stderr.strip()[-200:]}"]}
 
 
 def ensure_data(spec: str) -> dict:
@@ -588,6 +675,7 @@ def profile_line(stderr: str, stdout: str, prefix: str = "profile ") -> dict:
 
 def run_case(case: dict, label: str, rep: int) -> dict:
     """Runs a case once; the record: status, metric, samples, memory, checks, routes."""
+    case = measured(case)
     expect = ensure_data(case["data"])
     alt_expect = ensure_data(case["data_alt"]) if case.get("data_alt") else {}
     for extra in case.get("extra", []):
@@ -600,10 +688,14 @@ def run_case(case: dict, label: str, rep: int) -> dict:
     waited = time.monotonic()
     with quiet_slot(f"fast {case['name']}"):
         waited = time.monotonic() - waited
+        warmed = warm_inputs(case)
         record = measure(case, label, rep, expect, alt_expect, data)
         if rep == 1 and case.get("frontier") and record["status"] in LIMITS:
             record["frontier"] = frontier(case, label, rep, expect, alt_expect, data)
     record["slot_wait_s"] = round(waited, 1)
+    # How the case was measured: the calibration's settings, if it has an entry, and the bytes
+    # of input read into the page cache first.
+    record["measurement"] = {**MEASURE.get(case["name"], {}), "warmed_mib": warmed >> 20}
     return record
 
 
@@ -836,6 +928,7 @@ def invocation_observation(case: dict, result: dict, stderr: str, identity: dict
     peak = process_peak(result.get("peak_mib"), phases)
     levels = client_throughput(result)
     return {"identity": identity, "samples": samples(case, result), "estimator": estimator(result),
+            **({"batch": result["batch"]} if result.get("batch") else {}),
             "metric": metric_value(case, result), "counters": counters(case, result),
             **({"throughput": levels} if levels else {}),
             "rows": {q["name"]: q.get("rows") for q in result.get("queries", []) if "name" in q},
@@ -1109,8 +1202,13 @@ def samples(case: dict, result: dict) -> dict:
         return cold_series(result, detailed=True)
     if metric == "sum_p50_ms":
         # A perf lab without samples (main's): its p50, one value per process (estimator()).
-        return {q["name"]: q["samples_ms"] if "samples_ms" in q else [q["p50_ms"]]
-                for q in result.get("queries", []) if "error" not in q and ("samples_ms" in q or "p50_ms" in q)}
+        # Repeated processes (`repeat`) pool their samples: the pass's values are all of them.
+        series: dict[str, list[float]] = {}
+        for r in result.get("_repeats", [result]):
+            for q in r.get("queries", []):
+                if "error" not in q and ("samples_ms" in q or "p50_ms" in q):
+                    series.setdefault(q["name"], []).extend(q["samples_ms"] if "samples_ms" in q else [q["p50_ms"]])
+        return series
     section = metric.split(".")[0]
     if isinstance(result.get(section), dict) and "samples_ms" in result[section]:
         return {"_": result[section]["samples_ms"]}
@@ -1294,6 +1392,13 @@ def run(args) -> int:
     # only: it never makes data while it times (fast.py prepare does, before any pass).
     if os.environ.get("NRESE_TIMED_GATE") == "1" and not OPTIONS["prepared"]:
         sys.exit("a timed gate's pass reads prepared data only: fast.py prepare first, then run --prepared")
+    MEASURE.clear()
+    OPTIONS["measure"] = None
+    OPTIONS["batch"] = getattr(args, "batch", False)
+    if getattr(args, "measure", None):
+        found, OPTIONS["measure"] = load_measure(Path(args.measure))
+        MEASURE.update(found)
+    OPTIONS["cpus"] = pinned_cpus() if RUNTIME == "native" else None
     prepared = None
     if OPTIONS["prepared"]:
         prepared = prepared_inputs(cases)
@@ -1313,6 +1418,9 @@ def run(args) -> int:
               "options": dict(OPTIONS), "records": []}
     if prepared:
         report["prepared"] = {"manifest_sha256": prepared["sha256"], "files": len(prepared["files"])}
+    # The host as the pass met it, and as it left it: a governor, boost or another user's work
+    # that differs between passes is in the passes' own reports (release_gate.py reports it).
+    report["host_state"] = host_state()
     if RUNTIME == "native":
         # What the binaries are: they come from a build host, not from this checkout.
         report["binaries"] = binaries()
@@ -1353,6 +1461,7 @@ def run(args) -> int:
                       f"metric {f['metric']}, peak {f['peak_mib']} MiB")
             out.write_text(json.dumps(report, indent=1), encoding="utf-8")
     report["git_finished"] = manifest.git(ROOT)
+    report["host_state_finished"] = host_state()
     if RUNTIME == "native":
         report["binaries_finished"] = binaries()
     if prepared:
@@ -1532,6 +1641,12 @@ def main() -> int:
                                 "reports are unchecked (ok null), never failed")
             s.add_argument("--empty-queries", action="store_true",
                            help="a perf lab that requires --queries (main's): an empty directory where a case has none")
+            s.add_argument("--measure", metavar="TOML",
+                           help="the release gate's measurement per case (benches/fast/measure.toml: runs, "
+                                "warm-ups, repetitions), for every side alike")
+            s.add_argument("--batch", action="store_true",
+                           help="with --measure: its batched timing (perf_lab --batch), when every side's "
+                                "perf lab has it")
         if name == "compete":
             s.add_argument("--systems")
             s.add_argument("--runs", type=int, default=1)
