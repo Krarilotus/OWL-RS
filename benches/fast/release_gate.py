@@ -709,7 +709,30 @@ def host_states(passes: list[dict]) -> tuple[list[str], list[str]]:
               ["the CPU frequency policy changed between passes: " +
                " | ".join(f"{k} (passes {sorted(set(v))})" for k, v in policies.items())])
     notes = [f"{problem} (passes {', '.join(map(str, sorted(ns)))})" for problem, ns in sorted(problems.items())]
-    return errors, notes
+    return errors, notes + stall_notes(passes)
+
+
+STALL_SHARE = 0.02  # a process that waited this share of its case's time met what others didn't
+
+
+def stall_notes(passes: list[dict]) -> list[str]:
+    """The cases whose processes waited, for a CPU, I/O or memory (their scope's pressure
+    stalls, fast.py `stall_ms`), more than STALL_SHARE of the case's time: where a pass that
+    stands apart met another process, a missing page cache or reclaim."""
+    out = []
+    for p in sorted(passes, key=lambda p: p["n"]):
+        for r in p["report"].get("records", []):
+            wall_ms = (r.get("wall_s") or r.get("case_s") or 0) * 1000
+            stalls: dict[str, float] = {}
+            for o in r.get("observations") or []:
+                for kind, ms in (o.get("stall_ms") or {}).items():
+                    stalls[kind] = stalls.get(kind, 0) + ms
+            high = {k: v for k, v in stalls.items() if wall_ms and v > STALL_SHARE * wall_ms}
+            if high:
+                out.append(f"{r['case']} in pass {p['n']} ({p['side']}) waited " +
+                           ", ".join(f"{k} {v:.0f} ms" for k, v in sorted(high.items())) +
+                           f" of {wall_ms / 1000:.1f} s")
+    return out
 
 
 # --- the measurement calibration (benches/fast/measure.toml) -----------------------------------
@@ -782,12 +805,14 @@ def power_at(table: dict, n: int, sigma: float) -> float:
 
 def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_passes: int = 16,
               min_passes: int = CAMPAIGN_PASSES, sides: int = 3, table: dict | None = None,
-              batch: bool = True) -> dict:
+              batch: bool = True, keep: dict | None = None) -> dict:
     """Each case's measurement from passes of the gate's host (an A/A run, or a gate's): runs,
     warm-ups, batch and repetitions from its times, passes from its noise. Every case gets
     `min_passes` a side; the passes beyond go where they buy the most power against TARGET_LOSS
     a second of the timed part (weighted by the case's judged series), until `budget_min`. The
-    passes' binaries are the sides (an A/A run's one binary counts `sides` times)."""
+    passes' binaries are the sides (an A/A run's one binary counts `sides` times). `keep`: a
+    calibration the passes were measured with: its runs, warm-ups, batch and repetitions stay
+    (the passes' times already include them), only the noise and the passes are new."""
     cases = {c["name"]: c for c in catalog}
     by_case: dict[str, dict] = {}
     revs = set()
@@ -821,7 +846,9 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
         added = 0.0  # a process's added measured time, on every side
         entry = {}
         measured_runs = e["measured"].get("runs")
-        if runs_adjustable(case) and "ok" in e["status"] and rows:
+        if keep is not None:
+            entry.update({k: v for k, v in keep.get(name, {}).items() if k in ("runs", "warmup", "batch", "repeat")})
+        elif runs_adjustable(case) and "ok" in e["status"] and rows:
             runs, warmup = case_runs(case)
             longest = max(r["median_ms"] for r in rows)
             k = 1
@@ -1245,6 +1272,7 @@ def main() -> int:
     s.add_argument("--max-passes", type=int, default=16)
     s.add_argument("--no-batch", action="store_true", help="no batched timing for the microsecond cases")
     s.add_argument("--table", type=Path, help="a power table written before (--write-table), not simulated again")
+    s.add_argument("--keep", type=Path, help="the calibration the passes ran with: its runs stay, only passes are new")
     s.add_argument("--write-table", type=Path)
     s.add_argument("--out", type=Path, default=ROOT / "benches" / "fast" / "measure.toml")
     s = sub.add_parser("blocks", help="each block's plan of a gate (release-gate.sh plan-blocks)")
@@ -1326,7 +1354,8 @@ def main() -> int:
         if args.write_table:
             args.write_table.write_text(json.dumps(table), encoding="utf-8")
         result = calibrate(cases_registry.load(), found, args.budget_min, args.max_passes, table=table,
-                           batch=not args.no_batch)
+                           batch=not args.no_batch,
+                           keep=read_measure(args.keep.read_text(encoding="utf-8")) if args.keep else None)
         hosts_ = sorted({str((p["report"].get("machine") or {}).get("host")) for p in found})
         source = f"{len(found)} passes on {', '.join(hosts_)} ({', '.join(sorted({p['path'] for p in found})[:2])} ...)"
         args.out.write_text(write_measure(result, source), encoding="utf-8")

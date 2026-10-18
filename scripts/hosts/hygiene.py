@@ -117,7 +117,9 @@ def memory() -> dict:
             "thp_defrag": read("/sys/kernel/mm/transparent_hugepage/defrag"),
             "swappiness": read("/proc/sys/vm/swappiness"),
             "numa_balancing": read("/proc/sys/kernel/numa_balancing"),
-            "aslr": read("/proc/sys/kernel/randomize_va_space")}
+            "aslr": read("/proc/sys/kernel/randomize_va_space"),
+            # Pressure stall information: fast.py records each timed process's stalls with it.
+            "psi": Path("/proc/pressure/cpu").exists()}
 
 
 def temperatures() -> dict:
