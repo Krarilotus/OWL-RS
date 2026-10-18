@@ -839,9 +839,13 @@ impl Dictionary {
         }
     }
 
-    /// The string literals matching `query`, best first; the text index first takes in the
-    /// terms interned since the last search.
-    pub fn text_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
+    /// The string literals of the corpus `corpus` gives for the index matching `query`,
+    /// best first; the text index first takes in the terms interned since the last search.
+    pub(crate) fn text_search(
+        &self,
+        query: &super::TextQuery,
+        corpus: &dyn Fn(&super::text::TextIndex) -> std::sync::Arc<super::text::Corpus>,
+    ) -> Vec<super::TextMatch> {
         self.load_text(TEXT, &self.text);
         if self.text.read().covered() < self.len() {
             let mut text = self.text.write();
@@ -875,13 +879,16 @@ impl Dictionary {
                 self.text.write().prepare_stems(language);
             }
         }
+        // The corpus before the entries' lock: building it may read the whole store.
+        let text = self.text.read();
+        let corpus = corpus(&text);
         let inner = self.inner.read();
         let text_of = |index: u64| match view_key(&inner.key(index)) {
             TermView::String(value) | TermView::LangString { value, .. } => Some(value.to_owned()),
             _ => None,
         };
         // Matches are entry numbers: as ids, by the entry's kind.
-        let mut matches = self.text.read().search(query, &text_of);
+        let mut matches = text.search(query, &corpus, &text_of);
         for found in &mut matches {
             let kind = match view_key(&inner.key(found.id)) {
                 TermView::LangString { .. } => TermKind::LangString,
@@ -970,9 +977,13 @@ impl Dictionary {
         self.vectors.read().memory_bytes()
     }
 
-    /// The IRIs whose local name's words match `query`, best first; the index first takes
-    /// in the IRIs interned since the last search.
-    pub fn iri_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
+    /// The IRIs of the corpus `corpus` gives for the index whose local name's words match
+    /// `query`, best first; the index first takes in the IRIs interned since the last search.
+    pub(crate) fn iri_search(
+        &self,
+        query: &super::TextQuery,
+        corpus: &dyn Fn(&super::text::TextIndex) -> std::sync::Arc<super::text::Corpus>,
+    ) -> Vec<super::TextMatch> {
         use rayon::prelude::*;
         self.load_text(IRI_TEXT, &self.iri_text);
         if self.iri_text.read().covered() < self.len() {
@@ -1006,12 +1017,14 @@ impl Dictionary {
                 self.iri_text.write().prepare_stems(language);
             }
         }
+        let text = self.iri_text.read();
+        let corpus = corpus(&text);
         let inner = self.inner.read();
         let text_of = |index: u64| match view_key(&inner.key(index)) {
             TermView::Iri(iri) => super::text::local_name_text(iri),
             _ => None,
         };
-        let mut matches = self.iri_text.read().search(query, &text_of);
+        let mut matches = text.search(query, &corpus, &text_of);
         for found in &mut matches {
             found.id = TermId::new(TermKind::Iri, found.id).raw();
         }

@@ -4,11 +4,13 @@
 //! Every typed word must begin a word (`alb ein` finds *Albert Einstein*). Labels are the
 //! objects of [`LABELS`]; local names are split at camel case and punctuation
 //! (`hasPart`, `Albert_Einstein`). Both come from the full-text indexes, built at the first
-//! use. A resource found both ways keeps its better score and its label.
+//! use. A resource found both ways keeps its better score and its label. Scores are ranked
+//! among what the snapshot holds (`Snapshot::text_search_in`), never what an open
+//! transaction or a later version interned.
 
 use std::collections::HashMap;
 
-use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, TextQuery};
+use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, TextQuery, TextScope};
 use nrese_rdf::{NamedNodeRef, Term};
 
 /// The properties whose values are labels.
@@ -61,10 +63,12 @@ pub(crate) fn autocomplete(
             entry.1 = label;
         }
     };
-    // Both indexes at once (each built at its first use, on every core).
+    // Both indexes at once (each built at its first use, on every core); each ranks among
+    // what `model` reads in every graph: the string literals that are objects, the IRIs
+    // that are subjects.
     let (label_hits, name_hits) = rayon::join(
-        || snapshot.text_search(&query),
-        || snapshot.iri_search(&query),
+        || snapshot.text_search_in(model, &TextScope::EVERY, &query),
+        || snapshot.iri_search_in(model, &TextScope::EVERY, &query),
     );
     // Matches come best first: the first `limit` resources of each kind are its best.
     let mut from_labels = 0;
@@ -134,4 +138,47 @@ pub(crate) fn autocomplete(
     });
     suggestions.truncate(limit);
     suggestions
+}
+
+#[cfg(test)]
+mod tests {
+    use nrese_engine::{Engine, EngineConfig};
+    use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
+
+    use super::*;
+
+    fn label(subject: &str, text: &str) -> Quad {
+        Quad::new(
+            NamedNode::new_unchecked(format!("http://example.com/{subject}")),
+            NamedNode::new_unchecked(LABELS[0]),
+            Literal::new_simple_literal(text),
+            GraphName::DefaultGraph,
+        )
+    }
+
+    /// Scores rank among what the snapshot holds: an open transaction's labels and local
+    /// names, interned in the shared dictionary, change none.
+    #[test]
+    fn uncommitted_labels_change_no_score() {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        tx.insert(label("s1", "Beta").as_ref());
+        tx.insert(label("s2", "Beta gamma delta epsilon").as_ref());
+        tx.insert(label("s3", "Other words").as_ref());
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let before = autocomplete(&snapshot, ReadModel::Materialised, "bet", 10);
+        assert_eq!(before.len(), 2, "{before:?}");
+        assert!(before[1].score < 1.0);
+        let mut tx = engine.transaction();
+        for i in 0..40 {
+            let words = format!("beta {}", "filler ".repeat(20));
+            tx.insert(label(&format!("p{i}"), &words).as_ref());
+        }
+        assert_eq!(
+            autocomplete(&snapshot, ReadModel::Materialised, "bet", 10),
+            before
+        );
+        drop(tx);
+    }
 }

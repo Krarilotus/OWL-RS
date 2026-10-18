@@ -9,7 +9,11 @@
 //! is the query's business (it joins the matches with the statements).
 //!
 //! Scores are BM25 (k1 = 1.2, b = 0.75) summed over the query's words and divided by the
-//! best match's, so relevance lies in (0, 1] as Blazegraph's does.
+//! best match's, so relevance lies in (0, 1] as Blazegraph's does. A search ranks among the
+//! documents of a [`Corpus`] only: the literals a reader's snapshot and graphs hold (the
+//! dictionary is shared by every version and transaction, and holds what no statement uses
+//! any more). Its document count, average length and each word's document frequency are
+//! counted over the corpus, so no score depends on a literal outside it.
 //!
 //! A part of the query in double quotes is a phrase (`"quick brown" fox`): it matches the
 //! literals whose words hold it as a sequence, and counts as one of the query's terms.
@@ -207,15 +211,63 @@ impl Postings {
         self.len += 1;
     }
 
-    fn decode(&self) -> Vec<(u64, u16)> {
+    /// The documents of `corpus`, with their occurrences.
+    fn decode(&self, corpus: &Corpus) -> Vec<(u64, u16)> {
         let mut out = Vec::with_capacity(self.len as usize);
         let (mut position, mut document) = (0, 0u64);
         for _ in 0..self.len {
             document += get_varint(&self.bytes, &mut position);
             let count = get_varint(&self.bytes, &mut position) as u16;
-            out.push((document, count));
+            if corpus.contains(document) {
+                out.push((document, count));
+            }
         }
         out
+    }
+}
+
+/// The documents a search ranks among (by number), with the statistics BM25 takes from
+/// them: built by the caller from what a reader sees ([`TextIndex::corpus`]).
+#[derive(Debug)]
+pub struct Corpus {
+    members: Members,
+    documents: u64,
+    total_words: u64,
+}
+
+/// A corpus's documents: a sorted list where they are few against the numbers they span,
+/// else a bit per number.
+#[derive(Debug)]
+enum Members {
+    Sorted(Vec<u64>),
+    Bits(Vec<u64>),
+}
+
+impl Corpus {
+    fn contains(&self, document: u64) -> bool {
+        match &self.members {
+            Members::Sorted(sorted) => sorted.binary_search(&document).is_ok(),
+            Members::Bits(bits) => bits
+                .get((document / 64) as usize)
+                .is_some_and(|word| word >> (document % 64) & 1 == 1),
+        }
+    }
+
+    /// Its documents (the indexed ones: literals with a word).
+    pub fn documents(&self) -> u64 {
+        self.documents
+    }
+
+    /// Its words, counted with repetition.
+    pub fn total_words(&self) -> u64 {
+        self.total_words
+    }
+
+    /// Bytes it holds.
+    pub fn memory_bytes(&self) -> usize {
+        match &self.members {
+            Members::Sorted(v) | Members::Bits(v) => v.capacity() * 8,
+        }
     }
 }
 
@@ -441,6 +493,38 @@ impl TextIndex {
         self.word_count += new_words;
     }
 
+    /// The corpus of `members` (document numbers, ascending, below `span`; numbers this
+    /// index has no words for are left out), with their count and words.
+    pub(crate) fn corpus(&self, members: impl IntoIterator<Item = u64>, span: u64) -> Corpus {
+        let (mut documents, mut total_words) = (0u64, 0u64);
+        let mut sorted = Vec::new();
+        for document in members {
+            let length = self.lengths.get(document as usize).copied().unwrap_or(0);
+            if length > 0 {
+                debug_assert!(sorted.last().is_none_or(|&last| last < document));
+                sorted.push(document);
+                documents += 1;
+                total_words += u64::from(length);
+            }
+        }
+        // A bit per number where that is smaller than eight bytes per member.
+        let members = if (sorted.len() as u64) * 64 > span {
+            let mut bits = vec![0u64; span.div_ceil(64) as usize];
+            for document in sorted {
+                bits[(document / 64) as usize] |= 1 << (document % 64);
+            }
+            Members::Bits(bits)
+        } else {
+            sorted.shrink_to_fit();
+            Members::Sorted(sorted)
+        };
+        Corpus {
+            members,
+            documents,
+            total_words,
+        }
+    }
+
     /// Marks the dictionary entries below `covered` as looked at.
     pub(crate) fn cover(&mut self, covered: u64) {
         self.covered = covered;
@@ -478,14 +562,15 @@ impl TextIndex {
         );
     }
 
-    /// The postings of `word`: of the words it starts as a prefix, of the words within the
-    /// edits of a fuzzy match, of the words with its stem with `stems`, else its own; merged
-    /// by document (occurrences added up).
+    /// The postings of `word` in `corpus`: of the words it starts as a prefix, of the words
+    /// within the edits of a fuzzy match, of the words with its stem with `stems`, else its
+    /// own; merged by document (occurrences added up).
     fn postings_of(
         &self,
         word: &str,
         matching: Match,
         stems: Option<(&Stemmer, &Stems)>,
+        corpus: &Corpus,
     ) -> Cow<'_, [(u64, u16)]> {
         let lists: Vec<&Postings> = match (matching, stems) {
             (Match::Fuzzy(edits), _) => self
@@ -511,10 +596,12 @@ impl TextIndex {
         };
         match lists.as_slice() {
             [] => Cow::Borrowed(&[]),
-            [list] => Cow::Owned(list.decode()),
+            [list] => Cow::Owned(list.decode(corpus)),
             _ => {
-                let mut merged: Vec<(u64, u16)> =
-                    lists.into_iter().flat_map(Postings::decode).collect();
+                let mut merged: Vec<(u64, u16)> = lists
+                    .into_iter()
+                    .flat_map(|list| list.decode(corpus))
+                    .collect();
                 merged.sort_unstable_by_key(|&(id, _)| id);
                 merged.dedup_by(|later, kept| {
                     let same = later.0 == kept.0;
@@ -536,18 +623,19 @@ impl TextIndex {
         }
     }
 
-    /// The literals matching `query`, best first (ties by id); `text_of` gives a literal's
-    /// text, to check phrases.
+    /// The literals of `corpus` matching `query`, best first (ties by id), scored with the
+    /// corpus's statistics; `text_of` gives a literal's text, to check phrases.
     pub(crate) fn search(
         &self,
         query: &TextQuery,
+        corpus: &Corpus,
         text_of: &dyn Fn(u64) -> Option<String>,
     ) -> Vec<TextMatch> {
-        let documents = self.documents as f64;
+        let documents = corpus.documents as f64;
         if documents == 0.0 {
             return Vec::new();
         }
-        let average = self.total_words as f64 / documents;
+        let average = corpus.total_words as f64 / documents;
         let (k1, b) = (1.2, 0.75);
         // Stemming, where the language has a stemmer and its stems are prepared.
         let stemming = query
@@ -614,7 +702,7 @@ impl TextIndex {
         for phrase in &phrases {
             let lists: Vec<Cow<'_, [(u64, u16)]>> = phrase
                 .iter()
-                .map(|word| self.postings_of(word, Match::Exact, stems))
+                .map(|word| self.postings_of(word, Match::Exact, stems, corpus))
                 .collect();
             if lists.iter().any(|list| list.is_empty()) {
                 continue;
@@ -647,7 +735,7 @@ impl TextIndex {
             }
         }
         for (word, matching) in &terms {
-            let found = self.postings_of(word, *matching, stems);
+            let found = self.postings_of(word, *matching, stems, corpus);
             let frequency = found.len() as f64;
             let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
             for &(id, count) in found.iter() {
@@ -667,7 +755,7 @@ impl TextIndex {
         let excluded: std::collections::HashSet<u64> = excluded
             .iter()
             .flat_map(|word| {
-                self.postings_of(word, Match::Exact, stems)
+                self.postings_of(word, Match::Exact, stems, corpus)
                     .iter()
                     .map(|&(id, _)| id)
                     .collect::<Vec<_>>()
@@ -713,6 +801,12 @@ mod tests {
         matches.iter().map(|m| m.id).collect()
     }
 
+    /// Every document the index holds.
+    fn every(index: &TextIndex) -> Corpus {
+        let span = index.lengths.len() as u64;
+        index.corpus(0..span, span)
+    }
+
     #[test]
     fn words_prefixes_all_words_and_ranking() {
         let texts = [
@@ -724,6 +818,7 @@ mod tests {
             "brown, quick: the fox",
         ];
         let index = index(&texts);
+        let corpus = every(&index);
         let text_of = |id: u64| texts.get(id as usize).map(|t| (*t).to_owned());
         let query = |text: &str, all_words: bool, prefix: bool| {
             index.search(
@@ -733,6 +828,7 @@ mod tests {
                     prefix,
                     stem: None,
                 },
+                &corpus,
                 &text_of,
             )
         };
@@ -791,6 +887,7 @@ mod tests {
                     prefix: false,
                     stem: stem.map(str::to_owned),
                 },
+                &every(index),
                 &text_of,
             ));
             found.sort_unstable();
@@ -842,6 +939,7 @@ mod tests {
             "quickly",
         ];
         let index = index(&texts);
+        let corpus = every(&index);
         let text_of = |id: u64| texts.get(id as usize).map(|t| (*t).to_owned());
         let query = |text: &str| {
             let mut found = ids(&index.search(
@@ -851,6 +949,7 @@ mod tests {
                     prefix: false,
                     stem: None,
                 },
+                &corpus,
                 &text_of,
             ));
             found.sort_unstable();
@@ -909,11 +1008,70 @@ mod tests {
                 prefix: false,
                 stem: None,
             };
-            let a = parallel.search(&query, &text_of);
-            let b = sequential.search(&query, &text_of);
+            let a = parallel.search(&query, &every(&parallel), &text_of);
+            let b = sequential.search(&query, &every(&sequential), &text_of);
             assert!(!a.is_empty(), "{text}");
             assert_eq!(a, b, "{text}");
         }
         assert_eq!(parallel.word_count, sequential.word_count);
+    }
+
+    /// A search in a corpus scores as an index of the corpus's documents alone would: the
+    /// other documents change no relevance and no order, in either representation.
+    #[test]
+    fn a_corpus_scores_as_its_documents_alone() {
+        let texts = [
+            "alpha one two",
+            "beta",
+            "beta extra",
+            "beta more extra",
+            "gamma alpha",
+            "filler",
+            "\"quoted\" alpha beta",
+            "beta three",
+            "beta four",
+            "beta five",
+        ];
+        let kept = [0u64, 1, 4, 5, 6];
+        let whole = index(&texts);
+        let mut alone = TextIndex::default();
+        for &i in &kept {
+            alone.add(i, texts[i as usize]);
+        }
+        let text_of = |id: u64| texts.get(id as usize).map(|t| (*t).to_owned());
+        let sparse = whole.corpus(kept, 1 << 20);
+        let dense = whole.corpus(kept, texts.len() as u64);
+        assert!(matches!(sparse.members, Members::Sorted(_)));
+        assert!(matches!(dense.members, Members::Bits(_)));
+        assert_eq!((dense.documents(), dense.total_words()), (5, 10));
+        for text in [
+            "alpha beta",
+            "beta",
+            "\"alpha beta\" gamma",
+            "ext*",
+            "bet~1",
+        ] {
+            let query = TextQuery {
+                text: text.to_owned(),
+                all_words: false,
+                prefix: false,
+                stem: None,
+            };
+            let expected = alone.search(&query, &every(&alone), &text_of);
+            assert_eq!(whole.search(&query, &sparse, &text_of), expected, "{text}");
+            assert_eq!(whole.search(&query, &dense, &text_of), expected, "{text}");
+        }
+        // Without the corpus's restriction, `beta`'s other literals put `alpha` ahead.
+        let query = TextQuery {
+            text: "alpha beta".to_owned(),
+            all_words: false,
+            prefix: false,
+            stem: None,
+        };
+        let place = |found: &[TextMatch], id: u64| found.iter().position(|m| m.id == id);
+        let kept_order = whole.search(&query, &dense, &text_of);
+        assert!(place(&kept_order, 1) < place(&kept_order, 0));
+        let every_order = whole.search(&query, &every(&whole), &text_of);
+        assert!(place(&every_order, 0) < place(&every_order, 1));
     }
 }
