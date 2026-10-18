@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use nrese_engine::ReadModel;
 use nrese_reasoner::rulesets::Ruleset;
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_sparql::GraphAccess;
 use nrese_store::{
     BulkLoadRequest, GraphTarget, MutationCommand, MutationPipeline, MutationTicket, Requester,
@@ -70,10 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         started.elapsed().as_secs_f64(),
         report.inferred
     );
-    let pipeline = MutationPipeline::new(
-        Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),
-    );
+    let pipeline = MutationPipeline::new(Arc::clone(&store), ReasonerConfig::for_mode(mode));
     let access = Arc::new(GraphAccess {
         graphs: (0..graphs / 2).map(|g| format!("{GRAPH}{g}")).collect(),
         default_graph: true,

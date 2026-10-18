@@ -2,13 +2,13 @@
 //! opened again and removed without a server.
 
 use crate::support::Writes;
-use nrese_reasoner::{ReasonerConfig, ReasonerService};
+use nrese_reasoner::ReasonerConfig;
 use nrese_store::catalog::{Catalog, CatalogError, DEFAULT_REPOSITORY, RepositorySettings};
 use nrese_store::{StoreConfig, StoreService};
 
 fn open(dir: &std::path::Path) -> Catalog {
     let store = StoreService::new(StoreConfig::on_disk(dir)).expect("store");
-    Catalog::open(store, ReasonerService::new(ReasonerConfig::default())).expect("catalogue")
+    Catalog::open(store, ReasonerConfig::default()).expect("catalogue")
 }
 
 fn titled(title: &str) -> RepositorySettings {

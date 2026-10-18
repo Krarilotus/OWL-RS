@@ -146,7 +146,7 @@ fn validate_authenticated_posture(policy: &PolicyConfig) -> Result<(), &'static 
 
 #[cfg(test)]
 mod tests {
-    use nrese_reasoner::{ReasonerConfig, ReasonerService};
+    use nrese_reasoner::ReasonerConfig;
     use nrese_store::{StoreConfig, StoreMode, StoreService};
 
     use crate::ai::AiSuggestionService;
@@ -161,7 +161,7 @@ mod tests {
 
     fn test_state(policy: PolicyConfig, deployment_posture: DeploymentPosture) -> AppState {
         let store = StoreService::new(StoreConfig::default()).expect("store");
-        let reasoner = ReasonerService::new(ReasonerConfig::default());
+        let reasoner = ReasonerConfig::default();
         AppState::new(
             store,
             reasoner,
