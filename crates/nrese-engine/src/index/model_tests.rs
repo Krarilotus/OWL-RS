@@ -348,6 +348,43 @@ fn default_graph_versions_turn_into_quad_versions_at_a_named_graph() {
     }
 }
 
+/// The walking count of distinct values equals the groups listed, over ranges cut into
+/// parallel parts (groups of every size, one across many cuts); with deletions in range
+/// it declines, and the listing decides.
+#[test]
+fn distinct_counts_equal_the_listed_groups() {
+    // Subject s has 2s + 1 quads; subject 7 owns a stretch across several cuts.
+    let mut quads: Vec<EncodedQuad> = (0..300_000u64)
+        .map(|i| {
+            let s = (i as f64).sqrt() as u64;
+            EncodedQuad::new(term(1000 + s), term(1), term(10_000 + i), graph(0))
+        })
+        .collect();
+    quads.extend(
+        (0..200_000u64).map(|i| EncodedQuad::new(term(7), term(1), term(400_000 + i), graph(0))),
+    );
+    let version = IndexVersion::from_quads(Layout::DefaultGraph, quads.clone());
+    let pattern = QuadPattern {
+        subject: None,
+        predicate: Some(term(1)),
+        object: None,
+        graph: GraphSelector::Any,
+    };
+    let plan = AccessPlan::in_permutation(&pattern, Permutation::Psog).unwrap();
+    let mut listed = Vec::new();
+    version.group_counts(&plan, 1, &mut listed);
+    assert_eq!(version.count_groups(&plan, 1), Some(listed.len() as u64));
+    // Objects: every quad its own group.
+    let by_object = AccessPlan::in_permutation(&pattern, Permutation::Posg).unwrap();
+    assert_eq!(
+        version.count_groups(&by_object, 1),
+        Some(quads.len() as u64)
+    );
+    let deletes: Vec<EncodedQuad> = quads.iter().step_by(7).copied().collect();
+    let deleted = version.with_delta(&[], &deletes);
+    assert_eq!(deleted.count_groups(&plan, 1), None);
+}
+
 /// Group counts over ranges large enough to be walked in parallel parts: groups that span
 /// the parts' cuts are added up once, and deletions in a later run still count.
 #[test]
