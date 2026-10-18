@@ -18,6 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nrese_vector::{Hit, Hnsw, HnswParameters, HnswParts, Metric, Vectors};
 use parking_lot::RwLock;
@@ -44,7 +45,7 @@ pub enum VectorStrategy {
 }
 
 /// A vector search.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct VectorQuery {
     pub vector: Vec<f32>,
     pub k: usize,
@@ -55,6 +56,39 @@ pub struct VectorQuery {
     /// How many vectors the filter accepts, if the caller knows (it chooses the
     /// strategy).
     pub accepted: Option<usize>,
+    /// The most hits the search may hold at once (a query's memory budget, as a join's
+    /// row limit): a search that would hold more is refused before it allocates
+    /// ([`VectorStop::TooLarge`]). `None`: no limit.
+    pub max_hits: Option<usize>,
+    /// The caller's cancellation flag: a search that sees it set stops
+    /// ([`VectorStop::Cancelled`]).
+    pub stop: Option<Arc<AtomicBool>>,
+}
+
+/// Why a search gave no hits ([`VectorQuery::max_hits`], [`VectorQuery::stop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorStop {
+    /// It would hold `hits` at once, more than [`VectorQuery::max_hits`].
+    TooLarge { hits: usize },
+    /// Its stop flag was set.
+    Cancelled,
+}
+
+impl VectorQuery {
+    fn stopped(&self) -> Result<(), VectorStop> {
+        match &self.stop {
+            Some(stop) if stop.load(Ordering::Relaxed) => Err(VectorStop::Cancelled),
+            _ => Ok(()),
+        }
+    }
+
+    /// Refused if holding `hits` at once is more than the query may.
+    fn fits(&self, hits: usize) -> Result<(), VectorStop> {
+        match self.max_hits {
+            Some(max) if hits > max => Err(VectorStop::TooLarge { hits }),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl VectorQuery {
@@ -66,6 +100,8 @@ impl VectorQuery {
             strategy: VectorStrategy::default(),
             ef: 64,
             accepted: None,
+            max_hits: None,
+            stop: None,
         }
     }
 }
@@ -216,17 +252,19 @@ impl VectorIndex {
         &self,
         query: &VectorQuery,
         accept: &(dyn Fn(u64) -> bool + Sync),
-    ) -> (Vec<Hit>, VectorSearchReport) {
+    ) -> Result<(Vec<Hit>, VectorSearchReport), VectorStop> {
+        query.stopped()?;
         let Some(space) = self.spaces.get(&query.vector.len()) else {
-            return (
+            return Ok((
                 Vec::new(),
                 VectorSearchReport {
                     space: 0,
                     graph: false,
                     scanned: 0,
                 },
-            );
+            ));
         };
+        let stop = query.stop.as_deref();
         let len = space.vectors.len();
         let graph = space
             .graphs
@@ -235,39 +273,60 @@ impl VectorIndex {
             .and_then(|slot| slot.graph.as_ref())
             .filter(|_| uses_graph(space, query));
         let Some(graph) = graph else {
-            let hits =
-                nrese_vector::exact(&space.vectors, &query.vector, query.k, query.metric, accept);
-            return (
+            query.fits(nrese_vector::exact_held(query.k, 0, len))?;
+            let hits = nrese_vector::exact_from_until(
+                &space.vectors,
+                0,
+                &query.vector,
+                query.k,
+                query.metric,
+                accept,
+                stop,
+            );
+            query.stopped()?;
+            return Ok((
                 hits,
                 VectorSearchReport {
                     space: len,
                     graph: false,
                     scanned: len,
                 },
-            );
+            ));
         };
         // Over-fetch for the filter: the beam keeps accepted vectors only, so a filter
         // that rejects many needs a wider one.
         let share = query.accepted.map_or(1.0, |n| n as f64 / len.max(1) as f64);
         let ef = ((query.ef.max(query.k) as f64) / share.clamp(EXACT_SHARE, 1.0)).ceil() as usize;
-        let from_graph = graph.search(&space.vectors, &query.vector, query.k, ef, accept);
-        let tail = nrese_vector::exact_from(
+        // The graph search's results and candidates (at most its beam each, at most the
+        // vectors it covers), then the tail's scan, then the merge.
+        let covered = graph.len();
+        query.fits(
+            ef.max(query.k).min(covered).saturating_mul(2)
+                + nrese_vector::exact_held(query.k, covered, len)
+                + query.k.min(len),
+        )?;
+        let from_graph =
+            graph.search_until(&space.vectors, &query.vector, query.k, ef, accept, stop);
+        query.stopped()?;
+        let tail = nrese_vector::exact_from_until(
             &space.vectors,
-            graph.len(),
+            covered,
             &query.vector,
             query.k,
             query.metric,
             accept,
+            stop,
         );
+        query.stopped()?;
         let hits = nrese_vector::merge(from_graph.into_iter().chain(tail), query.k);
-        (
+        Ok((
             hits,
             VectorSearchReport {
                 space: len,
                 graph: true,
-                scanned: len - graph.len(),
+                scanned: len - covered,
             },
-        )
+        ))
     }
 
     /// Whether no space has a vector.
@@ -527,6 +586,100 @@ fn launch_build<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn space(n: usize) -> VectorIndex {
+        let mut vectors = Vectors::new(1);
+        for id in 0..n {
+            vectors.push(id as u64, &[id as f32]);
+        }
+        let mut index = VectorIndex::default();
+        index.spaces.insert(
+            1,
+            Space {
+                vectors,
+                graphs: Vec::new(),
+            },
+        );
+        index
+    }
+
+    /// A search that would hold more hits than its query may is refused before it
+    /// allocates, on the exact route and through the graph; within the limit it answers;
+    /// a set stop flag stops it on either route.
+    #[test]
+    fn searches_past_their_hit_limit_or_stopped_answer_nothing() {
+        let n = 10_000;
+        let index = space(n);
+        let exact = |k, max_hits, stop: Option<bool>| VectorQuery {
+            strategy: VectorStrategy::Exact,
+            max_hits,
+            stop: stop.map(|s| Arc::new(AtomicBool::new(s))),
+            ..VectorQuery::new(vec![0.5], k)
+        };
+        let held = nrese_vector::exact_held(usize::MAX, 0, n);
+        assert_eq!(
+            index
+                .search(&exact(usize::MAX, Some(held - 1), None), &|_| true)
+                .unwrap_err(),
+            VectorStop::TooLarge { hits: held }
+        );
+        let (all, _) = index
+            .search(&exact(usize::MAX, Some(held), None), &|_| true)
+            .unwrap();
+        assert_eq!(all.len(), n);
+        let (few, _) = index
+            .search(&exact(10, Some(100), None), &|_| true)
+            .unwrap();
+        assert_eq!(few.len(), 10);
+        assert_eq!(
+            index
+                .search(&exact(10, None, Some(true)), &|_| true)
+                .unwrap_err(),
+            VectorStop::Cancelled
+        );
+        assert_eq!(
+            index
+                .search(&exact(10, None, Some(false)), &|_| true)
+                .unwrap(),
+            index.search(&exact(10, None, None), &|_| true).unwrap()
+        );
+        // Through the graph: its beam and candidates count too.
+        let approximate = |k, ef, max_hits, stop: Option<bool>| VectorQuery {
+            strategy: VectorStrategy::Approximate,
+            ef,
+            ..exact(k, max_hits, stop)
+        };
+        let index = {
+            let lock = RwLock::new(space(n));
+            build(&lock, &approximate(1, 64, None, None));
+            lock.into_inner()
+        };
+        assert!(
+            index
+                .search(&approximate(10, 64, None, None), &|_| true)
+                .unwrap()
+                .1
+                .graph
+        );
+        assert!(matches!(
+            index.search(&approximate(10, n, Some(1_000), None), &|_| true),
+            Err(VectorStop::TooLarge { .. })
+        ));
+        assert_eq!(
+            index
+                .search(&approximate(10, 64, Some(1_000), None), &|_| true)
+                .unwrap()
+                .0
+                .len(),
+            10
+        );
+        assert_eq!(
+            index
+                .search(&approximate(10, 64, None, Some(true)), &|_| true)
+                .unwrap_err(),
+            VectorStop::Cancelled
+        );
+    }
 
     #[test]
     fn failed_launch_returns_only_its_build_slot_for_retry() {

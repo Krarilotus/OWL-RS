@@ -16,12 +16,12 @@
 //! | Predicate | Object |
 //! |---|---|
 //! | `nrv:near` | the query vector: a vector literal, or a variable the rest of the query binds to one (a search per value) |
-//! | `nrv:k` | how many nearest vectors (default 10) |
+//! | `nrv:k` | how many nearest vectors (a positive whole number, default 10): no fixed maximum, the query's memory budget bounds the hits a search may hold |
 //! | `nrv:score` | a variable: the cosine similarity or dot product, or the Euclidean distance |
 //! | `nrv:rank` | a variable: the rank, from 1 |
 //! | `nrv:metric` | `"cosine"` (the default), `"dot"` or `"l2"` |
 //! | `nrv:exact` | `true`: compare every vector (else large spaces are searched through an HNSW graph) |
-//! | `nrv:searchBudget` | the graph search's beam (default 64): wider finds more of the true nearest |
+//! | `nrv:searchBudget` | the graph search's beam (a positive whole number, default 64): wider finds more of the true nearest; bounded as `nrv:k` |
 //!
 //! The subject is the matched vector literal. Only literals the query's dataset uses as
 //! objects are found (so a user sees no vector from a graph it may not read). When the
@@ -32,7 +32,7 @@
 use std::collections::{HashMap, HashSet};
 
 use nrese_engine::vector::Metric;
-use nrese_engine::{TermId, VectorQuery, VectorSearchReport, VectorStrategy};
+use nrese_engine::{TermId, VectorQuery, VectorSearchReport, VectorStop, VectorStrategy};
 use nrese_exec::{Budget, IdTable, Reservation, UNDEF};
 use nrese_rdf::{Literal, Term, Variable};
 use nrese_sparql_syntax::algebra::GraphPattern;
@@ -47,9 +47,6 @@ pub(super) const SEARCH: &str = "urn:nrese:vector:search";
 
 /// Nearest vectors per query vector when `nrv:k` isn't given.
 const DEFAULT_K: usize = 10;
-
-/// The most `nrv:k` takes.
-const MAX_K: usize = 10_000;
 
 /// The search goes first when the pattern joined to it is estimated at more than this
 /// many rows per vector wanted.
@@ -123,7 +120,8 @@ fn parse(inner: &GraphPattern) -> Result<Search, QueryEvaluationError> {
         let number = || -> Result<usize, QueryEvaluationError> {
             literal
                 .and_then(|l| l.value().parse::<usize>().ok())
-                .ok_or_else(|| argument(format!("nrv:{option} takes a whole number")))
+                .filter(|&n| n > 0)
+                .ok_or_else(|| argument(format!("nrv:{option} takes a positive whole number")))
         };
         match option {
             "near" => {
@@ -136,8 +134,8 @@ fn parse(inner: &GraphPattern) -> Result<Search, QueryEvaluationError> {
                     _ => return Err(argument("nrv:near takes a vector literal or a variable")),
                 });
             }
-            "k" => search.k = number()?.clamp(1, MAX_K),
-            "searchBudget" => search.ef = Some(number()?.clamp(1, 100 * MAX_K)),
+            "k" => search.k = number()?,
+            "searchBudget" => search.ef = Some(number()?),
             "score" => {
                 search.score = Some(variable.ok_or_else(|| argument("nrv:score takes a variable"))?)
             }
@@ -266,7 +264,7 @@ impl Context<'_> {
         let search = parse(inner)?;
         let estimate = self.estimate(local);
         let probe_first = match &search.near {
-            Near::Vector(_) => estimate >= (PROBE_ABOVE * search.k) as f64,
+            Near::Vector(_) => estimate >= PROBE_ABOVE as f64 * search.k as f64,
             Near::Variable(_) => false,
         };
         if !probe_first {
@@ -355,7 +353,9 @@ impl Context<'_> {
         search: &Search,
         vector: Vec<f32>,
         accepted: Option<usize>,
-        mut fetch: impl FnMut(&VectorQuery) -> (Vec<(TermId, f32)>, VectorSearchReport),
+        mut fetch: impl FnMut(
+            &VectorQuery,
+        ) -> Result<(Vec<(TermId, f32)>, VectorSearchReport), VectorStop>,
         mut keep: impl FnMut(TermId) -> NativeResult<Option<T>>,
     ) -> NativeResult<Vec<(TermId, f32, T)>> {
         let mut query = VectorQuery {
@@ -372,7 +372,15 @@ impl Context<'_> {
         let mut next = Vec::new();
         loop {
             self.check()?;
-            let (hits, report) = fetch(&query);
+            // The hits a search may hold, as a join's rows: what the budget leaves (a hit
+            // is an id and a distance), and the query's cancellation.
+            let limit = self.row_limit(2);
+            query.max_hits = Some(limit.max_rows);
+            query.stop = limit.stop;
+            let (hits, report) = fetch(&query).map_err(|stop| match stop {
+                VectorStop::TooLarge { hits } => self.too_large(hits, 2),
+                VectorStop::Cancelled => QueryEvaluationError::Cancelled.into(),
+            })?;
             let fetched = hits.len();
             let mut hits = hits.into_iter().peekable();
             let mut pending = kept.drain(..);
@@ -406,7 +414,7 @@ impl Context<'_> {
             if kept.len() == search.k || fetched < query.k || query.k >= report.space {
                 return Ok(kept);
             }
-            query.k = (query.k * 4).min(report.space.max(1));
+            query.k = query.k.saturating_mul(4).min(report.space.max(1));
             query.ef = query.ef.max(query.k);
         }
     }
@@ -508,6 +516,43 @@ mod tests {
     use nrese_exec::SharedBudget;
     use std::cell::{Cell, RefCell};
 
+    /// `nrv:k` and `nrv:searchBudget` are taken as given, whatever their size (the budget
+    /// bounds what a search holds, not a clamp); zero, a negative or an unrepresentable
+    /// number is an argument error naming the option.
+    #[test]
+    fn search_options_are_taken_as_given_and_zero_is_refused() {
+        use nrese_rdf::NamedNode;
+        use nrese_sparql_syntax::term::TriplePattern;
+        let block = |k: &str, beam: &str| GraphPattern::Bgp {
+            patterns: [("near", "[1]"), ("k", k), ("searchBudget", beam)]
+                .into_iter()
+                .map(|(name, value)| TriplePattern {
+                    subject: TermPattern::Variable(Variable::new_unchecked("v")),
+                    predicate: NamedNodePattern::NamedNode(NamedNode::new_unchecked(format!(
+                        "urn:nrese:vector:{name}"
+                    ))),
+                    object: TermPattern::Literal(Literal::new_simple_literal(value)),
+                })
+                .collect(),
+        };
+        for (k, beam) in [(1, 1), (10_001, 1_000_001), (usize::MAX, usize::MAX)] {
+            let parsed = parse(&block(&k.to_string(), &beam.to_string())).unwrap();
+            assert_eq!((parsed.k, parsed.ef), (k, Some(beam)));
+        }
+        for (k, beam, option) in [
+            ("0", "64", "nrv:k"),
+            ("10", "0", "nrv:searchBudget"),
+            ("-1", "64", "nrv:k"),
+            ("10", "18446744073709551616", "nrv:searchBudget"),
+        ] {
+            let error = parse(&block(k, beam)).unwrap_err().to_string();
+            assert!(
+                error.contains(option) && error.contains("positive whole number"),
+                "{error}"
+            );
+        }
+    }
+
     fn search(k: usize) -> Search {
         Search {
             matched: Variable::new_unchecked("v"),
@@ -587,7 +632,7 @@ mod tests {
                         ],
                         _ => panic!("unnecessary search"),
                     };
-                    (hits(&values), report(100))
+                    Ok((hits(&values), report(100)))
                 },
                 |id| {
                     let id = id.raw();
@@ -678,10 +723,10 @@ mod tests {
                     Some(100),
                     |query| {
                         assert_eq!(query.accepted, Some(100));
-                        (
+                        Ok((
                             hits(&rounds.next().expect("two rounds suffice")),
                             report(100),
-                        )
+                        ))
                     },
                     |id| {
                         assert!(seen.insert(id.raw()), "each ID probed once");
@@ -713,7 +758,7 @@ mod tests {
                     |_| {
                         assert!(!fetched);
                         fetched = true;
-                        (hits(&values), report(space))
+                        Ok((hits(&values), report(space)))
                     },
                     |id| Ok((id.raw() != 0).then_some(())),
                 )
@@ -753,14 +798,14 @@ mod tests {
                     if round == 2 && stop == "fetch_cancel" {
                         token.cancel();
                     }
-                    (
+                    Ok((
                         if round == 1 {
                             hits(&[(0, 0.0), (8, 0.8), (9, 0.9)])
                         } else {
                             hits(&[(0, 0.0), (1, 0.1), (2, 0.2), (3, 0.3)])
                         },
                         report(100),
-                    )
+                    ))
                 },
                 |id| {
                     if id.raw() == 0 {
@@ -862,7 +907,9 @@ mod tests {
             strategy: VectorStrategy::Exact,
             ..VectorQuery::new(vec![0.0], 1)
         };
-        let id = snapshot.vector_search(&query, &|_| true).0[0].0.raw();
+        let id = snapshot.vector_search(&query, &|_| true).unwrap().0[0]
+            .0
+            .raw();
         let empty = ctx
             .eval_from(payload(&ctx, id), &rejected)
             .map_err(QueryEvaluationError::from)

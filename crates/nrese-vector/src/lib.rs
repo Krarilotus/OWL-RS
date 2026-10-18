@@ -15,6 +15,8 @@ pub use hnsw::{Hnsw, HnswParameters, HnswParts};
 pub use kernels::{Metric, dot, squared_l2};
 pub use literal::{DATATYPE, NAMESPACE, ParseError, lexical, parse};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use rayon::prelude::*;
 
 /// Vectors per chunk: appending copies at most the last chunk when a snapshot of the
@@ -193,6 +195,21 @@ pub fn exact_from(
     metric: Metric,
     accept: &(dyn Fn(u64) -> bool + Sync),
 ) -> Vec<Hit> {
+    exact_from_until(vectors, start, query, k, metric, accept, None)
+}
+
+/// [`exact_from`], stopping early once `stop` is set: each part checks it before its
+/// [`CHUNK`] vectors, and a stopped scan's hits are incomplete (the caller checks the
+/// flag after it, as a join checks its row limit's).
+pub fn exact_from_until(
+    vectors: &Vectors,
+    start: usize,
+    query: &[f32],
+    k: usize,
+    metric: Metric,
+    accept: &(dyn Fn(u64) -> bool + Sync),
+    stop: Option<&AtomicBool>,
+) -> Vec<Hit> {
     if k == 0 || start >= vectors.len() || query.len() != vectors.dimension {
         return Vec::new();
     }
@@ -200,9 +217,13 @@ pub fn exact_from(
     let parts: Vec<Vec<Hit>> = (start / CHUNK..vectors.chunks.len())
         .into_par_iter()
         .map(|c| {
-            let mut best = TopK::new(k);
+            if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+                return Vec::new();
+            }
             let first = (c * CHUNK).max(start);
-            for position in first..((c + 1) * CHUNK).min(vectors.len()) {
+            let end = ((c + 1) * CHUNK).min(vectors.len());
+            let mut best = TopK::new(k, end - first);
+            for position in first..end {
                 let position = position as u32;
                 let id = vectors.id(position);
                 if accept(id) {
@@ -212,16 +233,23 @@ pub fn exact_from(
             best.into_sorted()
         })
         .collect();
-    merge(parts.into_iter().flatten(), k)
+    let candidates = parts.iter().map(Vec::len).sum();
+    TopK::new(k, candidates).collect(parts.into_iter().flatten())
+}
+
+/// The hits [`exact_from`] holds at most at once for `k` over the `len` vectors from
+/// `start` on: each part's best, then the merged best.
+pub fn exact_held(k: usize, start: usize, len: usize) -> usize {
+    let n = len.saturating_sub(start);
+    let parts = len.div_ceil(CHUNK).saturating_sub(start / CHUNK);
+    k.saturating_mul(parts).min(n) + k.min(n)
 }
 
 /// The `k` nearest of `hits`, nearest first.
 pub fn merge(hits: impl IntoIterator<Item = Hit>, k: usize) -> Vec<Hit> {
-    let mut best = TopK::new(k);
-    for hit in hits {
-        best.offer(hit.id, hit.distance);
-    }
-    best.into_sorted()
+    let hits = hits.into_iter();
+    // Reserved for the hits there are, not for a k of any size.
+    TopK::new(k, hits.size_hint().0).collect(hits)
 }
 
 /// The `k` best hits offered, kept in a max-heap by distance.
@@ -231,11 +259,20 @@ struct TopK {
 }
 
 impl TopK {
-    fn new(k: usize) -> Self {
+    /// The best `k` of at most `candidates` (at least of as many as are known: what is
+    /// reserved, never a k of any size).
+    fn new(k: usize, candidates: usize) -> Self {
         Self {
             k,
-            heap: std::collections::BinaryHeap::with_capacity(k + 1),
+            heap: std::collections::BinaryHeap::with_capacity(k.min(candidates)),
         }
+    }
+
+    fn collect(mut self, hits: impl Iterator<Item = Hit>) -> Vec<Hit> {
+        for hit in hits {
+            self.offer(hit.id, hit.distance);
+        }
+        self.into_sorted()
     }
 
     fn offer(&mut self, id: u64, distance: f32) {
@@ -281,6 +318,50 @@ impl<T: Ord> Ord for Ordered<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A k of any size reserves for the candidates there are and returns all of them,
+    /// from exact-size and unknown-size inputs alike.
+    #[test]
+    fn a_large_k_allocates_for_candidates_and_returns_all_available_hits() {
+        let vectors = random_vectors(7, 3, 7);
+        let query = vectors.get(0);
+        let truth = exact(&vectors, query, vectors.len(), Metric::L2, &|_| true);
+        assert_eq!(
+            exact(&vectors, query, usize::MAX, Metric::L2, &|_| true),
+            truth
+        );
+        assert_eq!(merge(truth.clone(), usize::MAX), truth);
+        assert_eq!(
+            merge(truth.iter().copied().filter(|_| true), usize::MAX),
+            truth
+        );
+        assert!(merge(std::iter::empty(), usize::MAX).is_empty());
+        // At most each part's best and the merged best, never more than the vectors.
+        assert_eq!(exact_held(usize::MAX, 0, 10_000), 20_000);
+        assert_eq!(exact_held(10, 0, 10_000), 30 + 10);
+        assert_eq!(exact_held(10, 9_000, 10_000), 10 + 10);
+        assert_eq!(exact_held(10, 10_000, 10_000), 0);
+    }
+
+    /// A set stop flag ends a scan at its parts' starts: a stopped scan compares nothing.
+    #[test]
+    fn a_stopped_scan_compares_nothing() {
+        let vectors = random_vectors(3 * CHUNK, 2, 11);
+        let stop = AtomicBool::new(true);
+        let compared = std::sync::atomic::AtomicUsize::new(0);
+        let accept = |_: u64| {
+            compared.fetch_add(1, Ordering::Relaxed);
+            true
+        };
+        let query = vectors.get(0).to_vec();
+        assert!(
+            exact_from_until(&vectors, 0, &query, 5, Metric::L2, &accept, Some(&stop)).is_empty()
+        );
+        assert_eq!(compared.load(Ordering::Relaxed), 0);
+        stop.store(false, Ordering::Relaxed);
+        let found = exact_from_until(&vectors, 0, &query, 5, Metric::L2, &accept, Some(&stop));
+        assert_eq!(found, exact(&vectors, &query, 5, Metric::L2, &|_| true));
+    }
 
     /// Pseudo-random vectors, the same every run.
     pub(crate) fn random_vectors(n: usize, dimension: usize, seed: u64) -> Vectors {

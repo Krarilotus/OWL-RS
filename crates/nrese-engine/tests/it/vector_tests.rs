@@ -55,7 +55,9 @@ fn the_nearest_vector_literals_are_found() {
     let before = engine.snapshot();
     let angle = 90.4f32.to_radians();
     let query = VectorQuery::new(vec![angle.cos(), angle.sin()], 3);
-    let (found, report) = before.vector_search(&query, &|_| true);
+    let (found, report) = before
+        .vector_search(&query, &|_| true)
+        .expect("an unlimited search");
     assert_eq!(angles(&engine, &found), [90, 91, 89]);
     assert_eq!(report.space, 360);
     assert!(!report.graph, "a small space is scanned");
@@ -69,18 +71,23 @@ fn the_nearest_vector_literals_are_found() {
         let values = nrese_engine::vector::parse(literal.value()).unwrap();
         (values[1].atan2(values[0]).to_degrees().round() as i64).rem_euclid(2) == 1
     };
-    let (found, _) = before.vector_search(&query, &odd);
+    let (found, _) = before
+        .vector_search(&query, &odd)
+        .expect("an unlimited search");
     assert_eq!(angles(&engine, &found), [91, 89, 93]);
     // Euclidean: the same order on a circle.
     let euclidean = VectorQuery {
         metric: Metric::L2,
         ..query.clone()
     };
-    let (found, _) = before.vector_search(&euclidean, &|_| true);
+    let (found, _) = before
+        .vector_search(&euclidean, &|_| true)
+        .expect("an unlimited search");
     assert_eq!(angles(&engine, &found), [90, 91, 89]);
     // Another dimension finds nothing.
-    let (found, report) =
-        before.vector_search(&VectorQuery::new(vec![1.0, 0.0, 0.0], 3), &|_| true);
+    let (found, report) = before
+        .vector_search(&VectorQuery::new(vec![1.0, 0.0, 0.0], 3), &|_| true)
+        .expect("an unlimited search");
     assert!(found.is_empty() && report.space == 0);
     // A snapshot doesn't see literals interned after it.
     let mut tx = engine.transaction();
@@ -95,9 +102,14 @@ fn the_nearest_vector_literals_are_found() {
         nrese_rdf::GraphNameRef::DefaultGraph,
     ));
     tx.commit().expect("commit");
-    let (found, _) = before.vector_search(&query, &|_| true);
+    let (found, _) = before
+        .vector_search(&query, &|_| true)
+        .expect("an unlimited search");
     assert_eq!(angles(&engine, &found), [90, 91, 89]);
-    let (found, _) = engine.snapshot().vector_search(&query, &|_| true);
+    let (found, _) = engine
+        .snapshot()
+        .vector_search(&query, &|_| true)
+        .expect("an unlimited search");
     assert!(
         found[0].1 < 1e-6,
         "the new literal is the nearest: {found:?}"
@@ -132,7 +144,9 @@ fn large_spaces_are_searched_through_a_graph() {
     };
     // Past SYNC_BUILD the graph is built on a thread; a warm-up waits for it.
     snapshot.prepare_vector_graph(&query);
-    let (approximate, report) = snapshot.vector_search(&query, &|_| true);
+    let (approximate, report) = snapshot
+        .vector_search(&query, &|_| true)
+        .expect("an unlimited search");
     assert!(
         report.graph && report.space == 72_000 && report.scanned == 0,
         "{report:?}"
@@ -141,7 +155,9 @@ fn large_spaces_are_searched_through_a_graph() {
         strategy: VectorStrategy::Exact,
         ..query.clone()
     };
-    let (truth, report) = snapshot.vector_search(&exact, &|_| true);
+    let (truth, report) = snapshot
+        .vector_search(&exact, &|_| true)
+        .expect("an unlimited search");
     assert!(!report.graph);
     let shared = approximate
         .iter()
@@ -153,6 +169,8 @@ fn large_spaces_are_searched_through_a_graph() {
         accepted: Some(10),
         ..query
     };
-    let (_, report) = snapshot.vector_search(&selective, &|_| true);
+    let (_, report) = snapshot
+        .vector_search(&selective, &|_| true)
+        .expect("an unlimited search");
     assert!(!report.graph);
 }

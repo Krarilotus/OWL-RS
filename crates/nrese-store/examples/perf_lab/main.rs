@@ -1364,7 +1364,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         query.metric = metric;
         query.strategy = nrese_engine::VectorStrategy::Approximate;
         snapshot.prepare_vector_graph(&query);
-        let (_, readiness) = snapshot.vector_search(&query, &|_| true);
+        let (_, readiness) = snapshot
+            .vector_search(&query, &|_| true)
+            .expect("an unlimited search");
         report.sections.push(("vector_prepare", phase.json()));
         let metric = metric.name();
         report.sections.push(("vector_graph", format!(
