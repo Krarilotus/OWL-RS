@@ -529,9 +529,19 @@ impl TextIndex {
     pub(crate) fn absorb(&mut self, mut fragment: TextIndex) {
         debug_assert_eq!(fragment.first, self.covered);
         if self.documents == 0 && self.word_count == 0 {
-            // Numbered from 0 again, as a whole index is (and written).
-            let mut lengths = vec![0u16; fragment.first as usize];
-            lengths.append(&mut fragment.lengths);
+            // Numbered from 0 again, as a whole index is (and written); with room to grow,
+            // as the fragment's own lengths have (one commit's documents later would
+            // otherwise copy them all: 80 MB on DBpedia core).
+            let lengths = match fragment.first {
+                0 => std::mem::take(&mut fragment.lengths),
+                first => {
+                    let len = first as usize + fragment.lengths.len();
+                    let mut lengths = Vec::with_capacity(len + len / 4);
+                    lengths.resize(first as usize, 0);
+                    lengths.append(&mut fragment.lengths);
+                    lengths
+                }
+            };
             *self = Self {
                 lengths,
                 first: 0,
@@ -1256,6 +1266,14 @@ mod tests {
         let count = || {
             parts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         };
+        // Into an empty index, a move that keeps room to grow.
+        let mut moved = TextIndex::default();
+        let mut whole = TextIndex::starting_at(0);
+        whole.extend(&documents, &|| {});
+        whole.cover(80_003);
+        moved.absorb(whole);
+        assert!(moved.lengths.capacity() > moved.lengths.len());
+        assert_eq!(moved.documents, sequential.documents);
         let mut fragment = TextIndex::starting_at(10_003);
         fragment.extend(late, &count);
         fragment.cover(80_003);
