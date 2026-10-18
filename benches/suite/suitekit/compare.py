@@ -142,39 +142,88 @@ def bootstrap_ratio(base: list[dict], new: list[dict], rounds: int = 1000, seed:
     return point, ratios[int(0.025 * rounds)], ratios[int(0.975 * rounds) - 1]
 
 
-def strict_comparison(base: list[dict], new: list[dict], *, higher: bool = False,
-                      deterministic: bool = False) -> dict:
-    """Zero-margin release evidence; process repetitions remain the outer bootstrap unit.
+# --- the release gate's noise policy ---------------------------------------------------------
+#
+# benches/PROTOCOL.md §5 ("The release gate") states it and the measurements behind each
+# number. One dimension of one case (a query's time, a peak, a client width's QPS) is judged
+# on its own; nothing offsets anything else.
+#
+# MARGIN: identical binaries in interleaved passes on phuoc-yu (14 Oct 2026, 666 series of the
+# fast suite and the perf-lab datasets, ABBA halves) differ by 0.8 % (median), 4.8 % (p90);
+# beyond 10 % only series whose own passes spread as much. A series' margin is the larger of
+# MARGIN and the spread of either side's per-pass medians, so a noisy series isn't judged on
+# a margin its own noise exceeds.
+# FLOORS: below 0.5 ms (time) or 64 MiB (memory) a difference blocks only with strong evidence
+# (the whole interval beyond twice the margin): the same binaries' sub-millisecond DL phases
+# moved by up to 0.34 ms and 3x. RESOLUTION: the perf lab reports milliseconds to three
+# decimals; a difference under 10 µs is the timer's, never a verdict.
+MARGIN = 0.10
+FLOORS = {"ms": 0.5, "MiB": 64.0, "qps": 0.0}
+RESOLUTION = {"ms": 0.01, "MiB": 1.0, "qps": 0.0}
+MIN_PASSES = 2
+BLOCKING = ("regression", "suspect", "incomplete")
 
-    Overlap (including identical observed timings) is inconclusive, never equivalence.
-    Exact deterministic counts may be unchanged; zero timing denominators are unqualified.
-    """
-    result = {"verdict": "incomplete", "ratio": None, "ci": None,
-              "processes": [len(base), len(new)], "higher_is_better": higher}
-    if min(len(base), len(new)) < 2 or not all(valid_series(r) for r in base + new):
-        return result
-    if any(set(r) != {"value"} for r in base + new):
-        return result
-    b, n = ([v for r in side for v in r["value"]] for side in (base, new))
-    result.update(base=statistics.median(b), new=statistics.median(n))
-    if deterministic and len(set(b)) == len(set(n)) == 1:
-        change = (n[0] > b[0]) - (n[0] < b[0])
-        result.update(verdict="unchanged" if not change else
-                      "regression" if (change < 0 if higher else change > 0) else "win",
-                      ratio=n[0] / b[0] if b[0] else None)
-        return result
-    if min(b) <= 0:
-        return result
-    # Keep positive tiny measurements clear of the legacy bootstrap denominator floor.
-    scale = min(b)
-    base, new = ([{"value": [v / scale for v in r["value"]]} for r in side] for side in (base, new))
-    point, low, high = bootstrap_ratio(base, new)
-    if not all(math.isfinite(v) for v in (point, low, high)):
-        return result
-    result.update(ratio=point, ci=[low, high], verdict=
-                  "regression" if (high < 1 if higher else low > 1) else
-                  "win" if (low > 1 if higher else high < 1) else "inconclusive")
-    return result
+
+def judge(base: list[list[float]], new: list[list[float]], *, unit: str, higher_is_better: bool = False,
+          margin: float = MARGIN) -> dict:
+    """One dimension: `base` and `new` are per pass, each pass a list of its values (a
+    process's samples, or one value per process). The estimate is the median of the pooled
+    values; its 95 % interval of new/base comes from bootstrap_ratio (passes drawn, then values
+    within them). Verdicts, in the worse direction (lower QPS is worse):
+
+    - `regression`: beyond 1 + margin, at least the floor, and the interval above 1; below the
+      floor, only with the whole interval beyond 1 + 2 * margin and at least the resolution;
+    - `suspect`: beyond 1 + margin and the floor, the interval reaching 1 (rerun or bisect);
+    - `better`: below 1 / (1 + margin) with the interval below 1;
+    - `neutral`: everything else, a slowdown under the floor included (`below_floor`);
+    - `incomplete`: fewer than MIN_PASSES passes on a side, or a pass without valid values.
+
+    `blocks`: whether the verdict stops a release (BLOCKING)."""
+    out = {"unit": unit, "higher_is_better": higher_is_better, "passes": [len(base), len(new)],
+           "base": None, "new": None, "ratio": None, "ci": None, "spread": None, "margin": None,
+           "below_floor": False, "verdict": "incomplete", "blocks": True}
+
+    def valid(side) -> bool:
+        return len(side) >= MIN_PASSES and all(
+            isinstance(vs, list) and vs and all(type(v) in (int, float) and math.isfinite(v) and v >= 0 for v in vs)
+            for vs in side)
+
+    if not (valid(base) and valid(new)):
+        return out
+    b = statistics.median([v for vs in base for v in vs])
+    n = statistics.median([v for vs in new for v in vs])
+    spreads = []
+    for side in (base, new):
+        medians = [statistics.median(vs) for vs in side]
+        middle = statistics.median(medians)
+        spreads.append((max(medians) - min(medians)) / middle if middle > 0 else 0.0)
+    m = max(margin, *spreads)
+    out.update(base=b, new=n, spread=max(spreads), margin=m)
+    floor, resolution = FLOORS[unit], RESOLUTION[unit]
+    diff = (b - n) if higher_is_better else (n - b)
+    if b <= 0 or n <= 0:
+        # A zero (below the report's resolution) has no ratio: the difference decides.
+        worse = diff >= max(floor, resolution) and diff > 0
+        out.update(ratio=float("inf") if b <= 0 < n else (0.0 if n <= 0 < b else 1.0),
+                   verdict="regression" if worse else "neutral", blocks=worse)
+        return out
+    scale = max(b, n)
+    point, low, high = bootstrap_ratio([{"v": [v / scale for v in vs]} for vs in base],
+                                       [{"v": [v / scale for v in vs]} for vs in new], rounds=2000)
+    out.update(ratio=point, ci=[low, high])
+    worse, worse_low, worse_high = (1 / point, 1 / high, 1 / low) if higher_is_better else (point, low, high)
+    if worse > 1 + m:
+        if diff >= floor:
+            verdict = "regression" if worse_low > 1 else "suspect"
+        else:
+            out["below_floor"] = True
+            verdict = "regression" if diff >= resolution and worse_low > 1 + 2 * m else "neutral"
+    elif worse < 1 / (1 + m) and worse_high < 1:
+        verdict = "better"
+    else:
+        verdict = "neutral"
+    out.update(verdict=verdict, blocks=verdict in BLOCKING)
+    return out
 
 
 def counter_changes(base: dict, new: dict) -> tuple[bool, list[str]]:
