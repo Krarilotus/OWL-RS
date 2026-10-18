@@ -285,9 +285,11 @@ arises, the same for every side:
 - *Batched timing for the microsecond cases* (`perf_lab --batch K`: a sample times K executions,
   reported per execution to the nanosecond): a 9 µs query is nine steps of the report's
   microsecond, alone. It needs every side's perf lab to have it (the build's `CAPABILITIES`,
-  `GATE_BATCH`): v1.5's and main's don't, so against them a series' loss below the 5 µs
-  resolution (under 250 µs, a 2 % loss) stays undecidable, and the gate whose baselines have it
-  (v2's successors against v2) batches.
+  `GATE_BATCH`). A series batched on both sides in every pass is judged at its sample's
+  resolution, 5 µs / K (`judge`'s `resolution`): the 5 µs floor is the report's microsecond
+  steps, which a batch divides. v1.5's and main's perf labs can't batch, so against them a loss
+  below 5 µs (a 2 % loss under 250 µs) stays undecidable; the gate whose baselines batch (v2's
+  successors against v2) decides them.
 - *Passes where the noise needs them.* Each case's noise (the largest sd of log pass medians
   among its series whose 2 % is above the resolution) sets the passes a side for 90 % power
   against a 2 % loss, the confirm-on-rerun chain simulated as for the table above

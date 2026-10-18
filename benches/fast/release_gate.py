@@ -198,7 +198,7 @@ def evidence(passes: list[dict], case: str) -> dict:
     out = {"status": [], "expected": [], "failed_checks": [], "failed_routes": [], "unchecked": 0, "notes": [],
            "samples": [],
            "process": [], "estimator": set(), "lifetime": [], "phases": [], "cgroup": [], "qps": [],
-           "client_peaks": [], "cache_peaks": [], "rows": [], "counters": {}}
+           "client_peaks": [], "cache_peaks": [], "rows": [], "counters": {}, "batched": {}}
     for p in passes:
         if case not in (p["report"].get("planned_cases") or [case]):
             continue  # a later block's pass, without this case (its noise needs no more)
@@ -252,6 +252,11 @@ def evidence(passes: list[dict], case: str) -> dict:
         rows = {}
         for o in observations:
             rows.update({q: n for q, n in (o.get("rows") or {}).items() if n is not None})
+            # A series batched in every observation: its smallest batch (perf_lab --batch).
+            for q, k in (o.get("batched") or {}).items():
+                out["batched"][q] = min(out["batched"].get(q, k), k)
+        for q in [q for q in out["batched"] if not all(q in (o.get("batched") or {}) for o in observations)]:
+            del out["batched"][q]
         out["rows"].append(rows)
         for path, value in (record.get("counters") or {}).items():
             out["counters"].setdefault(path, []).append(value)
@@ -342,7 +347,10 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str]) -
         if not on_base:
             row["notes"].append(f"time/{s}: not on every pass of {side}, not compared")
             continue
-        row["dimensions"][f"time/{s}"] = judge(per_pass(values["base"], s), per_pass(values["cand"], s), unit="ms")
+        # Batched on both sides (every pass): the resolution of a sample of K executions.
+        k = min(cand["batched"].get(s, 1), base["batched"].get(s, 1))
+        row["dimensions"][f"time/{s}"] = judge(per_pass(values["base"], s), per_pass(values["cand"], s), unit="ms",
+                                               resolution=RESOLUTION["ms"] / k if k > 1 else None)
     if not series:
         row["blocks"].append("no timing evidence")
     # Memory (one policy, PROTOCOL.md §5): the process's own peak (VmHWM, every side's perf lab)

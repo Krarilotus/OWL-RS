@@ -1411,6 +1411,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         }
         // Batched samples are means of several executions: reported to the nanosecond.
         let digits = if batch > 1 { 6 } else { 3 };
+        if batch > 1 {
+            extra.push_str(&format!(",\n      \"batch\": {batch}"));
+        }
         let samples: Vec<String> = m
             .times
             .iter()
