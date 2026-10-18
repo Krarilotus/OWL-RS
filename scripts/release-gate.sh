@@ -262,18 +262,19 @@ w3c)
       && mv "$f.partial" "$f" || { log "the OWL 2 test cases don't match their pin"; exit 1; }
   fi
   export NRESE_W3C_OWL_TESTS=$PWD/$f NRESE_W3C_OUT=$OUT/w3c/tableau-w3c.tsv
-  code=0
   for kit in nrese-sparql:w3c_sparql11 nrese-sparql:geosparql_compliance nrese-shacl:w3c_shacl \
              nrese-store:w3c_owl2_rl nrese-dl:tableau_w3c nrese-owl:w3c_owl2 nrese-reasoner:w3c_n3_reasoner; do
     crate=${kit%%:*} test=${kit#*:}
     bash scripts/cargo-guarded.sh test --release --locked -p "$crate" --test "$test" -- --nocapture \
-      > "$OUT/w3c/$test.log" 2>&1 || code=1
+      > "$OUT/w3c/$test.log" 2>&1
     log "w3c $test: $(grep -E '^test result' "$OUT/w3c/$test.log" | tail -1)"
   done
+  # A failed kit or a count short of its requirement is the verdict's (w3c.json); this step
+  # fails only when the data or the counts couldn't be had.
   py benches/fast/release_gate.py w3c "$OUT/w3c" --expected benches/fast/w3c-expected.toml --json "$OUT/w3c.json" \
-    > "$OUT/w3c/counts.txt" || code=1
+    > "$OUT/w3c/counts.txt"
+  [ -f "$OUT/w3c.json" ] || exit 1
   log "w3c: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print("passed" if d["passed"] else "NOT passed: " + "; ".join(d["errors"]))' "$OUT/w3c.json")"
-  exit $code
   ;;
 
 guards)
@@ -284,6 +285,7 @@ guards)
   bash scripts/cargo-guarded.sh test --release --locked --workspace --no-fail-fast --lib --bins --tests -- \
     $(cat "$OUT/guards/names.txt") > "$OUT/guards/test.log" 2>&1
   py benches/fast/release_gate.py guards --log "$OUT/guards/test.log" --json "$OUT/guards.json" | tee -a "$OUT/gate.log"
+  [ -f "$OUT/guards.json" ] || exit 1  # the guards' verdict is guards.json's
   ;;
 
 verdict)
