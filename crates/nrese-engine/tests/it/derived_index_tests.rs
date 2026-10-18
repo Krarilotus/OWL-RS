@@ -76,7 +76,9 @@ fn text_and_vector_indexes_survive_a_reopen() {
         assert_eq!(text.len(), 2);
         let snapshot = engine.snapshot();
         snapshot.prepare_vector_graph(&query);
-        let (found, report) = snapshot.vector_search(&query, &|_| true);
+        let (found, report) = snapshot
+            .vector_search(&query, &|_| true)
+            .expect("an unlimited search");
         assert!(report.graph);
         engine.checkpoint().unwrap();
         assert!(dir.path().join("derived/text.index").exists());
@@ -87,7 +89,9 @@ fn text_and_vector_indexes_survive_a_reopen() {
     assert_eq!(engine.stats().dictionary.derived_loaded, 0);
     assert_eq!(search(&engine, "bridge*"), before_text);
     let snapshot = engine.snapshot();
-    let (found, report) = snapshot.vector_search(&query, &|_| true);
+    let (found, report) = snapshot
+        .vector_search(&query, &|_| true)
+        .expect("an unlimited search");
     assert!(
         report.graph && report.scanned == 0,
         "the graph read back: {report:?}"
@@ -98,7 +102,10 @@ fn text_and_vector_indexes_survive_a_reopen() {
     insert(&engine, "c", Literal::new_simple_literal("Bridge of Sighs"));
     assert_eq!(search(&engine, "bridge*").len(), 3);
     insert(&engine, "near", vector(&[1.0, 0.0001]));
-    let (found, _) = engine.snapshot().vector_search(&query, &|_| true);
+    let (found, _) = engine
+        .snapshot()
+        .vector_search(&query, &|_| true)
+        .expect("an unlimited search");
     assert!(found[0].1 < 1e-6, "{found:?}");
 }
 
@@ -159,11 +166,15 @@ fn large_graphs_are_built_on_a_thread() {
         ..VectorQuery::new(vec![0.3, 0.4, 5.0], 5)
     };
     let snapshot = engine.snapshot();
-    let (first, report) = snapshot.vector_search(&query, &|_| true);
+    let (first, report) = snapshot
+        .vector_search(&query, &|_| true)
+        .expect("an unlimited search");
     assert!(!report.graph && report.scanned == 60_000, "{report:?}");
     let mut waited = 0;
     loop {
-        let (found, report) = snapshot.vector_search(&query, &|_| true);
+        let (found, report) = snapshot
+            .vector_search(&query, &|_| true)
+            .expect("an unlimited search");
         if report.graph {
             let shared = found
                 .iter()

@@ -1476,19 +1476,21 @@ impl Snapshot {
     /// The vector literals this snapshot's dictionary holds that are nearest to
     /// `query.vector`, among those `accept` takes, nearest first, with how the search went
     /// (whether statements still use them is the caller's to check, in `accept`).
+    /// Refused before it allocates past [`crate::VectorQuery::max_hits`], stopped by its
+    /// `stop` flag ([`crate::VectorStop`]).
     pub fn vector_search(
         &self,
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
-    ) -> (Vec<(TermId, f32)>, crate::VectorSearchReport) {
+    ) -> Result<(Vec<(TermId, f32)>, crate::VectorSearchReport), crate::VectorStop> {
         let (hits, report) =
             self.dictionary
-                .vector_search(query, self.version.dictionary_len, accept);
+                .vector_search(query, self.version.dictionary_len, accept)?;
         let hits = hits
             .into_iter()
             .map(|hit| (TermId::from_raw(hit.id), hit.distance))
             .collect();
-        (hits, report)
+        Ok((hits, report))
     }
 
     /// Builds the graph searches like `query` use, covering every vector of its
