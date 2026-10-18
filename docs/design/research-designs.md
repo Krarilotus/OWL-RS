@@ -204,7 +204,8 @@ special global rewrite path against MVCC reads, explanations and stratification.
   `maintenance = auto | bf-count | dred-count | remat` to pin it.
 - Support counts always; derivation records (witnesses, support graph sets) as the
   provenance level chosen (`count | witness | acl | full`): the ACL design (§4) needs
-  `acl`.
+  `acl`. *(Superseded: counting was measured and rejected; deletes use one-step B/F
+  proofs without a count layer, [reasoner-provenance.md](reasoner-provenance.md).)*
 - Equality (§1) keeps logical identity apart from physical canonicalisation: stable term
   ids in storage and provenance, a per-epoch canonical map as an accelerator that old
   snapshots keep until no reader needs them.
