@@ -228,7 +228,9 @@ pub(crate) fn scan<P: Sync>(
             found
         })
         .collect();
-    ids.sort_unstable();
+    // In parallel: a bulk load's shards give their ids out of order (YAGO q10: 0.4 M of
+    // them, 10 ms on one thread).
+    ids.par_sort_unstable();
     ids.dedup();
     let scan = StringScan {
         searchers: matcher.searchers(),
