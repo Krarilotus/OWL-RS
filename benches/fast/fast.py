@@ -1090,7 +1090,10 @@ def case_manifest(catalog: list[dict], root: Path = ROOT) -> dict:
         directory = (queries_path(case, {}) if case.get("metric") in ("sum_p50_ms", "cold_ms")
                      and not query.startswith(("@vectors", "@parse", "@cache-log")) else None)
         paths = sorted((root / directory.removeprefix("/src/")).glob("*.rq")) if directory else []
-        queries.update({p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in paths})
+        # A query set kept with the data (NRESE_FAST_QUERY_SETS: WatDiv's) is outside the tree:
+        # named by its set and file, the same on every host.
+        queries.update({(p.relative_to(root).as_posix() if p.is_relative_to(root) else f"{query}/{p.name}"):
+                        hashlib.sha256(p.read_bytes()).hexdigest() for p in paths})
         if case.get("sweep"):
             series[name] = [" ".join(s) or "-" for s in case["sweep"]]
         elif case.get("metric") == "sum_p50_ms":
