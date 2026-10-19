@@ -701,28 +701,60 @@ mod tests {
     use super::*;
     use crate::QueryOptions;
 
-    /// A table remade from its own buffers keeps their charge: under an envelope of just
-    /// its bytes, a projection that keeps its columns isn't refused (Sol's review of
-    /// ff366fc5: charged twice, it was).
+    /// A table remade from charged ones keeps their charge, and is charged only for what it
+    /// allocates beyond their capacity: under an envelope of just their bytes, none is
+    /// refused (Sol's reviews of ff366fc5 and 85be2df0: charged again, they were).
     #[test]
-    fn a_table_remade_from_its_buffers_is_charged_once() {
+    fn a_table_remade_from_charged_ones_is_charged_once() {
         let engine = nrese_engine::Engine::new(Default::default()).unwrap();
         let snapshot = engine.snapshot();
-        let mut options = QueryOptions::default();
-        options.resources.memory = nrese_exec::Envelope::new(Some(64), None);
-        let ctx = Context::new(&snapshot, &options, None, None);
         let v = Variable::new_unchecked("v");
-        let rows = ctx
-            .produced(Solutions {
+        let table = |rows: &[u64], capacity: usize| {
+            let mut table = IdTable::with_capacity(1, capacity);
+            rows.iter().for_each(|&id| table.push_row(&[id]));
+            Solutions {
                 vars: vec![v.clone()],
-                table: IdTable::with_capacity(1, 8),
+                table,
+                ordered: false,
+            }
+        };
+        let concat = |ctx: &Context<'_>, parts: Vec<Solutions>| {
+            let growth = super::super::concat_growth(&parts);
+            ctx.reshaped(parts, growth, |parts| Solutions {
+                vars: vec![v.clone()],
+                table: IdTable::concat(1, parts.into_iter().map(|p| p.table).collect()),
                 ordered: false,
             })
-            .ok()
-            .unwrap();
-        let kept = ctx.distinct_on(rows, &[v]).ok().unwrap();
-        assert_eq!((ctx.budget.used(), ctx.budget.peak()), (64, 64));
-        ctx.consumed(kept);
-        assert_eq!(ctx.budget.used(), 0);
+        };
+        let cases: [(&str, Vec<Solutions>, usize); 3] = [
+            ("a projection keeping its column", vec![table(&[], 8)], 64),
+            ("one table joined into one", vec![table(&[1], 8)], 64),
+            (
+                "two, with room in the first",
+                vec![table(&[1], 8), table(&[2], 1)],
+                72,
+            ),
+        ];
+        for (case, parts, limit) in cases {
+            let mut options = QueryOptions::default();
+            options.resources.memory = nrese_exec::Envelope::new(Some(limit), None);
+            let ctx = Context::new(&snapshot, &options, None, None);
+            let parts: Vec<Solutions> = parts
+                .into_iter()
+                .map(|p| ctx.produced(p).ok().unwrap())
+                .collect();
+            let remade = match case {
+                "a projection keeping its column" => {
+                    let rows = parts.into_iter().next().unwrap();
+                    ctx.distinct_on(rows, std::slice::from_ref(&v))
+                }
+                _ => concat(&ctx, parts),
+            };
+            let remade = remade.ok().unwrap_or_else(|| panic!("{case}: refused"));
+            assert_eq!(ctx.budget.used(), remade.table.memory_bytes(), "{case}");
+            assert!(ctx.budget.peak() <= limit, "{case}");
+            ctx.consumed(remade);
+            assert_eq!(ctx.budget.used(), 0, "{case}");
+        }
     }
 }

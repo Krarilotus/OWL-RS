@@ -178,6 +178,18 @@ impl IdTable {
         out
     }
 
+    /// The bytes [`Self::concat`] of `parts` allocates beyond them: each column of the first
+    /// part without room for every row, reallocated to hold them all.
+    pub fn concat_growth<'a>(parts: impl IntoIterator<Item = &'a IdTable>) -> usize {
+        let mut parts = parts.into_iter();
+        let Some(first) = parts.next() else {
+            return 0;
+        };
+        let rows = first.len + parts.map(IdTable::len).sum::<usize>();
+        let short = first.columns.iter().filter(|c| c.capacity() < rows).count();
+        short.saturating_mul(rows).saturating_mul(8)
+    }
+
     /// Bytes held by the column buffers (by capacity), for memory budgets.
     pub fn memory_bytes(&self) -> usize {
         self.columns.iter().map(|c| c.capacity() * 8).sum()

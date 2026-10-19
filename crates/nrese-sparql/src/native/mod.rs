@@ -1257,12 +1257,9 @@ impl Charged for Vec<Solutions> {
     }
 }
 
-/// What [`IdTable::concat`] of `parts` allocates beyond them: the first part's columns
-/// grown to every row, while the old ones are still held.
+/// What [`IdTable::concat`] of `parts`' tables allocates beyond them.
 fn concat_growth(parts: &[Solutions]) -> usize {
-    let rows: usize = parts.iter().map(|p| p.table.len()).sum();
-    let width = parts.first().map_or(0, |p| p.table.width());
-    rows.saturating_mul(width).saturating_mul(size_of::<u64>())
+    IdTable::concat_growth(parts.iter().map(|p| &p.table))
 }
 
 impl<'a> Context<'a> {
