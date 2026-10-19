@@ -3,13 +3,14 @@ use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf::Literal;
 
 fn table(snapshot: &Snapshot, rows: &[&[u64]], computed: Vec<Term>) -> SolutionTable {
-    let table = IdTable::from_rows(rows.first().map_or(1, |r| r.len()), rows.iter().copied());
     let budget = Arc::new(Budget::unlimited());
-    budget.charge(table.memory_bytes()).unwrap();
+    let width = rows.first().map_or(1, |r| r.len());
+    // The table holds its own charge; the result holds what the query charged directly.
+    let table = IdTable::from_rows(width, rows.iter().copied(), &budget).unwrap();
     SolutionTable {
         snapshot: snapshot.clone(),
         variables: vec![Variable::new_unchecked("x")].into(),
-        held: Reservation::adopt(budget, table.memory_bytes()),
+        held: Reservation::new(budget),
         table,
         computed: Arc::new(computed),
         aligned: None,

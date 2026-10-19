@@ -325,7 +325,7 @@ mod tests {
         let engine = nrese_engine::Engine::new(Default::default()).unwrap();
         let snapshot = engine.snapshot();
         for rows in [0, 1, BLOCK_ROWS] {
-            let table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows));
+            let table = IdTable::rows_only(rows);
             for format in [ResultsFormat::Json, ResultsFormat::Tsv, ResultsFormat::Csv] {
                 let token = CancellationToken::new();
                 token.cancel();
@@ -374,7 +374,7 @@ mod tests {
         let snapshot = engine.snapshot();
         let workers = nrese_exec::workers::Workers::current();
         // Two row blocks, but their zero-column JSON rows fit in the final byte buffer.
-        let table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], BLOCK_ROWS + 1));
+        let table = IdTable::rows_only(BLOCK_ROWS + 1);
         let token = CancellationToken::new();
         let mut writer = CancelOnWrite {
             token: token.clone(),

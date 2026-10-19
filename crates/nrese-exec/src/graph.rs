@@ -115,20 +115,22 @@ pub fn reachable(
 
 /// Every `(start, end)` pair of the closure from each of `starts` over `adjacency`: `end`
 /// reachable in one or more steps, or zero or more with `reflexive`. Pairs are unique.
+/// The output is charged to `budget` as it grows.
 pub fn closure(
     adjacency: &Adjacency,
     starts: impl IntoIterator<Item = u64>,
     reflexive: bool,
-) -> IdTable {
+    budget: &std::sync::Arc<crate::Budget>,
+) -> Result<IdTable, crate::BudgetExceeded> {
     let mut out = IdTable::new(2);
     for start in starts {
         for end in reachable(start, reflexive, |node, buffer| {
             buffer.extend_from_slice(adjacency.neighbours(node))
         }) {
-            out.push_row(&[start, end]);
+            out.push_row(&[start, end], budget)?;
         }
     }
-    out
+    Ok(out)
 }
 
 /// The transitive closure of `edges`: every `(a, b)` with `b` reachable from `a` in one or
@@ -482,11 +484,16 @@ mod tests {
                 .map(|_| (100 + next(size), 100 + next(size)))
                 .collect();
             let adjacency = Adjacency::new(edges.clone());
-            let mut expected: Vec<(u64, u64)> =
-                closure(&adjacency, adjacency.sources().to_vec(), false)
-                    .rows()
-                    .map(|r| (r[0], r[1]))
-                    .collect();
+            let mut expected: Vec<(u64, u64)> = closure(
+                &adjacency,
+                adjacency.sources().to_vec(),
+                false,
+                &crate::test_budget(),
+            )
+            .unwrap()
+            .rows()
+            .map(|r| (r[0], r[1]))
+            .collect();
             expected.sort_unstable();
             let mut got = transitive_closure(&edges);
             got.sort_unstable();
@@ -559,11 +566,16 @@ mod tests {
             let nodes: Vec<u64> = (0..9).collect();
             let adjacency = Adjacency::new(edges.clone());
             for reflexive in [false, true] {
-                let mut got: Vec<(u64, u64)> =
-                    closure(&adjacency, nodes.iter().copied(), reflexive)
-                        .rows()
-                        .map(|r| (r[0], r[1]))
-                        .collect();
+                let mut got: Vec<(u64, u64)> = closure(
+                    &adjacency,
+                    nodes.iter().copied(),
+                    reflexive,
+                    &crate::test_budget(),
+                )
+                .unwrap()
+                .rows()
+                .map(|r| (r[0], r[1]))
+                .collect();
                 got.sort_unstable();
                 assert_eq!(
                     got,

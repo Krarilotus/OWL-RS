@@ -429,6 +429,11 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
         &self.budget
     }
 
+    /// The handle it holds the budget by (an `Arc` to make more charges with).
+    pub fn handle(&self) -> &B {
+        &self.budget
+    }
+
     /// Holds exactly `bytes`: charges the growth or returns the rest. A failed charge
     /// leaves what it held.
     pub fn resize(&mut self, bytes: usize) -> Result<(), BudgetExceeded> {

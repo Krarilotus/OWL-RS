@@ -227,7 +227,8 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
             let left = ctx
                 .produced(Solutions {
                     vars: shared.to_vec(),
-                    table: IdTable::from_rows(1, std::iter::once(&[hub.raw()][..])),
+                    table: IdTable::from_rows(1, std::iter::once(&[hub.raw()][..]), &ctx.budget)
+                        .unwrap(),
                     ordered: false,
                 })
                 .ok()
