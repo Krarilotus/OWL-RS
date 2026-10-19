@@ -129,7 +129,21 @@ fn a_measurement_counts_what_was_made_while_it_ran() {
     // Its threads started, not starting while a case runs.
     pool.broadcast(|_| ());
     let uncharged = || black_box(vec![1u8; BIG]).len();
-    let cases: [(&str, &dyn Fn() -> usize, Counted); 14] = [
+    let cases: [(&str, &dyn Fn() -> usize, Counted); 15] = [
+        (
+            "mapped outside the allocator, uncharged",
+            &|| {
+                let budget = Budget::unlimited();
+                measure_within(&budget, || {
+                    // A region made, its pages committed without a charge, then unmapped.
+                    let region = tag();
+                    mapped(BIG, region);
+                    unmapped(BIG, region);
+                })
+                .1
+            },
+            Counted::AtLeast(BIG),
+        ),
         (
             "a pool thread's first wait",
             &parks_on_the_pool,
