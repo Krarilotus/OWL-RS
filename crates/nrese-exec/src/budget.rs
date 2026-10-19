@@ -681,6 +681,23 @@ impl<T, B: Deref<Target = Budget>> std::ops::DerefMut for ChargedVec<T, B> {
     }
 }
 
+/// The most memory a hash map with room for `capacity` entries of `T` allocates (hashbrown's
+/// layout): buckets the power of two at or above 8/7 of it (at least 4, or 8), an entry and
+/// a control byte each, a group of control bytes more, and alignment.
+pub fn map_bytes<T>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = match capacity {
+        0..4 => 4,
+        4..8 => 8,
+        _ => (capacity.saturating_mul(8) / 7).next_power_of_two(),
+    };
+    buckets
+        .saturating_mul(size_of::<T>() + 1)
+        .saturating_add(2 * 16)
+}
+
 /// Working memory of an operation (sort buckets, masks, hash chains), charged to its
 /// budget before it grows: a [`ChargedVec`] borrowing the budget.
 pub type Scratch<'b, T> = ChargedVec<T, &'b Budget>;

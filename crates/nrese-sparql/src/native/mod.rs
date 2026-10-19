@@ -47,6 +47,8 @@ pub(crate) use pushdown::per_solution;
 #[cfg(test)]
 mod budget_tests;
 #[cfg(test)]
+mod cache_tests;
+#[cfg(test)]
 mod graph_tests;
 pub(crate) mod ql;
 mod ranges;
@@ -133,6 +135,15 @@ const PROBE_CHUNK: usize = 4096;
 
 /// Decoded terms kept per query for repeated ids (ORDER BY, aggregates, expressions).
 const DECODE_CACHE_ENTRIES: usize = 1 << 18;
+
+/// What a hash map of `len` entries with room for `capacity` allocates to take one more:
+/// the bound of its next table (it about doubles), or 0 while it has room.
+fn grown_table<T>(len: usize, capacity: usize) -> usize {
+    match len < capacity {
+        true => 0,
+        false => nrese_exec::map_bytes::<T>(capacity.saturating_mul(2).max(3)),
+    }
+}
 
 pub(crate) enum NativeError {
     /// Something the executor doesn't implement.
@@ -240,6 +251,7 @@ fn run(
         ),
         Form::Select => Outcome::Solutions(solutions, ctx.computed.take()),
     };
+    ctx.drop_decoded();
     Ok((
         outcome,
         Reservation::adopt(Arc::clone(&ctx.budget), ctx.budget.used()),
@@ -1185,7 +1197,15 @@ struct Context<'a> {
     evaluator: Evaluator,
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
+    /// The bound of `computed_ids`' table charged to the budget (with `computed`'s
+    /// capacity and both copies of each term: charged before they grow, the query's like
+    /// its tables).
+    computed_table: Cell<usize>,
     decoded: RefCell<HashMap<u64, Option<Term>>>,
+    /// What `decoded` holds charged to the budget: its terms, and its table's bound
+    /// (`decoded_table`), released when the cache is let go ([`Context::drop_decoded`]).
+    decoded_terms: Cell<usize>,
+    decoded_table: Cell<usize>,
     /// Stored terms decoded for expressions, orders and aggregates (EXPLAIN's `decoded`;
     /// the output's aren't counted).
     decodes: AtomicU64,
@@ -1377,7 +1397,10 @@ impl<'a> Context<'a> {
             aliases: RefCell::default(),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
+            computed_table: Cell::new(0),
             decoded: RefCell::default(),
+            decoded_terms: Cell::new(0),
+            decoded_table: Cell::new(0),
             decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
@@ -1563,28 +1586,69 @@ impl<'a> Context<'a> {
         }
         self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
         let term = self.snapshot.decode(TermId::from_raw(id));
-        // Bounded: a scan over millions of distinct labels must not keep them all.
+        // Bounded: a scan over millions of distinct labels must not keep them all. Kept
+        // only where the budget has room for it, charged first: the cache is optional, and
+        // a term not kept limits no answer.
         if decoded.len() < DECODE_CACHE_ENTRIES {
-            decoded.insert(id, term.clone());
+            let bytes = term.as_ref().map_or(0, Term::heap_bytes);
+            let table = grown_table::<(u64, Option<Term>)>(decoded.len(), decoded.capacity());
+            if bytes + table <= self.budget.remaining() && self.budget.charge(bytes + table).is_ok()
+            {
+                decoded.insert(id, term.clone());
+                self.decoded_terms.set(self.decoded_terms.get() + bytes);
+                if table > 0 {
+                    // The old table was freed as the new one took its entries.
+                    self.budget.release(self.decoded_table.replace(table));
+                }
+            }
         }
         term
     }
 
+    /// Lets the decode cache go, then releases its charge: before the query's charge is
+    /// handed to its results, which don't keep the cache.
+    fn drop_decoded(&self) {
+        drop(std::mem::take(&mut *self.decoded.borrow_mut()));
+        self.budget
+            .release(self.decoded_terms.take() + self.decoded_table.take());
+    }
+
     /// The id of `term`: its stored id if the snapshot knows it, else a computed id, the same
-    /// one for equal terms.
-    fn id(&self, term: &Term) -> u64 {
+    /// one for equal terms. A new computed term is charged before it is kept (twice: the
+    /// list's copy and the map's), and so is the room the list and the map grow to.
+    fn id(&self, term: &Term) -> NativeResult<u64> {
         if let Some(id) = self.lookup_const(term.as_ref()) {
-            return id.raw();
+            return Ok(id.raw());
         }
         let mut ids = self.computed_ids.borrow_mut();
         if let Some(&id) = ids.get(term) {
-            return id;
+            return Ok(id);
         }
         let mut computed = self.computed.borrow_mut();
+        let old_list = computed.capacity() * size_of::<Term>();
+        let list = match computed.len() < computed.capacity() {
+            true => 0,
+            false => (computed.capacity() + computed.capacity().max(4)) * size_of::<Term>(),
+        };
+        let table = grown_table::<(Term, u64)>(ids.len(), ids.capacity());
+        self.budget
+            .charge(2 * term.heap_bytes() + list + table)
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        if list > 0 {
+            let more = computed.capacity().max(4);
+            computed.reserve_exact(more);
+        }
         let id = computed_id(computed.len() as u64);
         computed.push(term.clone());
         ids.insert(term.clone(), id);
-        id
+        // What the list and the map grew from was freed as they moved.
+        if list > 0 {
+            self.budget.release(old_list);
+        }
+        if table > 0 {
+            self.budget.release(self.computed_table.replace(table));
+        }
+        Ok(id)
     }
 
     fn binding<'s>(
@@ -1714,8 +1778,8 @@ impl<'a> Context<'a> {
                             .map_or(UNDEF, |c| solutions.table.get(row, c))
                     };
                     match term.value(&value, &self.snapshot) {
-                        fast::Id::Stored(id) => return id.raw(),
-                        fast::Id::Error => return UNDEF,
+                        fast::Id::Stored(id) => return Ok(id.raw()),
+                        fast::Id::Error => return Ok(UNDEF),
                         fast::Id::Absent | fast::Id::Unknown => {}
                     }
                 }
@@ -1723,9 +1787,9 @@ impl<'a> Context<'a> {
                     .in_solution(row as u64, || {
                         self.evaluator.eval(&plain, &self.binding(&solutions, row))
                     })
-                    .map_or(UNDEF, |term| self.id(&term))
+                    .map_or(Ok(UNDEF), |term| self.id(&term))
             })
-            .collect();
+            .collect::<NativeResult<_>>()?;
         let mut solutions = drop_last_columns(solutions, added);
         let mut columns = std::mem::take(&mut solutions.table).into_columns();
         columns.push(values);
@@ -1942,9 +2006,9 @@ impl<'a> Context<'a> {
                         .iter()
                         .map(|term| match term {
                             Some(term) => self.id(&Term::from(term.clone())),
-                            None => UNDEF,
+                            None => Ok(UNDEF),
                         })
-                        .collect();
+                        .collect::<NativeResult<_>>()?;
                     table.push_row(&row);
                 }
                 self.produced(Solutions {
@@ -2190,17 +2254,17 @@ impl<'a> Context<'a> {
 
     /// An end of a path: a variable (blank nodes are variables here), or a constant's id
     /// (computed if the store doesn't know it; such an id has no edges).
-    fn path_end(&self, term: &TermPattern) -> Result<Variable, u64> {
-        match term {
+    fn path_end(&self, term: &TermPattern) -> NativeResult<Result<Variable, u64>> {
+        Ok(match term {
             TermPattern::Variable(v) => Ok(v.clone()),
             TermPattern::BlankNode(b) => {
                 Ok(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
             }
-            TermPattern::NamedNode(n) => Err(self.id(&n.clone().into())),
-            TermPattern::Literal(l) => Err(self.id(&l.clone().into())),
+            TermPattern::NamedNode(n) => Err(self.id(&n.clone().into())?),
+            TermPattern::Literal(l) => Err(self.id(&l.clone().into())?),
             // A triple term at a path's end matches nothing a path reaches.
             TermPattern::Triple(_) => Err(UNDEF),
-        }
+        })
     }
 
     /// The path evaluator for the active graph. There is none while `GRAPH ?g` is evaluated
@@ -2241,7 +2305,7 @@ impl<'a> Context<'a> {
         if self.as_written {
             return self.filtered_path(path, None, start);
         }
-        let (Ok(s), Ok(o)) = (self.path_end(path.subject), self.path_end(path.object)) else {
+        let (Ok(s), Ok(o)) = (self.path_end(path.subject)?, self.path_end(path.object)?) else {
             // A constant end already bounds the path.
             return self.filtered_path(path, None, start);
         };
@@ -2334,11 +2398,11 @@ impl<'a> Context<'a> {
     ) -> NativeResult<Solutions> {
         let start = Instant::now();
         let resolved = paths::Path::resolve(path, &self.snapshot);
-        let end = |term: &TermPattern| self.path_end(term);
+        let ends = (self.path_end(subject)?, self.path_end(object)?);
         let mut evaluator = self.path_evaluator()?;
-        evaluator.fixed = end(subject).err().or_else(|| end(object).err());
+        evaluator.fixed = ends.0.clone().err().or_else(|| ends.1.clone().err());
         let column = |values: Vec<u64>| IdTable::from_columns(vec![values]);
-        let (vars, table) = match (end(subject), end(object)) {
+        let (vars, table) = match ends {
             (Err(start), Err(finish)) => {
                 let rows = evaluator.multiplicity(&resolved, start, finish);
                 (
@@ -4660,7 +4724,7 @@ impl<'a> Context<'a> {
                 None => 0,
             };
             let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))]);
+            table.push_row(&[self.id(&integer(count))?]);
             return Ok(Solutions {
                 vars: vec![target.clone()],
                 table,
@@ -4676,7 +4740,7 @@ impl<'a> Context<'a> {
             && let Some(count) = self.cyclic_count(patterns)?
         {
             let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))]);
+            table.push_row(&[self.id(&integer(count))?]);
             return Ok(Solutions {
                 vars: vec![target.clone()],
                 table,
@@ -4694,7 +4758,7 @@ impl<'a> Context<'a> {
                 path,
                 object,
             } = inner
-            && let (Ok(start), Ok(end)) = (self.path_end(subject), self.path_end(object))
+            && let (Ok(start), Ok(end)) = (self.path_end(subject)?, self.path_end(object)?)
             && start != end
             && let Some(count) = self
                 .path_evaluator()?
@@ -4705,7 +4769,7 @@ impl<'a> Context<'a> {
                 self.note("closure", detail, Some(1), 1, begun);
             }
             let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))]);
+            table.push_row(&[self.id(&integer(count))?]);
             return Ok(Solutions {
                 vars: vec![target.clone()],
                 table,
@@ -4749,10 +4813,10 @@ impl<'a> Context<'a> {
                 let counts: Vec<u64> = groups
                     .iter()
                     .map(|&(_, n)| match TermId::inline_integer(n as i64) {
-                        Some(id) => id.raw(),
+                        Some(id) => Ok(id.raw()),
                         None => self.id(&integer(n)),
                     })
-                    .collect();
+                    .collect::<NativeResult<_>>()?;
                 let mut vars = vec![key.clone()];
                 for (target, _) in aggregates {
                     columns.push(counts.clone());
@@ -5198,10 +5262,10 @@ impl<'a> Context<'a> {
             let column: Vec<u64> = values
                 .iter()
                 .map(|group| match &group[index] {
-                    Agg::Id(id) => *id,
+                    Agg::Id(id) => Ok(*id),
                     Agg::Term(term) => self.id(term),
                 })
-                .collect();
+                .collect::<NativeResult<_>>()?;
             columns.push(column);
             vars.push(target.clone());
         }

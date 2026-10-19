@@ -424,10 +424,10 @@ impl Context<'_> {
             }
             let mut row = vec![found.id];
             if search.relevance.is_some() {
-                row.push(self.id(&Term::from(Literal::from(found.relevance))));
+                row.push(self.id(&Term::from(Literal::from(found.relevance)))?);
             }
             if search.rank.is_some() {
-                row.push(self.id(&Term::from(Literal::from(rank as i64))));
+                row.push(self.id(&Term::from(Literal::from(rank as i64)))?);
             }
             table.push_row(&row);
         }
