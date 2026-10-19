@@ -1,7 +1,8 @@
 //! Data for the fast suite (`benches/fast`): `perf_lab generate KIND OUT [key=value]...`.
 //!
 //! Every kind is deterministic for its parameters and seed, written as N-Triples (RDF 1.2
-//! where it holds triple terms), and computes here, independently of the store, the
+//! where it holds triple terms; the multi-graph kinds `geo4` and `social4` as N-Quads over four
+//! named graphs, `ex:graph0` to `ex:graph3`), and computes here, independently of the store, the
 //! answers the suite checks before a time counts. They go to standard output as one JSON
 //! object (`expect`), with the statement count and the parameters used. Kinds that need
 //! commits also write `OUT.commits.ru`: one SPARQL update per line, one commit each.
@@ -47,16 +48,32 @@ impl Rng {
     }
 }
 
-/// An N-Triples writer that counts its statements.
+/// An N-Triples writer that counts its statements; with `spread`, N-Quads: statement n
+/// (from 1) in graph n mod 4, every third one also in the next graph (as the merged-joins
+/// A-B-B-As spread the fast suite's data, 19 Oct 2026).
 struct Nt {
     out: BufWriter<File>,
     count: u64,
+    spread: bool,
 }
 
 impl Nt {
     fn t(&mut self, s: &str, p: &str, o: &str) -> std::io::Result<()> {
         self.count += 1;
-        writeln!(self.out, "{s} {p} {o} .")
+        if !self.spread {
+            return writeln!(self.out, "{s} {p} {o} .");
+        }
+        let g = self.count % 4;
+        self.q(s, p, o, g)?;
+        if self.count.is_multiple_of(3) {
+            self.q(s, p, o, (g + 1) % 4)?;
+        }
+        Ok(())
+    }
+
+    /// A statement in named graph `ex:graph{g}`, not counted.
+    fn q(&mut self, s: &str, p: &str, o: &str, g: u64) -> std::io::Result<()> {
+        writeln!(self.out, "{s} {p} {o} <{EX}graph{g}> .")
     }
 }
 
@@ -107,11 +124,13 @@ pub fn main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut nt = Nt {
         out: BufWriter::with_capacity(1 << 20, File::create(out)?),
         count: 0,
+        spread: kind == "social4",
     };
     let mut rng = Rng(params.get("seed", 1));
     let commits = format!("{out}.commits.ru");
     let mut expect = match kind.as_str() {
-        "social" => social(&params, &mut rng, &mut nt)?,
+        "social" | "social4" => social(&params, &mut rng, &mut nt)?,
+        "geo4" => geo4(&params, &mut rng, &mut nt)?,
         "hierarchy" => hierarchy(&params, &mut rng, &mut nt)?,
         "clique" => clique(&params, &mut rng, &mut nt, &commits)?,
         "sameas" => sameas(&params, &mut nt, &commits)?,
@@ -661,6 +680,66 @@ fn geo(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     for (k, count) in inside.iter().enumerate() {
         e.insert(format!("within_{k}"), json!(count));
     }
+    Ok(e)
+}
+
+/// `geo`'s points over four named graphs, point i's two statements in graph i mod 4, and the
+/// four squares as geometries of their own (`ex:sq0` to `ex:sq3`) in every graph: the access
+/// paths of GeoSPARQL over several graphs (`GRAPH <g>`, `GRAPH ?g`, `FROM`). The answers, per
+/// graph and square: the points inside (`within_g{g}_{k}`) and, with each square within and
+/// containing itself (OGC: within holds for equal geometries), what the fast suite's geo4
+/// queries count.
+fn geo4(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
+    let n = p.get("points", 1_000_000);
+    let squares = [(10.5, 20.5), (40.25, 45.25), (0.75, 50.75), (77.0, 99.0)];
+    let mut inside = [[0u64; 4]; 4];
+    let (has, wkt) = (format!("<{GEO}hasGeometry>"), format!("<{GEO}asWKT>"));
+    for i in 0..n {
+        let x = rng.below(1_000_000) as f64 / 10_000.0 + 0.00005;
+        let y = rng.below(1_000_000) as f64 / 10_000.0 + 0.00005;
+        let g = i % 4;
+        for (k, (lo, hi)) in squares.iter().enumerate() {
+            inside[g as usize][k] += u64::from(x > *lo && x < *hi && y > *lo && y < *hi);
+        }
+        nt.count += 2;
+        nt.q(&ex(format!("pt{i}")), &has, &ex(format!("g{i}")), g)?;
+        let point = format!("\"POINT({x:.5} {y:.5})\"^^<{GEO}wktLiteral>");
+        nt.q(&ex(format!("g{i}")), &wkt, &point, g)?;
+    }
+    for g in 0..4 {
+        for (k, (lo, hi)) in squares.iter().enumerate() {
+            let polygon = format!(
+                "\"POLYGON(({lo} {lo}, {hi} {lo}, {hi} {hi}, {lo} {hi}, {lo} {lo}))\"^^<{GEO}wktLiteral>"
+            );
+            nt.count += 1;
+            nt.q(&ex(format!("sq{k}")), &wkt, &polygon, g)?;
+        }
+    }
+    let mut e = Expect::new();
+    for (g, row) in inside.iter().enumerate() {
+        for (k, count) in row.iter().enumerate() {
+            e.insert(format!("within_g{g}_{k}"), json!(count));
+        }
+    }
+    // The queries of benches/fast/queries/geo4 and geo4-relations: a square is within (and
+    // contains) itself, no other square is within square 1 or 3, the squares have no
+    // hasGeometry; GRAPH ?g gives one solution per graph a statement is in (each square is in
+    // all four). A relation pattern answers features too, each where its geometry is (GeoSPARQL
+    // query rewriting, as the engine evaluates it): a point counts twice, in its own graph.
+    let all = |k: usize| inside.iter().map(|row| row[k]).sum::<u64>();
+    e.insert("graph0_filter_sq0".into(), json!(inside[0][0]));
+    e.insert(
+        "from01_filter_sq1".into(),
+        json!(inside[0][1] + inside[1][1] + 1),
+    );
+    e.insert("graphvar_filter_sq3".into(), json!(all(3) + 4));
+    e.insert("from01_join_sq1".into(), json!(inside[0][1] + inside[1][1]));
+    e.insert("graph1_within_sq1".into(), json!(2 * inside[1][1] + 1));
+    e.insert("graphvar_within_sq1".into(), json!(2 * all(1) + 4));
+    e.insert(
+        "from23_sq3_contains".into(),
+        json!(2 * (inside[2][3] + inside[3][3]) + 1),
+    );
     Ok(e)
 }
 
