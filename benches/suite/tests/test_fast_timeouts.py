@@ -114,7 +114,7 @@ class RuntimeTimeouts(unittest.TestCase):
                 if runtime == "native":
                     end.assert_called_once()
                 else:
-                    self.assertEqual(docker.call_args.args[0], ["rm", "-f", "contract"])
+                    self.assertEqual(docker.call_args.args[0], ["rm", "-f", fast.ns.name("fast-contract", fast.ROOT)])
 
 
 if __name__ == "__main__":

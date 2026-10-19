@@ -53,7 +53,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(ROOT / "benches/suite"))
 
 import program as P  # noqa: E402
-from suitekit import quiet  # noqa: E402
+from suitekit import ns, quiet  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
@@ -326,7 +326,7 @@ class Run:
              entrypoint: bool = True) -> Spec:
         # As the invoking user: what the engines write in /work stays removable.
         user = f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else None
-        return Spec(f"nrese-suite-datalog-{self.name}", image, command, {"HOME": "/tmp", **(env or {})},
+        return Spec(ns.name(f"suite-datalog-{self.name}", ROOT), image, command, {"HOME": "/tmp", **(env or {})},
                     [self.data, Mount(str(self.work), "/work", readonly=False), *linked(data_dir(self.case)),
                      *(extra or [])],
                     entrypoint=entrypoint, user=user, memory=None if self.memory == "0" else self.memory)
