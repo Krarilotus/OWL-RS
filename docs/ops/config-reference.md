@@ -200,7 +200,7 @@ api_key = "replace-me"
 - file key: `store.vocabulary`
 - env override: `NRESE_VOCABULARY`
 - default: `plain`
-- how checkpoints store the dictionary's keys: `plain`, or `fsst` (compressed with two FSST symbol tables, one for IRIs and one for the other terms, trained on a sample when the checkpoint is written). On the office PC's stores the keys shrink to 39 % (Wikidata lexemes, 576 → 224 MiB), 45 % (DBpedia core) and 53 % (YAGO); a key read from a compressed checkpoint costs a decode (about 17 ns in order, more at random), so result-heavy and string-scanning queries pay for it. Terms interned since the last checkpoint stay plain until the next. Both forms are read whatever the setting: switching takes effect at the next checkpoint
+- how checkpoints store the dictionary's keys: `plain`, or `fsst` (compressed with two FSST symbol tables, one for IRIs and one for the other terms, trained on a sample when the checkpoint is written). On the office PC's stores the keys shrink to 39 % (Wikidata lexemes, 576 → 224 MiB), 45 % (DBpedia core) and 53 % (YAGO); a key read from a compressed checkpoint costs a decode (about 17 ns in order, more at random), so result-heavy and string-scanning queries pay for it. Terms interned since the last checkpoint stay plain until the next. Both forms are read whatever the setting: switching takes effect at the next checkpoint. Applies to every repository of the server (see [process-wide settings](#process-wide-settings))
 
 - file key: `store.invalid_statements`
 - env override: `NRESE_INVALID_STATEMENTS`
@@ -318,6 +318,12 @@ embedded store never replaces that global policy; embedding hosts may install it
 Store-local watches cover participating operations, including DL bounds and diagnostics;
 an explicit zero remains disabled. These are cooperative checkpoints, not allocator limits
 or preemption of schema reading, normalisation and compilation.
+
+### Process-wide settings
+
+In this build four settings are the process's, not a repository's: `store.index_encoding`, `store.vocabulary`, `budgets.huge_pages` (only `off` changes anything) and `budgets.reasoning_release`. Opening a store (`StoreService::with_runtime`) sets them for the whole process (`nrese-store/src/service.rs`), so the store opened last decides for every store. The server opens every repository with the same values, so its repositories agree; an embedding application that opens stores with different values gets the last one's everywhere.
+
+One diagnostic is read from the environment outside this configuration: `NRESE_CLASSIFY_TRACE` (set to anything) makes the DL classification write its phases with their start times to stderr (`nrese-dl/src/classify/mod.rs`). It changes no result; it is for the lab, not an operator setting.
 
 The same settings have older names, which still work: `policy.limits.max_query_bytes`, `max_query_memory_bytes`, `max_update_bytes`, `max_rdf_upload_bytes`; `policy.timeouts.query_ms`, `update_ms`, `graph_read_ms`, `graph_write_ms`; `store.query_cache_bytes`. A setting under both names is a startup error.
 

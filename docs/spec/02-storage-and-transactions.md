@@ -22,14 +22,16 @@ This is the contract the storage engine (`nrese-engine`, layer L1) and the mutat
 
 - **Snapshot reads.** Every query, Graph Store read and export runs on one snapshot, a consistent committed revision.
   - A snapshot never observes a partial commit.
-  - Readers never wait for writers, compaction or checkpoints.
+  - Readers never wait for a commit, compaction or checkpoint to finish. Taking the latest snapshot reads the current version under a brief lock (`Versions::load`), held only while a finished version is published; reading a snapshot already taken takes no lock. The dictionary's lookups and the first build of a derived structure (a text order, a statistics set, a cache) can take locks of their own.
 - **Read models.** Every read takes one:
   - `Materialised` (the default): asserted plus inferred statements
   - `Asserted`: explicit statements only
   - `Inferred`: implicit statements only
 
   A request-level switch and GraphDB's `onto:explicit`/`onto:implicit` pseudo-graphs come with R4.
-- **Pattern cost.** Every triple pattern is a contiguous range in one of six index permutations: O(r·log n + k) for k results over r runs, with r = O(log n). The inferred stack keeps three permutations, because a graph-first order over its single graph is the same as the matching graph-last one.
+- **Pattern cost.** Every triple pattern is a contiguous range in one of a stack's index permutations: O(r·log n + k) for k results over r runs, with r = O(log n). A stack has one of two layouts (`index::Layout`):
+  - **Quads:** SPOG, POSG, OSPG, GSPO, GPOS, GOSP and GPSO, seven permutations for quads in any graph.
+  - **Default graph:** SPOG, POSG, OSPG and PSOG, four permutations. A graph-first order over one constant graph sorts like the matching graph-last one, so the graph-first ones would be copies. The inferred stack always has it; the asserted stack has it until it holds a quad in a named graph (checkpoint format 9 and later).
 
 ## Writes
 
@@ -38,7 +40,7 @@ Every write goes through the mutation pipeline:
 1. **Plan.** The command is applied to an engine transaction. Nothing is visible yet.
    - Later operations of one request see earlier ones.
    - The pending delta is exact: inserts are absent from the base, and deletes are present in it.
-2. **Validate.** The gates run on the transaction's state. Today this is the v1 reasoner gate, which reads the whole dataset when enabled; SHACL comes in M2.
+2. **Validate.** The gates run on the transaction's state: the reasoner maintains the inferred stack and rejects inconsistencies incrementally, from the delta (`mutation/pipeline.rs`; under `owl2-dl` also its consistency gate), and SHACL validates the changed focus nodes (`shacl.rs`).
 3. **Claim.** The request's ticket decides the race against a timeout. A timed-out request is guaranteed not to be committed, and cancelling it also stops SPARQL evaluation.
 4. **Commit.** The delta is appended to the WAL and synced, then published atomically as the next revision.
 
@@ -72,23 +74,23 @@ Initial loads and full restores bypass the per-commit path (`Engine::bulk_load`;
   - A torn record at the end of the log (a crash mid-write) is truncated; it was never acknowledged.
   - Invalid data anywhere else is a startup error, never silently skipped.
 - **Directory lock.** The data directory is locked against a second process.
-- **Format versions.** WAL segments and checkpoints carry a format version in their magic bytes; format 2 added the inferred stack. A directory written by another version is rejected at startup with `UnsupportedFormat` instead of being reported as corrupt.
+- **Format versions.** WAL segments and checkpoints carry a format version in their magic bytes (`durability/wal.rs`, `durability/checkpoint.rs`, which lists what each version added). Older formats this build still reads (WAL 4 to 6, checkpoints 4 to 11) are read; any other is rejected at startup with `UnsupportedFormat` instead of being reported as corrupt.
 
-## Limits (current milestone)
+## Limits
 
-- **Memory.** Indexes are held in memory, at about 190 bytes per quad uncompressed. Compressed and larger-than-RAM indexes are Pf1/Pf2.
+- **Memory.** Index runs are packed (compressed keys) in memory and in checkpoints. In on-disk mode a restart, a bulk load and a background checkpoint map the checkpoint and use its dictionary and packed runs in place (`durability/checkpoint.rs`, `crate::mapped`): the OS pages in what queries touch. Runs written since the last checkpoint are on the heap.
 - **Commit size.** One commit holds at most 4 GiB of WAL payload, about 130 M quads. Larger loads go through the bulk loader.
-- **v1 reasoner cost.** With the v1 reasoner enabled (`rules-mvp`), every write costs O(dataset) until the M3 reasoner replaces it.
+- **Reasoning cost.** A commit's reasoning is incremental (the delta executor) unless the program changes; the `rules-mvp` reasoner, whose every write cost O(dataset), was removed (the server refuses the name).
 
 ## Evidence
 
 | Guarantee | Test |
 |---|---|
 | Visibility rule, all pattern shapes, compaction | `crates/nrese-engine/src/index/model_tests.rs` |
-| Snapshot isolation, overlay reads, concurrent readers | `crates/nrese-engine/tests/engine_tests.rs` |
-| Bulk loads equal transactional loads (parallel, append/replace, durable) | `crates/nrese-engine/tests/bulk_load_tests.rs`, `crates/nrese-store/tests/it/bulk_load_tests.rs` |
-| Inferred stack: read models, disjointness, both stacks against a model across compaction, checkpoints and reopening | `crates/nrese-engine/tests/inferred_stack_tests.rs` |
-| Crash recovery, torn tails, corruption, checkpoints | `crates/nrese-engine/tests/durability_tests.rs` |
-| SPARQL semantics against an oracle | `crates/nrese-sparql/tests/differential_tests.rs` |
+| Snapshot isolation, overlay reads, concurrent readers | `crates/nrese-engine/tests/it/engine_tests.rs` |
+| Bulk loads equal transactional loads (parallel, append/replace, durable) | `crates/nrese-engine/tests/it/bulk_load_tests.rs`, `crates/nrese-store/tests/it/bulk_load_tests.rs` |
+| Inferred stack: read models, disjointness, both stacks against a model across compaction, checkpoints and reopening | `crates/nrese-engine/tests/it/inferred_stack_tests.rs` |
+| Crash recovery, torn tails, corruption, checkpoints | `crates/nrese-engine/tests/it/durability_tests.rs` |
+| SPARQL semantics against an oracle | `crates/nrese-sparql/tests/it/differential_tests.rs`, `native_differential_tests.rs` |
 | Pipeline: cancel vs. commit, gate rejection | `crates/nrese-store/tests/it/mutation_pipeline_tests.rs` |
 | Write cost independent of size (HTTP, end to end) | `benches/baselines/v2-write-scaling-*.json` |

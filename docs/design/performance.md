@@ -22,6 +22,10 @@ reading this table, and keeps the win or measures its replacement against it. Ea
 shapes, bounds), so regressions are caught where they happen rather than by chance in large
 benchmark runs.
 
+The table is not complete coverage: a row whose guard or fast case says it is missing is an
+open gap, and some wins have no row yet (GeoSPARQL's R-tree among them). A passing fast
+suite says nothing about those; a change to such code adds the row and its guard first.
+
 | Win | Measured | Guard | Fast case |
 |---|---|---|---|
 | Order-preserving DISTINCT removes adjacent duplicates when any complete column order is known, without sorting or gathering again | A full `[1, 0]` order no longer calls the `[0, 1]` sorter: original buffers and sort metadata kept; OWL2Bench QL q01/q20's +0.1/+0.04 ms gone | `ordered_dedup_uses_any_complete_sort_order_without_gathering` (`nrese-exec`), executor differential tests | OWL2Bench QL q01/q20 |

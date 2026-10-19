@@ -78,17 +78,23 @@ This section owns the execution policy; there is no setting for it besides `dl.t
   solution tables and their appended bound rows, the DL gap's scratch, compilation
   scratch and the vector collector's candidates use it; a `Gauge` is a reservation that
   follows a DL engine's sampled capacity. There is no second charge-on-drop mechanism.
-- **`Workers` is the DL batch width.** DL classification, realisation and exact
-  candidate batches take a `Workers` handle sized by `dl.threads` (0: every core;
+- **`Workers` is the DL batch width and the result encoder's.** DL classification,
+  realisation and exact candidate batches take a `Workers` handle sized by `dl.threads`
+  (0: every core;
   `Workers::new(n)` with `n` ≤ 1, or a pool that can't start, runs serially). A narrower
   handle bounds the batch's own dispatch; it is not a semaphore
   inherited by nested Rayon work, so child work partitions its allowance explicitly.
   Full-width batches keep Rayon's work stealing; narrow ones use bounded lanes, an idle
-  lane claiming the next probe while results keep their order.
-- **One absolute deadline per DL operation.** A DL operation computes its deadline once;
-  every phase (consistency, gate evidence, entailment batches, classification) measures
-  what remains from it rather than restarting a timeout, and checks the request's
-  cancellation token at the same points. Tableau portfolio siblings share a child token
+  lane claiming the next probe while results keep their order. A query's `Resources`
+  carry one too (the current registry by default); in SPARQL only result encoding
+  dispatches through it (`native/output.rs`), the other kernels use the whole pool.
+- **One absolute deadline per DL operation, not yet everywhere.** A multi-axiom
+  entailment computes its deadline once and gives each batch what remains of it
+  (`store/dl/entailment.rs`, `Budget::remaining`). Not yet so: a single-axiom entailment
+  passes the whole budget to each of its negation tests, and each consistency check starts
+  its own deadline from it; classification (`nrese_dl::classify`) and the U1 rebuild
+  (`store/dl/bounds.rs`) have deadline types of their own. Phases check the request's
+  cancellation token at their checkpoints. Tableau portfolio siblings share a child token
   that cannot cancel their request; the first decided outcome in input order is returned.
 - **What the envelopes don't cover.** Accounted capacities are not process RSS or a strict
   allocation ceiling: they are capacity estimates (compilation's are checked against the
@@ -96,8 +102,10 @@ This section owns the execution policy; there is no setting for it besides `dl.t
   exists, and decoded graph payloads, encoder buffers, the tableau's checkpoints and
   runtime overhead are not counted. Work the store shares between requests keeps its own
   owner: the revision's ontology, the bounds L and U1, classification and realisation
-  (cached per revision, under `dl.memory` and the process limit), rule materialisation,
-  bulk spill and background storage.
+  (cached per revision: an envelope of their own within the catalog's budget, not the
+  requesting operation's, besides `dl.memory` and the process limit;
+  `store/dl/classification.rs`), rule materialisation, bulk spill and background storage.
+  A cached result keeps what it retains after the request that computed it ends.
 - **A Rayon worker never waits on a cache flight.** A part another query computes is
   waited for only off the pool; a request on a worker computes it itself, so no wait can
   hold a stack its producer needs ([research-designs.md

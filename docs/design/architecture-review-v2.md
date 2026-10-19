@@ -5,6 +5,19 @@ hardware round, distribution, compaction), v2.1 (property graphs) and the produc
 will be built on it in other repositories? The evidence is the code at `9d5a65fd`, cited
 by file and line. No code was changed and nothing was built.
 
+**Reconciled with `c9be1609` (18 October 2026).** The findings below are kept as written
+for `9d5a65fd`; where the code has moved on, this table says so (the ownership audit,
+`Harness/notes/2026-10-18-ownership-consolidation-audit.md`, §5).
+
+| Finding | At `c9be1609` |
+|---|---|
+| Summary 6, L1: public write methods skip every gate | Resolved. The ungated writes are crate-private (`apply_ungated`, `update_ungated`, `update_str_ungated` in `service.rs`) for the store's system graphs and scratch stores; every public write goes through the pipeline (`mutation/pipeline.rs`, `write_path_tests`); bulk loads, rematerialisation and a replica's log are explicit operations |
+| Summary 4, §2.2.1: no id-level triple terms | Done: `Snapshot::triple_term` and `Snapshot::components` on ids, used by the triple-term joins (`native/triple_joins.rs`); a hop costs probes per edge (performance.md §0). `native/triple_terms.rs` now holds the patterns and constructors, not the unused linear scan the review meant |
+| L3: the store owns users and passwords against the ownership table | Resolved in the table: ARCHITECTURE.md §2.1 says what the store owns (access state, local users' hashes and their verification) and what the server owns (authentication backends) |
+| D1: the EL classifier's only user is an example | Not so: the context core's differential test (`nrese-dl/tests/context/el.rs`), the EL metamorphic tests and two examples (`classify`, timed by the `el-classify` cases, and `context_classify --compare-el`) use it. It is an independent oracle to keep, not dead code; isolating it from the production surface is consolidation PR 4 |
+| L8: stale "v1 reasoner" comment | Resolved: `mutation/pipeline.rs` describes the delta executor |
+| Still open | L2 (the server builds the reasoner, `main.rs`), L4 (opening a store sets process-wide settings, `service.rs`; [config reference](../ops/config-reference.md#process-wide-settings)), L5 (`NRESE_CLASSIFY_TRACE`, a lab diagnostic, now documented; `NRESE_PIE_DIR` is read by a test only), L6 (`nrese-dl`'s dev-dependency on the reasoner, also for the bounds' tests), L7 (the engine parses legacy triple-term keys through `nrese-rdf-io`), D2 (equality: one union kernel for engine and rules, but residual connectivity copies in `nrese-dl`, SPARQL's WCOJ and QL's hazards, and the tableau's reason-carrying merges, audit §1), D3 |
+
 ## Executive summary
 
 1. **The core is sound and worth building on.** Layers point down, the engine is one LSM over `[TermId; 4]` with MVCC, and the reasoner and executor work on ids. No core rewrite is needed for v2.0 or v2.1.

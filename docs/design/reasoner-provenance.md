@@ -10,7 +10,7 @@
 - The inferred stack holds the closure with set semantics: a fact is there or not.
 - Commits maintain it by DRed with backward/forward proofs (B/F; `nrese_reasoner::delta`). Overdeletion asks the prover whether a candidate keeps a proof avoiding the deleted facts. It restarts as plain DRed when a schema or list fact changes.
 - Explanations are searched backwards on demand.
-- Inferred statements are all-or-nothing per access policy (`GraphAccess::inferred`).
+- Inferred statements under graph access: all-or-nothing per access policy (`GraphAccess::inferred`), or, with `inferred = "supported"`, visible to a reader when one of their minimal support graph sets is readable. The sets are computed in memory (`nrese_reasoner::graph_sets`, kept per revision by `nrese-store/src/support.rs` in heap and `Arc` structures and updated per commit); they are not in the WAL or checkpoints, so a restart computes them again.
 
 ## What the field does (the state to reach)
 
@@ -40,9 +40,9 @@ The keys' dependency graph (body key → head key) is condensed into strongly co
 
 `witness` (one derivation per fact, for constant-time explanations) and `full` (every derivation) come later, if explanations need them.
 
-## Where it lives: a support stack
+## Where it lives: a support stack (proposed, not built)
 
-A third engine stack beside the asserted and inferred ones:
+The engine still has two stacks (`nrese-engine/src/engine/mod.rs`); today's sets are the in-memory ones above. The proposal: a third engine stack beside the asserted and inferred ones:
 - **Layout:** `DefaultGraph`, holding entries `(s, p, o, tag)`, with the same runs, MVCC, WAL, checkpoints and compaction, and set semantics.
 - **The tag** is a `TermId` of a reserved inline kind, `Set(id)`: one entry per minimal support graph set.
 - **Reading:** an SPO-prefix scan gives a fact's provenance, adjacent and sorted.
