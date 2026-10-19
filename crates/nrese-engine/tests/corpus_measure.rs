@@ -75,3 +75,37 @@ fn corpora_are_charged_before_they_are_allocated() {
     assert_eq!(excess(&engine.snapshot(), &envelope), 0, "not kept");
     assert_eq!(engine.stats().text_corpora.kept, 0);
 }
+
+/// A walk reserves what its slices can hold, from the bits it walks: one one-word document
+/// on two workers fits a 64 KiB budget (the review's case of 19 October: it asked 4 MiB,
+/// full slices on every worker).
+#[test]
+fn a_small_walk_reserves_for_its_own_slices() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    tx.insert(
+        Quad::new(
+            NamedNode::new_unchecked("http://example.com/s"),
+            NamedNode::new_unchecked("http://example.com/p"),
+            Literal::new_simple_literal("word"),
+            GraphName::DefaultGraph,
+        )
+        .as_ref(),
+    );
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let request = Arc::new(Budget::new(64 << 10));
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    let size = pool.install(|| {
+        snapshot.text_corpus_size(
+            ReadModel::Materialised,
+            &TextScope::EVERY,
+            false,
+            Some(&request),
+        )
+    });
+    assert_eq!(size.map(|(documents, _)| documents), Ok(1));
+}

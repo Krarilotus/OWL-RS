@@ -1676,7 +1676,7 @@ impl Snapshot {
         let mut bits = nrese_exec::ChargedVec::with_capacity(Arc::clone(budget), words)?;
         bits.resize(words, 0)?;
         let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
-        scratch.charge(self.walk_scratch())?;
+        scratch.charge(self.walk_scratch(words))?;
         for &kind in documents.kinds() {
             match scope {
                 TextScope::Graphs(graphs) => {
@@ -1697,12 +1697,15 @@ impl Snapshot {
             .with_text_index(iris, |index| index.corpus(bits)))
     }
 
-    /// The most a corpus walk's slices hold at once besides the bits: on each thread of
-    /// the pool, a slice's group counts (16 bytes a term, 64 terms a word) from each run,
-    /// and as many again where they are merged or compared.
-    fn walk_scratch(&self) -> usize {
+    /// The most a corpus walk over `words` words of bits holds at once besides them: for
+    /// each slice running at once (no more than the pool's threads, nor than there are), its
+    /// group counts (16 bytes a term, 64 terms a word of the slice) from each run, and as
+    /// many again where they are merged or compared.
+    fn walk_scratch(&self, words: usize) -> usize {
         let runs = self.version.runs().count().max(1);
-        rayon::current_num_threads() * SLICE_WORDS * 64 * 16 * runs * 2
+        let per = slice_words(words);
+        let running = words.div_ceil(per).min(rayon::current_num_threads());
+        running * per * 64 * 16 * runs * 2
     }
 
     /// Whether a statement this snapshot shows in `scope`'s graphs in `model` has `id` at
@@ -1747,10 +1750,7 @@ impl Snapshot {
         bits: &mut [u64],
     ) {
         use rayon::prelude::*;
-        let per = bits
-            .len()
-            .div_ceil(rayon::current_num_threads() * 4)
-            .clamp(1, SLICE_WORDS);
+        let per = slice_words(bits.len());
         let walked = bits
             .par_chunks_mut(per)
             .enumerate()
@@ -1834,6 +1834,14 @@ impl Snapshot {
         let plan = self.range_plan(model, &pattern, permutation, low, high)?;
         self.group_counts_of(model, &plan)
     }
+}
+
+/// Words of the bits each slice of a walk over `words` covers: four slices a thread of the
+/// pool, at most [`SLICE_WORDS`].
+fn slice_words(words: usize) -> usize {
+    words
+        .div_ceil(rayon::current_num_threads() * 4)
+        .clamp(1, SLICE_WORDS)
 }
 
 /// Words of the bits a slice of a corpus walk covers at most ([`Snapshot::mark_values`]):
