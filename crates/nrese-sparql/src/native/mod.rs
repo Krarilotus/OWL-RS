@@ -1240,6 +1240,31 @@ enum GraphScope {
     Missing,
 }
 
+/// Tables charged to a query's budget ([`Context::reshaped`]).
+trait Charged {
+    fn charged(&self) -> usize;
+}
+
+impl Charged for Solutions {
+    fn charged(&self) -> usize {
+        self.table.memory_bytes()
+    }
+}
+
+impl Charged for Vec<Solutions> {
+    fn charged(&self) -> usize {
+        self.iter().map(Charged::charged).sum()
+    }
+}
+
+/// What [`IdTable::concat`] of `parts` allocates beyond them: the first part's columns
+/// grown to every row, while the old ones are still held.
+fn concat_growth(parts: &[Solutions]) -> usize {
+    let rows: usize = parts.iter().map(|p| p.table.len()).sum();
+    let width = parts.first().map_or(0, |p| p.table.width());
+    rows.saturating_mul(width).saturating_mul(size_of::<u64>())
+}
+
 impl<'a> Context<'a> {
     /// Whether `triple` is a GeoSPARQL relation computed from geometries
     /// ([`spatial`]): not when only stated relations are read.
@@ -1440,8 +1465,37 @@ impl<'a> Context<'a> {
         .into()
     }
 
-    fn consumed(&self, solutions: &Solutions) {
-        self.budget.release(solutions.table.memory_bytes());
+    /// Frees a table charged to the query's budget, then releases its charge: the budget
+    /// never shows less than the tables hold.
+    fn consumed(&self, solutions: Solutions) {
+        let bytes = solutions.table.memory_bytes();
+        drop(solutions);
+        self.budget.release(bytes);
+    }
+
+    /// A table that `reshape` makes of charged ones, which it takes (filtering in place,
+    /// projecting, joining into one): their charge carries over to it, not charged again.
+    /// `growth`, the most it allocates beyond what it frees as it goes, is charged first;
+    /// once the tables it was made of are gone, it holds the charge of exactly its bytes.
+    /// On an error the tables are freed before their charge is released.
+    fn reshaped<T: Charged>(
+        &self,
+        from: T,
+        growth: usize,
+        reshape: impl FnOnce(T) -> Solutions,
+    ) -> NativeResult<Solutions> {
+        let mut held = Reservation::adopt(&*self.budget, from.charged());
+        if let Err(error) = held.charge(growth) {
+            drop(from);
+            return Err(QueryEvaluationError::MemoryLimit(error).into());
+        }
+        // Declared after `held`: dropped before it.
+        let solutions = reshape(from);
+        self.check()?;
+        held.resize(solutions.table.memory_bytes())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        held.transfer();
+        Ok(solutions)
     }
 
     fn term(&self, id: u64) -> Option<Term> {
@@ -1808,7 +1862,7 @@ impl<'a> Context<'a> {
                 } else {
                     anti_join_in_place(&mut table, &right.table, &lk, &rk);
                 }
-                self.consumed(&right);
+                self.consumed(right);
                 self.produced(Solutions {
                     vars: left.vars,
                     table,
@@ -2733,7 +2787,7 @@ impl<'a> Context<'a> {
                         }
                     }
                     let width = vars.len();
-                    self.consumed(&result);
+                    self.consumed(result);
                     return Ok(Solutions {
                         vars,
                         table: IdTable::new(width),
@@ -3449,7 +3503,7 @@ impl<'a> Context<'a> {
                     }
                     out.push(nrese_rdf::Triple::new(subject.clone(), p, o));
                 }
-                self.consumed(&statements);
+                self.consumed(statements);
             }
         }
         self.check()?;
@@ -3594,16 +3648,17 @@ impl<'a> Context<'a> {
         if ranges.len() >= MANY_RANGES
             && let Slot::Var(object) = &scan.slots[2]
         {
-            let mut solutions = self.scan(scan, Some(object))?;
+            let solutions = self.scan(scan, Some(object))?;
             let column = solutions
                 .column(object)
                 .expect("the pattern binds its object");
             let set = IdSet::new(ranges);
-            self.consumed(&solutions);
-            solutions
-                .table
-                .par_retain(|table, row| set.contains(table.get(row, column)));
-            return self.produced(solutions);
+            return self.reshaped(solutions, 0, |mut solutions| {
+                solutions
+                    .table
+                    .par_retain(|table, row| set.contains(table.get(row, column)));
+                solutions
+            });
         }
         // Each range a block and a column at a time where the index can, else quad by quad.
         let mut out: Vec<Vec<u64>> = vec![Vec::new(); vars.len()];
@@ -3760,11 +3815,12 @@ impl<'a> Context<'a> {
         } else {
             out.assume_sorted_by(key_columns)
         };
-        self.consumed(&result);
+        let ordered = result.ordered;
+        self.consumed(result);
         self.produced(Solutions {
             vars,
             table: out,
-            ordered: result.ordered,
+            ordered,
         })
     }
 
@@ -3788,12 +3844,13 @@ impl<'a> Context<'a> {
         }
         .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
         self.budget.release(hash_table);
-        self.consumed(&left);
-        self.consumed(&right);
+        let ordered = left.ordered;
+        self.consumed(left);
+        self.consumed(right);
         self.produced(Solutions {
             vars,
             table,
-            ordered: left.ordered,
+            ordered,
         })
     }
 
@@ -3832,12 +3889,13 @@ impl<'a> Context<'a> {
         }
         .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
         self.budget.release(hash_table);
-        self.consumed(&left);
-        self.consumed(&right);
+        let ordered = left.ordered;
+        self.consumed(left);
+        self.consumed(right);
         self.produced(Solutions {
             vars,
             table,
-            ordered: left.ordered,
+            ordered,
         })
     }
 
@@ -3864,8 +3922,8 @@ impl<'a> Context<'a> {
         };
         let mut table = widen(&left);
         table.append(&widen(&right));
-        self.consumed(&left);
-        self.consumed(&right);
+        self.consumed(left);
+        self.consumed(right);
         self.produced(Solutions {
             vars,
             table,
@@ -4709,8 +4767,8 @@ impl<'a> Context<'a> {
             parts.push(self.group_solutions(crossed, variables, aggregates)?);
             start = end;
         }
-        self.consumed(&keyed);
-        self.consumed(&other);
+        self.consumed(keyed);
+        self.consumed(other);
         let Some(first) = parts.first() else {
             // No keyed rows: no groups (with GROUP BY, an empty input has none).
             let mut vars = variables.to_vec();
@@ -4723,16 +4781,10 @@ impl<'a> Context<'a> {
         };
         let vars = first.vars.clone();
         let width = first.table.width();
-        let tables = parts
-            .into_iter()
-            .map(|part| {
-                self.consumed(&part);
-                part.table
-            })
-            .collect();
-        Ok(Some(self.produced(Solutions {
+        let growth = concat_growth(&parts);
+        Ok(Some(self.reshaped(parts, growth, |parts| Solutions {
             vars,
-            table: IdTable::concat(width, tables),
+            table: IdTable::concat(width, parts.into_iter().map(|p| p.table).collect()),
             ordered: false,
         })?))
     }
@@ -5031,7 +5083,7 @@ impl<'a> Context<'a> {
         } else {
             IdTable::from_columns(columns)
         };
-        self.consumed(&solutions);
+        self.consumed(solutions);
         self.produced(Solutions {
             vars,
             table,
