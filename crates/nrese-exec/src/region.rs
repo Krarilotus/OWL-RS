@@ -239,13 +239,23 @@ impl<B: Deref<Target = Budget>> Region<u64, B> {
 /// assert_eq!((settled.len(), settled[0]), (1, 7));
 /// ```
 ///
-/// It has no way to grow:
+/// It reads:
+///
+/// ```
+/// # use nrese_exec::{Budget, Region};
+/// let budget = Budget::new(1 << 20);
+/// let mut settled = Region::<u64, &Budget>::new(&budget, 1000).unwrap().settle();
+/// let _ = settled.as_slice();
+/// ```
+///
+/// and each row below is that one with its call changed, so the missing method is all that
+/// can fail them (stable rustdoc doesn't check the error code). It has no way to grow:
 ///
 /// ```compile_fail,E0599
 /// # use nrese_exec::{Budget, Region};
 /// let budget = Budget::new(1 << 20);
 /// let mut settled = Region::<u64, &Budget>::new(&budget, 1000).unwrap().settle();
-/// settled.push(7).unwrap();
+/// let _ = settled.push(7);
 /// ```
 ///
 /// or to shrink, then grow again into pages its advice covered (Sol's review of eb6ca4fc):
@@ -254,7 +264,7 @@ impl<B: Deref<Target = Budget>> Region<u64, B> {
 /// # use nrese_exec::{Budget, Region};
 /// let budget = Budget::new(1 << 20);
 /// let mut settled = Region::<u64, &Budget>::new(&budget, 1000).unwrap().settle();
-/// settled.shrink_to_fit();
+/// let _ = settled.shrink_to_fit();
 /// ```
 pub struct Settled<T: Copy, B: Deref<Target = Budget> = Arc<Budget>> {
     /// Before `held`, as in [`Region`].
