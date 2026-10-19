@@ -553,6 +553,25 @@ class Parts(unittest.TestCase):
         self.assertNotIn("rg-test-big", gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 4, None,
                                                          big_host=None))
 
+    def test_the_command_line_plans_and_splits_into_blocks(self):
+        # 19 Oct 2026: a local named `plan` in main() broke `release_gate.py plan` (a gate's prepare).
+        import subprocess
+        script = ROOT / "benches/fast/release_gate.py"
+        done = subprocess.run([sys.executable, "-B", str(script), "plan", "--max-gb", "24"], capture_output=True,
+                              text=True, encoding="utf-8")
+        self.assertEqual(done.returncode, 0, done.stderr[-500:])
+        plan = json.loads(done.stdout)
+        self.assertTrue(plan["run"])
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "plan.json").write_text(done.stdout, encoding="utf-8")
+            (Path(tmp) / "measure.toml").write_text(f'[case.{plan["run"][0]}]\npasses = 6\n', encoding="utf-8")
+            done = subprocess.run([sys.executable, "-B", str(script), "blocks", "--plan", str(Path(tmp) / "plan.json"),
+                                   "--measure", str(Path(tmp) / "measure.toml"), "--out", tmp],
+                                  capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(done.returncode, 0, done.stderr[-500:])
+            third = json.loads((Path(tmp) / "plan-block-3.json").read_text(encoding="utf-8"))
+        self.assertEqual(third["run"], plan["run"][:1])
+
     def test_report_writes_markdown_and_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
