@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use nrese_engine::{DurabilityConfig, Engine, EngineConfig, Snapshot, SyncPolicy};
+use nrese_engine::{DurabilityConfig, EncodedTriple, Engine, EngineConfig, Snapshot, SyncPolicy};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 use nrese_sparql::{GraphAccess, QueryOptions, QueryResults, evaluate_query, explain_query};
 use nrese_sparql_syntax::SparqlParser;
@@ -161,6 +161,19 @@ const CASES: &[Case] = &[
         oracle: Oracle::Dataset(&[Some("pub/1")], &["pub/2"]),
         on_replica: false,
     },
+    // fPub2's default geometry (secret) hides its other one (pub/1) in every scope that
+    // shows both, also where the scope shows every graph the store holds.
+    Case {
+        name: "every graph selected: a default geometry in another graph hides",
+        restricted: false,
+        union_default_graph: true,
+        dataset: "",
+        oracle: Oracle::Dataset(
+            &[None, Some("pub/1"), Some("pub/2"), Some("secret")],
+            &["pub/1", "pub/2", "secret"],
+        ),
+        on_replica: false,
+    },
     Case {
         name: "replica, unreadable graph",
         restricted: true,
@@ -213,14 +226,28 @@ fn public() -> GraphAccess {
     }
 }
 
-fn oracle(oracle: &Oracle) -> Snapshot {
+/// The oracle store of `case`: what it may see, with a merged default graph merged here
+/// (its statements copied into the store's default graph), so that the oracle never reads
+/// a merge itself.
+fn oracle(case: &Case) -> Snapshot {
     let engine = Engine::new(EngineConfig::default()).unwrap();
-    match oracle {
-        Oracle::Readable => commit(
+    let readable = |st: &&Statement| public().allows_graph(&graph_name(st.3));
+    match case.oracle {
+        Oracle::Readable if case.union_default_graph => commit(
             &engine,
             all()
-                .filter(|st| public().allows_graph(&graph_name(st.3)))
-                .map(|st| (st, graph_name(st.3))),
+                .filter(readable)
+                .map(|st| (st, GraphName::DefaultGraph))
+                .chain(
+                    all()
+                        .filter(readable)
+                        .filter(|st| st.3.is_some())
+                        .map(|st| (st, graph_name(st.3))),
+                ),
+        ),
+        Oracle::Readable => commit(
+            &engine,
+            all().filter(readable).map(|st| (st, graph_name(st.3))),
         ),
         Oracle::Dataset(default, named) => commit(
             &engine,
@@ -270,8 +297,8 @@ fn with_dataset(query: &str, dataset: &str) -> String {
 }
 
 /// A reader without access to a graph, and a query's dataset, see only their graphs, on a
-/// primary and on a replica fed by the log; every case fails where the spatial index reads
-/// every graph.
+/// primary and on a replica fed by the log; every case failed with an earlier index (the
+/// last with the first graph-scoped one).
 #[test]
 fn spatial_answers_stay_in_the_readers_scope() {
     let durable = EngineConfig {
@@ -301,15 +328,13 @@ fn spatial_answers_stay_in_the_readers_scope() {
             union_default_graph: case.union_default_graph,
             ..QueryOptions::default()
         };
-        let plain = QueryOptions {
-            union_default_graph: case.union_default_graph,
-            ..QueryOptions::default()
-        };
+        // The oracle reads its default graph as stored: never a merge.
+        let plain = QueryOptions::default();
         let store = match case.on_replica {
             true => replica.snapshot(),
             false => primary.snapshot(),
         };
-        let expected_store = oracle(&case.oracle);
+        let expected_store = oracle(case);
         for query in QUERIES {
             let got = run(&store, &with_dataset(query, case.dataset), &options);
             let expected = match case.oracle {
@@ -335,4 +360,46 @@ fn spatial_answers_stay_in_the_readers_scope() {
         "cases failing: {cases:?}\n{}",
         failed.join("\n")
     );
+}
+
+/// A constant that names an `owl:sameAs` alias relates as its class does, with canonical
+/// answers too: the spatial index is read with the one mapping canonical reads name
+/// terms by (`Snapshot::canonical_classes`), as a constant side and as a bound value.
+#[test]
+fn an_alias_relates_as_its_class() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let statements: [Statement; 2] = [
+        ("rep", "asWKT", "POINT(1 1)", None),
+        ("box", "asWKT", "POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))", None),
+    ];
+    commit(
+        &engine,
+        statements.iter().map(|st| (st, GraphName::DefaultGraph)),
+    );
+    let mut tx = engine.transaction();
+    let id = |tx: &nrese_engine::Transaction<'_>, iri: &str| {
+        tx.intern(NamedNode::new_unchecked(iri).as_ref().into())
+    };
+    let same_as = id(&tx, "http://www.w3.org/2002/07/owl#sameAs");
+    let (alias, rep) = (id(&tx, &format!("{EX}alias")), id(&tx, &format!("{EX}rep")));
+    tx.insert_inferred(EncodedTriple::new(alias, same_as, rep));
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot().with_equality(Some(same_as));
+    for canonical in [false, true] {
+        let options = QueryOptions {
+            equality_canonical: canonical,
+            equality_early_expansion: true,
+            ..QueryOptions::default()
+        };
+        for query in [
+            "SELECT ?b WHERE { ex:alias geo:sfWithin ?b }",
+            "SELECT ?b WHERE { VALUES ?a { ex:alias } ?a geo:sfWithin ?b }",
+        ] {
+            let (rows, _) = run(&snapshot, query, &options);
+            assert!(
+                rows.contains(&format!("<{EX}box>")),
+                "canonical {canonical}: {query}: {rows:?}"
+            );
+        }
+    }
 }
