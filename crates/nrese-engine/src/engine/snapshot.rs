@@ -406,17 +406,23 @@ impl Snapshot {
     /// inferred statements, its constants (the graph's name included) by their
     /// representatives, in every graph, as those reads give representatives from every
     /// graph ([`Self::with_canonical_equality`]); else as given.
-    fn read_pattern(&self, model: ReadModel, pattern: &QuadPattern) -> QuadPattern {
+    pub(crate) fn read_pattern<'p>(
+        &self,
+        model: ReadModel,
+        pattern: &'p QuadPattern,
+    ) -> std::borrow::Cow<'p, QuadPattern> {
+        use std::borrow::Cow;
         if !self.canonical || model == ReadModel::Asserted {
-            return *pattern;
+            return Cow::Borrowed(pattern);
         }
         match self.equality {
-            Some(same_as) => self
-                .version
-                .equality
-                .canonical(&self.version, same_as)
-                .normalised_everywhere(pattern),
-            None => *pattern,
+            Some(same_as) => Cow::Owned(
+                self.version
+                    .equality
+                    .canonical(&self.version, same_as)
+                    .normalised_everywhere(pattern),
+            ),
+            None => Cow::Borrowed(pattern),
         }
     }
 
@@ -605,7 +611,8 @@ impl Snapshot {
     /// equality classes, the stored matches without weighing the classes. Zero only if
     /// nothing matches.
     pub fn estimate_in(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
-        let pattern = &self.read_pattern(model, pattern);
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         let Some(classes) = self.expanding(model, pattern) else {
             return self.count_in(model, pattern);
         };
@@ -701,15 +708,17 @@ impl Snapshot {
 
     /// O(r log n) per included stack.
     pub fn contains_in(&self, model: ReadModel, quad: &EncodedQuad) -> bool {
-        let named = self.read_pattern(
-            model,
-            &QuadPattern {
-                subject: Some(quad.subject),
-                predicate: Some(quad.predicate),
-                object: Some(quad.object),
-                graph: GraphSelector::Exact(quad.graph),
-            },
-        );
+        let named = self
+            .read_pattern(
+                model,
+                &QuadPattern {
+                    subject: Some(quad.subject),
+                    predicate: Some(quad.predicate),
+                    object: Some(quad.object),
+                    graph: GraphSelector::Exact(quad.graph),
+                },
+            )
+            .into_owned();
         let GraphSelector::Exact(graph) = named.graph else {
             unreachable!("an exact graph stays exact")
         };
@@ -763,7 +772,8 @@ impl Snapshot {
         model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
-        let pattern = &self.read_pattern(model, pattern);
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
             return Either::Left(self.expanded(classes, model, pattern));
         }
@@ -786,7 +796,8 @@ impl Snapshot {
     /// per stack when the matching runs hold no tombstones in range (see
     /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up.
     pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
-        let pattern = &self.read_pattern(model, pattern);
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
             return self.expanded_count(&classes, model, pattern);
         }
@@ -813,7 +824,8 @@ impl Snapshot {
     /// True if some quad matches `pattern` in `model`; cheaper than
     /// [`count_in`](Self::count_in)` > 0`.
     pub fn exists_in(&self, model: ReadModel, pattern: &QuadPattern) -> bool {
-        let pattern = &self.read_pattern(model, pattern);
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
             return self.expanded(classes, model, pattern).next().is_some();
         }
@@ -837,7 +849,8 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<impl Iterator<Item = EncodedQuad> + use<'a>> {
-        let pattern = &self.read_pattern(model, pattern);
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
             return self
                 .expanded_sorted(classes, model, pattern, permutation)
@@ -946,7 +959,8 @@ impl Snapshot {
         low: TermId,
         high: TermId,
     ) -> Option<AccessPlan> {
-        let pattern = &self.read_pattern(model, pattern);
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if self.expanding(model, pattern).is_some() {
             return None;
         }
@@ -980,7 +994,8 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<Vec<(TermId, u64)>> {
-        let pattern = &self.read_pattern(model, pattern);
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if self.expanding(model, pattern).is_some() {
             return None;
         }
@@ -1047,7 +1062,8 @@ impl Snapshot {
         permutation: Permutation,
         components: &[usize],
     ) -> Option<Vec<Vec<u64>>> {
-        let pattern = &self.read_pattern(model, pattern);
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if self.expanding(model, pattern).is_some() {
             return None;
         }
@@ -1106,13 +1122,15 @@ impl Snapshot {
     /// for this version once computed. The two walks (subjects, objects) run in parallel.
     /// `None` where [`Self::group_counts_in`] can't walk the graphs.
     pub fn node_count_in(&self, model: ReadModel, graphs: GraphSelector) -> Option<u64> {
-        let pattern = self.read_pattern(
-            model,
-            &QuadPattern {
-                graph: graphs,
-                ..QuadPattern::all()
-            },
-        );
+        let pattern = self
+            .read_pattern(
+                model,
+                &QuadPattern {
+                    graph: graphs,
+                    ..QuadPattern::all()
+                },
+            )
+            .into_owned();
         let graphs = pattern.graph;
         if self.expanding(model, &pattern).is_some()
             || (self.canonical_data.is_some() && model != ReadModel::Asserted)
@@ -1165,7 +1183,8 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<u64> {
-        let pattern = &self.read_pattern(model, pattern);
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if self.expanding(model, pattern).is_some() {
             return None;
         }
@@ -1213,7 +1232,8 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<u64> {
-        let pattern = &self.read_pattern(model, pattern);
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         self.statistics.distinct(self, model, pattern, permutation)
     }
 
