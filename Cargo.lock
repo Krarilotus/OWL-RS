@@ -1172,6 +1172,7 @@ version = "0.1.0"
 dependencies = [
  "foldhash 0.2.0",
  "hashbrown 0.16.1",
+ "parking_lot_core",
  "rayon",
  "windows-sys 0.61.2",
 ]

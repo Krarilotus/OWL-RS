@@ -59,6 +59,40 @@ fn charged_on_threads() -> usize {
     worst
 }
 
+/// [`measure_within`] without its preparation ([`prepare`]): the counting alone, cheap
+/// enough to repeat 100,000 times.
+fn counted_within<T>(budget: &Budget, work: impl FnOnce() -> T) -> usize {
+    let running = Running::start(Some(budget));
+    black_box(work());
+    reported(running.end().excess)
+}
+
+/// A pool thread's first wait, in parking_lot (which makes its waiter table then).
+fn parks_on_the_pool() -> usize {
+    let park = || {
+        // SAFETY: parks nowhere: its validation fails.
+        unsafe {
+            parking_lot_core::park(
+                0x10,
+                || false,
+                || {},
+                |_, _| {},
+                parking_lot_core::DEFAULT_PARK_TOKEN,
+                None,
+            );
+        }
+    };
+    measure_within(&Budget::unlimited(), || rayon::join(park, park)).1
+}
+
+/// The most of 3,000 measurements of an empty parallel loop entered from outside the pool.
+fn enters_the_pool() -> usize {
+    (0..3_000)
+        .map(|_| measure_within(&Budget::unlimited(), || rayon::join(|| (), || ())).1)
+        .max()
+        .unwrap()
+}
+
 /// The least of 100,000 measurements of an uncharged kilobyte each, while another thread
 /// allocates and frees without pause: a block made as a measurement starts is counted at
 /// its allocation and its free, or at neither.
@@ -72,7 +106,7 @@ fn at_the_start() -> usize {
         });
         let budget = Budget::unlimited();
         let least = (0..100_000)
-            .map(|_| measure_within(&budget, || black_box(Vec::<u8>::with_capacity(1024))).1)
+            .map(|_| counted_within(&budget, || black_box(Vec::<u8>::with_capacity(1024))))
             .min();
         stop.store(true, SeqCst);
         least.unwrap()
@@ -94,7 +128,17 @@ fn a_measurement_counts_what_was_made_while_it_ran() {
     // Its threads started, not starting while a case runs.
     pool.broadcast(|_| ());
     let uncharged = || black_box(vec![1u8; BIG]).len();
-    let cases: [(&str, &dyn Fn() -> usize, Counted); 12] = [
+    let cases: [(&str, &dyn Fn() -> usize, Counted); 14] = [
+        (
+            "a pool thread's first wait",
+            &parks_on_the_pool,
+            Counted::Nothing,
+        ),
+        (
+            "entering the global pool from outside",
+            &enters_the_pool,
+            Counted::Nothing,
+        ),
         (
             "a block made as a measurement starts",
             &at_the_start,

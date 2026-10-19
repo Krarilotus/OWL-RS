@@ -337,6 +337,60 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
     }
 }
 
+/// The libraries' state made once that a measurement would otherwise count, made before
+/// it starts (unless one already runs, which would count it). Without it, the first
+/// measurement whose work a pool thread waits in counted parking_lot's waiter table
+/// (1 KiB), and one in 63 that enter the global pool from outside counted its queue's next
+/// block (1,520 bytes; 47 of 3,000 measurements of an empty parallel loop):
+/// - parking_lot's table, which grows with the threads that park at once and never shrinks:
+///   once per process, threads at least twice the machine's, and 8 more, park at once;
+/// - rayon's global queue, which allocates its next block on the 63rd entry from outside
+///   the pool: before each measurement made outside the pool, empty entries until one
+///   allocates (at most 63, about a millisecond), leaving 62 the work makes without
+///   allocating. Work that enters the global pool from outside more often, or a pool of
+///   its own from outside, still allocates such blocks: one per 63 entries.
+fn prepare() {
+    static WARM: std::sync::Once = std::sync::Once::new();
+    if ACTIVE.load(SeqCst) != 0 {
+        return;
+    }
+    WARM.call_once(|| {
+        let threads = std::thread::available_parallelism().map_or(8, |n| 2 * n.get() + 8);
+        let all = std::sync::Barrier::new(threads);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    // SAFETY: parks nowhere (its validation fails): the thread's waiter
+                    // data is made, and the table sized for it.
+                    unsafe {
+                        parking_lot_core::park(
+                            std::ptr::from_ref(&all).addr(),
+                            || false,
+                            || {},
+                            |_, _| {},
+                            parking_lot_core::DEFAULT_PARK_TOKEN,
+                            None,
+                        );
+                    }
+                    all.wait();
+                });
+            }
+        });
+        // The global pool started, and the entering thread's state made.
+        rayon::broadcast(|_| ());
+        rayon::join(|| (), || ());
+    });
+    if rayon::current_thread_index().is_none() {
+        for _ in 0..=63 {
+            let entry = Running::start(None);
+            rayon::join(|| (), || ());
+            if entry.end().live > 0 {
+                break;
+            }
+        }
+    }
+}
+
 /// A running measurement; it ends when this drops, whether the measurement returns or
 /// unwinds.
 struct Running(&'static Slot);
@@ -398,6 +452,7 @@ fn reported(count: i128) -> usize {
 /// `work`'s result, and the most bytes it held at once: allocated while it ran and not
 /// yet freed. Without [`Measured`] installed, the count is 0.
 pub fn measure<T>(work: impl FnOnce() -> T) -> (T, usize) {
+    prepare();
     let running = Running::start(None);
     let result = work();
     (result, reported(running.end().peak))
@@ -407,6 +462,7 @@ pub fn measure<T>(work: impl FnOnce() -> T) -> (T, usize) {
 /// part of it) at any of its events, 0 if never beyond: what it allocated before reserving
 /// it, or still held when it released the charge.
 pub fn measure_within<T>(budget: &Budget, work: impl FnOnce() -> T) -> (T, usize) {
+    prepare();
     let running = Running::start(Some(budget));
     let result = work();
     (result, reported(running.end().excess))
