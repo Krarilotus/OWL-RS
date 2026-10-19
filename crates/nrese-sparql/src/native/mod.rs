@@ -3759,6 +3759,10 @@ impl<'a> Context<'a> {
             return self.join(result, scanned);
         }
         if !result.ordered {
+            let mut scratch = Reservation::new(&*self.budget);
+            scratch
+                .charge(sort_scratch_bytes(&result.table))
+                .map_err(QueryEvaluationError::MemoryLimit)?;
             result.table.sort_by(&key_columns);
         }
         let new_vars: Vec<Variable> = scan
@@ -3798,19 +3802,29 @@ impl<'a> Context<'a> {
         let out = if rows < 2 * PROBE_CHUNK {
             probe.rows(0..rows, &cancelled)
         } else {
-            let parts: Vec<Result<_, ProbeStop>> = (0..rows.div_ceil(PROBE_CHUNK))
-                .into_par_iter()
-                .map(|i| {
-                    probe.rows(
-                        i * PROBE_CHUNK..((i + 1) * PROBE_CHUNK).min(rows),
-                        &cancelled,
-                    )
-                })
-                .collect();
-            parts
-                .into_iter()
-                .collect::<Result<Vec<_>, ProbeStop>>()
-                .and_then(|parts| probe.concat(parts))
+            // The chunks' lists (their results, then their tables and their charges apart,
+            // then the tables joined), charged first: a few entries a chunk.
+            let chunks = rows.div_ceil(PROBE_CHUNK);
+            let entry = size_of::<Result<(IdTable, Reservation<&Budget>), ProbeStop>>();
+            let mut lists = Reservation::new(&*self.budget);
+            match lists.charge(chunks.saturating_mul(4 * entry)) {
+                Err(exceeded) => Err(ProbeStop::Memory(exceeded)),
+                Ok(()) => {
+                    let parts: Vec<Result<_, ProbeStop>> = (0..chunks)
+                        .into_par_iter()
+                        .map(|i| {
+                            probe.rows(
+                                i * PROBE_CHUNK..((i + 1) * PROBE_CHUNK).min(rows),
+                                &cancelled,
+                            )
+                        })
+                        .collect();
+                    parts
+                        .into_iter()
+                        .collect::<Result<Vec<_>, ProbeStop>>()
+                        .and_then(|parts| probe.concat(parts))
+                }
+            }
         };
         let (out, held) = match out {
             Ok(out) => out,
@@ -4096,7 +4110,18 @@ impl<'a> Context<'a> {
             out_held.transfer();
             return Ok(Some(solutions));
         };
-        // The projection's columns are charged as the rows were: the result keeps its charge.
+        // The projection's new columns are charged as the rows were, before they are made:
+        // a bound variable's column moves, every other projected one is made (an unbound
+        // variable's, a column projected again). The result keeps its charge.
+        let moved = solutions
+            .vars
+            .iter()
+            .filter(|v| variables.contains(v))
+            .count();
+        let made = variables.len() - moved;
+        out_held
+            .charge(solutions.table.len().saturating_mul(8 * made))
+            .map_err(memory)?;
         let projected = self.project(solutions, variables);
         out_held
             .resize(projected.table.memory_bytes())
@@ -5568,6 +5593,12 @@ fn distinct<B: std::ops::Deref<Target = Budget>>(
         }
         (_, None) => unreachable!("scratch for records of several values"),
     }
+}
+
+/// The most a sort of `table` ([`IdTable::sort_by`]) holds beside it, per row: (value, row)
+/// pairs, then the rows' order, and each column gathered anew (all at once in parallel).
+fn sort_scratch_bytes(table: &IdTable) -> usize {
+    table.len().saturating_mul(4 + 16.max(8 * table.width()))
 }
 
 /// Room in `table` for `rows` more rows, charged to `held` (which holds exactly `table`'s
