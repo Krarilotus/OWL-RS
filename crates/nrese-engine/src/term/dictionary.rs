@@ -2032,9 +2032,11 @@ mod tests {
         let all = |iris: bool| {
             dictionary.with_text_index(iris, |index| {
                 let span = index.covered();
-                index
-                    .corpus(vec![u64::MAX; span.div_ceil(64) as usize], span)
-                    .documents()
+                let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+                let words = span.div_ceil(64) as usize;
+                let mut bits = nrese_exec::ChargedVec::with_capacity(budget, words).unwrap();
+                bits.resize(words, u64::MAX).unwrap();
+                index.corpus(bits).documents
             })
         };
         dictionary.cover_text(false);
