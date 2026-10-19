@@ -352,6 +352,18 @@ impl Classes {
         }
     }
 
+    /// `pattern` with its constants replaced by their representatives, the graph's name
+    /// included: for canonical reads, whose every graph is over representatives.
+    pub(crate) fn normalised_everywhere(&self, pattern: &QuadPattern) -> QuadPattern {
+        QuadPattern {
+            graph: match pattern.graph {
+                GraphSelector::Exact(graph) => GraphSelector::Exact(self.representative(graph)),
+                other => other,
+            },
+            ..self.normalised(pattern)
+        }
+    }
+
     /// Whether some term of `quad` has other identities.
     pub(crate) fn touches(&self, quad: &EncodedQuad) -> bool {
         [quad.subject, quad.predicate, quad.object]

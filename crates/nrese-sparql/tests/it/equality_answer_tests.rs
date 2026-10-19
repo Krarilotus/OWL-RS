@@ -162,6 +162,15 @@ fn every_way_of_naming_a_term_answers_by_its_class_in_every_mode() {
         ("GRAPH, outer sameTerm", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } FILTER(sameTerm(?x, ex:Alias)) }", None, true, false),
         ("GRAPH, outer IRI()", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } FILTER(?x = IRI(\"http://example.com/Alias\")) }", None, true, false),
         ("GRAPH, inner constant", "SELECT ?g { GRAPH ?g { ex:Rep ex:in ex:z } }", None, true, false),
+        ("GRAPH <g>, inline probe", "SELECT ?z { GRAPH ex:g { ex:Alias ex:in ?z } }", None, true, false),
+        ("GRAPH <g>, VALUES", "SELECT ?x ?z { VALUES ?x { ex:Alias } GRAPH ex:g { ?x ex:in ?z } }", None, true, false),
+        ("GRAPH <g>, FILTER scan", "SELECT ?x ?z { GRAPH ex:g { ?x ex:in ?z FILTER(?x = ex:Alias) } }", None, true, false),
+        ("GRAPH ?g, inline probe", "SELECT ?g ?z { GRAPH ?g { ex:Alias ex:in ?z } }", None, true, false),
+        ("GRAPH ?g, VALUES", "SELECT ?g ?x { VALUES ?x { ex:Alias } GRAPH ?g { ?x ex:in ?z } }", None, true, false),
+        ("GRAPH ?g, FILTER scan", "SELECT ?g ?x { GRAPH ?g { ?x ex:in ?z FILTER(?x = ex:Alias) } }", None, true, false),
+        ("FROM NAMED, inline probe", "SELECT ?g ?z FROM ex:none FROM NAMED ex:g { GRAPH ?g { ex:Alias ex:in ?z } }", None, true, false),
+        ("FROM NAMED, VALUES", "SELECT ?g ?x FROM ex:none FROM NAMED ex:g { VALUES ?x { ex:Alias } GRAPH ?g { ?x ex:in ?z } }", None, true, false),
+        ("FROM NAMED, FILTER scan", "SELECT ?g ?x FROM ex:none FROM NAMED ex:g { GRAPH ?g { ?x ex:in ?z FILTER(?x = ex:Alias) } }", None, true, false),
         ("GRAPH named in a class", "SELECT ?x { GRAPH ex:Alias { ?x ex:in ex:z } }", None, true, false),
         ("GRAPH, then default", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } ?x ex:p ex:o }", None, true, false),
         ("default, then GRAPH", "SELECT ?x { ?x ex:p ex:o GRAPH ex:g { ?x ex:in ex:z } }", None, true, false),
@@ -228,4 +237,60 @@ fn every_way_of_naming_a_term_answers_by_its_class_in_every_mode() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The engine's side of the same contract, for its other readers (spatial and text
+/// indexes): a canonical snapshot reads every graph over representatives, so a pattern's
+/// constant, the graph's name included, names its class in every read, whatever the
+/// graph selector or the access path.
+#[test]
+fn canonical_reads_take_a_constant_by_its_class_in_every_graph() {
+    use nrese_engine::{GraphSelector, QuadPattern, ReadModel, TermId};
+    let engine = engine(true);
+    let snapshot = engine.snapshot().with_canonical_equality();
+    let id = |local: &str| snapshot.lookup(ex(local).as_ref().into()).unwrap();
+    let (alias, rep, input, z) = (id("Alias"), id("Rep"), id("in"), id("z"));
+    let model = ReadModel::Materialised;
+    for graph in [
+        GraphSelector::Exact(id("g")),
+        GraphSelector::Exact(alias),
+        GraphSelector::AnyNamed,
+        GraphSelector::Any,
+    ] {
+        let pattern = |subject: TermId| QuadPattern {
+            subject: Some(subject),
+            predicate: Some(input),
+            object: None,
+            graph,
+        };
+        let reads = |subject: TermId| {
+            let pattern = pattern(subject);
+            let mut cursor = snapshot.probe_cursor(model);
+            let mut probed = Vec::new();
+            cursor.for_each(&pattern, |quad| probed.push(quad));
+            let mut scanned: Vec<_> = snapshot.quads_for_pattern_in(model, &pattern).collect();
+            scanned.sort_unstable();
+            probed.sort_unstable();
+            (
+                scanned,
+                probed,
+                snapshot.count_in(model, &pattern),
+                snapshot.exists_in(model, &pattern),
+                cursor.count(&pattern),
+                cursor.exists(&pattern),
+            )
+        };
+        let (by_alias, by_rep) = (reads(alias), reads(rep));
+        assert!(!by_rep.0.is_empty(), "{graph:?}: the class's statements");
+        assert!(
+            by_rep.0.iter().all(|q| q.subject == rep),
+            "{graph:?}: {:?}",
+            by_rep.0
+        );
+        assert_eq!(by_alias, by_rep, "{graph:?}");
+    }
+    let quad =
+        |subject: TermId, graph: TermId| nrese_engine::EncodedQuad::new(subject, input, z, graph);
+    assert!(snapshot.contains_in(model, &quad(alias, id("g"))));
+    assert!(snapshot.contains_in(model, &quad(alias, alias)));
 }

@@ -178,8 +178,9 @@ impl Snapshot {
     /// exists. Under it a term stands for its class, shown by
     /// [`EqualityClasses::representative`]. That is the one mapping of canonical answers
     /// (research-designs §1, "Canonical answers"): every id such a read gives, from any
-    /// graph, is a representative; a constant of a pattern read in the default graph is
-    /// normalised by it; every other id that meets those reads (a query's constants, a
+    /// graph, is a representative; a constant of a pattern, in every graph (the graph's
+    /// name included), is normalised by it; every other id that meets those reads (a
+    /// query's constants, a
     /// computed IRI, a federated row, an id an index keyed by stored ids gives, such as
     /// the spatial or text index) must be mapped by it too. A value leaving those reads
     /// for something that names terms as stored (a remote endpoint) goes as every
@@ -300,6 +301,24 @@ impl Snapshot {
     pub fn equality_classes(&self) -> Option<Arc<EqualityClasses>> {
         let same_as = self.equality?;
         Some(self.version.equality.classes(&self.version, same_as))
+    }
+
+    /// `pattern` as a read in `model` takes it: under canonical reads, in a model with
+    /// inferred statements, its constants (the graph's name included) by their
+    /// representatives, in every graph, as those reads give representatives from every
+    /// graph ([`Self::with_canonical_equality`]); else as given.
+    fn read_pattern(&self, model: ReadModel, pattern: &QuadPattern) -> QuadPattern {
+        if !self.canonical || model == ReadModel::Asserted {
+            return *pattern;
+        }
+        match self.equality {
+            Some(same_as) => self
+                .version
+                .equality
+                .canonical(&self.version, same_as)
+                .normalised_everywhere(pattern),
+            None => *pattern,
+        }
     }
 
     /// The classes a read of `pattern` in `model` expands: equality is on, some class
@@ -481,6 +500,7 @@ impl Snapshot {
     /// equality classes, the stored matches without weighing the classes. Zero only if
     /// nothing matches.
     pub fn estimate_in(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
+        let pattern = &self.read_pattern(model, pattern);
         let Some(classes) = self.expanding(model, pattern) else {
             return self.count_in(model, pattern);
         };
@@ -571,6 +591,24 @@ impl Snapshot {
 
     /// O(r log n) per included stack.
     pub fn contains_in(&self, model: ReadModel, quad: &EncodedQuad) -> bool {
+        let named = self.read_pattern(
+            model,
+            &QuadPattern {
+                subject: Some(quad.subject),
+                predicate: Some(quad.predicate),
+                object: Some(quad.object),
+                graph: GraphSelector::Exact(quad.graph),
+            },
+        );
+        let GraphSelector::Exact(graph) = named.graph else {
+            unreachable!("an exact graph stays exact")
+        };
+        let quad = &EncodedQuad::new(
+            named.subject.unwrap_or(quad.subject),
+            named.predicate.unwrap_or(quad.predicate),
+            named.object.unwrap_or(quad.object),
+            graph,
+        );
         if quad.graph.is_default_graph()
             && let Some(classes) =
                 self.expanding(model, &QuadPattern::in_graph(TermId::DEFAULT_GRAPH))
@@ -615,6 +653,7 @@ impl Snapshot {
         model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
+        let pattern = &self.read_pattern(model, pattern);
         if let Some(classes) = self.expanding(model, pattern) {
             return Either::Left(self.expanded(classes, model, pattern));
         }
@@ -636,6 +675,7 @@ impl Snapshot {
     /// per stack when the matching runs hold no tombstones in range (see
     /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up.
     pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
+        let pattern = &self.read_pattern(model, pattern);
         if let Some(classes) = self.expanding(model, pattern) {
             return self.expanded_count(&classes, model, pattern);
         }
@@ -662,6 +702,7 @@ impl Snapshot {
     /// True if some quad matches `pattern` in `model`; cheaper than
     /// [`count_in`](Self::count_in)` > 0`.
     pub fn exists_in(&self, model: ReadModel, pattern: &QuadPattern) -> bool {
+        let pattern = &self.read_pattern(model, pattern);
         if let Some(classes) = self.expanding(model, pattern) {
             return self.expanded(classes, model, pattern).next().is_some();
         }
@@ -685,6 +726,7 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<impl Iterator<Item = EncodedQuad> + use<'a>> {
+        let pattern = &self.read_pattern(model, pattern);
         if let Some(classes) = self.expanding(model, pattern) {
             return self
                 .expanded_sorted(classes, model, pattern, permutation)
@@ -793,6 +835,7 @@ impl Snapshot {
         low: TermId,
         high: TermId,
     ) -> Option<AccessPlan> {
+        let pattern = &self.read_pattern(model, pattern);
         if self.expanding(model, pattern).is_some() {
             return None;
         }
@@ -826,6 +869,7 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<Vec<(TermId, u64)>> {
+        let pattern = &self.read_pattern(model, pattern);
         if self.expanding(model, pattern).is_some() {
             return None;
         }
@@ -892,6 +936,7 @@ impl Snapshot {
         permutation: Permutation,
         components: &[usize],
     ) -> Option<Vec<Vec<u64>>> {
+        let pattern = &self.read_pattern(model, pattern);
         if self.expanding(model, pattern).is_some() {
             return None;
         }
@@ -950,10 +995,14 @@ impl Snapshot {
     /// for this version once computed. The two walks (subjects, objects) run in parallel.
     /// `None` where [`Self::group_counts_in`] can't walk the graphs.
     pub fn node_count_in(&self, model: ReadModel, graphs: GraphSelector) -> Option<u64> {
-        let pattern = QuadPattern {
-            graph: graphs,
-            ..QuadPattern::all()
-        };
+        let pattern = self.read_pattern(
+            model,
+            &QuadPattern {
+                graph: graphs,
+                ..QuadPattern::all()
+            },
+        );
+        let graphs = pattern.graph;
         if self.expanding(model, &pattern).is_some() {
             return None;
         }
@@ -1003,6 +1052,7 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<u64> {
+        let pattern = &self.read_pattern(model, pattern);
         if self.expanding(model, pattern).is_some() {
             return None;
         }
@@ -1050,6 +1100,7 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<u64> {
+        let pattern = &self.read_pattern(model, pattern);
         self.statistics.distinct(self, model, pattern, permutation)
     }
 
