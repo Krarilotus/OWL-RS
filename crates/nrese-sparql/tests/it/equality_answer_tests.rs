@@ -1,9 +1,10 @@
 //! Every way a query names a term of an `owl:sameAs` class, in every equality answer mode,
 //! optimised and as written, against the reference evaluator: strict answers (late and
-//! early expansion) against it over the expanded closure, canonical answers against its
-//! own quotient of the expanded closure (`nrese-sparql-reference`'s `quotient`), bags
-//! compared exactly. Canonical answers refuse what they can't answer (research-designs §1,
-//! "Canonical answers").
+//! early expansion) against it over the expanded closure; canonical answers against it
+//! over a quotient built here by hand, sharing no code with the engine: the fixture's
+//! statements written with the representative in a store without equality, the query with
+//! its constants written so too. Bags compared exactly. Canonical answers refuse what they
+//! can't answer (research-designs §1, "Canonical answers").
 
 use std::sync::Arc;
 
@@ -31,15 +32,8 @@ const QUOTED: usize = 2;
 /// Also `ex:meta ex:quoted <<( Alias ex:p ex:o )>>`: a triple term naming an alias.
 const ALIASED: usize = 3;
 
-/// `Rep ex:p ex:o`, `ex:s ex:q Rep`, `Alias owl:sameAs Rep` inferred (the closure over
-/// representatives, `Rep` the smaller id), and what `fixture` adds.
-fn engine(fixture: usize) -> Engine {
-    let engine = Engine::new(EngineConfig::default()).unwrap();
-    let mut tx = engine.transaction();
-    let rep = tx.intern(ex("Rep").as_ref().into());
-    let alias = tx.intern(ex("Alias").as_ref().into());
-    let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
-    let same_as = tx.intern(same_as.as_ref().into());
+/// `Rep ex:p ex:o`, `ex:s ex:q Rep`, and what `fixture` adds.
+fn statements(fixture: usize) -> Vec<Quad> {
     let mut quads = vec![
         Quad::new(ex("Rep"), ex("p"), ex("o"), GraphName::DefaultGraph),
         Quad::new(ex("s"), ex("q"), ex("Rep"), GraphName::DefaultGraph),
@@ -57,7 +51,19 @@ fn engine(fixture: usize) -> Engine {
         }
         _ => {}
     }
-    for quad in &quads {
+    quads
+}
+
+/// [`statements`], `Alias owl:sameAs Rep` inferred (the closure over representatives, `Rep`
+/// the smaller id).
+fn engine(fixture: usize) -> Engine {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let rep = tx.intern(ex("Rep").as_ref().into());
+    let alias = tx.intern(ex("Alias").as_ref().into());
+    let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+    let same_as = tx.intern(same_as.as_ref().into());
+    for quad in &statements(fixture) {
         tx.insert(quad.as_ref());
     }
     tx.insert_inferred(EncodedTriple {
@@ -69,6 +75,60 @@ fn engine(fixture: usize) -> Engine {
     engine.set_equality(Some(same_as));
     engine
 }
+
+/// The quotient of [`engine`], by hand: [`statements`] with `Rep` for `Alias` (inside triple
+/// terms too), in a store without equality.
+fn quotient(fixture: usize) -> Engine {
+    fn rep(term: Term) -> Term {
+        match term {
+            Term::NamedNode(n) if n == ex("Alias") => ex("Rep").into(),
+            Term::Triple(t) => {
+                let subject: nrese_rdf::NamedOrBlankNode = match rep(t.subject.into()) {
+                    Term::NamedNode(n) => n.into(),
+                    Term::BlankNode(b) => b.into(),
+                    _ => unreachable!(),
+                };
+                nrese_rdf::Triple::new(subject, t.predicate, rep(t.object)).into()
+            }
+            other => other,
+        }
+    }
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for quad in statements(fixture) {
+        let Term::NamedNode(subject) = rep(quad.subject.into()) else {
+            unreachable!()
+        };
+        let graph = match quad.graph_name {
+            GraphName::NamedNode(g) if g == ex("Alias") => GraphName::NamedNode(ex("Rep")),
+            other => other,
+        };
+        tx.insert(Quad::new(subject, quad.predicate, rep(quad.object), graph).as_ref());
+    }
+    tx.commit().unwrap();
+    engine
+}
+
+/// A query of [`quotient`]: `query` with `Rep` for each `Alias` it writes.
+fn quotient_query(query: &str) -> String {
+    query
+        .replace("ex:Alias", "ex:Rep")
+        .replace("http://example.com/Alias", "http://example.com/Rep")
+}
+
+/// What canonical answers give for a row of the table.
+#[derive(Clone, Copy)]
+enum Canonical {
+    /// The answer over the quotient to the quotient's query ([`quotient_query`]).
+    Quotient,
+    /// The answer over the quotient to this query (where [`quotient_query`] can't write it).
+    Query(&'static str),
+    /// The answer as stored: the query's default graph isn't the one the equality covers.
+    Stored,
+    /// Refused.
+    Refused,
+}
+use Canonical::*;
 
 /// An endpoint holding `Alias ex:r ex:z` and `Rep ex:r ex:z`, which knows no classes.
 struct Endpoint(Engine);
@@ -131,79 +191,79 @@ fn representative_of(snapshot: &Snapshot, term: &str) -> Term {
 #[test]
 fn every_way_of_naming_a_term_answers_by_its_class_in_every_mode() {
     // (case, query, the reference's query where it can't evaluate the case's, fixture,
-    // canonical answers refuse it)
+    // canonical answers)
     #[rustfmt::skip]
-    let cases: &[(&str, &str, Option<&str>, usize, bool)] = &[
-        ("inline, probe", "SELECT * { ex:Alias ex:p ex:o }", None, PLAIN, false),
-        ("inline, object", "SELECT * { ex:s ex:q ex:Alias }", None, PLAIN, false),
-        ("inline, join", "SELECT ?o { ex:Alias ex:p ?o . ex:s ex:q ex:Alias }", None, PLAIN, false),
-        ("VALUES, scan", "SELECT ?x { VALUES ?x { ex:Alias } ?x ex:p ex:o }", None, PLAIN, false),
-        ("VALUES, join", "SELECT ?x { VALUES ?x { ex:Alias } ?x ex:p ?o . ?s ex:q ?x }", None, PLAIN, false),
-        ("=, scan", "SELECT ?x { ?x ex:p ex:o FILTER(?x = ex:Alias) }", None, PLAIN, false),
-        ("=, join", "SELECT ?x { ?x ex:p ?o . ?s ex:q ?x FILTER(?x = ex:Alias) }", None, PLAIN, false),
-        ("sameTerm", "SELECT ?x { ?x ex:p ex:o FILTER(sameTerm(?x, ex:Alias)) }", None, PLAIN, false),
-        ("IN", "SELECT ?y { ex:s ex:q ?y FILTER(?y IN (ex:none, ex:Alias)) }", None, PLAIN, false),
-        ("!=", "SELECT ?x { ?x ex:p ex:o FILTER(?x != ex:Alias) }", None, PLAIN, false),
-        ("NOT IN", "SELECT ?x { ?x ex:p ex:o FILTER(?x NOT IN (ex:Alias)) }", None, PLAIN, false),
-        ("BIND, join", "SELECT ?x { BIND(ex:Alias AS ?x) ?x ex:p ex:o }", None, PLAIN, false),
-        ("BIND IRI(), join", "SELECT ?x { BIND(IRI(CONCAT(\"http://example.com/\", \"Alias\")) AS ?x) ?x ex:p ex:o }", None, PLAIN, false),
-        ("= IRI()", "SELECT ?x { ?x ex:p ex:o FILTER(?x = IRI(\"http://example.com/Alias\")) }", None, PLAIN, false),
-        ("STR", "SELECT ?s { BIND(STR(ex:Alias) AS ?s) }", None, PLAIN, false),
-        ("STR of IRI()", "SELECT ?s { BIND(STR(IRI(\"http://example.com/Alias\")) AS ?s) }", None, PLAIN, false),
-        ("STR =", "SELECT * { FILTER(STR(ex:Alias) = \"http://example.com/Rep\") }", None, PLAIN, false),
-        ("STRENDS", "SELECT * { FILTER(STRENDS(STR(ex:Alias), \"Rep\")) }", None, PLAIN, false),
-        ("subquery", "SELECT ?x { { SELECT ?x { VALUES ?x { ex:Alias } } } ?x ex:p ex:o }", None, PLAIN, false),
-        ("OPTIONAL", "SELECT ?x ?o { VALUES ?x { ex:Alias } OPTIONAL { ?x ex:p ?o FILTER(?x = ex:Alias) } }", None, PLAIN, false),
-        ("MINUS", "SELECT ?x { ?x ex:p ex:o MINUS { VALUES ?x { ex:Alias } } }", None, PLAIN, false),
-        ("EXISTS", "SELECT ?x { ?x ex:p ex:o FILTER EXISTS { ex:s ex:q ?x FILTER(?x = ex:Alias) } }", None, PLAIN, false),
-        ("NOT EXISTS", "SELECT ?x { ?x ex:p ex:o FILTER NOT EXISTS { ex:s ex:q ?x FILTER(?x = ex:Alias) } }", None, PLAIN, false),
-        ("path, subject", "SELECT ?o { ex:Alias ex:p+ ?o }", None, PLAIN, false),
-        ("path, object", "SELECT ?s { ?s ex:q+ ex:Alias }", None, PLAIN, false),
-        ("path, zero length", "SELECT ?s { ex:Alias ex:p* ?s }", None, PLAIN, false),
-        ("DISTINCT", "SELECT DISTINCT ?x { VALUES ?x { ex:Alias ex:Rep } }", None, PLAIN, false),
-        ("COUNT DISTINCT", "SELECT (COUNT(DISTINCT ?x) AS ?n) { VALUES ?x { ex:Alias ex:Rep } }", None, PLAIN, false),
-        ("COUNT, bag", "SELECT (COUNT(?x) AS ?n) { VALUES ?x { ex:Alias ex:Rep } }", None, PLAIN, false),
-        ("ORDER BY STR", "SELECT ?x { VALUES ?x { ex:Alias ex:Rep } } ORDER BY STR(?x)", None, PLAIN, false),
-        ("DESCRIBE", "DESCRIBE ex:Alias", None, PLAIN, false),
-        ("CONSTRUCT", "CONSTRUCT { ex:Alias ex:out ?x } { ?x ex:p ex:o }", None, PLAIN, false),
-        ("CONSTRUCT VALUES", "CONSTRUCT { ?x ex:out ex:Alias } { VALUES ?x { ex:Alias } }", None, PLAIN, false),
+    let cases: &[(&str, &str, Option<&str>, usize, Canonical)] = &[
+        ("inline, probe", "SELECT * { ex:Alias ex:p ex:o }", None, PLAIN, Quotient),
+        ("inline, object", "SELECT * { ex:s ex:q ex:Alias }", None, PLAIN, Quotient),
+        ("inline, join", "SELECT ?o { ex:Alias ex:p ?o . ex:s ex:q ex:Alias }", None, PLAIN, Quotient),
+        ("VALUES, scan", "SELECT ?x { VALUES ?x { ex:Alias } ?x ex:p ex:o }", None, PLAIN, Quotient),
+        ("VALUES, join", "SELECT ?x { VALUES ?x { ex:Alias } ?x ex:p ?o . ?s ex:q ?x }", None, PLAIN, Quotient),
+        ("=, scan", "SELECT ?x { ?x ex:p ex:o FILTER(?x = ex:Alias) }", None, PLAIN, Quotient),
+        ("=, join", "SELECT ?x { ?x ex:p ?o . ?s ex:q ?x FILTER(?x = ex:Alias) }", None, PLAIN, Quotient),
+        ("sameTerm", "SELECT ?x { ?x ex:p ex:o FILTER(sameTerm(?x, ex:Alias)) }", None, PLAIN, Quotient),
+        ("IN", "SELECT ?y { ex:s ex:q ?y FILTER(?y IN (ex:none, ex:Alias)) }", None, PLAIN, Quotient),
+        ("!=", "SELECT ?x { ?x ex:p ex:o FILTER(?x != ex:Alias) }", None, PLAIN, Quotient),
+        ("NOT IN", "SELECT ?x { ?x ex:p ex:o FILTER(?x NOT IN (ex:Alias)) }", None, PLAIN, Quotient),
+        ("BIND, join", "SELECT ?x { BIND(ex:Alias AS ?x) ?x ex:p ex:o }", None, PLAIN, Quotient),
+        ("BIND IRI(), join", "SELECT ?x { BIND(IRI(CONCAT(\"http://example.com/\", \"Alias\")) AS ?x) ?x ex:p ex:o }", None, PLAIN, Query("SELECT ?x { BIND(IRI(CONCAT(\"http://example.com/\", \"Rep\")) AS ?x) ?x ex:p ex:o }")),
+        ("= IRI()", "SELECT ?x { ?x ex:p ex:o FILTER(?x = IRI(\"http://example.com/Alias\")) }", None, PLAIN, Quotient),
+        ("STR", "SELECT ?s { BIND(STR(ex:Alias) AS ?s) }", None, PLAIN, Quotient),
+        ("STR of IRI()", "SELECT ?s { BIND(STR(IRI(\"http://example.com/Alias\")) AS ?s) }", None, PLAIN, Quotient),
+        ("STR =", "SELECT * { FILTER(STR(ex:Alias) = \"http://example.com/Rep\") }", None, PLAIN, Quotient),
+        ("STRENDS", "SELECT * { FILTER(STRENDS(STR(ex:Alias), \"Rep\")) }", None, PLAIN, Quotient),
+        ("subquery", "SELECT ?x { { SELECT ?x { VALUES ?x { ex:Alias } } } ?x ex:p ex:o }", None, PLAIN, Quotient),
+        ("OPTIONAL", "SELECT ?x ?o { VALUES ?x { ex:Alias } OPTIONAL { ?x ex:p ?o FILTER(?x = ex:Alias) } }", None, PLAIN, Quotient),
+        ("MINUS", "SELECT ?x { ?x ex:p ex:o MINUS { VALUES ?x { ex:Alias } } }", None, PLAIN, Quotient),
+        ("EXISTS", "SELECT ?x { ?x ex:p ex:o FILTER EXISTS { ex:s ex:q ?x FILTER(?x = ex:Alias) } }", None, PLAIN, Quotient),
+        ("NOT EXISTS", "SELECT ?x { ?x ex:p ex:o FILTER NOT EXISTS { ex:s ex:q ?x FILTER(?x = ex:Alias) } }", None, PLAIN, Quotient),
+        ("path, subject", "SELECT ?o { ex:Alias ex:p+ ?o }", None, PLAIN, Quotient),
+        ("path, object", "SELECT ?s { ?s ex:q+ ex:Alias }", None, PLAIN, Quotient),
+        ("path, zero length", "SELECT ?s { ex:Alias ex:p* ?s }", None, PLAIN, Quotient),
+        ("DISTINCT", "SELECT DISTINCT ?x { VALUES ?x { ex:Alias ex:Rep } }", None, PLAIN, Quotient),
+        ("COUNT DISTINCT", "SELECT (COUNT(DISTINCT ?x) AS ?n) { VALUES ?x { ex:Alias ex:Rep } }", None, PLAIN, Quotient),
+        ("COUNT, bag", "SELECT (COUNT(?x) AS ?n) { VALUES ?x { ex:Alias ex:Rep } }", None, PLAIN, Quotient),
+        ("ORDER BY STR", "SELECT ?x { VALUES ?x { ex:Alias ex:Q } } ORDER BY STR(?x)", None, PLAIN, Quotient),
+        ("DESCRIBE", "DESCRIBE ex:Alias", None, PLAIN, Quotient),
+        ("CONSTRUCT", "CONSTRUCT { ex:Alias ex:out ?x } { ?x ex:p ex:o }", None, PLAIN, Quotient),
+        ("CONSTRUCT VALUES", "CONSTRUCT { ?x ex:out ex:Alias } { VALUES ?x { ex:Alias } }", None, PLAIN, Quotient),
         ("SERVICE, joined", "SELECT ?x { ?x ex:p ex:o SERVICE <http://remote.example/sparql> { ?x ex:r ex:z } }",
-            Some("SELECT ?x { ?x ex:p ex:o VALUES ?x { ex:Alias ex:Rep } }"), PLAIN, false),
+            Some("SELECT ?x { ?x ex:p ex:o VALUES ?x { ex:Alias ex:Rep } }"), PLAIN, Quotient),
         ("SERVICE, own filter", "SELECT ?x { SERVICE <http://remote.example/sparql> { ?x ex:r ex:z FILTER(?x = ex:Alias) } ?x ex:p ex:o }",
-            Some("SELECT ?x { VALUES ?x { ex:Alias } ?x ex:p ex:o }"), PLAIN, false),
-        ("GRAPH, inner =", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z FILTER(?x = ex:Alias) } }", None, NAMED, false),
-        ("GRAPH, outer =", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } FILTER(?x = ex:Alias) }", None, NAMED, false),
-        ("GRAPH, outer !=", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } FILTER(?x != ex:Alias) }", None, NAMED, false),
-        ("GRAPH, outer STR", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } FILTER(STR(?x) = \"http://example.com/Rep\") }", None, NAMED, false),
-        ("GRAPH, outer sameTerm", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } FILTER(sameTerm(?x, ex:Alias)) }", None, NAMED, false),
-        ("GRAPH, outer IRI()", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } FILTER(?x = IRI(\"http://example.com/Alias\")) }", None, NAMED, false),
-        ("GRAPH, inner constant", "SELECT ?g { GRAPH ?g { ex:Rep ex:in ex:z } }", None, NAMED, false),
-        ("GRAPH <g>, inline probe", "SELECT ?z { GRAPH ex:g { ex:Alias ex:in ?z } }", None, NAMED, false),
-        ("GRAPH <g>, VALUES", "SELECT ?x ?z { VALUES ?x { ex:Alias } GRAPH ex:g { ?x ex:in ?z } }", None, NAMED, false),
-        ("GRAPH <g>, FILTER scan", "SELECT ?x ?z { GRAPH ex:g { ?x ex:in ?z FILTER(?x = ex:Alias) } }", None, NAMED, false),
-        ("GRAPH ?g, inline probe", "SELECT ?g ?z { GRAPH ?g { ex:Alias ex:in ?z } }", None, NAMED, false),
-        ("GRAPH ?g, VALUES", "SELECT ?g ?x { VALUES ?x { ex:Alias } GRAPH ?g { ?x ex:in ?z } }", None, NAMED, false),
-        ("GRAPH ?g, FILTER scan", "SELECT ?g ?x { GRAPH ?g { ?x ex:in ?z FILTER(?x = ex:Alias) } }", None, NAMED, false),
-        ("FROM NAMED, inline probe", "SELECT ?g ?z FROM ex:none FROM NAMED ex:g { GRAPH ?g { ex:Alias ex:in ?z } }", None, NAMED, false),
-        ("FROM NAMED, VALUES", "SELECT ?g ?x FROM ex:none FROM NAMED ex:g { VALUES ?x { ex:Alias } GRAPH ?g { ?x ex:in ?z } }", None, NAMED, false),
-        ("FROM NAMED, FILTER scan", "SELECT ?g ?x FROM ex:none FROM NAMED ex:g { GRAPH ?g { ?x ex:in ?z FILTER(?x = ex:Alias) } }", None, NAMED, false),
-        ("GRAPH named in a class", "SELECT ?x { GRAPH ex:Alias { ?x ex:in ex:z } }", None, NAMED, false),
-        ("GRAPH, then default", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } ?x ex:p ex:o }", None, NAMED, false),
-        ("default, then GRAPH", "SELECT ?x { ?x ex:p ex:o GRAPH ex:g { ?x ex:in ex:z } }", None, NAMED, false),
-        ("GRAPH in EXISTS", "SELECT ?x { ?x ex:p ex:o FILTER EXISTS { GRAPH ex:g { ?x ex:in ex:z } } }", None, NAMED, false),
-        ("GRAPH in MINUS", "SELECT ?x { ?x ex:p ex:o MINUS { GRAPH ex:g { ?x ex:in ex:z } } }", None, NAMED, false),
-        ("GRAPH ?g, VALUES", "SELECT ?g { VALUES ?g { ex:Alias } GRAPH ?g { ?x ex:in ex:z } }", None, NAMED, false),
-        ("FROM a named graph", "SELECT ?x FROM ex:g { ?x ex:in ex:z }", None, NAMED, false),
-        ("union default graph", "SELECT ?x { ?x ex:in ?z . ?x ex:p ex:o }", None, NAMED, false),
-        ("triple term, value", "SELECT ?t { ex:meta ex:quoted ?t }", None, QUOTED, false),
-        ("SUBJECT, join", "SELECT ?x { ex:meta ex:quoted ?t BIND(SUBJECT(?t) AS ?x) ?x ex:p ex:o }", None, QUOTED, false),
-        ("triple pattern, open", "SELECT ?s { ex:meta ex:quoted <<( ?s ex:p ex:o )>> }", None, QUOTED, false),
-        ("quoted constant", "SELECT * { ex:meta ex:quoted <<( ex:Alias ex:p ex:o )>> }", None, QUOTED, false),
-        ("quoted VALUES", "SELECT ?t { VALUES ?t { <<( ex:Alias ex:p ex:o )>> } ex:meta ex:quoted ?t }", None, QUOTED, false),
-        ("= TRIPLE()", "SELECT ?t { ex:meta ex:quoted ?t FILTER(?t = TRIPLE(ex:Alias, ex:p, ex:o)) }", None, QUOTED, false),
-        ("CONSTRUCT, quoted variable", "CONSTRUCT { ex:m ex:q <<( ?x ex:p ex:o )>> } WHERE { VALUES ?x { ex:Alias } }", None, QUOTED, false),
-        ("CONSTRUCT, quoted constant", "CONSTRUCT { ex:m ex:q <<( ex:Alias ex:p ex:o )>> } WHERE { }", None, QUOTED, false),
-        ("a stored triple term names an alias", "SELECT ?x { ?x ex:p ex:o }", None, ALIASED, true),
+            Some("SELECT ?x { VALUES ?x { ex:Alias } ?x ex:p ex:o }"), PLAIN, Quotient),
+        ("GRAPH, inner =", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z FILTER(?x = ex:Alias) } }", None, NAMED, Quotient),
+        ("GRAPH, outer =", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } FILTER(?x = ex:Alias) }", None, NAMED, Quotient),
+        ("GRAPH, outer !=", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } FILTER(?x != ex:Alias) }", None, NAMED, Quotient),
+        ("GRAPH, outer STR", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } FILTER(STR(?x) = \"http://example.com/Rep\") }", None, NAMED, Quotient),
+        ("GRAPH, outer sameTerm", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } FILTER(sameTerm(?x, ex:Alias)) }", None, NAMED, Quotient),
+        ("GRAPH, outer IRI()", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } FILTER(?x = IRI(\"http://example.com/Alias\")) }", None, NAMED, Quotient),
+        ("GRAPH, inner constant", "SELECT ?g { GRAPH ?g { ex:Rep ex:in ex:z } }", None, NAMED, Quotient),
+        ("GRAPH <g>, inline probe", "SELECT ?z { GRAPH ex:g { ex:Alias ex:in ?z } }", None, NAMED, Quotient),
+        ("GRAPH <g>, VALUES", "SELECT ?x ?z { VALUES ?x { ex:Alias } GRAPH ex:g { ?x ex:in ?z } }", None, NAMED, Quotient),
+        ("GRAPH <g>, FILTER scan", "SELECT ?x ?z { GRAPH ex:g { ?x ex:in ?z FILTER(?x = ex:Alias) } }", None, NAMED, Quotient),
+        ("GRAPH ?g, inline probe", "SELECT ?g ?z { GRAPH ?g { ex:Alias ex:in ?z } }", None, NAMED, Quotient),
+        ("GRAPH ?g, VALUES", "SELECT ?g ?x { VALUES ?x { ex:Alias } GRAPH ?g { ?x ex:in ?z } }", None, NAMED, Quotient),
+        ("GRAPH ?g, FILTER scan", "SELECT ?g ?x { GRAPH ?g { ?x ex:in ?z FILTER(?x = ex:Alias) } }", None, NAMED, Quotient),
+        ("FROM NAMED, inline probe", "SELECT ?g ?z FROM ex:none FROM NAMED ex:g { GRAPH ?g { ex:Alias ex:in ?z } }", None, NAMED, Stored),
+        ("FROM NAMED, VALUES", "SELECT ?g ?x FROM ex:none FROM NAMED ex:g { VALUES ?x { ex:Alias } GRAPH ?g { ?x ex:in ?z } }", None, NAMED, Stored),
+        ("FROM NAMED, FILTER scan", "SELECT ?g ?x FROM ex:none FROM NAMED ex:g { GRAPH ?g { ?x ex:in ?z FILTER(?x = ex:Alias) } }", None, NAMED, Stored),
+        ("GRAPH named in a class", "SELECT ?x { GRAPH ex:Alias { ?x ex:in ex:z } }", None, NAMED, Quotient),
+        ("GRAPH, then default", "SELECT ?x { GRAPH ex:g { ?x ex:in ex:z } ?x ex:p ex:o }", None, NAMED, Quotient),
+        ("default, then GRAPH", "SELECT ?x { ?x ex:p ex:o GRAPH ex:g { ?x ex:in ex:z } }", None, NAMED, Quotient),
+        ("GRAPH in EXISTS", "SELECT ?x { ?x ex:p ex:o FILTER EXISTS { GRAPH ex:g { ?x ex:in ex:z } } }", None, NAMED, Quotient),
+        ("GRAPH in MINUS", "SELECT ?x { ?x ex:p ex:o MINUS { GRAPH ex:g { ?x ex:in ex:z } } }", None, NAMED, Quotient),
+        ("GRAPH ?g, VALUES", "SELECT ?g { VALUES ?g { ex:Alias } GRAPH ?g { ?x ex:in ex:z } }", None, NAMED, Quotient),
+        ("FROM a named graph", "SELECT ?x FROM ex:g { ?x ex:in ex:z }", None, NAMED, Stored),
+        ("union default graph", "SELECT ?x { ?x ex:in ?z . ?x ex:p ex:o }", None, NAMED, Quotient),
+        ("triple term, value", "SELECT ?t { ex:meta ex:quoted ?t }", None, QUOTED, Quotient),
+        ("SUBJECT, join", "SELECT ?x { ex:meta ex:quoted ?t BIND(SUBJECT(?t) AS ?x) ?x ex:p ex:o }", None, QUOTED, Quotient),
+        ("triple pattern, open", "SELECT ?s { ex:meta ex:quoted <<( ?s ex:p ex:o )>> }", None, QUOTED, Quotient),
+        ("quoted constant", "SELECT * { ex:meta ex:quoted <<( ex:Alias ex:p ex:o )>> }", None, QUOTED, Quotient),
+        ("quoted VALUES", "SELECT ?t { VALUES ?t { <<( ex:Alias ex:p ex:o )>> } ex:meta ex:quoted ?t }", None, QUOTED, Quotient),
+        ("= TRIPLE()", "SELECT ?t { ex:meta ex:quoted ?t FILTER(?t = TRIPLE(ex:Alias, ex:p, ex:o)) }", None, QUOTED, Quotient),
+        ("CONSTRUCT, quoted variable", "CONSTRUCT { ex:m ex:q <<( ?x ex:p ex:o )>> } WHERE { VALUES ?x { ex:Alias } }", None, QUOTED, Quotient),
+        ("CONSTRUCT, quoted constant", "CONSTRUCT { ex:m ex:q <<( ex:Alias ex:p ex:o )>> } WHERE { }", None, QUOTED, Quotient),
+        ("a stored triple term names an alias", "SELECT ?x { ?x ex:p ex:o }", None, ALIASED, Refused),
     ];
     let remote = Engine::new(EngineConfig::default()).unwrap();
     let mut tx = remote.transaction();
@@ -213,6 +273,7 @@ fn every_way_of_naming_a_term_answers_by_its_class_in_every_mode() {
     tx.commit().unwrap();
     let services = Services(Arc::new(Endpoint(remote)));
     let engines = [PLAIN, NAMED, QUOTED, ALIASED].map(engine);
+    let quotients = [PLAIN, NAMED, QUOTED, ALIASED].map(quotient);
     let parse = |text: &str| {
         SparqlParser::new()
             .parse_query(&format!("PREFIX ex: <{EX}> {text}"))
@@ -224,7 +285,7 @@ fn every_way_of_naming_a_term_answers_by_its_class_in_every_mode() {
         ("canonical", false, true),
     ];
     let mut wrong = Vec::new();
-    for &(case, query, reference_query, fixture, refused) in cases {
+    for &(case, query, reference_query, fixture, canonical_answer) in cases {
         let snapshot = engines[fixture].snapshot();
         let ordered = query.contains("ORDER BY");
         assert_eq!(representative_of(&snapshot, "Alias"), ex("Rep").into());
@@ -239,16 +300,22 @@ fn every_way_of_naming_a_term_answers_by_its_class_in_every_mode() {
                     ..QueryOptions::default()
                 };
                 let got = answer(evaluate_query(&snapshot, &parse(query), &options), ordered);
-                let expected = match canonical && refused {
-                    true => Err("refused".to_owned()),
-                    false => answer(
-                        nrese_sparql_reference::evaluate_query(
-                            &snapshot,
-                            &parse(reference_query.unwrap_or(query)),
-                            &options,
-                        ),
-                        ordered,
-                    ),
+                let reference = |snapshot: &Snapshot, text: &str, options: &QueryOptions| {
+                    let results =
+                        nrese_sparql_reference::evaluate_query(snapshot, &parse(text), options);
+                    answer(results, ordered)
+                };
+                let strict = reference_query.unwrap_or(query);
+                let plain = QueryOptions {
+                    union_default_graph: options.union_default_graph,
+                    ..QueryOptions::default()
+                };
+                let over_quotient = quotients[fixture].snapshot();
+                let expected = match (canonical, canonical_answer) {
+                    (false, _) | (true, Stored) => reference(&snapshot, strict, &options),
+                    (true, Refused) => Err("refused".to_owned()),
+                    (true, Quotient) => reference(&over_quotient, &quotient_query(strict), &plain),
+                    (true, Query(text)) => reference(&over_quotient, text, &plain),
                 };
                 let agrees = match (&got, &expected) {
                     (Err(error), Err(_)) => error.contains("canonical equality answers"),

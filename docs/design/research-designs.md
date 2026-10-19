@@ -80,14 +80,15 @@ asserted model is answered as stored.
   outside its scope, none of this runs: the plan is the one without it.
 - So `VALUES ?x { <alias> } ?x ex:p ex:o`, `?x ex:p ex:o FILTER(?x = <alias>)`,
   `<alias> ex:p ex:o`, the same through `GRAPH`, `SERVICE`, subqueries and paths find
-  the same class, and answer with the representative, constants of the query included;
-  a CONSTRUCT template is written as given.
+  the same class, and answer with the representative, constants of the query included,
+  a CONSTRUCT template's too.
 - Two identities of one class are one term, so a query can't tell them apart:
   `FILTER(?x != <alias>)` drops the class, `STR` shows the representative's IRI.
   Canonical answers are therefore not strict answers renamed where strict answers tell
-  identities apart. The differential test checks them against the reference evaluator's
-  own quotient of the explicitly expanded closure (`nrese-sparql-reference`'s
-  `quotient`, `nrese-sparql/tests/it/equality_answer_tests.rs`). GraphDB's equivalent
+  identities apart. The differential test checks them against the reference evaluator
+  over a quotient written by hand, sharing no code with the engine: the fixture's
+  statements with the representative in a store without equality, the query with its
+  constants written so (`nrese-sparql/tests/it/equality_answer_tests.rs`). GraphDB's equivalent
   (`FROM onto:disable-sameAs`) documents lost solutions for filters over URIs instead.
 - **Triple terms**: a triple term's class is that of its parts. Where every triple term
   the store holds is over representatives, they answer as any term: a triple term the
@@ -102,7 +103,8 @@ asserted model is answered as stored.
   class is refused as well: every literal an expression computes would need the mapping.
   Congruence over such stores is a v2.0 follow-up (v2-programme.md).
 - **A view, not a rewrite**: the canonical model reads its own view of the version (named
-  graphs over representatives, kept beside the version); the asserted model and a
+  graphs over representatives, made once per version and owned by it, holding nothing
+  that holds the version); the asserted model and a
   snapshot read as stored see the statements as stored.
 - The completeness status makes no claim of its own here: it refers to the regime's
   certain answers, and canonical answers are those, up to the naming above.

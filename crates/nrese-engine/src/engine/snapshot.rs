@@ -46,8 +46,7 @@ pub struct Snapshot {
 /// The canonical view of `version` under `same_as` ([`Snapshot::canonical_data`]): `None`
 /// where it is `version` itself.
 fn canonical_data(version: &Arc<Version>, same_as: Option<TermId>) -> Option<Arc<Version>> {
-    let view = version.equality.canonical_version(version, same_as?);
-    (!Arc::ptr_eq(&view, version)).then_some(view)
+    super::equality::CanonicalCache::view(version, same_as?)
 }
 
 /// Inferred statements hidden from a reader, as runs stacked over the inferred stack
@@ -186,9 +185,10 @@ impl Snapshot {
         let Some(same_as) = self.equality else {
             return false;
         };
-        self.version
-            .equality
-            .triple_terms_name_aliases(&self.version, same_as, |classes| {
+        let classes = self.version.equality.classes(&self.version, same_as);
+        self.version.canonical.triple_terms(same_as, || {
+            let classes = &*classes;
+            {
                 let (low, high) = TermId::kind_range(crate::TermKind::Triple);
                 let plan = AccessPlan {
                     permutation: Permutation::Ospg,
@@ -210,7 +210,8 @@ impl Snapshot {
                         .filter(|object| object.kind() == crate::TermKind::Triple)
                         .any(|object| self.names_alias(object, classes, &mut seen))
                 })
-            })
+            }
+        })
     }
 
     /// Whether the triple term `id` names an alias in a part, at any depth (`seen`: the
@@ -334,6 +335,7 @@ impl Snapshot {
             revision: self.version.revision,
             dictionary_len: self.version.dictionary_len,
             equality: Default::default(),
+            canonical: Default::default(),
         });
         Snapshot {
             canonical_data: self.canonical_view(&version),
@@ -359,6 +361,7 @@ impl Snapshot {
             revision: self.version.revision,
             dictionary_len: self.version.dictionary_len,
             equality: Default::default(),
+            canonical: Default::default(),
         });
         Snapshot {
             canonical_data: self.canonical_view(&version),
@@ -385,6 +388,7 @@ impl Snapshot {
             revision: self.version.revision,
             dictionary_len: self.version.dictionary_len,
             equality: Default::default(),
+            canonical: Default::default(),
         });
         Some(Snapshot {
             canonical_data: self.canonical_view(&version),
@@ -1502,6 +1506,48 @@ where
         match self {
             Either::Left(left) => left.next(),
             Either::Right(right) => right.next(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonical_lifetime_tests {
+    use super::*;
+    use nrese_rdf::{GraphName, NamedNode};
+
+    /// A canonical view lives no longer than its version: once the engine and every
+    /// snapshot are gone, nothing holds either (the view's cache once held its own
+    /// version, through the equality cell the versions pass on).
+    #[test]
+    fn canonical_views_die_with_their_version() {
+        let ex = |local: &str| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+        for named in [false, true] {
+            let engine = crate::Engine::new(crate::EngineConfig::default()).unwrap();
+            let mut tx = engine.transaction();
+            let rep = tx.intern(ex("Rep").as_ref().into());
+            let alias = tx.intern(ex("Alias").as_ref().into());
+            let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+            let same_as = tx.intern(same_as.as_ref().into());
+            tx.insert(Quad::new(ex("Rep"), ex("p"), ex("o"), GraphName::DefaultGraph).as_ref());
+            if named {
+                tx.insert(Quad::new(ex("Alias"), ex("in"), ex("z"), ex("g")).as_ref());
+            }
+            tx.insert_inferred(crate::EncodedTriple {
+                subject: alias,
+                predicate: same_as,
+                object: rep,
+            });
+            tx.commit().unwrap();
+            engine.set_equality(Some(same_as));
+            let snapshot = engine.snapshot();
+            let canonical = snapshot.with_canonical_equality();
+            assert!(!canonical.triple_terms_name_aliases());
+            let version = Arc::downgrade(&canonical.version);
+            let view = canonical.canonical_data.as_ref().map(Arc::downgrade);
+            assert_eq!(view.is_some(), named);
+            drop((canonical, snapshot, engine));
+            assert_eq!(version.strong_count(), 0, "named graphs: {named}");
+            assert!(view.is_none_or(|view| view.strong_count() == 0));
         }
     }
 }

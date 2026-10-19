@@ -185,6 +185,8 @@ pub(crate) struct Version {
     /// What its statements are: kept where only their layout changes (compaction, a
     /// checkpoint mapped), new for any other version ([`Content`]).
     pub(crate) content: Content,
+    /// What canonical reads of it read, once asked for ([`equality::CanonicalCache`]).
+    pub(crate) canonical: equality::CanonicalCache,
 }
 
 /// The identity of a version's statements: two versions with the same one show the same
@@ -217,6 +219,7 @@ impl Version {
             dictionary_len: 0,
             equality: Default::default(),
             content: Content::fresh(),
+            canonical: Default::default(),
         }
     }
 
@@ -243,6 +246,8 @@ impl Version {
             equality: Arc::clone(&self.equality),
             // Only compaction replaces a stack this way: the same statements.
             content: self.content,
+            // A canonical view of the old runs would hold them: made afresh.
+            canonical: Default::default(),
         };
         *next.stack_mut(stack) = index;
         next
@@ -441,6 +446,7 @@ impl Shared {
                     dictionary_len: current.dictionary_len,
                     equality: Arc::clone(&current.equality),
                     content: current.content,
+                    canonical: Default::default(),
                 }
             });
         }

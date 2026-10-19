@@ -36,20 +36,8 @@ use crate::term::TermId;
 #[derive(Default)]
 pub(crate) struct EqualityCell(Mutex<Option<CachedClasses>>);
 
-/// `owl:sameAs`, its classes, and what canonical reads need of them once asked for.
-struct CachedClasses {
-    same_as: TermId,
-    classes: Arc<Classes>,
-    /// [`Classes::canonical_view`].
-    canonical: Option<Arc<Classes>>,
-    /// The version canonical reads of the version with that content read
-    /// ([`canonical_version`]): the cell passes on to later versions, so the last one asked
-    /// for is kept.
-    version: Option<(super::Content, Arc<Version>)>,
-    /// Whether a triple term of the version with that content names an alias
-    /// ([`EqualityCell::triple_terms_name_aliases`]).
-    triple_terms: Option<(super::Content, bool)>,
-}
+/// `owl:sameAs`, its classes, and their canonical view once asked for.
+type CachedClasses = (TermId, Arc<Classes>, Option<Arc<Classes>>);
 
 impl std::fmt::Debug for EqualityCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -61,32 +49,20 @@ impl EqualityCell {
     /// The classes of `version` under `same_as`.
     pub(crate) fn classes(&self, version: &Version, same_as: TermId) -> Arc<Classes> {
         let mut cell = self.0.lock();
-        if let Some(cached) = cell.as_ref()
-            && cached.same_as == same_as
+        if let Some((id, classes, _)) = cell.as_ref()
+            && *id == same_as
         {
-            return Arc::clone(&cached.classes);
+            return Arc::clone(classes);
         }
         let classes = Arc::new(Classes::of(version, same_as));
-        *cell = Some(CachedClasses {
-            same_as,
-            classes: Arc::clone(&classes),
-            canonical: None,
-            version: None,
-            triple_terms: None,
-        });
+        *cell = Some((same_as, Arc::clone(&classes), None));
         classes
     }
 
     /// A cell already holding `classes` under `same_as`, for a version whose default graph
     /// is that of the version they are the classes of.
     fn holding(same_as: TermId, classes: Arc<Classes>, canonical: Arc<Classes>) -> Self {
-        Self(Mutex::new(Some(CachedClasses {
-            same_as,
-            classes,
-            canonical: Some(canonical),
-            version: None,
-            triple_terms: None,
-        })))
+        Self(Mutex::new(Some((same_as, classes, Some(canonical)))))
     }
 
     /// The classes of `version` read canonically: the same aliases, no members to expand
@@ -95,63 +71,61 @@ impl EqualityCell {
         let full = self.classes(version, same_as);
         let mut cell = self.0.lock();
         match cell.as_mut() {
-            Some(cached) if Arc::ptr_eq(&cached.classes, &full) => Arc::clone(
-                cached
-                    .canonical
-                    .get_or_insert_with(|| Arc::new(full.canonical_view())),
-            ),
+            Some((_, classes, canonical)) if Arc::ptr_eq(classes, &full) => {
+                Arc::clone(canonical.get_or_insert_with(|| Arc::new(full.canonical_view())))
+            }
             _ => Arc::new(full.canonical_view()),
         }
     }
+}
 
-    /// The version canonical reads of `version` read ([`canonical_version`]), made once
-    /// per version.
-    pub(crate) fn canonical_version(
-        &self,
-        version: &Arc<Version>,
-        same_as: TermId,
-    ) -> Arc<Version> {
-        let canonical = self.canonical(version, same_as);
-        let full = self.classes(version, same_as);
-        if let Some(cached) = self.0.lock().as_ref()
-            && let Some((content, made)) = &cached.version
-            && *content == version.content
-        {
-            return Arc::clone(made);
-        }
-        let made = canonical_version(version, same_as, &full, &canonical);
-        if let Some(cached) = self.0.lock().as_mut()
-            && Arc::ptr_eq(&cached.classes, &full)
-        {
-            cached.version = Some((version.content, Arc::clone(&made)));
-        }
-        made
+/// What canonical reads of one version read, made at the first such read and owned by
+/// that version (`Version::canonical`): it lives as long as the version, and holds
+/// nothing that holds the version (the view is another version, over the same runs), so
+/// it can't keep the version alive. The equality cell, which versions pass on, holds
+/// only the classes.
+#[derive(Default)]
+pub(crate) struct CanonicalCache {
+    /// The canonical view under `owl:sameAs` ([`canonical_version`]); `None` where it is
+    /// the version itself.
+    view: Mutex<Option<(TermId, Option<Arc<Version>>)>>,
+    /// Whether a triple term of the version names an alias under `owl:sameAs`
+    /// (`Snapshot::triple_terms_name_aliases`).
+    triple_terms: Mutex<Option<(TermId, bool)>>,
+}
+
+impl std::fmt::Debug for CanonicalCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CanonicalCache").finish_non_exhaustive()
     }
 }
 
-impl EqualityCell {
-    /// Whether a triple term of `version` names, at any depth, another identity of a
-    /// class than its representative (`find` decides it over the classes), once per
-    /// version.
-    pub(crate) fn triple_terms_name_aliases(
-        &self,
-        version: &Version,
-        same_as: TermId,
-        find: impl FnOnce(&Classes) -> bool,
-    ) -> bool {
-        let classes = self.classes(version, same_as);
-        if let Some(cached) = self.0.lock().as_ref()
-            && let Some((content, found)) = cached.triple_terms
-            && content == version.content
+impl CanonicalCache {
+    /// The view canonical reads of `version` read under `same_as`, made once per version;
+    /// `None` where that is `version` itself.
+    pub(crate) fn view(version: &Arc<Version>, same_as: TermId) -> Option<Arc<Version>> {
+        if let Some((id, view)) = version.canonical.view.lock().as_ref()
+            && *id == same_as
+        {
+            return view.clone();
+        }
+        let classes = version.equality.classes(version, same_as);
+        let canonical = version.equality.canonical(version, same_as);
+        let made = canonical_version(version, same_as, &classes, &canonical);
+        *version.canonical.view.lock() = Some((same_as, made.clone()));
+        made
+    }
+
+    /// Whether a triple term of this cache's version names an alias under `same_as`
+    /// (`find` decides it), once per version.
+    pub(crate) fn triple_terms(&self, same_as: TermId, find: impl FnOnce() -> bool) -> bool {
+        if let Some((id, found)) = *self.triple_terms.lock()
+            && id == same_as
         {
             return found;
         }
-        let found = find(&classes);
-        if let Some(cached) = self.0.lock().as_mut()
-            && Arc::ptr_eq(&cached.classes, &classes)
-        {
-            cached.triple_terms = Some((version.content, found));
-        }
+        let found = find();
+        *self.triple_terms.lock() = Some((same_as, found));
         found
     }
 }
@@ -162,7 +136,7 @@ impl EqualityCell {
 /// included), is replaced by its representatives' statement: one run of tombstones and
 /// inserts over the asserted stack, so that every read, whatever its access path, gives
 /// representatives. The default graph stays as it is (its canonical reads skip what isn't
-/// over representatives). `version` itself where no named-graph statement names an alias.
+/// over representatives). `None` where no named-graph statement names an alias.
 ///
 /// O(a log n + k log k) for a aliases and k such statements, or one scan of the named
 /// graphs where that is less. Like the classes, it is the version's, not a query's: no
@@ -172,10 +146,10 @@ fn canonical_version(
     same_as: TermId,
     classes: &Arc<Classes>,
     canonical: &Arc<Classes>,
-) -> Arc<Version> {
+) -> Option<Arc<Version>> {
     let asserted = &version.asserted;
     if asserted.layout() != crate::index::Layout::Quads || classes.aliases.is_empty() {
-        return Arc::clone(version);
+        return None;
     }
     let named = QuadPattern {
         subject: None,
@@ -220,7 +194,7 @@ fn canonical_version(
         );
     }
     if renamed.is_empty() {
-        return Arc::clone(version);
+        return None;
     }
     let mut inserts: Vec<EncodedQuad> = renamed
         .iter()
@@ -233,7 +207,7 @@ fn canonical_version(
         .collect();
     inserts.sort_unstable();
     inserts.dedup();
-    Arc::new(Version {
+    Some(Arc::new(Version {
         asserted: asserted.with_delta(&inserts, &renamed),
         inferred: version.inferred.clone(),
         revision: version.revision,
@@ -244,7 +218,8 @@ fn canonical_version(
             Arc::clone(canonical),
         )),
         content: version.content,
-    })
+        canonical: Default::default(),
+    }))
 }
 
 /// `owl:sameAs` classes of two or more identities.
