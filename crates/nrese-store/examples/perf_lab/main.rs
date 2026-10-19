@@ -78,7 +78,7 @@ mod modes;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
@@ -102,10 +102,17 @@ static GLOBAL: Counting = Counting;
 static GLOBAL: nrese_exec::heap::Counting<mimalloc::MiMalloc> =
     nrese_exec::heap::Counting(mimalloc::MiMalloc);
 
-/// Whether allocations are counted (`--count-allocations`), and the counts.
+/// Whether allocations are counted (`--count-allocations`), and the counts: allocations and
+/// the bytes they requested in all (cumulative, never lowered by a free), and the bytes
+/// requested and not yet freed (`LIVE`, from when counting began: frees of earlier allocations
+/// can take it below zero) with its high-water mark (`PEAK_LIVE`, reset to `LIVE` when a phase
+/// starts: the peak live requested bytes of that phase).
 static COUNT_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+static LIVE: AtomicI64 = AtomicI64::new(0);
+static PEAK_LIVE: AtomicI64 = AtomicI64::new(0);
+static LIVE_PEAK_RUN: AtomicI64 = AtomicI64::new(0);
 
 /// mimalloc, counting allocations when asked (one relaxed load when not).
 #[cfg(not(any(system_alloc, alloc_profile)))]
@@ -119,6 +126,16 @@ impl Counting {
             ALLOCATED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
         }
     }
+
+    /// `delta` live bytes more (a successful allocation's size, a free's negated, a successful
+    /// reallocation's difference); the high-water mark follows, without allocating.
+    fn live(delta: i64) {
+        if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
+            let now = LIVE.fetch_add(delta, Ordering::Relaxed) + delta;
+            PEAK_LIVE.fetch_max(now, Ordering::Relaxed);
+            LIVE_PEAK_RUN.fetch_max(now, Ordering::Relaxed);
+        }
+    }
 }
 
 // SAFETY: every call is passed on to mimalloc unchanged; counting has no other effect.
@@ -127,16 +144,25 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         Self::count(layout.size());
         // SAFETY: the caller's contract for `alloc` is mimalloc's.
-        unsafe { mimalloc::MiMalloc.alloc(layout) }
+        let ptr = unsafe { mimalloc::MiMalloc.alloc(layout) };
+        if !ptr.is_null() {
+            Self::live(layout.size() as i64);
+        }
+        ptr
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         Self::count(layout.size());
         // SAFETY: as for `alloc`.
-        unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+        let ptr = unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            Self::live(layout.size() as i64);
+        }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        Self::live(-(layout.size() as i64));
         // SAFETY: `ptr` came from mimalloc with `layout`, as the caller guarantees.
         unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
     }
@@ -144,7 +170,12 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
         Self::count(new_size);
         // SAFETY: as for `dealloc`, and `new_size` is the caller's.
-        unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+        let moved = unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) };
+        // A failed reallocation leaves the old block in place: nothing changes.
+        if !moved.is_null() {
+            Self::live(new_size as i64 - layout.size() as i64);
+        }
+        moved
     }
 }
 
@@ -157,7 +188,8 @@ fn allocations() -> (u64, u64) {
 }
 
 /// The memory a phase used: its peak (Linux: the resident set's, in a window started with
-/// the phase; elsewhere the process's so far) and, when counted, its allocations.
+/// the phase; Windows: none, its peak can't be reset) and, when counted, its allocations, the
+/// bytes they requested in all, and its peak live requested bytes.
 struct Phase {
     allocations: (u64, u64),
 }
@@ -165,21 +197,24 @@ struct Phase {
 impl Phase {
     fn start() -> Self {
         nrese_exec::memory::start_peak_window();
+        PEAK_LIVE.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
         Self {
             allocations: allocations(),
         }
     }
 
-    /// `{"peak_mib": .., "allocations": .., "allocated_mib": ..}` since `start`.
+    /// `{"peak_mib": .., "allocations": .., "requested_mib": .., "peak_live_requested_bytes": ..}`
+    /// since `start`.
     fn json(&self) -> String {
         let (count, bytes) = allocations();
         let peak = nrese_exec::memory::window_peak_bytes()
             .map_or("null".to_owned(), |peak| (peak / 1048576).to_string());
         if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
             format!(
-                "{{\"peak_mib\": {peak}, \"allocations\": {}, \"allocated_mib\": {}}}",
+                "{{\"peak_mib\": {peak}, \"allocations\": {}, \"requested_mib\": {}, \"peak_live_requested_bytes\": {}}}",
                 count - self.allocations.0,
-                (bytes - self.allocations.1) / 1048576
+                (bytes - self.allocations.1) / 1048576,
+                PEAK_LIVE.load(Ordering::Relaxed).max(0)
             )
         } else {
             format!("{{\"peak_mib\": {peak}}}")
@@ -866,11 +901,26 @@ struct Report {
 impl Report {
     fn json(&self, label: &str) -> String {
         let memory = memory_mib();
-        let sections: String = self
+        let mut sections: String = self
             .sections
             .iter()
             .map(|(key, value)| format!("\n  \"{key}\": {value},"))
             .collect();
+        // What `peak_mib` measures, by name, and the working set's peak where the platform
+        // keeps one (Windows); with counted allocations, the run's peak live requested bytes.
+        sections.push_str(&format!(
+            "\n  \"peak_kind\": {:?},",
+            nrese_exec::memory::peak_kind()
+        ));
+        if let Some(peak) = nrese_exec::memory::peak_working_set_bytes() {
+            sections.push_str(&format!("\n  \"peak_working_set_bytes\": {peak},"));
+        }
+        if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
+            sections.push_str(&format!(
+                "\n  \"peak_live_requested_bytes\": {},",
+                LIVE_PEAK_RUN.load(Ordering::Relaxed).max(0)
+            ));
+        }
         format!(
             "{{\n  \"label\": {label:?},\n  \"open_s\": {:.6},\n  \"load_s\": {:.6},\n  \"peak_mib\": {},\n  \"cgroup_peak_mib\": {},\n  \"sum_p50_ms\": {:.3},{}{}\n  \"queries\": [\n{}\n  ]\n}}\n",
             self.open_s,

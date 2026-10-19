@@ -35,13 +35,42 @@ pub fn peak_process_bytes() -> Option<u64> {
 /// is returned. Starting a window by writing `clear_refs` directly loses the peak before it.
 pub fn start_peak_window() -> bool {
     peak_process_bytes();
-    imp::reset_peak()
+    let started = imp::reset_peak();
+    WINDOW_UNAVAILABLE.store(!started, Ordering::Relaxed);
+    started
 }
 
 /// The most the process has held since the last [`start_peak_window`] (since the start
-/// without one); `None` where the platform doesn't say.
+/// without one); `None` where the platform doesn't say, and where a window was asked for
+/// but couldn't start (Windows keeps one peak for the process's lifetime: that would be
+/// every phase before as well, not this one's).
 pub fn window_peak_bytes() -> Option<u64> {
+    if WINDOW_UNAVAILABLE.load(Ordering::Relaxed) {
+        return None;
+    }
     imp::peak_process_bytes()
+}
+
+/// Whether the last [`start_peak_window`] couldn't start one.
+static WINDOW_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// What [`peak_process_bytes`] measures on this platform, by name: `vmhwm` (Linux, the peak
+/// resident set, mapped files included), `peak_private_commit` (Windows, the peak committed
+/// private bytes, `PeakPagefileUsage`), or `none`.
+pub fn peak_kind() -> &'static str {
+    if cfg!(windows) {
+        "peak_private_commit"
+    } else if cfg!(target_os = "linux") {
+        "vmhwm"
+    } else {
+        "none"
+    }
+}
+
+/// The peak of the process's working set (Windows: `PeakWorkingSetSize`, the most physical
+/// memory it held at once, mapped and shared pages included); `None` elsewhere.
+pub fn peak_working_set_bytes() -> Option<u64> {
+    imp::peak_working_set_bytes()
 }
 
 /// The highest mark the kernel had when a peak window started.
@@ -230,6 +259,10 @@ mod imp {
         counters().map(|counters| counters.PeakPagefileUsage as u64)
     }
 
+    pub fn peak_working_set_bytes() -> Option<u64> {
+        counters().map(|counters| counters.PeakWorkingSetSize as u64)
+    }
+
     /// Windows keeps the peak for the process's lifetime.
     pub fn reset_peak() -> bool {
         false
@@ -346,6 +379,10 @@ mod imp {
         }
     }
 
+    pub fn peak_working_set_bytes() -> Option<u64> {
+        None
+    }
+
     pub fn peak_process_bytes() -> Option<u64> {
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
         let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
@@ -381,6 +418,10 @@ mod imp {
     }
 
     pub fn peak_process_bytes() -> Option<u64> {
+        None
+    }
+
+    pub fn peak_working_set_bytes() -> Option<u64> {
         None
     }
 
@@ -535,6 +576,14 @@ mod tests {
         assert!(assigned, "{}", std::io::Error::last_os_error());
         assert_eq!(imp::job_limit(), Some(limit));
         assert_eq!(available_bytes(), Some(limit));
+    }
+
+    /// A phase's peak is its window's or none: where no window starts (Windows keeps one peak
+    /// for the process's life), the lifetime's peak isn't reported as the phase's.
+    #[test]
+    fn a_phase_peak_is_its_windows_or_none() {
+        let started = start_peak_window();
+        assert_eq!(window_peak_bytes().is_some(), started);
     }
 
     #[test]
