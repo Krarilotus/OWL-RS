@@ -99,6 +99,7 @@ try:
         code = 1  # nothing to pull from here
     elif args[:1] == ["run"]:
         labels, _, _, name, plain = options(args[1:])
+        state.setdefault("runs", []).append(args)
         state["n"] += 1
         cid = f"c{state['n']}"
         volumes = [plain[i + 1].split(":")[0] for i, a in enumerate(plain) if a == "-v"]
@@ -493,6 +494,54 @@ class Timing(unittest.TestCase):
                 threading.Thread(target=take, daemon=True).start()
                 self.assertTrue(got.wait(timeout=10), f"{kind}: the lock stayed held after its holder died")
                 self.assertLess(time.monotonic() - started, 2.0, kind)
+
+
+@unittest.skipUnless(BASH, "needs bash")
+class PinSets(unittest.TestCase):
+    """Sol, 20 Oct 2026: the reasoning scorecard pinned Jena's image for one of its four Jena
+    systems, so the others failed after the rest had timed; the pins and the runs were two lists."""
+
+    def test_every_system_a_scorecard_can_run_has_its_image_pinned(self):
+        script = r'''
+. benches/reasoning/systems.sh
+RUST_IMAGE=rust:test
+for system in $REASONING_SYSTEMS; do
+  image=$(system_image "$system") || exit 3
+  pin_set $REASONING_SYSTEMS | grep -qxF "$image" || { echo "unpinned $system"; exit 4; }
+done
+pin_set oracle jena-unknown >/dev/null 2>&1 || echo refused
+'''
+        done = bash(script)
+        self.assertEqual((done.returncode, done.stdout.split()), (0, ["refused"]), done.stdout + done.stderr)
+        scorecard = (ROOT / "benches/reasoning/reasoning-scorecard.sh").read_text(encoding="utf-8")
+        # Every jena-* system it dispatches is one of the table's, and its runs name systems, never images.
+        self.assertIn('measured "$2" "jena-$3"', scorecard)
+        self.assertNotRegex(scorecard, r'measured "\$2" (nrese-bench/|"\$RUST_IMAGE")')
+        # The competitors' scorecard: its table names every system it can load and serve.
+        import re
+        competitors = (ROOT / "benches/competitors/scorecard.sh").read_text(encoding="utf-8")
+        table = set(re.findall(r"\[(\w+)\]=\w+_IMAGE", competitors))
+        loaders = set(re.findall(r"^load_(\w+)\(\)", competitors, re.M))
+        self.assertTrue(loaders and loaders <= table, (loaders, table))
+
+    def test_the_calibration_container_runs_its_pinned_image(self):
+        """Sol, 20 Oct 2026: the manifest timed a no-op container of alpine:latest by its tag."""
+        import json
+        from suitekit import manifest
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            python_side, _ = fake_docker(tmp)
+            env = {**python_side, "NRESE_LOCK_DIR": str(tmp / "locks"), "FLEET_JOB": "job-a"}
+            (tmp / "state.json").write_text(json.dumps({"containers": {}, "volumes": {}, "n": 0, "images": {}}))
+            with patch.dict(os.environ, env):
+                with self.assertRaises(ns.ImageError):  # not resolvable: the job stops
+                    manifest.container_start_ms(ROOT)
+                (tmp / "state.json").write_text(json.dumps({"containers": {}, "volumes": {}, "n": 0,
+                                                            "images": {manifest.CALIBRATION_IMAGE: "sha256:cal"}}))
+                self.assertIsNotNone(manifest.container_start_ms(ROOT))
+            runs = state(tmp)["runs"]
+            self.assertEqual(len(runs), 3)
+            self.assertTrue(all("sha256:cal" in r and manifest.CALIBRATION_IMAGE not in r for r in runs), runs)
 
 
 if __name__ == "__main__":
