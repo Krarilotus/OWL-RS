@@ -83,8 +83,8 @@ use nrese_exec::join::{
     left_join, outer_join_with_undef,
 };
 use nrese_exec::{
-    Budget, BudgetExceeded, ChargedVec, IdTable, Reservation, UNDEF, computed_id, computed_index,
-    group::group_rows,
+    Budget, BudgetExceeded, ChargedVec, IdTable, Reservation, Scratch, UNDEF, computed_id,
+    computed_index, group::group_rows,
 };
 use nrese_rdf::{Term, Variable};
 use nrese_sparql_syntax::Query;
@@ -252,9 +252,28 @@ fn run(
         Form::Select => Outcome::Solutions(solutions, ctx.computed.take()),
     };
     ctx.drop_decoded();
+    // The results take over what the query charged the budget directly (its computed
+    // terms); the table they keep holds its own charge.
+    let own = match &outcome {
+        Outcome::Solutions(solutions, _) => solutions.table.charge(),
+        Outcome::Graph(triples) => {
+            // The triples a graph result keeps, made outside any table: charged now, with
+            // what the query charged directly.
+            let bytes = triples.capacity() * size_of::<nrese_rdf::Triple>()
+                + triples
+                    .iter()
+                    .map(nrese_rdf::Triple::heap_bytes)
+                    .sum::<usize>();
+            ctx.budget
+                .charge(bytes)
+                .map_err(QueryEvaluationError::MemoryLimit)?;
+            0
+        }
+        Outcome::Boolean(_) => 0,
+    };
     Ok((
         outcome,
-        Reservation::adopt(Arc::clone(&ctx.budget), ctx.budget.used()),
+        Reservation::adopt(Arc::clone(&ctx.budget), ctx.budget.used() - own),
     ))
 }
 
@@ -1282,28 +1301,6 @@ enum GraphScope {
     Missing,
 }
 
-/// Tables charged to a query's budget ([`Context::reshaped`]).
-trait Charged {
-    fn charged(&self) -> usize;
-}
-
-impl Charged for Solutions {
-    fn charged(&self) -> usize {
-        self.table.memory_bytes()
-    }
-}
-
-impl Charged for Vec<Solutions> {
-    fn charged(&self) -> usize {
-        self.iter().map(Charged::charged).sum()
-    }
-}
-
-/// What [`IdTable::concat`] of `parts`' tables allocates beyond them.
-fn concat_growth(parts: &[Solutions]) -> usize {
-    IdTable::concat_growth(parts.iter().map(|p| &p.table))
-}
-
 impl<'a> Context<'a> {
     /// Whether `triple` is a GeoSPARQL relation computed from geometries
     /// ([`spatial`]): not when only stated relations are read.
@@ -1483,15 +1480,14 @@ impl<'a> Context<'a> {
     }
 
     /// Charges a produced table against the query's memory budget.
+    /// A table an operator made, holding the charge of exactly its memory: what it holds
+    /// beyond its own charge (a table built outside the charged path) is charged now.
     fn produced(&self, mut solutions: Solutions) -> NativeResult<Solutions> {
         self.check()?;
-        // What the table doesn't hold charged itself (it was built uncharged) is charged
-        // now; a table the kernels built charged hands its charge over as the table's.
-        let own = solutions.table.charge();
-        self.budget
-            .charge(solutions.table.memory_bytes().saturating_sub(own))
+        solutions
+            .table
+            .settle(&self.budget)
             .map_err(QueryEvaluationError::MemoryLimit)?;
-        solutions.table.transfer_charge();
         Ok(solutions)
     }
 
@@ -1540,37 +1536,36 @@ impl<'a> Context<'a> {
         .into()
     }
 
-    /// Frees a table charged to the query's budget, then releases its charge: the budget
-    /// never shows less than the tables hold.
+    /// Frees a table the query is done with: its charge is released with it, after its
+    /// columns.
     fn consumed(&self, solutions: Solutions) {
-        let bytes = solutions.table.memory_bytes();
         drop(solutions);
-        self.budget.release(bytes);
     }
 
-    /// A table that `reshape` makes of charged ones, which it takes (filtering in place,
-    /// projecting, joining into one): their charge carries over to it, not charged again.
-    /// `growth`, the most it allocates beyond what it frees as it goes, is charged first;
-    /// once the tables it was made of are gone, it holds the charge of exactly its bytes.
-    /// On an error the tables are freed before their charge is released.
-    fn reshaped<T: Charged>(
+    /// A table that `reshape` makes of the tables it takes (filtering in place, projecting,
+    /// joining into one), produced: their charges move with their buffers, and what it
+    /// holds beyond them is charged.
+    fn reshaped<T>(
         &self,
         from: T,
-        growth: usize,
-        reshape: impl FnOnce(T) -> Solutions,
+        reshape: impl FnOnce(T) -> NativeResult<Solutions>,
     ) -> NativeResult<Solutions> {
-        let mut held = Reservation::adopt(&*self.budget, from.charged());
-        if let Err(error) = held.charge(growth) {
-            drop(from);
-            return Err(QueryEvaluationError::MemoryLimit(error).into());
-        }
-        // Declared after `held`: dropped before it.
-        let solutions = reshape(from);
-        self.check()?;
-        held.resize(solutions.table.memory_bytes())
+        let solutions = reshape(from)?;
+        self.produced(solutions)
+    }
+
+    /// The rows of `parts`, in order, as one table: the first with rows grows (charged
+    /// first) to hold them all, each other one freed with its charge once copied.
+    fn concatenated(&self, vars: Vec<Variable>, parts: Vec<Solutions>) -> NativeResult<Solutions> {
+        let width = vars.len();
+        let mut tables: Vec<IdTable> = parts.into_iter().map(|part| part.table).collect();
+        let table = IdTable::concat_charged(width, &mut tables, &self.budget)
             .map_err(QueryEvaluationError::MemoryLimit)?;
-        held.transfer();
-        Ok(solutions)
+        self.produced(Solutions {
+            vars,
+            table,
+            ordered: false,
+        })
     }
 
     fn term(&self, id: u64) -> Option<Term> {
@@ -2817,7 +2812,7 @@ impl<'a> Context<'a> {
         let mut applied = None;
         while from < result.table.len() && rows < limit {
             let to = (from + size).min(result.table.len());
-            let columns = result
+            let columns: Vec<Vec<u64>> = result
                 .table
                 .columns()
                 .iter()
@@ -3776,11 +3771,11 @@ impl<'a> Context<'a> {
                 .column(object)
                 .expect("the pattern binds its object");
             let set = IdSet::new(ranges);
-            return self.reshaped(solutions, 0, |mut solutions| {
+            return self.reshaped(solutions, |mut solutions| {
                 solutions
                     .table
                     .par_retain(|table, row| set.contains(table.get(row, column)));
-                solutions
+                Ok(solutions)
             });
         }
         // Each range a block and a column at a time where the index can, else quad by quad.
@@ -3924,34 +3919,26 @@ impl<'a> Context<'a> {
         let out = if rows < 2 * PROBE_CHUNK {
             probe.rows(0..rows, &cancelled)
         } else {
-            // The chunks' lists (their results, then their tables and their charges apart,
-            // then the tables joined) and each chunk's own column list and row buffer, a
-            // column header and a value a column, charged first: the chunks grow with the
-            // input's rows.
+            // The chunks' tables in a list charged first (the chunks grow with the input's
+            // rows), each table charged as it grows, joined by the charged concatenation.
             let chunks = rows.div_ceil(PROBE_CHUNK);
-            let entry = size_of::<Result<(IdTable, Reservation<&Budget>), ProbeStop>>();
-            let columns = vars.len() * (size_of::<Vec<u64>>() + size_of::<u64>());
-            let mut lists = Reservation::new(&*self.budget);
-            match lists.charge(chunks.saturating_mul(4 * entry + columns)) {
-                Err(exceeded) => Err(ProbeStop::Memory(exceeded)),
-                Ok(()) => {
-                    let parts: Vec<Result<_, ProbeStop>> = (0..chunks)
-                        .into_par_iter()
-                        .map(|i| {
-                            probe.rows(
-                                i * PROBE_CHUNK..((i + 1) * PROBE_CHUNK).min(rows),
-                                &cancelled,
-                            )
-                        })
-                        .collect();
-                    parts
-                        .into_iter()
-                        .collect::<Result<Vec<_>, ProbeStop>>()
-                        .and_then(|parts| probe.concat(parts))
-                }
-            }
+            ChargedVec::with_capacity(&*self.budget, chunks)
+                .and_then(|mut parts: Scratch<'_, IdTable>| {
+                    parts.extend_bounded(chunks, std::iter::repeat_with(IdTable::default))?;
+                    Ok(parts)
+                })
+                .map_err(ProbeStop::Memory)
+                .and_then(|mut parts| {
+                    parts.par_iter_mut().enumerate().try_for_each(|(i, part)| {
+                        let range = i * PROBE_CHUNK..((i + 1) * PROBE_CHUNK).min(rows);
+                        *part = probe.rows(range, &cancelled)?;
+                        Ok(())
+                    })?;
+                    IdTable::concat_charged(vars.len(), &mut parts, &self.budget)
+                        .map_err(ProbeStop::Memory)
+                })
         };
-        let (out, held) = match out {
+        let out = match out {
             Ok(out) => out,
             Err(ProbeStop::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
             Err(ProbeStop::TooManyRows) => {
@@ -3964,9 +3951,8 @@ impl<'a> Context<'a> {
         self.probed
             .set(*probe.seeks.lock().unwrap_or_else(|e| e.into_inner()));
         let ordered = result.ordered;
-        // The rows probed from freed, then the result keeps the charge it grew under.
+        // The rows probed from freed; the result holds the charge it grew under.
         self.consumed(result);
-        held.transfer();
         let out = if ordered {
             out
         } else {
@@ -4138,19 +4124,17 @@ impl<'a> Context<'a> {
             .iter()
             .map(|v| (0..4).filter(|&i| scan.slots[i].is_var(v)).collect())
             .collect();
-        // Both tables are charged before they grow; the result keeps its charge, which
-        // whoever consumes it releases, as for a produced table.
+        // Both tables are charged before they grow, and hold their charge.
         let memory = QueryEvaluationError::MemoryLimit;
-        // (Each reservation before its table: locals drop in reverse, the table first.)
-        let mut out_held = Reservation::new(Arc::clone(&self.budget));
-        let mut chunk_held = Reservation::new(Arc::clone(&self.budget));
         let (mut out, mut chunk) = (IdTable::new(width), IdTable::new(width));
         // Without a filter, every row read is kept: no more than the limit are read at once.
         let chunk_rows = match filter {
             Some(_) => LIMIT_CHUNK,
             None => LIMIT_CHUNK.min(limit.max(1)),
         };
-        reserve_rows(&mut chunk, &mut chunk_held, chunk_rows, chunk_rows).map_err(memory)?;
+        chunk
+            .reserve_rows_exact(chunk_rows, &self.budget)
+            .map_err(memory)?;
         let mut row = vec![0u64; width];
         // The merged default graph is read in a graph-last order, where the copies of a
         // statement are adjacent, and all but the first are skipped (of a merge of listed
@@ -4190,7 +4174,7 @@ impl<'a> Context<'a> {
                     p[1..].iter().all(|&i| components[i] == *slot)
                 });
                 if consistent {
-                    chunk.push_row(&row);
+                    chunk.push_reserved(&row);
                 }
             }
             if chunk.len() >= chunk_rows || (more.is_none() && !chunk.is_empty()) {
@@ -4205,7 +4189,8 @@ impl<'a> Context<'a> {
                     chunk = part.table;
                     chunk.retain_mask(&mask);
                 }
-                reserve_rows(&mut out, &mut out_held, chunk.len(), limit).map_err(memory)?;
+                out.reserve_rows_up_to(chunk.len(), limit, &self.budget)
+                    .map_err(memory)?;
                 out.append(&chunk);
                 chunk.slice(0, Some(0));
                 if out.len() >= limit {
@@ -4230,27 +4215,27 @@ impl<'a> Context<'a> {
             ordered: false,
         };
         let Some(variables) = projection else {
-            out_held.transfer();
             return Ok(Some(solutions));
         };
         // The projection's new columns are charged as the rows were, before they are made:
         // a bound variable's column moves, every other projected one is made (an unbound
-        // variable's, a column projected again). The result keeps its charge.
+        // variable's, a column projected again), and the vector of them. Then the table
+        // holds what it holds.
         let moved = solutions
             .vars
             .iter()
             .filter(|v| variables.contains(v))
             .count();
         let made = variables.len() - moved;
-        out_held
-            .charge(solutions.table.len().saturating_mul(8 * made))
+        let mut solutions = solutions;
+        let bytes = solutions.table.len().saturating_mul(8 * made)
+            + variables.len() * size_of::<Vec<u64>>();
+        solutions
+            .table
+            .charge_ahead(bytes, &self.budget)
             .map_err(memory)?;
         let projected = self.project(solutions, variables);
-        out_held
-            .resize(projected.table.memory_bytes())
-            .map_err(memory)?;
-        out_held.transfer();
-        Ok(Some(projected))
+        Ok(Some(self.produced(projected)?))
     }
 
     /// Which rows pass `expression`: the compiled id-level predicate where it decides
@@ -4972,12 +4957,8 @@ impl<'a> Context<'a> {
         };
         let vars = first.vars.clone();
         let width = first.table.width();
-        let growth = concat_growth(&parts);
-        Ok(Some(self.reshaped(parts, growth, |parts| Solutions {
-            vars,
-            table: IdTable::concat(width, parts.into_iter().map(|p| p.table).collect()),
-            ordered: false,
-        })?))
+        debug_assert_eq!(width, vars.len());
+        Ok(Some(self.concatenated(vars, parts)?))
     }
 
     /// Every aggregate of every group in one pass over the rows, where each is `COUNT(*)`,
@@ -5256,7 +5237,7 @@ impl<'a> Context<'a> {
                 self.aggregate_groups(&solutions, &members, aggregates)?
             }
         };
-        let mut columns: Vec<Vec<u64>> = groups.keys.clone().into_columns();
+        let mut columns = groups.keys.clone().into_columns();
         let mut vars: Vec<Variable> = variables.to_vec();
         for (index, (target, _)) in aggregates.iter().enumerate() {
             let column: Vec<u64> = values
@@ -5454,7 +5435,7 @@ struct Probe<'a, 'b> {
     graphs: Option<&'a [TermId]>,
     /// The query's budget: each chunk's output and scratch are charged to it before they
     /// grow.
-    budget: &'b Budget,
+    budget: &'b Arc<Budget>,
     width: usize,
     /// Output rows allowed in total (the query's memory budget), and produced so far.
     max_rows: usize,
@@ -5480,29 +5461,33 @@ impl<'b> Probe<'_, 'b> {
         &self,
         rows: Range<usize>,
         cancelled: &(dyn Fn() -> bool + Sync),
-    ) -> Result<(IdTable, Reservation<&'b Budget>), ProbeStop> {
+    ) -> Result<IdTable, ProbeStop> {
         let table = self.table;
         let width = table.width();
         let stride = self.positions.len();
-        // The reservation before the table: locals drop in reverse, the table first.
-        let mut held = Reservation::new(self.budget);
+        let budget = &**self.budget;
         let mut out = IdTable::new(self.width);
         let mut cursor = self.snapshot.probe_cursor(self.model);
         // The new variables' values of each match of the current key, and their number
         // (a pattern binding nothing new matches without values).
-        let mut matches = ChargedVec::new(self.budget);
+        let mut matches = ChargedVec::new(budget);
         let mut refused = None;
         let mut found = 0usize;
         // A key's distinct records of several values in a merged default graph
         // ([`distinct`]): scratch kept from key to key, charged only when it grows.
         let mut scratch = (self.scan.merged() && stride > 1)
-            .then(|| (ChargedVec::new(self.budget), ChargedVec::new(self.budget)));
-        // The rows `out` has room for: below it, a key's matches need no charge. A row a
-        // key to start with.
-        reserve_rows(&mut out, &mut held, rows.len(), usize::MAX).map_err(ProbeStop::Memory)?;
-        let mut room = rows.len();
-        let mut row = vec![0u64; self.width];
-        let mut bound = self.scan.clone();
+            .then(|| (ChargedVec::new(budget), ChargedVec::new(budget)));
+        // A row a key to start with; below the room, a key's matches need no charge.
+        out.reserve_rows(rows.len(), self.budget)
+            .map_err(ProbeStop::Memory)?;
+        // The row being assembled, charged too: one a chunk, and the chunks grow with the
+        // input's rows.
+        let mut row: Scratch<'_, u64> =
+            ChargedVec::with_capacity(budget, self.width).map_err(ProbeStop::Memory)?;
+        row.resize(self.width, 0).map_err(ProbeStop::Memory)?;
+        // The pattern probed, its key positions set to each key: constants only, nothing
+        // allocated a chunk (a clone of the scan would copy its variables' names).
+        let mut bound = self.scan.quad_pattern();
         let first = rows.start;
         let mut counted = 0;
         let finish = |cursor: &nrese_engine::ProbeCursor<'_>| {
@@ -5528,10 +5513,15 @@ impl<'b> Probe<'_, 'b> {
                 for (slots, &k) in self.shared_positions.iter().zip(self.key_columns) {
                     let id = TermId::from_raw(table.get(r, k));
                     for &i in slots {
-                        bound.slots[i] = Slot::Const(id);
+                        match i {
+                            0 => bound.subject = Some(id),
+                            1 => bound.predicate = Some(id),
+                            2 => bound.object = Some(id),
+                            _ => bound.graph = GraphSelector::Exact(id),
+                        }
                     }
                 }
-                cursor.for_each(&bound.quad_pattern(), |quad| {
+                cursor.for_each(&bound, |quad| {
                     if refused.is_some()
                         || self
                             .graphs
@@ -5562,16 +5552,16 @@ impl<'b> Probe<'_, 'b> {
                         .map_err(ProbeStop::Memory)?;
                 }
             }
-            if out.len() + found > room {
-                reserve_rows(&mut out, &mut held, found, usize::MAX).map_err(ProbeStop::Memory)?;
-                room = out.memory_bytes() / (8 * self.width).max(1);
+            if out.room_left() < found {
+                out.reserve_rows(found, self.budget)
+                    .map_err(ProbeStop::Memory)?;
             }
             for m in 0..found {
                 for (c, slot) in row.iter_mut().enumerate().take(width) {
                     *slot = table.get(r, c);
                 }
                 row[width..].copy_from_slice(&matches[m * stride..(m + 1) * stride]);
-                out.push_row(&row);
+                out.push_reserved(&row);
             }
             // One key can match a whole index range: check within large fan-outs too.
             if out.len() - counted > 1 << 16 {
@@ -5581,24 +5571,7 @@ impl<'b> Probe<'_, 'b> {
         }
         finish(&cursor);
         self.grow(out.len() - counted)?;
-        Ok((out, held))
-    }
-
-    /// The chunks' rows as one table, charged before they are copied; each chunk's charge
-    /// goes with it.
-    fn concat(
-        &self,
-        parts: Vec<(IdTable, Reservation<&'b Budget>)>,
-    ) -> Result<(IdTable, Reservation<&'b Budget>), ProbeStop> {
-        let rows: usize = parts.iter().map(|(part, _)| part.len()).sum();
-        let mut held = Reservation::new(self.budget);
-        held.charge(rows.saturating_mul(8 * self.width))
-            .map_err(ProbeStop::Memory)?;
-        let (parts, charges): (Vec<IdTable>, Vec<_>) = parts.into_iter().unzip();
-        let out = IdTable::concat(self.width, parts);
-        drop(charges);
-        held.resize(out.memory_bytes()).map_err(ProbeStop::Memory)?;
-        Ok((out, held))
+        Ok(out)
     }
 
     fn grow(&self, rows: usize) -> Result<(), ProbeStop> {
@@ -5639,7 +5612,8 @@ fn drop_last_columns(mut solutions: Solutions, count: usize) -> Solutions {
     }
     let rows = solutions.table.len();
     let mut columns = std::mem::take(&mut solutions.table).into_columns();
-    columns.truncate(columns.len() - count);
+    let kept = columns.len() - count;
+    columns.truncate(kept);
     solutions.vars.truncate(solutions.vars.len() - count);
     solutions.table = if columns.is_empty() {
         IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
@@ -5722,37 +5696,6 @@ fn distinct<B: std::ops::Deref<Target = Budget>>(
 /// pairs, then the rows' order, and each column gathered anew (all at once in parallel).
 fn sort_scratch_bytes(table: &IdTable) -> usize {
     table.len().saturating_mul(4 + 16.max(8 * table.width()))
-}
-
-/// Room in `table` for `rows` more rows, charged to `held` (which holds exactly `table`'s
-/// capacity) before the columns grow: the capacity doubles, up to `most` rows, where the
-/// budget has room, else grows by what is asked. The old capacity and the new are both
-/// held while the columns move.
-fn reserve_rows<B: std::ops::Deref<Target = Budget>>(
-    table: &mut IdTable,
-    held: &mut Reservation<B>,
-    rows: usize,
-    most: usize,
-) -> Result<(), BudgetExceeded> {
-    let row_bytes = 8 * table.width();
-    let needed = table.len().saturating_add(rows);
-    if row_bytes == 0 || needed.saturating_mul(row_bytes) <= table.memory_bytes() {
-        return Ok(());
-    }
-    let doubled = (table.memory_bytes() / row_bytes * 2).min(most).max(needed);
-    let mut grow = |capacity: usize| -> Result<(), BudgetExceeded> {
-        let old = held.bytes();
-        held.charge(capacity.saturating_mul(row_bytes))?;
-        table.reserve_exact(capacity - table.len());
-        held.release(old);
-        // An allocator may hand out more than asked: held too.
-        let actual = table.memory_bytes();
-        if actual > held.bytes() {
-            held.charge(actual - held.bytes())?;
-        }
-        Ok(())
-    };
-    grow(doubled).or_else(|_| grow(needed))
 }
 
 fn has_undef(table: &IdTable, columns: &[usize]) -> bool {

@@ -220,7 +220,7 @@ impl Context<'_> {
         // Computed ids are the query's own: renumber those the table holds from 0.
         let mut local: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         let mut terms = Vec::new();
-        let columns = solutions
+        let columns: Vec<Vec<u64>> = solutions
             .table
             .columns()
             .iter()
@@ -282,7 +282,7 @@ impl Context<'_> {
                                 .map(|&id| computed_index(id).map_or(id, |i| ids[i as usize]))
                                 .collect()
                         })
-                        .collect(),
+                        .collect::<Vec<Vec<u64>>>(),
                 )
             }
         };

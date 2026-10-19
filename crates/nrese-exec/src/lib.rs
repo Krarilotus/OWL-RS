@@ -54,7 +54,7 @@ pub use budget::{
 static MEASURED: measure::Measured<std::alloc::System> = measure::Measured(std::alloc::System);
 pub use join::RowLimit;
 pub use region::{BoundTooLarge, Pages, Region, Settled};
-pub use table::IdTable;
+pub use table::{Columns, IdTable};
 
 /// A hash map keyed by term ids, with the fast hasher the operators use.
 pub type IdMap<V> = hashbrown::HashMap<u64, V, foldhash::fast::FixedState>;

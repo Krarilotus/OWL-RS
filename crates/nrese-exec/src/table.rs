@@ -13,9 +13,10 @@
 //! grew holds no charge and no budget. Rows are written into reserved room
 //! ([`IdTable::push_reserved`]): one check per row, no allocation, no atomics.
 //!
-//! Tables made by the older uncharged constructors (`with_capacity`, `from_columns`,
-//! `push_row`) hold no charge of their own; the executor charges them as a whole until it
-//! builds every table through the charged path.
+//! Tables made by the older constructors (`with_capacity`, `from_columns`, `push_row`)
+//! grow uncharged; the executor charges what they hold when it produces them
+//! ([`IdTable::settle`]) until it builds every table through the charged path. Either way
+//! a table owns its charge, and its columns taken out ([`IdTable::into_columns`]) carry it.
 
 use std::sync::Arc;
 
@@ -25,6 +26,42 @@ use crate::{Budget, BudgetExceeded, Reservation};
 
 /// Row count from which sorting runs in parallel.
 const PARALLEL_SORT_ROWS: usize = 1 << 16;
+
+/// A table's columns taken out of it ([`IdTable::into_columns`]), with its charge: a
+/// `Vec` of columns to read and change, and the charge of the memory they held, released
+/// after them, or taken over by the table they make ([`IdTable::from_columns`], which
+/// settles it to what it holds when it is produced).
+#[derive(Debug, Default)]
+pub struct Columns {
+    /// Before `held`: fields drop in order, the columns first.
+    columns: Vec<Vec<u64>>,
+    header: usize,
+    held: Option<Reservation<Arc<Budget>>>,
+}
+
+impl From<Vec<Vec<u64>>> for Columns {
+    fn from(columns: Vec<Vec<u64>>) -> Self {
+        Self {
+            columns,
+            header: 0,
+            held: None,
+        }
+    }
+}
+
+impl std::ops::Deref for Columns {
+    type Target = Vec<Vec<u64>>;
+
+    fn deref(&self) -> &Vec<Vec<u64>> {
+        &self.columns
+    }
+}
+
+impl std::ops::DerefMut for Columns {
+    fn deref_mut(&mut self) -> &mut Vec<Vec<u64>> {
+        &mut self.columns
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct IdTable {
@@ -117,16 +154,40 @@ impl IdTable {
         rows: usize,
         budget: &Arc<Budget>,
     ) -> Result<(), BudgetExceeded> {
+        self.reserve_rows_up_to(rows, usize::MAX, budget)
+    }
+
+    /// [`Self::reserve_rows`], doubling to no more than `most` rows in all (a LIMIT's).
+    pub fn reserve_rows_up_to(
+        &mut self,
+        rows: usize,
+        most: usize,
+        budget: &Arc<Budget>,
+    ) -> Result<(), BudgetExceeded> {
         let needed = self.needed(rows, budget)?;
         if needed <= self.room {
             return Ok(());
         }
-        let doubled = needed.max(self.room.saturating_mul(2));
+        let doubled = needed.max(self.room.saturating_mul(2).min(most));
         let fits = Self::bytes(self.width(), doubled).is_some_and(|bytes| {
             let budget = self.held.as_ref().map_or(&**budget, |held| held.budget());
             bytes <= budget.remaining()
         });
         self.set_room(if fits { doubled } else { needed }, budget)
+    }
+
+    /// `bytes` more charged to the table's budget (`budget` for a table that holds no
+    /// charge yet), before a change made outside the charged path allocates them (a
+    /// column pushed, columns projected again): [`Self::settle`] then holds exactly what
+    /// was made. Fails without charging.
+    pub fn charge_ahead(
+        &mut self,
+        bytes: usize,
+        budget: &Arc<Budget>,
+    ) -> Result<(), BudgetExceeded> {
+        self.held
+            .get_or_insert_with(|| Reservation::new(Arc::clone(budget)))
+            .charge(bytes)
     }
 
     /// Room for exactly `rows` more rows, charged first ([`Self::reserve_rows`]).
@@ -284,23 +345,43 @@ impl IdTable {
         Ok(out.append_parts(rest[1..].iter_mut().map(std::mem::take)))
     }
 
-    /// The charge of the table, handed to a holder that releases it itself
-    /// ([`Reservation::transfer`]): the table holds none after.
-    pub fn transfer_charge(&mut self) -> usize {
-        self.held.take().map_or(0, Reservation::transfer)
+    /// Holds the charge of exactly its memory ([`Self::memory_bytes`], the vector of
+    /// columns included), to `budget` if it holds none yet: what its columns hold beyond
+    /// its charge (grown, or made, outside [`Self::reserve_rows`]) is charged now, what it
+    /// holds beyond them released. Fails, holding what it held, where the budget has no
+    /// room.
+    pub fn settle(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetExceeded> {
+        if self.held.is_none() && self.columns.capacity() == 0 && self.memory_bytes() == 0 {
+            return Ok(());
+        }
+        self.header = self.columns.capacity() * size_of::<Vec<u64>>();
+        let bytes = self.memory_bytes();
+        self.held
+            .get_or_insert_with(|| Reservation::new(Arc::clone(budget)))
+            .resize(bytes)?;
+        self.room = self.capacity_rows();
+        Ok(())
     }
 
-    /// A table from equal-length columns.
+    /// A table from equal-length columns, with the charge they come with ([`Columns`]; a
+    /// `Vec` of columns comes with none).
     ///
     /// # Panics
     /// If the columns differ in length.
-    pub fn from_columns(columns: Vec<Vec<u64>>) -> Self {
+    pub fn from_columns(columns: impl Into<Columns>) -> Self {
+        let Columns {
+            columns,
+            header,
+            held,
+        } = columns.into();
         let len = columns.first().map_or(0, Vec::len);
         assert!(
             columns.iter().all(|c| c.len() == len),
             "IdTable columns must have equal lengths"
         );
-        Self::uncharged(columns, len, Vec::new())
+        let mut table = Self::uncharged(columns, len, Vec::new());
+        (table.header, table.held) = (header, held);
+        table
     }
 
     /// A table with one row per entry of `rows`, each `width` wide.
@@ -337,8 +418,14 @@ impl IdTable {
         &self.columns
     }
 
-    pub fn into_columns(self) -> Vec<Vec<u64>> {
-        self.columns
+    /// The columns, with the table's charge: it stays with them, into the table they make
+    /// ([`Self::from_columns`]), or is released when they are dropped, after them.
+    pub fn into_columns(mut self) -> Columns {
+        Columns {
+            columns: std::mem::take(&mut self.columns),
+            header: self.header,
+            held: self.held.take(),
+        }
     }
 
     #[inline]
