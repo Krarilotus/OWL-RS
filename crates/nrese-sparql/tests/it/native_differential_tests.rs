@@ -4172,7 +4172,9 @@ fn updates_with_a_dataset_equal_the_reference() {
 /// The default graph merged from listed graphs (`FROM <g0> FROM <g1>`) through the
 /// shortcuts that read the index directly (an index nested-loop join, a streamed `LIMIT`,
 /// `COUNT(*)` of one pattern): each statement once, and none from another graph. The
-/// `LIMIT` of one pattern streams until it has its rows, as over one graph.
+/// `LIMIT` of one pattern streams until it has its rows, as over one graph. A blank node
+/// two graphs share is one node of the merge (the owner's decision, as Jena, GraphDB and
+/// Oxigraph; RDF merge, SPARQL 1.1 §13.2, would keep the two apart: two solutions).
 #[test]
 fn a_merge_of_listed_graphs_takes_no_shortcut_through_other_graphs() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -4184,6 +4186,10 @@ fn a_merge_of_listed_graphs_takes_no_shortcut_through_other_graphs() {
             tx.insert(quad("b", format!("x{i}"), g).as_ref());
         }
         tx.insert(quad("b", format!("y{i}"), "g2").as_ref());
+    }
+    for g in ["g0", "g1"] {
+        let shared = nrese_rdf::BlankNode::new_unchecked("shared");
+        tx.insert(Quad::new(shared, ex("q"), ex("x"), ex(g)).as_ref());
     }
     tx.commit().unwrap();
     let snapshot = engine.snapshot();
@@ -4201,6 +4207,11 @@ fn a_merge_of_listed_graphs_takes_no_shortcut_through_other_graphs() {
         ),
         (
             format!("SELECT (COUNT(*) AS ?n) {from} WHERE {{ ?b <{EX}p> ?c }}"),
+            1,
+            None,
+        ),
+        (
+            format!("SELECT * {from} WHERE {{ ?s <{EX}q> ?o }}"),
             1,
             None,
         ),
