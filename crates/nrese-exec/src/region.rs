@@ -12,11 +12,12 @@
 //!
 //! - **Huge pages.** On Linux a region is advised `MADV_NOHUGEPAGE` while it grows: a
 //!   transparent huge page makes 2 MiB resident for the first byte touched, and 256 shards
-//!   growing at once each touch new ones. Once its holder says it is final
-//!   ([`Region::settle`]), the part of it whose huge pages lie wholly inside what it holds
-//!   is advised `MADV_HUGEPAGE`: the dictionary reads it for good, and queries over memory
-//!   a load left on small pages ran 2 to 5 % slower (fleet pm-thp-attrib-1, 19 Oct 2026).
-//!   Only the region's own range is advised: no process setting changes.
+//!   growing at once each touch new ones. A region never advises huge pages: its holder
+//!   settles it ([`Region::settle`]) into a [`Settled`], which has no way to grow or shrink,
+//!   and only then is the part whose huge pages lie wholly inside its charged pages advised
+//!   `MADV_HUGEPAGE`. The dictionary reads it for good, and queries over memory a load left
+//!   on small pages ran 2 to 5 % slower (fleet pm-thp-attrib-1, 19 Oct 2026). Only the
+//!   region's own range is advised: no process setting changes.
 //! - **Charging.** Bytes are charged to the region's [`Reservation`] before pages are
 //!   made for them and released after they are given back, at most [`STEP`] at a time;
 //!   a region grows by an eighth of what it holds (a page at least) and never past the
@@ -196,10 +197,79 @@ impl<T: Copy, B: Deref<Target = Budget>> Region<T, B> {
         self.pages.map.shrink(keep, &mut self.held);
     }
 
-    /// Says its items are final: huge pages may back what it holds from now on (module
-    /// docs). Charges nothing: the advice covers only whole huge pages inside its pages.
-    pub fn settle(&mut self) {
-        self.pages.map.settle();
+    /// Its items, final: the pages past them given back, and huge pages advised for the
+    /// whole ones inside what is left (module docs). A settled region only reads.
+    pub fn settle(mut self) -> Settled<T, B> {
+        self.shrink_to_fit();
+        self.pages.map.advise_settled();
+        Settled {
+            pages: self.pages,
+            held: self.held,
+        }
+    }
+}
+
+// `as_atomic` views a page-aligned `u64` array as atomics; where `AtomicU64` needs more
+// alignment than `u64` (32-bit x86) that is unsound for an item that isn't page-aligned,
+// and such targets aren't supported: they don't build.
+const _: () = assert!(align_of::<u64>() == align_of::<AtomicU64>());
+
+impl<B: Deref<Target = Budget>> Region<u64, B> {
+    /// Its items as atomics, for threads that write them in parallel.
+    pub fn as_atomic(&mut self) -> &[AtomicU64] {
+        let Some(base) = self.pages.map.base else {
+            return &[];
+        };
+        // SAFETY: a mapping is page-aligned, so aligned for `AtomicU64`, which has the size
+        // and alignment of `u64`; its first `len` items were written, and `&mut self` keeps
+        // any other view of them away while these are lent.
+        unsafe { std::slice::from_raw_parts(base.as_ptr().cast(), self.pages.len) }
+    }
+}
+
+/// A region whose items are final ([`Region::settle`]): read, taken apart or dropped,
+/// never grown or shrunk, so huge pages advised over it stay inside its charge.
+///
+/// ```
+/// # use nrese_exec::{Budget, Region};
+/// let budget = Budget::new(1 << 20);
+/// let mut region = Region::<u64, &Budget>::new(&budget, 1000).unwrap();
+/// region.push(7).unwrap();
+/// let settled = region.settle();
+/// assert_eq!((settled.len(), settled[0]), (1, 7));
+/// ```
+///
+/// It has no way to grow:
+///
+/// ```compile_fail,E0599
+/// # use nrese_exec::{Budget, Region};
+/// let budget = Budget::new(1 << 20);
+/// let mut settled = Region::<u64, &Budget>::new(&budget, 1000).unwrap().settle();
+/// settled.push(7).unwrap();
+/// ```
+///
+/// or to shrink, then grow again into pages its advice covered (Sol's review of eb6ca4fc):
+///
+/// ```compile_fail,E0599
+/// # use nrese_exec::{Budget, Region};
+/// let budget = Budget::new(1 << 20);
+/// let mut settled = Region::<u64, &Budget>::new(&budget, 1000).unwrap().settle();
+/// settled.shrink_to_fit();
+/// ```
+pub struct Settled<T: Copy, B: Deref<Target = Budget> = Arc<Budget>> {
+    /// Before `held`, as in [`Region`].
+    pages: Pages<T>,
+    held: Reservation<B>,
+}
+
+impl<T: Copy, B: Deref<Target = Budget>> Settled<T, B> {
+    /// The bytes held: what its pages were charged.
+    pub fn charged(&self) -> usize {
+        self.held.bytes()
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        &self.pages
     }
 
     /// Its pages, and the reservation of their bytes, for a holder that keeps the charge
@@ -209,14 +279,11 @@ impl<T: Copy, B: Deref<Target = Budget>> Region<T, B> {
     }
 }
 
-impl<B: Deref<Target = Budget>> Region<u64, B> {
-    /// Its items as atomics, for threads that write them in parallel.
-    pub fn as_atomic(&mut self) -> &[AtomicU64] {
-        // SAFETY: `items()` is page-aligned (or dangling and aligned for an empty region),
-        // so aligned for `AtomicU64`, which has the size of `u64`; the first `len` items
-        // were written, and `&mut self` keeps any other view of them away while these are
-        // lent.
-        unsafe { std::slice::from_raw_parts(self.pages.items().cast(), self.pages.len) }
+impl<T: Copy, B: Deref<Target = Budget>> Deref for Settled<T, B> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        &self.pages
     }
 }
 
@@ -353,8 +420,9 @@ impl Mapping {
         self.held = keep;
     }
 
-    /// Huge pages advised for the whole ones inside what it holds.
-    fn settle(&self) {
+    /// Huge pages advised for the whole ones inside what it holds: only for a
+    /// [`Settled`] region, whose held bytes no longer change.
+    fn advise_settled(&self) {
         let Some(base) = self.base else {
             return;
         };
@@ -677,8 +745,9 @@ mod tests {
                     (region.len() * 8).next_multiple_of(sys::page())
                 );
             }
-            region.settle();
-            let (pages, held) = region.into_parts();
+            let settled = region.settle();
+            assert_eq!(settled.charged(), budget.used());
+            let (pages, held) = settled.into_parts();
             assert_eq!(pages[5], 10, "5, and 5 added through its atomic");
             drop(pages);
             drop(held);
@@ -695,6 +764,41 @@ mod tests {
         assert_eq!((region.charged(), small.used()), (charged, charged));
         drop(region);
         assert_eq!(small.used(), 0);
+    }
+
+    /// A settled region is resident within its charge: its huge pages are advised only
+    /// where they lie wholly inside its pages, so collapsing every one the kernel lets
+    /// (`khugepaged` does it in time, `MADV_COLLAPSE` at once) fills none past them.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn a_settled_region_stays_resident_within_its_charge() {
+        /// Linux 6.1's synchronous collapse (not in libc for every target).
+        const MADV_COLLAPSE: libc::c_int = 25;
+        let page = sys::page();
+        let budget = Budget::new(64 << 20);
+        let mut region: Region<u8, &Budget> = Region::new(&budget, 32 << 20).unwrap();
+        // Past a few huge pages, ending inside one.
+        region
+            .extend_from_slice(&vec![1; (6 << 20) + 3 * page + 5])
+            .unwrap();
+        let settled = region.settle();
+        let (base, mapped) = (settled.as_ptr().cast_mut(), settled.pages.map.mapped);
+        for at in (base.addr().next_multiple_of(HUGE)..base.addr() + mapped).step_by(HUGE) {
+            // SAFETY: advice on a huge page of the region's own mapping, which never
+            // changes its contents; refused (outside the advised part), it does nothing.
+            let _ = unsafe { libc::madvise(base.with_addr(at).cast(), HUGE, MADV_COLLAPSE) };
+        }
+        let mut resident = vec![0u8; mapped / page];
+        // SAFETY: `resident` has a byte for each page of the mapping at `base`.
+        let done = unsafe { libc::mincore(base.cast(), mapped, resident.as_mut_ptr()) };
+        assert_eq!(done, 0, "mincore of the region's mapping");
+        let resident = resident.iter().filter(|&&r| r & 1 != 0).count() * page;
+        let charged = settled.charged();
+        assert!(
+            resident <= charged,
+            "{resident} bytes resident, {charged} charged"
+        );
+        assert!(settled.iter().all(|&b| b == 1));
     }
 
     /// The boundaries (Sol's review of 6112f533): each row an edge a region must hold.
