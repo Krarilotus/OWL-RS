@@ -2106,7 +2106,7 @@ impl<'a> Context<'a> {
         // Graph by graph: the pattern in each named graph, with the variable bound to it.
         let graphs: Vec<TermId> = match &self.named {
             Some(named) => named.clone(),
-            None => self.snapshot.named_graphs().collect(),
+            None => self.snapshot.named_graphs_in(self.model).collect(),
         };
         let mut all: Option<Solutions> = None;
         for graph in graphs {

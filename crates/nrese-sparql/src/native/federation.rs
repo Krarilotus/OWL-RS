@@ -173,7 +173,9 @@ impl Context<'_> {
             let table = match &self.canonical {
                 None => import(&results, |term| self.id(term)),
                 Some(names) => import(&results, |term| {
-                    names.lookup(term.as_ref()).unwrap_or_else(|| self.id(term))
+                    names
+                        .id(term)
+                        .unwrap_or_else(|| self.id(&names.term(term.clone())))
                 }),
             };
             let solutions = self.produced(Solutions {

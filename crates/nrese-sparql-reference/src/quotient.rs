@@ -8,16 +8,18 @@
 //! answers is used: not its canonical reads, its rewrite of the query, nor its handling
 //! of `IRI()`.
 //!
-//! A triple term is one term, as in the store's classes: its parts are not replaced.
+//! A triple term's class is that of its parts: it is replaced part by part.
 
 use std::collections::HashMap;
 
 use nrese_engine::{ReadModel, Snapshot};
-use nrese_rdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use nrese_rdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
 use nrese_sparql::QueryOptions;
 use nrese_sparql_syntax::Query;
 use nrese_sparql_syntax::algebra::{GraphPattern, PropertyPathExpression};
-use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
+use nrese_sparql_syntax::term::{
+    GroundTerm, GroundTriple, NamedNodePattern, TermPattern, TriplePattern,
+};
 
 use crate::Dataset;
 
@@ -54,6 +56,14 @@ impl Names {
 
     /// `term`'s representative (`term` outside every class).
     pub(crate) fn term(&self, term: Term) -> Term {
+        if let Term::Triple(t) = &term {
+            let subject = NamedOrBlankNode::try_from(self.term(t.subject.clone().into()));
+            if let Ok(subject) = subject {
+                let triple =
+                    Triple::new(subject, self.iri(&t.predicate), self.term(t.object.clone()));
+                return triple.into();
+            }
+        }
         self.0.get(&term).cloned().unwrap_or(term)
     }
 
@@ -97,7 +107,27 @@ impl Names {
                 Term::Literal(m) => TermPattern::Literal(m),
                 _ => t.clone(),
             },
+            TermPattern::Triple(t) => TermPattern::Triple(Box::new(TriplePattern {
+                subject: self.term_pattern(&t.subject),
+                predicate: self.predicate(&t.predicate),
+                object: self.term_pattern(&t.object),
+            })),
             other => other.clone(),
+        }
+    }
+
+    fn ground(&self, t: &GroundTerm) -> GroundTerm {
+        match t {
+            GroundTerm::NamedNode(n) => GroundTerm::NamedNode(self.iri(n)),
+            GroundTerm::Literal(l) => match self.term(l.clone().into()) {
+                Term::Literal(m) => GroundTerm::Literal(m),
+                _ => t.clone(),
+            },
+            GroundTerm::Triple(g) => GroundTerm::Triple(Box::new(GroundTriple {
+                subject: self.iri(&g.subject),
+                predicate: self.iri(&g.predicate),
+                object: self.ground(&g.object),
+            })),
         }
     }
 
@@ -194,16 +224,7 @@ impl Names {
                     .iter()
                     .map(|row| {
                         row.iter()
-                            .map(|t| {
-                                t.as_ref().map(|t| match t {
-                                    GroundTerm::NamedNode(n) => GroundTerm::NamedNode(self.iri(n)),
-                                    GroundTerm::Literal(l) => match self.term(l.clone().into()) {
-                                        Term::Literal(m) => GroundTerm::Literal(m),
-                                        _ => t.clone(),
-                                    },
-                                    GroundTerm::Triple(_) => t.clone(),
-                                })
-                            })
+                            .map(|t| t.as_ref().map(|t| self.ground(t)))
                             .collect()
                     })
                     .collect(),

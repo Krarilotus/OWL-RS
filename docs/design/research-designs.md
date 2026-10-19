@@ -89,14 +89,21 @@ asserted model is answered as stored.
   own quotient of the explicitly expanded closure (`nrese-sparql-reference`'s
   `quotient`, `nrese-sparql/tests/it/equality_answer_tests.rs`). GraphDB's equivalent
   (`FROM onto:disable-sameAs`) documents lost solutions for filters over URIs instead.
-- **Refused** (`Unsupported`), not answered: a query that builds or takes apart a triple
-  term (`TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, a triple pattern with a variable
-  inside). The quotient would make `<<( alias p o )>>` and `<<( rep p o )>>` one term, which
-  the store can't represent (the second is in no dictionary a read could intern it in);
-  mapping parts only where they are taken apart makes the composing and the decomposing
-  forms disagree. A triple term passing through as a value is one term and answered. A
-  store with a literal in a class is refused as well: every literal an expression
-  computes would need the mapping.
+- **Triple terms**: a triple term's class is that of its parts. Where every triple term
+  the store holds is over representatives, they answer as any term: a triple term the
+  query writes (a pattern, `VALUES`, `TRIPLE()`'s constants) is put in over
+  representatives, and one the evaluation builds or takes apart is made of them.
+  **Refused** (`Unsupported`), not answered: canonical queries over a store holding a
+  triple term that names another identity than its representative (at any depth;
+  `Snapshot::triple_terms_name_aliases`, a seek in the object index, once per version).
+  In the quotient that term and its representatives' are one, which no stored id stands
+  for and no read can intern; answering it as one term would tell identities apart
+  (`DISTINCT` over `<<( alias p o )>>` and `<<( rep p o )>>`). A store with a literal in a
+  class is refused as well: every literal an expression computes would need the mapping.
+  Congruence over such stores is a v2.0 follow-up (v2-programme.md).
+- **A view, not a rewrite**: the canonical model reads its own view of the version (named
+  graphs over representatives, kept beside the version); the asserted model and a
+  snapshot read as stored see the statements as stored.
 - The completeness status makes no claim of its own here: it refers to the regime's
   certain answers, and canonical answers are those, up to the naming above.
 - Not reserved: the classes and the canonical version are the version's, made once
