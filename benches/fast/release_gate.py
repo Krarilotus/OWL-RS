@@ -1474,8 +1474,8 @@ def main() -> int:
               + ", ".join(f"{c} ({e['noise']:.3f}, {e['power']:.2f})" for c, e in sorted(under.items())))
         return 0
     if args.command == "blocks":
-        plan = json.loads(args.plan.read_text(encoding="utf-8"))
-        found = blocks(plan["run"], read_measure(args.measure.read_text(encoding="utf-8"))
+        gate_plan = json.loads(args.plan.read_text(encoding="utf-8"))
+        found = blocks(gate_plan["run"], read_measure(args.measure.read_text(encoding="utf-8"))
                        if args.measure.is_file() else {})
         for k, cases in enumerate(found, start=1):
             (args.out / f"plan-block-{k}.json").write_text(json.dumps({"run": cases, "not_run": {}, "elsewhere": {}},
