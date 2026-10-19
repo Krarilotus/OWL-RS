@@ -243,12 +243,32 @@ impl Postings {
 
     /// The documents of `corpus`, with their occurrences.
     fn decode(&self, corpus: &Corpus) -> Vec<(u64, u16)> {
+        // The representation's test hoisted out of the loop: a bit, or a member list walked
+        // forward with the postings (both ascending).
+        match &corpus.members {
+            Members::Bits(bits) => self.decode_where(|document| {
+                let word = (document / 64) as usize;
+                word < bits.len() && bits[word] >> (document % 64) & 1 == 1
+            }),
+            Members::Sorted(sorted) => {
+                let mut at = 0;
+                self.decode_where(|document| {
+                    at += sorted[at..].partition_point(|&member| member < document);
+                    sorted.get(at) == Some(&document)
+                })
+            }
+        }
+    }
+
+    /// The documents `keep` takes (asked in ascending order), with their occurrences.
+    #[inline]
+    fn decode_where(&self, mut keep: impl FnMut(u64) -> bool) -> Vec<(u64, u16)> {
         let mut out = Vec::with_capacity(self.len as usize);
         let (mut position, mut document) = (0, 0u64);
         for _ in 0..self.len {
             document += get_varint(&self.bytes, &mut position);
             let count = get_varint(&self.bytes, &mut position) as u16;
-            if corpus.contains(document) {
+            if keep(document) {
                 out.push((document, count));
             }
         }
@@ -320,15 +340,6 @@ enum Members {
 }
 
 impl Corpus {
-    fn contains(&self, document: u64) -> bool {
-        match &self.members {
-            Members::Sorted(sorted) => sorted.binary_search(&document).is_ok(),
-            Members::Bits(bits) => bits
-                .get((document / 64) as usize)
-                .is_some_and(|word| word >> (document % 64) & 1 == 1),
-        }
-    }
-
     /// Its documents (the indexed ones: literals with a word).
     pub fn documents(&self) -> u64 {
         self.documents
