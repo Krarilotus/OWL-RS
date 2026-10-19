@@ -56,6 +56,11 @@ fn triple(s: &str, p: &str, o: &str) -> TriplePattern {
 /// which the planner's own budget is to cover.
 const PLAN_BOOKKEEPING_BYTES: usize = 640;
 
+/// What a column of an operator's input adds to its bookkeeping, per call: its variable, its
+/// header in the input's, the output's and each running chunk's column lists, a row slot
+/// (19 Oct: about 122 bytes a column, the same at two chunks and at sixteen).
+const COLUMN_BOOKKEEPING_BYTES: usize = 128;
+
 /// Sol's case (review of 2b6ddbb7): 100 statements in two listed graphs under one-byte
 /// request and server budgets, `LIMIT 100` refused with nothing left charged. And
 /// measured, beyond the engine's own scan or probes, with the inputs made inside the
@@ -131,9 +136,12 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
         excess.saturating_sub(engine_scan)
     };
     // What an index join holds uncharged beyond the engine's probes, for `rows` input rows
-    // (one key, one match in each of two graphs), in the order the index reads or not:
-    // sorted first, then probed in parallel chunks past two chunks' rows.
-    let probed_rows = |rows: usize, ordered: bool| -> usize {
+    // `width` columns wide (one key, one match in each of two graphs), in the order the
+    // index reads or not: sorted first, then probed in parallel chunks past two chunks' rows.
+    // The least of three measurements: the thread pool's own bookkeeping now and then
+    // allocates a little while one runs (144 bytes, at either size); what grows with the
+    // rows shows in every one.
+    let probed_rows = |rows: usize, ordered: bool, width: usize| -> usize {
         let engine = store(["g0", "g1"].map(|g| ("hub".to_owned(), "q", "o".to_owned(), g)));
         let snapshot = engine.snapshot();
         let envelope = Envelope::unlimited();
@@ -151,24 +159,38 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
         })
         .1;
         let shared = [Variable::new_unchecked("b")];
-        let (joined, excess) = measure_within(&envelope, || {
-            // The input made and charged inside the measurement, charged before it is made.
-            let mut held = Reservation::new(&*ctx.budget);
-            held.charge(rows * 8).unwrap();
-            let mut table = IdTable::with_capacity(1, rows);
-            for _ in 0..rows {
-                table.push_row(&[hub.raw()]);
-            }
-            held.transfer();
-            let left = Solutions {
-                vars: shared.to_vec(),
-                table,
-                ordered,
-            };
-            ctx.probe_join(left, &scan, &shared).ok().expect("the join")
-        });
-        assert_eq!(joined.table.len(), rows);
-        excess.saturating_sub(engine_probes)
+        let vars: Vec<Variable> = (0..width)
+            .map(|i| match i {
+                0 => shared[0].clone(),
+                _ => Variable::new_unchecked(format!("v{i}")),
+            })
+            .collect();
+        let row = vec![hub.raw(); width];
+        (0..3)
+            .map(|_| {
+                let (joined, excess) = measure_within(&envelope, || {
+                    // The input made and charged inside the measurement, charged before it
+                    // is made.
+                    let mut held = Reservation::new(&*ctx.budget);
+                    held.charge(rows * width * 8).unwrap();
+                    let mut table = IdTable::with_capacity(width, rows);
+                    for _ in 0..rows {
+                        table.push_row(&row);
+                    }
+                    held.transfer();
+                    let left = Solutions {
+                        vars: vars.clone(),
+                        table,
+                        ordered,
+                    };
+                    ctx.probe_join(left, &scan, &shared).ok().expect("the join")
+                });
+                assert_eq!(joined.table.len(), rows);
+                ctx.consumed(joined);
+                excess.saturating_sub(engine_probes)
+            })
+            .min()
+            .expect("three")
     };
     // What an index join holds uncharged beyond the engine's probes, for a key's `fanout`
     // matches in each of three graphs.
@@ -215,31 +237,42 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
     };
     // Each row scales one dimension that grows with the data: the rows a LIMIT streams
     // (plain, and projected on unbound variables: columns made per row), a key's matches,
-    // and an index join's input rows, kept in order or sorted first (two chunks against
-    // sixteen, both on the parallel path).
+    // and an index join's input rows, kept in order or sorted first, and 32 columns wide
+    // (two chunks against sixteen, both on the parallel path). Each is bounded by its
+    // plan's bookkeeping.
     let unbound = ["s", "o", "missing0", "missing1"];
-    for (operator, one, many) in [
-        ("streamed LIMIT", streamed(1, &[]), streamed(10_000, &[])),
+    for (operator, one, many, columns) in [
+        ("streamed LIMIT", streamed(1, &[]), streamed(10_000, &[]), 0),
         (
             "streamed LIMIT, unbound projected",
             streamed(2_000, &unbound),
             streamed(10_000, &unbound),
+            0,
         ),
-        ("index join", probed(1), probed(5_000)),
+        ("index join", probed(1), probed(5_000), 0),
         (
             "index join, input in order",
-            probed_rows(8_192, true),
-            probed_rows(65_536, true),
+            probed_rows(8_192, true, 1),
+            probed_rows(65_536, true, 1),
+            0,
         ),
         (
             "index join, input sorted",
-            probed_rows(8_192, false),
-            probed_rows(65_536, false),
+            probed_rows(8_192, false, 1),
+            probed_rows(65_536, false, 1),
+            0,
+        ),
+        (
+            "index join, wide input",
+            probed_rows(8_192, true, 32),
+            probed_rows(65_536, true, 32),
+            32,
         ),
     ] {
         assert_eq!(many, one, "{operator}: uncharged bytes grow with the rows");
+        let bound = PLAN_BOOKKEEPING_BYTES + columns * COLUMN_BOOKKEEPING_BYTES;
         assert!(
-            one <= PLAN_BOOKKEEPING_BYTES,
+            one <= bound,
             "{operator}: {one} uncharged bytes, more than the plan's bookkeeping"
         );
     }

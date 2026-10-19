@@ -3803,11 +3803,14 @@ impl<'a> Context<'a> {
             probe.rows(0..rows, &cancelled)
         } else {
             // The chunks' lists (their results, then their tables and their charges apart,
-            // then the tables joined), charged first: a few entries a chunk.
+            // then the tables joined) and each chunk's own column list and row buffer, a
+            // column header and a value a column, charged first: the chunks grow with the
+            // input's rows.
             let chunks = rows.div_ceil(PROBE_CHUNK);
             let entry = size_of::<Result<(IdTable, Reservation<&Budget>), ProbeStop>>();
+            let columns = vars.len() * (size_of::<Vec<u64>>() + size_of::<u64>());
             let mut lists = Reservation::new(&*self.budget);
-            match lists.charge(chunks.saturating_mul(4 * entry)) {
+            match lists.charge(chunks.saturating_mul(4 * entry + columns)) {
                 Err(exceeded) => Err(ProbeStop::Memory(exceeded)),
                 Ok(()) => {
                     let parts: Vec<Result<_, ProbeStop>> = (0..chunks)
