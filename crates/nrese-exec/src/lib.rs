@@ -52,7 +52,7 @@ pub use budget::{
 #[global_allocator]
 static MEASURED: measure::Measured<std::alloc::System> = measure::Measured(std::alloc::System);
 pub use join::RowLimit;
-pub use region::{BoundTooLarge, Pages, Region};
+pub use region::{BoundTooLarge, Pages, Region, Settled};
 pub use table::IdTable;
 
 /// A hash map keyed by term ids, with the fast hasher the operators use.
