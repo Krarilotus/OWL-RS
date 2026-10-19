@@ -282,6 +282,13 @@ arises, the same for every side:
   side, whatever the case's own arguments say, and records it per case. A case whose runs are
   what it measures (a first execution, a reopened store, a replayed log, a sweep, commits) is
   left as it is. Repeated processes pool their samples.
+- *Fresh processes where the noise is between them.* The same binary doing the same work
+  (identical work counters in every process) takes a different time in each process: its
+  memory layout (address randomisation, hash seeds) differs, and in-process repeats can't
+  average that. Where a case misses the target even at eight passes, a pass runs up to five
+  fresh processes (15 s together at most), the perf lab's `repeat`, a DL tool's `processes`
+  (its `repeat` repeats inside one process). Layouts are averaged over, never pinned: one
+  fixed layout would make its luck a repeatable difference between binaries.
 - *Batched timing for the microsecond cases* (`perf_lab --batch K`: a sample times K executions,
   reported per execution to the nanosecond): a 9 µs query is nine steps of the report's
   microsecond, alone. It needs every side's perf lab to have it (the build's `CAPABILITIES`,
@@ -289,7 +296,13 @@ arises, the same for every side:
   resolution, 5 µs / K (`judge`'s `resolution`): the 5 µs floor is the report's microsecond
   steps, which a batch divides. v1.5's and main's perf labs can't batch, so against them a loss
   below 5 µs (a 2 % loss under 250 µs) stays undecidable; the gate whose baselines batch (v2's
-  successors against v2) decides them.
+  successors against v2) decides them. Likewise a series reported in coarser steps (an older
+  perf lab's open time in whole milliseconds, the EL classifier's phases to a tenth) is judged
+  at its step: a difference of one step is no verdict (`release_gate.py quantum`).
+- *Nothing timed that the gate doesn't judge.* A gate's pass doesn't rerun a case past its
+  limit (the frontier rerun: 226 s of a 1,018 s pass), and a case with a declared outcome (a
+  known limit, whose status the gate checks but never times) runs in the first block only, two
+  passes a side.
 - *Passes where the noise needs them.* Each case's noise (the largest sd of log pass medians
   among its series whose 2 % is above the resolution) sets the passes a side for 90 % power
   against a 2 % loss, the confirm-on-rerun chain simulated as for the table above

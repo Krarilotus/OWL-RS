@@ -648,6 +648,16 @@ class NoiseReduction(unittest.TestCase):
         self.assertEqual(summary["comparisons"]["main"]["lab-olympics"]["dimensions"]["time/q01"]["verdict"],
                          "neutral")
 
+    def test_a_series_in_coarse_steps_is_judged_at_its_step(self):
+        # An older perf lab's open_s (seconds to three decimals): 4 or 5 ms, one step apart.
+        def records_of(side, n):
+            return [record(samples={"open": [5.0, 5.0, 4.0] if side == "cand" else [4.0, 4.0, 5.0]})]
+        summary = run_gate(passes(records_of))
+        self.assertEqual(summary["comparisons"]["base"]["lab-olympics"]["dimensions"]["time/open"]["verdict"],
+                         "neutral")
+        self.assertEqual(gate_module.quantum([[[4.0, 5.0]], [[17.4, 5.5]]]), 0.1)
+        self.assertEqual(gate_module.quantum([[[0.0091, 4.0]]]), 0.0)
+
     def test_calibrate_buys_runs_where_cheap_and_passes_where_noise_needs_them_within_budget(self):
         # Power at 4 passes falls from 1 (sd 0.1 %) to 0 (sd 10 %); 16 passes hold it to 2.5 %.
         table = {"grid": [0.001, 0.1], **{str(n): [1.0, max(0.0, (n - 4) / 12 * 0.9)] for n in range(4, 17, 2)}}

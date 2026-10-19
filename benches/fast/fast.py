@@ -394,8 +394,10 @@ PREPARED = "PREPARED.json"
 # `batch`: executions a timed sample (perf_lab --batch), of the queries `batch_queries` names
 # (all without), applied only with `run --batch`, when every side's perf lab has it (the
 # gate's CAPABILITIES).
+# `processes`: a DL tool's fresh processes a pass, pooled (its `repeat` runs inside one process;
+# a process's memory layout, hence its time, differs from the next one's).
 MEASURE: dict[str, dict] = {}
-MEASURED_KEYS = ("runs", "warmup", "repeat", "batch", "batch_queries")
+MEASURED_KEYS = ("runs", "warmup", "repeat", "batch", "batch_queries", "processes")
 
 
 def load_measure(path: Path) -> tuple[dict[str, dict], str]:
@@ -428,8 +430,9 @@ def measured(case: dict) -> dict:
                 value = ",".join(m[key]) if key == "batch_queries" else m[key]
                 args = with_flag(args, "--" + key.replace("_", "-"), value)
         case["args"] = args
-    if "repeat" in m:
-        case["repeat"] = m["repeat"]
+    for key in ("repeat", "processes"):
+        if key in m:
+            case[key] = m[key]
     return case
 
 
@@ -708,7 +711,9 @@ def run_case(case: dict, label: str, rep: int) -> dict:
         waited = time.monotonic() - waited
         warmed = warm_inputs(case)
         record = measure(case, label, rep, expect, alt_expect, data)
-        if rep == 1 and case.get("frontier") and record["status"] in LIMITS:
+        # Not in a gate's pass (--prepared): the rerun past the limit times nothing the gate
+        # judges, and took a quarter of a pass (dl-transitive-400: 226 of 1,018 s, 19 Oct 2026).
+        if rep == 1 and case.get("frontier") and record["status"] in LIMITS and not OPTIONS["prepared"]:
             record["frontier"] = frontier(case, label, rep, expect, alt_expect, data)
     record["slot_wait_s"] = round(waited, 1)
     # How the case was measured: the calibration's settings, if it has an entry, and the bytes
@@ -856,8 +861,14 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         envelope = str(int(case["cap_gb"] * 1024))
         command = ["/target/release/examples/tableau_consistency", "--timeout", timeout,
                    "--memory-mib", envelope, *files]
-        code, out, err, wall = container(name, case["cap_gb"], command, timeout=timeout_s)
-        rows = parse_tableau(out)
+        # Fresh processes (`processes`), their rows pooled; a failing one ends the case.
+        rows, wall = [], 0.0
+        for _ in range(int(case.get("processes", 1))):
+            code, out, err, w = container(name, case["cap_gb"], command, timeout=timeout_s)
+            rows += parse_tableau(out)
+            wall += w
+            if code != 0:
+                break
         # The tool names each file as it was given: natively, by its host path.
         named = native(data) if RUNTIME == "native" else data
         main = [r for r in rows if r["file"] == named]
@@ -881,8 +892,15 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         out_tsv = f"/out/{case['name']}.tsv"
         command = ["bash", "-c", f"/target/release/examples/{binary} --out {out_tsv} --repeat {repeat} {data}"
                                  f" && sha256sum {out_tsv} | cut -c1-16 && wc -l < {out_tsv}"]
-        code, out, err, wall = container(name, case["cap_gb"], command, timeout=timeout_s)
-        result = profile_line(err, out)
+        # Fresh processes (`processes`): each one's profile, pooled below; the last one's answer.
+        profiles, wall = [], 0.0
+        for _ in range(int(case.get("processes", 1))):
+            code, out, err, w = container(name, case["cap_gb"], command, timeout=timeout_s)
+            profiles.append(profile_line(err, out))
+            wall += w
+            if code != 0:
+                break
+        result = profiles[-1]
         lines = out.split()
         if code == 0 and len(lines) >= 2:
             result["hash"], result["subsumptions"] = lines[-2], int(lines[-1])
@@ -891,11 +909,14 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         total = result.get("total")
         if total is None and all(isinstance(result.get(k), float) for k in phases):
             total = sum(result[k] for k in phases)
-        result["whole_ms"] = total
-        result["samples_ms"] = [total] if total is not None else []
-        result["phase_samples"] = {k: [v] for k, v in result.items()
-                                   if k in ("read", "owl", "normalise", "compile", "prepare", "saturate", "assemble", "write")
-                                   and isinstance(v, float)}
+        totals = [pr.get("total") if pr.get("total") is not None else
+                  (sum(pr[k] for k in phases) if all(isinstance(pr.get(k), float) for k in phases) else None)
+                  for pr in profiles]
+        result["samples_ms"] = [x for x in totals if x is not None]
+        result["whole_ms"] = statistics.median(result["samples_ms"]) if result["samples_ms"] else total
+        result["phase_samples"] = {k: [pr[k] for pr in profiles if isinstance(pr.get(k), float)] for k in
+                                   ("read", "owl", "normalise", "compile", "prepare", "saturate", "assemble", "write")
+                                   if isinstance(result.get(k), float)}
         record["wall_s"] = round(wall, 2)
         if code != 0:
             record["status"] = classify_failure(code, err, result)
