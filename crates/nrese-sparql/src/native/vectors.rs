@@ -23,13 +23,15 @@
 //! | `nrv:exact` | `true`: compare every vector (else large spaces are searched through an HNSW graph) |
 //! | `nrv:searchBudget` | the graph search's beam (default 64): wider finds more of the true nearest |
 //!
-//! The subject is the matched vector literal. Only literals the query's dataset uses as
-//! objects are found (so a user sees no vector from a graph it may not read). When the
-//! rest of the query binds the subject first (`?doc ex:embedding ?v` above), the search
-//! is among those values only: an exact scan of them when they are few, the graph with a
-//! filter otherwise. The nearest `k` are returned per query vector, nearest first.
+//! The subject is the matched vector literal. The search is among the vector literals the
+//! query's active graph uses as objects at its snapshot (`Snapshot::vector_search_in`),
+//! every one compared: no vector of a graph the user may not read, of an open transaction
+//! or of another version is found, nor changes what is. When the rest of the query binds
+//! the subject first (`?doc ex:embedding ?v` above), the search is among those values
+//! only. The nearest `k` are returned per query vector, nearest first. `nrv:exact` and
+//! `nrv:searchBudget` are accepted; every search is exact.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use nrese_engine::vector::Metric;
 use nrese_engine::{TermId, VectorQuery, VectorSearchReport, VectorStrategy};
@@ -217,7 +219,6 @@ impl Context<'_> {
             }
         };
         let mut rows = Rows::new(&search);
-        let mut used: HashMap<u64, bool> = HashMap::new();
         for (near_id, vector) in queries {
             self.check()?;
             let accept = |id: TermId| {
@@ -229,13 +230,8 @@ impl Context<'_> {
                 &search,
                 vector,
                 candidates.as_ref().map(HashSet::len),
-                |query| self.snapshot.vector_search(query, &accept),
-                |id| {
-                    Ok((*used
-                        .entry(id.raw())
-                        .or_insert_with(|| self.used_as_object(id)))
-                    .then_some(()))
-                },
+                |query| self.vector_search(query, &accept),
+                |_| Ok(Some(())),
             )?;
             rows.push(
                 self,
@@ -283,11 +279,8 @@ impl Context<'_> {
             &search,
             vector.clone(),
             Some(estimate.ceil() as usize),
-            |query| self.snapshot.vector_search(query, &|_| true),
+            |query| self.vector_search(query, &|_| true),
             |id| {
-                if !self.used_as_object(id) {
-                    return Ok(None);
-                }
                 let mut table = IdTable::new(1);
                 table.push_row(&[id.raw()]);
                 let seed = self.produced(Solutions {
@@ -343,6 +336,28 @@ impl Context<'_> {
         self.join(local, found)
     }
 
+    /// The vector literals of the active graph's corpus nearest to `query.vector` among
+    /// those `accept` takes (`Snapshot::vector_search_in`), charged to the query's budget.
+    fn vector_search(
+        &self,
+        query: &VectorQuery,
+        accept: &(dyn Fn(TermId) -> bool + Sync),
+    ) -> NativeResult<(Vec<(TermId, f32)>, VectorSearchReport)> {
+        let Some((_charge, scope)) = self.text_scope()? else {
+            let report = VectorSearchReport {
+                space: 0,
+                graph: false,
+                scanned: 0,
+            };
+            return Ok((Vec::new(), report));
+        };
+        let found = self
+            .snapshot
+            .vector_search_in(self.model, &scope, query, accept, Some(&self.budget))
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        Ok(found)
+    }
+
     /// Merge sorted search rounds with retained, successfully probed candidates.
     /// O(fetched + k) per round, probing each ID at most once. Keeps at most k payloads
     /// between probes, plus one incoming probe; a displaced payload drops at once.
@@ -351,7 +366,7 @@ impl Context<'_> {
         search: &Search,
         vector: Vec<f32>,
         accepted: Option<usize>,
-        mut fetch: impl FnMut(&VectorQuery) -> (Vec<(TermId, f32)>, VectorSearchReport),
+        mut fetch: impl FnMut(&VectorQuery) -> NativeResult<(Vec<(TermId, f32)>, VectorSearchReport)>,
         mut keep: impl FnMut(TermId) -> NativeResult<Option<T>>,
     ) -> NativeResult<Vec<(TermId, f32, T)>> {
         let mut query = VectorQuery {
@@ -368,7 +383,7 @@ impl Context<'_> {
         let mut next = Vec::new();
         loop {
             self.check()?;
-            let (hits, report) = fetch(&query);
+            let (hits, report) = fetch(&query)?;
             let fetched = hits.len();
             let mut hits = hits.into_iter().peekable();
             let mut pending = kept.drain(..);
@@ -503,6 +518,7 @@ mod tests {
     use nrese_engine::Engine;
     use nrese_exec::SharedBudget;
     use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
 
     fn search(k: usize) -> Search {
         Search {
@@ -583,7 +599,7 @@ mod tests {
                         ],
                         _ => panic!("unnecessary search"),
                     };
-                    (hits(&values), report(100))
+                    Ok((hits(&values), report(100)))
                 },
                 |id| {
                     let id = id.raw();
@@ -674,10 +690,10 @@ mod tests {
                     Some(100),
                     |query| {
                         assert_eq!(query.accepted, Some(100));
-                        (
+                        Ok((
                             hits(&rounds.next().expect("two rounds suffice")),
                             report(100),
-                        )
+                        ))
                     },
                     |id| {
                         assert!(seen.insert(id.raw()), "each ID probed once");
@@ -709,7 +725,7 @@ mod tests {
                     |_| {
                         assert!(!fetched);
                         fetched = true;
-                        (hits(&values), report(space))
+                        Ok((hits(&values), report(space)))
                     },
                     |id| Ok((id.raw() != 0).then_some(())),
                 )
@@ -749,14 +765,14 @@ mod tests {
                     if round == 2 && stop == "fetch_cancel" {
                         token.cancel();
                     }
-                    (
+                    Ok((
                         if round == 1 {
                             hits(&[(0, 0.0), (8, 0.8), (9, 0.9)])
                         } else {
                             hits(&[(0, 0.0), (1, 0.1), (2, 0.2), (3, 0.3)])
                         },
                         report(100),
-                    )
+                    ))
                 },
                 |id| {
                     if id.raw() == 0 {
@@ -823,6 +839,9 @@ mod tests {
         let inner = pattern(
             "?v <urn:nrese:vector:near> \"[0]\" ; <urn:nrese:vector:k> 6 ; <urn:nrese:vector:metric> \"l2\" ; <urn:nrese:vector:exact> true",
         );
+        // The search's corpus kept first (the engine's): the budget below is the probes'.
+        let warm = Context::new(&snapshot, &QueryOptions::default(), None, None);
+        assert!(warm.vector_join(&local, &inner).is_ok());
         const UNRELATED: usize = 128;
         let options = QueryOptions {
             resources: crate::Resources {

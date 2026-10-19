@@ -198,14 +198,17 @@ pub(crate) enum Found {
     },
 }
 
-/// The terms of a statement a corpus may hold: its object if a string literal, its
-/// subject if an IRI (raw ids).
+/// The terms of a statement a corpus may hold: its object if a string literal or a typed
+/// one (a vector, for the corpora of vector searches), its subject if an IRI (raw ids).
 fn terms(
     subject: TermId,
     object: TermId,
 ) -> std::iter::Chain<std::option::IntoIter<u64>, std::option::IntoIter<u64>> {
-    let object =
-        matches!(object.kind(), TermKind::String | TermKind::LangString).then_some(object.raw());
+    let object = matches!(
+        object.kind(),
+        TermKind::String | TermKind::LangString | TermKind::TypedLiteral
+    )
+    .then_some(object.raw());
     let subject = (subject.kind() == TermKind::Iri).then_some(subject.raw());
     object.into_iter().chain(subject)
 }
