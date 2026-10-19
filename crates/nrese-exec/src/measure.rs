@@ -11,7 +11,8 @@
 //! The bytes asked of the allocator on every thread of the process (the operation's own,
 //! threads it starts, pools it hands work to), so a measured test runs [`alone`] in its
 //! process. Of these, a measurement counts only what was made while it ran:
-//! - a block, allocated while it ran, from its allocation to its free;
+//! - a block, allocated while it ran, from its allocation to its free, and so memory a
+//!   holder maps itself, outside the allocator, which reports it ([`mapped`]);
 //! - a [`Reservation`](crate::Reservation) made while it ran: its charges and releases;
 //! - a charge to its budget itself ([`Budget::charge`]) made while it ran, and of the
 //!   releases to the budget itself ([`Budget::release`]) no more than such charges hold.
@@ -228,6 +229,27 @@ fn allocated(size: usize, tag: u64) {
             c.rise(bytes(size));
         }
     });
+}
+
+/// Memory of `size` bytes that its holder mapped itself, outside the global allocator (a
+/// region's committed pages), counted as a block of generation `tag`: the generation
+/// [`tag`] gave when the holder was made, as a [`Reservation`](crate::Reservation) records
+/// its own, so that a measurement counts all of the holder's memory and charges, or none.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "until region.rs reports its pages: remove then")
+)]
+pub(crate) fn mapped(size: usize, tag: u64) {
+    allocated(size, tag);
+}
+
+/// Memory [`mapped`] with generation `tag`, unmapped.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "until region.rs reports its pages: remove then")
+)]
+pub(crate) fn unmapped(size: usize, tag: u64) {
+    freed(size, tag);
 }
 
 fn freed(size: usize, tag: u64) {
