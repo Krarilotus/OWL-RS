@@ -47,6 +47,7 @@ GATE=${NRESE_GATE_DIR:-$HOME/owlrs/${GATE_NAME:-gate-v2}}
 GATE_BIN=${GATE_BIN:-$HOME/owlrs/gate-v2-bin}
 OUT=${FLEET_OUT:-$GATE/results}
 SPARQL_DATA=${SPARQL_DATA:-$HOME/owlrs/sparql-data}
+SHARED=${NRESE_FAST_SHARED:-$HOME/owlrs/fast-data-shared}
 MAX_GB=${GATE_MAX_GB:-24}
 mkdir -p "$GATE" "$GATE_BIN" "$OUT"
 # A desktop's file indexer (GNOME's localsearch on phuoc-yu indexes all of $HOME) reads every
@@ -81,6 +82,9 @@ LAYOUTS=${GATE_LAYOUTS:-1}
 # The environment of a fast.py run on HARNESS's tree: native, the gate's data, nothing
 # written into the tree (the compact records go to the gate).
 fast_env() {
+  # The prepared data: one read-only copy per host, hardlinked into every gate's fast-data
+  # (fast.py prepare, NRESE_FAST_SHARED).
+  export NRESE_FAST_SHARED=$SHARED
   export NRESE_FAST_RUNTIME=native NRESE_FAST_DATA=$GATE/fast-data BENCH_GENERAL_DATA=$GATE/data \
     NRESE_FAST_QUERY_SETS=$GATE/query-sets NRESE_FAST_BASELINES=$GATE/compact NRESE_BENCH_REPORTS=$GATE/reports \
     NRESE_QUIET_SLOT=${NRESE_QUIET_SLOT:-0}
@@ -516,6 +520,8 @@ clean)
 ' ' ')
   [ -z "$swept" ] || log "clean: unused builds removed: $swept"
   git worktree prune
+  # Shared prepared data no gate has linked for two days (its last link's removal set its ctime).
+  [ -d "$SHARED/blobs" ] && find "$SHARED/blobs" -type f -links 1 -cmin +2880 -delete
   after=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
   log "clean: $(( (before - after) / 1048576 )) MiB reclaimed; kept the binaries, the data view, the prepared data, the results"
   ;;
