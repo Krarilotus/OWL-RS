@@ -259,6 +259,9 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     dirs = native_dirs()
     FAST_DATA.mkdir(parents=True, exist_ok=True)
     unit = f"{name}-{os.getpid()}-{int(time.monotonic() * 1000)}"
+    # The process's initial stack sits below its environment: a pad of random size each process
+    # moves it (Mytkowicz et al., ASPLOS 2009), on top of address randomisation.
+    pad = {"NRESE_LAYOUT_PAD": "x" * random.SystemRandom().randrange(0, 4096)}
     wrapper = ('g=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); "$@"; rc=$?; '
                'echo "fast-scope-peak $(cat "$g/memory.peak" 2>/dev/null)" >&2; p=; '
                'for r in cpu io memory; do p="$p $r=$(sed -n "s/^some .*total=//p" "$g/$r.pressure" 2>/dev/null)"; done; '
@@ -272,7 +275,7 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     cleanup_error = ""
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
-                              errors="replace", env={**ENV, **{k: str(v) for k, v in (env or {}).items()}},
+                              errors="replace", env={**ENV, **pad, **{k: str(v) for k, v in (env or {}).items()}},
                               pass_fds=tuple(map(int, os.environ.get("SUITE_LEASE_FDS", "").split())))
     except subprocess.TimeoutExpired:
         done = subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout} s")

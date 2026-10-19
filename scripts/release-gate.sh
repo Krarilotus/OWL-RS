@@ -7,7 +7,9 @@
 #   release-gate.sh build REV               REV's binaries, by REV's own toolchain, into GATE_BIN/bin-REV8-IDENTITY
 #   release-gate.sh prepare HARNESS         the plan, the data view and the cases' data, once, by
 #                                           HARNESS's generator; WatDiv's query sets checked
-#   release-gate.sh pass N SIDE REV HARNESS pass N: HARNESS's cases on REV's binaries, one repetition
+#   release-gate.sh pass N SIDE REV HARNESS [PLAN|-] [LAYOUT]
+#                                           pass N: HARNESS's cases on REV's binaries (its build of
+#                                           layout LAYOUT, GATE_LAYOUTS), one repetition
 #   release-gate.sh report HARNESS SIDE=REV ...   the timed part's report (the first SIDE the candidate)
 #   release-gate.sh w3c                     the W3C suites with their data required, their counts checked
 #   release-gate.sh guards                  every guard docs/design/performance.md §0 names, run and passed
@@ -69,6 +71,12 @@ worktree() {  # REV [DIR]: a clean worktree of the revision, made once
 
 # The builds by identity, this gate's pointer to each revision's (bin_of), the age sweep.
 . scripts/lib/gate-publish.sh
+# Layout L of a revision (GATE_LAYOUTS): 1 the plain build, L > 1 the same with its functions
+# linked in another order (rust-lld --shuffle-sections, seed L): a layout, not other code. Each
+# layout is a build of its own identity (build_identity REV L) and this gate's pointer.
+layout_bin() { bin_of "$1" "${2:-1}"; }
+verified() { build_verified "$1" "$2"; }
+LAYOUTS=${GATE_LAYOUTS:-1}
 
 # The environment of a fast.py run on HARNESS's tree: native, the gate's data, nothing
 # written into the tree (the compact records go to the gate).
@@ -91,11 +99,16 @@ case ${1:-} in
 build)
   rev=$(git rev-parse "$2") || exit 2
   export PATH=$HOME/.cargo/bin:$PATH
-  bin=$(identity_dir "$rev")
-  if build_verified "$bin" "$rev"; then
-    point "$rev" "$bin"
+  # Each layout's build by its identity: one there from before counts, the others are built.
+  todo=()
+  for L in $(seq 1 "$LAYOUTS"); do
+    lbin=$(identity_dir "$rev" "$L")
+    if build_verified "$lbin" "$rev"; then point "$rev" "$lbin" "$L"; else todo+=("$L"); fi
+  done
+  bin=$(identity_dir "$rev" 1)
+  if [ ${#todo[@]} -eq 0 ]; then
     cp "$bin/BUILD.txt" "$OUT/build-$(short "$rev").txt"
-    log "build $rev: verified binaries of its identity there from before ($bin)"; exit 0
+    log "build $rev: verified binaries of its identity there from before ($bin, $LAYOUTS layouts)"; exit 0
   fi
   # The source and build trees are this gate's own; the build is published under its identity.
   mkdir -p "$GATE/build" && src=$(worktree "$rev" "$GATE/build") || exit 2
@@ -107,10 +120,11 @@ build)
   [ -f "$lab" ] || lab=$src/crates/nrese-store/examples/perf_lab.rs
   patched=$(py benches/fast/patches/perf_lab_watchdog.py "$lab")
   case $patched in applied|present) timing=watchdog ;; *) timing=spawn ;; esac
-  log "build $rev ($(cd "$src" && rustc -V 2>/dev/null))"
+  log "build $rev ($(cd "$src" && rustc -V 2>/dev/null)); layouts to build: ${todo[*]}"
+  missing=()
+  if [ "${todo[0]}" = 1 ]; then
   part=$bin.partial-$$
   rm -rf "$part" && mkdir -p "$part/release/examples"
-  missing=()
   for spec in nrese-store:perf_lab nrese-store:ql_print_check nrese-dl:tableau_consistency \
               nrese-dl:context_classify nrese-reasoner:classify; do
     crate=${spec%%:*} example=${spec#*:}
@@ -137,10 +151,36 @@ build)
     echo "measurement patch perf_lab_watchdog: $patched";
     cat "$part/CAPABILITIES"; } > "$part/BUILD.txt"
   (cd "$part" && find release -type f | sort | xargs sha256sum > SHA256SUMS)
-  build_identity "$rev" > "$part/IDENTITY"
+  build_identity "$rev" 1 > "$part/IDENTITY"
   publish "$part" "$bin" || { log "build $rev: $bin is there but doesn't verify"; exit 1; }
-  point "$rev" "$bin"
+  point "$rev" "$bin" 1
+  fi
   cp "$bin/BUILD.txt" "$OUT/build-$(short "$rev").txt"
+  # Layouts 2..K: the timed tools linked with their functions in another order (seed L); the
+  # rest copied from layout 1. A linker that isn't LLD refuses the option: the build fails.
+  for L in "${todo[@]}"; do
+    [ "$L" -gt 1 ] || continue
+    lbin=$(identity_dir "$rev" "$L")
+    lpart=$lbin.partial-$$
+    rm -rf "$lpart" && cp -a "$bin" "$lpart" && rm -rf "$lpart/SHA256SUMS" "$lpart/IDENTITY" "$lpart/.refs"
+    for spec in nrese-store:perf_lab nrese-dl:tableau_consistency nrese-dl:context_classify nrese-reasoner:classify; do
+      crate=${spec%%:*} example=${spec#*:}
+      [ -e "$bin/release/examples/$example" ] || continue
+      (cd "$src" && RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--shuffle-sections=.text*=$L" \
+         bash scripts/cargo-guarded.sh build --release --locked --quiet -p "$crate" --example "$example") \
+        || { log "build of $example, layout $L, failed at $rev"; exit 1; }
+      cp "$CARGO_TARGET_DIR/release/examples/$example" "$lpart/release/examples/"
+    done
+    echo "$L" > "$lpart/LAYOUT"
+    echo "layout $L: the timed tools linked with --shuffle-sections=.text*=$L" >> "$lpart/BUILD.txt"
+    (cd "$lpart" && find release -type f | sort | xargs sha256sum > SHA256SUMS)
+    build_identity "$rev" "$L" > "$lpart/IDENTITY"
+    cmp -s "$bin/release/examples/perf_lab" "$lpart/release/examples/perf_lab" \
+      && { log "layout $L of $rev is byte-identical to layout 1: the shuffle didn't take"; exit 1; }
+    publish "$lpart" "$lbin" || { log "build $rev, layout $L: $lbin is there but doesn't verify"; exit 1; }
+    point "$rev" "$lbin" "$L"
+    log "built layout $L of $rev into $lbin"
+  done
   # The binaries stay; their build tree and source worktree go (a rebuild is rare).
   rm -rf "$CARGO_TARGET_DIR" && git worktree remove --force "$src"
   log "built $rev into $bin; missing: ${missing[*]:-none}; $(tr '\n' ' ' < "$bin/CAPABILITIES")"
@@ -238,12 +278,13 @@ pass)
   harness=$(git rev-parse "$5") || exit 2
   # A block's plan (plan-blocks), else the gate's.
   plan=$PLAN
-  if [ -n "${6:-}" ]; then
+  if [ -n "${6:-}" ] && [ "$6" != - ]; then
     plan=$GATE/$6
     [ -f "$plan" ] || { log "pass $n: no block plan $plan (plan-blocks first)"; exit 2; }
   fi
+  layout=${7:-1}
   tree=$(worktree "$harness") || exit 2
-  bin=$(bin_of "$rev")
+  bin=$(layout_bin "$rev" "$layout")
   [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS) \
     || { log "pass $n: no verified build of $rev"; exit 2; }
   mkdir -p "$OUT/passes"
@@ -269,7 +310,7 @@ pass)
   export NRESE_TIMED_GATE=1
   # A plan that can't be read (empty, half written) is no pass, never every case.
   cases=$(planned "$plan") && [ -n "$cases" ] || { log "pass $n: the plan $plan can't be read"; exit 2; }
-  log "pass $n: $side $rev on the cases of $harness, plan $(basename "$plan") (${flags[*]})"
+  log "pass $n: $side $rev, layout $layout, on the cases of $harness, plan $(basename "$plan") (${flags[*]})"
   # The host kept quiet while the pass runs (scripts/lib/quiet-watch.py, as the measurement
   # queue's timed chunks: this user's other busy processes stopped, other containers paused,
   # other users' work recorded); its verdict kept with the pass. GATE_QUIET=0: unwatched.
@@ -317,6 +358,7 @@ report)
      --require "$required" --harness-revision "$harness" --min-passes "${GATE_MIN_PASSES:-4}" --inputs "$GATE/inputs.txt" \
      --context "host=${GATE_HOST:-}" --context "round=${GATE_ROUND:-0}" --context "prefix=${GATE_PREFIX:-}" \
      --context "gate_name=${GATE_NAME:-}" --context "max_gb=$MAX_GB" --context "ram_gb=${GATE_RAM_GB:-$MAX_GB}" \
+     --context "layouts=$LAYOUTS" \
      --out "$OUT/release-gate.md" --json "$OUT/release-gate.json") > "$OUT/report.log" 2>&1
   code=$?
   log "timed part: $( [ $code -eq 0 ] && echo passed || echo 'not passed') ($OUT/release-gate.md)"
@@ -385,6 +427,10 @@ pack)
     [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS) \
       || { log "pack: no verified build of $rev"; exit 2; }
     dirs+=("$(basename "$bin")")
+    for L in $(seq 2 "$LAYOUTS"); do
+      verified "$(layout_bin "$rev" "$L")" "$rev" || { log "pack: no verified layout $L of $rev"; exit 2; }
+      dirs+=("$(basename "$(layout_bin "$rev" "$L")")")
+    done
   done
   mkdir -p "$OUT/binaries"
   # shellcheck disable=SC2046
@@ -409,7 +455,7 @@ unpack)
     done
     rev=$(cat "$aside/$bin/REVISION")
     publish "$aside/$bin" "$GATE_BIN/$bin" || { log "unpack: $GATE_BIN/$bin is there but doesn't verify"; exit 2; }
-    point "$rev" "$GATE_BIN/$bin"
+    point "$rev" "$GATE_BIN/$bin" "$(cat "$GATE_BIN/$bin/LAYOUT" 2>/dev/null || echo 1)"
     log "unpack: $bin verified ($rev)"
   done
   rm -rf "$aside"

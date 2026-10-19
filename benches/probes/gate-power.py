@@ -17,6 +17,12 @@ repeatable loss of a given size at that noise.
         the same where a series' loss below the gate's resolution (compare.RESOLUTION, 5 µs)
         counts as never caught, as the gate judges it (the agent's simulation leaves it out).
 
+    gate-power.py layout PASS.json... [--out layout.json]
+        passes of one revision built in several layouts (release-gate.sh GATE_LAYOUTS, each pass's
+        `binaries.layout`): per series, a one-way analysis of variance of the log pass medians by
+        layout; the layout's own component (sd), the rest's, and per case family (the case's area)
+        the median and the share of series whose layout component exceeds 0.5 % and 1 %.
+
 The simulation is the gate agent's of 18 Oct 2026 (the confirm-on-rerun receipts in PROTOCOL.md
 §5): one log-normal value a pass at the series' noise, the bootstrap over the passes (2,000
 draws), `judge`'s verdicts and the passes its `needs` estimate asks for. The noises are
@@ -69,6 +75,49 @@ def noise(paths: list[Path], min_ms: float) -> list[dict]:
                              "median_ms": st.median(meds), "meds": meds,
                              "sd": st.stdev(math.log(v) for v in meds)})
     return rows
+
+
+def layout_components(paths: list[Path], min_ms: float) -> list[dict]:
+    """Per series, the variance of its log pass medians split into the layouts' and the rest's."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "suite"))
+    from suitekit import cases as registry
+    areas = {c["name"]: c.get("area", "?") for c in registry.load()}
+    by: dict[tuple, dict[int, list[float]]] = {}
+    for path in paths:
+        report = json.loads(path.read_text(encoding="utf-8"))
+        layout = (report.get("binaries") or {}).get("layout", 1)
+        for key, values in pass_series(report).items():
+            by.setdefault(key, {}).setdefault(layout, []).append(st.median(values))
+    rows = []
+    for (case, series), groups in sorted(by.items()):
+        sizes = {len(v) for v in groups.values()}
+        if len(groups) < 2 or len(sizes) != 1 or min(sizes) < 2:
+            continue
+        n = sizes.pop()
+        logs = {k: [math.log(v) for v in vs] for k, vs in groups.items() if min(vs) > 0}
+        if len(logs) != len(groups) or st.median([v for vs in groups.values() for v in vs]) < min_ms:
+            continue
+        within = st.mean(st.variance(vs) for vs in logs.values())
+        between = n * st.variance([st.mean(vs) for vs in logs.values()])
+        layout_var = max(0.0, (between - within) / n)
+        rows.append({"case": case, "series": series, "area": areas.get(case, "?"), "layouts": len(groups),
+                     "per_layout": n, "median_ms": st.median([v for vs in groups.values() for v in vs]),
+                     "layout_sd": math.sqrt(layout_var), "rest_sd": math.sqrt(within),
+                     "f": between / within if within > 0 else math.inf})
+    return rows
+
+
+def layout_summary(rows: list[dict]) -> dict:
+    fam: dict[str, list[float]] = {}
+    for r in rows:
+        fam.setdefault(r["area"], []).append(r["layout_sd"])
+    every = [r["layout_sd"] for r in rows]
+    return {"series": len(rows),
+            "all": {"median": st.median(every) if every else None,
+                    "above_0.5pct": sum(s > 0.005 for s in every), "above_1pct": sum(s > 0.01 for s in every),
+                    "rest_median": st.median(r["rest_sd"] for r in rows) if rows else None},
+            "families": {a: {"series": len(v), "median": st.median(v), "above_0.5pct": sum(s > 0.005 for s in v),
+                             "above_1pct": sum(s > 0.01 for s in v), "max": max(v)} for a, v in sorted(fam.items())}}
 
 
 def summary(rows: list[dict]) -> dict:
@@ -181,6 +230,10 @@ def main() -> int:
     s.add_argument("reports", type=Path, nargs="+")
     s.add_argument("--min-ms", type=float, default=0.005)
     s.add_argument("--out", type=Path)
+    s = sub.add_parser("layout")
+    s.add_argument("reports", type=Path, nargs="+")
+    s.add_argument("--min-ms", type=float, default=0.005)
+    s.add_argument("--out", type=Path)
     s = sub.add_parser("power")
     s.add_argument("noise", type=Path)
     s.add_argument("--sims", type=int, default=400)
@@ -192,6 +245,12 @@ def main() -> int:
     if args.command == "noise":
         rows = noise(args.reports, args.min_ms)
         print(json.dumps(summary(rows), indent=1))
+        if args.out:
+            args.out.write_text(json.dumps(rows, indent=0), encoding="utf-8")
+        return 0
+    if args.command == "layout":
+        rows = layout_components(args.reports, args.min_ms)
+        print(json.dumps(layout_summary(rows), indent=1))
         if args.out:
             args.out.write_text(json.dumps(rows, indent=0), encoding="utf-8")
         return 0
