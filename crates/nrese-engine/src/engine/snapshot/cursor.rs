@@ -12,7 +12,7 @@
 //! answered by the snapshot's own scans (each counted as a search from the root).
 
 use super::Snapshot;
-use crate::engine::{ReadModel, Stack};
+use crate::engine::{ReadModel, Stack, Version};
 use crate::index::cursor::{SeekStats, StackCursor};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 
@@ -39,6 +39,10 @@ type Shape = ([bool; 4], usize);
 pub struct ProbeCursor<'a> {
     snapshot: &'a Snapshot,
     model: ReadModel,
+    /// What the model reads ([`Snapshot::data`]), and whether its patterns' constants are
+    /// put in by their representatives: decided once, not per probe.
+    data: &'a Version,
+    canonical: bool,
     /// Per stack (asserted, inferred): a cursor in the permutation the last probe read.
     stacks: [Option<StackCursor<'a>>; 2],
     /// The order the last leapfrog step read, for its pattern's shape (which positions
@@ -54,6 +58,11 @@ impl Snapshot {
         ProbeCursor {
             snapshot: self,
             model,
+            data: self.data(model),
+            canonical: matches!(
+                self.read_pattern(model, &QuadPattern::all()),
+                std::borrow::Cow::Owned(_)
+            ),
             stacks: [None, None],
             leapfrog: None,
             stats: SeekStats::default(),
@@ -65,7 +74,14 @@ impl<'a> ProbeCursor<'a> {
     /// Calls `f` with each quad matching `pattern`: what
     /// [`Snapshot::quads_for_pattern_in`] yields, asserted matches first.
     pub fn for_each(&mut self, pattern: &QuadPattern, mut f: impl FnMut(EncodedQuad)) {
-        let pattern = &self.snapshot.read_pattern(self.model, pattern);
+        let normalised;
+        let pattern = match self.canonical {
+            true => {
+                normalised = self.snapshot.read_pattern(self.model, pattern).into_owned();
+                &normalised
+            }
+            false => pattern,
+        };
         if self.unseekable(pattern) {
             self.snapshot
                 .quads_for_pattern_in(self.model, pattern)
@@ -81,7 +97,14 @@ impl<'a> ProbeCursor<'a> {
 
     /// Whether some quad matches `pattern`: [`Snapshot::exists_in`].
     pub fn exists(&mut self, pattern: &QuadPattern) -> bool {
-        let pattern = &self.snapshot.read_pattern(self.model, pattern);
+        let normalised;
+        let pattern = match self.canonical {
+            true => {
+                normalised = self.snapshot.read_pattern(self.model, pattern).into_owned();
+                &normalised
+            }
+            false => pattern,
+        };
         if self.unseekable(pattern) {
             return self.snapshot.exists_in(self.model, pattern);
         }
@@ -102,7 +125,14 @@ impl<'a> ProbeCursor<'a> {
     /// The matches of `pattern` for planning: [`Snapshot::estimate_in`] (exact where no
     /// equality class is expanded), each run's range found from its finger.
     pub fn count(&mut self, pattern: &QuadPattern) -> u64 {
-        let pattern = &self.snapshot.read_pattern(self.model, pattern);
+        let normalised;
+        let pattern = match self.canonical {
+            true => {
+                normalised = self.snapshot.read_pattern(self.model, pattern).into_owned();
+                &normalised
+            }
+            false => pattern,
+        };
         if self.unseekable(pattern) {
             return self.snapshot.estimate_in(self.model, pattern);
         }
@@ -115,7 +145,7 @@ impl<'a> ProbeCursor<'a> {
             if !self.model.includes(stack) {
                 continue;
             }
-            let index = self.snapshot.data(self.model).stack(stack);
+            let index = self.data.stack(stack);
             let Some(adapted) = index.layout().adapt(&plan) else {
                 continue;
             };
@@ -129,7 +159,14 @@ impl<'a> ProbeCursor<'a> {
     /// matches of `pattern`, ascending and distinct, where it is the pattern's only
     /// unbound position (the graph bound); `false`, nothing appended, otherwise.
     pub fn values(&mut self, pattern: &QuadPattern, component: usize, out: &mut Vec<u64>) -> bool {
-        let pattern = &self.snapshot.read_pattern(self.model, pattern);
+        let normalised;
+        let pattern = match self.canonical {
+            true => {
+                normalised = self.snapshot.read_pattern(self.model, pattern).into_owned();
+                &normalised
+            }
+            false => pattern,
+        };
         let GraphSelector::Exact(_) = pattern.graph else {
             return false;
         };
@@ -155,7 +192,7 @@ impl<'a> ProbeCursor<'a> {
             if !self.model.includes(stack) {
                 continue;
             }
-            let index = self.snapshot.data(self.model).stack(stack);
+            let index = self.data.stack(stack);
             let Some(adapted) = index.layout().adapt(&plan) else {
                 continue;
             };
@@ -179,7 +216,14 @@ impl<'a> ProbeCursor<'a> {
     /// among the matches with every other bound position as in `pattern`. Read in an
     /// index order whose bound prefix ends with `component`, where the layout has one.
     pub fn seek(&mut self, pattern: &QuadPattern, component: usize) -> Seek {
-        let pattern = &self.snapshot.read_pattern(self.model, pattern);
+        let normalised;
+        let pattern = match self.canonical {
+            true => {
+                normalised = self.snapshot.read_pattern(self.model, pattern).into_owned();
+                &normalised
+            }
+            false => pattern,
+        };
         let plan = match self.unseekable(pattern) {
             true => None,
             false => self.leapfrog_plan(pattern, component),
@@ -233,7 +277,7 @@ impl<'a> ProbeCursor<'a> {
             if !self.model.includes(stack) {
                 continue;
             }
-            let index = self.snapshot.data(self.model).stack(stack);
+            let index = self.data.stack(stack);
             let Some(adapted) = index.layout().adapt(plan) else {
                 continue;
             };
@@ -290,7 +334,7 @@ impl<'a> ProbeCursor<'a> {
             if !self.model.includes(stack) {
                 continue;
             }
-            let index = self.snapshot.data(self.model).stack(stack);
+            let index = self.data.stack(stack);
             let Some(adapted) = index.layout().adapt(plan) else {
                 continue;
             };
