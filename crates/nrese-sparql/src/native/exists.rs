@@ -21,6 +21,8 @@
 
 use std::collections::HashMap;
 
+use crate::QueryEvaluationError;
+
 use nrese_rdf::{Literal, Term, Variable};
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, Expression, GraphPattern, OrderExpression,
@@ -436,16 +438,29 @@ impl Context<'_> {
                 names.join(" ")
             );
             if !has_undef(&solutions.table, &lk) && !has_undef(&found.table, &rk) {
+                let (table, budget) = (&mut solutions.table, &*self.budget);
                 match keep_matching {
-                    true => semi_join_in_place(&mut solutions.table, &found.table, &lk, &rk),
-                    false => anti_join_in_place(&mut solutions.table, &found.table, &lk, &rk),
+                    true => semi_join_in_place(table, &found.table, &lk, &rk, budget),
+                    false => anti_join_in_place(table, &found.table, &lk, &rk, budget),
                 }
+                .map_err(QueryEvaluationError::MemoryLimit)?;
                 self.consumed(found);
                 note(joined, detail, solutions.table.len());
                 return Ok(solutions);
             }
             // An unbound variable isn't put into the pattern: any value matches.
-            let mask = compatible_mask(&solutions.table, &found.table, &lk, &rk, false);
+            let mut mask = vec![false; solutions.table.len()];
+            let table = &solutions.table;
+            compatible_mask(
+                table,
+                &found.table,
+                &lk,
+                &rk,
+                false,
+                &self.budget,
+                &mut mask,
+            )
+            .map_err(QueryEvaluationError::MemoryLimit)?;
             self.consumed(found);
             let kept = mask.iter().filter(|m| **m == keep_matching).count();
             note(joined, detail, kept);
@@ -561,7 +576,18 @@ impl Context<'_> {
         if correlated.is_empty() {
             let found = self.eval(pattern)?;
             let (lk, rk) = shared_columns(solutions, &found);
-            let mask = compatible_mask(&solutions.table, &found.table, &lk, &rk, false);
+            let mut mask = vec![false; solutions.table.len()];
+            let table = &solutions.table;
+            compatible_mask(
+                table,
+                &found.table,
+                &lk,
+                &rk,
+                false,
+                &self.budget,
+                &mut mask,
+            )
+            .map_err(QueryEvaluationError::MemoryLimit)?;
             self.consumed(found);
             return Ok(mask);
         }
@@ -646,9 +672,10 @@ impl Context<'_> {
             &rk,
             None,
             false,
+            &self.budget,
             max_rows,
         )
-        .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
+        .map_err(|stop| self.join_stopped(stop, vars.len()))?;
         self.consumed(right);
         let pairs = self.produced(Solutions {
             vars,

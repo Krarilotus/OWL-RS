@@ -72,6 +72,11 @@
 //!   a false pass. Rule: adopt only charges made inside the measurement, or make the inputs
 //!   inside it.
 //!
+//! - Pool threads tidy up after parallel work returns (crossbeam-epoch hands each
+//!   thread's garbage on, about 2 KB a thread), and a pool dropped ends its threads later:
+//!   a measurement that starts meanwhile counts it. Rule: make a measured test's inputs
+//!   without parallel work, and keep the pools it measures on for the whole process.
+//!
 //! And rayon's global queue (see [`prepare`]): work that enters the global pool from
 //! outside more than 62 times, or a pool of its own from outside, allocates a queue block
 //! of 1,520 bytes per 63 entries, which it counts.
