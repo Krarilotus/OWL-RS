@@ -418,6 +418,11 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
 ///   global pool from outside more often, or a pool of its own from outside, still
 ///   allocates such blocks: one per 63 entries.
 fn prepare() {
+    // Under Miri, which checks what the work does to memory and not what it counts (and
+    // rejects parking_lot's futex call), there is nothing to prepare.
+    if cfg!(miri) {
+        return;
+    }
     static WARM: std::sync::Once = std::sync::Once::new();
     if ACTIVE.load(SeqCst) == 0 {
         WARM.call_once(|| {
@@ -547,6 +552,10 @@ const ALONE: &str = "NRESE_MEASURE_ALONE";
 /// calling thread's, which the test harness names after it; what the run printed is
 /// printed (where the harness shows it).
 pub fn alone() -> bool {
+    // Miri can't start a process; it runs the tests it is given one at a time.
+    if cfg!(miri) {
+        return true;
+    }
     let current = std::thread::current();
     let test = current.name().expect("a test thread, named after its test");
     if std::env::var_os("NEXTEST").is_some() || std::env::var(ALONE).is_ok_and(|t| t == test) {
