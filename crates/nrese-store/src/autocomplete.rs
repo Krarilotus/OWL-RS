@@ -80,7 +80,7 @@ pub(crate) fn autocomplete(
     );
     // Matches come best first: the first `limit` resources of each kind are its best.
     let mut from_labels = 0;
-    for hit in label_hits {
+    for &hit in &label_hits {
         let literal = TermId::from_raw(hit.id);
         for &property in &labels {
             let pattern = QuadPattern {
@@ -101,7 +101,7 @@ pub(crate) fn autocomplete(
         }
     }
     let mut from_names = 0;
-    for hit in name_hits {
+    for &hit in &name_hits {
         let iri = TermId::from_raw(hit.id);
         let described = QuadPattern {
             subject: Some(iri),
