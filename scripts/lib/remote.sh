@@ -27,6 +27,15 @@ tree=$(GIT_INDEX_FILE=$index git write-tree)
 host=${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}
 [ -n "$host" ] || { echo "no build host (NRESE_BUILD_HOST or git config nrese.buildHost)" >&2; exit 2; }
 root=${NRESE_BUILD_ROOT:-owlrs}
+# The fleet's hosts time benchmarks; a build beside a timed run spoils it (19 Oct 2026: hooks
+# built on Office-PC during A-B-B-As). On them, builds and tests go through fleet jobs only.
+case "$(printf %s "$host" | tr '[:upper:]' '[:lower:]')" in
+  office-pc|phuoc-yu|khaleesi|khaleesi-wsl|gamergrill)
+    [ -n "${FLEET_SLICE:-}" ] || {
+      echo "$host is a fleet host: build here (NRESE_BUILD_HOST=local) or submit a fleet job" >&2
+      exit 2
+    } ;;
+esac
 snapshot=$(git commit-tree "$tree" -p HEAD -m "snapshot of $name")
 
 # While the host's owners use it (its guard wrote ~/owlrs/RETREAT, tools/office-guard), a build
