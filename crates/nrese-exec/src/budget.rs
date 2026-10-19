@@ -703,6 +703,115 @@ impl<T> Room<'_, T> {
         // SAFETY: the caller's.
         unsafe { self.0.set_len(len) }
     }
+
+    /// `n` items after the room's, the `i`-th `item(i)`, written in parallel: each worker
+    /// writes a range of slots of its own, and the length is published once, after every
+    /// item is written. If `item` panics anywhere, every item written (in any range) is
+    /// dropped once, no slot not written is read, the room holds what it held, and the
+    /// panic goes on. Panics where the room has fewer than `n` slots left.
+    pub fn par_fill(&mut self, n: usize, item: impl Fn(usize) -> T + Sync)
+    where
+        T: Send,
+    {
+        use rayon::prelude::*;
+        let len = self.0.len();
+        assert!(n <= self.0.capacity() - len, "past the room reserved");
+        // The only pointer to the slots: no reference to them is made until the length is
+        // published.
+        let slots = Slots(self.0.as_mut_ptr().wrapping_add(len));
+        let part = n.div_ceil(4 * rayon::current_num_threads()).max(1);
+        let written = (0..n.div_ceil(part))
+            .into_par_iter()
+            .map(|p| {
+                let mut written = Written::new(slots, p * part);
+                for i in p * part..(p * part + part).min(n) {
+                    let value = item(i);
+                    // SAFETY: (`Slots`) slot `i` is this range's, and not yet written.
+                    unsafe { slots.0.add(i).write(value) };
+                    written.len += 1;
+                }
+                written
+            })
+            // Adjacent ranges, in order: one range of every item, or, where a worker
+            // panicked, the ranges written dropped as the panic unwinds.
+            .reduce(|| Written::new(slots, 0), Written::join);
+        debug_assert_eq!((written.start, written.len), (0, n));
+        // Every slot written: the items are the vector's.
+        std::mem::forget(written);
+        // SAFETY: the `n` slots after the items are written, within the capacity.
+        unsafe { self.0.set_len(len + n) };
+    }
+}
+
+/// The spare slots [`Room::par_fill`] writes, by one pointer taken from the vector before
+/// the work splits.
+///
+/// SAFETY: the slots are `n` within the vector's capacity, and the vector is borrowed
+/// mutably for the whole fill, so nothing else reaches them. Each slot index belongs to one
+/// range, and each range to one worker, which alone writes it, and one [`Written`] token at
+/// a time owns the items of a range (tokens are joined, never copied), so no slot is
+/// written or dropped twice; a slot outside every token's range is never read. Hence the
+/// pointer may be shared between the workers (`Send`, `Sync`) when the items may move
+/// between threads (`T: Send`).
+struct Slots<T>(*mut T);
+
+impl<T> Clone for Slots<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Slots<T> {}
+
+// SAFETY: see `Slots`.
+unsafe impl<T: Send> Send for Slots<T> {}
+// SAFETY: see `Slots`.
+unsafe impl<T: Send> Sync for Slots<T> {}
+
+/// The items written into slots `start..start + len` by [`Room::par_fill`], not yet the
+/// vector's: they are dropped with this, unless it is forgotten once the vector takes them.
+struct Written<T> {
+    slots: Slots<T>,
+    start: usize,
+    len: usize,
+}
+
+impl<T> Written<T> {
+    fn new(slots: Slots<T>, start: usize) -> Self {
+        Self {
+            slots,
+            start,
+            len: 0,
+        }
+    }
+
+    /// `self` and the range right after it, as one.
+    fn join(self, next: Self) -> Self {
+        if self.len == 0 {
+            return next;
+        }
+        if next.len == 0 {
+            return self;
+        }
+        assert_eq!(self.start + self.len, next.start, "adjacent ranges");
+        let joined = Self {
+            slots: self.slots,
+            start: self.start,
+            len: self.len + next.len,
+        };
+        std::mem::forget((self, next));
+        joined
+    }
+}
+
+impl<T> Drop for Written<T> {
+    fn drop(&mut self) {
+        // SAFETY: (`Slots`) the `len` slots from `start` were written, and this alone owns them.
+        unsafe {
+            let first = self.slots.0.add(self.start);
+            std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(first, self.len));
+        }
+    }
 }
 
 /// A [`Reservation`] that follows what its holder samples it holds, from any thread (a
@@ -764,6 +873,58 @@ impl<B: Deref<Target = Budget>> Gauge<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker that panics after other ranges are written leaves nothing behind: every
+    /// item written is dropped once, the vector holds what it held, and the items' memory
+    /// (charged to the budget, so a leak would stay charged) is all released. The text
+    /// filter's fill published nothing and leaked them. Filled without a panic, it holds
+    /// nothing uncharged beside the items.
+    #[test]
+    fn a_panicking_parallel_fill_drops_every_item_it_wrote() {
+        if !crate::measure::alone() {
+            return;
+        }
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        static DROPPED: AtomicUsize = AtomicUsize::new(0);
+        /// An item holding memory charged to the budget, counting its drops.
+        struct Item<'b>(#[allow(dead_code)] ChargedVec<u8, &'b Budget>);
+        impl Drop for Item<'_> {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let budget = Budget::unlimited();
+        let item = |i: usize, panics_at: usize| {
+            assert!(i != panics_at, "the worker at item {i} panics");
+            MADE.fetch_add(1, Ordering::SeqCst);
+            Item(ChargedVec::with_capacity(&budget, 1_000).unwrap())
+        };
+        // One thread: the ranges are written in order, so the panic comes after some.
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let mut items: ChargedVec<Item<'_>, &Budget> = ChargedVec::new(&budget);
+        items.push(Item(ChargedVec::new(&budget))).unwrap();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            items.fill(100, |room| {
+                pool.install(|| room.par_fill(100, |i| item(i, 60)))
+            })
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(MADE.load(Ordering::SeqCst), 60, "earlier ranges completed");
+        assert_eq!(DROPPED.load(Ordering::SeqCst), 60, "each dropped once");
+        assert_eq!(items.len(), 1);
+        assert_eq!(budget.used(), items.charged(), "the items' memory released");
+        let ((), excess) = crate::measure::measure_within(&budget, || {
+            items
+                .fill(100, |room| {
+                    pool.install(|| room.par_fill(100, |i| item(i, usize::MAX)))
+                })
+                .unwrap();
+        });
+        assert_eq!((items.len(), excess), (101, 0));
+    }
 
     /// A charged vector never holds more than it was charged: every path that grows it
     /// reserves first, a writer it lends can't grow it, a capacity no vector can hold is
