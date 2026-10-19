@@ -919,42 +919,47 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
 /// that join them on `?graph` like on any variable.
 ///
 /// Anything else is evaluated graph by graph: a row without a scan (VALUES, an empty
-/// group, BIND alone), a property path (followed within one graph), a subquery or a nested
-/// GRAPH (their `?graph` is another variable), MINUS (the shared `?graph` would make rows
-/// with no other common variable remove each other) and a BIND to `?graph` itself.
-fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
-    fn only_scans(pattern: &GraphPattern, graph: &Variable) -> bool {
+/// group, BIND alone), a property path (followed within one graph), a GeoSPARQL relation
+/// computed from geometries (`spatial`: within one graph's geometries), a subquery or a
+/// nested GRAPH (their `?graph` is another variable), MINUS (the shared `?graph` would make
+/// rows with no other common variable remove each other) and a BIND to `?graph` itself.
+fn scans_everywhere(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
+    fn only_scans(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
         match pattern {
-            GraphPattern::Bgp { .. } => true,
+            GraphPattern::Bgp { patterns } => !spatial || !patterns.iter().any(spatial::is_spatial),
             GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
-                inputs.iter().all(|input| only_scans(input, graph))
+                inputs.iter().all(|input| only_scans(input, graph, spatial))
             }
             GraphPattern::LeftJoin {
                 left,
                 right,
                 expression,
             } => {
-                only_scans(left, graph)
-                    && only_scans(right, graph)
-                    && expression.as_ref().is_none_or(|e| filter(e, graph))
+                only_scans(left, graph, spatial)
+                    && only_scans(right, graph, spatial)
+                    && expression
+                        .as_ref()
+                        .is_none_or(|e| filter(e, graph, spatial))
             }
-            GraphPattern::Filter { inner, expr } => only_scans(inner, graph) && filter(expr, graph),
+            GraphPattern::Filter { inner, expr } => {
+                only_scans(inner, graph, spatial) && filter(expr, graph, spatial)
+            }
             GraphPattern::Extend { inner, bindings } => {
-                only_scans(inner, graph)
+                only_scans(inner, graph, spatial)
                     && bindings.iter().all(|(variable, expression)| {
-                        variable != graph && filter(expression, graph)
+                        variable != graph && filter(expression, graph, spatial)
                     })
             }
             _ => false,
         }
     }
     // `EXISTS` is a join on the shared variables, `?graph` among them.
-    fn filter(expression: &Expression, graph: &Variable) -> bool {
+    fn filter(expression: &Expression, graph: &Variable, spatial: bool) -> bool {
         match expression {
-            Expression::And(a, b) => filter(a, graph) && filter(b, graph),
-            Expression::Exists(pattern) => only_scans(pattern, graph),
+            Expression::And(a, b) => filter(a, graph, spatial) && filter(b, graph, spatial),
+            Expression::Exists(pattern) => only_scans(pattern, graph, spatial),
             Expression::Not(inner) if matches!(**inner, Expression::Exists(_)) => {
-                filter(inner, graph)
+                filter(inner, graph, spatial)
             }
             // An `EXISTS` anywhere else is not a join.
             other => !pushdown::per_solution(other) || !contains_any_exists(other),
@@ -1025,7 +1030,7 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
     if read_by_expressions(pattern, graph) && !bound_by_scans(pattern, graph) {
         return false;
     }
-    only_scans(pattern, graph) && rows_from_scans(pattern)
+    only_scans(pattern, graph, spatial) && rows_from_scans(pattern)
 }
 
 /// True if `expression` holds an `EXISTS` at any depth.
@@ -2101,7 +2106,7 @@ impl<'a> Context<'a> {
             }
             NamedNodePattern::Variable(v) => v,
         };
-        if scans_everywhere(inner, variable) {
+        if scans_everywhere(inner, variable, self.spatial_rewrite) {
             // Every row comes from scans, which bind the variable: one evaluation for
             // all graphs.
             let mut solutions = self.in_graph(GraphScope::Variable(variable.clone()), inner)?;
