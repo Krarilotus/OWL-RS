@@ -453,6 +453,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                 Arc::clone(&shared.dictionary),
                 Arc::clone(&shared.statistics),
                 None,
+                Arc::clone(&shared.views.read()),
             );
             let path = checkpoint::write(durable.root(), &image)?;
             shared

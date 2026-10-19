@@ -108,9 +108,11 @@ asserted model is answered as stored.
   snapshot read as stored see the statements as stored.
 - The completeness status makes no claim of its own here: it refers to the regime's
   certain answers, and canonical answers are those, up to the naming above.
-- Not reserved: the classes and the canonical version are the version's, made once
-  and shared by every query on it, like the classes before them; no query's reservation
-  holds them.
+- **Memory**: a canonical view is charged before it is made to the store's view budget,
+  which draws on the memory the queries do (`Engine::set_canonical_view_budget`), and the
+  charge is released when its version goes. Where the budget refuses, the view is made for
+  that query alone and charged to the query's own envelope. The classes, as before stage
+  C, are the version's and charged nowhere.
 
 ## 2. Vector similarity search
 
