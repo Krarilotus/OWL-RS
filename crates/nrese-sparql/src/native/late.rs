@@ -138,6 +138,7 @@ impl super::Context<'_> {
             service_denied: self.service_denied,
             equality_closed: self.equality_closed,
             late: None,
+            canonical: None,
             cache: None,
             pin: RefCell::default(),
         };

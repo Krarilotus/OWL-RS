@@ -61,7 +61,9 @@ pub struct QueryOptions {
     /// With equality classes kept over representatives (`reasoner.equality = "compact"`):
     /// answer with one identity per class, the representative, instead of every identity
     /// (`equality.answers = "canonical"`, work package W4 stage C): for analytics, where
-    /// the identities are one thing. Constants of the query keep their own names.
+    /// the identities are one thing. A term the query names (in a pattern, VALUES, an
+    /// expression) stands for its class too, and is answered by its representative
+    /// (research-designs §1, "Canonical answers").
     pub equality_canonical: bool,
     /// With equality classes kept over representatives: expand them at every read (stage
     /// B), not after the joins (stage C, the default: the parts of a query whose answer

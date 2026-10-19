@@ -131,6 +131,11 @@ pub struct Evaluator {
     aliases: std::sync::RwLock<HashMap<String, Term>>,
     /// This query run, in the blank nodes `BNODE(label)` makes.
     run: u64,
+    /// Under canonical answers, the names an IRI `IRI()` makes takes
+    /// ([`super::canonical`]).
+    canonical: Option<super::canonical::Names>,
+    /// Whether the expression reads inside `GRAPH`, where terms keep their stored names.
+    stored_names: std::sync::atomic::AtomicBool,
 }
 
 thread_local! {
@@ -154,6 +159,27 @@ impl Evaluator {
         let result = evaluate();
         SOLUTION.with(|s| s.set(previous));
         result
+    }
+
+    /// Makes `IRI()` name a class by its representative (canonical answers).
+    pub(crate) fn set_canonical(&mut self, names: Option<super::canonical::Names>) {
+        self.canonical = names;
+    }
+
+    /// Whether `IRI()` names classes by their representatives from now on; returns what
+    /// it did before (`GRAPH` reads terms as stored and restores it after).
+    pub(crate) fn canonical_scope(&self, on: bool) -> bool {
+        use std::sync::atomic::Ordering;
+        !self.stored_names.swap(!on, Ordering::Relaxed)
+    }
+
+    /// `term` as `IRI()` gives it: under canonical answers, its class's representative.
+    fn named(&self, term: Term) -> Term {
+        use std::sync::atomic::Ordering;
+        match &self.canonical {
+            Some(names) if !self.stored_names.load(Ordering::Relaxed) => names.term(term),
+            _ => term,
+        }
     }
 
     /// Makes `alias` evaluate to `term` (a blank node put into a pattern).
@@ -409,7 +435,8 @@ impl Evaluator {
                     ((value, None), None) => NamedNode::new(value).ok().map(Term::from),
                     _ => None,
                 },
-            },
+            }
+            .map(|iri| self.named(iri)),
             Function::Timezone | Function::Tz => {
                 let Term::Literal(literal) = arg(0)? else {
                     return None;
