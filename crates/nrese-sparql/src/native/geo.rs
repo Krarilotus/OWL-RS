@@ -82,13 +82,18 @@ pub(super) fn parse(term: &Term) -> Option<Shape> {
     let Term::Literal(literal) = term else {
         return None;
     };
-    let text = literal.value().trim();
-    let format = match literal.datatype().as_str() {
+    parse_literal(literal.value(), literal.datatype().as_str())
+}
+
+/// The shape of a literal of `datatype` with the lexical form `value` ([`parse`]).
+pub(super) fn parse_literal(value: &str, datatype: &str) -> Option<Shape> {
+    let text = value.trim();
+    let format = match datatype {
         GEOJSON_LITERAL => Serialisation::GeoJson,
         GML_LITERAL => Serialisation::Gml,
         _ => Serialisation::Wkt,
     };
-    let (crs, geometry) = match literal.datatype().as_str() {
+    let (crs, geometry) = match datatype {
         WKT_LITERAL => {
             let (crs, text) = match text.strip_prefix('<') {
                 Some(rest) => {

@@ -642,6 +642,8 @@ fn filter_functions_use_the_index() {
     let query = SparqlParser::new().parse_query(&text).unwrap();
     let plan = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
     assert_eq!(plan.rows, 9);
+    // The seed decides the conjunct on the indexed shapes: no literal is decoded again.
+    assert_eq!(plan.decoded, 0, "{:#?}", plan.steps);
     let largest = plan.steps.iter().map(|s| s.rows).max().unwrap();
     assert!(largest < 50, "{:#?}", plan.steps);
 }

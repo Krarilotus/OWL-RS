@@ -121,6 +121,7 @@ impl super::Context<'_> {
             numbers: RefCell::default(),
             cancellation: self.cancellation.clone(),
             budget: std::sync::Arc::clone(&self.budget),
+            memory: self.memory.clone(),
             trace: None,
             depth: Cell::new(0),
             probed: Cell::default(),

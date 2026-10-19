@@ -1201,6 +1201,9 @@ struct Context<'a> {
     numbers: RefCell<HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>>,
     cancellation: Option<CancellationToken>,
     budget: Arc<Budget>,
+    /// The request's envelope: what a part of the evaluation keeps beyond it (the spatial
+    /// index) draws from it ([`spatial`]).
+    memory: nrese_exec::Envelope,
     /// The operators run so far, for EXPLAIN; `None` when not explaining.
     trace: Option<RefCell<Vec<PlanStep>>>,
     /// Nesting depth of the operator being evaluated (for the trace).
@@ -1387,6 +1390,7 @@ impl<'a> Context<'a> {
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
             budget,
+            memory: options.resources.memory.clone(),
             trace: None,
             depth: Cell::new(0),
             probed: Cell::default(),
@@ -1847,15 +1851,16 @@ impl<'a> Context<'a> {
                     let (early, late): (Vec<_>, Vec<_>) = all
                         .into_iter()
                         .partition(|c| !as_written && pushdown::movable(c));
-                    let spatial_seed = self.spatial_seed(&early, patterns);
+                    let spatial_seed = self.spatial_seed(&early, patterns)?;
                     let mut early: Vec<(&Expression, Vec<Variable>)> = early
                         .into_iter()
                         .map(|c| (c, expression_variables(c)))
                         .collect();
-                    // A spatial filter's candidates from the R-tree start the joins.
+                    // A spatial filter's literals from the index start the joins; they
+                    // decide its conjunct, and come charged.
                     let mut solutions = match spatial_seed {
-                        Some(seed) => {
-                            let seed = self.produced(seed)?;
+                        Some((seed, decided)) => {
+                            early.remove(decided);
                             self.bgp_from(seed, patterns, &mut early)?
                         }
                         None => self.bgp(patterns, &hints, &mut early)?,

@@ -118,6 +118,20 @@ impl Base {
         }
     }
 
+    /// The most bytes entry `index`'s key holds while [`Self::plain`] decompresses it and
+    /// its text is copied out of it: the buffer it starts in and the one it moves to (a
+    /// code is at most a symbol of 8 bytes), then that one and the text.
+    fn decode_bound(&self, index: u64) -> usize {
+        let stored = self.key(index).len();
+        match &self.codec {
+            None => stored,
+            Some(_) => {
+                let moved = 8 * stored + 9;
+                (3 * stored + moved).max(2 * moved)
+            }
+        }
+    }
+
     /// The index of the plain `key`, whose hash is `hash`, if it is an entry.
     fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
         match &self.codec {
@@ -322,6 +336,15 @@ impl Inner {
         }
         let at = self.segments.partition_point(|s| s.start() <= index) - 1;
         Key::Borrowed(self.segments[at].key(index))
+    }
+
+    /// The most bytes decoding entry `index` allocates: its text's, and for a key stored
+    /// compressed the buffer it is decompressed into ([`Base::decode_bound`]).
+    fn decode_bound(&self, index: u64) -> usize {
+        match &self.base {
+            Some(base) if index < base.len => base.decode_bound(index),
+            _ => self.key(index).len(),
+        }
     }
 
     /// The index of `key`, whose hash is `hash`, if it is an entry.
@@ -1250,6 +1273,17 @@ impl Dictionary {
                 )
             }
         }
+    }
+
+    /// The most bytes [`Self::decode`] allocates for the dictionary term `id`, the term it
+    /// returns included, known without decoding it; `None` for inline ids, triple terms
+    /// (decoded part by part) and unknown ids.
+    pub fn decode_bound(&self, id: TermId) -> Option<usize> {
+        if !id.kind().is_dictionary() || id.kind() == TermKind::Triple {
+            return None;
+        }
+        let inner = self.inner.read_recursive();
+        (id.payload() < inner.len()).then(|| inner.decode_bound(id.payload()))
     }
 
     /// Calls `f` with a borrowed view of the dictionary term `id`, without allocating: the
