@@ -7,8 +7,16 @@
 #   ns_run_args NAME ROOT OWNER  sets NS_ARGS: --name NAME and the labels, for `docker run`
 #   ns_volume create NAME ROOT OWNER | rm NAME | inspect NAME   a `docker volume` command
 #   ns_shared KIND               a host-wide resource jobs share on purpose: data, cargo
-#   ns_clean ROOT [OWNER] [all]  removes this namespace's containers and volumes: the checkout's
-#                                own (or `all`: the whole job's), of OWNER or of every owner
+#   ns_network create NAME ROOT OWNER | rm NAME   a labelled `docker network` (swept like volumes)
+#   ns_dir BASE KIND ROOT        this job's own directory under a shared one (as ns.directory)
+#   ns_image TAG ROOT            the image ID the job runs for TAG: resolved (pulled if missing)
+#                                the first time the job uses it, that ID for the rest of the job
+#                                (ns.pin_image; the pins are the result's: ns_pins ROOT)
+#   ns_locked FILE CMD...        CMD under the host lock FILE (flock; else a lock directory)
+#   ns_serialize NAME "$0" "$@"  the calling script, run again under the host lock NAME unless it
+#                                holds it (shared dataset preparation: one at a time per host)
+#   ns_clean ROOT [OWNER] [all]  removes this namespace's containers, volumes and networks: the
+#                                checkout's own (or `all`: the whole job's), of OWNER or of all
 #   ns_docker ARGS...            Docker (NRESE_DOCKER names another executable: the tests' stub)
 
 ns_docker() { "${NRESE_DOCKER:-docker}" "$@"; }
@@ -44,6 +52,70 @@ ns_volume() {
   esac
 }
 
+ns_network() {
+  case $1 in
+    create) ns_labels "$3" "$4"; ns_docker network create "${NS_LABELS[@]}" "$2" ;;
+    rm) ns_docker network rm "$2" ;;
+    *) echo "ns_network: $1?" >&2; return 2 ;;
+  esac
+}
+
+ns_dir() { printf '%s/%s/%s' "$1" "$(ns_slug "$2")" "$(ns_name dir "$3" | sed 's/^nrese-dir-//')"; }
+
+ns_lock_dir() { printf '%s' "${NRESE_LOCK_DIR:-$HOME/.nrese-locks}"; }
+
+# FILE CMD...: one holder at a time per host. flock(2) where there is one (Linux: the gate's and
+# the fleet's hosts; the same lock as ns.host_lock's); else a lock directory with its holder's pid,
+# taken over when that process is gone.
+ns_locked() {
+  local file=$1 rc
+  shift
+  mkdir -p "$(dirname "$file")"
+  if command -v flock >/dev/null 2>&1; then
+    ( flock 9; "$@" ) 9>>"$file"
+    return
+  fi
+  until mkdir "$file.d" 2>/dev/null; do
+    kill -0 "$(cat "$file.d/pid" 2>/dev/null || echo 0)" 2>/dev/null || { rm -rf "$file.d"; continue; }
+    sleep 0.2
+  done
+  echo $$ > "$file.d/pid"
+  "$@"; rc=$?
+  rm -rf "$file.d"
+  return $rc
+}
+
+ns_serialize() {
+  local name=$1 held
+  shift
+  held=NS_HELD_$(ns_slug "$name" | tr -c 'a-z0-9' _)
+  [ -n "${!held:-}" ] && return 0
+  export "$held=1"
+  ns_locked "$(ns_lock_dir)/$name.lock" bash "$@"
+  exit $?
+}
+
+ns_pins_file() { printf '%s/pins/%s.tsv' "$(ns_lock_dir)" "$(ns_namespace "$1")"; }
+ns_pins() { cat "$(ns_pins_file "$1")" 2>/dev/null; return 0; }
+
+ns_pin_locked() {  # TAG FILE
+  local id
+  id=$(awk -F'\t' -v t="$1" '$1 == t { print $2 }' "$2" 2>/dev/null)
+  if [ -z "$id" ]; then
+    ns_docker image inspect "$1" >/dev/null 2>&1 || ns_docker pull -q "$1" >/dev/null 2>&1 || { printf '%s' "$1"; return; }
+    id=$(ns_docker image inspect -f '{{.Id}}' "$1") || { printf '%s' "$1"; return; }
+    mkdir -p "$(dirname "$2")" && printf '%s\t%s\n' "$1" "$id" >> "$2"
+  fi
+  printf '%s' "$id"
+}
+
+ns_image() {
+  case $1 in sha256:*) printf '%s' "$1"; return ;; esac
+  local file
+  file=$(ns_pins_file "$2")
+  ns_locked "$file.lock" ns_pin_locked "$1" "$file"
+}
+
 ns_shared() {
   case $1 in
     data) printf '%s' "${NRESE_BENCH_VOLUME:-nrese-bench-data}" ;;
@@ -59,5 +131,6 @@ ns_clean() {
   [ -z "$owner" ] || filters+=(--filter "label=nrese.owner=$owner")
   for item in $(ns_docker ps -a -q "${filters[@]}"); do ns_docker rm -f -v "$item" >/dev/null && echo "$item"; done
   for item in $(ns_docker volume ls -q "${filters[@]}"); do ns_docker volume rm "$item" >/dev/null && echo "$item"; done
+  for item in $(ns_docker network ls -q "${filters[@]}"); do ns_docker network rm "$item" >/dev/null && echo "$item"; done
   return 0
 }

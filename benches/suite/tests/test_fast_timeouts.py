@@ -105,7 +105,7 @@ class RuntimeTimeouts(unittest.TestCase):
                 with patch.object(fast, "RUNTIME", runtime), patch.object(fast, "SCRATCH", root), \
                         patch.object(fast, "FAST_DATA", root), patch.object(fast, "native_dirs", return_value={}), \
                         patch.object(fast, "native", side_effect=lambda text, dirs: text), \
-                        patch.object(fast, "end_scope") as end, \
+                        patch.object(fast, "end_scope") as end, patch.object(fast, "pinned", side_effect=lambda tag: tag), \
                         patch.object(fast, "docker", side_effect=[subprocess.TimeoutExpired("example", 1800), None]) as docker, \
                         patch.object(fast.subprocess, "run", side_effect=subprocess.TimeoutExpired("example", 1800)):
                     code, _, err, _ = fast.container("contract", 2, ["example"], timeout=1800)

@@ -29,6 +29,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=lib/target-cpu.sh
 . "$ROOT/scripts/lib/target-cpu.sh"
 
+# --print-rustflags: the RUSTFLAGS a build here hands rustc (the CPU choice added), and nothing
+# else: what a build's identity hashes (scripts/lib/gate-publish.sh).
+if [ "${1:-}" = --print-rustflags ]; then
+  export_target_cpu_rustflags
+  printf '%s\n' "${RUSTFLAGS:-}"
+  exit 0
+fi
+
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 BUDGET_GB="${NRESE_TARGET_BUDGET_GB:-25}"
 MIN_FREE_GB="${NRESE_MIN_FREE_GB:-20}"

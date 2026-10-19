@@ -3,6 +3,9 @@
 #
 # Usage: scripts/office/wikidata.sh   (the first 60 M valid lexeme triples into ~/nrese-bench/scratch/wikidata)
 set -euo pipefail
+# Shared datasets are prepared one at a time per host (scripts/lib/ns.sh): again under the lock.
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/ns.sh"
+ns_serialize datasets "$0" "$@"
 dir=~/nrese-bench/scratch/wikidata
 mkdir -p "$dir"; cd "$dir"
 [ -s lexemes.nt.gz ] || { curl -sSfL --retry 3 -o lexemes.nt.gz.part https://dumps.wikimedia.org/wikidatawiki/entities/latest-lexemes.nt.gz && mv lexemes.nt.gz.part lexemes.nt.gz; }

@@ -326,7 +326,7 @@ def dl_run(case: dict, systems: list[str], nrese_ms: float | None, stamp: str) -
         with fast.quiet_slot(f"compete {case['name']} dl"):
             done = fast.docker(["run", "--rm", *fast.ns.name_args(work, fast.ROOT, fast.OWNER), f"--memory={DL_MEMORY_GB}g",
                                 f"--memory-swap={DL_MEMORY_GB}g", *fast.cpu_args(), "-v", f"{fast.DATA_VOLUME}:/work",
-                                fast.dl_image(), "batch", f"/work/{work}.rest.tsv", f"/work/{work}.part.tsv",
+                                fast.pinned(fast.dl_image()), "batch", f"/work/{work}.rest.tsv", f"/work/{work}.part.tsv",
                                 f"/work/{work}-tax", str(timeout_s)], timeout=timeout_s * len(systems) + 300)
         # Results so far, and a timeout for the task the runner stopped at.
         merge = (f"cat /work/{work}.part.tsv >> /work/{work}.results.tsv 2>/dev/null; rm -f /work/{work}.part.tsv; "
@@ -401,7 +401,7 @@ def nemo_custom(case: dict) -> dict:
         started = time.monotonic()
         done = fast.docker(["run", "--rm", f"--memory={case['cap_gb']}g", f"--memory-swap={case['cap_gb']}g",
                             *fast.cpu_args(), "-v", f"{fast.DATA_VOLUME}:/fast", "-v", f"{rules.parent.as_posix()}:/rules:ro",
-                            "--entrypoint", "sh", fast.hosts.image("nrese-bench/nemo"), "-c", script], timeout=900)
+                            "--entrypoint", "sh", fast.pinned(fast.hosts.image("nrese-bench/nemo")), "-c", script], timeout=900)
         wall = time.monotonic() - started
     text = done.stdout
     import re
