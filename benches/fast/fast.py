@@ -1438,6 +1438,7 @@ def run(args) -> int:
     MEASURE.clear()
     OPTIONS["measure"] = None
     OPTIONS["batch"] = getattr(args, "batch", False)
+    OPTIONS["timing"] = getattr(args, "timing", None)
     if getattr(args, "measure", None):
         found, OPTIONS["measure"] = load_measure(Path(args.measure))
         MEASURE.update(found)
@@ -1687,6 +1688,9 @@ def main() -> int:
             s.add_argument("--measure", metavar="TOML",
                            help="the release gate's measurement per case (benches/fast/measure.toml: runs, "
                                 "warm-ups, repetitions), for every side alike")
+            s.add_argument("--timing", choices=("watchdog", "spawn"),
+                           help="how this perf lab's timed window is kept (its build's CAPABILITIES): "
+                                "the gate refuses sides timed differently")
             s.add_argument("--batch", action="store_true",
                            help="with --measure: its batched timing (perf_lab --batch), when every side's "
                                 "perf lab has it")

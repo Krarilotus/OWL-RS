@@ -184,6 +184,11 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
     measures = {(p["report"].get("options") or {}).get("measure") for p in passes}
     if len(measures) > 1:
         errors.append("the passes measured with different calibrations (fast.py --measure)")
+    # Every side's perf lab keeps its timed window alike (a thread started in it on one side
+    # only is a bias of microseconds: perf_lab_watchdog.py).
+    timings = {(p["report"].get("options") or {}).get("timing") for p in passes}
+    if len(timings) > 1:
+        errors.append("the sides' perf labs time differently: " + ", ".join(sorted(map(str, timings))))
     if len(prepared) > 1:
         errors.append("the passes read different prepared data")
     if len(identities) > 1:
