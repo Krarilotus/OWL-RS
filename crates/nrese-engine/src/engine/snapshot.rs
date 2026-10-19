@@ -40,7 +40,7 @@ pub struct Snapshot {
     /// its named graphs over representatives (`equality::canonical_version`), where that
     /// differs from `version`. The canonical model's view, never `version` itself, which
     /// the asserted model and [`Self::stored`] read as stored ([`Self::data`]).
-    canonical_data: Option<Arc<Version>>,
+    canonical_data: Option<super::equality::View>,
     /// What the canonical views versions keep are charged to, beside the readers' own
     /// budgets ([`crate::Engine::set_canonical_view_budget`]).
     views: Arc<nrese_exec::Budget>,
@@ -54,7 +54,7 @@ fn canonical_data(
     same_as: Option<TermId>,
     views: &Arc<nrese_exec::Budget>,
     fallback: &Arc<nrese_exec::Budget>,
-) -> Result<Option<Arc<Version>>, nrese_exec::BudgetExceeded> {
+) -> Result<Option<super::equality::View>, nrese_exec::BudgetExceeded> {
     match same_as {
         Some(same_as) => super::equality::CanonicalCache::view(version, same_as, views, fallback),
         None => Ok(None),
@@ -279,7 +279,7 @@ impl Snapshot {
     }
 
     /// The canonical view of `version` this snapshot's reads take, if it reads canonically.
-    fn canonical_view(&self, version: &Arc<Version>) -> Option<Arc<Version>> {
+    fn canonical_view(&self, version: &Arc<Version>) -> Option<super::equality::View> {
         match self.canonical {
             true => canonical_data(version, self.equality, &self.views, unlimited())
                 .unwrap_or_else(|_| unreachable!("an unlimited budget refuses nothing")),
@@ -291,7 +291,7 @@ impl Snapshot {
     /// model with inferred statements, else the snapshot's own.
     pub(crate) fn data(&self, model: ReadModel) -> &Arc<Version> {
         match &self.canonical_data {
-            Some(view) if model != ReadModel::Asserted => view,
+            Some(view) if model != ReadModel::Asserted => view.version(),
             _ => &self.version,
         }
     }
@@ -1590,7 +1590,10 @@ mod canonical_lifetime_tests {
             let canonical = snapshot.with_canonical_equality();
             assert!(!canonical.triple_terms_name_aliases());
             let version = Arc::downgrade(&canonical.version);
-            let view = canonical.canonical_data.as_ref().map(Arc::downgrade);
+            let view = canonical
+                .canonical_data
+                .as_ref()
+                .map(|view| Arc::downgrade(view.version()));
             assert_eq!(view.is_some(), named);
             let kept = named && limit.is_none();
             assert_eq!(views.used() > 0, kept, "{named} {limit:?}");
