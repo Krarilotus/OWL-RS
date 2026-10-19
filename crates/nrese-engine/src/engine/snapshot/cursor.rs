@@ -115,7 +115,7 @@ impl<'a> ProbeCursor<'a> {
             if !self.model.includes(stack) {
                 continue;
             }
-            let index = self.snapshot.version().stack(stack);
+            let index = self.snapshot.data(self.model).stack(stack);
             let Some(adapted) = index.layout().adapt(&plan) else {
                 continue;
             };
@@ -155,7 +155,7 @@ impl<'a> ProbeCursor<'a> {
             if !self.model.includes(stack) {
                 continue;
             }
-            let index = self.snapshot.version().stack(stack);
+            let index = self.snapshot.data(self.model).stack(stack);
             let Some(adapted) = index.layout().adapt(&plan) else {
                 continue;
             };
@@ -233,7 +233,7 @@ impl<'a> ProbeCursor<'a> {
             if !self.model.includes(stack) {
                 continue;
             }
-            let index = self.snapshot.version().stack(stack);
+            let index = self.snapshot.data(self.model).stack(stack);
             let Some(adapted) = index.layout().adapt(plan) else {
                 continue;
             };
@@ -290,7 +290,7 @@ impl<'a> ProbeCursor<'a> {
             if !self.model.includes(stack) {
                 continue;
             }
-            let index = self.snapshot.version().stack(stack);
+            let index = self.snapshot.data(self.model).stack(stack);
             let Some(adapted) = index.layout().adapt(plan) else {
                 continue;
             };

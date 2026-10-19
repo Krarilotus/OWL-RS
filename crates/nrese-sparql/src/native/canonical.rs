@@ -11,33 +11,41 @@
 //! - **reads**: a canonical snapshot gives representatives from every graph (the engine's
 //!   canonical reads; named graphs over representatives too);
 //! - **the query's constants**: put in as their representatives once, before planning,
-//!   with pre-bound values ([`Context::canonical_pattern`]);
+//!   with pre-bound values, inside triple terms too ([`Context::canonical_pattern`]);
 //! - **terms the evaluation makes**: `IRI()` names the representative, through the
 //!   canonical-name function the same pass wraps around it ([`FUNCTION`]);
-//! - **a remote endpoint's rows**: mapped where they are imported, and a bound value sent
-//!   to an endpoint as every identity of its class (`federation`).
+//! - **a remote endpoint's rows**: mapped where they are imported (a triple term part by
+//!   part), and a bound value sent to an endpoint as every identity of its class
+//!   (`federation`).
 //!
 //! Whether canonical answers apply is decided once per query (`Context::new`): where its
 //! default graph is the one the equality covers (the store's, or the merge of every graph,
 //! in a model with inferred statements) and some class exists. Elsewhere, and without the
 //! option, nothing here runs: the plan is the one without canonical answers.
 //!
-//! **Refused, not answered.** Triple terms are one term each (the store's classes and
-//! dictionary know no other); a query that takes one apart or builds one (`SUBJECT`,
-//! `PREDICATE`, `OBJECT`, `TRIPLE`, a triple pattern with a variable inside) could tell a
-//! class's identities apart through it, and a store with a literal in a class would need
-//! every computed literal mapped. Both are refused (`QueryEvaluationError::Unsupported`).
+//! **Triple terms.** In the quotient a triple term's class is that of its parts:
+//! `<<( alias p o )>>` and `<<( rep p o )>>` are one term. Where every triple term the store
+//! holds is over representatives, a stored triple term is its class's, a triple term the
+//! query writes is put in over representatives, and one the evaluation builds or takes
+//! apart (`TRIPLE`, `SUBJECT`, triple patterns) is made of representatives: they answer as
+//! any term. A triple term that names another identity has no id that stands for its
+//! class (no read can intern one), so canonical answers are refused over a store holding
+//! one (`nrese_engine::Snapshot::triple_terms_name_aliases`), as over a store with a
+//! literal in a class, whose every computed literal would need the mapping
+//! (`QueryEvaluationError::Unsupported`). Both are decided once, before planning.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use nrese_engine::{EqualityClasses, Snapshot, TermId};
-use nrese_rdf::{Literal, NamedNode, Term, TermRef, Variable};
+use nrese_rdf::{Literal, NamedNode, NamedOrBlankNode, Term, TermRef, Triple, Variable};
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, Expression, Function, GraphPattern, OrderExpression,
     PropertyPathExpression,
 };
-use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
+use nrese_sparql_syntax::term::{
+    GroundTerm, GroundTriple, NamedNodePattern, TermPattern, TriplePattern,
+};
 
 use super::Context;
 use crate::results::QueryEvaluationError;
@@ -63,9 +71,12 @@ impl Names {
         })
     }
 
-    /// The representative's id of `term`, if the snapshot knows it.
-    pub(super) fn lookup(&self, term: TermRef<'_>) -> Option<u64> {
-        let id = self.snapshot.lookup(term)?;
+    /// The id of `term`'s class, if the snapshot knows its name for it ([`Self::term`]).
+    pub(super) fn id(&self, term: &Term) -> Option<u64> {
+        let id = match term {
+            Term::Triple(_) => self.snapshot.lookup(self.term(term.clone()).as_ref())?,
+            _ => self.snapshot.lookup(term.as_ref())?,
+        };
         Some(self.classes.representative(id).raw())
     }
 
@@ -84,11 +95,27 @@ impl Names {
         Some((representative.raw(), self.snapshot.decode(representative)?))
     }
 
-    /// `term` as canonical answers name it.
+    /// `term` as canonical answers name it: a triple term over its parts' names.
     pub(crate) fn term(&self, term: Term) -> Term {
+        if let Term::Triple(t) = term {
+            let subject = NamedOrBlankNode::try_from(self.term(t.subject.into()));
+            return match subject {
+                Ok(subject) => {
+                    Triple::new(subject, self.iri(t.predicate), self.term(t.object)).into()
+                }
+                Err(_) => unreachable!("an IRI's or blank node's representative names one"),
+            };
+        }
         match self.representative(term.as_ref()) {
             Some((_, representative)) => representative,
             None => term,
+        }
+    }
+
+    fn iri(&self, n: NamedNode) -> NamedNode {
+        match self.term(n.clone().into()) {
+            Term::NamedNode(m) => m,
+            _ => n,
         }
     }
 
@@ -126,16 +153,12 @@ impl Context<'_> {
         if names.classes.relate_literals() {
             return Err(refused("a literal is an identity of an owl:sameAs class"));
         }
-        let rewrite = Rewrite {
-            ctx: self,
-            names,
-            refused: std::cell::Cell::new(None),
-        };
-        let pattern = rewrite.pattern(&pattern);
-        match rewrite.refused.get() {
-            Some(what) => Err(refused(what)),
-            None => Ok(pattern),
+        if self.snapshot.triple_terms_name_aliases() {
+            return Err(refused(
+                "a triple term the store holds names an identity other than its class's representative",
+            ));
         }
+        Ok(Rewrite { ctx: self, names }.pattern(&pattern))
     }
 }
 
@@ -154,8 +177,6 @@ enum Constant {
 struct Rewrite<'c, 'a> {
     ctx: &'c Context<'a>,
     names: &'c Names,
-    /// What the query does that canonical answers refuse, if anything.
-    refused: std::cell::Cell<Option<&'static str>>,
 }
 
 impl Rewrite<'_, '_> {
@@ -187,7 +208,9 @@ impl Rewrite<'_, '_> {
         let constant = match term {
             TermPattern::NamedNode(n) => self.constant(n.as_ref().into(), false),
             TermPattern::Literal(l) => self.constant(l.as_ref().into(), false),
-            // A triple term is one term: its parts stay as written.
+            TermPattern::Triple(inner) => {
+                return TermPattern::Triple(Box::new(self.triple(inner)));
+            }
             _ => None,
         };
         match constant {
@@ -205,13 +228,6 @@ impl Rewrite<'_, '_> {
     }
 
     fn triple(&self, triple: &TriplePattern) -> TriplePattern {
-        if [&triple.subject, &triple.object]
-            .iter()
-            .any(|t| matches!(t, TermPattern::Triple(inner) if !super::triple_terms::ground(inner)))
-        {
-            self.refused
-                .set(Some("a triple pattern takes a triple term apart"));
-        }
         TriplePattern {
             subject: self.term_pattern(&triple.subject),
             predicate: self.named_node_pattern(&triple.predicate),
@@ -245,7 +261,13 @@ impl Rewrite<'_, '_> {
         let constant = match term {
             GroundTerm::NamedNode(n) => self.constant(n.as_ref().into(), false),
             GroundTerm::Literal(l) => self.constant(l.as_ref().into(), false),
-            GroundTerm::Triple(_) => None,
+            GroundTerm::Triple(t) => {
+                return GroundTerm::Triple(Box::new(GroundTriple {
+                    subject: self.iri(&t.subject),
+                    predicate: self.iri(&t.predicate),
+                    object: self.ground(&t.object),
+                }));
+            }
         };
         match constant {
             Some(Constant::Iri(n)) => GroundTerm::NamedNode(n),
@@ -295,14 +317,6 @@ impl Rewrite<'_, '_> {
                 Function::Custom(NamedNode::new_unchecked(FUNCTION)),
                 vec![Expression::FunctionCall(Function::Iri, list(args))],
             ),
-            Expression::FunctionCall(
-                Function::Triple | Function::Subject | Function::Predicate | Function::Object,
-                _,
-            ) => {
-                self.refused
-                    .set(Some("an expression builds or takes apart a triple term"));
-                expression.clone()
-            }
             Expression::FunctionCall(function, args) => {
                 Expression::FunctionCall(function.clone(), list(args))
             }
