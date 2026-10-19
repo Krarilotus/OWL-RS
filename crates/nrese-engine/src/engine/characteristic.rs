@@ -56,7 +56,7 @@ pub struct CharacteristicSets {
 type Links = HashMap<u64, Vec<(u32, u32, u64)>>;
 
 /// Statements per (predicate, subject set, object set), while pairs are counted.
-type PairCounts = HashMap<(u64, u32, u32), u64>;
+pub(crate) type PairCounts = HashMap<(u64, u32, u32), u64>;
 
 #[derive(Debug)]
 struct Set {
@@ -136,49 +136,53 @@ impl CharacteristicSets {
     /// These sets with their characteristic pairs counted from `quads` (the same graph
     /// again, in any order); without pairs if there are too many subjects or pairs.
     #[cfg(test)]
-    pub(crate) fn with_pairs(self, quads: impl Iterator<Item = EncodedQuad> + Send) -> Self {
-        self.with_pairs_of(vec![quads])
+    pub(crate) fn with_pairs(mut self, quads: impl Iterator<Item = EncodedQuad>) -> Self {
+        let subjects = self.take_subjects();
+        let counted = (!subjects.is_empty()).then(|| Self::pair_counts(&subjects, quads));
+        self.with_pair_counts(counted.map(|c| c.into_iter().collect()))
     }
 
-    /// [`Self::with_pairs`] over parts of the graph, counted on every core and summed.
-    pub(crate) fn with_pairs_of<I>(mut self, parts: Vec<I>) -> Self
-    where
-        I: Iterator<Item = EncodedQuad> + Send,
-    {
-        use rayon::prelude::*;
-        let subject_sets = std::mem::take(&mut self.subject_sets);
-        if subject_sets.is_empty() {
-            return self;
-        }
+    /// The subjects' sets, which the pairs are counted by ([`Self::pair_counts`]), taken
+    /// out of these sets; empty where there are none to count by.
+    pub(crate) fn take_subjects(&mut self) -> Vec<(u64, u32)> {
+        std::mem::take(&mut self.subject_sets)
+    }
+
+    /// The characteristic pairs among `quads` (a part of the graph), by the subjects' sets
+    /// `subjects`; `None` past [`MAX_PAIRS`].
+    pub(crate) fn pair_counts(
+        subjects: &[(u64, u32)],
+        quads: impl Iterator<Item = EncodedQuad>,
+    ) -> Option<PairCounts> {
         let set_of = |id: u64| {
-            subject_sets
+            subjects
                 .binary_search_by_key(&id, |&(s, _)| s)
-                .map_or(NONE, |at| subject_sets[at].1)
+                .map_or(NONE, |at| subjects[at].1)
         };
-        let counted: Option<Vec<PairCounts>> = parts
-            .into_par_iter()
-            .map(|quads| {
-                let mut counts: PairCounts = HashMap::new();
-                let mut last: Option<(u64, u32)> = None;
-                for quad in quads {
-                    let s = quad.subject.raw();
-                    let from = match last {
-                        Some((subject, set)) if subject == s => set,
-                        _ => {
-                            let set = set_of(s);
-                            last = Some((s, set));
-                            set
-                        }
-                    };
-                    let key = (quad.predicate.raw(), from, set_of(quad.object.raw()));
-                    if !counts.contains_key(&key) && counts.len() >= MAX_PAIRS {
-                        return None;
-                    }
-                    *counts.entry(key).or_insert(0) += 1;
+        let mut counts: PairCounts = HashMap::new();
+        let mut last: Option<(u64, u32)> = None;
+        for quad in quads {
+            let s = quad.subject.raw();
+            let from = match last {
+                Some((subject, set)) if subject == s => set,
+                _ => {
+                    let set = set_of(s);
+                    last = Some((s, set));
+                    set
                 }
-                Some(counts)
-            })
-            .collect();
+            };
+            let key = (quad.predicate.raw(), from, set_of(quad.object.raw()));
+            if !counts.contains_key(&key) && counts.len() >= MAX_PAIRS {
+                return None;
+            }
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        Some(counts)
+    }
+
+    /// These sets with the pairs counted over the graph's parts ([`Self::pair_counts`])
+    /// summed; without pairs where a part had too many (`None`) or the sum has.
+    pub(crate) fn with_pair_counts(mut self, counted: Option<Vec<PairCounts>>) -> Self {
         let Some(counted) = counted else {
             return self;
         };
