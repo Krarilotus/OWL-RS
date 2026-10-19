@@ -44,6 +44,8 @@ nrese-reasoner = { path = "../nrese-reasoner" }
 nrese-sparql-reference = { path = "../nrese-sparql-reference" }
 # W3C suite runner: manifests, data files and expected results.
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
+# Replicas (a primary's image and log) in the GeoSPARQL scope tests.
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
