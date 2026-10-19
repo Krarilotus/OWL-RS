@@ -14,6 +14,10 @@
 # (query, rows, ms). The containers and their network are removed at the end; the images
 # stay for the next run.
 set -euo pipefail
+# This job's names (scripts/lib/ns.sh): its containers and volumes; the shared datasets' volume.
+NS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+. "$NS_ROOT/scripts/lib/ns.sh"
+DATA_VOLUME=$(ns_shared data)
 REFERENCE=0
 if [ "${1:-}" = --reference ]; then REFERENCE=1; shift; fi
 DIR=${1:-target/npd}
@@ -22,9 +26,9 @@ BASE=https://raw.githubusercontent.com/ontop/npd-benchmark/$COMMIT
 ONTOP=ontop/ontop:5.1.2
 POSTGRES=postgres:16-alpine
 JDBC=https://repo1.maven.org/maven2/org/postgresql/postgresql/42.7.4/postgresql-42.7.4.jar
-NET=npd-prepare-net
-PG=npd-prepare-pg
-ENDPOINT=npd-prepare-endpoint
+NET=$(ns_name npd-prepare-net "$NS_ROOT")
+PG=$(ns_name npd-prepare-pg "$NS_ROOT")
+ENDPOINT=$(ns_name npd-prepare-endpoint "$NS_ROOT")
 export MSYS_NO_PATHCONV=1
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 [ -f "$DIR/npd-v2-ql.owl" ] || bash "$ROOT/benches/reasoning/prepare-npd.sh" "$DIR"
@@ -50,7 +54,8 @@ cleanup() {
 trap cleanup EXIT
 cleanup
 docker network create "$NET" > /dev/null
-docker run -d --name "$PG" --network "$NET" -e POSTGRES_USER=npd -e POSTGRES_PASSWORD=npd \
+ns_run_args "$PG" "$NS_ROOT" reasoning
+docker run -d "${NS_ARGS[@]}" --network "$NET" -e POSTGRES_USER=npd -e POSTGRES_PASSWORD=npd \
   -e POSTGRES_DB=npd -v "$ABS/db:/dump:ro" "$POSTGRES" > /dev/null
 until docker exec "$PG" pg_isready -U npd -d npd > /dev/null 2>&1; do sleep 1; done
 sleep 2
@@ -68,7 +73,8 @@ NRESE=${NRESE_SERVER:-$ROOT/target/release/nrese-server}
 "$NRESE" convert "$DIR/npd-v2-ql.rdf" "$DIR/npd-v2-ql.nt"
 
 if [ "$REFERENCE" = 1 ]; then
-  docker run -d --name "$ENDPOINT" --network "$NET" -p 127.0.0.1:18080:8080 \
+  ns_run_args "$ENDPOINT" "$NS_ROOT" reasoning
+  docker run -d "${NS_ARGS[@]}" --network "$NET" -p 127.0.0.1:18080:8080 \
     -e ONTOP_MAPPING_FILE=/work/npd-v2-ql.obda -e ONTOP_ONTOLOGY_FILE=/npd/npd-v2-ql.owl \
     -e ONTOP_PROPERTIES_FILE=/work/npd-reasoning.properties \
     -v "$ABS/jdbc:/opt/ontop/jdbc:ro" -v "$ABS/db:/work:ro" -v "$ABS:/npd:ro" "$ONTOP" > /dev/null

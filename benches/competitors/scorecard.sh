@@ -38,13 +38,19 @@ require_free_gb "${NRESE_MIN_FREE_GB:-40}" "$(basename "$0")" "$(dirname "$0")"
 # volumes, datasets and images go, results stay. NRESE_BENCH_KEEP=1 keeps datasets and
 # images for the next run of a batch (see scripts/bench-cleanup.sh).
 CLEANUP="$(cd "$(dirname "$0")/../.." && pwd)/scripts/bench-cleanup.sh"
-trap '"$CLEANUP" >&2' EXIT
+trap '"$CLEANUP" --owner scorecard >&2' EXIT
 export MSYS_NO_PATHCONV=1
 
 DATASET=${1:?usage: $0 <dataset> [systems...]}
 shift
 native() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
 ROOT=$(native "$(cd "$(dirname "$0")/../.." && pwd)")
+# Every container and volume in this job's namespace (scripts/lib/ns.sh), labelled as the
+# scorecard's: its cleanup removes them and nothing of another job's.
+. "$ROOT/scripts/lib/ns.sh"
+sc() { ns_name "sc-$1" "$ROOT"; }
+DATA_VOLUME=$(ns_shared data)
+TARGET_VOLUME=$(ns_name target "$ROOT")
 RESULTS=$(native "${RESULTS:-$ROOT/benches/competitors/results/$(date +%Y-%m-%d)}")
 QUERY_TIMEOUT_S=${QUERY_TIMEOUT_S:-120}
 CLIENTS=${CLIENTS:-8}          # throughput phase: concurrent clients (0 = skip)
@@ -104,7 +110,8 @@ measured() {
   shift 2
   docker rm -f -v "$name" >/dev/null 2>&1 || true
   start=$(ms)
-  docker run -d --name "$name" "$@" >/dev/null
+  ns_run_args "$name" "$ROOT" scorecard
+  docker run -d "${NS_ARGS[@]}" "$@" >/dev/null
   watch_memory "$name" "$log.mem"
   docker wait "$name" >/dev/null
   local wall=$(( $(ms) - start ))
@@ -125,7 +132,8 @@ serve() {
   shift 2
   docker rm -f -v "$name" >/dev/null 2>&1 || true
   start=$(ms)
-  docker run -d --name "$name" "$@" >/dev/null
+  ns_run_args "$name" "$ROOT" scorecard
+  docker run -d "${NS_ARGS[@]}" "$@" >/dev/null
   until [ "$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode 'query=ASK {}' "$endpoint")" = 200 ]; do
     if [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" != true ]; then
       docker logs "$name" >&2 2>&1 | tail -20
@@ -144,51 +152,51 @@ volume_bytes() { docker run --rm -v "$1:/v" alpine du -sb /v | cut -f1; }
 # the server and sets ENDPOINT and RESTART_MS (call it directly, not in a subshell). ---
 
 load_nrese() {
-  measured nrese-sc-load "$2" -v nrese-target:/target:ro -v nrese-bench-data:/data:ro -v "$1:/store" \
+  measured "$(sc nrese-load)" "$2" -v "$TARGET_VOLUME:/target":ro -v "$DATA_VOLUME":/data:ro -v "$1:/store" \
     -e NRESE_STORE_MODE=on-disk -e NRESE_DATA_DIR=/store -e RUST_LOG=info "$RUST_IMAGE" \
     /target/release/nrese-server load "$FILE"
 }
 serve_nrese() {
   ENDPOINT=http://localhost:$PORT/dataset/query
   UPDATE_ENDPOINT=http://localhost:$PORT/dataset/update
-  serve nrese-sc "$ENDPOINT" -p "$PORT:8080" -v nrese-target:/target:ro -v "$1:/store" \
+  serve "$(sc nrese)" "$ENDPOINT" -p "$PORT:8080" -v "$TARGET_VOLUME:/target":ro -v "$1:/store" \
     -e NRESE_STORE_MODE=on-disk -e NRESE_DATA_DIR=/store -e NRESE_BIND_ADDR=0.0.0.0:8080 \
     -e NRESE_QUERY_TIMEOUT_MS=$(( QUERY_TIMEOUT_S * 1000 )) -e NRESE_READ_REQUESTS_PER_WINDOW=100000000 \
     "$RUST_IMAGE" /target/release/nrese-server
 }
 
 load_qlever() {
-  measured qlever-sc-load "$2" -u root -v nrese-bench-data:/data:ro -v "$1:/index" -w /index \
+  measured "$(sc qlever-load)" "$2" -u root -v "$DATA_VOLUME":/data:ro -v "$1:/index" -w /index \
     --entrypoint /qlever/qlever-index "$QLEVER_IMAGE" \
     -i /index/idx -f "$FILE" -F nt -p true --stxxl-memory 8G
 }
 serve_qlever() {
   ENDPOINT=http://localhost:$PORT/
   UPDATE_ENDPOINT=$ENDPOINT # in-memory delta; -n allows updates without an access token
-  serve qlever-sc "$ENDPOINT" -u root -p "$PORT:7001" -v "$1:/index" -w /index \
+  serve "$(sc qlever)" "$ENDPOINT" -u root -p "$PORT:7001" -v "$1:/index" -w /index \
     --entrypoint /qlever/qlever-server "$QLEVER_IMAGE" \
     -i /index/idx -p 7001 -n -j 8 -m 16G -c 1MB -e 1MB -k 0 -s "${QUERY_TIMEOUT_S}s"
 }
 
 load_oxigraph() {
-  measured oxigraph-sc-load "$2" -v nrese-bench-data:/data:ro -v "$1:/store" "$OXIGRAPH_IMAGE" \
+  measured "$(sc oxigraph-load)" "$2" -v "$DATA_VOLUME":/data:ro -v "$1:/store" "$OXIGRAPH_IMAGE" \
     load --location /store --file "$FILE"
 }
 serve_oxigraph() {
   ENDPOINT=http://localhost:$PORT/query
   UPDATE_ENDPOINT=http://localhost:$PORT/update
-  serve oxigraph-sc "$ENDPOINT" -p "$PORT:7878" -v "$1:/store" "$OXIGRAPH_IMAGE" \
+  serve "$(sc oxigraph)" "$ENDPOINT" -p "$PORT:7878" -v "$1:/store" "$OXIGRAPH_IMAGE" \
     serve --location /store --bind 0.0.0.0:7878
 }
 
 load_jena() {
-  measured jena-sc-load "$2" -e JVM_ARGS="-Xmx$JAVA_HEAP" -v nrese-bench-data:/data:ro -v "$1:/tdb2" \
+  measured "$(sc jena-load)" "$2" -e JVM_ARGS="-Xmx$JAVA_HEAP" -v "$DATA_VOLUME":/data:ro -v "$1:/tdb2" \
     "$JENA_IMAGE" tdb2.tdbloader --loader=parallel --loc /tdb2/db "$FILE"
 }
 serve_jena() {
   ENDPOINT=http://localhost:$PORT/ds/query
   UPDATE_ENDPOINT=http://localhost:$PORT/ds/update
-  serve jena-sc "$ENDPOINT" -p "$PORT:3030" -e JVM_ARGS="-Xmx$JAVA_HEAP" -v "$1:/tdb2" \
+  serve "$(sc jena)" "$ENDPOINT" -p "$PORT:3030" -e JVM_ARGS="-Xmx$JAVA_HEAP" -v "$1:/tdb2" \
     "$JENA_IMAGE" fuseki-server --update --tdb2 --loc=/tdb2/db --port 3030 /ds
 }
 
@@ -199,9 +207,11 @@ VIRTUOSO_ENV=(-e DBA_PASSWORD=bench
   -e VIRT_SPARQL_MAXQUERYCOSTESTIMATIONTIME=0)
 load_virtuoso() {
   # Virtuoso loads through its running server: time ld_dir + 6 loaders + checkpoint.
-  local name=virtuoso-sc-load start peak pid
+  local name start peak pid
+  name=$(sc virtuoso-load)
   docker rm -f -v "$name" >/dev/null 2>&1 || true
-  docker run -d --name "$name" "${VIRTUOSO_ENV[@]}" -v nrese-bench-data:/data:ro -v "$1:/database" \
+  ns_run_args "$name" "$ROOT" scorecard
+  docker run -d "${NS_ARGS[@]}" "${VIRTUOSO_ENV[@]}" -v "$DATA_VOLUME:/data:ro" -v "$1:/database" \
     "$VIRTUOSO_IMAGE" >/dev/null
   until docker logs "$name" 2>&1 | grep -q "Server online at 1111"; do sleep 0.2; done
   isql() { docker exec "$name" isql 1111 dba bench exec="$1"; }
@@ -226,8 +236,8 @@ serve_virtuoso() {
   ENDPOINT=http://localhost:$PORT/sparql
   UPDATE_ENDPOINT=$ENDPOINT
   WRITE_GRAPH=http://bench # Virtuoso holds the data in a named graph
-  serve virtuoso-sc "$ENDPOINT" -p "$PORT:8890" "${VIRTUOSO_ENV[@]}" -v "$1:/database" "$VIRTUOSO_IMAGE" &&
-    docker exec virtuoso-sc isql 1111 dba bench \
+  serve "$(sc virtuoso)" "$ENDPOINT" -p "$PORT:8890" "${VIRTUOSO_ENV[@]}" -v "$1:/database" "$VIRTUOSO_IMAGE" &&
+    docker exec "$(sc virtuoso)" isql 1111 dba bench \
       exec='GRANT SPARQL_UPDATE TO "SPARQL"; DB.DBA.RDF_DEFAULT_USER_PERMS_SET('"'"'nobody'"'"', 7);' >/dev/null
 }
 
@@ -238,10 +248,12 @@ serve_virtuoso() {
 # also serves the queries; store size and restart are reported as n/a.
 ANZOGRAPH_IMAGE=${ANZOGRAPH_IMAGE:-cambridgesemantics/anzograph:3.5.0}
 load_anzograph() {
-  local name=anzograph-sc start
+  local name start
+  name=$(sc anzograph)
   docker rm -f -v "$name" >/dev/null 2>&1 || true
   # Its own files live in /data, so the benchmark data is mounted at /bench.
-  docker run -d --name "$name" -p "$PORT:7070" -v nrese-bench-data:/bench:ro "$ANZOGRAPH_IMAGE" >/dev/null
+  ns_run_args "$name" "$ROOT" scorecard
+  docker run -d "${NS_ARGS[@]}" -p "$PORT:7070" -v "$DATA_VOLUME:/bench:ro" "$ANZOGRAPH_IMAGE" >/dev/null
   until [ "$(curl -s -o /dev/null -w '%{http_code}' --data-urlencode 'query=ASK {}' \
     "http://localhost:$PORT/sparql")" = 200 ]; do sleep 2; done
   start=$(ms)
@@ -259,8 +271,8 @@ serve_anzograph() {
 
 load_graphdb() {
   # importrdf run directly defaults to the distribution's home; point it at the volume.
-  measured graphdb-sc-load "$2" -e GDB_HEAP_SIZE="$JAVA_HEAP" \
-    -e GDB_JAVA_OPTS="-Dgraphdb.home=/opt/graphdb/home" -v nrese-bench-data:/data:ro \
+  measured "$(sc graphdb-load)" "$2" -e GDB_HEAP_SIZE="$JAVA_HEAP" \
+    -e GDB_JAVA_OPTS="-Dgraphdb.home=/opt/graphdb/home" -v "$DATA_VOLUME":/data:ro \
     -v "$(native "$ROOT/benches/competitors/graphdb"):/config:ro" -v "$1:/opt/graphdb/home" \
     --entrypoint /opt/graphdb/dist/bin/importrdf "$GRAPHDB_IMAGE" \
     preload -f -c /config/repo-empty.ttl "$FILE"
@@ -269,7 +281,7 @@ serve_graphdb() {
   ENDPOINT=http://localhost:$PORT/repositories/bench
   UPDATE_ENDPOINT=$ENDPOINT/statements
   [ -n "$GRAPHDB_LICENSE" ] || { echo "GraphDB needs GRAPHDB_LICENSE=/path/graphdb.license" >&2; return 1; }
-  serve graphdb-sc "$ENDPOINT" -p "$PORT:7200" -e GDB_HEAP_SIZE="$JAVA_HEAP" \
+  serve "$(sc graphdb)" "$ENDPOINT" -p "$PORT:7200" -e GDB_HEAP_SIZE="$JAVA_HEAP" \
     -e GDB_JAVA_OPTS="-Dgraphdb.license.file=/license/graphdb.license" \
     -v "$(native "$GRAPHDB_LICENSE"):/license/graphdb.license:ro" \
     -v "$1:/opt/graphdb/home" "$GRAPHDB_IMAGE"
@@ -280,14 +292,14 @@ serve_graphdb() {
 # What this run is about to pull is its to remove afterwards (scripts/bench-cleanup.sh).
 remember_pulls "$ROOT/tmp/bench-pulled-images" "$GRAPHDB_IMAGE" "$QLEVER_IMAGE" "$OXIGRAPH_IMAGE" \
   "$VIRTUOSO_IMAGE" "$ANZOGRAPH_IMAGE" "$RUST_IMAGE"
-docker run --rm -v nrese-bench-data:/data alpine test -s "$FILE" || {
+docker run --rm -v "$DATA_VOLUME":/data alpine test -s "$FILE" || {
   echo "missing $FILE: run prepare-datasets.sh or the harness generate command" >&2
   exit 1
 }
-TRIPLES=$(docker run --rm -v nrese-bench-data:/data alpine sh -c "wc -l < $FILE")
+TRIPLES=$(docker run --rm -v "$DATA_VOLUME":/data alpine sh -c "wc -l < $FILE")
 if [ -z "${SKIP_BUILD:-}" ]; then
-  docker volume create nrese-target >/dev/null
-  docker run --rm -v "$ROOT:/src:ro" -v nrese-target:/target -w /src "$RUST_IMAGE" \
+  ns_volume create "$TARGET_VOLUME" "$ROOT" scorecard >/dev/null
+  docker run --rm -v "$ROOT:/src:ro" -v "$TARGET_VOLUME:/target" -w /src "$RUST_IMAGE" \
     cargo build --release --locked -p nrese-server --target-dir /target >"$RESULTS/nrese-build.log" 2>&1
   docker build -q -t "$JENA_IMAGE" "$ROOT/benches/competitors/jena" >/dev/null
   (cd "$ROOT" && scripts/cargo-guarded.sh build --release --locked --quiet --manifest-path benches/nrese-bench-harness/Cargo.toml)
@@ -297,16 +309,16 @@ CSV=$RESULTS/scorecard-$DATASET.csv
 [ -s "$CSV" ] || echo "system,dataset,triples,load_ms,load_peak_mib,store_bytes,bytes_per_triple,restart_ms,serve_mib,queries_ok,queries_total,sum_p50_ms,qps,write_p50_ms,write_p99_ms,write_errors" >"$CSV"
 head -1 "$CSV"
 for system in $SYSTEMS; do
-  volume=sc-$system-$DATASET
+  volume=$(sc "$system-$DATASET")
   # Leftovers of an interrupted run would hold the volume (and its lock).
-  docker rm -f -v "$system-sc" "$system-sc-load" >/dev/null 2>&1 || true
-  docker volume rm -f "$volume" >/dev/null 2>&1 || true
-  docker volume create "$volume" >/dev/null
+  docker rm -f -v "$(sc "$system")" "$(sc "$system-load")" >/dev/null 2>&1 || true
+  ns_volume rm "$volume" >/dev/null 2>&1 || true
+  ns_volume create "$volume" "$ROOT" scorecard >/dev/null
   prefix=$RESULTS/$system-$DATASET
   WRITE_GRAPH=
   if ! read -r load_ms peak < <("load_$system" "$volume" "$prefix-load.log"); then
     echo "$system,$DATASET,$TRIPLES,FAILED" | tee -a "$CSV"
-    docker volume rm -f "$volume" >/dev/null
+    ns_volume rm "$volume" >/dev/null
     continue
   fi
   bytes=$(volume_bytes "$volume")
@@ -317,15 +329,15 @@ for system in $SYSTEMS; do
   else
     if ! "serve_$system" "$volume"; then
       echo "$line,FAILED" | tee -a "$CSV"
-      docker rm -f -v "$system-sc" >/dev/null 2>&1 || true
-      docker volume rm -f "$volume" >/dev/null
+      docker rm -f -v "$(sc "$system")" >/dev/null 2>&1 || true
+      ns_volume rm "$volume" >/dev/null
       continue
     fi
     restart=$RESTART_MS
     "$(native "$HARNESS")" query-mix --endpoint "$ENDPOINT" --queries "$QUERIES" --label "$system" \
       --warmup 1 --runs 5 --timeout-s "$QUERY_TIMEOUT_S" --clients "$CLIENTS" --duration-s "$DURATION_S" --update-endpoint "$UPDATE_ENDPOINT" ${WRITE_GRAPH:+--write-graph "$WRITE_GRAPH"} \
       --report-json "$prefix-queries.json" >"$prefix-queries.log" 2>&1 || true
-    rss=$(server_mib "$system-sc")
+    rss=$(server_mib "$(sc "$system")")
     summary=$(python -c "
 import json, sys
 try:
@@ -337,10 +349,10 @@ ok = [q for q in r['queries'] if not q['error']]
 t = r.get('throughput') or {}
 w = t.get('writes') or {}
 print(f\"{len(ok)},{len(r['queries'])},{sum(q['p50_ms'] for q in ok):.1f},{t.get('queries_per_s', 0):.1f},{w.get('p50_ms') or ''},{w.get('p99_ms') or ''},{w.get('errors', '')}\")" "$prefix-queries.json")
-    docker rm -f -v "$system-sc" >/dev/null
+    docker rm -f -v "$(sc "$system")" >/dev/null
     echo "$line,$restart,$rss,$summary" | tee -a "$CSV"
   fi
-  docker volume rm -f "$volume" >/dev/null
+  ns_volume rm "$volume" >/dev/null
 done
 
 # Cross-check: every system that answered a query should report the same number of rows.

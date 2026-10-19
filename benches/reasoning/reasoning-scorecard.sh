@@ -39,6 +39,11 @@
 # (long) run can't change the running script.
 {
 set -euo pipefail
+# This job's names (scripts/lib/ns.sh): its containers and volumes; the shared datasets' volume.
+NS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+. "$NS_ROOT/scripts/lib/ns.sh"
+DATA_VOLUME=$(ns_shared data)
+TARGET_VOLUME=$(ns_name target "$NS_ROOT")
 
 # Datasets, store files and images take tens of GB: don't start on a nearly full disk.
 . "$(dirname "$0")/../../scripts/lib/disk.sh"
@@ -47,7 +52,7 @@ require_free_gb "${NRESE_MIN_FREE_GB:-40}" "$(basename "$0")" "$(dirname "$0")"
 # volumes, datasets and images go, results stay. NRESE_BENCH_KEEP=1 keeps datasets and
 # images for the next run of a batch (see scripts/bench-cleanup.sh).
 CLEANUP="$(cd "$(dirname "$0")/../.." && pwd)/scripts/bench-cleanup.sh"
-trap '"$CLEANUP" >&2' EXIT
+trap '"$CLEANUP" --owner reasoning >&2' EXIT
 export MSYS_NO_PATHCONV=1
 native() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
 HERE=$(native "$(cd "$(dirname "$0")" && pwd)")
@@ -74,11 +79,12 @@ measured() {
   shift 2
   # --init: tini as PID 1 passes the timeout's SIGTERM on (a shell as PID 1 ignores it, and
   # the container then ran past its limit); -k: KILL if it still hasn't stopped.
-  timeout -k 30 "$TIMEOUT_S" docker run --init --name "$name" \
+  ns_run_args "$name" "$NS_ROOT" reasoning
+  timeout -k 30 "$TIMEOUT_S" docker run --init "${NS_ARGS[@]}" \
     ${DOCKER_MEMORY:+--memory "$DOCKER_MEMORY" --memory-swap "$DOCKER_MEMORY"} \
-    -v nrese-bench-data:/data:ro \
+    -v "$DATA_VOLUME":/data:ro \
     -v "$RESULTS:/out" -v "$ORACLE_CACHE:/cache" -v "$HERE/queries:/queries:ro" \
-    -v nrese-target:/target:ro -e JAVA_TOOL_OPTIONS="-Xmx$JAVA_HEAP" --entrypoint sh "$image" \
+    -v "$TARGET_VOLUME":/target:ro -e JAVA_TOOL_OPTIONS="-Xmx$JAVA_HEAP" --entrypoint sh "$image" \
     -c '"$@"; rc=$?; echo "peak_bytes $(cat /sys/fs/cgroup/memory.peak 2>/dev/null || echo 0)"; exit $rc' \
     sh "$@" >"$log" 2>&1 || rc=$?
   docker rm -f -v "$name" >/dev/null 2>&1 || true
@@ -119,7 +125,7 @@ reference() {
 compare() {
   local log=$RESULTS/$2-$1.compare.log
   # shellcheck disable=SC2046
-  docker run --rm -v nrese-bench-data:/data:ro -v "$RESULTS:/out" -v "$HERE:/kit:ro" \
+  docker run --rm -v "$DATA_VOLUME":/data:ro -v "$RESULTS:/out" -v "$HERE:/kit:ro" \
     --entrypoint python nrese-bench/owlrl-oracle /kit/compare_inferred.py \
     "/out/$3-$1.inferred.nt" "/out/$2-$1.inferred.nt" --input $(inputs "$1") --label "$2" \
     --json "/out/$2-$1.compare.json" >"$log" 2>&1 || { echo "error,error,error,error,error"; return; }
@@ -128,7 +134,7 @@ compare() {
 
 run_oracle() { # <dataset> <log>
   local cached=$ORACLE_CACHE/oracle-owl2-rl-$1.nt triples
-  triples=$(docker run --rm -v nrese-bench-data:/data:ro alpine sh -c "cat $(inputs "$1") | sort -u | wc -l")
+  triples=$(docker run --rm -v "$DATA_VOLUME":/data:ro alpine sh -c "cat $(inputs "$1") | sort -u | wc -l")
   if [ "$triples" -gt "$ORACLE_MAX_TRIPLES" ]; then
     echo "skipped: $triples input triples > ORACLE_MAX_TRIPLES=$ORACLE_MAX_TRIPLES" >"$2"
     return 1
@@ -152,7 +158,7 @@ run_nrese_v2() { # <dataset> <log>
     --out "/out/nrese-v2-$1.inferred.nt" $(inputs "$1") || return 1
   if [ -d "$HERE/queries/${1%%-*}" ]; then
     # shellcheck disable=SC2046
-    docker run --rm -v nrese-bench-data:/data:ro -v "$RESULTS:/out:ro" -v "$HERE/queries:/queries:ro" \
+    docker run --rm -v "$DATA_VOLUME":/data:ro -v "$RESULTS:/out:ro" -v "$HERE/queries:/queries:ro" \
       --entrypoint python nrese-bench/owlrl-oracle /oracle/answer_queries.py --queries "/queries/${1%%-*}" \
       $(inputs "$1") "/out/nrese-v2-$1.inferred.nt" >>"$2" 2>&1 || true
   fi
@@ -169,12 +175,12 @@ run_nemo() { # <dataset> <log>
   # Nemo has no SPARQL engine: Oxigraph answers the queries over its closure (counts only).
   if [ -d "$HERE/queries/${1%%-*}" ]; then
     # shellcheck disable=SC2046
-    docker run --rm -v nrese-bench-data:/data:ro -v "$RESULTS:/out:ro" -v "$HERE/queries:/queries:ro" \
+    docker run --rm -v "$DATA_VOLUME":/data:ro -v "$RESULTS:/out:ro" -v "$HERE/queries:/queries:ro" \
       --entrypoint python nrese-bench/owlrl-oracle /oracle/answer_queries.py --queries "/queries/${1%%-*}" \
       $(inputs "$1") "/out/nemo-$1.inferred.nt" >>"$2" 2>&1 || true
   fi
   local asserted
-  asserted=$(docker run --rm -v nrese-bench-data:/data:ro alpine sh -c "cat $(inputs "$1") | sort -u | wc -l")
+  asserted=$(docker run --rm -v "$DATA_VOLUME":/data:ro alpine sh -c "cat $(inputs "$1") | sort -u | wc -l")
   echo "$asserted,$(awk "BEGIN { print $(field 'Reasoning: +([0-9]+)ms' "$2") / 1000 }"),$(wc -l <"$RESULTS/nemo-$1.inferred.nt"),$(peak_mib "$2")"
 }
 
@@ -195,8 +201,8 @@ docker image inspect nrese-bench/jena:6.2.0 >/dev/null 2>&1 ||
 docker build -q -t nrese-bench/jena-reasoner "$HERE/jena" >/dev/null
 docker build -q -t nrese-bench/nemo "$HERE/nemo" >/dev/null
 if [[ " $SYSTEMS " == *" nrese-v"* ]] && [ -z "${SKIP_BUILD:-}" ]; then
-  docker volume create nrese-target >/dev/null
-  docker run --rm -v "$ROOT:/src:ro" -v nrese-target:/target -v nrese-cargo:/usr/local/cargo/registry \
+  ns_volume create "$TARGET_VOLUME" "$NS_ROOT" reasoning >/dev/null
+  docker run --rm -v "$ROOT:/src:ro" -v "$TARGET_VOLUME":/target -v "$(ns_shared cargo)":/usr/local/cargo/registry \
     -w /src "$RUST_IMAGE" cargo build --release --locked -p nrese-reasoner --example v2_closure \
     --target-dir /target >"$RESULTS/nrese-build.log" 2>&1
 fi

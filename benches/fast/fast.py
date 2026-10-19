@@ -9,7 +9,8 @@ hour, run like unit tests for performance (README.md here; the cases: benches/ca
     python benches/fast/fast.py prepare [--cases A,B]   a release gate's data, once, by one generator (native)
     python benches/fast/fast.py compete [--cases A,B] [--systems S,T]   NRESE beside its comparators
     python benches/fast/fast.py table [--baseline R] [--write]   the cases as CATALOG.md's table
-    python benches/fast/fast.py clean [--data]           this worktree's scratch; --data the shared data volume too
+    python benches/fast/fast.py clean [--build] [--data]  this checkout's scratch; --build its containers and
+                                                          build volume (a job's cleanup); --data the shared data volume
 
 `run` generates each case's data once (deterministic; kept in the fast volume, hosts.toml),
 runs each case in its own container under the case's memory cap, checks the answers
@@ -19,7 +20,7 @@ then every case again. `compare` reports regressions and wins beyond a bootstrap
 confidence interval of the ratio of medians.
 
 The build runs scripts/cargo-guarded.sh inside the pinned Rust image, into this
-worktree's own target volume (nrese-target-<worktree>), with CARGO_BUILD_JOBS and
+checkout's own target volume (suitekit/ns.py: the job's namespace), with CARGO_BUILD_JOBS and
 NRESE_MEMORY_CAP_GB from the environment (defaults 4 and 8) and the container capped
 to match.
 """
@@ -52,12 +53,18 @@ from suitekit.compare import (KEPT_POINTS, UNSTABLE_PEAK, bootstrap_ratio, clien
                               compare_reports, counter_changes, load_report, peak_spread, pooled,
                               process_peak, series_ratios, spread, statistic, thin)
 from suitekit.workloads import fast_data_name  # noqa: E402
+from suitekit import ns  # noqa: E402
 
 # The volumes (benches/hosts.toml [volumes]; NRESE_FAST_VOLUME and NRESE_BENCH_VOLUME name others).
 DATA_VOLUME = hosts.volume("fast")
 BENCH_VOLUME = hosts.volume("data")
-TARGET_VOLUME = os.environ.get("NRESE_TARGET_VOLUME", f"nrese-target-{ROOT.name}")
-CARGO_VOLUME = "nrese-cargo"
+# This checkout's own build volume, and its containers' and scratch's names: the job's
+# namespace (suitekit/ns.py); the Cargo registry is a cache every job shares.
+TARGET_VOLUME = ns.name("target", ROOT)
+CARGO_VOLUME = ns.shared("cargo")
+OWNER = "fast"
+# Its scratch in the shared fast volume.
+VOLUME_SCRATCH = f"/fast/scratch/{ns.name('scratch', ROOT)}"
 SCRATCH = ROOT / "tmp" / "fast"
 BASELINES = Path(os.environ.get("NRESE_FAST_BASELINES") or ROOT / "benches" / "baselines" / "fast")
 # The full reports, outside git (the same path on the main and the office PC).
@@ -139,7 +146,7 @@ def files(script: str) -> subprocess.CompletedProcess:
 
 
 def docker(args: list[str], timeout: float | None = None, capture: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["docker", *args], capture_output=capture, text=True, timeout=timeout, env=ENV,
+    return subprocess.run([ns.executable(), *args], capture_output=capture, text=True, timeout=timeout, env=ENV,
                           encoding="utf-8", errors="replace")
 
 
@@ -193,15 +200,17 @@ def quiet_slot(what: str):
         holder.wait(timeout=60)
 
 
-def container(name: str, cap_gb: float, command: list[str], env: dict | None = None,
+def container(kind: str, cap_gb: float, command: list[str], env: dict | None = None,
               timeout: float | None = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
     """Runs `command` under a memory cap without swap, in the Rust image or natively; (exit
-    code, stdout, stderr, wall seconds). Exit 137: killed at the cap."""
+    code, stdout, stderr, wall seconds). Exit 137: killed at the cap. Its name: `kind` in the
+    job's namespace."""
+    name = ns.name(f"fast-{kind}", ROOT)
     cap_gb = capped(cap_gb)
     SCRATCH.mkdir(parents=True, exist_ok=True)
     if RUNTIME == "native":
         return process(name, cap_gb, command, env, timeout)
-    argv = ["run", "--rm", "--name", name, f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g", *cpu_args(),
+    argv = ["run", "--rm", *ns.name_args(name, ROOT, OWNER), f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g", *cpu_args(),
             *quiet_label(),
             "-v", f"{TARGET_VOLUME}:/target:ro", "-v", f"{DATA_VOLUME}:/fast",
             "-v", f"{BENCH_VOLUME}:/data:ro", "-v", f"{host_path(ROOT)}:/src:ro",
@@ -283,10 +292,11 @@ def build(args) -> int:
                  "(scripts/cargo-guarded.sh build --release --locked with the packages of fast.py BUILD)")
     jobs =os.environ.get("CARGO_BUILD_JOBS", "4")
     cap = os.environ.get("NRESE_MEMORY_CAP_GB", "8")
-    for volume in (TARGET_VOLUME, CARGO_VOLUME):
-        docker(["volume", "create", volume])
+    docker(ns.volume("create", TARGET_VOLUME, ROOT, OWNER))
+    print(f"build volume {TARGET_VOLUME} (fast.py clean --build removes it)", flush=True)
     for packages in BUILD:
-        command = ["run", "--rm", "--name", f"fast-build-{ROOT.name}", f"--memory={cap}g", f"--memory-swap={cap}g",
+        command = ["run", "--rm", *ns.name_args(ns.name("fast-build", ROOT), ROOT, OWNER),
+                   f"--memory={cap}g", f"--memory-swap={cap}g",
                    f"--cpus={jobs}", "-v", f"{host_path(ROOT)}:/src:ro", "-v", f"{TARGET_VOLUME}:/target",
                    "-v", f"{CARGO_VOLUME}:/usr/local/cargo/registry", "-e", "CARGO_TARGET_DIR=/target",
                    "-e", f"CARGO_BUILD_JOBS={jobs}", "-e", f"NRESE_MEMORY_CAP_GB={cap}", "-w", "/src", rust_image(),
@@ -357,7 +367,9 @@ def ensure_data(spec: str) -> dict:
             if files(f"test -s {target}").returncode != 0:
                 raise RuntimeError(f"missing input: {spec} was not prepared (fast.py prepare)")
             return {}
-        files(f"test -s {target} || cat {parts} > {target}")
+        # Into the shared volume whole: another job may be reading or writing the same file.
+        part = f"{target}.{ns.name('part', ROOT)}"
+        files(f"test -s {target} || {{ cat {parts} > {part} && mv -f {part} {target}; }}")
         return {}
     path = data_file(spec)
     seed_from_inputs(path)
@@ -368,7 +380,7 @@ def ensure_data(spec: str) -> dict:
         raise RuntimeError(f"missing input: {spec} was not prepared (fast.py prepare)")
     kind, *params = spec.split()
     print(f"  generating {path}", flush=True)
-    code, out, err, _ = container(f"fast-gen-{ROOT.name}", 8, [
+    code, out, err, _ = container("gen", 8, [
         "bash", "-c", f"/target/release/examples/perf_lab generate {kind} {path} {' '.join(params)} > {path}.expect.json"
                       f" && cat {path}.expect.json"])
     if code != 0:
@@ -608,11 +620,11 @@ def verdict(case: dict, record: dict) -> dict:
 
 def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
     """run_case's measurement, its data ready: the record."""
-    name = f"fast-{case['name']}-{ROOT.name}"
+    name = case["name"]
     tool = case.get("tool", "perf_lab")
     out_json = f"/out/{case['name']}.json"
     record = {"case": case["name"], "rep": rep, "status": "ok", "notes": []}
-    scratch = f"/fast/scratch/{case['name']}"
+    scratch = f"{VOLUME_SCRATCH}/{case['name']}"
     repeat = int(case.get("repeat", 1))
     # Each measured invocation gets the case's wall limit; 0 means unlimited in both runtimes.
     timeout_s = case.get("timeout_s", CASE_TIMEOUT_S) or None
@@ -1425,23 +1437,23 @@ def table(args) -> int:
 
 
 def clean(args) -> int:
-    """This worktree's scratch and its stopped containers; the fast data volume only with
-    `--data`, and never while a container uses it: the volume is shared by every worktree and
-    campaign on the host, and holds copies of the verified inputs besides the generated data."""
+    """This checkout's scratch and its containers; with `--build` its build volume too (a job's
+    cleanup: what carries its namespace and checkout, nothing else, ns.clean); the fast data
+    volume only with `--data`, by hand, and never while a container uses it: it is shared by
+    every job on the host and holds copies of the verified inputs besides the generated data."""
     import shutil
     if RUNTIME == "native":
         shutil.rmtree(SCRATCH, ignore_errors=True)
-        print(f"removed {SCRATCH}")
+        files(f"rm -rf {VOLUME_SCRATCH}")
+        print(f"removed {SCRATCH} and {VOLUME_SCRATCH}")
         if args.data:
             shutil.rmtree(FAST_DATA, ignore_errors=True)
             print(f"removed the generated data {FAST_DATA}")
         return 0
-    stale = docker(["ps", "-a", "--filter", "status=exited", "--filter", f"name=-{ROOT.name}$",
-                    "--format", "{{.Names}}"]).stdout.split()
-    for name in stale:
-        docker(["rm", name])
+    files(f"rm -rf {VOLUME_SCRATCH}")
+    removed = [] if not args.build else ns.clean(ROOT, OWNER, run=docker)
     shutil.rmtree(SCRATCH, ignore_errors=True)
-    print(f"removed {SCRATCH}" + (f" and {len(stale)} stopped containers of this worktree" if stale else ""))
+    print(f"removed {SCRATCH} and {VOLUME_SCRATCH}" + (f"; this checkout's {', '.join(removed)}" if removed else ""))
     if not args.data:
         print(f"kept the volume {DATA_VOLUME} (shared; `clean --data` removes it)")
         return 0
@@ -1449,7 +1461,7 @@ def clean(args) -> int:
     if users:
         print(f"kept the volume {DATA_VOLUME}: in use by {', '.join(users)}")
         return 1
-    done = docker(["volume", "rm", DATA_VOLUME])
+    done = docker(ns.volume("rm", DATA_VOLUME))
     print(f"removed the volume {DATA_VOLUME}" if done.returncode == 0 else f"volume {DATA_VOLUME}: {done.stderr.strip()}")
     return done.returncode
 
@@ -1494,7 +1506,9 @@ def main() -> int:
     sub.add_parser("build")
     k = sub.add_parser("clean")
     k.add_argument("--data", action="store_true",
-                   help="also the shared fast data volume (refused while a container uses it)")
+                   help="also the shared fast data volume, by hand (refused while a container uses it)")
+    k.add_argument("--build", action="store_true",
+                   help="also this checkout's containers and build volume (a job's cleanup: never another's)")
     c = sub.add_parser("compare")
     c.add_argument("base")
     c.add_argument("new")

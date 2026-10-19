@@ -9,7 +9,7 @@ window = "quiet"
 priority = 2
 est_min = 480
 needs = ["docker"]
-env = { PYTHONIOENCODING = "utf-8", DOCKER_MEMORY = "28g", JAVA_HEAP = "20g", NRESE_TARGET_VOLUME = "nrese-target-breadth", NRESE_QUIET_DRAIN_S = "1800", NRESE_LICENSES = "/home/krarilotus/nrese-assets/kraris-gptler-20261009/snapshots/windows/nrese-bench/licenses" }
+env = { PYTHONIOENCODING = "utf-8", DOCKER_MEMORY = "28g", JAVA_HEAP = "20g", NRESE_QUIET_DRAIN_S = "1800", NRESE_LICENSES = "/home/krarilotus/nrese-assets/kraris-gptler-20261009/snapshots/windows/nrese-bench/licenses" }
 commands = [
   ["scripts/quiet-slot.sh", "python3", "benches/suite/suite.py", "run", "--data", "/home/krarilotus/nrese-breadth/data", "--results", "/home/krarilotus/owlrs/results/breadth-geo", "--workloads", "geographica2", "--tier", "geographica2=real", "--tier", "geographica2=census", "--tier", "geographica2=synthetic", "--tier", "geographica2=scalability", "--systems", "nrese,jena,rdf4j,graphdb,qlever,virtuoso", "--runs", "3", "--query-timeout-s", "3600", "--answers", "full", "--answers-reference", "jena,rdf4j"],
 ]

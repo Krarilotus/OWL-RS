@@ -13,6 +13,10 @@
 # generators run in throwaway containers named sparql-prep-*, capped (8 CPUs, 8 GB, lowest
 # priority) so that they never compete with a colleague's work on a shared host.
 set -euo pipefail
+# This job's names (scripts/lib/ns.sh): its containers and volumes; the shared datasets' volume.
+NS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+. "$NS_ROOT/scripts/lib/ns.sh"
+DATA_VOLUME=$(ns_shared data)
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${SPARQL_DATA:-$HOME/owlrs/sparql-data}
 sets=()
@@ -51,7 +55,8 @@ box() {  # NAME IMAGE sh -c SCRIPT: a capped throwaway container with OUT at /ou
           # /out read as OUT (the image's tool, java or g++, then comes from the host's PATH)
   local name=$1 image=$2; shift 2
   if command -v docker >/dev/null 2>&1; then
-    docker run --rm --name "sparql-prep-$name" "${CAP[@]}" --cpu-shares 2 -u "$(id -u):$(id -g)" \
+    ns_run_args "$(ns_name "sparql-prep-$name" "$NS_ROOT")" "$NS_ROOT" sparql
+    docker run --rm "${NS_ARGS[@]}" "${CAP[@]}" --cpu-shares 2 -u "$(id -u):$(id -g)" \
       -v "$OUT:/out" -w /out "$image" "$@"
   else
     local script=${3//\/out/$OUT}
