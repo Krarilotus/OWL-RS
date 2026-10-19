@@ -16,6 +16,7 @@
 //! - `measure` (tests, and the `measure` feature): holds what an operation allocates
 //!   against what it reserved
 //! - [`memory`]: the process's memory, and a watch for limits on long operations
+//! - [`region`]: growable arrays in pages of their own, charged before they grow
 //! - [`heap`]: heap profiles by phase, for memory guards and profiles
 //! - [`sort`]: sorting and deduplicating id keys by radix over their significant bits
 //!
@@ -36,6 +37,7 @@ pub mod join;
 #[cfg(any(test, feature = "measure"))]
 pub mod measure;
 pub mod memory;
+pub mod region;
 pub mod search;
 pub mod sort;
 pub mod table;
@@ -50,6 +52,7 @@ pub use budget::{
 #[global_allocator]
 static MEASURED: measure::Measured<std::alloc::System> = measure::Measured(std::alloc::System);
 pub use join::RowLimit;
+pub use region::{Pages, Region};
 pub use table::IdTable;
 
 /// A hash map keyed by term ids, with the fast hasher the operators use.
