@@ -57,6 +57,8 @@
 //!   stores without reasoning load). `--canonicalize` canonicalises blank nodes.
 //!   `--prepare-vector-graph 64:cosine` synchronously prepares that vector space before
 //!   query timing, recording its preparation phase and checking full graph coverage.
+//!   A query file ending in `.ac` holds typed text: autocompletion (the store's, ten
+//!   suggestions, inferred statements included) is timed for it.
 //!   `--then-commit FILE` applies one SPARQL update per line as a commit after the timed
 //!   runs, then runs each query once more: the report's `after_commit` (what the first
 //!   query after a commit pays, as full-text corpora do).
@@ -450,6 +452,49 @@ fn write_results(
     let file = std::io::BufWriter::new(std::fs::File::create(path)?);
     store.run_query(&prepared, &CancellationToken::new(), file)?;
     Ok(())
+}
+
+/// Whether a query file is typed text for autocompletion.
+fn is_autocomplete(file: &std::path::Path) -> bool {
+    file.extension().is_some_and(|x| x == "ac")
+}
+
+/// One autocompletion of `typed`: its suggestions and how long it took.
+fn complete_once(store: &StoreService, typed: &str) -> Result<(u64, Duration), String> {
+    let started = Instant::now();
+    let found = store
+        .autocomplete(&nrese_store::ReadScope::All, typed.trim(), 10, true)
+        .map_err(|e| e.to_string())?;
+    Ok((found.len() as u64, started.elapsed()))
+}
+
+/// [`measure`] for autocompletion.
+fn measure_autocomplete(store: &StoreService, typed: &str, args: &Args) -> Measured {
+    let mut measured = Measured {
+        rows: 0,
+        times: Vec::new(),
+        first: None,
+        error: None,
+        first_faults: None,
+        faults: Vec::new(),
+    };
+    for i in 0..args.warmup + args.runs {
+        match complete_once(store, typed) {
+            Ok((rows, elapsed)) => {
+                measured.rows = rows;
+                measured.first.get_or_insert(elapsed);
+                if i >= args.warmup {
+                    measured.times.push(elapsed);
+                }
+            }
+            Err(e) => {
+                measured.error = Some(e);
+                break;
+            }
+        }
+    }
+    measured.times.sort();
+    measured
 }
 
 fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
@@ -1135,7 +1180,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     } else {
         std::fs::read_dir(&args.queries)?
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "rq"))
+            .filter(|p| p.extension().is_some_and(|x| x == "rq" || x == "ac"))
             .filter(|p| {
                 args.only.as_ref().is_none_or(|only| {
                     p.file_stem()
@@ -1323,6 +1368,28 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             report.sum_p50 += p50;
             continue;
         }
+        if is_autocomplete(file) {
+            let m = measure_autocomplete(&store, text, args);
+            if let Some(error) = &m.error {
+                println!("{name:<28} error: {error}");
+                continue;
+            }
+            let p50 = ms(m.times[m.times.len() / 2]);
+            let (min, max) = (ms(m.times[0]), ms(*m.times.last().unwrap()));
+            report.sum_p50 += p50;
+            println!(
+                "{name:<28} {:>10} {p50:>11.2} {min:>10.2} {max:>10.2} {:>9}",
+                m.rows, "-"
+            );
+            let samples: Vec<String> = m.times.iter().map(|t| format!("{:.3}", ms(*t))).collect();
+            report.queries.push(format!(
+                "    {{\n      \"name\": \"{name}\",\n      \"rows\": {},\n      \"p50_ms\": {p50:.3},\n      \"min_ms\": {min:.3},\n      \"max_ms\": {max:.3},\n      \"samples_ms\": [{}],\n      \"first_ms\": {:.3}\n    }}",
+                m.rows,
+                samples.join(", "),
+                m.first.map_or(0.0, ms)
+            ));
+            continue;
+        }
         let m = measure(&store, text, args);
         if let Some(dir) = &args.results {
             write_results(&store, text, args, &dir.join(format!("{name}.out")))?;
@@ -1413,6 +1480,18 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         let mut after = Vec::new();
         for (file, text) in files.iter().zip(&texts) {
             let name = file.file_stem().unwrap().to_string_lossy().into_owned();
+            if is_autocomplete(file) {
+                let (rows, elapsed) = complete_once(&store, text)?;
+                println!(
+                    "{name:<28} after the commits: {rows} rows, {:.2} ms",
+                    ms(elapsed)
+                );
+                after.push(format!(
+                    "{{\"name\": \"{name}\", \"rows\": {rows}, \"ms\": {:.3}}}",
+                    ms(elapsed)
+                ));
+                continue;
+            }
             let mut request = SparqlQueryRequest::all(text);
             request.solutions_format = args.format;
             let prepared = PreparedQuery::parse(&request)?;
