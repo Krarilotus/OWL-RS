@@ -10,12 +10,17 @@ license.workspace = true
 [features]
 # The counting allocator and measurements (src/measure.rs), for other crates' tests: a
 # dev-dependency with this feature. Never in product builds.
-measure = []
+measure = ["dep:parking_lot_core"]
 
 [dependencies]
 foldhash = { workspace = true }
 hashbrown = { workspace = true }
 rayon = { workspace = true }
+# Warmed before measurements (src/measure.rs): its waiter table, grown once per process.
+parking_lot_core = { version = "0.9", optional = true }
+
+[dev-dependencies]
+parking_lot_core = "0.9"
 
 # The process's and the machine's memory (memory.rs).
 [target.'cfg(windows)'.dependencies]
