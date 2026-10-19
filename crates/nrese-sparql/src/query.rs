@@ -81,6 +81,10 @@ pub struct QueryOptions {
     /// Evaluate every GROUP BY that can stream in morsels of this many rows of its first
     /// pattern (`native/stream.rs`), not only when it runs out of memory. Tests set it.
     pub stream_rows: Option<usize>,
+    /// Join a pattern by probing the index once per row (`Some(true)`) or by scanning it
+    /// (`Some(false)`) wherever either can; `None`: by the estimates. The results are the
+    /// same; tests compare the two.
+    pub index_joins: Option<bool>,
     /// The graphs the query's user may read (graph-level access control): its dataset is
     /// restricted to them. `None`: every graph.
     pub access: Option<std::sync::Arc<crate::GraphAccess>>,

@@ -4219,6 +4219,152 @@ fn a_merge_of_listed_graphs_takes_no_shortcut_through_other_graphs() {
     }
 }
 
+/// Joins in a default graph merged from several graphs (`FROM`, the protocol's dataset, the
+/// merge of every graph, a restricted reader's readable graphs) and in `GRAPH`, run by
+/// index probes and by scans ([`QueryOptions::index_joins`]): both equal the reference
+/// evaluator (a restricted reader's on the dataset of its readable graphs). A third of the
+/// statements are in a second graph too: a probe skips the graphs outside the set and
+/// gives a statement once.
+#[test]
+fn joins_over_graph_sets_by_probes_and_by_scans_equal_the_reference() {
+    use nrese_rdf::NamedOrBlankNode;
+    use nrese_sparql::{GraphAccess, QueryDatasetSpecification};
+    let mut rng = Rng::seeded(20_261_019);
+    let (mut checked, mut probed, mut with_solutions) = (0, 0, 0);
+    let covered = |checked: usize, probed: usize, with_solutions: usize| {
+        checked > 200 && probed * 2 > checked && with_solutions * 3 > checked
+    };
+    let graph = |rng: &mut Rng| -> GraphName {
+        match rng.below(4) {
+            0 => GraphName::DefaultGraph,
+            n => ex(&format!("g{}", n - 1)).into(),
+        }
+    };
+    let named = |graphs: &[&str]| -> Vec<NamedOrBlankNode> {
+        graphs.iter().map(|g| ex(g).into()).collect()
+    };
+    let dataset = |default: Vec<GraphName>, named: Vec<NamedOrBlankNode>| {
+        let mut dataset = QueryDatasetSpecification::new();
+        dataset.set_default_graph(default);
+        dataset.set_available_named_graphs(named);
+        Some(dataset)
+    };
+    for drawn in 0.. {
+        if !draws_on(drawn, 6, covered(checked, probed, with_solutions)) {
+            break;
+        }
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in skewed_dataset(&mut rng) {
+            let copies = 1 + usize::from(rng.below(3) == 0);
+            for _ in 0..copies {
+                let g = graph(&mut rng);
+                let copy = Quad::new(
+                    quad.subject.clone(),
+                    quad.predicate.clone(),
+                    quad.object.clone(),
+                    g,
+                );
+                tx.insert(copy.as_ref());
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for query_case in 0..40 {
+            let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(3));
+            let rare = format!("?a <{EX}rare> ?b .");
+            let body = match rng.below(7) {
+                0 => format!("{rare} ?b {} ?c .", p(&mut rng)),
+                1 => format!("{rare} ?b {} ?c . ?c <{EX}name> ?n .", p(&mut rng)),
+                2 => format!("{rare} ?a {} ?c . ?c {} ?d .", p(&mut rng), p(&mut rng)),
+                3 => format!("{rare} OPTIONAL {{ ?b {} ?c }}", p(&mut rng)),
+                4 => format!("{rare} ?c {} ?d FILTER(?c = ?b)", p(&mut rng)),
+                5 => format!("GRAPH ?g {{ {rare} ?b {} ?c }}", p(&mut rng)),
+                _ => format!("{rare} GRAPH ?g {{ ?b {} ?c }}", p(&mut rng)),
+            };
+            let from = |graphs: &[&str]| -> String {
+                graphs.iter().map(|g| format!("FROM <{EX}{g}> ")).collect()
+            };
+            let (clause, options, oracle) = match rng.below(5) {
+                0 => (from(&["g0", "g1"]), QueryOptions::default(), None),
+                1 => (
+                    format!(
+                        "{}FROM NAMED <{EX}g1> FROM NAMED <{EX}g2> ",
+                        from(&["g0", "g1", "g2"])
+                    ),
+                    QueryOptions::default(),
+                    None,
+                ),
+                2 => {
+                    let default = vec![GraphName::DefaultGraph, ex("g1").into(), ex("g2").into()];
+                    let options = QueryOptions {
+                        dataset: dataset(default, named(&["g0", "g1"])),
+                        ..QueryOptions::default()
+                    };
+                    (String::new(), options, None)
+                }
+                3 => {
+                    let options = QueryOptions {
+                        union_default_graph: true,
+                        ..QueryOptions::default()
+                    };
+                    (String::new(), options, None)
+                }
+                _ => {
+                    let access = GraphAccess {
+                        graphs: vec![format!("{EX}g0"), format!("{EX}g1")],
+                        default_graph: rng.below(2) == 0,
+                        inferred: true,
+                        ..GraphAccess::default()
+                    };
+                    let mut default: Vec<GraphName> = vec![ex("g0").into(), ex("g1").into()];
+                    if access.default_graph {
+                        default.push(GraphName::DefaultGraph);
+                    }
+                    let oracle = QueryOptions {
+                        dataset: dataset(default, named(&["g0", "g1"])),
+                        ..QueryOptions::default()
+                    };
+                    let options = QueryOptions {
+                        union_default_graph: true,
+                        access: Some(std::sync::Arc::new(access)),
+                        ..QueryOptions::default()
+                    };
+                    (String::new(), options, Some(oracle))
+                }
+            };
+            let text = format!("SELECT * {clause}WHERE {{ {body} }}");
+            let context = format!("dataset {drawn}, query {query_case}: {text}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let oracle = oracle.unwrap_or_else(|| options.clone());
+            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
+            for index_joins in [Some(true), Some(false)] {
+                let options = QueryOptions {
+                    index_joins,
+                    ..options.clone()
+                };
+                let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+                assert_same_rows(&native, &expected, &format!("{context}, {index_joins:?}"));
+            }
+            let probes = QueryOptions {
+                index_joins: Some(true),
+                ..options
+            };
+            let plan = explain_query(&snapshot, &query, &probes).unwrap();
+            assert_eq!(plan.executor, "native", "{context}");
+            probed += usize::from(plan.steps.iter().any(|s| s.operator == "index join"));
+            with_solutions += usize::from(!expected.is_empty());
+            checked += 1;
+        }
+    }
+    assert!(
+        covered(checked, probed, with_solutions),
+        "{checked} checked, {probed} probed, {with_solutions} with solutions"
+    );
+}
+
 /// An `EXISTS` for [`exists_equal_the_reference`]: over any pattern, correlated with the outer
 /// solution through the variables it binds, through filters at its top, or deeper (inside
 /// an OPTIONAL, MINUS or BIND, where the native executor hands the query back).

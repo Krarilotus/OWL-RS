@@ -1199,6 +1199,8 @@ struct Context<'a> {
     cross_chunk_rows: usize,
     /// [`QueryOptions::stream_rows`].
     stream_rows: Option<usize>,
+    /// [`QueryOptions::index_joins`].
+    index_joins: Option<bool>,
     /// With a dataset of several default graphs (`FROM <a> FROM <b>`), the graphs whose
     /// merge the default graph is; the scope is then [`GraphScope::Union`].
     merge_set: Option<Vec<TermId>>,
@@ -1313,6 +1315,7 @@ impl<'a> Context<'a> {
             spatial_rewrite: !options.geosparql_stated_only,
             cross_chunk_rows: options.cross_chunk_rows.unwrap_or(CROSS_CHUNK_ROWS).max(1),
             stream_rows: options.stream_rows,
+            index_joins: options.index_joins,
             late: match options.equality_canonical || options.equality_early_expansion {
                 true => None,
                 false => snapshot.expand_late(options.read_model),
@@ -2601,10 +2604,7 @@ impl<'a> Context<'a> {
                     .into_iter()
                     .filter(|v| result.column(v).is_some())
                     .collect();
-                // (A default graph merged from listed graphs is read by scans, which filter.)
-                let probe = !shared.is_empty()
-                    && self.merge_set.is_none()
-                    && (result.table.len() as u64).saturating_mul(PROBE_FACTOR) < counts[next];
+                let probe = !shared.is_empty() && self.index_join(result.table.len(), counts[next]);
                 // A triple term between them: composed from the bound parts or taken apart
                 // into the pattern's (`triple_joins`).
                 let through = (!self.as_written && ranged[next].is_none())
@@ -2837,9 +2837,7 @@ impl<'a> Context<'a> {
                 .into_iter()
                 .filter(|v| result.column(v).is_some())
                 .collect();
-            let probe = !shared.is_empty()
-                && self.merge_set.is_none()
-                && (result.table.len() as u64).saturating_mul(PROBE_FACTOR) < counts[next];
+            let probe = !shared.is_empty() && self.index_join(result.table.len(), counts[next]);
             if self.trace.is_some() {
                 let count = counts[next] as f64;
                 let mut divisor = 1.0f64;
@@ -3712,6 +3710,14 @@ impl<'a> Context<'a> {
         )
     }
 
+    /// Whether a pattern of about `count` statements joins `rows` rows by probing the index
+    /// once per row rather than by a scan ([`PROBE_FACTOR`], [`QueryOptions::index_joins`]).
+    /// In a merged default graph both read every graph's copies of a statement.
+    fn index_join(&self, rows: usize, count: u64) -> bool {
+        self.index_joins
+            .unwrap_or_else(|| (rows as u64).saturating_mul(PROBE_FACTOR) < count)
+    }
+
     /// Joins `result` with `scan` by probing the index once per distinct key of `result`.
     fn probe_join(
         &self,
@@ -3773,6 +3779,7 @@ impl<'a> Context<'a> {
             key_columns: &key_columns,
             shared_positions: &shared_positions,
             positions: &positions,
+            graphs: self.merge_set.as_deref().filter(|_| scan.merged()),
             width: vars.len(),
             max_rows: self.max_rows(vars.len()),
             produced: AtomicUsize::new(0),
@@ -5255,6 +5262,9 @@ struct Probe<'a> {
     shared_positions: &'a [Vec<usize>],
     /// The scan positions of each new variable.
     positions: &'a [Vec<usize>],
+    /// For a merged default graph of listed graphs, the graphs ([`Context::merge_set`]):
+    /// the index's matches in other graphs are skipped.
+    graphs: Option<&'a [TermId]>,
     width: usize,
     /// Output rows allowed in total (the query's memory budget), and produced so far.
     max_rows: usize,
@@ -5320,6 +5330,11 @@ impl Probe<'_> {
                     }
                 }
                 cursor.for_each(&bound.quad_pattern(), |quad| {
+                    if let Some(graphs) = self.graphs
+                        && !graphs.contains(&quad.graph)
+                    {
+                        return;
+                    }
                     let components = quad.components();
                     let start = matches.len();
                     for places in self.positions {
