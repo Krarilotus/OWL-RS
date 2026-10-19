@@ -130,6 +130,7 @@ impl super::Context<'_> {
             spatial_rewrite: self.spatial_rewrite,
             cross_chunk_rows: self.cross_chunk_rows,
             stream_rows: self.stream_rows,
+            index_joins: self.index_joins,
             merge_set: self.merge_set.clone(),
             named: self.named.clone(),
             synthetic: Cell::new(self.synthetic.get()),

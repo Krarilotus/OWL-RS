@@ -254,8 +254,7 @@ impl Context<'_> {
             .into_iter()
             .filter(|v| left.column(v).is_some())
             .collect();
-        let probe = self.merge_set.is_none()
-            && (left.table.len() as u64).saturating_mul(PROBE_FACTOR) < count;
+        let probe = self.index_join(left.table.len(), count);
         if probe {
             self.probe_join(left, scan, &shared)
         } else {

@@ -643,6 +643,7 @@ fn query_options(
         pre_bound: None,
         cross_chunk_rows: None,
         stream_rows: None,
+        index_joins: None,
         access: prepared.access.clone(),
         result_cache: store.result_cache.clone(),
         pin: prepared.pin.clone(),
