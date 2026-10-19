@@ -154,10 +154,13 @@ prepare)
   general=$(cd "$tree" && py -c 'import sys; sys.path.insert(0, "benches/suite")
 from suitekit import hosts; print(hosts.input_path("general") or "")')
   fast_env
-  # The plan: what this host runs at the cases' declared caps.
+  # The plan: what this host runs at the cases' declared caps. Replaced only whole and only
+  # when made: a failed plan left the passes of another job in this directory an empty one
+  # (aa3-phuoc-timed, 19 Oct 2026).
   (cd "$tree" && py benches/fast/release_gate.py plan --max-gb "$MAX_GB" --min-gb "${GATE_MIN_GB:-0}" \
      ${GATE_BIG_GB:+--big-gb "$GATE_BIG_GB" --big-host "${GATE_BIG_HOST:-khaleesi}"} ${GATE_CASES:+--cases "$GATE_CASES"}) \
-    > "$GATE/plan.json" || exit 2
+    > "$GATE/plan.json.partial" && mv "$GATE/plan.json.partial" "$GATE/plan.json" \
+    || { log "prepare: no plan (release_gate.py plan failed)"; exit 2; }
   cp "$GATE/plan.json" "$OUT/plan.json"
   cases=$(planned)
   log "plan: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["run"]), "cases;", len(d["not_run"]), "not run;", len(d["elsewhere"]), "on the big host")' "$GATE/plan.json")"
@@ -264,6 +267,8 @@ pass)
   fast_env
   # A timed pass: prepared data only (fast.py refuses to make any while it times).
   export NRESE_TIMED_GATE=1
+  # A plan that can't be read (empty, half written) is no pass, never every case.
+  cases=$(planned "$plan") && [ -n "$cases" ] || { log "pass $n: the plan $plan can't be read"; exit 2; }
   log "pass $n: $side $rev on the cases of $harness, plan $(basename "$plan") (${flags[*]})"
   # The host kept quiet while the pass runs (scripts/lib/quiet-watch.py, as the measurement
   # queue's timed chunks: this user's other busy processes stopped, other containers paused,
@@ -276,7 +281,7 @@ pass)
     watcher=$!
   fi
   (cd "$tree" && NRESE_FAST_BIN=$bin NRESE_FAST_REVISION=$rev \
-     py benches/fast/fast.py run --reps 1 --label "gate-$n-$side" --cases "$(planned "$plan")" --out "$report" "${flags[@]}") \
+     py benches/fast/fast.py run --reps 1 --label "gate-$n-$side" --cases "$cases" --out "$report" "${flags[@]}") \
      > "$OUT/passes/pass-$n-$side.log" 2>&1
   code=$?
   if [ -n "$watcher" ]; then
