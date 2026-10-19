@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 
 use nrese_engine::vector::Metric;
 use nrese_engine::{TermId, VectorQuery, VectorSearchReport, VectorStrategy};
-use nrese_exec::{Budget, IdTable, Reservation, UNDEF};
+use nrese_exec::{IdTable, UNDEF};
 use nrese_rdf::{Literal, Term, Variable};
 use nrese_sparql_syntax::algebra::GraphPattern;
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
@@ -408,25 +408,23 @@ impl Context<'_> {
     }
 }
 
-/// Probe rows charged to the query's budget: released if they drop, handed on by
+/// Probe rows: their table holds its charge, released if they drop, handed on by
 /// [`Probed::take`].
 struct Probed<'b> {
     rows: Solutions,
-    held: Reservation<&'b Budget>,
+    _query: std::marker::PhantomData<&'b ()>,
 }
 
 impl<'b> Probed<'b> {
-    fn new(ctx: &'b Context<'_>, rows: Solutions) -> Self {
-        let bytes = rows.table.memory_bytes();
+    fn new(_ctx: &'b Context<'_>, rows: Solutions) -> Self {
         Self {
             rows,
-            held: Reservation::adopt(&*ctx.budget, bytes),
+            _query: std::marker::PhantomData,
         }
     }
 
-    /// The rows, whose new holder releases them.
+    /// The rows, with their charge.
     fn take(self) -> Solutions {
-        self.held.transfer();
         self.rows
     }
 }
@@ -842,7 +840,11 @@ mod tests {
             Err(QueryEvaluationError::MemoryLimit(error)) => error,
             _ => panic!("fourth winner's union must exceed the remaining budget"),
         };
-        assert_eq!((error.used, error.requested), (UNRELATED + 2048, 6144));
+        // The tables' charges include their vectors of columns (24 bytes a column).
+        assert_eq!(
+            (error.used, error.requested),
+            (UNRELATED + 2048 + 96, 6144 + 48)
+        );
         assert_eq!(
             ctx.budget.used(),
             UNRELATED,

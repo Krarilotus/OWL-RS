@@ -797,6 +797,17 @@ pub enum TermRef<'a> {
     Triple(&'a Triple),
 }
 
+impl Triple {
+    /// The bytes its terms hold on the heap ([`Term::heap_bytes`]).
+    pub fn heap_bytes(&self) -> usize {
+        let subject = match &self.subject {
+            NamedOrBlankNode::NamedNode(n) => n.heap_bytes(),
+            NamedOrBlankNode::BlankNode(b) => b.heap_bytes(),
+        };
+        subject + self.predicate.heap_bytes() + self.object.heap_bytes()
+    }
+}
+
 impl NamedNode {
     /// The bytes its IRI holds on the heap.
     pub fn heap_bytes(&self) -> usize {
@@ -833,13 +844,7 @@ impl Term {
             Self::NamedNode(n) => n.heap_bytes(),
             Self::BlankNode(b) => b.heap_bytes(),
             Self::Literal(l) => l.heap_bytes(),
-            Self::Triple(t) => {
-                let subject = match &t.subject {
-                    NamedOrBlankNode::NamedNode(n) => n.heap_bytes(),
-                    NamedOrBlankNode::BlankNode(b) => b.heap_bytes(),
-                };
-                size_of::<Triple>() + subject + t.predicate.heap_bytes() + t.object.heap_bytes()
-            }
+            Self::Triple(t) => size_of::<Triple>() + t.heap_bytes(),
         }
     }
 

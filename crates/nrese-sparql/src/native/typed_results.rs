@@ -57,7 +57,9 @@ impl SolutionTable {
 
     /// Bytes reserved for this result.
     pub fn reserved_bytes(&self) -> usize {
-        self.held.bytes() + self.aligned.as_ref().map_or(0, Reservation::bytes)
+        self.held.bytes()
+            + self.table.charge()
+            + self.aligned.as_ref().map_or(0, Reservation::bytes)
     }
 
     /// Align both results to one dictionary/computed-value domain. O(cells + computed
@@ -117,7 +119,7 @@ impl SolutionTable {
                 return table;
             }
             let mut columns = table.into_columns();
-            for column in &mut columns {
+            for column in columns.iter_mut() {
                 for id in column {
                     if *id != UNDEF
                         && let Some(i) = computed_index(*id)
@@ -234,25 +236,19 @@ pub(crate) fn evaluate(
     query: &nrese_sparql_syntax::Query,
     options: &crate::QueryOptions,
 ) -> Result<TypedResults, QueryEvaluationError> {
-    let (outcome, mut held) = super::run(&snapshot, query, options)?;
+    let (outcome, held) = super::run(&snapshot, query, options)?;
     Ok(match outcome {
         Outcome::Boolean(value) => TypedResults::Boolean(value),
         Outcome::Graph(triples) => TypedResults::Graph(triples, held),
-        Outcome::Solutions(solutions, computed) => {
-            held.charge(
-                computed
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<Term>())
-                    .saturating_add(computed.iter().map(crate::cache::term_heap).sum()),
-            )?;
-            TypedResults::Solutions(SolutionTable {
-                snapshot,
-                variables: solutions.vars.into(),
-                table: solutions.table,
-                computed: Arc::new(computed),
-                held,
-                aligned: None,
-            })
-        }
+        // The computed terms were charged as they were made, and `held` took that over;
+        // the table holds its own charge.
+        Outcome::Solutions(solutions, computed) => TypedResults::Solutions(SolutionTable {
+            snapshot,
+            variables: solutions.vars.into(),
+            table: solutions.table,
+            computed: Arc::new(computed),
+            held,
+            aligned: None,
+        }),
     })
 }

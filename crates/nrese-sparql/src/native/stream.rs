@@ -298,12 +298,7 @@ impl Context<'_> {
         plan: &Plan<'_>,
     ) -> NativeResult<Solutions> {
         let vars = partials[0].vars.clone();
-        let growth = super::concat_growth(&partials);
-        let all = self.reshaped(partials, growth, |partials| Solutions {
-            table: IdTable::concat(vars.len(), partials.into_iter().map(|p| p.table).collect()),
-            vars,
-            ordered: false,
-        })?;
+        let all = self.concatenated(vars, partials)?;
         self.group_solutions(all, variables, &plan.merges)
     }
 

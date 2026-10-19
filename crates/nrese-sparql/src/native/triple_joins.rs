@@ -241,13 +241,13 @@ impl Context<'_> {
         linked: (Vec<bool>, Vec<Vec<u64>>),
     ) -> NativeResult<Solutions> {
         let (keep, values) = linked;
-        let left = self.reshaped(result, 0, |mut left| {
+        let left = self.reshaped(result, |mut left| {
             left.table.retain_mask(&keep);
             let mut columns = std::mem::take(&mut left.table).into_columns();
             columns.extend(values);
             left.vars.extend(link.binds.iter().cloned());
             left.table = IdTable::from_columns(columns);
-            left
+            Ok(left)
         })?;
         let shared: Vec<Variable> = scan
             .vars()
