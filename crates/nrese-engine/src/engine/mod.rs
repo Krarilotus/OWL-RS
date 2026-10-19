@@ -662,8 +662,9 @@ impl Engine {
 
     /// What the canonical views of versions are charged to while their versions keep them
     /// (canonical equality answers; `Snapshot::with_canonical_equality`): unlimited unless
-    /// given one. A view the budget refuses is made for its reader alone, which charges it
-    /// ([`Snapshot::canonical_view_uncharged`]). Snapshots taken from now on use it.
+    /// given one. A view the budget refuses is made on its reader's own budget, for that
+    /// reader alone ([`Snapshot::with_canonical_equality_within`]). Snapshots taken from now
+    /// on use it.
     pub fn set_canonical_view_budget(&self, budget: Arc<nrese_exec::Budget>) {
         *self.inner.shared.views.write() = budget;
     }
