@@ -876,7 +876,7 @@ impl Report {
             .map(|(key, value)| format!("\n  \"{key}\": {value},"))
             .collect();
         format!(
-            "{{\n  \"label\": {label:?},\n  \"open_s\": {:.3},\n  \"load_s\": {:.3},\n  \"peak_mib\": {},\n  \"cgroup_peak_mib\": {},\n  \"sum_p50_ms\": {:.3},{}{}\n  \"queries\": [\n{}\n  ]\n}}\n",
+            "{{\n  \"label\": {label:?},\n  \"open_s\": {:.6},\n  \"load_s\": {:.6},\n  \"peak_mib\": {},\n  \"cgroup_peak_mib\": {},\n  \"sum_p50_ms\": {:.3},{}{}\n  \"queries\": [\n{}\n  ]\n}}\n",
             self.open_s,
             self.load_s,
             memory.map_or(0, |(peak, _)| peak),

@@ -74,7 +74,11 @@ def load_passes(directory: Path) -> list[dict]:
     return passes
 
 
-def schedule_errors(passes: list[dict], sides: list[str], min_passes: int) -> list[str]:
+STATUS_PASSES = 2  # a case with a declared outcome (a known limit): its status checked, not timed
+
+
+def schedule_errors(passes: list[dict], sides: list[str], min_passes: int,
+                    status_only: set[str] | None = None) -> list[str]:
     """Defect 1 (audit, 18 Oct 2026): a gate passed with one baseline and passes whose times
     overlapped. Every side needs at least `min_passes` passes, all sides as many; the passes
     ran one after another (each ended before the next began, no two began at once); their
@@ -126,9 +130,10 @@ def schedule_errors(passes: list[dict], sides: list[str], min_passes: int) -> li
         if len(sub) == len(order):
             continue
         counts = Counter(sub)
-        if any(counts[s] < min_passes for s in sides) or len({counts[s] for s in sides}) > 1:
+        least = STATUS_PASSES if case in (status_only or set()) else min_passes
+        if any(counts[s] < least for s in sides) or len({counts[s] for s in sides}) > 1:
             errors.append(f"{case}: " + ", ".join(f"{s} {counts[s]}" for s in sides)
-                          + f" passes; each side as many, at least {min_passes}")
+                          + f" passes; each side as many, at least {least}")
         elif sub != sub[::-1]:
             errors.append(f"{case}: its passes ran {'-'.join(sub)}, not a palindrome")
     return errors
@@ -300,6 +305,17 @@ def per_pass(values: list, key: str | None = None) -> list[list[float]]:
     return out
 
 
+def quantum(sides: list[list[list[float]]]) -> float:
+    """The coarsest step every value of a series is a whole multiple of (1, 0.1, 0.01 ms; else
+    0): a tool that reports milliseconds to one decimal (the EL classifier's phases), or a time
+    derived from seconds to three (an older perf lab's open_s), moves in such steps."""
+    values = [v for side in sides for vs in side for v in vs]
+    for q in (1.0, 0.1, 0.01):
+        if values and all(abs(v / q - round(v / q)) < 1e-6 for v in values):
+            return q
+    return 0.0
+
+
 def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str]) -> dict:
     """The candidate's case against one baseline's, dimension by dimension."""
     row = {"comparable": True, "dimensions": {}, "notes": [], "blocks": [], "reported": {}}
@@ -347,10 +363,14 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str]) -
         if not on_base:
             row["notes"].append(f"time/{s}: not on every pass of {side}, not compared")
             continue
-        # Batched on both sides (every pass): the resolution of a sample of K executions.
+        # Batched on both sides (every pass): the resolution of a sample of K executions. A
+        # series reported in coarser steps (quantum): a difference of one step is no verdict.
         k = min(cand["batched"].get(s, 1), base["batched"].get(s, 1))
-        row["dimensions"][f"time/{s}"] = judge(per_pass(values["base"], s), per_pass(values["cand"], s), unit="ms",
-                                               resolution=RESOLUTION["ms"] / k if k > 1 else None)
+        b_, c_ = per_pass(values["base"], s), per_pass(values["cand"], s)
+        resolution = RESOLUTION["ms"] / k if k > 1 else RESOLUTION["ms"]
+        if (q := quantum([b_, c_])) > resolution:
+            resolution = q * 1.001
+        row["dimensions"][f"time/{s}"] = judge(b_, c_, unit="ms", resolution=resolution)
     if not series:
         row["blocks"].append("no timing evidence")
     # Memory (one policy, PROTOCOL.md §5): the process's own peak (VmHWM, every side's perf lab)
@@ -472,7 +492,8 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
         summary["errors"].append(f"required baselines missing: {', '.join(missing)}")
     if len(baselines) < 1:
         summary["errors"].append("no baseline")
-    summary["errors"] += schedule_errors(passes, list(sides), min_passes)
+    status_only = {c["name"] for c in (catalog or []) if c.get("outcome", "ok") != "ok"}
+    summary["errors"] += schedule_errors(passes, list(sides), min_passes, status_only)
     planned = sorted({c for p in passes for c in p["report"].get("planned_cases", [])})
     summary["planned"] = planned
     summary["errors"] += provenance_errors(passes, sides, harness, planned)
@@ -757,9 +778,11 @@ TARGET_LOSS, TARGET_POWER = 0.02, 0.90
 QUERY_MS = 2000.0      # a perf-lab process's measured query time, at most (the runs it buys)
 DL_MS = 3000.0         # a DL tool's process: its files' time, at most
 MAX_RUNS, MAX_REPEAT = 2000, 30
-PROCESS_S = 8.0        # a case's fresh processes a pass, at most this long together ...
+PROCESS_S = 15.0       # a case's fresh processes a pass, at most this long together ...
 MAX_PROCESSES = 5      # ... and at most this many (a process that started differently, outvoted)
 PROCESS_PASSES = 8     # only where this many passes alone don't reach the target
+PROCESS_TOOLS = ("perf_lab", "tableau", "classify-el", "classify-horn")
+KEPT = ("runs", "warmup", "batch", "batch_queries", "repeat", "processes")
 BATCH_SAMPLE_MS = 0.05  # a batched sample lasts at least this (50 µs: the timer's steps far below)
 BATCH_BELOW_MS = 0.25   # queries batched: those whose 2 % loss is below the 5 µs resolution
 PASS_OVERHEAD_S = 40   # a pass's own time beyond its cases' (start, records, the host's state)
@@ -788,8 +811,9 @@ def runs_adjustable(case: dict) -> bool:
 
 def judged_noise(rows: list[dict], resolution_ms: float = RESOLUTION["ms"]) -> float:
     """A case's noise for its passes: the largest of its series whose TARGET_LOSS is above the
-    timing resolution (a smaller series can't show that loss at any number of passes)."""
-    judged = [r["sd"] for r in rows if r["median_ms"] * TARGET_LOSS >= resolution_ms]
+    timing resolution and the series' reporting step (a smaller series can't show that loss at
+    any number of passes)."""
+    judged = [r["sd"] for r in rows if r["median_ms"] * TARGET_LOSS >= max(resolution_ms, r.get("quantum", 0.0))]
     return max(judged, default=0.0)
 
 
@@ -817,14 +841,17 @@ def power_at(table: dict, n: int, sigma: float) -> float:
 
 def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_passes: int = 16,
               min_passes: int = CAMPAIGN_PASSES, sides: int = 3, table: dict | None = None,
-              batch: bool = True, keep: dict | None = None) -> dict:
+              batch: bool = True, keep: dict | None = None, side_weights: dict | None = None) -> dict:
     """Each case's measurement from passes of the gate's host (an A/A run, or a gate's): runs,
     warm-ups, batch and repetitions from its times, passes from its noise. Every case gets
     `min_passes` a side; the passes beyond go where they buy the most power against TARGET_LOSS
     a second of the timed part (weighted by the case's judged series), until `budget_min`. The
-    passes' binaries are the sides (an A/A run's one binary counts `sides` times). `keep`: a
-    calibration the passes were measured with: its runs, warm-ups, batch and repetitions stay
-    (the passes' times already include them), only the noise and the passes are new."""
+    passes' binaries are the sides (an A/A run's one binary counts `sides` times). `keep`: the
+    calibration the passes were measured with: a case's settings there stay (the passes' times
+    include them), only its noise and passes are new; a case without settings there gets them.
+    `side_weights`: per case, a gate pass of every side in units of the candidate's (from a real
+    gate's passes, `side_weights()`; an older baseline runs fewer cases, or faster): an A/A run's
+    times are the candidate's alone."""
     cases = {c["name"]: c for c in catalog}
     by_case: dict[str, dict] = {}
     revs = set()
@@ -832,14 +859,18 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
         rev = (p["report"].get("binaries") or {}).get("revision") or p["side"]
         revs.add(rev)
         for r in p["report"].get("records", []):
-            entry = by_case.setdefault(r["case"], {"seconds": {}, "series": {}, "status": set(), "measured": {}})
-            entry["seconds"].setdefault(rev, []).append(r.get("case_s") or 0)
+            entry = by_case.setdefault(r["case"], {"seconds": {}, "series": {}, "status": set(), "measured": {},
+                                                   "quanta": {}})
+            # A case stopped at its limit and run once more past it (frontier) took that rerun's
+            # time too, which a gate's pass doesn't spend: its own measurement's then.
+            entry["seconds"].setdefault(rev, []).append((r.get("wall_s") if r.get("frontier") else r.get("case_s")) or 0)
             entry["status"].add(r.get("status"))
             entry["measured"] = r.get("measurement") or entry["measured"]
             if r.get("status") == "ok":
                 for s, values in (r.get("samples") or {}).items():
                     if values:
                         entry["series"].setdefault((rev, s), []).append(statistics.median(values))
+                        entry["quanta"].setdefault((rev, s), []).append(values)
     evens = list(range(min_passes, max_passes + 1, 2))
     table = table or power_table(evens)
     per_side = sides if len(revs) == 1 else 1
@@ -849,7 +880,7 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
         if case is None:
             continue
         rows = [{"rev": rev, "series": s, "median_ms": statistics.median(m),
-                 "sd": statistics.stdev(math.log(v) for v in m)}
+                 "sd": statistics.stdev(math.log(v) for v in m), "quantum": quantum([e["quanta"].get((rev, s), [])])}
                 for (rev, s), m in e["series"].items() if len(m) >= 2 and min(m) > 0]
         seconds = {rev: statistics.mean(v) for rev, v in e["seconds"].items()}
         # One execution of every query (a DL tool's file: its phases), on the slowest side that
@@ -858,9 +889,9 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
         added = 0.0  # a process's added measured time, on every side
         entry = {}
         measured_runs = e["measured"].get("runs")
-        if keep is not None:
-            entry.update({k: v for k, v in keep.get(name, {}).items()
-                          if k in ("runs", "warmup", "batch", "batch_queries", "repeat")})
+        kept = {k: v for k, v in (keep or {}).get(name, {}).items() if k in KEPT}
+        if kept:
+            entry.update(kept)
         elif runs_adjustable(case) and "ok" in e["status"] and rows:
             runs, warmup = case_runs(case)
             # The short queries batched, each sample well above the timer's steps (applied
@@ -890,21 +921,28 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
                 entry["repeat"] = new
                 added = (new - (e["measured"].get("repeat") or repeat)) * whole / 1000
         process_s = 0.0
-        if (keep is None and case.get("tool", "perf_lab") == "perf_lab" and "ok" in e["status"] and rows
+        if (not kept and "ok" in e["status"] and rows and case.get("tool", "perf_lab") in PROCESS_TOOLS
                 and power_at(table, PROCESS_PASSES, judged_noise(rows)) < TARGET_POWER):
             # Fresh processes a pass where passes alone won't do: a pass's value the median
-            # over several processes, one that started differently outvoted.
-            repeat = int(case.get("repeat", 1))
-            process_s = (statistics.mean(seconds.values()) + added) / max(e["measured"].get("repeat") or repeat, 1)
-            new = int(min(MAX_PROCESSES, max(repeat, PROCESS_S // max(process_s, 0.1))))
-            if new > repeat:
-                entry["repeat"] = new
-                added += (new - repeat) * process_s
+            # over several processes, one that started differently (another memory layout)
+            # outvoted. The perf lab's are `repeat`; a DL tool's `processes` (its `repeat`
+            # repeats inside one process).
+            key = "repeat" if case.get("tool", "perf_lab") == "perf_lab" else "processes"
+            have = int(case.get(key, 1))
+            process_s = (statistics.mean(seconds.values()) + added) / max(e["measured"].get(key) or have, 1)
+            new = int(min(MAX_PROCESSES, max(have, PROCESS_S // max(process_s, 0.1))))
+            if new > have:
+                entry[key] = new
+                added += (new - have) * process_s
         sigma = judged_noise(rows)
-        entry.update(noise=round(sigma, 4), passes=min_passes,
+        status = case.get("outcome", "ok") != "ok"
+        entry.update(noise=round(sigma, 4), passes=STATUS_PASSES if status else min_passes,
                      seconds=round(statistics.mean(seconds.values()) + added, 1))
         rounds[name] = per_side * sum(s + added for s in seconds.values())  # a pass of every side
-        processes[name] = (int(case.get("repeat", 1)), process_s * per_side * len(seconds))
+        if side_weights and len(revs) == 1 and name in side_weights:
+            rounds[name] = rounds[name] / sides * side_weights[name]
+        key = "repeat" if case.get("tool", "perf_lab") == "perf_lab" else "processes"
+        processes[name] = (key, int(case.get(key, 1)), process_s * per_side * len(seconds))
         weights[name] = max(1, len({r["series"] for r in rows if r["median_ms"] * TARGET_LOSS >= RESOLUTION["ms"]}))
         out[name] = entry
 
@@ -918,15 +956,16 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
 
     # Over the budget at the least passes: the added processes go first, the costliest first.
     while minutes(out) > budget_min:
-        grown = [c for c, e in out.items() if "repeat" in e and processes[c][1] and e["repeat"] > processes[c][0]]
+        grown = [c for c, e in out.items() if processes[c][2] and e.get(processes[c][0], 0) > processes[c][1]]
         if not grown:
             break
-        c = max(grown, key=lambda c: (out[c]["repeat"] - processes[c][0]) * processes[c][1])
-        out[c]["repeat"] -= 1
-        rounds[c] -= processes[c][1]
-        out[c]["seconds"] = round(out[c]["seconds"] - processes[c][1] / max(per_side * 1, 1) / max(len(revs), 1), 1)
-        if out[c]["repeat"] == processes[c][0]:
-            del out[c]["repeat"]
+        c = max(grown, key=lambda c: (out[c][processes[c][0]] - processes[c][1]) * processes[c][2])
+        key, have, cost = processes[c]
+        out[c][key] -= 1
+        rounds[c] -= cost
+        out[c]["seconds"] = round(out[c]["seconds"] - cost / per_side / max(len(revs), 1), 1)
+        if out[c][key] == have:
+            del out[c][key]
     power = lambda c, n: power_at(table, n, out[c]["noise"])  # noqa: E731
     spent = minutes(out)
     while True:
@@ -934,10 +973,12 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
         best = None
         for c, e in out.items():
             for n in evens:
-                if n <= e["passes"]:
-                    continue
+                if n <= e["passes"] or e["passes"] < min_passes:
+                    continue  # a status-only case (a declared outcome) isn't timed
                 gain = weights[c] * (power(c, n) - power(c, e["passes"]))
-                cost = (n - e["passes"]) * rounds[c] * 2 / 60 + max(0, n - top) * sides * PASS_OVERHEAD_S / 60
+                # Two passes a side more: one block (a pass of every side, twice) of the case,
+                # and of each block it adds, the passes' own time.
+                cost = (n - e["passes"]) * rounds[c] / 60 + max(0, n - top) * sides * PASS_OVERHEAD_S / 60
                 if gain > 1e-3 and spent + cost <= budget_min and (best is None or gain / cost > best[0]):
                     best = (gain / cost, c, n, cost)
         if best is None:
@@ -945,9 +986,25 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
         out[best[1]]["passes"] = best[2]
         spent = minutes(out)
     for e in out.values():
-        e["power"] = round(power_at(table, e["passes"], e["noise"]), 3)
+        if e["passes"] >= min_passes:
+            e["power"] = round(power_at(table, e["passes"], e["noise"]), 3)
     return {"cases": out, "minutes": round(minutes(out), 1), "cap": max(e["passes"] for e in out.values()),
             "budget_min": budget_min}
+
+
+def side_weights(passes: list[dict], candidate: str = "cand") -> dict[str, float]:
+    """Per case, the mean time of a pass of every side over the candidate's (a real gate's
+    passes: base, main and cand)."""
+    times: dict[str, dict[str, list[float]]] = {}
+    for p in passes:
+        for r in p["report"].get("records", []):
+            times.setdefault(r["case"], {}).setdefault(p["side"], []).append(r.get("case_s") or 0)
+    out = {}
+    for case, by_side in times.items():
+        cand = statistics.mean(by_side.get(candidate) or [0])
+        if cand > 0:
+            out[case] = sum(statistics.mean(v) for v in by_side.values()) / cand
+    return out
 
 
 def write_measure(result: dict, source: str) -> str:
@@ -967,10 +1024,11 @@ def write_measure(result: dict, source: str) -> str:
 
 def blocks(plan: list[str], measure: dict, min_passes: int = CAMPAIGN_PASSES) -> list[list[str]]:
     """The cases of each A-B-C-C-B-A block: block k (from 1) runs those whose passes a side
-    (measure.toml) reach 2k; the first min_passes / 2 blocks run the whole plan."""
-    need = {c: max(min_passes, int(measure.get(c, {}).get("passes", min_passes))) for c in plan}
-    count = max(need.values(), default=min_passes) // 2
-    return [[c for c in plan if need[c] >= 2 * k] for k in range(1, count + 1)]
+    (measure.toml) reach 2k, a case without an entry min_passes; the first block every case (a
+    declared outcome's passes are STATUS_PASSES: checked there, not timed)."""
+    need = {c: int(measure.get(c, {}).get("passes", min_passes)) for c in plan}
+    count = max([min_passes, *need.values()]) // 2
+    return [[c for c in plan if need[c] >= 2 * k or k == 1] for k in range(1, count + 1)]
 
 
 def read_measure(text: str | None) -> dict:
@@ -1040,12 +1098,12 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, passes_per_si
     per_pass = {"base": 1, "main": 1, "cand": 1} if small else {"base": 14, "main": 4, "cand": 14}
     if measure:
         # Blocks: the k-th runs the cases needing 2k passes a side; a pass's minutes, its cases'.
-        need = {c: max(passes_per_side, int(e.get("passes", passes_per_side))) for c, e in measure.items()}
+        need = {c: int(e.get("passes", passes_per_side)) for c, e in measure.items()}
         count = max(max(need.values()) // 2, passes_per_side // 2)
         full = sum(e.get("seconds", 0) for e in measure.values()) or 1
         steps, est, n = [[*gate, "plan-blocks", harness]], 2.0, 0
         for k in range(1, count + 1):
-            share = sum(e.get("seconds", 0) for c, e in measure.items() if need[c] >= 2 * k) / full
+            share = sum(e.get("seconds", 0) for c, e in measure.items() if need[c] >= 2 * k or k == 1) / full
             for side in schedule(2):
                 n += 1
                 steps.append([*gate, "pass", str(n), side, revs[side], harness, f"plan-block-{k}.json"])
@@ -1314,6 +1372,7 @@ def main() -> int:
     s.add_argument("--no-batch", action="store_true", help="no batched timing for the microsecond cases")
     s.add_argument("--table", type=Path, help="a power table written before (--write-table), not simulated again")
     s.add_argument("--keep", type=Path, help="the calibration the passes ran with: its runs stay, only passes are new")
+    s.add_argument("--sides", type=Path, help="a real gate's passes: each case's time on every side, for the budget")
     s.add_argument("--write-table", type=Path)
     s.add_argument("--out", type=Path, default=ROOT / "benches" / "fast" / "measure.toml")
     s = sub.add_parser("blocks", help="each block's plan of a gate (release-gate.sh plan-blocks)")
@@ -1396,11 +1455,15 @@ def main() -> int:
             args.write_table.write_text(json.dumps(table), encoding="utf-8")
         result = calibrate(cases_registry.load(), found, args.budget_min, args.max_passes, table=table,
                            batch=not args.no_batch,
-                           keep=read_measure(args.keep.read_text(encoding="utf-8")) if args.keep else None)
+                           keep=read_measure(args.keep.read_text(encoding="utf-8")) if args.keep else None,
+                           side_weights=side_weights(load_passes(args.sides) or [
+                               {"n": i, "side": f.stem.rsplit("-", 1)[-1], "path": f.name,
+                                "report": json.loads(f.read_text(encoding="utf-8"))}
+                               for i, f in enumerate(sorted(args.sides.glob("*.json")))]) if args.sides else None)
         hosts_ = sorted({str((p["report"].get("machine") or {}).get("host")) for p in found})
         source = f"{len(found)} passes on {', '.join(hosts_)} ({', '.join(sorted({p['path'] for p in found})[:2])} ...)"
         args.out.write_text(write_measure(result, source), encoding="utf-8")
-        under = {c: e for c, e in result["cases"].items() if e["power"] < TARGET_POWER}
+        under = {c: e for c, e in result["cases"].items() if e.get("power", 1) < TARGET_POWER}
         print(f"{len(result['cases'])} cases; timed part {result['minutes']} min; passes at most {result['cap']}; "
               f"{len(under)} below {TARGET_POWER:.0%} power at a {TARGET_LOSS:.0%} loss: "
               + ", ".join(f"{c} ({e['noise']:.3f}, {e['power']:.2f})" for c, e in sorted(under.items())))
