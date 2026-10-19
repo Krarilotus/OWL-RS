@@ -211,63 +211,17 @@ impl VectorIndex {
         }
     }
 
-    /// The `query.k` vectors nearest to `query.vector` that `accept` takes (by id).
-    pub(crate) fn search(
-        &self,
-        query: &VectorQuery,
-        accept: &(dyn Fn(u64) -> bool + Sync),
-    ) -> (Vec<Hit>, VectorSearchReport) {
-        let Some(space) = self.spaces.get(&query.vector.len()) else {
-            return (
-                Vec::new(),
-                VectorSearchReport {
-                    space: 0,
-                    graph: false,
-                    scanned: 0,
-                },
-            );
-        };
-        let len = space.vectors.len();
+    /// What a search like `query` reads: a cheap copy of its space's vectors (shared chunks)
+    /// and the graph, where the search uses one. `None`: no space of that dimension.
+    fn search_input(&self, query: &VectorQuery) -> Option<(Vectors, Option<Arc<Hnsw>>)> {
+        let space = self.spaces.get(&query.vector.len())?;
         let graph = space
             .graphs
             .iter()
             .find(|slot| slot.metric == query.metric)
-            .and_then(|slot| slot.graph.as_ref())
+            .and_then(|slot| slot.graph.clone())
             .filter(|_| uses_graph(space, query));
-        let Some(graph) = graph else {
-            let hits =
-                nrese_vector::exact(&space.vectors, &query.vector, query.k, query.metric, accept);
-            return (
-                hits,
-                VectorSearchReport {
-                    space: len,
-                    graph: false,
-                    scanned: len,
-                },
-            );
-        };
-        // Over-fetch for the filter: the beam keeps accepted vectors only, so a filter
-        // that rejects many needs a wider one.
-        let share = query.accepted.map_or(1.0, |n| n as f64 / len.max(1) as f64);
-        let ef = ((query.ef.max(query.k) as f64) / share.clamp(EXACT_SHARE, 1.0)).ceil() as usize;
-        let from_graph = graph.search(&space.vectors, &query.vector, query.k, ef, accept);
-        let tail = nrese_vector::exact_from(
-            &space.vectors,
-            graph.len(),
-            &query.vector,
-            query.k,
-            query.metric,
-            accept,
-        );
-        let hits = nrese_vector::merge(from_graph.into_iter().chain(tail), query.k);
-        (
-            hits,
-            VectorSearchReport {
-                space: len,
-                graph: true,
-                scanned: len - graph.len(),
-            },
-        )
+        Some((space.vectors.clone(), graph))
     }
 
     /// Whether no space has a vector.
@@ -468,6 +422,62 @@ fn uses_graph(space: &Space, query: &VectorQuery) -> bool {
 
 /// Builds or extends the graph `query` uses, from what `index` holds now, and installs
 /// it.
+/// The `query.k` vectors nearest to `query.vector` that `accept` takes (by id), from a copy
+/// taken under `index`'s read lock and searched after it: the scans are parallel, and a pool
+/// thread waiting for the lock (a writer queued, a search's `accept` re-entering) must never
+/// hold up a part of the search.
+pub(crate) fn search(
+    index: &RwLock<VectorIndex>,
+    query: &VectorQuery,
+    accept: &(dyn Fn(u64) -> bool + Sync),
+) -> (Vec<Hit>, VectorSearchReport) {
+    let input = index.read().search_input(query);
+    let Some((vectors, graph)) = input else {
+        return (
+            Vec::new(),
+            VectorSearchReport {
+                space: 0,
+                graph: false,
+                scanned: 0,
+            },
+        );
+    };
+    let len = vectors.len();
+    let Some(graph) = graph else {
+        let hits = nrese_vector::exact(&vectors, &query.vector, query.k, query.metric, accept);
+        return (
+            hits,
+            VectorSearchReport {
+                space: len,
+                graph: false,
+                scanned: len,
+            },
+        );
+    };
+    // Over-fetch for the filter: the beam keeps accepted vectors only, so a filter that
+    // rejects many needs a wider one.
+    let share = query.accepted.map_or(1.0, |n| n as f64 / len.max(1) as f64);
+    let ef = ((query.ef.max(query.k) as f64) / share.clamp(EXACT_SHARE, 1.0)).ceil() as usize;
+    let from_graph = graph.search(&vectors, &query.vector, query.k, ef, accept);
+    let tail = nrese_vector::exact_from(
+        &vectors,
+        graph.len(),
+        &query.vector,
+        query.k,
+        query.metric,
+        accept,
+    );
+    let hits = nrese_vector::merge(from_graph.into_iter().chain(tail), query.k);
+    (
+        hits,
+        VectorSearchReport {
+            space: len,
+            graph: true,
+            scanned: len - graph.len(),
+        },
+    )
+}
+
 pub(crate) fn build(index: &RwLock<VectorIndex>, query: &VectorQuery) {
     let Some((vectors, base)) = index.read().build_inputs(query) else {
         return;
@@ -506,5 +516,50 @@ pub(crate) fn build_in_background(index: Arc<RwLock<VectorIndex>>, query: Vector
         });
     if let Err(error) = spawned {
         tracing::warn!(%error, "vector graph not built");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A search's scans are parallel and run its filter on the pool's threads: there the
+    /// index's lock must be free, or a part that wanted it (a job the thread took on
+    /// meanwhile, behind a queued writer) would never return. The filter checks it on every
+    /// call; the search ran under the read lock before, which it found held.
+    #[test]
+    fn a_search_scans_without_the_index_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let lexical: Vec<String> = (0..40_000u64)
+            .map(|i| format!("[{}, {}, {}, 1]", i % 97, i % 89, i % 83))
+            .collect();
+        let entries: Vec<(u64, &str)> = lexical
+            .iter()
+            .enumerate()
+            .map(|(i, text)| (i as u64, text.as_str()))
+            .collect();
+        let mut index = VectorIndex::default();
+        index.extend(&entries, entries.len() as u64);
+        let index = Arc::new(RwLock::new(index));
+        // One check at a time: a failed try then means the search holds the lock.
+        let (checking, held) = (parking_lot::Mutex::new(()), AtomicBool::new(false));
+        let accept = |_: u64| {
+            let _one = checking.lock();
+            if index.try_write().is_none() {
+                held.store(true, Ordering::Relaxed);
+            }
+            true
+        };
+        for strategy in [VectorStrategy::Exact, VectorStrategy::Auto] {
+            let query = VectorQuery {
+                strategy,
+                ..VectorQuery::new(vec![1.0, 2.0, 3.0, 1.0], 10)
+            };
+            assert_eq!(search(&index, &query, &accept).0.len(), 10);
+        }
+        assert!(
+            !held.load(Ordering::Relaxed),
+            "the index's lock was held during the scan"
+        );
     }
 }
