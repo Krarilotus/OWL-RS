@@ -572,6 +572,12 @@ class Parts(unittest.TestCase):
             third = json.loads((Path(tmp) / "plan-block-3.json").read_text(encoding="utf-8"))
         self.assertEqual(third["run"], plan["run"][:1])
 
+    def test_an_empty_case_selection_is_refused_never_every_case(self):
+        from types import SimpleNamespace
+        with self.assertRaises(SystemExit):
+            fast.select([{"name": "a", "area": "query"}], SimpleNamespace(cases="", areas=None))
+        self.assertEqual(len(fast.select([{"name": "a", "area": "query"}], SimpleNamespace(cases=None, areas=None))), 1)
+
     def test_report_writes_markdown_and_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
