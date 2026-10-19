@@ -46,6 +46,9 @@ struct CachedClasses {
     /// ([`canonical_version`]): the cell passes on to later versions, so the last one asked
     /// for is kept.
     version: Option<(super::Content, Arc<Version>)>,
+    /// Whether a triple term of the version with that content names an alias
+    /// ([`EqualityCell::triple_terms_name_aliases`]).
+    triple_terms: Option<(super::Content, bool)>,
 }
 
 impl std::fmt::Debug for EqualityCell {
@@ -69,6 +72,7 @@ impl EqualityCell {
             classes: Arc::clone(&classes),
             canonical: None,
             version: None,
+            triple_terms: None,
         });
         classes
     }
@@ -81,6 +85,7 @@ impl EqualityCell {
             classes,
             canonical: Some(canonical),
             version: None,
+            triple_terms: None,
         })))
     }
 
@@ -121,6 +126,33 @@ impl EqualityCell {
             cached.version = Some((version.content, Arc::clone(&made)));
         }
         made
+    }
+}
+
+impl EqualityCell {
+    /// Whether a triple term of `version` names, at any depth, another identity of a
+    /// class than its representative (`find` decides it over the classes), once per
+    /// version.
+    pub(crate) fn triple_terms_name_aliases(
+        &self,
+        version: &Version,
+        same_as: TermId,
+        find: impl FnOnce(&Classes) -> bool,
+    ) -> bool {
+        let classes = self.classes(version, same_as);
+        if let Some(cached) = self.0.lock().as_ref()
+            && let Some((content, found)) = cached.triple_terms
+            && content == version.content
+        {
+            return found;
+        }
+        let found = find(&classes);
+        if let Some(cached) = self.0.lock().as_mut()
+            && Arc::ptr_eq(&cached.classes, &classes)
+        {
+            cached.triple_terms = Some((version.content, found));
+        }
+        found
     }
 }
 
@@ -333,7 +365,7 @@ impl Classes {
     }
 
     /// Whether `id` is an identity of a class other than its representative.
-    fn is_alias(&self, id: u64) -> bool {
+    pub(crate) fn is_alias(&self, id: u64) -> bool {
         self.aliases.contains_key(&id)
     }
 
