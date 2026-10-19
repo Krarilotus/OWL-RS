@@ -1756,16 +1756,20 @@ impl Snapshot {
         bits.resize(words, 0)?;
         let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
         scratch.charge(self.walk_scratch(words))?;
-        for &kind in documents.kinds() {
-            match scope {
-                TextScope::Graphs(graphs) => {
-                    self.mark_values(model, *graphs, documents, kind, &mut bits);
+        // Per graph, each kind's walk; a scan (where the index can't walk them) marks every
+        // kind at once.
+        let mut mark = |graph: GraphSelector| {
+            for &kind in documents.kinds() {
+                if self.mark_values(model, graph, documents, kind, &mut bits) {
+                    break;
                 }
-                TextScope::Merge(graphs) => {
-                    for &graph in graphs {
-                        let graph = GraphSelector::Exact(graph);
-                        self.mark_values(model, graph, documents, kind, &mut bits);
-                    }
+            }
+        };
+        match scope {
+            TextScope::Graphs(graphs) => mark(*graphs),
+            TextScope::Merge(graphs) => {
+                for &graph in graphs {
+                    mark(GraphSelector::Exact(graph));
                 }
             }
         }
@@ -1823,8 +1827,9 @@ impl Snapshot {
     /// Sets the bit of the dictionary entry of each term of `kind` at `documents`' position
     /// (object or subject) of the statements in `graphs` (one graph, every graph, or every
     /// named graph) in `model`. The entries in slices of whole words, on every core: each a
-    /// walk over the index's groups in its range of ids, so no list of every term is held;
-    /// a scan of the statements where the index can't walk them.
+    /// walk over the index's groups in its range of ids, so no list of every term is held.
+    /// Where the index can't walk them (a reader of equality classes), one scan of the
+    /// statements marks the terms of every kind of `documents`: then `true`.
     fn mark_values(
         &self,
         model: ReadModel,
@@ -1832,7 +1837,7 @@ impl Snapshot {
         documents: Documents,
         kind: TermKind,
         bits: &mut [u64],
-    ) {
+    ) -> bool {
         use rayon::prelude::*;
         let per = slice_words(bits.len());
         let walked = bits
@@ -1875,7 +1880,7 @@ impl Snapshot {
             })
             .collect::<Option<()>>();
         if walked.is_some() {
-            return;
+            return false;
         }
         let pattern = QuadPattern {
             graph: graphs,
@@ -1886,11 +1891,12 @@ impl Snapshot {
                 Documents::Literals | Documents::Vectors => quad.object,
                 Documents::Subjects => quad.subject,
             };
-            if value.kind() == kind {
+            if documents.holds(value.kind()) {
                 let at = value.payload();
                 bits[(at / 64) as usize] |= 1 << (at % 64);
             }
         }
+        true
     }
 
     /// Per distinct term in `low..=high` at `documents`' position of the statements in
