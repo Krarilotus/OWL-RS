@@ -1,39 +1,50 @@
-//! Canonical equality answers ([`crate::QueryOptions::equality_canonical`]): every term
-//! the query names stands for its `owl:sameAs` class, shown by the class's representative
-//! (research-designs §1, "Canonical answers").
+//! Canonical equality answers ([`crate::QueryOptions::equality_canonical`]): the query
+//! evaluated over the quotient of the dataset by its `owl:sameAs` classes, each class one
+//! term, shown by its representative (research-designs §1, "Canonical answers").
 //!
-//! Canonical reads normalise the constants of a triple pattern themselves
-//! (`nrese_engine::Snapshot::canonical_classes`); the solutions they give name
-//! representatives. A term that reaches the solutions another way has to take the same
-//! mapping, or it misses the class it names: `VALUES ?x { <alias> } ?x ex:p ex:o` would
-//! join `<alias>` with the representative the scan gives, and `FILTER(?x = <alias>)` would
-//! compare them. So, by that one mapping:
+//! **One id space.** Every id the evaluation works on names a class by its representative,
+//! so that joins, filters and every rewrite of the plan (filter pushdown across `GRAPH`,
+//! sideways information passing) see one consistent id space and stay valid as they are.
+//! Ids enter evaluation at four places, and each takes the one mapping,
+//! `nrese_engine::Snapshot::canonical_classes`:
 //!
-//! - the query's constants (triple patterns, paths, VALUES, expressions of FILTER, BIND,
-//!   ORDER BY, aggregates and EXISTS, subqueries, pre-bound values) are put in as their
-//!   representatives once, before planning ([`Context::canonical_pattern`]);
-//! - a term the evaluation makes or receives (`IRI()`, a federated row) gets its
-//!   representative's id when it gets an id ([`Context::id`]), and `IRI()` names the
-//!   representative inside an expression too ([`super::Evaluator`]);
-//! - solutions of a named graph name its terms as stored (named graphs carry no equality,
-//!   as in strict answers), and are mapped where they leave `GRAPH`;
-//! - values sent to a `SERVICE` endpoint, which names terms as stored, go as every
-//!   identity of their class (`federation`'s bind join).
+//! - **reads**: a canonical snapshot gives representatives from every graph (the engine's
+//!   canonical reads; named graphs over representatives too);
+//! - **the query's constants**: put in as their representatives once, before planning,
+//!   with pre-bound values ([`Context::canonical_pattern`]);
+//! - **terms the evaluation makes**: `IRI()` names the representative, through the
+//!   canonical-name function the same pass wraps around it ([`FUNCTION`]);
+//! - **a remote endpoint's rows**: mapped where they are imported, and a bound value sent
+//!   to an endpoint as every identity of its class (`federation`).
 //!
-//! Inside `GRAPH` and `SERVICE` nothing is mapped: a named graph is read as stored, and a
-//! remote endpoint knows nothing of the classes. Triple terms are one term each, as in
-//! the store's classes.
+//! Whether canonical answers apply is decided once per query (`Context::new`): where its
+//! default graph is the one the equality covers (the store's, or the merge of every graph,
+//! in a model with inferred statements) and some class exists. Elsewhere, and without the
+//! option, nothing here runs: the plan is the one without canonical answers.
+//!
+//! **Refused, not answered.** Triple terms are one term each (the store's classes and
+//! dictionary know no other); a query that takes one apart or builds one (`SUBJECT`,
+//! `PREDICATE`, `OBJECT`, `TRIPLE`, a triple pattern with a variable inside) could tell a
+//! class's identities apart through it, and a store with a literal in a class would need
+//! every computed literal mapped. Both are refused (`QueryEvaluationError::Unsupported`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use nrese_engine::{EqualityClasses, Snapshot, TermId};
-use nrese_rdf::{Literal, NamedNode, Term, TermRef};
+use nrese_rdf::{Literal, NamedNode, Term, TermRef, Variable};
 use nrese_sparql_syntax::algebra::{
-    AggregateExpression, Expression, GraphPattern, OrderExpression, PropertyPathExpression,
+    AggregateExpression, Expression, Function, GraphPattern, OrderExpression,
+    PropertyPathExpression,
 };
 use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
 use super::Context;
+use crate::results::QueryEvaluationError;
+
+/// The canonical-name function: its argument's representative. Only canonical answers'
+/// plans hold it.
+pub(crate) const FUNCTION: &str = "urn:nrese:canonical-name";
 
 /// The classes canonical answers name terms by, with the snapshot that decodes them.
 #[derive(Clone)]
@@ -43,7 +54,8 @@ pub(crate) struct Names {
 }
 
 impl Names {
-    /// The names of canonical reads of `snapshot` in `model`, if they rename anything.
+    /// The names of canonical reads of `snapshot` in `model`, if some class renames
+    /// anything.
     pub(super) fn of(snapshot: &Snapshot, model: nrese_engine::ReadModel) -> Option<Self> {
         Some(Self {
             snapshot: snapshot.clone(),
@@ -51,9 +63,10 @@ impl Names {
         })
     }
 
-    /// The representative of the stored term `id` (itself outside every class).
-    pub(super) fn id(&self, id: u64) -> u64 {
-        self.classes.representative(TermId::from_raw(id)).raw()
+    /// The representative's id of `term`, if the snapshot knows it.
+    pub(super) fn lookup(&self, term: TermRef<'_>) -> Option<u64> {
+        let id = self.snapshot.lookup(term)?;
+        Some(self.classes.representative(id).raw())
     }
 
     /// The identities the stored term `id` stands for: its class's, or itself.
@@ -78,37 +91,58 @@ impl Names {
             None => term,
         }
     }
+
+    /// Pre-bound values as canonical answers name them.
+    pub(super) fn values(&self, values: &HashMap<Variable, Term>) -> HashMap<Variable, Term> {
+        values
+            .iter()
+            .map(|(v, t)| (v.clone(), self.term(t.clone())))
+            .collect()
+    }
+
+    /// Graphs by the names canonical reads give them, each once.
+    pub(super) fn graphs(&self, graphs: Vec<TermId>) -> Vec<TermId> {
+        let mut graphs: Vec<TermId> = graphs
+            .into_iter()
+            .map(|g| self.classes.representative(g))
+            .collect();
+        graphs.sort_unstable();
+        graphs.dedup();
+        graphs
+    }
 }
 
 impl Context<'_> {
-    /// The canonical names where the triple patterns are read now: the default graph as a
-    /// whole, under canonical answers.
-    pub(super) fn canonical_here(&self) -> Option<&Names> {
-        self.canonical.as_ref().filter(|_| self.late_scope())
-    }
-
-    /// `pattern` with the query's constants put in as their representatives (module
-    /// docs); unchanged without canonical answers.
-    pub(super) fn canonical_pattern(&self, pattern: GraphPattern) -> GraphPattern {
-        match self.canonical_here() {
-            Some(names) => Rewrite { ctx: self, names }.pattern(&pattern),
-            None => pattern,
+    /// `pattern` with the query's constants put in as their representatives, `IRI()`
+    /// wrapped in the canonical-name function (module docs); unchanged without canonical
+    /// answers. An error for what canonical answers refuse.
+    pub(super) fn canonical_pattern(
+        &self,
+        pattern: GraphPattern,
+    ) -> Result<GraphPattern, QueryEvaluationError> {
+        let Some(names) = &self.canonical else {
+            return Ok(pattern);
+        };
+        if names.classes.relate_literals() {
+            return Err(refused("a literal is an identity of an owl:sameAs class"));
+        }
+        let rewrite = Rewrite {
+            ctx: self,
+            names,
+            refused: std::cell::Cell::new(None),
+        };
+        let pattern = rewrite.pattern(&pattern);
+        match rewrite.refused.get() {
+            Some(what) => Err(refused(what)),
+            None => Ok(pattern),
         }
     }
+}
 
-    /// Solutions leaving `GRAPH`, their stored names mapped (module docs).
-    pub(super) fn canonical_solutions(&self, mut solutions: super::Solutions) -> super::Solutions {
-        if let Some(names) = self.canonical_here() {
-            let columns = std::mem::take(&mut solutions.table).into_columns();
-            let columns = columns
-                .into_iter()
-                .map(|column| column.into_iter().map(|id| names.id(id)).collect())
-                .collect();
-            solutions.table = nrese_exec::IdTable::from_columns(columns);
-            solutions.ordered = false;
-        }
-        solutions
-    }
+fn refused(what: &str) -> QueryEvaluationError {
+    QueryEvaluationError::Unsupported(format!(
+        "canonical equality answers (equality.answers = \"canonical\"): {what}"
+    ))
 }
 
 /// A constant put in for another identity of a class.
@@ -120,6 +154,8 @@ enum Constant {
 struct Rewrite<'c, 'a> {
     ctx: &'c Context<'a>,
     names: &'c Names,
+    /// What the query does that canonical answers refuse, if anything.
+    refused: std::cell::Cell<Option<&'static str>>,
 }
 
 impl Rewrite<'_, '_> {
@@ -151,6 +187,7 @@ impl Rewrite<'_, '_> {
         let constant = match term {
             TermPattern::NamedNode(n) => self.constant(n.as_ref().into(), false),
             TermPattern::Literal(l) => self.constant(l.as_ref().into(), false),
+            // A triple term is one term: its parts stay as written.
             _ => None,
         };
         match constant {
@@ -168,6 +205,13 @@ impl Rewrite<'_, '_> {
     }
 
     fn triple(&self, triple: &TriplePattern) -> TriplePattern {
+        if [&triple.subject, &triple.object]
+            .iter()
+            .any(|t| matches!(t, TermPattern::Triple(inner) if !super::triple_terms::ground(inner)))
+        {
+            self.refused
+                .set(Some("a triple pattern takes a triple term apart"));
+        }
         TriplePattern {
             subject: self.term_pattern(&triple.subject),
             predicate: self.named_node_pattern(&triple.predicate),
@@ -247,6 +291,18 @@ impl Rewrite<'_, '_> {
             Expression::In(a, xs) => Expression::In(e(a), list(xs)),
             Expression::If(a, b, c) => Expression::If(e(a), e(b), e(c)),
             Expression::Coalesce(xs) => Expression::Coalesce(list(xs)),
+            Expression::FunctionCall(Function::Iri, args) => Expression::FunctionCall(
+                Function::Custom(NamedNode::new_unchecked(FUNCTION)),
+                vec![Expression::FunctionCall(Function::Iri, list(args))],
+            ),
+            Expression::FunctionCall(
+                Function::Triple | Function::Subject | Function::Predicate | Function::Object,
+                _,
+            ) => {
+                self.refused
+                    .set(Some("an expression builds or takes apart a triple term"));
+                expression.clone()
+            }
             Expression::FunctionCall(function, args) => {
                 Expression::FunctionCall(function.clone(), list(args))
             }
@@ -290,6 +346,11 @@ impl Rewrite<'_, '_> {
             },
             GraphPattern::Filter { expr, inner } => GraphPattern::Filter {
                 expr: self.expression(expr),
+                inner: p(inner),
+            },
+            // Named graphs are read over representatives too, their names included.
+            GraphPattern::Graph { name, inner } => GraphPattern::Graph {
+                name: self.named_node_pattern(name),
                 inner: p(inner),
             },
             GraphPattern::Extend { inner, bindings } => GraphPattern::Extend {
@@ -372,8 +433,8 @@ impl Rewrite<'_, '_> {
                     })
                     .collect(),
             },
-            // Read as stored, or by another endpoint (module docs).
-            GraphPattern::Graph { .. } | GraphPattern::Service { .. } => pattern.clone(),
+            // The endpoint knows no classes: its block goes as written.
+            GraphPattern::Service { .. } => pattern.clone(),
         }
     }
 }

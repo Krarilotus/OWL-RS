@@ -145,10 +145,17 @@ impl Context<'_> {
             )
             .into());
         };
-        let patterns = match bound.and_then(|bound| bind_values(bound, inner, self)) {
-            Some(chunks) => chunks,
-            None => vec![inner.clone()],
+        // Under canonical answers a bound value stands for its class, and the endpoint names
+        // each identity as stored ([`super::canonical`]).
+        let (chunks, _held) = match (bound, &self.canonical) {
+            (Some(bound), None) => (bind_values(bound, inner, self), None),
+            (Some(bound), Some(names)) => match self.bind_classes(bound, inner, names)? {
+                Some((chunks, held)) => (Some(chunks), Some(held)),
+                None => (None, None),
+            },
+            (None, _) => (None, None),
         };
+        let patterns = chunks.unwrap_or_else(|| vec![inner.clone()]);
         let mut all: Option<Solutions> = None;
         for pattern in patterns {
             self.check()?;
@@ -162,14 +169,13 @@ impl Context<'_> {
                 .0
                 .select(endpoint, &query, self.cancellation.as_ref())
                 .map_err(QueryEvaluationError::Service)?;
-            let mut table = IdTable::new(results.variables.len());
-            let mut row = vec![UNDEF; results.variables.len()];
-            for values in &results.rows {
-                for (slot, value) in row.iter_mut().zip(values) {
-                    *slot = value.as_ref().map_or(UNDEF, |term| self.id(term));
-                }
-                table.push_row(&row);
-            }
+            // The endpoint's terms as canonical answers name them.
+            let table = match &self.canonical {
+                None => import(&results, |term| self.id(term)),
+                Some(names) => import(&results, |term| {
+                    names.lookup(term.as_ref()).unwrap_or_else(|| self.id(term))
+                }),
+            };
             let solutions = self.produced(Solutions {
                 vars: results.variables,
                 table,
@@ -181,6 +187,134 @@ impl Context<'_> {
             });
         }
         Ok(all.unwrap_or_else(Solutions::unit))
+    }
+}
+
+/// The endpoint's rows as an id table, each term's id by `id`.
+fn import(results: &crate::ServiceResults, id: impl Fn(&Term) -> u64) -> IdTable {
+    let mut table = IdTable::new(results.variables.len());
+    let mut row = vec![UNDEF; results.variables.len()];
+    for values in &results.rows {
+        for (slot, value) in row.iter_mut().zip(values) {
+            *slot = value.as_ref().map_or(UNDEF, &id);
+        }
+        table.push_row(&row);
+    }
+    table
+}
+
+impl Context<'_> {
+    /// [`bind_values`] under canonical answers: every combination of the identities of
+    /// the classes a row's values stand for. Counted before anything is made: past
+    /// [`BIND_LIMIT`] rows the block goes without `VALUES` (`None`), as a bind join would
+    /// past it. The rows are reserved before they are made, the reservation held with the
+    /// patterns made of them, and the query's cancellation is checked as they are.
+    fn bind_classes(
+        &self,
+        bound: &Solutions,
+        inner: &GraphPattern,
+        names: &super::canonical::Names,
+    ) -> NativeResult<Option<(Vec<GraphPattern>, nrese_exec::Reservation)>> {
+        let mut in_scope = Vec::new();
+        bound_variables(inner, &mut in_scope);
+        let shared: Vec<(Variable, usize)> = in_scope
+            .into_iter()
+            .filter_map(|v| bound.column(&v).map(|c| (v, c)))
+            .collect();
+        if shared.is_empty() {
+            return Ok(None);
+        }
+        let mut keys: Vec<Vec<u64>> = Vec::new();
+        let mut seen: HashSet<Vec<u64>> = HashSet::new();
+        let mut rows = 0usize;
+        for r in 0..bound.table.len() {
+            let key: Vec<u64> = shared.iter().map(|&(_, c)| bound.table.get(r, c)).collect();
+            if seen.contains(&key) {
+                continue;
+            }
+            let combinations = key
+                .iter()
+                .try_fold(1usize, |n, id| n.checked_mul(names.members(id).len()));
+            match combinations.and_then(|n| rows.checked_add(n)) {
+                Some(total) if total <= BIND_LIMIT => rows = total,
+                _ => return Ok(None),
+            }
+            seen.insert(key.clone());
+            keys.push(key);
+        }
+        // A row's terms, each a term of its own (an estimate per term, as the endpoint's
+        // query text is made from them).
+        let width = shared.len();
+        let variables: Vec<Variable> = shared.iter().map(|(v, _)| v.clone()).collect();
+        let mut held = nrese_exec::Reservation::new(std::sync::Arc::clone(&self.budget));
+        held.charge(rows.saturating_mul(width) * (std::mem::size_of::<GroundTerm>() + 64))
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        let mut out: Vec<Vec<Option<GroundTerm>>> = Vec::with_capacity(rows.min(BIND_CHUNK));
+        let mut patterns = Vec::new();
+        for key in &keys {
+            self.check()?;
+            let mut terms: Vec<Vec<GroundTerm>> = Vec::with_capacity(width);
+            for id in key {
+                let mut class = Vec::new();
+                for &member in names.members(id) {
+                    match ground(self, member) {
+                        Some(term) => class.push(term),
+                        None => return Ok(None),
+                    }
+                }
+                terms.push(class);
+            }
+            // Odometer order over the identities, the last value fastest.
+            let mut at = vec![0usize; width];
+            loop {
+                out.push(
+                    at.iter()
+                        .zip(&terms)
+                        .map(|(&i, class)| Some(class[i].clone()))
+                        .collect(),
+                );
+                if out.len() == BIND_CHUNK {
+                    patterns.push(values_join(&variables, std::mem::take(&mut out), inner));
+                }
+                let Some(column) = (0..width).rev().find(|&c| at[c] + 1 < terms[c].len()) else {
+                    break;
+                };
+                at[column] += 1;
+                at[column + 1..].fill(0);
+            }
+        }
+        if !out.is_empty() {
+            patterns.push(values_join(&variables, out, inner));
+        }
+        Ok(Some((patterns, held)))
+    }
+}
+
+/// A stored term as a `VALUES` term; `None` for a blank node (no bind join then).
+fn ground(ctx: &Context<'_>, id: u64) -> Option<GroundTerm> {
+    Some(match ctx.term(id)? {
+        Term::NamedNode(n) => GroundTerm::NamedNode(n),
+        Term::Literal(l) => GroundTerm::Literal(l),
+        // A triple term goes along if it holds no blank node.
+        triple @ Term::Triple(_) => GroundTerm::try_from(triple).ok()?,
+        Term::BlankNode(_) => return None,
+    })
+}
+
+/// The `SERVICE` block joined to `rows` as `VALUES`.
+fn values_join(
+    variables: &[Variable],
+    rows: Vec<Vec<Option<GroundTerm>>>,
+    inner: &GraphPattern,
+) -> GraphPattern {
+    GraphPattern::Join {
+        inputs: vec![
+            GraphPattern::Values {
+                variables: variables.to_vec(),
+                bindings: rows,
+            },
+            inner.clone(),
+        ],
     }
 }
 
@@ -203,32 +337,25 @@ fn bind_values(
     }
     let mut seen: HashSet<Vec<u64>> = HashSet::new();
     let mut rows: Vec<Vec<Option<GroundTerm>>> = Vec::new();
-    let names = ctx.canonical_here();
     for r in 0..bound.table.len() {
         let key: Vec<u64> = shared.iter().map(|&(_, c)| bound.table.get(r, c)).collect();
-        let keys = match names {
-            Some(names) => identities(&key, names),
-            None => vec![key],
-        };
-        for key in keys {
-            if !seen.insert(key.clone()) {
-                continue;
-            }
-            if seen.len() > BIND_LIMIT {
-                return None;
-            }
-            let mut row = Vec::with_capacity(key.len());
-            for id in key {
-                row.push(Some(match ctx.term(id)? {
-                    Term::NamedNode(n) => GroundTerm::NamedNode(n),
-                    Term::Literal(l) => GroundTerm::Literal(l),
-                    // A triple term goes along if it holds no blank node.
-                    triple @ Term::Triple(_) => GroundTerm::try_from(triple).ok()?,
-                    Term::BlankNode(_) => return None,
-                }));
-            }
-            rows.push(row);
+        if !seen.insert(key.clone()) {
+            continue;
         }
+        if seen.len() > BIND_LIMIT {
+            return None;
+        }
+        let mut row = Vec::with_capacity(key.len());
+        for id in key {
+            row.push(Some(match ctx.term(id)? {
+                Term::NamedNode(n) => GroundTerm::NamedNode(n),
+                Term::Literal(l) => GroundTerm::Literal(l),
+                // A triple term goes along if it holds no blank node.
+                triple @ Term::Triple(_) => GroundTerm::try_from(triple).ok()?,
+                Term::BlankNode(_) => return None,
+            }));
+        }
+        rows.push(row);
     }
     let variables: Vec<Variable> = shared.into_iter().map(|(v, _)| v).collect();
     Some(
@@ -244,24 +371,4 @@ fn bind_values(
             })
             .collect(),
     )
-}
-
-/// Under canonical answers a value stands for its class, and an endpoint names each
-/// identity as stored: every combination of the identities of `key`'s values
-/// ([`super::canonical`]).
-fn identities(key: &[u64], names: &super::canonical::Names) -> Vec<Vec<u64>> {
-    let mut keys = vec![Vec::with_capacity(key.len())];
-    for id in key {
-        keys = keys
-            .iter()
-            .flat_map(|prefix| {
-                names.members(id).iter().map(move |&member| {
-                    let mut key = prefix.clone();
-                    key.push(member);
-                    key
-                })
-            })
-            .collect();
-    }
-    keys
 }

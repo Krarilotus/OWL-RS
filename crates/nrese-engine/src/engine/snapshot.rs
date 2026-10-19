@@ -147,12 +147,22 @@ impl Snapshot {
 
     /// This snapshot reading equality classes canonically (work package W4, stage C):
     /// each statement of the default graph once, over its terms' representatives, the
-    /// pattern's constants in place; no copies for the other identities. Answers over it
+    /// pattern's constants in place; no copies for the other identities. Named graphs are
+    /// read over representatives too (`equality::canonical_version`), so that every id a
+    /// read gives in a model with inferred statements is a representative. Answers over it
     /// name one identity per class (`equality.answers = "canonical"`), and a query engine
     /// joins over it and expands the classes after the joins ([`Self::expand_late`]).
     /// Without equality classes it reads as this snapshot.
     pub fn with_canonical_equality(&self) -> Snapshot {
+        let version = match self.equality {
+            Some(same_as) => self
+                .version
+                .equality
+                .canonical_version(&self.version, same_as),
+            None => Arc::clone(&self.version),
+        };
         Snapshot {
+            version,
             canonical: true,
             ..self.clone()
         }
@@ -163,17 +173,18 @@ impl Snapshot {
         self.canonical
     }
 
-    /// The equality classes by which reads of the default graph in `model` name terms
-    /// canonically: `Some` when this snapshot reads canonically, the model has inferred
-    /// statements and some class exists. Under it a term stands for its class, shown by
+    /// The equality classes by which reads in `model` name terms canonically: `Some` when
+    /// this snapshot reads canonically, the model has inferred statements and some class
+    /// exists. Under it a term stands for its class, shown by
     /// [`EqualityClasses::representative`]. That is the one mapping of canonical answers
-    /// (research-designs §1, "Canonical answers"): reads normalise the constants of a
-    /// pattern by it, and every other way a term meets those reads (a query's constants
-    /// in VALUES, BIND and expressions, a computed IRI, a federated row, an index keyed
-    /// by stored ids such as the spatial or text index) is mapped by it too. A value
-    /// leaving those reads for something that names terms as stored (a remote endpoint)
-    /// goes as every identity of its class ([`EqualityClasses::members_of`]). Named graphs
-    /// and the asserted model are read as stored, without it.
+    /// (research-designs §1, "Canonical answers"): every id such a read gives, from any
+    /// graph, is a representative; a constant of a pattern read in the default graph is
+    /// normalised by it; every other id that meets those reads (a query's constants, a
+    /// computed IRI, a federated row, an id an index keyed by stored ids gives, such as
+    /// the spatial or text index) must be mapped by it too. A value leaving those reads
+    /// for something that names terms as stored (a remote endpoint) goes as every
+    /// identity of its class ([`EqualityClasses::members_of`]). The asserted model is
+    /// read as stored, without it.
     pub fn canonical_classes(&self, model: ReadModel) -> Option<Arc<EqualityClasses>> {
         if !self.canonical {
             return None;
@@ -333,8 +344,9 @@ impl Snapshot {
         }
         // Named graphs are read as stored, with the pattern's own constants: from this
         // scan when the representatives are those constants, else from one of their own.
+        // A canonical snapshot's named graphs are over representatives: from this scan.
         let named = model == ReadModel::Materialised && pattern.graph == GraphSelector::Any;
-        let renamed = normalised != *pattern;
+        let renamed = normalised != *pattern && !self.canonical;
         let named_plan = match named && renamed {
             true => Some(AccessPlan::in_permutation(pattern, permutation)?),
             false => None,
@@ -381,7 +393,9 @@ impl Snapshot {
                 for stack in Stack::ALL {
                     for quad in self.stack_quads(stack, &normalised) {
                         if !quad.graph.is_default_graph() {
-                            if model == ReadModel::Materialised && normalised == *pattern {
+                            if model == ReadModel::Materialised
+                                && (normalised == *pattern || self.canonical)
+                            {
                                 all.push(quad);
                             }
                             continue;
@@ -401,6 +415,7 @@ impl Snapshot {
                 if model == ReadModel::Materialised
                     && pattern.graph == GraphSelector::Any
                     && normalised != *pattern
+                    && !self.canonical
                 {
                     all.extend(
                         self.stack_quads(Stack::Asserted, pattern)
@@ -427,7 +442,10 @@ impl Snapshot {
         for stack in Stack::ALL {
             for quad in self.stack_quads(stack, &normalised) {
                 if !quad.graph.is_default_graph() {
-                    count += u64::from(model == ReadModel::Materialised && normalised == *pattern);
+                    count += u64::from(
+                        model == ReadModel::Materialised
+                            && (normalised == *pattern || self.canonical),
+                    );
                     continue;
                 }
                 if !classes.is_canonical(&quad) {
@@ -449,6 +467,7 @@ impl Snapshot {
         if model == ReadModel::Materialised
             && pattern.graph == GraphSelector::Any
             && normalised != *pattern
+            && !self.canonical
         {
             count += self
                 .stack_quads(Stack::Asserted, pattern)
@@ -468,8 +487,9 @@ impl Snapshot {
         let stored = self.stored();
         let normalised = classes.normalised(pattern);
         let mut estimate = stored.count_in(ReadModel::Materialised, &normalised);
-        // Named graphs are read with the pattern's own constants.
-        if normalised != *pattern && pattern.graph == GraphSelector::Any {
+        // Named graphs are read with the pattern's own constants (a canonical snapshot's,
+        // over representatives, with the normalised ones).
+        if normalised != *pattern && pattern.graph == GraphSelector::Any && !self.canonical {
             estimate += stored.count_in(ReadModel::Asserted, pattern);
         }
         estimate

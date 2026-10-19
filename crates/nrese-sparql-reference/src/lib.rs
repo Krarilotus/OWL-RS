@@ -43,6 +43,8 @@ use nrese_sparql_syntax::term::{
 };
 use nrese_sparql_syntax::{GraphUpdateOperation, Query, Update};
 
+mod quotient;
+
 /// A dataset: quads, the default graph's with [`GraphName::DefaultGraph`].
 #[derive(Debug, Clone, Default)]
 pub struct Dataset {
@@ -131,6 +133,17 @@ impl Dataset {
         query: &Query,
         options: &QueryOptions,
     ) -> Result<QueryResults<'static>, QueryEvaluationError> {
+        self.query_named(query, options, None)
+    }
+
+    /// [`Self::query`], over this dataset as the quotient by `names` if given
+    /// ([`quotient`]).
+    fn query_named(
+        &self,
+        query: &Query,
+        options: &QueryOptions,
+        names: Option<&quotient::Names>,
+    ) -> Result<QueryResults<'static>, QueryEvaluationError> {
         let (dataset, pattern, base) = match query {
             Query::Select {
                 dataset,
@@ -154,7 +167,16 @@ impl Dataset {
                 base_iri,
             } => (dataset.as_ref(), pattern, base_iri.clone()),
         };
-        let ctx = Context::new(self, options, dataset, base);
+        let mut ctx = Context::new(self, options, dataset, base);
+        ctx.names = names;
+        let named;
+        let pattern = match names {
+            Some(names) => {
+                named = names.pattern(pattern);
+                &named
+            }
+            None => pattern,
+        };
         let solutions = ctx.eval(pattern, &ctx.default_graph, &Solution::new())?;
         match query {
             Query::Select { .. } => {
@@ -466,6 +488,8 @@ struct Context<'d> {
     evaluator: Evaluator,
     /// `EXISTS` answers per pattern, graph and values (the answer depends on nothing else).
     exists: std::cell::RefCell<HashMap<ExistsKey, bool>>,
+    /// Canonical answers' classes, over the quotient dataset ([`quotient`]).
+    names: Option<&'d quotient::Names>,
 }
 
 type ExistsKey = (usize, usize, Vec<(String, Term)>);
@@ -521,6 +545,7 @@ impl<'d> Context<'d> {
             named,
             evaluator: Evaluator::with_base(base),
             exists: std::cell::RefCell::default(),
+            names: None,
         }
     }
 
@@ -846,6 +871,28 @@ impl<'d> Context<'d> {
                 .map(|e| self.resolve_exists(e, solution, graph, outer))
                 .collect()
         };
+        // Canonical answers: the query's terms, and the IRIs it makes, by their classes.
+        if let Some(names) = self.names {
+            let constant = |term: Option<Term>| match term.map(|t| names.term(t)) {
+                Some(Term::NamedNode(n)) => Expression::NamedNode(n),
+                Some(Term::Literal(l)) => Expression::Literal(l),
+                // An error, as the expression's value is one (or no constant can say it).
+                _ => Expression::Variable(Variable::new_unchecked("__quotient_error")),
+            };
+            match expression {
+                Expression::NamedNode(n) => return Ok(constant(Some(n.clone().into()))),
+                Expression::Literal(l) => return Ok(constant(Some(l.clone().into()))),
+                Expression::FunctionCall(nrese_sparql_syntax::algebra::Function::Iri, l) => {
+                    let call = Expression::FunctionCall(
+                        nrese_sparql_syntax::algebra::Function::Iri,
+                        list(l)?,
+                    );
+                    let binding = |v: &Variable| solution.get(v).or_else(|| outer.get(v)).cloned();
+                    return Ok(constant(self.evaluator.eval(&call, &binding)));
+                }
+                _ => {}
+            }
+        }
         Ok(match expression {
             Expression::Exists(pattern) => {
                 let mut values = outer.clone();
@@ -859,6 +906,14 @@ impl<'d> Context<'d> {
                 let found = match known {
                     Some(found) => found,
                     None => {
+                        let named;
+                        let pattern = match self.names {
+                            Some(names) => {
+                                named = names.pattern(pattern);
+                                &named
+                            }
+                            None => &**pattern,
+                        };
                         let found = !self.eval(pattern, graph, &values)?.is_empty();
                         self.exists.borrow_mut().insert(memo_key, found);
                         found
@@ -1551,5 +1606,11 @@ pub fn evaluate_query(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<QueryResults<'static>, QueryEvaluationError> {
-    Dataset::from_snapshot(snapshot, options.read_model).query(query, options)
+    let dataset = Dataset::from_snapshot(snapshot, options.read_model);
+    match quotient::Names::of(snapshot, query, options) {
+        Some(names) => names
+            .dataset(&dataset)
+            .query_named(query, options, Some(&names)),
+        None => dataset.query(query, options),
+    }
 }

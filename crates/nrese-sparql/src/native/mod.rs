@@ -209,13 +209,8 @@ fn run(
     let pre_bound = options
         .pre_bound
         .as_ref()
-        .map(|values| match ctx.canonical_here() {
-            Some(names) => Cow::Owned(
-                values
-                    .iter()
-                    .map(|(v, t)| (v.clone(), names.term(t.clone())))
-                    .collect(),
-            ),
+        .map(|values| match &ctx.canonical {
+            Some(names) => Cow::Owned(names.values(values)),
             None => Cow::Borrowed(&**values),
         });
     let pattern = match &pre_bound {
@@ -550,7 +545,7 @@ fn native_pattern<'q>(
             unsupported_part(&pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
         ));
     }
-    let pattern = ctx.canonical_pattern(pattern.into_owned());
+    let pattern = ctx.canonical_pattern(pattern.into_owned())?;
     let pattern = if options.as_written {
         pattern
     } else {
@@ -1236,8 +1231,8 @@ struct Context<'a> {
     /// The equality classes to expand after joins over canonical reads (stage C,
     /// [`Context::late_expansion`]); `None` where reads expand them, or don't need to.
     late: Option<Arc<nrese_engine::EqualityClasses>>,
-    /// Under canonical answers, the classes a term the query names stands for
-    /// ([`canonical`]); `None` otherwise.
+    /// Canonical answers, where they apply to this query: the classes its terms stand for
+    /// ([`canonical`]). Decided once, for the whole query; `None` evaluates as without.
     canonical: Option<canonical::Names>,
     /// Whether GeoSPARQL relations in triple patterns are computed from geometries too
     /// (the query-rewrite extension; not [`QueryOptions::geosparql_stated_only`]).
@@ -1330,9 +1325,24 @@ impl<'a> Context<'a> {
             DefaultGraph::Merge(graphs) => (GraphScope::Union, graphs),
             DefaultGraph::Empty => (GraphScope::Missing, None),
         };
+        // Canonical answers where the query's default graph is the one the equality covers
+        // (the store's, or the merge of every graph) and some class exists ([`canonical`]).
+        let in_scope = match scope {
+            GraphScope::Default => true,
+            GraphScope::Union => merge_set.is_none(),
+            _ => false,
+        };
+        let canonical = (options.equality_canonical && in_scope)
+            .then(|| snapshot.with_canonical_equality())
+            .and_then(|read| Some((canonical::Names::of(&read, options.read_model)?, read)));
+        let named = match &canonical {
+            // The graphs `FROM NAMED` lists, by the names canonical reads give them.
+            Some((names, _)) => resolved.named.map(|graphs| names.graphs(graphs)),
+            None => resolved.named,
+        };
         let mut ctx = Self {
             merge_set,
-            named: resolved.named,
+            named,
             as_written: options.as_written,
             spatial_rewrite: !options.geosparql_stated_only,
             cross_chunk_rows: options.cross_chunk_rows.unwrap_or(CROSS_CHUNK_ROWS).max(1),
@@ -1342,16 +1352,11 @@ impl<'a> Context<'a> {
                 true => None,
                 false => snapshot.expand_late(options.read_model),
             },
-            snapshot: match options.equality_canonical {
-                true => Cow::Owned(snapshot.with_canonical_equality()),
-                false => Cow::Borrowed(snapshot),
+            snapshot: match &canonical {
+                Some((_, read)) => Cow::Owned(read.clone()),
+                None => Cow::Borrowed(snapshot),
             },
-            canonical: match options.equality_canonical {
-                true => {
-                    canonical::Names::of(&snapshot.with_canonical_equality(), options.read_model)
-                }
-                false => None,
-            },
+            canonical: canonical.map(|(names, _)| names),
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
             aliases: RefCell::default(),
@@ -1386,8 +1391,6 @@ impl<'a> Context<'a> {
             ctx.cache = Some(ctx.cache_scope(Arc::clone(cache), fixed.into_bytes().into()));
         }
         ctx.evaluator.set_canonical(ctx.canonical.clone());
-        ctx.evaluator
-            .canonical_scope(ctx.canonical_here().is_some());
         ctx
     }
 
@@ -1550,14 +1553,10 @@ impl<'a> Context<'a> {
     }
 
     /// The id of `term`: its stored id if the snapshot knows it, else a computed id, the same
-    /// one for equal terms. Under canonical answers, a stored term gets its representative's id where the
-    /// default graph is read ([`canonical`]).
+    /// one for equal terms.
     fn id(&self, term: &Term) -> u64 {
         if let Some(id) = self.lookup_const(term.as_ref()) {
-            return match self.canonical_here() {
-                Some(names) => names.id(id.raw()),
-                None => id.raw(),
-            };
+            return id.raw();
         }
         let mut ids = self.computed_ids.borrow_mut();
         if let Some(&id) = ids.get(term) {
@@ -1728,10 +1727,7 @@ impl<'a> Context<'a> {
         }
         match pattern {
             GraphPattern::Bgp { patterns } => self.bgp(patterns, &[], &mut Vec::new()),
-            GraphPattern::Graph { name, inner } => {
-                let solutions = self.graph(name, inner)?;
-                Ok(self.canonical_solutions(solutions))
-            }
+            GraphPattern::Graph { name, inner } => self.graph(name, inner),
             GraphPattern::Service {
                 name,
                 inner,
@@ -2051,12 +2047,8 @@ impl<'a> Context<'a> {
     /// Evaluates `pattern` with `scope` as the active graph.
     fn in_graph(&self, scope: GraphScope, pattern: &GraphPattern) -> NativeResult<Solutions> {
         let outer = self.graph.replace(scope);
-        let canonical = self
-            .evaluator
-            .canonical_scope(self.canonical_here().is_some());
         let result = self.eval(pattern);
         *self.graph.borrow_mut() = outer;
-        self.evaluator.canonical_scope(canonical);
         result
     }
 
