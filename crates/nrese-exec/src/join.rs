@@ -15,9 +15,11 @@
 //! Key values must not be [`UNDEF`](crate::UNDEF) except in the `*_with_undef` functions,
 //! in [`compatible_mask`], and on the right side of [`left_join`]'s output.
 //!
-//! Joins that can multiply rows take `max_rows` and stop with [`TooManyRows`] once their
-//! output would exceed it, before the memory is taken: a cross product of three 2,000-row
-//! tables would otherwise ask for 64 GB at once.
+//! Their output tables and their working memory (hash chains, pairs of row numbers, masks)
+//! are charged to the `budget` they are given before they grow ([`IdTable::reserve_rows`],
+//! [`Scratch`]): a join the budget has no room for stops with [`JoinStop::Memory`] before it
+//! allocates. Joins that can multiply rows also take a row limit and stop with
+//! [`JoinStop::Rows`] past it, or once the query is cancelled.
 
 use std::cmp::Ordering;
 use std::ops::Range;
@@ -27,9 +29,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use hashbrown::HashMap;
 use rayon::prelude::*;
 
-use crate::UNDEF;
 use crate::search::partition_range_from;
 use crate::table::IdTable;
+use crate::{Budget, BudgetExceeded, ChargedVec, Reservation, Scratch, UNDEF};
 
 type Hasher = foldhash::fast::FixedState;
 
@@ -52,6 +54,38 @@ impl std::fmt::Display for TooManyRows {
 }
 
 impl std::error::Error for TooManyRows {}
+
+/// Why a join stopped before its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinStop {
+    /// Past its row limit, or cancelled.
+    Rows(TooManyRows),
+    /// Its budget has no room for its output or working memory.
+    Memory(BudgetExceeded),
+}
+
+impl From<TooManyRows> for JoinStop {
+    fn from(rows: TooManyRows) -> Self {
+        Self::Rows(rows)
+    }
+}
+
+impl From<BudgetExceeded> for JoinStop {
+    fn from(memory: BudgetExceeded) -> Self {
+        Self::Memory(memory)
+    }
+}
+
+impl std::fmt::Display for JoinStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rows(rows) => rows.fmt(f),
+            Self::Memory(memory) => memory.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for JoinStop {}
 
 /// How far a join may go: at most `max_rows` output rows, and no further once `stop` is set
 /// (the query was cancelled). Both are checked every [`LIMIT_STEP`] output rows, so a
@@ -105,55 +139,89 @@ impl Limit {
     }
 }
 
-/// An output table that charges its rows against a [`Limit`] every [`LIMIT_STEP`] rows.
+/// An output table written into room reserved (and charged) ahead, its rows counted against
+/// a [`Limit`] every [`LIMIT_STEP`] rows: a row costs one comparison, and the room and the
+/// limit are seen to between steps.
 struct Sink<'a> {
     out: IdTable,
-    pending: usize,
+    /// Rows counted against the limit.
+    counted: usize,
+    /// The row at which the next step is due: at most the room, and `LIMIT_STEP` past the
+    /// last count.
+    due: usize,
     limit: &'a Limit,
+    budget: &'a Arc<Budget>,
 }
 
 impl<'a> Sink<'a> {
-    fn new(width: usize, limit: &'a Limit) -> Self {
+    fn new(width: usize, limit: &'a Limit, budget: &'a Arc<Budget>) -> Self {
+        Self::after(IdTable::new(width), limit, budget)
+    }
+
+    /// Rows appended to `out`, whose own rows are counted already.
+    fn after(out: IdTable, limit: &'a Limit, budget: &'a Arc<Budget>) -> Self {
+        let counted = out.len();
         Self {
-            out: IdTable::new(width),
-            pending: 0,
+            out,
+            counted,
+            due: counted,
             limit,
+            budget,
         }
     }
 
     #[inline]
-    fn push(&mut self, row: &[u64]) -> Result<(), TooManyRows> {
-        self.pending += 1;
-        if self.pending == LIMIT_STEP {
-            self.limit.grow(LIMIT_STEP)?;
-            self.pending = 0;
+    fn push(&mut self, row: &[u64]) -> Result<(), JoinStop> {
+        if self.out.len() == self.due {
+            self.step()?;
         }
-        self.out.push_row(row);
+        self.out.push_reserved(row);
         Ok(())
     }
 
-    fn finish(self) -> Result<IdTable, TooManyRows> {
-        self.limit.grow(self.pending)?;
+    /// The rows since the last step counted, and room reserved where none is left.
+    #[cold]
+    fn step(&mut self) -> Result<(), JoinStop> {
+        let len = self.out.len();
+        self.limit.grow(len - self.counted)?;
+        self.counted = len;
+        if self.out.room_left() == 0 {
+            self.out.reserve_rows(LIMIT_STEP, self.budget)?;
+        }
+        self.due = len + self.out.room_left().min(LIMIT_STEP);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<IdTable, JoinStop> {
+        self.limit.grow(self.out.len() - self.counted)?;
         Ok(self.out)
     }
 }
 
 /// Runs `part` over consecutive row ranges of a `len`-row input, in parallel for large
 /// inputs, and concatenates the parts in input order (so the output order is the
-/// sequential one).
+/// sequential one), charged to `budget`.
 fn chunked(
     len: usize,
     width: usize,
-    part: impl Fn(Range<usize>) -> Result<IdTable, TooManyRows> + Sync,
-) -> Result<IdTable, TooManyRows> {
+    budget: &Arc<Budget>,
+    part: impl Fn(Range<usize>) -> Result<IdTable, JoinStop> + Sync,
+) -> Result<IdTable, JoinStop> {
     if len < 2 * PARALLEL_ROWS {
         return part(0..len);
     }
-    let parts: Vec<IdTable> = (0..len.div_ceil(PARALLEL_ROWS))
-        .into_par_iter()
-        .map(|i| part(i * PARALLEL_ROWS..((i + 1) * PARALLEL_ROWS).min(len)))
-        .collect::<Result<_, _>>()?;
-    Ok(IdTable::concat(width, parts))
+    let count = len.div_ceil(PARALLEL_ROWS);
+    let mut parts: Scratch<'_, IdTable> = ChargedVec::with_capacity(&**budget, count)?;
+    parts.extend_bounded(count, std::iter::repeat_with(IdTable::default))?;
+    parts.par_iter_mut().enumerate().try_for_each(|(i, slot)| {
+        let rows = part(i * PARALLEL_ROWS..((i + 1) * PARALLEL_ROWS).min(len))?;
+        // A part without rows is dropped here: it never grew, and holds nothing.
+        if !rows.is_empty() {
+            *slot = rows;
+        }
+        Ok::<_, JoinStop>(())
+    })?;
+    Ok(IdTable::concat_charged(width, &mut parts, budget)?)
 }
 
 /// A predicate over a combined output row (the filter of an OPTIONAL).
@@ -204,27 +272,28 @@ fn same_key(table: &IdTable, a: usize, b: usize, keys: &[usize]) -> bool {
     keys.iter().all(|&k| table.get(a, k) == table.get(b, k))
 }
 
-/// Inner join of `left` and `right` on `left_keys[i] = right_keys[i]`, of at most
-/// `max_rows` rows.
+/// Inner join of `left` and `right` on `left_keys[i] = right_keys[i]`, charged to `budget`,
+/// of at most `limit` rows.
 pub fn join(
     left: &IdTable,
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
+    budget: &Arc<Budget>,
     limit: impl Into<RowLimit>,
-) -> Result<IdTable, TooManyRows> {
+) -> Result<IdTable, JoinStop> {
     assert_eq!(left_keys.len(), right_keys.len(), "join key arity");
     let limit = Limit::new(limit);
     if left_keys.is_empty() {
-        return cross_product(left, right, &limit);
+        return cross_product(left, right, budget, &limit);
     }
     if left.is_sorted_on(left_keys) && right.is_sorted_on(right_keys) {
-        merge_join(left, right, left_keys, right_keys, &limit)
+        merge_join(left, right, left_keys, right_keys, budget, &limit)
     } else if left.len() <= right.len() {
         // Build on the smaller side; the output schema stays left-first either way.
-        hash_join(right, left, right_keys, left_keys, true, &limit)
+        hash_join(right, left, right_keys, left_keys, true, budget, &limit)
     } else {
-        hash_join(left, right, left_keys, right_keys, false, &limit)
+        hash_join(left, right, left_keys, right_keys, false, budget, &limit)
     }
 }
 
@@ -235,28 +304,33 @@ pub fn join_keeping_left_order(
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
+    budget: &Arc<Budget>,
     limit: impl Into<RowLimit>,
-) -> Result<IdTable, TooManyRows> {
+) -> Result<IdTable, JoinStop> {
     assert_eq!(left_keys.len(), right_keys.len(), "join key arity");
     let limit = Limit::new(limit);
     if left_keys.is_empty() {
-        return cross_product(left, right, &limit);
+        return cross_product(left, right, budget, &limit);
     }
-    hash_join(left, right, left_keys, right_keys, false, &limit)
+    hash_join(left, right, left_keys, right_keys, false, budget, &limit)
 }
 
-fn cross_product(left: &IdTable, right: &IdTable, limit: &Limit) -> Result<IdTable, TooManyRows> {
+fn cross_product(
+    left: &IdTable,
+    right: &IdTable,
+    budget: &Arc<Budget>,
+    limit: &Limit,
+) -> Result<IdTable, JoinStop> {
     // The size is known: refuse before producing anything.
-    let rows = left.len().saturating_mul(right.len());
-    if rows > limit.max_rows {
+    if left.len().saturating_mul(right.len()) > limit.max_rows {
         return Err(TooManyRows {
             max_rows: limit.max_rows,
-        });
+        }
+        .into());
     }
     let width = left.width() + right.width();
-    let out = chunked(left.len(), width, |lefts| {
-        // Reserve up front, but not unboundedly: an unlimited join still grows gradually.
-        let mut out = IdTable::with_capacity(width, (lefts.len() * right.len()).min(1 << 20));
+    chunked(left.len(), width, budget, |lefts| {
+        let mut out = Sink::new(width, limit, budget);
         let mut row = vec![0; width];
         for l in lefts {
             for (i, c) in left.columns().iter().enumerate() {
@@ -266,18 +340,11 @@ fn cross_product(left: &IdTable, right: &IdTable, limit: &Limit) -> Result<IdTab
                 for (i, c) in right.columns().iter().enumerate() {
                     row[left.width() + i] = c[r];
                 }
-                out.push_row(&row);
-            }
-            if limit.stopped() {
-                return Err(TooManyRows {
-                    max_rows: limit.max_rows,
-                });
+                out.push(&row)?;
             }
         }
-        Ok(out)
-    })?;
-    limit.grow(out.len())?;
-    Ok(out)
+        out.finish()
+    })
 }
 
 /// First row `>= from` in `table` whose key is not less than `other`'s key at `target`.
@@ -319,17 +386,18 @@ fn merge_join(
     right: &IdTable,
     lk: &[usize],
     rk: &[usize],
+    budget: &Arc<Budget>,
     limit: &Limit,
-) -> Result<IdTable, TooManyRows> {
+) -> Result<IdTable, JoinStop> {
     let width = left.width() + right_payload(right.width(), rk).len();
     // Each chunk of left rows starts at the first right row with its key.
-    let out = chunked(left.len(), width, |rows| {
+    let out = chunked(left.len(), width, budget, |rows| {
         let start = if rows.start == 0 {
             0
         } else {
             gallop(right, rk, 0, left, rows.start, lk, false)
         };
-        merge_rows(left, rows, right, start, lk, rk, limit)
+        merge_rows(left, rows, right, start, lk, rk, budget, limit)
     })?;
     // The output follows the left input's order, so it is sorted on the left keys.
     Ok(out.assume_sorted_by(lk.to_vec()))
@@ -338,6 +406,7 @@ fn merge_join(
 /// Merge join of the left rows `rows` with the right rows from `r`: the matching pairs of
 /// row numbers first, then the output a column at a time, gathered by them (no row is
 /// assembled). One key compares two id columns directly.
+#[allow(clippy::too_many_arguments)]
 fn merge_rows(
     left: &IdTable,
     rows: Range<usize>,
@@ -345,32 +414,15 @@ fn merge_rows(
     mut r: usize,
     lk: &[usize],
     rk: &[usize],
+    budget: &Arc<Budget>,
     limit: &Limit,
-) -> Result<IdTable, TooManyRows> {
+) -> Result<IdTable, JoinStop> {
     assert!(
         left.len() < END as usize && right.len() < END as usize,
         "join input exceeds u32 rows"
     );
-    let (mut lefts, mut rights): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
-    let mut pending = 0;
+    let mut pairs = Pairs::new(budget, limit);
     let (mut l, end) = (rows.start, rows.end);
-    // The pairs of the runs `l..l_end` and `r..r_end` (one key value). Each left row's
-    // pairs are charged before they are made, so a join over its limit (or cancelled)
-    // stops within a step instead of after expanding the whole group (the review of
-    // 3 October 2026, P1).
-    let mut pair = |l: usize, l_end: usize, r: usize, r_end: usize| {
-        for li in l..l_end {
-            pending += r_end - r;
-            if pending >= LIMIT_STEP {
-                limit.grow(std::mem::take(&mut pending))?;
-            }
-            for ri in r..r_end {
-                lefts.push(li as u32);
-                rights.push(ri as u32);
-            }
-        }
-        Ok(())
-    };
     if let ([lk], [rk]) = (lk, rk) {
         let (a, b) = (left.column(*lk), right.column(*rk));
         while l < end && r < b.len() {
@@ -380,7 +432,7 @@ fn merge_rows(
                 Ordering::Equal => {
                     let l_end = (l + 1..end).find(|&x| a[x] != a[l]).unwrap_or(end);
                     let r_end = (r + 1..b.len()).find(|&x| b[x] != b[r]).unwrap_or(b.len());
-                    pair(l, l_end, r, r_end)?;
+                    pairs.runs(l..l_end, r..r_end)?;
                     l = l_end;
                     r = r_end;
                 }
@@ -398,57 +450,152 @@ fn merge_rows(
                     let r_end = (r + 1..right.len())
                         .find(|&x| !same_key(right, r, x, rk))
                         .unwrap_or(right.len());
-                    pair(l, l_end, r, r_end)?;
+                    pairs.runs(l..l_end, r..r_end)?;
                     l = l_end;
                     r = r_end;
                 }
             }
         }
     }
-    limit.grow(pending)?;
-    let payload = right_payload(right.width(), rk);
-    if left.width() + payload.len() == 0 {
-        return Ok(IdTable::from_rows(
-            0,
-            std::iter::repeat_n(&[][..], lefts.len()),
-        ));
+    pairs.gather(left, right, &right_payload(right.width(), rk))
+}
+
+/// The matching pairs of row numbers of a merge, charged before they are made, and counted
+/// against the join's limit: a join over its limit (or cancelled) stops within a step
+/// instead of after expanding a whole group (the review of 3 October 2026, P1).
+struct Pairs<'a> {
+    lefts: Scratch<'a, u32>,
+    /// [`END`] for a left row without a match.
+    rights: Scratch<'a, u32>,
+    pending: usize,
+    budget: &'a Arc<Budget>,
+    limit: &'a Limit,
+}
+
+impl<'a> Pairs<'a> {
+    fn new(budget: &'a Arc<Budget>, limit: &'a Limit) -> Self {
+        Self {
+            lefts: ChargedVec::new(&**budget),
+            rights: ChargedVec::new(&**budget),
+            pending: 0,
+            budget,
+            limit,
+        }
     }
-    let gather = |column: &[u64], at: &[u32]| at.iter().map(|&i| column[i as usize]).collect();
-    let columns = left
-        .columns()
-        .iter()
-        .map(|column| gather(column, &lefts))
-        .chain(payload.iter().map(|&c| gather(right.column(c), &rights)))
-        .collect();
-    Ok(IdTable::from_columns(columns))
+
+    /// Each left row of `lefts` with each right row of `rights` (once with none if
+    /// `rights` is empty and `unmatched`).
+    #[inline(always)]
+    fn add(&mut self, l: usize, rights: Range<usize>, unmatched: bool) -> Result<(), JoinStop> {
+        let n = rights.len().max(usize::from(unmatched));
+        self.pending += n;
+        if self.pending >= LIMIT_STEP {
+            self.limit.grow(std::mem::take(&mut self.pending))?;
+        }
+        self.lefts
+            .extend_bounded(n, std::iter::repeat_n(l as u32, n))?;
+        match rights.is_empty() {
+            true => self.rights.extend_bounded(n, std::iter::repeat_n(END, n))?,
+            false => self.rights.extend_bounded(n, rights.map(|r| r as u32))?,
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn runs(&mut self, mut lefts: Range<usize>, rights: Range<usize>) -> Result<(), JoinStop> {
+        lefts.try_for_each(|l| self.add(l, rights.clone(), false))
+    }
+
+    /// The output, a column at a time: `left`'s columns, then `right`'s `payload` columns
+    /// ([`UNDEF`] where a left row has no match).
+    fn gather(
+        self,
+        left: &IdTable,
+        right: &IdTable,
+        payload: &[usize],
+    ) -> Result<IdTable, JoinStop> {
+        self.limit.grow(self.pending)?;
+        let (lefts, rights) = (&self.lefts[..], &self.rights[..]);
+        let columns = left
+            .columns()
+            .iter()
+            .map(|column| (&column[..], lefts))
+            .chain(payload.iter().map(|&c| (right.column(c), rights)))
+            .map(|(column, at)| {
+                at.iter()
+                    .map(move |&i| if i == END { UNDEF } else { column[i as usize] })
+            });
+        let width = left.width() + payload.len();
+        Ok(IdTable::gathered(width, lefts.len(), self.budget, columns)?)
+    }
 }
 
 /// Hash table from key to the chain of `build` rows with that key: `heads[key]` is the first
-/// row, `next[row]` the following one (`u32::MAX` ends the chain). No allocation per key.
-struct BuildTable {
+/// row, `next[row]` the following one (`u32::MAX` ends the chain). No allocation per key
+/// beyond a multi-column key's values. Its memory is reserved before it is allocated.
+struct BuildTable<'b> {
     heads: HashMap<Vec<u64>, u32, Hasher>,
     single: HashMap<u64, u32, Hasher>,
-    next: Vec<u32>,
+    next: Scratch<'b, u32>,
     one_key: bool,
+    /// The maps' memory and the keys': after them, so that it is released after they are
+    /// freed.
+    held: Reservation<&'b Budget>,
 }
 
 const END: u32 = u32::MAX;
 
-impl BuildTable {
-    fn new(build: &IdTable, keys: &[usize]) -> Self {
+/// The most memory a hash map with room for `capacity` entries of `T` allocates (hashbrown's
+/// layout): buckets the power of two at or above 8/7 of it (at least 4, or 8), an entry and
+/// a control byte each, a group of control bytes more, and alignment.
+fn map_bytes<T>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = match capacity {
+        0..4 => 4,
+        4..8 => 8,
+        _ => (capacity.saturating_mul(8) / 7).next_power_of_two(),
+    };
+    buckets
+        .saturating_mul(size_of::<T>() + 1)
+        .saturating_add(2 * 16)
+}
+
+impl<'b> BuildTable<'b> {
+    /// `build`'s rows that `include` keeps, chained by their key on `keys`.
+    fn new(
+        build: &IdTable,
+        keys: &[usize],
+        budget: &'b Budget,
+        include: impl Fn(usize) -> bool,
+    ) -> Result<Self, BudgetExceeded> {
         assert!(build.len() < END as usize, "join input exceeds u32 rows");
+        let rows = build.len();
         let one_key = keys.len() == 1;
+        let mut held = Reservation::new(budget);
+        let key_bytes = keys.len() * size_of::<u64>();
+        held.charge(match one_key {
+            true => map_bytes::<(u64, u32)>(rows),
+            false => map_bytes::<(Vec<u64>, u32)>(rows).saturating_add(rows * key_bytes),
+        })?;
+        let mut next = ChargedVec::with_capacity(budget, rows)?;
+        next.resize(rows, END)?;
         let mut table = Self {
-            heads: HashMap::with_hasher(Hasher::default()),
-            single: HashMap::with_capacity_and_hasher(
-                if one_key { build.len() } else { 0 },
+            heads: HashMap::with_capacity_and_hasher(
+                if one_key { 0 } else { rows },
                 Hasher::default(),
             ),
-            next: vec![END; build.len()],
+            single: HashMap::with_capacity_and_hasher(
+                if one_key { rows } else { 0 },
+                Hasher::default(),
+            ),
+            next,
             one_key,
+            held,
         };
         // Insert in reverse so chains list rows in input order.
-        for row in (0..build.len()).rev() {
+        for row in (0..rows).rev().filter(|&row| include(row)) {
             let head = if one_key {
                 table.single.entry(build.get(row, keys[0])).or_insert(END)
             } else {
@@ -460,7 +607,17 @@ impl BuildTable {
             table.next[row] = *head;
             *head = row as u32;
         }
-        table
+        // What the maps and the keys hold, within what was reserved.
+        let used = table.single.allocation_size()
+            + table.heads.allocation_size()
+            + table.heads.len() * key_bytes;
+        debug_assert!(
+            used <= table.held.bytes(),
+            "{used} past {}",
+            table.held.bytes()
+        );
+        table.held.resize(used.min(table.held.bytes()))?;
+        Ok(table)
     }
 
     fn first(&self, probe: &IdTable, row: usize, keys: &[usize]) -> u32 {
@@ -484,9 +641,10 @@ fn hash_join(
     probe_keys: &[usize],
     build_keys: &[usize],
     build_is_left: bool,
+    budget: &Arc<Budget>,
     limit: &Limit,
-) -> Result<IdTable, TooManyRows> {
-    let table = BuildTable::new(build, build_keys);
+) -> Result<IdTable, JoinStop> {
+    let table = BuildTable::new(build, build_keys, budget, |_| true)?;
     let (left, right, rk) = if build_is_left {
         (build, probe, probe_keys)
     } else {
@@ -494,8 +652,8 @@ fn hash_join(
     };
     let payload = right_payload(right.width(), rk);
     let width = left.width() + payload.len();
-    let out = chunked(probe.len(), width, |rows| {
-        let mut out = Sink::new(width, limit);
+    let out = chunked(probe.len(), width, budget, |rows| {
+        let mut out = Sink::new(width, limit, budget);
         let mut row = vec![0; width];
         for p in rows {
             let mut b = table.first(probe, p, probe_keys);
@@ -533,8 +691,9 @@ pub fn left_join(
     left_keys: &[usize],
     right_keys: &[usize],
     accept: Option<RowFilter<'_>>,
+    budget: &Arc<Budget>,
     limit: impl Into<RowLimit>,
-) -> Result<IdTable, TooManyRows> {
+) -> Result<IdTable, JoinStop> {
     let width = left.width() + right_payload(right.width(), right_keys).len();
     let limit = Limit::new(limit);
     // One key, both sides sorted on it, no filter: a merge (DBpedia q9 joined 100 k
@@ -544,10 +703,13 @@ pub fn left_join(
         && left.is_sorted_on(left_keys)
         && right.is_sorted_on(right_keys)
     {
-        let out = sorted_left_join(left, right, *lk, *rk, &limit)?;
+        let out = sorted_left_join(left, right, *lk, *rk, budget, &limit)?;
         return Ok(out.assume_sorted_by(left_keys.to_vec()));
     }
-    let table = (!left_keys.is_empty()).then(|| BuildTable::new(right, right_keys));
+    let table = match left_keys.is_empty() {
+        true => None,
+        false => Some(BuildTable::new(right, right_keys, budget, |_| true)?),
+    };
     let inputs = LeftJoin {
         left,
         right,
@@ -557,9 +719,9 @@ pub fn left_join(
     };
     let out = match accept {
         // The filter may not be thread-safe (it decodes terms through a cache).
-        Some(accept) => left_join_rows(&inputs, 0..left.len(), Some(accept), &limit)?,
-        None => chunked(left.len(), width, |rows| {
-            left_join_rows(&inputs, rows, None, &limit)
+        Some(accept) => left_join_rows(&inputs, 0..left.len(), Some(accept), budget, &limit)?,
+        None => chunked(left.len(), width, budget, |rows| {
+            left_join_rows(&inputs, rows, None, budget, &limit)
         })?,
     };
     Ok(if left.is_sorted_on(left_keys) && !left_keys.is_empty() {
@@ -577,15 +739,16 @@ fn sorted_left_join(
     right: &IdTable,
     lk: usize,
     rk: usize,
+    budget: &Arc<Budget>,
     limit: &Limit,
-) -> Result<IdTable, TooManyRows> {
+) -> Result<IdTable, JoinStop> {
     assert!(
         left.len() < END as usize && right.len() < END as usize,
         "join input exceeds u32 rows"
     );
     let (a, b) = (left.column(lk), right.column(rk));
-    let (mut lefts, mut rights): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
-    let (mut l, mut r, mut pending) = (0, 0, 0);
+    let mut pairs = Pairs::new(budget, limit);
+    let (mut l, mut r) = (0, 0);
     while l < a.len() {
         let key = a[l];
         let l_end = (l + 1..a.len()).find(|&x| a[x] != key).unwrap_or(a.len());
@@ -594,44 +757,12 @@ fn sorted_left_join(
         }
         let r_end = (r..b.len()).find(|&x| b[x] != key).unwrap_or(b.len());
         for li in l..l_end {
-            // Charged before the pairs are made, as in `merge_rows`.
-            pending += (r_end - r).max(1);
-            if pending >= LIMIT_STEP {
-                limit.grow(std::mem::take(&mut pending))?;
-            }
-            if r == r_end {
-                lefts.push(li as u32);
-                rights.push(END);
-            }
-            for ri in r..r_end {
-                lefts.push(li as u32);
-                rights.push(ri as u32);
-            }
+            pairs.add(li, r..r_end, true)?;
         }
         l = l_end;
         r = r_end;
     }
-    limit.grow(pending)?;
-    let payload = right_payload(right.width(), &[rk]);
-    if left.width() + payload.len() == 0 {
-        return Ok(IdTable::from_rows(
-            0,
-            std::iter::repeat_n(&[][..], lefts.len()),
-        ));
-    }
-    let columns = left
-        .columns()
-        .iter()
-        .map(|column| lefts.iter().map(|&i| column[i as usize]).collect())
-        .chain(payload.iter().map(|&c| {
-            let column = right.column(c);
-            rights
-                .iter()
-                .map(|&i| if i == END { UNDEF } else { column[i as usize] })
-                .collect()
-        }))
-        .collect();
-    Ok(IdTable::from_columns(columns))
+    pairs.gather(left, right, &right_payload(right.width(), &[rk]))
 }
 
 /// The inputs of a [`left_join`], shared by its parallel parts.
@@ -641,7 +772,7 @@ struct LeftJoin<'a> {
     left_keys: &'a [usize],
     right_keys: &'a [usize],
     /// `right` hashed on its keys; `None` without keys (every row matches).
-    table: Option<&'a BuildTable>,
+    table: Option<&'a BuildTable<'a>>,
 }
 
 /// [`left_join`] of the left rows `rows`.
@@ -649,8 +780,9 @@ fn left_join_rows(
     join: &LeftJoin<'_>,
     rows: Range<usize>,
     accept: Option<RowFilter<'_>>,
+    budget: &Arc<Budget>,
     limit: &Limit,
-) -> Result<IdTable, TooManyRows> {
+) -> Result<IdTable, JoinStop> {
     let LeftJoin {
         left,
         right,
@@ -660,7 +792,7 @@ fn left_join_rows(
     } = *join;
     let payload = right_payload(right.width(), right_keys);
     let width = left.width() + payload.len();
-    let mut out = Sink::new(width, limit);
+    let mut out = Sink::new(width, limit, budget);
     let mut row = vec![0; width];
     for l in rows {
         for (i, c) in left.columns().iter().enumerate() {
@@ -675,7 +807,7 @@ fn left_join_rows(
                 out.push(row)?;
                 matched = true;
             }
-            Ok(())
+            Ok::<_, JoinStop>(())
         };
         match table {
             Some(table) => {
@@ -701,54 +833,89 @@ fn left_join_rows(
     out.finish()
 }
 
-/// Left rows whose key doesn't occur in `right` (MINUS, FILTER NOT EXISTS). Order and
-/// sortedness of `left` are kept.
+/// Left rows whose key doesn't occur in `right` (MINUS, FILTER NOT EXISTS), copied into a
+/// table charged to `budget`. Order and sortedness of `left` are kept.
 pub fn anti_join(
     left: &IdTable,
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
-) -> IdTable {
-    let mut out = left.clone();
-    anti_join_in_place(&mut out, right, left_keys, right_keys);
-    out
+    budget: &Arc<Budget>,
+) -> Result<IdTable, BudgetExceeded> {
+    let mut out = left.try_clone(budget)?;
+    anti_join_in_place(&mut out, right, left_keys, right_keys, budget)?;
+    Ok(out)
 }
 
-/// [`anti_join`] of a table the caller owns, filtered where it is: no copy of it.
+/// [`anti_join`] of a table the caller owns, filtered where it is: no copy of it. Its
+/// working memory is charged to `budget`.
 pub fn anti_join_in_place(
     left: &mut IdTable,
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
-) {
+    budget: &Budget,
+) -> Result<(), BudgetExceeded> {
     if right.is_empty() {
-        return;
+        return Ok(());
     }
     if left_keys.is_empty() {
         left.slice(0, Some(0));
-        return;
+        return Ok(());
     }
-    if let Some(keep) = sorted_membership(left, right, left_keys, right_keys, false) {
-        left.retain_mask(&keep);
-        return;
-    }
-    let table = BuildTable::new(right, right_keys);
-    left.par_retain(|t, row| table.first(t, row, left_keys) == END);
+    let keep = membership(left, right, left_keys, right_keys, false, budget)?;
+    left.retain_mask(&keep);
+    Ok(())
 }
 
-/// Per left row, whether its key occurring in `right` is `wanted`, where both are sorted
-/// on their keys: one merge, galloping over runs, instead of a hash table of `right`
-/// (`None` otherwise). Wikidata lexemes: 432 k entries against the 246 k senses' entries.
-fn sorted_membership(
+/// Per left row, whether its key occurring in `right` is `wanted`: a merge where both are
+/// sorted on their keys ([`sorted_membership`]), else a hash table of `right`.
+fn membership<'b>(
     left: &IdTable,
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
     wanted: bool,
-) -> Option<Vec<bool>> {
-    if !left.is_sorted_on(left_keys) || !right.is_sorted_on(right_keys) {
-        return None;
+    budget: &'b Budget,
+) -> Result<Scratch<'b, bool>, BudgetExceeded> {
+    if let Some(keep) = sorted_membership(left, right, left_keys, right_keys, wanted, budget)? {
+        return Ok(keep);
     }
+    let table = BuildTable::new(right, right_keys, budget, |_| true)?;
+    let mut keep = mask(left.len(), !wanted, budget)?;
+    let found = |(row, keep): (usize, &mut bool)| {
+        *keep = (table.first(left, row, left_keys) != END) == wanted;
+    };
+    if left.len() < PARALLEL_ROWS {
+        keep.iter_mut().enumerate().for_each(found);
+    } else {
+        keep.par_iter_mut().enumerate().for_each(found);
+    }
+    Ok(keep)
+}
+
+/// A mask of `len` rows, each `value`, charged to `budget` first.
+fn mask(len: usize, value: bool, budget: &Budget) -> Result<Scratch<'_, bool>, BudgetExceeded> {
+    let mut mask = ChargedVec::with_capacity(budget, len)?;
+    mask.resize(len, value)?;
+    Ok(mask)
+}
+
+/// Per left row, whether its key occurring in `right` is `wanted`, where both are sorted
+/// on their keys: one merge, galloping over runs, instead of a hash table of `right`
+/// (`None` otherwise). Wikidata lexemes: 432 k entries against the 246 k senses' entries.
+fn sorted_membership<'b>(
+    left: &IdTable,
+    right: &IdTable,
+    left_keys: &[usize],
+    right_keys: &[usize],
+    wanted: bool,
+    budget: &'b Budget,
+) -> Result<Option<Scratch<'b, bool>>, BudgetExceeded> {
+    if !left.is_sorted_on(left_keys) || !right.is_sorted_on(right_keys) {
+        return Ok(None);
+    }
+    let mut keep = mask(left.len(), !wanted, budget)?;
     // One key: two columns of ids, merged in one linear pass without branches to
     // mispredict. Each step advances the smaller side; a left key equal to the right one
     // is found, and the right one stays for the next left key. A left row is written
@@ -759,7 +926,6 @@ fn sorted_membership(
     if let ([lk], [rk]) = (left_keys, right_keys) {
         const PART: usize = 1 << 15;
         let (keys, against) = (left.column(*lk), right.column(*rk));
-        let mut keep = vec![!wanted; keys.len()];
         let merge = |keys: &[u64], keep: &mut [bool]| {
             let Some(&first) = keys.first() else {
                 return;
@@ -779,9 +945,8 @@ fn sorted_membership(
                 .zip(keys.par_chunks(PART))
                 .for_each(|(keep, keys)| merge(keys, keep));
         }
-        return Some(keep);
+        return Ok(Some(keep));
     }
-    let mut keep = vec![!wanted; left.len()];
     let (mut l, mut r) = (0, 0);
     while l < left.len() && r < right.len() {
         match compare_keys(left, l, left_keys, right, r, right_keys) {
@@ -794,41 +959,41 @@ fn sorted_membership(
             }
         }
     }
-    Some(keep)
+    Ok(Some(keep))
 }
 
-/// Left rows whose key occurs in `right` (FILTER EXISTS). Order and sortedness of `left` are
-/// kept; each left row appears at most once.
+/// Left rows whose key occurs in `right` (FILTER EXISTS), copied into a table charged to
+/// `budget`. Order and sortedness of `left` are kept; each left row appears at most once.
 pub fn semi_join(
     left: &IdTable,
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
-) -> IdTable {
-    let mut out = left.clone();
-    semi_join_in_place(&mut out, right, left_keys, right_keys);
-    out
+    budget: &Arc<Budget>,
+) -> Result<IdTable, BudgetExceeded> {
+    let mut out = left.try_clone(budget)?;
+    semi_join_in_place(&mut out, right, left_keys, right_keys, budget)?;
+    Ok(out)
 }
 
-/// [`semi_join`] of a table the caller owns, filtered where it is: no copy of it.
+/// [`semi_join`] of a table the caller owns, filtered where it is: no copy of it. Its
+/// working memory is charged to `budget`.
 pub fn semi_join_in_place(
     left: &mut IdTable,
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
-) {
+    budget: &Budget,
+) -> Result<(), BudgetExceeded> {
     if left_keys.is_empty() {
         if right.is_empty() {
             left.slice(0, Some(0));
         }
-        return;
+        return Ok(());
     }
-    if let Some(keep) = sorted_membership(left, right, left_keys, right_keys, true) {
-        left.retain_mask(&keep);
-        return;
-    }
-    let table = BuildTable::new(right, right_keys);
-    left.par_retain(|t, row| table.first(t, row, left_keys) != END);
+    let keep = membership(left, right, left_keys, right_keys, true, budget)?;
+    left.retain_mask(&keep);
+    Ok(())
 }
 
 /// Inner join where key columns may hold UNDEF (SPARQL compatibility: UNDEF matches any
@@ -839,34 +1004,37 @@ pub fn join_with_undef(
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
+    budget: &Arc<Budget>,
     limit: impl Into<RowLimit>,
-) -> Result<IdTable, TooManyRows> {
-    let has_undef =
-        |t: &IdTable, row: usize, keys: &[usize]| keys.iter().any(|&k| t.get(row, k) == UNDEF);
-    let split = |t: &IdTable, keys: &[usize]| {
-        let mut bound = t.clone();
-        bound.retain(|t, row| !has_undef(t, row, keys));
-        let mut open = t.clone();
-        open.retain(|t, row| has_undef(t, row, keys));
-        (bound, open)
+) -> Result<IdTable, JoinStop> {
+    // The rows with every key bound, and those with one unbound, each copied (charged).
+    let split = |t: &IdTable, keys: &[usize]| -> Result<_, BudgetExceeded> {
+        let mut open = mask(t.len(), false, budget)?;
+        for (row, open) in open.iter_mut().enumerate() {
+            *open = keys.iter().any(|&k| t.get(row, k) == UNDEF);
+        }
+        Ok((
+            t.selected(&open, false, budget)?,
+            t.selected(&open, true, budget)?,
+        ))
     };
-    let (left_bound, left_open) = split(left, left_keys);
-    let (right_bound, right_open) = split(right, right_keys);
+    let (left_bound, left_open) = split(left, left_keys)?;
+    let (right_bound, right_open) = split(right, right_keys)?;
     let limit = limit.into();
     let joined = join(
         &left_bound,
         &right_bound,
         left_keys,
         right_keys,
+        budget,
         limit.clone(),
     )?;
     let limit = Limit::new(limit);
     limit.grow(joined.len())?;
     let payload = right_payload(right.width(), right_keys);
     let mut row = vec![0; joined.width()];
-    let mut out = Sink::new(joined.width(), &limit);
-    out.out = joined;
-    let mut nested = |l_table: &IdTable, r_table: &IdTable| -> Result<(), TooManyRows> {
+    let mut out = Sink::after(joined, &limit, budget);
+    let mut nested = |l_table: &IdTable, r_table: &IdTable| -> Result<(), JoinStop> {
         for l in 0..l_table.len() {
             'right: for r in 0..r_table.len() {
                 for (&lk, &rk) in left_keys.iter().zip(right_keys) {
@@ -896,35 +1064,38 @@ pub fn join_with_undef(
     out.finish()
 }
 
-/// `right` for joins whose keys may be UNDEF: its rows with every key bound by key, and
-/// the rows with an unbound key, which can match any left row.
+/// `right` for joins whose keys may be UNDEF: its rows with every key bound chained by key,
+/// and the rows with an unbound key, which can match any left row.
 struct Compatible<'a> {
     right: &'a IdTable,
     left_keys: &'a [usize],
     right_keys: &'a [usize],
-    bound: HashMap<Vec<u64>, Vec<u32>, Hasher>,
-    open: Vec<u32>,
+    bound: BuildTable<'a>,
+    open: Scratch<'a, u32>,
 }
 
 impl<'a> Compatible<'a> {
-    fn new(right: &'a IdTable, left_keys: &'a [usize], right_keys: &'a [usize]) -> Self {
-        let mut bound: HashMap<Vec<u64>, Vec<u32>, Hasher> = HashMap::default();
-        let mut open = Vec::new();
-        for r in 0..right.len() {
-            let key: Vec<u64> = right_keys.iter().map(|&k| right.get(r, k)).collect();
-            if key.contains(&UNDEF) {
-                open.push(r as u32);
-            } else {
-                bound.entry(key).or_default().push(r as u32);
-            }
-        }
-        Self {
+    fn new(
+        right: &'a IdTable,
+        left_keys: &'a [usize],
+        right_keys: &'a [usize],
+        budget: &'a Budget,
+    ) -> Result<Self, BudgetExceeded> {
+        let unbound = |r: usize| right_keys.iter().any(|&k| right.get(r, k) == UNDEF);
+        let bound = BuildTable::new(right, right_keys, budget, |r| !unbound(r))?;
+        let open_rows = (0..right.len()).filter(|&r| unbound(r)).count();
+        let open = ChargedVec::collect(
+            budget,
+            open_rows,
+            (0..right.len()).filter(|&r| unbound(r)).map(|r| r as u32),
+        )?;
+        Ok(Self {
             right,
             left_keys,
             right_keys,
             bound,
             open,
-        }
+        })
     }
 
     /// Whether left row `l` and right row `r` agree wherever both bind a key.
@@ -941,10 +1112,9 @@ impl<'a> Compatible<'a> {
         &self,
         left: &IdTable,
         l: usize,
-        mut found: impl FnMut(usize) -> Result<bool, TooManyRows>,
-    ) -> Result<(), TooManyRows> {
-        let key: Vec<u64> = self.left_keys.iter().map(|&k| left.get(l, k)).collect();
-        if key.contains(&UNDEF) {
+        mut found: impl FnMut(usize) -> Result<bool, JoinStop>,
+    ) -> Result<(), JoinStop> {
+        if self.left_keys.iter().any(|&k| left.get(l, k) == UNDEF) {
             for r in 0..self.right.len() {
                 if self.agree(left, l, r) && !found(r)? {
                     return Ok(());
@@ -952,12 +1122,14 @@ impl<'a> Compatible<'a> {
             }
             return Ok(());
         }
-        for &r in self.bound.get(&key).into_iter().flatten() {
+        let mut r = self.bound.first(left, l, self.left_keys);
+        while r != END {
             if !found(r as usize)? {
                 return Ok(());
             }
+            r = self.bound.next[r as usize];
         }
-        for &r in &self.open {
+        for &r in self.open.iter() {
             if self.agree(left, l, r as usize) && !found(r as usize)? {
                 return Ok(());
             }
@@ -970,6 +1142,7 @@ impl<'a> Compatible<'a> {
 /// UNDEF matches any value, and the output takes the bound one). With `keep_unmatched`
 /// it is the left outer join (OPTIONAL): a left row without an accepted match appears
 /// once, its right payload UNDEF. `accept` sees the combined output row.
+#[allow(clippy::too_many_arguments)]
 pub fn outer_join_with_undef(
     left: &IdTable,
     right: &IdTable,
@@ -977,13 +1150,14 @@ pub fn outer_join_with_undef(
     right_keys: &[usize],
     accept: Option<RowFilter<'_>>,
     keep_unmatched: bool,
+    budget: &Arc<Budget>,
     limit: impl Into<RowLimit>,
-) -> Result<IdTable, TooManyRows> {
+) -> Result<IdTable, JoinStop> {
     let payload = right_payload(right.width(), right_keys);
     let width = left.width() + payload.len();
     let limit = Limit::new(limit);
-    let mut out = Sink::new(width, &limit);
-    let compatible = Compatible::new(right, left_keys, right_keys);
+    let mut out = Sink::new(width, &limit, budget);
+    let compatible = Compatible::new(right, left_keys, right_keys, budget)?;
     let mut row = vec![0; width];
     for l in 0..left.len() {
         let mut matched = false;
@@ -1018,38 +1192,44 @@ pub fn outer_join_with_undef(
     out.finish()
 }
 
-/// Per left row, whether some right row is compatible with it on the keys, which may hold
-/// UNDEF on either side. With `bound_in_both`, the two rows must also share a key that
-/// both bind: SPARQL's MINUS removes a row only for a solution it has a variable in
-/// common with. Without it, this is (NOT) EXISTS.
+/// Per left row, into `found`, whether some right row is compatible with it on the keys,
+/// which may hold UNDEF on either side. With `bound_in_both`, the two rows must also share a
+/// key that both bind: SPARQL's MINUS removes a row only for a solution it has a variable in
+/// common with. Without it, this is (NOT) EXISTS. Its working memory is charged to
+/// `budget`; `found` is the caller's.
 pub fn compatible_mask(
     left: &IdTable,
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
     bound_in_both: bool,
-) -> Vec<bool> {
-    let compatible = Compatible::new(right, left_keys, right_keys);
-    (0..left.len())
-        .map(|l| {
-            let mut any = false;
-            let _ = compatible.each(left, l, |r| {
-                let shares = !bound_in_both
-                    || left_keys
-                        .iter()
-                        .zip(right_keys)
-                        .any(|(&a, &b)| left.get(l, a) != UNDEF && right.get(r, b) != UNDEF);
-                any |= shares;
-                Ok(!any)
-            });
-            any
-        })
-        .collect()
+    budget: &Budget,
+    found: &mut [bool],
+) -> Result<(), BudgetExceeded> {
+    assert_eq!(found.len(), left.len(), "mask length");
+    let compatible = Compatible::new(right, left_keys, right_keys, budget)?;
+    for (l, any) in found.iter_mut().enumerate() {
+        *any = false;
+        let _ = compatible.each(left, l, |r| {
+            let shares = !bound_in_both
+                || left_keys
+                    .iter()
+                    .zip(right_keys)
+                    .any(|(&a, &b)| left.get(l, a) != UNDEF && right.get(r, b) != UNDEF);
+            *any |= shares;
+            Ok(!*any)
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn budget() -> Arc<Budget> {
+        Arc::new(Budget::unlimited())
+    }
 
     /// SplitMix64 for test data.
     struct Rng(u64);
@@ -1126,13 +1306,13 @@ mod tests {
             let mut right = random_table(&mut rng, rw, right_rows, domain, false);
             let expected = naive(&left, &right, &lk, &rk);
             assert_eq!(
-                sorted_rows(&join(&left, &right, &lk, &rk, usize::MAX).unwrap()),
+                sorted_rows(&join(&left, &right, &lk, &rk, &budget(), usize::MAX).unwrap()),
                 expected,
                 "hash, case {case}"
             );
             left.sort_by(&lk);
             right.sort_by(&rk);
-            let merged = join(&left, &right, &lk, &rk, usize::MAX).unwrap();
+            let merged = join(&left, &right, &lk, &rk, &budget(), usize::MAX).unwrap();
             assert_eq!(sorted_rows(&merged), expected, "merge, case {case}");
             assert!(merged.is_sorted_on(&lk));
         }
@@ -1145,7 +1325,8 @@ mod tests {
             let (left_rows, right_rows) = (rng.below(20) as usize, rng.below(20) as usize);
             let left = random_table(&mut rng, 2, left_rows, 4, true);
             let right = random_table(&mut rng, 2, right_rows, 4, true);
-            let got = join_with_undef(&left, &right, &[0, 1], &[1, 0], usize::MAX).unwrap();
+            let got =
+                join_with_undef(&left, &right, &[0, 1], &[1, 0], &budget(), usize::MAX).unwrap();
             assert_eq!(
                 sorted_rows(&got),
                 naive(&left, &right, &[0, 1], &[1, 0]),
@@ -1201,13 +1382,23 @@ mod tests {
                 rows.sort();
                 rows
             };
-            let got = outer_join_with_undef(&left, &right, &lk, &rk, filter, true, usize::MAX);
+            let got =
+                outer_join_with_undef(&left, &right, &lk, &rk, filter, true, &budget(), usize::MAX);
             assert_eq!(
                 sorted_rows(&got.unwrap()),
                 sorted(outer),
                 "outer, case {case}"
             );
-            let got = outer_join_with_undef(&left, &right, &lk, &rk, filter, false, usize::MAX);
+            let got = outer_join_with_undef(
+                &left,
+                &right,
+                &lk,
+                &rk,
+                filter,
+                false,
+                &budget(),
+                usize::MAX,
+            );
             let got = got.unwrap();
             assert_eq!(sorted_rows(&got), sorted(inner), "inner, case {case}");
             // The left order is kept: the left columns of the output follow the input.
@@ -1239,23 +1430,35 @@ mod tests {
                         })
                     })
                     .collect();
+                let mut found = vec![true; left.len()];
+                compatible_mask(
+                    &left,
+                    &right,
+                    &lk,
+                    &rk,
+                    bound_in_both,
+                    &budget(),
+                    &mut found,
+                )
+                .unwrap();
                 assert_eq!(
-                    compatible_mask(&left, &right, &lk, &rk, bound_in_both),
-                    expected,
+                    found, expected,
                     "mask (bound in both: {bound_in_both}), case {case}"
                 );
             }
         }
         // The row limit applies.
         let many = IdTable::from_rows(1, (0..100).map(|_| &[UNDEF][..]));
-        assert!(outer_join_with_undef(&many, &many, &[0], &[0], None, true, 99).is_err());
+        assert!(
+            outer_join_with_undef(&many, &many, &[0], &[0], None, true, &budget(), 99).is_err()
+        );
     }
 
     #[test]
     fn left_and_anti_joins() {
         let left = IdTable::from_rows(2, [&[1, 10][..], &[2, 20], &[3, 30]]);
         let right = IdTable::from_rows(2, [&[1, 100][..], &[1, 101], &[3, 300]]);
-        let out = left_join(&left, &right, &[0], &[0], None, usize::MAX).unwrap();
+        let out = left_join(&left, &right, &[0], &[0], None, &budget(), usize::MAX).unwrap();
         assert_eq!(
             sorted_rows(&out),
             vec![
@@ -1272,6 +1475,7 @@ mod tests {
             &[0],
             &[0],
             Some(&|row: &[u64]| row[2] == 100),
+            &budget(),
             usize::MAX,
         )
         .unwrap();
@@ -1279,7 +1483,7 @@ mod tests {
             sorted_rows(&filtered),
             vec![vec![1, 10, 100], vec![2, 20, UNDEF], vec![3, 30, UNDEF]]
         );
-        let anti = anti_join(&left, &right, &[0], &[0]);
+        let anti = anti_join(&left, &right, &[0], &[0], &budget()).unwrap();
         assert_eq!(sorted_rows(&anti), vec![vec![2, 20]]);
     }
 
@@ -1293,32 +1497,51 @@ mod tests {
         let mut right = random_table(&mut rng, 2, rows / 2, rows as u64, false);
         let (lk, rk) = ([0], [1]);
 
-        let hashed = join(&left, &right, &lk, &rk, usize::MAX).unwrap();
+        let hashed = join(&left, &right, &lk, &rk, &budget(), usize::MAX).unwrap();
         left.sort_by(&lk);
         right.sort_by(&rk);
-        let merged = join(&left, &right, &lk, &rk, usize::MAX).unwrap();
+        let merged = join(&left, &right, &lk, &rk, &budget(), usize::MAX).unwrap();
         assert_eq!(
             merged,
-            merge_rows(&left, 0..rows, &right, 0, &lk, &rk, &Limit::new(usize::MAX))
-                .unwrap()
-                .assume_sorted_by(lk.to_vec())
+            merge_rows(
+                &left,
+                0..rows,
+                &right,
+                0,
+                &lk,
+                &rk,
+                &budget(),
+                &Limit::new(usize::MAX)
+            )
+            .unwrap()
+            .assume_sorted_by(lk.to_vec())
         );
         assert!(merged.len() > rows / 4, "the join must produce rows");
         assert_eq!(sorted_rows(&hashed), sorted_rows(&merged));
 
         let accept_all: &dyn Fn(&[u64]) -> bool = &|_| true;
         assert_eq!(
-            left_join(&left, &right, &lk, &rk, None, usize::MAX).unwrap(),
-            left_join(&left, &right, &lk, &rk, Some(accept_all), usize::MAX).unwrap()
+            left_join(&left, &right, &lk, &rk, None, &budget(), usize::MAX).unwrap(),
+            left_join(
+                &left,
+                &right,
+                &lk,
+                &rk,
+                Some(accept_all),
+                &budget(),
+                usize::MAX
+            )
+            .unwrap()
         );
 
-        let table = BuildTable::new(&right, &rk);
+        let held = budget();
+        let table = BuildTable::new(&right, &rk, &held, |_| true).unwrap();
         let mut anti = left.clone();
         anti.retain(|t, row| table.first(t, row, &lk) == END);
-        assert_eq!(anti_join(&left, &right, &lk, &rk), anti);
+        assert_eq!(anti_join(&left, &right, &lk, &rk, &budget()).unwrap(), anti);
         let mut semi = left.clone();
         semi.retain(|t, row| table.first(t, row, &lk) != END);
-        assert_eq!(semi_join(&left, &right, &lk, &rk), semi);
+        assert_eq!(semi_join(&left, &right, &lk, &rk, &budget()).unwrap(), semi);
     }
 
     #[test]
@@ -1326,24 +1549,24 @@ mod tests {
         let mut rng = Rng(3);
         let left = random_table(&mut rng, 2, 3000, 4, false);
         let right = random_table(&mut rng, 2, 3000, 4, false);
-        let full = join(&left, &right, &[0], &[0], usize::MAX).unwrap();
+        let full = join(&left, &right, &[0], &[0], &budget(), usize::MAX).unwrap();
         assert!(full.len() > 1_000_000);
         assert_eq!(
-            join(&left, &right, &[0], &[0], 100_000),
-            Err(TooManyRows { max_rows: 100_000 })
+            join(&left, &right, &[0], &[0], &budget(), 100_000),
+            Err(JoinStop::Rows(TooManyRows { max_rows: 100_000 }))
         );
         assert_eq!(
-            join(&left, &right, &[], &[], 1_000_000).map(|t| t.len()),
-            Err(TooManyRows {
+            join(&left, &right, &[], &[], &budget(), 1_000_000).map(|t| t.len()),
+            Err(JoinStop::Rows(TooManyRows {
                 max_rows: 1_000_000
-            })
+            }))
         );
         assert_eq!(
-            join(&left, &right, &[0], &[0], full.len()).map(|t| t.len()),
+            join(&left, &right, &[0], &[0], &budget(), full.len()).map(|t| t.len()),
             Ok(full.len())
         );
-        assert!(left_join(&left, &right, &[0], &[0], None, 1000).is_err());
-        assert!(join_with_undef(&left, &right, &[0], &[0], 1000).is_err());
+        assert!(left_join(&left, &right, &[0], &[0], None, &budget(), 1000).is_err());
+        assert!(join_with_undef(&left, &right, &[0], &[0], &budget(), 1000).is_err());
     }
 
     #[test]
@@ -1355,19 +1578,171 @@ mod tests {
             max_rows: usize::MAX,
             stop: Some(Arc::new(AtomicBool::new(true))),
         };
-        assert!(join(&left, &right, &[0], &[0], stopped()).is_err());
-        assert!(join(&left, &right, &[], &[], stopped()).is_err());
-        assert!(join_keeping_left_order(&left, &right, &[0], &[0], stopped()).is_err());
-        assert!(left_join(&left, &right, &[0], &[0], None, stopped()).is_err());
-        assert!(join_with_undef(&left, &right, &[0], &[0], stopped()).is_err());
+        assert!(join(&left, &right, &[0], &[0], &budget(), stopped()).is_err());
+        assert!(join(&left, &right, &[], &[], &budget(), stopped()).is_err());
+        assert!(join_keeping_left_order(&left, &right, &[0], &[0], &budget(), stopped()).is_err());
+        assert!(left_join(&left, &right, &[0], &[0], None, &budget(), stopped()).is_err());
+        assert!(join_with_undef(&left, &right, &[0], &[0], &budget(), stopped()).is_err());
         // An unset flag changes nothing.
         let running = RowLimit {
             max_rows: usize::MAX,
             stop: Some(Arc::new(AtomicBool::new(false))),
         };
         assert_eq!(
-            join(&left, &right, &[0], &[0], running).map(|t| t.len()),
-            join(&left, &right, &[0], &[0], usize::MAX).map(|t| t.len())
+            join(&left, &right, &[0], &[0], &budget(), running).map(|t| t.len()),
+            join(&left, &right, &[0], &[0], &budget(), usize::MAX).map(|t| t.len())
         );
+    }
+
+    /// What `work` holds beyond what it charged to the budget it's given, on one thread, so
+    /// that its parallel parts run one at a time: a join's row buffers and key lists (plan
+    /// bookkeeping, the same at every size), never its output or its working memory. All
+    /// it charged is released when it ends. The pool lives as long as the process: a pool
+    /// dropped ends its thread later, and the thread's end allocates (crossbeam-epoch hands
+    /// its garbage on), into whichever measurement runs then.
+    fn uncharged(work: impl Fn(&Arc<Budget>) + Send + Sync) -> usize {
+        static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+        let pool = POOL.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap()
+        });
+        pool.install(|| {
+            let budget = budget();
+            let ((), excess) = crate::measure::measure_within(&budget, || work(&budget));
+            assert_eq!(budget.used(), 0, "released when it ends");
+            excess
+        })
+    }
+
+    /// `rows` rows of distinct keys `0, step, 2·step, …` and a second column.
+    fn keyed(rows: usize, step: u64) -> IdTable {
+        IdTable::from_columns(vec![
+            (0..rows as u64).map(|i| i * step).collect(),
+            (0..rows as u64).collect(),
+        ])
+        .assume_sorted_by(vec![0])
+    }
+
+    /// [`keyed`]'s rows in reverse order, not known to be sorted: made without a parallel
+    /// sort, whose pool threads would go on tidying up into the next measurement.
+    fn unsorted(rows: usize, step: u64) -> IdTable {
+        IdTable::from_columns(vec![
+            (0..rows as u64).rev().map(|i| i * step).collect(),
+            (0..rows as u64).rev().collect(),
+        ])
+    }
+
+    /// Inner joins (merge, hash, cross product) hold nothing uncharged that grows with
+    /// their rows: outputs, pairs and hash chains are charged before they are allocated.
+    #[test]
+    fn inner_joins_hold_no_more_than_they_charge() {
+        if !crate::measure::alone() {
+            return;
+        }
+        let held = |rows: usize| {
+            let (left, right, unsorted) = (keyed(rows, 1), keyed(rows, 1), unsorted(rows, 1));
+            let small = keyed(rows / 100, 1);
+            [
+                uncharged(|b| drop(join(&left, &right, &[0], &[0], b, usize::MAX).unwrap())),
+                uncharged(|b| drop(join(&left, &unsorted, &[0], &[0], b, usize::MAX).unwrap())),
+                uncharged(|b| drop(join(&small, &small, &[], &[], b, usize::MAX).unwrap())),
+            ]
+        };
+        assert_eq!(held(10_000), held(100_000));
+    }
+
+    /// Left joins (merged on sorted keys, or hashed with a filter) hold nothing uncharged
+    /// that grows with the matches of a key.
+    #[test]
+    fn left_joins_hold_no_more_than_they_charge() {
+        if !crate::measure::alone() {
+            return;
+        }
+        let held = |matches: usize| {
+            let left = keyed(100, 2);
+            // Each even key `matches` times, each odd one once: left rows with and without
+            // a match.
+            let keys: Vec<u64> = (0..200)
+                .flat_map(|k| vec![k; if k % 2 == 0 { matches } else { 1 }])
+                .collect();
+            let right = IdTable::from_columns(vec![(0..keys.len() as u64).collect(), keys])
+                .assume_sorted_by(vec![1]);
+            let all: &(dyn Fn(&[u64]) -> bool + Sync) = &|_| true;
+            [
+                uncharged(|b| {
+                    drop(left_join(&left, &right, &[0], &[1], None, b, usize::MAX).unwrap())
+                }),
+                uncharged(|b| {
+                    drop(left_join(&left, &right, &[0], &[1], Some(all), b, usize::MAX).unwrap())
+                }),
+            ]
+        };
+        assert_eq!(held(10), held(10_000));
+    }
+
+    /// Joins whose keys may be unbound hold nothing uncharged that grows with the rows of
+    /// an unbound key: the copies of the bound and the unbound rows, the chains of the
+    /// bound ones, the list of the unbound ones and the output are charged.
+    #[test]
+    fn joins_over_unbound_keys_hold_no_more_than_they_charge() {
+        if !crate::measure::alone() {
+            return;
+        }
+        let held = |unbound: usize| {
+            let keys: Vec<u64> = (0..1_000)
+                .chain(std::iter::repeat_n(UNDEF, unbound))
+                .collect();
+            let rows = keys.len() as u64;
+            let left = IdTable::from_columns(vec![keys.clone(), (0..rows).collect()]);
+            let right = IdTable::from_columns(vec![keys, (0..rows).collect()]);
+            let found = std::sync::Mutex::new(vec![false; left.len()]);
+            [
+                uncharged(|b| {
+                    drop(join_with_undef(&left, &right, &[0], &[0], b, usize::MAX).unwrap())
+                }),
+                uncharged(|b| {
+                    let out =
+                        outer_join_with_undef(&left, &right, &[0], &[0], None, true, b, usize::MAX);
+                    drop(out.unwrap());
+                }),
+                uncharged(|b| {
+                    let mut found = found.lock().unwrap();
+                    compatible_mask(&left, &right, &[0], &[0], true, b, &mut found).unwrap();
+                }),
+            ]
+        };
+        assert_eq!(held(10), held(300));
+    }
+
+    /// Semi- and anti-joins in place hold nothing uncharged that grows with their rows:
+    /// their masks and hash chains are charged.
+    #[test]
+    fn semi_and_anti_joins_hold_no_more_than_they_charge() {
+        if !crate::measure::alone() {
+            return;
+        }
+        let held = |rows: usize| {
+            let (left, right) = (keyed(rows, 1), keyed(rows / 2, 2));
+            let unsorted = unsorted(rows / 2, 2);
+            let filtered = |semi: bool, right: &IdTable| {
+                let left = std::sync::Mutex::new(left.clone());
+                uncharged(|b| {
+                    let mut left = left.lock().unwrap();
+                    match semi {
+                        true => semi_join_in_place(&mut left, right, &[0], &[0], b).unwrap(),
+                        false => anti_join_in_place(&mut left, right, &[0], &[0], b).unwrap(),
+                    }
+                })
+            };
+            [
+                filtered(true, &right),
+                filtered(false, &right),
+                filtered(true, &unsorted),
+                filtered(false, &unsorted),
+            ]
+        };
+        assert_eq!(held(10_000), held(100_000));
     }
 }

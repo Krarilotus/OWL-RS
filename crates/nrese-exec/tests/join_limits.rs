@@ -5,8 +5,14 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use nrese_exec::IdTable;
+use std::sync::Arc;
+
 use nrese_exec::join::{join, left_join};
+use nrese_exec::{Budget, IdTable};
+
+fn budget() -> Arc<Budget> {
+    Arc::new(Budget::unlimited())
+}
 
 struct Counting;
 
@@ -50,14 +56,14 @@ fn joins_over_their_limit_stop_before_expanding_a_group() {
     // 2,000 × 2,000 rows of one key: 4 million pairs, 32 MB of row numbers if expanded.
     let (left, right) = (one_key(2_000), one_key(2_000));
     let peak = peak_of(|| {
-        assert!(join(&left, &right, &[0], &[0], 1).is_err());
+        assert!(join(&left, &right, &[0], &[0], &budget(), 1).is_err());
     });
     assert!(
         peak < 256 * 1024,
         "the inner join allocated {peak} bytes before refusing"
     );
     let peak = peak_of(|| {
-        assert!(left_join(&left, &right, &[0], &[0], None, 1).is_err());
+        assert!(left_join(&left, &right, &[0], &[0], None, &budget(), 1).is_err());
     });
     assert!(
         peak < 256 * 1024,
@@ -65,11 +71,13 @@ fn joins_over_their_limit_stop_before_expanding_a_group() {
     );
     // Within the limit the same joins give every pair.
     assert_eq!(
-        join(&left, &right, &[0], &[0], usize::MAX).unwrap().len(),
+        join(&left, &right, &[0], &[0], &budget(), usize::MAX)
+            .unwrap()
+            .len(),
         4_000_000
     );
     assert_eq!(
-        left_join(&left, &right, &[0], &[0], None, usize::MAX)
+        left_join(&left, &right, &[0], &[0], None, &budget(), usize::MAX)
             .unwrap()
             .len(),
         4_000_000
