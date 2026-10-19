@@ -4171,7 +4171,8 @@ fn updates_with_a_dataset_equal_the_reference() {
 
 /// The default graph merged from listed graphs (`FROM <g0> FROM <g1>`) through the
 /// shortcuts that read the index directly (an index nested-loop join, a streamed `LIMIT`,
-/// `COUNT(*)` of one pattern): each statement once, and none from another graph.
+/// `COUNT(*)` of one pattern): each statement once, and none from another graph. The
+/// `LIMIT` of one pattern streams until it has its rows, as over one graph.
 #[test]
 fn a_merge_of_listed_graphs_takes_no_shortcut_through_other_graphs() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -4187,26 +4188,35 @@ fn a_merge_of_listed_graphs_takes_no_shortcut_through_other_graphs() {
     tx.commit().unwrap();
     let snapshot = engine.snapshot();
     let from = format!("FROM <{EX}g0> FROM <{EX}g1>");
-    for (text, solutions) in [
+    for (text, solutions, operator) in [
         (
             format!("SELECT * {from} WHERE {{ <{EX}a> <{EX}p> ?b . ?b <{EX}p> ?c }}"),
             40,
+            None,
         ),
         (
             format!("SELECT * {from} WHERE {{ ?b <{EX}p> ?c }} LIMIT 100"),
             41,
+            Some(("limit pushdown", "until 100 rows")),
         ),
         (
             format!("SELECT (COUNT(*) AS ?n) {from} WHERE {{ ?b <{EX}p> ?c }}"),
             1,
+            None,
         ),
     ] {
         let query = SparqlParser::new().parse_query(&text).unwrap();
         let options = QueryOptions::default();
-        assert_eq!(
-            explain_query(&snapshot, &query, &options).unwrap().executor,
-            "native"
-        );
+        let plan = explain_query(&snapshot, &query, &options).unwrap();
+        assert_eq!(plan.executor, "native");
+        if let Some((operator, detail)) = operator {
+            assert!(
+                plan.steps
+                    .iter()
+                    .any(|s| s.operator == operator && s.detail.ends_with(detail)),
+                "{text}: no {operator} {detail}"
+            );
+        }
         let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
         assert_eq!(native.len(), solutions, "{text}");
         assert!(

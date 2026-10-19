@@ -3961,10 +3961,7 @@ impl<'a> Context<'a> {
         let [triple] = patterns.as_slice() else {
             return Ok(None);
         };
-        if self.merge_set.is_some()
-            || search::is_search(triple, patterns)
-            || self.is_spatial(triple)
-        {
+        if search::is_search(triple, patterns) || self.is_spatial(triple) {
             return Ok(None);
         }
         let vars = triple_variables(triple);
@@ -3995,14 +3992,19 @@ impl<'a> Context<'a> {
         let mut chunk = IdTable::new(width);
         let mut row = vec![0u64; width];
         // The merged default graph is read in a graph-last order, where the copies of a
-        // statement are adjacent, and all but the first are skipped.
+        // statement are adjacent, and all but the first are skipped (of a merge of listed
+        // graphs, those in other graphs first).
         let mut quads: Box<dyn Iterator<Item = nrese_engine::EncodedQuad> + '_> = if scan.merged() {
             let sorted = self
                 .snapshot
                 .scan_sorted_in(self.model, &scan.quad_pattern(), scan.permutation_for(None))
                 .expect("permutation_for returns a usable permutation");
             let mut previous: Option<[u64; 3]> = None;
+            let graphs = self.merge_set.as_deref();
             Box::new(sorted.filter(move |quad| {
+                if graphs.is_some_and(|graphs| !graphs.contains(&quad.graph)) {
+                    return false;
+                }
                 let components = quad.components();
                 let statement = [components[0], components[1], components[2]];
                 let first = previous != Some(statement);
