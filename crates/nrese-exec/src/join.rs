@@ -421,7 +421,7 @@ fn merge_rows(
         left.len() < END as usize && right.len() < END as usize,
         "join input exceeds u32 rows"
     );
-    let mut pairs = Pairs::new(budget, limit);
+    let mut pairs = Pairs::new(budget, limit, rows.len());
     let (mut l, end) = (rows.start, rows.end);
     if let ([lk], [rk]) = (lk, rk) {
         let (a, b) = (left.column(*lk), right.column(*rk));
@@ -473,14 +473,23 @@ struct Pairs<'a> {
 }
 
 impl<'a> Pairs<'a> {
-    fn new(budget: &'a Arc<Budget>, limit: &'a Limit) -> Self {
-        Self {
+    /// Pairs of a merge over `rows` left rows: room for one pair each, where the budget has
+    /// it, reserved at once (a join of keys that match once makes no more), so the lists
+    /// don't grow pair by pair, each growth a charge on budget counters every part shares.
+    fn new(budget: &'a Arc<Budget>, limit: &'a Limit, rows: usize) -> Self {
+        let mut pairs = Self {
             lefts: ChargedVec::new(&**budget),
             rights: ChargedVec::new(&**budget),
             pending: 0,
             budget,
             limit,
+        };
+        if rows.saturating_mul(2 * size_of::<u32>()) <= budget.remaining() {
+            // Room checked first: a refusal here would only mark the budget refused.
+            let _ = pairs.lefts.reserve_exact(rows);
+            let _ = pairs.rights.reserve_exact(rows);
         }
+        pairs
     }
 
     /// Each left row of `lefts` with each right row of `rights` (once with none if
@@ -492,11 +501,16 @@ impl<'a> Pairs<'a> {
         if self.pending >= LIMIT_STEP {
             self.limit.grow(std::mem::take(&mut self.pending))?;
         }
-        self.lefts
-            .extend_bounded(n, std::iter::repeat_n(l as u32, n))?;
-        match rights.is_empty() {
-            true => self.rights.extend_bounded(n, std::iter::repeat_n(END, n))?,
-            false => self.rights.extend_bounded(n, rights.map(|r| r as u32))?,
+        // Room for the run first, then plain writes: most runs are a pair or two.
+        self.lefts.reserve(n)?;
+        self.rights.reserve(n)?;
+        if rights.is_empty() && unmatched {
+            self.lefts.push(l as u32)?;
+            self.rights.push(END)?;
+        }
+        for r in rights {
+            self.lefts.push(l as u32)?;
+            self.rights.push(r as u32)?;
         }
         Ok(())
     }
@@ -730,7 +744,7 @@ fn sorted_left_join(
         "join input exceeds u32 rows"
     );
     let (a, b) = (left.column(lk), right.column(rk));
-    let mut pairs = Pairs::new(budget, limit);
+    let mut pairs = Pairs::new(budget, limit, a.len());
     let (mut l, mut r) = (0, 0);
     while l < a.len() {
         let key = a[l];
@@ -865,15 +879,14 @@ fn membership<'b>(
         return Ok(keep);
     }
     let table = BuildTable::new(right, right_keys, budget, |_| true)?;
-    let mut keep = mask(left.len(), !wanted, budget)?;
-    let found = |(row, keep): (usize, &mut bool)| {
-        *keep = (table.first(left, row, left_keys) != END) == wanted;
-    };
-    if left.len() < PARALLEL_ROWS {
-        keep.iter_mut().enumerate().for_each(found);
-    } else {
-        keep.par_iter_mut().enumerate().for_each(found);
+    let found = |row: usize| (table.first(left, row, left_keys) != END) == wanted;
+    // Each row's answer written once, into a mask charged first.
+    let rows = left.len();
+    if rows < PARALLEL_ROWS {
+        return ChargedVec::collect(budget, rows, (0..rows).map(found));
     }
+    let mut keep = ChargedVec::with_capacity(budget, rows)?;
+    keep.fill(rows, |room| room.par_fill(rows, found))?;
     Ok(keep)
 }
 
@@ -992,10 +1005,8 @@ pub fn join_with_undef(
 ) -> Result<IdTable, JoinStop> {
     // The rows with every key bound, and those with one unbound, each copied (charged).
     let split = |t: &IdTable, keys: &[usize]| -> Result<_, BudgetExceeded> {
-        let mut open = mask(t.len(), false, budget)?;
-        for (row, open) in open.iter_mut().enumerate() {
-            *open = keys.iter().any(|&k| t.get(row, k) == UNDEF);
-        }
+        let unbound = |row: usize| keys.iter().any(|&k| t.get(row, k) == UNDEF);
+        let open = ChargedVec::collect(&**budget, t.len(), (0..t.len()).map(unbound))?;
         Ok((
             t.selected(&open, false, budget)?,
             t.selected(&open, true, budget)?,
