@@ -51,7 +51,9 @@ fn triple(s: &str, p: &str, o: &str) -> TriplePattern {
 /// pattern's variables and scan pattern, the positions of each variable, a row buffer, the
 /// tables' column lists, the measured input's variable list), made per call, not per row.
 /// Uncharged by design (the executor charges rows); bounded here so that it stays small
-/// (19 Oct: 324 bytes for the streamed LIMIT, 553 for the index join).
+/// (19 Oct: 324 bytes for the streamed LIMIT, 553 for the index join). A bound for these
+/// fixed plans: the bookkeeping grows with the query's size (its patterns), not its data,
+/// which the planner's own budget is to cover.
 const PLAN_BOOKKEEPING_BYTES: usize = 640;
 
 /// Sol's case (review of 2b6ddbb7): 100 statements in two listed graphs under one-byte
@@ -84,8 +86,9 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
     );
     assert_eq!((shared.used(), shared.peak()), (0, 0));
 
-    // What a streamed LIMIT holds uncharged beyond the engine's scan, for `rows` rows.
-    let streamed = |rows: usize| -> usize {
+    // What a streamed LIMIT holds uncharged beyond the engine's scan, for `rows` rows
+    // projected on `projection` (none: every variable).
+    let streamed = |rows: usize, projection: &[&str]| -> usize {
         let engine = store(
             (0..rows)
                 .flat_map(|i| ["g0", "g1"].map(|g| (format!("s{i}"), "p", format!("o{i}"), g))),
@@ -98,9 +101,18 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
             None,
             None,
         );
-        let pattern = GraphPattern::Bgp {
+        let mut pattern = GraphPattern::Bgp {
             patterns: vec![triple("s", "p", "o")],
         };
+        if !projection.is_empty() {
+            pattern = GraphPattern::Project {
+                inner: Box::new(pattern),
+                variables: projection
+                    .iter()
+                    .map(|v| Variable::new_unchecked(*v))
+                    .collect(),
+            };
+        }
         let scan = ctx.scan_pattern(&triple("s", "p", "o")).unwrap();
         let engine_scan = measure(|| {
             snapshot
@@ -117,6 +129,46 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
         });
         assert_eq!(solutions.table.len(), rows);
         excess.saturating_sub(engine_scan)
+    };
+    // What an index join holds uncharged beyond the engine's probes, for `rows` input rows
+    // (one key, one match in each of two graphs), in the order the index reads or not:
+    // sorted first, then probed in parallel chunks past two chunks' rows.
+    let probed_rows = |rows: usize, ordered: bool| -> usize {
+        let engine = store(["g0", "g1"].map(|g| ("hub".to_owned(), "q", "o".to_owned(), g)));
+        let snapshot = engine.snapshot();
+        let envelope = Envelope::unlimited();
+        let options = merging(&["g0", "g1"], envelope.clone());
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let hub = snapshot.lookup(node("hub").as_ref().into()).unwrap();
+        let scan = ctx.scan_pattern(&triple("b", "q", "c")).unwrap();
+        let mut bound = scan.clone();
+        bound.slots[0] = Slot::Const(hub);
+        let engine_probes = measure(|| {
+            let mut cursor = snapshot.probe_cursor(ctx.model);
+            let mut quads = 0;
+            cursor.for_each(&bound.quad_pattern(), |_| quads += 1);
+            quads
+        })
+        .1;
+        let shared = [Variable::new_unchecked("b")];
+        let (joined, excess) = measure_within(&envelope, || {
+            // The input made and charged inside the measurement, charged before it is made.
+            let mut held = Reservation::new(&*ctx.budget);
+            held.charge(rows * 8).unwrap();
+            let mut table = IdTable::with_capacity(1, rows);
+            for _ in 0..rows {
+                table.push_row(&[hub.raw()]);
+            }
+            held.transfer();
+            let left = Solutions {
+                vars: shared.to_vec(),
+                table,
+                ordered,
+            };
+            ctx.probe_join(left, &scan, &shared).ok().expect("the join")
+        });
+        assert_eq!(joined.table.len(), rows);
+        excess.saturating_sub(engine_probes)
     };
     // What an index join holds uncharged beyond the engine's probes, for a key's `fanout`
     // matches in each of three graphs.
@@ -161,9 +213,29 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
         assert_eq!(joined.table.len(), fanout);
         excess.saturating_sub(engine_probes)
     };
+    // Each row scales one dimension that grows with the data: the rows a LIMIT streams
+    // (plain, and projected on unbound variables: columns made per row), a key's matches,
+    // and an index join's input rows, kept in order or sorted first (two chunks against
+    // sixteen, both on the parallel path).
+    let unbound = ["s", "o", "missing0", "missing1"];
     for (operator, one, many) in [
-        ("streamed LIMIT", streamed(1), streamed(10_000)),
+        ("streamed LIMIT", streamed(1, &[]), streamed(10_000, &[])),
+        (
+            "streamed LIMIT, unbound projected",
+            streamed(2_000, &unbound),
+            streamed(10_000, &unbound),
+        ),
         ("index join", probed(1), probed(5_000)),
+        (
+            "index join, input in order",
+            probed_rows(8_192, true),
+            probed_rows(65_536, true),
+        ),
+        (
+            "index join, input sorted",
+            probed_rows(8_192, false),
+            probed_rows(65_536, false),
+        ),
     ] {
         assert_eq!(many, one, "{operator}: uncharged bytes grow with the rows");
         assert!(
