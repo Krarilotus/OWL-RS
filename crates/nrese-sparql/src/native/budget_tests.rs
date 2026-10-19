@@ -48,18 +48,17 @@ fn triple(s: &str, p: &str, o: &str) -> TriplePattern {
 }
 
 /// What an operator holds uncharged whatever its rows: its plan's bookkeeping (the
-/// pattern's variables and scan pattern, the positions of each variable, a row buffer, the
-/// tables' column lists, the measured input's variable list), made per call, not per row.
-/// Uncharged by design (the executor charges rows); bounded here so that it stays small
-/// (19 Oct: 324 bytes for the streamed LIMIT, 553 for the index join). A bound for these
-/// fixed plans: the bookkeeping grows with the query's size (its patterns), not its data,
-/// which the planner's own budget is to cover.
-const PLAN_BOOKKEEPING_BYTES: usize = 640;
+/// pattern's variables, the positions of each variable, the measured input's variable
+/// list), made per call, not per row. The tables' column vectors and the row buffers are
+/// charged (the tables own their charge). Uncharged by design (it grows with the query's
+/// size, which the planner's own budget is to cover, not its data); bounded here so that it
+/// stays small (20 Oct: 276 bytes for the streamed LIMIT, 431 for the index join).
+const PLAN_BOOKKEEPING_BYTES: usize = 512;
 
-/// What a column of an operator's input adds to its bookkeeping, per call: its variable, its
-/// header in the input's, the output's and each running chunk's column lists, a row slot
-/// (19 Oct: about 122 bytes a column, the same at two chunks and at sixteen).
-const COLUMN_BOOKKEEPING_BYTES: usize = 128;
+/// What a column of an operator's input adds to its bookkeeping, per call: its variable,
+/// copied into the input's, the plan's and the output's variable lists (20 Oct: 99 bytes a
+/// column, the same at two chunks and at sixteen).
+const COLUMN_BOOKKEEPING_BYTES: usize = 104;
 
 /// Sol's case (review of 2b6ddbb7): 100 statements in two listed graphs under one-byte
 /// request and server budgets, `LIMIT 100` refused with nothing left charged. And
@@ -73,6 +72,12 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
     if !alone() {
         return;
     }
+    // Parallel parts one at a time (this test's process is its own): each holds the
+    // engine's probe cursor, measured apart (`engine_probes`) and not the join's to charge,
+    // and how many run at once depends on the threads, not the rows.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build_global();
     let engine = store(
         (0..100).flat_map(|i| ["g0", "g1"].map(|g| (format!("s{i}"), "p", "target".to_owned(), g))),
     );
@@ -171,13 +176,10 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
                 let (joined, excess) = measure_within(&envelope, || {
                     // The input made and charged inside the measurement, charged before it
                     // is made.
-                    let mut held = Reservation::new(&*ctx.budget);
-                    held.charge(rows * width * 8).unwrap();
-                    let mut table = IdTable::with_capacity(width, rows);
+                    let mut table = IdTable::charged(width, rows, &ctx.budget).unwrap();
                     for _ in 0..rows {
-                        table.push_row(&row);
+                        table.push_reserved(&row);
                     }
-                    held.transfer();
                     let left = Solutions {
                         vars: vars.clone(),
                         table,

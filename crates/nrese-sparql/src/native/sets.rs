@@ -120,7 +120,7 @@ impl Context<'_> {
         let kept: Vec<usize> = (0..solutions.vars.len())
             .filter(|&column| needed.contains(&solutions.vars[column]))
             .collect();
-        self.reshaped(solutions, 0, |solutions| {
+        self.reshaped(solutions, |solutions| {
             let rows = solutions.table.len();
             let vars = kept.iter().map(|&c| solutions.vars[c].clone()).collect();
             let ordered = solutions.ordered;
@@ -133,11 +133,11 @@ impl Context<'_> {
                 table.dedup_preserving_order();
                 table
             };
-            Solutions {
+            Ok(Solutions {
                 vars,
                 table,
                 ordered,
-            }
+            })
         })
     }
 
@@ -718,21 +718,19 @@ mod tests {
                 ordered: false,
             }
         };
-        let concat = |ctx: &Context<'_>, parts: Vec<Solutions>| {
-            let growth = super::super::concat_growth(&parts);
-            ctx.reshaped(parts, growth, |parts| Solutions {
-                vars: vec![v.clone()],
-                table: IdTable::concat(1, parts.into_iter().map(|p| p.table).collect()),
-                ordered: false,
-            })
-        };
+        // A table of one column with room for `rows`: its column and the vector of it.
+        let bytes = |rows: usize| size_of::<Vec<u64>>() + 8 * rows;
         let cases: [(&str, Vec<Solutions>, usize); 3] = [
-            ("a projection keeping its column", vec![table(&[], 8)], 64),
-            ("one table joined into one", vec![table(&[1], 8)], 64),
+            (
+                "a projection keeping its column",
+                vec![table(&[], 8)],
+                bytes(8),
+            ),
+            ("one table joined into one", vec![table(&[1], 8)], bytes(8)),
             (
                 "two, with room in the first",
                 vec![table(&[1], 8), table(&[2], 1)],
-                72,
+                bytes(8) + bytes(1),
             ),
         ];
         for (case, parts, limit) in cases {
@@ -748,7 +746,7 @@ mod tests {
                     let rows = parts.into_iter().next().unwrap();
                     ctx.distinct_on(rows, std::slice::from_ref(&v))
                 }
-                _ => concat(&ctx, parts),
+                _ => ctx.concatenated(vec![v.clone()], parts),
             };
             let remade = remade.ok().unwrap_or_else(|| panic!("{case}: refused"));
             assert_eq!(ctx.budget.used(), remade.table.memory_bytes(), "{case}");
