@@ -543,14 +543,19 @@ pub fn measure_within<T>(budget: &Budget, work: impl FnOnce() -> T) -> (T, usize
 /// The variable that tells a test process it runs one test alone.
 const ALONE: &str = "NRESE_MEASURE_ALONE";
 
-/// Whether the calling test runs alone in its process, as a measurement needs: under
-/// cargo-nextest (a process per test), and in the process this starts. Elsewhere it runs
-/// the test again, alone (ignored or not), in a child process of this binary and ends as
-/// it did there: a pass returns false (the caller returns), a failure fails, and a
-/// `should_panic` test that panicked there panics with its message. One that didn't
-/// panic there ends this binary with a failure, as a panic would pass it. The test is the
-/// calling thread's, which the test harness names after it; what the run printed is
-/// printed (where the harness shows it).
+/// Whether the calling test runs alone in its process, as a measurement needs: only in the
+/// process this starts. Elsewhere it runs the test again, alone (ignored or not), on the
+/// main thread of a child process of this binary (`--test-threads=1`) and ends as it did
+/// there: a pass returns false (the caller returns), a failure fails, and a `should_panic`
+/// test that panicked there panics with its message. One that didn't panic there ends this
+/// binary with a failure, as a panic would pass it. The test is the calling thread's, which
+/// the test harness names after it; what the run printed is printed (where the harness
+/// shows it).
+///
+/// Under cargo-nextest too, though it runs a process per test: there the harness runs the
+/// test on a thread of its own, and its main thread, past 60 seconds, writes that the test
+/// is running long, allocating into the measurement (594 bytes counted, 20 Oct, a guard
+/// slowed past a minute by a loaded machine). On the main thread nothing else runs.
 pub fn alone() -> bool {
     // Miri can't start a process; it runs the tests it is given one at a time.
     if cfg!(miri) {
@@ -558,7 +563,7 @@ pub fn alone() -> bool {
     }
     let current = std::thread::current();
     let test = current.name().expect("a test thread, named after its test");
-    if std::env::var_os("NEXTEST").is_some() || std::env::var(ALONE).is_ok_and(|t| t == test) {
+    if std::env::var(ALONE).is_ok_and(|t| t == test) {
         return true;
     }
     let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
