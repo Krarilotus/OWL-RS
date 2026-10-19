@@ -1,7 +1,7 @@
 //! Vector search over the dictionary's vector literals (`Snapshot::vector_search`).
 
 use nrese_engine::vector::{DATATYPE, Metric, lexical};
-use nrese_engine::{Engine, EngineConfig, TermId, VectorQuery, VectorStrategy};
+use nrese_engine::{Engine, EngineConfig, TermId, VectorQuery};
 use nrese_rdf::{Literal, NamedNode, Quad, QuadRef};
 
 fn engine() -> Engine {
@@ -104,55 +104,84 @@ fn the_nearest_vector_literals_are_found() {
     );
 }
 
-/// A large space is searched through its graph and finds what the exact scan finds.
+/// An answer depends on the vectors the reader sees alone: with deleted vectors and an
+/// open transaction's in the dictionary, each nearer to a query than any visible one, an
+/// approximate search finds the nearest visible ones, as comparing every one the filter
+/// takes does (the review's case of 19 October: one graph of every vector the dictionary
+/// held, whose links and descent ran through the hidden ones).
 #[test]
-fn large_spaces_are_searched_through_a_graph() {
+fn hidden_vectors_change_no_answer() {
+    use nrese_engine::{QuadPattern, VectorStrategy};
     let engine = engine();
-    // 72,000 points: the circle with 200 radii.
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut random = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+    };
+    let queries: Vec<Vec<f32>> = (0..20)
+        .map(|_| (0..16).map(|_| random()).collect())
+        .collect();
+    let quad = |name: String, values: &[f32]| {
+        let literal =
+            Literal::new_typed_literal(lexical(values), NamedNode::new_unchecked(DATATYPE));
+        Quad::new(
+            NamedNode::new_unchecked(format!("http://example.com/{name}")),
+            NamedNode::new_unchecked("http://example.com/embedding"),
+            literal,
+            nrese_rdf::GraphName::DefaultGraph,
+        )
+    };
+    // Near a query: within a hundredth on each axis.
+    let near = |q: &[f32], random: &mut dyn FnMut() -> f32| -> Vec<f32> {
+        q.iter().map(|x| x + random() * 0.01).collect()
+    };
+    let visible: Vec<Quad> = (0..20_000)
+        .map(|i| {
+            let values: Vec<f32> = (0..16).map(|_| random()).collect();
+            quad(format!("v{i}"), &values)
+        })
+        .collect();
+    let deleted: Vec<Quad> = (0..20_000)
+        .map(|i| quad(format!("d{i}"), &near(&queries[i % 20], &mut random)))
+        .collect();
     let mut tx = engine.transaction();
-    for i in 0..72_000usize {
-        let angle = ((i % 360) as f32 + (i / 360) as f32 * 0.001).to_radians();
-        let radius = 1.0 + (i / 360) as f32 * 0.01;
-        let literal = Literal::new_typed_literal(
-            lexical(&[radius * angle.cos(), radius * angle.sin(), (i % 7) as f32]),
-            NamedNode::new_unchecked(DATATYPE),
-        );
-        tx.insert(QuadRef::new(
-            NamedNode::new_unchecked(format!("http://example.com/item/{i}")).as_ref(),
-            NamedNode::new_unchecked("http://example.com/embedding").as_ref(),
-            literal.as_ref(),
-            nrese_rdf::GraphNameRef::DefaultGraph,
-        ));
+    for quad in visible.iter().chain(&deleted) {
+        tx.insert(QuadRef::from(quad));
     }
     tx.commit().expect("commit");
+    let mut tx = engine.transaction();
+    for quad in &deleted {
+        tx.remove(QuadRef::from(quad));
+    }
+    tx.commit().expect("commit");
+    let mut open = engine.transaction();
+    for i in 0..4_000 {
+        let values = near(&queries[i % 20], &mut random);
+        open.insert(QuadRef::from(&quad(format!("o{i}"), &values)));
+    }
     let snapshot = engine.snapshot();
-    let query = VectorQuery {
-        metric: Metric::L2,
-        ..VectorQuery::new(vec![0.5, 1.2, 3.0], 10)
+    let seen = |id: TermId| {
+        let pattern = QuadPattern {
+            object: Some(id),
+            ..QuadPattern::all()
+        };
+        snapshot.quads_for_pattern(&pattern).next().is_some()
     };
-    // Past SYNC_BUILD the graph is built on a thread; a warm-up waits for it.
-    snapshot.prepare_vector_graph(&query);
-    let (approximate, report) = snapshot.vector_search(&query, &|_| true);
-    assert!(
-        report.graph && report.space == 72_000 && report.scanned == 0,
-        "{report:?}"
-    );
-    let exact = VectorQuery {
-        strategy: VectorStrategy::Exact,
-        ..query.clone()
-    };
-    let (truth, report) = snapshot.vector_search(&exact, &|_| true);
-    assert!(!report.graph);
-    let shared = approximate
-        .iter()
-        .filter(|(id, _)| truth.iter().any(|(t, _)| t == id))
-        .count();
-    assert!(shared >= 9, "{shared} of 10");
-    // A selective filter is answered exactly.
-    let selective = VectorQuery {
-        accepted: Some(10),
-        ..query
-    };
-    let (_, report) = snapshot.vector_search(&selective, &|_| true);
-    assert!(!report.graph);
+    for query in &queries {
+        let approximate = VectorQuery {
+            strategy: VectorStrategy::Approximate,
+            ..VectorQuery::new(query.clone(), 10)
+        };
+        let exact = VectorQuery {
+            strategy: VectorStrategy::Exact,
+            ..approximate.clone()
+        };
+        let (found, _) = snapshot.vector_search(&approximate, &seen);
+        let (truth, _) = snapshot.vector_search(&exact, &seen);
+        assert_eq!(found.len(), 10);
+        assert_eq!(found, truth);
+    }
+    drop(open);
 }

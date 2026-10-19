@@ -502,10 +502,8 @@ struct Derived {
     dir: RwLock<Option<std::path::PathBuf>>,
     /// Per index ([`TEXT`], [`IRI_TEXT`], [`VECTORS`]): whether its file was looked for.
     looked: [std::sync::atomic::AtomicBool; 3],
-    /// Per index: the entries the last file written covered, and for the vectors the
-    /// vectors their graphs covered.
+    /// Per index: the entries the last file written covered.
     saved: parking_lot::Mutex<[u64; 3]>,
-    saved_graphs: parking_lot::Mutex<usize>,
     /// Indexes read from their files.
     loads: std::sync::atomic::AtomicU64,
 }
@@ -619,7 +617,6 @@ impl Dictionary {
         };
         let mut slot = self.vectors.write();
         if slot.covered() < covered {
-            *self.derived.saved_graphs.lock() = index.graph_coverage();
             *slot = index;
             self.derived.saved.lock()[VECTORS] = covered;
             self.derived
@@ -667,12 +664,10 @@ impl Dictionary {
                 }
             }
         }
-        // The vectors: when they or their graphs cover more than the file does.
+        // The vectors: when they cover more than the file does.
         let index = self.vectors.read();
         let covered = index.covered();
-        let graphs = index.graph_coverage();
-        let newer = covered > self.derived.saved.lock()[VECTORS]
-            || graphs > *self.derived.saved_graphs.lock();
+        let newer = covered > self.derived.saved.lock()[VECTORS];
         if covered == 0 || !newer || index.is_empty() {
             return;
         }
@@ -685,7 +680,6 @@ impl Dictionary {
         }) {
             Ok(()) => {
                 self.derived.saved.lock()[VECTORS] = covered;
-                *self.derived.saved_graphs.lock() = graphs;
                 tracing::info!(
                     covered,
                     ms = started.elapsed().as_millis() as u64,
@@ -1042,50 +1036,28 @@ impl Dictionary {
     }
 
     /// The vector literals nearest to `query.vector` among the first `known` entries that
-    /// `accept` takes (by id), nearest first; the index first takes in the vector literals
-    /// interned since the last search, and builds or extends the graph the search uses.
-    pub fn vector_search(
+    /// `accept` takes (by id), nearest first, every one compared ([`super::vectors`]); the
+    /// index first takes in the vector literals interned since the last search. What the
+    /// scan holds is charged to `budget` first.
+    pub(crate) fn vector_search(
         &self,
         query: &super::VectorQuery,
         known: u64,
         accept: &(dyn Fn(TermId) -> bool + Sync),
-    ) -> (Vec<nrese_vector::Hit>, super::VectorSearchReport) {
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+    ) -> Result<(Vec<nrese_vector::Hit>, super::VectorSearchReport), nrese_exec::BudgetExceeded>
+    {
         self.cover_vectors();
-        if self.vectors.read().may_need_work(query) {
-            let work = self.vectors.write().work_for(query);
-            match work {
-                super::vectors::Work::None => {}
-                super::vectors::Work::Now => super::vectors::build(&self.vectors, query),
-                super::vectors::Work::Background => super::vectors::build_in_background(
-                    std::sync::Arc::clone(&self.vectors),
-                    query.clone(),
-                ),
-            }
-        }
         let accept = |raw: u64| {
             let id = TermId::from_raw(raw);
             id.payload() < known && accept(id)
         };
-        super::vectors::search(&self.vectors, query, &accept)
-    }
-
-    /// Builds the graph a search like `query` uses, covering every vector, before
-    /// returning (a warm-up; searches build it themselves, large ones in the background).
-    pub fn prepare_vector_graph(&self, query: &super::VectorQuery) {
-        self.cover_vectors();
-        let strategy = super::VectorStrategy::Approximate;
-        let query = super::VectorQuery {
-            strategy,
-            ..query.clone()
-        };
-        if self.vectors.read().may_need_work(&query) {
-            super::vectors::build(&self.vectors, &query);
-        }
+        super::vectors::search(&self.vectors, query, &accept, budget)
     }
 
     /// The vector index, from its file at the first use, then with the vector literals
     /// interned since.
-    fn cover_vectors(&self) {
+    pub(crate) fn cover_vectors(&self) {
         self.load_vectors();
         if self.vectors.read().covered() < self.len() {
             let mut vectors = self.vectors.write();

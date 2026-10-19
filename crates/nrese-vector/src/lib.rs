@@ -183,6 +183,16 @@ pub fn exact(
     exact_from(vectors, 0, query, k, metric, accept)
 }
 
+/// The most bytes [`exact`] holds besides the vectors, for `k` of `vectors`: a copy of
+/// their chunk list, each chunk's best (a heap, then sorted), their merge and the answer.
+pub fn exact_bytes(vectors: &Vectors, k: usize) -> usize {
+    let chunks = vectors.chunks.len();
+    let kept = k.min(CHUNK) + 1;
+    chunks * std::mem::size_of::<std::sync::Arc<Chunk>>()
+        + (chunks + 2) * kept * std::mem::size_of::<Hit>() * 3
+        + chunks * std::mem::size_of::<Vec<Hit>>() * 2
+}
+
 /// [`exact`] over the vectors from position `start` on: the ones a graph doesn't cover
 /// yet.
 pub fn exact_from(
