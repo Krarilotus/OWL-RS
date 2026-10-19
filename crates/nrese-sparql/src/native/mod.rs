@@ -1234,6 +1234,9 @@ struct Context<'a> {
     /// Canonical answers, where they apply to this query: the classes its terms stand for
     /// ([`canonical`]). Decided once, for the whole query; `None` evaluates as without.
     canonical: Option<canonical::Names>,
+    /// Canonical answers' view refused by this query's budget too: the query's error
+    /// ([`canonical`]).
+    canonical_refused: Option<nrese_exec::BudgetExceeded>,
     /// Whether GeoSPARQL relations in triple patterns are computed from geometries too
     /// (the query-rewrite extension; not [`QueryOptions::geosparql_stated_only`]).
     spatial_rewrite: bool,
@@ -1332,9 +1335,20 @@ impl<'a> Context<'a> {
             GraphScope::Union => merge_set.is_none(),
             _ => false,
         };
-        let canonical = (options.equality_canonical && in_scope)
-            .then(|| snapshot.with_canonical_equality())
-            .and_then(|read| Some((canonical::Names::of(&read, options.read_model)?, read)));
+        // What this evaluation holds, counted on its own (what it leaves behind is its
+        // result's reservation), drawn from the request's envelope; a canonical view the
+        // store's view budget refuses is made on it, for this query.
+        let budget = Arc::new(options.resources.memory.part());
+        let (canonical, canonical_refused) = match options.equality_canonical && in_scope {
+            true => match snapshot.with_canonical_equality_within(&budget) {
+                Ok(read) => (
+                    canonical::Names::of(&read, options.read_model).map(|names| (names, read)),
+                    None,
+                ),
+                Err(refused) => (None, Some(refused)),
+            },
+            false => (None, None),
+        };
         let named = match &canonical {
             // The graphs `FROM NAMED` lists, by the names canonical reads give them.
             Some((names, _)) => resolved.named.map(|graphs| names.graphs(graphs)),
@@ -1357,6 +1371,7 @@ impl<'a> Context<'a> {
                 None => Cow::Borrowed(snapshot),
             },
             canonical: canonical.map(|(names, _)| names),
+            canonical_refused,
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
             aliases: RefCell::default(),
@@ -1366,9 +1381,7 @@ impl<'a> Context<'a> {
             decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
-            // What this evaluation holds, counted on its own (what it leaves behind is
-            // its result's reservation), drawn from the request's envelope.
-            budget: Arc::new(options.resources.memory.part()),
+            budget,
             trace: None,
             depth: Cell::new(0),
             probed: Cell::default(),

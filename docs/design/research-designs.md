@@ -108,11 +108,16 @@ asserted model is answered as stored.
   snapshot read as stored see the statements as stored.
 - The completeness status makes no claim of its own here: it refers to the regime's
   certain answers, and canonical answers are those, up to the naming above.
-- **Memory**: a canonical view is charged before it is made to the store's view budget,
-  which draws on the memory the queries do (`Engine::set_canonical_view_budget`), and the
-  charge is released when its version goes. Where the budget refuses, the view is made for
-  that query alone and charged to the query's own envelope. The classes, as before stage
-  C, are the version's and charged nowhere.
+- **Memory**: a canonical view holds its own charge. It is made on the store's view budget,
+  which draws on the memory the queries do (`Engine::set_canonical_view_budget`), every
+  array reserved before it is allocated (its statements, its run's arrays, its scans'
+  working memory, its version), and its run keeps the reservation: the charge goes when the
+  view's last holder, the cache or a reader, lets it go. Where the view budget refuses, the
+  view is made the same way on the query's own budget, for that query
+  (`Snapshot::with_canonical_equality_within`); where that refuses too, nothing is made and
+  the query fails with its memory limit. Readers that miss the cache at once each make
+  one, each charged in full. The classes, as before stage C, are the version's and charged
+  nowhere.
 
 ## 2. Vector similarity search
 

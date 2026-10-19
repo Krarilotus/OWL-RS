@@ -139,6 +139,7 @@ impl super::Context<'_> {
             equality_closed: self.equality_closed,
             late: None,
             canonical: None,
+            canonical_refused: None,
             cache: None,
             pin: RefCell::default(),
         };
