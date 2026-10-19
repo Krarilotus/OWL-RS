@@ -180,7 +180,7 @@ def stamp(results: Path, argv: list[str], images: list[str], datasets: list[Path
     """The run's manifest entry (benches/suite/suitekit/manifest.py's fields)."""
     return {
         "started": manifest.now(), "argv": argv, "protocol": protocol, "git": manifest.git(ROOT),
-        "machine": manifest.machine("docker"), "images": manifest.image_ids(images),
+        "machine": manifest.machine("docker", ROOT), "images": manifest.image_ids(images),
         "datasets": {str(p): p.stat().st_size for p in datasets if p.exists()},
         "binaries": {p.name: sha256(p) for p in sorted(BIN.glob("*")) if p.is_file()},
     }

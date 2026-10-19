@@ -1307,7 +1307,7 @@ def run(args) -> int:
     BASELINES.mkdir(parents=True, exist_ok=True)
     out = (Path(args.out) if args.out else REPORTS / f"{started:%Y-%m-%d}-{label}.json").resolve()
     report = {"label": label, "started": started.isoformat(timespec="seconds"), "started_ns": time.time_ns(),
-              "git": manifest.git(ROOT), "machine": manifest.machine(RUNTIME), "runtime": RUNTIME,
+              "git": manifest.git(ROOT), "machine": manifest.machine(RUNTIME, ROOT), "runtime": RUNTIME,
               "reps": args.reps, "planned_cases": [c["name"] for c in cases],
               "all_cases": [c["name"] for c in catalog], "case_manifest": case_manifest(catalog),
               "options": dict(OPTIONS), "records": []}

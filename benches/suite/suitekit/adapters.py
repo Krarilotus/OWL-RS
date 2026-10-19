@@ -48,10 +48,11 @@ ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def images_for(adapter, root: Path) -> list[str]:
-    """The images an adapter's containers run (as `suite.py images` asks): for the tools that pin
-    them at their start (DockerRuntime.pin)."""
+    """The images an adapter's containers run, the pulled (`images`) and the built here (`builds`),
+    as `suite.py images` asks: the pin set of the tools that pin them at their start
+    (DockerRuntime.pin). An adapter's containers take their image from the same declarations."""
     ctx = Context(None, root, root, root, Mount("-", "/data"), [], 0, dict(os.environ), "images")
-    return list(adapter.images(ctx))
+    return [*adapter.images(ctx), *(image for image, _ in adapter.builds())]
 
 
 def target_mount(kind: str) -> str:
@@ -1163,7 +1164,7 @@ class Nemo(ClosureAdapter):
         script = (f'mkdir -p /tmp/in /tmp/nemo && cat "$@" > /tmp/in/input.nt && {self.program()} && '
                   'nmo -I /tmp/in -D /tmp/nemo -o --report short /tmp/rules.rls && '
                   'cp /tmp/nemo/inferred.nt /work/closure.nt')
-        spec = Spec(ctx.name("load"), "nrese-bench/nemo", ["sh", "-c", script, "sh", *inputs],
+        spec = Spec(ctx.name("load"), self.builds()[0][0], ["sh", "-c", script, "sh", *inputs],
                     mounts=ctx.mounts(Mount(str(directory), "/rules")), memory=ctx.memory)
         log = ctx.logs / "load.log"
         measured = ctx.runtime.run(spec, log, ctx.timeout_s)
@@ -1217,7 +1218,7 @@ class Owlrl(ClosureAdapter):
 
     def load(self, ctx, store, inputs, regime):
         self.inputs = inputs
-        spec = Spec(ctx.name("load"), "nrese-bench/owlrl-oracle",
+        spec = Spec(ctx.name("load"), self.builds()[0][0],
                     ["python", "/oracle/owlrl_materialise.py", "--profile", self.regimes[regime],
                      "--out", "/work/closure.nt", *inputs], mounts=ctx.mounts(), memory=ctx.memory)
         log = ctx.logs / "load.log"

@@ -299,11 +299,18 @@ remember_pulls "$ROOT/tmp/bench-pulled-images" "$GRAPHDB_IMAGE" "$QLEVER_IMAGE" 
 declare -A system_image=([nrese]=RUST_IMAGE [qlever]=QLEVER_IMAGE [oxigraph]=OXIGRAPH_IMAGE [jena]=JENA_IMAGE
                          [virtuoso]=VIRTUOSO_IMAGE [graphdb]=GRAPHDB_IMAGE [anzograph]=ANZOGRAPH_IMAGE)
 used=(RUST_IMAGE)
-for system in $SYSTEMS; do [ -n "${system_image[$system]:-}" ] && used+=("${system_image[$system]}"); done
+for system in $SYSTEMS; do
+  # A system the table doesn't name has no pinned image: never timed by a tag.
+  [ -n "${system_image[$system]:-}" ] || { echo "no image for the system $system (system_image)" >&2; exit 1; }
+  used+=("${system_image[$system]}")
+done
 tags=()
 for var in "${used[@]}"; do tags+=("${!var}"); done
 ns_pin_images "$ROOT" "${tags[@]}" || exit 1
-for var in "${used[@]}"; do printf -v "$var" '%s' "$(ns_image "${!var}" "$ROOT")" || exit 1; done
+for var in "${used[@]}"; do
+  id=$(ns_image "${!var}" "$ROOT") || exit 1
+  printf -v "$var" '%s' "$id"
+done
 mkdir -p "$RESULTS" && ns_pins "$ROOT" > "$RESULTS/images-$DATASET.tsv"
 docker run --rm -v "$DATA_VOLUME":/data alpine test -s "$FILE" || {
   echo "missing $FILE: run prepare-datasets.sh or the harness generate command" >&2
