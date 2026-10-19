@@ -60,34 +60,48 @@ such giants.
   star / mesh topologies with the same closure, merges, redundant deletes, bridge
   deletes splitting two 100 k components, strict `COUNT`/`DISTINCT`/`STR` queries).
 
-**Canonical answers (decided 19 October 2026).** `canonical` answers the query modulo the
-equality: over the quotient of what the equality covers, each class one term, shown by its
-representative. The equality covers the default graph read with inferences, as strict
-answers' expansion does; named graphs and the asserted model are read as stored in both
-modes (SPARQL's entailment regimes entail per active graph, and the `sameAs` statements
-live in the inferred default graph).
+**Canonical answers (decided 19 October 2026, revised after review).** `canonical` answers
+the query over the quotient of the dataset by the equality: each class one term, shown by
+its representative, in every graph, graph names included. It applies to a query whose
+default graph is the one the equality covers (the store's, or the merge of every graph) in
+a model with inferred statements; a query of another default graph (`FROM <g>`) or of the
+asserted model is answered as stored.
 
-- A term the query names stands for its class wherever it meets those reads: a triple
-  pattern's or path's constant, a VALUES row, a constant in FILTER (`=`, `!=`, `sameTerm`,
-  `IN`), BIND, ORDER BY, an aggregate or EXISTS, a subquery's binding, a pre-bound value,
-  an IRI that `IRI()` makes, a row from `SERVICE`, a value leaving `GRAPH`. All of them
-  take one mapping, `nrese_engine::Snapshot::canonical_classes` (the executor's
-  `native/canonical.rs`): `VALUES ?x { <alias> } ?x ex:p ex:o`, `?x ex:p ex:o
-  FILTER(?x = <alias>)` and `<alias> ex:p ex:o` find the same class.
-- Answers name the representative, constants of the query included (`BIND(<alias> AS ?x)`
-  gives the representative); what the query writes itself, a CONSTRUCT template, is
-  written as given.
-- Inside `GRAPH` and `SERVICE` nothing is mapped (stored names; an endpoint knows no
-  classes). A value sent to an endpoint goes as every identity of its class.
-- Two identities of one class are one term here, so a query can't tell them apart:
-  `FILTER(?x != <alias>)` drops the class, `STR` shows the representative's IRI. Where
-  strict answers do tell them apart, canonical answers are not strict answers renamed;
-  where they don't, canonical answers are the strict ones with each class's identities
-  shown once, by the representative (the differential test,
-  `nrese-sparql/tests/it/equality_answer_tests.rs`). GraphDB's equivalent
+- **One id space.** Every id the evaluation works on is a representative, so joins,
+  filters and every plan rewrite (filter pushdown across `GRAPH` included) are valid as
+  they are. Ids enter evaluation at four places, each by one mapping,
+  `nrese_engine::Snapshot::canonical_classes`: reads (a canonical snapshot gives
+  representatives from every graph; named graphs through a run over the asserted stack
+  made once per version, `equality::canonical_version`), the query's constants and
+  pre-bound values (put in once before planning, `native/canonical.rs`), `IRI()` (wrapped
+  in a canonical-name function by the same pass), and a `SERVICE` endpoint's rows (mapped
+  on import; a bound value goes to the endpoint as every identity of its class, counted
+  before it is made, reserved, and past `BIND_LIMIT` not sent). Without the option, or
+  outside its scope, none of this runs: the plan is the one without it.
+- So `VALUES ?x { <alias> } ?x ex:p ex:o`, `?x ex:p ex:o FILTER(?x = <alias>)`,
+  `<alias> ex:p ex:o`, the same through `GRAPH`, `SERVICE`, subqueries and paths find
+  the same class, and answer with the representative, constants of the query included;
+  a CONSTRUCT template is written as given.
+- Two identities of one class are one term, so a query can't tell them apart:
+  `FILTER(?x != <alias>)` drops the class, `STR` shows the representative's IRI.
+  Canonical answers are therefore not strict answers renamed where strict answers tell
+  identities apart. The differential test checks them against the reference evaluator's
+  own quotient of the explicitly expanded closure (`nrese-sparql-reference`'s
+  `quotient`, `nrese-sparql/tests/it/equality_answer_tests.rs`). GraphDB's equivalent
   (`FROM onto:disable-sameAs`) documents lost solutions for filters over URIs instead.
+- **Refused** (`Unsupported`), not answered: a query that builds or takes apart a triple
+  term (`TRIPLE`, `SUBJECT`, `PREDICATE`, `OBJECT`, a triple pattern with a variable
+  inside). The quotient would make `<<( alias p o )>>` and `<<( rep p o )>>` one term, which
+  the store can't represent (the second is in no dictionary a read could intern it in);
+  mapping parts only where they are taken apart makes the composing and the decomposing
+  forms disagree. A triple term passing through as a value is one term and answered. A
+  store with a literal in a class is refused as well: every literal an expression
+  computes would need the mapping.
 - The completeness status makes no claim of its own here: it refers to the regime's
   certain answers, and canonical answers are those, up to the naming above.
+- Not reserved: the classes and the canonical version are the version's, made once
+  and shared by every query on it, like the classes before them; no query's reservation
+  holds them.
 
 ## 2. Vector similarity search
 

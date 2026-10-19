@@ -36,8 +36,17 @@ use crate::term::TermId;
 #[derive(Default)]
 pub(crate) struct EqualityCell(Mutex<Option<CachedClasses>>);
 
-/// `owl:sameAs`, its classes, and their canonical view once asked for.
-type CachedClasses = (TermId, Arc<Classes>, Option<Arc<Classes>>);
+/// `owl:sameAs`, its classes, and what canonical reads need of them once asked for.
+struct CachedClasses {
+    same_as: TermId,
+    classes: Arc<Classes>,
+    /// [`Classes::canonical_view`].
+    canonical: Option<Arc<Classes>>,
+    /// The version canonical reads of the version with that content read
+    /// ([`canonical_version`]): the cell passes on to later versions, so the last one asked
+    /// for is kept.
+    version: Option<(super::Content, Arc<Version>)>,
+}
 
 impl std::fmt::Debug for EqualityCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -49,14 +58,30 @@ impl EqualityCell {
     /// The classes of `version` under `same_as`.
     pub(crate) fn classes(&self, version: &Version, same_as: TermId) -> Arc<Classes> {
         let mut cell = self.0.lock();
-        if let Some((id, classes, _)) = cell.as_ref()
-            && *id == same_as
+        if let Some(cached) = cell.as_ref()
+            && cached.same_as == same_as
         {
-            return Arc::clone(classes);
+            return Arc::clone(&cached.classes);
         }
         let classes = Arc::new(Classes::of(version, same_as));
-        *cell = Some((same_as, Arc::clone(&classes), None));
+        *cell = Some(CachedClasses {
+            same_as,
+            classes: Arc::clone(&classes),
+            canonical: None,
+            version: None,
+        });
         classes
+    }
+
+    /// A cell already holding `classes` under `same_as`, for a version whose default graph
+    /// is that of the version they are the classes of.
+    fn holding(same_as: TermId, classes: Arc<Classes>, canonical: Arc<Classes>) -> Self {
+        Self(Mutex::new(Some(CachedClasses {
+            same_as,
+            classes,
+            canonical: Some(canonical),
+            version: None,
+        })))
     }
 
     /// The classes of `version` read canonically: the same aliases, no members to expand
@@ -65,12 +90,129 @@ impl EqualityCell {
         let full = self.classes(version, same_as);
         let mut cell = self.0.lock();
         match cell.as_mut() {
-            Some((_, classes, canonical)) if Arc::ptr_eq(classes, &full) => {
-                Arc::clone(canonical.get_or_insert_with(|| Arc::new(full.canonical_view())))
-            }
+            Some(cached) if Arc::ptr_eq(&cached.classes, &full) => Arc::clone(
+                cached
+                    .canonical
+                    .get_or_insert_with(|| Arc::new(full.canonical_view())),
+            ),
             _ => Arc::new(full.canonical_view()),
         }
     }
+
+    /// The version canonical reads of `version` read ([`canonical_version`]), made once
+    /// per version.
+    pub(crate) fn canonical_version(
+        &self,
+        version: &Arc<Version>,
+        same_as: TermId,
+    ) -> Arc<Version> {
+        let canonical = self.canonical(version, same_as);
+        let full = self.classes(version, same_as);
+        if let Some(cached) = self.0.lock().as_ref()
+            && let Some((content, made)) = &cached.version
+            && *content == version.content
+        {
+            return Arc::clone(made);
+        }
+        let made = canonical_version(version, same_as, &full, &canonical);
+        if let Some(cached) = self.0.lock().as_mut()
+            && Arc::ptr_eq(&cached.classes, &full)
+        {
+            cached.version = Some((version.content, Arc::clone(&made)));
+        }
+        made
+    }
+}
+
+/// `version` as canonical reads read it (work package W4, stage C; canonical answers):
+/// its named graphs over representatives, as its default graph's closure is. A named-graph
+/// statement that names another identity of a class, in any position (the graph's name
+/// included), is replaced by its representatives' statement: one run of tombstones and
+/// inserts over the asserted stack, so that every read, whatever its access path, gives
+/// representatives. The default graph stays as it is (its canonical reads skip what isn't
+/// over representatives). `version` itself where no named-graph statement names an alias.
+///
+/// O(a log n + k log k) for a aliases and k such statements, or one scan of the named
+/// graphs where that is less. Like the classes, it is the version's, not a query's: no
+/// query's reservation holds it.
+fn canonical_version(
+    version: &Arc<Version>,
+    same_as: TermId,
+    classes: &Arc<Classes>,
+    canonical: &Arc<Classes>,
+) -> Arc<Version> {
+    let asserted = &version.asserted;
+    if asserted.layout() != crate::index::Layout::Quads || classes.aliases.is_empty() {
+        return Arc::clone(version);
+    }
+    let named = QuadPattern {
+        subject: None,
+        predicate: None,
+        object: None,
+        graph: GraphSelector::AnyNamed,
+    };
+    let named_count = asserted.count_plan(&crate::quad::AccessPlan::for_pattern(&named));
+    let mut renamed: Vec<EncodedQuad> = Vec::new();
+    if (classes.aliases.len() as u64).saturating_mul(4) < named_count {
+        for &alias in classes.aliases.keys() {
+            let alias = TermId::from_raw(alias);
+            let patterns = [
+                QuadPattern {
+                    subject: Some(alias),
+                    ..named
+                },
+                QuadPattern {
+                    predicate: Some(alias),
+                    ..named
+                },
+                QuadPattern {
+                    object: Some(alias),
+                    ..named
+                },
+                QuadPattern {
+                    graph: GraphSelector::Exact(alias),
+                    ..named
+                },
+            ];
+            for pattern in &patterns {
+                renamed.extend(asserted.scan(pattern));
+            }
+        }
+        renamed.sort_unstable();
+        renamed.dedup();
+    } else {
+        renamed.extend(
+            asserted
+                .scan(&named)
+                .filter(|quad| classes.names_alias(quad)),
+        );
+    }
+    if renamed.is_empty() {
+        return Arc::clone(version);
+    }
+    let mut inserts: Vec<EncodedQuad> = renamed
+        .iter()
+        .map(|quad| {
+            EncodedQuad::from_components(
+                quad.components()
+                    .map(|id| classes.representative(TermId::from_raw(id)).raw()),
+            )
+        })
+        .collect();
+    inserts.sort_unstable();
+    inserts.dedup();
+    Arc::new(Version {
+        asserted: asserted.with_delta(&inserts, &renamed),
+        inferred: version.inferred.clone(),
+        revision: version.revision,
+        dictionary_len: version.dictionary_len,
+        equality: Arc::new(EqualityCell::holding(
+            same_as,
+            Arc::clone(classes),
+            Arc::clone(canonical),
+        )),
+        content: version.content,
+    })
 }
 
 /// `owl:sameAs` classes of two or more identities.
@@ -80,6 +222,8 @@ pub struct Classes {
     aliases: HashMap<u64, u64>,
     /// Each representative's identities, sorted (the representative first).
     members: HashMap<u64, Box<[u64]>>,
+    /// Some identity is a literal ([`Self::relate_literals`]).
+    literals: bool,
 }
 
 impl Classes {
@@ -110,6 +254,9 @@ impl Classes {
                 continue;
             }
             identities.sort_unstable();
+            classes.literals |= identities
+                .iter()
+                .any(|&id| is_literal(TermId::from_raw(id)));
             // The smallest id represents the class, as the reasoner chooses.
             let representative = identities[0];
             for &identity in &identities[1..] {
@@ -134,7 +281,21 @@ impl Classes {
         Self {
             aliases: self.aliases.clone(),
             members: HashMap::new(),
+            literals: self.literals,
         }
+    }
+
+    /// Whether a literal is an identity of some class (`ex:a owl:sameAs "a"`). Then a
+    /// value an expression computes may name a class, which canonical answers can't map
+    /// (`nrese_sparql`'s canonical answers refuse such classes).
+    pub fn relate_literals(&self) -> bool {
+        self.literals
+    }
+
+    /// Whether a term of `quad`, its graph included, is an identity of a class other than
+    /// its representative.
+    fn names_alias(&self, quad: &EncodedQuad) -> bool {
+        quad.components().iter().any(|&id| self.is_alias(id))
     }
 
     /// The identities `id` stands for once expanded: its class's if it represents one,
@@ -248,6 +409,15 @@ impl Classes {
             }
         }
     }
+}
+
+/// Whether `id` is a literal: any kind but IRIs, blank nodes and triple terms.
+fn is_literal(id: TermId) -> bool {
+    use crate::term::TermKind;
+    !matches!(
+        id.kind(),
+        TermKind::Iri | TermKind::BlankNode | TermKind::Triple | TermKind::DefaultGraph
+    )
 }
 
 enum Values<'a> {
