@@ -91,7 +91,7 @@ class ScopeLifetime(unittest.TestCase):
             namespace.update(native_dirs=lambda: {}, FAST_DATA=Path(temporary), os=os, time=__import__("time"),
                 scope_argv=lambda *_: ["scope", "--"], native=lambda command, _: command,
                 end_scope=lambda *_: None, SCOPE_PEAK=re.compile("never-match"), sys=sys, ENV={},
-                SCOPE_PRESSURE=re.compile("never-match"),
+                SCOPE_PRESSURE=re.compile("never-match"), random=__import__("random"),
                 pinned_cpus=lambda: None,
                 subprocess=types.SimpleNamespace(run=lambda *a, **kw: completed,
                     TimeoutExpired=TimeoutError, CompletedProcess=types.SimpleNamespace))
@@ -102,6 +102,8 @@ class ScopeLifetime(unittest.TestCase):
                     self.assertEqual(namespace["process"]("case", 6, ["original-command"])[0], 0)
                 self.assertEqual(observed[-1]["pass_fds"], tuple(map(int, descriptors.split())))
                 self.assertEqual(observed[-1]["timeout"], 900)
+                # Every process an environment pad of its own size (its initial stack moves).
+                self.assertLess(len(observed[-1]["env"]["NRESE_LAYOUT_PAD"]), 4096)
             # Pinned (hosts.toml `cpus`): the command, inside its scope, on those CPUs alone.
             argv = []
             namespace["subprocess"].run = lambda *a, **kw: argv.append(a[0]) or completed

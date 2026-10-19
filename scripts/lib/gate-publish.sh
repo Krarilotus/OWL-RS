@@ -18,8 +18,9 @@
 #   identity_dir REV [LAYOUT]     its directory under GATE_BIN
 #   publish PART DIR              PART becomes DIR unless DIR exists (then PART goes); 0 when DIR
 #                                 holds a verified build of PART's revision either way
-#   bin_of REV                    the build this gate uses for REV (its pointer: build or unpack)
-#   point REV DIR                 this gate uses DIR for REV (and stamps a reference)
+#   bin_of REV [LAYOUT]           the build this gate uses for REV (its pointer: build or unpack)
+#   point REV DIR [LAYOUT]        this gate uses DIR for REV (and stamps a reference); a layout
+#                                 other than 1 has a pointer of its own
 #   sweep_builds                  identity directories no gate used for GATE_BIN_AGE_DAYS
 
 . "$(dirname "${BASH_SOURCE[0]}")/ns.sh"
@@ -94,9 +95,12 @@ gate_lock() { NS_LOCK_VARS="GATE GATE_BIN GATE_PATCHES" ns_locked "$GATE_BIN/.lo
 # DIR: a reference from this gate, under the lock; fails when the build is gone (never made anew).
 stamp() { [ -d "$1/release" ] && mkdir -p "$1/.refs" && touch "$1/.refs/$(basename "$GATE")"; }
 
+# REV [LAYOUT]: the name of this gate's pointer to a revision's build of that layout.
+pointer() { if [ "${2:-1}" = 1 ]; then git rev-parse --short=8 "$1"; else echo "$(git rev-parse --short=8 "$1")-l$2"; fi; }
+
 point() {
   local key
-  key=$(git rev-parse --short=8 "$1")
+  key=$(pointer "$1" "${3:-1}")
   gate_lock stamp "$2" || return 1
   mkdir -p "$GATE/builds"
   basename "$2" > "$GATE/builds/$key.partial" && mv -f "$GATE/builds/$key.partial" "$GATE/builds/$key"
@@ -104,7 +108,7 @@ point() {
 
 bin_of() {
   local name
-  name=$(cat "$GATE/builds/$(git rev-parse --short=8 "$1")" 2>/dev/null) && gate_lock stamp "$GATE_BIN/$name" \
+  name=$(cat "$GATE/builds/$(pointer "$1" "${2:-1}")" 2>/dev/null) && gate_lock stamp "$GATE_BIN/$name" \
     || { echo "$GATE_BIN/none"; return; }
   echo "$GATE_BIN/$name"
 }
