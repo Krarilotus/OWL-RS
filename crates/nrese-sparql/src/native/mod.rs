@@ -77,8 +77,8 @@ use crate::results::{
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
-    anti_join_in_place, compatible_mask, join, join_keeping_left_order, join_with_undef, left_join,
-    outer_join_with_undef,
+    JoinStop, anti_join_in_place, compatible_mask, join, join_keeping_left_order, join_with_undef,
+    left_join, outer_join_with_undef,
 };
 use nrese_exec::{
     Budget, BudgetExceeded, ChargedVec, IdTable, Reservation, UNDEF, computed_id, computed_index,
@@ -1460,11 +1460,15 @@ impl<'a> Context<'a> {
     }
 
     /// Charges a produced table against the query's memory budget.
-    fn produced(&self, solutions: Solutions) -> NativeResult<Solutions> {
+    fn produced(&self, mut solutions: Solutions) -> NativeResult<Solutions> {
         self.check()?;
+        // What the table doesn't hold charged itself (it was built uncharged) is charged
+        // now; a table the kernels built charged hands its charge over as the table's.
+        let own = solutions.table.charge();
         self.budget
-            .charge(solutions.table.memory_bytes())
+            .charge(solutions.table.memory_bytes().saturating_sub(own))
             .map_err(QueryEvaluationError::MemoryLimit)?;
+        solutions.table.transfer_charge();
         Ok(solutions)
     }
 
@@ -1477,12 +1481,13 @@ impl<'a> Context<'a> {
 
     /// Charges a join's hash table over `rows` build rows (a key, a row number and the
     /// table's slack per row); the caller releases the returned bytes after the join.
-    fn charge_hash_table(&self, rows: usize) -> NativeResult<usize> {
-        let bytes = rows.saturating_mul(32);
-        self.budget
-            .charge(bytes)
-            .map_err(QueryEvaluationError::MemoryLimit)?;
-        Ok(bytes)
+    /// The error for a join that stopped: past its row limit (or cancelled), or past the
+    /// budget.
+    fn join_stopped(&self, stop: JoinStop, width: usize) -> NativeError {
+        match stop {
+            JoinStop::Rows(rows) => self.too_large(rows.max_rows.saturating_add(1), width),
+            JoinStop::Memory(memory) => QueryEvaluationError::MemoryLimit(memory).into(),
+        }
     }
 
     /// The error for an operator that would outgrow the budget.
@@ -1904,10 +1909,21 @@ impl<'a> Context<'a> {
                 let mut table = left.table;
                 if has_undef(&table, &lk) || has_undef(&right.table, &rk) {
                     // A row goes if a compatible row shares a variable both bind.
-                    let removed = compatible_mask(&table, &right.table, &lk, &rk, true);
+                    let mut removed = vec![false; table.len()];
+                    compatible_mask(
+                        &table,
+                        &right.table,
+                        &lk,
+                        &rk,
+                        true,
+                        &self.budget,
+                        &mut removed,
+                    )
+                    .map_err(QueryEvaluationError::MemoryLimit)?;
                     table.retain_mask(&removed.iter().map(|r| !r).collect::<Vec<_>>());
                 } else {
-                    anti_join_in_place(&mut table, &right.table, &lk, &rk);
+                    anti_join_in_place(&mut table, &right.table, &lk, &rk, &self.budget)
+                        .map_err(QueryEvaluationError::MemoryLimit)?;
                 }
                 self.consumed(right);
                 self.produced(Solutions {
@@ -3905,21 +3921,20 @@ impl<'a> Context<'a> {
     fn join(&self, left: Solutions, right: Solutions) -> NativeResult<Solutions> {
         let (lk, rk) = shared_columns(&left, &right);
         let vars = joined_vars(&left, &right, &rk);
-        let hash_table = self.charge_hash_table(left.table.len().min(right.table.len()))?;
         let max_rows = self.row_limit(vars.len());
-        let table = if has_undef(&left.table, &lk) || has_undef(&right.table, &rk) {
+        let (l, r, budget) = (&left.table, &right.table, &self.budget);
+        let table = if has_undef(l, &lk) || has_undef(r, &rk) {
             if left.ordered {
-                outer_join_with_undef(&left.table, &right.table, &lk, &rk, None, false, max_rows)
+                outer_join_with_undef(l, r, &lk, &rk, None, false, budget, max_rows)
             } else {
-                join_with_undef(&left.table, &right.table, &lk, &rk, max_rows)
+                join_with_undef(l, r, &lk, &rk, budget, max_rows)
             }
         } else if left.ordered {
-            join_keeping_left_order(&left.table, &right.table, &lk, &rk, max_rows)
+            join_keeping_left_order(l, r, &lk, &rk, budget, max_rows)
         } else {
-            join(&left.table, &right.table, &lk, &rk, max_rows)
+            join(l, r, &lk, &rk, budget, max_rows)
         }
-        .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
-        self.budget.release(hash_table);
+        .map_err(|stop| self.join_stopped(stop, vars.len()))?;
         let ordered = left.ordered;
         self.consumed(left);
         self.consumed(right);
@@ -3946,7 +3961,6 @@ impl<'a> Context<'a> {
         // compatible with any value and takes it.
         let unbound_keys = has_undef(&left.table, &lk) || has_undef(&right.table, &rk);
         let vars = joined_vars(&left, &right, &rk);
-        let hash_table = self.charge_hash_table(right.table.len())?;
         let max_rows = self.row_limit(vars.len());
         let accept = |row: &[u64]| {
             let binding = |v: &Variable| {
@@ -3958,13 +3972,13 @@ impl<'a> Context<'a> {
         let accept = expression
             .is_some()
             .then_some(&accept as &dyn Fn(&[u64]) -> bool);
+        let (l, r, budget) = (&left.table, &right.table, &self.budget);
         let table = if unbound_keys {
-            outer_join_with_undef(&left.table, &right.table, &lk, &rk, accept, true, max_rows)
+            outer_join_with_undef(l, r, &lk, &rk, accept, true, budget, max_rows)
         } else {
-            left_join(&left.table, &right.table, &lk, &rk, accept, max_rows)
+            left_join(l, r, &lk, &rk, accept, budget, max_rows)
         }
-        .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
-        self.budget.release(hash_table);
+        .map_err(|stop| self.join_stopped(stop, vars.len()))?;
         let ordered = left.ordered;
         self.consumed(left);
         self.consumed(right);
