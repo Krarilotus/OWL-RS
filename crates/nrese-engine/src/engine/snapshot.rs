@@ -41,26 +41,30 @@ pub struct Snapshot {
     /// differs from `version`. The canonical model's view, never `version` itself, which
     /// the asserted model and [`Self::stored`] read as stored ([`Self::data`]).
     canonical_data: Option<Arc<Version>>,
-    /// The bytes of `canonical_data` the view budget refused: then it is this snapshot's
-    /// alone ([`Self::canonical_view_uncharged`]).
-    canonical_uncharged: usize,
-    /// What the canonical views a version keeps are charged to, beside the queries'
-    /// envelopes ([`crate::Engine::set_canonical_view_budget`]).
+    /// What the canonical views versions keep are charged to, beside the readers' own
+    /// budgets ([`crate::Engine::set_canonical_view_budget`]).
     views: Arc<nrese_exec::Budget>,
 }
 
-/// The canonical view of `version` under `same_as` ([`Snapshot::canonical_data`]), charged
-/// to `views`, and its bytes `views` refused: `None` where it is `version` itself.
+/// The canonical view of `version` under `same_as` ([`Snapshot::canonical_data`]): made on
+/// `views` and kept, else on `fallback` for this reader ([`super::equality::CanonicalCache`]);
+/// `None` where it is `version` itself.
 fn canonical_data(
     version: &Arc<Version>,
     same_as: Option<TermId>,
     views: &Arc<nrese_exec::Budget>,
-) -> (Option<Arc<Version>>, usize) {
-    match same_as.and_then(|same_as| super::equality::CanonicalCache::view(version, same_as, views))
-    {
-        Some(view) => (Some(view.version), view.uncharged),
-        None => (None, 0),
+    fallback: &Arc<nrese_exec::Budget>,
+) -> Result<Option<Arc<Version>>, nrese_exec::BudgetExceeded> {
+    match same_as {
+        Some(same_as) => super::equality::CanonicalCache::view(version, same_as, views, fallback),
+        None => Ok(None),
     }
+}
+
+/// An unlimited budget, where a reader brings none: one for the process.
+fn unlimited() -> &'static Arc<nrese_exec::Budget> {
+    static UNLIMITED: std::sync::OnceLock<Arc<nrese_exec::Budget>> = std::sync::OnceLock::new();
+    UNLIMITED.get_or_init(|| Arc::new(nrese_exec::Budget::unlimited()))
 }
 
 /// Inferred statements hidden from a reader, as runs stacked over the inferred stack
@@ -146,7 +150,6 @@ impl Snapshot {
             equality,
             canonical: false,
             canonical_data: None,
-            canonical_uncharged: 0,
             views,
         }
     }
@@ -162,7 +165,6 @@ impl Snapshot {
             equality: same_as,
             canonical: false,
             canonical_data: None,
-            canonical_uncharged: 0,
             ..self.clone()
         }
     }
@@ -173,7 +175,6 @@ impl Snapshot {
             equality: None,
             canonical: false,
             canonical_data: None,
-            canonical_uncharged: 0,
             ..self.clone()
         }
     }
@@ -187,21 +188,23 @@ impl Snapshot {
     /// joins over it and expands the classes after the joins ([`Self::expand_late`]).
     /// Without equality classes it reads as this snapshot.
     pub fn with_canonical_equality(&self) -> Snapshot {
-        let (canonical_data, canonical_uncharged) =
-            canonical_data(&self.version, self.equality, &self.views);
-        Snapshot {
-            canonical: true,
-            canonical_data,
-            canonical_uncharged,
-            ..self.clone()
-        }
+        self.with_canonical_equality_within(unlimited())
+            .unwrap_or_else(|_| unreachable!("an unlimited budget refuses nothing"))
     }
 
-    /// The bytes of this snapshot's canonical view that the view budget refused (0 where
-    /// it keeps none, or the version keeps it): the view was made for this snapshot alone,
-    /// and its reader charges them, a query to its own envelope.
-    pub fn canonical_view_uncharged(&self) -> usize {
-        self.canonical_uncharged
+    /// [`Self::with_canonical_equality`], its view made on `fallback`, the reader's own
+    /// budget (a query's envelope), where the view budget refuses it: then the view is this
+    /// snapshot's alone, and holds its charge to `fallback` until the snapshot goes. An
+    /// error where `fallback` refuses it too, before anything is made.
+    pub fn with_canonical_equality_within(
+        &self,
+        fallback: &Arc<nrese_exec::Budget>,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        Ok(Snapshot {
+            canonical: true,
+            canonical_data: canonical_data(&self.version, self.equality, &self.views, fallback)?,
+            ..self.clone()
+        })
     }
 
     /// Whether a triple term this snapshot's statements hold names, at any depth, another
@@ -276,10 +279,11 @@ impl Snapshot {
     }
 
     /// The canonical view of `version` this snapshot's reads take, if it reads canonically.
-    fn canonical_view(&self, version: &Arc<Version>) -> (Option<Arc<Version>>, usize) {
+    fn canonical_view(&self, version: &Arc<Version>) -> Option<Arc<Version>> {
         match self.canonical {
-            true => canonical_data(version, self.equality, &self.views),
-            false => (None, 0),
+            true => canonical_data(version, self.equality, &self.views, unlimited())
+                .unwrap_or_else(|_| unreachable!("an unlimited budget refuses nothing")),
+            false => None,
         }
     }
 
@@ -367,10 +371,9 @@ impl Snapshot {
             equality: Default::default(),
             canonical: Default::default(),
         });
-        let (canonical_data, canonical_uncharged) = self.canonical_view(&version);
+        let canonical_data = self.canonical_view(&version);
         Snapshot {
             canonical_data,
-            canonical_uncharged,
             views: Arc::clone(&self.views),
             version,
             dictionary: Arc::clone(&self.dictionary),
@@ -396,10 +399,9 @@ impl Snapshot {
             equality: Default::default(),
             canonical: Default::default(),
         });
-        let (canonical_data, canonical_uncharged) = self.canonical_view(&version);
+        let canonical_data = self.canonical_view(&version);
         Snapshot {
             canonical_data,
-            canonical_uncharged,
             views: Arc::clone(&self.views),
             version,
             dictionary: Arc::clone(&self.dictionary),
@@ -426,10 +428,9 @@ impl Snapshot {
             equality: Default::default(),
             canonical: Default::default(),
         });
-        let (canonical_data, canonical_uncharged) = self.canonical_view(&version);
+        let canonical_data = self.canonical_view(&version);
         Some(Snapshot {
             canonical_data,
-            canonical_uncharged,
             views: Arc::clone(&self.views),
             version,
             dictionary: Arc::clone(&self.dictionary),
@@ -681,10 +682,9 @@ impl Snapshot {
     /// A snapshot of `version` over this one's dictionary and statistics.
     pub(super) fn with_version(&self, version: Version) -> Snapshot {
         let version = Arc::new(version);
-        let (canonical_data, canonical_uncharged) = self.canonical_view(&version);
+        let canonical_data = self.canonical_view(&version);
         Snapshot {
             canonical_data,
-            canonical_uncharged,
             views: Arc::clone(&self.views),
             version,
             dictionary: Arc::clone(&self.dictionary),
@@ -1594,7 +1594,6 @@ mod canonical_lifetime_tests {
             assert_eq!(view.is_some(), named);
             let kept = named && limit.is_none();
             assert_eq!(views.used() > 0, kept, "{named} {limit:?}");
-            assert_eq!(canonical.canonical_view_uncharged() > 0, named && !kept);
             if named {
                 let g = canonical.lookup(ex("g").as_ref().into()).unwrap();
                 let pattern = QuadPattern::in_graph(g);
