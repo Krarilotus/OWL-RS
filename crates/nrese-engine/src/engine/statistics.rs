@@ -193,7 +193,12 @@ impl<R: Send + 'static> Scan<R> {
             let scan = Arc::clone(&self);
             rayon::spawn(move || scan.help());
         }
-        self.help();
+        // A builder outside the pool waits for the lanes, as for a parallel loop, and
+        // allocates nothing for the scan: its heap is the queries' after a load. With no
+        // lanes, or on a pool thread, it scans too.
+        if lanes == 0 || rayon::current_thread_index().is_some() {
+            self.help();
+        }
         let mut left = self.left.lock();
         while *left > 0 {
             self.over.wait(&mut left);
@@ -502,7 +507,7 @@ impl Statistics {
             rayon::current_num_threads() as u64 * 4,
         )
         .into();
-        // This thread scans too: as many lanes beside it as the pool has other threads.
+        // As many lanes as the pool has threads beside this one.
         let lanes = match every_core {
             true => {
                 rayon::current_num_threads() - usize::from(rayon::current_thread_index().is_some())
