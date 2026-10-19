@@ -17,6 +17,9 @@ set -euo pipefail
 NS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 . "$NS_ROOT/scripts/lib/ns.sh"
 DATA_VOLUME=$(ns_shared data)
+# Shared datasets are prepared one at a time per host (their staging, the .part and .parts
+# files, and their publication): this script runs again under the host's datasets lock.
+ns_serialize datasets "$0" "$@"
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${SPARQL_DATA:-$HOME/owlrs/sparql-data}
 sets=()

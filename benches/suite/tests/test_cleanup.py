@@ -363,6 +363,7 @@ class Cleanup(unittest.TestCase):
             return done(0, "interrupted log\n" if "logs" in argv else "")
 
         with patch.object(rt, "names", return_value=[]), patch.object(rt, "sample", return_value=sampler), \
+                patch.object(runtime.ns, "pin_image", side_effect=lambda tag, root: tag), \
                 patch.object(runtime.subprocess, "run", side_effect=[done(), KeyboardInterrupt()]), \
                 patch.object(runtime, "run_quiet", side_effect=command):
             with self.assertRaises(KeyboardInterrupt):

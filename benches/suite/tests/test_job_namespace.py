@@ -66,28 +66,37 @@ try:
         return out.replace("{{.CreatedAt}}", item["created"]).replace("{{.Created}}", item["created"])
 
     code = 0
+    state.setdefault("networks", {})
+    state.setdefault("images", {})
     if args[:1] == ["info"]:
         pass
-    elif args[:2] == ["volume", "create"]:
+    elif args[:1] in (["volume"], ["network"]) and args[1:2] == ["create"]:
         labels, _, _, _, plain = options(args[2:])
-        state["volumes"].setdefault(plain[-1], {"labels": labels, "created": os.environ.get("FAKE_CREATED", "2026-10-19T12:00:00Z")})
+        state[args[0] + "s"].setdefault(plain[-1], {"labels": labels, "created": os.environ.get("FAKE_CREATED", "2026-10-19T12:00:00Z")})
         print(plain[-1])
-    elif args[:2] == ["volume", "rm"]:
+    elif args[:1] in (["volume"], ["network"]) and args[1:2] == ["rm"]:
         name = args[-1]
         users = [c for c in state["containers"].values() if name in c["volumes"]]
-        if name not in state["volumes"] or users:
+        if name not in state[args[0] + "s"] or users:
             code = 1
         else:
-            del state["volumes"][name]
-    elif args[:2] == ["volume", "inspect"]:
+            del state[args[0] + "s"][name]
+    elif args[:1] in (["volume"], ["network"]) and args[1:2] == ["inspect"]:
         _, _, fmt, _, plain = options(args[2:])
-        item = state["volumes"].get(plain[-1])
+        item = state[args[0] + "s"].get(plain[-1])
         if item is None: code = 1
         elif fmt: print(render(item, fmt))
-    elif args[:2] == ["volume", "ls"]:
+    elif args[:1] in (["volume"], ["network"]) and args[1:2] == ["ls"]:
         _, filters, _, _, _ = options(args[2:])
-        for name, item in state["volumes"].items():
+        for name, item in state[args[0] + "s"].items():
             if matches(item, filters): print(name)
+    elif args[:2] == ["image", "inspect"]:
+        _, _, fmt, _, plain = options(args[2:])
+        image = state["images"].get(plain[-1])
+        if image is None: code = 1
+        elif fmt: print(image)
+    elif args[:1] == ["pull"]:
+        code = 1  # nothing to pull from here
     elif args[:1] == ["run"]:
         labels, _, _, name, plain = options(args[1:])
         state["n"] += 1
@@ -259,6 +268,199 @@ sweep_builds
             done = subprocess.run([BASH, "-c", script, "-", ROOT.as_posix(), Path(tmp).as_posix()],
                                   capture_output=True, text=True, timeout=300)
         self.assertEqual(done.stdout.split(), ["first", "bin-bbbbbbbb-identity"], done.stdout + done.stderr)
+
+
+def bash(script: str, *args: str, env: dict | None = None, timeout: int = 300) -> subprocess.CompletedProcess:
+    return subprocess.run([BASH, "-c", script, "-", *args], cwd=ROOT, env={**os.environ, **(env or {})},
+                          capture_output=True, text=True, encoding="utf-8", timeout=timeout)
+
+
+@unittest.skipUnless(BASH, "needs bash")
+class GateBuilds(unittest.TestCase):
+    def test_a_build_used_between_the_sweeps_look_and_its_delete_stays(self):
+        """Sol, 20 Oct 2026: the sweep found a build old, a gate then stamped it, and the sweep
+        deleted it anyway. Use and removal share the lock; the sweep checks again under it."""
+        script = r'''
+. scripts/lib/gate-publish.sh
+GATE_BIN=$1 GATE=$1/gate-x NRESE_LOCK_DIR=$1/locks
+dir=$GATE_BIN/bin-aaaaaaaa-identity
+mkdir -p "$dir/release" "$GATE/builds" && echo tool > "$dir/release/tool" && echo rev > "$dir/REVISION"
+(cd "$dir" && sha256sum release/tool > SHA256SUMS)
+echo bin-aaaaaaaa-identity > "$GATE/builds/$(git rev-parse --short=8 HEAD)"
+find "$dir" -exec touch -d "30 days ago" {} +
+# A gate uses the build right after the sweep's first look found it old.
+eval "first_$(declare -f old_build)"
+looks=0
+old_build() { looks=$((looks + 1)); local r=0; first_old_build "$1" || r=1; [ $looks = 1 ] && bin_of HEAD >/dev/null; return $r; }
+sweep_builds
+[ -f "$dir/release/tool" ] && echo kept
+# Unused, it goes; a gate that asks for it then fails closed, never recreating it.
+unset -f old_build; eval "$(declare -f first_old_build | sed 1s/first_old_build/old_build/)"
+find "$dir" -exec touch -d "30 days ago" {} +
+sweep_builds
+bin_of HEAD; [ -e "$dir" ] || echo gone
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            done = bash(script, Path(tmp).as_posix())
+        self.assertEqual(done.stdout.split()[:2], ["kept", "bin-aaaaaaaa-identity"], done.stdout + done.stderr)
+        self.assertTrue(done.stdout.split()[2].endswith("/none"), done.stdout)
+        self.assertEqual(done.stdout.split()[3], "gone")
+
+    def test_a_portable_and_an_x86_64_v3_build_have_different_identities(self):
+        """Sol, 20 Oct 2026: the identity hashed RUSTFLAGS as given; cargo-guarded.sh adds the CPU
+        choice (NRESE_TARGET_CPU), so a portable build's identity was an x86-64-v3 build's."""
+        if shutil.which("rustc") is None:
+            self.skipTest("no rustc")
+        script = r'''
+. scripts/lib/gate-publish.sh
+GATE_BIN=/unused
+for cpu in portable x86-64-v3; do NRESE_TARGET_CPU=$cpu identity_dir HEAD; done
+NRESE_TARGET_CPU=x86-64-v3 build_identity HEAD | grep '^rustflags'
+'''
+        done = bash(script, env={"RUSTFLAGS": ""})
+        portable, v3, flags = done.stdout.splitlines()
+        self.assertNotEqual(portable, v3, done.stderr)
+        self.assertEqual(flags, "rustflags -C target-cpu=x86-64-v3")
+
+
+@unittest.skipUnless(BASH, "needs bash")
+class Coverage(unittest.TestCase):
+    def test_two_jobs_perf_lab_runs_of_one_label_keep_their_own_stores(self):
+        """Sol, 20 Oct 2026: scripts/office/perflab.sh's store-LABEL was every job's: job b's run
+        removed job a's store."""
+        # A fake perf lab, wherever the script looks for it: job a's first run marks its store and
+        # waits while job b runs the same label start to end, then says whether its store is there.
+        script = r'''
+. scripts/lib/ns.sh
+s=$HOME/nrese-bench/scratch
+fake='#!/bin/sh
+[ "$1" = --store ] || exit 0
+mkdir -p "$2"
+if [ "$FLEET_JOB" = job-a ] && [ ! -e "$HOME/started" ]; then
+  echo a > "$2/owner"; touch "$HOME/started"
+  while [ ! -e "$HOME/go" ]; do sleep 0.1; done
+  cat "$2/owner" > "$HOME/result" 2>/dev/null || echo missing > "$HOME/result"
+fi'
+for lab in "$s/perf_lab-run" "$(FLEET_JOB=job-a ns_dir "$s" perf_lab "$PWD")/run" "$(FLEET_JOB=job-b ns_dir "$s" perf_lab "$PWD")/run"; do
+  mkdir -p "$(dirname "$lab")" && printf '%s\n' "$fake" > "$lab" && chmod +x "$lab"
+done
+FLEET_JOB=job-a NO_BUILD=1 bash scripts/office/perflab.sh run >/dev/null 2>&1 & a=$!
+until [ -e "$HOME/started" ]; do sleep 0.1; done
+FLEET_JOB=job-b NO_BUILD=1 bash scripts/office/perflab.sh run >/dev/null 2>&1
+touch "$HOME/go"; wait $a
+cat "$HOME/result"
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            done = bash(script, env={"HOME": Path(tmp).as_posix()})
+        self.assertEqual(done.stdout.strip(), "a", done.stderr)
+
+    def test_a_jobs_network_is_labelled_cleaned_with_it_and_swept_after_it(self):
+        """Sol, 20 Oct 2026: prepare-npd-data.sh's network had no labels: an aborted job left it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            _, shell_side = fake_docker(tmp)
+            mine, ended = tmp / "mine", tmp / "ended"
+            mine.mkdir()
+            ended.mkdir()
+            script = r'''
+. scripts/lib/ns.sh
+FLEET_JOB=mine ns_network create "$(FLEET_JOB=mine ns_name npd-net "$1")" "$1" reasoning >/dev/null
+FAKE_CREATED=2026-10-01T00:00:00Z FLEET_JOB=ended ns_network create "$(FLEET_JOB=ended ns_name npd-net "$2")" "$2" reasoning >/dev/null
+FLEET_JOB=mine ns_clean "$1" "" all
+'''
+            done = bash(script, mine.as_posix(), ended.as_posix(), env=shell_side)
+            self.assertEqual(done.stdout.split(), [ns.name("npd-net", mine, {"FLEET_JOB": "mine"})], done.stderr)
+            self.assertEqual(state(tmp)["networks"][ns.name("npd-net", ended, {"FLEET_JOB": "ended"})]["labels"]["nrese.ns"],
+                             "ended")
+            shutil.rmtree(ended)
+            done = subprocess.run([BASH, (ROOT / "scripts" / "bench-cleanup.sh").as_posix()],
+                                  env={**shell_side, "FLEET_JOB": "this-job"}, capture_output=True, text=True, timeout=120)
+            self.assertEqual((done.returncode, state(tmp)["networks"]), (0, {}), done.stderr)
+
+    def test_shared_dataset_preparation_runs_one_at_a_time(self):
+        """Sol, 20 Oct 2026: prepare-datasets.sh's staging ($name.parts, .part files) was every
+        job's: a second preparer removed the first's and published an incomplete file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            prep = tmp / "prep.sh"
+            prep.write_text(f'#!/usr/bin/env bash\nset -euo pipefail\n. "{(ROOT / "scripts/lib/ns.sh").as_posix()}"\n'
+                            'ns_serialize datasets "$0" "$@"\n'
+                            f'echo "start $1" >> "{(tmp / "log").as_posix()}"; sleep 1\n'
+                            f'echo "end $1" >> "{(tmp / "log").as_posix()}"\n', newline="\n")
+            env = {**os.environ, "NRESE_LOCK_DIR": (tmp / "locks").as_posix()}
+            runs = [subprocess.Popen([BASH, prep.as_posix(), str(k)], env=env) for k in (1, 2)]
+            for run in runs:
+                run.wait(timeout=120)
+            log = (tmp / "log").read_text().split("\n")[:4]
+        self.assertEqual([line.split()[0] for line in log], ["start", "end", "start", "end"], log)
+        self.assertEqual(log[0].split()[1], log[1].split()[1])
+
+    def test_the_lint_takes_mounts_names_and_compose_and_documents_what_it_cant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cases = {"default.sh": 'docker run --rm -v "${X:-nrese-target}:/t" img\n',
+                     "assigned.sh": 'vol=sc-$system\ndocker run --rm -v "$vol:/s" img\n',
+                     "fstring.py": 'mount = f"nrese-suite-{run}-store"\n',
+                     "compose.yml": 'services:\n  w:\n    container_name: shared\n',
+                     "network.sh": 'docker network create npd\n',
+                     # What it can't tell apart (a host directory or a volume; a flag built at run
+                     # time): passes, so review covers these forms.
+                     "env-only.sh": 'docker run --rm -v "$SHARED_VOLUME:/target" img\n',
+                     "concat.py": "args = ['docker', 'run', '--' + 'name', 'shared', 'img']\n"}
+            for name, text in cases.items():
+                (tmp / name).write_text(text, newline="\n")
+                done = subprocess.run([BASH, (ROOT / "scripts" / "check-names.sh").as_posix(), (tmp / name).as_posix()],
+                                      capture_output=True, text=True)
+                expected = 0 if name in ("env-only.sh", "concat.py") else 1
+                self.assertEqual(done.returncode, expected, (name, done.stdout))
+
+
+@unittest.skipUnless(BASH, "needs bash")
+class Timing(unittest.TestCase):
+    def test_a_job_runs_the_image_id_it_first_resolved_whatever_the_tag_becomes(self):
+        import json
+        from suitekit.runtime import DockerRuntime, Spec
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            python_side, _ = fake_docker(tmp)
+            (tmp / "state.json").write_text(json.dumps({"containers": {}, "volumes": {}, "n": 0,
+                                                        "images": {"img:1": "sha256:first"}}))
+            with patch.dict(os.environ, {**python_side, "NRESE_LOCK_DIR": str(tmp / "locks"), "FLEET_JOB": "job-a"}):
+                self.assertEqual(ns.pin_image("img:1", ROOT), "sha256:first")
+                retagged = state(tmp)
+                retagged["images"]["img:1"] = "sha256:second"  # another job rebuilt the tag
+                (tmp / "state.json").write_text(json.dumps(retagged))
+                args = DockerRuntime(tmp, 0).args(Spec("x", "img:1", ["serve"]), detached=True)
+                self.assertEqual((args[-1], "img:1" in args), ("sha256:first", False))
+                self.assertEqual(ns.pinned(ROOT), {"img:1": "sha256:first"})
+
+    def test_a_timed_gate_pass_refuses_to_make_data(self):
+        import argparse
+        sys.path.insert(0, str(ROOT / "benches" / "fast"))
+        import fast
+        args = argparse.Namespace(cases="lab-olympics", areas=None, prepared=False, no_routes=False,
+                                  empty_queries=False)
+        with patch.dict(os.environ, {"NRESE_TIMED_GATE": "1"}), patch.object(fast, "RUNTIME", "native"), \
+                patch.object(fast, "native_dirs", return_value={}), patch.dict(fast.OPTIONS):
+            with self.assertRaisesRegex(SystemExit, "prepared data only"):
+                fast.run(args)
+
+    def test_the_host_lock_lets_one_holder_in_at_a_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            events = []
+
+            def hold(k):
+                with ns.host_lock(Path(tmp) / "datasets.lock"):
+                    events.append(f"start {k}")
+                    import time
+                    time.sleep(0.3)
+                    events.append(f"end {k}")
+            threads = [threading.Thread(target=hold, args=(k,)) for k in (1, 2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual([e.split()[0] for e in events], ["start", "end", "start", "end"], events)
 
 
 if __name__ == "__main__":

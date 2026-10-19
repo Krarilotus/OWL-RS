@@ -10,12 +10,16 @@
 set -u
 source ~/.cargo/env
 cd "$(dirname "$0")/../.."
+# This job's own store and perf lab (scripts/lib/ns.sh): another job's run of the same label
+# has its own.
+. scripts/lib/ns.sh
 label=${1:-run}
 data=${2:-$HOME/nrese-bench/scratch/dbpedia/dbpedia-core.nt}
 queries=${3:-benches/competitors/queries/dbpedia-core}
 shift $(( $# < 3 ? $# : 3 ))
-store=~/nrese-bench/scratch/store-$label
-lab=~/nrese-bench/scratch/perf_lab-$label
+store=$(ns_dir ~/nrese-bench/scratch store "$PWD")/$label
+lab=$(ns_dir ~/nrese-bench/scratch perf_lab "$PWD")/$label
+mkdir -p "$(dirname "$store")" "$(dirname "$lab")"
 if [ "${NO_BUILD:-}" != 1 ]; then
   scripts/cargo-guarded.sh build --release -p nrese-store --example perf_lab || exit 1
   cp target/release/examples/perf_lab "$lab"
