@@ -105,6 +105,9 @@ def load_cases() -> list[dict]:
 
 
 def select(cases: list[dict], args) -> list[dict]:
+    if args.cases is not None and not args.cases.strip(","):
+        # An empty selection (a gate's plan that couldn't be read) is an error, never every case.
+        sys.exit("--cases names no case")
     if args.cases:
         wanted = args.cases.split(",")
         unknown = set(wanted) - {c["name"] for c in cases}
