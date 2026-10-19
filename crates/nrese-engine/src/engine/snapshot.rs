@@ -41,12 +41,26 @@ pub struct Snapshot {
     /// differs from `version`. The canonical model's view, never `version` itself, which
     /// the asserted model and [`Self::stored`] read as stored ([`Self::data`]).
     canonical_data: Option<Arc<Version>>,
+    /// The bytes of `canonical_data` the view budget refused: then it is this snapshot's
+    /// alone ([`Self::canonical_view_uncharged`]).
+    canonical_uncharged: usize,
+    /// What the canonical views a version keeps are charged to, beside the queries'
+    /// envelopes ([`crate::Engine::set_canonical_view_budget`]).
+    views: Arc<nrese_exec::Budget>,
 }
 
-/// The canonical view of `version` under `same_as` ([`Snapshot::canonical_data`]): `None`
-/// where it is `version` itself.
-fn canonical_data(version: &Arc<Version>, same_as: Option<TermId>) -> Option<Arc<Version>> {
-    super::equality::CanonicalCache::view(version, same_as?)
+/// The canonical view of `version` under `same_as` ([`Snapshot::canonical_data`]), charged
+/// to `views`, and its bytes `views` refused: `None` where it is `version` itself.
+fn canonical_data(
+    version: &Arc<Version>,
+    same_as: Option<TermId>,
+    views: &Arc<nrese_exec::Budget>,
+) -> (Option<Arc<Version>>, usize) {
+    match same_as.and_then(|same_as| super::equality::CanonicalCache::view(version, same_as, views))
+    {
+        Some(view) => (Some(view.version), view.uncharged),
+        None => (None, 0),
+    }
 }
 
 /// Inferred statements hidden from a reader, as runs stacked over the inferred stack
@@ -123,6 +137,7 @@ impl Snapshot {
         dictionary: Arc<Dictionary>,
         statistics: Arc<Statistics>,
         equality: Option<TermId>,
+        views: Arc<nrese_exec::Budget>,
     ) -> Self {
         Self {
             version,
@@ -131,6 +146,8 @@ impl Snapshot {
             equality,
             canonical: false,
             canonical_data: None,
+            canonical_uncharged: 0,
+            views,
         }
     }
 
@@ -145,6 +162,7 @@ impl Snapshot {
             equality: same_as,
             canonical: false,
             canonical_data: None,
+            canonical_uncharged: 0,
             ..self.clone()
         }
     }
@@ -155,6 +173,7 @@ impl Snapshot {
             equality: None,
             canonical: false,
             canonical_data: None,
+            canonical_uncharged: 0,
             ..self.clone()
         }
     }
@@ -168,11 +187,21 @@ impl Snapshot {
     /// joins over it and expands the classes after the joins ([`Self::expand_late`]).
     /// Without equality classes it reads as this snapshot.
     pub fn with_canonical_equality(&self) -> Snapshot {
+        let (canonical_data, canonical_uncharged) =
+            canonical_data(&self.version, self.equality, &self.views);
         Snapshot {
             canonical: true,
-            canonical_data: canonical_data(&self.version, self.equality),
+            canonical_data,
+            canonical_uncharged,
             ..self.clone()
         }
+    }
+
+    /// The bytes of this snapshot's canonical view that the view budget refused (0 where
+    /// it keeps none, or the version keeps it): the view was made for this snapshot alone,
+    /// and its reader charges them, a query to its own envelope.
+    pub fn canonical_view_uncharged(&self) -> usize {
+        self.canonical_uncharged
     }
 
     /// Whether a triple term this snapshot's statements hold names, at any depth, another
@@ -247,10 +276,11 @@ impl Snapshot {
     }
 
     /// The canonical view of `version` this snapshot's reads take, if it reads canonically.
-    fn canonical_view(&self, version: &Arc<Version>) -> Option<Arc<Version>> {
-        self.canonical
-            .then(|| canonical_data(version, self.equality))
-            .flatten()
+    fn canonical_view(&self, version: &Arc<Version>) -> (Option<Arc<Version>>, usize) {
+        match self.canonical {
+            true => canonical_data(version, self.equality, &self.views),
+            false => (None, 0),
+        }
     }
 
     /// The version reads in `model` read: the canonical view for canonical reads in a
@@ -337,8 +367,11 @@ impl Snapshot {
             equality: Default::default(),
             canonical: Default::default(),
         });
+        let (canonical_data, canonical_uncharged) = self.canonical_view(&version);
         Snapshot {
-            canonical_data: self.canonical_view(&version),
+            canonical_data,
+            canonical_uncharged,
+            views: Arc::clone(&self.views),
             version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
@@ -363,8 +396,11 @@ impl Snapshot {
             equality: Default::default(),
             canonical: Default::default(),
         });
+        let (canonical_data, canonical_uncharged) = self.canonical_view(&version);
         Snapshot {
-            canonical_data: self.canonical_view(&version),
+            canonical_data,
+            canonical_uncharged,
+            views: Arc::clone(&self.views),
             version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
@@ -390,8 +426,11 @@ impl Snapshot {
             equality: Default::default(),
             canonical: Default::default(),
         });
+        let (canonical_data, canonical_uncharged) = self.canonical_view(&version);
         Some(Snapshot {
-            canonical_data: self.canonical_view(&version),
+            canonical_data,
+            canonical_uncharged,
+            views: Arc::clone(&self.views),
             version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
@@ -642,8 +681,11 @@ impl Snapshot {
     /// A snapshot of `version` over this one's dictionary and statistics.
     pub(super) fn with_version(&self, version: Version) -> Snapshot {
         let version = Arc::new(version);
+        let (canonical_data, canonical_uncharged) = self.canonical_view(&version);
         Snapshot {
-            canonical_data: self.canonical_view(&version),
+            canonical_data,
+            canonical_uncharged,
+            views: Arc::clone(&self.views),
             version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::clone(&self.statistics),
@@ -1515,14 +1557,19 @@ mod canonical_lifetime_tests {
     use super::*;
     use nrese_rdf::{GraphName, NamedNode};
 
-    /// A canonical view lives no longer than its version: once the engine and every
-    /// snapshot are gone, nothing holds either (the view's cache once held its own
-    /// version, through the equality cell the versions pass on).
+    /// A canonical view lives no longer than its version, and is charged to the view
+    /// budget while kept: once the engine and every snapshot are gone, nothing holds
+    /// either and the charge is released (the view's cache once held its own version,
+    /// through the equality cell the versions pass on). A view the budget refuses is made
+    /// for its reader alone, which reads canonically through it.
     #[test]
     fn canonical_views_die_with_their_version() {
         let ex = |local: &str| NamedNode::new_unchecked(format!("http://example.com/{local}"));
-        for named in [false, true] {
+        for (named, limit) in [(false, None), (true, None), (true, Some(1))] {
             let engine = crate::Engine::new(crate::EngineConfig::default()).unwrap();
+            let views =
+                Arc::new(limit.map_or_else(nrese_exec::Budget::unlimited, nrese_exec::Budget::new));
+            engine.set_canonical_view_budget(Arc::clone(&views));
             let mut tx = engine.transaction();
             let rep = tx.intern(ex("Rep").as_ref().into());
             let alias = tx.intern(ex("Alias").as_ref().into());
@@ -1545,9 +1592,28 @@ mod canonical_lifetime_tests {
             let version = Arc::downgrade(&canonical.version);
             let view = canonical.canonical_data.as_ref().map(Arc::downgrade);
             assert_eq!(view.is_some(), named);
+            let kept = named && limit.is_none();
+            assert_eq!(views.used() > 0, kept, "{named} {limit:?}");
+            assert_eq!(canonical.canonical_view_uncharged() > 0, named && !kept);
+            if named {
+                let g = canonical.lookup(ex("g").as_ref().into()).unwrap();
+                let pattern = QuadPattern::in_graph(g);
+                let read: Vec<_> = canonical
+                    .quads_for_pattern_in(ReadModel::Materialised, &pattern)
+                    .collect();
+                assert!(
+                    read.iter().all(|q| q.subject == rep) && !read.is_empty(),
+                    "{read:?}"
+                );
+            }
             drop((canonical, snapshot, engine));
             assert_eq!(version.strong_count(), 0, "named graphs: {named}");
             assert!(view.is_none_or(|view| view.strong_count() == 0));
+            assert_eq!(
+                views.used(),
+                0,
+                "the view's charge is released with its version"
+            );
         }
     }
 }
