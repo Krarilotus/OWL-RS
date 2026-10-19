@@ -16,6 +16,7 @@ mod cache_key;
 mod cached;
 pub(crate) use cached::output_key;
 mod calendar;
+mod canonical;
 mod equality;
 mod equijoin;
 mod estimate;
@@ -205,7 +206,19 @@ fn run(
 ) -> Result<(Outcome, Reservation), QueryEvaluationError> {
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
-    let pattern = match &options.pre_bound {
+    let pre_bound = options
+        .pre_bound
+        .as_ref()
+        .map(|values| match ctx.canonical_here() {
+            Some(names) => Cow::Owned(
+                values
+                    .iter()
+                    .map(|(v, t)| (v.clone(), names.term(t.clone())))
+                    .collect(),
+            ),
+            None => Cow::Borrowed(&**values),
+        });
+    let pattern = match &pre_bound {
         Some(values) => {
             // A blank node is put in as an alias IRI that stands for the node.
             for term in values.values() {
@@ -537,10 +550,11 @@ fn native_pattern<'q>(
             unsupported_part(&pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
         ));
     }
+    let pattern = ctx.canonical_pattern(pattern.into_owned());
     let pattern = if options.as_written {
-        pattern.into_owned()
+        pattern
     } else {
-        optimise(pattern.into_owned(), &mut rewrites, ctx)
+        optimise(pattern, &mut rewrites, ctx)
     };
     // ASK needs one solution: LIMIT 1 lets the evaluation stop at it.
     let pattern = match form {
@@ -1222,6 +1236,9 @@ struct Context<'a> {
     /// The equality classes to expand after joins over canonical reads (stage C,
     /// [`Context::late_expansion`]); `None` where reads expand them, or don't need to.
     late: Option<Arc<nrese_engine::EqualityClasses>>,
+    /// Under canonical answers, the classes a term the query names stands for
+    /// ([`canonical`]); `None` otherwise.
+    canonical: Option<canonical::Names>,
     /// Whether GeoSPARQL relations in triple patterns are computed from geometries too
     /// (the query-rewrite extension; not [`QueryOptions::geosparql_stated_only`]).
     spatial_rewrite: bool,
@@ -1329,6 +1346,12 @@ impl<'a> Context<'a> {
                 true => Cow::Owned(snapshot.with_canonical_equality()),
                 false => Cow::Borrowed(snapshot),
             },
+            canonical: match options.equality_canonical {
+                true => {
+                    canonical::Names::of(&snapshot.with_canonical_equality(), options.read_model)
+                }
+                false => None,
+            },
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
             aliases: RefCell::default(),
@@ -1362,6 +1385,9 @@ impl<'a> Context<'a> {
             let fixed = format!("{base:?} {:?}", options.access);
             ctx.cache = Some(ctx.cache_scope(Arc::clone(cache), fixed.into_bytes().into()));
         }
+        ctx.evaluator.set_canonical(ctx.canonical.clone());
+        ctx.evaluator
+            .canonical_scope(ctx.canonical_here().is_some());
         ctx
     }
 
@@ -1524,10 +1550,14 @@ impl<'a> Context<'a> {
     }
 
     /// The id of `term`: its stored id if the snapshot knows it, else a computed id, the same
-    /// one for equal terms.
+    /// one for equal terms. Under canonical answers, a stored term gets its representative's id where the
+    /// default graph is read ([`canonical`]).
     fn id(&self, term: &Term) -> u64 {
         if let Some(id) = self.lookup_const(term.as_ref()) {
-            return id.raw();
+            return match self.canonical_here() {
+                Some(names) => names.id(id.raw()),
+                None => id.raw(),
+            };
         }
         let mut ids = self.computed_ids.borrow_mut();
         if let Some(&id) = ids.get(term) {
@@ -1698,7 +1728,10 @@ impl<'a> Context<'a> {
         }
         match pattern {
             GraphPattern::Bgp { patterns } => self.bgp(patterns, &[], &mut Vec::new()),
-            GraphPattern::Graph { name, inner } => self.graph(name, inner),
+            GraphPattern::Graph { name, inner } => {
+                let solutions = self.graph(name, inner)?;
+                Ok(self.canonical_solutions(solutions))
+            }
             GraphPattern::Service {
                 name,
                 inner,
@@ -2018,8 +2051,12 @@ impl<'a> Context<'a> {
     /// Evaluates `pattern` with `scope` as the active graph.
     fn in_graph(&self, scope: GraphScope, pattern: &GraphPattern) -> NativeResult<Solutions> {
         let outer = self.graph.replace(scope);
+        let canonical = self
+            .evaluator
+            .canonical_scope(self.canonical_here().is_some());
         let result = self.eval(pattern);
         *self.graph.borrow_mut() = outer;
+        self.evaluator.canonical_scope(canonical);
         result
     }
 

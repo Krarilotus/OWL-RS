@@ -203,25 +203,32 @@ fn bind_values(
     }
     let mut seen: HashSet<Vec<u64>> = HashSet::new();
     let mut rows: Vec<Vec<Option<GroundTerm>>> = Vec::new();
+    let names = ctx.canonical_here();
     for r in 0..bound.table.len() {
         let key: Vec<u64> = shared.iter().map(|&(_, c)| bound.table.get(r, c)).collect();
-        if !seen.insert(key.clone()) {
-            continue;
+        let keys = match names {
+            Some(names) => identities(&key, names),
+            None => vec![key],
+        };
+        for key in keys {
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            if seen.len() > BIND_LIMIT {
+                return None;
+            }
+            let mut row = Vec::with_capacity(key.len());
+            for id in key {
+                row.push(Some(match ctx.term(id)? {
+                    Term::NamedNode(n) => GroundTerm::NamedNode(n),
+                    Term::Literal(l) => GroundTerm::Literal(l),
+                    // A triple term goes along if it holds no blank node.
+                    triple @ Term::Triple(_) => GroundTerm::try_from(triple).ok()?,
+                    Term::BlankNode(_) => return None,
+                }));
+            }
+            rows.push(row);
         }
-        if seen.len() > BIND_LIMIT {
-            return None;
-        }
-        let mut row = Vec::with_capacity(key.len());
-        for id in key {
-            row.push(Some(match ctx.term(id)? {
-                Term::NamedNode(n) => GroundTerm::NamedNode(n),
-                Term::Literal(l) => GroundTerm::Literal(l),
-                // A triple term goes along if it holds no blank node.
-                triple @ Term::Triple(_) => GroundTerm::try_from(triple).ok()?,
-                Term::BlankNode(_) => return None,
-            }));
-        }
-        rows.push(row);
     }
     let variables: Vec<Variable> = shared.into_iter().map(|(v, _)| v).collect();
     Some(
@@ -237,4 +244,24 @@ fn bind_values(
             })
             .collect(),
     )
+}
+
+/// Under canonical answers a value stands for its class, and an endpoint names each
+/// identity as stored: every combination of the identities of `key`'s values
+/// ([`super::canonical`]).
+fn identities(key: &[u64], names: &super::canonical::Names) -> Vec<Vec<u64>> {
+    let mut keys = vec![Vec::with_capacity(key.len())];
+    for id in key {
+        keys = keys
+            .iter()
+            .flat_map(|prefix| {
+                names.members(id).iter().map(move |&member| {
+                    let mut key = prefix.clone();
+                    key.push(member);
+                    key
+                })
+            })
+            .collect();
+    }
+    keys
 }

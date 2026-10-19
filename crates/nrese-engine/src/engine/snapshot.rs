@@ -163,6 +163,33 @@ impl Snapshot {
         self.canonical
     }
 
+    /// The equality classes by which reads of the default graph in `model` name terms
+    /// canonically: `Some` when this snapshot reads canonically, the model has inferred
+    /// statements and some class exists. Under it a term stands for its class, shown by
+    /// [`EqualityClasses::representative`]. That is the one mapping of canonical answers
+    /// (research-designs §1, "Canonical answers"): reads normalise the constants of a
+    /// pattern by it, and every other way a term meets those reads (a query's constants
+    /// in VALUES, BIND and expressions, a computed IRI, a federated row, an index keyed
+    /// by stored ids such as the spatial or text index) is mapped by it too. A value
+    /// leaving those reads for something that names terms as stored (a remote endpoint)
+    /// goes as every identity of its class ([`EqualityClasses::members_of`]). Named graphs
+    /// and the asserted model are read as stored, without it.
+    pub fn canonical_classes(&self, model: ReadModel) -> Option<Arc<EqualityClasses>> {
+        if !self.canonical {
+            return None;
+        }
+        self.expanding(model, &QuadPattern::in_graph(TermId::DEFAULT_GRAPH))?;
+        self.equality_classes()
+    }
+
+    /// `id` as reads of the default graph in `model` name it ([`Self::canonical_classes`]):
+    /// its class's representative under canonical reads, else `id`. For one-off lookups; a
+    /// loop takes the classes once.
+    pub fn canonical_id(&self, model: ReadModel, id: TermId) -> TermId {
+        self.canonical_classes(model)
+            .map_or(id, |classes| classes.representative(id))
+    }
+
     /// The classes to expand after joins over [`Self::with_canonical_equality`], if reads
     /// in `model` may be done so: equality classes exist, the model shows every copy of a
     /// statement (the materialised one), and no named graph can hold a copy that should be
