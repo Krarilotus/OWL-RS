@@ -12,11 +12,19 @@ use nrese_engine::{
 };
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 
+/// `subject`'s label `text`: a vector literal where it is one (`[1, 2]`).
 fn label(subject: &str, text: &str, graph: Option<&str>) -> Quad {
+    let literal = match text.starts_with('[') {
+        true => Literal::new_typed_literal(
+            text,
+            NamedNode::new_unchecked(nrese_engine::vector::DATATYPE),
+        ),
+        false => Literal::new_simple_literal(text),
+    };
     Quad::new(
         NamedNode::new_unchecked(format!("http://example.com/{subject}")),
         NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#label"),
-        Literal::new_simple_literal(text),
+        literal,
         match graph {
             Some(g) => NamedNode::new_unchecked(format!("http://example.com/{g}")).into(),
             None => GraphName::DefaultGraph,
@@ -265,8 +273,29 @@ fn visible(snapshot: &Snapshot, model: ReadModel, scope: &TextScope, iris: bool)
 }
 
 /// Checks the corpus a search of `snapshot` uses, of literals and of IRIs, against
-/// [`visible`].
+/// [`visible`]; and a vector search's, against the typed literals its scans show.
 fn check(snapshot: &Snapshot, model: ReadModel, scope: &TextScope, context: &str) {
+    let graphs: Vec<GraphSelector> = match scope {
+        TextScope::Graphs(graphs) => vec![*graphs],
+        TextScope::Merge(graphs) => graphs.iter().map(|&g| GraphSelector::Exact(g)).collect(),
+    };
+    let mut typed = std::collections::BTreeSet::new();
+    for graph in graphs {
+        let pattern = QuadPattern {
+            graph,
+            ..QuadPattern::all()
+        };
+        for quad in snapshot.quads_for_pattern_in(model, &pattern) {
+            if quad.object.kind() == TermKind::TypedLiteral {
+                typed.insert(quad.object.payload());
+            }
+        }
+    }
+    assert_eq!(
+        snapshot.vector_corpus_members(model, scope),
+        typed.into_iter().collect::<Vec<_>>(),
+        "{context}, {model:?}, {scope:?}, vectors"
+    );
     for iris in [false, true] {
         let (members, documents, _) = snapshot.text_corpus_members(model, scope, iris);
         let expected = visible(snapshot, model, scope, iris);
@@ -324,9 +353,10 @@ fn random_commits(seed: u64) {
     let mut asserted: Vec<(String, String, Option<&str>)> = Vec::new();
     let mut inferred: Vec<EncodedTriple> = Vec::new();
     let mut view: Option<(Snapshot, Snapshot, Vec<EncodedQuad>)> = None;
-    // Of the 3 readers × 6 scopes × 3 models, 24 (each checked for literals and IRIs).
+    // Of the 3 readers × 6 scopes × 3 models, 16 (each checked for literals, IRIs and
+    // vectors: with the pending states' and the view's, within the 64 corpora kept).
     let mut chosen = std::collections::BTreeSet::new();
-    while chosen.len() < 24 {
+    while chosen.len() < 16 {
         chosen.insert(1 + random.below(54) as usize);
     }
     for round in 0..60 {
@@ -336,7 +366,11 @@ fn random_commits(seed: u64) {
                 // A new statement (texts repeat, so a literal may stay in use elsewhere).
                 0..=4 => {
                     let a = words[random.below(5) as usize];
-                    let text = format!("{a} {}", words[random.below(5) as usize]);
+                    let text = match random.below(4) {
+                        // A vector (values repeat too).
+                        0 => format!("[{}, {}]", random.below(3), random.below(3)),
+                        _ => format!("{a} {}", words[random.below(5) as usize]),
+                    };
                     let subject = format!("s{}", random.below(12));
                     let graph = graphs[random.below(4) as usize];
                     if tx.insert(label(&subject, &text, graph).as_ref()) {

@@ -1496,29 +1496,71 @@ impl Snapshot {
             .expect("no budget to exceed")
     }
 
-    /// The vector literals this snapshot's dictionary holds that are nearest to
-    /// `query.vector`, among those `accept` takes, nearest first, with how the search went
-    /// (whether statements still use them is the caller's to check, in `accept`).
+    /// The vector literals that are objects of statements this snapshot shows in `scope`'s
+    /// graphs in `model` (its corpus of vectors, [`Self::text_corpus`]), among those
+    /// `accept` takes, nearest to `query.vector` first (ties by id), with how the search
+    /// went. Every one of them is compared (exact): no vector outside them (another
+    /// version's, an open transaction's, a deleted one, one in a graph outside the scope)
+    /// changes the answer. Building the corpus and the scan are charged to `budget` as
+    /// [`Self::text_search_in`]'s are.
+    pub fn vector_search_in(
+        &self,
+        model: ReadModel,
+        scope: &TextScope,
+        query: &crate::VectorQuery,
+        accept: &(dyn Fn(TermId) -> bool + Sync),
+        budget: Option<&Arc<nrese_exec::Budget>>,
+    ) -> Result<(Vec<(TermId, f32)>, crate::VectorSearchReport), nrese_exec::BudgetExceeded> {
+        let unbounded;
+        let request = match budget {
+            Some(budget) => budget,
+            None => {
+                unbounded = Arc::new(nrese_exec::Budget::unlimited());
+                &unbounded
+            }
+        };
+        // The vectors first, then the corpus, then the scan: no lock held across another's
+        // parallel parts.
+        self.dictionary.cover_vectors();
+        let corpus = self.text_corpus(Documents::Vectors, model, scope, Some(request))?;
+        let accept = |id: TermId| corpus.contains(id.payload()) && accept(id);
+        let (hits, report) =
+            self.dictionary
+                .vector_search(query, self.version.dictionary_len, &accept, request)?;
+        let hits = hits
+            .into_iter()
+            .map(|hit| (TermId::from_raw(hit.id), hit.distance))
+            .collect();
+        Ok((hits, report))
+    }
+
+    /// [`Self::vector_search_in`] over every graph, asserted and inferred.
     pub fn vector_search(
         &self,
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
     ) -> (Vec<(TermId, f32)>, crate::VectorSearchReport) {
-        let (hits, report) =
-            self.dictionary
-                .vector_search(query, self.version.dictionary_len, accept);
-        let hits = hits
-            .into_iter()
-            .map(|hit| (TermId::from_raw(hit.id), hit.distance))
-            .collect();
-        (hits, report)
+        self.vector_search_in(
+            ReadModel::Materialised,
+            &TextScope::EVERY,
+            query,
+            accept,
+            None,
+        )
+        .expect("no budget to exceed")
     }
 
-    /// Builds the graph searches like `query` use, covering every vector of its
-    /// dimension, before returning: a warm-up (searches build it themselves, a large one
-    /// on a thread of its own while they scan exactly).
-    pub fn prepare_vector_graph(&self, query: &crate::VectorQuery) {
-        self.dictionary.prepare_vector_graph(query);
+    /// Prepares what [`Self::vector_search`] reads before returning (a warm-up): the vectors
+    /// of the dictionary and the corpus of every graph's.
+    pub fn prepare_vector_search(&self) {
+        self.dictionary.cover_vectors();
+        self.text_corpus(
+            Documents::Vectors,
+            ReadModel::Materialised,
+            &TextScope::EVERY,
+            None,
+        )
+        .expect("no budget to exceed");
     }
 
     /// The IRIs that are subjects of statements this snapshot shows in `scope`'s graphs
@@ -1593,6 +1635,16 @@ impl Snapshot {
         (corpus.members(), corpus.documents(), corpus.total_words())
     }
 
+    /// The members of [`Self::vector_search_in`]'s corpus for `model` and `scope`: the
+    /// typed literals that are objects of statements this snapshot shows there (the scan
+    /// reads the vectors among them).
+    #[doc(hidden)]
+    pub fn vector_corpus_members(&self, model: ReadModel, scope: &TextScope) -> Vec<u64> {
+        self.text_corpus(Documents::Vectors, model, scope, None)
+            .expect("no budget to exceed")
+            .members()
+    }
+
     /// The documents of a full-text index this snapshot shows in `scope`, with their
     /// statistics from the index (which covers them: [`Dictionary::cover_text`] first);
     /// exact, kept by the statements' identity, model, graphs and how this snapshot reads
@@ -1614,7 +1666,7 @@ impl Snapshot {
         budget: Option<&Arc<nrese_exec::Budget>>,
     ) -> Result<super::corpora::CorpusRef, nrese_exec::BudgetExceeded> {
         use super::corpora::{CorpusRef, Found};
-        use crate::term::text::Corpus;
+        use crate::term::text::{Bits, Corpus};
         let unbounded;
         let request = match budget {
             Some(budget) => budget,
@@ -1640,6 +1692,7 @@ impl Snapshot {
             Found::Build { from, keep } => (from, keep),
         };
         let iris = documents == Documents::Subjects;
+        let vectors = documents == Documents::Vectors;
         // With equality classes read, a probe with an IRI as its constant reads the IRI's
         // class (an alias finds its representative's statements, the alias in place),
         // which a scan doesn't show: IRIs' corpora are walked then. Literals belong to no
@@ -1657,8 +1710,14 @@ impl Snapshot {
                     }
                 }
                 store.built(true);
-                self.dictionary
-                    .with_text_index(iris, |index| index.derive(&base, &changes, span, request))?
+                match vectors {
+                    // Every typed literal is a member (of one word): the scan reads the
+                    // vectors among them.
+                    true => Bits::derived(&base, &changes, span, request, |_| 1)?,
+                    false => self.dictionary.with_text_index(iris, |index| {
+                        index.derive(&base, &changes, span, request)
+                    })?,
+                }
             }
             None => {
                 store.built(false);
@@ -1711,10 +1770,15 @@ impl Snapshot {
             }
         }
         drop(scratch);
-        let iris = documents == Documents::Subjects;
-        Ok(self
-            .dictionary
-            .with_text_index(iris, |index| index.corpus(bits)))
+        Ok(match documents {
+            Documents::Vectors => crate::term::text::Bits::counted(bits, |_| 1),
+            Documents::Literals => self
+                .dictionary
+                .with_text_index(false, |index| index.corpus(bits)),
+            Documents::Subjects => self
+                .dictionary
+                .with_text_index(true, |index| index.corpus(bits)),
+        })
     }
 
     /// The most a corpus walk over `words` words of bits holds at once besides them: for
@@ -1734,7 +1798,7 @@ impl Snapshot {
     /// statements.
     fn uses(&self, model: ReadModel, scope: &TextScope, documents: Documents, id: TermId) -> bool {
         let pattern = |graph| match documents {
-            Documents::Literals => QuadPattern {
+            Documents::Literals | Documents::Vectors => QuadPattern {
                 object: Some(id),
                 graph,
                 ..QuadPattern::all()
@@ -1819,7 +1883,7 @@ impl Snapshot {
         };
         for quad in self.quads_for_pattern_in(model, &pattern) {
             let value = match documents {
-                Documents::Literals => quad.object,
+                Documents::Literals | Documents::Vectors => quad.object,
                 Documents::Subjects => quad.subject,
             };
             if value.kind() == kind {
@@ -1841,13 +1905,15 @@ impl Snapshot {
         high: TermId,
     ) -> Option<Vec<(TermId, u64)>> {
         let (pattern, permutation) = match (graphs, documents) {
-            (GraphSelector::Exact(graph), Documents::Literals) => {
+            (GraphSelector::Exact(graph), Documents::Literals | Documents::Vectors) => {
                 (QuadPattern::in_graph(graph), Permutation::Gosp)
             }
             (GraphSelector::Exact(graph), Documents::Subjects) => {
                 (QuadPattern::in_graph(graph), Permutation::Gspo)
             }
-            (GraphSelector::Any, Documents::Literals) => (QuadPattern::all(), Permutation::Ospg),
+            (GraphSelector::Any, Documents::Literals | Documents::Vectors) => {
+                (QuadPattern::all(), Permutation::Ospg)
+            }
             (GraphSelector::Any, Documents::Subjects) => (QuadPattern::all(), Permutation::Spog),
             (GraphSelector::AnyNamed, _) => return None,
         };
@@ -1924,12 +1990,13 @@ impl TextScope {
     }
 }
 
-/// Which documents a full-text index holds: string literals (objects), or IRIs by their
-/// local names (subjects).
+/// Which documents a corpus holds: string literals (objects) or IRIs by their local names
+/// (subjects), for full-text searches; vector literals (objects), for vector searches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Documents {
     Literals,
     Subjects,
+    Vectors,
 }
 
 impl Documents {
@@ -1938,6 +2005,7 @@ impl Documents {
         match self {
             Self::Literals => &[TermKind::String, TermKind::LangString],
             Self::Subjects => &[TermKind::Iri],
+            Self::Vectors => &[TermKind::TypedLiteral],
         }
     }
 

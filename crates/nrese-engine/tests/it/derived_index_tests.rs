@@ -74,10 +74,8 @@ fn text_and_vector_indexes_survive_a_reopen() {
         }
         let text = search(&engine, "bridge*");
         assert_eq!(text.len(), 2);
-        let snapshot = engine.snapshot();
-        snapshot.prepare_vector_graph(&query);
-        let (found, report) = snapshot.vector_search(&query, &|_| true);
-        assert!(report.graph);
+        let (found, report) = engine.snapshot().vector_search(&query, &|_| true);
+        assert_eq!(report.space, 50);
         engine.checkpoint().unwrap();
         assert!(dir.path().join("derived/text.index").exists());
         assert!(dir.path().join("derived/vectors.index").exists());
@@ -88,10 +86,7 @@ fn text_and_vector_indexes_survive_a_reopen() {
     assert_eq!(search(&engine, "bridge*"), before_text);
     let snapshot = engine.snapshot();
     let (found, report) = snapshot.vector_search(&query, &|_| true);
-    assert!(
-        report.graph && report.scanned == 0,
-        "the graph read back: {report:?}"
-    );
+    assert_eq!(report.space, 50, "the vectors read back");
     assert_eq!(found, before_vectors);
     assert_eq!(engine.stats().dictionary.derived_loaded, 2);
     // Terms interned since extend what was read.
@@ -131,49 +126,4 @@ fn files_of_another_store_are_ignored() {
     assert!(search(&engine, "tower").is_empty());
     assert_eq!(search(&engine, "else").len(), 1);
     assert_eq!(engine.stats().dictionary.derived_loaded, 0);
-}
-
-/// A space past the size built at once: the first search scans while a thread builds
-/// the graph; later searches use it.
-#[test]
-fn large_graphs_are_built_on_a_thread() {
-    let engine = Engine::new(EngineConfig {
-        background_maintenance: false,
-        ..EngineConfig::default()
-    })
-    .unwrap();
-    let mut tx = engine.transaction();
-    for i in 0..60_000usize {
-        let a = (i as f32 * 0.37).sin();
-        let b = (i as f32 * 0.11).cos();
-        tx.insert(QuadRef::new(
-            NamedNode::new_unchecked(format!("http://example.com/{i}")).as_ref(),
-            NamedNode::new_unchecked("http://example.com/p").as_ref(),
-            vector(&[a, b, (i % 13) as f32]).as_ref(),
-            GraphNameRef::DefaultGraph,
-        ));
-    }
-    tx.commit().unwrap();
-    let query = VectorQuery {
-        metric: Metric::L2,
-        ..VectorQuery::new(vec![0.3, 0.4, 5.0], 5)
-    };
-    let snapshot = engine.snapshot();
-    let (first, report) = snapshot.vector_search(&query, &|_| true);
-    assert!(!report.graph && report.scanned == 60_000, "{report:?}");
-    let mut waited = 0;
-    loop {
-        let (found, report) = snapshot.vector_search(&query, &|_| true);
-        if report.graph {
-            let shared = found
-                .iter()
-                .filter(|(id, _)| first.iter().any(|(f, _)| f == id))
-                .count();
-            assert!(shared >= 4, "{shared} of 5");
-            break;
-        }
-        waited += 1;
-        assert!(waited < 600, "no graph after a minute");
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
 }

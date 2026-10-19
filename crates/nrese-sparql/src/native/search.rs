@@ -58,7 +58,7 @@
 //! `?x luc:score ?s` binds the relevance. The index name is not looked up: there is one
 //! index, over every string literal.
 
-use nrese_engine::{GraphSelector, QuadPattern, TermId, TextQuery, TextScope};
+use nrese_engine::{GraphSelector, TermId, TextQuery, TextScope};
 use nrese_rdf::{Literal, Term, Variable, vocab::rdf};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 
@@ -373,36 +373,13 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
 }
 
 impl Context<'_> {
-    /// Whether `id` is the object of a statement in the active graph.
-    pub(super) fn used_as_object(&self, id: TermId) -> bool {
-        let graph = match &*self.graph.borrow() {
-            GraphScope::Default => GraphSelector::Exact(TermId::DEFAULT_GRAPH),
-            GraphScope::Named(g) => GraphSelector::Exact(*g),
-            GraphScope::Variable(_) => GraphSelector::AnyNamed,
-            GraphScope::Union => GraphSelector::Any,
-            GraphScope::Missing => return false,
-        };
-        let pattern = QuadPattern {
-            subject: None,
-            predicate: None,
-            object: Some(id),
-            graph,
-        };
-        let merge_set = matches!(*self.graph.borrow(), GraphScope::Union)
-            .then_some(self.merge_set.as_ref())
-            .flatten();
-        self.snapshot
-            .quads_for_pattern_in(self.model, &pattern)
-            .any(|quad| merge_set.is_none_or(|graphs| graphs.contains(&quad.graph)))
-    }
-
     /// The graphs whose literals a search in the active graph ranks among: the active
     /// graph, the merge the default graph is, or the named graphs `GRAPH ?g` may bind
     /// (`None`: none). A list of graphs is a copy charged to the query's budget first, with
     /// its reservation (bound before it, so that it goes after the copy); the engine sorts
     /// it where needed.
     #[allow(clippy::type_complexity)]
-    fn text_scope(&self) -> NativeResult<Option<(Option<Reservation>, TextScope)>> {
+    pub(super) fn text_scope(&self) -> NativeResult<Option<(Option<Reservation>, TextScope)>> {
         let copy = |graphs: &Vec<TermId>| -> NativeResult<(Option<Reservation>, TextScope)> {
             let copy = nrese_exec::ChargedVec::collect(
                 Arc::clone(&self.budget),

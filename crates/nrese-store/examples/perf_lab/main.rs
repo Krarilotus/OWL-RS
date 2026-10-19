@@ -55,8 +55,9 @@
 //!   `--duration-s`. `--threads N` sizes the thread pool (1: single-threaded). `--export`
 //!   writes the store's statements, inferred ones included, as N-Triples (the closure the
 //!   stores without reasoning load). `--canonicalize` canonicalises blank nodes.
-//!   `--prepare-vector-graph 64:cosine` synchronously prepares that vector space before
-//!   query timing, recording its preparation phase and checking full graph coverage.
+//!   `--prepare-vector-graph 64:cosine` synchronously prepares what searches of that vector
+//!   space read before query timing (its vectors and the corpus of every graph's), recording
+//!   its preparation phase.
 //!   A query file ending in `.ac` holds typed text: autocompletion (the store's, ten
 //!   suggestions, inferred statements included) is timed for it.
 //!   `--then-commit FILE` applies one SPARQL update per line as a commit after the timed
@@ -1333,7 +1334,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         query.vector[0] = 1.0;
         query.metric = metric;
         query.strategy = nrese_engine::VectorStrategy::Approximate;
-        snapshot.prepare_vector_graph(&query);
+        snapshot.prepare_vector_search();
         let (_, readiness) = snapshot.vector_search(&query, &|_| true);
         report.sections.push(("vector_prepare", phase.json()));
         let metric = metric.name();
@@ -1341,10 +1342,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             "{{\"dimension\": {dimension}, \"metric\": \"{metric}\", \"space\": {}, \"graph\": {}, \"scanned\": {}, \"prepare_ms\": {}}}",
             readiness.space, readiness.graph, readiness.scanned, started.elapsed().as_secs_f64() * 1000.0,
         )));
-        if readiness.space == 0 || !readiness.graph || readiness.scanned != 0 {
-            return Err(
-                "vector graph does not cover the requested space; query timing skipped".into(),
-            );
+        // Every search is exact over the reader's vectors: prepared means they are there.
+        if readiness.space == 0 {
+            return Err("no vectors of the requested space; query timing skipped".into());
         }
     }
     let baseline = args

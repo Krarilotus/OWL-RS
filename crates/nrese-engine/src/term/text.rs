@@ -476,6 +476,65 @@ pub(crate) struct Bits {
     pub(crate) total_words: u64,
 }
 
+impl Bits {
+    /// The documents whose bits `bits` sets (a bit per number below its span), with their
+    /// count and words: `length` gives a number's words (0: not a document, left out).
+    pub(crate) fn counted(mut bits: ChargedVec<u64>, length: impl Fn(u64) -> u16) -> Self {
+        let (mut documents, mut total_words) = (0u64, 0u64);
+        for (w, word) in bits.iter_mut().enumerate() {
+            let mut rest = *word;
+            while rest != 0 {
+                let bit = rest.trailing_zeros();
+                rest &= rest - 1;
+                match length(w as u64 * 64 + u64::from(bit)) {
+                    0 => *word &= !(1 << bit),
+                    length => {
+                        documents += 1;
+                        total_words += u64::from(length);
+                    }
+                }
+            }
+        }
+        Self {
+            bits,
+            documents,
+            total_words,
+        }
+    }
+
+    /// `base` with each document of `changes` a member or not (numbers below `span`;
+    /// numbers `length` gives no words stay out): its counts adjusted, not counted again.
+    pub(crate) fn derived(
+        base: &Corpus,
+        changes: &[(u64, bool)],
+        span: u64,
+        budget: &Arc<Budget>,
+        length: impl Fn(u64) -> u16,
+    ) -> Result<Self, BudgetExceeded> {
+        let mut bits = base.bits(span, budget)?;
+        let (mut documents, mut total_words) = (base.documents, base.total_words);
+        for &(document, member) in changes {
+            let (word, bit) = ((document / 64) as usize, document % 64);
+            let was = bits[word] >> bit & 1 == 1;
+            let length = length(document);
+            if member && !was && length > 0 {
+                bits[word] |= 1 << bit;
+                documents += 1;
+                total_words += u64::from(length);
+            } else if !member && was {
+                bits[word] &= !(1 << bit);
+                documents -= 1;
+                total_words -= u64::from(length);
+            }
+        }
+        Ok(Self {
+            bits,
+            documents,
+            total_words,
+        })
+    }
+}
+
 /// A corpus's documents: a sorted list where they are few against the numbers they span,
 /// else a bit per number.
 #[derive(Debug)]
@@ -493,6 +552,17 @@ impl Corpus {
     /// Its words, counted with repetition.
     pub fn total_words(&self) -> u64 {
         self.total_words
+    }
+
+    /// Whether `document` is one of its documents.
+    pub fn contains(&self, document: u64) -> bool {
+        match &self.members {
+            Members::Bits(bits) => {
+                let word = (document / 64) as usize;
+                word < bits.len() && bits[word] >> (document % 64) & 1 == 1
+            }
+            Members::Sorted(sorted) => sorted.binary_search(&document).is_ok(),
+        }
     }
 
     /// Its documents, ascending.
@@ -883,27 +953,8 @@ impl TextIndex {
     /// The corpus of the documents whose bits `bits` sets (a bit per number below `span`;
     /// numbers this index has no words for are left out), with their count and words. One
     /// thread: it runs under the index's lock.
-    pub(crate) fn corpus(&self, mut bits: ChargedVec<u64>) -> Bits {
-        let (mut documents, mut total_words) = (0u64, 0u64);
-        for (w, word) in bits.iter_mut().enumerate() {
-            let mut rest = *word;
-            while rest != 0 {
-                let bit = rest.trailing_zeros();
-                rest &= rest - 1;
-                match self.length_of(w as u64 * 64 + u64::from(bit)) {
-                    0 => *word &= !(1 << bit),
-                    length => {
-                        documents += 1;
-                        total_words += u64::from(length);
-                    }
-                }
-            }
-        }
-        Bits {
-            bits,
-            documents,
-            total_words,
-        }
+    pub(crate) fn corpus(&self, bits: ChargedVec<u64>) -> Bits {
+        Bits::counted(bits, |document| self.length_of(document))
     }
 
     /// `base` with each document of `changes` a member or not (numbers below `span`;
@@ -916,26 +967,8 @@ impl TextIndex {
         span: u64,
         budget: &Arc<Budget>,
     ) -> Result<Bits, BudgetExceeded> {
-        let mut bits = base.bits(span, budget)?;
-        let (mut documents, mut total_words) = (base.documents, base.total_words);
-        for &(document, member) in changes {
-            let (word, bit) = ((document / 64) as usize, document % 64);
-            let was = bits[word] >> bit & 1 == 1;
-            let length = self.length_of(document);
-            if member && !was && length > 0 {
-                bits[word] |= 1 << bit;
-                documents += 1;
-                total_words += u64::from(length);
-            } else if !member && was {
-                bits[word] &= !(1 << bit);
-                documents -= 1;
-                total_words -= u64::from(length);
-            }
-        }
-        Ok(Bits {
-            bits,
-            documents,
-            total_words,
+        Bits::derived(base, changes, span, budget, |document| {
+            self.length_of(document)
         })
     }
 
