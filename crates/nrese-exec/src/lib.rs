@@ -11,7 +11,10 @@
 //! - [`graph`]: adjacency, strongly connected components, reachability and closures
 //!   (property paths, hierarchies)
 //! - [`classes`]: equivalence classes by union (`owl:sameAs` classes)
-//! - [`budget`]: memory accounting: the server's budget, each request's envelope, its parts
+//! - [`budget`]: memory accounting: the server's budget, each request's envelope, its parts,
+//!   reservations and vectors charged before they grow
+//! - `measure` (tests, and the `measure` feature): holds what an operation allocates
+//!   against what it reserved
 //! - [`memory`]: the process's memory, and a watch for limits on long operations
 //! - [`heap`]: heap profiles by phase, for memory guards and profiles
 //! - [`sort`]: sorting and deduplicating id keys by radix over their significant bits
@@ -30,13 +33,22 @@ pub mod graph;
 pub mod group;
 pub mod heap;
 pub mod join;
+#[cfg(any(test, feature = "measure"))]
+pub mod measure;
 pub mod memory;
 pub mod search;
 pub mod sort;
 pub mod table;
 pub mod workers;
 
-pub use budget::{Budget, BudgetExceeded, Envelope, Gauge, Reservation, SharedBudget};
+pub use budget::{
+    Budget, BudgetExceeded, ChargedVec, Envelope, Gauge, Reservation, Room, SharedBudget,
+};
+
+/// The unit tests' allocator: the system's, counting what measured operations hold.
+#[cfg(test)]
+#[global_allocator]
+static MEASURED: measure::Measured<std::alloc::System> = measure::Measured(std::alloc::System);
 pub use join::RowLimit;
 pub use table::IdTable;
 
