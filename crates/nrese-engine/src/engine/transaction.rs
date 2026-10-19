@@ -178,7 +178,7 @@ impl<'e> Transaction<'e> {
             ]
             .into_iter()
             .flatten()
-            .map(|quad| (quad.subject, quad.object)),
+            .map(|quad| (quad.subject, quad.predicate, quad.object)),
         );
         let version = Version {
             content,

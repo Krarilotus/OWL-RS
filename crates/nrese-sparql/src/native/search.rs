@@ -431,11 +431,13 @@ impl Context<'_> {
         vars.extend(search.rank.iter().cloned());
         let mut table = IdTable::new(vars.len());
         let mut rank = 0usize;
-        // Every match is the object of a statement in the scope: no probe per match.
+        // Every match is the object of a statement the query's snapshot shows in the
+        // scope: no probe per match. Building the corpus is charged to the query's budget.
         let found = match self.text_scope() {
             Some(scope) => self
                 .snapshot
-                .text_search_in(self.model, &scope, &search.query),
+                .text_search_in(self.model, &scope, &search.query, Some(&self.budget))
+                .map_err(crate::QueryEvaluationError::MemoryLimit)?,
             None => Vec::new(),
         };
         for found in found {

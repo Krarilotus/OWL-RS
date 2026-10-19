@@ -366,11 +366,12 @@ impl Corpus {
         }
     }
 
-    /// Bytes it holds.
+    /// Bytes it holds, itself included.
     pub fn memory_bytes(&self) -> usize {
-        match &self.members {
+        let members = match &self.members {
             Members::Sorted(v) | Members::Bits(v) => v.capacity() * 8,
-        }
+        };
+        members + std::mem::size_of::<Self>()
     }
 }
 
