@@ -172,14 +172,14 @@ impl CommitRecord {
         ]
     }
 
-    /// The subjects and objects of the statements the record adds or removes, in either
-    /// stack: what the full-text corpora look at again (`corpora`).
-    pub(crate) fn touched(&self) -> Vec<(TermId, TermId)> {
+    /// The statements the record adds or removes, in either stack, as (subject,
+    /// predicate, object): what the full-text corpora look at again (`corpora`).
+    pub(crate) fn touched(&self) -> Vec<(TermId, TermId, TermId)> {
         let quads = self.inserts.iter().chain(&self.deletes);
         let triples = self.inferred_inserts.iter().chain(&self.inferred_deletes);
         quads
-            .map(|quad| (quad.subject, quad.object))
-            .chain(triples.map(|triple| (triple.subject, triple.object)))
+            .map(|quad| (quad.subject, quad.predicate, quad.object))
+            .chain(triples.map(|triple| (triple.subject, triple.predicate, triple.object)))
             .collect()
     }
 

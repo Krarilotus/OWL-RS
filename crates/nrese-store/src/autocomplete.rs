@@ -67,8 +67,16 @@ pub(crate) fn autocomplete(
     // what `model` reads in every graph: the string literals that are objects, the IRIs
     // that are subjects.
     let (label_hits, name_hits) = rayon::join(
-        || snapshot.text_search_in(model, &TextScope::EVERY, &query),
-        || snapshot.iri_search_in(model, &TextScope::EVERY, &query),
+        || {
+            snapshot
+                .text_search_in(model, &TextScope::EVERY, &query, None)
+                .expect("no budget to exceed")
+        },
+        || {
+            snapshot
+                .iri_search_in(model, &TextScope::EVERY, &query, None)
+                .expect("no budget to exceed")
+        },
     );
     // Matches come best first: the first `limit` resources of each kind are its best.
     let mut from_labels = 0;
