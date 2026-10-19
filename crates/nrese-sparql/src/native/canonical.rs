@@ -10,8 +10,9 @@
 //!
 //! - **reads**: a canonical snapshot gives representatives from every graph (the engine's
 //!   canonical reads; named graphs over representatives too);
-//! - **the query's constants**: put in as their representatives once, before planning,
-//!   with pre-bound values, inside triple terms too ([`Context::canonical_pattern`]);
+//! - **the query's constants**: put in as their representatives once, before planning, in
+//!   its pattern and its CONSTRUCT template, inside triple terms too, with pre-bound values
+//!   ([`Context::canonical_query`]);
 //! - **terms the evaluation makes**: `IRI()` names the representative, through the
 //!   canonical-name function the same pass wraps around it ([`FUNCTION`]);
 //! - **a remote endpoint's rows**: mapped where they are imported (a triple term part by
@@ -140,15 +141,17 @@ impl Names {
 }
 
 impl Context<'_> {
-    /// `pattern` with the query's constants put in as their representatives, `IRI()`
-    /// wrapped in the canonical-name function (module docs); unchanged without canonical
-    /// answers. An error for what canonical answers refuse.
-    pub(super) fn canonical_pattern(
+    /// The query's pattern and form with its constants put in as their representatives,
+    /// the CONSTRUCT template's too, `IRI()` wrapped in the canonical-name function (module
+    /// docs); unchanged without canonical answers. An error for what canonical answers
+    /// refuse.
+    pub(super) fn canonical_query<'q>(
         &self,
         pattern: GraphPattern,
-    ) -> Result<GraphPattern, QueryEvaluationError> {
+        form: super::Form<'q>,
+    ) -> Result<(GraphPattern, super::Form<'q>), QueryEvaluationError> {
         let Some(names) = &self.canonical else {
-            return Ok(pattern);
+            return Ok((pattern, form));
         };
         if names.classes.relate_literals() {
             return Err(refused("a literal is an identity of an owl:sameAs class"));
@@ -158,7 +161,14 @@ impl Context<'_> {
                 "a triple term the store holds names an identity other than its class's representative",
             ));
         }
-        Ok(Rewrite { ctx: self, names }.pattern(&pattern))
+        let rewrite = Rewrite { ctx: self, names };
+        let form = match form {
+            super::Form::Construct(template) => super::Form::Construct(std::borrow::Cow::Owned(
+                template.iter().map(|t| rewrite.triple(t)).collect(),
+            )),
+            form => form,
+        };
+        Ok((rewrite.pattern(&pattern), form))
     }
 }
 

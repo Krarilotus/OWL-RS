@@ -174,6 +174,7 @@ impl Durable {
                     revision: loaded.revision,
                     dictionary_len: 0,
                     equality: Default::default(),
+                    canonical: Default::default(),
                 }
             }
             None => Version::empty(),

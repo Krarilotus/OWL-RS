@@ -233,7 +233,7 @@ fn run(
         Form::Ask => Outcome::Boolean(!solutions.table.is_empty()),
         Form::Describe => Outcome::Graph(ctx.describe(&solutions)?),
         Form::Construct(template) => Outcome::Graph(
-            construct(snapshot, ctx.computed.take(), solutions, template, || {
+            construct(snapshot, ctx.computed.take(), solutions, &template, || {
                 ctx.check()
             })
             .collect::<NativeResult<_>>()?,
@@ -289,7 +289,7 @@ pub(crate) fn explain(
         Form::Select | Form::Ask => solutions.table.len(),
         Form::Describe => ctx.describe(&solutions)?.len(),
         Form::Construct(template) => {
-            construct(snapshot, ctx.computed.take(), solutions, template, || {
+            construct(snapshot, ctx.computed.take(), solutions, &template, || {
                 ctx.check()
             })
             .try_fold(0usize, |count, triple| triple.map(|_| count + 1))?
@@ -340,7 +340,7 @@ fn pattern_and_form(query: &Query) -> (&GraphPattern, Form<'_>) {
         Query::Ask { pattern, .. } => (pattern, Form::Ask),
         Query::Construct {
             template, pattern, ..
-        } => (pattern, Form::Construct(template)),
+        } => (pattern, Form::Construct(Cow::Borrowed(template))),
         Query::Describe { pattern, .. } => (pattern, Form::Describe),
     }
 }
@@ -511,8 +511,8 @@ pub(crate) fn delete_insert(
 enum Form<'q> {
     Select,
     Ask,
-    /// The triples of the template, per solution.
-    Construct(&'q [TriplePattern]),
+    /// The triples of the template, per solution (canonical answers' own: [`canonical`]).
+    Construct(Cow<'q, [TriplePattern]>),
     /// The statements about each term the solutions bind ([`Context::describe`]).
     Describe,
 }
@@ -545,7 +545,7 @@ fn native_pattern<'q>(
             unsupported_part(&pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
         ));
     }
-    let pattern = ctx.canonical_pattern(pattern.into_owned())?;
+    let (pattern, form) = ctx.canonical_query(pattern.into_owned(), form)?;
     let pattern = if options.as_written {
         pattern
     } else {
