@@ -5,33 +5,289 @@
 //! them. Rows are addressed by index. A table records which columns it's sorted on
 //! ([`sorted_by`](IdTable::sorted_by)), so a join can skip sorting inputs that already arrive
 //! in the right order (index scans produce sorted output).
+//!
+//! A table owns the charge of its column storage: the columns grow through one path,
+//! [`IdTable::reserve_rows`], which charges the new capacity to the table's budget before it
+//! allocates ([`ChargedVec`](crate::ChargedVec)'s growth, for all columns at once), and the
+//! charge is released when the table drops, after its columns are freed. A table that never
+//! grew holds no charge and no budget. Rows are written into reserved room
+//! ([`IdTable::push_reserved`]): one check per row, no allocation, no atomics.
+//!
+//! Tables made by the older uncharged constructors (`with_capacity`, `from_columns`,
+//! `push_row`) hold no charge of their own; the executor charges them as a whole until it
+//! builds every table through the charged path.
+
+use std::sync::Arc;
 
 use rayon::prelude::*;
+
+use crate::{Budget, BudgetExceeded, Reservation};
 
 /// Row count from which sorting runs in parallel.
 const PARALLEL_SORT_ROWS: usize = 1 << 16;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Default)]
 pub struct IdTable {
     columns: Vec<Vec<u64>>,
     len: usize,
     /// The table is sorted lexicographically on these columns (in this order). Empty if
     /// nothing is known.
     sorted_by: Vec<usize>,
+    /// Rows every column has room for: at most each column's capacity.
+    room: usize,
+    /// The bytes of the columns' own vector, charged with the columns since the table's
+    /// first charged growth (0 before).
+    header: usize,
+    /// The charge of the columns' capacity, from the table's first charged growth. After
+    /// `columns`: fields drop in order, the columns first.
+    held: Option<Reservation<Arc<Budget>>>,
+}
+
+/// The columns' rows and order; not their capacity or charge.
+impl PartialEq for IdTable {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.columns, self.len, &self.sorted_by) == (&other.columns, other.len, &other.sorted_by)
+    }
+}
+
+impl Eq for IdTable {}
+
+/// An uncharged copy ([`IdTable::try_clone`] is the charged one).
+impl Clone for IdTable {
+    fn clone(&self) -> Self {
+        Self::uncharged(self.columns.clone(), self.len, self.sorted_by.clone())
+    }
 }
 
 impl IdTable {
-    /// An empty table with `width` columns.
+    /// An empty table with `width` columns. It holds no memory and no charge.
     pub fn new(width: usize) -> Self {
         Self::with_capacity(width, 0)
     }
 
     pub fn with_capacity(width: usize, rows: usize) -> Self {
-        Self {
-            columns: (0..width).map(|_| Vec::with_capacity(rows)).collect(),
-            len: 0,
-            sorted_by: Vec::new(),
+        let columns = (0..width).map(|_| Vec::with_capacity(rows)).collect();
+        Self::uncharged(columns, 0, Vec::new())
+    }
+
+    fn uncharged(columns: Vec<Vec<u64>>, len: usize, sorted_by: Vec<usize>) -> Self {
+        let mut table = Self {
+            columns,
+            len,
+            sorted_by,
+            room: 0,
+            header: 0,
+            held: None,
+        };
+        table.room = table.capacity_rows();
+        table
+    }
+
+    /// The rows every column has room for.
+    fn capacity_rows(&self) -> usize {
+        self.columns
+            .iter()
+            .map(Vec::capacity)
+            .min()
+            .unwrap_or(usize::MAX)
+    }
+
+    /// An empty table with room for `rows` rows, charged to `budget` first.
+    pub fn charged(
+        width: usize,
+        rows: usize,
+        budget: &Arc<Budget>,
+    ) -> Result<Self, BudgetExceeded> {
+        let mut table = Self::new(width);
+        table.reserve_rows_exact(rows, budget)?;
+        Ok(table)
+    }
+
+    /// The bytes the table holds charged to its budget: its columns' capacity, or 0 for a
+    /// table that never grew through [`Self::reserve_rows`].
+    pub fn charge(&self) -> usize {
+        self.held.as_ref().map_or(0, Reservation::bytes)
+    }
+
+    /// Room for `rows` more rows, charged to the table's budget (`budget` for a table that
+    /// holds no charge yet) before the columns grow: their capacity doubles where the budget
+    /// has room for it, else grows by what is asked. Fails without growing.
+    pub fn reserve_rows(
+        &mut self,
+        rows: usize,
+        budget: &Arc<Budget>,
+    ) -> Result<(), BudgetExceeded> {
+        let needed = self.needed(rows, budget)?;
+        if needed <= self.room {
+            return Ok(());
         }
+        let doubled = needed.max(self.room.saturating_mul(2));
+        let fits = Self::bytes(self.width(), doubled).is_some_and(|bytes| {
+            let budget = self.held.as_ref().map_or(&**budget, |held| held.budget());
+            bytes <= budget.remaining()
+        });
+        self.set_room(if fits { doubled } else { needed }, budget)
+    }
+
+    /// Room for exactly `rows` more rows, charged first ([`Self::reserve_rows`]).
+    pub fn reserve_rows_exact(
+        &mut self,
+        rows: usize,
+        budget: &Arc<Budget>,
+    ) -> Result<(), BudgetExceeded> {
+        let needed = self.needed(rows, budget)?;
+        match needed <= self.room {
+            true => Ok(()),
+            false => self.set_room(needed, budget),
+        }
+    }
+
+    /// The rows with `rows` more, if they can be counted.
+    fn needed(&self, rows: usize, budget: &Budget) -> Result<usize, BudgetExceeded> {
+        self.len
+            .checked_add(rows)
+            .ok_or_else(|| budget.refusal(usize::MAX))
+    }
+
+    /// The bytes of `rows` rows `width` wide, if a table can hold them.
+    fn bytes(width: usize, rows: usize) -> Option<usize> {
+        let column = std::alloc::Layout::array::<u64>(rows).ok()?.size();
+        column.checked_mul(width)
+    }
+
+    /// The one path that grows the columns, to room for `rows` rows each: the new capacity
+    /// charged beside the old (a reallocation holds both while it moves the values), every
+    /// column reallocated, then the old capacity released.
+    fn set_room(&mut self, rows: usize, budget: &Arc<Budget>) -> Result<(), BudgetExceeded> {
+        let width = self.width();
+        if width == 0 {
+            self.room = usize::MAX;
+            return Ok(());
+        }
+        let header = width * size_of::<Vec<u64>>();
+        let bytes = Self::bytes(width, rows)
+            .and_then(|columns| columns.checked_add(header))
+            .ok_or_else(|| budget.refusal(usize::MAX))?;
+        self.header = header;
+        let held = self
+            .held
+            .get_or_insert_with(|| Reservation::new(Arc::clone(budget)));
+        // Released after the columns moved (or as this unwinds).
+        let old = held.renew(bytes)?;
+        for column in &mut self.columns {
+            column.reserve_exact(rows - column.len());
+        }
+        self.room = rows;
+        drop(old);
+        debug_assert!(self.capacity_rows() == rows);
+        Ok(())
+    }
+
+    /// Appends `row` within the room reserved ([`Self::reserve_rows`]): one check, then the
+    /// values written. Panics past the room.
+    #[inline]
+    pub fn push_reserved(&mut self, row: &[u64]) {
+        assert!(self.len < self.room, "past the rows reserved");
+        debug_assert_eq!(row.len(), self.width(), "row width");
+        for (column, &value) in self.columns.iter_mut().zip(row) {
+            // SAFETY: `room` is at most every column's capacity, and every column holds
+            // `len` values.
+            unsafe {
+                column.as_mut_ptr().add(self.len).write(value);
+                column.set_len(self.len + 1);
+            }
+        }
+        self.len += 1;
+        self.sorted_by.clear();
+    }
+
+    /// The rows free in the reserved room.
+    pub fn room_left(&self) -> usize {
+        self.room - self.len
+    }
+
+    /// A table of `rows` rows written a column at a time, `columns` yielding each column's
+    /// values (at most `rows` are taken): the room charged to `budget` first.
+    pub fn gathered<C: IntoIterator<Item = u64>>(
+        width: usize,
+        rows: usize,
+        budget: &Arc<Budget>,
+        columns: impl IntoIterator<Item = C>,
+    ) -> Result<Self, BudgetExceeded> {
+        let mut table = Self::charged(width, rows, budget)?;
+        let mut written = 0;
+        for (column, values) in table.columns.iter_mut().zip(columns) {
+            // Into room for `rows`: the column never grows.
+            column.extend(values.into_iter().take(rows));
+            assert_eq!(column.len(), rows, "a column of every row");
+            written += 1;
+        }
+        assert_eq!(written, width, "every column");
+        table.len = rows;
+        debug_assert!(table.capacity_rows() >= table.room);
+        Ok(table)
+    }
+
+    /// The rows whose `mask` entry is `keep`, copied into a table charged to `budget`.
+    pub fn selected(
+        &self,
+        mask: &[bool],
+        keep: bool,
+        budget: &Arc<Budget>,
+    ) -> Result<Self, BudgetExceeded> {
+        assert_eq!(mask.len(), self.len, "mask length");
+        let rows = mask.iter().filter(|&&m| m == keep).count();
+        let mut table = Self::gathered(
+            self.width(),
+            rows,
+            budget,
+            self.columns.iter().map(|column| {
+                column
+                    .iter()
+                    .zip(mask)
+                    .filter(move |&(_, &m)| m == keep)
+                    .map(|(&value, _)| value)
+            }),
+        )?;
+        table.sorted_by = self.sorted_by.clone();
+        Ok(table)
+    }
+
+    /// A copy charged to `budget` (`Clone` makes an uncharged one).
+    pub fn try_clone(&self, budget: &Arc<Budget>) -> Result<Self, BudgetExceeded> {
+        let mut table = Self::gathered(
+            self.width(),
+            self.len,
+            budget,
+            self.columns.iter().map(|column| column.iter().copied()),
+        )?;
+        table.sorted_by = self.sorted_by.clone();
+        Ok(table)
+    }
+
+    /// The rows of `parts` in order, in one table `width` wide, charged to `budget`: the
+    /// first part with rows grows (charged first) to hold every row, and each other part is
+    /// taken from `parts` and freed, its charge released, as soon as it is copied. Parts
+    /// without rows are skipped.
+    pub fn concat_charged(
+        width: usize,
+        parts: &mut [IdTable],
+        budget: &Arc<Budget>,
+    ) -> Result<IdTable, BudgetExceeded> {
+        let Some(first) = parts.iter().position(|part| !part.is_empty()) else {
+            return Ok(IdTable::new(width));
+        };
+        let rest = &mut parts[first..];
+        let extra = rest[1..].iter().map(IdTable::len).sum();
+        let mut out = std::mem::take(&mut rest[0]);
+        out.reserve_rows_exact(extra, budget)?;
+        Ok(out.append_parts(rest[1..].iter_mut().map(std::mem::take)))
+    }
+
+    /// The charge of the table, handed to a holder that releases it itself
+    /// ([`Reservation::transfer`]): the table holds none after.
+    pub fn transfer_charge(&mut self) -> usize {
+        self.held.take().map_or(0, Reservation::transfer)
     }
 
     /// A table from equal-length columns.
@@ -44,11 +300,7 @@ impl IdTable {
             columns.iter().all(|c| c.len() == len),
             "IdTable columns must have equal lengths"
         );
-        Self {
-            columns,
-            len,
-            sorted_by: Vec::new(),
-        }
+        Self::uncharged(columns, len, Vec::new())
     }
 
     /// A table with one row per entry of `rows`, each `width` wide.
@@ -153,12 +405,21 @@ impl IdTable {
         for column in &mut out.columns {
             column.reserve_exact(extra);
         }
+        out.append_parts(rest)
+    }
+
+    /// `rest` appended to `self`, which has room for them, each freed once copied.
+    fn append_parts(self, rest: impl IntoIterator<Item = IdTable>) -> IdTable {
+        let mut out = self;
         // Sorted on what every part is sorted on, where each part starts at or after the
         // row before it (the morsels of a sorted scan, in order).
         let mut sorted = std::mem::take(&mut out.sorted_by);
         // Each part is freed as soon as it is copied: together with the output they
         // would hold the rows twice.
         for part in rest {
+            if part.is_empty() {
+                continue;
+            }
             let common = sorted
                 .iter()
                 .zip(&part.sorted_by)
@@ -190,9 +451,10 @@ impl IdTable {
         short.saturating_mul(rows).saturating_mul(8)
     }
 
-    /// Bytes held by the column buffers (by capacity), for memory budgets.
+    /// Bytes held by the column buffers (by capacity), and by the vector of them once the
+    /// table was charged, for memory budgets.
     pub fn memory_bytes(&self) -> usize {
-        self.columns.iter().map(|c| c.capacity() * 8).sum()
+        self.header + self.columns.iter().map(|c| c.capacity() * 8).sum::<usize>()
     }
 
     /// The columns the table is known to be sorted on, most significant first.
@@ -287,6 +549,7 @@ impl IdTable {
         } else {
             self.columns.iter_mut().for_each(gather);
         }
+        self.room = self.capacity_rows();
     }
 
     /// Keeps the rows for which `keep(row)` is true, preserving order and sortedness.
@@ -408,11 +671,11 @@ impl IdTable {
                 }
             })
             .collect();
-        IdTable {
-            columns: projected,
-            len: self.len,
-            sorted_by,
-        }
+        let mut table = Self::uncharged(projected, self.len, sorted_by);
+        // The charge stays with the buffers it covers, dropped after them.
+        table.held = self.held.take();
+        table.header = self.header;
+        table
     }
 
     /// Keeps rows `offset..offset + limit`.
@@ -430,6 +693,41 @@ impl IdTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A table built through the charged path holds no more than it charges, however many
+    /// rows: its growth, copies, selections and concatenations are charged before they
+    /// allocate, and released after its columns are freed.
+    #[test]
+    fn a_charged_table_holds_no_more_than_it_charges() {
+        if !crate::measure::alone() {
+            return;
+        }
+        let held = |rows: usize| {
+            let budget = Arc::new(Budget::unlimited());
+            let mut odd = crate::ChargedVec::new(&*budget);
+            odd.extend_bounded(rows, (0..rows).map(|row| row % 2 == 1))
+                .unwrap();
+            let mut parts = [IdTable::new(3), IdTable::new(3), IdTable::new(3)];
+            let ((), excess) = crate::measure::measure_within(&budget, || {
+                let table = &mut parts[0];
+                for i in 0..rows as u64 {
+                    if table.room_left() == 0 {
+                        table.reserve_rows(1, &budget).unwrap();
+                    }
+                    table.push_reserved(&[i, i, i]);
+                }
+                parts[1] = parts[0].try_clone(&budget).unwrap();
+                parts[2] = parts[1].selected(&odd, true, &budget).unwrap();
+                let all = IdTable::concat_charged(3, &mut parts, &budget).unwrap();
+                assert_eq!(all.len(), rows * 5 / 2);
+                assert_eq!(budget.used(), odd.charged() + all.charge());
+            });
+            drop(odd);
+            assert_eq!(budget.used(), 0);
+            excess
+        };
+        assert_eq!((held(10), held(100_000)), (0, 0));
+    }
 
     fn table(rows: &[&[u64]]) -> IdTable {
         IdTable::from_rows(rows.first().map_or(0, |r| r.len()), rows.iter().copied())

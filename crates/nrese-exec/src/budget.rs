@@ -261,6 +261,12 @@ impl Budget {
         above
     }
 
+    /// The refusal of `bytes`, recorded: for a request no budget could grant (a size that
+    /// overflows).
+    pub fn refusal(&self, bytes: usize) -> BudgetExceeded {
+        self.refuse(bytes, self.used())
+    }
+
     /// The refusal of `bytes` with `used` in use, recorded.
     fn refuse(&self, bytes: usize, used: usize) -> BudgetExceeded {
         self.refused.store(true, Ordering::Relaxed);
@@ -418,6 +424,11 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
         self.bytes
     }
 
+    /// The budget it charges.
+    pub fn budget(&self) -> &Budget {
+        &self.budget
+    }
+
     /// Holds exactly `bytes`: charges the growth or returns the rest. A failed charge
     /// leaves what it held.
     pub fn resize(&mut self, bytes: usize) -> Result<(), BudgetExceeded> {
@@ -434,7 +445,7 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
     /// and what it held is handed back as a reservation of its own, released when that
     /// drops. Until then both are held, as a reallocation holds the old block and the new.
     /// A refusal changes nothing.
-    fn renew(&mut self, bytes: usize) -> Result<Reservation<&Budget>, BudgetExceeded> {
+    pub(crate) fn renew(&mut self, bytes: usize) -> Result<Reservation<&Budget>, BudgetExceeded> {
         self.budget.take(bytes)?;
         let old = Reservation {
             budget: &*self.budget,
@@ -517,11 +528,19 @@ impl<T, B: Deref<Target = Budget>> ChargedVec<T, B> {
 
     /// Room for `additional` more items: the capacity doubles where the budget has room
     /// for it, else grows by what is asked.
+    #[inline]
     pub fn reserve(&mut self, additional: usize) -> Result<(), BudgetExceeded> {
-        let needed = self.needed(additional)?;
-        if needed <= self.items.capacity() {
-            return Ok(());
+        match self.items.capacity() - self.items.len() >= additional {
+            true => Ok(()),
+            false => self.grow(additional),
         }
+    }
+
+    /// [`Self::reserve`] past the capacity: out of the line of the writes that don't need it.
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, additional: usize) -> Result<(), BudgetExceeded> {
+        let needed = self.needed(additional)?;
         let doubled = needed.max(self.items.capacity().saturating_mul(2));
         let fits = Self::bytes(doubled).is_some_and(|bytes| bytes <= self.held.budget.remaining());
         self.set_capacity(if fits { doubled } else { needed })
@@ -563,12 +582,14 @@ impl<T, B: Deref<Target = Budget>> ChargedVec<T, B> {
         Ok(())
     }
 
+    #[inline]
     pub fn push(&mut self, item: T) -> Result<(), BudgetExceeded> {
         self.reserve(1)?;
         self.items.push(item);
         Ok(())
     }
 
+    #[inline]
     pub fn extend_from_slice(&mut self, items: &[T]) -> Result<(), BudgetExceeded>
     where
         T: Clone,
@@ -580,17 +601,19 @@ impl<T, B: Deref<Target = Budget>> ChargedVec<T, B> {
 
     /// `items` appended, at most `bound` of them (an iterator that may yield more is cut
     /// there): the room for `bound` reserved first.
+    #[inline]
     pub fn extend_bounded(
         &mut self,
         bound: usize,
         items: impl IntoIterator<Item = T>,
     ) -> Result<(), BudgetExceeded> {
-        self.fill(bound, |room| {
-            items
-                .into_iter()
-                .take(bound)
-                .for_each(|item| room.push(item));
-        })
+        self.reserve(bound)?;
+        let capacity = self.items.capacity();
+        // At most `bound` items into room for `bound`: the vector never grows (and an
+        // iterator of known length is written in one loop without capacity checks).
+        self.items.extend(items.into_iter().take(bound));
+        debug_assert_eq!(self.items.capacity(), capacity);
+        Ok(())
     }
 
     /// `len` items, those past the current ones `value`'s clones.
@@ -657,6 +680,10 @@ impl<T, B: Deref<Target = Budget>> std::ops::DerefMut for ChargedVec<T, B> {
         &mut self.items
     }
 }
+
+/// Working memory of an operation (sort buckets, masks, hash chains), charged to its
+/// budget before it grows: a [`ChargedVec`] borrowing the budget.
+pub type Scratch<'b, T> = ChargedVec<T, &'b Budget>;
 
 /// The room a [`ChargedVec`] lends a writer ([`ChargedVec::fill`]): items are added within
 /// the capacity reserved, which it never grows.
