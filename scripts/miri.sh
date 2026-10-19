@@ -14,6 +14,7 @@ cd "$(dirname "$0")/.."
 # The tests that exercise unsafe code (one filter each).
 tests=(
   budget::tests::a_panicking_parallel_fill_drops_every_item_it_wrote
+  region::tests::a_region_is_charged_before_it_grows_and_returns_everything
 )
 if ! cargo +nightly miri --version > /dev/null 2>&1; then
   echo "miri.sh: no nightly Miri; rustup toolchain install nightly --component miri" >&2
