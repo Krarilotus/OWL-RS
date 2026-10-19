@@ -36,8 +36,10 @@
 //! a literal's decoder bound (from its stored key) is reserved before it is decoded, its
 //! parser's (from its text) before it is parsed, both trimmed to the shape after, and so is
 //! a filter constant's; the R-trees are packed arrays ([`Packed`]) sized before they are
-//! filled. Not charged is others' working memory: the engine's for a scan or a lookup, and
-//! geo's for computing a relation, as for every function call.
+//! filled. Computing a relation, geo's working memory is charged first, from a bound on
+//! the two shapes ([`relate_bound`]); a result's header (its variables, its columns' list)
+//! is charged and stays so with the evaluation. Not charged is the engine's working memory
+//! for a scan (its cursor) and a lookup.
 
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -52,7 +54,9 @@ use nrese_sparql_syntax::algebra::{Expression, Function};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use rayon::prelude::*;
 
-use super::geo::{RELATIONS, Shape, holds_apart, parse_literal, relation};
+use super::geo::{
+    RELATIONS, Shape, Size, holds_apart, parse_literal, relate_bound, relation, sized_bound,
+};
 use super::{
     CancellationToken, Context, GraphScope, NativeResult, PARALLEL_EXPRESSION_ROWS,
     QueryEvaluationError, Solutions, unsupported,
@@ -358,6 +362,9 @@ struct SpatialIndex {
     tree: Packed<u64>,
     /// The positions of the placements without one: empty shapes.
     empty: Charged<u64>,
+    /// The largest of its shapes' sizes in every part: a relation's bound with it bounds
+    /// the relation with any of its shapes ([`Workspace::cover`]).
+    largest: Size,
     /// The geometry literals, for filters over them: each with the position of its first
     /// placement (its shape, and its graph by the run), or, given by several graphs, [`LIST`]
     /// and the number of that position and the graphs in [`Self::spread`].
@@ -678,6 +685,7 @@ impl SpatialIndex {
         let mut geometries: Charged<Placement> =
             ChargedVec::with_capacity(Arc::clone(budget), statements.len())?;
         let mut runs: Charged<(u64, TermId)> = ChargedVec::new(Arc::clone(budget));
+        let mut largest = Size::default();
         // Per literal, the position of its first placement (`None`: not a shape).
         let mut scratch = Reservation::new(&**budget);
         scratch.charge(map_bytes::<u64, Option<u64>>(statements.len()))?;
@@ -711,6 +719,7 @@ impl SpatialIndex {
                     }
                     Some(shape) => {
                         first.insert(literal, Some(p));
+                        largest = largest.largest(Size::of(&shape.geometry));
                         shape
                     }
                 },
@@ -895,6 +904,7 @@ impl SpatialIndex {
         Ok(Self {
             tree,
             empty,
+            largest,
             geometries,
             features,
             runs,
@@ -1068,12 +1078,21 @@ impl Scoped<'_> {
     }
 
     /// Whether `relation` holds between the spatial objects `a` and `b`.
-    fn holds(&self, local: &str, a: u64, b: u64) -> bool {
-        self.shapes(a).any(|x| {
-            self.shapes(b).any(|y| {
-                x.crs == y.crs && relation(local, &x.geometry, &y.geometry).unwrap_or(false)
-            })
-        })
+    fn holds(
+        &self,
+        work: &mut Workspace<'_>,
+        local: &str,
+        a: u64,
+        b: u64,
+    ) -> Result<bool, BudgetExceeded> {
+        for x in self.shapes(a) {
+            for y in self.shapes(b) {
+                if work.holds(local, x, y)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// The objects of the placements whose box meets the shape at `known` and for whose
@@ -1083,7 +1102,7 @@ impl Scoped<'_> {
     fn near<B: Deref<Target = Budget>>(
         &self,
         known: u64,
-        test: impl Fn(&Shape, &Shape) -> bool,
+        mut test: impl FnMut(&Shape, &Shape) -> Result<bool, BudgetExceeded>,
         out: &mut ChargedVec<u64, B>,
     ) -> Result<(), BudgetExceeded> {
         let index = self.index;
@@ -1092,9 +1111,10 @@ impl Scoped<'_> {
         let mut candidate = |p: u64| {
             if refused.is_ok() && self.shows(p) {
                 let y = index.shape_at(p);
-                if x.crs == y.crs && test(x, y) {
-                    refused = out.push(index.object_at(p));
-                }
+                refused = match test(x, y) {
+                    Ok(true) => out.push(index.object_at(p)),
+                    other => other.map(|_| ()),
+                };
             }
         };
         match bbox(x) {
@@ -1114,8 +1134,7 @@ impl Scoped<'_> {
         budget: &'b Budget,
     ) -> Result<Scratch<'b, (u64, u64)>, BudgetExceeded> {
         let index = self.index;
-        let holds =
-            |x: &Shape, y: &Shape| relation(local, &x.geometry, &y.geometry).unwrap_or(false);
+        let mut work = Workspace::new(budget);
         let apart = holds_apart(local);
         let mut pairs: Scratch<'b, (u64, u64)> = ChargedVec::new(budget);
         // The other side's objects, with one side known.
@@ -1123,21 +1142,23 @@ impl Scoped<'_> {
         match (a, b) {
             (Some(a), Some(b)) => {
                 let stated = self.stated(&index.asserted, local, a).any(|x| x == b);
-                if stated || self.holds(local, a, b) {
+                if stated || self.holds(&mut work, local, a, b)? {
                     pairs.push((a, b))?;
                 }
             }
             (Some(a), None) => {
                 if apart {
                     for &b in self.objects(budget)?.iter() {
-                        if self.holds(local, a, b) {
+                        if self.holds(&mut work, local, a, b)? {
                             found.push(b)?;
                         }
                     }
                 } else {
                     for &p in index.positions(a) {
                         if self.shows(p) {
-                            self.near(p, holds, &mut found)?;
+                            work.cover(index.shape_at(p), index.largest);
+                            work.cover(index.shape_at(p), index.largest);
+                            self.near(p, |x, y| work.holds(local, x, y), &mut found)?;
                         }
                     }
                 }
@@ -1152,14 +1173,15 @@ impl Scoped<'_> {
             (None, Some(b)) => {
                 if apart {
                     for &a in self.objects(budget)?.iter() {
-                        if self.holds(local, a, b) {
+                        if self.holds(&mut work, local, a, b)? {
                             found.push(a)?;
                         }
                     }
                 } else {
                     for &p in index.positions(b) {
                         if self.shows(p) {
-                            self.near(p, |y, x| holds(x, y), &mut found)?;
+                            work.cover(index.shape_at(p), index.largest);
+                            self.near(p, |y, x| work.holds(local, x, y), &mut found)?;
                         }
                     }
                 }
@@ -1177,7 +1199,7 @@ impl Scoped<'_> {
                     all.sort_unstable();
                     for &a in all.iter() {
                         for &b in all.iter() {
-                            if self.holds(local, a, b) {
+                            if self.holds(&mut work, local, a, b)? {
                                 pairs.push((a, b))?;
                             }
                         }
@@ -1186,7 +1208,7 @@ impl Scoped<'_> {
                     let total = position(index.geometries.len() + index.features.len());
                     for p in (0..total).filter(|&p| self.shows(p)) {
                         found.clear();
-                        self.near(p, holds, &mut found)?;
+                        self.near(p, |x, y| work.holds(local, x, y), &mut found)?;
                         let a = index.object_at(p);
                         for &b in found.iter() {
                             pairs.push((a, b))?;
@@ -1210,11 +1232,102 @@ impl Scoped<'_> {
     }
 }
 
+/// Room on an evaluation's budget for geo's working memory while it computes relations:
+/// a pair's bound ([`relate_bound`]) is charged before geo computes it, and the room is
+/// kept, grown to the largest pair, while the operation computes relations. The first
+/// side's last shape is remembered with its size (one shape related to many is sized
+/// once), and the last pair's sizes, whose bound is held (points related to one shape are
+/// bounded once). A shape related to an index's shapes is covered once where it can be:
+/// its bound with the index's largest size held, its pairs need no other.
+struct Workspace<'b> {
+    budget: &'b Budget,
+    held: Reservation<&'b Budget>,
+    sized: Option<(*const Shape, Size)>,
+    bounded: Option<(Size, Size)>,
+    covered: Option<*const Shape>,
+}
+
+impl<'b> Workspace<'b> {
+    fn new(budget: &'b Budget) -> Self {
+        Self {
+            budget,
+            held: Reservation::new(budget),
+            sized: None,
+            bounded: None,
+            covered: None,
+        }
+    }
+
+    /// Holds, where the budget has room, what `known` with any shape of an index whose
+    /// shapes are at most `largest` takes: [`Self::holds`] then charges nothing more for
+    /// `known` and such a shape.
+    fn cover(&mut self, known: &Shape, largest: Size) {
+        self.covered = None;
+        if let Some(bound) = sized_bound(&Size::of(&known.geometry), &largest)
+            && (bound <= self.held.bytes() || self.held.resize(bound).is_ok())
+        {
+            self.covered = Some(known);
+        }
+    }
+
+    /// The size of `shape` on the first side.
+    fn size(&mut self, shape: &Shape) -> Size {
+        match self.sized {
+            Some((last, size)) if std::ptr::eq(last, shape) => size,
+            _ => {
+                let size = Size::of(&shape.geometry);
+                self.sized = Some((shape, size));
+                size
+            }
+        }
+    }
+
+    /// Whether `relation` holds between the shapes `x` and `y` (in one reference system),
+    /// refused before geo allocates what the budget has no room for.
+    fn holds(&mut self, local: &str, x: &Shape, y: &Shape) -> Result<bool, BudgetExceeded> {
+        if x.crs != y.crs {
+            return Ok(false);
+        }
+        if self
+            .covered
+            .is_some_and(|known| std::ptr::eq(known, x) || std::ptr::eq(known, y))
+        {
+            return Ok(relation(local, &x.geometry, &y.geometry).unwrap_or(false));
+        }
+        let sizes = (self.size(x), Size::of(&y.geometry));
+        if self.bounded != Some(sizes) {
+            let (sx, sy) = sizes;
+            // Where the sizes decide the bound, the next pair of these sizes has it held.
+            let (bound, bounded) = match sized_bound(&sx, &sy) {
+                Some(bound) => (bound, Some(sizes)),
+                None => (
+                    relate_bound((&x.geometry, &sx), (&y.geometry, &sy), self.budget)?,
+                    None,
+                ),
+            };
+            if bound > self.held.bytes() {
+                self.held.resize(bound)?;
+            }
+            self.bounded = bounded;
+        }
+        Ok(relation(local, &x.geometry, &y.geometry).unwrap_or(false))
+    }
+}
+
 /// One side of a spatial pattern.
 enum Side {
     Constant(Option<u64>),
     Bound(usize),
     Free(Variable),
+}
+
+impl Side {
+    fn free(&self) -> Option<&Variable> {
+        match self {
+            Side::Free(v) => Some(v),
+            _ => None,
+        }
+    }
 }
 
 /// A filter conjunct `geof:relation(?v, constant)` (or the other way round) for a
@@ -1237,14 +1350,29 @@ fn indexed_filter(conjunct: &Expression) -> Option<(&Variable, &Literal, &'stati
 }
 
 /// A table of charged columns, handed on with their charge: what [`Context::consumed`]
-/// releases of it is what they hold ([`IdTable::memory_bytes`]).
-fn charged_table(columns: Vec<Scratch<'_, u64>>) -> IdTable {
-    let column = |c: Scratch<'_, u64>| {
+/// releases of it is what they hold ([`IdTable::memory_bytes`]). Its list of columns is
+/// charged with the result's header ([`charge_header`]).
+fn charged_table<'b>(columns: impl ExactSizeIterator<Item = Scratch<'b, u64>>) -> IdTable {
+    let column = |c: Scratch<'b, u64>| {
         let (items, held) = c.into_parts();
         held.transfer();
         items
     };
-    IdTable::from_columns(columns.into_iter().map(column).collect())
+    IdTable::from_columns(columns.map(column).collect())
+}
+
+/// Charges a result's header before it is allocated: the list of its variables `vars`
+/// and their names, and its table's list of `width` columns, which the table's charge (its
+/// columns' bytes) doesn't count. It stays charged while the evaluation runs.
+fn charge_header<'v>(
+    budget: &Budget,
+    vars: impl IntoIterator<Item = &'v Variable>,
+    width: usize,
+) -> Result<(), BudgetExceeded> {
+    let (count, names) = vars.into_iter().fold((0, 0), |(count, names), v| {
+        (count + 1, names + v.as_str().len())
+    });
+    budget.charge(count * size_of::<Variable>() + names + width * size_of::<Vec<u64>>())
 }
 
 impl Context<'_> {
@@ -1303,18 +1431,19 @@ impl Context<'_> {
                 return Ok(None);
             };
             let literals = self
-                .seed_literals(&index.scoped(&scope), &b, |p| {
+                .seed_literals(&index.scoped(&scope), &b, &shape, |work, p| {
                     let found = index.shape_at(p);
-                    let (x, y) = match constant_first {
-                        true => (&shape, &**found),
-                        false => (&**found, &shape),
-                    };
-                    x.crs == y.crs && relation(local, &x.geometry, &y.geometry).unwrap_or(false)
+                    match constant_first {
+                        true => work.holds(local, &shape, found),
+                        false => work.holds(local, found, &shape),
+                    }
                 })
+                .map_err(QueryEvaluationError::MemoryLimit)?;
+            charge_header(&self.budget, [variable], 1)
                 .map_err(QueryEvaluationError::MemoryLimit)?;
             let seed = Solutions {
                 vars: vec![variable.clone()],
-                table: charged_table(vec![literals]),
+                table: charged_table(std::iter::once(literals)),
                 ordered: false,
             };
             self.check()?;
@@ -1323,15 +1452,16 @@ impl Context<'_> {
         Ok(None)
     }
 
-    /// The literals of `index` whose box meets `b` and whose shape `holds`: the candidates,
-    /// and in parallel chunks for many of them the chunks' results, charged to the
-    /// evaluation's budget before they are allocated. A cancelled query stops at its next
-    /// check.
+    /// The literals of `index` whose box meets `b` and whose shape `holds` (with `known`):
+    /// the candidates, and in parallel chunks for many of them the chunks' results, charged
+    /// to the evaluation's budget before they are allocated. A cancelled query stops at its
+    /// next check.
     fn seed_literals(
         &self,
         index: &Scoped<'_>,
         b: &Bbox,
-        holds: impl Fn(u64) -> bool + Sync,
+        known: &Shape,
+        holds: impl Fn(&mut Workspace<'_>, u64) -> Result<bool, BudgetExceeded> + Sync,
     ) -> Result<Scratch<'_, u64>, BudgetExceeded> {
         let budget: &Budget = &self.budget;
         let mut found: Scratch<'_, (u64, u64)> = ChargedVec::new(budget);
@@ -1344,8 +1474,10 @@ impl Context<'_> {
         refused?;
         let keep = |chunk: &[(u64, u64)]| -> Result<Scratch<'_, u64>, BudgetExceeded> {
             let mut kept = ChargedVec::with_capacity(budget, chunk.len())?;
+            let mut work = Workspace::new(budget);
+            work.cover(known, index.index.largest);
             for &(literal, p) in chunk {
-                if holds(p) {
+                if holds(&mut work, p)? {
                     kept.push(literal)?;
                 }
             }
@@ -1424,9 +1556,19 @@ impl Context<'_> {
             return Ok(index);
         }
         // Built without the lock: no other query waits for this one's build. Builds that
-        // race are each charged to their own request.
+        // race are each charged to their own request. The part's own allocation and the
+        // index's are charged to the part before they are made (the first through the
+        // request, until the part exists to hold it).
+        let shared = |size: usize| 2 * size_of::<usize>() + size;
+        let part = shared(size_of::<Budget>());
+        self.memory.charge(part)?;
         let budget = Arc::new(self.memory.part());
-        let index = Arc::new(SpatialIndex::build(&self.snapshot, model, &budget)?);
+        let charged = budget.charge(part);
+        self.memory.release(part);
+        charged?;
+        let mut index = SpatialIndex::build(&self.snapshot, model, &budget)?;
+        index._held.charge(shared(size_of::<SpatialIndex>()))?;
+        let index = Arc::new(index);
         let mut cache = lock();
         if let Some(built) = cached(&cache) {
             return Ok(built);
@@ -1471,28 +1613,40 @@ impl Context<'_> {
             .spatial_index()
             .map_err(QueryEvaluationError::MemoryLimit)?;
         let index = index.scoped(&scope);
+        let budget: &Budget = &self.budget;
+        let memory = QueryEvaluationError::MemoryLimit;
+        // What joining holds besides its columns, charged before it is allocated: a free
+        // side's variable (a blank node's named for it), and a row's line and the list of
+        // the columns, at most two wider than the rows joined.
+        let named = |term: &TermPattern| match term {
+            TermPattern::Variable(v) => size_of::<Variable>() + v.as_str().len(),
+            TermPattern::BlankNode(b) => size_of::<Variable>() + "_bnode_".len() + b.as_str().len(),
+            _ => 0,
+        };
+        let most = solutions.vars.len() + 2;
+        let mut working = Reservation::new(budget);
+        let lists = most * (size_of::<u64>() + size_of::<Scratch<'_, u64>>());
+        working
+            .charge(named(&triple.subject) + named(&triple.object) + lists)
+            .map_err(memory)?;
         let (s, o) = (
             self.side(&triple.subject, &solutions),
             self.side(&triple.object, &solutions),
         );
-        let mut vars = solutions.vars.clone();
-        let mut added = Vec::new();
-        for side in [&s, &o] {
-            if let Side::Free(v) = side
-                && !added.contains(v)
-            {
-                added.push(v.clone());
-                vars.push(v.clone());
-            }
-        }
-        let same = matches!((&s, &o), (Side::Free(a), Side::Free(b)) if a == b);
-        let budget: &Budget = &self.budget;
-        let memory = QueryEvaluationError::MemoryLimit;
-        let mut columns: Vec<Scratch<'_, u64>> =
-            (0..vars.len()).map(|_| ChargedVec::new(budget)).collect();
-        let mut rows = 0;
-        let mut line = vec![UNDEF; vars.len()];
+        // The free sides' variables, each once: the columns after the rows'.
+        let added = [s.free(), o.free().filter(|&v| s.free() != Some(v))];
         let width = solutions.vars.len();
+        let joined = width + added.iter().flatten().count();
+        let header = solutions.vars.iter().chain(added.iter().flatten().copied());
+        charge_header(budget, header, joined).map_err(memory)?;
+        let mut vars = Vec::with_capacity(joined);
+        vars.extend(solutions.vars.iter().cloned());
+        vars.extend(added.iter().flatten().map(|&v| v.clone()));
+        let same = matches!((&s, &o), (Side::Free(a), Side::Free(b)) if a == b);
+        let mut columns: Vec<Scratch<'_, u64>> = Vec::with_capacity(joined);
+        columns.extend((0..joined).map(|_| ChargedVec::new(budget)));
+        let mut rows = 0;
+        let mut line = vec![UNDEF; joined];
         // A value of a side in a row: a constant, the row's binding (unbound: any object).
         let value = |side: &Side, row: usize| -> Option<Option<u64>> {
             match side {
@@ -1524,8 +1678,8 @@ impl Context<'_> {
                 }
                 line[..width].copy_from_slice(&solutions.table.row(row));
                 let mut bound_free = |side: &Side, value: u64| {
-                    if let Side::Free(v) = side
-                        && let Some(position) = added.iter().position(|x| x == v)
+                    if let Some(v) = side.free()
+                        && let Some(position) = added.iter().flatten().position(|&x| x == v)
                     {
                         line[width + position] = value;
                     }
@@ -1545,13 +1699,15 @@ impl Context<'_> {
                 rows += 1;
             }
         }
+        drop((s, o, line));
         self.consumed(solutions);
         self.check()?;
-        let table = match vars.is_empty() {
+        let table = match joined {
             // No column: only the count of rows, which holds no memory.
-            true => IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
-            false => charged_table(columns),
+            0 => IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
+            _ => charged_table(columns.into_iter()),
         };
+        drop(working);
         Ok(Solutions {
             vars,
             table,
@@ -1802,18 +1958,23 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    /// The guard of the spatial path's memory: a cold build, a filter's seed and a
-    /// relation pattern, over sizes from a handful of shapes to 17,000 (Sol's), in one
-    /// graph and in several, with WKT, GeoJSON and GML literals, their keys plain and
-    /// compressed (a reopened checkpoint's); and Sol's literal and filter constant of
-    /// 10,000 points under budgets too small for them. None holds live (counted on every
-    /// thread by this test binary's allocator, at every allocation) more than its request
-    /// was charged since it started and others' working memory, measured here: the
-    /// engine's for a scan and a lookup, and geo's for a relation on each of the two
-    /// threads computing them. An allocation that wasn't reserved first fails here.
+    /// The guard of the spatial path's memory: a filter's seed and a relation pattern over
+    /// a cold index and a warm one, over sizes from a handful of shapes to 17,000 (Sol's),
+    /// in one graph and in several, with WKT, GeoJSON and GML literals, their keys plain and
+    /// compressed (a reopened checkpoint's); Sol's literal and filter constant of 10,000
+    /// points; and Sol's relation between two lines of 10,000 points under 256 bytes. None
+    /// holds (counted on every thread by this test binary's allocator, at every allocation
+    /// and release) a byte more than its request was charged since it started: geo's
+    /// working memory for a relation is charged before geo computes it. A build alone
+    /// holds the engine's scan cursor besides ([`ENGINE_SCAN`]).
     #[test]
     fn the_spatial_path_holds_no_more_than_it_charges() {
-        use nrese_exec::measure::{alone, measure, measure_within};
+        use nrese_exec::measure::{alone, measure_within};
+        /// The engine's working memory for a scan (a block of 128 keys per run, the
+        /// cursors' list), which no engine read charges yet: at most this over the stores
+        /// here (three runs), measured. Pending the decision on the engine's sites: a named
+        /// exemption bounded so, or a charge at its owner.
+        const ENGINE_SCAN: usize = 12_544;
         if !alone() {
             return;
         }
@@ -1847,38 +2008,26 @@ mod tests {
             0 => GraphName::DefaultGraph,
             g => GraphName::NamedNode(NamedNode::new_unchecked(format!("urn:graph{g}"))),
         };
+        // ?x sfIntersects ?y, with ?y bound to urn:g0 by the rows it joins.
         let relation = TriplePattern {
             subject: TermPattern::Variable(Variable::new_unchecked("x")),
             predicate: NamedNodePattern::NamedNode(node(format!("{GEO}sfIntersects"))),
-            object: TermPattern::NamedNode(node("urn:g0".to_owned())),
+            object: TermPattern::Variable(Variable::new_unchecked("y")),
         };
-        let wkt = format!("{GEO}wktLiteral");
-        // The engine's working memory: its largest lookup and scan of the build's.
-        let engine = |snapshot: &Snapshot| {
-            let names = SERIALISATIONS
-                .iter()
-                .chain(&["hasGeometry", "hasDefaultGeometry"]);
-            let names = names
-                .map(|local| format!("{GEO}{local}"))
-                .chain(["urn:g0".to_owned()]);
-            let mut most = 0;
-            for name in names {
-                let (id, lookup) =
-                    measure(|| snapshot.lookup(NamedNodeRef::new_unchecked(&name).into()));
-                let pattern = QuadPattern {
-                    subject: None,
-                    predicate: id,
-                    object: None,
-                    graph: GraphSelector::Any,
-                };
-                let scan = || {
-                    snapshot
-                        .quads_for_pattern_in(ReadModel::Materialised, &pattern)
-                        .count()
-                };
-                most = most.max(lookup + id.map_or(0, |_| measure(scan).1));
-            }
-            most
+        let g0 = |snapshot: &Snapshot| {
+            let g0 = snapshot.lookup(node("urn:g0".to_owned()).as_ref().into());
+            g0.expect("urn:g0").raw()
+        };
+        // The rows a join reads, made in its measurement and charged as their producer
+        // charges them: their header and their column.
+        let at = |ctx: &Context<'_>, g0: u64| {
+            let header = size_of::<Variable>() + "y".len() + size_of::<Vec<u64>>();
+            ctx.budget.charge(header + size_of::<u64>()).ok()?;
+            Some(Solutions {
+                vars: vec![Variable::new_unchecked("y")],
+                table: IdTable::from_columns(vec![vec![g0]]),
+                ordered: false,
+            })
         };
         let line = |points: usize| {
             let coordinates: Vec<String> = (0..points).map(|i| format!("{i} 0")).collect();
@@ -1903,38 +2052,21 @@ mod tests {
             };
             // Every shape: 17,000 candidates take the parallel chunks.
             let edge = side(n) + 1;
-            let square = format!("POLYGON((-1 -1, {edge} -1, {edge} {edge}, -1 {edge}, -1 -1))");
-            // geo's working memory: its largest relation the seed and the pattern compute.
-            let shape = |i: usize| {
-                let (_, datatype, text) = literal(n, i);
-                parse_literal(&text, &format!("{GEO}{datatype}")).unwrap()
-            };
-            let (within_square, meeting) = (parse_literal(&square, &wkt).unwrap(), shape(0));
-            let geo = (0..n)
-                .map(|i| {
-                    let y = shape(i);
-                    let a = measure(|| {
-                        super::relation("sfWithin", &y.geometry, &within_square.geometry)
-                    });
-                    let b =
-                        measure(|| super::relation("sfIntersects", &y.geometry, &meeting.geometry));
-                    a.1.max(b.1)
-                })
-                .max()
-                .unwrap_or(0);
-            let others = engine(&snapshot) + 2 * geo;
-            let filter = within(square);
+            let filter = within(format!(
+                "POLYGON((-1 -1, {edge} -1, {edge} {edge}, -1 {edge}, -1 -1))"
+            ));
             let pattern = as_wkt();
-            let path = |ctx: &Context<'_>| {
+            let path = |ctx: &Context<'_>, g0: u64| {
                 let (seed, _) = ctx
                     .spatial_seed(&[&filter], std::slice::from_ref(&pattern))
                     .ok()
                     .flatten()
                     .expect("a seed");
+                // Each table freed, then its charge released.
                 let rows = seed.table.len();
                 ctx.consumed(seed);
                 let joined = ctx
-                    .spatial_join(Solutions::unit(), &relation)
+                    .spatial_join(at(ctx, g0).expect("room"), &relation)
                     .ok()
                     .expect("the relation's rows");
                 let rows = rows + joined.table.len();
@@ -1952,13 +2084,13 @@ mod tests {
                 options.resources.memory = envelope.clone();
                 let (rows, excess) = pool.install(|| {
                     let ctx = Context::new(&snapshot, &options, None, None);
-                    measure_within(&envelope, || path(&ctx))
+                    let g0 = g0(&snapshot);
+                    measure_within(&envelope, || path(&ctx, g0))
                 });
                 assert!(rows > n, "{n} in {graphs}");
-                if excess > others {
-                    failures.push(format!(
-                        "{n} shapes in {graphs} graphs, {phase}: {excess} > {others}"
-                    ));
+                let engine = if phase == "cold" { ENGINE_SCAN } else { 0 };
+                if excess > engine {
+                    failures.push(format!("{n} shapes in {graphs} graphs, {phase}: {excess}"));
                 }
             }
         }
@@ -1972,17 +2104,64 @@ mod tests {
                     (Some(dir), snapshot)
                 }
             };
-            let others = engine(&snapshot);
             let budget = Arc::new(Budget::unlimited());
             let (built, excess) = measure_within(&budget, || {
                 SpatialIndex::build(&snapshot, ReadModel::Materialised, &budget).is_ok()
             });
             assert!(built);
-            if excess > others {
+            if excess > ENGINE_SCAN {
                 failures.push(format!(
-                    "a literal of 10,000 points, compressed {compressed}: {excess} > {others}"
+                    "a literal of 10,000 points, compressed {compressed}: {excess}"
                 ));
             }
+        }
+        // A point related to rings of 1,000 vertices: covered by the index's largest shape.
+        let ring = |r: usize| {
+            let points: Vec<String> = (0..=1_000)
+                .map(|k| {
+                    let t = (k % 1_000) as f64 / 1_000.0 * std::f64::consts::TAU;
+                    format!("{} {}", r as f64 * t.cos(), r as f64 * t.sin())
+                })
+                .collect();
+            format!("POLYGON(({}))", points.join(","))
+        };
+        let snapshot = snapshot_with(&vec![GraphName::DefaultGraph; 4], |i| match i {
+            0 => ("asWKT", "wktLiteral", "POINT(0 0)".to_owned()),
+            i => ("asWKT", "wktLiteral", ring(10 * i)),
+        });
+        let warm = Context::new(&snapshot, &QueryOptions::default(), None, None);
+        assert!(warm.spatial_index().is_ok());
+        let envelope = Envelope::unlimited();
+        let mut options = QueryOptions::default();
+        options.resources.memory = envelope.clone();
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let point = g0(&snapshot);
+        let (related, excess) = measure_within(&envelope, || {
+            let rows = at(&ctx, point).expect("room");
+            ctx.spatial_join(rows, &relation)
+                .map_or(0, |s| s.table.len())
+        });
+        if related == 0 || excess > 0 {
+            failures.push(format!("a point among rings: {related} rows, {excess}"));
+        }
+        // Sol's relation between two equal lines of 10,000 points, under 256 bytes.
+        let snapshot = snapshot_with(&vec![GraphName::DefaultGraph; 2], |_| {
+            ("asWKT", "wktLiteral", line(10_000))
+        });
+        let warm = Context::new(&snapshot, &QueryOptions::default(), None, None);
+        assert!(warm.spatial_index().is_ok());
+        let envelope = Envelope::new(Some(256), None);
+        let mut options = QueryOptions::default();
+        options.resources.memory = envelope.clone();
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let g0 = g0(&snapshot);
+        let (related, excess) = measure_within(&envelope, || {
+            at(&ctx, g0).is_some_and(|rows| ctx.spatial_join(rows, &relation).is_ok())
+        });
+        if related || excess > 0 {
+            failures.push(format!(
+                "lines of 10,000 points: related {related}, {excess}"
+            ));
         }
         // And a filter constant of 10,000 points over a warm index, under 16 bytes.
         let snapshot = snapshot_of(&vec![GraphName::DefaultGraph; 7]);
@@ -1999,18 +2178,24 @@ mod tests {
         });
         if seeded || excess > 0 {
             failures.push(format!(
-                "a filter constant of 10,000 points: seeded {seeded}, {excess} > 0"
+                "a filter constant of 10,000 points: seeded {seeded}, {excess}"
             ));
         }
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
-    /// Sol's (round 2): a seed from a warm index under a 16-byte envelope is refused before
-    /// its candidates are allocated, and leaves nothing charged.
+    /// Sol's (round 2): a seed from a warm index under a 64 KiB envelope, room for its
+    /// constant but not for its 17,000 candidates, is refused as its candidates grow past
+    /// it, before they are allocated (it holds nothing uncharged), and leaves nothing
+    /// charged.
     #[test]
     fn a_warm_seed_is_charged_before_it_allocates() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
         let snapshot = snapshot_of(&vec![GraphName::DefaultGraph; 17_000]);
-        let filter = within("POLYGON((-1 -1, 20000 -1, 20000 20000, -1 20000, -1 -1))".to_owned());
+        let square = "POLYGON((-1 -1, 20000 -1, 20000 20000, -1 20000, -1 -1))";
+        let filter = within(square.to_owned());
         let pattern = as_wkt();
         let warm = Context::new(&snapshot, &QueryOptions::default(), None, None);
         let (seed, _) = warm
@@ -2019,15 +2204,21 @@ mod tests {
             .flatten()
             .expect("a seed");
         assert_eq!(seed.table.len(), 17_000);
-        let envelope = Envelope::new(Some(16), None);
+        let limit = 64 << 10;
+        let envelope = Envelope::new(Some(limit), None);
         let mut options = QueryOptions::default();
         options.resources.memory = envelope.clone();
         let cold = Context::new(&snapshot, &options, None, None);
-        assert!(
+        let (seeded, excess) = nrese_exec::measure::measure_within(&envelope, || {
             cold.spatial_seed(&[&filter], std::slice::from_ref(&pattern))
-                .is_err()
+                .is_ok()
+        });
+        assert!(
+            !seeded && excess == 0,
+            "seeded {seeded}, {excess} bytes uncharged"
         );
         assert_eq!(envelope.used(), 0);
-        assert!(envelope.peak() <= 16);
+        // Past the constant's charge: the candidates were charged as they grew.
+        assert!(envelope.peak() > shape_bound(square.len()) && envelope.peak() <= limit);
     }
 }
