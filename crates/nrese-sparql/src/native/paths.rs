@@ -118,6 +118,8 @@ pub(crate) struct PathEvaluator<'a> {
     /// Closures computed per strongly connected component so far (an open `p+` or `p*`,
     /// or its size for `COUNT`), for EXPLAIN.
     pub(crate) closures: std::cell::Cell<usize>,
+    /// The query's budget, the closures' tables are charged to.
+    pub(crate) budget: &'a std::sync::Arc<nrese_exec::Budget>,
 }
 
 impl PathEvaluator<'_> {
@@ -487,8 +489,12 @@ impl PathEvaluator<'_> {
 
     /// The `(start, end)` pairs of [`Self::open`] whose start is one of `starts` (distinct
     /// values).
-    pub(crate) fn reached_from(&self, path: &Path, starts: &[u64]) -> Vec<(u64, u64)> {
-        match path {
+    pub(crate) fn reached_from(
+        &self,
+        path: &Path,
+        starts: &[u64],
+    ) -> Result<Vec<(u64, u64)>, nrese_exec::BudgetExceeded> {
+        Ok(match path {
             Path::OneOrMore(step) | Path::ZeroOrMore(step) if starts.len() > PROBED_VALUES => {
                 let reflexive = matches!(path, Path::ZeroOrMore(_));
                 let adjacency = Adjacency::new(self.open(step));
@@ -497,7 +503,7 @@ impl PathEvaluator<'_> {
                     .copied()
                     .take_while(|_| !self.stopped())
                     .filter(|&node| !reflexive || self.is_node(node));
-                pairs_of(closure(&adjacency, starts, reflexive))
+                pairs_of(closure(&adjacency, starts, reflexive, self.budget)?)
             }
             _ => starts
                 .iter()
@@ -508,13 +514,17 @@ impl PathEvaluator<'_> {
                         .map(move |end| (start, end))
                 })
                 .collect(),
-        }
+        })
     }
 
     /// The `(start, end)` pairs of [`Self::open`] whose end is one of `ends` (distinct
     /// values).
-    pub(crate) fn reaching(&self, path: &Path, ends: &[u64]) -> Vec<(u64, u64)> {
-        match path {
+    pub(crate) fn reaching(
+        &self,
+        path: &Path,
+        ends: &[u64],
+    ) -> Result<Vec<(u64, u64)>, nrese_exec::BudgetExceeded> {
+        Ok(match path {
             Path::OneOrMore(step) | Path::ZeroOrMore(step) if ends.len() > PROBED_VALUES => {
                 let reflexive = matches!(path, Path::ZeroOrMore(_));
                 let backwards =
@@ -524,7 +534,7 @@ impl PathEvaluator<'_> {
                     .copied()
                     .take_while(|_| !self.stopped())
                     .filter(|&node| !reflexive || self.is_node(node));
-                pairs_of(closure(&backwards, ends, reflexive))
+                pairs_of(closure(&backwards, ends, reflexive, self.budget)?)
                     .into_iter()
                     .map(|(end, start)| (start, end))
                     .collect()
@@ -538,7 +548,7 @@ impl PathEvaluator<'_> {
                         .map(move |start| (start, end))
                 })
                 .collect(),
-        }
+        })
     }
 
     /// Every `(start, end)` pair.
@@ -663,6 +673,7 @@ mod tests {
             &snapshot,
         );
         let token = crate::CancellationToken::new();
+        let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
         let evaluator = PathEvaluator {
             snapshot: &snapshot,
             model: ReadModel::default(),
@@ -670,6 +681,7 @@ mod tests {
             fixed: None,
             cancellation: Some(&token),
             closures: Default::default(),
+            budget: &budget,
         };
         let first = snapshot.lookup(node(0).as_ref().into()).unwrap().raw();
         let last = snapshot.lookup(node(50).as_ref().into()).unwrap().raw();

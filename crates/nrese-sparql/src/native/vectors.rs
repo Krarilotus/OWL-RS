@@ -289,7 +289,7 @@ impl Context<'_> {
                     return Ok(None);
                 }
                 let mut table = IdTable::new(1);
-                table.push_row(&[id.raw()]);
+                table.push_row(&[id.raw()], &self.budget)?;
                 let seed = self.produced(Solutions {
                     vars: vec![search.matched.clone()],
                     table,
@@ -476,7 +476,7 @@ impl Rows {
             if self.near_column {
                 row.push(near_id.unwrap_or(UNDEF));
             }
-            self.table.push_row(&row);
+            self.table.push_row(&row, &context.budget)?;
         }
         Ok(())
     }
@@ -534,7 +534,7 @@ mod tests {
     fn payload(ctx: &Context<'_>, id: u64) -> Solutions {
         ctx.produced(Solutions {
             vars: vec![Variable::new_unchecked("v")],
-            table: IdTable::from_rows(1, [&[id][..]]),
+            table: IdTable::from_rows(1, [&[id][..]], &ctx.budget).unwrap(),
             ordered: false,
         })
         .map_err(QueryEvaluationError::from)
@@ -840,11 +840,10 @@ mod tests {
             Err(QueryEvaluationError::MemoryLimit(error)) => error,
             _ => panic!("fourth winner's union must exceed the remaining budget"),
         };
-        // The tables' charges include their vectors of columns (24 bytes a column).
-        assert_eq!(
-            (error.used, error.requested),
-            (UNRELATED + 2048 + 96, 6144 + 48)
-        );
+        // The union widens both sides into tables charged before they are written, then
+        // appends one to the other: the refusal is the append's growth (the tables' charges
+        // include their vectors of columns, 24 bytes a column).
+        assert_eq!((error.used, error.requested), (UNRELATED + 7592, 1072));
         assert_eq!(
             ctx.budget.used(),
             UNRELATED,

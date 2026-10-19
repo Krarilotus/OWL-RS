@@ -56,6 +56,12 @@ pub use join::RowLimit;
 pub use region::{BoundTooLarge, Pages, Region, Settled};
 pub use table::{Columns, IdTable};
 
+/// A fresh unlimited budget for unit tests' tables.
+#[cfg(test)]
+pub(crate) fn test_budget() -> std::sync::Arc<Budget> {
+    std::sync::Arc::new(Budget::unlimited())
+}
+
 /// A hash map keyed by term ids, with the fast hasher the operators use.
 pub type IdMap<V> = hashbrown::HashMap<u64, V, foldhash::fast::FixedState>;
 

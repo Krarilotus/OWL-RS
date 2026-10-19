@@ -616,12 +616,15 @@ impl Context<'_> {
         for r in 0..solutions.table.len() {
             let key: Vec<u64> = keys.iter().map(|&c| solutions.table.get(r, c)).collect();
             let next = index.len() as u64;
-            let id = *index.entry(key).or_insert_with_key(|key| {
-                row[..keys.len()].copy_from_slice(key);
-                row[keys.len()] = next;
-                distinct.push_row(&row);
-                next
-            });
+            let id = match index.entry(key) {
+                std::collections::hash_map::Entry::Occupied(found) => *found.get(),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    row[..keys.len()].copy_from_slice(slot.key());
+                    row[keys.len()] = next;
+                    distinct.push_row(&row, &self.budget)?;
+                    *slot.insert(next)
+                }
+            };
             key_of_row.push(id);
         }
         let key_variable = self.synthetic("exists key");
@@ -697,27 +700,29 @@ impl Context<'_> {
         let mut out = IdTable::new(width - 1);
         let mut line = vec![UNDEF; width - 1];
         let mut next = 0;
-        let mut unmatched_before = |upto: usize, out: &mut IdTable, line: &mut [u64]| {
-            while next < upto {
-                if !matched[next] {
-                    line.fill(UNDEF);
-                    for (c, value) in line.iter_mut().enumerate().take(row_column) {
-                        *value = numbered.table.get(next, c);
+        let mut unmatched_before =
+            |upto: usize, out: &mut IdTable, line: &mut [u64]| -> NativeResult<()> {
+                while next < upto {
+                    if !matched[next] {
+                        line.fill(UNDEF);
+                        for (c, value) in line.iter_mut().enumerate().take(row_column) {
+                            *value = numbered.table.get(next, c);
+                        }
+                        out.push_row(line, &self.budget)?;
                     }
-                    out.push_row(line);
+                    next += 1;
                 }
-                next += 1;
-            }
-        };
+                Ok(())
+            };
         for p in 0..pairs.table.len() {
-            unmatched_before(pairs.table.get(p, row_column) as usize, &mut out, &mut line);
+            unmatched_before(pairs.table.get(p, row_column) as usize, &mut out, &mut line)?;
             for (c, value) in line.iter_mut().enumerate() {
                 let source = if c < row_column { c } else { c + 1 };
                 *value = pairs.table.get(p, source);
             }
-            out.push_row(&line);
+            out.push_row(&line, &self.budget)?;
         }
-        unmatched_before(rows, &mut out, &mut line);
+        unmatched_before(rows, &mut out, &mut line)?;
         let vars: Vec<Variable> = pairs.vars[..width]
             .iter()
             .filter(|v| **v != row_variable)

@@ -72,7 +72,7 @@ impl Context<'_> {
             };
             let mut subset = IdTable::new(bound.table.width());
             for &row in &rows {
-                subset.push_row(&bound.table.row(row));
+                subset.push_row(&bound.table.row(row), &self.budget)?;
             }
             let subset = Solutions {
                 vars: bound.vars.clone(),
@@ -90,7 +90,7 @@ impl Context<'_> {
                 let mut line = vec![id; vars.len()];
                 for row in 0..found.table.len() {
                     line[..found.vars.len()].copy_from_slice(&found.table.row(row));
-                    table.push_row(&line);
+                    table.push_row(&line, &self.budget)?;
                 }
                 Solutions {
                     vars,
@@ -171,8 +171,8 @@ impl Context<'_> {
                 .map_err(QueryEvaluationError::Service)?;
             // The endpoint's terms as canonical answers name them.
             let table = match &self.canonical {
-                None => import(&results, |term| self.id(term))?,
-                Some(names) => import(&results, |term| {
+                None => import(&results, &self.budget, |term| self.id(term))?,
+                Some(names) => import(&results, &self.budget, |term| {
                     names
                         .id(term)
                         .map_or_else(|| self.id(&names.term(term.clone())), Ok)
@@ -195,6 +195,7 @@ impl Context<'_> {
 /// The endpoint's rows as an id table, each term's id by `id`.
 fn import(
     results: &crate::ServiceResults,
+    budget: &std::sync::Arc<nrese_exec::Budget>,
     id: impl Fn(&Term) -> NativeResult<u64>,
 ) -> NativeResult<IdTable> {
     let mut table = IdTable::new(results.variables.len());
@@ -206,7 +207,7 @@ fn import(
                 None => UNDEF,
             };
         }
-        table.push_row(&row);
+        table.push_row(&row, budget)?;
     }
     Ok(table)
 }

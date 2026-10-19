@@ -302,7 +302,8 @@ impl Context<'_> {
             let index = self.spatial_index();
             let mut table = IdTable::new(1);
             for entry in index.literals.locate_in_envelope_intersecting(&b) {
-                table.push_row(&[entry.data]);
+                // Refused: no seed, the joins run unseeded.
+                table.push_row(&[entry.data], &self.budget).ok()?;
             }
             return Some(Solutions {
                 vars: vec![variable],
@@ -462,7 +463,7 @@ impl Context<'_> {
                 if let Side::Bound(c) = o {
                     line[c] = b;
                 }
-                table.push_row(&line);
+                table.push_row(&line, &self.budget)?;
             }
         }
         self.consumed(solutions);

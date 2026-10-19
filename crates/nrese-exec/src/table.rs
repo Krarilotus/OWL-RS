@@ -97,14 +97,10 @@ impl Clone for IdTable {
 }
 
 impl IdTable {
-    /// An empty table with `width` columns. It holds no memory and no charge.
+    /// An empty table with `width` columns. It holds no charge, and no memory but the vector
+    /// of its (empty) columns, charged with them when they first grow.
     pub fn new(width: usize) -> Self {
-        Self::with_capacity(width, 0)
-    }
-
-    pub fn with_capacity(width: usize, rows: usize) -> Self {
-        let columns = (0..width).map(|_| Vec::with_capacity(rows)).collect();
-        Self::uncharged(columns, 0, Vec::new())
+        Self::uncharged((0..width).map(|_| Vec::new()).collect(), 0, Vec::new())
     }
 
     fn uncharged(columns: Vec<Vec<u64>>, len: usize, sorted_by: Vec<usize>) -> Self {
@@ -385,17 +381,33 @@ impl IdTable {
     }
 
     /// A table with one row per entry of `rows`, each `width` wide.
-    pub fn from_rows<'a>(width: usize, rows: impl IntoIterator<Item = &'a [u64]>) -> Self {
+    /// A table of `rows` rows without columns: it holds no memory (the executor's tables of
+    /// a pattern without variables, or of a projection to none).
+    pub fn rows_only(rows: usize) -> Self {
+        Self::uncharged(Vec::new(), rows, Vec::new())
+    }
+
+    /// A table with one row per entry of `rows`, each `width` wide, charged to `budget` as it
+    /// grows ([`Self::push_row`]).
+    pub fn from_rows<'a>(
+        width: usize,
+        rows: impl IntoIterator<Item = &'a [u64]>,
+        budget: &Arc<Budget>,
+    ) -> Result<Self, BudgetExceeded> {
         // Rows without columns: only their number (the executor's tables of a pattern
         // without variables, or of a projection to none).
         if width == 0 {
-            return Self::uncharged(Vec::new(), rows.into_iter().count(), Vec::new());
+            return Ok(Self::uncharged(
+                Vec::new(),
+                rows.into_iter().count(),
+                Vec::new(),
+            ));
         }
         let mut table = Self::new(width);
         for row in rows {
-            table.push_row(row);
+            table.push_row(row, budget)?;
         }
-        table
+        Ok(table)
     }
 
     pub fn width(&self) -> usize {
@@ -443,61 +455,65 @@ impl IdTable {
         (0..self.len).map(|row| self.row(row))
     }
 
+    /// Appends `row`, room for it charged to the table's budget (`budget` for a table that
+    /// holds no charge yet) first where none is left ([`Self::reserve_rows`]). Fails
+    /// without changing the table.
     #[inline]
-    pub fn push_row(&mut self, row: &[u64]) {
-        debug_assert_eq!(row.len(), self.width(), "row width");
-        for (column, &value) in self.columns.iter_mut().zip(row) {
-            column.push(value);
+    pub fn push_row(&mut self, row: &[u64], budget: &Arc<Budget>) -> Result<(), BudgetExceeded> {
+        if self.len == self.room {
+            self.reserve_rows(1, budget)?;
         }
-        self.len += 1;
-        self.sorted_by.clear();
+        self.push_reserved(row);
+        Ok(())
     }
 
-    /// Adds a column, one value per row.
-    pub fn push_column(&mut self, column: Vec<u64>) {
+    /// Adds a column of `values`, one per row (at most the rows are taken), charged first:
+    /// the column, with room for as many rows as the others, and the vector of columns
+    /// where it grows (whole: [`Self::settle`] then releases the old one's charge).
+    pub fn push_column(
+        &mut self,
+        values: impl IntoIterator<Item = u64>,
+        budget: &Arc<Budget>,
+    ) -> Result<(), BudgetExceeded> {
+        // As many rows as the other columns have room for (the rows, for a table without
+        // columns), so that the room stays what it is.
+        let rows = match self.columns.is_empty() {
+            true => self.len,
+            false => self.room,
+        };
+        let grows = self.columns.len() == self.columns.capacity();
+        let header = match grows {
+            true => (self.columns.capacity() * 2).max(4) * size_of::<Vec<u64>>(),
+            false => 0,
+        };
+        let bytes = Self::bytes(1, rows)
+            .and_then(|column| column.checked_add(header))
+            .ok_or_else(|| budget.refusal(usize::MAX))?;
+        self.charge_ahead(bytes, budget)?;
+        let mut column = Vec::with_capacity(rows);
+        column.extend(values.into_iter().take(self.len));
         assert_eq!(column.len(), self.len, "push_column: rows differ");
         self.columns.push(column);
+        Ok(())
     }
 
-    /// The rows that fit before the table reallocates.
-    pub fn spare_rows(&self) -> usize {
-        self.columns
-            .iter()
-            .map(|c| c.capacity() - c.len())
-            .min()
-            .unwrap_or(usize::MAX)
-    }
-
-    /// Room for `rows` more rows, allocated exactly.
-    pub fn reserve_exact(&mut self, rows: usize) {
-        for column in &mut self.columns {
-            column.reserve_exact(rows);
-        }
-    }
-
-    /// Appends all rows of `other`, which must have the same width. Sortedness is lost.
-    pub fn append(&mut self, other: &IdTable) {
+    /// Appends all rows of `other`, which must have the same width, room for them charged
+    /// first ([`Self::reserve_rows`]). Sortedness is lost. Fails without changing the table.
+    pub fn append(&mut self, other: &IdTable, budget: &Arc<Budget>) -> Result<(), BudgetExceeded> {
         assert_eq!(self.width(), other.width(), "append: widths differ");
+        self.reserve_rows(other.len, budget)?;
+        self.extend_within(other);
+        Ok(())
+    }
+
+    /// Appends all rows of `other` into the room reserved for them.
+    fn extend_within(&mut self, other: &IdTable) {
+        debug_assert!(other.len <= self.room_left(), "past the rows reserved");
         for (column, extra) in self.columns.iter_mut().zip(&other.columns) {
             column.extend_from_slice(extra);
         }
         self.len += other.len;
         self.sorted_by.clear();
-    }
-
-    /// The rows of `parts` in order, in one table `width` wide (for parallel operators that
-    /// produce one part per chunk of their input).
-    pub fn concat(width: usize, parts: Vec<IdTable>) -> IdTable {
-        let mut parts = parts.into_iter();
-        let Some(mut out) = parts.next() else {
-            return IdTable::new(width);
-        };
-        let rest: Vec<IdTable> = parts.collect();
-        let extra: usize = rest.iter().map(IdTable::len).sum();
-        for column in &mut out.columns {
-            column.reserve_exact(extra);
-        }
-        out.append_parts(rest)
     }
 
     /// `rest` appended to `self`, which has room for them, each freed once copied.
@@ -525,22 +541,10 @@ impl IdTable {
                     sorted.clear();
                 }
             }
-            out.append(&part);
+            out.extend_within(&part);
         }
         out.sorted_by = sorted;
         out
-    }
-
-    /// The bytes [`Self::concat`] of `parts` allocates beyond them: each column of the first
-    /// part without room for every row, reallocated to hold them all.
-    pub fn concat_growth<'a>(parts: impl IntoIterator<Item = &'a IdTable>) -> usize {
-        let mut parts = parts.into_iter();
-        let Some(first) = parts.next() else {
-            return 0;
-        };
-        let rows = first.len + parts.map(IdTable::len).sum::<usize>();
-        let short = first.columns.iter().filter(|c| c.capacity() < rows).count();
-        short.saturating_mul(rows).saturating_mul(8)
     }
 
     /// Bytes held by the column buffers (by capacity), and by the vector of them once the
@@ -822,7 +826,12 @@ mod tests {
     }
 
     fn table(rows: &[&[u64]]) -> IdTable {
-        IdTable::from_rows(rows.first().map_or(0, |r| r.len()), rows.iter().copied())
+        IdTable::from_rows(
+            rows.first().map_or(0, |r| r.len()),
+            rows.iter().copied(),
+            &crate::test_budget(),
+        )
+        .unwrap()
     }
 
     /// Concatenated parts keep the sort order they share where each starts at or after the
@@ -831,16 +840,19 @@ mod tests {
     fn concatenation_keeps_a_shared_order_across_ordered_parts() {
         let a = table(&[&[1, 9], &[2, 8]]).assume_sorted_by(vec![0, 1]);
         let b = table(&[&[2, 9], &[3, 1]]).assume_sorted_by(vec![0]);
-        let joined = IdTable::concat(2, vec![a.clone(), b.clone()]);
+        let concat = |parts: &mut [IdTable]| {
+            IdTable::concat_charged(2, parts, &crate::test_budget()).unwrap()
+        };
+        let joined = concat(&mut [a.clone(), b.clone()]);
         assert_eq!(joined.sorted_by(), [0]);
         assert_eq!(joined.len(), 4);
         // Out of order at the boundary: no order.
-        let joined = IdTable::concat(2, vec![b, a]);
+        let joined = concat(&mut [b, a]);
         assert!(joined.sorted_by().is_empty());
         // An empty part in between changes nothing.
         let c = table(&[&[1, 1]]).assume_sorted_by(vec![0]);
         let d = table(&[&[5, 0]]).assume_sorted_by(vec![0]);
-        let joined = IdTable::concat(2, vec![c, IdTable::new(2).assume_sorted_by(vec![0]), d]);
+        let joined = concat(&mut [c, IdTable::new(2).assume_sorted_by(vec![0]), d]);
         assert_eq!(joined.sorted_by(), [0]);
     }
 
@@ -868,7 +880,8 @@ mod tests {
                 vec![(state >> 40) % 1000, state >> 20 & 0xffff]
             })
             .collect();
-        let mut t = IdTable::from_rows(2, rows.iter().map(Vec::as_slice));
+        let mut t =
+            IdTable::from_rows(2, rows.iter().map(Vec::as_slice), &crate::test_budget()).unwrap();
         t.sort_by(&[1, 0]);
         let mut expected = rows.clone();
         expected.sort_by_key(|r| (r[1], r[0]));

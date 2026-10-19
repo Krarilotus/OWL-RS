@@ -127,7 +127,7 @@ impl Context<'_> {
             let table = if kept.is_empty() {
                 drop(solutions);
                 // No column left: one row if there was any.
-                IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows.min(1)))
+                IdTable::rows_only(rows.min(1))
             } else {
                 let mut table = solutions.table.project(&kept);
                 table.dedup_preserving_order();
@@ -480,7 +480,11 @@ impl Context<'_> {
             })
             .collect();
         let key_table = IdTable::from_columns(key_columns);
-        let groups = group_rows(&key_table, &(0..variables.len()).collect::<Vec<_>>());
+        let groups = group_rows(
+            &key_table,
+            &(0..variables.len()).collect::<Vec<_>>(),
+            &self.budget,
+        )?;
         let group_count = groups.len();
         let members_of = |group_of: &mut dyn Iterator<Item = usize>| {
             let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
@@ -709,9 +713,10 @@ mod tests {
         let engine = nrese_engine::Engine::new(Default::default()).unwrap();
         let snapshot = engine.snapshot();
         let v = Variable::new_unchecked("v");
-        let table = |rows: &[u64], capacity: usize| {
-            let mut table = IdTable::with_capacity(1, capacity);
-            rows.iter().for_each(|&id| table.push_row(&[id]));
+        // A table of `rows` with room for `capacity`, charged to the query first.
+        let table = |ctx: &Context<'_>, rows: &[u64], capacity: usize| {
+            let mut table = IdTable::charged(1, capacity, &ctx.budget).unwrap();
+            rows.iter().for_each(|&id| table.push_reserved(&[id]));
             Solutions {
                 vars: vec![v.clone()],
                 table,
@@ -720,16 +725,14 @@ mod tests {
         };
         // A table of one column with room for `rows`: its column and the vector of it.
         let bytes = |rows: usize| size_of::<Vec<u64>>() + 8 * rows;
-        let cases: [(&str, Vec<Solutions>, usize); 3] = [
-            (
-                "a projection keeping its column",
-                vec![table(&[], 8)],
-                bytes(8),
-            ),
-            ("one table joined into one", vec![table(&[1], 8)], bytes(8)),
+        // Each case: its parts (rows, capacity), and the envelope.
+        type Case<'a> = (&'a str, &'a [(&'a [u64], usize)], usize);
+        let cases: [Case<'_>; 3] = [
+            ("a projection keeping its column", &[(&[], 8)], bytes(8)),
+            ("one table joined into one", &[(&[1], 8)], bytes(8)),
             (
                 "two, with room in the first",
-                vec![table(&[1], 8), table(&[2], 1)],
+                &[(&[1], 8), (&[2], 1)],
                 bytes(8) + bytes(1),
             ),
         ];
@@ -738,8 +741,8 @@ mod tests {
             options.resources.memory = nrese_exec::Envelope::new(Some(limit), None);
             let ctx = Context::new(&snapshot, &options, None, None);
             let parts: Vec<Solutions> = parts
-                .into_iter()
-                .map(|p| ctx.produced(p).ok().unwrap())
+                .iter()
+                .map(|&(rows, capacity)| ctx.produced(table(&ctx, rows, capacity)).ok().unwrap())
                 .collect();
             let remade = match case {
                 "a projection keeping its column" => {
