@@ -429,7 +429,7 @@ impl Context<'_> {
             if search.rank.is_some() {
                 row.push(self.id(&Term::from(Literal::from(rank as i64)))?);
             }
-            table.push_row(&row);
+            table.push_row(&row, &self.budget)?;
         }
         self.produced(Solutions {
             vars,

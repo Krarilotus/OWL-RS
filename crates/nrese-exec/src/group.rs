@@ -8,7 +8,10 @@
 
 use hashbrown::HashMap;
 
+use std::sync::Arc;
+
 use crate::table::IdTable;
+use crate::{Budget, BudgetExceeded};
 
 type Hasher = foldhash::fast::FixedState;
 
@@ -42,12 +45,18 @@ impl Groups {
 
 /// Groups `table` by `keys`. With no keys, all rows form one group, and an empty input gives
 /// one empty group (SPARQL: an aggregate without GROUP BY yields one row).
-pub fn group_rows(table: &IdTable, keys: &[usize]) -> Groups {
+/// The groups of `table`'s rows by their values in `keys`; the table of the groups' keys
+/// charged to `budget` as it grows.
+pub fn group_rows(
+    table: &IdTable,
+    keys: &[usize],
+    budget: &Arc<Budget>,
+) -> Result<Groups, BudgetExceeded> {
     if keys.is_empty() {
-        return Groups {
-            keys: IdTable::from_rows(0, [&[][..]]),
+        return Ok(Groups {
+            keys: IdTable::from_rows(0, [&[][..]], budget)?,
             group_of: vec![0; table.len()],
-        };
+        });
     }
     let mut group_keys = IdTable::new(keys.len());
     let mut group_of = Vec::with_capacity(table.len());
@@ -65,24 +74,27 @@ pub fn group_rows(table: &IdTable, keys: &[usize]) -> Groups {
                     .any(|&k| table.get(row, k) != table.get(row - 1, k));
             if new_group {
                 fill(&mut key, row);
-                group_keys.push_row(&key);
+                group_keys.push_row(&key, budget)?;
             }
             group_of.push(group_keys.len() as u32 - 1);
         }
         let sorted: Vec<usize> = (0..keys.len()).collect();
-        return Groups {
+        return Ok(Groups {
             keys: group_keys.assume_sorted_by(sorted),
             group_of,
-        };
+        });
     }
     if let [k] = keys {
         let mut index: HashMap<u64, u32, Hasher> = HashMap::with_hasher(Hasher::default());
         for &value in table.column(*k) {
             let next = index.len() as u32;
-            let group = *index.entry(value).or_insert_with(|| {
-                group_keys.push_row(&[value]);
-                next
-            });
+            let group = match index.entry(value) {
+                hashbrown::hash_map::Entry::Occupied(found) => *found.get(),
+                hashbrown::hash_map::Entry::Vacant(slot) => {
+                    group_keys.push_row(&[value], budget)?;
+                    *slot.insert(next)
+                }
+            };
             group_of.push(group);
         }
     } else {
@@ -94,17 +106,17 @@ pub fn group_rows(table: &IdTable, keys: &[usize]) -> Groups {
                 Some(&group) => group,
                 None => {
                     index.insert(key.clone(), next);
-                    group_keys.push_row(&key);
+                    group_keys.push_row(&key, budget)?;
                     next
                 }
             };
             group_of.push(group);
         }
     }
-    Groups {
+    Ok(Groups {
         keys: group_keys,
         group_of,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -120,21 +132,22 @@ mod tests {
     #[test]
     fn sorted_and_hashed_grouping_agree() {
         let rows: Vec<[u64; 3]> = (0..500u64).map(|i| [i % 7, i % 3, i]).collect();
-        let mut table = IdTable::from_rows(3, rows.iter().map(|r| &r[..]));
-        let hashed = group_rows(&table, &[0, 1]);
+        let mut table =
+            IdTable::from_rows(3, rows.iter().map(|r| &r[..]), &crate::test_budget()).unwrap();
+        let hashed = group_rows(&table, &[0, 1], &crate::test_budget()).unwrap();
         table.sort_by(&[0, 1]);
-        let sorted = group_rows(&table, &[0, 1]);
+        let sorted = group_rows(&table, &[0, 1], &crate::test_budget()).unwrap();
         assert_eq!(counted(&hashed), counted(&sorted));
         assert_eq!(sorted.len(), 21);
         assert!(sorted.keys.is_sorted_on(&[0, 1]));
-        let single = group_rows(&table, &[1]);
+        let single = group_rows(&table, &[1], &crate::test_budget()).unwrap();
         assert_eq!(counted(&single).iter().map(|(_, n)| n).sum::<u64>(), 500);
     }
 
     #[test]
     fn no_keys_is_one_group_even_when_empty() {
         let empty = IdTable::new(2);
-        let groups = group_rows(&empty, &[]);
+        let groups = group_rows(&empty, &[], &crate::test_budget()).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups.counts(), vec![0]);
     }

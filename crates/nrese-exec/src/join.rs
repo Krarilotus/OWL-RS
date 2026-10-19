@@ -1249,7 +1249,7 @@ mod tests {
                     }
                 })
                 .collect();
-            t.push_row(&row);
+            t.push_row(&row, &crate::test_budget()).unwrap();
         }
         t
     }
@@ -1442,7 +1442,8 @@ mod tests {
             }
         }
         // The row limit applies.
-        let many = IdTable::from_rows(1, (0..100).map(|_| &[UNDEF][..]));
+        let many =
+            IdTable::from_rows(1, (0..100).map(|_| &[UNDEF][..]), &crate::test_budget()).unwrap();
         assert!(
             outer_join_with_undef(&many, &many, &[0], &[0], None, true, &budget(), 99).is_err()
         );
@@ -1450,8 +1451,14 @@ mod tests {
 
     #[test]
     fn left_and_anti_joins() {
-        let left = IdTable::from_rows(2, [&[1, 10][..], &[2, 20], &[3, 30]]);
-        let right = IdTable::from_rows(2, [&[1, 100][..], &[1, 101], &[3, 300]]);
+        let left = IdTable::from_rows(2, [&[1, 10][..], &[2, 20], &[3, 30]], &crate::test_budget())
+            .unwrap();
+        let right = IdTable::from_rows(
+            2,
+            [&[1, 100][..], &[1, 101], &[3, 300]],
+            &crate::test_budget(),
+        )
+        .unwrap();
         let out = left_join(&left, &right, &[0], &[0], None, &budget(), usize::MAX).unwrap();
         assert_eq!(
             sorted_rows(&out),

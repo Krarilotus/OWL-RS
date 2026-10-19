@@ -286,7 +286,7 @@ impl Context<'_> {
         }
         let mut wanted = variables.to_vec();
         wanted.extend(aggregates.iter().map(|(target, _)| target.clone()));
-        let projected = self.project(solutions, &wanted);
+        let projected = self.project(solutions, &wanted)?;
         self.produced(projected)
     }
 

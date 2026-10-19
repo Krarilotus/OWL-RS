@@ -184,24 +184,21 @@ impl AlignedSolutions {
         Ok(())
     }
 
-    /// Makes room for `rows` appended rows at once; the old and the new allocation
-    /// coexist while the rows move.
+    /// Makes room for `rows` appended rows at once, charged to the aligned results' budget
+    /// first (the lower table's growth: the old and the new allocation are held while the
+    /// rows move).
     pub fn reserve_appends(&mut self, rows: usize) -> Result<(), QueryEvaluationError> {
-        let table = &mut self.lower.table;
-        let old = table.memory_bytes();
-        let more = rows.saturating_mul(table.width()).saturating_mul(8);
-        self.held.charge(old.saturating_add(more))?;
-        table.reserve_exact(rows);
-        self.held.release(old);
+        let budget = Arc::clone(self.held.handle());
+        self.lower.table.reserve_rows_exact(rows, &budget)?;
         Ok(())
     }
 
     /// Appends a proved candidate once, preserving every original lower row in place.
     pub fn append_upper(&mut self, row: usize) -> Result<(), QueryEvaluationError> {
-        if self.lower.table.spare_rows() == 0 {
+        if self.lower.table.room_left() == 0 {
             self.reserve_appends(self.lower.len().max(4))?;
         }
-        self.lower.table.push_row(&self.upper.table.row(row));
+        self.lower.table.push_reserved(&self.upper.table.row(row));
         Ok(())
     }
 

@@ -203,7 +203,7 @@ impl super::Context<'_> {
             self.check()?;
         }
         let out = if width == 0 {
-            nrese_exec::IdTable::from_rows(0, std::iter::repeat_n(&[][..], total.min(limit)))
+            nrese_exec::IdTable::rows_only(total.min(limit))
         } else {
             nrese_exec::IdTable::from_columns(columns)
         };

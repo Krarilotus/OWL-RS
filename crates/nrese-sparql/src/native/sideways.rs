@@ -343,7 +343,8 @@ impl Context<'_> {
                 return None;
             }
             if seen.insert(key.clone()) {
-                table.push_row(&key);
+                // Refused: no keys, the pattern evaluated whole (as below).
+                table.push_row(&key, &self.budget).ok()?;
             }
         }
         self.produced(Solutions {
