@@ -305,6 +305,11 @@ impl IdTable {
 
     /// A table with one row per entry of `rows`, each `width` wide.
     pub fn from_rows<'a>(width: usize, rows: impl IntoIterator<Item = &'a [u64]>) -> Self {
+        // Rows without columns: only their number (the executor's tables of a pattern
+        // without variables, or of a projection to none).
+        if width == 0 {
+            return Self::uncharged(Vec::new(), rows.into_iter().count(), Vec::new());
+        }
         let mut table = Self::new(width);
         for row in rows {
             table.push_row(row);
