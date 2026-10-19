@@ -85,12 +85,13 @@ fn parks_on_the_pool() -> usize {
     measure_within(&Budget::unlimited(), || rayon::join(park, park)).1
 }
 
-/// The most of 3,000 measurements of an empty parallel loop entered from outside the pool.
+/// The most of 3,000 measurements of an empty parallel loop entered from outside the pool,
+/// half of them within another measurement.
 fn enters_the_pool() -> usize {
-    (0..3_000)
-        .map(|_| measure_within(&Budget::unlimited(), || rayon::join(|| (), || ())).1)
-        .max()
-        .unwrap()
+    let entered = || measure_within(&Budget::unlimited(), || rayon::join(|| (), || ())).1;
+    let top = (0..1_500).map(|_| entered()).max().unwrap();
+    let (nested, _) = measure(|| (0..1_500).map(|_| entered()).max().unwrap());
+    top.max(nested)
 }
 
 /// The least of 100,000 measurements of an uncharged kilobyte each, while another thread
@@ -135,7 +136,7 @@ fn a_measurement_counts_what_was_made_while_it_ran() {
             Counted::Nothing,
         ),
         (
-            "entering the global pool from outside",
+            "entering the global pool from outside, nested or not",
             &enters_the_pool,
             Counted::Nothing,
         ),

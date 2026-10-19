@@ -43,6 +43,29 @@
 //! charged, so the balance is never below the truth (no false pass), and such a release of
 //! an earlier charge counts for nothing while the measurement holds none.
 //!
+//! # Known limits
+//!
+//! What a measurement counts is what it can tell apart. Three patterns of correct code
+//! are told apart wrongly; each has a rule for measured tests:
+//! - A reservation made before the measurement and used in it (moved in, then charged,
+//!   allocated, freed, released) counts none of its charges, but the blocks do: a false
+//!   failure. Rule: make the reservations a measured operation uses inside the
+//!   measurement ([`crate::ChargedVec`] renews its own as it grows).
+//! - A release to a budget itself ([`Budget::release`], the executor's `consumed`) of a
+//!   charge made before the measurement counts against the measurement's own such charges
+//!   still held: charging a new table directly, then freeing and releasing an earlier one,
+//!   reports the earlier one's bytes: a false failure. Rule: in measured work, release
+//!   earlier direct charges before making new ones, or make the inputs inside the
+//!   measurement.
+//! - [`crate::Reservation::adopt`] of a direct charge made before the measurement makes it
+//!   the measurement's charge, which then covers new blocks while the old one still lives:
+//!   a false pass. Rule: adopt only charges made inside the measurement, or make the inputs
+//!   inside it.
+//!
+//! And rayon's global queue (see [`prepare`]): work that enters the global pool from
+//! outside more than 62 times, or a pool of its own from outside, allocates a queue block
+//! of 1,520 bytes per 63 entries, which it counts.
+//!
 //! Counts are `i128`: a `usize` converts exactly, and no sum of them reaches its bounds.
 //! A realloc counts the new block, then frees the old: it may move the bytes. Measurements
 //! nest (up to 8 at once); one that unwinds ends as one that returns, and no thread reads
@@ -178,6 +201,25 @@ fn bytes(bytes: usize) -> i128 {
     i128::from(bytes as u64)
 }
 
+thread_local! {
+    /// The bytes this thread allocated uncounted, while it aligns rayon's queue
+    /// ([`prepare`]); `None` while it doesn't.
+    static UNCOUNTED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The generation a block of `size` bytes made now records, and whether it is counted: not
+/// while its thread aligns rayon's queue, whose blocks record 0, before every measurement,
+/// so that none counts their allocation or their free.
+fn block_tag(size: usize) -> (u64, bool) {
+    match UNCOUNTED.try_with(std::cell::Cell::get) {
+        Ok(Some(bytes)) => {
+            UNCOUNTED.set(Some(bytes.saturating_add(size)));
+            (0, false)
+        }
+        _ => (tag(), true),
+    }
+}
+
 fn allocated(size: usize, tag: u64) {
     each(Some(tag), |c| {
         c.live += bytes(size);
@@ -282,10 +324,10 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
         let Some((outer, header)) = with_header(layout) else {
             return std::ptr::null_mut();
         };
-        let tag = tag();
+        let (tag, counted) = block_tag(layout.size());
         // SAFETY: a non-zero size; the block has room for its header.
         let pointer = unsafe { handed_out(self.0.alloc(outer), header, tag) };
-        if !pointer.is_null() {
+        if counted && !pointer.is_null() {
             allocated(layout.size(), tag);
         }
         pointer
@@ -295,10 +337,10 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
         let Some((outer, header)) = with_header(layout) else {
             return std::ptr::null_mut();
         };
-        let tag = tag();
+        let (tag, counted) = block_tag(layout.size());
         // SAFETY: as for `alloc`.
         let pointer = unsafe { handed_out(self.0.alloc_zeroed(outer), header, tag) };
-        if !pointer.is_null() {
+        if counted && !pointer.is_null() {
             allocated(layout.size(), tag);
         }
         pointer
@@ -322,14 +364,16 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
         // it and is marked anew.
         unsafe {
             let was = tag_of(pointer);
-            let tag = tag();
+            let (tag, counted) = block_tag(size);
             let moved = handed_out(
                 self.0.realloc(pointer.sub(header), outer, grown),
                 header,
                 tag,
             );
             if !moved.is_null() {
-                allocated(size, tag);
+                if counted {
+                    allocated(size, tag);
+                }
                 freed(layout.size(), was);
             }
             moved
@@ -337,54 +381,55 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
     }
 }
 
-/// The libraries' state made once that a measurement would otherwise count, made before
-/// it starts (unless one already runs, which would count it). Without it, the first
-/// measurement whose work a pool thread waits in counted parking_lot's waiter table
-/// (1 KiB), and one in 63 that enter the global pool from outside counted its queue's next
-/// block (1,520 bytes; 47 of 3,000 measurements of an empty parallel loop):
+/// The libraries' state made once, or in steps, that a measurement would otherwise count,
+/// made before it starts. Without it, the first measurement whose work a pool thread waits
+/// in counted parking_lot's waiter table (93 KB here), and one in 63 that enter the global
+/// pool from outside counted its queue's next block (1,520 bytes; 47 of 3,000 measurements
+/// of an empty parallel loop):
 /// - parking_lot's table, which grows with the threads that park at once and never shrinks:
-///   once per process, threads at least twice the machine's, and 8 more, park at once;
+///   once per process, before the first measurement, threads at least twice the machine's
+///   and 8 more park at once;
 /// - rayon's global queue, which allocates its next block on the 63rd entry from outside
-///   the pool: before each measurement made outside the pool, empty entries until one
-///   allocates (at most 63, about a millisecond), leaving 62 the work makes without
-///   allocating. Work that enters the global pool from outside more often, or a pool of
-///   its own from outside, still allocates such blocks: one per 63 entries.
+///   the pool: before each measurement made outside the pool (nested ones too), empty
+///   entries until one allocates its block (at most 63, about a millisecond), uncounted by
+///   any measurement, leaving 62 the work makes without allocating. Work that enters the
+///   global pool from outside more often, or a pool of its own from outside, still
+///   allocates such blocks: one per 63 entries.
 fn prepare() {
     static WARM: std::sync::Once = std::sync::Once::new();
-    if ACTIVE.load(SeqCst) != 0 {
-        return;
-    }
-    WARM.call_once(|| {
-        let threads = std::thread::available_parallelism().map_or(8, |n| 2 * n.get() + 8);
-        let all = std::sync::Barrier::new(threads);
-        std::thread::scope(|scope| {
-            for _ in 0..threads {
-                scope.spawn(|| {
-                    // SAFETY: parks nowhere (its validation fails): the thread's waiter
-                    // data is made, and the table sized for it.
-                    unsafe {
-                        parking_lot_core::park(
-                            std::ptr::from_ref(&all).addr(),
-                            || false,
-                            || {},
-                            |_, _| {},
-                            parking_lot_core::DEFAULT_PARK_TOKEN,
-                            None,
-                        );
-                    }
-                    all.wait();
-                });
-            }
+    if ACTIVE.load(SeqCst) == 0 {
+        WARM.call_once(|| {
+            let threads = std::thread::available_parallelism().map_or(8, |n| 2 * n.get() + 8);
+            let all = std::sync::Barrier::new(threads);
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|| {
+                        // SAFETY: parks nowhere (its validation fails): the thread's waiter
+                        // data is made, and the table sized for it.
+                        unsafe {
+                            parking_lot_core::park(
+                                std::ptr::from_ref(&all).addr(),
+                                || false,
+                                || {},
+                                |_, _| {},
+                                parking_lot_core::DEFAULT_PARK_TOKEN,
+                                None,
+                            );
+                        }
+                        all.wait();
+                    });
+                }
+            });
+            // The global pool started, and the entering thread's state made.
+            rayon::broadcast(|_| ());
+            rayon::join(|| (), || ());
         });
-        // The global pool started, and the entering thread's state made.
-        rayon::broadcast(|_| ());
-        rayon::join(|| (), || ());
-    });
+    }
     if rayon::current_thread_index().is_none() {
         for _ in 0..=63 {
-            let entry = Running::start(None);
+            UNCOUNTED.set(Some(0));
             rayon::join(|| (), || ());
-            if entry.end().live > 0 {
+            if UNCOUNTED.replace(None).is_some_and(|bytes| bytes > 0) {
                 break;
             }
         }
