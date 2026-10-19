@@ -1,6 +1,8 @@
 //! The dataset of a query (`FROM`, `FROM NAMED`, the protocol's parameters), resolved
 //! against a view ([`ResolvedDataset`]). The default graph of several `FROM` graphs is their
-//! RDF merge (SPARQL 1.1 §13.2): a statement two of them hold counts once.
+//! merge: a statement two of them hold counts once. Blank nodes keep their identity across
+//! graphs, as in Jena, GraphDB and Oxigraph: a deliberate deviation from the RDF merge of
+//! SPARQL 1.1 §13.2, which keeps them apart (docs/ops/http-api.md, the owner's decision).
 
 use nrese_engine::TermId;
 use nrese_rdf::{GraphName, NamedOrBlankNodeRef, Term};
@@ -71,8 +73,8 @@ pub(crate) enum DefaultGraph {
     Store,
     /// One named graph.
     Graph(TermId),
-    /// The RDF merge of every graph (`None`) or of the listed ones: a statement counts
-    /// once, however many of them hold it.
+    /// The merge of every graph (`None`) or of the listed ones: a statement counts once,
+    /// however many of them hold it.
     Merge(Option<Vec<TermId>>),
     /// No graph the store holds.
     Empty,

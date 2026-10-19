@@ -3601,6 +3601,7 @@ impl<'a> Context<'a> {
                     continue;
                 }
                 // Graph-last order: the copies of a statement follow each other.
+                // Blank nodes keep their identity: not §13.2's RDF merge (dataset.rs).
                 let statement = [components[0], components[1], components[2]];
                 if previous == Some(statement) {
                     continue;
