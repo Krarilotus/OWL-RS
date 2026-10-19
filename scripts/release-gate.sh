@@ -7,9 +7,11 @@
 #   release-gate.sh build REV               REV's binaries, by REV's own toolchain, into GATE_BIN/bin-REV8-IDENTITY
 #   release-gate.sh prepare HARNESS         the plan, the data view and the cases' data, once, by
 #                                           HARNESS's generator; WatDiv's query sets checked
-#   release-gate.sh pass N SIDE REV HARNESS [PLAN|-] [LAYOUT]
-#                                           pass N: HARNESS's cases on REV's binaries (its build of
-#                                           layout LAYOUT, GATE_LAYOUTS), one repetition
+#   release-gate.sh block N HARNESS LAYOUT PLAN|- base=REV main=REV cand=REV
+#                                           block N: each of HARNESS's cases run base, main, cand,
+#                                           cand, main, base back to back (a palindrome per case:
+#                                           every side's runs centred on the same time), on each
+#                                           side's build of layout LAYOUT (GATE_LAYOUTS)
 #   release-gate.sh report HARNESS SIDE=REV ...   the timed part's report (the first SIDE the candidate)
 #   release-gate.sh w3c                     the W3C suites with their data required, their counts checked
 #   release-gate.sh guards                  every guard docs/design/performance.md §0 names, run and passed
@@ -19,28 +21,29 @@
 #   release-gate.sh confirm TIMED_DIR... --out DIR   the confirmation job of each host whose run flagged
 #                                           a loss or an undecided case (rg-H8-confirm, rg-H8-confirm2)
 #   release-gate.sh plan-cases CASES        a confirmation's plan: just those cases (GATE_PLAN)
-#   release-gate.sh plan-blocks HARNESS     each block's plan: the cases whose noise needs its passes
-#                                           (benches/fast/measure.toml); `pass N SIDE REV HARNESS PLAN`
-#                                           runs a block's
+#   release-gate.sh plan-blocks HARNESS     each block's plan: the cases whose noise needs its block
+#                                           (benches/fast/measure.toml); `block N HARNESS L PLAN ...`
+#                                           runs it
 #   release-gate.sh verdict TIMED_DIR... CHECKS_DIR   every part together, each host's rounds combined
 #   release-gate.sh jobs CAND [OPTIONS]     the fleet jobs of a whole gate (release_gate.py jobs --help)
 #   release-gate.sh clean                   the gate's worktrees and build trees (binaries and data stay)
 #
 # One harness for every side: HARNESS's fast suite (its cases, checks, generator and data);
 # only the engine's binaries differ. A side whose perf lab predates --routes (main) runs with
-# fast.py --no-routes --empty-queries, read from its CAPABILITIES. A pass with a complete
-# report is kept (the step resumes); an incomplete one is moved aside, kept, and run again.
+# fast.py --no-routes --empty-queries, read from its CAPABILITIES. A block with every report
+# complete is kept (the step resumes); an incomplete one is moved aside, kept, and run again whole.
 #
 # GATE (NRESE_GATE_DIR, default ~/owlrs/$GATE_NAME, gate-v2) keeps binaries, data and passes between
 # steps; results go to FLEET_OUT. GATE_CASES limits the cases (a dry run), GATE_MAX_GB is the
 # memory the host gives a case (default 24: a larger cap is not run, never lowered),
-# GATE_MIN_PASSES the passes per side (default 4; fewer is diagnostic). GATE_BIG_GB and
-# GATE_BIG_HOST: cases with caps up to it run on that host instead (its own job: GATE_MIN_GB
-# the timed host's limit, GATE_MAX_GB the big one's). No case is waived: only an owner-approved
+# GATE_MIN_BLOCKS the blocks of the round (default 2; fewer is diagnostic). GATE_BIG_GB and
+# GATE_BIG_HOST: cases with caps up to it run on that Linux host instead (khaleesi-wsl; its own
+# job: GATE_MIN_GB the timed host's limit, GATE_MAX_GB the big one's). No case is waived: only an owner-approved
 # trade-off (benches/release-tradeoffs.toml) accepts a loss. SPARQL_DATA (default
 # ~/owlrs/sparql-data) holds the SPARQL workloads' data and their generated query sets.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+export PATH=$HOME/.cargo/bin:$PATH
 GATE=${NRESE_GATE_DIR:-$HOME/owlrs/${GATE_NAME:-gate-v2}}
 # Binaries by build identity, shared by every gate (v1.5's and main's are built once):
 # published whole, never replaced (scripts/lib/gate-publish.sh).
@@ -103,6 +106,10 @@ case ${1:-} in
 build)
   rev=$(git rev-parse "$2") || exit 2
   export PATH=$HOME/.cargo/bin:$PATH
+  # The gate's flags replace a host's (its ~/.cargo/config.toml rustflags), before the identity
+  # is taken: the identity hashes the flags the build gets.
+  export RUSTFLAGS=$GATE_RUSTFLAGS
+  unset CARGO_ENCODED_RUSTFLAGS  # it would take precedence over RUSTFLAGS
   # Each layout's build by its identity: one there from before counts, the others are built.
   todo=()
   for L in $(seq 1 "$LAYOUTS"); do
@@ -154,8 +161,10 @@ build)
   { echo "revision $rev"; (cd "$src" && rustc -V); echo "missing at this revision: ${missing[*]:-none}";
     echo "measurement patch perf_lab_watchdog: $patched";
     cat "$part/CAPABILITIES"; } > "$part/BUILD.txt"
+  lld=$(lld_of "$part") || { log "build $rev: not linked by the toolchain's LLD"; exit 1; }
+  echo "linker $lld" >> "$part/BUILD.txt"
   (cd "$part" && find release -type f | sort | xargs sha256sum > SHA256SUMS)
-  build_identity "$rev" 1 > "$part/IDENTITY"
+  { build_identity "$rev" 1; echo "linker $lld"; } > "$part/IDENTITY"
   publish "$part" "$bin" || { log "build $rev: $bin is there but doesn't verify"; exit 1; }
   point "$rev" "$bin" 1
   fi
@@ -170,15 +179,16 @@ build)
     for spec in nrese-store:perf_lab nrese-dl:tableau_consistency nrese-dl:context_classify nrese-reasoner:classify; do
       crate=${spec%%:*} example=${spec#*:}
       [ -e "$bin/release/examples/$example" ] || continue
-      (cd "$src" && RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,--shuffle-sections=.text*=$L" \
+      (cd "$src" && RUSTFLAGS=$(layout_flags "$L") \
          bash scripts/cargo-guarded.sh build --release --locked --quiet -p "$crate" --example "$example") \
         || { log "build of $example, layout $L, failed at $rev"; exit 1; }
       cp "$CARGO_TARGET_DIR/release/examples/$example" "$lpart/release/examples/"
     done
     echo "$L" > "$lpart/LAYOUT"
+    lld=$(lld_of "$lpart") || { log "build $rev, layout $L: not linked by the toolchain's LLD"; exit 1; }
     echo "layout $L: the timed tools linked with --shuffle-sections=.text*=$L" >> "$lpart/BUILD.txt"
     (cd "$lpart" && find release -type f | sort | xargs sha256sum > SHA256SUMS)
-    build_identity "$rev" "$L" > "$lpart/IDENTITY"
+    { build_identity "$rev" "$L"; echo "linker $lld"; } > "$lpart/IDENTITY"
     cmp -s "$bin/release/examples/perf_lab" "$lpart/release/examples/perf_lab" \
       && { log "layout $L of $rev is byte-identical to layout 1: the shuffle didn't take"; exit 1; }
     publish "$lpart" "$lbin" || { log "build $rev, layout $L: $lbin is there but doesn't verify"; exit 1; }
@@ -202,7 +212,7 @@ from suitekit import hosts; print(hosts.input_path("general") or "")')
   # when made: a failed plan left the passes of another job in this directory an empty one
   # (aa3-phuoc-timed, 19 Oct 2026).
   (cd "$tree" && py benches/fast/release_gate.py plan --max-gb "$MAX_GB" --min-gb "${GATE_MIN_GB:-0}" \
-     ${GATE_BIG_GB:+--big-gb "$GATE_BIG_GB" --big-host "${GATE_BIG_HOST:-khaleesi}"} ${GATE_CASES:+--cases "$GATE_CASES"}) \
+     ${GATE_BIG_GB:+--big-gb "$GATE_BIG_GB" --big-host "${GATE_BIG_HOST:-khaleesi-wsl}"} ${GATE_CASES:+--cases "$GATE_CASES"}) \
     > "$GATE/plan.json.partial" && mv "$GATE/plan.json.partial" "$GATE/plan.json" \
     || { log "prepare: no plan (release_gate.py plan failed)"; exit 2; }
   cp "$GATE/plan.json" "$OUT/plan.json"
@@ -276,48 +286,66 @@ print(" ".join(sorted({c["queries"][1:] for c in r.load() if c["name"] in wanted
   exit $code
   ;;
 
-pass)
-  n=$2 side=$3
-  rev=$(git rev-parse "$4") || exit 2
-  harness=$(git rev-parse "$5") || exit 2
+block)
+  n=$2 layout=$4
+  harness=$(git rev-parse "$3") || exit 2
   # A block's plan (plan-blocks), else the gate's.
   plan=$PLAN
-  if [ -n "${6:-}" ] && [ "$6" != - ]; then
-    plan=$GATE/$6
-    [ -f "$plan" ] || { log "pass $n: no block plan $plan (plan-blocks first)"; exit 2; }
+  if [ "${5:--}" != - ]; then
+    plan=$GATE/$5
+    [ -f "$plan" ] || { log "block $n: no block plan $plan (plan-blocks first)"; exit 2; }
   fi
-  layout=${7:-1}
+  shift 5
   tree=$(worktree "$harness") || exit 2
-  bin=$(layout_bin "$rev" "$layout")
-  [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS) \
-    || { log "pass $n: no verified build of $rev"; exit 2; }
+  # Each side: its build of this layout, verified, and what its perf lab can do (CAPABILITIES).
+  sides=() names=()
+  for spec in "$@"; do
+    name=${spec%%=*}
+    rev=$(git rev-parse "${spec#*=}") || exit 2
+    bin=$(layout_bin "$rev" "$layout")
+    [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS) \
+      || { log "block $n: no verified build of $rev, layout $layout"; exit 2; }
+    routes=1 empty_queries=0 timing=spawn
+    # shellcheck disable=SC1091
+    . "$bin/CAPABILITIES"
+    flags=""
+    [ "$routes" = 1 ] || flags+="no-routes,"
+    [ "$empty_queries" = 1 ] && flags+="empty-queries,"
+    sides+=(--side "$name:$bin:$rev:${flags}timing=${timing:-spawn}")
+    names+=("$name")
+  done
   mkdir -p "$OUT/passes"
-  report=$OUT/passes/pass-$n-$side.json
-  if [ -f "$report" ]; then
-    if py -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("finished_ns") else 1)' "$report"; then
-      log "pass $n ($side): complete before"; exit 0
-    fi
-    mv "$report" "$OUT/passes/interrupted-$n-$side-$(date +%s).json"
-    log "pass $n ($side): its interrupted report kept aside; again"
-  fi
-  # shellcheck disable=SC1091
-  . "$bin/CAPABILITIES"
-  flags=(--prepared)
-  [ "$routes" = 1 ] || flags+=(--no-routes)
-  [ "$empty_queries" = 1 ] && flags+=(--empty-queries)
-  [ -f "$tree/$MEASURE" ] && flags+=(--measure "$MEASURE")
+  # Its reports: the six runs of the palindrome (fast.py block), written together at its end.
+  first=$(( 6 * (n - 1) + 1 ))
+  complete() {  # how many of the block's six reports are complete
+    local f r c=0
+    for f in $(seq "$first" $((first + 5))); do
+      for r in "$OUT/passes/pass-$f-"*.json; do
+        py -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("finished_ns") else 1)' "$r" 2>/dev/null \
+          && c=$((c + 1))
+      done
+    done
+    echo "$c"
+  }
+  if [ "$(complete)" = 6 ]; then log "block $n: complete before"; exit 0; fi
+  for f in $(seq "$first" $((first + 5))); do
+    for r in "$OUT/passes/pass-$f-"*.json; do
+      [ -f "$r" ] && mv "$r" "$OUT/passes/interrupted-$(basename "$r" .json)-$(date +%s).json"
+    done
+  done
+  opts=()
+  [ -f "$tree/$MEASURE" ] && opts+=(--measure "$MEASURE")
   # Batched timing (perf_lab --batch) only when every side's perf lab has it (jobs: GATE_BATCH).
-  [ "${GATE_BATCH:-0}" = 1 ] && flags+=(--batch)
-  flags+=(--timing "${timing:-spawn}")
+  [ "${GATE_BATCH:-0}" = 1 ] && opts+=(--batch)
   fast_env
-  # A timed pass: prepared data only (fast.py refuses to make any while it times).
+  # A timed block: prepared data only (fast.py never makes any while it times).
   export NRESE_TIMED_GATE=1
-  # A plan that can't be read (empty, half written) is no pass, never every case.
-  cases=$(planned "$plan") && [ -n "$cases" ] || { log "pass $n: the plan $plan can't be read"; exit 2; }
-  log "pass $n: $side $rev, layout $layout, on the cases of $harness, plan $(basename "$plan") (${flags[*]})"
-  # The host kept quiet while the pass runs (scripts/lib/quiet-watch.py, as the measurement
+  # A plan that can't be read (empty, half written) is no block, never every case.
+  cases=$(planned "$plan") && [ -n "$cases" ] || { log "block $n: the plan $plan can't be read"; exit 2; }
+  log "block $n: ${names[*]}, layout $layout, on the cases of $harness, plan $(basename "$plan")"
+  # The host kept quiet while the block runs (scripts/lib/quiet-watch.py, as the measurement
   # queue's timed chunks: this user's other busy processes stopped, other containers paused,
-  # other users' work recorded); its verdict kept with the pass. GATE_QUIET=0: unwatched.
+  # other users' work recorded); its verdict kept with the block. GATE_QUIET=0: unwatched.
   watcher=""
   if [ "${GATE_QUIET:-1}" != 0 ] && [ -d /proc ]; then
     rm -rf "$GATE/quiet" && mkdir -p "$GATE/quiet"
@@ -325,20 +353,18 @@ pass)
     python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" $$ "$NRESE_QUIET_TOKEN" &
     watcher=$!
   fi
-  (cd "$tree" && NRESE_FAST_BIN=$bin NRESE_FAST_REVISION=$rev \
-     py benches/fast/fast.py run --reps 1 --label "gate-$n-$side" --cases "$cases" --out "$report" "${flags[@]}") \
-     > "$OUT/passes/pass-$n-$side.log" 2>&1
+  (cd "$tree" && py benches/fast/fast.py block --block "$n" --layout "$layout" --cases "$cases" \
+     --out "$OUT/passes" "${sides[@]}" "${opts[@]}") > "$OUT/passes/block-$n.log" 2>&1
   code=$?
   if [ -n "$watcher" ]; then
     kill -TERM "$watcher" 2>/dev/null && wait "$watcher"
-    cp "$GATE/quiet/watch.log" "$OUT/passes/quiet-$n-$side.log" 2>/dev/null
-    log "pass $n ($side): $(tail -1 "$GATE/quiet/watch.log" 2>/dev/null)"
+    cp "$GATE/quiet/watch.log" "$OUT/passes/quiet-block-$n.log" 2>/dev/null
+    log "block $n: $(tail -1 "$GATE/quiet/watch.log" 2>/dev/null)"
   fi
-  grep -E "^rep 1 |not as expected" "$OUT/passes/pass-$n-$side.log" | tail -4
-  # The cases' failures are data, the report's to judge; a pass without its report isn't.
-  py -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("finished_ns") else 1)' "$report" 2>/dev/null \
-    || { log "pass $n ($side): no complete report (exit $code)"; exit 1; }
-  log "pass $n ($side): done (fast.py exit $code)"
+  tail -1 "$OUT/passes/block-$n.log"
+  # The cases' failures are data, the report's to judge; a block without its six reports isn't.
+  [ "$(complete)" = 6 ] || { log "block $n: not all six reports (exit $code)"; exit 1; }
+  log "block $n: done (fast.py exit $code)"
   ;;
 
 report)
@@ -359,7 +385,8 @@ report)
     while IFS= read -r line; do [ -z "$line" ] || args+=("--${key/_/-}" "$line"); done <<< "$listed"
   done
   (cd "$tree" && py benches/fast/release_gate.py report --passes "$OUT/passes" --candidate "$candidate" "${args[@]}" \
-     --require "$required" --harness-revision "$harness" --min-passes "${GATE_MIN_PASSES:-4}" --inputs "$GATE/inputs.txt" \
+     --require "$required" --harness-revision "$harness" --min-blocks "${GATE_MIN_BLOCKS:-2}" --family "$GATE/plan.json" \
+     --inputs "$GATE/inputs.txt" \
      --context "host=${GATE_HOST:-}" --context "round=${GATE_ROUND:-0}" --context "prefix=${GATE_PREFIX:-}" \
      --context "gate_name=${GATE_NAME:-}" --context "max_gb=$MAX_GB" --context "ram_gb=${GATE_RAM_GB:-$MAX_GB}" \
      --context "layouts=$LAYOUTS" \
@@ -428,11 +455,9 @@ pack)
   for spec in "$@"; do
     rev=$(git rev-parse "$spec") || exit 2
     bin=$(bin_of "$rev")
-    [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS) \
-      || { log "pack: no verified build of $rev"; exit 2; }
     dirs+=("$(basename "$bin")")
-    for L in $(seq 2 "$LAYOUTS"); do
-      verified "$(layout_bin "$rev" "$L")" "$rev" || { log "pack: no verified layout $L of $rev"; exit 2; }
+    for L in $(seq 1 "$LAYOUTS"); do
+      verified "$(layout_bin "$rev" "$L")" "$rev" "$L" || { log "pack: no verified layout $L of $rev"; exit 2; }
       dirs+=("$(basename "$(layout_bin "$rev" "$L")")")
     done
   done
@@ -445,6 +470,9 @@ pack)
   ;;
 
 unpack)
+  # The binaries are Linux ELF: on any other system (native Windows: khaleesi, not khaleesi-wsl)
+  # nothing is unpacked and the job fails, never runs them some other way.
+  [ "$(uname -s)" = Linux ] || { log "unpack: $(uname -s) is not Linux: the gate's binaries can't run here"; exit 2; }
   src=${FLEET_INPUT_BINARIES:?the binaries of the build job, its input named binaries}
   tarball=$(find "$src" -name gate-bin.tar | head -1)
   [ -n "$tarball" ] && (cd "$(dirname "$tarball")" && sha256sum -c --quiet gate-bin.tar.sha256) \
@@ -456,7 +484,10 @@ unpack)
     (cd "$aside/$bin" && sha256sum -c --quiet SHA256SUMS) || { log "unpack: $bin doesn't verify"; exit 2; }
     for f in $(cut -d' ' -f3- "$aside/$bin/SHA256SUMS"); do
       [ -x "$aside/$bin/$f" ] || { log "unpack: $bin/$f lost its executable mode"; exit 2; }
+      [ "$(head -c4 "$aside/$bin/$f" | od -An -tx1 | tr -d ' ')" = 7f454c46 ] \
+        || { log "unpack: $bin/$f is not an ELF binary"; exit 2; }
     done
+    grep -q '^linker LLD ' "$aside/$bin/IDENTITY" 2>/dev/null || { log "unpack: $bin has no build identity"; exit 2; }
     rev=$(cat "$aside/$bin/REVISION")
     publish "$aside/$bin" "$GATE_BIN/$bin" || { log "unpack: $GATE_BIN/$bin is there but doesn't verify"; exit 2; }
     point "$rev" "$GATE_BIN/$bin" "$(cat "$GATE_BIN/$bin/LAYOUT" 2>/dev/null || echo 1)"

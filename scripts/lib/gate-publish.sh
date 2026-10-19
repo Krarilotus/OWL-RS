@@ -25,6 +25,29 @@
 
 . "$(dirname "${BASH_SOURCE[0]}")/ns.sh"
 
+# The linker: the toolchain's own rust-lld (x86_64-unknown-linux-gnu's default since Rust 1.90;
+# every side's rust-toolchain.toml names 1.98.1), through cc, never a host's configured one
+# (a ~/.cargo/config.toml linker or rustflags: release-gate.sh's RUSTFLAGS replace those, the
+# linker variable is pinned). Each build reads the linker back from its binaries (lld_of) and
+# fails for any other.
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc
+GATE_RUSTFLAGS=""
+# LAYOUT: the flags of a layout's timed tools (layout 1 the plain link, L > 1 its functions in
+# another order, seed L).
+layout_flags() { echo "$GATE_RUSTFLAGS${GATE_RUSTFLAGS:+ }$( [ "$1" -gt 1 ] && echo "-C link-arg=-Wl,--shuffle-sections=.text*=$1")"; }
+# DIR: the LLD every binary under DIR/release was linked by ("LLD 22.1.8"); fails, naming the
+# binary, for one linked by anything else or by two versions.
+lld_of() {
+  local f l seen=""
+  while IFS= read -r f; do
+    l=$(grep -aoE 'Linker: LLD [0-9][0-9.]*' "$f" | head -1)
+    [ -n "$l" ] || { echo "$f: not linked by LLD" >&2; return 1; }
+    [ -z "$seen" ] || [ "$l" = "$seen" ] || { echo "$f: $l, the others $seen" >&2; return 1; }
+    seen=$l
+  done < <(find "$1/release" -type f | sort)
+  [ -n "$seen" ] && echo "${seen#Linker: }"
+}
+
 # The flags the revision's own build hands rustc: its cargo-guarded.sh --print-rustflags where it
 # has one, else its scripts/lib/target-cpu.sh applied here, as its cargo-guarded.sh does (every
 # revision the gate builds has it), else RUSTFLAGS as they are.

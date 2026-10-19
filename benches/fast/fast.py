@@ -41,6 +41,7 @@ import statistics
 import subprocess
 import sys
 import time
+import threading
 import tomllib
 from pathlib import Path
 
@@ -250,6 +251,52 @@ def container(kind: str, cap_gb: float, command: list[str], env: dict | None = N
     return done.returncode, done.stdout, done.stderr, time.monotonic() - started
 
 
+# The scope's anonymous and kernel memory at its peak (research round 8: the gate's Linux memory
+# metric; memory.peak also counts the file cache the case's reads were charged, which depends on
+# what the host had cached). cgroup v2 keeps no such peak: a thread outside the measured process
+# samples memory.stat every 50 ms, so a spike shorter than that can be missed.
+SCOPE_ANON_KERNEL = re.compile(r"^fast-anon-kernel-peak (\d+)$", re.M)
+KERNEL_PARTS = ("kernel_stack", "pagetables", "sec_pagetables", "percpu", "sock", "vmalloc", "slab")
+
+
+def anon_kernel_bytes(stat: str) -> int | None:
+    """anon + kernel from a cgroup's memory.stat (kernel: its own field, else the sum of its parts)."""
+    fields = dict(line.split() for line in stat.splitlines() if len(line.split()) == 2)
+    if "anon" not in fields:
+        return None
+    kernel = int(fields["kernel"]) if "kernel" in fields else sum(int(fields.get(k, 0)) for k in KERNEL_PARTS)
+    return int(fields["anon"]) + kernel
+
+
+class AnonKernelSampler(threading.Thread):
+    """Samples a scope's anon + kernel memory until stopped; `peak`: the largest seen. The scope's
+    cgroup directory is what the command's wrapper writes to `where` once it runs in it."""
+
+    def __init__(self, where: Path, period_s: float = 0.05):
+        super().__init__(daemon=True)
+        self.where, self.period_s, self.peak = where, period_s, None
+        self.halt = threading.Event()
+
+    def run(self):
+        stat = None
+        while not self.halt.is_set():
+            try:
+                if stat is None:
+                    group = self.where.read_text().strip() if self.where.is_file() else ""
+                    stat = Path(group) / "memory.stat" if group else None
+                value = anon_kernel_bytes(stat.read_text()) if stat else None
+            except OSError:
+                value = None
+            if value is not None:
+                self.peak = max(self.peak or 0, value)
+            self.halt.wait(self.period_s if stat else 0.005)
+
+    def stop(self) -> int | None:
+        self.halt.set()
+        self.join(timeout=2)
+        return self.peak
+
+
 def process(name: str, cap_gb: float, command: list[str], env: dict | None = None,
             timeout: float | None = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
     """`container` natively: the command, its container paths mapped (native_dirs), in a user
@@ -262,7 +309,7 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     # The process's initial stack sits below its environment: a pad of random size each process
     # moves it (Mytkowicz et al., ASPLOS 2009), on top of address randomisation.
     pad = {"NRESE_LAYOUT_PAD": "x" * random.SystemRandom().randrange(0, 4096)}
-    wrapper = ('g=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); "$@"; rc=$?; '
+    wrapper = ('g=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "$g" > "$FAST_SCOPE_DIR"; "$@"; rc=$?; '
                'echo "fast-scope-peak $(cat "$g/memory.peak" 2>/dev/null)" >&2; p=; '
                'for r in cpu io memory; do p="$p $r=$(sed -n "s/^some .*total=//p" "$g/$r.pressure" 2>/dev/null)"; done; '
                'echo "fast-scope-pressure$p" >&2; exit $rc')
@@ -273,13 +320,19 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
             "sh", "-c", wrapper, "sh", *(native(c, dirs) for c in command)]
     started = time.monotonic()
     cleanup_error = ""
+    where = FAST_DATA / f".scope-{unit}"
+    sampler = AnonKernelSampler(where)
+    sampler.start()
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
-                              errors="replace", env={**ENV, **pad, **{k: str(v) for k, v in (env or {}).items()}},
+                              errors="replace", env={**ENV, **pad, "FAST_SCOPE_DIR": str(where),
+                                                     **{k: str(v) for k, v in (env or {}).items()}},
                               pass_fds=tuple(map(int, os.environ.get("SUITE_LEASE_FDS", "").split())))
     except subprocess.TimeoutExpired:
         done = subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout} s")
     finally:
+        anon_kernel = sampler.stop()
+        where.unlink(missing_ok=True)
         # Nothing outlives its case: what the scope still holds (a child the command left) goes.
         try:
             end_scope(unit)
@@ -292,7 +345,8 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     pressures = SCOPE_PRESSURE.findall(done.stderr)
     err = SCOPE_PRESSURE.sub("", SCOPE_PEAK.sub("", done.stderr)).rstrip("\n")
     err = ((f"fast-scope-peak {peaks[-1]}\n" if peaks else "")
-           + (f"fast-scope-pressure{pressures[-1]}\n" if pressures else "") + err)
+           + (f"fast-scope-pressure{pressures[-1]}\n" if pressures else "")
+           + (f"fast-anon-kernel-peak {anon_kernel}\n" if anon_kernel else "") + err)
     if cleanup_error:
         err += "\n" + cleanup_error
     return done.returncode or (1 if cleanup_error else 0), done.stdout, err, time.monotonic() - started
@@ -980,6 +1034,10 @@ def invocation_observation(case: dict, result: dict, stderr: str, identity: dict
             "rows": {q["name"]: q.get("rows") for q in result.get("queries", []) if "name" in q},
             "phase_peaks": phases, "peak_mib": peak, "memory_kind": "lifetime" if peak else "unknown",
             "cgroup_peak_mib": result.get("cgroup_peak_mib") or scope_peak_mib(stderr),
+            **({"anon_kernel_peak_bytes": int(found[-1])} if (found := SCOPE_ANON_KERNEL.findall(stderr or "")) else {}),
+            **({"peak_live_requested_bytes": result["peak_live_requested_bytes"]}
+               if isinstance(result.get("peak_live_requested_bytes"), int) else {}),
+            **({"peak_kind": result["peak_kind"]} if result.get("peak_kind") else {}),
             **({"stall_ms": stalls} if (stalls := scope_stalls_ms(stderr)) else {})}
 
 
@@ -1028,7 +1086,7 @@ def counters(case: dict, result: dict) -> dict:
             if field in q:
                 out[f"q.{q['name']}.{field}"] = q[field]
     for phase, values in (result.get("phases") or {}).items():
-        for field in ("allocations", "allocated_mib"):
+        for field in ("allocations", "requested_mib", "allocated_mib"):
             if field in values:
                 out[f"phases.{phase}.{field}"] = values[field]
     return out
@@ -1615,6 +1673,102 @@ def run(args) -> int:
     return 1 if bad else 0
 
 
+def palindrome(sides: list[str], block: int) -> list[tuple[str, int]]:
+    """A block's runs of one case: the sides, then the same mirrored (base, main, cand, cand,
+    main, base), each side's two runs centred on the same instant whatever their durations; even
+    blocks start from the other end. Each entry: (side, its run 1 or 2)."""
+    order = sides if block % 2 else sides[::-1]
+    return [(s, 1) for s in order] + [(s, 2) for s in order[::-1]]
+
+
+def parse_side(spec: str) -> dict:
+    """`NAME:BINDIR:REVISION[:FLAGS]`, FLAGS comma-separated: no-routes, empty-queries,
+    timing=watchdog|spawn (the build's CAPABILITIES)."""
+    name, binaries, revision, *rest = spec.split(":", 3)
+    flags = set((rest[0] if rest else "").split(",")) - {""}
+    timing = next((f.split("=", 1)[1] for f in flags if f.startswith("timing=")), None)
+    return {"name": name, "bin": binaries, "revision": revision, "routes": "no-routes" not in flags,
+            "empty_queries": "empty-queries" in flags, "timing": timing}
+
+
+def use_side(side: dict) -> None:
+    """The runs that follow are the side's: its binaries, revision and perf lab's options."""
+    os.environ["NRESE_FAST_BIN"] = side["bin"]
+    os.environ["NRESE_FAST_REVISION"] = side["revision"]
+    OPTIONS.update(routes=side["routes"], empty_queries=side["empty_queries"], timing=side["timing"])
+
+
+def block(args) -> int:
+    """`block`: one block of a release gate: every case run on every side as a palindrome
+    (palindrome()), the runs written as one report per side and run, `pass-<n>-<side>.json`
+    (n: the run's place in the block, 6 (block - 1) + 1 ...), each record with its block, layout
+    and nanosecond start and end."""
+    if RUNTIME != "native":
+        sys.exit("block is the native runtime's (a release gate's host)")
+    sides = [parse_side(s) for s in args.side]
+    catalog = load_cases()
+    cases = select(catalog, args)
+    OPTIONS.update(prepared=True)
+    MEASURE.clear()
+    OPTIONS["measure"], OPTIONS["batch"] = None, getattr(args, "batch", False)
+    if args.measure:
+        found, OPTIONS["measure"] = load_measure(Path(args.measure))
+        MEASURE.update(found)
+    OPTIONS["cpus"] = pinned_cpus()
+    prepared = prepared_inputs(cases)
+    if prepared["errors"]:
+        print("\n".join(f"prepared data: {e}" for e in prepared["errors"]), file=sys.stderr)
+        return 2
+    order = palindrome([s["name"] for s in sides], args.block)
+    place = {run: 6 * (args.block - 1) + i + 1 for i, run in enumerate(order)} if len(sides) == 3 else \
+        {run: len(order) * (args.block - 1) + i + 1 for i, run in enumerate(order)}
+    by_name = {s["name"]: s for s in sides}
+    started = time.time_ns()
+    common = {"started": datetime.datetime.now().isoformat(timespec="seconds"), "git": manifest.git(ROOT),
+              "machine": manifest.machine(RUNTIME), "runtime": RUNTIME, "reps": 1, "block": args.block,
+              "layout": args.layout, "planned_cases": [c["name"] for c in cases],
+              "case_manifest": case_manifest(catalog), "host_state": host_state(),
+              "prepared": {"manifest_sha256": prepared["sha256"], "files": len(prepared["files"])}}
+    reports = {}
+    for name, run in order:
+        use_side(by_name[name])
+        reports[(name, run)] = {**common, "label": f"gate-{place[(name, run)]}-{name}", "side": name, "run": run,
+                                "options": dict(OPTIONS), "binaries": binaries(), "records": []}
+    args.out.mkdir(parents=True, exist_ok=True)
+    for case in cases:
+        for name, run in order:
+            use_side(by_name[name])
+            t0 = time.monotonic()
+            start_ns = time.time_ns()
+            try:
+                record = run_case(case, f"gate-{args.block}-{name}", 1)
+            except Exception as error:  # a case that breaks mustn't stop the block
+                record = {"case": case["name"], "rep": 1, "status": "failed", "notes": [str(error)[:300]],
+                          "checks": [], "routes": [], "samples": {}, "metric": None,
+                          "expected_outcome": case.get("outcome", "ok")}
+            record["verdict"] = verdict(case, record)
+            record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
+            record.update(started_ns=start_ns, finished_ns=time.time_ns(), block=args.block, layout=args.layout,
+                          side=name, run=run)
+            reports[(name, run)]["records"].append(record)
+            print(f"block {args.block} {case['name']:<24} {name:<5} {run} {record['status']:<13} "
+                  f"{record['case_s']:>6.1f} s", flush=True)
+    finished = {"git_finished": manifest.git(ROOT), "host_state_finished": host_state()}
+    changed = changed_inputs(prepared["files"])
+    bad = 0
+    for (name, run), report in reports.items():
+        use_side(by_name[name])
+        records = report["records"]
+        report.update(finished, binaries_finished=binaries(), finished=datetime.datetime.now().isoformat(timespec="seconds"),
+                      started_ns=min((r["started_ns"] for r in records), default=started),
+                      finished_ns=max((r["finished_ns"] for r in records), default=time.time_ns()))
+        report["prepared"] = {**report["prepared"], "changed": changed}
+        (args.out / f"pass-{place[(name, run)]}-{name}.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+        bad += len(not_as_expected(records))
+    print(f"block {args.block}: {len(cases)} cases x {len(order)} runs, layout {args.layout}; {bad} runs not as expected")
+    return 1 if bad else 0
+
+
 # --- what is kept ----------------------------------------------------------------------------
 
 
@@ -1784,6 +1938,16 @@ def main() -> int:
             s.add_argument("--counts-only", action="store_true",
                            help="the printer's verdicts for the rewritten comparators only: rows against "
                                 "NRESE's, no timings, no slot")
+    s = sub.add_parser("block", help="one block of a release gate: every case on every side, as a palindrome")
+    s.add_argument("--cases")
+    s.add_argument("--areas")
+    s.add_argument("--side", action="append", required=True, metavar="NAME:BINDIR:REVISION[:FLAGS]",
+                   help="a side, in order (base, main, cand); FLAGS: no-routes, empty-queries, timing=...")
+    s.add_argument("--block", type=int, required=True)
+    s.add_argument("--layout", type=int, default=1)
+    s.add_argument("--measure", metavar="TOML")
+    s.add_argument("--batch", action="store_true")
+    s.add_argument("--out", type=Path, required=True, help="the directory the side-runs' reports go to")
     t = sub.add_parser("table")
     t.add_argument("--baseline", help="a run's report, for each case's time and peak")
     t.add_argument("--write", action="store_true", help="into benches/CATALOG.md between its markers")
@@ -1805,7 +1969,7 @@ def main() -> int:
         from compete import compete
         return compete(args)
     return {"list": list_cases, "build": build, "run": run, "compare": compare, "clean": clean,
-            "table": table, "prepare": prepare}[args.command](args)
+            "table": table, "prepare": prepare, "block": block}[args.command](args)
 
 
 if __name__ == "__main__":

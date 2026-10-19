@@ -1,8 +1,9 @@
 # Noisy series: the release gate's work list
 
 The release gate tolerates no loss (benches/PROTOCOL.md §5, "The release gate"); a series whose
-run-to-run noise is large can't be decided at a practical number of passes, so it ends as
-*suspect* and blocks. These are to be fixed, not tolerated. The list: every series whose noise
+run-to-run noise is large can't be decided at a practical number of blocks: a loss there goes
+unseen (the gate controls false blocks, so noise costs power, not blocks). These are to be
+fixed, not tolerated; `probes/gate-power.py power` gives each case's blocks at its noise. The list: every series whose noise
 (the standard deviation of the log of its four per-pass medians) exceeds 5 % in the A-B-B-A
 passes of 14 Oct 2026 on phuoc-yu: 137 of the 621 series of at least 5 µs, each
 binary measured on its own (v1.5 0f465633 and v2 32ecf1e5 on the fast suite; main f9b515e8 and v2

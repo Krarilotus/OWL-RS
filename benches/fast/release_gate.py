@@ -32,17 +32,19 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import cases as cases_registry  # noqa: E402
-from suitekit.compare import CONFIDENCE, PRECISION, RESOLUTION, counter_changes, judge  # noqa: E402
+from suitekit import gatestats  # noqa: E402
+from suitekit.compare import counter_changes  # noqa: E402
+from suitekit import hosts as hosts_registry  # noqa: E402
 from suitekit.hosts import run_identity  # noqa: E402
 
-CAMPAIGN_PASSES = 4  # per side: A-B-C-C-B-A twice
+CAMPAIGN_BLOCKS = 2  # blocks a round at least (each: every case on every side, twice, as a palindrome)
 PASS_FILE = re.compile(r"pass-(\d+)-([A-Za-z0-9_.-]+)\.json$")
 
 
 # --- plan --------------------------------------------------------------------------------------
 
 def plan(catalog: list[dict], max_gb: float, selection: list[str] | None = None, min_gb: float = 0,
-         big_gb: float | None = None, big_host: str = "khaleesi") -> tuple[list[str], dict, dict]:
+         big_gb: float | None = None, big_host: str = "khaleesi-wsl") -> tuple[list[str], dict, dict]:
     """The cases a host giving `max_gb` runs at their declared caps (those above `min_gb`: the big
     host's share), the cases a big host giving `big_gb` runs instead (`elsewhere`), and the
     others with why. A cap is never lowered to fit (PROTOCOL.md §3)."""
@@ -74,68 +76,71 @@ def load_passes(directory: Path) -> list[dict]:
     return passes
 
 
-STATUS_PASSES = 2  # a case with a declared outcome (a known limit): its status checked, not timed
 
 
-def schedule_errors(passes: list[dict], sides: list[str], min_passes: int,
-                    status_only: set[str] | None = None) -> list[str]:
-    """Defect 1 (audit, 18 Oct 2026): a gate passed with one baseline and passes whose times
-    overlapped. Every side needs at least `min_passes` passes, all sides as many; the passes
-    ran one after another (each ended before the next began, no two began at once); their
-    order is a palindrome (A-B-B-A, A-B-C-C-B-A ...), so a drift linear in time falls on every
-    side alike, and no side ran more than two passes in a row."""
+def schedule_errors(passes: list[dict], sides: list[str], min_blocks: int,
+                    status_only: set[str] | None = None, layouts: int = 1) -> list[str]:
+    """What the passes' schedule must be. A pass is one side's run of one block (fast.py block:
+    pass-<n>-<side>.json with its block, run and layout). Every block has every side's two runs;
+    within a block each case ran on the sides as a palindrome (A B C C B A, or mirrored), its six
+    runs back to back (no other case between them: each side's two runs are then centred on the
+    same instant whatever the runs' durations, research round 8); blocks didn't overlap. Every case
+    is in at least `min_blocks` blocks (a declared outcome's in one, `status_only`) and, with
+    `layouts` > 1, its blocks cover every layout, each as often to within one."""
     errors = []
-    counts = Counter(p["side"] for p in passes)
-    for side in sides:
-        if counts[side] < min_passes:
-            errors.append(f"{side}: {counts[side]} passes, at least {min_passes} required")
-    if extra := set(counts) - set(sides):
-        errors.append(f"passes of undeclared sides: {', '.join(sorted(extra))}")
-    if len({counts[s] for s in sides}) > 1:
-        errors.append("the sides have different numbers of passes: " + ", ".join(f"{s} {counts[s]}" for s in sides))
-    timed = []
+    blocks: dict[int, list[dict]] = {}
     for p in passes:
         r = p["report"]
-        start, end = r.get("started_ns"), r.get("finished_ns")
-        if not isinstance(start, int) or not isinstance(end, int) or not r.get("finished"):
-            errors.append(f"{p['path']}: no start or end time (unfinished pass)")
-        elif end <= start:
-            errors.append(f"{p['path']}: ends before it starts")
-        else:
-            timed.append((start, end, p))
-    timed.sort(key=lambda t: t[0])
-    for (s1, e1, a), (s2, e2, b) in zip(timed, timed[1:]):
-        if s2 == s1:
-            errors.append(f"{a['path']} and {b['path']} started at the same time")
-        elif s2 < e1:
-            errors.append(f"{a['path']} and {b['path']} overlap: the passes didn't run one at a time")
-    if [p["n"] for _, _, p in timed] != sorted(p["n"] for _, _, p in timed):
-        errors.append("the passes' numbers don't follow the order they ran in")
-    order = [p["side"] for _, _, p in timed]
-    if order != order[::-1]:
-        errors.append(f"not interleaved A-B-B-A: the passes ran {'-'.join(order)}, not a palindrome")
-    run = 1
-    for x, y in zip(order, order[1:]):
-        run = run + 1 if x == y else 1
-        if run > 2:
-            errors.append(f"{x} ran more than two passes in a row ({'-'.join(order)})")
-            break
-    # A case in only some passes (a later block's, its noise needing more passes): the passes
-    # that ran it keep the same rules, each side as many, at least `min_passes`, a palindrome.
-    by_case: dict[str, list[str]] = {}
-    for _, _, p in timed:
-        for case in p["report"].get("planned_cases") or []:
-            by_case.setdefault(case, []).append(p["side"])
-    for case, sub in sorted(by_case.items()):
-        if len(sub) == len(order):
+        if not isinstance(r.get("block"), int) or r.get("run") not in (1, 2):
+            errors.append(f"{p['path']}: no block and run (not a pass of fast.py block)")
             continue
-        counts = Counter(sub)
-        least = STATUS_PASSES if case in (status_only or set()) else min_passes
-        if any(counts[s] < least for s in sides) or len({counts[s] for s in sides}) > 1:
-            errors.append(f"{case}: " + ", ".join(f"{s} {counts[s]}" for s in sides)
-                          + f" passes; each side as many, at least {least}")
-        elif sub != sub[::-1]:
-            errors.append(f"{case}: its passes ran {'-'.join(sub)}, not a palindrome")
+        if not r.get("finished") or not isinstance(r.get("finished_ns"), int):
+            errors.append(f"{p['path']}: no end time (unfinished pass)")
+        blocks.setdefault(r["block"], []).append(p)
+    spans = []
+    case_blocks: dict[str, list[int]] = {}
+    case_layouts: dict[str, Counter] = {}
+    for b, members in sorted(blocks.items()):
+        runs = Counter((p["side"], p["report"]["run"]) for p in members)
+        if set(runs) != {(s, r) for s in sides for r in (1, 2)} or any(n != 1 for n in runs.values()):
+            errors.append(f"block {b}: its runs are {sorted(runs)}, not each side's two")
+            continue
+        layout = {p["report"].get("layout", 1) for p in members}
+        if len(layout) != 1:
+            errors.append(f"block {b}: its sides ran different layouts {sorted(layout)}")
+        records = sorted(((rec.get("started_ns") or 0, rec.get("finished_ns") or 0, rec["case"], p["side"])
+                          for p in members for rec in p["report"].get("records", [])), key=lambda x: x[0])
+        if not records:
+            continue
+        spans.append((records[0][0], max(r[1] for r in records), b))
+        i = 0
+        while i < len(records):
+            case = records[i][2]
+            run = records[i:i + 2 * len(sides)]
+            if [r[2] for r in run] != [case] * (2 * len(sides)):
+                errors.append(f"block {b}: {case}'s runs aren't back to back")
+                break
+            seq = [r[3] for r in run]
+            if seq != seq[::-1] or sorted(seq[:len(sides)]) != sorted(sides):
+                errors.append(f"block {b}: {case} ran {'-'.join(r[3] for r in run)}, not a palindrome")
+            case_blocks.setdefault(case, []).append(b)
+            case_layouts.setdefault(case, Counter())[next(iter(layout))] += 1
+            i += 2 * len(sides)
+    spans.sort()
+    for (s1, e1, a), (s2, e2, b) in zip(spans, spans[1:]):
+        if s2 < e1:
+            errors.append(f"blocks {a} and {b} overlap")
+    for case, seen in sorted(case_blocks.items()):
+        least = 1 if case in (status_only or set()) else min_blocks
+        if len(seen) < least:
+            errors.append(f"{case}: {len(seen)} blocks, at least {least}")
+        counts = case_layouts[case]
+        if layouts > 1 and case not in (status_only or set()):
+            want = set(range(1, layouts + 1))
+            if len(seen) >= layouts and set(counts) != want:
+                errors.append(f"{case}: its blocks ran layouts {sorted(counts)}, not all of 1..{layouts}")
+            if counts and max(counts.values()) - min(counts.get(k, 0) for k in want) > 1:
+                errors.append(f"{case}: layouts unevenly covered {dict(sorted(counts.items()))}")
     return errors
 
 
@@ -213,18 +218,25 @@ def p50(values: list[float]) -> float:
 
 
 def evidence(passes: list[dict], case: str) -> dict:
-    """One side's evidence of a case, pass by pass."""
+    """One side's evidence of a case, pass by pass, each pass's block and layout beside it."""
     out = {"status": [], "expected": [], "failed_checks": [], "failed_routes": [], "unchecked": 0, "notes": [],
-           "samples": [],
-           "process": [], "estimator": set(), "lifetime": [], "phases": [], "cgroup": [], "qps": [],
+           "samples": [], "blocks": [], "layouts": [],
+           "process": [], "estimator": set(), "lifetime": [], "anon_kernel": [], "live": [], "kinds": set(),
+           "phases": [], "cgroup": [], "qps": [],
            "client_peaks": [], "cache_peaks": [], "rows": [], "counters": {}, "batched": {}}
     for p in passes:
         if case not in (p["report"].get("planned_cases") or [case]):
             continue  # a later block's pass, without this case (its noise needs no more)
         record = next((r for r in p["report"]["records"] if r.get("case") == case), None)
+        out["blocks"].append(p["report"].get("block", p["n"]))
+        out["layouts"].append(p["report"].get("layout", 1))
         if record is None:
             out["status"].append("missing")
             out["expected"].append("ok")
+            for key in ("samples", "process", "lifetime", "anon_kernel", "live", "phases", "cgroup", "qps",
+                        "client_peaks", "cache_peaks", "rows"):
+                out[key].append({} if key in ("samples", "process", "phases", "qps", "client_peaks", "cache_peaks",
+                                              "rows") else None)
             continue
         observations = record.get("observations") or []
         out["status"].append(record.get("status"))
@@ -248,6 +260,10 @@ def evidence(passes: list[dict], case: str) -> dict:
         peaks = [o.get("peak_mib") for o in observations if o.get("peak_mib")] or \
             ([record["peak_mib"]] if record.get("peak_mib") else [])
         out["lifetime"].append(max(peaks) if peaks else None)
+        out["kinds"] |= {o.get("peak_kind") for o in observations if o.get("peak_kind")}
+        for key, field in (("anon_kernel", "anon_kernel_peak_bytes"), ("live", "peak_live_requested_bytes")):
+            values = [o.get(field) for o in observations if isinstance(o.get(field), (int, float))]
+            out[key].append(max(values) if values else None)
         phases: dict[str, float] = {}
         for o in observations or [record]:
             for phase, peak in (o.get("phase_peaks") or {}).items():
@@ -311,7 +327,7 @@ def why_not(e: dict, side: str) -> str:
 
 
 def per_pass(values: list, key: str | None = None) -> list[list[float]]:
-    """A dimension's values as judge() takes them: per pass, a list."""
+    """A dimension's values per pass, each a list."""
     out = []
     for v in values:
         v = v.get(key) if key is not None else v
@@ -331,15 +347,13 @@ def quantum(sides: list[list[list[float]]]) -> float:
 
 
 def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str]) -> dict:
-    """The candidate's case against one baseline's, dimension by dimension."""
+    """The candidate's case against one baseline's, dimension by dimension, by blocks."""
     row = {"comparable": True, "dimensions": {}, "notes": [], "blocks": [], "reported": {}}
     base_state = state(base, off_route_ok=True)
     if state(base) == "known" and state(cand) == "known":
         return {**row, "comparable": False, "reason": "a known issue on both sides (no timing verdict)"}
     if state(cand) == "known":
         if base_state == "ok":
-            # The candidate stops at its declared limit where the baseline finished: that is a
-            # loss, whatever the declaration says.
             row["blocks"].append(f"stops at its declared outcome ({', '.join(sorted(set(cand['status'])))}) "
                                  f"where {side} completed")
         return {**row, "comparable": False, "reason": "the candidate's known issue"}
@@ -348,7 +362,6 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str]) -
     if base["failed_routes"]:
         row["notes"].append(f"{side} is off the route the harness asserts ({base['failed_routes'][0]}); "
                             "its answers are right, its time compared")
-    # Answers: each query's rows on both sides (every side reports them, main's perf lab too).
     differ = sorted(q for q in set(cand["rows"][0] if cand["rows"] else {}) &
                     set(base["rows"][0] if base["rows"] else {})
                     if {r.get(q) for r in cand["rows"]} != {r.get(q) for r in base["rows"]})
@@ -361,53 +374,60 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str]) -
             row["notes"].append(f"{text}: the candidate's match its pinned answer; {side}'s time not compared")
         else:
             row["blocks"].append(f"{text}: answers differ and no check pins them")
+    layouts = {b: l for e in (cand, base) for b, l in zip(e["blocks"], e["layouts"])}
+    bb, cb = base["blocks"], cand["blocks"]
+
+    def judge_key(name, key, unit, higher=False, sub=None, step=None):
+        bv, cv = per_pass(base[key], sub), per_pass(cand[key], sub)
+        row["dimensions"][name] = dimension(bv, bb, cv, cb, layouts, unit, higher, step)
+
     adapted = "process-p50" in cand["estimator"] | base["estimator"]
     if adapted:
         row["notes"].append(f"times as one p50 per process on both sides ({side}'s perf lab reports no samples)")
-    values = {"cand": cand["process" if adapted else "samples"], "base": base["process" if adapted else "samples"]}
-    series = sorted({s for rep in values["cand"] + values["base"] for s in rep})
+    key = "process" if adapted else "samples"
+    series = sorted({s for rep in cand[key] + base[key] for s in rep})
     for s in series:
         if s in excluded:
             continue
-        on_cand = all(s in rep for rep in values["cand"])
-        on_base = all(s in rep for rep in values["base"])
+        on_cand = all(s in rep for rep in cand[key])
+        on_base = all(s in rep for rep in base[key])
         if not on_cand and on_base:
             row["blocks"].append(f"time/{s}: lost (on {side}, not on every pass of the candidate)")
             continue
         if not on_base:
             row["notes"].append(f"time/{s}: not on every pass of {side}, not compared")
             continue
-        # Batched on both sides (every pass): the resolution of a sample of K executions. A
-        # series reported in coarser steps (quantum): a difference of one step is no verdict.
         k = min(cand["batched"].get(s, 1), base["batched"].get(s, 1))
-        b_, c_ = per_pass(values["base"], s), per_pass(values["cand"], s)
-        resolution = RESOLUTION["ms"] / k if k > 1 else RESOLUTION["ms"]
-        if (q := quantum([b_, c_])) > resolution:
-            resolution = q * 1.001
-        row["dimensions"][f"time/{s}"] = judge(b_, c_, unit="ms", resolution=resolution)
+        step = max(COUNTER_STEP["ms"] / k, quantum([per_pass(base[key], s), per_pass(cand[key], s)]))
+        judge_key(f"time/{s}", key, "ms", sub=s, step=step)
     if not series:
         row["blocks"].append("no timing evidence")
-    # Memory (one policy, PROTOCOL.md §5): the process's own peak (VmHWM, every side's perf lab)
-    # and each phase's are judged; the scope's cgroup peak, which also counts the page cache
-    # the case's reads were charged, is reported beside them, never judged.
-    if any(base["lifetime"]) or any(cand["lifetime"]):
-        row["dimensions"]["memory/lifetime"] = judge(per_pass(base["lifetime"]), per_pass(cand["lifetime"]), unit="MiB")
-    else:
-        row["notes"].append("memory/lifetime: the tool reports no process peak on either side (the cgroup's is reported)")
-    if any(cand["phases"]) and not any(base["phases"]):
-        row["notes"].append(f"phase peaks: {side}'s perf lab reports none, not compared")
-    for name, key, unit, higher in (("memory/phase", "phases", "MiB", False), ("qps", "qps", "qps", True),
-                                    ("memory/clients", "client_peaks", "MiB", False),
-                                    ("memory/cache", "cache_peaks", "MiB", False)):
-        for k in sorted({k for rep in cand[key] + base[key] for k in rep}):
-            on_cand, on_base = (all(k in rep for rep in e[key]) for e in (cand, base))
+    # Memory (research round 8): judged where both sides report them, the scope's anonymous and
+    # kernel memory (Linux: its cgroup's anon + kernel, sampled; the file cache left out) and the
+    # perf lab's peak live requested bytes; the process's own peak (VmHWM on Linux, peak private
+    # commit on Windows: its kind is named) and the phases' are reported, as is the cgroup's.
+    for name, field in (("memory/anon_kernel", "anon_kernel"), ("memory/live", "live")):
+        if any(v is not None for v in base[field]) and any(v is not None for v in cand[field]):
+            judge_key(name, field, "bytes")
+        elif any(v is not None for v in cand[field]):
+            row["notes"].append(f"{name}: {side} reports none, not compared")
+    kinds = sorted(cand["kinds"] | base["kinds"]) or ["vmhwm"]
+    for name, key_, unit, higher in (("qps", "qps", "qps", True),):
+        for k in sorted({k for rep in cand[key_] + base[key_] for k in rep}):
+            on_cand, on_base = (all(k in rep for rep in e[key_]) for e in (cand, base))
             if on_base and not on_cand:
                 row["blocks"].append(f"{name}/{k}: lost (on {side}, not on every pass of the candidate)")
             elif on_base:
-                row["dimensions"][f"{name}/{k}"] = judge(per_pass(base[key], k), per_pass(cand[key], k),
-                                                         unit=unit, higher_is_better=higher)
-            elif any(base[key]):
-                row["notes"].append(f"{name}/{k}: not on every pass of {side}, not compared")
+                judge_key(f"{name}/{k}", key_, unit, higher, sub=k)
+    reported = {}
+    if any(base["lifetime"]) and any(cand["lifetime"]):
+        reported[f"memory/{'+'.join(kinds)}"] = dimension(per_pass(base["lifetime"]), bb, per_pass(cand["lifetime"]),
+                                                          cb, layouts, "MiB")
+    for k in sorted({k for rep in cand["phases"] + base["phases"] for k in rep}):
+        if all(k in rep for rep in base["phases"]) and all(k in rep for rep in cand["phases"]):
+            reported[f"memory/phase/{k}"] = dimension(per_pass(base["phases"], k), bb, per_pass(cand["phases"], k),
+                                                      cb, layouts, "MiB")
+    row["reported"]["memory"] = {k: {f: v.get(f) for f in ("ratio", "ci", "p", "status")} for k, v in reported.items()}
     cgroups = [[v for v in e["cgroup"] if v] for e in (base, cand)]
     row["reported"]["cgroup_peak_mib"] = [statistics.median(v) if v else None for v in cgroups]
     common = {k: v for k, v in base["counters"].items() if k in cand["counters"]}
@@ -419,12 +439,11 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str]) -
 
 def describe(r: dict) -> str:
     if r.get("ratio") is None:
-        return f"{r['passes'][0]} and {r['passes'][1]} passes with values"
-    ci = f" [{r['ci'][0]:.3f}, {r['ci'][1]:.3f}]" if r.get("ci") else ""
-    more = f"; needs {r['needs_passes']} passes a side" if r.get("needs_passes") else (
-        "; more passes won't settle it" if r["verdict"] == "suspect" else "")
-    return (f"{fmt(r['base'])} -> {fmt(r['new'])} {r['unit']}, ratio {r['ratio']:.3f}{ci}, "
-            f"noise {fmt(r.get('noise'))}{more}")
+        return f"{r.get('blocks', 0)} blocks with values on both sides"
+    ci = f" [{r['ci'][0]:.4f}, {r['ci'][1]:.4f}]" if r.get("ci") else ""
+    flip = f", sign-flip p {r['p_sign_flip']:.3g}" if r.get("p_sign_flip") is not None else ""
+    return (f"{fmt(r['base'])} -> {fmt(r['new'])} {r['unit']}, ratio {r['ratio']:.4f}{ci}, one-sided p {r['p']:.3g}"
+            f"{flip}, {r['units']} units of {r['blocks']} blocks")
 
 
 def worse_end(r: dict) -> float | None:
@@ -432,6 +451,149 @@ def worse_end(r: dict) -> float | None:
     if not r.get("ci"):
         return None
     return 1 / r["ci"][0] if r.get("higher_is_better") else r["ci"][1]
+
+
+def block_contrasts(base: list[list[float]], base_blocks: list, new: list[list[float]], new_blocks: list,
+                    layouts: dict) -> tuple[list[float], list, float, float]:
+    """Per block present on both sides: log(median of the candidate's values in it / median of the
+    baseline's); the blocks' layouts; the medians of all the baseline's and candidate's values."""
+    def by_block(values, blocks):
+        out: dict = {}
+        for vs, b in zip(values, blocks):
+            out.setdefault(b, []).extend(v for v in vs if isinstance(v, (int, float)) and math.isfinite(v))
+        return out
+    b_, n_ = by_block(base, base_blocks), by_block(new, new_blocks)
+    contrasts, lays = [], []
+    for block in sorted(set(b_) & set(n_), key=str):
+        if b_[block] and n_[block]:
+            mb, mn = statistics.median(b_[block]), statistics.median(n_[block])
+            if mb > 0 and mn > 0:
+                contrasts.append(math.log(mn / mb))
+                lays.append(layouts.get(block, 1))
+    every_b = [v for vs in b_.values() for v in vs]
+    every_n = [v for vs in n_.values() for v in vs]
+    return contrasts, lays, (statistics.median(every_b) if every_b else None), \
+        (statistics.median(every_n) if every_n else None)
+
+
+# The counters' own resolution (research round 8: not a tolerance; a difference within it the test
+# doesn't reject is `unresolved`, never neutral): times to the reported step (quantum(), batches
+# dividing it), peaks in bytes where reported, else whole MiB.
+COUNTER_STEP = {"ms": 0.001, "MiB": 1.0, "bytes": 1.0, "qps": 0.0}
+
+
+def dimension(base: list[list[float]], base_blocks: list, new: list[list[float]], new_blocks: list,
+              layouts: dict, unit: str, higher_is_better: bool = False, step: float | None = None) -> dict:
+    """One dimension: its block contrasts and the one-sided test of a loss (gatestats.loss_test)."""
+    contrasts, lays, b, n = block_contrasts(base, base_blocks, new, new_blocks, layouts)
+    step = COUNTER_STEP[unit] if step is None else step
+    r = gatestats.loss_test(contrasts, lays, higher_is_better, resolution=step, scale=b or 0)
+    out = {"unit": unit, "higher_is_better": higher_is_better, "base": b, "new": n, "step": step, **r,
+           "ratio": math.exp(r["mean_log"]) if r["mean_log"] is not None else None}
+    if r["ci"]:
+        # The interval of new/base (gatestats tests the worse direction: undo its sign).
+        lo, hi = r["ci"]
+        out["ci"] = [math.exp(-hi), math.exp(-lo)] if higher_is_better else [math.exp(lo), math.exp(hi)]
+        if higher_is_better:
+            out["ratio"] = math.exp(-r["mean_log"])
+    if r["verdict"] == "incomplete":
+        out["status"] = "incomplete"
+    elif r["p"] <= gatestats.ALPHA * gatestats.PAIR_WEIGHTS[0]:
+        out["status"] = "loss shown"         # this round: a confirmation is due (rounds_needed)
+    elif r.get("below_resolution"):
+        out["status"] = "unresolved"         # within the counter's step, no loss shown
+    else:
+        out["status"] = "no loss shown"
+    return out
+
+
+def better_shown(r: dict) -> bool:
+    """A win: the whole interval on the better side."""
+    end = worse_end(r)
+    return end is not None and end < 1
+
+
+def hypothesis(side: str, case: str, dimension_: str) -> str:
+    return f"{side}|{case}|{dimension_}"
+
+
+# The phases each classifier tool times (fast.py's samples(): the profile's fields it reports).
+DL_TOOL_PHASES = {"classify-el": ("read", "normalise", "prepare", "saturate", "assemble", "write"),
+                  "classify-horn": ("read", "owl", "write")}
+
+
+def family_of(catalog: list[dict], cases: list[str], baselines: tuple[str, ...] = ("base", "main")) -> list[str]:
+    """The comparison family, declared before any result (research round 8): every planned
+    case's series and gated metrics, against each baseline. A case with a declared outcome is
+    checked, not timed: it adds none."""
+    import fast
+    manifest_ = fast.case_manifest(catalog)
+    by = {c["name"]: c for c in catalog}
+    out = []
+    for name in cases:
+        case = by[name]
+        if case.get("outcome", "ok") != "ok":
+            continue
+        tool = case.get("tool", "perf_lab")
+        series = manifest_["series"].get(name) or (list(fast.DL_PHASES) if tool == "tableau" else
+                                                   list(DL_TOOL_PHASES.get(tool, ["_"])))
+        dims = [f"time/{s}" for s in series]
+        dims += [f"qps/{n}" for n in manifest_["clients"].get(name, [])]
+        dims.append("memory/anon_kernel")
+        if "--count-allocations" in case.get("args", []):
+            dims.append("memory/live")
+        out += [hypothesis(side, name, d) for side in baselines for d in dims]
+    return out
+
+
+def block_layout(block: int, layouts: int) -> int:
+    """The layout block `block` (from 1) runs: they rotate, so any K blocks in a row cover all K
+    (research round 8: the old rotation never ran a third of the layouts when 3 divided K)."""
+    return (block - 1) % layouts + 1 if layouts > 1 else 1
+
+
+def block_step(gate_: list[str], n: int, harness: str, layout: int, plan_: str | None, revs: dict) -> list[str]:
+    return [*gate_, "block", str(n), harness, str(layout), plan_ or "-",
+            *(f"{side}={revs[side]}" for side in ("base", "main", "cand"))]
+
+
+def decide(parts: list[list[dict]]) -> dict:
+    """Every declared hypothesis of every timed part through its rounds: its p-value per round, the
+    combined p (gatestats.combine_rounds), and Holm over the whole family. `losses`: rejected
+    (blocks unless an approved trade-off covers it); `pending`: a round that could still reject it
+    hasn't run (round 2 for a round-1 p within 0.9 alpha; round 3 for one measured in round 2 that
+    round 3 could still get rejected, whether or not round 1 flagged it: a loss first seen while
+    confirming another is confirmed too, not dropped); everything else passes at the end of its
+    budget."""
+    family, rounds_p, where = [], {}, {}
+    for rounds in parts:
+        declared = rounds[0].get("family") or list(rounds[0].get("pvalues", {}))
+        family += [h for h in declared if h not in where]
+        for h in declared:
+            where[h] = rounds
+        for k, report in enumerate(rounds[:3]):
+            for h, p in (report.get("pvalues") or {}).items():
+                rounds_p.setdefault(h, [None, None, None])[k] = p
+    combined = {h: gatestats.combine_rounds(rounds_p.get(h, [None, None, None])) for h in family}
+    rejected = gatestats.holm(combined)
+    # Round 3 where it could still decide: Holm rejects it if every hypothesis measured in round 2
+    # came out of round 3 at p = 0 (Holm only rejects more as p-values fall, so nothing outside
+    # that set ever can). With a large family that takes a round-2 p near alpha / m, not 0.1 alpha.
+    third = {h for h in family
+             if h not in rejected and len(where[h]) == 2 and rounds_p.get(h, [None] * 3)[1] is not None}
+    best = gatestats.holm({h: gatestats.combine_rounds([*rounds_p[h][:2], 0.0]) if h in third else p
+                           for h, p in combined.items()})
+    pending = []
+    for h in family:
+        if h in rejected:
+            continue
+        ps = rounds_p.get(h, [None, None, None])
+        if ps[0] is not None and ps[0] <= gatestats.ALPHA * gatestats.PAIR_WEIGHTS[0] and len(where[h]) < 2:
+            pending.append(h)
+        elif h in third and h in best:
+            pending.append(h)
+    return {"family": family, "m": len(family), "combined": combined, "rounds": rounds_p,
+            "losses": sorted(rejected, key=lambda h: combined[h]), "pending": pending}
 
 
 # --- the owner-approved trade-offs (benches/release-tradeoffs.toml) ----------------------------
@@ -461,18 +623,18 @@ def load_tradeoffs(path: Path | None) -> tuple[list[dict], list[str]]:
     return ([] if errors else entries), errors
 
 
-def accepted(tradeoffs: list[dict], side: str, case: str, dimension: str, r: dict, comparisons: dict) -> dict | None:
+def accepted(tradeoffs: list[dict], side: str, case: str, dimension_: str, r: dict, comparisons: dict) -> dict | None:
     """The approved trade-off covering this loss, if one does: its case, dimension and baseline,
     the loss's interval within its max_ratio, and its paying win there."""
     for t in tradeoffs:
-        if (t["case"], t["dimension"]) != (case, dimension) or t.get("against", side) != side:
+        if (t["case"], t["dimension"]) != (case, dimension_) or t.get("against", side) != side:
             continue
         end = worse_end(r)
         if end is None or end > t["max_ratio"]:
             continue
         win = comparisons.get(side, {}).get(t["pays_with"]["case"], {}).get("dimensions", {}).get(
             t["pays_with"]["dimension"])
-        if win and win["verdict"] == "better":
+        if win and better_shown(win):
             return t
     return None
 
@@ -484,30 +646,35 @@ def fmt(x) -> str:
 # --- the timed part ----------------------------------------------------------------------------
 
 def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: list[str], harness: str,
-         min_passes: int = CAMPAIGN_PASSES, diagnostic: bool = False, not_run: dict | None = None,
+         min_blocks: int = CAMPAIGN_BLOCKS, diagnostic: bool = False, not_run: dict | None = None,
          tradeoffs: list[dict] | None = None, catalog: list[dict] | None = None, elsewhere: dict | None = None,
-         context: dict | None = None) -> dict:
+         context: dict | None = None, family: list[str] | None = None) -> dict:
+    """One round of one timed part: the schedule and provenance checked, every comparison's
+    blocks tested; each declared hypothesis's p-value (untested: 1). The decision over the family
+    and the rounds is verdict()'s."""
     not_run, tradeoffs, elsewhere = dict(not_run or {}), list(tradeoffs or []), dict(elsewhere or {})
     if candidate not in sides:
         raise ValueError(f"the candidate {candidate} is no declared side")
     baselines = [s for s in sides if s != candidate]
+    context = dict(context or {})
     summary = {"candidate": {"name": candidate, "revision": sides[candidate]},
                "baselines": {s: sides[s] for s in baselines}, "harness": harness,
-               "policy": {"confidence": CONFIDENCE, "precision": PRECISION, "resolution": RESOLUTION},
-               "passes": [{"n": p["n"], "side": p["side"], "file": p["path"],
-                           "started": p["report"].get("started"), "finished": p["report"].get("finished")}
+               "policy": {"alpha": gatestats.ALPHA, "pair_weights": gatestats.PAIR_WEIGHTS,
+                          "test": "one-sided t on log block contrasts, layouts the outer unit; Holm over the family"},
+               "passes": [{"n": p["n"], "side": p["side"], "file": p["path"], "block": p["report"].get("block"),
+                           "run": p["report"].get("run"), "layout": p["report"].get("layout")}
                           for p in sorted(passes, key=lambda p: p["n"])],
-               "diagnostic": diagnostic or min_passes < CAMPAIGN_PASSES, "required": required,
-               "context": dict(context or {}), "flagged": [], "other_blocking": [],
+               "diagnostic": diagnostic or min_blocks < CAMPAIGN_BLOCKS, "required": required,
+               "context": context, "flagged": [], "other_blocking": [], "pvalues": {},
                "not_run": not_run, "elsewhere": elsewhere, "tradeoffs": tradeoffs, "accepted": [], "errors": [],
-               "candidate_failures": {},
-               "known_issues": {}, "fixed": {}, "comparisons": {}, "blocking": []}
+               "candidate_failures": {}, "known_issues": {}, "fixed": {}, "comparisons": {}, "blocking": []}
     if missing := [s for s in required if s not in baselines]:
         summary["errors"].append(f"required baselines missing: {', '.join(missing)}")
     if len(baselines) < 1:
         summary["errors"].append("no baseline")
     status_only = {c["name"] for c in (catalog or []) if c.get("outcome", "ok") != "ok"}
-    summary["errors"] += schedule_errors(passes, list(sides), min_passes, status_only)
+    summary["errors"] += schedule_errors(passes, list(sides), min_blocks, status_only,
+                                         int(context.get("layouts", 1) or 1))
     planned = sorted({c for p in passes for c in p["report"].get("planned_cases", [])})
     summary["planned"] = planned
     summary["errors"] += provenance_errors(passes, sides, harness, planned)
@@ -533,7 +700,6 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                 continue
             row = compare_case(cand, evidence(by_side[side], case), side, checks.get(case, set()))
             summary["comparisons"].setdefault(side, {})[case] = row
-    # Each case's time a pass, per side (the confirmation job's estimate).
     summary["case_seconds"] = {}
     for p in passes:
         for r in p["report"].get("records", []):
@@ -544,72 +710,68 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
         summary["blocking"].append(f"{case}: the candidate fails ({why})")
     for case, why in not_run.items():
         summary["blocking"].append(f"{case}: not run ({why})")
-    needs = []
-    summary["other_blocking"] = list(summary["blocking"])
+    declared = list(family) if family is not None else [
+        hypothesis(side, case, d) for side, rows in summary["comparisons"].items()
+        for case, row in rows.items() for d in row["dimensions"]]
+    summary["family"] = declared
     for side, rows in summary["comparisons"].items():
         for case, row in rows.items():
             summary["blocking"] += [f"{case} against {side}: {b}" for b in row["blocks"]]
-            summary["other_blocking"] += [f"{case} against {side}: {b}" for b in row["blocks"]]
             for d, r in row["dimensions"].items():
-                if not r["blocks"]:
+                h = hypothesis(side, case, d)
+                if h not in declared:
+                    row["notes"].append(f"{d}: not in the declared family, reported only")
                     continue
-                # Nothing but an owner-approved trade-off accepts a loss.
-                t = accepted(tradeoffs, side, case, d, r, summary["comparisons"]) if r["verdict"] != "incomplete" else None
-                if t:
-                    r["accepted_tradeoff"] = {k: t[k] for k in ("max_ratio", "approved", "by", "reason", "pays_with")}
-                    summary["accepted"].append(f"{case} against {side}: {d}: {describe(r)}; accepted trade-off "
-                                               f"(at most {t['max_ratio']}, approved {t['approved']} by {t['by']}: "
-                                               f"{t['reason']}; paid by {t['pays_with']['case']} "
-                                               f"{t['pays_with']['dimension']})")
-                    continue
-                summary["blocking"].append(f"{case} against {side}: {d}: {r['verdict']} ({describe(r)})")
-                if r["verdict"] in ("regression", "suspect"):
-                    summary["flagged"].append({"side": side, "case": case, "dimension": d, **{
-                        k: r.get(k) for k in ("verdict", "ratio", "ci", "noise", "needs_passes", "passes",
-                                              "higher_is_better", "unit", "base", "new")}})
-                else:
-                    summary["other_blocking"].append(f"{case} against {side}: {d}: {r['verdict']} ({describe(r)})")
-                if r["verdict"] == "suspect":
-                    needs.append(r.get("needs_passes") or math.inf)
-    summary["needs_passes"] = (None if not needs else "more than the gate can run" if math.inf in needs
-                               else max(needs))
-    summary["counts"] = {side: dict(Counter(r["verdict"] for row in rows.values()
-                                            for r in row["dimensions"].values()))
+                summary["pvalues"][h] = r["p"]
+                if r["status"] == "incomplete":
+                    summary["blocking"].append(f"{case} against {side}: {d}: incomplete ({describe(r)})")
+                elif r["status"] == "loss shown":
+                    summary["flagged"].append({"side": side, "case": case, "dimension": d,
+                                               **{k: r.get(k) for k in ("p", "ratio", "ci", "units", "blocks", "unit")}})
+    summary["untested"] = sorted(set(declared) - set(summary["pvalues"]))
+    summary["other_blocking"] = list(summary["blocking"])
+    summary["counts"] = {side: dict(Counter(r["status"] for row in rows.values() for r in row["dimensions"].values()))
                          for side, rows in summary["comparisons"].items()}
-    summary["passed"] = not summary["diagnostic"] and not summary["errors"] and not summary["blocking"]
+    # One round decides nothing alone: a loss needs two (verdict()). This round passes on its
+    # own only when nothing is flagged, failed or missing.
+    summary["passed"] = (not summary["diagnostic"] and not summary["errors"] and not summary["blocking"]
+                         and not summary["flagged"])
     return summary
 
 
 def render(summary: dict) -> str:
     c = summary["candidate"]
-    verdict = "PASSED" if summary["passed"] else ("DIAGNOSTIC ONLY, not a release verdict" if summary["diagnostic"]
-                                                  else "NOT PASSED")
-    lines = [f"# Release gate: {c['name']} {c['revision']}", "",
+    verdict_ = "PASSED" if summary["passed"] else ("DIAGNOSTIC ONLY, not a release verdict" if summary["diagnostic"]
+                                                   else "NOT PASSED on its own (verdict combines the rounds)")
+    blocks = sorted({p["block"] for p in summary["passes"] if p.get("block") is not None}, key=str)
+    lines = [f"# Release gate round {summary['context'].get('round', 0)}: {c['name']} {c['revision']}", "",
              f"Against {', '.join(f'{s} {r}' for s, r in summary['baselines'].items())}; harness {summary['harness']}; "
-             f"host {', '.join(map(str, summary['host']))}; {len(summary['passes'])} passes "
-             f"({' '.join(p['side'] for p in summary['passes'])}).", "",
-             f"**{verdict}.** Policy: any loss blocks whose {CONFIDENCE:.0%} interval lies entirely on the worse "
-             f"side (at least {RESOLUTION['ms'] * 1000:g} µs or {RESOLUTION['MiB']:g} MiB); a case whose interval "
-             f"reaches beyond {PRECISION:g} x its between-pass noise is suspect (needs more passes); only an "
-             "owner-approved trade-off accepts a loss (benches/PROTOCOL.md §5).", ""]
-    if summary.get("needs_passes"):
-        lines += [f"Undecided cases need **{summary['needs_passes']}** passes a side (the largest estimate).", ""]
+             f"host {', '.join(map(str, summary['host']))}; {len(blocks)} blocks, {len(summary['passes'])} side-runs.", "",
+             f"**{verdict_}.** Each declared hypothesis (case x series or metric x baseline: {len(summary['family'])}) "
+             "gets a one-sided p-value of a loss from its block contrasts (layouts the outer unit); a loss counts "
+             f"when two consecutive rounds show it and Holm over the family rejects at {gatestats.ALPHA} "
+             "(benches/PROTOCOL.md §5). Flagged here: due for confirmation.", ""]
     if summary["errors"]:
         lines += ["## The passes don't qualify", ""] + [f"- {e}" for e in summary["errors"]] + [""]
     if summary.get("inputs") or summary.get("prepared_manifest"):
         prepared = ", ".join(summary.get("prepared_manifest", []))
-        lines += ["## Inputs", "", f"Prepared data: PREPARED.json sha256 {prepared}, the same in every pass, "
-                  "unchanged during each.", ""]
+        lines += ["## Inputs", "", f"Prepared data: PREPARED.json sha256 {prepared}, the same in every pass.", ""]
         lines += [f"- {line}" for line in summary.get("inputs", [])] + [""]
-    lines += ["## Blocking", ""] + ([f"- {b}" for b in summary["blocking"]] or ["- nothing"]) + [""]
+    lines += ["## Blocking (not statistical)", ""] + ([f"- {b}" for b in summary["blocking"]] or ["- nothing"]) + [""]
+    if summary["flagged"]:
+        lines += ["## Flagged: a loss shown this round, a confirmation due", "",
+                  "| baseline | case / dimension | ratio | interval | p | units |", "|---|---|---|---|---|---|"]
+        for f in sorted(summary["flagged"], key=lambda f: f["p"]):
+            ci = f"{f['ci'][0]:.4f}-{f['ci'][1]:.4f}" if f.get("ci") else "-"
+            lines.append(f"| {f['side']} | {f['case']} / {f['dimension']} | {fmt(f['ratio'])} | {ci} | {f['p']:.3g} | "
+                         f"{f['units']} |")
+        lines.append("")
     if summary.get("host_notes"):
-        lines += ["## The host as the passes met it (scripts/hosts/hygiene.py)", ""] +                  [f"- {n}" for n in summary["host_notes"]] + [""]
-    if summary.get("elsewhere"):
-        lines += ["Timed in another part of the gate (the verdict requires it): " +
-                  "; ".join(f"{k}: {v}" for k, v in summary["elsewhere"].items()), ""]
-    if summary.get("accepted"):
-        lines += ["## Accepted trade-offs (owner-approved, benches/release-tradeoffs.toml)", ""] + \
-                 [f"- {a}" for a in summary["accepted"]] + [""]
+        lines += ["## The host as the passes met it (scripts/hosts/hygiene.py)", ""] + \
+                 [f"- {n}" for n in summary["host_notes"]] + [""]
+    if summary.get("untested"):
+        lines += [f"Declared but untested here ({len(summary['untested'])}, p = 1): " +
+                  ", ".join(summary["untested"][:40]) + (" ..." if len(summary["untested"]) > 40 else ""), ""]
     if summary["known_issues"]:
         lines += ["Known issues as declared (no timing verdict): " +
                   ", ".join(f"{k} ({v})" for k, v in summary["known_issues"].items()), ""]
@@ -619,19 +781,11 @@ def render(summary: dict) -> str:
     for side, rows in summary["comparisons"].items():
         counts = summary["counts"].get(side, {})
         lines += [f"## Against {side} {summary['baselines'][side]}", "",
-                  f"{len(rows)} cases; dimensions: " + ", ".join(f"{n} {v}" for v, n in sorted(counts.items())), "",
-                  "| case / dimension | verdict | base | new | ratio | interval | noise (sd) | needs passes |",
-                  "|---|---|---|---|---|---|---|---|"]
-        for case, row in rows.items():
-            for d, r in row["dimensions"].items():
-                if r["verdict"] != "neutral":
-                    ci = f"{r['ci'][0]:.3f}-{r['ci'][1]:.3f}" if r.get("ci") else "-"
-                    ratio = "-" if r.get("ratio") is None else f"{r['ratio']:.3f}"
-                    verdict = "accepted trade-off" if r.get("accepted_tradeoff") else r["verdict"]
-                    needs = r.get("needs_passes") or ("unbounded" if r["verdict"] == "suspect" else "-")
-                    lines.append(f"| {case} / {d} | {verdict} | {fmt(r['base'])} | "
-                                 f"{fmt(r['new'])} {r['unit']} | {ratio} | {ci} | {fmt(r.get('noise'))} | {needs} |")
-        lines.append("")
+                  f"{len(rows)} cases; dimensions: " + ", ".join(f"{n} {v}" for v, n in sorted(counts.items())), ""]
+        unresolved = [f"{case} {d}" for case, row in rows.items() for d, r in row["dimensions"].items()
+                      if r["status"] == "unresolved"]
+        if unresolved:
+            lines += [f"Unresolved (within the counter's step, no loss shown): {', '.join(unresolved)}", ""]
         not_compared = {k: v["reason"] for k, v in rows.items() if not v["comparable"]}
         if not_compared:
             lines += [f"Not compared against {side} ({len(not_compared)}):", ""] + \
@@ -784,17 +938,17 @@ def stall_notes(passes: list[dict]) -> list[str]:
 # (benches/NOISY.md). `calibrate` sets, per case and from the gate's own passes, what the
 # measurement does about it, the same for every side: more executions a process where they are
 # cheap (the perf lab's --runs, the DL tools' files a process, a batch of executions a sample
-# where every side's perf lab has --batch), and more passes for the cases whose noise needs
-# them to catch a TARGET_LOSS with TARGET_POWER (the confirm-on-rerun chain simulated as in
-# benches/probes/gate-power.py), within the timed part's budget on the gate's host.
+# where every side's perf lab has --batch), and more blocks for the cases whose noise needs
+# them to catch a TARGET_LOSS with TARGET_POWER a round (the one-sided t at alpha / m, analytic:
+# gatestats.power_at, benches/probes/gate-power.py), within the timed part's budget.
 
-TARGET_LOSS, TARGET_POWER = 0.02, 0.90
+TARGET_LOSS, TARGET_POWER = 0.02, 0.90 ** 0.5  # a round's power: two rounds give 90 % together
 QUERY_MS = 2000.0      # a perf-lab process's measured query time, at most (the runs it buys)
 DL_MS = 3000.0         # a DL tool's process: its files' time, at most
 MAX_RUNS, MAX_REPEAT = 2000, 30
 PROCESS_S = 15.0       # a case's fresh processes a pass, at most this long together ...
 MAX_PROCESSES = 5      # ... and at most this many (a process that started differently, outvoted)
-PROCESS_PASSES = 8     # only where this many passes alone don't reach the target
+PROCESS_BLOCKS = 15    # only where this many blocks alone don't reach the target
 PROCESS_TOOLS = ("perf_lab", "tableau", "classify-el", "classify-horn")
 KEPT = ("runs", "warmup", "batch", "batch_queries", "repeat", "processes")
 BATCH_SAMPLE_MS = 0.05  # a batched sample lasts at least this (50 µs: the timer's steps far below)
@@ -823,52 +977,33 @@ def runs_adjustable(case: dict) -> bool:
             and case_runs(case)[1] > 0 and "--clients" not in args and "--commits" not in args)
 
 
-def judged_noise(rows: list[dict], resolution_ms: float = RESOLUTION["ms"]) -> float:
-    """A case's noise for its passes: the largest of its series whose TARGET_LOSS is above the
+def judged_noise(rows: list[dict], resolution_ms: float = 0.001) -> float:
+    """A case's noise for its blocks: the largest of its series whose TARGET_LOSS is above the
     timing resolution and the series' reporting step (a smaller series can't show that loss at
     any number of passes)."""
     judged = [r["sd"] for r in rows if r["median_ms"] * TARGET_LOSS >= max(resolution_ms, r.get("quantum", 0.0))]
     return max(judged, default=0.0)
 
 
-def power_table(passes: list[int], sims: int = 300) -> dict[int, list[float]]:
-    """The chain's power against TARGET_LOSS on gate-power.py's noise grid, per round-0 passes."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("gate_power", ROOT / "benches/probes/gate-power.py")
-    gp = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(gp)
-    table = {n: [gp.caught(s, 1 + TARGET_LOSS, n, sims, seed=11 + i)["block-confirmed"]
-                 for i, s in enumerate(gp.GRID)] for n in passes}
-    return {"grid": [float(s) for s in gp.GRID], **{str(n): v for n, v in table.items()}}
-
-
-def power_at(table: dict, n: int, sigma: float) -> float:
-    grid = table["grid"]
-    xs = [math.log(s) for s in grid]
-    x = math.log(max(sigma, grid[0]))
-    ys = table[str(n)]
-    if x >= xs[-1]:
-        return ys[-1]
-    i = max(j for j in range(len(xs)) if xs[j] <= x)
-    return ys[i] + (ys[i + 1] - ys[i]) * (x - xs[i]) / (xs[i + 1] - xs[i])
-
-
-def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_passes: int = 16,
-              min_passes: int = CAMPAIGN_PASSES, sides: int = 3, table: dict | None = None,
+def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_blocks: int = 30,
+              min_blocks: int = CAMPAIGN_BLOCKS, sides: int = 3, m: int | None = None,
               batch: bool = True, keep: dict | None = None, side_weights: dict | None = None) -> dict:
     """Each case's measurement from passes of the gate's host (an A/A run, or a gate's): runs,
-    warm-ups, batch and repetitions from its times, passes from its noise. Every case gets
-    `min_passes` a side; the passes beyond go where they buy the most power against TARGET_LOSS
-    a second of the timed part (weighted by the case's judged series), until `budget_min`. The
-    passes' binaries are the sides (an A/A run's one binary counts `sides` times). `keep`: the
-    calibration the passes were measured with: a case's settings there stay (the passes' times
-    include them), only its noise and passes are new; a case without settings there gets them.
+    warm-ups, batch and repetitions from its times, blocks from its noise. Every case gets
+    `min_blocks`; the blocks beyond go where they buy the most power against TARGET_LOSS a second
+    of the timed part (weighted by the case's judged series, at most `max_blocks`, power at the
+    family's size `m`), until `budget_min`. The passes' binaries are the sides (an A/A run's one
+    binary counts `sides` times). `keep`: the calibration the passes were measured with: a case's
+    settings there stay (the passes' times include them), only its noise and blocks are new.
     `side_weights`: per case, a gate pass of every side in units of the candidate's (from a real
     gate's passes, `side_weights()`; an older baseline runs fewer cases, or faster): an A/A run's
     times are the candidate's alone."""
     cases = {c["name"]: c for c in catalog}
     by_case: dict[str, dict] = {}
     revs = set()
+    if m is None:
+        present = sorted({r["case"] for p in passes for r in p["report"].get("records", []) if r["case"] in cases})
+        m = max(1, len(family_of(catalog, present)))
     for p in passes:
         rev = (p["report"].get("binaries") or {}).get("revision") or p["side"]
         revs.add(rev)
@@ -885,8 +1020,6 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
                     if values:
                         entry["series"].setdefault((rev, s), []).append(statistics.median(values))
                         entry["quanta"].setdefault((rev, s), []).append(values)
-    evens = list(range(min_passes, max_passes + 1, 2))
-    table = table or power_table(evens)
     per_side = sides if len(revs) == 1 else 1
     out, rounds, weights, processes = {}, {}, {}, {}
     for name, e in sorted(by_case.items()):
@@ -936,7 +1069,7 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
                 added = (new - (e["measured"].get("repeat") or repeat)) * whole / 1000
         process_s = 0.0
         if (not kept and "ok" in e["status"] and rows and case.get("tool", "perf_lab") in PROCESS_TOOLS
-                and power_at(table, PROCESS_PASSES, judged_noise(rows)) < TARGET_POWER):
+                and gatestats.power_at(PROCESS_BLOCKS, judged_noise(rows), m) < TARGET_POWER):
             # Fresh processes a pass where passes alone won't do: a pass's value the median
             # over several processes, one that started differently (another memory layout)
             # outvoted. The perf lab's are `repeat`; a DL tool's `processes` (its `repeat`
@@ -950,22 +1083,22 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
                 added += (new - have) * process_s
         sigma = judged_noise(rows)
         status = case.get("outcome", "ok") != "ok"
-        entry.update(noise=round(sigma, 4), passes=STATUS_PASSES if status else min_passes,
+        entry.update(noise=round(sigma, 4), blocks=1 if status else min_blocks,
                      seconds=round(statistics.mean(seconds.values()) + added, 1))
         rounds[name] = per_side * sum(s + added for s in seconds.values())  # a pass of every side
         if side_weights and len(revs) == 1 and name in side_weights:
             rounds[name] = rounds[name] / sides * side_weights[name]
         key = "repeat" if case.get("tool", "perf_lab") == "perf_lab" else "processes"
         processes[name] = (key, int(case.get(key, 1)), process_s * per_side * len(seconds))
-        weights[name] = max(1, len({r["series"] for r in rows if r["median_ms"] * TARGET_LOSS >= RESOLUTION["ms"]}))
+        weights[name] = max(1, len({r["series"] for r in rows if r["median_ms"] * TARGET_LOSS >= 0.001}))
         out[name] = entry
 
     def minutes(plan: dict) -> float:
-        blocks = max((e["passes"] for e in plan.values()), default=0) // 2
+        count = max((e["blocks"] for e in plan.values()), default=0)
         total = 0.0
-        for k in range(1, blocks + 1):
-            in_block = [rounds[c] for c, e in plan.items() if e["passes"] >= 2 * k]
-            total += 2 * (sum(in_block) + sides * PASS_OVERHEAD_S)
+        for k in range(1, count + 1):
+            in_block = [rounds[c] for c, e in plan.items() if e["blocks"] >= k]
+            total += 2 * sum(in_block) + PASS_OVERHEAD_S  # each side twice, then the block's own time
         return total / 60
 
     # Over the budget at the least passes: the added processes go first, the costliest first.
@@ -980,30 +1113,30 @@ def calibrate(catalog: list[dict], passes: list[dict], budget_min: float, max_pa
         out[c]["seconds"] = round(out[c]["seconds"] - cost / per_side / max(len(revs), 1), 1)
         if out[c][key] == have:
             del out[c][key]
-    power = lambda c, n: power_at(table, n, out[c]["noise"])  # noqa: E731
+    power = lambda c, n: gatestats.power_at(n, out[c]["noise"], m)  # noqa: E731
     spent = minutes(out)
     while True:
-        top = max(e["passes"] for e in out.values())
+        top = max(e["blocks"] for e in out.values())
         best = None
         for c, e in out.items():
-            for n in evens:
-                if n <= e["passes"] or e["passes"] < min_passes:
-                    continue  # a status-only case (a declared outcome) isn't timed
-                gain = weights[c] * (power(c, n) - power(c, e["passes"]))
-                # Two passes a side more: one block (a pass of every side, twice) of the case,
-                # and of each block it adds, the passes' own time.
-                cost = (n - e["passes"]) * rounds[c] / 60 + max(0, n - top) * sides * PASS_OVERHEAD_S / 60
+            if e["blocks"] < min_blocks:
+                continue  # a status-only case (a declared outcome) isn't timed
+            for n in range(e["blocks"] + 1, max_blocks + 1):
+                gain = weights[c] * (power(c, n) - power(c, e["blocks"]))
+                cost = (n - e["blocks"]) * 2 * rounds[c] / 60 + max(0, n - top) * PASS_OVERHEAD_S / 60
                 if gain > 1e-3 and spent + cost <= budget_min and (best is None or gain / cost > best[0]):
                     best = (gain / cost, c, n, cost)
+                if power(c, n) >= TARGET_POWER:
+                    break
         if best is None:
             break
-        out[best[1]]["passes"] = best[2]
+        out[best[1]]["blocks"] = best[2]
         spent = minutes(out)
     for e in out.values():
-        if e["passes"] >= min_passes:
-            e["power"] = round(power_at(table, e["passes"], e["noise"]), 3)
-    return {"cases": out, "minutes": round(minutes(out), 1), "cap": max(e["passes"] for e in out.values()),
-            "budget_min": budget_min}
+        if e["blocks"] >= min_blocks:
+            e["power"] = round(power(next(c for c in out if out[c] is e), e["blocks"]), 3)
+    return {"cases": out, "minutes": round(minutes(out), 1), "cap": max(e["blocks"] for e in out.values()),
+            "budget_min": budget_min, "m": m}
 
 
 def side_weights(passes: list[dict], candidate: str = "cand") -> dict[str, float]:
@@ -1024,10 +1157,11 @@ def side_weights(passes: list[dict], candidate: str = "cand") -> dict[str, float
 def write_measure(result: dict, source: str) -> str:
     lines = ["# The release gate's measurement per case (fast.py --measure; benches/PROTOCOL.md §5, \"Noise\").",
              "# Written by `release_gate.py calibrate`, not by hand: " + source + ".",
-             f"# runs, warmup, batch: the perf lab's a process; repeat: the DL tool's files a process; passes: a side",
-             f"# (round 0), for {TARGET_POWER:.0%} power against a {TARGET_LOSS:.0%} loss at the case's noise (the largest",
+             "# runs, warmup, batch: the perf lab's a process; repeat, processes: the DL tool's; blocks: a round's,",
+             f"# for {TARGET_POWER:.1%} power a round against a {TARGET_LOSS:.0%} loss (one-sided at alpha / m, m = "
+             f"{result.get('m')}) at the case's noise (the largest",
              "# sd of log pass medians of its series where that loss exceeds the resolution); power: at those passes;",
-             f"# seconds: a pass's. Timed part {result['minutes']} min (budget {result['budget_min']}, passes at most "
+             f"# seconds: a side's run. Timed part {result['minutes']} min (budget {result['budget_min']}, blocks at most "
              f"{result['cap']}).", ""]
     for name, e in result["cases"].items():
         lines.append(f"[case.{name}]")
@@ -1036,13 +1170,12 @@ def write_measure(result: dict, source: str) -> str:
     return "\n".join(lines)
 
 
-def blocks(plan: list[str], measure: dict, min_passes: int = CAMPAIGN_PASSES) -> list[list[str]]:
-    """The cases of each A-B-C-C-B-A block: block k (from 1) runs those whose passes a side
-    (measure.toml) reach 2k, a case without an entry min_passes; the first block every case (a
-    declared outcome's passes are STATUS_PASSES: checked there, not timed)."""
-    need = {c: int(measure.get(c, {}).get("passes", min_passes)) for c in plan}
-    count = max([min_passes, *need.values()]) // 2
-    return [[c for c in plan if need[c] >= 2 * k or k == 1] for k in range(1, count + 1)]
+def blocks(plan_: list[str], measure: dict, min_blocks: int = CAMPAIGN_BLOCKS) -> list[list[str]]:
+    """The cases of each block: block k (from 1) runs those whose blocks (measure.toml) reach k;
+    the first block every case (a declared outcome's: checked there, not timed)."""
+    need = {c: int(measure.get(c, {}).get("blocks", min_blocks)) for c in plan_}
+    count = max([min_blocks, *need.values()])
+    return [[c for c in plan_ if need[c] >= k or k == 1] for k in range(1, count + 1)]
 
 
 def read_measure(text: str | None) -> dict:
@@ -1053,35 +1186,6 @@ def read_measure(text: str | None) -> dict:
 
 BASE = "0f465633d33374bc56ab9ec33157cfa10ebf2d40"  # v1.5, the last recorded run's base
 MAIN = "f9b515e81f013ecd8c3811f3e9c65e91450ee44c"  # main
-
-
-def schedule(passes_per_side: int) -> list[str]:
-    """A-B-C-C-B-A blocks: base, main, candidate, then mirrored; each block two passes a side."""
-    if passes_per_side < 2 or passes_per_side % 2:
-        raise ValueError("passes per side: an even number, at least 2")
-    return ["base", "main", "cand", "cand", "main", "base"] * (passes_per_side // 2)
-
-
-def layouts_of(order: list[str], layouts: int) -> list[int]:
-    """Each pass's build layout (release-gate.sh GATE_LAYOUTS): a side's passes rotate through
-    them, each block of two passes a side running two, the first of them alternating from block
-    to block, so that a layout is never the earlier or later one of a block on any side."""
-    seen: Counter = Counter()
-    out = []
-    for side in order:
-        j = seen[side]
-        seen[side] += 1
-        out.append((j + j // 2) % layouts + 1 if layouts > 1 else 1)
-    return out
-
-
-def pass_step(gate: list[str], n: int, side: str, rev: str, harness: str, plan: str | None, layout: int) -> list[str]:
-    step = [*gate, "pass", str(n), side, rev, harness]
-    if plan or layout > 1:
-        step.append(plan or "-")
-    if layout > 1:
-        step.append(str(layout))
-    return step
 
 
 def toml_job(job: dict) -> str:
@@ -1103,100 +1207,94 @@ def toml_job(job: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def jobs(candidate: str, harness: str, checkout: str, prefix: str, passes_per_side: int, cases: str | None,
+def linux_host(name: str, registry: dict | None = None) -> None:
+    """The gate's binaries are Linux ELF (built on office-pc): a timed host must be a Linux one in
+    benches/hosts.toml (khaleesi-wsl, not khaleesi). Anything else is refused, never routed."""
+    host = (registry or hosts_registry.load()).get("host", {}).get(name)
+    if not host or host.get("os") != "linux":
+        raise SystemExit(f"{name}: not a Linux host in benches/hosts.toml "
+                         f"(os {host.get('os') if host else 'unknown'}): the gate's ELF binaries can't run there")
+
+
+def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_round: int, cases: str | None,
          base: str = BASE, main: str = MAIN, timed_host: str = "phuoc-yu", checks_host: str = "office-pc",
-         max_gb: float = 24, checks: bool = True, big_host: str | None = "khaleesi",
+         max_gb: float = 24, checks: bool = True, big_host: str | None = "khaleesi-wsl",
          big_gb: float = 28, measure: dict | None = None, batch: bool = False,
          layouts: int = 1) -> dict[str, dict]:
-    """The gate's fleet jobs: binaries and data, then the timed passes and their report, alone
-    on the timed host; the cases whose caps exceed it on the big host (khaleesi, 64 GB) at
-    their full caps, on the build's binaries (packed by the build job: the big host builds
-    nothing); the W3C suites and the guards on the checks host. No priority is set: each job
-    gets its class's (merge-gate). With `measure` (benches/fast/measure.toml) the timed passes
-    run in A-B-C-C-B-A blocks, each later block only the cases whose noise needs its passes
-    (plan-blocks); `batch`: every side's perf lab batches (fast.py --batch); `layouts`: each side
-    built that many times in different layouts, its passes rotating through them."""
+    """The gate's fleet jobs: binaries and data, then round 1's blocks and its report, alone on
+    the timed host; the cases whose caps exceed it on the big host, a Linux endpoint (khaleesi-wsl:
+    ELF binaries run there, never on native Windows; unpack refuses another), on the build's
+    binaries; the W3C suites and the guards on the checks host. With `measure` the k-th block runs
+    the cases needing k blocks; blocks rotate through `layouts` builds."""
+    linux_host(timed_host)
+    if big_host:
+        linux_host(big_host)
     env = {"GATE_NAME": f"gate-v2-{candidate[:8]}", "GATE_MAX_GB": str(max_gb), "NRESE_QUIET_SLOT": "0",
-           "GATE_MIN_PASSES": str(passes_per_side), **({"GATE_CASES": cases} if cases else {}),
+           "GATE_MIN_BLOCKS": str(blocks_per_round), **({"GATE_CASES": cases} if cases else {}),
            **({"GATE_BIG_GB": str(big_gb), "GATE_BIG_HOST": big_host} if big_host else {}),
            **({"GATE_BATCH": "1"} if batch else {}), **({"GATE_LAYOUTS": str(layouts)} if layouts > 1 else {})}
     source = [{"name": "checkout", "source": {"git": checkout, "rev": harness}}]
-    gate = ["bash", "scripts/release-gate.sh"]
-    order = schedule(passes_per_side)
+    gate_ = ["bash", "scripts/release-gate.sh"]
     revs = {"base": base, "main": main, "cand": candidate}
     small = bool(cases)
     out = {f"{prefix}-build": {
         "id": f"{prefix}-build", "group": "release", "kind": "owlrs.build", "priority_class": "merge-gate",
-        # About 25 minutes a revision's build (skipped when its verified binaries are there).
         "est_min": 25 * len(dict.fromkeys([base, main, candidate, harness])) + (10 if small else 30), "env": env,
-        "steps": [[*gate, "build", rev] for rev in dict.fromkeys([base, main, candidate, harness])]
-        + [[*gate, "prepare", harness]] + ([[*gate, "pack", base, main, candidate, harness]] if big_host else []),
+        "steps": [[*gate_, "build", rev] for rev in dict.fromkeys([base, main, candidate, harness])]
+        + [[*gate_, "prepare", harness]] + ([[*gate_, "pack", base, main, candidate, harness]] if big_host else []),
         "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": 12}, "inputs": source,
         **({"outputs": [{"name": "binaries", "path": "binaries"}]} if big_host else {})}}
-    per_pass = {"base": 1, "main": 1, "cand": 1} if small else {"base": 14, "main": 4, "cand": 14}
+    per_block = 2 if small else 60  # minutes, the three sides' two runs of every case
+    count = blocks_per_round
+    steps = [[*gate_, "plan-blocks", harness]] if measure else []
     if measure:
-        # Blocks: the k-th runs the cases needing 2k passes a side; a pass's minutes, its cases'.
-        need = {c: int(e.get("passes", passes_per_side)) for c, e in measure.items()}
-        count = max(max(need.values()) // 2, passes_per_side // 2)
+        need = {c: int(e.get("blocks", blocks_per_round)) for c, e in measure.items()}
+        count = max([blocks_per_round, *need.values()])
         full = sum(e.get("seconds", 0) for e in measure.values()) or 1
-        steps, est, n = [[*gate, "plan-blocks", harness]], 2.0, 0
-        sides = schedule(2) * count
-        for (k, side), layout in zip([(i // 6 + 1, s) for i, s in enumerate(sides)], layouts_of(sides, layouts)):
-            share = sum(e.get("seconds", 0) for c, e in measure.items() if need[c] >= 2 * k or k == 1) / full
-            n += 1
-            steps.append(pass_step(gate, n, side, revs[side], harness, f"plan-block-{k}.json", layout))
-            est += (per_pass[side] if small else full * share / 60) + PASS_OVERHEAD_S / 60
-    else:
-        steps = [pass_step(gate, n, side, revs[side], harness, None, layout)
-                 for n, (side, layout) in enumerate(zip(order, layouts_of(order, layouts)), start=1)]
-        est = sum(per_pass[s] for s in order) + 2
+    est = 2.0
+    for k in range(1, count + 1):
+        steps.append(block_step(gate_, k, harness, block_layout(k, layouts),
+                                f"plan-block-{k}.json" if measure else None, revs))
+        share = (sum(e.get("seconds", 0) for c, e in measure.items() if need[c] >= k or k == 1) / full) if measure else 1
+        est += per_block * share + 2
     out[f"{prefix}-timed"] = {
         "id": f"{prefix}-timed", "group": "release", "kind": "owlrs.timed", "class": "exclusive",
         "priority_class": "merge-gate", "after": [f"{prefix}-build"],
         "env": {**env, "GATE_HOST": timed_host, "GATE_PREFIX": prefix, "GATE_RAM_GB": str(max_gb)},
-        "est_min": round(est), "stall_after_min": 40,
-        "steps": steps + [[*gate, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"],
-                          [*gate, "clean"]],
+        "est_min": round(est), "stall_after_min": 60,
+        "steps": steps + [[*gate_, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"],
+                          [*gate_, "clean"]],
         "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": max_gb}, "inputs": source}
     if big_host:
         big_env = {**env, "GATE_MIN_GB": str(max_gb), "GATE_MAX_GB": str(big_gb), "GATE_HOST": big_host,
                    "GATE_PREFIX": f"{prefix}-big", "GATE_RAM_GB": str(big_gb + 4)}
         big_env.pop("GATE_BIG_GB")
-        per_big = 2 if small else 15
         out[f"{prefix}-big"] = {
             "id": f"{prefix}-big", "group": "release", "kind": "owlrs.timed", "class": "exclusive",
             "priority_class": "merge-gate", "after": [f"{prefix}-build"], "env": big_env,
-            "est_min": per_big * len(order) + 30, "stall_after_min": 60,
-            "steps": [[*gate, "unpack"], [*gate, "prepare", harness]]
-            + [pass_step(gate, n, side, revs[side], harness, None, layout)
-               for n, (side, layout) in enumerate(zip(order, layouts_of(order, layouts)), start=1)]
-            + [[*gate, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], [*gate, "clean"]],
+            "est_min": (6 if small else 45) * blocks_per_round + 30, "stall_after_min": 90,
+            "steps": [[*gate_, "unpack"], [*gate_, "prepare", harness]]
+            + [block_step(gate_, k, harness, block_layout(k, layouts), None, revs) for k in range(1, blocks_per_round + 1)]
+            + [[*gate_, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], [*gate_, "clean"]],
             "requires": {"hosts": [big_host], "cores": 16, "ram_gb": big_gb + 4},
             "inputs": [*source, {"name": "binaries", "source": {"artifact": f"{prefix}-build/binaries"}}]}
     if checks:
         out[f"{prefix}-checks"] = {
             "id": f"{prefix}-checks", "group": "release", "kind": "owlrs.any", "priority_class": "merge-gate",
             "est_min": 100, "env": {**env, "CARGO_BUILD_JOBS": "16"},
-            "steps": [[*gate, "w3c"], [*gate, "guards"], [*gate, "clean"]],
+            "steps": [[*gate_, "w3c"], [*gate_, "guards"], [*gate_, "clean"]],
             "requires": {"hosts": [checks_host], "cores": 16, "ram_gb": 12},
             "inputs": [{"name": "checkout", "source": {"git": checkout, "rev": candidate}}]}
     return out
 
 
-# --- confirm on rerun (the owner's decision, 18 Oct 2026) --------------------------------------
-#
-# A gate run flags each dimension whose 95 % interval shows a loss, or that it couldn't decide.
-# Those cases run again, alone, in a fresh, independent A-B-B-A on the same host (`confirm`).
-# A loss blocks only if a second round shows it too, at 95 % on the same, worse side; one that
-# doesn't repeat is "not confirmed", reported with every round's interval, and doesn't block.
-# A dimension still undecided gets another round; after CONFIRM_ROUNDS it blocks, undecided.
+# --- rounds and the verdict (research round 8: prespecified rounds, Holm over the family) ------
 
-CONFIRM_ROUNDS = 3        # the first run and two confirmations
-CONFIRM_PASSES = (4, 24)  # passes a side for a confirmation: its noise's estimate, within these
+
 
 
 def rounds_of(reports: list[dict]) -> list[list[dict]]:
-    """The reports of each host, first run first (`context.round`)."""
+    """The reports of each timed part (host), first round first (`context.round`)."""
     by_host: dict[str, list[dict]] = {}
     for r in reports:
         host = (r.get("context") or {}).get("host") or ",".join(map(str, r.get("host", [])))
@@ -1208,138 +1306,83 @@ def dimension_in(report: dict, side: str, case: str, dimension: str) -> dict | N
     return report.get("comparisons", {}).get(side, {}).get(case, {}).get("dimensions", {}).get(dimension)
 
 
-def combine(rounds: list[dict]) -> list[dict]:
-    """Every dimension the first run flagged, through the confirmation rounds: `confirmed` (two
-    rounds show the loss: blocks), `not confirmed` (shown once, then a round without it), `resolved`
-    (undecided, then decided without a loss), `pending` (another round is due), `undecided` (no
-    round left: blocks), `missing` (a confirmation lacks it: blocks)."""
-    out = []
-    for flag in rounds[0].get("flagged", []):
-        key = (flag["side"], flag["case"], flag["dimension"])
-        history, detections, status = [], 0, None
-        for k, report in enumerate(rounds):
-            r = flag if k == 0 else dimension_in(report, *key)
-            if r is None:
-                status = "missing"
-                break
-            if r.get("accepted_tradeoff"):
-                history.append({**{f: r.get(f) for f in ("verdict", "ratio", "ci", "passes")}, "verdict": "accepted"})
-                status = "resolved"
-                break
-            history.append({f: r.get(f) for f in ("verdict", "ratio", "ci", "passes", "needs_passes", "noise")})
-            if r["verdict"] == "regression":
-                detections += 1
-                if detections >= 2:
-                    status = "confirmed"
-                    break
-            elif r["verdict"] in ("neutral", "better"):
-                status = "not confirmed" if detections else "resolved"
-                break
-            elif r["verdict"] == "incomplete":
-                status = "missing"
-                break
-        if status is None:
-            status = "pending" if len(rounds) < CONFIRM_ROUNDS else "undecided"
-        out.append({**dict(zip(("side", "case", "dimension"), key)), "status": status, "rounds": history,
-                    "blocks": status in ("confirmed", "pending", "undecided", "missing")})
-    return out
+CONFIRM_BLOCKS = (2, 30)  # blocks of a confirmation round: its cases' calibrated blocks, within these
 
 
-def confirm_passes(history: list[dict]) -> int:
-    """Passes a side for the next round: the last round's estimate (its interval's half-width
-    against the distance to settle), even, within CONFIRM_PASSES."""
-    last = history[-1]
-    low, high = CONFIRM_PASSES
-    if last.get("needs_passes"):
-        need = last["needs_passes"]
-    elif last["verdict"] == "regression" and last.get("ci") and last.get("ratio"):
-        half = (math.log(last["ci"][1]) - math.log(last["ci"][0])) / 2
-        gap = abs(math.log(last["ratio"]))
-        need = (last.get("passes") or [low])[0] * (half / gap) ** 2 if gap > 0 else high
-    else:
-        need = high
-    n = min(high, max(low, math.ceil(need)))
-    return n + n % 2
-
-
-def confirm_job(rounds: list[dict], checkout: str) -> dict | None:
-    """The next confirmation's fleet job for one host, or None when no dimension is pending."""
-    states = [s for s in combine(rounds) if s["status"] == "pending"]
-    if not states:
+def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) -> dict | None:
+    """The next round's fleet job for one timed part: the cases of its pending hypotheses, each
+    for its calibrated blocks (measure.toml), layouts rotating; None when nothing is pending."""
+    pending = decide([rounds])["pending"]
+    if not pending:
         return None
     first = rounds[0]
     ctx = first.get("context") or {}
-    cases = sorted({s["case"] for s in states})
-    n = max(confirm_passes(s["rounds"]) for s in states)
-    order = schedule(n)
+    cases = sorted({h.split("|")[1] for h in pending})
+    low, high = CONFIRM_BLOCKS
+    n = min(high, max([low, *(int((measure or {}).get(c, {}).get("blocks", low)) for c in cases)]))
     revs = {"cand": first["candidate"]["revision"], **first["baselines"]}
     harness = first["harness"]
     k = len(rounds)
     prefix = ctx.get("prefix") or f"rg-{revs['cand'][:8]}"
     name = f"{prefix}-confirm" if k == 1 else f"{prefix}-confirm{k}"
-    seconds = sum(first.get("case_seconds", {}).get(c, {}).get(side, 60) for c in cases for side in order)
-    gate = ["bash", "scripts/release-gate.sh"]
+    seconds = sum(first.get("case_seconds", {}).get(c, {}).get(side, 60) for c in cases for side in revs) * 2
+    gate_ = ["bash", "scripts/release-gate.sh"]
+    layouts = int(ctx.get("layouts", 1) or 1)
     env = {"GATE_NAME": ctx.get("gate_name") or f"gate-v2-{revs['cand'][:8]}", "GATE_HOST": ctx.get("host", ""),
-           "GATE_ROUND": str(k), "GATE_PREFIX": prefix, "GATE_MIN_PASSES": str(n), "NRESE_QUIET_SLOT": "0",
+           "GATE_ROUND": str(k), "GATE_PREFIX": prefix, "GATE_MIN_BLOCKS": str(n), "NRESE_QUIET_SLOT": "0",
            "GATE_PLAN": f"plan-confirm{k}.json", "GATE_MAX_GB": str(ctx.get("max_gb", 24)),
-           **({"GATE_LAYOUTS": str(ctx["layouts"])} if ctx.get("layouts", 1) > 1 else {})}
+           **({"GATE_LAYOUTS": str(layouts)} if layouts > 1 else {})}
     return {"id": name, "group": "release", "kind": "owlrs.timed", "class": "exclusive",
             "priority_class": "merge-gate", "env": env,
-            "est_min": round(seconds / 60 + 0.7 * len(order) + 5), "stall_after_min": 60,
-            "steps": [[*gate, "plan-cases", ",".join(cases)]]
-            + [pass_step(gate, i, side, revs[side], harness, None, layout)
-               for i, (side, layout) in enumerate(zip(order, layouts_of(order, ctx.get("layouts", 1))), start=1)]
-            + [[*gate, "report", harness, f"cand={revs['cand']}", *(f"{s}={r}" for s, r in first["baselines"].items())],
-               [*gate, "clean"]],
+            "est_min": round(n * (seconds / 60 + 2) + 5), "stall_after_min": 60,
+            "steps": [[*gate_, "plan-cases", ",".join(cases)]]
+            + [block_step(gate_, b, harness, block_layout(b, layouts), None, revs) for b in range(1, n + 1)]
+            + [[*gate_, "report", harness, f"cand={revs['cand']}", *(f"{s}={r}" for s, r in first["baselines"].items())],
+               [*gate_, "clean"]],
             "requires": {"hosts": [ctx.get("host") or "phuoc-yu"], "cores": 16, "ram_gb": ctx.get("ram_gb", 24)},
             "inputs": [{"name": "checkout", "source": {"git": checkout, "rev": harness}}]}
 
 
 def verdict(timed: list[dict], w3c: dict, guards: dict) -> tuple[bool, str]:
-    """Every part together: each timed part passed, every case one part left to another
-    in some timed part's plan, the W3C counts and the guards."""
-    lines = ["# Release verdict", ""]
-    parts_passed = []
-    for rounds in rounds_of(timed):
-        first = rounds[0]
-        states = combine(rounds)
-        errors = [e for r in rounds for e in r["errors"]]
-        # Blocks no rerun can lift (a failed case, lost answers, a pass that doesn't qualify);
-        # confirmations add their own (the case failing there).
-        other = [b for r in rounds for b in r.get("other_blocking", [])]
-        blocking = [s for s in states if s["blocks"]]
-        ok = not errors and not other and not blocking and not any(r["diagnostic"] for r in rounds)
-        parts_passed.append(ok)
-        host = (first.get("context") or {}).get("host") or ", ".join(map(str, first["host"]))
-        lines.append(f"- timed on {host}: {'passed' if ok else 'NOT passed'} ({len(rounds)} round(s); "
-                     f"{sum(s['status'] == 'confirmed' for s in states)} confirmed losses, "
-                     f"{sum(s['status'] in ('pending', 'undecided', 'missing') for s in states)} undecided, "
-                     f"{len(other)} other blocks, {len(errors)} pass errors"
-                     f"{', diagnostic' if any(r['diagnostic'] for r in rounds) else ''})")
-        for s in states:
-            shown = "; ".join(f"round {i}: {h['verdict']} {h.get('ratio') or 0:.3f} "
-                              f"[{(h.get('ci') or [0, 0])[0]:.3f}, {(h.get('ci') or [0, 0])[1]:.3f}]"
-                              for i, h in enumerate(s["rounds"]))
-            lines.append(f"  - {s['case']} against {s['side']}: {s['dimension']}: **{s['status']}** ({shown})")
-        # A loss a confirmation shows that the first run didn't: one round, not confirmed, kept.
-        first_keys = {(f["side"], f["case"], f["dimension"]) for f in first.get("flagged", [])}
-        for k, report in enumerate(rounds[1:], start=1):
-            for f in report.get("flagged", []):
-                if (f["side"], f["case"], f["dimension"]) not in first_keys:
-                    ci = f.get("ci") or [0, 0]
-                    lines.append(f"  - {f['case']} against {f['side']}: {f['dimension']}: **not confirmed** (only round "
-                                 f"{k}: {f['verdict']} {f.get('ratio') or 0:.3f} [{ci[0]:.3f}, {ci[1]:.3f}]; round 0 "
-                                 "didn't show it)")
-        lines += [f"  - {b}" for b in other] + [f"  - pass error: {e}" for e in errors]
-    lines.append(f"- W3C: {'passed' if w3c['passed'] else 'NOT passed'} ({'; '.join(w3c['errors']) or 'every suite as required'})")
-    lines.append(f"- §0 guards: {'passed' if guards['passed'] else 'NOT passed'} "
-                 f"({'; '.join(guards['errors'][:5]) or str(guards['guards']) + ' guards ran and passed'})")
-    # A case one timed part leaves to another must be in that other's plan.
+    """Every part together: the family over every timed part decided (decide()), the other blocks
+    of every round, the cases one part left to another, the W3C counts and the guards."""
+    parts = rounds_of(timed)
+    d = decide(parts)
+    lines = ["# Release verdict", "",
+             f"Family: {d['m']} hypotheses declared (case x series or metric x baseline, every timed part); "
+             f"Holm at {gatestats.ALPHA} over p = min(max(p1, p2) / 0.9, max(p2, p3) / 0.1).", ""]
+    errors = [e for rounds in parts for r in rounds for e in r["errors"]]
+    other = [b for rounds in parts for r in rounds for b in r.get("other_blocking", [])]
+    diagnostic = any(r["diagnostic"] for rounds in parts for r in rounds)
+    blocking_losses = []
+    for h in d["losses"]:
+        side, case, dim = h.split("|")
+        ps = d["rounds"].get(h, [])
+        accepted_ = None
+        for rounds in parts:
+            for report in rounds:
+                r = report.get("comparisons", {}).get(side, {}).get(case, {}).get("dimensions", {}).get(dim)
+                if r is not None:
+                    t = accepted(report.get("tradeoffs", []), side, case, dim, r, report.get("comparisons", {}))
+                    accepted_ = accepted_ or t
+        text = f"{case} against {side}: {dim}: p per round {ps}, combined {d['combined'][h]:.3g}"
+        if accepted_:
+            lines.append(f"- accepted trade-off: {text} (at most {accepted_['max_ratio']}, approved "
+                         f"{accepted_['approved']} by {accepted_['by']})")
+        else:
+            blocking_losses.append(text)
+    lines += [f"- **confirmed loss**: {t}" for t in blocking_losses]
+    lines += [f"- **pending** (a round that could reject it hasn't run): {h}" for h in d["pending"]]
+    lines += [f"- {b}" for b in other] + [f"- pass error: {e}" for e in errors]
     covered = {c for t in timed for c in t.get("planned", [])}
     missing = sorted({c for t in timed for c in t.get("elsewhere", {})} - covered)
     if missing:
         lines.append(f"- NOT timed anywhere: {', '.join(missing)} (left to another part, which didn't run them)")
-    passed = all(parts_passed) and w3c["passed"] and guards["passed"] and not missing
+    lines.append(f"- W3C: {'passed' if w3c['passed'] else 'NOT passed'} ({'; '.join(w3c['errors']) or 'every suite as required'})")
+    lines.append(f"- §0 guards: {'passed' if guards['passed'] else 'NOT passed'} "
+                 f"({'; '.join(guards['errors'][:5]) or str(guards['guards']) + ' guards ran and passed'})")
+    passed = (not blocking_losses and not d["pending"] and not other and not errors and not diagnostic
+              and not missing and w3c["passed"] and guards["passed"])
     lines += ["", f"**{'PASSED' if passed else 'NOT PASSED'}**"]
     return passed, "\n".join(lines) + "\n"
 
@@ -1364,15 +1407,17 @@ def main() -> int:
     s.add_argument("--max-gb", type=float, required=True)
     s.add_argument("--min-gb", type=float, default=0, help="only cases above this cap (the big host's share)")
     s.add_argument("--big-gb", type=float, help="cases up to this cap run on the big host instead")
-    s.add_argument("--big-host", default="khaleesi")
+    s.add_argument("--big-host", default="khaleesi-wsl")
     s.add_argument("--cases")
+    s.add_argument("--baselines", default="base,main", help="the family's baselines (declared before any result)")
     s = sub.add_parser("report")
     s.add_argument("--passes", type=Path, required=True)
     s.add_argument("--candidate", required=True)
     s.add_argument("--side", action="append", required=True, metavar="NAME=REV")
     s.add_argument("--require", required=True, help="the baselines the gate needs, comma-separated")
     s.add_argument("--harness-revision", required=True)
-    s.add_argument("--min-passes", type=int, default=CAMPAIGN_PASSES)
+    s.add_argument("--min-blocks", type=int, default=CAMPAIGN_BLOCKS)
+    s.add_argument("--family", type=Path, help="the declared family (plan.json's), else the tested dimensions")
     s.add_argument("--diagnostic", action="store_true")
     s.add_argument("--not-run", action="append", default=[], metavar="CASE=WHY")
     s.add_argument("--elsewhere", action="append", default=[], metavar="CASE=WHERE",
@@ -1399,25 +1444,25 @@ def main() -> int:
     s.add_argument("--harness", help="the revision whose fast suite, generator and gate run (default: the candidate)")
     s.add_argument("--checkout", default=ROOT.as_posix(), help="the repository fleet takes the checkout from")
     s.add_argument("--id", help="the jobs' id prefix (default rg-CAND8)")
-    s.add_argument("--passes", type=int, default=CAMPAIGN_PASSES, help="passes per side (fewer than 4: diagnostic)")
+    s.add_argument("--blocks", type=int, default=CAMPAIGN_BLOCKS, help="blocks of round 1 at least (fewer than 2: diagnostic)")
     s.add_argument("--cases", help="a selection: a dry run, diagnostic only")
     s.add_argument("--base", default=BASE)
     s.add_argument("--main", default=MAIN)
     s.add_argument("--max-gb", type=float, default=24)
     s.add_argument("--no-checks", action="store_true", help="without the W3C and guards job")
-    s.add_argument("--big-host", default="khaleesi", help="the host of the cases above --max-gb ('' for none)")
+    s.add_argument("--big-host", default="khaleesi-wsl",
+                   help="the Linux host of the cases above --max-gb ('' for none; never native Windows)")
     s.add_argument("--big-gb", type=float, default=28)
     s.add_argument("--layouts", type=int, default=1, help="builds a side in different layouts (GATE_LAYOUTS)")
     s.add_argument("--out", type=Path, default=Path("."))
     s = sub.add_parser("calibrate", help="benches/fast/measure.toml from passes of the gate's host (an A/A run)")
     s.add_argument("--passes", type=Path, nargs="+", required=True, help="pass reports, or directories of them")
     s.add_argument("--budget-min", type=float, default=150, help="the timed part's minutes, at most")
-    s.add_argument("--max-passes", type=int, default=16)
+    s.add_argument("--max-blocks", type=int, default=30)
+    s.add_argument("--family-size", type=int, help="m, the declared family's size (default: the calibrated cases')")
     s.add_argument("--no-batch", action="store_true", help="no batched timing for the microsecond cases")
-    s.add_argument("--table", type=Path, help="a power table written before (--write-table), not simulated again")
-    s.add_argument("--keep", type=Path, help="the calibration the passes ran with: its runs stay, only passes are new")
+    s.add_argument("--keep", type=Path, help="the calibration the passes ran with: its runs stay, only blocks are new")
     s.add_argument("--sides", type=Path, help="a real gate's passes: each case's time on every side, for the budget")
-    s.add_argument("--write-table", type=Path)
     s.add_argument("--out", type=Path, default=ROOT / "benches" / "fast" / "measure.toml")
     s = sub.add_parser("blocks", help="each block's plan of a gate (release-gate.sh plan-blocks)")
     s.add_argument("--plan", type=Path, required=True)
@@ -1438,7 +1483,8 @@ def main() -> int:
         catalog = cases_registry.load()
         run, not_run, elsewhere = plan(catalog, args.max_gb, args.cases.split(",") if args.cases else None,
                                        args.min_gb, args.big_gb, args.big_host)
-        print(json.dumps({"run": run, "not_run": not_run, "elsewhere": elsewhere}, indent=1))
+        family = family_of(catalog, run, tuple(b for b in args.baselines.split(",") if b))
+        print(json.dumps({"run": run, "not_run": not_run, "elsewhere": elsewhere, "family": family}, indent=1))
         return 0
     if args.command == "report":
         sides = pairs(args.side, "--side")
@@ -1446,10 +1492,11 @@ def main() -> int:
         if bad:
             raise SystemExit("benches/release-tradeoffs.toml: " + "; ".join(bad))
         passes = load_passes(args.passes)
+        family = json.loads(args.family.read_text(encoding="utf-8")).get("family") if args.family else None
+        context = {k: v for k, v in pairs(args.context, "--context").items()}
         summary = gate(passes, sides, args.candidate, [s for s in args.require.split(",") if s], args.harness_revision,
-                       args.min_passes, args.diagnostic, pairs(args.not_run, "--not-run"), tradeoffs,
-                       cases_registry.load(), pairs(args.elsewhere, "--elsewhere"),
-                       {k: v for k, v in pairs(args.context, "--context").items()})
+                       args.min_blocks, args.diagnostic, pairs(args.not_run, "--not-run"), tradeoffs,
+                       cases_registry.load(), pairs(args.elsewhere, "--elsewhere"), context, family)
         for key in ("round", "max_gb", "ram_gb", "layouts"):
             if key in summary["context"]:
                 summary["context"][key] = float(summary["context"][key]) if "gb" in key else int(summary["context"][key])
@@ -1493,11 +1540,7 @@ def main() -> int:
             m = PASS_FILE.search(f.name)
             found.append({"n": int(m.group(1)) if m else i, "side": m.group(2) if m else "?", "path": f.name,
                           "report": json.loads(f.read_text(encoding="utf-8"))})
-        table = (json.loads(args.table.read_text(encoding="utf-8")) if args.table else
-                 power_table(list(range(CAMPAIGN_PASSES, args.max_passes + 1, 2))))
-        if args.write_table:
-            args.write_table.write_text(json.dumps(table), encoding="utf-8")
-        result = calibrate(cases_registry.load(), found, args.budget_min, args.max_passes, table=table,
+        result = calibrate(cases_registry.load(), found, args.budget_min, args.max_blocks, m=args.family_size,
                            batch=not args.no_batch,
                            keep=read_measure(args.keep.read_text(encoding="utf-8")) if args.keep else None,
                            side_weights=side_weights(load_passes(args.sides) or [
@@ -1508,7 +1551,8 @@ def main() -> int:
         source = f"{len(found)} passes on {', '.join(hosts_)} ({', '.join(sorted({p['path'] for p in found})[:2])} ...)"
         args.out.write_text(write_measure(result, source), encoding="utf-8")
         under = {c: e for c, e in result["cases"].items() if e.get("power", 1) < TARGET_POWER}
-        print(f"{len(result['cases'])} cases; timed part {result['minutes']} min; passes at most {result['cap']}; "
+        print(f"{len(result['cases'])} cases, family m = {result['m']}; timed part {result['minutes']} min; "
+              f"blocks at most {result['cap']}; "
               f"{len(under)} below {TARGET_POWER:.0%} power at a {TARGET_LOSS:.0%} loss: "
               + ", ".join(f"{c} ({e['noise']:.3f}, {e['power']:.2f})" for c, e in sorted(under.items())))
         return 0
@@ -1525,15 +1569,16 @@ def main() -> int:
         reports = [json.loads(path.read_text(encoding="utf-8")) for path in args.reports]
         args.out.mkdir(parents=True, exist_ok=True)
         written = 0
+        shown = (ROOT / "benches" / "fast" / "measure.toml")
+        measure = read_measure(shown.read_text(encoding="utf-8")) if shown.is_file() else {}
         for rounds in rounds_of(reports):
-            job = confirm_job(rounds, args.checkout)
-            states = combine(rounds)
-            print(f"{(rounds[0].get('context') or {}).get('host')}: " +
-                  (", ".join(f"{s['case']}/{s['dimension']} against {s['side']}: {s['status']}" for s in states) or
-                   "nothing flagged"))
+            job = confirm_job(rounds, args.checkout, measure)
+            d = decide([rounds])
+            print(f"{(rounds[0].get('context') or {}).get('host')}: {len(d['losses'])} losses, "
+                  f"{len(d['pending'])} pending of {d['m']}" + (": " + ", ".join(d["pending"][:20]) if d["pending"] else ""))
             if job:
                 (args.out / f"{job['id']}.toml").write_text(toml_job(job), encoding="utf-8")
-                print(f"  {args.out / (job['id'] + '.toml')}: {len(job['steps']) - 3} passes, est {job['est_min']} min")
+                print(f"  {args.out / (job['id'] + '.toml')}: {len(job['steps']) - 3} blocks, est {job['est_min']} min")
                 written += 1
         return 0
     if args.command == "jobs":
@@ -1550,7 +1595,7 @@ def main() -> int:
                                     "crates/nrese-store/examples"], capture_output=True).returncode == 0
                     for r in {candidate, rev(args.base), rev(args.main)})
         found = jobs(candidate, harness, args.checkout, args.id or f"rg-{candidate[:8]}",
-                     args.passes, args.cases, rev(args.base), rev(args.main), max_gb=args.max_gb,
+                     args.blocks, args.cases, rev(args.base), rev(args.main), max_gb=args.max_gb,
                      checks=not args.no_checks, big_host=args.big_host or None, big_gb=args.big_gb,
                      measure=measure, batch=batch, layouts=args.layouts)
         args.out.mkdir(parents=True, exist_ok=True)
