@@ -517,7 +517,7 @@ impl<'e> Transaction<'e> {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
             let content = super::Content::fresh();
-            corpora.record(current.content, content, touched);
+            corpora.record(current.content, content, touched.iter().copied());
             Version {
                 content,
                 asserted: asserted.with_run(asserted_run),

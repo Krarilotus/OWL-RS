@@ -34,6 +34,9 @@
 //! is built at the first stemmed search and extended at later ones.
 
 use std::borrow::Cow;
+use std::sync::Arc;
+
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use std::collections::{BTreeMap, HashMap};
 
 use rayon::prelude::*;
@@ -290,12 +293,22 @@ fn ones(bits: &[u64]) -> impl Iterator<Item = u64> + '_ {
 }
 
 /// The documents a search ranks among (by number), with the statistics BM25 takes from
-/// them: built by the caller from what a reader sees ([`TextIndex::corpus`]).
+/// them: built by the caller from what a reader sees ([`Corpus::finish`]). Its members are
+/// held on the budget they were charged to before they were allocated, until it drops.
 #[derive(Debug)]
 pub struct Corpus {
     members: Members,
     documents: u64,
     total_words: u64,
+    _charge: Reservation,
+}
+
+/// A corpus being built: a bit per dictionary entry, charged to the building search's
+/// budget, with the count of its documents and their words.
+pub(crate) struct Bits {
+    pub(crate) bits: ChargedVec<u64>,
+    pub(crate) documents: u64,
+    pub(crate) total_words: u64,
 }
 
 /// A corpus's documents: a sorted list where they are few against the numbers they span,
@@ -334,44 +347,66 @@ impl Corpus {
         }
     }
 
-    /// Its documents as a bit per number below `span` (at least its own).
-    fn bits(&self, span: u64) -> Vec<u64> {
+    /// Its documents as a bit per number below `span` (at least its own), charged to
+    /// `budget` before they are allocated.
+    fn bits(&self, span: u64, budget: &Arc<Budget>) -> Result<ChargedVec<u64>, BudgetExceeded> {
+        let words = match &self.members {
+            Members::Sorted(_) => span.div_ceil(64) as usize,
+            Members::Bits(bits) => (span.div_ceil(64) as usize).max(bits.len()),
+        };
+        let mut out = ChargedVec::with_capacity(Arc::clone(budget), words)?;
         match &self.members {
             Members::Sorted(sorted) => {
-                let mut bits = vec![0u64; span.div_ceil(64) as usize];
+                out.resize(words, 0)?;
                 for &document in sorted {
-                    bits[(document / 64) as usize] |= 1 << (document % 64);
+                    out[(document / 64) as usize] |= 1 << (document % 64);
                 }
-                bits
             }
             Members::Bits(bits) => {
-                let mut bits = bits.clone();
-                bits.resize((span.div_ceil(64) as usize).max(bits.len()), 0);
-                bits
+                out.extend_from_slice(bits)?;
+                out.resize(words, 0)?;
             }
         }
+        Ok(out)
     }
 
-    /// The representation of `documents` members whose bits `bits` sets: a sorted list
-    /// where that is smaller than a bit per number below `span`.
-    fn of_bits(bits: Vec<u64>, span: u64, documents: u64, total_words: u64) -> Self {
-        let members = match documents * 64 > span {
-            true => Members::Bits(bits),
-            false => Members::Sorted(ones(&bits).collect()),
+    /// The corpus of `bits` (a bit per number below `span`, every one a document), its
+    /// members charged to `budget` before they are allocated: a sorted list where that is
+    /// smaller than a bit per number.
+    pub(crate) fn finish(
+        bits: &Bits,
+        span: u64,
+        budget: &Arc<Budget>,
+    ) -> Result<Self, BudgetExceeded> {
+        let (members, charge) = match Self::finished_bytes(bits.documents, span) {
+            (true, _) => {
+                let mut out = ChargedVec::with_capacity(Arc::clone(budget), bits.bits.len())?;
+                out.extend_from_slice(&bits.bits)?;
+                let (members, charge) = out.into_parts();
+                (Members::Bits(members), charge)
+            }
+            (false, _) => {
+                let count = bits.documents as usize;
+                let out = ChargedVec::collect(Arc::clone(budget), count, ones(&bits.bits))?;
+                let (members, charge) = out.into_parts();
+                (Members::Sorted(members), charge)
+            }
         };
-        Self {
+        Ok(Self {
             members,
-            documents,
-            total_words,
-        }
+            documents: bits.documents,
+            total_words: bits.total_words,
+            _charge: charge,
+        })
     }
 
-    /// Bytes it holds, itself included.
-    pub fn memory_bytes(&self) -> usize {
-        let members = match &self.members {
-            Members::Sorted(v) | Members::Bits(v) => v.capacity() * 8,
-        };
-        members + std::mem::size_of::<Self>()
+    /// Whether a corpus of `documents` below `span` is kept as bits, and the bytes its
+    /// members take: what [`Self::finish`] charges.
+    pub(crate) fn finished_bytes(documents: u64, span: u64) -> (bool, usize) {
+        match documents * 64 > span {
+            true => (true, span.div_ceil(64) as usize * 8),
+            false => (false, documents as usize * 8),
+        }
     }
 }
 
@@ -692,7 +727,7 @@ impl TextIndex {
     /// The corpus of the documents whose bits `bits` sets (a bit per number below `span`;
     /// numbers this index has no words for are left out), with their count and words. One
     /// thread: it runs under the index's lock.
-    pub(crate) fn corpus(&self, mut bits: Vec<u64>, span: u64) -> Corpus {
+    pub(crate) fn corpus(&self, mut bits: ChargedVec<u64>) -> Bits {
         let (mut documents, mut total_words) = (0u64, 0u64);
         for (w, word) in bits.iter_mut().enumerate() {
             let mut rest = *word;
@@ -708,14 +743,24 @@ impl TextIndex {
                 }
             }
         }
-        Corpus::of_bits(bits, span, documents, total_words)
+        Bits {
+            bits,
+            documents,
+            total_words,
+        }
     }
 
     /// `base` with each document of `changes` a member or not (numbers below `span`;
     /// numbers this index has no words for stay out): its counts adjusted, not counted
     /// again.
-    pub(crate) fn derive(&self, base: &Corpus, changes: &[(u64, bool)], span: u64) -> Corpus {
-        let mut bits = base.bits(span);
+    pub(crate) fn derive(
+        &self,
+        base: &Corpus,
+        changes: &[(u64, bool)],
+        span: u64,
+        budget: &Arc<Budget>,
+    ) -> Result<Bits, BudgetExceeded> {
+        let mut bits = base.bits(span, budget)?;
         let (mut documents, mut total_words) = (base.documents, base.total_words);
         for &(document, member) in changes {
             let (word, bit) = ((document / 64) as usize, document % 64);
@@ -731,7 +776,11 @@ impl TextIndex {
                 total_words -= u64::from(length);
             }
         }
-        Corpus::of_bits(bits, span, documents, total_words)
+        Ok(Bits {
+            bits,
+            documents,
+            total_words,
+        })
     }
 
     /// Marks the dictionary entries below `covered` as looked at.
@@ -1019,10 +1068,18 @@ mod tests {
         bits
     }
 
+    /// The corpus of `bits` (a bit per number below `span`), unbounded.
+    fn corpus_of(index: &TextIndex, bits: Vec<u64>, span: u64) -> Corpus {
+        let budget = Arc::new(Budget::unlimited());
+        let mut charged = ChargedVec::with_capacity(Arc::clone(&budget), bits.len()).unwrap();
+        charged.extend_from_slice(&bits).unwrap();
+        Corpus::finish(&index.corpus(charged), span, &budget).unwrap()
+    }
+
     /// Every document the index holds.
     fn every(index: &TextIndex) -> Corpus {
         let span = index.lengths.len() as u64;
-        index.corpus(vec![u64::MAX; span.div_ceil(64) as usize], span)
+        corpus_of(index, vec![u64::MAX; span.div_ceil(64) as usize], span)
     }
 
     #[test]
@@ -1339,8 +1396,8 @@ mod tests {
             alone.add(i, texts[i as usize]);
         }
         let text_of = |id: u64| texts.get(id as usize).map(|t| (*t).to_owned());
-        let sparse = whole.corpus(bits(&kept, 1 << 20), 1 << 20);
-        let dense = whole.corpus(bits(&kept, texts.len() as u64), texts.len() as u64);
+        let sparse = corpus_of(&whole, bits(&kept, 1 << 20), 1 << 20);
+        let dense = corpus_of(&whole, bits(&kept, texts.len() as u64), texts.len() as u64);
         assert!(matches!(sparse.members, Members::Sorted(_)));
         assert!(matches!(dense.members, Members::Bits(_)));
         assert_eq!((dense.documents(), dense.total_words()), (5, 10));

@@ -187,7 +187,7 @@ impl Engine {
         let publish = move |current: &Version| {
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
             let content = super::Content::fresh();
-            corpora.record(current.content, content, touched);
+            corpora.record(current.content, content, touched.iter().copied());
             Version {
                 content,
                 asserted: asserted.with_run(asserted_run),

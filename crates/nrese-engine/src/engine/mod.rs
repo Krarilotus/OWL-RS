@@ -690,6 +690,14 @@ impl Engine {
         *self.inner.shared.views.write() = budget;
     }
 
+    /// The budget what the full-text corpora keep is charged to from now on (one within
+    /// the server's, say), instead of one of [`EngineConfig::text_corpus_bytes`]: the
+    /// corpora kept so far are let go (searches holding them keep them, charged to the
+    /// old one).
+    pub fn set_text_corpus_budget(&self, budget: nrese_exec::Budget) {
+        self.inner.shared.statistics.corpora.set_budget(budget);
+    }
+
     /// `owl:sameAs` if reads expand equality classes ([`Self::set_equality`]).
     pub fn equality(&self) -> Option<TermId> {
         *self.inner.shared.equality.read()
