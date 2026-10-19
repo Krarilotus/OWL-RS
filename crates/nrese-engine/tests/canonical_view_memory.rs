@@ -48,22 +48,37 @@ fn engine(size: usize, views: &Arc<Budget>) -> Engine {
     engine
 }
 
-/// A kept view is charged for everything it holds, its run and its version, from before it
-/// is made until its version goes (a fixed estimate once reserved less than the run held).
+/// A view is charged for everything it holds, its run and its version, from before it is
+/// made until it is freed, kept or made for its reader alone (a fixed estimate once
+/// reserved less than the run held; the run once released its charge before the version
+/// holding it was freed).
 #[test]
-fn a_kept_view_is_charged_for_all_it_holds() {
+fn a_view_is_charged_for_all_it_holds_until_it_goes() {
     if !measure::alone() {
         return;
     }
+    // The view kept, charged to the view budget, freed with the engine and its readers.
     let views = Arc::new(Budget::unlimited());
-    let engine = engine(1, &views);
-    let snapshot = engine.snapshot();
-    let (canonical, excess) =
-        measure::measure_within(&views, || snapshot.with_canonical_equality());
-    assert_eq!(excess, 0, "held beyond its charge");
-    assert!(views.used() > 0);
-    drop((canonical, snapshot, engine));
+    let store = engine(1, &views);
+    let snapshot = store.snapshot();
+    let ((), excess) = measure::measure_within(&views, || {
+        let canonical = snapshot.with_canonical_equality();
+        assert!(views.used() > 0);
+        drop((canonical, snapshot, store));
+    });
+    assert_eq!(excess, 0, "a kept view held beyond its charge");
     assert_eq!(views.used(), 0);
+    // The view the view budget refuses, charged to its reader's, freed with the reader.
+    let store = engine(1, &Arc::new(Budget::new(1)));
+    let snapshot = store.snapshot();
+    let query = Arc::new(Budget::unlimited());
+    let ((), excess) = measure::measure_within(&query, || {
+        let canonical = snapshot.with_canonical_equality_within(&query).unwrap();
+        assert!(query.used() > 0);
+        drop(canonical);
+    });
+    assert_eq!(excess, 0, "a reader's view held beyond its charge");
+    assert_eq!(query.used(), 0);
 }
 
 /// Readers that miss the cache at once each make a view and keep its charge while they
