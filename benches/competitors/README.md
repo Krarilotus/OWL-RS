@@ -94,11 +94,13 @@ memory and disk; nothing is ranked on only the queries both happened to finish.
 
 ## Cleaning up after a run
 
-The legacy scorecard scripts call `scripts/bench-cleanup.sh` when they exit, also when they fail or are interrupted. Its broad name-based cleanup removes:
-- the run's containers and store volumes;
-- the dataset volume `nrese-bench-data` and local datasets under `~/nrese-bench`;
-- the images built here (`nrese-bench/*`) and the images the run pulled itself (an image that was already on the machine stays);
+The legacy scorecard scripts call `scripts/bench-cleanup.sh --owner scorecard` when they exit, also when they fail or are interrupted. It removes by label only (every container and volume carries its job's namespace, checkout and tool: `scripts/lib/ns.sh`):
+- the run's own containers and store volumes, never another job's on the host;
+- the images the run pulled itself (an image that was already on the machine stays);
 - inferred-set dumps (`*.inferred.nt`); the scorecard keeps their counts and comparisons.
+
+The shared datasets (the volume `nrese-bench-data`, local datasets under `~/nrese-bench`) and the
+images built here (`nrese-bench/*`) go only by hand: `--datasets`, `--images`.
 
 Scorecards (CSV), logs and reports stay.
 

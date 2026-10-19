@@ -40,10 +40,23 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import ns
 from .manifest import docker_memory_bytes
-from .runtime import PREFIX, DockerRuntime, Measured, Mount, Runtime, Server, Spec, slice_limit_mib
+from .runtime import DockerRuntime, Measured, Mount, Runtime, Server, Spec, slice_limit_mib
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def target_mount(kind: str) -> str:
+    """A build's /target: a directory of prebuilt binaries the job names (NRESE_TARGET_VOLUME,
+    an absolute path), else this checkout's own volume. A volume name from outside is refused:
+    another job's name would be its build to time and its volume to remove."""
+    given = os.environ.get("NRESE_TARGET_VOLUME", "")
+    if given and kind == "target":
+        if not os.path.isabs(given):
+            raise SystemExit(f"NRESE_TARGET_VOLUME={given}: a directory of binaries (absolute), not a volume name")
+        return given
+    return ns.name(kind, Path(__file__).resolve().parents[3])
 
 
 @dataclass
@@ -69,7 +82,7 @@ class Context:
         return self.runtime.dry
 
     def name(self, part: str) -> str:
-        return f"{PREFIX}{self.run_id}-{part}"
+        return ns.name(f"suite-{self.run_id}-{part}", self.root)
 
     def mounts(self, *more: Mount) -> list[Mount]:
         return [self.data, Mount(str(self.work), "/work", readonly=False), *self.extra, *more]
@@ -345,8 +358,9 @@ class Nrese(Adapter):
     regimes = {"none": "disabled", "rdfs": "rdfs", "owl-horst": "owl-horst",
                "owl2-rl": "owl2-rl", "owl2-ql": "owl2-ql"}
     runtimes = {"docker", "apptainer", "rootfs", "process"}
-    # The Docker build's output, mounted at /target (NRESE_TARGET_VOLUME: a worktree's own).
-    target_volume = os.environ.get("NRESE_TARGET_VOLUME", "nrese-target")
+    # The Docker build's output, mounted at /target: this checkout's own volume (ns.py), or a
+    # directory of prebuilt binaries a job names (NRESE_TARGET_VOLUME, an absolute path).
+    target_volume = target_mount("target")
     bin_setting = "NRESE_BIN"
 
     def source(self, ctx: Context) -> Path:
@@ -443,7 +457,7 @@ class NreseOxigraph(Nrese):
     baseline/pre-oxigraph-migration`) or wherever NRESE_OXIGRAPH_SRC points."""
 
     key = "nrese-oxigraph"
-    target_volume = "nrese-oxigraph-target"
+    target_volume = target_mount("oxigraph-target")
     bin_setting = "NRESE_OXIGRAPH_BIN"
 
     def source(self, ctx):

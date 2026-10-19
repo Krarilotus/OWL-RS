@@ -133,7 +133,7 @@ def steps(args) -> int:
                 continue
             report = f"/reports/{name}.ttl"
             env = {"JAVA_OPTS": f"-Xms1g -Xmx{args.heap}"} if ENGINES[engine][1] == "java" else {}
-            spec = kit.Spec(name=f"nrese-suite-era-{name}".lower(), image=tag(engine), entrypoint=True,
+            spec = kit.Spec(name=kit.ns.name(f"suite-era-{name}", kit.ROOT), image=tag(engine), entrypoint=True,
                             command=[f"/data/{subset}.ttl", f"/shapes/{shape}_shapes.ttl", report],
                             env=env, memory=args.memory,
                             mounts=[kit.Mount(str(DATA), "/data"), kit.Mount(str(DATA / "shapes"), "/shapes"),

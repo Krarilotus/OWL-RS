@@ -4,7 +4,7 @@
 # the §0 guards green and the W3C suites' counts as required? Each command is a fleet step;
 # `jobs` writes the jobs (benches/fast/release_gate.py jobs).
 #
-#   release-gate.sh build REV               REV's binaries, by REV's own toolchain, into $GATE/bin-REV8
+#   release-gate.sh build REV               REV's binaries, by REV's own toolchain, into GATE_BIN/bin-REV8-IDENTITY
 #   release-gate.sh prepare HARNESS         the plan, the data view and the cases' data, once, by
 #                                           HARNESS's generator; WatDiv's query sets checked
 #   release-gate.sh pass N SIDE REV HARNESS pass N: HARNESS's cases on REV's binaries, one repetition
@@ -37,7 +37,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 GATE=${NRESE_GATE_DIR:-$HOME/owlrs/${GATE_NAME:-gate-v2}}
-# Binaries by revision, shared by every gate (v1.5's and main's are built once).
+# Binaries by build identity, shared by every gate (v1.5's and main's are built once):
+# published whole, never replaced (scripts/lib/gate-publish.sh).
 GATE_BIN=${GATE_BIN:-$HOME/owlrs/gate-v2-bin}
 OUT=${FLEET_OUT:-$GATE/results}
 SPARQL_DATA=${SPARQL_DATA:-$HOME/owlrs/sparql-data}
@@ -59,7 +60,8 @@ worktree() {  # REV [DIR]: a clean worktree of the revision, made once
   echo "$dir"
 }
 
-bin_of() { echo "$GATE_BIN/bin-$(short "$1")"; }
+# The builds by identity, this gate's pointer to each revision's (bin_of), the age sweep.
+. scripts/lib/gate-publish.sh
 
 # The environment of a fast.py run on HARNESS's tree: native, the gate's data, nothing
 # written into the tree (the compact records go to the gate).
@@ -77,15 +79,19 @@ planned() { py -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))[
 case ${1:-} in
 build)
   rev=$(git rev-parse "$2") || exit 2
-  bin=$(bin_of "$rev")
-  if [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS); then
+  export PATH=$HOME/.cargo/bin:$PATH
+  bin=$(identity_dir "$rev")
+  if build_verified "$bin" "$rev"; then
+    point "$rev" "$bin"
     cp "$bin/BUILD.txt" "$OUT/build-$(short "$rev").txt"
-    log "build $rev: verified binaries there from before ($bin)"; exit 0
+    log "build $rev: verified binaries of its identity there from before ($bin)"; exit 0
   fi
-  src=$(worktree "$rev" "$GATE_BIN") || exit 2
-  export CARGO_TARGET_DIR=$GATE_BIN/target-$(short "$rev") PATH=$HOME/.cargo/bin:$PATH
+  # The source and build trees are this gate's own; the build is published under its identity.
+  mkdir -p "$GATE/build" && src=$(worktree "$rev" "$GATE/build") || exit 2
+  export CARGO_TARGET_DIR=$GATE/build/target-$(short "$rev")
   log "build $rev ($(cd "$src" && rustc -V 2>/dev/null))"
-  rm -rf "$bin.partial" && mkdir -p "$bin.partial/release/examples"
+  part=$bin.partial-$$
+  rm -rf "$part" && mkdir -p "$part/release/examples"
   missing=()
   for spec in nrese-store:perf_lab nrese-store:ql_print_check nrese-dl:tableau_consistency \
               nrese-dl:context_classify nrese-reasoner:classify; do
@@ -93,25 +99,27 @@ build)
     if [ -e "$src/crates/$crate/examples/$example.rs" ] || [ -e "$src/crates/$crate/examples/$example/main.rs" ]; then
       (cd "$src" && bash scripts/cargo-guarded.sh build --release --locked --quiet -p "$crate" --example "$example") \
         || { log "build of $example failed at $rev"; exit 1; }
-      cp "$CARGO_TARGET_DIR/release/examples/$example" "$bin.partial/release/examples/"
+      cp "$CARGO_TARGET_DIR/release/examples/$example" "$part/release/examples/"
     else
       missing+=("$example")
     fi
   done
   (cd "$src" && bash scripts/cargo-guarded.sh build --release --locked --quiet -p nrese-server) \
     || { log "build of nrese-server failed at $rev"; exit 1; }
-  cp "$CARGO_TARGET_DIR/release/nrese-server" "$bin.partial/release/"
+  cp "$CARGO_TARGET_DIR/release/nrese-server" "$part/release/"
   # What the revision's perf lab can do, from its source: route reports (--routes) and
   # whether it requires --queries (main's, f9b515e8: neither, and no samples per run).
   routes=1 empty=0
   git grep -q -e '"--routes"' "$rev" -- crates/nrese-store/examples || routes=0
   git grep -q -e 'queries DIR is required' "$rev" -- crates/nrese-store/examples && empty=1
-  printf 'routes=%s\nempty_queries=%s\n' "$routes" "$empty" > "$bin.partial/CAPABILITIES"
-  echo "$rev" > "$bin.partial/REVISION"
+  printf 'routes=%s\nempty_queries=%s\n' "$routes" "$empty" > "$part/CAPABILITIES"
+  echo "$rev" > "$part/REVISION"
   { echo "revision $rev"; (cd "$src" && rustc -V); echo "missing at this revision: ${missing[*]:-none}";
-    cat "$bin.partial/CAPABILITIES"; } > "$bin.partial/BUILD.txt"
-  (cd "$bin.partial" && find release -type f | sort | xargs sha256sum > SHA256SUMS)
-  rm -rf "$bin" && mv "$bin.partial" "$bin"
+    cat "$part/CAPABILITIES"; } > "$part/BUILD.txt"
+  (cd "$part" && find release -type f | sort | xargs sha256sum > SHA256SUMS)
+  build_identity "$rev" > "$part/IDENTITY"
+  publish "$part" "$bin" || { log "build $rev: $bin is there but doesn't verify"; exit 1; }
+  point "$rev" "$bin"
   cp "$bin/BUILD.txt" "$OUT/build-$(short "$rev").txt"
   # The binaries stay; their build tree and source worktree go (a rebuild is rare).
   rm -rf "$CARGO_TARGET_DIR" && git worktree remove --force "$src"
@@ -339,14 +347,20 @@ unpack)
   tarball=$(find "$src" -name gate-bin.tar | head -1)
   [ -n "$tarball" ] && (cd "$(dirname "$tarball")" && sha256sum -c --quiet gate-bin.tar.sha256) \
     || { log "unpack: no verified gate-bin.tar in $src"; exit 2; }
-  tar -C "$GATE_BIN" -xpf "$tarball" || { log "unpack: tar failed"; exit 2; }
+  # Into a private directory, then each build published under its identity like a build.
+  aside=$GATE_BIN/.unpack-$$
+  rm -rf "$aside" && mkdir -p "$aside" && tar -C "$aside" -xpf "$tarball" || { log "unpack: tar failed"; exit 2; }
   for bin in $(tar -tf "$tarball" | cut -d/ -f1 | sort -u); do
-    (cd "$GATE_BIN/$bin" && sha256sum -c --quiet SHA256SUMS) || { log "unpack: $bin doesn't verify"; exit 2; }
-    for f in $(cut -d' ' -f3- "$GATE_BIN/$bin/SHA256SUMS"); do
-      [ -x "$GATE_BIN/$bin/$f" ] || { log "unpack: $bin/$f lost its executable mode"; exit 2; }
+    (cd "$aside/$bin" && sha256sum -c --quiet SHA256SUMS) || { log "unpack: $bin doesn't verify"; exit 2; }
+    for f in $(cut -d' ' -f3- "$aside/$bin/SHA256SUMS"); do
+      [ -x "$aside/$bin/$f" ] || { log "unpack: $bin/$f lost its executable mode"; exit 2; }
     done
-    log "unpack: $bin verified ($(cat "$GATE_BIN/$bin/REVISION"))"
+    rev=$(cat "$aside/$bin/REVISION")
+    publish "$aside/$bin" "$GATE_BIN/$bin" || { log "unpack: $GATE_BIN/$bin is there but doesn't verify"; exit 2; }
+    point "$rev" "$GATE_BIN/$bin"
+    log "unpack: $bin verified ($rev)"
   done
+  rm -rf "$aside"
   ;;
 
 plan-cases)
@@ -384,11 +398,15 @@ jobs)
   ;;
 
 clean)
-  # The gate's worktrees, build trees and scratch go; the binaries (shared by revision), the
-  # data view, the prepared data and every result stay for the gate's next run.
+  # This gate's worktrees, build trees and scratch go (never the shared binaries' directory:
+  # other gates build and read there); the data view, the prepared data and every result stay
+  # for the gate's next run. Builds no gate used for GATE_BIN_AGE_DAYS go (sweep_builds).
   before=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
-  for dir in "$GATE"/src-* "$GATE_BIN"/src-*; do [ -d "$dir" ] && git worktree remove --force "$dir"; done
-  rm -rf "$GATE"/target-* "$GATE_BIN"/target-* "$GATE"/reports "$GATE"/compact
+  for dir in "$GATE"/src-* "$GATE"/build/src-*; do [ -d "$dir" ] && git worktree remove --force "$dir"; done
+  rm -rf "$GATE"/target-* "$GATE"/build "$GATE"/reports "$GATE"/compact
+  swept=$(sweep_builds | tr '
+' ' ')
+  [ -z "$swept" ] || log "clean: unused builds removed: $swept"
   git worktree prune
   after=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
   log "clean: $(( (before - after) / 1048576 )) MiB reclaimed; kept the binaries, the data view, the prepared data, the results"

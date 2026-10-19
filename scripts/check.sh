@@ -188,6 +188,10 @@ side_steps() {
   if printf '%s\n' "${files[@]}" | grep -qE '^benches/suite/'; then
     step "suite contracts" python -m unittest discover -s benches/suite/tests
   fi
+  # Docker names only from the job namespace (scripts/check-names.sh).
+  if printf '%s\n' "${files[@]}" | grep -qE '^(benches|scripts)/'; then
+    step names bash scripts/check-names.sh
+  fi
   if printf '%s\n' "${files[@]}" | grep -qE '^benches/nrese-bench-harness/'; then
     harness
   fi
@@ -311,6 +315,7 @@ case "$mode" in
     harness
     step locks bash scripts/check-locks.sh
     step "suite contracts" python -m unittest discover -s benches/suite/tests
+    step names bash scripts/check-names.sh
     if cargo deny --version > /dev/null 2>&1; then
       step deny cargo deny --all-features check
       step "deny (bench harness)" cargo deny --manifest-path benches/nrese-bench-harness/Cargo.toml \

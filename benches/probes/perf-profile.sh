@@ -14,8 +14,13 @@
 #   NRESE_PROFILE_EXAMPLE=nrese-reasoner:classify benches/probes/perf-profile.sh el -- \
 #     --out /out/hierarchy.tsv /src/tmp/el-lab/nt/ore_ont_15929.nt
 #
-# Remove the volume afterwards: docker volume rm nrese-prof-target
+# Remove the volume afterwards: scripts/bench-cleanup.sh --owner probe (this job's alone)
 set -euo pipefail
+# This job's names (scripts/lib/ns.sh): its containers and volumes; the shared datasets' volume.
+NS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+. "$NS_ROOT/scripts/lib/ns.sh"
+DATA_VOLUME=$(ns_shared data)
+TARGET_VOLUME=$(ns_name prof-target "$NS_ROOT")
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 label=$1; shift
 [ "${1:-}" = -- ] && shift
@@ -26,9 +31,10 @@ image="rust:${toolchain}-bookworm"
 src=$(cd "$REPO" && pwd -W 2>/dev/null || pwd)
 envs=()
 for e in ${NRESE_PROFILE_ENV:-}; do envs+=(-e "$e"); done
+ns_volume create "$TARGET_VOLUME" "$NS_ROOT" probe >/dev/null  # labelled: its own, kept between profiles
 MSYS_NO_PATHCONV=1 docker run --rm --privileged \
-  -v "$src:/src:ro" -v nrese-prof-target:/target -v nrese-cargo:/usr/local/cargo/registry \
-  -v nrese-bench-data:/data:ro -v "$(cd "$out" && pwd -W 2>/dev/null || pwd):/out" \
+  -v "$src:/src:ro" -v "$TARGET_VOLUME":/target -v "$(ns_shared cargo)":/usr/local/cargo/registry \
+  -v "$DATA_VOLUME":/data:ro -v "$(cd "$out" && pwd -W 2>/dev/null || pwd):/out" \
   -e RUSTFLAGS="-C target-cpu=native -C force-frame-pointers=yes" \
   -e CARGO_PROFILE_RELEASE_DEBUG=line-tables-only -e EXAMPLE="${NRESE_PROFILE_EXAMPLE:-}" "${envs[@]}" \
   -w /src "$image" bash -c '

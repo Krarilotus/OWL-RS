@@ -14,6 +14,10 @@
 #   wikidata-lexemes  Wikidata lexemes dump, latest (1.5 GB gz)
 # Full Wikidata truthy (72 GB gz, ~8 B triples) needs a large server and isn't included.
 set -euo pipefail
+# This job's names (scripts/lib/ns.sh): its containers and volumes; the shared datasets' volume.
+NS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+. "$NS_ROOT/scripts/lib/ns.sh"
+DATA_VOLUME=$(ns_shared data)
 
 # Datasets, store files and images take tens of GB: don't start on a nearly full disk.
 . "$(dirname "$0")/../../scripts/lib/disk.sh"
@@ -30,7 +34,7 @@ NAMES=${*:-olympics yago-tiny dbpedia-core wikidata-lexemes}
 
 # Runs a shell command in /data/real of the data volume.
 in_volume() {
-  docker run --rm -v nrese-bench-data:/data -w /data/real alpine sh -euc "$1"
+  docker run --rm -v "$DATA_VOLUME":/data -w /data/real alpine sh -euc "$1"
 }
 
 # The Wikidata lexeme dump: the newest, or a dated one (WIKIDATA_LEXEMES_DUMP=YYYYMMDD;
@@ -59,7 +63,7 @@ convert() { # name glob [filter]
     source=$file
     if [ -n "$filter" ]; then
       source=$name.parts/$(basename "$file").filtered
-      docker run --rm -v nrese-bench-data:/data -v "$HERE:/scripts:ro" "$PYTHON_IMAGE" \
+      docker run --rm -v "$DATA_VOLUME":/data -v "$HERE:/scripts:ro" "$PYTHON_IMAGE" \
         sh -c "python /scripts/nt-filter.py < '/data/real/$file' > '/data/real/$source'"
     fi
     # The source's syntax by its extension (YAGO ships Turtle).
@@ -68,7 +72,7 @@ convert() { # name glob [filter]
       *.nq) format=nq ;;
       *) format=nt ;;
     esac
-    docker run --rm -v nrese-bench-data:/data "$OXIGRAPH_IMAGE" convert --from-format "$format" \
+    docker run --rm -v "$DATA_VOLUME":/data "$OXIGRAPH_IMAGE" convert --from-format "$format" \
       --from-file "/data/real/$source" --to-file "/data/real/$name.parts/$(basename "$file").nt"
     [ -z "$filter" ] || in_volume "rm -f '$source'"
   done
@@ -79,7 +83,7 @@ convert() { # name glob [filter]
 }
 
 for name in $NAMES; do
-  if docker run --rm -v nrese-bench-data:/data alpine test -s "/data/$name.nt"; then
+  if docker run --rm -v "$DATA_VOLUME":/data alpine test -s "/data/$name.nt"; then
     echo "$name: ready"
     continue
   fi
@@ -111,10 +115,10 @@ for name in $NAMES; do
       millions=${millions%m}
       download "$LEXEMES_URL" wikidata-lexemes.nt.gz
       in_volume "rm -rf '$name.parts' && mkdir '$name.parts'"
-      docker run --rm -v nrese-bench-data:/data -v "$HERE:/scripts:ro" "$PYTHON_IMAGE" sh -c \
+      docker run --rm -v "$DATA_VOLUME":/data -v "$HERE:/scripts:ro" "$PYTHON_IMAGE" sh -c \
         "gunzip -c /data/real/wikidata-lexemes.nt.gz | python /scripts/nt-filter.py \
          | head -n $(( millions * 1000000 )) > /data/real/$name.parts/slice.filtered"
-      docker run --rm -v nrese-bench-data:/data "$OXIGRAPH_IMAGE" convert --from-format nt \
+      docker run --rm -v "$DATA_VOLUME":/data "$OXIGRAPH_IMAGE" convert --from-format nt \
         --from-file "/data/real/$name.parts/slice.filtered" --to-file "/data/real/$name.parts/slice.nt"
       in_volume "rm -f '$name.parts/slice.filtered'"
       in_volume "mv '$name.parts/slice.nt' '/data/$name.nt' && rm -rf '$name.parts'

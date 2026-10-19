@@ -24,7 +24,8 @@ python benches/fast/fast.py run                           every case, 2 repetiti
 python benches/fast/fast.py run --cases q-cycles,rl-chain --reps 3 --label mine
 python benches/fast/fast.py compare benches/baselines/fast/BASE.json benches/baselines/fast/NEW.json
 python benches/fast/fast.py compete --cases q-cycles      NRESE beside the systems the case declares
-python benches/fast/fast.py clean [--data]                this worktree's scratch; --data the shared data volume too
+python benches/fast/fast.py clean [--build] [--data]     this checkout's scratch; --build its containers and build volume
+                                                         (a job's cleanup, never another job's); --data the shared data volume
 ```
 
 | File | What |

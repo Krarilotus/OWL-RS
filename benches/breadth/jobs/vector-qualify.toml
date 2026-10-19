@@ -8,7 +8,7 @@ window = "any"
 priority = 1
 est_min = 30
 needs = ["docker"]
-env = { NRESE_TARGET_VOLUME = "nrese-target-breadth", CARGO_BUILD_JOBS = "8", NRESE_MEMORY_CAP_GB = "12", PYTHONIOENCODING = "utf-8" }
+env = { CARGO_BUILD_JOBS = "8", NRESE_MEMORY_CAP_GB = "12", PYTHONIOENCODING = "utf-8" }
 commands = [
   ["python3", "benches/fast/fast.py", "build"],
   ["sh", "-c", "python3 benches/fast/fast.py run --cases vector-knn-exact,vector-knn-filtered --reps 1 --counts-only --label breadth-vector-qualify --out \"$QUEUE_RESULTS/fast.json\""],

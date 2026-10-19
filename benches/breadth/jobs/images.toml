@@ -9,7 +9,7 @@ window = "any"
 priority = 0
 est_min = 60
 needs = ["docker"]
-env = { NRESE_TARGET_VOLUME = "nrese-target-breadth", CARGO_BUILD_JOBS = "8", NRESE_MEMORY_CAP_GB = "12", PYTHONIOENCODING = "utf-8" }
+env = { CARGO_BUILD_JOBS = "8", NRESE_MEMORY_CAP_GB = "12", PYTHONIOENCODING = "utf-8" }
 commands = [
   ["python3", "benches/breadth/era-shacl/run.py", "images"],
   ["python3", "benches/breadth/vectors/ann.py", "setup"],
