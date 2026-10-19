@@ -578,6 +578,30 @@ class Parts(unittest.TestCase):
             fast.select([{"name": "a", "area": "query"}], SimpleNamespace(cases="", areas=None))
         self.assertEqual(len(fast.select([{"name": "a", "area": "query"}], SimpleNamespace(cases=None, areas=None))), 1)
 
+    def test_layouts_rotate_within_each_side_and_every_side_runs_them_alike(self):
+        found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 4, None, big_host=None, layouts=2)
+        timed = found["rg-test-timed"]
+        passes_ = [s for s in timed["steps"] if s[2] == "pass"]
+        self.assertEqual(found["rg-test-build"]["env"]["GATE_LAYOUTS"], "2")
+        by_side = {}
+        for s in passes_:
+            by_side.setdefault(s[4], []).append(int(s[8]) if len(s) > 8 else 1)
+        # Each block of two passes a side runs both layouts, the first alternating.
+        self.assertEqual(by_side, {"base": [1, 2, 2, 1], "main": [1, 2, 2, 1], "cand": [1, 2, 2, 1]})
+        self.assertEqual(passes_[0][2:], ["pass", "1", "base", gate_module.BASE, "c" * 40])
+
+        def records_of(side, n):
+            return [record()]
+        ps = passes(records_of)
+        for p, layout in zip(ps, gate_module.layouts_of(ORDER, 2)):
+            p["report"]["binaries"] = {**p["report"]["binaries"], "layout": layout,
+                                       "sha256": {"release/examples/perf_lab": f"{p['side']}{layout}"}}
+            p["report"]["binaries_finished"] = copy.deepcopy(p["report"]["binaries"])
+        self.assertEqual(run_gate(ps)["errors"], [])
+        ps[2]["report"]["binaries"]["layout"] = ps[2]["report"]["binaries_finished"]["layout"] = 2
+        errors = run_gate(ps)["errors"]
+        self.assertTrue(any("different layouts" in e for e in errors), errors)
+
     def test_report_writes_markdown_and_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)

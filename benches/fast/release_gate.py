@@ -143,7 +143,7 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
     """What each pass must say about itself: complete, one repetition of exactly the planned
     cases, the clean harness revision at start and end, its side's verified binaries (the same
     in every pass of the side), the same prepared data unchanged, one host and configuration."""
-    errors, binaries, prepared, identities, options = [], {}, set(), set(), {}
+    errors, binaries, prepared, identities, options, layouts = [], {}, set(), set(), {}, {}
     for p in passes:
         r, name = p["report"], p["path"]
         if r.get("reps") != 1:
@@ -168,7 +168,10 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
                               f"expected {rev} verified")
         if (r.get("binaries") or {}).get("sha256") != (r.get("binaries_finished") or {}).get("sha256"):
             errors.append(f"{name}: binaries changed during the pass")
-        binaries.setdefault(p["side"], set()).add(json.dumps((r.get("binaries") or {}).get("sha256"), sort_keys=True))
+        layout = (r.get("binaries") or {}).get("layout", 1)
+        binaries.setdefault((p["side"], layout), set()).add(
+            json.dumps((r.get("binaries") or {}).get("sha256"), sort_keys=True))
+        layouts.setdefault(p["side"], Counter())[layout] += 1
         info = r.get("prepared") or {}
         if not info:
             errors.append(f"{name}: not a prepared pass (fast.py run --prepared)")
@@ -178,7 +181,13 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
         options.setdefault(p["side"], set()).add(json.dumps(r.get("options"), sort_keys=True))
         identities.add(json.dumps({**run_identity(r.get("machine") or {}, r.get("started", "")),
                                    "runtime": r.get("runtime")}, sort_keys=True))
-    errors += [f"{side}: different binaries in its passes" for side, shas in binaries.items() if len(shas) > 1]
+    errors += [f"{side}: different binaries in its passes" + (f" of layout {layout}" if layout > 1 else "")
+               for (side, layout), shas in binaries.items() if len(shas) > 1]
+    # Builds of several layouts (release-gate.sh GATE_LAYOUTS): every side the same layouts as
+    # often, so that a layout's luck falls on all alike.
+    if len({json.dumps(sorted(c.items())) for c in layouts.values()}) > 1:
+        errors.append("the sides ran different layouts: " +
+                      "; ".join(f"{s} {dict(sorted(c.items()))}" for s, c in sorted(layouts.items())))
     errors += [f"{side}: different options in its passes" for side, opts in options.items() if len(opts) > 1]
     # The measurement (runs, warm-ups, repetitions: --measure's file) is the same for every side.
     measures = {(p["report"].get("options") or {}).get("measure") for p in passes}
@@ -1053,6 +1062,28 @@ def schedule(passes_per_side: int) -> list[str]:
     return ["base", "main", "cand", "cand", "main", "base"] * (passes_per_side // 2)
 
 
+def layouts_of(order: list[str], layouts: int) -> list[int]:
+    """Each pass's build layout (release-gate.sh GATE_LAYOUTS): a side's passes rotate through
+    them, each block of two passes a side running two, the first of them alternating from block
+    to block, so that a layout is never the earlier or later one of a block on any side."""
+    seen: Counter = Counter()
+    out = []
+    for side in order:
+        j = seen[side]
+        seen[side] += 1
+        out.append((j + j // 2) % layouts + 1 if layouts > 1 else 1)
+    return out
+
+
+def pass_step(gate: list[str], n: int, side: str, rev: str, harness: str, plan: str | None, layout: int) -> list[str]:
+    step = [*gate, "pass", str(n), side, rev, harness]
+    if plan or layout > 1:
+        step.append(plan or "-")
+    if layout > 1:
+        step.append(str(layout))
+    return step
+
+
 def toml_job(job: dict) -> str:
     def value(v):
         if isinstance(v, bool):
@@ -1075,18 +1106,20 @@ def toml_job(job: dict) -> str:
 def jobs(candidate: str, harness: str, checkout: str, prefix: str, passes_per_side: int, cases: str | None,
          base: str = BASE, main: str = MAIN, timed_host: str = "phuoc-yu", checks_host: str = "office-pc",
          max_gb: float = 24, checks: bool = True, big_host: str | None = "khaleesi",
-         big_gb: float = 28, measure: dict | None = None, batch: bool = False) -> dict[str, dict]:
+         big_gb: float = 28, measure: dict | None = None, batch: bool = False,
+         layouts: int = 1) -> dict[str, dict]:
     """The gate's fleet jobs: binaries and data, then the timed passes and their report, alone
     on the timed host; the cases whose caps exceed it on the big host (khaleesi, 64 GB) at
     their full caps, on the build's binaries (packed by the build job: the big host builds
     nothing); the W3C suites and the guards on the checks host. No priority is set: each job
     gets its class's (merge-gate). With `measure` (benches/fast/measure.toml) the timed passes
     run in A-B-C-C-B-A blocks, each later block only the cases whose noise needs its passes
-    (plan-blocks); `batch`: every side's perf lab batches (fast.py --batch)."""
+    (plan-blocks); `batch`: every side's perf lab batches (fast.py --batch); `layouts`: each side
+    built that many times in different layouts, its passes rotating through them."""
     env = {"GATE_NAME": f"gate-v2-{candidate[:8]}", "GATE_MAX_GB": str(max_gb), "NRESE_QUIET_SLOT": "0",
            "GATE_MIN_PASSES": str(passes_per_side), **({"GATE_CASES": cases} if cases else {}),
            **({"GATE_BIG_GB": str(big_gb), "GATE_BIG_HOST": big_host} if big_host else {}),
-           **({"GATE_BATCH": "1"} if batch else {})}
+           **({"GATE_BATCH": "1"} if batch else {}), **({"GATE_LAYOUTS": str(layouts)} if layouts > 1 else {})}
     source = [{"name": "checkout", "source": {"git": checkout, "rev": harness}}]
     gate = ["bash", "scripts/release-gate.sh"]
     order = schedule(passes_per_side)
@@ -1107,14 +1140,15 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, passes_per_si
         count = max(max(need.values()) // 2, passes_per_side // 2)
         full = sum(e.get("seconds", 0) for e in measure.values()) or 1
         steps, est, n = [[*gate, "plan-blocks", harness]], 2.0, 0
-        for k in range(1, count + 1):
+        sides = schedule(2) * count
+        for (k, side), layout in zip([(i // 6 + 1, s) for i, s in enumerate(sides)], layouts_of(sides, layouts)):
             share = sum(e.get("seconds", 0) for c, e in measure.items() if need[c] >= 2 * k or k == 1) / full
-            for side in schedule(2):
-                n += 1
-                steps.append([*gate, "pass", str(n), side, revs[side], harness, f"plan-block-{k}.json"])
-                est += (per_pass[side] if small else full * share / 60) + PASS_OVERHEAD_S / 60
+            n += 1
+            steps.append(pass_step(gate, n, side, revs[side], harness, f"plan-block-{k}.json", layout))
+            est += (per_pass[side] if small else full * share / 60) + PASS_OVERHEAD_S / 60
     else:
-        steps = [[*gate, "pass", str(n), side, revs[side], harness] for n, side in enumerate(order, start=1)]
+        steps = [pass_step(gate, n, side, revs[side], harness, None, layout)
+                 for n, (side, layout) in enumerate(zip(order, layouts_of(order, layouts)), start=1)]
         est = sum(per_pass[s] for s in order) + 2
     out[f"{prefix}-timed"] = {
         "id": f"{prefix}-timed", "group": "release", "kind": "owlrs.timed", "class": "exclusive",
@@ -1134,7 +1168,8 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, passes_per_si
             "priority_class": "merge-gate", "after": [f"{prefix}-build"], "env": big_env,
             "est_min": per_big * len(order) + 30, "stall_after_min": 60,
             "steps": [[*gate, "unpack"], [*gate, "prepare", harness]]
-            + [[*gate, "pass", str(n), side, revs[side], harness] for n, side in enumerate(order, start=1)]
+            + [pass_step(gate, n, side, revs[side], harness, None, layout)
+               for n, (side, layout) in enumerate(zip(order, layouts_of(order, layouts)), start=1)]
             + [[*gate, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], [*gate, "clean"]],
             "requires": {"hosts": [big_host], "cores": 16, "ram_gb": big_gb + 4},
             "inputs": [*source, {"name": "binaries", "source": {"artifact": f"{prefix}-build/binaries"}}]}
@@ -1246,12 +1281,14 @@ def confirm_job(rounds: list[dict], checkout: str) -> dict | None:
     gate = ["bash", "scripts/release-gate.sh"]
     env = {"GATE_NAME": ctx.get("gate_name") or f"gate-v2-{revs['cand'][:8]}", "GATE_HOST": ctx.get("host", ""),
            "GATE_ROUND": str(k), "GATE_PREFIX": prefix, "GATE_MIN_PASSES": str(n), "NRESE_QUIET_SLOT": "0",
-           "GATE_PLAN": f"plan-confirm{k}.json", "GATE_MAX_GB": str(ctx.get("max_gb", 24))}
+           "GATE_PLAN": f"plan-confirm{k}.json", "GATE_MAX_GB": str(ctx.get("max_gb", 24)),
+           **({"GATE_LAYOUTS": str(ctx["layouts"])} if ctx.get("layouts", 1) > 1 else {})}
     return {"id": name, "group": "release", "kind": "owlrs.timed", "class": "exclusive",
             "priority_class": "merge-gate", "env": env,
             "est_min": round(seconds / 60 + 0.7 * len(order) + 5), "stall_after_min": 60,
             "steps": [[*gate, "plan-cases", ",".join(cases)]]
-            + [[*gate, "pass", str(i), side, revs[side], harness] for i, side in enumerate(order, start=1)]
+            + [pass_step(gate, i, side, revs[side], harness, None, layout)
+               for i, (side, layout) in enumerate(zip(order, layouts_of(order, ctx.get("layouts", 1))), start=1)]
             + [[*gate, "report", harness, f"cand={revs['cand']}", *(f"{s}={r}" for s, r in first["baselines"].items())],
                [*gate, "clean"]],
             "requires": {"hosts": [ctx.get("host") or "phuoc-yu"], "cores": 16, "ram_gb": ctx.get("ram_gb", 24)},
@@ -1344,7 +1381,8 @@ def main() -> int:
                    help="the owner-approved trade-offs: the only way a loss is accepted")
     s.add_argument("--inputs", type=Path, help="the datasets the passes read, as prepare recorded them")
     s.add_argument("--context", action="append", default=[], metavar="KEY=VALUE",
-                   help="the job: host (fleet's name), round (0 the first run), prefix, gate_name, max_gb, ram_gb")
+                   help="the job: host (fleet's name), round (0 the first run), prefix, gate_name, max_gb, ram_gb, "
+                        "layouts")
     s.add_argument("--out", type=Path)
     s.add_argument("--json", type=Path)
     s = sub.add_parser("w3c")
@@ -1369,6 +1407,7 @@ def main() -> int:
     s.add_argument("--no-checks", action="store_true", help="without the W3C and guards job")
     s.add_argument("--big-host", default="khaleesi", help="the host of the cases above --max-gb ('' for none)")
     s.add_argument("--big-gb", type=float, default=28)
+    s.add_argument("--layouts", type=int, default=1, help="builds a side in different layouts (GATE_LAYOUTS)")
     s.add_argument("--out", type=Path, default=Path("."))
     s = sub.add_parser("calibrate", help="benches/fast/measure.toml from passes of the gate's host (an A/A run)")
     s.add_argument("--passes", type=Path, nargs="+", required=True, help="pass reports, or directories of them")
@@ -1411,7 +1450,7 @@ def main() -> int:
                        args.min_passes, args.diagnostic, pairs(args.not_run, "--not-run"), tradeoffs,
                        cases_registry.load(), pairs(args.elsewhere, "--elsewhere"),
                        {k: v for k, v in pairs(args.context, "--context").items()})
-        for key in ("round", "max_gb", "ram_gb"):
+        for key in ("round", "max_gb", "ram_gb", "layouts"):
             if key in summary["context"]:
                 summary["context"][key] = float(summary["context"][key]) if "gb" in key else int(summary["context"][key])
         if args.inputs and args.inputs.is_file():
@@ -1513,7 +1552,7 @@ def main() -> int:
         found = jobs(candidate, harness, args.checkout, args.id or f"rg-{candidate[:8]}",
                      args.passes, args.cases, rev(args.base), rev(args.main), max_gb=args.max_gb,
                      checks=not args.no_checks, big_host=args.big_host or None, big_gb=args.big_gb,
-                     measure=measure, batch=batch)
+                     measure=measure, batch=batch, layouts=args.layouts)
         args.out.mkdir(parents=True, exist_ok=True)
         for name, job in found.items():
             (args.out / f"{name}.toml").write_text(toml_job(job), encoding="utf-8")

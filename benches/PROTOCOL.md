@@ -299,6 +299,17 @@ arises, the same for every side:
   successors against v2) decides them. Likewise a series reported in coarser steps (an older
   perf lab's open time in whole milliseconds, the EL classifier's phases to a tenth) is judged
   at its step: a difference of one step is no verdict (`release_gate.py quantum`).
+- *Code layout measured, not argued* (Mytkowicz et al., ASPLOS 2009; Curtsinger and Berger,
+  STABILIZER, ASPLOS 2013). With `GATE_LAYOUTS=K` (`release_gate.py jobs --layouts K`) each
+  side is built K times: layout 1 the plain build, layout L its timed tools linked with their
+  functions in another order (rust-lld `--shuffle-sections=.text*=L`: the same code, other
+  addresses; codegen units are not varied, that would change the optimisation, not the layout).
+  A side's passes rotate through its layouts, each block of two passes a side running two, the
+  first alternating from block to block; every side runs the same layouts as often (the report
+  checks it), so the between-build variance is in the between-pass noise the interval rests on.
+  Built once per revision and layout, reused by every case and gate. Each process also gets an
+  environment pad of random size (its initial stack moves, on top of address randomisation).
+  `probes/gate-power.py layout` splits each series' variance into the layouts' and the rest's.
 - *No thread started in a timed window.* Every revision's perf lab started a canceller thread
   per run just before its timer, and the thread's start ran inside the timed call (1-5 µs on
   microsecond queries, against 0.3-0.45 µs between the engines in a clean loop). One watchdog
