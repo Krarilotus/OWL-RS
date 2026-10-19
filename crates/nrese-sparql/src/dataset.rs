@@ -201,12 +201,4 @@ impl ResolvedDataset {
         });
         Self { default, named }
     }
-
-    /// Whether the dataset has the named graph `graph`, which the store holds.
-    #[expect(dead_code)]
-    pub(crate) fn names(&self, graph: TermId) -> bool {
-        self.named
-            .as_ref()
-            .is_none_or(|named| named.contains(&graph))
-    }
 }
