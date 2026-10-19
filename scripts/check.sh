@@ -11,7 +11,8 @@
 #        scripts/check.sh push     pre-push hook: the crates changed since the upstream
 #                                  branch. fmt; clippy on them; all their tests, the
 #                                  dependents' fast tests; random tests on new seeds; the
-#                                  lock check.
+#                                  lock check; nrese-exec's unsafe code under Miri when it
+#                                  changed (scripts/miri.sh).
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
 #
@@ -288,6 +289,11 @@ case "$mode" in
         step test run_tests "${changed[@]}" "${dependents[@]}" -- "${dependents[@]}"
         step seeds run_seeds "${changed[@]}"
         step locks bash scripts/check-locks.sh
+        # nrese-exec's unsafe primitives under Miri (scripts/miri.sh).
+        if printf '%s
+' "${changed[@]}" | grep -qx nrese-exec; then
+          step miri bash scripts/miri.sh
+        fi
       fi
     fi
     side_steps "${files[@]}"
