@@ -465,7 +465,7 @@ impl Context<'_> {
                 table.push_row(&line);
             }
         }
-        self.consumed(&solutions);
+        self.consumed(solutions);
         self.produced(Solutions {
             vars,
             table,

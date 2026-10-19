@@ -120,21 +120,24 @@ impl Context<'_> {
         let kept: Vec<usize> = (0..solutions.vars.len())
             .filter(|&column| needed.contains(&solutions.vars[column]))
             .collect();
-        let rows = solutions.table.len();
-        self.consumed(&solutions);
-        let mut table = if kept.is_empty() {
-            // No column left: one row if there was any.
-            IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows.min(1)))
-        } else {
-            solutions.table.project(&kept)
-        };
-        if !kept.is_empty() {
-            table.dedup_preserving_order();
-        }
-        self.produced(Solutions {
-            vars: kept.iter().map(|&c| solutions.vars[c].clone()).collect(),
-            table,
-            ordered: solutions.ordered,
+        self.reshaped(solutions, 0, |solutions| {
+            let rows = solutions.table.len();
+            let vars = kept.iter().map(|&c| solutions.vars[c].clone()).collect();
+            let ordered = solutions.ordered;
+            let table = if kept.is_empty() {
+                drop(solutions);
+                // No column left: one row if there was any.
+                IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows.min(1)))
+            } else {
+                let mut table = solutions.table.project(&kept);
+                table.dedup_preserving_order();
+                table
+            };
+            Solutions {
+                vars,
+                table,
+                ordered,
+            }
         })
     }
 
@@ -665,7 +668,7 @@ impl Context<'_> {
                 let estimate = Some(kept_groups as u64);
                 self.note("aggregate", detail, estimate, kept_groups, start);
             }
-            self.consumed(&joined);
+            self.consumed(joined);
         }
 
         // Detached OPTIONALs without aggregates contribute nothing. The kept groups, with
@@ -683,12 +686,43 @@ impl Context<'_> {
             columns.push(kept.iter().map(|&g| column[g]).collect());
             vars.push(target.clone());
         }
-        self.consumed(&core);
+        self.consumed(core);
         self.produced(Solutions {
             vars,
             table: IdTable::from_columns(columns),
             ordered: false,
         })
         .map(Some)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::QueryOptions;
+
+    /// A table remade from its own buffers keeps their charge: under an envelope of just
+    /// its bytes, a projection that keeps its columns isn't refused (Sol's review of
+    /// ff366fc5: charged twice, it was).
+    #[test]
+    fn a_table_remade_from_its_buffers_is_charged_once() {
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let snapshot = engine.snapshot();
+        let mut options = QueryOptions::default();
+        options.resources.memory = nrese_exec::Envelope::new(Some(64), None);
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let v = Variable::new_unchecked("v");
+        let rows = ctx
+            .produced(Solutions {
+                vars: vec![v.clone()],
+                table: IdTable::with_capacity(1, 8),
+                ordered: false,
+            })
+            .ok()
+            .unwrap();
+        let kept = ctx.distinct_on(rows, &[v]).ok().unwrap();
+        assert_eq!((ctx.budget.used(), ctx.budget.peak()), (64, 64));
+        ctx.consumed(kept);
+        assert_eq!(ctx.budget.used(), 0);
     }
 }

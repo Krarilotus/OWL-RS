@@ -101,7 +101,7 @@ impl Context<'_> {
             let keep: Vec<bool> = by_id.iter().map(|&joined| !joined).collect();
             rows_where(&result, &keep)
         });
-        self.consumed(&result);
+        self.consumed(result);
         let left = self.produced(left)?;
         let shared = [b.clone()];
         let probe = self.merge_set.is_none()
