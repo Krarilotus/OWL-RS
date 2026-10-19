@@ -389,7 +389,7 @@ impl PackedKeys {
     /// keys keep stays reserved; the packing's working memory is released), on one thread.
     pub(crate) fn from_sorted_within(
         keys: &[Key],
-        charge: &mut dyn super::Charge,
+        charge: &mut impl super::Charge,
     ) -> Result<Self, nrese_exec::BudgetExceeded> {
         Self::packed(keys, current_encoding(), charge, false)
     }
@@ -397,7 +397,7 @@ impl PackedKeys {
     fn packed(
         keys: &[Key],
         encoding: IndexEncoding,
-        charge: &mut dyn super::Charge,
+        charge: &mut impl super::Charge,
         parallel: bool,
     ) -> Result<Self, nrese_exec::BudgetExceeded> {
         debug_assert!(keys.is_sorted(), "keys must be sorted");

@@ -547,7 +547,8 @@ impl IndexVersion {
 
 /// Where a structure being built reserves its memory before it allocates it: nowhere for
 /// the store's own runs ([`Uncharged`]), a reservation for a canonical view's
-/// (`engine::equality`), which the view then holds.
+/// (`engine::equality`), which the view then holds. Builders take it as a type parameter:
+/// the store's path is compiled with [`Uncharged`], whose calls inline to nothing.
 pub(crate) trait Charge {
     fn reserve(&mut self, bytes: usize) -> Result<(), BudgetExceeded>;
     fn release(&mut self, bytes: usize);
@@ -557,10 +558,12 @@ pub(crate) trait Charge {
 pub(crate) struct Uncharged;
 
 impl Charge for Uncharged {
+    #[inline(always)]
     fn reserve(&mut self, _: usize) -> Result<(), BudgetExceeded> {
         Ok(())
     }
 
+    #[inline(always)]
     fn release(&mut self, _: usize) {}
 }
 

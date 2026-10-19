@@ -89,7 +89,7 @@ impl EqualityCell {
 pub(crate) struct CanonicalCache {
     /// The canonical view under `owl:sameAs` ([`canonical_version`]), which holds its own
     /// charge; `None` where the view is the version itself.
-    view: Mutex<Option<(TermId, Option<Arc<Version>>)>>,
+    view: Mutex<Option<(TermId, Option<View>)>>,
     /// Whether a triple term of the version names an alias under `owl:sameAs`
     /// (`Snapshot::triple_terms_name_aliases`).
     triple_terms: Mutex<Option<(TermId, bool)>>,
@@ -101,20 +101,54 @@ impl std::fmt::Debug for CanonicalCache {
     }
 }
 
+/// A canonical view: the version canonical reads read, and its charge, shared by the cache
+/// and its readers. The last holder frees the view and then releases the charge: it takes
+/// the view out of the shared allocation, which goes first ([`Arc::into_inner`] gives the
+/// view to exactly one holder, whichever drops last), then the view's data, then its
+/// reservation, the last field of [`ViewData`] (fields drop in declaration order).
+#[derive(Clone)]
+pub(crate) struct View(Option<Arc<ViewData>>);
+
+/// What a [`View`] holds.
+struct ViewData {
+    version: Arc<Version>,
+    /// What the view's allocations are charged to. Last: released after everything it
+    /// covers is freed.
+    _held: Reservation,
+}
+
+impl View {
+    pub(crate) fn version(&self) -> &Arc<Version> {
+        &self
+            .0
+            .as_ref()
+            .expect("taken only by the last drop")
+            .version
+    }
+}
+
+impl Drop for View {
+    fn drop(&mut self) {
+        if let Some(data) = self.0.take().and_then(Arc::into_inner) {
+            drop(data);
+        }
+    }
+}
+
 impl CanonicalCache {
     /// The view canonical reads of `version` read under `same_as`; `None` where that is
     /// `version` itself. Made on `views`, the store's budget for the views versions keep,
     /// and kept for the version; where `views` refuses, made on `fallback` (the reader's
     /// own) and not kept; where that refuses too, the error. Each view holds its charge
-    /// (its run's [`Run::from_delta_within`](crate::index::run::Run)), released by its
-    /// last holder, the cache or a reader. Readers that miss at once each make one, each
+    /// ([`View`]), released by its last holder, the cache or a reader, after the view is
+    /// freed. Readers that miss at once each make one, each
     /// charged in full; the last one made is kept.
     pub(crate) fn view(
         version: &Arc<Version>,
         same_as: TermId,
         views: &Arc<Budget>,
         fallback: &Arc<Budget>,
-    ) -> Result<Option<Arc<Version>>, BudgetExceeded> {
+    ) -> Result<Option<View>, BudgetExceeded> {
         if let Some((id, view)) = version.canonical.view.lock().as_ref()
             && *id == same_as
         {
@@ -223,16 +257,16 @@ fn dedup_sorted(items: &mut ChargedVec<EncodedQuad>) {
 /// `None` where no statement is renamed.
 ///
 /// Made on `budget`, everything reserved before it is allocated: the statements, the
-/// run's arrays, its scans' working memory, the version and its list of runs. The view's
-/// run holds what the view keeps, so the charge goes with the view; a refusal leaves
-/// nothing made. O(a log n + k log k) for a aliases and k such statements, or one scan of
+/// run's arrays, its scans' working memory, the version and its list of runs, and the
+/// view's own allocation. The [`View`] holds what it keeps reserved, released after it is
+/// freed; a refusal leaves nothing made. O(a log n + k log k) for a aliases and k such statements, or one scan of
 /// the named graphs where that is less.
 fn canonical_version(
     version: &Arc<Version>,
     same_as: TermId,
     classes: &Arc<Classes>,
     budget: &Arc<Budget>,
-) -> Result<Option<Arc<Version>>, BudgetExceeded> {
+) -> Result<Option<View>, BudgetExceeded> {
     let asserted = &version.asserted;
     let mut scanning = Reservation::new(Arc::clone(budget));
     scanning.charge(asserted.scan_bytes())?;
@@ -255,20 +289,26 @@ fn canonical_version(
     inserts.sort_unstable();
     dedup_sorted(&mut inserts);
     // What the view keeps besides its run's arrays: its run, the list of runs, the
-    // version and its equality cell, each with its allocation's header.
+    // version and its equality cell, and the view itself, each with its allocation's
+    // header.
     let mut held = Reservation::new(Arc::clone(budget));
     let boxed = |bytes: usize| bytes + 2 * std::mem::size_of::<usize>();
     held.charge(
         boxed(std::mem::size_of::<crate::index::run::Run>())
             + asserted.run_list_bytes()
             + boxed(std::mem::size_of::<Version>())
-            + boxed(std::mem::size_of::<EqualityCell>()),
+            + boxed(std::mem::size_of::<EqualityCell>())
+            + boxed(std::mem::size_of::<ViewData>()),
     )?;
-    let run =
-        crate::index::run::Run::from_delta_within(asserted.layout(), &inserts, &renamed, held)?;
+    let run = crate::index::run::Run::from_delta_within(
+        asserted.layout(),
+        &inserts,
+        &renamed,
+        &mut held,
+    )?;
     let asserted = asserted.with_run(run);
     drop((inserts, renamed));
-    Ok(Some(Arc::new(Version {
+    let version = Arc::new(Version {
         asserted,
         inferred: version.inferred.clone(),
         revision: version.revision,
@@ -276,7 +316,11 @@ fn canonical_version(
         equality: Arc::new(EqualityCell::holding(same_as, Arc::clone(classes))),
         content: version.content,
         canonical: Default::default(),
-    })))
+    });
+    Ok(Some(View(Some(Arc::new(ViewData {
+        version,
+        _held: held,
+    })))))
 }
 
 /// `owl:sameAs` classes of two or more identities.

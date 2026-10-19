@@ -78,7 +78,7 @@ impl PermutationRun {
     /// packed on one thread unless `parallel`.
     fn from_sorted_within(
         entries: Vec<(Key, bool)>,
-        charge: &mut dyn super::Charge,
+        charge: &mut impl super::Charge,
         parallel: bool,
     ) -> Result<Self, nrese_exec::BudgetExceeded> {
         let has_tombstones = entries.iter().any(|(_, tomb)| *tomb);
@@ -121,9 +121,6 @@ pub(crate) struct Run {
     perms: [PermutationRun; Permutation::COUNT],
     inserts: u64,
     deletes: u64,
-    /// What a run built charged holds of its budget ([`Self::from_delta_within`]),
-    /// released with the run: by its last holder.
-    _held: Option<nrese_exec::Reservation>,
 }
 
 impl Run {
@@ -148,13 +145,13 @@ impl Run {
     }
 
     /// [`Self::from_delta`], on one thread, every array reserved on `held` before it is
-    /// made; the run holds `held` (with whatever else its maker reserved on it), so the
-    /// charge goes when the run does. A refusal leaves nothing made.
+    /// made; what the run keeps stays reserved there, for its maker to hold while the run
+    /// lives (`engine::equality::View`). A refusal leaves nothing made.
     pub(crate) fn from_delta_within(
         layout: Layout,
         inserts: &[EncodedQuad],
         deletes: &[EncodedQuad],
-        mut held: nrese_exec::Reservation,
+        held: &mut nrese_exec::Reservation,
     ) -> Result<Self, nrese_exec::BudgetExceeded> {
         let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
         let entries_bytes = (inserts.len() + deletes.len()) * std::mem::size_of::<(Key, bool)>();
@@ -164,13 +161,11 @@ impl Run {
             entries.extend(inserts.iter().map(|q| (permutation.to_key(q), false)));
             entries.extend(deletes.iter().map(|q| (permutation.to_key(q), true)));
             entries.sort_unstable_by_key(|entry| entry.0);
-            let built = PermutationRun::from_sorted_within(entries, &mut held, false);
+            let built = PermutationRun::from_sorted_within(entries, held, false);
             held.release(entries_bytes);
             perms[permutation as usize] = built?;
         }
-        let mut run = Self::from_permutations(layout, perms);
-        run._held = Some(held);
-        Ok(run)
+        Ok(Self::from_permutations(layout, perms))
     }
 
     /// Builds a tombstone-free run from arbitrary quads, removing duplicates. Used for bulk
@@ -203,7 +198,6 @@ impl Run {
             perms,
             inserts,
             deletes,
-            _held: None,
         }
     }
 
@@ -265,9 +259,6 @@ impl Run {
             perms,
             inserts: self.inserts,
             deletes: self.deletes,
-            // The store's own runs: charged nowhere (a canonical view's are built in the
-            // quad layout).
-            _held: None,
         }
     }
 
