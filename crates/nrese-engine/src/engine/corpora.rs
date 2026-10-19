@@ -55,6 +55,37 @@ const STEP_TERMS: usize = 1 << 18;
 /// canonically.
 pub(crate) type CorpusKind = (Documents, ReadModel, TextScope, Option<TermId>, bool);
 
+/// A corpus's kind as a search asks for it: borrowed, so that a lookup copies nothing; owned
+/// ([`CorpusKind`]) only when an entry is made, after its bytes are charged.
+#[derive(Clone, Copy)]
+pub(crate) struct KindRef<'a> {
+    pub(crate) documents: Documents,
+    pub(crate) model: ReadModel,
+    pub(crate) scope: &'a TextScope,
+    pub(crate) equality: Option<TermId>,
+    pub(crate) canonical: bool,
+}
+
+impl KindRef<'_> {
+    fn matches(&self, kind: &CorpusKind) -> bool {
+        kind.0 == self.documents
+            && kind.1 == self.model
+            && kind.2 == *self.scope
+            && kind.3 == self.equality
+            && kind.4 == self.canonical
+    }
+
+    fn to_owned(self) -> CorpusKind {
+        (
+            self.documents,
+            self.model,
+            self.scope.clone(),
+            self.equality,
+            self.canonical,
+        )
+    }
+}
+
 /// Counts of the corpora (for [`crate::EngineStats`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TextCorpusStats {
@@ -107,8 +138,8 @@ struct Kept {
 
 /// Bytes an entry takes besides its corpus: itself and its graphs (a clone, as long as
 /// it is: the capacity a vector's clone has).
-fn key_bytes(kind: &CorpusKind) -> usize {
-    let graphs = match &kind.2 {
+fn key_bytes(kind: KindRef<'_>) -> usize {
+    let graphs = match kind.scope {
         TextScope::Merge(graphs) => std::mem::size_of_val(graphs.as_slice()),
         TextScope::Graphs(_) => 0,
     };
@@ -435,9 +466,9 @@ impl CorpusStore {
 
     /// Lets the least recently used entry other than `(content, kind)` go; `false` if
     /// there is none.
-    fn evict_one(state: &mut State, keep: Option<(Content, &CorpusKind)>) -> bool {
+    fn evict_one(state: &mut State, keep: Option<(Content, KindRef<'_>)>) -> bool {
         let at = state.kept.iter().position(|k| {
-            keep.is_none_or(|(content, kind)| k.content != content || k.kind != *kind)
+            keep.is_none_or(|(content, kind)| k.content != content || !kind.matches(&k.kind))
         });
         match at {
             Some(at) => {
@@ -456,7 +487,7 @@ impl CorpusStore {
     pub(crate) fn find(
         &self,
         version: &Arc<Version>,
-        kind: &CorpusKind,
+        kind: KindRef<'_>,
         request: &Arc<Budget>,
     ) -> Result<Found, BudgetExceeded> {
         let content = version.content;
@@ -464,7 +495,7 @@ impl CorpusStore {
         let at = state
             .kept
             .iter()
-            .position(|k| k.content == content && k.kind == *kind);
+            .position(|k| k.content == content && kind.matches(&k.kind));
         let building = match at {
             Some(at) => {
                 // The most recently used goes last.
@@ -480,7 +511,7 @@ impl CorpusStore {
             None => false,
         };
         // The nearest ancestor with a kept, built corpus of this kind, and the steps there.
-        let same_as = kind.3.map(TermId::raw);
+        let same_as = kind.equality.map(TermId::raw);
         let mut ancestor = None;
         let (mut terms, mut count) = (0, 0);
         for step in up(&state.steps, content) {
@@ -493,7 +524,7 @@ impl CorpusStore {
             if let Some(corpus) = state
                 .kept
                 .iter()
-                .find(|k| k.content == at && k.kind == *kind)
+                .find(|k| k.content == at && kind.matches(&k.kind))
                 .and_then(|k| k.corpus.as_ref().map(|(corpus, _)| corpus))
             {
                 ancestor = Some(Arc::clone(corpus));
@@ -521,7 +552,7 @@ impl CorpusStore {
         while let Some(at) = state
             .kept
             .iter()
-            .position(|k| k.kind == *kind && k.version.strong_count() == 0)
+            .position(|k| kind.matches(&k.kind) && k.version.strong_count() == 0)
         {
             let kept = state.kept.remove(at);
             Self::retire(&mut state, kept);
@@ -538,7 +569,7 @@ impl CorpusStore {
         }
         state.kept.push(Kept {
             content,
-            kind: kind.clone(),
+            kind: kind.to_owned(),
             version: Arc::downgrade(version),
             _key: key,
             corpus: None,
@@ -554,7 +585,7 @@ impl CorpusStore {
     pub(crate) fn keep_built(
         &self,
         version: &Arc<Version>,
-        kind: &CorpusKind,
+        kind: KindRef<'_>,
         bytes: usize,
         build: impl FnOnce(&Arc<Budget>) -> Result<Corpus, BudgetExceeded>,
     ) -> Option<Arc<Corpus>> {
@@ -564,7 +595,7 @@ impl CorpusStore {
             state
                 .kept
                 .iter()
-                .position(|k| k.content == content && k.kind == *kind)
+                .position(|k| k.content == content && kind.matches(&k.kind))
         };
         {
             let mut state = self.state.lock();
