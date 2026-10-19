@@ -417,7 +417,9 @@ FLEET_JOB=mine ns_clean "$1" "" all
 
 @unittest.skipUnless(BASH, "needs bash")
 class Timing(unittest.TestCase):
-    def test_a_job_runs_the_image_id_it_first_resolved_whatever_the_tag_becomes(self):
+    def test_images_are_pinned_at_the_start_or_the_job_stops(self):
+        """Sol, 20 Oct 2026: a tag that couldn't be resolved was run by its tag, and a later
+        resolution could pin another image within one comparison."""
         import json
         from suitekit.runtime import DockerRuntime, Spec
         with tempfile.TemporaryDirectory() as tmp:
@@ -425,14 +427,29 @@ class Timing(unittest.TestCase):
             python_side, _ = fake_docker(tmp)
             (tmp / "state.json").write_text(json.dumps({"containers": {}, "volumes": {}, "n": 0,
                                                         "images": {"img:1": "sha256:first"}}))
-            with patch.dict(os.environ, {**python_side, "NRESE_LOCK_DIR": str(tmp / "locks"), "FLEET_JOB": "job-a"}):
-                self.assertEqual(ns.pin_image("img:1", ROOT), "sha256:first")
+            env = {**python_side, "NRESE_LOCK_DIR": str(tmp / "locks"), "FLEET_JOB": "job-a"}
+            with patch.dict(os.environ, env):
+                # A tag neither here nor pullable stops the job at its start, nothing pinned.
+                with self.assertRaises(ns.ImageError):
+                    ns.pin_images(["img:1", "img:gone"], ROOT)
+                self.assertEqual(ns.pinned(ROOT), {})
+                with self.assertRaises(SystemExit):
+                    DockerRuntime(tmp, 0).pin(["img:gone"])
+                done = bash('. scripts/lib/ns.sh; ns_pin_images "$PWD" img:gone || echo stopped', env=env)
+                self.assertEqual(done.stdout.split()[-1:], ["stopped"], done.stderr)
+                # Pinned at the start; another job retags; a later step pins again: the first ID.
+                self.assertEqual(ns.pin_images(["img:1"], ROOT), {"img:1": "sha256:first"})
                 retagged = state(tmp)
-                retagged["images"]["img:1"] = "sha256:second"  # another job rebuilt the tag
+                retagged["images"]["img:1"] = "sha256:second"
                 (tmp / "state.json").write_text(json.dumps(retagged))
+                ns.pin_images(["img:1"], ROOT)
                 args = DockerRuntime(tmp, 0).args(Spec("x", "img:1", ["serve"]), detached=True)
                 self.assertEqual((args[-1], "img:1" in args), ("sha256:first", False))
-                self.assertEqual(ns.pinned(ROOT), {"img:1": "sha256:first"})
+                # A tag the job didn't pin is never run by its tag.
+                with self.assertRaises(ns.ImageError):
+                    DockerRuntime(tmp, 0).args(Spec("y", "img:other", ["serve"]), detached=True)
+                done = bash('. scripts/lib/ns.sh; echo "$(ns_image img:1 "$PWD")"; ns_image img:other "$PWD" || echo refused', env=env)
+                self.assertEqual(done.stdout.split(), ["sha256:first", "refused"], done.stderr)
 
     def test_a_timed_gate_pass_refuses_to_make_data(self):
         import argparse
@@ -445,22 +462,37 @@ class Timing(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "prepared data only"):
                 fast.run(args)
 
-    def test_the_host_lock_lets_one_holder_in_at_a_time(self):
+    def test_a_holder_killed_mid_hold_leaves_the_lock_free_at_once(self):
+        """Sol, 20 Oct 2026: the lock directory's pid was the parent's, and Python never took over
+        a dead holder's: a crash blocked every later preparation. An OS lock goes with its holder."""
+        import signal
+        import time
+        suite = (ROOT / "benches" / "suite").as_posix()
         with tempfile.TemporaryDirectory() as tmp:
-            events = []
+            path = Path(tmp) / "datasets.lock"
+            holders = {
+                "python": [sys.executable, "-c", f"import sys, time; sys.path.insert(0, {suite!r})\n"
+                           f"from suitekit.lock import lock\nwith lock({str(path)!r}):\n"
+                           "    print('held', flush=True); time.sleep(120)"],
+                "shell": [BASH, "-c", f'. "{(ROOT / "scripts/lib/ns.sh").as_posix()}"; '
+                                      f'ns_locked "{path.as_posix()}" sh -c "echo held; sleep 120"'],
+            }
+            for kind, command in holders.items():
+                holder = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, start_new_session=os.name != "nt")
+                self.assertEqual(holder.stdout.readline().strip(), "held", kind)
+                if os.name == "nt":  # the holder and what it started, at once (SIGKILL's equivalent)
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(holder.pid)], capture_output=True)
+                else:
+                    os.killpg(holder.pid, signal.SIGKILL)
+                holder.wait(timeout=30)
+                started, got = time.monotonic(), threading.Event()
 
-            def hold(k):
-                with ns.host_lock(Path(tmp) / "datasets.lock"):
-                    events.append(f"start {k}")
-                    import time
-                    time.sleep(0.3)
-                    events.append(f"end {k}")
-            threads = [threading.Thread(target=hold, args=(k,)) for k in (1, 2)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-        self.assertEqual([e.split()[0] for e in events], ["start", "end", "start", "end"], events)
+                def take():
+                    with ns.lock(path):
+                        got.set()
+                threading.Thread(target=take, daemon=True).start()
+                self.assertTrue(got.wait(timeout=10), f"{kind}: the lock stayed held after its holder died")
+                self.assertLess(time.monotonic() - started, 2.0, kind)
 
 
 if __name__ == "__main__":

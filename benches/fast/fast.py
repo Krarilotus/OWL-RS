@@ -81,9 +81,18 @@ def rust_image() -> str:
 
 
 def pinned(tag: str) -> str:
-    """The image ID this job runs for `tag` (ns.pin_image: resolved once for the whole job; a
-    retag meanwhile can't change what a later case or side runs); the report records them."""
-    return ns.pin_image(tag, ROOT, run=docker)
+    """The image ID this job runs for `tag`, pinned at its start (pin_images): a retag meanwhile
+    can't change what a later case or side runs; a tag not pinned is an error, never run."""
+    return ns.image_id(tag, ROOT)
+
+
+def pin_images(tags) -> None:
+    """At the start, before anything is timed: every image the run's containers use, pulled if
+    missing and resolved to its ID for the whole job (ns.pin_images); one that can't be stops it."""
+    try:
+        ns.pin_images(tags, ROOT, run=docker)
+    except ns.ImageError as error:
+        sys.exit(str(error))
 
 
 def host_path(path: Path) -> str:
@@ -298,6 +307,7 @@ def build(args) -> int:
     if RUNTIME == "native":
         sys.exit("the native runtime builds nothing: a build host's binaries come in NRESE_FAST_BIN "
                  "(scripts/cargo-guarded.sh build --release --locked with the packages of fast.py BUILD)")
+    pin_images([rust_image()])
     jobs =os.environ.get("CARGO_BUILD_JOBS", "4")
     cap = os.environ.get("NRESE_MEMORY_CAP_GB", "8")
     docker(ns.volume("create", TARGET_VOLUME, ROOT, OWNER))
@@ -378,7 +388,7 @@ def ensure_data(spec: str) -> dict:
         # Into the shared volume whole, one job at a time per host (FAST_LOCK): another job may
         # be reading or making the same file.
         part = f"{target}.{ns.name('part', ROOT)}"
-        with ns.host_lock(FAST_LOCK):
+        with ns.lock(FAST_LOCK):
             files(f"test -s {target} || {{ cat {parts} > {part} && mv -f {part} {target}; }}")
         return {}
     path = data_file(spec)
@@ -393,7 +403,7 @@ def ensure_data(spec: str) -> dict:
     # it is generated into this job's staging directory beside it (the same file system) and
     # published whole: its side files and data first, the answers (.expect.json, what says a
     # file is there) last. A reader never sees a half-written file under its name.
-    with ns.host_lock(FAST_LOCK):
+    with ns.lock(FAST_LOCK):
         found = files(f"cat {path}.expect.json")
         if found.returncode == 0 and found.stdout.strip():
             return json.loads(found.stdout)["expect"]
@@ -1274,6 +1284,10 @@ def run(args) -> int:
                  "the cases as host processes")
     catalog = load_cases()
     cases = select(catalog, args)
+    if RUNTIME != "native":
+        # Every image the cases' containers use, pinned before the first case (pin_images).
+        ore = any(spec.startswith("ore:") for c in cases for spec in [c["data"], *c.get("extra", [])])
+        pin_images([rust_image(), *([dl_image()] if ore else [])])
     OPTIONS.update(prepared=getattr(args, "prepared", False), routes=not getattr(args, "no_routes", False),
                    empty_queries=getattr(args, "empty_queries", False))
     # A timed gate's pass (scripts/release-gate.sh sets NRESE_TIMED_GATE) reads prepared data

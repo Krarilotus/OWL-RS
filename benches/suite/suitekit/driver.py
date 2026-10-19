@@ -390,7 +390,7 @@ class Suite:
         log = self.results / "logs" / f"prepare-{slug(plan.workload)}-{slug(plan.tier)}-{self.stamp}.log"
         # Shared datasets are prepared one at a time per host (the preparation scripts take the
         # same lock: held here, they don't wait for themselves).
-        with ns.host_lock(ns.lock_dir() / "datasets.lock"), held_lock("datasets"):
+        with ns.lock(ns.lock_dir() / "datasets.lock"), held_lock("datasets"):
             rc = self.host_command(plan.prepare, log)
         self.made_files += missing
         still = self.data_missing(plan.all_inputs())
@@ -799,6 +799,14 @@ class Suite:
         if self.args.runtime == "docker":
             images.setdefault("alpine:latest", None)
         self.ensure_images(images)
+        # Every image the run's containers use, resolved to its ID now, before anything is timed
+        # (ns.pin_images): one that can't be stops the run; none is pulled or re-resolved later.
+        if self.args.runtime == "docker" and not self.args.dry_run:
+            try:
+                ns.pin_images(list(images), self.root)
+            except ns.ImageError as error:
+                self.say(f"images: {error}")
+                return 1
         if self.manifest and self.args.runtime == "docker":
             self.manifest.update(images=image_ids(list(images)), pinned_images=ns.pinned(self.root))
         for key in dict.fromkeys(key for _, key, system, _ in chosen if isinstance(system, Nrese)):

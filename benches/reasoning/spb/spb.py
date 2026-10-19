@@ -56,7 +56,7 @@ sys.path.insert(0, str(HERE.parent / "maintenance"))
 
 from maintenance import NreseBinary  # noqa: E402
 from suitekit import ns, quiet  # noqa: E402
-from suitekit.adapters import Context, Graphdb  # noqa: E402
+from suitekit.adapters import Context, Graphdb, images_for  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
@@ -124,7 +124,7 @@ def run_driver(name: str, work: Path, data: Path, log: Path, timeout_s: int) -> 
                "-u", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp"]
     for m in spec.mounts:
         command += ["-v", f"{m.source}:{m.target}{':ro' if m.readonly else ''}"]
-    command += [ns.pin_image(spec.image, ROOT), *spec.command]
+    command += [ns.image_id(spec.image, ROOT), *spec.command]
     with open(log, "w", encoding="utf-8") as out:
         try:
             return subprocess.run(command, stdout=out, stderr=subprocess.STDOUT, timeout=timeout_s).returncode
@@ -194,6 +194,7 @@ def generate_now(args):
         return
     (out / "generated").mkdir(parents=True, exist_ok=True)
     runtime = DockerRuntime(Path(setting("SPB_SCRATCH", str(Path.home() / "nrese-reasoning-suite/scratch"))), args.port)
+    runtime.pin([driver_spec("pin", Path("."), Path("."), None).image])
     run_id = f"spb-generate-{tier(args.size)}"
     work = Path(runtime.scratch) / run_id
     work.mkdir(parents=True, exist_ok=True)
@@ -263,6 +264,8 @@ def cmd_run(args):
     manifest = Manifest(results, ROOT, sys.argv[1:], protocol, "docker", dict(os.environ))
     writer = Writer(results / "results.csv", echo=print)
     runtime = DockerRuntime(Path(setting("SPB_SCRATCH", str(Path.home() / "nrese-reasoning-suite/scratch"))), args.port)
+    runtime.pin([driver_spec("pin", Path("."), Path("."), None).image,
+                 *(i for key in systems for i in images_for(system_for(key), ROOT))])
     registry = __import__("tomllib").loads((ROOT / "benches/suite/systems.toml").read_text(encoding="utf-8"))
     code = 0
     try:

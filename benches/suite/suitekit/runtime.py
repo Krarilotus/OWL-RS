@@ -413,6 +413,15 @@ class Runtime:
 
 class DockerRuntime(Runtime):
     kind = "docker"
+    by_id = True  # its containers run the pinned image IDs (a dry run's rendering: the tags)
+
+    def pin(self, tags):
+        """At the tool's start, before anything is timed: every image its containers will run,
+        pulled if missing and resolved to its ID for the whole job; one that can't be stops it."""
+        try:
+            ns.pin_images(tags, ROOT)
+        except ns.ImageError as error:
+            raise SystemExit(str(error))
 
     def __init__(self, scratch: Path, port: int, echo=print):
         super().__init__(scratch, port, echo)
@@ -448,9 +457,9 @@ class DockerRuntime(Runtime):
         command = list(spec.command)
         if not spec.entrypoint:
             args += ["--entrypoint", command.pop(0)]
-        # The image by the ID the job first resolved its tag to (ns.pin_image): a retag while the
-        # job runs can't change what a later system or repetition runs.
-        return args + [ns.pin_image(spec.image, ROOT)] + command
+        # The image by the ID pinned at the job's start (pin): a retag while the job runs can't
+        # change what a later system or repetition runs; a tag not pinned is an error, never run.
+        return args + [ns.image_id(spec.image, ROOT) if self.by_id else spec.image] + command
 
     def remove(self, name: str):
         if name not in self.containers:
@@ -883,6 +892,8 @@ class DryRuntime(Runtime):
     def __init__(self, inner: Runtime, echo=print):
         super().__init__(inner.scratch, inner.port, echo)
         self.inner = inner
+        if isinstance(inner, DockerRuntime):
+            inner.by_id = False  # a dry run pulls nothing: it shows the tags
         self.kind = inner.kind
         self.dry = True
 

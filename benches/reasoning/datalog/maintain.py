@@ -42,7 +42,7 @@ import datalog  # noqa: E402
 import program as P  # noqa: E402
 from maintenance import CountingWriter, NreseBinary, update  # noqa: E402
 from suitekit import quiet  # noqa: E402
-from suitekit.adapters import Context  # noqa: E402
+from suitekit.adapters import Context, images_for  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount  # noqa: E402
 from suitekit.schema import Result  # noqa: E402
@@ -169,6 +169,7 @@ def cmd_run(args) -> int:
     writer = CountingWriter(results / "results.csv", echo=print)
     runtime = DockerRuntime(Path(os.environ.get("DATALOG_SCRATCH", str(Path.home() / "nrese-reasoning-suite/scratch"))),
                             args.port)
+    runtime.pin(images_for(RulesNrese(Path(".")), ROOT))
     try:
         for name in datalog.selected(args.cases):
             for rep in range(1, args.runs + 1):

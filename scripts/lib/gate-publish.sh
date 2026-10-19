@@ -81,7 +81,7 @@ publish() {
   build_verified "$dir" "$rev"
 }
 
-gate_lock() { ns_locked "$GATE_BIN/.lock" "$@"; }
+gate_lock() { NS_LOCK_VARS="GATE GATE_BIN" ns_locked "$GATE_BIN/.lock" "$@"; }
 
 # DIR: a reference from this gate, under the lock; fails when the build is gone (never made anew).
 stamp() { [ -d "$1/release" ] && mkdir -p "$1/.refs" && touch "$1/.refs/$(basename "$GATE")"; }

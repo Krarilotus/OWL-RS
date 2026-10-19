@@ -663,6 +663,7 @@ def cmd_run(args):
     writer = CountingWriter(results / "results.csv", echo=print)
     runtime = DockerRuntime(Path(setting("DATALOG_SCRATCH", str(Path.home() / "nrese-reasoning-suite/scratch"))),
                             args.port)
+    runtime.pin([IMAGES.get(s, setting("NRESE_IMAGE", "ubuntu:24.04")) for s in systems])
     code = 0
     try:
         for name in selected(args.cases):

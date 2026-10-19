@@ -292,20 +292,18 @@ serve_graphdb() {
 # What this run is about to pull is its to remove afterwards (scripts/bench-cleanup.sh).
 remember_pulls "$ROOT/tmp/bench-pulled-images" "$GRAPHDB_IMAGE" "$QLEVER_IMAGE" "$OXIGRAPH_IMAGE" \
   "$VIRTUOSO_IMAGE" "$ANZOGRAPH_IMAGE" "$RUST_IMAGE"
-# The images of this run's systems, resolved to their IDs now and run by them (ns_image): a
-# retag while the scorecard runs can't change what a later system or repetition runs. Recorded
-# beside the scorecard.
-RUST_IMAGE=$(ns_image "$RUST_IMAGE" "$ROOT")
-for system in $SYSTEMS; do
-  case $system in
-    qlever) QLEVER_IMAGE=$(ns_image "$QLEVER_IMAGE" "$ROOT") ;;
-    oxigraph) OXIGRAPH_IMAGE=$(ns_image "$OXIGRAPH_IMAGE" "$ROOT") ;;
-    jena) JENA_IMAGE=$(ns_image "$JENA_IMAGE" "$ROOT") ;;
-    virtuoso) VIRTUOSO_IMAGE=$(ns_image "$VIRTUOSO_IMAGE" "$ROOT") ;;
-    graphdb) GRAPHDB_IMAGE=$(ns_image "$GRAPHDB_IMAGE" "$ROOT") ;;
-    anzograph) ANZOGRAPH_IMAGE=$(ns_image "$ANZOGRAPH_IMAGE" "$ROOT") ;;
-  esac
-done
+# The images of this run's systems, pulled if missing and resolved to their IDs now, before
+# anything is timed, and run by them (ns_pin_images, ns_image): a retag while the scorecard runs
+# can't change what a later system or repetition runs; a tag that can't be resolved stops it
+# here. Recorded beside the scorecard.
+declare -A system_image=([nrese]=RUST_IMAGE [qlever]=QLEVER_IMAGE [oxigraph]=OXIGRAPH_IMAGE [jena]=JENA_IMAGE
+                         [virtuoso]=VIRTUOSO_IMAGE [graphdb]=GRAPHDB_IMAGE [anzograph]=ANZOGRAPH_IMAGE)
+used=(RUST_IMAGE)
+for system in $SYSTEMS; do [ -n "${system_image[$system]:-}" ] && used+=("${system_image[$system]}"); done
+tags=()
+for var in "${used[@]}"; do tags+=("${!var}"); done
+ns_pin_images "$ROOT" "${tags[@]}" || exit 1
+for var in "${used[@]}"; do printf -v "$var" '%s' "$(ns_image "${!var}" "$ROOT")" || exit 1; done
 mkdir -p "$RESULTS" && ns_pins "$ROOT" > "$RESULTS/images-$DATASET.tsv"
 docker run --rm -v "$DATA_VOLUME":/data alpine test -s "$FILE" || {
   echo "missing $FILE: run prepare-datasets.sh or the harness generate command" >&2

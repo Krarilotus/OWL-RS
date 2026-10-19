@@ -47,6 +47,13 @@ from .runtime import DockerRuntime, Measured, Mount, Runtime, Server, Spec, slic
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
+def images_for(adapter, root: Path) -> list[str]:
+    """The images an adapter's containers run (as `suite.py images` asks): for the tools that pin
+    them at their start (DockerRuntime.pin)."""
+    ctx = Context(None, root, root, root, Mount("-", "/data"), [], 0, dict(os.environ), "images")
+    return list(adapter.images(ctx))
+
+
 def target_mount(kind: str) -> str:
     """A build's /target: a directory of prebuilt binaries the job names (NRESE_TARGET_VOLUME,
     an absolute path), else this checkout's own volume. A volume name from outside is refused:

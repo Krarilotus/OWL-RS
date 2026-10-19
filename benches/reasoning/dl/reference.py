@@ -40,6 +40,11 @@ def key(line):
 
 def run(cases, timeout, cpus, memory, name=None):
     name = name or ns.name("dl-reference", ROOT)
+    # The reasoners' image, resolved to its ID before the first task and run by it (ns.pin_images).
+    try:
+        ns.pin_images([IMAGE], ROOT)
+    except ns.ImageError as error:
+        raise SystemExit(str(error))
     cases = pathlib.Path(cases).resolve()
     manifest = [l for l in lines(cases / "manifest.tsv") if not l.startswith("#")]
     results = cases / "results.tsv"
@@ -54,7 +59,7 @@ def run(cases, timeout, cpus, memory, name=None):
         subprocess.run([ns.executable(), "rm", "-f", name], capture_output=True)
         subprocess.run(
             [ns.executable(), "run", "-d", *ns.name_args(name, ROOT, "reasoning"), f"--cpus={cpus}", "-m", memory,
-             "-v", f"{cases.as_posix()}:/work", ns.pin_image(IMAGE, ROOT), "batch", "/work/manifest.rest.tsv",
+             "-v", f"{cases.as_posix()}:/work", ns.image_id(IMAGE, ROOT), "batch", "/work/manifest.rest.tsv",
              "/work/results.part.tsv", "/work/tax", str(timeout)],
             check=True, capture_output=True)
         seen, last = 0, time.monotonic()
