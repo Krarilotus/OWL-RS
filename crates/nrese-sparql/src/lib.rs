@@ -65,3 +65,10 @@ pub use results::{
 pub use service::{ServiceClient, ServiceResults, Services};
 pub use update::{UpdateError, UpdateOptions, apply_update, graph_label};
 pub use view::ReadView;
+
+/// The unit tests' allocator: the system's, counting what a measured operation holds live
+/// ([`nrese_exec::measure`]), so that an allocation not charged to its budget fails a test.
+#[cfg(test)]
+#[global_allocator]
+static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
+    nrese_exec::measure::Measured(std::alloc::System);

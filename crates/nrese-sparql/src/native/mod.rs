@@ -44,6 +44,8 @@ use preparation::{ql_rewriting, semantic_pattern};
 mod pushdown;
 pub(crate) use pushdown::per_solution;
 #[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
 mod graph_tests;
 pub(crate) mod ql;
 mod ranges;
@@ -78,7 +80,7 @@ use nrese_exec::join::{
     outer_join_with_undef,
 };
 use nrese_exec::{
-    Budget, BudgetExceeded, IdTable, Reservation, UNDEF, computed_id, computed_index,
+    Budget, BudgetExceeded, ChargedVec, IdTable, Reservation, UNDEF, computed_id, computed_index,
     group::group_rows,
 };
 use nrese_rdf::{Term, Variable};
@@ -116,6 +118,9 @@ const PROBE_FACTOR: u64 = 32;
 /// Rows of the first pattern in the first (and smallest) morsel of a basic graph pattern
 /// under LIMIT.
 const MIN_MORSEL: usize = 1024;
+
+/// Rows a streamed LIMIT of one pattern reads at a time ([`Context::limited_scan`]).
+const LIMIT_CHUNK: usize = 4096;
 
 /// A range scan over at least this many id ranges scans the whole pattern and keeps the
 /// rows whose object is in one ([`IdSet`]).
@@ -3780,6 +3785,7 @@ impl<'a> Context<'a> {
             shared_positions: &shared_positions,
             positions: &positions,
             graphs: self.merge_set.as_deref().filter(|_| scan.merged()),
+            budget: &self.budget,
             width: vars.len(),
             max_rows: self.max_rows(vars.len()),
             produced: AtomicUsize::new(0),
@@ -3791,7 +3797,7 @@ impl<'a> Context<'a> {
         let out = if rows < 2 * PROBE_CHUNK {
             probe.rows(0..rows, &cancelled)
         } else {
-            let parts: Vec<Result<IdTable, ProbeStop>> = (0..rows.div_ceil(PROBE_CHUNK))
+            let parts: Vec<Result<_, ProbeStop>> = (0..rows.div_ceil(PROBE_CHUNK))
                 .into_par_iter()
                 .map(|i| {
                     probe.rows(
@@ -3802,26 +3808,32 @@ impl<'a> Context<'a> {
                 .collect();
             parts
                 .into_iter()
-                .collect::<Result<Vec<IdTable>, ProbeStop>>()
-                .map(|parts| IdTable::concat(vars.len(), parts))
+                .collect::<Result<Vec<_>, ProbeStop>>()
+                .and_then(|parts| probe.concat(parts))
         };
-        let out = match out {
+        let (out, held) = match out {
             Ok(out) => out,
             Err(ProbeStop::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
             Err(ProbeStop::TooManyRows) => {
                 return Err(self.too_large(probe.max_rows.saturating_add(1), vars.len()));
             }
+            Err(ProbeStop::Memory(exceeded)) => {
+                return Err(QueryEvaluationError::MemoryLimit(exceeded).into());
+            }
         };
         self.probed
             .set(*probe.seeks.lock().unwrap_or_else(|e| e.into_inner()));
-        let out = if result.ordered {
+        let ordered = result.ordered;
+        // The rows probed from freed, then the result keeps the charge it grew under.
+        self.consumed(result);
+        held.transfer();
+        let out = if ordered {
             out
         } else {
             out.assume_sorted_by(key_columns)
         };
-        let ordered = result.ordered;
-        self.consumed(result);
-        self.produced(Solutions {
+        self.check()?;
+        Ok(Solutions {
             vars,
             table: out,
             ordered,
@@ -3988,20 +4000,31 @@ impl<'a> Context<'a> {
             .iter()
             .map(|v| (0..4).filter(|&i| scan.slots[i].is_var(v)).collect())
             .collect();
-        let mut out = IdTable::new(width);
-        let mut chunk = IdTable::new(width);
+        // Both tables are charged before they grow; the result keeps its charge, which
+        // whoever consumes it releases, as for a produced table.
+        let memory = QueryEvaluationError::MemoryLimit;
+        // (Each reservation before its table: locals drop in reverse, the table first.)
+        let mut out_held = Reservation::new(Arc::clone(&self.budget));
+        let mut chunk_held = Reservation::new(Arc::clone(&self.budget));
+        let (mut out, mut chunk) = (IdTable::new(width), IdTable::new(width));
+        // Without a filter, every row read is kept: no more than the limit are read at once.
+        let chunk_rows = match filter {
+            Some(_) => LIMIT_CHUNK,
+            None => LIMIT_CHUNK.min(limit.max(1)),
+        };
+        reserve_rows(&mut chunk, &mut chunk_held, chunk_rows, chunk_rows).map_err(memory)?;
         let mut row = vec![0u64; width];
         // The merged default graph is read in a graph-last order, where the copies of a
         // statement are adjacent, and all but the first are skipped (of a merge of listed
-        // graphs, those in other graphs first).
-        let mut quads: Box<dyn Iterator<Item = nrese_engine::EncodedQuad> + '_> = if scan.merged() {
+        // graphs, those in other graphs first). One of the two reads, unboxed.
+        let merged = scan.merged().then(|| {
             let sorted = self
                 .snapshot
                 .scan_sorted_in(self.model, &scan.quad_pattern(), scan.permutation_for(None))
                 .expect("permutation_for returns a usable permutation");
             let mut previous: Option<[u64; 3]> = None;
             let graphs = self.merge_set.as_deref();
-            Box::new(sorted.filter(move |quad| {
+            sorted.filter(move |quad| {
                 if graphs.is_some_and(|graphs| !graphs.contains(&quad.graph)) {
                     return false;
                 }
@@ -4010,13 +4033,16 @@ impl<'a> Context<'a> {
                 let first = previous != Some(statement);
                 previous = Some(statement);
                 first
-            }))
-        } else {
-            Box::new(
-                self.snapshot
-                    .quads_for_pattern_in(self.model, &scan.quad_pattern()),
-            )
-        };
+            })
+        });
+        let own = (!scan.merged()).then(|| {
+            self.snapshot
+                .quads_for_pattern_in(self.model, &scan.quad_pattern())
+        });
+        let mut quads = merged
+            .into_iter()
+            .flatten()
+            .chain(own.into_iter().flatten());
         loop {
             let more = quads.next();
             if let Some(quad) = more {
@@ -4029,18 +4055,21 @@ impl<'a> Context<'a> {
                     chunk.push_row(&row);
                 }
             }
-            if chunk.len() >= 4096 || (more.is_none() && !chunk.is_empty()) {
+            if chunk.len() >= chunk_rows || (more.is_none() && !chunk.is_empty()) {
                 self.check()?;
-                let mut part = Solutions {
-                    vars: vars_unique.clone(),
-                    table: std::mem::replace(&mut chunk, IdTable::new(width)),
-                    ordered: false,
-                };
                 if let Some(expression) = filter {
+                    let part = Solutions {
+                        vars: vars_unique.clone(),
+                        table: chunk,
+                        ordered: false,
+                    };
                     let mask = self.filter_mask(&part, expression)?;
-                    part.table.retain_mask(&mask);
+                    chunk = part.table;
+                    chunk.retain_mask(&mask);
                 }
-                out.append(&part.table);
+                reserve_rows(&mut out, &mut out_held, chunk.len(), limit).map_err(memory)?;
+                out.append(&chunk);
+                chunk.slice(0, Some(0));
                 if out.len() >= limit {
                     out.slice(0, Some(limit));
                     break;
@@ -4062,10 +4091,17 @@ impl<'a> Context<'a> {
             table: out,
             ordered: false,
         };
-        Ok(Some(match projection {
-            Some(variables) => self.project(solutions, variables),
-            None => solutions,
-        }))
+        let Some(variables) = projection else {
+            out_held.transfer();
+            return Ok(Some(solutions));
+        };
+        // The projection's columns are charged as the rows were: the result keeps its charge.
+        let projected = self.project(solutions, variables);
+        out_held
+            .resize(projected.table.memory_bytes())
+            .map_err(memory)?;
+        out_held.transfer();
+        Ok(Some(projected))
     }
 
     /// Which rows pass `expression`: the compiled id-level predicate where it decides
@@ -5254,7 +5290,7 @@ impl FilterMask<'_> {
 
 /// An index nested-loop join of a key-sorted `table` with `scan`: the index is probed once
 /// per distinct key. Holds only thread-safe state, so chunks of rows run in parallel.
-struct Probe<'a> {
+struct Probe<'a, 'b> {
     snapshot: &'a Snapshot,
     model: ReadModel,
     table: &'a IdTable,
@@ -5267,6 +5303,9 @@ struct Probe<'a> {
     /// For a merged default graph of listed graphs, the graphs ([`Context::merge_set`]):
     /// the index's matches in other graphs are skipped.
     graphs: Option<&'a [TermId]>,
+    /// The query's budget: each chunk's output and scratch are charged to it before they
+    /// grow.
+    budget: &'b Budget,
     width: usize,
     /// Output rows allowed in total (the query's memory budget), and produced so far.
     max_rows: usize,
@@ -5279,28 +5318,40 @@ struct Probe<'a> {
 enum ProbeStop {
     Cancelled,
     TooManyRows,
+    Memory(BudgetExceeded),
 }
 
-impl Probe<'_> {
+impl<'b> Probe<'_, 'b> {
     /// The joined rows for `table` rows `rows`, in order. One probe cursor reads the index
     /// for all of them: the keys ascend in its order (`probe_join`), so each probe seeks
     /// forward from the last instead of searching every run from the root. The matches
     /// of a key are kept flat, `positions.len()` values each: nothing is allocated per
-    /// match.
+    /// match. The rows come with their charge.
     fn rows(
         &self,
         rows: Range<usize>,
         cancelled: &(dyn Fn() -> bool + Sync),
-    ) -> Result<IdTable, ProbeStop> {
+    ) -> Result<(IdTable, Reservation<&'b Budget>), ProbeStop> {
         let table = self.table;
         let width = table.width();
         let stride = self.positions.len();
+        // The reservation before the table: locals drop in reverse, the table first.
+        let mut held = Reservation::new(self.budget);
         let mut out = IdTable::new(self.width);
         let mut cursor = self.snapshot.probe_cursor(self.model);
         // The new variables' values of each match of the current key, and their number
         // (a pattern binding nothing new matches without values).
-        let mut matches: Vec<u64> = Vec::new();
+        let mut matches = ChargedVec::new(self.budget);
+        let mut refused = None;
         let mut found = 0usize;
+        // A key's distinct records of several values in a merged default graph
+        // ([`distinct`]): scratch kept from key to key, charged only when it grows.
+        let mut scratch = (self.scan.merged() && stride > 1)
+            .then(|| (ChargedVec::new(self.budget), ChargedVec::new(self.budget)));
+        // The rows `out` has room for: below it, a key's matches need no charge. A row a
+        // key to start with.
+        reserve_rows(&mut out, &mut held, rows.len(), usize::MAX).map_err(ProbeStop::Memory)?;
+        let mut room = rows.len();
         let mut row = vec![0u64; self.width];
         let mut bound = self.scan.clone();
         let first = rows.start;
@@ -5332,8 +5383,10 @@ impl Probe<'_> {
                     }
                 }
                 cursor.for_each(&bound.quad_pattern(), |quad| {
-                    if let Some(graphs) = self.graphs
-                        && !graphs.contains(&quad.graph)
+                    if refused.is_some()
+                        || self
+                            .graphs
+                            .is_some_and(|graphs| !graphs.contains(&quad.graph))
                     {
                         return;
                     }
@@ -5345,22 +5398,24 @@ impl Probe<'_> {
                             matches.truncate(start);
                             return;
                         }
-                        matches.push(value);
+                        if let Err(exceeded) = matches.push(value) {
+                            refused = Some(exceeded);
+                            return;
+                        }
                     }
                     found += 1;
                 });
-                if self.scan.merged() && found > 1 {
-                    // A statement in several graphs matched once per graph; its values
-                    // are the same each time.
-                    let mut distinct: Vec<&[u64]> = match stride {
-                        0 => vec![&[]],
-                        _ => matches.chunks_exact(stride).collect(),
-                    };
-                    distinct.sort_unstable();
-                    distinct.dedup();
-                    found = distinct.len();
-                    matches = distinct.concat();
+                if let Some(exceeded) = refused.take() {
+                    return Err(ProbeStop::Memory(exceeded));
                 }
+                if self.scan.merged() && found > 1 {
+                    found = distinct(&mut matches, scratch.as_mut(), stride)
+                        .map_err(ProbeStop::Memory)?;
+                }
+            }
+            if out.len() + found > room {
+                reserve_rows(&mut out, &mut held, found, usize::MAX).map_err(ProbeStop::Memory)?;
+                room = out.memory_bytes() / (8 * self.width).max(1);
             }
             for m in 0..found {
                 for (c, slot) in row.iter_mut().enumerate().take(width) {
@@ -5377,7 +5432,24 @@ impl Probe<'_> {
         }
         finish(&cursor);
         self.grow(out.len() - counted)?;
-        Ok(out)
+        Ok((out, held))
+    }
+
+    /// The chunks' rows as one table, charged before they are copied; each chunk's charge
+    /// goes with it.
+    fn concat(
+        &self,
+        parts: Vec<(IdTable, Reservation<&'b Budget>)>,
+    ) -> Result<(IdTable, Reservation<&'b Budget>), ProbeStop> {
+        let rows: usize = parts.iter().map(|(part, _)| part.len()).sum();
+        let mut held = Reservation::new(self.budget);
+        held.charge(rows.saturating_mul(8 * self.width))
+            .map_err(ProbeStop::Memory)?;
+        let (parts, charges): (Vec<IdTable>, Vec<_>) = parts.into_iter().unzip();
+        let out = IdTable::concat(self.width, parts);
+        drop(charges);
+        held.resize(out.memory_bytes()).map_err(ProbeStop::Memory)?;
+        Ok((out, held))
     }
 
     fn grow(&self, rows: usize) -> Result<(), ProbeStop> {
@@ -5448,6 +5520,84 @@ fn sorted_overlap(a: &[u64], b: &[u64]) -> u64 {
         }
     }
     both
+}
+
+/// The distinct matches of a key in a merged default graph, records of `stride` values
+/// each, left in `matches`, and their number: a statement in several graphs matched once
+/// per graph, its values the same each time. One value a record is sorted in place; longer
+/// records through `scratch` (an order and the distinct records), the caller's, kept from
+/// key to key: it grows (charged first) only past the largest key.
+#[allow(clippy::type_complexity)]
+fn distinct<B: std::ops::Deref<Target = Budget>>(
+    matches: &mut ChargedVec<u64, B>,
+    scratch: Option<&mut (ChargedVec<usize, B>, ChargedVec<u64, B>)>,
+    stride: usize,
+) -> Result<usize, BudgetExceeded> {
+    match (stride, scratch) {
+        (0, _) => Ok(1),
+        (1, _) => {
+            matches.sort_unstable();
+            let mut kept = 0;
+            for i in 0..matches.len() {
+                if kept == 0 || matches[i] != matches[kept - 1] {
+                    matches[kept] = matches[i];
+                    kept += 1;
+                }
+            }
+            matches.truncate(kept);
+            Ok(kept)
+        }
+        (_, Some((order, unique))) => {
+            let found = matches.len() / stride;
+            order.clear();
+            order.extend_bounded(found, 0..found)?;
+            let record = |i: usize| &matches[i * stride..(i + 1) * stride];
+            order.sort_unstable_by(|&a, &b| record(a).cmp(record(b)));
+            unique.clear();
+            unique.reserve(found * stride)?;
+            let mut last = None;
+            for &i in order.iter() {
+                if last.is_none_or(|last| record(last) != record(i)) {
+                    unique.extend_from_slice(record(i))?;
+                    last = Some(i);
+                }
+            }
+            std::mem::swap(matches, unique);
+            Ok(matches.len() / stride)
+        }
+        (_, None) => unreachable!("scratch for records of several values"),
+    }
+}
+
+/// Room in `table` for `rows` more rows, charged to `held` (which holds exactly `table`'s
+/// capacity) before the columns grow: the capacity doubles, up to `most` rows, where the
+/// budget has room, else grows by what is asked. The old capacity and the new are both
+/// held while the columns move.
+fn reserve_rows<B: std::ops::Deref<Target = Budget>>(
+    table: &mut IdTable,
+    held: &mut Reservation<B>,
+    rows: usize,
+    most: usize,
+) -> Result<(), BudgetExceeded> {
+    let row_bytes = 8 * table.width();
+    let needed = table.len().saturating_add(rows);
+    if row_bytes == 0 || needed.saturating_mul(row_bytes) <= table.memory_bytes() {
+        return Ok(());
+    }
+    let doubled = (table.memory_bytes() / row_bytes * 2).min(most).max(needed);
+    let mut grow = |capacity: usize| -> Result<(), BudgetExceeded> {
+        let old = held.bytes();
+        held.charge(capacity.saturating_mul(row_bytes))?;
+        table.reserve_exact(capacity - table.len());
+        held.release(old);
+        // An allocator may hand out more than asked: held too.
+        let actual = table.memory_bytes();
+        if actual > held.bytes() {
+            held.charge(actual - held.bytes())?;
+        }
+        Ok(())
+    };
+    grow(doubled).or_else(|_| grow(needed))
 }
 
 fn has_undef(table: &IdTable, columns: &[usize]) -> bool {
