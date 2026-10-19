@@ -21,7 +21,6 @@ nrese-rdf = { path = "../rdf/nrese-rdf" }
 # GeoSPARQL: geometries and their relations; WKT, GeoJSON and GML literals.
 geo = "0.33"
 quick-xml = { workspace = true }
-rstar = "0.12"
 serde_json = { workspace = true }
 wkt = "0.14"
 hex = "0.4"

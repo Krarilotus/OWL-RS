@@ -1365,6 +1365,16 @@ impl Snapshot {
         self.dictionary.decode(id)
     }
 
+    /// The most bytes [`Self::decode`] allocates for `id`, known without decoding it (see
+    /// [`Dictionary::decode_bound`](crate::Dictionary::decode_bound)); `None` for inline
+    /// ids, triple terms and ids this snapshot doesn't know.
+    pub fn decode_bound(&self, id: TermId) -> Option<usize> {
+        if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
+            return None;
+        }
+        self.dictionary.decode_bound(id)
+    }
+
     /// Calls `f` with a borrowed view of the dictionary term `id` (see
     /// [`Dictionary::with_view`](crate::Dictionary::with_view)); `None` for inline ids and
     /// ids this snapshot doesn't know.

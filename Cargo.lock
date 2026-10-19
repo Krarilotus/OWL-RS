@@ -1315,7 +1315,6 @@ dependencies = [
  "rand 0.9.5",
  "rayon",
  "regex",
- "rstar",
  "serde_json",
  "sha1",
  "sha2",
