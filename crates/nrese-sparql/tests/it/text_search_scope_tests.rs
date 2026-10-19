@@ -204,6 +204,51 @@ fn readers_of_the_same_graphs_share_a_corpus() {
     assert_eq!(snapshot.text_corpus_stats().walked, walked + 1);
 }
 
+/// A search alone in a pattern binds only literals the active graph shows: with equality
+/// by representatives, a label every copy of which is asserted in a named graph alone isn't
+/// in the default graph, though the inferred stack holds it over the representative (the
+/// review's case of 18 October; engine-v2 returned no row).
+#[test]
+fn a_search_alone_binds_only_what_the_active_graph_shows() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let iri = |s: &str| NamedNode::new_unchecked(format!("{EX}{s}"));
+    let representative = tx.intern(iri("Representative").as_ref().into());
+    let alias = tx.intern(iri("Alias").as_ref().into());
+    let same_as = tx.intern(
+        NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs")
+            .as_ref()
+            .into(),
+    );
+    for name in ["Representative", "Alias"] {
+        tx.insert(label_quad(name, "secret alpha", Some("g")).as_ref());
+    }
+    let label = tx.intern(
+        NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#label")
+            .as_ref()
+            .into(),
+    );
+    let text = tx.intern(Literal::new_simple_literal("secret alpha").as_ref().into());
+    for (subject, predicate, object) in [
+        (alias, same_as, representative),
+        (representative, label, text),
+    ] {
+        tx.insert_inferred(nrese_engine::EncodedTriple {
+            subject,
+            predicate,
+            object,
+        });
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot().with_equality(Some(same_as));
+    let found = rows(
+        &snapshot,
+        "SELECT ?o ?score WHERE { ?o bds:search \"secret\" ; bds:relevance ?score }",
+        &QueryOptions::default(),
+    );
+    assert!(found.is_empty(), "{found:?}");
+}
+
 /// The result cache keys results by snapshot: a hit equals what the snapshot computes
 /// afresh, whatever was interned since.
 #[test]

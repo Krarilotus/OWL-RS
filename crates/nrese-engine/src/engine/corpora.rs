@@ -2,28 +2,38 @@
 //! kept, and derived from one another across commits.
 //!
 //! A corpus is exact for its statements' identity ([`Content`]), the index's documents, the
-//! read model and the graphs (the scope, normalised so that equal graph sets share one).
-//! Building one walks the scope's index ranges; a version that a commit made from another
-//! (or a pending state, or a reader's view made from the reader's earlier one) instead
-//! takes the corpus of its nearest kept ancestor and looks again at the terms the steps
-//! between them touched: each is a member if a statement in the scope still uses it, an
-//! index probe. So a search after a small commit costs probes for what the commit touched,
-//! not a walk, and deletes stay exact (a literal stays while any statement uses it).
+//! read model, the graphs (the scope, normalised so that equal graph sets share one) and
+//! how the reader reads equality classes (`owl:sameAs` expanded or canonical, or as
+//! stored): its members are the terms the reader's own scans show. Building one walks the
+//! scope's statements; a version that a commit made from another (or a pending state, or
+//! a reader's view made from the reader's earlier one) instead takes the corpus of its
+//! nearest kept ancestor and looks again at the terms the steps between them touched:
+//! each is a member if a statement the reader sees in the scope still has it, a probe. So
+//! a search after a small commit costs probes for what the commit touched, not a walk,
+//! and deletes stay exact (a literal stays while any visible statement has it). Where a
+//! step changed a `sameAs` statement the reader expands, the classes changed and the
+//! corpus is walked again; so is an IRIs' corpus of a reader of equality classes.
 //!
-//! The lineage (content → its parent and the terms touched) is kept only while a corpus is
-//! kept, back to the oldest kept one, for at most [`STEPS`] steps and [`STEP_TERMS`] terms:
-//! a store nobody searches keeps none. Beyond, or where more terms were touched than a
-//! probe each is worth ([`worth_deriving`]), the corpus is walked again.
+//! The lineage (content → its parent, the terms and predicates touched) is kept only
+//! while a corpus is kept, back to the oldest kept one, for at most [`STEPS`] steps and
+//! [`STEP_TERMS`] terms: a store nobody searches keeps none. Beyond, or where more terms
+//! were touched than a probe each is worth ([`worth_deriving`]), the corpus is walked again.
 //!
-//! Kept corpora are bounded: at most [`ENTRIES`] and the engine's byte budget
-//! ([`crate::EngineConfig::text_corpus_bytes`]), least recently used first out; a corpus of a
-//! version no snapshot holds goes once a newer one of its kind is kept. What they hold is
-//! in [`crate::EngineStats::text_corpora`].
+//! Memory, by [`nrese_exec::Reservation`]s on the engine's budget for corpora
+//! ([`crate::EngineConfig::text_corpus_bytes`]): a kept entry's key from when it is
+//! entered, a kept corpus's members from when it is kept until the last search holding it
+//! lets go (an evicted corpus a search still uses stays charged), and each lineage step.
+//! What doesn't fit, after the least recently used are let go, isn't kept: a corpus
+//! larger than the budget serves its search and goes. At most [`ENTRIES`] are kept. A
+//! corpus being built, and one not kept, is the search's: charged to its request's budget
+//! ([`super::Snapshot::text_search_in`]). The budget's use is
+//! [`crate::EngineStats::text_corpora`].
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
+use nrese_exec::{Budget, Reservation};
 use parking_lot::Mutex;
 
 use super::snapshot::{Documents, TextScope};
@@ -39,54 +49,118 @@ pub(crate) const ENTRIES: usize = 64;
 const STEPS: usize = 4096;
 const STEP_TERMS: usize = 1 << 18;
 
-/// What a corpus is of, without the version: the documents, the model and the graphs.
-pub(crate) type CorpusKind = (Documents, ReadModel, TextScope);
+/// What a corpus is of, without the version: the documents, the model, the graphs, and
+/// the reader's equality (`owl:sameAs` when it expands classes) and whether it reads them
+/// canonically.
+pub(crate) type CorpusKind = (Documents, ReadModel, TextScope, Option<TermId>, bool);
 
 /// Counts of the corpora (for [`crate::EngineStats`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TextCorpusStats {
-    /// Corpora kept, and their bytes.
+    /// Corpora kept.
     pub kept: u64,
+    /// Bytes charged to the corpora's budget: kept entries' keys, kept corpora (and evicted
+    /// ones a search still holds), the lineage.
     pub bytes: u64,
-    /// The byte budget they are kept within.
+    /// The budget.
     pub budget: u64,
     /// Corpora built by a walk, and derived from an ancestor's, since the engine started.
     pub walked: u64,
     pub derived: u64,
 }
 
-/// A kept corpus: of which statements, of what, and the corpus once its first search
-/// built it (`None` meanwhile: other searches build their own rather than wait, since the
-/// build runs on every core and a waiting thread may be one of its parts').
+/// A corpus as searches share it, with the charge of its bytes to the corpora's budget
+/// when it is kept (released when the last search holding it lets go).
+pub(crate) struct Held {
+    corpus: Corpus,
+    _charge: Option<Reservation>,
+}
+
+impl Held {
+    /// A corpus not kept: the search that built it holds it, on its request's budget.
+    pub(crate) fn transient(corpus: Corpus) -> Arc<Self> {
+        Arc::new(Self {
+            corpus,
+            _charge: None,
+        })
+    }
+}
+
+impl Held {
+    /// Whether the corpora's budget holds its bytes (it is kept).
+    pub(crate) fn charged(&self) -> bool {
+        self._charge.is_some()
+    }
+}
+
+impl std::ops::Deref for Held {
+    type Target = Corpus;
+
+    fn deref(&self) -> &Corpus {
+        &self.corpus
+    }
+}
+
+/// Bytes a held corpus takes: its members, itself, the `Arc`'s counts.
+fn held_bytes(corpus: &Corpus) -> usize {
+    corpus.memory_bytes() + std::mem::size_of::<Held>() + 16
+}
+
+/// A kept corpus: of which statements, of what, the charge of its key, and the corpus once
+/// its first search built it (`None` meanwhile: other searches build their own rather
+/// than wait, since the build runs on every core and a waiting thread may be one of its
+/// parts').
 struct Kept {
     content: Content,
     kind: CorpusKind,
     /// The latest version seen with this content (compaction gives the same content new
     /// runs): while it lives, a snapshot may still ask.
     version: Weak<Version>,
-    corpus: Option<Arc<Corpus>>,
+    _key: Reservation,
+    corpus: Option<Arc<Held>>,
 }
 
-/// One step of the lineage: the content it was made from and the terms it touched
-/// (string literals as objects, IRIs as subjects; raw ids, sorted).
+/// Bytes a kept entry takes besides its corpus: itself and its graphs.
+fn key_bytes(kind: &CorpusKind) -> usize {
+    let graphs = match &kind.2 {
+        TextScope::Merge(graphs) => graphs.capacity() * std::mem::size_of::<TermId>(),
+        TextScope::Graphs(_) => 0,
+    };
+    std::mem::size_of::<Kept>() + graphs
+}
+
+/// One step of the lineage: the content it was made from, the terms it touched (string
+/// literals as objects, IRIs as subjects; raw ids, sorted), the predicates of the
+/// statements it added or removed (raw ids, sorted), and its charge.
 struct Step {
     parent: Content,
     touched: Arc<[u64]>,
+    predicates: Box<[u64]>,
+    bytes: usize,
 }
 
-#[derive(Default)]
+/// Bytes a step takes: itself, its key in the map and the order, its terms and predicates.
+fn step_bytes(touched: usize, predicates: usize) -> usize {
+    std::mem::size_of::<Step>()
+        + 3 * std::mem::size_of::<Content>()
+        + 16
+        + (touched + predicates) * std::mem::size_of::<u64>()
+}
+
 struct State {
     /// Least recently used first.
     kept: Vec<Kept>,
     steps: HashMap<Content, Step>,
     order: VecDeque<Content>,
     step_terms: usize,
+    /// The steps' charge.
+    lineage: Reservation,
 }
 
 /// The kept corpora and the lineage, shared by the snapshots of an engine and the views
 /// made from them.
 pub(crate) struct CorpusStore {
-    budget: u64,
+    budget: Arc<Budget>,
     state: Mutex<State>,
     walked: AtomicU64,
     derived: AtomicU64,
@@ -100,11 +174,11 @@ impl Default for CorpusStore {
 
 /// What a search finds for a corpus it needs: kept, or to derive from an ancestor's
 /// (with the terms touched since) or to walk; and whether to keep what it builds (not
-/// where another search is building it).
+/// where another search is building it, or its key didn't fit the budget).
 pub(crate) enum Found {
-    Kept(Arc<Corpus>),
+    Kept(Arc<Held>),
     Build {
-        from: Option<(Arc<Corpus>, Vec<u64>)>,
+        from: Option<(Arc<Held>, Vec<u64>)>,
         keep: bool,
     },
 }
@@ -126,39 +200,45 @@ pub(crate) fn worth_deriving(touched: usize, documents: u64) -> bool {
 
 impl CorpusStore {
     pub(crate) fn new(budget: usize) -> Self {
+        let budget = Arc::new(Budget::new(budget));
         Self {
-            budget: budget as u64,
-            state: Mutex::default(),
+            state: Mutex::new(State {
+                kept: Vec::new(),
+                steps: HashMap::new(),
+                order: VecDeque::new(),
+                step_terms: 0,
+                lineage: Reservation::new(Arc::clone(&budget)),
+            }),
+            budget,
             walked: AtomicU64::new(0),
             derived: AtomicU64::new(0),
         }
     }
 
-    /// Records that `child` was made from `parent`, adding or removing statements with
-    /// these subjects and objects.
+    /// Records that `child` was made from `parent`, adding or removing these statements
+    /// (subject, predicate, object).
     pub(crate) fn record(
         &self,
         parent: Content,
         child: Content,
-        statements: impl IntoIterator<Item = (TermId, TermId)>,
+        statements: impl IntoIterator<Item = (TermId, TermId, TermId)>,
     ) {
         if self.state.lock().kept.is_empty() {
             return;
         }
-        let mut touched: Vec<u64> = statements
-            .into_iter()
-            .flat_map(|(subject, object)| terms(subject, object))
-            .collect();
-        touched.sort_unstable();
-        touched.dedup();
-        self.record_terms(parent, child, touched);
+        let (mut touched, mut predicates) = (Vec::new(), Vec::new());
+        for (subject, predicate, object) in statements {
+            touched.extend(terms(subject, object));
+            predicates.push(predicate.raw());
+        }
+        self.record_terms(parent, child, touched, predicates);
     }
 
     /// Records that the view `child` of the version `base` was made from the view
     /// `earlier` of `earlier_base` (a reader's view at a later commit), touching what the
-    /// steps from `earlier_base` to `base` touched and the terms of `changed` (the
-    /// statements the view shows or hides now and didn't before). Nothing where the
-    /// lineage lacks those steps.
+    /// steps from `earlier_base` to `base` touched and the statements of `changed` (those
+    /// the view shows or hides now and didn't before). Nothing where the lineage lacks
+    /// those steps.
     pub(crate) fn record_view<'q>(
         &self,
         earlier: Content,
@@ -167,31 +247,44 @@ impl CorpusStore {
         base: Content,
         changed: impl IntoIterator<Item = &'q EncodedQuad>,
     ) {
-        let Some(mut touched) = self.touched_between(earlier_base, base) else {
+        let Some((mut touched, mut predicates)) = self.touched_between(earlier_base, base) else {
             return;
         };
-        touched.extend(
-            changed
-                .into_iter()
-                .flat_map(|quad| terms(quad.subject, quad.object)),
-        );
-        touched.sort_unstable();
-        touched.dedup();
-        self.record_terms(earlier, child, touched);
+        for quad in changed {
+            touched.extend(terms(quad.subject, quad.object));
+            predicates.push(quad.predicate.raw());
+        }
+        self.record_terms(earlier, child, touched, predicates);
     }
 
-    /// Records that `child` was made from `parent` touching `touched` (raw ids, sorted).
-    fn record_terms(&self, parent: Content, child: Content, touched: Vec<u64>) {
+    /// Records that `child` was made from `parent` touching `touched` and statements of
+    /// `predicates` (raw ids): charged to the budget, the oldest steps let go for it; not
+    /// recorded where it doesn't fit (a search there walks).
+    fn record_terms(
+        &self,
+        parent: Content,
+        child: Content,
+        mut touched: Vec<u64>,
+        mut predicates: Vec<u64>,
+    ) {
         if parent == child {
             return;
         }
+        touched.sort_unstable();
+        touched.dedup();
+        predicates.sort_unstable();
+        predicates.dedup();
         let mut state = self.state.lock();
         // Steps lead from a version to a kept corpus: with none kept, none are.
         if state.kept.is_empty() {
-            state.steps.clear();
-            state.order.clear();
-            state.step_terms = 0;
+            Self::forget_lineage(&mut state);
             return;
+        }
+        let bytes = step_bytes(touched.len(), predicates.len());
+        while state.lineage.charge(bytes).is_err() {
+            if !Self::drop_oldest_step(&mut state) {
+                return;
+            }
         }
         state.step_terms += touched.len();
         state.steps.insert(
@@ -199,10 +292,32 @@ impl CorpusStore {
             Step {
                 parent,
                 touched: touched.into(),
+                predicates: predicates.into(),
+                bytes,
             },
         );
         state.order.push_back(child);
         Self::prune(&mut state);
+    }
+
+    fn forget_lineage(state: &mut State) {
+        state.steps.clear();
+        state.order.clear();
+        state.step_terms = 0;
+        let held = state.lineage.bytes();
+        state.lineage.release(held);
+    }
+
+    /// Lets the oldest step go; `false` if there is none.
+    fn drop_oldest_step(state: &mut State) -> bool {
+        let Some(oldest) = state.order.pop_front() else {
+            return false;
+        };
+        if let Some(step) = state.steps.remove(&oldest) {
+            state.step_terms -= step.touched.len();
+            state.lineage.release(step.bytes);
+        }
+        true
     }
 
     /// Drops the oldest steps beyond the bounds, and those no path to a kept corpus takes:
@@ -215,34 +330,46 @@ impl CorpusStore {
             if !useless && state.order.len() <= STEPS && state.step_terms <= STEP_TERMS {
                 break;
             }
-            state.order.pop_front();
-            if let Some(step) = state.steps.remove(&oldest) {
-                state.step_terms -= step.touched.len();
-            }
+            Self::drop_oldest_step(state);
         }
     }
 
-    /// The terms the steps from `ancestor` to `content` touched, if the lineage holds
-    /// them all.
-    fn touched_between(&self, ancestor: Content, content: Content) -> Option<Vec<u64>> {
+    /// The terms and predicates the steps from `ancestor` to `content` touched, if the
+    /// lineage holds them all.
+    fn touched_between(&self, ancestor: Content, content: Content) -> Option<(Vec<u64>, Vec<u64>)> {
         let state = self.state.lock();
-        let mut terms = Vec::new();
+        let (mut terms, mut predicates) = (Vec::new(), Vec::new());
         let mut at = content;
         for _ in 0..STEPS {
             if at == ancestor {
-                terms.sort_unstable();
-                terms.dedup();
-                return Some(terms);
+                return Some((terms, predicates));
             }
             let step = state.steps.get(&at)?;
             terms.extend_from_slice(&step.touched);
+            predicates.extend_from_slice(&step.predicates);
             at = step.parent;
         }
         None
     }
 
+    /// Lets the least recently used entry other than `(content, kind)` go; `false` if
+    /// there is none.
+    fn evict_one(state: &mut State, keep: Option<(Content, &CorpusKind)>) -> bool {
+        let at = state.kept.iter().position(|k| {
+            keep.is_none_or(|(content, kind)| k.content != content || k.kind != *kind)
+        });
+        match at {
+            Some(at) => {
+                state.kept.remove(at);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// The corpus `kind` of `version`: kept, or to build, with the nearest kept ancestor's
-    /// corpus and the terms touched since where the lineage has one.
+    /// corpus and the terms touched since where the lineage has one (none past a step that
+    /// changed a `sameAs` statement the reader expands).
     pub(crate) fn find(&self, version: &Arc<Version>, kind: &CorpusKind) -> Found {
         let content = version.content;
         let mut state = self.state.lock();
@@ -265,6 +392,7 @@ impl CorpusStore {
             None => false,
         };
         // The nearest ancestor with a kept, built corpus of this kind.
+        let same_as = kind.3.map(TermId::raw);
         let mut from = None;
         let mut terms: Vec<u64> = Vec::new();
         let mut at = content;
@@ -272,6 +400,9 @@ impl CorpusStore {
             let Some(step) = state.steps.get(&at) else {
                 break;
             };
+            if same_as.is_some_and(|same_as| step.predicates.binary_search(&same_as).is_ok()) {
+                break;
+            }
             terms.extend_from_slice(&step.touched);
             at = step.parent;
             let ancestor = state
@@ -298,36 +429,68 @@ impl CorpusStore {
         state
             .kept
             .retain(|k| k.kind != *kind || k.version.strong_count() > 0);
+        while state.kept.len() >= ENTRIES {
+            Self::evict_one(&mut state, None);
+        }
+        let mut key = Reservation::new(Arc::clone(&self.budget));
+        while key.charge(key_bytes(kind)).is_err() {
+            if !Self::evict_one(&mut state, None) {
+                Self::prune(&mut state);
+                return Found::Build { from, keep: false };
+            }
+        }
         state.kept.push(Kept {
             content,
             kind: kind.clone(),
             version: Arc::downgrade(version),
+            _key: key,
             corpus: None,
         });
-        self.evict(&mut state);
+        Self::prune(&mut state);
         Found::Build { from, keep: true }
     }
 
     /// Keeps `corpus`, built for `kind` of `version` by the search [`Self::find`] told to,
-    /// and keeps within the bounds.
-    pub(crate) fn keep(&self, version: &Arc<Version>, kind: &CorpusKind, corpus: Arc<Corpus>) {
-        let mut state = self.state.lock();
+    /// if its bytes fit the budget once the least recently used others are let go; else
+    /// (or if its entry went meanwhile) it serves its search alone.
+    pub(crate) fn keep(
+        &self,
+        version: &Arc<Version>,
+        kind: &CorpusKind,
+        corpus: Corpus,
+    ) -> Arc<Held> {
         let content = version.content;
-        match state
-            .kept
-            .iter_mut()
-            .find(|k| k.content == content && k.kind == *kind)
-        {
-            Some(kept) => kept.corpus = Some(corpus),
-            // Evicted while it was built: kept again, as the most recently used.
-            None => state.kept.push(Kept {
-                content,
-                kind: kind.clone(),
-                version: Arc::downgrade(version),
-                corpus: Some(corpus),
-            }),
+        let mut state = self.state.lock();
+        let entry = |state: &State| {
+            state
+                .kept
+                .iter()
+                .position(|k| k.content == content && k.kind == *kind)
+        };
+        if entry(&state).is_none() {
+            return Held::transient(corpus);
         }
-        self.evict(&mut state);
+        let mut charge = Reservation::new(Arc::clone(&self.budget));
+        while charge.charge(held_bytes(&corpus)).is_err() {
+            if !Self::evict_one(&mut state, Some((content, kind))) {
+                // Larger than the budget: not kept, nor its entry.
+                if let Some(at) = entry(&state) {
+                    state.kept.remove(at);
+                }
+                Self::prune(&mut state);
+                return Held::transient(corpus);
+            }
+        }
+        let held = Arc::new(Held {
+            corpus,
+            _charge: Some(charge),
+        });
+        let at = entry(&state).expect("not evicted: kept above");
+        let mut kept = state.kept.remove(at);
+        kept.corpus = Some(Arc::clone(&held));
+        state.kept.push(kept);
+        Self::prune(&mut state);
+        held
     }
 
     /// Counts a corpus built, by a walk or derived.
@@ -338,34 +501,12 @@ impl CorpusStore {
         };
     }
 
-    /// Least recently used first out, until at most [`ENTRIES`] are kept and their bytes
-    /// fit the budget; the most recent stays, whatever its size (a search needs it).
-    fn evict(&self, state: &mut State) {
-        let bytes = |kept: &[Kept]| -> u64 {
-            kept.iter()
-                .filter_map(|k| k.corpus.as_ref())
-                .map(|corpus| corpus.memory_bytes() as u64)
-                .sum()
-        };
-        while state.kept.len() > 1
-            && (state.kept.len() > ENTRIES || bytes(&state.kept) > self.budget)
-        {
-            state.kept.remove(0);
-        }
-        Self::prune(state);
-    }
-
     pub(crate) fn stats(&self) -> TextCorpusStats {
-        let state = self.state.lock();
+        let kept = self.state.lock().kept.len() as u64;
         TextCorpusStats {
-            kept: state.kept.len() as u64,
-            bytes: state
-                .kept
-                .iter()
-                .filter_map(|k| k.corpus.as_ref())
-                .map(|corpus| corpus.memory_bytes() as u64)
-                .sum(),
-            budget: self.budget,
+            kept,
+            bytes: self.budget.used() as u64,
+            budget: self.budget.limit() as u64,
             walked: self.walked.load(Ordering::Relaxed),
             derived: self.derived.load(Ordering::Relaxed),
         }
@@ -436,7 +577,9 @@ mod tests {
                     crate::ReadModel::Materialised,
                     &crate::TextScope::EVERY,
                     &names,
+                    None,
                 )
+                .unwrap()
                 .len();
             let _ = done.send((found, named));
         });

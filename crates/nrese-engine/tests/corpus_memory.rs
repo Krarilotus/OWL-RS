@@ -85,3 +85,74 @@ fn corpora_under_churn_hold_the_heap_level() {
         "the heap grew by {grew} bytes over 900 rounds"
     );
 }
+
+/// What a search keeps is within the corpora's budget, keys included: a merge of 4,095
+/// graphs (a 32 KiB key) doesn't fit a 1,024-byte budget, so nothing of it stays live (the
+/// review's case of 18 October: 32,864 bytes kept, 64 reported). Eight such scopes: kept
+/// keys would hold 256 KiB; the allowance is for the thread pool's own buffers, which a
+/// loaded machine's work stealing grows and frees later.
+#[test]
+fn kept_keys_are_within_the_budget() {
+    use nrese_engine::{ReadModel, TextScope};
+    let engine = Engine::new(EngineConfig {
+        text_corpus_bytes: 1024,
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let mut tx = engine.transaction();
+    let quad = |graph: GraphName| {
+        Quad::new(
+            NamedNode::new_unchecked("http://example.com/s"),
+            NamedNode::new_unchecked("http://example.com/p"),
+            Literal::new_simple_literal("alpha"),
+            graph,
+        )
+    };
+    for i in 0..4096 {
+        let graph = NamedNode::new_unchecked(format!("http://example.com/g{i}"));
+        tx.insert(quad(graph.into()).as_ref());
+    }
+    tx.insert(quad(GraphName::DefaultGraph).as_ref());
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let query = TextQuery {
+        text: "alpha".to_owned(),
+        all_words: false,
+        prefix: false,
+        stem: None,
+    };
+    let graphs: Vec<_> = (0..4096)
+        .map(|i| {
+            let graph = NamedNode::new_unchecked(format!("http://example.com/g{i}"));
+            snapshot.lookup(graph.as_ref().into()).unwrap()
+        })
+        .collect();
+    // Every graph but the `left`th.
+    let scope = |left: usize| {
+        let mut graphs = graphs.clone();
+        graphs.remove(left);
+        TextScope::Merge(graphs)
+    };
+    let search = |scope: &TextScope| {
+        snapshot
+            .text_search_in(ReadModel::Materialised, scope, &query, None)
+            .unwrap()
+            .len()
+    };
+    // The index, the thread pool and a walk like the measured ones first.
+    snapshot.text_search(&query);
+    assert_eq!(search(&scope(4095)), 1);
+    let scopes: Vec<TextScope> = (0..8).map(scope).collect();
+    let before = heap::live();
+    for scope in &scopes {
+        assert_eq!(search(scope), 1);
+    }
+    let kept = heap::live().saturating_sub(before);
+    let stats = engine.stats().text_corpora;
+    assert!(stats.bytes <= stats.budget, "{stats:?}");
+    assert!(
+        kept <= stats.budget as usize + (64 << 10),
+        "{kept} bytes kept; {stats:?}"
+    );
+}

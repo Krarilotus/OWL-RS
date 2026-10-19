@@ -1,12 +1,14 @@
 //! Full-text corpora (`Snapshot::text_search_in`): a search ranks among the literals its
 //! snapshot's statements in its scope hold, so neither an open transaction, nor a later
 //! version, nor another scope changes its scores; a replica answers as its primary does.
+//! What a corpus holds is what the reader's scans show, equality classes as it reads them.
 //! The corpus is walked once, kept, and derived across commits from the last one; the
 //! kept ones are bounded (performance.md §0).
 
 use nrese_engine::{
     DurabilityConfig, EncodedQuad, EncodedTriple, Engine, EngineConfig, GraphSelector,
-    InferredSubset, ReadModel, Snapshot, SyncPolicy, TermId, TextMatch, TextQuery, TextScope,
+    InferredSubset, QuadPattern, ReadModel, Snapshot, SyncPolicy, TermId, TermKind, TextMatch,
+    TextQuery, TextScope,
 };
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 
@@ -73,7 +75,9 @@ fn corpora_are_walked_once_then_derived_across_commits() {
     assert_eq!(built(&snapshot), (1, 0));
     assert_eq!(snapshot.text_search(&query("beta")).len(), 2);
     assert_eq!(built(&snapshot), (1, 0));
-    let in_default = snapshot.text_search_in(model, &default, &query("alpha beta"));
+    let in_default = snapshot
+        .text_search_in(model, &default, &query("alpha beta"), None)
+        .unwrap();
     assert_eq!(built(&snapshot), (2, 0));
     assert_eq!(in_default.len(), 2);
     assert_eq!(every.len(), 3);
@@ -89,7 +93,9 @@ fn corpora_are_walked_once_then_derived_across_commits() {
     }
     assert_eq!(snapshot.text_search(&query("alpha beta")), every);
     assert_eq!(
-        snapshot.text_search_in(model, &default, &query("alpha beta")),
+        snapshot
+            .text_search_in(model, &default, &query("alpha beta"), None)
+            .unwrap(),
         in_default
     );
     assert_eq!(built(&snapshot), (2, 0));
@@ -101,7 +107,10 @@ fn corpora_are_walked_once_then_derived_across_commits() {
     assert_eq!(later.text_search(&query("alpha beta")).len(), 63);
     assert_eq!(built(&later), (2, 1));
     assert_eq!(
-        later.text_search_in(model, &default, &query("beta")).len(),
+        later
+            .text_search_in(model, &default, &query("beta"), None)
+            .unwrap()
+            .len(),
         61
     );
     assert_eq!(built(&later), (2, 2));
@@ -115,7 +124,9 @@ fn corpora_are_walked_once_then_derived_across_commits() {
     assert_eq!(latest.text_search(&query("beta")).len(), 65);
     assert_eq!(built(&latest), (2, 3));
     // Autocompletion's other index (IRIs by local name, among the subjects) has its own.
-    let names = latest.iri_search_in(model, &TextScope::EVERY, &query("x1"));
+    let names = latest
+        .iri_search_in(model, &TextScope::EVERY, &query("x1"), None)
+        .unwrap();
     assert_eq!(names.len(), 1);
     assert_eq!(built(&latest), (3, 3));
 }
@@ -157,7 +168,8 @@ fn kept_corpora_are_bounded_and_shared_by_equal_graph_sets() {
     ] {
         assert_eq!(
             snapshot
-                .text_search_in(model, &scope, &query("word1"))
+                .text_search_in(model, &scope, &query("word1"), None)
+                .unwrap()
                 .len(),
             1
         );
@@ -166,14 +178,18 @@ fn kept_corpora_are_bounded_and_shared_by_equal_graph_sets() {
     // Two graphs in either order: one corpus.
     let (g1, g2) = (graph(&snapshot, 1), graph(&snapshot, 2));
     for graphs in [vec![g1, g2], vec![g2, g1]] {
-        let found = snapshot.text_search_in(model, &TextScope::Merge(graphs), &query("word1"));
+        let found = snapshot
+            .text_search_in(model, &TextScope::Merge(graphs), &query("word1"), None)
+            .unwrap();
         assert_eq!(found.len(), 2);
     }
     assert_eq!(built(&snapshot), (2, 0));
     // More scopes than are kept: at most the count.
     for g in 0..80 {
         let scope = TextScope::Graphs(GraphSelector::Exact(graph(&snapshot, g)));
-        snapshot.text_search_in(model, &scope, &query("word1"));
+        snapshot
+            .text_search_in(model, &scope, &query("word1"), None)
+            .unwrap();
     }
     let stats = engine.stats().text_corpora;
     assert_eq!(stats.kept, 64, "{stats:?}");
@@ -184,7 +200,9 @@ fn kept_corpora_are_bounded_and_shared_by_equal_graph_sets() {
     let snapshot = engine.snapshot();
     for g in 0..80 {
         let scope = TextScope::Graphs(GraphSelector::Exact(graph(&snapshot, g)));
-        snapshot.text_search_in(model, &scope, &query("word1"));
+        snapshot
+            .text_search_in(model, &scope, &query("word1"), None)
+            .unwrap();
         let stats = snapshot.text_corpus_stats();
         assert!(stats.bytes <= stats.budget, "{stats:?}");
         assert!(stats.kept <= 4, "{stats:?}");
@@ -192,7 +210,9 @@ fn kept_corpora_are_bounded_and_shared_by_equal_graph_sets() {
     // The most recently used stays: searching it again builds nothing.
     let last = TextScope::Graphs(GraphSelector::Exact(graph(&snapshot, 79)));
     let before = built(&snapshot);
-    snapshot.text_search_in(model, &last, &query("word2"));
+    snapshot
+        .text_search_in(model, &last, &query("word2"), None)
+        .unwrap();
     assert_eq!(built(&snapshot), before);
 }
 
@@ -208,12 +228,64 @@ impl Random {
     }
 }
 
+/// The documents a corpus must hold: the terms at the documents' position (objects that are
+/// string literals with a word; subjects that are IRIs whose local name has one) of the
+/// statements `snapshot`'s own scans show in `scope`'s graphs in `model`. The oracle reads
+/// statements as the reader does, equality classes expanded or canonical.
+fn visible(snapshot: &Snapshot, model: ReadModel, scope: &TextScope, iris: bool) -> Vec<u64> {
+    let graphs: Vec<GraphSelector> = match scope {
+        TextScope::Graphs(graphs) => vec![*graphs],
+        TextScope::Merge(graphs) => graphs.iter().map(|&g| GraphSelector::Exact(g)).collect(),
+    };
+    let has_words = |text: &str| text.chars().any(char::is_alphanumeric);
+    let mut found = std::collections::BTreeSet::new();
+    for graph in graphs {
+        let pattern = QuadPattern {
+            graph,
+            ..QuadPattern::all()
+        };
+        for quad in snapshot.quads_for_pattern_in(model, &pattern) {
+            let term = if iris { quad.subject } else { quad.object };
+            let document = match snapshot.decode(term) {
+                Some(Term::Literal(l)) if !iris => {
+                    matches!(term.kind(), TermKind::String | TermKind::LangString)
+                        && has_words(l.value())
+                }
+                Some(Term::NamedNode(n)) if iris => {
+                    has_words(n.as_str().rsplit(['#', '/', ':']).next().unwrap_or(""))
+                }
+                _ => false,
+            };
+            if document {
+                found.insert(term.payload());
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// Checks the corpus a search of `snapshot` uses, of literals and of IRIs, against
+/// [`visible`].
+fn check(snapshot: &Snapshot, model: ReadModel, scope: &TextScope, context: &str) {
+    for iris in [false, true] {
+        let (members, documents, _) = snapshot.text_corpus_members(model, scope, iris);
+        let expected = visible(snapshot, model, scope, iris);
+        assert_eq!(
+            members, expected,
+            "{context}, {model:?}, {scope:?}, iris {iris}"
+        );
+        assert_eq!(documents, expected.len() as u64, "{context}");
+    }
+}
+
 /// Differential: after random commits (inserts, deletes, a literal moved between graphs,
-/// inferred statements added and retracted; searches after some commits, none after
-/// others), every corpus a search uses equals one walked afresh, in every scope and
-/// model; and so do those of pending states and of restricted views brought forward.
+/// inferred statements and `owl:sameAs` links added and retracted; searches after some
+/// commits, none after others), every corpus a search uses holds exactly what the
+/// reader's scans show (walked or derived), in every scope and model, read as stored,
+/// with equality classes expanded, and canonically; and so do those of pending states and
+/// of restricted views brought forward.
 #[test]
-fn derived_corpora_equal_walked_ones_after_random_commits() {
+fn search_corpora_equal_the_visible_statements_after_random_commits() {
     for seed in [0x9e37_79b9_7f4a_7c15, 7, 0xdead_beef, 1 << 40] {
         random_commits(seed);
     }
@@ -228,14 +300,39 @@ fn random_commits(seed: u64) {
     let graphs = [None, Some("g1"), Some("g2"), Some("g3")];
     let words = ["alpha", "beta", "gamma", "delta", "epsilon"];
     let mut random = Random(seed);
+    // The subjects first, in order: s0..s5 represent s6..s11 (the smaller id).
+    let (same_as, subjects) = {
+        let tx = engine.transaction();
+        let same_as = tx.intern(
+            NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs")
+                .as_ref()
+                .into(),
+        );
+        let subjects: Vec<TermId> = (0..12)
+            .map(|i| {
+                let iri = NamedNode::new_unchecked(format!("http://example.com/s{i}"));
+                tx.intern(iri.as_ref().into())
+            })
+            .collect();
+        tx.commit().unwrap();
+        (same_as, subjects)
+    };
+    // Reads expand the classes, as a store with equality by representatives does: the
+    // classes are found again at each commit that changes a `sameAs` statement.
+    engine.set_equality(Some(same_as));
     // The asserted statements, as (subject, text, graph).
     let mut asserted: Vec<(String, String, Option<&str>)> = Vec::new();
     let mut inferred: Vec<EncodedTriple> = Vec::new();
     let mut view: Option<(Snapshot, Snapshot, Vec<EncodedQuad>)> = None;
+    // Of the 3 readers × 6 scopes × 3 models, 24 (each checked for literals and IRIs).
+    let mut chosen = std::collections::BTreeSet::new();
+    while chosen.len() < 24 {
+        chosen.insert(1 + random.below(54) as usize);
+    }
     for round in 0..60 {
         let mut tx = engine.transaction();
         for _ in 0..1 + random.below(6) {
-            match random.below(10) {
+            match random.below(11) {
                 // A new statement (texts repeat, so a literal may stay in use elsewhere).
                 0..=4 => {
                     let a = words[random.below(5) as usize];
@@ -262,11 +359,11 @@ fn random_commits(seed: u64) {
                         asserted.push((subject, text, graph));
                     }
                 }
-                // An inferred statement (default graph).
+                // An inferred label (default graph).
                 8 => {
                     let a = words[random.below(5) as usize];
                     let quad = label(
-                        &format!("i{}", random.below(6)),
+                        &format!("s{}", random.below(12)),
                         &format!("{a} inferred"),
                         None,
                     );
@@ -279,7 +376,20 @@ fn random_commits(seed: u64) {
                         inferred.push(triple);
                     }
                 }
-                // One retracted.
+                // An identity linked to its representative (inferred, as equality by
+                // representatives stores it).
+                9 => {
+                    let i = random.below(6) as usize;
+                    let triple = EncodedTriple {
+                        subject: subjects[i + 6],
+                        predicate: same_as,
+                        object: subjects[i],
+                    };
+                    if tx.insert_inferred(triple) {
+                        inferred.push(triple);
+                    }
+                }
+                // An inferred statement retracted.
                 _ if !inferred.is_empty() => {
                     let at = random.below(inferred.len() as u64) as usize;
                     tx.remove_inferred(inferred.swap_remove(at));
@@ -309,28 +419,42 @@ fn random_commits(seed: u64) {
             ReadModel::Asserted,
             ReadModel::Inferred,
         ];
+        let readers = [
+            ("stored", snapshot.stored()),
+            ("expanded", snapshot.clone()),
+            ("canonical", snapshot.with_canonical_equality()),
+        ];
         // Searches after some commits only: the others are derived over several steps.
+        // A fixed choice of kinds per seed, fewer than the corpora kept, so that most
+        // rounds derive rather than walk.
         if random.below(3) != 0 {
-            for scope in &scopes {
-                for model in models {
-                    let derived = snapshot.text_corpus_members(model, scope, false);
-                    let walked = snapshot.text_corpus_members(model, scope, true);
-                    assert_eq!(
-                        derived, walked,
-                        "seed {seed}, round {round}, {model:?}, {scope:?}"
-                    );
+            let mut kind = 0usize;
+            for (name, reader) in &readers {
+                for scope in &scopes {
+                    for model in models {
+                        kind += 1;
+                        if !chosen.contains(&kind) {
+                            continue;
+                        }
+                        let context = format!("seed {seed}, round {round}, {name}");
+                        check(reader, model, scope, &context);
+                    }
                 }
             }
-            let every = TextScope::EVERY;
-            let model = ReadModel::Materialised;
-            let derived = pending.text_corpus_members(model, &every, false);
-            let walked = pending.text_corpus_members(model, &every, true);
-            assert_eq!(derived, walked, "seed {seed}, round {round}, pending");
+            for pending in [pending.stored(), pending.clone()] {
+                let context = format!("seed {seed}, round {round}, pending");
+                check(
+                    &pending,
+                    ReadModel::Materialised,
+                    &TextScope::EVERY,
+                    &context,
+                );
+            }
         }
         // A reader who sees some inferred statements: its view brought forward.
         let hidden: Vec<EncodedQuad> = inferred
             .iter()
-            .filter(|_| random.below(2) == 0)
+            .filter(|t| t.predicate != same_as && random.below(2) == 0)
             .map(|triple| triple.in_default_graph())
             .collect();
         let now = snapshot.with_inferred_subset(InferredSubset::Without(hidden.clone()));
@@ -344,14 +468,168 @@ fn random_commits(seed: u64) {
             flipped.sort_unstable();
             now.continues(&snapshot, earlier, earlier_base, &flipped);
         }
-        let every = TextScope::EVERY;
-        let derived = now.text_corpus_members(ReadModel::Materialised, &every, false);
-        let walked = now.text_corpus_members(ReadModel::Materialised, &every, true);
-        assert_eq!(derived, walked, "seed {seed}, round {round}, view");
+        check(
+            &now,
+            ReadModel::Materialised,
+            &TextScope::EVERY,
+            &format!("seed {seed}, round {round}, view"),
+        );
         view = Some((now, snapshot, hidden));
     }
+    // Walked: the first of each kind, IRIs' corpora of readers of equality classes, and
+    // any after a `sameAs` change; the rest derived.
     let stats = engine.stats().text_corpora;
-    assert!(stats.derived > stats.walked, "{stats:?}");
+    assert!(2 * stats.derived > stats.walked, "{stats:?}");
+}
+
+/// The review's (18 October) cases of equality by representatives, one per row: a search
+/// ranks among what the reader's scans show, as stored, expanded or canonical; the three
+/// readers share one version and keep three corpora. Each row: its statements (asserted
+/// and inferred), the model and scope searched, literals or IRIs, the query, and the
+/// matches a reader that expands classes gets.
+#[test]
+fn equality_readers_search_what_their_scans_show() {
+    const OWL_SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
+    struct Case {
+        name: &'static str,
+        /// (subject, predicate or "label", object or text, graph or None, inferred).
+        statements: &'static [(
+            &'static str,
+            &'static str,
+            &'static str,
+            Option<&'static str>,
+            bool,
+        )],
+        model: ReadModel,
+        default_graph_only: bool,
+        iris: bool,
+        query: &'static str,
+        expanded_matches: usize,
+    }
+    let cases = [
+        Case {
+            name: "copies asserted only in a named graph aren't in the default graph",
+            statements: &[
+                ("Representative", "label", "secret alpha", Some("g"), false),
+                ("Alias", "label", "secret alpha", Some("g"), false),
+                ("Alias", OWL_SAME_AS, "Representative", None, true),
+                ("Representative", "label", "secret alpha", None, true),
+            ],
+            model: ReadModel::Materialised,
+            default_graph_only: true,
+            iris: false,
+            query: "secret",
+            expanded_matches: 0,
+        },
+        Case {
+            name: "an asserted label's equality copy is inferred",
+            statements: &[
+                ("Alias", OWL_SAME_AS, "Representative", None, false),
+                ("Representative", "label", "alpha", None, false),
+            ],
+            model: ReadModel::Inferred,
+            default_graph_only: false,
+            iris: false,
+            query: "alpha",
+            expanded_matches: 1,
+        },
+        Case {
+            name: "an alias is the subject of its representative's inferred statements",
+            statements: &[
+                ("Alias", OWL_SAME_AS, "Representative", None, false),
+                ("Representative", "label", "alpha", None, true),
+            ],
+            model: ReadModel::Inferred,
+            default_graph_only: false,
+            iris: true,
+            query: "Alias",
+            expanded_matches: 1,
+        },
+    ];
+    for case in cases {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        // The representative first: the class's smallest id.
+        for name in ["Representative", "Alias"] {
+            tx.intern(
+                NamedNode::new_unchecked(format!("http://example.com/{name}"))
+                    .as_ref()
+                    .into(),
+            );
+        }
+        let same_as = tx.intern(NamedNode::new_unchecked(OWL_SAME_AS).as_ref().into());
+        for &(subject, predicate, object, graph, inferred) in case.statements {
+            let quad = match predicate {
+                "label" => label(subject, object, graph),
+                _ => Quad::new(
+                    NamedNode::new_unchecked(format!("http://example.com/{subject}")),
+                    NamedNode::new_unchecked(predicate),
+                    NamedNode::new_unchecked(format!("http://example.com/{object}")),
+                    GraphName::DefaultGraph,
+                ),
+            };
+            match inferred {
+                false => assert!(tx.insert(quad.as_ref())),
+                true => {
+                    let triple = EncodedTriple {
+                        subject: tx.intern(quad.subject.as_ref().into()),
+                        predicate: tx.intern(quad.predicate.as_ref().into()),
+                        object: tx.intern(quad.object.as_ref()),
+                    };
+                    assert!(tx.insert_inferred(triple));
+                }
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let expanded = snapshot.with_equality(Some(same_as));
+        let scope = match case.default_graph_only {
+            true => TextScope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
+            false => TextScope::EVERY,
+        };
+        for (reader, name) in [
+            (&snapshot, "stored"),
+            (&expanded, "expanded"),
+            (&expanded.with_canonical_equality(), "canonical"),
+        ] {
+            check(
+                reader,
+                case.model,
+                &scope,
+                &format!("{}: {name}", case.name),
+            );
+        }
+        let found = match case.iris {
+            false => expanded.text_search_in(case.model, &scope, &query(case.query), None),
+            true => expanded.iri_search_in(case.model, &scope, &query(case.query), None),
+        }
+        .unwrap();
+        assert_eq!(
+            found.len(),
+            case.expanded_matches,
+            "{}: {found:?}",
+            case.name
+        );
+    }
+}
+
+/// The corpora's byte budget holds: a corpus larger than it serves its search and isn't
+/// kept (the review's 8-byte case).
+#[test]
+fn a_corpus_larger_than_the_budget_is_not_kept() {
+    let engine = Engine::new(EngineConfig {
+        text_corpus_bytes: 8,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..512 {
+        tx.insert(label(&format!("s{i}"), &format!("alpha item{i}"), None).as_ref());
+    }
+    tx.commit().unwrap();
+    assert_eq!(engine.snapshot().text_search(&query("alpha")).len(), 512);
+    let stats = engine.stats().text_corpora;
+    assert!(stats.bytes <= stats.budget && stats.kept == 0, "{stats:?}");
 }
 
 /// The merge of graphs and every named graph: their literals, each once.
@@ -377,7 +655,9 @@ fn scopes_of_several_graphs() {
     let found = |scope: &TextScope| {
         let mut found: Vec<String> = texts(
             &snapshot,
-            &snapshot.text_search_in(ReadModel::Materialised, scope, &query("beta")),
+            &snapshot
+                .text_search_in(ReadModel::Materialised, scope, &query("beta"), None)
+                .unwrap(),
         )
         .into_iter()
         .map(|(text, _)| text)
@@ -415,12 +695,31 @@ fn a_replica_scores_as_its_primary() {
     base(&primary);
     primary.write_image(replica_dir.path()).unwrap();
     let replica = Engine::open(replica_dir.path(), config()).unwrap();
+    // A warmed replica takes a commit from the primary's log: its corpus is derived.
+    let q = query("alpha beta");
+    assert_eq!(
+        replica.snapshot().text_search(&q),
+        primary.snapshot().text_search(&q)
+    );
+    let mut tx = primary.transaction();
+    tx.insert(label("y", "gamma from the log", None).as_ref());
+    tx.remove(label("f0", "filler 0", None).as_ref());
+    tx.commit().unwrap();
+    let batch = primary
+        .log_since(replica.stats().revision, 1 << 20)
+        .unwrap();
+    replica.apply_log(&batch.frames).unwrap();
+    let derived = replica.stats().text_corpora.derived;
+    assert_eq!(
+        replica.snapshot().text_search(&q),
+        primary.snapshot().text_search(&q)
+    );
+    assert_eq!(replica.stats().text_corpora.derived, derived + 1);
     let mut tx = primary.transaction();
     for i in 0..60 {
         tx.insert(label(&format!("x{i}"), &format!("beta extra {i}"), None).as_ref());
     }
     let (p, r) = (primary.snapshot(), replica.snapshot());
-    let q = query("alpha beta");
     assert_eq!(p.text_search(&q), r.text_search(&q));
     assert_eq!(texts(&p, &p.text_search(&q))[0].0, "beta");
     drop(tx);
