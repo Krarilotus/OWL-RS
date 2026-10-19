@@ -72,12 +72,14 @@ RUST_IMAGE=${RUST_IMAGE:-rust:$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT/rust-
 DATASETS=${*:-lubm-1 lubm-10}
 mkdir -p "$RESULTS" "$ORACLE_CACHE"
 
-# Runs a command in a container: output to <log>, the container's peak memory appended as
-# `peak_bytes N`. Returns the command's exit code; 124 means TIMEOUT_S ran out.
+# Runs SYSTEM's command in a container: output to <log>, the container's peak memory appended
+# as `peak_bytes N`. Returns the command's exit code; 124 means TIMEOUT_S ran out. Its image is
+# the system's (systems.sh) by the ID pinned at the start (ns_image); unpinned, the scorecard
+# stops (a measured path never runs a tag, and never skips one system to time the others).
 measured() {
-  local log=$1 image name rc=0
-  # The reasoner's image by the ID pinned at the start (ns_image): the same in every run of it.
-  image=$(ns_image "$2" "$NS_ROOT") || return 125
+  local log=$1 system=$2 image name rc=0
+  image=$(ns_image "$(system_image "$system")" "$NS_ROOT") || {
+    echo "measured $system: its image isn't pinned: the scorecard stops" >&2; kill -TERM $SCORECARD; exit 125; }
   name=$(ns_name "rsc-$$-$RANDOM" "$NS_ROOT")
   shift 2
   # --init: tini as PID 1 passes the timeout's SIGTERM on (a shell as PID 1 ignores it, and
@@ -148,7 +150,7 @@ run_oracle() { # <dataset> <log>
     local queries=
     [ ! -d "$HERE/queries/${1%%-*}" ] || queries="--queries /queries/${1%%-*}"
     # shellcheck disable=SC2086
-    TIMEOUT_S=$ORACLE_TIMEOUT_S measured "$2" nrese-bench/owlrl-oracle python /oracle/owlrl_materialise.py \
+    TIMEOUT_S=$ORACLE_TIMEOUT_S measured "$2" oracle python /oracle/owlrl_materialise.py \
       --profile owl2-rl $queries --out "/cache/oracle-owl2-rl-$1.nt" $(inputs "$1") || return 1
     cp "$2" "$cached.log"
   fi
@@ -157,7 +159,7 @@ run_oracle() { # <dataset> <log>
 }
 
 run_nrese_v2() { # <dataset> <log>
-  measured "$2" "$RUST_IMAGE" /target/release/examples/v2_closure \
+  measured "$2" nrese-v2 /target/release/examples/v2_closure \
     --out "/out/nrese-v2-$1.inferred.nt" $(inputs "$1") || return 1
   if [ -d "$HERE/queries/${1%%-*}" ]; then
     # shellcheck disable=SC2046
@@ -171,7 +173,7 @@ run_nrese_v2() { # <dataset> <log>
 run_nemo() { # <dataset> <log>
   # Nemo reads one import file, so the inputs are concatenated first (outside the timing).
   # shellcheck disable=SC2046
-  measured "$2" nrese-bench/nemo bash -c 'mkdir -p /in /tmp/nemo && cat "$@" > /in/input.nt &&
+  measured "$2" nemo bash -c 'mkdir -p /in /tmp/nemo && cat "$@" > /in/input.nt &&
     nmo -I /in -D /tmp/nemo -o --report short /nemo/owl2rl.rls &&
     cp /tmp/nemo/inferred.nt "/out/nemo-$0.inferred.nt" && cp /tmp/nemo/violations.csv "/out/nemo-$0.violations.csv"' \
     "$1" $(inputs "$1") || return 1
@@ -190,7 +192,7 @@ run_nemo() { # <dataset> <log>
 run_jena() { # <dataset> <log> <profile>
   local queries=-
   [ ! -d "$HERE/queries/${1%%-*}" ] || queries=/queries/${1%%-*}
-  measured "$2" nrese-bench/jena-reasoner java -cp '/runner:/opt/jena/lib/*' Materialise "$3" \
+  measured "$2" "jena-$3" java -cp '/runner:/opt/jena/lib/*' Materialise "$3" \
     "/out/jena-$3-$1.inferred.nt" "$queries" $(inputs "$1") || return 1
   echo "$(field 'asserted ([0-9]+)' "$2"),$(field 'closure ([0-9.]+)' "$2"),$(field 'inferred ([0-9]+)' "$2"),$(peak_mib "$2")"
 }
@@ -198,7 +200,10 @@ run_jena() { # <dataset> <log> <profile>
 # Images and the NRESE build. What this run is about to pull is its to remove afterwards
 # (scripts/bench-cleanup.sh).
 remember_pulls "$ROOT/tmp/bench-pulled-images" "$RUST_IMAGE"
-# The Rust image first: the build and the timed runs of its binary use the one ID.
+# The Rust image first: the build and the timed runs of its binary use the one ID. The systems'
+# images and the table the pins and the runs read: benches/reasoning/systems.sh.
+. "$HERE/systems.sh"
+SCORECARD=$$
 ns_pin_images "$NS_ROOT" "$RUST_IMAGE" || exit 1
 RUST_IMAGE=$(ns_image "$RUST_IMAGE" "$NS_ROOT") || exit 1
 docker build -q -t nrese-bench/owlrl-oracle "$HERE/oracle" >/dev/null
@@ -212,16 +217,12 @@ if [[ " $SYSTEMS " == *" nrese-v"* ]] && [ -z "${SKIP_BUILD:-}" ]; then
     -w /src "$RUST_IMAGE" cargo build --release --locked -p nrese-reasoner --example v2_closure \
     --target-dir /target >"$RESULTS/nrese-build.log" 2>&1
 fi
-# The reasoners' images, resolved to their IDs now, before anything is timed, and run by them
-# (ns_pin_images; measured runs ns_image): a tag that can't be resolved stops the scorecard here.
-tags=("$RUST_IMAGE")
-for system in $SYSTEMS; do
-  case $system in
-    oracle) tags+=(nrese-bench/owlrl-oracle) ;;
-    jena-owl-micro) tags+=(nrese-bench/jena-reasoner) ;;
-    nemo) tags+=(nrese-bench/nemo) ;;
-  esac
-done
+# The systems' images (systems.sh, the table the runs read too), resolved to their IDs now,
+# before anything is timed, and run by them (ns_pin_images; measured runs ns_image): a system
+# without an image, or an image that can't be resolved, stops the scorecard here.
+# shellcheck disable=SC2086
+tags_text=$(pin_set $SYSTEMS) || exit 1
+mapfile -t tags <<< "$tags_text"
 ns_pin_images "$NS_ROOT" "${tags[@]}" || exit 1
 ns_pins "$NS_ROOT" > "$RESULTS/images.tsv"
 

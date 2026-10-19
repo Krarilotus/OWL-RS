@@ -156,7 +156,7 @@ class NreseBinary(Nrese):
     def spec(self, ctx, name, store, command, env):
         env = {"NRESE_STORE_MODE": "on-disk", "NRESE_DATA_DIR": "/store", "RUST_LOG": "info", **env}
         binary = Path(setting("NRESE_BIN"))
-        return Spec(name, setting("NRESE_IMAGE", "ubuntu:24.04"), [f"/nrese/{binary.name}", *command], env,
+        return Spec(name, self.images(ctx)[0], [f"/nrese/{binary.name}", *command], env,
                     ctx.mounts(Mount(str(binary.parent), "/nrese"), Mount(store, "/store", readonly=False)),
                     memory=ctx.memory)
 
