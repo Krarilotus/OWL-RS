@@ -50,10 +50,9 @@ impl SharedBudget {
     fn charge(&self, bytes: usize) -> Result<(), usize> {
         let mut used = self.used.load(Ordering::Relaxed);
         loop {
-            let next = used.saturating_add(bytes);
-            if next > self.limit {
+            let Some(next) = used.checked_add(bytes).filter(|&next| next <= self.limit) else {
                 return Err(used);
-            }
+            };
             match self
                 .used
                 .compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed)
@@ -220,18 +219,20 @@ impl Budget {
 
     /// Reserves `bytes`, or fails without reserving anything.
     pub fn charge(&self, bytes: usize) -> Result<(), BudgetExceeded> {
+        self.take(bytes)?;
+        #[cfg(any(test, feature = "measure"))]
+        crate::measure::charged(self, bytes);
+        Ok(())
+    }
+
+    /// [`Self::charge`] here and above, unseen by a measurement: the caller tells it whose
+    /// the bytes are.
+    fn take(&self, bytes: usize) -> Result<(), BudgetExceeded> {
         let mut used = self.used.load(Ordering::Relaxed);
         loop {
-            let next = used.saturating_add(bytes);
-            if next > self.limit {
-                self.refused.store(true, Ordering::Relaxed);
-                return Err(BudgetExceeded {
-                    limit: self.limit,
-                    requested: bytes,
-                    used,
-                    shared: false,
-                });
-            }
+            let Some(next) = used.checked_add(bytes).filter(|&next| next <= self.limit) else {
+                return Err(self.refuse(bytes, used));
+            };
             match self
                 .used
                 .compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed)
@@ -250,7 +251,7 @@ impl Budget {
                 used: in_use,
                 shared: true,
             }),
-            Some(Parent::Envelope(envelope)) => envelope.charge(bytes),
+            Some(Parent::Envelope(envelope)) => envelope.take(bytes),
             None => Ok(()),
         };
         if above.is_err() {
@@ -258,6 +259,17 @@ impl Budget {
             self.refused.store(true, Ordering::Relaxed);
         }
         above
+    }
+
+    /// The refusal of `bytes` with `used` in use, recorded.
+    fn refuse(&self, bytes: usize, used: usize) -> BudgetExceeded {
+        self.refused.store(true, Ordering::Relaxed);
+        BudgetExceeded {
+            limit: self.limit,
+            requested: bytes,
+            used,
+            shared: false,
+        }
     }
 
     /// Whether a charge ever failed, here or above: what was computed under this budget
@@ -268,16 +280,36 @@ impl Budget {
     }
 
     pub fn release(&self, bytes: usize) {
+        let _released = self.give(bytes);
+        #[cfg(any(test, feature = "measure"))]
+        crate::measure::released(self, _released);
+    }
+
+    /// [`Self::release`] here and above, unseen by a measurement; what was released.
+    fn give(&self, bytes: usize) -> usize {
         let bytes = bytes.min(self.used());
         self.used.fetch_sub(bytes, Ordering::Relaxed);
         self.release_above(bytes);
+        bytes
     }
 
     fn release_above(&self, bytes: usize) {
         match &self.parent {
             Some(Parent::Server(shared)) => shared.release(bytes),
-            Some(Parent::Envelope(envelope)) => envelope.release(bytes),
+            Some(Parent::Envelope(envelope)) => {
+                envelope.give(bytes);
+            }
             None => {}
+        }
+    }
+
+    /// The envelope this budget is a part of, if it is one: a measurement of the envelope
+    /// counts its parts' charges ([`crate::measure`]).
+    #[cfg(any(test, feature = "measure"))]
+    pub(crate) fn above(&self) -> Option<&Budget> {
+        match &self.parent {
+            Some(Parent::Envelope(envelope)) => Some(envelope),
+            _ => None,
         }
     }
 
@@ -318,40 +350,68 @@ impl Drop for Budget {
     /// A part or request that ends, with a result or an error, holds nothing of the
     /// budgets above it.
     fn drop(&mut self) {
-        self.release_above(self.used());
+        let used = self.used();
+        self.release_above(used);
+        #[cfg(any(test, feature = "measure"))]
+        crate::measure::released(self, used);
     }
 }
 
 /// Bytes charged to a budget that outlive the operation which charged them: released when
 /// the reservation drops, however its holder ends. `B` borrows or shares the budget.
+///
+/// A measurement ([`crate::measure`]) tells reservations apart: it counts the charges and
+/// releases of those made while it runs, and of no other.
 #[derive(Debug)]
 pub struct Reservation<B: Deref<Target = Budget> = Arc<Budget>> {
     budget: B,
     bytes: usize,
+    /// The measurements' generation it was made in ([`crate::measure`]).
+    #[cfg(any(test, feature = "measure"))]
+    tag: u64,
 }
 
 impl<B: Deref<Target = Budget>> Reservation<B> {
     pub fn new(budget: B) -> Self {
-        Self { budget, bytes: 0 }
+        Self {
+            budget,
+            bytes: 0,
+            #[cfg(any(test, feature = "measure"))]
+            tag: crate::measure::tag(),
+        }
     }
 
-    /// Takes over `bytes` already charged to `budget`.
+    /// Takes over `bytes` already charged to `budget` (by [`Budget::charge`]).
     pub fn adopt(budget: B, bytes: usize) -> Self {
-        Self { budget, bytes }
+        let mut held = Self::new(budget);
+        held.bytes = bytes;
+        #[cfg(any(test, feature = "measure"))]
+        {
+            crate::measure::reserved(&held.budget, held.tag, bytes);
+            crate::measure::released(&held.budget, bytes);
+        }
+        held
     }
 
     /// Reserves `bytes` more, or fails without reserving anything.
     pub fn charge(&mut self, bytes: usize) -> Result<(), BudgetExceeded> {
-        self.budget.charge(bytes)?;
-        self.bytes += bytes;
+        let Some(total) = self.bytes.checked_add(bytes) else {
+            return Err(self.budget.refuse(bytes, self.budget.used()));
+        };
+        self.budget.take(bytes)?;
+        self.bytes = total;
+        #[cfg(any(test, feature = "measure"))]
+        crate::measure::reserved(&self.budget, self.tag, bytes);
         Ok(())
     }
 
     /// Returns up to `bytes` of this reservation to the budget.
     pub fn release(&mut self, bytes: usize) {
         let bytes = bytes.min(self.bytes);
-        self.budget.release(bytes);
+        let _released = self.budget.give(bytes);
         self.bytes -= bytes;
+        #[cfg(any(test, feature = "measure"))]
+        crate::measure::unreserved(&self.budget, self.tag, _released);
     }
 
     pub fn bytes(&self) -> usize {
@@ -370,15 +430,278 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
         }
     }
 
-    /// Hands the bytes to a holder that releases them itself; nothing is released.
+    /// Holds `bytes` in place of what it held, as a reservation made now: they are charged,
+    /// and what it held is handed back as a reservation of its own, released when that
+    /// drops. Until then both are held, as a reallocation holds the old block and the new.
+    /// A refusal changes nothing.
+    fn renew(&mut self, bytes: usize) -> Result<Reservation<&Budget>, BudgetExceeded> {
+        self.budget.take(bytes)?;
+        let old = Reservation {
+            budget: &*self.budget,
+            bytes: std::mem::replace(&mut self.bytes, bytes),
+            #[cfg(any(test, feature = "measure"))]
+            tag: std::mem::replace(&mut self.tag, crate::measure::tag()),
+        };
+        #[cfg(any(test, feature = "measure"))]
+        crate::measure::reserved(old.budget, self.tag, bytes);
+        Ok(old)
+    }
+
+    /// Hands the bytes to a holder that releases them itself (with [`Budget::release`]);
+    /// nothing is released.
     pub fn transfer(mut self) -> usize {
-        std::mem::take(&mut self.bytes)
+        let bytes = std::mem::take(&mut self.bytes);
+        #[cfg(any(test, feature = "measure"))]
+        {
+            crate::measure::charged(&self.budget, bytes);
+            crate::measure::unreserved(&self.budget, self.tag, bytes);
+        }
+        bytes
     }
 }
 
 impl<B: Deref<Target = Budget>> Drop for Reservation<B> {
     fn drop(&mut self) {
-        self.budget.release(self.bytes);
+        self.release(self.bytes);
+    }
+}
+
+/// A vector whose memory is charged to a budget before it is allocated. Every change of its
+/// capacity takes one path ([`ChargedVec::set_capacity`]): the new capacity is charged
+/// first, beside the old (a reallocation holds both while it moves the items), then
+/// allocated, then the old capacity released; one the budget has no room for fails without
+/// allocating. It never holds more than it was charged, however a call ends: what it lends
+/// a writer ([`ChargedVec::fill`]) can't grow it. Dropped, it frees the items, then
+/// releases their charge; [`ChargedVec::into_parts`] hands the items out with their
+/// reservation.
+#[derive(Debug)]
+pub struct ChargedVec<T, B: Deref<Target = Budget> = Arc<Budget>> {
+    /// Before `held`: fields drop in order, the items first.
+    items: Vec<T>,
+    /// Exactly `items`' capacity in bytes.
+    held: Reservation<B>,
+}
+
+impl<T, B: Deref<Target = Budget>> ChargedVec<T, B> {
+    pub fn new(budget: B) -> Self {
+        Self {
+            items: Vec::new(),
+            held: Reservation::new(budget),
+        }
+    }
+
+    /// Room for `capacity` items, reserved first.
+    pub fn with_capacity(budget: B, capacity: usize) -> Result<Self, BudgetExceeded> {
+        let mut vec = Self::new(budget);
+        vec.reserve_exact(capacity)?;
+        Ok(vec)
+    }
+
+    /// `items`, at most `bound` of them: the room for `bound` reserved first.
+    pub fn collect(
+        budget: B,
+        bound: usize,
+        items: impl IntoIterator<Item = T>,
+    ) -> Result<Self, BudgetExceeded> {
+        let mut vec = Self::with_capacity(budget, bound)?;
+        vec.extend_bounded(bound, items)?;
+        Ok(vec)
+    }
+
+    /// The bytes of `capacity` items, if a vector can hold them.
+    fn bytes(capacity: usize) -> Option<usize> {
+        std::alloc::Layout::array::<T>(capacity)
+            .ok()
+            .map(|layout| layout.size())
+    }
+
+    /// Room for `additional` more items: the capacity doubles where the budget has room
+    /// for it, else grows by what is asked.
+    pub fn reserve(&mut self, additional: usize) -> Result<(), BudgetExceeded> {
+        let needed = self.needed(additional)?;
+        if needed <= self.items.capacity() {
+            return Ok(());
+        }
+        let doubled = needed.max(self.items.capacity().saturating_mul(2));
+        let fits = Self::bytes(doubled).is_some_and(|bytes| bytes <= self.held.budget.remaining());
+        self.set_capacity(if fits { doubled } else { needed })
+    }
+
+    /// Room for exactly `additional` more items.
+    pub fn reserve_exact(&mut self, additional: usize) -> Result<(), BudgetExceeded> {
+        let needed = self.needed(additional)?;
+        match needed <= self.items.capacity() {
+            true => Ok(()),
+            false => self.set_capacity(needed),
+        }
+    }
+
+    /// The length with `additional` more items, if it can be counted.
+    fn needed(&self, additional: usize) -> Result<usize, BudgetExceeded> {
+        let budget = &self.held.budget;
+        self.items
+            .len()
+            .checked_add(additional)
+            .ok_or_else(|| budget.refuse(usize::MAX, budget.used()))
+    }
+
+    /// The one path that changes the capacity, to `capacity` items (at least the length):
+    /// charged beside the old capacity, the vector reallocated, the old capacity released.
+    /// A capacity no vector can hold is refused as one the budget has no room for.
+    fn set_capacity(&mut self, capacity: usize) -> Result<(), BudgetExceeded> {
+        let budget = &self.held.budget;
+        let bytes =
+            Self::bytes(capacity).ok_or_else(|| budget.refuse(usize::MAX, budget.used()))?;
+        // Released when it drops: after the reallocation, or as an unwinding one ends.
+        let _old = self.held.renew(bytes)?;
+        if capacity > self.items.capacity() {
+            self.items.reserve_exact(capacity - self.items.len());
+        } else {
+            self.items.shrink_to(capacity);
+        }
+        debug_assert_eq!(Self::bytes(self.items.capacity()), Some(bytes));
+        Ok(())
+    }
+
+    pub fn push(&mut self, item: T) -> Result<(), BudgetExceeded> {
+        self.reserve(1)?;
+        self.items.push(item);
+        Ok(())
+    }
+
+    pub fn extend_from_slice(&mut self, items: &[T]) -> Result<(), BudgetExceeded>
+    where
+        T: Clone,
+    {
+        self.reserve(items.len())?;
+        self.items.extend_from_slice(items);
+        Ok(())
+    }
+
+    /// `items` appended, at most `bound` of them (an iterator that may yield more is cut
+    /// there): the room for `bound` reserved first.
+    pub fn extend_bounded(
+        &mut self,
+        bound: usize,
+        items: impl IntoIterator<Item = T>,
+    ) -> Result<(), BudgetExceeded> {
+        self.fill(bound, |room| {
+            items
+                .into_iter()
+                .take(bound)
+                .for_each(|item| room.push(item));
+        })
+    }
+
+    /// `len` items, those past the current ones `value`'s clones.
+    pub fn resize(&mut self, len: usize, value: T) -> Result<(), BudgetExceeded>
+    where
+        T: Clone,
+    {
+        self.reserve(len.saturating_sub(self.items.len()))?;
+        self.items.resize(len, value);
+        Ok(())
+    }
+
+    /// `fill` given room for `bound` more items, reserved first: for a writer that knows
+    /// how many items it adds at most (a decoder that knows its bound). It can't grow the
+    /// vector: an item past the room panics before anything is allocated.
+    pub fn fill<R>(
+        &mut self,
+        bound: usize,
+        fill: impl FnOnce(&mut Room<'_, T>) -> R,
+    ) -> Result<R, BudgetExceeded> {
+        self.reserve(bound)?;
+        Ok(fill(&mut Room(&mut self.items)))
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.items.truncate(len);
+    }
+
+    pub fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
+        self.items.retain(keep);
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.items.capacity()
+    }
+
+    /// The bytes held: the capacity's.
+    pub fn charged(&self) -> usize {
+        self.held.bytes()
+    }
+
+    /// The items, and the reservation of their capacity, for a holder that keeps it until
+    /// they are freed.
+    pub fn into_parts(self) -> (Vec<T>, Reservation<B>) {
+        let Self { items, held } = self;
+        (items, held)
+    }
+}
+
+impl<T, B: Deref<Target = Budget>> Deref for ChargedVec<T, B> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        &self.items
+    }
+}
+
+impl<T, B: Deref<Target = Budget>> std::ops::DerefMut for ChargedVec<T, B> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        &mut self.items
+    }
+}
+
+/// The room a [`ChargedVec`] lends a writer ([`ChargedVec::fill`]): items are added within
+/// the capacity reserved, which it never grows.
+#[derive(Debug)]
+pub struct Room<'v, T>(&'v mut Vec<T>);
+
+impl<T> Room<'_, T> {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Panics where no room is left.
+    pub fn push(&mut self, item: T) {
+        assert!(self.0.len() < self.0.capacity(), "past the room reserved");
+        self.0.push(item);
+    }
+
+    /// Panics where there is no room for them.
+    pub fn extend_from_slice(&mut self, items: &[T])
+    where
+        T: Clone,
+    {
+        assert!(
+            items.len() <= self.0.capacity() - self.0.len(),
+            "past the room reserved"
+        );
+        self.0.extend_from_slice(items);
+    }
+
+    /// The room left, to be written; [`Self::set_len`] then takes what was written.
+    pub fn spare_capacity_mut(&mut self) -> &mut [std::mem::MaybeUninit<T>] {
+        self.0.spare_capacity_mut()
+    }
+
+    /// As [`Vec::set_len`].
+    ///
+    /// # Safety
+    /// `len` is at most the capacity, and the items up to it are initialised.
+    pub unsafe fn set_len(&mut self, len: usize) {
+        // SAFETY: the caller's.
+        unsafe { self.0.set_len(len) }
     }
 }
 
@@ -441,6 +764,46 @@ impl<B: Deref<Target = Budget>> Gauge<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A charged vector never holds more than it was charged: every path that grows it
+    /// reserves first, a writer it lends can't grow it, a capacity no vector can hold is
+    /// refused, and its items leave with their reservation.
+    #[test]
+    fn a_charged_vector_never_holds_more_than_it_was_charged() {
+        if !crate::measure::alone() {
+            return;
+        }
+        let budget = Budget::new(1 << 20);
+        let mut vec: ChargedVec<u64, &Budget> = ChargedVec::collect(&budget, 4, 0..10).unwrap();
+        // A writer past what it said it would add panics before the vector grows.
+        let past = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vec.fill(0, |room| room.push(4))
+        }));
+        assert!(past.is_err());
+        assert_eq!((vec.capacity(), budget.used()), (4, 32));
+        let ((), excess) = crate::measure::measure_within(&budget, || {
+            vec.push(4).unwrap();
+            vec.extend_from_slice(&[5; 100]).unwrap();
+            vec.resize(300, 6).unwrap();
+            vec.fill(50, |room| room.extend_from_slice(&[7; 50]))
+                .unwrap();
+            assert!(vec.reserve_exact(usize::MAX - vec.len()).is_err());
+            assert_eq!(budget.used(), vec.capacity() * 8);
+            drop(vec);
+        });
+        assert_eq!((excess, budget.used()), (0, 0));
+        // The items keep their charge to the server once the last other holder of their
+        // budget is gone.
+        let server = SharedBudget::new(1 << 20);
+        let part = Arc::new(Budget::unlimited().within(Some(Arc::clone(&server))));
+        let (items, held) = ChargedVec::<u8>::with_capacity(part, 1_000)
+            .unwrap()
+            .into_parts();
+        assert_eq!(server.used(), 1_000);
+        drop(items);
+        drop(held);
+        assert_eq!(server.used(), 0);
+    }
 
     #[test]
     fn a_reservation_releases_what_it_holds_when_dropped() {
