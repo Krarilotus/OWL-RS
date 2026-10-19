@@ -45,6 +45,7 @@ pub mod workers;
 
 pub use budget::{
     Budget, BudgetExceeded, ChargedVec, Envelope, Gauge, Reservation, Room, Scratch, SharedBudget,
+    map_bytes,
 };
 
 /// The unit tests' allocator: the system's, counting what measured operations hold.

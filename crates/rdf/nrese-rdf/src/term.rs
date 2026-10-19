@@ -797,7 +797,52 @@ pub enum TermRef<'a> {
     Triple(&'a Triple),
 }
 
+impl NamedNode {
+    /// The bytes its IRI holds on the heap.
+    pub fn heap_bytes(&self) -> usize {
+        self.iri.capacity()
+    }
+}
+
+impl BlankNode {
+    /// The bytes its id holds on the heap.
+    pub fn heap_bytes(&self) -> usize {
+        self.id.capacity()
+    }
+}
+
+impl Literal {
+    /// The bytes its value, language or datatype hold on the heap.
+    pub fn heap_bytes(&self) -> usize {
+        self.value.capacity()
+            + match &self.kind {
+                Kind::Simple => 0,
+                Kind::Language(language) | Kind::DirectionalLanguage(language, _) => {
+                    language.capacity()
+                }
+                Kind::Typed(datatype) => datatype.heap_bytes(),
+            }
+    }
+}
+
 impl Term {
+    /// The bytes it holds on the heap: its strings' (a quoted triple's, boxed, too), for
+    /// memory budgets.
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Self::NamedNode(n) => n.heap_bytes(),
+            Self::BlankNode(b) => b.heap_bytes(),
+            Self::Literal(l) => l.heap_bytes(),
+            Self::Triple(t) => {
+                let subject = match &t.subject {
+                    NamedOrBlankNode::NamedNode(n) => n.heap_bytes(),
+                    NamedOrBlankNode::BlankNode(b) => b.heap_bytes(),
+                };
+                size_of::<Triple>() + subject + t.predicate.heap_bytes() + t.object.heap_bytes()
+            }
+        }
+    }
+
     pub fn as_ref(&self) -> TermRef<'_> {
         match self {
             Self::NamedNode(n) => TermRef::NamedNode(n.as_ref()),

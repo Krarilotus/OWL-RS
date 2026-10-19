@@ -171,12 +171,12 @@ impl Context<'_> {
                 .map_err(QueryEvaluationError::Service)?;
             // The endpoint's terms as canonical answers name them.
             let table = match &self.canonical {
-                None => import(&results, |term| self.id(term)),
+                None => import(&results, |term| self.id(term))?,
                 Some(names) => import(&results, |term| {
                     names
                         .id(term)
-                        .unwrap_or_else(|| self.id(&names.term(term.clone())))
-                }),
+                        .map_or_else(|| self.id(&names.term(term.clone())), Ok)
+                })?,
             };
             let solutions = self.produced(Solutions {
                 vars: results.variables,
@@ -193,16 +193,22 @@ impl Context<'_> {
 }
 
 /// The endpoint's rows as an id table, each term's id by `id`.
-fn import(results: &crate::ServiceResults, id: impl Fn(&Term) -> u64) -> IdTable {
+fn import(
+    results: &crate::ServiceResults,
+    id: impl Fn(&Term) -> NativeResult<u64>,
+) -> NativeResult<IdTable> {
     let mut table = IdTable::new(results.variables.len());
     let mut row = vec![UNDEF; results.variables.len()];
     for values in &results.rows {
         for (slot, value) in row.iter_mut().zip(values) {
-            *slot = value.as_ref().map_or(UNDEF, &id);
+            *slot = match value {
+                Some(term) => id(term)?,
+                None => UNDEF,
+            };
         }
         table.push_row(&row);
     }
-    table
+    Ok(table)
 }
 
 impl Context<'_> {
