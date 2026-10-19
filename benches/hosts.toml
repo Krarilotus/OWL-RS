@@ -115,6 +115,17 @@ queue = { dir = "S:/nrese-scratch/queue", repo = "S:/nrese-scratch/repo.git", re
 since = "2026-10-12"
 toolchain = "Rust 1.98.1 (MSVC); Windows 11"
 
+[host.khaleesi-wsl]
+# The WSL 2 distribution on khaleesi (the fleet's host khaleesi-wsl): the Linux endpoint of
+# khaleesi's 64 GiB, where the release gate's cases above the timed host's memory run on
+# office-pc's ELF binaries (release_gate.py jobs; native Windows can't run them: refused).
+os = "linux"
+machine = "AMD Ryzen 9 5950X, 32 threads, 64 GiB (khaleesi's, under WSL 2)"
+roles = ["measure"]
+has = []
+assets = false
+note = "khaleesi's owner rules apply (the same machine, khaleesi-guard.py's retreat); its own baseline, never compared with another host's"
+
 [host.gamergrill]
 ssh = "GamerGrill"
 hostname = "GamerGrill"
