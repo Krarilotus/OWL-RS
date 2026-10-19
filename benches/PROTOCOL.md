@@ -299,6 +299,15 @@ arises, the same for every side:
   successors against v2) decides them. Likewise a series reported in coarser steps (an older
   perf lab's open time in whole milliseconds, the EL classifier's phases to a tenth) is judged
   at its step: a difference of one step is no verdict (`release_gate.py quantum`).
+- *No thread started in a timed window.* Every revision's perf lab started a canceller thread
+  per run just before its timer, and the thread's start ran inside the timed call (1-5 µs on
+  microsecond queries, against 0.3-0.45 µs between the engines in a clean loop). One watchdog
+  thread for the whole process, started and running before any timing, armed before the timer
+  and disarmed after, replaces it: in the head's perf lab, and in v1.5's and main's at the gate's
+  build ([fast/patches/perf_lab_watchdog.py](fast/patches/perf_lab_watchdog.py), applied to the
+  revision's own source, the engine untouched; `BUILD.txt` and `CAPABILITIES` say so). The
+  report refuses sides timed differently; `test_perf_lab_timing.py` guards the window on every
+  side. `probes/timing-loop.py` measures what the loop adds.
 - *Nothing timed that the gate doesn't judge.* A gate's pass doesn't rerun a case past its
   limit (the frontier rerun: 226 s of a 1,018 s pass), and a case with a declared outcome (a
   known limit, whose status the gate checks but never times) runs in the first block only, two

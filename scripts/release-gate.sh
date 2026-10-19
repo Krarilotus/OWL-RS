@@ -100,6 +100,13 @@ build)
   # The source and build trees are this gate's own; the build is published under its identity.
   mkdir -p "$GATE/build" && src=$(worktree "$rev" "$GATE/build") || exit 2
   export CARGO_TARGET_DIR=$GATE/build/target-$(short "$rev")
+  # Every side's perf lab times alike: no thread started inside the timed window (the
+  # watchdog, applied to the revision's own perf lab source; the engine untouched; the patch
+  # is part of the build's identity, build_identity).
+  lab=$src/crates/nrese-store/examples/perf_lab/main.rs
+  [ -f "$lab" ] || lab=$src/crates/nrese-store/examples/perf_lab.rs
+  patched=$(py benches/fast/patches/perf_lab_watchdog.py "$lab")
+  case $patched in applied|present) timing=watchdog ;; *) timing=spawn ;; esac
   log "build $rev ($(cd "$src" && rustc -V 2>/dev/null))"
   part=$bin.partial-$$
   rm -rf "$part" && mkdir -p "$part/release/examples"
@@ -124,9 +131,10 @@ build)
   git grep -q -e '"--routes"' "$rev" -- crates/nrese-store/examples || routes=0
   git grep -q -e 'queries DIR is required' "$rev" -- crates/nrese-store/examples && empty=1
   git grep -q -e '"--batch"' "$rev" -- crates/nrese-store/examples && batch=1
-  printf 'routes=%s\nempty_queries=%s\nbatch=%s\n' "$routes" "$empty" "$batch" > "$part/CAPABILITIES"
+  printf 'routes=%s\nempty_queries=%s\nbatch=%s\ntiming=%s\n' "$routes" "$empty" "$batch" "$timing" > "$part/CAPABILITIES"
   echo "$rev" > "$part/REVISION"
   { echo "revision $rev"; (cd "$src" && rustc -V); echo "missing at this revision: ${missing[*]:-none}";
+    echo "measurement patch perf_lab_watchdog: $patched";
     cat "$part/CAPABILITIES"; } > "$part/BUILD.txt"
   (cd "$part" && find release -type f | sort | xargs sha256sum > SHA256SUMS)
   build_identity "$rev" > "$part/IDENTITY"
@@ -252,6 +260,7 @@ pass)
   [ -f "$tree/$MEASURE" ] && flags+=(--measure "$MEASURE")
   # Batched timing (perf_lab --batch) only when every side's perf lab has it (jobs: GATE_BATCH).
   [ "${GATE_BATCH:-0}" = 1 ] && flags+=(--batch)
+  flags+=(--timing "${timing:-spawn}")
   fast_env
   # A timed pass: prepared data only (fast.py refuses to make any while it times).
   export NRESE_TIMED_GATE=1
