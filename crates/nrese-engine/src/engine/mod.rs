@@ -362,6 +362,9 @@ struct Shared {
     /// `owl:sameAs`, when the inferred stack holds the closure over representatives
     /// ([`Engine::set_equality`]).
     equality: RwLock<Option<TermId>>,
+    /// What the canonical views versions keep are charged to
+    /// ([`Engine::set_canonical_view_budget`]).
+    views: RwLock<Arc<nrese_exec::Budget>>,
 }
 
 impl Shared {
@@ -371,6 +374,7 @@ impl Shared {
             Arc::clone(&self.dictionary),
             Arc::clone(&self.statistics),
             *self.equality.read(),
+            Arc::clone(&self.views.read()),
         )
     }
 
@@ -614,6 +618,7 @@ impl Engine {
             maintaining: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
             equality: RwLock::new(None),
+            views: RwLock::new(Arc::new(nrese_exec::Budget::unlimited())),
         });
         let worker = config
             .background_maintenance
@@ -653,6 +658,14 @@ impl Engine {
     /// reads the stacks as stored.
     pub fn set_equality(&self, same_as: Option<TermId>) {
         *self.inner.shared.equality.write() = same_as;
+    }
+
+    /// What the canonical views of versions are charged to while their versions keep them
+    /// (canonical equality answers; `Snapshot::with_canonical_equality`): unlimited unless
+    /// given one. A view the budget refuses is made for its reader alone, which charges it
+    /// ([`Snapshot::canonical_view_uncharged`]). Snapshots taken from now on use it.
+    pub fn set_canonical_view_budget(&self, budget: Arc<nrese_exec::Budget>) {
+        *self.inner.shared.views.write() = budget;
     }
 
     /// `owl:sameAs` if reads expand equality classes ([`Self::set_equality`]).

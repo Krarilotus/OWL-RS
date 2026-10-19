@@ -161,6 +161,10 @@ impl Context<'_> {
                 "a triple term the store holds names an identity other than its class's representative",
             ));
         }
+        // A view the store's view budget refused was made for this query: its own.
+        self.budget
+            .charge(self.snapshot.canonical_view_uncharged())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
         let rewrite = Rewrite { ctx: self, names };
         let form = match form {
             super::Form::Construct(template) => super::Form::Construct(std::borrow::Cow::Owned(

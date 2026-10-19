@@ -25,6 +25,7 @@ use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use hashbrown::HashMap;
+use nrese_exec::{Budget, Reservation};
 use parking_lot::Mutex;
 
 use super::{ReadModel, Stack, Version};
@@ -86,12 +87,19 @@ impl EqualityCell {
 /// only the classes.
 #[derive(Default)]
 pub(crate) struct CanonicalCache {
-    /// The canonical view under `owl:sameAs` ([`canonical_version`]); `None` where it is
-    /// the version itself.
-    view: Mutex<Option<(TermId, Option<Arc<Version>>)>>,
+    /// The canonical view under `owl:sameAs` ([`canonical_version`]), with what the view
+    /// budget holds for it; `None` where the view is the version itself.
+    view: Mutex<Option<(TermId, Option<Arc<KeptView>>)>>,
     /// Whether a triple term of the version names an alias under `owl:sameAs`
     /// (`Snapshot::triple_terms_name_aliases`).
     triple_terms: Mutex<Option<(TermId, bool)>>,
+}
+
+/// A canonical view kept for its version, and its charge to the view budget, released
+/// when the version (and so its cache) goes.
+struct KeptView {
+    version: Arc<Version>,
+    _held: Reservation,
 }
 
 impl std::fmt::Debug for CanonicalCache {
@@ -100,20 +108,64 @@ impl std::fmt::Debug for CanonicalCache {
     }
 }
 
+/// A canonical view ([`CanonicalCache::view`]).
+pub(crate) struct View {
+    pub(crate) version: Arc<Version>,
+    /// Its bytes where the view budget refused them: the view is then this reader's
+    /// alone, made for it, and the reader charges them.
+    pub(crate) uncharged: usize,
+}
+
 impl CanonicalCache {
-    /// The view canonical reads of `version` read under `same_as`, made once per version;
-    /// `None` where that is `version` itself.
-    pub(crate) fn view(version: &Arc<Version>, same_as: TermId) -> Option<Arc<Version>> {
-        if let Some((id, view)) = version.canonical.view.lock().as_ref()
+    /// The view canonical reads of `version` read under `same_as`; `None` where that is
+    /// `version` itself. Charged to `budget` before it is made, and kept for the version
+    /// with that charge, made once; where `budget` refuses it, made for this reader alone
+    /// and not kept ([`View::uncharged`]).
+    pub(crate) fn view(
+        version: &Arc<Version>,
+        same_as: TermId,
+        budget: &Arc<Budget>,
+    ) -> Option<View> {
+        if let Some((id, kept)) = version.canonical.view.lock().as_ref()
             && *id == same_as
         {
-            return view.clone();
+            return kept.as_ref().map(|kept| View {
+                version: Arc::clone(&kept.version),
+                uncharged: 0,
+            });
         }
         let classes = version.equality.classes(version, same_as);
+        let renamed = renamed_count(version, &classes);
+        if renamed == 0 {
+            *version.canonical.view.lock() = Some((same_as, None));
+            return None;
+        }
+        let mut held = Reservation::new(Arc::clone(budget));
+        let charged = held.charge(view_bytes(version, renamed)).is_ok();
         let canonical = version.equality.canonical(version, same_as);
-        let made = canonical_version(version, same_as, &classes, &canonical);
-        *version.canonical.view.lock() = Some((same_as, made.clone()));
-        made
+        let view = canonical_version(version, same_as, &classes, &canonical);
+        let bytes = view
+            .asserted
+            .runs()
+            .last()
+            .map_or(0, |run| run.memory_bytes() as usize);
+        if !charged {
+            return Some(View {
+                version: view,
+                uncharged: bytes,
+            });
+        }
+        // What the view keeps, its working memory gone.
+        let _ = held.resize(bytes);
+        let kept = Arc::new(KeptView {
+            version: Arc::clone(&view),
+            _held: held,
+        });
+        *version.canonical.view.lock() = Some((same_as, Some(kept)));
+        Some(View {
+            version: view,
+            uncharged: 0,
+        })
     }
 
     /// Whether a triple term of this cache's version names an alias under `same_as`
@@ -130,26 +182,17 @@ impl CanonicalCache {
     }
 }
 
-/// `version` as canonical reads read it (work package W4, stage C; canonical answers):
-/// its named graphs over representatives, as its default graph's closure is. A named-graph
-/// statement that names another identity of a class, in any position (the graph's name
-/// included), is replaced by its representatives' statement: one run of tombstones and
-/// inserts over the asserted stack, so that every read, whatever its access path, gives
-/// representatives. The default graph stays as it is (its canonical reads skip what isn't
-/// over representatives). `None` where no named-graph statement names an alias.
-///
-/// O(a log n + k log k) for a aliases and k such statements, or one scan of the named
-/// graphs where that is less. Like the classes, it is the version's, not a query's: no
-/// query's reservation holds it.
-fn canonical_version(
-    version: &Arc<Version>,
-    same_as: TermId,
-    classes: &Arc<Classes>,
-    canonical: &Arc<Classes>,
-) -> Option<Arc<Version>> {
+/// The named-graph statements of `version` that name another identity of a class than
+/// its representative, in any position (the graph's name included): seeks per alias, or
+/// one scan of the named graphs where that is less. A statement naming two aliases may
+/// come twice from the seeks.
+fn renamed_statements<'v>(
+    version: &'v Version,
+    classes: &'v Classes,
+) -> Box<dyn Iterator<Item = EncodedQuad> + 'v> {
     let asserted = &version.asserted;
     if asserted.layout() != crate::index::Layout::Quads || classes.aliases.is_empty() {
-        return None;
+        return Box::new(std::iter::empty());
     }
     let named = QuadPattern {
         subject: None,
@@ -158,44 +201,72 @@ fn canonical_version(
         graph: GraphSelector::AnyNamed,
     };
     let named_count = asserted.count_plan(&crate::quad::AccessPlan::for_pattern(&named));
-    let mut renamed: Vec<EncodedQuad> = Vec::new();
-    if (classes.aliases.len() as u64).saturating_mul(4) < named_count {
-        for &alias in classes.aliases.keys() {
-            let alias = TermId::from_raw(alias);
-            let patterns = [
-                QuadPattern {
-                    subject: Some(alias),
-                    ..named
-                },
-                QuadPattern {
-                    predicate: Some(alias),
-                    ..named
-                },
-                QuadPattern {
-                    object: Some(alias),
-                    ..named
-                },
-                QuadPattern {
-                    graph: GraphSelector::Exact(alias),
-                    ..named
-                },
-            ];
-            for pattern in &patterns {
-                renamed.extend(asserted.scan(pattern));
-            }
-        }
-        renamed.sort_unstable();
-        renamed.dedup();
-    } else {
-        renamed.extend(
+    if (classes.aliases.len() as u64).saturating_mul(4) >= named_count {
+        return Box::new(
             asserted
                 .scan(&named)
                 .filter(|quad| classes.names_alias(quad)),
         );
     }
-    if renamed.is_empty() {
-        return None;
-    }
+    Box::new(classes.aliases.keys().flat_map(move |&alias| {
+        let alias = TermId::from_raw(alias);
+        [
+            QuadPattern {
+                subject: Some(alias),
+                ..named
+            },
+            QuadPattern {
+                predicate: Some(alias),
+                ..named
+            },
+            QuadPattern {
+                object: Some(alias),
+                ..named
+            },
+            QuadPattern {
+                graph: GraphSelector::Exact(alias),
+                ..named
+            },
+        ]
+        .into_iter()
+        .flat_map(move |pattern| asserted.scan(&pattern))
+    }))
+}
+
+/// How many statements [`renamed_statements`] gives (at most), counted without keeping
+/// them.
+fn renamed_count(version: &Version, classes: &Classes) -> usize {
+    renamed_statements(version, classes).count()
+}
+
+/// What making the view of `version` for `renamed` statements holds at most: the
+/// statements and their renamed copies, and the run of both, one entry each per
+/// permutation of its layout.
+fn view_bytes(version: &Version, renamed: usize) -> usize {
+    let quad = std::mem::size_of::<EncodedQuad>();
+    let entry = quad + std::mem::size_of::<u64>();
+    let permutations = version.asserted.layout().permutations().len();
+    renamed.saturating_mul(2 * quad + 2 * entry * permutations)
+}
+
+/// `version` as canonical reads read it (work package W4, stage C; canonical answers):
+/// its named graphs over representatives, as its default graph's closure is. A named-graph
+/// statement that names another identity of a class ([`renamed_statements`]) is replaced
+/// by its representatives' statement: one run of tombstones and inserts over the asserted
+/// stack, so that every read, whatever its access path, gives representatives. The default
+/// graph stays as it is (its canonical reads skip what isn't over representatives).
+///
+/// O(a log n + k log k) for a aliases and k such statements, or one scan of the named
+/// graphs where that is less.
+fn canonical_version(
+    version: &Arc<Version>,
+    same_as: TermId,
+    classes: &Arc<Classes>,
+    canonical: &Arc<Classes>,
+) -> Arc<Version> {
+    let mut renamed: Vec<EncodedQuad> = renamed_statements(version, classes).collect();
+    renamed.sort_unstable();
+    renamed.dedup();
     let mut inserts: Vec<EncodedQuad> = renamed
         .iter()
         .map(|quad| {
@@ -207,8 +278,8 @@ fn canonical_version(
         .collect();
     inserts.sort_unstable();
     inserts.dedup();
-    Some(Arc::new(Version {
-        asserted: asserted.with_delta(&inserts, &renamed),
+    Arc::new(Version {
+        asserted: version.asserted.with_delta(&inserts, &renamed),
         inferred: version.inferred.clone(),
         revision: version.revision,
         dictionary_len: version.dictionary_len,
@@ -219,7 +290,7 @@ fn canonical_version(
         )),
         content: version.content,
         canonical: Default::default(),
-    }))
+    })
 }
 
 /// `owl:sameAs` classes of two or more identities.
