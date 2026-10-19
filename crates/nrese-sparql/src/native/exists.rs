@@ -366,8 +366,8 @@ impl Context<'_> {
     ) -> NativeResult<(Solutions, Expression, usize)> {
         let mut patterns = Vec::new();
         let plain = split(expression, &mut patterns, &mut |_| self.synthetic("exists"));
-        let yes = self.id(&Term::from(Literal::from(true)));
-        let no = self.id(&Term::from(Literal::from(false)));
+        let yes = self.id(&Term::from(Literal::from(true)))?;
+        let no = self.id(&Term::from(Literal::from(false)))?;
         for (variable, pattern) in &patterns {
             let mask = self.exists_mask(&solutions, pattern)?;
             let mut columns = std::mem::take(&mut solutions.table).into_columns();

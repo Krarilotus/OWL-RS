@@ -267,7 +267,11 @@ impl Context<'_> {
         let table = match part.computed.is_empty() {
             true => part.table.clone(),
             false => {
-                let ids: Vec<u64> = part.computed.iter().map(|term| self.id(term)).collect();
+                let ids: Vec<u64> = part
+                    .computed
+                    .iter()
+                    .map(|term| self.id(term))
+                    .collect::<NativeResult<_>>()?;
                 IdTable::from_columns(
                     part.table
                         .columns()

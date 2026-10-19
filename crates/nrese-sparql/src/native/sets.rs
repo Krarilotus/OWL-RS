@@ -505,10 +505,10 @@ impl Context<'_> {
                     computed
                         .iter()
                         .map(|group| match &group[position] {
-                            Agg::Id(id) => *id,
+                            Agg::Id(id) => Ok(*id),
                             Agg::Term(term) => self.id(term),
                         })
-                        .collect(),
+                        .collect::<NativeResult<_>>()?,
                 );
             }
             Ok(())

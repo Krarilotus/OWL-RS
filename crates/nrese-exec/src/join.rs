@@ -31,7 +31,7 @@ use rayon::prelude::*;
 
 use crate::search::partition_range_from;
 use crate::table::IdTable;
-use crate::{Budget, BudgetExceeded, ChargedVec, Reservation, Scratch, UNDEF};
+use crate::{Budget, BudgetExceeded, ChargedVec, Reservation, Scratch, UNDEF, map_bytes};
 
 type Hasher = foldhash::fast::FixedState;
 
@@ -544,23 +544,6 @@ struct BuildTable<'b> {
 }
 
 const END: u32 = u32::MAX;
-
-/// The most memory a hash map with room for `capacity` entries of `T` allocates (hashbrown's
-/// layout): buckets the power of two at or above 8/7 of it (at least 4, or 8), an entry and
-/// a control byte each, a group of control bytes more, and alignment.
-fn map_bytes<T>(capacity: usize) -> usize {
-    if capacity == 0 {
-        return 0;
-    }
-    let buckets = match capacity {
-        0..4 => 4,
-        4..8 => 8,
-        _ => (capacity.saturating_mul(8) / 7).next_power_of_two(),
-    };
-    buckets
-        .saturating_mul(size_of::<T>() + 1)
-        .saturating_add(2 * 16)
-}
 
 impl<'b> BuildTable<'b> {
     /// `build`'s rows that `include` keeps, chained by their key on `keys`.
