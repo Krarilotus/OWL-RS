@@ -418,6 +418,54 @@ fn probes_seek_forward_instead_of_from_the_root() {
     assert!(roots * 4 <= seeks, "{}", order.detail);
 }
 
+/// A selective join in a default graph merged from listed graphs (the dataset's `FROM`, a
+/// restricted reader's readable graphs) probes the index as one graph's does, not a
+/// scan of every graph's statements (GeoSPARQL over four graphs, `FROM` two of them: a
+/// 30 ms scan of the geometries' literals for a 1 ms join). Labels in four graphs, two read.
+#[test]
+fn joins_over_a_graph_set_probe_the_index() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let graph = |i: u32| GraphName::NamedNode(ex(&format!("g{}", i % 4)));
+    for i in 0..3000u32 {
+        let node = ex(&format!("n{i}"));
+        let next = ex(&format!("n{}", i + 1));
+        tx.insert(Quad::new(node.clone(), ex("knows"), next, graph(i)).as_ref());
+        let label = Literal::new_simple_literal(format!("label number {i}"));
+        tx.insert(Quad::new(node, ex("label"), label, graph(i)).as_ref());
+    }
+    tx.commit().unwrap();
+    let readable = nrese_sparql::GraphAccess {
+        graphs: vec![format!("{EX}g0"), format!("{EX}g1")],
+        ..Default::default()
+    };
+    for (from, options) in [
+        (
+            format!("FROM <{EX}g0> FROM <{EX}g1>"),
+            QueryOptions::default(),
+        ),
+        (
+            String::new(),
+            QueryOptions {
+                union_default_graph: true,
+                access: Some(std::sync::Arc::new(readable)),
+                ..QueryOptions::default()
+            },
+        ),
+    ] {
+        let text =
+            format!("SELECT * {from} WHERE {{ <{EX}n0> <{EX}knows> ?b . ?b <{EX}label> ?l }}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let plan = explain_query(&engine.snapshot(), &query, &options).unwrap();
+        let used: Vec<(&str, u64)> = plan
+            .steps
+            .iter()
+            .map(|s| (s.operator.as_str(), s.rows))
+            .collect();
+        assert!(used.contains(&("index join", 1)), "{text}: {used:?}");
+    }
+}
+
 /// Paths planned with the patterns they are joined to: a path from a constant that
 /// reaches few nodes goes first and the large pattern is probed from what it reaches,
 /// instead of the pattern being joined whole and the path after it.
