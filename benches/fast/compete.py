@@ -457,6 +457,17 @@ def compete(args) -> int:
     def save():
         (RESULTS / stamp / "compete.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
 
+    # Every image the comparisons' containers run, pinned before the first one (fast.pin_images);
+    # the suite's systems are pinned by the suite's own run.
+    wanted = [fast.rust_image()]
+    for case in cases:
+        for system, semantics in comparators(case, only):
+            if system in DL_SYSTEMS and semantics in ("dl", "el") and not args.counts_only:
+                wanted.append(fast.dl_image())
+            elif system == "nemo" and semantics == "custom" and not args.counts_only:
+                wanted.append(fast.hosts.image("nrese-bench/nemo"))
+    fast.pin_images(wanted)
+
     # Suite jobs, grouped: the cases on the same data and semantics load it once per system.
     groups: dict[tuple, dict] = {}
     expects: dict[str, dict] = {}

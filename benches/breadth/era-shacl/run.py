@@ -111,6 +111,7 @@ def steps(args) -> int:
     (out / "logs").mkdir(exist_ok=True)
     writer = kit.Writer(out / "results.csv", echo=print)
     runtime = kit.DockerRuntime(kit.SCRATCH, port=0)
+    runtime.pin([tag(e) for e in engines])  # the images built for this job, by their IDs from now
     pairs = [(d, s, e) for d in subsets for s in shapes for e in engines]
     plan = kit.interleaved(pairs, args.runs)
     entry = kit.stamp(out, sys.argv, [tag(e) for e in engines], [DATA / f"{d}.ttl" for d in subsets],

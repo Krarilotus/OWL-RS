@@ -9,10 +9,14 @@
 #   ns_shared KIND               a host-wide resource jobs share on purpose: data, cargo
 #   ns_network create NAME ROOT OWNER | rm NAME   a labelled `docker network` (swept like volumes)
 #   ns_dir BASE KIND ROOT        this job's own directory under a shared one (as ns.directory)
-#   ns_image TAG ROOT            the image ID the job runs for TAG: resolved (pulled if missing)
-#                                the first time the job uses it, that ID for the rest of the job
-#                                (ns.pin_image; the pins are the result's: ns_pins ROOT)
-#   ns_locked FILE CMD...        CMD under the host lock FILE (flock; else a lock directory)
+#   ns_pin_images ROOT TAG...    at the job's start, before its first timed step: every image its
+#                                measured containers will run, pulled if missing and resolved to
+#                                its ID for the whole job (ns.pin_images); fails, and the job
+#                                with it, if one can't be resolved
+#   ns_image TAG ROOT            the pinned ID to run; fails for a tag the job didn't pin (never
+#                                run by its tag). ns_pins ROOT: the pins, for the result
+#   ns_locked FILE CMD...        CMD under the host lock FILE: an OS lock the kernel releases when
+#                                its holder dies (flock; else suitekit/lock.py)
 #   ns_serialize NAME "$0" "$@"  the calling script, run again under the host lock NAME unless it
 #                                holds it (shared dataset preparation: one at a time per host)
 #   ns_clean ROOT [OWNER] [all]  removes this namespace's containers, volumes and networks: the
@@ -64,25 +68,33 @@ ns_dir() { printf '%s/%s/%s' "$1" "$(ns_slug "$2")" "$(ns_name dir "$3" | sed 's
 
 ns_lock_dir() { printf '%s' "${NRESE_LOCK_DIR:-$HOME/.nrese-locks}"; }
 
-# FILE CMD...: one holder at a time per host. flock(2) where there is one (Linux: the gate's and
-# the fleet's hosts; the same lock as ns.host_lock's); else a lock directory with its holder's pid,
-# taken over when that process is gone.
+NS_SUITE=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../benches/suite" && pwd)
+ns_python() { "${NRESE_PYTHON:-$(command -v python3 || command -v python)}" "$@"; }
+
+# FILE CMD...: one holder at a time per host, under an OS lock the kernel releases when its
+# holder dies (never a lock file or directory a crash leaves behind). flock(1) where there is one
+# (Linux: the gate's and the fleet's hosts; the same lock as suitekit/lock.py's); else (Git Bash)
+# suitekit/lock.py, CMD in a child shell given this shell's functions and the variables the caller
+# names in NS_LOCK_VARS.
 ns_locked() {
-  local file=$1 rc
+  local file=$1
   shift
   mkdir -p "$(dirname "$file")"
   if command -v flock >/dev/null 2>&1; then
     ( flock 9; "$@" ) 9>>"$file"
     return
   fi
-  until mkdir "$file.d" 2>/dev/null; do
-    kill -0 "$(cat "$file.d/pid" 2>/dev/null || echo 0)" 2>/dev/null || { rm -rf "$file.d"; continue; }
-    sleep 0.2
-  done
-  echo $$ > "$file.d/pid"
-  "$@"; rc=$?
-  rm -rf "$file.d"
-  return $rc
+  local sh=$BASH script vars=""
+  if command -v cygpath >/dev/null 2>&1; then  # Windows' paths for Windows' Python: one lock file
+    sh=$(cygpath -w "$BASH")
+    file=$(cygpath -w "$file")
+  fi
+  # shellcheck disable=SC2086
+  [ -z "${NS_LOCK_VARS:-}" ] || vars=$(declare -p ${NS_LOCK_VARS} 2>/dev/null)
+  script="$(declare -f)
+$vars
+$(printf '%q ' "$@")"
+  ns_python "$NS_SUITE/suitekit/lock.py" "$file" -- "$sh" -c "$script"
 }
 
 ns_serialize() {
@@ -98,22 +110,18 @@ ns_serialize() {
 ns_pins_file() { printf '%s/pins/%s.tsv' "$(ns_lock_dir)" "$(ns_namespace "$1")"; }
 ns_pins() { cat "$(ns_pins_file "$1")" 2>/dev/null; return 0; }
 
-ns_pin_locked() {  # TAG FILE
-  local id
-  id=$(awk -F'\t' -v t="$1" '$1 == t { print $2 }' "$2" 2>/dev/null)
-  if [ -z "$id" ]; then
-    ns_docker image inspect "$1" >/dev/null 2>&1 || ns_docker pull -q "$1" >/dev/null 2>&1 || { printf '%s' "$1"; return; }
-    id=$(ns_docker image inspect -f '{{.Id}}' "$1") || { printf '%s' "$1"; return; }
-    mkdir -p "$(dirname "$2")" && printf '%s\t%s\n' "$1" "$id" >> "$2"
-  fi
-  printf '%s' "$id"
+ns_pin_images() {  # ROOT TAG...
+  local root=$1
+  shift
+  ns_python "$NS_SUITE/suitekit/ns.py" pin "$(ns_checkout "$root")" "$@"
 }
 
 ns_image() {
   case $1 in sha256:*) printf '%s' "$1"; return ;; esac
-  local file
-  file=$(ns_pins_file "$2")
-  ns_locked "$file.lock" ns_pin_locked "$1" "$file"
+  local id
+  id=$(awk -F'\t' -v t="$1" '$1 == t { print $2 }' "$(ns_pins_file "$2")" 2>/dev/null | head -1)
+  [ -n "$id" ] || { echo "$1: not pinned at the job's start (ns_pin_images); never run by its tag" >&2; return 1; }
+  printf '%s' "$id"
 }
 
 ns_shared() {

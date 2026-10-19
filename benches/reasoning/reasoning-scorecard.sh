@@ -76,8 +76,8 @@ mkdir -p "$RESULTS" "$ORACLE_CACHE"
 # `peak_bytes N`. Returns the command's exit code; 124 means TIMEOUT_S ran out.
 measured() {
   local log=$1 image name rc=0
-  # The reasoner's image as the job first resolved it (ns_image): the same in every run of it.
-  image=$(ns_image "$2" "$NS_ROOT")
+  # The reasoner's image by the ID pinned at the start (ns_image): the same in every run of it.
+  image=$(ns_image "$2" "$NS_ROOT") || return 125
   name=$(ns_name "rsc-$$-$RANDOM" "$NS_ROOT")
   shift 2
   # --init: tini as PID 1 passes the timeout's SIGTERM on (a shell as PID 1 ignores it, and
@@ -198,7 +198,9 @@ run_jena() { # <dataset> <log> <profile>
 # Images and the NRESE build. What this run is about to pull is its to remove afterwards
 # (scripts/bench-cleanup.sh).
 remember_pulls "$ROOT/tmp/bench-pulled-images" "$RUST_IMAGE"
-RUST_IMAGE=$(ns_image "$RUST_IMAGE" "$NS_ROOT")
+# The Rust image first: the build and the timed runs of its binary use the one ID.
+ns_pin_images "$NS_ROOT" "$RUST_IMAGE" || exit 1
+RUST_IMAGE=$(ns_image "$RUST_IMAGE" "$NS_ROOT") || exit 1
 docker build -q -t nrese-bench/owlrl-oracle "$HERE/oracle" >/dev/null
 docker image inspect nrese-bench/jena:6.2.0 >/dev/null 2>&1 ||
   docker build -q -t nrese-bench/jena:6.2.0 "$HERE/../competitors/jena" >/dev/null
@@ -210,6 +212,18 @@ if [[ " $SYSTEMS " == *" nrese-v"* ]] && [ -z "${SKIP_BUILD:-}" ]; then
     -w /src "$RUST_IMAGE" cargo build --release --locked -p nrese-reasoner --example v2_closure \
     --target-dir /target >"$RESULTS/nrese-build.log" 2>&1
 fi
+# The reasoners' images, resolved to their IDs now, before anything is timed, and run by them
+# (ns_pin_images; measured runs ns_image): a tag that can't be resolved stops the scorecard here.
+tags=("$RUST_IMAGE")
+for system in $SYSTEMS; do
+  case $system in
+    oracle) tags+=(nrese-bench/owlrl-oracle) ;;
+    jena-owl-micro) tags+=(nrese-bench/jena-reasoner) ;;
+    nemo) tags+=(nrese-bench/nemo) ;;
+  esac
+done
+ns_pin_images "$NS_ROOT" "${tags[@]}" || exit 1
+ns_pins "$NS_ROOT" > "$RESULTS/images.tsv"
 
 CSV=$RESULTS/reasoning-scorecard.csv
 header="dataset,system,asserted,materialise_s,inferred,peak_mib,reference,precision,recall,explained,schema_precision,schema_recall,queries_correct"

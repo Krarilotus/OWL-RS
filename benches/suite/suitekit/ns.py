@@ -22,23 +22,33 @@ other's builds and one job's cleanup removed another's volumes (office-pc, 19 Oc
                          the datasets' and the fast suite's data volumes, the Cargo registry
     clean(root, owner, everything)   removes this namespace's containers, volumes and networks:
                          the checkout's own (or, `everything`, the whole job's), of one owner or all
-    host_lock(path)      one holder at a time per host (flock; else a lock directory, as ns.sh's)
-    pin_image(tag, root) the image ID the job runs for `tag`: resolved (pulled if missing) the
-                         first time the job uses it, that ID for the rest of the job, in every
-                         process and step of it (a retag can't change a running comparison);
-                         pinned(root) what it pinned, for the result
+    lock(path)           the host lock (lock.py: an OS lock the kernel releases when its holder
+                         dies); lock_dir() where the named ones live
+    pin_images(tags, root)   at the job's start, before its first timed step: every image its
+                         measured containers will run, pulled if missing and resolved to its ID,
+                         kept for the whole job (every later step reuses the ID, never resolves
+                         again). A tag that can't be resolved stops the job (ImageError).
+    image_id(tag, root)  the pinned ID to run; a tag the job didn't pin is an error, never run
+                         by its tag. pinned(root): the pins, for the result
     docker(argv)         runs Docker (NRESE_DOCKER names another executable: the tests' stub)
+
+    python ns.py pin ROOT TAG...    pin_images for a shell script (scripts/lib/ns.sh ns_pin_images)
 """
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import os
 import re
 import shutil
 import subprocess
-import time
+import sys
 from pathlib import Path
+
+try:
+    from .lock import lock
+except ImportError:  # run as a script, or imported beside it (runtime.py's scope entry)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from lock import lock
 
 LABEL_NS, LABEL_CHECKOUT, LABEL_OWNER = "nrese.ns", "nrese.checkout", "nrese.owner"
 SHARED = {"cargo": ("NRESE_CARGO_VOLUME", "nrese-cargo")}
@@ -133,38 +143,6 @@ def lock_dir() -> Path:
     return Path(os.environ.get("NRESE_LOCK_DIR") or Path.home() / ".nrese-locks")
 
 
-@contextlib.contextmanager
-def host_lock(path: Path | str):
-    """Holds the host lock `path` (the same as ns.sh's ns_locked on it): flock(2) where there is
-    one, else a lock directory beside it with the holder's pid."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        import fcntl
-    except ImportError:
-        fcntl = None
-    if fcntl is not None:
-        with open(path, "a") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
-        return
-    held = Path(f"{path}.d")
-    while True:
-        try:
-            held.mkdir()
-            break
-        except FileExistsError:
-            time.sleep(0.2)
-    (held / "pid").write_text(str(os.getpid()))
-    try:
-        yield
-    finally:
-        shutil.rmtree(held, ignore_errors=True)
-
-
 def pins_file(root: Path | str, environ: dict | None = None) -> Path:
     return lock_dir() / "pins" / f"{namespace(root, environ)}.tsv"
 
@@ -175,21 +153,46 @@ def pinned(root: Path | str, environ: dict | None = None) -> dict[str, str]:
     return dict(line.split("\t", 1) for line in lines if "\t" in line)
 
 
-def pin_image(tag: str, root: Path | str, environ: dict | None = None, run=None) -> str:
-    if tag.startswith("sha256:"):
-        return tag
+class ImageError(RuntimeError):
+    """An image the job can't run by ID: not resolvable at its start, or not pinned then."""
+
+
+def pin_images(tags, root: Path | str, environ: dict | None = None, run=None) -> dict[str, str]:
     run = run or docker
     path = pins_file(root, environ)
-    with host_lock(f"{path}.lock"):
-        found = pinned(root, environ).get(tag)
-        if found:
-            return found
-        if run(["image", "inspect", tag]).returncode != 0 and run(["pull", "-q", tag]).returncode != 0:
-            return tag  # neither here nor pullable: docker run says so
-        image = run(["image", "inspect", "-f", "{{.Id}}", tag]).stdout.strip()
-        if not image:
-            return tag
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8", newline="\n") as out:
-            out.write(f"{tag}\t{image}\n")
-        return image
+    with lock(f"{path}.lock"):
+        pins = pinned(root, environ)
+        new = {}
+        for tag in dict.fromkeys(t for t in tags if t and not t.startswith("sha256:")):
+            if tag in pins:
+                continue  # pinned at the job's start: the same ID for the whole job
+            if run(["image", "inspect", tag]).returncode != 0 and run(["pull", "-q", tag]).returncode != 0:
+                raise ImageError(f"{tag}: neither on this host nor pullable; the job stops before it times anything")
+            image = run(["image", "inspect", "-f", "{{.Id}}", tag]).stdout.strip()
+            if not image.startswith("sha256:"):
+                raise ImageError(f"{tag}: no image ID ({image!r}); the job stops before it times anything")
+            new[tag] = image
+        if new:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8", newline="\n") as out:
+                out.writelines(f"{tag}\t{image}\n" for tag, image in new.items())
+        return {**pins, **new}
+
+
+def image_id(tag: str, root: Path | str, environ: dict | None = None) -> str:
+    if tag.startswith("sha256:"):
+        return tag
+    found = pinned(root, environ).get(tag)
+    if not found:
+        raise ImageError(f"{tag}: not pinned at the job's start (ns.pin_images); never run by its tag")
+    return found
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "pin":
+        try:
+            pin_images(sys.argv[3:], sys.argv[2])
+        except ImageError as error:
+            sys.exit(str(error))
+    else:
+        sys.exit("usage: ns.py pin ROOT TAG...")
