@@ -43,6 +43,9 @@ effective_rustflags() {
   printf '%s' "$out"
 }
 
+# The gate's measurement patches (part of every build's identity), found from this file.
+GATE_PATCHES=${GATE_PATCHES:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/benches/fast/patches}
+
 build_identity() {
   local channel flags
   channel=$(git show "$1:rust-toolchain.toml" 2>/dev/null | sed -n 's/^channel *= *"\(.*\)"/\1/p')
@@ -59,6 +62,11 @@ build_identity() {
   esac
   echo "linker ${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:-cc} $(cc --version 2>/dev/null | head -1)"
   echo "profile release --locked"
+  # The measurement patches release-gate.sh applies to every side's perf lab source.
+  local patch
+  for patch in "$GATE_PATCHES"/*.py; do
+    [ -f "$patch" ] && echo "patch $(basename "$patch") $(sha256sum < "$patch" | cut -c1-16)"
+  done
   echo "layout ${2:-1}"
 }
 
@@ -81,7 +89,7 @@ publish() {
   build_verified "$dir" "$rev"
 }
 
-gate_lock() { NS_LOCK_VARS="GATE GATE_BIN" ns_locked "$GATE_BIN/.lock" "$@"; }
+gate_lock() { NS_LOCK_VARS="GATE GATE_BIN GATE_PATCHES" ns_locked "$GATE_BIN/.lock" "$@"; }
 
 # DIR: a reference from this gate, under the lock; fails when the build is gone (never made anew).
 stamp() { [ -d "$1/release" ] && mkdir -p "$1/.refs" && touch "$1/.refs/$(basename "$GATE")"; }
