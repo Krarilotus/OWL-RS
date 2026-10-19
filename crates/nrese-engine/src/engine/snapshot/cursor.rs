@@ -65,6 +65,7 @@ impl<'a> ProbeCursor<'a> {
     /// Calls `f` with each quad matching `pattern`: what
     /// [`Snapshot::quads_for_pattern_in`] yields, asserted matches first.
     pub fn for_each(&mut self, pattern: &QuadPattern, mut f: impl FnMut(EncodedQuad)) {
+        let pattern = &self.snapshot.read_pattern(self.model, pattern);
         if self.unseekable(pattern) {
             self.snapshot
                 .quads_for_pattern_in(self.model, pattern)
@@ -80,6 +81,7 @@ impl<'a> ProbeCursor<'a> {
 
     /// Whether some quad matches `pattern`: [`Snapshot::exists_in`].
     pub fn exists(&mut self, pattern: &QuadPattern) -> bool {
+        let pattern = &self.snapshot.read_pattern(self.model, pattern);
         if self.unseekable(pattern) {
             return self.snapshot.exists_in(self.model, pattern);
         }
@@ -100,6 +102,7 @@ impl<'a> ProbeCursor<'a> {
     /// The matches of `pattern` for planning: [`Snapshot::estimate_in`] (exact where no
     /// equality class is expanded), each run's range found from its finger.
     pub fn count(&mut self, pattern: &QuadPattern) -> u64 {
+        let pattern = &self.snapshot.read_pattern(self.model, pattern);
         if self.unseekable(pattern) {
             return self.snapshot.estimate_in(self.model, pattern);
         }
@@ -126,6 +129,7 @@ impl<'a> ProbeCursor<'a> {
     /// matches of `pattern`, ascending and distinct, where it is the pattern's only
     /// unbound position (the graph bound); `false`, nothing appended, otherwise.
     pub fn values(&mut self, pattern: &QuadPattern, component: usize, out: &mut Vec<u64>) -> bool {
+        let pattern = &self.snapshot.read_pattern(self.model, pattern);
         let GraphSelector::Exact(_) = pattern.graph else {
             return false;
         };
@@ -175,6 +179,7 @@ impl<'a> ProbeCursor<'a> {
     /// among the matches with every other bound position as in `pattern`. Read in an
     /// index order whose bound prefix ends with `component`, where the layout has one.
     pub fn seek(&mut self, pattern: &QuadPattern, component: usize) -> Seek {
+        let pattern = &self.snapshot.read_pattern(self.model, pattern);
         let plan = match self.unseekable(pattern) {
             true => None,
             false => self.leapfrog_plan(pattern, component),
