@@ -1350,6 +1350,64 @@ def file_digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+# One copy of a host's prepared data for every gate (NRESE_FAST_SHARED; release-gate.sh sets it):
+# each file under FAST_DATA lives once, read-only, as SHARED/blobs/<sha256>, hardlinked into each
+# gate's FAST_DATA, and SHARED/index/<generator>.json says which files a data file and its
+# sidecars were, so that the next gate links them in instead of generating them again (the data
+# is deterministic in the generator, perf_lab/generate.rs, and its parameters). Office kept a
+# 6.1 GB copy per gate name (19 Oct 2026).
+SHARED = Path(os.environ["NRESE_FAST_SHARED"]) if os.environ.get("NRESE_FAST_SHARED") else None
+
+
+def generator_key(root: Path = ROOT) -> str:
+    return file_digest(root / "crates" / "nrese-store" / "examples" / "perf_lab" / "generate.rs")[:16]
+
+
+def spec_files(path: Path) -> list[Path]:
+    """A data file and its sidecars (`FILE.*`: the generator's answers, commit files)."""
+    return [path, *sorted(p for p in path.parent.glob(path.name + ".*") if p.is_file())] if path.parent.is_dir() else [path]
+
+
+def adopt(path: Path, index: dict, shared: Path, data: Path) -> bool:
+    """Links `path` and its sidecars in from the shared blobs, if the index has them all."""
+    group = index.get(path.relative_to(data).as_posix())
+    if not group or path.exists():
+        return False
+    links = [(data / rel, shared / "blobs" / sha) for rel, sha in group.items()]
+    if not all(blob.is_file() for _, blob in links):
+        return False
+    for target, blob in links:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            os.link(blob, target)
+    return True
+
+
+def share(paths: list[Path], index: dict, shared: Path, data: Path) -> None:
+    """Each file of `paths` under `data` into the shared blobs (read-only), hardlinked back; the
+    index learns the group under its first file. A file on another filesystem stays unshared."""
+    group = {}
+    for path in paths:
+        if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(data.resolve()):
+            continue
+        sha = file_digest(path)
+        blob = shared / "blobs" / sha
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if not blob.exists():
+                os.link(path, blob)
+                os.chmod(blob, 0o444)
+            elif not os.path.samefile(blob, path):
+                linked = path.with_name(path.name + ".sharing")
+                os.link(blob, linked)
+                os.replace(linked, path)
+        except OSError:
+            continue
+        group[path.relative_to(data).as_posix()] = sha
+    if group:
+        index[next(iter(group))] = group
+
+
 def prepare(args) -> int:
     """`prepare`: the selected cases' data, generated once by this perf lab (NRESE_FAST_BIN:
     the harness revision's, for every side of a gate), and FAST_DATA/PREPARED.json: every file
@@ -1359,12 +1417,22 @@ def prepare(args) -> int:
         sys.exit("prepare is the native runtime's (a release gate's host)")
     cases = select(load_cases(), args)
     entries, failed = {}, {}
+    index_path = SHARED / "index" / f"{generator_key()}.json" if SHARED else None
+    index = json.loads(index_path.read_text(encoding="utf-8")) if index_path and index_path.is_file() else {}
+    adopted = 0
     for case in cases:
         try:
-            for spec in [case["data"], *([case["data_alt"]] if case.get("data_alt") else []), *case.get("extra", [])]:
+            specs = [case["data"], *([case["data_alt"]] if case.get("data_alt") else []), *case.get("extra", [])]
+            local = [Path(native(data_file(s))) for s in specs if s != "none" and not s.startswith("volume:")]
+            if SHARED:
+                adopted += sum(adopt(path, index, SHARED, FAST_DATA) for path in local)
+            for spec in specs:
                 ensure_data(spec)
             if case.get("reference") and not seed_from_inputs(case["reference"]):
                 raise RuntimeError(f"missing input: reference taxonomy {case['reference']}")
+            if SHARED:
+                for path in local + ([Path(native(case["reference"]))] if case.get("reference") else []):
+                    share(spec_files(path), index, SHARED, FAST_DATA)
             for path in input_files(case):
                 if not path.is_file():
                     raise RuntimeError(f"missing input: {path}")
@@ -1376,6 +1444,11 @@ def prepare(args) -> int:
         except Exception as error:  # a case without its data is reported, the others prepared
             failed[case["name"]] = str(error)[:300]
             print(f"NOT prepared {case['name']}: {failed[case['name']]}", flush=True)
+    if index_path:
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.with_suffix(".partial").write_text(json.dumps(index, indent=0), encoding="utf-8")
+        os.replace(index_path.with_suffix(".partial"), index_path)
+        print(f"shared data ({SHARED}): {adopted} data files linked in, not generated")
     manifest_path = FAST_DATA / PREPARED
     manifest_path.write_text(json.dumps({"git": manifest.git(ROOT), "binaries": binaries(),
                                          "cases": [c["name"] for c in cases if c["name"] not in failed],
