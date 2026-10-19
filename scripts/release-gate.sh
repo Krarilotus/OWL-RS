@@ -232,6 +232,8 @@ pass)
   [ "$routes" = 1 ] || flags+=(--no-routes)
   [ "$empty_queries" = 1 ] && flags+=(--empty-queries)
   fast_env
+  # A timed pass: prepared data only (fast.py refuses to make any while it times).
+  export NRESE_TIMED_GATE=1
   log "pass $n: $side $rev on the cases of $harness (${flags[*]})"
   (cd "$tree" && NRESE_FAST_BIN=$bin NRESE_FAST_REVISION=$rev \
      py benches/fast/fast.py run --reps 1 --label "gate-$n-$side" --cases "$(planned)" --out "$report" "${flags[@]}") \

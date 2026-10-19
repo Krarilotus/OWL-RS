@@ -75,7 +75,10 @@ mkdir -p "$RESULTS" "$ORACLE_CACHE"
 # Runs a command in a container: output to <log>, the container's peak memory appended as
 # `peak_bytes N`. Returns the command's exit code; 124 means TIMEOUT_S ran out.
 measured() {
-  local log=$1 image=$2 name=rsc-$$-$RANDOM rc=0
+  local log=$1 image name rc=0
+  # The reasoner's image as the job first resolved it (ns_image): the same in every run of it.
+  image=$(ns_image "$2" "$NS_ROOT")
+  name=$(ns_name "rsc-$$-$RANDOM" "$NS_ROOT")
   shift 2
   # --init: tini as PID 1 passes the timeout's SIGTERM on (a shell as PID 1 ignores it, and
   # the container then ran past its limit); -k: KILL if it still hasn't stopped.
@@ -195,6 +198,7 @@ run_jena() { # <dataset> <log> <profile>
 # Images and the NRESE build. What this run is about to pull is its to remove afterwards
 # (scripts/bench-cleanup.sh).
 remember_pulls "$ROOT/tmp/bench-pulled-images" "$RUST_IMAGE"
+RUST_IMAGE=$(ns_image "$RUST_IMAGE" "$NS_ROOT")
 docker build -q -t nrese-bench/owlrl-oracle "$HERE/oracle" >/dev/null
 docker image inspect nrese-bench/jena:6.2.0 >/dev/null 2>&1 ||
   docker build -q -t nrese-bench/jena:6.2.0 "$HERE/../competitors/jena" >/dev/null

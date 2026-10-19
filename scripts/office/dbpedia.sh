@@ -4,6 +4,9 @@
 #
 # Usage: scripts/office/dbpedia.sh   (downloads and filters DBpedia core into ~/nrese-bench/scratch/dbpedia)
 set -euo pipefail
+# Shared datasets are prepared one at a time per host (scripts/lib/ns.sh): again under the lock.
+. "$(cd "$(dirname "$0")/../.." && pwd)/scripts/lib/ns.sh"
+ns_serialize datasets "$0" "$@"
 dir=~/nrese-bench/scratch/dbpedia
 mkdir -p "$dir"
 cd "$dir"

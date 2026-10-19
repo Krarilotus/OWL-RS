@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import datetime
 import json
 import os
@@ -387,7 +388,10 @@ class Suite:
             return f"missing inputs: {', '.join(missing)} (prepare them on a machine with Docker)"
         self.say(f"preparing {plan.workload} {plan.tier}: {shell(plan.prepare)}")
         log = self.results / "logs" / f"prepare-{slug(plan.workload)}-{slug(plan.tier)}-{self.stamp}.log"
-        rc = self.host_command(plan.prepare, log)
+        # Shared datasets are prepared one at a time per host (the preparation scripts take the
+        # same lock: held here, they don't wait for themselves).
+        with ns.host_lock(ns.lock_dir() / "datasets.lock"), held_lock("datasets"):
+            rc = self.host_command(plan.prepare, log)
         self.made_files += missing
         still = self.data_missing(plan.all_inputs())
         return f"preparing the inputs failed; see {log}" if rc != 0 or still else None
@@ -796,7 +800,7 @@ class Suite:
             images.setdefault("alpine:latest", None)
         self.ensure_images(images)
         if self.manifest and self.args.runtime == "docker":
-            self.manifest.update(images=image_ids(list(images)))
+            self.manifest.update(images=image_ids(list(images)), pinned_images=ns.pinned(self.root))
         for key in dict.fromkeys(key for _, key, system, _ in chosen if isinstance(system, Nrese)):
             if not self.build_nrese(adapter(key)):
                 return 1
@@ -886,6 +890,17 @@ class Suite:
                 for image in list(self.made_images):
                     if self.runtime.attempt(checked, ["docker", "image", "rm", image]):
                         self.made_images.remove(image)
+
+
+@contextlib.contextmanager
+def held_lock(name: str):
+    """The scripts this process runs see the host lock `name` as held (scripts/lib/ns.sh)."""
+    key = "NS_HELD_" + re.sub(r"[^a-z0-9]", "_", name)
+    os.environ[key] = "1"
+    try:
+        yield
+    finally:
+        os.environ.pop(key, None)
 
 
 def images(argv: list[str], systems: dict, root: Path) -> int:

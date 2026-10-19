@@ -448,7 +448,9 @@ class DockerRuntime(Runtime):
         command = list(spec.command)
         if not spec.entrypoint:
             args += ["--entrypoint", command.pop(0)]
-        return args + [spec.image] + command
+        # The image by the ID the job first resolved its tag to (ns.pin_image): a retag while the
+        # job runs can't change what a later system or repetition runs.
+        return args + [ns.pin_image(spec.image, ROOT)] + command
 
     def remove(self, name: str):
         if name not in self.containers:

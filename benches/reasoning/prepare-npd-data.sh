@@ -49,11 +49,11 @@ EOF
 
 cleanup() {
   docker rm -f "$PG" "$ENDPOINT" > /dev/null 2>&1 || true
-  docker network rm "$NET" > /dev/null 2>&1 || true
+  ns_network rm "$NET" > /dev/null 2>&1 || true
 }
 trap cleanup EXIT
 cleanup
-docker network create "$NET" > /dev/null
+ns_network create "$NET" "$NS_ROOT" reasoning > /dev/null
 ns_run_args "$PG" "$NS_ROOT" reasoning
 docker run -d "${NS_ARGS[@]}" --network "$NET" -e POSTGRES_USER=npd -e POSTGRES_PASSWORD=npd \
   -e POSTGRES_DB=npd -v "$ABS/db:/dump:ro" "$POSTGRES" > /dev/null

@@ -38,7 +38,8 @@ def key(line):
     return (f[0], f[1])
 
 
-def run(cases, timeout, cpus, memory, name="nrese-dl-reference"):
+def run(cases, timeout, cpus, memory, name=None):
+    name = name or ns.name("dl-reference", ROOT)
     cases = pathlib.Path(cases).resolve()
     manifest = [l for l in lines(cases / "manifest.tsv") if not l.startswith("#")]
     results = cases / "results.tsv"
@@ -53,7 +54,7 @@ def run(cases, timeout, cpus, memory, name="nrese-dl-reference"):
         subprocess.run([ns.executable(), "rm", "-f", name], capture_output=True)
         subprocess.run(
             [ns.executable(), "run", "-d", *ns.name_args(name, ROOT, "reasoning"), f"--cpus={cpus}", "-m", memory,
-             "-v", f"{cases.as_posix()}:/work", IMAGE, "batch", "/work/manifest.rest.tsv",
+             "-v", f"{cases.as_posix()}:/work", ns.pin_image(IMAGE, ROOT), "batch", "/work/manifest.rest.tsv",
              "/work/results.part.tsv", "/work/tax", str(timeout)],
             check=True, capture_output=True)
         seen, last = 0, time.monotonic()

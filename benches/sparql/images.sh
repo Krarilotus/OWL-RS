@@ -10,12 +10,16 @@
 #   benches/sparql/images.sh unpack NAME.tar ROOTFS-DIR  there, for the rootfs runtime
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-BUILDER=sparql-capped
+. "$ROOT/scripts/lib/ns.sh"
+# This job's own builder (a buildx builder is a container: another job's is another's), removed
+# with the build.
+BUILDER=$(ns_name sparql-capped "$ROOT")
 lock=${NRESE_QUIET_DIR:-$HOME/.nrese-quiet-slot}
 case ${1:-} in millenniumdb|gcare) build=1 ;; *) build=0 ;; esac
 [ "$build" = 1 ] && while [ -d "$lock" ] && kill -0 "$(cat "$lock/pid" 2>/dev/null || echo 0)" 2>/dev/null; do
   echo "quiet slot held by $(cat "$lock/who" 2>/dev/null): waiting"; sleep 60
 done
+[ "$build" = 0 ] || trap 'docker buildx rm "$BUILDER" >/dev/null 2>&1 || true' EXIT
 [ "$build" = 0 ] || docker buildx inspect "$BUILDER" >/dev/null 2>&1 || docker buildx create --name "$BUILDER" --driver docker-container \
   --driver-opt cpuset-cpus=0-7 --driver-opt cpu-shares=2 --driver-opt memory=8g --driver-opt memory-swap=8g >/dev/null
 case ${1:-} in

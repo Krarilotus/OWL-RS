@@ -17,7 +17,7 @@
 # else; on a shared host other jobs run beside it (19 Oct 2026: one A-B-B-A job's cleanup
 # removed the others' build volumes, all named after the checkout directory `work`).
 #   own         containers and volumes of this namespace and checkout (--job: every checkout)
-#   sweep       labelled containers and volumes whose checkout no longer exists (its job ended
+#   sweep       labelled containers, volumes and networks whose checkout no longer exists (its job ended
 #               and fleet removed it), created more than NRESE_BENCH_VOLUME_AGE_H hours ago
 #               (default 6); unlabelled ones from before the labels are listed, never removed
 #   files       inferred-set dumps (*.inferred.nt) under benches/reasoning/results and
@@ -105,6 +105,10 @@ if command -v "${NRESE_DOCKER:-docker}" >/dev/null 2>&1 && ns_docker info >/dev/
   for volume in $(ns_docker volume ls -q --filter label=nrese.ns); do
     read -r checkout created < <(ns_docker volume inspect -f '{{index .Labels "nrese.checkout"}} {{.CreatedAt}}' "$volume")
     gone "$checkout" "$created" && run ns_volume rm "$volume"
+  done
+  for network in $(ns_docker network ls -q --filter label=nrese.ns); do
+    read -r checkout created < <(ns_docker network inspect -f '{{index .Labels "nrese.checkout"}} {{.Created}}' "$network")
+    gone "$checkout" "$created" && run ns_network rm "$network"
   done
   # Unlabelled leftovers of the names from before the namespaces: listed, never removed (one
   # may still belong to a job that started before them).

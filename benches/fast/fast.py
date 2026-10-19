@@ -65,6 +65,8 @@ CARGO_VOLUME = ns.shared("cargo")
 OWNER = "fast"
 # Its scratch in the shared fast volume.
 VOLUME_SCRATCH = f"/fast/scratch/{ns.name('scratch', ROOT)}"
+# The host lock under which shared fast data is made (generated or concatenated): one job at a time.
+FAST_LOCK = ns.lock_dir() / "fast-data.lock"
 SCRATCH = ROOT / "tmp" / "fast"
 BASELINES = Path(os.environ.get("NRESE_FAST_BASELINES") or ROOT / "benches" / "baselines" / "fast")
 # The full reports, outside git (the same path on the main and the office PC).
@@ -76,6 +78,12 @@ ENV = {**os.environ, "MSYS_NO_PATHCONV": "1"}
 def rust_image() -> str:
     channel = re.search(r'channel = "(.*)"', (ROOT / "rust-toolchain.toml").read_text()).group(1)
     return os.environ.get("RUST_IMAGE", f"rust:{channel}-bookworm")
+
+
+def pinned(tag: str) -> str:
+    """The image ID this job runs for `tag` (ns.pin_image: resolved once for the whole job; a
+    retag meanwhile can't change what a later case or side runs); the report records them."""
+    return ns.pin_image(tag, ROOT, run=docker)
 
 
 def host_path(path: Path) -> str:
@@ -217,7 +225,7 @@ def container(kind: str, cap_gb: float, command: list[str], env: dict | None = N
             "-v", f"{host_path(SCRATCH)}:/out"]
     for key, value in (env or {}).items():
         argv += ["-e", f"{key}={value}"]
-    argv += [rust_image(), *command]
+    argv += [pinned(rust_image()), *command]
     started = time.monotonic()
     try:
         done = docker(argv, timeout=timeout)
@@ -299,7 +307,7 @@ def build(args) -> int:
                    f"--memory={cap}g", f"--memory-swap={cap}g",
                    f"--cpus={jobs}", "-v", f"{host_path(ROOT)}:/src:ro", "-v", f"{TARGET_VOLUME}:/target",
                    "-v", f"{CARGO_VOLUME}:/usr/local/cargo/registry", "-e", "CARGO_TARGET_DIR=/target",
-                   "-e", f"CARGO_BUILD_JOBS={jobs}", "-e", f"NRESE_MEMORY_CAP_GB={cap}", "-w", "/src", rust_image(),
+                   "-e", f"CARGO_BUILD_JOBS={jobs}", "-e", f"NRESE_MEMORY_CAP_GB={cap}", "-w", "/src", pinned(rust_image()),
                    "bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked", "--quiet", *packages]
         print("build:", " ".join(packages), flush=True)
         done = docker(command, capture=False)
@@ -367,9 +375,11 @@ def ensure_data(spec: str) -> dict:
             if files(f"test -s {target}").returncode != 0:
                 raise RuntimeError(f"missing input: {spec} was not prepared (fast.py prepare)")
             return {}
-        # Into the shared volume whole: another job may be reading or writing the same file.
+        # Into the shared volume whole, one job at a time per host (FAST_LOCK): another job may
+        # be reading or making the same file.
         part = f"{target}.{ns.name('part', ROOT)}"
-        files(f"test -s {target} || {{ cat {parts} > {part} && mv -f {part} {target}; }}")
+        with ns.host_lock(FAST_LOCK):
+            files(f"test -s {target} || {{ cat {parts} > {part} && mv -f {part} {target}; }}")
         return {}
     path = data_file(spec)
     seed_from_inputs(path)
@@ -379,10 +389,23 @@ def ensure_data(spec: str) -> dict:
     if OPTIONS["prepared"]:
         raise RuntimeError(f"missing input: {spec} was not prepared (fast.py prepare)")
     kind, *params = spec.split()
-    print(f"  generating {path}", flush=True)
-    code, out, err, _ = container("gen", 8, [
-        "bash", "-c", f"/target/release/examples/perf_lab generate {kind} {path} {' '.join(params)} > {path}.expect.json"
-                      f" && cat {path}.expect.json"])
+    # One job at a time per host makes a shared file (FAST_LOCK), checked again under the lock;
+    # it is generated into this job's staging directory beside it (the same file system) and
+    # published whole: its side files and data first, the answers (.expect.json, what says a
+    # file is there) last. A reader never sees a half-written file under its name.
+    with ns.host_lock(FAST_LOCK):
+        found = files(f"cat {path}.expect.json")
+        if found.returncode == 0 and found.stdout.strip():
+            return json.loads(found.stdout)["expect"]
+        print(f"  generating {path}", flush=True)
+        folder, name = path.rsplit("/", 1)
+        stage = f"{folder}/.{ns.name('gen', ROOT)}"
+        script = (f"rm -rf {stage} && mkdir -p {stage} && /target/release/examples/perf_lab generate {kind} "
+                  f"{stage}/{name} {' '.join(params)} > {stage}/{name}.expect.json"
+                  f" && for f in {stage}/{name}.*; do case $f in *.expect.json) ;; *) mv -f $f {folder}/ ;; esac; done"
+                  f" && mv -f {stage}/{name} {path} && mv -f {stage}/{name}.expect.json {path}.expect.json"
+                  f" && rm -rf {stage} && cat {path}.expect.json")
+        code, out, err, _ = container("gen", 8, ["bash", "-c", script])
     if code != 0:
         raise RuntimeError(f"generating {spec} failed: {err[-500:]}")
     return json.loads(out)["expect"]
@@ -410,7 +433,7 @@ def ensure_ore(name: str):
     script = (f"mkdir -p /fast/ore && cp /ore/{name}.owl /fast/ore/{name}.owl && "
               f"printf '{name}\\tconvert\\tntriples\\t/fast/ore/{name}.owl\\n' > /fast/ore/{name}.manifest.tsv")
     docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "-v", f"{host_path(ORE_DIR)}:/ore:ro", "alpine", "sh", "-c", script])
-    docker(["run", "--rm", "--memory=10g", "-v", f"{DATA_VOLUME}:/fast", dl_image(), "batch",
+    docker(["run", "--rm", "--memory=10g", "-v", f"{DATA_VOLUME}:/fast", pinned(dl_image()), "batch",
             f"/fast/ore/{name}.manifest.tsv", f"/fast/ore/{name}.results.tsv", "/fast/ore", "600"], timeout=900)
     files(f"rm -f /fast/ore/{name}.owl /fast/ore/{name}.manifest.tsv /fast/ore/{name}.results.tsv")
     if files(f"test -s {target}").returncode != 0:
@@ -1253,6 +1276,10 @@ def run(args) -> int:
     cases = select(catalog, args)
     OPTIONS.update(prepared=getattr(args, "prepared", False), routes=not getattr(args, "no_routes", False),
                    empty_queries=getattr(args, "empty_queries", False))
+    # A timed gate's pass (scripts/release-gate.sh sets NRESE_TIMED_GATE) reads prepared data
+    # only: it never makes data while it times (fast.py prepare does, before any pass).
+    if os.environ.get("NRESE_TIMED_GATE") == "1" and not OPTIONS["prepared"]:
+        sys.exit("a timed gate's pass reads prepared data only: fast.py prepare first, then run --prepared")
     prepared = None
     if OPTIONS["prepared"]:
         prepared = prepared_inputs(cases)
@@ -1317,6 +1344,8 @@ def run(args) -> int:
     if prepared:
         # The prepared data must be what it was at the start of the pass, file by file.
         report["prepared"]["changed"] = changed_inputs(prepared["files"])
+    if RUNTIME != "native":
+        report["images"] = ns.pinned(ROOT)  # what the cases ran: the job's image IDs
     report["finished_ns"] = time.time_ns()
     report["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
     report["duration_s"] = round((datetime.datetime.now() - started).total_seconds(), 1)

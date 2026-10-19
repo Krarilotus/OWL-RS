@@ -124,7 +124,7 @@ def run_driver(name: str, work: Path, data: Path, log: Path, timeout_s: int) -> 
                "-u", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp"]
     for m in spec.mounts:
         command += ["-v", f"{m.source}:{m.target}{':ro' if m.readonly else ''}"]
-    command += [spec.image, *spec.command]
+    command += [ns.pin_image(spec.image, ROOT), *spec.command]
     with open(log, "w", encoding="utf-8") as out:
         try:
             return subprocess.run(command, stdout=out, stderr=subprocess.STDOUT, timeout=timeout_s).returncode
