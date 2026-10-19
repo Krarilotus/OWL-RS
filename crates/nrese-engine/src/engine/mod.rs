@@ -173,14 +173,14 @@ impl CommitRecord {
     }
 
     /// The statements the record adds or removes, in either stack, as (subject,
-    /// predicate, object): what the full-text corpora look at again (`corpora`).
-    pub(crate) fn touched(&self) -> Vec<(TermId, TermId, TermId)> {
+    /// predicate, object): what the full-text corpora look at again (`corpora`). Read in
+    /// place: a commit copies none of them.
+    pub(crate) fn touched(&self) -> impl Iterator<Item = (TermId, TermId, TermId)> + Clone + '_ {
         let quads = self.inserts.iter().chain(&self.deletes);
         let triples = self.inferred_inserts.iter().chain(&self.inferred_deletes);
         quads
             .map(|quad| (quad.subject, quad.predicate, quad.object))
             .chain(triples.map(|triple| (triple.subject, triple.predicate, triple.object)))
-            .collect()
     }
 
     /// Whether the record puts a quad in a named graph: then a default-graph asserted stack

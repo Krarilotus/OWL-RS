@@ -62,7 +62,9 @@ use nrese_engine::{GraphSelector, QuadPattern, TermId, TextQuery, TextScope};
 use nrese_rdf::{Literal, Term, Variable, vocab::rdf};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 
-use nrese_exec::IdTable;
+use std::sync::Arc;
+
+use nrese_exec::{IdTable, Reservation};
 
 use super::{Context, GraphScope, NativeResult, Solutions};
 
@@ -396,31 +398,37 @@ impl Context<'_> {
 
     /// The graphs whose literals a search in the active graph ranks among: the active
     /// graph, the merge the default graph is, or the named graphs `GRAPH ?g` may bind
-    /// (`None`: none).
-    fn text_scope(&self) -> Option<TextScope> {
-        Some(match &*self.graph.borrow() {
-            GraphScope::Default => TextScope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
-            GraphScope::Named(g) => TextScope::Graphs(GraphSelector::Exact(*g)),
+    /// (`None`: none). A list of graphs is a copy charged to the query's budget first, with
+    /// its reservation (bound before it, so that it goes after the copy); the engine sorts
+    /// it where needed.
+    #[allow(clippy::type_complexity)]
+    fn text_scope(&self) -> NativeResult<Option<(Option<Reservation>, TextScope)>> {
+        let copy = |graphs: &Vec<TermId>| -> NativeResult<(Option<Reservation>, TextScope)> {
+            let copy = nrese_exec::ChargedVec::collect(
+                Arc::clone(&self.budget),
+                graphs.len(),
+                graphs.iter().copied(),
+            )
+            .map_err(crate::QueryEvaluationError::MemoryLimit)?;
+            let (graphs, charge) = copy.into_parts();
+            Ok((Some(charge), TextScope::Merge(graphs)))
+        };
+        let plain = |scope| Ok(Some((None, scope)));
+        match &*self.graph.borrow() {
+            GraphScope::Default => plain(TextScope::Graphs(GraphSelector::Exact(
+                TermId::DEFAULT_GRAPH,
+            ))),
+            GraphScope::Named(g) => plain(TextScope::Graphs(GraphSelector::Exact(*g))),
             GraphScope::Variable(_) => match &self.named {
-                Some(named) => {
-                    let mut named = named.clone();
-                    named.sort_unstable();
-                    named.dedup();
-                    TextScope::Merge(named)
-                }
-                None => TextScope::Graphs(GraphSelector::AnyNamed),
+                Some(named) => copy(named).map(Some),
+                None => plain(TextScope::Graphs(GraphSelector::AnyNamed)),
             },
             GraphScope::Union => match &self.merge_set {
-                Some(graphs) => {
-                    let mut graphs = graphs.clone();
-                    graphs.sort_unstable();
-                    graphs.dedup();
-                    TextScope::Merge(graphs)
-                }
-                None => TextScope::Graphs(GraphSelector::Any),
+                Some(graphs) => copy(graphs).map(Some),
+                None => plain(TextScope::Graphs(GraphSelector::Any)),
             },
-            GraphScope::Missing => return None,
-        })
+            GraphScope::Missing => Ok(None),
+        }
     }
 
     /// The literals `search` matches, with their relevance and rank.
@@ -433,14 +441,16 @@ impl Context<'_> {
         let mut rank = 0usize;
         // Every match is the object of a statement the query's snapshot shows in the
         // scope: no probe per match. Building the corpus is charged to the query's budget.
-        let found = match self.text_scope() {
-            Some(scope) => self
-                .snapshot
-                .text_search_in(self.model, &scope, &search.query, Some(&self.budget))
-                .map_err(crate::QueryEvaluationError::MemoryLimit)?,
-            None => Vec::new(),
+        // The matches, charged to it too while they are read (none: no graph in scope).
+        let found = match self.text_scope()? {
+            Some((_charge, scope)) => Some(
+                self.snapshot
+                    .text_search_in(self.model, &scope, &search.query, Some(&self.budget))
+                    .map_err(crate::QueryEvaluationError::MemoryLimit)?,
+            ),
+            None => None,
         };
-        for found in found {
+        for &found in found.iter().flatten() {
             if search
                 .min_relevance
                 .is_some_and(|min| found.relevance < min)

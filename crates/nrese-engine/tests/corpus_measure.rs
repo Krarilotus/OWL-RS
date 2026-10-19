@@ -109,3 +109,101 @@ fn a_small_walk_reserves_for_its_own_slices() {
     });
     assert_eq!(size.map(|(documents, _)| documents), Ok(1));
 }
+
+/// Finding a kept corpus copies nothing uncharged: the scope is compared as the caller
+/// wrote it, copied (charged) only where it isn't sorted, and the key is cloned only for a
+/// new entry (the review's case of 19 October: 131,072 bytes for an 8,192-graph scope).
+#[test]
+fn a_kept_corpus_is_found_without_uncharged_copies() {
+    if !alone() {
+        return;
+    }
+    let envelope = Envelope::unlimited();
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    engine.set_text_corpus_budget(envelope.part());
+    let mut tx = engine.transaction();
+    for g in 0..8192 {
+        tx.insert(
+            Quad::new(
+                NamedNode::new_unchecked("http://example.com/s"),
+                NamedNode::new_unchecked("http://example.com/p"),
+                Literal::new_simple_literal(format!("word{g}")),
+                NamedNode::new_unchecked(format!("http://example.com/g{g}")),
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let mut graphs: Vec<_> = (0..8192)
+        .map(|g| {
+            let graph = NamedNode::new_unchecked(format!("http://example.com/g{g}"));
+            snapshot.lookup(graph.as_ref().into()).unwrap()
+        })
+        .collect();
+    graphs.sort_unstable();
+    let sorted = TextScope::Merge(graphs.clone());
+    graphs.reverse();
+    let unsorted = TextScope::Merge(graphs);
+    let model = ReadModel::Materialised;
+    snapshot
+        .text_corpus_size(model, &sorted, false, None)
+        .unwrap();
+    for scope in [&sorted, &unsorted] {
+        let request = Arc::new(envelope.part());
+        let (size, excess) = measure_within(&envelope, || {
+            snapshot
+                .text_corpus_size(model, scope, false, Some(&request))
+                .unwrap()
+        });
+        assert_eq!(size.0, 8192);
+        assert_eq!(excess, 0);
+    }
+}
+
+/// Scoring holds nothing uncharged: postings (of a word, a prefix's words, a fuzzy word's),
+/// a phrase's checks, the exclusions, the merge, the matches (held, then dropped) are all
+/// charged to the search's budget first (the review's case of 19 October: 745,637 bytes for
+/// a warm search of 8,192 documents, and nothing charged).
+#[test]
+fn scoring_is_charged_before_it_is_allocated() {
+    if !alone() {
+        return;
+    }
+    let envelope = Envelope::unlimited();
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    engine.set_text_corpus_budget(envelope.part());
+    let mut tx = engine.transaction();
+    for i in 0..8192 {
+        tx.insert(
+            Quad::new(
+                NamedNode::new_unchecked(format!("http://example.com/s{i}")),
+                NamedNode::new_unchecked("http://example.com/p"),
+                Literal::new_simple_literal(format!("Alpha beta item{i}")),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let query = nrese_engine::TextQuery {
+        text: "\"alpha beta\" alph* betta~1 -item7".to_owned(),
+        all_words: true,
+        prefix: false,
+        stem: None,
+    };
+    let (model, every) = (ReadModel::Materialised, TextScope::EVERY);
+    snapshot
+        .text_search_in(model, &every, &query, None)
+        .unwrap();
+    let request = Arc::new(envelope.part());
+    let (found, excess) = measure_within(&envelope, || {
+        let matches = snapshot
+            .text_search_in(model, &every, &query, Some(&request))
+            .unwrap();
+        matches.len()
+    });
+    assert_eq!(found, 8191);
+    assert_eq!(excess, 0);
+}

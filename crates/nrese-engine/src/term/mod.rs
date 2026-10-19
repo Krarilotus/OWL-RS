@@ -24,7 +24,7 @@ mod vocabulary_study;
 
 pub use dictionary::{Dictionary, DictionaryStats, TermView};
 pub use strings::{Placement, StringScan, StringTest};
-pub use text::{TextMatch, TextQuery};
+pub use text::{TextMatch, TextMatches, TextQuery};
 pub use vectors::{VectorQuery, VectorSearchReport, VectorStrategy};
 
 /// Number of bits used by the payload of a [`TermId`].

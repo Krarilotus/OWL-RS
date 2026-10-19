@@ -304,6 +304,17 @@ impl Inner {
         self.base.as_ref().map_or(0, |base| base.len)
     }
 
+    /// The most bytes [`Self::key`] allocates for entry `index`: a compressed base key's
+    /// decoding (its codec's bound, and the block it grows from); others are read in place.
+    fn key_bytes(&self, index: u64) -> usize {
+        match &self.base {
+            Some(base) if index < base.len && base.codec.is_some() => {
+                base.key(index).len() * 24 + 64
+            }
+            _ => 0,
+        }
+    }
+
     fn len(&self) -> u64 {
         self.heap.start + self.heap.len()
     }
@@ -995,29 +1006,39 @@ impl Dictionary {
     }
 
     /// The string literals of `corpus` matching `query`, best first; the index covers the
-    /// corpus's entries ([`Self::cover_text`] first). One thread, under the locks.
+    /// corpus's entries ([`Self::cover_text`] first). One thread, under the locks; what the
+    /// search holds charged to `budget` ([`super::text::TextIndex::search`]).
     pub(crate) fn text_search(
         &self,
         query: &super::TextQuery,
         corpus: &super::text::Corpus,
-    ) -> Vec<super::TextMatch> {
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+    ) -> Result<super::TextMatches, nrese_exec::BudgetExceeded> {
         self.prepare_stems(&self.text, query);
         let text = self.text.read();
         let inner = self.inner.read();
-        let text_of = |index: u64| match view_key(&inner.key(index)) {
-            TermView::String(value) | TermView::LangString { value, .. } => Some(value.to_owned()),
-            _ => None,
+        let text_of = |index: u64, visit: &mut dyn FnMut(&str)| {
+            let mut decoding = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+            decoding.charge(inner.key_bytes(index))?;
+            if let TermView::String(value) | TermView::LangString { value, .. } =
+                view_key(&inner.key(index))
+            {
+                visit(value);
+            }
+            Ok(())
         };
         // Matches are entry numbers: as ids, by the entry's kind.
-        let mut matches = text.search(query, corpus, &text_of);
-        for found in &mut matches {
+        let mut matches = text.search(query, corpus, &text_of, budget)?;
+        for found in matches.iter_mut() {
+            let mut decoding = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+            decoding.charge(inner.key_bytes(found.id))?;
             let kind = match view_key(&inner.key(found.id)) {
                 TermView::LangString { .. } => TermKind::LangString,
                 _ => TermKind::String,
             };
             found.id = TermId::new(kind, found.id).raw();
         }
-        matches
+        Ok(matches)
     }
 
     /// The vector literals nearest to `query.vector` among the first `known` entries that
@@ -1104,19 +1125,29 @@ impl Dictionary {
         &self,
         query: &super::TextQuery,
         corpus: &super::text::Corpus,
-    ) -> Vec<super::TextMatch> {
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+    ) -> Result<super::TextMatches, nrese_exec::BudgetExceeded> {
         self.prepare_stems(&self.iri_text, query);
         let text = self.iri_text.read();
         let inner = self.inner.read();
-        let text_of = |index: u64| match view_key(&inner.key(index)) {
-            TermView::Iri(iri) => super::text::local_name_text(iri),
-            _ => None,
+        let text_of = |index: u64, visit: &mut dyn FnMut(&str)| {
+            let mut decoding = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+            decoding.charge(inner.key_bytes(index))?;
+            if let TermView::Iri(iri) = view_key(&inner.key(index)) {
+                // Its local name's words, and the name whole: within twelve bytes of its own.
+                let mut naming = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+                naming.charge(iri.len() * 12 + 64)?;
+                if let Some(text) = super::text::local_name_text(iri) {
+                    visit(&text);
+                }
+            }
+            Ok(())
         };
-        let mut matches = text.search(query, corpus, &text_of);
-        for found in &mut matches {
+        let mut matches = text.search(query, corpus, &text_of, budget)?;
+        for found in matches.iter_mut() {
             found.id = TermId::new(TermKind::Iri, found.id).raw();
         }
-        matches
+        Ok(matches)
     }
 
     /// The ids of the entries `0..limit` whose text passes `test`, sorted: one parallel

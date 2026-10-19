@@ -1466,23 +1466,32 @@ impl Snapshot {
     /// literals alone ([`Self::text_corpus`]): no literal outside them (another version's,
     /// an open transaction's, a graph's outside the scope, one no visible statement has)
     /// changes a score. What building the corpus takes is charged to `budget` while the
-    /// search holds it (the request's; `None`: unbounded); a kept corpus is the engine's.
+    /// search holds it (the request's; `None`: unbounded), and what scoring takes, the
+    /// matches until they drop; a kept corpus is the engine's.
     pub fn text_search_in(
         &self,
         model: ReadModel,
         scope: &TextScope,
         query: &crate::TextQuery,
         budget: Option<&Arc<nrese_exec::Budget>>,
-    ) -> Result<Vec<crate::TextMatch>, nrese_exec::BudgetExceeded> {
+    ) -> Result<crate::TextMatches, nrese_exec::BudgetExceeded> {
+        let unbounded;
+        let request = match budget {
+            Some(budget) => budget,
+            None => {
+                unbounded = Arc::new(nrese_exec::Budget::unlimited());
+                &unbounded
+            }
+        };
         // The index first, then the corpus, then the search: no lock held across another's
         // parallel parts ([`Dictionary::cover_text`](crate::Dictionary)).
         self.dictionary.cover_text(false);
-        let corpus = self.text_corpus(Documents::Literals, model, scope, budget)?;
-        Ok(self.dictionary.text_search(query, &corpus))
+        let corpus = self.text_corpus(Documents::Literals, model, scope, Some(request))?;
+        self.dictionary.text_search(query, &corpus, request)
     }
 
     /// [`Self::text_search_in`] over every graph, asserted and inferred.
-    pub fn text_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
+    pub fn text_search(&self, query: &crate::TextQuery) -> crate::TextMatches {
         self.text_search_in(ReadModel::Materialised, &TextScope::EVERY, query, None)
             .expect("no budget to exceed")
     }
@@ -1521,10 +1530,18 @@ impl Snapshot {
         scope: &TextScope,
         query: &crate::TextQuery,
         budget: Option<&Arc<nrese_exec::Budget>>,
-    ) -> Result<Vec<crate::TextMatch>, nrese_exec::BudgetExceeded> {
+    ) -> Result<crate::TextMatches, nrese_exec::BudgetExceeded> {
+        let unbounded;
+        let request = match budget {
+            Some(budget) => budget,
+            None => {
+                unbounded = Arc::new(nrese_exec::Budget::unlimited());
+                &unbounded
+            }
+        };
         self.dictionary.cover_text(true);
-        let corpus = self.text_corpus(Documents::Subjects, model, scope, budget)?;
-        Ok(self.dictionary.iri_search(query, &corpus))
+        let corpus = self.text_corpus(Documents::Subjects, model, scope, Some(request))?;
+        self.dictionary.iri_search(query, &corpus, request)
     }
 
     /// The full-text corpora this snapshot's engine keeps, and how many were built by a
@@ -1606,16 +1623,19 @@ impl Snapshot {
                 &unbounded
             }
         };
-        let scope = scope.normalised();
+        // Copied only where it isn't written the one way yet, charged then; the charge
+        // bound first, as bindings drop in reverse: the copy goes before its charge.
+        let (_scope_charge, scope) = scope.normalised(request)?;
+        let scope = &*scope;
         let store = &self.statistics.corpora;
-        let kind = (
+        let kind = super::corpora::KindRef {
             documents,
             model,
-            scope.clone(),
-            self.equality,
-            self.canonical,
-        );
-        let (from, keep) = match store.find(&self.version, &kind, request)? {
+            scope,
+            equality: self.equality,
+            canonical: self.canonical,
+        };
+        let (from, keep) = match store.find(&self.version, kind, request)? {
             Found::Kept(corpus) => return Ok(CorpusRef::Kept(corpus)),
             Found::Build { from, keep } => (from, keep),
         };
@@ -1632,7 +1652,7 @@ impl Snapshot {
                     nrese_exec::ChargedVec::with_capacity(Arc::clone(request), touched.len())?;
                 for id in touched.iter().copied().map(TermId::from_raw) {
                     if documents.holds(id.kind()) && id.payload() < span {
-                        let used = self.uses(model, &scope, documents, id);
+                        let used = self.uses(model, scope, documents, id);
                         changes.push((id.payload(), used))?;
                     }
                 }
@@ -1642,14 +1662,14 @@ impl Snapshot {
             }
             None => {
                 store.built(false);
-                self.walk_corpus(documents, model, &scope, request)?
+                self.walk_corpus(documents, model, scope, request)?
             }
         };
         // Kept: built on the store's budget. Else the search's, on its own.
         let (_, bytes) = Corpus::finished_bytes(built.documents, span);
         let kept = keep
             .then(|| {
-                store.keep_built(&self.version, &kind, bytes, |budget| {
+                store.keep_built(&self.version, kind, bytes, |budget| {
                     Corpus::finish(&built, span, budget)
                 })
             })
@@ -1865,20 +1885,42 @@ impl TextScope {
     pub const EVERY: Self = Self::Graphs(GraphSelector::Any);
 
     /// The same graphs, written one way: a merge sorted and without repeats, a merge of one
-    /// graph as that graph (so scopes of equal graph sets share a corpus).
-    fn normalised(&self) -> Self {
-        match self {
-            Self::Merge(graphs) => {
-                let mut graphs = graphs.clone();
-                graphs.sort_unstable();
-                graphs.dedup();
-                match graphs[..] {
-                    [graph] => Self::Graphs(GraphSelector::Exact(graph)),
-                    _ => Self::Merge(graphs),
-                }
-            }
-            graphs => graphs.clone(),
+    /// graph as that graph (so scopes of equal graph sets share a corpus). This scope where
+    /// it is written so; else a copy, charged to `budget` first (its reservation first).
+    fn normalised(
+        &self,
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<
+        (Option<nrese_exec::Reservation>, std::borrow::Cow<'_, Self>),
+        nrese_exec::BudgetExceeded,
+    > {
+        use std::borrow::Cow;
+        let Self::Merge(graphs) = self else {
+            return Ok((None, Cow::Borrowed(self)));
+        };
+        if graphs.len() != 1 && graphs.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Ok((None, Cow::Borrowed(self)));
         }
+        let mut copy = nrese_exec::ChargedVec::collect(
+            Arc::clone(budget),
+            graphs.len(),
+            graphs.iter().copied(),
+        )?;
+        copy.sort_unstable();
+        let mut len = 0;
+        for i in 0..copy.len() {
+            if len == 0 || copy[i] != copy[len - 1] {
+                copy[len] = copy[i];
+                len += 1;
+            }
+        }
+        copy.truncate(len);
+        let (graphs, charge) = copy.into_parts();
+        let scope = match graphs[..] {
+            [graph] => Self::Graphs(GraphSelector::Exact(graph)),
+            _ => Self::Merge(graphs),
+        };
+        Ok((Some(charge), Cow::Owned(scope)))
     }
 }
 
