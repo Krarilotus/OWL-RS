@@ -1,7 +1,5 @@
-//! The reasoner's closure tests against the naive oracle, and the v1 scenarios
-//! (crate-internal: they use the `naive` oracle, which is built for tests only).
-
-mod v1_scenarios;
+//! The reasoner's closure tests against the naive oracle (crate-internal: they use the
+//! `naive` oracle, which is built for tests only).
 
 use std::collections::HashSet;
 
@@ -454,19 +452,39 @@ fn hierarchies_domains_and_property_axioms() {
          ex:knows rdf:type owl:SymmetricProperty
          ex:a ex:knows ex:b
          ex:hasPet owl:inverseOf ex:petOf
-         ex:alice ex:hasPet ex:tom",
+         ex:alice ex:hasPet ex:tom
+         ex:rex ex:petOf ex:carl
+         ex:owns rdfs:range ex:Possession
+         ex:Kitty owl:equivalentClass ex:Cat
+         ex:felix rdf:type ex:Kitty
+         ex:likes owl:equivalentProperty ex:fondOf
+         ex:a ex:likes ex:d
+         ex:c ex:fondOf ex:e
+         ex:p1 rdfs:subPropertyOf ex:p2
+         ex:p2 rdfs:subPropertyOf ex:p3
+         ex:a ex:p1 ex:b",
     );
-    for fact in [
+    let missing: Vec<&str> = [
         "ex:tom rdf:type ex:Mammal",
         "ex:tom rdf:type ex:Animal",
         "ex:Cat rdfs:subClassOf ex:Animal",
         "ex:alice rdf:type ex:Person",
+        "ex:tom rdf:type ex:Possession",
         "ex:a ex:ancestor ex:c",
         "ex:b ex:knows ex:a",
         "ex:tom ex:petOf ex:alice",
-    ] {
-        assert!(has(&mut v, &d, fact), "missing {fact}");
-    }
+        "ex:carl ex:hasPet ex:rex",
+        "ex:felix rdf:type ex:Cat",
+        "ex:tom rdf:type ex:Kitty",
+        "ex:a ex:fondOf ex:d",
+        "ex:c ex:likes ex:e",
+        "ex:p1 rdfs:subPropertyOf ex:p3",
+        "ex:a ex:p3 ex:b",
+    ]
+    .into_iter()
+    .filter(|fact| !has(&mut v, &d, fact))
+    .collect();
+    assert!(missing.is_empty(), "missing {missing:?}");
     assert!(violations.is_empty(), "{violations:?}");
 }
 
@@ -480,6 +498,14 @@ fn list_axioms_chains_intersections_unions_keys() {
          _:l2 rdf:rest rdf:nil
          ex:x ex:parent ex:y
          ex:y ex:brother ex:z
+         ex:greatUncle owl:propertyChainAxiom _:g1
+         _:g1 rdf:first ex:parent
+         _:g1 rdf:rest _:g2
+         _:g2 rdf:first ex:parent
+         _:g2 rdf:rest _:g3
+         _:g3 rdf:first ex:brother
+         _:g3 rdf:rest rdf:nil
+         ex:w ex:parent ex:x
          ex:Mother owl:intersectionOf _:i1
          _:i1 rdf:first ex:Woman
          _:i1 rdf:rest _:i2
@@ -501,16 +527,19 @@ fn list_axioms_chains_intersections_unions_keys() {
          ex:p1 ex:ssn ex:n42
          ex:p2 ex:ssn ex:n42",
     );
-    for fact in [
+    let missing: Vec<&str> = [
         "ex:x ex:uncle ex:z",
+        "ex:w ex:greatUncle ex:z",
         "ex:ann rdf:type ex:Mother",
         "ex:Mother rdfs:subClassOf ex:Woman",
         "ex:rex rdf:type ex:Pet",
         "ex:Dog rdfs:subClassOf ex:Pet",
         "ex:p1 owl:sameAs ex:p2",
-    ] {
-        assert!(has(&mut v, &d, fact), "missing {fact}");
-    }
+    ]
+    .into_iter()
+    .filter(|fact| !has(&mut v, &d, fact))
+    .collect();
+    assert!(missing.is_empty(), "missing {missing:?}");
 }
 
 #[test]
@@ -520,13 +549,82 @@ fn equality_and_consistency() {
          ex:bob ex:hasMother ex:m1
          ex:bob ex:hasMother ex:m2
          ex:m1 ex:name ex:n
+         ex:ssn rdf:type owl:InverseFunctionalProperty
+         ex:p ex:ssn ex:n42
+         ex:q ex:ssn ex:n42
+         ex:a owl:sameAs ex:b
+         ex:b owl:sameAs ex:c
          ex:Cat owl:disjointWith ex:Dog
          ex:odd rdf:type ex:Cat
          ex:odd rdf:type ex:Dog",
     );
-    assert!(has(&mut v, &d, "ex:m1 owl:sameAs ex:m2"));
-    assert!(has(&mut v, &d, "ex:m2 ex:name ex:n"), "eq-rep-s");
+    let missing: Vec<&str> = [
+        "ex:m1 owl:sameAs ex:m2",
+        "ex:m2 ex:name ex:n",
+        "ex:p owl:sameAs ex:q",
+        "ex:c owl:sameAs ex:a",
+    ]
+    .into_iter()
+    .filter(|fact| !has(&mut v, &d, fact))
+    .collect();
+    assert!(missing.is_empty(), "missing {missing:?}");
     assert_eq!(violations, vec!["cax-dw".to_owned()]);
+}
+
+/// Each consistency rule on its own (the v1 reasoner's scenarios): the violation names
+/// it, also where the facts it needs are inferred.
+#[test]
+fn consistency_rules_name_their_violation() {
+    let cases = [
+        (
+            "cax-dw",
+            "ex:Child rdfs:subClassOf ex:Parent
+             ex:Parent owl:disjointWith ex:Other
+             ex:p rdfs:domain ex:Other
+             ex:alice ex:p ex:spec
+             ex:alice rdf:type ex:Child",
+        ),
+        (
+            "cls-nothing2",
+            "ex:Impossible rdfs:subClassOf owl:Nothing
+             ex:alice rdf:type ex:Impossible",
+        ),
+        (
+            "eq-diff1",
+            "ex:alice owl:sameAs ex:alicia
+             ex:alicia owl:sameAs ex:ally
+             ex:alice owl:differentFrom ex:ally",
+        ),
+        (
+            "prp-irp",
+            "ex:p rdf:type owl:IrreflexiveProperty
+             ex:alice ex:p ex:alice",
+        ),
+        (
+            "prp-asyp",
+            "ex:p rdf:type owl:AsymmetricProperty
+             ex:alice ex:p ex:bob
+             ex:bob ex:p ex:alice",
+        ),
+        (
+            "prp-pdw",
+            "ex:p1 rdfs:subPropertyOf ex:p
+             ex:q1 rdfs:subPropertyOf ex:q
+             ex:p owl:propertyDisjointWith ex:q
+             ex:alice ex:p1 ex:bob
+             ex:alice ex:q1 ex:bob",
+        ),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|&(rule, data)| {
+            let (_, _, mut violations) = closure(data);
+            violations.sort();
+            violations.dedup();
+            (violations != [rule]).then(|| format!("{rule}: {violations:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:?}");
 }
 
 #[test]
@@ -700,28 +798,6 @@ fn equality_gives_lists_several_member_sequences() {
     assert!(has(&mut v, &d, "ex:Mother rdfs:subClassOf ex:Female"));
     assert!(has(&mut v, &d, "ex:Mother rdfs:subClassOf ex:Woman"));
     assert!(violations.is_empty(), "{violations:?}");
-}
-
-/// Runs a v1 scenario (lines of [`load`]) on both executors: the expected inferences
-/// (lines too) must be derived, and a violation reported iff `violation` says so.
-pub(super) fn scenario(data: &str, expected: &str, violation: Option<bool>) {
-    let mut vocabulary = LocalVocabulary::default();
-    let input = load(&mut vocabulary, data);
-    let (derived, violations) = both(&mut vocabulary, &input);
-    let lines = expected.lines().map(str::trim).filter(|l| !l.is_empty());
-    for (line, fact) in lines.zip(load(&mut vocabulary, expected)) {
-        assert!(
-            derived.contains(&fact) || input.contains(&fact),
-            "missing {line}"
-        );
-    }
-    if let Some(expected) = violation {
-        assert_eq!(
-            !violations.is_empty(),
-            expected,
-            "violations: {violations:?}"
-        );
-    }
 }
 
 /// A xorshift generator: `next(n)` is in `0..n`.
