@@ -8,7 +8,7 @@
 //!     [--shacl-report FILE] [--reason MODE]
 //!     [--rules FILE.n3] [--reason-runs 1] [--results DIR] [--routes] [--commits FILE]
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
-//!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC]
+//!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC] [--read-graphs IRI,...]
 //! cargo run --release -p nrese-store --example perf_lab -- generate KIND OUT [key=value]...
 //! ```
 //!
@@ -44,6 +44,9 @@
 //!   `--faults` prints, per query, the first execution's time and page faults beside the
 //!   later runs' median faults (the first execution after opening a mapped store, P6),
 //!   and the working set after opening; the report gets `first_faults` and `faults`.
+//!   `--read-graphs IRI,...` runs every query as a reader restricted to those named graphs
+//!   (graph-level access control: not the default graph, not the inferred statements), the
+//!   values and routes the report records included.
 //!   `--qerror` measures the planner's estimates: every operator with an estimate, over
 //!   every query, gets its q-error, `max(estimate, rows) / min(estimate, rows)` (both at
 //!   least 1; Moerkotte et al., VLDB 2009), summarised per operator (median, p90, max, the
@@ -221,6 +224,7 @@ struct Args {
     kernel: Option<String>,
     classify: bool,
     prepare_vector_graph: Option<(usize, nrese_engine::vector::Metric)>,
+    read_graphs: Vec<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -261,6 +265,7 @@ fn parse_args() -> Result<Args, String> {
         kernel: None,
         classify: false,
         prepare_vector_graph: None,
+        read_graphs: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -333,6 +338,7 @@ fn parse_args() -> Result<Args, String> {
             "--parse-only" => args.parse_only = true,
             "--kernel" => args.kernel = Some(value()?),
             "--classify" => args.classify = true,
+            "--read-graphs" => args.read_graphs = value()?.split(',').map(str::to_owned).collect(),
             "--prepare-vector-graph" => {
                 let input = value()?;
                 let (dimension, metric) = input
@@ -446,7 +452,7 @@ fn write_results(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut request = SparqlQueryRequest::all(text);
+    let mut request = request(text);
     request.solutions_format = args.format;
     let mut prepared = PreparedQuery::parse(&request)?;
     if prepared.kind() == QueryResultKind::Boolean {
@@ -460,7 +466,7 @@ fn write_results(
 
 /// Each sample of `measure` times `batch` executions (1: one).
 fn measure(store: &StoreService, text: &str, args: &Args, batch: usize) -> Measured {
-    let mut request = SparqlQueryRequest::all(text);
+    let mut request = request(text);
     request.solutions_format = args.format;
     let prepared = match PreparedQuery::parse(&request) {
         Ok(prepared) if prepared.kind() != QueryResultKind::Boolean => prepared,
@@ -523,7 +529,7 @@ fn ms(d: Duration) -> f64 {
 /// Prints how `text` runs: each operator, indented by depth, with estimated and actual
 /// rows and its time.
 fn explain(store: &StoreService, text: &str) {
-    let explained = PreparedQuery::parse(&SparqlQueryRequest::all(text))
+    let explained = PreparedQuery::parse(&request(text))
         .map_err(|e| e.to_string())
         .and_then(|prepared| {
             store
@@ -582,7 +588,7 @@ fn explain(store: &StoreService, text: &str) {
 
 /// The q-errors of `text`'s estimated operators, by operator.
 fn qerrors(store: &StoreService, text: &str, into: &mut BTreeMap<String, Vec<f64>>) {
-    let Ok(prepared) = PreparedQuery::parse(&SparqlQueryRequest::all(text)) else {
+    let Ok(prepared) = PreparedQuery::parse(&request(text)) else {
         return;
     };
     let Ok(explanation) = store.explain_query(&prepared, &CancellationToken::new()) else {
@@ -729,7 +735,7 @@ fn read_baseline(path: &PathBuf) -> BTreeMap<String, f64> {
 
 /// The first value of a one-row result (a count's answer), as its lexical form.
 fn first_value(store: &StoreService, text: &str) -> Option<String> {
-    let mut request = SparqlQueryRequest::all(text);
+    let mut request = request(text);
     request.solutions_format = SolutionsResultFormat::Tsv;
     let prepared = PreparedQuery::parse(&request).ok()?;
     if prepared.kind() != QueryResultKind::Solutions {
@@ -752,7 +758,7 @@ fn first_value(store: &StoreService, text: &str) -> Option<String> {
 
 /// The rewrites EXPLAIN reports for `text` (`ql-tree-witness`, `join-groups`, ...).
 fn rewrites(store: &StoreService, text: &str) -> Vec<&'static str> {
-    PreparedQuery::parse(&SparqlQueryRequest::all(text))
+    PreparedQuery::parse(&request(text))
         .ok()
         .and_then(|prepared| {
             store
@@ -766,7 +772,7 @@ fn rewrites(store: &StoreService, text: &str) -> Vec<&'static str> {
 /// The status of `text`'s answers, as JSON (`null` where nothing can leave answers out):
 /// sound, complete, the bounds' counts and, under `owl2-dl`, the paths that decided.
 fn query_status(store: &StoreService, text: &str) -> String {
-    let Ok(prepared) = PreparedQuery::parse(&SparqlQueryRequest::all(text)) else {
+    let Ok(prepared) = PreparedQuery::parse(&request(text)) else {
         return "null".to_owned();
     };
     match store.run_query_dl(
@@ -798,7 +804,7 @@ fn query_status(store: &StoreService, text: &str) -> String {
 
 /// The distinct operators `text` runs with, in the order EXPLAIN lists them.
 fn operators(store: &StoreService, text: &str) -> Vec<String> {
-    let Ok(prepared) = PreparedQuery::parse(&SparqlQueryRequest::all(text)) else {
+    let Ok(prepared) = PreparedQuery::parse(&request(text)) else {
         return Vec::new();
     };
     let Ok(explanation) = store.explain_query(&prepared, &CancellationToken::new()) else {
@@ -881,6 +887,17 @@ impl Report {
     }
 }
 
+/// Whose reads the queries are (`--read-graphs`); every graph when unset.
+static SCOPE: std::sync::OnceLock<nrese_store::ReadScope> = std::sync::OnceLock::new();
+
+/// A query request in the run's read scope.
+pub(crate) fn request(text: &str) -> SparqlQueryRequest {
+    SparqlQueryRequest::new(
+        text,
+        SCOPE.get().cloned().unwrap_or(nrese_store::ReadScope::All),
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().map(String::as_str) == Some("generate") {
@@ -891,6 +908,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     nrese_engine::memory::set_release(|force| unsafe { libmimalloc_sys::mi_collect(force) });
     let args =
         parse_args().map_err(|e| format!("{e}\nsee the usage at the top of perf_lab/main.rs"))?;
+    if !args.read_graphs.is_empty() {
+        let access = nrese_sparql::GraphAccess {
+            graphs: args.read_graphs.clone(),
+            ..Default::default()
+        };
+        let _ = SCOPE.set(nrese_store::ReadScope::of(Some(Arc::new(access))));
+    }
     let mut report = Report::default();
     let result = run(&args, &mut report);
     if let Err(error) = &result {
@@ -1228,9 +1252,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     }
     if let Some(path) = &args.export {
         let started = Instant::now();
-        let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(
-            "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
-        ))?;
+        let prepared = PreparedQuery::parse(&request("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }"))?;
         let file = std::io::BufWriter::new(std::fs::File::create(path)?);
         store.run_query(&prepared, &CancellationToken::new(), file)?;
         eprintln!("exported in {:.2} s", started.elapsed().as_secs_f64());
