@@ -157,12 +157,15 @@ trait Help: Send + Sync {
 }
 
 /// One scan of a build: `run(i)` for every slice `i`, its results kept in slice order; a
-/// slice that finds too much (`None`) stops the rest.
+/// slice that finds too much (`None`) or panics stops the rest.
 struct Scan<R> {
     run: Box<dyn Fn(usize) -> Option<R> + Send + Sync>,
     len: usize,
     next: AtomicUsize,
     failed: AtomicBool,
+    /// The first slice's panic, raised again in the builder ([`Scan::run`]): a slice that
+    /// panics on a lane or in a planner leaves the queue to the others, never stuck.
+    panic: Mutex<Option<Box<dyn std::any::Any + Send>>>,
     results: Mutex<Vec<Option<R>>>,
     /// Slices not yet over (claimed or not); `over` is notified when none are left.
     left: Mutex<usize>,
@@ -176,6 +179,7 @@ impl<R: Send + 'static> Scan<R> {
             len,
             next: AtomicUsize::new(0),
             failed: AtomicBool::new(false),
+            panic: Mutex::new(None),
             results: Mutex::new(std::iter::repeat_with(|| None).take(len).collect()),
             left: Mutex::new(len),
             over: Condvar::new(),
@@ -184,7 +188,9 @@ impl<R: Send + 'static> Scan<R> {
 
     /// Every slice's result in order, once all are over: helped with by `lanes` jobs on
     /// the current Rayon pool, by this thread, and by `build`'s waiting planners where it
-    /// is published there. `None` if a slice found too much.
+    /// is published there. `None` if a slice found too much; a slice's panic is raised
+    /// again here, once every slice is over (the builder's claim then gives its planners
+    /// no sets, and the next caller builds again).
     fn run(self: Arc<Self>, build: &Build, lanes: usize, publish: bool) -> Option<Vec<R>> {
         if publish {
             build.publish(Some(Arc::clone(&self) as Arc<dyn Help>));
@@ -206,6 +212,9 @@ impl<R: Send + 'static> Scan<R> {
         drop(left);
         if publish {
             build.publish(None);
+        }
+        if let Some(panic) = self.panic.lock().take() {
+            std::panic::resume_unwind(panic);
         }
         if self.failed.load(Ordering::SeqCst) {
             return None;
@@ -238,9 +247,14 @@ impl<R: Send> Help for Scan<R> {
             if self.failed.load(Ordering::SeqCst) {
                 continue;
             }
-            match (self.run)(i) {
-                Some(result) => self.results.lock()[i] = Some(result),
-                None => self.failed.store(true, Ordering::SeqCst),
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (self.run)(i)));
+            match ran {
+                Ok(Some(result)) => self.results.lock()[i] = Some(result),
+                Ok(None) => self.failed.store(true, Ordering::SeqCst),
+                Err(panic) => {
+                    self.failed.store(true, Ordering::SeqCst);
+                    self.panic.lock().get_or_insert(panic);
+                }
             }
         }
     }
@@ -332,8 +346,8 @@ impl Statistics {
     /// The characteristic sets of the default graph in `model` (see the module docs): kept
     /// (drifted ones while one rebuild replaces them), read from their file (written
     /// after a build, read at the first use after a start), or built now, the first
-    /// time, by one planner while the others wait; a Rayon worker that would wait gets
-    /// none.
+    /// time, by one planner while the others help with it and wait, on Rayon workers
+    /// too ([`Build`]); none where that build failed (the next caller builds again).
     pub(crate) fn characteristic_sets(
         self: &Arc<Self>,
         snapshot: &Snapshot,
@@ -758,6 +772,54 @@ mod tests {
         assert_eq!(rebuilt.subjects(), 6_000);
         assert!(same(&planners(&workers, &snapshot), &rebuilt));
         assert_eq!(statistics.scans(), 2);
+    }
+
+    /// A slice that panics on a lane leaves no build stuck: the lane goes on with the queue,
+    /// the builder outside the pool (which only waits for its lanes) gets the panic, the
+    /// planners asleep on the build wake without sets, and the next caller builds again.
+    /// Before, the panic left the lane (Rayon aborts the process on it, or with a handler
+    /// that returns the queue stays unclaimed) and the builder waited for good.
+    #[test]
+    fn a_panicking_slice_fails_the_build_and_wakes_its_planners() {
+        let model = ReadModel::default();
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        add(&engine, 0..300);
+        // The builder's thread borrows the statistics for good (a test's leak).
+        let statistics: &'static Statistics =
+            Box::leak(Box::new(Arc::clone(&engine.inner.shared.statistics)));
+        let builder = statistics.claim(model).ok().expect("no build yet");
+        let build = Arc::clone(&builder.build);
+        let (woke, planner) = std::sync::mpsc::channel();
+        let waiting = Arc::clone(&build);
+        std::thread::spawn(move || {
+            let _ = woke.send(waiting.wait());
+        });
+        let (over, failed) = std::sync::mpsc::channel();
+        let scanned = {
+            std::thread::spawn(move || {
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _builder = builder;
+                    let scan = Scan::new(2, |i| -> Option<u8> {
+                        assert!(i != 0, "the injected slice panic");
+                        Some(1)
+                    });
+                    // Not published: the planner sleeps, the lane alone runs the slices.
+                    scan.run(&build, 1, false)
+                }));
+                let _ = over.send(ran.is_err());
+            })
+        };
+        let patience = std::time::Duration::from_secs(10);
+        assert_eq!(
+            failed.recv_timeout(patience),
+            Ok(true),
+            "the builder got the panic"
+        );
+        scanned.join().unwrap();
+        assert!(matches!(planner.recv_timeout(patience), Ok(None)));
+        assert!(statistics.building.lock().is_empty());
+        assert!(statistics.sets.lock().get(&model).is_none());
+        assert!(engine.snapshot().characteristic_sets_in(model).is_some());
     }
 
     /// A pool's only thread that plans during a build started outside it, with no lanes
