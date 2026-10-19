@@ -356,6 +356,8 @@ struct SpatialIndex {
     several: Charged<Vec<u64>>,
     /// The placements' bounding boxes, each with its position.
     tree: Packed<u64>,
+    /// The positions of the placements without one: empty shapes.
+    empty: Charged<u64>,
     /// The geometry literals, for filters over them: each with the position of its first
     /// placement (its shape, and its graph by the run), or, given by several graphs, [`LIST`]
     /// and the number of that position and the graphs in [`Self::spread`].
@@ -860,9 +862,11 @@ impl SpatialIndex {
         let total = start + features.len();
         let mut entries: Charged<(Bbox, u64)> =
             ChargedVec::with_capacity(Arc::clone(budget), total)?;
+        let mut empty = ChargedVec::new(Arc::clone(budget));
         for p in 0..position(total) {
-            if let Some(b) = bbox(shape_at(p)) {
-                entries.push((b, p))?;
+            match bbox(shape_at(p)) {
+                Some(b) => entries.push((b, p))?,
+                None => empty.push(p)?,
             }
         }
         let tree = Packed::pack(entries, budget)?;
@@ -890,6 +894,7 @@ impl SpatialIndex {
         drop((first, spread, scratch));
         Ok(Self {
             tree,
+            empty,
             geometries,
             features,
             runs,
@@ -1074,7 +1079,7 @@ impl Scoped<'_> {
     /// The objects of the placements whose box meets the shape at `known` and for whose
     /// shape `test(known's shape, theirs)` holds, pushed onto `out`. Complete for every
     /// relation but disjointness: a pair in any other relation shares a point, so their
-    /// boxes meet.
+    /// boxes meet, or both are empty (and equal), without a box.
     fn near<B: Deref<Target = Budget>>(
         &self,
         known: u64,
@@ -1083,18 +1088,19 @@ impl Scoped<'_> {
     ) -> Result<(), BudgetExceeded> {
         let index = self.index;
         let x = index.shape_at(known);
-        let Some(b) = bbox(x) else {
-            return Ok(());
-        };
         let mut refused = Ok(());
-        index.tree.search(&b, &mut |p| {
+        let mut candidate = |p: u64| {
             if refused.is_ok() && self.shows(p) {
                 let y = index.shape_at(p);
                 if x.crs == y.crs && test(x, y) {
                     refused = out.push(index.object_at(p));
                 }
             }
-        });
+        };
+        match bbox(x) {
+            Some(b) => index.tree.search(&b, &mut candidate),
+            None => index.empty.iter().for_each(|&p| candidate(p)),
+        }
         refused
     }
 
