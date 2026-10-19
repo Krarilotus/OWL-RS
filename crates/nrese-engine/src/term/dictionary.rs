@@ -1045,7 +1045,7 @@ impl Dictionary {
             let id = TermId::from_raw(raw);
             id.payload() < known && accept(id)
         };
-        self.vectors.read().search(query, &accept)
+        super::vectors::search(&self.vectors, query, &accept)
     }
 
     /// Builds the graph a search like `query` uses, covering every vector, before
