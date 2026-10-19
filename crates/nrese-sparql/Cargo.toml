@@ -35,6 +35,9 @@ nrese-sparql-results = { path = "../rdf/nrese-sparql-results" }
 thiserror.workspace = true
 
 [dev-dependencies]
+# The unit tests' counting allocator (src/lib.rs): measured operations hold no more than
+# they charge.
+nrese-exec = { path = "../nrese-exec", features = ["measure"] }
 # The GeoSPARQL compliance runner reasons over the benchmark's dataset (RDFS).
 nrese-reasoner = { path = "../nrese-reasoner" }
 # The differential tests' reference: the specification's algebra, evaluated plainly.
