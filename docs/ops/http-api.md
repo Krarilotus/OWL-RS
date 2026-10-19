@@ -53,6 +53,8 @@ One extension to the query language, as Jena and QLever have it: `HAVING` may na
 
 Without dataset parameters and `FROM` clauses, a query reads the default graph, or the merge of all graphs if the server is configured with `store.default_graph = "union"` ([config-reference.md](config-reference.md)). `/version` says which.
 
+A default graph merged from several graphs (`FROM`, `default-graph-uri`, the union default graph, or a restricted user's readable graphs) keeps each blank node's identity across graphs, as Jena, GraphDB and Oxigraph do: a statement that two graphs hold, blank nodes included, counts once, and a blank node that two graphs share is one node of the merge, the same node as in `GRAPH`. This is a deliberate deviation from the RDF merge that SPARQL 1.1 §13.2 asks for, which keeps the blank nodes of different graphs apart.
+
 **Full-text search,** with Blazegraph's vocabulary (what ResearchSpace sends), in any basic graph pattern:
 
 ```sparql
