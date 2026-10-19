@@ -19,7 +19,9 @@ pub struct Resources {
     /// evaluation's intermediate and retained results draw from it, beside whatever else
     /// the request holds. Unlimited by default.
     pub memory: nrese_exec::Envelope,
-    /// The width of parallel kernels and result encoding; the work stays on the caller.
+    /// The width of result encoding's parallel work; the work stays on the caller. Other
+    /// parallel kernels use the whole current pool: nested Rayon work doesn't inherit a
+    /// narrower handle.
     pub workers: nrese_exec::workers::Workers,
 }
 
