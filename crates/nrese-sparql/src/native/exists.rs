@@ -440,13 +440,13 @@ impl Context<'_> {
                     true => semi_join_in_place(&mut solutions.table, &found.table, &lk, &rk),
                     false => anti_join_in_place(&mut solutions.table, &found.table, &lk, &rk),
                 }
-                self.consumed(&found);
+                self.consumed(found);
                 note(joined, detail, solutions.table.len());
                 return Ok(solutions);
             }
             // An unbound variable isn't put into the pattern: any value matches.
             let mask = compatible_mask(&solutions.table, &found.table, &lk, &rk, false);
-            self.consumed(&found);
+            self.consumed(found);
             let kept = mask.iter().filter(|m| **m == keep_matching).count();
             note(joined, detail, kept);
             mask
@@ -535,7 +535,7 @@ impl Context<'_> {
                 None => self.eval(&substituted)?,
             };
             let holds = !found.table.is_empty();
-            self.consumed(&found);
+            self.consumed(found);
             answers.insert(key, holds);
             mask.push(holds);
         }
@@ -562,7 +562,7 @@ impl Context<'_> {
             let found = self.eval(pattern)?;
             let (lk, rk) = shared_columns(solutions, &found);
             let mask = compatible_mask(&solutions.table, &found.table, &lk, &rk, false);
-            self.consumed(&found);
+            self.consumed(found);
             return Ok(mask);
         }
         let mut found = self.eval(inner)?;
@@ -615,7 +615,7 @@ impl Context<'_> {
         for &id in joined.table.column(column) {
             holds[id as usize] = true;
         }
-        self.consumed(&joined);
+        self.consumed(joined);
         Ok(key_of_row.iter().map(|&id| holds[id as usize]).collect())
     }
 
@@ -649,7 +649,7 @@ impl Context<'_> {
             max_rows,
         )
         .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
-        self.consumed(&right);
+        self.consumed(right);
         let pairs = self.produced(Solutions {
             vars,
             table: pairs,
@@ -691,13 +691,13 @@ impl Context<'_> {
             out.push_row(&line);
         }
         unmatched_before(rows, &mut out, &mut line);
-        self.consumed(&pairs);
-        self.consumed(&numbered);
         let vars: Vec<Variable> = pairs.vars[..width]
             .iter()
             .filter(|v| **v != row_variable)
             .cloned()
             .collect();
+        self.consumed(pairs);
+        self.consumed(numbered);
         debug_assert_eq!(vars.len(), width - 1);
         self.produced(Solutions {
             vars,

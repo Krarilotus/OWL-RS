@@ -150,7 +150,7 @@ impl super::Context<'_> {
     /// fastest), each column written in one pass.
     fn expand_classes(
         &self,
-        solutions: super::Solutions,
+        mut solutions: super::Solutions,
         classes: &nrese_engine::EqualityClasses,
         limit: Option<usize>,
     ) -> super::NativeResult<super::Solutions> {
@@ -201,9 +201,10 @@ impl super::Context<'_> {
         } else {
             nrese_exec::IdTable::from_columns(columns)
         };
-        self.consumed(&solutions);
+        let vars = std::mem::take(&mut solutions.vars);
+        self.consumed(solutions);
         self.produced(super::Solutions {
-            vars: solutions.vars,
+            vars,
             table: out,
             ordered: false,
         })

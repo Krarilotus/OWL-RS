@@ -175,7 +175,7 @@ impl Context<'_> {
             let mut vars = seed.vars.clone();
             bound_variables(pattern, &mut vars);
             let width = vars.len();
-            self.consumed(&seed);
+            self.consumed(seed);
             return Ok(Solutions {
                 vars,
                 table: IdTable::new(width),

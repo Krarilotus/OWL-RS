@@ -297,7 +297,7 @@ impl Context<'_> {
                 })?;
                 let rows = self.eval_from(seed, local)?;
                 if rows.table.is_empty() {
-                    self.consumed(&rows);
+                    self.consumed(rows);
                     return Ok(None);
                 }
                 Ok(Some(Probed::new(self, rows)))
@@ -336,7 +336,7 @@ impl Context<'_> {
         let found = match self.produced(rows.into_solutions()) {
             Ok(found) => found,
             Err(error) => {
-                self.consumed(&local);
+                self.consumed(local);
                 return Err(error);
             }
         };
@@ -627,14 +627,14 @@ mod tests {
                 buffers.borrow()[&id.raw()],
                 "rows move without copying"
             );
-            ctx.consumed(&rows);
+            ctx.consumed(rows);
         }
         assert_eq!(
             shared.used(),
             bytes,
             "unrelated reservation survives disposal"
         );
-        ctx.consumed(&unrelated);
+        ctx.consumed(unrelated);
         assert_eq!(shared.used(), 0);
     }
 
@@ -778,7 +778,7 @@ mod tests {
                 unrelated.table.memory_bytes(),
                 "{stop}: no stranded candidate charges"
             );
-            ctx.consumed(&unrelated);
+            ctx.consumed(unrelated);
             assert_eq!(shared.used(), 0);
         }
     }
@@ -868,14 +868,14 @@ mod tests {
             empty.table.memory_bytes() > 0,
             "rejection can retain table capacity"
         );
-        ctx.consumed(&empty);
+        ctx.consumed(empty);
         assert_eq!(ctx.budget.used(), UNRELATED);
         let empty = ctx
             .vector_join(&rejected, &inner)
             .map_err(QueryEvaluationError::from)
             .unwrap();
         assert!(empty.table.is_empty());
-        ctx.consumed(&empty);
+        ctx.consumed(empty);
         assert_eq!(
             ctx.budget.used(),
             UNRELATED,
