@@ -23,7 +23,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::SyncPolicy;
-use super::codec::{CommitRecord, Frame, decode_frame, encode_record, intact_len};
+use super::codec::{CommitRecord, FRAME_HEADER, Frame, decode_frame, encode_record, intact_len};
 use super::fault::{self, Step};
 use super::sidecar;
 use crate::error::{EngineError, EngineResult};
@@ -152,11 +152,17 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
                     _ => None,
                 };
                 let timed = magic == SEGMENT_MAGIC;
+                // The revision a record after the damage would have at least.
+                let next = match records.last() {
+                    Some(record) => record.revision + 1,
+                    None => segment_first_revision(path),
+                };
+                let policy = segment_policy(path);
                 return Ok(SegmentContents {
+                    tail: classify(&bytes[pos..], damaged, timed, policy, next),
                     records,
                     ends,
                     valid_len: pos as u64,
-                    tail: classify(&bytes[pos..], damaged, timed, segment_policy(path)),
                     integers_in_dictionary,
                 });
             }
@@ -173,24 +179,28 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
 
 /// What `rest`, a segment from its first frame that doesn't decode, is: `damaged` holds
 /// that frame's length if it is complete; `timed`, a version 6 segment; `policy`, the
-/// segment's sync policy if recorded. The rules are the [`super`] module docs'.
-fn classify(rest: &[u8], damaged: Option<usize>, timed: bool, policy: Option<SyncPolicy>) -> Tail {
+/// segment's sync policy if recorded; `next`, the least revision a record after the damage
+/// can have. The rules are the [`super`] module docs'.
+fn classify(
+    rest: &[u8],
+    damaged: Option<usize>,
+    timed: bool,
+    policy: Option<SyncPolicy>,
+    next: u64,
+) -> Tail {
     if rest.iter().all(|&byte| byte == 0) {
         return Tail::Torn;
     }
-    if intact_len(rest, timed).is_some() {
-        return Tail::Corrupt("an intact record under a damaged length".into());
+    if intact_record_in(rest, next, timed) {
+        return Tail::Corrupt("damage before an intact record".into());
     }
     let Some(len) = damaged else {
         return Tail::Torn;
     };
-    let (frame, after) = rest.split_at(len);
-    if matches!(decode_frame(after), Frame::Record(..)) {
-        return Tail::Corrupt("a damaged record before an intact one".into());
-    }
     if policy != Some(SyncPolicy::EveryCommit) {
         return Tail::Torn;
     }
+    let (frame, after) = rest.split_at(len);
     if !after.iter().all(|&byte| byte == 0) {
         return Tail::Corrupt("a damaged record with data after it".into());
     }
@@ -199,6 +209,38 @@ fn classify(rest: &[u8], damaged: Option<usize>, timed: bool, policy: Option<Syn
         true => Tail::Torn,
         false => Tail::Corrupt("a damaged last record, synced and so acknowledged".into()),
     }
+}
+
+/// Whether `rest` (a segment from its first frame that doesn't decode) holds an intact
+/// record of revision `next` or later anywhere: acknowledged commits beyond the damage,
+/// whatever damage, holes or damaged lengths come before. Every offset is tried, the record
+/// read by its length field or by its payload's own structure ([`intact_len`]); an offset
+/// whose revision field can't be such a record's is passed over before any checksum. Bytes
+/// of a term that happen to form a checksummed record of a plausible revision would also
+/// count: opening then fails closed, never loses a commit.
+fn intact_record_in(rest: &[u8], next: u64, timed: bool) -> bool {
+    // The smallest frame: its header, revision, dictionary start, key count and four counts.
+    const SMALLEST: usize = FRAME_HEADER + 8 + 8 + 4 + 4 * 4;
+    let latest = next + (rest.len() / SMALLEST) as u64;
+    (0..rest.len().saturating_sub(SMALLEST - 1)).any(|at| {
+        let tail = &rest[at..];
+        let revision = u64::from_le_bytes(
+            tail[FRAME_HEADER..FRAME_HEADER + 8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        (next..=latest).contains(&revision)
+            && (matches!(decode_frame(tail), Frame::Record(..))
+                || intact_len(tail, timed).is_some())
+    })
+}
+
+/// The revision a segment is named after: a lower bound of its records'.
+fn segment_first_revision(path: &Path) -> u64 {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Cuts a torn tail off a segment and syncs the result.
