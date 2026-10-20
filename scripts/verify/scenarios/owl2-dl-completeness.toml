@@ -1,0 +1,46 @@
+description = """Under reasoner.mode = "owl2-dl" every SPARQL answer carries its status in the
+NRESE-Completeness header (docs/ops/http-api.md, "Under owl2-dl, every answer carries its
+status"; docs/design/owl2-dl.md §8). Here x is a D only through a union no rule reads (A is
+B or C, both D), so the rules' lower bound has y and w, the upper bound x as well, and the exact
+services prove x: complete, with the bounds' counts, three answers. Asserted statements alone
+(infer=false) carry no status."""
+
+[server]
+set = { "reasoner.mode" = "owl2-dl" }
+
+[[step]]
+name = "write the ontology into the default graph"
+method = "PUT"
+path = "/dataset/data?default"
+headers = { Content-Type = "text/turtle" }
+body = """
+@prefix : <http://example.com/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :B rdfs:subClassOf :D . :C rdfs:subClassOf :D .
+:x a :A . :y a :B . :w a [ owl:unionOf ( :B :C ) ] .
+"""
+[step.expect]
+status = 204
+
+[[step]]
+name = "the Ds: complete under owl2-dl, with the bounds"
+path = "/dataset/query"
+params = { query = "SELECT ?x { ?x a <http://example.com/D> }" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+headers = { nrese-completeness = "complete; regime=owl2-dl; lower=2; upper=3; unresolved=0" }
+rows = 3
+body = [{ contains = "http://example.com/x" }, { contains = "http://example.com/y" },
+        { contains = "http://example.com/w" }]
+
+[[step]]
+name = "asserted statements alone: no status"
+path = "/dataset/query"
+params = { query = "SELECT ?x { ?x a <http://example.com/D> }", infer = "false" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+headers = { nrese-completeness = { present = false } }
+rows = 0
