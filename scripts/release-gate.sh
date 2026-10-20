@@ -11,7 +11,8 @@
 #                                           block N: each of HARNESS's cases run base, main, cand,
 #                                           cand, main, base back to back (a palindrome per case:
 #                                           every side's runs centred on the same time), on each
-#                                           side's build of layout LAYOUT (GATE_LAYOUTS)
+#                                           side's build of layout LAYOUT (GATE_LAYOUTS), copied
+#                                           for the block; orientation and case order from GATE_SEED
 #   release-gate.sh report HARNESS SIDE=REV ...   the timed part's report (the first SIDE the candidate)
 #   release-gate.sh w3c                     the W3C suites with their data required, their counts checked
 #   release-gate.sh guards                  every guard docs/design/performance.md §0 names, run and passed
@@ -337,6 +338,14 @@ block)
   [ -f "$tree/$MEASURE" ] && opts+=(--measure "$MEASURE")
   # Batched timing (perf_lab --batch) only when every side's perf lab has it (jobs: GATE_BATCH).
   [ "${GATE_BATCH:-0}" = 1 ] && opts+=(--batch)
+  # The round's seed (GATE_SEED, else drawn once and kept with its results): each pair of blocks'
+  # orientation and the cases' order in a block drawn from it, recorded in every pass.
+  [ -s "$OUT/seed" ] || echo "${GATE_SEED:-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')}" > "$OUT/seed"
+  opts+=(--seed "$(cat "$OUT/seed")")
+  # Every side timed from a copy of its build made for this block, removed after it (fast.py
+  # fresh_copies(): a cached instance's offset is the block's, not the round's; lks-aa-20).
+  rm -rf "$GATE/instances" && mkdir -p "$GATE/instances"
+  opts+=(--fresh-copies "$GATE/instances")
   fast_env
   # A timed block: prepared data only (fast.py never makes any while it times).
   export NRESE_TIMED_GATE=1
@@ -546,9 +555,8 @@ clean)
   # for the gate's next run. Builds no gate used for GATE_BIN_AGE_DAYS go (sweep_builds).
   before=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
   for dir in "$GATE"/src-* "$GATE"/build/src-*; do [ -d "$dir" ] && git worktree remove --force "$dir"; done
-  rm -rf "$GATE"/target-* "$GATE"/build "$GATE"/reports "$GATE"/compact
-  swept=$(sweep_builds | tr '
-' ' ')
+  rm -rf "$GATE"/target-* "$GATE"/build "$GATE"/reports "$GATE"/compact "$GATE"/instances
+  swept=$(sweep_builds | tr '\n' ' ')
   [ -z "$swept" ] || log "clean: unused builds removed: $swept"
   git worktree prune
   # Shared prepared data no gate has linked for two days (its last link's removal set its ctime).
