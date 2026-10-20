@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -22,17 +23,22 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 
-from suitekit import manifest  # noqa: E402
+from suitekit import manifest, ns  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402,F401
 from suitekit.schema import Result, Writer  # noqa: E402,F401
 
 WORK = Path(os.environ.get("NRESE_BREADTH") or Path.home() / "nrese-breadth")
-SRC, DATA, RESULTS, SCRATCH = (WORK / d for d in ("src", "data", "results", "scratch"))
-# NRESE's binaries for the containers: built in the pinned Rust image into this worktree's own
+# The datasets are shared by every job on the host; the rest is this job's own (suitekit/ns.py):
+# upstream sources a job patches and builds images from, its binaries, results and scratch.
+DATA = WORK / "data"
+SRC, RESULTS, SCRATCH = (ns.directory(WORK, d, ROOT) for d in ("src", "results", "scratch"))
+MIRROR = WORK / "mirror"
+# NRESE's binaries for the containers: built in the pinned Rust image into this checkout's own
 # target volume, then copied out with their SHA-256 (the fast suite's build, benches/fast/fast.py).
-TARGET_VOLUME = os.environ.get("NRESE_TARGET_VOLUME", f"nrese-target-{ROOT.name}")
-CARGO_VOLUME = "nrese-cargo"
-BIN = WORK / "bin"
+TARGET_VOLUME = ns.name("target", ROOT)
+CARGO_VOLUME = ns.shared("cargo")
+OWNER = "breadth"
+BIN = ns.directory(WORK, "bin", ROOT)
 
 
 def run(command: list[str], **kw) -> subprocess.CompletedProcess:
@@ -91,11 +97,10 @@ def retreated_since(started: float) -> bool:
 
 def build_nrese(targets: list[list[str]]) -> dict[str, str]:
     """Builds `targets` (cargo package/example arguments) in the pinned Rust image and copies
-    the binaries to WORK/bin; returns name -> SHA-256."""
+    the binaries to this job's BIN; returns name -> SHA-256."""
     jobs = os.environ.get("CARGO_BUILD_JOBS", "8")
     cap = os.environ.get("NRESE_MEMORY_CAP_GB", "12")
-    for volume in (TARGET_VOLUME, CARGO_VOLUME):
-        run(["docker", "volume", "create", volume], capture_output=True)
+    run([ns.executable(), *ns.volume("create", TARGET_VOLUME, ROOT, OWNER)], capture_output=True)
     for packages in targets:
         wait_for_quiet_slot()
         run(["docker", "run", "--rm", f"--memory={cap}g", f"--memory-swap={cap}g", f"--cpus={jobs}",
@@ -127,14 +132,26 @@ def sha256(path: Path) -> str:
 
 
 def checkout(repo: str, commit: str) -> Path:
-    """The upstream checkout `owner/repo` at `commit` (cloned on first use)."""
+    """This job's checkout of upstream `owner/repo` at `commit` (a job patches it and builds from
+    it), cloned from the host's mirror of the repository, which is made once: cloned aside and
+    renamed into place only if no other job did it first."""
+    mirror = MIRROR / (repo.replace("/", "_") + ".git")
+    if not mirror.exists():
+        MIRROR.mkdir(parents=True, exist_ok=True)
+        aside = mirror.with_name(f"{mirror.name}.{ns.name('part', ROOT)}")
+        shutil.rmtree(aside, ignore_errors=True)
+        run(["git", "clone", "-q", "--mirror", f"https://github.com/{repo}", str(aside)])
+        try:
+            aside.rename(mirror)
+        except OSError:
+            shutil.rmtree(aside, ignore_errors=True)  # another job's mirror came first
+    if subprocess.run(["git", "-C", str(mirror), "cat-file", "-e", f"{commit}^{{commit}}"],
+                      capture_output=True).returncode != 0:
+        run(["git", "-C", str(mirror), "fetch", "-q", "origin"], capture_output=True)
     path = SRC / repo.replace("/", "_")
     if not path.exists():
-        run(["git", "clone", "-q", f"https://github.com/{repo}", str(path)])
-    if subprocess.run(["git", "-C", str(path), "cat-file", "-e", f"{commit}^{{commit}}"],
-                      capture_output=True).returncode != 0:
-        run(["git", "-C", str(path), "fetch", "-q", "--unshallow"], capture_output=True)
-    run(["git", "-C", str(path), "checkout", "-q", "--detach", commit])
+        run(["git", "clone", "-q", "--no-checkout", str(mirror), str(path)])
+    run(["git", "-C", str(path), "checkout", "-q", "--detach", "--force", commit])
     return path
 
 
@@ -163,7 +180,7 @@ def stamp(results: Path, argv: list[str], images: list[str], datasets: list[Path
     """The run's manifest entry (benches/suite/suitekit/manifest.py's fields)."""
     return {
         "started": manifest.now(), "argv": argv, "protocol": protocol, "git": manifest.git(ROOT),
-        "machine": manifest.machine("docker"), "images": manifest.image_ids(images),
+        "machine": manifest.machine("docker", ROOT), "images": manifest.image_ids(images),
         "datasets": {str(p): p.stat().st_size for p in datasets if p.exists()},
         "binaries": {p.name: sha256(p) for p in sorted(BIN.glob("*")) if p.is_file()},
     }

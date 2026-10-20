@@ -9,7 +9,8 @@ hour, run like unit tests for performance (README.md here; the cases: benches/ca
     python benches/fast/fast.py prepare [--cases A,B]   a release gate's data, once, by one generator (native)
     python benches/fast/fast.py compete [--cases A,B] [--systems S,T]   NRESE beside its comparators
     python benches/fast/fast.py table [--baseline R] [--write]   the cases as CATALOG.md's table
-    python benches/fast/fast.py clean [--data]           this worktree's scratch; --data the shared data volume too
+    python benches/fast/fast.py clean [--build] [--data]  this checkout's scratch; --build its containers and
+                                                          build volume (a job's cleanup); --data the shared data volume
 
 `run` generates each case's data once (deterministic; kept in the fast volume, hosts.toml),
 runs each case in its own container under the case's memory cap, checks the answers
@@ -19,7 +20,7 @@ then every case again. `compare` reports regressions and wins beyond a bootstrap
 confidence interval of the ratio of medians.
 
 The build runs scripts/cargo-guarded.sh inside the pinned Rust image, into this
-worktree's own target volume (nrese-target-<worktree>), with CARGO_BUILD_JOBS and
+checkout's own target volume (suitekit/ns.py: the job's namespace), with CARGO_BUILD_JOBS and
 NRESE_MEMORY_CAP_GB from the environment (defaults 4 and 8) and the container capped
 to match.
 """
@@ -35,11 +36,14 @@ import math
 import os
 import random
 import re
+import shutil
 import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
+import threading
 import tomllib
 from pathlib import Path
 
@@ -52,12 +56,20 @@ from suitekit.compare import (KEPT_POINTS, UNSTABLE_PEAK, bootstrap_ratio, clien
                               compare_reports, counter_changes, load_report, peak_spread, pooled,
                               process_peak, series_ratios, spread, statistic, thin)
 from suitekit.workloads import fast_data_name  # noqa: E402
+from suitekit import ns  # noqa: E402
 
 # The volumes (benches/hosts.toml [volumes]; NRESE_FAST_VOLUME and NRESE_BENCH_VOLUME name others).
 DATA_VOLUME = hosts.volume("fast")
 BENCH_VOLUME = hosts.volume("data")
-TARGET_VOLUME = os.environ.get("NRESE_TARGET_VOLUME", f"nrese-target-{ROOT.name}")
-CARGO_VOLUME = "nrese-cargo"
+# This checkout's own build volume, and its containers' and scratch's names: the job's
+# namespace (suitekit/ns.py); the Cargo registry is a cache every job shares.
+TARGET_VOLUME = ns.name("target", ROOT)
+CARGO_VOLUME = ns.shared("cargo")
+OWNER = "fast"
+# Its scratch in the shared fast volume.
+VOLUME_SCRATCH = f"/fast/scratch/{ns.name('scratch', ROOT)}"
+# The host lock under which shared fast data is made (generated or concatenated): one job at a time.
+FAST_LOCK = ns.lock_dir() / "fast-data.lock"
 SCRATCH = ROOT / "tmp" / "fast"
 BASELINES = Path(os.environ.get("NRESE_FAST_BASELINES") or ROOT / "benches" / "baselines" / "fast")
 # The full reports, outside git (the same path on the main and the office PC).
@@ -71,6 +83,21 @@ def rust_image() -> str:
     return os.environ.get("RUST_IMAGE", f"rust:{channel}-bookworm")
 
 
+def pinned(tag: str) -> str:
+    """The image ID this job runs for `tag`, pinned at its start (pin_images): a retag meanwhile
+    can't change what a later case or side runs; a tag not pinned is an error, never run."""
+    return ns.image_id(tag, ROOT)
+
+
+def pin_images(tags) -> None:
+    """At the start, before anything is timed: every image the run's containers use, pulled if
+    missing and resolved to its ID for the whole job (ns.pin_images); one that can't be stops it."""
+    try:
+        ns.pin_images(tags, ROOT, run=docker)
+    except ns.ImageError as error:
+        sys.exit(str(error))
+
+
 def host_path(path: Path) -> str:
     return path.as_posix()
 
@@ -81,6 +108,9 @@ def load_cases() -> list[dict]:
 
 
 def select(cases: list[dict], args) -> list[dict]:
+    if args.cases is not None and not args.cases.strip(","):
+        # An empty selection (a gate's plan that couldn't be read) is an error, never every case.
+        sys.exit("--cases names no case")
     if args.cases:
         wanted = args.cases.split(",")
         unknown = set(wanted) - {c["name"] for c in cases}
@@ -105,6 +135,9 @@ FAST_DATA = Path(os.environ.get("NRESE_FAST_DATA") or Path.home() / "nrese-bench
 CONTAINER_PATH = re.compile(r"(?<![\w./:-])(/target|/fast|/data|/src|/out|/inputs|/ore)(?=/|\s|'|\"|;|$)")
 # The scope's peak, printed by the native runtime's wrapper after the command.
 SCOPE_PEAK = re.compile(r"^fast-scope-peak (\d+)$", re.M)
+# The scope's pressure stall totals (PSI, µs): time its tasks waited for a CPU, for I/O (the page
+# cache missing), for memory (reclaim). What a process met that another didn't, per case.
+SCOPE_PRESSURE = re.compile(r"^fast-scope-pressure((?: \w+=\d*)*)$", re.M)
 
 
 def native_dirs() -> dict[str, Path]:
@@ -139,7 +172,7 @@ def files(script: str) -> subprocess.CompletedProcess:
 
 
 def docker(args: list[str], timeout: float | None = None, capture: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(["docker", *args], capture_output=capture, text=True, timeout=timeout, env=ENV,
+    return subprocess.run([ns.executable(), *args], capture_output=capture, text=True, timeout=timeout, env=ENV,
                           encoding="utf-8", errors="replace")
 
 
@@ -193,22 +226,24 @@ def quiet_slot(what: str):
         holder.wait(timeout=60)
 
 
-def container(name: str, cap_gb: float, command: list[str], env: dict | None = None,
+def container(kind: str, cap_gb: float, command: list[str], env: dict | None = None,
               timeout: float | None = CASE_TIMEOUT_S) -> tuple[int, str, str, float]:
     """Runs `command` under a memory cap without swap, in the Rust image or natively; (exit
-    code, stdout, stderr, wall seconds). Exit 137: killed at the cap."""
+    code, stdout, stderr, wall seconds). Exit 137: killed at the cap. Its name: `kind` in the
+    job's namespace."""
+    name = ns.name(f"fast-{kind}", ROOT)
     cap_gb = capped(cap_gb)
     SCRATCH.mkdir(parents=True, exist_ok=True)
     if RUNTIME == "native":
         return process(name, cap_gb, command, env, timeout)
-    argv = ["run", "--rm", "--name", name, f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g", *cpu_args(),
+    argv = ["run", "--rm", *ns.name_args(name, ROOT, OWNER), f"--memory={cap_gb}g", f"--memory-swap={cap_gb}g", *cpu_args(),
             *quiet_label(),
             "-v", f"{TARGET_VOLUME}:/target:ro", "-v", f"{DATA_VOLUME}:/fast",
             "-v", f"{BENCH_VOLUME}:/data:ro", "-v", f"{host_path(ROOT)}:/src:ro",
             "-v", f"{host_path(SCRATCH)}:/out"]
     for key, value in (env or {}).items():
         argv += ["-e", f"{key}={value}"]
-    argv += [rust_image(), *command]
+    argv += [pinned(rust_image()), *command]
     started = time.monotonic()
     try:
         done = docker(argv, timeout=timeout)
@@ -216,6 +251,52 @@ def container(name: str, cap_gb: float, command: list[str], env: dict | None = N
         docker(["rm", "-f", name])
         return 124, "", f"timed out after {timeout} s", time.monotonic() - started
     return done.returncode, done.stdout, done.stderr, time.monotonic() - started
+
+
+# The scope's anonymous and kernel memory at its peak (research round 8: the gate's Linux memory
+# metric; memory.peak also counts the file cache the case's reads were charged, which depends on
+# what the host had cached). cgroup v2 keeps no such peak: a thread outside the measured process
+# samples memory.stat every 50 ms, so a spike shorter than that can be missed.
+SCOPE_ANON_KERNEL = re.compile(r"^fast-anon-kernel-peak (\d+)$", re.M)
+KERNEL_PARTS = ("kernel_stack", "pagetables", "sec_pagetables", "percpu", "sock", "vmalloc", "slab")
+
+
+def anon_kernel_bytes(stat: str) -> int | None:
+    """anon + kernel from a cgroup's memory.stat (kernel: its own field, else the sum of its parts)."""
+    fields = dict(line.split() for line in stat.splitlines() if len(line.split()) == 2)
+    if "anon" not in fields:
+        return None
+    kernel = int(fields["kernel"]) if "kernel" in fields else sum(int(fields.get(k, 0)) for k in KERNEL_PARTS)
+    return int(fields["anon"]) + kernel
+
+
+class AnonKernelSampler(threading.Thread):
+    """Samples a scope's anon + kernel memory until stopped; `peak`: the largest seen. The scope's
+    cgroup directory is what the command's wrapper writes to `where` once it runs in it."""
+
+    def __init__(self, where: Path, period_s: float = 0.05):
+        super().__init__(daemon=True)
+        self.where, self.period_s, self.peak = where, period_s, None
+        self.halt = threading.Event()
+
+    def run(self):
+        stat = None
+        while not self.halt.is_set():
+            try:
+                if stat is None:
+                    group = self.where.read_text().strip() if self.where.is_file() else ""
+                    stat = Path(group) / "memory.stat" if group else None
+                value = anon_kernel_bytes(stat.read_text()) if stat else None
+            except OSError:
+                value = None
+            if value is not None:
+                self.peak = max(self.peak or 0, value)
+            self.halt.wait(self.period_s if stat else 0.005)
+
+    def stop(self) -> int | None:
+        self.halt.set()
+        self.join(timeout=2)
+        return self.peak
 
 
 def process(name: str, cap_gb: float, command: list[str], env: dict | None = None,
@@ -227,20 +308,33 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
     dirs = native_dirs()
     FAST_DATA.mkdir(parents=True, exist_ok=True)
     unit = f"{name}-{os.getpid()}-{int(time.monotonic() * 1000)}"
-    wrapper = ('g=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); "$@"; rc=$?; '
-               'echo "fast-scope-peak $(cat "$g/memory.peak" 2>/dev/null)" >&2; exit $rc')
+    # The process's initial stack sits below its environment: a pad of random size each process
+    # moves it (Mytkowicz et al., ASPLOS 2009), on top of address randomisation.
+    pad = {"NRESE_LAYOUT_PAD": "x" * random.SystemRandom().randrange(0, 4096)}
+    wrapper = ('g=/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup); echo "$g" > "$FAST_SCOPE_DIR"; "$@"; rc=$?; '
+               'echo "fast-scope-peak $(cat "$g/memory.peak" 2>/dev/null)" >&2; p=; '
+               'for r in cpu io memory; do p="$p $r=$(sed -n "s/^some .*total=//p" "$g/$r.pressure" 2>/dev/null)"; done; '
+               'echo "fast-scope-pressure$p" >&2; exit $rc')
     # At the cap the kernel kills the command alone (OOMPolicy=continue): the wrapper then still prints the peak.
-    argv = [*scope_argv(unit, f"{int(cap_gb * 1024)}m"), "sh", "-c", wrapper, "sh",
-            *(native(c, dirs) for c in command)]
+    # Pinned (pinned_cpus) the command and all it starts stay on one L3 and NUMA node.
+    cpus = pinned_cpus()
+    argv = [*scope_argv(unit, f"{int(cap_gb * 1024)}m"), *(["taskset", "-c", cpus] if cpus else []),
+            "sh", "-c", wrapper, "sh", *(native(c, dirs) for c in command)]
     started = time.monotonic()
     cleanup_error = ""
+    where = FAST_DATA / f".scope-{unit}"
+    sampler = AnonKernelSampler(where)
+    sampler.start()
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, encoding="utf-8",
-                              errors="replace", env={**ENV, **{k: str(v) for k, v in (env or {}).items()}},
+                              errors="replace", env={**ENV, **pad, "FAST_SCOPE_DIR": str(where),
+                                                     **{k: str(v) for k, v in (env or {}).items()}},
                               pass_fds=tuple(map(int, os.environ.get("SUITE_LEASE_FDS", "").split())))
     except subprocess.TimeoutExpired:
         done = subprocess.CompletedProcess(argv, 124, "", f"timed out after {timeout} s")
     finally:
+        anon_kernel = sampler.stop()
+        where.unlink(missing_ok=True)
         # Nothing outlives its case: what the scope still holds (a child the command left) goes.
         try:
             end_scope(unit)
@@ -250,8 +344,11 @@ def process(name: str, cap_gb: float, command: list[str], env: dict | None = Non
             print(cleanup_error, file=sys.stderr)
     # The peak first: a record's note is the last line of stderr, the command's own.
     peaks = SCOPE_PEAK.findall(done.stderr)
-    err = SCOPE_PEAK.sub("", done.stderr).rstrip("\n")
-    err = (f"fast-scope-peak {peaks[-1]}\n" if peaks else "") + err
+    pressures = SCOPE_PRESSURE.findall(done.stderr)
+    err = SCOPE_PRESSURE.sub("", SCOPE_PEAK.sub("", done.stderr)).rstrip("\n")
+    err = ((f"fast-scope-peak {peaks[-1]}\n" if peaks else "")
+           + (f"fast-scope-pressure{pressures[-1]}\n" if pressures else "")
+           + (f"fast-anon-kernel-peak {anon_kernel}\n" if anon_kernel else "") + err)
     if cleanup_error:
         err += "\n" + cleanup_error
     return done.returncode or (1 if cleanup_error else 0), done.stdout, err, time.monotonic() - started
@@ -261,6 +358,15 @@ def scope_peak_mib(stderr: str) -> int | None:
     """The native runtime's scope peak, in MiB, if the wrapper printed it."""
     found = SCOPE_PEAK.findall(stderr or "")
     return int(found[-1]) // 1048576 if found else None
+
+
+def scope_stalls_ms(stderr: str) -> dict | None:
+    """The native runtime's pressure stalls of the scope, ms per resource, if printed."""
+    found = SCOPE_PRESSURE.findall(stderr or "")
+    if not found:
+        return None
+    pairs = (item.split("=") for item in found[-1].split())
+    return {k: round(int(v) / 1000, 1) for k, v in pairs if v.isdigit()} or None
 
 
 def binaries() -> dict:
@@ -281,15 +387,17 @@ def build(args) -> int:
     if RUNTIME == "native":
         sys.exit("the native runtime builds nothing: a build host's binaries come in NRESE_FAST_BIN "
                  "(scripts/cargo-guarded.sh build --release --locked with the packages of fast.py BUILD)")
+    pin_images([rust_image()])
     jobs =os.environ.get("CARGO_BUILD_JOBS", "4")
     cap = os.environ.get("NRESE_MEMORY_CAP_GB", "8")
-    for volume in (TARGET_VOLUME, CARGO_VOLUME):
-        docker(["volume", "create", volume])
+    docker(ns.volume("create", TARGET_VOLUME, ROOT, OWNER))
+    print(f"build volume {TARGET_VOLUME} (fast.py clean --build removes it)", flush=True)
     for packages in BUILD:
-        command = ["run", "--rm", "--name", f"fast-build-{ROOT.name}", f"--memory={cap}g", f"--memory-swap={cap}g",
+        command = ["run", "--rm", *ns.name_args(ns.name("fast-build", ROOT), ROOT, OWNER),
+                   f"--memory={cap}g", f"--memory-swap={cap}g",
                    f"--cpus={jobs}", "-v", f"{host_path(ROOT)}:/src:ro", "-v", f"{TARGET_VOLUME}:/target",
                    "-v", f"{CARGO_VOLUME}:/usr/local/cargo/registry", "-e", "CARGO_TARGET_DIR=/target",
-                   "-e", f"CARGO_BUILD_JOBS={jobs}", "-e", f"NRESE_MEMORY_CAP_GB={cap}", "-w", "/src", rust_image(),
+                   "-e", f"CARGO_BUILD_JOBS={jobs}", "-e", f"NRESE_MEMORY_CAP_GB={cap}", "-w", "/src", pinned(rust_image()),
                    "bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked", "--quiet", *packages]
         print("build:", " ".join(packages), flush=True)
         done = docker(command, capture=False)
@@ -341,6 +449,96 @@ def seed_from_inputs(target: str) -> bool:
 OPTIONS = {"prepared": False, "routes": True, "empty_queries": False}
 PREPARED = "PREPARED.json"
 
+# The release gate's measurement of each case (`--measure benches/fast/measure.toml`, written by
+# release_gate.py calibrate from the gate's own noise): the perf lab's runs and warm-ups a
+# process, and the case's repetitions (fresh processes for the perf lab, files a process for
+# the DL tools), the same for every side of a gate whatever the case's own arguments say.
+# `batch`: executions a timed sample (perf_lab --batch), of the queries `batch_queries` names
+# (all without), applied only with `run --batch`, when every side's perf lab has it (the
+# gate's CAPABILITIES).
+# `processes`: a DL tool's fresh processes a pass, pooled (its `repeat` runs inside one process;
+# a process's memory layout, hence its time, differs from the next one's).
+MEASURE: dict[str, dict] = {}
+MEASURED_KEYS = ("runs", "warmup", "repeat", "batch", "batch_queries", "processes")
+
+
+def load_measure(path: Path) -> tuple[dict[str, dict], str]:
+    """The calibration's cases (only the keys fast.py applies) and the file's SHA-256."""
+    data = path.read_bytes()
+    cases = tomllib.loads(data.decode("utf-8")).get("case", {})
+    return ({name: {k: (v if k == "batch_queries" else int(v)) for k, v in entry.items() if k in MEASURED_KEYS}
+             for name, entry in cases.items()}, hashlib.sha256(data).hexdigest())
+
+
+def with_flag(args: list[str], flag: str, value) -> list[str]:
+    """`args` with `flag VALUE`: the existing value replaced (every occurrence), else appended."""
+    out, found = list(args), False
+    for i, a in enumerate(out[:-1]):
+        if a == flag:
+            out[i + 1], found = str(value), True
+    return out if found else out + [flag, str(value)]
+
+
+def measured(case: dict) -> dict:
+    """The case as the calibration measures it (MEASURE): the case itself without an entry."""
+    m = MEASURE.get(case["name"])
+    if not m:
+        return case
+    case = dict(case)
+    if case.get("tool", "perf_lab") == "perf_lab":
+        args = list(case.get("args", []))
+        for key in ("runs", "warmup") + (("batch", "batch_queries") if OPTIONS.get("batch") else ()):
+            if key in m:
+                value = ",".join(m[key]) if key == "batch_queries" else m[key]
+                args = with_flag(args, "--" + key.replace("_", "-"), value)
+        case["args"] = args
+    for key in ("repeat", "processes"):
+        if key in m:
+            case[key] = m[key]
+    return case
+
+
+def warm_inputs(case: dict) -> int:
+    """Reads a warm case's input files once before its timing, so that every pass meets them
+    in the page cache whatever ran before (a large case evicting them, the first pass after
+    prepare); the bytes read. Cold runs empty the cache themselves (drop_page_cache)."""
+    if RUNTIME != "native" or "cold" in case.get("page_cache", ["warm"]):
+        return 0
+    total = 0
+    for path in input_files(case):
+        try:
+            with path.open("rb") as stream:
+                while chunk := stream.read(1 << 22):
+                    total += len(chunk)
+        except OSError:
+            continue  # a missing file is the case's own failure to report
+    return total
+
+
+def pinned_cpus() -> str | None:
+    """The CPUs timings run on (taskset notation): NRESE_FAST_CPUS, else the host
+    configuration's `cpus` (benches/hosts.toml: one L3 and NUMA node), else unpinned."""
+    if os.environ.get("NRESE_FAST_CPUS") is not None:
+        return os.environ["NRESE_FAST_CPUS"] or None
+    found = hosts.current()
+    config = hosts.configuration(found[0]) if found else None
+    return (config or {}).get("cpus")
+
+
+def host_state() -> dict | None:
+    """The host's state now (scripts/hosts/hygiene.py): frequency policy, THP, load, others
+    busy; None off Linux."""
+    if RUNTIME != "native" or not Path("/proc/self").exists():
+        return None
+    cpus = pinned_cpus()
+    done = subprocess.run([sys.executable, str(ROOT / "scripts" / "hosts" / "hygiene.py"),
+                           *(["--cpus", cpus] if cpus else []), "--sample-s", "1"],
+                          capture_output=True, text=True, timeout=60)
+    try:
+        return json.loads(done.stdout)
+    except ValueError:
+        return {"problems": [f"hygiene.py failed: {done.stderr.strip()[-200:]}"]}
+
 
 def ensure_data(spec: str) -> dict:
     """Generates `spec` once (or takes it from the verified inputs); its `expect` (the
@@ -357,7 +555,11 @@ def ensure_data(spec: str) -> dict:
             if files(f"test -s {target}").returncode != 0:
                 raise RuntimeError(f"missing input: {spec} was not prepared (fast.py prepare)")
             return {}
-        files(f"test -s {target} || cat {parts} > {target}")
+        # Into the shared volume whole, one job at a time per host (FAST_LOCK): another job may
+        # be reading or making the same file.
+        part = f"{target}.{ns.name('part', ROOT)}"
+        with ns.lock(FAST_LOCK):
+            files(f"test -s {target} || {{ cat {parts} > {part} && mv -f {part} {target}; }}")
         return {}
     path = data_file(spec)
     seed_from_inputs(path)
@@ -367,10 +569,23 @@ def ensure_data(spec: str) -> dict:
     if OPTIONS["prepared"]:
         raise RuntimeError(f"missing input: {spec} was not prepared (fast.py prepare)")
     kind, *params = spec.split()
-    print(f"  generating {path}", flush=True)
-    code, out, err, _ = container(f"fast-gen-{ROOT.name}", 8, [
-        "bash", "-c", f"/target/release/examples/perf_lab generate {kind} {path} {' '.join(params)} > {path}.expect.json"
-                      f" && cat {path}.expect.json"])
+    # One job at a time per host makes a shared file (FAST_LOCK), checked again under the lock;
+    # it is generated into this job's staging directory beside it (the same file system) and
+    # published whole: its side files and data first, the answers (.expect.json, what says a
+    # file is there) last. A reader never sees a half-written file under its name.
+    with ns.lock(FAST_LOCK):
+        found = files(f"cat {path}.expect.json")
+        if found.returncode == 0 and found.stdout.strip():
+            return json.loads(found.stdout)["expect"]
+        print(f"  generating {path}", flush=True)
+        folder, name = path.rsplit("/", 1)
+        stage = f"{folder}/.{ns.name('gen', ROOT)}"
+        script = (f"rm -rf {stage} && mkdir -p {stage} && /target/release/examples/perf_lab generate {kind} "
+                  f"{stage}/{name} {' '.join(params)} > {stage}/{name}.expect.json"
+                  f" && for f in {stage}/{name}.*; do case $f in *.expect.json) ;; *) mv -f $f {folder}/ ;; esac; done"
+                  f" && mv -f {stage}/{name} {path} && mv -f {stage}/{name}.expect.json {path}.expect.json"
+                  f" && rm -rf {stage} && cat {path}.expect.json")
+        code, out, err, _ = container("gen", 8, ["bash", "-c", script])
     if code != 0:
         raise RuntimeError(f"generating {spec} failed: {err[-500:]}")
     return json.loads(out)["expect"]
@@ -398,7 +613,7 @@ def ensure_ore(name: str):
     script = (f"mkdir -p /fast/ore && cp /ore/{name}.owl /fast/ore/{name}.owl && "
               f"printf '{name}\\tconvert\\tntriples\\t/fast/ore/{name}.owl\\n' > /fast/ore/{name}.manifest.tsv")
     docker(["run", "--rm", "-v", f"{DATA_VOLUME}:/fast", "-v", f"{host_path(ORE_DIR)}:/ore:ro", "alpine", "sh", "-c", script])
-    docker(["run", "--rm", "--memory=10g", "-v", f"{DATA_VOLUME}:/fast", dl_image(), "batch",
+    docker(["run", "--rm", "--memory=10g", "-v", f"{DATA_VOLUME}:/fast", pinned(dl_image()), "batch",
             f"/fast/ore/{name}.manifest.tsv", f"/fast/ore/{name}.results.tsv", "/fast/ore", "600"], timeout=900)
     files(f"rm -f /fast/ore/{name}.owl /fast/ore/{name}.manifest.tsv /fast/ore/{name}.results.tsv")
     if files(f"test -s {target}").returncode != 0:
@@ -543,6 +758,7 @@ def profile_line(stderr: str, stdout: str, prefix: str = "profile ") -> dict:
 
 def run_case(case: dict, label: str, rep: int) -> dict:
     """Runs a case once; the record: status, metric, samples, memory, checks, routes."""
+    case = measured(case)
     expect = ensure_data(case["data"])
     alt_expect = ensure_data(case["data_alt"]) if case.get("data_alt") else {}
     for extra in case.get("extra", []):
@@ -555,10 +771,16 @@ def run_case(case: dict, label: str, rep: int) -> dict:
     waited = time.monotonic()
     with quiet_slot(f"fast {case['name']}"):
         waited = time.monotonic() - waited
+        warmed = warm_inputs(case)
         record = measure(case, label, rep, expect, alt_expect, data)
-        if rep == 1 and case.get("frontier") and record["status"] in LIMITS:
+        # Not in a gate's pass (--prepared): the rerun past the limit times nothing the gate
+        # judges, and took a quarter of a pass (dl-transitive-400: 226 of 1,018 s, 19 Oct 2026).
+        if rep == 1 and case.get("frontier") and record["status"] in LIMITS and not OPTIONS["prepared"]:
             record["frontier"] = frontier(case, label, rep, expect, alt_expect, data)
     record["slot_wait_s"] = round(waited, 1)
+    # How the case was measured: the calibration's settings, if it has an entry, and the bytes
+    # of input read into the page cache first.
+    record["measurement"] = {**MEASURE.get(case["name"], {}), "warmed_mib": warmed >> 20}
     return record
 
 
@@ -608,11 +830,11 @@ def verdict(case: dict, record: dict) -> dict:
 
 def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
     """run_case's measurement, its data ready: the record."""
-    name = f"fast-{case['name']}-{ROOT.name}"
+    name = case["name"]
     tool = case.get("tool", "perf_lab")
     out_json = f"/out/{case['name']}.json"
     record = {"case": case["name"], "rep": rep, "status": "ok", "notes": []}
-    scratch = f"/fast/scratch/{case['name']}"
+    scratch = f"{VOLUME_SCRATCH}/{case['name']}"
     repeat = int(case.get("repeat", 1))
     # Each measured invocation gets the case's wall limit; 0 means unlimited in both runtimes.
     timeout_s = case.get("timeout_s", CASE_TIMEOUT_S) or None
@@ -701,8 +923,14 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         envelope = str(int(case["cap_gb"] * 1024))
         command = ["/target/release/examples/tableau_consistency", "--timeout", timeout,
                    "--memory-mib", envelope, *files]
-        code, out, err, wall = container(name, case["cap_gb"], command, timeout=timeout_s)
-        rows = parse_tableau(out)
+        # Fresh processes (`processes`), their rows pooled; a failing one ends the case.
+        rows, wall = [], 0.0
+        for _ in range(int(case.get("processes", 1))):
+            code, out, err, w = container(name, case["cap_gb"], command, timeout=timeout_s)
+            rows += parse_tableau(out)
+            wall += w
+            if code != 0:
+                break
         # The tool names each file as it was given: natively, by its host path.
         named = native(data) if RUNTIME == "native" else data
         main = [r for r in rows if r["file"] == named]
@@ -726,8 +954,15 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         out_tsv = f"/out/{case['name']}.tsv"
         command = ["bash", "-c", f"/target/release/examples/{binary} --out {out_tsv} --repeat {repeat} {data}"
                                  f" && sha256sum {out_tsv} | cut -c1-16 && wc -l < {out_tsv}"]
-        code, out, err, wall = container(name, case["cap_gb"], command, timeout=timeout_s)
-        result = profile_line(err, out)
+        # Fresh processes (`processes`): each one's profile, pooled below; the last one's answer.
+        profiles, wall = [], 0.0
+        for _ in range(int(case.get("processes", 1))):
+            code, out, err, w = container(name, case["cap_gb"], command, timeout=timeout_s)
+            profiles.append(profile_line(err, out))
+            wall += w
+            if code != 0:
+                break
+        result = profiles[-1]
         lines = out.split()
         if code == 0 and len(lines) >= 2:
             result["hash"], result["subsumptions"] = lines[-2], int(lines[-1])
@@ -736,11 +971,14 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         total = result.get("total")
         if total is None and all(isinstance(result.get(k), float) for k in phases):
             total = sum(result[k] for k in phases)
-        result["whole_ms"] = total
-        result["samples_ms"] = [total] if total is not None else []
-        result["phase_samples"] = {k: [v] for k, v in result.items()
-                                   if k in ("read", "owl", "normalise", "compile", "prepare", "saturate", "assemble", "write")
-                                   and isinstance(v, float)}
+        totals = [pr.get("total") if pr.get("total") is not None else
+                  (sum(pr[k] for k in phases) if all(isinstance(pr.get(k), float) for k in phases) else None)
+                  for pr in profiles]
+        result["samples_ms"] = [x for x in totals if x is not None]
+        result["whole_ms"] = statistics.median(result["samples_ms"]) if result["samples_ms"] else total
+        result["phase_samples"] = {k: [pr[k] for pr in profiles if isinstance(pr.get(k), float)] for k in
+                                   ("read", "owl", "normalise", "compile", "prepare", "saturate", "assemble", "write")
+                                   if isinstance(result.get(k), float)}
         record["wall_s"] = round(wall, 2)
         if code != 0:
             record["status"] = classify_failure(code, err, result)
@@ -791,11 +1029,18 @@ def invocation_observation(case: dict, result: dict, stderr: str, identity: dict
     peak = process_peak(result.get("peak_mib"), phases)
     levels = client_throughput(result)
     return {"identity": identity, "samples": samples(case, result), "estimator": estimator(result),
+            **({"batched": batched} if (batched := {q["name"]: q["batch"] for r in result.get("_repeats", [result])
+                                                    for q in r.get("queries", []) if q.get("batch")}) else {}),
             "metric": metric_value(case, result), "counters": counters(case, result),
             **({"throughput": levels} if levels else {}),
             "rows": {q["name"]: q.get("rows") for q in result.get("queries", []) if "name" in q},
             "phase_peaks": phases, "peak_mib": peak, "memory_kind": "lifetime" if peak else "unknown",
-            "cgroup_peak_mib": result.get("cgroup_peak_mib") or scope_peak_mib(stderr)}
+            "cgroup_peak_mib": result.get("cgroup_peak_mib") or scope_peak_mib(stderr),
+            **({"anon_kernel_peak_bytes": int(found[-1])} if (found := SCOPE_ANON_KERNEL.findall(stderr or "")) else {}),
+            **({"peak_live_requested_bytes": result["peak_live_requested_bytes"]}
+               if isinstance(result.get("peak_live_requested_bytes"), int) else {}),
+            **({"peak_kind": result["peak_kind"]} if result.get("peak_kind") else {}),
+            **({"stall_ms": stalls} if (stalls := scope_stalls_ms(stderr)) else {})}
 
 
 def estimator(result: dict) -> str:
@@ -843,7 +1088,7 @@ def counters(case: dict, result: dict) -> dict:
             if field in q:
                 out[f"q.{q['name']}.{field}"] = q[field]
     for phase, values in (result.get("phases") or {}).items():
-        for field in ("allocations", "allocated_mib"):
+        for field in ("allocations", "requested_mib", "allocated_mib"):
             if field in values:
                 out[f"phases.{phase}.{field}"] = values[field]
     return out
@@ -1064,13 +1309,20 @@ def samples(case: dict, result: dict) -> dict:
         return cold_series(result, detailed=True)
     if metric == "sum_p50_ms":
         # A perf lab without samples (main's): its p50, one value per process (estimator()).
-        return {q["name"]: q["samples_ms"] if "samples_ms" in q else [q["p50_ms"]]
-                for q in result.get("queries", []) if "error" not in q and ("samples_ms" in q or "p50_ms" in q)}
+        # Repeated processes (`repeat`) pool their samples: the pass's values are all of them.
+        series: dict[str, list[float]] = {}
+        for r in result.get("_repeats", [result]):
+            for q in r.get("queries", []):
+                if "error" not in q and ("samples_ms" in q or "p50_ms" in q):
+                    series.setdefault(q["name"], []).extend(q["samples_ms"] if "samples_ms" in q else [q["p50_ms"]])
+        return series
     section = metric.split(".")[0]
+    # Repeated processes (`repeat`) pool their samples, as the queries' above.
+    runs = result.get("_repeats", [result])
     if isinstance(result.get(section), dict) and "samples_ms" in result[section]:
-        return {"_": result[section]["samples_ms"]}
+        return {"_": [s for r in runs for s in (r.get(section) or {}).get("samples_ms", [])]}
     if "samples_ms" in result:
-        return {"_": [s for s in result["samples_ms"] if s is not None]}
+        return {"_": [s for r in runs for s in r.get("samples_ms", []) if s is not None]}
     if "_repeats" in result:
         values = [lookup(metric, r) for r in result["_repeats"]]
         scale = 1000.0 if metric in ("load_s", "open_s") else 1.0
@@ -1158,6 +1410,64 @@ def file_digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+# One copy of a host's prepared data for every gate (NRESE_FAST_SHARED; release-gate.sh sets it):
+# each file under FAST_DATA lives once, read-only, as SHARED/blobs/<sha256>, hardlinked into each
+# gate's FAST_DATA, and SHARED/index/<generator>.json says which files a data file and its
+# sidecars were, so that the next gate links them in instead of generating them again (the data
+# is deterministic in the generator, perf_lab/generate.rs, and its parameters). Office kept a
+# 6.1 GB copy per gate name (19 Oct 2026).
+SHARED = Path(os.environ["NRESE_FAST_SHARED"]) if os.environ.get("NRESE_FAST_SHARED") else None
+
+
+def generator_key(root: Path = ROOT) -> str:
+    return file_digest(root / "crates" / "nrese-store" / "examples" / "perf_lab" / "generate.rs")[:16]
+
+
+def spec_files(path: Path) -> list[Path]:
+    """A data file and its sidecars (`FILE.*`: the generator's answers, commit files)."""
+    return [path, *sorted(p for p in path.parent.glob(path.name + ".*") if p.is_file())] if path.parent.is_dir() else [path]
+
+
+def adopt(path: Path, index: dict, shared: Path, data: Path) -> bool:
+    """Links `path` and its sidecars in from the shared blobs, if the index has them all."""
+    group = index.get(path.relative_to(data).as_posix())
+    if not group or path.exists():
+        return False
+    links = [(data / rel, shared / "blobs" / sha) for rel, sha in group.items()]
+    if not all(blob.is_file() for _, blob in links):
+        return False
+    for target, blob in links:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            os.link(blob, target)
+    return True
+
+
+def share(paths: list[Path], index: dict, shared: Path, data: Path) -> None:
+    """Each file of `paths` under `data` into the shared blobs (read-only), hardlinked back; the
+    index learns the group under its first file. A file on another filesystem stays unshared."""
+    group = {}
+    for path in paths:
+        if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(data.resolve()):
+            continue
+        sha = file_digest(path)
+        blob = shared / "blobs" / sha
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if not blob.exists():
+                os.link(path, blob)
+                os.chmod(blob, 0o444)
+            elif not os.path.samefile(blob, path):
+                linked = path.with_name(path.name + ".sharing")
+                os.link(blob, linked)
+                os.replace(linked, path)
+        except OSError:
+            continue
+        group[path.relative_to(data).as_posix()] = sha
+    if group:
+        index[next(iter(group))] = group
+
+
 def prepare(args) -> int:
     """`prepare`: the selected cases' data, generated once by this perf lab (NRESE_FAST_BIN:
     the harness revision's, for every side of a gate), and FAST_DATA/PREPARED.json: every file
@@ -1167,12 +1477,22 @@ def prepare(args) -> int:
         sys.exit("prepare is the native runtime's (a release gate's host)")
     cases = select(load_cases(), args)
     entries, failed = {}, {}
+    index_path = SHARED / "index" / f"{generator_key()}.json" if SHARED else None
+    index = json.loads(index_path.read_text(encoding="utf-8")) if index_path and index_path.is_file() else {}
+    adopted = 0
     for case in cases:
         try:
-            for spec in [case["data"], *([case["data_alt"]] if case.get("data_alt") else []), *case.get("extra", [])]:
+            specs = [case["data"], *([case["data_alt"]] if case.get("data_alt") else []), *case.get("extra", [])]
+            local = [Path(native(data_file(s))) for s in specs if s != "none" and not s.startswith("volume:")]
+            if SHARED:
+                adopted += sum(adopt(path, index, SHARED, FAST_DATA) for path in local)
+            for spec in specs:
                 ensure_data(spec)
             if case.get("reference") and not seed_from_inputs(case["reference"]):
                 raise RuntimeError(f"missing input: reference taxonomy {case['reference']}")
+            if SHARED:
+                for path in local + ([Path(native(case["reference"]))] if case.get("reference") else []):
+                    share(spec_files(path), index, SHARED, FAST_DATA)
             for path in input_files(case):
                 if not path.is_file():
                     raise RuntimeError(f"missing input: {path}")
@@ -1184,6 +1504,11 @@ def prepare(args) -> int:
         except Exception as error:  # a case without its data is reported, the others prepared
             failed[case["name"]] = str(error)[:300]
             print(f"NOT prepared {case['name']}: {failed[case['name']]}", flush=True)
+    if index_path:
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.with_suffix(".partial").write_text(json.dumps(index, indent=0), encoding="utf-8")
+        os.replace(index_path.with_suffix(".partial"), index_path)
+        print(f"shared data ({SHARED}): {adopted} data files linked in, not generated")
     manifest_path = FAST_DATA / PREPARED
     manifest_path.write_text(json.dumps({"git": manifest.git(ROOT), "binaries": binaries(),
                                          "cases": [c["name"] for c in cases if c["name"] not in failed],
@@ -1239,8 +1564,24 @@ def run(args) -> int:
                  "the cases as host processes")
     catalog = load_cases()
     cases = select(catalog, args)
+    if RUNTIME != "native":
+        # Every image the cases' containers use, pinned before the first case (pin_images).
+        ore = any(spec.startswith("ore:") for c in cases for spec in [c["data"], *c.get("extra", [])])
+        pin_images([rust_image(), *([dl_image()] if ore else [])])
     OPTIONS.update(prepared=getattr(args, "prepared", False), routes=not getattr(args, "no_routes", False),
                    empty_queries=getattr(args, "empty_queries", False))
+    # A timed gate's pass (scripts/release-gate.sh sets NRESE_TIMED_GATE) reads prepared data
+    # only: it never makes data while it times (fast.py prepare does, before any pass).
+    if os.environ.get("NRESE_TIMED_GATE") == "1" and not OPTIONS["prepared"]:
+        sys.exit("a timed gate's pass reads prepared data only: fast.py prepare first, then run --prepared")
+    MEASURE.clear()
+    OPTIONS["measure"] = None
+    OPTIONS["batch"] = getattr(args, "batch", False)
+    OPTIONS["timing"] = getattr(args, "timing", None)
+    if getattr(args, "measure", None):
+        found, OPTIONS["measure"] = load_measure(Path(args.measure))
+        MEASURE.update(found)
+    OPTIONS["cpus"] = pinned_cpus() if RUNTIME == "native" else None
     prepared = None
     if OPTIONS["prepared"]:
         prepared = prepared_inputs(cases)
@@ -1254,12 +1595,15 @@ def run(args) -> int:
     BASELINES.mkdir(parents=True, exist_ok=True)
     out = (Path(args.out) if args.out else REPORTS / f"{started:%Y-%m-%d}-{label}.json").resolve()
     report = {"label": label, "started": started.isoformat(timespec="seconds"), "started_ns": time.time_ns(),
-              "git": manifest.git(ROOT), "machine": manifest.machine(RUNTIME), "runtime": RUNTIME,
+              "git": manifest.git(ROOT), "machine": manifest.machine(RUNTIME, ROOT), "runtime": RUNTIME,
               "reps": args.reps, "planned_cases": [c["name"] for c in cases],
               "all_cases": [c["name"] for c in catalog], "case_manifest": case_manifest(catalog),
               "options": dict(OPTIONS), "records": []}
     if prepared:
         report["prepared"] = {"manifest_sha256": prepared["sha256"], "files": len(prepared["files"])}
+    # The host as the pass met it, and as it left it: a governor, boost or another user's work
+    # that differs between passes is in the passes' own reports (release_gate.py reports it).
+    report["host_state"] = host_state()
     if RUNTIME == "native":
         # What the binaries are: they come from a build host, not from this checkout.
         report["binaries"] = binaries()
@@ -1300,11 +1644,14 @@ def run(args) -> int:
                       f"metric {f['metric']}, peak {f['peak_mib']} MiB")
             out.write_text(json.dumps(report, indent=1), encoding="utf-8")
     report["git_finished"] = manifest.git(ROOT)
+    report["host_state_finished"] = host_state()
     if RUNTIME == "native":
         report["binaries_finished"] = binaries()
     if prepared:
         # The prepared data must be what it was at the start of the pass, file by file.
         report["prepared"]["changed"] = changed_inputs(prepared["files"])
+    if RUNTIME != "native":
+        report["images"] = ns.pinned(ROOT)  # what the cases ran: the job's image IDs
     report["finished_ns"] = time.time_ns()
     report["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
     report["duration_s"] = round((datetime.datetime.now() - started).total_seconds(), 1)
@@ -1325,6 +1672,171 @@ def run(args) -> int:
         print(f"{key}: {len(names)}" + ("" if key.startswith("ok") else ": " + ", ".join(names)))
     print(f"\n{len(report['records'])} runs of {len(cases)} cases in {report['duration_s'] / 60:.1f} min; "
           f"{len(bad)} not as expected; report: {out}; kept: {kept}")
+    return 1 if bad else 0
+
+
+def drawn(seed: str, *key) -> int:
+    """A number drawn from a gate's seed for `key` (the same seed draws the same again)."""
+    return int(hashlib.sha256(":".join(map(str, (seed, *key))).encode()).hexdigest()[:16], 16)
+
+
+def palindrome(sides: list[str], block: int, seed: str | None = None) -> list[tuple[str, int]]:
+    """A block's runs of one case: the sides, then the same mirrored (base, main, cand, cand,
+    main, base), each side's two runs centred on the same instant whatever their durations; even
+    blocks start from the other end. With a seed each pair of blocks still has one block of each
+    orientation, which of them comes first drawn (lks, 20 Oct 2026: an order fixed in advance can
+    line up with whatever else repeats on the host). Each entry: (side, its run 1 or 2)."""
+    flip = block % 2 == 0
+    if seed is not None:
+        flip ^= bool(drawn(seed, "pair", (block - 1) // 2) & 1)
+    order = sides[::-1] if flip else sides
+    return [(s, 1) for s in order] + [(s, 2) for s in order[::-1]]
+
+
+def fresh_copies(sides: list[dict], into: Path) -> list[dict]:
+    """The sides with their binaries copied anew under `into`: new files, read into new page-cache
+    pages. lks-aa-20 (20 Oct 2026): a byte-identical copy of one build timed 4.8 % apart from it
+    on creaders' read p50 in one session and 1.7 % the other way in the next, consistently in every
+    block of the session; the offset belongs to the file's cached instance, and blocks timing the
+    same instance share it. A copy per block draws it anew, so it is part of the blocks' variance
+    and the blocks are independent units (and a confirmation round doesn't inherit round 1's)."""
+    out = []
+    for side in sides:
+        if not SIDE_NAME.fullmatch(side["name"]):
+            raise ValueError(f"a side's name is one path component: {side['name']!r}")
+        target = into / side["name"]
+        shutil.copytree(side["bin"], target, ignore=shutil.ignore_patterns(".refs", "*.partial-*"))
+        perf_lab = target / "release" / "examples" / "perf_lab"
+        out.append({**side, "bin": target.as_posix(), "built": side["bin"],
+                    "inode": perf_lab.stat().st_ino if perf_lab.is_file() else None})
+    return out
+
+
+@contextlib.contextmanager
+def block_copies(sides: list[dict], root: Path | None, block: int):
+    """The sides as this block times them: with `root` (fast.py block --fresh-copies), copies
+    (fresh_copies()) in a directory made for this block alone under it (mkdtemp, never one that
+    was there), written back before timing, and that directory removed after the block, also
+    when a copy fails. Nothing else under `root` is touched (Sol, 20 Oct 2026)."""
+    if root is None:
+        yield sides
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    own = Path(tempfile.mkdtemp(prefix=f"block-{block}-", dir=root))
+    try:
+        copied = fresh_copies(sides, own)
+        if hasattr(os, "sync"):
+            os.sync()  # the copies written back now, not during the first case's runs
+        yield copied
+    finally:
+        shutil.rmtree(own, ignore_errors=True)
+
+
+SIDE_NAME = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def parse_side(spec: str) -> dict:
+    """`NAME:BINDIR:REVISION[:FLAGS]`, FLAGS comma-separated: no-routes, empty-queries,
+    timing=watchdog|spawn (the build's CAPABILITIES). NAME is one path component (block's copies
+    are made under it)."""
+    name, binaries, revision, *rest = spec.split(":", 3)
+    if not SIDE_NAME.fullmatch(name):
+        sys.exit(f"--side {spec}: the side's name must be letters, digits, - and _ (a path component)")
+    flags = set((rest[0] if rest else "").split(",")) - {""}
+    timing = next((f.split("=", 1)[1] for f in flags if f.startswith("timing=")), None)
+    return {"name": name, "bin": binaries, "revision": revision, "routes": "no-routes" not in flags,
+            "empty_queries": "empty-queries" in flags, "timing": timing}
+
+
+def use_side(side: dict) -> None:
+    """The runs that follow are the side's: its binaries (or this block's copy of them), revision
+    and perf lab's options."""
+    os.environ["NRESE_FAST_BIN"] = side["bin"]
+    os.environ["NRESE_FAST_REVISION"] = side["revision"]
+    OPTIONS.update(routes=side["routes"], empty_queries=side["empty_queries"], timing=side["timing"])
+
+
+def block(args) -> int:
+    """`block`: one block of a release gate: every case run on every side as a palindrome
+    (palindrome()), the runs written as one report per side and run, `pass-<n>-<side>.json`
+    (n: the run's place in the block, 6 (block - 1) + 1 ...), each record with its block, layout
+    and nanosecond start and end. `--seed`: the orientation and the cases' order drawn from it;
+    `--fresh-copies DIR`: every side's binaries timed from a copy made for this block
+    (fresh_copies()), removed after it."""
+    if RUNTIME != "native":
+        sys.exit("block is the native runtime's (a release gate's host)")
+    sides = [parse_side(s) for s in args.side]
+    catalog = load_cases()
+    cases = select(catalog, args)
+    OPTIONS.update(prepared=True)
+    MEASURE.clear()
+    OPTIONS["measure"], OPTIONS["batch"] = None, getattr(args, "batch", False)
+    if args.measure:
+        found, OPTIONS["measure"] = load_measure(Path(args.measure))
+        MEASURE.update(found)
+    OPTIONS["cpus"] = pinned_cpus()
+    prepared = prepared_inputs(cases)
+    if prepared["errors"]:
+        print("\n".join(f"prepared data: {e}" for e in prepared["errors"]), file=sys.stderr)
+        return 2
+    seed = args.seed
+    order = palindrome([s["name"] for s in sides], args.block, seed)
+    place = {run: len(order) * (args.block - 1) + i + 1 for i, run in enumerate(order)}
+    if seed is not None:
+        cases = list(cases)
+        random.Random(drawn(seed, "cases", args.block)).shuffle(cases)
+    with block_copies(sides, args.fresh_copies, args.block) as timed:
+        return timed_block(args, timed, catalog, cases, prepared, order, place, seed)
+
+
+def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict], prepared: dict,
+                order: list[tuple[str, int]], place: dict, seed: str | None) -> int:
+    by_name = {s["name"]: s for s in sides}
+    started = time.time_ns()
+    common = {"started": datetime.datetime.now().isoformat(timespec="seconds"), "git": manifest.git(ROOT),
+              "machine": manifest.machine(RUNTIME), "runtime": RUNTIME, "reps": 1, "block": args.block,
+              "layout": args.layout, "planned_cases": [c["name"] for c in cases], "seed": seed,
+              "orientation": [name for name, run in order if run == 1],
+              "case_manifest": case_manifest(catalog), "host_state": host_state(),
+              "prepared": {"manifest_sha256": prepared["sha256"], "files": len(prepared["files"])}}
+    reports = {}
+    for name, run in order:
+        use_side(by_name[name])
+        reports[(name, run)] = {**common, "label": f"gate-{place[(name, run)]}-{name}", "side": name, "run": run,
+                                "options": dict(OPTIONS), "binaries": binaries(), "records": [],
+                                "instance": {k: by_name[name].get(k) for k in ("built", "inode")}}
+    args.out.mkdir(parents=True, exist_ok=True)
+    for case in cases:
+        for name, run in order:
+            use_side(by_name[name])
+            t0 = time.monotonic()
+            start_ns = time.time_ns()
+            try:
+                record = run_case(case, f"gate-{args.block}-{name}", 1)
+            except Exception as error:  # a case that breaks mustn't stop the block
+                record = {"case": case["name"], "rep": 1, "status": "failed", "notes": [str(error)[:300]],
+                          "checks": [], "routes": [], "samples": {}, "metric": None,
+                          "expected_outcome": case.get("outcome", "ok")}
+            record["verdict"] = verdict(case, record)
+            record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
+            record.update(started_ns=start_ns, finished_ns=time.time_ns(), block=args.block, layout=args.layout,
+                          side=name, run=run)
+            reports[(name, run)]["records"].append(record)
+            print(f"block {args.block} {case['name']:<24} {name:<5} {run} {record['status']:<13} "
+                  f"{record['case_s']:>6.1f} s", flush=True)
+    finished = {"git_finished": manifest.git(ROOT), "host_state_finished": host_state()}
+    changed = changed_inputs(prepared["files"])
+    bad = 0
+    for (name, run), report in reports.items():
+        use_side(by_name[name])
+        records = report["records"]
+        report.update(finished, binaries_finished=binaries(), finished=datetime.datetime.now().isoformat(timespec="seconds"),
+                      started_ns=min((r["started_ns"] for r in records), default=started),
+                      finished_ns=max((r["finished_ns"] for r in records), default=time.time_ns()))
+        report["prepared"] = {**report["prepared"], "changed": changed}
+        (args.out / f"pass-{place[(name, run)]}-{name}.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+        bad += len(not_as_expected(records))
+    print(f"block {args.block}: {len(cases)} cases x {len(order)} runs, layout {args.layout}; {bad} runs not as expected")
     return 1 if bad else 0
 
 
@@ -1425,23 +1937,23 @@ def table(args) -> int:
 
 
 def clean(args) -> int:
-    """This worktree's scratch and its stopped containers; the fast data volume only with
-    `--data`, and never while a container uses it: the volume is shared by every worktree and
-    campaign on the host, and holds copies of the verified inputs besides the generated data."""
+    """This checkout's scratch and its containers; with `--build` its build volume too (a job's
+    cleanup: what carries its namespace and checkout, nothing else, ns.clean); the fast data
+    volume only with `--data`, by hand, and never while a container uses it: it is shared by
+    every job on the host and holds copies of the verified inputs besides the generated data."""
     import shutil
     if RUNTIME == "native":
         shutil.rmtree(SCRATCH, ignore_errors=True)
-        print(f"removed {SCRATCH}")
+        files(f"rm -rf {VOLUME_SCRATCH}")
+        print(f"removed {SCRATCH} and {VOLUME_SCRATCH}")
         if args.data:
             shutil.rmtree(FAST_DATA, ignore_errors=True)
             print(f"removed the generated data {FAST_DATA}")
         return 0
-    stale = docker(["ps", "-a", "--filter", "status=exited", "--filter", f"name=-{ROOT.name}$",
-                    "--format", "{{.Names}}"]).stdout.split()
-    for name in stale:
-        docker(["rm", name])
+    files(f"rm -rf {VOLUME_SCRATCH}")
+    removed = [] if not args.build else ns.clean(ROOT, OWNER, run=docker)
     shutil.rmtree(SCRATCH, ignore_errors=True)
-    print(f"removed {SCRATCH}" + (f" and {len(stale)} stopped containers of this worktree" if stale else ""))
+    print(f"removed {SCRATCH} and {VOLUME_SCRATCH}" + (f"; this checkout's {', '.join(removed)}" if removed else ""))
     if not args.data:
         print(f"kept the volume {DATA_VOLUME} (shared; `clean --data` removes it)")
         return 0
@@ -1449,7 +1961,7 @@ def clean(args) -> int:
     if users:
         print(f"kept the volume {DATA_VOLUME}: in use by {', '.join(users)}")
         return 1
-    done = docker(["volume", "rm", DATA_VOLUME])
+    done = docker(ns.volume("rm", DATA_VOLUME))
     print(f"removed the volume {DATA_VOLUME}" if done.returncode == 0 else f"volume {DATA_VOLUME}: {done.stderr.strip()}")
     return done.returncode
 
@@ -1477,6 +1989,15 @@ def main() -> int:
                                 "reports are unchecked (ok null), never failed")
             s.add_argument("--empty-queries", action="store_true",
                            help="a perf lab that requires --queries (main's): an empty directory where a case has none")
+            s.add_argument("--measure", metavar="TOML",
+                           help="the release gate's measurement per case (benches/fast/measure.toml: runs, "
+                                "warm-ups, repetitions), for every side alike")
+            s.add_argument("--timing", choices=("watchdog", "spawn"),
+                           help="how this perf lab's timed window is kept (its build's CAPABILITIES): "
+                                "the gate refuses sides timed differently")
+            s.add_argument("--batch", action="store_true",
+                           help="with --measure: its batched timing (perf_lab --batch), when every side's "
+                                "perf lab has it")
         if name == "compete":
             s.add_argument("--systems")
             s.add_argument("--runs", type=int, default=1)
@@ -1488,13 +2009,28 @@ def main() -> int:
             s.add_argument("--counts-only", action="store_true",
                            help="the printer's verdicts for the rewritten comparators only: rows against "
                                 "NRESE's, no timings, no slot")
+    s = sub.add_parser("block", help="one block of a release gate: every case on every side, as a palindrome")
+    s.add_argument("--cases")
+    s.add_argument("--areas")
+    s.add_argument("--side", action="append", required=True, metavar="NAME:BINDIR:REVISION[:FLAGS]",
+                   help="a side, in order (base, main, cand); FLAGS: no-routes, empty-queries, timing=...")
+    s.add_argument("--block", type=int, required=True)
+    s.add_argument("--layout", type=int, default=1)
+    s.add_argument("--measure", metavar="TOML")
+    s.add_argument("--batch", action="store_true")
+    s.add_argument("--seed", help="the gate's: each pair of blocks' orientation and the cases' order drawn from it")
+    s.add_argument("--fresh-copies", type=Path, metavar="DIR",
+                   help="time every side from a copy of its binaries made for this block under DIR")
+    s.add_argument("--out", type=Path, required=True, help="the directory the side-runs' reports go to")
     t = sub.add_parser("table")
     t.add_argument("--baseline", help="a run's report, for each case's time and peak")
     t.add_argument("--write", action="store_true", help="into benches/CATALOG.md between its markers")
     sub.add_parser("build")
     k = sub.add_parser("clean")
     k.add_argument("--data", action="store_true",
-                   help="also the shared fast data volume (refused while a container uses it)")
+                   help="also the shared fast data volume, by hand (refused while a container uses it)")
+    k.add_argument("--build", action="store_true",
+                   help="also this checkout's containers and build volume (a job's cleanup: never another's)")
     c = sub.add_parser("compare")
     c.add_argument("base")
     c.add_argument("new")
@@ -1507,7 +2043,7 @@ def main() -> int:
         from compete import compete
         return compete(args)
     return {"list": list_cases, "build": build, "run": run, "compare": compare, "clean": clean,
-            "table": table, "prepare": prepare}[args.command](args)
+            "table": table, "prepare": prepare, "block": block}[args.command](args)
 
 
 if __name__ == "__main__":

@@ -8,8 +8,8 @@ memory of the process and the descendants it waited for (wait4), and the process
 sampled from /proc), exit code. The process runtime maps
 container paths in the command and environment to the host directories mounted there.
 
-Everything a runtime creates is named with PREFIX and removed by `cleanup()`, also when
-a run fails; nothing else is touched.
+Everything a runtime creates is named in the job's namespace (ns.py), labelled with it, and
+removed by `cleanup()`, also when a run fails; nothing else is touched.
 """
 from __future__ import annotations
 
@@ -27,7 +27,14 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-PREFIX = "nrese-suite-"
+try:
+    from . import ns
+except ImportError:  # run as a script (the scope entry below): the kit's module beside it
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import ns
+
+OWNER = "suite"
+ROOT = Path(__file__).resolve().parents[3]  # the checkout the suite runs from
 SAMPLE_S = 0.25
 
 
@@ -406,13 +413,22 @@ class Runtime:
 
 class DockerRuntime(Runtime):
     kind = "docker"
+    by_id = True  # its containers run the pinned image IDs (a dry run's rendering: the tags)
+
+    def pin(self, tags):
+        """At the tool's start, before anything is timed: every image its containers will run,
+        pulled if missing and resolved to its ID for the whole job; one that can't be stops it."""
+        try:
+            ns.pin_images(tags, ROOT)
+        except ns.ImageError as error:
+            raise SystemExit(str(error))
 
     def __init__(self, scratch: Path, port: int, echo=print):
         super().__init__(scratch, port, echo)
         self.containers: dict[str, Server] = {}
 
     def args(self, spec: Spec, detached: bool) -> list[str]:
-        args = ["docker", "run", "--name", spec.name, "--init"]
+        args = [ns.executable(), "run", *ns.name_args(spec.name, ROOT, OWNER), "--init"]
         # A measurement's own container: the quiet slot's watcher pauses the others.
         if os.environ.get("NRESE_QUIET_TOKEN"):
             args += ["--label", f"nrese.quiet={os.environ['NRESE_QUIET_TOKEN']}"]
@@ -441,7 +457,9 @@ class DockerRuntime(Runtime):
         command = list(spec.command)
         if not spec.entrypoint:
             args += ["--entrypoint", command.pop(0)]
-        return args + [spec.image] + command
+        # The image by the ID pinned at the job's start (pin): a retag while the job runs can't
+        # change what a later system or repetition runs; a tag not pinned is an error, never run.
+        return args + [ns.image_id(spec.image, ROOT) if self.by_id else spec.image] + command
 
     def remove(self, name: str):
         if name not in self.containers:
@@ -531,7 +549,7 @@ class DockerRuntime(Runtime):
     def new_store(self, name):
         if name in self.created_stores or name in self.names("volume"):
             raise FileExistsError(name)
-        subprocess.run(["docker", "volume", "create", name], check=True, capture_output=True)
+        ns.docker(ns.volume("create", name, ROOT, OWNER), check=True)
         self.created_stores.append(name)
         return name
 
@@ -874,6 +892,8 @@ class DryRuntime(Runtime):
     def __init__(self, inner: Runtime, echo=print):
         super().__init__(inner.scratch, inner.port, echo)
         self.inner = inner
+        if isinstance(inner, DockerRuntime):
+            inner.by_id = False  # a dry run pulls nothing: it shows the tags
         self.kind = inner.kind
         self.dry = True
 

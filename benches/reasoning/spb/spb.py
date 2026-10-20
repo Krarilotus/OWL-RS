@@ -55,8 +55,8 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent / "maintenance"))
 
 from maintenance import NreseBinary  # noqa: E402
-from suitekit import quiet  # noqa: E402
-from suitekit.adapters import Context, Graphdb  # noqa: E402
+from suitekit import ns, quiet  # noqa: E402
+from suitekit.adapters import Context, Graphdb, images_for  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
@@ -120,11 +120,11 @@ def jar() -> Path:
 def run_driver(name: str, work: Path, data: Path, log: Path, timeout_s: int) -> int:
     """Runs the driver with host networking (the endpoints listen on localhost)."""
     spec = driver_spec(name, work, data, None)
-    command = ["docker", "run", "--rm", "--name", name, "--network", "host",
+    command = [ns.executable(), "run", "--rm", *ns.name_args(ns.name(name, ROOT), ROOT, "reasoning"), "--network", "host",
                "-u", f"{os.getuid()}:{os.getgid()}", "-e", "HOME=/tmp"]
     for m in spec.mounts:
         command += ["-v", f"{m.source}:{m.target}{':ro' if m.readonly else ''}"]
-    command += [spec.image, *spec.command]
+    command += [ns.image_id(spec.image, ROOT), *spec.command]
     with open(log, "w", encoding="utf-8") as out:
         try:
             return subprocess.run(command, stdout=out, stderr=subprocess.STDOUT, timeout=timeout_s).returncode
@@ -194,6 +194,7 @@ def generate_now(args):
         return
     (out / "generated").mkdir(parents=True, exist_ok=True)
     runtime = DockerRuntime(Path(setting("SPB_SCRATCH", str(Path.home() / "nrese-reasoning-suite/scratch"))), args.port)
+    runtime.pin([driver_spec("pin", Path("."), Path("."), None).image])
     run_id = f"spb-generate-{tier(args.size)}"
     work = Path(runtime.scratch) / run_id
     work.mkdir(parents=True, exist_ok=True)
@@ -213,7 +214,7 @@ def generate_now(args):
                    {"generateCreativeWorks"})
         shutil.copy(spb_home() / "definitions.properties", work / "definitions.properties")
         started = time.monotonic()
-        rc = run_driver(f"nrese-suite-{run_id}-driver", work, out, logs / "generate.log", 24 * 3600)
+        rc = run_driver(f"suite-{run_id}-driver", work, out, logs / "generate.log", 24 * 3600)
         print(f"generation exit {rc} after {time.monotonic() - started:.0f} s")
         if rc != 0:
             raise SystemExit(f"generation failed; see {logs / 'generate.log'}")
@@ -263,6 +264,8 @@ def cmd_run(args):
     manifest = Manifest(results, ROOT, sys.argv[1:], protocol, "docker", dict(os.environ))
     writer = Writer(results / "results.csv", echo=print)
     runtime = DockerRuntime(Path(setting("SPB_SCRATCH", str(Path.home() / "nrese-reasoning-suite/scratch"))), args.port)
+    runtime.pin([driver_spec("pin", Path("."), Path("."), None).image,
+                 *(i for key in systems for i in images_for(system_for(key), ROOT))])
     registry = __import__("tomllib").loads((ROOT / "benches/suite/systems.toml").read_text(encoding="utf-8"))
     code = 0
     try:
@@ -328,7 +331,7 @@ def one(args, key, rep, runtime, writer, results, data, date, stamp, agents, pub
             for info in (data / "generated").glob("*.info"):
                 shutil.copy(info, work / "generated" / info.name)
             started = time.monotonic()
-            rc = run_driver(f"nrese-suite-{run_id}-driver", work, data, logs / "benchmark.log",
+            rc = run_driver(f"suite-{run_id}-driver", work, data, logs / "benchmark.log",
                             args.duration_s + args.warmup_s + 3600)
             text = (logs / "benchmark.log").read_text(encoding="utf-8", errors="replace")
             summary = parse_summary(text)

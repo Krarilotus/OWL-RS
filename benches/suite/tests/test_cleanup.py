@@ -321,6 +321,7 @@ class Cleanup(unittest.TestCase):
 
     def test_docker_collisions_never_predelete_shared_resources(self):
         rt = runtime.DockerRuntime(self.scratch, 1)
+        rt.by_id = False  # images by tag: the pins are test_job_namespace's
         with patch.object(runtime, "run_quiet", return_value=done(0, "shared\n")) as command, \
                 patch.object(runtime.subprocess, "run") as started:
             with self.assertRaises(FileExistsError):
@@ -332,6 +333,7 @@ class Cleanup(unittest.TestCase):
 
     def test_docker_removal_failures_and_daemon_errors_retain_ownership(self):
         rt = runtime.DockerRuntime(self.scratch, 1, echo=Mock())
+        rt.by_id = False  # images by tag: the pins are test_job_namespace's
         rt.containers.update((name, runtime.Server(runtime.Spec(name, "image", []))) for name in ("bad", "good"))
         rt.created_stores.append("owned-volume")
 
@@ -355,6 +357,7 @@ class Cleanup(unittest.TestCase):
 
     def test_docker_stats_is_stopped_when_wait_is_interrupted(self):
         rt = runtime.DockerRuntime(self.scratch, 1, echo=Mock())
+        rt.by_id = False  # images by tag: the pins are test_job_namespace's
         sampler = Mock()
         commands = []
 
@@ -385,6 +388,7 @@ class Cleanup(unittest.TestCase):
 
     def test_docker_start_and_stop_interruption_keeps_sampler_owned(self):
         rt = runtime.DockerRuntime(self.scratch, 1, echo=Mock())
+        rt.by_id = False  # images by tag: the pins are test_job_namespace's
         sampler = Mock(stop=Mock(side_effect=[KeyboardInterrupt(), 17]))
         spec = runtime.Spec("server", "image", ["unused"])
         with patch.object(rt, "names", return_value=[]), patch.object(runtime.subprocess, "run", return_value=done()), \
@@ -401,6 +405,7 @@ class Cleanup(unittest.TestCase):
 
     def test_docker_sampler_startup_failure_keeps_partial_server_owned(self):
         rt = runtime.DockerRuntime(self.scratch, 1, echo=Mock())
+        rt.by_id = False  # images by tag: the pins are test_job_namespace's
         with patch.object(rt, "names", return_value=[]), patch.object(runtime.subprocess, "run", return_value=done()), \
                 patch.object(rt, "sample", side_effect=KeyboardInterrupt()):
             with self.assertRaises(KeyboardInterrupt):

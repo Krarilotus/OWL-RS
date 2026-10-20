@@ -130,6 +130,11 @@ impl StoreService {
                 Engine::open(&config.data_dir, engine_config)?
             }
         };
+        // The canonical views versions keep (canonical equality answers) draw on the
+        // memory the queries do.
+        engine.set_canonical_view_budget(std::sync::Arc::new(
+            nrese_exec::Budget::unlimited().within(runtime.query_memory()),
+        ));
         let before = engine.snapshot().revision();
         let preloaded_ontology = preload_ontology(&engine, &config)?;
         let ql_mode = config.ql_rewriting;

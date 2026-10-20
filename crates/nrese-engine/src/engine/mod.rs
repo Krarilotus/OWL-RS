@@ -50,7 +50,7 @@ pub use replication::LogBatch;
 pub use snapshot::{InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity};
 pub use transaction::{CommitSummary, Transaction};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub compaction: CompactionPolicy,
     /// Run large compactions and automatic checkpoints on a background thread. When
@@ -59,6 +59,10 @@ pub struct EngineConfig {
     pub background_maintenance: bool,
     /// Used by [`Engine::open`] only.
     pub durability: DurabilityConfig,
+    /// The process's memory root, which the scratch of every checkpoint the engine writes
+    /// (its own, images, bulk loads') is charged within before it is allocated: one more
+    /// can't spend what queries or another store's checkpoint hold. `None`: no limit.
+    pub admission: Option<Arc<nrese_exec::SharedBudget>>,
 }
 
 impl Default for EngineConfig {
@@ -67,6 +71,7 @@ impl Default for EngineConfig {
             compaction: CompactionPolicy::default(),
             background_maintenance: true,
             durability: DurabilityConfig::default(),
+            admission: None,
         }
     }
 }
@@ -185,6 +190,8 @@ pub(crate) struct Version {
     /// What its statements are: kept where only their layout changes (compaction, a
     /// checkpoint mapped), new for any other version ([`Content`]).
     pub(crate) content: Content,
+    /// What canonical reads of it read, once asked for ([`equality::CanonicalCache`]).
+    pub(crate) canonical: equality::CanonicalCache,
 }
 
 /// The identity of a version's statements: two versions with the same one show the same
@@ -217,6 +224,7 @@ impl Version {
             dictionary_len: 0,
             equality: Default::default(),
             content: Content::fresh(),
+            canonical: Default::default(),
         }
     }
 
@@ -243,6 +251,8 @@ impl Version {
             equality: Arc::clone(&self.equality),
             // Only compaction replaces a stack this way: the same statements.
             content: self.content,
+            // A canonical view of the old runs would hold them: made afresh.
+            canonical: Default::default(),
         };
         *next.stack_mut(stack) = index;
         next
@@ -357,6 +367,11 @@ struct Shared {
     /// `owl:sameAs`, when the inferred stack holds the closure over representatives
     /// ([`Engine::set_equality`]).
     equality: RwLock<Option<TermId>>,
+    /// What the canonical views versions keep are charged to
+    /// ([`Engine::set_canonical_view_budget`]).
+    views: RwLock<Arc<nrese_exec::Budget>>,
+    /// The checkpoints' scratch is charged within it ([`EngineConfig::admission`]).
+    admission: Option<Arc<nrese_exec::SharedBudget>>,
 }
 
 impl Shared {
@@ -366,6 +381,7 @@ impl Shared {
             Arc::clone(&self.dictionary),
             Arc::clone(&self.statistics),
             *self.equality.read(),
+            Arc::clone(&self.views.read()),
         )
     }
 
@@ -391,7 +407,7 @@ impl Shared {
                 wal.rotate(snapshot.revision() + 1)?;
                 snapshot
             };
-            let path = checkpoint::write(durable.root(), &snapshot)?;
+            let path = checkpoint::write(durable.root(), &snapshot, self.admission.as_ref())?;
             self.checkpoints.fetch_add(1, Ordering::Relaxed);
             durable.wal.lock().release_through(snapshot.revision())?;
             (snapshot, path)
@@ -441,6 +457,7 @@ impl Shared {
                     dictionary_len: current.dictionary_len,
                     equality: Arc::clone(&current.equality),
                     content: current.content,
+                    canonical: Default::default(),
                 }
             });
         }
@@ -608,6 +625,8 @@ impl Engine {
             maintaining: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
             equality: RwLock::new(None),
+            views: RwLock::new(Arc::new(nrese_exec::Budget::unlimited())),
+            admission: config.admission,
         });
         let worker = config
             .background_maintenance
@@ -653,6 +672,15 @@ impl Engine {
     /// reads the stacks as stored.
     pub fn set_equality(&self, same_as: Option<TermId>) {
         *self.inner.shared.equality.write() = same_as;
+    }
+
+    /// What the canonical views of versions are charged to while their versions keep them
+    /// (canonical equality answers; `Snapshot::with_canonical_equality`): unlimited unless
+    /// given one. A view the budget refuses is made on its reader's own budget, for that
+    /// reader alone ([`Snapshot::with_canonical_equality_within`]). Snapshots taken from now
+    /// on use it.
+    pub fn set_canonical_view_budget(&self, budget: Arc<nrese_exec::Budget>) {
+        *self.inner.shared.views.write() = budget;
     }
 
     /// `owl:sameAs` if reads expand equality classes ([`Self::set_equality`]).
@@ -720,8 +748,9 @@ impl Engine {
     /// and both stacks) like the store's own, named by its revision, while writers go on. A
     /// data directory holding it opens at that revision.
     pub fn write_image(&self, dir: &std::path::Path) -> EngineResult<ImageInfo> {
-        let snapshot = self.inner.shared.snapshot();
-        let path = crate::durability::checkpoint::write(dir, &snapshot)?;
+        let shared = &self.inner.shared;
+        let snapshot = shared.snapshot();
+        let path = crate::durability::checkpoint::write(dir, &snapshot, shared.admission.as_ref())?;
         let version = snapshot.version();
         Ok(ImageInfo {
             path,

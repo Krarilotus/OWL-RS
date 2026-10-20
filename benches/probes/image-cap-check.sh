@@ -8,24 +8,29 @@
 # server (NRESE_QUERY_CACHE_BYTES=0 measures without the result cache). Needs Docker and
 # curl; runs on Git Bash or Linux.
 set -u
+# This job's names (scripts/lib/ns.sh): its containers and volumes; the shared datasets' volume.
+NS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+. "$NS_ROOT/scripts/lib/ns.sh"
+DATA_VOLUME=$(ns_shared data)
 img=$1; rel=$2; queries=$3; out=$4
 cap=${CERT_CAP:-4g}
-vol=nrese-cert-data
-name=nrese-cert-serve
+vol=$(ns_name cert-data "$NS_ROOT")
+name=$(ns_name cert-serve "$NS_ROOT")
 port=18080
 mkdir -p "$out/answers"
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$out/cert.log"; }
 
 docker rm -f "$name" >/dev/null 2>&1
-docker volume rm "$vol" >/dev/null 2>&1
-docker volume create "$vol" >/dev/null
+ns_volume rm "$vol" >/dev/null 2>&1
+ns_volume create "$vol" "$NS_ROOT" probe >/dev/null
 
 log "image $img ($(docker image inspect "$img" --format '{{.Id}}'))"
 log "release $rel: $(grep ' graph.ttl$' "$rel/SHA256SUMS")"
 log "cap $cap, no swap"
 
 # 1. Bulk load with the default (parallel) loader.
-MSYS_NO_PATHCONV=1 docker run --rm --name nrese-cert-load --memory "$cap" --memory-swap "$cap" \
+ns_run_args "$(ns_name cert-load "$NS_ROOT")" "$NS_ROOT" probe
+MSYS_NO_PATHCONV=1 docker run --rm "${NS_ARGS[@]}" --memory "$cap" --memory-swap "$cap" \
   -v "$vol:/var/lib/nrese/data" -v "$({ command -v cygpath >/dev/null && cygpath -w "$rel" || printf %s "$rel"; }):/release:ro" --entrypoint sh "$img" -c '
     start=$(date +%s)
     nrese-server load /release/graph.ttl
@@ -36,7 +41,8 @@ log "load: $(grep 'load exit' "$out/load.log") ; store $(tail -1 "$out/load.log"
 
 # 2. Serve under the same cap.
 started=$(date +%s%N)
-MSYS_NO_PATHCONV=1 docker run -d --name "$name" --memory "$cap" --memory-swap "$cap" \
+ns_run_args "$name" "$NS_ROOT" probe
+MSYS_NO_PATHCONV=1 docker run -d "${NS_ARGS[@]}" --memory "$cap" --memory-swap "$cap" \
   ${CERT_ENV:+-e "$CERT_ENV"} -v "$vol:/var/lib/nrese/data" -p "127.0.0.1:$port:8080" "$img" >/dev/null
 for _ in $(seq 1 600); do
   curl -sf "http://127.0.0.1:$port/readyz" >/dev/null && break
@@ -87,5 +93,5 @@ log "state: $(docker inspect "$name" --format 'OOMKilled={{.State.OOMKilled}} re
 
 docker logs "$name" > "$out/server.log" 2>&1
 docker rm -f "$name" >/dev/null
-docker volume rm "$vol" >/dev/null
+ns_volume rm "$vol" >/dev/null
 log "done"

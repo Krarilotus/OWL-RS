@@ -18,7 +18,9 @@ import sys
 import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "suite"))
-from suitekit import hosts  # noqa: E402
+from suitekit import hosts, ns  # noqa: E402
+
+ROOT = pathlib.Path(__file__).resolve().parents[3]  # the checkout: the containers' namespace
 
 # The image, or its verified preserved alias on a host whose Docker has only that (hosts.toml).
 IMAGE = hosts.image("nrese-bench/dl-reference")
@@ -36,7 +38,13 @@ def key(line):
     return (f[0], f[1])
 
 
-def run(cases, timeout, cpus, memory, name="nrese-dl-reference"):
+def run(cases, timeout, cpus, memory, name=None):
+    name = name or ns.name("dl-reference", ROOT)
+    # The reasoners' image, resolved to its ID before the first task and run by it (ns.pin_images).
+    try:
+        ns.pin_images([IMAGE], ROOT)
+    except ns.ImageError as error:
+        raise SystemExit(str(error))
     cases = pathlib.Path(cases).resolve()
     manifest = [l for l in lines(cases / "manifest.tsv") if not l.startswith("#")]
     results = cases / "results.tsv"
@@ -48,10 +56,10 @@ def run(cases, timeout, cpus, memory, name="nrese-dl-reference"):
             break
         (cases / "manifest.rest.tsv").write_text("\n".join(rest) + "\n", encoding="utf-8")
         part.unlink(missing_ok=True)
-        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run([ns.executable(), "rm", "-f", name], capture_output=True)
         subprocess.run(
-            ["docker", "run", "-d", "--name", name, f"--cpus={cpus}", "-m", memory,
-             "-v", f"{cases.as_posix()}:/work", IMAGE, "batch", "/work/manifest.rest.tsv",
+            [ns.executable(), "run", "-d", *ns.name_args(name, ROOT, "reasoning"), f"--cpus={cpus}", "-m", memory,
+             "-v", f"{cases.as_posix()}:/work", ns.image_id(IMAGE, ROOT), "batch", "/work/manifest.rest.tsv",
              "/work/results.part.tsv", "/work/tax", str(timeout)],
             check=True, capture_output=True)
         seen, last = 0, time.monotonic()
@@ -96,9 +104,10 @@ def main():
     r.add_argument("--timeout", type=int, default=60)
     r.add_argument("--cpus", default="8")
     r.add_argument("--memory", default="12g")
-    r.add_argument("--name", default="nrese-dl-reference", help="the container's name (one per concurrent run)")
+    r.add_argument("--name", default="dl-reference",
+                   help="the container's kind, in this job's namespace (one per concurrent run of a job)")
     args = p.parse_args()
-    run(args.cases, args.timeout, args.cpus, args.memory, args.name)
+    run(args.cases, args.timeout, args.cpus, args.memory, ns.name(args.name, ROOT))
 
 
 if __name__ == "__main__":

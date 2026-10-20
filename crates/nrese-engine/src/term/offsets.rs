@@ -7,6 +7,10 @@
 //! lexemes: 105 → 28 MiB), read with the same cache misses: one for the block (whose
 //! table is 1/32 of the keys' count in bytes) and one for the key's end.
 
+use std::ops::Deref;
+
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec};
+
 use crate::mapped::Mapped;
 
 /// Keys per block of block offsets.
@@ -138,32 +142,56 @@ impl BlockEnds {
     }
 }
 
+/// The bytes [`encode`] allocates for keys of `lengths`: the blocks' words, and each key's
+/// relative end in two bytes, or four in a block whose text takes 64 KiB or more.
+pub(crate) fn encoded_bytes(lengths: &[u32]) -> usize {
+    let ends: usize = lengths
+        .chunks(BLOCK)
+        .map(
+            |block| match block.iter().map(|&n| u64::from(n)).sum::<u64>() >= 1 << 16 {
+                true => 4 * block.len(),
+                false => 2 * block.len(),
+            },
+        )
+        .sum();
+    2 * lengths.len().div_ceil(BLOCK) * size_of::<u64>() + ends
+}
+
+/// Block offsets as [`encode`] makes them: the blocks' words, and the keys' relative ends.
+pub(crate) type Encoded<B> = (ChargedVec<u64, B>, ChargedVec<u8, B>);
+
 /// Block offsets for keys of `lengths` (module docs): the blocks' two words each, and the
-/// keys' relative ends; `None` if a block's keys take 4 GiB or more.
-pub(crate) fn encode(lengths: &[u32]) -> Option<(Vec<u64>, Vec<u8>)> {
-    let mut blocks = Vec::with_capacity(2 * lengths.len().div_ceil(BLOCK));
-    let mut ends = Vec::with_capacity(2 * lengths.len());
+/// keys' relative ends, each vector charged to `budget` before it is allocated, for exactly
+/// its capacity ([`encoded_bytes`] together); `None` if a block's keys take 4 GiB or more.
+pub(crate) fn encode<B: Deref<Target = Budget> + Clone>(
+    lengths: &[u32],
+    budget: B,
+) -> Result<Option<Encoded<B>>, BudgetExceeded> {
+    let words = 2 * lengths.len().div_ceil(BLOCK);
+    let mut blocks = ChargedVec::with_capacity(budget.clone(), words)?;
+    let mut ends =
+        ChargedVec::with_capacity(budget, encoded_bytes(lengths) - words * size_of::<u64>())?;
     let mut start = 0u64;
     for block in lengths.chunks(BLOCK) {
         let text: u64 = block.iter().map(|&n| u64::from(n)).sum();
         if text > u64::from(u32::MAX) {
-            return None;
+            return Ok(None);
         }
         let wide = text >= 1 << 16;
-        blocks.push(start);
-        blocks.push(((ends.len() as u64) << 1) | u64::from(wide));
+        blocks.push(start)?;
+        blocks.push(((ends.len() as u64) << 1) | u64::from(wide))?;
         let mut end = 0u64;
         for &n in block {
             end += u64::from(n);
             if wide {
-                ends.extend_from_slice(&(end as u32).to_le_bytes());
+                ends.extend_from_slice(&(end as u32).to_le_bytes())?;
             } else {
-                ends.extend_from_slice(&(end as u16).to_le_bytes());
+                ends.extend_from_slice(&(end as u16).to_le_bytes())?;
             }
         }
         start += text;
     }
-    Some((blocks, ends))
+    Ok(Some((blocks, ends)))
 }
 
 /// The offsets of a mapped dictionary base, as its checkpoint's format has them.
@@ -219,7 +247,8 @@ mod tests {
 
     /// The ends `encode` writes, read back as [`BlockEnds`] reads them.
     fn ends_of(lengths: &[u32]) -> Vec<usize> {
-        let (blocks, ends) = encode(lengths).unwrap();
+        let budget = Budget::unlimited();
+        let (blocks, ends) = encode(lengths, &budget).unwrap().unwrap();
         let end = |i: usize| {
             let block = i / BLOCK;
             let at = blocks[2 * block + 1];
@@ -251,10 +280,41 @@ mod tests {
             expected.push(end);
         }
         assert_eq!(ends_of(&lengths), expected);
-        let (blocks, ends) = encode(&lengths).unwrap();
+        let budget = Budget::unlimited();
+        let (blocks, ends) = encode(&lengths, &budget).unwrap().unwrap();
         assert_eq!(blocks.len(), 2 * lengths.len().div_ceil(BLOCK));
         // Two bytes a key, four in the wide block.
         assert_eq!(ends.len(), 2 * lengths.len() + 2 * BLOCK);
         assert!(<[u64] as Ends>::holding(&[3, 3, 7, 9][..], 0, 4, 3) == 2);
+    }
+
+    /// [`encoded_bytes`] is what [`encode`] charges and allocates, its vectors filled, at
+    /// every width boundary: empty, partial, full and several blocks, of keys around 65,536
+    /// bytes and up to `u32::MAX` (Sol's review, 20 Oct).
+    #[test]
+    fn encoded_bytes_are_what_encode_allocates() {
+        let budget = Budget::unlimited();
+        for count in [0, 1, 63, 64, 65, 128, 129] {
+            for length in [0, 1, 1023, 1024, 65535, 65536, u32::MAX / 64, u32::MAX] {
+                let lengths = vec![length; count];
+                match encode(&lengths, &budget).unwrap() {
+                    Some((blocks, ends)) => {
+                        assert_eq!(
+                            encoded_bytes(&lengths),
+                            blocks.capacity() * 8 + ends.capacity(),
+                            "{count} keys of {length}"
+                        );
+                        assert_eq!(budget.used(), encoded_bytes(&lengths));
+                        assert_eq!(
+                            (blocks.len(), ends.len()),
+                            (blocks.capacity(), ends.capacity())
+                        );
+                    }
+                    None => assert!(lengths.chunks(BLOCK).any(|block| {
+                        block.iter().map(|&n| u64::from(n)).sum::<u64>() > u64::from(u32::MAX)
+                    })),
+                }
+            }
+        }
     }
 }

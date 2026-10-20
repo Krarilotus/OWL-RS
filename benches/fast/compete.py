@@ -91,7 +91,7 @@ def print_queries(case: dict) -> dict:
     files = [fast.data_file(f) for f in [case["data"], *case.get("extra", [])]]
     out = f"/out/printed/{case['name']}"
     code, stdout, err, wall = fast.container(
-        f"fast-print-{fast.ROOT.name}", max(int(case["cap_gb"]) * 2, 8),
+        "print", max(int(case["cap_gb"]) * 2, 8),
         ["/target/release/examples/ql_print_check", "--queries", queries, "--out", out, *files])
     verdicts: dict[str, dict] = {}
     for line in stdout.splitlines()[1:]:
@@ -163,7 +163,7 @@ def export_closure(case: dict) -> str | None:
         return target
     loads = [x for f in [case["data"], *case.get("extra", [])] for x in ("--load", fast.data_file(f))]
     reason = ["--reason", case["semantics"]] if case["semantics"] not in ("none",) else []
-    code, _, err, _ = fast.container(f"fast-export-{fast.ROOT.name}", max(case["cap_gb"], 8),
+    code, _, err, _ = fast.container("export", max(case["cap_gb"], 8),
                                      ["/target/release/examples/perf_lab", *loads, *reason, "--export", target])
     if code != 0:
         print(f"  export of {case['name']}'s closure failed: {err.strip()[-300:]}")
@@ -181,7 +181,7 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
     tier = f"{case['name']}~{semantics}"
     out = RESULTS / stamp / (tier.replace("~", "-") + (f"-{track}" if track else ""))
     cap = int(fast.capped(max(int(case["cap_gb"]), 8)))
-    env = {**fast.ENV, "NRESE_TARGET_VOLUME": fast.TARGET_VOLUME, "DOCKER_MEMORY": f"{cap}g",
+    env = {**fast.ENV, "DOCKER_MEMORY": f"{cap}g",
            "JAVA_HEAP": f"{max(cap - 2, 2)}g", "CARGO_BUILD_JOBS": os.environ.get("CARGO_BUILD_JOBS", "4"),
            "NRESE_MEMORY_CAP_GB": os.environ.get("NRESE_MEMORY_CAP_GB", "8"),
            "CARGO_TARGET_DIR": str(fast.ROOT / "target")}
@@ -305,7 +305,8 @@ def dl_run(case: dict, systems: list[str], nrese_ms: float | None, stamp: str) -
     # The ontology as the fast suite's volume holds it, mounted at /work here.
     file = fast.data_file(case["data"]).removeprefix("/fast/")
     task = "consistency" if case.get("tool", "") == "tableau" else "classify"
-    work = f"fast-dl-{case['name']}"
+    # Its files in the shared fast volume: this job's own (another may run the case too).
+    work = f"{fast.ns.name('dl', fast.ROOT)}-{case['name']}"
     lines = "\n".join(f"{case['name']}\t{s}\t{task}\t/work/{file}" for s in systems) + "\n"
     manifest_path = f"/work/{work}.manifest.tsv"
     script = (f"printf '%s' '{lines}' > {manifest_path} && rm -f /work/{work}.results.tsv /work/{work}.part.tsv && "
@@ -323,9 +324,9 @@ def dl_run(case: dict, systems: list[str], nrese_ms: float | None, stamp: str) -
         if left.stdout.strip() in ("", "0"):
             break
         with fast.quiet_slot(f"compete {case['name']} dl"):
-            done = fast.docker(["run", "--rm", "--name", f"{work}-{fast.ROOT.name}", f"--memory={DL_MEMORY_GB}g",
+            done = fast.docker(["run", "--rm", *fast.ns.name_args(work, fast.ROOT, fast.OWNER), f"--memory={DL_MEMORY_GB}g",
                                 f"--memory-swap={DL_MEMORY_GB}g", *fast.cpu_args(), "-v", f"{fast.DATA_VOLUME}:/work",
-                                fast.dl_image(), "batch", f"/work/{work}.rest.tsv", f"/work/{work}.part.tsv",
+                                fast.pinned(fast.dl_image()), "batch", f"/work/{work}.rest.tsv", f"/work/{work}.part.tsv",
                                 f"/work/{work}-tax", str(timeout_s)], timeout=timeout_s * len(systems) + 300)
         # Results so far, and a timeout for the task the runner stopped at.
         merge = (f"cat /work/{work}.part.tsv >> /work/{work}.results.tsv 2>/dev/null; rm -f /work/{work}.part.tsv; "
@@ -400,7 +401,7 @@ def nemo_custom(case: dict) -> dict:
         started = time.monotonic()
         done = fast.docker(["run", "--rm", f"--memory={case['cap_gb']}g", f"--memory-swap={case['cap_gb']}g",
                             *fast.cpu_args(), "-v", f"{fast.DATA_VOLUME}:/fast", "-v", f"{rules.parent.as_posix()}:/rules:ro",
-                            "--entrypoint", "sh", fast.hosts.image("nrese-bench/nemo"), "-c", script], timeout=900)
+                            "--entrypoint", "sh", fast.pinned(fast.hosts.image("nrese-bench/nemo")), "-c", script], timeout=900)
         wall = time.monotonic() - started
     text = done.stdout
     import re
@@ -455,6 +456,17 @@ def compete(args) -> int:
 
     def save():
         (RESULTS / stamp / "compete.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+
+    # Every image the comparisons' containers run, pinned before the first one (fast.pin_images);
+    # the suite's systems are pinned by the suite's own run.
+    wanted = [fast.rust_image()]
+    for case in cases:
+        for system, semantics in comparators(case, only):
+            if system in DL_SYSTEMS and semantics in ("dl", "el") and not args.counts_only:
+                wanted.append(fast.dl_image())
+            elif system == "nemo" and semantics == "custom" and not args.counts_only:
+                wanted.append(fast.hosts.image("nrese-bench/nemo"))
+    fast.pin_images(wanted)
 
     # Suite jobs, grouped: the cases on the same data and semantics load it once per system.
     groups: dict[tuple, dict] = {}

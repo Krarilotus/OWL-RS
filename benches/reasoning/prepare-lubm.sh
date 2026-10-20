@@ -16,6 +16,13 @@
 #     so those lines are dropped.
 # The generator is pinned (lubm/Dockerfile), so the output is the same on every machine.
 set -euo pipefail
+# This job's names (scripts/lib/ns.sh): its containers and volumes; the shared datasets' volume.
+NS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+. "$NS_ROOT/scripts/lib/ns.sh"
+DATA_VOLUME=$(ns_shared data)
+# Shared datasets are prepared one at a time per host (their staging, the .part and .parts
+# files, and their publication): this script runs again under the host's datasets lock.
+ns_serialize datasets "$0" "$@"
 
 # Datasets, store files and images take tens of GB: don't start on a nearly full disk.
 . "$(dirname "$0")/../../scripts/lib/disk.sh"
@@ -33,25 +40,25 @@ ONTOLOGY_URL=http://swat.cse.lehigh.edu/onto/univ-bench.owl
 
 docker build -q -t nrese-bench/lubm-uba "$HERE/lubm" >/dev/null
 
-if ! docker run --rm -v nrese-bench-data:/data alpine test -s /data/univ-bench.nt; then
-  docker run --rm -v nrese-bench-data:/data alpine sh -c "
+if ! docker run --rm -v "$DATA_VOLUME":/data alpine test -s /data/univ-bench.nt; then
+  docker run --rm -v "$DATA_VOLUME":/data alpine sh -c "
     apk add -q curl >/dev/null &&
     curl -sSfL -o /tmp/univ-bench.owl $ONTOLOGY_URL &&
     sed 's#http://swat.cse.lehigh.edu/onto/univ-bench.owl#http://www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#g' \
       /tmp/univ-bench.owl > /data/univ-bench.owl"
-  docker run --rm -v nrese-bench-data:/data --entrypoint sh "$JENA_IMAGE" -c \
+  docker run --rm -v "$DATA_VOLUME":/data --entrypoint sh "$JENA_IMAGE" -c \
     '/opt/apache-jena-6.2.0/bin/riot --quiet --output=nt /data/univ-bench.owl > /data/univ-bench.nt &&
      rm /data/univ-bench.owl'
 fi
 
 for n in ${*:-1 10 100}; do
-  if docker run --rm -v nrese-bench-data:/data alpine test -s "/data/lubm-$n.nt"; then
+  if docker run --rm -v "$DATA_VOLUME":/data alpine test -s "/data/lubm-$n.nt"; then
     echo "lubm-$n: present"
     continue
   fi
-  docker run --rm -v nrese-bench-data:/data nrese-bench/lubm-uba \
+  docker run --rm -v "$DATA_VOLUME":/data nrese-bench/lubm-uba \
     -u "$n" -f NTRIPLES --consolidate Maximal -t 8 -q -o "/data/lubm-gen-$n" >/dev/null
-  docker run --rm -v nrese-bench-data:/data alpine sh -c "
+  docker run --rm -v "$DATA_VOLUME":/data alpine sh -c "
     cat /data/lubm-gen-$n/* | grep -v '^<> ' > /data/lubm-$n.nt && rm -rf /data/lubm-gen-$n &&
     echo lubm-$n: \$(wc -l < /data/lubm-$n.nt) triples"
 done

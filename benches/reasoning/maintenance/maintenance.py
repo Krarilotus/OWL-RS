@@ -59,7 +59,7 @@ sys.path.insert(0, str(ROOT / "benches/suite"))
 sys.path.insert(0, str(HERE.parent))
 
 from suitekit import quiet  # noqa: E402
-from suitekit.adapters import Context, Nrese, adapter  # noqa: E402
+from suitekit.adapters import Context, Nrese, adapter, images_for  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
@@ -150,10 +150,13 @@ class NreseBinary(Nrese):
     def supports(self, ctx, inputs, regime):
         return None if Path(setting("NRESE_BIN")).is_file() else "set NRESE_BIN"
 
+    def images(self, ctx):
+        return [setting("NRESE_IMAGE", "ubuntu:24.04")]
+
     def spec(self, ctx, name, store, command, env):
         env = {"NRESE_STORE_MODE": "on-disk", "NRESE_DATA_DIR": "/store", "RUST_LOG": "info", **env}
         binary = Path(setting("NRESE_BIN"))
-        return Spec(name, setting("NRESE_IMAGE", "ubuntu:24.04"), [f"/nrese/{binary.name}", *command], env,
+        return Spec(name, self.images(ctx)[0], [f"/nrese/{binary.name}", *command], env,
                     ctx.mounts(Mount(str(binary.parent), "/nrese"), Mount(store, "/store", readonly=False)),
                     memory=ctx.memory)
 
@@ -368,6 +371,7 @@ def cmd_run(args):
     writer = CountingWriter(results / "results.csv", echo=print)
     runtime = DockerRuntime(Path(setting("MAINTENANCE_SCRATCH", str(Path.home() / "nrese-reasoning-suite/scratch"))),
                             args.port)
+    runtime.pin([i for key in systems for i in images_for(system(key), ROOT)])
     code = 0
     try:
         for rep in range(1, args.runs + 1):

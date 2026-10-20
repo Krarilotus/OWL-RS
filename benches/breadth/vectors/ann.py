@@ -29,7 +29,7 @@ sys.path.insert(0, str(HERE.parent))
 import kit  # noqa: E402
 
 REPO, COMMIT = "erikbern/ann-benchmarks", "2e081ad32c1eccab72dcb739ad886c310b90f715"
-VENV = kit.WORK / "venv-ann"
+VENV = kit.ns.directory(kit.WORK, "venv-ann", kit.ROOT)  # this job's own: pip installs into it
 DATA = kit.DATA / "ann"
 # Build arguments that pin what upstream leaves floating or old (docker build --build-arg).
 VERSIONS = {"qdrant": {"QDRANT_VERSION": "1.19.2", "QDRANT_CLIENT_VERSION": "1.19.1"}}

@@ -12,8 +12,14 @@ fn node(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("urn:{local}"))
 }
 
+/// A store of `quads`, without background maintenance: no compaction or checkpoint runs on a
+/// thread of its own while a measurement does (every thread counts).
 fn store(quads: impl IntoIterator<Item = (String, &'static str, String, &'static str)>) -> Engine {
-    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let config = EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::new(config).unwrap();
     let mut tx = engine.transaction();
     for (s, p, o, g) in quads {
         tx.insert(Quad::new(node(&s), node(p), node(&o), node(g)).as_ref());

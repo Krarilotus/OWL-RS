@@ -35,6 +35,7 @@ use std::borrow::Cow;
 
 use keys::PackedKeys;
 use merge::SignedMerge;
+use nrese_exec::{BudgetExceeded, Reservation};
 use run::{PermutationRun, Run};
 
 use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
@@ -541,6 +542,58 @@ impl IndexVersion {
             runs,
             len: self.len,
         }
+    }
+}
+
+/// Where a structure being built reserves its memory before it allocates it: nowhere for
+/// the store's own runs ([`Uncharged`]), a reservation for a canonical view's
+/// (`engine::equality`), which the view then holds. Builders take it as a type parameter:
+/// the store's path is compiled with [`Uncharged`], whose calls inline to nothing.
+pub(crate) trait Charge {
+    /// Whether it counts anything: a builder that holds its memory to its charge may
+    /// build otherwise where it does (resolved when compiled: nothing on the store's path).
+    const COUNTED: bool;
+    fn reserve(&mut self, bytes: usize) -> Result<(), BudgetExceeded>;
+    fn release(&mut self, bytes: usize);
+}
+
+/// Nothing reserved.
+pub(crate) struct Uncharged;
+
+impl Charge for Uncharged {
+    const COUNTED: bool = false;
+
+    #[inline(always)]
+    fn reserve(&mut self, _: usize) -> Result<(), BudgetExceeded> {
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn release(&mut self, _: usize) {}
+}
+
+impl Charge for Reservation {
+    const COUNTED: bool = true;
+
+    fn reserve(&mut self, bytes: usize) -> Result<(), BudgetExceeded> {
+        self.charge(bytes)
+    }
+
+    fn release(&mut self, bytes: usize) {
+        Reservation::release(self, bytes);
+    }
+}
+
+impl IndexVersion {
+    /// The most a scan of this version holds while it runs (its merge's cursors and their
+    /// decoded keys): what a charged reader reserves before it scans.
+    pub(crate) fn scan_bytes(&self) -> usize {
+        merge::scan_bytes(self.runs.len())
+    }
+
+    /// The bytes [`Self::with_run`] allocates for the list of runs, at most at once.
+    pub(crate) fn run_list_bytes(&self) -> usize {
+        2 * (self.runs.len() + 1) * std::mem::size_of::<Arc<Run>>() + 16
     }
 }
 

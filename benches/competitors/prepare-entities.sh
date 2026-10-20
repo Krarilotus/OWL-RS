@@ -7,6 +7,13 @@
 #
 #   benches/competitors/prepare-entities.sh 10000000
 set -euo pipefail
+# This job's names (scripts/lib/ns.sh): its containers and volumes; the shared datasets' volume.
+NS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+. "$NS_ROOT/scripts/lib/ns.sh"
+DATA_VOLUME=$(ns_shared data)
+# Shared datasets are prepared one at a time per host (their staging, the .part and .parts
+# files, and their publication): this script runs again under the host's datasets lock.
+ns_serialize datasets "$0" "$@"
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 triples=$1
 name="entities-$triples"
@@ -18,7 +25,7 @@ harness="${HARNESS:-$REPO/target/release/nrese-bench-harness}"
     --manifest-path "$REPO/benches/nrese-bench-harness/Cargo.toml"
 "$harness" generate --triples "$triples" --out "$scratch/$name.nt"
 host=$(cd "$scratch" && pwd -W 2>/dev/null || pwd)
-MSYS_NO_PATHCONV=1 docker run --rm -v nrese-bench-data:/data -v "$host:/in:ro" alpine \
+MSYS_NO_PATHCONV=1 docker run --rm -v "$DATA_VOLUME":/data -v "$host:/in:ro" alpine \
   sh -c "cp /in/$name.nt /data/$name.nt.part && mv /data/$name.nt.part /data/$name.nt"
 rm -rf "$scratch"
-echo "$name: $triples triples into nrese-bench-data"
+echo "$name: $triples triples into $DATA_VOLUME"

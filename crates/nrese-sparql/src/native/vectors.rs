@@ -555,6 +555,8 @@ mod tests {
             ..Default::default()
         };
         let ctx = Context::new(&snapshot, &options, None, None);
+        // Beside the payloads, what the context holds of its own.
+        let own = super::super::own_bytes(&snapshot);
         let unrelated = payload(&ctx, 99);
         let bytes = unrelated.table.memory_bytes();
         let probes = RefCell::new(Vec::new());
@@ -589,14 +591,18 @@ mod tests {
                     let id = id.raw();
                     probes.borrow_mut().push(id);
                     assert!(
-                        shared.used() <= bytes * 4,
+                        shared.used() <= own + bytes * 4,
                         "at most k retained payloads plus unrelated"
                     );
                     if id == 0 {
                         return Ok(None);
                     }
                     if id == 3 {
-                        assert_eq!(shared.used(), bytes * 4, "9 is released before 3 is probed");
+                        assert_eq!(
+                            shared.used(),
+                            own + bytes * 4,
+                            "9 is released before 3 is probed"
+                        );
                     }
                     assert!(matches!(id, 1 | 2 | 3 | 8 | 9), "dominated suffix probed");
                     let rows = payload(&ctx, id);
@@ -614,10 +620,10 @@ mod tests {
             found.iter().map(|(id, _, _)| id.raw()).collect::<Vec<_>>(),
             [1, 2, 3]
         );
-        assert_eq!(shared.used(), bytes * 4, "8 is released");
+        assert_eq!(shared.used(), own + bytes * 4, "8 is released");
         assert_eq!(
             shared.peak(),
-            bytes * 5,
+            own + bytes * 5,
             "one incoming probe may overlap the k retained bags"
         );
         for (id, _, rows) in found {
@@ -631,10 +637,11 @@ mod tests {
         }
         assert_eq!(
             shared.used(),
-            bytes,
+            own + bytes,
             "unrelated reservation survives disposal"
         );
         ctx.consumed(unrelated);
+        drop(ctx);
         assert_eq!(shared.used(), 0);
     }
 
@@ -775,10 +782,12 @@ mod tests {
             assert!(result.is_err(), "{stop}");
             assert_eq!(
                 shared.used(),
-                unrelated.table.memory_bytes(),
+                super::super::own_bytes(&snapshot) + unrelated.table.memory_bytes(),
                 "{stop}: no stranded candidate charges"
             );
             ctx.consumed(unrelated);
+            drop(result);
+            drop(ctx);
             assert_eq!(shared.used(), 0);
         }
     }
@@ -823,10 +832,13 @@ mod tests {
         let inner = pattern(
             "?v <urn:nrese:vector:near> \"[0]\" ; <urn:nrese:vector:k> 6 ; <urn:nrese:vector:metric> \"l2\" ; <urn:nrese:vector:exact> true",
         );
+        // Charged beside the probes: an unrelated reservation, and what the context holds of
+        // its own.
+        let unrelated = 128 + super::super::own_bytes(&snapshot);
         const UNRELATED: usize = 128;
         let options = QueryOptions {
             resources: crate::Resources {
-                memory: nrese_exec::Envelope::new(Some(UNRELATED + 8192 - 1), None),
+                memory: nrese_exec::Envelope::new(Some(unrelated + 8192 - 1), None),
                 ..Default::default()
             },
             ..Default::default()
@@ -841,10 +853,10 @@ mod tests {
             Err(QueryEvaluationError::MemoryLimit(error)) => error,
             _ => panic!("fourth winner's union must exceed the remaining budget"),
         };
-        assert_eq!((error.used, error.requested), (UNRELATED + 2048, 6144));
+        assert_eq!((error.used, error.requested), (unrelated + 2048, 6144));
         assert_eq!(
             ctx.budget.used(),
-            UNRELATED,
+            unrelated,
             "pending winners release; handed-off union inputs release only once"
         );
 
@@ -869,7 +881,7 @@ mod tests {
             "rejection can retain table capacity"
         );
         ctx.consumed(empty);
-        assert_eq!(ctx.budget.used(), UNRELATED);
+        assert_eq!(ctx.budget.used(), unrelated);
         let empty = ctx
             .vector_join(&rejected, &inner)
             .map_err(QueryEvaluationError::from)
@@ -878,7 +890,7 @@ mod tests {
         ctx.consumed(empty);
         assert_eq!(
             ctx.budget.used(),
-            UNRELATED,
+            unrelated,
             "every empty probe returns its capacity charge"
         );
     }
