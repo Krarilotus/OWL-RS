@@ -860,34 +860,27 @@ pub fn anti_join_in_place(
         left.slice(0, Some(0));
         return Ok(());
     }
-    let keep = membership(left, right, left_keys, right_keys, false, budget)?;
-    left.retain_mask(&keep);
-    Ok(())
+    keep_members(left, right, left_keys, right_keys, false, budget)
 }
 
-/// Per left row, whether its key occurring in `right` is `wanted`: a merge where both are
-/// sorted on their keys ([`sorted_membership`]), else a hash table of `right`.
-fn membership<'b>(
-    left: &IdTable,
+/// The left rows whose key occurring in `right` is `wanted`, kept in place: a merge where
+/// both are sorted on their keys ([`sorted_membership`]), else a probe per row into a hash
+/// table of `right` (in parallel for large inputs, its mask charged to `left`'s budget,
+/// [`IdTable::par_retain`]).
+fn keep_members(
+    left: &mut IdTable,
     right: &IdTable,
     left_keys: &[usize],
     right_keys: &[usize],
     wanted: bool,
-    budget: &'b Budget,
-) -> Result<Scratch<'b, bool>, BudgetExceeded> {
+    budget: &Budget,
+) -> Result<(), BudgetExceeded> {
     if let Some(keep) = sorted_membership(left, right, left_keys, right_keys, wanted, budget)? {
-        return Ok(keep);
+        left.retain_mask(&keep);
+        return Ok(());
     }
     let table = BuildTable::new(right, right_keys, budget, |_| true)?;
-    let found = |row: usize| (table.first(left, row, left_keys) != END) == wanted;
-    // Each row's answer written once, into a mask charged first.
-    let rows = left.len();
-    if rows < PARALLEL_ROWS {
-        return ChargedVec::collect(budget, rows, (0..rows).map(found));
-    }
-    let mut keep = ChargedVec::with_capacity(budget, rows)?;
-    keep.fill(rows, |room| room.par_fill(rows, found))?;
-    Ok(keep)
+    left.par_retain(|t, row| (table.first(t, row, left_keys) != END) == wanted)
 }
 
 /// A mask of `len` rows, each `value`, charged to `budget` first.
@@ -987,9 +980,7 @@ pub fn semi_join_in_place(
         }
         return Ok(());
     }
-    let keep = membership(left, right, left_keys, right_keys, true, budget)?;
-    left.retain_mask(&keep);
-    Ok(())
+    keep_members(left, right, left_keys, right_keys, true, budget)
 }
 
 /// Inner join where key columns may hold UNDEF (SPARQL compatibility: UNDEF matches any
@@ -1735,9 +1726,9 @@ mod tests {
             let (left, right) = (keyed(rows, 1), keyed(rows / 2, 2));
             let unsorted = unsorted(rows / 2, 2);
             let filtered = |semi: bool, right: &IdTable| {
-                let left = std::sync::Mutex::new(left.clone());
                 uncharged(|b| {
-                    let mut left = left.lock().unwrap();
+                    // The left side as the executor has it: a table holding its charge.
+                    let mut left = left.try_clone(b).unwrap();
                     match semi {
                         true => semi_join_in_place(&mut left, right, &[0], &[0], b).unwrap(),
                         false => anti_join_in_place(&mut left, right, &[0], &[0], b).unwrap(),
