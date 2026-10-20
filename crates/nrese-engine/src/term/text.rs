@@ -8,9 +8,9 @@
 //! append-only, so nothing indexed ever changes. A large extension is built apart, as an
 //! index of the new documents alone (a fragment), with no lock held, and then taken in
 //! ([`TextIndex::absorb`]): a part of the parallel build may run a job that wants the
-//! dictionary or this index. Taking it in runs under the index's lock, on threads of its
-//! own (scoped, not Rayon's: they run nothing else, so no job they take on can wait for
-//! the lock); into an empty index it is a move. Whether a literal still occurs in the data
+//! dictionary or this index. Taking it in runs under the index's lock, on a pool of its
+//! own (not the global one: its threads run nothing else, so no job they take on can wait
+//! for the lock); into an empty index it is a move. Whether a literal still occurs in the data
 //! is the query's business (it joins the matches with the statements).
 //!
 //! Scores are BM25 (k1 = 1.2, b = 0.75) summed over the query's words and divided by the
@@ -426,21 +426,20 @@ pub(crate) fn threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
-/// `f` of each of `parts`, each on a thread of its own (scoped, not Rayon's): for work
-/// done while a lock is held, since these threads take on no other job, which might wait
-/// for that lock.
+/// `f` of each of `parts`, in parallel on a pool of its own (not the global one): for work
+/// done while a lock is held, since its threads take on no job of the global pool's, which
+/// might wait for that lock. Its threads are made once (spawning them for each build cost
+/// more than the work on a cold index of a few hundred thousand terms).
 pub(crate) fn scoped<T: Send, R: Send>(parts: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
-    let f = &f;
-    std::thread::scope(|scope| {
-        let handles: Vec<_> = parts
-            .into_iter()
-            .map(|part| scope.spawn(move || f(part)))
-            .collect();
-        handles
-            .into_iter()
-            .map(|handle| handle.join().expect("a scoped part"))
-            .collect()
-    })
+    static LOCKED: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    let pool = LOCKED.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads())
+            .thread_name(|i| format!("nrese-locked-{i}"))
+            .build()
+            .expect("the pool for work under a lock")
+    });
+    pool.install(|| parts.into_par_iter().map(&f).collect())
 }
 
 /// The numbers whose bits `bits` sets, ascending.
