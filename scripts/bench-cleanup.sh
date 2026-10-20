@@ -25,6 +25,8 @@
 #   images      the images this checkout's runs pulled themselves (tmp/bench-pulled-images; an
 #               image that was already on the machine is someone else's and stays); with
 #               --images the shared nrese-bench/* too
+#   build cache Docker's, bounded: what exceeds 10 GB (docker builder prune --keep-storage;
+#               the cache is no job's, so no label says whose: only its size is bounded)
 #   datasets    --datasets only: the reserved dataset volume nrese-bench-data (budget in
 #               benches/datasets.toml) and the datasets (*.nt) and stores (store-*) under the
 #               local benchmark directory (NRESE_BENCH_LOCAL, default ~/nrese-bench): every
@@ -127,6 +129,13 @@ if command -v "${NRESE_DOCKER:-docker}" >/dev/null 2>&1 && ns_docker info >/dev/
       ns_docker image inspect "$image" >/dev/null 2>&1 && run ns_docker rmi "$image"
     done
     [ -n "$DRY" ] || rm -f "$PULLED_LIST"
+  fi
+  # The build cache beyond 10 GB (newer daemons name the bound --reserved-space).
+  if [ -n "$DRY" ]; then
+    printf 'would run: docker builder prune -f --keep-storage 10GB\n'
+  else
+    ns_docker builder prune -f --keep-storage 10GB >/dev/null 2>&1 \
+      || ns_docker builder prune -f --reserved-space 10GB >/dev/null 2>&1 || true
   fi
   if [ -n "$TOOLS" ] && [ -f "$TOOLBOX" ]; then
     for image in $(sort -u "$TOOLBOX"); do

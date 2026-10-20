@@ -58,6 +58,37 @@ class CaseTimeouts(unittest.TestCase):
         self.assertNotIn("timeout", calls[-1].kwargs)
 
 
+class FreshProcesses(unittest.TestCase):
+    """The release gate's `processes` (benches/fast/measure.toml): a DL tool's fresh processes,
+    their times pooled (a process's memory layout moves its time, not its work)."""
+
+    def test_a_dl_tool_runs_its_processes_and_pools_their_times(self):
+        times = iter([10.0, 12.0, 11.0])
+
+        def tableau(*args, **kwargs):
+            return 0, f"none\tconsistent\twhole_ms={next(times)} expand_ms=1.5\n", "", 1
+
+        case = dict(name="p", data="none", args=[], queries="", metric="whole_ms", cap_gb=2, tool="tableau",
+                    processes=3)
+        with patch.object(fast, "native", side_effect=lambda text: text), \
+                patch.object(fast, "container", side_effect=tableau) as run:
+            record = fast.measure(case, "contract", 1, {}, {}, "none")
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(record["result"]["whole_ms"], 11.0)
+        self.assertEqual(record["observations"][0]["samples"]["expand"], [1.5, 1.5, 1.5])
+        totals = iter([20.0, 24.0])
+
+        def classify(*args, **kwargs):
+            return 0, "abcd\n7\n", f"profile read=1.0 owl=2.0 total={next(totals)} write=0.5\n", 1
+
+        case = {**case, "tool": "classify-horn", "processes": 2}
+        with patch.object(fast, "container", side_effect=classify) as run:
+            record = fast.measure(case, "contract", 1, {}, {}, "none")
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(record["result"]["whole_ms"], 22.0)
+        self.assertEqual(record["observations"][0]["samples"]["read"], [1.0, 1.0])
+
+
 class RuntimeTimeouts(unittest.TestCase):
     def test_scope_cleanup_failure_cannot_pass_or_hide_a_primary_failure(self):
         primary = ValueError("original failure")

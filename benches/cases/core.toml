@@ -805,6 +805,62 @@ cap_gb = 6
 systems = ["jena:geosparql", "qlever:geosparql", "virtuoso:geosparql"]
 args = ["--runs", "40"]
 [[case]]
+name = "geo4"
+area = "geo"
+what = "GeoSPARQL filters over four named graphs (1 M points, each in one graph; four squares in each): GRAPH <g>, GRAPH ?g, FROM two graphs, FROM with a join (the access paths of geo-within over several graphs)"
+semantics = "none"
+data = "geo4 points=1000000"
+queries = "geo4"
+metric = "sum_p50_ms"
+check = { "q.graph-filter.value" = "expect.graph0_filter_sq0", "q.from-filter.value" = "expect.from01_filter_sq1", "q.graphvar-filter.value" = "expect.graphvar_filter_sq3", "q.from-join-filter.value" = "expect.from01_join_sq1" }
+route = {}
+cap_gb = 4
+systems = []
+args = ["--runs", "40"]
+[[case]]
+name = "geo4-relations"
+area = "geo"
+what = "GeoSPARQL relation patterns (the spatial index) over four named graphs: GRAPH <g>, GRAPH ?g, FROM two graphs"
+semantics = "none"
+data = "geo4 points=1000000"
+queries = "geo4-relations"
+metric = "sum_p50_ms"
+check = { "q.graph-tp.value" = "expect.graph1_within_sq1", "q.graphvar-tp.value" = "expect.graphvar_within_sq1", "q.from-tp.value" = "expect.from23_sq3_contains" }
+route = {}
+cap_gb = 4
+systems = []
+args = ["--runs", "40"]
+outcome = "wrong"
+known = "the spatial index answers a relation pattern from every graph, GRAPH and FROM ignored (the GeoSPARQL audit's item 1; fix/geo-access-scope, 58e9952e, not merged): on efcb78b9, 19 Oct 2026, graph-tp 5,043 for 1,213, from-tp 96,923 for 48,167"
+[[case]]
+name = "graphs4"
+area = "query"
+what = "the social network over four named graphs (every third statement in two): merged default graphs of two and four listed graphs (a lookup, a star, a chain, a count), FROM NAMED, GRAPH <g> and GRAPH ?g"
+semantics = "none"
+data = "social4 people=40000"
+queries = "graphs4"
+metric = "sum_p50_ms"
+check = { "q.from4-star-count.value" = "expect.people", "q.graph-follows-count.value" = 106668, "q.graphvar-follows-count.value" = 426667, "q.from2-chain-4.rows" = 389, "q.from2-person.rows" = 8, "q.from2-star.rows" = 40, "q.graphvar-star.rows" = 14, "q.named2-star.rows" = 14 }
+pinned = "Oxigraph 0.5.12 over the same data, the FROM graphs merged as a set (benches/probes/graphs4-oracle.py), equal to NRESE efcb78b9's, 19 Oct 2026"
+route = {}
+cap_gb = 2
+systems = []
+args = ["--runs", "40"]
+[[case]]
+name = "graphs4-reader"
+area = "query"
+what = "graphs4's data read by a reader restricted to two of the four graphs (graph-level access control): GRAPH ?g and FROM all four graphs, each limited to the readable two (a perf lab older than --read-graphs can't run it)"
+semantics = "none"
+data = "social4 people=40000"
+queries = "graphs4-reader"
+metric = "sum_p50_ms"
+check = { "q.from4-follows-count.value" = 186666, "q.graphvar-follows-count.value" = 213334, "q.from4-chain-4.rows" = 389 }
+pinned = "Oxigraph 0.5.12 over the dataset the reader may read, written out (benches/probes/graphs4-oracle.py), equal to NRESE efcb78b9's, 19 Oct 2026"
+route = {}
+cap_gb = 2
+systems = []
+args = ["--read-graphs", "http://example.org/fast/graph0,http://example.org/fast/graph1", "--runs", "40"]
+[[case]]
 name = "text-search"
 area = "service"
 what = "full-text search over 1 M short documents: four words and a prefix"

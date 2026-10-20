@@ -228,7 +228,12 @@ def fast_data_name(spec: str) -> str:
     if spec.startswith("volume:"):
         return spec[len("volume:"):]
     kind, *params = spec.split()
-    return "-".join([kind, *[p.replace("=", "") for p in params]]) + ".nt"
+    # The multi-graph kinds write N-Quads (perf_lab generate geo4, social4).
+    suffix = ".nq" if kind in QUAD_KINDS else ".nt"
+    return "-".join([kind, *[p.replace("=", "") for p in params]]) + suffix
+
+
+QUAD_KINDS = ("geo4", "social4")
 
 
 # A fast case's semantics as the suite's regime; the others have no runner in the suite.
