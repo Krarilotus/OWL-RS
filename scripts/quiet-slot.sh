@@ -88,16 +88,20 @@ if [ -d /proc ] && command -v python3 >/dev/null 2>&1; then
   watcher=$!
 fi
 stop_watch() {
+  local status=$? watched=0
   if [ -n "$watcher" ]; then
-    kill -TERM "$watcher" 2>/dev/null && wait "$watcher"
+    kill -TERM "$watcher" 2>/dev/null
+    wait "$watcher" || watched=$?
     [ -f "$LOCK/watch.log" ] && echo "quiet slot: $(tail -1 "$LOCK/watch.log")" >&2
   fi
-  # Suspensions the watcher couldn't resume keep the lock and their record for the next holder.
-  if [ -f "$LOCK/frozen" ]; then
+  # Suspensions the watcher couldn't resume keep the lock and their record for the next holder,
+  # and fail the slot (exit 3), whatever the measurement's own status.
+  if [ -f "$LOCK/frozen" ] || [ "$watched" != 0 ]; then
     echo "quiet slot: suspensions not resumed, kept in $LOCK/frozen" >&2
-  else
-    rm -rf "$LOCK"
+    exit 3
   fi
+  rm -rf "$LOCK"
+  exit "$status"
 }
 trap stop_watch EXIT
 # What the measurement builds itself doesn't wait for the slot it holds.
