@@ -36,6 +36,10 @@ pub struct ReadyResponse {
     pub reasoning_semantic_tier: &'static str,
     /// Under `owl2-dl`: the data's consistency under OWL 2 DL, as last checked.
     pub dl: Option<DlReady>,
+    /// The repositories that can't serve (`id: unavailable`): the server stays ready for
+    /// the others, so that a load balancer keeps it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
 }
 
 /// The `owl2-dl` mode's status.
@@ -220,6 +224,7 @@ pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError>
                     revision: None,
                 },
             }),
+        degraded: state.degraded(),
     })
 }
 

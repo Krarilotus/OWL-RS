@@ -202,13 +202,23 @@ fn tombstone(root: &std::path::Path, id: &str) -> PathBuf {
 }
 
 /// Brings `store`'s inferences in line with `reasoner`: recomputed under its rules, or
-/// cleared without reasoning.
-fn settle(store: &StoreService, reasoner: &ReasonerService) -> Result<(), CatalogError> {
+/// cleared without reasoning. A failure says whether the store's inferences changed
+/// (published, then not recorded) or not.
+fn settle(store: &StoreService, reasoner: &ReasonerService) -> Result<(), Unsettled> {
     match reasoner.config().materialised_program() {
         Some(program) => store.rematerialise(&program).map(drop),
         None => store.clear_inferred().map(drop),
     }
-    .map_err(|error| CatalogError::Store(error.to_string()))
+    .map_err(|error| Unsettled {
+        published: matches!(error, crate::StoreError::InferencesNotRecorded(_)),
+        error: CatalogError::Store(error.to_string()),
+    })
+}
+
+/// A failed [`settle`]: whether the new inferences were published nonetheless.
+struct Unsettled {
+    published: bool,
+    error: CatalogError,
 }
 
 /// How a removal ended ([`Catalog::delete`]): the repository is gone either way.
@@ -450,6 +460,23 @@ impl Catalog {
         }
     }
 
+    /// Makes repository `id`, whose store is `store`, unavailable until a restart: its
+    /// inferences match neither its old reasoning nor its new one. Other repositories go
+    /// on; requests to it are answered 503 with why (operators: which file, how to repair).
+    fn make_unavailable(&self, id: &str, store: &StoreService, error: &str) {
+        let why = format!(
+            "repository '{id}' ({}): a change of its reasoning failed and its inferences couldn't be restored: {error}. Repair: restart the server; it reads the settings kept in {} and recomputes the inferences",
+            store.config().data_dir.display(),
+            self.settings_file(id)
+                .map_or_else(|| "memory".to_owned(), |file| file.display().to_string())
+        );
+        store.make_unavailable(why.clone());
+        if id != DEFAULT_REPOSITORY {
+            self.others.write().remove(id);
+            self.unavailable.write().insert(id.to_owned(), why);
+        }
+    }
+
     /// Why repository `id` didn't open at start, and how to repair it.
     pub fn unavailable(&self, id: &str) -> Option<String> {
         self.unavailable.read().get(id).cloned()
@@ -573,18 +600,34 @@ impl Catalog {
                     Arc::clone(previous.reasoner()),
                 ));
             };
-            if let Err(error) = settle(&store, &reasoner) {
+            // Back to the old reasoning after the new inferences were published: they are
+            // recomputed under it before its write path is published again. If that fails
+            // too, the repository serves nothing more until a restart (never old rules over
+            // new inferences): its write path stays retired.
+            let roll_back = |error: CatalogError| {
+                match settle(&store, previous.reasoner()) {
+                    Ok(()) => restore(),
+                    Err(back) => {
+                        self.make_unavailable(id, &store, &back.error.to_string());
+                        return CatalogError::Store(format!(
+                            "{error}; the old inferences couldn't be restored ({}): the repository is unavailable until the server restarts",
+                            back.error
+                        ));
+                    }
+                }
+                error
+            };
+            match settle(&store, &reasoner) {
+                Ok(()) => {}
                 // One commit that didn't happen: the inferences are the old ones.
-                restore();
-                return Err(error);
+                Err(failed) if !failed.published => {
+                    restore();
+                    return Err(failed.error);
+                }
+                Err(failed) => return Err(roll_back(failed.error)),
             }
             if let Err(error) = persist() {
-                if let Err(back) = settle(&store, previous.reasoner()) {
-                    // The old write path recomputes them at its first write, a start too.
-                    tracing::error!(repository = %id, error = %back, "inferences not recomputed under the old reasoning");
-                }
-                restore();
-                return Err(error);
+                return Err(roll_back(error));
             }
             *repository.pipeline.write() =
                 Arc::new(MutationPipeline::new(store, Arc::new(reasoner)));

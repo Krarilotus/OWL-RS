@@ -61,6 +61,10 @@ pub enum StoreError {
     /// A materialisation was stopped; the previous inferred stack stands.
     #[error("materialisation cancelled")]
     MaterialisationCancelled,
+    /// A recomputation published its inferred statements, then couldn't record them (the
+    /// reasoning state file): the store holds the new inferences, unrecorded.
+    #[error("the inferences were recomputed and published, but not recorded: {0}")]
+    InferencesNotRecorded(Box<StoreError>),
     /// A long operation stopped because the process reached its memory limit
     /// ([`crate::StoreConfig::process_memory_bytes`]); nothing of it was applied.
     #[error(
@@ -167,6 +171,7 @@ impl StoreError {
             | Self::Engine(_)
             | Self::OntologyFileNotFound { .. }
             | Self::MaterialisationCancelled
+            | Self::InferencesNotRecorded(_)
             | Self::ProcessMemoryLimit { .. }
             | Self::LoadCancelled
             // Answered by the transport as what it is (the query is fine; its answers

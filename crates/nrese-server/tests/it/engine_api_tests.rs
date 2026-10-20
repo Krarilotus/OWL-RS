@@ -1161,3 +1161,75 @@ async fn query_results_are_pinned_listed_and_unpinned() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
+
+/// A change of the default repository's reasoning that fails after publishing its
+/// inferences, and can't restore the old ones either (neither reasoning's state file can be
+/// written: `reasoning.tmp` taken), leaves the default repository unavailable until a
+/// restart: its requests get 503, while the repository list (which says why to operators),
+/// `/readyz` (ready, degraded) and the other repositories go on.
+#[tokio::test]
+async fn a_default_repository_left_in_no_known_state_is_unavailable_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = test_app_with_store_config(
+        StoreConfig::on_disk(dir.path()),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let json = Some("application/json");
+    let (status, text) = send(&app, Method::PUT, "/api/v1/repositories/r2", json, "{}").await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let (status, text) = send(
+        &app,
+        Method::PATCH,
+        "/api/v1/repositories/nrese",
+        json,
+        r#"{"reasoning": "rdfs"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    std::fs::create_dir(dir.path().join("reasoning.tmp")).unwrap();
+    let (status, text) = send(
+        &app,
+        Method::PATCH,
+        "/api/v1/repositories/nrese",
+        json,
+        r#"{"reasoning": "owl2-rl"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+    let query = |base: &str| format!("{base}/query?query={}", urlencoding(COUNT));
+    let (status, text) = send(&app, Method::GET, &query("/dataset"), None, "").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+    assert!(text.contains("restart"), "{text}");
+    let (status, text) = send(
+        &app,
+        Method::GET,
+        &query("/api/v1/repositories/r2"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the other repository serves: {text}"
+    );
+    let (status, text) = send(&app, Method::GET, "/readyz", None, "").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let ready: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        ready["degraded"],
+        serde_json::json!(["nrese: unavailable"]),
+        "{text}"
+    );
+    let (status, text) = send(&app, Method::GET, "/api/v1/repositories", None, "").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let list: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        list[0]["unavailable"]
+            .as_str()
+            .is_some_and(|why| why.contains("restart")),
+        "{text}"
+    );
+}
