@@ -26,8 +26,10 @@ export MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks"
 export CARGO_BUILD_WARNINGS=warn
 export CARGO_TARGET_DIR=target/miri
 status=0
+# Through cargo-guarded.sh: Miri's compiles wait for room like any other (no CPU flag, as before).
 for test in "${tests[@]}"; do
-  cargo +nightly miri test --locked -q --target x86_64-unknown-linux-gnu -p nrese-exec --lib \
+  NRESE_TARGET_CPU=portable bash scripts/cargo-guarded.sh +nightly miri test --locked -q \
+    --target x86_64-unknown-linux-gnu -p nrese-exec --lib \
     -- --exact "$test" || status=1
 done
 exit $status
