@@ -1307,11 +1307,19 @@ def write_measure(result: dict, source: str) -> str:
     return "\n".join(lines)
 
 
-def blocks(plan_: list[str], measure: dict, min_blocks: int = CAMPAIGN_BLOCKS) -> list[list[str]]:
-    """The cases of each block: block k (from 1) runs those whose blocks (measure.toml) reach k;
-    the first block every case (a declared outcome's: checked there, not timed)."""
-    need = {c: int(measure.get(c, {}).get("blocks", min_blocks)) for c in plan_}
-    count = max([min_blocks, *need.values()])
+def whole_squares(n: int, square: int) -> int:
+    """n blocks rounded up to whole Latin squares of `square` blocks (fast.py palindrome(): one per
+    timed side). Only whole squares give every side the first place alike; a case in 2 blocks of
+    three sides leaves one side never opening (tf2-gate-1, 20 Oct 2026: a first run cost 15.8 %)."""
+    return -(-n // square) * square if square > 1 else n
+
+
+def blocks(plan_: list[str], measure: dict, min_blocks: int = CAMPAIGN_BLOCKS, square: int = 1) -> list[list[str]]:
+    """The cases of each block: block k (from 1) runs those whose blocks (measure.toml) reach k,
+    each case's count in whole squares of `square` blocks (whole_squares()); the first block every
+    case (a declared outcome's: checked there, not timed)."""
+    need = {c: whole_squares(int(measure.get(c, {}).get("blocks", min_blocks)), square) for c in plan_}
+    count = max([whole_squares(min_blocks, square), *need.values()])
     return [[c for c in plan_ if need[c] >= k or k == 1] for k in range(1, count + 1)]
 
 
@@ -1406,11 +1414,16 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
         "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": 12}, "inputs": source,
         **({"outputs": [{"name": "binaries", "path": "binaries"}]} if big_host else {})}}
     # minutes, the three sides' two runs of every case (a main that is the base isn't timed again)
-    per_block = (2 if small else 60) * (2 + (main != base)) / 3
+    sides = 2 + (main != base)
+    per_block = (2 if small else 60) * sides / 3
+    # Whole Latin squares (whole_squares()): every timed side opens a case's blocks alike.
+    env["GATE_SQUARE"] = str(sides)
+    blocks_per_round = whole_squares(blocks_per_round, sides)
+    env["GATE_MIN_BLOCKS"] = str(blocks_per_round)
     count = blocks_per_round
     steps = [[*gate_, "plan-blocks", harness]] if measure else []
     if measure:
-        need = {c: int(e.get("blocks", blocks_per_round)) for c, e in measure.items()}
+        need = {c: whole_squares(int(e.get("blocks", blocks_per_round)), sides) for c, e in measure.items()}
         count = max([blocks_per_round, *need.values()])
         full = sum(e.get("seconds", 0) for e in measure.values()) or 1
     est = 2.0
@@ -1481,8 +1494,10 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
     ctx = first.get("context") or {}
     cases = sorted({h.split("|")[1] for h in pending})
     low, high = CONFIRM_BLOCKS
-    n = min(high, max([low, *(int((measure or {}).get(c, {}).get("blocks", low)) for c in cases)]))
     revs = {"cand": first["candidate"]["revision"], **first["baselines"]}
+    # In whole Latin squares of the timed sides (a main that is base's build isn't timed again).
+    n = whole_squares(min(high, max([low, *(int((measure or {}).get(c, {}).get("blocks", low)) for c in cases)])),
+                      len(set(revs.values())))
     harness = first["harness"]
     k = len(rounds)
     prefix = ctx.get("prefix") or f"rg-{revs['cand'][:8]}"
@@ -1635,6 +1650,7 @@ def main() -> int:
     s = sub.add_parser("blocks", help="each block's plan of a gate (release-gate.sh plan-blocks)")
     s.add_argument("--plan", type=Path, required=True)
     s.add_argument("--measure", type=Path, required=True)
+    s.add_argument("--square", type=int, default=1, help="the timed sides: each case's blocks in whole Latin squares")
     s.add_argument("--out", type=Path, required=True)
     s = sub.add_parser("confirm", help="the confirmation job of each host whose run flagged a loss or an undecided case")
     s.add_argument("--reports", type=Path, nargs="+", required=True, help="every timed report so far (release-gate.json)")
@@ -1741,7 +1757,7 @@ def main() -> int:
     if args.command == "blocks":
         gate_plan = json.loads(args.plan.read_text(encoding="utf-8"))
         found = blocks(gate_plan["run"], read_measure(args.measure.read_text(encoding="utf-8"))
-                       if args.measure.is_file() else {})
+                       if args.measure.is_file() else {}, square=args.square)
         for k, cases in enumerate(found, start=1):
             (args.out / f"plan-block-{k}.json").write_text(json.dumps({"run": cases, "not_run": {}, "elsewhere": {}},
                                                                       indent=1), encoding="utf-8")
