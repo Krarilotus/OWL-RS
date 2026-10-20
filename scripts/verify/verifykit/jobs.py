@@ -26,6 +26,7 @@ BUILD = {"cores": 2, "ram_gb": 3, "est_min": 10}
 # the self-test at 42.7 MiB (the step's cgroup, verify-run-ebaeb593-10201343), about a minute
 # together. Scenarios with more data declare more (--ram-gb); each summary records its peak.
 RUN = {"cores": 2, "ram_gb": 0.5, "est_min": 5}
+RUN_CEILING_S = 1800
 
 
 def git(repo: Path, *args: str) -> str:
@@ -74,9 +75,12 @@ def jobs(repo: Path, rev: str, harness: str, scenarios: list[str], settings: lis
         "requires": {"hosts": [HOST], "cores": BUILD["cores"], "ram_gb": BUILD["ram_gb"]},
         "inputs": [{"name": "checkout", "source": {"git": source, "rev": sha}}]}
     run_args = [a for s in settings for a in ("--set", s)]
+    # Every phase of verify.py has its own deadline; this ceiling is the fleet step's (fleet stops
+    # no step itself). Its SIGTERM makes verify.py clean up and write a failing summary.
+    ceiling = ["timeout", "--kill-after=60", str(RUN_CEILING_S), "python3", "scripts/verify/verify.py"]
     # The self-test first: a runner whose checks don't fail when they should proves nothing after.
-    steps = [["python3", "scripts/verify/verify.py", "selftest", "--server-rev", sha]] if selftest else []
-    steps.append(["python3", "scripts/verify/verify.py", "run", "--server-rev", sha, *run_args, *scenarios])
+    steps = [[*ceiling, "selftest", "--server-rev", sha]] if selftest else []
+    steps.append([*ceiling, "run", "--server-rev", sha, *run_args, *scenarios])
     run = {
         "id": run_id, "group": "verify", "kind": "owlrs.any", "priority": priority, "priority_reason": reason,
         "after": [build_id], "est_min": RUN["est_min"], "steps": steps,
