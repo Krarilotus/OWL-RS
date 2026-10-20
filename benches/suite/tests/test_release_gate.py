@@ -670,6 +670,79 @@ printf "no linker" > "$d/release/other"; lld_of "$d" 2>/dev/null || echo not-lld
         self.assertTrue(notes[0].startswith("block 2: disturbed") and "40%" in notes[0], notes)
         self.assertIn("not resumed", notes[1])
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the watcher watches /proc (Linux)")
+    def test_a_disturbed_block_is_left_out_both_sides_and_run_once_more_and_a_disturbed_repeat_kept(self):
+        """The orchestrator, 20 Oct 2026: a disturbed block is excluded from the statistics (both
+        sides: the disturbance is the host's) and repeated once; disturbed again, it is kept, and
+        the report lists it. The watcher stubbed: disturbed on every attempt, then on the first only."""
+        import shutil
+        import subprocess
+        bash, python = shutil.which("bash"), shutil.which("python3")
+        head = "a" * 40  # no git: a fake answers the block step's few questions (below)
+        for verdicts, kept in ((["disturbed", "disturbed"], True), (["disturbed", "quiet"], False)):
+            with self.subTest(verdicts=verdicts), tempfile.TemporaryDirectory() as tmp:
+                t = Path(tmp).as_posix()
+                shim = Path(tmp) / "shim"
+                shim.mkdir()
+                (Path(tmp) / "verdicts").write_text("\n".join(verdicts) + "\n", encoding="utf-8")
+                # fast.py block writes the block's reports; quiet-watch.py, the next verdict on TERM.
+                (shim / "python3").write_text(f"""#!/usr/bin/env bash
+case " $* " in
+  *" benches/fast/fast.py block "*)
+    n=0; out=; sides=()
+    while [ $# -gt 0 ]; do case $1 in --block) n=$2 ;; --out) out=$2 ;; --side) sides+=("${{2%%:*}}") ;; esac; shift; done
+    per=$(( 2 * ${{#sides[@]}} ))
+    for k in $(seq 1 $per); do echo '{{"finished_ns": 1}}' > "$out/pass-$(( per * (n - 1) + k ))-x$k.json"; done
+    sleep 1 ;;  # a block takes time: the watcher is up before it ends
+  *"quiet-watch.py"*" --resume "*) exit 0 ;;
+  *"quiet-watch.py"*)
+    state=$2
+    verdict() {{
+      v=$(head -1 {t}/verdicts); sed -i 1d {t}/verdicts
+      printf '{{"verdict": "%s", "samples": 9, "unowned_share": 0.5}}\\n' "$v" > "$state/verdict.json"
+      echo "$v" > "$state/watch.log"; exit 0
+    }}
+    trap verdict TERM
+    while :; do sleep 0.2; done ;;
+  *) exec "{Path(python).as_posix()}" "$@" ;;
+esac
+""", encoding="utf-8", newline="\n")
+                (shim / "python3").chmod(0o755)
+                # git, faked: the revision is a fixed id, a worktree an empty directory; anything
+                # else the step asks fails loudly (no real repository is touched).
+                (shim / "git").write_text(f"""#!/usr/bin/env bash
+case "$1 $2" in
+  "rev-parse --short=8") echo "${{3:0:8}}" ;;
+  "rev-parse HEAD") echo {head} ;;
+  "worktree add") mkdir -p "${{@: -2:1}}" ;;
+  "status --porcelain") ;;
+  *) if [ "$1" = rev-parse ] && [ $# -eq 2 ]; then echo "$2"; else echo "fake git: $*" >&2; exit 99; fi ;;
+esac
+""", encoding="utf-8", newline="\n")
+                (shim / "git").chmod(0o755)
+                setup = f'''
+. scripts/lib/gate-publish.sh
+GATE={t}/gate GATE_BIN={t}/bin
+b=$GATE_BIN/bin-test; mkdir -p "$b/release" "$GATE" {t}/out
+echo tool > "$b/release/tool"; echo {head} > "$b/REVISION"; echo timing=watchdog > "$b/CAPABILITIES"
+(cd "$b" && sha256sum release/tool > SHA256SUMS)
+point {head} "$b"
+echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
+'''
+                env = {**os.environ, "NRESE_GATE_DIR": f"{t}/gate", "GATE_BIN": f"{t}/bin", "FLEET_OUT": f"{t}/out",
+                       "PATH": f"{shim}{os.pathsep}{os.environ['PATH']}"}
+                subprocess.run([bash, "-c", setup], cwd=ROOT, env=env, check=True, capture_output=True)
+                done = subprocess.run([bash, "-c", f'PATH="{shim}:$PATH" exec bash scripts/release-gate.sh block 1 {head} 1 - '
+                                       f'base={head} cand={head}'], cwd=ROOT, env=env, capture_output=True, text=True)
+                passes = Path(tmp) / "out" / "passes"
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual((len(list(passes.glob("pass-*.json"))), len(list(passes.glob("disturbed-pass-*.json")))),
+                                 (4, 4), done.stdout + done.stderr + str(sorted(x.name for x in passes.iterdir()))
+                                 + str([x.read_text() for x in passes.glob("quiet-block-*.json")]))
+                notes = gate_module.quiet_verdicts(passes)[1]
+                self.assertTrue(notes[0].startswith("block 1: disturbed: left out of the statistics"), notes)
+                self.assertEqual(any("its repeat disturbed, kept" in note for note in notes), kept, notes)
+
     def test_report_writes_markdown_and_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)

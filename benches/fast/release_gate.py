@@ -717,8 +717,14 @@ def quiet_verdicts(directory: Path) -> tuple[dict, list[str]]:
     """Each block's quiet-watcher verdict (release-gate.sh block: quiet-block-<n>.json), and a
     note for each block work that isn't the job's own disturbed (scripts/lib/quiet-watch.py
     suspends only the job's own: other work is left running and its load recorded), or whose
-    suspensions weren't all resumed."""
+    suspensions weren't all resumed. A disturbed block was left out and run once more
+    (quiet-block-<n>-disturbed-<t>.json, its reports disturbed-*); a repeat disturbed again
+    was kept ("repeat")."""
     verdicts, notes = {}, []
+    for n in sorted({int(m.group(1)) for p in directory.glob("quiet-block-*-disturbed-*.json")
+                     if (m := re.search(r"quiet-block-(\d+)-disturbed-\d+\.json$", p.name))}):
+        notes.append(f"block {n}: disturbed: left out of the statistics (both sides, kept as disturbed-*) "
+                     "and run once more")
     found = [(int(m.group(1)), p) for p in directory.glob("quiet-block-*.json")
              if (m := re.search(r"quiet-block-(\d+)\.json$", p.name))]
     for n, path in sorted(found):
@@ -729,7 +735,8 @@ def quiet_verdicts(directory: Path) -> tuple[dict, list[str]]:
             continue
         verdicts[n] = v
         if v.get("verdict") == "disturbed":
-            notes.append(f"block {n}: disturbed: work that isn't this job's used more than a core in "
+            notes.append(f"block {n}: {'its repeat ' if v.get('repeat') else ''}disturbed"
+                         f"{', kept' if v.get('repeat') else ''}: work that isn't this job's used more than a core in "
                          f"{v.get('unowned_share', 0):.0%} of {v.get('samples', 0)} samples (left running, never suspended)")
         if v.get("not_resumed"):
             notes.append(f"block {n}: suspensions not resumed: {v['not_resumed']}")
