@@ -35,6 +35,10 @@ pub struct AppState {
     replication: Arc<crate::replication::ReplicationState>,
 }
 
+/// What a repository that didn't open at start ([`Catalog::unavailable`]) answers to all
+/// but operators, who see why in the repository list: not the server's paths.
+pub(crate) const UNAVAILABLE: &str = "is unavailable: its stored settings or files can't be read; operators see why and how to repair it in the repository list";
+
 impl AppState {
     /// [`Self::try_new`]; panics if the access state can't be opened (for tests).
     pub fn new(
@@ -196,10 +200,12 @@ impl AppState {
         if id == DEFAULT_REPOSITORY {
             return Ok(self.clone());
         }
-        let repository = self
-            .repositories
-            .get(id)
-            .ok_or_else(|| ApiError::not_found(format!("no repository '{id}'")))?;
+        let Some(repository) = self.repositories.get(id) else {
+            return Err(match self.repositories.unavailable(id) {
+                Some(_) => ApiError::unavailable(format!("repository '{id}' {UNAVAILABLE}")),
+                None => ApiError::not_found(format!("no repository '{id}'")),
+            });
+        };
         // A repository with its own query budget answers with it; the rest of the policy
         // is the server's.
         let policy = match repository.settings.read().query_timeout() {

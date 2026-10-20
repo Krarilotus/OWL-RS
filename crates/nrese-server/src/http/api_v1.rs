@@ -23,25 +23,43 @@ struct RepositoryEntry {
     /// The path of its engine API.
     path: String,
     default: bool,
+    /// Set when it didn't open at start (its stored settings or files can't be read): it
+    /// answers 503 until repaired or removed. Operators see why, with the file and the
+    /// repair; others only that it is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable: Option<String>,
 }
 
 #[utoipa::path(get, path = "/api/v1/repositories", tag = "repositories",
-    responses((status = 200, description = "The repositories, the default one first", body = Vec<RepositoryEntry>)))]
-/// The repositories: the default one first, then the others.
+    responses((status = 200, description = "The repositories, the default one first, then the others, those unavailable included", body = Vec<RepositoryEntry>)))]
+/// The repositories: the default one first, then the others, with those that didn't open.
 pub async fn repositories(
     authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &authenticated).await?;
-    let entries: Vec<RepositoryEntry> = std::iter::once((DEFAULT_REPOSITORY.to_owned(), None))
-        .chain(state.repositories().list())
-        .map(|(id, title)| RepositoryEntry {
-            path: format!("/api/v1/repositories/{id}"),
-            title: title.unwrap_or_else(|| format!("NRESE: {id}")),
-            default: id == DEFAULT_REPOSITORY,
-            id,
-        })
+    let operator = state
+        .authorize(crate::policy::PolicyAction::OperatorRead, &authenticated)
+        .is_ok();
+    let entry = |id: String, title: Option<String>, unavailable: Option<String>| RepositoryEntry {
+        path: format!("/api/v1/repositories/{id}"),
+        title: title.unwrap_or_else(|| format!("NRESE: {id}")),
+        default: id == DEFAULT_REPOSITORY,
+        id,
+        unavailable,
+    };
+    let catalog = state.repositories();
+    let mut entries: Vec<RepositoryEntry> = std::iter::once((DEFAULT_REPOSITORY.to_owned(), None))
+        .chain(catalog.list())
+        .map(|(id, title)| entry(id, title, None))
         .collect();
+    entries.extend(catalog.unavailable_list().into_iter().map(|(id, why)| {
+        let why = match operator {
+            true => why,
+            false => crate::state::UNAVAILABLE.to_owned(),
+        };
+        entry(id, None, Some(why))
+    }));
     Ok(Json(entries).into_response())
 }
 

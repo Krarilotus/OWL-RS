@@ -47,6 +47,10 @@ pub enum ApiError {
     Timeout(String),
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+    /// Unavailable for a moment (a write that met a repository's reconfiguration): 503
+    /// with `Retry-After`.
+    #[error("service unavailable: {0}")]
+    RetryLater(String),
     #[error("internal server error: {0}")]
     Internal(String),
 }
@@ -121,6 +125,11 @@ impl ApiError {
         Self::ServiceUnavailable(message.into())
     }
 
+    /// 503 with `Retry-After` ([`RETRY_AFTER_SECONDS`]): send the request again.
+    pub fn retry_later(message: impl Into<String>) -> Self {
+        Self::RetryLater(message.into())
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
@@ -134,6 +143,7 @@ impl IntoResponse for ApiError {
             tracing::error!(%detail, "request failed on the server side");
         }
         let rejected = matches!(self, Self::ReasonerReject { .. });
+        let retry = matches!(self, Self::RetryLater(_));
         if let Self::IncompleteAnswer(answer) = self {
             return incomplete_answer(&answer);
         }
@@ -161,7 +171,9 @@ impl IntoResponse for ApiError {
             Self::PayloadTooLarge(detail) => (StatusCode::PAYLOAD_TOO_LARGE, detail, None),
             Self::TooManyRequests(detail) => (StatusCode::TOO_MANY_REQUESTS, detail, None),
             Self::Timeout(detail) => (StatusCode::REQUEST_TIMEOUT, detail, None),
-            Self::ServiceUnavailable(detail) => (StatusCode::SERVICE_UNAVAILABLE, detail, None),
+            Self::ServiceUnavailable(detail) | Self::RetryLater(detail) => {
+                (StatusCode::SERVICE_UNAVAILABLE, detail, None)
+            }
             Self::Internal(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail, None),
         };
         let (problem_type, title) = if rejected {
@@ -172,7 +184,7 @@ impl IntoResponse for ApiError {
         } else {
             kind(status)
         };
-        problem(
+        let mut response = problem(
             status,
             &ProblemJson {
                 r#type: problem_type,
@@ -181,9 +193,18 @@ impl IntoResponse for ApiError {
                 detail,
                 reasoner_reject,
             },
-        )
+        );
+        if retry {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECONDS));
+        }
+        response
     }
 }
+
+/// How long [`ApiError::retry_later`] asks a client to wait, in seconds.
+pub const RETRY_AFTER_SECONDS: u32 = 1;
 
 /// The problem document of exact answers that can't be proven complete: 422, type
 /// `incomplete-answer`, with the status's reasons, its bounds and the first unresolved
@@ -277,4 +298,22 @@ struct ProblemJson {
     status: u16,
     detail: String,
     reasoner_reject: Option<RejectExplanationView>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A write that met a reconfiguration is told when to send it again.
+    #[test]
+    fn a_retryable_refusal_says_when_to_retry() {
+        let response = ApiError::retry_later("reconfigured").into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from(RETRY_AFTER_SECONDS))
+        );
+        let plain = ApiError::unavailable("down").into_response();
+        assert!(plain.headers().get(header::RETRY_AFTER).is_none());
+    }
 }
