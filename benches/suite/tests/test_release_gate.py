@@ -792,6 +792,28 @@ class Instances(unittest.TestCase):
         del ps[2]["report"]["instance"]
         self.assertIn("timed its side's build in place", " ".join(run_gate(ps)["errors"]))
 
+    def test_a_block_removes_only_the_copies_it_made_also_when_a_copy_fails(self):
+        """Sol, 20 Oct 2026: block removed a block-<n>-<pid> directory that was there before it,
+        copied outside its cleanup, and took any side name as a path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "instances"
+            other = root / f"block-1-{os.getpid()}"
+            other.mkdir(parents=True)
+            (other / "keep").write_text("another block's", encoding="utf-8")
+            built = Path(tmp) / "bin"
+            (built / "release").mkdir(parents=True)
+            (built / "release" / "tool").write_text("tool", encoding="utf-8")
+            sides = [{"name": "base", "bin": built.as_posix()}, {"name": "cand", "bin": built.as_posix()}]
+            with fast.block_copies(sides, root, 1) as timed:
+                self.assertTrue(all(Path(s["bin"], "release", "tool").is_file() for s in timed))
+            self.assertEqual(sorted(p.name for p in root.iterdir()), [other.name])
+            with self.assertRaises(OSError), fast.block_copies([*sides, {"name": "main", "bin": f"{tmp}/none"}], root, 1):
+                pass
+            self.assertEqual(sorted(p.name for p in root.iterdir()), [other.name])
+            self.assertTrue((other / "keep").is_file())
+        with self.assertRaises(SystemExit):
+            fast.parse_side("../escape:/bin:rev")
+
     def test_each_pair_of_blocks_has_both_orientations_which_first_drawn_from_the_seed(self):
         firsts = set()
         for seed in map(str, range(20)):

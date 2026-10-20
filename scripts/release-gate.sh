@@ -347,9 +347,11 @@ block)
   [ -s "$OUT/seed" ] || echo "${GATE_SEED:-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')}" > "$OUT/seed"
   opts+=(--seed "$(cat "$OUT/seed")")
   # Every side timed from a copy of its build made for this block, removed after it (fast.py
-  # fresh_copies(): a cached instance's offset is the block's, not the round's; lks-aa-20).
-  rm -rf "$GATE/instances" && mkdir -p "$GATE/instances"
-  opts+=(--fresh-copies "$GATE/instances")
+  # block_copies(): a cached instance's offset is the block's, not the round's; lks-aa-20). The
+  # block's directory is made here for it alone, and only it is removed, also if fast.py dies.
+  mkdir -p "$GATE/instances" && copies=$(mktemp -d "$GATE/instances/block-$n-XXXXXX") || exit 2
+  trap 'rm -rf "$copies"' EXIT
+  opts+=(--fresh-copies "$copies")
   fast_env
   # A timed block: prepared data only (fast.py never makes any while it times).
   export NRESE_TIMED_GATE=1
@@ -559,7 +561,10 @@ clean)
   # for the gate's next run. Builds no gate used for GATE_BIN_AGE_DAYS go (sweep_builds).
   before=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
   for dir in "$GATE"/src-* "$GATE"/build/src-*; do [ -d "$dir" ] && git worktree remove --force "$dir"; done
-  rm -rf "$GATE"/target-* "$GATE"/build "$GATE"/reports "$GATE"/compact "$GATE"/instances
+  rm -rf "$GATE"/target-* "$GATE"/build "$GATE"/reports "$GATE"/compact
+  # Block copies are removed by their block; what a killed one left is named, not swept.
+  rmdir "$GATE/instances" 2>/dev/null || { [ -d "$GATE/instances" ] \
+    && log "clean: block copies left by an interrupted block, not removed: $(ls "$GATE/instances" | tr '\n' ' ')"; }
   swept=$(sweep_builds | tr '\n' ' ')
   [ -z "$swept" ] || log "clean: unused builds removed: $swept"
   git worktree prune
