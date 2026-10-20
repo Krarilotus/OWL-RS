@@ -1,6 +1,7 @@
-"""Build admission (scripts/cargo-guarded.sh): a cargo run waits while the machine is busy, for a
-slot and until its declared memory peak fits above the floor, never building anyway; a request
-that can never fit is refused at once; a dead holder is reclaimed by its identity; and a run says
+"""Build admission (scripts/cargo-guarded.sh): a cargo run waits for a slot and until its declared
+memory peak fits above the floor, never building anyway, and for no earlier run that can't start
+itself; its wait is bounded, terminal or not; a request that can never fit is refused at once; a
+dead holder is reclaimed by its identity; and a run says
 it was stopped by the main PC's guard only when the guard stopped a process of its own build.
 Sol's round-1 probes (Harness/notes/review-build-admission-r1-20261020/probe.py) are here with
 the behaviour they asked for.
@@ -69,13 +70,16 @@ class Admission(unittest.TestCase):
 
     def env(self, run, **env):
         base = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "NRESE_", "CARGO_", "FLEET_"))}
-        return {**base, "HOME": str(self.root), "PATH": f"{self.stubs}{os.pathsep}{os.environ['PATH']}",
+        merged = {**base, "HOME": str(self.root), "PATH": f"{self.stubs}{os.pathsep}{os.environ['PATH']}",
                 "OUT": str(self.out), "RUN": run, "GUARD": str(self.guard),
                 "NRESE_BUILD_SLOT_DIR": str(self.root / "slots"), "NRESE_GUARD_BUSY": str(self.guard / "BUSY"),
                 "NRESE_GUARD_KILLED": str(self.guard / "killed.log"), "NRESE_MEMINFO": str(self.root / "meminfo"),
                 "NRESE_BUILD_FLOOR_GB": "16", "NRESE_MEMORY_CAP_GB": "0", "NRESE_MIN_FREE_GB": "0",
                 "NRESE_TARGET_BUDGET_GB": "1000", "CARGO_TARGET_DIR": str(self.root / "target"),
-                "NRESE_QUIET_DIR": str(self.root / "no-quiet-slot"), "NRESE_BUILD_SLOT_WAIT_S": "0", **env}
+                "NRESE_QUIET_DIR": str(self.root / "no-quiet-slot"), "NRESE_BUILD_SLOT_WAIT_S": "600",
+                "NRESE_BUILD_SLOT_POLL_S": "1", **env}
+        # None: not set at all (the script's own default).
+        return {k: v for k, v in merged.items() if v is not None}
 
     def start(self, run, stderr=subprocess.DEVNULL, **env):
         build = subprocess.Popen([BASH, "scripts/cargo-guarded.sh", "build"], cwd=self.repo,
@@ -91,16 +95,61 @@ class Admission(unittest.TestCase):
             time.sleep(0.2)
         return None
 
+    def late_writer_done(self):
+        # The stub's late writer (NOTICE=after) ends before the test does: Windows can't remove a
+        # directory a process still writes to.
+        deadline = time.time() + 15
+        while "GUARD-STOPPED" not in (self.guard / "killed.log").read_text() and time.time() < deadline:
+            time.sleep(0.2)
+
     def ended(self, run):
         return int((self.out / f"{run}.ended").read_text())
 
-    def test_a_busy_machine_holds_every_build_however_long_and_frees_them_when_it_clears(self):
-        (self.guard / "BUSY").write_text("5.4 GB RAM, 394 GB disk free")
-        build = self.start("a")
-        self.assertIsNone(self.started("a", within=8), "built while the machine was busy")
-        (self.guard / "BUSY").unlink()
+    def test_a_build_that_fits_above_the_floor_runs_though_the_machine_is_busy(self):
+        # The orchestrator, 20 Oct 2026: BUSY stayed set for hours under the agents' own load. 12 GB
+        # free, the default 8 GB floor: room for a 3 GB peak, not for a 5 GB one.
+        (self.guard / "BUSY").write_text("12.0 GB RAM, 394 GB disk free")
+        self.free(12)
+        floor = {"NRESE_BUILD_FLOOR_GB": None, "NRESE_GUARD_SCRIPT": str(self.root / "no-guard.ps1")}
+        fits = self.start("a", NRESE_BUILD_PEAK_GB="3", **floor)
+        self.assertIsNotNone(self.started("a", within=60), "held by BUSY though it fits")
+        self.assertEqual(fits.wait(timeout=120), 0)
+        self.start("b", NRESE_BUILD_PEAK_GB="5", **floor)
+        self.assertIsNone(self.started("b", within=8))
+
+    def test_a_run_that_cannot_start_holds_up_no_one_behind_it_who_can(self):
+        # 20 Oct 2026 (16:52, 18:11): a run that couldn't start headed the line and stalled every
+        # hook behind it. 24 GB free, a 16 GB floor: 8 GB of room; the first asks 12 GB, the next 2.
+        self.start("big", NRESE_BUILD_PEAK_GB="12")
+        deadline = time.time() + 30
+        while not list((self.root / "slots" / "queue").glob("*")) and time.time() < deadline:
+            time.sleep(0.2)
+        small = self.start("small", NRESE_BUILD_PEAK_GB="2")
+        self.assertIsNotNone(self.started("small", within=60), "held up by a run that can't start")
+        self.assertEqual(small.wait(timeout=120), 0)
+        self.assertFalse((self.out / "big.started").exists())
+
+    def test_the_default_floor_is_the_guards_kill_line_and_a_margin(self):
+        # 20 Oct 2026: the soft line (16 GB) as the floor kept every hook on a merged base waiting.
+        # The guard's script says its kill line; plus 4 GB. Here 6: a 10 GB floor, 13 GB free.
+        script = self.root / "guard.ps1"
+        script.write_text("$soft = ($ram -lt 16) -or ($disk -lt 150)\n$hard = ($ram -lt 6) -or ($disk -lt 100)\n")
+        self.free(13)
+        floor = {"NRESE_BUILD_FLOOR_GB": None, "NRESE_GUARD_SCRIPT": str(script)}
+        fits = self.start("a", NRESE_BUILD_PEAK_GB="3", **floor)
+        self.assertIsNotNone(self.started("a", within=60), "3 GB above a 10 GB floor with 13 GB free")
+        self.assertEqual(fits.wait(timeout=120), 0)
+        self.start("b", NRESE_BUILD_PEAK_GB="4", **floor)
+        self.assertIsNone(self.started("b", within=8), "4 GB above a 10 GB floor with 13 GB free")
+
+    def test_without_the_guards_script_the_floor_is_8_gb(self):
+        self.free(12)
+        floor = {"NRESE_BUILD_FLOOR_GB": None, "NRESE_GUARD_SCRIPT": str(self.root / "no-guard.ps1")}
+        fits = self.start("a", NRESE_BUILD_PEAK_GB="4", **floor)
         self.assertIsNotNone(self.started("a", within=60))
-        self.assertEqual(build.wait(timeout=120), 0)
+        self.assertEqual(fits.wait(timeout=120), 0)
+        self.start("b", NRESE_BUILD_PEAK_GB="5", **floor)
+        self.assertIsNone(self.started("b", within=8))
 
     def test_a_build_runs_with_the_jobs_memory_allows_and_the_next_waits_for_its_peak(self):
         # 24 GB free, a 16 GB floor: 8 GB of room; 12 jobs would peak at 9.2 GB, 10 at 8.0 GB.
@@ -169,6 +218,7 @@ class Admission(unittest.TestCase):
         _, err = build.communicate(timeout=120)
         self.assertEqual(build.returncode, 127, err)
         self.assertNotIn("stopped by the PC guard", err)
+        self.late_writer_done()
 
     def test_even_the_first_look_at_the_notices_counts_only_before_the_deadline(self):
         # Sol, round 4: the first scan of the guard's notices taking 4 s (an awk that is slow only
@@ -179,6 +229,7 @@ class Admission(unittest.TestCase):
         _, err = build.communicate(timeout=120)
         self.assertEqual(build.returncode, 127, err)
         self.assertNotIn("stopped by the PC guard", err)
+        self.late_writer_done()
 
     @unittest.skipUnless(shutil.which("powershell"), "the memory cap's helper is Windows'")
     def test_a_broken_cap_helper_is_built_again_and_a_cap_never_silently_dropped(self):
@@ -204,16 +255,15 @@ class Admission(unittest.TestCase):
         self.assertIn("memory cap could not be applied (scripts/lib/memory-cap.ps1): not building", err)
         self.assertIsNone(self.started("uncapped", within=1))
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "a pseudo-terminal (pty)")
-    def test_only_a_terminal_gives_up_waiting(self):
-        import pty
-        (self.guard / "BUSY").write_text("busy")
-        primary, secondary = pty.openpty()
-        self.addCleanup(os.close, primary)
-        self.addCleanup(os.close, secondary)
-        build = self.start("a", stderr=secondary)
-        self.assertEqual(build.wait(timeout=60), 75)
+    def test_a_wait_without_a_terminal_ends_failing_with_its_reason_and_nothing_built(self):
+        # A hook has no terminal and no one to interrupt it: it fails, it never hangs or builds.
+        build = self.start("a", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="12", NRESE_BUILD_SLOT_WAIT_S="3")
+        _, err = build.communicate(timeout=60)
+        self.assertEqual(build.returncode, 75, err)
+        self.assertIn("not built: no room to build after", err)
+        self.assertIn("it may peak at 12 GB", err)
         self.assertFalse((self.out / "a.started").exists())
+        self.assertEqual(list((self.root / "slots" / "queue").glob("*")), [])
 
 
 if __name__ == "__main__":
