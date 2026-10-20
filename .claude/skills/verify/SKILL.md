@@ -36,7 +36,9 @@ The scenario schema, the predicates and the evidence layout: `scripts/verify/REA
 
    It writes `tmp/verify/jobs/verify-build-<sha8>-<stamp>.toml` and `verify-run-…toml` and
    prints their paths. Priority 600 by default (exploratory); 790 with `--verifies` for a v1.5
-   fix verification. `--set KEY=VALUE` passes a server setting to every scenario.
+   fix verification. `--set KEY=VALUE` passes a server setting to every scenario. The run job
+   asks for 0.5 GB (the example scenarios peaked at 55 MiB): declare more with `--ram-gb` when
+   your scenarios hold more data; every summary records the peak.
 3. **Submit both** (`fleet submit BUILD RUN`). The build is a debug `nrese-server` at the
    server commit, made on gamergrill (fleet can't stage a binary onto a WSL host), kept there in
    `~/fleet/cache/owlrs-verify/bin-<sha12>/` and returned with `build.json`. A later build of the

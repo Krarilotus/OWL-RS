@@ -243,7 +243,6 @@ def run_one(sc: scenarios.Scenario, out: Path, target: dict, settings: dict[str,
             server = Server(target["command"], {**sc.settings, **settings}, sc.env, out / "server.log",
                             start_timeout=args.start_timeout, scratch=args.scratch)
             result["launch"] = {**server.start(), "binary": target["binary"]}
-            _write(out / "launch.json", result["launch"])
             base = server.base
         print(f"[{sc.name}] server at {base}", flush=True)
         report = doctor(base)
@@ -264,6 +263,8 @@ def run_one(sc: scenarios.Scenario, out: Path, target: dict, settings: dict[str,
     finally:
         if server:
             result["cleanup"] = server.cleanup(keep=args.keep)
+            _write(out / "launch.json", {"binary": target["binary"], "starts": server.starts,
+                                         "settings": server.settings, "cleanup": result["cleanup"]})
     result["ok"] = not result["error"] and all(s["ok"] for s in result["steps"])
     return result
 
@@ -284,8 +285,10 @@ def cgroup_peak_mib() -> float | None:
         return None
 
 
-def summarise(evidence: Path, results: list[dict], target: dict, title: str, extra: list[str] | None = None) -> Path:
-    """summary.json and summary.md in `evidence`; the path of summary.md."""
+def summarise(evidence: Path, results: list[dict], target: dict, title: str, extra: list[str] | None = None,
+              on_purpose: bool = False) -> Path:
+    """summary.json and summary.md in `evidence`; the path of summary.md. `on_purpose`: the
+    self-test's, whose wrong steps fail by design (the title says whether it passed)."""
     context = {"host": socket.gethostname(), "platform": platform.platform(), "python": platform.python_version(),
                "fleet_job": os.environ.get("FLEET_JOB"), "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                "server": target.get("binary") or {"url": target.get("url")}, "cgroup_peak_mib": cgroup_peak_mib()}
@@ -304,8 +307,9 @@ def summarise(evidence: Path, results: list[dict], target: dict, title: str, ext
     lines += [f"- {n}" for n in extra or []]
     for r in results:
         steps = r["steps"]
-        lines += ["", f"## {r['scenario']}: {'passed' if r['ok'] else 'FAILED'} "
-                      f"({sum(s['ok'] for s in steps)} of {len(steps)} steps)", ""]
+        counts = f"{sum(s['ok'] for s in steps)} of {len(steps)} steps passed"
+        lines += ["", f"## {r['scenario']}: " + (f"{counts}; its wrong steps fail on purpose" if on_purpose else
+                                                 f"{'passed' if r['ok'] else 'FAILED'} ({counts})"), ""]
         if r["description"]:
             lines += [r["description"], ""]
         if r["doctor"]:
@@ -449,13 +453,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--verifies", help="the commit or issue a fix verification verifies")
     p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     p.add_argument("--no-selftest", action="store_true", help="leave out the self-test step")
+    p.add_argument("--ram-gb", type=float, help="the run job's memory (default 0.5: the example scenarios "
+                   "peaked at 55 MiB); each summary records the peak")
     p.add_argument("scenarios", nargs="+", help="paths in the harness commit")
     args = parser.parse_args(argv)
     signal.signal(signal.SIGTERM, _terminated)
+    # A response's text in a failure line mustn't stop the run on a console that can't show it.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
 
     if args.command == "jobs":
         out = jobs.jobs(args.repo, args.rev, args.harness or args.rev, [Path(s).as_posix() for s in args.scenarios],
-                        args.set, args.priority, args.reason, args.verifies, not args.no_selftest)
+                        args.set, args.priority, args.reason, args.verifies, not args.no_selftest, args.ram_gb)
         args.out.mkdir(parents=True, exist_ok=True)
         for job_id, job in out.items():
             path = args.out / f"{job_id}.toml"
@@ -502,7 +511,7 @@ def main(argv: list[str] | None = None) -> int:
             verdict = ("passed: every wrong expectation failed with its message, and the controls passed"
                        if not problems else "FAILED: " + "; ".join(problems))
             summary = summarise(evidence, results, target, f"/verify self-test {verdict.split(':')[0]}",
-                                [f"self-test {verdict}", "the steps named wrong fail on purpose"])
+                                [f"self-test {verdict}"], on_purpose=True)
             print(f"self-test {verdict}")
             # A server that didn't come up (or go) judges nothing: that's the infrastructure's.
             code = 3 if results[0]["error"] or (results[0]["cleanup"] or {}).get("error") else 1 if problems else 0
