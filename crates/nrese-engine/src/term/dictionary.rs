@@ -760,6 +760,35 @@ impl Dictionary {
     /// Like [`lookup`](Self::lookup) but treats entries with index `>= limit` as absent.
     /// Snapshots use this so that terms interned after the snapshot was taken are never
     /// observed, which keeps term identity stable for the lifetime of a query.
+    /// The most bytes [`Self::lookup_bounded`] allocates for `term`, known before it runs:
+    /// its key (from 64 bytes, grown to the term's encoded length by doubling, the old
+    /// buffer beside the new while it grows), and where the base's keys are compressed the
+    /// compressor's output (twice the key) and the stored key it is copied into, grown
+    /// past the key's length; a triple term's, its components' looked up one after another
+    /// and then its key of ids.
+    pub fn lookup_bytes(&self, term: TermRef<'_>) -> usize {
+        if let TermRef::Triple(triple) = term {
+            let parts = [
+                self.lookup_bytes(triple.subject.as_ref().into()),
+                self.lookup_bytes(triple.predicate.as_ref().into()),
+                self.lookup_bytes(triple.object.as_ref()),
+            ];
+            return parts.into_iter().max().unwrap_or(0).max(TRIPLE_KEY_LEN);
+        }
+        let encoded = encoded_len(term);
+        let key = encoded.max(64);
+        let compressed = self
+            .inner
+            .read()
+            .base
+            .as_ref()
+            .is_some_and(|base| base.codec.is_some());
+        match compressed {
+            false => 3 * key,
+            true => 2 * key + 5 * encoded + 16,
+        }
+    }
+
     pub fn lookup_bounded(&self, term: TermRef<'_>, limit: u64) -> Option<TermId> {
         if let Some(id) = self.inline_id(term) {
             return Some(id);
@@ -1683,6 +1712,26 @@ fn graph_term(graph: GraphNameRef<'_>) -> Option<TermRef<'_>> {
         GraphNameRef::NamedNode(node) => Some(node.into()),
         GraphNameRef::BlankNode(node) => Some(node.into()),
         GraphNameRef::DefaultGraph => None,
+    }
+}
+
+/// The length of `term`'s key ([`encode_key`]), but a triple term's.
+fn encoded_len(term: TermRef<'_>) -> usize {
+    match term {
+        TermRef::NamedNode(node) => 1 + node.as_str().len(),
+        TermRef::BlankNode(node) => 1 + node.as_str().len(),
+        TermRef::Literal(literal) => {
+            let head = match literal.language() {
+                Some(language) => {
+                    let direction = literal.direction().map_or(0, |d| d.as_str().len() + 1);
+                    1 + language.len() + direction + 1
+                }
+                None if literal.datatype() == nrese_rdf::vocab::xsd::STRING => 1,
+                None => 1 + literal.datatype().as_str().len() + 1,
+            };
+            head + literal.value().len()
+        }
+        TermRef::Triple(_) => TRIPLE_KEY_LEN,
     }
 }
 
