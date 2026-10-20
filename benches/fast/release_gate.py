@@ -1314,10 +1314,11 @@ def whole_squares(n: int, square: int) -> int:
     return -(-n // square) * square if square > 1 else n
 
 
-def blocks(plan_: list[str], measure: dict, min_blocks: int = CAMPAIGN_BLOCKS, square: int = 1) -> list[list[str]]:
+def blocks(plan_: list[str], measure: dict, min_blocks: int = CAMPAIGN_BLOCKS, *, square: int) -> list[list[str]]:
     """The cases of each block: block k (from 1) runs those whose blocks (measure.toml) reach k,
-    each case's count in whole squares of `square` blocks (whole_squares()); the first block every
-    case (a declared outcome's: checked there, not timed)."""
+    each case's count in whole squares of `square` blocks (whole_squares(): the timed sides); the
+    first block every case (a declared outcome's: checked there, not timed). `square` has no
+    default (Sol r1, 20 Oct 2026: a call without it planned 2 and 8 blocks for three sides)."""
     need = {c: whole_squares(int(measure.get(c, {}).get("blocks", min_blocks)), square) for c in plan_}
     count = max([whole_squares(min_blocks, square), *need.values()])
     return [[c for c in plan_ if need[c] >= k or k == 1] for k in range(1, count + 1)]
@@ -1650,7 +1651,7 @@ def main() -> int:
     s = sub.add_parser("blocks", help="each block's plan of a gate (release-gate.sh plan-blocks)")
     s.add_argument("--plan", type=Path, required=True)
     s.add_argument("--measure", type=Path, required=True)
-    s.add_argument("--square", type=int, default=1, help="the timed sides: each case's blocks in whole Latin squares")
+    s.add_argument("--square", type=int, required=True, help="the timed sides: each case's blocks in whole Latin squares")
     s.add_argument("--out", type=Path, required=True)
     s = sub.add_parser("confirm", help="the confirmation job of each host whose run flagged a loss or an undecided case")
     s.add_argument("--reports", type=Path, nargs="+", required=True, help="every timed report so far (release-gate.json)")
