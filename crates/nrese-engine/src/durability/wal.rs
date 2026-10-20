@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use super::SyncPolicy;
 use super::codec::{CommitRecord, FRAME_HEADER, Frame, decode_frame, encode_record, intact_len};
 use super::fault::{self, Step};
+use super::publish::publish_or_fail;
 use super::sidecar;
 use crate::error::{EngineError, EngineResult};
 
@@ -100,6 +101,25 @@ pub(crate) enum Tail {
 /// The sync policy `segment` was written under, if its sidecar records one.
 fn segment_policy(segment: &Path) -> Option<SyncPolicy> {
     sidecar::read(segment, "sync").and_then(|word| SyncPolicy::from_word(&word))
+}
+
+/// Removes what a crash left of a segment or sidecar being written under a temporary name
+/// ([`create_segment`], [`copy_log_segment`], [`sidecar::write`]).
+pub(crate) fn remove_partials(dir: &Path) -> EngineResult<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if [".creating", ".copying", ".meta.tmp"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+        {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }
 
 /// Removes a segment and its sidecar.
@@ -432,13 +452,16 @@ impl Wal {
 fn archive_segment(path: &Path, archive: &Path) -> EngineResult<()> {
     let target = archive.join(path.file_name().expect("segment file name"));
     sidecar::copy(path, &target)?;
-    if fs::rename(path, &target).is_err() {
-        fs::copy(path, &target)?;
-        OpenOptions::new().write(true).open(&target)?.sync_all()?;
+    if publish_or_fail(path, &target).is_err() {
+        // Another file system: a copy, published, then the original goes.
+        let mut partial = target.clone().into_os_string();
+        partial.push(".copying");
+        let partial = PathBuf::from(partial);
+        fs::copy(path, &partial)?;
+        publish_or_fail(&partial, &target)?;
         fs::remove_file(path)?;
     }
     sidecar::remove(path);
-    super::sync_dir(archive)?;
     Ok(())
 }
 
@@ -455,10 +478,7 @@ pub fn copy_log_segment(segment: &Path, dir: &Path) -> EngineResult<PathBuf> {
     partial.push(".copying");
     let partial = PathBuf::from(partial);
     fs::copy(segment, &partial)?;
-    // Synced through a writable handle: Windows flushes no other.
-    OpenOptions::new().write(true).open(&partial)?.sync_all()?;
-    fs::rename(&partial, &target)?;
-    super::sync_dir(dir)?;
+    publish_or_fail(&partial, &target)?;
     Ok(target)
 }
 
@@ -477,13 +497,11 @@ fn create_segment(
 ) -> EngineResult<File> {
     let path = segment_path(dir, first_revision);
     sidecar::write(&path, &[("sync", sync.word())])?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&path)?;
-    file.write_all(magic)?;
-    file.sync_all()?;
-    super::sync_dir(dir)?;
+    // Written under a temporary name and published: the segment is there whole or not at all.
+    let mut partial = path.clone().into_os_string();
+    partial.push(".creating");
+    let partial = PathBuf::from(partial);
+    File::create(&partial)?.write_all(magic)?;
+    publish_or_fail(&partial, &path)?;
     Ok(OpenOptions::new().append(true).open(&path)?)
 }

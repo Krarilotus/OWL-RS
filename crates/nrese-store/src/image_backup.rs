@@ -208,7 +208,8 @@ pub fn restore_image(backup: &Path, data_dir: &Path) -> StoreResult<ImageManifes
     let target = data_dir.join(&manifest.file);
     let partial = data_dir.join(format!("{}.restoring", manifest.file));
     fs::copy(&image, &partial).map_err(|e| io(e, &image))?;
-    fs::rename(&partial, &target).map_err(|e| io(e, &target))?;
+    // Flushed and placed durably: the store opens from it.
+    nrese_engine::place_file(&partial, &target).map_err(|e| io(e, &target))?;
     Ok(manifest)
 }
 
