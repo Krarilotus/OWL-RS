@@ -207,6 +207,13 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
     })
 }
 
+/// Microseconds since 1970, 0 for a clock before it.
+fn now_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros() as u64)
+}
+
 /// What `rest`, a segment from its first frame that doesn't decode, is: `damaged` holds
 /// that frame's length if it is complete; `timed`, a version 6 segment; `policy`, the
 /// segment's sync policy if recorded; `next`, the least revision a record after the damage
@@ -240,8 +247,11 @@ fn classify(
     if !after.iter().all(|&byte| byte == 0) {
         return Tail::Corrupt("a damaged record with data after it".into());
     }
-    match frame.ends_with(&[0; 8]) {
-        // Its end, the commit time, never reached the disk: the write was in flight.
+    // A version 6 frame ends in its non-zero commit time (the writer sees to it): zeros there
+    // mean its end never reached the disk, so the write was in flight. That is read from the
+    // segment's format, never from the frame: an untimed frame (version 4) can end in zeros
+    // whole, and its damage fails closed.
+    match timed && frame.ends_with(&[0; 8]) {
         true => Tail::Torn,
         false => Tail::Corrupt("a damaged last record, synced and so acknowledged".into()),
     }
@@ -462,15 +472,25 @@ impl Wal {
         }
         self.buffer.clear();
         // Version 4 segments (stores that keep integers in their dictionary) have no times.
-        let timed;
-        let record = match self.magic == SEGMENT_MAGIC {
-            true => record,
-            false => {
-                timed = CommitRecord {
+        // Every version 6 frame ends in a non-zero time, which recovery relies on (a final
+        // frame ending in zeros never landed whole: [`classify`]): a record without one (a
+        // replica's from an older primary) or with a zero clock gets this one's.
+        let restamped;
+        let record = match (self.magic == SEGMENT_MAGIC, record.committed_micros) {
+            (true, Some(micros)) if micros > 0 => record,
+            (true, _) => {
+                restamped = CommitRecord {
+                    committed_micros: Some(now_micros().max(1)),
+                    ..record.clone()
+                };
+                &restamped
+            }
+            (false, _) => {
+                restamped = CommitRecord {
                     committed_micros: None,
                     ..record.clone()
                 };
-                &timed
+                &restamped
             }
         };
         encode_record(record, &mut self.buffer)?; // nothing written yet on error

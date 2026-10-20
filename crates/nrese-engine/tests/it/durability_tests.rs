@@ -228,6 +228,20 @@ fn wal_damage_is_truncated_or_refused_by_its_evidence() {
     type Damage = fn(&mut Vec<u8>, &[(usize, usize)]);
     let flip_first: Damage = |bytes, frames| bytes[frames[0].0 + 12] ^= 1;
     let flip_last: Damage = |bytes, frames| bytes[frames[2].0 + 12] ^= 1;
+    // The segment rewritten as version 4 (untimed frames, as a store that keeps integers in
+    // its dictionary writes), then its last frame damaged.
+    let untimed_flip_last: Damage = |bytes, frames| {
+        let mut untimed = b"NRESEWL4".to_vec();
+        for &(start, end) in frames {
+            let payload = &bytes[start + 8..end - 8];
+            untimed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            untimed.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+            untimed.extend_from_slice(payload);
+        }
+        let last = untimed.len() - (frames[2].1 - frames[2].0 - 8) + 12;
+        untimed[last] ^= 1;
+        *bytes = untimed;
+    };
     let flip_two: Damage = |bytes, frames| {
         bytes[frames[0].0 + 12] ^= 1;
         bytes[frames[1].0 + 12] ^= 1;
@@ -253,7 +267,7 @@ fn wal_damage_is_truncated_or_refused_by_its_evidence() {
         Option<u64>,
         Result<u64, u64>,
     );
-    let rows: [Row; 12] = [
+    let rows: [Row; 13] = [
         (
             "damage before intact records",
             every,
@@ -295,6 +309,14 @@ fn wal_damage_is_truncated_or_refused_by_its_evidence() {
             Err(0),
         ),
         ("a zero-filled tail", every, true, zero_tail, None, Ok(3)),
+        (
+            "an untimed (version 4) last record damaged",
+            every,
+            true,
+            untimed_flip_last,
+            None,
+            Err(2),
+        ),
         (
             "a damaged length over an intact record",
             every,
