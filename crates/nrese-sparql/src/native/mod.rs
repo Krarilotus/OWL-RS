@@ -1751,13 +1751,13 @@ impl<'a> Context<'a> {
         // BIND(?x AS ?y) copies the column: the same terms, nothing to evaluate (the
         // aggregates of a SELECT come out this way).
         if let Expression::Variable(source) = expression {
-            let values = match solutions.column(source) {
-                Some(column) => solutions.table.column(column).to_vec(),
-                None => vec![UNDEF; solutions.table.len()],
-            };
+            let source = solutions.column(source);
             let mut solutions = solutions;
             let mut columns = std::mem::take(&mut solutions.table).into_columns();
-            columns.push(values);
+            match source {
+                Some(column) => columns.push_copy(column, &self.budget)?,
+                None => columns.push(std::iter::repeat_n(UNDEF, columns.rows()), &self.budget)?,
+            }
             solutions.vars.push(variable.clone());
             solutions.table = IdTable::from_columns(columns);
             return self.produced(solutions);
@@ -1771,8 +1771,9 @@ impl<'a> Context<'a> {
         // expressions by the generic evaluator.
         let on_ids = fast::compile_term(&plain, &self.snapshot)
             .filter(|term| matches!(term, fast::IdTerm::Part(..) | fast::IdTerm::Triple(_)));
-        let values: Vec<u64> = (0..solutions.table.len())
-            .map(|row| {
+        let mut made = nrese_exec::Columns::new(solutions.table.len());
+        made.push_try(
+            (0..solutions.table.len()).map(|row| {
                 if let Some(term) = &on_ids {
                     let value = |v: &Variable| {
                         solutions
@@ -1790,11 +1791,12 @@ impl<'a> Context<'a> {
                         self.evaluator.eval(&plain, &self.binding(&solutions, row))
                     })
                     .map_or(Ok(UNDEF), |term| self.id(&term))
-            })
-            .collect::<NativeResult<_>>()?;
+            }),
+            &self.budget,
+        )?;
         let mut solutions = drop_last_columns(solutions, added);
         let mut columns = std::mem::take(&mut solutions.table).into_columns();
-        columns.push(values);
+        columns.append(made, &self.budget)?;
         solutions.vars.push(variable.clone());
         solutions.table = IdTable::from_columns(columns);
         self.produced(solutions)
@@ -2218,13 +2220,13 @@ impl<'a> Context<'a> {
                         .collect();
                     solutions.table.retain_mask(&mask);
                     let mut columns = std::mem::take(&mut solutions.table).into_columns();
-                    columns[column].fill(graph.raw());
+                    columns.column_mut(column).fill(graph.raw());
                     solutions.table = IdTable::from_columns(columns);
                 }
                 None => {
                     let rows = solutions.table.len();
                     let mut columns = std::mem::take(&mut solutions.table).into_columns();
-                    columns.push(vec![graph.raw(); rows]);
+                    columns.push(std::iter::repeat_n(graph.raw(), rows), &self.budget)?;
                     solutions.vars.push(variable.clone());
                     solutions.table = IdTable::from_columns(columns);
                 }
@@ -2292,6 +2294,36 @@ impl<'a> Context<'a> {
         })
     }
 
+    /// The starts of `pairs` whose end is their start, as a column charged first.
+    fn same_ends(&self, pairs: &[(u64, u64)]) -> NativeResult<IdTable> {
+        let same = || pairs.iter().filter(|(a, b)| a == b).map(|&(a, _)| a);
+        let mut columns = nrese_exec::Columns::new(same().count());
+        columns.push(same(), &self.budget)?;
+        Ok(IdTable::from_columns(columns))
+    }
+
+    /// `pairs` as two columns, starts and ends, charged first.
+    fn both_ends(&self, pairs: &[(u64, u64)]) -> NativeResult<IdTable> {
+        let mut columns = nrese_exec::Columns::new(pairs.len());
+        columns.push(pairs.iter().map(|&(a, _)| a), &self.budget)?;
+        columns.push(pairs.iter().map(|&(_, b)| b), &self.budget)?;
+        Ok(IdTable::from_columns(columns))
+    }
+
+    /// The columns of `variables` in `solutions` (UNDEF for one it hasn't), copied into a
+    /// table charged first: the keys of a GROUP BY.
+    fn key_table(&self, solutions: &Solutions, variables: &[Variable]) -> NativeResult<IdTable> {
+        let rows = solutions.table.len();
+        let mut columns = nrese_exec::Columns::new(rows);
+        for v in variables {
+            match solutions.column(v) {
+                Some(c) => columns.push(solutions.table.column(c).iter().copied(), &self.budget)?,
+                None => columns.push(std::iter::repeat_n(UNDEF, rows), &self.budget)?,
+            }
+        }
+        Ok(IdTable::from_columns(columns))
+    }
+
     /// The solutions of `path` that can join `bound`: if `bound` binds one of the path's
     /// variable ends in every row, the path is followed from those values (from the end
     /// with fewer distinct values, if both are bound). Otherwise all of the path's
@@ -2329,12 +2361,9 @@ impl<'a> Context<'a> {
         };
         let estimate = || self.path_estimate(path, Some(from));
         self.note_closures(&evaluator, path.path, estimate, pairs.len(), start);
-        let (vars, table) = if s == o {
-            let same = pairs.into_iter().filter(|(a, b)| a == b).map(|(a, _)| a);
-            (vec![s], IdTable::from_columns(vec![same.collect()]))
-        } else {
-            let (starts, ends): (Vec<u64>, Vec<u64>) = pairs.into_iter().unzip();
-            (vec![s, o], IdTable::from_columns(vec![starts, ends]))
+        let (vars, table) = match s == o {
+            true => (vec![s], self.same_ends(&pairs)?),
+            false => (vec![s, o], self.both_ends(&pairs)?),
         };
         let reached = self.produced(Solutions {
             vars,
@@ -2404,28 +2433,20 @@ impl<'a> Context<'a> {
         let ends = (self.path_end(subject)?, self.path_end(object)?);
         let mut evaluator = self.path_evaluator()?;
         evaluator.fixed = ends.0.clone().err().or_else(|| ends.1.clone().err());
-        let column = |values: Vec<u64>| IdTable::from_columns(vec![values]);
+        let column = |values: Vec<u64>| -> NativeResult<IdTable> {
+            let mut columns = nrese_exec::Columns::new(values.len());
+            columns.push(values, &self.budget)?;
+            Ok(IdTable::from_columns(columns))
+        };
         let (vars, table) = match ends {
             (Err(start), Err(finish)) => {
                 let rows = evaluator.multiplicity(&resolved, start, finish);
                 (Vec::new(), IdTable::rows_only(rows))
             }
-            (Err(start), Ok(o)) => (vec![o], column(evaluator.from(&resolved, start))),
-            (Ok(s), Err(finish)) => (vec![s], column(evaluator.to(&resolved, finish))),
-            (Ok(s), Ok(o)) if s == o => {
-                let same: Vec<u64> = evaluator
-                    .open(&resolved)
-                    .into_iter()
-                    .filter(|(a, b)| a == b)
-                    .map(|(a, _)| a)
-                    .collect();
-                (vec![s], column(same))
-            }
-            (Ok(s), Ok(o)) => {
-                let (starts, ends): (Vec<u64>, Vec<u64>) =
-                    evaluator.open(&resolved).into_iter().unzip();
-                (vec![s, o], IdTable::from_columns(vec![starts, ends]))
-            }
+            (Err(start), Ok(o)) => (vec![o], column(evaluator.from(&resolved, start))?),
+            (Ok(s), Err(finish)) => (vec![s], column(evaluator.to(&resolved, finish))?),
+            (Ok(s), Ok(o)) if s == o => (vec![s], self.same_ends(&evaluator.open(&resolved))?),
+            (Ok(s), Ok(o)) => (vec![s, o], self.both_ends(&evaluator.open(&resolved))?),
         };
         let estimate = || {
             let pattern = PathPattern {
@@ -2817,12 +2838,10 @@ impl<'a> Context<'a> {
         let mut applied = None;
         while from < result.table.len() && rows < limit {
             let to = (from + size).min(result.table.len());
-            let columns: Vec<Vec<u64>> = result
-                .table
-                .columns()
-                .iter()
-                .map(|column| column[from..to].to_vec())
-                .collect();
+            let mut columns = nrese_exec::Columns::new(to - from);
+            for column in result.table.columns() {
+                columns.push(column[from..to].iter().copied(), &self.budget)?;
+            }
             let morsel = Solutions {
                 vars: result.vars.clone(),
                 table: IdTable::from_columns(columns).assume_sorted_by(sorted.clone()),
@@ -3696,7 +3715,7 @@ impl<'a> Context<'a> {
                     let rows = self.snapshot.count_in(self.model, &pattern) as usize;
                     IdTable::rows_only(rows)
                 } else {
-                    IdTable::from_columns(columns)
+                    IdTable::adopted(columns, &self.budget)?
                 };
                 return self.produced(Solutions {
                     vars: vars.clone(),
@@ -3785,7 +3804,8 @@ impl<'a> Context<'a> {
             });
         }
         // Each range a block and a column at a time where the index can, else quad by quad.
-        let mut out: Vec<Vec<u64>> = vec![Vec::new(); vars.len()];
+        let mut out = IdTable::new(vars.len());
+        let mut row = vec![0u64; vars.len()];
         for &(low, high) in ranges {
             self.check()?;
             if let Some(decoded) = self.snapshot.scan_range_columns_in(
@@ -3796,9 +3816,7 @@ impl<'a> Context<'a> {
                 high,
                 &columns,
             ) {
-                for (column, values) in out.iter_mut().zip(decoded) {
-                    column.extend(values);
-                }
+                out.append(&IdTable::adopted(decoded, &self.budget)?, &self.budget)?;
                 continue;
             }
             let Some(quads) =
@@ -3812,16 +3830,17 @@ impl<'a> Context<'a> {
                     self.check()?;
                 }
                 let components = quad.components();
-                for (column, &c) in out.iter_mut().zip(&columns) {
-                    column.push(components[c]);
+                for (slot, &c) in row.iter_mut().zip(&columns) {
+                    *slot = components[c];
                 }
+                out.push_row(&row, &self.budget)?;
             }
         }
         let object = vars
             .iter()
             .position(|v| scan.slots[2].is_var(v))
             .expect("ranged object");
-        let table = IdTable::from_columns(out).assume_sorted_by(vec![object]);
+        let table = out.assume_sorted_by(vec![object]);
         self.produced(Solutions {
             vars,
             table,
@@ -4637,12 +4656,10 @@ impl<'a> Context<'a> {
             _ => order.sort_unstable_by(compare),
         }
         let order: Vec<usize> = order.into_iter().map(|position| rows[position]).collect();
-        let columns: Vec<Vec<u64>> = solutions
-            .table
-            .columns()
-            .iter()
-            .map(|column| order.iter().map(|&row| column[row]).collect())
-            .collect();
+        let mut columns = nrese_exec::Columns::new(order.len());
+        for column in solutions.table.columns() {
+            columns.push(order.iter().map(|&row| column[row]), &self.budget)?;
+        }
         let width = solutions.table.width();
         solutions.table = if width == 0 {
             IdTable::rows_only(order.len())
@@ -4791,22 +4808,23 @@ impl<'a> Context<'a> {
                     let estimate = Some(self.distinct(&scan, key, count));
                     self.note("group count", detail, estimate, groups.len(), start);
                 }
-                let mut columns = vec![
-                    groups
-                        .iter()
-                        .map(|(value, _)| value.raw())
-                        .collect::<Vec<_>>(),
-                ];
-                let counts: Vec<u64> = groups
-                    .iter()
-                    .map(|&(_, n)| match TermId::inline_integer(n as i64) {
-                        Some(id) => Ok(id.raw()),
-                        None => self.id(&integer(n)),
-                    })
-                    .collect::<NativeResult<_>>()?;
+                let mut columns = nrese_exec::Columns::new(groups.len());
+                columns.push(groups.iter().map(|(value, _)| value.raw()), &self.budget)?;
                 let mut vars = vec![key.clone()];
                 for (target, _) in aggregates {
-                    columns.push(counts.clone());
+                    // The counts once, copied for each further aggregate.
+                    match columns.len() {
+                        1 => columns.push_try(
+                            groups
+                                .iter()
+                                .map(|&(_, n)| match TermId::inline_integer(n as i64) {
+                                    Some(id) => Ok(id.raw()),
+                                    None => self.id(&integer(n)),
+                                }),
+                            &self.budget,
+                        )?,
+                        _ => columns.push_copy(1, &self.budget)?,
+                    }
                     vars.push(target.clone());
                 }
                 let table = IdTable::from_columns(columns).assume_sorted_by(vec![0]);
@@ -4918,12 +4936,10 @@ impl<'a> Context<'a> {
                 end += 1;
             }
             let rows = &order[start..end];
-            let columns: Vec<Vec<u64>> = keyed
-                .table
-                .columns()
-                .iter()
-                .map(|column| rows.iter().map(|&row| column[row]).collect())
-                .collect();
+            let mut columns = nrese_exec::Columns::new(rows.len());
+            for column in keyed.table.columns() {
+                columns.push(rows.iter().map(|&row| column[row]), &self.budget)?;
+            }
             let chunk = self.produced(Solutions {
                 vars: keyed.vars.clone(),
                 table: if columns.is_empty() {
@@ -5205,14 +5221,7 @@ impl<'a> Context<'a> {
         let key_table = if variables.is_empty() {
             IdTable::rows_only(solutions.table.len())
         } else {
-            let key_columns: Vec<Vec<u64>> = variables
-                .iter()
-                .map(|v| match solutions.column(v) {
-                    Some(c) => solutions.table.column(c).to_vec(),
-                    None => vec![UNDEF; solutions.table.len()],
-                })
-                .collect();
-            let key_table = IdTable::from_columns(key_columns);
+            let key_table = self.key_table(&solutions, variables)?;
             let sorted_on: Vec<usize> = variables
                 .iter()
                 .map_while(|v| solutions.column(v))
@@ -5239,17 +5248,16 @@ impl<'a> Context<'a> {
                 self.aggregate_groups(&solutions, &members, aggregates)?
             }
         };
-        let mut columns = groups.keys.clone().into_columns();
+        let mut columns = groups.keys.try_clone(&self.budget)?.into_columns();
         let mut vars: Vec<Variable> = variables.to_vec();
         for (index, (target, _)) in aggregates.iter().enumerate() {
-            let column: Vec<u64> = values
-                .iter()
-                .map(|group| match &group[index] {
+            columns.push_try(
+                values.iter().map(|group| match &group[index] {
                     Agg::Id(id) => Ok(*id),
                     Agg::Term(term) => self.id(term),
-                })
-                .collect::<NativeResult<_>>()?;
-            columns.push(column);
+                }),
+                &self.budget,
+            )?;
             vars.push(target.clone());
         }
         let table = if columns.is_empty() {

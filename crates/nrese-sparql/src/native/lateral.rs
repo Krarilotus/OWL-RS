@@ -86,7 +86,7 @@ impl Context<'_> {
                     continue;
                 }
                 let mut columns = std::mem::take(&mut found.table).into_columns();
-                columns.push(vec![id; rows]);
+                columns.push(std::iter::repeat_n(id, rows), &self.budget)?;
                 found.table = IdTable::from_columns(columns);
                 found.vars.push(variable);
             }

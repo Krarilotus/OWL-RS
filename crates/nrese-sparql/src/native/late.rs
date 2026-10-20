@@ -181,29 +181,41 @@ impl super::Context<'_> {
             kept += 1;
         }
         self.check()?;
-        let mut columns: Vec<Vec<u64>> = vec![Vec::new(); width];
+        // The columns of the rows that fit, charged before they are written.
+        let rows_out = total.min(limit);
+        let mut columns = nrese_exec::Columns::new(rows_out);
+        for _ in 0..width {
+            columns.push(
+                std::iter::repeat_n(nrese_exec::UNDEF, rows_out),
+                &self.budget,
+            )?;
+        }
         // Products of the later columns' sizes, per row, built from the last column back.
         let mut stride = vec![1usize; kept];
         for c in (0..width).rev() {
             let column = solutions.table.column(c);
-            let mut out = Vec::with_capacity(total);
+            let out = columns.column_mut(c);
+            let mut at = 0;
             for r in 0..kept {
                 let members = classes.members_of(&column[r]);
                 let repeat = stride[r];
                 let rounds = factor[r] / (members.len() * repeat);
+                // Past the limit nothing is written, but every row's stride is kept.
                 for _ in 0..rounds {
                     for &member in members {
-                        out.extend(std::iter::repeat_n(member, repeat));
+                        let end = (at + repeat).min(out.len());
+                        if at < end {
+                            out[at..end].fill(member);
+                        }
+                        at += repeat;
                     }
                 }
                 stride[r] *= members.len();
             }
-            out.truncate(limit);
-            columns[c] = out;
             self.check()?;
         }
         let out = if width == 0 {
-            nrese_exec::IdTable::rows_only(total.min(limit))
+            nrese_exec::IdTable::rows_only(rows_out)
         } else {
             nrese_exec::IdTable::from_columns(columns)
         };

@@ -1225,6 +1225,12 @@ mod tests {
         Arc::new(Budget::unlimited())
     }
 
+    /// A table of `columns`, charged to an unlimited budget.
+    fn of(columns: Vec<Vec<u64>>) -> IdTable {
+        let rows = columns.first().map_or(0, Vec::len);
+        IdTable::gathered(columns.len(), rows, &budget(), columns).unwrap()
+    }
+
     /// SplitMix64 for test data.
     struct Rng(u64);
     impl Rng {
@@ -1619,7 +1625,7 @@ mod tests {
 
     /// `rows` rows of distinct keys `0, step, 2·step, …` and a second column.
     fn keyed(rows: usize, step: u64) -> IdTable {
-        IdTable::from_columns(vec![
+        of(vec![
             (0..rows as u64).map(|i| i * step).collect(),
             (0..rows as u64).collect(),
         ])
@@ -1629,7 +1635,7 @@ mod tests {
     /// [`keyed`]'s rows in reverse order, not known to be sorted: made without a parallel
     /// sort, whose pool threads would go on tidying up into the next measurement.
     fn unsorted(rows: usize, step: u64) -> IdTable {
-        IdTable::from_columns(vec![
+        of(vec![
             (0..rows as u64).rev().map(|i| i * step).collect(),
             (0..rows as u64).rev().collect(),
         ])
@@ -1668,8 +1674,7 @@ mod tests {
             let keys: Vec<u64> = (0..200)
                 .flat_map(|k| vec![k; if k % 2 == 0 { matches } else { 1 }])
                 .collect();
-            let right = IdTable::from_columns(vec![(0..keys.len() as u64).collect(), keys])
-                .assume_sorted_by(vec![1]);
+            let right = of(vec![(0..keys.len() as u64).collect(), keys]).assume_sorted_by(vec![1]);
             let all: &(dyn Fn(&[u64]) -> bool + Sync) = &|_| true;
             [
                 uncharged(|b| {
@@ -1696,8 +1701,8 @@ mod tests {
                 .chain(std::iter::repeat_n(UNDEF, unbound))
                 .collect();
             let rows = keys.len() as u64;
-            let left = IdTable::from_columns(vec![keys.clone(), (0..rows).collect()]);
-            let right = IdTable::from_columns(vec![keys, (0..rows).collect()]);
+            let left = of(vec![keys.clone(), (0..rows).collect()]);
+            let right = of(vec![keys, (0..rows).collect()]);
             let found = std::sync::Mutex::new(vec![false; left.len()]);
             [
                 uncharged(|b| {

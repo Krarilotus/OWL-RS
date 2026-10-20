@@ -271,7 +271,9 @@ pub fn kernel(name: &str, runs: usize) -> Result<String, Box<dyn std::error::Err
     let (mut table_times, mut std_times) = (Vec::new(), Vec::new());
     let mut sorted = true;
     for _ in 0..runs {
-        let mut table = nrese_exec::IdTable::from_columns(vec![a.clone(), b.clone()]);
+        let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+        let columns = [a.iter().copied(), b.iter().copied()];
+        let mut table = nrese_exec::IdTable::gathered(2, rows, &budget, columns)?;
         let at = Instant::now();
         table.sort_by(&[0, 1]);
         table_times.push(at.elapsed());

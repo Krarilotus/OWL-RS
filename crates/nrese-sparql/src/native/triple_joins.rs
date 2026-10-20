@@ -194,10 +194,12 @@ impl Context<'_> {
         &self,
         bound: &Solutions,
         link: &Link,
-    ) -> Option<(Vec<bool>, Vec<Vec<u64>>)> {
+    ) -> Option<(Vec<bool>, IdTable)> {
         let rows = bound.table.len();
         let mut keep = Vec::with_capacity(rows);
-        let mut columns: Vec<Vec<u64>> = vec![Vec::new(); link.binds.len()];
+        // The bound values of the kept rows, charged as they grow (refused: undecided here,
+        // as for a row not decided on ids).
+        let mut columns = IdTable::new(link.binds.len());
         let mut values = vec![UNDEF; link.binds.len()];
         let snapshot: &Snapshot = &self.snapshot;
         for row in 0..rows {
@@ -220,9 +222,7 @@ impl Context<'_> {
                 Id::Unknown => return None,
             };
             if kept {
-                for (column, &value) in columns.iter_mut().zip(&values) {
-                    column.push(value);
-                }
+                columns.push_row(&values, &self.budget).ok()?;
             }
             keep.push(kept);
         }
@@ -238,13 +238,13 @@ impl Context<'_> {
         scan: &ScanPattern,
         count: u64,
         link: &Link,
-        linked: (Vec<bool>, Vec<Vec<u64>>),
+        linked: (Vec<bool>, IdTable),
     ) -> NativeResult<Solutions> {
         let (keep, values) = linked;
         let left = self.reshaped(result, |mut left| {
             left.table.retain_mask(&keep);
             let mut columns = std::mem::take(&mut left.table).into_columns();
-            columns.extend(values);
+            columns.append(values.into_columns(), &self.budget)?;
             left.vars.extend(link.binds.iter().cloned());
             left.table = IdTable::from_columns(columns);
             Ok(left)

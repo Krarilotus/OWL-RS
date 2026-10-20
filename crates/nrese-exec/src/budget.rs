@@ -463,6 +463,21 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
         Ok(old)
     }
 
+    /// Holds `other`'s bytes too, of the same budget: nothing is charged or released.
+    ///
+    /// # Panics
+    /// If `other` charges another budget.
+    pub fn absorb(&mut self, mut other: Reservation<B>) {
+        assert!(std::ptr::eq(&*self.budget, &*other.budget), "one budget");
+        let bytes = std::mem::take(&mut other.bytes);
+        self.bytes += bytes;
+        #[cfg(any(test, feature = "measure"))]
+        {
+            crate::measure::reserved(&self.budget, self.tag, bytes);
+            crate::measure::unreserved(&self.budget, other.tag, bytes);
+        }
+    }
+
     /// Hands the bytes to a holder that releases them itself (with [`Budget::release`]);
     /// nothing is released.
     pub fn transfer(mut self) -> usize {

@@ -119,7 +119,7 @@ impl SolutionTable {
                 return table;
             }
             let mut columns = table.into_columns();
-            for column in columns.iter_mut() {
+            for column in columns.values_mut() {
                 for id in column {
                     if *id != UNDEF
                         && let Some(i) = computed_index(*id)

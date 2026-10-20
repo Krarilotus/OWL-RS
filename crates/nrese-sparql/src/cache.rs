@@ -813,7 +813,13 @@ mod tests {
     fn part(rows: usize) -> Part {
         Part {
             vars: vec![0],
-            table: IdTable::from_columns(vec![vec![7; rows]]),
+            // An uncharged copy, as the cache keeps.
+            table: {
+                let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+                IdTable::gathered(1, rows, &budget, [std::iter::repeat_n(7, rows)])
+                    .unwrap()
+                    .clone()
+            },
             ordered: false,
             computed: Vec::new(),
         }
