@@ -138,11 +138,28 @@ impl BlockEnds {
     }
 }
 
+/// The bytes [`encode`] allocates for keys of `lengths`: the blocks' words, and each key's
+/// relative end in two bytes, or four in a block whose text takes 64 KiB or more.
+pub(crate) fn encoded_bytes(lengths: &[u32]) -> usize {
+    let ends: usize = lengths
+        .chunks(BLOCK)
+        .map(
+            |block| match block.iter().map(|&n| u64::from(n)).sum::<u64>() >= 1 << 16 {
+                true => 4 * block.len(),
+                false => 2 * block.len(),
+            },
+        )
+        .sum();
+    2 * lengths.len().div_ceil(BLOCK) * size_of::<u64>() + ends
+}
+
 /// Block offsets for keys of `lengths` (module docs): the blocks' two words each, and the
-/// keys' relative ends; `None` if a block's keys take 4 GiB or more.
+/// keys' relative ends; `None` if a block's keys take 4 GiB or more. It allocates exactly
+/// [`encoded_bytes`].
 pub(crate) fn encode(lengths: &[u32]) -> Option<(Vec<u64>, Vec<u8>)> {
     let mut blocks = Vec::with_capacity(2 * lengths.len().div_ceil(BLOCK));
-    let mut ends = Vec::with_capacity(2 * lengths.len());
+    let mut ends =
+        Vec::with_capacity(encoded_bytes(lengths) - blocks.capacity() * size_of::<u64>());
     let mut start = 0u64;
     for block in lengths.chunks(BLOCK) {
         let text: u64 = block.iter().map(|&n| u64::from(n)).sum();
