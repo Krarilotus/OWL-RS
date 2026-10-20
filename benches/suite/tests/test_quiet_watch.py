@@ -147,6 +147,41 @@ class Watch(unittest.TestCase):
             self.assertEqual(sent, [])
 
     @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
+    def test_a_directory_sync_that_keeps_failing_stops_every_later_suspension_too(self):
+        """Sol, 20 Oct 2026 (r3): after a failed first sync the journal file existed, so the next
+        suspension skipped the directory sync and stopped the process; so did the next container."""
+        import stat
+        owner, mine = watch.Owner({"FLEET_JOB": "job-a"}), (lambda pid: {"FLEET_JOB": "job-a"})
+        real, syncs = os.fsync, []
+
+        def failing(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                syncs.append(fd)
+                raise OSError("injected: the directory sync keeps failing")
+            return real(fd)
+        with tempfile.TemporaryDirectory() as tmp:
+            sent = []
+            with pidfds(sent), patch.object(watch.os, "fsync", failing), patch.object(watch, "started", lambda pid: "777"):
+                args = (31, Path(tmp) / "frozen", "boot-1", set(), owner)
+                attempts = [watch.suspend(*args, environ_of=mine) for _ in range(2)]
+            self.assertEqual((attempts, len(syncs), sent), ([False, False], 2, []))
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = []
+
+            def docker(args, **kwargs):
+                calls.append(args)
+                return watch.subprocess.CompletedProcess(args, 0, "", "")
+            measurement = {20: (0, 0, 0, "measurement")}
+            with patch.object(watch.os, "fsync", failing), patch.object(watch.time, "sleep"), \
+                    patch.object(watch.signal, "signal"), patch.object(watch.subprocess, "run", docker), \
+                    patch.object(watch, "processes", side_effect=[measurement, measurement, {}]), \
+                    patch.object(watch, "Owner", return_value=watch.Owner({"FLEET_JOB": "job-a"}, namespace="job-a")), \
+                    patch.object(watch, "containers", return_value=[("abc", "job-a"), ("def", "job-a")]), \
+                    patch.object(watch, "resume", return_value=[]):
+                watch.watch(Path(tmp), 20, "token")
+            self.assertEqual([c for c in calls if c[:2] == ["docker", "pause"]], [])
+
+    @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
     def test_an_unknown_boot_proves_nothing_gone_and_suspends_nothing(self):
         """Sol, 20 Oct 2026: an unreadable boot id became "?", unequal to the recorded boot, so the
         record of a process still stopped was dropped without looking at it."""
@@ -211,7 +246,7 @@ class Watch(unittest.TestCase):
             with patch.object(watch, "fsync_dir", lambda d: synced.append(Path(d)), create=True):
                 watch.journal(frozen, "pid 51")  # no start time: never settled
                 watch.journal(frozen, "container abc")
-            self.assertEqual(synced, [Path(tmp)])  # the new journal's entry, once
+            self.assertEqual(synced, [Path(tmp), Path(tmp)])  # after each append
             whole = frozen.read_text()
 
             def crash(src, dst):
