@@ -251,12 +251,27 @@ impl Durable {
         }
         // Set once the log has been cut at `recover_until`: later segments go.
         let mut cut = false;
+        let checkpointed = version.revision;
         for (position, (_, path)) in segments.iter().enumerate() {
             if cut {
                 wal::remove_segment(path)?;
                 continue;
             }
             let contents = wal::read_segment(path)?;
+            // A segment whose records the checkpoint all covers (left by a release that failed,
+            // or a crash before it) isn't replayed: damage in it can't lose anything, and isn't
+            // a reason to refuse, nor to cut the log after it.
+            let covered = segments
+                .get(position + 1)
+                .is_some_and(|(next, _)| *next <= checkpointed + 1);
+            if covered && contents.tail != wal::Tail::Clean {
+                tracing::warn!(
+                    segment = %path.display(),
+                    checkpoint = checkpointed,
+                    "damage in a WAL segment the checkpoint covers; it isn't replayed"
+                );
+                continue;
+            }
             if contents.valid_len > 0 {
                 match integers_in_dictionary {
                     None => integers_in_dictionary = Some(contents.integers_in_dictionary),
