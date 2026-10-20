@@ -930,3 +930,41 @@ fn bulk_replacement_is_streamed_into_its_checkpoint() {
     let engine = Engine::open(dir.path(), config()).unwrap();
     assert_eq!(contents(&engine), expected);
 }
+
+/// A checkpoint orders the dictionary's texts (format 7): two equal texts of 256 KiB, a
+/// simple literal's and a typed one's, are ordered as any others, and a prefix search finds
+/// both after reopening. (The order refined them a level per shared 8 bytes, which
+/// overflowed the checkpoint's worker stacks.)
+#[test]
+fn a_checkpoint_orders_equal_long_texts() {
+    use nrese_engine::{Placement, StringTest};
+    let dir = tempfile::tempdir().unwrap();
+    let text = "abcdefgh".repeat(32 << 10);
+    let objects = [
+        Literal::new_simple_literal(&text),
+        Literal::new_typed_literal(&text, NamedNode::new_unchecked("http://example.com/type")),
+    ];
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    let mut tx = engine.transaction();
+    for (i, object) in objects.iter().enumerate() {
+        let subject = NamedNode::new_unchecked(format!("http://example.com/s{i}"));
+        let predicate = NamedNode::new_unchecked("http://example.com/p");
+        tx.insert(Quad::new(subject, predicate, object.clone(), GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    engine.checkpoint().unwrap();
+    drop(engine);
+    let snapshot = Engine::open(dir.path(), config()).unwrap().snapshot();
+    let test = StringTest {
+        needle: "abcdefghabcdefgh",
+        placement: Placement::Start,
+        iris: false,
+        strings: true,
+        lang_strings: false,
+        typed: true,
+        language: None,
+        ascii_case_insensitive: false,
+    };
+    assert!(snapshot.text_order_ready());
+    assert_eq!(snapshot.matching_strings(&test).len(), 2);
+}
