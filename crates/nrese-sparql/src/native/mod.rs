@@ -1357,6 +1357,13 @@ impl<'a> Context<'a> {
             },
             false => (None, None),
         };
+        // What the reads hold while they run (an equality expansion's waiting copies) is
+        // charged to the evaluation too; a read it refuses fails the query at its next check
+        // ([`Self::check`]).
+        let read = match &canonical {
+            Some((_, read)) => read.reading_within(Arc::clone(&budget)),
+            None => snapshot.reading_within(Arc::clone(&budget)),
+        };
         let named = match &canonical {
             // The graphs `FROM NAMED` lists, by the names canonical reads give them.
             Some((names, _)) => resolved.named.map(|graphs| names.graphs(graphs)),
@@ -1374,10 +1381,7 @@ impl<'a> Context<'a> {
                 true => None,
                 false => snapshot.expand_late(options.read_model),
             },
-            snapshot: match &canonical {
-                Some((_, read)) => Cow::Owned(read.clone()),
-                None => Cow::Borrowed(snapshot),
-            },
+            snapshot: Cow::Owned(read),
             canonical: canonical.map(|(names, _)| names),
             canonical_refused,
             model: options.read_model,
@@ -1477,7 +1481,12 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Fails a cancelled query, and one a read refused memory to: what it read since may
+    /// be incomplete ([`Snapshot::reading_within`]).
     fn check(&self) -> NativeResult<()> {
+        if let Some(refused) = self.snapshot.read_refused() {
+            return Err(QueryEvaluationError::MemoryLimit(refused).into());
+        }
         Ok(self
             .cancellation
             .as_ref()

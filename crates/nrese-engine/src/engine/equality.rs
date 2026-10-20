@@ -500,6 +500,18 @@ impl Classes {
     }
 
     /// The quads a canonical stored quad stands for, the pattern's constants in place.
+    /// How many copies [`Self::expand`] gives `quad` for `pattern`: the product of its
+    /// unbound components' class sizes.
+    pub(crate) fn copies(&self, quad: &EncodedQuad, pattern: &QuadPattern) -> usize {
+        let count = |bound: Option<TermId>, id: TermId| match bound {
+            Some(_) => 1,
+            None => self.expansion(id.raw()).map_or(1, <[u64]>::len),
+        };
+        count(pattern.subject, quad.subject)
+            .saturating_mul(count(pattern.predicate, quad.predicate))
+            .saturating_mul(count(pattern.object, quad.object))
+    }
+
     pub(crate) fn expand(
         &self,
         quad: &EncodedQuad,
@@ -611,6 +623,13 @@ impl<'a> Visibility<'a> {
 /// representatives expanded, others skipped; quads of named graphs passed on when
 /// `named` (they match the pattern as given); copies shown as [`Visibility`] says. Sorted
 /// by `permutation` as its input is.
+///
+/// The copies wait in a heap until no later input can sort before them. That is no bound
+/// of one quad's copies: under a class of n identities in the permutation's first place,
+/// the copies of every quad over its representative wait for the last of them. So the
+/// heap's growth is charged to the reader's budget before it grows, the old allocation
+/// beside the new while the copies move, and released once freed ([`Reads`]); a growth
+/// the budget refuses ends the scan, the refusal kept for the reader.
 pub(crate) struct Expand<'a, I: Iterator<Item = EncodedQuad>> {
     input: std::iter::Peekable<I>,
     classes: Arc<Classes>,
@@ -619,6 +638,10 @@ pub(crate) struct Expand<'a, I: Iterator<Item = EncodedQuad>> {
     named: bool,
     visibility: Visibility<'a>,
     pending: BinaryHeap<Reverse<Key>>,
+    /// The reader's budget, and what the heap's capacity is charged to it.
+    reads: Option<Arc<super::snapshot::Reads>>,
+    held: usize,
+    refused: bool,
 }
 
 impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
@@ -639,7 +662,44 @@ impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
             named,
             visibility: Visibility::new(version, model),
             pending: BinaryHeap::new(),
+            reads: None,
+            held: 0,
+            refused: false,
         }
+    }
+
+    /// This scan charging its waiting copies to `reads`, the reader's budget, if any.
+    pub(crate) fn charging(mut self, reads: Option<Arc<super::snapshot::Reads>>) -> Self {
+        self.reads = reads;
+        self
+    }
+
+    /// Room in the heap for `more` copies, its growth charged first; false where the
+    /// reader's budget refuses it.
+    fn room(&mut self, more: usize) -> bool {
+        let needed = self.pending.len().saturating_add(more);
+        if needed <= self.pending.capacity() {
+            return true;
+        }
+        let Some(reads) = &self.reads else {
+            self.pending.reserve(more);
+            return true;
+        };
+        let size = size_of::<Reverse<Key>>();
+        let capacity = needed.max(self.pending.capacity().saturating_mul(2));
+        if !reads.charge(capacity.saturating_mul(size)) {
+            return false;
+        }
+        self.pending.reserve_exact(capacity - self.pending.len());
+        // An allocator may hand out more than asked: held too.
+        let got = self.pending.capacity().saturating_mul(size);
+        let asked = capacity.saturating_mul(size);
+        if got > asked && !reads.charge(got - asked) {
+            self.pending.shrink_to(capacity);
+        }
+        reads.release(self.held);
+        self.held = self.pending.capacity().saturating_mul(size);
+        true
     }
 
     /// The key the quad `raw` would have in the answer at the least: its own values with
@@ -661,12 +721,18 @@ impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
         };
         if !raw.graph.is_default_graph() {
             if self.named {
+                if !self.room(1) {
+                    return self.refuse();
+                }
                 self.pending.push(Reverse(self.permutation.to_key(&raw)));
             }
             return true;
         }
         if !self.classes.is_canonical(&raw) {
             return true;
+        }
+        if !self.room(self.classes.copies(&raw, &self.pattern)) {
+            return self.refuse();
         }
         let (permutation, visibility) = (self.permutation, self.visibility);
         let touching = self.classes.touches(&raw);
@@ -681,10 +747,36 @@ impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
     }
 }
 
+impl<I: Iterator<Item = EncodedQuad>> Expand<'_, I> {
+    /// Ends the scan after a refused growth: nothing more is given (the refusal is the
+    /// reader's to see), the heap freed before its charge is released.
+    fn refuse(&mut self) -> bool {
+        self.refused = true;
+        self.pending = BinaryHeap::new();
+        if let Some(reads) = &self.reads {
+            reads.release(std::mem::take(&mut self.held));
+        }
+        false
+    }
+}
+
+impl<I: Iterator<Item = EncodedQuad>> Drop for Expand<'_, I> {
+    /// The heap freed, then its charge released.
+    fn drop(&mut self) {
+        self.pending = BinaryHeap::new();
+        if let Some(reads) = &self.reads {
+            reads.release(std::mem::take(&mut self.held));
+        }
+    }
+}
+
 impl<I: Iterator<Item = EncodedQuad>> Iterator for Expand<'_, I> {
     type Item = EncodedQuad;
 
     fn next(&mut self) -> Option<EncodedQuad> {
+        if self.refused {
+            return None;
+        }
         loop {
             // What the heap holds may go out once no later input can sort before it.
             if let Some(Reverse(first)) = self.pending.peek() {
@@ -698,7 +790,7 @@ impl<I: Iterator<Item = EncodedQuad>> Iterator for Expand<'_, I> {
                     return Some(self.permutation.key_to_quad(&key));
                 }
             }
-            if !self.pull() && self.pending.is_empty() {
+            if !self.pull() && (self.refused || self.pending.is_empty()) {
                 return None;
             }
         }
