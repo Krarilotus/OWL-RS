@@ -127,14 +127,29 @@ def family(table: dict, root: int) -> tuple[set[int], set[int]]:
     return mine, ancestors
 
 
+def job_namespace(environ=os.environ) -> str | None:
+    """The job namespace (suitekit/ns.py) of this checkout and job, or None without the kit."""
+    try:
+        sys.path.insert(0, str(ROOT / "benches" / "suite"))
+        from suitekit import ns
+        return ns.namespace(ROOT, environ)
+    except Exception:  # noqa: BLE001 (no kit, no namespace: no container is owned)
+        return None
+
+
 class Owner:
     """Whose work the slot may suspend: its fleet job (FLEET_JOB), the step's slice (FLEET_SLICE)
-    and the job namespace its containers carry (nrese.ns). Empty: nothing is suspended."""
+    and the job namespace its containers carry (nrese.ns). A slot with neither a job nor a slice
+    (a manual run) owns nothing, containers included: its namespace would be the checkout's,
+    which every manual run from it shares (Sol, 20 Oct 2026)."""
 
     def __init__(self, environ=os.environ, namespace: str | None = None):
         self.job = environ.get("FLEET_JOB", "")
         self.slice = environ.get("FLEET_SLICE", "")
-        self.namespace = namespace
+        if not (self.job or self.slice):
+            self.namespace = None
+        else:
+            self.namespace = namespace if namespace is not None else job_namespace(environ)
 
     def owns(self, pid: int, environ_of=environ_of, cgroup_of=cgroup_of) -> bool:
         if self.job and environ_of(pid).get("FLEET_JOB") == self.job:
@@ -146,16 +161,6 @@ class Owner:
 
     def owns_container(self, ns_label: str) -> bool:
         return bool(self.namespace) and ns_label == self.namespace
-
-
-def namespace() -> str | None:
-    """The job namespace (suitekit/ns.py) of this checkout and job, or None without the kit."""
-    try:
-        sys.path.insert(0, str(ROOT / "benches" / "suite"))
-        from suitekit import ns
-        return ns.namespace(ROOT)
-    except Exception:  # noqa: BLE001 (no kit, no namespace: no container is owned)
-        return None
 
 
 def busy(before: dict, now: dict, interval_s: float, keep: set[int], owner: Owner,
@@ -342,7 +347,7 @@ def watch(state: Path, root: int, token: str) -> int:
     stop = {"now": False}
     signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
     me, boot = os.getpid(), boot_id()
-    owner = Owner(namespace=namespace())
+    owner = Owner()
     frozen = state / "frozen"
     stopped: set[int] = set()
     paused: set[str] = set()
