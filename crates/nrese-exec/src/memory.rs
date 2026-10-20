@@ -96,6 +96,19 @@ pub fn available_bytes() -> Option<u64> {
     imp::available_bytes()
 }
 
+/// The memory the process could still take now, as the system reports it: on Linux the
+/// least of the machine's available memory (`MemAvailable`) and what its cgroups leave
+/// (each limit less the group's use, inactive file pages not counted); on Windows the
+/// least of the machine's available physical memory and what its job object leaves (its
+/// job-wide limit less the job's committed memory, its per-process limit less the process's
+/// own); `None` where the platform doesn't say. Unlike [`available_bytes`], the total, it
+/// changes from one reading to the next, and counts as used what the allocator holds
+/// freed, until it returns it. A cap for admitting an operation as it starts, never a
+/// reservation: what it reports is taken by whoever allocates first.
+pub fn remaining_bytes() -> Option<u64> {
+    imp::remaining_bytes()
+}
+
 /// The process's memory limit, for long operations whose caller passes no watch of its
 /// own: set by whoever owns the process's configuration (server startup, or an explicit
 /// embedding host), never by opening a store. Polled through [`process_limit_exceeded`]
@@ -224,7 +237,8 @@ mod imp {
 
     use windows_sys::Win32::System::JobObjects::{
         JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOBOBJECT_LIMIT_VIOLATION_INFORMATION,
+        JOBOBJECTINFOCLASS, JobObjectExtendedLimitInformation, JobObjectLimitViolationInformation,
         QueryInformationJobObject,
     };
     use windows_sys::Win32::System::ProcessStatus::{
@@ -276,7 +290,7 @@ mod imp {
         counters().map(|counters| counters.WorkingSetSize as u64)
     }
 
-    pub fn available_bytes() -> Option<u64> {
+    fn status() -> Option<MEMORYSTATUSEX> {
         let mut status = MEMORYSTATUSEX {
             dwLength: u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?,
             ..Default::default()
@@ -284,8 +298,47 @@ mod imp {
         // SAFETY: `status` is a valid, writable MEMORYSTATUSEX with dwLength set, as the
         // API requires.
         let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
-        let machine = (ok != 0).then_some(status.ullTotalPhys)?;
+        (ok != 0).then_some(status)
+    }
+
+    pub fn available_bytes() -> Option<u64> {
+        let machine = status()?.ullTotalPhys;
         Some(job_limit().map_or(machine, |limit| limit.min(machine)))
+    }
+
+    pub fn remaining_bytes() -> Option<u64> {
+        super::least([status().map(|status| status.ullAvailPhys), job_left()])
+    }
+
+    /// One class of information about the job object the process runs in; `None` outside a
+    /// job. `T` must be the class's structure.
+    fn job<T: Default>(class: JOBOBJECTINFOCLASS) -> Option<T> {
+        let mut info = T::default();
+        let size = u32::try_from(std::mem::size_of::<T>()).ok()?;
+        // SAFETY: a null handle names the job of the calling process; `info` is a valid,
+        // writable structure of `size` bytes, the one `class` fills (the callers' contract),
+        // and the returned length isn't wanted. Outside a job the call fails.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                std::ptr::null_mut(),
+                class,
+                std::ptr::from_mut(&mut info).cast(),
+                size,
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some(info)
+    }
+
+    /// The job object's memory limits that are set: job-wide and per-process.
+    fn job_limits() -> Option<[Option<u64>; 2]> {
+        let info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = job(JobObjectExtendedLimitInformation)?;
+        let flags = info.BasicLimitInformation.LimitFlags;
+        let set = |flag, limit: usize| (flags & flag != 0 && limit > 0).then_some(limit as u64);
+        Some([
+            set(JOB_OBJECT_LIMIT_JOB_MEMORY, info.JobMemoryLimit),
+            set(JOB_OBJECT_LIMIT_PROCESS_MEMORY, info.ProcessMemoryLimit),
+        ])
     }
 
     /// The memory limit of the job object the process runs in (a job-wide or a per-process
@@ -294,33 +347,21 @@ mod imp {
     /// (which has no limit), so a cap on an enclosing job is seen only by processes started
     /// directly, as a service or a container starts the server.
     pub(super) fn job_limit() -> Option<u64> {
-        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        let size =
-            u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).ok()?;
-        // SAFETY: a null handle names the job of the calling process; `info` is a valid,
-        // writable JOBOBJECT_EXTENDED_LIMIT_INFORMATION of `size` bytes, and the returned
-        // length isn't wanted. Outside a job the call fails.
-        let ok = unsafe {
-            QueryInformationJobObject(
-                std::ptr::null_mut(),
-                JobObjectExtendedLimitInformation,
-                std::ptr::from_mut(&mut info).cast(),
-                size,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            return None;
-        }
-        let flags = info.BasicLimitInformation.LimitFlags;
-        [
-            (JOB_OBJECT_LIMIT_JOB_MEMORY, info.JobMemoryLimit),
-            (JOB_OBJECT_LIMIT_PROCESS_MEMORY, info.ProcessMemoryLimit),
-        ]
-        .into_iter()
-        .filter(|&(flag, limit)| flags & flag != 0 && limit > 0)
-        .map(|(_, limit)| limit as u64)
-        .min()
+        super::least(job_limits()?)
+    }
+
+    /// What the job object's limits leave: its job-wide limit less the memory committed by
+    /// the job's processes (the limit-violation class's `JobMemory`, which reports it whether
+    /// or not a limit was hit), its per-process limit less the process's own committed memory.
+    fn job_left() -> Option<u64> {
+        let [job_wide, per_process] = job_limits()?;
+        let job_wide = job_wide.and_then(|limit| {
+            let info: JOBOBJECT_LIMIT_VIOLATION_INFORMATION =
+                job(JobObjectLimitViolationInformation)?;
+            Some((limit, info.JobMemory))
+        });
+        let per_process = per_process.and_then(|limit| Some((limit, super::process_bytes()?)));
+        super::left([job_wide, per_process])
     }
 }
 
@@ -405,6 +446,13 @@ mod imp {
         let limit = read("/proc/self/cgroup").and_then(|own| super::cgroup::limit(&own, read));
         Some(limit.map_or(machine, |limit| limit.min(machine)))
     }
+
+    pub fn remaining_bytes() -> Option<u64> {
+        let read = |path: &str| std::fs::read_to_string(path).ok();
+        let meminfo = read("/proc/meminfo");
+        let own = read("/proc/self/cgroup");
+        super::linux_remaining(meminfo.as_deref(), own.as_deref(), read)
+    }
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
@@ -440,6 +488,45 @@ mod imp {
     pub fn available_bytes() -> Option<u64> {
         None
     }
+
+    pub fn remaining_bytes() -> Option<u64> {
+        None
+    }
+}
+
+/// The smallest of the readings there are; `None` if there are none.
+#[cfg(any(windows, target_os = "linux", test))]
+fn least(readings: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    readings.into_iter().flatten().min()
+}
+
+/// What a set of limits leaves: the least of each limit less what is used of it.
+#[cfg(any(windows, test))]
+fn left(limits: impl IntoIterator<Item = Option<(u64, u64)>>) -> Option<u64> {
+    least(
+        limits
+            .into_iter()
+            .map(|limit| limit.map(|(limit, used)| limit.saturating_sub(used))),
+    )
+}
+
+/// The memory a Linux process could still take, from `/proc/meminfo`'s text and its cgroup
+/// membership (`/proc/self/cgroup`'s): the least of the machine's `MemAvailable` and what
+/// its cgroups leave ([`cgroup::left`]). `read` reads a file's text.
+#[cfg(any(target_os = "linux", test))]
+fn linux_remaining(
+    meminfo: Option<&str>,
+    own: Option<&str>,
+    read: impl Fn(&str) -> Option<String>,
+) -> Option<u64> {
+    let machine = meminfo.and_then(|text| {
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("MemAvailable:"))?;
+        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kib * 1024)
+    });
+    least([machine, own.and_then(|own| cgroup::left(own, read))])
 }
 
 /// The memory limit a Linux process runs under, from its cgroup membership: cgroup v2 (a
@@ -451,33 +538,94 @@ mod cgroup {
     /// Above this a limit means "none".
     const NONE_ABOVE: u64 = 1 << 62;
 
-    pub fn limit(own: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64> {
-        let (root, file, path) = own.lines().find_map(|line| {
+    /// Where a cgroup version keeps a group's memory limit, its use, and its statistics, and
+    /// the statistic that counts its inactive file pages.
+    struct Files {
+        root: &'static str,
+        limit: &'static str,
+        usage: &'static str,
+        inactive: &'static str,
+    }
+
+    const V2: Files = Files {
+        root: "/sys/fs/cgroup",
+        limit: "memory.max",
+        usage: "memory.current",
+        inactive: "inactive_file",
+    };
+
+    const V1: Files = Files {
+        root: "/sys/fs/cgroup/memory",
+        limit: "memory.limit_in_bytes",
+        usage: "memory.usage_in_bytes",
+        inactive: "total_inactive_file",
+    };
+
+    /// `each` of the process's memory group and its ancestors that has a limit, innermost
+    /// first: its directory and its limit.
+    fn limited(
+        own: &str,
+        read: &impl Fn(&str) -> Option<String>,
+        mut each: impl FnMut(&Files, &str, u64),
+    ) -> Option<()> {
+        let (files, path) = own.lines().find_map(|line| {
             let mut fields = line.splitn(3, ':');
             let (_, controllers, path) = (fields.next()?, fields.next()?, fields.next()?);
             if controllers.is_empty() {
-                Some(("/sys/fs/cgroup", "memory.max", path))
+                Some((&V2, path))
             } else if controllers.split(',').any(|c| c == "memory") {
-                Some(("/sys/fs/cgroup/memory", "memory.limit_in_bytes", path))
+                Some((&V1, path))
             } else {
                 None
             }
         })?;
-        let mut dir = path.trim().trim_end_matches('/').to_owned();
-        let mut smallest: Option<u64> = None;
+        let mut dir = format!("{}{}", files.root, path.trim().trim_end_matches('/'));
         loop {
-            if let Some(value) = read(&format!("{root}{dir}/{file}"))
+            if let Some(limit) = read(&format!("{dir}/{}", files.limit))
                 .and_then(|text| text.trim().parse::<u64>().ok())
                 .filter(|&value| value > 0 && value < NONE_ABOVE)
             {
-                smallest = Some(smallest.map_or(value, |s| s.min(value)));
+                each(files, &dir, limit);
             }
-            match dir.rfind('/') {
-                Some(cut) => dir.truncate(cut),
-                None => break,
+            if dir.len() == files.root.len() {
+                return Some(());
             }
+            dir.truncate(dir.rfind('/')?);
         }
+    }
+
+    pub fn limit(own: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64> {
+        let mut smallest = None;
+        limited(own, &read, |_, _, limit| {
+            smallest = super::least([smallest, Some(limit)]);
+        });
         smallest
+    }
+
+    /// What the process's groups leave of their limits: the least of each limit less the
+    /// group's use, its inactive file pages not counted. Those are page cache the kernel
+    /// reclaims before it refuses memory, the store's mapped files among them (counted,
+    /// a store mapping its checkpoint would leave nothing); its active ones count.
+    pub fn left(own: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64> {
+        let mut least = None;
+        limited(own, &read, |files, dir, limit| {
+            let number = |text: &str| text.trim().parse::<u64>().ok();
+            let Some(usage) = read(&format!("{dir}/{}", files.usage)).and_then(|t| number(&t))
+            else {
+                return;
+            };
+            let inactive = read(&format!("{dir}/memory.stat"))
+                .and_then(|stat| {
+                    stat.lines().find_map(|line| {
+                        let (name, value) = line.split_once(' ')?;
+                        (name == files.inactive).then(|| number(value)).flatten()
+                    })
+                })
+                .unwrap_or(0);
+            let used = usage.saturating_sub(inactive);
+            least = super::least([least, Some(limit.saturating_sub(used))]);
+        });
+        least
     }
 }
 
@@ -536,6 +684,88 @@ mod tests {
         assert_eq!(cgroup::limit("3:memory:/free", read), None);
     }
 
+    /// Linux's remaining memory is the least of the machine's available memory and what
+    /// each cgroup with a limit leaves of it, inactive file pages not counted as used.
+    #[test]
+    fn linux_remaining_memory_is_the_least_left() {
+        use std::collections::HashMap;
+        const G: u64 = 1 << 30;
+        let gib = |n: u64| (n * G).to_string();
+        let files: HashMap<String, String> = [
+            // v2: the slice leaves 8 - (7 - 2) = 3 GiB, the scope 16 - (6 - 1) = 11.
+            ("/sys/fs/cgroup/memory.max", "max".to_owned()),
+            ("/sys/fs/cgroup/app.slice/memory.max", gib(8)),
+            ("/sys/fs/cgroup/app.slice/memory.current", gib(7)),
+            (
+                "/sys/fs/cgroup/app.slice/memory.stat",
+                format!("anon {}\ninactive_file {}\nactive_file 0", gib(4), gib(2)),
+            ),
+            ("/sys/fs/cgroup/app.slice/run.scope/memory.max", gib(16)),
+            ("/sys/fs/cgroup/app.slice/run.scope/memory.current", gib(6)),
+            (
+                "/sys/fs/cgroup/app.slice/run.scope/memory.stat",
+                format!("inactive_file {}", gib(1)),
+            ),
+            // v1: 4 GiB less 3 used, 1 of them inactive cache: 2 GiB.
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
+                gib(4),
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.usage_in_bytes",
+                gib(3),
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/abc/memory.stat",
+                format!("inactive_file 0\ntotal_inactive_file {}", gib(1)),
+            ),
+        ]
+        .into_iter()
+        .map(|(path, text)| (path.to_owned(), text))
+        .collect();
+        let read = |path: &str| files.get(path).cloned();
+        let meminfo = |available: u64| {
+            format!(
+                "MemTotal: 33554432 kB\nMemAvailable: {} kB\n",
+                available / 1024
+            )
+        };
+        let v2 = Some("0::/app.slice/run.scope");
+        assert_eq!(
+            linux_remaining(Some(&meminfo(20 * G)), v2, read),
+            Some(3 * G)
+        );
+        // The machine's, where it is less.
+        assert_eq!(linux_remaining(Some(&meminfo(G)), v2, read), Some(G));
+        let v1 = Some("4:cpu:/docker/abc\n3:memory:/docker/abc");
+        assert_eq!(
+            linux_remaining(Some(&meminfo(20 * G)), v1, read),
+            Some(2 * G)
+        );
+        // No limit anywhere: the machine's; and no reading at all.
+        let free = Some("0::/system.slice/x.service");
+        assert_eq!(
+            linux_remaining(Some(&meminfo(5 * G)), free, read),
+            Some(5 * G)
+        );
+        assert_eq!(linux_remaining(None, None, read), None);
+    }
+
+    /// What a job object leaves is the least of its set limits less what is used of each.
+    #[test]
+    fn a_job_leaves_the_least_of_its_limits_less_their_use() {
+        const G: u64 = 1 << 30;
+        // Job-wide 8 GiB with 5 committed, per process 4 with 2.
+        assert_eq!(
+            left([Some((8 * G, 5 * G)), Some((4 * G, 2 * G))]),
+            Some(2 * G)
+        );
+        assert_eq!(left([Some((8 * G, 5 * G)), None]), Some(3 * G));
+        // Over a limit leaves nothing; none set, no reading.
+        assert_eq!(left([Some((G, 2 * G))]), Some(0));
+        assert_eq!(left([None, None]), None);
+    }
+
     /// A job object's memory limit counts as the memory the process may use: the test puts
     /// its own process into a job with a limit below the machine's memory (it becomes the
     /// innermost job) and reads it back.
@@ -576,6 +806,13 @@ mod tests {
         assert!(assigned, "{}", std::io::Error::last_os_error());
         assert_eq!(imp::job_limit(), Some(limit));
         assert_eq!(available_bytes(), Some(limit));
+        // What remains of it is the limit less the job's committed memory (this process's).
+        let remaining = remaining_bytes().expect("the job's remaining memory");
+        let held = process_bytes().expect("the process's committed memory");
+        assert!(
+            remaining < limit && remaining + held <= limit + (64 << 20),
+            "{remaining}, {held}"
+        );
     }
 
     /// A phase's peak is its window's or none: where no window starts (Windows keeps one peak
