@@ -484,3 +484,25 @@ fn a_change_whose_closure_cant_be_restored_makes_the_repository_unavailable() {
     let why = catalog.unavailable("probe").expect("unavailable");
     assert!(why.contains("probe") && why.contains("restart"), "{why}");
 }
+
+/// A repository whose store doesn't open (here: a checkpoint that isn't one) is listed
+/// unavailable with its directory and the repair, as one whose settings are refused.
+#[test]
+fn a_repository_whose_store_doesnt_open_says_where_and_how_to_repair_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    open(dir.path())
+        .create("broken", RepositorySettings::default())
+        .expect("created");
+    let repository = dir.path().join("repositories").join("broken");
+    std::fs::write(
+        repository.join("checkpoint-00000000000000000009.nck"),
+        b"not a checkpoint",
+    )
+    .expect("written");
+    let catalog = open(dir.path());
+    let why = catalog.unavailable("broken").expect("unavailable");
+    assert!(
+        why.contains(&repository.display().to_string()) && why.contains("Repair"),
+        "{why}"
+    );
+}
