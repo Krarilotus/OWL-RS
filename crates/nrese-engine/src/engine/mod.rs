@@ -400,6 +400,11 @@ impl Shared {
                 wal.rotate(snapshot.revision() + 1)?;
                 snapshot
             };
+            // A checkpoint copies a revision already committed: whether its file is in place
+            // or not, recovery reaches the same state, so a publication whose outcome is
+            // unknown returns its error without poisoning the WAL, and releases no segment
+            // (they stay the source of that revision). Only publishing a new revision
+            // poisons on an unknown outcome ([`super::bulk`]).
             let path = checkpoint::write(durable.root(), &snapshot)?
                 .commit()
                 .map_err(checkpoint::Uncommitted::into_error)?;

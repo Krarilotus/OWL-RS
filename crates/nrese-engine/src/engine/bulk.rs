@@ -30,7 +30,8 @@
 //! the WAL is poisoned, so nothing can reuse the revision meanwhile, and the error is
 //! [`EngineError::CommitUnknown`]. After it, the version is installed and the load
 //! succeeds even if releasing covered WAL segments or removing older checkpoints fails
-//! (logged; the next checkpoint retries).
+//! (logged; a checkpoint of a later revision retries: one of the same revision finds its
+//! file in place and does nothing).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -621,7 +622,7 @@ fn commit_image(
     }
     let mut wal = durable.wal.lock();
     shared.versions.install(next);
-    // Committed: what follows is housekeeping, which the next checkpoint retries.
+    // Committed: what follows is housekeeping, retried by a checkpoint of a later revision.
     if let Err(error) = wal.release_through(revision) {
         tracing::warn!(%error, revision, "bulk load committed; covered WAL segments stay for now");
     }
@@ -746,6 +747,36 @@ mod tests {
     use crate::durability::fault::{self, Step};
     use crate::{BulkMode, Engine, EngineConfig, EngineError};
     use nrese_rdf::{GraphName, NamedNode, Quad};
+
+    /// An explicit checkpoint whose publication's outcome is unknown copies a committed
+    /// revision either way: it fails, releases no WAL segment and leaves the WAL writable
+    /// (only publishing a new revision poisons). The scoped rule of Sol r1 R3.
+    #[test]
+    fn an_unknown_checkpoint_publication_fails_without_poisoning_or_releasing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        };
+        let engine = Engine::open(dir.path(), config).unwrap();
+        let mut tx = engine.transaction();
+        tx.insert(quad("before").as_ref());
+        tx.commit().unwrap();
+        let first_segment = dir.path().join("wal").join(format!("{:020}.wal", 1));
+        fault::fail_at(Step::DirSync);
+        assert!(engine.checkpoint().is_err());
+        assert!(
+            first_segment.exists(),
+            "the segment holding revision 1 was released"
+        );
+        let mut tx = engine.transaction();
+        tx.insert(quad("after").as_ref());
+        assert_eq!(tx.commit().unwrap().revision, 2);
+        drop(engine);
+        let reopened = Engine::open(dir.path(), config).unwrap();
+        assert_eq!(reopened.snapshot().revision(), 2);
+        assert_eq!(reopened.stats().quads, 2);
+    }
 
     fn quad(name: &str) -> Quad {
         let iri = |s: String| NamedNode::new_unchecked(s);
