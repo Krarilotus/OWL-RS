@@ -16,6 +16,14 @@ pub enum EngineError {
     UnsupportedTerm,
     #[error("the write-ahead log failed earlier; reopen the engine to recover")]
     WalPoisoned,
+    /// A bulk publication failed at its commit point: whether revision `revision` was
+    /// committed shows when the engine is reopened. Nothing is written meanwhile, so the
+    /// revision can't be used twice.
+    #[error("whether revision {revision} was committed shows on reopening the engine: {cause}")]
+    CommitUnknown {
+        revision: u64,
+        cause: std::io::Error,
+    },
     #[error("transaction too large for one WAL record ({bytes} bytes); use the bulk loader")]
     TransactionTooLarge { bytes: u64 },
     #[error("data directory {0} is locked by another process")]

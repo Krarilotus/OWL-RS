@@ -96,9 +96,13 @@ pub(crate) enum Frame {
     Record(CommitRecord, usize),
     /// No bytes left.
     End,
-    /// An incomplete or checksum-failing frame: a torn write at the tail of the log, or
-    /// corruption anywhere else. The caller decides which, based on the position.
-    Invalid,
+    /// The bytes end inside the frame, in its header or the payload it announces: a write
+    /// cut short, or a damaged length field ([`intact_len`] tells).
+    Short,
+    /// A complete frame, of this many bytes, whose checksum or payload doesn't check:
+    /// damage, or a write that didn't land whole. The caller decides which
+    /// ([`super::wal::read_segment`]).
+    Damaged(usize),
 }
 
 pub(crate) fn decode_frame(bytes: &[u8]) -> Frame {
@@ -107,18 +111,44 @@ pub(crate) fn decode_frame(bytes: &[u8]) -> Frame {
     }
     let mut header = Reader::new(bytes);
     let (Some(len), Some(crc)) = (header.u32(), header.u32()) else {
-        return Frame::Invalid;
+        return Frame::Short;
     };
-    let Some(payload) = bytes.get(FRAME_HEADER..FRAME_HEADER + len as usize) else {
-        return Frame::Invalid;
+    let used = FRAME_HEADER + len as usize;
+    let Some(payload) = bytes.get(FRAME_HEADER..used) else {
+        return Frame::Short;
     };
     if crc32fast::hash(payload) != crc {
-        return Frame::Invalid;
+        return Frame::Damaged(used);
     }
     match decode_payload(payload) {
-        Some(record) => Frame::Record(record, FRAME_HEADER + len as usize),
-        None => Frame::Invalid,
+        Some(record) => Frame::Record(record, used),
+        None => Frame::Damaged(used),
     }
+}
+
+/// The size of the frame at the start of `bytes` as its payload's own structure delimits
+/// it (`timed`: with the commit time, segments of version 6), if that much is there and it
+/// matches the header's checksum: an intact record, whatever its length field says.
+pub(crate) fn intact_len(bytes: &[u8], timed: bool) -> Option<usize> {
+    let mut header = Reader::new(bytes);
+    let (_, crc) = (header.u32()?, header.u32()?);
+    let payload = &bytes[FRAME_HEADER..];
+    let mut reader = Reader::new(payload);
+    reader.u64()?;
+    reader.u64()?;
+    for _ in 0..reader.u32()? {
+        let len = reader.u32()?;
+        reader.bytes(len as usize)?;
+    }
+    for size in [QUAD_BYTES, QUAD_BYTES, TRIPLE_BYTES, TRIPLE_BYTES] {
+        let count = reader.u32()? as usize;
+        reader.bytes(count.checked_mul(size)?)?;
+    }
+    if timed {
+        reader.u64()?;
+    }
+    let len = payload.len() - reader.remaining();
+    (crc32fast::hash(&payload[..len]) == crc).then_some(FRAME_HEADER + len)
 }
 
 fn decode_payload(payload: &[u8]) -> Option<CommitRecord> {
@@ -297,7 +327,7 @@ mod tests {
         let mut bytes = Vec::new();
         encode_record(&sample(), &mut bytes).unwrap();
         for cut in 1..bytes.len() {
-            assert_eq!(decode_frame(&bytes[..cut]), Frame::Invalid, "cut at {cut}");
+            assert_eq!(decode_frame(&bytes[..cut]), Frame::Short, "cut at {cut}");
         }
         for i in 0..bytes.len() {
             let mut flipped = bytes.clone();

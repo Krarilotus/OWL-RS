@@ -12,12 +12,31 @@
 //! append the WAL record and sync it, then publish the new version. A commit is therefore
 //! acknowledged only once it is durable, and nothing is visible that isn't in the log.
 //!
-//! Recovery = newest checkpoint + replay of all later WAL records in revision order. A torn
-//! frame at the end of the last segment is truncated (it was never acknowledged); invalid
-//! data anywhere else is reported as corruption instead of being silently skipped.
+//! Recovery = newest checkpoint + replay of all later WAL records in revision order. Where
+//! the log ends in a write that never landed whole, the tail is truncated; where it may
+//! hold acknowledged commits, opening fails ([`EngineError::Corruption`], naming the last
+//! intact revision) rather than drop them. Per segment ([`wal::read_segment`]), by the
+//! sync policy it was written under (recorded beside it):
+//!
+//! - Truncated, whatever the policy: a tail that ends inside a frame's header or announced
+//!   payload, or is all zeros (a size extended whose data never reached the disk).
+//! - Corruption, whatever the policy: a damaged frame followed by an intact one, a frame
+//!   whose payload is intact under a damaged length field, and any damage in a segment
+//!   that isn't the last.
+//! - [`SyncPolicy::EveryCommit`]: a complete last frame that fails its check was synced,
+//!   so acknowledged: corruption, unless its last 8 bytes are zero (a version 6 frame ends
+//!   in its non-zero commit time, so the write was still in flight: truncated).
+//! - [`SyncPolicy::OsBuffered`], or a segment that doesn't record its policy (older ones):
+//!   such a frame is truncated with a warning. That policy may lose the last commits on
+//!   power loss, and writes reaching the disk out of order are how.
+//!
+//! To keep the intact part of a corrupt log, open with `recover_until` at the revision the
+//! error names: the log is cut before the damage.
 
 pub(crate) mod checkpoint;
 pub(crate) mod codec;
+pub(crate) mod fault;
+pub(crate) mod sidecar;
 pub(crate) mod wal;
 
 use std::fs::{self, File};
@@ -35,11 +54,29 @@ use wal::Wal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPolicy {
-    /// `fsync` the WAL before acknowledging each commit. Survives power loss.
+    /// `fsync` the WAL before acknowledging each commit. Survives power loss: damage to an
+    /// acknowledged record is reported as corruption at recovery (module docs).
     EveryCommit,
     /// Hand WAL writes to the OS without waiting. Survives a process crash, but the last
-    /// commits can be lost on power failure or an OS crash.
+    /// commits can be lost on power failure or an OS crash: recovery then truncates the
+    /// log's damaged tail, with a warning, as an unsynced write (module docs).
     OsBuffered,
+}
+
+impl SyncPolicy {
+    /// Its name in a segment's sidecar.
+    fn word(self) -> &'static str {
+        match self {
+            Self::EveryCommit => "every-commit",
+            Self::OsBuffered => "os-buffered",
+        }
+    }
+
+    fn from_word(word: &str) -> Option<Self> {
+        [Self::EveryCommit, Self::OsBuffered]
+            .into_iter()
+            .find(|policy| policy.word() == word)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,8 +90,10 @@ pub struct DurabilityConfig {
     /// Check the whole checkpoint when opening: its CRC, every index block and every
     /// dictionary key. Off by default: a checkpoint is used in place from a memory map, and
     /// opening then reads only its headers, so a restart costs milliseconds and memory
-    /// grows with what queries touch. On, opening reads the whole file once (and a damaged
-    /// one is refused at once rather than failing when a query reaches the damage).
+    /// grows with what queries touch. Off, damage the headers don't show is not detected
+    /// later either: a query reaching it can return altered answers or empty text, or fail.
+    /// On, opening reads the whole file once and refuses a damaged checkpoint; use it where
+    /// integrity matters more than the time to open.
     pub verify_on_open: bool,
     /// Serve the data from a checkpoint once it is written (after a bulk load, and by
     /// background or explicit checkpoints): the index runs and dictionary entries it covers
@@ -107,6 +146,8 @@ pub(crate) struct Durable {
     pub(crate) wal: Mutex<Wal>,
     pub(crate) checkpoint_slot: Mutex<()>,
     pub(crate) config: DurabilityConfig,
+    /// Bulk loads that spilled, for their spill directories' names.
+    spill_loads: std::sync::atomic::AtomicU64,
     _lock: File,
 }
 
@@ -200,7 +241,7 @@ impl Durable {
         let mut cut = false;
         for (position, (_, path)) in segments.iter().enumerate() {
             if cut {
-                fs::remove_file(path)?;
+                wal::remove_segment(path)?;
                 continue;
             }
             let contents = wal::read_segment(path)?;
@@ -231,7 +272,7 @@ impl Durable {
                 if after {
                     // Point-in-time restore: the log ends before this record.
                     match index {
-                        0 => fs::remove_file(path)?,
+                        0 => wal::remove_segment(path)?,
                         _ => wal::truncate_segment(path, contents.ends[index - 1])?,
                     }
                     cut = true;
@@ -247,15 +288,39 @@ impl Durable {
                 }
                 replay(&mut version, dictionary, policy, record)?;
             }
-            if contents.torn && !cut {
-                if Some(position) != last {
-                    return Err(EngineError::Corruption(format!(
-                        "invalid record in {} (not the last segment)",
-                        path.display()
-                    )));
+            match &contents.tail {
+                _ if cut => {}
+                wal::Tail::Clean => {}
+                wal::Tail::Torn if Some(position) == last => {
+                    tracing::warn!(
+                        segment = %path.display(),
+                        valid_len = contents.valid_len,
+                        revision = version.revision,
+                        "truncating a WAL tail that was never written whole; the log ends at this revision"
+                    );
+                    wal::truncate_segment(path, contents.valid_len)?;
                 }
-                tracing::warn!(segment = %path.display(), valid_len = contents.valid_len, "truncating torn WAL tail");
-                wal::truncate_segment(path, contents.valid_len)?;
+                tail => {
+                    let why = match tail {
+                        wal::Tail::Corrupt(why) => why.as_str(),
+                        _ => "an incomplete record before the last segment",
+                    };
+                    if config.recover_until == Some(version.revision) {
+                        // Asked to end here: the damage goes with the rest of the log.
+                        tracing::warn!(segment = %path.display(), why, "cutting a damaged WAL at recover_until");
+                        wal::truncate_segment(path, contents.valid_len)?;
+                        cut = true;
+                    } else {
+                        return Err(EngineError::Corruption(format!(
+                            "{why} at byte {} of {}: the log is intact through revision {}; \
+                             open with recover_until = {} to keep that and drop the rest",
+                            contents.valid_len,
+                            path.display(),
+                            version.revision,
+                            version.revision
+                        )));
+                    }
+                }
             }
         }
 
@@ -283,6 +348,7 @@ impl Durable {
                 wal: Mutex::new(wal),
                 checkpoint_slot: Mutex::new(()),
                 config,
+                spill_loads: Default::default(),
                 _lock: lock,
             },
             version,
@@ -291,6 +357,12 @@ impl Durable {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// A number no other spilling load of this engine has: its spill directory's name.
+    pub(crate) fn next_spill_load(&self) -> u64 {
+        self.spill_loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
 

@@ -121,7 +121,7 @@ impl Engine {
                     record
                 }
                 Frame::End => break,
-                Frame::Invalid => {
+                Frame::Short | Frame::Damaged(_) => {
                     return Err(EngineError::Corruption(format!(
                         "an invalid log record at byte {pos} of a replicated batch"
                     )));
