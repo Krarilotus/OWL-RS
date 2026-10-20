@@ -499,7 +499,6 @@ impl Classes {
             * size(pattern.object, quad.object)
     }
 
-    /// The quads a canonical stored quad stands for, the pattern's constants in place.
     /// How many copies [`Self::expand`] gives `quad` for `pattern`: the product of its
     /// unbound components' class sizes.
     pub(crate) fn copies(&self, quad: &EncodedQuad, pattern: &QuadPattern) -> usize {
@@ -512,6 +511,7 @@ impl Classes {
             .saturating_mul(count(pattern.object, quad.object))
     }
 
+    /// The quads a canonical stored quad stands for, the pattern's constants in place.
     pub(crate) fn expand(
         &self,
         quad: &EncodedQuad,
@@ -691,14 +691,16 @@ impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
             return false;
         }
         self.pending.reserve_exact(capacity - self.pending.len());
-        // An allocator may hand out more than asked: held too.
+        // The heap may be given more than asked: charged too, or the scan refused (what was
+        // charged held, released once the heap is freed).
         let got = self.pending.capacity().saturating_mul(size);
         let asked = capacity.saturating_mul(size);
         if got > asked && !reads.charge(got - asked) {
-            self.pending.shrink_to(capacity);
+            self.held = self.held.saturating_add(asked);
+            return false;
         }
         reads.release(self.held);
-        self.held = self.pending.capacity().saturating_mul(size);
+        self.held = got;
         true
     }
 
