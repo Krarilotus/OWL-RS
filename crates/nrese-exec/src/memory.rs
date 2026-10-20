@@ -382,8 +382,18 @@ mod imp {
         const FIRST: usize = 64;
         /// Windows's answer for a process id that no longer names a process.
         const ERROR_INVALID_PARAMETER: i32 = 87;
-        // The list: two u32 counts in the first word, then a word per process id.
-        let mut words = vec![0usize; 1 + FIRST];
+        /// The words before the first id: the list's two u32 counts, one word on a 64-bit
+        /// host, two on a 32-bit one (Sol, measure-pool r2), as the structure lays them out.
+        const HEADER: usize = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList)
+            / std::mem::size_of::<usize>();
+        const _: () = assert!(
+            std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList)
+                == HEADER * std::mem::size_of::<usize>()
+                && HEADER > 0,
+            "the ids start at a whole word after the counts"
+        );
+        // The list: its counts in the first HEADER words, then a word per process id.
+        let mut words = vec![0usize; HEADER + FIRST];
         let ids = loop {
             let size = u32::try_from(std::mem::size_of_val(words.as_slice())).ok()?;
             // SAFETY: a null handle names the job of the calling process; `words` is a valid,
@@ -411,13 +421,13 @@ mod imp {
                 break assigned;
             }
             // Refused with room for every process: outside a job, or no answer.
-            if ok == 0 && assigned < words.len() {
+            if ok == 0 && HEADER + assigned <= words.len() {
                 return None;
             }
-            words.resize(1 + assigned + FIRST, 0);
+            words.resize(HEADER + assigned + FIRST, 0);
         };
         let mut committed = 0u64;
-        for &id in &words[1..=ids] {
+        for &id in &words[HEADER..HEADER + ids] {
             let id = u32::try_from(id).ok()?;
             // SAFETY: opens a handle for query only, closed below.
             let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, id) };
