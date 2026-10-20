@@ -646,7 +646,8 @@ plan-blocks)
   # later one the cases whose measured noise needs more passes (benches/fast/measure.toml).
   harness=$(git rev-parse "$2") || exit 2
   tree=$(worktree "$harness") || exit 2
-  (cd "$tree" && py benches/fast/release_gate.py blocks --plan "$PLAN" --measure "$MEASURE" --out "$GATE") \
+  (cd "$tree" && py benches/fast/release_gate.py blocks --plan "$PLAN" --measure "$MEASURE" --out "$GATE" \
+    --square "${GATE_SQUARE:-1}") \
     | tee -a "$OUT/gate.log" || exit 2
   cp "$GATE"/plan-block-*.json "$OUT/"
   ;;

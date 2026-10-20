@@ -501,10 +501,10 @@ class Parts(unittest.TestCase):
         self.assertEqual((timed["kind"], timed["class"], timed["after"]), ("owlrs.timed", "exclusive", ["rg-test-build"]))
         self.assertEqual(checks["requires"]["hosts"], ["office-pc"])
         blocks_ = [s for s in timed["steps"] if s[2] == "block"]
-        self.assertEqual([s[3] for s in blocks_], ["1", "2"])
+        self.assertEqual([s[3] for s in blocks_], ["1", "2", "3"])  # 2 asked: one whole square of three sides
         self.assertEqual(blocks_[0][2:], ["block", "1", "c" * 40, "1", "-", f"base={gate_module.BASE}",
                                           f"main={gate_module.MAIN}", f"cand={'c' * 40}"])
-        self.assertEqual(timed["env"]["GATE_MIN_BLOCKS"], "2")
+        self.assertEqual(timed["env"]["GATE_MIN_BLOCKS"], "3")
         for job in found.values():
             self.assertNotIn("priority", job)
             self.assertEqual(job["priority_class"], "merge-gate")
@@ -906,10 +906,17 @@ class Measurement(unittest.TestCase):
     def test_a_case_whose_noise_needs_more_blocks_is_tested_on_them_and_the_jobs_run_them(self):
         measure = {"a": {"blocks": 2}, "b": {"blocks": 4}, "c": {"blocks": 3}}
         self.assertEqual(gate_module.blocks(["a", "b", "c"], measure), [["a", "b", "c"], ["a", "b", "c"], ["b", "c"], ["b"]])
+        # Whole Latin squares of the timed sides (tf2-gate-1: a first run's cost; a case in 2
+        # blocks of three sides leaves one side never opening): 2 -> 3, 4 -> 6, 3 stays.
+        self.assertEqual(gate_module.blocks(["a", "b", "c"], measure, square=3),
+                         [["a", "b", "c"]] * 3 + [["b"]] * 3)
         timed = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, measure=measure)["rg-test-timed"]
         self.assertEqual(timed["steps"][0][2:], ["plan-blocks", "c" * 40])
-        self.assertEqual([s[6] for s in timed["steps"] if s[2] == "block"],
-                         ["plan-block-1.json", "plan-block-2.json", "plan-block-3.json", "plan-block-4.json"])
+        self.assertEqual([s[6] for s in timed["steps"] if s[2] == "block"], [f"plan-block-{k}.json" for k in range(1, 7)])
+        self.assertEqual((timed["env"]["GATE_SQUARE"], timed["env"]["GATE_MIN_BLOCKS"]), ("3", "3"))
+        two = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, measure=measure,
+                               main=gate_module.BASE)["rg-test-timed"]  # main is base's build: two sides
+        self.assertEqual(len([s for s in two["steps"] if s[2] == "block"]), 4)
 
         def records_of(side, n):
             return [record()] + ([record(case="lab-yago-tiny")] if n <= 12 else [])

@@ -1695,9 +1695,8 @@ def palindrome(sides: list[str], block: int, seed: str | None = None) -> list[tu
     slower than its run 2 on olympics q06-text-filter p50 (t 6.5 over 6 blocks), the other places
     symmetric, so P read 7.4 % faster than M. A mirror alternating per pair of blocks kept the
     middle side out of the first place for good, A' in an A-B-B-A and main in the gate: a bias of
-    a quarter of the first run's cost. Squares give every side the first place alike; a case run
-    in fewer blocks than a whole number of squares keeps part of it (release_gate.blocks() runs a
-    case in blocks 1..n). Each entry: (side, its run 1 or 2)."""
+    a quarter of the first run's cost. Squares give every side the first place alike, so the gate
+    runs a case in whole squares (release_gate.whole_squares()). Each entry: (side, its run 1 or 2)."""
     k = len(sides)
     square, row = divmod(block - 1, k)
     labels, rows = list(sides), list(range(k))
