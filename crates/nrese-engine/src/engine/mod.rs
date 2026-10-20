@@ -400,7 +400,9 @@ impl Shared {
                 wal.rotate(snapshot.revision() + 1)?;
                 snapshot
             };
-            let path = checkpoint::write(durable.root(), &snapshot)?;
+            let path = checkpoint::write(durable.root(), &snapshot)?
+                .commit()
+                .map_err(checkpoint::Uncommitted::into_error)?;
             self.checkpoints.fetch_add(1, Ordering::Relaxed);
             durable.wal.lock().release_through(snapshot.revision())?;
             (snapshot, path)
@@ -735,7 +737,9 @@ impl Engine {
     /// data directory holding it opens at that revision.
     pub fn write_image(&self, dir: &std::path::Path) -> EngineResult<ImageInfo> {
         let snapshot = self.inner.shared.snapshot();
-        let path = crate::durability::checkpoint::write(dir, &snapshot)?;
+        let path = crate::durability::checkpoint::write(dir, &snapshot)?
+            .commit()
+            .map_err(crate::durability::checkpoint::Uncommitted::into_error)?;
         let version = snapshot.version();
         Ok(ImageInfo {
             path,

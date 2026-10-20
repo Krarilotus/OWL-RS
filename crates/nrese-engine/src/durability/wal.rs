@@ -12,13 +12,20 @@
 //! is then *poisoned*: every later append fails until the engine is reopened, and recovery
 //! truncates the torn tail. Appending after a partial frame would turn a recoverable torn
 //! tail into mid-log corruption.
+//!
+//! Each segment records the sync policy it is written under in a sidecar
+//! (`<segment>.wal.meta`, [`super::sidecar`]), written before the segment: recovery tells a
+//! write that never landed from damage by it ([`super::`] module docs). A segment never
+//! mixes policies: opening under another policy starts a new one.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::SyncPolicy;
-use super::codec::{CommitRecord, Frame, decode_frame, encode_record};
+use super::codec::{CommitRecord, Frame, decode_frame, encode_record, intact_len};
+use super::fault::{self, Step};
+use super::sidecar;
 use crate::error::{EngineError, EngineResult};
 
 /// Version 2 added the inferred stack to commit records (roadmap E6); version 3 inlines
@@ -71,10 +78,35 @@ pub(crate) struct SegmentContents {
     pub ends: Vec<u64>,
     /// Length of the valid prefix (header plus complete records).
     pub valid_len: u64,
-    /// True if bytes after `valid_len` could not be decoded.
-    pub torn: bool,
+    /// What the bytes after `valid_len` are.
+    pub tail: Tail,
     /// A version 4 segment: integer-derived literals are dictionary entries.
     pub integers_in_dictionary: bool,
+}
+
+/// What follows a segment's complete records.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Tail {
+    /// Nothing.
+    Clean,
+    /// A write that never landed whole: not acknowledged, or acknowledged under
+    /// [`SyncPolicy::OsBuffered`] only, which may lose the last commits. Truncated at the
+    /// end of the log.
+    Torn,
+    /// Damage to what may hold acknowledged commits, and why: recovery stops.
+    Corrupt(String),
+}
+
+/// The sync policy `segment` was written under, if its sidecar records one.
+fn segment_policy(segment: &Path) -> Option<SyncPolicy> {
+    sidecar::read(segment, "sync").and_then(|word| SyncPolicy::from_word(&word))
+}
+
+/// Removes a segment and its sidecar.
+pub(crate) fn remove_segment(path: &Path) -> EngineResult<()> {
+    fs::remove_file(path)?;
+    sidecar::remove(path);
+    Ok(())
 }
 
 pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
@@ -85,7 +117,10 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
             records: Vec::new(),
             ends: Vec::new(),
             valid_len: 0,
-            torn: !bytes.is_empty(),
+            tail: match bytes.is_empty() {
+                true => Tail::Clean,
+                false => Tail::Torn,
+            },
             integers_in_dictionary: false,
         });
     }
@@ -111,12 +146,17 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
                 ends.push(pos as u64);
             }
             Frame::End => break,
-            Frame::Invalid => {
+            frame @ (Frame::Short | Frame::Damaged(_)) => {
+                let damaged = match frame {
+                    Frame::Damaged(len) => Some(len),
+                    _ => None,
+                };
+                let timed = magic == SEGMENT_MAGIC;
                 return Ok(SegmentContents {
                     records,
                     ends,
                     valid_len: pos as u64,
-                    torn: true,
+                    tail: classify(&bytes[pos..], damaged, timed, segment_policy(path)),
                     integers_in_dictionary,
                 });
             }
@@ -126,9 +166,39 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
         records,
         ends,
         valid_len: pos as u64,
-        torn: false,
+        tail: Tail::Clean,
         integers_in_dictionary,
     })
+}
+
+/// What `rest`, a segment from its first frame that doesn't decode, is: `damaged` holds
+/// that frame's length if it is complete; `timed`, a version 6 segment; `policy`, the
+/// segment's sync policy if recorded. The rules are the [`super`] module docs'.
+fn classify(rest: &[u8], damaged: Option<usize>, timed: bool, policy: Option<SyncPolicy>) -> Tail {
+    if rest.iter().all(|&byte| byte == 0) {
+        return Tail::Torn;
+    }
+    if intact_len(rest, timed).is_some() {
+        return Tail::Corrupt("an intact record under a damaged length".into());
+    }
+    let Some(len) = damaged else {
+        return Tail::Torn;
+    };
+    let (frame, after) = rest.split_at(len);
+    if matches!(decode_frame(after), Frame::Record(..)) {
+        return Tail::Corrupt("a damaged record before an intact one".into());
+    }
+    if policy != Some(SyncPolicy::EveryCommit) {
+        return Tail::Torn;
+    }
+    if !after.iter().all(|&byte| byte == 0) {
+        return Tail::Corrupt("a damaged record with data after it".into());
+    }
+    match frame.ends_with(&[0; 8]) {
+        // Its end, the commit time, never reached the disk: the write was in flight.
+        true => Tail::Torn,
+        false => Tail::Corrupt("a damaged last record, synced and so acknowledged".into()),
+    }
 }
 
 /// Cuts a torn tail off a segment and syncs the result.
@@ -137,7 +207,7 @@ pub(crate) fn truncate_segment(path: &Path, valid_len: u64) -> EngineResult<()> 
     if valid_len < SEGMENT_MAGIC.len() as u64 {
         file.set_len(0)?;
         drop(file);
-        fs::remove_file(path)?;
+        remove_segment(path)?;
         return Ok(());
     }
     file.set_len(valid_len)?;
@@ -181,13 +251,15 @@ impl Wal {
         if let Some(archive) = &archive {
             fs::create_dir_all(archive)?;
         }
-        // The newest segment is appended to if it is of the format written now; otherwise
-        // (a store from before version 6) a new segment starts.
+        // The newest segment is appended to if it is of the format written now and was
+        // written under this sync policy; otherwise (a store from before version 6, another
+        // policy, or no policy recorded) a new segment starts.
         let newest = list_segments(dir)?.pop().filter(|(_, path)| {
             let mut head = [0u8; 8];
             File::open(path)
                 .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut head))
                 .is_ok_and(|()| &head == magic)
+                && segment_policy(path) == Some(sync)
         });
         let (first_revision, active, active_bytes) = match newest {
             Some((first_revision, path)) => {
@@ -196,7 +268,7 @@ impl Wal {
                 (first_revision, file, len)
             }
             None => {
-                let file = create_segment(dir, next_revision, magic)?;
+                let file = create_segment(dir, next_revision, magic, sync)?;
                 (next_revision, file, SEGMENT_MAGIC.len() as u64)
             }
         };
@@ -258,17 +330,39 @@ impl Wal {
         Ok(())
     }
 
-    /// Starts a new segment whose first record will be `next_revision`. No-op if the active
-    /// segment is still empty.
+    /// Starts a new segment whose first record will be `next_revision` or later. No-op if
+    /// the active segment is still empty. A failure poisons the log, as an append's does: the
+    /// active segment's sync failed (its earlier records can't be trusted to be on disk), or
+    /// the new segment is in an unknown state.
     pub(crate) fn rotate(&mut self, next_revision: u64) -> EngineResult<()> {
+        if self.poisoned {
+            return Err(EngineError::WalPoisoned);
+        }
         if self.active_bytes <= SEGMENT_MAGIC.len() as u64 {
             return Ok(());
         }
-        self.active.sync_all()?;
-        self.active = create_segment(&self.dir, next_revision, self.magic)?;
-        self.active_first_revision = next_revision;
-        self.active_bytes = SEGMENT_MAGIC.len() as u64;
-        Ok(())
+        let rotated = fault::check(Step::Rotate)
+            .and_then(|()| self.active.sync_all())
+            .map_err(EngineError::from)
+            .and_then(|()| create_segment(&self.dir, next_revision, self.magic, self.sync));
+        match rotated {
+            Ok(active) => {
+                self.active = active;
+                self.active_first_revision = next_revision;
+                self.active_bytes = SEGMENT_MAGIC.len() as u64;
+                Ok(())
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// Stops all writing until the engine is reopened: a bulk publication's outcome is
+    /// unknown until then ([`EngineError::CommitUnknown`]).
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     /// Called after a checkpoint at `revision`: restarts the byte counter and deletes (or
@@ -276,12 +370,13 @@ impl Wal {
     /// segment stays.
     pub(crate) fn release_through(&mut self, revision: u64) -> EngineResult<()> {
         self.bytes_since_checkpoint = 0;
+        fault::check(Step::Release)?;
         let segments = list_segments(&self.dir)?;
         for pair in segments.windows(2) {
             let ((_, path), (next_first, _)) = (&pair[0], &pair[1]);
             if *next_first <= revision + 1 && *next_first <= self.active_first_revision {
                 match &self.archive {
-                    None => fs::remove_file(path)?,
+                    None => remove_segment(path)?,
                     Some(archive) => archive_segment(path, archive)?,
                 }
             }
@@ -290,7 +385,8 @@ impl Wal {
     }
 }
 
-/// Moves a segment into `archive` (a copy where a rename can't cross file systems).
+/// Moves a segment into `archive` (a copy where a rename can't cross file systems), and
+/// its sidecar with it where it can.
 fn archive_segment(path: &Path, archive: &Path) -> EngineResult<()> {
     let target = archive.join(path.file_name().expect("segment file name"));
     if fs::rename(path, &target).is_err() {
@@ -298,14 +394,23 @@ fn archive_segment(path: &Path, archive: &Path) -> EngineResult<()> {
         File::open(&target)?.sync_all()?;
         fs::remove_file(path)?;
     }
+    if fs::rename(sidecar::path_of(path), sidecar::path_of(&target)).is_err() {
+        sidecar::remove(path);
+    }
     super::sync_dir(archive)?;
     Ok(())
 }
 
-impl Wal {}
-
-fn create_segment(dir: &Path, first_revision: u64, magic: &[u8; 8]) -> EngineResult<File> {
+/// A new segment, its sync policy recorded first: a segment that has frames always has it
+/// (older ones excepted).
+fn create_segment(
+    dir: &Path,
+    first_revision: u64,
+    magic: &[u8; 8],
+    sync: SyncPolicy,
+) -> EngineResult<File> {
     let path = segment_path(dir, first_revision);
+    sidecar::write(&path, &[("sync", sync.word())])?;
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
