@@ -156,6 +156,15 @@ its resolution floors and memory policy, and the measurements they rest on).
    the allocator moves them by up to 32 %, more is a measurement counting what is not the
    process's.
 
+### An A-B-B-A of two builds (a confirmation round)
+
+Every block times copies of the builds made for it ([PROTOCOL.md §5, "the unit"](../PROTOCOL.md#the-release-gate): a cached file's offset is shared by every block that times that file).
+
+- **Catalog cases, through the gate's steps:** `release-gate.sh build REV` for each side, then `prepare HARNESS` with `GATE_BASELINES=base GATE_CASES=...`. Then `block N HARNESS 1 - base=REV cand=REV` for N = 1..k (four reports a block), and `report HARNESS cand=REV base=REV`.
+- **Directly:** `fast.py block --block N --cases C --side base:BINDIR:REV --side cand:BINDIR:REV --seed S --fresh-copies DIR --out PASSES`. This needs the native runtime and prepared data, and a BINDIR laid out like a gate build (`release/examples/perf_lab`, REVISION, SHA256SUMS).
+- **A hand-rolled `perf_lab` loop (no catalog case):** at each block's start run `cp -a "$BIN" "$W/copy-$k-$side" && sync` for each side, time from the copy, and `rm -rf` it at the block's end. Never time one file in two blocks.
+- **The verdict:** `release_gate.py report` takes the host's A-A' floor from `noise-floor/HOST.toml` (`release_gate.py floor`), or says the host has none.
+
 ## What is kept
 
 A run writes two files:
