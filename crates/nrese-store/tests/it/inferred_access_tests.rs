@@ -111,19 +111,23 @@ fn readers_see_the_inferences_their_graphs_support() {
 
     // Explanations of statements the reader doesn't see are refused.
     let explain = |subject: &str, class: &str| {
-        store.explain_statement(
-            Ruleset::Owl2Rl,
-            &supported,
-            nrese_rdf::NamedNode::new_unchecked(format!("{EX}{subject}"))
+        store
+            .explain_statement(
+                Ruleset::Owl2Rl,
+                &supported,
+                nrese_rdf::NamedNode::new_unchecked(format!("{EX}{subject}"))
+                    .as_ref()
+                    .into(),
+                nrese_rdf::NamedNode::new_unchecked(
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                )
                 .as_ref()
                 .into(),
-            nrese_rdf::NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
-                .as_ref()
-                .into(),
-            nrese_rdf::NamedNode::new_unchecked(format!("{EX}{class}"))
-                .as_ref()
-                .into(),
-        )
+                nrese_rdf::NamedNode::new_unchecked(format!("{EX}{class}"))
+                    .as_ref()
+                    .into(),
+            )
+            .unwrap()
     };
     assert!(explain("a", "E").is_some());
     assert!(explain("a", "F").is_none());
@@ -147,6 +151,149 @@ fn support_follows_the_latest_revision() {
     assert_eq!(store.support_statistics().computed, 2);
 }
 
+/// The cap on support graph sets hides nothing: `w a C` in 17 graphs and `C subClassOf D`
+/// in the default graph give `w a D` 17 sets, one past the default cap of 16. Graphs sort
+/// by IRI, so the cap leaves g16's set out: a reader of g16 sees `w a D` all the same,
+/// decided by the closure of what it reads, as a reader of g03 is by a kept set; a reader
+/// of none of them doesn't.
+#[test]
+fn readers_past_the_cap_see_what_their_graphs_derive() {
+    let store = StoreService::new(in_memory_store_config()).unwrap();
+    let graphs: String = (0..17)
+        .map(|g| format!("GRAPH ex:g{g:02} {{ ex:w a ex:C }} "))
+        .collect();
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {{ ex:C rdfs:subClassOf ex:D . {graphs} }}"
+        )))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    let reading = |graph: &str| {
+        ReadScope::Graphs(Arc::new(GraphAccess {
+            graphs: vec![format!("{EX}{graph}")],
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: true,
+            ..GraphAccess::default()
+        }))
+    };
+    assert_eq!(classes(&store, &reading("g16"), "w"), ["<D>"]);
+    assert_eq!(classes(&store, &reading("g03"), "w"), ["<D>"]);
+    assert!(classes(&store, &reading("other"), "w").is_empty());
+    // The readers of g16 and of neither asked their closures; g03's kept set decided.
+    assert_eq!(store.support_statistics().closures, 2);
+}
+
+/// What a reader derives from its own graph doesn't depend on whether a graph it can't read
+/// also asserts it (review r1 of N12, P0-1): the stack keeps no inferred copy of a statement
+/// asserted anywhere, so a view that only filters the stack lost it exactly when a hidden
+/// graph asserted it, an exact membership test for any statement the reader can make
+/// derivable. Each row: the reader's graph `open` derives the statement, `secret` asserts it
+/// or not; ASK and COUNT answer alike either way, by support and seeing every inference.
+#[test]
+fn a_hidden_assertion_does_not_change_what_a_reader_derives() {
+    const OWL: &str = "PREFIX owl: <http://www.w3.org/2002/07/owl#>";
+    // (what `open` holds, what `secret` may assert, the ASK, the COUNT)
+    let rows = [
+        (
+            "ex:alice a ex:Human . ex:Human rdfs:subClassOf ex:Patient",
+            "ex:alice a ex:Patient",
+            "ASK { ex:alice a ex:Patient }",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s a ex:Patient }",
+        ),
+        (
+            "ex:alice ex:noted ex:v . ex:noted rdfs:subPropertyOf ex:diagnosis",
+            "ex:alice ex:diagnosis ex:v",
+            "ASK { ex:alice ex:diagnosis ex:v }",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s ex:diagnosis ?o }",
+        ),
+        (
+            "ex:key a owl:InverseFunctionalProperty . ex:alice ex:key 7 . ex:bob ex:key 7",
+            "ex:alice owl:sameAs ex:bob",
+            "ASK { ex:alice owl:sameAs ex:bob }",
+            "SELECT (COUNT(*) AS ?n) WHERE { ex:alice owl:sameAs ?o }",
+        ),
+    ];
+    let answers = |open: &str, secret: Option<&str>, ask: &str, count: &str, scope: &ReadScope| {
+        let store = StoreService::new(in_memory_store_config()).unwrap();
+        let hidden = secret.map_or(String::new(), |s| format!("GRAPH ex:secret {{ {s} }}"));
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {OWL}
+                 INSERT DATA {{ GRAPH ex:open {{ {open} }} {hidden} }}"
+            )))
+            .unwrap();
+        store.rematerialise(Ruleset::Owl2Rl).unwrap();
+        store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+        let query = |q: &str| select(&store, scope, &format!("{OWL} {q}"));
+        (query(ask), query(count))
+    };
+    for (by_support, mode) in [(true, "supported"), (false, "visible")] {
+        let scope = reader(by_support);
+        for (open, secret, ask, count) in rows {
+            let public = answers(open, None, ask, count, &scope);
+            assert!(
+                public.0.contains("true"),
+                "{mode}: {ask} derivable from open: {public:?}"
+            );
+            let hidden = answers(open, Some(secret), ask, count, &scope);
+            assert_eq!(hidden, public, "{mode}: {secret} asserted in secret");
+        }
+    }
+}
+
+/// The same across commits, live: an unrestricted writer asserts the statement in `secret`
+/// and later retracts it; after each commit a reader's answers are what they were. The sets
+/// and the re-derived facts are updated for the commits, the views made afresh.
+#[test]
+fn a_hidden_assertion_committed_later_does_not_change_what_a_reader_derives() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_store::{MutationCommand, MutationPipeline, MutationTicket, Requester};
+    let pipeline = MutationPipeline::new(
+        Arc::new(StoreService::new(in_memory_store_config()).unwrap()),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    let apply = |update: &str| {
+        pipeline
+            .apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                    "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {update}"
+                ))),
+                &Requester::all(),
+                &MutationTicket::new(),
+            )
+            .unwrap();
+    };
+    apply(
+        "INSERT DATA { GRAPH ex:open { ex:alice a ex:Human . ex:Human rdfs:subClassOf ex:Patient } }",
+    );
+    let seen = || -> Vec<String> {
+        [reader(true), reader(false)]
+            .iter()
+            .flat_map(|scope| {
+                [
+                    "ASK { ex:alice a ex:Patient }",
+                    "SELECT (COUNT(*) AS ?n) WHERE { ?s a ex:Patient }",
+                ]
+                .map(|query| select(pipeline.store(), scope, query))
+            })
+            .collect()
+    };
+    let before = seen();
+    assert!(
+        before[0].contains("true") && before[2].contains("true"),
+        "{before:?}"
+    );
+    apply("INSERT DATA { GRAPH ex:secret { ex:alice a ex:Patient } }");
+    assert_eq!(seen(), before, "asserted in secret");
+    apply("DELETE DATA { GRAPH ex:secret { ex:alice a ex:Patient } }");
+    assert_eq!(seen(), before, "retracted from secret");
+}
+
 /// Without rules registered the sets can't be computed: no inferred statement is shown.
 #[test]
 fn without_rules_nothing_inferred_is_shown() {
@@ -157,20 +304,30 @@ fn without_rules_nothing_inferred_is_shown() {
 }
 
 /// Commits through the mutation pipeline update the sets instead of computing them
-/// afresh: after every commit, a reader sees what a store forced to compute them sees.
+/// afresh: after every commit, a reader sees what a store forced to compute them sees,
+/// and so does a reader of a store that keeps one set per statement (the cap's marks
+/// updated with the sets, the views patched or, where a mark leaves a statement open,
+/// made afresh).
 #[test]
 fn updated_sets_equal_fresh_ones_across_commits() {
     use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
     use nrese_store::{MutationCommand, MutationPipeline, MutationTicket, Requester};
-    let pipeline = || {
+    let pipeline = |support_sets: usize| {
         MutationPipeline::new(
-            Arc::new(StoreService::new(in_memory_store_config()).unwrap()),
+            Arc::new(
+                StoreService::new(nrese_store::StoreConfig {
+                    support_sets,
+                    ..in_memory_store_config()
+                })
+                .unwrap(),
+            ),
             Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
                 ReasoningMode::Owl2Rl,
             ))),
         )
     };
-    let (updating, fresh) = (pipeline(), pipeline());
+    let default = in_memory_store_config().support_sets;
+    let (updating, fresh, capped) = (pipeline(default), pipeline(default), pipeline(1));
     let apply = |pipeline: &MutationPipeline, update: &str| {
         pipeline
             .apply(
@@ -199,19 +356,25 @@ fn updated_sets_equal_fresh_ones_across_commits() {
         "INSERT DATA { GRAPH ex:open { ex:D rdfs:subClassOf ex:F } }",
         "DELETE DATA { GRAPH ex:secret { ex:c a ex:C } }",
     ];
-    // A reader of one graph (it misses most: a list of what it sees) and one of two (it
-    // sees most: a mask of what it misses).
+    // A reader of one graph (it misses most: a list of what it sees), one of two (it sees
+    // most: a mask of what it misses), and one of the other graph alone: where `open` and
+    // `secret` both assert a statement (`c a C`, `y anc z`), the cap of one keeps the set
+    // of `open`, the lower graph, and that reader's closure decides what follows.
     let narrow = reader(true);
-    let broad = ReadScope::Graphs(Arc::new(GraphAccess {
-        graphs: vec![format!("{EX}open"), format!("{EX}secret")],
-        default_graph: true,
-        inferred: true,
-        inferred_by_support: true,
-        ..GraphAccess::default()
-    }));
+    let reading = |graphs: &[&str]| {
+        ReadScope::Graphs(Arc::new(GraphAccess {
+            graphs: graphs.iter().map(|graph| format!("{EX}{graph}")).collect(),
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: true,
+            ..GraphAccess::default()
+        }))
+    };
+    let broad = reading(&["open", "secret"]);
+    let other = reading(&["secret"]);
     let seen = |pipeline: &MutationPipeline| -> Vec<String> {
         let mut seen = Vec::new();
-        for (name, reader) in [("narrow", &narrow), ("broad", &broad)] {
+        for (name, reader) in [("narrow", &narrow), ("broad", &broad), ("other", &other)] {
             for s in ["a", "b", "c", "d", "x", "y", "z"] {
                 for c in classes(pipeline.store(), reader, s) {
                     seen.push(format!("{name}: {s} a {c}"));
@@ -234,16 +397,20 @@ fn updated_sets_equal_fresh_ones_across_commits() {
     for (step, commit) in commits.iter().enumerate() {
         apply(&updating, commit);
         apply(&fresh, commit);
+        apply(&capped, commit);
         // Forget the fresh store's sets: they are computed again.
         fresh
             .store()
             .use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+        let expected = seen(&fresh);
+        assert_eq!(seen(&updating), expected, "after commit {step}: {commit}");
         assert_eq!(
-            seen(&updating),
-            seen(&fresh),
-            "after commit {step}: {commit}"
+            seen(&capped),
+            expected,
+            "cap 1, after commit {step}: {commit}"
         );
     }
+    assert!(capped.store().support_statistics().closures > 0);
     let statistics = updating.store().support_statistics();
     assert!(statistics.updated >= 6, "{statistics:?}");
     assert!(statistics.patched >= 10, "{statistics:?}");

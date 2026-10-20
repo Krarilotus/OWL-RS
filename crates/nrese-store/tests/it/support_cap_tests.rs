@@ -7,7 +7,9 @@
 //! an inferred statement when one of its derivations uses graphs it may read alone, that is,
 //! exactly what the closure of the statements it may read holds. Exact here means a cap past
 //! every statement's sets (`usize::MAX`); the cap's own contract (config.rs,
-//! `StoreConfig::support_sets`) is that it keeps that many sets per statement.
+//! `StoreConfig::support_sets`) is that it bounds memory and work, not what readers see: a
+//! reader none of a statement's kept sets fits, where the cap left some out, is decided by the
+//! closure of its graphs.
 //!
 //! The two tests of the default configuration are red while its cap is 16: they are the
 //! specification an exact default must meet, run with `--ignored`.
@@ -183,11 +185,13 @@ fn default_reads_equal_the_oracle() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Spec: config.rs (`StoreConfig::support_sets`): the cap keeps that many sets per statement,
-/// at least 1. A target derivable from each of k graphs alone has k sets: of the k readers of
-/// one graph each, k - cap are denied it, none when nothing is capped.
+/// Spec: config.rs (`StoreConfig::support_sets`): the cap bounds memory and work, not what
+/// readers see; a reader none of a statement's kept sets fits, where the cap left some out,
+/// is decided by the closure of its graphs. A target derivable from each of k graphs alone
+/// has k sets: at caps 1, 4, 16 and off (every set kept), with k at the cap and one past it,
+/// every reader answers as the oracle, the k readers of one graph each among them.
 #[test]
-fn the_cap_keeps_as_many_sets_as_it_is_set_to() {
+fn readers_equal_the_oracle_at_every_cap() {
     for (cap, k) in [
         (1, 1),
         (1, 2),
@@ -197,17 +201,8 @@ fn the_cap_keeps_as_many_sets_as_it_is_set_to() {
         (16, 17),
         (EXACT, 17),
     ] {
-        let family = Family::new(Shape::Copies(k), 1, 7);
-        let store = store(&family.quads(), capped(cap));
-        let probe = format!("{EX}x0");
-        let denied = (0..u64::from(k))
-            .filter(|&i| !answers(&store, &reader(&family.support(i)), &probe).0)
-            .count();
-        assert_eq!(
-            denied,
-            (k as usize).saturating_sub(cap),
-            "cap {cap}, {k} sets"
-        );
+        let wrong = mismatches(&Family::new(Shape::Copies(k), 1, 7), capped(cap));
+        assert!(wrong.is_empty(), "cap {cap}, {k} sets: {wrong:#?}");
     }
 }
 

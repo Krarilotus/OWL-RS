@@ -279,7 +279,8 @@ pub const SETTINGS: &[Setting] = &[
         names::REASONING_SUPPORT_SETS,
         Integer,
         "Support graph sets kept per inferred statement for inferred = \"supported\" in the \
-         access policy (default 16, at least 1); fewer can only hide statements.",
+         access policy (default 16, at least 1): a bound on memory and work; a reader past \
+         it is decided by the closure of its graphs, with the same answers.",
     ),
     // [dl]
     setting(

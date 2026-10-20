@@ -593,7 +593,13 @@ impl IndexVersion {
 
     /// The bytes [`Self::with_run`] allocates for the list of runs, at most at once.
     pub(crate) fn run_list_bytes(&self) -> usize {
-        2 * (self.runs.len() + 1) * std::mem::size_of::<Arc<Run>>() + 16
+        self.runs_bytes(1)
+    }
+
+    /// The bytes a version with `extra` more runs allocates for its list of runs, at most at
+    /// once ([`Self::with_run`], [`Self::with_runs`]).
+    pub(crate) fn runs_bytes(&self, extra: usize) -> usize {
+        2 * (self.runs.len() + extra) * std::mem::size_of::<Arc<Run>>() + 16
     }
 }
 

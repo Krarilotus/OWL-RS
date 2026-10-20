@@ -1429,7 +1429,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     if let Some((dimension, metric)) = args.prepare_vector_graph {
         let phase = Phase::start();
         let started = Instant::now();
-        let snapshot = store.read_snapshot(None);
+        let snapshot = store.read_snapshot(None)?;
         let mut query = nrese_engine::VectorQuery::new(vec![0.0; dimension], 1);
         query.vector[0] = 1.0;
         query.metric = metric;
