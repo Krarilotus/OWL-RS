@@ -365,10 +365,16 @@ block)
   cases=$(planned "$plan") && [ -n "$cases" ] || { log "block $n: the plan $plan can't be read"; exit 2; }
   log "block $n: ${names[*]}, layout $layout, on the cases of $harness, plan $(basename "$plan")"
   # The host kept quiet while the block runs (scripts/lib/quiet-watch.py, as the measurement
-  # queue's timed chunks: this user's other busy processes stopped, other containers paused,
-  # other users' work recorded); its verdict kept with the block. GATE_QUIET=0: unwatched.
+  # queue's timed chunks: the job's own other busy work suspended, anything else recorded as
+  # disturbing it); its verdict kept with the block. GATE_QUIET=0: unwatched.
   watcher=""
   if [ "${GATE_QUIET:-1}" != 0 ] && [ -d /proc ]; then
+    # What an earlier block's watcher left suspended (it died) is resumed before this block's
+    # state replaces its record; what can't be settled stops the block, never erased.
+    if [ -f "$GATE/quiet/frozen" ]; then
+      python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" --resume \
+        || { log "block $n: an earlier watcher's suspensions couldn't be resumed ($GATE/quiet/frozen)"; exit 2; }
+    fi
     rm -rf "$GATE/quiet" && mkdir -p "$GATE/quiet"
     export NRESE_QUIET_TOKEN="gate-$n-$$"
     python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" $$ "$NRESE_QUIET_TOKEN" &
@@ -380,6 +386,7 @@ block)
   if [ -n "$watcher" ]; then
     kill -TERM "$watcher" 2>/dev/null && wait "$watcher"
     cp "$GATE/quiet/watch.log" "$OUT/passes/quiet-block-$n.log" 2>/dev/null
+    cp "$GATE/quiet/verdict.json" "$OUT/passes/quiet-block-$n.json" 2>/dev/null
     log "block $n: $(tail -1 "$GATE/quiet/watch.log" 2>/dev/null)"
   fi
   tail -1 "$OUT/passes/block-$n.log"
