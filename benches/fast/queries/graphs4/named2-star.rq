@@ -1,0 +1,2 @@
+PREFIX e: <http://example.org/fast/>
+SELECT ?g ?u ?n FROM NAMED e:graph0 FROM NAMED e:graph1 WHERE { GRAPH ?g { ?u e:city e:c7 . ?u e:name ?n } }

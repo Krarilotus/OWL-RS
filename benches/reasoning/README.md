@@ -46,12 +46,14 @@ Everything runs in Docker on the same host. The data lives in the volume `nrese-
 
 ## Cleaning up after a run
 
-A run leaves nothing behind but its results. The scorecard scripts call `scripts/bench-cleanup.sh` when they exit, also when they fail or are interrupted. It removes:
-- the run's containers and store volumes;
-- the dataset volume `nrese-bench-data` and local datasets under `~/nrese-bench`;
-- the images built here (`nrese-bench/*`) and the images the run pulled itself (an image that was already on the machine stays);
+A run leaves nothing behind but its results and the shared datasets. The scorecard scripts call `scripts/bench-cleanup.sh --owner reasoning` when they exit, also when they fail or are interrupted. It removes by label only (every container and volume carries its job's namespace, checkout and tool: `scripts/lib/ns.sh`):
+- the run's own containers and store volumes, never another job's on the host;
+- the images the run pulled itself (an image that was already on the machine stays);
 - inferred-set dumps (`*.inferred.nt`); the scorecard keeps their counts and comparisons.
+
+The datasets (the volume `nrese-bench-data`, local datasets under `~/nrese-bench`) are every job's
+and go only by hand (`--datasets`), as do the images built here (`--images`).
 
 Scorecards (CSV), logs and reports stay.
 
-For several runs in a row, set `NRESE_BENCH_KEEP=1` so datasets and images survive between them, and run `scripts/bench-cleanup.sh` once at the end. `--dry-run` shows what it would remove. It only removes things by the names these scripts use, never "everything unused", so other projects' containers, volumes and images are safe.
+For several runs in a row, set `NRESE_BENCH_KEEP=1` so datasets and images survive between them, and run `scripts/bench-cleanup.sh` once at the end. `--dry-run` shows what it would remove. It only removes what carries this job's labels (and, sweeping the host, what carries the labels of a job whose checkout is gone), never "everything unused", so other jobs' and projects' containers, volumes and images are safe.

@@ -14,13 +14,13 @@
 //! policy (L3 `nrese-store`), transport (L4). Fix storage-layout, visibility and durability
 //! bugs here and nowhere else.
 
-/// The unit tests' allocator: the system's, counting what a measured operation holds live
-/// ([`nrese_exec::measure`]), so that an allocation not charged to its budget fails a test.
+/// The unit tests' allocator: the system's, counting what measured operations hold
+/// against their budgets ([`nrese_exec::measure`]), so that an allocation not charged to its
+/// budget fails a test.
 #[cfg(test)]
 #[global_allocator]
 static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
     nrese_exec::measure::Measured(std::alloc::System);
-
 pub mod cpu;
 mod durability;
 pub mod engine;

@@ -110,21 +110,29 @@ def docker_memory_bytes() -> int | None:
     return int(out) if out and out.isdigit() else None
 
 
-def container_start_ms() -> float | None:
+# The calibration container's image: timed like any measured container, so pinned like one.
+CALIBRATION_IMAGE = "alpine:latest"
+
+
+def container_start_ms(root: Path) -> float | None:
     """The median wall time of three no-op containers: what every load and kit step timed
-    around `docker run` carries on top of the system's own work."""
+    around `docker run` carries on top of the system's own work. Their image is pinned at the
+    job's start and run by its ID (ns.pin_images); one that can't be resolved stops the job."""
     import statistics
     import time
+    from . import ns
+    ns.pin_images([CALIBRATION_IMAGE], root)
+    image = ns.image_id(CALIBRATION_IMAGE, root)
     times = []
     for _ in range(3):
         started = time.monotonic()
-        if _out(["docker", "run", "--rm", "alpine:latest", "true"], timeout=60) is None:
+        if ns.docker(["run", "--rm", image, "true"], timeout=60).returncode != 0:
             return None
         times.append((time.monotonic() - started) * 1000)
     return round(statistics.median(times), 1)
 
 
-def machine(runtime: str) -> dict:
+def machine(runtime: str, root: Path | None = None) -> dict:
     out = {
         "host": platform.node(),
         "os": platform.platform(),
@@ -141,8 +149,8 @@ def machine(runtime: str) -> dict:
             out[key] = Path(path).read_text(encoding="utf-8").strip()
         except OSError:
             pass
-    if runtime == "docker":
-        out["container_start_ms"] = container_start_ms()
+    if runtime == "docker" and root is not None:
+        out["container_start_ms"] = container_start_ms(root)
         info = _out(["docker", "info", "--format", "{{.ServerVersion}}|{{.NCPU}}|{{.MemTotal}}|{{.OperatingSystem}}"])
         if info:
             version, cpus, memory, system = (info.split("|") + ["", "", "", ""])[:4]
@@ -171,6 +179,8 @@ def binaries(target: Path, revision: str = "") -> dict:
     try:
         if (target / "REVISION").is_file():
             out["revision"] = (target / "REVISION").read_text().strip()
+        # The build's layout (release-gate.sh GATE_LAYOUTS): 1 the plain link, else its seed.
+        out["layout"] = int((target / "LAYOUT").read_text().strip()) if (target / "LAYOUT").is_file() else 1
         sums = target / "SHA256SUMS"
         expected = dict((line.split(maxsplit=1)[1].lstrip(" *"), line.split(maxsplit=1)[0])
                         for line in sums.read_text().splitlines()) if sums.is_file() else {}
@@ -216,7 +226,7 @@ class Manifest:
                 "query_timeout_s": args.query_timeout_s, "runtime": runtime,
             },
             "git": git(root),
-            "machine": machine(runtime),
+            "machine": machine(runtime, root),
             "settings": {k: settings[k] for k in SETTINGS if settings.get(k)}
                         | {k: "set" for k in SECRET_SETTINGS if settings.get(k)},
             "images": {},

@@ -278,6 +278,7 @@ impl<'e> BulkLoad<'e> {
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
                     equality: Default::default(),
+                    canonical: Default::default(),
                 };
                 (Next::Built(next), summary)
             }
@@ -315,6 +316,7 @@ impl<'e> BulkLoad<'e> {
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
                     equality: Default::default(),
+                    canonical: Default::default(),
                 };
                 (Next::Built(next), summary)
             }
@@ -451,8 +453,9 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                 Arc::clone(&shared.dictionary),
                 Arc::clone(&shared.statistics),
                 None,
+                Arc::clone(&shared.views.read()),
             );
-            let path = checkpoint::write(durable.root(), &image)?;
+            let path = checkpoint::write(durable.root(), &image, shared.admission.as_ref())?;
             shared
                 .checkpoints
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -473,6 +476,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                         equality: Arc::clone(&next.equality),
                         revision,
                         dictionary_len: next.dictionary_len,
+                        canonical: Default::default(),
                     })
                 }
                 Some(Err(error)) => {
@@ -526,6 +530,7 @@ fn publish_streamed(
             revision,
             dictionary_len,
             equality: Default::default(),
+            canonical: Default::default(),
         };
         let len = next.asserted.len();
         publish(engine, Next::Built(next))?;
@@ -537,6 +542,7 @@ fn publish_streamed(
     let mut len = 0;
     let path = checkpoint::write_parts(
         durable.root(),
+        shared.admission.as_ref(),
         revision,
         &shared.dictionary,
         dictionary_len,
@@ -575,6 +581,7 @@ fn publish_streamed(
         revision,
         dictionary_len,
         equality: Default::default(),
+        canonical: Default::default(),
     });
     let mut wal = durable.wal.lock();
     wal.rotate(revision + 1)?;
@@ -676,6 +683,7 @@ impl<'e> Rematerialisation<'e> {
             revision: summary.revision,
             dictionary_len: shared.dictionary.len(),
             equality: Default::default(),
+            canonical: Default::default(),
         };
         publish(engine, Next::Built(next))?;
         drop(_compaction);
