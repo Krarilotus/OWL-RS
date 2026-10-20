@@ -98,13 +98,15 @@ const LATER: &[Statement] = &[
     ("sec3", "asWKT", "POINT(6 5)", Some("secret")),
 ];
 
-/// One query per path: a constant side, both sides free, a stated relation, a feature's
-/// default geometry, a count, disjointness (every object), an index-seeded filter, and
-/// relations under `GRAPH ?g` and `GRAPH <g>`.
+/// One query per path: a constant side, both sides free, a stated relation (a constant
+/// side, and both free: the audit's SPR-01), a feature's default geometry, a count,
+/// disjointness (every object), an index-seeded filter, and relations under `GRAPH ?g` and
+/// `GRAPH <g>`.
 const QUERIES: &[&str] = &[
     "SELECT ?x WHERE { ex:pubA geo:sfContains ?x }",
     "SELECT ?a ?b WHERE { ?a geo:sfIntersects ?b }",
     "SELECT ?b WHERE { ex:secret geo:sfContains ?b }",
+    "SELECT ?a ?b WHERE { ?a geo:sfContains ?b }",
     "SELECT ?x WHERE { ex:fPub2 geo:sfWithin ?x }",
     "SELECT (COUNT(*) AS ?n) WHERE { ?a geo:sfWithin ?b }",
     "SELECT ?x WHERE { ?x geo:sfDisjoint ex:pubPt }",
@@ -122,10 +124,19 @@ enum Oracle {
     Dataset(&'static [Option<&'static str>], &'static [&'static str]),
 }
 
+/// The graphs a case's reader may read.
+#[derive(Clone, Copy, PartialEq)]
+enum Access {
+    All,
+    /// The public graphs and the default graph ([`public`]).
+    Public,
+    /// None: an empty readable dataset.
+    Nothing,
+}
+
 struct Case {
     name: &'static str,
-    /// Only the public graphs and the default graph readable.
-    restricted: bool,
+    access: Access,
     union_default_graph: bool,
     /// `FROM` and `FROM NAMED` clauses.
     dataset: &'static str,
@@ -136,7 +147,7 @@ struct Case {
 const CASES: &[Case] = &[
     Case {
         name: "unreadable graph, default graph",
-        restricted: true,
+        access: Access::Public,
         union_default_graph: false,
         dataset: "",
         oracle: Oracle::Readable,
@@ -144,7 +155,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "unreadable graph, merged default graph",
-        restricted: true,
+        access: Access::Public,
         union_default_graph: true,
         dataset: "",
         oracle: Oracle::Readable,
@@ -152,7 +163,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "unreadable graph, FROM",
-        restricted: true,
+        access: Access::Public,
         union_default_graph: false,
         dataset: " FROM <http://example.com/g/pub/2> FROM <http://example.com/g/secret>",
         oracle: Oracle::Readable,
@@ -160,7 +171,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "unreadable graph, FROM NAMED",
-        restricted: true,
+        access: Access::Public,
         union_default_graph: false,
         dataset: " FROM NAMED <http://example.com/g/pub/2> FROM NAMED <http://example.com/g/secret>",
         oracle: Oracle::Readable,
@@ -168,7 +179,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "dataset, FROM",
-        restricted: false,
+        access: Access::All,
         union_default_graph: false,
         dataset: " FROM <http://example.com/g/pub/1> FROM <http://example.com/g/pub/2>",
         oracle: Oracle::Dataset(&[Some("pub/1"), Some("pub/2")], &[]),
@@ -176,7 +187,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "dataset, FROM NAMED",
-        restricted: false,
+        access: Access::All,
         union_default_graph: false,
         dataset: " FROM <http://example.com/g/pub/1> FROM NAMED <http://example.com/g/pub/2>",
         oracle: Oracle::Dataset(&[Some("pub/1")], &["pub/2"]),
@@ -186,7 +197,7 @@ const CASES: &[Case] = &[
     // shows both, also where the scope shows every graph the store holds.
     Case {
         name: "every graph selected: a default geometry in another graph hides",
-        restricted: false,
+        access: Access::All,
         union_default_graph: true,
         dataset: "",
         oracle: Oracle::Dataset(
@@ -197,11 +208,21 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "replica, unreadable graph",
-        restricted: true,
+        access: Access::Public,
         union_default_graph: false,
         dataset: "",
         oracle: Oracle::Readable,
         on_replica: true,
+    },
+    // The audit's empty readable dataset (SPR-01): no graph readable, the default graph a
+    // merge of none.
+    Case {
+        name: "no readable graph, merged default graph",
+        access: Access::Nothing,
+        union_default_graph: true,
+        dataset: "",
+        oracle: Oracle::Dataset(&[], &[]),
+        on_replica: false,
     },
 ];
 
@@ -329,7 +350,7 @@ fn oracle(case: &Case, canonical: bool) -> (Snapshot, TermId) {
 /// Whether canonical answers apply to `case` on both sides: its default graph is the
 /// store's or the merge of every graph (no `FROM`, no restricted merge), as the oracle's is.
 fn canonical_applies(case: &Case) -> bool {
-    !case.dataset.contains(" FROM <") && !(case.union_default_graph && case.restricted)
+    !case.dataset.contains(" FROM <") && !(case.union_default_graph && case.access != Access::All)
 }
 
 /// The answer as sorted lines, and the most rows any step read (a seeded filter's
@@ -405,7 +426,11 @@ fn spatial_answers_stay_in_the_readers_scope() {
                 ..options
             };
             let options = modes(QueryOptions {
-                access: case.restricted.then(|| Arc::new(public())),
+                access: match case.access {
+                    Access::All => None,
+                    Access::Public => Some(Arc::new(public())),
+                    Access::Nothing => Some(Arc::new(GraphAccess::default())),
+                },
                 union_default_graph: case.union_default_graph,
                 ..QueryOptions::default()
             });

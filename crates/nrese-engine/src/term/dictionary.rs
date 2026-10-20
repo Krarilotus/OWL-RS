@@ -1325,6 +1325,16 @@ impl Dictionary {
         Ok(Some(decode_key(&inner.key(id.payload()))))
     }
 
+    /// [`Self::decode_charged`]'s bound for the dictionary term `id`, as the dictionary
+    /// stores it now; `None` for inline ids, triple terms and unknown ids.
+    pub fn decode_bound(&self, id: TermId) -> Option<usize> {
+        if !id.kind().is_dictionary() || id.kind() == TermKind::Triple {
+            return None;
+        }
+        let inner = self.inner.read_recursive();
+        (id.payload() < inner.len()).then(|| inner.decode_bound(id.payload()))
+    }
+
     /// Calls `f` with a borrowed view of the dictionary term `id`, without allocating: the
     /// view points into the arena under the read lock, so `f` must be short. `None` for
     /// inline ids (which carry their value, see [`TermId`]) and unknown ids.

@@ -1366,6 +1366,17 @@ impl Snapshot {
         self.dictionary.decode_charged(id, charge)
     }
 
+    /// An upper bound of the bytes [`Self::decode`] allocates for `id`, for the dictionary
+    /// as stored now: a checkpoint may store the term compressed after, so a charge for a
+    /// decode goes through [`Self::decode_charged`]. `None` for inline ids, triple terms and
+    /// ids this snapshot doesn't know.
+    pub fn decode_bound(&self, id: TermId) -> Option<usize> {
+        if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
+            return None;
+        }
+        self.dictionary.decode_bound(id)
+    }
+
     /// Calls `f` with a borrowed view of the dictionary term `id` (see
     /// [`Dictionary::with_view`](crate::Dictionary::with_view)); `None` for inline ids and
     /// ids this snapshot doesn't know.
