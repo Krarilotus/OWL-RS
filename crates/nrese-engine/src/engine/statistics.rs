@@ -25,8 +25,9 @@
 //! The sets kept are charged to the budget the engine's owner gives it
 //! ([`Statistics::set_budget`]; none: unlimited), for as long as they are kept: built into
 //! charged vectors ([`Gathered::kept`]), so that the charge is what they hold. A rebuild
-//! builds and charges the new sets while the old are still kept, then replaces them: the
-//! budget must hold two copies while a rebuild ends. Where it can't take the new ones, the
+//! builds and charges the new sets while the old are still kept, then replaces them: while
+//! a rebuild ends the budget must hold the old sets, the new ones and the build's charged
+//! scratch (its sort keys), not only two copies. Where it can't take the new ones, the
 //! old stay, and the next drift tries again; a refusal never leaves fewer sets than before.
 //!
 //! A scan stops once the slices have found more than
