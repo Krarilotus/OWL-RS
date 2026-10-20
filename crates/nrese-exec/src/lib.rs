@@ -13,6 +13,8 @@
 //! - [`classes`]: equivalence classes by union (`owl:sameAs` classes)
 //! - [`budget`]: memory accounting: the server's budget, each request's envelope, its parts,
 //!   reservations and vectors charged before they grow
+//! - [`cell`]: a value built once per key while those who need it wait (helping with its
+//!   slices), never a Rayon worker waiting on parallel work it may hold
 //! - `measure` (tests, and the `measure` feature): holds what an operation allocates
 //!   against what it reserved
 //! - [`memory`]: the process's memory, and a watch for limits on long operations
@@ -31,6 +33,7 @@
 //! have no stored id.
 
 pub mod budget;
+pub mod cell;
 pub mod classes;
 pub mod graph;
 pub mod group;
