@@ -399,7 +399,7 @@ fn spatial_answers_stay_in_the_readers_scope() {
         ..EngineConfig::default()
     };
     let (primary_dir, replica_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let primary = Engine::open(primary_dir.path(), durable).unwrap();
+    let primary = Engine::open(primary_dir.path(), durable.clone()).unwrap();
     graph_representatives(&primary);
     commit(&primary, DATA.iter().map(|st| (st, graph_name(st.3))));
     let same_as = classes(&primary);

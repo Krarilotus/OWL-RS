@@ -129,7 +129,7 @@ fn checkpoint_plus_wal_recovers_and_releases_covered_segments() {
         ..config()
     };
     let states = {
-        let engine = Engine::open(dir.path(), small_segments).unwrap();
+        let engine = Engine::open(dir.path(), small_segments.clone()).unwrap();
         let mut states = commit_all(&engine, &batches(0..30));
         assert!(segments(dir.path()).len() > 3, "small segments rotate");
         assert_eq!(engine.checkpoint().unwrap(), 30);
@@ -193,7 +193,7 @@ fn corruption_before_the_tail_is_an_error_not_data_loss() {
         ..config()
     };
     {
-        let engine = Engine::open(dir.path(), small_segments).unwrap();
+        let engine = Engine::open(dir.path(), small_segments.clone()).unwrap();
         commit_all(&engine, &batches(0..30));
     }
     let first = &segments(dir.path())[0];
@@ -353,7 +353,7 @@ fn background_checkpoints_bound_the_wal() {
         ..EngineConfig::default()
     };
     let states = {
-        let engine = Engine::open(dir.path(), config).unwrap();
+        let engine = Engine::open(dir.path(), config.clone()).unwrap();
         commit_all(&engine, &batches(0..200))
     };
     let checkpoints = fs::read_dir(dir.path())
@@ -400,7 +400,7 @@ fn checkpoint_of_many_runs_with_tombstones_recovers() {
         },
         ..config()
     };
-    let engine = Engine::open(dir.path(), config).unwrap();
+    let engine = Engine::open(dir.path(), config.clone()).unwrap();
     let mut batches = batches(0..400);
     // Delete quads inserted by earlier commits: tombstones in later runs.
     for (i, (_, deletes)) in batches.iter_mut().enumerate().skip(1) {
@@ -671,7 +671,7 @@ fn bulk_loads_are_served_from_their_checkpoint() {
             },
             ..config()
         };
-        let engine = Engine::open(dir.path(), config).unwrap();
+        let engine = Engine::open(dir.path(), config.clone()).unwrap();
         let data: Vec<Quad> = (0..500).flat_map(|n| [quad(n), label(n)]).collect();
         let load = engine.bulk_load(BulkMode::Append);
         load.add(&data);
@@ -704,7 +704,7 @@ fn bulk_loads_past_their_budget_spill_and_merge() {
         },
         ..config()
     };
-    let engine = Engine::open(dir.path(), config).unwrap();
+    let engine = Engine::open(dir.path(), config.clone()).unwrap();
     commit_all(&engine, &batches(0..5));
     let data: Vec<Quad> = (0..900).flat_map(|n| [quad(n), label(n)]).collect();
     let load = engine.bulk_load(BulkMode::Replace);
