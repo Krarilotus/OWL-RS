@@ -38,6 +38,11 @@ def parse_path(path: str) -> list[str | int | None]:
     return steps
 
 
+def selects(path: str) -> bool:
+    """Whether a path has [*]: its value is the list of what it selects, maybe empty."""
+    return None in parse_path(path)
+
+
 def json_path(document, path: str):
     """The value at `path`. With [*] it is the list of the values found under each element
     (elements without the rest of the path left out); without, a missing key is a PathError."""

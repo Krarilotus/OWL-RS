@@ -1,12 +1,23 @@
-"""One HTTP exchange of a step, and its evidence: the request and the response as sent and
-received (headers in order, every value), each body's SHA-256 and length over all of it with its
-first bytes in a file of their own, and the times to connect, to the response's headers and to its
-last byte. Times are recorded, never judged: /verify proves behaviour, not speed."""
+"""One HTTP exchange, and its evidence: the request and the response as sent and received
+(headers in order, every value), each body's SHA-256 and length over all of it with its first
+bytes in a file of their own, and the times to connect, to the response's headers and to its last
+byte. Times are recorded, never judged: /verify proves behaviour, not speed.
+
+An exchange either completes or fails, before any expectation is read:
+- **One deadline for all of it.** Connecting, sending, every read of the headers and of the body
+  wait at most what is left of the step's time, so a peer that trickles its bytes can't hold it
+  past its deadline (a socket timeout alone restarts with every byte).
+- **Every byte the framing announced.** A body shorter than its Content-Length, a chunked body
+  cut off, or one the deadline cut is an incomplete response: an error, never a body to check.
+  The missing tail could hold the very text a `not_contains` excludes.
+The evidence says both whether the saved prefix is all that was received (`saved_complete`) and
+whether what was received is the whole message (`transport_complete`)."""
 from __future__ import annotations
 
 import base64
 import hashlib
 import http.client
+import io
 import json
 import socket
 import time
@@ -14,12 +25,72 @@ import urllib.parse
 from pathlib import Path
 
 
+class Deadline:
+    """What is left of one operation's time, and what the operation is doing (`phase`)."""
+
+    def __init__(self, seconds: float):
+        self.seconds, self.end, self.phase = seconds, time.monotonic() + seconds, "connecting"
+
+    def left(self) -> float:
+        left = self.end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError(self.passed())
+        return left
+
+    def passed(self) -> str:
+        return f"the {self.seconds:g} s deadline passed while {self.phase}"
+
+
+class _Reader(io.RawIOBase):
+    """The socket's bytes, each read within the deadline."""
+
+    def __init__(self, sock: socket.socket, deadline: Deadline):
+        self.sock, self.deadline = sock, deadline
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        self.sock.settimeout(self.deadline.left())
+        try:
+            return self.sock.recv_into(buffer)
+        except TimeoutError:
+            raise TimeoutError(self.deadline.passed()) from None
+
+
+class _Socket:
+    """The connection's socket as http.client uses it (sendall, makefile), every blocking call
+    within the deadline; anything else is the socket's own. Closing it does nothing: http.client
+    closes the connection's socket as soon as the server says it will close, before the body is
+    read (a real socket file counts its readers; this one doesn't), so `transfer` closes the
+    socket itself when the exchange is over."""
+
+    def __init__(self, sock: socket.socket, deadline: Deadline):
+        self._sock, self._deadline = sock, deadline
+
+    def close(self) -> None:
+        pass
+
+    def sendall(self, data) -> None:
+        self._sock.settimeout(self._deadline.left())
+        try:
+            self._sock.sendall(data)
+        except TimeoutError:
+            raise TimeoutError(self._deadline.passed()) from None
+
+    def makefile(self, mode: str = "rb", *args, **kwargs):
+        return io.BufferedReader(_Reader(self._sock, self._deadline))
+
+    def __getattr__(self, name: str):
+        return getattr(self._sock, name)
+
+
 class Body:
     """A body read in full for the checks (up to its read limit), hashed and counted over every
     byte; `kept` is what the checks see."""
 
     def __init__(self, read_limit: int):
-        self.digest, self.size, self.read_limit, self.parts, self.cut = hashlib.sha256(), 0, read_limit, [], None
+        self.digest, self.size, self.read_limit, self.parts = hashlib.sha256(), 0, read_limit, []
 
     def add(self, chunk: bytes) -> None:
         self.digest.update(chunk)
@@ -33,11 +104,70 @@ class Body:
         return b"".join(self.parts)
 
     def record(self, file: Path, evidence_bytes: int) -> dict:
-        kept = self.kept
-        file.write_bytes(kept[:evidence_bytes])
+        saved = self.kept[:evidence_bytes]
+        file.write_bytes(saved)
         return {"bytes": self.size, "sha256": self.digest.hexdigest(), "file": file.name,
-                "file_bytes": min(len(kept), evidence_bytes), "complete": self.size <= evidence_bytes,
-                "beyond_read_limit": self.size > self.read_limit, "cut": self.cut}
+                "saved_bytes": len(saved), "saved_complete": len(saved) == self.size,
+                "beyond_read_limit": self.size > self.read_limit}
+
+
+def transfer(method: str, url: str, headers: list[tuple[str, str]], payload: bytes | None,
+             timeout_s: float, read_limit: int) -> dict:
+    """One request and its whole response within `timeout_s`. The result: `response` (status,
+    reason, version, headers; None if they didn't all arrive), `body` (a Body), `declared`
+    (the Content-Length, if any), `timings_ms`, and `error`: None only for a complete response."""
+    parts = urllib.parse.urlsplit(url)
+    target = parts.path + (f"?{parts.query}" if parts.query else "")
+    deadline = Deadline(timeout_s)
+    out = {"response": None, "body": Body(read_limit), "declared": None, "timings_ms": {}, "error": None}
+    connection = http.client.HTTPConnection(parts.hostname, parts.port)
+    raw = None
+    started = time.perf_counter()
+    try:
+        connection.timeout = deadline.left()
+        connection.connect()
+        raw = connection.sock
+        connection.sock = _Socket(raw, deadline)
+        out["timings_ms"]["connect"] = _ms(started)
+        deadline.phase = "sending the request"
+        connection.putrequest(method, target, skip_accept_encoding=True)
+        for name, value in headers:
+            connection.putheader(name, value)
+        if payload is not None:
+            connection.putheader("Content-Length", str(len(payload)))
+        connection.endheaders(payload)
+        deadline.phase = "reading the response's headers"
+        response = connection.getresponse()
+        out["timings_ms"]["headers"] = _ms(started)
+        out["response"] = {"status": response.status, "reason": response.reason,
+                           "version": f"HTTP/{response.version / 10:.1f}", "headers": list(response.getheaders())}
+        out["declared"] = response.length  # None: chunked, or until the connection closes
+        deadline.phase = "reading the body"
+        while chunk := response.read1(65536):
+            out["body"].add(chunk)
+        if response.length:  # what Content-Length announced and the connection never sent
+            raise http.client.IncompleteRead(b"", response.length)
+    except (OSError, http.client.HTTPException) as e:
+        prefix = "no response" if out["response"] is None else "incomplete response"
+        if isinstance(e, http.client.IncompleteRead):
+            reason = (f"{out['body'].size} of {out['declared']} body bytes, then the connection closed"
+                      if out["declared"] else f"the chunked body ended early after {out['body'].size} bytes")
+        elif isinstance(e, TimeoutError):
+            reason = deadline.passed() + (f", after {out['body'].size} body bytes" if out["response"] else "")
+        else:
+            reason = f"{type(e).__name__}: {e}"
+        out["error"] = f"{prefix}: {reason}"
+    finally:
+        out["timings_ms"]["total"] = _ms(started)
+        connection.close()
+        if raw is not None:
+            raw.close()
+    return out
+
+
+def get(url: str, timeout_s: float, read_limit: int = 1 << 20) -> dict:
+    """A GET within `timeout_s` all told (the doctor's readings, the readiness probe)."""
+    return transfer("GET", url, [], None, timeout_s, read_limit)
 
 
 def request_of(step: dict, base: str) -> tuple[str, str, list[tuple[str, str]], bytes | None]:
@@ -71,53 +201,24 @@ def request_of(step: dict, base: str) -> tuple[str, str, list[tuple[str, str]], 
 
 def exchange(step: dict, base: str, files: Path, evidence_bytes: int) -> dict:
     """Sends the step's request and reads its response. The record has `request`, `response`
-    (None if there was none), `timings_ms` and `error`; `body` holds the response's kept bytes for
-    the checks and is left out of the evidence."""
+    (None if its headers didn't all arrive), `timings_ms` and `error` (None only for a complete
+    response); `body` holds the response's kept bytes for the checks and is left out of the
+    evidence."""
     method, url, headers, payload = request_of(step, base)
-    parts = urllib.parse.urlsplit(url)
-    target = parts.path + (f"?{parts.query}" if parts.query else "")
     files.parent.mkdir(parents=True, exist_ok=True)
-    sent = Body(len(payload or b""))
-    if payload:
+    sent = None
+    if payload is not None:
+        sent = Body(len(payload))
         sent.add(payload)
+    done = transfer(method, url, headers, payload, step["timeout_s"], step["read_limit"])
     record = {"request": {"method": method, "url": url, "headers": headers,
-                          "body": sent.record(files.with_suffix(".request.body"), evidence_bytes) if payload else None},
-              "response": None, "timings_ms": {}, "error": None, "body": b""}
-    deadline = time.monotonic() + step["timeout_s"]
-    connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=step["timeout_s"])
-    started = time.perf_counter()
-    try:
-        connection.connect()
-        record["timings_ms"]["connect"] = _ms(started)
-        connection.putrequest(method, target, skip_accept_encoding=True)
-        for name, value in headers:
-            connection.putheader(name, value)
-        if payload is not None:
-            connection.putheader("Content-Length", str(len(payload)))
-        connection.endheaders(payload)
-        response = connection.getresponse()
-        record["timings_ms"]["headers"] = _ms(started)
-        received = Body(step["read_limit"])
-        while True:
-            if time.monotonic() > deadline:
-                received.cut = f"the step's timeout ({step['timeout_s']:g} s) passed while reading the body"
-                break
-            chunk = response.read1(65536) if method != "HEAD" else b""
-            if not chunk:
-                break
-            received.add(chunk)
-        record["timings_ms"]["total"] = _ms(started)
-        record["response"] = {
-            "status": response.status, "reason": response.reason, "version": f"HTTP/{response.version / 10:.1f}",
-            "headers": list(response.getheaders()),
-            "body": received.record(files.with_suffix(".response.body"), evidence_bytes)}
-        record["body"] = received.kept
-    except (OSError, http.client.HTTPException) as e:
-        record["timings_ms"]["total"] = _ms(started)
-        reason = "timed out" if isinstance(e, socket.timeout) else f"{type(e).__name__}: {e}"
-        record["error"] = f"no response: {reason}"
-    finally:
-        connection.close()
+                          "body": sent.record(files.with_suffix(".request.body"), evidence_bytes) if sent else None},
+              "response": done["response"], "timings_ms": done["timings_ms"], "error": done["error"],
+              "body": done["body"].kept}
+    if done["response"] is not None:
+        record["response"]["body"] = {**done["body"].record(files.with_suffix(".response.body"), evidence_bytes),
+                                      "declared_bytes": done["declared"],
+                                      "transport_complete": done["error"] is None}
     return record
 
 

@@ -13,20 +13,24 @@ evidence (the skill: .claude/skills/verify/SKILL.md; scenario files: README.md).
 Each scenario, in five phases:
 1. **Launch:** a fresh temporary data directory, the server from the given build on a free port
    of 127.0.0.1, the scenario's settings (`[server] set`), then this command's `--set`, over
-   `store.mode = "on-disk"`; ready when /readyz answers 200.
-2. **Doctor:** read-only: /healthz, /readyz, /version, /api/v1/repositories.
-3. **Drive:** the scenario's steps in order, each request checked against its expectations;
-   captured values reach later steps. A failed step doesn't stop the others; once the server has
-   exited, the remaining steps are recorded as not run.
+   `store.mode = "on-disk"`; ready when /readyz answers 200. Every attempt is recorded; only one
+   whose own log says its port was taken is tried again, after it is stopped and reaped.
+2. **Doctor:** read-only: /healthz, /readyz, /version, /api/v1/repositories, each within 10 s.
+3. **Drive:** the scenario's steps in order, each exchange complete within its step's timeout
+   (else that is its failure) and then checked against its expectations; captured values reach
+   later steps. A failed step doesn't stop the others; once the server has exited, the remaining
+   steps are recorded as not run.
 4. **Evidence** (EVIDENCE/<scenario>/): every request and response (headers, the body's first
    64 KiB and the SHA-256 and length of all of it, timings), the server's log, the doctor's
    readings, and summary.md and summary.json beside them, each step passed or failed with why.
-5. **Cleanup:** the server stopped and its directory removed, always (`--keep` keeps the directory).
+5. **Cleanup:** the server stopped and its directory removed, always (`--keep` keeps the directory),
+   also after SIGTERM or Ctrl-C, which then still writes the summary, titled INTERRUPTED.
 
 EVIDENCE is $FLEET_OUT/evidence (selftest: $FLEET_OUT/selftest) in a fleet job, else
 tmp/verify/<time> in the repository. The summary's path is printed last. Exit: 0 every step
 passed; 1 a step failed (selftest: a check misjudged); 2 a scenario or the command is wrong;
-3 the server didn't come up, the doctor found it unwell, or the cleanup failed.
+3 the server didn't come up, the doctor found it unwell, the cleanup failed, or the run was
+interrupted.
 """
 from __future__ import annotations
 
@@ -40,14 +44,13 @@ import signal
 import socket
 import sys
 import time
-import urllib.error
 from pathlib import Path
 
 if sys.version_info < (3, 11):
     sys.exit("verify.py needs Python 3.11 or later (tomllib)")
 
 from verifykit import checks, client, jobs, scenario as scenarios, selftest  # noqa: E402
-from verifykit.server import DIRECT, LaunchError, Server, sha256_of  # noqa: E402
+from verifykit.server import LaunchError, Server, sha256_of  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCTOR = ("/healthz", "/readyz", "/version", "/api/v1/repositories")
@@ -59,23 +62,21 @@ class Interrupted(Exception):
 
 
 def _terminated(*_):
-    raise Interrupted("terminated")
+    # The first one unwinds; any later one mustn't cut the cleanup and the summary short.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    raise Interrupted("terminated (SIGTERM)")
 
 
 # --- phase 2: doctor ---------------------------------------------------------------------------
 
-def doctor(base: str) -> dict:
-    """Read-only readings of a running server; `ok` when /healthz and /readyz answer 200."""
+def doctor(base: str, timeout_s: float = 10.0) -> dict:
+    """Read-only readings of a running server, each within `timeout_s` all told; `ok` when
+    /healthz and /readyz answered 200 in full."""
     readings = {}
     for path in DOCTOR:
-        reading = {"status": None}
-        try:
-            with DIRECT.open(base + path, timeout=10) as response:
-                reading["status"], text = response.status, response.read(1 << 20).decode("utf-8", "replace")
-        except urllib.error.HTTPError as e:
-            reading["status"], text = e.code, e.read(1 << 20).decode("utf-8", "replace")
-        except OSError as e:
-            reading["error"], text = str(e), ""
+        got = client.get(base + path, timeout_s)
+        text = got["body"].kept.decode("utf-8", "replace")
+        reading = {"status": got["response"]["status"] if got["response"] else None, "error": got["error"]}
         try:
             reading["body"] = json.loads(text)
         except ValueError:
@@ -91,14 +92,15 @@ def doctor(base: str) -> dict:
             f"reasoning {version.get('reasoning_mode', '?')}; readyz {ready.get('status', '?')}/"
             f"{ready.get('consistency', '?')}, revision {ready.get('revision', '?')}, "
             f"{ready.get('quad_count', '?')} quads; repositories: {ids}")
-    ok = readings["/healthz"]["status"] == 200 and readings["/readyz"]["status"] == 200
+    ok = all(readings[p]["status"] == 200 and not readings[p]["error"] for p in ("/healthz", "/readyz"))
     return {"ok": ok, "line": line, "readings": readings}
 
 
 # --- phase 3: drive ----------------------------------------------------------------------------
 
 def evaluate(step: dict, record: dict) -> list[str]:
-    """The step's failed expectations (empty: it passed)."""
+    """The step's failed expectations (empty: it passed). An incomplete exchange is its one
+    failure: no expectation is read against part of a response."""
     if record["error"]:
         return [record["error"]]
     expect, response, body = step["expect"], record["response"], record["body"]
@@ -129,6 +131,12 @@ def evaluate(step: dict, record: dict) -> list[str]:
                     failures.append(f"json {e}")
                     continue
                 value, present = None, False
+            if present and checks.selects(path) and "present" in predicate:
+                # A [*] path always yields a list; what is present is a nonempty selection.
+                if predicate["present"] != bool(value):
+                    failures.append(f"json {path}: expected {'a nonempty' if predicate['present'] else 'an empty'} "
+                                    f"selection, got {checks.show(value)}")
+                predicate = {k: v for k, v in predicate.items() if k != "present"}
             failures += checks.check(f"json {path}", value, predicate, present=present)
     if expect["rows"] is not None:
         try:
@@ -153,11 +161,10 @@ def _problem(record: dict) -> str:
 
 
 def capture(step: dict, record: dict) -> tuple[dict[str, str], list[str]]:
+    """The step's captured values, from a complete exchange (drive takes none from another)."""
     captured, failures = {}, []
     for name, spec in step["capture"].items():
         try:
-            if record["error"]:
-                raise ValueError("no response")
             if "header" in spec:
                 value = client.header(record, spec["header"])
                 if value is None:
@@ -182,25 +189,27 @@ def slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:48] or "step"
 
 
-def drive(sc: scenarios.Scenario, base: str, server: Server | None, out: Path, evidence_bytes: int) -> list[dict]:
+def drive(sc: scenarios.Scenario, base: str, server: Server | None, out: Path, evidence_bytes: int,
+          results: list[dict]) -> None:
+    """The scenario's steps, each one's result appended to `results` as it begins (so an
+    interruption leaves the steps so far, the one it cut marked as failed)."""
     variables = {**sc.vars, "base": base, "port": base.rsplit(":", 1)[-1]}
-    results = []
     gone = None
     for step in sc.steps:
         name, files = step["name"], out / "steps" / f"{step['index']:02d}-{slug(step['name'])}"
-        result = {"index": step["index"], "name": name, "ok": False, "failures": [], "status": None,
-                  "ms": None, "record": f"steps/{files.name}.json"}
+        result = {"index": step["index"], "name": name, "ok": False, "failures": ["interrupted during this step"],
+                  "status": None, "ms": None, "record": f"steps/{files.name}.json"}
         results.append(result)
         if gone:
-            result["failures"] = [f"not run: {gone}"]
-            result["record"] = None
+            result.update(failures=[f"not run: {gone}"], record=None)
             continue
         if step.get("restart"):
             try:
                 start = server.restart()
                 variables.update(base=server.base, port=str(server.port))
-                result.update(ok=True, ms=round(start["ready_s"] * 1000, 1), note=f"restarted: pid {start['pid']}, "
-                              f"port {start['port']}, ready after {start['ready_s']} s")
+                result.update(ok=True, failures=[], ms=round(start["ready_s"] * 1000, 1),
+                              note=f"restarted: pid {start['pid']}, port {start['port']}, "
+                                   f"ready after {start['ready_s']} s")
             except LaunchError as e:
                 result["failures"] = [f"restart: {e}"]
                 gone = "the server didn't come back after a restart"
@@ -209,13 +218,13 @@ def drive(sc: scenarios.Scenario, base: str, server: Server | None, out: Path, e
         missing = sorted({m for m in scenarios.VAR.findall(repr(step)) if m not in variables})
         if missing:
             names = ", ".join("${" + m + "}" for m in missing)
-            result["failures"] = [f"not run: {names} not captured (an earlier step failed)"]
-            result["record"] = None
+            result.update(failures=[f"not run: {names} not captured (an earlier step failed)"], record=None)
             continue
         live = scenarios.substitute(step, variables)
         record = client.exchange(live, variables["base"], files, evidence_bytes)
         failures = evaluate(live, record)
-        captured, capture_failures = capture(live, record)
+        # Nothing is captured from an incomplete exchange: a later step needing it isn't run.
+        captured, capture_failures = capture(live, record) if not record["error"] else ({}, [])
         variables.update(captured)
         result.update(ok=not failures and not capture_failures, failures=failures + capture_failures,
                       status=record["response"]["status"] if record["response"] else None,
@@ -224,17 +233,20 @@ def drive(sc: scenarios.Scenario, base: str, server: Server | None, out: Path, e
                | {"step": step["name"], "ok": result["ok"], "failures": result["failures"], "captured": captured})
         if record["error"] and server and server.exited() is not None:
             gone = f"the server exited with code {server.exited()} (its log: server.log)"
-    return results
 
 
 # --- the phases, per scenario ------------------------------------------------------------------
 
-def run_one(sc: scenarios.Scenario, out: Path, target: dict, settings: dict[str, str], args) -> dict:
+def run_one(sc: scenarios.Scenario, out: Path, target: dict, settings: dict[str, str], args,
+            results: list[dict]) -> dict:
+    """The five phases of one scenario; its result is appended to `results` first, so an
+    interruption (re-raised after the cleanup) leaves it there, failed."""
     out.mkdir(parents=True, exist_ok=True)
     (out / ("scenario.toml" if sc.path else "scenario.json")).write_text(sc.text, encoding="utf-8")
     result = {"scenario": sc.name, "dir": out.name, "file": str(sc.path) if sc.path else None,
               "description": sc.description, "ok": False, "error": None, "doctor": None, "launch": None,
               "cleanup": None, "steps": []}
+    results.append(result)
     server = None
     try:
         if target.get("url"):
@@ -253,19 +265,22 @@ def run_one(sc: scenarios.Scenario, out: Path, target: dict, settings: dict[str,
             result["error"] = f"the doctor found it unwell: /healthz {report['readings']['/healthz']['status']}, " \
                               f"/readyz {report['readings']['/readyz']['status']}"
         else:
-            result["steps"] = drive(sc, base, server, out, args.evidence_kib * 1024)
+            drive(sc, base, server, out, args.evidence_kib * 1024, result["steps"])
             for step in result["steps"]:
                 mark = "pass" if step["ok"] else "FAIL"
                 print(f"[{sc.name}] {mark} {step['index']:2d} {step['name']}"
                       + "".join(f"\n        {f}" for f in step["failures"]), flush=True)
     except LaunchError as e:
         result["error"] = f"launch: {e}"
+    except (Interrupted, KeyboardInterrupt) as e:
+        result["error"] = f"interrupted: {e or 'Ctrl-C'}"
+        raise
     finally:
         if server:
             result["cleanup"] = server.cleanup(keep=args.keep)
-            _write(out / "launch.json", {"binary": target["binary"], "starts": server.starts,
+            _write(out / "launch.json", {"binary": target["binary"], "attempts": server.attempts,
                                          "settings": server.settings, "cleanup": result["cleanup"]})
-    result["ok"] = not result["error"] and all(s["ok"] for s in result["steps"])
+        result["ok"] = not result["error"] and all(s["ok"] for s in result["steps"])
     return result
 
 
@@ -388,9 +403,17 @@ def overrides(pairs: list[str]) -> dict[str, str]:
     return out
 
 
-def cmd_run(args, loaded: list[scenarios.Scenario], kind: str) -> tuple[int, Path, dict, list[dict]]:
-    """Each scenario through the five phases: the exit code, the evidence directory, where the
-    server came from, and each scenario's result."""
+def unrun(sc: scenarios.Scenario, error: str) -> dict:
+    return {"scenario": sc.name, "dir": sc.name, "file": str(sc.path) if sc.path else None,
+            "description": sc.description, "ok": False, "error": error, "doctor": None, "launch": None,
+            "cleanup": None, "steps": []}
+
+
+def cmd_run(args, loaded: list[scenarios.Scenario], kind: str, extra: list[tuple] = ()) -> dict:
+    """Each scenario through the five phases against the server the arguments name (`extra`:
+    scenarios with targets of their own, after them). The exit code, the evidence directory,
+    the server's target, each scenario's result, and whether a SIGTERM or Ctrl-C cut it short:
+    then the scenario it cut has failed and the ones after it weren't run."""
     if args.url and any(s.get("restart") for sc in loaded for s in sc.steps):
         raise SystemExit("restart steps need a server of the runner's (--server or --server-rev), not --url")
     settings = overrides(args.set)
@@ -400,17 +423,23 @@ def cmd_run(args, loaded: list[scenarios.Scenario], kind: str) -> tuple[int, Pat
         target = target_of(args)
     except LaunchError as e:
         print(f"verify: {e}", file=sys.stderr)
-        return 3, evidence, {}, [{"scenario": sc.name, "dir": sc.name, "file": str(sc.path),
-                                  "description": sc.description, "ok": False, "error": f"launch: {e}",
-                                  "doctor": None, "launch": None, "cleanup": None, "steps": []} for sc in loaded]
-    results, names = [], set()
-    for sc in loaded:
+        return {"code": 3, "evidence": evidence, "target": {}, "interrupted": False,
+                "results": [unrun(sc, f"launch: {e}") for sc in loaded]}
+    plan = [(sc, target) for sc in loaded] + list(extra)
+    results, names, interrupted = [], set(), False
+    for i, (sc, where) in enumerate(plan):
         name = sc.name if sc.name not in names else f"{sc.name}-{len(names) + 1}"
         names.add(name)
-        results.append(run_one(sc, evidence / name, target, settings, args))
+        try:
+            run_one(sc, evidence / name, where, settings, args, results)
+        except (Interrupted, KeyboardInterrupt):
+            interrupted = True
+            results += [unrun(later, "not run: interrupted before it began") for later, _ in plan[i + 1:]]
+            break
     infra = any(r["error"] or (r["cleanup"] and r["cleanup"]["error"]) for r in results)
     failed = any(not s["ok"] for r in results for s in r["steps"])
-    return 1 if failed else 3 if infra else 0, evidence, target, results
+    code = 3 if interrupted else 1 if failed else 3 if infra else 0
+    return {"code": code, "evidence": evidence, "target": target, "results": results, "interrupted": interrupted}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -488,38 +517,49 @@ def main(argv: list[str] | None = None) -> int:
         print(f"doctor: {'ok' if report['ok'] else 'UNWELL'}: {report['line']}")
         return 0 if report["ok"] else 3
     if args.command == "selftest":
-        loaded = [scenarios.from_dict(selftest.scenario(), "selftest")]
-        loaded[0].text = json.dumps(selftest.scenario(), indent=1)
-    else:
-        try:
-            loaded = [scenarios.load(p) for p in args.scenarios]
-        except (scenarios.ScenarioError, OSError) as e:
-            print(f"verify: {e}", file=sys.stderr)
-            return 2
+        return cmd_selftest(args)
+    try:
+        loaded = [scenarios.load(p) for p in args.scenarios]
+    except (scenarios.ScenarioError, OSError) as e:
+        print(f"verify: {e}", file=sys.stderr)
+        return 2
     if args.command == "check":
         for sc in loaded:
             print(f"{sc.path}: {sc.name}, {len(sc.steps)} steps")
         return 0
-    try:
-        if args.command == "run":
-            code, evidence, target, results = cmd_run(args, loaded, "evidence")
-            passed = sum(r["ok"] for r in results)
-            summary = summarise(evidence, results, target, f"/verify: {passed} of {len(results)} scenarios passed")
-        else:
-            code, evidence, target, results = cmd_run(args, loaded, "selftest")
-            problems = selftest.judge(results[0])
-            verdict = ("passed: every wrong expectation failed with its message, and the controls passed"
-                       if not problems else "FAILED: " + "; ".join(problems))
-            summary = summarise(evidence, results, target, f"/verify self-test {verdict.split(':')[0]}",
-                                [f"self-test {verdict}"], on_purpose=True)
-            print(f"self-test {verdict}")
-            # A server that didn't come up (or go) judges nothing: that's the infrastructure's.
-            code = 3 if results[0]["error"] or (results[0]["cleanup"] or {}).get("error") else 1 if problems else 0
-    except (Interrupted, KeyboardInterrupt):
-        print("verify: interrupted; the servers were stopped and their directories removed", file=sys.stderr)
-        return 3
+    run = cmd_run(args, loaded, "evidence")
+    passed = sum(r["ok"] for r in run["results"])
+    title = (f"/verify INTERRUPTED: {passed} of {len(run['results'])} scenarios passed before it"
+             if run["interrupted"] else f"/verify: {passed} of {len(run['results'])} scenarios passed")
+    print(f"summary: {summarise(run['evidence'], run['results'], run['target'], title)}")
+    return run["code"]
+
+
+def built_in(data: dict) -> scenarios.Scenario:
+    sc = scenarios.from_dict(data, data["name"])
+    sc.text = json.dumps(data, indent=1)
+    return sc
+
+
+def cmd_selftest(args) -> int:
+    """The self-test's checks against the server, its faults against its own fault server; exit 0
+    when every row went as it must, 1 when one didn't, 3 when the server didn't come up or go,
+    or the run was interrupted."""
+    with selftest.fault_server() as faulty:
+        run = cmd_run(args, [built_in(selftest.scenario())], "selftest",
+                      extra=[(built_in(selftest.fault_scenario()), {"url": faulty})])
+    problems = ["interrupted"] if run["interrupted"] else selftest.judge(run["results"])
+    verdict = ("passed: every wrong row failed with its message, every other row passed"
+               if not problems else "FAILED: " + "; ".join(problems))
+    summary = summarise(run["evidence"], run["results"], run["target"], f"/verify self-test {verdict.split(':')[0]}",
+                        [f"self-test {verdict}"], on_purpose=True)
+    print(f"self-test {verdict}")
     print(f"summary: {summary}")
-    return code
+    first = run["results"][0]
+    # A server that didn't come up (or go) judges nothing: that's the infrastructure's.
+    if run["interrupted"] or first["error"] or (first["cleanup"] or {}).get("error"):
+        return 3
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":

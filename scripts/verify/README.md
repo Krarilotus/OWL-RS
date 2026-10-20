@@ -12,7 +12,7 @@ the commands and the exit codes: `verify.py`'s docstring (`python scripts/verify
 | `verifykit/checks.py` | The predicates, JSON paths and row counts, and their failure messages |
 | `verifykit/client.py` | One HTTP exchange and its evidence |
 | `verifykit/server.py` | Launch (temporary data directory, free port, settings) and cleanup |
-| `verifykit/selftest.py` | Wrong expectations on purpose: each must fail with its message |
+| `verifykit/selftest.py` | Every check held and broken, and broken HTTP on purpose: each failure with its message |
 | `verifykit/jobs.py`, `build-on-host.sh` | The fleet jobs: a debug build on gamergrill, then the run |
 | `scenarios/` | Scenarios that prove something about today's server |
 
@@ -43,7 +43,7 @@ headers = { Content-Type = "text/turtle" }
 auth = { basic = ["alice", "${password}"] }   # or { bearer = "${token}" }
 body = """..."""                  # one payload at most: body (text), body_file (beside the file),
                                   # json = { ... } (Content-Type set), form = { ... } (urlencoded)
-timeout_s = 60                    # the whole exchange (default 60)
+timeout_s = 60                    # the whole exchange: connect, send, headers, body (default 60)
 read_limit_mib = 16               # what the checks read of the body (default 16; all of it is hashed)
 
 [step.expect]                     # required, with status
@@ -71,10 +71,25 @@ restart = true                    # stops the server and starts it again on its 
 | `contains`, `not_contains` | text: the substring is (not) in it; a list: the element; an object: the key |
 | `matches` | a regular expression (Python's `re.search`) matches the text |
 | `length` | a list, object or text has this length |
-| `present` | `true`: the header or JSON path exists; `false`: it doesn't (headers and JSON only) |
+| `present` | `true`: the header or JSON path exists (a `[*]` path: selects something); `false`: it doesn't (headers and JSON only) |
 
 **JSON paths:** `$`, then `.key`, `['key with dots']`, `[0]` and `[*]` (every element: the value
 is then the list of what each element holds, elements without the rest of the path left out).
+A `[*]` path's list may be empty, and `contains`/`not_contains` on an empty list say nothing of
+existence: to claim that something is there, say so with `present = true` (a nonempty
+selection), `length = N`, or `contains` the value itself:
+
+```toml
+json = { "$.results.bindings[*].x" = { present = true },          # at least one row binds x
+         "$.results.bindings[*].x.value" = { contains = "http://example.com/x" } }
+```
+
+**Complete exchanges only.** An exchange fails, before any expectation is read or any value
+captured, when it didn't complete within `timeout_s` (the deadline covers connecting, sending,
+every header and every body byte: a server trickling its bytes can't hold a step past it) or its
+body is shorter than its framing announced (Content-Length, chunks). Such a step's failure is the
+exchange's (`no response: …` before the headers ended, `incomplete response: …` after), and a
+step needing a value it would have captured isn't run.
 
 **Variables:** `${base}` and `${port}` (the runner's, changed by a restart if the port had to
 change), `[vars]`, and what earlier steps captured. A name none of them defines is an error
@@ -88,13 +103,22 @@ behaviour. Timing belongs to the fleet's timed hosts and the release gate.
 ```
 EVIDENCE/summary.md, summary.json        every scenario's steps, passed or failed and why
 EVIDENCE/<scenario>/scenario.toml        the file as run
-                    launch.json          argv, port, pid, seconds until ready, per start
+                    launch.json          every attempt to start the server (argv, port, pid,
+                                         outcome, exit code if it failed, seconds until ready),
+                                         its settings, the cleanup
                     doctor.json          /healthz, /readyz, /version, /api/v1/repositories
-                    server.log           the server's output, every start marked
+                    server.log           the server's output, every attempt marked
                     steps/NN-<name>.json the request and response (headers, the body's SHA-256,
                                          length and first 64 KiB in .request.body/.response.body),
                                          timings, the checks' failures, what was captured
 ```
+
+A response body's record says how much of it the evidence holds and how much of it came:
+`saved_complete` (the saved file is every byte received), `transport_complete` (what was received
+is the whole message its framing announced), `declared_bytes` (its Content-Length, if any).
+
+An interrupted run (SIGTERM from the fleet, Ctrl-C) stops its servers, removes their directories
+and writes its summary, titled INTERRUPTED: the scenario it cut has failed, later ones weren't run.
 
 summary.json also says where it ran (host, fleet job) and, on Linux, the peak memory of the
 runner's cgroup: under fleet the step's, the runner and its servers together.
