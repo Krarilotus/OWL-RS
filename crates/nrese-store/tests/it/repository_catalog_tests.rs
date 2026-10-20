@@ -423,3 +423,64 @@ fn a_removal_whose_files_are_held_stays_removed_after_a_restart() {
     assert!(catalog.unavailable("held").is_none());
     assert!(!path.exists(), "reclaimed at the start");
 }
+
+/// The reasoning marker of a recomputation can't be written (`reasoning.tmp` taken), so
+/// the recomputation fails after it has published the new inferences: a failed change to
+/// RDFS from none restores the old closure, not only the old write path.
+#[test]
+fn a_change_whose_recomputation_fails_after_publishing_restores_the_old_closure() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let catalog = open(dir.path());
+    catalog
+        .create("probe", RepositorySettings::default())
+        .expect("created");
+    let store = || Arc::clone(catalog.get("probe").expect("probe").pipeline.read().store());
+    store()
+        .execute_update_str("INSERT DATA { <urn:C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:D> . <urn:a> a <urn:C> }")
+        .expect("written");
+    let derived = || {
+        String::from_utf8(
+            store()
+                .execute_query_str("ASK { <urn:a> a <urn:D> }")
+                .expect("ask")
+                .payload,
+        )
+        .expect("utf-8")
+        .contains("true")
+    };
+    assert!(!derived());
+    std::fs::create_dir(dir.path().join("repositories/probe/reasoning.tmp")).expect("taken");
+    let rdfs = RepositorySettings {
+        reasoning: Some("rdfs".to_owned()),
+        ..RepositorySettings::default()
+    };
+    assert!(catalog.change("probe", rdfs).is_err());
+    assert_eq!(
+        catalog.settings("probe"),
+        Some(RepositorySettings::default())
+    );
+    assert!(!derived(), "the failed change left its inferences");
+}
+
+/// When the old closure can't be restored either (both reasonings need the marker), the
+/// repository is unavailable, with why and how to repair it: never old rules over new
+/// inferences.
+#[test]
+fn a_change_whose_closure_cant_be_restored_makes_the_repository_unavailable() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let catalog = open(dir.path());
+    let rdfs = RepositorySettings {
+        reasoning: Some("rdfs".to_owned()),
+        ..RepositorySettings::default()
+    };
+    catalog.create("probe", rdfs).expect("created");
+    std::fs::create_dir(dir.path().join("repositories/probe/reasoning.tmp")).expect("taken");
+    let rl = RepositorySettings {
+        reasoning: Some("owl2-rl".to_owned()),
+        ..RepositorySettings::default()
+    };
+    assert!(catalog.change("probe", rl).is_err());
+    assert!(catalog.get("probe").is_none(), "served in a mixed state");
+    let why = catalog.unavailable("probe").expect("unavailable");
+    assert!(why.contains("probe") && why.contains("restart"), "{why}");
+}

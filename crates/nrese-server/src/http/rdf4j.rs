@@ -397,7 +397,7 @@ pub async fn repositories(
     let ids = std::iter::once((
         DEFAULT_REPOSITORY.to_owned(),
         Some("NRESE".to_owned()),
-        true,
+        state.default_unavailable().is_none(),
     ))
     .chain(
         state
