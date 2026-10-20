@@ -114,6 +114,20 @@ class Watch(unittest.TestCase):
                     patch.object(watch, "job_namespace", return_value=None):
                 self.assertEqual(watch.watch(Path(tmp), 12345, "token"), 1)
 
+    def test_a_docker_that_doesnt_answer_fails_the_resume_and_keeps_its_line(self):
+        """Sol, 20 Oct 2026: docker unpause had no time limit; a wedged daemon held the slot's
+        lock (and a block's recovery) forever."""
+        bounds = []
+
+        def wedged(args, **kwargs):
+            bounds.append(kwargs.get("timeout"))
+            raise watch.subprocess.TimeoutExpired(args, kwargs.get("timeout"))
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "frozen").write_text("container abc\n")
+            with patch.object(watch.subprocess, "run", wedged):
+                self.assertEqual(watch.resume(Path(tmp)), ["container abc"])
+            self.assertEqual(((Path(tmp) / "frozen").read_text(), bounds), ("container abc\n", [watch.DOCKER_S]))
+
     @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
     def test_no_suspension_follows_a_journal_whose_directory_couldnt_be_synced(self):
         """Sol, 20 Oct 2026: a failed directory sync of a new journal was swallowed and the process
