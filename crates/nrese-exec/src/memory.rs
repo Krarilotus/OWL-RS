@@ -235,29 +235,40 @@ mod imp {
         false
     }
 
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOBOBJECT_LIMIT_VIOLATION_INFORMATION,
-        JOBOBJECTINFOCLASS, JobObjectExtendedLimitInformation, JobObjectLimitViolationInformation,
-        QueryInformationJobObject,
+        JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOBOBJECTINFOCLASS,
+        JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     };
     use windows_sys::Win32::System::ProcessStatus::{
         GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
     };
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     fn counters() -> Option<PROCESS_MEMORY_COUNTERS_EX> {
+        // SAFETY: GetCurrentProcess returns a pseudo-handle, valid and needing no closing.
+        unsafe { counters_of(GetCurrentProcess()) }
+    }
+
+    /// The memory counters of the process `process` is a handle of.
+    ///
+    /// # Safety
+    /// `process` is a valid process handle with query access.
+    unsafe fn counters_of(process: HANDLE) -> Option<PROCESS_MEMORY_COUNTERS_EX> {
         let mut counters = PROCESS_MEMORY_COUNTERS_EX {
             cb: u32::try_from(std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>()).ok()?,
             ..Default::default()
         };
-        // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no closing, and
-        // `counters` is a valid, writable PROCESS_MEMORY_COUNTERS_EX whose size is `cb`;
-        // the EX form starts with the plain one, as the API allows.
+        // SAFETY: `process` is valid (the caller's contract), and `counters` is a valid,
+        // writable PROCESS_MEMORY_COUNTERS_EX whose size is `cb`; the EX form starts with the
+        // plain one, as the API allows.
         let ok = unsafe {
             GetProcessMemoryInfo(
-                GetCurrentProcess(),
+                process,
                 std::ptr::from_mut(&mut counters).cast::<PROCESS_MEMORY_COUNTERS>(),
                 counters.cb,
             )
@@ -350,18 +361,84 @@ mod imp {
         super::least(job_limits()?)
     }
 
-    /// What the job object's limits leave: its job-wide limit less the memory committed by
-    /// the job's processes (the limit-violation class's `JobMemory`, which reports it whether
-    /// or not a limit was hit), its per-process limit less the process's own committed memory.
-    fn job_left() -> Option<u64> {
+    /// What the job object's limits leave: its job-wide limit less the memory its processes
+    /// commit now ([`job_committed`]), its per-process limit less the process's own committed
+    /// memory. `None` where a limit is set whose use can't be read.
+    pub(super) fn job_left() -> Option<u64> {
         let [job_wide, per_process] = job_limits()?;
-        let job_wide = job_wide.and_then(|limit| {
-            let info: JOBOBJECT_LIMIT_VIOLATION_INFORMATION =
-                job(JobObjectLimitViolationInformation)?;
-            Some((limit, info.JobMemory))
-        });
-        let per_process = per_process.and_then(|limit| Some((limit, super::process_bytes()?)));
+        let job_wide = match job_wide {
+            Some(limit) => Some((limit, job_committed()?)),
+            None => None,
+        };
+        let per_process = match per_process {
+            Some(limit) => Some((limit, super::process_bytes()?)),
+            None => None,
+        };
         super::left([job_wide, per_process])
+    }
+
+    /// The memory the processes of the job object the process runs in commit now: the sum
+    /// of each one's committed private memory, which is what a job's memory limit counts.
+    /// From documented calls only: the job's process list, and each process's counters. A
+    /// process that ended since the list was read commits nothing; one that can't be asked
+    /// leaves the sum unknown.
+    fn job_committed() -> Option<u64> {
+        /// The ids that fit after the list's two counts, to start with.
+        const FIRST: usize = 64;
+        /// Windows's answer for a process id that no longer names a process.
+        const ERROR_INVALID_PARAMETER: i32 = 87;
+        // The list: two u32 counts in the first word, then a word per process id.
+        let mut words = vec![0usize; 1 + FIRST];
+        let ids = loop {
+            let size = u32::try_from(std::mem::size_of_val(words.as_slice())).ok()?;
+            // SAFETY: a null handle names the job of the calling process; `words` is a valid,
+            // writable buffer of `size` bytes, aligned for and starting with a
+            // JOBOBJECT_BASIC_PROCESS_ID_LIST, whose ids follow its counts word by word.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    std::ptr::null_mut(),
+                    JobObjectBasicProcessIdList,
+                    words.as_mut_ptr().cast(),
+                    size,
+                    std::ptr::null_mut(),
+                )
+            };
+            // SAFETY: the buffer starts with the list's header, written or still zeroed, and
+            // is aligned for it.
+            let header = unsafe {
+                words
+                    .as_ptr()
+                    .cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+                    .read()
+            };
+            let assigned = header.NumberOfAssignedProcesses as usize;
+            if ok != 0 && header.NumberOfProcessIdsInList as usize == assigned {
+                break assigned;
+            }
+            // Refused with room for every process: outside a job, or no answer.
+            if ok == 0 && assigned < words.len() {
+                return None;
+            }
+            words.resize(1 + assigned + FIRST, 0);
+        };
+        let mut committed = 0u64;
+        for &id in &words[1..=ids] {
+            let id = u32::try_from(id).ok()?;
+            // SAFETY: opens a handle for query only, closed below.
+            let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, id) };
+            if process.is_null() {
+                if std::io::Error::last_os_error().raw_os_error() == Some(ERROR_INVALID_PARAMETER) {
+                    continue;
+                }
+                return None;
+            }
+            // SAFETY: `process` is the handle just opened with query access.
+            let counters = unsafe { counters_of(process) };
+            // SAFETY: closes the handle opened above, once.
+            unsafe { CloseHandle(process) };
+            committed += counters?.PrivateUsage as u64;
+        }
+        Some(committed)
     }
 }
 
@@ -844,13 +921,38 @@ mod tests {
         assert!(assigned, "{}", std::io::Error::last_os_error());
         assert_eq!(imp::job_limit(), Some(limit));
         assert_eq!(available_bytes(), Some(limit));
-        // What remains of it is the limit less the job's committed memory (this process's).
-        let remaining = remaining_bytes().expect("the job's remaining memory");
-        let held = process_bytes().expect("the process's committed memory");
-        assert!(
-            remaining < limit && remaining + held <= limit + (64 << 20),
-            "{remaining}, {held}"
-        );
+        // What it leaves is the limit less what the job commits now (this process alone is in
+        // it): down by what is committed, and up again when that is freed, at each reading
+        // (Sol, measure-pool r1: a reading at a notification is not one now).
+        const COMMITTED: u64 = 256 << 20;
+        const SLACK: u64 = 64 << 20;
+        let left = || imp::job_left().expect("what the job leaves");
+        let follows = |when: &str| {
+            let before = left();
+            let held = process_bytes().expect("the process's committed memory");
+            assert!(
+                before + held <= limit + SLACK && before + SLACK >= limit - held,
+                "{when}: {before} left, {held} held, of {limit}"
+            );
+            let block = Vec::<u8>::with_capacity(COMMITTED as usize);
+            let during = left();
+            drop(std::hint::black_box(block));
+            let after = left();
+            assert!(
+                before - during >= COMMITTED - SLACK && after - during >= COMMITTED - SLACK,
+                "{when}: {before}, {during}, {after}"
+            );
+            assert!(remaining_bytes().is_some_and(|remaining| remaining <= after + SLACK));
+        };
+        follows("before a violation");
+        // The whole limit asked at once: the job refuses it (a violation of its limit).
+        let whole = std::alloc::Layout::from_size_align(limit as usize, 4096).expect("a layout");
+        // SAFETY: a layout of non-zero size; a block, if one were made, is freed with it.
+        unsafe {
+            let block = std::alloc::GlobalAlloc::alloc(&std::alloc::System, whole);
+            assert!(block.is_null(), "the job allowed its whole limit");
+        }
+        follows("after a violation");
     }
 
     /// A phase's peak is its window's or none: where no window starts (Windows keeps one peak
