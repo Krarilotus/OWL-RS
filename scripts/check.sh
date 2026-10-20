@@ -215,9 +215,20 @@ console() {
   fi
 }
 
+# Whether nrese-exec differs from where this branch left refactor/engine-v2, committed or
+# not (Miri's step): the upstream or the last commit alone would miss earlier commits of a
+# branch that has none. Without that history, it is taken to differ.
+exec_changed() {
+  local base
+  base=$(git merge-base HEAD origin/refactor/engine-v2 2>/dev/null) || return 0
+  ! git diff --quiet "$base" -- crates/nrese-exec ||
+    [ -n "$(git ls-files --others --exclude-standard -- crates/nrese-exec)" ]
+}
+
 # The files a commit or push changes. A merge commit: a file the same as on one side was
 # tested on that side; new is what differs from both (resolved conflicts, files both sides
 # changed). A push: everything since the upstream branch.
+
 changed_files() {
   if [ "$1" = commit ] && git rev-parse -q --verify MERGE_HEAD > /dev/null; then
     comm -12 <(git diff --name-only --cached HEAD | sort) <(git diff --name-only --cached MERGE_HEAD | sort)
@@ -293,14 +304,13 @@ case "$mode" in
         step test run_tests "${changed[@]}" "${dependents[@]}" -- "${dependents[@]}"
         step seeds run_seeds "${changed[@]}"
         step locks bash scripts/check-locks.sh
-        # nrese-exec's unsafe primitives under Miri (scripts/miri.sh), and its doc tests:
-        # the compile-fail rows that keep their misuse unwritable (a settled region grows).
-        if printf '%s
-' "${changed[@]}" | grep -qx nrese-exec; then
-          step miri bash scripts/miri.sh
-          step "doc tests (nrese-exec)" "$guarded" test --locked --doc -p nrese-exec
-        fi
       fi
+    fi
+    # nrese-exec's unsafe primitives under Miri (scripts/miri.sh), and its doc tests: the
+    # compile-fail rows that keep their misuse unwritable (a settled region grows).
+    if [ "$mode" = push ] && exec_changed; then
+      step miri bash scripts/miri.sh
+      step "doc tests (nrese-exec)" "$guarded" test --locked --doc -p nrese-exec
     fi
     side_steps "${files[@]}"
     ;;
