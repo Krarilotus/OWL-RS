@@ -275,7 +275,7 @@ pub fn kernel(name: &str, runs: usize) -> Result<String, Box<dyn std::error::Err
         let columns = [a.iter().copied(), b.iter().copied()];
         let mut table = nrese_exec::IdTable::gathered(2, rows, &budget, columns)?;
         let at = Instant::now();
-        table.sort_by(&[0, 1]);
+        table.sort_by(&[0, 1])?;
         table_times.push(at.elapsed());
         sorted &= (1..table.len()).all(|i| {
             (table.get(i - 1, 0), table.get(i - 1, 1)) <= (table.get(i, 0), table.get(i, 1))

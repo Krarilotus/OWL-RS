@@ -142,7 +142,9 @@ fn gap_releases_scratch_on_cancel_or_drop() {
             .unwrap();
         assert_eq!(pair.upper().len(), 1 << 16);
         assert!(!pair.upper().is_sorted_on(&[0, 1]));
-        let sort_scratch = pair.upper().memory_bytes() + pair.upper().len() * 24;
+        // The sort's working memory, charged to the gap's budget: the rows' order, and every
+        // column gathered anew at once (the parallel path).
+        let sort_scratch = pair.upper().len() * (4 + 8 * pair.upper().width());
         let mut expected = vec![ids(pair.upper(), 0), ids(pair.upper(), 1)];
         expected.sort();
         let before = budget.used();
