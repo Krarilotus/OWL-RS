@@ -854,8 +854,9 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
     ))
 }
 
-/// Deletes checkpoints older than `revision`. One still mapped can't be deleted on Windows
-/// ([`crate::mapped`]); it stays until a later checkpoint, and recovery reads the newest.
+/// Deletes checkpoints older than `revision`. One that can't be deleted (still mapped,
+/// where Windows refuses that: [`crate::mapped`]) stays until a later checkpoint, and
+/// recovery reads the newest.
 pub(crate) fn remove_older_than(dir: &Path, revision: u64) -> EngineResult<()> {
     fault::check(Step::RemoveOlder)?;
     for (checkpoint_revision, path) in list(dir)? {

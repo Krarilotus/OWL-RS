@@ -9,8 +9,11 @@
 //! Safety rests on the files never changing while mapped: a checkpoint is written to a
 //! temporary file, synced and renamed, never written again, and the engine holds the
 //! directory's lock. Deleting a mapped file (an older checkpoint) is fine on Unix, where
-//! the pages stay valid until unmapped; on Windows the deletion fails while it is mapped,
-//! and the file is removed at a later checkpoint.
+//! the pages stay valid until unmapped. Recent Windows behaves the same, with POSIX delete
+//! semantics: on Windows 11 with NTFS the deletion succeeds and the pages stay valid
+//! (checked 20 Oct 2026). Where Windows refuses instead (older versions, other file
+//! systems), the file is removed at a later checkpoint. Nothing depends on which: a failed
+//! deletion is retried, never needed.
 
 use std::fs::File;
 use std::marker::PhantomData;
