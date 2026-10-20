@@ -54,7 +54,8 @@ from verifykit.server import LaunchError, Server, sha256_of  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCTOR = ("/healthz", "/readyz", "/version", "/api/v1/repositories")
-CACHE = Path(os.environ.get("NRESE_VERIFY_CACHE", "~/fleet/cache/owlrs-verify")).expanduser()
+# The host's one cache, shared with the gates (Harness/notes/2026-10-20-host-cache-contract.md).
+CACHE = Path(os.environ.get("NRESE_VERIFY_CACHE", "~/fleet/cache/owlrs-gate")).expanduser()
 
 
 class Interrupted(Exception):
@@ -367,6 +368,8 @@ def target_of(args) -> dict:
                               "(submit its build job: verify.py jobs)")
         if sums.read_text().split()[0] != sha256_of(binary):
             raise LaunchError(f"{binary}: its checksum doesn't hold (SHA256SUMS): build it again")
+        # Its use, for the host cache's sweep (Harness/notes/2026-10-20-host-cache-contract.md §5).
+        (binary.parent / ".last-used").write_text(f"{int(time.time())}\n", encoding="utf-8")
     else:
         binary = Path(args.server).expanduser().resolve()
         if not binary.is_file():

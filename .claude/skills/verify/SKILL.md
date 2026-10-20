@@ -40,8 +40,9 @@ The scenario schema, the predicates and the evidence layout: `scripts/verify/REA
    asks for 0.5 GB (the example scenarios peaked at 55 MiB): declare more with `--ram-gb` when
    your scenarios hold more data; every summary records the peak.
 3. **Submit both** (`fleet submit BUILD RUN`). The build is a debug `nrese-server` at the
-   server commit, made on gamergrill (fleet can't stage a binary onto a WSL host), kept there in
-   `~/fleet/cache/owlrs-verify/bin-<sha12>/` and returned with `build.json`. A later build of the
+   server commit, made on gamergrill (fleet can't stage a binary onto a WSL host) in the host's
+   one cache, shared with the gates (`~/fleet/cache/owlrs-gate/`), kept there in `bin-<sha12>/`
+   and returned with `build.json`. A later build of the
    same commit only checks the binary's checksum. The run job comes after it: the self-test,
    then your scenarios.
 4. **On the notice**, `fleet results <run id> --to DIR`, then read
@@ -71,6 +72,7 @@ lifecycle` step 11 (after the restart: its settings) passed, job verify-run-…,
 
 ## Afterwards
 
-The runner removes each server's directory itself. The build step removes binaries of other
-commits unused for 7 days and other toolchains' target directories unused for 14 (exact paths
-under `~/fleet/cache/owlrs-verify/`). Cancel your jobs a newer run supersedes (`fleet list --mine`).
+The runner removes each server's directory itself. The host's cache is swept after every build by
+the rule the gates share (Harness/notes/2026-10-20-host-cache-contract.md): binaries unused for 7
+days, target directories and Python environments for 14, then the least recently used until it
+fits its budget; exact paths only. Cancel your jobs a newer run supersedes (`fleet list --mine`).

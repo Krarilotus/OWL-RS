@@ -5,8 +5,10 @@ host.
 The build runs there too: fleet stages only git inputs onto a WSL host (fleet-hosts copy.rs
 refuses artifacts there), so a binary built elsewhere can't reach it (the orchestrator's choice,
 20 Oct 2026). The build job's step is build-on-host.sh, sent inline, so the commit under test
-needn't have it; it leaves the binary at ~/fleet/cache/owlrs-verify/bin-<sha12>/ for the run
-jobs (and returns it with build.json), and a second build of the same commit only checks it.
+needn't have it; it builds in the host's one cache, shared with the gates
+(~/fleet/cache/owlrs-gate; Harness/notes/2026-10-20-host-cache-contract.md), and leaves the binary
+there in bin-<sha12>/ for the run jobs (and returns it with build.json); a second build of the
+same commit only checks it.
 The run job takes the harness (runner and scenarios) from its own checkout, which may be another
 commit than the server's: scenarios a fleet job runs must be committed there."""
 from __future__ import annotations
