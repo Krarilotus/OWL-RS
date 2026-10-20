@@ -48,7 +48,10 @@ fn peak_of(work: impl FnOnce()) -> usize {
 
 /// `rows` rows of one key value, sorted on it, with a second column.
 fn one_key(rows: usize) -> IdTable {
-    IdTable::from_columns(vec![vec![5; rows], (0..rows as u64).collect()]).assume_sorted_by(vec![0])
+    let columns: Vec<Vec<u64>> = vec![vec![5; rows], (0..rows as u64).collect()];
+    IdTable::gathered(2, rows, &budget(), columns)
+        .unwrap()
+        .assume_sorted_by(vec![0])
 }
 
 #[test]

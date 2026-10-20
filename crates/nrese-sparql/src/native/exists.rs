@@ -371,7 +371,7 @@ impl Context<'_> {
         for (variable, pattern) in &patterns {
             let mask = self.exists_mask(&solutions, pattern)?;
             let mut columns = std::mem::take(&mut solutions.table).into_columns();
-            columns.push(mask.iter().map(|&m| if m { yes } else { no }).collect());
+            columns.push(mask.iter().map(|&m| if m { yes } else { no }), &self.budget)?;
             solutions.table = IdTable::from_columns(columns);
             solutions.vars.push(variable.clone());
         }
@@ -662,7 +662,7 @@ impl Context<'_> {
         let row_variable = self.synthetic("left row");
         let mut numbered = left;
         let mut columns = std::mem::take(&mut numbered.table).into_columns();
-        columns.push((0..rows as u64).collect());
+        columns.push(0..rows as u64, &self.budget)?;
         numbered.table = IdTable::from_columns(columns);
         numbered.vars.push(row_variable.clone());
         let (lk, rk) = shared_columns(&numbered, &right);

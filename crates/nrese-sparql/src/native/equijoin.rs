@@ -51,26 +51,17 @@ fn only_itself(id: u64) -> bool {
     )
 }
 
-/// The rows of `solutions` that `keep` selects.
-fn rows_where(solutions: &Solutions, keep: &[bool]) -> Solutions {
-    let columns: Vec<Vec<u64>> = solutions
-        .table
-        .columns()
-        .iter()
-        .map(|column| {
-            column
-                .iter()
-                .zip(keep)
-                .filter(|&(_, &keep)| keep)
-                .map(|(&id, _)| id)
-                .collect()
-        })
-        .collect();
-    Solutions {
+/// The rows of `solutions` that `keep` selects, copied into a table charged to `budget`.
+fn rows_where(
+    solutions: &Solutions,
+    keep: &[bool],
+    budget: &std::sync::Arc<nrese_exec::Budget>,
+) -> Result<Solutions, nrese_exec::BudgetExceeded> {
+    Ok(Solutions {
         vars: solutions.vars.clone(),
-        table: IdTable::from_columns(columns),
+        table: solutions.table.selected(keep, true, budget)?,
         ordered: false,
-    }
+    })
 }
 
 impl Context<'_> {
@@ -91,15 +82,14 @@ impl Context<'_> {
         let by_id: Vec<bool> = ids.iter().map(|&id| same_term || only_itself(id)).collect();
         let by_value = !by_id.iter().all(|&joined| joined);
         // By id: `?b` as a copy of `?a`, then the pattern joined on `?b`.
-        let mut left = rows_where(&result, &by_id);
-        let copy = left.table.column(column).to_vec();
+        let mut left = rows_where(&result, &by_id, &self.budget)?;
         let mut columns = left.table.into_columns();
-        columns.push(copy);
+        columns.push_copy(column, &self.budget)?;
         left.vars.push(b.clone());
         left.table = IdTable::from_columns(columns);
         let crossed = by_value.then(|| {
             let keep: Vec<bool> = by_id.iter().map(|&joined| !joined).collect();
-            rows_where(&result, &keep)
+            rows_where(&result, &keep, &self.budget)
         });
         self.consumed(result);
         let left = self.produced(left)?;
@@ -111,7 +101,7 @@ impl Context<'_> {
             let scanned = self.scan(scan, Some(b))?;
             self.join(left, scanned)?
         };
-        let Some(crossed) = crossed else {
+        let Some(crossed) = crossed.transpose()? else {
             return Ok(joined);
         };
         // By value: rows with literals or triple terms against the pattern's such rows.
