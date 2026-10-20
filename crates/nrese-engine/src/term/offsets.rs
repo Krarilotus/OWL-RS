@@ -274,4 +274,32 @@ mod tests {
         assert_eq!(ends.len(), 2 * lengths.len() + 2 * BLOCK);
         assert!(<[u64] as Ends>::holding(&[3, 3, 7, 9][..], 0, 4, 3) == 2);
     }
+
+    /// [`encoded_bytes`], what a checkpoint charges for the offsets first, is what
+    /// [`encode`] allocates, at every width boundary: empty, partial, full and several
+    /// blocks, of keys around 65,536 bytes and up to `u32::MAX` (Sol's review, 20 Oct).
+    #[test]
+    fn encoded_bytes_are_what_encode_allocates() {
+        for count in [0, 1, 63, 64, 65, 128, 129] {
+            for length in [0, 1, 1023, 1024, 65535, 65536, u32::MAX / 64, u32::MAX] {
+                let lengths = vec![length; count];
+                match encode(&lengths) {
+                    Some((blocks, ends)) => {
+                        assert_eq!(
+                            encoded_bytes(&lengths),
+                            blocks.capacity() * 8 + ends.capacity(),
+                            "{count} keys of {length}"
+                        );
+                        assert_eq!(
+                            (blocks.len(), ends.len()),
+                            (blocks.capacity(), ends.capacity())
+                        );
+                    }
+                    None => assert!(lengths.chunks(BLOCK).any(|block| {
+                        block.iter().map(|&n| u64::from(n)).sum::<u64>() > u64::from(u32::MAX)
+                    })),
+                }
+            }
+        }
+    }
 }
