@@ -294,6 +294,134 @@ fn a_hidden_assertion_committed_later_does_not_change_what_a_reader_derives() {
     assert_eq!(seen(), before, "retracted from secret");
 }
 
+/// A fact asserted only in a graph the reader can't read is shown to it as inferred only
+/// where it follows without that assertion: a cycle back through the fact itself is no
+/// derivation (review r1 of item 18 part 1, F3). `C ⊑ D` and `D ⊑ C` turn the hidden
+/// `alice a C` into `alice a D` and back, and `sameAs` symmetry does the same; with an
+/// independent public proof the fact is shown. Both modes.
+#[test]
+fn a_hidden_assertion_does_not_derive_itself() {
+    const OWL: &str = "PREFIX owl: <http://www.w3.org/2002/07/owl#>";
+    // (what `open` holds, what `secret` asserts, the ASK, whether `open` derives it)
+    let rows = [
+        (
+            "ex:C rdfs:subClassOf ex:D . ex:D rdfs:subClassOf ex:C",
+            "ex:alice a ex:C",
+            "ASK { ex:alice a ex:C }",
+            false,
+        ),
+        (
+            "ex:alice ex:marker ex:bob",
+            "ex:alice owl:sameAs ex:bob",
+            "ASK { ex:alice owl:sameAs ex:bob }",
+            false,
+        ),
+        (
+            "ex:C rdfs:subClassOf ex:D . ex:D rdfs:subClassOf ex:C .
+             ex:Human rdfs:subClassOf ex:C . ex:alice a ex:Human",
+            "ex:alice a ex:C",
+            "ASK { ex:alice a ex:C }",
+            true,
+        ),
+    ];
+    for by_support in [false, true] {
+        for (open, secret, ask, derived) in rows {
+            let store = StoreService::new(in_memory_store_config()).unwrap();
+            store
+                .execute_update(&SparqlUpdateRequest::new(format!(
+                    "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {OWL}
+                     INSERT DATA {{ GRAPH ex:open {{ {open} }} GRAPH ex:secret {{ {secret} }} }}"
+                )))
+                .unwrap();
+            store.rematerialise(Ruleset::Owl2Rl).unwrap();
+            store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+            let answer = select(&store, &reader(by_support), &format!("{OWL} {ask}"));
+            assert_eq!(
+                answer.contains("true"),
+                derived,
+                "by support {by_support}: {secret} with {open}: {answer}"
+            );
+        }
+    }
+}
+
+/// The same across commits: when a commit removes the public proof while the fact still
+/// stands through its own hidden assertion (and the cycle back to it), it leaves the
+/// reader's view; when the proof comes back, so does the fact. `alice a X` stays derived
+/// through the cycle, so the commit changes no inferred statement and one step from the
+/// removed fact doesn't reach `alice a C`: the update follows the whole forward cone.
+#[test]
+fn a_hidden_assertion_left_without_its_public_proof_leaves_the_view() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_store::{MutationCommand, MutationPipeline, MutationTicket, Requester};
+    let pipeline = MutationPipeline::new(
+        Arc::new(StoreService::new(in_memory_store_config()).unwrap()),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    let apply = |update: &str| {
+        pipeline
+            .apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                    "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {update}"
+                ))),
+                &Requester::all(),
+                &MutationTicket::new(),
+            )
+            .unwrap();
+    };
+    apply(
+        "INSERT DATA { ex:Human rdfs:subClassOf ex:X . ex:X rdfs:subClassOf ex:C .
+                       ex:C rdfs:subClassOf ex:X .
+                       GRAPH ex:open { ex:alice a ex:Human } GRAPH ex:secret { ex:alice a ex:C } }",
+    );
+    let seen = || -> Vec<bool> {
+        [reader(true), reader(false)]
+            .iter()
+            .map(|scope| {
+                select(pipeline.store(), scope, "ASK { ex:alice a ex:C }").contains("true")
+            })
+            .collect()
+    };
+    assert_eq!(seen(), [true, true], "derived from open");
+    apply("DELETE DATA { GRAPH ex:open { ex:alice a ex:Human } }");
+    assert_eq!(seen(), [false, false], "only through itself");
+    apply("INSERT DATA { GRAPH ex:open { ex:alice a ex:Human } }");
+    assert_eq!(seen(), [true, true], "derived from open again");
+}
+
+/// A restricted read whose query is cancelled while its view is computed fails as
+/// cancelled (the request's time running out cancels it too), never with fewer
+/// statements: the view's computation stops at its first round, so no re-derived facts or
+/// view are made. Nothing of it is kept, so the next read answers.
+#[test]
+fn a_cancelled_restricted_read_fails_and_leaves_nothing_behind() {
+    use nrese_store::{CancellationToken, PreparedQuery, QueryEvaluationError, StoreError};
+    let store = store();
+    let scope = reader(false);
+    let prepared = PreparedQuery::parse(&SparqlQueryRequest::new(
+        format!("PREFIX ex: <{EX}> SELECT ?c WHERE {{ ex:a a ?c }}"),
+        scope.clone(),
+    ))
+    .unwrap();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let before = store.support_statistics();
+    let result = store.run_query(&prepared, &cancelled, &mut Vec::new());
+    assert!(
+        matches!(
+            result,
+            Err(StoreError::SparqlEvaluation(
+                QueryEvaluationError::Cancelled
+            ))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(store.support_statistics(), before, "the view was computed");
+    assert_eq!(classes(&store, &scope, "a"), ["<D>", "<E>", "<F>"]);
+}
+
 /// Without rules registered the sets can't be computed: no inferred statement is shown.
 #[test]
 fn without_rules_nothing_inferred_is_shown() {

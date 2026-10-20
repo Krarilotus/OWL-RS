@@ -426,20 +426,22 @@ impl StoreService {
         let snapshot = self.engine.snapshot();
         match access {
             Some(access) if needs_view(&snapshot, access) => {
-                self.view_of(&snapshot, Some(access), &self.settings.envelope(None))
+                self.view_of(&snapshot, Some(access), &self.settings.envelope(None), None)
             }
             _ => Ok(snapshot),
         }
     }
 
     /// [`Self::read_snapshot`] for a request, its view's working memory charged to the
-    /// request's envelope `memory`.
+    /// request's envelope `memory`; cancelling the request (its time running out) stops
+    /// the view's computation with the request's cancellation error.
     pub(crate) fn read_snapshot_within(
         &self,
         access: Option<&std::sync::Arc<nrese_sparql::GraphAccess>>,
         memory: &nrese_exec::Envelope,
+        cancellation: &CancellationToken,
     ) -> StoreResult<nrese_engine::Snapshot> {
-        self.view_of(&self.engine.snapshot(), access, memory)
+        self.view_of(&self.engine.snapshot(), access, memory, Some(cancellation))
     }
 
     /// [`Self::read_snapshot_within`] of `snapshot`, a committed revision. The
@@ -450,13 +452,16 @@ impl StoreService {
         snapshot: &nrese_engine::Snapshot,
         access: Option<&std::sync::Arc<nrese_sparql::GraphAccess>>,
         memory: &nrese_exec::Envelope,
+        cancellation: Option<&CancellationToken>,
     ) -> StoreResult<nrese_engine::Snapshot> {
         match access {
-            Some(access) if needs_view(snapshot, access) => {
-                Ok(self
-                    .supports
-                    .view(snapshot, access, self.support_compilation(), memory)?)
-            }
+            Some(access) if needs_view(snapshot, access) => Ok(self.supports.view(
+                snapshot,
+                access,
+                self.support_compilation(),
+                memory,
+                cancellation,
+            )?),
             _ => Ok(snapshot.clone()),
         }
     }
@@ -735,7 +740,7 @@ impl StoreService {
                         let snapshot = match read {
                             Read::Lower(snapshot) | Read::At(snapshot) => snapshot,
                             Read::Latest => {
-                                self.read_snapshot_within(prepared.access(), &memory)?
+                                self.read_snapshot_within(prepared.access(), &memory, cancellation)?
                             }
                         };
                         let context = format!("{dl} {status:?}");
@@ -756,7 +761,7 @@ impl StoreService {
                 };
             return Ok((Some(detail), None));
         }
-        let snapshot = self.read_snapshot_within(prepared.access(), &memory)?;
+        let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
         let ql = run_query(
             &snapshot,
             prepared,
@@ -841,7 +846,7 @@ impl StoreService {
             .register(prepared.text(), prepared.origin(), cancellation);
         let memory = self.settings.query_envelope(prepared);
         let mut explanation = explain_prepared(
-            &self.read_snapshot_within(prepared.access(), &memory)?,
+            &self.read_snapshot_within(prepared.access(), &memory, cancellation)?,
             prepared,
             &self.settings,
             cancellation,
@@ -983,7 +988,7 @@ impl StoreService {
                 // graphs the reader can't read, and derived) stays unless the operations
                 // assert it where the reader reads it.
                 let memory = self.settings.envelope(None);
-                let base = self.view_of(tx.base(), Some(access), &memory)?;
+                let base = self.view_of(tx.base(), Some(access), &memory, None)?;
                 let left = |quad: &nrese_engine::EncodedQuad| match tx
                     .base()
                     .contains_in(ReadModel::Inferred, quad)
@@ -1511,7 +1516,7 @@ impl StoreService {
     ) -> StoreResult<bool> {
         if by_support(access) {
             let [s, p, o] = fact.map(nrese_engine::TermId::from_raw);
-            let view = self.view_of(snapshot, Some(access), &self.settings.envelope(None))?;
+            let view = self.view_of(snapshot, Some(access), &self.settings.envelope(None), None)?;
             Ok(view.contains_in(
                 ReadModel::Inferred,
                 &nrese_engine::EncodedQuad::new(s, p, o, nrese_engine::TermId::DEFAULT_GRAPH),
