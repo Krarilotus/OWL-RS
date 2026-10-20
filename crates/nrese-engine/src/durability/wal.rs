@@ -78,7 +78,14 @@ pub(crate) struct SegmentContents {
 }
 
 pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
-    let bytes = fs::read(path)?;
+    read_open_segment(&mut File::open(path)?, path)
+}
+
+/// [`read_segment`] of a segment already open (`path` names it in errors): what it holds
+/// stays readable while the log releases or archives it.
+pub(crate) fn read_open_segment(file: &mut File, path: &Path) -> EngineResult<SegmentContents> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(file, &mut bytes)?;
     if bytes.len() < SEGMENT_MAGIC.len() {
         // Crash while creating the segment: treat it as empty and torn.
         return Ok(SegmentContents {
