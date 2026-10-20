@@ -80,6 +80,19 @@ const TRAINING_BYTES: usize = 6 << 20;
 /// same test.
 const CODEC_HELD: usize = 384 << 10;
 
+/// A codec with the charge of its tables ([`CODEC_HELD`]), which it frees before the charge
+/// is released, however its owner goes.
+pub(crate) struct Trained<'b> {
+    codec: Codec,
+    _held: Reservation<&'b Budget>,
+}
+
+impl Trained<'_> {
+    pub(crate) fn codec(&self) -> &Codec {
+        &self.codec
+    }
+}
+
 /// Keys to train a codec on, one after another, charged to a budget as they grow.
 pub(crate) struct Sample<'b> {
     bytes: ChargedVec<u8, &'b Budget>,
@@ -124,17 +137,19 @@ impl Codec {
         for key in keys {
             sample.push(key).expect("no limit");
         }
-        Self::train_within(&sample, &budget).expect("no limit").0
+        Self::train_within(&sample, &budget)
+            .expect("no limit")
+            .codec
     }
 
     /// Tables trained on `sample` (plain keys), rebuilt from their stored form, everything
     /// it allocates charged to `budget` first: the keys' rests sorted to their tables, and
-    /// FSST's training ([`TRAINING_BYTES`]); then the codec ([`CODEC_HELD`]), held as long
-    /// as it lives (the reservation returned).
+    /// FSST's training ([`TRAINING_BYTES`]); then the codec's tables ([`CODEC_HELD`]), held
+    /// as long as it lives.
     pub(crate) fn train_within<'b>(
         sample: &Sample<'_>,
         budget: &'b Budget,
-    ) -> Result<(Self, Reservation<&'b Budget>), BudgetExceeded> {
+    ) -> Result<Trained<'b>, BudgetExceeded> {
         let mut held = Reservation::new(budget);
         held.charge(TRAINING_BYTES)?;
         let iri = |key: &&[u8]| key.first() == Some(&TAG_IRI);
@@ -149,14 +164,14 @@ impl Codec {
             others,
             sample.keys().filter(|key| !iri(key)).map(rest),
         )?;
-        // FSST trains on a vector; the rests' charge is released after it is freed.
-        let ((iris, iris_held), (others, others_held)) = (iris.into_parts(), others.into_parts());
+        // FSST trains on a vector: each paired with its charge, which a tuple releases after
+        // it frees the vector.
+        let (iris, others) = (iris.into_parts(), others.into_parts());
         let trained = Self {
-            iri: Compressor::train(&iris),
-            other: Compressor::train(&others),
+            iri: Compressor::train(&iris.0),
+            other: Compressor::train(&others.0),
         };
         drop((iris, others));
-        drop((iris_held, others_held));
         let mut stored = Vec::with_capacity(CODEC_BYTES);
         trained.write(&mut stored);
         drop(trained);
@@ -164,7 +179,7 @@ impl Codec {
         // Rebuilt, it holds its tables only.
         drop(stored);
         held.resize(CODEC_HELD)?;
-        Ok((codec, held))
+        Ok(Trained { codec, _held: held })
     }
 
     /// Every `count / SAMPLE`-th of `count` entries: the keys to train on.
