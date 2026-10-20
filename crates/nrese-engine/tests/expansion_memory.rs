@@ -68,8 +68,10 @@ fn an_expansion_holds_no_more_than_it_charges() {
     for size in [1, 10, 100, 1_000] {
         let snapshot = snapshot(size);
         let budget = Arc::new(Budget::unlimited());
-        let reader = snapshot.reading_within(Arc::clone(&budget));
         let (read, excess) = measure::measure_within(&budget, || {
+            let reader = snapshot
+                .reading_within(Arc::clone(&budget))
+                .expect("an unlimited budget");
             let mut scan = Reservation::new(&*budget);
             scan.charge(reader.scan_bytes(ReadModel::Materialised))
                 .expect("an unlimited budget");
@@ -88,7 +90,9 @@ fn an_expansion_holds_no_more_than_it_charges() {
     }
     let snapshot = snapshot(1_000);
     let budget = Arc::new(Budget::new(1024));
-    let reader = snapshot.reading_within(Arc::clone(&budget));
+    let reader = snapshot
+        .reading_within(Arc::clone(&budget))
+        .expect("room for the reader");
     let read = reader
         .quads_for_pattern_in(ReadModel::Materialised, &QuadPattern::all())
         .count();
@@ -96,5 +100,29 @@ fn an_expansion_holds_no_more_than_it_charges() {
         reader.read_refused().is_some(),
         "a read of {read} statements in 1,024 bytes"
     );
+    drop(reader);
     assert_eq!(budget.used(), 0);
+}
+
+/// The reader's own state, shared by its snapshots and scans, is charged before it is made
+/// and released once freed; a budget without room for it refuses the reader.
+#[test]
+fn a_readers_state_is_charged() {
+    if !measure::alone() {
+        return;
+    }
+    let snapshot = snapshot(1);
+    let budget = Arc::new(Budget::unlimited());
+    let (reader, excess) = measure::measure_within(&budget, || {
+        snapshot
+            .reading_within(Arc::clone(&budget))
+            .expect("an unlimited budget")
+    });
+    assert_eq!(excess, 0, "{excess} bytes beyond the charge");
+    let copy = reader.clone();
+    drop(reader);
+    assert!(budget.used() > 0, "released while a handle lives");
+    drop(copy);
+    assert_eq!(budget.used(), 0);
+    assert!(snapshot.reading_within(Arc::new(Budget::new(8))).is_err());
 }
