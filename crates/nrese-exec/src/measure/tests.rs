@@ -288,17 +288,28 @@ fn a_measurement_counts_what_was_made_while_it_ran() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// What the one running measurement counts as live now.
+fn live_now() -> i128 {
+    RUNNING
+        .iter()
+        .find(|slot| slot.since.load(SeqCst) != 0)
+        .map_or(0, |slot| slot.with(|_, c| c.live))
+}
+
 /// The global pool's threads have started before a measurement on another pool opens:
 /// one starting in it would be counted (its crossbeam-epoch handle, 2,304 bytes, made as
 /// it first looks for work). They are held at their start, after the pool is built (which
 /// waits for each thread's queue) and before that first look, until the measurement has
-/// opened, or for a second if the measurement waits for them first.
+/// opened, or for a second if the measurement waits for them first. The measurement then
+/// waits for their handles to be counted, for at most 2 seconds: where they were made
+/// before it, as they must be, it waits all of that.
 #[test]
 fn the_global_pool_has_started_before_a_measurement_on_another() {
     use std::time::{Duration, Instant};
     static OPEN: AtomicBool = AtomicBool::new(false);
     static STARTED: AtomicUsize = AtomicUsize::new(0);
     const THREADS: usize = 4;
+    const HANDLE: i128 = 2_304;
     if !alone() {
         return;
     }
@@ -329,12 +340,33 @@ fn the_global_pool_has_started_before_a_measurement_on_another() {
             while STARTED.load(SeqCst) < THREADS {
                 spin_loop();
             }
-            // Past their start, to their first look for work.
-            std::thread::sleep(Duration::from_millis(50));
+            let since = Instant::now();
+            while live_now() < THREADS as i128 * HANDLE && since.elapsed() < Duration::from_secs(2)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
         })
     });
     opener.join().unwrap();
     assert_eq!(counted, 0, "global threads started in the measurement");
+}
+
+/// A first measurement made on a thread of the global pool returns: preparing it waits for
+/// a broadcast to every thread of that pool, its own included (Sol, measure-pool r1: with
+/// one thread, it waited for ever).
+#[test]
+fn a_first_measurement_on_a_global_thread_returns() {
+    use std::time::Duration;
+    if !alone() {
+        return;
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build_global()
+        .unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    rayon::spawn(move || sent.send(measure(|| ()).1).unwrap());
+    assert_eq!(received.recv_timeout(Duration::from_secs(10)), Ok(0));
 }
 
 /// A measured test runs alone under cargo test too when it is ignored, or should panic.
