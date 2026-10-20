@@ -9,6 +9,7 @@
 //!     [--rules FILE.n3] [--reason-runs 1] [--results DIR] [--routes] [--commits FILE]
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
 //!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC] [--read-graphs IRI,...]
+//! cargo run --release -p nrese-store --example perf_lab -- --durable NAME --store DIR [--runs 5]
 //! cargo run --release -p nrese-store --example perf_lab -- generate KIND OUT [key=value]...
 //! ```
 //!
@@ -73,6 +74,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+mod durable;
 mod generate;
 mod modes;
 
@@ -257,6 +259,8 @@ struct Args {
     count_allocations: bool,
     parse_only: bool,
     kernel: Option<String>,
+    /// `--durable NAME`: the durable engine's own costs ([`durable`]).
+    durable: Option<String>,
     classify: bool,
     prepare_vector_graph: Option<(usize, nrese_engine::vector::Metric)>,
     read_graphs: Vec<String>,
@@ -298,6 +302,7 @@ fn parse_args() -> Result<Args, String> {
         count_allocations: false,
         parse_only: false,
         kernel: None,
+        durable: None,
         classify: false,
         prepare_vector_graph: None,
         read_graphs: Vec::new(),
@@ -372,6 +377,7 @@ fn parse_args() -> Result<Args, String> {
             "--count-allocations" => args.count_allocations = true,
             "--parse-only" => args.parse_only = true,
             "--kernel" => args.kernel = Some(value()?),
+            "--durable" => args.durable = Some(value()?),
             "--classify" => args.classify = true,
             "--read-graphs" => args.read_graphs = value()?.split(',').map(str::to_owned).collect(),
             "--prepare-vector-graph" => {
@@ -1032,6 +1038,13 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         ..config
     };
     COUNT_ALLOCATIONS.store(args.count_allocations, Ordering::Relaxed);
+    if let Some(name) = &args.durable {
+        let root = args.store.as_ref().ok_or("--durable needs --store DIR")?;
+        report
+            .sections
+            .push(("durable", durable::durable(name, root, args.runs)?));
+        return Ok(());
+    }
     if let Some(kernel) = &args.kernel {
         report
             .sections
