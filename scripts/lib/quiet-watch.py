@@ -192,12 +192,47 @@ def containers(token: str) -> list[tuple[str, str]]:
     return found
 
 
+def fsync_dir(directory: Path):
+    """Makes a directory's entries durable (a file created, renamed or removed in it)."""
+    try:
+        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def journal(frozen: Path, line: str):
-    """Records a suspension before it is made: appended, flushed, synced."""
+    """Records a suspension before it is made: appended, flushed, synced (and the directory too
+    when the journal is new, so its entry survives a power loss)."""
+    created = not frozen.exists()
     with open(frozen, "a", encoding="utf-8") as f:
         f.write(line + "\n")
         f.flush()
         os.fsync(f.fileno())
+    if created:
+        fsync_dir(frozen.parent)
+
+
+def rewrite(frozen: Path, lines: list[str]):
+    """Replaces the journal with `lines` whole or not at all: a synced temporary file renamed over
+    it, then the directory synced. Truncating it in place lost the records of a crash midway
+    (Sol, 20 Oct 2026)."""
+    temporary = frozen.with_name(f"{frozen.name}.{os.getpid()}.new")
+    try:
+        with open(temporary, "w", encoding="utf-8") as f:
+            f.write("".join(f"{line}\n" for line in lines))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, frozen)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    fsync_dir(frozen.parent)
 
 
 def alive(fd: int) -> bool:
@@ -288,9 +323,10 @@ def resume(state: Path) -> list[str]:
         elif line.strip():
             left.append(line)
     if left:
-        path.write_text("".join(f"{line}\n" for line in left), encoding="utf-8")
+        rewrite(path, left)
     else:
         path.unlink()
+        fsync_dir(path.parent)
     return left
 
 

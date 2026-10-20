@@ -144,6 +144,32 @@ class Watch(unittest.TestCase):
                 self.assertEqual(watch.resume(Path(tmp)), ["pid 31 777 boot-1"])
             self.assertEqual(bare, [])
 
+    @unittest.skipUnless(hasattr(watch.signal, "SIGCONT"), "POSIX signals (the watcher runs on Linux)")
+    def test_a_journal_is_replaced_whole_or_not_at_all_and_its_directory_synced(self):
+        """Sol, 20 Oct 2026: the unsettled lines were written over the journal in place, so a
+        crash midway left it empty, and the next resume deleted it and reported success."""
+        with tempfile.TemporaryDirectory() as tmp:
+            frozen = Path(tmp) / "frozen"
+            synced = []
+            with patch.object(watch, "fsync_dir", lambda d: synced.append(Path(d)), create=True):
+                watch.journal(frozen, "pid 51")  # no start time: never settled
+                watch.journal(frozen, "container abc")
+            self.assertEqual(synced, [Path(tmp)])  # the new journal's entry, once
+            whole = frozen.read_text()
+
+            def crash(src, dst):
+                raise OSError("injected crash before the rename")
+            with patch.object(watch.subprocess, "run", lambda *a, **k: watch.subprocess.CompletedProcess(a, 0, "", "")), \
+                    patch.object(watch.os, "replace", crash):
+                with self.assertRaises(OSError):
+                    watch.resume(Path(tmp))
+            self.assertEqual(frozen.read_text(), whole)  # the old journal, whole
+            self.assertEqual(sorted(p.name for p in Path(tmp).iterdir()), ["frozen"])
+            with patch.object(watch.subprocess, "run", lambda *a, **k: watch.subprocess.CompletedProcess(a, 0, "", "")), \
+                    patch.object(watch, "fsync_dir", lambda d: synced.append(Path(d)), create=True):
+                self.assertEqual(watch.resume(Path(tmp)), ["pid 51"])
+            self.assertEqual((frozen.read_text(), synced[-1]), ("pid 51\n", Path(tmp)))
+
     @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
     def test_the_journal_comes_first_and_a_resume_continues_only_the_process_it_recorded(self):
         """COT-14 (20 Oct 2026): the suspension came before its record, and the record was a bare
