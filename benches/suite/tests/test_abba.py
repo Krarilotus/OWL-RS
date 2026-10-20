@@ -7,6 +7,7 @@ had no interleaved A-A' arm, or checked counts instead of content.
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -60,15 +61,19 @@ class Abba(unittest.TestCase):
         self.path.write_text(FAMILY, encoding="utf-8")
         self.family = abba.load_family(self.path)
 
-    def round_(self, records_of, name="r1", drop=lambda p: False, manifest=True, host="phuoc-yu"):
-        """A round's results as a job leaves them: the manifest of its check, its passes."""
+    def round_(self, records_of, name="r1", drop=lambda p: False, manifest=True, host="phuoc-yu", k=1):
+        """Round k's results as its job leaves them: the manifest of its check, its passes (after
+        round k - 1's)."""
         out = Path(self.tmp.name) / name
         (out / "passes").mkdir(parents=True)
         for p in fixture.passes(records_of, blocks=6, sides=abba.SIDES):
+            later = (k - 1) * 10 ** 9
+            for item in [p["report"], *p["report"]["records"]]:
+                item.update(started_ns=item["started_ns"] + later, finished_ns=item["finished_ns"] + later)
             if not drop(p):
                 (out / "passes" / p["path"]).write_text(json.dumps(p["report"]), encoding="utf-8")
         if manifest:
-            (out / "abba-manifest.json").write_text(json.dumps(abba.manifest_of(self.family, fixture.HARNESS, 1, host)),
+            (out / "abba-manifest.json").write_text(json.dumps(abba.manifest_of(self.family, fixture.HARNESS, k, host)),
                                                     encoding="utf-8")
         return out
 
@@ -122,10 +127,25 @@ systems = []
             abba.load_family(self.path)
         self.assertIn("no content check", "\n".join(refused.exception.args[0]))
 
-    def test_a_loss_is_shown_in_one_round_and_confirmed_by_two(self):
+    def test_a_loss_is_shown_in_one_round_and_confirmed_by_another(self):
         one = self.round_(records(b=1.08), name="loss1")
         self.assertEqual(self.verdict(one)[0], abba.LOSS_SHOWN)
-        self.assertEqual(self.verdict(one, self.round_(records(b=1.08), name="loss2"))[0], abba.CONFIRMED)
+        two = self.round_(records(b=1.08), name="loss2", k=2)
+        self.assertEqual(self.verdict(one, two)[0], abba.CONFIRMED)
+        # Sol r1: the same round given twice confirmed its loss. Neither it, nor a copy of it
+        # renamed round 2, nor the rounds out of order is a confirmation.
+        copy = Path(self.tmp.name) / "copy"
+        shutil.copytree(one, copy)
+        manifest = json.loads((copy / "abba-manifest.json").read_text(encoding="utf-8"))
+        manifest.update(round=2, session="another")
+        (copy / "abba-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        for case, rounds, why in (("twice", (one, one), "round 1's directory again"),
+                                  ("a copy", (one, copy), "round 1's evidence again"),
+                                  ("out of order", (two, one), "its manifest says round 2")):
+            with self.subTest(case):
+                code, text = self.verdict(*rounds)
+                self.assertEqual(code, abba.NO_VERDICT, text)
+                self.assertIn(why, text)
 
     def test_the_jobs_time_every_block_on_one_host_with_the_a_a_arm(self):
         found = abba.jobs(self.family, B, ROOT.as_posix(), "office-pc")
