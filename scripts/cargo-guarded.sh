@@ -147,18 +147,24 @@ if [ -r "/proc/$$/winpid" ] && command -v powershell >/dev/null 2>&1; then
   read -r winpid < "/proc/$$/winpid"
   read -r sum _ < <(sha256sum "$ROOT/scripts/lib/memory-cap.ps1")
   cap_exe="/tmp/nrese-memory-cap/memory-cap-${sum:0:12}.exe"
-  if [ -x "$cap_exe" ]; then
-    cap=("$cap_exe" "$winpid" "${NRESE_MEMORY_CAP_GB:-0}" ${registry:+"$registry"})
-  else
-    cap=(powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$ROOT/scripts/lib/memory-cap.ps1")"
-      -ProcessId "$winpid" -LimitGB "${NRESE_MEMORY_CAP_GB:-0}" ${registry:+-Registry "$registry"})
-  fi
-  if JOB=$("${cap[@]}"); then
+  by_powershell=(powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$ROOT/scripts/lib/memory-cap.ps1")"
+    -ProcessId "$winpid" -LimitGB "${NRESE_MEMORY_CAP_GB:-0}" ${registry:+-Registry "$registry"})
+  # The cached program, else memory-cap.ps1 (which builds it); a cached one that fails is built
+  # again, once (Sol, 20 Oct 2026: a corrupt one would otherwise be trusted at every build).
+  again=()
+  [ -x "$cap_exe" ] && again=(-Rebuild)
+  if { [ -x "$cap_exe" ] && JOB=$("$cap_exe" "$winpid" "${NRESE_MEMORY_CAP_GB:-0}" ${registry:+"$registry"}); } \
+      || JOB=$("${by_powershell[@]}" "${again[@]}"); then
     JOB=${JOB%$'\r'}
     [ -z "$registry" ] || registered="$GUARD_DIR/jobs/$JOB"
+  elif [ "${NRESE_MEMORY_CAP_GB:-0}" -gt 0 ]; then
+    # A cap was asked for: no build without it.
+    printf 'cargo %s: the %s GB memory cap could not be applied (scripts/lib/memory-cap.ps1): not building\n' \
+      "$*" "$NRESE_MEMORY_CAP_GB" >&2
+    exit 1
   else
     JOB=""
-    printf 'memory cap not applied; building uncapped\n' >&2
+    printf 'no memory cap asked for, and the build job could not be named: the PC guard cannot tell this build it stopped it\n' >&2
   fi
 fi
 
@@ -363,13 +369,17 @@ code=$?
 set -e
 killed="${NRESE_GUARD_KILLED:-$HOME/owlrs-guard/killed.log}"
 if [ "$code" -ne 0 ] && { [ -f "$killed" ] || [ -f "$BUSY" ]; }; then
+  # A deadline by the clock (microseconds), not by turns of the loop: what is first seen after it
+  # doesn't count, however late a turn ran (Sol, 20 Oct 2026).
+  now_us() { printf '%s\n' "${EPOCHREALTIME/[.,]/}"; }
+  deadline=$(( $(now_us) + ${NRESE_GUARD_NOTICE_WAIT_S:-10} * 1000000 ))
   notices=$(guard_notices)
-  waited=0
   while ! grep -q '^stopped ' <<< "$notices" && { [ -f "$BUSY" ] || grep -q '^pending' <<< "$notices"; } \
-      && [ "$waited" -lt "${NRESE_GUARD_NOTICE_WAIT_S:-10}" ]; do
+      && [ "$(now_us)" -lt "$deadline" ]; do
     sleep 1
-    waited=$((waited + 1))
-    notices=$(guard_notices)
+    seen=$(guard_notices)
+    [ "$(now_us)" -le "$deadline" ] || break
+    notices=$seen
   done
   stopped=$(sed -n 's/^stopped //p' <<< "$notices" | tr '\n' ' ')
   if [ -n "$stopped" ]; then
