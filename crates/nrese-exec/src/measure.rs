@@ -76,6 +76,16 @@
 //! outside more than 62 times, or a pool of its own from outside, allocates a queue block
 //! of 1,520 bytes per 63 entries, which it counts.
 //!
+//! And a pool's threads as they start: each allocates its own queue (1,520 bytes) and, as
+//! it first looks for work, its crossbeam-epoch handle (2,304), on its own thread, when the
+//! system runs it, which under load can be well after the pool was made. [`prepare`] waits
+//! for every thread of the global pool to start before the first measurement, from outside
+//! any pool, whatever pool that measurement runs on: input built on the global pool, then
+//! a measurement on another, counted the global threads that started late, in pairs of
+//! those sizes (the GeoSPARQL guard's rare excess, attributed 20 Oct). A pool of a test's
+//! own is the test's: rule, start its threads before measuring (`pool.broadcast(|_| ())`),
+//! or a measurement counts those that start in it.
+//!
 //! Counts are `i128`: a `usize` converts exactly, and no sum of them reaches its bounds.
 //! A realloc counts the new block, then frees the old: it may move the bytes. Measurements
 //! nest (up to 8 at once); one that unwinds ends as one that returns, and no thread reads
@@ -412,6 +422,10 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
 /// - parking_lot's table, which grows with the threads that park at once and never shrinks:
 ///   once per process, before the first measurement, threads at least twice the machine's
 ///   and 8 more park at once;
+/// - the global pool's threads, and the pool's the first measurement runs on, each of which
+///   allocates its state as it starts (see "Known limits"): once per process, before the
+///   first measurement, each has run a broadcast, the global pool's sent from outside any
+///   pool;
 /// - rayon's global queue, which allocates its next block on the 63rd entry from outside
 ///   the pool: before each measurement made outside the pool (nested ones too), empty
 ///   entries until one allocates its block (at most 63, about a millisecond), uncounted by
@@ -448,9 +462,20 @@ fn prepare() {
                     });
                 }
             });
-            // The global pool started, and the entering thread's state made.
-            rayon::broadcast(|_| ());
-            rayon::join(|| (), || ());
+            // The pool entered started, every thread of it too (a broadcast returns when each
+            // has run it), and the entering thread's state made. The global pool's from
+            // outside any pool, as a broadcast reaches the pool it is made on: from another,
+            // the global pool's threads would start when the system runs them.
+            let warm = || {
+                rayon::broadcast(|_| ());
+                rayon::join(|| (), || ());
+            };
+            if rayon::current_thread_index().is_some() {
+                std::thread::scope(|scope| {
+                    scope.spawn(warm);
+                });
+            }
+            warm();
         });
     }
     if rayon::current_thread_index().is_none() {
