@@ -181,21 +181,28 @@ fi
 # Admission, one queue per machine (the main PC's guard stopped 47 of our processes at its hard
 # line between 12:17 and 12:33 on 20 Oct 2026: builds started whatever the memory). A cargo run
 # starts only when
-# - the machine isn't busy: no ~/owlrs-guard/BUSY (NRESE_GUARD_BUSY), the guard's soft line;
-# - it is first in line (first come, first served, across every worktree and agent);
+# - no run that came before it could start now (first come, first served, across every worktree
+#   and agent; a run waiting for room for its own peak holds up no one who fits: on 20 Oct 2026 a
+#   `cargo check` that couldn't start headed the line and stalled every hook behind it);
 # - fewer than NRESE_BUILD_SLOTS runs (default 3) hold a slot; and
 # - its declared peak fits: free memory, less the peaks the runs already admitted declared, less
-#   its own, stays at or above the floor: NRESE_BUILD_FLOOR_GB, by default the guard's soft line
-#   (16 GB) where the guard runs (~/owlrs-guard), else 0.
+#   its own, stays at or above the floor: NRESE_BUILD_FLOOR_GB, by default the guard's kill line
+#   plus a 4 GB margin where the guard runs (~/owlrs-guard), else 0. The kill line is read from
+#   the guard's script (NRESE_GUARD_SCRIPT, its `$hard = ($ram -lt N)`), else taken as 4 GB, as
+#   it is today: an 8 GB floor. (Its soft line, 16 GB, was the floor before: the agents' own load
+#   keeps the main PC at 12-16 GB free, so no hook on a merged base could start, 20 Oct 2026.)
+# The guard's BUSY (~/owlrs-guard/BUSY, NRESE_GUARD_BUSY: below its soft line) holds no run whose
+# peak fits above the floor; the agents' own load keeps it set for hours. A build's disk is
+# checked by the build itself (NRESE_MIN_FREE_GB, above).
 # Its peak: NRESE_BUILD_PEAK_GB, else 0.6 GB per compiler job (1.2 GB for release code, fat LTO)
 # and 2 GB for the linker and the tests it runs. When that doesn't fit, it runs with fewer jobs
 # (2 at least) unless CARGO_BUILD_JOBS was given; else it waits. A run whose least peak exceeds
-# the machine's memory less the floor never fits: it is refused at once (exit 2), never left
-# heading the queue. Admitted, it holds its slot for the whole cargo run, compiling and running
-# tests alike, until cargo ends.
+# the machine's memory less the floor never fits: it is refused at once (exit 2). Admitted, it
+# holds its slot for the whole cargo run, compiling and running tests alike, until cargo ends.
 #
-# It never builds anyway: it waits, saying its place in line every minute. Only at a terminal does
-# it give up, after NRESE_BUILD_SLOT_WAIT_S (default 3600 s), with exit 75. Inside a fleet job's
+# It never builds anyway: it waits, saying its place in line every minute, and gives up after
+# NRESE_BUILD_SLOT_WAIT_S (default 3600 s at a terminal, 1800 s without one: a hook, which no one
+# can interrupt and which holds the commit slot) with exit 75, nothing built. Inside a fleet job's
 # slice (FLEET_SLICE) the fleet admitted the job by its ask and the slice holds it there: no
 # admission here. NRESE_BUILD_SLOTS=0 switches it off. Waits go to tmp/guard-slots.log.
 #
@@ -204,7 +211,22 @@ fi
 ADMIT="${NRESE_BUILD_SLOT_DIR:-$HOME/.nrese-build-slots}"
 SLOTS="${NRESE_BUILD_SLOTS:-3}"
 BUSY="${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}"
-if [ -d "${BUSY%/*}" ]; then floor_default=16; else floor_default=0; fi
+floor_default=0
+# (A Windows path's separators too: with them unread, the guard looked absent and the floor was 0.)
+busy_posix=${BUSY//\\//}
+if [ -d "${busy_posix%/*}" ]; then
+  kill_line=4
+  guard_script="${NRESE_GUARD_SCRIPT:-$HOME/Desktop/Harness/tools/main-pc-guard/guard.ps1}"
+  if [ -r "$guard_script" ]; then
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^[[:space:]]*\$hard[[:space:]]*=[[:space:]]*\(\$ram[[:space:]]+-lt[[:space:]]+([0-9]+)\) ]]; then
+        kill_line=${BASH_REMATCH[1]}
+        break
+      fi
+    done < "$guard_script"
+  fi
+  floor_default=$(( kill_line + 4 ))
+fi
 FLOOR_MB=$(( ${NRESE_BUILD_FLOOR_GB:-$floor_default} * 1024 ))
 per_job_mb=614
 previous=""
@@ -273,26 +295,35 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
   fi
   mkdir -p "$ADMIT/queue" "$ADMIT/run"
   ticket="$ADMIT/queue/${EPOCHREALTIME/[.,]/}000-$ME"
-  printf '%s cargo %s\n' "$ROOT" "$*" > "$ticket"
-  waited=0 said=-60 limit="${NRESE_BUILD_SLOT_WAIT_S:-3600}"
+  # Its least peak (MiB) first: what a later run reads to tell whether it could start now.
+  printf '%s %s cargo %s\n' "$least" "$ROOT" "$*" > "$ticket"
+  waited=0 said=-60 since=$SECONDS
+  if [ -t 2 ]; then limit=${NRESE_BUILD_SLOT_WAIT_S:-3600}; else limit=${NRESE_BUILD_SLOT_WAIT_S:-1800}; fi
   while :; do
     lock_admission
     for t in "$ADMIT"/queue/*; do if [ -e "$t" ] && ! holds "${t##*-}"; then rm -f "$t"; fi; done
     for r in "$ADMIT"/run/*; do if [ -e "$r" ] && ! holds "${r##*/}"; then rm -rf "$r"; fi; done
-    place=1
-    for t in "$ADMIT"/queue/*; do if [[ -e "$t" && "$t" < "$ticket" ]]; then place=$((place + 1)); fi; done
     running=0 others=0
     for r in "$ADMIT"/run/*; do
       if [ -e "$r/peak" ]; then read -r held < "$r/peak"; running=$((running + 1)); others=$((others + held)); fi
     done
     read_memory
     room=$(( FREE_MB - FLOOR_MB - others ))
+    # Its place, and the runs before it that could start now (a ticket without a peak, of an
+    # earlier version of this script, is taken to).
+    place=1 ahead=0
+    for t in "$ADMIT"/queue/*; do
+      if [[ -e "$t" && "$t" < "$ticket" ]]; then
+        place=$((place + 1))
+        theirs=""
+        read -r theirs _ < "$t" 2> /dev/null || true
+        if ! [[ "$theirs" =~ ^[0-9]+$ ]] || [ "$theirs" -le "$room" ]; then ahead=$((ahead + 1)); fi
+      fi
+    done
     peak=$(peak_of "$CARGO_BUILD_JOBS")
     why=""
-    if [ -f "$BUSY" ]; then
-      why="the machine is busy ($(cat "$BUSY" 2>/dev/null || true))"
-    elif [ "$place" -gt 1 ]; then
-      why="$((place - 1)) waiting before it"
+    if [ "$ahead" -gt 0 ]; then
+      why="$ahead waiting before it"
     elif [ "$running" -ge "$SLOTS" ]; then
       why="all $SLOTS build slots are taken"
     elif [ "$peak" -gt "$room" ]; then
@@ -303,6 +334,7 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
         peak=$(peak_of "$fit")
       else
         why="it may peak at $((peak / 1024)) GB; $(( room > 0 ? room / 1024 : 0 )) GB are free above the $((FLOOR_MB / 1024)) GB floor"
+        [ ! -f "$BUSY" ] || why="$why; the machine is busy ($(cat "$BUSY" 2>/dev/null || true))"
       fi
     fi
     if [ -z "$why" ]; then
@@ -319,12 +351,14 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
       printf 'waiting to build, place %s in line: %s\n' "$place" "$why" >&2
       said=$waited
     fi
-    if [ -t 2 ] && [ "$waited" -ge "$limit" ]; then
-      printf 'no room to build after %s s; try again later, or build on the fleet\n' "$waited" >&2
+    if [ "$waited" -ge "$limit" ]; then
+      rm -f "$ticket"
+      printf 'cargo %s: not built: no room to build after %s s (%s); try again later, or build on the fleet\n' \
+        "$*" "$waited" "$why" >&2
       exit 75
     fi
-    sleep 5
-    waited=$((waited + 5))
+    sleep "${NRESE_BUILD_SLOT_POLL_S:-5}"
+    waited=$((SECONDS - since))
   done
   if [ "$waited" -gt 0 ]; then
     mkdir -p "$ROOT/tmp"
