@@ -277,3 +277,60 @@ fn the_report_is_an_rdf_graph() {
     assert_eq!(graph.len(), 2);
     assert!(empty.conforms());
 }
+
+/// `$PATH` is the property shape's path where it is a triple pattern's predicate, and only
+/// there (SHACL §5.2): a literal and a longer name keep their text, and any other use is
+/// ill-formed. A sequence path joins through its middle nodes as the path written there
+/// would: each solution is one result, so two ways to the same value are two results.
+#[test]
+fn path_is_substituted_only_as_a_predicate() {
+    let literal = "ex:a ex:p \"$PATH\" .";
+    let two_ways = "ex:a ex:p ex:m1, ex:m2 . ex:m1 ex:q ex:z . ex:m2 ex:q ex:z .";
+    for (data, path, query, expected) in [
+        (
+            literal,
+            "ex:p",
+            r#"SELECT $this ?value WHERE { $this $PATH ?value FILTER(STR(?value) != "$PATH") }"#,
+            Ok(0),
+        ),
+        (
+            literal,
+            "ex:p",
+            "SELECT $this ?value WHERE { $this $PATH ?value
+               OPTIONAL { ?value <http://example.com/q> ?PATHX } FILTER(!BOUND(?PATHX)) }",
+            Ok(1),
+        ),
+        (
+            literal,
+            "ex:p",
+            "SELECT $this ?value WHERE { $this $PATH ?value . ?value <http://example.com/q> $PATH }",
+            Err("other than as a predicate"),
+        ),
+        (
+            two_ways,
+            "( ex:p ex:q )",
+            "SELECT $this ?value WHERE { $this $PATH ?value }",
+            Ok(2),
+        ),
+    ] {
+        let engine = engine(
+            data,
+            &format!(
+                "ex:S sh:targetNode ex:a ; sh:property [ sh:path {path} ; sh:sparql [ sh:select '''{query}''' ] ] ."
+            ),
+        );
+        let snapshot = engine.snapshot();
+        match (compile(&snapshot, shapes_selection(&snapshot)), expected) {
+            (Ok(shapes), Ok(results)) => {
+                let report = validate(&snapshot, &shapes, DEFAULT);
+                assert!(report.failures.is_empty(), "{query}: {:?}", report.failures);
+                assert_eq!(report.results.len(), results, "{query}");
+            }
+            (Err(errors), Err(problem)) => assert!(
+                errors.iter().any(|error| error.message.contains(problem)),
+                "{query}: {errors:?}"
+            ),
+            (outcome, _) => panic!("{query}: {:?}", outcome.map(|shapes| shapes.len())),
+        }
+    }
+}
