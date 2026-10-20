@@ -237,3 +237,77 @@ fn inferred_views_are_charged_for_all_they_hold() {
     }
     assert!(charged[1] > 4 * charged[0], "{charged:?}");
 }
+
+/// A view or mask refused anywhere in its making holds nothing past its charge, and nothing
+/// once refused: every budget from none to what it needs, for a view of kept statements, a
+/// mask stacked on an earlier one, and the view of such a mask. Its charge is taken before
+/// anything it covers is made, so no refusal releases it while the caller still owns a run
+/// (review r1 of item 18 part 1, F5). What the earlier masks hold is charged elsewhere and
+/// made before the measurement.
+#[test]
+fn inferred_views_refused_anywhere_free_before_they_release() {
+    if !measure::alone() {
+        return;
+    }
+    let store = Engine::new(quiet()).unwrap();
+    let mut tx = store.transaction();
+    let s = tx.intern(node("s").as_ref().into());
+    let p = tx.intern(node("p").as_ref().into());
+    for i in 0..200 {
+        let o = tx.intern(node(&format!("o{i}")).as_ref().into());
+        tx.insert_inferred(EncodedTriple {
+            subject: s,
+            predicate: p,
+            object: o,
+        });
+    }
+    tx.commit().unwrap();
+    let snapshot = store.snapshot();
+    let mut quads: Vec<EncodedQuad> = snapshot
+        .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+        .collect();
+    quads.sort_unstable();
+    let (seen, missed) = quads.split_at(100);
+    let (earlier, later) = missed.split_at(50);
+    let unlimited = Arc::new(Budget::unlimited());
+    // The masks a later one stacks on and a view reads, charged elsewhere.
+    let first = InferredMask::hiding(&snapshot, earlier, &unlimited).unwrap();
+    let second = first.changed(&snapshot, later, &[], &unlimited).unwrap();
+    let only = |budget: &Arc<Budget>| snapshot.with_inferred_only(seen, budget).map(drop);
+    let stacked = |budget: &Arc<Budget>| first.changed(&snapshot, later, &[], budget).map(drop);
+    let viewed = |budget: &Arc<Budget>| {
+        snapshot
+            .with_inferred_mask(&second, budget)
+            .map(|view| drop(view.expect("the stack's layout")))
+    };
+    type Make<'a> = &'a dyn Fn(&Arc<Budget>) -> Result<(), nrese_exec::BudgetExceeded>;
+    let makes: [(&str, Make); 3] = [("only", &only), ("stacked", &stacked), ("viewed", &viewed)];
+    for (name, make) in makes {
+        // The most it charges at once: every budget below it refuses somewhere.
+        let needed = {
+            let budget = Arc::new(Budget::unlimited());
+            make(&budget).unwrap();
+            budget.peak()
+        };
+        let (mut refused, mut made) = (0, 0);
+        for limit in (0..=needed + 8).step_by(4) {
+            let budget = Arc::new(Budget::new(limit));
+            let (result, excess) = measure::measure_within(&budget, || make(&budget));
+            refused += usize::from(result.is_err());
+            made += usize::from(result.is_ok());
+            assert_eq!(
+                excess, 0,
+                "{name} within {limit} bytes: {excess} past the charge"
+            );
+            assert_eq!(
+                budget.used(),
+                0,
+                "{name} within {limit} bytes: still charged"
+            );
+        }
+        assert!(
+            refused > 0 && made > 0,
+            "{name}: {refused} refused, {made} made"
+        );
+    }
+}
