@@ -1,6 +1,8 @@
-"""The suite's runner keeps a test that runs git out of the repository a calling git names
-(isolation.py). 20 Oct 2026: under the commit hook, tests that ran git emptied two commits and
-moved a branch of the repository being committed to."""
+"""The suite's runner keeps a test that runs git out of the repository, the configuration and the
+hooks a calling git names (isolation.py). 20 Oct 2026: under the commit hook, tests that ran git
+emptied two commits and moved a branch of the repository being committed to; a caller's
+configuration (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG_COUNT) set core.hooksPath and ran
+an outside hook in a test's own repository (Sol)."""
 from __future__ import annotations
 
 import os
@@ -15,39 +17,54 @@ INNER_TEST = '''
 import subprocess, tempfile, unittest
 
 class Inner(unittest.TestCase):
-    def test_commits_in_its_own_repository(self):
+    def test_commits_in_its_own_repository_with_the_suite_s_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
-            git = lambda *a: subprocess.run(["git", "-C", tmp, "-c", "user.name=t", "-c", "user.email=t@t", *a],
-                                            capture_output=True, text=True, check=True).stdout
+            git = lambda *a: subprocess.run(["git", "-C", tmp, *a], capture_output=True, text=True,
+                                            check=True).stdout.strip()
             git("init", "-q")
-            git("commit", "-q", "--allow-empty", "-m", "inner")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "inner")
             git("checkout", "-q", "-b", "elsewhere")
             self.assertIn("inner", git("log", "--oneline"))
+            self.assertEqual(git("config", "user.name"), "suite test")
+            self.assertTrue(git("config", "core.hooksPath").endswith("/hooks"))
 '''
 
 
 class Isolation(unittest.TestCase):
-    def test_a_test_running_git_under_a_hook_leaves_the_outer_repository_alone(self):
+    def test_a_test_running_git_under_a_hook_touches_neither_the_outer_repository_nor_its_hooks(self):
         clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         with tempfile.TemporaryDirectory() as tmp:
-            outer, inner = Path(tmp) / "outer", Path(tmp) / "inner"
-            outer.mkdir()
-            inner.mkdir()
+            tmp = Path(tmp)
+            outer, inner, hooks = tmp / "outer", tmp / "inner", tmp / "outside-hooks"
+            for d in (outer, inner, hooks):
+                d.mkdir()
             git = lambda *a: subprocess.run(["git", "-C", str(outer), "-c", "user.name=t", "-c", "user.email=t@t",  # noqa: E731
-                                             *a], capture_output=True, text=True, env=clean, check=True).stdout
+                                             "-c", "core.hooksPath=", *a], capture_output=True, text=True, env=clean,
+                                            check=True).stdout
             git("init", "-q")
             git("commit", "-q", "--allow-empty", "-m", "outer")
             state = lambda: (git("for-each-ref"), git("rev-parse", "HEAD"), git("symbolic-ref", "HEAD"),  # noqa: E731
                              (outer / ".git" / "index").read_bytes() if (outer / ".git" / "index").exists() else b"")
             before = state()
+            # An outside hook a caller's configuration names: it marks where it ran.
+            marker = tmp / "hook-ran"
+            (hooks / "pre-commit").write_text(f"#!/bin/sh\necho ran > '{marker.as_posix()}'\n", encoding="utf-8",
+                                              newline="\n")
+            (hooks / "pre-commit").chmod(0o755)
+            config = tmp / "caller.gitconfig"
+            config.write_text(f"[core]\n\thooksPath = {hooks.as_posix()}\n", encoding="utf-8")
             (inner / "test_inner.py").write_text(INNER_TEST, encoding="utf-8")
-            # What a commit hook's environment names: the outer repository, its index, its tree.
+            # What a commit hook's environment can name: the outer repository, its index and tree,
+            # a namespace, and configuration of every level.
             hook = {**clean, "GIT_DIR": str(outer / ".git"), "GIT_INDEX_FILE": str(outer / ".git" / "index"),
-                    "GIT_WORK_TREE": str(outer)}
+                    "GIT_WORK_TREE": str(outer), "GIT_NAMESPACE": "caller", "GIT_CONFIG_GLOBAL": str(config),
+                    "GIT_CONFIG_SYSTEM": str(config), "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.hooksPath",
+                    "GIT_CONFIG_VALUE_0": hooks.as_posix()}
             done = subprocess.run([sys.executable, str(ISOLATION), "discover", "-s", str(inner)], env=hook,
                                   capture_output=True, text=True, timeout=120)
-            self.assertEqual(done.returncode, 0, done.stderr[-800:])
+            self.assertFalse(marker.exists(), "an outside hook ran in a test's repository")
             self.assertEqual(state(), before)
+            self.assertEqual(done.returncode, 0, done.stderr[-800:])
 
 
 if __name__ == "__main__":
