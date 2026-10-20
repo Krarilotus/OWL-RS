@@ -730,6 +730,14 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     if candidate not in sides:
         raise ValueError(f"the candidate {candidate} is no declared side")
     baselines = [s for s in sides if s != candidate]
+    # A baseline of an earlier baseline's revision (a confirmation job's main that is its base):
+    # one build, timed once as that one (release-gate.sh block); it is that side here, and its
+    # hypotheses are that side's, not declared twice.
+    aliases = {}
+    for k, s in enumerate(baselines):
+        same = next((t for t in baselines[:k] if sides[t] == sides[s] and t not in aliases), None)
+        if same is not None:
+            aliases[s] = same
     context = dict(context or {})
     summary = {"candidate": {"name": candidate, "revision": sides[candidate]},
                "baselines": {s: sides[s] for s in baselines}, "harness": harness,
@@ -749,7 +757,8 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     if len(baselines) < 1:
         summary["errors"].append("no baseline")
     status_only = {c["name"] for c in (catalog or []) if c.get("outcome", "ok") != "ok"}
-    summary["errors"] += schedule_errors(passes, list(sides), min_blocks, status_only,
+    summary["aliases"] = aliases
+    summary["errors"] += schedule_errors(passes, [s for s in sides if s not in aliases], min_blocks, status_only,
                                          int(context.get("layouts", 1) or 1))
     planned = sorted({c for p in passes for c in p["report"].get("planned_cases", [])})
     summary["planned"] = planned
@@ -772,7 +781,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
         if cand["unchecked"] and state(cand) != "failed":
             summary["candidate_failures"][case] = f"{cand['unchecked']} checks unchecked on the candidate"
         for side in baselines:
-            if state(cand) == "failed":
+            if state(cand) == "failed" or side in aliases:
                 continue
             row = compare_case(cand, evidence(by_side[side], case), side, checks.get(case, set()),
                                ((floor or {}).get("cases") or {}).get(case))
@@ -787,7 +796,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
         summary["blocking"].append(f"{case}: the candidate fails ({why})")
     for case, why in not_run.items():
         summary["blocking"].append(f"{case}: not run ({why})")
-    declared = list(family) if family is not None else [
+    declared = [h for h in family if h.split("|", 1)[0] not in aliases] if family is not None else [
         hypothesis(side, case, d) for side, rows in summary["comparisons"].items()
         for case, row in rows.items() for d in row["dimensions"]]
     summary["family"] = declared
@@ -838,7 +847,9 @@ def render(summary: dict) -> str:
     blocks = sorted({p["block"] for p in summary["passes"] if p.get("block") is not None}, key=str)
     lines = [f"# Release gate round {summary['context'].get('round', 0)}: {c['name']} {c['revision']}", "",
              f"Against {', '.join(f'{s} {r}' for s, r in summary['baselines'].items())}; harness {summary['harness']}; "
-             f"host {', '.join(map(str, summary['host']))}; {len(blocks)} blocks, {len(summary['passes'])} side-runs.", "",
+             f"host {', '.join(map(str, summary['host']))}; {len(blocks)} blocks, {len(summary['passes'])} side-runs."
+             + "".join(f" {s} is {t}'s build (one revision): timed once, as {t}; its hypotheses are {t}'s."
+                       for s, t in summary.get("aliases", {}).items()), "",
              f"**{verdict_}.** Each declared hypothesis (case x series or metric x baseline: {len(summary['family'])}) "
              "gets a one-sided p-value of a loss from its block contrasts (layouts the outer unit); a loss counts "
              f"when two consecutive rounds show it and Holm over the family rejects at {gatestats.ALPHA} "
@@ -1340,7 +1351,8 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
         + [[*gate_, "prepare", harness]] + ([[*gate_, "pack", base, main, candidate, harness]] if big_host else []),
         "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": 12}, "inputs": source,
         **({"outputs": [{"name": "binaries", "path": "binaries"}]} if big_host else {})}}
-    per_block = 2 if small else 60  # minutes, the three sides' two runs of every case
+    # minutes, the three sides' two runs of every case (a main that is the base isn't timed again)
+    per_block = (2 if small else 60) * (2 + (main != base)) / 3
     count = blocks_per_round
     steps = [[*gate_, "plan-blocks", harness]] if measure else []
     if measure:
