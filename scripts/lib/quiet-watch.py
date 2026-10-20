@@ -204,15 +204,15 @@ def containers(token: str) -> list[tuple[str, str]]:
 
 
 def fsync_dir(directory: Path):
-    """Makes a directory's entries durable (a file created, renamed or removed in it)."""
-    try:
-        fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-    except OSError:
+    """Makes a directory's entries durable (a file created, renamed or removed in it), and raises
+    when it can't: a suspension never follows a journal that wasn't committed (Sol, 20 Oct 2026:
+    the failure was swallowed and SIGSTOP sent). Windows can't open a directory to sync it and
+    journals its entries itself: there, nothing to do."""
+    if os.name == "nt":
         return
+    fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
         os.fsync(fd)
-    except OSError:
-        pass
     finally:
         os.close(fd)
 
@@ -391,7 +391,11 @@ def watch(state: Path, root: int, token: str) -> int:
                         say(f"a running container that isn't ours (not paused): {cid} {ns_label or 'unlabelled'}")
                     continue
                 if cid not in paused:
-                    journal(frozen, f"container {cid}")
+                    try:
+                        journal(frozen, f"container {cid}")
+                    except OSError as error:
+                        say(f"not paused: {cid}'s record couldn't be committed ({error})")
+                        continue
                     paused.add(cid)
                     if subprocess.run(["docker", "pause", cid], capture_output=True).returncode == 0:
                         say(f"paused container {cid} (ours)")
