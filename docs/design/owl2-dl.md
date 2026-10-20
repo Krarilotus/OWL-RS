@@ -828,9 +828,10 @@ inputs, so every OWL 2 DL ontology up to a bound is checked, not a sample of the
   up to size 4, chosen greedily until every pair (349 cases) and every triple of the 67
   features (3,354 cases, all 47,905 triples) occurs; a tuple the batches leave gets many
   aimed tries of its own.
-- **In the gate:** the scope `3,3` (35,505 cases) against the references' recorded answers
-  (`crates/nrese-dl/tests/scope`, the push tier, 10 s), its one-axiom part (8,578 cases) in
-  the commit tier (`tests/scope_one`, 5 s).
+- **In the gate:** the scope `3,3` (35,505 cases) against the references' recorded answers,
+  each case once: its one-axiom part (8,578 cases) in the commit tier
+  (`crates/nrese-dl/tests/scope_one`), the rest (26,927 cases) in the push tier
+  (`tests/scope`).
 
 The campaigns and their adjudications are in `benches/reasoning/dl/README.md`.
 

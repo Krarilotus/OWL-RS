@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, HashMap};
 use nrese_dl::classify;
 use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
 use nrese_owl::{Make, Term, Vocabulary};
-use nrese_store::ReadScope;
+use nrese_store::{ReadScope, Refusal, StoreError};
 
 use super::{insert, pipeline};
 
@@ -95,9 +95,24 @@ fn a_horn_ontology_is_classified_by_the_context_core_and_follows_commits() {
 #[test]
 fn classification_needs_a_scope_that_reads_everything() {
     let dl = pipeline();
+    insert(&dl, ":A rdfs:subClassOf :B . :x a :A .").expect("ontology");
     let restricted = ReadScope::Graphs(std::sync::Arc::new(Default::default()));
-    assert!(dl.store().classify(&restricted).is_err());
-    assert!(dl.store().realise(&restricted).is_err());
+    type Operation = fn(&nrese_store::StoreService, &ReadScope) -> Result<(), StoreError>;
+    let operations: [(&str, Operation); 2] = [
+        ("classification", |store, scope| {
+            store.classify(scope).map(drop)
+        }),
+        ("realisation", |store, scope| store.realise(scope).map(drop)),
+    ];
+    for (name, operation) in operations {
+        operation(dl.store(), &ReadScope::All).expect(name);
+        match operation(dl.store(), &restricted) {
+            Err(StoreError::Forbidden(refusal)) => {
+                assert_eq!(refusal, Refusal::ReadAll(name.to_owned()))
+            }
+            other => panic!("{name}: not refused: {other:?}"),
+        }
+    }
 }
 
 /// Term ids for a generated ontology, with their N-Triples text.
