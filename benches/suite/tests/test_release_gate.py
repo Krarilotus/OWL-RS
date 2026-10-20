@@ -656,6 +656,20 @@ printf "no linker" > "$d/release/other"; lld_of "$d" 2>/dev/null || echo not-lld
         with self.assertRaises(SystemExit):
             fast.select([{"name": "a", "area": "query"}], SimpleNamespace(cases="", areas=None))
 
+    def test_a_block_that_work_not_its_own_disturbed_is_noted_in_the_report(self):
+        """COT-13 (20 Oct 2026): the watcher no longer stops work that isn't the job's own; it
+        leaves it running and records it, and the report says which blocks it disturbed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for n, verdict in ((1, {"verdict": "quiet", "samples": 30, "unowned_share": 0.0}),
+                               (2, {"verdict": "disturbed", "samples": 30, "unowned_share": 0.4,
+                                    "not_resumed": ["pid 51"]})):
+                (Path(tmp) / f"quiet-block-{n}.json").write_text(json.dumps(verdict), encoding="utf-8")
+            verdicts, notes = gate_module.quiet_verdicts(Path(tmp))
+        self.assertEqual(sorted(verdicts), [1, 2])
+        self.assertEqual(len(notes), 2)
+        self.assertTrue(notes[0].startswith("block 2: disturbed") and "40%" in notes[0], notes)
+        self.assertIn("not resumed", notes[1])
+
     def test_report_writes_markdown_and_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
