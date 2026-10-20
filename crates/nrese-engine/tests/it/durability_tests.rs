@@ -207,6 +207,196 @@ fn corruption_before_the_tail_is_an_error_not_data_loss() {
     }
 }
 
+/// The frames of a WAL segment: (start, end) of each, after the 8-byte magic.
+fn frames(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let mut frames = Vec::new();
+    let mut at = 8;
+    while at < bytes.len() {
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        frames.push((at, at + 8 + len));
+        at += 8 + len;
+    }
+    frames
+}
+
+/// Damage to the one segment of a three-commit log, by the sync policy it was written
+/// under: truncated where the write never landed whole (or the policy allows losing the last
+/// commits), refused as corruption where acknowledged records may be lost, naming the last
+/// intact revision; `recover_until` at it then keeps the intact part.
+#[test]
+fn wal_damage_is_truncated_or_refused_by_its_evidence() {
+    type Damage = fn(&mut Vec<u8>, &[(usize, usize)]);
+    let flip_first: Damage = |bytes, frames| bytes[frames[0].0 + 12] ^= 1;
+    let flip_last: Damage = |bytes, frames| bytes[frames[2].0 + 12] ^= 1;
+    let zero_tail: Damage = |bytes, _| bytes.extend_from_slice(&[0; 40]);
+    let zero_end: Damage = |bytes, frames| bytes[frames[2].1 - 8..frames[2].1].fill(0);
+    let long_length: Damage = |bytes, frames| {
+        bytes[frames[1].0..frames[1].0 + 4].copy_from_slice(&u32::MAX.to_le_bytes())
+    };
+    let every = SyncPolicy::EveryCommit;
+    let buffered = SyncPolicy::OsBuffered;
+    // (case, policy, sidecar kept, damage, recover_until, Ok(revision opened) or
+    // Err(the last intact revision the refusal names))
+    type Row = (
+        &'static str,
+        SyncPolicy,
+        bool,
+        Damage,
+        Option<u64>,
+        Result<u64, u64>,
+    );
+    let rows: [Row; 10] = [
+        (
+            "damage before intact records",
+            every,
+            true,
+            flip_first,
+            None,
+            Err(0),
+        ),
+        (
+            "the same, under os-buffered",
+            buffered,
+            true,
+            flip_first,
+            None,
+            Err(0),
+        ),
+        (
+            "cut before the damage",
+            every,
+            true,
+            flip_first,
+            Some(0),
+            Ok(0),
+        ),
+        ("a zero-filled tail", every, true, zero_tail, None, Ok(3)),
+        (
+            "a damaged length over an intact record",
+            every,
+            true,
+            long_length,
+            None,
+            Err(1),
+        ),
+        (
+            "a synced last record damaged",
+            every,
+            true,
+            flip_last,
+            None,
+            Err(2),
+        ),
+        (
+            "cut before the damaged last record",
+            every,
+            true,
+            flip_last,
+            Some(2),
+            Ok(2),
+        ),
+        (
+            "a last record whose end never landed",
+            every,
+            true,
+            zero_end,
+            None,
+            Ok(2),
+        ),
+        (
+            "a last record damaged under os-buffered",
+            buffered,
+            true,
+            flip_last,
+            None,
+            Ok(2),
+        ),
+        (
+            "a last record damaged, no policy recorded",
+            every,
+            false,
+            flip_last,
+            None,
+            Ok(2),
+        ),
+    ];
+    for (case, sync, sidecar, damage, until, expected) in rows {
+        let dir = tempfile::tempdir().unwrap();
+        let written = EngineConfig {
+            durability: DurabilityConfig {
+                sync,
+                ..config().durability
+            },
+            ..config()
+        };
+        {
+            let engine = Engine::open(dir.path(), written).unwrap();
+            commit_all(&engine, &batches(0..3));
+        }
+        let segment = &segments(dir.path())[0];
+        let mut bytes = fs::read(segment).unwrap();
+        let at = frames(&bytes);
+        assert_eq!(at.len(), 3, "{case}");
+        damage(&mut bytes, &at);
+        fs::write(segment, bytes).unwrap();
+        if !sidecar {
+            let mut meta = segment.clone().into_os_string();
+            meta.push(".meta");
+            fs::remove_file(meta).unwrap();
+        }
+        let reopen = EngineConfig {
+            durability: DurabilityConfig {
+                recover_until: until,
+                ..written.durability
+            },
+            ..written
+        };
+        match (Engine::open(dir.path(), reopen), expected) {
+            (Ok(engine), Ok(revision)) => assert_eq!(engine.stats().revision, revision, "{case}"),
+            (Err(EngineError::Corruption(why)), Err(intact)) => assert!(
+                why.contains(&format!("intact through revision {intact};")),
+                "{case}: {why}"
+            ),
+            (other, expected) => panic!(
+                "{case}: expected {expected:?}, got {:?}",
+                other.map(|e| e.stats().revision)
+            ),
+        }
+    }
+}
+
+/// A segment holds commits of one sync policy: reopening under another starts a new one,
+/// and each records its own.
+#[test]
+fn a_new_sync_policy_starts_a_new_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let under = |sync| EngineConfig {
+        durability: DurabilityConfig {
+            sync,
+            ..config().durability
+        },
+        ..config()
+    };
+    for (sync, commits) in [
+        (SyncPolicy::EveryCommit, 0..2),
+        (SyncPolicy::OsBuffered, 2..3),
+    ] {
+        let engine = Engine::open(dir.path(), under(sync)).unwrap();
+        commit_all(&engine, &batches(commits));
+    }
+    let policies: Vec<String> = segments(dir.path())
+        .iter()
+        .map(|segment| {
+            let mut meta = segment.clone().into_os_string();
+            meta.push(".meta");
+            fs::read_to_string(meta).unwrap()
+        })
+        .collect();
+    assert_eq!(policies, ["sync=every-commit\n", "sync=os-buffered\n"]);
+    let engine = Engine::open(dir.path(), under(SyncPolicy::OsBuffered)).unwrap();
+    assert_eq!(engine.stats().revision, 3);
+}
+
 #[test]
 fn crash_during_checkpoint_keeps_the_previous_state() {
     let dir = tempfile::tempdir().unwrap();

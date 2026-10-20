@@ -38,9 +38,12 @@
 //! read.
 //!
 //! A checkpoint is written from a [`Snapshot`], so writers keep committing while it is being
-//! written. It is streamed to `checkpoint-<revision>.tmp`, synced, and atomically renamed
-//! to `checkpoint-<revision>.nck`; a crash at any point leaves either the old or the new
-//! checkpoint, never a partial one. Leftover `.tmp` files are deleted on open.
+//! written. It is streamed to `checkpoint-<revision>.tmp` and synced ([`Written`]), then
+//! atomically renamed to `checkpoint-<revision>.nck` and the directory synced
+//! ([`Written::commit`]); a crash at any point leaves either the old or the new checkpoint,
+//! never a partial one. Leftover `.tmp` files are deleted on open. In between, the written
+//! file can already be mapped: a bulk load's commit point is that rename
+//! ([`crate::engine::bulk`]), and nothing fallible needs to follow it.
 
 use std::borrow::Cow;
 use std::fs::{self, File};
@@ -50,6 +53,7 @@ use std::path::{Path, PathBuf};
 use rayon::prelude::*;
 
 use super::codec::{Reader, put_u32, put_u64};
+use super::fault::{self, Step};
 use crate::engine::{Snapshot, Stack};
 use crate::error::{EngineError, EngineResult};
 use crate::index::keys::PackedKeys;
@@ -441,8 +445,86 @@ pub(crate) fn exists(dir: &Path, revision: u64) -> bool {
     checkpoint_path(dir, revision, EXTENSION).exists()
 }
 
-/// Writes a checkpoint of `snapshot` and returns its path.
-pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
+/// A checkpoint written and synced under its temporary name, not yet in place. Dropped
+/// without [`commit`](Self::commit), the file goes.
+pub(crate) struct Written {
+    dir: PathBuf,
+    tmp: PathBuf,
+    revision: u64,
+    /// Cleared once renamed.
+    pending: bool,
+}
+
+/// Why [`Written::commit`] failed.
+pub(crate) enum Uncommitted {
+    /// The checkpoint is not in place.
+    No(EngineError),
+    /// It may be: the rename failed with the target there, or the directory didn't sync.
+    Unknown(std::io::Error),
+}
+
+impl Written {
+    fn new(dir: &Path, revision: u64) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            tmp: checkpoint_path(dir, revision, "tmp"),
+            revision,
+            pending: true,
+        }
+    }
+
+    /// The written file, under its temporary name.
+    pub(crate) fn tmp(&self) -> &Path {
+        &self.tmp
+    }
+
+    /// Renames the checkpoint into place and syncs the directory: from here a restart
+    /// recovers it. Returns its path.
+    pub(crate) fn commit(mut self) -> Result<PathBuf, Uncommitted> {
+        let path = checkpoint_path(&self.dir, self.revision, EXTENSION);
+        let renamed = fault::check(Step::Rename).and_then(|()| fs::rename(&self.tmp, &path));
+        if let Err(error) = renamed {
+            return Err(match path.exists() {
+                true => {
+                    self.pending = false;
+                    Uncommitted::Unknown(error)
+                }
+                false => Uncommitted::No(error.into()),
+            });
+        }
+        self.pending = false;
+        let synced = fault::check(Step::DirSync).and_then(|()| {
+            super::sync_dir(&self.dir).map_err(|error| match error {
+                EngineError::Io(error) => error,
+                other => std::io::Error::other(other.to_string()),
+            })
+        });
+        synced.map_err(Uncommitted::Unknown)?;
+        Ok(path)
+    }
+}
+
+impl Drop for Written {
+    fn drop(&mut self) {
+        if self.pending {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+impl Uncommitted {
+    /// As an error of an operation that publishes nothing (a checkpoint of a committed
+    /// revision, an image): either outcome is the same state.
+    pub(crate) fn into_error(self) -> EngineError {
+        match self {
+            Self::No(error) => error,
+            Self::Unknown(error) => error.into(),
+        }
+    }
+}
+
+/// Writes a checkpoint of `snapshot` under its temporary name.
+pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<Written> {
     let version = snapshot.version();
     write_parts(
         dir,
@@ -454,7 +536,7 @@ pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
     )
 }
 
-/// Writes a checkpoint of `revision` from its parts and returns its path: the dictionary's
+/// Writes a checkpoint of `revision` from its parts under its temporary name: the dictionary's
 /// entries `0..dictionary_len`, and each stack's permutations as `packed` gives them, in
 /// the order of the stack's layout (`layouts`: asserted, inferred). Each is written before the next is asked for, so a
 /// caller can build one at a time and drop it (bulk loads).
@@ -465,9 +547,11 @@ pub(crate) fn write_parts<'a>(
     dictionary_len: u64,
     layouts: [Layout; 2],
     packed: &mut dyn FnMut(Stack, Permutation) -> EngineResult<Cow<'a, PackedKeys>>,
-) -> EngineResult<PathBuf> {
-    let tmp = checkpoint_path(dir, revision, "tmp");
-    let mut file = File::create(&tmp)?;
+) -> EngineResult<Written> {
+    // Removes the file again if writing fails.
+    let written = Written::new(dir, revision);
+    fault::check(Step::Write)?;
+    let mut file = File::create(written.tmp())?;
     // The magic is written last, once everything else is on file; it is checksummed apart
     // and the checksums combined.
     file.write_all(MAGIC)?;
@@ -523,12 +607,9 @@ pub(crate) fn write_parts<'a>(
     let flushed = syncing.elapsed();
     file.sync_all()?;
     drop(file);
-    let path = checkpoint_path(dir, revision, EXTENSION);
-    fs::rename(&tmp, &path)?;
-    super::sync_dir(dir)?;
     tracing::debug!(
         revision,
-        bytes = out_written(&path),
+        bytes = out_written(written.tmp()),
         dictionary_ms,
         permutations_build_ms = build.as_millis() as u64,
         permutations_write_ms = write.as_millis() as u64,
@@ -536,7 +617,7 @@ pub(crate) fn write_parts<'a>(
         sync_ms = (syncing.elapsed() - flushed).as_millis() as u64,
         "checkpoint written"
     );
-    Ok(path)
+    Ok(written)
 }
 
 /// The index of `stack` from a checkpoint's packed permutations: the inferred stack in the
@@ -737,6 +818,7 @@ fn read_stacks<'a>(
 /// base and both stacks, each one run, to be used in place of the copies in memory. Only
 /// the structure is read (the file was checked as it was written).
 pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])> {
+    fault::check(Step::Map)?;
     let corrupt =
         |what: &str| EngineError::Corruption(format!("checkpoint {}: {what}", path.display()));
     let map = crate::mapped::map(path)?;
@@ -775,6 +857,7 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
 /// Deletes checkpoints older than `revision`. One still mapped can't be deleted on Windows
 /// ([`crate::mapped`]); it stays until a later checkpoint, and recovery reads the newest.
 pub(crate) fn remove_older_than(dir: &Path, revision: u64) -> EngineResult<()> {
+    fault::check(Step::RemoveOlder)?;
     for (checkpoint_revision, path) in list(dir)? {
         if checkpoint_revision < revision
             && let Err(error) = fs::remove_file(&path)

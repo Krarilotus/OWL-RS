@@ -87,7 +87,8 @@ pub struct StoreConfig {
     pub support_sets: usize,
     /// On disk: check the whole checkpoint when opening (see
     /// `nrese_engine::DurabilityConfig::verify_on_open`). Off: the checkpoint is used in
-    /// place and opening reads only its structure.
+    /// place and opening reads only its structure; damage outside it goes undetected, and a
+    /// query reaching it can return altered answers.
     pub verify_on_open: bool,
     /// On disk: serve the data from each checkpoint once written, freeing its copies in
     /// memory (see `nrese_engine::DurabilityConfig::map_checkpoints`).
