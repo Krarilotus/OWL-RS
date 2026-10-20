@@ -352,44 +352,72 @@ block)
   # orientation and the cases' order in a block drawn from it, recorded in every pass.
   [ -s "$OUT/seed" ] || echo "${GATE_SEED:-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')}" > "$OUT/seed"
   opts+=(--seed "$(cat "$OUT/seed")")
-  # Every side timed from a copy of its build made for this block, removed after it (fast.py
-  # block_copies(): a cached instance's offset is the block's, not the round's; lks-aa-20). The
-  # block's directory is made here for it alone, and only it is removed, also if fast.py dies.
-  mkdir -p "$GATE/instances" && copies=$(mktemp -d "$GATE/instances/block-$n-XXXXXX") || exit 2
-  trap 'rm -rf "$copies"' EXIT
-  opts+=(--fresh-copies "$copies")
   fast_env
   # A timed block: prepared data only (fast.py never makes any while it times).
   export NRESE_TIMED_GATE=1
   # A plan that can't be read (empty, half written) is no block, never every case.
   cases=$(planned "$plan") && [ -n "$cases" ] || { log "block $n: the plan $plan can't be read"; exit 2; }
   log "block $n: ${names[*]}, layout $layout, on the cases of $harness, plan $(basename "$plan")"
-  # The host kept quiet while the block runs (scripts/lib/quiet-watch.py, as the measurement
-  # queue's timed chunks: the job's own other busy work suspended, anything else recorded as
-  # disturbing it); its verdict kept with the block. GATE_QUIET=0: unwatched.
-  watcher=""
-  if [ "${GATE_QUIET:-1}" != 0 ] && [ -d /proc ]; then
-    # What an earlier block's watcher left suspended (it died) is resumed before this block's
-    # state replaces its record; what can't be settled stops the block, never erased.
-    if [ -f "$GATE/quiet/frozen" ]; then
-      python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" --resume \
-        || { log "block $n: an earlier watcher's suspensions couldn't be resumed ($GATE/quiet/frozen)"; exit 2; }
+  attempt() {  # one run of the block, watched; its reports in $OUT/passes, its verdict beside them
+    local copies watcher=""
+    # Every side timed from a copy of its build made for this attempt, removed after it (fast.py
+    # block_copies(): a cached instance's offset is the block's, not the round's; lks-aa-20). The
+    # directory is made here for it alone, and only it is removed, also if fast.py dies.
+    mkdir -p "$GATE/instances" && copies=$(mktemp -d "$GATE/instances/block-$n-XXXXXX") || exit 2
+    trap 'rm -rf "$copies"' EXIT
+    # The host kept quiet while the block runs (scripts/lib/quiet-watch.py, as the measurement
+    # queue's timed chunks: the job's own other busy work suspended, anything else recorded as
+    # disturbing it); its verdict kept with the block. GATE_QUIET=0: unwatched.
+    if [ "${GATE_QUIET:-1}" != 0 ] && [ -d /proc ]; then
+      # What an earlier block's watcher left suspended (it died) is resumed before this block's
+      # state replaces its record; what can't be settled stops the block, never erased.
+      if [ -f "$GATE/quiet/frozen" ]; then
+        python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" --resume \
+          || { log "block $n: an earlier watcher's suspensions couldn't be resumed ($GATE/quiet/frozen)"; exit 2; }
+      fi
+      rm -rf "$GATE/quiet" && mkdir -p "$GATE/quiet"
+      export NRESE_QUIET_TOKEN="gate-$n-$$"
+      python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" $$ "$NRESE_QUIET_TOKEN" &
+      watcher=$!
     fi
-    rm -rf "$GATE/quiet" && mkdir -p "$GATE/quiet"
-    export NRESE_QUIET_TOKEN="gate-$n-$$"
-    python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" $$ "$NRESE_QUIET_TOKEN" &
-    watcher=$!
+    (cd "$tree" && py benches/fast/fast.py block --block "$n" --layout "$layout" --cases "$cases" \
+       --out "$OUT/passes" "${sides[@]}" "${opts[@]}" --fresh-copies "$copies") > "$OUT/passes/block-$n.log" 2>&1
+    code=$?
+    rm -rf "$copies" && trap - EXIT
+    if [ -n "$watcher" ]; then
+      kill -TERM "$watcher" 2>/dev/null && wait "$watcher"
+      cp "$GATE/quiet/watch.log" "$OUT/passes/quiet-block-$n.log" 2>/dev/null
+      cp "$GATE/quiet/verdict.json" "$OUT/passes/quiet-block-$n.json" 2>/dev/null
+      log "block $n: $(tail -1 "$GATE/quiet/watch.log" 2>/dev/null)"
+    fi
+    tail -1 "$OUT/passes/block-$n.log"
+  }
+  disturbed() { py -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("verdict") == "disturbed" else 1)' \
+                  "$OUT/passes/quiet-block-$n.json" 2>/dev/null; }
+  # A disturbed block (work not the job's own busy too often, quiet-watch.py) is left out of the
+  # statistics, both sides (the disturbance is the host's, not a side's: dropping it is unbiased),
+  # its reports kept aside as disturbed-*; it runs once more. A repeat disturbed again is kept,
+  # and the report says so (the orchestrator's policy, 20 Oct 2026). The marker makes a resumed
+  # step's next attempt the repeat, never a third.
+  attempt
+  if disturbed && [ ! -f "$OUT/passes/repeated-block-$n" ]; then
+    stamp=$(date +%s)
+    for f in $(seq "$first" $((first + per - 1))); do
+      for r in "$OUT/passes/pass-$f-"*.json; do
+        [ -f "$r" ] && mv "$r" "$OUT/passes/disturbed-$(basename "$r" .json)-$stamp.json"
+      done
+    done
+    mv "$OUT/passes/quiet-block-$n.json" "$OUT/passes/quiet-block-$n-disturbed-$stamp.json"
+    mv "$OUT/passes/quiet-block-$n.log" "$OUT/passes/quiet-block-$n-disturbed-$stamp.log" 2>/dev/null
+    touch "$OUT/passes/repeated-block-$n"
+    log "block $n: disturbed: left out of the statistics (kept as disturbed-*), run once more"
+    attempt
   fi
-  (cd "$tree" && py benches/fast/fast.py block --block "$n" --layout "$layout" --cases "$cases" \
-     --out "$OUT/passes" "${sides[@]}" "${opts[@]}") > "$OUT/passes/block-$n.log" 2>&1
-  code=$?
-  if [ -n "$watcher" ]; then
-    kill -TERM "$watcher" 2>/dev/null && wait "$watcher"
-    cp "$GATE/quiet/watch.log" "$OUT/passes/quiet-block-$n.log" 2>/dev/null
-    cp "$GATE/quiet/verdict.json" "$OUT/passes/quiet-block-$n.json" 2>/dev/null
-    log "block $n: $(tail -1 "$GATE/quiet/watch.log" 2>/dev/null)"
+  if [ -f "$OUT/passes/repeated-block-$n" ] && [ -f "$OUT/passes/quiet-block-$n.json" ]; then
+    py -c 'import json,sys; p=sys.argv[1]; v=json.load(open(p)); v["repeat"]=True; json.dump(v, open(p, "w"))' \
+      "$OUT/passes/quiet-block-$n.json"
+    disturbed && log "block $n: its repeat disturbed too: kept, the report lists it"
   fi
-  tail -1 "$OUT/passes/block-$n.log"
   # The cases' failures are data, the report's to judge; a block without all its reports isn't.
   [ "$(complete)" = "$per" ] || { log "block $n: not all $per reports (exit $code)"; exit 1; }
   log "block $n: done (fast.py exit $code)"
