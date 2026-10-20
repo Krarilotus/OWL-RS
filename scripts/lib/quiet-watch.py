@@ -77,10 +77,11 @@ def processes() -> dict[int, tuple[int, int, int, str]]:
 
 
 def started(pid: int) -> str | None:
-    """The process's start time (clock ticks since boot, /proc/PID/stat field 22), or None."""
+    """The process's start time (clock ticks since boot, /proc/PID/stat field 22); None when it is
+    gone. Any other failure to read it (permission, an I/O error) raises: that is not gone."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
+    except (FileNotFoundError, ProcessLookupError):
         return None
     return stat[stat.rindex(")") + 2:].split()[19]
 
@@ -216,8 +217,11 @@ def suspend(pid: int, frozen: Path, boot: str, recorded: set[int]) -> bool:
 
 def resume(state: Path) -> list[str]:
     """Continues and unpauses what STATE/frozen records; a process only if it is still the one
-    recorded (same start time, same boot). The lines it couldn't settle stay in the file (it goes
-    when none remain); they are returned."""
+    recorded (same start time, same boot). A line is settled only when its process is continued,
+    or proven gone (no such pid, another start time, another boot), or its container unpaused or
+    gone; one that couldn't be inspected or signalled is not (Sol, 20 Oct 2026: an EPERM on
+    SIGCONT dropped the record of a process left stopped). The unsettled lines stay in the file
+    (it goes when none remain); they are returned."""
     path = state / "frozen"
     if not path.exists():
         return []
@@ -230,14 +234,27 @@ def resume(state: Path) -> list[str]:
             if not pid.isdigit() or not start:
                 left.append(line)  # no start time (an older watcher's line): which process is unknown
                 continue
-            # Gone, or another process under a reused pid: nothing of ours to continue.
-            if booted == boot and started(int(pid)) == start:
-                try:
-                    os.kill(int(pid), signal.SIGCONT)
-                except OSError:
-                    pass
+            if booted != boot:
+                continue  # recorded in another boot: that process is gone
+            try:
+                now = started(int(pid))
+            except OSError:
+                left.append(line)  # can't be inspected: not known to be gone
+                continue
+            if now != start:
+                continue  # gone, or another process under a reused pid: nothing of ours to continue
+            try:
+                os.kill(int(pid), signal.SIGCONT)
+            except ProcessLookupError:
+                pass  # gone meanwhile
+            except OSError:
+                left.append(line)  # still stopped, and still ours: kept
         elif kind == "container":
-            done = subprocess.run(["docker", "unpause", what], capture_output=True, text=True)
+            try:
+                done = subprocess.run(["docker", "unpause", what], capture_output=True, text=True)
+            except OSError:
+                left.append(line)
+                continue
             gone_or_running = done.returncode == 0 or "No such container" in done.stderr or "not paused" in done.stderr
             if not gone_or_running:
                 left.append(line)
@@ -313,7 +330,8 @@ def watch(state: Path, root: int, token: str) -> int:
             f"unowned work above a core in {share:.0%} of {samples} samples ({len(named)} busy processes and "
             f"{len(unowned_containers)} containers not ours, left running)"
             + (f"; NOT resumed: {left}" if left else ""))
-    return 0
+    # Anything left suspended fails the watch, and its callers with it (the record stays).
+    return 1 if left else 0
 
 
 def main() -> int:

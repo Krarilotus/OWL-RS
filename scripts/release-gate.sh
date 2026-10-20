@@ -385,10 +385,14 @@ block)
     code=$?
     rm -rf "$copies" && trap - EXIT
     if [ -n "$watcher" ]; then
-      kill -TERM "$watcher" 2>/dev/null && wait "$watcher"
+      kill -TERM "$watcher" 2>/dev/null
+      wait "$watcher"
+      watched=$?
       cp "$GATE/quiet/watch.log" "$OUT/passes/quiet-block-$n.log" 2>/dev/null
       cp "$GATE/quiet/verdict.json" "$OUT/passes/quiet-block-$n.json" 2>/dev/null
       log "block $n: $(tail -1 "$GATE/quiet/watch.log" 2>/dev/null)"
+      # Something the watcher suspended stayed suspended: the block stops, its record kept.
+      [ "$watched" = 0 ] || { log "block $n: the watcher left suspensions ($GATE/quiet/frozen)"; exit 1; }
     fi
     tail -1 "$OUT/passes/block-$n.log"
   }

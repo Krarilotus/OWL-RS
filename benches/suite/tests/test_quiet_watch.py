@@ -59,6 +59,33 @@ class Watch(unittest.TestCase):
         self.assertEqual([owner.owns_container(label) for label in ("job-a", "job-b", "")], [True, False, False])
         self.assertFalse(nobody.owns_container(""))
 
+    @unittest.skipUnless(hasattr(watch.signal, "SIGCONT"), "POSIX signals (the watcher runs on Linux)")
+    def test_a_resume_settles_only_what_it_continued_or_proved_gone_and_the_watch_fails_on_the_rest(self):
+        """Sol, 20 Oct 2026: an EPERM on SIGCONT, or a stat that couldn't be read, counted as
+        settled: the record of a process left stopped was deleted, and the watch exited 0."""
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            frozen = Path(tmp) / "frozen"
+            frozen.write_text("pid 31 777 boot-1\npid 41 555 boot-1\npid 51 666 boot-1\npid 61 888 boot-0\n")
+
+            def started(pid):
+                if pid == 51:
+                    raise PermissionError("injected: unreadable stat")
+                return {31: "777", 41: None}.get(pid)
+
+            def kill(pid, sig):
+                raise PermissionError("injected EPERM")
+            with patch.object(watch, "started", started), patch.object(watch, "boot_id", lambda: "boot-1"), \
+                    patch.object(watch.os, "kill", kill):
+                left = watch.resume(Path(tmp))
+            # 31 couldn't be continued, 51 couldn't be inspected: kept; 41 is gone, 61 of another boot.
+            self.assertEqual(left, ["pid 31 777 boot-1", "pid 51 666 boot-1"])
+            self.assertEqual(frozen.read_text(), "pid 31 777 boot-1\npid 51 666 boot-1\n")
+            with patch.object(watch, "processes", side_effect=[{}, {}]), patch.object(watch.time, "sleep"), \
+                    patch.object(watch, "resume", return_value=["container stuck"]), \
+                    patch.object(watch, "namespace", return_value=None):
+                self.assertEqual(watch.watch(Path(tmp), 12345, "token"), 1)
+
     @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
     def test_the_journal_comes_first_and_a_resume_continues_only_the_process_it_recorded(self):
         """COT-14 (20 Oct 2026): the suspension came before its record, and the record was a bare
