@@ -639,7 +639,7 @@ pub(crate) struct Expand<'a, I: Iterator<Item = EncodedQuad>> {
     visibility: Visibility<'a>,
     pending: BinaryHeap<Reverse<Key>>,
     /// The reader's budget, and what the heap's capacity is charged to it.
-    reads: Option<Arc<super::snapshot::Reads>>,
+    reads: Option<super::snapshot::ReadBudget>,
     held: usize,
     refused: bool,
 }
@@ -669,7 +669,7 @@ impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
     }
 
     /// This scan charging its waiting copies to `reads`, the reader's budget, if any.
-    pub(crate) fn charging(mut self, reads: Option<Arc<super::snapshot::Reads>>) -> Self {
+    pub(crate) fn charging(mut self, reads: Option<super::snapshot::ReadBudget>) -> Self {
         self.reads = reads;
         self
     }
