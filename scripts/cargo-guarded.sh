@@ -16,8 +16,10 @@
 #
 # It also keeps a build from taking the whole machine: half the cores unless
 # CARGO_BUILD_JOBS says otherwise, low process priority, so other work on the same
-# machine and disk (editors, containers, WSL) stays responsive, and on Windows a memory
-# cap on the build and everything it runs (NRESE_MEMORY_CAP_GB, default half the RAM).
+# machine and disk (editors, containers, WSL) stays responsive, on Windows a memory
+# cap on the build and everything it runs (NRESE_MEMORY_CAP_GB, default half the RAM),
+# and admission: a cargo run, its tests included, starts only when the machine isn't busy,
+# it is first in line, and its declared memory peak fits above the floor (below).
 #
 # Code is generated for this machine's CPU unless NRESE_TARGET_CPU says otherwise
 # (`portable`, `x86-64-v3`, …; see scripts/lib/target-cpu.sh).
@@ -133,60 +135,148 @@ if [ "${NRESE_MEMORY_CAP_GB:-0}" -gt 0 ] && [ -r "/proc/$$/winpid" ] && command 
     || printf 'memory cap not applied; building uncapped\n' >&2
 fi
 
-# Jobs per build: three quarters of the cores (the rest stays free for whoever uses the
-# machine), shared by the builds the slots allow at once (below), so that
-# full slots don't run more compilers than the machine has threads (8 jobs x 3 slots on 16
-# threads did). Without slots, half the cores.
-if [ -z "${CARGO_BUILD_JOBS:-}" ]; then
+# Jobs per build: three quarters of the cores (the rest stays free for whoever uses the machine),
+# shared by two builds, so that two at once don't run more compilers than the machine has threads
+# (8 jobs x 3 builds on 16 threads did). Admission (below) may lower it to what memory allows.
+jobs_given=${CARGO_BUILD_JOBS:-}
+if [ -z "$jobs_given" ]; then
   cores=$(nproc 2>/dev/null || printf 4)
-  share=${NRESE_BUILD_SLOTS:-2}
-  [ "$share" -gt 0 ] 2>/dev/null || share=2
-  jobs=$(( (cores * 3 / 4 + share - 1) / share ))
+  jobs=$(( (cores * 3 / 4 + 1) / 2 ))
   export CARGO_BUILD_JOBS=$(( jobs > 2 ? jobs : 2 ))
 fi
 
-# A machine-wide limit on builds: at most NRESE_BUILD_SLOTS (default 2) cargo runs of ours at
-# once, so that agents sharing a machine don't run more compilers than it has cores. A build
-# waits for a free slot (at most NRESE_BUILD_SLOT_WAIT_S, default 3600 s, then it runs
-# anyway); a slot whose owner died is taken over. Waits are logged in tmp/guard-slots.log.
-# NRESE_BUILD_SLOTS=0 switches the limit off.
-SLOTS="${NRESE_BUILD_SLOTS:-2}"
-SLOT_DIR="${NRESE_BUILD_SLOT_DIR:-$HOME/.nrese-build-slots}"
-slot=""
-take_slot() {
-  local i owner waited=0 limit="${NRESE_BUILD_SLOT_WAIT_S:-3600}"
-  mkdir -p "$SLOT_DIR"
-  while :; do
-    for i in $(seq 1 "$SLOTS"); do
-      if mkdir "$SLOT_DIR/$i" 2>/dev/null; then
-        echo $$ > "$SLOT_DIR/$i/pid"
-        printf '%s %s\n' "$ROOT" "cargo $*" > "$SLOT_DIR/$i/who"
-        slot="$SLOT_DIR/$i"
-        [ "$waited" -gt 0 ] && mkdir -p "$ROOT/tmp" && printf '%s waited %s s for a build slot: cargo %s\n' \
-          "$(date '+%Y-%m-%d %H:%M:%S')" "$waited" "$*" >> "$ROOT/tmp/guard-slots.log"
-        return 0
-      fi
-      owner=$(cat "$SLOT_DIR/$i/pid" 2>/dev/null || echo "")
-      if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
-        rm -rf "$SLOT_DIR/$i"
-      fi
-    done
-    if [ "$waited" -ge "$limit" ]; then
-      printf 'no build slot free after %s s: building anyway\n' "$waited" >&2
-      return 0
+# Admission, one queue per machine (the main PC's guard stopped 47 of our processes at its hard
+# line between 12:17 and 12:33 on 20 Oct 2026: builds started whatever the memory). A cargo run
+# starts only when
+# - the machine isn't busy: no ~/owlrs-guard/BUSY (NRESE_GUARD_BUSY), the guard's soft line;
+# - it is first in line (first come, first served, across every worktree and agent); and
+# - its declared peak fits: free memory, less the peaks the runs already admitted declared, less
+#   its own, stays at or above the floor: NRESE_BUILD_FLOOR_GB, by default the guard's soft line
+#   (16 GB) where the guard runs (~/owlrs-guard), else 0.
+# Its peak: NRESE_BUILD_PEAK_GB, else 0.6 GB per compiler job (1.2 GB for release code, fat LTO)
+# and 2 GB for the linker and the tests it runs. When that doesn't fit, it runs with fewer jobs
+# (2 at least) unless CARGO_BUILD_JOBS was given; else it waits. Admitted, it holds its place for
+# the whole cargo run, compiling and running tests alike, until cargo ends.
+#
+# It never builds anyway: it waits, saying its place in line every minute. Only at a terminal does
+# it give up, after NRESE_BUILD_SLOT_WAIT_S (default 3600 s), with exit 75. Inside a fleet job's
+# slice (FLEET_SLICE) the fleet admitted the job by its ask and the slice holds it there: no
+# admission here. NRESE_BUILD_SLOTS=0 switches it off. Waits go to tmp/guard-slots.log.
+ADMIT="${NRESE_BUILD_SLOT_DIR:-$HOME/.nrese-build-slots}"
+BUSY="${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}"
+if [ -d "$(dirname "$BUSY")" ]; then floor_default=16; else floor_default=0; fi
+FLOOR_MB=$(( ${NRESE_BUILD_FLOOR_GB:-$floor_default} * 1024 ))
+per_job_mb=614
+previous=""
+for arg in "$@"; do
+  case "$previous $arg" in
+    *" --release" | *" --profile=release" | *" --profile=lab" | *" --profile=profiling" \
+      | "--profile release" | "--profile lab" | "--profile profiling") per_job_mb=1229 ;;
+  esac
+  previous=$arg
+done
+BASE_MB=2048
+peak_of() {
+  if [ -n "${NRESE_BUILD_PEAK_GB:-}" ]; then echo $(( NRESE_BUILD_PEAK_GB * 1024 )); else echo $(( $1 * per_job_mb + BASE_MB )); fi
+}
+# Free memory now (MiB): Linux's MemAvailable; Windows' free physical memory (Git Bash's MemFree,
+# the guard's reading).
+free_mb() {
+  awk '/^MemAvailable:/ { a = $2 } /^MemFree:/ { f = $2 } END { print int((a ? a : f) / 1024) }' \
+    "${NRESE_MEMINFO:-/proc/meminfo}"
+}
+alive() { kill -0 "$1" 2>/dev/null; }
+# One admission at a time (a lock whose holder died, or never got to name itself, goes after a minute).
+lock_admission() {
+  local holder
+  until mkdir "$ADMIT/.lock" 2>/dev/null; do
+    holder=$(cat "$ADMIT/.lock/pid" 2>/dev/null || true)
+    if { [ -n "$holder" ] && ! alive "$holder"; } || [ -n "$(find "$ADMIT/.lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+      rm -rf "$ADMIT/.lock"
     fi
-    [ "$waited" -eq 0 ] && printf 'all %s build slots are taken: waiting\n' "$SLOTS" >&2
+    sleep 0.2
+  done
+  echo $$ > "$ADMIT/.lock/pid"
+}
+unlock_admission() { rm -rf "$ADMIT/.lock"; }
+
+slot=""
+ticket=""
+if [ "${NRESE_BUILD_SLOTS:-1}" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
+  mkdir -p "$ADMIT/queue" "$ADMIT/run"
+  ticket="$ADMIT/queue/$(date +%s%N)-$$"
+  printf '%s cargo %s\n' "$ROOT" "$*" > "$ticket"
+  trap 'rm -f "$ticket"; [ -z "$slot" ] || rm -rf "$slot"' EXIT
+  waited=0 said=-60 limit="${NRESE_BUILD_SLOT_WAIT_S:-3600}"
+  while :; do
+    lock_admission
+    for t in "$ADMIT"/queue/*; do if [ -e "$t" ] && ! alive "${t##*-}"; then rm -f "$t"; fi; done
+    for r in "$ADMIT"/run/*; do if [ -e "$r" ] && ! alive "${r##*/}"; then rm -rf "$r"; fi; done
+    place=1
+    for t in "$ADMIT"/queue/*; do if [[ -e "$t" && "$t" < "$ticket" ]]; then place=$((place + 1)); fi; done
+    others=0
+    for r in "$ADMIT"/run/*; do if [ -e "$r/peak" ]; then others=$((others + $(cat "$r/peak"))); fi; done
+    room=$(( $(free_mb) - FLOOR_MB - others ))
+    peak=$(peak_of "$CARGO_BUILD_JOBS")
+    why=""
+    if [ -f "$BUSY" ]; then
+      why="the machine is busy ($(cat "$BUSY" 2>/dev/null || true))"
+    elif [ "$place" -gt 1 ]; then
+      why="$((place - 1)) waiting before it"
+    elif [ "$peak" -gt "$room" ]; then
+      fit=$(( (room - BASE_MB) / per_job_mb ))
+      if [ -z "$jobs_given" ] && [ -z "${NRESE_BUILD_PEAK_GB:-}" ] && [ "$fit" -ge 2 ]; then
+        printf 'room for %s compiler jobs, not %s: building with %s\n' "$fit" "$CARGO_BUILD_JOBS" "$fit" >&2
+        export CARGO_BUILD_JOBS=$fit
+        peak=$(peak_of "$fit")
+      else
+        why="it may peak at $((peak / 1024)) GB; $(( room > 0 ? room / 1024 : 0 )) GB are free above the $((FLOOR_MB / 1024)) GB floor"
+      fi
+    fi
+    if [ -z "$why" ]; then
+      slot="$ADMIT/run/$$"
+      mkdir -p "$slot"
+      echo "$peak" > "$slot/peak"
+      printf '%s cargo %s\n' "$ROOT" "$*" > "$slot/who"
+      rm -f "$ticket"
+      unlock_admission
+      break
+    fi
+    unlock_admission
+    if [ $((waited - said)) -ge 60 ]; then
+      printf 'waiting to build, place %s in line: %s\n' "$place" "$why" >&2
+      said=$waited
+    fi
+    if [ -t 2 ] && [ "$waited" -ge "$limit" ]; then
+      printf 'no room to build after %s s; try again later, or build on the fleet\n' "$waited" >&2
+      exit 75
+    fi
     sleep 5
     waited=$((waited + 5))
   done
-}
-if [ "$SLOTS" -gt 0 ]; then
-  take_slot "$@"
-  trap '[ -n "$slot" ] && rm -rf "$slot"' EXIT
+  if [ "$waited" -gt 0 ]; then
+    mkdir -p "$ROOT/tmp"
+    printf '%s waited %s s to build: cargo %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$waited" "$*" >> "$ROOT/tmp/guard-slots.log"
+  fi
 fi
 
+# The main PC's guard stops our processes below its hard line without telling them; it notes each
+# in ~/owlrs-guard/killed.log (NRESE_GUARD_KILLED). A cargo run that failed while it did says so.
+started=$(date +%s)
+set +e
 if command -v nice >/dev/null 2>&1; then
   nice -n 15 cargo "$@"
 else
   cargo "$@"
 fi
+code=$?
+set -e
+killed="${NRESE_GUARD_KILLED:-$HOME/owlrs-guard/killed.log}"
+if [ "$code" -ne 0 ] && [ -f "$killed" ]; then
+  stopped=$(awk -v s="$started" '$1 >= s && $2 == "KILLED-BY-GUARD" { print $3 " " $4 }' "$killed" | tr '\n' ' ')
+  if [ -n "$stopped" ]; then
+    printf 'cargo %s: stopped by the PC guard, low memory (it stopped %s); not a build failure\n' "$*" "$stopped" >&2
+    exit 75
+  fi
+fi
+exit "$code"
