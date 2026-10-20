@@ -86,11 +86,17 @@ def started(pid: int) -> str | None:
     return stat[stat.rindex(")") + 2:].split()[19]
 
 
-def boot_id() -> str:
+def boot_id() -> str | None:
+    """This boot's id, or None when it can't be read: an unknown boot, never taken for another."""
     try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip() or None
     except OSError:
-        return "?"
+        return None
+
+
+def known(boot: str | None) -> bool:
+    """A boot id that can be compared: read, and not an older watcher's "?" for an unread one."""
+    return bool(boot) and boot != "?"
 
 
 def environ_of(pid: int) -> dict[str, str]:
@@ -255,7 +261,10 @@ def suspend(pid: int, frozen: Path, boot: str, recorded: set[int], owner: Owner,
     ownership are read while the handle holds it, the handle's process is then proven alive (so
     those reads were of it: a live process keeps its pid), the journal line (pid, start time,
     boot) is written once, and the signal goes through the handle, never to a pid that may since
-    name another process (Sol, 20 Oct 2026). No pidfd (an older kernel or Python): not stopped."""
+    name another process (Sol, 20 Oct 2026). No pidfd (an older kernel or Python), or a boot
+    that can't be read (the record would name no boot): not stopped."""
+    if not known(boot):
+        return False
     try:
         fd = os.pidfd_open(pid)
     except (AttributeError, OSError):
@@ -293,6 +302,9 @@ def resume(state: Path) -> list[str]:
             start, _, booted = rest.partition(" ")
             if not pid.isdigit() or not start:
                 left.append(line)  # no start time (an older watcher's line): which process is unknown
+                continue
+            if not (known(boot) and known(booted)):
+                left.append(line)  # this boot or the recorded one unknown: not proven gone
                 continue
             if booted != boot:
                 continue  # recorded in another boot: that process is gone

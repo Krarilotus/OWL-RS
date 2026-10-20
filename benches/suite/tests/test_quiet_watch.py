@@ -115,6 +115,26 @@ class Watch(unittest.TestCase):
                 self.assertEqual(watch.watch(Path(tmp), 12345, "token"), 1)
 
     @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
+    def test_an_unknown_boot_proves_nothing_gone_and_suspends_nothing(self):
+        """Sol, 20 Oct 2026: an unreadable boot id became "?", unequal to the recorded boot, so the
+        record of a process still stopped was dropped without looking at it."""
+        owner, mine = watch.Owner({"FLEET_JOB": "job-a"}), (lambda pid: {"FLEET_JOB": "job-a"})
+        with tempfile.TemporaryDirectory() as tmp:
+            frozen = Path(tmp) / "frozen"
+            for unknown in (None, "?"):
+                frozen.write_text("pid 31 777 boot-1\npid 32 888 ?\n")
+                sent = []
+                with patch.object(watch, "boot_id", lambda: unknown), patch.object(watch, "started", lambda pid: "777"), \
+                        pidfds(sent):
+                    self.assertEqual(watch.resume(Path(tmp)), ["pid 31 777 boot-1", "pid 32 888 ?"])
+                    self.assertFalse(watch.suspend(41, Path(tmp) / "new", unknown, set(), owner, environ_of=mine))
+                self.assertEqual((sent, frozen.read_text(), (Path(tmp) / "new").exists()),
+                                 ([], "pid 31 777 boot-1\npid 32 888 ?\n", False))
+            # A recorded "?" boot stays unknown under a known one too.
+            with patch.object(watch, "boot_id", lambda: "boot-1"), pidfds([]):
+                self.assertEqual(watch.resume(Path(tmp)), ["pid 32 888 ?"])
+
+    @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
     def test_signals_go_through_a_handle_proven_to_hold_the_recorded_process_never_by_bare_pid(self):
         """Sol, 20 Oct 2026: the start time was read, then kill(pid) sent: a pid reused between
         the two got SIGSTOP or SIGCONT. Every signal now goes through a pidfd whose process was
