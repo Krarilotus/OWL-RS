@@ -43,6 +43,7 @@ import re
 import subprocess
 import sys
 import tomllib
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -124,11 +125,12 @@ def load_family(path: str | Path) -> dict:
             "sides": dict(sides), "cases": cases, "hypotheses": hypotheses, "catalog": catalog}
 
 
-def manifest_of(family: dict, harness: str, round_: int, host: str) -> dict:
+def manifest_of(family: dict, harness: str, round_: int, host: str, job: str = "") -> dict:
     """What a round is held to; `host` is the one its blocks ran on (jobs --host may override the
-    family's), whose floor the report takes."""
+    family's), whose floor the report takes. `session`: drawn anew by every check, and `job` the
+    fleet job that ran it, so that a round is told from any other (rounds_errors())."""
     return {k: family[k] for k in ("path", "sha256", "name", "blocks", "sides", "cases", "hypotheses")} | {
-        "harness": harness, "round": round_, "host": host}
+        "harness": harness, "round": round_, "host": host, "session": uuid.uuid4().hex, "job": job}
 
 
 def git(*args: str, cwd: Path = ROOT) -> str:
@@ -282,8 +284,52 @@ def judge(family: dict, results: Path) -> tuple[list[str], dict | None, dict | N
     return problems, aa, ab, host
 
 
+def rounds_errors(rounds: list[Path]) -> list[str]:
+    """Why the rounds given aren't rounds 1, 2, ... of their own (empty: they are). Sol, 20 Oct 2026
+    (r1): the same round given twice confirmed its own loss. Each must be a distinct run with
+    fresh copies: its own directory, manifest round k at place k, its own check's session and
+    fleet job, no pass file that another round has too, its blocks after the round before."""
+    errors, seen, sessions, jobs_, spans = [], {}, {}, {}, []
+    for k, results in enumerate(rounds, 1):
+        where = Path(results).resolve()
+        if where in seen:
+            errors.append(f"round {k} is round {seen[where]}'s directory again ({results})")
+            continue
+        seen[where] = k
+        path = where / "abba-manifest.json"
+        manifest = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        if manifest and manifest.get("round") != k:
+            errors.append(f"round {k} ({results}): its manifest says round {manifest.get('round')}")
+        for key, owners, what in (("session", sessions, "check's session"), ("job", jobs_, "fleet job")):
+            value = manifest.get(key)
+            if value and value in owners:
+                errors.append(f"round {k} has round {owners[value]}'s {what} ({value})")
+            elif value:
+                owners[value] = k
+        starts, ends = [], []
+        for p in sorted((where / "passes").glob("pass-*.json")) if (where / "passes").is_dir() else []:
+            digest = hashlib.sha256(p.read_bytes()).hexdigest()
+            if digest in seen:
+                errors.append(f"round {k}'s {p.name} is round {seen[digest]}'s evidence again")
+            seen.setdefault(digest, k)
+            report_ = json.loads(p.read_text(encoding="utf-8"))
+            starts.append(report_.get("started_ns") or 0)
+            ends.append(report_.get("finished_ns") or 0)
+        if starts:
+            spans.append((k, min(starts), max(ends)))
+    for (j, _, end), (k, start, _) in zip(spans, spans[1:]):
+        if start <= end:
+            errors.append(f"round {k} didn't start after round {j} ended: not a confirmation of it")
+    return errors
+
+
 def report(family: dict, rounds: list[Path]) -> tuple[int, str, dict]:
     """The verdict over the rounds given (round 1 first) and its exit code."""
+    if errors := rounds_errors(rounds):
+        text = "\n".join([f"# A-B-B-A {family['name']}: no verdict", "",
+                          "**No verdict** (exit 3): the results given aren't distinct rounds in order.", ""]
+                         + [f"- {e}" for e in errors])
+        return NO_VERDICT, text, {"family": family["path"], "exit": NO_VERDICT, "rounds_errors": errors}
     judged = [judge(family, r) for r in rounds]
     lines = [f"# A-B-B-A {family['name']}: b {family['sides']['b']} against a {family['sides']['a']}", "",
              f"{len(family['hypotheses'])} hypotheses on {', '.join(dict.fromkeys(h for *_, h in judged if h)) or '-'}, "
@@ -350,7 +396,7 @@ def main() -> int:
         if os.environ.get("FLEET_OUT"):  # in a job: the manifest its report holds the results to
             harness = os.environ.get("ABBA_HARNESS") or git("rev-parse", "HEAD")
             manifest = manifest_of(family, harness, int(os.environ.get("ABBA_ROUND", "1")),
-                                   os.environ.get("GATE_HOST") or family["host"])
+                                   os.environ.get("GATE_HOST") or family["host"], os.environ.get("FLEET_JOB", ""))
             (Path(os.environ["FLEET_OUT"]) / "abba-manifest.json").write_text(json.dumps(manifest, indent=1),
                                                                               encoding="utf-8")
         return 0
