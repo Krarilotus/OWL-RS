@@ -21,7 +21,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import re
 import statistics
 import sys
@@ -1332,12 +1331,10 @@ def checkout_rev(checkout: str, candidate: str, harness: str) -> str:
     if candidate == harness:
         return harness
     import subprocess
-    # That checkout's repository, whatever a calling git (a hook's GIT_DIR, GIT_INDEX_FILE) names.
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
 
     def contains(rev: str, other: str) -> bool:
         done = subprocess.run(["git", "-C", checkout, "merge-base", "--is-ancestor", other, rev],
-                              capture_output=True, text=True, env=env)
+                              capture_output=True, text=True)
         if done.returncode not in (0, 1):
             raise SystemExit(f"{checkout}: can't compare {other[:8]} and {rev[:8]}: {done.stderr.strip()}")
         return done.returncode == 0
