@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -504,6 +505,52 @@ class Parts(unittest.TestCase):
                                   capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertIn("is not Linux", done.stdout)
+
+    def test_a_block_of_two_sides_is_complete_with_its_four_reports(self):
+        """20 Oct 2026: release-gate.sh block counted six reports a block whatever the sides, so an
+        A-B-B-A of two (the agents' confirmation rounds) never completed."""
+        import shutil
+        import subprocess
+        bash, python = shutil.which("bash"), shutil.which("python3")
+        if bash is None or python is None:
+            self.skipTest("no bash or python3")
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp).as_posix()
+            # fast.py block as it numbers its reports (2 per side a block); every other python3 call the real one.
+            shim = Path(tmp) / "shim"
+            shim.mkdir()
+            (shim / "python3").write_text(f"""#!/usr/bin/env bash
+case " $* " in
+  *" benches/fast/fast.py block "*)
+    n=0; out=; sides=()
+    while [ $# -gt 0 ]; do case $1 in --block) n=$2 ;; --out) out=$2 ;; --side) sides+=("${{2%%:*}}") ;; esac; shift; done
+    per=$(( 2 * ${{#sides[@]}} ))
+    for k in $(seq 1 $per); do echo '{{"finished_ns": 1}}' > "$out/pass-$(( per * (n - 1) + k ))-x$k.json"; done ;;
+  *) exec "{Path(python).as_posix()}" "$@" ;;
+esac
+""", encoding="utf-8", newline="\n")
+            (shim / "python3").chmod(0o755)
+            setup = f'''
+. scripts/lib/gate-publish.sh
+GATE={t}/gate GATE_BIN={t}/bin
+b=$GATE_BIN/bin-test; mkdir -p "$b/release" "$GATE" {t}/out
+echo tool > "$b/release/tool"; echo {head} > "$b/REVISION"; echo timing=watchdog > "$b/CAPABILITIES"
+(cd "$b" && sha256sum release/tool > SHA256SUMS)
+point {head} "$b"
+echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
+'''
+            env = {**os.environ, "NRESE_GATE_DIR": f"{t}/gate", "GATE_BIN": f"{t}/bin", "FLEET_OUT": f"{t}/out",
+                   "GATE_QUIET": "0"}
+            subprocess.run([bash, "-c", setup], cwd=ROOT, env=env, check=True, capture_output=True)
+            done = subprocess.run([bash, "-c", f'PATH="$(cygpath -u "{shim}" 2>/dev/null || echo "{shim}"):$PATH" '
+                                   f'exec bash scripts/release-gate.sh block 2 {head} 1 - base={head} cand={head}'],
+                                  cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
+            subprocess.run(["git", "worktree", "remove", "--force", f"{t}/gate/src-{head[:8]}"], cwd=ROOT,
+                           capture_output=True)
+        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("block 2: done", done.stdout)
 
     def test_a_cached_build_counts_only_with_its_whole_identity(self):
         """Round 8: binaries from before counted by revision alone, whatever toolchain, flags or
