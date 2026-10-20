@@ -189,9 +189,13 @@ such. Each timed host runs one fleet job of class *exclusive* (nothing else on t
 head, main, base back to back, the next case after it. Each side's two runs of a case are then
 centred on the same instant whatever the runs' durations, so a drift linear in time falls on
 every side alike; a palindrome of whole passes isn't (a case's runs sit where the other cases'
-durations put them: research round 8). Each pair of blocks has one block of each orientation,
-which comes first drawn from the round's seed (`GATE_SEED`, else drawn and kept in the results),
-as is the cases' order in each block; both are recorded in every report. Every block times each
+durations put them: research round 8). The mirror cancels a linear drift, not the cost of a
+block's first run (tf2-gate-1, 20 Oct 2026: 15.8 % on one series). So the blocks' orders are Latin
+squares: in every k blocks (k sides) each side opens one block and holds each place once.
+Each square's relabelling and row order are drawn from the round's seed (`GATE_SEED`, else drawn
+and kept in the results), as is the cases' order in each block; both are recorded in every
+report. A case's blocks are whole squares (release_gate.py `whole_squares()`: with three timed
+sides 2 blocks become 3, 8 become 9): a partial square leaves part of the cost on one side. Every block times each
 side from a copy of its build made for that block and removed after it (`fast.py block
 --fresh-copies`): new files, read into new page-cache pages (below, *the unit*). A block writes
 one report per side and run (`pass-<n>-<side>.json`, each record with its block, layout and

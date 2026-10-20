@@ -1,18 +1,32 @@
 """The case registry (benches/cases/README.md, the schema's one owner): every case of every
 group, read from benches/cases/*.toml, and its validation.
 
-    load()                       every case, each with `group` (its file's stem), names unique
+    load()                       every case, each with `group` (its file's stem), names unique; with
+                                 `family` or NRESE_FAMILY (an A-B-B-A family, benches/suite/abba.py)
+                                 its own cases too, group "family"
     problems(cases, ...)         what is wrong with them, one line each (empty: valid)
 
 `suite.py --check` and the gate's suite contracts run the validation over the repository.
 """
 from __future__ import annotations
 
+import os
 import re
 import tomllib
 from pathlib import Path
 
 CASES = Path(__file__).resolve().parents[2] / "cases"
+ROOT = Path(__file__).resolve().parents[3]
+
+
+def family_cases(path: str | Path) -> list[dict]:
+    """A family file's own cases (its [[case]] entries that aren't `catalog = NAME`), in the
+    catalogue's schema; a relative path is the repository's."""
+    path = Path(path)
+    path = path if path.is_absolute() else ROOT / path
+    entries = tomllib.loads(path.read_text(encoding="utf-8")).get("case", [])
+    return [{k: v for k, v in e.items() if k not in ("dimensions", "min_samples")}
+            for e in entries if "catalog" not in e]
 
 # The vocabulary (benches/cases/README.md explains each).
 AREAS = {"cache", "concurrency", "dl", "kernel", "layout", "load", "maintenance", "memory", "operator", "parse",
@@ -45,12 +59,15 @@ KEYS = {
 REQUIRED = ("name", "area", "what", "semantics", "data", "metric", "cap_gb", "systems")
 
 
-def load(directory: Path = CASES) -> list[dict]:
+def load(directory: Path = CASES, family: str | Path | None = None) -> list[dict]:
     """Every case of every group file, in file and then entry order; each gets its `group`."""
     out = []
     for path in sorted(directory.glob("*.toml")):
         for case in tomllib.loads(path.read_text(encoding="utf-8")).get("case", []):
             out.append({**case, "group": path.stem})
+    family = family or os.environ.get("NRESE_FAMILY")
+    if family:
+        out += [{**case, "group": "family"} for case in family_cases(family)]
     names = [c["name"] for c in out]
     duplicate = sorted({n for n in names if names.count(n) > 1})
     if duplicate:
