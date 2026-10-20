@@ -257,113 +257,136 @@ fn wal_damage_is_truncated_or_refused_by_its_evidence() {
     };
     let every = SyncPolicy::EveryCommit;
     let buffered = SyncPolicy::OsBuffered;
-    // (case, policy, sidecar kept, damage, recover_until, Ok(revision opened) or
-    // Err(the last intact revision the refusal names))
+    // The segment's sidecar: as written, removed (an older segment), or there but unreadable.
+    #[derive(Debug, PartialEq)]
+    enum Sidecar {
+        Kept,
+        Missing,
+        Unreadable,
+    }
+    // Opening: at this revision; refused as corruption, naming this last intact revision; or
+    // failing on an I/O error.
+    #[derive(Debug)]
+    enum Expect {
+        Opens(u64),
+        Refused(u64),
+        Fails,
+    }
+    use {Expect::*, Sidecar::*};
+    // (case, policy, sidecar, damage, recover_until, expected)
     type Row = (
         &'static str,
         SyncPolicy,
-        bool,
+        Sidecar,
         Damage,
         Option<u64>,
-        Result<u64, u64>,
+        Expect,
     );
-    let rows: [Row; 13] = [
+    let rows: [Row; 14] = [
         (
             "damage before intact records",
             every,
-            true,
+            Kept,
             flip_first,
             None,
-            Err(0),
+            Refused(0),
         ),
         (
             "the same, under os-buffered",
             buffered,
-            true,
+            Kept,
             flip_first,
             None,
-            Err(0),
+            Refused(0),
         ),
         (
             "cut before the damage",
             every,
-            true,
+            Kept,
             flip_first,
             Some(0),
-            Ok(0),
+            Opens(0),
         ),
         (
             "two damaged records before an intact one, os-buffered",
             buffered,
-            true,
+            Kept,
             flip_two,
             None,
-            Err(0),
+            Refused(0),
         ),
         (
             "a damaged length and payload before intact records",
             every,
-            true,
+            Kept,
             long_and_flipped,
             None,
-            Err(0),
+            Refused(0),
         ),
-        ("a zero-filled tail", every, true, zero_tail, None, Ok(3)),
+        ("a zero-filled tail", every, Kept, zero_tail, None, Opens(3)),
         (
             "an untimed (version 4) last record damaged",
             every,
-            true,
+            Kept,
             untimed_flip_last,
             None,
-            Err(2),
+            Refused(2),
         ),
         (
             "a damaged length over an intact record",
             every,
-            true,
+            Kept,
             long_length,
             None,
-            Err(1),
+            Refused(1),
         ),
         (
             "a synced last record damaged",
             every,
-            true,
+            Kept,
             flip_last,
             None,
-            Err(2),
+            Refused(2),
         ),
         (
             "cut before the damaged last record",
             every,
-            true,
+            Kept,
             flip_last,
             Some(2),
-            Ok(2),
+            Opens(2),
         ),
         (
             "a last record whose end never landed",
             every,
-            true,
+            Kept,
             zero_end,
             None,
-            Ok(2),
+            Opens(2),
         ),
         (
             "a last record damaged under os-buffered",
             buffered,
-            true,
+            Kept,
             flip_last,
             None,
-            Ok(2),
+            Opens(2),
         ),
         (
             "a last record damaged, no policy recorded",
             every,
-            false,
+            Missing,
             flip_last,
             None,
-            Ok(2),
+            Opens(2),
+        ),
+        (
+            "a last record damaged, its sidecar unreadable",
+            every,
+            Unreadable,
+            flip_last,
+            None,
+            Fails,
         ),
     ];
     for (case, sync, sidecar, damage, until, expected) in rows {
@@ -385,10 +408,14 @@ fn wal_damage_is_truncated_or_refused_by_its_evidence() {
         assert_eq!(at.len(), 3, "{case}");
         damage(&mut bytes, &at);
         fs::write(segment, bytes).unwrap();
-        if !sidecar {
-            let mut meta = segment.clone().into_os_string();
-            meta.push(".meta");
-            fs::remove_file(meta).unwrap();
+        let mut meta = segment.clone().into_os_string();
+        meta.push(".meta");
+        if sidecar != Kept {
+            fs::remove_file(&meta).unwrap();
+        }
+        if sidecar == Unreadable {
+            // A directory where the file should be: reading it fails on every platform.
+            fs::create_dir(&meta).unwrap();
         }
         let reopen = EngineConfig {
             durability: DurabilityConfig {
@@ -398,11 +425,14 @@ fn wal_damage_is_truncated_or_refused_by_its_evidence() {
             ..written
         };
         match (Engine::open(dir.path(), reopen), expected) {
-            (Ok(engine), Ok(revision)) => assert_eq!(engine.stats().revision, revision, "{case}"),
-            (Err(EngineError::Corruption(why)), Err(intact)) => assert!(
+            (Ok(engine), Opens(revision)) => {
+                assert_eq!(engine.stats().revision, revision, "{case}")
+            }
+            (Err(EngineError::Corruption(why)), Refused(intact)) => assert!(
                 why.contains(&format!("intact through revision {intact};")),
                 "{case}: {why}"
             ),
+            (Err(EngineError::Io(_)), Fails) => {}
             (other, expected) => panic!(
                 "{case}: expected {expected:?}, got {:?}",
                 other.map(|e| e.stats().revision)
