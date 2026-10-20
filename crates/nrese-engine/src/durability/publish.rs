@@ -40,10 +40,7 @@ pub(crate) fn publish(from: &Path, to: &Path) -> Result<(), Failed> {
         .and_then(|file| file.sync_all())
         .map_err(Failed::NotMoved)?;
     if let Err(error) = rename(from, to) {
-        return Err(match to.exists() && !from.exists() {
-            true => Failed::Unknown(error),
-            false => Failed::NotMoved(error),
-        });
+        return Err(after_failed_rename(error, to.try_exists()));
     }
     sync_parent(to).map_err(Failed::Unknown)
 }
@@ -79,6 +76,16 @@ pub(crate) mod record {
     /// This thread's operations since the last call.
     pub(crate) fn take() -> Vec<Op> {
         OPS.take()
+    }
+}
+
+/// What a failed rename left, by whether its target is there (`target`): only a target
+/// known to be absent means the file wasn't moved; a target there, or one whose state can't
+/// be read, may be the file.
+fn after_failed_rename(error: io::Error, target: io::Result<bool>) -> Failed {
+    match target {
+        Ok(false) => Failed::NotMoved(error),
+        Ok(true) | Err(_) => Failed::Unknown(error),
     }
 }
 
@@ -144,6 +151,26 @@ mod tests {
         assert_eq!(std::fs::read(&to).unwrap(), b"new");
         assert!(!from.exists());
         assert!(matches!(publish(&from, &to), Err(Failed::NotMoved(_))));
+    }
+
+    /// A failed rename is "not moved" only when its target is known to be absent; a target
+    /// there, or one that can't be looked at, leaves the outcome unknown (crash r1 F8).
+    #[test]
+    fn a_failed_rename_is_not_moved_only_with_its_target_absent() {
+        let failed = || io::Error::other("rename failed");
+        assert!(matches!(
+            after_failed_rename(failed(), Ok(false)),
+            Failed::NotMoved(_)
+        ));
+        assert!(matches!(
+            after_failed_rename(failed(), Ok(true)),
+            Failed::Unknown(_)
+        ));
+        let unreadable = Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(matches!(
+            after_failed_rename(failed(), unreadable),
+            Failed::Unknown(_)
+        ));
     }
 
     /// Every name recovery reads is placed through [`publish`]: no other rename in the
