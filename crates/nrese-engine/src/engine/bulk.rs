@@ -866,6 +866,22 @@ mod tests {
                 };
                 assert_eq!(reopened.snapshot().revision(), revision, "{case}");
                 assert_eq!(reopened.stats().quads, quads, "{case}");
+                if step == Step::Release {
+                    // The segment the failed release left is covered by the image: damage in
+                    // it doesn't stop the store from opening, nor cut the later commits.
+                    drop(reopened);
+                    let covered = dir.path().join("wal").join(format!("{:020}.wal", 1));
+                    let mut bytes = std::fs::read(&covered).unwrap();
+                    bytes[8 + 12] ^= 1;
+                    std::fs::write(&covered, bytes).unwrap();
+                    let reopened = Engine::open(dir.path(), config).unwrap();
+                    assert_eq!(
+                        reopened.snapshot().revision(),
+                        revision,
+                        "{case}: covered damage"
+                    );
+                    assert_eq!(reopened.stats().quads, quads, "{case}: covered damage");
+                }
             }
         }
     }
