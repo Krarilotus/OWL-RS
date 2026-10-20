@@ -66,6 +66,32 @@ struct Set {
 }
 
 impl CharacteristicSets {
+    /// The bytes it holds on the heap (what keeping it is charged: [`super::statistics`]).
+    pub(crate) fn heap_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let sets = self.sets.capacity() * size_of::<Set>()
+            + self
+                .sets
+                .iter()
+                .map(|set| set.predicates.len() * size_of::<(u64, u64)>())
+                .sum::<usize>();
+        let by_predicate = self.by_predicate.capacity() * size_of::<(u64, Vec<u32>)>()
+            + self
+                .by_predicate
+                .values()
+                .map(|v| v.capacity() * size_of::<u32>())
+                .sum::<usize>();
+        let subject_sets = self.subject_sets.capacity() * size_of::<(u64, u32)>();
+        let pairs = self.pairs.as_ref().map_or(0, |links| {
+            links.capacity() * size_of::<(u64, Vec<(u32, u32, u64)>)>()
+                + links
+                    .values()
+                    .map(|v| v.capacity() * size_of::<(u32, u32, u64)>())
+                    .sum::<usize>()
+        });
+        size_of::<Self>() + sets + by_predicate + subject_sets + pairs
+    }
+
     /// The sets of `quads`, which come sorted by subject and then predicate (as `Gspo`
     /// scans them); `None` past [`MAX_SETS`] distinct sets.
     #[cfg(test)]

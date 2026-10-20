@@ -639,6 +639,12 @@ impl Engine {
             .prepare_sets(&snapshot, ReadModel::default());
     }
 
+    /// What the planner's statistics kept are charged to from now on: their owner's budget
+    /// (a store's own envelope within its catalog's; unset, an unlimited one of their own).
+    pub fn charge_statistics_to(&self, budget: Arc<nrese_exec::budget::Budget>) {
+        self.inner.shared.statistics.set_budget(budget);
+    }
+
     /// Equality by representatives (work package W4, stage B): with `Some(sameAs)`, the
     /// inferred stack holds the closure over one representative per `owl:sameAs` class,
     /// each other identity stored as `identity sameAs representative`, and snapshots taken

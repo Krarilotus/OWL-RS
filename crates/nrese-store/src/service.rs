@@ -168,6 +168,11 @@ impl StoreService {
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             last_materialisation: std::sync::Arc::default(),
         };
+        // The planner's statistics are the store's, shared by its requests: an envelope of
+        // their own within the catalog's budget, as classification's.
+        service
+            .engine
+            .charge_statistics_to(std::sync::Arc::new(service.envelope(None).part()));
         if service.engine.snapshot().revision() != before {
             service.invalidate_reasoning()?;
         }
