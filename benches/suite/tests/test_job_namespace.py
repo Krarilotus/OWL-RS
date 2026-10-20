@@ -463,6 +463,19 @@ class Timing(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "prepared data only"):
                 fast.run(args)
 
+    def test_a_long_locked_command_arrives_whole_without_flock(self):
+        """20 Oct 2026: where there is no flock (Windows), the locked shell got its functions as one
+        -c argument; past about 8 KB it arrived cut short and the command failed."""
+        script = r'''
+. scripts/lib/ns.sh
+eval "long() { $(for i in $(seq 0 399); do printf 'echo "line %s of a long function"; ' "$i"; done) }"
+ns_locked_python "$1/a.lock" long
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            done = bash(script, Path(tmp).as_posix())
+        self.assertEqual((done.returncode, done.stdout.splitlines()[-1:]), (0, ["line 399 of a long function"]),
+                         done.stderr)
+
     def test_a_holder_killed_mid_hold_leaves_the_lock_free_at_once(self):
         """Sol, 20 Oct 2026: the lock directory's pid was the parent's, and Python never took over
         a dead holder's: a crash blocked every later preparation. An OS lock goes with its holder."""
