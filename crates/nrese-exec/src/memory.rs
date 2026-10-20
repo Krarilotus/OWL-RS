@@ -318,7 +318,7 @@ mod imp {
     }
 
     pub fn remaining_bytes() -> Option<u64> {
-        super::least([status().map(|status| status.ullAvailPhys), job_left()])
+        super::windows_remaining(status().map(|status| status.ullAvailPhys), job_left())
     }
 
     /// One class of information about the job object the process runs in; `None` outside a
@@ -361,20 +361,15 @@ mod imp {
         super::least(job_limits()?)
     }
 
-    /// What the job object's limits leave: its job-wide limit less the memory its processes
-    /// commit now ([`job_committed`]), its per-process limit less the process's own committed
-    /// memory. `None` where a limit is set whose use can't be read.
-    pub(super) fn job_left() -> Option<u64> {
-        let [job_wide, per_process] = job_limits()?;
-        let job_wide = match job_wide {
-            Some(limit) => Some((limit, job_committed()?)),
-            None => None,
+    /// What the job object's limits leave ([`super::job_left_from`]): its job-wide limit less
+    /// the memory its processes commit now ([`job_committed`]), its per-process limit less the
+    /// process's own committed memory. `Some(None)` outside a job or without a limit; `None`
+    /// where a limit is set whose use can't be read.
+    pub(super) fn job_left() -> Option<Option<u64>> {
+        let Some(limits) = job_limits() else {
+            return Some(None);
         };
-        let per_process = match per_process {
-            Some(limit) => Some((limit, super::process_bytes()?)),
-            None => None,
-        };
-        super::left([job_wide, per_process])
+        super::job_left_from(limits, job_committed, super::process_bytes)
     }
 
     /// The memory the processes of the job object the process runs in commit now: the sum
@@ -585,6 +580,34 @@ fn left(limits: impl IntoIterator<Item = Option<(u64, u64)>>) -> Option<u64> {
             .into_iter()
             .map(|limit| limit.map(|(limit, used)| limit.saturating_sub(used))),
     )
+}
+
+/// What a Windows job object's limits leave, from its job-wide and per-process limits (those
+/// set) and readings of what each counts: the job's committed memory and the process's own.
+/// `Some(None)`: no limit is set; `None`: a limit is set and what it counts can't be read, so
+/// what is left isn't known (Sol, measure-pool r2: not the machine's).
+#[cfg(any(windows, test))]
+fn job_left_from(
+    [job_wide, per_process]: [Option<u64>; 2],
+    job_committed: impl FnOnce() -> Option<u64>,
+    own_committed: impl FnOnce() -> Option<u64>,
+) -> Option<Option<u64>> {
+    let job_wide = match job_wide {
+        Some(limit) => Some((limit, job_committed()?)),
+        None => None,
+    };
+    let per_process = match per_process {
+        Some(limit) => Some((limit, own_committed()?)),
+        None => None,
+    };
+    Some(left([job_wide, per_process]))
+}
+
+/// The memory a Windows process could still take: the least of the machine's available
+/// memory and what its job leaves; `None` where the job's reading isn't known.
+#[cfg(any(windows, test))]
+fn windows_remaining(machine: Option<u64>, job: Option<Option<u64>>) -> Option<u64> {
+    least([machine, job?])
 }
 
 /// The memory a Linux process could still take, from `/proc/meminfo`'s text and its cgroup
@@ -866,6 +889,29 @@ mod tests {
         }
     }
 
+    /// A job whose limit counts something that can't be read leaves what isn't known, and so
+    /// does the remaining memory, not the machine's (Sol, measure-pool r2); a job without a
+    /// limit leaves the machine's.
+    #[test]
+    fn an_unreadable_job_leaves_what_isnt_known() {
+        const G: u64 = 1 << 30;
+        let read = |bytes: u64| move || Some(bytes);
+        let refused = || None;
+        assert_eq!(
+            job_left_from([Some(8 * G), None], read(5 * G), refused),
+            Some(Some(3 * G))
+        );
+        assert_eq!(job_left_from([Some(8 * G), None], refused, read(G)), None);
+        assert_eq!(job_left_from([None, Some(4 * G)], read(G), refused), None);
+        assert_eq!(job_left_from([None, None], refused, refused), Some(None));
+        assert_eq!(windows_remaining(Some(16 * G), None), None);
+        assert_eq!(windows_remaining(Some(16 * G), Some(None)), Some(16 * G));
+        assert_eq!(
+            windows_remaining(Some(16 * G), Some(Some(3 * G))),
+            Some(3 * G)
+        );
+    }
+
     /// What a job object leaves is the least of its set limits less what is used of each.
     #[test]
     fn a_job_leaves_the_least_of_its_limits_less_their_use() {
@@ -926,7 +972,7 @@ mod tests {
         // (Sol, measure-pool r1: a reading at a notification is not one now).
         const COMMITTED: u64 = 256 << 20;
         const SLACK: u64 = 64 << 20;
-        let left = || imp::job_left().expect("what the job leaves");
+        let left = || imp::job_left().flatten().expect("what the job leaves");
         let follows = |when: &str| {
             let before = left();
             let held = process_bytes().expect("the process's committed memory");
