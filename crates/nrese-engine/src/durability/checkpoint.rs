@@ -46,8 +46,9 @@ use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation, SharedBudget};
 use rayon::prelude::*;
 
 use super::codec::{Reader, put_u32, put_u64};
@@ -88,6 +89,11 @@ const MAGIC_V5: &[u8; 8] = b"NRESECK5";
 const MAGIC_V4: &[u8; 8] = b"NRESECK4";
 /// Magic prefix shared by every checkpoint format version.
 const FAMILY: &[u8; 7] = b"NRESECK";
+/// What the writer's buffer holds before it is written out; it is made twice this, so that
+/// nothing appended between two drains grows it (a key that doesn't fit is written past it).
+const BUFFER: usize = 1 << 16;
+/// The file writer's buffer.
+const WRITER: usize = 1 << 20;
 const EXTENSION: &str = "nck";
 /// Dictionary keys copied per lock acquisition, so interning is never blocked for long.
 const KEY_CHUNK: u64 = 64 * 1024;
@@ -165,34 +171,28 @@ impl<W: Write> Checksummed<W> {
 
     /// Writes the buffer out once it is large.
     fn drain(&mut self) -> std::io::Result<()> {
-        if self.buffer.len() >= 1 << 16 {
+        if self.buffer.len() >= BUFFER {
             self.flush_buffer()?;
         }
         Ok(())
     }
+
+    /// Appends `bytes` without growing the buffer: into it where they fit, else written
+    /// after it.
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.len() > self.buffer.capacity() - self.buffer.len() {
+            return self.write_bytes(bytes);
+        }
+        self.buffer.extend_from_slice(bytes);
+        self.drain()
+    }
 }
 
-/// What a checkpoint's scratch may take: the process's limit, where one is set, less what it
-/// holds, and no more than the machine has available; without either, no bound.
-fn admission() -> Budget {
-    use nrese_exec::memory::{available_bytes, process_bytes, process_limit};
-    let within_limit = match (process_limit(), process_bytes()) {
-        (Some(limit), Some(held)) => Some(limit.saturating_sub(held)),
-        _ => None,
-    };
-    let room = match (within_limit, available_bytes()) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    };
-    Budget::new(room.map_or(usize::MAX, |room| {
-        usize::try_from(room).unwrap_or(usize::MAX)
-    }))
-}
-
-/// Writes the dictionary section (module docs) of the entries `0..len`, reading the
-/// dictionary in chunks so interning is never blocked for long. Its scratch, which grows
-/// with the whole vocabulary however small the change since the last checkpoint, is
-/// charged to `admission` before it is allocated: refused, nothing is written.
+/// Writes the dictionary section (module docs) of the entries `0..len` but its text order
+/// ([`write_text_order`]), reading the dictionary in chunks so interning is never blocked
+/// for long. Its scratch, which grows with the whole vocabulary however small the change
+/// since the last checkpoint, is charged to `admission` before it is allocated: the keys
+/// decoded and compressed, the hash table and the offsets.
 fn write_dictionary<W: Write>(
     out: &mut Checksummed<W>,
     dictionary: &Dictionary,
@@ -227,13 +227,21 @@ fn write_dictionary<W: Write>(
         put_u64(&mut out.buffer, block);
         out.drain()?;
     }
+    let (mut decoded, mut stored) = (ChargedVec::new(admission), ChargedVec::new(admission));
     for (from, to) in chunks() {
-        dictionary.for_each_key(from, to, |key| match codec {
-            None => out.buffer.extend_from_slice(key),
-            Some(codec) => codec.compress(key, &mut out.buffer),
-        });
-        out.drain()?;
+        dictionary.for_each_key(from, to, &mut decoded, |key| -> EngineResult<()> {
+            let key = match codec {
+                None => key,
+                Some(codec) => {
+                    stored.clear();
+                    codec.compress_within(key, &mut stored)?;
+                    &stored
+                }
+            };
+            Ok(out.append(key)?)
+        })?;
     }
+    drop((decoded, stored));
     out.write_bytes(&ends)?;
     drop(ends);
     drop(encoded);
@@ -243,7 +251,23 @@ fn write_dictionary<W: Write>(
         out.drain()?;
     }
     drop(slots);
-    let written = started.elapsed();
+    tracing::debug!(
+        entries = len,
+        hash_ms = hashed.as_millis() as u64,
+        keys_and_slots_ms = (started.elapsed() - hashed).as_millis() as u64,
+        "checkpoint dictionary written"
+    );
+    Ok(())
+}
+
+/// Writes the end of the dictionary section: the entries `0..len` with a text, sorted by it
+/// ([`crate::term::order`]). Its sort is not charged yet (the scans' charging brings one).
+fn write_text_order<W: Write>(
+    out: &mut Checksummed<W>,
+    dictionary: &Dictionary,
+    len: u64,
+) -> EngineResult<()> {
+    let started = std::time::Instant::now();
     let order = dictionary.text_order(len);
     let ordered = started.elapsed();
     out.pad();
@@ -254,11 +278,9 @@ fn write_dictionary<W: Write>(
     }
     tracing::debug!(
         entries = len,
-        hash_ms = hashed.as_millis() as u64,
-        keys_and_slots_ms = (written - hashed).as_millis() as u64,
-        text_order_ms = (ordered - written).as_millis() as u64,
+        text_order_ms = ordered.as_millis() as u64,
         order_write_ms = (started.elapsed() - ordered).as_millis() as u64,
-        "checkpoint dictionary written"
+        "checkpoint text order written"
     );
     Ok(())
 }
@@ -302,20 +324,13 @@ fn hashed<'b>(
     let mut slots: ChargedVec<u32, &Budget> = ChargedVec::with_capacity(admission, slot_count)?;
     slots.resize(slot_count, 0)?;
     let mut lengths: ChargedVec<u32, &Budget> = ChargedVec::with_capacity(admission, n)?;
-    // A compressed key's stored length: the codec's output (at most twice the text, and its
-    // tag) and the copy it is appended to, charged before they are made. Grown only, a
-    // chunk's charge is the largest key's so far.
-    let stored_len = |key: &[u8], stored: &mut Vec<u8>, held: &mut Reservation<&Budget>| {
+    // A compressed key's stored length: compressed into `stored`, its room charged first.
+    let stored_len = |key: &[u8], stored: &mut Scratch<'b, u8>| {
         let Some(codec) = codec else {
             return Ok(key.len());
         };
-        let bound = 2 * key.len() + 1;
-        if stored.capacity() < bound {
-            held.resize(held.bytes().max(3 * bound))?;
-            *stored = Vec::with_capacity(bound);
-        }
         stored.clear();
-        codec.compress(key, stored);
+        codec.compress_within(key, stored)?;
         Ok::<_, BudgetExceeded>(stored.len())
     };
     if slot_count <= 1 << 32 {
@@ -330,26 +345,18 @@ fn hashed<'b>(
             .enumerate()
             .map(|(c, (homes, lens))| {
                 let from = (c * chunk) as u64;
-                let (mut i, mut refused) = (0, None);
-                let (mut stored, mut held) = (Vec::new(), Reservation::new(admission));
-                dictionary.for_each_key(from, from + homes.len() as u64, |key| {
-                    if refused.is_some() {
-                        return;
-                    }
-                    match stored_len(key, &mut stored, &mut held) {
-                        Ok(length) => {
-                            let home = (key_hash(key) as usize & mask) as u64;
-                            homes[i] = home << 32 | (from + i as u64);
-                            lens[i] = length as u32;
-                            i += 1;
-                        }
-                        Err(exceeded) => refused = Some(exceeded),
-                    }
-                });
-                // The copy freed, then its charge released.
-                drop(stored);
-                drop(held);
-                refused.map_or(Ok(i as u64), Err)
+                let mut i = 0;
+                let (mut decoded, mut stored) =
+                    (ChargedVec::new(admission), ChargedVec::new(admission));
+                dictionary.for_each_key(from, from + homes.len() as u64, &mut decoded, |key| {
+                    let length = stored_len(key, &mut stored)?;
+                    let home = (key_hash(key) as usize & mask) as u64;
+                    homes[i] = home << 32 | (from + i as u64);
+                    lens[i] = length as u32;
+                    i += 1;
+                    Ok::<_, BudgetExceeded>(())
+                })?;
+                Ok::<_, BudgetExceeded>(i as u64)
             })
             .try_reduce(|| 0, |a, b| Ok(a + b))?;
         if total != len {
@@ -380,29 +387,19 @@ fn hashed<'b>(
             slots[slot] = index + 1;
         }
     } else {
-        let (mut stored, mut held) = (Vec::new(), Reservation::new(admission));
-        let mut refused = None;
+        let (mut decoded, mut stored) = (ChargedVec::new(admission), ChargedVec::new(admission));
         for (from, to) in
             (0..len.div_ceil(KEY_CHUNK)).map(|c| (c * KEY_CHUNK, ((c + 1) * KEY_CHUNK).min(len)))
         {
-            dictionary.for_each_key(from, to, |key| {
-                if refused.is_some() {
-                    return;
-                }
+            dictionary.for_each_key(from, to, &mut decoded, |key| {
                 let mut slot = key_hash(key) as usize & mask;
                 while slots[slot] != 0 {
                     slot = (slot + 1) & mask;
                 }
-                match stored_len(key, &mut stored, &mut held)
-                    .and_then(|length| lengths.push(length as u32))
-                {
-                    Ok(()) => slots[slot] = lengths.len() as u32,
-                    Err(exceeded) => refused = Some(exceeded),
-                }
-            });
-            if let Some(exceeded) = refused {
-                return Err(exceeded.into());
-            }
+                lengths.push(stored_len(key, &mut stored)? as u32)?;
+                slots[slot] = lengths.len() as u32;
+                Ok::<_, BudgetExceeded>(())
+            })?;
         }
         if lengths.len() as u64 != len {
             return Err(EngineError::Corruption(
@@ -534,11 +531,17 @@ pub(crate) fn exists(dir: &Path, revision: u64) -> bool {
     checkpoint_path(dir, revision, EXTENSION).exists()
 }
 
-/// Writes a checkpoint of `snapshot` and returns its path.
-pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
+/// Writes a checkpoint of `snapshot` and returns its path; its scratch is charged within
+/// `admission` ([`write_parts`]).
+pub(crate) fn write(
+    dir: &Path,
+    snapshot: &Snapshot,
+    admission: Option<&Arc<SharedBudget>>,
+) -> EngineResult<PathBuf> {
     let version = snapshot.version();
     write_parts(
         dir,
+        admission,
         snapshot.revision(),
         snapshot.dictionary(),
         snapshot.dictionary_len(),
@@ -551,29 +554,45 @@ pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
 /// entries `0..dictionary_len`, and each stack's permutations as `packed` gives them, in
 /// the order of the stack's layout (`layouts`: asserted, inferred). Each is written before the next is asked for, so a
 /// caller can build one at a time and drop it (bulk loads).
+///
+/// The scratch of the dictionary's section is charged to a budget within `admission`, the
+/// process's root (`EngineConfig::admission`; `None`: no limit), before it is allocated:
+/// refused, it fails with [`EngineError::MemoryLimit`] and publishes nothing.
 pub(crate) fn write_parts<'a>(
     dir: &Path,
+    admission: Option<&Arc<SharedBudget>>,
     revision: u64,
     dictionary: &Dictionary,
     dictionary_len: u64,
     layouts: [Layout; 2],
     packed: &mut dyn FnMut(Stack, Permutation) -> EngineResult<Cow<'a, PackedKeys>>,
 ) -> EngineResult<PathBuf> {
+    let admission = Budget::unlimited().within(admission.cloned());
+    // The writer's buffers, and keys compressed with tables trained on a sample of them
+    // ([`crate::term::vocabulary`]), before the file is made.
+    let mut buffers = Reservation::new(&admission);
+    buffers.charge(WRITER + 2 * BUFFER)?;
+    // The codec before its charge: a tuple's fields drop in order.
+    let trained = match vocabulary_encoding() {
+        VocabularyEncoding::Fsst => {
+            let sample = dictionary.sample_within(dictionary_len, &admission)?;
+            Some(Codec::train_within(&sample, &admission)?)
+        }
+        VocabularyEncoding::Plain => None,
+    };
+    let codec = trained.as_ref().map(|(codec, _)| codec);
     let tmp = checkpoint_path(dir, revision, "tmp");
     let mut file = File::create(&tmp)?;
     // The magic is written last, once everything else is on file; it is checksummed apart
     // and the checksums combined.
     file.write_all(MAGIC)?;
     let mut out = Checksummed {
-        inner: BufWriter::with_capacity(1 << 20, file),
+        inner: BufWriter::with_capacity(WRITER, file),
         crc: crc32fast::Hasher::new(),
-        buffer: Vec::with_capacity(1 << 16),
+        buffer: Vec::with_capacity(2 * BUFFER),
         written: MAGIC.len() as u64,
     };
     put_u64(&mut out.buffer, revision);
-    // Keys compressed with tables trained on a sample of them ([`crate::term::vocabulary`]).
-    let codec = (vocabulary_encoding() == VocabularyEncoding::Fsst)
-        .then(|| Codec::train(&dictionary.sample_keys(dictionary_len)));
     let flags = match dictionary.integers_in_dictionary() {
         true => INTEGERS_IN_DICTIONARY,
         false => 0,
@@ -584,13 +603,8 @@ pub(crate) fn write_parts<'a>(
     put_u64(&mut out.buffer, flags);
     // Where the time goes, for the load log (bulk loads build the permutations here).
     let started = std::time::Instant::now();
-    write_dictionary(
-        &mut out,
-        dictionary,
-        dictionary_len,
-        codec.as_ref(),
-        &admission(),
-    )?;
+    write_dictionary(&mut out, dictionary, dictionary_len, codec, &admission)?;
+    write_text_order(&mut out, dictionary, dictionary_len)?;
     let dictionary_ms = started.elapsed().as_millis() as u64;
     let (mut build, mut write) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
     for (stack, layout) in Stack::ALL.into_iter().zip(layouts) {
@@ -886,67 +900,174 @@ pub(crate) fn remove_older_than(dir: &Path, revision: u64) -> EngineResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use nrese_exec::Budget;
-    use nrese_rdf::LiteralRef;
+    use std::path::Path;
+    use std::sync::Arc;
 
+    use nrese_exec::{Budget, SharedBudget};
+    use nrese_rdf::{GraphName, Literal, LiteralRef, NamedNode, Quad};
+
+    use super::Checksummed;
     use crate::term::Dictionary;
-    use crate::term::vocabulary::Codec;
+    use crate::term::vocabulary::{Codec, SAMPLE, Sample};
 
-    /// 70,000 keys over two of the hash's chunks, one block of 64 of them of 2,000
-    /// pseudo-random hex digits each (a wide offset block even compressed), and a codec
-    /// trained on them.
-    fn dictionary() -> (Dictionary, Codec) {
-        let dictionary = Dictionary::default();
-        for i in 0..70_000u64 {
-            let tail: String = match i {
-                6_400..6_464 => {
-                    let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ i;
-                    (0..2_000)
-                        .map(|_| {
-                            x ^= x << 13;
-                            x ^= x >> 7;
-                            x ^= x << 17;
-                            char::from_digit((x & 15) as u32, 16).unwrap()
-                        })
-                        .collect()
-                }
-                _ => String::new(),
-            };
-            dictionary.intern(LiteralRef::new_simple_literal(&format!("word {i}{tail}")).into());
-        }
-        let codec = Codec::train(&dictionary.export_keys(0, dictionary.len()));
-        (dictionary, codec)
+    /// `n` pseudo-random hex digits, from `seed`.
+    fn hex(seed: u64, n: usize) -> String {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ seed;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                char::from_digit((x & 15) as u32, 16).unwrap()
+            })
+            .collect()
     }
 
-    /// A checkpoint's dictionary scratch (hash table, homes, lengths, offsets, the codec's
-    /// copies) is charged to its admission before it is allocated: it grows with the whole
-    /// vocabulary, and was charged nowhere (EEV-25).
+    /// 70,000 keys over two of the hash's chunks: a block of 64 of them of 2,000
+    /// pseudo-random hex digits each (a wide offset block even compressed), and one of
+    /// 400,000 (compressed, longer than the writer's buffer), mapped from a section written
+    /// with a codec trained on them (a compressed base: each key decoded as it is read), and
+    /// 1,000 keys interned on top.
+    fn dictionary(dir: &Path) -> Dictionary {
+        let heap = Dictionary::default();
+        for i in 0..70_000u64 {
+            let tail = match i {
+                6_400..6_464 => hex(i, 2_000),
+                50_000 => hex(i, 400_000),
+                _ => String::new(),
+            };
+            heap.intern(LiteralRef::new_simple_literal(&format!("word {i}{tail}")).into());
+        }
+        let codec = Codec::train(&heap.export_keys(0, heap.len()));
+        let mut out = Checksummed {
+            inner: Vec::new(),
+            crc: crc32fast::Hasher::new(),
+            buffer: Vec::new(),
+            written: 0,
+        };
+        let budget = Budget::unlimited();
+        super::write_dictionary(&mut out, &heap, heap.len(), Some(&codec), &budget).unwrap();
+        super::write_text_order(&mut out, &heap, heap.len()).unwrap();
+        out.flush_buffer().unwrap();
+        let path = dir.join("dictionary");
+        std::fs::write(&path, out.inner).unwrap();
+        let map = crate::mapped::map(&path).unwrap();
+        let base = super::read_dictionary(&mut super::Reader::new(&map), &map, true, true, true);
+        let dictionary = Dictionary::default();
+        dictionary.restore_base(base.unwrap()).unwrap();
+        for i in 0..1_000 {
+            dictionary.intern(LiteralRef::new_simple_literal(&format!("new {i}")).into());
+        }
+        dictionary
+    }
+
+    /// Samples FSST trains on at its largest: the most keys a sample has, each empty (FSST
+    /// copies the list of them), of either table; long keys of both (FSST samples them, one
+    /// table trained while the other lives); every byte value, in no order (the most symbol
+    /// pairs it weighs).
+    fn largest_trainings() -> [Vec<Vec<u8>>; 4] {
+        let empty = |tag: &[u8]| vec![tag.to_vec(); 2 * SAMPLE - 1];
+        let long = (0..2_000)
+            .map(|i| format!("{} item {i} {}", ["I", "S"][i % 2], "of words ".repeat(50)))
+            .map(String::into_bytes)
+            .collect();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let noise = (0..2_000)
+            .map(|i| {
+                let bytes = (0..500).map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                });
+                [b"IS"[i % 2]].into_iter().chain(bytes).collect()
+            })
+            .collect();
+        [empty(b"S"), empty(b"I"), long, noise]
+    }
+
+    /// A checkpoint's dictionary section takes nothing it didn't charge to its admission
+    /// first: the codec's sample and training, the keys of a compressed base decoded (Sol's
+    /// review: 176,020 bytes held beyond the charges), the hash table, homes, lengths and
+    /// offsets, the keys compressed, and the writer's buffer, which never grows (a key past
+    /// it is written after it). All of it grows with the whole vocabulary, however small the
+    /// change since the last checkpoint, and was charged nowhere (EEV-25). Rows after the
+    /// section's: the codec's training at its largest, within the constants it charges for
+    /// FSST's training and tables (fsst pinned; a new version fails here first).
     #[test]
-    fn the_dictionary_scratch_holds_what_it_charged() {
+    fn the_dictionary_section_holds_what_it_charged() {
         if !nrese_exec::measure::alone() {
             return;
         }
-        let (dictionary, codec) = dictionary();
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = dictionary(dir.path());
         let budget = Budget::unlimited();
-        let (written, excess) = nrese_exec::measure::measure_within(&budget, || {
-            let (slots, lengths) =
-                super::hashed(&dictionary, dictionary.len(), Some(&codec), &budget).unwrap();
-            let offsets = super::offsets(&lengths, &budget).unwrap();
-            (slots.len(), lengths.len(), offsets.1.len())
+        let mut out = Checksummed {
+            inner: std::io::sink(),
+            crc: crc32fast::Hasher::new(),
+            buffer: Vec::with_capacity(2 * super::BUFFER),
+            written: 0,
+        };
+        let ((), section) = nrese_exec::measure::measure_within(&budget, || {
+            let sample = dictionary.sample_within(dictionary.len(), &budget).unwrap();
+            let trained = Codec::train_within(&sample, &budget).unwrap();
+            drop(sample);
+            let len = dictionary.len();
+            super::write_dictionary(&mut out, &dictionary, len, Some(&trained.0), &budget).unwrap();
         });
-        assert_eq!(written.1 as u64, dictionary.len());
-        assert_eq!(excess, 0, "bytes held beyond the charges");
+        let mut excess = vec![section];
+        for keys in largest_trainings() {
+            let (_, training) = nrese_exec::measure::measure_within(&budget, || {
+                let mut sample = Sample::new(&budget);
+                for key in &keys {
+                    sample.push(key).unwrap();
+                }
+                Codec::train_within(&sample, &budget).unwrap()
+            });
+            excess.push(training);
+        }
+        assert_eq!(excess, [0; 5], "bytes held beyond the charges");
         assert_eq!(budget.used(), 0);
     }
 
-    /// An admission without room for the scratch refuses the checkpoint's dictionary before
-    /// it is allocated, with a memory error, and holds nothing after.
+    /// A checkpoint its admission root has no room for fails with a memory error, once its
+    /// file is begun: it publishes nothing and holds nothing. The next start removes the
+    /// file and recovers the revision from the log, and a checkpoint with room is written
+    /// (Sol's review: the refusal was only seen in a helper).
     #[test]
-    fn a_checkpoint_without_room_for_its_scratch_is_refused() {
-        let (dictionary, codec) = dictionary();
-        let budget = Budget::new(64 * 1024);
-        let refused = super::hashed(&dictionary, dictionary.len(), Some(&codec), &budget);
+    fn a_checkpoint_its_admission_refuses_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = |admission| crate::EngineConfig {
+            background_maintenance: false,
+            admission,
+            ..Default::default()
+        };
+        // Room for the writer's buffers, none for the dictionary's scratch.
+        let root = SharedBudget::new(super::WRITER + 2 * super::BUFFER);
+        let engine = crate::Engine::open(dir.path(), config(Some(Arc::clone(&root)))).unwrap();
+        let mut transaction = engine.transaction();
+        transaction.insert(
+            Quad::new(
+                NamedNode::new_unchecked("urn:s"),
+                NamedNode::new_unchecked("urn:p"),
+                Literal::new_simple_literal("value"),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+        transaction.commit().unwrap();
+        let refused = engine.checkpoint();
         assert!(matches!(refused, Err(crate::EngineError::MemoryLimit(_))));
-        assert_eq!(budget.used(), 0);
+        assert_eq!((engine.snapshot().len(), root.used()), (1, 0));
+        assert!(!super::exists(dir.path(), 1));
+        assert!(super::checkpoint_path(dir.path(), 1, "tmp").exists());
+        drop(engine);
+        for _ in 0..2 {
+            let engine = crate::Engine::open(dir.path(), config(None)).unwrap();
+            assert!(!super::checkpoint_path(dir.path(), 1, "tmp").exists());
+            let snapshot = engine.snapshot();
+            assert_eq!((snapshot.revision(), snapshot.len()), (1, 1));
+            assert_eq!(engine.checkpoint().unwrap(), 1);
+        }
     }
 }
