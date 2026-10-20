@@ -54,8 +54,12 @@ pub(crate) fn text_of(key: &[u8]) -> Option<&[u8]> {
 /// sorted again by the next 8 bytes, until the runs are single entries or their texts end.
 /// RDF texts share long prefixes (`http://yago-knowledge.org/resource/`): a comparison
 /// sort met them in every one of its n·log n comparisons, reading both keys from the
-/// arena; here a prefix costs one read of each entry's key per 8 bytes. Transient memory:
-/// 16 bytes per entry (640 MB at DBpedia's 40 M terms), freed when the order is built.
+/// arena; here a prefix costs one read of each entry's key per 8 bytes. A run still
+/// together after [`DEEP`] words, or of at most [`FEW`] entries, is finished by comparing
+/// the rest of its texts: equal long texts cost a few comparisons, not a read of every key
+/// per 8 bytes, and the refinement nests no deeper than [`DEEP`] (a level per shared word
+/// overflowed the stack at texts of tens of kilobytes). Transient memory: 16 bytes per
+/// entry (640 MB at DBpedia's 40 M terms), freed when the order is built.
 pub(crate) fn sorted<'a, T>(
     range: std::ops::Range<u64>,
     key: &(dyn Fn(u64) -> Key<'a> + Sync),
@@ -133,6 +137,12 @@ impl Entry {
     }
 }
 
+/// The words a run of [`sorted`] is refined by at most: past them it is finished by
+/// comparing the rest of its texts ([`finish`]).
+const DEEP: usize = 32;
+/// The entries of a run that is finished by comparing its texts at any depth.
+const FEW: usize = 16;
+
 /// Sorts `entries`, whose texts agree on their first `depth · 8` bytes and whose words are
 /// those at `depth`.
 fn refine<'a>(entries: &mut [Entry], depth: usize, key: &(dyn Fn(u64) -> Key<'a> + Sync)) {
@@ -161,6 +171,10 @@ fn refine<'a>(entries: &mut [Entry], depth: usize, key: &(dyn Fn(u64) -> Key<'a>
         .filter(|run| run.len() > 1 && run[0].more())
         .collect();
     runs.into_par_iter().for_each(|run| {
+        if depth + 1 >= DEEP || run.len() <= FEW {
+            finish(run, depth + 1, key);
+            return;
+        }
         for entry in run.iter_mut() {
             let k = key(u64::from(entry.index));
             *entry = Entry::at(
@@ -172,6 +186,26 @@ fn refine<'a>(entries: &mut [Entry], depth: usize, key: &(dyn Fn(u64) -> Key<'a>
         }
         refine(run, depth + 1, key);
     });
+}
+
+/// Sorts `entries`, whose texts agree on their first `depth · 8` bytes and go on past them,
+/// by the rest of their texts, then their index: the order [`refine`] gives (a text that
+/// is a prefix of another comes first).
+fn finish<'a>(entries: &mut [Entry], depth: usize, key: &(dyn Fn(u64) -> Key<'a> + Sync)) {
+    fn rest<'k>(key: &'k [u8], entry: &Entry, depth: usize) -> &'k [u8] {
+        key.get(entry.skip() + depth * 8..).unwrap_or_default()
+    }
+    let order = |a: &Entry, b: &Entry| {
+        let (ka, kb) = (key(u64::from(a.index)), key(u64::from(b.index)));
+        rest(&ka, a, depth)
+            .cmp(rest(&kb, b, depth))
+            .then(a.index.cmp(&b.index))
+    };
+    if entries.len() > 1 << 14 {
+        entries.par_sort_unstable_by(order);
+    } else {
+        entries.sort_unstable_by(order);
+    }
 }
 
 /// The positions `start..end` of `order` whose text starts with `prefix`.
@@ -255,8 +289,9 @@ mod tests {
     use super::*;
 
     /// The radix refinement against a plain sort by (text, index): texts sharing long
-    /// prefixes, ending on and around 8-byte boundaries, containing zero bytes, and equal
-    /// texts under different tags; enough of them for the parallel branches.
+    /// prefixes (one past the depth where runs are finished by comparison), ending on and
+    /// around 8-byte boundaries, containing zero bytes, and equal texts under different
+    /// tags; enough of them for the parallel branches.
     #[test]
     fn the_word_radix_order_is_the_text_order() {
         let mut seed = 0x2026_1003_u64;
@@ -266,17 +301,19 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (seed >> 33) % n
         };
-        let stems: [&[u8]; 4] = [
+        let long = b"http://e/".repeat(DEEP);
+        let stems: [&[u8]; 5] = [
             b"http://yago-knowledge.org/resource/",
             b"http://e/",
             b"",
             b"ab\0",
+            &long,
         ];
         let tags: [&[u8]; 4] = [b"I", b"S", b"Len\0", b"Lde\0"];
         let mut keys: Vec<Vec<u8>> = Vec::new();
         for _ in 0..40_000 {
             let mut key = tags[next(4) as usize].to_vec();
-            key.extend_from_slice(stems[next(4) as usize]);
+            key.extend_from_slice(stems[next(5) as usize]);
             for _ in 0..next(20) {
                 key.push(b"ab\0z"[next(4) as usize]);
             }
