@@ -6,8 +6,11 @@
 use std::sync::Arc;
 
 use nrese_engine::{EncodedTriple, Engine, EngineConfig, QuadPattern, ReadModel, Snapshot};
-use nrese_exec::{Budget, measure};
+use nrese_exec::{Budget, Reservation, measure};
 use nrese_rdf::{NamedNode, Quad};
+
+#[global_allocator]
+static ALLOCATOR: measure::Measured<std::alloc::System> = measure::Measured(std::alloc::System);
 
 fn node(name: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("urn:{name}"))
@@ -54,8 +57,9 @@ fn snapshot(size: usize) -> Snapshot {
 
 /// A read of every statement in subject order holds the copies of the representative's
 /// statements for its later identities until the last of them is read: as many as the class
-/// has identities, times 20. At each class size the read holds no more than it charged, and
-/// a budget too small for the copies ends the read with its refusal kept.
+/// has identities, times 20. At each class size the read holds no more than it charged (its
+/// scan's working memory reserved first, as a charged reader does, the pending copies by the
+/// expansion), and a budget too small for the copies ends the read with its refusal kept.
 #[test]
 fn an_expansion_holds_no_more_than_it_charges() {
     if !measure::alone() {
@@ -64,8 +68,11 @@ fn an_expansion_holds_no_more_than_it_charges() {
     for size in [1, 10, 100, 1_000] {
         let snapshot = snapshot(size);
         let budget = Arc::new(Budget::unlimited());
+        let reader = snapshot.reading_within(Arc::clone(&budget));
         let (read, excess) = measure::measure_within(&budget, || {
-            let reader = snapshot.reading_within(Arc::clone(&budget));
+            let mut scan = Reservation::new(&*budget);
+            scan.charge(reader.scan_bytes(ReadModel::Materialised))
+                .expect("an unlimited budget");
             let read = reader
                 .quads_for_pattern_in(ReadModel::Materialised, &QuadPattern::all())
                 .count();
