@@ -260,6 +260,13 @@ class Queue:
             env["PATH"] = os.pathsep.join([*(str(expand(p)) for p in self.path), env.get("PATH", "")])
             code = made.returncode
             timed = job.get("window", "quiet") == "quiet" and self.watch
+            unquiet = ""
+            # What an earlier watcher of the job left suspended is resumed before the timed
+            # command starts; anything it can't settle and the chunk doesn't run (Sol, 20 Oct 2026:
+            # it ran on, measured over frozen work).
+            if code == 0 and timed and not quiet_reconcile(results / "quiet"):
+                code, unquiet = 3, f"an earlier watcher's suspensions couldn't be resumed ({results / 'quiet' / 'frozen'})"
+                out.write(f"=== {now} chunk {index + 1} not started: {unquiet}\n")
             if code == 0:
                 command = commands[index]
                 out.write(f"=== {now} chunk {index + 1} of {len(commands)}: {' '.join(command)}\n")
@@ -279,10 +286,13 @@ class Queue:
                     code, over = process.wait(), True
                 if watcher is not None:
                     watcher.terminate()
-                    watcher.wait(timeout=120)
+                    watched = watcher.wait(timeout=120)
                     verdicts = results / "quiet" / "watch.log"
                     lines = verdicts.read_text(encoding="utf-8").splitlines() if verdicts.exists() else []
                     job["quiet"] = lines[-1] if lines else "no verdict"
+                    # The watcher left something suspended: the chunk fails, whatever its exit.
+                    if watched != 0:
+                        unquiet = f"its watcher left suspensions ({results / 'quiet' / 'frozen'})"
             pidfile.unlink(missing_ok=True)
             if code == 0:
                 head = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"], capture_output=True, text=True,
@@ -292,7 +302,10 @@ class Queue:
                        creationflags=QUIET_WINDOW)
         job["exit"] = code
         job["results"] = str(results)
-        if over:
+        if unquiet:
+            job["note"] = f"chunk {index + 1}: {unquiet}; the record kept"
+            state = "failed"
+        elif over:
             job["note"] = (f"chunk {index + 1} ran past {chunk_min * 1.5:g} min and was stopped, its partial results "
                            f"kept: split it into chunks of about {chunk_min:g} min")
             state = "failed"
@@ -339,20 +352,25 @@ def stop(process: subprocess.Popen, grace_s: float = 30):
         pass
 
 
+QUIET_WATCH = HERE.parents[1] / "scripts" / "lib" / "quiet-watch.py"
+
+
+def quiet_reconcile(state: Path) -> bool:
+    """Resumes what an earlier watcher of the job left suspended (its record STATE/frozen);
+    whether nothing stays suspended. A host without the watcher has nothing to resume."""
+    if not (state / "frozen").exists() or not Path("/proc").is_dir() or not QUIET_WATCH.exists():
+        return True
+    return subprocess.run([sys.executable, str(QUIET_WATCH), str(state), "--resume"]).returncode == 0
+
+
 def quiet_watch(state: Path, pid: int, token: str) -> subprocess.Popen | None:
     """The watcher over a timed command (Linux): the job's own other busy work suspended,
-    anything else recorded as disturbing it, until it ends. What an earlier watcher of the job
-    left suspended is resumed first; if it can't be, no watcher starts (the job runs unwatched,
-    its verdict says so) and its record stays."""
-    watch = HERE.parents[1] / "scripts" / "lib" / "quiet-watch.py"
-    if not Path("/proc").is_dir() or not watch.exists():
+    anything else recorded as disturbing it, until it ends (its exit status: 1 when it left
+    anything suspended)."""
+    if not Path("/proc").is_dir() or not QUIET_WATCH.exists():
         return None
     state.mkdir(parents=True, exist_ok=True)
-    if (state / "frozen").exists() and subprocess.run([sys.executable, str(watch), str(state), "--resume"]).returncode:
-        (state / "watch.log").write_text("not watched: an earlier watcher's suspensions couldn't be resumed "
-                                         f"({state / 'frozen'})\n", encoding="utf-8")
-        return None
-    return subprocess.Popen([sys.executable, str(watch), str(state), str(pid), token])
+    return subprocess.Popen([sys.executable, str(QUIET_WATCH), str(state), str(pid), token])
 
 
 def here() -> tuple[str, dict]:
