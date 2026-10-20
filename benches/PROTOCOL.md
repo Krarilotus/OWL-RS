@@ -194,7 +194,8 @@ block's first run (tf2-gate-1, 20 Oct 2026: 15.8 % on one series). So the blocks
 squares: in every k blocks (k sides) each side opens one block and holds each place once.
 Each square's relabelling and row order are drawn from the round's seed (`GATE_SEED`, else drawn
 and kept in the results), as is the cases' order in each block; both are recorded in every
-report. A case in fewer blocks than whole squares keeps part of a first run's cost. Every block times each
+report. A case's blocks are whole squares (release_gate.py `whole_squares()`: with three timed
+sides 2 blocks become 3, 8 become 9): a partial square leaves part of the cost on one side. Every block times each
 side from a copy of its build made for that block and removed after it (`fast.py block
 --fresh-copies`): new files, read into new page-cache pages (below, *the unit*). A block writes
 one report per side and run (`pass-<n>-<side>.json`, each record with its block, layout and
