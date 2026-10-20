@@ -497,8 +497,19 @@ fn prepare() {
                 rayon::join(|| (), || ());
             };
             if rayon::current_thread_index().is_some() {
+                // Waiting for it runs this thread's jobs meanwhile: on a thread of the
+                // global pool, its own part of the broadcast, which nothing else can run.
+                let done = AtomicBool::new(false);
                 std::thread::scope(|scope| {
-                    scope.spawn(warm);
+                    scope.spawn(|| {
+                        warm();
+                        done.store(true, SeqCst);
+                    });
+                    while !done.load(SeqCst) {
+                        if rayon::yield_now() != Some(rayon::Yield::Executed) {
+                            std::thread::yield_now();
+                        }
+                    }
                 });
             }
             warm();
