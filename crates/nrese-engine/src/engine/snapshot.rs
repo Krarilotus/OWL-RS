@@ -545,58 +545,18 @@ impl Snapshot {
         })
     }
 
-    /// The expanded matches of `pattern` in `model`, in the order of its access plan.
+    /// The expanded matches of `pattern` in `model`, in the order of its access plan,
+    /// merged as they are read: nothing is collected. Every layout keeps the permutation a
+    /// pattern's access plan reads (`Layout::supports`, tested over every pattern shape).
     fn expanded<'a>(
         &'a self,
         classes: Arc<EqualityClasses>,
         model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
-        let data = self.data(model);
         let permutation = AccessPlan::for_pattern(&classes.normalised(pattern)).permutation;
-        match self.expanded_sorted(Arc::clone(&classes), model, pattern, permutation) {
-            Some(sorted) => Either::Left(sorted),
-            None => {
-                // A layout without the permutation: every match, then sorted.
-                let mut all: Vec<EncodedQuad> = Vec::new();
-                let normalised = classes.normalised(pattern);
-                for stack in Stack::ALL {
-                    for quad in data.stack(stack).scan(&normalised) {
-                        if !quad.graph.is_default_graph() {
-                            if model == ReadModel::Materialised
-                                && (normalised == *pattern || self.canonical)
-                            {
-                                all.push(quad);
-                            }
-                            continue;
-                        }
-                        if !classes.is_canonical(&quad) {
-                            continue;
-                        }
-                        let touching = classes.touches(&quad);
-                        let visibility = CopyVisibility::new(data, model);
-                        classes.expand(&quad, pattern, &mut |copy| {
-                            if visibility.shows(&copy, touching) {
-                                all.push(copy);
-                            }
-                        });
-                    }
-                }
-                if model == ReadModel::Materialised
-                    && pattern.graph == GraphSelector::Any
-                    && normalised != *pattern
-                    && !self.canonical
-                {
-                    all.extend(
-                        data.asserted
-                            .scan(pattern)
-                            .filter(|quad| !quad.graph.is_default_graph()),
-                    );
-                }
-                all.sort_unstable_by_key(|quad| permutation.to_key(quad));
-                Either::Right(all.into_iter())
-            }
-        }
+        self.expanded_sorted(classes, model, pattern, permutation)
+            .expect("every layout keeps the permutation of a pattern's access plan")
     }
 
     /// The number of quads matching `pattern` in `model`, expanded: the stored matches over
@@ -1328,6 +1288,32 @@ impl Snapshot {
     }
 
     /// Id of `term` as of this snapshot; `None` if the term is unknown (so no quad uses it).
+    /// [`Self::lookup`], what it allocates charged first through `charge`
+    /// ([`Dictionary::lookup_charged`]: the bound and the lookup read one state of the
+    /// dictionary, which a checkpoint may otherwise change between them).
+    pub fn lookup_charged<E>(
+        &self,
+        term: TermRef<'_>,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<TermId>, E> {
+        self.dictionary
+            .lookup_charged(term, self.version.dictionary_len, charge)
+    }
+
+    /// The most bytes a read of this snapshot in `model` holds while it runs
+    /// ([`Self::quads_for_pattern_in`] without equality expansion): each stack's merge,
+    /// its cursors and a decoded block per run. What a charged reader reserves first. The
+    /// runs are this snapshot's own, which no checkpoint changes. An expansion holds its
+    /// pending copies besides.
+    pub fn scan_bytes(&self, model: ReadModel) -> usize {
+        let data = self.data(model);
+        Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack))
+            .map(|stack| data.stack(stack).scan_bytes())
+            .sum()
+    }
+
     pub fn lookup(&self, term: TermRef<'_>) -> Option<TermId> {
         self.dictionary
             .lookup_bounded(term, self.version.dictionary_len)
@@ -1363,6 +1349,32 @@ impl Snapshot {
 
     pub fn decode(&self, id: TermId) -> Option<Term> {
         self.dictionary.decode(id)
+    }
+
+    /// [`Self::decode`] of the dictionary term `id`, what it allocates charged first
+    /// through `charge` ([`Dictionary::decode_charged`]: the bound and the decoding read one
+    /// state of the dictionary). `Ok(None)` for inline ids, triple terms and ids this
+    /// snapshot doesn't know.
+    pub fn decode_charged<E>(
+        &self,
+        id: TermId,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<Term>, E> {
+        if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
+            return Ok(None);
+        }
+        self.dictionary.decode_charged(id, charge)
+    }
+
+    /// An upper bound of the bytes [`Self::decode`] allocates for `id`, for the dictionary
+    /// as stored now: a checkpoint may store the term compressed after, so a charge for a
+    /// decode goes through [`Self::decode_charged`]. `None` for inline ids, triple terms and
+    /// ids this snapshot doesn't know.
+    pub fn decode_bound(&self, id: TermId) -> Option<usize> {
+        if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
+            return None;
+        }
+        self.dictionary.decode_bound(id)
     }
 
     /// Calls `f` with a borrowed view of the dictionary term `id` (see

@@ -919,42 +919,47 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
 /// that join them on `?graph` like on any variable.
 ///
 /// Anything else is evaluated graph by graph: a row without a scan (VALUES, an empty
-/// group, BIND alone), a property path (followed within one graph), a subquery or a nested
-/// GRAPH (their `?graph` is another variable), MINUS (the shared `?graph` would make rows
-/// with no other common variable remove each other) and a BIND to `?graph` itself.
-fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
-    fn only_scans(pattern: &GraphPattern, graph: &Variable) -> bool {
+/// group, BIND alone), a property path (followed within one graph), a GeoSPARQL relation
+/// computed from geometries (`spatial`: within one graph's geometries), a subquery or a
+/// nested GRAPH (their `?graph` is another variable), MINUS (the shared `?graph` would make
+/// rows with no other common variable remove each other) and a BIND to `?graph` itself.
+fn scans_everywhere(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
+    fn only_scans(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
         match pattern {
-            GraphPattern::Bgp { .. } => true,
+            GraphPattern::Bgp { patterns } => !spatial || !patterns.iter().any(spatial::is_spatial),
             GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
-                inputs.iter().all(|input| only_scans(input, graph))
+                inputs.iter().all(|input| only_scans(input, graph, spatial))
             }
             GraphPattern::LeftJoin {
                 left,
                 right,
                 expression,
             } => {
-                only_scans(left, graph)
-                    && only_scans(right, graph)
-                    && expression.as_ref().is_none_or(|e| filter(e, graph))
+                only_scans(left, graph, spatial)
+                    && only_scans(right, graph, spatial)
+                    && expression
+                        .as_ref()
+                        .is_none_or(|e| filter(e, graph, spatial))
             }
-            GraphPattern::Filter { inner, expr } => only_scans(inner, graph) && filter(expr, graph),
+            GraphPattern::Filter { inner, expr } => {
+                only_scans(inner, graph, spatial) && filter(expr, graph, spatial)
+            }
             GraphPattern::Extend { inner, bindings } => {
-                only_scans(inner, graph)
+                only_scans(inner, graph, spatial)
                     && bindings.iter().all(|(variable, expression)| {
-                        variable != graph && filter(expression, graph)
+                        variable != graph && filter(expression, graph, spatial)
                     })
             }
             _ => false,
         }
     }
     // `EXISTS` is a join on the shared variables, `?graph` among them.
-    fn filter(expression: &Expression, graph: &Variable) -> bool {
+    fn filter(expression: &Expression, graph: &Variable, spatial: bool) -> bool {
         match expression {
-            Expression::And(a, b) => filter(a, graph) && filter(b, graph),
-            Expression::Exists(pattern) => only_scans(pattern, graph),
+            Expression::And(a, b) => filter(a, graph, spatial) && filter(b, graph, spatial),
+            Expression::Exists(pattern) => only_scans(pattern, graph, spatial),
             Expression::Not(inner) if matches!(**inner, Expression::Exists(_)) => {
-                filter(inner, graph)
+                filter(inner, graph, spatial)
             }
             // An `EXISTS` anywhere else is not a join.
             other => !pushdown::per_solution(other) || !contains_any_exists(other),
@@ -1025,7 +1030,7 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
     if read_by_expressions(pattern, graph) && !bound_by_scans(pattern, graph) {
         return false;
     }
-    only_scans(pattern, graph) && rows_from_scans(pattern)
+    only_scans(pattern, graph, spatial) && rows_from_scans(pattern)
 }
 
 /// True if `expression` holds an `EXISTS` at any depth.
@@ -1196,6 +1201,9 @@ struct Context<'a> {
     numbers: RefCell<HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>>,
     cancellation: Option<CancellationToken>,
     budget: Arc<Budget>,
+    /// The request's envelope: what a part of the evaluation keeps beyond it (the spatial
+    /// index) draws from it ([`spatial`]).
+    memory: nrese_exec::Envelope,
     /// The operators run so far, for EXPLAIN; `None` when not explaining.
     trace: Option<RefCell<Vec<PlanStep>>>,
     /// Nesting depth of the operator being evaluated (for the trace).
@@ -1382,6 +1390,7 @@ impl<'a> Context<'a> {
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
             budget,
+            memory: options.resources.memory.clone(),
             trace: None,
             depth: Cell::new(0),
             probed: Cell::default(),
@@ -1409,6 +1418,22 @@ impl<'a> Context<'a> {
 
     /// The id of a constant of a pattern: an alias IRI ([`substitute`]) stands for its
     /// blank node.
+    /// [`Self::lookup_const`], what the snapshot's lookup allocates charged to `held` first
+    /// ([`Snapshot::lookup_charged`]).
+    fn lookup_const_charged(
+        &self,
+        term: nrese_rdf::TermRef<'_>,
+        held: &mut Reservation<&nrese_exec::Budget>,
+    ) -> Result<Option<TermId>, nrese_exec::BudgetExceeded> {
+        if let nrese_rdf::TermRef::NamedNode(n) = term
+            && n.as_str().starts_with(substitute::ALIAS)
+        {
+            return Ok(self.lookup_const(term));
+        }
+        self.snapshot
+            .lookup_charged(term, |bytes| held.charge(bytes))
+    }
+
     fn lookup_const(&self, term: nrese_rdf::TermRef<'_>) -> Option<TermId> {
         if let nrese_rdf::TermRef::NamedNode(n) = term
             && n.as_str().starts_with(substitute::ALIAS)
@@ -1842,15 +1867,16 @@ impl<'a> Context<'a> {
                     let (early, late): (Vec<_>, Vec<_>) = all
                         .into_iter()
                         .partition(|c| !as_written && pushdown::movable(c));
-                    let spatial_seed = self.spatial_seed(&early, patterns);
+                    let spatial_seed = self.spatial_seed(&early, patterns)?;
                     let mut early: Vec<(&Expression, Vec<Variable>)> = early
                         .into_iter()
                         .map(|c| (c, expression_variables(c)))
                         .collect();
-                    // A spatial filter's candidates from the R-tree start the joins.
+                    // A spatial filter's literals from the index start the joins; they
+                    // decide its conjunct, and come charged.
                     let mut solutions = match spatial_seed {
-                        Some(seed) => {
-                            let seed = self.produced(seed)?;
+                        Some((seed, decided)) => {
+                            early.remove(decided);
                             self.bgp_from(seed, patterns, &mut early)?
                         }
                         None => self.bgp(patterns, &hints, &mut early)?,
@@ -2101,7 +2127,7 @@ impl<'a> Context<'a> {
             }
             NamedNodePattern::Variable(v) => v,
         };
-        if scans_everywhere(inner, variable) {
+        if scans_everywhere(inner, variable, self.spatial_rewrite) {
             // Every row comes from scans, which bind the variable: one evaluation for
             // all graphs.
             let mut solutions = self.in_graph(GraphScope::Variable(variable.clone()), inner)?;
