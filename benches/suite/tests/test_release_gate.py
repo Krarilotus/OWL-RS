@@ -581,12 +581,19 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
                                    f'exec bash scripts/release-gate.sh block 2 {head} 1 - base={head} main={head} '
                                    f'cand={head}'],
                                   cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
+            # An A-B-B-A's A' (benches/suite/abba.py) is A's build by design: timed, never skipped.
+            aa = subprocess.run([bash, "-c", f'PATH="$(cygpath -u "{shim}" 2>/dev/null || echo "{shim}"):$PATH" '
+                                 f'exec bash scripts/release-gate.sh block 3 {head} 1 - a={head} a2={head} b={head}'],
+                                cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
+            reports = len(list(Path(tmp).glob("out/passes/pass-*.json"))) - 4  # block 2's: base and cand
             subprocess.run(["git", "worktree", "remove", "--force", f"{t}/gate/src-{head[:8]}"], cwd=ROOT,
                            capture_output=True)
         subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("block 2: done", done.stdout)
         self.assertIn("main is the same build as another side", done.stdout)  # timed once, as base
+        self.assertEqual((aa.returncode, reports), (0, 6), aa.stdout + aa.stderr)  # a, a2, b: twice each
+        self.assertNotIn("same build", aa.stdout)
 
     def test_a_main_that_is_the_base_is_timed_once_and_declared_once(self):
         """Orchestrator, 20 Oct 2026: the jobs require a main, so a confirmation passes the base

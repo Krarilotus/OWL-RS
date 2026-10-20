@@ -301,14 +301,15 @@ block)
   shift 5
   tree=$(worktree "$harness") || exit 2
   # Each side: its build of this layout, verified, and what its perf lab can do (CAPABILITIES).
-  # A baseline that is an earlier baseline's build (a confirmation job's main that is its base)
-  # is timed once, as that one (the report treats it so); the candidate always runs.
+  # A main that is an earlier side's build (a confirmation job's main that is its base) is timed
+  # once, as that one (the report treats it so); every other side always runs: an A-B-B-A's A'
+  # (benches/suite/abba.py) is A's build by design.
   sides=() names=() timed=()
   for spec in "$@"; do
     name=${spec%%=*}
     rev=$(git rev-parse "${spec#*=}") || exit 2
     bin=$(layout_bin "$rev" "$layout")
-    if [ "$name" != cand ] && printf '%s\n' "${timed[@]}" | grep -qxF -- "$bin"; then
+    if [ "$name" = main ] && printf '%s\n' "${timed[@]}" | grep -qxF -- "$bin"; then
       log "block $n: $name is the same build as another side ($(basename "$bin")): timed once"; continue
     fi
     [ "$name" = cand ] || timed+=("$bin")
