@@ -135,7 +135,7 @@ mod tests {
         let mut table =
             IdTable::from_rows(3, rows.iter().map(|r| &r[..]), &crate::test_budget()).unwrap();
         let hashed = group_rows(&table, &[0, 1], &crate::test_budget()).unwrap();
-        table.sort_by(&[0, 1]);
+        table.sort_by(&[0, 1]).unwrap();
         let sorted = group_rows(&table, &[0, 1], &crate::test_budget()).unwrap();
         assert_eq!(counted(&hashed), counted(&sorted));
         assert_eq!(sorted.len(), 21);

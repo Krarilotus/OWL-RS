@@ -130,7 +130,7 @@ impl Context<'_> {
                 IdTable::rows_only(rows.min(1))
             } else {
                 let mut table = solutions.table.project(&kept);
-                table.dedup_preserving_order();
+                table.dedup_preserving_order()?;
                 table
             };
             Ok(Solutions {
@@ -525,7 +525,7 @@ impl Context<'_> {
         }
 
         // HAVING over what is known by now drops groups before the OPTIONALs are read.
-        let mut keep = vec![true; group_count];
+        let mut keep = self.mask(group_count, true)?;
         if let Some(having) = having {
             let mut vars = variables.to_vec();
             let mut columns = groups.keys.try_clone(&self.budget)?.into_columns();
@@ -547,8 +547,8 @@ impl Context<'_> {
                     if pushdown::movable(conjunct) && reads.iter().all(|v| known.vars.contains(v)) {
                         let mask = self.filter_mask(&known, conjunct)?;
                         keep.iter_mut()
-                            .zip(mask)
-                            .for_each(|(keep, pass)| *keep &= pass);
+                            .zip(mask.iter())
+                            .for_each(|(keep, &pass)| *keep &= pass);
                     }
                 }
             }
@@ -626,7 +626,7 @@ impl Context<'_> {
             vars.extend(from_core.iter().cloned());
             to_representatives(&vars, &mut columns);
             let mut table = IdTable::from_columns(columns);
-            table.dedup_preserving_order();
+            table.dedup_preserving_order()?;
             let left = self.produced(Solutions {
                 vars,
                 table,
@@ -645,7 +645,7 @@ impl Context<'_> {
                 let mut columns = std::mem::take(&mut right.table).into_columns();
                 to_representatives(&right.vars, &mut columns);
                 right.table = IdTable::from_columns(columns);
-                right.table.dedup_preserving_order();
+                right.table.dedup_preserving_order()?;
             }
             let start = std::time::Instant::now();
             // A left join keeps its left rows, and meets about one partner per row.

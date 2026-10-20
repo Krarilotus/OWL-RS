@@ -1310,8 +1310,8 @@ mod tests {
                 expected,
                 "hash, case {case}"
             );
-            left.sort_by(&lk);
-            right.sort_by(&rk);
+            left.sort_by(&lk).unwrap();
+            right.sort_by(&rk).unwrap();
             let merged = join(&left, &right, &lk, &rk, &budget(), usize::MAX).unwrap();
             assert_eq!(sorted_rows(&merged), expected, "merge, case {case}");
             assert!(merged.is_sorted_on(&lk));
@@ -1505,8 +1505,8 @@ mod tests {
         let (lk, rk) = ([0], [1]);
 
         let hashed = join(&left, &right, &lk, &rk, &budget(), usize::MAX).unwrap();
-        left.sort_by(&lk);
-        right.sort_by(&rk);
+        left.sort_by(&lk).unwrap();
+        right.sort_by(&rk).unwrap();
         let merged = join(&left, &right, &lk, &rk, &budget(), usize::MAX).unwrap();
         assert_eq!(
             merged,
@@ -1544,10 +1544,12 @@ mod tests {
         let held = budget();
         let table = BuildTable::new(&right, &rk, &held, |_| true).unwrap();
         let mut anti = left.clone();
-        anti.retain(|t, row| table.first(t, row, &lk) == END);
+        anti.retain(|t, row| table.first(t, row, &lk) == END)
+            .unwrap();
         assert_eq!(anti_join(&left, &right, &lk, &rk, &budget()).unwrap(), anti);
         let mut semi = left.clone();
-        semi.retain(|t, row| table.first(t, row, &lk) != END);
+        semi.retain(|t, row| table.first(t, row, &lk) != END)
+            .unwrap();
         assert_eq!(semi_join(&left, &right, &lk, &rk, &budget()).unwrap(), semi);
     }
 
