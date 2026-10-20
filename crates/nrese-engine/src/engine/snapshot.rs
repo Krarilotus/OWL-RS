@@ -1754,22 +1754,35 @@ impl Snapshot {
         bits.resize(words, 0)?;
         let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
         scratch.charge(self.walk_scratch(words))?;
-        // The index first (only the count needs it); then per graph, each kind's walk, a
-        // scan (where the index can't walk them) marking every kind at once.
-        self.cover(documents);
-        let mut mark = |graph: GraphSelector| {
-            for &kind in documents.kinds() {
-                if self.mark_values(model, graph, documents, kind, &mut bits) {
-                    break;
+        // Per graph, each kind's walk; a scan (where the index can't walk them) marks every
+        // kind at once. Only the count needs the index: on a pool thread it is covered
+        // while the statements are walked (the cover, on this thread, as it would be
+        // alone); elsewhere first.
+        let marks: &mut [u64] = &mut bits;
+        let mut walk = move || {
+            let mut mark = |graph: GraphSelector| {
+                for &kind in documents.kinds() {
+                    if self.mark_values(model, graph, documents, kind, marks) {
+                        break;
+                    }
+                }
+            };
+            match scope {
+                TextScope::Graphs(graphs) => mark(*graphs),
+                TextScope::Merge(graphs) => {
+                    for &graph in graphs {
+                        mark(GraphSelector::Exact(graph));
+                    }
                 }
             }
         };
-        match scope {
-            TextScope::Graphs(graphs) => mark(*graphs),
-            TextScope::Merge(graphs) => {
-                for &graph in graphs {
-                    mark(GraphSelector::Exact(graph));
-                }
+        match rayon::current_thread_index() {
+            Some(_) => {
+                rayon::join(|| self.cover(documents), walk);
+            }
+            None => {
+                self.cover(documents);
+                walk();
             }
         }
         drop(scratch);
