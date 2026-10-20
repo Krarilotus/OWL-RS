@@ -380,8 +380,29 @@ impl PackedKeys {
 
     /// Packs `keys`, which must be sorted, in `encoding`.
     pub(crate) fn from_sorted_as(keys: &[Key], encoding: IndexEncoding) -> Self {
-        debug_assert!(keys.is_sorted(), "keys must be sorted");
         let parallel = keys.len() >= PARALLEL_PACK;
+        Self::packed(keys, encoding, &mut super::Uncharged, parallel)
+            .unwrap_or_else(|_| unreachable!("nothing is charged"))
+    }
+
+    /// [`Self::from_sorted`], each array reserved on `charge` before it is made (what the
+    /// keys keep stays reserved; the packing's working memory is released), on one thread.
+    pub(crate) fn from_sorted_within(
+        keys: &[Key],
+        charge: &mut impl super::Charge,
+    ) -> Result<Self, nrese_exec::BudgetExceeded> {
+        Self::packed(keys, current_encoding(), charge, false)
+    }
+
+    fn packed(
+        keys: &[Key],
+        encoding: IndexEncoding,
+        charge: &mut impl super::Charge,
+        parallel: bool,
+    ) -> Result<Self, nrese_exec::BudgetExceeded> {
+        debug_assert!(keys.is_sorted(), "keys must be sorted");
+        let blocks = keys.len().div_ceil(BLOCK);
+        charge.reserve(blocks * std::mem::size_of::<Header>())?;
         let mut headers: Vec<Header> = if parallel {
             keys.par_chunks(BLOCK)
                 .map(|block| Header::of(block, encoding))
@@ -397,7 +418,10 @@ impl PackedKeys {
             words += header.words(block.len());
         }
         // One spare word, so reads never cross the end.
+        charge.reserve((words + 1) * std::mem::size_of::<u64>())?;
         let mut data = vec![0u64; words + 1];
+        let slices_bytes = headers.len() * std::mem::size_of::<&mut [u64]>();
+        charge.reserve(slices_bytes)?;
         let mut slices: Vec<&mut [u64]> = Vec::with_capacity(headers.len());
         let mut rest = data.as_mut_slice();
         for (header, block) in headers.iter().zip(keys.chunks(BLOCK)) {
@@ -417,12 +441,14 @@ impl PackedKeys {
                 header.pack(block, bits);
             }
         }
-        Self {
+        charge.release(slices_bytes);
+        charge.reserve(blocks * std::mem::size_of::<Key>())?;
+        Ok(Self {
             len: keys.len(),
             headers: Storage::Owned(headers.into_boxed_slice()),
             firsts: Storage::Owned(keys.chunks(BLOCK).map(|block| block[0]).collect()),
             data: Storage::Owned(data.into_boxed_slice()),
-        }
+        })
     }
 
     /// Packs `len` sorted keys that `gather` produces a block at a time (it appends the

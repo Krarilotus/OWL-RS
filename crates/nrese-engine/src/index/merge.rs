@@ -26,6 +26,16 @@ struct Cursor<'a> {
     buffered: usize,
 }
 
+/// The most a merge over `runs` runs holds at once: its list of cursors and each cursor's
+/// buffer of decoded keys, both grown by doubling, so at most an old and a new block of
+/// each at once (a buffer's first block is one key short of [`super::keys::BLOCK`], the
+/// next grows it to twice that).
+pub(crate) fn scan_bytes(runs: usize) -> usize {
+    let cursors = runs.next_power_of_two().max(4);
+    let buffer = 3 * super::keys::BLOCK * std::mem::size_of::<Key>();
+    3 * cursors * std::mem::size_of::<Cursor<'_>>() + runs * buffer
+}
+
 /// A range at least this long left in the current block is decoded block-wise.
 const BUFFER_FROM: usize = 16;
 

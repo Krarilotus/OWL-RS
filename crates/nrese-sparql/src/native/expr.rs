@@ -131,6 +131,9 @@ pub struct Evaluator {
     aliases: std::sync::RwLock<HashMap<String, Term>>,
     /// This query run, in the blank nodes `BNODE(label)` makes.
     run: u64,
+    /// Under canonical answers, the classes the canonical-name function names terms by
+    /// ([`super::canonical`]).
+    canonical: Option<super::canonical::Names>,
 }
 
 thread_local! {
@@ -154,6 +157,11 @@ impl Evaluator {
         let result = evaluate();
         SOLUTION.with(|s| s.set(previous));
         result
+    }
+
+    /// The classes canonical answers name terms by ([`super::canonical`]).
+    pub(crate) fn set_canonical(&mut self, names: Option<super::canonical::Names>) {
+        self.canonical = names;
     }
 
     /// Makes `alias` evaluate to `term` (a blank node put into a pattern).
@@ -487,7 +495,14 @@ impl Evaluator {
                 let values: Option<Vec<Term>> = (0..args.len()).map(arg).collect();
                 super::geo::call(name.as_str(), &values?)
             }
-            Function::Custom(name) => cast(name.as_str(), arg(0)?),
+            // The canonical-name function is only in canonical answers' plans: no cast
+            // pays for it.
+            Function::Custom(name) => match cast(name.as_str(), arg(0)?) {
+                None if name.as_str() == super::canonical::FUNCTION => {
+                    Some(self.canonical.as_ref()?.term(arg(0)?))
+                }
+                cast => cast,
+            },
             Function::Str => match arg(0)? {
                 Term::NamedNode(node) => Some(Literal::new_simple_literal(node.as_str()).into()),
                 // The lexical form, as written (SPARQL 1.1 §17.4.2.5): STR("03"^^xsd:integer)

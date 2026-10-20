@@ -185,6 +185,8 @@ pub(crate) struct Version {
     /// What its statements are: kept where only their layout changes (compaction, a
     /// checkpoint mapped), new for any other version ([`Content`]).
     pub(crate) content: Content,
+    /// What canonical reads of it read, once asked for ([`equality::CanonicalCache`]).
+    pub(crate) canonical: equality::CanonicalCache,
 }
 
 /// The identity of a version's statements: two versions with the same one show the same
@@ -217,6 +219,7 @@ impl Version {
             dictionary_len: 0,
             equality: Default::default(),
             content: Content::fresh(),
+            canonical: Default::default(),
         }
     }
 
@@ -243,6 +246,8 @@ impl Version {
             equality: Arc::clone(&self.equality),
             // Only compaction replaces a stack this way: the same statements.
             content: self.content,
+            // A canonical view of the old runs would hold them: made afresh.
+            canonical: Default::default(),
         };
         *next.stack_mut(stack) = index;
         next
@@ -357,6 +362,9 @@ struct Shared {
     /// `owl:sameAs`, when the inferred stack holds the closure over representatives
     /// ([`Engine::set_equality`]).
     equality: RwLock<Option<TermId>>,
+    /// What the canonical views versions keep are charged to
+    /// ([`Engine::set_canonical_view_budget`]).
+    views: RwLock<Arc<nrese_exec::Budget>>,
 }
 
 impl Shared {
@@ -366,6 +374,7 @@ impl Shared {
             Arc::clone(&self.dictionary),
             Arc::clone(&self.statistics),
             *self.equality.read(),
+            Arc::clone(&self.views.read()),
         )
     }
 
@@ -441,6 +450,7 @@ impl Shared {
                     dictionary_len: current.dictionary_len,
                     equality: Arc::clone(&current.equality),
                     content: current.content,
+                    canonical: Default::default(),
                 }
             });
         }
@@ -608,6 +618,7 @@ impl Engine {
             maintaining: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
             equality: RwLock::new(None),
+            views: RwLock::new(Arc::new(nrese_exec::Budget::unlimited())),
         });
         let worker = config
             .background_maintenance
@@ -647,6 +658,15 @@ impl Engine {
     /// reads the stacks as stored.
     pub fn set_equality(&self, same_as: Option<TermId>) {
         *self.inner.shared.equality.write() = same_as;
+    }
+
+    /// What the canonical views of versions are charged to while their versions keep them
+    /// (canonical equality answers; `Snapshot::with_canonical_equality`): unlimited unless
+    /// given one. A view the budget refuses is made on its reader's own budget, for that
+    /// reader alone ([`Snapshot::with_canonical_equality_within`]). Snapshots taken from now
+    /// on use it.
+    pub fn set_canonical_view_budget(&self, budget: Arc<nrese_exec::Budget>) {
+        *self.inner.shared.views.write() = budget;
     }
 
     /// `owl:sameAs` if reads expand equality classes ([`Self::set_equality`]).

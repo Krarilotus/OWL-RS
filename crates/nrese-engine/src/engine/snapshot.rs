@@ -36,6 +36,35 @@ pub struct Snapshot {
     /// Reads give each class's statements once, over its representative (stage C,
     /// [`Self::with_canonical_equality`]), instead of expanding them.
     canonical: bool,
+    /// What canonical reads in a model with inferred statements read: the version with
+    /// its named graphs over representatives (`equality::canonical_version`), where that
+    /// differs from `version`. The canonical model's view, never `version` itself, which
+    /// the asserted model and [`Self::stored`] read as stored ([`Self::data`]).
+    canonical_data: Option<super::equality::View>,
+    /// What the canonical views versions keep are charged to, beside the readers' own
+    /// budgets ([`crate::Engine::set_canonical_view_budget`]).
+    views: Arc<nrese_exec::Budget>,
+}
+
+/// The canonical view of `version` under `same_as` ([`Snapshot::canonical_data`]): made on
+/// `views` and kept, else on `fallback` for this reader ([`super::equality::CanonicalCache`]);
+/// `None` where it is `version` itself.
+fn canonical_data(
+    version: &Arc<Version>,
+    same_as: Option<TermId>,
+    views: &Arc<nrese_exec::Budget>,
+    fallback: &Arc<nrese_exec::Budget>,
+) -> Result<Option<super::equality::View>, nrese_exec::BudgetExceeded> {
+    match same_as {
+        Some(same_as) => super::equality::CanonicalCache::view(version, same_as, views, fallback),
+        None => Ok(None),
+    }
+}
+
+/// An unlimited budget, where a reader brings none: one for the process.
+fn unlimited() -> &'static Arc<nrese_exec::Budget> {
+    static UNLIMITED: std::sync::OnceLock<Arc<nrese_exec::Budget>> = std::sync::OnceLock::new();
+    UNLIMITED.get_or_init(|| Arc::new(nrese_exec::Budget::unlimited()))
 }
 
 /// Inferred statements hidden from a reader, as runs stacked over the inferred stack
@@ -112,6 +141,7 @@ impl Snapshot {
         dictionary: Arc<Dictionary>,
         statistics: Arc<Statistics>,
         equality: Option<TermId>,
+        views: Arc<nrese_exec::Budget>,
     ) -> Self {
         Self {
             version,
@@ -119,6 +149,8 @@ impl Snapshot {
             statistics,
             equality,
             canonical: false,
+            canonical_data: None,
+            views,
         }
     }
 
@@ -132,6 +164,7 @@ impl Snapshot {
         Snapshot {
             equality: same_as,
             canonical: false,
+            canonical_data: None,
             ..self.clone()
         }
     }
@@ -141,26 +174,160 @@ impl Snapshot {
         Snapshot {
             equality: None,
             canonical: false,
+            canonical_data: None,
             ..self.clone()
         }
     }
 
     /// This snapshot reading equality classes canonically (work package W4, stage C):
     /// each statement of the default graph once, over its terms' representatives, the
-    /// pattern's constants in place; no copies for the other identities. Answers over it
+    /// pattern's constants in place; no copies for the other identities. Named graphs are
+    /// read over representatives too (`equality::canonical_version`), so that every id a
+    /// read gives in a model with inferred statements is a representative. Answers over it
     /// name one identity per class (`equality.answers = "canonical"`), and a query engine
     /// joins over it and expands the classes after the joins ([`Self::expand_late`]).
     /// Without equality classes it reads as this snapshot.
     pub fn with_canonical_equality(&self) -> Snapshot {
-        Snapshot {
+        self.with_canonical_equality_within(unlimited())
+            .unwrap_or_else(|_| unreachable!("an unlimited budget refuses nothing"))
+    }
+
+    /// [`Self::with_canonical_equality`], its view made on `fallback`, the reader's own
+    /// budget (a query's envelope), where the view budget refuses it: then the view is this
+    /// snapshot's alone, and holds its charge to `fallback` until the snapshot goes. An
+    /// error where `fallback` refuses it too, before anything is made.
+    pub fn with_canonical_equality_within(
+        &self,
+        fallback: &Arc<nrese_exec::Budget>,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        Ok(Snapshot {
             canonical: true,
+            canonical_data: canonical_data(&self.version, self.equality, &self.views, fallback)?,
             ..self.clone()
+        })
+    }
+
+    /// Whether a triple term this snapshot's statements hold names, at any depth, another
+    /// identity of a class than its representative. In the quotient that term and its
+    /// representatives' are one, which no stored id stands for: canonical answers can't
+    /// answer over such a snapshot (`nrese_sparql` refuses it). Triple terms are objects
+    /// only and their ids one range: a seek in the object-first index, then each distinct
+    /// triple term once; made once per version.
+    pub fn triple_terms_name_aliases(&self) -> bool {
+        let Some(same_as) = self.equality else {
+            return false;
+        };
+        let classes = self.version.equality.classes(&self.version, same_as);
+        self.version.canonical.triple_terms(same_as, || {
+            let classes = &*classes;
+            {
+                let (low, high) = TermId::kind_range(crate::TermKind::Triple);
+                let plan = AccessPlan {
+                    permutation: Permutation::Ospg,
+                    low: [low.raw(), 0, 0, 0],
+                    high: [high.raw(), u64::MAX, u64::MAX, u64::MAX],
+                    exclude_default_graph: false,
+                };
+                let mut seen = std::collections::HashSet::new();
+                let data = self.data(ReadModel::Materialised);
+                Stack::ALL.into_iter().any(|stack| {
+                    let index = data.stack(stack);
+                    let objects: Box<dyn Iterator<Item = EncodedQuad>> =
+                        match index.layout().supports(Permutation::Ospg) {
+                            true => Box::new(index.scan_plan(&plan)),
+                            false => Box::new(index.scan(&QuadPattern::all())),
+                        };
+                    objects
+                        .map(|quad| quad.object)
+                        .filter(|object| object.kind() == crate::TermKind::Triple)
+                        .any(|object| self.names_alias(object, classes, &mut seen))
+                })
+            }
+        })
+    }
+
+    /// Whether the triple term `id` names an alias in a part, at any depth (`seen`: the
+    /// triple terms already found not to).
+    fn names_alias(
+        &self,
+        id: TermId,
+        classes: &EqualityClasses,
+        seen: &mut std::collections::HashSet<TermId>,
+    ) -> bool {
+        if !seen.insert(id) {
+            return false;
+        }
+        let parts = match self.components(id) {
+            Some(parts) => parts.to_vec(),
+            // Keyed by its text (the first RDF 1.2 version): its parts by lookup.
+            None => match self.decode(id) {
+                Some(Term::Triple(t)) => [
+                    Term::from(t.subject.clone()),
+                    t.predicate.clone().into(),
+                    t.object.clone(),
+                ]
+                .iter()
+                .filter_map(|part| self.lookup(part.as_ref()))
+                .collect(),
+                _ => Vec::new(),
+            },
+        };
+        parts.into_iter().any(|part| {
+            classes.is_alias(part.raw())
+                || (part.kind() == crate::TermKind::Triple && self.names_alias(part, classes, seen))
+        })
+    }
+
+    /// The canonical view of `version` this snapshot's reads take, if it reads canonically.
+    fn canonical_view(&self, version: &Arc<Version>) -> Option<super::equality::View> {
+        match self.canonical {
+            true => canonical_data(version, self.equality, &self.views, unlimited())
+                .unwrap_or_else(|_| unreachable!("an unlimited budget refuses nothing")),
+            false => None,
+        }
+    }
+
+    /// The version reads in `model` read: the canonical view for canonical reads in a
+    /// model with inferred statements, else the snapshot's own.
+    pub(crate) fn data(&self, model: ReadModel) -> &Arc<Version> {
+        match &self.canonical_data {
+            Some(view) if model != ReadModel::Asserted => view.version(),
+            _ => &self.version,
         }
     }
 
     /// Whether this snapshot reads equality classes canonically.
     pub fn reads_canonically(&self) -> bool {
         self.canonical
+    }
+
+    /// The equality classes by which reads in `model` name terms canonically: `Some` when
+    /// this snapshot reads canonically, the model has inferred statements and some class
+    /// exists. Under it a term stands for its class, shown by
+    /// [`EqualityClasses::representative`]. That is the one mapping of canonical answers
+    /// (research-designs §1, "Canonical answers"): every id such a read gives, from any
+    /// graph, is a representative; a constant of a pattern, in every graph (the graph's
+    /// name included), is normalised by it; every other id that meets those reads (a
+    /// query's constants, a
+    /// computed IRI, a federated row, an id an index keyed by stored ids gives, such as
+    /// the spatial or text index) must be mapped by it too. A value leaving those reads
+    /// for something that names terms as stored (a remote endpoint) goes as every
+    /// identity of its class ([`EqualityClasses::members_of`]). The asserted model, and
+    /// the snapshot read as stored ([`Self::stored`]), read the statements as stored.
+    pub fn canonical_classes(&self, model: ReadModel) -> Option<Arc<EqualityClasses>> {
+        if !self.canonical {
+            return None;
+        }
+        self.expanding(model, &QuadPattern::in_graph(TermId::DEFAULT_GRAPH))?;
+        self.equality_classes()
+    }
+
+    /// `id` as reads of the default graph in `model` name it ([`Self::canonical_classes`]):
+    /// its class's representative under canonical reads, else `id`. For one-off lookups; a
+    /// loop takes the classes once.
+    pub fn canonical_id(&self, model: ReadModel, id: TermId) -> TermId {
+        self.canonical_classes(model)
+            .map_or(id, |classes| classes.representative(id))
     }
 
     /// The classes to expand after joins over [`Self::with_canonical_equality`], if reads
@@ -195,15 +362,20 @@ impl Snapshot {
                 crate::index::IndexVersion::from_quads(self.version.inferred.layout(), kept)
             }
         };
+        let version = Arc::new(Version {
+            content: super::Content::fresh(),
+            asserted: self.version.asserted.clone(),
+            inferred,
+            revision: self.version.revision,
+            dictionary_len: self.version.dictionary_len,
+            equality: Default::default(),
+            canonical: Default::default(),
+        });
+        let canonical_data = self.canonical_view(&version);
         Snapshot {
-            version: Arc::new(Version {
-                content: super::Content::fresh(),
-                asserted: self.version.asserted.clone(),
-                inferred,
-                revision: self.version.revision,
-                dictionary_len: self.version.dictionary_len,
-                equality: Default::default(),
-            }),
+            canonical_data,
+            views: Arc::clone(&self.views),
+            version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
             equality: self.equality,
@@ -217,16 +389,21 @@ impl Snapshot {
     /// statistics and equality classes of its own. O(k log k) for k statements, as one
     /// more run.
     pub fn with_inferred_added(&self, added: &[EncodedQuad]) -> Snapshot {
+        let version = Arc::new(Version {
+            // Other statements than this snapshot's, at its revision.
+            content: super::Content::fresh(),
+            asserted: self.version.asserted.clone(),
+            inferred: self.version.inferred.with_delta(added, &[]),
+            revision: self.version.revision,
+            dictionary_len: self.version.dictionary_len,
+            equality: Default::default(),
+            canonical: Default::default(),
+        });
+        let canonical_data = self.canonical_view(&version);
         Snapshot {
-            version: Arc::new(Version {
-                // Other statements than this snapshot's, at its revision.
-                content: super::Content::fresh(),
-                asserted: self.version.asserted.clone(),
-                inferred: self.version.inferred.with_delta(added, &[]),
-                revision: self.version.revision,
-                dictionary_len: self.version.dictionary_len,
-                equality: Default::default(),
-            }),
+            canonical_data,
+            views: Arc::clone(&self.views),
+            version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
             equality: self.equality,
@@ -242,15 +419,20 @@ impl Snapshot {
         if mask.runs.iter().any(|run| run.layout() != stack.layout()) {
             return None;
         }
+        let version = Arc::new(Version {
+            content: super::Content::fresh(),
+            asserted: self.version.asserted.clone(),
+            inferred: stack.with_runs(&mask.runs),
+            revision: self.version.revision,
+            dictionary_len: self.version.dictionary_len,
+            equality: Default::default(),
+            canonical: Default::default(),
+        });
+        let canonical_data = self.canonical_view(&version);
         Some(Snapshot {
-            version: Arc::new(Version {
-                content: super::Content::fresh(),
-                asserted: self.version.asserted.clone(),
-                inferred: stack.with_runs(&mask.runs),
-                revision: self.version.revision,
-                dictionary_len: self.version.dictionary_len,
-                equality: Default::default(),
-            }),
+            canonical_data,
+            views: Arc::clone(&self.views),
+            version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
             equality: self.equality,
@@ -262,6 +444,30 @@ impl Snapshot {
     pub fn equality_classes(&self) -> Option<Arc<EqualityClasses>> {
         let same_as = self.equality?;
         Some(self.version.equality.classes(&self.version, same_as))
+    }
+
+    /// `pattern` as a read in `model` takes it: under canonical reads, in a model with
+    /// inferred statements, its constants (the graph's name included) by their
+    /// representatives, in every graph, as those reads give representatives from every
+    /// graph ([`Self::with_canonical_equality`]); else as given.
+    pub(crate) fn read_pattern<'p>(
+        &self,
+        model: ReadModel,
+        pattern: &'p QuadPattern,
+    ) -> std::borrow::Cow<'p, QuadPattern> {
+        use std::borrow::Cow;
+        if !self.canonical || model == ReadModel::Asserted {
+            return Cow::Borrowed(pattern);
+        }
+        match self.equality {
+            Some(same_as) => Cow::Owned(
+                self.version
+                    .equality
+                    .canonical(&self.version, same_as)
+                    .normalised_everywhere(pattern),
+            ),
+            None => Cow::Borrowed(pattern),
+        }
     }
 
     /// The classes a read of `pattern` in `model` expands: equality is on, some class
@@ -296,25 +502,27 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<impl Iterator<Item = EncodedQuad> + use<'a>> {
+        let data = self.data(model);
         let normalised = classes.normalised(pattern);
         let plan = AccessPlan::in_permutation(&normalised, permutation)?;
         let supported = Stack::ALL
             .into_iter()
-            .all(|stack| self.version.stack(stack).layout().supports(permutation));
+            .all(|stack| data.stack(stack).layout().supports(permutation));
         if !supported {
             return None;
         }
         // Named graphs are read as stored, with the pattern's own constants: from this
         // scan when the representatives are those constants, else from one of their own.
+        // A canonical snapshot's named graphs are over representatives: from this scan.
         let named = model == ReadModel::Materialised && pattern.graph == GraphSelector::Any;
-        let renamed = normalised != *pattern;
+        let renamed = normalised != *pattern && !self.canonical;
         let named_plan = match named && renamed {
             true => Some(AccessPlan::in_permutation(pattern, permutation)?),
             false => None,
         };
         let stored = SortedMerge {
-            left: self.version.asserted.scan_plan(&plan).peekable(),
-            right: self.version.inferred.scan_plan(&plan).peekable(),
+            left: data.asserted.scan_plan(&plan).peekable(),
+            right: data.inferred.scan_plan(&plan).peekable(),
             permutation,
         };
         let expanded = Expand::new(
@@ -324,11 +532,11 @@ impl Snapshot {
             permutation,
             named && !renamed,
             model,
-            &self.version,
+            data,
         );
         let named = named_plan
             .into_iter()
-            .flat_map(move |plan| self.version.asserted.scan_plan(&plan))
+            .flat_map(move |plan| data.asserted.scan_plan(&plan))
             .filter(|quad| !quad.graph.is_default_graph());
         Some(SortedMerge {
             left: expanded.peekable(),
@@ -344,6 +552,7 @@ impl Snapshot {
         model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
+        let data = self.data(model);
         let permutation = AccessPlan::for_pattern(&classes.normalised(pattern)).permutation;
         match self.expanded_sorted(Arc::clone(&classes), model, pattern, permutation) {
             Some(sorted) => Either::Left(sorted),
@@ -352,9 +561,11 @@ impl Snapshot {
                 let mut all: Vec<EncodedQuad> = Vec::new();
                 let normalised = classes.normalised(pattern);
                 for stack in Stack::ALL {
-                    for quad in self.stack_quads(stack, &normalised) {
+                    for quad in data.stack(stack).scan(&normalised) {
                         if !quad.graph.is_default_graph() {
-                            if model == ReadModel::Materialised && normalised == *pattern {
+                            if model == ReadModel::Materialised
+                                && (normalised == *pattern || self.canonical)
+                            {
                                 all.push(quad);
                             }
                             continue;
@@ -363,7 +574,7 @@ impl Snapshot {
                             continue;
                         }
                         let touching = classes.touches(&quad);
-                        let visibility = CopyVisibility::new(&self.version, model);
+                        let visibility = CopyVisibility::new(data, model);
                         classes.expand(&quad, pattern, &mut |copy| {
                             if visibility.shows(&copy, touching) {
                                 all.push(copy);
@@ -374,9 +585,11 @@ impl Snapshot {
                 if model == ReadModel::Materialised
                     && pattern.graph == GraphSelector::Any
                     && normalised != *pattern
+                    && !self.canonical
                 {
                     all.extend(
-                        self.stack_quads(Stack::Asserted, pattern)
+                        data.asserted
+                            .scan(pattern)
                             .filter(|quad| !quad.graph.is_default_graph()),
                     );
                 }
@@ -394,13 +607,17 @@ impl Snapshot {
         model: ReadModel,
         pattern: &QuadPattern,
     ) -> u64 {
+        let data = self.data(model);
         let normalised = classes.normalised(pattern);
-        let visibility = CopyVisibility::new(&self.version, model);
+        let visibility = CopyVisibility::new(data, model);
         let mut count = 0;
         for stack in Stack::ALL {
-            for quad in self.stack_quads(stack, &normalised) {
+            for quad in data.stack(stack).scan(&normalised) {
                 if !quad.graph.is_default_graph() {
-                    count += u64::from(model == ReadModel::Materialised && normalised == *pattern);
+                    count += u64::from(
+                        model == ReadModel::Materialised
+                            && (normalised == *pattern || self.canonical),
+                    );
                     continue;
                 }
                 if !classes.is_canonical(&quad) {
@@ -422,9 +639,12 @@ impl Snapshot {
         if model == ReadModel::Materialised
             && pattern.graph == GraphSelector::Any
             && normalised != *pattern
+            && !self.canonical
         {
             count += self
-                .stack_quads(Stack::Asserted, pattern)
+                .data(model)
+                .asserted
+                .scan(pattern)
                 .filter(|quad| !quad.graph.is_default_graph())
                 .count() as u64;
         }
@@ -435,14 +655,20 @@ impl Snapshot {
     /// equality classes, the stored matches without weighing the classes. Zero only if
     /// nothing matches.
     pub fn estimate_in(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         let Some(classes) = self.expanding(model, pattern) else {
             return self.count_in(model, pattern);
         };
-        let stored = self.stored();
+        let stored = Snapshot {
+            version: Arc::clone(self.data(model)),
+            ..self.stored()
+        };
         let normalised = classes.normalised(pattern);
         let mut estimate = stored.count_in(ReadModel::Materialised, &normalised);
-        // Named graphs are read with the pattern's own constants.
-        if normalised != *pattern && pattern.graph == GraphSelector::Any {
+        // Named graphs are read with the pattern's own constants (a canonical snapshot's,
+        // over representatives, with the normalised ones).
+        if normalised != *pattern && pattern.graph == GraphSelector::Any && !self.canonical {
             estimate += stored.count_in(ReadModel::Asserted, pattern);
         }
         estimate
@@ -455,8 +681,12 @@ impl Snapshot {
 
     /// A snapshot of `version` over this one's dictionary and statistics.
     pub(super) fn with_version(&self, version: Version) -> Snapshot {
+        let version = Arc::new(version);
+        let canonical_data = self.canonical_view(&version);
         Snapshot {
-            version: Arc::new(version),
+            canonical_data,
+            views: Arc::clone(&self.views),
+            version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::clone(&self.statistics),
             equality: self.equality,
@@ -510,7 +740,7 @@ impl Snapshot {
         Stack::ALL
             .into_iter()
             .filter(|&stack| model.includes(stack))
-            .map(|stack| self.version.stack(stack).len())
+            .map(|stack| self.data(model).stack(stack).len())
             .sum()
     }
 
@@ -524,6 +754,26 @@ impl Snapshot {
 
     /// O(r log n) per included stack.
     pub fn contains_in(&self, model: ReadModel, quad: &EncodedQuad) -> bool {
+        let named = self
+            .read_pattern(
+                model,
+                &QuadPattern {
+                    subject: Some(quad.subject),
+                    predicate: Some(quad.predicate),
+                    object: Some(quad.object),
+                    graph: GraphSelector::Exact(quad.graph),
+                },
+            )
+            .into_owned();
+        let GraphSelector::Exact(graph) = named.graph else {
+            unreachable!("an exact graph stays exact")
+        };
+        let quad = &EncodedQuad::new(
+            named.subject.unwrap_or(quad.subject),
+            named.predicate.unwrap_or(quad.predicate),
+            named.object.unwrap_or(quad.object),
+            graph,
+        );
         if quad.graph.is_default_graph()
             && let Some(classes) =
                 self.expanding(model, &QuadPattern::in_graph(TermId::DEFAULT_GRAPH))
@@ -538,14 +788,14 @@ impl Snapshot {
             );
             let stored = Stack::ALL
                 .into_iter()
-                .any(|stack| self.stack_contains(stack, &canonical));
+                .any(|stack| self.data(model).stack(stack).contains(&canonical));
             return stored
-                && CopyVisibility::new(&self.version, model)
+                && CopyVisibility::new(self.data(model), model)
                     .shows(quad, classes.touches(&canonical));
         }
         Stack::ALL
             .into_iter()
-            .any(|stack| model.includes(stack) && self.stack_contains(stack, quad))
+            .any(|stack| model.includes(stack) && self.data(model).stack(stack).contains(quad))
     }
 
     pub(crate) fn stack_contains(&self, stack: Stack, quad: &EncodedQuad) -> bool {
@@ -568,15 +818,18 @@ impl Snapshot {
         model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
             return Either::Left(self.expanded(classes, model, pattern));
         }
         let pattern = *pattern;
+        let data = self.data(model);
         Either::Right(
             Stack::ALL
                 .into_iter()
                 .filter(move |&stack| model.includes(stack))
-                .flat_map(move |stack| self.stack_quads(stack, &pattern)),
+                .flat_map(move |stack| data.stack(stack).scan(&pattern)),
         )
     }
 
@@ -589,6 +842,8 @@ impl Snapshot {
     /// per stack when the matching runs hold no tombstones in range (see
     /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up.
     pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
             return self.expanded_count(&classes, model, pattern);
         }
@@ -608,13 +863,15 @@ impl Snapshot {
         Stack::ALL
             .into_iter()
             .filter(|&stack| model.includes(stack))
-            .map(|stack| self.version.stack(stack).count_plan(&plan))
+            .map(|stack| self.data(model).stack(stack).count_plan(&plan))
             .sum()
     }
 
     /// True if some quad matches `pattern` in `model`; cheaper than
     /// [`count_in`](Self::count_in)` > 0`.
     pub fn exists_in(&self, model: ReadModel, pattern: &QuadPattern) -> bool {
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
             return self.expanded(classes, model, pattern).next().is_some();
         }
@@ -624,7 +881,7 @@ impl Snapshot {
         let plan = AccessPlan::for_pattern(pattern);
         Stack::ALL
             .into_iter()
-            .any(|stack| model.includes(stack) && self.version.stack(stack).any_plan(&plan))
+            .any(|stack| model.includes(stack) && self.data(model).stack(stack).any_plan(&plan))
     }
 
     /// Quads matching `pattern` in `model`, sorted by `permutation`'s key order, or `None` if
@@ -638,6 +895,8 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<impl Iterator<Item = EncodedQuad> + use<'a>> {
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
             return self
                 .expanded_sorted(classes, model, pattern, permutation)
@@ -645,7 +904,7 @@ impl Snapshot {
         }
         let plan = AccessPlan::in_permutation(pattern, permutation)?;
         let supported = Stack::ALL.into_iter().all(|stack| {
-            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
+            !model.includes(stack) || self.data(model).stack(stack).layout().supports(permutation)
         });
         if !supported {
             return None;
@@ -653,7 +912,7 @@ impl Snapshot {
         let scan = |stack: Stack| {
             model
                 .includes(stack)
-                .then(|| self.version.stack(stack).scan_plan(&plan))
+                .then(|| self.data(model).stack(stack).scan_plan(&plan))
                 .into_iter()
                 .flatten()
         };
@@ -679,7 +938,7 @@ impl Snapshot {
         let scan = move |stack: Stack| {
             model
                 .includes(stack)
-                .then(|| self.version.stack(stack).scan_plan(&plan))
+                .then(|| self.data(model).stack(stack).scan_plan(&plan))
                 .into_iter()
                 .flatten()
         };
@@ -733,7 +992,7 @@ impl Snapshot {
             Stack::ALL
                 .into_iter()
                 .filter(|&stack| model.includes(stack))
-                .map(|stack| self.version.stack(stack).count_plan(&plan))
+                .map(|stack| self.data(model).stack(stack).count_plan(&plan))
                 .sum(),
         )
     }
@@ -746,6 +1005,8 @@ impl Snapshot {
         low: TermId,
         high: TermId,
     ) -> Option<AccessPlan> {
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if self.expanding(model, pattern).is_some() {
             return None;
         }
@@ -779,6 +1040,8 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<Vec<(TermId, u64)>> {
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if self.expanding(model, pattern).is_some() {
             return None;
         }
@@ -796,7 +1059,7 @@ impl Snapshot {
             return None;
         }
         let supported = Stack::ALL.into_iter().all(|stack| {
-            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
+            !model.includes(stack) || self.data(model).stack(stack).layout().supports(permutation)
         });
         if !supported {
             return None;
@@ -806,7 +1069,7 @@ impl Snapshot {
         for stack in Stack::ALL {
             if model.includes(stack) {
                 let before = counts.len();
-                self.version
+                self.data(model)
                     .stack(stack)
                     .group_counts(&plan, bound, &mut counts);
                 sources += usize::from(counts.len() > before);
@@ -845,6 +1108,8 @@ impl Snapshot {
         permutation: Permutation,
         components: &[usize],
     ) -> Option<Vec<Vec<u64>>> {
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if self.expanding(model, pattern).is_some() {
             return None;
         }
@@ -853,7 +1118,7 @@ impl Snapshot {
             return None;
         }
         if Stack::ALL.into_iter().any(|stack| {
-            model.includes(stack) && !self.version.stack(stack).layout().supports(permutation)
+            model.includes(stack) && !self.data(model).stack(stack).layout().supports(permutation)
         }) {
             return None;
         }
@@ -877,7 +1142,7 @@ impl Snapshot {
             if !model.includes(stack) {
                 continue;
             }
-            let index = self.version.stack(stack);
+            let index = self.data(model).stack(stack);
             if !index.any_plan(plan) {
                 continue;
             }
@@ -903,11 +1168,19 @@ impl Snapshot {
     /// for this version once computed. The two walks (subjects, objects) run in parallel.
     /// `None` where [`Self::group_counts_in`] can't walk the graphs.
     pub fn node_count_in(&self, model: ReadModel, graphs: GraphSelector) -> Option<u64> {
-        let pattern = QuadPattern {
-            graph: graphs,
-            ..QuadPattern::all()
-        };
-        if self.expanding(model, &pattern).is_some() {
+        let pattern = self
+            .read_pattern(
+                model,
+                &QuadPattern {
+                    graph: graphs,
+                    ..QuadPattern::all()
+                },
+            )
+            .into_owned();
+        let graphs = pattern.graph;
+        if self.expanding(model, &pattern).is_some()
+            || (self.canonical_data.is_some() && model != ReadModel::Asserted)
+        {
             return None;
         }
         self.statistics
@@ -956,6 +1229,8 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<u64> {
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         if self.expanding(model, pattern).is_some() {
             return None;
         }
@@ -970,7 +1245,7 @@ impl Snapshot {
             .take_while(|(l, h)| l == h)
             .count();
         let supported = Stack::ALL.into_iter().all(|stack| {
-            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
+            !model.includes(stack) || self.data(model).stack(stack).layout().supports(permutation)
         });
         if bound >= 4 || !supported {
             return None;
@@ -980,7 +1255,7 @@ impl Snapshot {
         for stack in Stack::ALL {
             if model.includes(stack) {
                 let before = values.len();
-                self.version
+                self.data(model)
                     .stack(stack)
                     .distinct_values(&plan, bound, &mut values);
                 sources += usize::from(values.len() > before);
@@ -1003,6 +1278,8 @@ impl Snapshot {
         pattern: &QuadPattern,
         permutation: Permutation,
     ) -> Option<u64> {
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
         self.statistics.distinct(self, model, pattern, permutation)
     }
 
@@ -1038,7 +1315,13 @@ impl Snapshot {
     /// Ids of all named graphs that contain at least one quad, in id order. Inferences live
     /// in the default graph, so this reads the asserted stack only.
     pub fn named_graphs(&self) -> impl Iterator<Item = TermId> + '_ {
-        let index = &self.version.asserted;
+        self.named_graphs_in(ReadModel::Asserted)
+    }
+
+    /// [`Self::named_graphs`] as reads in `model` name them (canonical reads: by their
+    /// representatives).
+    pub fn named_graphs_in(&self, model: ReadModel) -> impl Iterator<Item = TermId> + '_ {
+        let index = &self.data(model).asserted;
         std::iter::successors(index.next_named_graph(None), |&graph| {
             index.next_named_graph(Some(graph))
         })
@@ -1265,6 +1548,74 @@ where
         match self {
             Either::Left(left) => left.next(),
             Either::Right(right) => right.next(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonical_lifetime_tests {
+    use super::*;
+    use nrese_rdf::{GraphName, NamedNode};
+
+    /// A canonical view lives no longer than its version, and is charged to the view
+    /// budget while kept: once the engine and every snapshot are gone, nothing holds
+    /// either and the charge is released (the view's cache once held its own version,
+    /// through the equality cell the versions pass on). A view the budget refuses is made
+    /// for its reader alone, which reads canonically through it.
+    #[test]
+    fn canonical_views_die_with_their_version() {
+        let ex = |local: &str| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+        for (named, limit) in [(false, None), (true, None), (true, Some(1))] {
+            let engine = crate::Engine::new(crate::EngineConfig::default()).unwrap();
+            let views =
+                Arc::new(limit.map_or_else(nrese_exec::Budget::unlimited, nrese_exec::Budget::new));
+            engine.set_canonical_view_budget(Arc::clone(&views));
+            let mut tx = engine.transaction();
+            let rep = tx.intern(ex("Rep").as_ref().into());
+            let alias = tx.intern(ex("Alias").as_ref().into());
+            let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+            let same_as = tx.intern(same_as.as_ref().into());
+            tx.insert(Quad::new(ex("Rep"), ex("p"), ex("o"), GraphName::DefaultGraph).as_ref());
+            if named {
+                tx.insert(Quad::new(ex("Alias"), ex("in"), ex("z"), ex("g")).as_ref());
+            }
+            tx.insert_inferred(crate::EncodedTriple {
+                subject: alias,
+                predicate: same_as,
+                object: rep,
+            });
+            tx.commit().unwrap();
+            engine.set_equality(Some(same_as));
+            let snapshot = engine.snapshot();
+            let canonical = snapshot.with_canonical_equality();
+            assert!(!canonical.triple_terms_name_aliases());
+            let version = Arc::downgrade(&canonical.version);
+            let view = canonical
+                .canonical_data
+                .as_ref()
+                .map(|view| Arc::downgrade(view.version()));
+            assert_eq!(view.is_some(), named);
+            let kept = named && limit.is_none();
+            assert_eq!(views.used() > 0, kept, "{named} {limit:?}");
+            if named {
+                let g = canonical.lookup(ex("g").as_ref().into()).unwrap();
+                let pattern = QuadPattern::in_graph(g);
+                let read: Vec<_> = canonical
+                    .quads_for_pattern_in(ReadModel::Materialised, &pattern)
+                    .collect();
+                assert!(
+                    read.iter().all(|q| q.subject == rep) && !read.is_empty(),
+                    "{read:?}"
+                );
+            }
+            drop((canonical, snapshot, engine));
+            assert_eq!(version.strong_count(), 0, "named graphs: {named}");
+            assert!(view.is_none_or(|view| view.strong_count() == 0));
+            assert_eq!(
+                views.used(),
+                0,
+                "the view's charge is released with its version"
+            );
         }
     }
 }
