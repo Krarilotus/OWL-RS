@@ -7,7 +7,9 @@ p50s); the cgroup's peak counts page cache. Research round 8 (19 Oct 2026): a pa
 whole passes isn't time-balanced; the layout rotation skipped layouts; layouts weren't the
 statistical unit; a loss first seen while confirming another was dropped; a difference within
 the counter's step was neutral, untested; the Windows peak was mislabelled; the big host was
-native Windows.
+native Windows. lks (20 Oct 2026): blocks timing one cached instance of a build share its
+offset, so a round's blocks weren't independent; the order was fixed in advance; no test knew the
+host's noise between instances.
 """
 from __future__ import annotations
 
@@ -59,6 +61,7 @@ def report(side, n, records, options=None):
             "reps": 1, "planned_cases": sorted({r["case"] for r in records}), "records": records,
             "git": {"commit": HARNESS, "dirty": 0}, "git_finished": {"commit": HARNESS, "dirty": 0},
             "binaries": binaries, "binaries_finished": copy.deepcopy(binaries), "machine": MACHINE,
+            "instance": {"built": f"/gate/bin-{side}", "inode": n},
             "runtime": "native", "prepared": {"manifest_sha256": "p" * 64, "files": 3, "changed": []},
             "options": options or {"prepared": True, "routes": True, "empty_queries": False}}
 
@@ -680,6 +683,73 @@ class Measurement(unittest.TestCase):
                   "_repeats": [{"queries": [{"name": "q", "samples_ms": [1.0, 2.0]}]},
                                {"queries": [{"name": "q", "samples_ms": [3.0]}]}]}
         self.assertEqual(fast.samples({"metric": "sum_p50_ms"}, result), {"q": [1.0, 2.0, 3.0]})
+
+
+class Instances(unittest.TestCase):
+    """lks-abba-11 and -13 timed the same two files: creaders' read p50 x1.032 and x0.951, each at
+    p = 0.001; lks-aa-20 timed a build against a byte-identical copy: x1.048 in one session, x0.983
+    in the next. The offset is the cached file instance's, the same in every block that times it."""
+
+    def test_every_block_times_a_fresh_copy_and_the_gate_refuses_a_build_timed_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            built = Path(tmp) / "bin-cccccccc-l1"
+            (built / "release" / "examples").mkdir(parents=True)
+            (built / "release" / "examples" / "perf_lab").write_bytes(b"\x7fELF perf lab")
+            (built / ".refs").mkdir()
+            side = {"name": "cand", "bin": built.as_posix()}
+            first, = fast.fresh_copies([side], Path(tmp) / "block-1")
+            second, = fast.fresh_copies([side], Path(tmp) / "block-2")
+            lab = [Path(s["bin"]) / "release" / "examples" / "perf_lab" for s in (first, second)]
+            self.assertEqual([x.read_bytes() for x in lab], [b"\x7fELF perf lab"] * 2)
+            self.assertFalse(lab[0].samefile(built / "release" / "examples" / "perf_lab"))
+            self.assertFalse(lab[0].samefile(lab[1]))
+            self.assertEqual((first["built"], (Path(first["bin"]) / ".refs").exists()), (built.as_posix(), False))
+        ps = passes()
+        del ps[2]["report"]["instance"]
+        self.assertIn("timed its side's build in place", " ".join(run_gate(ps)["errors"]))
+
+    def test_each_pair_of_blocks_has_both_orientations_which_first_drawn_from_the_seed(self):
+        firsts = set()
+        for seed in map(str, range(20)):
+            for b in (1, 3, 5, 7):
+                pair = [fast.palindrome(list(SIDES), x, seed)[0][0] for x in (b, b + 1)]
+                self.assertEqual(sorted(pair), ["base", "cand"], (seed, b))
+            firsts.add(fast.palindrome(list(SIDES), 1, seed)[0][0])
+            self.assertEqual(fast.palindrome(list(SIDES), 3, seed), fast.palindrome(list(SIDES), 3, seed))
+        self.assertEqual(firsts, {"base", "cand"})
+
+    def test_a_loss_is_judged_against_the_host_s_a_a_floor(self):
+        """An A-A' gate (every side one revision, each block its own copies) gives the floor; a
+        round whose candidate is 3.5 % slower in every block, by its instances' luck as in
+        lks-abba-11, is no loss against it, while a 15 % loss still is."""
+        import math
+        import random
+
+        def offset(side, n):  # each block's copy of a side: its own offset
+            return math.exp(random.Random(f"{side}{(n - 1) // 6}").gauss(0, 0.04))
+
+        def copies(side, n):
+            return [record(samples={"q06": [v * offset(side, n) for v in (4.8, 4.85, 4.8)]})]
+        aa = passes(copies, blocks=8)
+        for p in aa:
+            for key in ("binaries", "binaries_finished"):
+                p["report"][key]["revision"] = REVS["base"]
+        summary = gate_module.gate(aa, {s: REVS["base"] for s in ("cand", "base", "main")}, "cand",
+                                   ["base", "main"], HARNESS, context=CONTEXT)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "phuoc-yu.toml"
+            path.write_text(gate_module.write_floor(gate_module.noise_floor(summary), "aa-test"), encoding="utf-8")
+            floor = gate_module.read_floor(path)
+        self.assertGreater(floor["cases"]["lab-olympics"]["time/q06"], 0.03)
+
+        def flagged(factor, floor_):
+            s = run_gate(passes(slower(factor), blocks=4), floor=floor_)
+            return {f["side"] for f in s["flagged"] if f["dimension"] == "time/q06"}
+        self.assertEqual(flagged(1.035, None), {"base", "main"})
+        self.assertEqual(flagged(1.035, floor), set())
+        self.assertEqual(flagged(1.15, floor), {"base", "main"})
+        with self.assertRaises(ValueError):  # a gate of two revisions is no A-A' run
+            gate_module.noise_floor(run_gate(passes()))
 
 
 if __name__ == "__main__":

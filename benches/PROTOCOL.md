@@ -186,11 +186,16 @@ every other line unchanged; the result's SHA-256 is pinned beside the freeze); a
 that isn't the freeze (phuoc-yu's is a Jena riot conversion of a regeneration) is reported as
 such. Each timed host runs one fleet job of class *exclusive* (nothing else on the host) of
 *blocks* (`release-gate.sh block`, `fast.py block`): in a block each case runs base, main, head,
-head, main, base back to back, the next case after it (even blocks mirrored). Each side's two
-runs of a case are then centred on the same instant whatever the runs' durations, so a drift
-linear in time falls on every side alike; a palindrome of whole passes isn't (a case's runs sit
-where the other cases' durations put them: research round 8). A block writes one report per
-side and run (`pass-<n>-<side>.json`, each record with its block, layout and nanosecond times).
+head, main, base back to back, the next case after it. Each side's two runs of a case are then
+centred on the same instant whatever the runs' durations, so a drift linear in time falls on
+every side alike; a palindrome of whole passes isn't (a case's runs sit where the other cases'
+durations put them: research round 8). Each pair of blocks has one block of each orientation,
+which comes first drawn from the round's seed (`GATE_SEED`, else drawn and kept in the results),
+as is the cases' order in each block; both are recorded in every report. Every block times each
+side from a copy of its build made for that block and removed after it (`fast.py block
+--fresh-copies`): new files, read into new page-cache pages (below, *the unit*). A block writes
+one report per side and run (`pass-<n>-<side>.json`, each record with its block, layout and
+nanosecond times, the report its seed, orientation and copy).
 A round's first two blocks run every case, each later block only the cases whose noise needs
 more ([fast/measure.toml](fast/measure.toml), "Noise: reduced, not tolerated" below).
 
@@ -200,7 +205,7 @@ back and a palindrome (by their recorded nanosecond times); blocks don't overlap
 in at least the round's blocks (two; fewer is diagnostic, never a release verdict; a declared
 outcome's case one) and, with several layouts, its blocks cover them evenly. Each report is
 complete, of its block's plan, on the clean harness revision at its start and end, on its side's
-verified binaries, one host and configuration, measured by the same calibration; the CPU
+verified binaries copied for its block, one host and configuration, measured by the same calibration; the CPU
 frequency policy the blocks met (each records the host's state) is the same in all.
 
 **main's perf lab** (f9b515e8, a single file) has no `--routes`, requires `--queries`, and
@@ -225,7 +230,20 @@ phuoc-yu and the big host); a declared hypothesis a round doesn't test counts at
 - *The unit.* A block's contrast is log(head's median in the block / the baseline's). With
   several layouts the blocks of a layout are averaged first: the layout is the unit, so its
   variance (tau^2 / K) stays in the error however many blocks repeat it; with one build per side
-  each block is a unit.
+  each block is a unit. A block is a unit only because it times copies of its own (lks, 20 Oct
+  2026): two rounds timing the same two files gave creaders' read p50 x1.032 and x0.951, each at
+  p = 0.001, and a build against a byte-identical copy of itself (lks-aa-20) x1.048 in one session
+  and x0.983 in the next, the same in every block of a session. The offset belongs to the file's
+  cached instance (up to 0.045 in log against 0.0075 between blocks of one instance); blocks
+  timing one instance share it, so the round's blocks weren't independent and its p was
+  anti-conservative. A copy per block draws the offset anew: it is in the blocks' variance, and
+  a confirmation round no longer inherits round 1's instances.
+- *The floor.* `release_gate.py floor` writes `fast/noise-floor/<host>.toml`
+  from an A-A' gate on that host (every side one revision; the copies make them different
+  instances): per case and dimension, the sd of one block's contrast. Each test takes its units'
+  spread as at least that (floor / sqrt(k) for a unit of k blocks), so a loss must be clear
+  against the noise measured between instances and sessions, not only against the few blocks'
+  own spread. The report names the floor it used, or says the host has none.
 - *The test* is one-sided for a loss (a better head is never a loss), a t-test on the units'
   mean log contrast (Student's t computed in the kit; it matches SciPy). Its calibration on
   identical binaries is checked below; an exact sign-flip p is reported beside it where the

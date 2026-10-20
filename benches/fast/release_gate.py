@@ -173,6 +173,10 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
                               f"expected {rev} verified")
         if (r.get("binaries") or {}).get("sha256") != (r.get("binaries_finished") or {}).get("sha256"):
             errors.append(f"{name}: binaries changed during the pass")
+        if not (r.get("instance") or {}).get("built"):
+            # Blocks timing one cached instance of a build share its offset (lks-aa-20): no
+            # independent units (fast.py block --fresh-copies).
+            errors.append(f"{name}: timed its side's build in place, not a copy made for its block")
         layout = (r.get("binaries") or {}).get("layout", 1)
         binaries.setdefault((p["side"], layout), set()).add(
             json.dumps((r.get("binaries") or {}).get("sha256"), sort_keys=True))
@@ -346,8 +350,10 @@ def quantum(sides: list[list[list[float]]]) -> float:
     return 0.0
 
 
-def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str]) -> dict:
-    """The candidate's case against one baseline's, dimension by dimension, by blocks."""
+def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], floor: dict | None = None) -> dict:
+    """The candidate's case against one baseline's, dimension by dimension, by blocks; `floor`:
+    the case's A-A' noise floor on this host, per dimension (read_floor())."""
+    floor = floor or {}
     row = {"comparable": True, "dimensions": {}, "notes": [], "blocks": [], "reported": {}}
     base_state = state(base, off_route_ok=True)
     if state(base) == "known" and state(cand) == "known":
@@ -379,7 +385,7 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str]) -
 
     def judge_key(name, key, unit, higher=False, sub=None, step=None):
         bv, cv = per_pass(base[key], sub), per_pass(cand[key], sub)
-        row["dimensions"][name] = dimension(bv, bb, cv, cb, layouts, unit, higher, step)
+        row["dimensions"][name] = dimension(bv, bb, cv, cb, layouts, unit, higher, step, floor.get(name, 0.0))
 
     adapted = "process-p50" in cand["estimator"] | base["estimator"]
     if adapted:
@@ -483,12 +489,15 @@ COUNTER_STEP = {"ms": 0.001, "MiB": 1.0, "bytes": 1.0, "qps": 0.0}
 
 
 def dimension(base: list[list[float]], base_blocks: list, new: list[list[float]], new_blocks: list,
-              layouts: dict, unit: str, higher_is_better: bool = False, step: float | None = None) -> dict:
-    """One dimension: its block contrasts and the one-sided test of a loss (gatestats.loss_test)."""
+              layouts: dict, unit: str, higher_is_better: bool = False, step: float | None = None,
+              floor: float = 0.0) -> dict:
+    """One dimension: its block contrasts and the one-sided test of a loss (gatestats.loss_test),
+    its spread at least the host's A-A' floor."""
     contrasts, lays, b, n = block_contrasts(base, base_blocks, new, new_blocks, layouts)
     step = COUNTER_STEP[unit] if step is None else step
-    r = gatestats.loss_test(contrasts, lays, higher_is_better, resolution=step, scale=b or 0)
+    r = gatestats.loss_test(contrasts, lays, higher_is_better, resolution=step, scale=b or 0, floor=floor)
     out = {"unit": unit, "higher_is_better": higher_is_better, "base": b, "new": n, "step": step, **r,
+           "contrasts": [round(c, 6) for c in contrasts],
            "ratio": math.exp(r["mean_log"]) if r["mean_log"] is not None else None}
     if r["ci"]:
         # The interval of new/base (gatestats tests the worse direction: undo its sign).
@@ -639,6 +648,51 @@ def accepted(tradeoffs: list[dict], side: str, case: str, dimension_: str, r: di
     return None
 
 
+def noise_floor(summary: dict) -> dict:
+    """The host's noise floor from an A-A' gate (every side the same revision; fast.py block's copies
+    make them different instances): per case and dimension, the sd of one block's log contrast,
+    pooled over the baselines. lks-aa-20 (20 Oct 2026): the instances' offsets reached 0.045 on
+    creaders' read p50 against 0.0075 between the blocks of one instance."""
+    revisions = {summary["candidate"]["revision"], *summary["baselines"].values()}
+    if len(revisions) != 1:
+        raise ValueError(f"not an A-A' run: the sides are {len(revisions)} revisions")
+    if summary["errors"]:
+        raise ValueError("its passes don't qualify: " + "; ".join(summary["errors"][:3]))
+    pooled: dict = {}
+    for rows in summary["comparisons"].values():
+        for case, row in rows.items():
+            for d, r in row["dimensions"].items():
+                c = r.get("contrasts") or []
+                if len(c) >= 2:
+                    pooled.setdefault(case, {}).setdefault(d, []).append((statistics.variance(c), len(c) - 1))
+    cases = {case: {d: math.sqrt(sum(v * df for v, df in vs) / sum(df for _, df in vs)) for d, vs in dims.items()}
+             for case, dims in pooled.items()}
+    blocks = len({p["block"] for p in summary["passes"]})
+    return {"host": ", ".join(map(str, summary["host"])), "blocks": blocks, "cases": cases}
+
+
+def write_floor(floor: dict, source: str) -> str:
+    lines = [f"# The A-A' noise floor of {floor['host']} (release_gate.py floor; benches/PROTOCOL.md §5):",
+             "# per case and dimension, the sd of one block's log contrast between copies of one build.",
+             f"# From {source}, {floor['blocks']} blocks. Written by the tool, not by hand.",
+             f'source = "{source}, {floor["blocks"]} blocks"', ""]
+    for case, dims in sorted(floor["cases"].items()):
+        lines.append(f'[cases."{case}"]')
+        lines += [f'"{d}" = {sd:.6f}' for d, sd in sorted(dims.items())] + [""]
+    return "\n".join(lines)
+
+
+def read_floor(path: Path) -> dict | None:
+    """A host's floor (noise-floor/<host>.toml), or None where none was measured."""
+    if not path.is_file():
+        return None
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    return {"source": f"{path.name}: {data.get('source', '?')}", "cases": data.get("cases", {})}
+
+
+FLOORS = ROOT / "benches" / "fast" / "noise-floor"
+
+
 def fmt(x) -> str:
     return "-" if x is None else f"{x:.4g}"
 
@@ -648,10 +702,10 @@ def fmt(x) -> str:
 def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: list[str], harness: str,
          min_blocks: int = CAMPAIGN_BLOCKS, diagnostic: bool = False, not_run: dict | None = None,
          tradeoffs: list[dict] | None = None, catalog: list[dict] | None = None, elsewhere: dict | None = None,
-         context: dict | None = None, family: list[str] | None = None) -> dict:
+         context: dict | None = None, family: list[str] | None = None, floor: dict | None = None) -> dict:
     """One round of one timed part: the schedule and provenance checked, every comparison's
     blocks tested; each declared hypothesis's p-value (untested: 1). The decision over the family
-    and the rounds is verdict()'s."""
+    and the rounds is verdict()'s. `floor`: the host's A-A' noise floor (read_floor())."""
     not_run, tradeoffs, elsewhere = dict(not_run or {}), list(tradeoffs or []), dict(elsewhere or {})
     if candidate not in sides:
         raise ValueError(f"the candidate {candidate} is no declared side")
@@ -660,7 +714,9 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     summary = {"candidate": {"name": candidate, "revision": sides[candidate]},
                "baselines": {s: sides[s] for s in baselines}, "harness": harness,
                "policy": {"alpha": gatestats.ALPHA, "pair_weights": gatestats.PAIR_WEIGHTS,
-                          "test": "one-sided t on log block contrasts, layouts the outer unit; Holm over the family"},
+                          "test": "one-sided t on log block contrasts, layouts the outer unit, the spread at "
+                                  "least the host's A-A' floor; Holm over the family",
+                          "floor": (floor or {}).get("source")},
                "passes": [{"n": p["n"], "side": p["side"], "file": p["path"], "block": p["report"].get("block"),
                            "run": p["report"].get("run"), "layout": p["report"].get("layout")}
                           for p in sorted(passes, key=lambda p: p["n"])],
@@ -698,7 +754,8 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
         for side in baselines:
             if state(cand) == "failed":
                 continue
-            row = compare_case(cand, evidence(by_side[side], case), side, checks.get(case, set()))
+            row = compare_case(cand, evidence(by_side[side], case), side, checks.get(case, set()),
+                               ((floor or {}).get("cases") or {}).get(case))
             summary["comparisons"].setdefault(side, {})[case] = row
     summary["case_seconds"] = {}
     for p in passes:
@@ -753,6 +810,10 @@ def render(summary: dict) -> str:
              "(benches/PROTOCOL.md §5). Flagged here: due for confirmation.", ""]
     if summary["errors"]:
         lines += ["## The passes don't qualify", ""] + [f"- {e}" for e in summary["errors"]] + [""]
+    floor = summary["policy"].get("floor")
+    lines += [f"Noise floor: {floor}." if floor else
+              "Noise floor: none measured for this host (release_gate.py floor): each test against its "
+              "blocks' own spread alone.", ""]
     if summary.get("inputs") or summary.get("prepared_manifest"):
         prepared = ", ".join(summary.get("prepared_manifest", []))
         lines += ["## Inputs", "", f"Prepared data: PREPARED.json sha256 {prepared}, the same in every pass.", ""]
@@ -1428,8 +1489,13 @@ def main() -> int:
     s.add_argument("--context", action="append", default=[], metavar="KEY=VALUE",
                    help="the job: host (fleet's name), round (0 the first run), prefix, gate_name, max_gb, ram_gb, "
                         "layouts")
+    s.add_argument("--floor", type=Path, help="the host's A-A' noise floor (default noise-floor/HOST.toml, "
+                                               "HOST the context's)")
     s.add_argument("--out", type=Path)
     s.add_argument("--json", type=Path)
+    s = sub.add_parser("floor", help="a host's noise floor (noise-floor/HOST.toml) from an A-A' gate's report")
+    s.add_argument("report", type=Path, help="its release-gate.json (every side one revision)")
+    s.add_argument("--host", required=True, help="fleet's name of the host")
     s = sub.add_parser("w3c")
     s.add_argument("logs", type=Path)
     s.add_argument("--expected", type=Path, required=True)
@@ -1494,9 +1560,11 @@ def main() -> int:
         passes = load_passes(args.passes)
         family = json.loads(args.family.read_text(encoding="utf-8")).get("family") if args.family else None
         context = {k: v for k, v in pairs(args.context, "--context").items()}
+        floor_file = args.floor or (FLOORS / f"{context['host']}.toml" if context.get("host") else None)
         summary = gate(passes, sides, args.candidate, [s for s in args.require.split(",") if s], args.harness_revision,
                        args.min_blocks, args.diagnostic, pairs(args.not_run, "--not-run"), tradeoffs,
-                       cases_registry.load(), pairs(args.elsewhere, "--elsewhere"), context, family)
+                       cases_registry.load(), pairs(args.elsewhere, "--elsewhere"), context, family,
+                       read_floor(floor_file) if floor_file else None)
         for key in ("round", "max_gb", "ram_gb", "layouts"):
             if key in summary["context"]:
                 summary["context"][key] = float(summary["context"][key]) if "gb" in key else int(summary["context"][key])
@@ -1511,6 +1579,16 @@ def main() -> int:
         if args.json:
             args.json.write_text(json.dumps(summary, indent=1, default=str), encoding="utf-8")
         return 0 if summary["passed"] else 1
+    if args.command == "floor":
+        summary = json.loads(args.report.read_text(encoding="utf-8"))
+        floor = noise_floor(summary)
+        FLOORS.mkdir(exist_ok=True)
+        out = FLOORS / f"{args.host}.toml"
+        source = f"{summary['context'].get('gate_name') or args.report.parent.name} round {summary['context'].get('round', 0)}"
+        out.write_text(write_floor(floor, source), encoding="utf-8")
+        print(f"{out}: {sum(len(d) for d in floor['cases'].values())} dimensions of {len(floor['cases'])} cases, "
+              f"{floor['blocks']} blocks")
+        return 0
     if args.command == "w3c":
         expected = tomllib.loads(args.expected.read_text(encoding="utf-8"))["suite"]
         counts = w3c_counts(args.logs)

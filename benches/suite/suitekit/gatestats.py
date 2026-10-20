@@ -117,11 +117,16 @@ def sign_flip_p(values: list[float]) -> float | None:
 
 
 def loss_test(contrasts: list[float], layouts: list | None = None, higher_is_better: bool = False,
-              resolution: float = 0.0, scale: float = 1.0) -> dict:
+              resolution: float = 0.0, scale: float = 1.0, floor: float = 0.0) -> dict:
     """The one-sided test of a loss over block contrasts (log new/base, one per block), the units
     being layouts where several blocks share one. `resolution`: the counter's step, in the
     measurement's unit, and `scale` the base level it is relative to (a log difference below
-    resolution / scale that the test doesn't reject is `unresolved`)."""
+    resolution / scale that the test doesn't reject is `unresolved`). `floor`: the sd of one
+    block's contrast between two copies of one build on this host (its A-A' run, noise_floor());
+    the units' spread is taken as at least that (a unit of k blocks: floor / sqrt(k)), so a loss is
+    clear against the noise measured between instances and sessions, not only against the few
+    units' own spread (lks, 20 Oct 2026: two rounds of the same two files, x1.032 and x0.951, both
+    at p = 0.001)."""
     signed = [(-c if higher_is_better else c) for c in contrasts]  # positive: worse
     u = units(signed, list(layouts or []))
     out = {"blocks": len(contrasts), "units": len(u), "mean_log": None, "p": 1.0, "p_sign_flip": None,
@@ -130,6 +135,11 @@ def loss_test(contrasts: list[float], layouts: list | None = None, higher_is_bet
         return out
     mean = statistics.fmean(u)
     sd = statistics.stdev(u)
+    if floor > 0:
+        least = floor / math.sqrt(len(contrasts) / len(u))
+        out["floor"] = least
+        if sd < least:
+            sd, out["floored"] = least, True
     out["mean_log"] = mean
     out["p_sign_flip"] = sign_flip_p(u)
     if sd == 0:

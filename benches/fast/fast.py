@@ -36,6 +36,7 @@ import math
 import os
 import random
 import re
+import shutil
 import socket
 import statistics
 import subprocess
@@ -1673,12 +1674,39 @@ def run(args) -> int:
     return 1 if bad else 0
 
 
-def palindrome(sides: list[str], block: int) -> list[tuple[str, int]]:
+def drawn(seed: str, *key) -> int:
+    """A number drawn from a gate's seed for `key` (the same seed draws the same again)."""
+    return int(hashlib.sha256(":".join(map(str, (seed, *key))).encode()).hexdigest()[:16], 16)
+
+
+def palindrome(sides: list[str], block: int, seed: str | None = None) -> list[tuple[str, int]]:
     """A block's runs of one case: the sides, then the same mirrored (base, main, cand, cand,
     main, base), each side's two runs centred on the same instant whatever their durations; even
-    blocks start from the other end. Each entry: (side, its run 1 or 2)."""
-    order = sides if block % 2 else sides[::-1]
+    blocks start from the other end. With a seed each pair of blocks still has one block of each
+    orientation, which of them comes first drawn (lks, 20 Oct 2026: an order fixed in advance can
+    line up with whatever else repeats on the host). Each entry: (side, its run 1 or 2)."""
+    flip = block % 2 == 0
+    if seed is not None:
+        flip ^= bool(drawn(seed, "pair", (block - 1) // 2) & 1)
+    order = sides[::-1] if flip else sides
     return [(s, 1) for s in order] + [(s, 2) for s in order[::-1]]
+
+
+def fresh_copies(sides: list[dict], into: Path) -> list[dict]:
+    """The sides with their binaries copied anew under `into`: new files, read into new page-cache
+    pages. lks-aa-20 (20 Oct 2026): a byte-identical copy of one build timed 4.8 % apart from it
+    on creaders' read p50 in one session and 1.7 % the other way in the next, consistently in every
+    block of the session; the offset belongs to the file's cached instance, and blocks timing the
+    same instance share it. A copy per block draws it anew, so it is part of the blocks' variance
+    and the blocks are independent units (and a confirmation round doesn't inherit round 1's)."""
+    out = []
+    for side in sides:
+        target = into / side["name"]
+        shutil.copytree(side["bin"], target, ignore=shutil.ignore_patterns(".refs", "*.partial-*"))
+        perf_lab = target / "release" / "examples" / "perf_lab"
+        out.append({**side, "bin": target.as_posix(), "built": side["bin"],
+                    "inode": perf_lab.stat().st_ino if perf_lab.is_file() else None})
+    return out
 
 
 def parse_side(spec: str) -> dict:
@@ -1692,7 +1720,8 @@ def parse_side(spec: str) -> dict:
 
 
 def use_side(side: dict) -> None:
-    """The runs that follow are the side's: its binaries, revision and perf lab's options."""
+    """The runs that follow are the side's: its binaries (or this block's copy of them), revision
+    and perf lab's options."""
     os.environ["NRESE_FAST_BIN"] = side["bin"]
     os.environ["NRESE_FAST_REVISION"] = side["revision"]
     OPTIONS.update(routes=side["routes"], empty_queries=side["empty_queries"], timing=side["timing"])
@@ -1702,7 +1731,9 @@ def block(args) -> int:
     """`block`: one block of a release gate: every case run on every side as a palindrome
     (palindrome()), the runs written as one report per side and run, `pass-<n>-<side>.json`
     (n: the run's place in the block, 6 (block - 1) + 1 ...), each record with its block, layout
-    and nanosecond start and end."""
+    and nanosecond start and end. `--seed`: the orientation and the cases' order drawn from it;
+    `--fresh-copies DIR`: every side's binaries timed from a copy made for this block
+    (fresh_copies()), removed after it."""
     if RUNTIME != "native":
         sys.exit("block is the native runtime's (a release gate's host)")
     sides = [parse_side(s) for s in args.side]
@@ -1719,21 +1750,43 @@ def block(args) -> int:
     if prepared["errors"]:
         print("\n".join(f"prepared data: {e}" for e in prepared["errors"]), file=sys.stderr)
         return 2
-    order = palindrome([s["name"] for s in sides], args.block)
+    seed = args.seed
+    order = palindrome([s["name"] for s in sides], args.block, seed)
     place = {run: 6 * (args.block - 1) + i + 1 for i, run in enumerate(order)} if len(sides) == 3 else \
         {run: len(order) * (args.block - 1) + i + 1 for i, run in enumerate(order)}
+    if seed is not None:
+        cases = list(cases)
+        random.Random(drawn(seed, "cases", args.block)).shuffle(cases)
+    copies = None
+    if args.fresh_copies:
+        copies = args.fresh_copies / f"block-{args.block}-{os.getpid()}"
+        shutil.rmtree(copies, ignore_errors=True)
+        sides = fresh_copies(sides, copies)
+        if hasattr(os, "sync"):
+            os.sync()  # the copies written back now, not during the first case's runs
+    try:
+        return timed_block(args, sides, catalog, cases, prepared, order, place, seed)
+    finally:
+        if copies is not None:
+            shutil.rmtree(copies, ignore_errors=True)
+
+
+def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict], prepared: dict,
+                order: list[tuple[str, int]], place: dict, seed: str | None) -> int:
     by_name = {s["name"]: s for s in sides}
     started = time.time_ns()
     common = {"started": datetime.datetime.now().isoformat(timespec="seconds"), "git": manifest.git(ROOT),
               "machine": manifest.machine(RUNTIME), "runtime": RUNTIME, "reps": 1, "block": args.block,
-              "layout": args.layout, "planned_cases": [c["name"] for c in cases],
+              "layout": args.layout, "planned_cases": [c["name"] for c in cases], "seed": seed,
+              "orientation": [name for name, run in order if run == 1],
               "case_manifest": case_manifest(catalog), "host_state": host_state(),
               "prepared": {"manifest_sha256": prepared["sha256"], "files": len(prepared["files"])}}
     reports = {}
     for name, run in order:
         use_side(by_name[name])
         reports[(name, run)] = {**common, "label": f"gate-{place[(name, run)]}-{name}", "side": name, "run": run,
-                                "options": dict(OPTIONS), "binaries": binaries(), "records": []}
+                                "options": dict(OPTIONS), "binaries": binaries(), "records": [],
+                                "instance": {k: by_name[name].get(k) for k in ("built", "inode")}}
     args.out.mkdir(parents=True, exist_ok=True)
     for case in cases:
         for name, run in order:
@@ -1947,6 +2000,9 @@ def main() -> int:
     s.add_argument("--layout", type=int, default=1)
     s.add_argument("--measure", metavar="TOML")
     s.add_argument("--batch", action="store_true")
+    s.add_argument("--seed", help="the gate's: each pair of blocks' orientation and the cases' order drawn from it")
+    s.add_argument("--fresh-copies", type=Path, metavar="DIR",
+                   help="time every side from a copy of its binaries made for this block under DIR")
     s.add_argument("--out", type=Path, required=True, help="the directory the side-runs' reports go to")
     t = sub.add_parser("table")
     t.add_argument("--baseline", help="a run's report, for each case's time and peak")
