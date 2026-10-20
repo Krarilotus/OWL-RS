@@ -344,7 +344,25 @@ block)
   # never starts, and reports count only once their attempt's verdict is recorded (Sol, 20 Oct
   # 2026: a restart accepted a disturbed block, or ran a third attempt).
   state=$OUT/passes/block-$n.state
-  set_state() { printf 'attempt=%s\nstage=%s\n' "$1" "$2" > "$state.new" && mv -f "$state.new" "$state"; }
+  # Each state is a prerequisite of what follows it: written aside, synced, renamed over the old
+  # one, the directory synced; if any of it fails the step ends there (Sol, 20 Oct 2026: a failed
+  # rename went unnoticed and the block ran a third time).
+  set_state() {
+    py -c 'import os, sys
+path, text = sys.argv[1], f"attempt={sys.argv[2]}\nstage={sys.argv[3]}\n"
+with open(path + ".new", "w", encoding="utf-8") as f:
+    f.write(text)
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(path + ".new", path)
+if os.name != "nt":  # a directory is synced on POSIX; Windows can not open one to, and journals its entries
+    fd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)' "$state" "$1" "$2" \
+      || { log "block $n: its state (attempt $1, $2) couldn't be saved ($state): stopped"; exit 2; }
+  }
   attempt=1 stage=start
   if [ -f "$state" ]; then
     attempt=$(sed -n 's/^attempt=//p' "$state") stage=$(sed -n 's/^stage=//p' "$state")
@@ -430,11 +448,16 @@ print(v if v in ("quiet", "disturbed", "unwatched") else "")' "$OUT/passes/quiet
     stamp=$(date +%s)
     for f in $(seq "$first" $((first + per - 1))); do
       for r in "$OUT/passes/pass-$f-"*.json; do
-        [ -f "$r" ] && mv "$r" "$OUT/passes/$1-$(basename "$r" .json)-$stamp.json"
+        if [ -f "$r" ]; then
+          mv "$r" "$OUT/passes/$1-$(basename "$r" .json)-$stamp.json" \
+            || { log "block $n: $r couldn't be moved aside: stopped"; exit 2; }
+        fi
       done
     done
     for r in "$OUT/passes/quiet-block-$n.json" "$OUT/passes/quiet-block-$n.log"; do
-      [ -f "$r" ] && mv "$r" "${r%.*}-$1-$stamp.${r##*.}"
+      if [ -f "$r" ]; then
+        mv "$r" "${r%.*}-$1-$stamp.${r##*.}" || { log "block $n: $r couldn't be moved aside: stopped"; exit 2; }
+      fi
     done
   }
   # A disturbed block (work not the job's own busy too often, quiet-watch.py) is left out of the
@@ -452,8 +475,11 @@ print(v if v in ("quiet", "disturbed", "unwatched") else "")' "$OUT/passes/quiet
         # The cases' failures are data, the report's to judge; a block without all its reports isn't.
         [ "$(complete)" = "$per" ] || { log "block $n: not all $per reports (exit $code)"; exit 1; }
         [ -n "$(verdict)" ] || { log "block $n: attempt $attempt recorded no verdict"; exit 1; }
-        [ "$attempt" = 2 ] && py -c 'import json, sys
-p = sys.argv[1]; v = json.load(open(p)); v["repeat"] = True; json.dump(v, open(p, "w"))' "$OUT/passes/quiet-block-$n.json"
+        if [ "$attempt" = 2 ]; then
+          py -c 'import json, sys
+p = sys.argv[1]; v = json.load(open(p)); v["repeat"] = True; json.dump(v, open(p, "w"))' "$OUT/passes/quiet-block-$n.json" \
+            || { log "block $n: its repeat's verdict couldn't be marked: stopped"; exit 2; }
+        fi
         set_state "$attempt" ran
         stage=ran
         ;;

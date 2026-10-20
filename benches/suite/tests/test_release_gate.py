@@ -686,7 +686,21 @@ printf "no linker" > "$d/release/other"; lld_of "$d" 2>/dev/null || echo not-lld
         archived = {f"disturbed-{r[:-5]}-9.json": "{}" for r in reports}
         quiet, disturbed = '{"verdict": "quiet"}', '{"verdict": "disturbed"}'
         # case, the state file, files in passes, an earlier watcher's record, the verdicts of the
-        # attempts it runs -> exit, attempts run, pass-*, disturbed-pass-*, final state, a report note
+        # attempts it runs -> exit, attempts run, pass-*, disturbed-pass-*, final state, a report
+        # note; and a fault: mv failing on paths that contain a text, or a directory where the
+        # state is written (its temporary file) or renamed to
+        faults = {
+            "a state that can't be written: nothing run":
+                (None, {}, None, ["quiet"], (2, 0, 0, 0, None, None), ("squat", "block-1.state.new")),
+            "a state that can't be renamed: nothing run":
+                (None, {}, None, ["quiet"], (2, 0, 0, 0, "squatted", None), ("squat", "block-1.state")),
+            "an acceptance that can't be saved: not accepted":
+                ("1:ran", {**complete, "quiet-block-1.json": quiet}, None, [], (2, 0, 4, 0, "1:ran", None),
+                 ("squat", "block-1.state.new")),
+            "an archival move that fails: no repeat":
+                ("1:ran", {**complete, "quiet-block-1.json": disturbed}, None, ["quiet"], (2, 0, 4, 0, "1:archiving", None),
+                 ("mv", "disturbed-pass")),
+        }
         rows = [
             ("fresh, quiet", None, {}, None, ["quiet"], (0, 1, 4, 0, "1:accepted", None)),
             ("fresh, disturbed then quiet", None, {}, None, ["disturbed", "quiet"],
@@ -714,7 +728,8 @@ printf "no linker" > "$d/release/other"; lld_of "$d" 2>/dev/null || echo not-lld
              {**complete, "quiet-block-1.json": disturbed}, "pid 51\n", [], (2, 0, 4, 0, None, None)),
             ("a third attempt: never started", "3:start", {}, None, [], (2, 0, 0, 0, "3:start", None)),
         ]
-        for case, state, files, frozen, verdicts, expected in rows:
+        rows = [(*row, None) for row in rows] + [(case, *rest) for case, rest in faults.items()]
+        for case, state, files, frozen, verdicts, expected, fault in rows:
             with self.subTest(case), tempfile.TemporaryDirectory() as tmp:
                 t = Path(tmp).as_posix()
                 shim = Path(tmp) / "shim"
@@ -757,6 +772,10 @@ case "$1 $2" in
 esac
 """, encoding="utf-8", newline="\n")
                 (shim / "git").chmod(0o755)
+                if fault and fault[0] == "mv":
+                    (shim / "mv").write_text(f'#!/bin/sh\ncase "$*" in *{fault[1]}*) echo "injected mv failure" >&2; exit 1 ;; '
+                                             'esac\nexec /bin/mv "$@"\n', encoding="utf-8", newline="\n")
+                    (shim / "mv").chmod(0o755)
                 setup = f'''
 . scripts/lib/gate-publish.sh
 GATE={t}/gate GATE_BIN={t}/bin
@@ -775,6 +794,8 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
                 if state:
                     attempt, stage = state.split(":")
                     (passes / "block-1.state").write_text(f"attempt={attempt}\nstage={stage}\n", encoding="utf-8")
+                if fault and fault[0] == "squat":
+                    (passes / fault[1]).mkdir()  # a directory where the state is written or renamed to
                 if frozen:
                     (Path(tmp) / "gate" / "quiet").mkdir(parents=True)
                     (Path(tmp) / "gate" / "quiet" / "frozen").write_text(frozen, encoding="utf-8")
@@ -784,6 +805,7 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
                 final = passes / "block-1.state"
                 found = (done.returncode, len(runs.read_text().split()) if runs.exists() else 0,
                          len(list(passes.glob("pass-*.json"))), len(list(passes.glob("disturbed-pass-*.json"))),
+                         "squatted" if final.is_dir() else
                          ":".join(line.split("=", 1)[1] for line in final.read_text().split()) if final.exists() else None)
                 self.assertEqual(found, expected[:5], done.stdout + done.stderr)
                 if frozen:
