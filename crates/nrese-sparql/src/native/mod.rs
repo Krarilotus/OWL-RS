@@ -1418,6 +1418,22 @@ impl<'a> Context<'a> {
 
     /// The id of a constant of a pattern: an alias IRI ([`substitute`]) stands for its
     /// blank node.
+    /// [`Self::lookup_const`], what the snapshot's lookup allocates charged to `held` first
+    /// ([`Snapshot::lookup_charged`]).
+    fn lookup_const_charged(
+        &self,
+        term: nrese_rdf::TermRef<'_>,
+        held: &mut Reservation<&nrese_exec::Budget>,
+    ) -> Result<Option<TermId>, nrese_exec::BudgetExceeded> {
+        if let nrese_rdf::TermRef::NamedNode(n) = term
+            && n.as_str().starts_with(substitute::ALIAS)
+        {
+            return Ok(self.lookup_const(term));
+        }
+        self.snapshot
+            .lookup_charged(term, |bytes| held.charge(bytes))
+    }
+
     fn lookup_const(&self, term: nrese_rdf::TermRef<'_>) -> Option<TermId> {
         if let nrese_rdf::TermRef::NamedNode(n) = term
             && n.as_str().starts_with(substitute::ALIAS)

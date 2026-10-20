@@ -38,8 +38,8 @@
 //! a filter constant's; the R-trees are packed arrays ([`Packed`]) sized before they are
 //! filled. Computing a relation, geo's working memory is charged first, from a bound on
 //! the two shapes ([`relate_bound`]); a result's header (its variables, its columns' list)
-//! is charged and stays so with the evaluation. Not charged is the engine's working memory
-//! for a scan (its cursor) and a lookup.
+//! is charged and stays so with the evaluation. So is the engine's working memory for a
+//! scan (its merge's cursors and decoded blocks) and a lookup, before each runs.
 
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -580,14 +580,14 @@ fn decoded(
     id: TermId,
 ) -> Result<Option<Arc<Shape>>, BudgetExceeded> {
     // A geometry literal has a datatype, and is no inline value.
-    let Some(decoding) = snapshot
-        .decode_bound(id)
-        .filter(|_| id.kind() == TermKind::TypedLiteral)
-    else {
+    if id.kind() != TermKind::TypedLiteral {
         return Ok(None);
-    };
-    held.charge(decoding)?;
-    let term = snapshot.decode(id);
+    }
+    let mut decoding = 0;
+    let term = snapshot.decode_charged(id, |bytes| {
+        decoding = bytes;
+        held.charge(bytes)
+    })?;
     let Some(Term::Literal(literal)) = &term else {
         held.release(decoding);
         return Ok(None);
@@ -661,8 +661,8 @@ impl SpatialIndex {
             name.push_str(GEO);
             name.push_str(local);
             let term = NamedNodeRef::new_unchecked(&name).into();
-            naming.charge(snapshot.lookup_bytes(term))?;
-            let Some(predicate) = snapshot.lookup(term) else {
+            let Some(predicate) = snapshot.lookup_charged(term, |bytes| naming.charge(bytes))?
+            else {
                 return Ok(statements);
             };
             drop((name, naming));
@@ -1583,11 +1583,17 @@ impl Context<'_> {
         Ok(index)
     }
 
-    fn side(&self, term: &TermPattern, solutions: &Solutions) -> Side {
-        match term {
-            TermPattern::NamedNode(n) => {
-                Side::Constant(self.lookup_const(n.as_ref().into()).map(TermId::raw))
-            }
+    fn side(
+        &self,
+        term: &TermPattern,
+        solutions: &Solutions,
+        held: &mut Reservation<&Budget>,
+    ) -> Result<Side, BudgetExceeded> {
+        Ok(match term {
+            TermPattern::NamedNode(n) => Side::Constant(
+                self.lookup_const_charged(n.as_ref().into(), held)?
+                    .map(TermId::raw),
+            ),
             TermPattern::Variable(v) => match solutions.column(v) {
                 Some(c) => Side::Bound(c),
                 None => Side::Free(v.clone()),
@@ -1600,7 +1606,7 @@ impl Context<'_> {
                 }
             }
             _ => Side::Constant(None),
-        }
+        })
     }
 
     /// `solutions` joined with the spatial pattern `triple`; what it allocates charged to
@@ -1635,17 +1641,12 @@ impl Context<'_> {
         working
             .charge(named(&triple.subject) + named(&triple.object) + lists)
             .map_err(memory)?;
-        // A constant side's lookup, charged while it runs.
-        let lookups = [&triple.subject, &triple.object].map(|term| match term {
-            TermPattern::NamedNode(n) => self.snapshot.lookup_bytes(n.as_ref().into()),
-            _ => 0,
-        });
-        working
-            .charge(lookups.into_iter().max().unwrap_or(0))
-            .map_err(memory)?;
+        // A constant side's lookup charged before it runs, held with the join's working memory.
         let (s, o) = (
-            self.side(&triple.subject, &solutions),
-            self.side(&triple.object, &solutions),
+            self.side(&triple.subject, &solutions, &mut working)
+                .map_err(memory)?,
+            self.side(&triple.object, &solutions, &mut working)
+                .map_err(memory)?,
         );
         // The free sides' variables, each once: the columns after the rows'.
         let added = [s.free(), o.free().filter(|&v| s.free() != Some(v))];

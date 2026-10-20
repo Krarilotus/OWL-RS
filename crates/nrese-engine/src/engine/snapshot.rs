@@ -1288,16 +1288,23 @@ impl Snapshot {
     }
 
     /// Id of `term` as of this snapshot; `None` if the term is unknown (so no quad uses it).
-    /// The most bytes [`Self::lookup`] allocates for `term`, known before it runs: what a
-    /// charged reader reserves first ([`Dictionary::lookup_bytes`]).
-    pub fn lookup_bytes(&self, term: TermRef<'_>) -> usize {
-        self.dictionary.lookup_bytes(term)
+    /// [`Self::lookup`], what it allocates charged first through `charge`
+    /// ([`Dictionary::lookup_charged`]: the bound and the lookup read one state of the
+    /// dictionary, which a checkpoint may otherwise change between them).
+    pub fn lookup_charged<E>(
+        &self,
+        term: TermRef<'_>,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<TermId>, E> {
+        self.dictionary
+            .lookup_charged(term, self.version.dictionary_len, charge)
     }
 
     /// The most bytes a read of this snapshot in `model` holds while it runs
     /// ([`Self::quads_for_pattern_in`] without equality expansion): each stack's merge,
-    /// its cursors and a decoded block per run. What a charged reader reserves first. An
-    /// expansion holds its pending copies besides.
+    /// its cursors and a decoded block per run. What a charged reader reserves first. The
+    /// runs are this snapshot's own, which no checkpoint changes. An expansion holds its
+    /// pending copies besides.
     pub fn scan_bytes(&self, model: ReadModel) -> usize {
         let data = self.data(model);
         Stack::ALL
@@ -1344,14 +1351,19 @@ impl Snapshot {
         self.dictionary.decode(id)
     }
 
-    /// The most bytes [`Self::decode`] allocates for `id`, known without decoding it (see
-    /// [`Dictionary::decode_bound`](crate::Dictionary::decode_bound)); `None` for inline
-    /// ids, triple terms and ids this snapshot doesn't know.
-    pub fn decode_bound(&self, id: TermId) -> Option<usize> {
+    /// [`Self::decode`] of the dictionary term `id`, what it allocates charged first
+    /// through `charge` ([`Dictionary::decode_charged`]: the bound and the decoding read one
+    /// state of the dictionary). `Ok(None)` for inline ids, triple terms and ids this
+    /// snapshot doesn't know.
+    pub fn decode_charged<E>(
+        &self,
+        id: TermId,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<Term>, E> {
         if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
-            return None;
+            return Ok(None);
         }
-        self.dictionary.decode_bound(id)
+        self.dictionary.decode_charged(id, charge)
     }
 
     /// Calls `f` with a borrowed view of the dictionary term `id` (see
