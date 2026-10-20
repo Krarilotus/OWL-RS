@@ -297,21 +297,31 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
   fi
 fi
 
-# The main PC's guard stops our processes below its hard line. Before it stops one it notes it in
-# ~/owlrs-guard/killed.log (NRESE_GUARD_KILLED): `<unix s> KILLED-BY-GUARD <pid> <name>
-# <pid>@<created> jobs=<job>,...`, the listed build jobs the process is in (a stop that then
-# failed: `<unix s> GUARD-STOP-FAILED <pid>@<created>`). A cargo run that failed says it was
-# stopped only when a process of its own job was: never for another build's. While the machine is
-# busy a notice may still be on its way: it waits for one up to NRESE_GUARD_NOTICE_WAIT_S
-# (default 10 s).
-stopped_here() {
+# The main PC's guard stops our processes below its hard line, and tells it in
+# ~/owlrs-guard/killed.log (NRESE_GUARD_KILLED): before a stop, its intent, `<unix s>
+# KILLED-BY-GUARD <pid> <name> <pid>@<created> jobs=<job>,...` (the listed build jobs the process
+# is in); after it, `<unix s> GUARD-STOPPED <pid>@<created>`, or `GUARD-STOP-FAILED` when it
+# didn't happen. A cargo run that failed says it was stopped only for a completed stop of a process
+# of its own job: never another build's, never an intent alone. While the machine is busy, or
+# while an intent for its job awaits its completion, it waits up to NRESE_GUARD_NOTICE_WAIT_S
+# (default 10 s); without a completed stop by then, cargo's own failure stands.
+#
+# guard_notices prints `stopped <pid> <name>` per completed stop of this job's processes, and
+# `pending` while an intent for it has no completion yet.
+guard_notices() {
   awk -v s="$started" -v job="$JOB" '
-    $2 == "GUARD-STOP-FAILED" { failed[$3] = 1 }
+    $2 == "GUARD-STOPPED" { done[$3] = "stopped" }
+    $2 == "GUARD-STOP-FAILED" { done[$3] = "failed" }
     $2 == "KILLED-BY-GUARD" && $1 >= s {
       j = $6; sub(/^jobs=/, "", j); n = split(j, jobs, ",")
-      for (i = 1; i <= n; i++) if (jobs[i] == job) hit[$5] = $3 " " $4
+      for (i = 1; i <= n; i++) if (jobs[i] == job) mine[$5] = $3 " " $4
     }
-    END { for (k in hit) if (!(k in failed)) print hit[k] }' "$killed" 2> /dev/null | tr '\n' ' ' || true
+    END {
+      for (k in mine) {
+        if (done[k] == "stopped") print "stopped " mine[k]
+        else if (done[k] == "") print "pending"
+      }
+    }' "$killed" 2> /dev/null || true
 }
 started=$(date +%s)
 set +e
@@ -324,13 +334,15 @@ code=$?
 set -e
 killed="${NRESE_GUARD_KILLED:-$HOME/owlrs-guard/killed.log}"
 if [ "$code" -ne 0 ] && { [ -f "$killed" ] || [ -f "$BUSY" ]; }; then
-  stopped=$(stopped_here)
+  notices=$(guard_notices)
   waited=0
-  while [ -z "$stopped" ] && [ -f "$BUSY" ] && [ "$waited" -lt "${NRESE_GUARD_NOTICE_WAIT_S:-10}" ]; do
+  while ! grep -q '^stopped ' <<< "$notices" && { [ -f "$BUSY" ] || grep -q '^pending' <<< "$notices"; } \
+      && [ "$waited" -lt "${NRESE_GUARD_NOTICE_WAIT_S:-10}" ]; do
     sleep 1
     waited=$((waited + 1))
-    stopped=$(stopped_here)
+    notices=$(guard_notices)
   done
+  stopped=$(sed -n 's/^stopped //p' <<< "$notices" | tr '\n' ' ')
   if [ -n "$stopped" ]; then
     printf 'cargo %s: stopped by the PC guard, low memory (it stopped %s); not a build failure\n' "$*" "$stopped" >&2
     exit 75

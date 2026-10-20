@@ -35,14 +35,20 @@ class Admission(unittest.TestCase):
         self.stubs = self.root / "stubs"
         self.stubs.mkdir()
         # cargo: says when it started and with how many jobs, runs a while, and ends with $CODE.
-        # NOTICE=late: the machine turns busy and the guard's notice for this build's job comes a
-        # second after cargo ended; NOTICE=other: a notice for another build's job.
+        # The guard's notices (an intent, then STOPPED or STOP-FAILED), by NOTICE: late, the machine
+        # turns busy and a completed stop of this build's process comes a second after cargo ended;
+        # other, a completed stop of another build's; failed, an intent for this build whose stop
+        # fails two seconds later; intent, an intent that never completes.
         self.stub("cargo", 'echo "$(date +%s%N) $CARGO_BUILD_JOBS" > "$OUT/$RUN.started"\n'
                            'sleep "${SLEEP:-0}"\n'
-                           'note() { echo "$(date +%s) KILLED-BY-GUARD 4242 rustc.exe 4242@1 jobs=$1" >> "$GUARD/killed.log"; }\n'
+                           'log() { echo "$(date +%s) $*" >> "$GUARD/killed.log"; }\n'
+                           'intent() { log "KILLED-BY-GUARD 4242 rustc.exe 4242@1 jobs=$1"; }\n'
                            'case "${NOTICE:-}" in\n'
-                           '  late) echo busy > "$GUARD/BUSY"; (sleep 1; note "$NRESE_BUILD_JOB") > /dev/null 2>&1 & ;;\n'
-                           '  other) note nrese-build-another ;;\n'
+                           '  late) echo busy > "$GUARD/BUSY"\n'
+                           '    (sleep 1; intent "$NRESE_BUILD_JOB"; log GUARD-STOPPED 4242@1) > /dev/null 2>&1 & ;;\n'
+                           '  other) intent nrese-build-another; log GUARD-STOPPED 4242@1 ;;\n'
+                           '  failed) intent "$NRESE_BUILD_JOB"; (sleep 2; log GUARD-STOP-FAILED 4242@1) > /dev/null 2>&1 & ;;\n'
+                           '  intent) intent "$NRESE_BUILD_JOB" ;;\n'
                            'esac\n'
                            'echo "$(date +%s%N)" > "$OUT/$RUN.ended"\nexit "${CODE:-0}"')
         self.stub("nproc", "echo 32")  # 12 compiler jobs by default
@@ -131,7 +137,9 @@ class Admission(unittest.TestCase):
         self.addCleanup(lambda: (sleeper.kill(), sleeper.wait()))
         pid = sleeper.stdout.readline().strip()
         self.addCleanup(lambda: subprocess.run([BASH, "-c", f"kill {pid} 2> /dev/null"]))
-        for holder in (f"{pid}@1", "99999999@1"):
+        # The holder named by its pid alone (before identities: kill -0 says it lives) and by its pid
+        # with another start time; and one whose pid is gone.
+        for holder in (pid, f"{pid}@1", "99999999@1"):
             stale = self.root / "slots" / "run" / holder
             stale.mkdir(parents=True)
             (stale / "peak").write_text("999999")
@@ -140,10 +148,12 @@ class Admission(unittest.TestCase):
         self.assertEqual(build.wait(timeout=120), 0)
         self.assertEqual(list((self.root / "slots" / "run").iterdir()), [])
 
-    def test_only_a_stop_of_its_own_build_counts_and_a_late_notice_is_waited_for(self):
-        for notice, code in (("late", 75), ("other", 127)):
+    def test_only_a_completed_stop_of_its_own_build_counts_and_a_late_one_is_waited_for(self):
+        for notice, code in (("late", 75), ("other", 127), ("failed", 127), ("intent", 127)):
             (self.guard / "BUSY").unlink(missing_ok=True)
-            build = self.start(f"said-{notice}", stderr=subprocess.PIPE, NOTICE=notice, CODE="127")
+            (self.guard / "killed.log").unlink(missing_ok=True)
+            build = self.start(f"said-{notice}", stderr=subprocess.PIPE, NOTICE=notice, CODE="127",
+                               NRESE_GUARD_NOTICE_WAIT_S="4")
             _, err = build.communicate(timeout=120)
             self.assertEqual(build.returncode, code, (notice, err))
             self.assertEqual("stopped by the PC guard" in err, code == 75, (notice, err))
