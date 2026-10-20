@@ -27,7 +27,6 @@ class ScopeLifetime(unittest.TestCase):
         self.assertIn("TimeoutStopSec=30", argv)
         self.assertIn("KillMode=control-group", argv)
         self.assertIn("SendSIGKILL=yes", argv)
-        self.assertGreater(4380 - 4 * 900, 0)  # preflight/validation still need their budget
         self.assertEqual(argv[-1], "--")
 
     def test_worker_binds_to_exact_parent_with_its_own_stop_allowance(self):
