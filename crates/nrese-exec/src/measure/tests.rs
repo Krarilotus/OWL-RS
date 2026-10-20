@@ -369,6 +369,55 @@ fn a_first_measurement_on_a_global_thread_returns() {
     assert_eq!(received.recv_timeout(Duration::from_secs(10)), Ok(0));
 }
 
+/// Preparing a first measurement on a thread of the global pool runs none of the jobs that
+/// wait there (Sol, measure-pool r2): not one that measures too, which would enter the
+/// preparation still under way, nor one that takes a lock the measuring thread holds. Both
+/// measurements return, and the lock is taken after it is let go.
+#[test]
+fn preparing_a_measurement_runs_no_job_waiting_on_its_thread() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    if !alone() {
+        return;
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build_global()
+        .unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    let held = Arc::new(Mutex::new(()));
+    rayon::spawn(move || {
+        let inner = sent.clone();
+        rayon::spawn(move || {
+            inner
+                .send(("queued measurement", measure(|| ()).1))
+                .unwrap()
+        });
+        let lock = held.lock().unwrap();
+        let waiting = Arc::clone(&held);
+        let locked = sent.clone();
+        rayon::spawn(move || {
+            drop(waiting.lock().unwrap());
+            locked.send(("queued lock", 0)).unwrap();
+        });
+        let measured = measure(|| ()).1;
+        drop(lock);
+        sent.send(("measurement", measured)).unwrap();
+    });
+    let mut done: Vec<_> = (0..3)
+        .map(|_| received.recv_timeout(Duration::from_secs(20)))
+        .collect();
+    done.sort_by_key(|r| format!("{r:?}"));
+    assert_eq!(
+        done,
+        [
+            Ok(("measurement", 0)),
+            Ok(("queued lock", 0)),
+            Ok(("queued measurement", 0)),
+        ]
+    );
+}
+
 /// A measured test runs alone under cargo test too when it is ignored, or should panic.
 #[test]
 #[ignore = "runs with --ignored"]

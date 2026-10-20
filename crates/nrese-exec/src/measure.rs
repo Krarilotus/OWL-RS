@@ -84,7 +84,10 @@
 //! for every thread of the global pool to start before the first measurement, from outside
 //! any pool, whatever pool that measurement runs on: input built on the global pool, then
 //! a measurement on another, counted the global threads that started late, in pairs of
-//! those sizes (the GeoSPARQL guard's rare excess, attributed 20 Oct). A pool of a test's
+//! those sizes (the GeoSPARQL guard's rare excess, attributed 20 Oct). It waits running no
+//! job, and for at most 4 seconds: a global thread busy for longer, or one that never runs
+//! its part (the caller's own, if it is one, or one blocked on this preparation), is not
+//! waited for, and if it hasn't started, a measurement counts its start. A pool of a test's
 //! own is the test's: rule, start its threads before measuring (`pool.broadcast(|_| ())`),
 //! or a measurement counts those that start in it.
 //!
@@ -96,6 +99,7 @@
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 
 use crate::Budget;
@@ -451,8 +455,9 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
 ///   and 8 more park at once;
 /// - the global pool's threads, and the pool's the first measurement runs on, each of which
 ///   allocates its state as it starts (see "Known limits"): once per process, before the
-///   first measurement, each has run a broadcast, the global pool's sent from outside any
-///   pool;
+///   first measurement, each has run a broadcast that only counts, the global pool's sent
+///   from outside any pool, the caller waiting without running any job, for at most 4
+///   seconds;
 /// - rayon's global queue, which allocates its next block on the 63rd entry from outside
 ///   the pool: before each measurement made outside the pool (nested ones too), empty
 ///   entries until one allocates its block (at most 63, about a millisecond), uncounted by
@@ -490,31 +495,34 @@ fn prepare() {
                     });
                 }
             });
-            // The pool entered started, every thread of it too (a broadcast returns when each
-            // has run it), and the entering thread's state made. The global pool's from
-            // outside any pool, as a broadcast reaches the pool it is made on: from another,
-            // the global pool's threads would start when the system runs them.
-            let warm = || {
-                rayon::broadcast(|_| ());
-                rayon::join(|| (), || ());
-            };
-            if rayon::current_thread_index().is_some() {
-                // Waiting for it runs this thread's jobs meanwhile: on a thread of the
-                // global pool, its own part of the broadcast, which nothing else can run.
-                let done = AtomicBool::new(false);
+            // Every thread of the global pool started, and of the pool the caller is on (a
+            // thread allocates as it starts: "Known limits"). The wait runs no job on the
+            // caller: a job it ran could measure, entering this preparation again, or wait
+            // for a lock the caller holds (Sol, measure-pool r2). So each pool gets a
+            // broadcast that only counts, sent without waiting, and the caller waits for the
+            // count (`started`). The global pool's is sent from outside any pool, as a
+            // broadcast reaches the pool it is made on.
+            let in_pool = rayon::current_thread_index().is_some();
+            let global = Arc::new(AtomicUsize::new(0));
+            let threads = if in_pool {
                 std::thread::scope(|scope| {
-                    scope.spawn(|| {
-                        warm();
-                        done.store(true, SeqCst);
-                    });
-                    while !done.load(SeqCst) {
-                        if rayon::yield_now() != Some(rayon::Yield::Executed) {
-                            std::thread::yield_now();
-                        }
-                    }
-                });
+                    scope
+                        .spawn(|| counted_broadcast(&global))
+                        .join()
+                        .expect("the broadcast is sent")
+                })
+            } else {
+                counted_broadcast(&global)
+            };
+            started(&global, threads);
+            if in_pool {
+                let own = Arc::new(AtomicUsize::new(0));
+                let threads = counted_broadcast(&own);
+                started(&own, threads);
+            } else {
+                // The entering thread's state, made: outside any pool, nothing it runs.
+                rayon::join(|| (), || ());
             }
-            warm();
         });
     }
     if rayon::current_thread_index().is_none() {
@@ -526,6 +534,33 @@ fn prepare() {
             }
         }
     }
+}
+
+/// Sends every thread of the current pool (the global one outside any pool) a job that only
+/// counts into `count`, without waiting for it; the pool's threads.
+fn counted_broadcast(count: &Arc<AtomicUsize>) -> usize {
+    let ran = Arc::clone(count);
+    rayon::spawn_broadcast(move |_| {
+        ran.fetch_add(1, SeqCst);
+    });
+    rayon::current_num_threads()
+}
+
+/// Waits, running nothing, until `count` says each of `threads` has run its job: all but
+/// one for at most 3 seconds, then the last for at most 1 more. The caller's own thread, if
+/// it is one of them, runs its job only once it is back in its pool, so it waits for itself
+/// that 1 second; a thread that doesn't come within the time (busy for longer, so started)
+/// doesn't hold it either.
+fn started(count: &AtomicUsize, threads: usize) {
+    use std::time::{Duration, Instant};
+    let wait = |least: usize, most: Duration| {
+        let since = Instant::now();
+        while count.load(SeqCst) < least && since.elapsed() < most {
+            std::thread::yield_now();
+        }
+    };
+    wait(threads.saturating_sub(1), Duration::from_secs(3));
+    wait(threads, Duration::from_secs(1));
 }
 
 /// A running measurement; it ends when this drops, whether the measurement returns or
