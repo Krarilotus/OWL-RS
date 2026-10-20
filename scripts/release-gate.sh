@@ -301,11 +301,17 @@ block)
   shift 5
   tree=$(worktree "$harness") || exit 2
   # Each side: its build of this layout, verified, and what its perf lab can do (CAPABILITIES).
-  sides=() names=()
+  # A baseline that is an earlier baseline's build (a confirmation job's main that is its base)
+  # is timed once, as that one (the report treats it so); the candidate always runs.
+  sides=() names=() timed=()
   for spec in "$@"; do
     name=${spec%%=*}
     rev=$(git rev-parse "${spec#*=}") || exit 2
     bin=$(layout_bin "$rev" "$layout")
+    if [ "$name" != cand ] && printf '%s\n' "${timed[@]}" | grep -qxF -- "$bin"; then
+      log "block $n: $name is the same build as another side ($(basename "$bin")): timed once"; continue
+    fi
+    [ "$name" = cand ] || timed+=("$bin")
     [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS) \
       || { log "block $n: no verified build of $rev, layout $layout"; exit 2; }
     routes=1 empty_queries=0 timing=spawn
