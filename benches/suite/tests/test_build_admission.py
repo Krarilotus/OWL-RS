@@ -170,6 +170,16 @@ class Admission(unittest.TestCase):
         self.assertEqual(build.returncode, 127, err)
         self.assertNotIn("stopped by the PC guard", err)
 
+    def test_even_the_first_look_at_the_notices_counts_only_before_the_deadline(self):
+        # Sol, round 4: the first scan of the guard's notices taking 4 s (an awk that is slow only
+        # for them) must not take in a completion published at 3 s against a 2 s deadline.
+        self.stub("awk", 'case "$*" in *"-v s="*) /bin/sleep 4 ;; esac\nexec /usr/bin/awk "$@"')
+        build = self.start("said-after", stderr=subprocess.PIPE, NOTICE="after", CODE="127",
+                           NRESE_GUARD_NOTICE_WAIT_S="2")
+        _, err = build.communicate(timeout=120)
+        self.assertEqual(build.returncode, 127, err)
+        self.assertNotIn("stopped by the PC guard", err)
+
     @unittest.skipUnless(shutil.which("powershell"), "the memory cap's helper is Windows'")
     def test_a_broken_cap_helper_is_built_again_and_a_cap_never_silently_dropped(self):
         script = self.repo / "scripts/lib/memory-cap.ps1"
