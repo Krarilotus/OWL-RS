@@ -8,6 +8,7 @@ the behaviour they asked for.
 Run: python -m unittest discover -s benches/suite/tests -p test_build_admission.py
 """
 
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -49,6 +50,7 @@ class Admission(unittest.TestCase):
                            '  other) intent nrese-build-another; log GUARD-STOPPED 4242@1 ;;\n'
                            '  failed) intent "$NRESE_BUILD_JOB"; (sleep 2; log GUARD-STOP-FAILED 4242@1) > /dev/null 2>&1 & ;;\n'
                            '  intent) intent "$NRESE_BUILD_JOB" ;;\n'
+                           '  after) intent "$NRESE_BUILD_JOB"; (/usr/bin/sleep 3; log GUARD-STOPPED 4242@1) > /dev/null 2>&1 & ;;\n'
                            'esac\n'
                            'echo "$(date +%s%N)" > "$OUT/$RUN.ended"\nexit "${CODE:-0}"')
         self.stub("nproc", "echo 32")  # 12 compiler jobs by default
@@ -157,6 +159,40 @@ class Admission(unittest.TestCase):
             _, err = build.communicate(timeout=120)
             self.assertEqual(build.returncode, code, (notice, err))
             self.assertEqual("stopped by the PC guard" in err, code == 75, (notice, err))
+
+    def test_a_completion_seen_after_the_deadline_does_not_count(self):
+        # Sol, round 3: a turn of the wait that runs late (sleep 1 taking 4 s) must not stretch a
+        # 2 s deadline to take in a completion published at 3 s.
+        self.stub("sleep", '[ "$1" = 1 ] && exec /usr/bin/sleep 4; exec /usr/bin/sleep "$@"')
+        build = self.start("said-after", stderr=subprocess.PIPE, NOTICE="after", CODE="127",
+                           NRESE_GUARD_NOTICE_WAIT_S="2")
+        _, err = build.communicate(timeout=120)
+        self.assertEqual(build.returncode, 127, err)
+        self.assertNotIn("stopped by the PC guard", err)
+
+    @unittest.skipUnless(shutil.which("powershell"), "the memory cap's helper is Windows'")
+    def test_a_broken_cap_helper_is_built_again_and_a_cap_never_silently_dropped(self):
+        script = self.repo / "scripts/lib/memory-cap.ps1"
+        # A copy of the script of its own (a comment of its own): its own cache entry, never the
+        # one every build here uses.
+        script.write_text(script.read_text() + f"\n# test {self.root.name}\n")
+        digest = hashlib.sha256(script.read_bytes()).hexdigest()[:12]
+        cached = Path(tempfile.gettempdir()) / "nrese-memory-cap" / f"memory-cap-{digest}.exe"
+        cached.parent.mkdir(exist_ok=True)
+        self.addCleanup(lambda: cached.unlink(missing_ok=True))
+        cached.write_bytes(b"not a program")
+        build = self.start("corrupt", stderr=subprocess.PIPE, NRESE_MEMORY_CAP_GB="32")
+        _, err = build.communicate(timeout=300)
+        self.assertEqual(build.returncode, 0, err)
+        self.assertIsNotNone(self.started("corrupt", within=1), "no build after the helper was rebuilt")
+        self.assertNotEqual(cached.read_bytes(), b"not a program", "the broken helper stayed")
+        # A helper that can't be built: with a cap asked for, no build.
+        script.write_text(script.read_text() + "\n} this script does not parse {\n")
+        build = self.start("uncapped", stderr=subprocess.PIPE, NRESE_MEMORY_CAP_GB="32")
+        _, err = build.communicate(timeout=300)
+        self.assertEqual(build.returncode, 1, err)
+        self.assertIn("memory cap could not be applied (scripts/lib/memory-cap.ps1): not building", err)
+        self.assertIsNone(self.started("uncapped", within=1))
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "a pseudo-terminal (pty)")
     def test_only_a_terminal_gives_up_waiting(self):
