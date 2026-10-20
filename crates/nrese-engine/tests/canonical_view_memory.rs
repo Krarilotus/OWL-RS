@@ -16,11 +16,20 @@ fn node(name: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("urn:{name}"))
 }
 
+/// An engine without background maintenance: no compaction or checkpoint runs on a thread of
+/// its own while a measurement does (every thread counts).
+fn quiet() -> EngineConfig {
+    EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    }
+}
+
 /// `size` statements about `alias` in a named graph, `alias sameAs rep`, canonical views
 /// charged to `views`. The classes are made here, before any measurement: they are the
 /// version's, charged nowhere, as before canonical answers.
 fn engine(size: usize, views: &Arc<Budget>) -> Engine {
-    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let engine = Engine::new(quiet()).unwrap();
     engine.set_canonical_view_budget(Arc::clone(views));
     let mut tx = engine.transaction();
     let rep = tx.intern(node("rep").as_ref().into());
@@ -41,7 +50,7 @@ fn engine(size: usize, views: &Arc<Budget>) -> Engine {
         .snapshot()
         .count_in(ReadModel::Materialised, &QuadPattern::all());
     // Readers that bring no budget share one, made once.
-    Engine::new(EngineConfig::default())
+    Engine::new(quiet())
         .unwrap()
         .snapshot()
         .with_canonical_equality();
