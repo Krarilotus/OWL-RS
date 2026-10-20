@@ -586,20 +586,13 @@ mod tests {
     fn sorts_are_the_same_at_any_thread_count() {
         let mut rng = Rng(9);
         let input = keys(&mut rng, 300_000, [22, 5, 23, 0]);
-        let sorted: Vec<Vec<[u64; 4]>> = [1, 3, 8]
-            .into_iter()
-            .map(|threads| {
-                let pool = rayon::ThreadPoolBuilder::new()
-                    .num_threads(threads)
-                    .build()
-                    .unwrap();
-                let mut keys = input.clone();
-                let kept = pool.install(|| sort_dedup_keys(&mut keys));
-                keys.truncate(kept);
-                keys
-            })
-            .collect();
-        assert!(sorted.windows(2).all(|w| w[0] == w[1]));
+        for threads in [1, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| check(input.clone()));
+        }
     }
 
     /// The kernel against the comparison sort on a million LUBM-like quads:
