@@ -13,6 +13,13 @@
 # it asks each listed job whether a process it stops is in it, and names those jobs in its notice,
 # so the build that started the process learns it was stopped (scripts/cargo-guarded.sh). A job's
 # processes stay in it whatever becomes of their parents (Git Bash's exec leaves none).
+#
+# The work is a small program (below), compiled once into memory-cap-<hash>.exe in the temporary
+# directory's nrese-memory-cap, <hash> the first 12 hex digits of this file's SHA-256. This script
+# builds it if it isn't there and runs it; scripts/cargo-guarded.sh runs it directly when it is
+# (PowerShell's start and a compile took seconds at every build: Sol, 20 Oct 2026).
+#
+#   memory-cap-<hash>.exe PID LIMIT_GB [REGISTRY]
 param(
     [Parameter(Mandatory = $true)][int]$ProcessId,
     [Parameter(Mandatory = $true)][double]$LimitGB,
@@ -21,9 +28,11 @@ param(
 
 $source = @"
 using System;
+using System.Globalization;
+using System.IO;
 using System.Runtime.InteropServices;
 
-public static class NreseJob {
+public static class NreseMemoryCap {
     [StructLayout(LayoutKind.Sequential)]
     struct BasicLimits {
         public long PerProcessUserTimeLimit;
@@ -63,6 +72,9 @@ public static class NreseJob {
     static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetProcessTimes(IntPtr process, out long created, out long exited, out long kernel, out long user);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
 
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -77,61 +89,62 @@ public static class NreseJob {
 
     const int ExtendedLimitInformation = 9;
     const uint LimitJobMemory = 0x200;
-    const uint ProcessSetQuota = 0x0100, ProcessTerminate = 0x0001, ProcessDupHandle = 0x0040;
+    const uint ProcessSetQuota = 0x0100, ProcessTerminate = 0x0001, ProcessDupHandle = 0x0040,
+        ProcessQueryLimited = 0x1000;
     const uint DuplicateSameAccess = 0x2;
 
-    // Returns "" on success, else what failed. bytes 0: no limit.
-    public static string Cap(int pid, ulong bytes, string name) {
+    static int Fail(string what, int pid) {
+        Console.Error.WriteLine("memory-cap: " + what + ": " + Marshal.GetLastWin32Error() + " (process " + pid + " left uncapped)");
+        return 1;
+    }
+
+    public static int Main(string[] args) {
+        int pid = int.Parse(args[0], CultureInfo.InvariantCulture);
+        ulong bytes = (ulong)(double.Parse(args[1], CultureInfo.InvariantCulture) * (1UL << 30));
+        string registry = args.Length > 2 ? args[2] : "";
+        IntPtr process = OpenProcess(ProcessSetQuota | ProcessTerminate | ProcessDupHandle | ProcessQueryLimited, false, pid);
+        if (process == IntPtr.Zero) return Fail("OpenProcess", pid);
+        long created, exited, kernel, user;
+        if (!GetProcessTimes(process, out created, out exited, out kernel, out user)) return Fail("GetProcessTimes", pid);
+        string name = "nrese-build-" + pid + "-" + created;
         IntPtr job = CreateJobObject(IntPtr.Zero, name);
-        if (job == IntPtr.Zero) return "CreateJobObject: " + Marshal.GetLastWin32Error();
+        if (job == IntPtr.Zero) return Fail("CreateJobObject", pid);
         if (bytes > 0) {
             var info = new ExtendedLimits();
             info.Basic.LimitFlags = LimitJobMemory;
             info.JobMemoryLimit = new UIntPtr(bytes);
             if (!SetInformationJobObject(job, ExtendedLimitInformation, ref info, (uint)Marshal.SizeOf(typeof(ExtendedLimits))))
-                return "SetInformationJobObject: " + Marshal.GetLastWin32Error();
+                return Fail("SetInformationJobObject", pid);
         }
-        IntPtr process = OpenProcess(ProcessSetQuota | ProcessTerminate | ProcessDupHandle, false, pid);
-        if (process == IntPtr.Zero) return "OpenProcess: " + Marshal.GetLastWin32Error();
-        bool ok = AssignProcessToJobObject(job, process);
-        int error = Marshal.GetLastWin32Error();
+        if (!AssignProcessToJobObject(job, process)) return Fail("AssignProcessToJobObject", pid);
         // A job keeps its name only while a handle to it is open: the process itself gets one,
         // so the name lasts exactly as long as the process (the guard finds the job by it).
         IntPtr theirs;
-        if (ok && name != null && !DuplicateHandle(GetCurrentProcess(), job, process, out theirs, 0, false, DuplicateSameAccess)) {
-            error = Marshal.GetLastWin32Error();
-            CloseHandle(process);
-            return "DuplicateHandle: " + error;
-        }
+        if (!DuplicateHandle(GetCurrentProcess(), job, process, out theirs, 0, false, DuplicateSameAccess))
+            return Fail("DuplicateHandle", pid);
         CloseHandle(process);
-        // This script's own handle closes when it ends; the job lives on while the process is in it.
-        return ok ? "" : "AssignProcessToJobObject: " + error;
+        if (registry != "") {
+            Directory.CreateDirectory(registry);
+            File.WriteAllText(Path.Combine(registry, name), pid.ToString(CultureInfo.InvariantCulture));
+        }
+        Console.WriteLine(name);
+        // This program's own handle closes when it ends; the job lives on while the process is in it.
+        return 0;
     }
 }
 "@
-# Compiled once into a library cached by its source's hash (compiling took seconds at every build).
-$hash = -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($source)) | Select-Object -First 6 | ForEach-Object { $_.ToString('x2') })
+
+$hash = (Get-FileHash -Algorithm SHA256 -Path $PSCommandPath).Hash.Substring(0, 12).ToLowerInvariant()
 $cache = Join-Path ([IO.Path]::GetTempPath()) 'nrese-memory-cap'
-$dll = Join-Path $cache "NreseJob-$hash.dll"
-if (-not (Test-Path $dll)) {
+$exe = Join-Path $cache "memory-cap-$hash.exe"
+if (-not (Test-Path $exe)) {
     New-Item -ItemType Directory -Force $cache | Out-Null
-    $part = "$dll.$PID.tmp"
-    Add-Type -TypeDefinition $source -OutputAssembly $part -OutputType Library
-    Move-Item -Path $part -Destination $dll -ErrorAction SilentlyContinue
+    $part = "$cache\memory-cap-$hash.$PID.tmp.exe"
+    Add-Type -TypeDefinition $source -OutputAssembly $part -OutputType ConsoleApplication
+    Move-Item -Path $part -Destination $exe -ErrorAction SilentlyContinue
     Remove-Item -Path $part -ErrorAction SilentlyContinue
 }
-Add-Type -Path $dll
-
-$bytes = [uint64]($LimitGB * 1GB)
-$created = (Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId").CreationDate
-$name = "nrese-build-$ProcessId-$(if ($created) { $created.ToFileTimeUtc() } else { 0 })"
-$failed = [NreseJob]::Cap($ProcessId, $bytes, $name)
-if ($failed) {
-    [Console]::Error.WriteLine("memory-cap: $failed (process $ProcessId left uncapped)")
-    exit 1
-}
-if ($Registry) {
-    New-Item -ItemType Directory -Force $Registry | Out-Null
-    Set-Content -Path (Join-Path $Registry $name) -Value $ProcessId
-}
-$name
+$arguments = @("$ProcessId", $LimitGB.ToString([Globalization.CultureInfo]::InvariantCulture))
+if ($Registry) { $arguments += $Registry }
+& $exe @arguments
+exit $LASTEXITCODE
