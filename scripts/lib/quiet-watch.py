@@ -220,15 +220,15 @@ def fsync_dir(directory: Path):
 
 
 def journal(frozen: Path, line: str):
-    """Records a suspension before it is made: appended, flushed, synced (and the directory too
-    when the journal is new, so its entry survives a power loss)."""
-    created = not frozen.exists()
+    """Records a suspension before it is made: appended, flushed, synced, and the directory synced
+    every time, so the journal's entry is durable before any suspension it records (Sol, 20 Oct
+    2026: synced only when the file was created, a failed first sync left the file there and the
+    next suspension went ahead unsynced). A failure raises: nothing is suspended."""
     with open(frozen, "a", encoding="utf-8") as f:
         f.write(line + "\n")
         f.flush()
         os.fsync(f.fileno())
-    if created:
-        fsync_dir(frozen.parent)
+    fsync_dir(frozen.parent)
 
 
 def rewrite(frozen: Path, lines: list[str]):
