@@ -319,13 +319,19 @@ fn a_removed_repository_stays_removed() {
     open(dir.path())
         .create("gone", RepositorySettings::default())
         .expect("created");
-    // What a removal leaves when neither the rename nor the deletion succeeds.
-    let repository = dir.path().join("repositories").join("gone");
-    std::fs::write(repository.join(".removed"), b"").expect("tombstone");
+    // What a removal leaves when neither the rename nor the deletion succeeds: its
+    // tombstone beside the repositories, the directory as it was.
+    let root = dir.path().join("repositories");
+    let repository = root.join("gone");
+    std::fs::write(root.join("~removed-gone"), b"").expect("tombstone");
     let catalog = open(dir.path());
     assert!(catalog.get("gone").is_none());
     assert!(catalog.unavailable("gone").is_none());
     assert!(!repository.exists(), "reclaimed");
+    assert!(
+        !root.join("~removed-gone").exists(),
+        "its tombstone goes with it"
+    );
 }
 
 /// Settings that would be silently ignored are refused: unknown fields, an unknown rules
@@ -380,4 +386,40 @@ fn settings_that_would_be_ignored_are_refused() {
             },
         )
         .expect("created");
+}
+
+/// A removal whose files are held (Windows: its directory open without delete sharing, so
+/// that neither the rename nor the deletion succeeds) stays removed across a restart: the
+/// decision is kept outside the directory it reclaims (Sol, r1 of the store lifecycle).
+#[cfg(windows)]
+#[test]
+fn a_removal_whose_files_are_held_stays_removed_after_a_restart() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let catalog = open(dir.path());
+    catalog
+        .create("held", RepositorySettings::default())
+        .expect("created");
+    let path = dir.path().join("repositories").join("held");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3)
+        .custom_flags(BACKUP_SEMANTICS)
+        .open(&path)
+        .expect("held");
+    assert_eq!(
+        catalog.delete("held").expect("removed"),
+        nrese_store::catalog::Removal::Pending
+    );
+    assert!(catalog.get("held").is_none());
+    drop(held);
+    drop(catalog);
+    let catalog = open(dir.path());
+    assert!(
+        catalog.get("held").is_none(),
+        "the removed repository came back"
+    );
+    assert!(catalog.unavailable("held").is_none());
+    assert!(!path.exists(), "reclaimed at the start");
 }

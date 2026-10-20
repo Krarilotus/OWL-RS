@@ -30,6 +30,16 @@ pub(crate) fn write(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
     sync_dir(dir)
 }
 
+/// Removes `file` (absent: nothing to do), the directory synced after.
+pub(crate) fn remove(file: &Path) -> std::io::Result<()> {
+    match fs::remove_file(file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    sync_dir(file.parent().unwrap_or_else(|| Path::new(".")))
+}
+
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     File::open(dir)?.sync_all()?;
