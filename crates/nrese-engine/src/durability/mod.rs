@@ -18,11 +18,12 @@
 //! intact revision) rather than drop them. Per segment ([`wal::read_segment`]), by the
 //! sync policy it was written under (recorded beside it):
 //!
-//! - Truncated, whatever the policy: a tail that ends inside a frame's header or announced
-//!   payload, or is all zeros (a size extended whose data never reached the disk).
-//! - Corruption, whatever the policy: a damaged frame followed by an intact one, a frame
-//!   whose payload is intact under a damaged length field, and any damage in a segment
-//!   that isn't the last.
+//! - Truncated, whatever the policy, if no intact record follows: a tail that ends inside a
+//!   frame's header or announced payload, or is all zeros (a size extended whose data never
+//!   reached the disk).
+//! - Corruption, whatever the policy: an intact record anywhere after the damage, past any
+//!   number of damaged frames, holes and damaged length fields (a payload intact under a
+//!   damaged length counts), and any damage in a segment that isn't the last.
 //! - [`SyncPolicy::EveryCommit`]: a complete last frame that fails its check was synced,
 //!   so acknowledged: corruption, unless its last 8 bytes are zero (a version 6 frame ends
 //!   in its non-zero commit time, so the write was still in flight: truncated).

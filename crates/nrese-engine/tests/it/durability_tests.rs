@@ -228,6 +228,14 @@ fn wal_damage_is_truncated_or_refused_by_its_evidence() {
     type Damage = fn(&mut Vec<u8>, &[(usize, usize)]);
     let flip_first: Damage = |bytes, frames| bytes[frames[0].0 + 12] ^= 1;
     let flip_last: Damage = |bytes, frames| bytes[frames[2].0 + 12] ^= 1;
+    let flip_two: Damage = |bytes, frames| {
+        bytes[frames[0].0 + 12] ^= 1;
+        bytes[frames[1].0 + 12] ^= 1;
+    };
+    let long_and_flipped: Damage = |bytes, frames| {
+        bytes[frames[0].0..frames[0].0 + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[frames[0].0 + 12] ^= 1;
+    };
     let zero_tail: Damage = |bytes, _| bytes.extend_from_slice(&[0; 40]);
     let zero_end: Damage = |bytes, frames| bytes[frames[2].1 - 8..frames[2].1].fill(0);
     let long_length: Damage = |bytes, frames| {
@@ -245,7 +253,7 @@ fn wal_damage_is_truncated_or_refused_by_its_evidence() {
         Option<u64>,
         Result<u64, u64>,
     );
-    let rows: [Row; 10] = [
+    let rows: [Row; 12] = [
         (
             "damage before intact records",
             every,
@@ -269,6 +277,22 @@ fn wal_damage_is_truncated_or_refused_by_its_evidence() {
             flip_first,
             Some(0),
             Ok(0),
+        ),
+        (
+            "two damaged records before an intact one, os-buffered",
+            buffered,
+            true,
+            flip_two,
+            None,
+            Err(0),
+        ),
+        (
+            "a damaged length and payload before intact records",
+            every,
+            true,
+            long_and_flipped,
+            None,
+            Err(0),
         ),
         ("a zero-filled tail", every, true, zero_tail, None, Ok(3)),
         (
