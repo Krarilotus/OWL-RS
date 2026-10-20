@@ -383,7 +383,12 @@ impl Catalog {
                     }
                     Err(error) => Err(repair(&file, &error.to_string())),
                 };
-                match settings.and_then(|settings| repositories.start(&id, settings)) {
+                let started = |settings| {
+                    repositories
+                        .start(&id, settings)
+                        .map_err(|error| repair_files(&entry.path(), &error))
+                };
+                match settings.and_then(started) {
                     Ok(repository) => {
                         repositories.others.write().insert(id, repository);
                     }
@@ -727,6 +732,16 @@ fn repair(file: &std::path::Path, error: &str) -> String {
         "{}: {error}. Repair or remove the file (the repository then takes the server's \
          settings) and start again, or remove the repository",
         file.display()
+    )
+}
+
+/// Why the store in `dir` didn't open (or its inferences weren't brought in line), and how
+/// to repair it.
+fn repair_files(dir: &std::path::Path, error: &str) -> String {
+    format!(
+        "{}: the repository's store didn't open: {error}. Repair: free or restore its files \
+         there (a backup's image, the log) and start again, or remove the repository",
+        dir.display()
     )
 }
 
