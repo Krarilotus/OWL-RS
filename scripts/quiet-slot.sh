@@ -39,8 +39,12 @@ compilers() {
 while ! mkdir "$LOCK" 2>/dev/null; do
   owner=$(cat "$LOCK/pid" 2>/dev/null || echo "")
   if [ -n "$owner" ] && ! alive "$owner"; then
-    # What a dead holder's watcher stopped continues before the lock is taken over.
-    [ -f "$LOCK/frozen" ] && python3 "$WATCH" "$LOCK" --resume
+    # What a dead holder's watcher suspended continues before the lock is taken over; what
+    # can't be settled keeps the lock (its record isn't erased) and this measurement doesn't run.
+    if [ -f "$LOCK/frozen" ] && ! python3 "$WATCH" "$LOCK" --resume; then
+      echo "quiet slot: a dead holder's suspensions couldn't be resumed ($LOCK/frozen); not taken over" >&2
+      exit 2
+    fi
     rm -rf "$LOCK"
     continue
   fi
@@ -66,9 +70,10 @@ while :; do
   fi
   sleep 5
 done
-# While the measurement runs, nothing else heavy does: the watcher stops this user's other
-# busy processes and pauses the containers that aren't the measurement's, and resumes them
-# when it ends (scripts/lib/quiet-watch.py; its verdict, quiet or disturbed, in watch.log).
+# While the measurement runs, the watcher suspends the job's own other busy work (its
+# FLEET_JOB, its slice, its namespace's containers) and resumes it when it ends; anything else
+# is left running and recorded (scripts/lib/quiet-watch.py; its verdict, quiet or disturbed,
+# in watch.log).
 # The measurement's own containers carry the label nrese.quiet=$NRESE_QUIET_TOKEN.
 export NRESE_QUIET_TOKEN="$$-$(date +%s)"
 watcher=""
@@ -87,7 +92,12 @@ stop_watch() {
     kill -TERM "$watcher" 2>/dev/null && wait "$watcher"
     [ -f "$LOCK/watch.log" ] && echo "quiet slot: $(tail -1 "$LOCK/watch.log")" >&2
   fi
-  rm -rf "$LOCK"
+  # Suspensions the watcher couldn't resume keep the lock and their record for the next holder.
+  if [ -f "$LOCK/frozen" ]; then
+    echo "quiet slot: suspensions not resumed, kept in $LOCK/frozen" >&2
+  else
+    rm -rf "$LOCK"
+  fi
 }
 trap stop_watch EXIT
 # What the measurement builds itself doesn't wait for the slot it holds.

@@ -340,12 +340,18 @@ def stop(process: subprocess.Popen, grace_s: float = 30):
 
 
 def quiet_watch(state: Path, pid: int, token: str) -> subprocess.Popen | None:
-    """The watcher over a timed command (Linux): this user's other busy processes stopped,
-    other containers paused, until it ends."""
+    """The watcher over a timed command (Linux): the job's own other busy work suspended,
+    anything else recorded as disturbing it, until it ends. What an earlier watcher of the job
+    left suspended is resumed first; if it can't be, no watcher starts (the job runs unwatched,
+    its verdict says so) and its record stays."""
     watch = HERE.parents[1] / "scripts" / "lib" / "quiet-watch.py"
     if not Path("/proc").is_dir() or not watch.exists():
         return None
     state.mkdir(parents=True, exist_ok=True)
+    if (state / "frozen").exists() and subprocess.run([sys.executable, str(watch), str(state), "--resume"]).returncode:
+        (state / "watch.log").write_text("not watched: an earlier watcher's suspensions couldn't be resumed "
+                                         f"({state / 'frozen'})\n", encoding="utf-8")
+        return None
     return subprocess.Popen([sys.executable, str(watch), str(state), str(pid), token])
 
 

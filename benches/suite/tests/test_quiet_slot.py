@@ -58,6 +58,24 @@ esac
         self.assertFalse(self.lock.exists(), "quiet slot must be released")
         return result
 
+    def test_a_dead_holders_unresolved_suspensions_keep_the_lock_and_stop_the_measurement(self):
+        """COT-14 (20 Oct 2026): a taken-over lock's record of suspensions was removed whether or
+        not they were resumed. One that can't be settled now keeps the lock."""
+        (self.bin / "python3").symlink_to(shutil.which("python3"))
+        self.lock.mkdir()
+        (self.lock / "pid").write_text("999999")  # a holder that is gone
+        (self.lock / "frozen").write_text("pid 51\n")  # no start time: which process is unknown
+        self.state.write_text("quiet")
+        result = subprocess.run(
+            [self.bash, str(GUARD), "/bin/sh", "-c", 'echo ran > "$MARKER"'],
+            env={**os.environ, "PATH": str(self.bin), "PROBE_STATE": str(self.state), "SLEPT": str(self.root / "slept"),
+                 "MARKER": str(self.marker), "NRESE_QUIET_DIR": str(self.lock), "NRESE_QUIET_DRAIN_S": "0"},
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("couldn't be resumed", result.stderr)
+        self.assertEqual((self.lock / "frozen").read_text(), "pid 51\n")
+        self.assertFalse(self.marker.exists())
+
     def test_no_compilers_runs_without_count_warning(self):
         result = self.run_guard("quiet")
         self.assertEqual(result.returncode, 0, result.stderr)
