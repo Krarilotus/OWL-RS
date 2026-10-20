@@ -713,6 +713,36 @@ def read_floor(path: Path) -> dict | None:
 FLOORS = ROOT / "benches" / "fast" / "noise-floor"
 
 
+def quiet_verdicts(directory: Path) -> tuple[dict, list[str]]:
+    """Each block's quiet-watcher verdict (release-gate.sh block: quiet-block-<n>.json), and a
+    note for each block work that isn't the job's own disturbed (scripts/lib/quiet-watch.py
+    suspends only the job's own: other work is left running and its load recorded), or whose
+    suspensions weren't all resumed. A disturbed block was left out and run once more
+    (quiet-block-<n>-disturbed-<t>.json, its reports disturbed-*); a repeat disturbed again
+    was kept ("repeat")."""
+    verdicts, notes = {}, []
+    for n in sorted({int(m.group(1)) for p in directory.glob("quiet-block-*-disturbed-*.json")
+                     if (m := re.search(r"quiet-block-(\d+)-disturbed-\d+\.json$", p.name))}):
+        notes.append(f"block {n}: disturbed: left out of the statistics (both sides, kept as disturbed-*) "
+                     "and run once more")
+    found = [(int(m.group(1)), p) for p in directory.glob("quiet-block-*.json")
+             if (m := re.search(r"quiet-block-(\d+)\.json$", p.name))]
+    for n, path in sorted(found):
+        try:
+            v = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            notes.append(f"block {n}: its quiet verdict can't be read ({path.name})")
+            continue
+        verdicts[n] = v
+        if v.get("verdict") == "disturbed":
+            notes.append(f"block {n}: {'its repeat ' if v.get('repeat') else ''}disturbed"
+                         f"{', kept' if v.get('repeat') else ''}: work that isn't this job's used more than a core in "
+                         f"{v.get('unowned_share', 0):.0%} of {v.get('samples', 0)} samples (left running, never suspended)")
+        if v.get("not_resumed"):
+            notes.append(f"block {n}: suspensions not resumed: {v['not_resumed']}")
+    return verdicts, notes
+
+
 def fmt(x) -> str:
     return "-" if x is None else f"{x:.4g}"
 
@@ -1642,6 +1672,8 @@ def main() -> int:
                 summary["context"][key] = float(summary["context"][key]) if "gb" in key else int(summary["context"][key])
         if args.inputs and args.inputs.is_file():
             summary["inputs"] = args.inputs.read_text(encoding="utf-8").splitlines()
+        summary["quiet"], notes = quiet_verdicts(args.passes)
+        summary["host_notes"] = [*summary.get("host_notes", []), *notes]
         prepared = {(p["report"].get("prepared") or {}).get("manifest_sha256") for p in passes}
         summary["prepared_manifest"] = sorted(map(str, prepared))
         text = render(summary)

@@ -680,6 +680,164 @@ printf "no linker" > "$d/release/other"; lld_of "$d" 2>/dev/null || echo not-lld
         with self.assertRaises(SystemExit):
             fast.select([{"name": "a", "area": "query"}], SimpleNamespace(cases="", areas=None))
 
+    def test_a_block_that_work_not_its_own_disturbed_is_noted_in_the_report(self):
+        """COT-13 (20 Oct 2026): the watcher no longer stops work that isn't the job's own; it
+        leaves it running and records it, and the report says which blocks it disturbed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for n, verdict in ((1, {"verdict": "quiet", "samples": 30, "unowned_share": 0.0}),
+                               (2, {"verdict": "disturbed", "samples": 30, "unowned_share": 0.4,
+                                    "not_resumed": ["pid 51"]})):
+                (Path(tmp) / f"quiet-block-{n}.json").write_text(json.dumps(verdict), encoding="utf-8")
+            verdicts, notes = gate_module.quiet_verdicts(Path(tmp))
+        self.assertEqual(sorted(verdicts), [1, 2])
+        self.assertEqual(len(notes), 2)
+        self.assertTrue(notes[0].startswith("block 2: disturbed") and "40%" in notes[0], notes)
+        self.assertIn("not resumed", notes[1])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the watcher watches /proc (Linux)")
+    def test_a_blocks_attempts_from_every_crash_point_one_repeat_at_most_a_verdict_before_acceptance(self):
+        """The orchestrator, 20 Oct 2026: a disturbed block is left out of the statistics, both
+        sides, and repeated once; a disturbed repeat is kept and listed. Sol, 20 Oct 2026: a restart
+        accepted a disturbed block, or ran a third attempt. One table over the states a crash leaves
+        a block in: what the restarted step runs and keeps. git, the watcher and fast.py are faked
+        (the watcher's --resume is the real one); no repository is touched."""
+        import shutil
+        import subprocess
+        bash, python = shutil.which("bash"), shutil.which("python3")
+        head = "a" * 40
+        reports = [f"pass-{k}-x{k}.json" for k in range(1, 5)]
+        complete = {r: '{"finished_ns": 1}' for r in reports}
+        archived = {f"disturbed-{r[:-5]}-9.json": "{}" for r in reports}
+        quiet, disturbed = '{"verdict": "quiet"}', '{"verdict": "disturbed"}'
+        # case, the state file, files in passes, an earlier watcher's record, the verdicts of the
+        # attempts it runs -> exit, attempts run, pass-*, disturbed-pass-*, final state, a report
+        # note; and a fault: mv failing on paths that contain a text, or a directory where the
+        # state is written (its temporary file) or renamed to
+        faults = {
+            "a state that can't be written: nothing run":
+                (None, {}, None, ["quiet"], (2, 0, 0, 0, None, None), ("squat", "block-1.state.new")),
+            "a state that can't be renamed: nothing run":
+                (None, {}, None, ["quiet"], (2, 0, 0, 0, "squatted", None), ("squat", "block-1.state")),
+            "an acceptance that can't be saved: not accepted":
+                ("1:ran", {**complete, "quiet-block-1.json": quiet}, None, [], (2, 0, 4, 0, "1:ran", None),
+                 ("squat", "block-1.state.new")),
+            "an archival move that fails: no repeat":
+                ("1:ran", {**complete, "quiet-block-1.json": disturbed}, None, ["quiet"], (2, 0, 4, 0, "1:archiving", None),
+                 ("mv", "disturbed-pass")),
+        }
+        rows = [
+            ("fresh, quiet", None, {}, None, ["quiet"], (0, 1, 4, 0, "1:accepted", None)),
+            ("fresh, disturbed then quiet", None, {}, None, ["disturbed", "quiet"],
+             (0, 2, 4, 4, "2:accepted", "left out of the statistics")),
+            ("fresh, disturbed twice: kept", None, {}, None, ["disturbed", "disturbed"],
+             (0, 2, 4, 4, "2:accepted", "its repeat disturbed, kept")),
+            ("a crash during attempt 1: resumed", "1:running", dict(list(complete.items())[:2]), None, ["quiet"],
+             (0, 1, 4, 0, "1:accepted", None)),
+            ("attempt 1 run, its verdict not recorded: run again", "1:ran", complete, None, ["quiet"],
+             (0, 1, 4, 0, "1:accepted", None)),
+            ("attempt 1 disturbed, a crash before archiving", "1:ran", {**complete, "quiet-block-1.json": disturbed},
+             None, ["quiet"], (0, 1, 4, 4, "2:accepted", "left out of the statistics")),
+            ("a crash midway through archiving", "1:archiving",
+             {**dict(list(complete.items())[2:]), **dict(list(archived.items())[:2]), "quiet-block-1.json": disturbed},
+             None, ["quiet"], (0, 1, 4, 4, "2:accepted", "left out of the statistics")),
+            ("archived, a crash before the repeat", "2:start", archived, None, ["quiet"], (0, 1, 4, 4, "2:accepted", None)),
+            ("a crash during the repeat: resumed, never a third", "2:running",
+             {**archived, **dict(list(complete.items())[:1])}, None, ["disturbed"],
+             (0, 1, 4, 4, "2:accepted", "its repeat disturbed, kept")),
+            ("the repeat disturbed and recorded: kept, nothing run", "2:ran",
+             {**archived, **complete, "quiet-block-1.json": disturbed}, None, [], (0, 0, 4, 4, "2:accepted", None)),
+            ("accepted before: nothing run", "1:accepted", {**complete, "quiet-block-1.json": quiet}, None, [],
+             (0, 0, 4, 0, "1:accepted", None)),
+            ("complete and disturbed, no state, an earlier record unresolved: stopped", None,
+             {**complete, "quiet-block-1.json": disturbed}, "pid 51\n", [], (2, 0, 4, 0, None, None)),
+            ("a third attempt: never started", "3:start", {}, None, [], (2, 0, 0, 0, "3:start", None)),
+        ]
+        rows = [(*row, None) for row in rows] + [(case, *rest) for case, rest in faults.items()]
+        for case, state, files, frozen, verdicts, expected, fault in rows:
+            with self.subTest(case), tempfile.TemporaryDirectory() as tmp:
+                t = Path(tmp).as_posix()
+                shim = Path(tmp) / "shim"
+                shim.mkdir()
+                (Path(tmp) / "verdicts").write_text("".join(f"{v}\n" for v in verdicts), encoding="utf-8")
+                # fast.py block writes the block's reports (each run counted); quiet-watch.py writes
+                # the next verdict when it is stopped; its --resume is the real watcher's.
+                (shim / "python3").write_text(f"""#!/usr/bin/env bash
+case " $* " in
+  *" benches/fast/fast.py block "*)
+    echo run >> {t}/runs
+    n=0; out=; sides=()
+    while [ $# -gt 0 ]; do case $1 in --block) n=$2 ;; --out) out=$2 ;; --side) sides+=("${{2%%:*}}") ;; esac; shift; done
+    per=$(( 2 * ${{#sides[@]}} ))
+    for k in $(seq 1 $per); do echo '{{"finished_ns": 1}}' > "$out/pass-$(( per * (n - 1) + k ))-x$k.json"; done
+    sleep 1 ;;  # a block takes time: the watcher is up before it ends
+  *"quiet-watch.py"*" --resume "*) exec "{Path(python).as_posix()}" "{(ROOT / 'scripts/lib/quiet-watch.py').as_posix()}" "$2" --resume ;;
+  *"quiet-watch.py"*)
+    state=$2
+    verdict() {{
+      v=$(head -1 {t}/verdicts); sed -i 1d {t}/verdicts
+      printf '{{"verdict": "%s", "samples": 9, "unowned_share": 0.5}}\\n' "$v" > "$state/verdict.json"
+      echo "$v" > "$state/watch.log"; exit 0
+    }}
+    trap verdict TERM
+    while :; do sleep 0.2; done ;;
+  *) exec "{Path(python).as_posix()}" "$@" ;;
+esac
+""", encoding="utf-8", newline="\n")
+                (shim / "python3").chmod(0o755)
+                # git, faked: the revision is a fixed id, a worktree an empty directory; anything
+                # else the step asks fails loudly (no real repository is touched).
+                (shim / "git").write_text(f"""#!/usr/bin/env bash
+case "$1 $2" in
+  "rev-parse --short=8") echo "${{3:0:8}}" ;;
+  "rev-parse HEAD") echo {head} ;;
+  "worktree add") mkdir -p "${{@: -2:1}}" ;;
+  "status --porcelain") ;;
+  *) if [ "$1" = rev-parse ] && [ $# -eq 2 ]; then echo "$2"; else echo "fake git: $*" >&2; exit 99; fi ;;
+esac
+""", encoding="utf-8", newline="\n")
+                (shim / "git").chmod(0o755)
+                if fault and fault[0] == "mv":
+                    (shim / "mv").write_text(f'#!/bin/sh\ncase "$*" in *{fault[1]}*) echo "injected mv failure" >&2; exit 1 ;; '
+                                             'esac\nexec /bin/mv "$@"\n', encoding="utf-8", newline="\n")
+                    (shim / "mv").chmod(0o755)
+                setup = f'''
+. scripts/lib/gate-publish.sh
+GATE={t}/gate GATE_BIN={t}/bin
+b=$GATE_BIN/bin-test; mkdir -p "$b/release" "$GATE" {t}/out/passes
+echo tool > "$b/release/tool"; echo {head} > "$b/REVISION"; echo timing=watchdog > "$b/CAPABILITIES"
+(cd "$b" && sha256sum release/tool > SHA256SUMS)
+point {head} "$b"
+echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
+'''
+                env = {**os.environ, "NRESE_GATE_DIR": f"{t}/gate", "GATE_BIN": f"{t}/bin", "FLEET_OUT": f"{t}/out",
+                       "PATH": f"{shim}{os.pathsep}{os.environ['PATH']}"}
+                subprocess.run([bash, "-c", setup], cwd=ROOT, env=env, check=True, capture_output=True)
+                passes = Path(tmp) / "out" / "passes"
+                for name, content in files.items():
+                    (passes / name).write_text(content, encoding="utf-8")
+                if state:
+                    attempt, stage = state.split(":")
+                    (passes / "block-1.state").write_text(f"attempt={attempt}\nstage={stage}\n", encoding="utf-8")
+                if fault and fault[0] == "squat":
+                    (passes / fault[1]).mkdir()  # a directory where the state is written or renamed to
+                if frozen:
+                    (Path(tmp) / "gate" / "quiet").mkdir(parents=True)
+                    (Path(tmp) / "gate" / "quiet" / "frozen").write_text(frozen, encoding="utf-8")
+                done = subprocess.run([bash, "-c", f'PATH="{shim}:$PATH" exec bash scripts/release-gate.sh block 1 {head} 1 - '
+                                       f'base={head} cand={head}'], cwd=ROOT, env=env, capture_output=True, text=True)
+                runs = Path(tmp) / "runs"
+                final = passes / "block-1.state"
+                found = (done.returncode, len(runs.read_text().split()) if runs.exists() else 0,
+                         len(list(passes.glob("pass-*.json"))), len(list(passes.glob("disturbed-pass-*.json"))),
+                         "squatted" if final.is_dir() else
+                         ":".join(line.split("=", 1)[1] for line in final.read_text().split()) if final.exists() else None)
+                self.assertEqual(found, expected[:5], done.stdout + done.stderr)
+                if frozen:
+                    self.assertEqual((Path(tmp) / "gate" / "quiet" / "frozen").read_text(), frozen)
+                notes = gate_module.quiet_verdicts(passes)[1]
+                if expected[5]:
+                    self.assertTrue(any(expected[5] in note for note in notes), notes)
+
     def test_report_writes_markdown_and_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
