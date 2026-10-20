@@ -26,11 +26,12 @@ use crate::index::Layout;
 const OPEN_ATTEMPTS: usize = 3;
 
 /// The log segments of the store at `root` that may hold `after + 1` or later, in order,
-/// archived ones first, each open. Segments are named after their first revision.
+/// archived ones first, each open. Segments are named after their first revision. `None`
+/// when they kept moving through every attempt: the log is being cut faster than it is read.
 fn open_segments(
     root: &std::path::Path,
     after: u64,
-) -> EngineResult<Vec<(std::path::PathBuf, std::fs::File)>> {
+) -> EngineResult<Option<Vec<(std::path::PathBuf, std::fs::File)>>> {
     let mut attempt = 0;
     'list: loop {
         attempt += 1;
@@ -52,15 +53,16 @@ fn open_segments(
         for (_, path) in segments.drain(start..) {
             match std::fs::File::open(&path) {
                 Ok(file) => open.push((path, file)),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound && attempt < OPEN_ATTEMPTS =>
-                {
-                    continue 'list;
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match attempt < OPEN_ATTEMPTS {
+                        true => continue 'list,
+                        false => return Ok(None),
+                    }
                 }
                 Err(error) => return Err(error.into()),
             }
         }
-        return Ok(open);
+        return Ok(Some(open));
     }
 }
 
@@ -103,7 +105,11 @@ impl Engine {
         let Some(durable) = &shared.durable else {
             return Err(EngineError::LogTruncated { oldest: latest });
         };
-        let segments = open_segments(durable.root(), after)?;
+        // Segments that kept moving: the follower starts again from an image, as for a log a
+        // checkpoint has covered.
+        let Some(segments) = open_segments(durable.root(), after)? else {
+            return Err(EngineError::LogTruncated { oldest: latest });
+        };
         let mut expected = after + 1;
         let mut oldest = None;
         'segments: for (path, mut file) in segments {
@@ -252,24 +258,23 @@ impl Engine {
 mod tests {
     use std::cell::RefCell;
 
-    use crate::{DurabilityConfig, Engine, EngineConfig, SyncPolicy};
+    use crate::{DurabilityConfig, Engine, EngineConfig, EngineError, SyncPolicy};
 
     thread_local! {
         /// What a test does between the feed's listing of the segments and its opening them.
-        static BETWEEN: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+        static BETWEEN: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
     }
 
     pub(super) fn between_listing_and_opening() {
-        if let Some(act) = BETWEEN.with(|between| between.borrow_mut().take()) {
-            act();
-        }
+        BETWEEN.with(|between| {
+            if let Some(act) = between.borrow_mut().as_mut() {
+                act();
+            }
+        });
     }
 
-    /// A segment archived after the feed listed it and before it opened it is found in
-    /// the archive.
-    #[test]
-    fn a_segment_archived_while_the_feed_lists_is_still_read() {
-        let dir = tempfile::tempdir().unwrap();
+    /// A durable engine with three commits (each in the active segment).
+    fn three_commits(dir: &std::path::Path) -> Engine {
         let config = EngineConfig {
             background_maintenance: false,
             durability: DurabilityConfig {
@@ -278,7 +283,7 @@ mod tests {
             },
             ..EngineConfig::default()
         };
-        let engine = Engine::open(dir.path(), config).unwrap();
+        let engine = Engine::open(dir, config).unwrap();
         for n in 0..3 {
             let mut tx = engine.transaction();
             let quad = nrese_rdf::Quad::new(
@@ -290,19 +295,66 @@ mod tests {
             tx.insert(quad.as_ref());
             tx.commit().unwrap();
         }
+        engine
+    }
+
+    /// Segments that move between every listing and opening (the log cut faster than the
+    /// feed reads it) send the follower back to an image, as a truncated log does: not an
+    /// error of the server's.
+    #[test]
+    fn segments_that_keep_moving_are_a_truncated_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = three_commits(dir.path());
         let (wal, archive) = (
             super::wal::wal_dir(dir.path()),
             super::wal::archive_dir(dir.path()),
         );
+        std::fs::create_dir_all(&archive).unwrap();
         BETWEEN.with(|between| {
             *between.borrow_mut() = Some(Box::new(move || {
-                std::fs::create_dir_all(&archive).unwrap();
-                for (_, path) in super::wal::list_segments(&wal).unwrap() {
-                    std::fs::rename(&path, archive.join(path.file_name().unwrap())).unwrap();
+                // Whatever was listed moves: from the log to the archive, or back.
+                for (from, to) in [(&wal, &archive), (&archive, &wal)] {
+                    let listed = super::wal::list_segments(from).unwrap();
+                    if !listed.is_empty() {
+                        for (_, path) in listed {
+                            std::fs::rename(&path, to.join(path.file_name().unwrap())).unwrap();
+                        }
+                        return;
+                    }
+                }
+            }));
+        });
+        let result = engine.log_since(0, 1 << 20);
+        BETWEEN.with(|between| *between.borrow_mut() = None);
+        assert!(
+            matches!(result, Err(EngineError::LogTruncated { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// A segment archived after the feed listed it and before it opened it is found in
+    /// the archive.
+    #[test]
+    fn a_segment_archived_while_the_feed_lists_is_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = three_commits(dir.path());
+        let (wal, archive) = (
+            super::wal::wal_dir(dir.path()),
+            super::wal::archive_dir(dir.path()),
+        );
+        let mut once = true;
+        BETWEEN.with(|between| {
+            *between.borrow_mut() = Some(Box::new(move || {
+                if std::mem::take(&mut once) {
+                    std::fs::create_dir_all(&archive).unwrap();
+                    for (_, path) in super::wal::list_segments(&wal).unwrap() {
+                        std::fs::rename(&path, archive.join(path.file_name().unwrap())).unwrap();
+                    }
                 }
             }));
         });
         let batch = engine.log_since(0, 1 << 20).unwrap();
+        BETWEEN.with(|between| *between.borrow_mut() = None);
         assert_eq!((batch.records, batch.last), (3, 3));
     }
 }
