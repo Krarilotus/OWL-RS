@@ -676,7 +676,7 @@ printf "no linker" > "$d/release/other"; lld_of "$d" 2>/dev/null || echo not-lld
             (Path(tmp) / "plan.json").write_text(done.stdout, encoding="utf-8")
             (Path(tmp) / "measure.toml").write_text(f'[case.{plan["run"][0]}]\nblocks = 3\n', encoding="utf-8")
             done = subprocess.run([sys.executable, "-B", str(script), "blocks", "--plan", str(Path(tmp) / "plan.json"),
-                                   "--measure", str(Path(tmp) / "measure.toml"), "--out", tmp],
+                                   "--measure", str(Path(tmp) / "measure.toml"), "--square", "1", "--out", tmp],
                                   capture_output=True, text=True, encoding="utf-8")
             self.assertEqual(done.returncode, 0, done.stderr[-500:])
             third = json.loads((Path(tmp) / "plan-block-3.json").read_text(encoding="utf-8"))
@@ -905,7 +905,10 @@ class Measurement(unittest.TestCase):
 
     def test_a_case_whose_noise_needs_more_blocks_is_tested_on_them_and_the_jobs_run_them(self):
         measure = {"a": {"blocks": 2}, "b": {"blocks": 4}, "c": {"blocks": 3}}
-        self.assertEqual(gate_module.blocks(["a", "b", "c"], measure), [["a", "b", "c"], ["a", "b", "c"], ["b", "c"], ["b"]])
+        self.assertEqual(gate_module.blocks(["a", "b", "c"], measure, square=1),  # one side: no squares
+                         [["a", "b", "c"], ["a", "b", "c"], ["b", "c"], ["b"]])
+        with self.assertRaises(TypeError):  # Sol r1: no square given planned 2 and 8 blocks for three sides
+            gate_module.blocks(["a"], measure)
         # Whole Latin squares of the timed sides (tf2-gate-1: a first run's cost; a case in 2
         # blocks of three sides leaves one side never opening): 2 -> 3, 4 -> 6, 3 stays.
         self.assertEqual(gate_module.blocks(["a", "b", "c"], measure, square=3),
