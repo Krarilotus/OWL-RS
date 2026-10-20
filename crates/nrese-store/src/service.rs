@@ -155,8 +155,10 @@ impl StoreService {
             }),
             ql: std::sync::Arc::default(),
         };
+        let unavailable = std::sync::Arc::<std::sync::OnceLock<String>>::default();
         let namespaces = crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
+            std::sync::Arc::clone(&unavailable),
         )?;
         let quarantine = crate::quarantine::Quarantine::open(
             (config.mode == StoreMode::OnDisk).then_some(config.data_dir.as_path()),
@@ -173,7 +175,7 @@ impl StoreService {
             engine,
             preloaded_ontology,
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            unavailable: std::sync::Arc::default(),
+            unavailable,
             materialised: std::sync::Arc::default(),
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             last_materialisation: std::sync::Arc::default(),

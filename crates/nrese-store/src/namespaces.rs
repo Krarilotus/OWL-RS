@@ -24,6 +24,9 @@ pub type NamespaceMap = BTreeMap<String, String>;
 #[derive(Debug)]
 pub struct Namespaces {
     map: Mutex<NamespaceMap>,
+    /// The store's [`crate::StoreService::unavailable`]: set when a change's file is in
+    /// place but not made durable.
+    unavailable: std::sync::Arc<std::sync::OnceLock<String>>,
     /// Held by a change from its copy of the set to its publication, so that two changes
     /// don't lose one another's; readers take only `map`, never waiting on the disk.
     writer: Mutex<()>,
@@ -32,8 +35,12 @@ pub struct Namespaces {
 }
 
 impl Namespaces {
-    /// The namespaces of a store whose data directory is `dir` (`None`: in memory).
-    pub(crate) fn open(dir: Option<PathBuf>) -> StoreResult<Self> {
+    /// The namespaces of a store whose data directory is `dir` (`None`: in memory), and
+    /// whose unavailability is `unavailable`.
+    pub(crate) fn open(
+        dir: Option<PathBuf>,
+        unavailable: std::sync::Arc<std::sync::OnceLock<String>>,
+    ) -> StoreResult<Self> {
         let read = |path: &PathBuf| -> StoreResult<Option<NamespaceMap>> {
             let refused = |error: &dyn std::fmt::Display| {
                 StoreError::Configuration(format!(
@@ -62,6 +69,7 @@ impl Namespaces {
         };
         Ok(Self {
             map: Mutex::new(map.unwrap_or_else(standard)),
+            unavailable,
             writer: Mutex::new(()),
             file: dir.map(|dir| dir.join(FILE)),
         })
@@ -107,7 +115,9 @@ impl Namespaces {
     }
 
     /// Changes the set and keeps it: the changed copy is written ([`crate::metadata`]),
-    /// then published, so that a failed write changes nothing.
+    /// then published, so that a failed write changes nothing. A write whose file is in
+    /// place but not durable publishes it (the set is what the file says) and makes the
+    /// store unavailable until a restart, which reads the file again.
     fn change(&self, change: impl FnOnce(&mut NamespaceMap)) -> StoreResult<()> {
         let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut next = self.all();
@@ -115,7 +125,19 @@ impl Namespaces {
         if let Some(path) = &self.file {
             let json = serde_json::to_vec_pretty(&next)
                 .map_err(|error| StoreError::Configuration(error.to_string()))?;
-            crate::metadata::write(path, &json)?;
+            if let Err(error) = crate::metadata::write(path, &json) {
+                if error.renamed {
+                    *self.map.lock().unwrap_or_else(PoisonError::into_inner) = next;
+                    let why = format!(
+                        "{}: the namespace prefixes were written but not made durable ({}). Repair: restart the server; it reads the file again",
+                        path.display(),
+                        error.error
+                    );
+                    tracing::error!(%why, "store unavailable until the server restarts");
+                    let _ = self.unavailable.set(why);
+                }
+                return Err(error.into());
+            }
         }
         *self.map.lock().unwrap_or_else(PoisonError::into_inner) = next;
         Ok(())
@@ -142,19 +164,27 @@ mod tests {
     fn namespaces_are_kept_and_taken_over_from_the_rdf4j_file() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(BEFORE), r#"{"ex": "http://example.com/"}"#).unwrap();
-        let namespaces = Namespaces::open(Some(dir.path().to_path_buf())).unwrap();
+        let namespaces =
+            Namespaces::open(Some(dir.path().to_path_buf()), Default::default()).unwrap();
         assert_eq!(namespaces.get("ex").as_deref(), Some("http://example.com/"));
         namespaces
             .set("foaf", "http://xmlns.com/foaf/0.1/")
             .unwrap();
         assert!(namespaces.remove("ex").unwrap());
         assert!(!namespaces.remove("ex").unwrap());
-        let reopened = Namespaces::open(Some(dir.path().to_path_buf())).unwrap();
+        let reopened =
+            Namespaces::open(Some(dir.path().to_path_buf()), Default::default()).unwrap();
         assert_eq!(reopened.all().len(), 1);
         assert!(reopened.get("foaf").is_some());
         assert!(dir.path().join(BEFORE).exists(), "the old file is left");
         // In memory: the standard four.
-        assert_eq!(Namespaces::open(None).unwrap().all().len(), 4);
+        assert_eq!(
+            Namespaces::open(None, Default::default())
+                .unwrap()
+                .all()
+                .len(),
+            4
+        );
         assert!(reopened.set("x", " ").is_err());
     }
 
@@ -165,7 +195,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(BEFORE), r#"{"ex": "http://old.example/"}"#).unwrap();
         std::fs::write(dir.path().join(FILE), b"{\"ex\": ").unwrap();
-        let error = Namespaces::open(Some(dir.path().to_path_buf())).unwrap_err();
+        let error =
+            Namespaces::open(Some(dir.path().to_path_buf()), Default::default()).unwrap_err();
         assert!(error.to_string().contains(FILE), "{error}");
     }
 
@@ -173,11 +204,37 @@ mod tests {
     #[test]
     fn a_failed_change_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let namespaces = Namespaces::open(Some(dir.path().to_path_buf())).unwrap();
+        let namespaces =
+            Namespaces::open(Some(dir.path().to_path_buf()), Default::default()).unwrap();
         namespaces.set("ex", "http://example.com/").unwrap();
         // The staging name taken by a directory: the write fails.
         std::fs::create_dir(dir.path().join(format!("{FILE}.tmp"))).unwrap();
         assert!(namespaces.set("ex", "http://other.example/").is_err());
         assert_eq!(namespaces.get("ex").as_deref(), Some("http://example.com/"));
+    }
+
+    /// A change whose file is in place but not durable (the directory sync after the
+    /// rename failed) is what the store serves, and the store is unavailable until a
+    /// restart: the error doesn't mean "as before".
+    #[test]
+    fn a_change_written_but_not_durable_makes_the_store_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let unavailable = std::sync::Arc::<std::sync::OnceLock<String>>::default();
+        let namespaces = Namespaces::open(
+            Some(dir.path().to_path_buf()),
+            std::sync::Arc::clone(&unavailable),
+        )
+        .unwrap();
+        crate::metadata::tests::FAIL_DIR_SYNC.set(true);
+        let result = namespaces.set("ex", "http://example.com/");
+        crate::metadata::tests::FAIL_DIR_SYNC.set(false);
+        assert!(result.is_err());
+        assert_eq!(
+            namespaces.get("ex").as_deref(),
+            Some("http://example.com/"),
+            "as on disk"
+        );
+        let why = unavailable.get().expect("unavailable");
+        assert!(why.contains(FILE) && why.contains("restart"), "{why}");
     }
 }
