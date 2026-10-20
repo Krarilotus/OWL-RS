@@ -27,39 +27,173 @@ use crate::{Budget, BudgetExceeded, Reservation};
 /// Row count from which sorting runs in parallel.
 const PARALLEL_SORT_ROWS: usize = 1 << 16;
 
-/// A table's columns taken out of it ([`IdTable::into_columns`]), with its charge: a
-/// `Vec` of columns to read and change, and the charge of the memory they held, released
-/// after them, or taken over by the table they make ([`IdTable::from_columns`], which
-/// settles it to what it holds when it is produced).
+/// Columns of `rows` values each, with the charge of the memory they hold: a table's taken
+/// out of it ([`IdTable::into_columns`]), or made one at a time ([`Columns::new`],
+/// [`Columns::push`], each charged before it is made). Their values can be read and
+/// changed in place; a column is added only through [`Columns::push`] or
+/// [`Columns::append`], so none comes uncharged. Their charge is released after them, or
+/// taken over by the table they make ([`IdTable::from_columns`], which settles it to what
+/// it holds when it is produced).
 #[derive(Debug, Default)]
 pub struct Columns {
     /// Before `held`: fields drop in order, the columns first.
     columns: Vec<Vec<u64>>,
+    rows: usize,
     header: usize,
     held: Option<Reservation<Arc<Budget>>>,
 }
 
-impl From<Vec<Vec<u64>>> for Columns {
-    fn from(columns: Vec<Vec<u64>>) -> Self {
+impl Columns {
+    /// No columns yet, for columns of `rows` values.
+    pub fn new(rows: usize) -> Self {
         Self {
-            columns,
+            columns: Vec::new(),
+            rows,
             header: 0,
             held: None,
         }
     }
-}
 
-impl std::ops::Deref for Columns {
-    type Target = Vec<Vec<u64>>;
+    /// The values per column.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
 
-    fn deref(&self) -> &Vec<Vec<u64>> {
-        &self.columns
+    /// `bytes` more charged to the columns' budget (`budget` while they hold none).
+    fn charge(&mut self, bytes: usize, budget: &Arc<Budget>) -> Result<(), BudgetExceeded> {
+        self.held
+            .get_or_insert_with(|| Reservation::new(Arc::clone(budget)))
+            .charge(bytes)
+    }
+
+    /// A column of `values` added (the first `rows` of them; panics on fewer), charged
+    /// before it is made: the column, and the vector of columns where it grows. Fails
+    /// without adding it.
+    pub fn push(
+        &mut self,
+        values: impl IntoIterator<Item = u64>,
+        budget: &Arc<Budget>,
+    ) -> Result<(), BudgetExceeded> {
+        let header = match self.columns.len() == self.columns.capacity() {
+            true => (self.columns.capacity() * 2).max(4) * size_of::<Vec<u64>>(),
+            false => 0,
+        };
+        let column = self
+            .rows
+            .checked_mul(8)
+            .ok_or_else(|| budget.refusal(usize::MAX))?;
+        self.charge(column + header, budget)?;
+        self.header += header;
+        let mut made = Vec::with_capacity(self.rows);
+        made.extend(values.into_iter().take(self.rows));
+        assert_eq!(made.len(), self.rows, "a column of every row");
+        self.columns.push(made);
+        Ok(())
+    }
+
+    /// A copy of column `index` added, charged before it is made ([`Self::push`]).
+    pub fn push_copy(&mut self, index: usize, budget: &Arc<Budget>) -> Result<(), BudgetExceeded> {
+        let rows = self.rows;
+        let header = match self.columns.len() == self.columns.capacity() {
+            true => (self.columns.capacity() * 2).max(4) * size_of::<Vec<u64>>(),
+            false => 0,
+        };
+        self.charge(rows * 8 + header, budget)?;
+        self.header += header;
+        let mut made = Vec::with_capacity(rows);
+        made.extend_from_slice(&self.columns[index]);
+        self.columns.push(made);
+        Ok(())
+    }
+
+    /// A column of `values` added where each may fail, charged before it is made
+    /// ([`Self::push`]): the first error is returned, the column dropped and its charge
+    /// released.
+    pub fn push_try<E: From<BudgetExceeded>>(
+        &mut self,
+        values: impl IntoIterator<Item = Result<u64, E>>,
+        budget: &Arc<Budget>,
+    ) -> Result<(), E> {
+        let rows = self.rows;
+        let header = match self.columns.len() == self.columns.capacity() {
+            true => (self.columns.capacity() * 2).max(4) * size_of::<Vec<u64>>(),
+            false => 0,
+        };
+        let column = rows
+            .checked_mul(8)
+            .ok_or_else(|| budget.refusal(usize::MAX))?;
+        self.charge(column, budget)?;
+        let mut made = Vec::with_capacity(rows);
+        for value in values.into_iter().take(rows) {
+            match value {
+                Ok(value) => made.push(value),
+                Err(error) => {
+                    drop(made);
+                    if let Some(held) = &mut self.held {
+                        held.release(column);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        assert_eq!(made.len(), rows, "a column of every row");
+        self.charge(header, budget)?;
+        self.header += header;
+        self.columns.push(made);
+        Ok(())
+    }
+
+    /// Column `index`'s values, to change in place.
+    pub fn column_mut(&mut self, index: usize) -> &mut [u64] {
+        &mut self.columns[index]
+    }
+
+    /// `other`'s columns added after these, with their charge (to the same budget): nothing
+    /// is charged or released, the vector of columns growth aside.
+    pub fn append(
+        &mut self,
+        mut other: Columns,
+        budget: &Arc<Budget>,
+    ) -> Result<(), BudgetExceeded> {
+        assert!(
+            other.columns.is_empty() || other.rows == self.rows,
+            "columns of every row"
+        );
+        let more = other.columns.len();
+        let header = match self.columns.capacity() - self.columns.len() < more {
+            true => (self.columns.len() + more) * size_of::<Vec<u64>>(),
+            false => 0,
+        };
+        self.charge(header, budget)?;
+        self.header += header;
+        if let Some(theirs) = other.held.take() {
+            match &mut self.held {
+                Some(ours) => ours.absorb(theirs),
+                None => self.held = Some(theirs),
+            }
+        }
+        self.columns.append(&mut other.columns);
+        Ok(())
+    }
+
+    /// The first `width` columns kept; the others dropped (their charge stays until the
+    /// table they make is settled).
+    pub fn truncate(&mut self, width: usize) {
+        self.columns.truncate(width);
+    }
+
+    /// The columns' values, to change in place.
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut [u64]> {
+        self.columns.iter_mut().map(Vec::as_mut_slice)
     }
 }
 
-impl std::ops::DerefMut for Columns {
-    fn deref_mut(&mut self) -> &mut Vec<Vec<u64>> {
-        &mut self.columns
+/// The columns, to read.
+impl std::ops::Deref for Columns {
+    type Target = [Vec<u64>];
+
+    fn deref(&self) -> &[Vec<u64>] {
+        &self.columns
     }
 }
 
@@ -364,23 +498,40 @@ impl IdTable {
     ///
     /// # Panics
     /// If the columns differ in length.
-    pub fn from_columns(columns: impl Into<Columns>) -> Self {
+    pub fn from_columns(columns: Columns) -> Self {
         let Columns {
             columns,
+            rows,
             header,
             held,
-        } = columns.into();
-        let len = columns.first().map_or(0, Vec::len);
+        } = columns;
         assert!(
-            columns.iter().all(|c| c.len() == len),
+            columns.iter().all(|c| c.len() == rows),
             "IdTable columns must have equal lengths"
         );
-        let mut table = Self::uncharged(columns, len, Vec::new());
+        let mut table = Self::uncharged(columns, rows, Vec::new());
         (table.header, table.held) = (header, held);
         table
     }
 
     /// A table with one row per entry of `rows`, each `width` wide.
+    /// A table of columns another component made (an engine scan's decoded block), charged
+    /// as they arrive: the one way a table's memory is charged after it is allocated, for
+    /// memory the engine allocates and owns until it hands it over (its scan of a pattern the
+    /// planner chose, bounded by that pattern's matches). Fails, freeing them, where the
+    /// budget has no room for them.
+    pub fn adopted(columns: Vec<Vec<u64>>, budget: &Arc<Budget>) -> Result<Self, BudgetExceeded> {
+        let rows = columns.first().map_or(0, Vec::len);
+        let mut table = Self::from_columns(Columns {
+            columns,
+            rows,
+            header: 0,
+            held: None,
+        });
+        table.settle(budget)?;
+        Ok(table)
+    }
+
     /// A table of `rows` rows without columns: it holds no memory (the executor's tables of
     /// a pattern without variables, or of a projection to none).
     pub fn rows_only(rows: usize) -> Self {
@@ -435,6 +586,7 @@ impl IdTable {
     pub fn into_columns(mut self) -> Columns {
         Columns {
             columns: std::mem::take(&mut self.columns),
+            rows: self.len,
             header: self.header,
             held: self.held.take(),
         }

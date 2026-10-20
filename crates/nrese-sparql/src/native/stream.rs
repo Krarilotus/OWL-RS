@@ -218,12 +218,10 @@ impl Context<'_> {
         while from < total {
             self.check()?;
             let to = (from + size).min(total);
-            let columns: Vec<Vec<u64>> = seeds
-                .table
-                .columns()
-                .iter()
-                .map(|column| column[from..to].to_vec())
-                .collect();
+            let mut columns = nrese_exec::Columns::new(to - from);
+            for column in seeds.table.columns() {
+                columns.push(column[from..to].iter().copied(), &self.budget)?;
+            }
             let seed = self.produced(Solutions {
                 vars: seeds.vars.clone(),
                 table: IdTable::from_columns(columns),

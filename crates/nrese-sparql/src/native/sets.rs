@@ -331,8 +331,9 @@ impl Context<'_> {
             }
             // The column at once: a row at a time cost as much as the walk (DBpedia q13,
             // 363 k subjects).
-            let table =
-                IdTable::from_columns(vec![groups.iter().map(|(id, _)| id.raw()).collect()]);
+            let mut columns = nrese_exec::Columns::new(groups.len());
+            columns.push(groups.iter().map(|(id, _)| id.raw()), &self.budget)?;
+            let table = IdTable::from_columns(columns);
             let values = self.produced(Solutions {
                 vars: vec![(*kept).clone()],
                 table: table.assume_sorted_by(vec![0]),
@@ -472,14 +473,7 @@ impl Context<'_> {
         }
 
         // The groups, from the core.
-        let key_columns: Vec<Vec<u64>> = variables
-            .iter()
-            .map(|v| match core.column(v) {
-                Some(column) => core.table.column(column).to_vec(),
-                None => vec![UNDEF; core.table.len()],
-            })
-            .collect();
-        let key_table = IdTable::from_columns(key_columns);
+        let key_table = self.key_table(&core, variables)?;
         let groups = group_rows(
             &key_table,
             &(0..variables.len()).collect::<Vec<_>>(),
@@ -534,10 +528,11 @@ impl Context<'_> {
         let mut keep = vec![true; group_count];
         if let Some(having) = having {
             let mut vars = variables.to_vec();
-            let mut columns = groups.keys.clone().into_columns();
+            let mut columns = groups.keys.try_clone(&self.budget)?.into_columns();
             for &a in &core_aggregates {
                 vars.push(aggregates[a].0.clone());
-                columns.push(values[a].clone().unwrap_or_default());
+                let column = values[a].as_deref().unwrap_or_default();
+                columns.push(column.iter().copied(), &self.budget)?;
             }
             if !columns.is_empty() {
                 let known = Solutions {
@@ -590,16 +585,16 @@ impl Context<'_> {
             let rows: Vec<usize> = (0..core.table.len())
                 .filter(|&row| keep[groups.group_of[row] as usize])
                 .collect();
-            let mut columns = vec![
-                rows.iter()
-                    .map(|&row| u64::from(groups.group_of[row]))
-                    .collect::<Vec<u64>>(),
-            ];
+            let mut columns = nrese_exec::Columns::new(rows.len());
+            columns.push(
+                rows.iter().map(|&row| u64::from(groups.group_of[row])),
+                &self.budget,
+            )?;
             for variable in &from_core {
                 let column = core
                     .table
                     .column(core.column(variable).expect("filtered above"));
-                columns.push(rows.iter().map(|&row| column[row]).collect());
+                columns.push(rows.iter().map(|&row| column[row]), &self.budget)?;
             }
             // Data closed under sameAs: a plain pattern gives every identity of a key the
             // same rows, so the join, which feeds duplicate-insensitive aggregates only,
@@ -616,9 +611,9 @@ impl Context<'_> {
                 _ => Vec::new(),
             };
             let representatives = self.representatives();
-            let to_representatives = |vars: &[Variable], columns: &mut [Vec<u64>]| {
+            let to_representatives = |vars: &[Variable], columns: &mut nrese_exec::Columns| {
                 if let Some(representatives) = &representatives {
-                    for (variable, column) in vars.iter().zip(columns.iter_mut()) {
+                    for (variable, column) in vars.iter().zip(columns.values_mut()) {
                         if by_representative.contains(variable) {
                             for id in column.iter_mut() {
                                 *id = super::equality::representative(representatives, *id);
@@ -678,16 +673,15 @@ impl Context<'_> {
         // Detached OPTIONALs without aggregates contribute nothing. The kept groups, with
         // the aggregates in the caller's order.
         let kept: Vec<usize> = (0..group_count).filter(|&g| keep[g]).collect();
-        let mut columns: Vec<Vec<u64>> = groups
-            .keys
-            .columns()
-            .iter()
-            .map(|column| kept.iter().map(|&g| column[g]).collect())
-            .collect();
+        let mut columns = nrese_exec::Columns::new(kept.len());
+        for column in groups.keys.columns() {
+            columns.push(kept.iter().map(|&g| column[g]), &self.budget)?;
+        }
         let mut vars = variables.to_vec();
         for (a, (target, _)) in aggregates.iter().enumerate() {
-            let column = values[a].take().unwrap_or_else(|| vec![UNDEF; group_count]);
-            columns.push(kept.iter().map(|&g| column[g]).collect());
+            let column = values[a].take();
+            let value = |g: usize| column.as_ref().map_or(UNDEF, |column| column[g]);
+            columns.push(kept.iter().map(|&g| value(g)), &self.budget)?;
             vars.push(target.clone());
         }
         self.consumed(core);

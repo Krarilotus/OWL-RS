@@ -220,23 +220,19 @@ impl Context<'_> {
         // Computed ids are the query's own: renumber those the table holds from 0.
         let mut local: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
         let mut terms = Vec::new();
-        let columns: Vec<Vec<u64>> = solutions
-            .table
-            .columns()
-            .iter()
-            .map(|column| {
-                column
-                    .iter()
-                    .map(|&id| match computed_index(id) {
-                        Some(index) => *local.entry(id).or_insert_with(|| {
-                            terms.push(computed[index as usize].clone());
-                            nrese_exec::computed_id(terms.len() as u64 - 1)
-                        }),
-                        None => id,
-                    })
-                    .collect()
-            })
-            .collect();
+        // The cache keeps an uncharged copy, which its own byte budget counts: the copy's
+        // computed ids renumbered in place.
+        let mut columns = solutions.table.clone().into_columns();
+        for column in columns.values_mut() {
+            for id in column {
+                if let Some(index) = computed_index(*id) {
+                    *id = *local.entry(*id).or_insert_with(|| {
+                        terms.push(computed[index as usize].clone());
+                        nrese_exec::computed_id(terms.len() as u64 - 1)
+                    });
+                }
+            }
+        }
         Some(Part {
             vars: numbers,
             table: IdTable::from_columns(columns),
@@ -264,28 +260,24 @@ impl Context<'_> {
                     "a cached part numbers another key's variables".into(),
                 )
             })?;
-        let table = match part.computed.is_empty() {
-            true => part.table.clone(),
-            false => {
-                let ids: Vec<u64> = part
-                    .computed
-                    .iter()
-                    .map(|term| self.id(term))
-                    .collect::<NativeResult<_>>()?;
-                IdTable::from_columns(
-                    part.table
-                        .columns()
-                        .iter()
-                        .map(|column| {
-                            column
-                                .iter()
-                                .map(|&id| computed_index(id).map_or(id, |i| ids[i as usize]))
-                                .collect()
-                        })
-                        .collect::<Vec<Vec<u64>>>(),
-                )
+        // A copy charged to the query, the part's computed ids made this query's in place.
+        let ids: Vec<u64> = part
+            .computed
+            .iter()
+            .map(|term| self.id(term))
+            .collect::<NativeResult<_>>()?;
+        let mut table = part.table.try_clone(&self.budget)?;
+        if !ids.is_empty() {
+            let mut columns = table.into_columns();
+            for column in columns.values_mut() {
+                for id in column {
+                    if let Some(i) = computed_index(*id) {
+                        *id = ids[i as usize];
+                    }
+                }
             }
-        };
+            table = IdTable::from_columns(columns);
+        }
         if let (Some(trace), Some(step)) = (&self.trace, step) {
             trace.borrow_mut()[step].cache = Some(how);
         }
