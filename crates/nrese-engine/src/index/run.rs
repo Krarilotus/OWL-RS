@@ -70,12 +70,27 @@ impl PermutationRun {
 
     /// Builds a run from entries sorted by key, each flagged as tombstone or not.
     pub(crate) fn from_sorted(entries: Vec<(Key, bool)>) -> Self {
+        Self::from_sorted_within(entries, &mut super::Uncharged, true)
+            .unwrap_or_else(|_| unreachable!("nothing is charged"))
+    }
+
+    /// [`Self::from_sorted`], each array reserved on `charge` before it is made, the keys
+    /// packed on one thread unless `parallel`.
+    fn from_sorted_within(
+        entries: Vec<(Key, bool)>,
+        charge: &mut impl super::Charge,
+        parallel: bool,
+    ) -> Result<Self, nrese_exec::BudgetExceeded> {
         let has_tombstones = entries.iter().any(|(_, tomb)| *tomb);
-        let mut tombstones = if has_tombstones {
-            vec![0u64; entries.len().div_ceil(64)]
+        let words = if has_tombstones {
+            entries.len().div_ceil(64)
         } else {
-            Vec::new()
+            0
         };
+        charge.reserve(words * std::mem::size_of::<u64>())?;
+        let mut tombstones = vec![0u64; words];
+        let keys_bytes = entries.len() * std::mem::size_of::<Key>();
+        charge.reserve(keys_bytes)?;
         let keys: Vec<Key> = entries
             .into_iter()
             .enumerate()
@@ -86,10 +101,16 @@ impl PermutationRun {
                 key
             })
             .collect();
-        Self {
-            keys: PackedKeys::from_sorted(&keys),
+        let packed = match parallel {
+            true => PackedKeys::from_sorted(&keys),
+            false => PackedKeys::from_sorted_within(&keys, charge)?,
+        };
+        drop(keys);
+        charge.release(keys_bytes);
+        Ok(Self {
+            keys: packed,
             tombstones: tombstones.into_boxed_slice(),
-        }
+        })
     }
 }
 
@@ -121,6 +142,30 @@ impl Run {
             layout,
             build_all(layout, inserts.len() + deletes.len(), build),
         )
+    }
+
+    /// [`Self::from_delta`], on one thread, every array reserved on `held` before it is
+    /// made; what the run keeps stays reserved there, for its maker to hold while the run
+    /// lives (`engine::equality::View`). A refusal leaves nothing made.
+    pub(crate) fn from_delta_within(
+        layout: Layout,
+        inserts: &[EncodedQuad],
+        deletes: &[EncodedQuad],
+        held: &mut nrese_exec::Reservation,
+    ) -> Result<Self, nrese_exec::BudgetExceeded> {
+        let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
+        let entries_bytes = (inserts.len() + deletes.len()) * std::mem::size_of::<(Key, bool)>();
+        for &permutation in layout.permutations() {
+            held.charge(entries_bytes)?;
+            let mut entries: Vec<(Key, bool)> = Vec::with_capacity(inserts.len() + deletes.len());
+            entries.extend(inserts.iter().map(|q| (permutation.to_key(q), false)));
+            entries.extend(deletes.iter().map(|q| (permutation.to_key(q), true)));
+            entries.sort_unstable_by_key(|entry| entry.0);
+            let built = PermutationRun::from_sorted_within(entries, held, false);
+            held.release(entries_bytes);
+            perms[permutation as usize] = built?;
+        }
+        Ok(Self::from_permutations(layout, perms))
     }
 
     /// Builds a tombstone-free run from arbitrary quads, removing duplicates. Used for bulk

@@ -29,6 +29,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The canonical views' memory guard measures against budgets (tests/canonical_view_memory.rs).
+nrese-exec = { path = "../nrese-exec", features = ["measure"] }
 
 [lints]
 workspace = true

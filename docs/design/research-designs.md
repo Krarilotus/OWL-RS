@@ -60,6 +60,65 @@ such giants.
   star / mesh topologies with the same closure, merges, redundant deletes, bridge
   deletes splitting two 100 k components, strict `COUNT`/`DISTINCT`/`STR` queries).
 
+**Canonical answers (decided 19 October 2026, revised after review).** `canonical` answers
+the query over the quotient of the dataset by the equality: each class one term, shown by
+its representative, in every graph, graph names included. It applies to a query whose
+default graph is the one the equality covers (the store's, or the merge of every graph) in
+a model with inferred statements; a query of another default graph (`FROM <g>`) or of the
+asserted model is answered as stored.
+
+- **One id space.** Every id the evaluation works on is a representative, so joins,
+  filters and every plan rewrite (filter pushdown across `GRAPH` included) are valid as
+  they are. Ids enter evaluation at four places, each by one mapping,
+  `nrese_engine::Snapshot::canonical_classes`: reads (a canonical snapshot gives
+  representatives from every graph; named graphs through a run over the asserted stack
+  made once per version, `equality::canonical_version`), the query's constants and
+  pre-bound values (put in once before planning, `native/canonical.rs`), `IRI()` (wrapped
+  in a canonical-name function by the same pass), and a `SERVICE` endpoint's rows (mapped
+  on import; a bound value goes to the endpoint as every identity of its class, counted
+  before it is made, reserved, and past `BIND_LIMIT` not sent). Without the option, or
+  outside its scope, none of this runs: the plan is the one without it.
+- So `VALUES ?x { <alias> } ?x ex:p ex:o`, `?x ex:p ex:o FILTER(?x = <alias>)`,
+  `<alias> ex:p ex:o`, the same through `GRAPH`, `SERVICE`, subqueries and paths find
+  the same class, and answer with the representative, constants of the query included,
+  a CONSTRUCT template's too.
+- Two identities of one class are one term, so a query can't tell them apart:
+  `FILTER(?x != <alias>)` drops the class, `STR` shows the representative's IRI.
+  Canonical answers are therefore not strict answers renamed where strict answers tell
+  identities apart. The differential test checks them against the reference evaluator
+  over a quotient written by hand, sharing no code with the engine: the fixture's
+  statements with the representative in a store without equality, the query with its
+  constants written so (`nrese-sparql/tests/it/equality_answer_tests.rs`). GraphDB's equivalent
+  (`FROM onto:disable-sameAs`) documents lost solutions for filters over URIs instead.
+- **Triple terms**: a triple term's class is that of its parts. Where every triple term
+  the store holds is over representatives, they answer as any term: a triple term the
+  query writes (a pattern, `VALUES`, `TRIPLE()`'s constants) is put in over
+  representatives, and one the evaluation builds or takes apart is made of them.
+  **Refused** (`Unsupported`), not answered: canonical queries over a store holding a
+  triple term that names another identity than its representative (at any depth;
+  `Snapshot::triple_terms_name_aliases`, a seek in the object index, once per version).
+  In the quotient that term and its representatives' are one, which no stored id stands
+  for and no read can intern; answering it as one term would tell identities apart
+  (`DISTINCT` over `<<( alias p o )>>` and `<<( rep p o )>>`). A store with a literal in a
+  class is refused as well: every literal an expression computes would need the mapping.
+  Congruence over such stores is a v2.0 follow-up (v2-programme.md).
+- **A view, not a rewrite**: the canonical model reads its own view of the version (named
+  graphs over representatives, made once per version and owned by it, holding nothing
+  that holds the version); the asserted model and a
+  snapshot read as stored see the statements as stored.
+- The completeness status makes no claim of its own here: it refers to the regime's
+  certain answers, and canonical answers are those, up to the naming above.
+- **Memory**: a canonical view holds its own charge. It is made on the store's view budget,
+  which draws on the memory the queries do (`Engine::set_canonical_view_budget`), every
+  array reserved before it is allocated (its statements, its run's arrays, its scans'
+  working memory, its version), and its run keeps the reservation: the charge goes when the
+  view's last holder, the cache or a reader, lets it go. Where the view budget refuses, the
+  view is made the same way on the query's own budget, for that query
+  (`Snapshot::with_canonical_equality_within`); where that refuses too, nothing is made and
+  the query fails with its memory limit. Readers that miss the cache at once each make
+  one, each charged in full. The classes, as before stage C, are the version's and charged
+  nowhere.
+
 ## 2. Vector similarity search
 
 **Evidence.** Index families and their regimes: exact SIMD scans below about 10^5–10^6
