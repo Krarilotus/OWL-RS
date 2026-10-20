@@ -20,6 +20,7 @@ import abba  # noqa: E402
 import test_release_gate as fixture  # noqa: E402  (the gate's pass fixtures)
 
 A, B = "a" * 40, "b" * 40
+CHECKS = next(c for c in abba.cases_registry.load() if c["name"] == "lab-olympics")["check"]
 fixture.REVS.update(a=A, a2=A, b=B)
 SERIES = ("q01-point-lookup", "q06-text-filter")
 FAMILY = f'''name = "t"
@@ -35,13 +36,15 @@ min_samples = 3
 '''
 
 
-def records(b=1.0, a2=1.0, broken=None):
-    """records_of for fixture.passes: B `b` times A, A' `a2` times A (each a little jitter), and
-    `broken(side, n)` a record that failed."""
+def records(b=1.0, a2=1.0, broken=None, checked=True):
+    """records_of for fixture.passes: B `b` times A, A' `a2` times A (each a little jitter), every
+    declared content check passing (`checked`), and `broken(side, n)` a record that failed."""
     def records_of(side, n):
         jitter = 1 + 0.004 * ((n * 7) % 5 - 2)
         scale = {"b": fixture.worse(b, n) if b != 1 else 1.0, "a2": a2 * jitter}.get(side, 1.0)
         rec = fixture.record(samples={s: [v * scale for v in (4.8, 4.85, 4.8)] for s in SERIES})
+        if checked:
+            rec["checks"] = [{"path": p, "expected": v, "got": v, "ok": True} for p, v in CHECKS.items()]
         if broken and broken(side, n):
             rec.update(status="failed", notes=["a content check failed"])
         return [rec]
@@ -96,6 +99,10 @@ class Abba(unittest.TestCase):
         code, text = self.verdict(self.round_(records(broken=lambda side, n: side == "a2" and n == 2)))
         self.assertEqual(code, abba.NO_VERDICT, text)
         self.assertIn("lab-olympics on a2", text)
+        # Sol r1: a run with no check results counted as checked (exit 0).
+        code, text = self.verdict(self.round_(records(checked=False), name="no-results"))
+        self.assertEqual(code, abba.NO_VERDICT, text)
+        self.assertIn("no passing result for its content checks q.q01-point-lookup.rows", text)
         self.family["cases"][0]["min_samples"] = 4  # every series has 3 samples a pass
         self.assertEqual(self.verdict(self.round_(records(), name="few"))[0], abba.NO_VERDICT)
 
