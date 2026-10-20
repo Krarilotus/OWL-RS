@@ -25,8 +25,9 @@
 //!   number of damaged frames, holes and damaged length fields (a payload intact under a
 //!   damaged length counts), and any damage in a segment that isn't the last.
 //! - [`SyncPolicy::EveryCommit`]: a complete last frame that fails its check was synced,
-//!   so acknowledged: corruption, unless its last 8 bytes are zero (a version 6 frame ends
-//!   in its non-zero commit time, so the write was still in flight: truncated).
+//!   so acknowledged: corruption, unless the segment is of version 6 and the frame's last
+//!   8 bytes are zero (every version 6 frame ends in a non-zero commit time, so the write
+//!   was still in flight: truncated). Untimed frames (version 4) fail closed.
 //! - [`SyncPolicy::OsBuffered`], or a segment that doesn't record its policy (older ones):
 //!   such a frame is truncated with a warning. That policy may lose the last commits on
 //!   power loss, and writes reaching the disk out of order are how.
