@@ -204,6 +204,26 @@ impl TextMatches {
     }
 }
 
+impl TextMatches {
+    /// Each match named by `representative` of its id, each id once at its best match's
+    /// relevance; best first (ties by id), in place.
+    pub(crate) fn as_representatives(&mut self, representative: impl Fn(u64) -> u64) {
+        for found in &mut self.matches {
+            found.id = representative(found.id);
+        }
+        self.matches.sort_unstable_by(|a, b| {
+            a.id.cmp(&b.id)
+                .then_with(|| b.relevance.total_cmp(&a.relevance))
+        });
+        self.matches.dedup_by_key(|found| found.id);
+        self.matches.sort_unstable_by(|a, b| {
+            b.relevance
+                .total_cmp(&a.relevance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+}
+
 impl std::ops::Deref for TextMatches {
     type Target = [TextMatch];
 
