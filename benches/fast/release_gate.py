@@ -82,7 +82,7 @@ def schedule_errors(passes: list[dict], sides: list[str], min_blocks: int,
                     status_only: set[str] | None = None, layouts: int = 1) -> list[str]:
     """What the passes' schedule must be. A pass is one side's run of one block (fast.py block:
     pass-<n>-<side>.json with its block, run and layout). Every block has every side's two runs;
-    within a block each case ran on the sides as a palindrome (A B C C B A, or mirrored), its six
+    within a block each case ran on the sides as a palindrome (A B C C B A, or a rotation), its six
     runs back to back (no other case between them: each side's two runs are then centred on the
     same instant whatever the runs' durations, research round 8); blocks didn't overlap. Every case
     is in at least `min_blocks` blocks (a declared outcome's in one, `status_only`) and, with
