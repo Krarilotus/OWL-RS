@@ -84,17 +84,31 @@ ns_locked() {
     ( flock 9; "$@" ) 9>>"$file"
     return
   fi
-  local sh=$BASH script vars=""
-  if command -v cygpath >/dev/null 2>&1; then  # Windows' paths for Windows' Python: one lock file
-    sh=$(cygpath -w "$BASH")
-    file=$(cygpath -w "$file")
-  fi
+  ns_locked_python "$file" "$@"
+}
+
+ns_locked_python() {  # FILE CMD...: ns_locked where there is no flock (suitekit/lock.py)
+  local file=$1 sh=$BASH script vars="" tmp run code
+  shift
   # shellcheck disable=SC2086
   [ -z "${NS_LOCK_VARS:-}" ] || vars=$(declare -p ${NS_LOCK_VARS} 2>/dev/null)
   script="$(declare -f)
 $vars
 $(printf '%q ' "$@")"
-  ns_python "$NS_SUITE/suitekit/lock.py" "$file" -- "$sh" -c "$script"
+  # The script as a file: a command line holds a few kilobytes on Windows, and a longer -c
+  # script arrived cut short (20 Oct 2026: a gate's functions came to 8 KB).
+  tmp=$(mktemp) || return 1
+  printf '%s\n' "$script" > "$tmp"
+  run=$tmp
+  if command -v cygpath >/dev/null 2>&1; then  # Windows' paths for Windows' Python: one lock file
+    sh=$(cygpath -w "$BASH")
+    file=$(cygpath -w "$file")
+    run=$(cygpath -w "$tmp")
+  fi
+  ns_python "$NS_SUITE/suitekit/lock.py" "$file" -- "$sh" "$run"
+  code=$?
+  rm -f "$tmp"
+  return $code
 }
 
 ns_serialize() {

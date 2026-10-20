@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use nrese_store::{
     CancellationToken, MutationCommand, MutationPipeline, MutationTicket, PreparedQuery, Requester,
-    SparqlQueryRequest, SparqlUpdateRequest, StoreService,
+    SparqlUpdateRequest, StoreService,
 };
 
 use crate::CountingSink;
@@ -39,7 +39,7 @@ fn spawn_readers(
             std::thread::spawn(move || {
                 let prepared: Vec<PreparedQuery> = queries
                     .iter()
-                    .map(|q| PreparedQuery::parse(&SparqlQueryRequest::all(q)))
+                    .map(|q| PreparedQuery::parse(&crate::request(q)))
                     .collect::<Result<_, _>>()
                     .map_err(|e| e.to_string())?;
                 let mut times = Vec::new();
@@ -319,7 +319,7 @@ pub fn parse_and_plan(
     let (mut steps, mut rewrites) = (0, 0);
     for _ in 0..runs {
         let at = Instant::now();
-        let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(text))?;
+        let prepared = PreparedQuery::parse(&crate::request(text))?;
         let plan = store.plan_query(&prepared, &CancellationToken::new())?;
         times.push(at.elapsed());
         steps = plan.steps.len();

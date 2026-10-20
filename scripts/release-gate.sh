@@ -7,7 +7,12 @@
 #   release-gate.sh build REV               REV's binaries, by REV's own toolchain, into GATE_BIN/bin-REV8-IDENTITY
 #   release-gate.sh prepare HARNESS         the plan, the data view and the cases' data, once, by
 #                                           HARNESS's generator; WatDiv's query sets checked
-#   release-gate.sh pass N SIDE REV HARNESS pass N: HARNESS's cases on REV's binaries, one repetition
+#   release-gate.sh block N HARNESS LAYOUT PLAN|- base=REV main=REV cand=REV
+#                                           block N: each of HARNESS's cases run base, main, cand,
+#                                           cand, main, base back to back (a palindrome per case:
+#                                           every side's runs centred on the same time), on each
+#                                           side's build of layout LAYOUT (GATE_LAYOUTS), copied
+#                                           for the block; orientation and case order from GATE_SEED
 #   release-gate.sh report HARNESS SIDE=REV ...   the timed part's report (the first SIDE the candidate)
 #   release-gate.sh w3c                     the W3C suites with their data required, their counts checked
 #   release-gate.sh guards                  every guard docs/design/performance.md §0 names, run and passed
@@ -17,33 +22,42 @@
 #   release-gate.sh confirm TIMED_DIR... --out DIR   the confirmation job of each host whose run flagged
 #                                           a loss or an undecided case (rg-H8-confirm, rg-H8-confirm2)
 #   release-gate.sh plan-cases CASES        a confirmation's plan: just those cases (GATE_PLAN)
+#   release-gate.sh plan-blocks HARNESS     each block's plan: the cases whose noise needs its block
+#                                           (benches/fast/measure.toml); `block N HARNESS L PLAN ...`
+#                                           runs it
 #   release-gate.sh verdict TIMED_DIR... CHECKS_DIR   every part together, each host's rounds combined
 #   release-gate.sh jobs CAND [OPTIONS]     the fleet jobs of a whole gate (release_gate.py jobs --help)
 #   release-gate.sh clean                   the gate's worktrees and build trees (binaries and data stay)
 #
 # One harness for every side: HARNESS's fast suite (its cases, checks, generator and data);
 # only the engine's binaries differ. A side whose perf lab predates --routes (main) runs with
-# fast.py --no-routes --empty-queries, read from its CAPABILITIES. A pass with a complete
-# report is kept (the step resumes); an incomplete one is moved aside, kept, and run again.
+# fast.py --no-routes --empty-queries, read from its CAPABILITIES. A block with every report
+# complete is kept (the step resumes); an incomplete one is moved aside, kept, and run again whole.
 #
 # GATE (NRESE_GATE_DIR, default ~/owlrs/$GATE_NAME, gate-v2) keeps binaries, data and passes between
 # steps; results go to FLEET_OUT. GATE_CASES limits the cases (a dry run), GATE_MAX_GB is the
 # memory the host gives a case (default 24: a larger cap is not run, never lowered),
-# GATE_MIN_PASSES the passes per side (default 4; fewer is diagnostic). GATE_BIG_GB and
-# GATE_BIG_HOST: cases with caps up to it run on that host instead (its own job: GATE_MIN_GB
-# the timed host's limit, GATE_MAX_GB the big one's). No case is waived: only an owner-approved
+# GATE_MIN_BLOCKS the blocks of the round (default 2; fewer is diagnostic). GATE_BIG_GB and
+# GATE_BIG_HOST: cases with caps up to it run on that Linux host instead (khaleesi-wsl; its own
+# job: GATE_MIN_GB the timed host's limit, GATE_MAX_GB the big one's). No case is waived: only an owner-approved
 # trade-off (benches/release-tradeoffs.toml) accepts a loss. SPARQL_DATA (default
 # ~/owlrs/sparql-data) holds the SPARQL workloads' data and their generated query sets.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+export PATH=$HOME/.cargo/bin:$PATH
 GATE=${NRESE_GATE_DIR:-$HOME/owlrs/${GATE_NAME:-gate-v2}}
 # Binaries by build identity, shared by every gate (v1.5's and main's are built once):
 # published whole, never replaced (scripts/lib/gate-publish.sh).
 GATE_BIN=${GATE_BIN:-$HOME/owlrs/gate-v2-bin}
 OUT=${FLEET_OUT:-$GATE/results}
 SPARQL_DATA=${SPARQL_DATA:-$HOME/owlrs/sparql-data}
+SHARED=${NRESE_FAST_SHARED:-$HOME/owlrs/fast-data-shared}
 MAX_GB=${GATE_MAX_GB:-24}
 mkdir -p "$GATE" "$GATE_BIN" "$OUT"
+# A desktop's file indexer (GNOME's localsearch on phuoc-yu indexes all of $HOME) reads every
+# file the gate writes, during the passes: these directories are excluded from it (Tracker's
+# ignored-directories-with-content; the file's removal undoes it).
+for dir in "$GATE" "$GATE_BIN"; do [ -e "$dir/.trackerignore" ] || echo "release gate: not indexed" > "$dir/.trackerignore"; done
 log() { echo "$(date '+%F %T') $*" | tee -a "$OUT/gate.log"; }
 short() { git rev-parse --short=8 "$1"; }
 py() { PYTHONIOENCODING=utf-8 python3 -B "$@"; }
@@ -62,37 +76,67 @@ worktree() {  # REV [DIR]: a clean worktree of the revision, made once
 
 # The builds by identity, this gate's pointer to each revision's (bin_of), the age sweep.
 . scripts/lib/gate-publish.sh
+# Layout L of a revision (GATE_LAYOUTS): 1 the plain build, L > 1 the same with its functions
+# linked in another order (rust-lld --shuffle-sections, seed L): a layout, not other code. Each
+# layout is a build of its own identity (build_identity REV L) and this gate's pointer.
+layout_bin() { bin_of "$1" "${2:-1}"; }
+verified() { build_verified "$1" "$2"; }
+LAYOUTS=${GATE_LAYOUTS:-1}
 
 # The environment of a fast.py run on HARNESS's tree: native, the gate's data, nothing
 # written into the tree (the compact records go to the gate).
 fast_env() {
+  # The prepared data: one read-only copy per host, hardlinked into every gate's fast-data
+  # (fast.py prepare, NRESE_FAST_SHARED).
+  export NRESE_FAST_SHARED=$SHARED
   export NRESE_FAST_RUNTIME=native NRESE_FAST_DATA=$GATE/fast-data BENCH_GENERAL_DATA=$GATE/data \
     NRESE_FAST_QUERY_SETS=$GATE/query-sets NRESE_FAST_BASELINES=$GATE/compact NRESE_BENCH_REPORTS=$GATE/reports \
     NRESE_QUIET_SLOT=${NRESE_QUIET_SLOT:-0}
   mkdir -p "$GATE/fast-data" "$GATE/data" "$GATE/query-sets" "$GATE/compact" "$GATE/reports"
 }
 
-# The plan the passes run: the gate's (prepare), or a confirmation's (plan-cases, GATE_PLAN).
+# The plan the passes run: the gate's (prepare), or a confirmation's (plan-cases, GATE_PLAN);
+# a pass of a later block runs its block's (plan-blocks: the cases whose noise needs it).
 PLAN=$GATE/${GATE_PLAN:-plan.json}
-planned() { py -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["run"]))' "$PLAN"; }
+planned() { py -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["run"]))' "${1:-$PLAN}"; }
+# The measurement per case (runs, warm-ups, repetitions; release_gate.py calibrate), the
+# harness's, for every side alike.
+MEASURE=benches/fast/measure.toml
 
 case ${1:-} in
 build)
   rev=$(git rev-parse "$2") || exit 2
   export PATH=$HOME/.cargo/bin:$PATH
-  bin=$(identity_dir "$rev")
-  if build_verified "$bin" "$rev"; then
-    point "$rev" "$bin"
+  # The gate's flags replace a host's (its ~/.cargo/config.toml rustflags), before the identity
+  # is taken: the identity hashes the flags the build gets.
+  export RUSTFLAGS=$GATE_RUSTFLAGS
+  unset CARGO_ENCODED_RUSTFLAGS  # it would take precedence over RUSTFLAGS
+  # Each layout's build by its identity: one there from before counts, the others are built.
+  todo=()
+  for L in $(seq 1 "$LAYOUTS"); do
+    lbin=$(identity_dir "$rev" "$L")
+    if build_verified "$lbin" "$rev"; then point "$rev" "$lbin" "$L"; else todo+=("$L"); fi
+  done
+  bin=$(identity_dir "$rev" 1)
+  if [ ${#todo[@]} -eq 0 ]; then
     cp "$bin/BUILD.txt" "$OUT/build-$(short "$rev").txt"
-    log "build $rev: verified binaries of its identity there from before ($bin)"; exit 0
+    log "build $rev: verified binaries of its identity there from before ($bin, $LAYOUTS layouts)"; exit 0
   fi
   # The source and build trees are this gate's own; the build is published under its identity.
   mkdir -p "$GATE/build" && src=$(worktree "$rev" "$GATE/build") || exit 2
   export CARGO_TARGET_DIR=$GATE/build/target-$(short "$rev")
-  log "build $rev ($(cd "$src" && rustc -V 2>/dev/null))"
+  # Every side's perf lab times alike: no thread started inside the timed window (the
+  # watchdog, applied to the revision's own perf lab source; the engine untouched; the patch
+  # is part of the build's identity, build_identity).
+  lab=$src/crates/nrese-store/examples/perf_lab/main.rs
+  [ -f "$lab" ] || lab=$src/crates/nrese-store/examples/perf_lab.rs
+  patched=$(py benches/fast/patches/perf_lab_watchdog.py "$lab")
+  case $patched in applied|present) timing=watchdog ;; *) timing=spawn ;; esac
+  log "build $rev ($(cd "$src" && rustc -V 2>/dev/null)); layouts to build: ${todo[*]}"
+  missing=()
+  if [ "${todo[0]}" = 1 ]; then
   part=$bin.partial-$$
   rm -rf "$part" && mkdir -p "$part/release/examples"
-  missing=()
   for spec in nrese-store:perf_lab nrese-store:ql_print_check nrese-dl:tableau_consistency \
               nrese-dl:context_classify nrese-reasoner:classify; do
     crate=${spec%%:*} example=${spec#*:}
@@ -109,18 +153,49 @@ build)
   cp "$CARGO_TARGET_DIR/release/nrese-server" "$part/release/"
   # What the revision's perf lab can do, from its source: route reports (--routes) and
   # whether it requires --queries (main's, f9b515e8: neither, and no samples per run).
-  routes=1 empty=0
+  routes=1 empty=0 batch=0
   git grep -q -e '"--routes"' "$rev" -- crates/nrese-store/examples || routes=0
   git grep -q -e 'queries DIR is required' "$rev" -- crates/nrese-store/examples && empty=1
-  printf 'routes=%s\nempty_queries=%s\n' "$routes" "$empty" > "$part/CAPABILITIES"
+  git grep -q -e '"--batch"' "$rev" -- crates/nrese-store/examples && batch=1
+  printf 'routes=%s\nempty_queries=%s\nbatch=%s\ntiming=%s\n' "$routes" "$empty" "$batch" "$timing" > "$part/CAPABILITIES"
   echo "$rev" > "$part/REVISION"
   { echo "revision $rev"; (cd "$src" && rustc -V); echo "missing at this revision: ${missing[*]:-none}";
+    echo "measurement patch perf_lab_watchdog: $patched";
     cat "$part/CAPABILITIES"; } > "$part/BUILD.txt"
+  lld=$(lld_of "$part") || { log "build $rev: not linked by the toolchain's LLD"; exit 1; }
+  echo "linker $lld" >> "$part/BUILD.txt"
   (cd "$part" && find release -type f | sort | xargs sha256sum > SHA256SUMS)
-  build_identity "$rev" > "$part/IDENTITY"
+  { build_identity "$rev" 1; echo "linker $lld"; } > "$part/IDENTITY"
   publish "$part" "$bin" || { log "build $rev: $bin is there but doesn't verify"; exit 1; }
-  point "$rev" "$bin"
+  point "$rev" "$bin" 1
+  fi
   cp "$bin/BUILD.txt" "$OUT/build-$(short "$rev").txt"
+  # Layouts 2..K: the timed tools linked with their functions in another order (seed L); the
+  # rest copied from layout 1. A linker that isn't LLD refuses the option: the build fails.
+  for L in "${todo[@]}"; do
+    [ "$L" -gt 1 ] || continue
+    lbin=$(identity_dir "$rev" "$L")
+    lpart=$lbin.partial-$$
+    rm -rf "$lpart" && cp -a "$bin" "$lpart" && rm -rf "$lpart/SHA256SUMS" "$lpart/IDENTITY" "$lpart/.refs"
+    for spec in nrese-store:perf_lab nrese-dl:tableau_consistency nrese-dl:context_classify nrese-reasoner:classify; do
+      crate=${spec%%:*} example=${spec#*:}
+      [ -e "$bin/release/examples/$example" ] || continue
+      (cd "$src" && RUSTFLAGS=$(layout_flags "$L") \
+         bash scripts/cargo-guarded.sh build --release --locked --quiet -p "$crate" --example "$example") \
+        || { log "build of $example, layout $L, failed at $rev"; exit 1; }
+      cp "$CARGO_TARGET_DIR/release/examples/$example" "$lpart/release/examples/"
+    done
+    echo "$L" > "$lpart/LAYOUT"
+    lld=$(lld_of "$lpart") || { log "build $rev, layout $L: not linked by the toolchain's LLD"; exit 1; }
+    echo "layout $L: the timed tools linked with --shuffle-sections=.text*=$L" >> "$lpart/BUILD.txt"
+    (cd "$lpart" && find release -type f | sort | xargs sha256sum > SHA256SUMS)
+    { build_identity "$rev" "$L"; echo "linker $lld"; } > "$lpart/IDENTITY"
+    cmp -s "$bin/release/examples/perf_lab" "$lpart/release/examples/perf_lab" \
+      && { log "layout $L of $rev is byte-identical to layout 1: the shuffle didn't take"; exit 1; }
+    publish "$lpart" "$lbin" || { log "build $rev, layout $L: $lbin is there but doesn't verify"; exit 1; }
+    point "$rev" "$lbin" "$L"
+    log "built layout $L of $rev into $lbin"
+  done
   # The binaries stay; their build tree and source worktree go (a rebuild is rare).
   rm -rf "$CARGO_TARGET_DIR" && git worktree remove --force "$src"
   log "built $rev into $bin; missing: ${missing[*]:-none}; $(tr '\n' ' ' < "$bin/CAPABILITIES")"
@@ -134,10 +209,15 @@ prepare)
   general=$(cd "$tree" && py -c 'import sys; sys.path.insert(0, "benches/suite")
 from suitekit import hosts; print(hosts.input_path("general") or "")')
   fast_env
-  # The plan: what this host runs at the cases' declared caps.
+  # The plan: what this host runs at the cases' declared caps. Replaced only whole and only
+  # when made: a failed plan left the passes of another job in this directory an empty one
+  # (aa3-phuoc-timed, 19 Oct 2026).
+  # The family's baselines: GATE_BASELINES (default base,main; an A-B-B-A of two sides: base).
   (cd "$tree" && py benches/fast/release_gate.py plan --max-gb "$MAX_GB" --min-gb "${GATE_MIN_GB:-0}" \
-     ${GATE_BIG_GB:+--big-gb "$GATE_BIG_GB" --big-host "${GATE_BIG_HOST:-khaleesi}"} ${GATE_CASES:+--cases "$GATE_CASES"}) \
-    > "$GATE/plan.json" || exit 2
+     --baselines "${GATE_BASELINES:-base,main}" \
+     ${GATE_BIG_GB:+--big-gb "$GATE_BIG_GB" --big-host "${GATE_BIG_HOST:-khaleesi-wsl}"} ${GATE_CASES:+--cases "$GATE_CASES"}) \
+    > "$GATE/plan.json.partial" && mv "$GATE/plan.json.partial" "$GATE/plan.json" \
+    || { log "prepare: no plan (release_gate.py plan failed)"; exit 2; }
   cp "$GATE/plan.json" "$OUT/plan.json"
   cases=$(planned)
   log "plan: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["run"]), "cases;", len(d["not_run"]), "not run;", len(d["elsewhere"]), "on the big host")' "$GATE/plan.json")"
@@ -209,41 +289,103 @@ print(" ".join(sorted({c["queries"][1:] for c in r.load() if c["name"] in wanted
   exit $code
   ;;
 
-pass)
-  n=$2 side=$3
-  rev=$(git rev-parse "$4") || exit 2
-  harness=$(git rev-parse "$5") || exit 2
-  tree=$(worktree "$harness") || exit 2
-  bin=$(bin_of "$rev")
-  [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS) \
-    || { log "pass $n: no verified build of $rev"; exit 2; }
-  mkdir -p "$OUT/passes"
-  report=$OUT/passes/pass-$n-$side.json
-  if [ -f "$report" ]; then
-    if py -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("finished_ns") else 1)' "$report"; then
-      log "pass $n ($side): complete before"; exit 0
-    fi
-    mv "$report" "$OUT/passes/interrupted-$n-$side-$(date +%s).json"
-    log "pass $n ($side): its interrupted report kept aside; again"
+block)
+  n=$2 layout=$4
+  harness=$(git rev-parse "$3") || exit 2
+  # A block's plan (plan-blocks), else the gate's.
+  plan=$PLAN
+  if [ "${5:--}" != - ]; then
+    plan=$GATE/$5
+    [ -f "$plan" ] || { log "block $n: no block plan $plan (plan-blocks first)"; exit 2; }
   fi
-  # shellcheck disable=SC1091
-  . "$bin/CAPABILITIES"
-  flags=(--prepared)
-  [ "$routes" = 1 ] || flags+=(--no-routes)
-  [ "$empty_queries" = 1 ] && flags+=(--empty-queries)
+  shift 5
+  tree=$(worktree "$harness") || exit 2
+  # Each side: its build of this layout, verified, and what its perf lab can do (CAPABILITIES).
+  # A baseline that is an earlier baseline's build (a confirmation job's main that is its base)
+  # is timed once, as that one (the report treats it so); the candidate always runs.
+  sides=() names=() timed=()
+  for spec in "$@"; do
+    name=${spec%%=*}
+    rev=$(git rev-parse "${spec#*=}") || exit 2
+    bin=$(layout_bin "$rev" "$layout")
+    if [ "$name" != cand ] && printf '%s\n' "${timed[@]}" | grep -qxF -- "$bin"; then
+      log "block $n: $name is the same build as another side ($(basename "$bin")): timed once"; continue
+    fi
+    [ "$name" = cand ] || timed+=("$bin")
+    [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS) \
+      || { log "block $n: no verified build of $rev, layout $layout"; exit 2; }
+    routes=1 empty_queries=0 timing=spawn
+    # shellcheck disable=SC1091
+    . "$bin/CAPABILITIES"
+    flags=""
+    [ "$routes" = 1 ] || flags+="no-routes,"
+    [ "$empty_queries" = 1 ] && flags+="empty-queries,"
+    sides+=(--side "$name:$bin:$rev:${flags}timing=${timing:-spawn}")
+    names+=("$name")
+  done
+  mkdir -p "$OUT/passes"
+  # Its reports: each side's two runs of the palindrome (fast.py block), written together at its
+  # end: six for base, main and cand, four for an A-B-B-A of two sides.
+  per=$(( 2 * ${#names[@]} ))
+  first=$(( per * (n - 1) + 1 ))
+  complete() {  # how many of the block's reports are complete
+    local f r c=0
+    for f in $(seq "$first" $((first + per - 1))); do
+      for r in "$OUT/passes/pass-$f-"*.json; do
+        py -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("finished_ns") else 1)' "$r" 2>/dev/null \
+          && c=$((c + 1))
+      done
+    done
+    echo "$c"
+  }
+  if [ "$(complete)" = "$per" ]; then log "block $n: complete before"; exit 0; fi
+  for f in $(seq "$first" $((first + per - 1))); do
+    for r in "$OUT/passes/pass-$f-"*.json; do
+      [ -f "$r" ] && mv "$r" "$OUT/passes/interrupted-$(basename "$r" .json)-$(date +%s).json"
+    done
+  done
+  opts=()
+  [ -f "$tree/$MEASURE" ] && opts+=(--measure "$MEASURE")
+  # Batched timing (perf_lab --batch) only when every side's perf lab has it (jobs: GATE_BATCH).
+  [ "${GATE_BATCH:-0}" = 1 ] && opts+=(--batch)
+  # The round's seed (GATE_SEED, else drawn once and kept with its results): each pair of blocks'
+  # orientation and the cases' order in a block drawn from it, recorded in every pass.
+  [ -s "$OUT/seed" ] || echo "${GATE_SEED:-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')}" > "$OUT/seed"
+  opts+=(--seed "$(cat "$OUT/seed")")
+  # Every side timed from a copy of its build made for this block, removed after it (fast.py
+  # block_copies(): a cached instance's offset is the block's, not the round's; lks-aa-20). The
+  # block's directory is made here for it alone, and only it is removed, also if fast.py dies.
+  mkdir -p "$GATE/instances" && copies=$(mktemp -d "$GATE/instances/block-$n-XXXXXX") || exit 2
+  trap 'rm -rf "$copies"' EXIT
+  opts+=(--fresh-copies "$copies")
   fast_env
-  # A timed pass: prepared data only (fast.py refuses to make any while it times).
+  # A timed block: prepared data only (fast.py never makes any while it times).
   export NRESE_TIMED_GATE=1
-  log "pass $n: $side $rev on the cases of $harness (${flags[*]})"
-  (cd "$tree" && NRESE_FAST_BIN=$bin NRESE_FAST_REVISION=$rev \
-     py benches/fast/fast.py run --reps 1 --label "gate-$n-$side" --cases "$(planned)" --out "$report" "${flags[@]}") \
-     > "$OUT/passes/pass-$n-$side.log" 2>&1
+  # A plan that can't be read (empty, half written) is no block, never every case.
+  cases=$(planned "$plan") && [ -n "$cases" ] || { log "block $n: the plan $plan can't be read"; exit 2; }
+  log "block $n: ${names[*]}, layout $layout, on the cases of $harness, plan $(basename "$plan")"
+  # The host kept quiet while the block runs (scripts/lib/quiet-watch.py, as the measurement
+  # queue's timed chunks: this user's other busy processes stopped, other containers paused,
+  # other users' work recorded); its verdict kept with the block. GATE_QUIET=0: unwatched.
+  watcher=""
+  if [ "${GATE_QUIET:-1}" != 0 ] && [ -d /proc ]; then
+    rm -rf "$GATE/quiet" && mkdir -p "$GATE/quiet"
+    export NRESE_QUIET_TOKEN="gate-$n-$$"
+    python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" $$ "$NRESE_QUIET_TOKEN" &
+    watcher=$!
+  fi
+  (cd "$tree" && py benches/fast/fast.py block --block "$n" --layout "$layout" --cases "$cases" \
+     --out "$OUT/passes" "${sides[@]}" "${opts[@]}") > "$OUT/passes/block-$n.log" 2>&1
   code=$?
-  grep -E "^rep 1 |not as expected" "$OUT/passes/pass-$n-$side.log" | tail -4
-  # The cases' failures are data, the report's to judge; a pass without its report isn't.
-  py -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("finished_ns") else 1)' "$report" 2>/dev/null \
-    || { log "pass $n ($side): no complete report (exit $code)"; exit 1; }
-  log "pass $n ($side): done (fast.py exit $code)"
+  if [ -n "$watcher" ]; then
+    kill -TERM "$watcher" 2>/dev/null && wait "$watcher"
+    cp "$GATE/quiet/watch.log" "$OUT/passes/quiet-block-$n.log" 2>/dev/null
+    log "block $n: $(tail -1 "$GATE/quiet/watch.log" 2>/dev/null)"
+  fi
+  tail -1 "$OUT/passes/block-$n.log"
+  # The cases' failures are data, the report's to judge; a block without all its reports isn't.
+  [ "$(complete)" = "$per" ] || { log "block $n: not all $per reports (exit $code)"; exit 1; }
+  log "block $n: done (fast.py exit $code)"
   ;;
 
 report)
@@ -264,9 +406,11 @@ report)
     while IFS= read -r line; do [ -z "$line" ] || args+=("--${key/_/-}" "$line"); done <<< "$listed"
   done
   (cd "$tree" && py benches/fast/release_gate.py report --passes "$OUT/passes" --candidate "$candidate" "${args[@]}" \
-     --require "$required" --harness-revision "$harness" --min-passes "${GATE_MIN_PASSES:-4}" --inputs "$GATE/inputs.txt" \
+     --require "$required" --harness-revision "$harness" --min-blocks "${GATE_MIN_BLOCKS:-2}" --family "$GATE/plan.json" \
+     --inputs "$GATE/inputs.txt" \
      --context "host=${GATE_HOST:-}" --context "round=${GATE_ROUND:-0}" --context "prefix=${GATE_PREFIX:-}" \
      --context "gate_name=${GATE_NAME:-}" --context "max_gb=$MAX_GB" --context "ram_gb=${GATE_RAM_GB:-$MAX_GB}" \
+     --context "layouts=$LAYOUTS" \
      --out "$OUT/release-gate.md" --json "$OUT/release-gate.json") > "$OUT/report.log" 2>&1
   code=$?
   log "timed part: $( [ $code -eq 0 ] && echo passed || echo 'not passed') ($OUT/release-gate.md)"
@@ -332,9 +476,11 @@ pack)
   for spec in "$@"; do
     rev=$(git rev-parse "$spec") || exit 2
     bin=$(bin_of "$rev")
-    [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS) \
-      || { log "pack: no verified build of $rev"; exit 2; }
     dirs+=("$(basename "$bin")")
+    for L in $(seq 1 "$LAYOUTS"); do
+      verified "$(layout_bin "$rev" "$L")" "$rev" "$L" || { log "pack: no verified layout $L of $rev"; exit 2; }
+      dirs+=("$(basename "$(layout_bin "$rev" "$L")")")
+    done
   done
   mkdir -p "$OUT/binaries"
   # shellcheck disable=SC2046
@@ -345,6 +491,9 @@ pack)
   ;;
 
 unpack)
+  # The binaries are Linux ELF: on any other system (native Windows: khaleesi, not khaleesi-wsl)
+  # nothing is unpacked and the job fails, never runs them some other way.
+  [ "$(uname -s)" = Linux ] || { log "unpack: $(uname -s) is not Linux: the gate's binaries can't run here"; exit 2; }
   src=${FLEET_INPUT_BINARIES:?the binaries of the build job, its input named binaries}
   tarball=$(find "$src" -name gate-bin.tar | head -1)
   [ -n "$tarball" ] && (cd "$(dirname "$tarball")" && sha256sum -c --quiet gate-bin.tar.sha256) \
@@ -356,13 +505,26 @@ unpack)
     (cd "$aside/$bin" && sha256sum -c --quiet SHA256SUMS) || { log "unpack: $bin doesn't verify"; exit 2; }
     for f in $(cut -d' ' -f3- "$aside/$bin/SHA256SUMS"); do
       [ -x "$aside/$bin/$f" ] || { log "unpack: $bin/$f lost its executable mode"; exit 2; }
+      [ "$(head -c4 "$aside/$bin/$f" | od -An -tx1 | tr -d ' ')" = 7f454c46 ] \
+        || { log "unpack: $bin/$f is not an ELF binary"; exit 2; }
     done
+    grep -q '^linker LLD ' "$aside/$bin/IDENTITY" 2>/dev/null || { log "unpack: $bin has no build identity"; exit 2; }
     rev=$(cat "$aside/$bin/REVISION")
     publish "$aside/$bin" "$GATE_BIN/$bin" || { log "unpack: $GATE_BIN/$bin is there but doesn't verify"; exit 2; }
-    point "$rev" "$GATE_BIN/$bin"
+    point "$rev" "$GATE_BIN/$bin" "$(cat "$GATE_BIN/$bin/LAYOUT" 2>/dev/null || echo 1)"
     log "unpack: $bin verified ($rev)"
   done
   rm -rf "$aside"
+  ;;
+
+plan-blocks)
+  # Each block's plan (release_gate.py blocks): the first blocks the gate's whole plan, each
+  # later one the cases whose measured noise needs more passes (benches/fast/measure.toml).
+  harness=$(git rev-parse "$2") || exit 2
+  tree=$(worktree "$harness") || exit 2
+  (cd "$tree" && py benches/fast/release_gate.py blocks --plan "$PLAN" --measure "$MEASURE" --out "$GATE") \
+    | tee -a "$OUT/gate.log" || exit 2
+  cp "$GATE"/plan-block-*.json "$OUT/"
   ;;
 
 plan-cases)
@@ -406,16 +568,20 @@ clean)
   before=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
   for dir in "$GATE"/src-* "$GATE"/build/src-*; do [ -d "$dir" ] && git worktree remove --force "$dir"; done
   rm -rf "$GATE"/target-* "$GATE"/build "$GATE"/reports "$GATE"/compact
-  swept=$(sweep_builds | tr '
-' ' ')
+  # Block copies are removed by their block; what a killed one left is named, not swept.
+  rmdir "$GATE/instances" 2>/dev/null || { [ -d "$GATE/instances" ] \
+    && log "clean: block copies left by an interrupted block, not removed: $(ls "$GATE/instances" | tr '\n' ' ')"; }
+  swept=$(sweep_builds | tr '\n' ' ')
   [ -z "$swept" ] || log "clean: unused builds removed: $swept"
   git worktree prune
+  # Shared prepared data no gate has linked for two days (its last link's removal set its ctime).
+  [ -d "$SHARED/blobs" ] && find "$SHARED/blobs" -type f -links 1 -cmin +2880 -delete
   after=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
   log "clean: $(( (before - after) / 1048576 )) MiB reclaimed; kept the binaries, the data view, the prepared data, the results"
   ;;
 
 *)
-  sed -n '2,28p' "$0"
+  sed -n '2,31p' "$0"
   exit 2
   ;;
 esac
