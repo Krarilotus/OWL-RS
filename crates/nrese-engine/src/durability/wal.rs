@@ -100,9 +100,19 @@ pub(crate) enum Tail {
     Corrupt(String),
 }
 
-/// The sync policy `segment` was written under, if its sidecar records one.
-fn segment_policy(segment: &Path) -> Option<SyncPolicy> {
-    sidecar::read(segment, "sync").and_then(|word| SyncPolicy::from_word(&word))
+/// The sync policy `segment` was written under, if it has a sidecar; an error if the sidecar
+/// can't be read or names a policy this engine doesn't know (recovery must not take it for
+/// a missing one and so be lenient).
+fn segment_policy(segment: &Path) -> EngineResult<Option<SyncPolicy>> {
+    match sidecar::read(segment, "sync")? {
+        None => Ok(None),
+        Some(word) => SyncPolicy::from_word(&word).map(Some).ok_or_else(|| {
+            EngineError::Corruption(format!(
+                "{}: unknown sync policy {word:?}",
+                sidecar::path_of(segment).display()
+            ))
+        }),
+    }
 }
 
 /// Removes what a crash left of a segment or sidecar being written under a temporary name
@@ -187,7 +197,7 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
                         dictionary: None,
                     },
                 };
-                let policy = segment_policy(path);
+                let policy = segment_policy(path)?;
                 return Ok(SegmentContents {
                     tail: classify(&bytes[pos..], damaged, timed, policy, next),
                     records,
@@ -424,20 +434,24 @@ impl Wal {
         // The newest segment is appended to if it is of the format written now and was
         // written under this sync policy; otherwise (a store from before version 6, another
         // policy, or no policy recorded) a new segment starts.
-        let newest = list_segments(dir)?.pop().filter(|(_, path)| {
-            let mut head = [0u8; 8];
-            File::open(path)
-                .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut head))
-                .is_ok_and(|()| &head == magic)
-                && segment_policy(path) == Some(sync)
-        });
+        let newest = list_segments(dir)?.pop();
+        let reusable = match &newest {
+            Some((_, path)) => {
+                let mut head = [0u8; 8];
+                File::open(path)
+                    .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut head))
+                    .is_ok_and(|()| &head == magic)
+                    && segment_policy(path)? == Some(sync)
+            }
+            None => false,
+        };
         let (first_revision, active, active_bytes) = match newest {
-            Some((first_revision, path)) => {
+            Some((first_revision, path)) if reusable => {
                 let mut file = OpenOptions::new().append(true).open(&path)?;
                 let len = file.seek(SeekFrom::End(0))?;
                 (first_revision, file, len)
             }
-            None => {
+            _ => {
                 let file = create_segment(dir, next_revision, magic, sync)?;
                 (next_revision, file, SEGMENT_MAGIC.len() as u64)
             }
