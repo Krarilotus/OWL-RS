@@ -11,7 +11,8 @@
 # toolchain's target directory after 14. Exact paths under the cache, nothing else.
 #
 # Results ($FLEET_OUT): build.log, build.json (commit, host, toolchain, built or reused, seconds,
-# the binary's SHA-256 and size, python3's version for the run job) and, for a fresh build,
+# the binary's SHA-256 and size, python3's version for the run job, the step's cgroup memory
+# peak) and, for a fresh build,
 # server/ (the binary with REVISION and SHA256SUMS), fetched back with the job.
 set -euo pipefail
 out=${FLEET_OUT:?a fleet job}
@@ -74,10 +75,16 @@ VERIFY_SHA=$sha VERIFY_BIN=$bin VERIFY_BUILT=$built VERIFY_SECONDS=$(($(date +%s
 import json, os, sys
 e = os.environ
 binary = os.path.join(e["VERIFY_BIN"], "nrese-server")
+try:  # the step's cgroup (cgroup v2): the build's peak memory, what BUILD's ram_gb must cover
+    scope = open("/proc/self/cgroup").read().strip().splitlines()[-1].split("::", 1)[1]
+    peak_mib = round(int(open(f"/sys/fs/cgroup{scope}/memory.peak").read()) / 2**20, 1)
+except (OSError, IndexError, ValueError):
+    peak_mib = None
 json.dump({
     "rev": e["VERIFY_SHA"], "host": e["VERIFY_HOST"], "path": binary, "built": e["VERIFY_BUILT"] == "true",
     "seconds": int(e["VERIFY_SECONDS"]), "rustc": e["VERIFY_RUSTC"], "python3": e["VERIFY_PYTHON"],
     "bytes": os.path.getsize(binary), "sha256": open(os.path.join(e["VERIFY_BIN"], "SHA256SUMS")).read().split()[0],
+    "cgroup_peak_mib": peak_mib,
 }, open(os.path.join(sys.argv[1], "build.json"), "w"), indent=1)
 EOF
 cat "$out/build.json"
