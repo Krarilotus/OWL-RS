@@ -866,7 +866,9 @@ class Tradeoffs(unittest.TestCase):
                                     "q06": [v * (worse(1.08, n) if cand else 1) for v in [4.8, 4.85, 4.8]]}),
                     record(case="kernel-intersect",
                            samples={"triangles": [v * (worse(0.36, n) if cand else 1) for v in [140.0, 140.5]]})]
-        return [run_gate(passes(records_of), tradeoffs=list(tradeoffs), context={**CONTEXT, "round": k})
+        # Three blocks: with two, the 8 % loss sat on Holm's threshold (combined p 0.0082 against
+        # 0.0083), and which runs a side got in the block's order decided it.
+        return [run_gate(passes(records_of, blocks=3), tradeoffs=list(tradeoffs), context={**CONTEXT, "round": k})
                 for k in (0, 1)]
 
     def entry(self, **changes):
@@ -1022,15 +1024,20 @@ class Instances(unittest.TestCase):
         with self.assertRaises(SystemExit):
             fast.parse_side("../escape:/bin:rev")
 
-    def test_each_pair_of_blocks_has_both_orientations_which_first_drawn_from_the_seed(self):
+    def test_each_square_of_blocks_gives_every_side_every_place_once_drawn_from_the_seed(self):
+        """tf2-gate-1 (20 Oct 2026): a block's first run cost 15.8 % on one series. With the mirror
+        alternating per pair of blocks the middle side (main; A' in an A-B-B-A) never opened."""
         firsts = set()
-        for seed in map(str, range(20)):
-            for b in (1, 3, 5, 7):
-                pair = [fast.palindrome(list(SIDES), x, seed)[0][0] for x in (b, b + 1)]
-                self.assertEqual(sorted(pair), ["base", "cand"], (seed, b))
+        for seed in [None, *map(str, range(20))]:
+            for square in range(3):
+                orders = [[s for s, run in fast.palindrome(list(SIDES), 3 * square + j, seed) if run == 1]
+                          for j in (1, 2, 3)]
+                for place in range(3):
+                    self.assertEqual(sorted(o[place] for o in orders), sorted(SIDES), (seed, square, orders))
             firsts.add(fast.palindrome(list(SIDES), 1, seed)[0][0])
             self.assertEqual(fast.palindrome(list(SIDES), 3, seed), fast.palindrome(list(SIDES), 3, seed))
-        self.assertEqual(firsts, {"base", "cand"})
+        self.assertEqual(firsts, set(SIDES))
+        self.assertEqual([fast.palindrome(["a", "b"], b)[0][0] for b in (1, 2, 3)], ["a", "b", "a"])
 
     def test_a_loss_is_judged_against_the_host_s_a_a_floor(self):
         """An A-A' gate (every side one revision, each block its own copies) gives the floor; a
