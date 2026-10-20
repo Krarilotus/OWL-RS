@@ -740,19 +740,61 @@ impl IdTable {
         std::cmp::Ordering::Equal
     }
 
+    /// The table's charge moved to `budget` (a holder that takes the table over under a
+    /// budget of its own): charged there first, then released where it was. Fails, keeping
+    /// its charge, where `budget` has no room.
+    pub fn recharge(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetExceeded> {
+        if self.held.is_none() && self.memory_bytes() == 0 {
+            return Ok(());
+        }
+        let mut moved = Reservation::new(Arc::clone(budget));
+        moved.charge(self.memory_bytes())?;
+        // The old charge released as it drops, after the new one is held.
+        self.held = Some(moved);
+        Ok(())
+    }
+
+    /// Working memory of `bytes` for an operation on the table, charged to its budget first
+    /// and released when the returned reservation drops (after the memory, declared before
+    /// it). None for a table that holds no charge: it holds no memory of a query (empty, or
+    /// a copy the result cache keeps and counts).
+    fn working(&self, bytes: usize) -> Result<Option<Reservation<Arc<Budget>>>, BudgetExceeded> {
+        let Some(held) = &self.held else {
+            return Ok(None);
+        };
+        let mut working = Reservation::new(Arc::clone(held.handle()));
+        working.charge(bytes)?;
+        Ok(Some(working))
+    }
+
     /// Sorts the rows lexicographically on `keys`, unless already sorted on them. The sort
     /// computes a row permutation once and gathers every column through it, in parallel for
-    /// large tables.
-    pub fn sort_by(&mut self, keys: &[usize]) {
+    /// large tables. Its working memory (the permutation, and the columns gathered anew
+    /// beside the old ones) is charged to the table's budget first; refused, the table is as
+    /// it was.
+    pub fn sort_by(&mut self, keys: &[usize]) -> Result<(), BudgetExceeded> {
         if self.is_sorted_on(keys) {
             if self.sorted_by.len() < keys.len() {
                 self.sorted_by = keys.to_vec();
             }
-            return;
+            return Ok(());
         }
+        let rows = self.len;
+        // One key: (value, row) pairs, then the rows; else the rows alone.
+        let order = match keys {
+            [_] => rows.saturating_mul(size_of::<(u64, u32)>() + size_of::<u32>()),
+            _ => rows.saturating_mul(size_of::<u32>()),
+        };
+        // A column at a time, or all at once in parallel.
+        let gathered = match rows >= PARALLEL_SORT_ROWS {
+            true => self.width(),
+            false => self.width().min(1),
+        };
+        let _working = self.working(order.saturating_add(rows.saturating_mul(8 * gathered)))?;
         let order = self.sort_order(keys);
         self.gather(&order);
         self.sorted_by = keys.to_vec();
+        Ok(())
     }
 
     /// The row permutation that sorts the table on `keys`.
@@ -798,18 +840,34 @@ impl IdTable {
             self.columns.iter_mut().for_each(gather);
         }
         self.room = self.capacity_rows();
+        // The columns gathered anew hold exactly their rows: no more than before.
+        let bytes = self.memory_bytes();
+        if let Some(held) = &mut self.held {
+            held.resize(bytes.min(held.bytes()))
+                .expect("releasing refuses nothing");
+        }
     }
 
-    /// Keeps the rows for which `keep(row)` is true, preserving order and sortedness.
-    pub fn retain(&mut self, mut keep: impl FnMut(&IdTable, usize) -> bool) {
+    /// Keeps the rows for which `keep(row)` is true, preserving order and sortedness. The
+    /// mask of the rows is charged to the table's budget first.
+    pub fn retain(
+        &mut self,
+        mut keep: impl FnMut(&IdTable, usize) -> bool,
+    ) -> Result<(), BudgetExceeded> {
+        let _working = self.working(self.len)?;
         let mask: Vec<bool> = (0..self.len).map(|row| keep(self, row)).collect();
         self.retain_mask(&mask);
+        Ok(())
     }
 
     /// Keeps the rows whose `mask` entry is true, preserving order and sortedness.
     /// [`retain`](Self::retain) with a thread-safe predicate, evaluated in parallel for
     /// large tables.
-    pub fn par_retain(&mut self, keep: impl Fn(&IdTable, usize) -> bool + Sync) {
+    pub fn par_retain(
+        &mut self,
+        keep: impl Fn(&IdTable, usize) -> bool + Sync,
+    ) -> Result<(), BudgetExceeded> {
+        let _working = self.working(self.len)?;
         let mask: Vec<bool> = if self.len < PARALLEL_SORT_ROWS {
             (0..self.len).map(|row| keep(self, row)).collect()
         } else {
@@ -819,6 +877,7 @@ impl IdTable {
                 .collect()
         };
         self.retain_mask(&mask);
+        Ok(())
     }
 
     pub fn retain_mask(&mut self, mask: &[bool]) {
@@ -836,14 +895,16 @@ impl IdTable {
     }
 
     /// Removes duplicate rows. Sorts on all columns first unless already sorted on them.
-    pub fn dedup(&mut self) {
+    /// Working memory is charged to the table's budget first ([`Self::sort_by`]).
+    pub fn dedup(&mut self) -> Result<(), BudgetExceeded> {
         let all: Vec<usize> = (0..self.width()).collect();
-        self.sort_by(&all);
-        self.dedup_adjacent();
+        self.sort_by(&all)?;
+        self.dedup_adjacent()
     }
 
     /// Equal rows are adjacent when any permutation of all columns orders the table.
-    fn dedup_adjacent(&mut self) {
+    fn dedup_adjacent(&mut self) -> Result<(), BudgetExceeded> {
+        let _working = self.working(self.len)?;
         let mask: Vec<bool> = (0..self.len)
             .map(|row| {
                 row == 0
@@ -854,15 +915,18 @@ impl IdTable {
             })
             .collect();
         self.retain_mask(&mask);
+        Ok(())
     }
 
     /// Removes duplicate rows, keeping the first occurrence of each and the row order
-    /// (SPARQL DISTINCT after ORDER BY). Sortedness is kept.
-    pub fn dedup_preserving_order(&mut self) {
+    /// (SPARQL DISTINCT after ORDER BY). Sortedness is kept. The table of rows seen and the
+    /// mask are charged to the table's budget first.
+    pub fn dedup_preserving_order(&mut self) -> Result<(), BudgetExceeded> {
         if self.width() > 0 && (0..self.width()).all(|column| self.sorted_by.contains(&column)) {
-            self.dedup_adjacent();
-            return;
+            return self.dedup_adjacent();
         }
+        let _working =
+            self.working(crate::map_bytes::<usize>(self.len).saturating_add(self.len))?;
         // A table of row numbers, hashed and compared through the columns: no row is
         // copied.
         use std::hash::{BuildHasher, Hasher};
@@ -889,7 +953,9 @@ impl IdTable {
                 }
             })
             .collect();
+        drop(seen);
         self.retain_mask(&mask);
+        Ok(())
     }
 
     /// Keeps the given columns in that order, moving their buffers. Only repeated columns
@@ -943,8 +1009,9 @@ mod tests {
     use super::*;
 
     /// A table built through the charged path holds no more than it charges, however many
-    /// rows: its growth, copies, selections and concatenations are charged before they
-    /// allocate, and released after its columns are freed.
+    /// rows: its growth, copies, selections and concatenations, and the working memory of
+    /// its sorts, deduplications and filters are charged before they allocate, and released
+    /// after what they cover is freed.
     #[test]
     fn a_charged_table_holds_no_more_than_it_charges() {
         if !crate::measure::alone() {
@@ -966,8 +1033,14 @@ mod tests {
                 }
                 parts[1] = parts[0].try_clone(&budget).unwrap();
                 parts[2] = parts[1].selected(&odd, true, &budget).unwrap();
-                let all = IdTable::concat_charged(3, &mut parts, &budget).unwrap();
+                let mut all = IdTable::concat_charged(3, &mut parts, &budget).unwrap();
                 assert_eq!(all.len(), rows * 5 / 2);
+                // Its working memory: a sort on one key (pairs) and on all (the rows'
+                // order), the columns gathered anew, the rows seen, and masks.
+                all.sort_by(&[2]).unwrap();
+                all.dedup_preserving_order().unwrap();
+                all.retain(|table, row| table.get(row, 0) % 3 != 0).unwrap();
+                all.dedup().unwrap();
                 assert_eq!(budget.used(), odd.charged() + all.charge());
             });
             drop(odd);
@@ -1011,7 +1084,7 @@ mod tests {
     #[test]
     fn sort_is_lexicographic_and_stable_for_equal_keys() {
         let mut t = table(&[&[3, 1], &[1, 9], &[3, 0], &[1, 2]]);
-        t.sort_by(&[0, 1]);
+        t.sort_by(&[0, 1]).unwrap();
         assert_eq!(
             t.rows().collect::<Vec<_>>(),
             vec![vec![1, 2], vec![1, 9], vec![3, 0], vec![3, 1]]
@@ -1034,7 +1107,7 @@ mod tests {
             .collect();
         let mut t =
             IdTable::from_rows(2, rows.iter().map(Vec::as_slice), &crate::test_budget()).unwrap();
-        t.sort_by(&[1, 0]);
+        t.sort_by(&[1, 0]).unwrap();
         let mut expected = rows.clone();
         expected.sort_by_key(|r| (r[1], r[0]));
         assert_eq!(t.rows().collect::<Vec<_>>(), expected);
@@ -1043,7 +1116,7 @@ mod tests {
     #[test]
     fn dedup_project_slice_retain() {
         let mut t = table(&[&[2, 5], &[1, 5], &[2, 5], &[1, 4]]);
-        t.dedup();
+        t.dedup().unwrap();
         assert_eq!(
             t.rows().collect::<Vec<_>>(),
             vec![vec![1, 4], vec![1, 5], vec![2, 5]]
@@ -1056,7 +1129,7 @@ mod tests {
         let mut s = t.clone();
         s.slice(1, Some(1));
         assert_eq!(s.rows().collect::<Vec<_>>(), vec![vec![1, 5]]);
-        t.retain(|t, row| t.get(row, 1) == 5);
+        t.retain(|t, row| t.get(row, 1) == 5).unwrap();
         assert_eq!(t.len(), 2);
         assert!(t.is_sorted_on(&[0, 1]));
     }
@@ -1098,7 +1171,7 @@ mod tests {
             .iter()
             .map(|column| column.as_ptr())
             .collect();
-        input.dedup_preserving_order();
+        input.dedup_preserving_order().unwrap();
         assert_eq!(input.rows().collect::<Vec<_>>(), [vec![2, 1], vec![1, 2]]);
         assert_eq!(input.sorted_by(), [1, 0]);
         for (column, buffer) in input.columns().iter().zip(buffers) {
@@ -1108,7 +1181,7 @@ mod tests {
         // Repeating one key does not cover the other column: equal rows need not be
         // adjacent. Keep the hash path's first occurrence and its order in that case.
         let mut partial = table(&[&[1, 2], &[1, 3], &[1, 2]]).assume_sorted_by(vec![0, 0]);
-        partial.dedup_preserving_order();
+        partial.dedup_preserving_order().unwrap();
         assert_eq!(partial.rows().collect::<Vec<_>>(), [vec![1, 2], vec![1, 3]]);
     }
 }

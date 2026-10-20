@@ -32,7 +32,7 @@ use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
 use nrese_exec::join::{
     anti_join_in_place, compatible_mask, outer_join_with_undef, semi_join_in_place,
 };
-use nrese_exec::{IdTable, UNDEF};
+use nrese_exec::{ChargedVec, IdTable, Scratch, UNDEF};
 
 use super::{
     Context, GraphScope, NativeResult, Solutions, bound_variables, expr, has_undef, pushdown,
@@ -449,7 +449,7 @@ impl Context<'_> {
                 return Ok(solutions);
             }
             // An unbound variable isn't put into the pattern: any value matches.
-            let mut mask = vec![false; solutions.table.len()];
+            let mut mask = self.mask(solutions.table.len(), false)?;
             let table = &solutions.table;
             compatible_mask(
                 table,
@@ -498,7 +498,7 @@ impl Context<'_> {
         &self,
         solutions: &Solutions,
         pattern: &GraphPattern,
-    ) -> NativeResult<Vec<bool>> {
+    ) -> NativeResult<Scratch<'_, bool>> {
         let visible = mentioned(pattern);
         let columns: Vec<(usize, Variable)> = solutions
             .vars
@@ -514,7 +514,7 @@ impl Context<'_> {
             _ => None,
         };
         let mut answers: HashMap<Vec<u64>, bool> = HashMap::new();
-        let mut mask = Vec::with_capacity(solutions.table.len());
+        let mut mask = ChargedVec::with_capacity(&*self.budget, solutions.table.len())?;
         for row in 0..solutions.table.len() {
             self.check()?;
             let mut key: Vec<u64> = columns
@@ -526,7 +526,7 @@ impl Context<'_> {
                 .filter(|&id| id != UNDEF);
             key.push(graph.unwrap_or(UNDEF));
             if let Some(&holds) = answers.get(&key) {
-                mask.push(holds);
+                mask.push(holds)?;
                 continue;
             }
             let mut terms = HashMap::new();
@@ -552,7 +552,7 @@ impl Context<'_> {
             let holds = !found.table.is_empty();
             self.consumed(found);
             answers.insert(key, holds);
-            mask.push(holds);
+            mask.push(holds)?;
         }
         Ok(mask)
     }
@@ -562,9 +562,9 @@ impl Context<'_> {
         &self,
         solutions: &Solutions,
         pattern: &GraphPattern,
-    ) -> NativeResult<Vec<bool>> {
+    ) -> NativeResult<Scratch<'_, bool>> {
         if solutions.table.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ChargedVec::new(&*self.budget));
         }
         let (conjuncts, inner) = top_filters(pattern);
         if !correlation_safe(inner, &solutions.vars) {
@@ -576,7 +576,7 @@ impl Context<'_> {
         if correlated.is_empty() {
             let found = self.eval(pattern)?;
             let (lk, rk) = shared_columns(solutions, &found);
-            let mut mask = vec![false; solutions.table.len()];
+            let mut mask = self.mask(solutions.table.len(), false)?;
             let table = &solutions.table;
             compatible_mask(
                 table,
@@ -640,12 +640,15 @@ impl Context<'_> {
             joined = self.filter(joined, conjunct)?;
         }
         let column = joined.column(&key_variable).expect("the key column");
-        let mut holds = vec![false; index.len()];
+        let mut holds = self.mask(index.len(), false)?;
         for &id in joined.table.column(column) {
             holds[id as usize] = true;
         }
         self.consumed(joined);
-        Ok(key_of_row.iter().map(|&id| holds[id as usize]).collect())
+        self.mask_of(
+            key_of_row.len(),
+            key_of_row.iter().map(|&id| holds[id as usize]),
+        )
     }
 
     /// `OPTIONAL { right } FILTER(expression)` where the condition holds an `EXISTS`: the
@@ -692,7 +695,7 @@ impl Context<'_> {
         // EXISTS columns; the output drops the last three kinds' extras.
         let row_column = numbered.vars.len() - 1;
         let width = pairs.vars.len() - added;
-        let mut matched = vec![false; rows];
+        let mut matched = self.mask(rows, false)?;
         for &r in pairs.table.column(row_column) {
             matched[r as usize] = true;
         }

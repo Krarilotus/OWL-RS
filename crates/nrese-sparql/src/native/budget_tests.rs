@@ -280,3 +280,42 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
         );
     }
 }
+
+/// A FILTER's mask of its rows is charged before it is made, on one thread and in parallel
+/// parts: what it holds uncharged doesn't grow with the rows.
+#[test]
+fn filter_masks_hold_no_more_than_they_charge() {
+    if !alone() {
+        return;
+    }
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let v = Variable::new_unchecked("v");
+    // FILTER(?v > 5) over inline integers: decided on ids.
+    let expression = Expression::Greater(
+        Box::new(Expression::Variable(v.clone())),
+        Box::new(Expression::Literal(nrese_rdf::Literal::from(5))),
+    );
+    let held = |rows: usize| {
+        let envelope = Envelope::unlimited();
+        let mut options = QueryOptions::default();
+        options.resources.memory = envelope.clone();
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let (kept, excess) = measure_within(&envelope, || {
+            // The input made charged inside the measurement.
+            let ids = (0..rows as i64).map(|i| TermId::inline_integer(i).unwrap().raw());
+            let table = IdTable::gathered(1, rows, &ctx.budget, [ids]).unwrap();
+            let solutions = Solutions {
+                vars: vec![v.clone()],
+                table,
+                ordered: false,
+            };
+            let kept = ctx.filter(solutions, &expression).ok().expect("filtered");
+            kept.table.len()
+        });
+        assert_eq!(kept, rows.saturating_sub(6));
+        excess
+    };
+    assert_eq!(held(100), held(10_000), "on one thread");
+    assert_eq!(held(20_000), held(200_000), "in parallel parts");
+}

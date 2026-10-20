@@ -1543,6 +1543,23 @@ impl<'a> Context<'a> {
         .into()
     }
 
+    /// A mask of `rows` rows, each `value`, charged to the query's budget first (a row's
+    /// working memory, of filters, EXISTS and MINUS).
+    fn mask(&self, rows: usize, value: bool) -> NativeResult<Scratch<'_, bool>> {
+        let mut mask = ChargedVec::with_capacity(&*self.budget, rows)?;
+        mask.resize(rows, value)?;
+        Ok(mask)
+    }
+
+    /// A mask of `rows` rows, `bits`, charged first.
+    fn mask_of(
+        &self,
+        rows: usize,
+        bits: impl IntoIterator<Item = bool>,
+    ) -> NativeResult<Scratch<'_, bool>> {
+        Ok(ChargedVec::collect(&*self.budget, rows, bits)?)
+    }
+
     /// Frees a table the query is done with: its charge is released with it, after its
     /// columns.
     fn consumed(&self, solutions: Solutions) {
@@ -1977,7 +1994,7 @@ impl<'a> Context<'a> {
                 let mut table = left.table;
                 if has_undef(&table, &lk) || has_undef(&right.table, &rk) {
                     // A row goes if a compatible row shares a variable both bind.
-                    let mut removed = vec![false; table.len()];
+                    let mut removed = self.mask(table.len(), false)?;
                     compatible_mask(
                         &table,
                         &right.table,
@@ -1988,7 +2005,8 @@ impl<'a> Context<'a> {
                         &mut removed,
                     )
                     .map_err(QueryEvaluationError::MemoryLimit)?;
-                    table.retain_mask(&removed.iter().map(|r| !r).collect::<Vec<_>>());
+                    removed.iter_mut().for_each(|r| *r = !*r);
+                    table.retain_mask(&removed);
                 } else {
                     anti_join_in_place(&mut table, &right.table, &lk, &rk, &self.budget)
                         .map_err(QueryEvaluationError::MemoryLimit)?;
@@ -2057,7 +2075,7 @@ impl<'a> Context<'a> {
                         _ => self.eval(sorted)?,
                     };
                     let mut solutions = self.project(solutions, variables)?;
-                    solutions.table.dedup_preserving_order();
+                    solutions.table.dedup_preserving_order()?;
                     return self.order_by(solutions, expression, None);
                 }
                 // DISTINCT over a projection of joins: the joins work on sets (`sets`).
@@ -2071,11 +2089,11 @@ impl<'a> Context<'a> {
                 {
                     let solutions = self.eval_set(projected, variables)?;
                     let mut solutions = self.project(solutions, variables)?;
-                    solutions.table.dedup_preserving_order();
+                    solutions.table.dedup_preserving_order()?;
                     return Ok(solutions);
                 }
                 let mut solutions = self.eval(inner)?;
-                solutions.table.dedup_preserving_order();
+                solutions.table.dedup_preserving_order()?;
                 Ok(solutions)
             }
             GraphPattern::Reduced { inner } => self.eval(inner),
@@ -2190,13 +2208,9 @@ impl<'a> Context<'a> {
             // all graphs.
             let mut solutions = self.in_graph(GraphScope::Variable(variable.clone()), inner)?;
             if let (Some(named), Some(column)) = (&self.named, solutions.column(variable)) {
-                let mask: Vec<bool> = solutions
-                    .table
-                    .column(column)
-                    .iter()
-                    .map(|&id| named.contains(&TermId::from_raw(id)))
-                    .collect();
-                solutions.table.retain_mask(&mask);
+                solutions.table.retain(|table, row| {
+                    named.contains(&TermId::from_raw(table.get(row, column)))
+                })?;
             }
             return Ok(solutions);
         }
@@ -2212,13 +2226,10 @@ impl<'a> Context<'a> {
             match solutions.column(variable) {
                 // The pattern binds the variable itself: it must be this graph.
                 Some(column) => {
-                    let mask: Vec<bool> = solutions
-                        .table
-                        .column(column)
-                        .iter()
-                        .map(|&id| id == graph.raw() || id == UNDEF)
-                        .collect();
-                    solutions.table.retain_mask(&mask);
+                    solutions.table.retain(|table, row| {
+                        let id = table.get(row, column);
+                        id == graph.raw() || id == UNDEF
+                    })?;
                     let mut columns = std::mem::take(&mut solutions.table).into_columns();
                     columns.column_mut(column).fill(graph.raw());
                     solutions.table = IdTable::from_columns(columns);
@@ -3799,7 +3810,7 @@ impl<'a> Context<'a> {
             return self.reshaped(solutions, |mut solutions| {
                 solutions
                     .table
-                    .par_retain(|table, row| set.contains(table.get(row, column)));
+                    .par_retain(|table, row| set.contains(table.get(row, column)))?;
                 Ok(solutions)
             });
         }
@@ -3901,11 +3912,8 @@ impl<'a> Context<'a> {
             return self.join(result, scanned);
         }
         if !result.ordered {
-            let mut scratch = Reservation::new(&*self.budget);
-            scratch
-                .charge(sort_scratch_bytes(&result.table))
-                .map_err(QueryEvaluationError::MemoryLimit)?;
-            result.table.sort_by(&key_columns);
+            // Its working memory charged first, to the table's budget.
+            result.table.sort_by(&key_columns)?;
         }
         let new_vars: Vec<Variable> = scan
             .vars()
@@ -4251,7 +4259,7 @@ impl<'a> Context<'a> {
         &self,
         solutions: &Solutions,
         expression: &Expression,
-    ) -> NativeResult<Vec<bool>> {
+    ) -> NativeResult<Scratch<'_, bool>> {
         let compiled = fast::compile(expression, &self.snapshot);
         let rows = solutions.table.len();
         let mask = FilterMask {
@@ -4263,10 +4271,13 @@ impl<'a> Context<'a> {
         };
         if rows < 2 * PARALLEL_EXPRESSION_ROWS {
             let term = |id: u64| self.term(id);
-            let mut out = Vec::with_capacity(rows);
+            let mut out = ChargedVec::with_capacity(&*self.budget, rows)?;
+            // A chunk's mask at a time, before it is copied in.
+            let mut chunk_held = Reservation::new(&*self.budget);
+            chunk_held.charge(rows.min(1 << 16))?;
             for start in (0..rows).step_by(1 << 16) {
                 self.check()?;
-                out.extend(mask.rows(start..(start + (1 << 16)).min(rows), &term));
+                out.extend_from_slice(&mask.rows(start..(start + (1 << 16)).min(rows), &term))?;
             }
             return Ok(out);
         }
@@ -4277,6 +4288,11 @@ impl<'a> Context<'a> {
         let token = self.cancellation.as_ref();
         let snapshot: &Snapshot = &self.snapshot;
         let decodes = &self.decodes;
+        // The parts' masks, then the mask they make, charged first.
+        let mut out = ChargedVec::with_capacity(&*self.budget, rows)?;
+        let mut parts_held = Reservation::new(&*self.budget);
+        let chunks = rows.div_ceil(PARALLEL_EXPRESSION_ROWS);
+        parts_held.charge(rows + chunks * size_of::<Option<Vec<bool>>>())?;
         let parts: Vec<Option<Vec<bool>>> = (0..rows.div_ceil(PARALLEL_EXPRESSION_ROWS))
             .into_par_iter()
             .map(|i| {
@@ -4289,12 +4305,11 @@ impl<'a> Context<'a> {
                 Some(mask.rows(range, &|id| decoder.term(id)))
             })
             .collect();
-        let mut out = Vec::with_capacity(rows);
         for part in parts {
             let Some(part) = part else {
                 return Err(QueryEvaluationError::Cancelled.into());
             };
-            out.extend(part);
+            out.extend_from_slice(&part)?;
         }
         Ok(out)
     }
@@ -5700,12 +5715,6 @@ fn distinct<B: std::ops::Deref<Target = Budget>>(
         }
         (_, None) => unreachable!("scratch for records of several values"),
     }
-}
-
-/// The most a sort of `table` ([`IdTable::sort_by`]) holds beside it, per row: (value, row)
-/// pairs, then the rows' order, and each column gathered anew (all at once in parallel).
-fn sort_scratch_bytes(table: &IdTable) -> usize {
-    table.len().saturating_mul(4 + 16.max(8 * table.width()))
 }
 
 fn has_undef(table: &IdTable, columns: &[usize]) -> bool {

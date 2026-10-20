@@ -83,7 +83,7 @@ impl SolutionTable {
             .chain(upper.computed.iter())
             .map(|t| crate::cache::term_heap(t).saturating_add(128))
             .sum::<usize>();
-        let mut held = Reservation::new(budget);
+        let mut held = Reservation::new(Arc::clone(&budget));
         held.charge(computed_bytes.saturating_mul(3))?;
         let mut values = std::collections::HashMap::new();
         let mut computed = Vec::new();
@@ -132,6 +132,10 @@ impl SolutionTable {
         }
         self.table = translate(self.table, &lower_map);
         upper.table = translate(upper.table, &upper_map);
+        // Both tables held under the aligned results' budget from now on: their growth and
+        // working memory (appends, deduplication) are charged to it.
+        self.table.recharge(&budget)?;
+        upper.table.recharge(&budget)?;
         let computed = Arc::new(computed);
         self.computed = Arc::clone(&computed);
         upper.computed = computed;
@@ -170,17 +174,11 @@ impl AlignedSolutions {
         self.upper.row(row)
     }
 
-    /// Uses the shared ID-table set primitive; only U changes order. Scratch is reserved
-    /// before sorting/gathering, including the permutation and deduplication mask.
+    /// Uses the shared ID-table set primitive; only U changes order. Its working memory
+    /// (the permutation, the columns gathered, the mask) is charged to the aligned results'
+    /// budget, which holds the table since [`SolutionTable::align`], before it is made.
     pub fn deduplicate_upper(&mut self) -> Result<(), QueryEvaluationError> {
-        let scratch = self
-            .upper
-            .table
-            .memory_bytes()
-            .saturating_add(self.upper.len().saturating_mul(24));
-        self.held.charge(scratch)?;
-        self.upper.table.dedup();
-        self.held.release(scratch);
+        self.upper.table.dedup()?;
         Ok(())
     }
 

@@ -79,7 +79,10 @@ impl Context<'_> {
     ) -> NativeResult<Solutions> {
         let column = result.column(a).expect("linked variables are bound");
         let ids = result.table.column(column);
-        let by_id: Vec<bool> = ids.iter().map(|&id| same_term || only_itself(id)).collect();
+        let by_id = self.mask_of(
+            ids.len(),
+            ids.iter().map(|&id| same_term || only_itself(id)),
+        )?;
         let by_value = !by_id.iter().all(|&joined| joined);
         // By id: `?b` as a copy of `?a`, then the pattern joined on `?b`.
         let mut left = rows_where(&result, &by_id, &self.budget)?;
@@ -87,10 +90,12 @@ impl Context<'_> {
         columns.push_copy(column, &self.budget)?;
         left.vars.push(b.clone());
         left.table = IdTable::from_columns(columns);
-        let crossed = by_value.then(|| {
-            let keep: Vec<bool> = by_id.iter().map(|&joined| !joined).collect();
-            rows_where(&result, &keep, &self.budget)
-        });
+        let crossed = by_value
+            .then(|| -> NativeResult<Solutions> {
+                let keep = self.mask_of(by_id.len(), by_id.iter().map(|&joined| !joined))?;
+                Ok(rows_where(&result, &keep, &self.budget)?)
+            })
+            .transpose()?;
         self.consumed(result);
         let left = self.produced(left)?;
         let shared = [b.clone()];
@@ -101,7 +106,7 @@ impl Context<'_> {
             let scanned = self.scan(scan, Some(b))?;
             self.join(left, scanned)?
         };
-        let Some(crossed) = crossed.transpose()? else {
+        let Some(crossed) = crossed else {
             return Ok(joined);
         };
         // By value: rows with literals or triple terms against the pattern's such rows.
@@ -111,7 +116,7 @@ impl Context<'_> {
         scanned.table.retain(|table, row| {
             let id = table.get(row, at);
             id != UNDEF && !only_itself(id)
-        });
+        })?;
         let crossed = self.join(crossed, scanned)?;
         self.union(joined, crossed)
     }
