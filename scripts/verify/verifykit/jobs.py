@@ -18,10 +18,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
 HOST = "gamergrill"
-# A debug build of nrese-server at -j2: cold, with its crates downloaded, 118 s at ebaeb593
-# (verify-build-ebaeb593-10201343), within the commit tier's ask there (3 GB; build.json records
-# the step's cgroup peak); a reused build is a checksum.
-BUILD = {"cores": 2, "ram_gb": 3, "est_min": 10}
+# A debug build of nrese-server at -j2, cold at ebaeb593 (verify-coldbuild-ebaeb593-10201518): 119 s;
+# the build itself held at most 897 MiB (anonymous memory, sampled each second), the step's cgroup
+# 2,319 MiB with the page cache of what it wrote, which the cap reclaims. 2 GB (capped at 3) holds
+# it twice over; build.json records both for every build. A reused build is a checksum.
+BUILD = {"cores": 2, "ram_gb": 2, "est_min": 10}
 # The runner and one debug server at a time: the three example scenarios peaked at 54.7 MiB and
 # the self-test at 42.7 MiB (the step's cgroup, verify-run-ebaeb593-10201343), about a minute
 # together. Scenarios with more data declare more (--ram-gb); each summary records its peak.
