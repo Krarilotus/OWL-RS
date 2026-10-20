@@ -1682,14 +1682,29 @@ def drawn(seed: str, *key) -> int:
 
 def palindrome(sides: list[str], block: int, seed: str | None = None) -> list[tuple[str, int]]:
     """A block's runs of one case: the sides, then the same mirrored (base, main, cand, cand,
-    main, base), each side's two runs centred on the same instant whatever their durations; even
-    blocks start from the other end. With a seed each pair of blocks still has one block of each
-    orientation, which of them comes first drawn (lks, 20 Oct 2026: an order fixed in advance can
-    line up with whatever else repeats on the host). Each entry: (side, its run 1 or 2)."""
-    flip = block % 2 == 0
+    main, base), each side's two runs centred on the same instant whatever their durations. The
+    orders form Latin squares: each run of k blocks (k sides; blocks 1..k, k+1..2k, ...) has every
+    side open one block and hold each place once, its run 1 at place p and its run 2 at 2k+1-p,
+    the square a rotation of the sides. Unseeded, block 1 is the sides as given and each later
+    block of the square the next rotation; for two sides that is the old alternation. With a seed,
+    each square relabels the sides and orders its rows at random (lks, 20 Oct 2026: an order fixed
+    in advance can line up with whatever else repeats on the host).
+
+    The mirror alone cancels a drift linear in time, not a first run's own cost. tf2-gate-1 (20 Oct
+    2026, phuoc-yu, M P N N P M in every block, M and P one build): the opener's run 1 was 15.8 %
+    slower than its run 2 on olympics q06-text-filter p50 (t 6.5 over 6 blocks), the other places
+    symmetric, so P read 7.4 % faster than M. A mirror alternating per pair of blocks kept the
+    middle side out of the first place for good, A' in an A-B-B-A and main in the gate: a bias of
+    a quarter of the first run's cost. Squares give every side the first place alike, so the gate
+    runs a case in whole squares (release_gate.whole_squares()). Each entry: (side, its run 1 or 2)."""
+    k = len(sides)
+    square, row = divmod(block - 1, k)
+    labels, rows = list(sides), list(range(k))
     if seed is not None:
-        flip ^= bool(drawn(seed, "pair", (block - 1) // 2) & 1)
-    order = sides[::-1] if flip else sides
+        draw = random.Random(drawn(seed, "square", square))
+        draw.shuffle(labels)
+        draw.shuffle(rows)
+    order = labels[rows[row]:] + labels[:rows[row]]
     return [(s, 1) for s in order] + [(s, 2) for s in order[::-1]]
 
 
@@ -2018,7 +2033,7 @@ def main() -> int:
     s.add_argument("--layout", type=int, default=1)
     s.add_argument("--measure", metavar="TOML")
     s.add_argument("--batch", action="store_true")
-    s.add_argument("--seed", help="the gate's: each pair of blocks' orientation and the cases' order drawn from it")
+    s.add_argument("--seed", help="the gate's: each square of blocks' orders and the cases' order drawn from it")
     s.add_argument("--fresh-copies", type=Path, metavar="DIR",
                    help="time every side from a copy of its binaries made for this block under DIR")
     s.add_argument("--out", type=Path, required=True, help="the directory the side-runs' reports go to")

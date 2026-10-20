@@ -262,6 +262,20 @@ class Rounds(unittest.TestCase):
         self.assertAlmostEqual(gatestats.combine_rounds([0.01, 0.02]), 0.02 / 0.9)
         self.assertAlmostEqual(gatestats.combine_rounds([0.5, 0.001, 0.001]), 0.01)
 
+    def test_a_confirmation_runs_whole_squares_of_its_timed_sides(self):
+        """Sol r2: the candidate is timed whatever revision it shares; only a main that is base's
+        build isn't. Counting revisions gave three timed sides 2 blocks."""
+        for cand, main, sides in (("b", "m", 3), ("m", "m", 3), ("b", "b", 2), ("c", "m", 3), ("c", "b", 2)):
+            with self.subTest(cand=cand, main=main), patch.dict(REVS, {"cand": cand * 40, "base": "b" * 40, "main": main * 40}):
+                summary = run_gate(passes(slower(1.08), blocks=6))
+                for calibrated in (None, 3):
+                    measure = {"lab-olympics": {"blocks": calibrated}} if calibrated else None
+                    with patch.object(gate_module, "checkout_rev", return_value="x"):
+                        job = gate_module.confirm_job([summary], "C:/repo", measure=measure)
+                    n = len([s for s in job["steps"] if s[2] == "block"])
+                    self.assertEqual(n % sides, 0, (cand, main, calibrated, n))
+                    self.assertGreaterEqual(n, calibrated or gate_module.CONFIRM_BLOCKS[0])
+
     def test_nothing_flagged_needs_no_confirmation(self):
         clean = self.round_(1.0)
         self.assertIsNone(gate_module.confirm_job([clean], "C:/repo"))
@@ -501,10 +515,10 @@ class Parts(unittest.TestCase):
         self.assertEqual((timed["kind"], timed["class"], timed["after"]), ("owlrs.timed", "exclusive", ["rg-test-build"]))
         self.assertEqual(checks["requires"]["hosts"], ["office-pc"])
         blocks_ = [s for s in timed["steps"] if s[2] == "block"]
-        self.assertEqual([s[3] for s in blocks_], ["1", "2"])
+        self.assertEqual([s[3] for s in blocks_], ["1", "2", "3"])  # 2 asked: one whole square of three sides
         self.assertEqual(blocks_[0][2:], ["block", "1", "c" * 40, "1", "-", f"base={gate_module.BASE}",
                                           f"main={gate_module.MAIN}", f"cand={'c' * 40}"])
-        self.assertEqual(timed["env"]["GATE_MIN_BLOCKS"], "2")
+        self.assertEqual(timed["env"]["GATE_MIN_BLOCKS"], "3")
         for job in found.values():
             self.assertNotIn("priority", job)
             self.assertEqual(job["priority_class"], "merge-gate")
@@ -581,12 +595,19 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
                                    f'exec bash scripts/release-gate.sh block 2 {head} 1 - base={head} main={head} '
                                    f'cand={head}'],
                                   cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
+            # An A-B-B-A's A' (benches/suite/abba.py) is A's build by design: timed, never skipped.
+            aa = subprocess.run([bash, "-c", f'PATH="$(cygpath -u "{shim}" 2>/dev/null || echo "{shim}"):$PATH" '
+                                 f'exec bash scripts/release-gate.sh block 3 {head} 1 - a={head} a2={head} b={head}'],
+                                cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
+            reports = len(list(Path(tmp).glob("out/passes/pass-*.json"))) - 4  # block 2's: base and cand
             subprocess.run(["git", "worktree", "remove", "--force", f"{t}/gate/src-{head[:8]}"], cwd=ROOT,
                            capture_output=True)
         subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("block 2: done", done.stdout)
         self.assertIn("main is the same build as another side", done.stdout)  # timed once, as base
+        self.assertEqual((aa.returncode, reports), (0, 6), aa.stdout + aa.stderr)  # a, a2, b: twice each
+        self.assertNotIn("same build", aa.stdout)
 
     def test_a_main_that_is_the_base_is_timed_once_and_declared_once(self):
         """Orchestrator, 20 Oct 2026: the jobs require a main, so a confirmation passes the base
@@ -669,7 +690,7 @@ printf "no linker" > "$d/release/other"; lld_of "$d" 2>/dev/null || echo not-lld
             (Path(tmp) / "plan.json").write_text(done.stdout, encoding="utf-8")
             (Path(tmp) / "measure.toml").write_text(f'[case.{plan["run"][0]}]\nblocks = 3\n', encoding="utf-8")
             done = subprocess.run([sys.executable, "-B", str(script), "blocks", "--plan", str(Path(tmp) / "plan.json"),
-                                   "--measure", str(Path(tmp) / "measure.toml"), "--out", tmp],
+                                   "--measure", str(Path(tmp) / "measure.toml"), "--square", "1", "--out", tmp],
                                   capture_output=True, text=True, encoding="utf-8")
             self.assertEqual(done.returncode, 0, done.stderr[-500:])
             third = json.loads((Path(tmp) / "plan-block-3.json").read_text(encoding="utf-8"))
@@ -859,7 +880,9 @@ class Tradeoffs(unittest.TestCase):
                                     "q06": [v * (worse(1.08, n) if cand else 1) for v in [4.8, 4.85, 4.8]]}),
                     record(case="kernel-intersect",
                            samples={"triangles": [v * (worse(0.36, n) if cand else 1) for v in [140.0, 140.5]]})]
-        return [run_gate(passes(records_of), tradeoffs=list(tradeoffs), context={**CONTEXT, "round": k})
+        # Three blocks: with two, the 8 % loss sat on Holm's threshold (combined p 0.0082 against
+        # 0.0083), and which runs a side got in the block's order decided it.
+        return [run_gate(passes(records_of, blocks=3), tradeoffs=list(tradeoffs), context={**CONTEXT, "round": k})
                 for k in (0, 1)]
 
     def entry(self, **changes):
@@ -896,11 +919,25 @@ class Measurement(unittest.TestCase):
 
     def test_a_case_whose_noise_needs_more_blocks_is_tested_on_them_and_the_jobs_run_them(self):
         measure = {"a": {"blocks": 2}, "b": {"blocks": 4}, "c": {"blocks": 3}}
-        self.assertEqual(gate_module.blocks(["a", "b", "c"], measure), [["a", "b", "c"], ["a", "b", "c"], ["b", "c"], ["b"]])
+        self.assertEqual(gate_module.blocks(["a", "b", "c"], measure, square=1),  # one side: no squares
+                         [["a", "b", "c"], ["a", "b", "c"], ["b", "c"], ["b"]])
+        with self.assertRaises(TypeError):  # Sol r1: no square given planned 2 and 8 blocks for three sides
+            gate_module.blocks(["a"], measure)
+        # Sol r2: the plan files follow the job's minimum (jobs() with 4 blocks a round and a case
+        # needing 2: 6 block steps, the plan 3), and a declared outcome's case keeps its one block.
+        plan = gate_module.blocks(["a", "b", "c"], measure, 6, square=3, checked={"c"})
+        self.assertEqual([sorted(cases) for cases in plan], [["a", "b", "c"]] + [["a", "b"]] * 5)
+        # Whole Latin squares of the timed sides (tf2-gate-1: a first run's cost; a case in 2
+        # blocks of three sides leaves one side never opening): 2 -> 3, 4 -> 6, 3 stays.
+        self.assertEqual(gate_module.blocks(["a", "b", "c"], measure, square=3),
+                         [["a", "b", "c"]] * 3 + [["b"]] * 3)
         timed = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, measure=measure)["rg-test-timed"]
         self.assertEqual(timed["steps"][0][2:], ["plan-blocks", "c" * 40])
-        self.assertEqual([s[6] for s in timed["steps"] if s[2] == "block"],
-                         ["plan-block-1.json", "plan-block-2.json", "plan-block-3.json", "plan-block-4.json"])
+        self.assertEqual([s[6] for s in timed["steps"] if s[2] == "block"], [f"plan-block-{k}.json" for k in range(1, 7)])
+        self.assertEqual((timed["env"]["GATE_SQUARE"], timed["env"]["GATE_MIN_BLOCKS"]), ("3", "3"))
+        two = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, measure=measure,
+                               main=gate_module.BASE)["rg-test-timed"]  # main is base's build: two sides
+        self.assertEqual(len([s for s in two["steps"] if s[2] == "block"]), 4)
 
         def records_of(side, n):
             return [record()] + ([record(case="lab-yago-tiny")] if n <= 12 else [])
@@ -1015,15 +1052,20 @@ class Instances(unittest.TestCase):
         with self.assertRaises(SystemExit):
             fast.parse_side("../escape:/bin:rev")
 
-    def test_each_pair_of_blocks_has_both_orientations_which_first_drawn_from_the_seed(self):
+    def test_each_square_of_blocks_gives_every_side_every_place_once_drawn_from_the_seed(self):
+        """tf2-gate-1 (20 Oct 2026): a block's first run cost 15.8 % on one series. With the mirror
+        alternating per pair of blocks the middle side (main; A' in an A-B-B-A) never opened."""
         firsts = set()
-        for seed in map(str, range(20)):
-            for b in (1, 3, 5, 7):
-                pair = [fast.palindrome(list(SIDES), x, seed)[0][0] for x in (b, b + 1)]
-                self.assertEqual(sorted(pair), ["base", "cand"], (seed, b))
+        for seed in [None, *map(str, range(20))]:
+            for square in range(3):
+                orders = [[s for s, run in fast.palindrome(list(SIDES), 3 * square + j, seed) if run == 1]
+                          for j in (1, 2, 3)]
+                for place in range(3):
+                    self.assertEqual(sorted(o[place] for o in orders), sorted(SIDES), (seed, square, orders))
             firsts.add(fast.palindrome(list(SIDES), 1, seed)[0][0])
             self.assertEqual(fast.palindrome(list(SIDES), 3, seed), fast.palindrome(list(SIDES), 3, seed))
-        self.assertEqual(firsts, {"base", "cand"})
+        self.assertEqual(firsts, set(SIDES))
+        self.assertEqual([fast.palindrome(["a", "b"], b)[0][0] for b in (1, 2, 3)], ["a", "b", "a"])
 
     def test_a_loss_is_judged_against_the_host_s_a_a_floor(self):
         """An A-A' gate (every side one revision, each block its own copies) gives the floor; a
