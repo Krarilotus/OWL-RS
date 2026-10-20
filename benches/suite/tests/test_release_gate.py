@@ -223,7 +223,8 @@ class Rounds(unittest.TestCase):
         passed, text = gate_module.verdict([first], self.W3C, self.GUARDS)
         self.assertFalse(passed)
         self.assertIn("**pending**", text)
-        job = gate_module.confirm_job([first], "C:/repo")
+        with patch.object(gate_module, "checkout_rev", lambda checkout, cand, harness: harness):  # no repository
+            job = gate_module.confirm_job([first], "C:/repo")
         self.assertEqual((job["id"], job["requires"]["hosts"]), ("rg-cccccccc-confirm", ["phuoc-yu"]))
         self.assertEqual(job["steps"][0][2:], ["plan-cases", "lab-olympics"])
         self.assertEqual({s[2] for s in job["steps"][1:-2]}, {"block"})
@@ -607,6 +608,35 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
                          ([], {"main": "base"}, sorted(h for h in family if h.startswith("base|"))))
         self.assertTrue(s["passed"])
         self.assertIn("main is base's build", gate_module.render(s))
+
+    def test_a_job_s_checkout_holds_the_candidate_and_the_harness_or_there_is_no_job(self):
+        """Keepers, 20 Oct 2026: a confirmation's candidate rebased onto the harness was built in a
+        checkout at the harness, which doesn't contain it, and the build failed with exit 2."""
+        import subprocess
+        # A commit hook's GIT_DIR and GIT_INDEX_FILE would override -C: this repository's commits.
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        with tempfile.TemporaryDirectory() as tmp:
+            git = lambda *a: subprocess.run(["git", "-C", tmp, *a], capture_output=True, text=True,  # noqa: E731
+                                            env=clean, check=True).stdout.strip()
+            git("init", "-q")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base")
+            root = git("rev-parse", "HEAD")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "harness")
+            harness = git("rev-parse", "HEAD")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "rebased candidate")
+            rebased = git("rev-parse", "HEAD")
+            git("checkout", "-q", "-b", "elsewhere", root)
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "diverged")
+            diverged = git("rev-parse", "HEAD")
+
+            def checkout_of(candidate):
+                found = gate_module.jobs(candidate, harness, tmp, "rg-test", 2, None, base=root, main=root,
+                                         checks=False, big_host=None)
+                return found["rg-test-build"]["inputs"][0]["source"]["rev"]
+            self.assertEqual((checkout_of(rebased), checkout_of(root)), (rebased, harness))
+            with self.assertRaises(SystemExit) as refused:
+                checkout_of(diverged)
+            self.assertIn("contains the other", str(refused.exception))
 
     def test_a_cached_build_counts_only_with_its_whole_identity(self):
         """Round 8: binaries from before counted by revision alone, whatever toolchain, flags or
