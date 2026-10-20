@@ -149,8 +149,8 @@ pub fn restore_until(
             .get(i + 1)
             .is_none_or(|(next, _)| *next > manifest.revision + 1);
         if after_image {
-            let target = wal.join(path.file_name().expect("segment name"));
-            fs::copy(path, &target).map_err(|e| io(e, path))?;
+            // With its sidecar: the sync policy its recovery reads.
+            nrese_engine::copy_log_segment(path, &wal)?;
         }
     }
     let config = nrese_engine::EngineConfig {
@@ -235,7 +235,7 @@ pub fn prune_wal_archive(archive: &Path, revision: u64) -> StoreResult<usize> {
         // A segment's records end where the next segment's begin.
         let ((_, path), (next_first, _)) = (&pair[0], &pair[1]);
         if *next_first <= revision {
-            fs::remove_file(path).map_err(|e| io(e, path))?;
+            nrese_engine::remove_log_segment(path)?;
             removed += 1;
         }
     }
