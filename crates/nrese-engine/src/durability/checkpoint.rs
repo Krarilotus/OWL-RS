@@ -95,6 +95,19 @@ fn checkpoint_path(dir: &Path, revision: u64, extension: &str) -> PathBuf {
     dir.join(format!("checkpoint-{revision:020}.{extension}"))
 }
 
+/// The revision of the checkpoint (or image) file named `name`: `checkpoint-<revision>.nck`,
+/// a plain file name; `None` for any other name.
+pub fn image_revision(name: &str) -> Option<u64> {
+    let stem = name
+        .strip_prefix("checkpoint-")?
+        .strip_suffix(&format!(".{EXTENSION}"))?;
+    // Digits only: `parse` would take a sign.
+    match !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()) {
+        true => stem.parse().ok(),
+        false => None,
+    }
+}
+
 fn list(dir: &Path) -> EngineResult<Vec<(u64, PathBuf)>> {
     let mut found = Vec::new();
     for entry in fs::read_dir(dir)? {
@@ -102,9 +115,7 @@ fn list(dir: &Path) -> EngineResult<Vec<(u64, PathBuf)>> {
         let revision = path
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_prefix("checkpoint-"))
-            .and_then(|rest| rest.strip_suffix(&format!(".{EXTENSION}")))
-            .and_then(|stem| stem.parse::<u64>().ok());
+            .and_then(image_revision);
         if let Some(revision) = revision {
             found.push((revision, path));
         }
