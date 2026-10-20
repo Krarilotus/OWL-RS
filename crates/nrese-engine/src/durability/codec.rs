@@ -97,7 +97,7 @@ pub(crate) enum Frame {
     /// No bytes left.
     End,
     /// The bytes end inside the frame, in its header or the payload it announces: a write
-    /// cut short, or a damaged length field ([`intact_len`] tells).
+    /// cut short, or a damaged length field ([`structural_len`] tells).
     Short,
     /// A complete frame, of this many bytes, whose checksum or payload doesn't check:
     /// damage, or a write that didn't land whole. The caller decides which
@@ -127,13 +127,25 @@ pub(crate) fn decode_frame(bytes: &[u8]) -> Frame {
 }
 
 /// The size of the frame at the start of `bytes` as its payload's own structure delimits
-/// it (`timed`: with the commit time, segments of version 6), if that much is there and it
-/// matches the header's checksum: an intact record, whatever its length field says.
-pub(crate) fn intact_len(bytes: &[u8], timed: bool) -> Option<usize> {
-    let mut header = Reader::new(bytes);
-    let (_, crc) = (header.u32()?, header.u32()?);
-    let payload = &bytes[FRAME_HEADER..];
+/// it (`timed`: with the commit time, segments of version 6), if that much is there (`Err`:
+/// how far the parse got); no checksum: an intact record under a damaged length field has
+/// this size. Its cost is at
+/// most the bytes it covers (each key's length prefix takes 4 of them).
+pub(crate) fn structural_len(bytes: &[u8], timed: bool) -> Result<usize, usize> {
+    let Some(payload) = bytes.get(FRAME_HEADER..) else {
+        return Err(bytes.len());
+    };
     let mut reader = Reader::new(payload);
+    let walked = walk_payload(&mut reader, timed);
+    let used = FRAME_HEADER + payload.len() - reader.remaining();
+    match walked {
+        Some(()) => Ok(used),
+        None => Err(used),
+    }
+}
+
+/// Reads past a payload's fields, without keeping them.
+fn walk_payload(reader: &mut Reader<'_>, timed: bool) -> Option<()> {
     reader.u64()?;
     reader.u64()?;
     for _ in 0..reader.u32()? {
@@ -147,8 +159,7 @@ pub(crate) fn intact_len(bytes: &[u8], timed: bool) -> Option<usize> {
     if timed {
         reader.u64()?;
     }
-    let len = payload.len() - reader.remaining();
-    (crc32fast::hash(&payload[..len]) == crc).then_some(FRAME_HEADER + len)
+    Some(())
 }
 
 fn decode_payload(payload: &[u8]) -> Option<CommitRecord> {

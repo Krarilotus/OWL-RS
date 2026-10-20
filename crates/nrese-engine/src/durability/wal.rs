@@ -23,7 +23,9 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::SyncPolicy;
-use super::codec::{CommitRecord, FRAME_HEADER, Frame, decode_frame, encode_record, intact_len};
+use super::codec::{
+    CommitRecord, FRAME_HEADER, Frame, decode_frame, encode_record, structural_len,
+};
 use super::fault::{self, Step};
 use super::publish::publish_or_fail;
 use super::sidecar;
@@ -172,10 +174,18 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
                     _ => None,
                 };
                 let timed = magic == SEGMENT_MAGIC;
-                // The revision a record after the damage would have at least.
+                // What a record after the damage would have at least: its revision, and its
+                // dictionary start where an earlier record of the segment gives it (the log's
+                // terms are contiguous within a segment; across one, a bulk load may intern).
                 let next = match records.last() {
-                    Some(record) => record.revision + 1,
-                    None => segment_first_revision(path),
+                    Some(record) => Expected {
+                        revision: record.revision + 1,
+                        dictionary: Some(record.dictionary_start + record.keys.len() as u64),
+                    },
+                    None => Expected {
+                        revision: segment_first_revision(path),
+                        dictionary: None,
+                    },
                 };
                 let policy = segment_policy(path);
                 return Ok(SegmentContents {
@@ -200,19 +210,25 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
 /// What `rest`, a segment from its first frame that doesn't decode, is: `damaged` holds
 /// that frame's length if it is complete; `timed`, a version 6 segment; `policy`, the
 /// segment's sync policy if recorded; `next`, the least revision a record after the damage
-/// can have. The rules are the [`super`] module docs'.
+/// can have ([`Expected`]). The rules are the [`super`] module docs'.
 fn classify(
     rest: &[u8],
     damaged: Option<usize>,
     timed: bool,
     policy: Option<SyncPolicy>,
-    next: u64,
+    next: Expected,
 ) -> Tail {
     if rest.iter().all(|&byte| byte == 0) {
         return Tail::Torn;
     }
-    if intact_record_in(rest, next, timed) {
-        return Tail::Corrupt("damage before an intact record".into());
+    match intact_record_in(rest, next, timed, &mut Work::default()) {
+        Search::Found => return Tail::Corrupt("damage before an intact record".into()),
+        Search::Exhausted => {
+            return Tail::Corrupt(
+                "damage too extensive to search for intact records within its budget".into(),
+            );
+        }
+        Search::None => {}
     }
     let Some(len) = damaged else {
         return Tail::Torn;
@@ -231,28 +247,110 @@ fn classify(
     }
 }
 
+/// The least revision and dictionary start a record after damage can have.
+#[derive(Debug, Clone, Copy)]
+struct Expected {
+    revision: u64,
+    /// `None` where no earlier record of the segment gives it.
+    dictionary: Option<u64>,
+}
+
+/// The outcome of [`intact_record_in`].
+#[derive(Debug, PartialEq, Eq)]
+enum Search {
+    /// An intact record of a revision after the damage.
+    Found,
+    /// None anywhere.
+    None,
+    /// The budget ran out first: not known, so recovery refuses.
+    Exhausted,
+}
+
+/// What a search did: offsets looked at, and bytes parsed or checksummed.
+#[derive(Debug, Default)]
+struct Work {
+    offsets: u64,
+    verified: u64,
+}
+
+/// The smallest frame: its header, revision, dictionary start, key count and four counts.
+const SMALLEST: usize = FRAME_HEADER + 8 + 8 + 4 + 4 * 4;
+
+/// Bytes a search may parse and checksum for a damaged tail of `len` bytes.
+fn search_budget(len: usize) -> u64 {
+    4 * len as u64 + (1 << 20)
+}
+
 /// Whether `rest` (a segment from its first frame that doesn't decode) holds an intact
-/// record of revision `next` or later anywhere: acknowledged commits beyond the damage,
-/// whatever damage, holes or damaged lengths come before. Every offset is tried, the record
-/// read by its length field or by its payload's own structure ([`intact_len`]); an offset
-/// whose revision field can't be such a record's is passed over before any checksum. Bytes
-/// of a term that happen to form a checksummed record of a plausible revision would also
-/// count: opening then fails closed, never loses a commit.
-fn intact_record_in(rest: &[u8], next: u64, timed: bool) -> bool {
-    // The smallest frame: its header, revision, dictionary start, key count and four counts.
-    const SMALLEST: usize = FRAME_HEADER + 8 + 8 + 4 + 4 * 4;
-    let latest = next + (rest.len() / SMALLEST) as u64;
-    (0..rest.len().saturating_sub(SMALLEST - 1)).any(|at| {
+/// record after the damage anywhere: acknowledged commits, whatever damage, holes or damaged
+/// lengths come before. Every offset is tried, the record read by its length field or by its
+/// payload's own structure ([`structural_len`]).
+///
+/// Cost, for a tail of n bytes: each offset is first checked in O(1), with no parse and no
+/// checksum. Its revision field must lie in `next.revision ..= next.revision + n / SMALLEST`,
+/// and its dictionary start, where the segment gives one, in `start ..= start + n / 4` (each
+/// key of a later record takes 4 bytes or more). Term ids carry their kind in their high
+/// bits, so in a log's own bytes almost only frame starts pass. An offset that passes is
+/// parsed and checksummed, each byte charged to a budget of 4n + 1 MiB
+/// ([`search_budget`]) before the work is done, and parsed no further than the budget left. The worst case, data crafted so that every offset passes, is
+/// therefore n cheap checks and 4n + 1 MiB of parsing and checksums, linear in the tail.
+/// Once the budget is spent the search gives up ([`Search::Exhausted`]) and recovery refuses
+/// to open: it never truncates what it couldn't search. Bytes of a term that happen to form
+/// a checksummed record of a plausible revision would also count as one: opening then fails
+/// closed, and loses no commit.
+fn intact_record_in(rest: &[u8], next: Expected, timed: bool, work: &mut Work) -> Search {
+    let n = rest.len();
+    let latest = next.revision + (n / SMALLEST) as u64;
+    let dictionary = next
+        .dictionary
+        .map(|start| start..=start.saturating_add((n / 4) as u64));
+    let budget = search_budget(n);
+    let field =
+        |tail: &[u8], at: usize| u64::from_le_bytes(tail[at..at + 8].try_into().expect("8 bytes"));
+    for at in 0..n.saturating_sub(SMALLEST - 1) {
+        work.offsets += 1;
         let tail = &rest[at..];
-        let revision = u64::from_le_bytes(
-            tail[FRAME_HEADER..FRAME_HEADER + 8]
-                .try_into()
-                .expect("8 bytes"),
-        );
-        (next..=latest).contains(&revision)
-            && (matches!(decode_frame(tail), Frame::Record(..))
-                || intact_len(tail, timed).is_some())
-    })
+        if !(next.revision..=latest).contains(&field(tail, FRAME_HEADER))
+            || dictionary
+                .as_ref()
+                .is_some_and(|range| !range.contains(&field(tail, FRAME_HEADER + 8)))
+        {
+            continue;
+        }
+        // By its length field, if that fits: its checksum (and decoding) cost its length.
+        let len = u32::from_le_bytes(tail[..4].try_into().expect("4 bytes")) as usize;
+        if (SMALLEST - FRAME_HEADER..=tail.len() - FRAME_HEADER).contains(&len) {
+            if work.verified + 2 * len as u64 > budget {
+                return Search::Exhausted;
+            }
+            work.verified += 2 * len as u64;
+            if matches!(decode_frame(tail), Frame::Record(..)) {
+                return Search::Found;
+            }
+        }
+        // By its payload's structure (a damaged length field), parsed no further than the
+        // budget left, then checksummed.
+        let room = (budget - work.verified) as usize;
+        let window = &tail[..tail.len().min(FRAME_HEADER + room)];
+        match structural_len(window, timed) {
+            Ok(size) => {
+                if work.verified + 2 * size as u64 > budget {
+                    return Search::Exhausted;
+                }
+                work.verified += 2 * size as u64;
+                let crc = u32::from_le_bytes(tail[4..8].try_into().expect("4 bytes"));
+                if crc32fast::hash(&tail[FRAME_HEADER..size]) == crc {
+                    return Search::Found;
+                }
+            }
+            // The structure runs past the room left: it can't be checked within the budget.
+            Err(parsed) if parsed >= window.len() && window.len() < tail.len() => {
+                return Search::Exhausted;
+            }
+            Err(parsed) => work.verified += parsed as u64,
+        }
+    }
+    Search::None
 }
 
 /// The revision a segment is named after: a lower bound of its records'.
@@ -504,4 +602,80 @@ fn create_segment(
     File::create(&partial)?.write_all(magic)?;
     publish_or_fail(&partial, &path)?;
     Ok(OpenOptions::new().append(true).open(&path)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The evidence search is linear in a damaged tail, never quadratic: for a large tail of
+    /// garbage and for one crafted so that every offset passes the cheap checks, it looks at
+    /// each offset once and parses or checksums at most its budget, giving up (so recovery
+    /// refuses) rather than searching on. And it finds a record behind a large damaged
+    /// stretch within that budget.
+    #[test]
+    fn the_evidence_search_is_bounded_by_its_budget() {
+        let next = Expected {
+            revision: 5,
+            dictionary: Some(100),
+        };
+        let n = 16 << 20;
+        // Garbage: a pseudo-random tail.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let garbage: Vec<u8> = (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        // Crafted: every 8 bytes a plausible length, revision and dictionary start, so that
+        // offsets pass the cheap checks and are verified.
+        let crafted: Vec<u8> = (0..n / 24)
+            .flat_map(|_| {
+                [(n as u32 / 2).to_le_bytes(), 5u32.to_le_bytes()]
+                    .concat()
+                    .into_iter()
+                    .chain(5u64.to_le_bytes())
+                    .chain(100u64.to_le_bytes())
+            })
+            .collect();
+        for (case, tail, expected) in [
+            ("garbage", &garbage, Search::None),
+            ("crafted", &crafted, Search::Exhausted),
+        ] {
+            let mut work = Work::default();
+            assert_eq!(
+                intact_record_in(tail, next, true, &mut work),
+                expected,
+                "{case}"
+            );
+            assert!(work.offsets <= tail.len() as u64, "{case}: {work:?}");
+            assert!(
+                work.verified <= search_budget(tail.len()),
+                "{case}: {work:?}"
+            );
+        }
+        // A record behind 1 MiB of garbage is found, within the budget.
+        let mut record = Vec::new();
+        encode_record(
+            &CommitRecord {
+                revision: 9,
+                dictionary_start: 100,
+                committed_micros: Some(1),
+                ..CommitRecord::default()
+            },
+            &mut record,
+        )
+        .unwrap();
+        let mut tail = garbage[..1 << 20].to_vec();
+        tail.extend_from_slice(&record);
+        let mut work = Work::default();
+        assert_eq!(
+            intact_record_in(&tail, next, true, &mut work),
+            Search::Found
+        );
+        assert!(work.verified <= search_budget(tail.len()), "{work:?}");
+    }
 }
