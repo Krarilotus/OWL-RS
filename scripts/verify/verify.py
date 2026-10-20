@@ -41,14 +41,13 @@ import socket
 import sys
 import time
 import urllib.error
-import urllib.request
 from pathlib import Path
 
 if sys.version_info < (3, 11):
     sys.exit("verify.py needs Python 3.11 or later (tomllib)")
 
 from verifykit import checks, client, jobs, scenario as scenarios, selftest  # noqa: E402
-from verifykit.server import LaunchError, Server, sha256_of  # noqa: E402
+from verifykit.server import DIRECT, LaunchError, Server, sha256_of  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCTOR = ("/healthz", "/readyz", "/version", "/api/v1/repositories")
@@ -71,7 +70,7 @@ def doctor(base: str) -> dict:
     for path in DOCTOR:
         reading = {"status": None}
         try:
-            with urllib.request.urlopen(base + path, timeout=10) as response:
+            with DIRECT.open(base + path, timeout=10) as response:
                 reading["status"], text = response.status, response.read(1 << 20).decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             reading["status"], text = e.code, e.read(1 << 20).decode("utf-8", "replace")
@@ -86,7 +85,8 @@ def doctor(base: str) -> dict:
     version = version if isinstance(version, dict) else {}
     ready = ready if isinstance(ready, dict) else {}
     repos = readings["/api/v1/repositories"].get("body")
-    ids = [r.get("id") for r in repos] if isinstance(repos, list) else f"status {readings['/api/v1/repositories']['status']}"
+    ids = ([r.get("id") for r in repos] if isinstance(repos, list)
+           else f"status {readings['/api/v1/repositories']['status']}")
     line = (f"{version.get('service', '?')} {version.get('version', '?')}, store {version.get('store_mode', '?')}, "
             f"reasoning {version.get('reasoning_mode', '?')}; readyz {ready.get('status', '?')}/"
             f"{ready.get('consistency', '?')}, revision {ready.get('revision', '?')}, "
@@ -208,7 +208,8 @@ def drive(sc: scenarios.Scenario, base: str, server: Server | None, out: Path, e
             continue
         missing = sorted({m for m in scenarios.VAR.findall(repr(step)) if m not in variables})
         if missing:
-            result["failures"] = [f"not run: {', '.join('${' + m + '}' for m in missing)} not captured (an earlier step failed)"]
+            names = ", ".join("${" + m + "}" for m in missing)
+            result["failures"] = [f"not run: {names} not captured (an earlier step failed)"]
             result["record"] = None
             continue
         live = scenarios.substitute(step, variables)
@@ -343,7 +344,8 @@ def target_of(args) -> dict:
         binary = CACHE / f"bin-{args.server_rev[:12]}" / "nrese-server"
         sums = binary.parent / "SHA256SUMS"
         if not binary.is_file() or not sums.is_file():
-            raise LaunchError(f"no build of {args.server_rev[:12]} at {binary.parent} (submit its build job: verify.py jobs)")
+            raise LaunchError(f"no build of {args.server_rev[:12]} at {binary.parent} "
+                              "(submit its build job: verify.py jobs)")
         if sums.read_text().split()[0] != sha256_of(binary):
             raise LaunchError(f"{binary}: its checksum doesn't hold (SHA256SUMS): build it again")
     else:
