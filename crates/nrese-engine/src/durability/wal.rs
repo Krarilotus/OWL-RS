@@ -385,20 +385,44 @@ impl Wal {
     }
 }
 
-/// Moves a segment into `archive` (a copy where a rename can't cross file systems), and
-/// its sidecar with it where it can.
+/// Moves a segment into `archive` (a copy where a rename can't cross file systems), its
+/// sidecar placed there first.
 fn archive_segment(path: &Path, archive: &Path) -> EngineResult<()> {
     let target = archive.join(path.file_name().expect("segment file name"));
+    sidecar::copy(path, &target)?;
     if fs::rename(path, &target).is_err() {
         fs::copy(path, &target)?;
-        File::open(&target)?.sync_all()?;
+        OpenOptions::new().write(true).open(&target)?.sync_all()?;
         fs::remove_file(path)?;
     }
-    if fs::rename(sidecar::path_of(path), sidecar::path_of(&target)).is_err() {
-        sidecar::remove(path);
-    }
+    sidecar::remove(path);
     super::sync_dir(archive)?;
     Ok(())
+}
+
+/// Copies the WAL segment `segment` into `dir` (a restore's `wal/`) and returns its path
+/// there. Its sidecar goes first, then the segment under a temporary name, synced and
+/// renamed: the segment never counts there without the sync policy its recovery reads.
+pub fn copy_log_segment(segment: &Path, dir: &Path) -> EngineResult<PathBuf> {
+    let name = segment.file_name().ok_or_else(|| {
+        EngineError::Configuration(format!("{} is not a segment", segment.display()))
+    })?;
+    let target = dir.join(name);
+    sidecar::copy(segment, &target)?;
+    let mut partial = target.clone().into_os_string();
+    partial.push(".copying");
+    let partial = PathBuf::from(partial);
+    fs::copy(segment, &partial)?;
+    // Synced through a writable handle: Windows flushes no other.
+    OpenOptions::new().write(true).open(&partial)?.sync_all()?;
+    fs::rename(&partial, &target)?;
+    super::sync_dir(dir)?;
+    Ok(target)
+}
+
+/// Removes the WAL segment `segment` (of an archive) and its sidecar.
+pub fn remove_log_segment(segment: &Path) -> EngineResult<()> {
+    remove_segment(segment)
 }
 
 /// A new segment, its sync policy recorded first: a segment that has frames always has it
