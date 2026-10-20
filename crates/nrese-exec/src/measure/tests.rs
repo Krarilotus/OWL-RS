@@ -288,6 +288,55 @@ fn a_measurement_counts_what_was_made_while_it_ran() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// The global pool's threads have started before a measurement on another pool opens:
+/// one starting in it would be counted (its crossbeam-epoch handle, 2,304 bytes, made as
+/// it first looks for work). They are held at their start, after the pool is built (which
+/// waits for each thread's queue) and before that first look, until the measurement has
+/// opened, or for a second if the measurement waits for them first.
+#[test]
+fn the_global_pool_has_started_before_a_measurement_on_another() {
+    use std::time::{Duration, Instant};
+    static OPEN: AtomicBool = AtomicBool::new(false);
+    static STARTED: AtomicUsize = AtomicUsize::new(0);
+    const THREADS: usize = 4;
+    if !alone() {
+        return;
+    }
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(THREADS)
+        .start_handler(|_| {
+            while !OPEN.load(SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            STARTED.fetch_add(1, SeqCst);
+        })
+        .build_global()
+        .unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    pool.broadcast(|_| ());
+    let opener = std::thread::spawn(|| {
+        let since = Instant::now();
+        while ACTIVE.load(SeqCst) == 0 && since.elapsed() < Duration::from_secs(1) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        OPEN.store(true, SeqCst);
+    });
+    let ((), counted) = pool.install(|| {
+        measure(|| {
+            while STARTED.load(SeqCst) < THREADS {
+                spin_loop();
+            }
+            // Past their start, to their first look for work.
+            std::thread::sleep(Duration::from_millis(50));
+        })
+    });
+    opener.join().unwrap();
+    assert_eq!(counted, 0, "global threads started in the measurement");
+}
+
 /// A measured test runs alone under cargo test too when it is ignored, or should panic.
 #[test]
 #[ignore = "runs with --ignored"]
