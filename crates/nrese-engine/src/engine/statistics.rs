@@ -23,7 +23,11 @@
 //!   that waits, slice by slice, each slice alone (no Rayon inside it).
 //!
 //! The sets kept are charged to the budget the engine's owner gives it
-//! ([`Statistics::set_budget`]; none: unlimited), for as long as they are kept.
+//! ([`Statistics::set_budget`]; none: unlimited), for as long as they are kept: built into
+//! charged vectors ([`Gathered::kept`]), so that the charge is what they hold. A rebuild
+//! builds and charges the new sets while the old are still kept, then replaces them: the
+//! budget must hold two copies while a rebuild ends. Where it can't take the new ones, the
+//! old stay, and the next drift tries again; a refusal never leaves fewer sets than before.
 //!
 //! A scan stops once the slices have found more than
 //! [`MAX_SETS`](super::characteristic::MAX_SETS) sets between them.
@@ -36,7 +40,7 @@ use nrese_exec::budget::Budget;
 use nrese_exec::cell::{self, Build, BuildCell, Builder, Claim, Kind, Scan};
 use parking_lot::Mutex;
 
-use super::characteristic::{CharacteristicSets, PairCounts, Partial, SetCount};
+use super::characteristic::{CharacteristicSets, Gathered, PairCounts, Partial, SetCount};
 use super::{ReadModel, Snapshot, Version};
 use crate::quad::{GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
@@ -218,8 +222,9 @@ impl Statistics {
                 let Some((built, at)) = self.load_sets(snapshot, model) else {
                     return Kept::Cold;
                 };
+                // Over the budget: none until the next build (there were none before).
                 vacant.insert(Sets {
-                    built: built.and_then(|sets| self.keep(sets)),
+                    built: built.and_then(|sets| self.keep(sets).ok()),
                     at,
                     rebuilding: false,
                 })
@@ -232,19 +237,15 @@ impl Statistics {
         Kept::Sets(kept.sets())
     }
 
-    /// `sets` charged to the budget, or `None` where it can't take them (planners go on
-    /// without them until the next build).
-    fn keep(&self, sets: Arc<CharacteristicSets>) -> Option<cell::Kept<CharacteristicSets>> {
+    /// `sets` as kept, built into vectors charged to the budget ([`Gathered::kept`]); an
+    /// error, nothing charged, where it can't take them.
+    fn keep(
+        &self,
+        sets: Gathered,
+    ) -> Result<cell::Kept<CharacteristicSets>, nrese_exec::BudgetExceeded> {
         let budget = self.budget.lock().clone();
         let budget = budget.unwrap_or_else(|| Arc::new(Budget::unlimited()));
-        let bytes = sets.heap_bytes();
-        match cell::Kept::charge(sets, bytes, budget) {
-            Ok(kept) => Some(kept),
-            Err(error) => {
-                tracing::warn!(%error, bytes, "characteristic sets not kept: over the budget");
-                None
-            }
-        }
+        cell::Kept::new(sets.kept(&budget)?, budget)
     }
 
     /// Rebuilds the drifted sets of `model` on a thread of its own, scanning on that
@@ -299,10 +300,40 @@ impl Statistics {
             ms = started.elapsed().as_millis() as u64,
             "characteristic sets built"
         );
-        self.save_sets(snapshot, model, size, built.as_deref());
-        let kept = built.and_then(|sets| self.keep(sets));
+        self.save_sets(snapshot, model, size, built.as_ref());
+        // Built and charged while the old sets are still kept, then put in their place.
+        let kept = match built.map(|sets| self.keep(sets)) {
+            Some(Ok(kept)) => Some(kept),
+            // Too many sets: none kept at this size.
+            None => None,
+            // Over the budget: the old sets stay (none if there were none); the next
+            // drift tries again.
+            Some(Err(error)) => {
+                tracing::warn!(%error, ?model, "characteristic sets not replaced: over the budget");
+                let mut sets = self.sets.lock();
+                let old = match sets.get_mut(&model) {
+                    Some(old) => {
+                        old.rebuilding = false;
+                        old.sets()
+                    }
+                    None => {
+                        sets.insert(
+                            model,
+                            Sets {
+                                built: None,
+                                at: size,
+                                rebuilding: false,
+                            },
+                        );
+                        None
+                    }
+                };
+                builder.finish(old.clone());
+                return old;
+            }
+        };
         let built = kept.as_ref().map(|kept| Arc::clone(kept.value()));
-        self.sets.lock().insert(
+        let replaced = self.sets.lock().insert(
             model,
             Sets {
                 built: kept,
@@ -310,8 +341,20 @@ impl Statistics {
                 rebuilding: false,
             },
         );
+        // The old sets let go after the swap, outside the lock.
+        drop(replaced);
         builder.finish(built.clone());
         built
+    }
+
+    /// What the sets of `model` kept are charged (their vectors' and their `Arc`'s).
+    #[cfg(test)]
+    fn charged(&self, model: ReadModel) -> usize {
+        self.sets
+            .lock()
+            .get(&model)
+            .and_then(|s| s.built.as_ref())
+            .map_or(0, |kept| kept.bytes() + kept.value().charged())
     }
 
     /// Scans of the store for the characteristic sets begun so far.
@@ -330,7 +373,7 @@ impl Statistics {
         snapshot: &Snapshot,
         model: ReadModel,
         every_core: bool,
-    ) -> Option<Arc<CharacteristicSets>> {
+    ) -> Option<Gathered> {
         let ranges: Arc<[(TermId, TermId)]> = subject_ranges(
             snapshot.dictionary_len(),
             rayon::current_num_threads() as u64 * 4,
@@ -368,20 +411,18 @@ impl Statistics {
             parts.publish_on(build);
             hook(build);
         }
-        let mut sets = CharacteristicSets::merge(parts.run(build, lanes, every_core)?)?;
+        let mut sets = Gathered::merge(parts.run(build, lanes, every_core)?)?;
         // The pairs need each subject's set first: a second scan.
         let subjects: Arc<[(u64, u32)]> = sets.take_subjects().into();
         if subjects.is_empty() {
-            return Some(Arc::new(sets));
+            return Some(sets);
         }
         let snapshot = snapshot.clone();
         let pairs: Arc<Scan<PairCounts>> = Scan::new(ranges.len(), move |i| {
             slice(&snapshot, model, &ranges, i)
-                .and_then(|quads| CharacteristicSets::pair_counts(&subjects, quads))
+                .and_then(|quads| Gathered::pair_counts(&subjects, quads))
         });
-        Some(Arc::new(
-            sets.with_pair_counts(pairs.run(build, lanes, every_core)),
-        ))
+        Some(sets.with_pair_counts(pairs.run(build, lanes, every_core)))
     }
 
     /// Where the derived files are (a durable engine's `derived/`).
@@ -393,13 +434,7 @@ impl Statistics {
         format!("statistics-{model:?}").to_ascii_lowercase()
     }
 
-    fn save_sets(
-        &self,
-        snapshot: &Snapshot,
-        model: ReadModel,
-        size: u64,
-        sets: Option<&CharacteristicSets>,
-    ) {
+    fn save_sets(&self, snapshot: &Snapshot, model: ReadModel, size: u64, sets: Option<&Gathered>) {
         let Some(dir) = self.dir.lock().clone() else {
             return;
         };
@@ -425,11 +460,7 @@ impl Statistics {
 
     /// The sets of `model` saved for this dictionary: (`None` if there were too many to
     /// keep, the size they were built at).
-    fn load_sets(
-        &self,
-        snapshot: &Snapshot,
-        model: ReadModel,
-    ) -> Option<(Option<Arc<CharacteristicSets>>, u64)> {
+    fn load_sets(&self, snapshot: &Snapshot, model: ReadModel) -> Option<(Option<Gathered>, u64)> {
         let dir = self.dir.lock().clone()?;
         let dictionary = snapshot.dictionary();
         let (_, loaded) = crate::term::derived::load(&dir, &Self::sets_name(model), |covered| {
@@ -439,7 +470,7 @@ impl Statistics {
         let size = reader.u64()?;
         let sets = match reader.u32()? {
             0 => None,
-            _ => Some(Arc::new(CharacteristicSets::read(&mut reader)?)),
+            _ => Some(Gathered::read(&mut reader)?),
         };
         Some((sets, size))
     }
@@ -564,7 +595,7 @@ mod tests {
             .expect("the planners finished");
         assert!(same(&during, &first));
         assert_eq!(statistics.scans(), 1);
-        assert_eq!(budget.used(), first.heap_bytes());
+        assert_eq!(budget.used(), statistics.charged(model));
         assert!(same(&planners(&workers, &snapshot), &first));
         // Drifted, the rebuild held back: every planner has the old sets, none waits.
         add(&engine, 3_000..6_000);
@@ -589,9 +620,87 @@ mod tests {
         let rebuilt = snapshot.characteristic_sets_in(model).expect("rebuilt");
         assert!(!Arc::ptr_eq(&rebuilt, &first));
         assert_eq!(rebuilt.subjects(), 6_000);
-        assert_eq!(budget.used(), rebuilt.heap_bytes());
+        // The old sets' vectors stay charged while anyone holds them: here, until now.
+        drop((first, during));
+        assert_eq!(budget.used(), statistics.charged(model));
         assert!(same(&planners(&workers, &snapshot), &rebuilt));
         assert_eq!(statistics.scans(), 2);
+    }
+
+    /// A rebuild of the same sets under a budget that holds one copy keeps the old ones,
+    /// charged as before; one that holds two replaces them, and the old ones' charge goes
+    /// with them. Sol's review of 6c683347: the rebuild that didn't fit dropped the kept sets
+    /// and left none (and nothing charged).
+    #[test]
+    fn a_rebuild_the_budget_cannot_take_keeps_the_old_sets() {
+        let model = ReadModel::default();
+        let engine = |budget: &Arc<Budget>| {
+            let engine = Engine::new(EngineConfig::default()).unwrap();
+            add(&engine, 0..300);
+            engine.charge_statistics_to(Arc::clone(budget));
+            engine.prepare_statistics();
+            engine
+        };
+        let unlimited = Arc::new(Budget::unlimited());
+        let _measured = engine(&unlimited);
+        let one = unlimited.used();
+        assert!(one > 0);
+        for (copies, replaced) in [(1, false), (2, true)] {
+            let budget = Arc::new(Budget::new(copies * one));
+            let engine = engine(&budget);
+            let first = engine
+                .snapshot()
+                .characteristic_sets_in(model)
+                .expect("kept");
+            engine.prepare_statistics();
+            let after = engine
+                .snapshot()
+                .characteristic_sets_in(model)
+                .expect("still kept after the rebuild");
+            assert_eq!(!Arc::ptr_eq(&first, &after), replaced, "{copies} copies");
+            // Replaced, the old sets' vectors stay charged while anyone holds them.
+            drop(first);
+            assert_eq!(budget.used(), one, "{copies} copies");
+        }
+    }
+
+    /// What the kept sets hold is what they are charged, at any number of predicates: they
+    /// are built into charged vectors, and their `Arc`'s block is charged before it is
+    /// allocated. Sol's review of 6c683347: a charge estimated from the maps' capacities,
+    /// and the `Arc` charged after it was allocated, left 81,968 bytes uncharged at 4,096
+    /// predicates.
+    #[test]
+    fn kept_sets_hold_no_more_than_they_charge() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        for predicates in [16u64, 256, 4096] {
+            let statistics = Statistics::default();
+            let budget = Arc::new(Budget::unlimited());
+            statistics.set_budget(Arc::clone(&budget));
+            // A chain over `predicates` subjects, each with a predicate of its own: as many
+            // sets as predicates, and as many pairs.
+            let id = |raw| TermId::from_raw(raw);
+            let quads: Vec<crate::quad::EncodedQuad> = (0..predicates)
+                .map(|i| {
+                    let (s, o) = (id(1 + i), id(1 + (i + 1) % predicates));
+                    crate::quad::EncodedQuad::new(s, id(1_000_000 + i), o, TermId::DEFAULT_GRAPH)
+                })
+                .collect();
+            let gathered = Gathered::build(quads.clone().into_iter())
+                .unwrap()
+                .with_pairs(quads.into_iter());
+            let (kept, excess) =
+                nrese_exec::measure::measure_within(&budget, || statistics.keep(gathered).unwrap());
+            assert_eq!(kept.value().len(), predicates as usize);
+            assert!(kept.value().has_pairs());
+            assert_eq!(
+                excess, 0,
+                "{predicates} predicates: {excess} bytes beyond the charge"
+            );
+            drop(kept);
+            assert_eq!(budget.used(), 0);
+        }
     }
 
     /// A slice that panics on a lane leaves no build stuck: the lane goes on with the queue,

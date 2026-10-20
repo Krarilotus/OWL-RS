@@ -29,6 +29,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The unit tests' counting allocator (src/lib.rs): what the statistics keep is what they
+# charge.
+nrese-exec = { path = "../nrese-exec", features = ["measure"] }
 
 [lints]
 workspace = true
