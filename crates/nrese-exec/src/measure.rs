@@ -4,7 +4,9 @@
 //! budget. An allocation that wasn't reserved first, or a charge released while its memory
 //! lives, fails the test instead of needing a review, wherever in the operation it happens.
 //! Test-only: built for this crate's tests and with the `measure` feature, which test
-//! builds of other crates turn on; product builds have none of it.
+//! builds of other crates turn on; product builds have none of it. In a binary whose
+//! global allocator isn't [`Measured`], [`measure`], [`measure_within`] and [`alone`]
+//! panic, naming it: there a measurement would count nothing and pass.
 //!
 //! # What a measurement counts
 //!
@@ -94,7 +96,8 @@
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 
 use crate::Budget;
 
@@ -179,6 +182,25 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Held while a measurement starts: starts publish their generations in order.
 static STARTING: AtomicBool = AtomicBool::new(false);
+/// Whether [`Measured`] has allocated: it is the process's global allocator.
+static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Panics unless [`Measured`] is the process's global allocator: without it a measurement
+/// counts nothing, and passes whatever the work holds.
+fn require_measured() {
+    if !INSTALLED.load(Relaxed) {
+        // Made by the process's allocator: Measured, which records it, if it is that.
+        drop(std::hint::black_box(Box::new(0u8)));
+    }
+    assert!(
+        INSTALLED.load(Relaxed),
+        "a measurement needs nrese_exec::measure::Measured as this test binary's global \
+         allocator, or it counts nothing and passes: add `#[global_allocator] static \
+         MEASURED: nrese_exec::measure::Measured<std::alloc::System> = \
+         nrese_exec::measure::Measured(std::alloc::System);` to the binary (a crate's unit \
+         tests are one binary, each file in tests/ another)"
+    );
+}
 
 /// The generation a block or reservation made now records.
 pub(crate) fn tag() -> u64 {
@@ -231,6 +253,9 @@ thread_local! {
 /// while its thread aligns rayon's queue, whose blocks record 0, before every measurement,
 /// so that none counts their allocation or their free.
 fn block_tag(size: usize) -> (u64, bool) {
+    if !INSTALLED.load(Relaxed) {
+        INSTALLED.store(true, Relaxed);
+    }
     match UNCOUNTED.try_with(std::cell::Cell::get) {
         Ok(Some(bytes)) => {
             UNCOUNTED.set(Some(bytes.saturating_add(size)));
@@ -433,6 +458,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
 ///   global pool from outside more often, or a pool of its own from outside, still
 ///   allocates such blocks: one per 63 entries.
 fn prepare() {
+    require_measured();
     // Under Miri, which checks what the work does to memory and not what it counts (and
     // rejects parking_lot's futex call), there is nothing to prepare.
     if cfg!(miri) {
@@ -595,6 +621,7 @@ fn alone_args(test: &str) -> [&str; 5] {
 /// is running long, allocating into the measurement (594 bytes counted, 20 Oct, a guard
 /// slowed past a minute by a loaded machine). On the main thread nothing else runs.
 pub fn alone() -> bool {
+    require_measured();
     // Miri can't start a process; it runs the tests it is given one at a time.
     if cfg!(miri) {
         return true;
