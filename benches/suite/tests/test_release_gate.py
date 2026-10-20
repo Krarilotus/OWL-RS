@@ -416,6 +416,39 @@ class Memory(unittest.TestCase):
         self.assertGreater(unresolved["p"], 0.045)
 
 
+class Evidence(unittest.TestCase):
+    def test_a_declared_hypothesis_without_candidate_evidence_fails_closed(self):
+        """Sol, 20 Oct 2026: with the baseline's memory reading and none from the candidate, the
+        hypothesis went untested and the gate passed a confirmed loss. A reading lost on the
+        candidate blocks; a baseline without the metric is stated, not missing."""
+        dims = ("time/q01", "time/q06", "memory/anon_kernel")
+        family = [f"{s}|lab-olympics|{d}" for s in ("base", "main") for d in dims]
+        rows = [  # case, the baseline's reading, the candidate's per pass n, the declared family's extra
+            ("complete", 1_000_000, lambda n: 2_000_000, []),
+            ("absent", 1_000_000, lambda n: None, []),
+            ("partial", 1_000_000, lambda n: None if n % 3 == 0 else 2_000_000, []),
+            ("unsupported by the baseline", None, lambda n: 2_000_000, []),
+            ("declared, never measured", 1_000_000, lambda n: 1_000_000, ["base|lab-olympics|time/q99"]),
+        ]
+        out = {}
+        for name, base_anon, cand_anon, extra in rows:
+            def records_of(side, n, base_anon=base_anon, cand_anon=cand_anon):
+                anon = cand_anon(n) if side == "cand" else base_anon
+                return [record(samples={"q01": [10.0, 10.1, 9.9], "q06": [4.8, 4.85, 4.8]}, anon=anon)]
+            s = run_gate(passes(records_of, blocks=4), family=family + extra)
+            memory = "base|lab-olympics|memory/anon_kernel"
+            out[name] = (memory in s["pvalues"], any("memory/anon_kernel" in b for b in s["blocking"]),
+                         any("no evidence from the candidate" in e for e in s["errors"]),
+                         "unsupported" in s["not_compared"].get(memory, ""))
+        self.assertEqual(out, {
+            "complete": (True, False, False, False),
+            "absent": (False, True, False, False),
+            "partial": (False, True, False, False),
+            "unsupported by the baseline": (False, False, False, True),
+            "declared, never measured": (True, False, True, False),
+        })
+
+
 class Parts(unittest.TestCase):
     def test_plan_never_lowers_a_cap(self):
         catalog = [{"name": "small", "cap_gb": 4}, {"name": "bsbm-bi-100m", "cap_gb": 28},

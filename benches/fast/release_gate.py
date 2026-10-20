@@ -352,9 +352,11 @@ def quantum(sides: list[list[list[float]]]) -> float:
 
 def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], floor: dict | None = None) -> dict:
     """The candidate's case against one baseline's, dimension by dimension, by blocks; `floor`:
-    the case's A-A' noise floor on this host, per dimension (read_floor())."""
+    the case's A-A' noise floor on this host, per dimension (read_floor()). `not_compared`: each
+    dimension deliberately not tested, with its reason (one this baseline doesn't support, or one
+    whose loss of evidence blocks); gate() holds every other untested hypothesis an error."""
     floor = floor or {}
-    row = {"comparable": True, "dimensions": {}, "notes": [], "blocks": [], "reported": {}}
+    row = {"comparable": True, "dimensions": {}, "notes": [], "blocks": [], "reported": {}, "not_compared": {}}
     base_state = state(base, off_route_ok=True)
     if state(base) == "known" and state(cand) == "known":
         return {**row, "comparable": False, "reason": "a known issue on both sides (no timing verdict)"}
@@ -378,8 +380,10 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], f
         excluded.add(q)
         if q in checked_queries:
             row["notes"].append(f"{text}: the candidate's match its pinned answer; {side}'s time not compared")
+            row["not_compared"][f"time/{q}"] = f"answers differ from {side}'s; the candidate's match the pinned ones"
         else:
             row["blocks"].append(f"{text}: answers differ and no check pins them")
+            row["not_compared"][f"time/{q}"] = "answers differ (blocks)"
     layouts = {b: l for e in (cand, base) for b, l in zip(e["blocks"], e["layouts"])}
     bb, cb = base["blocks"], cand["blocks"]
 
@@ -399,9 +403,11 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], f
         on_base = all(s in rep for rep in base[key])
         if not on_cand and on_base:
             row["blocks"].append(f"time/{s}: lost (on {side}, not on every pass of the candidate)")
+            row["not_compared"][f"time/{s}"] = "lost on the candidate (blocks)"
             continue
         if not on_base:
             row["notes"].append(f"time/{s}: not on every pass of {side}, not compared")
+            row["not_compared"][f"time/{s}"] = f"not on every pass of {side} (unsupported by this baseline)"
             continue
         k = min(cand["batched"].get(s, 1), base["batched"].get(s, 1))
         step = max(COUNTER_STEP["ms"] / k, quantum([per_pass(base[key], s), per_pass(cand[key], s)]))
@@ -412,19 +418,33 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], f
     # kernel memory (Linux: its cgroup's anon + kernel, sampled; the file cache left out) and the
     # perf lab's peak live requested bytes; the process's own peak (VmHWM on Linux, peak private
     # commit on Windows: its kind is named) and the phases' are reported, as is the cgroup's.
+    # A baseline that reports none doesn't support it (an older perf lab, another system): stated.
+    # The candidate must then report it on every pass: a reading lost on the candidate blocks
+    # (Sol, 20 Oct 2026: it left the hypothesis untested and the gate passed a confirmed loss).
     for name, field in (("memory/anon_kernel", "anon_kernel"), ("memory/live", "live")):
-        if any(v is not None for v in base[field]) and any(v is not None for v in cand[field]):
+        on_base = [v is not None for v in base[field]]
+        on_cand = [v is not None for v in cand[field]]
+        if not any(on_base):
+            row["not_compared"][name] = f"{side} reports none (unsupported by this baseline)"
+            if any(on_cand):
+                row["notes"].append(f"{name}: {side} reports none, not compared")
+        elif not all(on_cand):
+            where = "on no pass" if not any(on_cand) else f"on {sum(on_cand)} of {len(on_cand)} passes"
+            row["blocks"].append(f"{name}: the candidate reports it {where}, {side} does (its evidence lost)")
+            row["not_compared"][name] = "missing on the candidate (blocks)"
+        else:
             judge_key(name, field, "bytes")
-        elif any(v is not None for v in cand[field]):
-            row["notes"].append(f"{name}: {side} reports none, not compared")
     kinds = sorted(cand["kinds"] | base["kinds"]) or ["vmhwm"]
     for name, key_, unit, higher in (("qps", "qps", "qps", True),):
         for k in sorted({k for rep in cand[key_] + base[key_] for k in rep}):
             on_cand, on_base = (all(k in rep for rep in e[key_]) for e in (cand, base))
             if on_base and not on_cand:
                 row["blocks"].append(f"{name}/{k}: lost (on {side}, not on every pass of the candidate)")
+                row["not_compared"][f"{name}/{k}"] = "lost on the candidate (blocks)"
             elif on_base:
                 judge_key(f"{name}/{k}", key_, unit, higher, sub=k)
+            else:
+                row["not_compared"][f"{name}/{k}"] = f"not on every pass of {side} (unsupported by this baseline)"
     reported = {}
     if any(base["lifetime"]) and any(cand["lifetime"]):
         reported[f"memory/{'+'.join(kinds)}"] = dimension(per_pass(base["lifetime"]), bb, per_pass(cand["lifetime"]),
@@ -786,6 +806,21 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                     summary["flagged"].append({"side": side, "case": case, "dimension": d,
                                                **{k: r.get(k) for k in ("p", "ratio", "ci", "units", "blocks", "unit")}})
     summary["untested"] = sorted(set(declared) - set(summary["pvalues"]))
+    # Fail closed: a declared hypothesis of a case this round ran that has no test and no stated
+    # reason (the candidate failing the case, a baseline that can't run it or doesn't support the
+    # metric, evidence lost on the candidate, which blocks) has lost its candidate evidence.
+    summary["not_compared"] = {}
+    for h in summary["untested"]:
+        side, case, d = h.split("|", 2)
+        row = summary["comparisons"].get(side, {}).get(case)
+        if case not in planned or case in summary["candidate_failures"] or side not in sides:
+            continue
+        if row is not None and not row["comparable"]:
+            summary["not_compared"][h] = row.get("reason", "not comparable")
+        elif row is not None and d in row["not_compared"]:
+            summary["not_compared"][h] = row["not_compared"][d]
+        else:
+            summary["errors"].append(f"{h}: declared, but no evidence from the candidate and no reason")
     summary["other_blocking"] = list(summary["blocking"])
     summary["counts"] = {side: dict(Counter(r["status"] for row in rows.values() for r in row["dimensions"].values()))
                          for side, rows in summary["comparisons"].items()}
