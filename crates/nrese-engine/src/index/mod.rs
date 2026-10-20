@@ -550,6 +550,9 @@ impl IndexVersion {
 /// (`engine::equality`), which the view then holds. Builders take it as a type parameter:
 /// the store's path is compiled with [`Uncharged`], whose calls inline to nothing.
 pub(crate) trait Charge {
+    /// Whether it counts anything: a builder that holds its memory to its charge may
+    /// build otherwise where it does (resolved when compiled: nothing on the store's path).
+    const COUNTED: bool;
     fn reserve(&mut self, bytes: usize) -> Result<(), BudgetExceeded>;
     fn release(&mut self, bytes: usize);
 }
@@ -558,6 +561,8 @@ pub(crate) trait Charge {
 pub(crate) struct Uncharged;
 
 impl Charge for Uncharged {
+    const COUNTED: bool = false;
+
     #[inline(always)]
     fn reserve(&mut self, _: usize) -> Result<(), BudgetExceeded> {
         Ok(())
@@ -568,6 +573,8 @@ impl Charge for Uncharged {
 }
 
 impl Charge for Reservation {
+    const COUNTED: bool = true;
+
     fn reserve(&mut self, bytes: usize) -> Result<(), BudgetExceeded> {
         self.charge(bytes)
     }
