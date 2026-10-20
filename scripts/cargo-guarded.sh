@@ -95,7 +95,7 @@ case "${1:-}" in
 esac
 
 # Measuring walks the directory, so it is done at most every ten minutes.
-now=$(date +%s)
+now=$EPOCHSECONDS
 last=$(cat "$STAMP" 2>/dev/null || printf 0)
 if [ $((now - last)) -ge 600 ]; then
   shrink
@@ -129,7 +129,8 @@ export_target_cpu_rustflags
 # The job is named after this process (memory-cap.ps1), capped or not, and listed for the main
 # PC's guard (~/owlrs-guard/jobs): a process of this build the guard stops is named with the job,
 # whatever became of its parents, so the build can say so (below).
-GUARD_DIR=$(dirname "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}")
+GUARD_DIR=${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}
+GUARD_DIR=${GUARD_DIR%/*}
 JOB=""
 ticket="" slot="" registered=""
 cleanup() { rm -f "$ticket" "$registered"; [ -z "$slot" ] || rm -rf "$slot"; }
@@ -141,8 +142,19 @@ fi
 if [ -r "/proc/$$/winpid" ] && command -v powershell >/dev/null 2>&1; then
   registry=""
   [ -d "$GUARD_DIR" ] && registry=$(cygpath -w "$GUARD_DIR/jobs")
-  if JOB=$(powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$ROOT/scripts/lib/memory-cap.ps1")" \
-      -ProcessId "$(cat "/proc/$$/winpid")" -LimitGB "${NRESE_MEMORY_CAP_GB:-0}" ${registry:+-Registry "$registry"} | tr -d '\r'); then
+  # memory-cap.ps1's program, compiled once per version of it into Windows' temporary directory,
+  # Git Bash's /tmp: no PowerShell at every build (Sol, 20 Oct 2026: seconds per call).
+  read -r winpid < "/proc/$$/winpid"
+  read -r sum _ < <(sha256sum "$ROOT/scripts/lib/memory-cap.ps1")
+  cap_exe="/tmp/nrese-memory-cap/memory-cap-${sum:0:12}.exe"
+  if [ -x "$cap_exe" ]; then
+    cap=("$cap_exe" "$winpid" "${NRESE_MEMORY_CAP_GB:-0}" ${registry:+"$registry"})
+  else
+    cap=(powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$ROOT/scripts/lib/memory-cap.ps1")"
+      -ProcessId "$winpid" -LimitGB "${NRESE_MEMORY_CAP_GB:-0}" ${registry:+-Registry "$registry"})
+  fi
+  if JOB=$("${cap[@]}"); then
+    JOB=${JOB%$'\r'}
     [ -z "$registry" ] || registered="$GUARD_DIR/jobs/$JOB"
   else
     JOB=""
@@ -186,7 +198,7 @@ fi
 ADMIT="${NRESE_BUILD_SLOT_DIR:-$HOME/.nrese-build-slots}"
 SLOTS="${NRESE_BUILD_SLOTS:-3}"
 BUSY="${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}"
-if [ -d "$(dirname "$BUSY")" ]; then floor_default=16; else floor_default=0; fi
+if [ -d "${BUSY%/*}" ]; then floor_default=16; else floor_default=0; fi
 FLOOR_MB=$(( ${NRESE_BUILD_FLOOR_GB:-$floor_default} * 1024 ))
 per_job_mb=614
 previous=""
@@ -203,16 +215,31 @@ peak_of() {
 }
 # Memory (MiB): the machine's, and free now (Linux's MemAvailable; Windows' free physical memory,
 # Git Bash's MemFree, the guard's reading).
-total_mb() { awk '/^MemTotal:/ { print int($2 / 1024) }' "${NRESE_MEMINFO:-/proc/meminfo}"; }
-free_mb() {
-  awk '/^MemAvailable:/ { a = $2 } /^MemFree:/ { f = $2 } END { print int((a ? a : f) / 1024) }' \
-    "${NRESE_MEMINFO:-/proc/meminfo}"
+# (Read with builtins: a fork costs tens of milliseconds under Git Bash.)
+read_memory() {
+  local key value available="" free=""
+  while read -r key value _; do
+    case $key in
+      MemTotal:) TOTAL_MB=$((value / 1024)) ;;
+      MemAvailable:) available=$((value / 1024)) ;;
+      MemFree:) free=$((value / 1024)) ;;
+    esac
+  done < "${NRESE_MEMINFO:-/proc/meminfo}"
+  FREE_MB=${available:-$free}
 }
 # A process's identity, <pid>@<start time>; nothing for one that doesn't run.
-identity_of() { awk -v p="$1" '{ print p "@" $22 }' "/proc/$1/stat" 2> /dev/null || true; }
+identity_of() {
+  local stat
+  { read -r -a stat < "/proc/$1/stat"; } 2> /dev/null && printf '%s@%s\n' "$1" "${stat[21]}"
+  return 0
+}
 # Whether the process an identity names still runs: the same pid, started at the same time.
-holds() { [ -n "$1" ] && [ "$(identity_of "${1%@*}")" = "$1" ]; }
-ME=$(identity_of $$)
+holds() {
+  local stat
+  [ -n "$1" ] && { read -r -a stat < "/proc/${1%@*}/stat"; } 2> /dev/null && [ "${1%@*}@${stat[21]}" = "$1" ]
+}
+read -r -a stat < "/proc/$$/stat"
+ME="$$@${stat[21]}"
 # This build's name in the guard's notices: its job's (Windows), else after its identity.
 [ -n "$JOB" ] || JOB="nrese-build-${ME/@/-}"
 export NRESE_BUILD_JOB=$JOB
@@ -232,13 +259,14 @@ unlock_admission() { rm -rf "$ADMIT/.lock"; }
 
 if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
   least=$(peak_of "${jobs_given:-2}")
-  if [ "$least" -gt $(( $(total_mb) - FLOOR_MB )) ]; then
+  read_memory
+  if [ "$least" -gt $(( TOTAL_MB - FLOOR_MB )) ]; then
     printf 'cargo %s: it may peak at %s GB, more than this machine can ever give it (%s GB less a %s GB floor): refused\n' \
-      "$*" "$((least / 1024))" "$(( $(total_mb) / 1024 ))" "$((FLOOR_MB / 1024))" >&2
+      "$*" "$((least / 1024))" "$(( TOTAL_MB / 1024 ))" "$((FLOOR_MB / 1024))" >&2
     exit 2
   fi
   mkdir -p "$ADMIT/queue" "$ADMIT/run"
-  ticket="$ADMIT/queue/$(date +%s%N)-$ME"
+  ticket="$ADMIT/queue/${EPOCHREALTIME/[.,]/}000-$ME"
   printf '%s cargo %s\n' "$ROOT" "$*" > "$ticket"
   waited=0 said=-60 limit="${NRESE_BUILD_SLOT_WAIT_S:-3600}"
   while :; do
@@ -249,9 +277,10 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
     for t in "$ADMIT"/queue/*; do if [[ -e "$t" && "$t" < "$ticket" ]]; then place=$((place + 1)); fi; done
     running=0 others=0
     for r in "$ADMIT"/run/*; do
-      if [ -e "$r/peak" ]; then running=$((running + 1)); others=$((others + $(cat "$r/peak"))); fi
+      if [ -e "$r/peak" ]; then read -r held < "$r/peak"; running=$((running + 1)); others=$((others + held)); fi
     done
-    room=$(( $(free_mb) - FLOOR_MB - others ))
+    read_memory
+    room=$(( FREE_MB - FLOOR_MB - others ))
     peak=$(peak_of "$CARGO_BUILD_JOBS")
     why=""
     if [ -f "$BUSY" ]; then
@@ -323,7 +352,7 @@ guard_notices() {
       }
     }' "$killed" 2> /dev/null || true
 }
-started=$(date +%s)
+started=$EPOCHSECONDS
 set +e
 if command -v nice >/dev/null 2>&1; then
   nice -n 15 cargo "$@"
