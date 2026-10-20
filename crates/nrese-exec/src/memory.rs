@@ -512,7 +512,8 @@ fn left(limits: impl IntoIterator<Item = Option<(u64, u64)>>) -> Option<u64> {
 
 /// The memory a Linux process could still take, from `/proc/meminfo`'s text and its cgroup
 /// membership (`/proc/self/cgroup`'s): the least of the machine's `MemAvailable` and what
-/// its cgroups leave ([`cgroup::left`]). `read` reads a file's text.
+/// its cgroups leave ([`cgroup::left`]); `None` where a cgroup's reading makes no sense, not
+/// the machine's alone. `read` reads a file's text.
 #[cfg(any(target_os = "linux", test))]
 fn linux_remaining(
     meminfo: Option<&str>,
@@ -526,13 +527,18 @@ fn linux_remaining(
         let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
         Some(kib * 1024)
     });
-    least([machine, own.and_then(|own| cgroup::left(own, read))])
+    let groups = match own {
+        Some(own) => cgroup::left(own, read)?,
+        None => None,
+    };
+    least([machine, groups])
 }
 
 /// The memory limit a Linux process runs under, from its cgroup membership: cgroup v2 (a
 /// `0::/path` line) reads `memory.max` in the process's group and every ancestor's, v1 (a
-/// line naming the `memory` controller) `memory.limit_in_bytes`; the smallest counts. "max"
-/// and v1's page-aligned maximum mean no limit. `read` reads a file's text.
+/// line naming the `memory` controller) `memory.limit_in_bytes`; the smallest counts. "max",
+/// v1's page-aligned maximum and a group without the file mean no limit; 0 is a limit of
+/// nothing. `read` reads a file's text.
 #[cfg(any(target_os = "linux", test))]
 mod cgroup {
     /// Above this a limit means "none".
@@ -562,13 +568,14 @@ mod cgroup {
     };
 
     /// `each` of the process's memory group and its ancestors that has a limit, innermost
-    /// first: its directory and its limit.
+    /// first: its directory and its limit; `each` returns `None` where it can't read what it
+    /// needs. `None`: a limit, or what `each` read, that makes no sense.
     fn limited(
         own: &str,
         read: &impl Fn(&str) -> Option<String>,
-        mut each: impl FnMut(&Files, &str, u64),
+        mut each: impl FnMut(&Files, &str, u64) -> Option<()>,
     ) -> Option<()> {
-        let (files, path) = own.lines().find_map(|line| {
+        let Some((files, path)) = own.lines().find_map(|line| {
             let mut fields = line.splitn(3, ':');
             let (_, controllers, path) = (fields.next()?, fields.next()?, fields.next()?);
             if controllers.is_empty() {
@@ -578,14 +585,19 @@ mod cgroup {
             } else {
                 None
             }
-        })?;
+        }) else {
+            return Some(());
+        };
         let mut dir = format!("{}{}", files.root, path.trim().trim_end_matches('/'));
         loop {
-            if let Some(limit) = read(&format!("{dir}/{}", files.limit))
-                .and_then(|text| text.trim().parse::<u64>().ok())
-                .filter(|&value| value > 0 && value < NONE_ABOVE)
-            {
-                each(files, &dir, limit);
+            if let Some(text) = read(&format!("{dir}/{}", files.limit)) {
+                let text = text.trim();
+                if text != "max" {
+                    let limit: u64 = text.parse().ok()?;
+                    if limit < NONE_ABOVE {
+                        each(files, &dir, limit)?;
+                    }
+                }
             }
             if dir.len() == files.root.len() {
                 return Some(());
@@ -598,22 +610,22 @@ mod cgroup {
         let mut smallest = None;
         limited(own, &read, |_, _, limit| {
             smallest = super::least([smallest, Some(limit)]);
-        });
+            Some(())
+        })?;
         smallest
     }
 
     /// What the process's groups leave of their limits: the least of each limit less the
     /// group's use, its inactive file pages not counted. Those are page cache the kernel
     /// reclaims before it refuses memory, the store's mapped files among them (counted,
-    /// a store mapping its checkpoint would leave nothing); its active ones count.
-    pub fn left(own: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64> {
+    /// a store mapping its checkpoint would leave nothing); its active ones count. `Some(None)`:
+    /// no group has a limit; `None`: a group has one but its use can't be read, or a limit
+    /// makes no sense, so what is left isn't known.
+    pub fn left(own: &str, read: impl Fn(&str) -> Option<String>) -> Option<Option<u64>> {
         let mut least = None;
         limited(own, &read, |files, dir, limit| {
             let number = |text: &str| text.trim().parse::<u64>().ok();
-            let Some(usage) = read(&format!("{dir}/{}", files.usage)).and_then(|t| number(&t))
-            else {
-                return;
-            };
+            let usage = number(&read(&format!("{dir}/{}", files.usage))?)?;
             let inactive = read(&format!("{dir}/memory.stat"))
                 .and_then(|stat| {
                     stat.lines().find_map(|line| {
@@ -624,8 +636,9 @@ mod cgroup {
                 .unwrap_or(0);
             let used = usage.saturating_sub(inactive);
             least = super::least([least, Some(limit.saturating_sub(used))]);
-        });
-        least
+            Some(())
+        })?;
+        Some(least)
     }
 }
 
@@ -719,6 +732,15 @@ mod tests {
                 "/sys/fs/cgroup/memory/docker/abc/memory.stat",
                 format!("inactive_file 0\ntotal_inactive_file {}", gib(1)),
             ),
+            // A limit of 0 (Sol, measure-pool r1), a limit without its use, and one that
+            // makes no sense.
+            ("/sys/fs/cgroup/zero.scope/memory.max", "0".to_owned()),
+            (
+                "/sys/fs/cgroup/zero.scope/memory.current",
+                "4096".to_owned(),
+            ),
+            ("/sys/fs/cgroup/blind.scope/memory.max", gib(4)),
+            ("/sys/fs/cgroup/odd.scope/memory.max", "lots".to_owned()),
         ]
         .into_iter()
         .map(|(path, text)| (path.to_owned(), text))
@@ -749,6 +771,22 @@ mod tests {
             Some(5 * G)
         );
         assert_eq!(linux_remaining(None, None, read), None);
+        // A limit of 0 leaves nothing; one whose use or value can't be read leaves what
+        // isn't known, not the machine's.
+        let at = |group: &str| format!("0::/{group}");
+        let machine = Some(meminfo(G));
+        assert_eq!(
+            linux_remaining(machine.as_deref(), Some(&at("zero.scope")), read),
+            Some(0)
+        );
+        assert_eq!(cgroup::limit(&at("zero.scope"), read), Some(0));
+        for group in ["blind.scope", "odd.scope"] {
+            assert_eq!(
+                linux_remaining(machine.as_deref(), Some(&at(group)), read),
+                None,
+                "{group}"
+            );
+        }
     }
 
     /// What a job object leaves is the least of its set limits less what is used of each.
