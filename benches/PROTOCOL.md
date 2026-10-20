@@ -237,13 +237,32 @@ phuoc-yu and the big host); a declared hypothesis a round doesn't test counts at
   cached instance (up to 0.045 in log against 0.0075 between blocks of one instance); blocks
   timing one instance share it, so the round's blocks weren't independent and its p was
   anti-conservative. A copy per block draws the offset anew: it is in the blocks' variance, and
-  a confirmation round no longer inherits round 1's instances.
+  a confirmation round no longer inherits round 1's instances. That each copy draws it
+  independently is assumed, not yet shown: lks-aa-20 shows that two fixed files differ, not
+  that copying and deleting per block redraws the offset (pages can be reused). The first A-A'
+  floor run (phuoc-yu) tests it, its copy-to-copy spread across blocks against lks-aa-20's
+  between-file spread; until then the false-block rates of `probes/gate-falseblock.py` (0 of
+  2,000 simulated A/A gates with copies, against 0.1 % to 100 % without, by blocks a round) hold
+  under that assumption only.
 - *The floor.* `release_gate.py floor` writes `fast/noise-floor/<host>.toml`
   from an A-A' gate on that host (every side one revision; the copies make them different
   instances): per case and dimension, the sd of one block's contrast. Each test takes its units'
   spread as at least that (floor / sqrt(k) for a unit of k blocks), so a loss must be clear
   against the noise measured between instances and sessions, not only against the few blocks'
-  own spread. The report names the floor it used, or says the host has none.
+  own spread. The report names the floor it used, or says the host has none. Open (Sol,
+  20 Oct 2026; none blocks): the floor file records no host identity, source hashes or freeze
+  time, and `read_floor()` checks none; `rounds_of()` doesn't check that rounds are distinct
+  campaigns; with layouts timed unevenly often the floor takes their mean replication, exact only
+  for equal counts; the copies' file system device isn't recorded; the instance directories are
+  the gate's, outside `suitekit/ns.py`'s ownership.
+- *Evidence fails closed.* A declared hypothesis of a case the round ran that has neither a test
+  nor a stated reason is an error, which blocks the verdict. Stated reasons: the candidate fails
+  or doesn't run the case; a baseline can't run it; the baseline doesn't report the metric
+  (unsupported by it); or the candidate lost the evidence the baseline has (a series, a client
+  width, a memory reading on any pass), which blocks.
+- *One build, timed once.* A baseline whose build is an earlier baseline's (a confirmation job's
+  main that is its base) is timed once, as that one; the report takes it as that side and leaves
+  its hypotheses out of the family rather than declaring them twice. The candidate always runs.
 - *The test* is one-sided for a loss (a better head is never a loss), a t-test on the units'
   mean log contrast (Student's t computed in the kit; it matches SciPy). Its calibration on
   identical binaries is checked below; an exact sign-flip p is reported beside it where the
