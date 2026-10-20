@@ -81,6 +81,33 @@ fn a_view_is_charged_for_all_it_holds_until_it_goes() {
     assert_eq!(query.used(), 0);
 }
 
+/// A view's run of any size is charged for what building it holds: its keys made beside its
+/// entries, in the room reserved for them. Collected in place over the entries (40 bytes
+/// each, the keys 32), the allocation was shrunk by a reallocation that held both blocks,
+/// uncharged, wherever the entries' bytes aren't a multiple of the keys' (here, an odd
+/// number of statements: each renamed one an insert and a delete). Found by the lock
+/// sweep's view guard: 96,032 bytes at 12,005 statements.
+#[test]
+fn a_view_of_any_size_holds_no_more_than_its_charge() {
+    if !measure::alone() {
+        return;
+    }
+    for size in [3, 5, 1_001] {
+        let views = Arc::new(Budget::unlimited());
+        let store = engine(size, &views);
+        let snapshot = store.snapshot();
+        let ((), excess) = measure::measure_within(&views, || {
+            let canonical = snapshot.with_canonical_equality();
+            drop((canonical, snapshot, store));
+        });
+        assert_eq!(
+            excess, 0,
+            "{size} statements: {excess} bytes beyond the charge"
+        );
+        assert_eq!(views.used(), 0);
+    }
+}
+
 /// Readers that miss the cache at once each make a view and keep its charge while they
 /// hold it, whichever the cache keeps (replacing the cache's once released what readers
 /// still held).
