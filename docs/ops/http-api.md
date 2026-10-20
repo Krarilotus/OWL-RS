@@ -67,8 +67,8 @@ SELECT ?s ?o ?score WHERE {
 
 | Predicate | Object |
 |---|---|
-| `bds:search` | the words (a literal); a word ending in `*` matches as a prefix; words in double quotes are a phrase, matching the literals that hold them in sequence (`"\"quick brown\" fox"`); `-word` excludes the literals that have it; `word~` (two edits) or `word~1` matches words within that many insertions, deletions, substitutions or transpositions; case doesn't matter |
-| `bds:relevance` | a variable: an `xsd:double` in (0, 1], the best match 1 (BM25, normalised) |
+| `bds:search` | the words (a literal); a word ending in `*` matches as a prefix; words in double quotes are a phrase, matching the literals that hold them in sequence (`"\"quick brown\" fox"`); `-word` excludes the literals that have it; `word~` or `word~2` permits two edits, `word~1` one, and `word~0` exact spelling, including when stemming is enabled; edits are insertions, deletions, substitutions or transpositions; case doesn't matter |
+| `bds:relevance` | a variable: an `xsd:double` in (0, 1], BM25 normalised to the best dictionary match before graph and other visibility filters |
 | `bds:rank` | a variable: the rank by relevance, from 1 |
 | `bds:matchAllTerms "true"` | every word must occur (else any) |
 | `bds:prefixMatch "true"` | every word matches as a prefix |
@@ -76,6 +76,14 @@ SELECT ?s ?o ?score WHERE {
 | `bds:stem "en"` | words match by their Snowball stem in that language, phrases too: `"connect"` finds *connected*, *connection*, *connecting* (an NRESE extension; Blazegraph ignores it). Languages: ar, da, de, el, en, es, fi, fr, hu, it, nl, no, pt, ro, ru, sv, ta, tr |
 
 The matched literal (the subject) is a simple or language-tagged string that is the object of a statement in the graph the pattern reads, as the query reads statements (with equality by representatives, its expanded or canonical copies). Relevance is ranked among those literals alone: BM25's statistics (how many literals, their average length, how many have each word) count the string literals that are objects of statements in the pattern's graphs (the dataset's, as the requester's graph access restricts them), at the query's snapshot and in its read model. So a requester who may not read a graph gets the scores and order of a store without it, a transaction not yet committed or a later commit changes no score at an earlier snapshot, a cached result equals a fresh one, and a replica scores as its primary. `GRAPH ?g { ?o bds:search … }` searches each named graph on its own (relevance per graph), unless its pattern's scans bind `?g` (then the named graphs together). Words are runs of letters and digits. The index is built in memory at the first search and extended with new literals at later searches; the set of literals a search ranks among is found by a walk over the store's object index once, then after each commit derived from the last version's (a probe per literal the commit added or removed), and kept within a byte budget (`text_corpus_bytes` of the engine, least recently used out, keys and the lineage counted; a set larger than the budget isn't kept; requesters reading the same graphs share one; `nrese_text_corpus_bytes` and `nrese_text_corpora_built_total` in the metrics); building one is charged to the query's memory budget; a durable store writes it to `derived/` of its data directory after each checkpoint and reads it back at the first search after a restart, so it isn't built again. Searches start the pattern's joins.
+
+Malformed fuzzy suffixes, distances outside 0–2, negated phrases or fuzzy/prefix
+terms, unclosed phrases and wildcards other than one trailing `*` are request
+errors, including on an empty store. In `GRAPH ?g`, matches bind each allowed
+named graph; the same literal in two graphs can produce two rows. Ranks and
+rank limits apply within each graph. Scoring still uses dictionary-wide statistics:
+scores are not yet isolated to the visible snapshot, graph, property or language
+corpus.
 
 The same index answers **Jena's `text:query`** (what Fuseki clients send) and **GraphDB's legacy `luc:` predicates**:
 
@@ -89,7 +97,16 @@ PREFIX luc: <http://www.ontotext.com/owlim/lucene#>
 SELECT ?x ?score WHERE { ?x luc:myIndex "tower bridge" ; luc:score ?score }
 ```
 
-`text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals and `"lang:xx"`. Without a property, a literal matches as the object of any property. `luc:` takes any index name (there is one index, over every string literal) and finds the resources with a matching literal. Query strings are read as Lucene's syntax as far as this index goes: words, phrases, `word*`, fuzzy `word~` and `word~1`, `AND` (every word needed, else any), `NOT` and `-` (the word is excluded; a phrase after them is dropped); `OR`, `+`, field names and boosts (`^`) are dropped. Scores are the relevance above, not Lucene's.
+`text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals and `"lang:xx"`. The property and language restrict eligible literals before the rank limit; joining those literals to resources preserves matching subjects. Without a property, a literal matches as the object of any property. Cyclic or malformed RDF argument/output lists return request errors.
+
+`luc:` takes any index name (there is one native index over every string literal)
+and finds resources with a matching literal. Jena and `luc:` query strings accept
+words, phrases, `word*`, fuzzy terms as above, flat `AND`/`&&` or `OR`/`||` groups,
+and plain-word exclusions using `NOT` or `-`. Unconnected positive terms mean OR.
+Mixed Boolean modes, parentheses, required clauses (`+`), field names, boosts,
+negated phrases and other unsupported syntax return request errors; they are
+not silently removed. Punctuation inside a phrase is tokenized as ordinary text.
+Scores are the relevance above, not Lucene's.
 
 **Vector similarity search** through a virtual `SERVICE`: the vectors are literals of the datatype `nrv:vector` (`"[0.12, -0.5, 0.33]"^^nrv:vector`, numbers as in a JSON array; what embedding services return), and the search finds the nearest ones:
 
@@ -106,12 +123,12 @@ SELECT ?doc ?score WHERE {
 | Predicate | Object |
 |---|---|
 | `nrv:near` | the query vector: a vector literal, or a variable the rest of the query binds to one (`?other ex:embedding ?q`: a search per value) |
-| `nrv:k` | how many nearest vectors per query vector (default 10, at most 10,000) |
+| `nrv:k` | how many nearest vectors per query vector (a positive whole number, default 10; fewer where fewer qualify). No fixed maximum: a search whose hits the query's memory budget (`budgets.query_memory`) can't hold is answered `413`, before it allocates them |
 | `nrv:score` | a variable: the cosine similarity or dot product (`xsd:double`), or the Euclidean distance with `nrv:metric "l2"` |
 | `nrv:rank` | a variable: the rank, from 1 |
 | `nrv:metric` | `"cosine"` (the default), `"dot"` or `"l2"` |
 | `nrv:exact true` | compare every vector (every search does) |
-| `nrv:searchBudget` | accepted; no search uses a graph's beam |
+| `nrv:searchBudget` | a positive whole number, else the query is refused; accepted and without effect: every search compares every vector, so no beam applies. `nrv:k` likewise: a positive whole number taken as given (no clamp), bounded by the memory budget |
 
 The subject is the matched vector literal. The search is among the vector literals the query's active graph uses as objects at its snapshot, every one compared: a user finds no vector of a graph it may not read, of an open transaction or of another version, and none of them changes what is found (replicas agree). The search returns the `k` nearest vectors that satisfy the patterns joined to it (`?doc ex:embedding ?v` with other conditions on `?doc`). Where those patterns are estimated to bind few rows, they go first and the search is among their values; where they bind many, the search goes first and each hit, nearest first, is checked against them through the indexes until `k` pass. Vectors of each dimension are indexed in memory at the first search and extended with new literals at later ones; the reader's vectors are a corpus of the scope, walked at the first search and derived across commits (as the full-text corpora are), a bit tested per vector of the scan.
 
@@ -321,7 +338,7 @@ Every error is an `application/problem+json` document (RFC 9457), whoever answer
 | `/version` | Build, enabled surfaces, reasoning semantics |
 | `/dataset/service-description` | SPARQL service description (Turtle); it names every endpoint above |
 | `/dataset/info` | Statement and graph counts |
-| `/dataset/autocomplete?q=…` | Resources whose labels' words or local names' words begin with the words of `q`, best first: `{"suggestions": [{"iri", "label", "score"}]}`. Labels are the values of `rdfs:label`, `skos:prefLabel`, `skos:altLabel`, `foaf:name`, `schema:name`, `dcterms:title` and `dc:title`; local names are split at camel case and punctuation. With equality classes read canonically, a class is found by any of its identities' local names and suggested once, as its representative. `limit` (default 10, at most 1000), `infer=false` for asserted statements only. The indexes are built at the first use |
+| `/dataset/autocomplete?q=…` | Resources whose labels' words or local names' words begin with the words of `q`, best first: `{"suggestions": [{"iri", "label", "score"}]}`. Input is plain typed text: punctuation separates words and never introduces search operators. Labels are the values of `rdfs:label`, `skos:prefLabel`, `skos:altLabel`, `foaf:name`, `schema:name`, `dcterms:title` and `dc:title`; local names are split at camel case and punctuation. With equality classes read canonically, a class is found by any of its identities' local names and suggested once, as its representative. `limit` counts distinct resources (default 10, at most 1000; `0` gives none); `infer=false` reads asserted statements only. The indexes are built at the first use |
 | `/dataset/tell` | Adds an RDF payload to a graph (`POST`) |
 | `/metrics` | Prometheus metrics (below) |
 | `/console`, `/ops` | User console, operator UI |

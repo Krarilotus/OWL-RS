@@ -429,6 +429,13 @@ pub const SETTINGS: &[Setting] = &[
         "Rows one request may return (default 1000000).",
     ),
     // [budgets]
+    setting(
+        "budgets.planner_effort",
+        names::PLANNER_EFFORT,
+        Integer,
+        "Approximate greedy join-order candidate estimates; at least one complete start; \
+         0 removes the effort bound (default 524288).",
+    ),
     older(
         setting(
             "budgets.query_memory",

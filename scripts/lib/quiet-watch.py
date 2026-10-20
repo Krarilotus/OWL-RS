@@ -41,8 +41,10 @@ HEAVY_CORES = 0.2
 # measurement was disturbed.
 DISTURBED_SHARE = 0.10
 TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
-# Never stopped, whatever they use: what keeps the host and the queue running.
-SPARED = ("guard.sh", "sshd", "systemd", "queue.py", "quiet-watch.py", "dbus-daemon")
+# Never stopped, whatever they use: what keeps the host and the queue running, and a desktop
+# session's compositor (phuoc-yu's console: gnome-shell stopped would freeze its display).
+SPARED = ("guard.sh", "sshd", "systemd", "queue.py", "quiet-watch.py", "dbus-daemon",
+          "gnome-shell", "Xwayland", "gnome-session", "gdm")
 
 
 def spared(pid: int) -> bool:

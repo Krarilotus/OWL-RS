@@ -249,6 +249,47 @@ fn patterns_joined_to_rows_are_evaluated_from_them() {
     );
 }
 
+/// ERA's DISTINCT constraints must not read every label after a mandatory focus check
+/// has already failed. Keep the empty result's projected variables, as the oracle does.
+#[test]
+fn distinct_optional_does_not_read_labels_after_an_empty_left_side() {
+    let engine = engine();
+    let snapshot = engine.snapshot();
+    // n1 has kind k1, not k9. Both constants exist, so this exercises a known-empty
+    // index range rather than the unknown-term shortcut. There are 3,000 other labels.
+    let text = format!(
+        "PREFIX e: <{EX}> SELECT DISTINCT ?o ?l WHERE {{ \
+         e:n1 e:kind e:k9 . e:n1 e:knows ?o . OPTIONAL {{ ?o e:label ?l }} }}"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let options = QueryOptions::default();
+    let nrese_sparql::QueryResults::Solutions(mut actual) =
+        nrese_sparql::evaluate_query(&snapshot, &query, &options).unwrap()
+    else {
+        panic!("a SELECT")
+    };
+    let nrese_sparql::QueryResults::Solutions(mut expected) =
+        nrese_sparql_reference::evaluate_query(&snapshot, &query, &options).unwrap()
+    else {
+        panic!("a SELECT")
+    };
+    assert_eq!(actual.variables(), expected.variables());
+    assert!(actual.next().is_none());
+    assert!(expected.next().is_none());
+
+    let explained = explain_query(&snapshot, &query, &options).unwrap();
+    assert_eq!(explained.rows, 0);
+    let label = format!("{EX}label");
+    assert!(
+        !explained
+            .steps
+            .iter()
+            .any(|step| step.rows > 0 && step.detail.contains(&label)),
+        "labels were read after the mandatory left side was empty: {:#?}",
+        explained.steps
+    );
+}
+
 /// LIMIT pushdown: a LIMIT without ORDER BY stops the pattern's joins once it has enough
 /// rows (Wikidata q04, LIMIT 100 k: 3,380 -> 21 ms).
 #[test]

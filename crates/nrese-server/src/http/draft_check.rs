@@ -147,7 +147,13 @@ pub async fn check(
         None => {
             let seconds = Duration::from_secs_f64(request.limits.max_seconds).min(server_max);
             let memory = policy.limits.max_query_memory_bytes;
-            run(&request, seconds, (memory > 0).then_some(memory)).await
+            run(
+                &request,
+                seconds,
+                (memory > 0).then_some(memory),
+                policy.limits.planner,
+            )
+            .await
         }
     };
     Ok(Json(DraftCheckReply {
@@ -211,12 +217,13 @@ async fn run(
     request: &DraftCheckRequest,
     seconds: Duration,
     memory: Option<usize>,
+    planner: nrese_sparql::PlannerOptions,
 ) -> DraftOutcome {
     let cancellation = CancellationToken::new();
     let (operation, inputs, limits) = (request.operation, request.inputs.clone(), request.limits);
     let token = cancellation.clone();
     let task = tokio::task::spawn_blocking(move || {
-        run_draft_check(operation, &inputs, &limits, &token, memory)
+        run_draft_check(operation, &inputs, &limits, &token, memory, planner)
     });
     match tokio::time::timeout(seconds, task).await {
         Ok(Ok(outcome)) => outcome,

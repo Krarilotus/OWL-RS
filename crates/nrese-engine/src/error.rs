@@ -10,6 +10,11 @@ pub enum EngineError {
     Corruption(String),
     #[error("invalid engine configuration: {0}")]
     Configuration(String),
+    #[error("invalid text query: {0}")]
+    InvalidTextQuery(String),
+    /// A search's working memory (its corpus, its scoring) doesn't fit the request's budget.
+    #[error("memory limit: {0}")]
+    MemoryLimit(#[from] nrese_exec::BudgetExceeded),
     #[error("term {0:#x} is not known to the dictionary")]
     UnknownTerm(u64),
     #[error("RDF-star triple terms are not supported by the engine")]

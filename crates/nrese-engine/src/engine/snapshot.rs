@@ -90,9 +90,12 @@ impl InferredMask {
     pub fn changed(&self, snapshot: &Snapshot, hide: &[EncodedQuad], show: &[EncodedQuad]) -> Self {
         let mut runs = self.runs.clone();
         if !(hide.is_empty() && show.is_empty()) {
-            let layout = snapshot.version.inferred.layout();
+            let inferred = &snapshot.version.inferred;
             runs.push(Arc::new(crate::index::run::Run::from_delta(
-                layout, show, hide,
+                inferred.layout(),
+                inferred.encoding(),
+                show,
+                hide,
             )));
         }
         Self { runs }
@@ -359,7 +362,8 @@ impl Snapshot {
         let inferred = match subset {
             InferredSubset::Without(hidden) => self.version.inferred.with_delta(&[], &hidden),
             InferredSubset::Only(kept) => {
-                crate::index::IndexVersion::from_quads(self.version.inferred.layout(), kept)
+                let inferred = &self.version.inferred;
+                crate::index::IndexVersion::from_quads(inferred.layout(), inferred.encoding(), kept)
             }
         };
         let version = Arc::new(Version {
@@ -1058,6 +1062,48 @@ impl Snapshot {
         Some(plan)
     }
 
+    /// The number of distinct values of the first unbound component of `pattern` in
+    /// `permutation`'s order among its matches in `model`: exact, counted while the index's
+    /// groups are walked without keeping them where one run of one stack holds the matches
+    /// and no deletion among them, else from [`Self::group_counts_in`]. `None` where that
+    /// can't answer. `COUNT(DISTINCT ?x)` of one triple pattern.
+    pub fn distinct_count_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+    ) -> Option<u64> {
+        if self.expanding(model, pattern).is_some() {
+            return None;
+        }
+        let plan = AccessPlan::in_permutation(pattern, permutation)?;
+        let bound = plan
+            .low
+            .iter()
+            .zip(&plan.high)
+            .take_while(|(l, h)| l == h)
+            .count();
+        let supported = Stack::ALL.into_iter().all(|stack| {
+            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
+        });
+        if plan.exclude_default_graph || bound >= 4 || !supported {
+            return None;
+        }
+        let with: Vec<Stack> = Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack) && self.version.stack(stack).any_plan(&plan))
+            .collect();
+        let counted = match with.as_slice() {
+            [] => Some(0),
+            [stack] => self.version.stack(*stack).count_groups(&plan, bound),
+            _ => None,
+        };
+        counted.or_else(|| {
+            self.group_counts_in(model, pattern, permutation)
+                .map(|groups| groups.len() as u64)
+        })
+    }
+
     /// For each distinct value of the first unbound component of `pattern` in `permutation`'s
     /// order, the number of matching quads in `model`, in id order. `None` if the pattern's
     /// bound components aren't a prefix of that order, or an included stack can't answer it.
@@ -1467,14 +1513,16 @@ impl Snapshot {
     /// an open transaction's, a graph's outside the scope, one no visible statement has)
     /// changes a score. What building the corpus takes is charged to `budget` while the
     /// search holds it (the request's; `None`: unbounded), and what scoring takes, the
-    /// matches until they drop; a kept corpus is the engine's.
+    /// matches until they drop; a kept corpus is the engine's. Malformed or unsupported
+    /// operators return [`crate::EngineError::InvalidTextQuery`], a budget that has no room
+    /// [`crate::EngineError::MemoryLimit`].
     pub fn text_search_in(
         &self,
         model: ReadModel,
         scope: &TextScope,
         query: &crate::TextQuery,
         budget: Option<&Arc<nrese_exec::Budget>>,
-    ) -> Result<crate::TextMatches, nrese_exec::BudgetExceeded> {
+    ) -> crate::EngineResult<crate::TextMatches> {
         let unbounded;
         let request = match budget {
             Some(budget) => budget,
@@ -1489,10 +1537,9 @@ impl Snapshot {
         self.dictionary.text_search(query, &corpus, request)
     }
 
-    /// [`Self::text_search_in`] over every graph, asserted and inferred.
-    pub fn text_search(&self, query: &crate::TextQuery) -> crate::TextMatches {
+    /// [`Self::text_search_in`] over every graph, asserted and inferred, unbounded.
+    pub fn text_search(&self, query: &crate::TextQuery) -> crate::EngineResult<crate::TextMatches> {
         self.text_search_in(ReadModel::Materialised, &TextScope::EVERY, query, None)
-            .expect("no budget to exceed")
     }
 
     /// The vector literals that are objects of statements this snapshot shows in `scope`'s
@@ -1501,7 +1548,9 @@ impl Snapshot {
     /// went. Every one of them is compared (exact): no vector outside them (another
     /// version's, an open transaction's, a deleted one, one in a graph outside the scope)
     /// changes the answer. Building the corpus and the scan are charged to `budget` as
-    /// [`Self::text_search_in`]'s are.
+    /// [`Self::text_search_in`]'s are; refused before it allocates past
+    /// [`crate::VectorQuery::max_hits`] or the budget, stopped by its `stop` flag
+    /// ([`crate::VectorStop`]).
     pub fn vector_search_in(
         &self,
         model: ReadModel,
@@ -1509,7 +1558,7 @@ impl Snapshot {
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
         budget: Option<&Arc<nrese_exec::Budget>>,
-    ) -> Result<(Vec<(TermId, f32)>, crate::VectorSearchReport), nrese_exec::BudgetExceeded> {
+    ) -> Result<(Vec<(TermId, f32)>, crate::VectorSearchReport), crate::VectorStop> {
         let unbounded;
         let request = match budget {
             Some(budget) => budget,
@@ -1520,7 +1569,9 @@ impl Snapshot {
         };
         // The corpus, the vectors covering it, then the scan: no lock held across another's
         // parallel parts.
-        let corpus = self.text_corpus(Documents::Vectors, model, scope, Some(request))?;
+        let corpus = self
+            .text_corpus(Documents::Vectors, model, scope, Some(request))
+            .map_err(crate::VectorStop::Memory)?;
         let accept = |id: TermId| corpus.contains(id.payload()) && accept(id);
         let (hits, report) =
             self.dictionary
@@ -1537,7 +1588,7 @@ impl Snapshot {
         &self,
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
-    ) -> (Vec<(TermId, f32)>, crate::VectorSearchReport) {
+    ) -> Result<(Vec<(TermId, f32)>, crate::VectorSearchReport), crate::VectorStop> {
         self.vector_search_in(
             ReadModel::Materialised,
             &TextScope::EVERY,
@@ -1545,7 +1596,6 @@ impl Snapshot {
             accept,
             None,
         )
-        .expect("no budget to exceed")
     }
 
     /// Prepares what [`Self::vector_search`] reads before returning (a warm-up): the vectors
@@ -1573,7 +1623,7 @@ impl Snapshot {
         scope: &TextScope,
         query: &crate::TextQuery,
         budget: Option<&Arc<nrese_exec::Budget>>,
-    ) -> Result<crate::TextMatches, nrese_exec::BudgetExceeded> {
+    ) -> crate::EngineResult<crate::TextMatches> {
         let unbounded;
         let request = match budget {
             Some(budget) => budget,
@@ -1790,7 +1840,8 @@ impl Snapshot {
         let mut bits = nrese_exec::ChargedVec::with_capacity(Arc::clone(budget), words)?;
         bits.resize(words, 0)?;
         let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
-        scratch.charge(self.walk_scratch(words))?;
+        let (running, bytes) = self.walk_scratch(words, budget.remaining());
+        scratch.charge(bytes)?;
         // Per graph, each kind's walk; a scan (where the index can't walk them) marks every
         // kind at once. Only the count needs the index: on a pool thread it is covered
         // while the statements are walked (the cover, on this thread, as it would be
@@ -1799,7 +1850,7 @@ impl Snapshot {
         let mut walk = move || {
             let mut mark = |graph: GraphSelector| {
                 for &kind in documents.kinds() {
-                    if self.mark_values(model, graph, documents, kind, marks) {
+                    if self.mark_values(model, graph, documents, kind, marks, running) {
                         break;
                     }
                 }
@@ -1867,15 +1918,18 @@ impl Snapshot {
         }
     }
 
-    /// The most a corpus walk over `words` words of bits holds at once besides them: for
-    /// each slice running at once (no more than the pool's threads, nor than there are), its
-    /// group counts (16 bytes a term, 64 terms a word of the slice) from each run, and as
-    /// many again where they are merged or compared.
-    fn walk_scratch(&self, words: usize) -> usize {
+    /// How many slices of a corpus walk over `words` words of bits run at once, and the most
+    /// they hold besides the bits: per slice its group counts (16 bytes a term, 64 terms a
+    /// word of the slice) from each run, and as many again where they are merged or
+    /// compared. As many at once as `room` holds, at least one, no more than the pool's
+    /// threads nor than there are slices.
+    fn walk_scratch(&self, words: usize, room: usize) -> (usize, usize) {
         let runs = self.version.runs().count().max(1);
         let per = slice_words(words);
-        let running = words.div_ceil(per).min(rayon::current_num_threads());
-        running * per * 64 * 16 * runs * 2
+        let slice = per * 64 * 16 * runs * 2;
+        let most = words.div_ceil(per).min(rayon::current_num_threads()).max(1);
+        let running = (room / slice).clamp(1, most);
+        (running, running * slice)
     }
 
     /// Whether a statement this snapshot shows in `scope`'s graphs in `model` has `id` at
@@ -1908,8 +1962,9 @@ impl Snapshot {
 
     /// Sets the bit of the dictionary entry of each term of `kind` at `documents`' position
     /// (object or subject) of the statements in `graphs` (one graph, every graph, or every
-    /// named graph) in `model`. The entries in slices of whole words, on every core: each a
-    /// walk over the index's groups in its range of ids, so no list of every term is held.
+    /// named graph) in `model`. The entries in slices of whole words, `running` at once on
+    /// the pool: each a walk over the index's groups in its range of ids, so no list of
+    /// every term is held.
     /// Where the index can't walk them (a reader of equality classes), one scan of the
     /// statements marks the terms of every kind of `documents`: then `true`.
     fn mark_values(
@@ -1919,48 +1974,56 @@ impl Snapshot {
         documents: Documents,
         kind: TermKind,
         bits: &mut [u64],
+        running: usize,
     ) -> bool {
         use rayon::prelude::*;
         let per = slice_words(bits.len());
-        let walked = bits
-            .par_chunks_mut(per)
-            .enumerate()
-            .map(|(i, words)| {
-                self.dictionary.part_started();
-                let first = (i * per * 64) as u64;
-                let last = first + words.len() as u64 * 64 - 1;
-                let (low, high) = (TermId::new(kind, first), TermId::new(kind, last));
-                let counts = |graphs| self.range_counts(model, graphs, documents, low, high);
-                let mut mark = |value: TermId| {
-                    let at = value.payload() - first;
-                    words[(at / 64) as usize] |= 1 << (at % 64);
-                };
-                match graphs {
-                    GraphSelector::AnyNamed => {
-                        // Every graph's, less those only the default graph has.
-                        let every = counts(GraphSelector::Any)?;
-                        let default = counts(GraphSelector::Exact(TermId::DEFAULT_GRAPH))?;
-                        let mut j = 0;
-                        for (value, count) in every {
-                            while j < default.len() && default[j].0 < value {
-                                j += 1;
-                            }
-                            let in_default = match default.get(j) {
-                                Some(&(v, c)) if v == value => c,
-                                _ => 0,
-                            };
-                            if count > in_default {
-                                mark(value);
+        let wave = |at: usize, wave: &mut [u64]| {
+            wave.par_chunks_mut(per)
+                .enumerate()
+                .map(|(i, words)| {
+                    self.dictionary.part_started();
+                    let first = ((at + i) * per * 64) as u64;
+                    let last = first + words.len() as u64 * 64 - 1;
+                    let (low, high) = (TermId::new(kind, first), TermId::new(kind, last));
+                    let counts = |graphs| self.range_counts(model, graphs, documents, low, high);
+                    let mut mark = |value: TermId| {
+                        let at = value.payload() - first;
+                        words[(at / 64) as usize] |= 1 << (at % 64);
+                    };
+                    match graphs {
+                        GraphSelector::AnyNamed => {
+                            // Every graph's, less those only the default graph has.
+                            let every = counts(GraphSelector::Any)?;
+                            let default = counts(GraphSelector::Exact(TermId::DEFAULT_GRAPH))?;
+                            let mut j = 0;
+                            for (value, count) in every {
+                                while j < default.len() && default[j].0 < value {
+                                    j += 1;
+                                }
+                                let in_default = match default.get(j) {
+                                    Some(&(v, c)) if v == value => c,
+                                    _ => 0,
+                                };
+                                if count > in_default {
+                                    mark(value);
+                                }
                             }
                         }
+                        _ => counts(graphs)?
+                            .into_iter()
+                            .for_each(|(value, _)| mark(value)),
                     }
-                    _ => counts(graphs)?
-                        .into_iter()
-                        .for_each(|(value, _)| mark(value)),
-                }
-                Some(())
-            })
-            .collect::<Option<()>>();
+                    Some(())
+                })
+                .collect::<Option<()>>()
+        };
+        // In waves of `running` slices; one the index can't walk (as none of them then)
+        // goes to the scan.
+        let walked = bits
+            .chunks_mut(per * running)
+            .enumerate()
+            .try_for_each(|(w, words)| wave(w * running, words));
         if walked.is_some() {
             return false;
         }

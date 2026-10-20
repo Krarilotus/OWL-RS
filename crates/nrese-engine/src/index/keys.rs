@@ -23,15 +23,14 @@
 //!
 //! Typical cost on LUBM: 6 to 12 bytes per key instead of 32.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use rayon::prelude::*;
 
 use crate::mapped::{Map, Mapped, Plain};
 use crate::quad::Key;
 
-/// How index blocks are encoded when they are built (`store.index_encoding`). Reading
-/// takes either, so a store can switch: blocks built after the switch take the new one.
+/// How index blocks are encoded when they are built (`EngineConfig::index_encoding`,
+/// `store.index_encoding`): each index version builds its runs in its own. Reading takes
+/// either, so a store can switch: blocks built after the switch take the new one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IndexEncoding {
     /// Frame of reference only: the fastest scans.
@@ -55,22 +54,6 @@ impl IndexEncoding {
             "compact" => Some(Self::Compact),
             _ => None,
         }
-    }
-}
-
-/// The encoding blocks are built with, for the process: the stores of one server share
-/// their settings.
-static COMPACT: AtomicBool = AtomicBool::new(false);
-
-/// Sets the encoding of the index blocks built from now on, in every store of the process.
-pub fn set_index_encoding(encoding: IndexEncoding) {
-    COMPACT.store(encoding == IndexEncoding::Compact, Ordering::Relaxed);
-}
-
-fn current_encoding() -> IndexEncoding {
-    match COMPACT.load(Ordering::Relaxed) {
-        true => IndexEncoding::Compact,
-        false => IndexEncoding::Fast,
     }
 }
 
@@ -372,14 +355,9 @@ fn write(data: &mut [u64], bit: usize, width: u8, value: u64) {
 }
 
 impl PackedKeys {
-    /// Packs `keys`, which must be sorted, in the process's encoding. Large arrays are
-    /// packed in parallel.
-    pub(crate) fn from_sorted(keys: &[Key]) -> Self {
-        Self::from_sorted_as(keys, current_encoding())
-    }
-
-    /// Packs `keys`, which must be sorted, in `encoding`.
-    pub(crate) fn from_sorted_as(keys: &[Key], encoding: IndexEncoding) -> Self {
+    /// Packs `keys`, which must be sorted, in `encoding`. Large arrays are packed in
+    /// parallel.
+    pub(crate) fn from_sorted(keys: &[Key], encoding: IndexEncoding) -> Self {
         let parallel = keys.len() >= PARALLEL_PACK;
         Self::packed(keys, encoding, &mut super::Uncharged, parallel)
             .unwrap_or_else(|_| unreachable!("nothing is charged"))
@@ -389,9 +367,10 @@ impl PackedKeys {
     /// keys keep stays reserved; the packing's working memory is released), on one thread.
     pub(crate) fn from_sorted_within(
         keys: &[Key],
+        encoding: IndexEncoding,
         charge: &mut impl super::Charge,
     ) -> Result<Self, nrese_exec::BudgetExceeded> {
-        Self::packed(keys, current_encoding(), charge, false)
+        Self::packed(keys, encoding, charge, false)
     }
 
     fn packed(
@@ -457,9 +436,9 @@ impl PackedKeys {
     /// is gathered twice, once for its header and once to pack it.
     pub(crate) fn from_sorted_gathered(
         len: usize,
+        encoding: IndexEncoding,
         gather: impl Fn(std::ops::Range<usize>, &mut Vec<Key>) + Sync,
     ) -> Self {
-        let encoding = current_encoding();
         let blocks = len.div_ceil(BLOCK);
         let range = |b: usize| b * BLOCK..((b + 1) * BLOCK).min(len);
         let block_of = |b: usize, keys: &mut Vec<Key>| {
@@ -510,12 +489,14 @@ impl PackedKeys {
     }
 
     /// Packs keys arriving in sorted order (a merged scan), without holding them all.
-    pub(crate) fn from_sorted_iter(keys: impl Iterator<Item = Key>) -> Self {
+    pub(crate) fn from_sorted_iter(
+        keys: impl Iterator<Item = Key>,
+        encoding: IndexEncoding,
+    ) -> Self {
         let mut packed = Self::default();
         let mut data: Vec<u64> = Vec::new();
         let (mut headers, mut firsts) = (Vec::new(), Vec::new());
         let mut block: Vec<Key> = Vec::with_capacity(BLOCK);
-        let encoding = current_encoding();
         let mut flush = |block: &mut Vec<Key>, data: &mut Vec<u64>| {
             let mut header = Header::of(block, encoding);
             header.offset = data.len() as u64;
@@ -1118,7 +1099,7 @@ mod tests {
         let mut state = 5;
         for n in [0, 1, 2, 127, 128, 129, 1000, 5000, 70_000] {
             let keys = random_keys(&mut state, n);
-            let packed = PackedKeys::from_sorted(&keys);
+            let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
             assert_eq!(packed.len(), keys.len());
             for (i, key) in keys.iter().enumerate() {
                 assert_eq!(packed.get(i), *key, "n {n} index {i}");
@@ -1163,7 +1144,7 @@ mod tests {
         let mut state = 41;
         for n in [1, 127, 128, 129, 5000, 70_000] {
             let keys = random_keys(&mut state, n);
-            let packed = PackedKeys::from_sorted(&keys);
+            let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
             let mut probes: Vec<Key> = (0..300)
                 .map(|_| {
                     let mut key = keys[(rng(&mut state) as usize) % keys.len()];
@@ -1206,7 +1187,7 @@ mod tests {
             random_keys(&mut state, 300),
             long,
         ] {
-            let packed = PackedKeys::from_sorted(&keys);
+            let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
             for _ in 0..100 {
                 // A range with a fixed first component, grouped on the second; or the whole
                 // array grouped on the first.
@@ -1237,8 +1218,8 @@ mod tests {
         let mut state = 17;
         for n in [0, 1, 128, 1000, 70_000] {
             let keys = random_keys(&mut state, n);
-            let packed = PackedKeys::from_sorted(&keys);
-            let streamed = PackedKeys::from_sorted_iter(keys.iter().copied());
+            let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
+            let streamed = PackedKeys::from_sorted_iter(keys.iter().copied(), IndexEncoding::Fast);
             let mut bytes = Vec::new();
             packed
                 .write(Some(0), &mut |piece| {
@@ -1278,7 +1259,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         for (n, at) in [(1000, 0u64), (70_000, 3), (129, 13), (0, 5)] {
             let keys = random_keys(&mut state, n);
-            let packed = PackedKeys::from_sorted(&keys);
+            let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
             let mut bytes = vec![0xaa; at as usize];
             packed
                 .write(Some(at), &mut |piece| {
@@ -1326,9 +1307,9 @@ mod tests {
             .collect();
         keys.sort_unstable();
         keys.dedup();
-        let packed = PackedKeys::from_sorted_as(&keys, IndexEncoding::Compact);
+        let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Compact);
         assert!(
-            PackedKeys::from_sorted_as(&keys, IndexEncoding::Fast)
+            PackedKeys::from_sorted(&keys, IndexEncoding::Fast)
                 .headers
                 .iter()
                 .all(|h| (0..4).all(|c| !h.palette(c))),
@@ -1400,7 +1381,7 @@ mod tests {
             [u64::MAX >> 4, u64::MAX, 1, 2],
             [u64::MAX, u64::MAX, u64::MAX, u64::MAX],
         ];
-        let packed = PackedKeys::from_sorted(&keys);
+        let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
         for (i, key) in keys.iter().enumerate() {
             assert_eq!(packed.get(i), *key);
         }
@@ -1426,7 +1407,7 @@ mod tests {
             })
             .collect();
         keys.sort_unstable();
-        let packed = PackedKeys::from_sorted(&keys);
+        let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
         let per_key = packed.memory_bytes() as f64 / keys.len() as f64;
         assert!(per_key < 8.0, "{per_key} bytes per key");
     }
@@ -1454,7 +1435,7 @@ mod tests {
             })
             .collect();
         keys.sort_unstable();
-        let packed = PackedKeys::from_sorted(&keys);
+        let packed = PackedKeys::from_sorted(&keys, IndexEncoding::Fast);
         let probes: Vec<Key> = (0..1_000_000)
             .map(|_| keys[(rng(&mut state) % 1_000_000) as usize])
             .collect();

@@ -52,6 +52,7 @@ use rayon::prelude::*;
 use super::codec::{Reader, put_u32, put_u64};
 use crate::engine::{Snapshot, Stack};
 use crate::error::{EngineError, EngineResult};
+use crate::index::IndexEncoding;
 use crate::index::keys::PackedKeys;
 use crate::index::{IndexVersion, Layout};
 use crate::mapped::{Map, Mapped};
@@ -60,7 +61,7 @@ use crate::term::Dictionary;
 use crate::term::dictionary::{Base, base_slots};
 use crate::term::hash::key_hash;
 use crate::term::offsets::{BlockEnds, Ends, Offsets};
-use crate::term::vocabulary::{Codec, VocabularyEncoding, vocabulary_encoding};
+use crate::term::vocabulary::{Codec, VocabularyEncoding};
 
 /// Version 2 added the inferred stack (roadmap E6); version 3 changed term encoding (E1);
 /// version 4 made integer ids order-preserving and split literal kinds (XC1); version 5
@@ -442,7 +443,11 @@ pub(crate) fn exists(dir: &Path, revision: u64) -> bool {
 }
 
 /// Writes a checkpoint of `snapshot` and returns its path.
-pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
+pub(crate) fn write(
+    dir: &Path,
+    snapshot: &Snapshot,
+    vocabulary: VocabularyEncoding,
+) -> EngineResult<PathBuf> {
     let version = snapshot.version();
     write_parts(
         dir,
@@ -450,6 +455,7 @@ pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
         snapshot.dictionary(),
         snapshot.dictionary_len(),
         [version.asserted.layout(), version.inferred.layout()],
+        vocabulary,
         &mut |stack, permutation| Ok(snapshot.version().stack(stack).packed(permutation)),
     )
 }
@@ -464,6 +470,7 @@ pub(crate) fn write_parts<'a>(
     dictionary: &Dictionary,
     dictionary_len: u64,
     layouts: [Layout; 2],
+    vocabulary: VocabularyEncoding,
     packed: &mut dyn FnMut(Stack, Permutation) -> EngineResult<Cow<'a, PackedKeys>>,
 ) -> EngineResult<PathBuf> {
     let tmp = checkpoint_path(dir, revision, "tmp");
@@ -479,7 +486,7 @@ pub(crate) fn write_parts<'a>(
     };
     put_u64(&mut out.buffer, revision);
     // Keys compressed with tables trained on a sample of them ([`crate::term::vocabulary`]).
-    let codec = (vocabulary_encoding() == VocabularyEncoding::Fsst)
+    let codec = (vocabulary == VocabularyEncoding::Fsst)
         .then(|| Codec::train(&dictionary.sample_keys(dictionary_len)));
     let flags = match dictionary.integers_in_dictionary() {
         true => INTEGERS_IN_DICTIONARY,
@@ -544,8 +551,9 @@ pub(crate) fn write_parts<'a>(
 pub(crate) fn stack_index(
     stack: Stack,
     packed: Vec<(Permutation, PackedKeys)>,
+    encoding: IndexEncoding,
 ) -> Result<IndexVersion, String> {
-    let index = IndexVersion::from_packed(packed)?;
+    let index = IndexVersion::from_packed(packed, encoding)?;
     match (stack, index.layout()) {
         (Stack::Inferred, Layout::Quads) => Err("the inferred stack holds named graphs".into()),
         _ => Ok(index),
@@ -736,7 +744,11 @@ fn read_stacks<'a>(
 /// The checkpoint at `path`, which this engine has just written, mapped: its dictionary
 /// base and both stacks, each one run, to be used in place of the copies in memory. Only
 /// the structure is read (the file was checked as it was written).
-pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])> {
+/// Runs built later over its stacks are packed in `encoding`.
+pub(crate) fn map_written(
+    path: &Path,
+    encoding: IndexEncoding,
+) -> EngineResult<(Base, [IndexVersion; 2])> {
     let corrupt =
         |what: &str| EngineError::Corruption(format!("checkpoint {}: {what}", path.display()));
     let map = crate::mapped::map(path)?;
@@ -762,7 +774,9 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
     .map_err(|error| corrupt(&error))?;
     let [asserted, inferred] =
         read_stacks(&mut reader, body, Some(&map), false).map_err(|error| corrupt(&error))?;
-    let index = |stack: Stack, packed| stack_index(stack, packed).map_err(|error| corrupt(&error));
+    let index = |stack: Stack, packed| {
+        stack_index(stack, packed, encoding).map_err(|error| corrupt(&error))
+    };
     Ok((
         base,
         [

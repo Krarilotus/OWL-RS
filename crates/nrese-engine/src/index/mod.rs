@@ -42,7 +42,7 @@ use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
 use crate::term::TermId;
 
 pub use compaction::CompactionPolicy;
-pub use keys::{IndexEncoding, set_index_encoding};
+pub use keys::IndexEncoding;
 
 /// Which quads a stack of runs may hold, and therefore which permutations it maintains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -151,14 +151,17 @@ const _: () = assert!(GROUP_PART.is_multiple_of(keys::BLOCK));
 #[derive(Debug, Clone, Default)]
 pub(crate) struct IndexVersion {
     layout: Layout,
+    /// What runs built for this version are packed in ([`IndexEncoding`]).
+    encoding: IndexEncoding,
     runs: Arc<[Arc<Run>]>,
     len: u64,
 }
 
 impl IndexVersion {
-    pub(crate) fn empty(layout: Layout) -> Self {
+    pub(crate) fn empty(layout: Layout, encoding: IndexEncoding) -> Self {
         Self {
             layout,
+            encoding,
             ..Self::default()
         }
     }
@@ -166,7 +169,11 @@ impl IndexVersion {
     /// A version holding one base run built from packed permutations (a checkpoint): every
     /// permutation of a layout exactly once, all with the same number of keys. The layout
     /// is the one they make up.
-    pub(crate) fn from_packed(packed: Vec<(Permutation, PackedKeys)>) -> Result<Self, String> {
+    /// Runs built for it later are packed in `encoding`.
+    pub(crate) fn from_packed(
+        packed: Vec<(Permutation, PackedKeys)>,
+        encoding: IndexEncoding,
+    ) -> Result<Self, String> {
         let permutations: Vec<Permutation> = packed.iter().map(|(p, _)| *p).collect();
         let layout = Layout::of(&permutations)
             .ok_or("the checkpoint doesn't hold every permutation of a layout once")?;
@@ -181,7 +188,7 @@ impl IndexVersion {
                 tombstones: Box::default(),
             };
         }
-        Ok(Self::empty(layout).with_run(Run::from_permutations(layout, perms)))
+        Ok(Self::empty(layout, encoding).with_run(Run::from_permutations(layout, encoding, perms)))
     }
 
     /// The visible keys of `permutation` as one packed array: the run's own array when the
@@ -201,12 +208,17 @@ impl IndexVersion {
             SignedMerge::new(parts)
                 .filter(|&(_, sign)| sign > 0)
                 .map(|(key, _)| key),
+            self.encoding,
         ))
     }
 
     /// A version holding exactly the (deduplicated) `quads` in one base run.
-    pub(crate) fn from_quads(layout: Layout, quads: Vec<EncodedQuad>) -> Self {
-        Self::empty(layout).with_run(Run::from_quads(layout, quads))
+    pub(crate) fn from_quads(
+        layout: Layout,
+        encoding: IndexEncoding,
+        quads: Vec<EncodedQuad>,
+    ) -> Self {
+        Self::empty(layout, encoding).with_run(Run::from_quads(layout, encoding, quads))
     }
 
     /// Number of visible quads. O(1).
@@ -218,6 +230,10 @@ impl IndexVersion {
         self.layout
     }
 
+    pub(crate) fn encoding(&self) -> IndexEncoding {
+        self.encoding
+    }
+
     /// `self` with the exact delta `inserts` and `deletes` appended as a run. A default-graph
     /// stack that receives a quad in a named graph turns into a quad stack first
     /// ([`with_quads_layout`](Self::with_quads_layout)).
@@ -227,7 +243,7 @@ impl IndexVersion {
             true => self.with_quads_layout(),
             false => self.clone(),
         };
-        let run = Run::from_delta(base.layout, inserts, deletes);
+        let run = Run::from_delta(base.layout, base.encoding, inserts, deletes);
         base.with_run(run)
     }
 
@@ -241,6 +257,7 @@ impl IndexVersion {
         }
         Self {
             layout: Layout::Quads,
+            encoding: self.encoding,
             runs: self
                 .runs
                 .iter()
@@ -394,6 +411,69 @@ impl IndexVersion {
         }
     }
 
+    /// The number of distinct values at key `position` of `plan`'s permutation, counted
+    /// while the groups are walked (in parallel parts for a large range, a group across a
+    /// cut counted once) and none kept: O(d) time, O(1) memory. `None` where several runs
+    /// have matches or the run has tombstones in range: then values must be merged
+    /// ([`Self::group_counts`]).
+    pub(crate) fn count_groups(&self, plan: &AccessPlan, position: usize) -> Option<u64> {
+        let adapted = self.layout.adapt(plan)?;
+        let position = if adapted.permutation == plan.permutation {
+            position
+        } else if position == 0 {
+            // Grouped by the graph that the single-graph layout leaves out: every quad is
+            // the default graph's.
+            return Some(u64::from(self.count_plan(plan) > 0));
+        } else {
+            position - 1
+        };
+        let mut found = None;
+        for run in self.runs.iter() {
+            let perm = run.permutation(adapted.permutation);
+            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            if start < end {
+                if found.is_some() || perm.tombstones_in(start, end) > 0 {
+                    return None;
+                }
+                found = Some((perm, start, end));
+            }
+        }
+        let Some((perm, start, end)) = found else {
+            return Some(0);
+        };
+        // Per part: its groups, its first value and its last.
+        let walk = |start: usize, end: usize| {
+            let (mut groups, mut first, mut last) = (0u64, None, None);
+            perm.keys.groups(start, end, position, |value, _, _| {
+                groups += 1;
+                first.get_or_insert(value);
+                last = Some(value);
+            });
+            (groups, first, last)
+        };
+        if end - start < 2 * GROUP_PART {
+            return Some(walk(start, end).0);
+        }
+        let cuts: Vec<usize> = std::iter::once(start)
+            .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
+            .chain(std::iter::once(end))
+            .collect();
+        let parts: Vec<(u64, Option<u64>, Option<u64>)> = cuts
+            .par_windows(2)
+            .map(|cut| walk(cut[0], cut[1]))
+            .collect();
+        let mut total = 0;
+        let mut previous: Option<u64> = None;
+        for (groups, first, last) in parts {
+            total += groups;
+            if previous.is_some() && previous == first {
+                total -= 1;
+            }
+            previous = last.or(previous);
+        }
+        Some(total)
+    }
+
     /// Appends the distinct values at key `position` of each run's range for `plan` (sorted
     /// per run; values may repeat across runs). Tombstones are ignored: for estimates.
     pub(crate) fn distinct_values(&self, plan: &AccessPlan, position: usize, out: &mut Vec<u64>) {
@@ -485,6 +565,7 @@ impl IndexVersion {
         let net: i64 = extra.iter().map(|run| run.net()).sum();
         Self {
             layout: self.layout,
+            encoding: self.encoding,
             runs: self.runs.iter().chain(extra).cloned().collect(),
             len: self
                 .len
@@ -506,6 +587,7 @@ impl IndexVersion {
         let runs = self.runs.iter().cloned().chain([Arc::new(run)]).collect();
         Self {
             layout: self.layout,
+            encoding: self.encoding,
             runs,
             len,
         }
@@ -523,6 +605,7 @@ impl IndexVersion {
             .collect();
         Self {
             layout: self.layout,
+            encoding: self.encoding,
             runs,
             len: self.len,
         }
@@ -539,6 +622,7 @@ impl IndexVersion {
             .collect();
         Self {
             layout: self.layout,
+            encoding: self.encoding,
             runs,
             len: self.len,
         }

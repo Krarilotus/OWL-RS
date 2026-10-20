@@ -242,16 +242,19 @@ fn is_update(headers: &HeaderMap) -> bool {
         || media_type_matches(content_type, "application/sparql-update")
 }
 
+/// The update the request carries, its `WHERE` clauses planned with the server's setting.
 pub(crate) fn update(
     raw: &RawQuery,
     headers: &HeaderMap,
     body: &Bytes,
+    planner: nrese_sparql::PlannerOptions,
 ) -> Result<SparqlUpdateRequest, ApiError> {
     let operation = update_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), body)?;
     Ok(SparqlUpdateRequest {
         update: operation.update,
         using_graphs: operation.using_graphs,
         using_named_graphs: operation.using_named_graphs,
+        planner,
     })
 }
 
@@ -487,7 +490,7 @@ pub async fn query_post(
             .is_ok_and(|pairs| pairs.iter().any(|(key, _)| key == "update"));
     if form_update || media_type_matches(content_type, "application/sparql-update") {
         let access = guard::update_access(&state, &authenticated).await?;
-        let request = update(&raw, &headers, &body)?;
+        let request = update(&raw, &headers, &body, state.policy().limits.planner)?;
         apply(&state, vec![StatementOp::Update(request)], &access).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
@@ -563,7 +566,12 @@ pub async fn statements_post(
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     let op = if is_update(&headers) {
-        StatementOp::Update(update(&raw, &headers, &body)?)
+        StatementOp::Update(update(
+            &raw,
+            &headers,
+            &body,
+            state.policy().limits.planner,
+        )?)
     } else {
         state.policy().enforce_rdf_upload_bytes(body.len())?;
         StatementOp::Add {
@@ -876,7 +884,12 @@ pub async fn transaction_action(
             contexts: contexts(&pairs)?,
         }]),
         "DELETE" => Some(removals(&pairs, &headers, &body)?),
-        "UPDATE" => Some(vec![StatementOp::Update(update(&raw, &headers, &body)?)]),
+        "UPDATE" => Some(vec![StatementOp::Update(update(
+            &raw,
+            &headers,
+            &body,
+            state.policy().limits.planner,
+        )?)]),
         _ => None,
     };
     if let Some(ops) = ops {

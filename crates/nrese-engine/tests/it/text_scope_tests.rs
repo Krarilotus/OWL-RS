@@ -79,9 +79,9 @@ fn corpora_are_walked_once_then_derived_across_commits() {
     let snapshot = engine.snapshot();
     let default = TextScope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
     let model = ReadModel::Materialised;
-    let every = snapshot.text_search(&query("alpha beta"));
+    let every = snapshot.text_search(&query("alpha beta")).unwrap();
     assert_eq!(built(&snapshot), (1, 0));
-    assert_eq!(snapshot.text_search(&query("beta")).len(), 2);
+    assert_eq!(snapshot.text_search(&query("beta")).unwrap().len(), 2);
     assert_eq!(built(&snapshot), (1, 0));
     let in_default = snapshot
         .text_search_in(model, &default, &query("alpha beta"), None)
@@ -99,7 +99,7 @@ fn corpora_are_walked_once_then_derived_across_commits() {
     for i in 0..60 {
         tx.insert(label(&format!("x{i}"), &format!("beta extra {i}"), None).as_ref());
     }
-    assert_eq!(snapshot.text_search(&query("alpha beta")), every);
+    assert_eq!(snapshot.text_search(&query("alpha beta")).unwrap(), every);
     assert_eq!(
         snapshot
             .text_search_in(model, &default, &query("alpha beta"), None)
@@ -109,10 +109,10 @@ fn corpora_are_walked_once_then_derived_across_commits() {
     assert_eq!(built(&snapshot), (2, 0));
     tx.commit().unwrap();
     // The old version keeps its corpus; the new one derives its own from it.
-    assert_eq!(snapshot.text_search(&query("alpha beta")), every);
+    assert_eq!(snapshot.text_search(&query("alpha beta")).unwrap(), every);
     assert_eq!(built(&snapshot), (2, 0));
     let later = engine.snapshot();
-    assert_eq!(later.text_search(&query("alpha beta")).len(), 63);
+    assert_eq!(later.text_search(&query("alpha beta")).unwrap().len(), 63);
     assert_eq!(built(&later), (2, 1));
     assert_eq!(
         later
@@ -129,7 +129,7 @@ fn corpora_are_walked_once_then_derived_across_commits() {
         tx.commit().unwrap();
     }
     let latest = engine.snapshot();
-    assert_eq!(latest.text_search(&query("beta")).len(), 65);
+    assert_eq!(latest.text_search(&query("beta")).unwrap().len(), 65);
     assert_eq!(built(&latest), (2, 3));
     // Autocompletion's other index (IRIs by local name, among the subjects) has its own.
     let names = latest
@@ -680,7 +680,14 @@ fn a_corpus_larger_than_the_budget_is_not_kept() {
         tx.insert(label(&format!("s{i}"), &format!("alpha item{i}"), None).as_ref());
     }
     tx.commit().unwrap();
-    assert_eq!(engine.snapshot().text_search(&query("alpha")).len(), 512);
+    assert_eq!(
+        engine
+            .snapshot()
+            .text_search(&query("alpha"))
+            .unwrap()
+            .len(),
+        512
+    );
     let stats = engine.stats().text_corpora;
     assert!(stats.bytes <= stats.budget && stats.kept == 0, "{stats:?}");
 }
@@ -751,8 +758,8 @@ fn a_replica_scores_as_its_primary() {
     // A warmed replica takes a commit from the primary's log: its corpus is derived.
     let q = query("alpha beta");
     assert_eq!(
-        replica.snapshot().text_search(&q),
-        primary.snapshot().text_search(&q)
+        replica.snapshot().text_search(&q).unwrap(),
+        primary.snapshot().text_search(&q).unwrap()
     );
     let mut tx = primary.transaction();
     tx.insert(label("y", "gamma from the log", None).as_ref());
@@ -764,8 +771,8 @@ fn a_replica_scores_as_its_primary() {
     replica.apply_log(&batch.frames).unwrap();
     let derived = replica.stats().text_corpora.derived;
     assert_eq!(
-        replica.snapshot().text_search(&q),
-        primary.snapshot().text_search(&q)
+        replica.snapshot().text_search(&q).unwrap(),
+        primary.snapshot().text_search(&q).unwrap()
     );
     assert_eq!(replica.stats().text_corpora.derived, derived + 1);
     let mut tx = primary.transaction();
@@ -773,7 +780,7 @@ fn a_replica_scores_as_its_primary() {
         tx.insert(label(&format!("x{i}"), &format!("beta extra {i}"), None).as_ref());
     }
     let (p, r) = (primary.snapshot(), replica.snapshot());
-    assert_eq!(p.text_search(&q), r.text_search(&q));
-    assert_eq!(texts(&p, &p.text_search(&q))[0].0, "beta");
+    assert_eq!(p.text_search(&q).unwrap(), r.text_search(&q).unwrap());
+    assert_eq!(texts(&p, &p.text_search(&q).unwrap())[0].0, "beta");
     drop(tx);
 }

@@ -112,6 +112,12 @@ timeout) to run once more past it, so that its record says what it needs.
 - **Repetitions:** `--reps 2` by default, interleaved: every case once, then every case
   again in an order rotated by one. Within a repetition the perf lab repeats its
   measurements (`--runs`, `--reason-runs`, `repeat`) and keeps every sample.
+- **The release gate's measurement:** `run --measure measure.toml` (written by
+  `release_gate.py calibrate` from the gate host's passes) sets each listed case's runs,
+  warm-ups and repetitions for every side alike, `--batch` its batched timing where every
+  side's perf lab has `--batch`; each case's inputs are read into the page cache first, timed
+  processes are pinned to the host configuration's `cpus`, and the report records the host's
+  state at the start and end (`host_state`, scripts/hosts/hygiene.py).
 
 ## Comparing
 
@@ -149,6 +155,15 @@ its resolution floors and memory policy, and the measurements they rest on).
    vary by more than 40 % between repetitions are not compared and fail the comparison:
    the allocator moves them by up to 32 %, more is a measurement counting what is not the
    process's.
+
+### An A-B-B-A of two builds (a confirmation round)
+
+Every block times copies of the builds made for it ([PROTOCOL.md §5, "the unit"](../PROTOCOL.md#the-release-gate): a cached file's offset is shared by every block that times that file).
+
+- **Catalog cases, through the gate's steps:** `release-gate.sh build REV` for each side, then `prepare HARNESS` with `GATE_BASELINES=base GATE_CASES=...`. Then `block N HARNESS 1 - base=REV cand=REV` for N = 1..k (four reports a block), and `report HARNESS cand=REV base=REV`.
+- **Directly:** `fast.py block --block N --cases C --side base:BINDIR:REV --side cand:BINDIR:REV --seed S --fresh-copies DIR --out PASSES`. This needs the native runtime and prepared data, and a BINDIR laid out like a gate build (`release/examples/perf_lab`, REVISION, SHA256SUMS).
+- **A hand-rolled `perf_lab` loop (no catalog case):** at each block's start run `cp -a "$BIN" "$W/copy-$k-$side" && sync` for each side, time from the copy, and `rm -rf` it at the block's end. Never time one file in two blocks.
+- **The verdict:** `release_gate.py report` takes the host's A-A' floor from `noise-floor/HOST.toml` (`release_gate.py floor`), or says the host has none.
 
 ## What is kept
 

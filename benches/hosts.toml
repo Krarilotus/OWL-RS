@@ -62,6 +62,13 @@ has = ["docker", "java"]
 assets = true
 queue = { dir = "~/owlrs/queue", windows = ["21:00-06:00"], free = "~/owlrs/FREE", retreat = "~/owlrs/RETREAT", path = ["~/nrese-bench/py312/bin", "~/.cargo/bin"], python = "~/nrese-bench/py312/bin/python3" }
 
+[[host.office-pc.config]]
+since = "2026-10-18T23:00"
+governor = "powersave: amd-pstate-epp active, energy preference balance_performance, boost on (the host's administrators' setting on a shared host: recorded, not changed; scripts/hosts/hygiene.py records it with every pass)"
+# `cpus`: fast.py pins timed processes there (taskset; NRESE_FAST_CPUS overrides, empty unpins).
+cpus = "8-15,24-31"
+note = "timings on one CCD of the 5950X (L3 domain 8-15,24-31, one NUMA node: no cross-CCD migration or remote L3), 16 threads as phuoc-yu's; THP madvise; no password-less sudo (no cold_cache)"
+
 [host.phuoc-yu]
 ssh = "Phuoc-Yu"
 hostname = "Phuoc-Yu"
@@ -79,7 +86,7 @@ toolchain = "gcc 15.2 as cc and linker (Ubuntu 15.2.0-16ubuntu1); Rust 1.98.1 (r
 governor = "performance"
 perf_event_paranoid = 1
 cold_cache = "sudo -n /usr/local/sbin/owlrs-drop-caches"
-note = "profiling allowed; the page cache can be emptied before a cold run; measure only, builds on office-pc"
+note = "profiling allowed; the page cache can be emptied before a cold run; measure only, builds on office-pc. Checked 18 Oct 2026 (scripts/hosts/hygiene.py): amd-pstate-epp active, energy preference performance, boost on (no password-less sudo but the cold-cache command: recorded, not changed); one L3 and NUMA node (0-15), so timings aren't pinned; THP madvise. A desktop session runs (gnome-shell, T3 Code, ChatGPT; GNOME's localsearch indexes all of $HOME): the gate's directories carry .trackerignore, its passes run under the quiet watcher"
 
 [[host.phuoc-yu.config]]
 since = "2026-10-09"
@@ -107,6 +114,17 @@ queue = { dir = "S:/nrese-scratch/queue", repo = "S:/nrese-scratch/repo.git", re
 [[host.khaleesi.config]]
 since = "2026-10-12"
 toolchain = "Rust 1.98.1 (MSVC); Windows 11"
+
+[host.khaleesi-wsl]
+# The WSL 2 distribution on khaleesi (the fleet's host khaleesi-wsl): the Linux endpoint of
+# khaleesi's 64 GiB, where the release gate's cases above the timed host's memory run on
+# office-pc's ELF binaries (release_gate.py jobs; native Windows can't run them: refused).
+os = "linux"
+machine = "AMD Ryzen 9 5950X, 32 threads, 64 GiB (khaleesi's, under WSL 2)"
+roles = ["measure"]
+has = []
+assets = false
+note = "khaleesi's owner rules apply (the same machine, khaleesi-guard.py's retreat); its own baseline, never compared with another host's"
 
 [host.gamergrill]
 ssh = "GamerGrill"
