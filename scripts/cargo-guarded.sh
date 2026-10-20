@@ -188,12 +188,14 @@ fi
 # - its declared peak fits: free memory, less the peaks the runs already admitted declared, less
 #   its own, stays at or above the floor: NRESE_BUILD_FLOOR_GB, by default the guard's kill line
 #   plus a 4 GB margin where the guard runs (~/owlrs-guard), else 0. The kill line is read from
-#   the guard's script (NRESE_GUARD_SCRIPT, its `$hard = ($ram -lt N)`), else taken as 4 GB, as
-#   it is today: an 8 GB floor. (Its soft line, 16 GB, was the floor before: the agents' own load
+#   the guard's script (NRESE_GUARD_SCRIPT, its `$hard = ($ram -lt N) -or ($disk -lt M)`; a
+#   script present but unreadable so means no build), else taken as today's 4 GB: an 8 GB floor.
+#   (Its soft line, 16 GB, was the floor before: the agents' own load
 #   keeps the main PC at 12-16 GB free, so no hook on a merged base could start, 20 Oct 2026.)
 # The guard's BUSY (~/owlrs-guard/BUSY, NRESE_GUARD_BUSY: below its soft line) holds no run whose
-# peak fits above the floor; the agents' own load keeps it set for hours. A build's disk is
-# checked by the build itself (NRESE_MIN_FREE_GB, above).
+# peak fits above the floor; the agents' own load keeps it set for hours. The guard's other kill
+# line, free disk on C:, holds every run: none starts below that line plus 10 GB
+# (NRESE_GUARD_DISK_MARGIN_GB).
 # Its peak: NRESE_BUILD_PEAK_GB, else 0.6 GB per compiler job (1.2 GB for release code, fat LTO)
 # and 2 GB for the linker and the tests it runs. When that doesn't fit, it runs with fewer jobs
 # (2 at least) unless CARGO_BUILD_JOBS was given; else it waits. A run whose least peak exceeds
@@ -211,22 +213,53 @@ fi
 ADMIT="${NRESE_BUILD_SLOT_DIR:-$HOME/.nrese-build-slots}"
 SLOTS="${NRESE_BUILD_SLOTS:-3}"
 BUSY="${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}"
-floor_default=0
+floor_default=0 disk_floor_gb=0
 # (A Windows path's separators too: with them unread, the guard looked absent and the floor was 0.)
 busy_posix=${BUSY//\\//}
 if [ -d "${busy_posix%/*}" ]; then
-  kill_line=4
+  # The guard's kill line, its `$hard = ($ram -lt N) -or ($disk -lt M)` (GB of RAM free, GB free
+  # on C:), read as PowerShell reads it: any case and spacing, a last line without a newline. No
+  # script: today's line (4 GB, 100 GB). A script whose line can't be read so: no build, never a
+  # lower line silently (Sol, review-build-admission-r5, r5-2).
+  kill_ram=4 kill_disk=100
   guard_script="${NRESE_GUARD_SCRIPT:-$HOME/Desktop/Harness/tools/main-pc-guard/guard.ps1}"
-  if [ -r "$guard_script" ]; then
-    while IFS= read -r line; do
-      if [[ "$line" =~ ^[[:space:]]*\$hard[[:space:]]*=[[:space:]]*\(\$ram[[:space:]]+-lt[[:space:]]+([0-9]+)\) ]]; then
-        kill_line=${BASH_REMATCH[1]}
+  if [ -e "$guard_script" ]; then
+    hard=""
+    shopt -s nocasematch
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=${line%$'\r'}
+      if [[ "$line" =~ ^[[:space:]]*\$hard[[:space:]]*= ]]; then
+        hard=unreadable
+        s='[[:space:]]*'
+        if [[ "$line" =~ ^$s\$hard$s=$s\($s\$ram[[:space:]]+-lt[[:space:]]+([0-9]+)$s\)$s-or$s\($s\$disk[[:space:]]+-lt[[:space:]]+([0-9]+)$s\)$s(#.*)?$ ]]; then
+          hard="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+        fi
         break
       fi
     done < "$guard_script"
+    shopt -u nocasematch
+    if ! [[ "$hard" =~ ^[0-9]+\ [0-9]+$ ]]; then
+      printf 'cargo %s: the guard'\''s kill line can'\''t be read from %s (its `$hard = ($ram -lt N) -or ($disk -lt M)`): not building\n' \
+        "$*" "$guard_script" >&2
+      exit 2
+    fi
+    read -r kill_ram kill_disk <<< "$hard"
   fi
-  floor_default=$(( kill_line + 4 ))
+  floor_default=$(( kill_ram + 4 ))
+  # The guard also stops our processes below its disk line on C: (Sol, r5-1): a build waits for that
+  # line plus a margin, BUSY or not (NRESE_GUARD_VOLUME, default /c).
+  disk_floor_gb=$(( kill_disk + ${NRESE_GUARD_DISK_MARGIN_GB:-10} ))
 fi
+# Free GB on the guard's volume (NRESE_GUARD_DISKFREE: a file with the number, for tests); nothing
+# when it can't be read.
+guard_disk_gb() {
+  if [ -n "${NRESE_GUARD_DISKFREE:-}" ]; then
+    local gb
+    read -r gb < "$NRESE_GUARD_DISKFREE" 2> /dev/null && printf '%s\n' "$gb"
+  else
+    free_gb "${NRESE_GUARD_VOLUME:-/c}" 2> /dev/null
+  fi
+}
 FLOOR_MB=$(( ${NRESE_BUILD_FLOOR_GB:-$floor_default} * 1024 ))
 per_job_mb=614
 previous=""
@@ -322,7 +355,11 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
     done
     peak=$(peak_of "$CARGO_BUILD_JOBS")
     why=""
-    if [ "$ahead" -gt 0 ]; then
+    disk=""
+    [ "$disk_floor_gb" -eq 0 ] || disk=$(guard_disk_gb)
+    if [ "$disk_floor_gb" -gt 0 ] && ! { [[ "$disk" =~ ^[0-9]+$ ]] && [ "$disk" -ge "$disk_floor_gb" ]; }; then
+      why="the guard's volume has ${disk:-an unreadable number of} GB free, below its kill line of $kill_disk GB plus a $(( disk_floor_gb - kill_disk )) GB margin"
+    elif [ "$ahead" -gt 0 ]; then
       why="$ahead waiting before it"
     elif [ "$running" -ge "$SLOTS" ]; then
       why="all $SLOTS build slots are taken"
@@ -351,14 +388,18 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
       printf 'waiting to build, place %s in line: %s\n' "$place" "$why" >&2
       said=$waited
     fi
+    # The deadline before any later look at the room, and no sleep past it: room that appears after
+    # it doesn't admit (Sol, r5 follow-up).
+    pause=${NRESE_BUILD_SLOT_POLL_S:-5}
+    [ $(( limit - waited )) -ge "$pause" ] || pause=$(( limit - waited ))
+    [ "$pause" -le 0 ] || sleep "$pause"
+    waited=$((SECONDS - since))
     if [ "$waited" -ge "$limit" ]; then
       rm -f "$ticket"
       printf 'cargo %s: not built: no room to build after %s s (%s); try again later, or build on the fleet\n' \
         "$*" "$waited" "$why" >&2
       exit 75
     fi
-    sleep "${NRESE_BUILD_SLOT_POLL_S:-5}"
-    waited=$((SECONDS - since))
   done
   if [ "$waited" -gt 0 ]; then
     mkdir -p "$ROOT/tmp"
