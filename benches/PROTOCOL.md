@@ -242,7 +242,7 @@ phuoc-yu and the big host); a declared hypothesis a round doesn't test counts at
   that copying and deleting per block redraws the offset (pages can be reused). The first A-A'
   floor run (phuoc-yu) tests it, its copy-to-copy spread across blocks against lks-aa-20's
   between-file spread; until then the false-block rates of `probes/gate-falseblock.py` (0 of
-  2,000 simulated A/A gates with copies, against 0.1 % to 100 % without, by blocks a round) hold
+  2,000 simulated A/A gates with copies, against 0.2 % to 100 % without, by blocks a round) hold
   under that assumption only.
 - *The floor.* `release_gate.py floor` writes `fast/noise-floor/<host>.toml`
   from an A-A' gate on that host (every side one revision; the copies make them different
