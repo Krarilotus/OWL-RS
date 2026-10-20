@@ -386,8 +386,9 @@ if os.name != "nt":  # a directory is synced on POSIX; Windows can not open one 
   [ -f "$tree/$MEASURE" ] && opts+=(--measure "$MEASURE")
   # Batched timing (perf_lab --batch) only when every side's perf lab has it (jobs: GATE_BATCH).
   [ "${GATE_BATCH:-0}" = 1 ] && opts+=(--batch)
-  # The round's seed (GATE_SEED, else drawn once and kept with its results): each pair of blocks'
-  # orientation and the cases' order in a block drawn from it, recorded in every pass.
+  # The round's seed (GATE_SEED, else drawn once and kept with its results): each square of
+  # blocks' orders (fast.py palindrome()) and the cases' order in a block drawn from it, recorded
+  # in every pass.
   [ -s "$OUT/seed" ] || echo "${GATE_SEED:-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')}" > "$OUT/seed"
   opts+=(--seed "$(cat "$OUT/seed")")
   fast_env
