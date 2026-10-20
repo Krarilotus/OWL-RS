@@ -23,6 +23,7 @@ mod graph_store_executor;
 pub mod image_backup;
 pub mod jobs;
 mod loader;
+mod metadata;
 pub mod mutation;
 pub mod namespaces;
 pub mod quarantine;

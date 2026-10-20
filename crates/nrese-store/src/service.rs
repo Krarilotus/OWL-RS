@@ -153,7 +153,7 @@ impl StoreService {
         };
         let namespaces = crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
-        );
+        )?;
         let quarantine = crate::quarantine::Quarantine::open(
             (config.mode == StoreMode::OnDisk).then_some(config.data_dir.as_path()),
         )?;

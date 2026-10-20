@@ -393,16 +393,34 @@ pub async fn repositories(
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &authenticated).await?;
     let writable = state.runtime_posture().sparql_update_enabled;
-    let ids = std::iter::once((DEFAULT_REPOSITORY.to_owned(), Some("NRESE".to_owned())))
-        .chain(state.repositories().list());
+    // Those that didn't open at start are listed neither readable nor writable.
+    let ids = std::iter::once((
+        DEFAULT_REPOSITORY.to_owned(),
+        Some("NRESE".to_owned()),
+        true,
+    ))
+    .chain(
+        state
+            .repositories()
+            .list()
+            .into_iter()
+            .map(|(id, title)| (id, title, true)),
+    )
+    .chain(
+        state
+            .repositories()
+            .unavailable_list()
+            .into_iter()
+            .map(|(id, _)| (id, None, false)),
+    );
     let rows = ids
-        .map(|(id, title)| {
+        .map(|(id, title, open)| {
             vec![
                 literal(format!("/repositories/{id}")),
                 literal(id.as_str()),
                 literal(title.unwrap_or_else(|| format!("NRESE: {id}"))),
-                Some(Literal::from(true).into()),
-                Some(Literal::from(writable).into()),
+                Some(Literal::from(open).into()),
+                Some(Literal::from(open && writable).into()),
             ]
         })
         .collect();
