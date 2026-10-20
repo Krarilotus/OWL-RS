@@ -449,7 +449,12 @@ pub(crate) fn threads() -> usize {
 /// `f` of each of `parts`, in parallel on a pool of its own (not the global one): for work
 /// done while a lock is held, since its threads take on no job of the global pool's, which
 /// might wait for that lock. Its threads are made once (spawning them for each build cost
-/// more than the work on a cold index of a few hundred thousand terms).
+/// more than the work on a cold index of a few hundred thousand terms). The caller waits
+/// without taking on work: a worker of a pool waiting in another pool's `install` runs its
+/// own pool's jobs meanwhile, one of which might want the lock it holds, so a worker waits
+/// on a thread of no pool. `f` takes no lock of the dictionary, a read included (with a
+/// writer queued, a new read waits behind it, and the writer behind the holder): it is
+/// handed what it reads.
 pub(crate) fn scoped<T: Send, R: Send>(parts: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
     static LOCKED: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     let pool = LOCKED.get_or_init(|| {
@@ -459,7 +464,16 @@ pub(crate) fn scoped<T: Send, R: Send>(parts: Vec<T>, f: impl Fn(T) -> R + Sync)
             .build()
             .expect("the pool for work under a lock")
     });
-    pool.install(|| parts.into_par_iter().map(&f).collect())
+    let run = || pool.install(|| parts.into_par_iter().map(&f).collect());
+    match rayon::current_thread_index() {
+        Some(_) => std::thread::scope(|scope| {
+            scope
+                .spawn(run)
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        }),
+        None => run(),
+    }
 }
 
 /// The numbers whose bits `bits` sets, ascending.
