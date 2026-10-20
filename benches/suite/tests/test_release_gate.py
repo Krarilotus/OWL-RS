@@ -514,7 +514,11 @@ class Parts(unittest.TestCase):
         bash, python = shutil.which("bash"), shutil.which("python3")
         if bash is None or python is None:
             self.skipTest("no bash or python3")
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+        # Outside a commit hook's index: its GIT_INDEX_FILE would take the new worktree's checkout
+        # (20 Oct 2026: the hook's own test run emptied two commits).
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, env=clean, capture_output=True,
+                              text=True).stdout.strip()
         with tempfile.TemporaryDirectory() as tmp:
             t = Path(tmp).as_posix()
             # fast.py block as it numbers its reports (2 per side a block); every other python3 call the real one.
@@ -540,15 +544,15 @@ echo tool > "$b/release/tool"; echo {head} > "$b/REVISION"; echo timing=watchdog
 point {head} "$b"
 echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
 '''
-            env = {**os.environ, "NRESE_GATE_DIR": f"{t}/gate", "GATE_BIN": f"{t}/bin", "FLEET_OUT": f"{t}/out",
+            env = {**clean, "NRESE_GATE_DIR": f"{t}/gate", "GATE_BIN": f"{t}/bin", "FLEET_OUT": f"{t}/out",
                    "GATE_QUIET": "0"}
             subprocess.run([bash, "-c", setup], cwd=ROOT, env=env, check=True, capture_output=True)
             done = subprocess.run([bash, "-c", f'PATH="$(cygpath -u "{shim}" 2>/dev/null || echo "{shim}"):$PATH" '
                                    f'exec bash scripts/release-gate.sh block 2 {head} 1 - base={head} cand={head}'],
                                   cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
             subprocess.run(["git", "worktree", "remove", "--force", f"{t}/gate/src-{head[:8]}"], cwd=ROOT,
-                           capture_output=True)
-        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
+                           env=clean, capture_output=True)
+        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, env=clean, capture_output=True)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("block 2: done", done.stdout)
 
