@@ -451,7 +451,13 @@ impl Wal {
                 let len = file.seek(SeekFrom::End(0))?;
                 (first_revision, file, len)
             }
-            _ => {
+            newest => {
+                // Commits are acknowledged in the new segment only once what recovery
+                // replayed from the newest one is on disk too: after a process crash it may
+                // still be in the page cache alone (an OsBuffered write, or one not yet synced).
+                if let Some((_, path)) = newest {
+                    OpenOptions::new().write(true).open(&path)?.sync_all()?;
+                }
                 let file = create_segment(dir, next_revision, magic, sync)?;
                 (next_revision, file, SEGMENT_MAGIC.len() as u64)
             }
