@@ -216,17 +216,56 @@ fn measures_in_metres_and_degrees() {
         )
         .is_none()
     );
-    // In a projected system, measures are in its own unit.
-    let projected = number(
-        &engine,
-        &format!(
-            "geof:distance({}, {}, uom:metre)",
-            wkt("<http://www.opengis.net/def/crs/EPSG/0/3857> POINT(0 0)"),
-            wkt("<http://www.opengis.net/def/crs/EPSG/0/3857> POINT(300 400)")
-        ),
-    )
-    .unwrap();
-    assert!((projected - 500.0).abs() < 1e-9);
+    // A projected system whose axes are known to be in metres measures in metres; another
+    // unit, or a system whose unit isn't known, is refused, never answered with the raw
+    // coordinate measure in whatever unit was asked (SPR-19: 300 in metres and in degrees
+    // alike).
+    let in_crs = |crs: &str, text: &str| {
+        wkt(&format!(
+            "<http://www.opengis.net/def/crs/EPSG/0/{crs}> {text}"
+        ))
+    };
+    let (a, b) = (
+        in_crs("3857", "POINT(0 0)"),
+        in_crs("3857", "LINESTRING(300 400, 300 0)"),
+    );
+    let square = in_crs("3857", "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))");
+    let measured =
+        |expression: String| number(&engine, &expression).unwrap_or_else(|| panic!("{expression}"));
+    assert_eq!(
+        measured(format!("geof:distance({a}, {b}, uom:metre)")),
+        300.0
+    );
+    assert_eq!(measured(format!("geof:length({b}, uom:metre)")), 400.0);
+    assert_eq!(
+        measured(format!("geof:area({square}, uom:squareMetre)")),
+        100.0
+    );
+    let disc = measured(format!(
+        "geof:area(geof:buffer({a}, 1, uom:metre), uom:squareMetre)"
+    ));
+    assert!((3.0..3.2).contains(&disc), "{disc}");
+    let (c, d) = (
+        in_crs("2056", "POINT(0 0)"),
+        in_crs("2056", "POINT(300 400)"),
+    );
+    for refused in [
+        format!("geof:distance({a}, {b}, uom:degree)"),
+        format!("geof:length({b}, uom:radian)"),
+        format!("geof:area({square}, uom:degree)"),
+        format!("geof:buffer({a}, 1, uom:degree)"),
+        format!("geof:distance({c}, {d}, uom:metre)"),
+        format!("geof:area(geof:envelope({c}), uom:squareMetre)"),
+    ] {
+        assert!(
+            select(
+                &engine,
+                &format!("SELECT ?v WHERE {{ BIND({refused} AS ?v) }}")
+            )[0][0]
+                .is_none(),
+            "{refused}"
+        );
+    }
 }
 
 #[test]
