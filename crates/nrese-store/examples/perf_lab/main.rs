@@ -2,13 +2,13 @@
 //!
 //! ```text
 //! cargo run --release -p nrese-store --example perf_lab -- \
-//!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] \
+//!     [--store DIR] [--load FILE]... --queries DIR [--runs 5] [--warmup 1] [--batch 1 [--batch-queries A,B]] \
 //!     [--timeout-s 120] [--only SUBSTRING] [--label NAME] [--json OUT] [--baseline JSON] \
 //!     [--explain] [--qerror] [--format tsv|json|xml|csv] [--shapes FILE]
 //!     [--shacl-report FILE] [--reason MODE]
 //!     [--rules FILE.n3] [--reason-runs 1] [--results DIR] [--routes] [--commits FILE]
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
-//!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC]
+//!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC] [--read-graphs IRI,...]
 //! cargo run --release -p nrese-store --example perf_lab -- generate KIND OUT [key=value]...
 //! ```
 //!
@@ -17,7 +17,11 @@
 //!   After a load (and its reasoning) the planner's statistics are prepared before the
 //!   queries, as the server's load command does, timed apart (`statistics_ms`).
 //! - **Queries:** every `*.rq` in `--queries`, in name order. Each runs `--warmup` times
-//!   unmeasured, then `--runs` times measured. The result is serialised as the server
+//!   unmeasured, then `--runs` times measured; with `--batch K` each measured sample times K
+//!   executions back to back and reports their mean, in nanoseconds (a query of a few
+//!   microseconds, timed alone, is a few steps of the report's microsecond and its timer's
+//!   overhead); `--batch-queries` limits it to the queries named (the short ones of a set
+//!   that also has long ones). The result is serialised as the server
 //!   would (TSV for SELECT, JSON for ASK, N-Triples for CONSTRUCT/DESCRIBE) into a
 //!   counting sink, so evaluation, term decoding and serialisation are all included.
 //! - **Report:** rows, p50, min and max per query, peak memory (Linux), and a JSON file
@@ -40,6 +44,9 @@
 //!   `--faults` prints, per query, the first execution's time and page faults beside the
 //!   later runs' median faults (the first execution after opening a mapped store, P6),
 //!   and the working set after opening; the report gets `first_faults` and `faults`.
+//!   `--read-graphs IRI,...` runs every query as a reader restricted to those named graphs
+//!   (graph-level access control: not the default graph, not the inferred statements), the
+//!   values and routes the report records included.
 //!   `--qerror` measures the planner's estimates: every operator with an estimate, over
 //!   every query, gets its q-error, `max(estimate, rows) / min(estimate, rows)` (both at
 //!   least 1; Moerkotte et al., VLDB 2009), summarised per operator (median, p90, max, the
@@ -77,10 +84,10 @@ mod modes;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode, UserRules};
 use nrese_store::{
     BulkLoadRequest, CancellationToken, GraphTarget, MutationPipeline, PreparedQuery,
     QueryResultKind, ShaclValidationRequest, SolutionsResultFormat, SparqlQueryRequest,
@@ -101,10 +108,17 @@ static GLOBAL: Counting = Counting;
 static GLOBAL: nrese_exec::heap::Counting<mimalloc::MiMalloc> =
     nrese_exec::heap::Counting(mimalloc::MiMalloc);
 
-/// Whether allocations are counted (`--count-allocations`), and the counts.
+/// Whether allocations are counted (`--count-allocations`), and the counts: allocations and
+/// the bytes they requested in all (cumulative, never lowered by a free), and the bytes
+/// requested and not yet freed (`LIVE`, from when counting began: frees of earlier allocations
+/// can take it below zero) with its high-water mark (`PEAK_LIVE`, reset to `LIVE` when a phase
+/// starts: the peak live requested bytes of that phase).
 static COUNT_ALLOCATIONS: AtomicBool = AtomicBool::new(false);
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+static LIVE: AtomicI64 = AtomicI64::new(0);
+static PEAK_LIVE: AtomicI64 = AtomicI64::new(0);
+static LIVE_PEAK_RUN: AtomicI64 = AtomicI64::new(0);
 
 /// mimalloc, counting allocations when asked (one relaxed load when not).
 #[cfg(not(any(system_alloc, alloc_profile)))]
@@ -118,6 +132,16 @@ impl Counting {
             ALLOCATED_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
         }
     }
+
+    /// `delta` live bytes more (a successful allocation's size, a free's negated, a successful
+    /// reallocation's difference); the high-water mark follows, without allocating.
+    fn live(delta: i64) {
+        if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
+            let now = LIVE.fetch_add(delta, Ordering::Relaxed) + delta;
+            PEAK_LIVE.fetch_max(now, Ordering::Relaxed);
+            LIVE_PEAK_RUN.fetch_max(now, Ordering::Relaxed);
+        }
+    }
 }
 
 // SAFETY: every call is passed on to mimalloc unchanged; counting has no other effect.
@@ -126,16 +150,25 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         Self::count(layout.size());
         // SAFETY: the caller's contract for `alloc` is mimalloc's.
-        unsafe { mimalloc::MiMalloc.alloc(layout) }
+        let ptr = unsafe { mimalloc::MiMalloc.alloc(layout) };
+        if !ptr.is_null() {
+            Self::live(layout.size() as i64);
+        }
+        ptr
     }
 
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         Self::count(layout.size());
         // SAFETY: as for `alloc`.
-        unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) }
+        let ptr = unsafe { mimalloc::MiMalloc.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            Self::live(layout.size() as i64);
+        }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        Self::live(-(layout.size() as i64));
         // SAFETY: `ptr` came from mimalloc with `layout`, as the caller guarantees.
         unsafe { mimalloc::MiMalloc.dealloc(ptr, layout) }
     }
@@ -143,7 +176,12 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
         Self::count(new_size);
         // SAFETY: as for `dealloc`, and `new_size` is the caller's.
-        unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) }
+        let moved = unsafe { mimalloc::MiMalloc.realloc(ptr, layout, new_size) };
+        // A failed reallocation leaves the old block in place: nothing changes.
+        if !moved.is_null() {
+            Self::live(new_size as i64 - layout.size() as i64);
+        }
+        moved
     }
 }
 
@@ -156,7 +194,8 @@ fn allocations() -> (u64, u64) {
 }
 
 /// The memory a phase used: its peak (Linux: the resident set's, in a window started with
-/// the phase; elsewhere the process's so far) and, when counted, its allocations.
+/// the phase; Windows: none, its peak can't be reset) and, when counted, its allocations, the
+/// bytes they requested in all, and its peak live requested bytes.
 struct Phase {
     allocations: (u64, u64),
 }
@@ -164,21 +203,24 @@ struct Phase {
 impl Phase {
     fn start() -> Self {
         nrese_exec::memory::start_peak_window();
+        PEAK_LIVE.store(LIVE.load(Ordering::Relaxed), Ordering::Relaxed);
         Self {
             allocations: allocations(),
         }
     }
 
-    /// `{"peak_mib": .., "allocations": .., "allocated_mib": ..}` since `start`.
+    /// `{"peak_mib": .., "allocations": .., "requested_mib": .., "peak_live_requested_bytes": ..}`
+    /// since `start`.
     fn json(&self) -> String {
         let (count, bytes) = allocations();
         let peak = nrese_exec::memory::window_peak_bytes()
             .map_or("null".to_owned(), |peak| (peak / 1048576).to_string());
         if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
             format!(
-                "{{\"peak_mib\": {peak}, \"allocations\": {}, \"allocated_mib\": {}}}",
+                "{{\"peak_mib\": {peak}, \"allocations\": {}, \"requested_mib\": {}, \"peak_live_requested_bytes\": {}}}",
                 count - self.allocations.0,
-                (bytes - self.allocations.1) / 1048576
+                (bytes - self.allocations.1) / 1048576,
+                PEAK_LIVE.load(Ordering::Relaxed).max(0)
             )
         } else {
             format!("{{\"peak_mib\": {peak}}}")
@@ -192,6 +234,8 @@ struct Args {
     queries: PathBuf,
     runs: usize,
     warmup: usize,
+    batch: usize,
+    batch_queries: Option<Vec<String>>,
     timeout: Duration,
     only: Option<String>,
     label: String,
@@ -222,6 +266,7 @@ struct Args {
     kernel: Option<String>,
     classify: bool,
     prepare_vector_graph: Option<(usize, nrese_engine::vector::Metric)>,
+    read_graphs: Vec<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -231,6 +276,8 @@ fn parse_args() -> Result<Args, String> {
         queries: PathBuf::new(),
         runs: 5,
         warmup: 1,
+        batch: 1,
+        batch_queries: None,
         timeout: Duration::from_secs(120),
         only: None,
         label: "nrese".into(),
@@ -261,6 +308,7 @@ fn parse_args() -> Result<Args, String> {
         kernel: None,
         classify: false,
         prepare_vector_graph: None,
+        read_graphs: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -271,6 +319,10 @@ fn parse_args() -> Result<Args, String> {
             "--queries" => args.queries = value()?.into(),
             "--runs" => args.runs = value()?.parse().map_err(|e| format!("--runs: {e}"))?,
             "--warmup" => args.warmup = value()?.parse().map_err(|e| format!("--warmup: {e}"))?,
+            "--batch" => args.batch = value()?.parse().map_err(|e| format!("--batch: {e}"))?,
+            "--batch-queries" => {
+                args.batch_queries = Some(value()?.split(',').map(str::to_owned).collect())
+            }
             "--timeout-s" => {
                 args.timeout =
                     Duration::from_secs(value()?.parse().map_err(|e| format!("--timeout-s: {e}"))?)
@@ -330,6 +382,7 @@ fn parse_args() -> Result<Args, String> {
             "--parse-only" => args.parse_only = true,
             "--kernel" => args.kernel = Some(value()?),
             "--classify" => args.classify = true,
+            "--read-graphs" => args.read_graphs = value()?.split(',').map(str::to_owned).collect(),
             "--prepare-vector-graph" => {
                 let input = value()?;
                 let (dimension, metric) = input
@@ -357,8 +410,8 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument {other}")),
         }
     }
-    if args.runs == 0 || args.reason_runs == 0 {
-        return Err("--runs and --reason-runs must be > 0".into());
+    if args.runs == 0 || args.reason_runs == 0 || args.batch == 0 {
+        return Err("--runs, --reason-runs and --batch must be > 0".into());
     }
     Ok(args)
 }
@@ -393,30 +446,30 @@ struct Measured {
     faults: Vec<u64>,
 }
 
+/// Runs the query `executions` times back to back under one timeout: the rows of an execution
+/// and the mean time of one (`--batch`; 1 times a single execution).
 fn run_once(
     store: &StoreService,
     prepared: &PreparedQuery,
     timeout: Duration,
+    executions: usize,
 ) -> Result<(u64, Duration), String> {
     let token = CancellationToken::new();
-    let canceller = {
-        let token = token.clone();
-        let (done, wait) = std::sync::mpsc::channel::<()>();
-        (
-            std::thread::spawn(move || {
-                if wait.recv_timeout(timeout).is_err() {
-                    token.cancel();
-                }
-            }),
-            done,
-        )
-    };
+    // The process's watchdog cancels at the timeout: armed before the timed window, disarmed
+    // after it, so that no thread starts inside it (benches/fast/patches/perf_lab_watchdog.py).
+    let armed = perf_lab_watchdog::arm(&token, timeout);
     let mut sink = CountingSink::default();
     let started = Instant::now();
-    let result = store.run_query(prepared, &token, &mut sink);
+    let mut result = Ok(());
+    for _ in 0..executions {
+        sink = CountingSink::default();
+        result = store.run_query(prepared, &token, &mut sink).map(|_| ());
+        if result.is_err() {
+            break;
+        }
+    }
     let elapsed = started.elapsed();
-    let _ = canceller.1.send(());
-    let _ = canceller.0.join();
+    drop(armed);
     result.map_err(|e| {
         if elapsed >= timeout {
             format!("timeout after {} s", timeout.as_secs())
@@ -430,7 +483,7 @@ fn run_once(
         QueryResultKind::Boolean => 1,
         QueryResultKind::Graph => sink.lines,
     };
-    Ok((rows, elapsed))
+    Ok((rows, elapsed / executions as u32))
 }
 
 /// The query's answer, serialised as the measurement does, into `path`.
@@ -443,7 +496,7 @@ fn write_results(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut request = SparqlQueryRequest::all(text);
+    let mut request = request(text);
     request.solutions_format = args.format;
     let mut prepared = PreparedQuery::parse(&request)?;
     if prepared.kind() == QueryResultKind::Boolean {
@@ -498,8 +551,9 @@ fn measure_autocomplete(store: &StoreService, typed: &str, args: &Args) -> Measu
     measured
 }
 
-fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
-    let mut request = SparqlQueryRequest::all(text);
+/// Each sample of `measure` times `batch` executions (1: one).
+fn measure(store: &StoreService, text: &str, args: &Args, batch: usize) -> Measured {
+    let mut request = request(text);
     request.solutions_format = args.format;
     let prepared = match PreparedQuery::parse(&request) {
         Ok(prepared) if prepared.kind() != QueryResultKind::Boolean => prepared,
@@ -529,7 +583,8 @@ fn measure(store: &StoreService, text: &str, args: &Args) -> Measured {
     };
     for i in 0..args.warmup + args.runs {
         let faults = nrese_exec::memory::page_faults();
-        match run_once(store, &prepared, args.timeout) {
+        let executions = if i >= args.warmup { batch } else { 1 };
+        match run_once(store, &prepared, args.timeout, executions) {
             Ok((rows, elapsed)) => {
                 if let (Some(before), Some(after)) = (faults, nrese_exec::memory::page_faults()) {
                     match measured.first_faults {
@@ -561,7 +616,7 @@ fn ms(d: Duration) -> f64 {
 /// Prints how `text` runs: each operator, indented by depth, with estimated and actual
 /// rows and its time.
 fn explain(store: &StoreService, text: &str) {
-    let explained = PreparedQuery::parse(&SparqlQueryRequest::all(text))
+    let explained = PreparedQuery::parse(&request(text))
         .map_err(|e| e.to_string())
         .and_then(|prepared| {
             store
@@ -620,7 +675,7 @@ fn explain(store: &StoreService, text: &str) {
 
 /// The q-errors of `text`'s estimated operators, by operator.
 fn qerrors(store: &StoreService, text: &str, into: &mut BTreeMap<String, Vec<f64>>) {
-    let Ok(prepared) = PreparedQuery::parse(&SparqlQueryRequest::all(text)) else {
+    let Ok(prepared) = PreparedQuery::parse(&request(text)) else {
         return;
     };
     let Ok(explanation) = store.explain_query(&prepared, &CancellationToken::new()) else {
@@ -767,7 +822,7 @@ fn read_baseline(path: &PathBuf) -> BTreeMap<String, f64> {
 
 /// The first value of a one-row result (a count's answer), as its lexical form.
 fn first_value(store: &StoreService, text: &str) -> Option<String> {
-    let mut request = SparqlQueryRequest::all(text);
+    let mut request = request(text);
     request.solutions_format = SolutionsResultFormat::Tsv;
     let prepared = PreparedQuery::parse(&request).ok()?;
     if prepared.kind() != QueryResultKind::Solutions {
@@ -790,7 +845,7 @@ fn first_value(store: &StoreService, text: &str) -> Option<String> {
 
 /// The rewrites EXPLAIN reports for `text` (`ql-tree-witness`, `join-groups`, ...).
 fn rewrites(store: &StoreService, text: &str) -> Vec<&'static str> {
-    PreparedQuery::parse(&SparqlQueryRequest::all(text))
+    PreparedQuery::parse(&request(text))
         .ok()
         .and_then(|prepared| {
             store
@@ -804,7 +859,7 @@ fn rewrites(store: &StoreService, text: &str) -> Vec<&'static str> {
 /// The status of `text`'s answers, as JSON (`null` where nothing can leave answers out):
 /// sound, complete, the bounds' counts and, under `owl2-dl`, the paths that decided.
 fn query_status(store: &StoreService, text: &str) -> String {
-    let Ok(prepared) = PreparedQuery::parse(&SparqlQueryRequest::all(text)) else {
+    let Ok(prepared) = PreparedQuery::parse(&request(text)) else {
         return "null".to_owned();
     };
     match store.run_query_dl(
@@ -836,7 +891,7 @@ fn query_status(store: &StoreService, text: &str) -> String {
 
 /// The distinct operators `text` runs with, in the order EXPLAIN lists them.
 fn operators(store: &StoreService, text: &str) -> Vec<String> {
-    let Ok(prepared) = PreparedQuery::parse(&SparqlQueryRequest::all(text)) else {
+    let Ok(prepared) = PreparedQuery::parse(&request(text)) else {
         return Vec::new();
     };
     let Ok(explanation) = store.explain_query(&prepared, &CancellationToken::new()) else {
@@ -898,13 +953,28 @@ struct Report {
 impl Report {
     fn json(&self, label: &str) -> String {
         let memory = memory_mib();
-        let sections: String = self
+        let mut sections: String = self
             .sections
             .iter()
             .map(|(key, value)| format!("\n  \"{key}\": {value},"))
             .collect();
+        // What `peak_mib` measures, by name, and the working set's peak where the platform
+        // keeps one (Windows); with counted allocations, the run's peak live requested bytes.
+        sections.push_str(&format!(
+            "\n  \"peak_kind\": {:?},",
+            nrese_exec::memory::peak_kind()
+        ));
+        if let Some(peak) = nrese_exec::memory::peak_working_set_bytes() {
+            sections.push_str(&format!("\n  \"peak_working_set_bytes\": {peak},"));
+        }
+        if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
+            sections.push_str(&format!(
+                "\n  \"peak_live_requested_bytes\": {},",
+                LIVE_PEAK_RUN.load(Ordering::Relaxed).max(0)
+            ));
+        }
         format!(
-            "{{\n  \"label\": {label:?},\n  \"open_s\": {:.3},\n  \"load_s\": {:.3},\n  \"peak_mib\": {},\n  \"cgroup_peak_mib\": {},\n  \"sum_p50_ms\": {:.3},{}{}\n  \"queries\": [\n{}\n  ]\n}}\n",
+            "{{\n  \"label\": {label:?},\n  \"open_s\": {:.6},\n  \"load_s\": {:.6},\n  \"peak_mib\": {},\n  \"cgroup_peak_mib\": {},\n  \"sum_p50_ms\": {:.3},{}{}\n  \"queries\": [\n{}\n  ]\n}}\n",
             self.open_s,
             self.load_s,
             memory.map_or(0, |(peak, _)| peak),
@@ -919,6 +989,17 @@ impl Report {
     }
 }
 
+/// Whose reads the queries are (`--read-graphs`); every graph when unset.
+static SCOPE: std::sync::OnceLock<nrese_store::ReadScope> = std::sync::OnceLock::new();
+
+/// A query request in the run's read scope.
+pub(crate) fn request(text: &str) -> SparqlQueryRequest {
+    SparqlQueryRequest::new(
+        text,
+        SCOPE.get().cloned().unwrap_or(nrese_store::ReadScope::All),
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().map(String::as_str) == Some("generate") {
@@ -929,6 +1010,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     nrese_engine::memory::set_release(|force| unsafe { libmimalloc_sys::mi_collect(force) });
     let args =
         parse_args().map_err(|e| format!("{e}\nsee the usage at the top of perf_lab/main.rs"))?;
+    if !args.read_graphs.is_empty() {
+        let access = nrese_sparql::GraphAccess {
+            graphs: args.read_graphs.clone(),
+            ..Default::default()
+        };
+        let _ = SCOPE.set(nrese_store::ReadScope::of(Some(Arc::new(access))));
+    }
     let mut report = Report::default();
     let result = run(&args, &mut report);
     if let Err(error) = &result {
@@ -1048,12 +1136,10 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     let program = reasoner.materialised_program();
     // Under `owl2-dl` the store enters the mode with its pipeline (the bounds, the
     // consistency gate, a status on every answer); the commits below use the same one.
-    let mut dl_pipeline = reasoner.mode().is_dl().then(|| {
-        MutationPipeline::new(
-            Arc::clone(&store),
-            Arc::new(ReasonerService::new(reasoner.clone())),
-        )
-    });
+    let mut dl_pipeline = reasoner
+        .mode()
+        .is_dl()
+        .then(|| MutationPipeline::new(Arc::clone(&store), reasoner.clone()));
     if let Some(program) = &program {
         if let Some((peak, rss)) = memory_mib() {
             eprintln!("before reasoning: memory peak {peak} MiB, resident {rss} MiB");
@@ -1197,12 +1283,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         .collect::<Result<_, _>>()?;
     if let Some(file) = &args.commits {
         let phase = Phase::start();
-        let pipeline = dl_pipeline.take().unwrap_or_else(|| {
-            MutationPipeline::new(
-                Arc::clone(&store),
-                Arc::new(ReasonerService::new(reasoner.clone())),
-            )
-        });
+        let pipeline = dl_pipeline
+            .take()
+            .unwrap_or_else(|| MutationPipeline::new(Arc::clone(&store), reasoner.clone()));
         report.sections.push((
             "commits",
             modes::commits(&pipeline, file, &texts, args.readers)?,
@@ -1266,9 +1349,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     }
     if let Some(path) = &args.export {
         let started = Instant::now();
-        let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(
-            "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
-        ))?;
+        let prepared = PreparedQuery::parse(&request("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }"))?;
         let file = std::io::BufWriter::new(std::fs::File::create(path)?);
         store.run_query(&prepared, &CancellationToken::new(), file)?;
         eprintln!("exported in {:.2} s", started.elapsed().as_secs_f64());
@@ -1335,7 +1416,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         query.metric = metric;
         query.strategy = nrese_engine::VectorStrategy::Approximate;
         snapshot.prepare_vector_search();
-        let (_, readiness) = snapshot.vector_search(&query, &|_| true);
+        let (_, readiness) = snapshot
+            .vector_search(&query, &|_| true)
+            .expect("an unlimited search");
         report.sections.push(("vector_prepare", phase.json()));
         let metric = metric.name();
         report.sections.push(("vector_graph", format!(
@@ -1390,7 +1473,12 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             ));
             continue;
         }
-        let m = measure(&store, text, args);
+        // Batched where asked: every query, or those `--batch-queries` names.
+        let batch = match &args.batch_queries {
+            Some(names) if !names.contains(&name) => 1,
+            _ => args.batch,
+        };
+        let m = measure(&store, text, args, batch);
         if let Some(dir) = &args.results {
             write_results(&store, text, args, &dir.join(format!("{name}.out")))?;
         }
@@ -1453,9 +1541,18 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
                 operators(&store, text)
             ));
         }
-        let samples: Vec<String> = m.times.iter().map(|t| format!("{:.3}", ms(*t))).collect();
+        // Batched samples are means of several executions: reported to the nanosecond.
+        let digits = if batch > 1 { 6 } else { 3 };
+        if batch > 1 {
+            extra.push_str(&format!(",\n      \"batch\": {batch}"));
+        }
+        let samples: Vec<String> = m
+            .times
+            .iter()
+            .map(|t| format!("{:.digits$}", ms(*t)))
+            .collect();
         report.queries.push(format!(
-            "    {{\n      \"name\": \"{name}\",\n      \"rows\": {},\n      \"p50_ms\": {p50:.3},\n      \"min_ms\": {min:.3},\n      \"max_ms\": {max:.3},\n      \"samples_ms\": [{}]{extra}\n    }}",
+            "    {{\n      \"name\": \"{name}\",\n      \"rows\": {},\n      \"p50_ms\": {p50:.digits$},\n      \"min_ms\": {min:.digits$},\n      \"max_ms\": {max:.digits$},\n      \"samples_ms\": [{}]{extra}\n    }}",
             m.rows,
             samples.join(", ")
         ));
@@ -1465,12 +1562,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     }
     if let Some(file) = &args.then_commit {
         let phase = Phase::start();
-        let pipeline = dl_pipeline.take().unwrap_or_else(|| {
-            MutationPipeline::new(
-                Arc::clone(&store),
-                Arc::new(ReasonerService::new(reasoner.clone())),
-            )
-        });
+        let pipeline = dl_pipeline
+            .take()
+            .unwrap_or_else(|| MutationPipeline::new(Arc::clone(&store), reasoner.clone()));
         for update in std::fs::read_to_string(file)?.lines() {
             if !update.trim().is_empty() {
                 pipeline.execute_update_str(update)?;
@@ -1492,10 +1586,8 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
                 ));
                 continue;
             }
-            let mut request = SparqlQueryRequest::all(text);
-            request.solutions_format = args.format;
-            let prepared = PreparedQuery::parse(&request)?;
-            let (rows, elapsed) = run_once(&store, &prepared, args.timeout)?;
+            let prepared = PreparedQuery::parse(&request(text))?;
+            let (rows, elapsed) = run_once(&store, &prepared, args.timeout, 1)?;
             let value = (rows == 1)
                 .then(|| first_value(&store, text))
                 .flatten()
@@ -1512,6 +1604,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         report
             .sections
             .push(("after_commit", format!("[{}]", after.join(", "))));
+    }
+    if args.batch > 1 {
+        report.sections.push(("batch", args.batch.to_string()));
     }
     if !files.is_empty() {
         phases.push(("queries", queries_phase.json()));
@@ -1541,4 +1636,58 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         println!("memory: peak {peak} MiB, resident {rss} MiB");
     }
     Ok(())
+}
+
+/// The timeout of every timed run, by one thread for the whole process (release gate harness:
+/// benches/fast/patches/perf_lab_watchdog.py): started once, before any timing, and running
+/// before it returns; it polls every 10 ms and takes the slot's lock only then, which the timed
+/// call never takes.
+mod perf_lab_watchdog {
+    use super::CancellationToken;
+    use std::sync::{Mutex, OnceLock, mpsc};
+    use std::time::{Duration, Instant};
+
+    type Slot = Mutex<Option<(Instant, CancellationToken)>>;
+    const POLL: Duration = Duration::from_millis(10);
+
+    fn slot() -> &'static Slot {
+        static SLOT: OnceLock<Slot> = OnceLock::new();
+        static STARTED: OnceLock<()> = OnceLock::new();
+        let slot: &'static Slot = SLOT.get_or_init(|| Mutex::new(None));
+        STARTED.get_or_init(|| {
+            let (ready, started) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = ready.send(());
+                loop {
+                    std::thread::sleep(POLL);
+                    let mut armed = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    if armed
+                        .as_ref()
+                        .is_some_and(|(deadline, _)| Instant::now() >= *deadline)
+                        && let Some((_, token)) = armed.take()
+                    {
+                        token.cancel();
+                    }
+                }
+            });
+            let _ = started.recv();
+        });
+        slot
+    }
+
+    /// Disarms the watchdog when dropped.
+    pub struct Armed;
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            *slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// Cancels `token` once `timeout` has passed, unless the guard is dropped first.
+    pub fn arm(token: &CancellationToken, timeout: Duration) -> Armed {
+        *slot().lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now() + timeout, token.clone()));
+        Armed
+    }
 }

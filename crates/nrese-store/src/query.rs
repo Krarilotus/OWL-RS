@@ -96,6 +96,8 @@ pub struct SparqlQueryRequest {
     /// Bytes of intermediate results the query may hold; `None` is unlimited. A query that
     /// needs more fails ([`StoreError::is_memory_limit`](crate::StoreError::is_memory_limit)).
     pub memory_limit: Option<usize>,
+    /// Effort spent choosing a join order; shared by evaluation and EXPLAIN.
+    pub planner: nrese_sparql::PlannerOptions,
     /// Evaluate the operators where the query puts them (no filter pushdown, no set
     /// evaluation, paths in full): same results, for comparisons and as an escape hatch.
     pub as_written: bool,
@@ -121,6 +123,7 @@ impl SparqlQueryRequest {
             named_graphs: Vec::new(),
             read_model: None,
             memory_limit: None,
+            planner: Default::default(),
             as_written: false,
             scope,
             dl_answers: None,

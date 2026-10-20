@@ -5,7 +5,7 @@
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_server::ai::AiSuggestionService;
 use nrese_server::policy::PolicyConfig;
 use nrese_server::replication::{self, ReplicationConfig, ReplicationMode};
@@ -21,7 +21,7 @@ const PREFIXES: &str = "PREFIX ex: <http://example.com/> \
 fn state(store: StoreService, replication: ReplicationConfig) -> AppState {
     let state = AppState::new(
         store,
-        ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Rdfs)),
+        ReasonerConfig::for_mode(ReasoningMode::Rdfs),
         PolicyConfig::default(),
         AiSuggestionService::disabled(),
         DeploymentPosture::OpenWorkbench,
@@ -221,7 +221,7 @@ async fn answered(
 /// primary's, which interns the bounds' terms in its commits).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replica_gives_its_primarys_dl_answers() -> Result<(), Box<dyn std::error::Error>> {
-    let dl = || ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Owl2Dl));
+    let dl = || ReasonerConfig::for_mode(ReasoningMode::Owl2Dl);
     let primary_dir = tempfile::tempdir()?;
     let primary_state = AppState::new(
         StoreService::new(StoreConfig::on_disk(primary_dir.path()))?,

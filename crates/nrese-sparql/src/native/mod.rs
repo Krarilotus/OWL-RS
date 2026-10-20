@@ -106,11 +106,11 @@ use std::borrow::Cow;
 
 use crate::query::{PlanStep, QueryOptions};
 use aggregate::{
-    Agg, Aggregator, Number, aggregate_in_one_pass, counts_rows, finish_total, integer, integer_agg,
+    Agg, Aggregator, Number, aggregate_in_one_pass, counts_rows, finish_total, integer,
+    integer_agg, number_of,
 };
 pub use aggregate::{average, group_concat, sum};
 use expr::Evaluator;
-use value::Value;
 
 /// A right side at least this many times larger than the running result is joined by
 /// probing the index once per result row instead of scanning it.
@@ -1175,6 +1175,7 @@ impl Solutions {
 }
 
 struct Context<'a> {
+    planner: crate::PlannerOptions,
     /// The snapshot read; owned when it reads equality classes canonically
     /// ([`QueryOptions::equality_canonical`], [`Context::late_expansion`]).
     snapshot: Cow<'a, Snapshot>,
@@ -1355,6 +1356,7 @@ impl<'a> Context<'a> {
             None => resolved.named,
         };
         let mut ctx = Self {
+            planner: options.resources.planner,
             merge_set,
             named,
             as_written: options.as_written,
@@ -2397,7 +2399,8 @@ impl<'a> Context<'a> {
             return self.filter_bound(result, filters);
         }
         // Full-text searches start the joins (`search`).
-        if let Some((searches, rest)) = search::split(triples) {
+        if let Some(searches) = search::split(triples) {
+            let (searches, rest) = searches?;
             let mut result = Solutions::unit();
             for search in &searches {
                 let start = Instant::now();
@@ -3083,8 +3086,15 @@ impl<'a> Context<'a> {
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         };
-        plan::order(inputs, variables, PROBE_FACTOR, sets.as_deref(), &cancelled)
-            .ok_or_else(|| QueryEvaluationError::Cancelled.into())
+        plan::order(
+            inputs,
+            variables,
+            PROBE_FACTOR,
+            sets.as_deref(),
+            self.planner,
+            &cancelled,
+        )
+        .ok_or_else(|| QueryEvaluationError::Cancelled.into())
     }
 
     /// The join orderer's inputs for `scans` with their `counts`: distinct values per
@@ -4291,7 +4301,7 @@ impl<'a> Context<'a> {
     fn aggregate_groups(
         &self,
         solutions: &Solutions,
-        members: &[Vec<usize>],
+        members: &nrese_exec::group::Members,
         aggregates: &[(Variable, AggregateExpression)],
     ) -> NativeResult<Vec<Vec<Agg>>> {
         let per_group = |aggregator: &Aggregator<'_>, rows: &[usize]| -> Vec<Agg> {
@@ -4346,9 +4356,8 @@ impl<'a> Context<'a> {
                     numbers: RefCell::default(),
                 };
                 Some(
-                    members[window[0]..window[1]]
-                        .iter()
-                        .map(|rows| per_group(&aggregator, rows))
+                    (window[0]..window[1])
+                        .map(|group| per_group(&aggregator, members.get(group)))
                         .collect(),
                 )
             })
@@ -4628,11 +4637,22 @@ impl<'a> Context<'a> {
         aggregates: &[(Variable, AggregateExpression)],
         having: Option<&Expression>,
     ) -> NativeResult<Solutions> {
-        // COUNT(*) of one triple pattern without GROUP BY: the index knows the answer.
+        // COUNT(*) of one triple pattern without GROUP BY, or COUNT(?v) of a variable it
+        // binds: the index knows the answer (Sparqloscope 100, `COUNT(?s)` of every
+        // statement, read all 605 M of them).
         if variables.is_empty()
-            && let [(target, AggregateExpression::CountSolutions { distinct: false })] = aggregates
+            && let [(target, aggregate)] = aggregates
             && let GraphPattern::Bgp { patterns } = inner
             && let [triple] = patterns.as_slice()
+            && match aggregate {
+                AggregateExpression::CountSolutions { distinct: false } => true,
+                AggregateExpression::FunctionCall {
+                    name: AggregateFunction::Count,
+                    expr: Expression::Variable(v),
+                    distinct: false,
+                } => triple_variables(triple).contains(v),
+                _ => false,
+            }
             && !search::is_search(triple, patterns)
             && !self.is_spatial(triple)
         {
@@ -4645,6 +4665,28 @@ impl<'a> Context<'a> {
                 Some(scan) => self.scan(&scan, None)?.table.len() as u64,
                 None => 0,
             };
+            let mut table = IdTable::new(1);
+            table.push_row(&[self.id(&integer(count))]);
+            return Ok(Solutions {
+                vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
+        // COUNT(DISTINCT ?v) of one triple pattern: the groups of the index sorted on ?v,
+        // counted as they are walked (Sparqloscope 101 to 103, the subjects, predicates and
+        // objects of every statement, read all 605 M of them, two past 26 GB).
+        if variables.is_empty()
+            && let [(target, aggregate)] = aggregates
+            && let AggregateExpression::FunctionCall {
+                name: AggregateFunction::Count,
+                expr: Expression::Variable(key),
+                distinct: true,
+            } = aggregate
+            && let GraphPattern::Bgp { patterns } = inner
+            && let [triple] = patterns.as_slice()
+            && let Some(count) = self.distinct_count(triple, key)?
+        {
             let mut table = IdTable::new(1);
             table.push_row(&[self.id(&integer(count))]);
             return Ok(Solutions {
@@ -4759,9 +4801,13 @@ impl<'a> Context<'a> {
             return Ok(solutions);
         }
         // Aggregates that ignore duplicates let the pattern be evaluated as a set, and
-        // OPTIONALs that only feed them be aggregated apart from the rest (`sets`).
+        // OPTIONALs that only feed them be aggregated apart from the rest (`sets`). One
+        // pattern too: its values by a group walk (Sparqloscope 058, MIN of a name, folded
+        // 30.5 M rows for their distinct names).
+        let one_pattern = variables.is_empty()
+            && matches!(inner, GraphPattern::Bgp { patterns } if patterns.len() == 1);
         let solutions = match sets::insensitive_arguments(aggregates) {
-            Some(arguments) if sets::joins(inner) && !self.as_written => {
+            Some(arguments) if (sets::joins(inner) || one_pattern) && !self.as_written => {
                 if !variables.is_empty()
                     && let Some(solutions) =
                         self.group_detached(inner, variables, aggregates, &arguments, having)?
@@ -4779,6 +4825,49 @@ impl<'a> Context<'a> {
             _ => self.eval(inner)?,
         };
         self.group_solutions(solutions, variables, aggregates)
+    }
+
+    /// The distinct values of `key` in `triple`'s matches, from the index's groups
+    /// ([`Snapshot::distinct_count_in`]); `None` where the index can't say.
+    fn distinct_count(&self, triple: &TriplePattern, key: &Variable) -> NativeResult<Option<u64>> {
+        if self.as_written
+            || search::is_search(triple, std::slice::from_ref(triple))
+            || self.is_spatial(triple)
+        {
+            return Ok(None);
+        }
+        if !triple_variables(triple).contains(key) {
+            return Ok(None);
+        }
+        let Some(scan) = self.scan_pattern(triple) else {
+            // A constant the store doesn't know: no matches.
+            return Ok(Some(0));
+        };
+        let Some(component) = (0..3).find(|&c| scan.slots[c].is_var(key)) else {
+            return Ok(None);
+        };
+        if scan.repeats_variable() || scan.merged() || !matches!(scan.slots[3], Slot::Const(_)) {
+            return Ok(None);
+        }
+        let permutation = scan.permutation_for(Some(key));
+        if scan.first_free(permutation) != Some(component) {
+            return Ok(None);
+        }
+        let start = Instant::now();
+        let count = self
+            .snapshot
+            .distinct_count_in(self.model, &scan.quad_pattern(), permutation);
+        self.check()?;
+        if count.is_some() && self.trace.is_some() {
+            self.note(
+                "distinct count",
+                format!("{key} of {triple}: the index's groups counted"),
+                Some(1),
+                1,
+                start,
+            );
+        }
+        Ok(count)
     }
 
     /// GROUP BY over a cross product: (filters over) a join of two patterns that share no
@@ -4994,10 +5083,7 @@ impl<'a> Context<'a> {
                 let binding = aggregator.binding(solutions, row);
                 match aggregator.evaluator.eval(expr, &binding) {
                     None => Number::Error,
-                    Some(term) => match Numeric::of(&Value::of(&term)) {
-                        Some(number) => Number::Value(number),
-                        None => Number::Other,
-                    },
+                    Some(term) => number_of(&term),
                 }
             };
             let found: Vec<(u64, Number)> = if missing.len() < 2 * PARALLEL_EXPRESSION_ROWS {
@@ -5171,10 +5257,10 @@ impl<'a> Context<'a> {
         let values = match one_pass {
             Some(values) => values,
             None => {
-                let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
-                for (row, &group) in groups.group_of.iter().enumerate() {
-                    members[group as usize].push(row);
-                }
+                let members = nrese_exec::group::Members::of(
+                    groups.group_of.iter().map(|&g| g as usize),
+                    group_count,
+                );
                 self.aggregate_groups(&solutions, &members, aggregates)?
             }
         };

@@ -16,7 +16,7 @@ mod versions;
 
 use std::sync::Arc;
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_store::{
     DlConfig, MutationCommand, MutationError, MutationPipeline, MutationTicket, Requester,
     SparqlUpdateRequest, StoreConfig, StoreService,
@@ -36,9 +36,7 @@ pub fn pipeline_with(dl: DlConfig) -> MutationPipeline {
     let store = StoreService::new(config).expect("store");
     MutationPipeline::new(
         Arc::new(store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Dl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
     )
 }
 
