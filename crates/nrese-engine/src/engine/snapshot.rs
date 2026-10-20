@@ -176,14 +176,12 @@ struct HeldData {
 }
 
 impl Held {
-    /// `own`, charged for what it covers, with `parts`; the bytes of its box and list
-    /// ([`Self::overhead`]) are charged to `own` first.
-    fn new(
-        parts: Vec<Held>,
-        mut own: nrese_exec::Reservation,
-    ) -> Result<Self, nrese_exec::BudgetExceeded> {
-        own.charge(Self::overhead(parts.capacity()))?;
-        Ok(Self(Some(Arc::new(HeldData { parts, own }))))
+    /// `own` with `parts`. `own` holds the charge of what it covers and of this holder's
+    /// box and list ([`Self::overhead`]), taken in its first charge, before anything it
+    /// covers is made: nothing is charged once the payload exists, so a refusal can't
+    /// release a charge while its payload is still the caller's.
+    fn new(parts: Vec<Held>, own: nrese_exec::Reservation) -> Self {
+        Self(Some(Arc::new(HeldData { parts, own })))
     }
 
     /// What a charge with a list of `parts` parts allocates for itself.
@@ -191,12 +189,17 @@ impl Held {
         boxed(std::mem::size_of::<HeldData>()) + parts * std::mem::size_of::<Held>()
     }
 
-    /// The parts list of a charge made beside this one: this one, if it is any.
-    fn with(&self) -> Vec<Held> {
-        match &self.0 {
-            Some(_) => vec![self.clone()],
-            None => Vec::new(),
-        }
+    /// The parts of a charge made beside this one ([`Self::with`]): one if this is one.
+    fn count(&self) -> usize {
+        usize::from(self.0.is_some())
+    }
+
+    /// The parts list of a charge made beside this one: this one, if it is any, with room
+    /// for `more` parts.
+    fn with(&self, more: usize) -> Vec<Held> {
+        let mut parts = Vec::with_capacity(self.count() + more);
+        parts.extend(self.0.is_some().then(|| self.clone()));
+        parts
     }
 
     /// The bytes charged, its parts' included (a part shared by two charges counts for
@@ -246,8 +249,10 @@ impl InferredMask {
         let runs_len = self.runs.len() + usize::from(new_run);
         held.charge(
             runs_len * size_of::<Arc<crate::index::run::Run>>()
-                + usize::from(new_run) * boxed(size_of::<crate::index::run::Run>()),
+                + usize::from(new_run) * boxed(size_of::<crate::index::run::Run>())
+                + Held::overhead(self.held.count()),
         )?;
+        // After `held`: dropped first, so a refusal below frees the runs before it releases.
         let mut runs = Vec::with_capacity(runs_len);
         runs.extend(self.runs.iter().cloned());
         if new_run {
@@ -257,7 +262,7 @@ impl InferredMask {
         }
         Ok(Self {
             runs,
-            held: Held::new(self.held.with(), held)?,
+            held: Held::new(self.held.with(0), held),
         })
     }
 
@@ -572,10 +577,11 @@ impl Snapshot {
         held.charge(
             Self::restricted_bytes()
                 + empty.runs_bytes(1)
-                + boxed(std::mem::size_of::<crate::index::run::Run>()),
+                + boxed(std::mem::size_of::<crate::index::run::Run>())
+                + Held::overhead(self.held.count()),
         )?;
         let run = crate::index::run::Run::from_delta_within(layout, kept, &[], &mut held)?;
-        let held = Held::new(self.held.with(), held)?;
+        let held = Held::new(self.held.with(0), held);
         let inferred = empty.with_run(run);
         Ok(self.restricted(inferred, held))
     }
@@ -607,11 +613,14 @@ impl Snapshot {
             return Ok(None);
         }
         let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
-        held.charge(Self::restricted_bytes() + stack.runs_bytes(mask.runs.len()))?;
-        let mut parts = self.held.with();
-        parts.reserve_exact(1);
+        held.charge(
+            Self::restricted_bytes()
+                + stack.runs_bytes(mask.runs.len())
+                + Held::overhead(self.held.count() + 1),
+        )?;
+        let mut parts = self.held.with(1);
         parts.push(mask.held.clone());
-        let held = Held::new(parts, held)?;
+        let held = Held::new(parts, held);
         let inferred = stack.with_runs(&mask.runs);
         Ok(Some(self.restricted(inferred, held)))
     }

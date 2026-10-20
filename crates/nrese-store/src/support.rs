@@ -54,7 +54,7 @@ use nrese_reasoner::graph_sets::{
     rederived_candidates, support_sets, update_support_sets,
 };
 use nrese_reasoner::ir::Triple;
-use nrese_sparql::GraphAccess;
+use nrese_sparql::{CancellationToken, GraphAccess};
 
 use crate::reasoning::Program;
 
@@ -135,6 +135,8 @@ pub enum Unavailable {
     Memory(BudgetExceeded),
     /// The process held more than its memory limit.
     ProcessMemory,
+    /// The reading query was cancelled, or its time ran out, while the view was computed.
+    Cancelled,
 }
 
 impl From<BudgetExceeded> for Unavailable {
@@ -150,27 +152,54 @@ impl From<Unavailable> for crate::StoreError {
             Unavailable::ProcessMemory => crate::StoreError::ProcessMemoryLimit {
                 limit: nrese_exec::memory::process_limit().unwrap_or(0),
             },
+            Unavailable::Cancelled => nrese_sparql::QueryEvaluationError::Cancelled.into(),
         }
+    }
+}
+
+/// What computing a view reads and builds is charged to (a part of the reading query's
+/// envelope), and the reading query's cancellation (its time running out cancels it too),
+/// which the evaluations poll at their rounds ([`Following`]).
+struct Work {
+    budget: Arc<Budget>,
+    cancellation: Option<CancellationToken>,
+}
+
+impl std::ops::Deref for Work {
+    type Target = Arc<Budget>;
+
+    fn deref(&self) -> &Arc<Budget> {
+        &self.budget
     }
 }
 
 /// An evaluation's working set, followed on the reading query's budget at its rounds
 /// ([`nrese_reasoner::graph_sets::Watch`]): what it reports is charged, a refusal kept for
-/// the read to fail with. The charge is released when it drops.
+/// the read to fail with; and the query's cancellation, which stops it there as well. The
+/// charge is released when it drops.
 struct Following {
     held: Mutex<Reservation<Arc<Budget>>>,
     refused: Mutex<Option<BudgetExceeded>>,
+    cancellation: Option<CancellationToken>,
 }
 
 impl Following {
-    fn new(working: &Arc<Budget>) -> Self {
+    fn new(working: &Work) -> Self {
         Self {
-            held: Mutex::new(Reservation::new(Arc::clone(working))),
+            held: Mutex::new(Reservation::new(Arc::clone(&working.budget))),
             refused: Mutex::new(None),
+            cancellation: working.cancellation.clone(),
         }
     }
 
     fn watch(&self, bytes: usize) -> bool {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return false;
+        }
         let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
         match held.resize(bytes) {
             Ok(()) => true,
@@ -184,13 +213,13 @@ impl Following {
     fn failure(&self, stopped: Stopped) -> Unavailable {
         match stopped {
             Stopped::ProcessMemory => Unavailable::ProcessMemory,
-            Stopped::Memory { .. } => Unavailable::Memory(
-                self.refused
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .take()
-                    .expect("the watch refused"),
-            ),
+            // The watch refused: the budget, or else the cancellation.
+            Stopped::Memory { .. } => self
+                .refused
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+                .map_or(Unavailable::Cancelled, Unavailable::Memory),
         }
     }
 }
@@ -383,7 +412,7 @@ impl SupportSets {
         snapshot: &Snapshot,
         cap: usize,
         kept: &Arc<Budget>,
-        working: &Arc<Budget>,
+        working: &Work,
     ) -> Result<Self, Unavailable> {
         let graphs = graphs_in_order(snapshot, &[TermId::DEFAULT_GRAPH], kept, working)?;
         let mut axioms: Kept<Triple> =
@@ -519,7 +548,7 @@ impl SupportSets {
         touched: &[Triple],
         cap: usize,
         kept: &Arc<Budget>,
-        working: &Arc<Budget>,
+        working: &Work,
     ) -> Result<Option<Self>, Unavailable> {
         let ground = program.ground_program(snapshot);
         let schema = ground.schema_premises();
@@ -1003,19 +1032,17 @@ impl SupportSets {
         }
         let visible_now = self.visible_sets(snapshot, access, working)?;
         let visible_before = earlier.visible_sets(before, access, working)?;
-        // A changed fact asserted in a graph the reader can't read, before or now, joins or
-        // leaves the view as a derived extra where the sets don't hide it ([`Self::split`]):
-        // the view is then made afresh. Hidden by both, it is no extra of either view.
+        // A changed fact asserted only in graphs the reader can't read, before or now, joins
+        // or leaves the view as a derived extra where the sets don't hide it
+        // ([`Self::split`]): the view is then made afresh. Hidden by both, or asserted in a
+        // graph the reader reads both times, it is no extra of either view.
         let mut scanning = Reservation::new(Arc::clone(working));
         scanning.charge(snapshot.scan_bytes(ReadModel::Asserted))?;
-        let unreadable = |at: &Snapshot, fact: Triple| {
-            at.quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any))
-                .any(|quad| !access.allows_id(at, quad.graph))
-        };
         let extra = |fact: Triple| {
             (earlier.decide(fact, &visible_before) != Decision::Hidden
                 || self.decide(fact, &visible_now) != Decision::Hidden)
-                && (unreadable(before, fact) || unreadable(snapshot, fact))
+                && (asserted_out_of_reach(before, access, fact)
+                    || asserted_out_of_reach(snapshot, access, fact))
         };
         if changed.iter().any(|&fact| extra(fact)) {
             return Ok(None);
@@ -1401,8 +1428,9 @@ fn bound_pattern([s, p, o]: [Option<u64>; 3]) -> QuadPattern {
 /// One revision's sets, computed once (or not: a failure is kept by no one).
 type Cell = Shared<OnceLock<Result<Option<Shared<SupportSets>>, Unavailable>>>;
 
-/// The asserted facts of a revision that a rule derives from its other facts
-/// ([`nrese_reasoner::graph_sets::derived_otherwise`]), sorted: what a reader who sees every
+/// The asserted facts of a revision that follow from its other facts without their own
+/// assertion ([`nrese_reasoner::graph_sets::rederived`]; a cycle through the fact supports
+/// nothing), sorted: what a reader who sees every
 /// inference (`inferred = "visible"`) is shown of a fact asserted only in graphs it can't
 /// read, as the inference it is. The stack holds no copy of them (an inferred statement is
 /// suppressed while it is asserted anywhere), so without them that reader's answers would
@@ -1647,7 +1675,10 @@ impl Supports {
         let spawned = std::thread::Builder::new()
             .name("nrese-support-sets".to_owned())
             .spawn(move || {
-                let working = Arc::new(memory.part());
+                let working = Work {
+                    budget: Arc::new(memory.part()),
+                    cancellation: None,
+                };
                 let sets = cell.get_or_init(|| supports.compute(&snapshot, compilation, &working));
                 if let Err(error) = sets {
                     tracing::warn!(?error, "support graph sets not prepared");
@@ -1743,17 +1774,38 @@ impl Supports {
     /// `snapshot` as a reader with `access` sees it. By support (`inferred = "supported"`):
     /// with only the inferred statements it may derive from the graphs it reads. Seeing
     /// every inference (`"visible"`): the stack, and the facts asserted only in graphs it
-    /// can't read that a rule derives from other facts, as inferred. Either way what it sees
-    /// doesn't depend on what a graph it can't read asserts of what it derives. What computing
-    /// the view reads and builds is charged to `memory`, the reading query's envelope; what
-    /// is kept, to the support budget. `Err` if either has no room: the read fails, and
-    /// nothing of it is kept.
+    /// can't read that follow from the other facts without that assertion, as inferred.
+    /// Either way what it sees doesn't depend on what a graph it can't read asserts of what
+    /// it derives. What computing the view reads and builds is charged to `memory`, the
+    /// reading query's envelope; what is kept, to the support budget. `Err` if either has
+    /// no room, or `cancellation` (the reading query's) is cancelled while it is computed:
+    /// the read fails, and nothing of it is kept. A computation it waited for that another
+    /// reader's cancellation stopped is made again, by this read.
     pub(crate) fn view(
         &self,
         snapshot: &Snapshot,
         access: &Arc<GraphAccess>,
         compilation: Compilation,
         memory: &Envelope,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Snapshot, Unavailable> {
+        loop {
+            match self.view_once(snapshot, access, compilation, memory, cancellation) {
+                Err(Unavailable::Cancelled)
+                    if !cancellation.is_some_and(CancellationToken::is_cancelled) => {}
+                made => return made,
+            }
+        }
+    }
+
+    /// [`Self::view`], once: its failure is kept by no one.
+    fn view_once(
+        &self,
+        snapshot: &Snapshot,
+        access: &Arc<GraphAccess>,
+        compilation: Compilation,
+        memory: &Envelope,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<Snapshot, Unavailable> {
         let (cell, rederiving, view) = {
             let mut state = self.state();
@@ -1771,7 +1823,10 @@ impl Supports {
             };
             (cell.clone(), rederiving.clone(), view)
         };
-        let working = Arc::new(memory.part());
+        let working = Work {
+            budget: Arc::new(memory.part()),
+            cancellation: cancellation.cloned(),
+        };
         let made = view
             .get_or_init(|| match access.inferred_by_support {
                 true => {
@@ -1845,7 +1900,7 @@ impl Supports {
         &self,
         snapshot: &Snapshot,
         compilation: Compilation,
-        working: &Arc<Budget>,
+        working: &Work,
     ) -> Result<Shared<Rederived>, Unavailable> {
         let Some(rules) = self.rules.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
             return Ok(Shared::new(Rederived::empty(&self.kept), &self.kept)?);
@@ -1866,6 +1921,40 @@ impl Supports {
         let closure = After {
             snapshot,
             removed: &[],
+        };
+        let asserted = |fact: Triple| {
+            snapshot.exists_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any))
+        };
+        // Past this many facts, a candidate's cone is no cheaper than the whole closure.
+        let limit = usize::try_from(snapshot.len_in(ReadModel::Materialised)).unwrap_or(usize::MAX)
+            / 4
+            + 10_000;
+        // The candidates (sorted) that follow from the other facts without their own
+        // assertion, sorted; those whose cone can't decide, by the closure of the asserted
+        // facts without each.
+        let decide = |candidates: &[Triple]| -> Result<Kept<Triple>, Unavailable> {
+            let (found, undecided) = rederived(
+                &closure, &ground, &axioms, &asserted, candidates, limit, &watch,
+            )
+            .map_err(|stopped| following.failure(stopped))?;
+            let mut passing: Kept<Triple> =
+                ChargedVec::with_capacity(Arc::clone(working), found.len() + undecided.len())?;
+            passing.extend_from_slice(&found)?;
+            drop(found);
+            if !undecided.is_empty() {
+                let graphs = graphs_in_order(snapshot, &[TermId::DEFAULT_GRAPH], working, working)?;
+                let whole = Closure::of(snapshot, &graphs, &axioms, working)?;
+                for &fact in &undecided {
+                    let without = |other: Triple| other != fact && asserted(other);
+                    let held = closure_within(&whole.facts, &ground, &axioms, &without, &watch)
+                        .map_err(|stopped| following.failure(stopped))?;
+                    if held.contains_key(&fact) {
+                        passing.push(fact)?;
+                    }
+                }
+            }
+            passing.sort_unstable();
+            Ok(passing)
         };
         let started = std::time::Instant::now();
         let earlier = {
@@ -1895,18 +1984,18 @@ impl Supports {
                 snapshot,
                 removed: &removed,
             };
-            let candidates = rederived_candidates(&after, &ground, &touched, &watch)
+            let candidates = rederived_candidates(&after, &ground, &touched, limit, &watch)
                 .map_err(|stopped| following.failure(stopped))?;
             if let Some(candidates) = candidates {
-                let mut asserted: Kept<Triple> =
+                let mut reachable: Kept<Triple> =
                     ChargedVec::with_capacity(Arc::clone(working), candidates.len())?;
                 for &fact in &candidates {
-                    if snapshot.exists_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any)) {
-                        asserted.push(fact)?;
+                    if asserted(fact) {
+                        reachable.push(fact)?;
                     }
                 }
-                let passing = rederived(&closure, &ground, &axioms, &asserted, &watch)
-                    .map_err(|stopped| following.failure(stopped))?;
+                let passing = decide(&reachable)?;
+                drop(reachable);
                 // The earlier ones the change can't reach, with the candidates that pass.
                 let mut reached = candidates.iter().peekable();
                 let unreached = earlier.facts.iter().copied().filter(|fact| {
@@ -1917,7 +2006,7 @@ impl Supports {
                     Arc::clone(&self.kept),
                     earlier.facts.len() + passing.len(),
                 )?;
-                merge_sorted(unreached, passing.into_iter(), &mut facts)?;
+                merge_sorted(unreached, passing.iter().copied(), &mut facts)?;
                 updated = Some(facts);
             }
         }
@@ -1932,8 +2021,7 @@ impl Supports {
                 }
                 drop(quads);
                 dedup(&mut all);
-                let passing = rederived(&closure, &ground, &axioms, &all, &watch)
-                    .map_err(|stopped| following.failure(stopped))?;
+                let passing = decide(&all)?;
                 drop(all);
                 let mut facts: Kept<Triple> =
                     ChargedVec::with_capacity(Arc::clone(&self.kept), passing.len())?;
@@ -2010,7 +2098,7 @@ impl Supports {
         access: &Arc<GraphAccess>,
         sets: &Shared<SupportSets>,
         compilation: Compilation,
-        working: &Arc<Budget>,
+        working: &Work,
     ) -> Result<Snapshot, Unavailable> {
         let started = std::time::Instant::now();
         let earlier = self
@@ -2109,7 +2197,7 @@ impl Supports {
         snapshot: &Snapshot,
         access: &GraphAccess,
         compilation: Compilation,
-        working: &Arc<Budget>,
+        working: &Work,
     ) -> Result<Kept<Triple>, Unavailable> {
         let rules = self
             .rules
@@ -2155,7 +2243,7 @@ impl Supports {
         &self,
         snapshot: &Snapshot,
         compilation: Compilation,
-        working: &Arc<Budget>,
+        working: &Work,
     ) -> Result<Option<Shared<SupportSets>>, Unavailable> {
         let Some(rules) = self.rules.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
             return Ok(None);

@@ -528,6 +528,10 @@ pub fn closure_within(
 /// whose premises is it. A rule's instance with the fact among its own premises, such as
 /// `(x p x), (x p z) -> (x p z)`, doesn't count: it derives nothing the fact itself
 /// doesn't give.
+///
+/// Necessary for following from the other facts, not sufficient: the premises may hold
+/// only through the fact itself (`C ⊑ D`, `D ⊑ C`, `a : C` gives `a : D`, which gives
+/// `a : C` back). [`independently_derived`] decides.
 pub fn derived_otherwise<S: Source + ?Sized>(
     source: &S,
     program: &GroundProgram,
@@ -575,79 +579,190 @@ pub fn derived_otherwise<S: Source + ?Sized>(
         && derives(&transitivity(p))
 }
 
-/// The facts of `candidates` (sorted) that follow in one step from other facts of `source`
-/// ([`derived_otherwise`]), sorted. `watch` sees the candidates' bytes before the checks
-/// run, in parallel, each on its own.
+/// Whether the asserted `fact` of the closure `source` is in the least closure of the
+/// asserted facts without it (`asserted`: whether a fact is asserted), under `program`
+/// (grounded on the whole closure: a grounding's schema premises are premises like the
+/// others, so a schema fact that follows only from `fact` grounds nothing here), axioms
+/// included. Its forward cone (the facts some derivation of which uses it, transitively)
+/// is evaluated again from the rest: every other asserted fact in one graph, `fact` in
+/// none, cap 1, by [`update_support_sets`]; a fact outside the cone keeps every
+/// derivation, so it holds without `fact`. A cycle through `fact` supports nothing, as no
+/// least fixpoint starts from it.
+///
+/// `Ok(None)` where the cone reaches a schema fact or passes `limit` facts: then the
+/// caller decides with the reader-free closure of the asserted facts without `fact`
+/// ([`closure_within`]), exact as well. Work: the cone's derivations; `watch` sees its
+/// working set after each round.
+pub fn independently_derived<S: Source + Sync + ?Sized>(
+    source: &S,
+    program: &GroundProgram,
+    axioms: &[Triple],
+    asserted: &(dyn Fn(Triple) -> bool + Sync),
+    fact: Triple,
+    limit: usize,
+    watch: Watch<'_>,
+) -> Result<Option<bool>, Stopped> {
+    let derivable = Annotation {
+        sets: vec![GraphSet::of(0)],
+        truncated: false,
+    };
+    let empty = Annotation::empty_set();
+    let previous = |other: Triple| match axioms.binary_search(&other).is_ok() {
+        true => empty.clone(),
+        false => derivable.clone(),
+    };
+    let one_graph = |other: Triple| match other != fact && asserted(other) {
+        true => vec![0],
+        false => Vec::new(),
+    };
+    let change = Change {
+        source,
+        in_closure: &|other| source.contains(other),
+        touched: &[fact],
+        previous: &previous,
+        limit,
+    };
+    let found = update_support_sets(&change, program, axioms, &one_graph, 1, watch)?;
+    Ok(found.map(|sets| sets.get(&fact).is_some_and(|found| !found.is_empty())))
+}
+
+/// The facts of `candidates` (sorted, each asserted in the closure `source`) that follow
+/// from the closure's other facts without their own assertion, sorted, and those this
+/// can't decide, sorted. A one-step derivation from other facts ([`derived_otherwise`],
+/// checked in parallel) is necessary; [`independently_derived`] then decides each in
+/// turn. The undecided ones (their cone reaches a schema fact or passes `limit`) the
+/// caller decides with the closure of the asserted facts without each ([`closure_within`]).
+/// `watch` sees the candidates' bytes before the checks, and each check's working set.
 pub fn rederived<S: Source + Sync + ?Sized>(
     source: &S,
     program: &GroundProgram,
     axioms: &[Triple],
+    asserted: &(dyn Fn(Triple) -> bool + Sync),
     candidates: &[Triple],
+    limit: usize,
     watch: Watch<'_>,
-) -> Result<Vec<Triple>, Stopped> {
+) -> Result<(Vec<Triple>, Vec<Triple>), Stopped> {
     check(watch, size_of_val(candidates))?;
-    let found: Vec<Triple> = candidates
+    let one_step: Vec<Triple> = candidates
         .par_iter()
         .copied()
         .filter(|&fact| derived_otherwise(source, program, axioms, fact))
         .collect();
     check(
         watch,
-        (candidates.len() + found.capacity()) * size_of::<Triple>(),
+        (candidates.len() + 2 * one_step.capacity()) * size_of::<Triple>(),
     )?;
-    Ok(found)
+    let (mut found, mut undecided) = (Vec::with_capacity(one_step.len()), Vec::new());
+    for fact in one_step {
+        if axioms.binary_search(&fact).is_ok() {
+            found.push(fact);
+            continue;
+        }
+        match independently_derived(source, program, axioms, asserted, fact, limit, watch)? {
+            Some(true) => found.push(fact),
+            Some(false) => {}
+            None => undecided.push(fact),
+        }
+    }
+    Ok((found, undecided))
 }
 
-/// The facts whose one-step derivability ([`derived_otherwise`]) a change can alter: those
-/// it touched (`touched`, sorted: their graphs, or whether they are in the closure), and
-/// the heads of every rule instance with a touched premise in `source` (the closure after
-/// the change, and the facts it removed). Sorted, each once. `None` when a touched fact is
-/// one the program was grounded on: the grounding changes, and the caller checks all.
+/// The facts a change can alter the independent derivation of ([`rederived`]): those it
+/// touched (`touched`, sorted: their graphs, or
+/// whether they are in the closure) and their forward cone in `source` (the closure after
+/// the change, and the facts it removed): every fact a derivation of which uses a touched
+/// fact, transitively. A fact outside it has the derivations it had, over facts that
+/// didn't change. Sorted, each once. `None` when the cone reaches a fact the program was
+/// grounded on (the grounding changes) or passes `limit` facts: the caller checks all.
 pub fn rederived_candidates<S: Source + Sync + ?Sized>(
     source: &S,
     program: &GroundProgram,
     touched: &[Triple],
+    limit: usize,
     watch: Watch<'_>,
 ) -> Result<Option<Vec<Triple>>, Stopped> {
     let schema = program.schema_premises();
-    if touched.iter().any(|fact| schema.contains(fact)) {
+    let rules = body_rules(program);
+    let rules: Vec<(&Rule, Grounding)> =
+        rules.iter().map(|(rule, g)| (rule.as_ref(), *g)).collect();
+    let fixed = table_bytes::<Triple, ()>(schema.capacity());
+    let Some(cone) = forward_cone(source, &rules, &schema, touched, limit, fixed, watch)? else {
         return Ok(None);
-    }
-    let transitive: Vec<(Rule, Grounding)> = program
-        .transitive
-        .iter()
-        .map(|&p| (transitivity(p), Grounding::Transitive(p)))
-        .collect();
-    let ruled: Vec<(&Rule, Grounding)> = program
+    };
+    let mut cone: Vec<Triple> = cone.into_iter().collect();
+    check(watch, fixed + cone.capacity() * size_of::<Triple>())?;
+    cone.par_sort_unstable();
+    Ok(Some(cone))
+}
+
+/// The rules with a body and fact heads of `program`, transitivity included, each with its
+/// grounding: what a forward cone follows.
+fn body_rules(program: &GroundProgram) -> Vec<(std::borrow::Cow<'_, Rule>, Grounding)> {
+    program
         .rules
         .iter()
         .enumerate()
-        .map(|(r, rule)| (rule, Grounding::Rule(r)))
-        .chain(
-            transitive
-                .iter()
-                .map(|(rule, grounding)| (rule, *grounding)),
-        )
+        .map(|(r, rule)| (std::borrow::Cow::Borrowed(rule), Grounding::Rule(r)))
+        .chain(program.transitive.iter().map(|&p| {
+            (
+                std::borrow::Cow::Owned(transitivity(p)),
+                Grounding::Transitive(p),
+            )
+        }))
         .filter(|(rule, _)| !rule.body.is_empty() && matches!(rule.head, Head::Facts(_)))
-        .collect();
-    let delta = Store::new(touched.to_vec());
-    let changed = Changed {
-        all: source,
-        changed: &delta,
-    };
-    let mut heads = instances(&changed, &ruled, &|k, bindings, out| {
-        if let Head::Facts(heads) = &ruled[k].0.head {
-            out.extend(heads.iter().map(|head| instantiate_head(head, bindings)));
+        .collect()
+}
+
+/// `touched` and every fact of `source` a derivation of which (by `rules`) uses one of
+/// them, transitively. `None` once it reaches a fact of `schema` or passes `limit` facts.
+/// `watch` sees `fixed` and what it holds after each round.
+fn forward_cone<S: Source + Sync + ?Sized>(
+    source: &S,
+    rules: &[(&Rule, Grounding)],
+    schema: &HashSet<Triple>,
+    touched: &[Triple],
+    limit: usize,
+    fixed: usize,
+    watch: Watch<'_>,
+) -> Result<Option<HashSet<Triple>>, Stopped> {
+    let mut affected: HashSet<Triple> = touched.iter().copied().collect();
+    if affected.iter().any(|fact| schema.contains(fact)) {
+        return Ok(None);
+    }
+    let mut frontier: Vec<Triple> = affected.iter().copied().collect();
+    while !frontier.is_empty() {
+        frontier.sort_unstable();
+        let delta = Store::new(std::mem::take(&mut frontier));
+        let changed = Changed {
+            all: source,
+            changed: &delta,
+        };
+        let heads = instances(&changed, rules, &|k, bindings, out| {
+            let rule = rules[k].0;
+            if let Head::Facts(heads) = &rule.head {
+                out.extend(heads.iter().map(|head| instantiate_head(head, bindings)));
+            }
+        });
+        check(
+            watch,
+            fixed
+                + table_bytes::<Triple, ()>(affected.capacity())
+                + delta.bytes().total()
+                + heads.capacity() * size_of::<Triple>(),
+        )?;
+        for head in heads {
+            if affected.insert(head) {
+                if schema.contains(&head) {
+                    return Ok(None);
+                }
+                frontier.push(head);
+            }
         }
-    });
-    check(
-        watch,
-        delta.bytes().total() + (heads.capacity() + touched.len()) * size_of::<Triple>(),
-    )?;
-    heads.extend_from_slice(touched);
-    heads.par_sort_unstable();
-    heads.dedup();
-    Ok(Some(heads))
+        if affected.len() > limit {
+            return Ok(None);
+        }
+    }
+    Ok(Some(affected))
 }
 
 /// A change of the closure, for [`update_support_sets`].
@@ -691,62 +806,23 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
     watch: Watch<'_>,
 ) -> Result<Option<HashMap<Triple, Annotation>>, Stopped> {
     let schema = program.schema_premises();
-    let transitive: Vec<(Rule, Grounding)> = program
-        .transitive
-        .iter()
-        .map(|&p| (transitivity(p), Grounding::Transitive(p)))
-        .collect();
-    let rules: Vec<(&Rule, Grounding)> = program
-        .rules
-        .iter()
-        .enumerate()
-        .map(|(r, rule)| (rule, Grounding::Rule(r)))
-        .chain(
-            transitive
-                .iter()
-                .map(|(rule, grounding)| (rule, *grounding)),
-        )
-        .filter(|(rule, _)| !rule.body.is_empty() && matches!(rule.head, Head::Facts(_)))
-        .collect();
+    let owned = body_rules(program);
+    let rules: Vec<(&Rule, Grounding)> =
+        owned.iter().map(|(rule, g)| (rule.as_ref(), *g)).collect();
     // The affected facts: the touched ones and what follows from them.
-    let mut affected: HashSet<Triple> = change.touched.iter().copied().collect();
-    if affected.iter().any(|fact| schema.contains(fact)) {
-        return Ok(None);
-    }
     let fixed = table_bytes::<Triple, ()>(schema.capacity());
-    let mut frontier: Vec<Triple> = affected.iter().copied().collect();
-    while !frontier.is_empty() {
-        frontier.sort_unstable();
-        let delta = Store::new(std::mem::take(&mut frontier));
-        let source = Changed {
-            all: change.source,
-            changed: &delta,
-        };
-        let heads = instances(&source, &rules, &|k, bindings, out| {
-            let rule = rules[k].0;
-            if let Head::Facts(heads) = &rule.head {
-                out.extend(heads.iter().map(|head| instantiate_head(head, bindings)));
-            }
-        });
-        check(
-            watch,
-            fixed
-                + table_bytes::<Triple, ()>(affected.capacity())
-                + delta.bytes().total()
-                + heads.capacity() * size_of::<Triple>(),
-        )?;
-        for head in heads {
-            if affected.insert(head) {
-                if schema.contains(&head) {
-                    return Ok(None);
-                }
-                frontier.push(head);
-            }
-        }
-        if affected.len() > change.limit {
-            return Ok(None);
-        }
-    }
+    let Some(affected) = forward_cone(
+        change.source,
+        &rules,
+        &schema,
+        change.touched,
+        change.limit,
+        fixed,
+        watch,
+    )?
+    else {
+        return Ok(None);
+    };
     let members: HashSet<Triple> = affected
         .iter()
         .copied()
