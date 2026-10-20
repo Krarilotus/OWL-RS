@@ -1981,7 +1981,10 @@ mod tests {
     /// holds (counted on every thread by this test binary's allocator, at every allocation
     /// and release) a byte more than its request was charged since it started: geo's
     /// working memory for a relation is charged before geo computes it, and the engine's
-    /// for a scan and a lookup before it runs.
+    /// for a scan and a lookup before it runs. Inputs and work all run on the guard's pool,
+    /// never Rayon's global one: a parallel build there leaves its workers to look
+    /// for work once more, which under load can fall in a later measurement, a worker's first
+    /// look allocating its crossbeam-epoch handle there (2,304 bytes, attributed 20 Oct).
     #[test]
     fn the_spatial_path_holds_no_more_than_it_charges() {
         use nrese_exec::measure::{alone, measure_within};
@@ -2054,9 +2057,12 @@ mod tests {
         for (n, graphs, compressed) in rows {
             let all: Vec<GraphName> = (0..n).map(|i| named(i % graphs)).collect();
             let (_dir, snapshot) = match compressed {
-                false => (None, snapshot_with(&all, |i| literal(n, i))),
+                false => (
+                    None,
+                    pool.install(|| snapshot_with(&all, |i| literal(n, i))),
+                ),
                 true => {
-                    let (dir, snapshot) = reopened(&all, |i| literal(n, i));
+                    let (dir, snapshot) = pool.install(|| reopened(&all, |i| literal(n, i)));
                     (Some(dir), snapshot)
                 }
             };
@@ -2107,15 +2113,21 @@ mod tests {
         for compressed in [false, true] {
             let statement = |_| ("asWKT", "wktLiteral", line(10_000));
             let (_dir, snapshot) = match compressed {
-                false => (None, snapshot_with(&[GraphName::DefaultGraph], statement)),
+                false => (
+                    None,
+                    pool.install(|| snapshot_with(&[GraphName::DefaultGraph], statement)),
+                ),
                 true => {
-                    let (dir, snapshot) = reopened(&[GraphName::DefaultGraph], statement);
+                    let (dir, snapshot) =
+                        pool.install(|| reopened(&[GraphName::DefaultGraph], statement));
                     (Some(dir), snapshot)
                 }
             };
             let budget = Arc::new(Budget::unlimited());
-            let (built, excess) = measure_within(&budget, || {
-                SpatialIndex::build(&snapshot, ReadModel::Materialised, &budget).is_ok()
+            let (built, excess) = pool.install(|| {
+                measure_within(&budget, || {
+                    SpatialIndex::build(&snapshot, ReadModel::Materialised, &budget).is_ok()
+                })
             });
             assert!(built);
             if excess > 0 {
@@ -2134,38 +2146,46 @@ mod tests {
                 .collect();
             format!("POLYGON(({}))", points.join(","))
         };
-        let snapshot = snapshot_with(&vec![GraphName::DefaultGraph; 4], |i| match i {
-            0 => ("asWKT", "wktLiteral", "POINT(0 0)".to_owned()),
-            i => ("asWKT", "wktLiteral", ring(10 * i)),
+        let snapshot = pool.install(|| {
+            snapshot_with(&vec![GraphName::DefaultGraph; 4], |i| match i {
+                0 => ("asWKT", "wktLiteral", "POINT(0 0)".to_owned()),
+                i => ("asWKT", "wktLiteral", ring(10 * i)),
+            })
         });
-        let warm = Context::new(&snapshot, &QueryOptions::default(), None, None);
-        assert!(warm.spatial_index().is_ok());
         let envelope = Envelope::unlimited();
         let mut options = QueryOptions::default();
         options.resources.memory = envelope.clone();
-        let ctx = Context::new(&snapshot, &options, None, None);
         let point = g0(&snapshot);
-        let (related, excess) = measure_within(&envelope, || {
-            let rows = at(&ctx, point).expect("room");
-            ctx.spatial_join(rows, &relation)
-                .map_or(0, |s| s.table.len())
+        let (related, excess) = pool.install(|| {
+            let warm = Context::new(&snapshot, &QueryOptions::default(), None, None);
+            assert!(warm.spatial_index().is_ok());
+            let ctx = Context::new(&snapshot, &options, None, None);
+            measure_within(&envelope, || {
+                let rows = at(&ctx, point).expect("room");
+                ctx.spatial_join(rows, &relation)
+                    .map_or(0, |s| s.table.len())
+            })
         });
         if related == 0 || excess > 0 {
             failures.push(format!("a point among rings: {related} rows, {excess}"));
         }
         // Sol's relation between two equal lines of 10,000 points, under 256 bytes.
-        let snapshot = snapshot_with(&vec![GraphName::DefaultGraph; 2], |_| {
-            ("asWKT", "wktLiteral", line(10_000))
+        let snapshot = pool.install(|| {
+            snapshot_with(&vec![GraphName::DefaultGraph; 2], |_| {
+                ("asWKT", "wktLiteral", line(10_000))
+            })
         });
-        let warm = Context::new(&snapshot, &QueryOptions::default(), None, None);
-        assert!(warm.spatial_index().is_ok());
         let envelope = Envelope::new(Some(256), None);
         let mut options = QueryOptions::default();
         options.resources.memory = envelope.clone();
-        let ctx = Context::new(&snapshot, &options, None, None);
         let g0 = g0(&snapshot);
-        let (related, excess) = measure_within(&envelope, || {
-            at(&ctx, g0).is_some_and(|rows| ctx.spatial_join(rows, &relation).is_ok())
+        let (related, excess) = pool.install(|| {
+            let warm = Context::new(&snapshot, &QueryOptions::default(), None, None);
+            assert!(warm.spatial_index().is_ok());
+            let ctx = Context::new(&snapshot, &options, None, None);
+            measure_within(&envelope, || {
+                at(&ctx, g0).is_some_and(|rows| ctx.spatial_join(rows, &relation).is_ok())
+            })
         });
         if related || excess > 0 {
             failures.push(format!(
@@ -2173,17 +2193,19 @@ mod tests {
             ));
         }
         // And a filter constant of 10,000 points over a warm index, under 16 bytes.
-        let snapshot = snapshot_of(&vec![GraphName::DefaultGraph; 7]);
-        let warm = Context::new(&snapshot, &QueryOptions::default(), None, None);
-        assert!(warm.spatial_index().is_ok());
+        let snapshot = pool.install(|| snapshot_of(&vec![GraphName::DefaultGraph; 7]));
         let (filter, pattern) = (within(line(10_000)), as_wkt());
         let envelope = Envelope::new(Some(16), None);
         let mut options = QueryOptions::default();
         options.resources.memory = envelope.clone();
-        let ctx = Context::new(&snapshot, &options, None, None);
-        let (seeded, excess) = measure_within(&envelope, || {
-            ctx.spatial_seed(&[&filter], std::slice::from_ref(&pattern))
-                .is_ok()
+        let (seeded, excess) = pool.install(|| {
+            let warm = Context::new(&snapshot, &QueryOptions::default(), None, None);
+            assert!(warm.spatial_index().is_ok());
+            let ctx = Context::new(&snapshot, &options, None, None);
+            measure_within(&envelope, || {
+                ctx.spatial_seed(&[&filter], std::slice::from_ref(&pattern))
+                    .is_ok()
+            })
         });
         if seeded || excess > 0 {
             failures.push(format!(
