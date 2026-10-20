@@ -212,7 +212,9 @@ from suitekit import hosts; print(hosts.input_path("general") or "")')
   # The plan: what this host runs at the cases' declared caps. Replaced only whole and only
   # when made: a failed plan left the passes of another job in this directory an empty one
   # (aa3-phuoc-timed, 19 Oct 2026).
+  # The family's baselines: GATE_BASELINES (default base,main; an A-B-B-A of two sides: base).
   (cd "$tree" && py benches/fast/release_gate.py plan --max-gb "$MAX_GB" --min-gb "${GATE_MIN_GB:-0}" \
+     --baselines "${GATE_BASELINES:-base,main}" \
      ${GATE_BIG_GB:+--big-gb "$GATE_BIG_GB" --big-host "${GATE_BIG_HOST:-khaleesi-wsl}"} ${GATE_CASES:+--cases "$GATE_CASES"}) \
     > "$GATE/plan.json.partial" && mv "$GATE/plan.json.partial" "$GATE/plan.json" \
     || { log "prepare: no plan (release_gate.py plan failed)"; exit 2; }
@@ -316,11 +318,13 @@ block)
     names+=("$name")
   done
   mkdir -p "$OUT/passes"
-  # Its reports: the six runs of the palindrome (fast.py block), written together at its end.
-  first=$(( 6 * (n - 1) + 1 ))
-  complete() {  # how many of the block's six reports are complete
+  # Its reports: each side's two runs of the palindrome (fast.py block), written together at its
+  # end: six for base, main and cand, four for an A-B-B-A of two sides.
+  per=$(( 2 * ${#names[@]} ))
+  first=$(( per * (n - 1) + 1 ))
+  complete() {  # how many of the block's reports are complete
     local f r c=0
-    for f in $(seq "$first" $((first + 5))); do
+    for f in $(seq "$first" $((first + per - 1))); do
       for r in "$OUT/passes/pass-$f-"*.json; do
         py -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("finished_ns") else 1)' "$r" 2>/dev/null \
           && c=$((c + 1))
@@ -328,8 +332,8 @@ block)
     done
     echo "$c"
   }
-  if [ "$(complete)" = 6 ]; then log "block $n: complete before"; exit 0; fi
-  for f in $(seq "$first" $((first + 5))); do
+  if [ "$(complete)" = "$per" ]; then log "block $n: complete before"; exit 0; fi
+  for f in $(seq "$first" $((first + per - 1))); do
     for r in "$OUT/passes/pass-$f-"*.json; do
       [ -f "$r" ] && mv "$r" "$OUT/passes/interrupted-$(basename "$r" .json)-$(date +%s).json"
     done
@@ -371,8 +375,8 @@ block)
     log "block $n: $(tail -1 "$GATE/quiet/watch.log" 2>/dev/null)"
   fi
   tail -1 "$OUT/passes/block-$n.log"
-  # The cases' failures are data, the report's to judge; a block without its six reports isn't.
-  [ "$(complete)" = 6 ] || { log "block $n: not all six reports (exit $code)"; exit 1; }
+  # The cases' failures are data, the report's to judge; a block without all its reports isn't.
+  [ "$(complete)" = "$per" ] || { log "block $n: not all $per reports (exit $code)"; exit 1; }
   log "block $n: done (fast.py exit $code)"
   ;;
 

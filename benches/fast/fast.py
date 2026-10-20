@@ -1752,8 +1752,7 @@ def block(args) -> int:
         return 2
     seed = args.seed
     order = palindrome([s["name"] for s in sides], args.block, seed)
-    place = {run: 6 * (args.block - 1) + i + 1 for i, run in enumerate(order)} if len(sides) == 3 else \
-        {run: len(order) * (args.block - 1) + i + 1 for i, run in enumerate(order)}
+    place = {run: len(order) * (args.block - 1) + i + 1 for i, run in enumerate(order)}
     if seed is not None:
         cases = list(cases)
         random.Random(drawn(seed, "cases", args.block)).shuffle(cases)
