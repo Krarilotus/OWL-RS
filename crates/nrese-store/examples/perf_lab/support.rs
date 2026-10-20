@@ -20,7 +20,8 @@ use nrese_reasoner::{ReasonerConfig, ReasonerService};
 use nrese_sparql::GraphAccess;
 use nrese_store::support::SupportStatistics;
 use nrese_store::{
-    MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlUpdateRequest, StoreService,
+    MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlUpdateRequest, StoreResult,
+    StoreService,
 };
 
 use crate::Phase;
@@ -54,16 +55,16 @@ struct Read {
 }
 
 impl Read {
-    fn of(store: &StoreService, access: &Arc<GraphAccess>) -> Self {
+    fn of(store: &StoreService, access: &Arc<GraphAccess>) -> StoreResult<Self> {
         let before = store.support_statistics();
         let started = Instant::now();
         let visible = store
-            .read_snapshot(Some(access))
+            .read_snapshot(Some(access))?
             .len_in(ReadModel::Inferred);
         let read_ms = started.elapsed().as_secs_f64() * 1e3;
         let after = store.support_statistics();
         let grew = |f: fn(&SupportStatistics) -> u64| f(&after) - f(&before);
-        Self {
+        Ok(Self {
             read_ms,
             statistics: [
                 grew(|s| s.computed),
@@ -73,7 +74,7 @@ impl Read {
                 grew(|s| s.viewing_us),
             ],
             visible,
-        }
+        })
     }
 
     fn json(&self) -> String {
@@ -113,9 +114,9 @@ pub fn measure(
         Arc::clone(store),
         Arc::new(ReasonerService::new(reasoner.clone())),
     );
-    let inferred = store.read_snapshot(None).len_in(ReadModel::Inferred);
+    let inferred = store.read_snapshot(None)?.len_in(ReadModel::Inferred);
     let phase = Phase::start();
-    let first = Read::of(store, access);
+    let first = Read::of(store, access)?;
     phases.push(("support_first_read", phase.json()));
     eprintln!("support: first restricted read {}", first.json());
     let [_, _, computing, _, viewing] = first.statistics;
@@ -142,7 +143,7 @@ pub fn measure(
             &MutationTicket::new(),
         )?;
         let commit_ms = started.elapsed().as_secs_f64() * 1e3;
-        let after = Read::of(store, access);
+        let after = Read::of(store, access)?;
         phases.push((COMMIT_PHASES[k], phase.json()));
         eprintln!("support: commit {commit_ms:.1} ms, then {}", after.json());
         samples.push(format!("\"commit_{}\": [{commit_ms:.3}]", k + 1));

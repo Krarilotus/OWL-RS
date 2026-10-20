@@ -84,8 +84,9 @@ pub struct StoreConfig {
     /// can't tell (stage C, `"late"`, the default). The same answers.
     pub equality_early_expansion: bool,
     /// Support graph sets kept per inferred statement for `inferred = "supported"` in the
-    /// access policy (`reasoner.support_sets`, at least 1): the smallest first. A set left
-    /// out can only hide a statement from a reader who could have seen it.
+    /// access policy (`reasoner.support_sets`, at least 1): the smallest first. A bound on
+    /// memory and work, not on what readers see: a reader none of a statement's kept sets
+    /// fits, where the cap left some out, is decided by the closure of its graphs.
     pub support_sets: usize,
     /// On disk: check the whole checkpoint when opening (see
     /// `nrese_engine::DurabilityConfig::verify_on_open`). Off: the checkpoint is used in

@@ -204,10 +204,11 @@ nrese_derived_indexes_loaded_total {}
 # TYPE nrese_support_sets_total counter
 nrese_support_sets_total{{how=\"computed\"}} {}
 nrese_support_sets_total{{how=\"updated\"}} {}
-# HELP nrese_support_views_total Readers' views built, all and from the reader's earlier one.
+# HELP nrese_support_views_total Readers' views built: all, from the reader's earlier one, and those that asked the reader's closure about statements past reasoner.support_sets.
 # TYPE nrese_support_views_total counter
 nrese_support_views_total{{how=\"built\"}} {}
 nrese_support_views_total{{how=\"patched\"}} {}
+nrese_support_views_total{{how=\"closure\"}} {}
 # HELP nrese_support_seconds_total Time spent on support graph sets and views.
 # TYPE nrese_support_seconds_total counter
 nrese_support_seconds_total{{phase=\"compute\"}} {}
@@ -220,6 +221,7 @@ nrese_support_seconds_total{{phase=\"view\"}} {}
         support.updated,
         support.views,
         support.patched,
+        support.closures,
         support.computing_us as f64 / 1e6,
         support.updating_us as f64 / 1e6,
         support.viewing_us as f64 / 1e6,
