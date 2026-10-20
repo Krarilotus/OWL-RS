@@ -200,19 +200,39 @@ def journal(frozen: Path, line: str):
         os.fsync(f.fileno())
 
 
-def suspend(pid: int, frozen: Path, boot: str, recorded: set[int]) -> bool:
-    """Stops an owned process, its journal line (pid, start time, boot) written first, once."""
-    start = started(pid)
-    if start is None:
-        return False
-    if pid not in recorded:
-        journal(frozen, f"pid {pid} {start} {boot}")
-        recorded.add(pid)
+def alive(fd: int) -> bool:
+    """Whether a pidfd's process still exists (signal 0 through the handle)."""
     try:
-        os.kill(pid, signal.SIGSTOP)
-    except OSError:
+        signal.pidfd_send_signal(fd, 0)
+    except ProcessLookupError:
         return False
     return True
+
+
+def suspend(pid: int, frozen: Path, boot: str, recorded: set[int], owner: Owner,
+            environ_of=environ_of, cgroup_of=cgroup_of) -> bool:
+    """Stops an owned process through a handle on it (a pidfd): its identity (start time) and
+    ownership are read while the handle holds it, the handle's process is then proven alive (so
+    those reads were of it: a live process keeps its pid), the journal line (pid, start time,
+    boot) is written once, and the signal goes through the handle, never to a pid that may since
+    name another process (Sol, 20 Oct 2026). No pidfd (an older kernel or Python): not stopped."""
+    try:
+        fd = os.pidfd_open(pid)
+    except (AttributeError, OSError):
+        return False
+    try:
+        start = started(pid)
+        if start is None or not owner.owns(pid, environ_of, cgroup_of) or not alive(fd):
+            return False
+        if pid not in recorded:
+            journal(frozen, f"pid {pid} {start} {boot}")
+            recorded.add(pid)
+        signal.pidfd_send_signal(fd, signal.SIGSTOP)
+        return True
+    except (AttributeError, OSError):
+        return False
+    finally:
+        os.close(fd)
 
 
 def resume(state: Path) -> list[str]:
@@ -236,19 +256,26 @@ def resume(state: Path) -> list[str]:
                 continue
             if booted != boot:
                 continue  # recorded in another boot: that process is gone
+            # Through a handle on the process, as suspend(): identity read while it holds it,
+            # proven alive after, the signal through it. No handle: not continued blindly.
+            try:
+                fd = os.pidfd_open(int(pid))
+            except ProcessLookupError:
+                continue  # gone
+            except (AttributeError, OSError):
+                left.append(line)
+                continue
             try:
                 now = started(int(pid))
-            except OSError:
-                left.append(line)  # can't be inspected: not known to be gone
-                continue
-            if now != start:
-                continue  # gone, or another process under a reused pid: nothing of ours to continue
-            try:
-                os.kill(int(pid), signal.SIGCONT)
+                if not alive(fd) or now != start:
+                    continue  # gone, or another process under a reused pid: nothing of ours to continue
+                signal.pidfd_send_signal(fd, signal.SIGCONT)
             except ProcessLookupError:
                 pass  # gone meanwhile
-            except OSError:
-                left.append(line)  # still stopped, and still ours: kept
+            except (AttributeError, OSError):
+                left.append(line)  # can't be inspected or signalled: still stopped, still ours, kept
+            finally:
+                os.close(fd)
         elif kind == "container":
             try:
                 done = subprocess.run(["docker", "unpause", what], capture_output=True, text=True)
@@ -298,7 +325,7 @@ def watch(state: Path, root: int, token: str) -> int:
             # A stopped process uses no CPU; one another watcher resumed is stopped again.
             owned, unowned_cores, unowned = busy(before, now, at - last, mine | ancestors | {me} | stopped, owner)
             for pid in owned:
-                if not spared(pid) and suspend(pid, frozen, boot, stopped):
+                if not spared(pid) and suspend(pid, frozen, boot, stopped, owner):
                     say(f"stopped {pid} {now[pid][3]} (ours)")
             for pid in unowned:
                 if pid not in named:
