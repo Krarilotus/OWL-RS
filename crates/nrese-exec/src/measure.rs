@@ -244,19 +244,11 @@ fn allocated(size: usize, tag: u64) {
 /// region's committed pages), counted as a block of generation `tag`: the generation
 /// [`tag`] gave when the holder was made, as a [`Reservation`](crate::Reservation) records
 /// its own, so that a measurement counts all of the holder's memory and charges, or none.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "until region.rs reports its pages: remove then")
-)]
 pub(crate) fn mapped(size: usize, tag: u64) {
     allocated(size, tag);
 }
 
 /// Memory [`mapped`] with generation `tag`, unmapped.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "until region.rs reports its pages: remove then")
-)]
 pub(crate) fn unmapped(size: usize, tag: u64) {
     freed(size, tag);
 }
