@@ -22,8 +22,11 @@
 //! `subj`, `pred`, `obj` and `context` are written as in N-Triples (`<iri>`, `_:b`,
 //! `"text"@en`, `"1"^^<…#int>`); `context=null` is the default graph. A transaction's
 //! operations are kept on the server and applied in one commit; reads inside one
-//! (`action=QUERY`, `GET`, `SIZE`) see its changes: its operations are applied to an engine
-//! transaction that is never committed, holding the writer slot while they read. Namespaces
+//! (`action=QUERY`, `GET`, `SIZE`) see its changes: its operations are applied to a
+//! speculative engine transaction over the latest revision, never committed, so it takes no
+//! writer slot and other clients commit meanwhile (`StoreService::with_pending`). That is
+//! RDF4J's SNAPSHOT_READ: a transaction asking for a stronger level is refused at its begin
+//! ([`transaction_begin`]). Namespaces
 //! are kept in `rdf4j-namespaces.json` in an on-disk store's directory (in memory
 //! otherwise), written whole at every change.
 
@@ -824,15 +827,81 @@ fn absolute(headers: &HeaderMap, path: &str) -> String {
     format!("{scheme}://{host}{path}")
 }
 
+/// The isolation levels a transaction may ask for (RDF4J's `IsolationLevels`) and whether
+/// this server's transactions meet each. Each of their reads sees the latest commit with
+/// the transaction's own operations applied, one snapshot per read: SNAPSHOT_READ, and so
+/// every weaker level. SNAPSHOT (one snapshot for the whole transaction) and SERIALIZABLE
+/// (conflicting commits refused) they don't give; holding a revision is v1.6's.
+const ISOLATION_LEVELS: [(&str, bool); 6] = [
+    ("NONE", true),
+    ("READ_UNCOMMITTED", true),
+    ("READ_COMMITTED", true),
+    ("SNAPSHOT_READ", true),
+    ("SNAPSHOT", false),
+    ("SERIALIZABLE", false),
+];
+/// Where a begin names its isolation level: RDF4J's client since 3.3 (a transaction setting,
+/// in the form body), and the older parameter (graphdb.js, in the URL), whose value may carry
+/// the Sesame namespace.
+const ISOLATION_SETTING: &str =
+    "transaction-setting__org.eclipse.rdf4j.common.transaction.IsolationLevel";
+const ISOLATION_LEGACY: &str = "isolation-level";
+const SESAME: &str = "http://www.openrdf.org/schema/sesame#";
+
+/// Refuses a begin that names an isolation level this server's transactions don't meet, or
+/// one RDF4J doesn't know, looking in the URL and a form body under either name, as RDF4J's
+/// server does. The reason is plain text, which RDF4J's client shows as its exception's
+/// message (its Workbench then leaves the level out of its list). A refused level is never
+/// given weaker in silence; no level named means the server's own.
+fn check_isolation(raw: &RawQuery, headers: &HeaderMap, body: &Bytes) -> Result<(), ApiError> {
+    let mut named = pairs(raw)?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    if media_type_matches(content_type, "application/x-www-form-urlencoded") {
+        named.extend(
+            serde_urlencoded::from_bytes::<Vec<(String, String)>>(body)
+                .map_err(|error| ApiError::bad_request_plain_text(error.to_string()))?,
+        );
+    }
+    for (name, value) in named {
+        let level = match name.as_str() {
+            ISOLATION_SETTING => value.as_str(),
+            ISOLATION_LEGACY => value.strip_prefix(SESAME).unwrap_or(value.as_str()),
+            _ => continue,
+        };
+        match ISOLATION_LEVELS.iter().find(|(known, _)| *known == level) {
+            Some((_, true)) => {}
+            Some((known, false)) => {
+                return Err(ApiError::bad_request_plain_text(format!(
+                    "isolation level {known} isn't supported: a transaction here reads the \
+                     latest commit with its own changes, one snapshot per read (SNAPSHOT_READ); \
+                     ask for NONE, READ_UNCOMMITTED, READ_COMMITTED or SNAPSHOT_READ"
+                )));
+            }
+            None => {
+                return Err(ApiError::bad_request_plain_text(format!(
+                    "unknown isolation level '{value}' in {name}; the levels are NONE, \
+                     READ_UNCOMMITTED, READ_COMMITTED, SNAPSHOT_READ, SNAPSHOT and SERIALIZABLE"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn transaction_begin(
     authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
+    raw: RawQuery,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
     // Authenticated first; the view is the repository's (workspaces are per repository).
     let identity = guard::enforce_update_write(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
+    check_isolation(&raw, &headers, &body)?;
     let access = guard::view(&state, &identity);
     let txid = state
         .store()
