@@ -262,6 +262,20 @@ class Rounds(unittest.TestCase):
         self.assertAlmostEqual(gatestats.combine_rounds([0.01, 0.02]), 0.02 / 0.9)
         self.assertAlmostEqual(gatestats.combine_rounds([0.5, 0.001, 0.001]), 0.01)
 
+    def test_a_confirmation_runs_whole_squares_of_its_timed_sides(self):
+        """Sol r2: the candidate is timed whatever revision it shares; only a main that is base's
+        build isn't. Counting revisions gave three timed sides 2 blocks."""
+        for cand, main, sides in (("b", "m", 3), ("m", "m", 3), ("b", "b", 2), ("c", "m", 3), ("c", "b", 2)):
+            with self.subTest(cand=cand, main=main), patch.dict(REVS, {"cand": cand * 40, "base": "b" * 40, "main": main * 40}):
+                summary = run_gate(passes(slower(1.08), blocks=6))
+                for calibrated in (None, 3):
+                    measure = {"lab-olympics": {"blocks": calibrated}} if calibrated else None
+                    with patch.object(gate_module, "checkout_rev", return_value="x"):
+                        job = gate_module.confirm_job([summary], "C:/repo", measure=measure)
+                    n = len([s for s in job["steps"] if s[2] == "block"])
+                    self.assertEqual(n % sides, 0, (cand, main, calibrated, n))
+                    self.assertGreaterEqual(n, calibrated or gate_module.CONFIRM_BLOCKS[0])
+
     def test_nothing_flagged_needs_no_confirmation(self):
         clean = self.round_(1.0)
         self.assertIsNone(gate_module.confirm_job([clean], "C:/repo"))
@@ -909,6 +923,10 @@ class Measurement(unittest.TestCase):
                          [["a", "b", "c"], ["a", "b", "c"], ["b", "c"], ["b"]])
         with self.assertRaises(TypeError):  # Sol r1: no square given planned 2 and 8 blocks for three sides
             gate_module.blocks(["a"], measure)
+        # Sol r2: the plan files follow the job's minimum (jobs() with 4 blocks a round and a case
+        # needing 2: 6 block steps, the plan 3), and a declared outcome's case keeps its one block.
+        plan = gate_module.blocks(["a", "b", "c"], measure, 6, square=3, checked={"c"})
+        self.assertEqual([sorted(cases) for cases in plan], [["a", "b", "c"]] + [["a", "b"]] * 5)
         # Whole Latin squares of the timed sides (tf2-gate-1: a first run's cost; a case in 2
         # blocks of three sides leaves one side never opening): 2 -> 3, 4 -> 6, 3 stays.
         self.assertEqual(gate_module.blocks(["a", "b", "c"], measure, square=3),

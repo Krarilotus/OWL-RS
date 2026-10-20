@@ -1314,12 +1314,16 @@ def whole_squares(n: int, square: int) -> int:
     return -(-n // square) * square if square > 1 else n
 
 
-def blocks(plan_: list[str], measure: dict, min_blocks: int = CAMPAIGN_BLOCKS, *, square: int) -> list[list[str]]:
-    """The cases of each block: block k (from 1) runs those whose blocks (measure.toml) reach k,
-    each case's count in whole squares of `square` blocks (whole_squares(): the timed sides); the
-    first block every case (a declared outcome's: checked there, not timed). `square` has no
-    default (Sol r1, 20 Oct 2026: a call without it planned 2 and 8 blocks for three sides)."""
-    need = {c: whole_squares(int(measure.get(c, {}).get("blocks", min_blocks)), square) for c in plan_}
+def blocks(plan_: list[str], measure: dict, min_blocks: int = CAMPAIGN_BLOCKS, *, square: int,
+           checked: set | frozenset = frozenset()) -> list[list[str]]:
+    """The cases of each block: block k (from 1) runs those whose blocks (measure.toml, at least the
+    round's `min_blocks`) reach k, each case's count in whole squares of `square` blocks
+    (whole_squares(): the timed sides); a declared outcome's case (`checked`) only the first, where
+    it is checked, not timed. `square` has no default (Sol r1, 20 Oct 2026: a call without it
+    planned 2 and 8 blocks for three sides). Sol r2: the plan files are the job's block steps
+    (jobs() counts with the same minimum), and a declared outcome isn't rounded up to a square."""
+    need = {c: 1 if c in checked else whole_squares(max(int(measure.get(c, {}).get("blocks", min_blocks)), min_blocks),
+                                                    square) for c in plan_}
     count = max([whole_squares(min_blocks, square), *need.values()])
     return [[c for c in plan_ if need[c] >= k or k == 1] for k in range(1, count + 1)]
 
@@ -1496,9 +1500,11 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
     cases = sorted({h.split("|")[1] for h in pending})
     low, high = CONFIRM_BLOCKS
     revs = {"cand": first["candidate"]["revision"], **first["baselines"]}
-    # In whole Latin squares of the timed sides (a main that is base's build isn't timed again).
-    n = whole_squares(min(high, max([low, *(int((measure or {}).get(c, {}).get("blocks", low)) for c in cases)])),
-                      len(set(revs.values())))
+    # In whole Latin squares of the timed sides: the candidate always, and each baseline that isn't
+    # an earlier one's build (gate()'s aliases; release-gate.sh skips only such a main). Sol r2, 20
+    # Oct 2026: counting revisions dropped a candidate that shares base's, so three timed sides got 2.
+    timed = 1 + len(set(first["baselines"].values()))
+    n = whole_squares(min(high, max([low, *(int((measure or {}).get(c, {}).get("blocks", low)) for c in cases)])), timed)
     harness = first["harness"]
     k = len(rounds)
     prefix = ctx.get("prefix") or f"rg-{revs['cand'][:8]}"
@@ -1652,6 +1658,7 @@ def main() -> int:
     s.add_argument("--plan", type=Path, required=True)
     s.add_argument("--measure", type=Path, required=True)
     s.add_argument("--square", type=int, required=True, help="the timed sides: each case's blocks in whole Latin squares")
+    s.add_argument("--min-blocks", type=int, default=CAMPAIGN_BLOCKS, help="the round's least blocks a timed case (GATE_MIN_BLOCKS)")
     s.add_argument("--out", type=Path, required=True)
     s = sub.add_parser("confirm", help="the confirmation job of each host whose run flagged a loss or an undecided case")
     s.add_argument("--reports", type=Path, nargs="+", required=True, help="every timed report so far (release-gate.json)")
@@ -1758,7 +1765,8 @@ def main() -> int:
     if args.command == "blocks":
         gate_plan = json.loads(args.plan.read_text(encoding="utf-8"))
         found = blocks(gate_plan["run"], read_measure(args.measure.read_text(encoding="utf-8"))
-                       if args.measure.is_file() else {}, square=args.square)
+                       if args.measure.is_file() else {}, args.min_blocks, square=args.square,
+                       checked={c["name"] for c in cases_registry.load() if c.get("outcome", "ok") != "ok"})
         for k, cases in enumerate(found, start=1):
             (args.out / f"plan-block-{k}.json").write_text(json.dumps({"run": cases, "not_run": {}, "elsewhere": {}},
                                                                       indent=1), encoding="utf-8")
