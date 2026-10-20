@@ -2248,6 +2248,7 @@ mod tests {
             !seeded && excess == 0,
             "seeded {seeded}, {excess} bytes uncharged"
         );
+        drop(cold);
         assert_eq!(envelope.used(), 0);
         // Past the constant's charge: the candidates were charged as they grew.
         assert!(envelope.peak() > shape_bound(square.len()) && envelope.peak() <= limit);

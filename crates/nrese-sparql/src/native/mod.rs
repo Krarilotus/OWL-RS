@@ -1245,6 +1245,9 @@ struct Context<'a> {
     /// Canonical answers' view refused by this query's budget too: the query's error
     /// ([`canonical`]).
     canonical_refused: Option<nrese_exec::BudgetExceeded>,
+    /// The reader's state refused by this query's budget ([`Snapshot::reading_within`]): the
+    /// query's error at its first check.
+    reads_refused: Option<nrese_exec::BudgetExceeded>,
     /// Whether GeoSPARQL relations in triple patterns are computed from geometries too
     /// (the query-rewrite extension; not [`QueryOptions::geosparql_stated_only`]).
     spatial_rewrite: bool,
@@ -1290,6 +1293,17 @@ impl Charged for Vec<Solutions> {
 /// What [`IdTable::concat`] of `parts`' tables allocates beyond them.
 fn concat_growth(parts: &[Solutions]) -> usize {
     IdTable::concat_growth(parts.iter().map(|p| &p.table))
+}
+
+/// What a context holds of its own before it evaluates anything (its reader's state,
+/// [`Snapshot::reading_within`]): tests that count a query's charges exactly add it.
+#[cfg(test)]
+pub(crate) fn own_bytes(snapshot: &Snapshot) -> usize {
+    let mut options = QueryOptions::default();
+    options.resources.memory = nrese_exec::Envelope::unlimited();
+    let memory = options.resources.memory.clone();
+    let _context = Context::new(snapshot, &options, None, None);
+    memory.used()
 }
 
 impl<'a> Context<'a> {
@@ -1357,6 +1371,17 @@ impl<'a> Context<'a> {
             },
             false => (None, None),
         };
+        // What the reads hold while they run (an equality expansion's waiting copies) is
+        // charged to the evaluation too; a read it refuses fails the query at its next check
+        // ([`Self::check`]), and so does the reader's state refused.
+        let unread = match &canonical {
+            Some((_, read)) => read,
+            None => snapshot,
+        };
+        let (read, reads_refused) = match unread.reading_within(Arc::clone(&budget)) {
+            Ok(read) => (read, None),
+            Err(refused) => (unread.clone(), Some(refused)),
+        };
         let named = match &canonical {
             // The graphs `FROM NAMED` lists, by the names canonical reads give them.
             Some((names, _)) => resolved.named.map(|graphs| names.graphs(graphs)),
@@ -1374,12 +1399,10 @@ impl<'a> Context<'a> {
                 true => None,
                 false => snapshot.expand_late(options.read_model),
             },
-            snapshot: match &canonical {
-                Some((_, read)) => Cow::Owned(read.clone()),
-                None => Cow::Borrowed(snapshot),
-            },
+            snapshot: Cow::Owned(read),
             canonical: canonical.map(|(names, _)| names),
             canonical_refused,
+            reads_refused,
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
             aliases: RefCell::default(),
@@ -1477,7 +1500,12 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Fails a cancelled query, and one a read refused memory to: what it read since may
+    /// be incomplete ([`Snapshot::reading_within`]).
     fn check(&self) -> NativeResult<()> {
+        if let Some(refused) = self.reads_refused.or_else(|| self.snapshot.read_refused()) {
+            return Err(QueryEvaluationError::MemoryLimit(refused).into());
+        }
         Ok(self
             .cancellation
             .as_ref()
