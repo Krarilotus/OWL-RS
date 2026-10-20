@@ -38,6 +38,8 @@ import time
 from pathlib import Path
 
 PERIOD_S = 2.0
+# A Docker call's bound: a wedged daemon fails the call (its record kept), never holds the slot.
+DOCKER_S = 60
 # A process using more than this many cores is busy (a build, an unpack, a load).
 HEAVY_CORES = 0.2
 # Samples in which unowned work used more than a core: beyond this share, the measurement was
@@ -330,9 +332,9 @@ def resume(state: Path) -> list[str]:
                 os.close(fd)
         elif kind == "container":
             try:
-                done = subprocess.run(["docker", "unpause", what], capture_output=True, text=True)
-            except OSError:
-                left.append(line)
+                done = subprocess.run(["docker", "unpause", what], capture_output=True, text=True, timeout=DOCKER_S)
+            except (OSError, subprocess.TimeoutExpired):
+                left.append(line)  # no answer (Sol, 20 Oct 2026: a wedged Docker held the lock forever)
                 continue
             gone_or_running = done.returncode == 0 or "No such container" in done.stderr or "not paused" in done.stderr
             if not gone_or_running:
@@ -397,8 +399,11 @@ def watch(state: Path, root: int, token: str) -> int:
                         say(f"not paused: {cid}'s record couldn't be committed ({error})")
                         continue
                     paused.add(cid)
-                    if subprocess.run(["docker", "pause", cid], capture_output=True).returncode == 0:
-                        say(f"paused container {cid} (ours)")
+                    try:
+                        if subprocess.run(["docker", "pause", cid], capture_output=True, timeout=DOCKER_S).returncode == 0:
+                            say(f"paused container {cid} (ours)")
+                    except (OSError, subprocess.TimeoutExpired) as error:
+                        say(f"pausing {cid} gave no answer ({error}); its record stands for the resume")
             samples += 1
             disturbed += unowned_cores > 1.0
             before, last = now, at
