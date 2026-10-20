@@ -369,17 +369,23 @@ code=$?
 set -e
 killed="${NRESE_GUARD_KILLED:-$HOME/owlrs-guard/killed.log}"
 if [ "$code" -ne 0 ] && { [ -f "$killed" ] || [ -f "$BUSY" ]; }; then
-  # A deadline by the clock (microseconds), not by turns of the loop: what is first seen after it
-  # doesn't count, however late a turn ran (Sol, 20 Oct 2026).
-  now_us() { printf '%s\n' "${EPOCHREALTIME/[.,]/}"; }
-  deadline=$(( $(now_us) + ${NRESE_GUARD_NOTICE_WAIT_S:-10} * 1000000 ))
-  notices=$(guard_notices)
-  while ! grep -q '^stopped ' <<< "$notices" && { [ -f "$BUSY" ] || grep -q '^pending' <<< "$notices"; } \
-      && [ "$(now_us)" -lt "$deadline" ]; do
-    sleep 1
+  # A deadline by a clock that only moves forward (/proc/uptime, in hundredths of a second: Linux's
+  # and Git Bash's alike), checked after every look at the notices, the first included: what is
+  # first seen after it doesn't count, however late a look ran (Sol, 20 Oct 2026).
+  uptime_cs() {
+    local up
+    read -r up _ < /proc/uptime
+    printf '%s\n' $(( 10#${up%.*} * 100 + 10#${up#*.} ))
+  }
+  deadline=$(( $(uptime_cs) + ${NRESE_GUARD_NOTICE_WAIT_S:-10} * 100 ))
+  notices=""
+  while :; do
     seen=$(guard_notices)
-    [ "$(now_us)" -le "$deadline" ] || break
+    [ "$(uptime_cs)" -le "$deadline" ] || break
     notices=$seen
+    grep -q '^stopped ' <<< "$notices" && break
+    { [ -f "$BUSY" ] || grep -q '^pending' <<< "$notices"; } || break
+    sleep 1
   done
   stopped=$(sed -n 's/^stopped //p' <<< "$notices" | tr '\n' ' ')
   if [ -n "$stopped" ]; then
