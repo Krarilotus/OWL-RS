@@ -119,7 +119,7 @@ def load_family(path: str | Path) -> dict:
         if unknown:
             problems.append(f"{where}: dimensions {unknown} aren't the case's ({', '.join(offered)})")
         cases.append({"name": case["name"], "cap_gb": case.get("cap_gb", 4), "min_samples": int(entry.get("min_samples", 1)),
-                      "checks": sorted(case.get("check") or {})})
+                      "checks": sorted(case.get("check") or {}), "tool": case.get("tool", "perf_lab")})
         hypotheses += [rg.hypothesis("a", case["name"], d) for d in wanted if d in offered]
     if len({c["name"] for c in cases}) != len(cases):
         problems.append("a case is declared twice")
@@ -182,13 +182,20 @@ def jobs(family: dict, harness: str, checkout: str, host: str, round_: int = 1) 
 
 # --- the verdict ---------------------------------------------------------------------------------
 
-def missing_checks(record: dict, paths: list[str]) -> list[str]:
-    """The declared content checks (`paths`) a run has no passing result for: in the record (its
-    own results and its observations' together) and in each observation that reports checks. Sol,
-    20 Oct 2026 (r1): a run with no check results at all counted as checked, so a family whose
-    checks never ran passed."""
-    observed = [o["checks"] for o in record.get("observations") or [] if o.get("checks")]
-    units = [list(record.get("checks") or []) + [c for unit in observed for c in unit], *observed]
+def missing_checks(record: dict, paths: list[str], per_invocation: bool = True) -> list[str]:
+    """The declared content checks (`paths`) a run has no passing result for. Sol, 20 Oct 2026:
+    a run with no check results counted as checked (r1); then an invocation whose check list was
+    empty or absent borrowed a sibling's results (r2). With `per_invocation` (perf_lab: fast.py
+    checks every invocation's answer, its observation's `checks`, and the record's own are only
+    the last invocation's), every observation must prove every path itself, and only a record
+    without observations is proved by its own results. Otherwise (the other tools: one
+    observation, the record's checks) the record's results, and each observation that reports
+    checks must cover them too."""
+    observations = record.get("observations") or []
+    if per_invocation and observations:
+        units = [o.get("checks") or [] for o in observations]
+    else:
+        units = [list(record.get("checks") or []), *[o["checks"] for o in observations if o.get("checks")]]
     return sorted({p for unit in units for p in paths
                    if not any(c.get("path") == p and c.get("ok") is True for c in unit)})
 
@@ -215,6 +222,7 @@ def completeness(family: dict, manifest: dict | None, passes: list[dict]) -> lis
             series.setdefault(case, []).append(dim[len("time/"):])
     floors = {c["name"]: c["min_samples"] for c in family["cases"]}
     declared = {c["name"]: c["checks"] for c in family["cases"]}
+    per_invocation = {c["name"]: c.get("tool", "perf_lab") == "perf_lab" for c in family["cases"]}
     for side in SIDES:
         mine = [p for p in passes if p["side"] == side]
         if not mine:
@@ -232,7 +240,7 @@ def completeness(family: dict, manifest: dict | None, passes: list[dict]) -> lis
                 for r in p["report"].get("records", []):
                     if r.get("case") != case:
                         continue
-                    for path in missing_checks(r, declared[case]):
+                    for path in missing_checks(r, declared[case], per_invocation[case]):
                         unproven.setdefault(path, []).append(p["n"])
                     for s in series.get(case, []):
                         n = len((r.get("samples") or {}).get(s) or [])
