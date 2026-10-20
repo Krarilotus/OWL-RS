@@ -39,6 +39,8 @@ pub(crate) mod fault;
 pub(crate) mod sidecar;
 pub(crate) mod wal;
 
+pub use wal::{copy_log_segment, remove_log_segment};
+
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
