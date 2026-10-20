@@ -11,9 +11,10 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 SUITE = Path(__file__).resolve().parent.parent
@@ -173,10 +174,36 @@ class Running(unittest.TestCase):
         self.assertIn("2", (Path(done["results"]) / "queue-2.log").read_text())
 
     def test_a_chunk_past_its_limit_is_stopped_and_the_job_must_be_split(self):
+        # The limit (1.5 x 20 min) runs out when the test says: the chunk's first timed wait
+        # reports it over at once. The real chunk, asleep for 30 s, is stopped and reaped.
+        children, limits = [], []
+
+        class Chunk(subprocess.Popen):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                children.append(self)
+
+            def wait(self, timeout=None):
+                if timeout is not None and not limits:
+                    limits.append(timeout)
+                    raise subprocess.TimeoutExpired(self.args, timeout)
+                return super().wait(timeout)
+
         path, found = self.submit([[sys.executable, "-c", "import time; time.sleep(30)"]])
-        started = time.monotonic()
-        self.assertEqual(self.q.run(path, found, self.retreat, chunk_min=0.02), "failed")
-        self.assertLess(time.monotonic() - started, 20)
+        states = []
+        with patch.object(queue, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": Chunk})):
+            runner = threading.Thread(
+                target=lambda: states.append(self.q.run(path, found, self.retreat, chunk_min=20)), daemon=True)
+            runner.start()
+            runner.join(60)  # contains a stop that never happens
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+        self.assertFalse(runner.is_alive(), "the limit didn't stop the chunk")
+        self.assertEqual(states, ["failed"])
+        self.assertEqual(limits, [20 * 1.5 * 60])
+        [child] = children
+        self.assertNotIn(child.returncode, (None, 0), "the chunk was stopped and reaped")
         self.assertIn("split it", queue.read_job(self.q.directory / "failed" / "j.toml")["note"])
 
 

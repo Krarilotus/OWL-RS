@@ -51,12 +51,17 @@ class GraphdbContract(unittest.TestCase):
         self.adapter = Graphdb()
 
     def test_native_equality_follows_entailment_regime(self):
-        for regime in self.adapter.regimes:
+        # regime: (GraphDB's ruleset, sameAs disabled), stated here rather than read from
+        # the adapter, so a wrong mapping can't label another ruleset with the regime.
+        expected = {'none': ('empty', 'true'), 'rdfs': ('rdfs', 'true'),
+                    'owl-horst': ('owl-horst', 'false'), 'owl2-rl': ('owl2-rl', 'false'),
+                    'owl2-ql': ('owl2-ql', 'false')}
+        self.assertEqual(set(self.adapter.regimes), set(expected))
+        for regime, (ruleset, disabled) in expected.items():
             with self.subTest(regime=regime):
                 config = self.adapter.configuration(self.ctx, regime)
-                disabled = 'true' if regime in ('none', 'rdfs') else 'false'
                 self.assertIn(f'graphdb:disable-sameAs "{disabled}"', config)
-                self.assertIn(f'graphdb:ruleset "{self.adapter.regimes[regime]}"', config)
+                self.assertIn(f'graphdb:ruleset "{ruleset}"', config)
                 self.assertIn('graphdb:enablePredicateList "true"', config)
                 self.assertIn('graphdb:enable-literal-index "true"', config)
                 self.assertIn('graphdb:query-limit-results "0"', config)
