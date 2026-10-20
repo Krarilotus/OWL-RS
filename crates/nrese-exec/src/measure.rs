@@ -46,6 +46,15 @@
 //!
 //! # Known limits
 //!
+//! A measurement counts every thread of its process, so a measured test runs in a child of
+//! its own, on the test harness's main thread with no other test ([`alone`], under
+//! cargo-nextest too): libtest's main thread, beside a test running on its own thread,
+//! writes after 60 seconds that the test is running long, and that allocates (594 bytes
+//! counted in a measurement across the mark, 20 Oct). The child is recognised by a marker
+//! variable naming the test together with the arguments it was started with; a process
+//! started by hand with the same variable and those arguments is taken for the child,
+//! which it is in all but name.
+//!
 //! What a measurement counts is what it can tell apart. Three patterns of correct code
 //! are told apart wrongly; each has a rule for measured tests:
 //! - A reservation made before the measurement and used in it (moved in, then charged,
@@ -543,6 +552,18 @@ pub fn measure_within<T>(budget: &Budget, work: impl FnOnce() -> T) -> (T, usize
 /// The variable that tells a test process it runs one test alone.
 const ALONE: &str = "NRESE_MEASURE_ALONE";
 
+/// The arguments [`alone`] runs `test` with, in a child of its own: that test alone, on one
+/// test thread (the harness's main thread).
+fn alone_args(test: &str) -> [&str; 5] {
+    [
+        test,
+        "--exact",
+        "--include-ignored",
+        "--test-threads=1",
+        "--nocapture",
+    ]
+}
+
 /// Whether the calling test runs alone in its process, as a measurement needs: only in the
 /// process this starts. Elsewhere it runs the test again, alone (ignored or not), on the
 /// main thread of a child process of this binary (`--test-threads=1`) and ends as it did
@@ -563,17 +584,15 @@ pub fn alone() -> bool {
     }
     let current = std::thread::current();
     let test = current.name().expect("a test thread, named after its test");
-    if std::env::var(ALONE).is_ok_and(|t| t == test) {
+    // The child [`alone`] started: the marker names this test, and the process was started
+    // with exactly the arguments that run it alone on one thread. A marker inherited from
+    // elsewhere, in a run of other arguments, is no such child.
+    let started_alone = || std::env::args().skip(1).eq(alone_args(test));
+    if std::env::var(ALONE).is_ok_and(|t| t == test) && started_alone() {
         return true;
     }
     let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-        .args([
-            test,
-            "--exact",
-            "--include-ignored",
-            "--test-threads=1",
-            "--nocapture",
-        ])
+        .args(alone_args(test))
         .env(ALONE, test)
         .output()
         .expect("the test binary runs");
