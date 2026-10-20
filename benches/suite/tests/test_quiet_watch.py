@@ -76,11 +76,16 @@ class Watch(unittest.TestCase):
         # a colleague's and root's are left running and count as load.
         self.assertEqual((sorted(owned), sorted(unowned)), ([31, 34], [32, 33, 50, 60]))
         self.assertAlmostEqual(unowned_cores, 8.0, places=1)
-        # A slot that knows no owner (no FLEET_JOB, no slice) suspends nothing, whatever the uid.
-        nobody = watch.Owner({}, namespace=None)
+        # A slot that knows no owner (no FLEET_JOB, no slice: a manual run) suspends nothing,
+        # whatever the uid, nor pauses a container, not even one labelled with the checkout's own
+        # namespace (Sol, 20 Oct 2026: it did). Built as the watcher builds it.
+        nobody = watch.Owner({})
         self.assertEqual(watch.busy(TABLE, now, 1.0, mine | ancestors, nobody, environ_of, cgroup_of)[0], [])
         self.assertEqual([owner.owns_container(label) for label in ("job-a", "job-b", "")], [True, False, False])
-        self.assertFalse(nobody.owns_container(""))
+        checkout = watch.job_namespace({})
+        self.assertTrue(checkout)
+        self.assertEqual([nobody.owns_container(label) for label in (checkout, "")], [False, False])
+        self.assertEqual(watch.Owner({"FLEET_JOB": "job-a"}).namespace, "job-a")
 
     @unittest.skipUnless(hasattr(watch.signal, "SIGCONT"), "POSIX signals (the watcher runs on Linux)")
     def test_a_resume_settles_only_what_it_continued_or_proved_gone_and_the_watch_fails_on_the_rest(self):
@@ -106,7 +111,7 @@ class Watch(unittest.TestCase):
             self.assertEqual(frozen.read_text(), "pid 31 777 boot-1\npid 51 666 boot-1\n")
             with patch.object(watch, "processes", side_effect=[{}, {}]), patch.object(watch.time, "sleep"), \
                     patch.object(watch, "resume", return_value=["container stuck"]), \
-                    patch.object(watch, "namespace", return_value=None):
+                    patch.object(watch, "job_namespace", return_value=None):
                 self.assertEqual(watch.watch(Path(tmp), 12345, "token"), 1)
 
     @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
