@@ -874,26 +874,18 @@ impl Dictionary {
     /// builds its own, the first taken in. A small extension is indexed under the locks, on
     /// this thread alone.
     pub(crate) fn cover_text(&self, iris: bool) {
-        use rayon::prelude::*;
         let (which, slot, building) = match iris {
             false => (TEXT, &self.text, &self.text_building[0]),
             true => (IRI_TEXT, &self.iri_text, &self.text_building[1]),
         };
-        // The text an entry is found by (a literal's value, an IRI as it is: its local
-        // name is made from it with no lock held).
-        let raw = |key: Key<'_>| -> Option<String> {
+        // The text an entry is found by: a literal's value, an IRI's local name's words.
+        let text_of = |key: Key<'_>| -> Option<String> {
             match (iris, view_key(&key)) {
                 (false, TermView::String(value) | TermView::LangString { value, .. }) => {
                     Some(value.to_owned())
                 }
-                (true, TermView::Iri(iri)) => Some(iri.to_owned()),
+                (true, TermView::Iri(iri)) => super::text::local_name_text(iri),
                 _ => None,
-            }
-        };
-        let words = |text: String| -> Option<String> {
-            match iris {
-                false => Some(text),
-                true => super::text::local_name_text(&text),
             }
         };
         self.load_text(which, slot);
@@ -910,7 +902,7 @@ impl Dictionary {
                 }
                 let inner = self.inner.read();
                 for entry in start..end.min(inner.len()) {
-                    if let Some(text) = raw(inner.key(entry)).and_then(words) {
+                    if let Some(text) = text_of(inner.key(entry)) {
                         index.add(entry, &text);
                     }
                 }
@@ -928,7 +920,10 @@ impl Dictionary {
             let mut from = start;
             while from < end {
                 let stop = (from + TEXT_BATCH).min(end);
-                let texts: Vec<(u64, String)> = {
+                // The texts on the pool for work under a lock ([`super::text::scoped`]): its
+                // threads take on no other job, so the entries' lock held holds up no part
+                // of another build.
+                let parts: Vec<Vec<(u64, String)>> = {
                     let inner = self.inner.read();
                     let inner: &Inner = &inner;
                     let per = (stop - from).div_ceil(super::text::threads() as u64);
@@ -938,20 +933,13 @@ impl Dictionary {
                         .collect();
                     super::text::scoped(ranges, |(a, b)| {
                         (a..b)
-                            .filter_map(|entry| Some((entry, raw(inner.key(entry))?)))
+                            .filter_map(|entry| Some((entry, text_of(inner.key(entry))?)))
                             .collect::<Vec<_>>()
                     })
-                    .into_iter()
-                    .flatten()
-                    .collect()
                 };
-                let documents: Vec<(u64, String)> = texts
-                    .into_par_iter()
-                    .with_min_len(super::text::BUILD_PART)
-                    .filter_map(|(entry, text)| Some((entry, words(text)?)))
-                    .collect();
-                let documents: Vec<(u64, &str)> = documents
+                let documents: Vec<(u64, &str)> = parts
                     .iter()
+                    .flatten()
                     .map(|(entry, text)| (*entry, text.as_str()))
                     .collect();
                 fragment.extend(&documents, &|| self.part_started());

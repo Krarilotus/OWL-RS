@@ -1483,9 +1483,8 @@ impl Snapshot {
                 &unbounded
             }
         };
-        // The index first, then the corpus, then the search: no lock held across another's
-        // parallel parts ([`Dictionary::cover_text`](crate::Dictionary)).
-        self.dictionary.cover_text(false);
+        // The corpus, the index covering it, then the search: no lock held across
+        // another's parallel parts ([`Dictionary::cover_text`](crate::Dictionary)).
         let corpus = self.text_corpus(Documents::Literals, model, scope, Some(request))?;
         self.dictionary.text_search(query, &corpus, request)
     }
@@ -1519,9 +1518,8 @@ impl Snapshot {
                 &unbounded
             }
         };
-        // The vectors first, then the corpus, then the scan: no lock held across another's
+        // The corpus, the vectors covering it, then the scan: no lock held across another's
         // parallel parts.
-        self.dictionary.cover_vectors();
         let corpus = self.text_corpus(Documents::Vectors, model, scope, Some(request))?;
         let accept = |id: TermId| corpus.contains(id.payload()) && accept(id);
         let (hits, report) =
@@ -1553,7 +1551,6 @@ impl Snapshot {
     /// Prepares what [`Self::vector_search`] reads before returning (a warm-up): the vectors
     /// of the dictionary and the corpus of every graph's.
     pub fn prepare_vector_search(&self) {
-        self.dictionary.cover_vectors();
         self.text_corpus(
             Documents::Vectors,
             ReadModel::Materialised,
@@ -1581,7 +1578,6 @@ impl Snapshot {
                 &unbounded
             }
         };
-        self.dictionary.cover_text(true);
         let corpus = self.text_corpus(Documents::Subjects, model, scope, Some(request))?;
         self.dictionary.iri_search(query, &corpus, request)
     }
@@ -1604,7 +1600,6 @@ impl Snapshot {
         iris: bool,
         budget: Option<&Arc<nrese_exec::Budget>>,
     ) -> Result<(u64, u64), nrese_exec::BudgetExceeded> {
-        self.dictionary.cover_text(iris);
         let documents = match iris {
             false => Documents::Literals,
             true => Documents::Subjects,
@@ -1624,7 +1619,6 @@ impl Snapshot {
         scope: &TextScope,
         iris: bool,
     ) -> (Vec<u64>, u64, u64) {
-        self.dictionary.cover_text(iris);
         let documents = match iris {
             false => Documents::Literals,
             true => Documents::Subjects,
@@ -1688,7 +1682,10 @@ impl Snapshot {
             canonical: self.canonical,
         };
         let (from, keep) = match store.find(&self.version, kind, request)? {
-            Found::Kept(corpus) => return Ok(CorpusRef::Kept(corpus)),
+            Found::Kept(corpus) => {
+                self.cover(documents);
+                return Ok(CorpusRef::Kept(corpus));
+            }
             Found::Build { from, keep } => (from, keep),
         };
         let iris = documents == Documents::Subjects;
@@ -1701,6 +1698,7 @@ impl Snapshot {
         let span = self.version.dictionary_len;
         let built = match from {
             Some((base, touched)) => {
+                self.cover(documents);
                 let mut changes =
                     nrese_exec::ChargedVec::with_capacity(Arc::clone(request), touched.len())?;
                 for id in touched.iter().copied().map(TermId::from_raw) {
@@ -1756,8 +1754,9 @@ impl Snapshot {
         bits.resize(words, 0)?;
         let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
         scratch.charge(self.walk_scratch(words))?;
-        // Per graph, each kind's walk; a scan (where the index can't walk them) marks every
-        // kind at once.
+        // The index first (only the count needs it); then per graph, each kind's walk, a
+        // scan (where the index can't walk them) marking every kind at once.
+        self.cover(documents);
         let mut mark = |graph: GraphSelector| {
             for &kind in documents.kinds() {
                 if self.mark_values(model, graph, documents, kind, &mut bits) {
@@ -1783,6 +1782,16 @@ impl Snapshot {
                 .dictionary
                 .with_text_index(true, |index| index.corpus(bits)),
         })
+    }
+
+    /// Extends the index of `documents` (the vectors, for vector literals) over the
+    /// dictionary's entries.
+    fn cover(&self, documents: Documents) {
+        match documents {
+            Documents::Literals => self.dictionary.cover_text(false),
+            Documents::Subjects => self.dictionary.cover_text(true),
+            Documents::Vectors => self.dictionary.cover_vectors(),
+        }
     }
 
     /// The most a corpus walk over `words` words of bits holds at once besides them: for
