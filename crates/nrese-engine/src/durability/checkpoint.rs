@@ -54,6 +54,7 @@ use rayon::prelude::*;
 
 use super::codec::{Reader, put_u32, put_u64};
 use super::fault::{self, Step};
+use super::publish;
 use crate::engine::{Snapshot, Stack};
 use crate::error::{EngineError, EngineResult};
 use crate::index::keys::PackedKeys;
@@ -482,24 +483,17 @@ impl Written {
     /// recovers it. Returns its path.
     pub(crate) fn commit(mut self) -> Result<PathBuf, Uncommitted> {
         let path = checkpoint_path(&self.dir, self.revision, EXTENSION);
-        let renamed = fault::check(Step::Rename).and_then(|()| fs::rename(&self.tmp, &path));
-        if let Err(error) = renamed {
-            return Err(match path.exists() {
-                true => {
-                    self.pending = false;
-                    Uncommitted::Unknown(error)
-                }
-                false => Uncommitted::No(error.into()),
-            });
+        fault::check(Step::Rename).map_err(|error| Uncommitted::No(error.into()))?;
+        match publish::publish(&self.tmp, &path) {
+            Ok(()) => {}
+            Err(publish::Failed::NotMoved(error)) => return Err(Uncommitted::No(error.into())),
+            Err(publish::Failed::Unknown(error)) => {
+                self.pending = false;
+                return Err(Uncommitted::Unknown(error));
+            }
         }
         self.pending = false;
-        let synced = fault::check(Step::DirSync).and_then(|()| {
-            super::sync_dir(&self.dir).map_err(|error| match error {
-                EngineError::Io(error) => error,
-                other => std::io::Error::other(other.to_string()),
-            })
-        });
-        synced.map_err(Uncommitted::Unknown)?;
+        fault::check(Step::DirSync).map_err(Uncommitted::Unknown)?;
         Ok(path)
     }
 }

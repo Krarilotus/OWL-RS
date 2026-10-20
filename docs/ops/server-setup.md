@@ -68,6 +68,7 @@ Durable storage note:
 - `NRESE_STORE_MODE=on-disk` stores a write-ahead log and checkpoints under `NRESE_DATA_DIR`.
   - It needs no build feature and no native toolchain.
   - Every commit is synced before it is acknowledged.
+  - What survives a power cut, per platform: a commit's WAL record is flushed before it is acknowledged (`fsync` on Linux, `FlushFileBuffers` on Windows), and every file name recovery reads (a checkpoint, a WAL segment and its `.wal.meta`, a restored image or segment) is placed durably before it counts: on Linux a rename and an `fsync` of its directory, on Windows `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`. These are the platforms' documented primitives; the guarantee is theirs and the disk's (a disk that acknowledges unwritten cached data defeats both). A power-cut test has not been run on either platform.
 - The data directory is locked. A second server on the same directory fails at startup with a clear error.
 - Checkpoints run in the background and delete the WAL segments they cover.
 - Backups:

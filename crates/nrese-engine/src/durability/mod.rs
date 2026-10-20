@@ -37,10 +37,17 @@
 pub(crate) mod checkpoint;
 pub(crate) mod codec;
 pub(crate) mod fault;
+pub(crate) mod publish;
 pub(crate) mod sidecar;
 pub(crate) mod wal;
 
 pub use wal::{copy_log_segment, remove_log_segment};
+
+/// Flushes `from` and moves it to `to`, durably once this returns: how a restore places a
+/// file a store will open ([`publish`] module docs).
+pub fn place_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    publish::publish_or_fail(from, to)
+}
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -230,6 +237,7 @@ impl Durable {
 
         let wal_dir = wal::wal_dir(root);
         fs::create_dir_all(&wal_dir)?;
+        wal::remove_partials(&wal_dir)?;
         let segments = wal::list_segments(&wal_dir)?;
         let last = segments.len().checked_sub(1);
         if let Some(until) = config.recover_until
@@ -395,15 +403,5 @@ fn replay(
         *version.stack_mut(stack) = index;
     }
     version.revision = record.revision;
-    Ok(())
-}
-
-/// Makes a rename or file creation in `dir` durable. Directories can't be opened as files on
-/// Windows; there, NTFS journals the metadata change and this is a no-op.
-pub(crate) fn sync_dir(dir: &Path) -> EngineResult<()> {
-    #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
     Ok(())
 }

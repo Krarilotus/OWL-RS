@@ -1,7 +1,7 @@
 //! Sidecars: small text files beside a durable file, `<file>.meta`, holding facts about it
 //! that its format has no room for, as `key=value` lines (a WAL segment's sync policy).
-//! Written atomically (a temporary file, synced, renamed, the directory synced) before the
-//! file they describe; engines that don't know them ignore them, so they change no format.
+//! Written atomically (a temporary file, published: [`super::publish`]) before the file
+//! they describe; engines that don't know them ignore them, so they change no format.
 //! A missing or unreadable sidecar reads as no facts: its readers fall back accordingly.
 
 use std::ffi::OsString;
@@ -48,14 +48,8 @@ fn write_text(file: &Path, text: &str) -> EngineResult<()> {
     let mut tmp = OsString::from(path.as_os_str());
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    let mut out = File::create(&tmp)?;
-    out.write_all(text.as_bytes())?;
-    out.sync_all()?;
-    drop(out);
-    fs::rename(&tmp, &path)?;
-    if let Some(dir) = path.parent() {
-        super::sync_dir(dir)?;
-    }
+    File::create(&tmp)?.write_all(text.as_bytes())?;
+    super::publish::publish_or_fail(&tmp, &path)?;
     Ok(())
 }
 
