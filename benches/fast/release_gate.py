@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import statistics
 import sys
@@ -1323,6 +1324,32 @@ def linux_host(name: str, registry: dict | None = None) -> None:
                          f"(os {host.get('os') if host else 'unknown'}): the gate's ELF binaries can't run there")
 
 
+def checkout_rev(checkout: str, candidate: str, harness: str) -> str:
+    """The revision a gate job's checkout takes, so that release-gate.sh can name every revision
+    it builds: the harness when it contains the candidate (a gate of a head the harness is on), the
+    candidate when it contains the harness (a branch rebased on it: keepers, 20 Oct 2026, whose
+    candidate builds failed at the harness's checkout); neither containing the other is no job."""
+    if candidate == harness:
+        return harness
+    import subprocess
+    # That checkout's repository, whatever a calling git (a hook's GIT_DIR, GIT_INDEX_FILE) names.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+    def contains(rev: str, other: str) -> bool:
+        done = subprocess.run(["git", "-C", checkout, "merge-base", "--is-ancestor", other, rev],
+                              capture_output=True, text=True, env=env)
+        if done.returncode not in (0, 1):
+            raise SystemExit(f"{checkout}: can't compare {other[:8]} and {rev[:8]}: {done.stderr.strip()}")
+        return done.returncode == 0
+    if contains(harness, candidate):
+        return harness
+    if contains(candidate, harness):
+        return candidate
+    raise SystemExit(f"neither the candidate {candidate[:8]} nor the harness {harness[:8]} contains the other: "
+                     "a job's checkout must hold both (rebase the candidate onto the harness, or gate with "
+                     "--harness the candidate)")
+
+
 def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_round: int, cases: str | None,
          base: str = BASE, main: str = MAIN, timed_host: str = "phuoc-yu", checks_host: str = "office-pc",
          max_gb: float = 24, checks: bool = True, big_host: str | None = "khaleesi-wsl",
@@ -1340,7 +1367,7 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
            "GATE_MIN_BLOCKS": str(blocks_per_round), **({"GATE_CASES": cases} if cases else {}),
            **({"GATE_BIG_GB": str(big_gb), "GATE_BIG_HOST": big_host} if big_host else {}),
            **({"GATE_BATCH": "1"} if batch else {}), **({"GATE_LAYOUTS": str(layouts)} if layouts > 1 else {})}
-    source = [{"name": "checkout", "source": {"git": checkout, "rev": harness}}]
+    source = [{"name": "checkout", "source": {"git": checkout, "rev": checkout_rev(checkout, candidate, harness)}}]
     gate_ = ["bash", "scripts/release-gate.sh"]
     revs = {"base": base, "main": main, "cand": candidate}
     small = bool(cases)
@@ -1448,7 +1475,8 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
             + [[*gate_, "report", harness, f"cand={revs['cand']}", *(f"{s}={r}" for s, r in first["baselines"].items())],
                [*gate_, "clean"]],
             "requires": {"hosts": [ctx.get("host") or "phuoc-yu"], "cores": 16, "ram_gb": ctx.get("ram_gb", 24)},
-            "inputs": [{"name": "checkout", "source": {"git": checkout, "rev": harness}}]}
+            "inputs": [{"name": "checkout", "source": {"git": checkout,
+                                                       "rev": checkout_rev(checkout, revs["cand"], harness)}}]}
 
 
 def verdict(timed: list[dict], w3c: dict, guards: dict) -> tuple[bool, str]:
