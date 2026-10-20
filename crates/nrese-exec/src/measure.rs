@@ -96,8 +96,7 @@
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
-use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 
 use crate::Budget;
 
@@ -182,18 +181,23 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Held while a measurement starts: starts publish their generations in order.
 static STARTING: AtomicBool = AtomicBool::new(false);
-/// Whether [`Measured`] has allocated: it is the process's global allocator.
-static INSTALLED: AtomicBool = AtomicBool::new(false);
-
 /// Panics unless [`Measured`] is the process's global allocator: without it a measurement
-/// counts nothing, and passes whatever the work holds.
+/// counts nothing, and passes whatever the work holds. Asked anew each time: one byte from
+/// the global allocator, uncounted, which only a [`Measured`] that is the global allocator
+/// sees (a `Measured` of the test's own, called directly, never does).
 fn require_measured() {
-    if !INSTALLED.load(Relaxed) {
-        // Made by the process's allocator: Measured, which records it, if it is that.
-        drop(std::hint::black_box(Box::new(0u8)));
+    let before = UNCOUNTED.replace(Some(0));
+    let layout = Layout::new::<u8>();
+    // SAFETY: a layout of non-zero size; the block, if one was made, is freed with it.
+    unsafe {
+        let block = std::alloc::alloc(layout);
+        if !block.is_null() {
+            std::alloc::dealloc(block, layout);
+        }
     }
+    let seen = UNCOUNTED.replace(before).is_some_and(|bytes| bytes > 0);
     assert!(
-        INSTALLED.load(Relaxed),
+        seen,
         "a measurement needs nrese_exec::measure::Measured as this test binary's global \
          allocator, or it counts nothing and passes: add `#[global_allocator] static \
          MEASURED: nrese_exec::measure::Measured<std::alloc::System> = \
@@ -245,17 +249,15 @@ fn bytes(bytes: usize) -> i128 {
 
 thread_local! {
     /// The bytes this thread allocated uncounted, while it aligns rayon's queue
-    /// ([`prepare`]); `None` while it doesn't.
+    /// ([`prepare`]) or asks whether [`Measured`] is the global allocator; `None` while it
+    /// does neither.
     static UNCOUNTED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// The generation a block of `size` bytes made now records, and whether it is counted: not
-/// while its thread aligns rayon's queue, whose blocks record 0, before every measurement,
-/// so that none counts their allocation or their free.
+/// while its thread aligns rayon's queue or asks for [`Measured`], whose blocks record 0,
+/// before every measurement, so that none counts their allocation or their free.
 fn block_tag(size: usize) -> (u64, bool) {
-    if !INSTALLED.load(Relaxed) {
-        INSTALLED.store(true, Relaxed);
-    }
     match UNCOUNTED.try_with(std::cell::Cell::get) {
         Ok(Some(bytes)) => {
             UNCOUNTED.set(Some(bytes.saturating_add(size)));
@@ -585,7 +587,7 @@ fn reported(count: i128) -> usize {
 }
 
 /// `work`'s result, and the most bytes it held at once: allocated while it ran and not
-/// yet freed. Without [`Measured`] installed, the count is 0.
+/// yet freed. Without [`Measured`] as the global allocator, it panics.
 pub fn measure<T>(work: impl FnOnce() -> T) -> (T, usize) {
     prepare();
     let running = Running::start(None);
