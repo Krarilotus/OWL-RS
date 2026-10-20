@@ -581,13 +581,32 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
                    "GATE_QUIET": "0"}
             subprocess.run([bash, "-c", setup], cwd=ROOT, env=env, check=True, capture_output=True)
             done = subprocess.run([bash, "-c", f'PATH="$(cygpath -u "{shim}" 2>/dev/null || echo "{shim}"):$PATH" '
-                                   f'exec bash scripts/release-gate.sh block 2 {head} 1 - base={head} cand={head}'],
+                                   f'exec bash scripts/release-gate.sh block 2 {head} 1 - base={head} main={head} '
+                                   f'cand={head}'],
                                   cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
             subprocess.run(["git", "worktree", "remove", "--force", f"{t}/gate/src-{head[:8]}"], cwd=ROOT,
                            env=clean, capture_output=True)
         subprocess.run(["git", "worktree", "prune"], cwd=ROOT, env=clean, capture_output=True)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("block 2: done", done.stdout)
+        self.assertIn("main is the same build as another side", done.stdout)  # timed once, as base
+
+    def test_a_main_that_is_the_base_is_timed_once_and_declared_once(self):
+        """Orchestrator, 20 Oct 2026: the jobs require a main, so a confirmation passes the base
+        twice and every block timed it twice. The gate takes the base's runs for it, and its
+        hypotheses aren't declared beside the base's."""
+        sides = {"cand": REVS["cand"], "base": REVS["base"], "main": REVS["base"]}
+        ps = passes(sides=("base", "cand"))
+        for p in ps:
+            if p["side"] == "base":
+                for key in ("binaries", "binaries_finished"):
+                    p["report"][key]["revision"] = REVS["base"]
+        family = [f"{s}|lab-olympics|time/{q}" for s in ("base", "main") for q in ("q01", "q06")]
+        s = gate_module.gate(ps, sides, "cand", ["base", "main"], HARNESS, context=CONTEXT, family=family)
+        self.assertEqual((s["errors"], s["aliases"], sorted(s["family"])),
+                         ([], {"main": "base"}, sorted(h for h in family if h.startswith("base|"))))
+        self.assertTrue(s["passed"])
+        self.assertIn("main is base's build", gate_module.render(s))
 
     def test_a_cached_build_counts_only_with_its_whole_identity(self):
         """Round 8: binaries from before counted by revision alone, whatever toolchain, flags or
@@ -836,7 +855,7 @@ class Instances(unittest.TestCase):
 
         def copies(side, n):
             return [record(samples={"q06": [v * offset(side, n) for v in (4.8, 4.85, 4.8)]})]
-        aa = passes(copies, blocks=8)
+        aa = passes(copies, blocks=8, sides=("base", "cand"))  # main, the same build, timed once as base
         for p in aa:
             for key in ("binaries", "binaries_finished"):
                 p["report"][key]["revision"] = REVS["base"]
