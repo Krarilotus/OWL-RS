@@ -660,10 +660,15 @@ impl SpatialIndex {
             let mut name = String::with_capacity(GEO.len() + local.len());
             name.push_str(GEO);
             name.push_str(local);
-            let Some(predicate) = snapshot.lookup(NamedNodeRef::new_unchecked(&name).into()) else {
+            let term = NamedNodeRef::new_unchecked(&name).into();
+            naming.charge(snapshot.lookup_bytes(term))?;
+            let Some(predicate) = snapshot.lookup(term) else {
                 return Ok(statements);
             };
             drop((name, naming));
+            // The engine's merge while it reads (its cursors, a decoded block per run).
+            let mut scanning = Reservation::new(&**budget);
+            scanning.charge(snapshot.scan_bytes(model))?;
             let pattern = QuadPattern {
                 subject: None,
                 predicate: Some(predicate),
@@ -673,6 +678,7 @@ impl SpatialIndex {
             for q in snapshot.quads_for_pattern_in(model, &pattern) {
                 statements.push((q.subject.raw(), q.object.raw(), q.graph))?;
             }
+            drop(scanning);
             Ok(statements)
         };
         let mut statements = read(SERIALISATIONS[0])?;
@@ -1629,6 +1635,14 @@ impl Context<'_> {
         working
             .charge(named(&triple.subject) + named(&triple.object) + lists)
             .map_err(memory)?;
+        // A constant side's lookup, charged while it runs.
+        let lookups = [&triple.subject, &triple.object].map(|term| match term {
+            TermPattern::NamedNode(n) => self.snapshot.lookup_bytes(n.as_ref().into()),
+            _ => 0,
+        });
+        working
+            .charge(lookups.into_iter().max().unwrap_or(0))
+            .map_err(memory)?;
         let (s, o) = (
             self.side(&triple.subject, &solutions),
             self.side(&triple.object, &solutions),
@@ -1965,16 +1979,11 @@ mod tests {
     /// points; and Sol's relation between two lines of 10,000 points under 256 bytes. None
     /// holds (counted on every thread by this test binary's allocator, at every allocation
     /// and release) a byte more than its request was charged since it started: geo's
-    /// working memory for a relation is charged before geo computes it. A build alone
-    /// holds the engine's scan cursor besides ([`ENGINE_SCAN`]).
+    /// working memory for a relation is charged before geo computes it, and the engine's
+    /// for a scan and a lookup before it runs.
     #[test]
     fn the_spatial_path_holds_no_more_than_it_charges() {
         use nrese_exec::measure::{alone, measure_within};
-        /// The engine's working memory for a scan (a block of 128 keys per run, the
-        /// cursors' list), which no engine read charges yet: at most this over the stores
-        /// here (three runs), measured. Pending the decision on the engine's sites: a named
-        /// exemption bounded so, or a charge at its owner.
-        const ENGINE_SCAN: usize = 12_544;
         if !alone() {
             return;
         }
@@ -2088,8 +2097,7 @@ mod tests {
                     measure_within(&envelope, || path(&ctx, g0))
                 });
                 assert!(rows > n, "{n} in {graphs}");
-                let engine = if phase == "cold" { ENGINE_SCAN } else { 0 };
-                if excess > engine {
+                if excess > 0 {
                     failures.push(format!("{n} shapes in {graphs} graphs, {phase}: {excess}"));
                 }
             }
@@ -2109,7 +2117,7 @@ mod tests {
                 SpatialIndex::build(&snapshot, ReadModel::Materialised, &budget).is_ok()
             });
             assert!(built);
-            if excess > ENGINE_SCAN {
+            if excess > 0 {
                 failures.push(format!(
                     "a literal of 10,000 points, compressed {compressed}: {excess}"
                 ));
