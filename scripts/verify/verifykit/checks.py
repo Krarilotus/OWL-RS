@@ -102,7 +102,8 @@ def check(what: str, value, predicate: dict, *, present: bool = True) -> list[st
         failures.append(f"{what}: expected to match /{predicate['matches']}/, got {show(value)}")
     if "length" in predicate:
         if not isinstance(value, (list, dict, str)):
-            failures.append(f"{what}: expected length {predicate['length']}, got a {type(value).__name__} {show(value)}")
+            failures.append(f"{what}: expected length {predicate['length']}, "
+                            f"got a {type(value).__name__} {show(value)}")
         elif len(value) != predicate["length"]:
             failures.append(f"{what}: expected length {predicate['length']}, got {len(value)}")
     return failures
