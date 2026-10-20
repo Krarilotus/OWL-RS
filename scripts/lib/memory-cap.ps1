@@ -23,7 +23,9 @@
 param(
     [Parameter(Mandatory = $true)][int]$ProcessId,
     [Parameter(Mandatory = $true)][double]$LimitGB,
-    [string]$Registry = ""
+    [string]$Registry = "",
+    # Build the program again (the cached one didn't run).
+    [switch]$Rebuild
 )
 
 $source = @"
@@ -137,14 +139,31 @@ public static class NreseMemoryCap {
 $hash = (Get-FileHash -Algorithm SHA256 -Path $PSCommandPath).Hash.Substring(0, 12).ToLowerInvariant()
 $cache = Join-Path ([IO.Path]::GetTempPath()) 'nrese-memory-cap'
 $exe = Join-Path $cache "memory-cap-$hash.exe"
-if (-not (Test-Path $exe)) {
+# A fresh build under a name of its own, then put in place (over a cached one that doesn't run);
+# if that one can't be replaced (another build runs it), the fresh one is used where it is.
+function Build {
     New-Item -ItemType Directory -Force $cache | Out-Null
     $part = "$cache\memory-cap-$hash.$PID.tmp.exe"
     Add-Type -TypeDefinition $source -OutputAssembly $part -OutputType ConsoleApplication
-    Move-Item -Path $part -Destination $exe -ErrorAction SilentlyContinue
-    Remove-Item -Path $part -ErrorAction SilentlyContinue
+    try {
+        Move-Item -Path $part -Destination $exe -Force -ErrorAction Stop
+        return $exe
+    } catch {
+        return $part
+    }
+}
+function Run($program) {
+    try { & $program @arguments; return $LASTEXITCODE } catch { [Console]::Error.WriteLine("memory-cap: $program doesn't run: $_"); return 1 }
 }
 $arguments = @("$ProcessId", $LimitGB.ToString([Globalization.CultureInfo]::InvariantCulture))
 if ($Registry) { $arguments += $Registry }
-& $exe @arguments
-exit $LASTEXITCODE
+$built = $Rebuild -or -not (Test-Path $exe)
+$program = if ($built) { Build } else { $exe }
+$code = Run $program
+# A cached program that doesn't run is built again, once.
+if ($code -ne 0 -and -not $built) {
+    $program = Build
+    $code = Run $program
+}
+if ($program -ne $exe) { Remove-Item -Path $program -ErrorAction SilentlyContinue }
+exit $code
