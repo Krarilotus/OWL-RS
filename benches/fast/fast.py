@@ -41,6 +41,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import threading
 import tomllib
@@ -1701,6 +1702,8 @@ def fresh_copies(sides: list[dict], into: Path) -> list[dict]:
     and the blocks are independent units (and a confirmation round doesn't inherit round 1's)."""
     out = []
     for side in sides:
+        if not SIDE_NAME.fullmatch(side["name"]):
+            raise ValueError(f"a side's name is one path component: {side['name']!r}")
         target = into / side["name"]
         shutil.copytree(side["bin"], target, ignore=shutil.ignore_patterns(".refs", "*.partial-*"))
         perf_lab = target / "release" / "examples" / "perf_lab"
@@ -1709,10 +1712,36 @@ def fresh_copies(sides: list[dict], into: Path) -> list[dict]:
     return out
 
 
+@contextlib.contextmanager
+def block_copies(sides: list[dict], root: Path | None, block: int):
+    """The sides as this block times them: with `root` (fast.py block --fresh-copies), copies
+    (fresh_copies()) in a directory made for this block alone under it (mkdtemp, never one that
+    was there), written back before timing, and that directory removed after the block, also
+    when a copy fails. Nothing else under `root` is touched (Sol, 20 Oct 2026)."""
+    if root is None:
+        yield sides
+        return
+    root.mkdir(parents=True, exist_ok=True)
+    own = Path(tempfile.mkdtemp(prefix=f"block-{block}-", dir=root))
+    try:
+        copied = fresh_copies(sides, own)
+        if hasattr(os, "sync"):
+            os.sync()  # the copies written back now, not during the first case's runs
+        yield copied
+    finally:
+        shutil.rmtree(own, ignore_errors=True)
+
+
+SIDE_NAME = re.compile(r"[A-Za-z0-9_-]+")
+
+
 def parse_side(spec: str) -> dict:
     """`NAME:BINDIR:REVISION[:FLAGS]`, FLAGS comma-separated: no-routes, empty-queries,
-    timing=watchdog|spawn (the build's CAPABILITIES)."""
+    timing=watchdog|spawn (the build's CAPABILITIES). NAME is one path component (block's copies
+    are made under it)."""
     name, binaries, revision, *rest = spec.split(":", 3)
+    if not SIDE_NAME.fullmatch(name):
+        sys.exit(f"--side {spec}: the side's name must be letters, digits, - and _ (a path component)")
     flags = set((rest[0] if rest else "").split(",")) - {""}
     timing = next((f.split("=", 1)[1] for f in flags if f.startswith("timing=")), None)
     return {"name": name, "bin": binaries, "revision": revision, "routes": "no-routes" not in flags,
@@ -1756,18 +1785,8 @@ def block(args) -> int:
     if seed is not None:
         cases = list(cases)
         random.Random(drawn(seed, "cases", args.block)).shuffle(cases)
-    copies = None
-    if args.fresh_copies:
-        copies = args.fresh_copies / f"block-{args.block}-{os.getpid()}"
-        shutil.rmtree(copies, ignore_errors=True)
-        sides = fresh_copies(sides, copies)
-        if hasattr(os, "sync"):
-            os.sync()  # the copies written back now, not during the first case's runs
-    try:
-        return timed_block(args, sides, catalog, cases, prepared, order, place, seed)
-    finally:
-        if copies is not None:
-            shutil.rmtree(copies, ignore_errors=True)
+    with block_copies(sides, args.fresh_copies, args.block) as timed:
+        return timed_block(args, timed, catalog, cases, prepared, order, place, seed)
 
 
 def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict], prepared: dict,
