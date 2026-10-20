@@ -338,12 +338,31 @@ block)
     done
     echo "$c"
   }
-  if [ "$(complete)" = "$per" ]; then log "block $n: complete before"; exit 0; fi
-  for f in $(seq "$first" $((first + per - 1))); do
-    for r in "$OUT/passes/pass-$f-"*.json; do
-      [ -f "$r" ] && mv "$r" "$OUT/passes/interrupted-$(basename "$r" .json)-$(date +%s).json"
-    done
-  done
+  # The block's state: its attempt (1, or 2 after a disturbed first) and the attempt's stage,
+  # replaced whole (written aside, renamed) before what it records is started, signalled or
+  # moved. A crash at any point resumes the attempt it was in (not a new one), an attempt above 2
+  # never starts, and reports count only once their attempt's verdict is recorded (Sol, 20 Oct
+  # 2026: a restart accepted a disturbed block, or ran a third attempt).
+  state=$OUT/passes/block-$n.state
+  set_state() { printf 'attempt=%s\nstage=%s\n' "$1" "$2" > "$state.new" && mv -f "$state.new" "$state"; }
+  attempt=1 stage=start
+  if [ -f "$state" ]; then
+    attempt=$(sed -n 's/^attempt=//p' "$state") stage=$(sed -n 's/^stage=//p' "$state")
+    case "$attempt:$stage" in
+      [12]:start | [12]:running | [12]:ran | 1:archiving | [12]:accepted) ;;
+      *) log "block $n: no attempt of this block is started past the second, nor from an unreadable state ($state)"; exit 2 ;;
+    esac
+  fi
+  # What an earlier watcher left suspended (it died) is resumed before anything else; what can't
+  # be settled stops the step, its record kept.
+  if [ "${GATE_QUIET:-1}" != 0 ] && [ -d /proc ] && [ -f "$GATE/quiet/frozen" ]; then
+    python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" --resume \
+      || { log "block $n: an earlier watcher's suspensions couldn't be resumed ($GATE/quiet/frozen)"; exit 2; }
+  fi
+  if [ "$stage" = accepted ]; then
+    [ "$(complete)" = "$per" ] && { log "block $n: complete before (attempt $attempt)"; exit 0; }
+    log "block $n: accepted before, but its reports are gone"; exit 2
+  fi
   opts=()
   [ -f "$tree/$MEASURE" ] && opts+=(--measure "$MEASURE")
   # Batched timing (perf_lab --batch) only when every side's perf lab has it (jobs: GATE_BATCH).
@@ -393,38 +412,76 @@ block)
       log "block $n: $(tail -1 "$GATE/quiet/watch.log" 2>/dev/null)"
       # Something the watcher suspended stayed suspended: the block stops, its record kept.
       [ "$watched" = 0 ] || { log "block $n: the watcher left suspensions ($GATE/quiet/frozen)"; exit 1; }
+    else
+      printf '{"verdict": "unwatched"}\n' > "$OUT/passes/quiet-block-$n.json"
     fi
     tail -1 "$OUT/passes/block-$n.log"
   }
-  disturbed() { py -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("verdict") == "disturbed" else 1)' \
-                  "$OUT/passes/quiet-block-$n.json" 2>/dev/null; }
-  # A disturbed block (work not the job's own busy too often, quiet-watch.py) is left out of the
-  # statistics, both sides (the disturbance is the host's, not a side's: dropping it is unbiased),
-  # its reports kept aside as disturbed-*; it runs once more. A repeat disturbed again is kept,
-  # and the report says so (the orchestrator's policy, 20 Oct 2026). The marker makes a resumed
-  # step's next attempt the repeat, never a third.
-  attempt
-  if disturbed && [ ! -f "$OUT/passes/repeated-block-$n" ]; then
+  verdict() {  # the attempt's recorded verdict (quiet, disturbed, unwatched); empty when none is valid
+    py -c 'import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get("verdict")
+except Exception:
+    v = ""
+print(v if v in ("quiet", "disturbed", "unwatched") else "")' "$OUT/passes/quiet-block-$n.json"
+  }
+  aside() {  # KIND: this block's reports and verdict moved aside, as KIND-* (whatever is still there)
+    local stamp f r
     stamp=$(date +%s)
     for f in $(seq "$first" $((first + per - 1))); do
       for r in "$OUT/passes/pass-$f-"*.json; do
-        [ -f "$r" ] && mv "$r" "$OUT/passes/disturbed-$(basename "$r" .json)-$stamp.json"
+        [ -f "$r" ] && mv "$r" "$OUT/passes/$1-$(basename "$r" .json)-$stamp.json"
       done
     done
-    mv "$OUT/passes/quiet-block-$n.json" "$OUT/passes/quiet-block-$n-disturbed-$stamp.json"
-    mv "$OUT/passes/quiet-block-$n.log" "$OUT/passes/quiet-block-$n-disturbed-$stamp.log" 2>/dev/null
-    touch "$OUT/passes/repeated-block-$n"
-    log "block $n: disturbed: left out of the statistics (kept as disturbed-*), run once more"
-    attempt
-  fi
-  if [ -f "$OUT/passes/repeated-block-$n" ] && [ -f "$OUT/passes/quiet-block-$n.json" ]; then
-    py -c 'import json,sys; p=sys.argv[1]; v=json.load(open(p)); v["repeat"]=True; json.dump(v, open(p, "w"))' \
-      "$OUT/passes/quiet-block-$n.json"
-    disturbed && log "block $n: its repeat disturbed too: kept, the report lists it"
-  fi
-  # The cases' failures are data, the report's to judge; a block without all its reports isn't.
-  [ "$(complete)" = "$per" ] || { log "block $n: not all $per reports (exit $code)"; exit 1; }
-  log "block $n: done (fast.py exit $code)"
+    for r in "$OUT/passes/quiet-block-$n.json" "$OUT/passes/quiet-block-$n.log"; do
+      [ -f "$r" ] && mv "$r" "${r%.*}-$1-$stamp.${r##*.}"
+    done
+  }
+  # A disturbed block (work not the job's own busy too often, quiet-watch.py) is left out of the
+  # statistics, both sides (the disturbance is the host's, not a side's: dropping it is unbiased),
+  # its reports kept aside as disturbed-*; it runs once more. A repeat disturbed again is kept,
+  # and the report says so (the orchestrator's policy, 20 Oct 2026).
+  while :; do
+    case $stage in
+      start | running)
+        # The attempt's run, whole: a new one, or one a crash interrupted (resumed, not counted
+        # again): what an interrupted run left goes aside first.
+        aside interrupted
+        set_state "$attempt" running
+        attempt
+        # The cases' failures are data, the report's to judge; a block without all its reports isn't.
+        [ "$(complete)" = "$per" ] || { log "block $n: not all $per reports (exit $code)"; exit 1; }
+        [ -n "$(verdict)" ] || { log "block $n: attempt $attempt recorded no verdict"; exit 1; }
+        [ "$attempt" = 2 ] && py -c 'import json, sys
+p = sys.argv[1]; v = json.load(open(p)); v["repeat"] = True; json.dump(v, open(p, "w"))' "$OUT/passes/quiet-block-$n.json"
+        set_state "$attempt" ran
+        stage=ran
+        ;;
+      ran)
+        found=$(verdict)
+        if [ -z "$found" ] || [ "$(complete)" != "$per" ]; then
+          log "block $n: attempt $attempt has no recorded verdict or not all its reports: run again (the same attempt)"
+          stage=running
+          continue
+        fi
+        if [ "$found" = disturbed ] && [ "$attempt" = 1 ]; then
+          set_state 1 archiving
+          stage=archiving
+          continue
+        fi
+        [ "$found" = disturbed ] && log "block $n: its repeat disturbed too: kept, the report lists it"
+        set_state "$attempt" accepted
+        log "block $n: done (attempt $attempt, $found, fast.py exit ${code:-before})"
+        exit 0
+        ;;
+      archiving)
+        aside disturbed
+        log "block $n: disturbed: left out of the statistics (kept as disturbed-*), run once more"
+        set_state 2 start
+        attempt=2 stage=start
+        ;;
+    esac
+  done
   ;;
 
 report)
