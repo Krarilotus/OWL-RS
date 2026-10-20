@@ -583,9 +583,30 @@ impl Catalog {
         }
         check(&settings)?;
         let before = repository.settings.read().clone();
-        let persist = || match self.settings_file(id) {
-            Some(file) => write_settings(&file, &settings),
+        // A settings file in place but not made durable: neither the old state nor the new
+        // one is known to survive, so the repository serves nothing until a restart, which
+        // reads the file again.
+        let persist = || {
+            match self.settings_file(id) {
+            Some(file) => written(&file, &settings).map_err(|error| {
+                let failed = CatalogError::Store(format!("{}: {error}", file.display()));
+                if error.renamed {
+                    let store = Arc::clone(repository.pipeline.read().store());
+                    store.make_unavailable(format!(
+                        "repository '{id}': its settings were written to {} but not made durable ({}). Repair: restart the server; it reads the file again and brings the inferences in line",
+                        file.display(),
+                        error.error
+                    ));
+                    if id != DEFAULT_REPOSITORY {
+                        let why = store.unavailable().unwrap_or_default().to_owned();
+                        self.others.write().remove(id);
+                        self.unavailable.write().insert(id.to_owned(), why);
+                    }
+                }
+                (failed, error.renamed)
+            }),
             None => Ok(()),
+        }
         };
         if (&before.reasoning, &before.rules) != (&settings.reasoning, &settings.rules) {
             let reasoner = self.reasoner_for(&settings)?;
@@ -626,13 +647,15 @@ impl Catalog {
                 }
                 Err(failed) => return Err(roll_back(failed.error)),
             }
-            if let Err(error) = persist() {
-                return Err(roll_back(error));
+            match persist() {
+                Ok(()) => {}
+                Err((error, true)) => return Err(error),
+                Err((error, false)) => return Err(roll_back(error)),
             }
             *repository.pipeline.write() =
                 Arc::new(MutationPipeline::new(store, Arc::new(reasoner)));
         } else {
-            persist()?;
+            persist().map_err(|(error, _)| error)?;
         }
         if before.ql_rewriting != settings.ql_rewriting {
             let mode = settings
@@ -676,15 +699,26 @@ pub fn check(settings: &RepositorySettings) -> Result<(), CatalogError> {
     Ok(())
 }
 
-/// Writes `settings` to `file`, whole or not at all ([`crate::metadata`]).
+/// Writes `settings` to `file`, whole or not at all ([`crate::metadata`]; an error may
+/// still have put the new file in place, undurably: it says so).
 pub fn write_settings(
     file: &std::path::Path,
     settings: &RepositorySettings,
 ) -> Result<(), CatalogError> {
-    let json = serde_json::to_vec_pretty(settings)
-        .map_err(|error| CatalogError::Store(error.to_string()))?;
-    crate::metadata::write(file, &json)
+    written(file, settings)
         .map_err(|error| CatalogError::Store(format!("{}: {error}", file.display())))
+}
+
+fn written(
+    file: &std::path::Path,
+    settings: &RepositorySettings,
+) -> Result<(), crate::metadata::WriteError> {
+    let json =
+        serde_json::to_vec_pretty(settings).map_err(|error| crate::metadata::WriteError {
+            error: std::io::Error::other(error),
+            renamed: false,
+        })?;
+    crate::metadata::write(file, &json)
 }
 
 /// Why the stored settings in `file` are refused, and how to repair them.
@@ -776,9 +810,19 @@ impl Catalog {
         let _lifecycle = repository.as_ref().map(|r| r.lifecycle.lock());
         if let Some(root) = &self.root {
             let tombstone = tombstone(root, id);
-            crate::metadata::write(&tombstone, b"").map_err(|error| {
-                CatalogError::Store(format!("{}: {error}", tombstone.display()))
-            })?;
+            match crate::metadata::write(&tombstone, b"") {
+                Ok(()) => {}
+                // The tombstone is in place: the removal is decided, whether it lasts or not.
+                Err(error) if error.renamed => {
+                    tracing::warn!(file = %tombstone.display(), %error, "tombstone not made durable");
+                }
+                Err(error) => {
+                    return Err(CatalogError::Store(format!(
+                        "{}: {error}",
+                        tombstone.display()
+                    )));
+                }
+            }
         }
         self.others.write().remove(id);
         self.unavailable.write().remove(id);
@@ -806,6 +850,38 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::{TRASH, existing, valid};
+
+    /// A change whose settings file is in place but not made durable (the directory sync
+    /// after the rename failed) leaves the repository unavailable until a restart: the
+    /// error doesn't mean "as before", nor "as after".
+    #[test]
+    fn settings_written_but_not_durable_make_the_repository_unavailable() {
+        use super::{Catalog, RepositorySettings};
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir.path())).unwrap();
+        let catalog = Catalog::open(
+            store,
+            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default()),
+        )
+        .unwrap();
+        catalog
+            .create("probe", RepositorySettings::default())
+            .unwrap();
+        let titled = RepositorySettings {
+            title: Some("renamed".to_owned()),
+            ..RepositorySettings::default()
+        };
+        crate::metadata::tests::FAIL_DIR_SYNC.set(true);
+        let result = catalog.change("probe", titled);
+        crate::metadata::tests::FAIL_DIR_SYNC.set(false);
+        assert!(result.is_err());
+        assert!(catalog.get("probe").is_none(), "served as if unchanged");
+        let why = catalog.unavailable("probe").expect("unavailable");
+        assert!(
+            why.contains("repository.json") && why.contains("restart"),
+            "{why}"
+        );
+    }
 
     #[test]
     fn repository_ids() {
