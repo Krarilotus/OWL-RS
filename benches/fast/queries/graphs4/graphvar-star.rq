@@ -1,0 +1,2 @@
+PREFIX e: <http://example.org/fast/>
+SELECT ?g ?u ?n WHERE { GRAPH ?g { ?u e:city e:c7 . ?u e:name ?n } }

@@ -46,20 +46,26 @@
 //! optional property, the query string, an optional limit on the matched literals, and
 //! `"lang:xx"` for the literals' language (other `name:value` options are ignored). The
 //! query string is read as Lucene's syntax as far as the index goes: words, phrases in
-//! double quotes, `word*` prefixes and fuzzy `word~` (two edits) or `word~1`; `AND` between
-//! words makes every word needed (else any); words after `NOT` or `-` are excluded (a phrase
-//! after them is dropped); `OR`, `+`, field names and boosts (`^`) are dropped. Without a
-//! property, a literal matches as the
-//! object of any property (Jena uses the index's default field). The score is the
-//! relevance as for `bds:` (the best match has 1), not Lucene's.
+//! double quotes, `word*` prefixes and fuzzy `word~` (two edits), `word~0` (exact),
+//! `word~1` or `word~2`. Flat AND or OR groups are supported; unconnected positive
+//! terms mean OR. NOT and `-` exclude plain words. Mixed Boolean modes, required
+//! clauses, fields, boosts, grouping and negated phrases/fuzzy/prefix terms are argument
+//! errors. Quoted punctuation is ordinary phrase text. The property, active graph and
+//! read model restrict eligible literals before rank limits; the join retains matching
+//! subjects. Without a property, any predicate can qualify a literal. Under `GRAPH ?g` a
+//! search runs in each named graph the query may read, its rows binding `?g`, its ranks
+//! that graph's. The score is the relevance as for `bds:` (the best match has 1), not
+//! Lucene's.
 //!
 //! GraphDB's legacy Lucene predicates likewise: `?x luc:anyIndex "query"` finds the
 //! resources with a literal matching the query (Lucene's syntax as above), and
 //! `?x luc:score ?s` binds the relevance. The index name is not looked up: there is one
 //! index, over every string literal.
 
-use nrese_engine::{GraphSelector, TermId, TextQuery, TextScope};
-use nrese_rdf::{Literal, Term, Variable, vocab::rdf};
+use std::collections::HashSet;
+
+use nrese_engine::{GraphSelector, QuadPattern, TermId, TextQuery, TextScope};
+use nrese_rdf::{Literal, NamedNode, Term, Variable, vocab::rdf};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use std::sync::Arc;
@@ -67,6 +73,7 @@ use std::sync::Arc;
 use nrese_exec::{IdTable, Reservation};
 
 use super::{Context, GraphScope, NativeResult, Solutions};
+use crate::QueryEvaluationError;
 
 const BDS: &str = "http://www.bigdata.com/rdf/search#";
 const JENA_QUERY: &str = "http://jena.apache.org/text#query";
@@ -84,6 +91,8 @@ pub(super) struct Search {
     max_rank: Option<usize>,
     /// Only literals in this language (`text:query`'s `"lang:xx"`).
     language: Option<String>,
+    /// Only literals that are objects of this property (`text:query`'s property).
+    property: Option<NamedNode>,
 }
 
 impl Search {
@@ -102,6 +111,7 @@ impl Search {
             min_rank: None,
             max_rank: None,
             language: None,
+            property: None,
         }
     }
 }
@@ -154,12 +164,15 @@ fn luc(triple: &TriplePattern) -> Option<&str> {
     }
 }
 
-/// The searches among `triples` and the other triple patterns; `None` if there is no
-/// search.
-pub(super) fn split(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> {
+type SearchSplit = (Vec<Search>, Vec<TriplePattern>);
+
+/// The searches and remaining patterns; `None` only when there is no search. Invalid
+/// searches stay recognised by planner guards and report their error at evaluation.
+pub(super) fn split(triples: &[TriplePattern]) -> Option<NativeResult<SearchSplit>> {
     let (mut searches, triples) = match jena(triples) {
-        Some((searches, rest)) => (searches, rest),
-        None => (Vec::new(), triples.to_vec()),
+        Ok(Some(found)) => found,
+        Ok(None) => (Vec::new(), triples.to_vec()),
+        Err(error) => return Some(Err(error)),
     };
     let jena_searches = searches.len();
     for triple in &triples {
@@ -209,83 +222,139 @@ pub(super) fn split(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<Tripl
             _ => {}
         }
     }
-    Some((searches, rest))
+    Some(Ok((searches, rest)))
 }
 
 /// The items of the RDF list `head` as the parser writes `( ... )` in a pattern
 /// (`rdf:first` and `rdf:rest` triples on blank nodes), and the indexes of those triples;
-/// `None` if `head` isn't such a list.
-fn list(head: &TermPattern, triples: &[TriplePattern]) -> Option<(Vec<TermPattern>, Vec<usize>)> {
+/// `None` if `head` isn't such a list; malformed or cyclic lists are query errors.
+fn list(
+    head: &TermPattern,
+    triples: &[TriplePattern],
+) -> NativeResult<Option<(Vec<TermPattern>, Vec<usize>)>> {
     let (mut items, mut used) = (Vec::new(), Vec::new());
-    let mut node = head.clone();
+    let mut seen = HashSet::new();
+    let mut node = head;
+    let invalid = || QueryEvaluationError::Argument("malformed text:query RDF list".into());
     loop {
-        match &node {
+        match node {
             TermPattern::NamedNode(n) if n.as_str() == rdf::NIL.as_str() => {
-                return Some((items, used));
+                return Ok(Some((items, used)));
             }
-            TermPattern::BlankNode(_) => {}
-            _ => return None,
+            TermPattern::BlankNode(b) if seen.insert(b) => {}
+            _ if items.is_empty() => return Ok(None),
+            _ => return Err(invalid().into()),
         }
-        let link = |property: &str| {
-            triples.iter().position(|t| {
-                t.subject == node
+        let mut link = |property: &str| -> NativeResult<Option<&TermPattern>> {
+            let mut value = None;
+            for (index, triple) in triples.iter().enumerate().filter(|(_, t)| {
+                &t.subject == node
                     && matches!(&t.predicate, NamedNodePattern::NamedNode(p) if p.as_str() == property)
-            })
+            }) {
+                if value.is_some_and(|value| value != &triple.object) {
+                    return Err(invalid().into());
+                }
+                value = Some(&triple.object);
+                // Identical repeated links describe the same list, but all must be consumed.
+                used.push(index);
+            }
+            Ok(value)
         };
         let (first, rest) = (link(rdf::FIRST.as_str())?, link(rdf::REST.as_str())?);
-        items.push(triples[first].object.clone());
-        used.extend([first, rest]);
-        node = triples[rest].object.clone();
+        let (first, rest) = match (first, rest) {
+            (Some(first), Some(rest)) => (first, rest),
+            (None, None) if items.is_empty() => return Ok(None),
+            _ => return Err(invalid().into()),
+        };
+        items.push(first.clone());
+        node = rest;
     }
 }
 
 /// Jena's query string as this index's query (module docs), and whether every word is
 /// needed.
-fn lucene(text: &str) -> (String, bool) {
-    let (mut out, mut all_words, mut negate_next) = (Vec::new(), false, false);
-    // Phrases stay whole: split outside double quotes only.
-    for (i, part) in text.split('"').enumerate() {
-        if i % 2 == 1 {
-            // A phrase after `-` or `NOT` is dropped: the index excludes words only.
-            if !std::mem::take(&mut negate_next) {
-                out.push(format!("\"{part}\""));
-            }
-            continue;
+fn lucene(text: &str) -> NativeResult<(String, bool)> {
+    let invalid = || QueryEvaluationError::Argument("unsupported or malformed Lucene query".into());
+    let (mut out, mut mode, mut operator) = (Vec::new(), None, None);
+    let (mut negate_next, mut positive) = (false, false);
+    let mut rest = text.trim();
+    while !rest.is_empty() {
+        // Quoted punctuation is literal text, never a field, boost or Boolean operator.
+        let phrase = rest.starts_with('"');
+        let end = if phrase {
+            rest[1..].find('"').ok_or_else(invalid)? + 2
+        } else {
+            rest.find(char::is_whitespace).unwrap_or(rest.len())
+        };
+        let (token, tail) = rest.split_at(end);
+        if !tail.is_empty() && !tail.starts_with(char::is_whitespace) {
+            return Err(invalid().into());
         }
-        for token in part.split_whitespace() {
-            match token {
-                "AND" | "&&" => all_words = true,
-                "OR" | "||" => {}
-                "NOT" | "!" | "-" => negate_next = true,
-                _ => {
-                    let negated = std::mem::take(&mut negate_next) || token.starts_with('-');
-                    let token = token.trim_start_matches(['+', '-']);
-                    // A field name and boosts go; fuzziness stays.
-                    let token = token.rsplit_once(':').map_or(token, |(_, word)| word);
-                    let token = token.split('^').next().unwrap_or_default();
-                    if !token.is_empty() {
-                        out.push(match negated {
-                            true => format!("-{token}"),
-                            false => token.to_owned(),
-                        });
-                    }
+        rest = tail.trim_start();
+        match token {
+            "AND" | "&&" | "OR" | "||" => {
+                if out.is_empty() || operator.is_some() || negate_next {
+                    return Err(invalid().into());
                 }
+                operator = Some(matches!(token, "AND" | "&&"));
+                continue;
             }
+            "NOT" | "!" | "-" => {
+                if negate_next {
+                    return Err(invalid().into());
+                }
+                negate_next = true;
+                continue;
+            }
+            _ => {}
         }
-        // A `-` right before a phrase.
-        if part.ends_with('-') {
-            negate_next = true;
+        let negated = negate_next || token.starts_with('-');
+        let operand = token
+            .strip_prefix('-')
+            .unwrap_or(token)
+            .split('~')
+            .next()
+            .unwrap_or_default();
+        if (negate_next && token.starts_with('-'))
+            || token.starts_with("--")
+            || (negated && (phrase || operator == Some(false)))
+            || (!phrase && matches!(operand, "AND" | "OR" | "NOT"))
+            || (!phrase
+                && token.contains([
+                    ':', '^', '(', ')', '[', ']', '{', '}', '+', '!', '&', '|', '/', '\\', '"',
+                ]))
+        {
+            return Err(invalid().into());
         }
+        // Implicit OR between positive clauses cannot be mixed with explicit AND.
+        let link = operator
+            .take()
+            .or_else(|| (positive && (!negated || mode != Some(true))).then_some(false));
+        if let Some(link) = link {
+            if mode.is_some_and(|mode| mode != link) {
+                return Err(invalid().into());
+            }
+            mode = Some(link);
+        }
+        positive |= !negated;
+        out.push(if std::mem::take(&mut negate_next) {
+            format!("-{token}")
+        } else {
+            token.to_owned()
+        });
     }
-    (out.join(" "), all_words)
+    if operator.is_some() || negate_next {
+        return Err(invalid().into());
+    }
+    Ok((out.join(" "), mode.unwrap_or(false)))
 }
 
 /// The `text:query` patterns among `triples` as searches, each with the triple pattern
 /// that joins its literal to the subject (`?s <property> ?literal`), and the other triple
 /// patterns; `None` if there is none.
-fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> {
+fn jena(triples: &[TriplePattern]) -> NativeResult<Option<SearchSplit>> {
     if !triples.iter().any(is_jena) {
-        return None;
+        return Ok(None);
     }
     let (mut searches, mut joins, mut consumed) = (Vec::new(), Vec::new(), Vec::new());
     for (index, triple) in triples.iter().enumerate().filter(|(_, t)| is_jena(t)) {
@@ -296,14 +365,17 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
             _ => None,
         };
         // The subject: ?s, or (?s ?score ?literal ?graph ?property).
-        let (outputs, used) = match list(&triple.subject, triples) {
+        let (outputs, used) = match list(&triple.subject, triples)? {
             Some(found) => found,
             None => (vec![triple.subject.clone()], Vec::new()),
         };
         consumed.extend(used);
-        let subject = outputs.first().cloned()?;
+        let subject = outputs
+            .first()
+            .cloned()
+            .ok_or_else(|| QueryEvaluationError::Argument("text:query needs a subject".into()))?;
         // The object: "query", or (property? "query" limit? "name:value"*).
-        let (arguments, used) = match list(&triple.object, triples) {
+        let (arguments, used) = match list(&triple.object, triples)? {
             Some(found) => found,
             None => (vec![triple.object.clone()], Vec::new()),
         };
@@ -318,9 +390,11 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
             _ => None,
         };
         let Some(TermPattern::Literal(text)) = arguments.next() else {
-            return None;
+            return Err(
+                QueryEvaluationError::Argument("text:query needs a query literal".into()).into(),
+            );
         };
-        let (text, all_words) = lucene(text.value());
+        let (text, all_words) = lucene(text.value())?;
         let literal = outputs
             .get(2)
             .and_then(variable)
@@ -328,6 +402,7 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
         let mut search = Search::new(literal.clone(), text);
         search.query.all_words = all_words;
         search.relevance = outputs.get(1).and_then(variable);
+        search.property = property.clone();
         // GraphDB: the score is a statement on the subject.
         if luc(triple).is_some()
             && let Some(score) = triples.iter().position(|t| {
@@ -369,7 +444,7 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
         .map(|(_, t)| t.clone())
         .chain(joins)
         .collect();
-    Some((searches, rest))
+    Ok(Some((searches, rest)))
 }
 
 impl Context<'_> {
@@ -408,32 +483,68 @@ impl Context<'_> {
         }
     }
 
+    /// Whether `id` is the object of a statement in the active graph, of `property` if
+    /// given.
+    fn used_as_object_for_property(&self, id: TermId, property: Option<TermId>) -> bool {
+        let graph = match &*self.graph.borrow() {
+            GraphScope::Default => GraphSelector::Exact(TermId::DEFAULT_GRAPH),
+            GraphScope::Named(g) => GraphSelector::Exact(*g),
+            GraphScope::Variable(_) => GraphSelector::AnyNamed,
+            GraphScope::Union => GraphSelector::Any,
+            GraphScope::Missing => return false,
+        };
+        let pattern = QuadPattern {
+            subject: None,
+            predicate: property,
+            object: Some(id),
+            graph,
+        };
+        let merge_set = matches!(*self.graph.borrow(), GraphScope::Union)
+            .then_some(self.merge_set.as_ref())
+            .flatten();
+        self.snapshot
+            .quads_for_pattern_in(self.model, &pattern)
+            .any(|quad| merge_set.is_none_or(|graphs| graphs.contains(&quad.graph)))
+    }
+
     /// The literals `search` matches, with their relevance and rank.
     pub(super) fn search(&self, search: &Search) -> NativeResult<Solutions> {
         self.check()?;
+        // GRAPH ?g: one search per named graph the query may read (`search_each_graph`).
+        let each = match &*self.graph.borrow() {
+            GraphScope::Variable(variable) => Some(variable.clone()),
+            _ => None,
+        };
+        if let Some(variable) = each {
+            return self.search_each_graph(search, &variable);
+        }
+        let eligible = self.search_eligible(search);
         let mut vars = vec![search.matched.clone()];
         vars.extend(search.relevance.iter().cloned());
         vars.extend(search.rank.iter().cloned());
         let mut table = IdTable::new(vars.len());
         let mut rank = 0usize;
         // Every match is the object of a statement the query's snapshot shows in the
-        // scope: no probe per match. Building the corpus is charged to the query's budget.
-        // The matches, charged to it too while they are read (none: no graph in scope).
+        // scope: no probe per match (only for a property, `search_eligible`). Building the
+        // corpus is charged to the query's budget, and the matches while they are read
+        // (none: no graph in scope).
         let found = match self.text_scope()? {
             Some((_charge, scope)) => Some(
                 self.snapshot
                     .text_search_in(self.model, &scope, &search.query, Some(&self.budget))
-                    .map_err(crate::QueryEvaluationError::MemoryLimit)?,
+                    .map_err(QueryEvaluationError::from)?,
             ),
             None => None,
         };
         for &found in found.iter().flatten() {
+            self.check()?;
             if search
                 .min_relevance
                 .is_some_and(|min| found.relevance < min)
             {
                 break;
             }
+            let id = TermId::from_raw(found.id);
             if let Some(language) = &search.language {
                 let in_language = matches!(
                     self.term(found.id),
@@ -442,6 +553,9 @@ impl Context<'_> {
                 if !in_language {
                     continue;
                 }
+            }
+            if !eligible(id) {
+                continue;
             }
             rank += 1;
             if search.max_rank.is_some_and(|max| rank > max) {
@@ -464,5 +578,58 @@ impl Context<'_> {
             table,
             ordered: false,
         })
+    }
+
+    /// Which literals `search` may rank, decided before its rank limits: objects of a
+    /// statement in the active graph (every match of its corpus is one), of its property if
+    /// it names one (a property the store doesn't know: none).
+    fn search_eligible(&self, search: &Search) -> impl Fn(TermId) -> bool + '_ {
+        let property = search
+            .property
+            .as_ref()
+            .map(|p| self.snapshot.lookup(p.as_ref().into()));
+        move |id| match property {
+            None => true,
+            Some(None) => false,
+            Some(Some(property)) => self.used_as_object_for_property(id, Some(property)),
+        }
+    }
+
+    /// `search` under `GRAPH ?variable`: in each named graph the query may read (its
+    /// dataset's, else the store's), each graph's rows binding `?variable` before filters
+    /// and joins run, ranks and rank limits that graph's. A graph, literal or score
+    /// variable reused must agree with both bindings.
+    fn search_each_graph(&self, search: &Search, variable: &Variable) -> NativeResult<Solutions> {
+        let mut graphs = self
+            .named
+            .clone()
+            .unwrap_or_else(|| self.snapshot.named_graphs().collect());
+        graphs.sort_unstable();
+        graphs.dedup();
+        let mut vars = vec![search.matched.clone()];
+        vars.extend(search.relevance.iter().cloned());
+        vars.extend(search.rank.iter().cloned());
+        if !vars.contains(variable) {
+            vars.push(variable.clone());
+        }
+        let mut all = Solutions {
+            table: IdTable::new(vars.len()),
+            vars,
+            ordered: false,
+        };
+        for graph in graphs {
+            let outer = self.graph.replace(GraphScope::Named(graph));
+            let found = self.search(search);
+            self.graph.replace(outer);
+            let found = found?;
+            let binding = self.produced(Solutions {
+                vars: vec![variable.clone()],
+                table: IdTable::from_columns(vec![vec![graph.raw()]]),
+                ordered: false,
+            })?;
+            let found = self.join(found, binding)?;
+            all = self.union(all, found)?;
+        }
+        Ok(all)
     }
 }

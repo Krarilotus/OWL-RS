@@ -502,6 +502,7 @@ impl<'e> Transaction<'e> {
         // stack. No compaction or checkpoint may replace its runs meanwhile: the writer slot
         // excludes other commits, the compaction slot both of those.
         let latest = shared.versions.load();
+        let encoding = latest.asserted.encoding();
         let converting = latest.asserted.layout() == Layout::DefaultGraph && record.names_a_graph();
         let _compaction = converting.then(|| shared.versions.compaction_slot.lock());
         let converted = converting.then(|| shared.versions.load().asserted.with_quads_layout());
@@ -509,7 +510,7 @@ impl<'e> Transaction<'e> {
             .as_ref()
             .map_or(latest.asserted.layout(), |index| index.layout());
         drop(latest);
-        let [asserted_run, inferred_run] = record.runs(asserted_layout);
+        let [asserted_run, inferred_run] = record.runs(asserted_layout, encoding);
         let revision = record.revision;
         let touched = record.touched();
         let corpora = std::sync::Arc::clone(&shared.statistics.corpora);

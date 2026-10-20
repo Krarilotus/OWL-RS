@@ -370,14 +370,46 @@ async fn autocomplete_finds_labels_and_local_names() {
     };
     // Every word begins a word; a note is not a label.
     assert_eq!(suggest("alb ein").await, ["q1"]);
+    for typed in ["alb-ein", "alb&ein", "\"alb ein", "alb~ ein", "-alb ein"] {
+        assert_eq!(suggest(typed).await, ["q1"], "{typed}");
+    }
+    assert!(suggest("!~*\"").await.is_empty());
     let mut albert = suggest("alb").await;
     albert.sort();
     assert_eq!(albert, ["q1", "q2"]);
     // Local names, split at camel case.
     assert_eq!(suggest("part").await, ["hasPart"]);
     assert_eq!(suggest("haspa").await, ["hasPart"]);
+    for typed in ["has-part", "\"has part", "has~ part"] {
+        assert_eq!(suggest(typed).await, ["hasPart"], "{typed}");
+    }
     let (status, _) = send(&app, Method::GET, "/dataset/autocomplete", None, None, "").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn invalid_text_search_is_bad_request_for_query_and_update() {
+    let app = test_app().unwrap();
+    for predicate in [
+        "http://www.bigdata.com/rdf/search#search",
+        "http://jena.apache.org/text#query",
+        "http://www.ontotext.com/owlim/lucene#labels",
+    ] {
+        let pattern = format!("?s <{predicate}> \"bridge~3\"");
+        for (path, content_type, operation) in [
+            ("/dataset/query", "application/sparql-query", "SELECT *"),
+            (
+                "/dataset/update",
+                "application/sparql-update",
+                "INSERT { <urn:s> <urn:p> ?s }",
+            ),
+        ] {
+            let request = format!("{operation} WHERE {{ {pattern} }}");
+            let (status, body) =
+                send(&app, Method::POST, path, Some(content_type), None, &request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{request}: {body}");
+        }
+    }
 }
 
 /// An on-disk store keeps its namespaces across a restart.

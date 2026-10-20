@@ -12,6 +12,8 @@
 //! - **Role chains and transitivity** are encoded by automata, exact on interpretations
 //!   closed under the role inclusions: such ontologies get closed interpretations.
 
+mod definitions;
+
 use std::collections::HashMap;
 
 use nrese_owl::{

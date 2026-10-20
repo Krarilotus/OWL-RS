@@ -201,4 +201,16 @@ mod tests {
         }
         assert!(!StoreError::SparqlUpdate(UpdateError::Cancelled).is_request_error());
     }
+
+    #[test]
+    fn invalid_text_queries_are_request_errors_through_select_and_update() {
+        let error =
+            || QueryEvaluationError::from(EngineError::InvalidTextQuery("bad suffix".into()));
+        assert!(matches!(error(), QueryEvaluationError::Argument(_)));
+        assert!(StoreError::SparqlEvaluation(error()).is_request_error());
+        assert!(StoreError::SparqlUpdate(UpdateError::Evaluation(error())).is_request_error());
+        let error = QueryEvaluationError::from(EngineError::Corruption("storage fault".into()));
+        assert!(matches!(error, QueryEvaluationError::Dataset(_)));
+        assert!(!StoreError::SparqlEvaluation(error).is_request_error());
+    }
 }

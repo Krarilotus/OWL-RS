@@ -995,7 +995,7 @@ impl Dictionary {
         query: &super::TextQuery,
         corpus: &super::text::Corpus,
         budget: &std::sync::Arc<nrese_exec::Budget>,
-    ) -> Result<super::TextMatches, nrese_exec::BudgetExceeded> {
+    ) -> EngineResult<super::TextMatches> {
         self.prepare_stems(&self.text, query);
         let text = self.text.read();
         let inner = self.inner.read();
@@ -1026,15 +1026,15 @@ impl Dictionary {
     /// The vector literals nearest to `query.vector` among the first `known` entries that
     /// `accept` takes (by id), nearest first, every one compared ([`super::vectors`]); the
     /// index first takes in the vector literals interned since the last search. What the
-    /// scan holds is charged to `budget` first.
+    /// scan holds is charged to `budget` first; refused or stopped as
+    /// [`super::VectorQuery::max_hits`] and `stop` say.
     pub(crate) fn vector_search(
         &self,
         query: &super::VectorQuery,
         known: u64,
         accept: &(dyn Fn(TermId) -> bool + Sync),
         budget: &std::sync::Arc<nrese_exec::Budget>,
-    ) -> Result<(Vec<nrese_vector::Hit>, super::VectorSearchReport), nrese_exec::BudgetExceeded>
-    {
+    ) -> Result<(Vec<nrese_vector::Hit>, super::VectorSearchReport), super::VectorStop> {
         self.cover_vectors();
         let accept = |raw: u64| {
             let id = TermId::from_raw(raw);
@@ -1086,7 +1086,7 @@ impl Dictionary {
         query: &super::TextQuery,
         corpus: &super::text::Corpus,
         budget: &std::sync::Arc<nrese_exec::Budget>,
-    ) -> Result<super::TextMatches, nrese_exec::BudgetExceeded> {
+    ) -> EngineResult<super::TextMatches> {
         self.prepare_stems(&self.iri_text, query);
         let text = self.iri_text.read();
         let inner = self.inner.read();

@@ -39,9 +39,10 @@ each with its run record.
 - **Resource ownership in `nrese-dl`:** the envelope needed and has: an engine's budget is
   an owned value (no longer `Copy`), its observer and the tableau reserve from the request's
   envelope and return it when the engine drops, and exhaustion stays sticky per engine (an
-  envelope's refusal included). `context::Engine::with_budget` no longer exists. Open:
-  detached `Individuals` keep their original owner; public mutation of
-  `Individuals.contexts` isn't tracked; a result retained beyond its request keeps its
+  envelope's refusal included). `context::Engine::with_budget` no longer exists.
+  `Individuals` borrows its engine and returns its retained charge on drop, including
+  unwinding; its context list is read-only. Open: a result retained beyond its request
+  keeps its
   engine's reservation (request-scoped saturations are dropped at the request's end;
   cached classification runs without an envelope); changed policy and historical peaks
   need an API contract first.
@@ -68,6 +69,15 @@ each with its run record.
   ([coverage](../benches/runs/2026-10-09-graphdb-coverage.toml)).
 
 ## OWL 2 DL (v1.5, branch `v15/dl-complete`, 12 October)
+
+**Normalisation repair (14 October):** auxiliary definitions now
+preserve every conjunct beyond the distribution cutoff. Previously a wide definition
+could name itself again and become `Q → Q`, losing entailments while classification
+reported completeness. Three direct-semantics guards fail on the old normaliser and pass
+with the repair; context-taxonomy and tableau-consistency guards also pass. NCIt and
+affected saved taxonomies still need requalification. The earlier finite-scope campaigns
+do not cover arbitrary conjunction widths; independently checked certificates keep their
+individual guarantees. Persisted RL closure semantics are unchanged.
 
 **Coverage.** Every construct OWL 2 DL has is decided by the engines; an answer is
 `unknown` only for what the specification rules out, a resource limit, or a reader

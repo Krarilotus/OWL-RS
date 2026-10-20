@@ -1,8 +1,9 @@
 # Noisy series: the release gate's work list
 
 The release gate tolerates no loss (benches/PROTOCOL.md §5, "The release gate"); a series whose
-run-to-run noise is large can't be decided at a practical number of passes, so it ends as
-*suspect* and blocks. These are to be fixed, not tolerated. The list: every series whose noise
+run-to-run noise is large can't be decided at a practical number of blocks: a loss there goes
+unseen (the gate controls false blocks, so noise costs power, not blocks). These are to be
+fixed, not tolerated; `probes/gate-power.py power` gives each case's blocks at its noise. The list: every series whose noise
 (the standard deviation of the log of its four per-pass medians) exceeds 5 % in the A-B-B-A
 passes of 14 Oct 2026 on phuoc-yu: 137 of the 621 series of at least 5 µs, each
 binary measured on its own (v1.5 0f465633 and v2 32ecf1e5 on the fast suite; main f9b515e8 and v2
@@ -29,6 +30,35 @@ The pass medians fall into two clusters (one process fast, the next slow), the s
 | dl-roles | blocking | v2 32ecf1e5 | 0.1162 | 0.649 | 0.056, 0.058, 0.1745, 0.176 |
 | lab-dbpedia-core | q03-top-birthplaces | main f9b515e8 (perf-lab datasets) | 3.224 | 0.161 | 2.648, 3.65, 2.859, 3.589 |
 | writes-under-readers | --readers 32 | v1.5 0f465633 | 0.1638 | 0.213 | 0.1937, 0.1925, 0.1352, 0.1318 |
+
+**dl-roles blocking: a probable engine effect, by run order within a process** (19 Oct 2026; for a
+DL owner, not the harness). The tableau tool runs the case's file four times in one process
+(`repeat = 4`). In every pass, of v1.5 0f465633, v2 32ecf1e5 and c9be1609 alike, the first two runs'
+blocking phase takes 0.053–0.062 ms, the third 0.32–0.36 ms (six times as long), the fourth
+either 0.29–0.31 ms or 0.053–0.060 ms again; the other phases don't move with it (saturate
+7.4–8.7 ms in every run), and the work counters are the same in every process. The "bimodal"
+pass medians (0.056 against 0.175 ms) are only the median of four flipping with the fourth run.
+Per pass, the runs' blocking times in ms (phuoc-yu):
+
+| Pass | Binary | Runs 1-4 |
+|---|---|---|
+| 14 Oct, 1 | v1.5 0f465633 | 0.053, 0.053, 0.346, 0.290 |
+| 14 Oct, 6 | v1.5 0f465633 | 0.053, 0.053, 0.331, 0.293 |
+| 14 Oct, 7 | v1.5 0f465633 | 0.054, 0.053, 0.324, 0.301 |
+| 14 Oct, 12 | v1.5 0f465633 | 0.053, 0.053, 0.350, 0.053 |
+| 14 Oct, 3 | v2 32ecf1e5 | 0.056, 0.056, 0.333, 0.056 |
+| 14 Oct, 4 | v2 32ecf1e5 | 0.056, 0.055, 0.319, 0.060 |
+| 14 Oct, 9 | v2 32ecf1e5 | 0.056, 0.055, 0.347, 0.293 |
+| 14 Oct, 10 | v2 32ecf1e5 | 0.056, 0.056, 0.347, 0.296 |
+| 18-19 Oct A/A, 1-5 | c9be1609 | 0.059, 0.057, 0.328, 0.291 / 0.059, 0.058, 0.351, 0.300 / 0.058, 0.058, 0.329, 0.305 / 0.059, 0.062, 0.357, 0.303 / 0.059, 0.056, 0.328, 0.056 |
+
+So something the blocking code keeps across classifications in one process (a table's
+retained capacity or layout, a cache, the allocator's state) makes the third run's blocking
+slower, deterministically, and sometimes the fourth's. Not timer noise: the effect is six
+times the phase, at the same place in every process. More passes won't settle it; more runs a
+process (the calibration's `repeat`) make the series stable, but it then measures the slow
+state. Next: profile runs 2 and 3 of one process side by side (`tableau_consistency` with the
+file four times), and check whether the effect follows the run count or the input.
 
 ## One pass apart: a process that started differently (26)
 

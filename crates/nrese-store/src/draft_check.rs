@@ -183,10 +183,11 @@ pub fn run_draft_check(
     limits: &DraftLimits,
     cancellation: &CancellationToken,
     memory_limit: Option<usize>,
+    planner: nrese_sparql::PlannerOptions,
 ) -> DraftOutcome {
     let checked = match operation {
         DraftOperation::Shacl => check_shacl(inputs, limits),
-        DraftOperation::Query => check_query(inputs, limits, cancellation, memory_limit),
+        DraftOperation::Query => check_query(inputs, limits, cancellation, memory_limit, planner),
         DraftOperation::Reasoning => check_reasoning(inputs, limits, cancellation),
     };
     checked.unwrap_or_else(|outcome| outcome)
@@ -304,6 +305,7 @@ fn check_query(
     limits: &DraftLimits,
     cancellation: &CancellationToken,
     memory_limit: Option<usize>,
+    planner: nrese_sparql::PlannerOptions,
 ) -> Checked {
     let text = inputs
         .query
@@ -313,6 +315,7 @@ fn check_query(
     let mut request = SparqlQueryRequest::all(text);
     request.read_model = Some(ReadModel::Asserted);
     request.memory_limit = memory_limit;
+    request.planner = planner;
     let prepared = store
         .prepare_query(&request)
         .map_err(|error| failed(format!("the query does not parse: {error}")))?;

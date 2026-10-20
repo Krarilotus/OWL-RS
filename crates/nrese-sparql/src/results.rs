@@ -40,6 +40,16 @@ pub enum QueryEvaluationError {
     Unexpected(String),
 }
 
+impl From<nrese_engine::EngineError> for QueryEvaluationError {
+    fn from(error: nrese_engine::EngineError) -> Self {
+        match error {
+            nrese_engine::EngineError::InvalidTextQuery(message) => Self::Argument(message),
+            nrese_engine::EngineError::MemoryLimit(exceeded) => Self::MemoryLimit(exceeded),
+            error => Self::Dataset(Box::new(error)),
+        }
+    }
+}
+
 /// A flag a running query checks; cancelling it stops the query at its next check.
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken(Arc<AtomicBool>);

@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_store::{
     BulkLoadReport, BulkLoadRequest, DatasetBackupFormat, EntryState, GraphTarget,
     InvalidStatements, MutationError, MutationPipeline, MutationTicket, Outcome, QuarantineFilter,
@@ -82,9 +82,7 @@ fn on_disk(dir: &Path) -> StoreConfig {
 fn pipeline(config: StoreConfig) -> MutationPipeline {
     MutationPipeline::new(
         Arc::new(StoreService::new(config).expect("store")),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )
 }
 

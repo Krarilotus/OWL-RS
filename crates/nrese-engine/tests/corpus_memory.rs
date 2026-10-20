@@ -62,7 +62,7 @@ fn corpora_under_churn_hold_the_heap_level() {
             present[i as usize] = !present[i as usize];
         }
         tx.commit().unwrap();
-        assert!(!engine.snapshot().text_search(&query).is_empty());
+        assert!(!engine.snapshot().text_search(&query).unwrap().is_empty());
     };
     for _ in 0..300 {
         round(&engine);
@@ -141,7 +141,7 @@ fn kept_keys_are_within_the_budget() {
             .len()
     };
     // The index, the thread pool and a walk like the measured ones first.
-    snapshot.text_search(&query);
+    snapshot.text_search(&query).unwrap();
     assert_eq!(search(&scope(4095)), 1);
     let scopes: Vec<TextScope> = (0..8).map(scope).collect();
     let before = heap::live();

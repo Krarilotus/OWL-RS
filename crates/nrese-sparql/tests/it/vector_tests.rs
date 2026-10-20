@@ -116,6 +116,42 @@ fn near(degrees: f32) -> String {
 }
 
 #[test]
+fn an_unbound_candidate_row_keeps_the_search_unrestricted() {
+    let engine = engine();
+    let query = |values: &str| {
+        format!(
+            "SELECT ?v WHERE {{ {values} SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k 3 ; nrv:exact true }} }} ORDER BY ?v",
+            near(92.0)
+        )
+    };
+    let options = QueryOptions::default();
+    assert_eq!(
+        rows(&engine, &query("VALUES ?v { UNDEF }"), &options),
+        rows(&engine, &query(""), &options)
+    );
+    let truth = rows(&engine, &query(""), &options);
+    let selected = format!("\"{}\"^^nrv:vector", truth[0][0]);
+    let found = rows(
+        &engine,
+        &query(&format!(
+            "VALUES ?v {{ UNDEF UNDEF {selected} {selected} }}"
+        )),
+        &options,
+    );
+    assert_eq!(found.len(), 8);
+    let mut counts: Vec<_> = truth
+        .iter()
+        .map(|row| found.iter().filter(|got| *got == row).count())
+        .collect();
+    counts.sort_unstable();
+    assert_eq!(
+        counts,
+        [2, 2, 4],
+        "wildcards and bound duplicates retain their multiplicities"
+    );
+}
+
+#[test]
 fn the_nearest_items_are_found_and_ranked() {
     let engine = engine();
     let plain = QueryOptions::default();
@@ -436,4 +472,65 @@ fn a_filtered_search_that_goes_first_finds_the_true_nearest() {
         recall >= 0.95,
         "recall@10 {recall:.3} under a one-in-ten filter"
     );
+}
+
+/// The query's budget bounds the hits a search may hold, as it bounds a join's rows: a k
+/// whose hits the budget can't hold (never more than the space has vectors) is refused
+/// before the search allocates, with a memory error and nothing left charged; a small k
+/// under the same budget answers, and without a budget the huge k takes every vector (no
+/// fixed clamp).
+#[test]
+fn a_huge_k_past_the_budget_fails_cleanly_and_leaves_nothing_charged() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..20_000u32 {
+        let angle = (i as f32 / 20_000.0 * 360.0).to_radians();
+        tx.insert(
+            Quad::new(
+                ex(&format!("item/{i}")),
+                ex("embedding"),
+                vector(&[angle.cos(), angle.sin()]),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let query = |k: &str| {
+        let text = format!(
+            "{PREFIXES}SELECT ?v WHERE {{ SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k {k} ; nrv:exact true }} }}",
+            near(0.0)
+        );
+        SparqlParser::new().parse_query(&text).unwrap()
+    };
+    let count =
+        |options: &QueryOptions, k: &str| -> Result<usize, nrese_sparql::QueryEvaluationError> {
+            let QueryResults::Solutions(solutions) = evaluate_query(&snapshot, &query(k), options)?
+            else {
+                panic!("solutions")
+            };
+            solutions
+                .map(|s| s.map(|_| ()))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|rows| rows.len())
+        };
+    let server = nrese_sparql::SharedBudget::new(1 << 30);
+    let small = QueryOptions {
+        resources: nrese_sparql::Resources {
+            memory: nrese_exec::Envelope::new(Some(256 << 10), Some(Arc::clone(&server))),
+            ..Default::default()
+        },
+        ..QueryOptions::default()
+    };
+    let huge = u64::MAX.to_string();
+    let error = count(&small, &huge).unwrap_err();
+    assert!(
+        matches!(error, nrese_sparql::QueryEvaluationError::MemoryLimit(_)),
+        "{error}"
+    );
+    assert_eq!(server.used(), 0, "a failed search leaves nothing charged");
+    assert_eq!(count(&small, "10").unwrap(), 10);
+    assert_eq!(server.used(), 0);
+    assert_eq!(count(&QueryOptions::default(), &huge).unwrap(), 20_000);
 }

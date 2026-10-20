@@ -86,6 +86,21 @@ impl Budget {
     pub(crate) fn spent(&self) -> bool {
         self.timeout.is_some_and(|timeout| timeout.is_zero())
     }
+
+    /// Stop before preparing or starting another part of the operation.
+    pub(crate) fn stopped(&self, deadline: Deadline) -> Option<String> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(tableau::Cancel::is_cancelled)
+        {
+            Some("cancelled".to_owned())
+        } else if self.spent() || deadline.passed() {
+            Some(Limit::Time.reached("the deadline passed"))
+        } else {
+            None
+        }
+    }
 }
 
 /// Why a model of `ontology` says nothing for the source: parts of the source weren't
@@ -107,8 +122,14 @@ pub fn left_out(ontology: &Ontology) -> Option<String> {
 /// ontology, else the hypertableau within `budget`. `Consistent` only if nothing of the
 /// source was left out ([`left_out`]).
 pub fn check(ontology: &Ontology, budget: &Budget) -> Checked {
+    check_until(ontology, budget, Deadline::after(budget.timeout))
+}
+
+/// A nested check inherits its owner's absolute deadline, including preparation.
+/// The owner has already folded `budget.timeout` into this deadline.
+pub(crate) fn check_until(ontology: &Ontology, budget: &Budget, deadline: Deadline) -> Checked {
     let started = Instant::now();
-    let mut checked = check_read(ontology, budget);
+    let mut checked = check_read(ontology, budget, deadline);
     checked.elapsed = started.elapsed();
     if checked.verdict == Verdict::Consistent
         && let Some(why) = left_out(ontology)
@@ -129,10 +150,12 @@ pub(crate) fn check_after_assertions(
     budget: &Budget,
 ) -> Option<Checked> {
     let started = Instant::now();
+    let deadline = Deadline::after(budget.timeout);
     if left_out(ontology).is_some() {
         return None;
     }
-    let outcome = nrese_dl::islands::after_assertions(ontology, touched, &tableau_config(budget))?;
+    let outcome =
+        nrese_dl::islands::after_assertions(ontology, touched, &tableau_config(budget, deadline))?;
     Some(Checked {
         verdict: verdict(outcome.answer),
         engine: "touched-islands",
@@ -140,10 +163,10 @@ pub(crate) fn check_after_assertions(
     })
 }
 
-/// The hypertableau's configuration within `budget`.
-fn tableau_config(budget: &Budget) -> tableau::Config {
+/// The hypertableau's configuration with the owner's deadline and no timeout to renew.
+pub(super) fn tableau_config(budget: &Budget, deadline: Deadline) -> tableau::Config {
     tableau::Config {
-        timeout: budget.timeout,
+        deadline: deadline.instant(),
         max_memory: budget.memory_bytes,
         memory: budget.memory.clone(),
         max_nodes: budget.max_nodes,
@@ -164,10 +187,9 @@ fn verdict(answer: tableau::Answer) -> Verdict {
     }
 }
 
-fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
+fn check_read(ontology: &Ontology, budget: &Budget, deadline: Deadline) -> Checked {
     let started = Instant::now();
-    let deadline = Deadline::after(budget.timeout);
-    if budget.spent() {
+    if budget.spent() || deadline.passed() {
         return Checked {
             verdict: Verdict::Unknown(Limit::Time.reached("no time left")),
             engine: "none",
@@ -213,7 +235,7 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
             elapsed: started.elapsed(),
         };
     }
-    let config = tableau_config(&budget.remaining(deadline));
+    let config = tableau_config(budget, deadline);
     // Island by island where the ABox splits (`nrese_dl::islands`).
     let outcome = nrese_dl::islands::consistency(ontology, &config);
     Checked {

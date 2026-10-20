@@ -18,11 +18,35 @@
 #   identity_dir REV [LAYOUT]     its directory under GATE_BIN
 #   publish PART DIR              PART becomes DIR unless DIR exists (then PART goes); 0 when DIR
 #                                 holds a verified build of PART's revision either way
-#   bin_of REV                    the build this gate uses for REV (its pointer: build or unpack)
-#   point REV DIR                 this gate uses DIR for REV (and stamps a reference)
+#   bin_of REV [LAYOUT]           the build this gate uses for REV (its pointer: build or unpack)
+#   point REV DIR [LAYOUT]        this gate uses DIR for REV (and stamps a reference); a layout
+#                                 other than 1 has a pointer of its own
 #   sweep_builds                  identity directories no gate used for GATE_BIN_AGE_DAYS
 
 . "$(dirname "${BASH_SOURCE[0]}")/ns.sh"
+
+# The linker: the toolchain's own rust-lld (x86_64-unknown-linux-gnu's default since Rust 1.90;
+# every side's rust-toolchain.toml names 1.98.1), through cc, never a host's configured one
+# (a ~/.cargo/config.toml linker or rustflags: release-gate.sh's RUSTFLAGS replace those, the
+# linker variable is pinned). Each build reads the linker back from its binaries (lld_of) and
+# fails for any other.
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc
+GATE_RUSTFLAGS=""
+# LAYOUT: the flags of a layout's timed tools (layout 1 the plain link, L > 1 its functions in
+# another order, seed L).
+layout_flags() { echo "$GATE_RUSTFLAGS${GATE_RUSTFLAGS:+ }$( [ "$1" -gt 1 ] && echo "-C link-arg=-Wl,--shuffle-sections=.text*=$1")"; }
+# DIR: the LLD every binary under DIR/release was linked by ("LLD 22.1.8"); fails, naming the
+# binary, for one linked by anything else or by two versions.
+lld_of() {
+  local f l seen=""
+  while IFS= read -r f; do
+    l=$(grep -aoE 'Linker: LLD [0-9][0-9.]*' "$f" | head -1)
+    [ -n "$l" ] || { echo "$f: not linked by LLD" >&2; return 1; }
+    [ -z "$seen" ] || [ "$l" = "$seen" ] || { echo "$f: $l, the others $seen" >&2; return 1; }
+    seen=$l
+  done < <(find "$1/release" -type f | sort)
+  [ -n "$seen" ] && echo "${seen#Linker: }"
+}
 
 # The flags the revision's own build hands rustc: its cargo-guarded.sh --print-rustflags where it
 # has one, else its scripts/lib/target-cpu.sh applied here, as its cargo-guarded.sh does (every
@@ -43,6 +67,9 @@ effective_rustflags() {
   printf '%s' "$out"
 }
 
+# The gate's measurement patches (part of every build's identity), found from this file.
+GATE_PATCHES=${GATE_PATCHES:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/benches/fast/patches}
+
 build_identity() {
   local channel flags
   channel=$(git show "$1:rust-toolchain.toml" 2>/dev/null | sed -n 's/^channel *= *"\(.*\)"/\1/p')
@@ -59,6 +86,11 @@ build_identity() {
   esac
   echo "linker ${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:-cc} $(cc --version 2>/dev/null | head -1)"
   echo "profile release --locked"
+  # The measurement patches release-gate.sh applies to every side's perf lab source.
+  local patch
+  for patch in "$GATE_PATCHES"/*.py; do
+    [ -f "$patch" ] && echo "patch $(basename "$patch") $(sha256sum < "$patch" | cut -c1-16)"
+  done
   echo "layout ${2:-1}"
 }
 
@@ -81,14 +113,17 @@ publish() {
   build_verified "$dir" "$rev"
 }
 
-gate_lock() { NS_LOCK_VARS="GATE GATE_BIN" ns_locked "$GATE_BIN/.lock" "$@"; }
+gate_lock() { NS_LOCK_VARS="GATE GATE_BIN GATE_PATCHES" ns_locked "$GATE_BIN/.lock" "$@"; }
 
 # DIR: a reference from this gate, under the lock; fails when the build is gone (never made anew).
 stamp() { [ -d "$1/release" ] && mkdir -p "$1/.refs" && touch "$1/.refs/$(basename "$GATE")"; }
 
+# REV [LAYOUT]: the name of this gate's pointer to a revision's build of that layout.
+pointer() { if [ "${2:-1}" = 1 ]; then git rev-parse --short=8 "$1"; else echo "$(git rev-parse --short=8 "$1")-l$2"; fi; }
+
 point() {
   local key
-  key=$(git rev-parse --short=8 "$1")
+  key=$(pointer "$1" "${3:-1}")
   gate_lock stamp "$2" || return 1
   mkdir -p "$GATE/builds"
   basename "$2" > "$GATE/builds/$key.partial" && mv -f "$GATE/builds/$key.partial" "$GATE/builds/$key"
@@ -96,7 +131,7 @@ point() {
 
 bin_of() {
   local name
-  name=$(cat "$GATE/builds/$(git rev-parse --short=8 "$1")" 2>/dev/null) && gate_lock stamp "$GATE_BIN/$name" \
+  name=$(cat "$GATE/builds/$(pointer "$1" "${2:-1}")" 2>/dev/null) && gate_lock stamp "$GATE_BIN/$name" \
     || { echo "$GATE_BIN/none"; return; }
   echo "$GATE_BIN/$name"
 }

@@ -724,7 +724,7 @@ mod tests {
             ..query.clone()
         };
         std::thread::spawn(move || {
-            let found = searching.text_search(&query).len();
+            let found = searching.text_search(&query).unwrap().len();
             let named = searching
                 .iri_search_in(
                     crate::ReadModel::Materialised,

@@ -84,6 +84,7 @@ pub struct RequestLimits {
     pub max_query_bytes: usize,
     /// Bytes of intermediate results one query may hold; 0 is unlimited.
     pub max_query_memory_bytes: usize,
+    pub planner: nrese_sparql::PlannerOptions,
     pub max_update_bytes: usize,
     pub max_rdf_upload_bytes: usize,
 }
@@ -104,6 +105,7 @@ impl Default for RequestLimits {
         Self {
             max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
             max_query_memory_bytes: DEFAULT_QUERY_MEMORY_BYTES,
+            planner: Default::default(),
             max_update_bytes: DEFAULT_MAX_UPDATE_BYTES,
             max_rdf_upload_bytes: DEFAULT_MAX_RDF_UPLOAD_BYTES,
         }

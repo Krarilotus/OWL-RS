@@ -179,6 +179,8 @@ def binaries(target: Path, revision: str = "") -> dict:
     try:
         if (target / "REVISION").is_file():
             out["revision"] = (target / "REVISION").read_text().strip()
+        # The build's layout (release-gate.sh GATE_LAYOUTS): 1 the plain link, else its seed.
+        out["layout"] = int((target / "LAYOUT").read_text().strip()) if (target / "LAYOUT").is_file() else 1
         sums = target / "SHA256SUMS"
         expected = dict((line.split(maxsplit=1)[1].lstrip(" *"), line.split(maxsplit=1)[0])
                         for line in sums.read_text().splitlines()) if sums.is_file() else {}

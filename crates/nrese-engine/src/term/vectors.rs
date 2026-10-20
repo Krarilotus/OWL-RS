@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nrese_exec::{Budget, BudgetExceeded, Reservation};
 use nrese_vector::{Hit, Metric, Vectors};
@@ -30,16 +31,52 @@ pub enum VectorStrategy {
 }
 
 /// A vector search.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct VectorQuery {
     pub vector: Vec<f32>,
     pub k: usize,
     pub metric: Metric,
     pub strategy: VectorStrategy,
-    /// An approximate search's beam (at least `k`); an exact one has none.
+    /// A beam for an approximate search, taken as given; no search uses it while every
+    /// search is exact (the module's docs).
     pub ef: usize,
     /// How many vectors the filter accepts, if the caller knows.
     pub accepted: Option<usize>,
+    /// The most hits the search may hold at once (a query's memory budget, as a join's
+    /// row limit): a search that would hold more is refused before it allocates
+    /// ([`VectorStop::TooLarge`]). `None`: no limit.
+    pub max_hits: Option<usize>,
+    /// The caller's cancellation flag: a search that sees it set stops
+    /// ([`VectorStop::Cancelled`]).
+    pub stop: Option<Arc<AtomicBool>>,
+}
+
+/// Why a search gave no hits ([`VectorQuery::max_hits`], [`VectorQuery::stop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VectorStop {
+    /// It would hold `hits` at once, more than [`VectorQuery::max_hits`].
+    TooLarge { hits: usize },
+    /// Its stop flag was set.
+    Cancelled,
+    /// What it would hold doesn't fit the request's budget.
+    Memory(BudgetExceeded),
+}
+
+impl VectorQuery {
+    fn stopped(&self) -> Result<(), VectorStop> {
+        match &self.stop {
+            Some(stop) if stop.load(Ordering::Relaxed) => Err(VectorStop::Cancelled),
+            _ => Ok(()),
+        }
+    }
+
+    /// Refused if holding `hits` at once is more than the query may.
+    fn fits(&self, hits: usize) -> Result<(), VectorStop> {
+        match self.max_hits {
+            Some(max) if hits > max => Err(VectorStop::TooLarge { hits }),
+            _ => Ok(()),
+        }
+    }
 }
 
 impl VectorQuery {
@@ -51,6 +88,8 @@ impl VectorQuery {
             strategy: VectorStrategy::default(),
             ef: 64,
             accepted: None,
+            max_hits: None,
+            stop: None,
         }
     }
 }
@@ -152,20 +191,25 @@ const VECTOR_FORMAT: u32 = 2;
 /// first (ties by id), compared with every one of them. The space's vectors are a cheap
 /// copy (shared chunks) taken under `index`'s read lock and scanned after it: the scans
 /// are parallel, and a pool thread waiting for the lock (a writer queued, a search's
-/// `accept` re-entering) must never hold up a part of the search. What the scan holds
-/// besides the vectors is charged to `budget` first, for the search's duration.
+/// `accept` re-entering) must never hold up a part of the search. Refused before it
+/// allocates if it would hold more hits than [`VectorQuery::max_hits`], or if what the
+/// scan holds besides the vectors (charged to `budget` first, for the search's duration)
+/// doesn't fit; stopped at the next part once [`VectorQuery::stop`] is set.
 pub(crate) fn search(
     index: &RwLock<VectorIndex>,
     query: &VectorQuery,
     accept: &(dyn Fn(u64) -> bool + Sync),
     budget: &Arc<Budget>,
-) -> Result<(Vec<Hit>, VectorSearchReport), BudgetExceeded> {
+) -> Result<(Vec<Hit>, VectorSearchReport), VectorStop> {
+    query.stopped()?;
     let mut scan = Reservation::new(Arc::clone(budget));
     let vectors = {
         let index = index.read();
         match index.spaces.get(&query.vector.len()) {
             Some(vectors) => {
-                scan.charge(nrese_vector::exact_bytes(vectors, query.k))?;
+                query.fits(nrese_vector::exact_held(query.k, 0, vectors.len()))?;
+                scan.charge(nrese_vector::exact_bytes(vectors, query.k))
+                    .map_err(VectorStop::Memory)?;
                 Some(vectors.clone())
             }
             None => None,
@@ -179,7 +223,17 @@ pub(crate) fn search(
         };
         return Ok((Vec::new(), report));
     };
-    let hits = nrese_vector::exact(&vectors, &query.vector, query.k, query.metric, accept);
+    let stop = query.stop.as_deref();
+    let hits = nrese_vector::exact_from_until(
+        &vectors,
+        0,
+        &query.vector,
+        query.k,
+        query.metric,
+        accept,
+        stop,
+    );
+    query.stopped()?;
     let report = VectorSearchReport {
         space: vectors.len(),
         graph: false,
@@ -226,6 +280,48 @@ mod tests {
         assert!(
             !held.load(Ordering::Relaxed),
             "the index's lock was held during the scan"
+        );
+    }
+
+    /// A search that would hold more hits than its query may is refused before it
+    /// allocates; within the limit it answers; a set stop flag stops it.
+    #[test]
+    fn searches_past_their_hit_limit_or_stopped_answer_nothing() {
+        let n = 10_000;
+        let mut vectors = Vectors::new(1);
+        for id in 0..n {
+            vectors.push(id as u64, &[id as f32]);
+        }
+        let mut index = VectorIndex::default();
+        index.spaces.insert(1, vectors);
+        let index = RwLock::new(index);
+        let budget = Arc::new(Budget::unlimited());
+        let search = |query: &VectorQuery| super::search(&index, query, &|_| true, &budget);
+        let exact = |k, max_hits, stop: Option<bool>| VectorQuery {
+            max_hits,
+            stop: stop.map(|s| Arc::new(AtomicBool::new(s))),
+            ..VectorQuery::new(vec![0.5], k)
+        };
+        let held = nrese_vector::exact_held(usize::MAX, 0, n);
+        assert_eq!(
+            search(&exact(usize::MAX, Some(held - 1), None)).unwrap_err(),
+            VectorStop::TooLarge { hits: held }
+        );
+        assert_eq!(
+            search(&exact(usize::MAX, Some(held), None))
+                .unwrap()
+                .0
+                .len(),
+            n
+        );
+        assert_eq!(search(&exact(10, Some(100), None)).unwrap().0.len(), 10);
+        assert_eq!(
+            search(&exact(10, None, Some(true))).unwrap_err(),
+            VectorStop::Cancelled
+        );
+        assert_eq!(
+            search(&exact(10, None, Some(false))).unwrap(),
+            search(&exact(10, None, None)).unwrap()
         );
     }
 }

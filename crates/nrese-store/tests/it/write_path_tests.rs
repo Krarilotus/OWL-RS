@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use nrese_engine::Transaction;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Triple};
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_sparql::GraphAccess;
 use nrese_store::{
     DEFAULT_SHAPES_GRAPH, DeltaPlanner, GateSeverity, MutationCommand, MutationCommitReport,
@@ -104,9 +104,7 @@ fn front_end_writes_go_through_every_gate() {
     .unwrap();
     let pipeline = MutationPipeline::new(
         Arc::new(store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     );
     pipeline
         .execute_update_str(&format!(
