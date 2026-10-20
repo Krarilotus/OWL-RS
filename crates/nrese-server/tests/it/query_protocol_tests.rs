@@ -227,15 +227,14 @@ async fn explain_plan_shows_the_plan_without_running_it() -> Result<(), Box<dyn 
 #[tokio::test]
 async fn a_query_beyond_its_memory_limit_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let (app, _dir) = app_with_triples(2_000, Duration::from_secs(30))?;
-    // 8·10⁹ rows: refused before any memory is taken.
+    // 8·10⁹ rows: refused before any memory is taken, which the executor's join measures
+    // (nrese-exec's tests/join_limits.rs); here, the refusal's status and message.
     let query = "SELECT (COUNT(*) AS ?n) WHERE { ?a ?b ?c . ?d ?e ?f . ?g ?h ?i }";
-    let started = Instant::now();
     let response = app
         .oneshot(get(&format!("/dataset/query?query={}", encode(query)))?)
         .await?;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert!(body_text(response).await?.contains("memory budget"));
-    assert!(started.elapsed() < Duration::from_secs(10));
     Ok(())
 }
 

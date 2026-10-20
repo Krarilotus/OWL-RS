@@ -1,6 +1,8 @@
 //! The small-scope check's procedure (`main.rs`; `../scope_one`): every case of the scope
 //! answered as the recorded references, and the certificates counted.
 
+use std::ops::RangeInclusive;
+
 use nrese_owl::scope::{self, Ax, Feature, Scope};
 use rayon::prelude::*;
 
@@ -70,16 +72,17 @@ fn data_features() -> u128 {
     .fold(0, |m, f| m | f.bit())
 }
 
-/// The cases of at most `axioms` axioms; at most `uncertified` claims without a checked
+/// The cases with a number of axioms in `axioms` (each answer looked up at the case's
+/// index in the whole scope's references); at most `uncertified` claims without a checked
 /// model.
-pub fn check(axioms: usize, uncertified: usize) {
+pub fn check(axioms: RangeInclusive<usize>, uncertified: usize) {
     let scope = Scope::parse(SCOPE).expect("scope");
     let t = scope.tables();
     let (u, names) = scope::universe();
     let data = data_features();
     let all = scope::cases(&scope, &t).count();
     let cases: Vec<(u64, String, bool)> = scope::cases(&scope, &t)
-        .filter(|c| c.axioms.len() <= axioms)
+        .filter(|c| axioms.contains(&c.axioms.len()))
         .map(|c| {
             let with_data = c.axioms.iter().any(|&a| {
                 t.axiom_features(a) & data != 0
