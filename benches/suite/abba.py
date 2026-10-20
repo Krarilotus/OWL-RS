@@ -113,7 +113,8 @@ def load_family(path: str | Path) -> dict:
         unknown = sorted(set(wanted) - set(offered))
         if unknown:
             problems.append(f"{where}: dimensions {unknown} aren't the case's ({', '.join(offered)})")
-        cases.append({"name": case["name"], "cap_gb": case.get("cap_gb", 4), "min_samples": int(entry.get("min_samples", 1))})
+        cases.append({"name": case["name"], "cap_gb": case.get("cap_gb", 4), "min_samples": int(entry.get("min_samples", 1)),
+                      "checks": sorted(case.get("check") or {})})
         hypotheses += [rg.hypothesis("a", case["name"], d) for d in wanted if d in offered]
     if len({c["name"] for c in cases}) != len(cases):
         problems.append("a case is declared twice")
@@ -175,6 +176,17 @@ def jobs(family: dict, harness: str, checkout: str, host: str, round_: int = 1) 
 
 # --- the verdict ---------------------------------------------------------------------------------
 
+def missing_checks(record: dict, paths: list[str]) -> list[str]:
+    """The declared content checks (`paths`) a run has no passing result for: in the record (its
+    own results and its observations' together) and in each observation that reports checks. Sol,
+    20 Oct 2026 (r1): a run with no check results at all counted as checked, so a family whose
+    checks never ran passed."""
+    observed = [o["checks"] for o in record.get("observations") or [] if o.get("checks")]
+    units = [list(record.get("checks") or []) + [c for unit in observed for c in unit], *observed]
+    return sorted({p for unit in units for p in paths
+                   if not any(c.get("path") == p and c.get("ok") is True for c in unit)})
+
+
 def completeness(family: dict, manifest: dict | None, passes: list[dict]) -> list[str]:
     """Why a round's evidence can't be judged (empty: it can): its manifest, every block and slot,
     every process and content check on every side, every declared series' samples."""
@@ -196,6 +208,7 @@ def completeness(family: dict, manifest: dict | None, passes: list[dict]) -> lis
         if dim.startswith("time/"):
             series.setdefault(case, []).append(dim[len("time/"):])
     floors = {c["name"]: c["min_samples"] for c in family["cases"]}
+    declared = {c["name"]: c["checks"] for c in family["cases"]}
     for side in SIDES:
         mine = [p for p in passes if p["side"] == side]
         if not mine:
@@ -208,14 +221,22 @@ def completeness(family: dict, manifest: dict | None, passes: list[dict]) -> lis
                 problems.append(f"{case} on {side}: {', '.join(map(str, sorted(set(e['status']))))}"
                                 + (f" ({'; '.join(why)})" if why else "")
                                 + (f", {e['unchecked']} checks unchecked" if e["unchecked"] else ""))
+            unproven = {}
             for p in mine:
                 for r in p["report"].get("records", []):
                     if r.get("case") != case:
                         continue
+                    for path in missing_checks(r, declared[case]):
+                        unproven.setdefault(path, []).append(p["n"])
                     for s in series.get(case, []):
                         n = len((r.get("samples") or {}).get(s) or [])
                         if n < floors[case]:
                             problems.append(f"{case} on {side}, pass {p['n']}: {n} samples of {s}, {floors[case]} required")
+            if unproven:
+                problems.append(f"{case} on {side}: no passing result for its content checks "
+                                + "; ".join(f"{path} (passes {', '.join(map(str, ns))})"
+                                            for path, ns in sorted(unproven.items())[:3])
+                                + (f", and {len(unproven) - 3} more" if len(unproven) > 3 else ""))
     return problems
 
 
