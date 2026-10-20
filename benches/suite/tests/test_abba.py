@@ -46,6 +46,8 @@ def records(b=1.0, a2=1.0, broken=None, checked=True):
         rec = fixture.record(samples={s: [v * scale for v in (4.8, 4.85, 4.8)] for s in SERIES})
         if checked:
             rec["checks"] = [{"path": p, "expected": v, "got": v, "ok": True} for p, v in CHECKS.items()]
+            for o in rec["observations"]:  # perf_lab checks each invocation's answer
+                o["checks"] = [dict(c) for c in rec["checks"]]
         if broken and broken(side, n):
             rec.update(status="failed", notes=["a content check failed"])
         return [rec]
@@ -108,6 +110,17 @@ class Abba(unittest.TestCase):
         code, text = self.verdict(self.round_(records(checked=False), name="no-results"))
         self.assertEqual(code, abba.NO_VERDICT, text)
         self.assertIn("no passing result for its content checks q.q01-point-lookup.rows", text)
+        # Sol r2: a perf_lab invocation with no check results borrowed its sibling's (exit 0).
+        def two_invocations(side, n):
+            out = records()(side, n)
+            for rec in out:
+                first, last = (json.loads(json.dumps(rec["observations"][0])) for _ in range(2))
+                first["identity"]["repeat"], first["checks"] = 0, []
+                last["identity"]["repeat"] = 1
+                rec["observations"] = [first, last]
+            return out
+        code, text = self.verdict(self.round_(two_invocations, name="one-unchecked-invocation"))
+        self.assertEqual(code, abba.NO_VERDICT, text)
         self.family["cases"][0]["min_samples"] = 4  # every series has 3 samples a pass
         self.assertEqual(self.verdict(self.round_(records(), name="few"))[0], abba.NO_VERDICT)
 
