@@ -194,6 +194,7 @@ impl Engine {
                     true => Default::default(),
                     false => std::sync::Arc::clone(&current.equality),
                 },
+                canonical: Default::default(),
             }
         };
         let wal_bytes = match &shared.durable {

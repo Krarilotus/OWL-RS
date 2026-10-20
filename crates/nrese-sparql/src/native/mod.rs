@@ -16,6 +16,7 @@ mod cache_key;
 mod cached;
 pub(crate) use cached::output_key;
 mod calendar;
+mod canonical;
 mod equality;
 mod equijoin;
 mod estimate;
@@ -205,7 +206,14 @@ fn run(
 ) -> Result<(Outcome, Reservation), QueryEvaluationError> {
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
     let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
-    let pattern = match &options.pre_bound {
+    let pre_bound = options
+        .pre_bound
+        .as_ref()
+        .map(|values| match &ctx.canonical {
+            Some(names) => Cow::Owned(names.values(values)),
+            None => Cow::Borrowed(&**values),
+        });
+    let pattern = match &pre_bound {
         Some(values) => {
             // A blank node is put in as an alias IRI that stands for the node.
             for term in values.values() {
@@ -225,7 +233,7 @@ fn run(
         Form::Ask => Outcome::Boolean(!solutions.table.is_empty()),
         Form::Describe => Outcome::Graph(ctx.describe(&solutions)?),
         Form::Construct(template) => Outcome::Graph(
-            construct(snapshot, ctx.computed.take(), solutions, template, || {
+            construct(snapshot, ctx.computed.take(), solutions, &template, || {
                 ctx.check()
             })
             .collect::<NativeResult<_>>()?,
@@ -281,7 +289,7 @@ pub(crate) fn explain(
         Form::Select | Form::Ask => solutions.table.len(),
         Form::Describe => ctx.describe(&solutions)?.len(),
         Form::Construct(template) => {
-            construct(snapshot, ctx.computed.take(), solutions, template, || {
+            construct(snapshot, ctx.computed.take(), solutions, &template, || {
                 ctx.check()
             })
             .try_fold(0usize, |count, triple| triple.map(|_| count + 1))?
@@ -332,7 +340,7 @@ fn pattern_and_form(query: &Query) -> (&GraphPattern, Form<'_>) {
         Query::Ask { pattern, .. } => (pattern, Form::Ask),
         Query::Construct {
             template, pattern, ..
-        } => (pattern, Form::Construct(template)),
+        } => (pattern, Form::Construct(Cow::Borrowed(template))),
         Query::Describe { pattern, .. } => (pattern, Form::Describe),
     }
 }
@@ -503,8 +511,8 @@ pub(crate) fn delete_insert(
 enum Form<'q> {
     Select,
     Ask,
-    /// The triples of the template, per solution.
-    Construct(&'q [TriplePattern]),
+    /// The triples of the template, per solution (canonical answers' own: [`canonical`]).
+    Construct(Cow<'q, [TriplePattern]>),
     /// The statements about each term the solutions bind ([`Context::describe`]).
     Describe,
 }
@@ -537,10 +545,11 @@ fn native_pattern<'q>(
             unsupported_part(&pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
         ));
     }
+    let (pattern, form) = ctx.canonical_query(pattern.into_owned(), form)?;
     let pattern = if options.as_written {
-        pattern.into_owned()
+        pattern
     } else {
-        optimise(pattern.into_owned(), &mut rewrites, ctx)
+        optimise(pattern, &mut rewrites, ctx)
     };
     // ASK needs one solution: LIMIT 1 lets the evaluation stop at it.
     let pattern = match form {
@@ -1222,6 +1231,12 @@ struct Context<'a> {
     /// The equality classes to expand after joins over canonical reads (stage C,
     /// [`Context::late_expansion`]); `None` where reads expand them, or don't need to.
     late: Option<Arc<nrese_engine::EqualityClasses>>,
+    /// Canonical answers, where they apply to this query: the classes its terms stand for
+    /// ([`canonical`]). Decided once, for the whole query; `None` evaluates as without.
+    canonical: Option<canonical::Names>,
+    /// Canonical answers' view refused by this query's budget too: the query's error
+    /// ([`canonical`]).
+    canonical_refused: Option<nrese_exec::BudgetExceeded>,
     /// Whether GeoSPARQL relations in triple patterns are computed from geometries too
     /// (the query-rewrite extension; not [`QueryOptions::geosparql_stated_only`]).
     spatial_rewrite: bool,
@@ -1313,9 +1328,35 @@ impl<'a> Context<'a> {
             DefaultGraph::Merge(graphs) => (GraphScope::Union, graphs),
             DefaultGraph::Empty => (GraphScope::Missing, None),
         };
+        // Canonical answers where the query's default graph is the one the equality covers
+        // (the store's, or the merge of every graph) and some class exists ([`canonical`]).
+        let in_scope = match scope {
+            GraphScope::Default => true,
+            GraphScope::Union => merge_set.is_none(),
+            _ => false,
+        };
+        // What this evaluation holds, counted on its own (what it leaves behind is its
+        // result's reservation), drawn from the request's envelope; a canonical view the
+        // store's view budget refuses is made on it, for this query.
+        let budget = Arc::new(options.resources.memory.part());
+        let (canonical, canonical_refused) = match options.equality_canonical && in_scope {
+            true => match snapshot.with_canonical_equality_within(&budget) {
+                Ok(read) => (
+                    canonical::Names::of(&read, options.read_model).map(|names| (names, read)),
+                    None,
+                ),
+                Err(refused) => (None, Some(refused)),
+            },
+            false => (None, None),
+        };
+        let named = match &canonical {
+            // The graphs `FROM NAMED` lists, by the names canonical reads give them.
+            Some((names, _)) => resolved.named.map(|graphs| names.graphs(graphs)),
+            None => resolved.named,
+        };
         let mut ctx = Self {
             merge_set,
-            named: resolved.named,
+            named,
             as_written: options.as_written,
             spatial_rewrite: !options.geosparql_stated_only,
             cross_chunk_rows: options.cross_chunk_rows.unwrap_or(CROSS_CHUNK_ROWS).max(1),
@@ -1325,10 +1366,12 @@ impl<'a> Context<'a> {
                 true => None,
                 false => snapshot.expand_late(options.read_model),
             },
-            snapshot: match options.equality_canonical {
-                true => Cow::Owned(snapshot.with_canonical_equality()),
-                false => Cow::Borrowed(snapshot),
+            snapshot: match &canonical {
+                Some((_, read)) => Cow::Owned(read.clone()),
+                None => Cow::Borrowed(snapshot),
             },
+            canonical: canonical.map(|(names, _)| names),
+            canonical_refused,
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
             aliases: RefCell::default(),
@@ -1338,9 +1381,7 @@ impl<'a> Context<'a> {
             decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
-            // What this evaluation holds, counted on its own (what it leaves behind is
-            // its result's reservation), drawn from the request's envelope.
-            budget: Arc::new(options.resources.memory.part()),
+            budget,
             trace: None,
             depth: Cell::new(0),
             probed: Cell::default(),
@@ -1362,6 +1403,7 @@ impl<'a> Context<'a> {
             let fixed = format!("{base:?} {:?}", options.access);
             ctx.cache = Some(ctx.cache_scope(Arc::clone(cache), fixed.into_bytes().into()));
         }
+        ctx.evaluator.set_canonical(ctx.canonical.clone());
         ctx
     }
 
@@ -2077,7 +2119,7 @@ impl<'a> Context<'a> {
         // Graph by graph: the pattern in each named graph, with the variable bound to it.
         let graphs: Vec<TermId> = match &self.named {
             Some(named) => named.clone(),
-            None => self.snapshot.named_graphs().collect(),
+            None => self.snapshot.named_graphs_in(self.model).collect(),
         };
         let mut all: Option<Solutions> = None;
         for graph in graphs {
