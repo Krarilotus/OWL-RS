@@ -345,14 +345,33 @@ impl<R: Send> Help for Scan<R> {
     }
 }
 
-/// A built value as its owner keeps it: its bytes charged to the owner's budget for as long
-/// as it is kept (a waiter's own `Arc` of it isn't charged after the owner lets go).
+/// A built value as its owner keeps it, charged to the owner's budget. [`Kept::new`]: its
+/// `Arc`'s block for as long as it is kept, its own memory by its charged containers for as
+/// long as any `Arc` of it lives. [`Kept::charge`]: the bytes given, for as long as it is kept
+/// (a waiter's own `Arc` isn't charged after the owner lets go).
 pub struct Kept<V> {
     value: Arc<V>,
     held: Reservation,
 }
 
+/// The block an `Arc<V>` allocates: std's `ArcInner` (two counts, then the value; `repr(C)`
+/// there too), so that what [`Kept::new`] charges is its layout.
+#[repr(C)]
+struct ArcBlock<V>(AtomicUsize, AtomicUsize, V);
+
 impl<V> Kept<V> {
+    /// `value` kept, the block its `Arc` takes charged to `budget` before it is allocated:
+    /// for a value whose own memory its containers charge as they grow (none charged twice).
+    /// Nothing is charged where `budget` has no room.
+    pub fn new(value: V, budget: Arc<Budget>) -> Result<Self, BudgetExceeded> {
+        let mut held = Reservation::new(budget);
+        held.charge(std::mem::size_of::<ArcBlock<V>>())?;
+        Ok(Self {
+            value: Arc::new(value),
+            held,
+        })
+    }
+
     /// `value` kept, `bytes` charged to `budget`; nothing charged where it can't take them.
     pub fn charge(
         value: Arc<V>,
