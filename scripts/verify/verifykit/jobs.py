@@ -18,12 +18,14 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
 HOST = "gamergrill"
-# A cold debug build of nrese-server at -j2 (the commit tier's ask there: about 3 GB); a reused
-# build is a checksum.
-BUILD = {"cores": 2, "ram_gb": 3, "est_min": 45}
-# The runner, and one debug server at a time on a small store (the step's cgroup peak is in each
-# summary: read it before changing this).
-RUN = {"cores": 2, "ram_gb": 1.5, "est_min": 10}
+# A debug build of nrese-server at -j2: cold, with its crates downloaded, 118 s at ebaeb593
+# (verify-build-ebaeb593-10201343), within the commit tier's ask there (3 GB; build.json records
+# the step's cgroup peak); a reused build is a checksum.
+BUILD = {"cores": 2, "ram_gb": 3, "est_min": 10}
+# The runner and one debug server at a time: the three example scenarios peaked at 54.7 MiB and
+# the self-test at 42.7 MiB (the step's cgroup, verify-run-ebaeb593-10201343), about a minute
+# together. Scenarios with more data declare more (--ram-gb); each summary records its peak.
+RUN = {"cores": 2, "ram_gb": 0.5, "est_min": 5}
 
 
 def git(repo: Path, *args: str) -> str:
@@ -50,7 +52,8 @@ def toml_job(job: dict) -> str:
 
 
 def jobs(repo: Path, rev: str, harness: str, scenarios: list[str], settings: list[str], priority: int,
-         reason: str, verifies: str | None = None, selftest: bool = True, stamp: str | None = None) -> dict[str, dict]:
+         reason: str, verifies: str | None = None, selftest: bool = True, ram_gb: float | None = None,
+         stamp: str | None = None) -> dict[str, dict]:
     """The build job and the run job (after it), by id. `rev` is the server's commit and `harness`
     the runner's; the scenarios are paths in the harness commit."""
     sha, harness_sha = git(repo, "rev-parse", f"{rev}^{{commit}}"), git(repo, "rev-parse", f"{harness}^{{commit}}")
@@ -78,6 +81,6 @@ def jobs(repo: Path, rev: str, harness: str, scenarios: list[str], settings: lis
         "id": run_id, "group": "verify", "kind": "owlrs.any", "priority": priority, "priority_reason": reason,
         "after": [build_id], "est_min": RUN["est_min"], "steps": steps,
         **({"verifies": verifies} if verifies else {}),
-        "requires": {"hosts": [HOST], "cores": RUN["cores"], "ram_gb": RUN["ram_gb"]},
+        "requires": {"hosts": [HOST], "cores": RUN["cores"], "ram_gb": ram_gb or RUN["ram_gb"]},
         "inputs": [{"name": "checkout", "source": {"git": source, "rev": harness_sha}}]}
     return {build_id: build, run_id: run}
