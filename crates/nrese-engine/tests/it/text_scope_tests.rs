@@ -239,7 +239,9 @@ impl Random {
 /// The documents a corpus must hold: the terms at the documents' position (objects that are
 /// string literals with a word; subjects that are IRIs whose local name has one) of the
 /// statements `snapshot`'s own scans show in `scope`'s graphs in `model`. The oracle reads
-/// statements as the reader does, equality classes expanded or canonical.
+/// statements as the reader does, equality classes expanded or canonical; read
+/// canonically, a class whose representative is a subject holds every identity's local
+/// name (each answered as the representative).
 fn visible(snapshot: &Snapshot, model: ReadModel, scope: &TextScope, iris: bool) -> Vec<u64> {
     let graphs: Vec<GraphSelector> = match scope {
         TextScope::Graphs(graphs) => vec![*graphs],
@@ -266,6 +268,22 @@ fn visible(snapshot: &Snapshot, model: ReadModel, scope: &TextScope, iris: bool)
             };
             if document {
                 found.insert(term.payload());
+            }
+        }
+    }
+    let classes = snapshot
+        .equality_classes()
+        .filter(|_| iris && snapshot.reads_canonically() && model != ReadModel::Asserted);
+    for (representative, identities) in classes.iter().flat_map(|classes| classes.iter()) {
+        if !found.contains(&TermId::from_raw(representative).payload()) {
+            continue;
+        }
+        for &identity in identities {
+            let id = TermId::from_raw(identity);
+            let named =
+                |n: &NamedNode| has_words(n.as_str().rsplit(['#', '/', ':']).next().unwrap_or(""));
+            if matches!(snapshot.decode(id), Some(Term::NamedNode(n)) if named(&n)) {
+                found.insert(id.payload());
             }
         }
     }
@@ -510,10 +528,11 @@ fn random_commits(seed: u64) {
         );
         view = Some((now, snapshot, hidden));
     }
-    // Walked: the first of each kind, IRIs' corpora of readers of equality classes, and
-    // any after a `sameAs` change; the rest derived.
+    // Walked: the first of each kind and any after a `sameAs` change; the rest derived,
+    // IRIs' corpora of readers of equality classes too (every identity of a touched
+    // IRI's class probed): before, they were walked, and derived were 1.2-1.6 walked.
     let stats = engine.stats().text_corpora;
-    assert!(2 * stats.derived > stats.walked, "{stats:?}");
+    assert!(stats.derived >= 2 * stats.walked, "{stats:?}");
 }
 
 /// The review's (18 October) cases of equality by representatives, one per row: a search

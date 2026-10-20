@@ -1048,7 +1048,7 @@ impl Snapshot {
             .take_while(|(l, h)| l == h)
             .count();
         let supported = Stack::ALL.into_iter().all(|stack| {
-            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
+            !model.includes(stack) || self.data(model).stack(stack).layout().supports(permutation)
         });
         if bound >= 4 || plan.exclude_default_graph || !supported {
             return None;
@@ -1562,7 +1562,11 @@ impl Snapshot {
 
     /// The IRIs that are subjects of statements this snapshot shows in `scope`'s graphs
     /// in `model` and whose local names match `query`, best first, ranked among those IRIs
-    /// alone (as [`Self::text_search_in`] ranks literals, `budget` as there).
+    /// alone (as [`Self::text_search_in`] ranks literals, `budget` as there). Read
+    /// canonically, a class is its representative, named by every identity: each
+    /// identity's local name is a document while the representative is a subject, and a
+    /// match is answered as the representative, each once, at its best identity's
+    /// relevance ([`Self::corpus_classes`]).
     pub fn iri_search_in(
         &self,
         model: ReadModel,
@@ -1579,7 +1583,32 @@ impl Snapshot {
             }
         };
         let corpus = self.text_corpus(Documents::Subjects, model, scope, Some(request))?;
-        self.dictionary.iri_search(query, &corpus, request)
+        let mut found = self.dictionary.iri_search(query, &corpus, request)?;
+        if let Some((classes, true)) = self.corpus_classes(Documents::Subjects, model) {
+            found.as_representatives(|id| classes.representative(TermId::from_raw(id)).raw());
+        }
+        Ok(found)
+    }
+
+    /// The equality classes a corpus of `documents` in `model` reads by, and whether reads
+    /// are canonical: IRIs' corpora of a reader of equality classes in a model with
+    /// inferred statements, where a class of two or more identities exists. Expanded, its
+    /// scans show every identity of a class with a statement; canonical, its scans show
+    /// the representative, and its corpus holds every identity of a class whose
+    /// representative it holds (what a probe of an identity, normalised to the
+    /// representative, finds). Either way a statement touching one identity may change
+    /// every identity's membership.
+    fn corpus_classes(
+        &self,
+        documents: Documents,
+        model: ReadModel,
+    ) -> Option<(Arc<EqualityClasses>, bool)> {
+        if documents != Documents::Subjects || model == ReadModel::Asserted {
+            return None;
+        }
+        let same_as = self.equality?;
+        let classes = self.version.equality.classes(&self.version, same_as);
+        (!classes.is_empty()).then_some((classes, self.canonical))
     }
 
     /// The full-text corpora this snapshot's engine keeps, and how many were built by a
@@ -1646,9 +1675,11 @@ impl Snapshot {
     /// (equality classes expanded or canonical, the visibility of their copies), never
     /// the statements as stored. Derived from the nearest kept ancestor's where the
     /// lineage has one: each term the steps since touched is probed, a member while a
-    /// visible statement in the scope has it; else walked ([`Self::walk_corpus`]), and
-    /// always for IRIs where equality classes are read. The probes and the walk hold no lock of the
-    /// dictionary (the walk runs on every core); only the counting does, on this thread.
+    /// visible statement in the scope has it (an IRI of a class: every identity of it,
+    /// [`Self::corpus_classes`]); else walked ([`Self::walk_corpus`]), and after a change
+    /// of a `sameAs` statement (the classes change). The probes and the walk hold no lock
+    /// of the dictionary (the walk runs on every core); only the counting does, on this
+    /// thread.
     /// Nobody waits for another's build: a search that finds one under way builds its own
     /// and doesn't keep it. What the build takes, and a corpus not kept, is charged to
     /// `budget`, returned as the reservation the search holds until it is done.
@@ -1690,21 +1721,27 @@ impl Snapshot {
         };
         let iris = documents == Documents::Subjects;
         let vectors = documents == Documents::Vectors;
-        // With equality classes read, a probe with an IRI as its constant reads the IRI's
-        // class (an alias finds its representative's statements, the alias in place),
-        // which a scan doesn't show: IRIs' corpora are walked then. Literals belong to no
-        // class; their probes read as scans do.
-        let from = from.filter(|_| !(iris && self.equality.is_some()));
+        // A touched IRI of a class stands for every identity of it (literals belong to no
+        // class): each is probed.
+        let classes = self.corpus_classes(documents, model);
         let span = self.version.dictionary_len;
         let built = match from {
             Some((base, touched)) => {
                 self.cover(documents);
                 let mut changes =
                     nrese_exec::ChargedVec::with_capacity(Arc::clone(request), touched.len())?;
-                for id in touched.iter().copied().map(TermId::from_raw) {
-                    if documents.holds(id.kind()) && id.payload() < span {
-                        let used = self.uses(model, scope, documents, id);
-                        changes.push((id.payload(), used))?;
+                for &raw in touched.iter() {
+                    let identities = match &classes {
+                        Some((classes, _)) => classes
+                            .class_of(TermId::from_raw(raw))
+                            .unwrap_or(std::slice::from_ref(&raw)),
+                        None => std::slice::from_ref(&raw),
+                    };
+                    for id in identities.iter().copied().map(TermId::from_raw) {
+                        if documents.holds(id.kind()) && id.payload() < span {
+                            let used = self.uses(model, scope, documents, id);
+                            changes.push((id.payload(), used))?;
+                        }
                     }
                 }
                 store.built(true);
@@ -1786,6 +1823,29 @@ impl Snapshot {
             }
         }
         drop(scratch);
+        // Read canonically, a class whose representative is a member: each identity too.
+        if let Some((classes, true)) = self.corpus_classes(documents, model) {
+            let span = self.version.dictionary_len;
+            for (representative, identities) in classes.iter() {
+                // Each identity is of one class: setting a class's bits sets no other
+                // representative's.
+                let representative = TermId::from_raw(representative);
+                let at = representative.payload();
+                let member = documents.holds(representative.kind())
+                    && bits
+                        .get((at / 64) as usize)
+                        .is_some_and(|word| word >> (at % 64) & 1 == 1);
+                if !member {
+                    continue;
+                }
+                for id in identities.iter().copied().map(TermId::from_raw) {
+                    if documents.holds(id.kind()) && id.payload() < span {
+                        let at = id.payload();
+                        bits[(at / 64) as usize] |= 1 << (at % 64);
+                    }
+                }
+            }
+        }
         Ok(match documents {
             Documents::Vectors => crate::term::text::Bits::counted(bits, |_| 1),
             Documents::Literals => self
