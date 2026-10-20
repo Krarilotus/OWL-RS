@@ -22,6 +22,7 @@
 //! stays where it was interned ([`Dictionary::adopt_pending`]).
 
 use hashbrown::HashTable;
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec};
 use nrese_rdf::{
     BaseDirection, BlankNode, GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Quad,
     QuadRef, Term, TermRef,
@@ -32,7 +33,7 @@ use super::hash::key_hash;
 use super::offsets::{Ends, Offsets};
 use super::order::Key;
 use super::pending::{Adopted, NewKey, Pending};
-use super::vocabulary::Codec;
+use super::vocabulary::{Codec, Sample};
 use super::{TermId, TermKind, inline_to_literal, try_inline_literal};
 use crate::error::{EngineError, EngineResult};
 use crate::mapped::Mapped;
@@ -331,11 +332,36 @@ impl Inner {
                 .expect("an index below the base")
                 .plain(index);
         }
+        Key::Borrowed(self.added_key(index))
+    }
+
+    /// Entry `index`'s key, above the base: on the heap or in a segment, in place.
+    fn added_key(&self, index: u64) -> &[u8] {
         if index >= self.heap.start {
-            return Key::Borrowed(self.heap.key(index));
+            return self.heap.key(index);
         }
         let at = self.segments.partition_point(|s| s.start() <= index) - 1;
-        Key::Borrowed(self.segments[at].key(index))
+        self.segments[at].key(index)
+    }
+
+    /// [`Self::key`], a key of a compressed base decoded into `decoded`, its room charged
+    /// first; every other key is read in place.
+    fn key_within<'k, B: std::ops::Deref<Target = Budget>>(
+        &'k self,
+        index: u64,
+        decoded: &'k mut ChargedVec<u8, B>,
+    ) -> Result<&'k [u8], BudgetExceeded> {
+        let Some(base) = self.base.as_ref().filter(|base| index < base.len) else {
+            return Ok(self.added_key(index));
+        };
+        match &base.codec {
+            None => Ok(base.key(index)),
+            Some(codec) => {
+                decoded.clear();
+                codec.decompress_within(base.key(index), decoded)?;
+                Ok(decoded)
+            }
+        }
     }
 
     /// The most bytes decoding entry `index` allocates: its text's, and for a key stored
@@ -1480,13 +1506,20 @@ impl Dictionary {
         ))
     }
 
-    /// The plain keys of a sample of the entries `0..len`, spread over them: what a
-    /// checkpoint's symbol tables are trained on ([`super::vocabulary`]).
-    pub(crate) fn sample_keys(&self, len: u64) -> Vec<Vec<u8>> {
+    /// The plain keys of a sample of the entries `0..len`, spread over them, each charged to
+    /// `budget` before it is copied (or decoded): what a checkpoint's symbol tables are
+    /// trained on ([`super::vocabulary`]).
+    pub(crate) fn sample_within<'b>(
+        &self,
+        len: u64,
+        budget: &'b Budget,
+    ) -> Result<Sample<'b>, BudgetExceeded> {
         let inner = self.inner.read();
-        Codec::sample_indexes(len.min(inner.len()))
-            .map(|index| inner.key(index).into_owned())
-            .collect()
+        let (mut sample, mut decoded) = (Sample::new(budget), ChargedVec::new(budget));
+        for index in Codec::sample_indexes(len.min(inner.len())) {
+            sample.push(inner.key_within(index, &mut decoded)?)?;
+        }
+        Ok(sample)
     }
 
     /// Raw key bytes of entries `[from, to)`, in id order. Used by the WAL and checkpoints.
@@ -1498,12 +1531,24 @@ impl Dictionary {
     }
 
     /// Calls `f` with the key of each entry in `from..to`, in id order, holding the read
-    /// lock for the range: checkpoints read the dictionary in chunks with this.
-    pub(crate) fn for_each_key(&self, from: u64, to: u64, mut f: impl FnMut(&[u8])) {
+    /// lock for the range, until `f` fails: checkpoints read the dictionary in chunks with
+    /// this. A key of a compressed base is decoded into `decoded`, its room charged first.
+    pub(crate) fn for_each_key<B, E>(
+        &self,
+        from: u64,
+        to: u64,
+        decoded: &mut ChargedVec<u8, B>,
+        mut f: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        B: std::ops::Deref<Target = Budget>,
+        E: From<BudgetExceeded>,
+    {
         let inner = self.inner.read();
         for index in from..to.min(inner.len()) {
-            f(&inner.key(index));
+            f(inner.key_within(index, decoded)?)?;
         }
+        Ok(())
     }
 
     /// Restores a checkpoint's mapped entries into this empty dictionary.
