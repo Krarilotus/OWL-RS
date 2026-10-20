@@ -11,8 +11,9 @@
 //! (checks, compiles, recomputes the inferences) with the old write path retired, writes
 //! the settings whole ([`crate::metadata`]), then publishes; on failure the old reasoning
 //! is published again, so the settings on disk are always the acknowledged ones. A removal
-//! writes a tombstone before reclaiming the files: a directory whose files can't be removed
-//! yet is never opened again. A repository whose stored settings or files can't be read is
+//! writes a tombstone beside the repositories (outside the directory it reclaims) before
+//! reclaiming the files, and removes it only once the directory is gone: a repository
+//! whose files can't be removed yet is never opened again. A repository whose stored settings or files can't be read is
 //! listed as unavailable with the reason ([`Catalog::unavailable`]), not left out.
 //!
 //! The catalogue is the store's (ADR-0007): the server, the command line and embedders
@@ -190,9 +191,15 @@ pub fn stored_default_settings(
     }
 }
 
-/// What a removal leaves in a repository's directory before its files are reclaimed: a
-/// directory holding it is never opened again, only reclaimed.
-const TOMBSTONE: &str = ".removed";
+/// A removal's tombstone, beside the repositories: `~removed-<id>`, a name no repository can
+/// have ([`existing`]: no `~`). Written (durably) before the files are reclaimed, outside the
+/// directory a reclamation removes, and removed only once that directory is gone: a
+/// repository it names is never opened again, only reclaimed.
+const REMOVED: &str = "~removed-";
+
+fn tombstone(root: &std::path::Path, id: &str) -> PathBuf {
+    root.join(format!("{REMOVED}{id}"))
+}
 
 /// Brings `store`'s inferences in line with `reasoner`: recomputed under its rules, or
 /// cleared without reasoning.
@@ -209,8 +216,8 @@ fn settle(store: &StoreService, reasoner: &ReasonerService) -> Result<(), Catalo
 pub enum Removal {
     /// Its files are deleted.
     Reclaimed,
-    /// Its files are still held (or couldn't be deleted): its tombstone keeps it removed,
-    /// and they are deleted at the next start.
+    /// Its files are still held (or couldn't be deleted): its tombstone (or its directory's
+    /// trash name) keeps it removed, and they are deleted at the next start.
     Pending,
 }
 
@@ -318,7 +325,21 @@ impl Catalog {
         if let Some(root) = &repositories.root
             && let Ok(entries) = std::fs::read_dir(root)
         {
-            for entry in entries.flatten() {
+            let entries: Vec<_> = entries.flatten().collect();
+            // Removals: their repositories reclaimed (again) and never opened.
+            let removed: BTreeSet<String> = entries
+                .iter()
+                .filter_map(|entry| {
+                    let name = entry.file_name();
+                    name.to_str()?.strip_prefix(REMOVED).map(str::to_owned)
+                })
+                .collect();
+            for id in &removed {
+                if repositories.reclaim(root, id) == Removal::Pending {
+                    tracing::warn!(repository = %id, "removed repository's files not deleted yet");
+                }
+            }
+            for entry in entries {
                 let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
                     continue;
                 };
@@ -329,12 +350,7 @@ impl Catalog {
                     }
                     continue;
                 }
-                if !existing(&id) || !entry.path().is_dir() {
-                    continue;
-                }
-                // Removed, its files not deleted then: reclaimed now, never opened.
-                if entry.path().join(TOMBSTONE).exists() {
-                    repositories.reclaim(root, &id);
+                if !existing(&id) || !entry.path().is_dir() || removed.contains(&id) {
                     continue;
                 }
                 if !valid(&id) {
@@ -464,26 +480,41 @@ impl Catalog {
 
     /// Deletes removed repository `id`'s directory (its tombstone written): renamed out of
     /// the way first, at once, so that files still held (mapped checkpoints of a request
-    /// in flight, on Windows) leave a `~trash-` directory the next start deletes.
+    /// in flight, on Windows) leave a `~trash-` directory the next start deletes; then the
+    /// tombstone goes. A directory that can't be renamed keeps its name and its tombstone,
+    /// whole (nothing is deleted under a name a start could open), for the next start.
     fn reclaim(&self, root: &std::path::Path, id: &str) -> Removal {
         let dir = root.join(id);
         let trash = (0..)
             .map(|n| root.join(format!("{TRASH}{id}-{n}")))
             .find(|path| !path.exists())
             .expect("a free name");
-        let doomed = match std::fs::rename(&dir, &trash) {
-            Ok(()) => trash,
-            Err(error) => {
-                tracing::warn!(dir = %dir.display(), %error, "repository directory not renamed");
-                dir
+        match std::fs::rename(&dir, &trash) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.unmark(root, id);
+                return Removal::Reclaimed;
             }
-        };
-        match std::fs::remove_dir_all(&doomed) {
+            Err(error) => {
+                tracing::warn!(dir = %dir.display(), %error, "removed repository's directory not renamed; reclaimed at the next start");
+                return Removal::Pending;
+            }
+        }
+        self.unmark(root, id);
+        match std::fs::remove_dir_all(&trash) {
             Ok(()) => Removal::Reclaimed,
             Err(error) => {
-                tracing::warn!(dir = %doomed.display(), %error, "removed repository's files not deleted yet; deleted at the next start");
+                tracing::warn!(dir = %trash.display(), %error, "removed repository's files not deleted yet; deleted at the next start");
                 Removal::Pending
             }
+        }
+    }
+
+    /// Removes repository `id`'s tombstone, its directory gone. One that stays (the
+    /// deletion failed) names nothing: the next start removes it.
+    fn unmark(&self, root: &std::path::Path, id: &str) {
+        if let Err(error) = crate::metadata::remove(&tombstone(root, id)) {
+            tracing::warn!(repository = %id, %error, "removed repository's tombstone not deleted");
         }
     }
 
@@ -656,7 +687,7 @@ impl Catalog {
         if let Some(root) = &self.root {
             let dir = root.join(id);
             // A removal whose files weren't deleted: done now, or the id stays taken.
-            if dir.join(TOMBSTONE).exists() && self.reclaim(root, id) == Removal::Pending {
+            if tombstone(root, id).exists() && self.reclaim(root, id) == Removal::Pending {
                 return Err(CatalogError::Conflict(format!(
                     "repository '{id}' is still being removed (its files are held); try again later"
                 )));
@@ -701,7 +732,7 @@ impl Catalog {
         }
         let _lifecycle = repository.as_ref().map(|r| r.lifecycle.lock());
         if let Some(root) = &self.root {
-            let tombstone = root.join(id).join(TOMBSTONE);
+            let tombstone = tombstone(root, id);
             crate::metadata::write(&tombstone, b"").map_err(|error| {
                 CatalogError::Store(format!("{}: {error}", tombstone.display()))
             })?;
@@ -721,7 +752,7 @@ impl Catalog {
     /// Removes the files of repository `id`, which isn't in the catalogue: tombstoned,
     /// then reclaimed.
     fn remove_files(&self, root: &std::path::Path, id: &str) {
-        let tombstone = root.join(id).join(TOMBSTONE);
+        let tombstone = tombstone(root, id);
         if let Err(error) = crate::metadata::write(&tombstone, b"") {
             tracing::warn!(file = %tombstone.display(), %error, "tombstone not written");
         }
