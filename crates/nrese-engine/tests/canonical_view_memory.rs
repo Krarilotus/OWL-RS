@@ -1,11 +1,15 @@
-//! Guard of the canonical views' memory (canonical equality answers, research-designs §1):
-//! a view is reserved before it is made, on the store's view budget or else on its reader's
+//! Guard of the views' memory: the canonical views (canonical equality answers,
+//! research-designs §1) and the restricted inferred views (`inferred = "supported"`). A
+//! view is reserved before it is made, on the store's view budget or else on its reader's
 //! own, and holds its charge until its last holder lets it go. Measured against those
 //! budgets (`nrese_exec::measure`), so this file is a test binary of its own.
 
 use std::sync::{Arc, Barrier, Mutex};
 
-use nrese_engine::{EncodedTriple, Engine, EngineConfig, QuadPattern, ReadModel, Snapshot};
+use nrese_engine::{
+    EncodedQuad, EncodedTriple, Engine, EngineConfig, InferredMask, QuadPattern, ReadModel,
+    Snapshot,
+};
 use nrese_exec::{Budget, measure};
 use nrese_rdf::{NamedNode, Quad};
 
@@ -178,4 +182,58 @@ fn a_view_both_budgets_refuse_is_never_made() {
     assert!(made.is_err());
     assert_eq!(excess, 0, "made before it was refused");
     assert_eq!((views.used(), query.used()), (0, 0));
+}
+
+/// A restricted inferred view (`inferred = "supported"`), a list of what a reader sees or a
+/// mask over the stack of what it misses, is charged for all it makes before it is made,
+/// and holds it until the last of the masks and views over it goes. The charge follows
+/// the view's size.
+#[test]
+fn inferred_views_are_charged_for_all_they_hold() {
+    if !measure::alone() {
+        return;
+    }
+    let mut charged = Vec::new();
+    for size in [500, 4_000] {
+        let store = Engine::new(quiet()).unwrap();
+        let mut tx = store.transaction();
+        let s = tx.intern(node("s").as_ref().into());
+        let p = tx.intern(node("p").as_ref().into());
+        for i in 0..size {
+            let o = tx.intern(node(&format!("o{i}")).as_ref().into());
+            tx.insert_inferred(EncodedTriple {
+                subject: s,
+                predicate: p,
+                object: o,
+            });
+        }
+        tx.commit().unwrap();
+        let snapshot = store.snapshot();
+        let mut quads: Vec<EncodedQuad> = snapshot
+            .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+            .collect();
+        quads.sort_unstable();
+        let (seen, missed) = quads.split_at(size / 2);
+        let budget = Arc::new(Budget::unlimited());
+        let (used, excess) = measure::measure_within(&budget, || {
+            let only = snapshot.with_inferred_only(seen, &budget).unwrap();
+            let mask = InferredMask::hiding(&snapshot, missed, &budget).unwrap();
+            let masked = snapshot
+                .with_inferred_mask(&mask, &budget)
+                .unwrap()
+                .expect("the stack's layout");
+            assert_eq!(only.len_in(ReadModel::Inferred), seen.len() as u64);
+            assert_eq!(masked.len_in(ReadModel::Inferred), seen.len() as u64);
+            let used = budget.used();
+            drop((only, mask, masked));
+            used
+        });
+        assert_eq!(
+            excess, 0,
+            "{size} statements: {excess} bytes beyond the charge"
+        );
+        assert_eq!(budget.used(), 0, "{size} statements: still charged");
+        charged.push(used);
+    }
+    assert!(charged[1] > 4 * charged[0], "{charged:?}");
 }

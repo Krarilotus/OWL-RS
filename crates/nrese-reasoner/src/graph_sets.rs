@@ -11,12 +11,23 @@
 //!   schema premises (the facts its ground rule was grounded on) included;
 //! - a fact whose sets change is propagated again, until nothing changes.
 //!
-//! Each fact keeps at most `cap` sets, the smallest first. A set dropped by the cap can
-//! only hide a fact from a reader who could have seen it, never show one to a reader who
-//! couldn't.
+//! Each fact keeps at most `cap` sets, the smallest first ([`Annotation`]). Where the cap
+//! leaves out one of a fact's minimal sets, or one of a premise's on the way, the fact is
+//! marked truncated: its kept sets are each a real derivation's, but maybe not all. A
+//! reader one of them fits sees the fact; a reader none fits sees it only if the fact is
+//! unmarked; for a marked one, [`closure_within`] decides, exactly. So the cap bounds the
+//! work and the memory, never what a reader sees.
 //!
 //! After a change, [`update_support_sets`] recomputes only the facts it can affect (the
-//! forward closure of the facts it touched), from what the others keep.
+//! forward closure of the facts it touched), from what the others keep: each starts
+//! again from its own graphs, its mark included.
+//!
+//! Memory: an evaluation's working set (the closure's store, the sets, a round's
+//! derivations) is not charged before it is allocated; it reports its size to a
+//! [`Watch`] at round boundaries and stops when the watch refuses (the reading query's
+//! envelope), or when the process passes its memory limit. A temporary exemption, shared
+//! with the materialiser's working set, until the reasoner's working set is charged
+//! (notes/2026-10-20-executor-admission-design.md, W1 site "reasoner fixpoint").
 
 use std::borrow::Cow;
 
@@ -31,6 +42,72 @@ use super::ir::{Head, Rule, Triple};
 
 /// Driver facts per parallel task.
 const MORSEL: usize = 4096;
+
+/// A fact's support graph sets as an evaluation keeps them: minimal, at most the cap, the
+/// smallest first; and whether one of its minimal sets may be missing because the cap
+/// left one out, here or in a premise's on the way. Unmarked, the sets are all of the
+/// fact's: a reader none of them fits can't derive it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Annotation {
+    pub sets: Vec<GraphSet>,
+    pub truncated: bool,
+}
+
+impl Annotation {
+    /// The empty set alone: what a fact without premises has, and where a product starts.
+    fn empty_set() -> Self {
+        Self {
+            sets: vec![GraphSet::default()],
+            truncated: false,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sets.is_empty()
+    }
+
+    /// The bytes it holds on the heap: its list, and the words of sets past two.
+    pub fn heap_bytes(&self) -> usize {
+        self.sets.capacity() * size_of::<GraphSet>()
+            + self.sets.iter().map(GraphSet::heap_bytes).sum::<usize>()
+    }
+}
+
+/// Why an evaluation stopped before its fixpoint; nothing it computed is to be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// Its working set grew to `bytes`, more than its [`Watch`] let it hold.
+    Memory { bytes: usize },
+    /// The process held more than its memory limit ([`super::eval::over_memory_limit`]).
+    ProcessMemory,
+}
+
+/// What an evaluation reports its working set's bytes to at round boundaries: `false`
+/// stops it ([`Stopped::Memory`]).
+pub type Watch<'a> = &'a (dyn Fn(usize) -> bool + Sync);
+
+fn unwatched(_: usize) -> bool {
+    true
+}
+
+/// A [`Watch`] that lets an evaluation hold anything (the process limit still applies).
+pub const UNWATCHED: Watch<'static> = &unwatched;
+
+/// `Err` if the process is past its memory limit or `watch` refuses `bytes`.
+fn check(watch: Watch<'_>, bytes: usize) -> Result<(), Stopped> {
+    if super::eval::over_memory_limit() {
+        return Err(Stopped::ProcessMemory);
+    }
+    match watch(bytes) {
+        true => Ok(()),
+        false => Err(Stopped::Memory { bytes }),
+    }
+}
+
+/// The bytes a hash map of `capacity` entries of `(K, V)` holds in its table.
+fn table_bytes<K, V>(capacity: usize) -> usize {
+    capacity * (size_of::<(K, V)>() + 1)
+}
 
 /// A set of graphs (indices into the caller's graph list) as a bitset: inline up to 128
 /// graphs, so a union is a word-wise OR and a subset test an AND-NOT, without allocation.
@@ -85,6 +162,14 @@ impl GraphSet {
                 .map(move |b| i as u32 * 64 + b)
         })
     }
+
+    /// The bytes it holds on the heap: none up to 128 graphs, else its words.
+    pub fn heap_bytes(&self) -> usize {
+        match self.0.spilled() {
+            true => self.0.capacity() * size_of::<u64>(),
+            false => 0,
+        }
+    }
 }
 
 /// The facts of `all`, read whole or, as the delta, only the facts whose sets changed.
@@ -115,70 +200,78 @@ impl<S: Source + ?Sized> Source for Changed<'_, S> {
 
 /// The sets of facts as an evaluation reads them: `None` for a fact without sets yet.
 trait Lookup: Sync {
-    fn sets_of(&self, fact: &Triple) -> Option<Cow<'_, [GraphSet]>>;
+    fn sets_of(&self, fact: &Triple) -> Option<Cow<'_, Annotation>>;
 }
 
-impl Lookup for HashMap<Triple, Vec<GraphSet>> {
-    fn sets_of(&self, fact: &Triple) -> Option<Cow<'_, [GraphSet]>> {
-        self.get(fact).map(|sets| Cow::Borrowed(sets.as_slice()))
+impl Lookup for HashMap<Triple, Annotation> {
+    fn sets_of(&self, fact: &Triple) -> Option<Cow<'_, Annotation>> {
+        self.get(fact).map(Cow::Borrowed)
     }
 }
 
 /// During an update: the facts it recomputes as they are now, the others as they were.
 struct Recomputing<'a> {
-    now: &'a HashMap<Triple, Vec<GraphSet>>,
+    now: &'a HashMap<Triple, Annotation>,
     affected: &'a HashSet<Triple>,
-    previous: &'a (dyn Fn(Triple) -> Vec<GraphSet> + Sync),
+    previous: &'a (dyn Fn(Triple) -> Annotation + Sync),
 }
 
 impl Lookup for Recomputing<'_> {
-    fn sets_of(&self, fact: &Triple) -> Option<Cow<'_, [GraphSet]>> {
+    fn sets_of(&self, fact: &Triple) -> Option<Cow<'_, Annotation>> {
         if self.affected.contains(fact) {
             return self.now.sets_of(fact);
         }
-        let sets = (self.previous)(*fact);
-        (!sets.is_empty()).then_some(Cow::Owned(sets))
+        let previous = (self.previous)(*fact);
+        (!previous.is_empty()).then_some(Cow::Owned(previous))
     }
 }
 
 /// The sets a fact starts with: the empty set for an axiom, else one per graph that
-/// holds it (none for a fact only inferred). At most `cap`.
-pub fn initial_sets(graphs: Vec<u32>, axiom: bool, cap: usize) -> Vec<GraphSet> {
+/// holds it (none for a fact only inferred). At most `cap`, marked truncated past it.
+pub fn initial_sets(graphs: Vec<u32>, axiom: bool, cap: usize) -> Annotation {
     match axiom {
-        true => vec![GraphSet::default()],
+        true => Annotation::empty_set(),
         false => minimal(graphs.into_iter().map(GraphSet::of).collect(), cap),
     }
 }
 
-/// `sets` without those that contain another, the smallest first, at most `cap`.
-fn minimal(mut sets: Vec<GraphSet>, cap: usize) -> Vec<GraphSet> {
+/// `sets` without those that contain another, the smallest first, at most `cap`; marked
+/// truncated if the cap left out a set that no kept one is contained in.
+fn minimal(mut sets: Vec<GraphSet>, cap: usize) -> Annotation {
     sets.sort_unstable_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
     sets.dedup();
     let mut out: Vec<GraphSet> = Vec::new();
+    let mut truncated = false;
     for set in sets {
+        if out.iter().any(|kept| kept.is_subset(&set)) {
+            continue;
+        }
         if out.len() == cap {
+            truncated = true;
             break;
         }
-        if !out.iter().any(|kept| kept.is_subset(&set)) {
-            out.push(set);
-        }
+        out.push(set);
     }
-    out
+    Annotation {
+        sets: out,
+        truncated,
+    }
 }
 
 /// The support graph sets of every fact of the closure `facts` under `program`.
 /// `graphs_of` gives an asserted fact's graphs (none for an inferred one); `axioms`
 /// (sorted) hold in no graph, for every reader (a ruleset's axiomatic triples); `cap`
-/// bounds the sets kept per fact.
+/// bounds the sets kept per fact. `watch` sees the working set's bytes after each round.
 pub fn support_sets(
     facts: &[Triple],
     program: &GroundProgram,
     axioms: &[Triple],
     graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
     cap: usize,
-) -> HashMap<Triple, Vec<GraphSet>> {
+    watch: Watch<'_>,
+) -> Result<HashMap<Triple, Annotation>, Stopped> {
     let all = Store::new(facts.to_vec());
-    let initial: Vec<(Triple, Vec<GraphSet>)> = facts
+    let initial: Vec<(Triple, Annotation)> = facts
         .par_iter()
         .filter_map(|&fact| {
             let axiom = axioms.binary_search(&fact).is_ok();
@@ -187,9 +280,11 @@ pub fn support_sets(
             (!initial.is_empty()).then_some((fact, initial))
         })
         .collect();
-    let mut sets: HashMap<Triple, Vec<GraphSet>> = HashMap::with_capacity(facts.len());
+    // The heap bytes of the annotations the map holds, kept as they change.
+    let mut annotations: usize = initial.iter().map(|(_, a)| a.heap_bytes()).sum();
+    let mut sets: HashMap<Triple, Annotation> = HashMap::with_capacity(facts.len());
     sets.extend(initial);
-    let empty = GraphSet::default();
+    let empty = Annotation::empty_set();
     // Facts without a body (ground from schema facts alone, `C subClassOf C` from
     // `C a owl:Class`): evaluated again whenever one of their premises changes.
     let mut bodiless_by_premise: HashMap<Triple, Vec<Triple>> = HashMap::new();
@@ -201,7 +296,7 @@ pub fn support_sets(
             }
         }
         let from = grounding_sets(program, grounding, &sets, cap, &empty);
-        merge(&mut sets, fact, from, cap);
+        merge(&mut sets, fact, from, cap, &mut annotations);
     }
     // The rules with their schema premises; transitivity as a rule here (the module's
     // closure has no instances to annotate).
@@ -233,6 +328,24 @@ pub fn support_sets(
             }
         }
     }
+    // What the round doesn't change: the closure's store and the premise maps.
+    let fixed = all.bytes().total()
+        + table_bytes::<Triple, Vec<Triple>>(bodiless_by_premise.capacity())
+        + table_bytes::<Triple, Vec<usize>>(rules_by_premise.capacity())
+        + bodiless_by_premise
+            .values()
+            .map(|v| v.capacity())
+            .sum::<usize>()
+            * size_of::<Triple>()
+        + rules_by_premise
+            .values()
+            .map(|v| v.capacity())
+            .sum::<usize>()
+            * size_of::<usize>();
+    let held = |sets: &HashMap<Triple, Annotation>, annotations: usize| {
+        fixed + table_bytes::<Triple, Annotation>(sets.capacity()) + annotations
+    };
+    check(watch, held(&sets, annotations))?;
     let mut changed: Vec<Triple> = sets.keys().copied().collect();
     let mut first = true;
     while !changed.is_empty() {
@@ -251,17 +364,21 @@ pub fn support_sets(
         };
         // Every instance with a premise among the changed facts, with every premise's
         // current sets (an instance found twice adds the same sets twice, harmlessly):
-        // jobs in parallel morsels, each emitting (head, set) pairs.
-        let mut found: Vec<(Triple, GraphSet)> = Vec::new();
+        // jobs in parallel morsels, each emitting (head, set, whether the instance's sets
+        // are truncated) triples.
+        let mut found: Vec<(Triple, GraphSet, bool)> = Vec::new();
         for fact in delta_facts(&delta) {
             for &bodiless in bodiless_by_premise.get(&fact).into_iter().flatten() {
                 let grounding = Grounding::Bodiless(bodiless);
-                for set in grounding_sets(program, grounding, &sets, cap, &empty) {
-                    found.push((bodiless, set));
-                }
+                let from = grounding_sets(program, grounding, &sets, cap, &empty);
+                found.extend(
+                    from.sets
+                        .into_iter()
+                        .map(|set| (bodiless, set, from.truncated)),
+                );
             }
         }
-        let mut jobs: Vec<(Job<'_>, &[super::ir::Atom], Vec<GraphSet>)> = Vec::new();
+        let mut jobs: Vec<(Job<'_>, &[super::ir::Atom], Annotation)> = Vec::new();
         for (k, &(rule, grounding)) in rules.iter().enumerate() {
             // The schema facts' part, once per rule and round: the minimal sets over the
             // alternative groundings.
@@ -315,11 +432,26 @@ pub fn support_sets(
                 let from = premise_sets_from(&body, schema, sets_now, cap);
                 for head in heads.iter() {
                     let fact = super::eval::instantiate_head(head, bindings);
-                    out.extend(from.iter().map(|set| (fact, set.clone())));
+                    out.extend(
+                        from.sets
+                            .iter()
+                            .map(|set| (fact, set.clone(), from.truncated)),
+                    );
                 }
             });
             out
         }));
+        // The round's peak: its derivations and its delta beside the sets.
+        let round = found.capacity() * size_of::<(Triple, GraphSet, bool)>()
+            + found
+                .iter()
+                .map(|(_, set, _)| set.heap_bytes())
+                .sum::<usize>()
+            + delta.bytes().total()
+            + jobs.capacity() * size_of::<(Job<'_>, &[super::ir::Atom], Annotation)>()
+            + tasks.capacity() * size_of::<(usize, std::ops::Range<usize>)>();
+        check(watch, held(&sets, annotations) + round)?;
+        drop((jobs, tasks));
         // Per head: its new sets merged into its old ones.
         found.par_sort_unstable();
         found.dedup();
@@ -327,32 +459,195 @@ pub fn support_sets(
             .filter(|&i| i == 0 || found[i - 1].0 != found[i].0)
             .collect();
         starts.push(found.len());
-        // In parallel against the sets as they are; then the changes written back.
-        let updates: Vec<(Triple, Vec<GraphSet>)> = starts
+        // In parallel against the sets as they are; then the changes written back. A
+        // change of the mark alone is news too: the facts derived from it are marked.
+        let updates: Vec<(Triple, Annotation)> = starts
             .par_windows(2)
             .filter_map(|w| {
                 let group = &found[w[0]..w[1]];
                 let fact = group[0].0;
-                let current = sets.get(&fact).map_or(&[][..], Vec::as_slice);
-                // Nothing new: every found set is covered by a kept one.
-                if group
-                    .iter()
-                    .all(|(_, set)| current.iter().any(|kept| kept.is_subset(set)))
+                let (kept, truncated) = sets
+                    .get(&fact)
+                    .map_or((&[][..], false), |a| (a.sets.as_slice(), a.truncated));
+                let marks = group.iter().any(|&(_, _, marked)| marked);
+                // Nothing new: every found set is covered by a kept one, no new mark.
+                if (truncated || !marks)
+                    && group
+                        .iter()
+                        .all(|(_, set, _)| kept.iter().any(|k| k.is_subset(set)))
                 {
                     return None;
                 }
-                let mut all = current.to_vec();
-                all.extend(group.iter().map(|(_, set)| set.clone()));
-                let next = minimal(all, cap);
-                (next.as_slice() != current).then_some((fact, next))
+                let mut all = kept.to_vec();
+                all.extend(group.iter().map(|(_, set, _)| set.clone()));
+                let mut next = minimal(all, cap);
+                next.truncated |= truncated || marks;
+                (next.sets.as_slice() != kept || next.truncated != truncated)
+                    .then_some((fact, next))
             })
             .collect();
+        drop((found, starts));
         for (fact, next) in updates {
-            sets.insert(fact, next);
+            annotations += next.heap_bytes();
+            if let Some(old) = sets.insert(fact, next) {
+                annotations = annotations.saturating_sub(old.heap_bytes());
+            }
             changed.push(fact);
         }
+        check(watch, held(&sets, annotations))?;
     }
-    sets
+    Ok(sets)
+}
+
+/// The facts of the closure `facts` that hold for a reader of the statements `readable`
+/// accepts: the closure of what it reads, axioms included, by the evaluation that gives
+/// the support graph sets ([`support_sets`]), every readable statement in one graph. A
+/// fact then has one set or none, so no cap applies and no mark arises. The exact
+/// decision for the facts whose kept sets don't decide a reader ([`Annotation::truncated`]),
+/// the conservative way: the reader's whole closure, each fact with its one set.
+pub fn closure_within(
+    facts: &[Triple],
+    program: &GroundProgram,
+    axioms: &[Triple],
+    readable: &(dyn Fn(Triple) -> bool + Sync),
+    watch: Watch<'_>,
+) -> Result<HashMap<Triple, Annotation>, Stopped> {
+    let one_graph = |fact: Triple| match readable(fact) {
+        true => vec![0],
+        false => Vec::new(),
+    };
+    let mut sets = support_sets(facts, program, axioms, &one_graph, 1, watch)?;
+    sets.retain(|_, annotation| !annotation.is_empty());
+    debug_assert!(sets.values().all(|annotation| !annotation.truncated));
+    Ok(sets)
+}
+
+/// Whether `fact` follows in one step from facts of `source` other than itself: it is an
+/// axiom, a bodiless fact one of whose groundings holds without it, or the head of a rule
+/// instance (transitivity included) one of whose groundings holds without it and none of
+/// whose premises is it. A rule's instance with the fact among its own premises, such as
+/// `(x p x), (x p z) -> (x p z)`, doesn't count: it derives nothing the fact itself
+/// doesn't give.
+pub fn derived_otherwise<S: Source + ?Sized>(
+    source: &S,
+    program: &GroundProgram,
+    axioms: &[Triple],
+    fact: Triple,
+) -> bool {
+    if axioms.binary_search(&fact).is_ok() {
+        return true;
+    }
+    let holds = |premises: &[Triple]| premises.iter().all(|&p| p != fact && source.contains(p));
+    let grounded = |grounding: Grounding| {
+        program
+            .premise_alternatives(grounding)
+            .into_iter()
+            .any(holds)
+    };
+    if program.bodiless.contains(&fact) && grounded(Grounding::Bodiless(fact)) {
+        return true;
+    }
+    let derives = |rule: &Rule| {
+        let mut found = false;
+        let mut body = Vec::with_capacity(rule.body.len());
+        derivations(source, rule, fact, Seg::All, &mut |bindings| {
+            body.clear();
+            body.extend(
+                rule.body
+                    .iter()
+                    .map(|atom| instantiate_head(atom, bindings)),
+            );
+            found = body.iter().all(|&premise| premise != fact);
+            found
+        });
+        found
+    };
+    if program
+        .producers(fact)
+        .into_iter()
+        .any(|r| grounded(Grounding::Rule(r)) && derives(&program.rules[r]))
+    {
+        return true;
+    }
+    let p = fact[1];
+    program.transitive.contains(&p)
+        && grounded(Grounding::Transitive(p))
+        && derives(&transitivity(p))
+}
+
+/// The facts of `candidates` (sorted) that follow in one step from other facts of `source`
+/// ([`derived_otherwise`]), sorted. `watch` sees the candidates' bytes before the checks
+/// run, in parallel, each on its own.
+pub fn rederived<S: Source + Sync + ?Sized>(
+    source: &S,
+    program: &GroundProgram,
+    axioms: &[Triple],
+    candidates: &[Triple],
+    watch: Watch<'_>,
+) -> Result<Vec<Triple>, Stopped> {
+    check(watch, size_of_val(candidates))?;
+    let found: Vec<Triple> = candidates
+        .par_iter()
+        .copied()
+        .filter(|&fact| derived_otherwise(source, program, axioms, fact))
+        .collect();
+    check(
+        watch,
+        (candidates.len() + found.capacity()) * size_of::<Triple>(),
+    )?;
+    Ok(found)
+}
+
+/// The facts whose one-step derivability ([`derived_otherwise`]) a change can alter: those
+/// it touched (`touched`, sorted: their graphs, or whether they are in the closure), and
+/// the heads of every rule instance with a touched premise in `source` (the closure after
+/// the change, and the facts it removed). Sorted, each once. `None` when a touched fact is
+/// one the program was grounded on: the grounding changes, and the caller checks all.
+pub fn rederived_candidates<S: Source + Sync + ?Sized>(
+    source: &S,
+    program: &GroundProgram,
+    touched: &[Triple],
+    watch: Watch<'_>,
+) -> Result<Option<Vec<Triple>>, Stopped> {
+    let schema = program.schema_premises();
+    if touched.iter().any(|fact| schema.contains(fact)) {
+        return Ok(None);
+    }
+    let transitive: Vec<(Rule, Grounding)> = program
+        .transitive
+        .iter()
+        .map(|&p| (transitivity(p), Grounding::Transitive(p)))
+        .collect();
+    let ruled: Vec<(&Rule, Grounding)> = program
+        .rules
+        .iter()
+        .enumerate()
+        .map(|(r, rule)| (rule, Grounding::Rule(r)))
+        .chain(
+            transitive
+                .iter()
+                .map(|(rule, grounding)| (rule, *grounding)),
+        )
+        .filter(|(rule, _)| !rule.body.is_empty() && matches!(rule.head, Head::Facts(_)))
+        .collect();
+    let delta = Store::new(touched.to_vec());
+    let changed = Changed {
+        all: source,
+        changed: &delta,
+    };
+    let mut heads = instances(&changed, &ruled, &|k, bindings, out| {
+        if let Head::Facts(heads) = &ruled[k].0.head {
+            out.extend(heads.iter().map(|head| instantiate_head(head, bindings)));
+        }
+    });
+    check(
+        watch,
+        delta.bytes().total() + (heads.capacity() + touched.len()) * size_of::<Triple>(),
+    )?;
+    heads.extend_from_slice(touched);
+    heads.par_sort_unstable();
+    heads.dedup();
+    Ok(Some(heads))
 }
 
 /// A change of the closure, for [`update_support_sets`].
@@ -365,8 +660,8 @@ pub struct Change<'a, S: ?Sized> {
     /// Every fact whose own graphs changed, or that the change added to the closure or
     /// removed from it.
     pub touched: &'a [Triple],
-    /// A fact's sets before the change.
-    pub previous: &'a (dyn Fn(Triple) -> Vec<GraphSet> + Sync),
+    /// A fact's sets before the change, with its mark.
+    pub previous: &'a (dyn Fn(Triple) -> Annotation + Sync),
     /// Past this many affected facts the update gives up (a recomputation is cheaper).
     pub limit: usize,
 }
@@ -378,19 +673,23 @@ pub struct Change<'a, S: ?Sized> {
 ///
 /// `program` is the ground program after the change and must have been grounded on the
 /// same schema facts as the one before (the caller compares
-/// [`GroundProgram::schema_premises`]). `None` when the change reaches a schema fact,
-/// or affects more than `change.limit` facts: then [`support_sets`] computes them all.
+/// [`GroundProgram::schema_premises`]). `Ok(None)` when the change reaches a schema
+/// fact, or affects more than `change.limit` facts: then [`support_sets`] computes them
+/// all. `watch` sees the working set's bytes after each round.
 ///
-/// The affected facts start again from their own graphs: one pass over each one's
-/// derivations takes in what the unaffected facts support, then semi-naive rounds among
-/// the affected facts reach the least fixpoint, as [`support_sets`] does for all.
+/// The affected facts start again from their own graphs, unmarked unless those alone
+/// pass the cap (a mark is a fact of one fixpoint: kept across a change, a mark whose
+/// cause the change removed would stay): one pass over each one's derivations takes in
+/// what the unaffected facts support, then semi-naive rounds among the affected facts
+/// reach the least fixpoint, as [`support_sets`] does for all.
 pub fn update_support_sets<S: Source + Sync + ?Sized>(
     change: &Change<'_, S>,
     program: &GroundProgram,
     axioms: &[Triple],
     graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
     cap: usize,
-) -> Option<HashMap<Triple, Vec<GraphSet>>> {
+    watch: Watch<'_>,
+) -> Result<Option<HashMap<Triple, Annotation>>, Stopped> {
     let schema = program.schema_premises();
     let transitive: Vec<(Rule, Grounding)> = program
         .transitive
@@ -412,8 +711,9 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
     // The affected facts: the touched ones and what follows from them.
     let mut affected: HashSet<Triple> = change.touched.iter().copied().collect();
     if affected.iter().any(|fact| schema.contains(fact)) {
-        return None;
+        return Ok(None);
     }
+    let fixed = table_bytes::<Triple, ()>(schema.capacity());
     let mut frontier: Vec<Triple> = affected.iter().copied().collect();
     while !frontier.is_empty() {
         frontier.sort_unstable();
@@ -428,16 +728,23 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
                 out.extend(heads.iter().map(|head| instantiate_head(head, bindings)));
             }
         });
+        check(
+            watch,
+            fixed
+                + table_bytes::<Triple, ()>(affected.capacity())
+                + delta.bytes().total()
+                + heads.capacity() * size_of::<Triple>(),
+        )?;
         for head in heads {
             if affected.insert(head) {
                 if schema.contains(&head) {
-                    return None;
+                    return Ok(None);
                 }
                 frontier.push(head);
             }
         }
         if affected.len() > change.limit {
-            return None;
+            return Ok(None);
         }
     }
     let members: HashSet<Triple> = affected
@@ -445,8 +752,8 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
         .copied()
         .filter(|&fact| (change.in_closure)(fact))
         .collect();
-    let empty = GraphSet::default();
-    let mut now: HashMap<Triple, Vec<GraphSet>> = members
+    let empty = Annotation::empty_set();
+    let mut now: HashMap<Triple, Annotation> = members
         .iter()
         .map(|&fact| {
             let axiom = axioms.binary_search(&fact).is_ok();
@@ -454,8 +761,16 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
             (fact, initial_sets(graphs, axiom, cap))
         })
         .collect();
+    let mut annotations: usize = now.values().map(Annotation::heap_bytes).sum();
+    let fixed = fixed
+        + table_bytes::<Triple, ()>(affected.capacity())
+        + table_bytes::<Triple, ()>(members.capacity());
+    let held = |now: &HashMap<Triple, Annotation>, annotations: usize| {
+        fixed + table_bytes::<Triple, Annotation>(now.capacity()) + annotations
+    };
+    check(watch, held(&now, annotations))?;
     // The schema facts' part per rule: they aren't affected, so it is fixed.
-    let schemas: Vec<Vec<GraphSet>> = {
+    let schemas: Vec<Annotation> = {
         let lookup = Recomputing {
             now: &now,
             affected: &affected,
@@ -473,7 +788,7 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
         .collect();
     let premises_in_closure = |body: &[Triple]| body.iter().all(|&p| (change.in_closure)(p));
     // Every derivation of every affected fact, against the sets as they start.
-    let found: Vec<(Triple, Vec<GraphSet>)> = {
+    let found: Vec<(Triple, Annotation)> = {
         let lookup = Recomputing {
             now: &now,
             affected: &affected,
@@ -482,9 +797,13 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
         let list: Vec<Triple> = members.iter().copied().collect();
         list.par_iter()
             .map(|&fact| {
-                let mut from = Vec::new();
+                let mut from = Annotation::default();
+                let mut take = |found: Annotation| {
+                    from.truncated |= found.truncated;
+                    from.sets.extend(found.sets);
+                };
                 if program.bodiless.contains(&fact) {
-                    from.extend(grounding_sets(
+                    take(grounding_sets(
                         program,
                         Grounding::Bodiless(fact),
                         &lookup,
@@ -517,7 +836,7 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
                                 .map(|atom| instantiate_head(atom, bindings)),
                         );
                         if premises_in_closure(&body) {
-                            from.extend(premise_sets_from(&body, schema, &lookup, cap));
+                            take(premise_sets_from(&body, schema, &lookup, cap));
                         }
                         false
                     });
@@ -526,9 +845,15 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
             })
             .collect()
     };
+    check(
+        watch,
+        held(&now, annotations)
+            + found.capacity() * size_of::<(Triple, Annotation)>()
+            + found.iter().map(|(_, a)| a.heap_bytes()).sum::<usize>(),
+    )?;
     let mut changed: Vec<Triple> = Vec::new();
     for (fact, from) in found {
-        if merge(&mut now, fact, from, cap) {
+        if merge(&mut now, fact, from, cap, &mut annotations) {
             changed.push(fact);
         }
     }
@@ -562,23 +887,32 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
                 let from = premise_sets_from(&body, &schemas[k], &lookup, cap);
                 for head in heads {
                     let fact = instantiate_head(head, bindings);
-                    if members.contains(&fact) {
-                        out.extend(from.iter().map(|set| (fact, set.clone())));
+                    if members.contains(&fact) && !from.is_empty() {
+                        out.push((fact, from.clone()));
                     }
                 }
             })
         };
-        let mut by_fact: HashMap<Triple, Vec<GraphSet>> = HashMap::new();
-        for (fact, set) in found {
-            by_fact.entry(fact).or_default().push(set);
+        check(
+            watch,
+            held(&now, annotations)
+                + delta.bytes().total()
+                + found.capacity() * size_of::<(Triple, Annotation)>()
+                + found.iter().map(|(_, a)| a.heap_bytes()).sum::<usize>(),
+        )?;
+        let mut by_fact: HashMap<Triple, Annotation> = HashMap::new();
+        for (fact, from) in found {
+            let entry = by_fact.entry(fact).or_default();
+            entry.truncated |= from.truncated;
+            entry.sets.extend(from.sets);
         }
         for (fact, from) in by_fact {
-            if merge(&mut now, fact, from, cap) {
+            if merge(&mut now, fact, from, cap, &mut annotations) {
                 changed.push(fact);
             }
         }
     }
-    Some(now)
+    Ok(Some(now))
 }
 
 /// What `emit` makes of every instance of `rules` (by index) with a premise among
@@ -634,40 +968,48 @@ fn delta_facts(store: &Store) -> Vec<Triple> {
 }
 
 /// The sets of the schema facts `grounding` was grounded on: over its alternatives, the
-/// minimal unions of one set per premise; none if no alternative has sets yet.
+/// minimal unions of one set per premise, marked if an alternative's were or the cap
+/// cut them; none if no alternative has sets yet.
 fn grounding_sets<L: Lookup + ?Sized>(
     program: &GroundProgram,
     grounding: Grounding,
     sets: &L,
     cap: usize,
-    empty: &GraphSet,
-) -> Vec<GraphSet> {
-    let all = program
-        .premise_alternatives(grounding)
-        .into_iter()
-        .flat_map(|premises| premise_sets_from(premises, std::slice::from_ref(empty), sets, cap))
-        .collect();
-    minimal(all, cap)
+    empty: &Annotation,
+) -> Annotation {
+    let (mut all, mut truncated) = (Vec::new(), false);
+    for premises in program.premise_alternatives(grounding) {
+        let found = premise_sets_from(premises, empty, sets, cap);
+        truncated |= found.truncated;
+        all.extend(found.sets);
+    }
+    let mut out = minimal(all, cap);
+    out.truncated |= truncated;
+    out
 }
 
-/// The minimal unions of the sets `start` with one set per premise of `body`; none if a
-/// premise has none yet.
+/// The minimal unions of the sets `start` with one set per premise of `body`, marked if
+/// `start`'s, a premise's or a step's were; none if a premise has none yet.
 fn premise_sets_from<L: Lookup + ?Sized>(
     body: &[Triple],
-    start: &[GraphSet],
+    start: &Annotation,
     sets: &L,
     cap: usize,
-) -> Vec<GraphSet> {
+) -> Annotation {
     // The usual case, one set everywhere: a single union, nothing to minimise.
-    if let [only] = start {
+    if let [only] = start.sets.as_slice() {
         let mut one = only.clone();
+        let mut truncated = start.truncated;
         let mut single = true;
         for premise in body {
             let Some(own) = sets.sets_of(premise) else {
-                return Vec::new();
+                return Annotation::default();
             };
-            match &*own {
-                [set] => one = one.union(set),
+            match own.sets.as_slice() {
+                [set] => {
+                    one = one.union(set);
+                    truncated |= own.truncated;
+                }
                 _ => {
                     single = false;
                     break;
@@ -675,39 +1017,52 @@ fn premise_sets_from<L: Lookup + ?Sized>(
             }
         }
         if single {
-            return vec![one];
+            return Annotation {
+                sets: vec![one],
+                truncated,
+            };
         }
     }
-    let mut product = start.to_vec();
+    let mut product = start.clone();
     for premise in body {
         let Some(own) = sets.sets_of(premise) else {
-            return Vec::new();
+            return Annotation::default();
         };
-        let mut next = Vec::with_capacity(product.len() * own.len());
-        for a in &product {
-            for b in own.iter() {
+        let mut next = Vec::with_capacity(product.sets.len() * own.sets.len());
+        for a in &product.sets {
+            for b in own.sets.iter() {
                 next.push(a.union(b));
             }
         }
+        let truncated = product.truncated || own.truncated;
         product = minimal(next, cap);
+        product.truncated |= truncated;
     }
-    product
+    // A premise without sets yet: the instance gives nothing now, whatever was cut.
+    match product.is_empty() {
+        true => Annotation::default(),
+        false => product,
+    }
 }
 
-/// Adds `from` to `fact`'s sets; whether they changed.
+/// Adds `from` to `fact`'s sets, `annotations` following the heap bytes; whether its sets
+/// or its mark changed (either is news for the facts derived from it).
 fn merge(
-    sets: &mut HashMap<Triple, Vec<GraphSet>>,
+    sets: &mut HashMap<Triple, Annotation>,
     fact: Triple,
-    from: Vec<GraphSet>,
+    from: Annotation,
     cap: usize,
+    annotations: &mut usize,
 ) -> bool {
     let current = sets.entry(fact).or_default();
-    let mut all = current.clone();
-    all.extend(from);
-    let next = minimal(all, cap);
+    let mut all = current.sets.clone();
+    all.extend(from.sets);
+    let mut next = minimal(all, cap);
+    next.truncated |= current.truncated || from.truncated;
     if next == *current {
         return false;
     }
+    *annotations = (*annotations + next.heap_bytes()).saturating_sub(current.heap_bytes());
     *current = next;
     true
 }

@@ -46,6 +46,10 @@ pub struct Snapshot {
     views: Arc<nrese_exec::Budget>,
     /// The reader's budget, where it brought one ([`Self::reading_within`]).
     reads: Option<ReadBudget>,
+    /// What a restricted inferred view keeps is charged to ([`Self::with_inferred_mask`],
+    /// [`Self::with_inferred_only`]), shared with the masks it came from and the snapshots
+    /// made from it. Last: released after everything else the snapshot holds is freed.
+    held: Held,
 }
 
 /// A reader's budget for what its reads hold while they run, and the first charge it
@@ -140,36 +144,132 @@ fn unlimited() -> &'static Arc<nrese_exec::Budget> {
 /// ([`Snapshot::with_inferred_mask`]): a first run of tombstones, then one per change,
 /// tombstones for statements hidden since and inserts for those shown again (visible
 /// now, or gone from the stack). A change costs O(c log c) for its c statements, not a
-/// new run of everything hidden.
-#[derive(Debug, Clone, Default)]
+/// new run of everything hidden. Each run, and each mask's lists, is charged before it is
+/// made, to a reservation the masks and views over it share: released once the last of
+/// them lets go.
+#[derive(Debug, Default)]
 pub struct InferredMask {
     runs: Vec<Arc<crate::index::run::Run>>,
+    /// The charge of its runs and its list, the earlier masks' among its parts. After
+    /// `runs`: released once they are freed.
+    held: Held,
+}
+
+/// The bytes an `Arc` of a `size`-byte value allocates: the value and its two counts.
+fn boxed(size: usize) -> usize {
+    size + 2 * std::mem::size_of::<usize>()
+}
+
+/// A charge for memory masks and views keep, shared by every holder of it. The last holder
+/// takes the charge out of its box (freeing the box), drops its parts (the charges of what
+/// it keeps besides: the masks its runs come from, the snapshot it was made from), and
+/// releases it last, so that nothing it covers is still there when it goes. It covers its
+/// own box and its list of parts too.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Held(Option<Arc<HeldData>>);
+
+#[derive(Debug)]
+struct HeldData {
+    parts: Vec<Held>,
+    /// Last: released after the parts and their list are freed.
+    own: nrese_exec::Reservation,
+}
+
+impl Held {
+    /// `own`, charged for what it covers, with `parts`; the bytes of its box and list
+    /// ([`Self::overhead`]) are charged to `own` first.
+    fn new(
+        parts: Vec<Held>,
+        mut own: nrese_exec::Reservation,
+    ) -> Result<Self, nrese_exec::BudgetExceeded> {
+        own.charge(Self::overhead(parts.capacity()))?;
+        Ok(Self(Some(Arc::new(HeldData { parts, own }))))
+    }
+
+    /// What a charge with a list of `parts` parts allocates for itself.
+    fn overhead(parts: usize) -> usize {
+        boxed(std::mem::size_of::<HeldData>()) + parts * std::mem::size_of::<Held>()
+    }
+
+    /// The parts list of a charge made beside this one: this one, if it is any.
+    fn with(&self) -> Vec<Held> {
+        match &self.0 {
+            Some(_) => vec![self.clone()],
+            None => Vec::new(),
+        }
+    }
+
+    /// The bytes charged, its parts' included (a part shared by two charges counts for
+    /// each).
+    fn bytes(&self) -> usize {
+        self.0.as_ref().map_or(0, |data| {
+            data.own.bytes() + data.parts.iter().map(Held::bytes).sum::<usize>()
+        })
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // The last holder: its box freed by `into_inner`, then the parts, then the charge.
+        if let Some(data) = self.0.take().and_then(Arc::into_inner) {
+            drop(data);
+        }
+    }
 }
 
 impl InferredMask {
-    /// A mask hiding `hidden`: inferred statements `snapshot` holds, each once.
-    pub fn hiding(snapshot: &Snapshot, hidden: &[EncodedQuad]) -> Self {
-        Self::default().changed(snapshot, hidden, &[])
+    /// A mask hiding `hidden` (inferred statements `snapshot` holds, each once), charged to
+    /// `budget` first.
+    pub fn hiding(
+        snapshot: &Snapshot,
+        hidden: &[EncodedQuad],
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<Self, nrese_exec::BudgetExceeded> {
+        Self::default().changed(snapshot, hidden, &[], budget)
     }
 
     /// This mask, made for an earlier revision, over `snapshot`: `hide` are statements
     /// `snapshot`'s stack holds that it didn't hide, `show` statements it hid that are
     /// to be seen again or that `snapshot`'s stack no longer holds. Each once, the two
-    /// disjoint.
-    pub fn changed(&self, snapshot: &Snapshot, hide: &[EncodedQuad], show: &[EncodedQuad]) -> Self {
-        let mut runs = self.runs.clone();
-        if !(hide.is_empty() && show.is_empty()) {
+    /// disjoint. Its lists and its new run charged to `budget` before they are made; a
+    /// refusal leaves nothing made.
+    pub fn changed(
+        &self,
+        snapshot: &Snapshot,
+        hide: &[EncodedQuad],
+        show: &[EncodedQuad],
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<Self, nrese_exec::BudgetExceeded> {
+        use std::mem::size_of;
+        let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
+        let new_run = !(hide.is_empty() && show.is_empty());
+        let runs_len = self.runs.len() + usize::from(new_run);
+        held.charge(
+            runs_len * size_of::<Arc<crate::index::run::Run>>()
+                + usize::from(new_run) * boxed(size_of::<crate::index::run::Run>()),
+        )?;
+        let mut runs = Vec::with_capacity(runs_len);
+        runs.extend(self.runs.iter().cloned());
+        if new_run {
             let layout = snapshot.version.inferred.layout();
-            runs.push(Arc::new(crate::index::run::Run::from_delta(
-                layout, show, hide,
-            )));
+            let run = crate::index::run::Run::from_delta_within(layout, show, hide, &mut held)?;
+            runs.push(Arc::new(run));
         }
-        Self { runs }
+        Ok(Self {
+            runs,
+            held: Held::new(self.held.with(), held)?,
+        })
     }
 
     /// The runs it stacks; past a few, a new mask is cheaper to read.
     pub fn runs(&self) -> usize {
         self.runs.len()
+    }
+
+    /// The bytes charged for it, its runs' included (shared with the masks it was made
+    /// from, counted for each).
+    pub fn charged(&self) -> usize {
+        self.held.bytes()
     }
 }
 
@@ -221,6 +321,7 @@ impl Snapshot {
             canonical_data: None,
             views,
             reads: None,
+            held: Held::default(),
         }
     }
 
@@ -453,6 +554,81 @@ impl Snapshot {
                 crate::index::IndexVersion::from_quads(self.version.inferred.layout(), kept)
             }
         };
+        self.restricted(inferred, self.held.clone())
+    }
+
+    /// [`Self::with_inferred_subset`] of [`InferredSubset::Only`] `kept` (sorted, each
+    /// once), everything it makes charged to `budget` before it is made and held by the
+    /// view until its last reader lets it go. O(k log k) for its k statements, on one
+    /// thread. A refusal leaves nothing made.
+    pub fn with_inferred_only(
+        &self,
+        kept: &[EncodedQuad],
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        let layout = self.version.inferred.layout();
+        let empty = crate::index::IndexVersion::empty(layout);
+        let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
+        held.charge(
+            Self::restricted_bytes()
+                + empty.runs_bytes(1)
+                + boxed(std::mem::size_of::<crate::index::run::Run>()),
+        )?;
+        let run = crate::index::run::Run::from_delta_within(layout, kept, &[], &mut held)?;
+        let held = Held::new(self.held.with(), held)?;
+        let inferred = empty.with_run(run);
+        Ok(self.restricted(inferred, held))
+    }
+
+    /// This snapshot with `added` statements in its inferred stack, for a reader of facts
+    /// the store keeps apart from its stacks (the `owl2-dl` mode's upper bound): never
+    /// published, so no other reader sees them. Like [`Self::with_inferred_subset`] it has
+    /// statistics and equality classes of its own. O(k log k) for k statements, as one
+    /// more run.
+    pub fn with_inferred_added(&self, added: &[EncodedQuad]) -> Snapshot {
+        // Other statements than this snapshot's, at its revision.
+        self.restricted(
+            self.version.inferred.with_delta(added, &[]),
+            self.held.clone(),
+        )
+    }
+
+    /// This snapshot with the inferred statements `mask` hides removed, as
+    /// [`Self::with_inferred_subset`] does, by stacking its runs: O(r) for its r runs.
+    /// `Ok(None)` if the mask was built for another layout of the stack. What the view
+    /// makes is charged to `budget` first; it holds the mask's charges besides.
+    pub fn with_inferred_mask(
+        &self,
+        mask: &InferredMask,
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<Option<Snapshot>, nrese_exec::BudgetExceeded> {
+        let stack = &self.version.inferred;
+        if mask.runs.iter().any(|run| run.layout() != stack.layout()) {
+            return Ok(None);
+        }
+        let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
+        held.charge(Self::restricted_bytes() + stack.runs_bytes(mask.runs.len()))?;
+        let mut parts = self.held.with();
+        parts.reserve_exact(1);
+        parts.push(mask.held.clone());
+        let held = Held::new(parts, held)?;
+        let inferred = stack.with_runs(&mask.runs);
+        Ok(Some(self.restricted(inferred, held)))
+    }
+
+    /// What [`Self::restricted`] allocates for a view: its version, equality cell and
+    /// statistics.
+    fn restricted_bytes() -> usize {
+        use std::mem::size_of;
+        boxed(size_of::<Version>())
+            + boxed(size_of::<super::equality::EqualityCell>())
+            + boxed(size_of::<Statistics>())
+    }
+
+    /// This snapshot with `inferred` as its inferred stack, holding `held`: a version of
+    /// its own (new statements at its revision), with statistics and equality classes of
+    /// its own.
+    fn restricted(&self, inferred: crate::index::IndexVersion, held: Held) -> Snapshot {
         let version = Arc::new(Version {
             content: super::Content::fresh(),
             asserted: self.version.asserted.clone(),
@@ -472,66 +648,8 @@ impl Snapshot {
             statistics: Arc::default(),
             equality: self.equality,
             canonical: self.canonical,
+            held,
         }
-    }
-
-    /// This snapshot with `added` statements in its inferred stack, for a reader of facts
-    /// the store keeps apart from its stacks (the `owl2-dl` mode's upper bound): never
-    /// published, so no other reader sees them. Like [`Self::with_inferred_subset`] it has
-    /// statistics and equality classes of its own. O(k log k) for k statements, as one
-    /// more run.
-    pub fn with_inferred_added(&self, added: &[EncodedQuad]) -> Snapshot {
-        let version = Arc::new(Version {
-            // Other statements than this snapshot's, at its revision.
-            content: super::Content::fresh(),
-            asserted: self.version.asserted.clone(),
-            inferred: self.version.inferred.with_delta(added, &[]),
-            revision: self.version.revision,
-            dictionary_len: self.version.dictionary_len,
-            equality: Default::default(),
-            canonical: Default::default(),
-        });
-        let canonical_data = self.canonical_view(&version);
-        Snapshot {
-            canonical_data,
-            views: Arc::clone(&self.views),
-            reads: self.reads.clone(),
-            version,
-            dictionary: Arc::clone(&self.dictionary),
-            statistics: Arc::default(),
-            equality: self.equality,
-            canonical: self.canonical,
-        }
-    }
-
-    /// This snapshot with the inferred statements `mask` hides removed, as
-    /// [`Self::with_inferred_subset`] does, by stacking its runs: O(r) for its r runs.
-    /// `None` if the mask was built for another layout of the stack.
-    pub fn with_inferred_mask(&self, mask: &InferredMask) -> Option<Snapshot> {
-        let stack = &self.version.inferred;
-        if mask.runs.iter().any(|run| run.layout() != stack.layout()) {
-            return None;
-        }
-        let version = Arc::new(Version {
-            content: super::Content::fresh(),
-            asserted: self.version.asserted.clone(),
-            inferred: stack.with_runs(&mask.runs),
-            revision: self.version.revision,
-            dictionary_len: self.version.dictionary_len,
-            equality: Default::default(),
-            canonical: Default::default(),
-        });
-        let canonical_data = self.canonical_view(&version);
-        Some(Snapshot {
-            canonical_data,
-            views: Arc::clone(&self.views),
-            reads: self.reads.clone(),
-            version,
-            dictionary: Arc::clone(&self.dictionary),
-            statistics: Arc::default(),
-            equality: self.equality,
-            canonical: self.canonical,
-        })
     }
 
     /// The `owl:sameAs` classes reads expand, if equality by representatives is on.
@@ -747,6 +865,7 @@ impl Snapshot {
             statistics: Arc::clone(&self.statistics),
             equality: self.equality,
             canonical: self.canonical,
+            held: self.held.clone(),
         }
     }
 

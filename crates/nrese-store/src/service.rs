@@ -157,13 +157,18 @@ impl StoreService {
         let quarantine = crate::quarantine::Quarantine::open(
             (config.mode == StoreMode::OnDisk).then_some(config.data_dir.as_path()),
         )?;
+        // The support graph sets and restricted views draw on the memory the queries do,
+        // as the canonical views.
+        let supports = crate::support::Supports::new(std::sync::Arc::new(
+            nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
+        ));
         let service = Self {
             settings,
             namespaces: std::sync::Arc::new(namespaces),
             quarantine: std::sync::Arc::new(quarantine),
             sessions: std::sync::Arc::default(),
             running: std::sync::Arc::default(),
-            supports: std::sync::Arc::default(),
+            supports: std::sync::Arc::new(supports),
             dl: std::sync::Arc::default(),
             config,
             engine,
@@ -411,27 +416,48 @@ impl StoreService {
     }
 
     /// The latest snapshot as a reader with `access` sees it (`None`: every graph): with
-    /// `inferred = "supported"`, only the inferred statements its graphs support
-    /// ([`crate::support`]).
+    /// `inferred = "supported"`, only the inferred statements its graphs derive
+    /// ([`crate::support`]). What making that view reads and builds is charged to the
+    /// queries' memory; `Err` if it has no room (never a partial view).
     pub fn read_snapshot(
         &self,
         access: Option<&std::sync::Arc<nrese_sparql::GraphAccess>>,
-    ) -> nrese_engine::Snapshot {
-        self.view_of(&self.engine.snapshot(), access)
+    ) -> StoreResult<nrese_engine::Snapshot> {
+        let snapshot = self.engine.snapshot();
+        match access {
+            Some(access) if needs_view(&snapshot, access) => {
+                self.view_of(&snapshot, Some(access), &self.settings.envelope(None))
+            }
+            _ => Ok(snapshot),
+        }
     }
 
-    /// [`Self::read_snapshot`] of `snapshot`, a committed revision.
+    /// [`Self::read_snapshot`] for a request, its view's working memory charged to the
+    /// request's envelope `memory`.
+    pub(crate) fn read_snapshot_within(
+        &self,
+        access: Option<&std::sync::Arc<nrese_sparql::GraphAccess>>,
+        memory: &nrese_exec::Envelope,
+    ) -> StoreResult<nrese_engine::Snapshot> {
+        self.view_of(&self.engine.snapshot(), access, memory)
+    }
+
+    /// [`Self::read_snapshot_within`] of `snapshot`, a committed revision. The
+    /// unrestricted path (every graph, or no inferences, or every inference over every
+    /// named graph) is the snapshot itself: no support state is read.
     fn view_of(
         &self,
         snapshot: &nrese_engine::Snapshot,
         access: Option<&std::sync::Arc<nrese_sparql::GraphAccess>>,
-    ) -> nrese_engine::Snapshot {
+        memory: &nrese_exec::Envelope,
+    ) -> StoreResult<nrese_engine::Snapshot> {
         match access {
-            Some(access) if by_support(access) => {
-                self.supports
-                    .view(snapshot, access, self.support_compilation())
+            Some(access) if needs_view(snapshot, access) => {
+                Ok(self
+                    .supports
+                    .view(snapshot, access, self.support_compilation(), memory)?)
             }
-            _ => snapshot.clone(),
+            _ => Ok(snapshot.clone()),
         }
     }
 
@@ -449,8 +475,11 @@ impl StoreService {
     /// when the policy turns to it; the store does it itself after a rematerialisation
     /// while readers use them). Returns at once.
     pub fn prepare_support_sets(&self) {
-        self.supports
-            .prepare(self.engine.snapshot(), self.support_compilation());
+        self.supports.prepare(
+            self.engine.snapshot(),
+            self.support_compilation(),
+            self.settings.envelope(None),
+        );
     }
 
     /// Inferred statements under graph access ([`crate::support`]): the mutation pipeline
@@ -705,7 +734,9 @@ impl StoreService {
                     Outcome::Stream(status, read, detail) => {
                         let snapshot = match read {
                             Read::Lower(snapshot) | Read::At(snapshot) => snapshot,
-                            Read::Latest => self.read_snapshot(prepared.access()),
+                            Read::Latest => {
+                                self.read_snapshot_within(prepared.access(), &memory)?
+                            }
                         };
                         let context = format!("{dl} {status:?}");
                         run_query(
@@ -725,7 +756,7 @@ impl StoreService {
                 };
             return Ok((Some(detail), None));
         }
-        let snapshot = self.read_snapshot(prepared.access());
+        let snapshot = self.read_snapshot_within(prepared.access(), &memory)?;
         let ql = run_query(
             &snapshot,
             prepared,
@@ -810,7 +841,7 @@ impl StoreService {
             .register(prepared.text(), prepared.origin(), cancellation);
         let memory = self.settings.query_envelope(prepared);
         let mut explanation = explain_prepared(
-            &self.read_snapshot(prepared.access()),
+            &self.read_snapshot_within(prepared.access(), &memory)?,
             prepared,
             &self.settings,
             cancellation,
@@ -852,7 +883,7 @@ impl StoreService {
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
         let mut planned = plan_prepared(
-            &self.read_snapshot(prepared.access()),
+            &self.read_snapshot(prepared.access())?,
             prepared,
             &self.settings,
             cancellation,
@@ -886,7 +917,7 @@ impl StoreService {
         form: nrese_sparql::ql::PrintForm,
     ) -> StoreResult<nrese_sparql::ql::Printed> {
         let query = nrese_sparql::compat::parse_query(query, None)?;
-        let snapshot = self.read_snapshot(None);
+        let snapshot = self.engine.snapshot();
         Ok(nrese_sparql::ql::print(&snapshot, &query, form)?)
     }
 
@@ -913,7 +944,7 @@ impl StoreService {
             }
         }
         execute_graph_read(
-            &self.read_snapshot(read.scope.access()),
+            &self.read_snapshot(read.scope.access())?,
             request,
             read.model(),
             &read.cancel,
@@ -945,16 +976,48 @@ impl StoreService {
             crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
         })?;
         let view = match scope.access() {
-            Some(access) if by_support(access) => {
+            Some(access) if needs_view(tx.base(), access) => {
                 // The operations aren't reasoned over: the base's inferred statements, as
-                // far as the reader sees them and the operations left them.
-                let base = self.view_of(tx.base(), Some(access));
-                let kept: Vec<nrese_engine::EncodedQuad> = base
-                    .quads_for_pattern_in(ReadModel::Inferred, &nrese_engine::QuadPattern::all())
-                    .filter(|quad| view_has(&tx, quad))
-                    .collect();
-                tx.pending_snapshot()
-                    .with_inferred_subset(nrese_engine::InferredSubset::Only(kept))
+                // far as the reader sees them and the operations left them, kept (charged)
+                // as the support views are. A statement the view adds (asserted only in
+                // graphs the reader can't read, and derived) stays unless the operations
+                // assert it where the reader reads it.
+                let memory = self.settings.envelope(None);
+                let base = self.view_of(tx.base(), Some(access), &memory)?;
+                let left = |quad: &nrese_engine::EncodedQuad| match tx
+                    .base()
+                    .contains_in(ReadModel::Inferred, quad)
+                {
+                    true => view_has(&tx, quad),
+                    false => !tx
+                        .quads_for_pattern_in(
+                            ReadModel::Asserted,
+                            &nrese_engine::QuadPattern {
+                                subject: Some(quad.subject),
+                                predicate: Some(quad.predicate),
+                                object: Some(quad.object),
+                                graph: nrese_engine::GraphSelector::Any,
+                            },
+                        )
+                        .any(|asserted| access.allows_id(&tx, asserted.graph)),
+                };
+                let budget = self.supports.kept();
+                let len = usize::try_from(base.len_in(ReadModel::Inferred)).unwrap_or(usize::MAX);
+                let mut kept: nrese_exec::ChargedVec<nrese_engine::EncodedQuad> =
+                    nrese_exec::ChargedVec::with_capacity(std::sync::Arc::clone(budget), len)?;
+                let mut scanning = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+                scanning.charge(base.scan_bytes(ReadModel::Inferred))?;
+                kept.extend_bounded(
+                    len,
+                    base.quads_for_pattern_in(
+                        ReadModel::Inferred,
+                        &nrese_engine::QuadPattern::all(),
+                    )
+                    .filter(|quad| left(quad)),
+                )?;
+                drop(scanning);
+                kept.sort_unstable();
+                tx.pending_snapshot().with_inferred_only(&kept, budget)?
             }
             _ => tx.pending_snapshot(),
         };
@@ -1163,7 +1226,7 @@ impl StoreService {
         read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
     ) -> StoreResult<T> {
         match context.pending {
-            None => read(&self.read_snapshot(context.scope.access())),
+            None => read(&self.read_snapshot(context.scope.access())?),
             Some(pending) => self.with_pending(pending, &context.scope, &context.cancel, read),
         }
     }
@@ -1348,21 +1411,29 @@ impl StoreService {
         subject: nrese_rdf::TermRef<'_>,
         predicate: nrese_rdf::TermRef<'_>,
         object: nrese_rdf::TermRef<'_>,
-    ) -> Option<Vec<crate::reasoning::InferenceStep>> {
+    ) -> StoreResult<Option<Vec<crate::reasoning::InferenceStep>>> {
         let snapshot = self.engine.snapshot();
         let program = self.bound_program(&snapshot, program.into());
-        let fact = Self::fact_of(&snapshot, [subject, predicate, object])?;
+        let Some(fact) = Self::fact_of(&snapshot, [subject, predicate, object]) else {
+            return Ok(None);
+        };
         let crate::ReadScope::Graphs(access) = scope else {
-            return crate::reasoning::explain_fact(&program, &snapshot, fact, None);
+            return Ok(crate::reasoning::explain_fact(
+                &program, &snapshot, fact, None,
+            ));
         };
         let readable = |fact: [u64; 3]| readable_asserted(&snapshot, access, fact);
-        let steps = crate::reasoning::explain_fact(&program, &snapshot, fact, Some(&readable))?;
+        let Some(steps) =
+            crate::reasoning::explain_fact(&program, &snapshot, fact, Some(&readable))
+        else {
+            return Ok(None);
+        };
         let visible = match steps.first().map(|step| step.origin) {
-            Some("inferred") => self.inferred_visible(&snapshot, access, fact),
+            Some("inferred") => self.inferred_visible(&snapshot, access, fact)?,
             Some("asserted") => true,
             _ => false,
         };
-        visible.then_some(steps)
+        Ok(visible.then_some(steps))
     }
 
     /// The justifications of the statement `subject predicate object` under `program`:
@@ -1376,19 +1447,29 @@ impl StoreService {
         scope: &crate::ReadScope,
         statement: [nrese_rdf::TermRef<'_>; 3],
         mode: crate::reasoning::JustificationMode,
-    ) -> Option<crate::reasoning::JustificationAnswer> {
+    ) -> StoreResult<Option<crate::reasoning::JustificationAnswer>> {
         let snapshot = self.engine.snapshot();
         let program = self.bound_program(&snapshot, program.into());
-        let fact = Self::fact_of(&snapshot, statement)?;
+        let Some(fact) = Self::fact_of(&snapshot, statement) else {
+            return Ok(None);
+        };
         let crate::ReadScope::Graphs(access) = scope else {
-            return crate::reasoning::justify_fact(&program, &snapshot, fact, mode, None);
+            return Ok(crate::reasoning::justify_fact(
+                &program, &snapshot, fact, mode, None,
+            ));
         };
         let readable = |fact: [u64; 3]| readable_asserted(&snapshot, access, fact);
-        let visible = readable(fact) || self.inferred_visible(&snapshot, access, fact);
+        let visible = readable(fact) || self.inferred_visible(&snapshot, access, fact)?;
         if !visible {
-            return None;
+            return Ok(None);
         }
-        crate::reasoning::justify_fact(&program, &snapshot, fact, mode, Some(&readable))
+        Ok(crate::reasoning::justify_fact(
+            &program,
+            &snapshot,
+            fact,
+            mode,
+            Some(&readable),
+        ))
     }
 
     /// `program` with its constants by the snapshot's ids, without the writer: a constant
@@ -1420,21 +1501,23 @@ impl StoreService {
         ])
     }
 
-    /// Whether the requester sees `fact` as an inferred statement.
+    /// Whether the requester sees `fact` as an inferred statement; `Err` if its view
+    /// couldn't be made.
     fn inferred_visible(
         &self,
         snapshot: &nrese_engine::Snapshot,
         access: &std::sync::Arc<nrese_sparql::GraphAccess>,
         fact: [u64; 3],
-    ) -> bool {
+    ) -> StoreResult<bool> {
         if by_support(access) {
             let [s, p, o] = fact.map(nrese_engine::TermId::from_raw);
-            self.view_of(snapshot, Some(access)).contains_in(
+            let view = self.view_of(snapshot, Some(access), &self.settings.envelope(None))?;
+            Ok(view.contains_in(
                 ReadModel::Inferred,
                 &nrese_engine::EncodedQuad::new(s, p, o, nrese_engine::TermId::DEFAULT_GRAPH),
-            )
+            ))
         } else {
-            access.inferred
+            Ok(access.inferred)
         }
     }
 
@@ -1583,6 +1666,17 @@ impl StoreService {
 /// sets ([`crate::support`]).
 fn by_support(access: &nrese_sparql::GraphAccess) -> bool {
     access.inferred && access.inferred_by_support
+}
+
+/// Whether a reader with `access` reads `snapshot` through a view of its own
+/// ([`crate::support`]): by support, or seeing every inference while some named graph is
+/// out of its reach (a fact asserted only there, and derived, is shown to it as inferred).
+fn needs_view(snapshot: &nrese_engine::Snapshot, access: &nrese_sparql::GraphAccess) -> bool {
+    by_support(access)
+        || (access.inferred
+            && snapshot
+                .named_graphs()
+                .any(|graph| !access.allows_id(snapshot, graph)))
 }
 
 /// Whether the pending state of `tx` holds the inferred `quad`.

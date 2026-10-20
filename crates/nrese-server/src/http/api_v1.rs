@@ -534,23 +534,27 @@ pub async fn explain(
         })
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?
+        .map_err(|error| super::sparql::map_query_error(&state.policy(), error))?
         .ok_or_else(|| ApiError::not_found("the statement doesn't hold"))?;
         return Ok(Json(Justified::from(answer)).into_response());
     }
     let dl = state.store().dl().active();
     let found = tokio::task::spawn_blocking(move || {
         let statement = [subject.as_ref(), predicate.as_ref(), object.as_ref()];
-        match store.explain_statement(program, &scope, statement[0], statement[1], statement[2]) {
+        let steps =
+            store.explain_statement(program, &scope, statement[0], statement[1], statement[2])?;
+        Ok::<_, nrese_store::StoreError>(match steps {
             Some(steps) => Some((steps, None)),
             // Not derived by the rules: under owl2-dl, why OWL 2 DL entails it.
             None if dl => store
                 .explain_dl(&scope, statement)
                 .map(|e| (Vec::new(), Some(DlJustified::from(e)))),
             None => None,
-        }
+        })
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(|error| super::sparql::map_query_error(&state.policy(), error))?
     .ok_or_else(|| ApiError::not_found("the statement doesn't hold"))?;
     let (steps, owl2_dl) = found;
     let steps: Vec<ExplanationStep> = steps

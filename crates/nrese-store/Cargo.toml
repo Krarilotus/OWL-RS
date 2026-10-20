@@ -41,6 +41,8 @@ openapi = ["dep:utoipa"]
 [dev-dependencies]
 libmimalloc-sys = { workspace = true }
 mimalloc = { workspace = true }
+# The support graph sets' memory guard measures against budgets (tests/support_memory.rs).
+nrese-exec = { path = "../nrese-exec", features = ["measure"] }
 tempfile = { workspace = true }
 
 [lints]

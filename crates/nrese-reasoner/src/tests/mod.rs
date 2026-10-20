@@ -1695,95 +1695,110 @@ fn list_rules_follow_list_edits_under_the_delta_executor() {
     }
 }
 
-/// The oracle of `graph_sets` (its test calls it): random ontologies whose statements
-/// are spread over three graphs; for each set of graphs, the facts with a support set
-/// inside it equal the closure of its statements.
-pub(super) fn support_sets_against_closures() {
+/// The default cap on sets per fact (`reasoner.support_sets`, nrese-store `config.rs`).
+const DEFAULT_SUPPORT_SETS: usize = 16;
+
+/// One case of the support graph sets' oracle, under OWL 2 RL: statements `placed` in
+/// graphs (numbered below 64). For each cap of `caps` and each reader of `readers` (a mask
+/// of graphs), what the reader is decided to see (by its kept sets where they decide, by
+/// `graph_sets::closure_within` where a fact is marked truncated) equals a fresh
+/// materialisation of the statements it reads; and a fact left unmarked kept every set.
+/// Returns the readers checked, the marked facts met, and the facts the closure decided
+/// visible.
+#[allow(clippy::too_many_arguments)]
+fn check_supports(
+    vocabulary: &LocalVocabulary,
+    rules: &[super::ir::Rule],
+    lists: &ListVocabulary,
+    schema: &Schema,
+    placed: &[(Triple, u32)],
+    readers: &[u64],
+    caps: &[usize],
+    case: &str,
+) -> [u64; 3] {
     use super::delta::{MemoryBase, Rules, program};
-    let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
-    let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
-    let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x6a5e_7c0d_2026_1003));
-    let mut checked = 0;
-    let covered = |checked: usize| checked > 0;
-    for case in 0.. {
-        if !draws_on(case, cases, covered(checked)) {
-            break;
-        }
-        let lines = random_ontology(&mut next);
-        let mut vocabulary = LocalVocabulary::default();
-        let pool = load(
-            &mut vocabulary,
-            &lines.join(
-                "
-",
-            ),
-        );
-        let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
-        let lists = ListVocabulary::new(&mut vocabulary);
-        let schema = Schema::owl(&mut vocabulary);
-        let compiled = Rules {
-            rules: &rules,
-            lists: Some(&lists),
-            schema: &schema,
-        };
-        // Each statement in one graph, a few in two.
-        let mut placed: Vec<(Triple, u32)> = Vec::new();
-        for &fact in &pool {
-            placed.push((fact, next(3) as u32));
-            if next(6) == 0 {
-                placed.push((fact, next(3) as u32));
+    use super::graph_sets::{Annotation, UNWATCHED, closure_within, support_sets};
+    let compiled = Rules {
+        rules,
+        lists: Some(lists),
+        schema,
+    };
+    let closure = |facts: &[Triple]| {
+        let mut all = batch::materialise(facts, rules, Some(lists), schema).derived;
+        all.extend_from_slice(facts);
+        all.sort_unstable();
+        all.dedup();
+        all
+    };
+    let mut asserted: Vec<Triple> = placed.iter().map(|&(f, _)| f).collect();
+    asserted.sort_unstable();
+    asserted.dedup();
+    let full = closure(&asserted);
+    let inferred: Vec<Triple> = full
+        .iter()
+        .copied()
+        .filter(|f| asserted.binary_search(f).is_err())
+        .collect();
+    let ground = program(&MemoryBase::new(&asserted, &inferred), compiled);
+    let graphs_of = |fact: Triple| -> Vec<u32> {
+        placed
+            .iter()
+            .filter(|&&(f, _)| f == fact)
+            .map(|&(_, g)| g)
+            .collect()
+    };
+    let text = |t: &Triple| {
+        let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
+        format!("{s} {p} {o}")
+    };
+    let every = support_sets(&full, &ground, &[], &graphs_of, usize::MAX, UNWATCHED).unwrap();
+    let mut counts = [0u64; 3];
+    for &cap in caps {
+        let sets = support_sets(&full, &ground, &[], &graphs_of, cap, UNWATCHED).unwrap();
+        for (fact, kept) in &sets {
+            match kept.truncated {
+                true => counts[1] += 1,
+                false => assert_eq!(
+                    kept.sets,
+                    every[fact].sets,
+                    "{case}, cap {cap}: {} is unmarked but lost sets",
+                    text(fact)
+                ),
             }
         }
-        let mut asserted: Vec<Triple> = placed.iter().map(|&(f, _)| f).collect();
-        asserted.sort_unstable();
-        asserted.dedup();
-        let closure = |facts: &[Triple]| {
-            let mut all = batch::materialise(facts, &rules, Some(&lists), &schema).derived;
-            all.extend_from_slice(facts);
-            all.sort_unstable();
-            all.dedup();
-            all
-        };
-        let full = closure(&asserted);
-        let inferred: Vec<Triple> = full
-            .iter()
-            .copied()
-            .filter(|f| asserted.binary_search(f).is_err())
-            .collect();
-        let ground = program(&MemoryBase::new(&asserted, &inferred), compiled);
-        let graphs_of = |fact: Triple| -> Vec<u32> {
-            placed
+        for &readable in readers {
+            let reads = |graph: u32| readable & (1 << graph) != 0;
+            let fits = |kept: &Annotation| kept.sets.iter().any(|set| set.graphs().all(reads));
+            let mut data: Vec<Triple> = placed
                 .iter()
-                .filter(|&&(f, _)| f == fact)
-                .map(|&(_, g)| g)
-                .collect()
-        };
-        let sets = super::graph_sets::support_sets(&full, &ground, &[], &graphs_of, usize::MAX);
-        for readable in 0u32..8 {
-            let data: Vec<Triple> = placed
-                .iter()
-                .filter(|&&(_, g)| readable & (1 << g) != 0)
+                .filter(|&&(_, g)| reads(g))
                 .map(|&(f, _)| f)
                 .collect();
-            let mut data = data;
             data.sort_unstable();
             data.dedup();
             let expected = closure(&data);
+            let undecided = full.iter().any(|f| {
+                sets.get(f)
+                    .is_some_and(|kept| kept.truncated && !fits(kept))
+            });
+            let within = undecided.then(|| {
+                let read = |fact: Triple| data.binary_search(&fact).is_ok();
+                closure_within(&full, &ground, &[], &read, UNWATCHED).unwrap()
+            });
             let visible: Vec<Triple> = full
                 .iter()
                 .copied()
-                .filter(|f| {
-                    sets.get(f).is_some_and(|sets| {
-                        sets.iter()
-                            .any(|set| set.graphs().all(|g| readable & (1 << g) != 0))
-                    })
+                .filter(|f| match sets.get(f) {
+                    Some(kept) if fits(kept) => true,
+                    Some(kept) if kept.truncated => {
+                        let held = within.as_ref().expect("undecided").contains_key(f);
+                        counts[2] += u64::from(held);
+                        held
+                    }
+                    _ => false,
                 })
                 .collect();
             if visible != expected {
-                let text = |t: &Triple| {
-                    let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
-                    format!("{s} {p} {o}")
-                };
                 let wrong: Vec<Triple> = visible
                     .iter()
                     .filter(|f| expected.binary_search(f).is_err())
@@ -1817,31 +1832,121 @@ pub(super) fn support_sets_against_closures() {
                     .map(|(f, g)| format!("{} @{g}", text(f)))
                     .collect();
                 panic!(
-                    "case {case}, graphs {readable:03b}: wrong {:#?}\nwhy {why:#?}\nontology:\n{}",
+                    "{case}, cap {cap}, graphs {readable:b}: wrong {:#?}\nwhy {why:#?}\nontology:\n{}",
                     wrong.iter().map(text).collect::<Vec<_>>(),
                     ontology.join("\n")
                 );
             }
-            checked += 1;
+            counts[0] += 1;
         }
     }
-    assert!(covered(checked), "no case checked");
+    counts
+}
+
+/// The oracle of `graph_sets` (its test calls it): for each set of graphs, a reader sees
+/// exactly the closure of the statements in it, whatever the cap.
+/// - The store's default cap overflows: a statement in 17 graphs and its class's subclass
+///   axiom in an 18th give the subclass inference 17 minimal sets, and the statement's
+///   own 17 pass the cap from the start. A reader of the 17th graph and the axiom's sees
+///   both inferences.
+/// - Random ontologies whose statements are spread over three graphs, with every set
+///   kept and with one: the marks propagate through products, schema alternatives,
+///   bodiless facts and recursion, and the closure decides what they leave open.
+pub(super) fn support_sets_against_closures() {
+    let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
+    let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
+    let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x6a5e_7c0d_2026_1003));
+    let add = |counts: &mut [u64; 3], found: [u64; 3]| {
+        for (count, more) in counts.iter_mut().zip(found) {
+            *count += more;
+        }
+    };
+    let rules_of = |vocabulary: &mut LocalVocabulary| {
+        let rules = Ruleset::Owl2Rl.rules(vocabulary).unwrap();
+        (
+            rules,
+            ListVocabulary::new(vocabulary),
+            Schema::owl(vocabulary),
+        )
+    };
+    let mut counts = [0u64; 3];
+    {
+        let mut vocabulary = LocalVocabulary::default();
+        let pool = load(
+            &mut vocabulary,
+            "ex:x rdf:type ex:C\nex:C rdfs:subClassOf ex:D",
+        );
+        let (rules, lists, schema) = rules_of(&mut vocabulary);
+        let mut placed: Vec<(Triple, u32)> = (0..17).map(|g| (pool[0], g)).collect();
+        placed.push((pool[1], 17));
+        let readers = [(1 << 16) | (1 << 17), 1 | (1 << 17), 1 << 16, (1 << 18) - 1];
+        let found = check_supports(
+            &vocabulary,
+            &rules,
+            &lists,
+            &schema,
+            &placed,
+            &readers,
+            &[DEFAULT_SUPPORT_SETS],
+            "17 graphs",
+        );
+        assert!(found[1] >= 2 && found[2] >= 1, "17 graphs: {found:?}");
+        add(&mut counts, found);
+    }
+    let covered = |counts: &[u64; 3]| counts.iter().all(|&n| n > 0);
+    for case in 0.. {
+        if !draws_on(case, cases, covered(&counts)) {
+            break;
+        }
+        let lines = random_ontology(&mut next);
+        let mut vocabulary = LocalVocabulary::default();
+        let pool = load(&mut vocabulary, &lines.join("\n"));
+        let (rules, lists, schema) = rules_of(&mut vocabulary);
+        // Each statement in one graph, a few in two.
+        let mut placed: Vec<(Triple, u32)> = Vec::new();
+        for &fact in &pool {
+            placed.push((fact, next(3) as u32));
+            if next(6) == 0 {
+                placed.push((fact, next(3) as u32));
+            }
+        }
+        let readers: Vec<u64> = (0..8).collect();
+        let found = check_supports(
+            &vocabulary,
+            &rules,
+            &lists,
+            &schema,
+            &placed,
+            &readers,
+            &[usize::MAX, 1],
+            &format!("case {case}"),
+        );
+        add(&mut counts, found);
+    }
+    assert!(covered(&counts), "{counts:?}");
 }
 
 /// The oracle of `graph_sets::update_support_sets` (its test calls it): random
 /// ontologies over three graphs, then random changes of where instance statements
-/// are (added to a graph, removed from one, moved); the update's sets equal those
-/// computed afresh for every fact of the closure after the change.
+/// are (added to a graph, removed from one, moved). With every set kept, the update's
+/// sets equal those computed afresh for every fact of the closure after the change. With
+/// one kept, a fact the update leaves unmarked has all the fresh sets, and every reader
+/// is decided to see the fresh closure of what it reads: marks set, cleared and set again
+/// by the change included.
 pub(super) fn support_set_updates_against_recomputation() {
     use super::delta::{MemoryBase, Rules, program};
-    use super::graph_sets::{Change, support_sets, update_support_sets};
+    use super::graph_sets::{
+        Annotation, Change, UNWATCHED, closure_within, support_sets, update_support_sets,
+    };
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
     let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x5e75_d1ff_2026_1003));
-    let (mut updated, mut refused) = (0, 0);
-    let covered = |updated: u64| updated > cases / 4;
+    let (mut updated, mut refused, mut remarked, mut decided) = (0, 0, 0, 0);
+    let covered = |updated: u64, remarked: u64, decided: u64| {
+        updated > cases / 4 && remarked > 0 && decided > 0
+    };
     for case in 0.. {
-        if !draws_on(case, cases, covered(updated)) {
+        if !draws_on(case, cases, covered(updated, remarked, decided)) {
             break;
         }
         let lines = random_ontology(&mut next);
@@ -1888,13 +1993,6 @@ pub(super) fn support_set_updates_against_recomputation() {
         };
         let mut placed: Vec<(Triple, u32)> = pool.iter().map(|&f| (f, next(3) as u32)).collect();
         let (before, ground_before) = state(&placed);
-        let sets_before = support_sets(
-            &before,
-            &ground_before,
-            &[],
-            &|f| graphs_in(&placed, f),
-            usize::MAX,
-        );
         // Change placements of statements no grounding rests on.
         let premises = ground_before.schema_premises();
         let movable: Vec<usize> = (0..placed.len())
@@ -1939,23 +2037,16 @@ pub(super) fn support_set_updates_against_recomputation() {
         let mut reachable = after.clone();
         reachable.extend_from_slice(&removed);
         let source = super::batch::Store::new(reachable);
-        let previous = |f: Triple| sets_before.get(&f).cloned().unwrap_or_default();
-        let change = Change {
-            source: &source,
-            in_closure: &|f| after.binary_search(&f).is_ok(),
-            touched: &touched,
-            previous: &previous,
-            limit: usize::MAX,
+        let text = |t: &Triple| {
+            let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
+            format!("{s} {p} {o}")
         };
-        let Some(update) = update_support_sets(
-            &change,
-            &ground_after,
-            &[],
-            &|f| graphs_in(&placed, f),
-            usize::MAX,
-        ) else {
-            refused += 1;
-            continue;
+        let shown = || -> String {
+            placed
+                .iter()
+                .map(|(f, g)| format!("{} @{g}", text(f)))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
         let expected = support_sets(
             &after,
@@ -1963,31 +2054,107 @@ pub(super) fn support_set_updates_against_recomputation() {
             &[],
             &|f| graphs_in(&placed, f),
             usize::MAX,
-        );
-        for &fact in &after {
-            let got = update.get(&fact).cloned().unwrap_or_else(|| previous(fact));
-            let want = expected.get(&fact).cloned().unwrap_or_default();
-            if got != want {
-                let text = |t: &Triple| {
-                    let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
-                    format!("{s} {p} {o}")
+            UNWATCHED,
+        )
+        .unwrap();
+        let mut served = true;
+        for cap in [usize::MAX, 1] {
+            let sets_before = support_sets(
+                &before,
+                &ground_before,
+                &[],
+                &|f| graphs_in(&old_placed, f),
+                cap,
+                UNWATCHED,
+            )
+            .unwrap();
+            let previous = |f: Triple| sets_before.get(&f).cloned().unwrap_or_default();
+            let change = Change {
+                source: &source,
+                in_closure: &|f| after.binary_search(&f).is_ok(),
+                touched: &touched,
+                previous: &previous,
+                limit: usize::MAX,
+            };
+            let Some(update) = update_support_sets(
+                &change,
+                &ground_after,
+                &[],
+                &|f| graphs_in(&placed, f),
+                cap,
+                UNWATCHED,
+            )
+            .unwrap() else {
+                served = false;
+                break;
+            };
+            let now = |f: Triple| update.get(&f).cloned().unwrap_or_else(|| previous(f));
+            for &fact in &after {
+                let (got, want) = (now(fact), expected.get(&fact).cloned().unwrap_or_default());
+                let wrong = match cap {
+                    usize::MAX => got != want,
+                    _ => !got.truncated && got.sets != want.sets,
                 };
-                let shown: Vec<String> = placed
+                if wrong {
+                    panic!(
+                        "case {case}, cap {cap}: {} has {got:?}, recomputed {want:?}; before {:?}; touched {:?}\nplaced:\n{}",
+                        text(&fact),
+                        previous(fact),
+                        touched.iter().map(text).collect::<Vec<_>>(),
+                        shown()
+                    );
+                }
+                remarked += u64::from(previous(fact).truncated != got.truncated);
+            }
+            if cap == usize::MAX {
+                continue;
+            }
+            for readable in 0u64..8 {
+                let reads = |graph: u32| readable & (1 << graph) != 0;
+                let fits = |kept: &Annotation| kept.sets.iter().any(|set| set.graphs().all(reads));
+                let mut data: Vec<Triple> = placed
                     .iter()
-                    .map(|(f, g)| format!("{} @{g}", text(f)))
+                    .filter(|&&(_, g)| reads(g))
+                    .map(|&(f, _)| f)
                     .collect();
-                panic!(
-                    "case {case}: {} has {got:?}, recomputed {want:?}; before {:?}; touched {:?}\nplaced:\n{}",
-                    text(&fact),
-                    previous(fact),
+                data.sort_unstable();
+                data.dedup();
+                let fresh = closure(&data);
+                let read = |fact: Triple| data.binary_search(&fact).is_ok();
+                let within = closure_within(&after, &ground_after, &[], &read, UNWATCHED).unwrap();
+                let seen: Vec<Triple> = after
+                    .iter()
+                    .copied()
+                    .filter(|&f| {
+                        let kept = now(f);
+                        match fits(&kept) {
+                            true => true,
+                            false if kept.truncated => {
+                                decided += 1;
+                                within.contains_key(&f)
+                            }
+                            false => false,
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    seen.iter().map(text).collect::<Vec<_>>(),
+                    fresh.iter().map(text).collect::<Vec<_>>(),
+                    "case {case}, graphs {readable:03b}; touched {:?}\nplaced:\n{}",
                     touched.iter().map(text).collect::<Vec<_>>(),
-                    shown.join("\n")
+                    shown()
                 );
             }
         }
-        updated += 1;
+        match served {
+            true => updated += 1,
+            false => refused += 1,
+        }
     }
-    assert!(covered(updated), "updated {updated}, refused {refused}");
+    assert!(
+        covered(updated, remarked, decided),
+        "updated {updated}, refused {refused}, remarked {remarked}, decided {decided}"
+    );
 }
 
 /// Random ontologies under random insert/delete sequences: after every change, the
