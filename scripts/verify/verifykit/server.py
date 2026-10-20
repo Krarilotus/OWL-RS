@@ -3,7 +3,12 @@ port on 127.0.0.1, the scenario's settings (`--set`, over the defaults below) an
 caller's environment (no NRESE_* variable reaches it, and it starts in its own directory, so no
 stray .env file does either). Its log goes to the evidence. `cleanup` stops it and removes the
 directory, and runs however the scenario ended; on Linux the server also dies with the runner
-(PR_SET_PDEATHSIG), and under fleet the step's scope ends both."""
+(PR_SET_PDEATHSIG), and under fleet the step's scope ends both.
+
+Every attempt to start it is recorded (`attempts`), failed ones too. An attempt that fails is
+stopped and reaped before anything else happens; only one whose own log says it couldn't bind
+its port (another process took the port between our probe and its bind) is tried again, on
+another port."""
 from __future__ import annotations
 
 import ctypes
@@ -16,15 +21,14 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
+
+from . import client
 
 # Durable, as deployments run (repositories live on disk; a restart reopens them).
 DEFAULTS = {"store.mode": "on-disk"}
 BIND_ATTEMPTS = 3
-# Straight to 127.0.0.1: no HTTP_PROXY from the environment in between.
-DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+BIND_FAILED = "failed to bind"  # nrese-server's own words (main.rs) when its port is taken
 
 
 class LaunchError(Exception):
@@ -61,7 +65,7 @@ class Server:
         self.root: Path | None = None
         self.process: subprocess.Popen | None = None
         self.port = 0
-        self.starts: list[dict] = []
+        self.attempts: list[dict] = []
 
     @property
     def base(self) -> str:
@@ -78,59 +82,65 @@ class Server:
 
     def start(self) -> dict:
         """Starts it (a fresh directory the first time, the same one after) and waits until
-        /readyz answers 200. The start's record: argv, port, pid, seconds until ready."""
+        /readyz answers 200. The start's record (also in `attempts`): argv, port, pid, the
+        attempt's number and outcome, seconds until ready."""
         if self.root is None:
             if self.scratch:
                 self.scratch.mkdir(parents=True, exist_ok=True)
             self.root = Path(tempfile.mkdtemp(prefix="nrese-verify-", dir=self.scratch))
-        port = self.port
+        port = self.port  # a restart keeps its port while it can
         for attempt in range(1, BIND_ATTEMPTS + 1):
             self.port = port or free_port()
             began = time.monotonic()
             with open(self.log, "ab") as log:
-                log.write(f"=== verify: start {len(self.starts) + 1}, port {self.port}, "
+                offset = log.tell()  # where this attempt's own log begins
+                log.write(f"=== verify: start attempt {len(self.attempts) + 1}, port {self.port}, "
                           f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\n".encode())
                 log.flush()
+                record = {"argv": self.argv(), "port": self.port, "pid": None, "attempt": attempt, "outcome": None}
+                self.attempts.append(record)
                 try:
                     self.process = subprocess.Popen(
                         self.argv(), cwd=self.root, env=self.env, stdin=subprocess.DEVNULL, stdout=log,
                         stderr=subprocess.STDOUT,
                         preexec_fn=_die_with_parent if sys.platform.startswith("linux") else None)
                 except OSError as e:
-                    raise LaunchError(f"can't start {self.command[0]}: {e}") from None
-            record = {"argv": self.argv(), "port": self.port, "pid": self.process.pid, "attempt": attempt}
+                    record["outcome"] = f"can't start {self.command[0]}: {e}"
+                    raise LaunchError(record["outcome"]) from None
+            record["pid"] = self.process.pid
             try:
-                record["ready_s"] = self._wait_ready(began)
-                self.starts.append(record)
+                record["ready_s"] = self._wait_ready(began, offset)
+                record["outcome"] = "ready"
                 return record
             except LaunchError as e:
-                # The port another process took between our probe and the server's bind: again,
-                # on another (a restart keeps its port when it can, else takes another).
-                if "failed to bind" in str(e) and attempt < BIND_ATTEMPTS:
+                record["exit_code"] = self.stop()  # stopped and reaped, whatever went wrong
+                bind_failed = BIND_FAILED in self.since(offset)
+                record["outcome"] = BIND_FAILED if bind_failed else str(e).splitlines()[0]
+                if bind_failed and attempt < BIND_ATTEMPTS:
                     port = 0
                     continue
-                self.stop()
+                raise
+            except BaseException as e:  # interrupted: the cleanup stops it
+                record["outcome"] = f"interrupted ({type(e).__name__})"
                 raise
         raise AssertionError("unreachable")
 
-    def _wait_ready(self, began: float) -> float:
+    def _wait_ready(self, began: float, offset: int) -> float:
+        """Seconds until /readyz answered 200, every probe within what is left of start_timeout."""
         last = "no answer yet"
-        while time.monotonic() - began < self.start_timeout:
+        while (left := self.start_timeout - (time.monotonic() - began)) > 0:
             code = self.process.poll()
             if code is not None:
                 raise LaunchError(f"the server exited with code {code} before it was ready; "
-                                  f"its log ends:\n{self.tail()}")
-            try:
-                with DIRECT.open(f"{self.base}/readyz", timeout=2) as response:
-                    if response.status == 200:
-                        return round(time.monotonic() - began, 3)
-                    last = f"/readyz {response.status}"
-            except urllib.error.HTTPError as e:
-                last = f"/readyz {e.code}: {e.read(300).decode('utf-8', 'replace')}"
-            except OSError as e:
-                last = f"/readyz: {e}"
-            time.sleep(0.2)
-        raise LaunchError(f"not ready after {self.start_timeout:g} s ({last}); its log ends:\n{self.tail()}")
+                                  f"its log ends:\n{self.tail(offset=offset)}")
+            probe = client.get(f"{self.base}/readyz", timeout_s=min(2.0, left), read_limit=300)
+            if probe["response"] and probe["response"]["status"] == 200:
+                return round(time.monotonic() - began, 3)
+            last = (probe["error"] or f"/readyz {probe['response']['status']}: "
+                    + probe["body"].kept.decode("utf-8", "replace"))
+            time.sleep(min(0.2, max(0.0, self.start_timeout - (time.monotonic() - began))))
+        raise LaunchError(f"not ready after {self.start_timeout:g} s ({last}); "
+                          f"its log ends:\n{self.tail(offset=offset)}")
 
     def restart(self) -> dict:
         self.stop()
@@ -174,9 +184,14 @@ class Server:
                 "removed": bool(self.root) and not self.root.exists(), "kept": keep,
                 "error": stopping or removing}
 
-    def tail(self, lines: int = 20) -> str:
+    def since(self, offset: int = 0) -> str:
+        """The log from `offset` on (an attempt's own, from where it began)."""
         try:
-            text = self.log.read_text(encoding="utf-8", errors="replace")
+            with open(self.log, "rb") as f:
+                f.seek(offset)
+                return f.read().decode("utf-8", errors="replace")
         except OSError:
             return "(no log)"
-        return "\n".join(text.splitlines()[-lines:])
+
+    def tail(self, lines: int = 20, offset: int = 0) -> str:
+        return "\n".join(self.since(offset).splitlines()[-lines:])
