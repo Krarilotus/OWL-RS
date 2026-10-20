@@ -49,10 +49,21 @@ pub async fn repositories(
         unavailable,
     };
     let catalog = state.repositories();
-    let mut entries: Vec<RepositoryEntry> = std::iter::once((DEFAULT_REPOSITORY.to_owned(), None))
-        .chain(catalog.list())
-        .map(|(id, title)| entry(id, title, None))
-        .collect();
+    let default_unavailable = state.default_unavailable().map(|why| match operator {
+        true => why.to_owned(),
+        false => crate::state::UNAVAILABLE_UNTIL_RESTART.to_owned(),
+    });
+    let mut entries: Vec<RepositoryEntry> = vec![entry(
+        DEFAULT_REPOSITORY.to_owned(),
+        None,
+        default_unavailable,
+    )];
+    entries.extend(
+        catalog
+            .list()
+            .into_iter()
+            .map(|(id, title)| entry(id, title, None)),
+    );
     entries.extend(catalog.unavailable_list().into_iter().map(|(id, why)| {
         let why = match operator {
             true => why,
