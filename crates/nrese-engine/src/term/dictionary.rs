@@ -1974,6 +1974,39 @@ mod tests {
         assert_eq!(dictionary.text.read().covered(), dictionary.len());
     }
 
+    /// A worker of the global pool that builds an index under the entries' lock takes on
+    /// no other job of its pool while it waits for the build's parts: one that wants the
+    /// lock exclusively would never get it (one worker, so the job waits in its own queue;
+    /// the guard fails after 30 s). Waiting in the parts' pool's `install` it would run it.
+    #[test]
+    fn a_build_under_the_lock_takes_on_no_other_job() {
+        let dictionary = std::sync::Arc::new(Dictionary::default());
+        for i in 0..3 * super::super::text::SERIAL_DOCUMENTS {
+            dictionary.intern(
+                NamedNodeRef::new_unchecked(&format!("http://example.com/Thing{i}")).into(),
+            );
+        }
+        let (done, finished) = std::sync::mpsc::channel();
+        let building = std::sync::Arc::clone(&dictionary);
+        std::thread::spawn(move || {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap();
+            pool.install(|| {
+                rayon::scope(|scope| {
+                    scope.spawn(|_| building.take_search_locks());
+                    building.cover_text(true);
+                })
+            });
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the build waited without taking on the job that wants its lock");
+        assert_eq!(dictionary.iri_text.read().covered(), dictionary.len());
+    }
+
     /// The full-text indexes' builds run their parallel parts without the dictionary's
     /// lock or theirs: a job one of the parts' threads takes on meanwhile may intern, or
     /// extend an index, behind a writer that would wait for the build. Here each part
