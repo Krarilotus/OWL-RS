@@ -2,7 +2,8 @@
 //! that its format has no room for, as `key=value` lines (a WAL segment's sync policy).
 //! Written atomically (a temporary file, published: [`super::publish`]) before the file
 //! they describe; engines that don't know them ignore them, so they change no format.
-//! A missing or unreadable sidecar reads as no facts: its readers fall back accordingly.
+//! A missing sidecar reads as no facts, and its readers fall back accordingly; one that is
+//! there but can't be read (or names what this engine doesn't know) is an error.
 
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -53,13 +54,19 @@ fn write_text(file: &Path, text: &str) -> EngineResult<()> {
     Ok(())
 }
 
-/// The value of `key` in the sidecar of `file`, if there is one.
-pub(crate) fn read(file: &Path, key: &str) -> Option<String> {
-    let text = fs::read_to_string(path_of(file)).ok()?;
-    text.lines().find_map(|line| {
+/// The value of `key` in the sidecar of `file`: `None` if there is no sidecar (or no such
+/// key). A sidecar that is there but can't be read is an error, never taken for a missing
+/// one.
+pub(crate) fn read(file: &Path, key: &str) -> std::io::Result<Option<String>> {
+    let text = match fs::read_to_string(path_of(file)) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(text.lines().find_map(|line| {
         let (name, value) = line.split_once('=')?;
         (name == key).then(|| value.to_owned())
-    })
+    }))
 }
 
 /// Removes the sidecar of `file`, if any.
