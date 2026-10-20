@@ -115,6 +115,24 @@ class Watch(unittest.TestCase):
                 self.assertEqual(watch.watch(Path(tmp), 12345, "token"), 1)
 
     @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
+    def test_no_suspension_follows_a_journal_whose_directory_couldnt_be_synced(self):
+        """Sol, 20 Oct 2026: a failed directory sync of a new journal was swallowed and the process
+        stopped all the same: a power loss could lose the only record of it."""
+        import stat
+        owner, mine = watch.Owner({"FLEET_JOB": "job-a"}), (lambda pid: {"FLEET_JOB": "job-a"})
+        real = os.fsync
+
+        def failing(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError("injected: directory sync failed")
+            return real(fd)
+        with tempfile.TemporaryDirectory() as tmp:
+            sent = []
+            with pidfds(sent), patch.object(watch.os, "fsync", failing), patch.object(watch, "started", lambda pid: "777"):
+                self.assertFalse(watch.suspend(31, Path(tmp) / "frozen", "boot-1", set(), owner, environ_of=mine))
+            self.assertEqual(sent, [])
+
+    @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
     def test_an_unknown_boot_proves_nothing_gone_and_suspends_nothing(self):
         """Sol, 20 Oct 2026: an unreadable boot id became "?", unequal to the recorded boot, so the
         record of a process still stopped was dropped without looking at it."""
