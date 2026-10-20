@@ -44,6 +44,33 @@ pub struct Snapshot {
     /// What the canonical views versions keep are charged to, beside the readers' own
     /// budgets ([`crate::Engine::set_canonical_view_budget`]).
     views: Arc<nrese_exec::Budget>,
+    /// The reader's budget, where it brought one ([`Self::reading_within`]).
+    reads: Option<Arc<Reads>>,
+}
+
+/// A reader's budget for what its reads hold while they run, and the first charge it
+/// refused ([`Snapshot::reading_within`]).
+#[derive(Debug)]
+pub(crate) struct Reads {
+    budget: Arc<nrese_exec::Budget>,
+    refused: std::sync::OnceLock<nrese_exec::BudgetExceeded>,
+}
+
+impl Reads {
+    /// Charges `bytes`; false, the refusal kept, where the budget has no room.
+    pub(crate) fn charge(&self, bytes: usize) -> bool {
+        match self.budget.charge(bytes) {
+            Ok(()) => true,
+            Err(refused) => {
+                let _ = self.refused.set(refused);
+                false
+            }
+        }
+    }
+
+    pub(crate) fn release(&self, bytes: usize) {
+        self.budget.release(bytes);
+    }
 }
 
 /// The canonical view of `version` under `same_as` ([`Snapshot::canonical_data`]): made on
@@ -151,6 +178,7 @@ impl Snapshot {
             canonical: false,
             canonical_data: None,
             views,
+            reads: None,
         }
     }
 
@@ -167,6 +195,26 @@ impl Snapshot {
             canonical_data: None,
             ..self.clone()
         }
+    }
+
+    /// This snapshot charging what its reads hold while they run to `budget` (a query's): the
+    /// copies an equality expansion holds until they are in order ([`Expand`]). A read the
+    /// budget has no room for stops, and the refusal is kept: [`Self::read_refused`] tells the
+    /// reader, which must not use what it read then. Without one, reads charge nothing.
+    pub fn reading_within(&self, budget: Arc<nrese_exec::Budget>) -> Snapshot {
+        Snapshot {
+            reads: Some(Arc::new(Reads {
+                budget,
+                refused: std::sync::OnceLock::new(),
+            })),
+            ..self.clone()
+        }
+    }
+
+    /// The first charge a read refused since [`Self::reading_within`]: what was read since
+    /// may be incomplete.
+    pub fn read_refused(&self) -> Option<nrese_exec::BudgetExceeded> {
+        self.reads.as_ref()?.refused.get().copied()
     }
 
     /// This snapshot reading the statements as stored: no equality expansion.
@@ -375,6 +423,7 @@ impl Snapshot {
         Snapshot {
             canonical_data,
             views: Arc::clone(&self.views),
+            reads: self.reads.clone(),
             version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
@@ -403,6 +452,7 @@ impl Snapshot {
         Snapshot {
             canonical_data,
             views: Arc::clone(&self.views),
+            reads: self.reads.clone(),
             version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
@@ -432,6 +482,7 @@ impl Snapshot {
         Some(Snapshot {
             canonical_data,
             views: Arc::clone(&self.views),
+            reads: self.reads.clone(),
             version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
@@ -533,7 +584,8 @@ impl Snapshot {
             named && !renamed,
             model,
             data,
-        );
+        )
+        .charging(self.reads.clone());
         let named = named_plan
             .into_iter()
             .flat_map(move |plan| data.asserted.scan_plan(&plan))
@@ -646,6 +698,7 @@ impl Snapshot {
         Snapshot {
             canonical_data,
             views: Arc::clone(&self.views),
+            reads: self.reads.clone(),
             version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::clone(&self.statistics),
