@@ -456,7 +456,7 @@ impl Wal {
                 // replayed from the newest one is on disk too: after a process crash it may
                 // still be in the page cache alone (an OsBuffered write, or one not yet synced).
                 if let Some((_, path)) = newest {
-                    OpenOptions::new().write(true).open(&path)?.sync_all()?;
+                    super::publish::sync_file(&path)?;
                 }
                 let file = create_segment(dir, next_revision, magic, sync)?;
                 (next_revision, file, SEGMENT_MAGIC.len() as u64)
@@ -647,6 +647,50 @@ fn create_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After a process crash the replayed tail may be in the page cache alone: when opening
+    /// starts a new segment (here: another sync policy), the newest old one is synced before
+    /// the new one is published, so before any commit is acknowledged in it (crash r1 F5).
+    #[test]
+    fn the_replayed_tail_is_synced_before_a_new_segment() {
+        use super::super::publish::record::{self, Op};
+        use crate::{DurabilityConfig, Engine, EngineConfig};
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        let dir = tempfile::tempdir().unwrap();
+        let under = |sync| EngineConfig {
+            background_maintenance: false,
+            durability: DurabilityConfig {
+                sync,
+                ..DurabilityConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        {
+            let engine = Engine::open(dir.path(), under(SyncPolicy::OsBuffered)).unwrap();
+            let iri = |s: &str| NamedNode::new_unchecked(s);
+            let mut tx = engine.transaction();
+            let quad = Quad::new(
+                iri("http://s"),
+                iri("http://p"),
+                iri("http://o"),
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+            tx.commit().unwrap();
+        }
+        let old = segment_path(&wal_dir(dir.path()), 1);
+        let new = segment_path(&wal_dir(dir.path()), 2);
+        record::take();
+        let engine = Engine::open(dir.path(), under(SyncPolicy::EveryCommit)).unwrap();
+        let ops = record::take();
+        let synced = ops.iter().position(|op| *op == Op::Sync(old.clone()));
+        let published = ops.iter().position(|op| *op == Op::Publish(new.clone()));
+        assert!(
+            synced.is_some() && synced < published,
+            "the old segment must be synced before the new one is published: {ops:?}"
+        );
+        assert_eq!(engine.stats().revision, 1);
+    }
 
     /// The evidence search is linear in a damaged tail, never quadratic: for a large tail of
     /// garbage and for one crafted so that every offset passes the cheap checks, it looks at

@@ -32,6 +32,8 @@ impl Failed {
 
 /// Flushes `from` and moves it to `to` (replacing it), durably once this returns `Ok`.
 pub(crate) fn publish(from: &Path, to: &Path) -> Result<(), Failed> {
+    #[cfg(test)]
+    record::push(record::Op::Publish(to.to_path_buf()));
     OpenOptions::new()
         .write(true)
         .open(from)
@@ -44,6 +46,40 @@ pub(crate) fn publish(from: &Path, to: &Path) -> Result<(), Failed> {
         });
     }
     sync_parent(to).map_err(Failed::Unknown)
+}
+
+/// Flushes `path`'s data to the disk (through a writable handle: Windows flushes no other).
+pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    record::push(record::Op::Sync(path.to_path_buf()));
+    OpenOptions::new().write(true).open(path)?.sync_all()
+}
+
+/// The order of this thread's syncs and publications, for tests: what reaches the disk
+/// before what.
+#[cfg(test)]
+pub(crate) mod record {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum Op {
+        Sync(PathBuf),
+        Publish(PathBuf),
+    }
+
+    thread_local! {
+        static OPS: RefCell<Vec<Op>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn push(op: Op) {
+        OPS.with_borrow_mut(|ops| ops.push(op));
+    }
+
+    /// This thread's operations since the last call.
+    pub(crate) fn take() -> Vec<Op> {
+        OPS.take()
+    }
 }
 
 /// [`publish`] where either failure is just an error.
