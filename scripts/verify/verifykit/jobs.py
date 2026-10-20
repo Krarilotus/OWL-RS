@@ -61,7 +61,7 @@ def jobs(repo: Path, rev: str, harness: str, scenarios: list[str], settings: lis
         raise SystemExit(f"not committed at {harness_sha[:12]} (a fleet job sees git only): {', '.join(missing)}")
     stamp = stamp or time.strftime("%m%d%H%M")
     build_id, run_id = f"verify-build-{sha[:8]}-{stamp}", f"verify-run-{sha[:8]}-{stamp}"
-    script = (HERE / "build-on-host.sh").read_text(encoding="utf-8")
+    script = (HERE / "build-on-host.sh").read_text(encoding="utf-8").replace("\r\n", "\n")  # bash -c, on Linux
     source = str(repo.resolve().as_posix())
     build = {
         "id": build_id, "group": "verify", "kind": "owlrs.any", "priority": priority,

@@ -23,6 +23,8 @@ from pathlib import Path
 # Durable, as deployments run (repositories live on disk; a restart reopens them).
 DEFAULTS = {"store.mode": "on-disk"}
 BIND_ATTEMPTS = 3
+# Straight to 127.0.0.1: no HTTP_PROXY from the environment in between.
+DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 class LaunchError(Exception):
@@ -92,7 +94,8 @@ class Server:
                 try:
                     self.process = subprocess.Popen(
                         self.argv(), cwd=self.root, env=self.env, stdin=subprocess.DEVNULL, stdout=log,
-                        stderr=subprocess.STDOUT, preexec_fn=_die_with_parent if sys.platform.startswith("linux") else None)
+                        stderr=subprocess.STDOUT,
+                        preexec_fn=_die_with_parent if sys.platform.startswith("linux") else None)
                 except OSError as e:
                     raise LaunchError(f"can't start {self.command[0]}: {e}") from None
             record = {"argv": self.argv(), "port": self.port, "pid": self.process.pid, "attempt": attempt}
@@ -115,9 +118,10 @@ class Server:
         while time.monotonic() - began < self.start_timeout:
             code = self.process.poll()
             if code is not None:
-                raise LaunchError(f"the server exited with code {code} before it was ready; its log ends:\n{self.tail()}")
+                raise LaunchError(f"the server exited with code {code} before it was ready; "
+                                  f"its log ends:\n{self.tail()}")
             try:
-                with urllib.request.urlopen(f"{self.base}/readyz", timeout=2) as response:
+                with DIRECT.open(f"{self.base}/readyz", timeout=2) as response:
                     if response.status == 200:
                         return round(time.monotonic() - began, 3)
                     last = f"/readyz {response.status}"
@@ -164,7 +168,8 @@ class Server:
                 except OSError as e:
                     removing = f"removing {self.root}: {e}"
                     time.sleep(0.5)
-        return {"exit_code": exit_code, "stopped": stopping is None and (self.process is None or self.process.poll() is not None),
+        stopped = stopping is None and (self.process is None or self.process.poll() is not None)
+        return {"exit_code": exit_code, "stopped": stopped,
                 "directory": str(self.root) if self.root else None,
                 "removed": bool(self.root) and not self.root.exists(), "kept": keep,
                 "error": stopping or removing}
