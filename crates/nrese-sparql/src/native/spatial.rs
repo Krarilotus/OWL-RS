@@ -1767,7 +1767,7 @@ mod tests {
             ..EngineConfig::default()
         };
         nrese_engine::set_vocabulary_encoding(nrese_engine::VocabularyEncoding::Fsst);
-        let engine = Engine::open(dir.path(), config).unwrap();
+        let engine = Engine::open(dir.path(), config.clone()).unwrap();
         insert(&engine, graphs, literal);
         engine.checkpoint().unwrap();
         drop(engine);

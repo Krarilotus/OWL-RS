@@ -504,7 +504,7 @@ fn both_stacks_survive_checkpoints_and_reopening() {
     let mut rng = Rng(fuzz(99));
     let mut committed = Model::default();
     for round in 0..6 {
-        let engine = Engine::open(dir.path(), config).expect("open");
+        let engine = Engine::open(dir.path(), config.clone()).expect("open");
         assert_eq!(
             intern_terms(&engine),
             (0..TERM_COUNT).map(id).collect::<Vec<_>>()
