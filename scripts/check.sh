@@ -186,7 +186,7 @@ side_steps() {
     step locks bash scripts/check-locks.sh
   fi
   if printf '%s\n' "${files[@]}" | grep -qE '^benches/suite/'; then
-    step "suite contracts" python -m unittest discover -s benches/suite/tests
+    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
   fi
   # Docker names only from the job namespace (scripts/check-names.sh).
   if printf '%s\n' "${files[@]}" | grep -qE '^(benches|scripts)/'; then
@@ -326,7 +326,7 @@ case "$mode" in
     step "doc tests" "$guarded" test --locked --workspace --doc
     harness
     step locks bash scripts/check-locks.sh
-    step "suite contracts" python -m unittest discover -s benches/suite/tests
+    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
     step names bash scripts/check-names.sh
     if cargo deny --version > /dev/null 2>&1; then
       step deny cargo deny --all-features check
