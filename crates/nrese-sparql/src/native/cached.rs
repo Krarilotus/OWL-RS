@@ -314,7 +314,9 @@ impl Context<'_> {
 /// The key of `query`'s whole answer written in `format` (the media type with its
 /// parameters) on `snapshot`, for a caller whose answer depends on `context` too: its
 /// context, the format, the caller's context, the QL rewriting, the query form with a CONSTRUCT's
-/// template, and its pattern as parsed (the answer is the query's, however it is planned).
+/// template, and its pattern as parsed (the answer is the query's, however it is planned);
+/// for a SELECT, the names its answer shows, in order: the pattern numbers its variables
+/// (parts of renamed queries share answers), but these bytes hold the names in their header.
 /// `None` if the query isn't cached (no cache, a volatile query, pre-bound variables).
 pub(crate) fn output_key(
     snapshot: &nrese_engine::Snapshot,
@@ -372,6 +374,26 @@ pub(crate) fn output_key(
         }
     };
     encoder.pattern(pattern).ok()?;
+    if let Query::Select { pattern, .. } = query {
+        // The projection under the solution modifiers; else every variable, in the
+        // pattern's numbering.
+        let mut top = pattern;
+        let names = loop {
+            match top {
+                GraphPattern::Slice { inner, .. }
+                | GraphPattern::Distinct { inner }
+                | GraphPattern::Reduced { inner }
+                | GraphPattern::OrderBy { inner, .. } => top = inner,
+                GraphPattern::Project { variables, .. } => break variables.clone(),
+                _ => break encoder.vars.clone(),
+            }
+        };
+        encoder.tag(b'N');
+        encoder.number(names.len() as u64);
+        for name in &names {
+            encoder.text(name.as_str());
+        }
+    }
     Some(Key {
         snapshot: scope.snapshot,
         part: encoder.bytes.into(),
