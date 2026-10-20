@@ -148,6 +148,17 @@ systems = []
                 self.assertIn(why, text)
 
     def test_the_jobs_time_every_block_on_one_host_with_the_a_a_arm(self):
+        self.path.write_text(FAMILY.replace("blocks = 6", "blocks = 8"), encoding="utf-8")
+        eight = abba.load_family(self.path)  # Sol r1: whole squares of A, A' and B
+        self.assertEqual(sum("block" in s for s in abba.jobs(eight, B, ROOT.as_posix(), "office-pc")["abba-t-bbbbbbbb"]["steps"]), 9)
+        # One whole square is the least a family may ask (a long, flat case needs no more), fewer
+        # is refused: N11 found 6 hard-coded.
+        self.path.write_text(FAMILY.replace("blocks = 6", "blocks = 3"), encoding="utf-8")
+        self.assertEqual(abba.load_family(self.path)["blocks"], 3)
+        self.path.write_text(FAMILY.replace("blocks = 6", "blocks = 2"), encoding="utf-8")
+        with self.assertRaises(abba.Invalid):
+            abba.load_family(self.path)
+        self.path.write_text(FAMILY, encoding="utf-8")
         found = abba.jobs(self.family, B, ROOT.as_posix(), "office-pc")
         timed = found["abba-t-bbbbbbbb"]
         self.assertEqual((timed["requires"]["hosts"], timed["class"], timed["steps"][0][-2:]),

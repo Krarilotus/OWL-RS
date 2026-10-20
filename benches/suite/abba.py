@@ -15,7 +15,7 @@ A family (benches/abba/NAME.toml):
 
     name = "lcp"                  # the jobs' names: abba-lcp-...
     host = "phuoc-yu"             # one exclusive timing host for every block (--host overrides)
-    blocks = 6                    # a round's blocks, at least 6
+    blocks = 3                    # a round's blocks: at least 3 (one whole square), in whole squares
     [sides]
     a = "REV"                     # the base
     b = "REV"                     # the change; A' is A's build again, a copy of its own
@@ -57,7 +57,7 @@ sys.path.insert(0, str(ROOT / "benches" / "fast"))
 spec.loader.exec_module(rg)
 
 SIDES = ("a", "a2", "b")  # A, A' (A's build, another copy), B: the palindrome's order
-MIN_BLOCKS = 6
+MIN_BLOCKS = 3  # one whole Latin square of A, A' and B; a family may ask for more (owner, 20 Oct 2026)
 NO_LOSS, LOSS_SHOWN, INVALID, NO_VERDICT, CONFIRMED = 0, 1, 2, 3, 4
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 REV = re.compile(r"^[0-9a-f]{7,40}$")
@@ -89,6 +89,10 @@ def load_family(path: str | Path) -> dict:
         problems.append(f"name {name!r}: lower-case letters, digits and -")
     if not isinstance(blocks, int) or blocks < MIN_BLOCKS:
         problems.append(f"blocks {blocks!r}: at least {MIN_BLOCKS}")
+    else:
+        # Whole Latin squares of the three sides (release_gate.whole_squares(); Sol r1: 8 blocks
+        # left A, A' or B opening one block fewer).
+        blocks = rg.whole_squares(blocks, len(SIDES))
     if set(sides) != {"a", "b"} or not all(isinstance(v, str) and REV.match(v) for v in sides.values()):
         problems.append("sides: exactly a and b, each a commit id (7 to 40 hex digits)")
     entries = data.get("case", [])
@@ -392,7 +396,7 @@ def main() -> int:
         return INVALID
     if args.command == "check":
         print(f"{family['name']}: {len(family['hypotheses'])} hypotheses, {len(family['cases'])} cases, "
-              f"{family['blocks']} blocks on {family['host']}")
+              f"{family['blocks']} blocks (whole squares of A, A' and B) on {family['host']}")
         if os.environ.get("FLEET_OUT"):  # in a job: the manifest its report holds the results to
             harness = os.environ.get("ABBA_HARNESS") or git("rev-parse", "HEAD")
             manifest = manifest_of(family, harness, int(os.environ.get("ABBA_ROUND", "1")),

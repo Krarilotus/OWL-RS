@@ -647,7 +647,7 @@ plan-blocks)
   harness=$(git rev-parse "$2") || exit 2
   tree=$(worktree "$harness") || exit 2
   (cd "$tree" && py benches/fast/release_gate.py blocks --plan "$PLAN" --measure "$MEASURE" --out "$GATE" \
-    --square "${GATE_SQUARE:-1}") \
+    --square "${GATE_SQUARE:?plan-blocks needs GATE_SQUARE, the timed sides (release_gate.py jobs sets it)}") \
     | tee -a "$OUT/gate.log" || exit 2
   cp "$GATE"/plan-block-*.json "$OUT/"
   ;;
