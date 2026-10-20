@@ -19,7 +19,7 @@ param(
     [string]$Registry = ""
 )
 
-Add-Type -TypeDefinition @"
+$source = @"
 using System;
 using System.Runtime.InteropServices;
 
@@ -109,6 +109,18 @@ public static class NreseJob {
     }
 }
 "@
+# Compiled once into a library cached by its source's hash (compiling took seconds at every build).
+$hash = -join ([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($source)) | Select-Object -First 6 | ForEach-Object { $_.ToString('x2') })
+$cache = Join-Path ([IO.Path]::GetTempPath()) 'nrese-memory-cap'
+$dll = Join-Path $cache "NreseJob-$hash.dll"
+if (-not (Test-Path $dll)) {
+    New-Item -ItemType Directory -Force $cache | Out-Null
+    $part = "$dll.$PID.tmp"
+    Add-Type -TypeDefinition $source -OutputAssembly $part -OutputType Library
+    Move-Item -Path $part -Destination $dll -ErrorAction SilentlyContinue
+    Remove-Item -Path $part -ErrorAction SilentlyContinue
+}
+Add-Type -Path $dll
 
 $bytes = [uint64]($LimitGB * 1GB)
 $created = (Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId").CreationDate
