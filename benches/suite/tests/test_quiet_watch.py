@@ -5,7 +5,9 @@ gets stopped while it runs.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +28,27 @@ TABLE = {10: (1, ME, 0, "python3"), 20: (10, ME, 0, "fast.py"), 21: (20, ME, 0, 
          34: (1, ME, 0, "load"), 40: (1, ME, 0, "bash"), 50: (1, OTHER, 0, "firefox"), 60: (1, ROOT, 0, "dockerd")}
 ENVIRON = {31: {"FLEET_JOB": "job-a"}, 32: {"FLEET_JOB": "job-b"}, 34: {}, 40: {}, 50: {}, 60: {}}
 CGROUP = {34: "0::/user.slice/user-1000.slice/user@1000.service/fleet.slice/fleet-job-a.slice/step.scope\n"}
+
+
+@contextlib.contextmanager
+def pidfds(sent: list, fail=None):
+    """os.pidfd_open and signal.pidfd_send_signal stood in for: a real descriptor (of os.devnull)
+    per opened pid, each signal but 0 recorded as (pid, signal); fail(pid, signal) may raise."""
+    fds = {}
+
+    def opened(pid):
+        fd = os.open(os.devnull, os.O_RDONLY)
+        fds[fd] = pid
+        return fd
+
+    def send(fd, sig):
+        if fail:
+            fail(fds[fd], sig)
+        if sig:
+            sent.append((fds[fd], sig))
+    with patch.object(watch.os, "pidfd_open", opened, create=True), \
+            patch.object(watch.signal, "pidfd_send_signal", send, create=True):
+        yield
 
 
 def later(busy: dict[int, int]) -> dict:
@@ -63,7 +86,6 @@ class Watch(unittest.TestCase):
     def test_a_resume_settles_only_what_it_continued_or_proved_gone_and_the_watch_fails_on_the_rest(self):
         """Sol, 20 Oct 2026: an EPERM on SIGCONT, or a stat that couldn't be read, counted as
         settled: the record of a process left stopped was deleted, and the watch exited 0."""
-        from types import SimpleNamespace
         with tempfile.TemporaryDirectory() as tmp:
             frozen = Path(tmp) / "frozen"
             frozen.write_text("pid 31 777 boot-1\npid 41 555 boot-1\npid 51 666 boot-1\npid 61 888 boot-0\n")
@@ -73,10 +95,11 @@ class Watch(unittest.TestCase):
                     raise PermissionError("injected: unreadable stat")
                 return {31: "777", 41: None}.get(pid)
 
-            def kill(pid, sig):
-                raise PermissionError("injected EPERM")
+            def eperm(pid, sig):
+                if sig:
+                    raise PermissionError("injected EPERM")
             with patch.object(watch, "started", started), patch.object(watch, "boot_id", lambda: "boot-1"), \
-                    patch.object(watch.os, "kill", kill):
+                    pidfds([], fail=eperm):
                 left = watch.resume(Path(tmp))
             # 31 couldn't be continued, 51 couldn't be inspected: kept; 41 is gone, 61 of another boot.
             self.assertEqual(left, ["pid 31 777 boot-1", "pid 51 666 boot-1"])
@@ -87,17 +110,56 @@ class Watch(unittest.TestCase):
                 self.assertEqual(watch.watch(Path(tmp), 12345, "token"), 1)
 
     @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
+    def test_signals_go_through_a_handle_proven_to_hold_the_recorded_process_never_by_bare_pid(self):
+        """Sol, 20 Oct 2026: the start time was read, then kill(pid) sent: a pid reused between
+        the two got SIGSTOP or SIGCONT. Every signal now goes through a pidfd whose process was
+        alive after its identity and ownership were read; without pidfds, nothing is signalled."""
+        owner = watch.Owner({"FLEET_JOB": "job-a"})
+        mine = lambda pid: {"FLEET_JOB": "job-a"}  # noqa: E731
+        with tempfile.TemporaryDirectory() as tmp:
+            frozen = Path(tmp) / "frozen"
+            for dies_after_read, expect_stop in ((False, True), (True, False)):
+                sent, bare = [], []
+
+                def exits(pid, sig, dies=dies_after_read):
+                    if dies and sig == 0:
+                        raise ProcessLookupError  # the handle's process exited after its stat was read
+                with pidfds(sent, fail=exits), patch.object(watch.os, "kill", lambda *a: bare.append(a)), \
+                        patch.object(watch, "boot_id", lambda: "boot-1"), \
+                        patch.object(watch, "started", lambda pid: "777"):
+                    stopped = watch.suspend(31, frozen, "boot-1", set(), owner, environ_of=mine)
+                    frozen.write_text("pid 31 777 boot-1\n")
+                    left = watch.resume(Path(tmp))
+                self.assertEqual((stopped, [s for _, s in sent], bare, left),
+                                 (expect_stop, [watch.signal.SIGSTOP, watch.signal.SIGCONT] if expect_stop else [],
+                                  [], []))
+            # No pidfds here: nothing is stopped, and a recorded process isn't continued blindly.
+            frozen.write_text("pid 31 777 boot-1\n")
+
+            def none(pid):
+                raise AttributeError("no pidfd_open")
+            with patch.object(watch.os, "pidfd_open", none, create=True), patch.object(watch, "started", lambda pid: "777"), \
+                    patch.object(watch, "boot_id", lambda: "boot-1"), patch.object(watch.os, "kill", lambda *a: bare.append(a)):
+                self.assertFalse(watch.suspend(31, frozen, "boot-1", set(), owner, environ_of=mine))
+                self.assertEqual(watch.resume(Path(tmp)), ["pid 31 777 boot-1"])
+            self.assertEqual(bare, [])
+
+    @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
     def test_the_journal_comes_first_and_a_resume_continues_only_the_process_it_recorded(self):
         """COT-14 (20 Oct 2026): the suspension came before its record, and the record was a bare
         pid: a watcher killed between them stranded the process, and a resume could continue a
         reused pid. A line that can't be settled stays for the next holder."""
         from types import SimpleNamespace
+        owner, mine = watch.Owner({"FLEET_JOB": "job-a"}), (lambda pid: {"FLEET_JOB": "job-a"})
         with tempfile.TemporaryDirectory() as tmp:
             frozen = Path(tmp) / "frozen"
             seen = []
-            with patch.object(watch, "started", lambda pid: "777"), \
-                    patch.object(watch.os, "kill", lambda pid, sig: seen.append((pid, sig, frozen.read_text()))):
-                self.assertTrue(watch.suspend(31, frozen, "boot-1", set()))
+
+            def journalled(pid, sig):  # what the journal holds when the signal is sent
+                if sig:
+                    seen.append((pid, sig, frozen.read_text()))
+            with patch.object(watch, "started", lambda pid: "777"), pidfds([], fail=journalled):
+                self.assertTrue(watch.suspend(31, frozen, "boot-1", set(), owner, environ_of=mine))
             self.assertEqual(seen, [(31, watch.signal.SIGSTOP, "pid 31 777 boot-1\n")])
             # 31 is still the process recorded; 41's pid now names another (other start time);
             # 51 has no start time (an older watcher's line); container def won't unpause.
@@ -108,8 +170,7 @@ class Watch(unittest.TestCase):
                 unpaused.append(args[-1])
                 return SimpleNamespace(returncode=0 if args[-1] == "abc" else 1, stderr="cannot unpause")
             with patch.object(watch, "started", lambda pid: {31: "777", 41: "999"}.get(pid)), \
-                    patch.object(watch, "boot_id", lambda: "boot-1"), \
-                    patch.object(watch.os, "kill", lambda pid, sig: sent.append((pid, sig))), \
+                    patch.object(watch, "boot_id", lambda: "boot-1"), pidfds(sent), \
                     patch.object(watch.subprocess, "run", docker):
                 left = watch.resume(Path(tmp))
             self.assertEqual(sent, [(31, watch.signal.SIGCONT)])
