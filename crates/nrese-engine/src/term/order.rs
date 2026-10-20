@@ -16,6 +16,7 @@
 
 use std::borrow::Cow;
 
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use rayon::prelude::*;
@@ -71,14 +72,32 @@ pub(crate) fn sorted<'a, T>(
 where
     T: Copy + Ord + Send + Into<u64> + TryFrom<u64>,
 {
-    sorted_counted(range, key).0
+    sorted_reading(range, key, &Words::default())
 }
 
-/// [`sorted`], and the words of the keys its refinement read ([`refine`]'s bound).
-fn sorted_counted<'a, T>(
+/// The words of keys the refinement reads, counted under test only: the guard of
+/// [`refine`]'s bound. Product builds have nothing here and count nothing ([`count`]).
+#[cfg(test)]
+type Words = AtomicU64;
+#[cfg(not(test))]
+type Words = ();
+
+/// Adds `$n` words to the `Words` `$read`: under test; compiled out of product builds.
+macro_rules! count {
+    ($read:expr, $n:expr) => {
+        #[cfg(test)]
+        $read.fetch_add($n as u64, Relaxed);
+        #[cfg(not(test))]
+        let _: &Words = $read;
+    };
+}
+
+/// [`sorted`], the words of keys it reads added to `read`.
+fn sorted_reading<'a, T>(
     range: std::ops::Range<u64>,
     key: &(dyn Fn(u64) -> Key<'a> + Sync),
-) -> (Vec<T>, u64)
+    read: &Words,
+) -> Vec<T>
 where
     T: Copy + Ord + Send + Into<u64> + TryFrom<u64>,
 {
@@ -95,7 +114,7 @@ where
             .collect();
         let text = |index: T| text_in(key(index.into()));
         entries.par_sort_unstable_by(|&a, &b| text(a).cmp(&text(b)).then(a.cmp(&b)));
-        return (entries, 0);
+        return entries;
     }
     let mut entries: Vec<Entry> = range
         .into_par_iter()
@@ -106,17 +125,16 @@ where
             Some(Entry::at(text, 0, index as u32, skip))
         })
         .collect();
-    let read = AtomicU64::new(entries.len() as u64);
-    refine(&mut entries, 0, key, &read);
-    let order = entries
+    count!(read, entries.len());
+    refine(&mut entries, 0, key, read);
+    entries
         .into_iter()
         .map(|entry| {
             T::try_from(u64::from(entry.index))
                 .ok()
                 .expect("an index of the order's width")
         })
-        .collect();
-    (order, read.into_inner())
+        .collect()
 }
 
 /// An entry of [`sorted`] at some depth of its text.
@@ -181,7 +199,7 @@ fn refine<'a>(
     mut run: &mut [Entry],
     mut depth: usize,
     key: &(dyn Fn(u64) -> Key<'a> + Sync),
-    read: &AtomicU64,
+    read: &Words,
 ) {
     // Texts that end within this word come before those that go on (zero padding sorts
     // first); among equal words that both end, the shorter text first, then the index.
@@ -256,7 +274,7 @@ fn words_at<'a>(
     run: &mut [Entry],
     depth: usize,
     key: &(dyn Fn(u64) -> Key<'a> + Sync),
-    read: &AtomicU64,
+    read: &Words,
 ) -> bool {
     let at = |entry: &mut Entry| {
         let k = key(u64::from(entry.index));
@@ -265,12 +283,12 @@ fn words_at<'a>(
     let first = |run: &[Entry]| (run[0].word, run[0].more());
     if run.len() > PARALLEL {
         run.par_iter_mut().for_each(at);
-        read.fetch_add(run.len() as u64, Relaxed);
+        count!(read, run.len());
         let (word, more) = first(run);
         more && run.par_iter().all(|e| e.word == word && e.more())
     } else {
         run.iter_mut().for_each(at);
-        read.fetch_add(run.len() as u64, Relaxed);
+        count!(read, run.len());
         let (word, more) = first(run);
         more && run.iter().all(|e| e.word == word && e.more())
     }
@@ -289,7 +307,7 @@ fn common<'a>(
     run: &mut [Entry],
     mut depth: usize,
     key: &(dyn Fn(u64) -> Key<'a> + Sync),
-    read: &AtomicU64,
+    read: &Words,
 ) -> usize {
     for _ in 0..2 {
         depth += 1;
@@ -306,24 +324,20 @@ fn common<'a>(
         let shared = |entry: &Entry| {
             let k = key(u64::from(entry.index));
             let text = k.get(entry.skip() + known..).unwrap_or_default();
-            text.iter()
+            let shared = text
+                .iter()
                 .zip(window_of_theirs)
                 .take_while(|(a, b)| a == b)
-                .count()
+                .count();
+            // The words compared, the differing one included.
+            count!(read, shared / 8 + 1);
+            shared
         };
-        // The least shared, and the words compared (the differing one included).
-        let (least, compared) = match run.len() > PARALLEL {
-            true => run
-                .par_iter()
-                .map(&shared)
-                .map(|n| (n, n / 8 + 1))
-                .reduce(|| (usize::MAX, 0), |a, b| (a.0.min(b.0), a.1 + b.1)),
-            false => run
-                .iter()
-                .map(&shared)
-                .fold((usize::MAX, 0), |a, n| (a.0.min(n), a.1 + n / 8 + 1)),
-        };
-        read.fetch_add(compared as u64, Relaxed);
+        let least = match run.len() > PARALLEL {
+            true => run.par_iter().map(&shared).min(),
+            false => run.iter().map(&shared).min(),
+        }
+        .unwrap_or(0);
         known += least;
         if least < window {
             break;
@@ -495,7 +509,9 @@ mod tests {
             keys.push([&b"S"[..], &b"wwwwwwww".repeat(8 * k + 8), b"xxxxxxxx"].concat());
         }
         let key = |i: u64| Cow::Borrowed(keys[i as usize].as_slice());
-        let (got, read): (Vec<u64>, u64) = sorted_counted(0..keys.len() as u64, &key);
+        let read = AtomicU64::new(0);
+        let got: Vec<u64> = sorted_reading(0..keys.len() as u64, &key, &read);
+        let read = read.into_inner();
         let text = |i: u64| text_of(&keys[i as usize]).unwrap();
         let mut expected: Vec<u64> = (0..keys.len() as u64).collect();
         expected.sort_by(|&a, &b| text(a).cmp(text(b)).then(a.cmp(&b)));
