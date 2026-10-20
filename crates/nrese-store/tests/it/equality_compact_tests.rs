@@ -478,7 +478,7 @@ fn late_expansion_answers_as_early_expansion_and_replication() {
     // Every identity of each class (3 for ?s, 2 for ?o), and one per class.
     assert!(strict_count.contains("\"6\""), "{strict_count}");
     assert!(canonical_count.contains("\"1\""), "{canonical_count}");
-    // A constant keeps its own name.
+    // A constant stands for its class.
     let text = answer(&canonical, "SELECT ?o WHERE { ex:b ex:p ?o }");
     assert!(text.contains("http://example.com/x"), "{text}");
 

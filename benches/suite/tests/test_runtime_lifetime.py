@@ -1,9 +1,10 @@
 """Local scope-contract fixtures: mock systemd, never launch native workloads."""
+import importlib.util
 import json
-import ast
 import os
 from pathlib import Path
 import runpy
+import subprocess
 import sys
 import tempfile
 import types
@@ -12,6 +13,15 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from suitekit import runtime
+
+
+def load_fast():
+    """benches/fast/fast.py as a module of its own, as test_fast_timeouts loads it."""
+    spec = importlib.util.spec_from_file_location(
+        "fast_lifetime_contract", Path(__file__).resolve().parents[2] / "fast" / "fast.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class ScopeLifetime(unittest.TestCase):
@@ -27,7 +37,6 @@ class ScopeLifetime(unittest.TestCase):
         self.assertIn("TimeoutStopSec=30", argv)
         self.assertIn("KillMode=control-group", argv)
         self.assertIn("SendSIGKILL=yes", argv)
-        self.assertGreater(4380 - 4 * 900, 0)  # preflight/validation still need their budget
         self.assertEqual(argv[-1], "--")
 
     def test_worker_binds_to_exact_parent_with_its_own_stop_allowance(self):
@@ -79,27 +88,36 @@ class ScopeLifetime(unittest.TestCase):
                     runpy.run_path(runtime.__file__, run_name="__main__")
                 execute.assert_not_called()
 
-    def test_original_fast_process_forwards_only_explicit_leases_and_keeps_900_seconds(self):
-        source = Path(__file__).resolve().parents[2] / "fast/fast.py"
-        tree = ast.parse(source.read_text())
-        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "process")
-        namespace = {"CASE_TIMEOUT_S": 900}
-        exec("from __future__ import annotations\n" + ast.unparse(function), namespace)
-        with tempfile.TemporaryDirectory() as temporary:
-            completed = types.SimpleNamespace(returncode=0, stdout="", stderr="")
-            import re
-            namespace.update(native_dirs=lambda: {}, FAST_DATA=Path(temporary), os=os, time=__import__("time"),
-                scope_argv=lambda *_: ["scope", "--"], native=lambda command, _: command,
-                end_scope=lambda *_: None, SCOPE_PEAK=re.compile("never-match"), sys=sys, ENV={},
-                subprocess=types.SimpleNamespace(run=lambda *a, **kw: completed,
-                    TimeoutExpired=TimeoutError, CompletedProcess=types.SimpleNamespace))
-            observed = []
-            namespace["subprocess"].run = lambda *a, **kw: observed.append(kw) or completed
+    def test_fast_process_forwards_only_explicit_leases_and_its_case_limit(self):
+        """fast.py's own `process`, its boundaries (scope, paths, the run) replaced. The limit's
+        value is test_fast_timeouts' (default, declared, unlimited); here, that it reaches the run."""
+        fast = load_fast()
+        observed, argv = [], []
+        completed = types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        def run(command, **kwargs):
+            argv.append(command)
+            observed.append(kwargs)
+            return completed
+
+        with tempfile.TemporaryDirectory() as temporary, \
+                patch.multiple(fast, native_dirs=lambda: {}, FAST_DATA=Path(temporary),
+                               scope_argv=lambda *_: ["scope", "--"], native=lambda command, _: command,
+                               end_scope=lambda *_: None, pinned_cpus=lambda: None,
+                               AnonKernelSampler=lambda where: types.SimpleNamespace(start=lambda: None,
+                                                                                     stop=lambda: None),
+                               subprocess=types.SimpleNamespace(**{**vars(subprocess), "run": run})):
             for descriptors in ("", "9 14"):
                 with patch.dict(os.environ, {"SUITE_LEASE_FDS": descriptors}):
-                    self.assertEqual(namespace["process"]("case", 6, ["original-command"])[0], 0)
+                    self.assertEqual(fast.process("case", 6, ["original-command"])[0], 0)
                 self.assertEqual(observed[-1]["pass_fds"], tuple(map(int, descriptors.split())))
-                self.assertEqual(observed[-1]["timeout"], 900)
+                self.assertEqual(observed[-1]["timeout"], fast.CASE_TIMEOUT_S)
+                # Every process an environment pad of its own size (its initial stack moves).
+                self.assertLess(len(observed[-1]["env"]["NRESE_LAYOUT_PAD"]), 4096)
+            # Pinned (hosts.toml `cpus`): the command, inside its scope, on those CPUs alone.
+            with patch.object(fast, "pinned_cpus", lambda: "8-15,24-31"):
+                fast.process("case", 6, ["original-command"])
+            self.assertEqual(argv[-1][:5], ["scope", "--", "taskset", "-c", "8-15,24-31"])
 
     def test_populated_owned_cgroup_prevents_success(self):
         with tempfile.TemporaryDirectory() as temporary:

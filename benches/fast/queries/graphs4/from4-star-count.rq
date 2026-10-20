@@ -1,0 +1,2 @@
+PREFIX e: <http://example.org/fast/>
+SELECT (COUNT(*) AS ?n) FROM e:graph0 FROM e:graph1 FROM e:graph2 FROM e:graph3 WHERE { ?u a e:Person ; e:name ?name ; e:age ?a ; e:born ?b ; e:city ?c }

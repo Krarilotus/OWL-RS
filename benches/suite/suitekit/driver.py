@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import contextlib
 import datetime
 import json
 import os
@@ -28,9 +29,9 @@ from collections import defaultdict
 from pathlib import Path
 
 from .adapters import ADAPTERS, Context, Endpoint, Nrese, adapter, count_all, post
-from . import hosts
+from . import hosts, ns
 from .answers import Recorder, capped_post
-from .runtime import (PREFIX, ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime, RootfsRuntime,
+from .runtime import (ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime, RootfsRuntime,
                       run_quiet, shell)
 from .manifest import Manifest, image_ids
 from .schema import FIELDS, Result, Writer, problems, read
@@ -178,7 +179,7 @@ class Suite:
         self.stamp = now.strftime("%Y%m%d-%H%M%S-%f")
         self.host = socket.gethostname()
         scratch_root = Path(self.settings.get("NRESE_BENCH_SCRATCH") or root / "tmp")
-        self.scratch = scratch_root.resolve() / f"{PREFIX}{self.stamp}"
+        self.scratch = scratch_root.resolve() / f"{ns.name('suite', root)}-{self.stamp}"
         self.results = Path(args.results or root / "benches/suite/results" / now.strftime("%Y-%m-%d")).resolve()
         if args.dry_run:
             # A dry run writes nothing that stays: its rows and logs go with the scratch.
@@ -290,9 +291,12 @@ class Suite:
         self.say(f"building {nrese.key} (release) from {source}")
         log = self.results / "logs" / f"{nrese.key}-build-{self.stamp}.log"
         if self.args.runtime == "docker":
-            for volume in (nrese.target_volume, "nrese-cargo"):
-                if run_quiet(["docker", "volume", "inspect", volume]).returncode != 0:
-                    self.made_volumes.append(volume)
+            # Its own build volume, labelled, removed with the run; the Cargo registry is the
+            # host's shared cache, never removed by a run.
+            if nrese.target_volume not in self.made_volumes and \
+                    ns.docker(ns.volume("inspect", nrese.target_volume)).returncode != 0:
+                ns.docker(ns.volume("create", nrese.target_volume, self.root, "suite"))
+                self.made_volumes.append(nrese.target_volume)
             # Built in the pinned Rust image, as the scorecards do: the binary runs in it.
             # Half the cores, like scripts/cargo-guarded.sh: the machine stays usable.
             cpus = str(max(1, (os.cpu_count() or 2) // 2))
@@ -302,7 +306,8 @@ class Suite:
             rustflags = "" if cpu in ("", "portable") else f"-C target-cpu={cpu}"
             rc = self.host_command(["docker", "run", "--rm", "--cpus", cpus, "-v", f"{source.as_posix()}:/src:ro",
                                     "-e", f"RUSTFLAGS={rustflags}",
-                                    "-v", f"{nrese.target_volume}:/target", "-v", "nrese-cargo:/usr/local/cargo/registry",
+                                    "-v", f"{nrese.target_volume}:/target",
+                                    "-v", f"{ns.shared('cargo')}:/usr/local/cargo/registry",
                                     "-w", "/src", nrese.rust_image(ctx),
                                     "cargo", "build", "--release", "--locked", "-j", cpus, "-p", "nrese-server",
                                     "--target-dir", "/target"], log)
@@ -373,11 +378,9 @@ class Suite:
                 if line.strip()] if real.is_dir() else []
 
     def ensure_data(self, plan) -> str | None:
-        # Looking for the inputs mounts the volume, which creates it: whether this run made
-        # it (and so removes it) is decided before.
-        if (self.data_volume and not self.args.dry_run and self.data_volume not in self.made_volumes
-                and run_quiet(["docker", "volume", "inspect", self.data_volume]).returncode != 0):
-            self.made_volumes.append(self.data_volume)
+        # The datasets' volume is the host's, shared by every job: a run that creates it (by
+        # looking for its inputs) never removes it, nor the files it fetched into it (another
+        # job may read them by then; scripts/bench-cleanup.sh --datasets, by hand).
         missing = self.data_missing(plan.all_inputs())
         if not missing:
             return None
@@ -385,7 +388,10 @@ class Suite:
             return f"missing inputs: {', '.join(missing)} (prepare them on a machine with Docker)"
         self.say(f"preparing {plan.workload} {plan.tier}: {shell(plan.prepare)}")
         log = self.results / "logs" / f"prepare-{slug(plan.workload)}-{slug(plan.tier)}-{self.stamp}.log"
-        rc = self.host_command(plan.prepare, log)
+        # Shared datasets are prepared one at a time per host (the preparation scripts take the
+        # same lock: held here, they don't wait for themselves).
+        with ns.lock(ns.lock_dir() / "datasets.lock"), held_lock("datasets"):
+            rc = self.host_command(plan.prepare, log)
         self.made_files += missing
         still = self.data_missing(plan.all_inputs())
         return f"preparing the inputs failed; see {log}" if rc != 0 or still else None
@@ -793,8 +799,16 @@ class Suite:
         if self.args.runtime == "docker":
             images.setdefault("alpine:latest", None)
         self.ensure_images(images)
+        # Every image the run's containers use, resolved to its ID now, before anything is timed
+        # (ns.pin_images): one that can't be stops the run; none is pulled or re-resolved later.
+        if self.args.runtime == "docker" and not self.args.dry_run:
+            try:
+                ns.pin_images(list(images), self.root)
+            except ns.ImageError as error:
+                self.say(f"images: {error}")
+                return 1
         if self.manifest and self.args.runtime == "docker":
-            self.manifest.update(images=image_ids(list(images)))
+            self.manifest.update(images=image_ids(list(images)), pinned_images=ns.pinned(self.root))
         for key in dict.fromkeys(key for _, key, system, _ in chosen if isinstance(system, Nrese)):
             if not self.build_nrese(adapter(key)):
                 return 1
@@ -865,7 +879,7 @@ class Suite:
 
     def cleanup(self):
         """What this run made goes: containers, stores, scratch; and unless kept for a
-        batch, datasets, build volumes and images (installed tools stay)."""
+        batch, its build volume and images (installed tools stay). The shared datasets stay."""
         self.runtime.cleanup()
         if self.args.dry_run and self.results.exists() and self.results == self.scratch / "dry-run-results":
             self.runtime.attempt(shutil.rmtree, self.runtime.owned_path(str(self.results)))
@@ -877,19 +891,24 @@ class Suite:
             def checked(command):
                 run_quiet(command).check_returncode()
 
-            if self.made_files and self.data_volume and self.data_volume not in self.made_volumes:
-                if self.runtime.attempt(checked, ["docker", "run", "--rm", "-v", f"{self.data_volume}:/data",
-                                                 "alpine", "rm", "-f", "--", *self.made_files]):
-                    self.made_files.clear()
             for volume in list(self.made_volumes):
                 if self.runtime.attempt(DockerRuntime.remove_resource, self.runtime, "volume", volume):
                     self.made_volumes.remove(volume)
-                    if volume == self.data_volume:
-                        self.made_files.clear()
             if not self.tools_installed:
                 for image in list(self.made_images):
                     if self.runtime.attempt(checked, ["docker", "image", "rm", image]):
                         self.made_images.remove(image)
+
+
+@contextlib.contextmanager
+def held_lock(name: str):
+    """The scripts this process runs see the host lock `name` as held (scripts/lib/ns.sh)."""
+    key = "NS_HELD_" + re.sub(r"[^a-z0-9]", "_", name)
+    os.environ[key] = "1"
+    try:
+        yield
+    finally:
+        os.environ.pop(key, None)
 
 
 def images(argv: list[str], systems: dict, root: Path) -> int:
