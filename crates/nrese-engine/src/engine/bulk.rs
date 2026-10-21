@@ -490,14 +490,13 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
             let mut wal = durable.wal.lock();
             wal.rotate(revision + 1)?;
             shared.versions.install(next);
-            wal.release_through(revision)?;
+            release_covered(&mut wal, durable.root(), revision);
             drop(wal);
             if let Some(base) = base
                 && let Err(error) = shared.dictionary.rebase(base)
             {
                 tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
             }
-            checkpoint::remove_older_than(durable.root(), revision)?;
         }
         None => shared.versions.install(next),
     }
@@ -585,13 +584,27 @@ fn publish_streamed(
     let mut wal = durable.wal.lock();
     wal.rotate(revision + 1)?;
     shared.versions.install(next);
-    wal.release_through(revision)?;
+    release_covered(&mut wal, durable.root(), revision);
     drop(wal);
     if let Err(error) = shared.dictionary.rebase(base) {
         tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
     }
-    checkpoint::remove_older_than(durable.root(), revision)?;
     Ok(len)
+}
+
+/// Removes what a published checkpoint at `revision` covers: the log segments before it and
+/// the older checkpoints. After the version is installed this is cleanup, not part of the
+/// commit, which has happened (its checkpoint is written and synced): a failure keeps those
+/// files, which recovery skips (the newest checkpoint and the records after it count), and the
+/// next checkpoint that writes removes them. Returning it would report a published commit as
+/// failed.
+fn release_covered(wal: &mut crate::durability::wal::Wal, root: &std::path::Path, revision: u64) {
+    if let Err(error) = wal.release_through(revision) {
+        tracing::warn!(%error, revision, "log segments the checkpoint covers kept for now; the next checkpoint releases them");
+    }
+    if let Err(error) = checkpoint::remove_older_than(root, revision) {
+        tracing::warn!(%error, revision, "older checkpoints kept for now; the next checkpoint removes them");
+    }
 }
 
 /// A rematerialisation in progress: the reasoner reads [`base`](Self::base), computes the
