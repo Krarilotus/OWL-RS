@@ -17,7 +17,7 @@ A family (benches/abba/NAME.toml):
     host = "phuoc-yu"             # one exclusive timing host for every block (--host overrides)
     blocks = 3                    # a round's blocks: at least 3 (one whole square), in whole squares
     [sides]
-    a = "REV"                     # the base
+    a = "REV"                     # the base: a commit id, resolved to its full id (a short one too)
     b = "REV"                     # the change; A' is A's build again, a copy of its own
     [[case]]
     catalog = "op-group"          # a case of benches/cases/, by name
@@ -76,6 +76,25 @@ def family_path(path: str | Path) -> str:
         raise Invalid([f"{path}: a family lives in the repository (benches/abba/), not outside it"])
 
 
+def full_ids(sides: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+    """The sides as full commit ids, resolved against this checkout (the harness's). A pass records
+    its binary's full revision and the gate compares it exactly, so a short id gave every pass of
+    a complete run "no verdict" (lcp-passes, 21 Oct 2026). A short id that names no commit here, or
+    more than one, is refused; a full one is taken as it is (its build checks it)."""
+    out, problems = {}, []
+    for side, rev in sides.items():
+        if len(rev) == 40:
+            out[side] = rev
+            continue
+        found = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], cwd=ROOT,
+                               capture_output=True, text=True)
+        if found.returncode == 0 and REV.match(found.stdout.strip()):
+            out[side] = found.stdout.strip()
+        else:
+            problems.append(f"side {side}: {rev} names no single commit of this checkout: give its full id")
+    return out, problems
+
+
 def load_family(path: str | Path) -> dict:
     """The family, resolved and validated: its cases (catalogue or its own, each with a content
     check), its hypotheses (b vs a, per case and declared dimension). Raises Invalid."""
@@ -95,6 +114,9 @@ def load_family(path: str | Path) -> dict:
         blocks = rg.whole_squares(blocks, len(SIDES))
     if set(sides) != {"a", "b"} or not all(isinstance(v, str) and REV.match(v) for v in sides.values()):
         problems.append("sides: exactly a and b, each a commit id (7 to 40 hex digits)")
+    else:
+        sides, unresolved = full_ids(sides)
+        problems += unresolved
     entries = data.get("case", [])
     if not entries:
         problems.append("no [[case]]")
