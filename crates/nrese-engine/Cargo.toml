@@ -34,7 +34,7 @@ tracing.workspace = true
 tempfile = { workspace = true }
 # The canonical views' memory guard measures against budgets (tests/canonical_view_memory.rs),
 # and the unit tests' counting allocator (src/lib.rs) checks that what the statistics keep is
-# what they charge.
+# what they charge; measuring without its allocator fails (tests/measure_without_its_allocator.rs).
 nrese-exec = { path = "../nrese-exec", features = ["measure"] }
 
 [lints]
