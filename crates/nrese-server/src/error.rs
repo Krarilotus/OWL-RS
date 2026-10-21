@@ -47,6 +47,9 @@ pub enum ApiError {
     Timeout(String),
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+    /// Busy for now: 503 with `Retry-After`, to be tried again shortly.
+    #[error("busy: {0}")]
+    Busy(String),
     #[error("internal server error: {0}")]
     Internal(String),
 }
@@ -121,6 +124,11 @@ impl ApiError {
         Self::ServiceUnavailable(message.into())
     }
 
+    /// 503 with `Retry-After: 1`: the request may succeed when tried again.
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::Busy(message.into())
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
@@ -137,6 +145,13 @@ impl IntoResponse for ApiError {
         if let Self::IncompleteAnswer(answer) = self {
             return incomplete_answer(&answer);
         }
+        if let Self::Busy(detail) = self {
+            let mut response = Self::ServiceUnavailable(detail).into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
         let (status, detail, reasoner_reject) = match self {
             Self::BadRequest(detail) => (StatusCode::BAD_REQUEST, detail, None),
             Self::BadRequestPlainText(detail) => {
@@ -152,7 +167,7 @@ impl IntoResponse for ApiError {
             Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail, None),
             Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail, None),
             Self::Conflict(detail) => (StatusCode::CONFLICT, detail, None),
-            Self::IncompleteAnswer(_) => unreachable!("answered above"),
+            Self::IncompleteAnswer(_) | Self::Busy(_) => unreachable!("answered above"),
             Self::Gone(detail) => (StatusCode::GONE, detail, None),
             Self::NotAcceptable(detail) => (StatusCode::NOT_ACCEPTABLE, detail, None),
             Self::UnsupportedMediaType(detail) => {
