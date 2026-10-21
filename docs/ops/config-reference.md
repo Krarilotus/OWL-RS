@@ -298,11 +298,11 @@ Every limit on memory, time and request size is in one table, `[budgets]`. Value
 | `budgets.bulk_load_memory` | `NRESE_BULK_LOAD_MEMORY` | 25 % of the machine's memory | The quads of a bulk load (`nrese-server load`, or a load into an empty store). Past it they are sorted in chunks of a third of it (one filling, one being sorted, its sorted copy), spilled to `bulk-spill/` in the data directory and merged into each index permutation while the checkpoint is written: one more pass over the disk, but the load's quads take this much plus one packed permutation whatever the data's size. The dictionary is apart (it grows with the distinct terms). Needs `store.map_checkpoints`. `0` = unlimited |
 | `budgets.query_timeout` | `NRESE_QUERY_TIMEOUT_MS` | 30 s | A query, until its last result is sent (`408`) |
 | `budgets.update_timeout` | `NRESE_UPDATE_TIMEOUT_MS` | 60 s | A SPARQL update, reasoning included |
-| `budgets.graph_read_timeout` | `NRESE_GRAPH_READ_TIMEOUT_MS` | 30 s | A Graph Store read |
+| `budgets.graph_read_timeout` | `NRESE_GRAPH_READ_TIMEOUT_MS` | 30 s | A streamed read of stored statements (Graph Store `GET`, RDF4J `GET /statements`, the N-Quads export): the wait for its first chunk, then for each next one. A client that keeps reading is never cut off; one that stops for this long is. A Graph Store `HEAD` |
 | `budgets.graph_write_timeout` | `NRESE_GRAPH_WRITE_TIMEOUT_MS` | 60 s | A Graph Store write |
 | `budgets.query_text` | `NRESE_MAX_QUERY_BYTES` | 1 MiB | The text of a query |
 | `budgets.update_size` | `NRESE_MAX_UPDATE_BYTES` | 16 MiB | A SPARQL update request |
-| `budgets.upload_size` | `NRESE_MAX_RDF_UPLOAD_BYTES` | 128 MiB | An RDF payload (Graph Store, TELL, SHACL shapes); larger data goes through `nrese-server load` |
+| `budgets.upload_size` | `NRESE_MAX_RDF_UPLOAD_BYTES` | 128 MiB | An RDF payload (Graph Store, TELL, SHACL shapes); larger data goes through `nrese-server load`. An N-Quads restore (`POST …/restore`) has no limit of its own: the server's body limit bounds it, 3 × the largest of this, `budgets.update_size` and `budgets.query_text`, plus 64 KiB (about 384 MiB, some 3 million statements, by default), and it holds the whole payload while it parses. Store-sized backups restore offline: `nrese-server load --replace` for an N-Quads export, `nrese-server restore DIR` for an image |
 | `budgets.result_cache` | `NRESE_QUERY_CACHE_BYTES` | 2% of memory (64 MiB to 8 GiB) | Results of query parts (id columns) kept for repeated queries and shared sub-patterns ([the result cache](#store)); a size or a share (`5%`). `0` switches the cache off |
 | `budgets.result_cache_pins` | `NRESE_PINNED_QUERIES` | none | Query files whose results are pinned in the result cache at startup |
 
