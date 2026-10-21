@@ -260,7 +260,11 @@ pub(crate) fn apply_sparql_update(
     let options = sparql_update_options(request, requester, context)?;
     apply_update(tx, &update, &options).map_err(|error| match error {
         nrese_sparql::UpdateError::Forbidden(graph) => crate::Refusal::Write(graph).into(),
-        error => error.into(),
+        // A memory refusal of its WHERE as its reader may be told it: a scan of graphs a
+        // reader of some may not read sized what it held and asked for (round 13, R13-diag;
+        // the queries' own, `StoreService::run_reporting`).
+        error if requester.read.reads_everything() => error.into(),
+        error => StoreError::from(error).without_amounts(),
     })
 }
 

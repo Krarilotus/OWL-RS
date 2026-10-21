@@ -544,3 +544,54 @@ fn restricted_refusals_tell_nothing_of_hidden_sizes() {
     };
     assert_eq!(refusal(100_000), refusal(200_000));
 }
+
+/// Nor does an update's: the WHERE of a restricted requester's update runs out of the query
+/// memory on a scan sized by a graph it may not read, and the refusal it is told keeps its
+/// kind and limit, not the bytes (Sol's review of R13, r3 S1).
+#[test]
+fn restricted_update_refusals_tell_nothing_of_hidden_sizes() {
+    let refusal = |hidden: usize| {
+        let mut config = in_memory_store_config();
+        config.process_memory_bytes = 0;
+        config.total_query_memory_bytes = 64 << 10;
+        let pipeline = nrese_store::MutationPipeline::new(
+            Arc::new(StoreService::new(config).unwrap()),
+            nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Disabled),
+        );
+        let secret: String = (0..hidden)
+            .map(|i| format!("<urn:hidden{i}> <urn:p> {i} . "))
+            .collect();
+        pipeline
+            .execute_update_str(&format!(
+                "INSERT DATA {{ GRAPH <urn:g:public> {{ <urn:visible> <urn:p> 1 }}
+                   GRAPH <urn:g:secret> {{ {secret} }} }}"
+            ))
+            .unwrap();
+        let access = Arc::new(GraphAccess {
+            prefixes: vec!["urn:g:public".to_owned()],
+            ..GraphAccess::default()
+        });
+        let requester = Requester::new(
+            ReadScope::Graphs(Arc::clone(&access)),
+            WriteScope::Graphs(access),
+        );
+        let error = pipeline
+            .apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(
+                    "INSERT { GRAPH <urn:g:public> { ?s <urn:copy> ?o } }
+                     WHERE { GRAPH ?g { ?s <urn:p> ?o } }",
+                )),
+                &requester,
+                &nrese_store::MutationTicket::new(),
+            )
+            .unwrap_err();
+        match &error {
+            nrese_store::MutationError::Store { source, .. } => {
+                assert!(source.is_server_memory_limit(), "{error}")
+            }
+            other => panic!("a memory refusal, not {other}"),
+        }
+        error.to_string()
+    };
+    assert_eq!(refusal(100_000), refusal(200_000));
+}
