@@ -21,6 +21,8 @@ quick-xml = { workspace = true }
 thiserror.workspace = true
 
 [dev-dependencies]
+# Binary RDF's bounds are measured (tests/binary_bounds.rs).
+nrese-exec = { path = "../../nrese-exec", features = ["measure"] }
 # The W3C RDFC-1.0 suite runs here, where N-Quads can be read.
 nrese-rdf = { path = "../nrese-rdf", default-features = false, features = ["rdfc"] }
 
