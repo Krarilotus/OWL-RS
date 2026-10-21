@@ -897,6 +897,7 @@ pub fn update_with<B: Base + ?Sized>(
         settled_consistency..program.consistency.len(),
         &variants,
         &mut found,
+        stop,
     );
     check_stop()?;
     result.violations = sorted(found);
