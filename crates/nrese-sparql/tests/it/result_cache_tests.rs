@@ -442,3 +442,37 @@ fn serialised_answers_equal_fresh_ones_over_random_commits() {
         "{from_bytes} of {checked} from bytes"
     );
 }
+
+/// A default graph merged from two listed graphs, and one merged from every graph but the
+/// same two, have different answers: the cache keeps them apart.
+#[test]
+fn listed_and_left_out_graphs_are_different_datasets() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (s, graph) in [("a1", "g1"), ("a2", "g2"), ("a3", "g3")] {
+        tx.insert(Quad::new(ex(s), ex("p"), ex("o"), GraphName::NamedNode(ex(graph))).as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let cache = Arc::new(ResultCache::new(1 << 20).admitting_all());
+    let text = format!("SELECT ?s WHERE {{ ?s <{EX}p> ?o }}");
+    let two = vec![
+        GraphName::NamedNode(ex("g1")),
+        GraphName::NamedNode(ex("g2")),
+    ];
+    let mut listed = nrese_sparql::QueryDatasetSpecification::new();
+    listed.set_default_graph(two.clone());
+    let mut left_out = nrese_sparql::QueryDatasetSpecification::new();
+    left_out.set_default_graph_excluding(two);
+    let with = |dataset: &nrese_sparql::QueryDatasetSpecification, cached: bool| QueryOptions {
+        dataset: Some(dataset.clone()),
+        ..match cached {
+            true => with_cache(&cache, ReadModel::Materialised),
+            false => QueryOptions::default(),
+        }
+    };
+    assert_eq!(select(&snapshot, &text, &with(&listed, true)).len(), 2);
+    let fresh = select(&snapshot, &text, &with(&left_out, false));
+    assert_eq!(fresh.len(), 1, "{fresh:?}");
+    assert_eq!(select(&snapshot, &text, &with(&left_out, true)), fresh);
+}

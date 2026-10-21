@@ -12,8 +12,9 @@
 //!
 //! **Pre-binding** puts the values in for the variables, throughout the query
 //! ([`nrese_sparql::QueryOptions::pre_bound`]): `$this`, `$currentShape`, `$shapesGraph`
-//! (if the shapes graph is a named graph), `$value` and the parameters. `$PATH` in a
-//! property shape's query is replaced by its path in SPARQL syntax before parsing. The
+//! (if the shapes graph is a named graph), `$value` and the parameters. `$PATH` as the
+//! predicate of a triple pattern in a property shape's query is read as its path while the
+//! query is parsed, as if the path were written there; any other use is ill-formed. The
 //! restrictions of §5.6.2 make a query ill-formed: `MINUS`, `VALUES`, `SERVICE`,
 //! binding a pre-bound variable (`AS ?this`), and a subquery that doesn't project every
 //! pre-bound variable (`$shapesGraph` and `$currentShape` aside).
@@ -25,10 +26,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nrese_engine::{GraphSelector, TermId};
-use nrese_rdf::{GraphName, NamedNode, Term, Variable};
-use nrese_sparql::{QueryDatasetSpecification, QueryOptions, QueryResults, ReadView};
-use nrese_sparql_syntax::algebra::{Expression, GraphPattern};
+use nrese_engine::TermId;
+use nrese_rdf::{NamedNode, Term, Variable};
+use nrese_sparql::{QueryOptions, QueryResults, ReadView};
+use nrese_sparql_syntax::algebra::{Expression, GraphPattern, PropertyPathExpression};
 
 use crate::graph::Selection;
 use crate::model::{Path, SparqlCheck};
@@ -38,6 +39,9 @@ pub(crate) const THIS: &str = "this";
 pub(crate) const CURRENT_SHAPE: &str = "currentShape";
 pub(crate) const SHAPES_GRAPH: &str = "shapesGraph";
 pub(crate) const VALUE: &str = "value";
+/// The placeholder for a property shape's path (SHACL §5.2): legal only as the predicate of
+/// a triple pattern, where it is read as the path.
+pub(crate) const PATH: &str = "PATH";
 
 /// Why `pattern` can't be pre-bound with `pre_bound` (§5.6.2), if it can't: `MINUS`,
 /// `VALUES`, `SERVICE`, a pre-bound variable bound by `AS`, or a subquery that leaves out
@@ -140,20 +144,23 @@ fn expression_problem(expression: &Expression, pre_bound: &[String]) -> Option<S
     }
 }
 
-/// `path` in SPARQL property path syntax, with `iri` naming each predicate.
-pub(crate) fn path_text(path: &Path, iri: &dyn Fn(TermId) -> Option<String>) -> Option<String> {
-    let joined = |parts: &[Path], separator: &str| -> Option<String> {
-        let parts: Option<Vec<String>> = parts.iter().map(|p| path_text(p, iri)).collect();
-        Some(format!("({})", parts?.join(separator)))
+/// `path` as a SPARQL property path, with `iri` naming each predicate.
+pub(crate) fn path_expression(
+    path: &Path,
+    iri: &dyn Fn(TermId) -> Option<NamedNode>,
+) -> Option<PropertyPathExpression> {
+    let parts = |parts: &[Path]| -> Option<Vec<PropertyPathExpression>> {
+        parts.iter().map(|p| path_expression(p, iri)).collect()
     };
+    let inner = |inner: &Path| path_expression(inner, iri).map(Box::new);
     Some(match path {
-        Path::Predicate(predicate) => format!("<{}>", iri(*predicate)?),
-        Path::Inverse(inner) => format!("^({})", path_text(inner, iri)?),
-        Path::Sequence(parts) => joined(parts, "/")?,
-        Path::Alternative(parts) => joined(parts, "|")?,
-        Path::ZeroOrMore(inner) => format!("({})*", path_text(inner, iri)?),
-        Path::OneOrMore(inner) => format!("({})+", path_text(inner, iri)?),
-        Path::ZeroOrOne(inner) => format!("({})?", path_text(inner, iri)?),
+        Path::Predicate(predicate) => PropertyPathExpression::NamedNode(iri(*predicate)?),
+        Path::Inverse(path) => PropertyPathExpression::Reverse(inner(path)?),
+        Path::Sequence(steps) => PropertyPathExpression::sequence(parts(steps)?),
+        Path::Alternative(paths) => PropertyPathExpression::alternative(parts(paths)?),
+        Path::ZeroOrMore(path) => PropertyPathExpression::ZeroOrMore(inner(path)?),
+        Path::OneOrMore(path) => PropertyPathExpression::OneOrMore(inner(path)?),
+        Path::ZeroOrOne(path) => PropertyPathExpression::ZeroOrOne(inner(path)?),
     })
 }
 
@@ -197,23 +204,9 @@ pub(crate) fn run<V: ReadView>(
     for (name, value) in &check.parameters {
         bound.insert(name.clone(), decode(*value)?);
     }
-    let mut options = QueryOptions {
-        read_model: data.model,
-        ..QueryOptions::default()
-    };
-    match data.graphs {
-        GraphSelector::Exact(graph) if !graph.is_default_graph() => {
-            let mut dataset = QueryDatasetSpecification::new();
-            let Term::NamedNode(name) = decode(graph)? else {
-                return Err("the data graph isn't an IRI".into());
-            };
-            dataset.set_default_graph(vec![GraphName::NamedNode(name)]);
-            options.dataset = Some(dataset);
-        }
-        GraphSelector::Exact(_) => {}
-        // Every graph: their merge (a shapes graph among them is read too).
-        _ => options.union_default_graph = true,
-    }
+    // The statements Core reads, shapes graphs left out ([`Selection::query_dataset`]).
+    let mut options = QueryOptions::default();
+    data.query_dataset(view, &mut options)?;
     let evaluate = |bound: HashMap<Variable, Term>| {
         let options = QueryOptions {
             pre_bound: Some(Arc::new(bound)),

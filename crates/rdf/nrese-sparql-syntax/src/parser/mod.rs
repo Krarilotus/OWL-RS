@@ -21,7 +21,7 @@ use std::fmt;
 
 use nrese_rdf::{BlankNode, Iri, IriParseError, NamedNode, Variable};
 
-use crate::algebra::{AggregateExpression, GraphPattern};
+use crate::algebra::{AggregateExpression, GraphPattern, PropertyPathExpression};
 use crate::query::{GraphUpdateOperation, Query, Update};
 
 /// Nesting allowed by default: of groups, brackets, paths, collections and triple terms
@@ -43,6 +43,9 @@ pub struct SparqlParser {
     lateral: bool,
     adjust: bool,
     max_nesting: usize,
+    /// A variable that stands for a property path in the predicate position
+    /// ([`Self::with_path_variable`]).
+    path_variable: Option<(Variable, PropertyPathExpression)>,
 }
 
 impl Default for SparqlParser {
@@ -62,6 +65,7 @@ impl SparqlParser {
             lateral: true,
             adjust: true,
             max_nesting: DEFAULT_MAX_NESTING,
+            path_variable: None,
         }
     }
 
@@ -111,6 +115,15 @@ impl SparqlParser {
     /// they build, may nest ([`DEFAULT_MAX_NESTING`]).
     pub fn with_max_nesting(mut self, depth: usize) -> Self {
         self.max_nesting = depth;
+        self
+    }
+
+    /// Reads `variable` as the predicate of a triple pattern as `path`: the pattern is
+    /// translated as if the text had the path there (one step a triple, `/` through fresh
+    /// blank nodes), and only there, not in a literal, a comment or a longer name. This is
+    /// SHACL-SPARQL's `$PATH` (SHACL §5.3); any other use of the variable stays a variable.
+    pub fn with_path_variable(mut self, variable: Variable, path: PropertyPathExpression) -> Self {
+        self.path_variable = Some((variable, path));
         self
     }
 
