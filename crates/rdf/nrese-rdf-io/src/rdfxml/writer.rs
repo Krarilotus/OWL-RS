@@ -77,7 +77,7 @@ impl RdfXmlWriter {
         } else {
             self.prefixes
                 .iter()
-                .find(|(_, ns)| ns == namespace)
+                .find(|(p, ns)| ns == namespace && declared(p))
                 .map(|(p, _)| p.as_str())
         };
         indent(out, depth);
@@ -171,7 +171,7 @@ impl RdfXmlWriter {
         out.extend_from_slice(RDF.as_bytes());
         out.push(b'"');
         for (prefix, namespace) in &self.prefixes {
-            if prefix == "rdf" || prefix.is_empty() || !is_nc_name(prefix) {
+            if !declared(prefix) {
                 continue;
             }
             out.extend_from_slice(b"\n\txmlns:");
@@ -188,6 +188,17 @@ impl RdfXmlWriter {
             out.extend_from_slice(b"\t</rdf:Description>\n");
         }
     }
+}
+
+/// Whether `prefix` goes on `rdf:RDF`, so that a qualified name may use it: an NCName that
+/// isn't `rdf` (always RDF's own namespace here) or reserved by XML (`xml…`). Any other
+/// namespace is declared on the property element itself.
+fn declared(prefix: &str) -> bool {
+    prefix != "rdf"
+        && is_nc_name(prefix)
+        && !prefix
+            .get(..3)
+            .is_some_and(|start| start.eq_ignore_ascii_case("xml"))
 }
 
 fn indent(out: &mut Vec<u8>, depth: usize) {
