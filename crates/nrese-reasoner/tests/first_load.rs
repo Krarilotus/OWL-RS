@@ -168,3 +168,63 @@ fn a_first_load_tolerates_a_violation_the_axioms_had_before() {
         "first load must keep introduced-only verdicts"
     );
 }
+
+/// The same for a conclusion no store holds: an axiom's literal outside its range
+/// (`-1 a xsd:nonNegativeInteger`) is old, so an unrelated insert doesn't report its
+/// `dt-not-type`, cached grounding or not, in both non-compact equality modes (Sol r2 F1).
+#[test]
+fn a_first_load_tolerates_a_datatype_violation_the_axioms_had_before() {
+    use nrese_reasoner::{RuleProgram, UserRules};
+    let user = std::sync::Arc::new(
+        UserRules::n3(
+            "old-datatype.n3",
+            format!("{PREFIX}ex:age rdfs:range xsd:nonNegativeInteger . ex:old ex:age -1 ."),
+        )
+        .unwrap(),
+    );
+    let rules = RuleProgram::new(Some(Ruleset::Owl2Rl), Some(user)).unwrap();
+    for representatives in [false, true] {
+        for cached in [false, true] {
+            let mut outcomes = Vec::new();
+            for plan in [None, Some(Plan::Dred)] {
+                let engine = Engine::new(EngineConfig {
+                    background_maintenance: false,
+                    ..EngineConfig::default()
+                })
+                .unwrap();
+                let tx = engine.transaction();
+                let program = Program::compile(&rules, &|t| tx.intern(t))
+                    .by_representatives(representatives)
+                    .storing_representatives(false)
+                    .maintaining_by(plan);
+                drop(tx);
+                let remat = engine.rematerialisation();
+                let closure = materialise(&program, remat.base());
+                assert!(closure.violations.iter().any(|v| v.rule == "dt-not-type"));
+                remat.finish(closure.inferred).unwrap();
+                assert_eq!(engine.snapshot().len_in(ReadModel::Asserted), 0);
+                let ground = program.ground_program(&engine.snapshot());
+                let mut tx = engine.transaction();
+                for quad in RdfParser::from_format(RdfFormat::Turtle)
+                    .for_reader(format!("{PREFIX}ex:new ex:p ex:o .").as_bytes())
+                {
+                    tx.insert(quad.unwrap().as_ref());
+                }
+                let done =
+                    maintain(&program, cached.then_some(&ground), &mut tx, &|| false).unwrap();
+                let mut violations = done
+                    .violations
+                    .iter()
+                    .map(|v| format!("{}:{:?}", v.rule, v.bindings))
+                    .collect::<Vec<_>>();
+                violations.sort();
+                outcomes.push(violations);
+            }
+            assert!(outcomes[1].is_empty(), "DRed control: {outcomes:?}");
+            assert_eq!(
+                outcomes[0], outcomes[1],
+                "introduced-only parity: representatives={representatives} cached={cached}"
+            );
+        }
+    }
+}
