@@ -115,20 +115,21 @@ class Admission(unittest.TestCase):
         # free, the default 8 GB floor: room for a 3 GB peak, not for a 5 GB one.
         (self.guard / "BUSY").write_text("12.0 GB RAM, 394 GB disk free")
         self.free(12)
-        floor = {"NRESE_BUILD_FLOOR_GB": None, "NRESE_GUARD_SCRIPT": str(self.root / "no-guard.ps1")}
+        floor = {"NRESE_BUILD_FLOOR_GB": None, "NRESE_GUARD_THRESHOLDS": str(self.root / "no-thresholds")}
         fits = self.start("a", NRESE_BUILD_PEAK_GB="3", **floor)
         self.assertIsNotNone(self.started("a", within=60), "held by BUSY though it fits")
         self.assertEqual(fits.wait(timeout=120), 0)
-        self.start("b", NRESE_BUILD_PEAK_GB="5", **floor)
-        self.assertIsNone(self.started("b", within=8))
+        waiting = self.start("b", NRESE_BUILD_PEAK_GB="5", NRESE_BUILD_SLOT_WAIT_S="15", **floor)
+        self.assertEqual(waiting.wait(timeout=120), 75)  # ends by itself: no process left in the directory
+        self.assertFalse((self.out / "b.started").exists())
 
     def test_no_run_starts_below_the_guards_disk_line_busy_or_not(self):
         # Sol, review-build-admission-r5 (r5-1): ignoring BUSY ignored the guard's disk kill line (100 GB
         # on C:). Memory fits; C: has 90 GB free: no build; at 400 GB the same run builds.
         (self.guard / "BUSY").write_text("24.0 GB RAM, 90 GB disk free")
         self.disk(90)
-        floor = {"NRESE_BUILD_FLOOR_GB": None, "NRESE_GUARD_SCRIPT": str(self.root / "no-guard.ps1")}
-        low = self.start("low", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="1", NRESE_BUILD_SLOT_WAIT_S="3", **floor)
+        floor = {"NRESE_BUILD_FLOOR_GB": None, "NRESE_GUARD_THRESHOLDS": str(self.root / "no-thresholds")}
+        low = self.start("low", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="1", NRESE_BUILD_SLOT_WAIT_S="15", **floor)
         _, err = low.communicate(timeout=60)
         self.assertEqual(low.returncode, 75, err)
         self.assertIn("below its kill line of 100 GB", err)
@@ -137,21 +138,6 @@ class Admission(unittest.TestCase):
         fits = self.start("fits", NRESE_BUILD_PEAK_GB="1", **floor)
         self.assertEqual(fits.wait(timeout=120), 0)
         self.assertIsNotNone(self.started("fits", within=1))
-
-    def test_an_ambiguous_guard_script_means_no_build(self):
-        # Sol, review-build-admission-r6 (r6-1): the first textual `$hard` was taken, though it sat in a
-        # block comment, or a later assignment was the one PowerShell keeps. 11 GB free, a 12 GB line.
-        self.free(11)
-        script = self.root / "guard.ps1"
-        for n, text in enumerate(["<#\n$hard = ($ram -lt 4) -or ($disk -lt 100)\n#>\n$hard = ($ram -lt 12) -or ($disk -lt 100)\n",
-                                  "$hard = ($ram -lt 4) -or ($disk -lt 100)\n$hard = ($ram -lt 12) -or ($disk -lt 100)\n"]):
-            script.write_text(text)
-            run = self.start(f"amb{n}", stderr=subprocess.PIPE, NRESE_BUILD_FLOOR_GB=None, NRESE_GUARD_SCRIPT=str(script),
-                             NRESE_BUILD_PEAK_GB="1")
-            _, err = run.communicate(timeout=60)
-            self.assertEqual(run.returncode, 2, (text, err))
-            self.assertIn("kill line can't be read", err)
-            self.assertFalse((self.out / f"amb{n}.started").exists(), text)
 
     @unittest.skipUnless(shutil.which("mkfifo"), "a disk reading that never comes (a FIFO)")
     def test_a_disk_reading_that_never_comes_ends_at_the_deadline_and_holds_no_one(self):
@@ -168,28 +154,70 @@ class Admission(unittest.TestCase):
         self.assertEqual(beside.wait(timeout=120), 0)
         self.assertIsNotNone(self.started("beside", within=1), "held up by a stalled disk reading")
 
-    def test_the_guards_line_is_read_as_powershell_reads_it_or_nothing_builds(self):
-        # Sol, r5-2: other casing or spacing, or a last line without a newline, read as no line: an
-        # 8 GB floor under a guard that kills at 12 GB. 11 GB free: none of them builds.
+    def thresholds(self, text):
+        path = self.root / "thresholds"
+        path.write_text(text)
+        return {"NRESE_BUILD_FLOOR_GB": None, "NRESE_GUARD_THRESHOLDS": str(path)}
+
+    def test_the_floor_and_the_disk_line_come_from_the_guards_thresholds_file(self):
+        # The orchestrator, IB0612-8d33: the guard writes its lines; admission never reads its
+        # PowerShell. A 6 GB kill line: a 10 GB floor, 13 GB free; a 200 GB disk line: 210 GB needed.
+        self.free(13)
+        floor = self.thresholds("ram_soft_gb=16 disk_soft_gb=150 ram_kill_gb=6 disk_kill_gb=200\n")
+        fits = self.start("a", NRESE_BUILD_PEAK_GB="3", **floor)
+        self.assertEqual(fits.wait(timeout=120), 0)
+        self.assertIsNotNone(self.started("a", within=1), "3 GB above a 10 GB floor with 13 GB free")
+        waiting = self.start("b", NRESE_BUILD_PEAK_GB="4", NRESE_BUILD_SLOT_WAIT_S="15", **floor)
+        self.assertEqual(waiting.wait(timeout=120), 75)  # ends by itself: no process left in the directory
+        self.assertFalse((self.out / "b.started").exists(), "4 GB above a 10 GB floor with 13 GB free")
+        self.disk(205)
+        low = self.start("c", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="1", NRESE_BUILD_SLOT_WAIT_S="15", **floor)
+        _, err = low.communicate(timeout=60)
+        self.assertEqual(low.returncode, 75, err)
+        self.assertIn("below its kill line of 200 GB", err)
+
+    def test_an_unreadable_thresholds_file_takes_todays_lines_and_says_so(self):
+        # Anything but the guard's one line of four numbers is no file: an 8 GB floor, and the wait
+        # names the file. 11 GB free: a 4 GB peak doesn't fit.
         self.free(11)
-        script = self.root / "guard.ps1"
-        for n, text in enumerate(["$Hard = ($RAM -lt 12 ) -or ( $Disk -lt 100)\n",
-                                  "$soft = ($ram -lt 16)\n$hard = ($ram -lt 12) -or ($disk -lt 100)"]):
-            script.write_text(text)
-            run = self.start(f"v{n}", stderr=subprocess.PIPE, NRESE_BUILD_FLOOR_GB=None, NRESE_GUARD_SCRIPT=str(script),
-                             NRESE_BUILD_PEAK_GB="1", NRESE_BUILD_SLOT_WAIT_S="2")
-            _, err = run.communicate(timeout=60)
-            self.assertEqual(run.returncode, 75, (text, err))
-            self.assertIn("above the 16 GB floor", err)
-            self.assertFalse((self.out / f"v{n}.started").exists(), text)
-        # A line it can't read: no build at all, never a guessed lower line.
-        script.write_text("$hard = $ram -lt 12\n")
-        run = self.start("unread", stderr=subprocess.PIPE, NRESE_BUILD_FLOOR_GB=None, NRESE_GUARD_SCRIPT=str(script),
-                         NRESE_BUILD_PEAK_GB="1")
+        floor = self.thresholds("ram_kill_gb=12\n")
+        run = self.start("a", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="4", NRESE_BUILD_SLOT_WAIT_S="15", **floor)
         _, err = run.communicate(timeout=60)
-        self.assertEqual(run.returncode, 2, err)
-        self.assertIn("kill line can't be read", err)
-        self.assertFalse((self.out / "unread.started").exists())
+        self.assertEqual(run.returncode, 75, err)
+        self.assertIn("above the 8 GB floor", err)
+        self.assertIn("thresholds file", err)
+        self.assertIn("missing or unreadable", err)
+
+    def test_a_lock_held_past_the_deadline_admits_nothing_and_ends_at_the_deadline(self):
+        # Sol, review-build-admission-r7 (r7-2): the first acquisition waited for the lock without a
+        # deadline, then admitted on a disk reading taken before the wait. Another live process holds
+        # the lock for 8 s while C: falls from 110 GB to 99; the run (1 s limit) must end before then.
+        self.disk(110)
+        holder = subprocess.Popen([BASH, "-c", 'read -r -a s < /proc/$$/stat; echo "$$@${s[21]}"; for i in $(seq 60); do sleep 1; done'],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (holder.kill(), holder.wait()))
+        identity = holder.stdout.readline().strip()
+        lock = self.root / "slots" / ".lock"
+        lock.mkdir(parents=True)
+        (lock / "holder").write_text(identity + "\n")
+        run = self.start("a", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="1", NRESE_BUILD_SLOT_WAIT_S="1",
+                         NRESE_GUARD_DISK_TIMEOUT_S="1", NRESE_GUARD_THRESHOLDS=str(self.root / "no-thresholds"),
+                         NRESE_BUILD_FLOOR_GB=None)
+        # Once it has queued (a loaded machine takes seconds to get there), C: falls; it must then end
+        # within its deadline while the lock is still held.
+        deadline = time.time() + 60
+        while not list((self.root / "slots" / "queue").glob("*")) and run.poll() is None and time.time() < deadline:
+            time.sleep(0.1)
+        self.disk(99)
+        deadline = time.time() + 30
+        while run.poll() is None and time.time() < deadline:
+            time.sleep(0.2)
+        ended_while_locked = run.poll() is not None
+        shutil.rmtree(lock)
+        _, err = run.communicate(timeout=60)
+        self.assertTrue(ended_while_locked, "it waited for the lock past its deadline")
+        self.assertEqual(run.returncode, 75, err)
+        self.assertFalse((self.out / "a.started").exists(), "admitted below the guard's disk line")
 
     def test_room_that_appears_after_the_deadline_admits_nothing(self):
         # Sol, r5 follow-up: a sleep running past the deadline, then room: the run must end, not build.
@@ -219,27 +247,15 @@ class Admission(unittest.TestCase):
         self.assertEqual(small.wait(timeout=120), 0)
         self.assertFalse((self.out / "big.started").exists())
 
-    def test_the_default_floor_is_the_guards_kill_line_and_a_margin(self):
-        # 20 Oct 2026: the soft line (16 GB) as the floor kept every hook on a merged base waiting.
-        # The guard's script says its kill line; plus 4 GB. Here 6: a 10 GB floor, 13 GB free.
-        script = self.root / "guard.ps1"
-        script.write_text("$soft = ($ram -lt 16) -or ($disk -lt 150)\n$hard = ($ram -lt 6) -or ($disk -lt 100)\n")
-        self.free(13)
-        floor = {"NRESE_BUILD_FLOOR_GB": None, "NRESE_GUARD_SCRIPT": str(script)}
-        fits = self.start("a", NRESE_BUILD_PEAK_GB="3", **floor)
-        self.assertIsNotNone(self.started("a", within=60), "3 GB above a 10 GB floor with 13 GB free")
-        self.assertEqual(fits.wait(timeout=120), 0)
-        self.start("b", NRESE_BUILD_PEAK_GB="4", **floor)
-        self.assertIsNone(self.started("b", within=8), "4 GB above a 10 GB floor with 13 GB free")
-
-    def test_without_the_guards_script_the_floor_is_8_gb(self):
+    def test_without_the_guards_thresholds_file_the_floor_is_8_gb(self):
         self.free(12)
-        floor = {"NRESE_BUILD_FLOOR_GB": None, "NRESE_GUARD_SCRIPT": str(self.root / "no-guard.ps1")}
+        floor = {"NRESE_BUILD_FLOOR_GB": None, "NRESE_GUARD_THRESHOLDS": str(self.root / "no-thresholds")}
         fits = self.start("a", NRESE_BUILD_PEAK_GB="4", **floor)
         self.assertIsNotNone(self.started("a", within=60))
         self.assertEqual(fits.wait(timeout=120), 0)
-        self.start("b", NRESE_BUILD_PEAK_GB="5", **floor)
-        self.assertIsNone(self.started("b", within=8))
+        waiting = self.start("b", NRESE_BUILD_PEAK_GB="5", NRESE_BUILD_SLOT_WAIT_S="15", **floor)
+        self.assertEqual(waiting.wait(timeout=120), 75)  # ends by itself: no process left in the directory
+        self.assertFalse((self.out / "b.started").exists())
 
     def test_a_build_runs_with_the_jobs_memory_allows_and_the_next_waits_for_its_peak(self):
         # 24 GB free, a 16 GB floor: 8 GB of room; 12 jobs would peak at 9.2 GB, 10 at 8.0 GB.
@@ -349,7 +365,7 @@ class Admission(unittest.TestCase):
 
     def test_a_wait_without_a_terminal_ends_failing_with_its_reason_and_nothing_built(self):
         # A hook has no terminal and no one to interrupt it: it fails, it never hangs or builds.
-        build = self.start("a", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="12", NRESE_BUILD_SLOT_WAIT_S="3")
+        build = self.start("a", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="12", NRESE_BUILD_SLOT_WAIT_S="15")
         _, err = build.communicate(timeout=60)
         self.assertEqual(build.returncode, 75, err)
         self.assertIn("not built: no room to build after", err)
