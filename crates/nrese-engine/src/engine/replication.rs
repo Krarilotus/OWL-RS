@@ -76,7 +76,8 @@ impl Engine {
         let mut oldest = None;
         'segments: for (_, path) in &segments[start..] {
             // The active segment may grow while it is read: its complete records count.
-            let contents = wal::read_segment(path)?;
+            // Its complete records only: how a damaged tail is classified doesn't matter here.
+            let contents = wal::read_segment(path, after)?;
             for record in contents.records {
                 oldest.get_or_insert(record.revision);
                 if record.revision < expected {
