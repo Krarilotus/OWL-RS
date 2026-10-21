@@ -41,11 +41,11 @@ pub struct AppState {
 
 /// What a repository that didn't open at start ([`Catalog::unavailable`]) answers to all
 /// but operators, who see why in the repository list: not the server's paths.
-pub(crate) const UNAVAILABLE: &str = "is unavailable: its stored settings or files can't be read; operators see why and how to repair it in the repository list";
+pub(crate) const UNAVAILABLE: &str = "is unavailable: it didn't open at start, or a change to it failed and its state couldn't be confirmed; operators see why and how to repair it in the repository list";
 
 /// What a repository a failed change left in no known state answers to all but operators
 /// (who see the file and the repair in the repository list): a restart repairs it.
-pub(crate) const UNAVAILABLE_UNTIL_RESTART: &str = "is unavailable until the server restarts: a change of its reasoning failed and couldn't be undone; operators see why and how to repair it in the repository list";
+pub(crate) const UNAVAILABLE_UNTIL_RESTART: &str = "is unavailable until the server restarts: a change to it failed and its state couldn't be confirmed; operators see why and how to repair it in the repository list";
 
 impl AppState {
     /// [`Self::try_new`]; panics if the access state can't be opened (for tests).
@@ -233,7 +233,13 @@ impl AppState {
     /// This server's state as repository `id` sees it: the default repository's own, or a
     /// copy with that repository's store and RDF4J state. Called on the default's state.
     pub fn for_repository(&self, id: &str) -> Result<Self, ApiError> {
+        // The id as the route decoded it (`%6Erese` is the default repository too).
         if id == DEFAULT_REPOSITORY {
+            if self.default_unavailable().is_some() {
+                return Err(ApiError::unavailable(format!(
+                    "repository '{id}' {UNAVAILABLE_UNTIL_RESTART}"
+                )));
+            }
             return Ok(self.clone());
         }
         let Some(repository) = self.repositories.get(id) else {

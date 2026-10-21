@@ -1199,9 +1199,29 @@ async fn a_default_repository_left_in_no_known_state_is_unavailable_alone() {
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
     let query = |base: &str| format!("{base}/query?query={}", urlencoding(COUNT));
-    let (status, text) = send(&app, Method::GET, &query("/dataset"), None, "").await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
-    assert!(text.contains("restart"), "{text}");
+    // By its path and by its id, plain or percent-encoded (the route decodes it: Sol r2), in
+    // the engine API and in RDF4J's.
+    for base in [
+        "/dataset",
+        "/api/v1/repositories/nrese",
+        "/api/v1/repositories/%6Erese",
+    ] {
+        let (status, text) = send(&app, Method::GET, &query(base), None, "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{base}: {text}");
+        assert!(text.contains("restart"), "{text}");
+    }
+    for rdf4j in ["/repositories/nrese", "/repositories/%6Erese"] {
+        let uri = format!("{rdf4j}?query={}", urlencoding(COUNT));
+        let (status, text) = send(&app, Method::GET, &uri, None, "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{rdf4j}: {text}");
+    }
+    let uri = format!("/repositories/r2?query={}", urlencoding(COUNT));
+    let (status, text) = send(&app, Method::GET, &uri, None, "").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "RDF4J's other repository serves: {text}"
+    );
     let (status, text) = send(
         &app,
         Method::GET,

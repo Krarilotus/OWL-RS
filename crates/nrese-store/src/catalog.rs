@@ -487,18 +487,27 @@ impl Catalog {
         }
     }
 
-    /// Why repository `id` didn't open at start, and how to repair it.
+    /// Why repository `id` (not the default) can't serve, if it can't: it didn't open at
+    /// start, or its store became unavailable since ([`StoreService::unavailable`]); with
+    /// how to repair it.
     pub fn unavailable(&self, id: &str) -> Option<String> {
-        self.unavailable.read().get(id).cloned()
+        if let Some(why) = self.unavailable.read().get(id) {
+            return Some(why.clone());
+        }
+        let others = self.others.read();
+        let store = Arc::clone(others.get(id)?.pipeline.read().store());
+        store.unavailable().map(str::to_owned)
     }
 
-    /// The repositories that didn't open at start, sorted, each with why.
+    /// The repositories besides the default that can't serve, sorted, each with why.
     pub fn unavailable_list(&self) -> Vec<(String, String)> {
-        self.unavailable
-            .read()
-            .iter()
-            .map(|(id, why)| (id.clone(), why.clone()))
-            .collect()
+        let mut list: BTreeMap<String, String> = self.unavailable.read().clone();
+        for (id, repository) in self.others.read().iter() {
+            if let Some(why) = repository.pipeline.read().store().unavailable() {
+                list.insert(id.clone(), why.to_owned());
+            }
+        }
+        list.into_iter().collect()
     }
 
     /// Reserves `id` for a creation or removal: refused while another holds it.
@@ -569,10 +578,16 @@ impl Catalog {
     }
 
     /// Repository `id`, the default one included.
+    /// One that can't serve ([`Self::unavailable`]) is not served: `None`, but the default.
     pub fn get(&self, id: &str) -> Option<Repository> {
         match id {
             DEFAULT_REPOSITORY => Some(self.default.clone()),
-            id => self.others.read().get(id).cloned(),
+            id => self
+                .others
+                .read()
+                .get(id)
+                .filter(|repository| repository.pipeline.read().store().unavailable().is_none())
+                .cloned(),
         }
     }
 
@@ -769,6 +784,7 @@ impl Catalog {
         self.others
             .read()
             .iter()
+            .filter(|(_, repository)| repository.pipeline.read().store().unavailable().is_none())
             .map(|(id, repository)| (id.clone(), repository.settings.read().title.clone()))
             .collect()
     }
@@ -949,6 +965,29 @@ mod tests {
             .execute_query_str("ASK { <urn:a> <urn:p> <urn:b> }")
             .unwrap();
         assert!(String::from_utf8(answer.payload).unwrap().contains("true"));
+    }
+
+    /// A repository whose store became unavailable after it opened (here: namespaces written
+    /// but not made durable) is unavailable wherever the catalogue is asked: not served,
+    /// not listed as serving, listed unavailable with why (Sol, r2 of the store lifecycle).
+    #[test]
+    fn a_repository_whose_store_became_unavailable_is_not_served() {
+        use super::RepositorySettings;
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = on_disk(dir.path());
+        catalog
+            .create("probe", RepositorySettings::default())
+            .unwrap();
+        let store = std::sync::Arc::clone(catalog.get("probe").unwrap().pipeline.read().store());
+        crate::metadata::tests::FAIL_DIR_SYNC.set(true);
+        let written = store.namespaces().set("ex", "http://example.com/");
+        crate::metadata::tests::FAIL_DIR_SYNC.set(false);
+        assert!(written.is_err());
+        assert!(catalog.get("probe").is_none(), "served");
+        assert!(catalog.list().is_empty(), "listed as serving");
+        let why = catalog.unavailable("probe").expect("unavailable");
+        assert!(why.contains("restart"), "{why}");
+        assert_eq!(catalog.unavailable_list().len(), 1);
     }
 
     /// A change whose settings file is in place but not made durable (the directory sync
