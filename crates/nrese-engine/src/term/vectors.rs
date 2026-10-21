@@ -265,19 +265,25 @@ pub(crate) fn search(
     budget: &Arc<Budget>,
 ) -> Result<(VectorHits, VectorSearchReport), VectorStop> {
     query.stopped()?;
-    let vectors = index.read().spaces.get(&query.vector.len()).cloned();
     let none = VectorSearchReport {
         space: 0,
         graph: false,
         scanned: 0,
     };
-    let Some(vectors) = vectors else {
+    // Admitted and charged by the query and the reader's bound alone, before the space is
+    // looked up: whether the dictionary has one of the query's dimension (a vector the
+    // reader may not read can make it) changes no refusal.
+    if query.k == 0 || bound == 0 {
         return Ok((VectorHits::empty(budget), none));
-    };
+    }
     query.fits(nrese_vector::scan_held(query.k, bound))?;
     let mut scan = Reservation::new(Arc::clone(budget));
     scan.charge(nrese_vector::scan_bytes(query.k, bound))
         .map_err(VectorStop::Memory)?;
+    let vectors = index.read().spaces.get(&query.vector.len()).cloned();
+    let Some(vectors) = vectors else {
+        return Ok((VectorHits::empty(budget), none));
+    };
     let stop = query.stop.as_deref();
     let (hits, n) = nrese_vector::exact_scan(
         &vectors,

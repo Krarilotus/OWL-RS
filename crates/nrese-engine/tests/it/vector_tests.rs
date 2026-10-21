@@ -260,6 +260,52 @@ fn hidden_vectors_change_no_admission_nor_report() {
     }
 }
 
+/// A vector the reader may not read that is the first of its dimension changes no refusal:
+/// the search of that dimension is admitted and charged as before (Sol's review of W2, r2
+/// F1: it answered nothing before the space existed, and was refused as `TooLarge` or out of
+/// memory after).
+#[test]
+fn an_unreadable_first_vector_of_a_dimension_changes_no_refusal() {
+    use nrese_engine::{GraphSelector, ReadModel, TextScope};
+    let engine = engine();
+    let mut tx = engine.transaction();
+    tx.insert(QuadRef::from(&embedding(
+        0,
+        nrese_rdf::GraphName::DefaultGraph,
+    )));
+    tx.commit().expect("commit");
+    let old = engine.snapshot();
+    let scope = TextScope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
+    let plane = VectorQuery::new(vec![0.0, 0.0], 1);
+    let limited = VectorQuery {
+        max_hits: Some(2),
+        ..plane.clone()
+    };
+    let tiny = std::sync::Arc::new(nrese_exec::Budget::new(1024));
+    let outcomes = |snapshot: &nrese_engine::Snapshot| {
+        // The corpus kept first, on the engine's budget.
+        drop(snapshot.vector_search_in(ReadModel::Asserted, &scope, &plane, &|_| true, None));
+        [(&limited, None), (&plane, Some(&tiny))].map(|(query, budget)| {
+            snapshot
+                .vector_search_in(ReadModel::Asserted, &scope, query, &|_| true, budget)
+                .map(|(hits, report)| (hits.to_vec(), report))
+        })
+    };
+    let before = outcomes(&old);
+    let mut tx = engine.transaction();
+    tx.insert(QuadRef::from(&Quad::new(
+        NamedNode::new_unchecked("urn:item:hidden"),
+        NamedNode::new_unchecked("urn:embedding"),
+        Literal::new_typed_literal("[1, 2]", NamedNode::new_unchecked(DATATYPE)),
+        NamedNode::new_unchecked("urn:private"),
+    )));
+    tx.commit().expect("commit");
+    for snapshot in [&old, &engine.snapshot()] {
+        assert_eq!(outcomes(snapshot), before);
+    }
+    assert_eq!(tiny.used(), 0);
+}
+
 /// The hits a search returns keep their charge until they drop (Sol's review of W2, r1 F2:
 /// the scan's reservation went as the search returned).
 #[test]
