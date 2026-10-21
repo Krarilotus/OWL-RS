@@ -224,20 +224,28 @@ if [ -d "${busy_posix%/*}" ]; then
   kill_ram=4 kill_disk=100
   guard_script="${NRESE_GUARD_SCRIPT:-$HOME/Desktop/Harness/tools/main-pc-guard/guard.ps1}"
   if [ -e "$guard_script" ]; then
-    hard=""
+    # Only an unambiguous script: exactly one assignment, at the start of its line (so not inside a
+    # block that might not run), and no block comment anywhere (one could hide or hold an assignment);
+    # anything else is unreadable (Sol, review-build-admission-r6, r6-1).
+    hard="" seen=0
     shopt -s nocasematch
     while IFS= read -r line || [ -n "$line" ]; do
       line=${line%$'\r'}
+      if [[ "$line" == *'<#'* ]]; then
+        hard=unreadable seen=2
+        break
+      fi
       if [[ "$line" =~ ^[[:space:]]*\$hard[[:space:]]*= ]]; then
+        seen=$((seen + 1))
         hard=unreadable
         s='[[:space:]]*'
-        if [[ "$line" =~ ^$s\$hard$s=$s\($s\$ram[[:space:]]+-lt[[:space:]]+([0-9]+)$s\)$s-or$s\($s\$disk[[:space:]]+-lt[[:space:]]+([0-9]+)$s\)$s(#.*)?$ ]]; then
+        if [[ "$line" =~ ^\$hard$s=$s\($s\$ram[[:space:]]+-lt[[:space:]]+([0-9]+)$s\)$s-or$s\($s\$disk[[:space:]]+-lt[[:space:]]+([0-9]+)$s\)$s(#.*)?$ ]]; then
           hard="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
         fi
-        break
       fi
     done < "$guard_script"
     shopt -u nocasematch
+    [ "$seen" = 1 ] || hard=unreadable
     if ! [[ "$hard" =~ ^[0-9]+\ [0-9]+$ ]]; then
       printf 'cargo %s: the guard'\''s kill line can'\''t be read from %s (its `$hard = ($ram -lt N) -or ($disk -lt M)`): not building\n' \
         "$*" "$guard_script" >&2
@@ -250,15 +258,18 @@ if [ -d "${busy_posix%/*}" ]; then
   # line plus a margin, BUSY or not (NRESE_GUARD_VOLUME, default /c).
   disk_floor_gb=$(( kill_disk + ${NRESE_GUARD_DISK_MARGIN_GB:-10} ))
 fi
-# Free GB on the guard's volume (NRESE_GUARD_DISKFREE: a file with the number, for tests); nothing
-# when it can't be read.
+# Free GB on the guard's volume (NRESE_GUARD_DISKFREE: a file with the number, for tests). Bounded
+# (NRESE_GUARD_DISK_TIMEOUT_S, default 10 s: a stalled file system must not hold a hook), read
+# outside the admission lock, and never failing: a reading it can't get is empty, a wait (r6-2).
 guard_disk_gb() {
+  local gb="" t=${NRESE_GUARD_DISK_TIMEOUT_S:-10}
   if [ -n "${NRESE_GUARD_DISKFREE:-}" ]; then
-    local gb
-    read -r gb < "$NRESE_GUARD_DISKFREE" 2> /dev/null && printf '%s\n' "$gb"
+    gb=$(timeout --kill-after=2 "$t" head -1 -- "$NRESE_GUARD_DISKFREE" 2> /dev/null) || gb=""
   else
-    free_gb "${NRESE_GUARD_VOLUME:-/c}" 2> /dev/null
+    gb=$(timeout --kill-after=2 "$t" df -Pk "${NRESE_GUARD_VOLUME:-/c}" 2> /dev/null \
+      | awk 'NR==2 { printf "%d", $4 / 1048576 }') || gb=""
   fi
+  printf '%s\n' "${gb%$'\r'}"
 }
 FLOOR_MB=$(( ${NRESE_BUILD_FLOOR_GB:-$floor_default} * 1024 ))
 per_job_mb=614
@@ -332,8 +343,22 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
   printf '%s %s cargo %s\n' "$least" "$ROOT" "$*" > "$ticket"
   waited=0 said=-60 since=$SECONDS
   if [ -t 2 ]; then limit=${NRESE_BUILD_SLOT_WAIT_S:-3600}; else limit=${NRESE_BUILD_SLOT_WAIT_S:-1800}; fi
+  looked=0
   while :; do
+    # The disk read before the lock (bounded, never failing): a stalled file system holds no one else.
+    disk=""
+    [ "$disk_floor_gb" -eq 0 ] || disk=$(guard_disk_gb)
     lock_admission
+    # Once it has waited, the deadline again after the reads and the lock: nothing is admitted past it
+    # (r6-2). Its first look comes at once (at most the disk reading's 10 s late), whatever the limit.
+    waited=$((SECONDS - since))
+    if [ "$looked" = 1 ] && [ "$waited" -gt "$limit" ]; then
+      unlock_admission
+      rm -f "$ticket"
+      printf 'cargo %s: not built: no room to build after %s s (%s); try again later, or build on the fleet\n' \
+        "$*" "$waited" "$why" >&2
+      exit 75
+    fi
     for t in "$ADMIT"/queue/*; do if [ -e "$t" ] && ! holds "${t##*-}"; then rm -f "$t"; fi; done
     for r in "$ADMIT"/run/*; do if [ -e "$r" ] && ! holds "${r##*/}"; then rm -rf "$r"; fi; done
     running=0 others=0
@@ -354,9 +379,7 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
       fi
     done
     peak=$(peak_of "$CARGO_BUILD_JOBS")
-    why=""
-    disk=""
-    [ "$disk_floor_gb" -eq 0 ] || disk=$(guard_disk_gb)
+    why="" looked=1
     if [ "$disk_floor_gb" -gt 0 ] && ! { [[ "$disk" =~ ^[0-9]+$ ]] && [ "$disk" -ge "$disk_floor_gb" ]; }; then
       why="the guard's volume has ${disk:-an unreadable number of} GB free, below its kill line of $kill_disk GB plus a $(( disk_floor_gb - kill_disk )) GB margin"
     elif [ "$ahead" -gt 0 ]; then
@@ -391,6 +414,7 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
     # The deadline before any later look at the room, and no sleep past it: room that appears after
     # it doesn't admit (Sol, r5 follow-up).
     pause=${NRESE_BUILD_SLOT_POLL_S:-5}
+    waited=$((SECONDS - since))
     [ $(( limit - waited )) -ge "$pause" ] || pause=$(( limit - waited ))
     [ "$pause" -le 0 ] || sleep "$pause"
     waited=$((SECONDS - since))
