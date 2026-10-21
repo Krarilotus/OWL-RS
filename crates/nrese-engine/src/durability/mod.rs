@@ -34,6 +34,15 @@
 //!
 //! To keep the intact part of a corrupt log, open with `recover_until` at the revision the
 //! error names: the log is cut before the damage.
+//!
+//! A known false refusal, in the conservative direction: on file systems that extend a
+//! file's size before its data reaches the disk (NTFS, XFS), a power loss during an
+//! EveryCommit append of a frame spanning several pages can leave a later page written and
+//! an earlier one not. The frame was never synced, so never acknowledged, but it reads as
+//! damage (its end is not zeros) and opening fails closed, naming the revision before it.
+//! `recover_until` at that revision drops exactly that frame. Only when the frame's last
+//! page is the one lost does the in-flight rule above truncate it by itself. Telling the two
+//! apart needs per-block checksums: item 11 of the v2.0 plan.
 
 pub(crate) mod checkpoint;
 pub(crate) mod codec;
