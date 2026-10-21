@@ -47,6 +47,9 @@ impl Selection {
     /// ([`GraphView`]): the selected graphs without the excluded ones, in the selection's read
     /// model. The named graphs stay the store's, so `GRAPH $shapesGraph` still reads the
     /// shapes; only the default graph, which SHACL-SPARQL's data graph is, leaves them out.
+    /// Every selection sets the dataset, as a protocol request does: a constraint's own `FROM`
+    /// and `FROM NAMED` are replaced whatever form the selection takes, so the answer depends
+    /// only on the statements selected.
     pub(crate) fn query_dataset<V: ReadView>(
         &self,
         view: &V,
@@ -73,12 +76,7 @@ impl Selection {
             GraphSelector::Exact(graph) if excluded.contains(&graph) => {
                 dataset.set_default_graph(Vec::new());
             }
-            GraphSelector::Exact(graph) if graph.is_default_graph() => return Ok(()),
             GraphSelector::Exact(graph) => dataset.set_default_graph(vec![name(graph)?]),
-            GraphSelector::Any if excluded.is_empty() => {
-                options.union_default_graph = true;
-                return Ok(());
-            }
             GraphSelector::Any => dataset.set_default_graph_excluding(names(&excluded)?),
             GraphSelector::AnyNamed => {
                 let mut left_out = names(&excluded)?;
