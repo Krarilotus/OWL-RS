@@ -822,6 +822,39 @@ pub fn over_memory_limit() -> bool {
     nrese_exec::memory::process_limit_exceeded()
 }
 
+/// A [`Stop`] that stays stopped: once it has read true, it reads true for the rest of the
+/// operation it was made for. Interrupted work is found by asking the stop again
+/// ([`run_jobs`] skips what remains, its caller re-asks), and a stop the process's memory
+/// limit fires reads false again once memory is freed ([`over_memory_limit`]): without the
+/// latch, an interrupted round could pass as complete. The flag is read only when the stop
+/// is asked (between units of work, at a [`Poller`]'s poll), never per fact.
+pub struct Latched<F> {
+    stop: F,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl<F: Fn() -> bool + Sync> Latched<F> {
+    pub fn new(stop: F) -> Self {
+        Self {
+            stop,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the stop has fired, now or before.
+    pub fn stopped(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.fired.load(Relaxed) {
+            return true;
+        }
+        let stopped = (self.stop)();
+        if stopped {
+            self.fired.store(true, Relaxed);
+        }
+        stopped
+    }
+}
+
 /// Every fact `jobs` derive that `keep` accepts. If `stop` fires, the remaining morsels
 /// are skipped and the result is incomplete: the caller must check `stop` and discard it.
 pub fn run_jobs<S: Source + ?Sized>(

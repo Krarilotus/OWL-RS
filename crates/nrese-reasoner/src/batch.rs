@@ -2315,8 +2315,10 @@ fn run(
     mut representatives: Option<Representatives>,
     stop: super::eval::Stop<'_>,
 ) -> Result<Materialisation, Interrupted> {
-    // The process's memory limit stops it too, whatever the caller polls.
-    let stop: super::eval::Stop<'_> = &|| stop() || super::eval::over_memory_limit();
+    // The process's memory limit stops it too, whatever the caller polls; once either has
+    // fired, the run stays stopped (an interrupted round is never taken as complete).
+    let latch = super::eval::Latched::new(|| stop() || super::eval::over_memory_limit());
+    let stop: super::eval::Stop<'_> = &|| latch.stopped();
     let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
     let mut phases = Phases {
         load,
