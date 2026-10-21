@@ -53,6 +53,43 @@ const TRIPLE_VALUE: u8 = 7;
 const MAX_DECLARED: usize = 1 << 26;
 /// The longest string read (a literal of 1 GiB).
 const MAX_STRING: usize = 1 << 30;
+/// Reads up to this long take their buffer at once; longer ones grow it as their bytes
+/// arrive, so a record's declared length never allocates more than the document holds.
+const EAGER: usize = 1 << 16;
+
+/// The values a document declared, by id. RDF4J's writer numbers them from 0 and reuses
+/// ids within its table, so they are dense: a `Vec`. An id past its end goes to a map, so
+/// that memory follows the declarations made, never the largest id named.
+#[derive(Default)]
+struct Declared {
+    dense: Vec<Option<Term>>,
+    sparse: HashMap<usize, Option<Term>>,
+}
+
+impl Declared {
+    fn get(&self, id: usize) -> Option<&Term> {
+        match self.dense.get(id) {
+            Some(value) => value.as_ref(),
+            None => self.sparse.get(&id)?.as_ref(),
+        }
+    }
+
+    fn set(&mut self, id: usize, value: Option<Term>) {
+        if id < self.dense.len() {
+            self.dense[id] = value;
+        } else if id == self.dense.len() {
+            self.dense.push(value);
+            // What was declared past the end joins the dense part once it is reached.
+            while !self.sparse.is_empty()
+                && let Some(next) = self.sparse.remove(&self.dense.len())
+            {
+                self.dense.push(next);
+            }
+        } else {
+            self.sparse.insert(id, value);
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Charset {
@@ -67,7 +104,7 @@ pub(crate) struct BinaryParser<R: Read> {
     offset: u64,
     version: Option<i32>,
     charset: Charset,
-    declared: Vec<Option<Term>>,
+    declared: Declared,
     blank_nodes: BlankNodes,
     unchecked: bool,
     pub(crate) current: Option<Quad>,
@@ -81,7 +118,7 @@ impl<R: Read> BinaryParser<R> {
             offset: 0,
             version: None,
             charset: Charset::Utf8,
-            declared: Vec::new(),
+            declared: Declared::default(),
             blank_nodes,
             unchecked,
             current: None,
@@ -98,15 +135,27 @@ impl<R: Read> BinaryParser<R> {
         RdfSyntaxError::new(message, at..at).into()
     }
 
+    /// The next `n` bytes, in a buffer that holds no more than the bytes that came.
     fn bytes(&mut self, n: usize) -> Result<Vec<u8>, RdfParseError> {
-        let mut buffer = vec![0; n];
-        self.reader.read_exact(&mut buffer).map_err(|error| {
-            if error.kind() == io::ErrorKind::UnexpectedEof {
-                self.error("the document ends in the middle of a record")
-            } else {
-                error.into()
+        let ended = |parser: &Self| parser.error("the document ends in the middle of a record");
+        let buffer = if n <= EAGER {
+            let mut buffer = vec![0; n];
+            self.reader.read_exact(&mut buffer).map_err(|error| {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    ended(self)
+                } else {
+                    error.into()
+                }
+            })?;
+            buffer
+        } else {
+            let mut buffer = Vec::with_capacity(EAGER);
+            Read::take(&mut self.reader, n as u64).read_to_end(&mut buffer)?;
+            if buffer.len() < n {
+                return Err(ended(self));
             }
-        })?;
+            buffer
+        };
         self.offset += n as u64;
         Ok(buffer)
     }
@@ -218,8 +267,8 @@ impl<R: Read> BinaryParser<R> {
             VALUE_REF => {
                 let id = self.id()?;
                 return match self.declared.get(id) {
-                    Some(Some(term)) => Ok(Some(term.clone())),
-                    _ => Err(self.error(format!("a reference to value {id}, never declared"))),
+                    Some(term) => Ok(Some(term.clone())),
+                    None => Err(self.error(format!("a reference to value {id}, never declared"))),
                 };
             }
             URI_VALUE => {
@@ -316,10 +365,7 @@ impl<R: Read> BinaryParser<R> {
                 VALUE_DECL => {
                     let id = self.id()?;
                     let value = self.value(0)?;
-                    if self.declared.len() <= id {
-                        self.declared.resize(id + 1, None);
-                    }
-                    self.declared[id] = value;
+                    self.declared.set(id, value);
                 }
                 NAMESPACE_DECL => {
                     self.string()?;

@@ -15,7 +15,8 @@
 //! bugs here and nowhere else.
 
 /// The unit tests' allocator: the system's, counting what measured operations hold
-/// against their budgets ([`nrese_exec::measure`]).
+/// against their budgets ([`nrese_exec::measure`]), so that an allocation not charged to its
+/// budget fails a test.
 #[cfg(test)]
 #[global_allocator]
 static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =

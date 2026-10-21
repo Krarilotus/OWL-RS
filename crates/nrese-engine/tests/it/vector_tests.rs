@@ -306,6 +306,45 @@ fn an_unreadable_first_vector_of_a_dimension_changes_no_refusal() {
     assert_eq!(tiny.used(), 0);
 }
 
+/// A corpus built by a read its reader's budget refused (an equality expansion past it) is
+/// neither kept nor used: the next reader of the same statements finds every member (Sol's
+/// review of W2, r2 M1, with engine-v2's reader budgets).
+#[test]
+fn a_refused_read_keeps_no_partial_corpus() {
+    use nrese_engine::EncodedTriple;
+    let node = |name: &str| NamedNode::new_unchecked(format!("urn:{name}"));
+    let engine = engine();
+    let mut tx = engine.transaction();
+    let rep = tx.intern(node("rep").as_ref().into());
+    let same_as = tx.intern(node("sameAs").as_ref().into());
+    for i in 1..1000 {
+        let alias = tx.intern(node(&format!("alias{i}")).as_ref().into());
+        tx.insert_inferred(EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: rep,
+        });
+    }
+    tx.insert(QuadRef::from(&Quad::new(
+        node("rep"),
+        node("embedding"),
+        Literal::new_typed_literal("[1]", NamedNode::new_unchecked(DATATYPE)),
+        nrese_rdf::GraphName::DefaultGraph,
+    )));
+    tx.commit().expect("commit");
+    engine.set_equality(Some(same_as));
+    let reader = engine.snapshot();
+    let query = VectorQuery::new(vec![0.0], 1);
+    let small = reader
+        .reading_within(std::sync::Arc::new(nrese_exec::Budget::new(1024)))
+        .unwrap();
+    assert!(small.vector_search(&query, &|_| true).is_err());
+    assert!(small.read_refused().is_some());
+    drop(small);
+    let (hits, report) = reader.vector_search(&query, &|_| true).unwrap();
+    assert_eq!((hits.len(), report.space), (1, 1));
+}
+
 /// The hits a search returns keep their charge until they drop (Sol's review of W2, r1 F2:
 /// the scan's reservation went as the search returned).
 #[test]

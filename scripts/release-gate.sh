@@ -301,14 +301,15 @@ block)
   shift 5
   tree=$(worktree "$harness") || exit 2
   # Each side: its build of this layout, verified, and what its perf lab can do (CAPABILITIES).
-  # A baseline that is an earlier baseline's build (a confirmation job's main that is its base)
-  # is timed once, as that one (the report treats it so); the candidate always runs.
+  # A main that is an earlier side's build (a confirmation job's main that is its base) is timed
+  # once, as that one (the report treats it so); every other side always runs: an A-B-B-A's A'
+  # (benches/suite/abba.py) is A's build by design.
   sides=() names=() timed=()
   for spec in "$@"; do
     name=${spec%%=*}
     rev=$(git rev-parse "${spec#*=}") || exit 2
     bin=$(layout_bin "$rev" "$layout")
-    if [ "$name" != cand ] && printf '%s\n' "${timed[@]}" | grep -qxF -- "$bin"; then
+    if [ "$name" = main ] && printf '%s\n' "${timed[@]}" | grep -qxF -- "$bin"; then
       log "block $n: $name is the same build as another side ($(basename "$bin")): timed once"; continue
     fi
     [ "$name" = cand ] || timed+=("$bin")
@@ -385,8 +386,9 @@ if os.name != "nt":  # a directory is synced on POSIX; Windows can not open one 
   [ -f "$tree/$MEASURE" ] && opts+=(--measure "$MEASURE")
   # Batched timing (perf_lab --batch) only when every side's perf lab has it (jobs: GATE_BATCH).
   [ "${GATE_BATCH:-0}" = 1 ] && opts+=(--batch)
-  # The round's seed (GATE_SEED, else drawn once and kept with its results): each pair of blocks'
-  # orientation and the cases' order in a block drawn from it, recorded in every pass.
+  # The round's seed (GATE_SEED, else drawn once and kept with its results): each square of
+  # blocks' orders (fast.py palindrome()) and the cases' order in a block drawn from it, recorded
+  # in every pass.
   [ -s "$OUT/seed" ] || echo "${GATE_SEED:-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')}" > "$OUT/seed"
   opts+=(--seed "$(cat "$OUT/seed")")
   fast_env
@@ -644,7 +646,9 @@ plan-blocks)
   # later one the cases whose measured noise needs more passes (benches/fast/measure.toml).
   harness=$(git rev-parse "$2") || exit 2
   tree=$(worktree "$harness") || exit 2
-  (cd "$tree" && py benches/fast/release_gate.py blocks --plan "$PLAN" --measure "$MEASURE" --out "$GATE") \
+  (cd "$tree" && py benches/fast/release_gate.py blocks --plan "$PLAN" --measure "$MEASURE" --out "$GATE" \
+    --square "${GATE_SQUARE:?plan-blocks needs GATE_SQUARE, the timed sides (release_gate.py jobs sets it)}" \
+    --min-blocks "${GATE_MIN_BLOCKS:-2}") \
     | tee -a "$OUT/gate.log" || exit 2
   cp "$GATE"/plan-block-*.json "$OUT/"
   ;;

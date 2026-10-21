@@ -142,6 +142,7 @@ impl super::Context<'_> {
             late: None,
             canonical: None,
             canonical_refused: None,
+            reads_refused: self.reads_refused,
             cache: None,
             pin: RefCell::default(),
         };

@@ -98,6 +98,7 @@ export type AutocompleteResponse = {
 
 export type OutputState = {
   title: string;
-  status: "idle" | "success" | "error";
+  /** `incomplete`: answered, but not shown to be complete (and sound). */
+  status: "idle" | "success" | "incomplete" | "error";
   body: string;
 };

@@ -32,7 +32,7 @@ use parking_lot::RwLock;
 use super::hash::key_hash;
 use super::offsets::{Ends, Offsets};
 use super::order::Key;
-use super::pending::{Adopted, NewKey, Pending};
+use super::pending::{Adopted, NEW, Pending};
 use super::vocabulary::{Codec, Sample};
 use super::{TermId, TermKind, inline_to_literal, try_inline_literal};
 use crate::error::{EngineError, EngineResult};
@@ -1516,39 +1516,33 @@ impl Dictionary {
         &self,
         quads: &[Quad],
         pending: &Pending,
-        chunk: u32,
-        batch: u32,
+        (chunk, batch): (u32, u32),
+        scratch: &mut BatchScratch,
     ) -> Vec<EncodedQuad> {
-        let mut keys = KeyBatch::with_capacity(quads.len());
-        let slots = keys.slots(self, quads);
+        let BatchScratch {
+            keys,
+            slots,
+            indexes,
+            by_shard,
+        } = scratch;
+        keys.clear();
+        keys.slots(self, quads, slots);
         // Known keys under the shared lock; the others go to `pending`, each shard locked
         // once, at their positions in the input.
-        let found: Vec<Option<u64>> = {
+        indexes.clear();
+        {
             let inner = self.inner.read();
-            keys.keys
-                .iter()
-                .map(|key| inner.find(key.hash, &keys.arena[key.start..key.end]))
-                .collect()
-        };
-        let new: Vec<NewKey> = keys
-            .keys
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| found[i].is_none())
-            .map(|(i, key)| NewKey {
-                start: key.start,
-                end: key.end,
-                hash: key.hash,
-                at: super::pending::position(chunk, batch, i),
-            })
-            .collect();
-        let provisional = pending.intern(&keys.arena, &new);
-        let mut provisional = provisional.into_iter();
-        let indexes: Vec<u64> = found
-            .into_iter()
-            .map(|index| index.unwrap_or_else(|| provisional.next().expect("one per new key")))
-            .collect();
-        keys.resolve(&slots, &indexes)
+            indexes.extend(keys.keys.iter().map(|key| {
+                inner
+                    .find(key.hash, &keys.arena[key.start..key.end])
+                    .unwrap_or(NEW)
+            }));
+        }
+        pending.intern((chunk, batch), indexes, by_shard, |i| {
+            let key = &keys.keys[i];
+            (&keys.arena[key.start..key.end], key.hash)
+        });
+        keys.resolve(slots, indexes)
     }
 
     /// Numbers a bulk load's `pending` terms after the entries there are (in the order of
@@ -1561,7 +1555,12 @@ impl Dictionary {
             return;
         }
         let inner = self.inner.upgradable_read();
-        let adopted = pending.number(inner.len(), |hash, key| inner.find(hash, key));
+        // A load into an empty dictionary finds none of its terms there: no hashing.
+        let empty = inner.len() == 0;
+        let adopted = pending.number(inner.len(), |key| match empty {
+            true => None,
+            false => inner.find(key_hash(key), key),
+        });
         remap(&adopted);
         let mut inner = parking_lot::RwLockUpgradableReadGuard::upgrade(inner);
         inner.adopt(adopted);
@@ -1778,7 +1777,20 @@ struct PreparedKey {
     kind: TermKind,
 }
 
+/// What interning a bulk load's batch works in, kept for its next batches (one per thread
+/// at a time, [`crate::engine::BulkLoad`]): allocated afresh for each batch, on every thread
+/// at once, these arrays made the allocator hold far more than the load's data at its peak
+/// (18 Oct 2026).
+#[derive(Default)]
+pub(crate) struct BatchScratch {
+    keys: KeyBatch,
+    slots: Vec<[Slot; 4]>,
+    indexes: Vec<u64>,
+    by_shard: Vec<(u16, u32)>,
+}
+
 /// The distinct keys of one batch, encoded into one arena, with their hashes.
+#[derive(Default)]
 struct KeyBatch {
     arena: Vec<u8>,
     keys: Vec<PreparedKey>,
@@ -1790,21 +1802,19 @@ impl KeyBatch {
     /// Each quad's terms as slots, its keys added to the batch.
     /// Keys are added in the order the terms come (subject, predicate, object, graph): a
     /// bulk load's new terms are numbered in this order ([`super::pending`]).
-    fn slots(&mut self, dictionary: &Dictionary, quads: &[Quad]) -> Vec<[Slot; 4]> {
-        quads
-            .iter()
-            .map(|quad| {
-                let quad = quad.as_ref();
-                let subject = self.slot(dictionary, quad.subject.into());
-                let predicate = self.slot(dictionary, quad.predicate.into());
-                let object = self.slot(dictionary, quad.object);
-                let graph = match graph_term(quad.graph_name) {
-                    Some(term) => self.slot(dictionary, term),
-                    None => Slot::Id(TermId::DEFAULT_GRAPH),
-                };
-                [subject, predicate, object, graph]
-            })
-            .collect()
+    fn slots(&mut self, dictionary: &Dictionary, quads: &[Quad], slots: &mut Vec<[Slot; 4]>) {
+        slots.clear();
+        slots.extend(quads.iter().map(|quad| {
+            let quad = quad.as_ref();
+            let subject = self.slot(dictionary, quad.subject.into());
+            let predicate = self.slot(dictionary, quad.predicate.into());
+            let object = self.slot(dictionary, quad.object);
+            let graph = match graph_term(quad.graph_name) {
+                Some(term) => self.slot(dictionary, term),
+                None => Slot::Id(TermId::DEFAULT_GRAPH),
+            };
+            [subject, predicate, object, graph]
+        }));
     }
 
     /// The quads of `slots`, each key taking its index in `indexes`.
@@ -1827,12 +1837,11 @@ impl KeyBatch {
         quads
     }
 
-    fn with_capacity(quads: usize) -> Self {
-        Self {
-            arena: Vec::with_capacity(quads * 64),
-            keys: Vec::with_capacity(quads),
-            table: HashTable::with_capacity(quads),
-        }
+    /// Empty, its capacity kept.
+    fn clear(&mut self) {
+        self.arena.clear();
+        self.keys.clear();
+        self.table.clear();
     }
 
     fn slot(&mut self, dictionary: &Dictionary, term: TermRef<'_>) -> Slot {

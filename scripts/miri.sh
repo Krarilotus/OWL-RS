@@ -14,6 +14,8 @@ cd "$(dirname "$0")/.."
 # The tests that exercise unsafe code (one filter each).
 tests=(
   budget::tests::a_panicking_parallel_fill_drops_every_item_it_wrote
+  budget::tests::a_failing_parallel_fill_stops_and_drops_every_item_it_wrote
+  budget::tests::a_parallel_fill_returns_its_lowest_failure_and_unwinds_past_one
   region::tests::a_region_is_charged_before_it_grows_and_returns_everything
   region::tests::a_region_holds_at_its_boundaries
 )

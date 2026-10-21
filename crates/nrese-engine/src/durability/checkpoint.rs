@@ -90,11 +90,14 @@ const MAGIC_V5: &[u8; 8] = b"NRESECK5";
 const MAGIC_V4: &[u8; 8] = b"NRESECK4";
 /// Magic prefix shared by every checkpoint format version.
 const FAMILY: &[u8; 7] = b"NRESECK";
-/// What the writer's buffer holds before it is written out; it is made twice this, so that
-/// nothing appended between two drains grows it (a key that doesn't fit is written past it).
-const BUFFER: usize = 1 << 16;
 /// The file writer's buffer.
 const WRITER: usize = 1 << 20;
+/// What the writer's buffer holds before it is written out; it is made twice this, so that
+/// nothing appended between two drains grows it (a key that doesn't fit is written past it).
+/// The file writer's size: a flush that large goes past `BufWriter` to the file instead of
+/// being copied into it (at 64 KiB, every key was copied once more: YAGO's checkpoint
+/// dictionary pass 8 % slower, w6-ckpt-12).
+const BUFFER: usize = WRITER;
 const EXTENSION: &str = "nck";
 /// Dictionary keys copied per lock acquisition, so interning is never blocked for long.
 const KEY_CHUNK: u64 = 64 * 1024;
@@ -939,7 +942,7 @@ mod tests {
 
     /// 70,000 keys over two of the hash's chunks: a block of 64 of them of 2,000
     /// pseudo-random hex digits each (a wide offset block even compressed), and one of
-    /// 400,000 (compressed, longer than the writer's buffer), mapped from a section written
+    /// 8,000,000 (compressed, longer than the writer's buffer), mapped from a section written
     /// with a codec trained on them (a compressed base: each key decoded as it is read), and
     /// 1,000 keys interned on top.
     fn dictionary(dir: &Path) -> Dictionary {
@@ -947,7 +950,7 @@ mod tests {
         for i in 0..70_000u64 {
             let tail = match i {
                 6_400..6_464 => hex(i, 2_000),
-                50_000 => hex(i, 400_000),
+                50_000 => hex(i, 8_000_000),
                 _ => String::new(),
             };
             heap.intern(LiteralRef::new_simple_literal(&format!("word {i}{tail}")).into());
@@ -1047,7 +1050,8 @@ mod tests {
     }
 
     /// A dictionary section refused part way, by a root another holder filled (here on the
-    /// writer's first write), frees every buffer before it releases its charge, on the error
+    /// writer's first write: the keys' first flush, before the long key's compression needs
+    /// room), frees every buffer before it releases its charge, on the error
     /// path as on success: the offsets' reservation was released before their bytes, 60,100
     /// bytes held uncharged (Sol's review r2, `review_dictionary_error_frees_before_releasing`).
     #[test]
@@ -1055,7 +1059,7 @@ mod tests {
         if !nrese_exec::measure::alone() {
             return;
         }
-        const ROOM: usize = 2 << 20;
+        const ROOM: usize = 8 << 20;
         /// A writer whose first write fills the root but 64 bytes, for another holder.
         struct Filling<'a> {
             other: Reservation<&'a Budget>,
@@ -1073,8 +1077,10 @@ mod tests {
             }
         }
         let dictionary = Dictionary::default();
-        for i in 0..30_000 {
-            dictionary.intern(LiteralRef::new_simple_literal(&format!("word {i}")).into());
+        // Keys enough for the writer's buffer to flush before the long key (over 1 MiB stored).
+        for i in 0..120_000 {
+            let key = format!("word {i} {}", hex(i, 24));
+            dictionary.intern(LiteralRef::new_simple_literal(&key).into());
         }
         dictionary.intern(LiteralRef::new_simple_literal(&"long ".repeat(20_000)).into());
         let codec = Codec::train(&dictionary.export_keys(0, dictionary.len()));

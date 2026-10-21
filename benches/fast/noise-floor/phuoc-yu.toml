@@ -1,0 +1,47 @@
+# The A-A' noise floor of Phuoc-Yu (release_gate.py floor; benches/PROTOCOL.md §5):
+# per case and dimension, the sd of one block's log contrast between copies of one build.
+# From gate-ff-851e987d round 0, 8 blocks. Written by the tool, not by hand.
+source = "gate-ff-851e987d round 0, 8 blocks"
+
+[cases."lab-dbpedia-core"]
+"memory/anon_kernel" = 0.016497
+"time/q01-point-lookup" = 0.020178
+"time/q02-born-in-berlin" = 0.008191
+"time/q03-top-birthplaces" = 0.010654
+"time/q04-date-range" = 0.010205
+"time/q05-population" = 0.007973
+"time/q06-film-cast" = 0.022791
+"time/q07-subdivision-path" = 0.010084
+"time/q08-label-text" = 0.006954
+"time/q09-optional-death" = 0.020384
+"time/q10-types-count" = 0.026741
+"time/q11-count-all" = 0.032044
+"time/q12-goals-per-team" = 0.009978
+"time/q13-no-death" = 0.027425
+
+[cases."op-group"]
+"memory/anon_kernel" = 0.022867
+"time/distinct-authors" = 0.002787
+"time/tag-counts" = 0.011726
+"time/untitled" = 0.004641
+
+[cases."open-first-query"]
+"memory/anon_kernel" = 0.044689
+"time/cold/followers/first" = 0.038818
+"time/cold/followers/repeat" = 0.038818
+"time/cold/name/first" = 0.033604
+"time/cold/name/repeat" = 0.033604
+"time/cold/open" = 0.019300
+"time/cold/person/first" = 0.022228
+"time/cold/person/repeat" = 0.022228
+"time/cold/post/first" = 0.019743
+"time/cold/post/repeat" = 0.019743
+"time/warm/followers/first" = 0.010852
+"time/warm/followers/repeat" = 0.010852
+"time/warm/name/first" = 0.020070
+"time/warm/name/repeat" = 0.020070
+"time/warm/open" = 0.024451
+"time/warm/person/first" = 0.024989
+"time/warm/person/repeat" = 0.024989
+"time/warm/post/first" = 0.058682
+"time/warm/post/repeat" = 0.058682

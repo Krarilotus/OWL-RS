@@ -61,6 +61,93 @@ impl Shape {
     fn geographic(&self) -> bool {
         self.crs == CRS84
     }
+
+    /// The unit its measures (`distance`, `area`, `length`, `buffer`) are answered in.
+    fn units(&self) -> Units {
+        match self.geographic() {
+            true => Units::Geographic,
+            false => match in_metres(&self.crs) {
+                true => Units::Metres,
+                false => Units::Unknown,
+            },
+        }
+    }
+}
+
+/// What a shape's measures can answer in.
+#[derive(Clone, Copy, PartialEq)]
+enum Units {
+    /// CRS84 (EPSG:4326 read as it): metres geodesic, degrees and radians planar.
+    Geographic,
+    /// A projected system whose axes are in metres ([`in_metres`]): metres, planar.
+    Metres,
+    /// Any other system: its coordinates' unit isn't known here, so no requested unit can be
+    /// shown to be its own, and its raw coordinate measures would answer in whatever unit was
+    /// asked (SPR-19). Its measures are refused, an expression error.
+    Unknown,
+}
+
+/// Whether `crs` is one of the projected systems whose axis unit is known to be the metre
+/// (the EPSG registry): WGS 84 / UTM zones 1N-60N (32601-32660) and 1S-60S (32701-32760),
+/// WGS 84 / Pseudo-Mercator (3857), ETRS89 / UTM zones 28N-38N (25828-25838), ETRS89-extended
+/// / LAEA Europe (3035), RGF93 / Lambert-93 (2154), OSGB36 / British National Grid (27700)
+/// and DHDN / 3-degree Gauss-Krueger zones 2-5 (31466-31469), under any of the identifier
+/// forms [`epsg_code`] reads. A CRS database, with units and conversions for every system,
+/// comes in v2.0.
+fn in_metres(crs: &str) -> bool {
+    let Some(code) = epsg_code(crs) else {
+        return false;
+    };
+    matches!(
+        code,
+        32601..=32660
+            | 32701..=32760
+            | 3857
+            | 25828..=25838
+            | 3035
+            | 2154
+            | 27700
+            | 31466..=31469
+    )
+}
+
+/// The EPSG code `crs` names, in the identifier forms of one EPSG object: the OGC HTTP IRI
+/// of any dataset version (`http://www.opengis.net/def/crs/EPSG/0/3857`, `.../EPSG/8.9.2/3857`),
+/// the OGC URN with or without a version (`urn:ogc:def:crs:EPSG::3857`,
+/// `urn:ogc:def:crs:EPSG:6.18:3:3857`), and GML's legacy URL
+/// (`http://www.opengis.net/gml/srs/epsg.xml#3857`). A version is digits and dots, a code
+/// digits only: any other suffix names no code.
+fn epsg_code(crs: &str) -> Option<u32> {
+    let version = |v: &str| {
+        v.split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let (version_ok, code) = match (
+        crs.strip_prefix("http://www.opengis.net/def/crs/EPSG/"),
+        crs.strip_prefix("urn:ogc:def:crs:EPSG:"),
+        crs.strip_prefix("http://www.opengis.net/gml/srs/epsg.xml#"),
+    ) {
+        (Some(rest), _, _) => {
+            let (v, code) = rest.split_once('/')?;
+            (version(v), code)
+        }
+        (_, Some(rest), _) => {
+            let (v, code) = rest.rsplit_once(':')?;
+            (v.is_empty() || v.split(':').all(version), code)
+        }
+        (_, _, Some(code)) => (true, code),
+        (None, None, None) => return None,
+    };
+    let digits = !code.is_empty() && code.len() <= 6 && code.bytes().all(|b| b.is_ascii_digit());
+    if !(version_ok && digits) {
+        return None;
+    }
+    code.parse().ok()
+}
+
+/// Whether `unit` is the metre.
+fn metres(unit: &str) -> bool {
+    matches!(unit, "metre" | "meter")
 }
 
 /// The reference system a GML `srsName` names, in GeoSPARQL's IRI form.
@@ -722,26 +809,27 @@ pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
         "distance" => {
             let (a, b) = pair()?;
             let unit = unit(args.get(2)?)?;
-            if a.geographic() {
-                match planar_factor(unit)? {
+            match a.units() {
+                Units::Geographic => match planar_factor(unit)? {
                     None => double(geodesic_distance(&a.geometry, &b.geometry)?),
                     Some(per_degree) => {
                         double(Euclidean.distance(&a.geometry, &b.geometry) / per_degree)
                     }
+                },
+                Units::Metres if metres(unit) => {
+                    double(Euclidean.distance(&a.geometry, &b.geometry))
                 }
-            } else {
-                double(Euclidean.distance(&a.geometry, &b.geometry))
+                Units::Metres | Units::Unknown => None,
             }
         }
         "area" => {
             let a = shape(0)?;
             let unit = unit(args.get(1)?)?;
-            match (a.geographic(), unit) {
-                (true, "metre" | "meter" | "squareMetre" | "squareMeter") => {
-                    double(a.geometry.geodesic_area_unsigned())
-                }
-                (true, _) => None,
-                (false, _) => double(a.geometry.unsigned_area()),
+            let square_metres = matches!(unit, "metre" | "meter" | "squareMetre" | "squareMeter");
+            match a.units() {
+                Units::Geographic if square_metres => double(a.geometry.geodesic_area_unsigned()),
+                Units::Metres if square_metres => double(a.geometry.unsigned_area()),
+                _ => None,
             }
         }
         "length" => {
@@ -756,13 +844,13 @@ pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
                     _ => 0.0,
                 }
             };
-            match (a.geographic(), planar_factor(unit)) {
-                (true, Some(None)) => double(lines(&|l| Geodesic.length(l))),
-                (true, Some(Some(per_degree))) => {
+            match (a.units(), planar_factor(unit)) {
+                (Units::Geographic, Some(None)) => double(lines(&|l| Geodesic.length(l))),
+                (Units::Geographic, Some(Some(per_degree))) => {
                     double(lines(&|l| Euclidean.length(l)) / per_degree)
                 }
-                (true, None) => None,
-                (false, _) => double(lines(&|l| Euclidean.length(l))),
+                (Units::Metres, _) if metres(unit) => double(lines(&|l| Euclidean.length(l))),
+                _ => None,
             }
         }
         "buffer" => {
@@ -772,12 +860,13 @@ pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
                 _ => return None,
             };
             let unit = unit(args.get(2)?)?;
-            let buffered = match (a.geographic(), planar_factor(unit)?) {
+            let buffered = match (a.units(), planar_factor(unit)?) {
                 // In CRS84, metres: in a plane about the geometry.
-                (true, None) => metre_buffer(&a.geometry, radius)?,
+                (Units::Geographic, None) => metre_buffer(&a.geometry, radius)?,
                 // In CRS84, degrees and radians: planar.
-                (true, Some(factor)) => a.geometry.buffer(radius * factor),
-                (false, _) => a.geometry.buffer(radius),
+                (Units::Geographic, Some(factor)) => a.geometry.buffer(radius * factor),
+                (Units::Metres, None) => a.geometry.buffer(radius),
+                (Units::Metres, Some(_)) | (Units::Unknown, _) => return None,
             };
             Some(literal(&rounded(Geometry::MultiPolygon(buffered)), &a))
         }
