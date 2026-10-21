@@ -160,6 +160,7 @@ its resolution floors and memory policy, and the measurements they rest on).
 
 Every block times copies of the builds made for it ([PROTOCOL.md §5, "the unit"](../PROTOCOL.md#the-release-gate): a cached file's offset is shared by every block that times that file).
 
+- **The command for it:** [`benches/suite/abba.py`](../suite/abba.py). Declare a family file (sides a and b, the cases, each with a content check), then run `abba.py jobs FAMILY` and submit the jobs. `abba.py report` gives the verdict: an interleaved A-A' arm, the A-A' floor, Holm, and exit codes 0/1/2/3/4. The ways below are what it is built from.
 - **Catalog cases, through the gate's steps:** `release-gate.sh build REV` for each side, then `prepare HARNESS` with `GATE_BASELINES=base GATE_CASES=...`. Then `block N HARNESS 1 - base=REV cand=REV` for N = 1..k (four reports a block), and `report HARNESS cand=REV base=REV`.
 - **Directly:** `fast.py block --block N --cases C --side base:BINDIR:REV --side cand:BINDIR:REV --seed S --fresh-copies DIR --out PASSES`. This needs the native runtime and prepared data, and a BINDIR laid out like a gate build (`release/examples/perf_lab`, REVISION, SHA256SUMS).
 - **A hand-rolled `perf_lab` loop (no catalog case):** at each block's start run `cp -a "$BIN" "$W/copy-$k-$side" && sync` for each side, time from the copy, and `rm -rf` it at the block's end. Never time one file in two blocks.

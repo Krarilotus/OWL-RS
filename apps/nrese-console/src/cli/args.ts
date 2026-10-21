@@ -19,6 +19,8 @@ export type CliOptions = {
   baseUrl: string;
   token?: string;
   headers: Record<string, string>;
+  /** Fail (exit 3) on answers the server doesn't vouch for as complete. */
+  requireComplete: boolean;
   command: CliCommand;
 };
 
@@ -55,7 +57,8 @@ Content options:
   --accept <type>      Query accept header. Default: application/sparql-results+json
   --graph <mode>       default | named
   --graph-iri <iri>    Named graph IRI when --graph named
-  --method <verb>      PUT | POST for graph-write`;
+  --method <verb>      PUT | POST for graph-write
+  --require-complete   Exit 3 when the answers aren't shown to be complete (NRESE-Completeness)`;
 
 function requireValue(args: string[], index: number, flag: string): string {
   const value = args[index + 1];
@@ -93,6 +96,7 @@ export function parseCliArgs(argv: string[]): CliOptions {
   };
 
   let method: "PUT" | "POST" = "PUT";
+  let requireComplete = false;
 
   for (let index = 0; index < rest.length; index += 1) {
     const arg = rest[index];
@@ -145,6 +149,9 @@ export function parseCliArgs(argv: string[]): CliOptions {
         index += 1;
         break;
       }
+      case "--require-complete":
+        requireComplete = true;
+        break;
       default:
         throw new Error(`Unknown argument: ${arg}\n\n${HELP_TEXT}`);
     }
@@ -155,6 +162,7 @@ export function parseCliArgs(argv: string[]): CliOptions {
     baseUrl: pending.baseUrl,
     token: pending.token,
     headers: pending.headers,
+    requireComplete,
     command,
   };
 }

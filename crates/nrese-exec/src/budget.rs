@@ -741,7 +741,83 @@ impl<T> Room<'_, T> {
         // SAFETY: the `n` slots after the items are written, within the capacity.
         unsafe { self.0.set_len(len + n) };
     }
+
+    /// [`Self::par_fill`] with items that can fail: the first `Err` stops the fill, every
+    /// worker seeing it (one relaxed load per item) before its next item. Every worker is
+    /// joined before it returns; on an error every item written is dropped once, the room
+    /// holds what it held, and the error of the lowest index observed is returned (workers
+    /// stopped early may skip lower items, so it needn't be the one a sequential fill would
+    /// meet first). A panic is handled as in [`Self::par_fill`].
+    pub fn try_par_fill<E: Send>(
+        &mut self,
+        n: usize,
+        item: impl Fn(usize) -> Result<T, E> + Sync,
+    ) -> Result<(), E>
+    where
+        T: Send,
+    {
+        use rayon::prelude::*;
+        let len = self.0.len();
+        assert!(n <= self.0.capacity() - len, "past the room reserved");
+        // As in `par_fill`: the only pointer to the slots until the length is published.
+        let slots = Slots(self.0.as_mut_ptr().wrapping_add(len));
+        let part = n.div_ceil(4 * rayon::current_num_threads()).max(1);
+        let failed = AtomicBool::new(false);
+        // One token per range, with the range's error: ranges stopped early aren't adjacent,
+        // so the tokens are kept apart, at most a few per worker.
+        let ranges: Vec<FillRange<T, E>> = (0..n.div_ceil(part))
+            .into_par_iter()
+            .map(|p| {
+                let mut written = Written::new(slots, p * part);
+                for i in p * part..(p * part + part).min(n) {
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match item(i) {
+                        Ok(value) => {
+                            // SAFETY: (`Slots`) slot `i` is this range's, and not yet written.
+                            unsafe { slots.0.add(i).write(value) };
+                            written.len += 1;
+                        }
+                        Err(error) => {
+                            failed.store(true, Ordering::Relaxed);
+                            return (written, Some((i, error)));
+                        }
+                    }
+                }
+                (written, None)
+            })
+            .collect();
+        let mut first: Option<(usize, E)> = None;
+        let mut complete = Vec::with_capacity(ranges.len());
+        for (written, error) in ranges {
+            complete.push(written);
+            if let Some((i, error)) = error
+                && first.as_ref().is_none_or(|(at, _)| i < *at)
+            {
+                first = Some((i, error));
+            }
+        }
+        if let Some((_, error)) = first {
+            // Dropping the tokens drops what each range wrote, once.
+            drop(complete);
+            return Err(error);
+        }
+        // No error, so no range stopped: one range of every item, in order.
+        let written = complete
+            .into_iter()
+            .fold(Written::new(slots, 0), Written::join);
+        assert_eq!((written.start, written.len), (0, n), "every slot written");
+        std::mem::forget(written);
+        // SAFETY: the `n` slots after the items are written, within the capacity.
+        unsafe { self.0.set_len(len + n) };
+        Ok(())
+    }
 }
+
+/// What one range of [`Room::try_par_fill`] leaves: the items it wrote, and the index and error
+/// of the item it stopped at, if one failed.
+type FillRange<T, E> = (Written<T>, Option<(usize, E)>);
 
 /// The spare slots [`Room::par_fill`] writes, by one pointer taken from the vector before
 /// the work splits.
@@ -924,6 +1000,151 @@ mod tests {
                 .unwrap();
         });
         assert_eq!((items.len(), excess), (101, 0));
+    }
+
+    /// A fill whose item fails stops its siblings and leaves nothing behind: every item
+    /// written is dropped once, the vector holds what it held, the items' memory is released,
+    /// and the error returned is the lowest index observed. Without a failure it publishes
+    /// every item.
+    #[test]
+    fn a_failing_parallel_fill_stops_and_drops_every_item_it_wrote() {
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        static DROPPED: AtomicUsize = AtomicUsize::new(0);
+        struct Item<'b>(#[allow(dead_code)] ChargedVec<u8, &'b Budget>);
+        impl Drop for Item<'_> {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let budget = Budget::unlimited();
+        let item = |i: usize, fails: &[usize]| {
+            if fails.contains(&i) {
+                return Err(i);
+            }
+            MADE.fetch_add(1, Ordering::SeqCst);
+            Ok(Item(ChargedVec::with_capacity(&budget, 100).unwrap()))
+        };
+        let fill = |threads: usize, fails: &[usize]| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut items: ChargedVec<Item<'_>, &Budget> = ChargedVec::new(&budget);
+            items.push(Item(ChargedVec::new(&budget))).unwrap();
+            let filled = items
+                .fill(100, |room| {
+                    pool.install(|| room.try_par_fill(100, |i| item(i, fails)))
+                })
+                .unwrap();
+            (filled, items.len())
+        };
+        // One thread: the ranges in order, so the failure at 60 stops everything after it.
+        assert_eq!(fill(1, &[60, 80]), (Err(60), 1));
+        assert_eq!(MADE.load(Ordering::SeqCst), 60);
+        assert_eq!(
+            DROPPED.load(Ordering::SeqCst),
+            60 + 1,
+            "each once, then the vector"
+        );
+        // Several threads: whichever failures were observed, the lowest is returned, and
+        // every item made is dropped once.
+        let made = MADE.load(Ordering::SeqCst);
+        let (filled, len) = fill(4, &[30, 70]);
+        assert!(matches!(filled, Err(30 | 70)), "{filled:?}");
+        assert_eq!(len, 1);
+        assert_eq!(
+            DROPPED.load(Ordering::SeqCst) - 61,
+            MADE.load(Ordering::SeqCst) - made + 1
+        );
+        assert_eq!(budget.used(), 0, "the items' memory released");
+        assert_eq!(fill(4, &[]), (Ok(()), 101));
+    }
+
+    /// Two failures both observed return the lower: items 2 and 6 of 8, a range each on two
+    /// workers (each half of the fill on its own), each waiting until the other has started,
+    /// for at most 5 seconds, so that neither stops the other first. And a worker that panics
+    /// while another fails unwinds out of the fill with every item made dropped once, the
+    /// vector as it was and the items' memory released (Sol, w1-step1 r1, F1).
+    #[test]
+    fn a_parallel_fill_returns_its_lowest_failure_and_unwinds_past_one() {
+        use std::time::{Duration, Instant};
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        static DROPPED: AtomicUsize = AtomicUsize::new(0);
+        struct Item<'b>(#[allow(dead_code)] ChargedVec<u8, &'b Budget>);
+        impl Drop for Item<'_> {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let budget = Budget::unlimited();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let started = AtomicUsize::new(0);
+        let meet = || {
+            started.fetch_add(1, Ordering::SeqCst);
+            let since = Instant::now();
+            while started.load(Ordering::SeqCst) < 2 && since.elapsed() < Duration::from_secs(5) {
+                std::thread::yield_now();
+            }
+        };
+        let made = || {
+            MADE.fetch_add(1, Ordering::SeqCst);
+            Ok(Item(ChargedVec::with_capacity(&budget, 100).unwrap()))
+        };
+        let mut items: ChargedVec<Item<'_>, &Budget> = ChargedVec::new(&budget);
+        items.push(Item(ChargedVec::new(&budget))).unwrap();
+        let filled = items
+            .fill(8, |room| {
+                pool.install(|| {
+                    room.try_par_fill(8, |i| match i {
+                        2 | 6 => {
+                            meet();
+                            Err(i)
+                        }
+                        _ => made(),
+                    })
+                })
+            })
+            .unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 2, "both failures observed");
+        assert_eq!(filled, Err(2), "the lower of the two");
+        assert_eq!(items.len(), 1);
+        assert_eq!(DROPPED.load(Ordering::SeqCst), MADE.load(Ordering::SeqCst));
+        assert_eq!(budget.used(), items.charged(), "the items' memory released");
+        // Item 2 panics once item 6 has started, and item 6 fails.
+        started.store(0, Ordering::SeqCst);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            items.fill(8, |room| {
+                pool.install(|| {
+                    room.try_par_fill(8, |i| match i {
+                        2 => {
+                            meet();
+                            panic!("the worker at item 2 panics");
+                        }
+                        6 => {
+                            meet();
+                            Err(i)
+                        }
+                        _ => made(),
+                    })
+                })
+            })
+        }));
+        assert!(unwound.is_err(), "the panic unwinds out of the fill");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "the failure observed too"
+        );
+        assert_eq!(items.len(), 1, "the vector as it was");
+        assert_eq!(
+            DROPPED.load(Ordering::SeqCst),
+            MADE.load(Ordering::SeqCst),
+            "each item made dropped once"
+        );
+        assert_eq!(budget.used(), items.charged(), "the items' memory released");
     }
 
     /// A charged vector never holds more than it was charged: every path that grows it

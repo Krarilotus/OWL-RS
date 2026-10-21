@@ -8,7 +8,7 @@ import {
   runUpdate,
   writeGraph,
 } from "../lib/api";
-import { describeProblem, type Problem } from "../lib/http";
+import { describeProblem, type ResponseEnvelope } from "../lib/http";
 import type { OutputState, QuerySuggestion } from "../lib/types";
 
 type Setter<T> = (value: T) => void;
@@ -33,18 +33,29 @@ type SuggestionState = {
 export function useConsoleActions(strings: AppStrings, runtimeRefs: RuntimeRefs) {
   async function applyAction(
     title: string,
-    operation: Promise<{ ok: boolean; status: number; body: string; problem?: Problem }>,
+    operation: Promise<ResponseEnvelope>,
     setOutput: Setter<OutputState>,
     refresh = false,
   ) {
     const response = await operation;
-    setOutput({
-      title: `${title} (${response.status})`,
-      status: response.ok ? "success" : "error",
-      body: response.problem
-        ? describeProblem(response.problem)
-        : response.body || strings.noOutput,
-    });
+    const body = response.problem
+      ? describeProblem(response.problem)
+      : response.body || strings.noOutput;
+    // Answers the server doesn't vouch for as complete never read as a plain success.
+    const completeness = response.completeness;
+    if (response.ok && completeness && completeness.status !== "complete") {
+      setOutput({
+        title: `${title} (${response.status}, ${completeness.status})`,
+        status: "incomplete",
+        body: `${strings.incompleteAnswer} (${completeness.header})\n\n${body}`,
+      });
+    } else {
+      setOutput({
+        title: `${title} (${response.status})`,
+        status: response.ok ? "success" : "error",
+        body,
+      });
+    }
     if (refresh) {
       void runtimeRefs.refetchRuntime();
       void runtimeRefs.refetchCapabilities();
