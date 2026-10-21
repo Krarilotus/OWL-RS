@@ -1415,7 +1415,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         query.vector[0] = 1.0;
         query.metric = metric;
         query.strategy = nrese_engine::VectorStrategy::Approximate;
-        snapshot.prepare_vector_search();
+        snapshot
+            .prepare_vector_search()
+            .expect("an unbudgeted reader");
         let (_, readiness) = snapshot
             .vector_search(&query, &|_| true)
             .expect("an unlimited search");
