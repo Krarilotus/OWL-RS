@@ -264,12 +264,15 @@ class Migration(unittest.TestCase):
         (old / "lock").touch()
         inode = (old / "lock").stat().st_ino
         (old / "bin-0123456789ab").mkdir()
+        (old / "target\nnewline").mkdir()  # du prints such a name over two lines
         self.migrate(old)
         self.assertEqual(sorted(p.name for p in old.iterdir()), ["lock"])
         self.assertEqual((old / "lock").stat().st_ino, inode)
         # A build of the old kind holds the lock (a waiter that got it): its target survives a migration.
         (old / "target-1.98.1").mkdir()
-        holder = subprocess.Popen(["flock", str(old / "lock"), "sleep", "30"])
+        # --no-fork: the holder is the sleep itself, so killing it frees the lock and its pipes at once.
+        holder = subprocess.Popen(["flock", "--no-fork", str(old / "lock"), "sleep", "30"],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)
         deadline = time.monotonic() + 10
