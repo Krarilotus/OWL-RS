@@ -515,18 +515,25 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
                         continue;
                     }
                     let mut body = Vec::with_capacity(rule.body.len());
-                    derivations(change.source, rule, fact, Seg::All, &mut |bindings| {
-                        body.clear();
-                        body.extend(
-                            rule.body
-                                .iter()
-                                .map(|atom| instantiate_head(atom, bindings)),
-                        );
-                        if premises_in_closure(&body) {
-                            from.extend(premise_sets_from(&body, schema, &lookup, cap));
-                        }
-                        false
-                    });
+                    derivations(
+                        change.source,
+                        rule,
+                        fact,
+                        Seg::All,
+                        &mut Poller::never(),
+                        &mut |bindings| {
+                            body.clear();
+                            body.extend(
+                                rule.body
+                                    .iter()
+                                    .map(|atom| instantiate_head(atom, bindings)),
+                            );
+                            if premises_in_closure(&body) {
+                                from.extend(premise_sets_from(&body, schema, &lookup, cap));
+                            }
+                            false
+                        },
+                    );
                 }
                 (fact, from)
             })

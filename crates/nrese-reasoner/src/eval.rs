@@ -355,8 +355,10 @@ pub fn walk<S: Source + ?Sized>(
 /// [`walk`] that stops once `emit` returns true: the rest of a scan under way is passed
 /// over (a scan can't be stopped) and nothing deeper is scanned, so asking for one
 /// derivation doesn't enumerate the whole join (the review of 3 October 2026, P6).
-/// Returns whether `emit` stopped it. Kept apart from [`walk`], which materialisation
-/// runs and which never stops.
+/// Returns whether `emit` stopped it. It also stops at `poll`, as [`walk`] does: a search
+/// that finds nothing can try every partial binding of the body, a product of the
+/// atoms' matches (`poll.stopped()` then tells that nothing was decided).
+#[allow(clippy::too_many_arguments)]
 pub fn walk_until<S: Source + ?Sized>(
     source: &S,
     body: &[Atom],
@@ -364,6 +366,7 @@ pub fn walk_until<S: Source + ?Sized>(
     order: &[(usize, Seg)],
     depth: usize,
     bindings: &mut [Option<u64>],
+    poll: &mut Poller<'_>,
     emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
 ) -> bool {
     let Some(&(index, seg)) = order.get(depth) else {
@@ -372,11 +375,11 @@ pub fn walk_until<S: Source + ?Sized>(
     let atom = &body[index];
     let mut stopped = false;
     source.scan(pattern(atom, bindings), seg, &mut |fact| {
-        if stopped {
+        if stopped || poll.tick() {
             return;
         }
         if let Some(newly) = bind(atom, fact, bindings) {
-            stopped = walk_until(source, body, guards, order, depth + 1, bindings, emit);
+            stopped = walk_until(source, body, guards, order, depth + 1, bindings, poll, emit);
             unbind(atom, newly, bindings);
         }
     });
@@ -1041,6 +1044,7 @@ pub fn derivations<S: Source + ?Sized>(
     rule: &Rule,
     fact: Triple,
     seg: Seg,
+    poll: &mut Poller<'_>,
     emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
 ) {
     let Head::Facts(heads) = &rule.head else {
@@ -1072,11 +1076,12 @@ pub fn derivations<S: Source + ?Sized>(
                 &order,
                 0,
                 &mut bindings,
+                poll,
                 emit,
             )
         };
         unbind(head, newly, &mut bindings);
-        if stop {
+        if stop || poll.stopped() {
             return;
         }
     }
@@ -1618,16 +1623,23 @@ impl GroundProgram {
             .chain(transitive.as_ref().map(|rule| (rule, transitive_premises)));
         let mut bodies = Vec::new();
         for (rule, premises) in rules {
-            derivations(source, rule, fact, Seg::All, &mut |bindings| {
-                let mut body: Vec<Triple> = rule
-                    .body
-                    .iter()
-                    .map(|atom| instantiate_head(atom, bindings))
-                    .collect();
-                body.extend_from_slice(premises);
-                bodies.push((rule.name.clone(), body));
-                bodies.len() >= limit
-            });
+            derivations(
+                source,
+                rule,
+                fact,
+                Seg::All,
+                &mut Poller::never(),
+                &mut |bindings| {
+                    let mut body: Vec<Triple> = rule
+                        .body
+                        .iter()
+                        .map(|atom| instantiate_head(atom, bindings))
+                        .collect();
+                    body.extend_from_slice(premises);
+                    bodies.push((rule.name.clone(), body));
+                    bodies.len() >= limit
+                },
+            );
             if bodies.len() >= limit {
                 break;
             }
@@ -1664,19 +1676,26 @@ impl GroundProgram {
         let mut bodies = Vec::new();
         for (rule, grounding) in rules {
             let alternatives = self.premise_alternatives(grounding);
-            derivations(source, rule, fact, Seg::All, &mut |bindings| {
-                let body: Vec<Triple> = rule
-                    .body
-                    .iter()
-                    .map(|atom| instantiate_head(atom, bindings))
-                    .collect();
-                for premises in &alternatives {
-                    let mut full = body.clone();
-                    full.extend_from_slice(premises);
-                    bodies.push((rule.name.clone(), full));
-                }
-                bodies.len() >= limit
-            });
+            derivations(
+                source,
+                rule,
+                fact,
+                Seg::All,
+                &mut Poller::never(),
+                &mut |bindings| {
+                    let body: Vec<Triple> = rule
+                        .body
+                        .iter()
+                        .map(|atom| instantiate_head(atom, bindings))
+                        .collect();
+                    for premises in &alternatives {
+                        let mut full = body.clone();
+                        full.extend_from_slice(premises);
+                        bodies.push((rule.name.clone(), full));
+                    }
+                    bodies.len() >= limit
+                },
+            );
             if bodies.len() >= limit {
                 break;
             }
@@ -1687,39 +1706,63 @@ impl GroundProgram {
     /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`):
     /// a bodiless instance, a rule whose head matches it, or transitivity.
     pub fn derivable<S: Source + ?Sized>(&self, source: &S, fact: Triple) -> bool {
-        self.derivable_with(source, fact, true)
+        self.derivable_with(source, fact, true, NEVER)
     }
 
     /// [`Self::derivable`], optionally without transitivity (whose closure the caller
-    /// recomputes).
+    /// recomputes), polling `stop` as rule jobs do: a search that finds nothing can try a
+    /// product of the body's matches. Once `stop` fires the answer is `false`, decided by
+    /// nothing; the caller asks `stop` again (it stays stopped, [`Latched`]) and discards
+    /// what it found.
     pub fn derivable_with<S: Source + ?Sized>(
         &self,
         source: &S,
         fact: Triple,
         transitivity_too: bool,
+        stop: Stop<'_>,
     ) -> bool {
         if self.bodiless.contains(&fact) {
             return true;
         }
+        let Some(mut poll) = Poller::new(stop) else {
+            return false;
+        };
         let mut producers = Vec::new();
         self.heads.matching_fact(fact, &mut producers);
         producers.sort_unstable();
         producers.dedup_by_key(|(r, _)| *r);
         let mut found = false;
         for (r, _) in producers {
-            derivations(source, &self.rules[r], fact, Seg::All, &mut |_| {
-                found = true;
-                true
-            });
+            derivations(
+                source,
+                &self.rules[r],
+                fact,
+                Seg::All,
+                &mut poll,
+                &mut |_| {
+                    found = true;
+                    true
+                },
+            );
             if found {
                 return true;
             }
+            if poll.stopped() {
+                return false;
+            }
         }
         if transitivity_too && self.transitive.contains(&fact[1]) {
-            derivations(source, &transitivity(fact[1]), fact, Seg::All, &mut |_| {
-                found = true;
-                true
-            });
+            derivations(
+                source,
+                &transitivity(fact[1]),
+                fact,
+                Seg::All,
+                &mut poll,
+                &mut |_| {
+                    found = true;
+                    true
+                },
+            );
         }
         found
     }
@@ -1760,13 +1803,18 @@ impl GroundProgram {
             .collect()
     }
 
-    /// Whether one of the rules `only` marks derives `fact` from `source` in one step.
+    /// Whether one of the rules `only` marks derives `fact` from `source` in one step,
+    /// polling `stop` as [`Self::derivable_with`] does.
     pub fn derivable_by<S: Source + ?Sized>(
         &self,
         source: &S,
         fact: Triple,
         only: &[bool],
+        stop: Stop<'_>,
     ) -> bool {
+        let Some(mut poll) = Poller::new(stop) else {
+            return false;
+        };
         let mut producers = Vec::new();
         self.heads.matching_fact(fact, &mut producers);
         producers.sort_unstable();
@@ -1776,12 +1824,22 @@ impl GroundProgram {
             if !only.get(r).copied().unwrap_or(false) {
                 continue;
             }
-            derivations(source, &self.rules[r], fact, Seg::All, &mut |_| {
-                found = true;
-                true
-            });
+            derivations(
+                source,
+                &self.rules[r],
+                fact,
+                Seg::All,
+                &mut poll,
+                &mut |_| {
+                    found = true;
+                    true
+                },
+            );
             if found {
                 return true;
+            }
+            if poll.stopped() {
+                return false;
             }
         }
         false
@@ -1923,10 +1981,17 @@ mod tests {
             head: Head::Facts(vec![Atom([1, 13, 2].map(Term::Const))]),
         };
         let mut emitted = 0;
-        derivations(&source, &rule, [1, 13, 2], Seg::All, &mut |_| {
-            emitted += 1;
-            true
-        });
+        derivations(
+            &source,
+            &rule,
+            [1, 13, 2],
+            Seg::All,
+            &mut Poller::never(),
+            &mut |_| {
+                emitted += 1;
+                true
+            },
+        );
         assert_eq!(emitted, 1);
         assert_eq!(
             source.scans.load(Ordering::Relaxed),
@@ -1940,10 +2005,17 @@ mod tests {
         );
         // Not stopping, every derivation.
         let mut all = 0;
-        derivations(&source, &rule, [1, 13, 2], Seg::All, &mut |_| {
-            all += 1;
-            false
-        });
+        derivations(
+            &source,
+            &rule,
+            [1, 13, 2],
+            Seg::All,
+            &mut Poller::never(),
+            &mut |_| {
+                all += 1;
+                false
+            },
+        );
         assert_eq!(all, 10_000);
     }
 }
