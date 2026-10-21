@@ -4,9 +4,10 @@ bytes in a file of their own, and the times to connect, to the response's header
 byte. Times are recorded, never judged: /verify proves behaviour, not speed.
 
 An exchange either completes or fails, before any expectation is read:
-- **One deadline for all of it.** Connecting, sending, every read of the headers and of the body
-  wait at most what is left of the step's time, so a peer that trickles its bytes can't hold it
-  past its deadline (a socket timeout alone restarts with every byte).
+- **One deadline for all of it.** Resolving the host's name, connecting, sending, every read of
+  the headers and of the body wait at most what is left of the step's time, so a peer that
+  trickles its bytes can't hold it past its deadline (a socket timeout alone restarts with every
+  byte), nor can a slow resolver or a name with many addresses.
 - **Every byte the framing announced.** A body shorter than its Content-Length, a chunked body
   cut off, or one the deadline cut is an incomplete response: an error, never a body to check.
   The missing tail could hold the very text a `not_contains` excludes.
@@ -20,6 +21,7 @@ import http.client
 import io
 import json
 import socket
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -111,6 +113,44 @@ class Body:
                 "beyond_read_limit": self.size > self.read_limit}
 
 
+def connect(host: str, port: int, deadline: Deadline) -> socket.socket:
+    """A connected socket within the deadline, name resolution included: getaddrinfo runs on a
+    thread of its own (left behind, a daemon, if it outlasts the deadline: Python can't
+    interrupt it), and each address in turn gets only what is left (not a timeout each, as
+    socket.create_connection gives)."""
+    deadline.phase = "resolving the host's name"
+    found: dict = {}
+
+    def resolve() -> None:
+        try:
+            found["addresses"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as e:
+            found["error"] = e
+    resolver = threading.Thread(target=resolve, daemon=True)
+    resolver.start()
+    resolver.join(deadline.left())
+    if resolver.is_alive():
+        raise TimeoutError(deadline.passed())
+    if "error" in found:
+        raise found["error"]
+    deadline.phase = "connecting"
+    last: OSError = OSError(f"{host}: no address")
+    for family, kind, protocol, _, address in found["addresses"]:
+        sock = socket.socket(family, kind, protocol)
+        try:
+            sock.settimeout(deadline.left())
+            sock.connect(address)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            return sock
+        except TimeoutError:
+            sock.close()
+            raise TimeoutError(deadline.passed()) from None
+        except OSError as e:
+            sock.close()
+            last = e
+    raise last
+
+
 def transfer(method: str, url: str, headers: list[tuple[str, str]], payload: bytes | None,
              timeout_s: float, read_limit: int) -> dict:
     """One request and its whole response within `timeout_s`. The result: `response` (status,
@@ -124,9 +164,7 @@ def transfer(method: str, url: str, headers: list[tuple[str, str]], payload: byt
     raw = None
     started = time.perf_counter()
     try:
-        connection.timeout = deadline.left()
-        connection.connect()
-        raw = connection.sock
+        raw = connect(parts.hostname, parts.port or 80, deadline)
         connection.sock = _Socket(raw, deadline)
         out["timings_ms"]["connect"] = _ms(started)
         deadline.phase = "sending the request"
