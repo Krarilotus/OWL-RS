@@ -18,8 +18,11 @@ pub struct AiSuggestionService {
 
 impl AiSuggestionService {
     pub fn new(config: AiConfig) -> Result<Self> {
+        // No redirects: a provider's key travels in headers (Gemini's `x-goog-api-key` is
+        // one reqwest keeps across origins), and a hop elsewhere must not take it along.
         let http = Client::builder()
             .timeout(config.request_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("failed to build AI HTTP client")?;
 
@@ -83,7 +86,14 @@ impl AiSuggestionService {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::http::{HeaderMap, StatusCode, header};
+    use axum::response::IntoResponse;
+
     use super::AiSuggestionService;
+    use crate::ai::config::{AiConfig, AiProviderConfig, GeminiConfig};
+    use crate::ai::types::SuggestionContext;
 
     #[test]
     fn disabled_status_reports_no_model() {
@@ -93,5 +103,64 @@ mod tests {
         assert!(!status.enabled);
         assert_eq!(status.provider, "disabled");
         assert!(status.model.is_none());
+    }
+
+    /// A provider that redirects elsewhere doesn't get its API key sent there: the client
+    /// follows no redirect.
+    #[tokio::test]
+    async fn a_redirect_does_not_take_the_api_key_elsewhere() {
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/", elsewhere.local_addr().unwrap());
+        let record = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move |headers: HeaderMap| {
+                let record = Arc::clone(&record);
+                async move {
+                    let key = headers.get("x-goog-api-key").map(|key| format!("{key:?}"));
+                    record.lock().unwrap().push(key);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            });
+            axum::serve(elsewhere, app).await.unwrap();
+        });
+        let provider = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let api_base = format!("http://{}", provider.local_addr().unwrap());
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let target = target.clone();
+                async move {
+                    (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, target)]).into_response()
+                }
+            });
+            axum::serve(provider, app).await.unwrap();
+        });
+        let service = AiSuggestionService::new(AiConfig {
+            enabled: true,
+            provider: AiProviderConfig::Gemini(GeminiConfig {
+                api_key: "secret-key".to_owned(),
+                api_base,
+            }),
+            ..AiConfig::default()
+        })
+        .unwrap();
+        let outcome = service
+            .suggest(SuggestionContext {
+                locale: "en".to_owned(),
+                prompt: "classes".to_owned(),
+                current_query: None,
+                quad_count: 0,
+                named_graph_count: 0,
+                reasoning_mode: "disabled",
+                reasoning_profile: "none",
+                reasoning_read_model: "asserted",
+            })
+            .await;
+        assert!(outcome.is_err());
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
     }
 }

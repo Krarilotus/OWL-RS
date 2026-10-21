@@ -309,6 +309,8 @@ pub enum AccessError {
     Conflict(String),
     /// Too many failed logins.
     Throttled(String),
+    /// Too many password checks at once: try again shortly.
+    Busy(String),
     Store(String),
 }
 
@@ -320,6 +322,7 @@ impl fmt::Display for AccessError {
             | Self::NotFound(m)
             | Self::Conflict(m)
             | Self::Throttled(m)
+            | Self::Busy(m)
             | Self::Store(m) => f.write_str(m),
         }
     }
@@ -450,6 +453,35 @@ impl AccessState {
                 .as_ref()
                 .and_then(|user| self.users.get(user))
                 .is_some_and(|user| user.admin)
+    }
+
+    /// Whether `by` may create or change user `name` with these fields: its own password
+    /// only (no `admin`, no `roles`), or anything as an administrator. Decided before a
+    /// password is hashed, and again when the change applies.
+    pub fn may_put_user(
+        &self,
+        by: &Principal,
+        name: &str,
+        admin: Option<bool>,
+        roles: Option<&BTreeSet<String>>,
+    ) -> Result<(), AccessError> {
+        let own_password = by.user.as_deref() == Some(name) && admin.is_none() && roles.is_none();
+        if !own_password && !self.is_admin(by) {
+            return Err(AccessError::Forbidden(
+                "only administrators change users other than their own password".to_owned(),
+            ));
+        }
+        if !valid_user_name(name) {
+            return Err(AccessError::Invalid(format!(
+                "'{name}' can't name a user (letters, digits, '. _ @ + | : -')"
+            )));
+        }
+        if let Some(roles) = roles
+            && let Some(bad) = roles.iter().find(|role| !valid_role_name(role))
+        {
+            return Err(AccessError::Invalid(format!("'{bad}' can't name a role")));
+        }
+        Ok(())
     }
 
     /// `principal`'s roles: its credentials' and its user record's.
@@ -654,22 +686,7 @@ impl AccessState {
                 roles,
                 password_hash,
             } => {
-                let own_password = by.user.as_deref() == Some(name.as_str())
-                    && make_admin.is_none()
-                    && roles.is_none();
-                if !own_password {
-                    only_admins("change users other than their own password")?;
-                }
-                if !valid_user_name(&name) {
-                    return Err(AccessError::Invalid(format!(
-                        "'{name}' can't name a user (letters, digits, '. _ @ + | : -')"
-                    )));
-                }
-                if let Some(roles) = &roles
-                    && let Some(bad) = roles.iter().find(|role| !valid_role_name(role))
-                {
-                    return Err(AccessError::Invalid(format!("'{bad}' can't name a role")));
-                }
+                self.may_put_user(by, &name, make_admin, roles.as_ref())?;
                 let created = !self.users.contains_key(&name);
                 let user = self.users.entry(name.clone()).or_default();
                 let mut parts = Vec::new();
