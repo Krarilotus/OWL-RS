@@ -19,6 +19,8 @@ Every drill must use an artifact with these recorded fields:
 - quad count
 - checksum
 
+Where they come from: an image backup's `manifest.json` (revision, counts, size, SHA-256). For the N-Quads export (`GET /ops/api/admin/dataset/backup`), the headers `x-nrese-source-revision` and `x-nrese-quad-count`, and the SHA-256 at the end: the file's last line `# nrese-sha256 <hex>` (over every byte before it, so it stays with the file) and the trailer `x-nrese-checksum-sha256` (with `curl`, send `TE: trailers`). A restore checks the last line and refuses a mismatch; record its `checksum_verified`.
+
 ## Restore Verification Contract
 
 Every restore drill must record these checks:

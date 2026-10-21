@@ -164,6 +164,8 @@ pub struct AdminRestoreResponse {
     pub quad_count: u64,
     pub format: &'static str,
     pub checksum_sha256: String,
+    /// The payload's closing checksum comment (`# nrese-sha256`) was there and matched.
+    pub checksum_verified: bool,
     pub replaced_existing: bool,
 }
 
@@ -348,6 +350,7 @@ pub fn build_admin_restore_response(
         quad_count: report.quad_count,
         format: "n-quads",
         checksum_sha256: report.checksum_sha256.clone(),
+        checksum_verified: report.checksum_verified,
         replaced_existing: report.replaced_existing,
     }
 }

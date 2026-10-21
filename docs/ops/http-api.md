@@ -162,6 +162,8 @@ The hierarchy isn't stored; the reasoning modes materialise instance-level infer
 | DELETE | Removes the graph | 204; 404 if the named graph doesn't exist |
 
 - A named graph exists while it holds statements. The default graph always exists.
+- `GET` streams the graph as it is read, in constant memory at any size; `HEAD` answers whether it exists without reading it. The read's timeout (`budgets.graph_read_timeout`) bounds the wait for the first chunk and then each stall: a client that keeps reading gets all of a large graph, one that stops reading for that long (or disconnects) ends the read. A failure after the first chunk aborts the transfer (no final chunk, or a reset HTTP/2 stream), so a truncated body never looks complete. RDF4J's `GET /statements` streams the same way.
+- Writers' named bounds, so a stream's memory doesn't grow with the data: JSON-LD writes a subject with more than 64 KiB of statements as several node objects with the same `@id` (`jsonld-node-flush`; JSON-LD merges them), and Binary RDF refers by id to at most 65,536 values holding at most 4 MiB, writing others in full (`binary-rdf-idtable-bytes`).
 - Payloads: any of the six graph formats, named by `Content-Type`. A payload that names graphs of its own (possible in N-Quads, TriG and JSON-LD) is rejected.
 - `Content-Location` gives the base IRI for relative IRIs in the payload.
 - Writing the same content twice leaves the same graph: blank nodes are scoped to the payload, and a `PUT` replaces.
@@ -246,7 +248,7 @@ One repository-scoped API for every capability ([ADR-0007](../adr/0007-one-engin
 | `…/repositories/{id}/data` | Graph Store Protocol (`?graph=` or `?default`), as `/dataset/data` |
 | `…/repositories/{id}/tell`, `/shacl`, `/autocomplete`, `/classification`, `/realisation` | as their `/dataset/…` counterparts |
 | `…/repositories/{id}/info`, `/summary`, `/reasoning`, `/service-description` | readiness and statistics, reasoning diagnostics, the service description |
-| `…/repositories/{id}/backup`, `/restore` | N-Quads backup and restore |
+| `…/repositories/{id}/backup`, `/restore` | N-Quads backup and restore. The backup streams every asserted statement; `x-nrese-source-revision` and `x-nrese-quad-count` lead it, and its SHA-256 closes it as the comment `# nrese-sha256 <hex>` (over every byte before it) and follows it as the trailer `x-nrese-checksum-sha256` (announced in `Trailer`; HTTP/1.1 clients send `TE: trailers`). A restore checks that comment where present (`checksum_verified` in its answer) and refuses a mismatch with 400 before changing anything; a dump without one restores unchecked. |
 | `POST …/repositories/{id}/image` | An image backup into `backups/` of the data directory (administrators) |
 | `GET …/repositories/{id}/namespaces`, `PUT`/`DELETE …/namespaces/{prefix}` | The repository's prefixes (JSON object; the IRI as the `PUT` body); RDF4J's `/namespaces` reads the same |
 | `POST …/repositories/{id}/sessions` | Opens a client transaction (JSON: `id`, `path`, `idle_seconds`); then `POST {path}/update` (SPARQL update), `POST`/`DELETE {path}/data` (RDF to add or remove, `?graph=` for its graph), `GET`/`POST {path}/query` (reads the data as the session would leave it), `POST {path}/commit`, `DELETE {path}` (rollback). A session exists for the user who opened it only (its id is random; for anyone else it is 404), and reads in it keep their view of the data until the session or the store changes. RDF4J transactions use the same sessions |
