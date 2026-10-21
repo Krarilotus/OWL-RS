@@ -101,6 +101,49 @@ fn undeclarable_prefixes_round_trip() {
     }
 }
 
+/// The prefixes the writer declares on an element (for a namespace with no prefix, for
+/// `its:dir`) never shadow a configured one that names inside that element still use: a
+/// directional literal's own predicate, a triple term's predicates.
+#[test]
+fn element_declarations_shadow_no_configured_prefix() {
+    for (text, prefix, namespace) in [
+        (
+            "<http://e/s> <http://e/p> \"v\"@en--ltr .",
+            "its",
+            "http://e/",
+        ),
+        (
+            "<http://e/s> <http://other/p> <<( <http://e/a> <http://e/p> <http://e/b> )>> .",
+            "ns",
+            "http://e/",
+        ),
+    ] {
+        let quads: BTreeSet<Quad> = RdfParser::from_format(RdfFormat::NQuads)
+            .for_slice(text.as_bytes())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut writer = RdfSerializer::from_format(RdfFormat::RdfXml)
+            .with_prefix(prefix, namespace)
+            .unwrap()
+            .for_writer(Vec::new());
+        for quad in &quads {
+            writer.serialize_quad(quad).unwrap();
+        }
+        let written = writer.finish().unwrap();
+        let back: BTreeSet<Quad> = RdfParser::from_format(RdfFormat::RdfXml)
+            .for_slice(&written)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            back,
+            quads,
+            "{prefix:?}
+{}",
+            String::from_utf8_lossy(&written)
+        );
+    }
+}
+
 #[test]
 fn what_rdf_xml_cant_hold_is_an_error() {
     let parse = |text: &str| -> Vec<Quad> {
