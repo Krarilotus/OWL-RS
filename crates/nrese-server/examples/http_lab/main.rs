@@ -14,6 +14,10 @@
 //!
 //! The JSON report has, per workload, `p50_us` and `samples_us`, and `checked`: whether
 //! every response was what it must be (else the times don't count).
+//!
+//! This file is the same on every side a comparison builds; the one call that differs between
+//! revisions, the bulk load, is `load.rs` beside it (a revision without this file's own
+//! `load.rs` gets one from `benches/suite/shims/<revision>/http_lab/`).
 
 use std::time::Instant;
 
@@ -25,6 +29,8 @@ use nrese_server::policy::PolicyConfig;
 use nrese_server::{AppState, DeploymentPosture, build_app};
 use nrese_store::{StoreConfig, StoreService};
 use tower::util::ServiceExt;
+
+mod load;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -99,12 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let file = std::env::temp_dir().join(format!("http-lab-{}.nt", std::process::id()));
     std::fs::write(&file, data)?;
-    let loaded = store.bulk_load(&nrese_store::BulkLoadRequest {
-        files: vec![file.clone()],
-        replace: false,
-        graph: nrese_store::GraphTarget::DefaultGraph,
-        invalid: None,
-    });
+    let loaded = load::bulk_load(&store, vec![file.clone()]);
     std::fs::remove_file(&file)?;
     loaded?;
     let state = AppState::new(
