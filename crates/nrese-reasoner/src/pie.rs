@@ -32,7 +32,9 @@
 //! - `[Context <g>]`: GraphDB's internal contexts for auxiliary statements (`onto:_allDiff`,
 //!   `onto:scm_int`). A statement in a context becomes one with a predicate of its own,
 //!   `urn:nrese:pie-context:<g>#<p>`, so rules that read the context see exactly what rules
-//!   that write it derived. Unlike GraphDB, which hides the contexts, those statements are
+//!   that write it derived. `%` and `#` inside `<g>` or `<p>` are percent-encoded, so no two
+//!   (context, predicate) pairs share a predicate (GraphDB's own contexts have neither, and
+//!   keep these names). Unlike GraphDB, which hides the contexts, those statements are
 //!   in the inferred stack.
 //! - `[Cut]`: an evaluation hint of GraphDB's; ignored (it changes no conclusion).
 //! - Comments: `//` to the end of a line, and `/* … */`.
@@ -437,17 +439,24 @@ fn options(raw: Vec<String>) -> Result<Options, String> {
     Ok(out)
 }
 
-/// The predicate a statement in `context` gets ([`compile`]'s docs).
+/// The predicate a statement in `context` gets ([`compile`]'s docs): the pair's one name.
+/// `%` and `#` in either part are percent-encoded, so the one `#` between them splits the
+/// name back into the pair: no two pairs share it, and the name is a well-formed IRI.
 fn context_predicate(
     context: &Token,
     predicate: &Token,
     prefixes: &HashMap<String, String>,
 ) -> Result<Token, String> {
+    let part = |iri: &str| {
+        expand(iri, prefixes)
+            .replace('%', "%25")
+            .replace('#', "%23")
+    };
     match (context, predicate) {
         (Token::Iri(context), Token::Iri(predicate)) => Ok(Token::Iri(format!(
             "urn:nrese:pie-context:{}#{}",
-            expand(context, prefixes),
-            expand(predicate, prefixes)
+            part(context),
+            part(predicate)
         ))),
         _ => Err("a context on a statement whose predicate is a variable".into()),
     }
@@ -642,6 +651,32 @@ Consistency: self_friend
   -------------------------------
 }
 "#;
+
+    /// A statement's relation in a context is one per (context, predicate): pairs a plain
+    /// concatenation would merge get relations of their own, and GraphDB's own contexts keep
+    /// the names they had (statements inferred before still match).
+    #[test]
+    fn each_context_and_predicate_pair_is_its_own_relation() {
+        let prefixes = HashMap::from([("onto".to_owned(), "http://www.ontotext.com/".to_owned())]);
+        let name = |context: &str, predicate: &str| {
+            let iri = |text: &str| Token::Iri(text.to_owned());
+            match context_predicate(&iri(context), &iri(predicate), &prefixes).unwrap() {
+                Token::Iri(name) => name,
+                other => panic!("{other:?}"),
+            }
+        };
+        assert_ne!(
+            name("http://e/a", "http://e/b#c"),
+            name("http://e/a#http://e/b", "c")
+        );
+        assert_ne!(name("http://e/a%23", "p"), name("http://e/a#", "p"));
+        let owl = name("onto:_allDiff", "http://www.w3.org/2002/07/owl#sameAs");
+        assert_eq!(owl.matches('#').count(), 1, "{owl}");
+        assert_eq!(
+            name("onto:_allDiff", "onto:_distinct"),
+            "urn:nrese:pie-context:http://www.ontotext.com/_allDiff#http://www.ontotext.com/_distinct"
+        );
+    }
 
     #[test]
     fn a_ruleset_compiles_into_rules_axioms_and_checks() {
