@@ -1060,6 +1060,93 @@ mod tests {
         assert_eq!(fill(4, &[]), (Ok(()), 101));
     }
 
+    /// Two failures both observed return the lower: items 2 and 6 of 8, a range each on two
+    /// workers (each half of the fill on its own), each waiting until the other has started,
+    /// for at most 5 seconds, so that neither stops the other first. And a worker that panics
+    /// while another fails unwinds out of the fill with every item made dropped once, the
+    /// vector as it was and the items' memory released (Sol, w1-step1 r1, F1).
+    #[test]
+    fn a_parallel_fill_returns_its_lowest_failure_and_unwinds_past_one() {
+        use std::time::{Duration, Instant};
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        static DROPPED: AtomicUsize = AtomicUsize::new(0);
+        struct Item<'b>(#[allow(dead_code)] ChargedVec<u8, &'b Budget>);
+        impl Drop for Item<'_> {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let budget = Budget::unlimited();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let started = AtomicUsize::new(0);
+        let meet = || {
+            started.fetch_add(1, Ordering::SeqCst);
+            let since = Instant::now();
+            while started.load(Ordering::SeqCst) < 2 && since.elapsed() < Duration::from_secs(5) {
+                std::thread::yield_now();
+            }
+        };
+        let made = || {
+            MADE.fetch_add(1, Ordering::SeqCst);
+            Ok(Item(ChargedVec::with_capacity(&budget, 100).unwrap()))
+        };
+        let mut items: ChargedVec<Item<'_>, &Budget> = ChargedVec::new(&budget);
+        items.push(Item(ChargedVec::new(&budget))).unwrap();
+        let filled = items
+            .fill(8, |room| {
+                pool.install(|| {
+                    room.try_par_fill(8, |i| match i {
+                        2 | 6 => {
+                            meet();
+                            Err(i)
+                        }
+                        _ => made(),
+                    })
+                })
+            })
+            .unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 2, "both failures observed");
+        assert_eq!(filled, Err(2), "the lower of the two");
+        assert_eq!(items.len(), 1);
+        assert_eq!(DROPPED.load(Ordering::SeqCst), MADE.load(Ordering::SeqCst));
+        assert_eq!(budget.used(), items.charged(), "the items' memory released");
+        // Item 2 panics once item 6 has started, and item 6 fails.
+        started.store(0, Ordering::SeqCst);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            items.fill(8, |room| {
+                pool.install(|| {
+                    room.try_par_fill(8, |i| match i {
+                        2 => {
+                            meet();
+                            panic!("the worker at item 2 panics");
+                        }
+                        6 => {
+                            meet();
+                            Err(i)
+                        }
+                        _ => made(),
+                    })
+                })
+            })
+        }));
+        assert!(unwound.is_err(), "the panic unwinds out of the fill");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "the failure observed too"
+        );
+        assert_eq!(items.len(), 1, "the vector as it was");
+        assert_eq!(
+            DROPPED.load(Ordering::SeqCst),
+            MADE.load(Ordering::SeqCst),
+            "each item made dropped once"
+        );
+        assert_eq!(budget.used(), items.charged(), "the items' memory released");
+    }
+
     /// A charged vector never holds more than it was charged: every path that grows it
     /// reserves first, a writer it lends can't grow it, a capacity no vector can hold is
     /// refused, and its items leave with their reservation.
