@@ -2382,3 +2382,78 @@ _:l33a rdf:rest _:l33b"#,
         );
     }
 }
+
+/// A rederivation that finds nothing can try a product of the body's matches: the only
+/// derivation of a fact between two complete components is deleted, and its three-link chain
+/// joins every partial path inside one component before the last link fails. Once the
+/// update's stop fires, the search ends within its poll interval, not after the product
+/// (review N10 r1, F2).
+#[test]
+fn a_failing_rederivation_stops_within_its_poll_interval() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::delta::{Base, Interrupted, MemoryBase, Rules, update_until};
+    use super::ir::parse_rules;
+
+    /// A base that counts the facts its scans hand out.
+    struct Counting {
+        base: MemoryBase,
+        scanned: AtomicUsize,
+    }
+    impl Base for Counting {
+        fn scan(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
+            self.base.scan(pattern, &mut |fact| {
+                self.scanned.fetch_add(1, Ordering::Relaxed);
+                f(fact);
+            });
+        }
+        fn estimate(&self, pattern: [Option<u64>; 3]) -> usize {
+            self.base.estimate(pattern)
+        }
+        fn contains(&self, fact: Triple) -> bool {
+            self.base.contains(fact)
+        }
+        fn is_asserted(&self, fact: Triple) -> bool {
+            self.base.is_asserted(fact)
+        }
+    }
+
+    let n = 100;
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = parse_rules(
+        "chain: (?a rdfs:seeAlso ?b), (?b rdfs:seeAlso ?c), (?c rdfs:seeAlso ?d) -> (?a rdfs:isDefinedBy ?d)",
+        &mut vocabulary,
+    )
+    .unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    let compiled = Rules {
+        rules: &rules,
+        lists: None,
+        schema: &schema,
+    };
+    let mut text = Vec::new();
+    for component in ["a", "b"] {
+        for i in 0..n {
+            for j in 0..n {
+                text.push(format!("ex:{component}{i} rdfs:seeAlso ex:{component}{j}"));
+            }
+        }
+    }
+    let asserted = load(&mut vocabulary, &text.join("\n"));
+    let deleted = load(&mut vocabulary, "ex:a0 rdfs:isDefinedBy ex:b0");
+    let base = Counting {
+        base: MemoryBase::new(&asserted, &[]),
+        scanned: AtomicUsize::new(0),
+    };
+    let fires = 1000;
+    let stop = || base.scanned.load(Ordering::Relaxed) >= fires;
+    let result = update_until(&base, &[], &deleted, compiled, None, &stop);
+    assert_eq!(result.err(), Some(Interrupted));
+    let scanned = base.scanned.load(Ordering::Relaxed);
+    let bound = fires + nrese_exec::POLL_UNITS as usize + 3 * n;
+    assert!(
+        scanned <= bound,
+        "{scanned} facts scanned (bound {bound}; the failed search tries {})",
+        n + n * n
+    );
+}
