@@ -93,7 +93,10 @@ pub(crate) fn backup_image(
     let json = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| StoreError::Configuration(error.to_string()))?;
     let path = dir.join(MANIFEST);
-    fs::write(&path, json).map_err(|e| io(e, &path))?;
+    // Written beside it and placed durably, as the image is: a restore reads it first.
+    let partial = path.with_extension("json.tmp");
+    fs::write(&partial, json).map_err(|e| io(e, &partial))?;
+    nrese_engine::place_file(&partial, &path).map_err(|e| io(e, &path))?;
     Ok(manifest)
 }
 
