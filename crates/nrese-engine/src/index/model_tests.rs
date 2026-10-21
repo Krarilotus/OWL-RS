@@ -383,3 +383,35 @@ fn group_counts_of_large_ranges_add_up_across_parts() {
     }
     assert_eq!(totals, expected);
 }
+
+/// Every layout keeps the permutation each pattern shape's access plan reads, the pattern's
+/// bound components a prefix of it: an equality expansion merges its matches in that order
+/// as it reads them, collecting none (`Snapshot::expanded`).
+#[test]
+fn every_layout_keeps_every_access_plans_permutation() {
+    let selectors = [
+        GraphSelector::Any,
+        GraphSelector::AnyNamed,
+        GraphSelector::Exact(TermId::DEFAULT_GRAPH),
+        GraphSelector::Exact(graph(1)),
+    ];
+    for graph in selectors {
+        for bits in 0..8u8 {
+            let bound = |bit: u8| (bits & bit != 0).then(|| term(1));
+            let pattern = QuadPattern {
+                subject: bound(1),
+                predicate: bound(2),
+                object: bound(4),
+                graph,
+            };
+            let permutation = AccessPlan::for_pattern(&pattern).permutation;
+            assert!(
+                AccessPlan::in_permutation(&pattern, permutation).is_some(),
+                "{pattern:?}"
+            );
+            for layout in LAYOUTS {
+                assert!(layout.supports(permutation), "{pattern:?} {layout:?}");
+            }
+        }
+    }
+}

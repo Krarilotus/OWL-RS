@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 use nrese_engine::{Engine, EngineConfig, ReadModel, TermId};
 use nrese_sparql::CancellationToken;
 
-use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, export_dataset};
+use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, export_dataset};
 use crate::bulk_load::{BulkLoadReport, BulkLoadRequest, bulk_load};
 use crate::config::{StoreConfig, StoreMode};
 use crate::error::StoreResult;
-use crate::graph_store::{GraphReadRequest, GraphReadResult, GraphWriteReport, GraphWriteRequest};
-use crate::graph_store_executor::execute_graph_read;
+use crate::graph_store::{
+    GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport, GraphWriteRequest,
+};
+use crate::graph_store_executor::{graph_exists, write_graph};
 use crate::loader::preload_ontology;
 use crate::mutation::{MutationCommand, MutationCommitReport};
 use crate::query::{SerializedQueryResult, SparqlQueryRequest};
@@ -95,13 +97,17 @@ impl fmt::Debug for StoreService {
 
 impl StoreService {
     pub fn new(config: StoreConfig) -> StoreResult<Self> {
-        let runtime = std::sync::Arc::new(crate::Runtime::new(config.total_query_memory_bytes));
+        let runtime = std::sync::Arc::new(crate::Runtime::new(
+            config.process_memory_bytes,
+            config.total_query_memory_bytes,
+        ));
         Self::with_runtime(config, runtime)
     }
 
     /// Opens a store on resources shared with other stores. A catalog uses this for
     /// every repository; embedded applications can supply the same owner explicitly.
-    /// The runtime's budget applies, not `config.total_query_memory_bytes`.
+    /// The runtime's budgets apply, not `config.total_query_memory_bytes` or, for what is
+    /// charged, `config.process_memory_bytes` (which stays this store's watch).
     pub fn with_runtime(
         config: StoreConfig,
         runtime: std::sync::Arc<crate::Runtime>,
@@ -180,6 +186,11 @@ impl StoreService {
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             last_materialisation: std::sync::Arc::default(),
         };
+        // The planner's statistics are the store's, shared by its requests: an envelope of
+        // their own within the catalog's budget, as classification's.
+        service
+            .engine
+            .charge_statistics_to(std::sync::Arc::new(service.envelope(None).part()));
         if service.engine.snapshot().revision() != before {
             service.invalidate_reasoning()?;
         }
@@ -402,6 +413,17 @@ impl StoreService {
     ) -> StoreResult<DatasetBackupArtifact> {
         scope.require_all("an export")?;
         export_dataset(&self.engine.snapshot(), format)
+    }
+
+    /// An export of the latest snapshot, to be written as it is read
+    /// ([`DatasetExport::write`]); for a scope that reads every graph.
+    pub fn dataset_export(
+        &self,
+        scope: &crate::ReadScope,
+        format: DatasetBackupFormat,
+    ) -> StoreResult<DatasetExport> {
+        scope.require_all("an export")?;
+        Ok(DatasetExport::of(self.engine.snapshot(), format))
     }
 
     /// What this store's updates are evaluated with.
@@ -898,7 +920,7 @@ impl StoreService {
     /// once, and the limit; `None` without a limit
     /// ([`StoreConfig::total_query_memory_bytes`]).
     pub fn query_memory(&self) -> Option<(usize, usize, usize)> {
-        let budget = self.settings.runtime.query_memory()?;
+        let budget = self.settings.runtime.query_pool()?;
         Some((budget.used(), budget.peak(), budget.limit()))
     }
 
@@ -921,29 +943,61 @@ impl StoreService {
         self.execute_query(&SparqlQueryRequest::new(query, crate::ReadScope::All))
     }
 
-    /// A graph (Graph Store Protocol `GET`) as the read sees it: a graph its scope doesn't
-    /// read doesn't exist for it.
+    /// A graph (Graph Store Protocol `GET`) as the read sees it, in memory: for callers that
+    /// want it so (tests, embedding); the server streams [`Self::write_graph`].
     pub fn execute_graph_read(
         &self,
         read: &crate::ReadContext<'_>,
         request: &GraphReadRequest,
     ) -> StoreResult<GraphReadResult> {
-        if let Some(access) = read.scope.access() {
-            let graph = request.target.graph_name()?;
-            if !access.allows_graph(&graph) {
-                return Ok(GraphReadResult {
-                    media_type: request.format.media_type(),
-                    payload: Vec::new(),
-                    exists: false,
-                });
-            }
+        let mut payload = Vec::new();
+        let exists = self.write_graph(read, request, &mut payload)?;
+        Ok(GraphReadResult {
+            media_type: request.format.media_type(),
+            payload,
+            exists,
+        })
+    }
+
+    /// A graph (Graph Store Protocol `GET`) as the read sees it, written to `out` as it is
+    /// read; `false` (nothing written) for a graph that doesn't exist for the read, as a
+    /// graph its scope doesn't read.
+    pub fn write_graph(
+        &self,
+        read: &crate::ReadContext<'_>,
+        request: &GraphReadRequest,
+        out: impl std::io::Write,
+    ) -> StoreResult<bool> {
+        if !self.readable(read, &request.target)? {
+            return Ok(false);
         }
-        execute_graph_read(
+        let view = self.read_snapshot(read.scope.access());
+        write_graph(&view, request, read.model(), &read.cancel, out)
+    }
+
+    /// Whether a graph exists as the read sees it (Graph Store Protocol `HEAD`), as
+    /// [`Self::write_graph`] would answer, with nothing decoded.
+    pub fn graph_exists(
+        &self,
+        read: &crate::ReadContext<'_>,
+        target: &GraphTarget,
+    ) -> StoreResult<bool> {
+        if !self.readable(read, target)? {
+            return Ok(false);
+        }
+        graph_exists(
             &self.read_snapshot(read.scope.access()),
-            request,
+            target,
             read.model(),
-            &read.cancel,
         )
+    }
+
+    /// Whether the read's scope reads `target`: a graph it doesn't read doesn't exist for it.
+    fn readable(&self, read: &crate::ReadContext<'_>, target: &GraphTarget) -> StoreResult<bool> {
+        Ok(match read.scope.access() {
+            Some(access) => access.allows_graph(&target.graph_name()?),
+            None => true,
+        })
     }
 
     /// Runs `read` on the data as it would be after `pending` (an RDF4J transaction's

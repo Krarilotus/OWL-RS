@@ -159,6 +159,13 @@ thread_local! {
     pub(super) static STATISTICS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Run at every step the orderer asks whether to stop, before it asks: a test's measure
+    /// of planning work, and its way to cancel a query after a chosen amount of it.
+    pub(super) static STEP: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn note_statistics(_reads: usize, _steps: usize) {
     #[cfg(test)]
     STATISTICS.with(|c| {
@@ -177,6 +184,15 @@ pub(super) fn order(
     sets: Option<&CharacteristicSets>,
     stop: &dyn Fn() -> bool,
 ) -> Option<Plan> {
+    #[cfg(test)]
+    let stop = &|| {
+        STEP.with(|hook| {
+            if let Some(hook) = &*hook.borrow() {
+                hook();
+            }
+        });
+        stop()
+    };
     search(inputs, variables, probe_factor, sets, None, stop)
 }
 
@@ -621,6 +637,105 @@ mod tests {
             sorted.sort_unstable();
             assert_eq!(sorted, (0..n).collect::<Vec<_>>());
             assert_eq!(plan.rows.len(), n);
+        }
+    }
+    /// A query's cancellation reaches the orderer while it plans the large patterns of
+    /// `tests/it/depth_tests.rs` (a path of 1,000 steps spelled out as triple patterns, stars
+    /// of 1,000 patterns, of 1,000 single-variable checks and of 250 triple terms; a
+    /// 1,000-step path planned for 28 s, a 250-pattern star for 114 s, unable to stop:
+    /// 12 October 2026). Cancelled halfway through the steps its planning takes, a query
+    /// stops at that step, refused with `Cancelled`.
+    #[test]
+    fn large_patterns_stop_planning_at_the_step_they_are_cancelled() {
+        use crate::{CancellationToken, QueryEvaluationError, QueryOptions, Resources};
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let node = |name: String| NamedNode::new_unchecked(format!("http://e/{name}"));
+        let mut tx = engine.transaction();
+        for s in 0..5 {
+            for i in 0..7 {
+                let quad = Quad::new(
+                    node(format!("s{s}")),
+                    node(format!("p{i}")),
+                    node(format!("s{}", (s + i) % 5)),
+                    GraphName::DefaultGraph,
+                );
+                tx.insert(quad.as_ref());
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let p = |i: usize| format!("<http://e/p{}>", i % 7);
+        let patterns = |n: usize, f: &dyn Fn(usize) -> String| (0..n).map(f).collect::<String>();
+        for (shape, text) in [
+            (
+                "chain",
+                format!(
+                    "SELECT * WHERE {{ ?s {} ?o }}",
+                    (0..1_000).map(p).collect::<Vec<_>>().join("/")
+                ),
+            ),
+            (
+                "star",
+                format!(
+                    "SELECT * WHERE {{ {} }}",
+                    patterns(1_000, &|i| format!("?s {} ?o{i} . ", p(i)))
+                ),
+            ),
+            (
+                "checks",
+                format!(
+                    "SELECT * WHERE {{ {} }}",
+                    patterns(1_000, &|i| format!("?s {} <http://e/s{}> . ", p(i), i % 5))
+                ),
+            ),
+            (
+                "triple-terms",
+                format!(
+                    "SELECT * WHERE {{ ?s ?q ?o . {} }}",
+                    patterns(250, &|i| format!(
+                        "?s {} <<( ?a{i} {} ?o )>> . ",
+                        p(i),
+                        p(i + 1)
+                    ))
+                ),
+            ),
+        ] {
+            let query = nrese_sparql_syntax::SparqlParser::new()
+                .parse_query(&text)
+                .unwrap();
+            let steps = Rc::new(Cell::new(0usize));
+            let count = Rc::clone(&steps);
+            STEP.set(Some(Box::new(move || count.set(count.get() + 1))));
+            let planned = crate::plan_query(&snapshot, &query, &QueryOptions::default());
+            let all = steps.replace(0);
+            assert!(planned.is_ok(), "{shape}: {:?}", planned.err());
+            assert!(all >= 100, "{shape}: planned in {all} steps");
+            let token = CancellationToken::new();
+            let (count, cancel) = (Rc::clone(&steps), token.clone());
+            STEP.set(Some(Box::new(move || {
+                count.set(count.get() + 1);
+                if count.get() == all / 2 {
+                    cancel.cancel();
+                }
+            })));
+            let options = QueryOptions {
+                resources: Resources {
+                    cancellation: Some(token),
+                    ..Resources::default()
+                },
+                ..QueryOptions::default()
+            };
+            let planned = crate::plan_query(&snapshot, &query, &options);
+            STEP.set(None);
+            assert!(
+                matches!(planned, Err(QueryEvaluationError::Cancelled)),
+                "{shape}: {:?}",
+                planned.err()
+            );
+            assert_eq!(steps.get(), all / 2, "{shape}: steps of {all}");
         }
     }
 }

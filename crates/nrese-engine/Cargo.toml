@@ -10,8 +10,11 @@ license.workspace = true
 [dependencies]
 aho-corasick = "1.1"
 crc32fast = "1.5"
-# FSST-compressed vocabularies (src/term/vocabulary.rs); Apache-2.0.
-fsst = { package = "fsst-rs", version = "0.6" }
+# FSST-compressed vocabularies (src/term/vocabulary.rs); Apache-2.0. Pinned: a checkpoint
+# charges FSST's training and tables as constants measured on this version
+# (vocabulary::TRAINING_BYTES, CODEC_HELD); a new version is measured again
+# (durability::checkpoint's the_dictionary_section_holds_what_it_charged).
+fsst = { package = "fsst-rs", version = "=0.6.0" }
 hashbrown = { workspace = true }
 memchr = { workspace = true }
 memmap2 = "0.9"
@@ -29,7 +32,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# The canonical views' memory guard measures against budgets (tests/canonical_view_memory.rs).
+# The canonical views' memory guard measures against budgets (tests/canonical_view_memory.rs),
+# and the unit tests' counting allocator (src/lib.rs) checks that what the statistics keep is
+# what they charge; measuring without its allocator fails (tests/measure_without_its_allocator.rs).
 nrese-exec = { path = "../nrese-exec", features = ["measure"] }
 
 [lints]

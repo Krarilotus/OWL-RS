@@ -9,7 +9,7 @@ use crate::error::ApiError;
 use crate::http::media::{BOOLEAN, GRAPHS, SOLUTIONS, negotiated};
 use crate::http::mutation;
 use crate::http::requests::{Explain, QueryOperation, UpdateOperation};
-use crate::http::result_stream::stream_blocking;
+use crate::http::result_stream::{Pace, stream_blocking};
 use crate::policy::PolicyConfig;
 use crate::state::AppState;
 
@@ -64,7 +64,7 @@ pub async fn execute_query_in(
         // Statistics only, nothing evaluated; under the deadline as evaluation is: planning
         // a large pattern stops when the deadline cancels it.
         return stream_blocking(
-            deadline,
+            Pace::Total(deadline),
             cancellation,
             "application/json",
             QUERY_TIMEOUT_MESSAGE,
@@ -80,7 +80,7 @@ pub async fn execute_query_in(
     }
     if explain == Explain::Analyze {
         return stream_blocking(
-            deadline,
+            Pace::Total(deadline),
             cancellation,
             "application/json",
             QUERY_TIMEOUT_MESSAGE,
@@ -103,7 +103,7 @@ pub async fn execute_query_in(
         *slot.lock().unwrap_or_else(|p| p.into_inner()) = r;
     };
     let mut response = stream_blocking(
-        deadline,
+        Pace::Total(deadline),
         cancellation,
         media_type,
         QUERY_TIMEOUT_MESSAGE,
@@ -119,10 +119,18 @@ pub async fn execute_query_in(
     )
     .await?;
     if let Some(report) = status.lock().unwrap_or_else(|p| p.into_inner()).take() {
-        response.headers_mut().insert(
+        let headers = response.headers_mut();
+        headers.insert(
             COMPLETENESS,
             axum::http::HeaderValue::from_str(&report.header())
                 .unwrap_or_else(|_| axum::http::HeaderValue::from_static(report.as_str())),
+        );
+        // Readable by a console on another origin too (CORS hides other response headers),
+        // so an incomplete answer never shows as a complete one there; appended, so what a
+        // proxy exposes besides stays exposed.
+        headers.append(
+            axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            axum::http::HeaderValue::from_static(COMPLETENESS),
         );
     }
     Ok(response)

@@ -351,9 +351,12 @@ impl Evaluator {
         match function {
             Function::SubStr => {
                 let (source, language) = string(&arg(0)?)?;
-                let position = |i: usize| -> Option<usize> {
+                // Positions must be integers (SPARQL 1.1 §17.4.3.3), zero and negative ones
+                // too; a decimal or double position is a type error and leaves the result
+                // unbound.
+                let position = |i: usize| -> Option<i128> {
                     match Value::of(&arg(i)?) {
-                        Value::Integer(v) => usize::try_from(i64::from(v)).ok(),
+                        Value::Integer(v) => Some(i128::from(i64::from(v))),
                         _ => None,
                     }
                 };
@@ -363,17 +366,21 @@ impl Evaluator {
                 } else {
                     None
                 };
-                // Character positions, 1-based (XPath fn:substring).
-                let mut chars = source.char_indices().skip(start.checked_sub(1)?).peekable();
-                let result = match chars.peek().copied() {
-                    Some((from, _)) => match length {
-                        Some(length) => match chars.nth(length) {
-                            Some((to, _)) => &source[from..to],
-                            None => &source[from..],
-                        },
-                        None => &source[from..],
-                    },
-                    None => "",
+                // The characters at 1-based positions p with start <= p < start + length
+                // (XPath fn:substring), clipped to the string.
+                let count = source.chars().count() as i128;
+                let first = start.max(1);
+                let end = length.map_or(count + 1, |length| (start + length).min(count + 1));
+                let result = match first < end {
+                    true => {
+                        let mut bytes = source.char_indices().map(|(at, _)| at);
+                        let from = bytes.nth((first - 1) as usize).unwrap_or(source.len());
+                        let to = bytes
+                            .nth((end - first - 1) as usize)
+                            .unwrap_or(source.len());
+                        &source[from..to]
+                    }
+                    false => "",
                 };
                 Some(plain(result.to_owned(), language))
             }
@@ -391,6 +398,14 @@ impl Evaluator {
                     String::new()
                 };
                 let regex = self.regex(&pattern, &flags)?;
+                // A pattern that matches the empty string is an error (FORX0003).
+                if regex.is_match("") {
+                    return None;
+                }
+                let replacement = match flags.contains('q') {
+                    true => replacement.replace('$', "$$"),
+                    false => xpath_replacement(&replacement, regex.captures_len() - 1)?,
+                };
                 let replaced = regex.replace_all(&text, replacement.as_str()).into_owned();
                 Some(plain(replaced, language))
             }
@@ -761,19 +776,67 @@ fn uuid() -> String {
     )
 }
 
+/// XPath's replacement string (F&O 3.1 `fn:replace`) for a pattern with `groups` capturing
+/// groups, in the `regex` crate's syntax: `\$` and `\\` are a literal `$` and `\`; `$` and
+/// the digits after it are the number N of a group: N at most `groups` (0: the whole
+/// match) that group, N above `groups` but at most 9 the empty string, else the last digit
+/// literal and the rest read again. Any other `$` or `\` is an error (FORX0004): `None`.
+fn xpath_replacement(replacement: &str, groups: usize) -> Option<String> {
+    let mut out = String::with_capacity(replacement.len() + 8);
+    let mut chars = replacement.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next()? {
+                '$' => out.push_str("$$"),
+                '\\' => out.push('\\'),
+                _ => return None,
+            },
+            '$' => {
+                let mut digits = String::new();
+                while let Some(&d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+                    digits.push(d);
+                    chars.next();
+                }
+                if digits.is_empty() {
+                    return None;
+                }
+                // The longest number that names a group (or is at most 9); the digits
+                // after it are literal. A longer prefix is never a smaller number, so one
+                // pass finds it (a first digit always is at most 9).
+                let limit = groups.max(9);
+                let (mut number, mut take) = (0, 0);
+                for digit in digits.bytes() {
+                    let next = number * 10 + usize::from(digit - b'0');
+                    if next > limit {
+                        break;
+                    }
+                    (number, take) = (next, take + 1);
+                }
+                if number <= groups {
+                    out.push_str(&format!("${{{number}}}"));
+                }
+                out.push_str(&digits[take..]);
+            }
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
 /// The regular expression of SPARQL's `REGEX(_, pattern, flags)`; `None` if the pattern
 /// or a flag is invalid. Flags (XPath): i, s, m, x, and q (the pattern is a literal string).
+/// With q only i still applies; s, m and x have no effect (F&O 3.1 §5.6.1).
 pub fn compile_regex(pattern: &str, flags: &str) -> Option<Regex> {
     let mut builder_pattern = String::new();
-    let mut literal = false;
+    let literal = flags.contains('q');
     for flag in flags.chars() {
         match flag {
-            'i' | 's' | 'm' | 'x' => {
+            'i' | 's' | 'm' | 'x' if !literal || flag == 'i' => {
                 builder_pattern.push_str("(?");
                 builder_pattern.push(flag);
                 builder_pattern.push(')');
             }
-            'q' => literal = true,
+            'i' | 's' | 'm' | 'x' | 'q' => {}
             _ => return None,
         }
     }

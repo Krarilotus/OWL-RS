@@ -89,13 +89,21 @@ pub(crate) struct Shard {
     /// Each key's end offset in `bytes` (a shard's text stays under 4 GiB: the
     /// dictionary's under 1 TiB).
     pub(crate) ends: Vec<u32>,
-    /// Each key's hash, for the table to grow by (dropped once numbered).
-    hashes: Vec<u64>,
     /// Each key's first position while loading; its final id once numbered (atomic so
     /// that the ranges of the numbering merge write their entries' ids in parallel).
     slots: Vec<AtomicU64>,
-    /// Indexes into the keys, by hash.
+    /// Indexes into the keys, by hash; grown by hashing the keys again: their hashes, kept
+    /// for it, were 8 bytes a new term at a load's peak (DBpedia core: 0.3 GB, 18 Oct 2026).
     table: HashTable<u32>,
+}
+
+/// Entry `local` of the keys `bytes` with the end offsets `ends`.
+fn entry<'b>(bytes: &'b [u8], ends: &[u32], local: usize) -> &'b [u8] {
+    let start = match local {
+        0 => 0,
+        _ => ends[local - 1] as usize,
+    };
+    &bytes[start..ends[local] as usize]
 }
 
 impl Shard {
@@ -104,11 +112,7 @@ impl Shard {
     }
 
     pub(crate) fn key(&self, local: usize) -> &[u8] {
-        let start = match local {
-            0 => 0,
-            _ => self.ends[local - 1] as usize,
-        };
-        &self.bytes[start..self.ends[local] as usize]
+        entry(&self.bytes, &self.ends, local)
     }
 
     fn find(&self, hash: u64, key: &[u8]) -> Option<u32> {
@@ -128,10 +132,13 @@ impl Shard {
         self.bytes.extend_from_slice(key);
         let end = u32::try_from(self.bytes.len()).expect("a shard's text under 4 GiB");
         self.ends.push(end);
-        self.hashes.push(hash);
         self.slots.push(AtomicU64::new(at));
-        let Shard { table, hashes, .. } = self;
-        table.insert_unique(hash, local, |&i| hashes[i as usize]);
+        let Shard {
+            table, bytes, ends, ..
+        } = self;
+        table.insert_unique(hash, local, |&i| {
+            super::hash::key_hash(entry(bytes, ends, i as usize))
+        });
         local
     }
 }
@@ -149,36 +156,40 @@ impl Default for Pending {
     }
 }
 
-/// A key of a batch for [`Pending::intern`]: where its bytes lie in the batch's arena,
-/// its hash, and its position in the input.
-pub(crate) struct NewKey {
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-    pub(crate) hash: u64,
-    pub(crate) at: u64,
-}
+/// An entry of [`Pending::intern`]'s `indexes` the dictionary doesn't hold yet.
+pub(crate) const NEW: u64 = u64::MAX;
 
 impl Pending {
-    /// The provisional payload of each of `keys` (bytes in `arena`), interned: each shard
-    /// locked once for the batch.
-    pub(crate) fn intern(&self, arena: &[u8], keys: &[NewKey]) -> Vec<u64> {
-        let mut by_shard: Vec<(u16, u32)> = keys
-            .iter()
-            .enumerate()
-            .map(|(i, key)| (shard_of(key.hash) as u16, i as u32))
-            .collect();
+    /// Interns the keys of batch `batch` of chunk `chunk` whose entry in `indexes` is
+    /// [`NEW`] (key `i`'s bytes and hash `key(i)`), each shard locked once for the batch
+    /// (in the order `by_shard`, the caller's array, holds); their entries take their
+    /// provisional payloads. In place: arrays per key, on every thread of a load at once,
+    /// were 64 bytes a key of its peak (18 Oct 2026).
+    pub(crate) fn intern<'a>(
+        &self,
+        (chunk, batch): (u32, u32),
+        indexes: &mut [u64],
+        by_shard: &mut Vec<(u16, u32)>,
+        key: impl Fn(usize) -> (&'a [u8], u64),
+    ) {
+        by_shard.clear();
+        by_shard.extend(
+            indexes
+                .iter()
+                .enumerate()
+                .filter(|&(_, &index)| index == NEW)
+                .map(|(i, _)| (shard_of(key(i).1) as u16, i as u32)),
+        );
         by_shard.sort_unstable();
-        let mut out = vec![0u64; keys.len()];
         for run in by_shard.chunk_by(|a, b| a.0 == b.0) {
             let shard = run[0].0 as usize;
             let mut table = self.shards[shard].lock();
             for &(_, i) in run {
-                let key = &keys[i as usize];
-                let local = table.intern(&arena[key.start..key.end], key.hash, key.at);
-                out[i as usize] = provisional(shard, local);
+                let (bytes, hash) = key(i as usize);
+                let local = table.intern(bytes, hash, position(chunk, batch, i as usize));
+                indexes[i as usize] = provisional(shard, local);
             }
         }
-        out
     }
 
     /// Whether no term is pending.
@@ -196,7 +207,7 @@ impl Pending {
     pub(crate) fn number(
         self,
         start: u64,
-        existing: impl Fn(u64, &[u8]) -> Option<u64> + Sync,
+        existing: impl Fn(&[u8]) -> Option<u64> + Sync,
     ) -> Adopted {
         let mut shards: Vec<Shard> = self
             .shards
@@ -210,16 +221,14 @@ impl Pending {
             .map(|shard| {
                 let mut order: Vec<u32> = Vec::with_capacity(shard.len());
                 for local in 0..shard.len() {
-                    match existing(shard.hashes[local], shard.key(local)) {
+                    match existing(shard.key(local)) {
                         Some(id) => *shard.slots[local].get_mut() = id,
                         None => order.push(local as u32),
                     }
                 }
                 order.sort_unstable_by_key(|&local| shard.slots[local as usize].load(Relaxed));
-                // The table finds keys without the hashes from now on, and the arrays
-                // shed what growing by doubling left over (a shard at a time, so the
-                // copies are small).
-                shard.hashes = Vec::new();
+                // The arrays shed what growing by doubling left over (a shard at a time,
+                // so the copies are small).
                 shard.bytes.shrink_to_fit();
                 shard.ends.shrink_to_fit();
                 shard.slots.shrink_to_fit();
@@ -227,13 +236,7 @@ impl Pending {
                     table, bytes, ends, ..
                 } = shard;
                 table.shrink_to_fit(|&local| {
-                    let local = local as usize;
-                    let start = if local == 0 {
-                        0
-                    } else {
-                        ends[local - 1] as usize
-                    };
-                    super::hash::key_hash(&bytes[start..ends[local] as usize])
+                    super::hash::key_hash(entry(bytes, ends, local as usize))
                 });
                 order
             })
@@ -420,24 +423,14 @@ mod tests {
             let pending = Pending::default();
             // Batches of 100 words; batch b at position (chunk 1, batch b).
             for &b in order {
-                let mut arena = Vec::new();
-                let keys: Vec<NewKey> = words[b * 100..(b + 1) * 100]
-                    .iter()
-                    .enumerate()
-                    .map(|(k, word)| {
-                        let start = arena.len();
-                        arena.extend_from_slice(word);
-                        NewKey {
-                            start,
-                            end: arena.len(),
-                            hash: hash(word),
-                            at: position(1, b as u32, k),
-                        }
-                    })
-                    .collect();
-                pending.intern(&arena, &keys);
+                let batch = &words[b * 100..(b + 1) * 100];
+                let mut indexes = vec![NEW; batch.len()];
+                pending.intern((1, b as u32), &mut indexes, &mut Vec::new(), |k| {
+                    (&batch[k][..], hash(&batch[k]))
+                });
+                assert!(indexes.iter().all(|&index| split(index).is_some()));
             }
-            let adopted = pending.number(10, |_, _| None);
+            let adopted = pending.number(10, |_| None);
             (0..adopted.len())
                 .map(|i| {
                     let key = adopted.key(i);
@@ -463,23 +456,11 @@ mod tests {
         let pending = Pending::default();
         let long = vec![b'S'; LONG as usize + 5];
         let words: Vec<&[u8]> = vec![b"Sa", &long, b"Sb", b"", b"Sc"];
-        let mut arena = Vec::new();
-        let keys: Vec<NewKey> = words
-            .iter()
-            .enumerate()
-            .map(|(k, word)| {
-                let start = arena.len();
-                arena.extend_from_slice(word);
-                NewKey {
-                    start,
-                    end: arena.len(),
-                    hash: hash(word),
-                    at: position(1, 0, k),
-                }
-            })
-            .collect();
-        pending.intern(&arena, &keys);
-        let adopted = pending.number(0, |_, _| None);
+        let mut indexes = vec![NEW; words.len()];
+        pending.intern((1, 0), &mut indexes, &mut Vec::new(), |k| {
+            (words[k], hash(words[k]))
+        });
+        let adopted = pending.number(0, |_| None);
         let keys: Vec<&[u8]> = (0..adopted.len()).map(|i| adopted.key(i)).collect();
         assert_eq!(keys, words);
     }

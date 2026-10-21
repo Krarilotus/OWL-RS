@@ -139,11 +139,20 @@ mod tests {
         source
     }
 
+    /// Each mode without the setting it can't work without is refused, naming that setting.
     #[test]
-    fn bearer_static_config_requires_admin_token() {
-        let source = source(&[("NRESE_AUTH_MODE", "bearer-static")]);
-
-        assert!(parse_auth_config(&source).is_err());
+    fn required_auth_settings() {
+        for (mode, setting) in [
+            ("bearer-static", "NRESE_AUTH_ADMIN_TOKEN"),
+            ("bearer-jwt", "NRESE_AUTH_JWT_SECRET"),
+            ("mtls", "NRESE_AUTH_MTLS_ADMIN_SUBJECTS"),
+            ("oidc-introspection", "NRESE_AUTH_OIDC_INTROSPECTION_URL"),
+        ] {
+            let error = parse_auth_config(&source(&[("NRESE_AUTH_MODE", mode)]))
+                .expect_err(mode)
+                .to_string();
+            assert_eq!(error, format!("{setting} is required in {mode} mode"));
+        }
     }
 
     #[test]
@@ -161,20 +170,6 @@ mod tests {
                 admin_token: "admin".to_owned(),
             })
         );
-    }
-
-    #[test]
-    fn bearer_jwt_config_requires_shared_secret() {
-        let source = source(&[("NRESE_AUTH_MODE", "bearer-jwt")]);
-
-        assert!(parse_auth_config(&source).is_err());
-    }
-
-    #[test]
-    fn mtls_config_requires_admin_subjects() {
-        let source = source(&[("NRESE_AUTH_MODE", "mtls")]);
-
-        assert!(parse_auth_config(&source).is_err());
     }
 
     #[test]
@@ -207,13 +202,6 @@ mod tests {
                 trusted_proxies: crate::auth::peers::AddressRange::loopback(),
             })
         );
-    }
-
-    #[test]
-    fn oidc_introspection_requires_introspection_url() {
-        let source = source(&[("NRESE_AUTH_MODE", "oidc-introspection")]);
-
-        assert!(parse_auth_config(&source).is_err());
     }
 
     #[test]

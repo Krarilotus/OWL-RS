@@ -7,12 +7,13 @@
 //! group before them, groups, subqueries, EXISTS, GRAPH, arithmetic) answers up to the
 //! nesting limit and is refused past it.
 //!
-//! Large basic graph patterns plan within a bound or stop at their deadline: planning
-//! observes the query's cancellation as evaluating does.
+//! Large basic graph patterns plan and answer, and are refused once cancelled; that their
+//! planning observes the query's cancellation midway is counted in planning steps
+//! (`native::plan`'s tests).
 
 use std::process::Command;
 use std::sync::{Arc, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf::{GraphName, NamedNode, Quad};
@@ -297,72 +298,68 @@ fn an_update_of_a_long_union_applies() {
     );
 }
 
-/// The deadline the planning guard gives a query, and the time past it a stop may take.
-const DEADLINE: Duration = Duration::from_secs(5);
-const STOP: Duration = Duration::from_secs(2);
+/// How long the large patterns below may take together before the test calls them hung: a
+/// bound that contains a planner unable to finish, not a measurement.
+const HANG: Duration = Duration::from_secs(120);
 
 /// Large basic graph patterns (a path of 1,000 steps spelled out as triple patterns, stars
 /// of 1,000 patterns, of 1,000 single-variable checks and of 250 triple terms) plan and
-/// answer within the deadline, or are refused with `Cancelled` at it: the join orderer asks
-/// for the query's cancellation at every step (a 1,000-step path planned for 28 s, a
-/// 250-pattern star for 114 s, unable to stop: 12 October 2026). A query cancelled before
-/// it starts is refused.
+/// answer, and a query cancelled before it starts is refused. That planning stops at the
+/// step its query is cancelled, which is what failed here on 12 October 2026, is counted
+/// in steps, not by a clock: `native::plan`'s
+/// `large_patterns_stop_planning_at_the_step_they_are_cancelled`.
 #[test]
-fn large_patterns_plan_in_time_or_stop_at_the_deadline() {
-    let engine = engine();
-    let snapshot = engine.snapshot();
-    for (shape, n) in [
-        ("chain", 1_000),
-        ("star", 1_000),
-        ("checks", 1_000),
-        ("triple-terms", 250),
-    ] {
-        let query = SparqlParser::new().parse_query(&query(shape, n)).unwrap();
-        let token = CancellationToken::new();
-        let options = QueryOptions {
-            resources: Resources {
-                cancellation: Some(token.clone()),
-                ..Resources::default()
-            },
-            ..QueryOptions::default()
-        };
-        let (done, finished) = mpsc::channel::<()>();
-        let watchdog = std::thread::spawn({
-            let token = token.clone();
-            move || {
-                if finished.recv_timeout(DEADLINE).is_err() {
-                    token.cancel();
-                }
-            }
-        });
-        let begun = Instant::now();
-        let outcome = plan_query(&snapshot, &query, &options).and_then(|_| {
-            match evaluate_query(&snapshot, &query, &options)? {
-                QueryResults::Solutions(solutions) => {
-                    for solution in solutions {
-                        solution?;
+fn large_patterns_plan_and_answer_and_are_refused_once_cancelled() {
+    let (done, finished) = mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || {
+        let engine = engine();
+        let snapshot = engine.snapshot();
+        for (shape, n) in [
+            ("chain", 1_000),
+            ("star", 1_000),
+            ("checks", 1_000),
+            ("triple-terms", 250),
+        ] {
+            let query = SparqlParser::new().parse_query(&query(shape, n)).unwrap();
+            let token = CancellationToken::new();
+            let options = QueryOptions {
+                resources: Resources {
+                    cancellation: Some(token.clone()),
+                    ..Resources::default()
+                },
+                ..QueryOptions::default()
+            };
+            let outcome =
+                plan_query(&snapshot, &query, &options).and_then(|_| {
+                    match evaluate_query(&snapshot, &query, &options)? {
+                        QueryResults::Solutions(solutions) => {
+                            for solution in solutions {
+                                solution?;
+                            }
+                            Ok(())
+                        }
+                        _ => Ok(()),
                     }
-                    Ok(())
-                }
-                _ => Ok(()),
-            }
-        });
-        let took = begun.elapsed();
+                });
+            assert!(outcome.is_ok(), "{shape} of {n}: {outcome:?}");
+            token.cancel();
+            assert!(
+                matches!(
+                    plan_query(&snapshot, &query, &options),
+                    Err(QueryEvaluationError::Cancelled)
+                ),
+                "{shape} of {n}: planned once cancelled"
+            );
+        }
         let _ = done.send(());
-        watchdog.join().unwrap();
-        assert!(
-            matches!(outcome, Ok(()) | Err(QueryEvaluationError::Cancelled)),
-            "{shape} of {n}: {outcome:?}"
-        );
-        assert!(took < DEADLINE + STOP, "{shape} of {n}: {took:?}");
-        token.cancel();
-        assert!(
-            matches!(
-                plan_query(&snapshot, &query, &options),
-                Err(QueryEvaluationError::Cancelled)
-            ),
-            "{shape} of {n}: planned once cancelled"
-        );
+    });
+    match finished.recv_timeout(HANG) {
+        Err(mpsc::RecvTimeoutError::Timeout) => panic!("still planning after {HANG:?}: hung"),
+        _ => {
+            if let Err(panic) = worker.join() {
+                std::panic::resume_unwind(panic);
+            }
+        }
     }
 }
 
