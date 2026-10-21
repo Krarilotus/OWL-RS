@@ -17,8 +17,8 @@ use crate::lists::ListDiagnostic;
 pub struct Closure {
     /// The storable inferred statements (in the default graph).
     pub inferred: Vec<EncodedTriple>,
-    /// The derived facts no store can hold (a literal subject, a non-IRI predicate): the
-    /// datatype checks read them, as the delta executor's do ([`super::maintain`]).
+    /// The derived facts no store can hold (a literal subject, a non-IRI predicate). A
+    /// first load whose closure has any takes the delta executor ([`super::maintain`]).
     pub unstorable: Vec<Triple>,
     pub violations: Vec<Violation>,
     /// List axioms that weren't instantiated.

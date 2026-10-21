@@ -174,8 +174,11 @@ pub fn maintain(
     // a round that derived nothing, where a materialisation holds about 140 (DMW's A/B,
     // fleet pm-dmwab-3, 21 Oct 2026). Not over a compact stack: its closure lists
     // equalities over representatives, which the datatype checks don't read as the delta's
-    // expanded ones (Sol r1 F1).
-    let first_load = !revived
+    // expanded ones (Sol r1 F1). Nor where the closure concludes a fact no store holds (a
+    // literal subject): whether the change derives such a fact anew can't be told from a
+    // state that can't hold it, so the delta executor, which follows the derivations,
+    // decides those (Sol r2 F1, r3 F1).
+    let mut first_load = !revived
         && !program.stores_representatives()
         && program
             .plan
@@ -184,11 +187,12 @@ pub fn maintain(
         && tx.deleted().next().is_none()
         && tx.inserted().next().is_some();
     if first_load {
-        rebuilt = Some(super::materialise_until(
-            program,
-            &tx.pending_snapshot(),
-            stop,
-        )?);
+        let closure = super::materialise_until(program, &tx.pending_snapshot(), stop)?;
+        if closure.unstorable.is_empty() {
+            rebuilt = Some(closure);
+        } else {
+            first_load = false;
+        }
     }
     let update = {
         let base = EngineBase::new(tx, &program.axioms);
@@ -239,18 +243,9 @@ pub fn maintain(
         if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
         } else if let Some(closure) = rebuilt.as_ref().filter(|_| first_load) {
-            // The new inferred facts, as the delta executor reports them (its `insert`). The
-            // facts no store holds (a literal subject) can't be told new from the base: those
-            // the state concluded before (from its axioms alone, as it holds no asserted
-            // fact) are old, and a datatype violation of theirs stays tolerated (Sol r2 F1).
+            // The new inferred facts, as the delta executor reports them (its `insert`): every
+            // one storable (above), so the state tells which it held before.
             let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
-            let old_unstorable: HashSet<Triple> = match closure.unstorable.is_empty() {
-                true => HashSet::new(),
-                false => super::materialise_until(program, tx.base(), stop)?
-                    .unstorable
-                    .into_iter()
-                    .collect(),
-            };
             let derived: Vec<Triple> = closure
                 .inferred
                 .iter()
@@ -258,13 +253,6 @@ pub fn maintain(
                 .filter(|&f| {
                     !base.is_asserted(f) && !(base.contains(f) && !inserted_set.contains(&f))
                 })
-                .chain(
-                    closure
-                        .unstorable
-                        .iter()
-                        .copied()
-                        .filter(|f| !old_unstorable.contains(f)),
-                )
                 .collect();
             delta::Update {
                 violations: delta::introduced_violations(&base, &inserted, &derived, rules, ground),
