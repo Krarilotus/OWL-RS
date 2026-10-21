@@ -78,6 +78,9 @@ impl CancellationToken {
 pub struct QueryDatasetSpecification {
     default: Option<Vec<GraphName>>,
     named: Option<Vec<NamedOrBlankNode>>,
+    /// With `default` unset: graphs left out of a default graph that merges every graph
+    /// ([`Self::set_default_graph_excluding`]).
+    excluded: Vec<GraphName>,
 }
 
 impl QueryDatasetSpecification {
@@ -88,6 +91,20 @@ impl QueryDatasetSpecification {
     /// The graphs whose merge is the default graph.
     pub fn set_default_graph(&mut self, graphs: Vec<GraphName>) {
         self.default = Some(graphs);
+        self.excluded.clear();
+    }
+
+    /// The default graph as the merge of every graph but `graphs` (SHACL's data graph: every
+    /// graph except those holding shapes). No protocol request says this; the named graphs
+    /// stay as they are.
+    pub fn set_default_graph_excluding(&mut self, graphs: Vec<GraphName>) {
+        self.default = None;
+        self.excluded = graphs;
+    }
+
+    /// The graphs a default graph merged from every graph leaves out.
+    pub fn excluded_default_graphs(&self) -> &[GraphName] {
+        &self.excluded
     }
 
     /// The named graphs `GRAPH` may read.
@@ -105,7 +122,7 @@ impl QueryDatasetSpecification {
 
     /// Whether it leaves the store's dataset as it is.
     pub fn is_default_dataset(&self) -> bool {
-        self.default.is_none() && self.named.is_none()
+        self.default.is_none() && self.named.is_none() && self.excluded.is_empty()
     }
 }
 
@@ -116,6 +133,7 @@ impl From<QueryDataset> for QueryDatasetSpecification {
             named: dataset
                 .named
                 .map(|named| named.into_iter().map(Into::into).collect()),
+            excluded: Vec::new(),
         }
     }
 }
