@@ -91,13 +91,17 @@ impl fmt::Debug for StoreService {
 
 impl StoreService {
     pub fn new(config: StoreConfig) -> StoreResult<Self> {
-        let runtime = std::sync::Arc::new(crate::Runtime::new(config.total_query_memory_bytes));
+        let runtime = std::sync::Arc::new(crate::Runtime::new(
+            config.process_memory_bytes,
+            config.total_query_memory_bytes,
+        ));
         Self::with_runtime(config, runtime)
     }
 
     /// Opens a store on resources shared with other stores. A catalog uses this for
     /// every repository; embedded applications can supply the same owner explicitly.
-    /// The runtime's budget applies, not `config.total_query_memory_bytes`.
+    /// The runtime's budgets apply, not `config.total_query_memory_bytes` or, for what is
+    /// charged, `config.process_memory_bytes` (which stays this store's watch).
     pub fn with_runtime(
         config: StoreConfig,
         runtime: std::sync::Arc<crate::Runtime>,
@@ -877,7 +881,7 @@ impl StoreService {
     /// once, and the limit; `None` without a limit
     /// ([`StoreConfig::total_query_memory_bytes`]).
     pub fn query_memory(&self) -> Option<(usize, usize, usize)> {
-        let budget = self.settings.runtime.query_memory()?;
+        let budget = self.settings.runtime.query_pool()?;
         Some((budget.used(), budget.peak(), budget.limit()))
     }
 
