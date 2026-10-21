@@ -20,6 +20,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -174,6 +175,24 @@ class Interruption(unittest.TestCase):
         self.assertEqual(result["error"], "interrupted: terminated (SIGTERM)")
         self.assertEqual([(s["name"], s["ok"]) for s in result["steps"]], [("health 1", True), ("health 2", False)])
         self.assertTrue(result["cleanup"]["removed"] and result["cleanup"]["stopped"], result["cleanup"])
+
+
+class Resolution(unittest.TestCase):
+    def test_resolving_the_host_name_is_within_the_deadline(self):
+        from verifykit import client
+        release = threading.Event()
+
+        def resolver(*args, **kwargs):  # answers only once the exchange has returned
+            release.wait(10)
+            raise OSError("resolved too late")
+
+        original, client.socket.getaddrinfo = client.socket.getaddrinfo, resolver
+        try:
+            got = client.get("http://resolves.slowly.invalid:8080/healthz", 0.2)
+        finally:
+            client.socket.getaddrinfo = original
+            release.set()
+        self.assertEqual(got["error"], "no response: the 0.2 s deadline passed while resolving the host's name")
 
 
 class Launch(unittest.TestCase):

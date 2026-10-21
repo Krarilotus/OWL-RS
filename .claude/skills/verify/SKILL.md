@@ -1,6 +1,6 @@
 ---
 name: verify
-description: Prove nrese-server's HTTP-level behaviour by driving a real server through a scenario file (launch, doctor, drive, evidence, cleanup) and cite the evidence directory. Use before claiming that something visible over HTTP works or is fixed - repository lifecycle, login and auth ordering, output streaming and limits, the Graph Store Protocol, RDF4J sessions and transactions, NRESE-Completeness and other headers - instead of reasoning from the code. Never for timing.
+description: Prove nrese-server's HTTP-level behaviour by driving a real server through a scenario file (launch, doctor, drive, evidence, cleanup) and cite the evidence directory. Use for a release condition, for a claim to the owner or the orchestrator about behaviour only HTTP shows (repository lifecycle, login and auth ordering, output streaming and limits, the Graph Store Protocol, RDF4J sessions and transactions, NRESE-Completeness and other headers), or when a review asks for HTTP evidence. Not for what a crate's tests prove, and never for timing.
 ---
 
 # /verify
@@ -14,14 +14,28 @@ passed; the summary's path is the last line it prints.
 
 The scenario schema, the predicates and the evidence layout: `scripts/verify/README.md`.
 
+## When to use it, and when not
+
+A run costs a build and a fleet slot, so use it where nothing cheaper is evidence:
+- **A release condition** that is about HTTP (a gate item, a v1.5 fix's acceptance).
+- **A claim to the owner or the orchestrator** about behaviour only HTTP shows: repository
+  lifecycle, login and auth ordering, output streaming and limits, the Graph Store Protocol,
+  RDF4J sessions and transactions, the completeness and other headers.
+- **A review that asks for HTTP evidence.**
+
+Not for behaviour a crate's own tests prove, the server's included (`crates/nrese-server/tests/it`
+drives the router in-process): parsing, a handler's logic, a status a test already asserts. Those
+claims cite the test, its command and exit code. A routine HTTP-adjacent change needs no /verify
+run unless one of the three above applies.
+
 ## Where it runs
 
 - **On gamergrill, through the fleet** (the default): a build job, then a run job, both written
   by `verify.py jobs`. Read the fleet-jobs skill first: your own `FLEET_OWNER` and webhook, a
   priority with its reason, stale jobs cancelled.
 - **Never on phuoc-yu**, and never to time anything: timings are recorded, never judged.
-- **On the main PC** only for a quick run, when `~/owlrs-guard/BUSY` is absent and the current
-  build rules let you build the server here (`--server target/debug/nrese-server.exe`).
+- **On the main PC**, a local run goes through the commit slot, like any local build (brief v3,
+  Current operations): `--server target/debug/nrese-server.exe`.
 - Never build or run on a fleet host except through a fleet job.
 
 ## Run it through the fleet
@@ -40,8 +54,9 @@ The scenario schema, the predicates and the evidence layout: `scripts/verify/REA
    asks for 0.5 GB (the example scenarios peaked at 55 MiB): declare more with `--ram-gb` when
    your scenarios hold more data; every summary records the peak.
 3. **Submit both** (`fleet submit BUILD RUN`). The build is a debug `nrese-server` at the
-   server commit, made on gamergrill (fleet can't stage a binary onto a WSL host), kept there in
-   `~/fleet/cache/owlrs-verify/bin-<sha12>/` and returned with `build.json`. A later build of the
+   server commit, made on gamergrill (fleet can't stage a binary onto a WSL host) in the host's
+   one cache, shared with the gates (`~/fleet/cache/owlrs-gate/`), kept there in `bin-<sha12>/`
+   and returned with `build.json`. A later build of the
    same commit only checks the binary's checksum. The run job comes after it: the self-test,
    then your scenarios.
 4. **On the notice**, `fleet results <run id> --to DIR`, then read
@@ -71,6 +86,12 @@ lifecycle` step 11 (after the restart: its settings) passed, job verify-run-…,
 
 ## Afterwards
 
-The runner removes each server's directory itself. The build step removes binaries of other
-commits unused for 7 days and other toolchains' target directories unused for 14 (exact paths
-under `~/fleet/cache/owlrs-verify/`). Cancel your jobs a newer run supersedes (`fleet list --mine`).
+The runner removes each server's directory itself. The host's cache is swept after every build by
+the rule the gates share (Harness/notes/2026-10-20-host-cache-contract.md): binaries unused for 7
+days, target directories and Python environments for 14, then the least recently used until it
+fits its budget; exact paths only. Cancel your jobs a newer run supersedes (`fleet list --mine`).
+
+## Follow-up
+
+Once gates by tree land (tooling/remote-gates), the server a run drives should come from a gate's
+recorded build of that tree, not a build job of /verify's own.
