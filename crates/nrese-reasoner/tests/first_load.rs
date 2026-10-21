@@ -228,3 +228,73 @@ fn a_first_load_tolerates_a_datatype_violation_the_axioms_had_before() {
         }
     }
 }
+
+/// A new assertion that derives again a conclusion no store holds (`ex:new ex:age -1` beside
+/// the axiom's `ex:old ex:age -1`): new to the delta, which reports its `dt-not-type`. Such
+/// a closure takes the delta executor, and the verdicts agree (Sol r3 F1).
+#[test]
+fn a_first_load_that_concludes_an_unstorable_fact_takes_the_delta() {
+    use nrese_reasoner::{RuleProgram, UserRules};
+    let user = std::sync::Arc::new(
+        UserRules::n3(
+            "old-datatype.n3",
+            format!("{PREFIX}ex:age rdfs:range xsd:nonNegativeInteger . ex:old ex:age -1 ."),
+        )
+        .unwrap(),
+    );
+    let rules = RuleProgram::new(Some(Ruleset::Owl2Rl), Some(user)).unwrap();
+    for representatives in [false, true] {
+        for cached in [false, true] {
+            let mut outcomes = Vec::new();
+            for plan in [None, Some(Plan::Dred)] {
+                let engine = Engine::new(EngineConfig {
+                    background_maintenance: false,
+                    ..EngineConfig::default()
+                })
+                .unwrap();
+                let tx = engine.transaction();
+                let program = Program::compile(&rules, &|t| tx.intern(t))
+                    .by_representatives(representatives)
+                    .storing_representatives(false)
+                    .maintaining_by(plan);
+                drop(tx);
+                let remat = engine.rematerialisation();
+                let closure = materialise(&program, remat.base());
+                assert!(closure.violations.iter().any(|v| v.rule == "dt-not-type"));
+                remat.finish(closure.inferred).unwrap();
+                assert_eq!(engine.snapshot().len_in(ReadModel::Asserted), 0);
+                let ground = program.ground_program(&engine.snapshot());
+                let mut tx = engine.transaction();
+                for quad in RdfParser::from_format(RdfFormat::Turtle)
+                    .for_reader(format!("{PREFIX}ex:new ex:age -1 .").as_bytes())
+                {
+                    tx.insert(quad.unwrap().as_ref());
+                }
+                let done =
+                    maintain(&program, cached.then_some(&ground), &mut tx, &|| false).unwrap();
+                if plan.is_none() {
+                    assert_ne!(
+                        done.work.plan,
+                        Plan::Rebuild,
+                        "a literal's conclusion takes the delta"
+                    );
+                }
+                let mut violations = done
+                    .violations
+                    .iter()
+                    .map(|v| format!("{}:{:?}", v.rule, v.bindings))
+                    .collect::<Vec<_>>();
+                violations.sort();
+                outcomes.push(violations);
+            }
+            assert!(
+                outcomes[1].iter().any(|v| v.starts_with("dt-not-type:")),
+                "DRed must report the new derivation: {outcomes:?}"
+            );
+            assert_eq!(
+                outcomes[0], outcomes[1],
+                "introduced-only parity: representatives={representatives} cached={cached}"
+            );
+        }
+    }
+}
