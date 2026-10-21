@@ -26,8 +26,11 @@ impl OidcIntrospectionConfig {
         admin_role: String,
         timeout_millis: u64,
     ) -> Result<Self, reqwest::Error> {
+        // No redirects: the presented token travels in the form body (and the client's
+        // credentials in Basic), and a 307/308 would repeat both to wherever it points.
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(timeout_millis))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?;
 
         Ok(Self {
@@ -132,4 +135,65 @@ async fn introspect_token(
         .json::<IntrospectionResponse>()
         .await
         .map_err(|error| ApiError::unauthorized(format!("invalid introspection response: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    use super::*;
+
+    /// An introspection endpoint that redirects elsewhere doesn't get the presented token
+    /// sent there: the client follows no redirect, and the token is refused.
+    #[tokio::test]
+    async fn a_redirect_does_not_take_the_token_elsewhere() {
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let elsewhere = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/", elsewhere.local_addr().unwrap());
+        let record = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move |body: String| {
+                let record = Arc::clone(&record);
+                async move {
+                    record.lock().unwrap().push(body);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            });
+            axum::serve(elsewhere, app).await.unwrap();
+        });
+        let endpoint = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/introspect",
+            endpoint.local_addr().unwrap()
+        ))
+        .unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let target = target.clone();
+                async move {
+                    (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, target)]).into_response()
+                }
+            });
+            axum::serve(endpoint, app).await.unwrap();
+        });
+        let config = OidcIntrospectionConfig::new(
+            url,
+            Some("nrese".to_owned()),
+            Some("client-secret".to_owned()),
+            "nrese.read".to_owned(),
+            "nrese.admin".to_owned(),
+            5_000,
+        )
+        .unwrap();
+        let outcome = introspect_token(&config, "presented-token").await;
+        assert!(outcome.is_err());
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+    }
 }
