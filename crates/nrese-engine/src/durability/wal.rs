@@ -141,7 +141,10 @@ pub(crate) fn remove_segment(path: &Path) -> EngineResult<()> {
     Ok(())
 }
 
-pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
+/// The segment at `path`, classified for recovery: `reached` is the revision recovery has
+/// reached before it (the checkpoint's, or the last record replayed), the least bound on
+/// what an uncovered record after damage in it can be.
+pub(crate) fn read_segment(path: &Path, reached: u64) -> EngineResult<SegmentContents> {
     let bytes = fs::read(path)?;
     if bytes.len() < SEGMENT_MAGIC.len() {
         // Crash while creating the segment: treat it as empty and torn.
@@ -192,8 +195,12 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
                         revision: record.revision + 1,
                         dictionary: Some(record.dictionary_start + record.keys.len() as u64),
                     },
+                    // A segment's name is only a lower bound of its records, and can lag far
+                    // behind (an empty segment keeps its name while bulk loads publish
+                    // revisions without frames): the revision recovery reached bounds it.
+                    // Records after the damage at or below it are covered, so not lost.
                     None => Expected {
-                        revision: segment_first_revision(path),
+                        revision: segment_first_revision(path).max(reached + 1),
                         dictionary: None,
                     },
                 };

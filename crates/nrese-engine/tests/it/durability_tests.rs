@@ -441,6 +441,61 @@ fn wal_damage_is_truncated_or_refused_by_its_evidence() {
     }
 }
 
+/// A segment's name is only a lower bound of its records: an empty segment keeps its name
+/// while bulk loads publish revisions without frames. Ten bulk loads leave segment 1 empty,
+/// then commits 11 and 12 go into it; damage to 11 must not let recovery drop the intact,
+/// acknowledged 12 (Sol r2 N1-R2-1: the search bounded revisions by the stale name).
+#[test]
+fn a_stale_segment_name_hides_no_intact_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let quad = |n: u64| {
+        Quad::new(
+            NamedNode::new_unchecked(format!("urn:s:{n}")),
+            NamedNode::new_unchecked("urn:p"),
+            NamedNode::new_unchecked("urn:o"),
+            GraphName::DefaultGraph,
+        )
+    };
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    // Every term in the checkpoint first, so that the two later records carry no keys.
+    let terms: Vec<_> = (0..12).map(quad).collect();
+    let load = engine.bulk_load(BulkMode::Replace);
+    load.add(&terms);
+    assert_eq!(load.finish().unwrap().revision, 1);
+    for (n, term) in terms.iter().enumerate().take(10).skip(1) {
+        let load = engine.bulk_load(BulkMode::Replace);
+        load.add(std::slice::from_ref(term));
+        assert_eq!(load.finish().unwrap().revision, n as u64 + 1);
+    }
+    for n in [10, 11] {
+        let mut tx = engine.transaction();
+        tx.insert(terms[n].as_ref());
+        assert_eq!(tx.commit().unwrap().revision, n as u64 + 1);
+    }
+    drop(engine);
+    let segment = dir.path().join("wal").join(format!("{:020}.wal", 1));
+    let mut bytes = fs::read(&segment).unwrap();
+    let at = frames(&bytes);
+    assert_eq!(at.len(), 2);
+    assert_eq!(
+        u64::from_le_bytes(bytes[at[1].0 + 8..at[1].0 + 16].try_into().unwrap()),
+        12
+    );
+    // Revision 11's length and a byte of its payload damaged; 12 intact behind it.
+    bytes[at[0].0..at[0].0 + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    bytes[at[0].0 + 12] ^= 1;
+    fs::write(&segment, bytes).unwrap();
+    match Engine::open(dir.path(), config()) {
+        Err(EngineError::Corruption(why)) => {
+            assert!(why.contains("intact through revision 10;"), "{why}")
+        }
+        other => panic!(
+            "the intact revision 12 must not be dropped; got {:?}",
+            other.map(|e| e.stats().revision)
+        ),
+    }
+}
+
 /// A segment holds commits of one sync policy: reopening under another starts a new one,
 /// and each records its own.
 #[test]
