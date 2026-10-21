@@ -527,12 +527,13 @@ async fn statements(
     let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let store = state.store();
     let (scope, infer) = (access.read_scope(), infer(&pairs));
-    // Streamed as read: a whole repository in constant memory.
-    let deadline = tokio::time::Instant::now() + state.policy().timeouts.graph_read;
+    // Streamed as read: a whole repository in constant memory, for as long as the client
+    // keeps reading.
+    let pace = super::result_stream::Pace::stalled_after(state.policy().timeouts.graph_read);
     let cancellation = nrese_store::CancellationToken::new();
     let token = cancellation.clone();
     super::result_stream::stream_blocking(
-        deadline,
+        pace,
         cancellation,
         format.media_type(),
         "reading the statements exceeded the policy timeout",

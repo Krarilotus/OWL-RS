@@ -298,7 +298,7 @@ Every limit on memory, time and request size is in one table, `[budgets]`. Value
 | `budgets.bulk_load_memory` | `NRESE_BULK_LOAD_MEMORY` | 25 % of the machine's memory | The quads of a bulk load (`nrese-server load`, or a load into an empty store). Past it they are sorted in chunks of a third of it (one filling, one being sorted, its sorted copy), spilled to `bulk-spill/` in the data directory and merged into each index permutation while the checkpoint is written: one more pass over the disk, but the load's quads take this much plus one packed permutation whatever the data's size. The dictionary is apart (it grows with the distinct terms). Needs `store.map_checkpoints`. `0` = unlimited |
 | `budgets.query_timeout` | `NRESE_QUERY_TIMEOUT_MS` | 30 s | A query, until its last result is sent (`408`) |
 | `budgets.update_timeout` | `NRESE_UPDATE_TIMEOUT_MS` | 60 s | A SPARQL update, reasoning included |
-| `budgets.graph_read_timeout` | `NRESE_GRAPH_READ_TIMEOUT_MS` | 30 s | A Graph Store read |
+| `budgets.graph_read_timeout` | `NRESE_GRAPH_READ_TIMEOUT_MS` | 30 s | A streamed read of stored statements (Graph Store `GET`, RDF4J `GET /statements`, the N-Quads export): the wait for its first chunk, then for each next one. A client that keeps reading is never cut off; one that stops for this long is. A Graph Store `HEAD` |
 | `budgets.graph_write_timeout` | `NRESE_GRAPH_WRITE_TIMEOUT_MS` | 60 s | A Graph Store write |
 | `budgets.query_text` | `NRESE_MAX_QUERY_BYTES` | 1 MiB | The text of a query |
 | `budgets.update_size` | `NRESE_MAX_UPDATE_BYTES` | 16 MiB | A SPARQL update request |
