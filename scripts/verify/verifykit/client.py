@@ -136,17 +136,22 @@ def connect(host: str, port: int, deadline: Deadline) -> socket.socket:
     deadline.phase = "connecting"
     last: OSError = OSError(f"{host}: no address")
     for family, kind, protocol, _, address in found["addresses"]:
-        sock = socket.socket(family, kind, protocol)
+        sock = None
         try:
+            # Inside the per-address handling: a family the host can't create (IPv6 off) is
+            # this address's failure, and the next address is tried (Sol r3, finding 2).
+            sock = socket.socket(family, kind, protocol)
             sock.settimeout(deadline.left())
             sock.connect(address)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             return sock
         except TimeoutError:
-            sock.close()
+            if sock is not None:
+                sock.close()
             raise TimeoutError(deadline.passed()) from None
         except OSError as e:
-            sock.close()
+            if sock is not None:
+                sock.close()
             last = e
     raise last
 
