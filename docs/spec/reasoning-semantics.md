@@ -98,7 +98,7 @@ OWL 2 DL with arbitrary rules is undecidable; rules whose variables bind to name
 - Rules match over the **union of all graphs** (default and named).
 - Inferred statements go to the **default graph**.
 - An inferred statement is suppressed while it is asserted in any graph.
-- A named graph is **not** a reasoning boundary: there's no per-graph isolation or placement of inferences yet (planned: R9). Which graphs an inferred statement came from is known: under `inferred = "supported"` a reader sees it when one of its support graph sets is readable ([reasoner-provenance.md](../design/reasoner-provenance.md); the sets are computed in memory per revision, not stored).
+- A named graph is **not** a reasoning boundary: there's no per-graph isolation or placement of inferences yet (planned for v2.0: [Named graphs as a reasoning boundary](../STATUS.md#engine-gaps)). Which graphs an inferred statement came from is known: under `inferred = "supported"` a reader sees it when one of its support graph sets is readable ([reasoner-provenance.md](../design/reasoner-provenance.md); the sets are computed in memory per revision, not stored).
 
 ## Reads
 

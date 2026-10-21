@@ -1,0 +1,148 @@
+description = """A repository's life through the engine API (docs/ops/http-api.md, "Engine API"),
+and the catalog's listing at each turn, the engine API's and RDF4J's: created (201 with its
+Location; a second creation 409), configured (a new title and RDFS reasoning, in effect at once:
+an inferred type answers), still there after a restart with its settings and data, removed with
+its data (204), then gone (404, and the catalog back to the default repository alone)."""
+
+[vars]
+repo = "verify-lifecycle"
+ex = "http://example.com/verify/"
+
+[[step]]
+name = "the catalog holds the default repository alone"
+path = "/api/v1/repositories"
+[step.expect]
+status = 200
+json = { "$[*].id" = ["nrese"] }
+
+[[step]]
+name = "create it"
+method = "PUT"
+path = "/api/v1/repositories/${repo}"
+json = { title = "Verify lifecycle" }
+[step.expect]
+status = 201
+headers = { location = "/api/v1/repositories/${repo}" }
+json = { "$.id" = "${repo}" }
+
+[[step]]
+name = "creating it again is a conflict"
+method = "PUT"
+path = "/api/v1/repositories/${repo}"
+json = { title = "Verify lifecycle" }
+[step.expect]
+status = 409
+headers = { content-type = { contains = "application/problem+json" } }
+
+[[step]]
+name = "the catalog lists it, after the default"
+path = "/api/v1/repositories"
+[step.expect]
+status = 200
+json = { "$[*].id" = ["nrese", "${repo}"], "$[1].title" = "Verify lifecycle", "$[1].default" = false }
+
+[[step]]
+name = "RDF4J's listing has it too"
+path = "/repositories"
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+rows = 2
+body = { contains = "${repo}" }
+
+[[step]]
+name = "configure it: a new title and RDFS reasoning"
+method = "PATCH"
+path = "/api/v1/repositories/${repo}"
+json = { title = "Verify lifecycle, configured", reasoning = "rdfs" }
+[step.expect]
+status = 200
+json = { "$.title" = "Verify lifecycle, configured", "$.reasoning" = "rdfs" }
+
+[[step]]
+name = "write a class hierarchy and an instance into it"
+method = "POST"
+path = "/api/v1/repositories/${repo}/update"
+headers = { Content-Type = "application/sparql-update" }
+body = """
+INSERT DATA {
+  <${ex}Cat> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <${ex}Animal> .
+  <${ex}tom> a <${ex}Cat> .
+}
+"""
+[step.expect]
+status = 204
+
+[[step]]
+name = "RDFS is in effect: tom is an Animal"
+path = "/api/v1/repositories/${repo}/query"
+params = { query = "ASK { <http://example.com/verify/tom> a <http://example.com/verify/Animal> }" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+json = { "$.boolean" = true }
+
+[[step]]
+name = "the default repository didn't get the data"
+path = "/dataset/query"
+params = { query = "ASK { <http://example.com/verify/tom> ?p ?o }" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+json = { "$.boolean" = false }
+
+[[step]]
+name = "restart the server on the same data directory"
+restart = true
+
+[[step]]
+name = "after the restart: its settings"
+path = "/api/v1/repositories/${repo}"
+[step.expect]
+status = 200
+json = { "$.title" = "Verify lifecycle, configured", "$.reasoning" = "rdfs" }
+
+[[step]]
+name = "after the restart: its data and inferences"
+path = "/api/v1/repositories/${repo}/query"
+params = { query = "ASK { <http://example.com/verify/tom> a <http://example.com/verify/Animal> }" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+json = { "$.boolean" = true }
+
+[[step]]
+name = "remove it"
+method = "DELETE"
+path = "/api/v1/repositories/${repo}"
+[step.expect]
+status = 204
+
+[[step]]
+name = "it is gone"
+path = "/api/v1/repositories/${repo}"
+[step.expect]
+status = 404
+
+[[step]]
+name = "the catalog holds the default repository alone again"
+path = "/api/v1/repositories"
+[step.expect]
+status = 200
+json = { "$[*].id" = ["nrese"] }
+
+[[step]]
+name = "RDF4J's listing agrees"
+path = "/repositories"
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+rows = 1
+body = { not_contains = "${repo}" }
+
+[[step]]
+name = "removing it again: 404"
+method = "DELETE"
+path = "/api/v1/repositories/${repo}"
+[step.expect]
+status = 404

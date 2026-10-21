@@ -60,7 +60,9 @@ fn placed_any_case(text: &[u8], needle: &[u8], placement: Placement) -> bool {
         .any(|c| memchr::memmem::find(text, c.as_bytes()).is_some());
     special
         || match placement {
-            Placement::Anywhere => text.windows(n).any(|w| w.eq_ignore_ascii_case(needle)),
+            Placement::Anywhere => {
+                n == 0 || text.windows(n).any(|w| w.eq_ignore_ascii_case(needle))
+            }
             Placement::Start => text.len() >= n && text[..n].eq_ignore_ascii_case(needle),
             Placement::End => {
                 text.len() >= n && text[text.len() - n..].eq_ignore_ascii_case(needle)
@@ -317,6 +319,41 @@ mod tests {
 
     use super::*;
     use crate::{Dictionary, TermView};
+
+    /// An empty needle without regard to case: every text holds it, and only an empty
+    /// one is it (it panicked in `windows(0)`: Sol's review, 18 October).
+    #[test]
+    fn an_empty_needle_without_regard_to_case_holds_everywhere() {
+        let dictionary = Dictionary::default();
+        let texts = ["hello", "", "HeLLo \u{0130}"];
+        let ids: Vec<TermId> = texts
+            .iter()
+            .map(|t| dictionary.intern(Literal::new_simple_literal(*t).as_ref().into()))
+            .collect();
+        for (placement, expected) in [
+            (Placement::Anywhere, ids.clone()),
+            (Placement::Start, ids.clone()),
+            (Placement::End, ids.clone()),
+            // The empty text, and the candidate (its lower case is the caller's to test).
+            (Placement::Whole, vec![ids[1], ids[2]]),
+        ] {
+            let test = StringTest {
+                needle: "",
+                placement,
+                iris: false,
+                strings: true,
+                lang_strings: false,
+                typed: false,
+                language: None,
+                ascii_case_insensitive: true,
+            };
+            assert_eq!(
+                dictionary.matching_strings(&test, u64::MAX),
+                expected,
+                "{placement:?}"
+            );
+        }
+    }
 
     /// The arena search against a test of every entry's view.
     #[test]
