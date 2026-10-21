@@ -277,6 +277,42 @@ fn tsv(
 
 const TSV: &str = "text/tab-separated-values";
 
+/// A renamed SELECT is answered with its own names: the serialised answer's header holds
+/// them, so its key does too (SPR-02: the second query was served the first's header).
+#[test]
+fn a_renamed_select_is_answered_with_its_own_names() {
+    use nrese_sparql::{CachedOutput, cached_output};
+    let engine = store_of(&[("a", "p", "b")]);
+    let cache = Arc::new(ResultCache::new(1 << 20).admitting_all());
+    let options = with_cache(&cache, ReadModel::Materialised);
+    let snapshot = engine.snapshot();
+    let json = "application/sparql-results+json";
+    let first = parse(&format!("SELECT ?s ?o WHERE {{ ?s <{EX}p> ?o }}"));
+    for format in [TSV, json] {
+        let CachedOutput::Miss(slot) = cached_output(&snapshot, &first, &options, format, "")
+        else {
+            panic!("nothing cached yet")
+        };
+        slot.offer(b"?s\t?o\n".to_vec(), std::time::Duration::from_millis(5));
+    }
+    let renamed = parse(&format!("SELECT ?x ?y WHERE {{ ?x <{EX}p> ?y }}"));
+    for format in [TSV, json] {
+        assert!(
+            matches!(
+                cached_output(&snapshot, &renamed, &options, format, ""),
+                CachedOutput::Miss(_)
+            ),
+            "{format}: the renamed query's own answer"
+        );
+    }
+    // The same names: the answer kept.
+    let again = parse(&format!("SELECT ?s ?o WHERE {{ ?s <{EX}p> ?o }}"));
+    assert!(matches!(
+        cached_output(&snapshot, &again, &options, TSV, ""),
+        CachedOutput::Hit(_)
+    ));
+}
+
 #[test]
 fn serialised_answers_are_kept_per_format_form_and_snapshot() {
     use nrese_sparql::{CachedOutput, cached_output};
