@@ -12,9 +12,11 @@
 //! once and compares compressed bytes; the hash table keeps the plain keys' hashes. Both
 //! the writer and every reader compress with a compressor rebuilt from the stored table.
 
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use fsst::{Compressor, Symbol};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 
 /// How checkpoints store the dictionary's keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -61,12 +63,64 @@ pub(crate) fn vocabulary_encoding() -> VocabularyEncoding {
 const TAG_IRI: u8 = b'I';
 /// Keys sampled to train a table: spread over the dictionary (FSST trains on a few dozen
 /// KiB of them in any case).
-const SAMPLE: usize = 1 << 16;
+pub(crate) const SAMPLE: usize = 1 << 16;
 /// Bytes of one table on file: 255 symbols of 8 bytes, then their 255 lengths, then the
 /// number of symbols in use.
 const TABLE_BYTES: usize = 255 * 8 + 255 + 1;
 /// Bytes of the two tables on file.
 pub(crate) const CODEC_BYTES: usize = 2 * TABLE_BYTES;
+/// The most a codec holds while it is trained and while it lives, besides the keys it is
+/// trained on: FSST's counters, candidate heap and sample of the keys, and both tables, built
+/// and rebuilt from their stored form. FSST's (0.6.0, pinned) sizes, whatever the keys and
+/// however many (at most twice [`SAMPLE`]): 5.36 MiB at the largest (the most keys, each
+/// empty: FSST copies the list of them), measured by the checkpoint's
+/// `the_dictionary_section_holds_what_it_charged`, which fails past it.
+const TRAINING_BYTES: usize = 6 << 20;
+/// What a trained codec holds: its two tables (FSST's, 0.6.0), 327,977 bytes measured, by the
+/// same test.
+const CODEC_HELD: usize = 384 << 10;
+
+/// A codec with the charge of its tables ([`CODEC_HELD`]), which it frees before the charge
+/// is released, however its owner goes.
+pub(crate) struct Trained<'b> {
+    codec: Codec,
+    _held: Reservation<&'b Budget>,
+}
+
+impl Trained<'_> {
+    pub(crate) fn codec(&self) -> &Codec {
+        &self.codec
+    }
+}
+
+/// Keys to train a codec on, one after another, charged to a budget as they grow.
+pub(crate) struct Sample<'b> {
+    bytes: ChargedVec<u8, &'b Budget>,
+    /// Where each key ends in `bytes`.
+    ends: ChargedVec<usize, &'b Budget>,
+}
+
+impl<'b> Sample<'b> {
+    pub(crate) fn new(budget: &'b Budget) -> Self {
+        Self {
+            bytes: ChargedVec::new(budget),
+            ends: ChargedVec::new(budget),
+        }
+    }
+
+    /// `key` (plain) appended, its room charged first.
+    pub(crate) fn push(&mut self, key: &[u8]) -> Result<(), BudgetExceeded> {
+        self.bytes.extend_from_slice(key)?;
+        self.ends.push(self.bytes.len())
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &[u8]> + Clone {
+        (0..self.ends.len()).map(|i| {
+            let start = if i == 0 { 0 } else { self.ends[i - 1] };
+            &self.bytes[start..self.ends[i]]
+        })
+    }
+}
 
 /// The symbol tables of a vocabulary: one for IRIs, one for the rest.
 pub(crate) struct Codec {
@@ -75,25 +129,57 @@ pub(crate) struct Codec {
 }
 
 impl Codec {
-    /// Tables trained on a sample of `keys` (plain), rebuilt from their stored form.
+    /// Tables trained on `keys` (plain), rebuilt from their stored form.
+    #[cfg(test)]
     pub(crate) fn train(keys: &[Vec<u8>]) -> Self {
-        let (iris, others): (Vec<&[u8]>, Vec<&[u8]>) = keys
-            .iter()
-            .map(|key| key.as_slice())
-            .partition(|key| key.first() == Some(&TAG_IRI));
-        let rest =
-            |keys: &[&[u8]]| -> Vec<Vec<u8>> { keys.iter().map(|key| key[1..].to_vec()).collect() };
-        let train = |keys: Vec<Vec<u8>>| {
-            let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-            Compressor::train(&refs)
-        };
+        let budget = Budget::unlimited();
+        let mut sample = Sample::new(&budget);
+        for key in keys {
+            sample.push(key).expect("no limit");
+        }
+        Self::train_within(&sample, &budget)
+            .expect("no limit")
+            .codec
+    }
+
+    /// Tables trained on `sample` (plain keys), rebuilt from their stored form, everything
+    /// it allocates charged to `budget` first: the keys' rests sorted to their tables, and
+    /// FSST's training ([`TRAINING_BYTES`]); then the codec's tables ([`CODEC_HELD`]), held
+    /// as long as it lives.
+    pub(crate) fn train_within<'b>(
+        sample: &Sample<'_>,
+        budget: &'b Budget,
+    ) -> Result<Trained<'b>, BudgetExceeded> {
+        let mut held = Reservation::new(budget);
+        held.charge(TRAINING_BYTES)?;
+        let iri = |key: &&[u8]| key.first() == Some(&TAG_IRI);
+        fn rest(key: &[u8]) -> &[u8] {
+            key.get(1..).unwrap_or_default()
+        }
+        let iris = sample.keys().filter(iri).count();
+        let iris = ChargedVec::collect(budget, iris, sample.keys().filter(iri).map(rest))?;
+        let others = sample.ends.len() - iris.len();
+        let others = ChargedVec::collect(
+            budget,
+            others,
+            sample.keys().filter(|key| !iri(key)).map(rest),
+        )?;
+        // FSST trains on a vector: each paired with its charge, which a tuple releases after
+        // it frees the vector.
+        let (iris, others) = (iris.into_parts(), others.into_parts());
         let trained = Self {
-            iri: train(rest(&iris)),
-            other: train(rest(&others)),
+            iri: Compressor::train(&iris.0),
+            other: Compressor::train(&others.0),
         };
+        drop((iris, others));
         let mut stored = Vec::with_capacity(CODEC_BYTES);
         trained.write(&mut stored);
-        Self::read(&stored).expect("a table just written reads")
+        drop(trained);
+        let codec = Self::read(&stored).expect("a table just written reads");
+        // Rebuilt, it holds its tables only.
+        drop(stored);
+        held.resize(CODEC_HELD)?;
+        Ok(Trained { codec, _held: held })
     }
 
     /// Every `count / SAMPLE`-th of `count` entries: the keys to train on.
@@ -117,6 +203,51 @@ impl Codec {
         };
         out.push(tag);
         out.extend_from_slice(&self.table(tag).compress(rest));
+    }
+
+    /// [`Self::compress`] into room in `out` charged first: the tag, and twice the rest
+    /// (FSST's largest output, every byte escaped).
+    pub(crate) fn compress_within<B: Deref<Target = Budget>>(
+        &self,
+        key: &[u8],
+        out: &mut ChargedVec<u8, B>,
+    ) -> Result<(), BudgetExceeded> {
+        let Some((&tag, rest)) = key.split_first() else {
+            return Ok(());
+        };
+        out.fill(1 + 2 * rest.len(), |room| {
+            room.push(tag);
+            let at = room.len();
+            // SAFETY: the room left holds twice the rest, the most FSST writes.
+            let len = unsafe {
+                self.table(tag)
+                    .compress_into(rest, room.spare_capacity_mut())
+            };
+            // SAFETY: `compress_into` initialised `len` bytes of the room left.
+            unsafe { room.set_len(at + len) };
+        })
+    }
+
+    /// [`Self::decompress`] into room in `out` charged first: FSST's bound for the rest.
+    pub(crate) fn decompress_within<B: Deref<Target = Budget>>(
+        &self,
+        stored: &[u8],
+        out: &mut ChargedVec<u8, B>,
+    ) -> Result<(), BudgetExceeded> {
+        let Some((&tag, rest)) = stored.split_first() else {
+            return Ok(());
+        };
+        let decompressor = self.table(tag).decompressor();
+        out.fill(
+            1 + decompressor.max_decompression_capacity(rest) + 8,
+            |room| {
+                room.push(tag);
+                let at = room.len();
+                let len = decompressor.decompress_into(rest, room.spare_capacity_mut());
+                // SAFETY: `decompress_into` initialised `len` bytes of the room left.
+                unsafe { room.set_len(at + len) };
+            },
+        )
     }
 
     /// Appends the plain key of `stored`.

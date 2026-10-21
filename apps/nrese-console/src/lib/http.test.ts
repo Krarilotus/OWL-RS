@@ -40,3 +40,25 @@ describe("problem documents", () => {
     expect((error as ProblemError).message).toBe("Request failed with status 502");
   });
 });
+
+describe("completeness", () => {
+  const answered = (header?: string): typeof fetch => async () =>
+    new Response("{}", {
+      status: 200,
+      headers: header ? { "NRESE-Completeness": header } : {},
+    });
+
+  test("a query's answers carry the status the server states", async () => {
+    for (const [header, status] of [
+      ["complete; regime=owl2-ql", "complete"],
+      ['sound-only; regime=owl2-dl; reasons="dl: open"', "sound-only"],
+      ["unsound; regime=owl2-dl", "unsound"],
+      // A status this client doesn't know is never taken for complete.
+      ["provisional", "unsound"],
+    ] as const) {
+      const response = await fetchText(answered(header), "", "/q");
+      expect(response.completeness).toEqual({ status, header });
+    }
+    expect((await fetchText(answered(), "", "/q")).completeness).toBeUndefined();
+  });
+});

@@ -10,6 +10,12 @@
 //! login is checked against a fixed hash all the same, so the time a refusal takes doesn't
 //! tell which names exist.
 //!
+//! Argon2 holds about 19 MiB while it runs, uncharged: at most [`LoginLimits::hashes`]
+//! runs go at once (the named exemption `login-argon2`, K × 19 MiB; it is CPU-bound, so
+//! more at once gain nothing). A check that can't start within [`LoginLimits::hash_wait`]
+//! fails as busy, to be retried, and doesn't count as a failed attempt. A remembered
+//! credential runs no Argon2 and never waits.
+//!
 //! Failed attempts are counted per user name and client address, never per name alone:
 //! someone who can reach the port can slow down their own guesses, not lock a user out.
 //! Past [`LoginLimits::failures`], the pair waits before its next attempt, one second
@@ -21,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use argon2::Argon2;
@@ -44,6 +50,10 @@ pub struct LoginLimits {
     pub remembered: usize,
     /// Counts kept, per name and address and per address (beyond, the oldest go).
     pub tracked: usize,
+    /// Argon2 runs at once (hashing a new password, checking one not remembered).
+    pub hashes: usize,
+    /// How long a check waits for its turn before it fails as busy.
+    pub hash_wait: Duration,
 }
 
 impl Default for LoginLimits {
@@ -54,6 +64,8 @@ impl Default for LoginLimits {
             window: Duration::from_secs(300),
             remembered: 10_000,
             tracked: 10_000,
+            hashes: std::thread::available_parallelism().map_or(1, usize::from),
+            hash_wait: Duration::from_secs(10),
         }
     }
 }
@@ -137,6 +149,73 @@ struct Throttle {
     addresses: Counts<Option<IpAddr>>,
 }
 
+/// Admits at most `limit` Argon2 runs at once (the exemption `login-argon2`).
+pub(super) struct Argon2Gate {
+    limit: usize,
+    running: Mutex<usize>,
+    freed: Condvar,
+    /// The most runs there were at once.
+    #[cfg(test)]
+    most: std::sync::atomic::AtomicUsize,
+}
+
+impl Argon2Gate {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            running: Mutex::new(0),
+            freed: Condvar::new(),
+            #[cfg(test)]
+            most: Default::default(),
+        }
+    }
+
+    /// `work` (an Argon2 run), once fewer than `limit` run, waiting `wait` at most: past
+    /// it, [`AccessError::Busy`].
+    pub(super) fn run<T>(
+        &self,
+        wait: Duration,
+        work: impl FnOnce() -> T,
+    ) -> Result<T, AccessError> {
+        let deadline = Instant::now() + wait;
+        let mut running = self.running.lock().expect("argon2 gate");
+        while *running >= self.limit {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(AccessError::Busy(
+                    "too many password checks at once; try again shortly".to_owned(),
+                ));
+            }
+            running = self
+                .freed
+                .wait_timeout(running, left)
+                .expect("argon2 gate")
+                .0;
+        }
+        *running += 1;
+        #[cfg(test)]
+        self.most
+            .fetch_max(*running, std::sync::atomic::Ordering::Relaxed);
+        drop(running);
+        // Its turn ends however `work` ends.
+        struct Turn<'a>(&'a Argon2Gate);
+        impl Drop for Turn<'_> {
+            fn drop(&mut self) {
+                *self.0.running.lock().expect("argon2 gate") -= 1;
+                self.0.freed.notify_one();
+            }
+        }
+        let _turn = Turn(self);
+        Ok(work())
+    }
+}
+
+impl Default for Argon2Gate {
+    fn default() -> Self {
+        Self::new(LoginLimits::default().hashes)
+    }
+}
+
 /// The hash a user name without a login is checked against: the work of a check, which
 /// no password passes in practice (made from random bytes).
 fn dummy_hash() -> &'static str {
@@ -197,6 +276,8 @@ pub(super) struct Logins {
     failures: Mutex<Throttle>,
     /// Session tokens: the user and when the session ends.
     sessions: Mutex<HashMap<String, (String, Instant)>>,
+    /// Every Argon2 run's turn.
+    argon2: Argon2Gate,
 }
 
 /// A session token's prefix, which tells it from other bearer tokens.
@@ -210,6 +291,7 @@ impl Logins {
         Self {
             limits,
             secret,
+            argon2: Argon2Gate::new(limits.hashes),
             ..Self::default()
         }
     }
@@ -243,7 +325,7 @@ impl Logins {
         }
         let Some(hash) = state.users.get(user).and_then(|u| u.password_hash.clone()) else {
             // As long as a wrong password takes.
-            let _ = verify_password(password, dummy_hash());
+            self.hashing(|| verify_password(password, dummy_hash()))?;
             self.failed(&pair);
             return Err(refused());
         };
@@ -255,7 +337,7 @@ impl Logins {
             .get(&key)
             .is_some_and(|(name, verified)| name == user && *verified == hash);
         if !known {
-            if !verify_password(password, &hash) {
+            if !self.hashing(|| verify_password(password, &hash))? {
                 self.failed(&pair);
                 return Err(refused());
             }
@@ -270,6 +352,11 @@ impl Logins {
             user: Some(user.to_owned()),
             ..Principal::default()
         })
+    }
+
+    /// `work`, an Argon2 run, in its turn ([`Argon2Gate`]).
+    pub(super) fn hashing<T>(&self, work: impl FnOnce() -> T) -> Result<T, AccessError> {
+        self.argon2.run(self.limits.hash_wait, work)
     }
 
     fn failed(&self, pair: &(String, Option<IpAddr>)) {
@@ -328,6 +415,94 @@ impl Logins {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::access::User;
+
+    const PASSWORD: &str = "correct horse battery";
+
+    fn logins(hashes: usize, hash_wait: Duration) -> Logins {
+        Logins::new(LoginLimits {
+            hashes,
+            hash_wait,
+            ..LoginLimits::default()
+        })
+    }
+
+    /// alice, with a local login.
+    fn state() -> AccessState {
+        let mut state = AccessState::default();
+        let user = User {
+            password_hash: Some(hash_password(PASSWORD).unwrap()),
+            ..User::default()
+        };
+        state.users.insert("alice".to_owned(), user);
+        state
+    }
+
+    /// `then`, while a run holds every turn of `logins`' gate (one turn).
+    fn while_held<T>(logins: &Logins, then: impl FnOnce() -> T) -> T {
+        let (held, done) = (Barrier::new(2), Barrier::new(2));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                logins
+                    .argon2
+                    .run(Duration::ZERO, || {
+                        held.wait();
+                        done.wait();
+                    })
+                    .unwrap()
+            });
+            held.wait();
+            let outcome = then();
+            done.wait();
+            outcome
+        })
+    }
+
+    /// Checks that aren't remembered, all at once: never more Argon2 runs than the gate's turns.
+    #[test]
+    fn concurrent_checks_hash_at_most_k_at_once() {
+        let logins = logins(2, Duration::from_secs(600));
+        let state = state();
+        let start = Barrier::new(6);
+        std::thread::scope(|scope| {
+            for guess in 0..6 {
+                let (logins, state, start) = (&logins, &state, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    let refused = logins.login(state, "alice", &format!("guess {guess}"), None);
+                    assert!(matches!(refused, Err(AccessError::Forbidden(_))));
+                });
+            }
+        });
+        let most = logins.argon2.most.load(Ordering::Relaxed);
+        assert!((1..=2).contains(&most), "{most} at once");
+    }
+
+    /// A check that can't start before its wait ends fails as busy, and isn't counted as a
+    /// failed attempt.
+    #[test]
+    fn a_check_without_a_turn_in_time_is_busy() {
+        let logins = logins(1, Duration::from_millis(20));
+        let state = state();
+        let outcome = while_held(&logins, || logins.login(&state, "alice", PASSWORD, None));
+        assert!(matches!(outcome, Err(AccessError::Busy(_))), "{outcome:?}");
+        assert_eq!(logins.tracked(), (0, 0));
+    }
+
+    /// A remembered credential runs no Argon2, so it never waits for a turn.
+    #[test]
+    fn a_remembered_credential_needs_no_turn() {
+        let logins = logins(1, Duration::ZERO);
+        let state = state();
+        logins.login(&state, "alice", PASSWORD, None).unwrap();
+        let again = while_held(&logins, || logins.login(&state, "alice", PASSWORD, None));
+        assert!(again.is_ok(), "{again:?}");
+    }
+
     /// RFC 4231, test case 1.
     #[test]
     fn hmac_matches_rfc_4231() {

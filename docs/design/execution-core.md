@@ -110,6 +110,13 @@ This section owns the execution policy; there is no setting for it besides `dl.t
   waited for only off the pool; a request on a worker computes it itself, so no wait can
   hold a stack its producer needs ([research-designs.md
   §8](research-designs.md#8-query-progress-under-shared-cache-waits-decided-the-bounded-rule)).
+- **What the engine and the store build once for everyone** (the characteristic sets per
+  read model) goes through `nrese_exec::cell::BuildCell`: one build per key, nothing held
+  locked while it runs. A *sliced* build, all of its parallel work slices of a queue run
+  alone, is helped with by every waiter, a Rayon worker too, which sleeps only once nothing
+  is left to take. An *opaque* build, with Rayon work of its own, is waited for only off
+  the pool: a worker is turned away (`Busy`). What the owner keeps is charged to its budget
+  while kept (`Kept`).
 
 SPARQL's [`SolutionTable`](../../crates/nrese-sparql/src/native/typed_results.rs) retains
 its snapshot, computed terms and capacity reservations. Alignment rejects unrelated

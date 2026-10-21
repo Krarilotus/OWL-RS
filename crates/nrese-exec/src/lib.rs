@@ -13,11 +13,15 @@
 //! - [`classes`]: equivalence classes by union (`owl:sameAs` classes)
 //! - [`budget`]: memory accounting: the server's budget, each request's envelope, its parts,
 //!   reservations and vectors charged before they grow
+//! - [`cell`]: a value built once per key while those who need it wait (helping with its
+//!   slices), never a Rayon worker waiting on parallel work it may hold
 //! - `measure` (tests, and the `measure` feature): holds what an operation allocates
 //!   against what it reserved
 //! - [`memory`]: the process's memory, and a watch for limits on long operations
 //! - [`region`]: growable arrays in pages of their own, charged before they grow
 //! - [`heap`]: heap profiles by phase, for memory guards and profiles
+//! - [`stop`]: stopping long work at bounded checkpoints ([`StopSource`], [`Ticker`])
+//! - [`narrow`]: narrow representations, refused typed at their exact limit
 //! - [`sort`]: sorting and deduplicating id keys by radix over their significant bits
 //!
 //! Everything here works on ids: it never decodes a term. Operations that need values
@@ -29,6 +33,7 @@
 //! have no stored id.
 
 pub mod budget;
+pub mod cell;
 pub mod classes;
 pub mod graph;
 pub mod group;
@@ -37,9 +42,11 @@ pub mod join;
 #[cfg(any(test, feature = "measure"))]
 pub mod measure;
 pub mod memory;
+pub mod narrow;
 pub mod region;
 pub mod search;
 pub mod sort;
+pub mod stop;
 pub mod table;
 pub mod workers;
 
@@ -52,7 +59,9 @@ pub use budget::{
 #[global_allocator]
 static MEASURED: measure::Measured<std::alloc::System> = measure::Measured(std::alloc::System);
 pub use join::RowLimit;
+pub use narrow::RepresentationLimit;
 pub use region::{BoundTooLarge, Pages, Region, Settled};
+pub use stop::{POLL_UNITS, Stop, StopCheck, StopSource, Ticker};
 pub use table::IdTable;
 
 /// A hash map keyed by term ids, with the fast hasher the operators use.

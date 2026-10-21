@@ -301,14 +301,15 @@ block)
   shift 5
   tree=$(worktree "$harness") || exit 2
   # Each side: its build of this layout, verified, and what its perf lab can do (CAPABILITIES).
-  # A baseline that is an earlier baseline's build (a confirmation job's main that is its base)
-  # is timed once, as that one (the report treats it so); the candidate always runs.
+  # A main that is an earlier side's build (a confirmation job's main that is its base) is timed
+  # once, as that one (the report treats it so); every other side always runs: an A-B-B-A's A'
+  # (benches/suite/abba.py) is A's build by design.
   sides=() names=() timed=()
   for spec in "$@"; do
     name=${spec%%=*}
     rev=$(git rev-parse "${spec#*=}") || exit 2
     bin=$(layout_bin "$rev" "$layout")
-    if [ "$name" != cand ] && printf '%s\n' "${timed[@]}" | grep -qxF -- "$bin"; then
+    if [ "$name" = main ] && printf '%s\n' "${timed[@]}" | grep -qxF -- "$bin"; then
       log "block $n: $name is the same build as another side ($(basename "$bin")): timed once"; continue
     fi
     [ "$name" = cand ] || timed+=("$bin")
@@ -338,54 +339,177 @@ block)
     done
     echo "$c"
   }
-  if [ "$(complete)" = "$per" ]; then log "block $n: complete before"; exit 0; fi
-  for f in $(seq "$first" $((first + per - 1))); do
-    for r in "$OUT/passes/pass-$f-"*.json; do
-      [ -f "$r" ] && mv "$r" "$OUT/passes/interrupted-$(basename "$r" .json)-$(date +%s).json"
-    done
-  done
+  # The block's state: its attempt (1, or 2 after a disturbed first) and the attempt's stage,
+  # replaced whole (written aside, renamed) before what it records is started, signalled or
+  # moved. A crash at any point resumes the attempt it was in (not a new one), an attempt above 2
+  # never starts, and reports count only once their attempt's verdict is recorded (Sol, 20 Oct
+  # 2026: a restart accepted a disturbed block, or ran a third attempt).
+  state=$OUT/passes/block-$n.state
+  # Each state is a prerequisite of what follows it: written aside, synced, renamed over the old
+  # one, the directory synced; if any of it fails the step ends there (Sol, 20 Oct 2026: a failed
+  # rename went unnoticed and the block ran a third time).
+  set_state() {
+    py -c 'import os, sys
+path, text = sys.argv[1], f"attempt={sys.argv[2]}\nstage={sys.argv[3]}\n"
+with open(path + ".new", "w", encoding="utf-8") as f:
+    f.write(text)
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(path + ".new", path)
+if os.name != "nt":  # a directory is synced on POSIX; Windows can not open one to, and journals its entries
+    fd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)' "$state" "$1" "$2" \
+      || { log "block $n: its state (attempt $1, $2) couldn't be saved ($state): stopped"; exit 2; }
+  }
+  attempt=1 stage=start
+  if [ -f "$state" ]; then
+    attempt=$(sed -n 's/^attempt=//p' "$state") stage=$(sed -n 's/^stage=//p' "$state")
+    case "$attempt:$stage" in
+      [12]:start | [12]:running | [12]:ran | 1:archiving | [12]:accepted) ;;
+      *) log "block $n: no attempt of this block is started past the second, nor from an unreadable state ($state)"; exit 2 ;;
+    esac
+  fi
+  # What an earlier watcher left suspended (it died) is resumed before anything else; what can't
+  # be settled stops the step, its record kept.
+  if [ "${GATE_QUIET:-1}" != 0 ] && [ -d /proc ] && [ -f "$GATE/quiet/frozen" ]; then
+    python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" --resume \
+      || { log "block $n: an earlier watcher's suspensions couldn't be resumed ($GATE/quiet/frozen)"; exit 2; }
+  fi
+  if [ "$stage" = accepted ]; then
+    [ "$(complete)" = "$per" ] && { log "block $n: complete before (attempt $attempt)"; exit 0; }
+    log "block $n: accepted before, but its reports are gone"; exit 2
+  fi
   opts=()
   [ -f "$tree/$MEASURE" ] && opts+=(--measure "$MEASURE")
   # Batched timing (perf_lab --batch) only when every side's perf lab has it (jobs: GATE_BATCH).
   [ "${GATE_BATCH:-0}" = 1 ] && opts+=(--batch)
-  # The round's seed (GATE_SEED, else drawn once and kept with its results): each pair of blocks'
-  # orientation and the cases' order in a block drawn from it, recorded in every pass.
+  # The round's seed (GATE_SEED, else drawn once and kept with its results): each square of
+  # blocks' orders (fast.py palindrome()) and the cases' order in a block drawn from it, recorded
+  # in every pass.
   [ -s "$OUT/seed" ] || echo "${GATE_SEED:-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')}" > "$OUT/seed"
   opts+=(--seed "$(cat "$OUT/seed")")
-  # Every side timed from a copy of its build made for this block, removed after it (fast.py
-  # block_copies(): a cached instance's offset is the block's, not the round's; lks-aa-20). The
-  # block's directory is made here for it alone, and only it is removed, also if fast.py dies.
-  mkdir -p "$GATE/instances" && copies=$(mktemp -d "$GATE/instances/block-$n-XXXXXX") || exit 2
-  trap 'rm -rf "$copies"' EXIT
-  opts+=(--fresh-copies "$copies")
   fast_env
   # A timed block: prepared data only (fast.py never makes any while it times).
   export NRESE_TIMED_GATE=1
   # A plan that can't be read (empty, half written) is no block, never every case.
   cases=$(planned "$plan") && [ -n "$cases" ] || { log "block $n: the plan $plan can't be read"; exit 2; }
   log "block $n: ${names[*]}, layout $layout, on the cases of $harness, plan $(basename "$plan")"
-  # The host kept quiet while the block runs (scripts/lib/quiet-watch.py, as the measurement
-  # queue's timed chunks: this user's other busy processes stopped, other containers paused,
-  # other users' work recorded); its verdict kept with the block. GATE_QUIET=0: unwatched.
-  watcher=""
-  if [ "${GATE_QUIET:-1}" != 0 ] && [ -d /proc ]; then
-    rm -rf "$GATE/quiet" && mkdir -p "$GATE/quiet"
-    export NRESE_QUIET_TOKEN="gate-$n-$$"
-    python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" $$ "$NRESE_QUIET_TOKEN" &
-    watcher=$!
-  fi
-  (cd "$tree" && py benches/fast/fast.py block --block "$n" --layout "$layout" --cases "$cases" \
-     --out "$OUT/passes" "${sides[@]}" "${opts[@]}") > "$OUT/passes/block-$n.log" 2>&1
-  code=$?
-  if [ -n "$watcher" ]; then
-    kill -TERM "$watcher" 2>/dev/null && wait "$watcher"
-    cp "$GATE/quiet/watch.log" "$OUT/passes/quiet-block-$n.log" 2>/dev/null
-    log "block $n: $(tail -1 "$GATE/quiet/watch.log" 2>/dev/null)"
-  fi
-  tail -1 "$OUT/passes/block-$n.log"
-  # The cases' failures are data, the report's to judge; a block without all its reports isn't.
-  [ "$(complete)" = "$per" ] || { log "block $n: not all $per reports (exit $code)"; exit 1; }
-  log "block $n: done (fast.py exit $code)"
+  attempt() {  # one run of the block, watched; its reports in $OUT/passes, its verdict beside them
+    local copies watcher=""
+    # Every side timed from a copy of its build made for this attempt, removed after it (fast.py
+    # block_copies(): a cached instance's offset is the block's, not the round's; lks-aa-20). The
+    # directory is made here for it alone, and only it is removed, also if fast.py dies.
+    mkdir -p "$GATE/instances" && copies=$(mktemp -d "$GATE/instances/block-$n-XXXXXX") || exit 2
+    trap 'rm -rf "$copies"' EXIT
+    # The host kept quiet while the block runs (scripts/lib/quiet-watch.py, as the measurement
+    # queue's timed chunks: the job's own other busy work suspended, anything else recorded as
+    # disturbing it); its verdict kept with the block. GATE_QUIET=0: unwatched.
+    if [ "${GATE_QUIET:-1}" != 0 ] && [ -d /proc ]; then
+      # What an earlier block's watcher left suspended (it died) is resumed before this block's
+      # state replaces its record; what can't be settled stops the block, never erased.
+      if [ -f "$GATE/quiet/frozen" ]; then
+        python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" --resume \
+          || { log "block $n: an earlier watcher's suspensions couldn't be resumed ($GATE/quiet/frozen)"; exit 2; }
+      fi
+      rm -rf "$GATE/quiet" && mkdir -p "$GATE/quiet"
+      export NRESE_QUIET_TOKEN="gate-$n-$$"
+      python3 "$tree/scripts/lib/quiet-watch.py" "$GATE/quiet" $$ "$NRESE_QUIET_TOKEN" &
+      watcher=$!
+    fi
+    (cd "$tree" && py benches/fast/fast.py block --block "$n" --layout "$layout" --cases "$cases" \
+       --out "$OUT/passes" "${sides[@]}" "${opts[@]}" --fresh-copies "$copies") > "$OUT/passes/block-$n.log" 2>&1
+    code=$?
+    rm -rf "$copies" && trap - EXIT
+    if [ -n "$watcher" ]; then
+      kill -TERM "$watcher" 2>/dev/null
+      wait "$watcher"
+      watched=$?
+      cp "$GATE/quiet/watch.log" "$OUT/passes/quiet-block-$n.log" 2>/dev/null
+      cp "$GATE/quiet/verdict.json" "$OUT/passes/quiet-block-$n.json" 2>/dev/null
+      log "block $n: $(tail -1 "$GATE/quiet/watch.log" 2>/dev/null)"
+      # Something the watcher suspended stayed suspended: the block stops, its record kept.
+      [ "$watched" = 0 ] || { log "block $n: the watcher left suspensions ($GATE/quiet/frozen)"; exit 1; }
+    else
+      printf '{"verdict": "unwatched"}\n' > "$OUT/passes/quiet-block-$n.json"
+    fi
+    tail -1 "$OUT/passes/block-$n.log"
+  }
+  verdict() {  # the attempt's recorded verdict (quiet, disturbed, unwatched); empty when none is valid
+    py -c 'import json, sys
+try:
+    v = json.load(open(sys.argv[1])).get("verdict")
+except Exception:
+    v = ""
+print(v if v in ("quiet", "disturbed", "unwatched") else "")' "$OUT/passes/quiet-block-$n.json"
+  }
+  aside() {  # KIND: this block's reports and verdict moved aside, as KIND-* (whatever is still there)
+    local stamp f r
+    stamp=$(date +%s)
+    for f in $(seq "$first" $((first + per - 1))); do
+      for r in "$OUT/passes/pass-$f-"*.json; do
+        if [ -f "$r" ]; then
+          mv "$r" "$OUT/passes/$1-$(basename "$r" .json)-$stamp.json" \
+            || { log "block $n: $r couldn't be moved aside: stopped"; exit 2; }
+        fi
+      done
+    done
+    for r in "$OUT/passes/quiet-block-$n.json" "$OUT/passes/quiet-block-$n.log"; do
+      if [ -f "$r" ]; then
+        mv "$r" "${r%.*}-$1-$stamp.${r##*.}" || { log "block $n: $r couldn't be moved aside: stopped"; exit 2; }
+      fi
+    done
+  }
+  # A disturbed block (work not the job's own busy too often, quiet-watch.py) is left out of the
+  # statistics, both sides (the disturbance is the host's, not a side's: dropping it is unbiased),
+  # its reports kept aside as disturbed-*; it runs once more. A repeat disturbed again is kept,
+  # and the report says so (the orchestrator's policy, 20 Oct 2026).
+  while :; do
+    case $stage in
+      start | running)
+        # The attempt's run, whole: a new one, or one a crash interrupted (resumed, not counted
+        # again): what an interrupted run left goes aside first.
+        aside interrupted
+        set_state "$attempt" running
+        attempt
+        # The cases' failures are data, the report's to judge; a block without all its reports isn't.
+        [ "$(complete)" = "$per" ] || { log "block $n: not all $per reports (exit $code)"; exit 1; }
+        [ -n "$(verdict)" ] || { log "block $n: attempt $attempt recorded no verdict"; exit 1; }
+        if [ "$attempt" = 2 ]; then
+          py -c 'import json, sys
+p = sys.argv[1]; v = json.load(open(p)); v["repeat"] = True; json.dump(v, open(p, "w"))' "$OUT/passes/quiet-block-$n.json" \
+            || { log "block $n: its repeat's verdict couldn't be marked: stopped"; exit 2; }
+        fi
+        set_state "$attempt" ran
+        stage=ran
+        ;;
+      ran)
+        found=$(verdict)
+        if [ -z "$found" ] || [ "$(complete)" != "$per" ]; then
+          log "block $n: attempt $attempt has no recorded verdict or not all its reports: run again (the same attempt)"
+          stage=running
+          continue
+        fi
+        if [ "$found" = disturbed ] && [ "$attempt" = 1 ]; then
+          set_state 1 archiving
+          stage=archiving
+          continue
+        fi
+        [ "$found" = disturbed ] && log "block $n: its repeat disturbed too: kept, the report lists it"
+        set_state "$attempt" accepted
+        log "block $n: done (attempt $attempt, $found, fast.py exit ${code:-before})"
+        exit 0
+        ;;
+      archiving)
+        aside disturbed
+        log "block $n: disturbed: left out of the statistics (kept as disturbed-*), run once more"
+        set_state 2 start
+        attempt=2 stage=start
+        ;;
+    esac
+  done
   ;;
 
 report)
@@ -522,7 +646,9 @@ plan-blocks)
   # later one the cases whose measured noise needs more passes (benches/fast/measure.toml).
   harness=$(git rev-parse "$2") || exit 2
   tree=$(worktree "$harness") || exit 2
-  (cd "$tree" && py benches/fast/release_gate.py blocks --plan "$PLAN" --measure "$MEASURE" --out "$GATE") \
+  (cd "$tree" && py benches/fast/release_gate.py blocks --plan "$PLAN" --measure "$MEASURE" --out "$GATE" \
+    --square "${GATE_SQUARE:?plan-blocks needs GATE_SQUARE, the timed sides (release_gate.py jobs sets it)}" \
+    --min-blocks "${GATE_MIN_BLOCKS:-2}") \
     | tee -a "$OUT/gate.log" || exit 2
   cp "$GATE"/plan-block-*.json "$OUT/"
   ;;

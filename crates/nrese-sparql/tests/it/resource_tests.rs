@@ -216,3 +216,70 @@ fn encoding_widths_preserve_direct_output_and_caller_owned_writers() {
         }
     }
 }
+
+/// An expanded read the query's budget refuses part way fails the query. A class of 1,000
+/// identities over a representative with 20 statements: an early-expanding read holds the
+/// copies until they are in order. At every limit from 1 KiB to 16 MiB the answer is all
+/// 20,000 rows or the query's memory error, never the rows read before the refusal.
+#[test]
+fn a_refused_expanded_read_fails_the_query() {
+    use nrese_engine::EncodedTriple;
+    use nrese_rdf::{GraphName, NamedNode, Quad};
+    use nrese_sparql::{QueryEvaluationError, QueryResults};
+
+    let node = |name: &str| NamedNode::new_unchecked(format!("urn:{name}"));
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let mut tx = engine.transaction();
+    let rep = tx.intern(node("rep").as_ref().into());
+    let same_as = tx.intern(node("sameAs").as_ref().into());
+    for i in 1..1_000 {
+        let alias = tx.intern(node(&format!("alias{i}")).as_ref().into());
+        tx.insert_inferred(EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: rep,
+        });
+    }
+    for i in 0..20 {
+        let object = node(&format!("o{i}"));
+        tx.insert(Quad::new(node("rep"), node("p"), object, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    engine.set_equality(Some(same_as));
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }")
+        .unwrap();
+    let (mut answered, mut refused) = (0, 0);
+    for shift in 10..=24 {
+        let options = QueryOptions {
+            equality_early_expansion: true,
+            resources: Resources {
+                memory: nrese_exec::Envelope::new(Some(1 << shift), None),
+                ..Default::default()
+            },
+            ..QueryOptions::default()
+        };
+        let rows = match evaluate_query(&snapshot, &query, &options) {
+            Ok(QueryResults::Solutions(rows)) => rows.collect::<Result<Vec<_>, _>>(),
+            Ok(_) => panic!("solutions"),
+            Err(error) => Err(error),
+        };
+        match rows {
+            Ok(rows) => {
+                assert_eq!(rows.len(), 20_000, "{} bytes: a partial answer", 1 << shift);
+                answered += 1;
+            }
+            Err(QueryEvaluationError::MemoryLimit(_)) => refused += 1,
+            Err(other) => panic!("{} bytes: {other}", 1 << shift),
+        }
+    }
+    assert!(
+        answered > 0 && refused > 0,
+        "{answered} answered, {refused} refused"
+    );
+}

@@ -50,7 +50,7 @@ pub use replication::LogBatch;
 pub use snapshot::{InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity};
 pub use transaction::{CommitSummary, Transaction};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub compaction: CompactionPolicy,
     /// Run large compactions and automatic checkpoints on a background thread. When
@@ -59,6 +59,10 @@ pub struct EngineConfig {
     pub background_maintenance: bool,
     /// Used by [`Engine::open`] only.
     pub durability: DurabilityConfig,
+    /// The process's memory root, which the scratch of every checkpoint the engine writes
+    /// (its own, images, bulk loads') is charged within before it is allocated: one more
+    /// can't spend what queries or another store's checkpoint hold. `None`: no limit.
+    pub admission: Option<Arc<nrese_exec::SharedBudget>>,
 }
 
 impl Default for EngineConfig {
@@ -67,6 +71,7 @@ impl Default for EngineConfig {
             compaction: CompactionPolicy::default(),
             background_maintenance: true,
             durability: DurabilityConfig::default(),
+            admission: None,
         }
     }
 }
@@ -365,6 +370,8 @@ struct Shared {
     /// What the canonical views versions keep are charged to
     /// ([`Engine::set_canonical_view_budget`]).
     views: RwLock<Arc<nrese_exec::Budget>>,
+    /// The checkpoints' scratch is charged within it ([`EngineConfig::admission`]).
+    admission: Option<Arc<nrese_exec::SharedBudget>>,
 }
 
 impl Shared {
@@ -400,7 +407,7 @@ impl Shared {
                 wal.rotate(snapshot.revision() + 1)?;
                 snapshot
             };
-            let path = checkpoint::write(durable.root(), &snapshot)?;
+            let path = checkpoint::write(durable.root(), &snapshot, self.admission.as_ref())?;
             self.checkpoints.fetch_add(1, Ordering::Relaxed);
             durable.wal.lock().release_through(snapshot.revision())?;
             (snapshot, path)
@@ -619,6 +626,7 @@ impl Engine {
             checkpoints: AtomicU64::new(0),
             equality: RwLock::new(None),
             views: RwLock::new(Arc::new(nrese_exec::Budget::unlimited())),
+            admission: config.admission,
         });
         let worker = config
             .background_maintenance
@@ -648,6 +656,12 @@ impl Engine {
             .shared
             .statistics
             .prepare_sets(&snapshot, ReadModel::default());
+    }
+
+    /// What the planner's statistics kept are charged to from now on: their owner's budget
+    /// (a store's own envelope within its catalog's; unset, an unlimited one of their own).
+    pub fn charge_statistics_to(&self, budget: Arc<nrese_exec::budget::Budget>) {
+        self.inner.shared.statistics.set_budget(budget);
     }
 
     /// Equality by representatives (work package W4, stage B): with `Some(sameAs)`, the
@@ -734,8 +748,9 @@ impl Engine {
     /// and both stacks) like the store's own, named by its revision, while writers go on. A
     /// data directory holding it opens at that revision.
     pub fn write_image(&self, dir: &std::path::Path) -> EngineResult<ImageInfo> {
-        let snapshot = self.inner.shared.snapshot();
-        let path = crate::durability::checkpoint::write(dir, &snapshot)?;
+        let shared = &self.inner.shared;
+        let snapshot = shared.snapshot();
+        let path = crate::durability::checkpoint::write(dir, &snapshot, shared.admission.as_ref())?;
         let version = snapshot.version();
         Ok(ImageInfo {
             path,
