@@ -132,6 +132,12 @@ impl RuleProgram {
         feed(&SEMANTICS_VERSION.to_le_bytes());
         feed(b"custom:");
         feed(user.text.as_bytes());
+        // A GraphDB ruleset with contexts derives relations named by the PIE compiler; a
+        // change of those names is a change of what it derives. Others keep their value.
+        if user.format == RuleFormat::Pie && super::pie::uses_contexts(&user.text) {
+            feed(b"pie-context-names:");
+            feed(&super::pie::CONTEXT_NAMES.to_le_bytes());
+        }
         hash
     }
 
@@ -201,6 +207,51 @@ mod tests {
     const RULES: &str = "@prefix : <http://e/> .
         { ?x :parent ?y . ?y :parent ?z } => { ?x :grandparent ?z } .
         :parent :is :relation .";
+
+    /// What a build before the PIE context names changed stored for a user ruleset.
+    fn fingerprint_before_context_names(user: &str) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &byte in SEMANTICS_VERSION
+            .to_le_bytes()
+            .iter()
+            .chain(b"custom:")
+            .chain(user.as_bytes())
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// A GraphDB ruleset with contexts no longer matches the state a build with the old
+    /// context names stored, so the store rebuilds its closure; other rulesets keep theirs.
+    #[test]
+    fn changed_context_names_make_older_closures_stale() {
+        let with = "Prefices { e : http://e/ }
+Rules
+{
+Id: r
+  x <e:p> y
+  ---
+  x <e:q> y [Context <e:g#x>]
+}
+";
+        let without = "Prefices { e : http://e/ }
+Rules
+{
+Id: r
+  x <e:p> y
+  ---
+  x <e:q> y
+}
+";
+        for (text, rebuilds) in [(with, true), (without, false)] {
+            let user = Arc::new(UserRules::pie("rules.pie", text).unwrap());
+            let program = RuleProgram::new(None, Some(user)).unwrap();
+            let stored = fingerprint_before_context_names(text);
+            assert_eq!(program.fingerprint() != stored, rebuilds, "{text}");
+        }
+    }
 
     #[test]
     fn names_fingerprints_and_parts() {
