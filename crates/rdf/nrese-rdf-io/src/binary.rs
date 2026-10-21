@@ -21,7 +21,8 @@
 //!
 //! The reader takes both versions (UTF-8 and UTF-16 charsets); the writer writes version 2
 //! in UTF-8, declaring each IRI and blank node on its first use and referring to it after
-//! (a bounded table), as RDF4J's own writer does for repeated values.
+//! (a table bounded in entries and in bytes: [`WRITER_TABLE`], [`WRITER_TABLE_BYTES`]), as
+//! RDF4J's own writer does for repeated values.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -336,11 +337,17 @@ impl<R: Read> BinaryParser<R> {
 
 /// Values the writer refers to by id: the most it keeps at once.
 const WRITER_TABLE: usize = 1 << 16;
+/// The most bytes those values hold (the named bound `binary-rdf-idtable-bytes`): long IRIs
+/// fill it before the count does. A value past either bound is written in full each time,
+/// which reads back the same.
+const WRITER_TABLE_BYTES: usize = 4 << 20;
 
 /// Writes Binary RDF, version 2 in UTF-8.
 pub(crate) struct BinaryWriter {
     started: bool,
     ids: HashMap<Term, u32>,
+    /// What `ids` holds: each entry's slot and its value's text.
+    held: usize,
     /// Where the record being written starts in the buffer: declarations go before it.
     record_start: usize,
 }
@@ -363,6 +370,7 @@ impl BinaryWriter {
         Self {
             started: false,
             ids: HashMap::new(),
+            held: 0,
             record_start: 0,
         }
     }
@@ -387,7 +395,14 @@ impl BinaryWriter {
                 varint(out, id);
                 return Ok(());
             }
-            if self.ids.len() < WRITER_TABLE {
+            let text = match term {
+                TermRef::NamedNode(node) => node.as_str().len(),
+                TermRef::BlankNode(node) => node.as_str().len(),
+                _ => 0,
+            };
+            let entry = std::mem::size_of::<(Term, u32)>() + text;
+            if self.ids.len() < WRITER_TABLE && self.held + entry <= WRITER_TABLE_BYTES {
+                self.held += entry;
                 let id = self.ids.len() as u32;
                 // The declaration goes before the record that uses it.
                 let mut declaration = vec![VALUE_DECL];
@@ -537,6 +552,42 @@ mod tests {
             .for_slice(&bytes[..bytes.len() - 5])
             .collect::<Result<Vec<_>, _>>();
         assert!(cut.is_err());
+    }
+
+    /// IRIs whose text passes the table's byte bound (`binary-rdf-idtable-bytes`) before its
+    /// count does: the later ones are written in full at every use, and the document reads
+    /// back the same.
+    #[test]
+    fn values_past_the_table_bytes_are_written_in_full() {
+        let iri =
+            |i: usize| NamedNode::new_unchecked(format!("http://e/{i:04}/{}", "x".repeat(1024)));
+        let count = 2 * WRITER_TABLE_BYTES / 1024;
+        let p = NamedNode::new_unchecked("http://e/p");
+        let quads: Vec<Quad> = (0..count)
+            .map(|i| Quad::new(iri(i), p.clone(), iri(i), GraphName::DefaultGraph))
+            .collect();
+        let mut serializer =
+            RdfSerializer::from_format(RdfFormat::BinaryRdf).for_writer(Vec::new());
+        for quad in &quads {
+            serializer.serialize_quad(quad).unwrap();
+        }
+        let bytes = serializer.finish().unwrap();
+        let read: Vec<Quad> = RdfParser::from_format(RdfFormat::BinaryRdf)
+            .for_slice(&bytes)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(read, quads);
+        let occurrences = |i: usize| {
+            let text = iri(i);
+            let text = text.as_str().as_bytes();
+            bytes.windows(text.len()).filter(|w| w == &text).count()
+        };
+        assert_eq!(occurrences(0), 1, "the first is declared once");
+        assert_eq!(
+            occurrences(count - 1),
+            2,
+            "the last is written in full twice"
+        );
     }
 
     /// A version 1 document as RDF4J 2 wrote it: i32 ids, UTF-16 strings.
