@@ -713,6 +713,36 @@ def read_floor(path: Path) -> dict | None:
 FLOORS = ROOT / "benches" / "fast" / "noise-floor"
 
 
+def quiet_verdicts(directory: Path) -> tuple[dict, list[str]]:
+    """Each block's quiet-watcher verdict (release-gate.sh block: quiet-block-<n>.json), and a
+    note for each block work that isn't the job's own disturbed (scripts/lib/quiet-watch.py
+    suspends only the job's own: other work is left running and its load recorded), or whose
+    suspensions weren't all resumed. A disturbed block was left out and run once more
+    (quiet-block-<n>-disturbed-<t>.json, its reports disturbed-*); a repeat disturbed again
+    was kept ("repeat")."""
+    verdicts, notes = {}, []
+    for n in sorted({int(m.group(1)) for p in directory.glob("quiet-block-*-disturbed-*.json")
+                     if (m := re.search(r"quiet-block-(\d+)-disturbed-\d+\.json$", p.name))}):
+        notes.append(f"block {n}: disturbed: left out of the statistics (both sides, kept as disturbed-*) "
+                     "and run once more")
+    found = [(int(m.group(1)), p) for p in directory.glob("quiet-block-*.json")
+             if (m := re.search(r"quiet-block-(\d+)\.json$", p.name))]
+    for n, path in sorted(found):
+        try:
+            v = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            notes.append(f"block {n}: its quiet verdict can't be read ({path.name})")
+            continue
+        verdicts[n] = v
+        if v.get("verdict") == "disturbed":
+            notes.append(f"block {n}: {'its repeat ' if v.get('repeat') else ''}disturbed"
+                         f"{', kept' if v.get('repeat') else ''}: work that isn't this job's used more than a core in "
+                         f"{v.get('unowned_share', 0):.0%} of {v.get('samples', 0)} samples (left running, never suspended)")
+        if v.get("not_resumed"):
+            notes.append(f"block {n}: suspensions not resumed: {v['not_resumed']}")
+    return verdicts, notes
+
+
 def fmt(x) -> str:
     return "-" if x is None else f"{x:.4g}"
 
@@ -1323,6 +1353,30 @@ def linux_host(name: str, registry: dict | None = None) -> None:
                          f"(os {host.get('os') if host else 'unknown'}): the gate's ELF binaries can't run there")
 
 
+def checkout_rev(checkout: str, candidate: str, harness: str) -> str:
+    """The revision a gate job's checkout takes, so that release-gate.sh can name every revision
+    it builds: the harness when it contains the candidate (a gate of a head the harness is on), the
+    candidate when it contains the harness (a branch rebased on it: keepers, 20 Oct 2026, whose
+    candidate builds failed at the harness's checkout); neither containing the other is no job."""
+    if candidate == harness:
+        return harness
+    import subprocess
+
+    def contains(rev: str, other: str) -> bool:
+        done = subprocess.run(["git", "-C", checkout, "merge-base", "--is-ancestor", other, rev],
+                              capture_output=True, text=True)
+        if done.returncode not in (0, 1):
+            raise SystemExit(f"{checkout}: can't compare {other[:8]} and {rev[:8]}: {done.stderr.strip()}")
+        return done.returncode == 0
+    if contains(harness, candidate):
+        return harness
+    if contains(candidate, harness):
+        return candidate
+    raise SystemExit(f"neither the candidate {candidate[:8]} nor the harness {harness[:8]} contains the other: "
+                     "a job's checkout must hold both (rebase the candidate onto the harness, or gate with "
+                     "--harness the candidate)")
+
+
 def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_round: int, cases: str | None,
          base: str = BASE, main: str = MAIN, timed_host: str = "phuoc-yu", checks_host: str = "office-pc",
          max_gb: float = 24, checks: bool = True, big_host: str | None = "khaleesi-wsl",
@@ -1340,7 +1394,7 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
            "GATE_MIN_BLOCKS": str(blocks_per_round), **({"GATE_CASES": cases} if cases else {}),
            **({"GATE_BIG_GB": str(big_gb), "GATE_BIG_HOST": big_host} if big_host else {}),
            **({"GATE_BATCH": "1"} if batch else {}), **({"GATE_LAYOUTS": str(layouts)} if layouts > 1 else {})}
-    source = [{"name": "checkout", "source": {"git": checkout, "rev": harness}}]
+    source = [{"name": "checkout", "source": {"git": checkout, "rev": checkout_rev(checkout, candidate, harness)}}]
     gate_ = ["bash", "scripts/release-gate.sh"]
     revs = {"base": base, "main": main, "cand": candidate}
     small = bool(cases)
@@ -1448,7 +1502,8 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
             + [[*gate_, "report", harness, f"cand={revs['cand']}", *(f"{s}={r}" for s, r in first["baselines"].items())],
                [*gate_, "clean"]],
             "requires": {"hosts": [ctx.get("host") or "phuoc-yu"], "cores": 16, "ram_gb": ctx.get("ram_gb", 24)},
-            "inputs": [{"name": "checkout", "source": {"git": checkout, "rev": harness}}]}
+            "inputs": [{"name": "checkout", "source": {"git": checkout,
+                                                       "rev": checkout_rev(checkout, revs["cand"], harness)}}]}
 
 
 def verdict(timed: list[dict], w3c: dict, guards: dict) -> tuple[bool, str]:
@@ -1617,6 +1672,8 @@ def main() -> int:
                 summary["context"][key] = float(summary["context"][key]) if "gb" in key else int(summary["context"][key])
         if args.inputs and args.inputs.is_file():
             summary["inputs"] = args.inputs.read_text(encoding="utf-8").splitlines()
+        summary["quiet"], notes = quiet_verdicts(args.passes)
+        summary["host_notes"] = [*summary.get("host_notes", []), *notes]
         prepared = {(p["report"].get("prepared") or {}).get("manifest_sha256") for p in passes}
         summary["prepared_manifest"] = sorted(map(str, prepared))
         text = render(summary)

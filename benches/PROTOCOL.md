@@ -263,6 +263,12 @@ phuoc-yu and the big host); a declared hypothesis a round doesn't test counts at
 - *One build, timed once.* A baseline whose build is an earlier baseline's (a confirmation job's
   main that is its base) is timed once, as that one; the report takes it as that side and leaves
   its hypotheses out of the family rather than declaring them twice. The candidate always runs.
+- *A disturbed block is repeated once.* The quiet watcher (`scripts/lib/quiet-watch.py`) suspends
+  only the job's own work and records what else ran; a block in which work not the job's own
+  used more than a core in more than a tenth of the samples is disturbed. It is left out of the
+  statistics, both sides (the disturbance is the host's, not a side's: leaving it out is
+  unbiased), its reports kept aside, and run once more; a repeat disturbed again is kept, and
+  the report lists it (the orchestrator's policy, 20 Oct 2026).
 - *The test* is one-sided for a loss (a better head is never a loss), a t-test on the units'
   mean log contrast (Student's t computed in the kit; it matches SciPy). Its calibration on
   identical binaries is checked below; an exact sign-flip p is reported beside it where the

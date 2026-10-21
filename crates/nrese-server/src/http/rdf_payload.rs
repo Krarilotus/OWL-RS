@@ -142,17 +142,17 @@ mod tests {
     }
 
     #[test]
-    fn rdf_content_type_accepts_turtle() {
-        let format = parse_graph_content_format(Some("text/turtle; charset=utf-8"))
-            .expect("format should parse");
-        assert_eq!(format, GraphResultFormat::Turtle);
-    }
-
-    #[test]
-    fn rdf_content_type_accepts_rdf_xml() {
-        let format = parse_graph_content_format(Some("application/rdf+xml; charset=utf-8"))
-            .expect("format should parse");
-        assert_eq!(format, GraphResultFormat::RdfXml);
+    fn accepted_graph_content_types() {
+        for (content_type, expected) in [
+            ("text/turtle; charset=utf-8", GraphResultFormat::Turtle),
+            (
+                "application/rdf+xml; charset=utf-8",
+                GraphResultFormat::RdfXml,
+            ),
+        ] {
+            let format = parse_graph_content_format(Some(content_type)).expect(content_type);
+            assert_eq!(format, expected, "{content_type}");
+        }
     }
 
     #[test]

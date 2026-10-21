@@ -4,6 +4,10 @@ pub type EngineResult<T> = Result<T, EngineError>;
 
 #[derive(Debug, Error)]
 pub enum EngineError {
+    /// Work refused by its memory budget before it allocated: nothing was changed (a
+    /// checkpoint's scratch, a search's corpus or scoring).
+    #[error("not enough memory: {0}")]
+    MemoryLimit(#[from] nrese_exec::BudgetExceeded),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error("storage corruption: {0}")]
@@ -12,9 +16,6 @@ pub enum EngineError {
     Configuration(String),
     #[error("invalid text query: {0}")]
     InvalidTextQuery(String),
-    /// A search's working memory (its corpus, its scoring) doesn't fit the request's budget.
-    #[error("memory limit: {0}")]
-    MemoryLimit(#[from] nrese_exec::BudgetExceeded),
     #[error("term {0:#x} is not known to the dictionary")]
     UnknownTerm(u64),
     #[error("RDF-star triple terms are not supported by the engine")]
