@@ -257,7 +257,7 @@ impl Durable {
                 wal::remove_segment(path)?;
                 continue;
             }
-            let contents = wal::read_segment(path)?;
+            let contents = wal::read_segment(path, version.revision)?;
             // A segment whose records the checkpoint all covers (left by a release that failed,
             // or a crash before it) isn't replayed: damage in it can't lose anything, and isn't
             // a reason to refuse, nor to cut the log after it.
