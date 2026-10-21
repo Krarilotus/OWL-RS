@@ -601,19 +601,15 @@ pub(crate) fn explain_prepared(
 }
 
 /// The plan `prepared` would run as on `view`, with estimated rows, without running it
-/// (EXPLAIN).
+/// (EXPLAIN), drawing from the request's envelope `memory` as its run would.
 pub(crate) fn plan_prepared(
     view: &impl ReadView,
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
+    memory: &nrese_exec::Envelope,
 ) -> StoreResult<PlannedQuery> {
-    let options = query_options(
-        prepared,
-        store,
-        cancellation,
-        &nrese_exec::Envelope::unlimited(),
-    );
+    let options = query_options(prepared, store, cancellation, memory);
     Ok(plan_query(view, &prepared.query, &options)?)
 }
 
