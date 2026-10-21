@@ -74,6 +74,7 @@ use nrese_exec::{IdTable, Reservation};
 
 use super::{Context, GraphScope, NativeResult, Solutions};
 use crate::QueryEvaluationError;
+use crate::dataset::GraphSet;
 
 const BDS: &str = "http://www.bigdata.com/rdf/search#";
 const JENA_QUERY: &str = "http://jena.apache.org/text#query";
@@ -452,18 +453,35 @@ impl Context<'_> {
     /// graph, the merge the default graph is, or the named graphs `GRAPH ?g` may bind
     /// (`None`: none). A list of graphs is a copy charged to the query's budget first, with
     /// its reservation (bound before it, so that it goes after the copy); the engine sorts
-    /// it where needed.
+    /// it where needed. A merge of every graph but some (SHACL's data graph without its
+    /// shapes) is listed: the default graph and every named graph the snapshot holds but
+    /// those, charged as the list grows.
     #[allow(clippy::type_complexity)]
     pub(super) fn text_scope(&self) -> NativeResult<Option<(Option<Reservation>, TextScope)>> {
-        let copy = |graphs: &Vec<TermId>| -> NativeResult<(Option<Reservation>, TextScope)> {
+        let charged = |graphs: nrese_exec::ChargedVec<TermId>| -> NativeResult<(Option<Reservation>, TextScope)> {
+            let (graphs, charge) = graphs.into_parts();
+            Ok((Some(charge), TextScope::Merge(graphs)))
+        };
+        let copy = |graphs: &[TermId]| -> NativeResult<(Option<Reservation>, TextScope)> {
             let copy = nrese_exec::ChargedVec::collect(
                 Arc::clone(&self.budget),
                 graphs.len(),
                 graphs.iter().copied(),
             )
             .map_err(crate::QueryEvaluationError::MemoryLimit)?;
-            let (graphs, charge) = copy.into_parts();
-            Ok((Some(charge), TextScope::Merge(graphs)))
+            charged(copy)
+        };
+        let all_but = |left_out: &[TermId]| -> NativeResult<(Option<Reservation>, TextScope)> {
+            let mut graphs = nrese_exec::ChargedVec::new(Arc::clone(&self.budget));
+            for graph in std::iter::once(TermId::DEFAULT_GRAPH).chain(self.snapshot.named_graphs())
+            {
+                if left_out.binary_search(&graph).is_err() {
+                    graphs
+                        .push(graph)
+                        .map_err(crate::QueryEvaluationError::MemoryLimit)?;
+                }
+            }
+            charged(graphs)
         };
         let plain = |scope| Ok(Some((None, scope)));
         match &*self.graph.borrow() {
@@ -476,7 +494,8 @@ impl Context<'_> {
                 None => plain(TextScope::Graphs(GraphSelector::AnyNamed)),
             },
             GraphScope::Union => match &self.merge_set {
-                Some(graphs) => copy(graphs).map(Some),
+                Some(GraphSet::Only(graphs)) => copy(graphs).map(Some),
+                Some(GraphSet::AllBut(left_out)) => all_but(left_out).map(Some),
                 None => plain(TextScope::Graphs(GraphSelector::Any)),
             },
             GraphScope::Missing => Ok(None),

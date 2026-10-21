@@ -4014,6 +4014,33 @@ fn a_dataset_is_what_the_query_names() {
             options.dataset
         );
     }
+    // The merge of every graph but some (SHACL's data graph), asked for without the union
+    // default graph: nothing left out is every graph, as is leaving out a graph the store
+    // doesn't hold; the named graphs stay the store's.
+    let unknown = || -> GraphName { ex("g9").into() };
+    for (left_out, text, solutions) in [
+        (vec![], "SELECT * WHERE { ?s ?p ?o }", 5),
+        (vec![unknown()], "SELECT * WHERE { ?s ?p ?o }", 5),
+        (vec![ex("g0").into()], "SELECT * WHERE { ?s ?p ?o }", 4),
+        (
+            vec![GraphName::DefaultGraph, ex("g2").into()],
+            "SELECT * WHERE { ?s ?p ?o }",
+            3,
+        ),
+        (vec![ex("g0").into()], "SELECT * WHERE { GRAPH ?g { } }", 3),
+    ] {
+        let mut dataset = nrese_sparql::QueryDatasetSpecification::new();
+        dataset.set_default_graph_excluding(left_out.clone());
+        let options = QueryOptions {
+            dataset: Some(dataset),
+            ..QueryOptions::default()
+        };
+        assert_eq!(
+            count(text, &options),
+            solutions,
+            "{text} without {left_out:?}"
+        );
+    }
     // Rows no statement gives, under names in and outside the dataset: checked by example
     // and against the reference evaluator.
     let native_count = |text: &str| {

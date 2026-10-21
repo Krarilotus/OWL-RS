@@ -1532,8 +1532,24 @@ impl Context<'_> {
             GraphScope::Default => Scope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
             GraphScope::Named(graph) => Scope::Graphs(GraphSelector::Exact(*graph)),
             GraphScope::Union => match &self.merge_set {
-                Some(graphs) => {
+                Some(crate::dataset::GraphSet::Only(graphs)) => {
                     Scope::merge(graphs, &self.budget).map_err(QueryEvaluationError::MemoryLimit)?
+                }
+                Some(crate::dataset::GraphSet::AllBut(left_out)) => {
+                    // Every graph the snapshot holds but those, listed (charged as it grows).
+                    let mut graphs = ChargedVec::new(Arc::clone(&self.budget));
+                    for graph in
+                        std::iter::once(TermId::DEFAULT_GRAPH).chain(self.snapshot.named_graphs())
+                    {
+                        if left_out.binary_search(&graph).is_err() {
+                            graphs
+                                .push(graph)
+                                .map_err(QueryEvaluationError::MemoryLimit)?;
+                        }
+                    }
+                    graphs.sort_unstable();
+                    dedup(&mut graphs);
+                    Scope::Merge(graphs)
                 }
                 None => Scope::Graphs(GraphSelector::Any),
             },
