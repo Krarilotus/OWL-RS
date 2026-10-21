@@ -365,3 +365,40 @@ fn sparql_constraints_read_the_data_core_reads() {
         "only the query that reads the shapes graph"
     );
 }
+
+/// A selection's form doesn't change what a SPARQL constraint reads: its own `FROM` or
+/// `FROM NAMED` is replaced by the selected data whatever the selection's form, so leaving
+/// out a graph that holds nothing changes nothing, and the default graph alone is pinned as
+/// every other selection is (review N11 r1, F2).
+#[test]
+fn a_constraints_dataset_is_the_selection_whatever_its_form() {
+    for clause in [
+        "FROM <http://example.com/shapes>",
+        "FROM NAMED <http://example.com/shapes>",
+    ] {
+        let engine = engine(
+            "ex:a ex:p ex:b .",
+            &format!(
+                "ex:Sparql sh:targetNode ex:a ; sh:sparql [ sh:select
+                  \"SELECT $this {clause} WHERE {{ $this <http://example.com/p> ?o }}\" ] ."
+            ),
+        );
+        let snapshot = engine.snapshot();
+        let shapes = compiled(&snapshot);
+        let results = |selection: Selection| {
+            let report = validate(&snapshot, &shapes, selection);
+            assert!(
+                report.failures.is_empty(),
+                "{clause}: {:?}",
+                report.failures
+            );
+            report.results.len()
+        };
+        // ex:p is a term, but no graph is named so: leaving it out leaves the data as it is.
+        let any = Selection::of(GraphSelector::Any);
+        let p = id(&snapshot, "http://example.com/p");
+        for selection in [any, any.excluding(p), DEFAULT] {
+            assert_eq!(results(selection), 1, "{clause}, {selection:?}");
+        }
+    }
+}

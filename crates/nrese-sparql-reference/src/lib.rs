@@ -498,7 +498,7 @@ impl<'d> Context<'d> {
             Some(specification) => {
                 let default = match specification.default_graph_graphs() {
                     // Every graph, or every graph but those it leaves out.
-                    None => match specification.excluded_default_graphs() {
+                    None => match specification.excluded_default_graphs().unwrap_or_default() {
                         [] => merge(dataset, None),
                         left_out => {
                             let graphs: Vec<GraphName> = std::iter::once(GraphName::DefaultGraph)

@@ -172,7 +172,7 @@ impl ResolvedDataset {
             ids
         };
         let default = match specification.default_graph_graphs() {
-            None => match ids_of(specification.excluded_default_graphs()) {
+            None => match ids_of(specification.excluded_default_graphs().unwrap_or_default()) {
                 left_out if left_out.is_empty() => DefaultGraph::Merge(None),
                 left_out => DefaultGraph::Merge(Some(GraphSet::AllBut(left_out))),
             },
