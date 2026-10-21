@@ -247,6 +247,10 @@ pub struct Catalog {
     unavailable: RwLock<BTreeMap<String, String>>,
     /// Ids (ASCII lowercase) being created or removed.
     reserved: Mutex<BTreeSet<String>>,
+    /// Ids (ASCII lowercase) whose removal's tombstone couldn't be removed durably: a new
+    /// repository of the id would be reclaimed by the next start, so none is created until a
+    /// start has removed it.
+    marked: Mutex<BTreeSet<String>>,
 }
 
 /// An id reserved by a creation or removal, until it is dropped.
@@ -331,6 +335,7 @@ impl Catalog {
             others: RwLock::default(),
             unavailable: RwLock::default(),
             reserved: Mutex::default(),
+            marked: Mutex::default(),
         };
         if let Some(root) = &repositories.root
             && let Ok(entries) = std::fs::read_dir(root)
@@ -524,17 +529,20 @@ impl Catalog {
         match std::fs::rename(&dir, &trash) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.unmark(root, id);
-                return Removal::Reclaimed;
+                return match self.unmark(root, id) {
+                    true => Removal::Reclaimed,
+                    false => Removal::Pending,
+                };
             }
             Err(error) => {
                 tracing::warn!(dir = %dir.display(), %error, "removed repository's directory not renamed; reclaimed at the next start");
                 return Removal::Pending;
             }
         }
-        self.unmark(root, id);
+        let unmarked = self.unmark(root, id);
         match std::fs::remove_dir_all(&trash) {
-            Ok(()) => Removal::Reclaimed,
+            Ok(()) if unmarked => Removal::Reclaimed,
+            Ok(()) => Removal::Pending,
             Err(error) => {
                 tracing::warn!(dir = %trash.display(), %error, "removed repository's files not deleted yet; deleted at the next start");
                 Removal::Pending
@@ -542,11 +550,21 @@ impl Catalog {
         }
     }
 
-    /// Removes repository `id`'s tombstone, its directory gone. One that stays (the
-    /// deletion failed) names nothing: the next start removes it.
-    fn unmark(&self, root: &std::path::Path, id: &str) {
-        if let Err(error) = crate::metadata::remove(&tombstone(root, id)) {
-            tracing::warn!(repository = %id, %error, "removed repository's tombstone not deleted");
+    /// Removes repository `id`'s tombstone, its directory gone; whether it is removed
+    /// durably. One that stays (or may come back: the directory sync failed) would reclaim a
+    /// new repository of the id at the next start, so the id stays taken until a start has
+    /// removed it ([`Self::create`]).
+    fn unmark(&self, root: &std::path::Path, id: &str) -> bool {
+        match crate::metadata::remove(&tombstone(root, id)) {
+            Ok(()) => {
+                self.marked.lock().remove(&id.to_ascii_lowercase());
+                true
+            }
+            Err(error) => {
+                tracing::warn!(repository = %id, %error, "removed repository's tombstone not deleted durably; the id is free again after a start");
+                self.marked.lock().insert(id.to_ascii_lowercase());
+                false
+            }
         }
     }
 
@@ -779,7 +797,9 @@ impl Catalog {
         if let Some(root) = &self.root {
             let dir = root.join(id);
             // A removal whose files weren't deleted: done now, or the id stays taken.
-            if tombstone(root, id).exists() && self.reclaim(root, id) == Removal::Pending {
+            if self.marked.lock().contains(&id.to_ascii_lowercase())
+                || (tombstone(root, id).exists() && self.reclaim(root, id) == Removal::Pending)
+            {
                 return Err(CatalogError::Conflict(format!(
                     "repository '{id}' is still being removed (its files are held); try again later"
                 )));
@@ -865,6 +885,71 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::{TRASH, existing, valid};
+
+    fn on_disk(dir: &std::path::Path) -> super::Catalog {
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir)).unwrap();
+        super::Catalog::open(
+            store,
+            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default()),
+        )
+        .unwrap()
+    }
+
+    /// A removal whose tombstone can't be removed (held or protected; a failed sync of the
+    /// directory too) keeps the id taken: a repository created under it would be reclaimed
+    /// by the next start, its acknowledged writes with it (Sol, r2 of the store lifecycle).
+    /// After a start has removed the tombstone the id is free, and what is written to the new
+    /// repository stays across restarts.
+    #[test]
+    fn an_id_whose_tombstone_stays_is_not_reused_until_a_start() {
+        use super::{CatalogError, RepositorySettings};
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = on_disk(dir.path());
+        catalog
+            .create("probe", RepositorySettings::default())
+            .unwrap();
+        // The fault stays on through the creation: on Windows the removal's rename fails first
+        // (the store is still open), and the creation's own reclaim then reaches the tombstone.
+        crate::metadata::tests::FAIL_REMOVE.set(true);
+        let removal = catalog.delete("probe");
+        let recreated = catalog.create("probe", RepositorySettings::default());
+        crate::metadata::tests::FAIL_REMOVE.set(false);
+        assert_eq!(removal.unwrap(), super::Removal::Pending);
+        assert!(
+            matches!(recreated, Err(CatalogError::Conflict(_))),
+            "{recreated:?}"
+        );
+        drop(catalog);
+        let catalog = on_disk(dir.path());
+        catalog
+            .create("probe", RepositorySettings::default())
+            .unwrap();
+        let pipeline = std::sync::Arc::clone(&*catalog.get("probe").unwrap().pipeline.read());
+        pipeline
+            .apply(
+                crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(
+                    "INSERT DATA { <urn:a> <urn:p> <urn:b> }",
+                )),
+                &crate::Requester::all(),
+                &crate::MutationTicket::new(),
+            )
+            .expect("acknowledged");
+        drop(pipeline);
+        drop(catalog);
+        let catalog = on_disk(dir.path());
+        let store = std::sync::Arc::clone(
+            catalog
+                .get("probe")
+                .expect("the new repository is kept")
+                .pipeline
+                .read()
+                .store(),
+        );
+        let answer = store
+            .execute_query_str("ASK { <urn:a> <urn:p> <urn:b> }")
+            .unwrap();
+        assert!(String::from_utf8(answer.payload).unwrap().contains("true"));
+    }
 
     /// A change whose settings file is in place but not made durable (the directory sync
     /// after the rename failed) leaves the repository unavailable until a restart: the

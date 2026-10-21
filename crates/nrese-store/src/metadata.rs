@@ -62,8 +62,13 @@ pub(crate) fn write(file: &Path, bytes: &[u8]) -> Result<(), WriteError> {
     })
 }
 
-/// Removes `file` (absent: nothing to do), the directory synced after.
+/// Removes `file` (absent: nothing to do), the directory synced after. An error may come
+/// after the file is gone, undurably (the sync): a crash can bring it back.
 pub(crate) fn remove(file: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_REMOVE.get() {
+        return Err(std::io::Error::other("removal failed (a test's)"));
+    }
     match fs::remove_file(file) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -89,6 +94,8 @@ pub(crate) mod tests {
     thread_local! {
         /// Makes this thread's directory syncs fail: a test's fault after a rename.
         pub(crate) static FAIL_DIR_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Makes this thread's removals fail: a test's held or protected file.
+        pub(crate) static FAIL_REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     #[test]
