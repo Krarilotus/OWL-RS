@@ -82,8 +82,19 @@ if [ "$old" != "$cache" ] && [ -d "$old" ]; then
   exec 8> "$old/lock"
   if flock -n 8; then
     while IFS= read -r -d '' entry; do
-      migrated=$((migrated + $(du -s --block-size=1 -- "$entry" | cut -f1)))
+      # Its size, the number before du's first tab (a name may hold anything, newlines too); an
+      # entry gone meanwhile has none and nothing to remove, one that can't be measured stops
+      # the build (Sol r4, finding 1).
+      entry_bytes=0
+      if du_line=$(du -s --block-size=1 -- "$entry" 2> /dev/null); then
+        entry_bytes=${du_line%%$'\t'*}
+        [[ $entry_bytes =~ ^[0-9]+$ ]] || { echo "can't read the size of $entry: '$entry_bytes'" >&2; exit 3; }
+      elif [ -e "$entry" ] || [ -L "$entry" ]; then
+        echo "can't measure $entry" >&2
+        exit 3
+      fi
       rm -rf -- "$entry"
+      migrated=$((migrated + entry_bytes))
     done < <(find "$old" -mindepth 1 -maxdepth 1 ! -name lock -print0)
     if [ "$migrated" -gt 0 ]; then
       echo "removed $old's entries ($migrated bytes): /verify uses the host's one cache now"
