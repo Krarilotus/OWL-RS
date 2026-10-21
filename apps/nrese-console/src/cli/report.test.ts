@@ -35,3 +35,26 @@ describe("textReport", () => {
     });
   });
 });
+
+describe("completeness", () => {
+  const soundOnly = {
+    ok: true,
+    status: 200,
+    body: "false",
+    completeness: { status: "sound-only" as const, header: "sound-only; regime=owl2-dl" },
+  };
+
+  test("an answer not shown to be complete warns on stderr and keeps stdout", () => {
+    expect(textReport(soundOnly)).toEqual({
+      lines: ["status=200", "false"],
+      warnings: ["completeness=sound-only; regime=owl2-dl"],
+      exitCode: 0,
+    });
+  });
+
+  test("--require-complete fails on it, with its own exit status", () => {
+    expect(textReport(soundOnly, true).exitCode).toBe(3);
+    const complete = { ...soundOnly, completeness: { status: "complete" as const, header: "complete" } };
+    expect(textReport(complete, true)).toEqual({ lines: ["status=200", "false"], exitCode: 0 });
+  });
+});
