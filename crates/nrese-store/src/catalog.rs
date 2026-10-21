@@ -247,10 +247,6 @@ pub struct Catalog {
     unavailable: RwLock<BTreeMap<String, String>>,
     /// Ids (ASCII lowercase) being created or removed.
     reserved: Mutex<BTreeSet<String>>,
-    /// Ids (ASCII lowercase) whose removal's tombstone couldn't be removed durably: a new
-    /// repository of the id would be reclaimed by the next start, so none is created until a
-    /// start has removed it.
-    marked: Mutex<BTreeSet<String>>,
 }
 
 /// An id reserved by a creation or removal, until it is dropped.
@@ -335,7 +331,6 @@ impl Catalog {
             others: RwLock::default(),
             unavailable: RwLock::default(),
             reserved: Mutex::default(),
-            marked: Mutex::default(),
         };
         if let Some(root) = &repositories.root
             && let Ok(entries) = std::fs::read_dir(root)
@@ -560,18 +555,13 @@ impl Catalog {
     }
 
     /// Removes repository `id`'s tombstone, its directory gone; whether it is removed
-    /// durably. One that stays (or may come back: the directory sync failed) would reclaim a
-    /// new repository of the id at the next start, so the id stays taken until a start has
-    /// removed it ([`Self::create`]).
+    /// durably. One that stays visible keeps the id taken; one gone but not durably (the
+    /// directory sync failed) is made durable by the next creation's sync ([`Self::create`]).
     fn unmark(&self, root: &std::path::Path, id: &str) -> bool {
         match crate::metadata::remove(&tombstone(root, id)) {
-            Ok(()) => {
-                self.marked.lock().remove(&id.to_ascii_lowercase());
-                true
-            }
+            Ok(()) => true,
             Err(error) => {
-                tracing::warn!(repository = %id, %error, "removed repository's tombstone not deleted durably; the id is free again after a start");
-                self.marked.lock().insert(id.to_ascii_lowercase());
+                tracing::warn!(repository = %id, %error, "removed repository's tombstone not deleted durably; the id is taken until it is");
                 false
             }
         }
@@ -789,8 +779,9 @@ impl Catalog {
             .collect()
     }
 
-    /// Creates repository `id`, empty, with `settings`: its id reserved, its settings
-    /// written, then its store opened. A failed start removes what was made.
+    /// Creates repository `id`, empty, with `settings`: its id reserved, `repositories/` synced
+    /// (so that no earlier removal's tombstone can come back over it), its settings written,
+    /// then its store opened. A failed start removes what was made.
     pub fn create(&self, id: &str, settings: RepositorySettings) -> Result<(), CatalogError> {
         if !valid(id) {
             return Err(CatalogError::Invalid(format!(
@@ -812,10 +803,20 @@ impl Catalog {
         }
         if let Some(root) = &self.root {
             let dir = root.join(id);
+            // An earlier removal of the id may have unlinked its tombstone without making that
+            // durable, in this run or one before it (a restart doesn't make it durable): a crash
+            // could bring it back, and the next start would reclaim the new repository. A sync
+            // of the directory makes every such unlink durable, else nothing is created.
+            // (A new directory holds no tombstone: its first sync is as good.)
+            let synced = std::fs::create_dir_all(root).and_then(|()| crate::metadata::sync(root));
+            if let Err(error) = synced {
+                return Err(CatalogError::Store(format!(
+                    "{}: {error}; no repository is created until the directory can be synced (a removal's tombstone may not be durably gone)",
+                    root.display()
+                )));
+            }
             // A removal whose files weren't deleted: done now, or the id stays taken.
-            if self.marked.lock().contains(&id.to_ascii_lowercase())
-                || (tombstone(root, id).exists() && self.reclaim(root, id) == Removal::Pending)
-            {
+            if tombstone(root, id).exists() && self.reclaim(root, id) == Removal::Pending {
                 return Err(CatalogError::Conflict(format!(
                     "repository '{id}' is still being removed (its files are held); try again later"
                 )));
@@ -937,6 +938,73 @@ mod tests {
         );
         drop(catalog);
         let catalog = on_disk(dir.path());
+        catalog
+            .create("probe", RepositorySettings::default())
+            .unwrap();
+        let pipeline = std::sync::Arc::clone(&*catalog.get("probe").unwrap().pipeline.read());
+        pipeline
+            .apply(
+                crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(
+                    "INSERT DATA { <urn:a> <urn:p> <urn:b> }",
+                )),
+                &crate::Requester::all(),
+                &crate::MutationTicket::new(),
+            )
+            .expect("acknowledged");
+        drop(pipeline);
+        drop(catalog);
+        let catalog = on_disk(dir.path());
+        let store = std::sync::Arc::clone(
+            catalog
+                .get("probe")
+                .expect("the new repository is kept")
+                .pipeline
+                .read()
+                .store(),
+        );
+        let answer = store
+            .execute_query_str("ASK { <urn:a> <urn:p> <urn:b> }")
+            .unwrap();
+        assert!(String::from_utf8(answer.payload).unwrap().contains("true"));
+    }
+
+    /// A tombstone unlinked without the directory sync (R3-1, Sol r3 of the store lifecycle):
+    /// its absence isn't durable, and a restart doesn't make it so. A creation of the id after
+    /// a restart, with the directory still unsyncable, is refused (a crash could bring the
+    /// tombstone back, and the next start would reclaim the new repository). Once the
+    /// directory syncs, the id is reused, and what is written to it stays across restarts.
+    /// The fault stays on through the restarts: on Windows the removal's rename fails first
+    /// (the store is still open), and the next start's reclaim does the unlink.
+    #[test]
+    fn an_id_is_reused_only_after_its_tombstones_removal_is_durable() {
+        use super::{CatalogError, RepositorySettings};
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = on_disk(dir.path());
+        catalog
+            .create("probe", RepositorySettings::default())
+            .unwrap();
+        crate::metadata::tests::FAIL_DIR_SYNC.set(true);
+        let removal = catalog.delete("probe");
+        drop(catalog);
+        // Two starts with the directory unsyncable: by the second, no tombstone is visible and
+        // nothing in memory remembers the removal.
+        drop(on_disk(dir.path()));
+        let catalog = on_disk(dir.path());
+        let recreated = catalog.create("probe", RepositorySettings::default());
+        crate::metadata::tests::FAIL_DIR_SYNC.set(false);
+        assert!(removal.is_ok(), "{removal:?}");
+        let root = dir.path().join("repositories");
+        assert!(
+            !root.join("~removed-probe").exists(),
+            "unlinked, not durably"
+        );
+        // Refused by the barrier itself (not by a later write the fault also fails), before
+        // anything is made.
+        assert!(
+            matches!(&recreated, Err(CatalogError::Store(why)) if why.contains("until the directory can be synced")),
+            "{recreated:?}"
+        );
+        assert!(!root.join("probe").exists(), "nothing made");
         catalog
             .create("probe", RepositorySettings::default())
             .unwrap();

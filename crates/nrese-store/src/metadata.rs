@@ -62,8 +62,9 @@ pub(crate) fn write(file: &Path, bytes: &[u8]) -> Result<(), WriteError> {
     })
 }
 
-/// Removes `file` (absent: nothing to do), the directory synced after. An error may come
-/// after the file is gone, undurably (the sync): a crash can bring it back.
+/// Removes `file`, the directory synced after: `Ok` only once its absence is durable (an
+/// absent file too, whose earlier removal may not have been). An error may come after the file
+/// is gone, undurably (the sync): a crash can bring it back.
 pub(crate) fn remove(file: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     if tests::FAIL_REMOVE.get() {
@@ -71,10 +72,16 @@ pub(crate) fn remove(file: &Path) -> std::io::Result<()> {
     }
     match fs::remove_file(file) {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
     sync_dir(file.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+/// Makes what was done in `dir` durable: every entry added, renamed or removed there before
+/// survives a crash once this returns `Ok`.
+pub(crate) fn sync(dir: &Path) -> std::io::Result<()> {
+    sync_dir(dir)
 }
 
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
