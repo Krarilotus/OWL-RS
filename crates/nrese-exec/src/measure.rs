@@ -84,12 +84,24 @@
 //! for every thread of the global pool to start before the first measurement, from outside
 //! any pool, whatever pool that measurement runs on: input built on the global pool, then
 //! a measurement on another, counted the global threads that started late, in pairs of
-//! those sizes (the GeoSPARQL guard's rare excess, attributed 20 Oct). It waits running no
-//! job, and for at most 4 seconds: a global thread busy for longer, or one that never runs
-//! its part (the caller's own, if it is one, or one blocked on this preparation), is not
-//! waited for, and if it hasn't started, a measurement counts its start. A pool of a test's
-//! own is the test's: rule, start its threads before measuring (`pool.broadcast(|_| ())`),
-//! or a measurement counts those that start in it.
+//! those sizes (the GeoSPARQL guard's rare excess, attributed 20 Oct). That wait for the
+//! threads to start runs no job and lasts at most 4 seconds a pool: a global thread busy for
+//! longer, or one that never runs its part (the caller's own, if it is one, or one blocked on
+//! this preparation), is not waited for, and if it hasn't started, a measurement counts its
+//! start. A pool of a test's own is the test's: rule, start its threads before measuring
+//! (`pool.broadcast(|_| ())`), or a measurement counts those that start in it.
+//!
+//! And the preparation's own waits for the global pool, which are not bounded: outside any
+//! pool, the first measurement makes the caller's own thread state with a `rayon::join`,
+//! within the preparation that runs once per process, and every measurement aligns rayon's
+//! queue with such joins (see [`prepare`]); each waits for a thread of the global pool to run
+//! its job. A global thread that waits for that preparation, or for a lock the measuring
+//! thread holds, never does, and neither returns (Sol, measure-pool r3; the base had the same
+//! waits). So, the rule for a measured test: its first measurement is not made while a thread
+//! of a pool is entering one, and a measuring thread holds no lock a pool's job needs. In the
+//! suite's own runs it did not occur: 0 hangs in 91 runs of this module's tests recorded from
+//! 19 to 21 October 2026 (commit hooks, push gates and fleet proofs). A preparation that
+//! waits on no pool is the follow-up.
 //!
 //! Counts are `i128`: a `usize` converts exactly, and no sum of them reaches its bounds.
 //! A realloc counts the new block, then frees the old: it may move the bytes. Measurements
@@ -457,7 +469,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
 ///   allocates its state as it starts (see "Known limits"): once per process, before the
 ///   first measurement, each has run a broadcast that only counts, the global pool's sent
 ///   from outside any pool, the caller waiting without running any job, for at most 4
-///   seconds;
+///   seconds a pool (the joins below wait without a bound: "Known limits");
 /// - rayon's global queue, which allocates its next block on the 63rd entry from outside
 ///   the pool: before each measurement made outside the pool (nested ones too), empty
 ///   entries until one allocates its block (at most 63, about a millisecond), uncounted by
@@ -622,7 +634,8 @@ fn reported(count: i128) -> usize {
 }
 
 /// `work`'s result, and the most bytes it held at once: allocated while it ran and not
-/// yet freed. Without [`Measured`] as the global allocator, it panics.
+/// yet freed. Without [`Measured`] as the global allocator, it panics. Its preparation can
+/// wait for the global pool: mind the rule for measured tests in "Known limits".
 pub fn measure<T>(work: impl FnOnce() -> T) -> (T, usize) {
     prepare();
     let running = Running::start(None);
@@ -632,7 +645,8 @@ pub fn measure<T>(work: impl FnOnce() -> T) -> (T, usize) {
 
 /// `work`'s result, and the most bytes it held beyond what it reserved of `budget` (or a
 /// part of it) at any of its events, 0 if never beyond: what it allocated before reserving
-/// it, or still held when it released the charge.
+/// it, or still held when it released the charge. As for [`measure`], mind the rule for
+/// measured tests in "Known limits".
 pub fn measure_within<T>(budget: &Budget, work: impl FnOnce() -> T) -> (T, usize) {
     prepare();
     let running = Running::start(Some(budget));
