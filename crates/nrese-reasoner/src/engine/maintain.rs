@@ -165,7 +165,36 @@ pub fn maintain(
     } else {
         None
     };
-    let update = {
+    // A first load (no asserted fact before, nothing deleted): its closure is the whole
+    // closure, so it is materialised once, by the batch executor, and every violation in it
+    // is the change's own. The delta executor built one job per ground rule and copied
+    // each job's matches before the round ran: a 250-class subclass chain with 400
+    // individuals held 757 MiB in a round that derived nothing, where a materialisation
+    // holds about 140 (DMW's A/B, fleet pm-dmwab-3, 21 Oct 2026).
+    let first_load = !revived
+        && program
+            .plan
+            .is_none_or(|plan| plan == delta::policy::Plan::Rebuild)
+        && tx.base().len_in(ReadModel::Asserted) == 0
+        && tx.deleted().next().is_none()
+        && tx.inserted().next().is_some();
+    if first_load {
+        rebuilt = Some(super::materialise_until(
+            program,
+            &tx.pending_snapshot(),
+            stop,
+        )?);
+    }
+    let update = if let Some(closure) = rebuilt.as_mut().filter(|_| first_load) {
+        delta::Update {
+            violations: std::mem::take(&mut closure.violations),
+            policy: delta::policy::Counts {
+                plan: delta::policy::Plan::Rebuild,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    } else {
         let base = EngineBase::new(tx, &program.axioms);
         // Facts new to the state: in no graph and not inferred before the transaction.
         let mut inserted: Vec<Triple> = tx
@@ -753,6 +782,80 @@ mod tests {
                 closure.violations.iter().any(|v| v.rule == "cls-nothing2"),
                 "by representatives {representatives}: {:?}",
                 closure.violations
+            );
+        }
+    }
+
+    /// A first load is materialised once, not run through the delta executor: its stack
+    /// is the recomputed closure, an inconsistent one is still reported, and the next
+    /// commit, onto a loaded state, takes the delta.
+    #[test]
+    fn a_first_load_is_materialised_and_the_next_commit_takes_the_delta() {
+        use crate::delta::policy::Plan;
+        for consistent in [true, false] {
+            let engine = Engine::new(EngineConfig {
+                background_maintenance: false,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let mut tx = engine.transaction();
+            let program =
+                Program::compile(&crate::rulesets::Ruleset::Owl2Rl.into(), &|t| tx.intern(t));
+            let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+            let rdf_type = iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+            let subclass = iri("http://www.w3.org/2000/01/rdf-schema#subClassOf");
+            let disjoint = iri("http://www.w3.org/2002/07/owl#disjointWith");
+            // A subclass chain of 20 with 10 individuals at the bottom (DMW's chain, small).
+            let class = |n: usize| iri(&format!("http://example.com/C{n}"));
+            let mut facts: Vec<Triple> = (1..20)
+                .map(|n| [class(n), subclass, class(n - 1)])
+                .collect();
+            facts.extend((0..10).map(|i| {
+                [
+                    iri(&format!("http://example.com/i{i}")),
+                    rdf_type,
+                    class(19),
+                ]
+            }));
+            if !consistent {
+                facts.push([class(0), disjoint, class(19)]);
+            }
+            let next = [iri("http://example.com/j"), rdf_type, class(10)];
+            for &fact in &facts {
+                tx.insert_encoded(encode(fact).in_default_graph());
+            }
+            let done = maintain(&program, None, &mut tx, crate::eval::NEVER).unwrap();
+            assert_eq!(done.work.plan, Plan::Rebuild, "consistent {consistent}");
+            assert_eq!(
+                done.violations.is_empty(),
+                consistent,
+                "{:?}",
+                done.violations
+            );
+            if !consistent {
+                continue;
+            }
+            tx.commit().unwrap();
+            let snapshot = engine.snapshot();
+            let stored: HashSet<EncodedTriple> = snapshot
+                .stored()
+                .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+                .map(Into::into)
+                .collect();
+            let fresh: HashSet<EncodedTriple> = super::super::materialise(&program, &snapshot)
+                .inferred
+                .into_iter()
+                .filter(|t| !snapshot.contains_in(ReadModel::Asserted, &t.in_default_graph()))
+                .collect();
+            assert_eq!(stored, fresh);
+            let ground = done.program.expect("the ground program after the load");
+            let mut tx = engine.transaction();
+            tx.insert_encoded(encode(next).in_default_graph());
+            let done = maintain(&program, Some(&ground), &mut tx, crate::eval::NEVER).unwrap();
+            assert_ne!(
+                done.work.plan,
+                Plan::Rebuild,
+                "a loaded state takes the delta"
             );
         }
     }
