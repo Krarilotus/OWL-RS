@@ -112,35 +112,32 @@ pub(crate) fn term(text: &str) -> Result<Term, ApiError> {
     Ok(Literal::new_typed_literal(value, datatype).into())
 }
 
-/// N-Triples string escapes undone.
+/// N-Triples string escapes undone; `None` for a malformed one (a `\u` escape takes exactly
+/// four hex digits, `\U` eight, as everywhere else).
 fn unescape(text: &str) -> Option<String> {
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next()? {
-            't' => out.push('\t'),
-            'b' => out.push('\u{8}'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            'f' => out.push('\u{c}'),
-            '"' => out.push('"'),
-            '\'' => out.push('\''),
-            '\\' => out.push('\\'),
-            'u' => out.push(hex(&mut chars, 4)?),
-            'U' => out.push(hex(&mut chars, 8)?),
+    let mut rest = text;
+    while let Some(at) = rest.find('\\') {
+        out.push_str(&rest[..at]);
+        let escape = &rest[at..];
+        let (c, width) = match escape.as_bytes().get(1)? {
+            b't' => ('\t', 2),
+            b'b' => ('\u{8}', 2),
+            b'n' => ('\n', 2),
+            b'r' => ('\r', 2),
+            b'f' => ('\u{c}', 2),
+            b'"' => ('"', 2),
+            b'\'' => ('\'', 2),
+            b'\\' => ('\\', 2),
+            b'u' => (nrese_rdf::escape::unicode_escape(escape.as_bytes(), 0)?, 6),
+            b'U' => (nrese_rdf::escape::unicode_escape(escape.as_bytes(), 0)?, 10),
             _ => return None,
-        }
+        };
+        out.push(c);
+        rest = &escape[width..];
     }
+    out.push_str(rest);
     Some(out)
-}
-
-fn hex(chars: &mut std::str::Chars<'_>, digits: usize) -> Option<char> {
-    let code: String = chars.take(digits).collect();
-    char::from_u32(u32::from_str_radix(&code, 16).ok()?)
 }
 
 /// The graphs of the `context` parameters (`null`: the default graph).
@@ -972,6 +969,11 @@ mod tests {
         assert!(matches!(term("_:b1").unwrap(), Term::BlankNode(_)));
         assert!(term("plain").is_err());
         assert!(term("\"open").is_err());
+        // A truncated or signed `\u` escape is refused, never read as another character
+        // (a DELETE with it would remove a different statement).
+        assert!(term("\"\\u12\"").is_err());
+        assert!(term("\"\\u+041\"").is_err());
+        assert!(term("<http://e/\\U0001F98>").is_err());
     }
 
     #[test]
