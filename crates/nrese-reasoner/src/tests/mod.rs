@@ -1484,7 +1484,9 @@ fn delta_equality_equals_rematerialisation() {
 }
 
 /// A materialisation stops when asked, at any poll, and a stop that never fires
-/// changes nothing (completion plan 1.7).
+/// changes nothing (completion plan 1.7). A stop that fires at one poll only (the
+/// process's memory limit reads true, then false once memory is freed) never ends it as
+/// complete with less than the closure.
 #[test]
 fn materialisation_stops_when_asked() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1493,7 +1495,7 @@ fn materialisation_stops_when_asked() {
     // most do, and a seed that draws one that doesn't draws another (at most ten), so
     // that the test never depends on the seed's luck.
     let mut drawn = 0;
-    let (groups, rules, lists, schema, total) = loop {
+    let (groups, rules, lists, schema, total, full) = loop {
         drawn += 1;
         let lines = random_ontology(&mut next);
         let mut vocabulary = LocalVocabulary::default();
@@ -1523,7 +1525,7 @@ fn materialisation_stops_when_asked() {
         assert_eq!(again.derived, full.derived);
         let total = polls.load(Ordering::Relaxed);
         if total > 2 || drawn == 10 {
-            break (groups, rules, lists, schema, total);
+            break (groups, rules, lists, schema, total, full);
         }
     };
     assert!(total > 2, "{total} polls in {drawn} ontologies");
@@ -1535,6 +1537,18 @@ fn materialisation_stops_when_asked() {
                 .is_err(),
             "stopped at poll {at}"
         );
+    }
+    for at in 0..total {
+        let seen = AtomicUsize::new(0);
+        let once = || seen.fetch_add(1, Ordering::Relaxed) == at;
+        if let Ok(result) =
+            batch::materialise_grouped_until(groups.clone(), &rules, Some(&lists), &schema, &once)
+        {
+            assert_eq!(
+                result.derived, full.derived,
+                "stopped at poll {at} only, then not: published as complete"
+            );
+        }
     }
 }
 
