@@ -302,7 +302,7 @@ Every limit on memory, time and request size is in one table, `[budgets]`. Value
 | `budgets.graph_write_timeout` | `NRESE_GRAPH_WRITE_TIMEOUT_MS` | 60 s | A Graph Store write |
 | `budgets.query_text` | `NRESE_MAX_QUERY_BYTES` | 1 MiB | The text of a query |
 | `budgets.update_size` | `NRESE_MAX_UPDATE_BYTES` | 16 MiB | A SPARQL update request |
-| `budgets.upload_size` | `NRESE_MAX_RDF_UPLOAD_BYTES` | 128 MiB | An RDF payload (Graph Store, TELL, SHACL shapes); larger data goes through `nrese-server load` |
+| `budgets.upload_size` | `NRESE_MAX_RDF_UPLOAD_BYTES` | 128 MiB | An RDF payload (Graph Store, TELL, SHACL shapes); larger data goes through `nrese-server load`. An N-Quads restore (`POST …/restore`) has no limit of its own: the server's body limit bounds it, 3 × the largest of this, `budgets.update_size` and `budgets.query_text`, plus 64 KiB (about 384 MiB, some 3 million statements, by default), and it holds the whole payload while it parses. Store-sized backups restore offline: `nrese-server load --replace` for an N-Quads export, `nrese-server restore DIR` for an image |
 | `budgets.result_cache` | `NRESE_QUERY_CACHE_BYTES` | 2% of memory (64 MiB to 8 GiB) | Results of query parts (id columns) kept for repeated queries and shared sub-patterns ([the result cache](#store)); a size or a share (`5%`). `0` switches the cache off |
 | `budgets.result_cache_pins` | `NRESE_PINNED_QUERIES` | none | Query files whose results are pinned in the result cache at startup |
 
