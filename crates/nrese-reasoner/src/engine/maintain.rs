@@ -239,8 +239,18 @@ pub fn maintain(
         if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
         } else if let Some(closure) = rebuilt.as_ref().filter(|_| first_load) {
-            // The new inferred facts, as the delta executor reports them (its `insert`).
+            // The new inferred facts, as the delta executor reports them (its `insert`). The
+            // facts no store holds (a literal subject) can't be told new from the base: those
+            // the state concluded before (from its axioms alone, as it holds no asserted
+            // fact) are old, and a datatype violation of theirs stays tolerated (Sol r2 F1).
             let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
+            let old_unstorable: HashSet<Triple> = match closure.unstorable.is_empty() {
+                true => HashSet::new(),
+                false => super::materialise_until(program, tx.base(), stop)?
+                    .unstorable
+                    .into_iter()
+                    .collect(),
+            };
             let derived: Vec<Triple> = closure
                 .inferred
                 .iter()
@@ -248,7 +258,13 @@ pub fn maintain(
                 .filter(|&f| {
                     !base.is_asserted(f) && !(base.contains(f) && !inserted_set.contains(&f))
                 })
-                .chain(closure.unstorable.iter().copied())
+                .chain(
+                    closure
+                        .unstorable
+                        .iter()
+                        .copied()
+                        .filter(|f| !old_unstorable.contains(f)),
+                )
                 .collect();
             delta::Update {
                 violations: delta::introduced_violations(&base, &inserted, &derived, rules, ground),
