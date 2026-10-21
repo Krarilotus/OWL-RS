@@ -807,7 +807,8 @@ impl StoreService {
     }
 
     /// Runs a prepared query on the latest snapshot to completion and reports how it ran:
-    /// the executor, each operator with estimated and actual rows, and times.
+    /// the executor, each operator with estimated and actual rows, and times. To a reader
+    /// who may not read every graph, without its operators ([`reads_everything`]).
     pub fn explain_query(
         &self,
         prepared: &PreparedQuery,
@@ -848,23 +849,34 @@ impl StoreService {
                 .map(|ql| ql.completeness.clone())
                 .or_else(|| self.status_without_dl(prepared));
         }
+        if !reads_everything(prepared) {
+            explanation.steps.clear();
+            explanation.decoded = 0;
+        }
         Ok(explanation)
     }
 
     /// The plan `prepared` would run as, each node with its estimated rows, without
-    /// running it (EXPLAIN without ANALYZE). Planning stops with
-    /// [`nrese_sparql::QueryEvaluationError::Cancelled`] once `cancellation` is cancelled.
+    /// running it (EXPLAIN without ANALYZE), within the query's memory envelope. Planning
+    /// stops with [`nrese_sparql::QueryEvaluationError::Cancelled`] once `cancellation` is
+    /// cancelled. To a reader who may not read every graph, without its nodes
+    /// ([`reads_everything`]).
     pub fn plan_query(
         &self,
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
+        let memory = self.settings.query_envelope(prepared);
         let mut planned = plan_prepared(
             &self.read_snapshot(prepared.access()),
             prepared,
             &self.settings,
             cancellation,
+            &memory,
         )?;
+        if !reads_everything(prepared) {
+            planned.steps.clear();
+        }
         planned.completeness = match self.dl_mode(prepared) {
             Some(_) => Some(crate::dl::query::plan_status(self, prepared)),
             None => planned
@@ -1645,4 +1657,12 @@ pub(crate) fn in_readable_graph(
         };
         access.allows_graph(&graph)
     })
+}
+
+/// Whether `prepared` reads every graph: only then does EXPLAIN report its operators. Their
+/// estimates, their order (chosen by those estimates), their row counts, the dictionary work
+/// they report and their times come from statistics and scans of every graph, the ones its
+/// reader may not read too; the rewrites, the answer's rows and its completeness don't.
+fn reads_everything(prepared: &PreparedQuery) -> bool {
+    crate::ReadScope::of(prepared.access().cloned()).reads_everything()
 }

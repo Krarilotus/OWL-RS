@@ -420,3 +420,43 @@ fn service_is_a_privilege_of_its_own() {
         "{refused}"
     );
 }
+
+/// EXPLAIN and EXPLAIN ANALYZE tell a restricted reader nothing of the graphs it may not
+/// read: two stores that differ only in a secret graph answer its plan and its run alike
+/// (times aside). The planner's estimates, the order they choose and the operators' rows
+/// read every graph (round 13, R13-diag), so a restricted reader gets no operators; a reader
+/// of every graph still gets them all.
+#[test]
+fn explain_tells_a_restricted_reader_nothing_of_hidden_graphs() {
+    let with_secret = |secret: usize| {
+        let store = store();
+        let quads: String = (0..secret)
+            .map(|i| format!("<urn:s{i}> <urn:p> {i} . <urn:s{i}> <urn:q> <urn:o{i}> . "))
+            .collect();
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ GRAPH <urn:g:secret> {{ {quads} }} }}"
+            )))
+            .unwrap();
+        store
+    };
+    let query = "SELECT * WHERE { GRAPH ?g { ?s <urn:p> ?v . ?s <urn:q> ?o } }";
+    let explain = |store: &StoreService, scope: ReadScope| {
+        let prepared = store
+            .prepare_query(&SparqlQueryRequest::new(query, scope))
+            .unwrap();
+        let token = nrese_store::CancellationToken::new();
+        let plan = store.plan_query(&prepared, &token).unwrap();
+        store.clear_query_cache();
+        let mut run = store.explain_query(&prepared, &token).unwrap();
+        run.micros = 0;
+        for step in &mut run.steps {
+            step.micros = 0;
+        }
+        (plan, run)
+    };
+    let (small, large) = (with_secret(1), with_secret(2_000));
+    assert_eq!(explain(&small, public()), explain(&large, public()));
+    let (plan, run) = explain(&large, ReadScope::All);
+    assert!(!plan.steps.is_empty() && !run.steps.is_empty());
+}
