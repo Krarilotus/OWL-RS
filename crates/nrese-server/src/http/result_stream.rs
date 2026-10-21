@@ -7,21 +7,27 @@
 //!   error) arrives, so errors and timeouts before any output still get a proper status.
 //! - **After the first chunk,** a failure can only abort the transfer: no final chunk on
 //!   HTTP/1.1, a reset stream on HTTP/2, never a clean end. The 200 is already sent; clients
-//!   see a truncated body they can tell from a complete one, as with QLever or Fuseki.
+//!   see a truncated body they can tell from a complete one, as with QLever or Fuseki. How
+//!   the producer ended is kept beside the channel ([`Outcome`]), not sent through it: a
+//!   failure that comes while the channel is full (a client that stopped reading) can't be
+//!   lost, and the body ends cleanly only after a producer that finished.
 //! - **Trailers.** A producer may end with trailer fields ([`ChannelWriter::trailers`]),
 //!   sent after the body: what is known only once all of it is written (a checksum).
 //! - **Time ([`Pace`]).** A computation deadline for the whole stream (a query's timeout),
 //!   or a deadline for the first chunk and then a bound on each chunk's stall (reads of
 //!   stored statements, the export): a client that keeps reading is never cut off, one that
 //!   stops is. Either way the producer waits for room in the channel only so long, so it
-//!   lets go of its thread and snapshot when nobody reads.
+//!   lets go of its thread and snapshot when nobody reads. Under a stall bound, whether the
+//!   first chunk was in time is decided once ([`Start`]): a chunk goes out only after the
+//!   producer claimed the start, and the first deadline cancels only a stream nobody
+//!   started.
 //! - **Cancellation.** Reaching the deadline or a stall, or the client disconnecting (the
 //!   body is dropped), cancels the producer's token, so evaluation stops promptly instead of
 //!   running to completion for nobody.
 
 use std::io;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
@@ -38,7 +44,67 @@ const CHUNK_BYTES: usize = 64 * 1024;
 /// Chunks in flight between producer and client (at most ~0.5 MiB per request).
 const CHANNEL_CHUNKS: usize = 8;
 
-type Message = Result<Frame<Bytes>, ApiError>;
+type Message = Frame<Bytes>;
+
+/// How the producer ended: `None` while it runs (or if it panicked), its result after.
+#[derive(Default)]
+struct Outcome(Mutex<Option<Result<(), ApiError>>>);
+
+impl Outcome {
+    fn set(&self, result: Result<(), ApiError>) {
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(result);
+    }
+
+    /// The producer's result, once its sender is gone: one that recorded none didn't finish.
+    fn take(&self) -> Result<(), ApiError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .unwrap_or_else(|| Err(ApiError::internal("the output ended without finishing")))
+    }
+}
+
+/// Whether the first chunk went out in time, decided once: the producer claims the start
+/// before it publishes the first chunk, the first deadline claims it late; whichever comes
+/// first wins, so a chunk the client got is never followed by a cancellation for lateness.
+#[derive(Default)]
+struct Start(AtomicU8);
+
+impl Start {
+    const WAITING: u8 = 0;
+    const STARTED: u8 = 1;
+    const LATE: u8 = 2;
+
+    fn started(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::STARTED
+    }
+
+    /// The producer's claim: whether the stream has started (now or before).
+    fn begin(&self) -> bool {
+        match self.0.compare_exchange(
+            Self::WAITING,
+            Self::STARTED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(state) => state == Self::STARTED,
+        }
+    }
+
+    /// The first deadline's claim: whether nothing started before it.
+    fn late(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::WAITING,
+                Self::LATE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
 
 /// How long a stream may take.
 #[derive(Debug, Clone, Copy)]
@@ -78,21 +144,25 @@ pub struct ChannelWriter {
     sender: mpsc::Sender<Message>,
     buffer: Vec<u8>,
     pace: Pace,
-    /// A chunk went into the channel.
-    started: Arc<AtomicBool>,
+    start: Arc<Start>,
     runtime: tokio::runtime::Handle,
 }
 
 impl ChannelWriter {
-    /// Sends `message`, waiting for room in the channel as long as the pace allows.
+    /// Sends `message`, waiting for room in the channel as long as the pace allows. The
+    /// first one claims the start once it has room, before it goes out.
     fn send(&self, message: Message) -> io::Result<()> {
-        let until = self.pace.until(self.started.load(Ordering::Acquire));
-        let sent = self
+        let started = self.start.started();
+        let until = self.pace.until(started);
+        let room = self
             .runtime
-            .block_on(tokio::time::timeout_at(until, self.sender.send(message)));
-        match sent {
-            Ok(Ok(())) => {
-                self.started.store(true, Ordering::Release);
+            .block_on(tokio::time::timeout_at(until, self.sender.reserve()));
+        match room {
+            Ok(Ok(permit)) => {
+                if !started && !self.start.begin() {
+                    return Err(io::Error::from(io::ErrorKind::TimedOut)); // the first was late
+                }
+                permit.send(message);
                 Ok(())
             }
             Ok(Err(_)) => Err(io::Error::from(io::ErrorKind::BrokenPipe)), // client went away
@@ -103,7 +173,7 @@ impl ChannelWriter {
     /// Ends the body with `trailers`, sent after everything written so far.
     pub fn trailers(&mut self, trailers: HeaderMap) -> io::Result<()> {
         io::Write::flush(self)?;
-        self.send(Ok(Frame::trailers(trailers)))
+        self.send(Frame::trailers(trailers))
     }
 }
 
@@ -128,7 +198,7 @@ impl io::Write for ChannelWriter {
             return Ok(());
         }
         let chunk = std::mem::replace(&mut self.buffer, Vec::with_capacity(CHUNK_BYTES));
-        self.send(Ok(Frame::data(Bytes::from(chunk))))
+        self.send(Frame::data(Bytes::from(chunk)))
     }
 }
 
@@ -153,21 +223,23 @@ pub async fn stream_blocking(
     produce: impl FnOnce(&mut ChannelWriter) -> Result<(), ApiError> + Send + 'static,
 ) -> Result<Response, ApiError> {
     let (sender, mut receiver) = mpsc::channel::<Message>(CHANNEL_CHUNKS);
-    let started = Arc::new(AtomicBool::new(false));
+    let start = Arc::new(Start::default());
+    let outcome = Arc::new(Outcome::default());
     let mut writer = ChannelWriter {
         sender,
         buffer: Vec::with_capacity(CHUNK_BYTES),
         pace,
-        started: Arc::clone(&started),
+        start: Arc::clone(&start),
         runtime: tokio::runtime::Handle::current(),
     };
+    let ended = Arc::clone(&outcome);
     tokio::task::spawn_blocking(move || {
         let result = produce(&mut writer).and_then(|()| {
             io::Write::flush(&mut writer).map_err(|error| ApiError::internal(error.to_string()))
         });
-        if let Err(error) = result {
-            let _ = writer.send(Err(error)); // the client is gone, or isn't reading
-        }
+        // Recorded before the sender goes (with `writer`): the receiver reads it once the
+        // channel closes, however full the channel was.
+        ended.set(result);
     });
     // The first deadline as a computation deadline: evaluation stops at it whether or not
     // the body is being polled (the review of 3 October 2026, P5). Under a stall bound only
@@ -179,7 +251,7 @@ pub async fn stream_blocking(
     let watchdog = cancellation.clone();
     let watchdog = tokio::spawn(async move {
         tokio::time::sleep_until(deadline).await;
-        if total || !started.load(Ordering::Acquire) {
+        if total || start.late() {
             watchdog.cancel();
         }
     })
@@ -188,14 +260,19 @@ pub async fn stream_blocking(
     let guard = CancelOnDrop(cancellation, watchdog);
     let first = match tokio::time::timeout_at(deadline, receiver.recv()).await {
         Err(_elapsed) => return Err(ApiError::timeout(timeout_message)), // guard cancels
-        Ok(Some(Err(error))) => return Err(error),
-        Ok(Some(Ok(frame))) => Some(frame),
-        Ok(None) => None, // finished without output
+        Ok(Some(frame)) => Some(frame),
+        // Ended without output: a success is an empty body, a failure keeps its status.
+        Ok(None) => {
+            outcome.take()?;
+            outcome.set(Ok(())); // the body's end reads it again
+            None
+        }
     };
 
     struct State {
         receiver: mpsc::Receiver<Message>,
         first: Option<Frame<Bytes>>,
+        outcome: Arc<Outcome>,
         guard: CancelOnDrop,
         pace: Pace,
         timeout_message: &'static str,
@@ -203,6 +280,7 @@ pub async fn stream_blocking(
     let state = State {
         receiver,
         first,
+        outcome,
         guard,
         pace,
         timeout_message,
@@ -214,9 +292,12 @@ pub async fn stream_blocking(
         }
         let until = state.pace.until(true);
         match tokio::time::timeout_at(until, state.receiver.recv()).await {
-            Ok(Some(Ok(frame))) => Some((Ok(frame), Some(state))),
-            Ok(Some(Err(error))) => Some((Err(io::Error::other(error.to_string())), None)),
-            Ok(None) => None,
+            Ok(Some(frame)) => Some((Ok(frame), Some(state))),
+            // The producer is gone: a clean end only if it finished.
+            Ok(None) => match state.outcome.take() {
+                Ok(()) => None,
+                Err(error) => Some((Err(io::Error::other(error.to_string())), None)),
+            },
             Err(_elapsed) => {
                 state.guard.0.cancel();
                 Some((Err(io::Error::other(state.timeout_message)), None))
@@ -414,5 +495,99 @@ mod tests {
         assert!(ended, "the producer still waits for a stalled reader");
         drop(body);
         busy.abort();
+    }
+
+    /// Sol r1 F1: a client that stops reading until the producer has given up, then drains
+    /// what was buffered, gets a failed body, never a clean end, though the failure came
+    /// while the channel was full. The producer's sender is watched (weakly) until it is
+    /// gone, so no timing decides the assertion.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_failure_while_the_channel_is_full_is_not_a_clean_end() {
+        use http_body_util::BodyExt;
+
+        let busy = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
+        let stall = Duration::from_millis(300);
+        let (weak_sender, weak) = tokio::sync::oneshot::channel();
+        let response = stream_blocking(
+            Pace::stalled_after(stall),
+            CancellationToken::new(),
+            "text/plain",
+            "timeout",
+            move |writer| {
+                weak_sender
+                    .send(writer.sender.downgrade())
+                    .expect("the test waits");
+                for _ in 0..32 {
+                    io::Write::write_all(writer, &[b'x'; CHUNK_BYTES])
+                        .map_err(|error| ApiError::internal(error.to_string()))?;
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        let weak = weak.await.unwrap();
+        for _ in 0..120_000 {
+            if weak.strong_count() == 0 {
+                break;
+            }
+            tokio::time::advance(stall + Duration::from_millis(1)).await;
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(1)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(weak.strong_count(), 0, "the producer didn't give up");
+        let mut body = response.into_body();
+        let (mut bytes, mut failed) = (0, false);
+        while let Some(frame) = body.frame().await {
+            match frame {
+                Ok(frame) => bytes += frame.into_data().map_or(0, |data| data.len()),
+                Err(_) => failed = true,
+            }
+        }
+        busy.abort();
+        assert!(bytes < 32 * CHUNK_BYTES, "the producer finished after all");
+        assert!(
+            failed,
+            "{bytes} of {} bytes, and a clean end",
+            32 * CHUNK_BYTES
+        );
+    }
+
+    /// A producer that finished without writing anything is a clean, empty body (the end of
+    /// the body reads the outcome the first receive already read).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_producer_that_writes_nothing_gives_an_empty_body() {
+        let response = stream_blocking(
+            Pace::stalled_after(Duration::from_secs(30)),
+            CancellationToken::new(),
+            "text/plain",
+            "timeout",
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert_eq!(body.expect("a clean end").len(), 0);
+    }
+
+    /// Sol r1 F2: the first chunk's start is decided once. In both orders exactly one side
+    /// wins: a producer that claimed the start is never declared late, and a stream declared
+    /// late never starts.
+    #[test]
+    fn the_first_chunk_and_the_first_deadline_decide_once() {
+        let start = Start::default();
+        assert!(start.begin(), "the producer first: started");
+        assert!(!start.late(), "then the deadline finds it started");
+        assert!(start.begin(), "and later chunks go on");
+
+        let start = Start::default();
+        assert!(start.late(), "the deadline first: late");
+        assert!(!start.begin(), "then the producer may not start");
+        assert!(!start.started());
     }
 }
