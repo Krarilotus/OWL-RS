@@ -33,7 +33,19 @@ pub struct AppState {
     jobs: Arc<nrese_store::jobs::Jobs>,
     /// This server's part in replication ([`crate::replication`]).
     replication: Arc<crate::replication::ReplicationState>,
+    /// Why the default repository can't serve until a restart, if it can't
+    /// ([`nrese_store::StoreService::unavailable`]): read on every request
+    /// ([`crate::app`]'s `default_repository_available`), one atomic load.
+    default_unavailable: Arc<std::sync::OnceLock<String>>,
 }
+
+/// What a repository that didn't open at start ([`Catalog::unavailable`]) answers to all
+/// but operators, who see why in the repository list: not the server's paths.
+pub(crate) const UNAVAILABLE: &str = "is unavailable: it didn't open at start, or a change to it failed and its state couldn't be confirmed; operators see why and how to repair it in the repository list";
+
+/// What a repository a failed change left in no known state answers to all but operators
+/// (who see the file and the repair in the repository list): a restart repairs it.
+pub(crate) const UNAVAILABLE_UNTIL_RESTART: &str = "is unavailable until the server restarts: a change to it failed and its state couldn't be confirmed; operators see why and how to repair it in the repository list";
 
 impl AppState {
     /// [`Self::try_new`]; panics if the access state can't be opened (for tests).
@@ -60,8 +72,15 @@ impl AppState {
         let access = Arc::new(open_access(store.config(), store.runtime(), &policy)?);
         let repositories =
             Arc::new(Catalog::open(store, reasoner).map_err(|error| anyhow::anyhow!(error))?);
+        let default_unavailable = repositories
+            .default_repository()
+            .pipeline
+            .read()
+            .store()
+            .unavailable_flag();
         let state = Self {
             pipeline: Arc::clone(&repositories.default_repository().pipeline),
+            default_unavailable,
             ready: Arc::new(AtomicBool::new(false)),
             policy: Arc::new(policy),
             ai: Arc::new(ai),
@@ -191,16 +210,45 @@ impl AppState {
         &self.repositories
     }
 
+    /// Why the default repository can't serve until a restart, if it can't.
+    pub fn default_unavailable(&self) -> Option<&str> {
+        self.default_unavailable.get().map(String::as_str)
+    }
+
+    /// The repositories that can't serve: `id: unavailable` each, the default first (for
+    /// `/readyz`, which stays ready for the others).
+    pub fn degraded(&self) -> Vec<String> {
+        self.default_unavailable()
+            .map(|_| DEFAULT_REPOSITORY.to_owned())
+            .into_iter()
+            .chain(
+                self.repositories
+                    .unavailable_list()
+                    .into_iter()
+                    .map(|(id, _)| id),
+            )
+            .map(|id| format!("{id}: unavailable"))
+            .collect()
+    }
+
     /// This server's state as repository `id` sees it: the default repository's own, or a
     /// copy with that repository's store and RDF4J state. Called on the default's state.
     pub fn for_repository(&self, id: &str) -> Result<Self, ApiError> {
+        // The id as the route decoded it (`%6Erese` is the default repository too).
         if id == DEFAULT_REPOSITORY {
+            if self.default_unavailable().is_some() {
+                return Err(ApiError::unavailable(format!(
+                    "repository '{id}' {UNAVAILABLE_UNTIL_RESTART}"
+                )));
+            }
             return Ok(self.clone());
         }
-        let repository = self
-            .repositories
-            .get(id)
-            .ok_or_else(|| ApiError::not_found(format!("no repository '{id}'")))?;
+        let Some(repository) = self.repositories.get(id) else {
+            return Err(match self.repositories.unavailable(id) {
+                Some(_) => ApiError::unavailable(format!("repository '{id}' {UNAVAILABLE}")),
+                None => ApiError::not_found(format!("no repository '{id}'")),
+            });
+        };
         // A repository with its own query budget answers with it; the rest of the policy
         // is the server's.
         let policy = match repository.settings.read().query_timeout() {

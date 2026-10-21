@@ -345,6 +345,10 @@ fn authorised(
     }
 }
 
+/// What a replica's download of the primary's image is called while it comes, in a
+/// directory of its own.
+const STAGED_IMAGE: &str = "image.download";
+
 /// A replica's start: if `data_dir` holds no store, the primary's image placed there.
 /// Returns the image's revision, or `None` if a store was already there (the replica
 /// follows the log from its own revision).
@@ -382,23 +386,25 @@ pub async fn bootstrap(config: &ReplicationConfig, data_dir: &Path) -> anyhow::R
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| anyhow::anyhow!("the image came without its manifest"))?,
     )?;
+    // The name comes from the primary: checked before anything, and the download staged
+    // under a name of this side's.
+    manifest
+        .image_name()
+        .map_err(|error| anyhow::anyhow!("{primary}: {error}"))?;
     std::fs::create_dir_all(data_dir)?;
     let incoming = tempfile::tempdir_in(data_dir)?;
+    let staged = incoming.path().join(STAGED_IMAGE);
     {
         use std::io::Write;
-        let mut file = std::fs::File::create(incoming.path().join(&manifest.file))?;
+        let mut file = std::fs::File::create(&staged)?;
         let mut response = response;
         while let Some(chunk) = response.chunk().await? {
             file.write_all(&chunk)?;
         }
         file.sync_all()?;
     }
-    std::fs::write(
-        incoming.path().join(nrese_store::image_backup::MANIFEST),
-        serde_json::to_vec_pretty(&manifest)?,
-    )?;
     // Checks the image against its manifest and places it.
-    let placed = nrese_store::restore_image(incoming.path(), data_dir)
+    let placed = nrese_store::image_backup::place_image(&staged, manifest, data_dir)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     Ok(Some(placed.revision))
 }

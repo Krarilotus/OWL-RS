@@ -56,6 +56,10 @@ pub struct StoreService {
     supports: std::sync::Arc<crate::support::Supports>,
     /// The `owl2-dl` mode's state ([`crate::dl`]).
     dl: std::sync::Arc<crate::dl::Dl>,
+    /// Why the store can't serve any more until the server restarts, if it can't
+    /// ([`Self::unavailable`]): its state is neither the one before a failed change nor the
+    /// one after it. Set once.
+    unavailable: std::sync::Arc<std::sync::OnceLock<String>>,
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
@@ -157,9 +161,11 @@ impl StoreService {
             }),
             ql: std::sync::Arc::default(),
         };
+        let unavailable = std::sync::Arc::<std::sync::OnceLock<String>>::default();
         let namespaces = crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
-        );
+            std::sync::Arc::clone(&unavailable),
+        )?;
         let quarantine = crate::quarantine::Quarantine::open(
             (config.mode == StoreMode::OnDisk).then_some(config.data_dir.as_path()),
         )?;
@@ -175,6 +181,7 @@ impl StoreService {
             engine,
             preloaded_ontology,
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            unavailable,
             materialised: std::sync::Arc::default(),
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             last_materialisation: std::sync::Arc::default(),
@@ -257,6 +264,25 @@ impl StoreService {
     /// The store's namespace prefixes ([`crate::namespaces`]).
     pub fn namespaces(&self) -> &crate::namespaces::Namespaces {
         &self.namespaces
+    }
+
+    /// Why the store can't serve until the server restarts, if it can't: a change failed
+    /// and its state couldn't be brought back to a known one (the reason says which file
+    /// and how to repair it). Its server answers every request to it with 503.
+    pub fn unavailable(&self) -> Option<&str> {
+        self.unavailable.get().map(String::as_str)
+    }
+
+    /// The store's [`Self::unavailable`], shared: a server reads it on every request
+    /// without taking the store.
+    pub fn unavailable_flag(&self) -> std::sync::Arc<std::sync::OnceLock<String>> {
+        std::sync::Arc::clone(&self.unavailable)
+    }
+
+    /// Makes the store unavailable until a restart, for `why` (the first reason stays).
+    pub(crate) fn make_unavailable(&self, why: String) {
+        tracing::error!(%why, "store unavailable until the server restarts");
+        let _ = self.unavailable.set(why);
     }
 
     /// The statements bulk loads couldn't read ([`crate::quarantine`]).
@@ -1574,12 +1600,14 @@ impl StoreService {
         let summary = rematerialisation.finish(closure.inferred)?;
         nrese_exec::heap::phase("store: done");
         nrese_engine::memory::release_all();
+        // From here the new inferences are published: a failure says so.
         self.record_reasoning(crate::ReasoningState::of_with(
             rules,
             self.config.hide_unnamed_classes,
             self.config.equality_compact,
             closure.violations.len(),
-        ))?;
+        ))
+        .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
         if !closure.violations.is_empty() {
             tracing::error!(
                 ruleset = %rules.name(),
