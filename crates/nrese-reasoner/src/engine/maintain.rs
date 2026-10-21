@@ -166,12 +166,17 @@ pub fn maintain(
         None
     };
     // A first load (no asserted fact before, nothing deleted): its closure is the whole
-    // closure, so it is materialised once, by the batch executor, and every violation in it
-    // is the change's own. The delta executor built one job per ground rule and copied
-    // each job's matches before the round ran: a 250-class subclass chain with 400
-    // individuals held 757 MiB in a round that derived nothing, where a materialisation
-    // holds about 140 (DMW's A/B, fleet pm-dmwab-3, 21 Oct 2026).
+    // closure, so it is materialised once, by the batch executor, and its violations are
+    // checked as the delta executor checks them, through the new facts only
+    // ([`delta::introduced_violations`]): an axiom's violation from before stays tolerated.
+    // The delta executor built one job per ground rule and copied each job's matches
+    // before the round ran: a 250-class subclass chain with 400 individuals held 757 MiB in
+    // a round that derived nothing, where a materialisation holds about 140 (DMW's A/B,
+    // fleet pm-dmwab-3, 21 Oct 2026). Not over a compact stack: its closure lists
+    // equalities over representatives, which the datatype checks don't read as the delta's
+    // expanded ones (Sol r1 F1).
     let first_load = !revived
+        && !program.stores_representatives()
         && program
             .plan
             .is_none_or(|plan| plan == delta::policy::Plan::Rebuild)
@@ -185,16 +190,7 @@ pub fn maintain(
             stop,
         )?);
     }
-    let update = if let Some(closure) = rebuilt.as_mut().filter(|_| first_load) {
-        delta::Update {
-            violations: std::mem::take(&mut closure.violations),
-            policy: delta::policy::Counts {
-                plan: delta::policy::Plan::Rebuild,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    } else {
+    let update = {
         let base = EngineBase::new(tx, &program.axioms);
         // Facts new to the state: in no graph and not inferred before the transaction.
         let mut inserted: Vec<Triple> = tx
@@ -211,7 +207,7 @@ pub fn maintain(
                 .collect();
             inserted.extend(missing_axioms.iter().copied());
         }
-        if let Some(closure) = &rebuilt {
+        if let Some(closure) = rebuilt.as_ref().filter(|_| !first_load) {
             inserted.extend(
                 closure
                     .inferred
@@ -242,6 +238,27 @@ pub fn maintain(
         };
         if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
+        } else if let Some(closure) = rebuilt.as_ref().filter(|_| first_load) {
+            // The new inferred facts, as the delta executor reports them (its `insert`).
+            let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
+            let derived: Vec<Triple> = closure
+                .inferred
+                .iter()
+                .map(|t| triple(t.in_default_graph()))
+                .filter(|&f| {
+                    !base.is_asserted(f) && !(base.contains(f) && !inserted_set.contains(&f))
+                })
+                .chain(closure.unstorable.iter().copied())
+                .collect();
+            delta::Update {
+                violations: delta::introduced_violations(&base, &inserted, &derived, rules, ground),
+                insert: derived,
+                policy: delta::policy::Counts {
+                    plan: delta::policy::Plan::Rebuild,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
         } else {
             delta::update_with(&base, &inserted, &deleted, rules, ground, stop, policy)?
         }
