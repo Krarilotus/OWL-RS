@@ -45,7 +45,17 @@ impl Context<'_> {
         let mut encoder = Encoder::default();
         encoder.bytes.extend_from_slice(&fixed);
         encoder.tag(self.model as u8);
-        for graphs in [&self.merge_set, &self.named] {
+        // Every graph, the listed ones, or every graph but the listed ones: each told apart
+        // (a list's length is never u64::MAX - 1).
+        let (merged, left_out) = match &self.merge_set {
+            None => (None, false),
+            Some(crate::dataset::GraphSet::Only(graphs)) => (Some(graphs), false),
+            Some(crate::dataset::GraphSet::AllBut(graphs)) => (Some(graphs), true),
+        };
+        if left_out {
+            encoder.number(u64::MAX - 1);
+        }
+        for graphs in [merged, self.named.as_ref()] {
             match graphs {
                 Some(graphs) => {
                     encoder.number(graphs.len() as u64);
