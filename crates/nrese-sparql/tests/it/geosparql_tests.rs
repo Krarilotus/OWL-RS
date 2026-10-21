@@ -517,6 +517,15 @@ fn relations_as_triple_patterns() {
             );
         }
     }
+    // Empty geometries: equal to each other, without a bounding box.
+    for (name, text) in [
+        ("empty", "GEOMETRYCOLLECTION EMPTY"),
+        ("nowhere", "POINT EMPTY"),
+    ] {
+        let literal = Literal::new_typed_literal(text, wkt.clone());
+        let quad = Quad::new(ex(name), geo("asWKT"), literal, GraphName::DefaultGraph);
+        tx.insert(quad.as_ref());
+    }
     tx.commit().unwrap();
     let pairs = |query: &str| -> Vec<String> {
         let mut rows: Vec<String> = select(&engine, query)
@@ -534,6 +543,8 @@ fn relations_as_triple_patterns() {
     let mut nonempty = 0;
     for relation in [
         "sfEquals",
+        "ehEquals",
+        "rcc8eq",
         "sfDisjoint",
         "sfIntersects",
         "sfTouches",
@@ -570,6 +581,14 @@ fn relations_as_triple_patterns() {
             "SELECT ?b WHERE {{ ex:g3 geo:asWKT ?x . ?b geo:asWKT ?y FILTER(geof:{relation}(?x, ?y)) }}"
         ));
         assert_eq!(geometry, filtered, "{relation} from a constant");
+        // And from an empty shape, which has no box: the empty ones.
+        let empty = pairs(&format!(
+            "SELECT ?b WHERE {{ ex:empty geo:{relation} ?b . ?b geo:asWKT ?y }}"
+        ));
+        let filtered = pairs(&format!(
+            "SELECT ?b WHERE {{ ex:empty geo:asWKT ?x . ?b geo:asWKT ?y FILTER(geof:{relation}(?x, ?y)) }}"
+        ));
+        assert_eq!(empty, filtered, "{relation} from an empty shape");
     }
     assert!(nonempty >= 10, "{nonempty}");
     // Both sides free; a constant side starting the joins; one pattern with LIMIT.
@@ -642,6 +661,8 @@ fn filter_functions_use_the_index() {
     let query = SparqlParser::new().parse_query(&text).unwrap();
     let plan = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
     assert_eq!(plan.rows, 9);
+    // The seed decides the conjunct on the indexed shapes: no literal is decoded again.
+    assert_eq!(plan.decoded, 0, "{:#?}", plan.steps);
     let largest = plan.steps.iter().map(|s| s.rows).max().unwrap();
     assert!(largest < 50, "{:#?}", plan.steps);
 }

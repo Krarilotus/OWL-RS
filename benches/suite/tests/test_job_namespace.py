@@ -480,7 +480,6 @@ ns_locked_python "$1/a.lock" long
         """Sol, 20 Oct 2026: the lock directory's pid was the parent's, and Python never took over
         a dead holder's: a crash blocked every later preparation. An OS lock goes with its holder."""
         import signal
-        import time
         suite = (ROOT / "benches" / "suite").as_posix()
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "datasets.lock"
@@ -499,14 +498,17 @@ ns_locked_python "$1/a.lock" long
                 else:
                     os.killpg(holder.pid, signal.SIGKILL)
                 holder.wait(timeout=30)
-                started, got = time.monotonic(), threading.Event()
+                got = threading.Event()
 
                 def take():
                     with ns.lock(path):
                         got.set()
-                threading.Thread(target=take, daemon=True).start()
+                taker = threading.Thread(target=take, daemon=True)
+                taker.start()
+                # A bound for a lock that never comes free, not a speed: the holder is gone.
                 self.assertTrue(got.wait(timeout=10), f"{kind}: the lock stayed held after its holder died")
-                self.assertLess(time.monotonic() - started, 2.0, kind)
+                # Its handle closed before the directory goes (Windows refuses to remove an open file).
+                taker.join(timeout=10)
 
 
 @unittest.skipUnless(BASH, "needs bash")

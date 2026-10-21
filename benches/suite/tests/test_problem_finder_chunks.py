@@ -8,14 +8,15 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import itertools
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
-import time
+import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -43,12 +44,43 @@ class CappedChunk(unittest.TestCase):
     def test_the_commands_exit_status_and_the_budget_ending_a_chunk(self):
         done = self.run_chunk(1, "raise SystemExit(3)")
         self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
-        started = time.monotonic()
-        stopped = self.run_chunk(0.05, "import time; time.sleep(30)")
+        # The budget ends on a clock the test moves (20 s a reading, 60 s of budget), and each
+        # timed wait for the real child reports its poll interval over at once; the child,
+        # asleep for 30 s, is stopped and reaped for real.
+        children = []
+
+        class Child(subprocess.Popen):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                children.append(self)
+
+            def wait(self, timeout=None):
+                if timeout is not None:
+                    raise subprocess.TimeoutExpired(self.args, timeout)
+                return super().wait()
+
+        clock = itertools.count(0, 20)
+        argv = ["capped-chunk.py", "--memory-mib", "512", "--budget-min", "1", "--",
+                sys.executable, "-c", "import time; time.sleep(30)"]
+        output, ended = io.StringIO(), []
+        with ExitStack() as patched:
+            patched.enter_context(patch.object(sys, "argv", argv))
+            patched.enter_context(patch.object(chunk, "subprocess",
+                                               SimpleNamespace(**{**vars(subprocess), "Popen": Child})))
+            patched.enter_context(patch.object(chunk, "time", SimpleNamespace(monotonic=lambda: next(clock))))
+            patched.enter_context(redirect_stdout(output))
+            runner = threading.Thread(target=lambda: ended.append(chunk.main()), daemon=True)
+            runner.start()
+            runner.join(60)  # contains a stop that never happens
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+        self.assertFalse(runner.is_alive(), "the budget didn't stop the chunk")
         # Defect 4 (audit, 18 Oct 2026): a budget kill exited 0, which a sweep recorded as ok.
-        self.assertEqual(stopped.returncode, chunk.BUDGET_ENDED, stopped.stdout + stopped.stderr)
-        self.assertIn("the next chunk resumes", stopped.stdout)
-        self.assertLess(time.monotonic() - started, 25)
+        self.assertEqual(ended, [chunk.BUDGET_ENDED], output.getvalue())
+        self.assertIn("the next chunk resumes", output.getvalue())
+        [child] = children
+        self.assertNotIn(child.returncode, (None, 0), "the child was stopped and reaped")
 
     def test_a_resumable_chunk_may_end_at_its_budget_with_zero_when_it_says_so(self):
         done = subprocess.run([sys.executable, str(ROOT / "scripts/capped-chunk.py"), "--memory-mib", "512",

@@ -55,7 +55,7 @@ pub use snapshot::{
 };
 pub use transaction::{CommitSummary, Transaction};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub compaction: CompactionPolicy,
     /// Run large compactions and automatic checkpoints on a background thread. When
@@ -73,6 +73,10 @@ pub struct EngineConfig {
     /// How the checkpoints this engine writes store the dictionary's keys; checkpoints of
     /// either are read.
     pub vocabulary: VocabularyEncoding,
+    /// The process's memory root, which the scratch of every checkpoint the engine writes
+    /// (its own, images, bulk loads') is charged within before it is allocated: one more
+    /// can't spend what queries or another store's checkpoint hold. `None`: no limit.
+    pub admission: Option<Arc<nrese_exec::SharedBudget>>,
 }
 
 impl Default for EngineConfig {
@@ -84,6 +88,7 @@ impl Default for EngineConfig {
             text_corpus_bytes: 256 << 20,
             index_encoding: IndexEncoding::default(),
             vocabulary: VocabularyEncoding::default(),
+            admission: None,
         }
     }
 }
@@ -402,6 +407,8 @@ struct Shared {
     index_encoding: IndexEncoding,
     /// [`EngineConfig::vocabulary`].
     vocabulary: VocabularyEncoding,
+    /// The checkpoints' scratch is charged within it ([`EngineConfig::admission`]).
+    admission: Option<Arc<nrese_exec::SharedBudget>>,
 }
 
 impl Shared {
@@ -437,7 +444,12 @@ impl Shared {
                 wal.rotate(snapshot.revision() + 1)?;
                 snapshot
             };
-            let path = checkpoint::write(durable.root(), &snapshot, self.vocabulary)?;
+            let path = checkpoint::write(
+                durable.root(),
+                &snapshot,
+                self.vocabulary,
+                self.admission.as_ref(),
+            )?;
             self.checkpoints.fetch_add(1, Ordering::Relaxed);
             durable.wal.lock().release_through(snapshot.revision())?;
             (snapshot, path)
@@ -602,12 +614,8 @@ impl std::fmt::Debug for Engine {
 impl Engine {
     /// An in-memory engine.
     pub fn new(config: EngineConfig) -> EngineResult<Self> {
-        Self::build(
-            config,
-            Arc::default(),
-            None,
-            Version::empty(config.index_encoding),
-        )
+        let empty = Version::empty(config.index_encoding);
+        Self::build(config, Arc::default(), None, empty)
     }
 
     /// Opens (or creates) a durable engine in `dir`, recovering its last committed revision.
@@ -665,6 +673,7 @@ impl Engine {
             views: RwLock::new(Arc::new(nrese_exec::Budget::unlimited())),
             index_encoding: config.index_encoding,
             vocabulary: config.vocabulary,
+            admission: config.admission,
         });
         let worker = config
             .background_maintenance
@@ -788,9 +797,14 @@ impl Engine {
     /// and both stacks) like the store's own, named by its revision, while writers go on. A
     /// data directory holding it opens at that revision.
     pub fn write_image(&self, dir: &std::path::Path) -> EngineResult<ImageInfo> {
-        let snapshot = self.inner.shared.snapshot();
-        let vocabulary = self.inner.shared.vocabulary;
-        let path = crate::durability::checkpoint::write(dir, &snapshot, vocabulary)?;
+        let shared = &self.inner.shared;
+        let snapshot = shared.snapshot();
+        let path = crate::durability::checkpoint::write(
+            dir,
+            &snapshot,
+            shared.vocabulary,
+            shared.admission.as_ref(),
+        )?;
         let version = snapshot.version();
         Ok(ImageInfo {
             path,

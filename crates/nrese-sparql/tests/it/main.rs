@@ -8,6 +8,7 @@ mod depth_tests;
 mod differential_tests;
 mod equality_answer_tests;
 mod federation_tests;
+mod geosparql_scope_tests;
 mod geosparql_tests;
 mod lateral_tests;
 mod native_differential_tests;

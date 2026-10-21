@@ -468,7 +468,12 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                 None,
                 Arc::clone(&shared.views.read()),
             );
-            let path = checkpoint::write(durable.root(), &image, shared.vocabulary)?;
+            let path = checkpoint::write(
+                durable.root(),
+                &image,
+                shared.vocabulary,
+                shared.admission.as_ref(),
+            )?;
             shared
                 .checkpoints
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -560,6 +565,7 @@ fn publish_streamed(
     let mut len = 0;
     let path = checkpoint::write_parts(
         durable.root(),
+        shared.admission.as_ref(),
         revision,
         &shared.dictionary,
         dictionary_len,

@@ -26,6 +26,7 @@ use geo::{
     Relate,
 };
 use geo::{Geometry, MultiPolygon, Point};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec};
 use nrese_rdf::{Literal, NamedNode, Term};
 use wkt::{ToWkt, TryFromWkt};
 
@@ -82,13 +83,39 @@ pub(super) fn parse(term: &Term) -> Option<Shape> {
     let Term::Literal(literal) = term else {
         return None;
     };
-    let text = literal.value().trim();
-    let format = match literal.datatype().as_str() {
+    parse_literal(literal.value(), literal.datatype().as_str())
+}
+
+/// `g` with its polygons' lists of holes no larger than they hold: a parser may leave a
+/// list's capacity behind (an in-place collect of its rings), which a shape's size
+/// (`spatial::shape_bytes`, from the holes it has) wouldn't count.
+fn tight(g: Geometry<f64>) -> Geometry<f64> {
+    let polygon = |p: geo::Polygon<f64>| {
+        let (exterior, mut holes) = p.into_inner();
+        holes.shrink_to_fit();
+        geo::Polygon::new(exterior, holes)
+    };
+    match g {
+        Geometry::Polygon(p) => Geometry::Polygon(polygon(p)),
+        Geometry::MultiPolygon(m) => {
+            Geometry::MultiPolygon(MultiPolygon(m.0.into_iter().map(polygon).collect()))
+        }
+        Geometry::GeometryCollection(c) => {
+            Geometry::GeometryCollection(c.0.into_iter().map(tight).collect())
+        }
+        g => g,
+    }
+}
+
+/// The shape of a literal of `datatype` with the lexical form `value` ([`parse`]).
+pub(super) fn parse_literal(value: &str, datatype: &str) -> Option<Shape> {
+    let text = value.trim();
+    let format = match datatype {
         GEOJSON_LITERAL => Serialisation::GeoJson,
         GML_LITERAL => Serialisation::Gml,
         _ => Serialisation::Wkt,
     };
-    let (crs, geometry) = match literal.datatype().as_str() {
+    let (crs, geometry) = match datatype {
         WKT_LITERAL => {
             let (crs, text) = match text.strip_prefix('<') {
                 Some(rest) => {
@@ -119,6 +146,7 @@ pub(super) fn parse(term: &Term) -> Option<Shape> {
         }
         _ => return None,
     };
+    let geometry = tight(geometry);
     Some(if crs == EPSG_4326 {
         Shape {
             geometry: geometry.map_coords(|c| geo::coord! { x: c.y, y: c.x }),
@@ -388,6 +416,284 @@ pub(super) fn relation(local: &str, a: &Geometry<f64>, b: &Geometry<f64>) -> Opt
     a.relate(b).matches(pattern).ok()
 }
 
+/// What geo's `relate` allocates per coordinate of the two geometries: the graph's copy of
+/// it in its edge, its segment's entry in the edge-set R-tree, and its share of the nodes,
+/// labels and edge ends at the edges' ends. Measured at most 159 bytes (a point in a ring
+/// of 1,000, polygons with holes, crossing zigzags); this is with room for growth.
+const RELATE_PER_COORDINATE: usize = 256;
+/// What `relate` allocates per intersection it records: an edge intersection in a sorted
+/// set on each of the two edges, its node in the node map with its star, and the edge ends
+/// the edges are split into there with their labelled bundles. Measured at most 717 bytes
+/// (self-crossing lines, crossing rings of one polygon, equal lines and rings).
+const RELATE_PER_INTERSECTION: usize = 1024;
+/// What `relate` allocates whatever the geometries: its maps, intersector and matrix.
+/// Measured at most 8.6 KiB.
+const RELATE_FIXED: usize = 16 << 10;
+/// Below this many bytes, the intersections are bounded by counting segment pairs, not
+/// by testing them.
+const RELATE_COUNTED_FROM: usize = 64 << 10;
+
+/// The most bytes geo's `relate` allocates for `a` and `b`, known before it runs:
+/// [`RELATE_PER_COORDINATE`] for each coordinate, [`RELATE_PER_INTERSECTION`] for each
+/// intersection it records, and [`RELATE_FIXED`]. It records what its graphs' segments
+/// meet in: within one geometry every intersection between different edges, and within an
+/// edge of a geometry that isn't all rings every one but at the point adjacent segments
+/// share; between the two geometries every one but a proper crossing (a point inside both
+/// segments, which it only flags). A collinear overlap records its two ends; each
+/// intersection is recorded on both edges. Mostly there are none worth testing for: the
+/// pairs of segments bound them (a point has no segment, a ring has no pair within one
+/// geometry). Where the pairs would bound them above [`RELATE_COUNTED_FROM`] bytes, the
+/// segments are swept in order of their boxes and each pair whose boxes meet is tested as
+/// geo tests it, with the sweep's array charged to `scratch` first: a geometry that
+/// crosses itself a million times takes about 2.7 GB in geo, and this bound says so
+/// before geo allocates it.
+pub(super) fn relate_bound(
+    (a, size_a): (&Geometry<f64>, &Size),
+    (b, size_b): (&Geometry<f64>, &Size),
+    scratch: &Budget,
+) -> Result<usize, BudgetExceeded> {
+    if let Some(bound) = sized_bound(size_a, size_b) {
+        return Ok(bound);
+    }
+    let intersections = recorded(a, b, size_a, size_b, scratch)?;
+    Ok(bytes(
+        size_a.coordinates + size_b.coordinates,
+        intersections,
+    ))
+}
+
+/// [`relate_bound`] where the geometries' sizes decide it: where their pairs of segments
+/// bound the intersections to [`RELATE_COUNTED_FROM`] bytes. The bound grows with each
+/// part of a size, so a size no smaller in any part ([`Size::largest`]) bounds as much.
+pub(super) fn sized_bound(a: &Size, b: &Size) -> Option<usize> {
+    // A pair of segments records at most two points on each of its two edges; a pair
+    // within one geometry comes in both orders (counted so by `within`).
+    let pairs = a
+        .within
+        .saturating_add(b.within)
+        .saturating_add(a.segments.saturating_mul(b.segments));
+    let intersections = pairs.saturating_mul(4);
+    (intersections.saturating_mul(RELATE_PER_INTERSECTION) <= RELATE_COUNTED_FROM)
+        .then(|| bytes(a.coordinates + b.coordinates, intersections))
+}
+
+fn bytes(coordinates: usize, intersections: usize) -> usize {
+    RELATE_FIXED
+        .saturating_add(coordinates.saturating_mul(RELATE_PER_COORDINATE))
+        .saturating_add(intersections.saturating_mul(RELATE_PER_INTERSECTION))
+}
+
+/// What [`relate_bound`] reads of a geometry: its coordinates, its graph's segments, the
+/// pairs of them geo intersects within the geometry, and whether its edges are all rings
+/// (whose segments geo doesn't intersect within one edge). Known once for a geometry
+/// related to many.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Size {
+    coordinates: usize,
+    segments: usize,
+    within: usize,
+    rings: bool,
+}
+
+impl Size {
+    pub(super) fn of(g: &Geometry<f64>) -> Self {
+        let coordinates = g.coords_count();
+        if let Geometry::Point(_) = g {
+            return Self {
+                coordinates,
+                ..Self::default()
+            };
+        }
+        let (mut segments, mut squares) = (0usize, 0usize);
+        edges(g, &mut |edge| {
+            let n = edge.segments();
+            segments += n;
+            squares = squares.saturating_add(n * n);
+        });
+        let all = segments.saturating_mul(segments);
+        let rings = rings(g);
+        let within = match rings {
+            true => all - squares.min(all),
+            false => all,
+        };
+        Self {
+            coordinates,
+            segments,
+            within,
+            rings,
+        }
+    }
+
+    /// The largest of both in every part, which bounds what either bounds.
+    pub(super) fn largest(self, other: Self) -> Self {
+        Self {
+            coordinates: self.coordinates.max(other.coordinates),
+            segments: self.segments.max(other.segments),
+            within: self.within.max(other.within),
+            rings: self.rings && other.rings,
+        }
+    }
+}
+
+/// An edge of a geometry's graph: a line string's coordinates, or a line's, box's or
+/// triangle's (its segments' count of them, and whether it is a ring).
+#[derive(Clone, Copy)]
+enum Edge<'a> {
+    Coords(&'a [geo::Coord<f64>]),
+    Fixed([geo::Coord<f64>; 5], usize, bool),
+}
+
+impl Edge<'_> {
+    fn segments(&self) -> usize {
+        match self {
+            Edge::Coords(c) => c.len().saturating_sub(1),
+            Edge::Fixed(_, n, _) => *n,
+        }
+    }
+
+    fn segment(&self, i: usize) -> geo::Line<f64> {
+        match self {
+            Edge::Coords(c) => geo::Line::new(c[i], c[i + 1]),
+            Edge::Fixed(c, _, _) => geo::Line::new(c[i], c[i + 1]),
+        }
+    }
+
+    fn closed(&self) -> bool {
+        match self {
+            Edge::Coords(c) => c.len() > 1 && c.first() == c.last(),
+            Edge::Fixed(_, _, ring) => *ring,
+        }
+    }
+}
+
+/// Whether geo treats `g`'s edges as rings, not intersecting them within themselves.
+fn rings(g: &Geometry<f64>) -> bool {
+    match g {
+        Geometry::LineString(l) => l.is_closed(),
+        Geometry::MultiLineString(m) => m.is_closed(),
+        Geometry::Polygon(_) | Geometry::MultiPolygon(_) => true,
+        _ => false,
+    }
+}
+
+/// `f` for each edge of `g`'s graph.
+fn edges<'a>(g: &'a Geometry<f64>, f: &mut impl FnMut(Edge<'a>)) {
+    let polygon = |p: &'a geo::Polygon<f64>, f: &mut dyn FnMut(Edge<'a>)| {
+        f(Edge::Coords(&p.exterior().0));
+        for ring in p.interiors() {
+            f(Edge::Coords(&ring.0));
+        }
+    };
+    match g {
+        Geometry::Point(_) | Geometry::MultiPoint(_) => {}
+        Geometry::Line(l) => {
+            f(Edge::Fixed([l.start, l.end, l.end, l.end, l.end], 1, false));
+        }
+        Geometry::LineString(l) => f(Edge::Coords(&l.0)),
+        Geometry::MultiLineString(m) => m.0.iter().for_each(|l| f(Edge::Coords(&l.0))),
+        Geometry::Polygon(p) => polygon(p, f),
+        Geometry::MultiPolygon(m) => m.0.iter().for_each(|p| polygon(p, f)),
+        Geometry::Rect(r) => {
+            let (lo, hi) = (r.min(), r.max());
+            let corner = |x, y| geo::Coord { x, y };
+            let ring = [lo, corner(hi.x, lo.y), hi, corner(lo.x, hi.y), lo];
+            f(Edge::Fixed(ring, 4, true));
+        }
+        Geometry::Triangle(t) => f(Edge::Fixed(
+            [t.v1(), t.v2(), t.v3(), t.v1(), t.v1()],
+            3,
+            true,
+        )),
+        Geometry::GeometryCollection(c) => c.0.iter().for_each(|g| edges(g, f)),
+    }
+}
+
+/// A segment in the sweep: its box, which geometry and edge it is of, and its place.
+#[derive(Clone, Copy)]
+struct Swept {
+    bbox: [f64; 4],
+    line: geo::Line<f64>,
+    of_b: bool,
+    edge: u32,
+    index: u32,
+    /// The edge's last segment if the edge is closed (its first and last are adjacent).
+    last: Option<u32>,
+}
+
+/// The intersections geo's `relate` records for `a` and `b` (on both edges, a pair within
+/// one geometry in both orders): their segments swept by the least `x` of their boxes,
+/// each pair whose boxes meet tested as geo tests it.
+fn recorded(
+    a: &Geometry<f64>,
+    b: &Geometry<f64>,
+    sa: &Size,
+    sb: &Size,
+    scratch: &Budget,
+) -> Result<usize, BudgetExceeded> {
+    use geo::line_intersection::{LineIntersection, line_intersection};
+    let mut swept: ChargedVec<Swept, &Budget> =
+        ChargedVec::with_capacity(scratch, sa.segments + sb.segments)?;
+    let mut edge = 0;
+    for (g, of_b) in [(a, false), (b, true)] {
+        edges(g, &mut |e| {
+            let n = e.segments();
+            let last = e.closed().then(|| n.saturating_sub(1) as u32);
+            for i in 0..n {
+                let line = e.segment(i);
+                let (p, q) = (line.start, line.end);
+                let bbox = [p.x.min(q.x), p.y.min(q.y), p.x.max(q.x), p.y.max(q.y)];
+                let segment = Swept {
+                    bbox,
+                    line,
+                    of_b,
+                    edge,
+                    index: i as u32,
+                    last,
+                };
+                // Room for every segment was charged: this doesn't grow.
+                swept.push(segment).expect("reserved");
+            }
+            edge += 1;
+        });
+    }
+    swept.sort_unstable_by(|x, y| x.bbox[0].total_cmp(&y.bbox[0]));
+    let mut recorded = 0usize;
+    for (i, x) in swept.iter().enumerate() {
+        for y in swept[i + 1..].iter().take_while(|y| y.bbox[0] <= x.bbox[2]) {
+            if y.bbox[1] > x.bbox[3] || x.bbox[1] > y.bbox[3] {
+                continue;
+            }
+            let same = x.edge == y.edge;
+            if x.of_b == y.of_b && same && [sa, sb][usize::from(x.of_b)].rings {
+                continue;
+            }
+            let Some(meeting) = line_intersection(x.line, y.line) else {
+                continue;
+            };
+            let points = match meeting {
+                LineIntersection::SinglePoint { is_proper, .. } => {
+                    if x.of_b != y.of_b && is_proper {
+                        continue;
+                    }
+                    // Adjacent segments of one edge share a point, which isn't recorded.
+                    let ends = |p: u32, q: u32| {
+                        p.abs_diff(q) == 1
+                            || x.last.is_some_and(|l| (p, q) == (0, l) || (q, p) == (0, l))
+                    };
+                    if same && x.of_b == y.of_b && ends(x.index, y.index) {
+                        continue;
+                    }
+                    1
+                }
+                LineIntersection::Collinear { .. } => 2,
+            };
+            let orders = if x.of_b == y.of_b { 2 } else { 1 };
+            recorded = recorded.saturating_add(2 * orders * points);
+        }
+    }
+    Ok(recorded)
+}
+
 /// `geof:name(args)`; `None` is an error (a wrong argument, systems that differ).
 pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
     let local = name.strip_prefix(GEOF)?;
@@ -538,5 +844,133 @@ pub(crate) fn call(name: &str, args: &[Term]) -> Option<Term> {
             })
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use geo::{Coord, LineString, MultiPolygon, Polygon};
+    use nrese_exec::measure::{alone, measure};
+
+    use super::*;
+
+    fn line(points: impl Iterator<Item = (f64, f64)>) -> LineString<f64> {
+        LineString(points.map(|(x, y)| Coord { x, y }).collect())
+    }
+
+    fn ring(n: usize, cx: f64, r: f64) -> LineString<f64> {
+        let mut l = line((0..n).map(|i| {
+            let t = i as f64 / n as f64 * std::f64::consts::TAU;
+            (cx + r * t.cos(), r * t.sin())
+        }));
+        l.0.push(l.0[0]);
+        l
+    }
+
+    fn zigzag(n: usize, up: bool) -> LineString<f64> {
+        line((0..n).map(|i| match up {
+            true => (i as f64, (i % 2) as f64 * n as f64),
+            false => ((i % 2) as f64 * n as f64, i as f64 + 0.5),
+        }))
+    }
+
+    /// geo's `relate` allocates no more than its bound, over the cases that drive each of
+    /// its terms: equal and overlapping lines and rings (intersections at every vertex),
+    /// crossing zigzags (crossings it doesn't record), a line crossing itself and the
+    /// crossing rings of one polygon (crossings it records, a million at 1,000 vertices),
+    /// holes, points and boxes.
+    #[test]
+    fn relate_allocates_no_more_than_its_bound() {
+        if !alone() {
+            return;
+        }
+        let poly = |l: LineString<f64>| Geometry::Polygon(Polygon::new(l, vec![]));
+        let mut failures = Vec::new();
+        for n in [4usize, 10, 100, 1_000] {
+            let mut crossing = zigzag(n, true);
+            crossing.0.extend(zigzag(n, false).0);
+            let closed = |mut l: LineString<f64>| {
+                l.0.push(l.0[0]);
+                Polygon::new(l, vec![])
+            };
+            let rings = MultiPolygon(vec![closed(zigzag(n, true)), closed(zigzag(n, false))]);
+            let mut cases: Vec<(&str, Geometry<f64>, Geometry<f64>)> = vec![
+                (
+                    "equal lines",
+                    line((0..n).map(|i| (i as f64, 0.0))).into(),
+                    line((0..n).map(|i| (i as f64, 0.0))).into(),
+                ),
+                (
+                    "back and forth",
+                    line((0..n).map(|i| ((i % 2) as f64, 0.0))).into(),
+                    line((0..n).map(|i| ((i % 2) as f64, 1.0 - (i % 2) as f64))).into(),
+                ),
+                (
+                    "crossing zigzags",
+                    zigzag(n, true).into(),
+                    zigzag(n, false).into(),
+                ),
+                (
+                    "offset rings",
+                    poly(ring(n, 0.0, 10.0)),
+                    poly(ring(n, 5.0, 10.0)),
+                ),
+                (
+                    "equal rings",
+                    poly(ring(n, 0.0, 10.0)),
+                    poly(ring(n, 0.0, 10.0)),
+                ),
+                (
+                    "holes",
+                    Polygon::new(
+                        ring(n, 0.0, 10.0),
+                        (0..4).map(|k| ring(n, k as f64 - 1.5, 0.4)).collect(),
+                    )
+                    .into(),
+                    poly(ring(n, 0.5, 10.0)),
+                ),
+                (
+                    "point in ring",
+                    Point::new(1.0, 1.0).into(),
+                    poly(ring(n, 0.0, 10.0)),
+                ),
+                (
+                    "points in ring",
+                    Geometry::MultiPoint(
+                        (0..n)
+                            .map(|i| Point::new(i as f64 / n as f64, 0.5))
+                            .collect(),
+                    ),
+                    poly(ring(n, 0.0, 10.0)),
+                ),
+                (
+                    "box over ring",
+                    geo::Rect::new((-5.0, -5.0), (5.0, 5.0)).into(),
+                    poly(ring(n, 0.0, 5.0)),
+                ),
+            ];
+            if n <= 100 {
+                cases.push((
+                    "a line crossing itself",
+                    crossing.into(),
+                    poly(ring(8, 0.0, 3.0)),
+                ));
+                cases.push(("crossing rings", rings.into(), poly(ring(8, 0.0, 3.0))));
+            }
+            for (case, a, b) in cases {
+                let bound = relate_bound(
+                    (&a, &Size::of(&a)),
+                    (&b, &Size::of(&b)),
+                    &Budget::unlimited(),
+                )
+                .unwrap();
+                let (_, held) = measure(|| a.relate(&b).is_intersects());
+                eprintln!("{case} at {n}: held {held} of {bound}");
+                if held > bound {
+                    failures.push(format!("{case} at {n}: {held} > {bound}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }

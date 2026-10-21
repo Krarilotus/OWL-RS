@@ -366,7 +366,7 @@ The owlrl oracle doesn't finish within an hour. The equivalence and transitive m
 | **R8 Beyond GraphDB** (stretch, each an independent decision) | EL classification module (consequence-based, ELK-style: Kazakov, Krötzsch, Simančík, JAR 2014) for large terminologies like SNOMED; OWL 2 QL query rewriting (PerfectRef/Ontop style) as a zero-materialisation mode | L each | Per item |
 | **R9 Graph-scoped reasoning** | `placement = source-graph`: per-graph rule evaluation, shared schema graphs, quad layout for the inferred stack, maintenance per graph | M | Per-graph results equal evaluating each graph separately; the memory cost is recorded |
 
-**Order:** R0 (as E6, now) → R1 → R2 → R3 → R4 → R5 → R6, with R7 anywhere in M3. R9 follows R6, unless a ResearchSpace or DMW need moves it earlier.
+**Order:** R0 (as E6, now) → R1 → R2 → R3 → R4 → R5 → R6, with R7 anywhere in M3. R9 follows R6, unless a ResearchSpace or DMW need moves it earlier. R9 is now scheduled for v2.0 as [Named graphs as a reasoning boundary](../STATUS.md#engine-gaps).
 - R1 and the reference evaluator come before any optimised code, because they are the oracle (roadmap rule 2).
 - R4 comes before R5 so the product gets queryable inferences early. Until R5, deletes under reasoning use DRed through the batch executor: correct, but not yet fast.
 

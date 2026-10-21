@@ -362,11 +362,11 @@ fn new_terms_take_ids_in_input_order_whatever_the_threads() {
     };
     for threads in [1, 2, 8] {
         let dir = tempfile::tempdir().unwrap();
-        let engine = Engine::open(dir.path(), spilling).unwrap();
+        let engine = Engine::open(dir.path(), spilling.clone()).unwrap();
         assert_eq!(parallel(&engine, threads), in_order);
         assert_eq!(contents(&engine.snapshot(), ReadModel::Asserted), expected);
         drop(engine);
-        let engine = Engine::open(dir.path(), spilling).unwrap();
+        let engine = Engine::open(dir.path(), spilling.clone()).unwrap();
         assert_eq!(ids_of(&engine, &data), in_order);
         assert_eq!(contents(&engine.snapshot(), ReadModel::Asserted), expected);
     }

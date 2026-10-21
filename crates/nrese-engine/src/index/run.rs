@@ -76,10 +76,10 @@ impl PermutationRun {
 
     /// [`Self::from_sorted`], each array reserved on `charge` before it is made, the keys
     /// packed on one thread unless `parallel`.
-    fn from_sorted_within(
+    fn from_sorted_within<C: super::Charge>(
         entries: Vec<(Key, bool)>,
         encoding: IndexEncoding,
-        charge: &mut impl super::Charge,
+        charge: &mut C,
         parallel: bool,
     ) -> Result<Self, nrese_exec::BudgetExceeded> {
         let has_tombstones = entries.iter().any(|(_, tomb)| *tomb);
@@ -92,16 +92,33 @@ impl PermutationRun {
         let mut tombstones = vec![0u64; words];
         let keys_bytes = entries.len() * std::mem::size_of::<Key>();
         charge.reserve(keys_bytes)?;
-        let keys: Vec<Key> = entries
-            .into_iter()
-            .enumerate()
-            .map(|(i, (key, tomb))| {
-                if tomb {
-                    tombstones[i / 64] |= 1 << (i % 64);
+        let mut mark = |i: usize, tomb: bool| {
+            if tomb {
+                tombstones[i / 64] |= 1 << (i % 64);
+            }
+        };
+        let keys: Vec<Key> = match C::COUNTED {
+            // A collect in place keeps the entries' allocation and, its size not a multiple
+            // of the keys', shrinks it by a reallocation that holds both blocks at once: a
+            // charged build makes the keys beside the entries instead, in the room reserved.
+            true => {
+                let mut keys = Vec::with_capacity(entries.len());
+                for (i, &(key, tomb)) in entries.iter().enumerate() {
+                    mark(i, tomb);
+                    keys.push(key);
                 }
-                key
-            })
-            .collect();
+                drop(entries);
+                keys
+            }
+            false => entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, (key, tomb))| {
+                    mark(i, tomb);
+                    key
+                })
+                .collect(),
+        };
         let packed = match parallel {
             true => PackedKeys::from_sorted(&keys, encoding),
             false => PackedKeys::from_sorted_within(&keys, encoding, charge)?,
