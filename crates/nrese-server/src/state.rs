@@ -147,6 +147,7 @@ impl AppState {
             Err(nrese_store::access::AccessError::Throttled(message)) => {
                 Err(ApiError::too_many_requests(message))
             }
+            Err(nrese_store::access::AccessError::Busy(message)) => Err(ApiError::busy(message)),
             Err(_) => Err(ApiError::unauthorized("wrong user name or password")),
         }
     }
