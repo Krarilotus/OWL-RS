@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import process from "node:process";
 
 import { NreseClient } from "../lib/client";
+import type { ResponseEnvelope } from "../lib/http";
 import { cliHelpText, parseCliArgs } from "./args";
 import { textReport } from "./report";
 
@@ -42,12 +43,12 @@ async function main(): Promise<void> {
           await resolveBody(options.command.text),
           options.command.accept,
         );
-        printTextResponse(response);
+        printTextResponse(response, options.requireComplete);
         break;
       }
       case "update": {
         const response = await client.runUpdate(await resolveBody(options.command.text));
-        printTextResponse(response);
+        printTextResponse(response, options.requireComplete);
         break;
       }
       case "tell": {
@@ -56,7 +57,7 @@ async function main(): Promise<void> {
           options.command.graphMode,
           options.command.graphIri,
         );
-        printTextResponse(response);
+        printTextResponse(response, options.requireComplete);
         break;
       }
       case "graph-read": {
@@ -64,7 +65,7 @@ async function main(): Promise<void> {
           options.command.graphMode,
           options.command.graphIri,
         );
-        printTextResponse(response);
+        printTextResponse(response, options.requireComplete);
         break;
       }
       case "graph-write": {
@@ -74,7 +75,7 @@ async function main(): Promise<void> {
           options.command.graphMode,
           options.command.graphIri,
         );
-        printTextResponse(response);
+        printTextResponse(response, options.requireComplete);
         break;
       }
       case "graph-delete": {
@@ -82,7 +83,7 @@ async function main(): Promise<void> {
           options.command.graphMode,
           options.command.graphIri,
         );
-        printTextResponse(response);
+        printTextResponse(response, options.requireComplete);
         break;
       }
     }
@@ -105,10 +106,13 @@ function printJson(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
 }
 
-function printTextResponse(response: { ok: boolean; status: number; body: string }): void {
-  const report = textReport(response);
+function printTextResponse(response: ResponseEnvelope, requireComplete: boolean): void {
+  const report = textReport(response, requireComplete);
   for (const line of report.lines) {
     console.log(line);
+  }
+  for (const warning of report.warnings ?? []) {
+    console.error(warning);
   }
   if (report.exitCode !== 0) {
     process.exitCode = report.exitCode;

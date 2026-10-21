@@ -675,6 +675,13 @@ async fn query_answers_say_whether_answers_through_existentials_are_complete()
         "{:?}",
         response.headers()
     );
+    // Exposed to a console on another origin (CORS hides unexposed response headers).
+    assert_eq!(
+        response.headers()["access-control-expose-headers"],
+        "nrese-completeness",
+        "{:?}",
+        response.headers()
+    );
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
     assert!(String::from_utf8(body.to_vec())?.contains("<http://example.com/bob>"));
 

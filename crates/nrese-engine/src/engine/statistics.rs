@@ -17,10 +17,18 @@
 //! - Sets kept or saved but drifted: every planner goes on with them, while one rebuild
 //!   on a thread of its own, scanning on that thread alone, replaces them when done.
 //! - None at all (a first use without a load's build): the first planner builds them and
-//!   planners that arrive meanwhile wait for that build. A Rayon worker doesn't wait (the
-//!   stack it holds may be what the build waits for, as for the result cache's flights):
-//!   it plans without them. Only such a query (SHACL-SPARQL checks run on workers) can
-//!   plan by when it came, and only during that first build.
+//!   every planner that arrives meanwhile, on a Rayon worker or not, plans with them too.
+//!   No lock is held while they build: a sliced build of [`nrese_exec::cell`], each scan
+//!   a queue of subject slices run by the builder, by lanes it spawns, and by every planner
+//!   that waits, slice by slice, each slice alone (no Rayon inside it).
+//!
+//! The sets kept are charged to the budget the engine's owner gives it
+//! ([`Statistics::set_budget`]; none: unlimited), for as long as they are kept: built into
+//! charged vectors ([`Gathered::kept`]), so that the charge is what they hold. A rebuild
+//! builds and charges the new sets while the old are still kept, then replaces them: while
+//! a rebuild ends the budget must hold the old sets, the new ones and the build's charged
+//! scratch (its sort keys), not only two copies. Where it can't take the new ones, the
+//! old stay, and the next drift tries again; a refusal never leaves fewer sets than before.
 //!
 //! A scan stops once the slices have found more than
 //! [`MAX_SETS`](super::characteristic::MAX_SETS) sets between them.
@@ -32,18 +40,20 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
+use nrese_exec::budget::Budget;
+use nrese_exec::cell::{self, Build, BuildCell, Builder, Claim, Kind, Scan};
 use parking_lot::Mutex;
 
-use super::characteristic::{CharacteristicSets, Partial, SetCount};
+use super::characteristic::{CharacteristicSets, Gathered, PairCounts, Partial, SetCount};
 use super::corpora::CorpusStore;
 use super::{ReadModel, Snapshot, Version};
 use crate::quad::{GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
 
 /// The characteristic sets of one read model as built at a size (`None`: there were too
-/// many to keep), and whether a rebuild is under way.
+/// many to keep, or the budget couldn't take them), and whether a rebuild is under way.
 struct Sets {
-    built: Option<Arc<CharacteristicSets>>,
+    built: Option<cell::Kept<CharacteristicSets>>,
     at: u64,
     rebuilding: bool,
 }
@@ -51,6 +61,10 @@ struct Sets {
 impl Sets {
     fn fits(&self, size: u64) -> bool {
         size.abs_diff(self.at) <= self.at / 4
+    }
+
+    fn sets(&self) -> Option<Arc<CharacteristicSets>> {
+        self.built.as_ref().map(|kept| Arc::clone(kept.value()))
     }
 }
 
@@ -83,8 +97,11 @@ pub(crate) struct Statistics {
     nodes: Mutex<Vec<NodeCount>>,
     /// Per read model, the default graph's characteristic sets.
     sets: Mutex<HashMap<ReadModel, Sets>>,
-    /// Held while the sets are built: planners that need them meanwhile wait for them.
-    building: Mutex<()>,
+    /// Per read model, the build of its sets under way: one at a time, and planners that
+    /// need the sets meanwhile help it and wait for it.
+    building: BuildCell<ReadModel, CharacteristicSets>,
+    /// What the sets kept are charged to (`None`: an unlimited budget of their own).
+    budget: Mutex<Option<Arc<Budget>>>,
     /// The full-text corpora ([`super::corpora`]): this engine's, shared with the views
     /// made from its snapshots.
     pub(crate) corpora: Arc<CorpusStore>,
@@ -92,7 +109,15 @@ pub(crate) struct Statistics {
     dir: Mutex<Option<std::path::PathBuf>>,
     /// Scans of the store for the sets begun: what the tests count.
     scans: AtomicU64,
+    /// Called once by the next build, its first scan published and not begun: what the
+    /// tests hold a build with.
+    #[cfg(test)]
+    hook: Mutex<Option<Hook>>,
 }
+
+/// What a test runs at the next build's first scan ([`Statistics::hook`]).
+#[cfg(test)]
+type Hook = Box<dyn FnOnce(&Build<CharacteristicSets>) + Send>;
 
 /// Slices of the subject ids for scanning a graph by subject on every core: the
 /// dictionary's IRIs and blank nodes each cut into `slices` (their payloads are dictionary
@@ -177,8 +202,8 @@ impl Statistics {
     /// The characteristic sets of the default graph in `model` (see the module docs): kept
     /// (drifted ones while one rebuild replaces them), read from their file (written
     /// after a build, read at the first use after a start), or built now, the first
-    /// time, by one planner while the others wait; a Rayon worker that would wait gets
-    /// none.
+    /// time, by one planner while the others help with it and wait, on Rayon workers
+    /// too ([`Build`]); none where that build failed (the next caller builds again).
     pub(crate) fn characteristic_sets(
         self: &Arc<Self>,
         snapshot: &Snapshot,
@@ -189,15 +214,28 @@ impl Statistics {
         if let Kept::Sets(sets) = self.kept_sets(snapshot, model, size) {
             return sets;
         }
-        let building = match rayon::current_thread_index() {
-            Some(_) => self.building.try_lock(),
-            None => Some(self.building.lock()),
-        };
-        let _building = building?;
-        match self.kept_sets(snapshot, model, size) {
-            Kept::Sets(sets) => sets,
-            Kept::Cold => self.build_sets(snapshot, model, size, true),
+        let kept = || self.sets.lock().get(&model).map(Sets::sets);
+        match self.building.claim(model, Kind::Sliced, kept) {
+            Claim::Build(builder) => self.build_sets(&builder, snapshot, model, size, true),
+            // Another planner's build: helped with and waited for (a sliced build turns no
+            // waiter away).
+            Claim::Wait(build) => build.wait().ok().flatten(),
         }
+    }
+
+    /// The build of `model`'s sets for a caller that must build whatever is kept: a build
+    /// under way is waited for first.
+    fn claim_anyway(&self, model: ReadModel) -> Builder<'_, ReadModel, CharacteristicSets> {
+        match self.building.claim_anyway(model, Kind::Sliced) {
+            Ok(builder) => builder,
+            Err(_) => unreachable!("a sliced build turns no waiter away"),
+        }
+    }
+
+    /// What the sets kept are charged to from now on (a store's own envelope within its
+    /// catalog's budget).
+    pub(crate) fn set_budget(&self, budget: Arc<Budget>) {
+        *self.budget.lock() = Some(budget);
     }
 
     /// The sets of `model` kept, or read from their file if none are; drifted ones by more
@@ -210,8 +248,9 @@ impl Statistics {
                 let Some((built, at)) = self.load_sets(snapshot, model) else {
                     return Kept::Cold;
                 };
+                // Over the budget: none until the next build (there were none before).
                 vacant.insert(Sets {
-                    built,
+                    built: built.and_then(|sets| self.keep(sets).ok()),
                     at,
                     rebuilding: false,
                 })
@@ -221,7 +260,18 @@ impl Statistics {
             kept.rebuilding = true;
             self.rebuild(snapshot, model);
         }
-        Kept::Sets(kept.built.clone())
+        Kept::Sets(kept.sets())
+    }
+
+    /// `sets` as kept, built into vectors charged to the budget ([`Gathered::kept`]); an
+    /// error, nothing charged, where it can't take them.
+    fn keep(
+        &self,
+        sets: Gathered,
+    ) -> Result<cell::Kept<CharacteristicSets>, nrese_exec::BudgetExceeded> {
+        let budget = self.budget.lock().clone();
+        let budget = budget.unwrap_or_else(|| Arc::new(Budget::unlimited()));
+        cell::Kept::new(sets.kept(&budget)?, budget)
     }
 
     /// Rebuilds the drifted sets of `model` on a thread of its own, scanning on that
@@ -231,10 +281,10 @@ impl Statistics {
         let started = std::thread::Builder::new()
             .name("nrese-statistics".to_owned())
             .spawn(move || {
-                let _building = statistics.building.lock();
+                let builder = statistics.claim_anyway(model);
                 let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
                 let size = snapshot.count_in(model, &pattern);
-                statistics.build_sets(&snapshot, model, size, false);
+                statistics.build_sets(&builder, &snapshot, model, size, false);
             });
         if started.is_err()
             && let Some(kept) = self.sets.lock().get_mut(&model)
@@ -250,14 +300,15 @@ impl Statistics {
     pub(crate) fn prepare_sets(self: &Arc<Self>, snapshot: &Snapshot, model: ReadModel) {
         let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
         let size = snapshot.count_in(model, &pattern);
-        let _building = self.building.lock();
-        self.build_sets(snapshot, model, size, true);
+        let builder = self.claim_anyway(model);
+        self.build_sets(&builder, snapshot, model, size, true);
     }
 
     /// The sets of `model` scanned (on every core or on this thread alone), kept as built
-    /// at `size` and saved; under `building`.
+    /// at `size` and saved, and given to the planners that wait for `builder`'s build.
     fn build_sets(
         &self,
+        builder: &Builder<'_, ReadModel, CharacteristicSets>,
         snapshot: &Snapshot,
         model: ReadModel,
         size: u64,
@@ -265,7 +316,7 @@ impl Statistics {
     ) -> Option<Arc<CharacteristicSets>> {
         let started = std::time::Instant::now();
         self.scans.fetch_add(1, Ordering::Relaxed);
-        let built = Self::scan_sets(snapshot, model, every_core);
+        let built = self.scan_sets(builder.build(), snapshot, model, every_core);
         tracing::debug!(
             ?model,
             statements = size,
@@ -275,16 +326,61 @@ impl Statistics {
             ms = started.elapsed().as_millis() as u64,
             "characteristic sets built"
         );
-        self.save_sets(snapshot, model, size, built.as_deref());
-        self.sets.lock().insert(
+        self.save_sets(snapshot, model, size, built.as_ref());
+        // Built and charged while the old sets are still kept, then put in their place.
+        let kept = match built.map(|sets| self.keep(sets)) {
+            Some(Ok(kept)) => Some(kept),
+            // Too many sets: none kept at this size.
+            None => None,
+            // Over the budget: the old sets stay (none if there were none); the next
+            // drift tries again.
+            Some(Err(error)) => {
+                tracing::warn!(%error, ?model, "characteristic sets not replaced: over the budget");
+                let mut sets = self.sets.lock();
+                let old = match sets.get_mut(&model) {
+                    Some(old) => {
+                        old.rebuilding = false;
+                        old.sets()
+                    }
+                    None => {
+                        sets.insert(
+                            model,
+                            Sets {
+                                built: None,
+                                at: size,
+                                rebuilding: false,
+                            },
+                        );
+                        None
+                    }
+                };
+                builder.finish(old.clone());
+                return old;
+            }
+        };
+        let built = kept.as_ref().map(|kept| Arc::clone(kept.value()));
+        let replaced = self.sets.lock().insert(
             model,
             Sets {
-                built: built.clone(),
+                built: kept,
                 at: size,
                 rebuilding: false,
             },
         );
+        // The old sets let go after the swap, outside the lock.
+        drop(replaced);
+        builder.finish(built.clone());
         built
+    }
+
+    /// What the sets of `model` kept are charged (their vectors' and their `Arc`'s).
+    #[cfg(test)]
+    fn charged(&self, model: ReadModel) -> usize {
+        self.sets
+            .lock()
+            .get(&model)
+            .and_then(|s| s.built.as_ref())
+            .map_or(0, |kept| kept.bytes() + kept.value().charged())
     }
 
     /// Scans of the store for the characteristic sets begun so far.
@@ -293,36 +389,66 @@ impl Statistics {
         self.scans.load(Ordering::Relaxed)
     }
 
-    /// The sets of `model` from two scans in subject order over slices of the subjects,
-    /// on every core or on this thread alone; the first stops once the slices have found
-    /// more than [`MAX_SETS`](super::characteristic::MAX_SETS) between them.
+    /// The sets of `model` from two scans in subject order over slices of the subjects, on
+    /// every core (lanes on the current Rayon pool, and the planners that wait for
+    /// `build`) or on this thread alone; the first stops once the slices have found more
+    /// than [`MAX_SETS`](super::characteristic::MAX_SETS) between them.
     fn scan_sets(
+        &self,
+        build: &Build<CharacteristicSets>,
         snapshot: &Snapshot,
         model: ReadModel,
         every_core: bool,
-    ) -> Option<Arc<CharacteristicSets>> {
-        use rayon::prelude::*;
-        let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
-        let ranges = subject_ranges(
+    ) -> Option<Gathered> {
+        let ranges: Arc<[(TermId, TermId)]> = subject_ranges(
             snapshot.dictionary_len(),
             rayon::current_num_threads() as u64 * 4,
-        );
-        let scan = |&(low, high): &(TermId, TermId)| {
+        )
+        .into();
+        // As many lanes as the pool has threads beside this one.
+        let lanes = match every_core {
+            true => {
+                rayon::current_num_threads() - usize::from(rayon::current_thread_index().is_some())
+            }
+            false => 0,
+        };
+        // Slice `i` of the default graph, in subject order.
+        fn slice<'s>(
+            snapshot: &'s Snapshot,
+            model: ReadModel,
+            ranges: &[(TermId, TermId)],
+            i: usize,
+        ) -> Option<impl Iterator<Item = crate::quad::EncodedQuad> + 's> {
+            let (low, high) = ranges[i];
+            let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
             snapshot.scan_range_in(model, &pattern, Permutation::Gspo, low, high)
-        };
-        let count = SetCount::default();
-        let part = |range: &(TermId, TermId)| scan(range).and_then(|q| Partial::of(q, &count));
-        let parts: Option<Vec<Partial>> = match every_core {
-            true => ranges.par_iter().map(part).collect(),
-            false => ranges.iter().map(part).collect(),
-        };
-        let sets = CharacteristicSets::merge(parts?)?;
+        }
+        let count = Arc::new(SetCount::default());
+        let parts = Scan::new(ranges.len(), {
+            let (snapshot, ranges) = (snapshot.clone(), Arc::clone(&ranges));
+            move |i| {
+                slice(&snapshot, model, &ranges, i).and_then(|quads| Partial::of(quads, &count))
+            }
+        });
+        #[cfg(test)]
+        let hook = self.hook.lock().take();
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            parts.publish_on(build);
+            hook(build);
+        }
+        let mut sets = Gathered::merge(parts.run(build, lanes, every_core)?)?;
         // The pairs need each subject's set first: a second scan.
-        let scans: Option<Vec<_>> = ranges.iter().map(scan).collect();
-        Some(Arc::new(match scans {
-            Some(scans) => sets.with_pairs_of(scans),
-            None => sets,
-        }))
+        let subjects: Arc<[(u64, u32)]> = sets.take_subjects().into();
+        if subjects.is_empty() {
+            return Some(sets);
+        }
+        let snapshot = snapshot.clone();
+        let pairs: Arc<Scan<PairCounts>> = Scan::new(ranges.len(), move |i| {
+            slice(&snapshot, model, &ranges, i)
+                .and_then(|quads| Gathered::pair_counts(&subjects, quads))
+        });
+        Some(sets.with_pair_counts(pairs.run(build, lanes, every_core)))
     }
 
     /// Where the derived files are (a durable engine's `derived/`).
@@ -334,13 +460,7 @@ impl Statistics {
         format!("statistics-{model:?}").to_ascii_lowercase()
     }
 
-    fn save_sets(
-        &self,
-        snapshot: &Snapshot,
-        model: ReadModel,
-        size: u64,
-        sets: Option<&CharacteristicSets>,
-    ) {
+    fn save_sets(&self, snapshot: &Snapshot, model: ReadModel, size: u64, sets: Option<&Gathered>) {
         let Some(dir) = self.dir.lock().clone() else {
             return;
         };
@@ -366,11 +486,7 @@ impl Statistics {
 
     /// The sets of `model` saved for this dictionary: (`None` if there were too many to
     /// keep, the size they were built at).
-    fn load_sets(
-        &self,
-        snapshot: &Snapshot,
-        model: ReadModel,
-    ) -> Option<(Option<Arc<CharacteristicSets>>, u64)> {
+    fn load_sets(&self, snapshot: &Snapshot, model: ReadModel) -> Option<(Option<Gathered>, u64)> {
         let dir = self.dir.lock().clone()?;
         let dictionary = snapshot.dictionary();
         let (_, loaded) = crate::term::derived::load(&dir, &Self::sets_name(model), |covered| {
@@ -380,7 +496,7 @@ impl Statistics {
         let size = reader.u64()?;
         let sets = match reader.u32()? {
             0 => None,
-            _ => Some(Arc::new(CharacteristicSets::read(&mut reader)?)),
+            _ => Some(Gathered::read(&mut reader)?),
         };
         Some((sets, size))
     }
@@ -439,26 +555,49 @@ mod tests {
         tx.commit().unwrap();
     }
 
-    /// Planners on Rayon workers (SHACL-SPARQL checks) during the first build don't each
-    /// scan the store: they plan without the sets and the build is one scan. After a drift
-    /// by more than a quarter every planner, on a worker or not, goes on with the old sets
-    /// at once, and one rebuild on a thread of its own scans once more.
+    /// Holds the next build once its first scan is published: `planners` start, and the
+    /// build goes on once `asleep` of them sleep on it.
+    fn holding(statistics: &Statistics, asleep: usize, planners: impl FnOnce() + Send + 'static) {
+        *statistics.hook.lock() = Some(Box::new(move |build: &Build<CharacteristicSets>| {
+            planners();
+            let started = std::time::Instant::now();
+            while build.waiting() < asleep {
+                assert!(
+                    started.elapsed().as_secs() < 30,
+                    "the planners never waited"
+                );
+                std::thread::yield_now();
+            }
+        }));
+    }
+
+    /// Planners on Rayon workers (SHACL-SPARQL checks) that arrive during the first build
+    /// plan with the complete sets, as every other planner does (q02: no plan by when a
+    /// query came), and the build stays one scan: 64 planners on a pool of two threads,
+    /// nested in its joins, each asleep on the build or helping it. Workers planned
+    /// without the sets before. After a drift by more than a quarter every planner goes on
+    /// with the old sets at once, and one rebuild on a thread of its own scans once more.
+    /// The sets kept are charged to the owner's budget, the rebuilt ones in place of the old.
     #[test]
-    fn planners_during_a_build_scan_the_store_once() {
+    fn planners_during_a_build_plan_with_the_complete_sets() {
         let model = ReadModel::default();
         let engine = Engine::new(EngineConfig::default()).unwrap();
+        let budget = Arc::new(Budget::unlimited());
+        engine.charge_statistics_to(Arc::clone(&budget));
         add(&engine, 0..3_000);
         let statistics = Arc::clone(&engine.inner.shared.statistics);
-        let workers = rayon::ThreadPoolBuilder::new()
-            .num_threads(4)
-            .build()
-            .unwrap();
-        let planners = |snapshot: &Snapshot| -> Vec<Option<Arc<CharacteristicSets>>> {
+        let workers = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap(),
+        );
+        let planners = move |workers: &rayon::ThreadPool, snapshot: &Snapshot| {
             workers.install(|| {
                 (0..64)
                     .into_par_iter()
                     .map(|_| snapshot.characteristic_sets_in(model))
-                    .collect()
+                    .collect::<Vec<_>>()
             })
         };
         let same = |found: &[Option<Arc<CharacteristicSets>>], sets: &Arc<CharacteristicSets>| {
@@ -466,21 +605,29 @@ mod tests {
                 .iter()
                 .all(|s| s.as_ref().is_some_and(|s| Arc::ptr_eq(s, sets)))
         };
-        // The first build under way (held here): the workers plan without the sets.
         let snapshot = engine.snapshot();
-        let held = statistics.building.lock();
-        assert!(planners(&snapshot).iter().all(Option::is_none));
-        assert_eq!(statistics.scans(), 0);
-        drop(held);
-        // A planner off the workers builds them, once; then the workers have them too.
+        let (found, during) = std::sync::mpsc::channel();
+        holding(&statistics, 2, {
+            let (workers, snapshot) = (Arc::clone(&workers), snapshot.clone());
+            move || {
+                std::thread::spawn(move || {
+                    let _ = found.send(planners(&workers, &snapshot));
+                });
+            }
+        });
         let first = snapshot.characteristic_sets_in(model).expect("built");
+        let during = during
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the planners finished");
+        assert!(same(&during, &first));
         assert_eq!(statistics.scans(), 1);
-        assert!(same(&planners(&snapshot), &first));
+        assert_eq!(budget.used(), statistics.charged(model));
+        assert!(same(&planners(&workers, &snapshot), &first));
         // Drifted, the rebuild held back: every planner has the old sets, none waits.
         add(&engine, 3_000..6_000);
         let snapshot = engine.snapshot();
-        let held = statistics.building.lock();
-        assert!(same(&planners(&snapshot), &first));
+        let held = statistics.claim_anyway(model);
+        assert!(same(&planners(&workers, &snapshot), &first));
         assert!(same(&[snapshot.characteristic_sets_in(model)], &first));
         drop(held);
         // One rebuild replaces them.
@@ -499,7 +646,177 @@ mod tests {
         let rebuilt = snapshot.characteristic_sets_in(model).expect("rebuilt");
         assert!(!Arc::ptr_eq(&rebuilt, &first));
         assert_eq!(rebuilt.subjects(), 6_000);
-        assert!(same(&planners(&snapshot), &rebuilt));
+        // The old sets' vectors stay charged while anyone holds them: here, until now.
+        drop((first, during));
+        assert_eq!(budget.used(), statistics.charged(model));
+        assert!(same(&planners(&workers, &snapshot), &rebuilt));
         assert_eq!(statistics.scans(), 2);
+    }
+
+    /// A rebuild of the same sets under a budget that holds one copy keeps the old ones,
+    /// charged as before; one that holds two replaces them, and the old ones' charge goes
+    /// with them. Sol's review of 6c683347: the rebuild that didn't fit dropped the kept sets
+    /// and left none (and nothing charged).
+    #[test]
+    fn a_rebuild_the_budget_cannot_take_keeps_the_old_sets() {
+        let model = ReadModel::default();
+        let engine = |budget: &Arc<Budget>| {
+            let engine = Engine::new(EngineConfig::default()).unwrap();
+            add(&engine, 0..300);
+            engine.charge_statistics_to(Arc::clone(budget));
+            engine.prepare_statistics();
+            engine
+        };
+        let unlimited = Arc::new(Budget::unlimited());
+        let _measured = engine(&unlimited);
+        let one = unlimited.used();
+        assert!(one > 0);
+        for (copies, replaced) in [(1, false), (2, true)] {
+            let budget = Arc::new(Budget::new(copies * one));
+            let engine = engine(&budget);
+            let first = engine
+                .snapshot()
+                .characteristic_sets_in(model)
+                .expect("kept");
+            engine.prepare_statistics();
+            let after = engine
+                .snapshot()
+                .characteristic_sets_in(model)
+                .expect("still kept after the rebuild");
+            assert_eq!(!Arc::ptr_eq(&first, &after), replaced, "{copies} copies");
+            // Replaced, the old sets' vectors stay charged while anyone holds them.
+            drop(first);
+            assert_eq!(budget.used(), one, "{copies} copies");
+        }
+    }
+
+    /// What the kept sets hold is what they are charged, at any number of predicates: they
+    /// are built into charged vectors, and their `Arc`'s block is charged before it is
+    /// allocated. Sol's review of 6c683347: a charge estimated from the maps' capacities,
+    /// and the `Arc` charged after it was allocated, left 81,968 bytes uncharged at 4,096
+    /// predicates.
+    #[test]
+    fn kept_sets_hold_no_more_than_they_charge() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        for predicates in [16u64, 256, 4096] {
+            let statistics = Statistics::default();
+            let budget = Arc::new(Budget::unlimited());
+            statistics.set_budget(Arc::clone(&budget));
+            // A chain over `predicates` subjects, each with a predicate of its own: as many
+            // sets as predicates, and as many pairs.
+            let id = |raw| TermId::from_raw(raw);
+            let quads: Vec<crate::quad::EncodedQuad> = (0..predicates)
+                .map(|i| {
+                    let (s, o) = (id(1 + i), id(1 + (i + 1) % predicates));
+                    crate::quad::EncodedQuad::new(s, id(1_000_000 + i), o, TermId::DEFAULT_GRAPH)
+                })
+                .collect();
+            let gathered = Gathered::build(quads.clone().into_iter())
+                .unwrap()
+                .with_pairs(quads.into_iter());
+            let (kept, excess) =
+                nrese_exec::measure::measure_within(&budget, || statistics.keep(gathered).unwrap());
+            assert_eq!(kept.value().len(), predicates as usize);
+            assert!(kept.value().has_pairs());
+            assert_eq!(
+                excess, 0,
+                "{predicates} predicates: {excess} bytes beyond the charge"
+            );
+            drop(kept);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    /// A slice that panics on a lane leaves no build stuck: the lane goes on with the queue,
+    /// the builder outside the pool (which only waits for its lanes) gets the panic, the
+    /// planners asleep on the build wake without sets, and the next caller builds again.
+    /// Before, the panic left the lane (Rayon aborts the process on it, or with a handler
+    /// that returns the queue stays unclaimed) and the builder waited for good.
+    #[test]
+    fn a_panicking_slice_fails_the_build_and_wakes_its_planners() {
+        let model = ReadModel::default();
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        add(&engine, 0..300);
+        // The builder's thread borrows the statistics for good (a test's leak).
+        let statistics: &'static Statistics =
+            Box::leak(Box::new(Arc::clone(&engine.inner.shared.statistics)));
+        let Claim::Build(builder) = statistics.building.claim(model, Kind::Sliced, || None) else {
+            panic!("no build yet");
+        };
+        let Claim::Wait(build) = statistics.building.claim(model, Kind::Sliced, || None) else {
+            panic!("one build at a time");
+        };
+        let (woke, planner) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = woke.send(build.wait().ok().flatten());
+        });
+        let (over, failed) = std::sync::mpsc::channel();
+        let scanned = {
+            std::thread::spawn(move || {
+                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let scan = Scan::new(2, |i| -> Option<u8> {
+                        assert!(i != 0, "the injected slice panic");
+                        Some(1)
+                    });
+                    // Not published: the planner sleeps, the lane alone runs the slices.
+                    let ran = scan.run(builder.build(), 1, false);
+                    drop(builder);
+                    ran
+                }));
+                let _ = over.send(ran.is_err());
+            })
+        };
+        let patience = std::time::Duration::from_secs(10);
+        assert_eq!(
+            failed.recv_timeout(patience),
+            Ok(true),
+            "the builder got the panic"
+        );
+        scanned.join().unwrap();
+        assert!(matches!(planner.recv_timeout(patience), Ok(None)));
+        assert!(statistics.building.is_idle());
+        assert!(statistics.sets.lock().get(&model).is_none());
+        assert!(engine.snapshot().characteristic_sets_in(model).is_some());
+    }
+
+    /// A pool's only thread that plans during a build started outside it, with no lanes
+    /// beside the builder, scans the whole first scan itself and then has the complete
+    /// sets: a planner that waits never needs a thread of its own pool to get on.
+    #[test]
+    fn a_pools_only_thread_runs_the_build_it_waits_for() {
+        let model = ReadModel::default();
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        add(&engine, 0..3_000);
+        let statistics = Arc::clone(&engine.inner.shared.statistics);
+        let one = || {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap()
+        };
+        let (planners, builders) = (Arc::new(one()), one());
+        let snapshot = engine.snapshot();
+        let (found, planned) = std::sync::mpsc::channel();
+        // The builder holds back until the planner sleeps: it has scanned every slice.
+        holding(&statistics, 1, {
+            let snapshot = snapshot.clone();
+            move || {
+                planners.spawn(move || {
+                    let _ = found.send(snapshot.characteristic_sets_in(model));
+                });
+            }
+        });
+        // On a pool of one thread the builder spawns no lanes.
+        let built = builders
+            .install(|| snapshot.characteristic_sets_in(model))
+            .expect("built");
+        let planned = planned
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the planner finished")
+            .expect("the planner has the sets");
+        assert!(Arc::ptr_eq(&planned, &built));
+        assert_eq!(statistics.scans(), 1);
     }
 }

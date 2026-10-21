@@ -791,9 +791,11 @@ mod tests {
                 72,
             ),
         ];
+        // Beside the tables, what the context holds of its own.
+        let own = super::super::own_bytes(&snapshot);
         for (case, parts, limit) in cases {
             let mut options = QueryOptions::default();
-            options.resources.memory = nrese_exec::Envelope::new(Some(limit), None);
+            options.resources.memory = nrese_exec::Envelope::new(Some(own + limit), None);
             let ctx = Context::new(&snapshot, &options, None, None);
             let parts: Vec<Solutions> = parts
                 .into_iter()
@@ -807,10 +809,14 @@ mod tests {
                 _ => concat(&ctx, parts),
             };
             let remade = remade.ok().unwrap_or_else(|| panic!("{case}: refused"));
-            assert_eq!(ctx.budget.used(), remade.table.memory_bytes(), "{case}");
-            assert!(ctx.budget.peak() <= limit, "{case}");
+            assert_eq!(
+                ctx.budget.used(),
+                own + remade.table.memory_bytes(),
+                "{case}"
+            );
+            assert!(ctx.budget.peak() <= own + limit, "{case}");
             ctx.consumed(remade);
-            assert_eq!(ctx.budget.used(), 0, "{case}");
+            assert_eq!(ctx.budget.used(), own, "{case}");
         }
     }
 }
