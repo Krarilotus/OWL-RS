@@ -460,3 +460,82 @@ fn explain_tells_a_restricted_reader_nothing_of_hidden_graphs() {
     let (plan, run) = explain(&large, ReadScope::All);
     assert!(!plan.steps.is_empty() && !run.steps.is_empty());
 }
+
+/// Nor do the rewrites: eager aggregation is chosen by an estimate, and a restricted reader's
+/// merged default graph is estimated over every graph (Sol's review of R13, r1 B-F1). Hidden
+/// prices make it pay in one store and not in the other; the answer, the plan and the run the
+/// reader is told are the same.
+#[test]
+fn restricted_rewrites_tell_nothing_of_hidden_statistics() {
+    let with_hidden_prices = |hidden: usize| {
+        let mut config = in_memory_store_config();
+        config.union_default_graph = true;
+        let store = StoreService::new(config).unwrap();
+        let visible: String = (0..10)
+            .map(|i| {
+                format!("<urn:product{i}> <urn:team> <urn:t> . <urn:offer{i}> <urn:product> <urn:product{i}> . ")
+            })
+            .collect();
+        let secret: String = (0..hidden)
+            .map(|i| format!("<urn:hidden{i}> <urn:price> {} . ", i + 2))
+            .collect();
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ {visible} <urn:visible-price> <urn:price> 1 .
+                   GRAPH <urn:g:public> {{ <urn:marker> <urn:present> 1 }}
+                   GRAPH <urn:g:secret> {{ <urn:hidden-marker> <urn:present> 1 . {secret} }} }}"
+            )))
+            .unwrap();
+        store
+    };
+    let query = "SELECT ?team (SUM(?price) AS ?total) WHERE { ?product <urn:team> ?team .
+                 ?offer <urn:product> ?product . ?x <urn:price> ?price } GROUP BY ?team";
+    let observe = |store: &StoreService| {
+        let request = SparqlQueryRequest::new(query, public());
+        let payload = store.execute_query(&request).unwrap().payload;
+        let prepared = store.prepare_query(&request).unwrap();
+        let token = nrese_store::CancellationToken::new();
+        let plan = store.plan_query(&prepared, &token).unwrap();
+        store.clear_query_cache();
+        let run = store.explain_query(&prepared, &token).unwrap();
+        (payload, plan.rewrites, run.rewrites)
+    };
+    assert_eq!(
+        observe(&with_hidden_prices(0)),
+        observe(&with_hidden_prices(20))
+    );
+}
+
+/// Nor does a refusal: a scan sized by a graph the reader may not read runs out of the
+/// query's memory, and the refusal it is told keeps its kind and limit, not the bytes (Sol's
+/// review of R13, r1 B-F2: they were in the message).
+#[test]
+fn restricted_explain_refusals_tell_nothing_of_hidden_sizes() {
+    let refusal = |hidden: usize| {
+        let mut config = in_memory_store_config();
+        config.total_query_memory_bytes = 0;
+        let store = StoreService::new(config).unwrap();
+        let secret: String = (0..hidden)
+            .map(|i| format!("<urn:hidden{i}> <urn:p> {i} . "))
+            .collect();
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ GRAPH <urn:g:public> {{ <urn:visible> <urn:p> 1 }}
+                   GRAPH <urn:g:secret> {{ {secret} }} }}"
+            )))
+            .unwrap();
+        let mut request =
+            SparqlQueryRequest::new("SELECT * WHERE { GRAPH ?g { ?s <urn:p> ?o } }", public());
+        request.memory_limit = Some(64 << 10);
+        let prepared = store.prepare_query(&request).unwrap();
+        let error = store
+            .explain_query(&prepared, &nrese_store::CancellationToken::new())
+            .unwrap_err();
+        assert!(
+            error.is_memory_limit() && !error.is_server_memory_limit(),
+            "{error}"
+        );
+        error.to_string()
+    };
+    assert_eq!(refusal(100_000), refusal(200_000));
+}
