@@ -245,6 +245,31 @@ fn measures_in_metres_and_degrees() {
         "geof:area(geof:buffer({a}, 1, uom:metre), uom:squareMetre)"
     ));
     assert!((3.0..3.2).contains(&disc), "{disc}");
+    // The same system under its other EPSG identifier forms (a dataset version, GML's
+    // versioned URN and legacy URL) measures as well; another code, or a suffix that isn't
+    // one, under them doesn't.
+    let points = |of: &dyn Fn(f64) -> String| {
+        format!("geof:distance({}, {}, uom:metre)", of(0.0), of(300.0))
+    };
+    let versioned = |x: f64| {
+        wkt(&format!(
+            "<http://www.opengis.net/def/crs/EPSG/8.9.2/3857> POINT({x} 0)"
+        ))
+    };
+    let gml = |srs: &'static str| {
+        move |x: f64| {
+            format!(
+                "'<gml:Point xmlns:gml=\"http://www.opengis.net/gml/3.2\" srsName=\"{srs}\"><gml:pos>{x} 0</gml:pos></gml:Point>'^^geo:gmlLiteral"
+            )
+        }
+    };
+    for measure in [
+        points(&versioned),
+        points(&gml("urn:ogc:def:crs:EPSG:6.18:3:3857")),
+        points(&gml("http://www.opengis.net/gml/srs/epsg.xml#3857")),
+    ] {
+        assert_eq!(measured(measure), 300.0);
+    }
     let (c, d) = (
         in_crs("2056", "POINT(0 0)"),
         in_crs("2056", "POINT(300 400)"),
@@ -256,6 +281,16 @@ fn measures_in_metres_and_degrees() {
         format!("geof:buffer({a}, 1, uom:degree)"),
         format!("geof:distance({c}, {d}, uom:metre)"),
         format!("geof:area(geof:envelope({c}), uom:squareMetre)"),
+        points(&|x| {
+            wkt(&format!(
+                "<http://www.opengis.net/def/crs/EPSG/8.9.2/2056> POINT({x} 0)"
+            ))
+        }),
+        points(&|x| {
+            wkt(&format!(
+                "<http://www.opengis.net/def/crs/EPSG/0/3857x> POINT({x} 0)"
+            ))
+        }),
     ] {
         assert!(
             select(

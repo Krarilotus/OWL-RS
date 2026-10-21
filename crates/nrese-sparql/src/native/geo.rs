@@ -91,13 +91,11 @@ enum Units {
 /// (the EPSG registry): WGS 84 / UTM zones 1N-60N (32601-32660) and 1S-60S (32701-32760),
 /// WGS 84 / Pseudo-Mercator (3857), ETRS89 / UTM zones 28N-38N (25828-25838), ETRS89-extended
 /// / LAEA Europe (3035), RGF93 / Lambert-93 (2154), OSGB36 / British National Grid (27700)
-/// and DHDN / 3-degree Gauss-Krueger zones 2-5 (31466-31469). A CRS database, with units
-/// and conversions for every system, comes in v2.0.
+/// and DHDN / 3-degree Gauss-Krueger zones 2-5 (31466-31469), under any of the identifier
+/// forms [`epsg_code`] reads. A CRS database, with units and conversions for every system,
+/// comes in v2.0.
 fn in_metres(crs: &str) -> bool {
-    let Some(code) = crs
-        .strip_prefix("http://www.opengis.net/def/crs/EPSG/0/")
-        .and_then(|code| code.parse::<u32>().ok())
-    else {
+    let Some(code) = epsg_code(crs) else {
         return false;
     };
     matches!(
@@ -111,6 +109,40 @@ fn in_metres(crs: &str) -> bool {
             | 27700
             | 31466..=31469
     )
+}
+
+/// The EPSG code `crs` names, in the identifier forms of one EPSG object: the OGC HTTP IRI
+/// of any dataset version (`http://www.opengis.net/def/crs/EPSG/0/3857`, `.../EPSG/8.9.2/3857`),
+/// the OGC URN with or without a version (`urn:ogc:def:crs:EPSG::3857`,
+/// `urn:ogc:def:crs:EPSG:6.18:3:3857`), and GML's legacy URL
+/// (`http://www.opengis.net/gml/srs/epsg.xml#3857`). A version is digits and dots, a code
+/// digits only: any other suffix names no code.
+fn epsg_code(crs: &str) -> Option<u32> {
+    let version = |v: &str| {
+        v.split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let (version_ok, code) = match (
+        crs.strip_prefix("http://www.opengis.net/def/crs/EPSG/"),
+        crs.strip_prefix("urn:ogc:def:crs:EPSG:"),
+        crs.strip_prefix("http://www.opengis.net/gml/srs/epsg.xml#"),
+    ) {
+        (Some(rest), _, _) => {
+            let (v, code) = rest.split_once('/')?;
+            (version(v), code)
+        }
+        (_, Some(rest), _) => {
+            let (v, code) = rest.rsplit_once(':')?;
+            (v.is_empty() || v.split(':').all(version), code)
+        }
+        (_, _, Some(code)) => (true, code),
+        (None, None, None) => return None,
+    };
+    let digits = !code.is_empty() && code.len() <= 6 && code.bytes().all(|b| b.is_ascii_digit());
+    if !(version_ok && digits) {
+        return None;
+    }
+    code.parse().ok()
 }
 
 /// Whether `unit` is the metre.
