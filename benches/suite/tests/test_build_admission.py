@@ -138,6 +138,36 @@ class Admission(unittest.TestCase):
         self.assertEqual(fits.wait(timeout=120), 0)
         self.assertIsNotNone(self.started("fits", within=1))
 
+    def test_an_ambiguous_guard_script_means_no_build(self):
+        # Sol, review-build-admission-r6 (r6-1): the first textual `$hard` was taken, though it sat in a
+        # block comment, or a later assignment was the one PowerShell keeps. 11 GB free, a 12 GB line.
+        self.free(11)
+        script = self.root / "guard.ps1"
+        for n, text in enumerate(["<#\n$hard = ($ram -lt 4) -or ($disk -lt 100)\n#>\n$hard = ($ram -lt 12) -or ($disk -lt 100)\n",
+                                  "$hard = ($ram -lt 4) -or ($disk -lt 100)\n$hard = ($ram -lt 12) -or ($disk -lt 100)\n"]):
+            script.write_text(text)
+            run = self.start(f"amb{n}", stderr=subprocess.PIPE, NRESE_BUILD_FLOOR_GB=None, NRESE_GUARD_SCRIPT=str(script),
+                             NRESE_BUILD_PEAK_GB="1")
+            _, err = run.communicate(timeout=60)
+            self.assertEqual(run.returncode, 2, (text, err))
+            self.assertIn("kill line can't be read", err)
+            self.assertFalse((self.out / f"amb{n}.started").exists(), text)
+
+    @unittest.skipUnless(shutil.which("mkfifo"), "a disk reading that never comes (a FIFO)")
+    def test_a_disk_reading_that_never_comes_ends_at_the_deadline_and_holds_no_one(self):
+        # r6-2: the disk query ran unbounded inside the admission lock: a stalled one held its hook and
+        # every hook behind it. A FIFO no one writes stands for it.
+        fifo = self.root / "stalled"
+        subprocess.run(["mkfifo", str(fifo)], check=True)
+        stalled = self.start("stalled", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="1", NRESE_BUILD_SLOT_WAIT_S="3",
+                             NRESE_GUARD_DISKFREE=str(fifo), NRESE_GUARD_DISK_TIMEOUT_S="1")
+        beside = self.start("beside", NRESE_BUILD_PEAK_GB="1")
+        _, err = stalled.communicate(timeout=60)
+        self.assertEqual(stalled.returncode, 75, err)
+        self.assertFalse((self.out / "stalled.started").exists())
+        self.assertEqual(beside.wait(timeout=120), 0)
+        self.assertIsNotNone(self.started("beside", within=1), "held up by a stalled disk reading")
+
     def test_the_guards_line_is_read_as_powershell_reads_it_or_nothing_builds(self):
         # Sol, r5-2: other casing or spacing, or a last line without a newline, read as no line: an
         # 8 GB floor under a guard that kills at 12 GB. 11 GB free: none of them builds.
