@@ -497,7 +497,17 @@ impl<'d> Context<'d> {
             ),
             Some(specification) => {
                 let default = match specification.default_graph_graphs() {
-                    None => merge(dataset, None),
+                    // Every graph, or every graph but those it leaves out.
+                    None => match specification.excluded_default_graphs().unwrap_or_default() {
+                        [] => merge(dataset, None),
+                        left_out => {
+                            let graphs: Vec<GraphName> = std::iter::once(GraphName::DefaultGraph)
+                                .chain(all.iter().cloned().map(GraphName::from))
+                                .filter(|graph| !left_out.contains(graph))
+                                .collect();
+                            merge(dataset, Some(&graphs))
+                        }
+                    },
                     Some(graphs) => merge(dataset, Some(graphs)),
                 };
                 // A store has a named graph while it holds a statement: a graph the
