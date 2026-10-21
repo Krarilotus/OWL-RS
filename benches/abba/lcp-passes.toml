@@ -3,19 +3,24 @@
 # its results. a: refactor/engine-v2 after the fix (0251a486); b: two passes over a run's entries
 # fewer (6ef779a1, fix/term-order-passes).
 #
+# Sides by full commit id: the first run (abba-lcp-passes-6ef779a1) named them by 8-digit
+# prefixes, and release_gate.py compares a pass's binaries' recorded revision with the side
+# exactly, so every pass failed its completeness check and the report gave no verdict (exit 3)
+# before computing any statistic. Same commits, same case, same hypothesis and blocks.
+#
 # The product path the loss is on: a store in memory has no stored text order, so its first
 # prefix search sorts every entry with borrowed keys (Dictionary::prefix_matches; while at most
 # 2^20 entries are uncovered, else the search scans instead). 180,000 people give about 860,000
 # terms, under that bound (the catalogue's op-strings, 300,000 people, has 1.4 M and scans). One
 # run per fresh process, so each sample of STRSTARTS is that sort; the other two queries of the
 # set (CONTAINS and LANG) don't touch the order and aren't hypotheses.
-name = "lcp-passes"
+name = "lcp-passes-full"
 host = "phuoc-yu"
 blocks = 6
 
 [sides]
-a = "0251a486"
-b = "6ef779a1"
+a = "0251a48690c7e823c9a47b1eec303debe22cfc1d"
+b = "6ef779a11e62f943895a325addf3587cfa2ee28e"
 
 [[case]]
 name = "lazy-text-order"
