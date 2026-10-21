@@ -75,10 +75,28 @@ fn replace_uses_xpath_replacement_syntax() {
         (r#"REPLACE("a$b", "\\$", "\\\\")"#, Some("a\\b")),
         (r#"REPLACE("ab", "b", "\\$")"#, Some("a$")),
         (r#"REPLACE("a.b", ".", "$1", "q")"#, Some("a$1b")),
+        (r#"REPLACE("x", "(x)", "$0/$01/$12/$99")"#, Some("x/x/x2/9")),
+        (r#"REPLACE("x", "(?:x)", "$1a")"#, Some("a")),
+        // With q the pattern is literal and x has no effect: a space is a space.
+        (r#"REPLACE("a b", " ", "_", "qx")"#, Some("a_b")),
+        (r#"REPLACE("a b", " ", "_", "xq")"#, Some("a_b")),
+        (r#"REPLACE("A.a", "a", "_", "qi")"#, Some("_._")),
+        (r#"REPLACE("a b", " ", "_", "x")"#, None),
         (r#"REPLACE("abracadabra", ".*?", "$1")"#, None),
         (r#"REPLACE("x", "x", "\\q")"#, None),
         (r#"REPLACE("x", "x", "$")"#, None),
     ] {
         assert_eq!(value(expression).as_deref(), expected, "{expression}");
     }
+}
+
+/// A group reference's number is found in one pass over its digits: a reference of 300,000
+/// leading zeros then 300,000 ones (each shorter prefix parsed again would be 9e10 digit
+/// visits) is group 1 and the ones after it.
+#[test]
+fn a_long_group_reference_is_read_in_one_pass() {
+    let digits = format!("{}{}", "0".repeat(300_000), "1".repeat(300_000));
+    let expression = format!(r#"REPLACE("x", "(x)", "${digits}")"#);
+    let expected = format!("x{}", "1".repeat(299_999));
+    assert_eq!(value(&expression), Some(expected));
 }

@@ -776,8 +776,6 @@ fn uuid() -> String {
     )
 }
 
-/// The regular expression of SPARQL's `REGEX(_, pattern, flags)`; `None` if the pattern
-/// or a flag is invalid. Flags (XPath): i, s, m, x, and q (the pattern is a literal string).
 /// XPath's replacement string (F&O 3.1 `fn:replace`) for a pattern with `groups` capturing
 /// groups, in the `regex` crate's syntax: `\$` and `\\` are a literal `$` and `\`; `$` and
 /// the digits after it are the number N of a group: N at most `groups` (0: the whole
@@ -803,15 +801,17 @@ fn xpath_replacement(replacement: &str, groups: usize) -> Option<String> {
                     return None;
                 }
                 // The longest number that names a group (or is at most 9); the digits
-                // after it are literal.
-                let mut take = digits.len();
-                let number = loop {
-                    let number: usize = digits[..take].parse().unwrap_or(usize::MAX);
-                    if number <= groups || number <= 9 || take == 1 {
-                        break number;
+                // after it are literal. A longer prefix is never a smaller number, so one
+                // pass finds it (a first digit always is at most 9).
+                let limit = groups.max(9);
+                let (mut number, mut take) = (0, 0);
+                for digit in digits.bytes() {
+                    let next = number * 10 + usize::from(digit - b'0');
+                    if next > limit {
+                        break;
                     }
-                    take -= 1;
-                };
+                    (number, take) = (next, take + 1);
+                }
                 if number <= groups {
                     out.push_str(&format!("${{{number}}}"));
                 }
@@ -823,17 +823,20 @@ fn xpath_replacement(replacement: &str, groups: usize) -> Option<String> {
     Some(out)
 }
 
+/// The regular expression of SPARQL's `REGEX(_, pattern, flags)`; `None` if the pattern
+/// or a flag is invalid. Flags (XPath): i, s, m, x, and q (the pattern is a literal string).
+/// With q only i still applies; s, m and x have no effect (F&O 3.1 §5.6.1).
 pub fn compile_regex(pattern: &str, flags: &str) -> Option<Regex> {
     let mut builder_pattern = String::new();
-    let mut literal = false;
+    let literal = flags.contains('q');
     for flag in flags.chars() {
         match flag {
-            'i' | 's' | 'm' | 'x' => {
+            'i' | 's' | 'm' | 'x' if !literal || flag == 'i' => {
                 builder_pattern.push_str("(?");
                 builder_pattern.push(flag);
                 builder_pattern.push(')');
             }
-            'q' => literal = true,
+            'i' | 's' | 'm' | 'x' | 'q' => {}
             _ => return None,
         }
     }
