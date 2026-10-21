@@ -78,7 +78,14 @@ pub(crate) struct SegmentContents {
 }
 
 pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
-    let bytes = fs::read(path)?;
+    read_open_segment(&mut File::open(path)?, path)
+}
+
+/// [`read_segment`] of a segment already open (`path` names it in errors): what it holds
+/// stays readable while the log releases or archives it.
+pub(crate) fn read_open_segment(file: &mut File, path: &Path) -> EngineResult<SegmentContents> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(file, &mut bytes)?;
     if bytes.len() < SEGMENT_MAGIC.len() {
         // Crash while creating the segment: treat it as empty and torn.
         return Ok(SegmentContents {
@@ -276,6 +283,10 @@ impl Wal {
     /// segment stays.
     pub(crate) fn release_through(&mut self, revision: u64) -> EngineResult<()> {
         self.bytes_since_checkpoint = 0;
+        #[cfg(test)]
+        if tests::FAIL_RELEASE.get() {
+            return Err(std::io::Error::other("segment release failed (a test's)").into());
+        }
         let segments = list_segments(&self.dir)?;
         for pair in segments.windows(2) {
             let ((_, path), (next_first, _)) = (&pair[0], &pair[1]);
@@ -315,4 +326,75 @@ fn create_segment(dir: &Path, first_revision: u64, magic: &[u8; 8]) -> EngineRes
     file.sync_all()?;
     super::sync_dir(dir)?;
     Ok(OpenOptions::new().append(true).open(&path)?)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    thread_local! {
+        /// Makes this thread's segment releases fail: a test's fault after a checkpoint.
+        pub(crate) static FAIL_RELEASE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A rematerialisation whose covered log segments can't be released (held, on Windows)
+    /// has published its inferences: it succeeds, and the next checkpoint that writes (after
+    /// a commit) releases them.
+    /// Reported as failed, its caller would take the published inferences for the old ones.
+    #[test]
+    fn a_published_rematerialisation_survives_a_failed_segment_release() {
+        use crate::{DurabilityConfig, Engine, EngineConfig, SyncPolicy};
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            background_maintenance: false,
+            durability: DurabilityConfig {
+                sync: SyncPolicy::EveryCommit,
+                ..DurabilityConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        let engine = Engine::open(dir.path(), config).unwrap();
+        let node = |n: &str| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{n}"));
+        let mut tx = engine.transaction();
+        let quad = nrese_rdf::Quad::new(
+            node("a"),
+            node("p"),
+            node("b"),
+            nrese_rdf::GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+        tx.commit().unwrap();
+        let segments = || {
+            super::list_segments(&super::wal_dir(dir.path()))
+                .unwrap()
+                .len()
+        };
+        let rematerialisation = engine.rematerialisation();
+        // One statement that isn't asserted (an asserted one isn't inferred: nothing would
+        // change, and nothing be published).
+        let id =
+            |n: &str| rematerialisation.intern(nrese_rdf::TermRef::NamedNode(node(n).as_ref()));
+        let inferred = vec![crate::EncodedTriple {
+            subject: id("a"),
+            predicate: id("q"),
+            object: id("b"),
+        }];
+        FAIL_RELEASE.set(true);
+        let finished = rematerialisation.finish(inferred);
+        FAIL_RELEASE.set(false);
+        assert!(finished.is_ok(), "{:?}", finished.err());
+        assert_eq!(engine.stats().inferred, 1, "published");
+        let kept = segments();
+        assert!(kept >= 2, "the covered segment is still there ({kept})");
+        // The next checkpoint that writes (after a commit; one with nothing new returns early).
+        let mut tx = engine.transaction();
+        let next = nrese_rdf::Quad::new(
+            node("c"),
+            node("p"),
+            node("d"),
+            nrese_rdf::GraphName::DefaultGraph,
+        );
+        tx.insert(next.as_ref());
+        tx.commit().unwrap();
+        engine.checkpoint().unwrap();
+        assert!(segments() < kept, "the next checkpoint released it");
+    }
 }

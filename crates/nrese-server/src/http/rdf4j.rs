@@ -396,16 +396,34 @@ pub async fn repositories(
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &authenticated).await?;
     let writable = state.runtime_posture().sparql_update_enabled;
-    let ids = std::iter::once((DEFAULT_REPOSITORY.to_owned(), Some("NRESE".to_owned())))
-        .chain(state.repositories().list());
+    // Those that didn't open at start are listed neither readable nor writable.
+    let ids = std::iter::once((
+        DEFAULT_REPOSITORY.to_owned(),
+        Some("NRESE".to_owned()),
+        state.default_unavailable().is_none(),
+    ))
+    .chain(
+        state
+            .repositories()
+            .list()
+            .into_iter()
+            .map(|(id, title)| (id, title, true)),
+    )
+    .chain(
+        state
+            .repositories()
+            .unavailable_list()
+            .into_iter()
+            .map(|(id, _)| (id, None, false)),
+    );
     let rows = ids
-        .map(|(id, title)| {
+        .map(|(id, title, open)| {
             vec![
                 literal(format!("/repositories/{id}")),
                 literal(id.as_str()),
                 literal(title.unwrap_or_else(|| format!("NRESE: {id}"))),
-                Some(Literal::from(true).into()),
-                Some(Literal::from(writable).into()),
+                Some(Literal::from(open).into()),
+                Some(Literal::from(open && writable).into()),
             ]
         })
         .collect();
@@ -530,12 +548,13 @@ async fn statements(
     let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let store = state.store();
     let (scope, infer) = (access.read_scope(), infer(&pairs));
-    // Streamed as read: a whole repository in constant memory.
-    let deadline = tokio::time::Instant::now() + state.policy().timeouts.graph_read;
+    // Streamed as read: a whole repository in constant memory, for as long as the client
+    // keeps reading.
+    let pace = super::result_stream::Pace::stalled_after(state.policy().timeouts.graph_read);
     let cancellation = nrese_store::CancellationToken::new();
     let token = cancellation.clone();
     super::result_stream::stream_blocking(
-        deadline,
+        pace,
         cancellation,
         format.media_type(),
         "reading the statements exceeded the policy timeout",
