@@ -25,7 +25,7 @@ use rayon::prelude::*;
 
 use super::batch::Store;
 use super::eval::{
-    GroundProgram, Grounding, Job, Seg, Source, derivations, instantiate_head, transitivity,
+    GroundProgram, Grounding, Job, Poller, Seg, Source, derivations, instantiate_head, transitivity,
 };
 use super::ir::{Head, Rule, Triple};
 
@@ -304,20 +304,26 @@ pub fn support_sets(
             let (job, heads, schema) = &jobs[*j];
             let mut out = Vec::new();
             let mut body = Vec::with_capacity(job.rule.body.len());
-            job.run(&source, range.clone(), &mut |bindings| {
-                body.clear();
-                body.extend(
-                    job.rule
-                        .body
-                        .iter()
-                        .map(|atom| super::eval::instantiate_head(atom, bindings)),
-                );
-                let from = premise_sets_from(&body, schema, sets_now, cap);
-                for head in heads.iter() {
-                    let fact = super::eval::instantiate_head(head, bindings);
-                    out.extend(from.iter().map(|set| (fact, set.clone())));
-                }
-            });
+            // No stop reaches the support sets' evaluation (a v1.6 follow-up, N10).
+            job.run(
+                &source,
+                range.clone(),
+                &mut Poller::never(),
+                &mut |bindings| {
+                    body.clear();
+                    body.extend(
+                        job.rule
+                            .body
+                            .iter()
+                            .map(|atom| super::eval::instantiate_head(atom, bindings)),
+                    );
+                    let from = premise_sets_from(&body, schema, sets_now, cap);
+                    for head in heads.iter() {
+                        let fact = super::eval::instantiate_head(head, bindings);
+                        out.extend(from.iter().map(|set| (fact, set.clone())));
+                    }
+                },
+            );
             out
         }));
         // Per head: its new sets merged into its old ones.
@@ -618,9 +624,12 @@ where
         .flat_map_iter(|(j, range)| {
             let (k, job) = &jobs[*j];
             let mut out = Vec::new();
-            job.run(source, range.clone(), &mut |bindings| {
-                emit(*k, bindings, &mut out)
-            });
+            job.run(
+                source,
+                range.clone(),
+                &mut Poller::never(),
+                &mut |bindings| emit(*k, bindings, &mut out),
+            );
             out
         })
         .collect()

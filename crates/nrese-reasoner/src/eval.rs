@@ -317,7 +317,13 @@ pub fn guards_hold(guards: &[Guard], bindings: &[Option<u64>]) -> bool {
         .all(|guard| guard.holds(|term| value(term, bindings)))
 }
 
-/// Evaluates `order[depth..]` of `body`, calling `emit` for each complete binding.
+/// Evaluates `order[depth..]` of `body`, calling `emit` for each complete binding. Each
+/// fact it scans, bound or not, is one unit `poll` counts; once the stop has fired, the rest
+/// of each scan under way is passed over (a scan can't be stopped) and nothing deeper is
+/// scanned, so one driver's fan-out can't outlive the stop by more than [`POLL_UNITS`].
+///
+/// [`POLL_UNITS`]: nrese_exec::POLL_UNITS
+#[allow(clippy::too_many_arguments)]
 pub fn walk<S: Source + ?Sized>(
     source: &S,
     body: &[Atom],
@@ -325,6 +331,7 @@ pub fn walk<S: Source + ?Sized>(
     order: &[(usize, Seg)],
     depth: usize,
     bindings: &mut [Option<u64>],
+    poll: &mut Poller<'_>,
     emit: &mut dyn FnMut(&[Option<u64>]),
 ) {
     let Some(&(index, seg)) = order.get(depth) else {
@@ -335,8 +342,11 @@ pub fn walk<S: Source + ?Sized>(
     };
     let atom = &body[index];
     source.scan(pattern(atom, bindings), seg, &mut |fact| {
+        if poll.tick() {
+            return;
+        }
         if let Some(newly) = bind(atom, fact, bindings) {
-            walk(source, body, guards, order, depth + 1, bindings, emit);
+            walk(source, body, guards, order, depth + 1, bindings, poll, emit);
             unbind(atom, newly, bindings);
         }
     });
@@ -545,6 +555,8 @@ pub fn ground<S: Source + ?Sized>(
         &order,
         0,
         &mut bindings,
+        // Grounding runs to its end: a program grounded part-way would be kept as if whole.
+        &mut Poller::never(),
         &mut |substitution| {
             if let Some(grounded) = instance(rule, &instance_atoms, substitution) {
                 emit(grounded);
@@ -587,6 +599,7 @@ pub fn ground_delta<S: Source + ?Sized>(
             &order,
             0,
             &mut bindings,
+            &mut Poller::never(),
             &mut |substitution| {
                 if let Some(grounded) = instance(rule, &instance_atoms, substitution) {
                     emit(grounded);
@@ -708,16 +721,22 @@ impl<'r> Job<'r> {
         }
     }
 
-    /// Runs the variant for `drivers[range]`, calling `emit` with each complete binding.
+    /// Runs the variant for `drivers[range]`, calling `emit` with each complete binding,
+    /// counting each driver and each fact the walk scans on `poll` ([`walk`]): once it has
+    /// fired, the rest is passed over and `poll` says so.
     pub fn run<S: Source + ?Sized>(
         &self,
         source: &S,
         range: std::ops::Range<usize>,
+        poll: &mut Poller<'_>,
         emit: &mut dyn FnMut(&[Option<u64>]),
     ) {
         let mut bindings = vec![None; self.rule.variables()];
         let driver = &self.rule.body[self.order[0].0];
         let mut visit = |fact: Triple| {
+            if poll.tick() {
+                return;
+            }
             if let Some(newly) = bind(driver, fact, &mut bindings) {
                 walk(
                     source,
@@ -726,6 +745,7 @@ impl<'r> Job<'r> {
                     &self.order,
                     1,
                     &mut bindings,
+                    poll,
                     emit,
                 );
                 unbind(driver, newly, &mut bindings);
@@ -740,9 +760,51 @@ impl<'r> Job<'r> {
 
 /// Runs `jobs` in parallel morsels; returns the facts their heads derive that `keep`
 /// accepts (typically: not yet in the source).
-/// Asked between units of work: `true` means stop (the caller gave up). Polling it is an
-/// atomic load in practice, so it is checked per morsel.
+/// Asked between units of work: `true` means stop (the caller gave up). It is asked at each
+/// morsel's start and, through a [`Poller`], every [`POLL_UNITS`] facts a morsel scans.
+///
+/// [`POLL_UNITS`]: nrese_exec::POLL_UNITS
 pub type Stop<'a> = &'a (dyn Fn() -> bool + Sync);
+
+/// What [`walk`] and [`Job::run`] poll a [`Stop`] with: nrese-exec's [`Ticker`] over it, one
+/// unit per fact scanned, and whether it has fired. One per morsel (a rayon task).
+///
+/// [`Ticker`]: nrese_exec::Ticker
+pub struct Poller<'a> {
+    ticker: nrese_exec::Ticker<Stop<'a>>,
+    stopped: bool,
+}
+
+impl<'a> Poller<'a> {
+    /// A poller of `stop`, or `None` if it has fired already.
+    pub fn new(stop: Stop<'a>) -> Option<Self> {
+        nrese_exec::Ticker::new(stop).ok().map(|ticker| Self {
+            ticker,
+            stopped: false,
+        })
+    }
+
+    /// One that never fires, for work that has to run to its end (grounding: a program
+    /// grounded part-way would be kept as if whole).
+    pub fn never() -> Self {
+        Self::new(NEVER).expect("NEVER doesn't stop")
+    }
+
+    /// Whether the stop fired: what was found since is incomplete.
+    pub fn stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// Counts one unit; true once the stop has fired. The common path is a test of
+    /// `stopped` and the ticker's countdown: no call, no atomic.
+    #[inline]
+    fn tick(&mut self) -> bool {
+        if !self.stopped && self.ticker.tick(1).is_err() {
+            self.stopped = true;
+        }
+        self.stopped
+    }
+}
 
 fn never() -> bool {
     false
@@ -886,12 +948,12 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
             let Head::Facts(heads) = &job.rule.head else {
                 return finish(*j, Vec::new());
             };
-            if stop() {
+            let Some(mut poll) = Poller::new(stop) else {
                 return finish(*j, Vec::new());
-            }
+            };
             let mut out = Vec::new();
             let mut enumerated = 0u64;
-            job.run(source, range.clone(), &mut |bindings| {
+            job.run(source, range.clone(), &mut poll, &mut |bindings| {
                 enumerated += 1;
                 for head in heads {
                     let fact = instantiate_head(head, bindings);
@@ -906,6 +968,10 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                     }
                 }
             });
+            // Stopped part-way: the caller discards the round (it asks the stop again).
+            if poll.stopped() {
+                return finish(*j, Vec::new());
+            }
             // The morsel's duplicates go before `keep` probes the source, and the probes
             // run in (predicate, subject, object) order: about half of an OWL 2 RL round's
             // candidates repeat within it, and sorted probes let a store read a relation's
@@ -1759,6 +1825,45 @@ mod tests {
         fn contains(&self, fact: Triple) -> bool {
             self.facts.contains(&fact)
         }
+    }
+
+    /// One driver whose body joins two atoms of `n` matches each is n² bindings in one
+    /// morsel. A stop that fires once the morsel has started ends it within `POLL_UNITS`
+    /// scanned facts (plus the scans under way), not after the whole product (RSH-18).
+    #[test]
+    fn a_morsel_stops_within_its_poll_interval() {
+        let n = 300u64;
+        let mut facts = vec![[1, 11, 2]];
+        facts.extend((0..n).map(|i| [100 + i, 12, 1000 + i]));
+        let source = Counting {
+            facts,
+            scans: AtomicUsize::new(0),
+            matches: AtomicUsize::new(0),
+        };
+        let var = Term::Var;
+        let rule = Rule {
+            name: "product".into(),
+            body: vec![
+                Atom([var(0), Term::Const(11), var(1)]),
+                Atom([var(2), Term::Const(12), var(3)]),
+                Atom([var(4), Term::Const(12), var(5)]),
+            ],
+            guards: vec![],
+            head: Head::Facts(vec![Atom([var(0), Term::Const(13), var(5)])]),
+        };
+        let jobs: Vec<Job<'_>> = Job::full(&source, &rule).into_iter().collect();
+        assert_eq!(jobs[0].drivers(), 1, "one driver, one morsel");
+        let asks = AtomicUsize::new(0);
+        // Not at the morsel's start; at every ask after it.
+        let stop = || asks.fetch_add(1, Ordering::Relaxed) >= 1;
+        let _ = run_jobs(&source, &jobs, &|_| true, &stop);
+        let scanned = source.matches.load(Ordering::Relaxed);
+        let bound = nrese_exec::POLL_UNITS as usize + 2 * n as usize;
+        assert!(
+            scanned <= bound,
+            "{scanned} facts scanned after a stop (bound {bound}; the product is {})",
+            n * n + n
+        );
     }
 
     #[test]
