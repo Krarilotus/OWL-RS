@@ -15,8 +15,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use nrese_exec::{Budget, BudgetExceeded, Reservation};
-use nrese_vector::{Hit, Metric, Vectors};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
+
+use super::TermId;
+use nrese_vector::{Metric, Vectors};
 use parking_lot::RwLock;
 
 /// How a search finds its vectors. Every search is exact over the vectors the reader
@@ -109,8 +111,10 @@ pub struct VectorSearchReport {
 pub(crate) struct VectorIndex {
     /// Dictionary entries up to here are in the spaces.
     covered: u64,
-    /// The vectors of each dimension.
-    spaces: BTreeMap<usize, Vectors>,
+    /// The vectors of each dimension, shared with the searches reading them (a search takes
+    /// an `Arc`, so it copies nothing the size of the space; a later extension copies the
+    /// space's chunk list if a search still holds it).
+    spaces: BTreeMap<usize, Arc<Vectors>>,
 }
 
 impl VectorIndex {
@@ -124,22 +128,26 @@ impl VectorIndex {
             let Ok(vector) = nrese_vector::parse(lexical) else {
                 continue;
             };
-            self.spaces
+            let space = self
+                .spaces
                 .entry(vector.len())
-                .or_insert_with(|| Vectors::new(vector.len()))
-                .push(id, &vector);
+                .or_insert_with(|| Arc::new(Vectors::new(vector.len())));
+            Arc::make_mut(space).push(id, &vector);
         }
         self.covered = end;
     }
 
     /// Whether no space has a vector.
     pub(crate) fn is_empty(&self) -> bool {
-        self.spaces.values().all(Vectors::is_empty)
+        self.spaces.values().all(|vectors| vectors.is_empty())
     }
 
     /// Bytes of the vectors.
     pub(crate) fn memory_bytes(&self) -> usize {
-        self.spaces.values().map(Vectors::memory_bytes).sum()
+        self.spaces
+            .values()
+            .map(|vectors| vectors.memory_bytes())
+            .sum()
     }
 
     /// The index as bytes ([`super::derived`]).
@@ -178,7 +186,7 @@ impl VectorIndex {
                 let values = input.f32s(dimension)?;
                 vectors.push(id, &values);
             }
-            spaces.insert(dimension, vectors);
+            spaces.insert(dimension, Arc::new(vectors));
         }
         input.is_done().then_some(Self { covered, spaces })
     }
@@ -187,59 +195,126 @@ impl VectorIndex {
 /// The version of [`VectorIndex::write`]'s layout (1 held graphs).
 const VECTOR_FORMAT: u32 = 2;
 
-/// The `query.k` vectors nearest to `query.vector` that `accept` takes (by id), nearest
-/// first (ties by id), compared with every one of them. The space's vectors are a cheap
-/// copy (shared chunks) taken under `index`'s read lock and scanned after it: the scans
-/// are parallel, and a pool thread waiting for the lock (a writer queued, a search's
-/// `accept` re-entering) must never hold up a part of the search. Refused before it
-/// allocates if it would hold more hits than [`VectorQuery::max_hits`], or if what the
-/// scan holds besides the vectors (charged to `budget` first, for the search's duration)
-/// doesn't fit; stopped at the next part once [`VectorQuery::stop`] is set.
+/// The vector literals a search found, nearest first, held on the budget their room was
+/// charged to until they drop ([`search`]).
+#[derive(Debug)]
+pub struct VectorHits {
+    /// Before the charge: fields drop in order, the hits first.
+    hits: Vec<(TermId, f32)>,
+    _charge: Reservation,
+}
+
+impl VectorHits {
+    /// No hits (nothing allocated).
+    fn empty(budget: &Arc<Budget>) -> Self {
+        Self {
+            hits: Vec::new(),
+            _charge: Reservation::new(Arc::clone(budget)),
+        }
+    }
+}
+
+impl Default for VectorHits {
+    /// No hits, held on no budget.
+    fn default() -> Self {
+        Self::empty(&Arc::new(Budget::unlimited()))
+    }
+}
+
+impl std::ops::Deref for VectorHits {
+    type Target = [(TermId, f32)];
+
+    fn deref(&self) -> &[(TermId, f32)] {
+        &self.hits
+    }
+}
+
+impl PartialEq for VectorHits {
+    fn eq(&self, other: &Self) -> bool {
+        self.hits == other.hits
+    }
+}
+
+impl<'a> IntoIterator for &'a VectorHits {
+    type Item = &'a (TermId, f32);
+    type IntoIter = std::slice::Iter<'a, (TermId, f32)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.hits.iter()
+    }
+}
+
+/// The `query.k` vectors nearest to `query.vector` among those `eligible` takes that `accept`
+/// takes too (by id), nearest first (ties by id), compared with every one of them. Only what
+/// the reader may read decides anything a caller sees: its admission (refused past
+/// [`VectorQuery::max_hits`] or the budget) and what it holds from `bound`, its number of
+/// documents (at least its eligible vectors; the corpus's own count), its report from the
+/// eligible vectors the scan counts as it tests them, its hits from them; the others cost
+/// the scan's time alone. The
+/// space's vectors are shared (an `Arc`), taken under `index`'s read lock and scanned after
+/// it: the scans are parallel, and a pool thread waiting for the lock (a writer queued, a
+/// search's `accept` re-entering) must never hold up a part of the search. What the scan
+/// holds besides the vectors is charged to `budget` before it is allocated; the hits keep
+/// their charge until they drop. Stopped at the next chunk once [`VectorQuery::stop`] is set.
 pub(crate) fn search(
     index: &RwLock<VectorIndex>,
     query: &VectorQuery,
+    eligible: &(dyn Fn(u64) -> bool + Sync),
+    bound: usize,
     accept: &(dyn Fn(u64) -> bool + Sync),
     budget: &Arc<Budget>,
-) -> Result<(Vec<Hit>, VectorSearchReport), VectorStop> {
+) -> Result<(VectorHits, VectorSearchReport), VectorStop> {
     query.stopped()?;
-    let mut scan = Reservation::new(Arc::clone(budget));
-    let vectors = {
-        let index = index.read();
-        match index.spaces.get(&query.vector.len()) {
-            Some(vectors) => {
-                query.fits(nrese_vector::exact_held(query.k, 0, vectors.len()))?;
-                scan.charge(nrese_vector::exact_bytes(vectors, query.k))
-                    .map_err(VectorStop::Memory)?;
-                Some(vectors.clone())
-            }
-            None => None,
-        }
+    let vectors = index.read().spaces.get(&query.vector.len()).cloned();
+    let none = VectorSearchReport {
+        space: 0,
+        graph: false,
+        scanned: 0,
     };
     let Some(vectors) = vectors else {
-        let report = VectorSearchReport {
-            space: 0,
-            graph: false,
-            scanned: 0,
-        };
-        return Ok((Vec::new(), report));
+        return Ok((VectorHits::empty(budget), none));
     };
+    query.fits(nrese_vector::scan_held(query.k, bound))?;
+    let mut scan = Reservation::new(Arc::clone(budget));
+    scan.charge(nrese_vector::scan_bytes(query.k, bound))
+        .map_err(VectorStop::Memory)?;
     let stop = query.stop.as_deref();
-    let hits = nrese_vector::exact_from_until(
+    let (hits, n) = nrese_vector::exact_scan(
         &vectors,
-        0,
         &query.vector,
         query.k,
         query.metric,
+        eligible,
         accept,
+        bound,
         stop,
     );
     query.stopped()?;
+    // The answer's own room, charged before it is made; the scan's goes after its hits.
+    let mut found =
+        ChargedVec::with_capacity(Arc::clone(budget), hits.len()).map_err(VectorStop::Memory)?;
+    found
+        .extend_bounded(
+            hits.len(),
+            hits.iter()
+                .map(|hit| (TermId::from_raw(hit.id), hit.distance)),
+        )
+        .map_err(VectorStop::Memory)?;
+    drop(hits);
+    drop(scan);
+    let (hits, charge) = found.into_parts();
     let report = VectorSearchReport {
-        space: vectors.len(),
+        space: n,
         graph: false,
-        scanned: vectors.len(),
+        scanned: n,
     };
-    Ok((hits, report))
+    Ok((
+        VectorHits {
+            hits,
+            _charge: charge,
+        },
+        report,
+    ))
 }
 
 #[cfg(test)]
@@ -275,7 +350,7 @@ mod tests {
         };
         let query = VectorQuery::new(vec![1.0, 2.0, 3.0, 1.0], 10);
         let budget = Arc::new(Budget::unlimited());
-        let (hits, _) = search(&index, &query, &accept, &budget).unwrap();
+        let (hits, _) = search(&index, &query, &|_| true, lexical.len(), &accept, &budget).unwrap();
         assert_eq!(hits.len(), 10);
         assert!(
             !held.load(Ordering::Relaxed),
@@ -293,16 +368,17 @@ mod tests {
             vectors.push(id as u64, &[id as f32]);
         }
         let mut index = VectorIndex::default();
-        index.spaces.insert(1, vectors);
+        index.spaces.insert(1, Arc::new(vectors));
         let index = RwLock::new(index);
         let budget = Arc::new(Budget::unlimited());
-        let search = |query: &VectorQuery| super::search(&index, query, &|_| true, &budget);
+        let search =
+            |query: &VectorQuery| super::search(&index, query, &|_| true, n, &|_| true, &budget);
         let exact = |k, max_hits, stop: Option<bool>| VectorQuery {
             max_hits,
             stop: stop.map(|s| Arc::new(AtomicBool::new(s))),
             ..VectorQuery::new(vec![0.5], k)
         };
-        let held = nrese_vector::exact_held(usize::MAX, 0, n);
+        let held = nrese_vector::scan_held(usize::MAX, n);
         assert_eq!(
             search(&exact(usize::MAX, Some(held - 1), None)).unwrap_err(),
             VectorStop::TooLarge { hits: held }
@@ -314,7 +390,8 @@ mod tests {
                 .len(),
             n
         );
-        assert_eq!(search(&exact(10, Some(100), None)).unwrap().0.len(), 10);
+        let held = nrese_vector::scan_held(10, n);
+        assert_eq!(search(&exact(10, Some(held), None)).unwrap().0.len(), 10);
         assert_eq!(
             search(&exact(10, None, Some(true))).unwrap_err(),
             VectorStop::Cancelled

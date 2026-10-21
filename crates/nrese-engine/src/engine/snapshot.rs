@@ -1570,7 +1570,7 @@ impl Snapshot {
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
         budget: Option<&Arc<nrese_exec::Budget>>,
-    ) -> Result<(Vec<(TermId, f32)>, crate::VectorSearchReport), crate::VectorStop> {
+    ) -> Result<(crate::VectorHits, crate::VectorSearchReport), crate::VectorStop> {
         let unbounded;
         let request = match budget {
             Some(budget) => budget,
@@ -1584,15 +1584,18 @@ impl Snapshot {
         let corpus = self
             .text_corpus(Documents::Vectors, model, scope, Some(request))
             .map_err(crate::VectorStop::Memory)?;
-        let accept = |id: TermId| corpus.contains(id.payload()) && accept(id);
-        let (hits, report) =
-            self.dictionary
-                .vector_search(query, self.version.dictionary_len, &accept, request)?;
-        let hits = hits
-            .into_iter()
-            .map(|hit| (TermId::from_raw(hit.id), hit.distance))
-            .collect();
-        Ok((hits, report))
+        // The corpus decides what the search admits, holds and reports; `accept` narrows
+        // its hits.
+        let eligible = |id: TermId| corpus.contains(id.payload());
+        let bound = usize::try_from(corpus.documents()).unwrap_or(usize::MAX);
+        self.dictionary.vector_search(
+            query,
+            self.version.dictionary_len,
+            &eligible,
+            bound,
+            accept,
+            request,
+        )
     }
 
     /// [`Self::vector_search_in`] over every graph, asserted and inferred.
@@ -1600,7 +1603,7 @@ impl Snapshot {
         &self,
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
-    ) -> Result<(Vec<(TermId, f32)>, crate::VectorSearchReport), crate::VectorStop> {
+    ) -> Result<(crate::VectorHits, crate::VectorSearchReport), crate::VectorStop> {
         self.vector_search_in(
             ReadModel::Materialised,
             &TextScope::EVERY,

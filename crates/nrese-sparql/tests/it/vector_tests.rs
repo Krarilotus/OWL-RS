@@ -534,3 +534,60 @@ fn a_huge_k_past_the_budget_fails_cleanly_and_leaves_nothing_charged() {
     assert_eq!(server.used(), 0);
     assert_eq!(count(&QueryOptions::default(), &huge).unwrap(), 20_000);
 }
+
+fn embedding(i: usize, graph: GraphName) -> Quad {
+    Quad::new(
+        NamedNode::new_unchecked(format!("urn:item:{i}")),
+        NamedNode::new_unchecked("urn:embedding"),
+        Literal::new_typed_literal(
+            format!("[{i}]"),
+            NamedNode::new_unchecked(nrese_engine::vector::DATATYPE),
+        ),
+        graph,
+    )
+}
+
+/// A one-row vector query answers alike whatever the reader may not read: 10,000 vectors in
+/// a graph outside its access, committed after its snapshot or visible to a later one,
+/// don't turn it into a memory error sized by them (Sol's review of W2, r1 F1).
+#[test]
+fn unreadable_vectors_change_no_query_outcome() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    tx.insert(embedding(0, GraphName::DefaultGraph).as_ref());
+    tx.commit().unwrap();
+    let old = engine.snapshot();
+    let options = QueryOptions {
+        access: Some(Arc::new(nrese_sparql::GraphAccess {
+            default_graph: true,
+            ..nrese_sparql::GraphAccess::default()
+        })),
+        resources: nrese_sparql::Resources {
+            memory: nrese_exec::Envelope::new(Some(256 << 10), None),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let count =
+        |snapshot: &nrese_engine::Snapshot| -> Result<usize, nrese_sparql::QueryEvaluationError> {
+            let query = SparqlParser::new()
+            .parse_query(&format!(
+                "{PREFIXES}SELECT ?v WHERE {{ SERVICE nrv:search {{ ?v nrv:near \"[0]\"^^nrv:vector ; nrv:k 18446744073709551615 ; nrv:exact true }} }}"
+            ))
+            .unwrap();
+            let QueryResults::Solutions(rows) = evaluate_query(snapshot, &query, &options)? else {
+                panic!("solutions")
+            };
+            rows.map(|row| row.map(|_| ()))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|rows| rows.len())
+        };
+    assert_eq!(count(&old).unwrap(), 1);
+    let mut tx = engine.transaction();
+    for i in 1..10_001 {
+        tx.insert(embedding(i, NamedNode::new_unchecked("urn:private").into()).as_ref());
+    }
+    tx.commit().unwrap();
+    assert_eq!(count(&old).unwrap(), 1);
+    assert_eq!(count(&engine.snapshot()).unwrap(), 1);
+}
