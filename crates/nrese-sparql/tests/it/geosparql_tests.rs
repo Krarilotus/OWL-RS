@@ -216,17 +216,91 @@ fn measures_in_metres_and_degrees() {
         )
         .is_none()
     );
-    // In a projected system, measures are in its own unit.
-    let projected = number(
-        &engine,
-        &format!(
-            "geof:distance({}, {}, uom:metre)",
-            wkt("<http://www.opengis.net/def/crs/EPSG/0/3857> POINT(0 0)"),
-            wkt("<http://www.opengis.net/def/crs/EPSG/0/3857> POINT(300 400)")
-        ),
-    )
-    .unwrap();
-    assert!((projected - 500.0).abs() < 1e-9);
+    // A projected system whose axes are known to be in metres measures in metres; another
+    // unit, or a system whose unit isn't known, is refused, never answered with the raw
+    // coordinate measure in whatever unit was asked (SPR-19: 300 in metres and in degrees
+    // alike).
+    let in_crs = |crs: &str, text: &str| {
+        wkt(&format!(
+            "<http://www.opengis.net/def/crs/EPSG/0/{crs}> {text}"
+        ))
+    };
+    let (a, b) = (
+        in_crs("3857", "POINT(0 0)"),
+        in_crs("3857", "LINESTRING(300 400, 300 0)"),
+    );
+    let square = in_crs("3857", "POLYGON((0 0, 10 0, 10 10, 0 10, 0 0))");
+    let measured =
+        |expression: String| number(&engine, &expression).unwrap_or_else(|| panic!("{expression}"));
+    assert_eq!(
+        measured(format!("geof:distance({a}, {b}, uom:metre)")),
+        300.0
+    );
+    assert_eq!(measured(format!("geof:length({b}, uom:metre)")), 400.0);
+    assert_eq!(
+        measured(format!("geof:area({square}, uom:squareMetre)")),
+        100.0
+    );
+    let disc = measured(format!(
+        "geof:area(geof:buffer({a}, 1, uom:metre), uom:squareMetre)"
+    ));
+    assert!((3.0..3.2).contains(&disc), "{disc}");
+    // The same system under its other EPSG identifier forms (a dataset version, GML's
+    // versioned URN and legacy URL) measures as well; another code, or a suffix that isn't
+    // one, under them doesn't.
+    let points = |of: &dyn Fn(f64) -> String| {
+        format!("geof:distance({}, {}, uom:metre)", of(0.0), of(300.0))
+    };
+    let versioned = |x: f64| {
+        wkt(&format!(
+            "<http://www.opengis.net/def/crs/EPSG/8.9.2/3857> POINT({x} 0)"
+        ))
+    };
+    let gml = |srs: &'static str| {
+        move |x: f64| {
+            format!(
+                "'<gml:Point xmlns:gml=\"http://www.opengis.net/gml/3.2\" srsName=\"{srs}\"><gml:pos>{x} 0</gml:pos></gml:Point>'^^geo:gmlLiteral"
+            )
+        }
+    };
+    for measure in [
+        points(&versioned),
+        points(&gml("urn:ogc:def:crs:EPSG:6.18:3:3857")),
+        points(&gml("http://www.opengis.net/gml/srs/epsg.xml#3857")),
+    ] {
+        assert_eq!(measured(measure), 300.0);
+    }
+    let (c, d) = (
+        in_crs("2056", "POINT(0 0)"),
+        in_crs("2056", "POINT(300 400)"),
+    );
+    for refused in [
+        format!("geof:distance({a}, {b}, uom:degree)"),
+        format!("geof:length({b}, uom:radian)"),
+        format!("geof:area({square}, uom:degree)"),
+        format!("geof:buffer({a}, 1, uom:degree)"),
+        format!("geof:distance({c}, {d}, uom:metre)"),
+        format!("geof:area(geof:envelope({c}), uom:squareMetre)"),
+        points(&|x| {
+            wkt(&format!(
+                "<http://www.opengis.net/def/crs/EPSG/8.9.2/2056> POINT({x} 0)"
+            ))
+        }),
+        points(&|x| {
+            wkt(&format!(
+                "<http://www.opengis.net/def/crs/EPSG/0/3857x> POINT({x} 0)"
+            ))
+        }),
+    ] {
+        assert!(
+            select(
+                &engine,
+                &format!("SELECT ?v WHERE {{ BIND({refused} AS ?v) }}")
+            )[0][0]
+                .is_none(),
+            "{refused}"
+        );
+    }
 }
 
 #[test]
