@@ -237,7 +237,7 @@ mod imp {
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
-        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        IsProcessInJob, JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
         JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOBOBJECTINFOCLASS,
         JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     };
@@ -366,10 +366,17 @@ mod imp {
     /// process's own committed memory. `Some(None)` outside a job or without a limit; `None`
     /// where a limit is set whose use can't be read.
     pub(super) fn job_left() -> Option<Option<u64>> {
-        let Some(limits) = job_limits() else {
-            return Some(None);
-        };
-        super::job_left_from(limits, job_committed, super::process_bytes)
+        super::job_left_from(in_job(), job_limits, job_committed, super::process_bytes)
+    }
+
+    /// Whether the process runs in a job object; `None` where that can't be asked. Told
+    /// apart from a failed query of the job's limits, which outside a job fails too.
+    fn in_job() -> Option<bool> {
+        let mut result = 0;
+        // SAFETY: the current process's pseudo-handle needs no closing; a null job handle asks
+        // about any job; `result` is a valid, writable BOOL.
+        let ok = unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut result) };
+        (ok != 0).then_some(result != 0)
     }
 
     /// The memory the processes of the job object the process runs in commit now: the sum
@@ -592,16 +599,23 @@ fn left(limits: impl IntoIterator<Item = Option<(u64, u64)>>) -> Option<u64> {
     )
 }
 
-/// What a Windows job object's limits leave, from its job-wide and per-process limits (those
-/// set) and readings of what each counts: the job's committed memory and the process's own.
-/// `Some(None)`: no limit is set; `None`: a limit is set and what it counts can't be read, so
-/// what is left isn't known (Sol, measure-pool r2: not the machine's).
+/// What a Windows job object's limits leave, from whether the process is in a job, the job's
+/// job-wide and per-process limits (those set), and readings of what each counts: the job's
+/// committed memory and the process's own. `Some(None)`: no job, or no limit set; `None`: in a
+/// job whose limits can't be read, or with a limit whose use can't be read, or where whether
+/// it is in a job can't be asked, so what is left isn't known (Sol, measure-pool r2 and r3:
+/// not the machine's).
 #[cfg(any(windows, test))]
 fn job_left_from(
-    [job_wide, per_process]: [Option<u64>; 2],
+    in_job: Option<bool>,
+    limits: impl FnOnce() -> Option<[Option<u64>; 2]>,
     job_committed: impl FnOnce() -> Option<u64>,
     own_committed: impl FnOnce() -> Option<u64>,
 ) -> Option<Option<u64>> {
+    if !in_job? {
+        return Some(None);
+    }
+    let [job_wide, per_process] = limits()?;
     let job_wide = match job_wide {
         Some(limit) => Some((limit, job_committed()?)),
         None => None,
@@ -900,20 +914,46 @@ mod tests {
     }
 
     /// A job whose limit counts something that can't be read leaves what isn't known, and so
-    /// does the remaining memory, not the machine's (Sol, measure-pool r2); a job without a
-    /// limit leaves the machine's.
+    /// does the remaining memory, not the machine's (Sol, measure-pool r2), and so does a job
+    /// whose limits can't be read (r3); a job without a limit, or no job, leaves the machine's.
     #[test]
     fn an_unreadable_job_leaves_what_isnt_known() {
         const G: u64 = 1 << 30;
         let read = |bytes: u64| move || Some(bytes);
         let refused = || None;
         assert_eq!(
-            job_left_from([Some(8 * G), None], read(5 * G), refused),
+            job_left_from(
+                Some(true),
+                || Some([Some(8 * G), None]),
+                read(5 * G),
+                refused
+            ),
             Some(Some(3 * G))
         );
-        assert_eq!(job_left_from([Some(8 * G), None], refused, read(G)), None);
-        assert_eq!(job_left_from([None, Some(4 * G)], read(G), refused), None);
-        assert_eq!(job_left_from([None, None], refused, refused), Some(None));
+        assert_eq!(
+            job_left_from(Some(true), || Some([Some(8 * G), None]), refused, read(G)),
+            None
+        );
+        assert_eq!(
+            job_left_from(Some(true), || Some([None, Some(4 * G)]), read(G), refused),
+            None
+        );
+        assert_eq!(
+            job_left_from(Some(true), || Some([None, None]), refused, refused),
+            Some(None)
+        );
+        // In a job whose limits can't be read, or where membership can't be asked: unknown,
+        // not taken for no job (Sol, measure-pool r3); outside a job: no limit.
+        let no_limits = || None;
+        assert_eq!(job_left_from(Some(true), no_limits, refused, refused), None);
+        assert_eq!(
+            job_left_from(None, || Some([None, None]), refused, refused),
+            None
+        );
+        assert_eq!(
+            job_left_from(Some(false), no_limits, refused, refused),
+            Some(None)
+        );
         assert_eq!(windows_remaining(Some(16 * G), None), None);
         assert_eq!(windows_remaining(Some(16 * G), Some(None)), Some(16 * G));
         assert_eq!(
