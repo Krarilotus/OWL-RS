@@ -293,3 +293,22 @@ struct ProblemJson {
     detail: String,
     reasoner_reject: Option<RejectExplanationView>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A retryable refusal (busy, or a write that met a reconfiguration) is told when to send
+    /// it again; a plain unavailability isn't.
+    #[test]
+    fn a_retryable_refusal_says_when_to_retry() {
+        let response = ApiError::busy("reconfigured").into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        let plain = ApiError::unavailable("down").into_response();
+        assert!(plain.headers().get(header::RETRY_AFTER).is_none());
+    }
+}

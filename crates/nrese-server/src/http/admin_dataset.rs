@@ -11,59 +11,75 @@ use crate::http::media::{header_value_str, media_type_matches};
 use crate::http::mutation;
 use crate::http::request_metrics::BackupKind;
 use crate::http::responses::build_admin_restore_response;
+use crate::http::result_stream::{Pace, stream_blocking};
 use crate::state::AppState;
 
 const BACKUP_FORMAT_HEADER: &str = "x-nrese-backup-format";
 const SOURCE_REVISION_HEADER: &str = "x-nrese-source-revision";
 const QUAD_COUNT_HEADER: &str = "x-nrese-quad-count";
+/// A trailer of the export: its SHA-256, as its closing comment holds it.
 const CHECKSUM_HEADER: &str = "x-nrese-checksum-sha256";
 
+/// The N-Quads export of every asserted statement, streamed as it is read: a whole store in
+/// constant memory, for as long as the client keeps reading. Its revision and statement
+/// count go in the headers; its SHA-256 closes the body as a comment
+/// (`# nrese-sha256 <hex>`) and follows it as the trailer [`CHECKSUM_HEADER`], announced in
+/// `Trailer` (HTTP/1.1 clients send `TE: trailers` to receive it).
 pub async fn backup(state: AppState) -> Result<Response, ApiError> {
     state.ensure_serving()?;
-
-    let store = state.store();
+    // Administrators only (the caller's guard): every graph.
+    let export = state
+        .store()
+        .dataset_export(&nrese_store::ReadScope::All, DatasetBackupFormat::NQuads)
+        .map_err(map_backup_error)?;
+    let (revision, quads) = (export.source_revision, export.quad_count);
+    let cancellation = nrese_store::CancellationToken::new();
+    let token = cancellation.clone();
+    let metrics = state.clone();
     let started = std::time::Instant::now();
-    let artifact =
-        // Administrators only (the caller's guard): every graph.
-        tokio::task::spawn_blocking(move || {
-            store.export_dataset(&nrese_store::ReadScope::All, DatasetBackupFormat::NQuads)
-        })
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))
-            .and_then(|result| result.map_err(map_backup_error));
-    state.request_metrics().record_backup(
-        BackupKind::Dump,
-        artifact
-            .as_ref()
-            .ok()
-            .map(|artifact| artifact.payload.len() as u64),
-        started.elapsed(),
-    );
-    let artifact = artifact?;
-
-    let mut response = (StatusCode::OK, artifact.payload).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/n-quads"),
-    );
-    insert_header(response.headers_mut(), BACKUP_FORMAT_HEADER, "n-quads")?;
-    insert_header(
-        response.headers_mut(),
-        SOURCE_REVISION_HEADER,
-        &artifact.source_revision.to_string(),
-    )?;
-    insert_header(
-        response.headers_mut(),
-        QUAD_COUNT_HEADER,
-        &artifact.quad_count.to_string(),
-    )?;
-    insert_header(
-        response.headers_mut(),
-        CHECKSUM_HEADER,
-        &artifact.checksum_sha256,
-    )?;
-
+    let mut response = stream_blocking(
+        Pace::stalled_after(state.policy().timeouts.graph_read),
+        cancellation,
+        "application/n-quads",
+        "the export's client stopped reading (timeouts.graph_read)",
+        move |out| {
+            let mut counted = Counting(&mut *out, 0);
+            let written = export.write(&token, &mut counted);
+            let bytes = counted.1;
+            metrics.request_metrics().record_backup(
+                BackupKind::Dump,
+                written.as_ref().ok().map(|_| bytes),
+                started.elapsed(),
+            );
+            let checksum = written.map_err(map_backup_error)?;
+            let mut trailers = HeaderMap::new();
+            insert_header(&mut trailers, CHECKSUM_HEADER, &checksum)?;
+            out.trailers(trailers)
+                .map_err(|error| ApiError::internal(error.to_string()))
+        },
+    )
+    .await?;
+    let headers = response.headers_mut();
+    insert_header(headers, BACKUP_FORMAT_HEADER, "n-quads")?;
+    insert_header(headers, SOURCE_REVISION_HEADER, &revision.to_string())?;
+    insert_header(headers, QUAD_COUNT_HEADER, &quads.to_string())?;
+    headers.insert(header::TRAILER, HeaderValue::from_static(CHECKSUM_HEADER));
     Ok(response)
+}
+
+/// A writer that counts the bytes it passes on.
+struct Counting<W>(W, u64);
+
+impl<W: std::io::Write> std::io::Write for Counting<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.0.write(bytes)?;
+        self.1 += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }
 
 pub async fn restore(

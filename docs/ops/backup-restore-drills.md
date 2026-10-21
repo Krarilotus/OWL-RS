@@ -19,6 +19,8 @@ Every drill must use an artifact with these recorded fields:
 - quad count
 - checksum
 
+Where they come from: an image backup's `manifest.json` (revision, counts, size, SHA-256). For the N-Quads export (`GET /ops/api/admin/dataset/backup`), the headers `x-nrese-source-revision` and `x-nrese-quad-count`, and the SHA-256 at the end: the file's last line `# nrese-sha256 <hex>` (over every byte before it, so it stays with the file) and the trailer `x-nrese-checksum-sha256` (with `curl`, send `TE: trailers`). The HTTP restore checks the last line and refuses a mismatch; record its `checksum_verified`. The offline `nrese-server load --replace` doesn't: check the file first with `head -n -1 export.nq | sha256sum` against that line.
+
 ## Restore Verification Contract
 
 Every restore drill must record these checks:
@@ -50,7 +52,11 @@ Each drill run must produce:
 ## Scenario A: Standard Restore
 
 1. Take latest backup artifact.
-2. Restore into clean staging data directory.
+2. Restore into clean staging data directory. For a store-sized backup, restore offline:
+   - an image backup: `nrese-server restore DIR` (checked against its manifest);
+   - an N-Quads export: `nrese-server load --replace export.nq` (with the target's configuration, `NRESE_STORE_MODE=on-disk`, `NRESE_DATA_DIR`).
+
+   The HTTP restore (`POST /ops/api/admin/dataset/restore`) takes at most the server's body limit, about 3 × `budgets.upload_size` + 64 KiB (about 384 MiB by default), held whole while it is parsed: for small datasets only.
 3. Start NRESE with restored dataset.
 4. Run smoke tests and critical query pack.
 
