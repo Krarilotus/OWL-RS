@@ -97,6 +97,21 @@ pub(crate) fn backup_image(
     Ok(manifest)
 }
 
+impl ImageManifest {
+    /// The image's file name, checked: a checkpoint's (`checkpoint-<revision>.nck`), a
+    /// plain name in the backup directory. A manifest naming anything else (a path out of
+    /// it, from a tampered archive or primary) is refused before the name is used.
+    pub fn image_name(&self) -> StoreResult<&str> {
+        match nrese_engine::image_revision(&self.file) {
+            Some(_) => Ok(&self.file),
+            None => Err(StoreError::Configuration(format!(
+                "the manifest names the image {:?}, not a checkpoint file name                  (checkpoint-<revision>.nck)",
+                self.file
+            ))),
+        }
+    }
+}
+
 /// The manifest of the backup in `dir`.
 pub fn read_manifest(dir: &Path) -> StoreResult<ImageManifest> {
     let path = dir.join(MANIFEST);
@@ -172,15 +187,27 @@ pub fn restore_until(
 /// The store opens from it as from any checkpoint.
 pub fn restore_image(backup: &Path, data_dir: &Path) -> StoreResult<ImageManifest> {
     let manifest = read_manifest(backup)?;
+    let image = backup.join(manifest.image_name()?);
+    place_image(&image, manifest, data_dir)
+}
+
+/// Places the image in file `image` (any name: a download is staged under its own),
+/// described by `manifest`, into `data_dir`, which must hold no store: checked against the
+/// manifest, then copied there under the manifest's checked file name.
+pub fn place_image(
+    image: &Path,
+    manifest: ImageManifest,
+    data_dir: &Path,
+) -> StoreResult<ImageManifest> {
+    let name = manifest.image_name()?.to_owned();
     if manifest.format != "nrese-checkpoint" {
         return Err(StoreError::Configuration(format!(
             "{}: not an image backup ({})",
-            backup.display(),
+            image.display(),
             manifest.format
         )));
     }
-    let image: PathBuf = backup.join(&manifest.file);
-    let (sha256, bytes) = sha256(&image)?;
+    let (sha256, bytes) = sha256(image)?;
     if sha256 != manifest.sha256 || bytes != manifest.bytes {
         return Err(StoreError::Configuration(format!(
             "{}: the image doesn't match its manifest",
@@ -205,9 +232,9 @@ pub fn restore_image(backup: &Path, data_dir: &Path) -> StoreResult<ImageManifes
         )));
     }
     fs::create_dir_all(data_dir).map_err(|e| io(e, data_dir))?;
-    let target = data_dir.join(&manifest.file);
-    let partial = data_dir.join(format!("{}.restoring", manifest.file));
-    fs::copy(&image, &partial).map_err(|e| io(e, &image))?;
+    let target = data_dir.join(&name);
+    let partial = data_dir.join(format!("{name}.restoring"));
+    fs::copy(image, &partial).map_err(|e| io(e, image))?;
     fs::rename(&partial, &target).map_err(|e| io(e, &target))?;
     Ok(manifest)
 }
@@ -240,4 +267,55 @@ pub fn prune_wal_archive(archive: &Path, revision: u64) -> StoreResult<usize> {
         }
     }
     Ok(removed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manifest naming its image by a path out of the backup (a tampered archive or
+    /// primary) is refused before the name is used: nothing outside is read or written.
+    #[test]
+    fn an_image_name_that_isnt_a_plain_checkpoint_name_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let (backup, data_dir) = (root.path().join("backup"), root.path().join("data"));
+        fs::create_dir_all(&backup).unwrap();
+        // A file outside the backup that matches the manifest: followed, it would be
+        // copied to `data/../escape.nck`.
+        let outside = root.path().join("escape.nck");
+        fs::write(&outside, b"not an image").unwrap();
+        let (sha256, bytes) = sha256(&outside).unwrap();
+        let absolute = outside.display().to_string();
+        for name in [
+            "../escape.nck",
+            absolute.as_str(),
+            "checkpoint-1.nck:stream",
+            "checkpoint-+1.nck",
+            "escape.nck",
+        ] {
+            let manifest = ImageManifest {
+                format: "nrese-checkpoint".to_owned(),
+                file: name.to_owned(),
+                revision: 1,
+                quads: 0,
+                inferred: 0,
+                bytes,
+                sha256: sha256.clone(),
+                created_unix: 0,
+                nrese_version: String::new(),
+            };
+            fs::write(
+                backup.join(MANIFEST),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            assert!(restore_image(&backup, &data_dir).is_err(), "{name}");
+            assert_eq!(fs::read(&outside).unwrap(), b"not an image", "{name}");
+            assert!(!data_dir.exists(), "{name}: nothing placed");
+        }
+        assert_eq!(
+            nrese_engine::image_revision("checkpoint-00000000000000000042.nck"),
+            Some(42)
+        );
+    }
 }
