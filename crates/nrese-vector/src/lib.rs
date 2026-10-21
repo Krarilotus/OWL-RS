@@ -247,6 +247,84 @@ pub fn exact_from_until(
     TopK::new(k, candidates).collect(parts.into_iter().flatten())
 }
 
+/// The most parts [`exact_scan`] splits a space into, whatever the host's threads or the
+/// space's size, so that what a scan holds depends on its query and its bound alone.
+pub const SCAN_PARTS: usize = 64;
+
+/// The hits [`exact_scan`] holds at most at once for `k` over `eligible` vectors: the best of
+/// each part that finds one (a heap, then sorted; at most `eligible` parts find one), their
+/// merge, the answer.
+pub fn scan_held(k: usize, eligible: usize) -> usize {
+    let best = k.min(eligible);
+    SCAN_PARTS
+        .min(eligible)
+        .saturating_mul(best)
+        .saturating_add(best)
+        .saturating_mul(2)
+}
+
+/// The most bytes [`exact_scan`] holds besides the vectors, for `k` over `eligible` vectors:
+/// its hits ([`scan_held`]) and the parts' list.
+pub fn scan_bytes(k: usize, eligible: usize) -> usize {
+    scan_held(k, eligible)
+        .saturating_mul(std::mem::size_of::<Hit>())
+        .saturating_add(SCAN_PARTS * std::mem::size_of::<(Vec<Hit>, usize)>())
+}
+
+/// The `k` vectors nearest to `query` among those `eligible` takes that `accept` takes too
+/// (by id), nearest first (ties by id), every one compared, and how many `eligible` took. At
+/// most `bound` are eligible (the caller's bound, from what it may read): the space's chunks
+/// in at most [`SCAN_PARTS`] runs of chunks, each its best of at most `min(k, bound)`, kept
+/// from the first vector it takes on, so that what it holds ([`scan_bytes`]) depends on `k`
+/// and `bound` alone. Eligibility is tested once a
+/// vector. Each part checks `stop` before each chunk; a stopped scan's hits are incomplete
+/// (the caller checks the flag after it).
+#[allow(clippy::too_many_arguments)]
+pub fn exact_scan(
+    vectors: &Vectors,
+    query: &[f32],
+    k: usize,
+    metric: Metric,
+    eligible: &(dyn Fn(u64) -> bool + Sync),
+    accept: &(dyn Fn(u64) -> bool + Sync),
+    bound: usize,
+    stop: Option<&AtomicBool>,
+) -> (Vec<Hit>, usize) {
+    if k == 0 || bound == 0 || query.len() != vectors.dimension {
+        return (Vec::new(), 0);
+    }
+    let query = Query::new(query);
+    let chunks = vectors.chunks.len();
+    let per = chunks.div_ceil(SCAN_PARTS).max(1);
+    let parts: Vec<(Vec<Hit>, usize)> = (0..chunks.div_ceil(per))
+        .into_par_iter()
+        .map(|part| {
+            let (mut best, mut seen) = (None, 0);
+            for c in part * per..((part + 1) * per).min(chunks) {
+                if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+                    break;
+                }
+                for position in c * CHUNK..((c + 1) * CHUNK).min(vectors.len()) {
+                    let position = position as u32;
+                    let id = vectors.id(position);
+                    if eligible(id) {
+                        seen += 1;
+                        if accept(id) {
+                            best.get_or_insert_with(|| TopK::new(k, bound))
+                                .offer(id, vectors.distance(metric, &query, position));
+                        }
+                    }
+                }
+            }
+            (best.map_or_else(Vec::new, TopK::into_sorted), seen)
+        })
+        .collect();
+    let seen = parts.iter().map(|(_, seen)| seen).sum();
+    let candidates = parts.iter().map(|(hits, _)| hits.len()).sum();
+    let hits = TopK::new(k, candidates).collect(parts.into_iter().flat_map(|(hits, _)| hits));
+    (hits, seen)
+}
+
 /// The hits [`exact_from`] holds at most at once for `k` over the `len` vectors from
 /// `start` on: each part's best, then the merged best.
 pub fn exact_held(k: usize, start: usize, len: usize) -> usize {
@@ -369,6 +447,10 @@ mod tests {
         assert_eq!(exact_held(10, 0, 10_000), 30 + 10);
         assert_eq!(exact_held(10, 9_000, 10_000), 10 + 10);
         assert_eq!(exact_held(10, 10_000, 10_000), 0);
+        // A scan's: of its query and its bound alone, the parts that find one at most.
+        assert_eq!(scan_held(10, 1), 2 * (1 + 1));
+        assert_eq!(scan_held(10, 10_000), 2 * (SCAN_PARTS * 10 + 10));
+        assert_eq!(scan_held(usize::MAX, 10), 2 * (10 * 10 + 10));
     }
 
     /// A set stop flag ends a scan at its parts' starts: a stopped scan compares nothing.

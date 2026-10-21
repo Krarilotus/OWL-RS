@@ -345,14 +345,14 @@ impl Context<'_> {
         &self,
         query: &VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
-    ) -> NativeResult<(Vec<(TermId, f32)>, VectorSearchReport)> {
+    ) -> NativeResult<(nrese_engine::VectorHits, VectorSearchReport)> {
         let Some((_charge, scope)) = self.text_scope()? else {
             let report = VectorSearchReport {
                 space: 0,
                 graph: false,
                 scanned: 0,
             };
-            return Ok((Vec::new(), report));
+            return Ok((nrese_engine::VectorHits::default(), report));
         };
         let found = self
             .snapshot
@@ -368,12 +368,12 @@ impl Context<'_> {
     /// Merge sorted search rounds with retained, successfully probed candidates.
     /// O(fetched + k) per round, probing each ID at most once. Keeps at most k payloads
     /// between probes, plus one incoming probe; a displaced payload drops at once.
-    fn nearest<T>(
+    fn nearest<T, H: std::ops::Deref<Target = [(TermId, f32)]>>(
         &self,
         search: &Search,
         vector: Vec<f32>,
         accepted: Option<usize>,
-        mut fetch: impl FnMut(&VectorQuery) -> NativeResult<(Vec<(TermId, f32)>, VectorSearchReport)>,
+        mut fetch: impl FnMut(&VectorQuery) -> NativeResult<(H, VectorSearchReport)>,
         mut keep: impl FnMut(TermId) -> NativeResult<Option<T>>,
     ) -> NativeResult<Vec<(TermId, f32, T)>> {
         let mut query = VectorQuery {
@@ -395,9 +395,10 @@ impl Context<'_> {
             let limit = self.row_limit(2);
             query.max_hits = Some(limit.max_rows);
             query.stop = limit.stop;
-            let (hits, report) = fetch(&query)?;
-            let fetched = hits.len();
-            let mut hits = hits.into_iter().peekable();
+            // The round's hits, held (charged) while they are read.
+            let (found, report) = fetch(&query)?;
+            let fetched = found.len();
+            let mut hits = found.iter().copied().peekable();
             let mut pending = kept.drain(..);
             while next.len() < search.k {
                 self.check()?;

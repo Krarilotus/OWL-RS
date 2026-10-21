@@ -197,3 +197,95 @@ fn hidden_vectors_change_no_answer() {
     }
     drop(open);
 }
+
+fn embedding(i: usize, graph: nrese_rdf::GraphName) -> Quad {
+    Quad::new(
+        NamedNode::new_unchecked(format!("urn:item:{i}")),
+        NamedNode::new_unchecked("urn:embedding"),
+        Literal::new_typed_literal(format!("[{i}]"), NamedNode::new_unchecked(DATATYPE)),
+        graph,
+    )
+}
+
+/// A search's admission, refusal and report depend on the vectors its reader may read alone:
+/// 10,000 vectors in a graph outside the scope, committed after the snapshot or visible to
+/// a later one, change nothing under a hit limit or a byte budget (Sol's review of W2, r1
+/// F1: the earlier snapshot's search was refused as `TooLarge { hits: 40 }`, counted over
+/// every vector of the dictionary).
+#[test]
+fn hidden_vectors_change_no_admission_nor_report() {
+    use nrese_engine::{GraphSelector, ReadModel, TextScope};
+    let engine = engine();
+    let mut tx = engine.transaction();
+    tx.insert(QuadRef::from(&embedding(
+        0,
+        nrese_rdf::GraphName::DefaultGraph,
+    )));
+    tx.commit().expect("commit");
+    let old = engine.snapshot();
+    let scope = TextScope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
+    let query = VectorQuery {
+        max_hits: Some(20),
+        ..VectorQuery::new(vec![0.0], 10)
+    };
+    let search = |snapshot: &nrese_engine::Snapshot, budget: Option<u64>| {
+        let budget =
+            budget.map(|bytes| std::sync::Arc::new(nrese_exec::Budget::new(bytes as usize)));
+        snapshot
+            .vector_search_in(
+                ReadModel::Asserted,
+                &scope,
+                &query,
+                &|_| true,
+                budget.as_ref(),
+            )
+            .map(|(hits, report)| (hits.to_vec(), report))
+    };
+    let before = search(&old, None).expect("one vector");
+    assert_eq!(before.0.len(), 1);
+    let mut tx = engine.transaction();
+    for i in 1..10_001 {
+        let private = NamedNode::new_unchecked("urn:private").into();
+        tx.insert(QuadRef::from(&embedding(i, private)));
+    }
+    tx.commit().expect("commit");
+    for snapshot in [&old, &engine.snapshot()] {
+        for budget in [None, Some(64 << 10)] {
+            assert_eq!(
+                search(snapshot, budget),
+                Ok(before.clone()),
+                "budget {budget:?}"
+            );
+        }
+    }
+}
+
+/// The hits a search returns keep their charge until they drop (Sol's review of W2, r1 F2:
+/// the scan's reservation went as the search returned).
+#[test]
+fn returned_vector_hits_keep_their_reservation() {
+    use nrese_engine::{GraphSelector, ReadModel, TextScope};
+    let engine = engine();
+    let mut tx = engine.transaction();
+    tx.insert(QuadRef::from(&embedding(
+        0,
+        nrese_rdf::GraphName::DefaultGraph,
+    )));
+    tx.commit().expect("commit");
+    let snapshot = engine.snapshot();
+    let scope = TextScope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
+    let query = VectorQuery::new(vec![0.0], 1);
+    let search = |budget| {
+        snapshot
+            .vector_search_in(ReadModel::Asserted, &scope, &query, &|_| true, budget)
+            .expect("one vector")
+    };
+    // The corpus kept first, on the engine's budget: the request's holds the scan's alone.
+    drop(search(None));
+    let budget = std::sync::Arc::new(nrese_exec::Budget::new(1 << 20));
+    let (hits, _) = search(Some(&budget));
+    assert_eq!(hits.len(), 1);
+    assert!(budget.used() >= std::mem::size_of::<(TermId, f32)>());
+    drop(hits);
+    assert_eq!(budget.used(), 0);
+}

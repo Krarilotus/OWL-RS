@@ -45,5 +45,6 @@ pub use quad::{EncodedQuad, EncodedTriple, GraphSelector, QuadPattern};
 pub use term::vocabulary::VocabularyEncoding;
 pub use term::{
     Dictionary, DictionaryStats, Placement, StringScan, StringTest, TermId, TermKind, TermView,
-    TextMatch, TextMatches, TextQuery, VectorQuery, VectorSearchReport, VectorStop, VectorStrategy,
+    TextMatch, TextMatches, TextQuery, VectorHits, VectorQuery, VectorSearchReport, VectorStop,
+    VectorStrategy,
 };

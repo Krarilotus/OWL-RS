@@ -1110,15 +1110,18 @@ impl Dictionary {
         &self,
         query: &super::VectorQuery,
         known: u64,
+        eligible: &(dyn Fn(TermId) -> bool + Sync),
+        bound: usize,
         accept: &(dyn Fn(TermId) -> bool + Sync),
         budget: &std::sync::Arc<nrese_exec::Budget>,
-    ) -> Result<(Vec<nrese_vector::Hit>, super::VectorSearchReport), super::VectorStop> {
+    ) -> Result<(super::VectorHits, super::VectorSearchReport), super::VectorStop> {
         self.cover_vectors();
-        let accept = |raw: u64| {
+        let eligible = |raw: u64| {
             let id = TermId::from_raw(raw);
-            id.payload() < known && accept(id)
+            id.payload() < known && eligible(id)
         };
-        super::vectors::search(&self.vectors, query, &accept, budget)
+        let accept = |raw: u64| accept(TermId::from_raw(raw));
+        super::vectors::search(&self.vectors, query, &eligible, bound, &accept, budget)
     }
 
     /// The vector index, from its file at the first use, then with the vector literals

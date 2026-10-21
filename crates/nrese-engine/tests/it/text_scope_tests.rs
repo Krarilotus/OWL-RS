@@ -784,3 +784,41 @@ fn a_replica_scores_as_its_primary() {
     assert_eq!(texts(&p, &p.text_search(&q).unwrap())[0].0, "beta");
     drop(tx);
 }
+
+/// Terms an aborted transaction or a speculative one interned (the shared dictionary keeps
+/// them; no visible statement has them) change no reader's text or IRI search: answers and
+/// scores byte for byte as before, for the reader taken before and one taken after (the audit
+/// reconciliation's ticket "text search over aborted terms").
+#[test]
+fn aborted_and_speculative_terms_change_no_answer_or_score() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (subject, text) in [("s1", "alpha beta"), ("s2", "alpha"), ("s3", "beta gamma")] {
+        tx.insert(label(subject, text, None).as_ref());
+    }
+    tx.commit().unwrap();
+    let reader = engine.snapshot();
+    let (model, every) = (ReadModel::Materialised, TextScope::EVERY);
+    let answers = |snapshot: &Snapshot| {
+        let text = snapshot.text_search(&query("alpha beta")).unwrap();
+        let iris = snapshot
+            .iri_search_in(model, &every, &query("alphathing s1"), None)
+            .unwrap();
+        format!("{:?} {:?}", &*text, &*iris)
+    };
+    let before = answers(&reader);
+    {
+        let mut aborted = engine.transaction();
+        for i in 0..50 {
+            aborted.insert(label(&format!("alphathing{i}"), "alpha alpha zeta", None).as_ref());
+        }
+    }
+    let mut speculative = engine.speculative();
+    for i in 0..50 {
+        speculative.insert(label(&format!("alphathing{i}x"), "beta beta eta", None).as_ref());
+    }
+    let pending = speculative.pending_snapshot();
+    assert_eq!(answers(&reader), before);
+    assert_eq!(answers(&engine.snapshot()), before);
+    drop((pending, speculative));
+}
