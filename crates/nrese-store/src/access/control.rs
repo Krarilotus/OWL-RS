@@ -231,9 +231,34 @@ impl AccessControl {
         Ok(record)
     }
 
+    /// The change by `by` that creates or changes user `name`, setting `password` if given
+    /// (empty: the local login removed). Whether `by` may make it is decided before the
+    /// password is hashed, so a refused request never pays for Argon2; [`Self::apply`]
+    /// decides again on the state it commits to.
+    pub fn put_user(
+        &self,
+        by: &Principal,
+        name: String,
+        admin: Option<bool>,
+        roles: Option<BTreeSet<String>>,
+        password: Option<&str>,
+    ) -> Result<Change, AccessError> {
+        self.state()
+            .may_put_user(by, &name, admin, roles.as_ref())?;
+        let password_hash = password
+            .map(|password| self.password_hash(password))
+            .transpose()?;
+        Ok(Change::PutUser {
+            name,
+            admin,
+            roles,
+            password_hash,
+        })
+    }
+
     /// The password hash a change of `password` stores: `None` for an empty one (the
     /// local login removed); refused if shorter than the settings allow.
-    pub fn password_hash(&self, password: &str) -> Result<Option<String>, AccessError> {
+    pub(super) fn password_hash(&self, password: &str) -> Result<Option<String>, AccessError> {
         if password.is_empty() {
             return Ok(None);
         }
@@ -243,7 +268,7 @@ impl AccessControl {
                 "a password needs {shortest} characters at least"
             )));
         }
-        hash_password(password).map(Some)
+        self.logins.hashing(|| hash_password(password))?.map(Some)
     }
 
     /// The principal of a local login with `user` and `password` from `client` (the
