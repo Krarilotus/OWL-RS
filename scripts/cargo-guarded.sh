@@ -187,9 +187,11 @@ fi
 # - fewer than NRESE_BUILD_SLOTS runs (default 3) hold a slot; and
 # - its declared peak fits: free memory, less the peaks the runs already admitted declared, less
 #   its own, stays at or above the floor: NRESE_BUILD_FLOOR_GB, by default the guard's kill line
-#   plus a 4 GB margin where the guard runs (~/owlrs-guard), else 0. The kill line is read from
-#   the guard's script (NRESE_GUARD_SCRIPT, its `$hard = ($ram -lt N) -or ($disk -lt M)`; a
-#   script present but unreadable so means no build), else taken as today's 4 GB: an 8 GB floor.
+#   plus a 4 GB margin where the guard runs (~/owlrs-guard), else 0. The guard writes its lines to
+#   ~/owlrs-guard/thresholds (NRESE_GUARD_THRESHOLDS: `ram_soft_gb=16 disk_soft_gb=150 ram_kill_gb=4
+#   disk_kill_gb=100`); without a readable one, today's lines are taken (an 8 GB floor, 110 GB of
+#   disk), and the wait says so. Never its PowerShell: a text match can't tell which assignment
+#   runs (Sol, review-build-admission-r5..r7; the orchestrator, IB0612-8d33).
 #   (Its soft line, 16 GB, was the floor before: the agents' own load
 #   keeps the main PC at 12-16 GB free, so no hook on a merged base could start, 20 Oct 2026.)
 # The guard's BUSY (~/owlrs-guard/BUSY, NRESE_GUARD_BUSY: below its soft line) holds no run whose
@@ -217,41 +219,16 @@ floor_default=0 disk_floor_gb=0
 # (A Windows path's separators too: with them unread, the guard looked absent and the floor was 0.)
 busy_posix=${BUSY//\\//}
 if [ -d "${busy_posix%/*}" ]; then
-  # The guard's kill line, its `$hard = ($ram -lt N) -or ($disk -lt M)` (GB of RAM free, GB free
-  # on C:), read as PowerShell reads it: any case and spacing, a last line without a newline. No
-  # script: today's line (4 GB, 100 GB). A script whose line can't be read so: no build, never a
-  # lower line silently (Sol, review-build-admission-r5, r5-2).
-  kill_ram=4 kill_disk=100
-  guard_script="${NRESE_GUARD_SCRIPT:-$HOME/Desktop/Harness/tools/main-pc-guard/guard.ps1}"
-  if [ -e "$guard_script" ]; then
-    # Only an unambiguous script: exactly one assignment, at the start of its line (so not inside a
-    # block that might not run), and no block comment anywhere (one could hide or hold an assignment);
-    # anything else is unreadable (Sol, review-build-admission-r6, r6-1).
-    hard="" seen=0
-    shopt -s nocasematch
-    while IFS= read -r line || [ -n "$line" ]; do
-      line=${line%$'\r'}
-      if [[ "$line" == *'<#'* ]]; then
-        hard=unreadable seen=2
-        break
-      fi
-      if [[ "$line" =~ ^[[:space:]]*\$hard[[:space:]]*= ]]; then
-        seen=$((seen + 1))
-        hard=unreadable
-        s='[[:space:]]*'
-        if [[ "$line" =~ ^\$hard$s=$s\($s\$ram[[:space:]]+-lt[[:space:]]+([0-9]+)$s\)$s-or$s\($s\$disk[[:space:]]+-lt[[:space:]]+([0-9]+)$s\)$s(#.*)?$ ]]; then
-          hard="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
-        fi
-      fi
-    done < "$guard_script"
-    shopt -u nocasematch
-    [ "$seen" = 1 ] || hard=unreadable
-    if ! [[ "$hard" =~ ^[0-9]+\ [0-9]+$ ]]; then
-      printf 'cargo %s: the guard'\''s kill line can'\''t be read from %s (its `$hard = ($ram -lt N) -or ($disk -lt M)`): not building\n' \
-        "$*" "$guard_script" >&2
-      exit 2
-    fi
-    read -r kill_ram kill_disk <<< "$hard"
+  # The guard's lines from its own file, one line of four whole numbers; anything else is no file.
+  kill_ram=4 kill_disk=100 thresholds_note=""
+  thresholds="${NRESE_GUARD_THRESHOLDS:-${busy_posix%/*}/thresholds}"
+  line=""
+  { IFS= read -r line || [ -n "$line" ]; } 2> /dev/null < "$thresholds" || line=""
+  line=${line%$'\r'}
+  if [[ "$line" =~ ^ram_soft_gb=([0-9]+)\ disk_soft_gb=([0-9]+)\ ram_kill_gb=([0-9]+)\ disk_kill_gb=([0-9]+)$ ]]; then
+    kill_ram=${BASH_REMATCH[3]} kill_disk=${BASH_REMATCH[4]}
+  else
+    thresholds_note=" (the guard's thresholds file $thresholds is missing or unreadable: today's lines taken)"
   fi
   floor_default=$(( kill_ram + 4 ))
   # The guard also stops our processes below its disk line on C: (Sol, r5-1): a build waits for that
@@ -316,9 +293,11 @@ ME="$$@${stat[21]}"
 [ -n "$JOB" ] || JOB="nrese-build-${ME/@/-}"
 export NRESE_BUILD_JOB=$JOB
 # One admission at a time (a lock whose holder is gone, or never got to name itself, goes after a minute).
+# lock_admission [DEADLINE]: fails, without the lock, once SECONDS passes DEADLINE (r7-2).
 lock_admission() {
   local holder
   until mkdir "$ADMIT/.lock" 2>/dev/null; do
+    [ -z "${1:-}" ] || [ "$SECONDS" -le "$1" ] || return 1
     holder=$(cat "$ADMIT/.lock/holder" 2>/dev/null || true)
     if { [ -n "$holder" ] && ! holds "$holder"; } || [ -n "$(find "$ADMIT/.lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
       rm -rf "$ADMIT/.lock"
@@ -343,16 +322,26 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
   printf '%s %s cargo %s\n' "$least" "$ROOT" "$*" > "$ticket"
   waited=0 said=-60 since=$SECONDS
   if [ -t 2 ]; then limit=${NRESE_BUILD_SLOT_WAIT_S:-3600}; else limit=${NRESE_BUILD_SLOT_WAIT_S:-1800}; fi
-  looked=0
+  why="its deadline passed before it could look"
+  poll=${NRESE_BUILD_SLOT_POLL_S:-5}
   while :; do
     # The disk read before the lock (bounded, never failing): a stalled file system holds no one else.
-    disk=""
+    # Taken under the lock only while it is fresh: no older than a poll (r7-2).
+    disk="" read_at=$SECONDS
     [ "$disk_floor_gb" -eq 0 ] || disk=$(guard_disk_gb)
-    lock_admission
-    # Once it has waited, the deadline again after the reads and the lock: nothing is admitted past it
-    # (r6-2). Its first look comes at once (at most the disk reading's 10 s late), whatever the limit.
+    if ! lock_admission $(( since + limit )); then
+      rm -f "$ticket"
+      printf 'cargo %s: not built: no room to build after %s s (%s; the admission lock stayed taken); try again later, or build on the fleet\n' \
+        "$*" "$((SECONDS - since))" "$why" >&2
+      exit 75
+    fi
+    if [ "$disk_floor_gb" -gt 0 ] && [ $(( SECONDS - read_at )) -gt "$poll" ]; then
+      unlock_admission
+      continue
+    fi
+    # The deadline after the reads and the lock: nothing is admitted past it.
     waited=$((SECONDS - since))
-    if [ "$looked" = 1 ] && [ "$waited" -gt "$limit" ]; then
+    if [ "$waited" -gt "$limit" ]; then
       unlock_admission
       rm -f "$ticket"
       printf 'cargo %s: not built: no room to build after %s s (%s); try again later, or build on the fleet\n' \
@@ -379,9 +368,9 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
       fi
     done
     peak=$(peak_of "$CARGO_BUILD_JOBS")
-    why="" looked=1
+    why=""
     if [ "$disk_floor_gb" -gt 0 ] && ! { [[ "$disk" =~ ^[0-9]+$ ]] && [ "$disk" -ge "$disk_floor_gb" ]; }; then
-      why="the guard's volume has ${disk:-an unreadable number of} GB free, below its kill line of $kill_disk GB plus a $(( disk_floor_gb - kill_disk )) GB margin"
+      why="the guard's volume has ${disk:-an unreadable number of} GB free, below its kill line of $kill_disk GB plus a $(( disk_floor_gb - kill_disk )) GB margin${thresholds_note:-}"
     elif [ "$ahead" -gt 0 ]; then
       why="$ahead waiting before it"
     elif [ "$running" -ge "$SLOTS" ]; then
@@ -393,7 +382,7 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
         export CARGO_BUILD_JOBS=$fit
         peak=$(peak_of "$fit")
       else
-        why="it may peak at $((peak / 1024)) GB; $(( room > 0 ? room / 1024 : 0 )) GB are free above the $((FLOOR_MB / 1024)) GB floor"
+        why="it may peak at $((peak / 1024)) GB; $(( room > 0 ? room / 1024 : 0 )) GB are free above the $((FLOOR_MB / 1024)) GB floor${thresholds_note:-}"
         [ ! -f "$BUSY" ] || why="$why; the machine is busy ($(cat "$BUSY" 2>/dev/null || true))"
       fi
     fi
@@ -413,7 +402,7 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
     fi
     # The deadline before any later look at the room, and no sleep past it: room that appears after
     # it doesn't admit (Sol, r5 follow-up).
-    pause=${NRESE_BUILD_SLOT_POLL_S:-5}
+    pause=$poll
     waited=$((SECONDS - since))
     [ $(( limit - waited )) -ge "$pause" ] || pause=$(( limit - waited ))
     [ "$pause" -le 0 ] || sleep "$pause"
