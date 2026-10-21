@@ -119,10 +119,18 @@ pub async fn execute_query_in(
     )
     .await?;
     if let Some(report) = status.lock().unwrap_or_else(|p| p.into_inner()).take() {
-        response.headers_mut().insert(
+        let headers = response.headers_mut();
+        headers.insert(
             COMPLETENESS,
             axum::http::HeaderValue::from_str(&report.header())
                 .unwrap_or_else(|_| axum::http::HeaderValue::from_static(report.as_str())),
+        );
+        // Readable by a console on another origin too (CORS hides other response headers),
+        // so an incomplete answer never shows as a complete one there; appended, so what a
+        // proxy exposes besides stays exposed.
+        headers.append(
+            axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            axum::http::HeaderValue::from_static(COMPLETENESS),
         );
     }
     Ok(response)
