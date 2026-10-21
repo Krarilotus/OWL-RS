@@ -223,7 +223,8 @@ if [ -d "${busy_posix%/*}" ]; then
   kill_ram=4 kill_disk=100 thresholds_note=""
   thresholds="${NRESE_GUARD_THRESHOLDS:-${busy_posix%/*}/thresholds}"
   line=""
-  { IFS= read -r line || [ -n "$line" ]; } 2> /dev/null < "$thresholds" || line=""
+  # Bounded (NRESE_GUARD_THRESHOLDS_TIMEOUT_S, default 5 s): a stalled file system is no file (r8-2).
+  line=$(timeout --kill-after=2 "${NRESE_GUARD_THRESHOLDS_TIMEOUT_S:-5}" head -1 -- "$thresholds" 2> /dev/null) || line=""
   line=${line%$'\r'}
   if [[ "$line" =~ ^ram_soft_gb=([0-9]+)\ disk_soft_gb=([0-9]+)\ ram_kill_gb=([0-9]+)\ disk_kill_gb=([0-9]+)$ ]]; then
     kill_ram=${BASH_REMATCH[3]} kill_disk=${BASH_REMATCH[4]}
@@ -335,11 +336,8 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
         "$*" "$((SECONDS - since))" "$why" >&2
       exit 75
     fi
-    if [ "$disk_floor_gb" -gt 0 ] && [ $(( SECONDS - read_at )) -gt "$poll" ]; then
-      unlock_admission
-      continue
-    fi
-    # The deadline after the reads and the lock: nothing is admitted past it.
+    # The deadline after the reads and the lock, before anything else: nothing is admitted past it,
+    # and no retry for a stale reading outlives it (Sol, review-build-admission-r8, r8-1).
     waited=$((SECONDS - since))
     if [ "$waited" -gt "$limit" ]; then
       unlock_admission
@@ -347,6 +345,11 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
       printf 'cargo %s: not built: no room to build after %s s (%s); try again later, or build on the fleet\n' \
         "$*" "$waited" "$why" >&2
       exit 75
+    fi
+    if [ "$disk_floor_gb" -gt 0 ] && [ $(( SECONDS - read_at )) -gt "$poll" ]; then
+      unlock_admission
+      why="its disk reading took longer than a poll"
+      continue
     fi
     for t in "$ADMIT"/queue/*; do if [ -e "$t" ] && ! holds "${t##*-}"; then rm -f "$t"; fi; done
     for r in "$ADMIT"/run/*; do if [ -e "$r" ] && ! holds "${r##*/}"; then rm -rf "$r"; fi; done

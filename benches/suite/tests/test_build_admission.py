@@ -159,6 +159,30 @@ class Admission(unittest.TestCase):
         path.write_text(text)
         return {"NRESE_BUILD_FLOOR_GB": None, "NRESE_GUARD_THRESHOLDS": str(path)}
 
+    @unittest.skipUnless(shutil.which("mkfifo"), "disk readings that keep running out (a FIFO)")
+    def test_disk_readings_slower_than_a_poll_end_at_the_deadline(self):
+        # Sol, review-build-admission-r8 (r8-1): a reading older than a poll was retried before the
+        # deadline was looked at, so readings that kept taking longer than a poll retried forever. Each
+        # here takes its 3 s timeout (a FIFO no one writes), the poll is 1 s, the limit 2 s.
+        fifo = self.root / "slow"
+        subprocess.run(["mkfifo", str(fifo)], check=True)
+        run = self.start("slow", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="1", NRESE_BUILD_SLOT_WAIT_S="2",
+                         NRESE_BUILD_SLOT_POLL_S="1", NRESE_GUARD_DISKFREE=str(fifo), NRESE_GUARD_DISK_TIMEOUT_S="3")
+        _, err = run.communicate(timeout=90)
+        self.assertEqual(run.returncode, 75, err)
+        self.assertFalse((self.out / "slow.started").exists())
+
+    @unittest.skipUnless(shutil.which("mkfifo"), "a thresholds file that never answers (a FIFO)")
+    def test_a_thresholds_file_that_never_answers_is_no_file(self):
+        # r8-2: the thresholds read had no bound; a stalled one held the run before it ever queued.
+        fifo = self.root / "thresholds-stalled"
+        subprocess.run(["mkfifo", str(fifo)], check=True)
+        run = self.start("t", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="1", NRESE_BUILD_FLOOR_GB=None,
+                         NRESE_GUARD_THRESHOLDS=str(fifo), NRESE_GUARD_THRESHOLDS_TIMEOUT_S="1")
+        _, err = run.communicate(timeout=90)
+        self.assertEqual(run.returncode, 0, err)
+        self.assertIsNotNone(self.started("t", within=1), "today's lines, so it fits")
+
     def test_the_floor_and_the_disk_line_come_from_the_guards_thresholds_file(self):
         # The orchestrator, IB0612-8d33: the guard writes its lines; admission never reads its
         # PowerShell. A 6 GB kill line: a 10 GB floor, 13 GB free; a 200 GB disk line: 210 GB needed.
