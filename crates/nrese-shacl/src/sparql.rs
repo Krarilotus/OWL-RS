@@ -26,9 +26,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nrese_engine::{GraphSelector, TermId};
-use nrese_rdf::{GraphName, NamedNode, Term, Variable};
-use nrese_sparql::{QueryDatasetSpecification, QueryOptions, QueryResults, ReadView};
+use nrese_engine::TermId;
+use nrese_rdf::{NamedNode, Term, Variable};
+use nrese_sparql::{QueryOptions, QueryResults, ReadView};
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern, PropertyPathExpression};
 
 use crate::graph::Selection;
@@ -204,23 +204,9 @@ pub(crate) fn run<V: ReadView>(
     for (name, value) in &check.parameters {
         bound.insert(name.clone(), decode(*value)?);
     }
-    let mut options = QueryOptions {
-        read_model: data.model,
-        ..QueryOptions::default()
-    };
-    match data.graphs {
-        GraphSelector::Exact(graph) if !graph.is_default_graph() => {
-            let mut dataset = QueryDatasetSpecification::new();
-            let Term::NamedNode(name) = decode(graph)? else {
-                return Err("the data graph isn't an IRI".into());
-            };
-            dataset.set_default_graph(vec![GraphName::NamedNode(name)]);
-            options.dataset = Some(dataset);
-        }
-        GraphSelector::Exact(_) => {}
-        // Every graph: their merge (a shapes graph among them is read too).
-        _ => options.union_default_graph = true,
-    }
+    // The statements Core reads, shapes graphs left out ([`Selection::query_dataset`]).
+    let mut options = QueryOptions::default();
+    data.query_dataset(view, &mut options)?;
     let evaluate = |bound: HashMap<Variable, Term>| {
         let options = QueryOptions {
             pre_bound: Some(Arc::new(bound)),

@@ -1225,7 +1225,7 @@ struct Context<'a> {
     index_joins: Option<bool>,
     /// With a dataset of several default graphs (`FROM <a> FROM <b>`), the graphs whose
     /// merge the default graph is; the scope is then [`GraphScope::Union`].
-    merge_set: Option<Vec<TermId>>,
+    merge_set: Option<crate::dataset::GraphSet>,
     /// The graphs `GRAPH` may name, if the dataset lists them (`FROM NAMED`).
     named: Option<Vec<TermId>>,
     /// Numbers the columns the executor adds for itself ([`exists`]).
@@ -2246,10 +2246,10 @@ impl<'a> Context<'a> {
     fn path_evaluator(&self) -> NativeResult<paths::PathEvaluator<'_>> {
         let graph = match &*self.graph.borrow() {
             GraphScope::Default => paths::PathGraph::Default,
-            GraphScope::Union => paths::PathGraph::Merged(self.merge_set.as_deref()),
+            GraphScope::Union => paths::PathGraph::Merged(self.merge_set.as_ref()),
             GraphScope::Named(id) => paths::PathGraph::Named(*id),
             // A graph the store doesn't hold: the merge of no graphs.
-            GraphScope::Missing => paths::PathGraph::Merged(Some(&[])),
+            GraphScope::Missing => paths::PathGraph::Merged(Some(&crate::dataset::NO_GRAPHS)),
             // `GRAPH ?g` sends patterns with paths graph by graph (`scans_everywhere`).
             GraphScope::Variable(_) => return unsupported("a path read in all graphs at once"),
         };
@@ -3885,7 +3885,7 @@ impl<'a> Context<'a> {
             key_columns: &key_columns,
             shared_positions: &shared_positions,
             positions: &positions,
-            graphs: self.merge_set.as_deref().filter(|_| scan.merged()),
+            graphs: self.merge_set.as_ref().filter(|_| scan.merged()),
             budget: &self.budget,
             width: vars.len(),
             max_rows: self.max_rows(vars.len()),
@@ -4137,7 +4137,7 @@ impl<'a> Context<'a> {
                 .scan_sorted_in(self.model, &scan.quad_pattern(), scan.permutation_for(None))
                 .expect("permutation_for returns a usable permutation");
             let mut previous: Option<[u64; 3]> = None;
-            let graphs = self.merge_set.as_deref();
+            let graphs = self.merge_set.as_ref();
             sorted.filter(move |quad| {
                 if graphs.is_some_and(|graphs| !graphs.contains(&quad.graph)) {
                     return false;
@@ -5427,7 +5427,7 @@ struct Probe<'a, 'b> {
     positions: &'a [Vec<usize>],
     /// For a merged default graph of listed graphs, the graphs ([`Context::merge_set`]):
     /// the index's matches in other graphs are skipped.
-    graphs: Option<&'a [TermId]>,
+    graphs: Option<&'a crate::dataset::GraphSet>,
     /// The query's budget: each chunk's output and scratch are charged to it before they
     /// grow.
     budget: &'b Budget,

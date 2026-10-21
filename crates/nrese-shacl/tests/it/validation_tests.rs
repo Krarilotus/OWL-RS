@@ -334,3 +334,34 @@ fn path_is_substituted_only_as_a_predicate() {
         }
     }
 }
+
+/// SHACL-SPARQL reads the statements Core reads: a shapes graph left out of the data is
+/// left out of the queries' default graph too, so the two agree on a data-like statement in
+/// it, and `GRAPH $shapesGraph` still reads the shapes (RSH-06).
+#[test]
+fn sparql_constraints_read_the_data_core_reads() {
+    let engine = engine(
+        "ex:a ex:p ex:b .",
+        r#"ex:a ex:q ex:c .
+        ex:Core sh:targetNode ex:a ; sh:property [ sh:path ex:q ; sh:maxCount 0 ] .
+        ex:Sparql sh:targetNode ex:a ;
+            sh:sparql [ sh:select "SELECT $this WHERE { $this <http://example.com/q> ?o }" ] .
+        ex:Shapes sh:targetNode ex:a ; sh:sparql [ sh:select
+            "SELECT $this WHERE { GRAPH $shapesGraph { $this <http://example.com/q> ?o } }" ] ."#,
+    );
+    let snapshot = engine.snapshot();
+    let shapes = compiled(&snapshot);
+    let data = Selection::of(GraphSelector::Any).excluding(id(&snapshot, SHAPES_GRAPH));
+    let report = validate(&snapshot, &shapes, data);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let sources: Vec<String> = report
+        .results
+        .iter()
+        .map(|result| result.source_shape.to_string())
+        .collect();
+    assert_eq!(
+        sources,
+        [ex("Shapes")],
+        "only the query that reads the shapes graph"
+    );
+}

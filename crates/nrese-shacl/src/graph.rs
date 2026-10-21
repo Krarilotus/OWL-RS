@@ -4,8 +4,8 @@
 //! here: every accessor returns a sorted set of ids.
 
 use nrese_engine::{EncodedQuad, GraphSelector, QuadPattern, ReadModel, TermId};
-use nrese_rdf::{NamedNodeRef, Term};
-use nrese_sparql::ReadView;
+use nrese_rdf::{GraphName, NamedNodeRef, Term};
+use nrese_sparql::{QueryDatasetSpecification, QueryOptions, ReadView};
 
 /// Which statements a validation reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +41,53 @@ impl Selection {
         let slot = if self.excluded[0].is_none() { 0 } else { 1 };
         self.excluded[slot] = Some(graph);
         self
+    }
+
+    /// Sets `options` to read, as the query's default graph, the statements Core reads
+    /// ([`GraphView`]): the selected graphs without the excluded ones, in the selection's read
+    /// model. The named graphs stay the store's, so `GRAPH $shapesGraph` still reads the
+    /// shapes; only the default graph, which SHACL-SPARQL's data graph is, leaves them out.
+    pub(crate) fn query_dataset<V: ReadView>(
+        &self,
+        view: &V,
+        options: &mut QueryOptions,
+    ) -> Result<(), String> {
+        let name = |graph: TermId| -> Result<GraphName, String> {
+            if graph.is_default_graph() {
+                return Ok(GraphName::DefaultGraph);
+            }
+            match view.decode(graph) {
+                Some(Term::NamedNode(name)) => Ok(GraphName::NamedNode(name)),
+                Some(Term::BlankNode(name)) => Ok(GraphName::BlankNode(name)),
+                _ => Err(format!("graph #{} isn't a graph name", graph.raw())),
+            }
+        };
+        let excluded: Vec<TermId> = self.excluded.iter().flatten().copied().collect();
+        let names = |graphs: &[TermId]| -> Result<Vec<GraphName>, String> {
+            graphs.iter().map(|&graph| name(graph)).collect()
+        };
+        options.read_model = self.model;
+        let mut dataset = QueryDatasetSpecification::new();
+        match self.graphs {
+            // A graph left out of itself: nothing.
+            GraphSelector::Exact(graph) if excluded.contains(&graph) => {
+                dataset.set_default_graph(Vec::new());
+            }
+            GraphSelector::Exact(graph) if graph.is_default_graph() => return Ok(()),
+            GraphSelector::Exact(graph) => dataset.set_default_graph(vec![name(graph)?]),
+            GraphSelector::Any if excluded.is_empty() => {
+                options.union_default_graph = true;
+                return Ok(());
+            }
+            GraphSelector::Any => dataset.set_default_graph_excluding(names(&excluded)?),
+            GraphSelector::AnyNamed => {
+                let mut left_out = names(&excluded)?;
+                left_out.push(GraphName::DefaultGraph);
+                dataset.set_default_graph_excluding(left_out);
+            }
+        }
+        options.dataset = Some(dataset);
+        Ok(())
     }
 }
 
