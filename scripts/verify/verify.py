@@ -357,7 +357,17 @@ def summarise(evidence: Path, results: list[dict], target: dict, title: str, ext
 
 def target_of(args) -> dict:
     """Where the server comes from: --url (running), --server (a binary), --server-rev (a
-    fleet host's build, its checksum checked)."""
+    fleet host's build, its checksum checked). Runs take no lock on the host's cache, so a sweep
+    may remove the build while it is chosen: any file error here is a launch failure, with its
+    failing summary, never an escape without one (Sol r3, finding 4)."""
+    try:
+        return _target_of(args)
+    except OSError as e:
+        raise LaunchError(f"reading the server's build failed ({e}); a build in the host's cache may "
+                          "have been swept meanwhile: build it again") from None
+
+
+def _target_of(args) -> dict:
     if args.url:
         return {"url": args.url}
     if args.server_rev:
