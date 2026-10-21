@@ -45,7 +45,8 @@ pub mod update;
 mod view;
 
 pub use backup::{
-    DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
+    DIGEST_PREFIX, DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, DatasetRestoreReport,
+    DatasetRestoreRequest,
 };
 pub use bulk_load::{BulkLoadReport, BulkLoadRequest, LoadProgress};
 pub use classification::{ClassificationReport, RealisationReport};

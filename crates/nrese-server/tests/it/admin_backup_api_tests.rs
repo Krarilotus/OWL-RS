@@ -74,6 +74,59 @@ async fn backup_endpoint_returns_dataset_payload_with_expected_headers()
     Ok(())
 }
 
+/// The export streams; its SHA-256 closes the body as a comment and follows it as the
+/// trailer the `Trailer` header announces: both equal a SHA-256 computed here over the
+/// bytes before the comment.
+#[tokio::test]
+async fn the_exports_trailer_and_closing_comment_hold_its_checksum()
+-> Result<(), Box<dyn std::error::Error>> {
+    use http_body_util::BodyExt;
+    use sha2::{Digest, Sha256};
+
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory().with_ontology(crate::support::minimal_fixture_path()),
+        admin_policy(),
+        ReasonerConfig::default(),
+    )?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/ops/api/admin/dataset/backup")
+                .method(Method::GET)
+                .header("authorization", "Bearer admin")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("trailer")
+            .and_then(|v| v.to_str().ok()),
+        Some("x-nrese-checksum-sha256")
+    );
+    let mut body = response.into_body();
+    let (mut bytes, mut trailers) = (Vec::new(), None);
+    while let Some(frame) = body.frame().await {
+        match frame?.into_data() {
+            Ok(data) => bytes.extend_from_slice(&data),
+            Err(frame) => trailers = frame.into_trailers().ok(),
+        }
+    }
+    let text = String::from_utf8(bytes)?;
+    let (statements, comment) = text.trim_end().rsplit_once('\n').ok_or("a statement")?;
+    let computed = format!("{:x}", Sha256::digest(format!("{statements}\n")));
+    assert_eq!(comment, format!("# nrese-sha256 {computed}"));
+    let trailer = trailers.ok_or("no trailers")?;
+    assert_eq!(
+        trailer
+            .get("x-nrese-checksum-sha256")
+            .and_then(|v| v.to_str().ok()),
+        Some(computed.as_str())
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn restore_endpoint_replaces_dataset_and_updates_ready_surface()
 -> Result<(), Box<dyn std::error::Error>> {

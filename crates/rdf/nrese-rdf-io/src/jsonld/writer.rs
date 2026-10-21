@@ -8,6 +8,11 @@
 //! comes back later gets another node object: JSON-LD merges them. IRIs are compacted with
 //! the prefixes; plain strings are JSON strings.
 //!
+//! The writer holds at most one run, and a run at most [`NODE_FLUSH_BYTES`] of statements
+//! (the bound `jsonld-node-flush`): a subject with more is written as several node objects
+//! with the same `@id`, which JSON-LD merges into the same statements. So a writer's memory
+//! doesn't grow with a subject's fan-out.
+//!
 //! An IRI whose scheme is a prefix's name (`ex:thing` with a prefix `ex`) would be read
 //! as a compact IRI. The node object (or named graph) that holds one turns that prefix off
 //! in a context of its own (`"@context": {"ex": null}`) and writes such IRIs in full.
@@ -29,6 +34,10 @@ struct Prefix {
     explicit: bool,
 }
 
+/// The statements' bytes a run holds before it is written as a node object of its own
+/// (the named bound `jsonld-node-flush`).
+pub(crate) const NODE_FLUSH_BYTES: usize = 64 * 1024;
+
 pub(crate) struct JsonLdWriter {
     prefixes: Vec<Prefix>,
     started: bool,
@@ -36,6 +45,8 @@ pub(crate) struct JsonLdWriter {
     graph: Option<(GraphName, Vec<usize>)>,
     subject: Option<(GraphName, NamedOrBlankNode)>,
     statements: Vec<(NamedNode, Term)>,
+    /// What `statements` holds, by [`held`].
+    held: usize,
     /// Whether the open array (a named graph's, or the top `@graph`) has an item yet.
     items: bool,
     outer_items: bool,
@@ -59,6 +70,7 @@ impl JsonLdWriter {
             graph: None,
             subject: None,
             statements: Vec::new(),
+            held: 0,
             items: false,
             outer_items: false,
         }
@@ -163,8 +175,15 @@ impl JsonLdWriter {
             }
             self.subject = Some((quad.graph_name.into_owned(), quad.subject.into_owned()));
         }
-        self.statements
-            .push((quad.predicate.into_owned(), quad.object.into_owned()));
+        let statement = (quad.predicate.into_owned(), quad.object.into_owned());
+        self.held += held(&statement);
+        self.statements.push(statement);
+        if self.held >= NODE_FLUSH_BYTES {
+            // The run so far as a node object; the subject's next statements open another.
+            let subject = self.subject.clone();
+            self.flush_node(out);
+            self.subject = subject;
+        }
         Ok(())
     }
 
@@ -198,6 +217,7 @@ impl JsonLdWriter {
             return;
         };
         let statements = std::mem::take(&mut self.statements);
+        self.held = 0;
         // The prefixes the graph turned off stay off; this node turns off those its IRIs
         // would be mistaken for.
         let inherited: &[usize] = self.graph.as_ref().map_or(&[], |(_, off)| off);
@@ -332,6 +352,19 @@ impl JsonLdWriter {
         out.extend_from_slice(b"\n]}\n");
         Ok(())
     }
+}
+
+/// The bytes a buffered statement holds: its slot and its terms' text.
+fn held((predicate, object): &(NamedNode, Term)) -> usize {
+    let object = match object {
+        Term::NamedNode(n) => n.as_str().len(),
+        Term::BlankNode(b) => b.as_str().len(),
+        Term::Literal(l) => {
+            l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
+        }
+        Term::Triple(_) => 0, // refused in `write`
+    };
+    std::mem::size_of::<(NamedNode, Term)>() + predicate.as_str().len() + object
 }
 
 fn string(text: &str, out: &mut Vec<u8>) {
