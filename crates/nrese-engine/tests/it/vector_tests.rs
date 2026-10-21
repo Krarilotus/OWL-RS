@@ -307,8 +307,8 @@ fn an_unreadable_first_vector_of_a_dimension_changes_no_refusal() {
 }
 
 /// A corpus built by a read its reader's budget refused (an equality expansion past it) is
-/// neither kept nor used: the next reader of the same statements finds every member (Sol's
-/// review of W2, r2 M1, with engine-v2's reader budgets).
+/// neither kept nor used, and the search and its warm-up refuse: the next reader of the same
+/// statements finds every member (Sol's review of W2, r2 M1, with engine-v2's reader budgets).
 #[test]
 fn a_refused_read_keeps_no_partial_corpus() {
     use nrese_engine::EncodedTriple;
@@ -340,6 +340,8 @@ fn a_refused_read_keeps_no_partial_corpus() {
         .unwrap();
     assert!(small.vector_search(&query, &|_| true).is_err());
     assert!(small.read_refused().is_some());
+    // The warm-up refuses too, as an error (Sol's review of W2, r3 F1: it panicked).
+    assert!(small.prepare_vector_search().is_err());
     drop(small);
     let (hits, report) = reader.vector_search(&query, &|_| true).unwrap();
     assert_eq!((hits.len(), report.space), (1, 1));
