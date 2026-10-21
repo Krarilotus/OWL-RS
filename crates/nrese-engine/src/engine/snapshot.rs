@@ -1710,15 +1710,17 @@ impl Snapshot {
     }
 
     /// Prepares what [`Self::vector_search`] reads before returning (a warm-up): the vectors
-    /// of the dictionary and the corpus of every graph's.
-    pub fn prepare_vector_search(&self) {
+    /// of the dictionary and the corpus of every graph's. Refused
+    /// ([`crate::EngineError::MemoryLimit`]) where the reader's budget refused a read
+    /// ([`Self::reading_within`]): what it read may be incomplete, so nothing is kept.
+    pub fn prepare_vector_search(&self) -> crate::EngineResult<()> {
         self.text_corpus(
             Documents::Vectors,
             ReadModel::Materialised,
             &TextScope::EVERY,
             None,
-        )
-        .expect("no budget to exceed");
+        )?;
+        Ok(())
     }
 
     /// The IRIs that are subjects of statements this snapshot shows in `scope`'s graphs
