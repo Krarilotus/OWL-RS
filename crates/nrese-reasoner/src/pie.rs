@@ -439,6 +439,18 @@ fn options(raw: Vec<String>) -> Result<Options, String> {
     Ok(out)
 }
 
+/// The version of [`context_predicate`]'s names, part of a `[Context]` ruleset's fingerprint
+/// ([`crate::RuleProgram::fingerprint`]): change it with any change to those names, so stores
+/// materialised under the old ones rebuild instead of keeping relations nothing derives now.
+/// 2: `%` and `#` in either part percent-encoded (20 Oct 2026; 1: plain concatenation).
+pub(crate) const CONTEXT_NAMES: u32 = 2;
+
+/// Whether a `.pie` text may state a statement in a context (any `[Context` at all, comments
+/// included: a needless rebuild at worst).
+pub(crate) fn uses_contexts(text: &str) -> bool {
+    text.contains("[Context")
+}
+
 /// The predicate a statement in `context` gets ([`compile`]'s docs): the pair's one name.
 /// `%` and `#` in either part are percent-encoded, so the one `#` between them splits the
 /// name back into the pair: no two pairs share it, and the name is a well-formed IRI.
