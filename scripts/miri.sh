@@ -14,6 +14,8 @@ cd "$(dirname "$0")/.."
 # The tests that exercise unsafe code (one filter each).
 tests=(
   budget::tests::a_panicking_parallel_fill_drops_every_item_it_wrote
+  budget::tests::a_failing_parallel_fill_stops_and_drops_every_item_it_wrote
+  budget::tests::a_parallel_fill_returns_its_lowest_failure_and_unwinds_past_one
   region::tests::a_region_is_charged_before_it_grows_and_returns_everything
   region::tests::a_region_holds_at_its_boundaries
 )
@@ -26,8 +28,10 @@ export MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks"
 export CARGO_BUILD_WARNINGS=warn
 export CARGO_TARGET_DIR=target/miri
 status=0
+# Through cargo-guarded.sh: Miri's compiles wait for room like any other (no CPU flag, as before).
 for test in "${tests[@]}"; do
-  cargo +nightly miri test --locked -q --target x86_64-unknown-linux-gnu -p nrese-exec --lib \
+  NRESE_TARGET_CPU=portable bash scripts/cargo-guarded.sh +nightly miri test --locked -q \
+    --target x86_64-unknown-linux-gnu -p nrese-exec --lib \
     -- --exact "$test" || status=1
 done
 exit $status

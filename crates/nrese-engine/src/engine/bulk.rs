@@ -36,6 +36,7 @@ use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
 use crate::index::{IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple, Permutation, QuadPattern};
+use crate::term::dictionary::BatchScratch;
 use crate::term::pending::Pending;
 
 /// Batches copied between releases of their memory ([`crate::memory`]): about 256 MiB at
@@ -70,6 +71,8 @@ pub struct BulkLoad<'e> {
     pending: Pending,
     /// Batches [`add`](Self::add) has numbered.
     added: std::sync::atomic::AtomicU32,
+    /// What interning a batch works in, kept for the next ones: one per thread adding.
+    scratch: Mutex<Vec<BatchScratch>>,
 }
 
 /// Interned quads not yet spilled.
@@ -101,6 +104,7 @@ impl<'e> BulkLoad<'e> {
             spill_failed: Mutex::new(None),
             pending: Pending::default(),
             added: std::sync::atomic::AtomicU32::new(0),
+            scratch: Mutex::default(),
         }
     }
 
@@ -119,11 +123,14 @@ impl<'e> BulkLoad<'e> {
     /// from several threads at once. Past the memory budget, it waits while the last
     /// chunk is spilled.
     pub fn add_at(&self, chunk: u32, batch: u32, quads: &[Quad]) {
-        let encoded =
-            self.engine
-                .shared
-                .dictionary
-                .intern_quads_pending(quads, &self.pending, chunk, batch);
+        let mut scratch = self.scratch.lock().pop().unwrap_or_default();
+        let encoded = self.engine.shared.dictionary.intern_quads_pending(
+            quads,
+            &self.pending,
+            (chunk, batch),
+            &mut scratch,
+        );
+        self.scratch.lock().push(scratch);
         let full = {
             let mut batches = self.batches.lock();
             batches.quads += encoded.len();
@@ -192,8 +199,10 @@ impl<'e> BulkLoad<'e> {
             spiller,
             spill_failed,
             pending,
+            scratch,
             ..
         } = self;
+        drop(scratch);
         let shared = &engine.shared;
         // No commit can run (writer slot) and no compaction can replace runs while the new
         // version is built from the current one and installed.
@@ -455,7 +464,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                 None,
                 Arc::clone(&shared.views.read()),
             );
-            let path = checkpoint::write(durable.root(), &image)?;
+            let path = checkpoint::write(durable.root(), &image, shared.admission.as_ref())?;
             shared
                 .checkpoints
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -541,6 +550,7 @@ fn publish_streamed(
     let mut len = 0;
     let path = checkpoint::write_parts(
         durable.root(),
+        shared.admission.as_ref(),
         revision,
         &shared.dictionary,
         dictionary_len,

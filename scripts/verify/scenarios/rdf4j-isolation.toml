@@ -1,0 +1,78 @@
+description = """An RDF4J transaction's begin may name its isolation level (docs/ops/http-api.md, "RDF4J
+protocol"). A transaction here reads the latest commit with its own changes, one snapshot per read:
+with no level named (RDF4J's begin() without one), NONE (RDF4J's console) or SNAPSHOT_READ (what
+RDF4J's own stores give by default) it begins, 201 with its Location; SNAPSHOT and SERIALIZABLE,
+which it doesn't give, are refused at the begin with 400 and the reason as plain text, in the form
+body as RDF4J's Java client sends them and in the URL under the older name as graphdb.js does,
+never given weaker in silence."""
+
+[[step]]
+name = "begin with no level named: 201"
+method = "POST"
+path = "/repositories/nrese/transactions"
+[step.expect]
+status = 201
+headers = { location = { contains = "/repositories/nrese/transactions/" } }
+[step.capture]
+tx = { header = "location", regex = "/transactions/([^/?]+)$" }
+
+[[step]]
+name = "roll it back"
+method = "DELETE"
+path = "/repositories/nrese/transactions/${tx}"
+[step.expect]
+status = 204
+
+[[step]]
+name = "begin with NONE: 201"
+method = "POST"
+path = "/repositories/nrese/transactions"
+form = { "transaction-setting__org.eclipse.rdf4j.common.transaction.IsolationLevel" = "NONE" }
+[step.expect]
+status = 201
+[step.capture]
+tx_none = { header = "location", regex = "/transactions/([^/?]+)$" }
+
+[[step]]
+name = "roll back the NONE transaction"
+method = "DELETE"
+path = "/repositories/nrese/transactions/${tx_none}"
+[step.expect]
+status = 204
+
+[[step]]
+name = "begin with SNAPSHOT_READ: 201"
+method = "POST"
+path = "/repositories/nrese/transactions"
+form = { "transaction-setting__org.eclipse.rdf4j.common.transaction.IsolationLevel" = "SNAPSHOT_READ" }
+[step.expect]
+status = 201
+[step.capture]
+tx_read = { header = "location", regex = "/transactions/([^/?]+)$" }
+
+[[step]]
+name = "roll back the SNAPSHOT_READ transaction"
+method = "DELETE"
+path = "/repositories/nrese/transactions/${tx_read}"
+[step.expect]
+status = 204
+
+[[step]]
+name = "begin with SNAPSHOT in the form body: refused, 400 in plain text"
+method = "POST"
+path = "/repositories/nrese/transactions"
+form = { "transaction-setting__org.eclipse.rdf4j.common.transaction.IsolationLevel" = "SNAPSHOT" }
+[step.expect]
+status = 400
+headers = { content-type = { contains = "text/plain" } }
+body = [{ contains = "SNAPSHOT isn't supported" }, { contains = "SNAPSHOT_READ" }]
+
+[[step]]
+name = "begin with SERIALIZABLE in the URL, the older name: refused, 400 in plain text"
+method = "POST"
+path = "/repositories/nrese/transactions"
+params = { "isolation-level" = "http://www.openrdf.org/schema/sesame#SERIALIZABLE" }
+[step.expect]
+status = 400
+headers = { content-type = { contains = "text/plain" } }
+body = { contains = "SERIALIZABLE isn't supported" }
