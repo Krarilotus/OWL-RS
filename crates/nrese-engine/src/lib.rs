@@ -31,6 +31,7 @@ pub mod memory;
 pub mod quad;
 pub mod term;
 
+pub use durability::checkpoint::image_revision;
 pub use durability::{DurabilityConfig, SyncPolicy};
 pub use engine::{
     BulkLoad, BulkMode, CommitSummary, Content, Engine, EngineConfig, EngineStats, EqualityClasses,

@@ -36,6 +36,10 @@ pub struct ReadyResponse {
     pub reasoning_semantic_tier: &'static str,
     /// Under `owl2-dl`: the data's consistency under OWL 2 DL, as last checked.
     pub dl: Option<DlReady>,
+    /// The repositories that can't serve (`id: unavailable`): the server stays ready for
+    /// the others, so that a load balancer keeps it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
 }
 
 /// The `owl2-dl` mode's status.
@@ -164,6 +168,8 @@ pub struct AdminRestoreResponse {
     pub quad_count: u64,
     pub format: &'static str,
     pub checksum_sha256: String,
+    /// The payload's closing checksum comment (`# nrese-sha256`) was there and matched.
+    pub checksum_verified: bool,
     pub replaced_existing: bool,
 }
 
@@ -220,6 +226,7 @@ pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError>
                     revision: None,
                 },
             }),
+        degraded: state.degraded(),
     })
 }
 
@@ -348,6 +355,7 @@ pub fn build_admin_restore_response(
         quad_count: report.quad_count,
         format: "n-quads",
         checksum_sha256: report.checksum_sha256.clone(),
+        checksum_verified: report.checksum_verified,
         replaced_existing: report.replaced_existing,
     }
 }

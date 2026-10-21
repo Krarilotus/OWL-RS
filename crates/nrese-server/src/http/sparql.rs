@@ -9,7 +9,7 @@ use crate::error::ApiError;
 use crate::http::media::{BOOLEAN, GRAPHS, SOLUTIONS, negotiated};
 use crate::http::mutation;
 use crate::http::requests::{Explain, QueryOperation, UpdateOperation};
-use crate::http::result_stream::stream_blocking;
+use crate::http::result_stream::{Pace, stream_blocking};
 use crate::policy::PolicyConfig;
 use crate::state::AppState;
 
@@ -62,7 +62,7 @@ pub async fn execute_query_in(
         // Statistics only, nothing evaluated; under the deadline as evaluation is: planning
         // a large pattern stops when the deadline cancels it.
         return stream_blocking(
-            deadline,
+            Pace::Total(deadline),
             cancellation,
             "application/json",
             QUERY_TIMEOUT_MESSAGE,
@@ -78,7 +78,7 @@ pub async fn execute_query_in(
     }
     if explain == Explain::Analyze {
         return stream_blocking(
-            deadline,
+            Pace::Total(deadline),
             cancellation,
             "application/json",
             QUERY_TIMEOUT_MESSAGE,
@@ -101,7 +101,7 @@ pub async fn execute_query_in(
         *slot.lock().unwrap_or_else(|p| p.into_inner()) = r;
     };
     let mut response = stream_blocking(
-        deadline,
+        Pace::Total(deadline),
         cancellation,
         media_type,
         QUERY_TIMEOUT_MESSAGE,
