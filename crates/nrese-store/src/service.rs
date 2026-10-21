@@ -808,8 +808,24 @@ impl StoreService {
 
     /// Runs a prepared query on the latest snapshot to completion and reports how it ran:
     /// the executor, each operator with estimated and actual rows, and times. To a reader
-    /// who may not read every graph, without its operators ([`reads_everything`]).
+    /// who may not read every graph, only what is its own ([`for_its_reader`]).
     pub fn explain_query(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<crate::Explanation> {
+        for_its_reader(
+            prepared,
+            self.explain_whole(prepared, cancellation),
+            |explanation| {
+                explanation.steps.clear();
+                explanation.rewrites.clear();
+                explanation.decoded = 0;
+            },
+        )
+    }
+
+    fn explain_whole(
         &self,
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
@@ -849,19 +865,30 @@ impl StoreService {
                 .map(|ql| ql.completeness.clone())
                 .or_else(|| self.status_without_dl(prepared));
         }
-        if !reads_everything(prepared) {
-            explanation.steps.clear();
-            explanation.decoded = 0;
-        }
         Ok(explanation)
     }
 
     /// The plan `prepared` would run as, each node with its estimated rows, without
     /// running it (EXPLAIN without ANALYZE), within the query's memory envelope. Planning
     /// stops with [`nrese_sparql::QueryEvaluationError::Cancelled`] once `cancellation` is
-    /// cancelled. To a reader who may not read every graph, without its nodes
-    /// ([`reads_everything`]).
+    /// cancelled. To a reader who may not read every graph, only what is its own
+    /// ([`for_its_reader`]).
     pub fn plan_query(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<crate::PlannedQuery> {
+        for_its_reader(
+            prepared,
+            self.plan_whole(prepared, cancellation),
+            |planned| {
+                planned.steps.clear();
+                planned.rewrites.clear();
+            },
+        )
+    }
+
+    fn plan_whole(
         &self,
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
@@ -874,9 +901,6 @@ impl StoreService {
             cancellation,
             &memory,
         )?;
-        if !reads_everything(prepared) {
-            planned.steps.clear();
-        }
         planned.completeness = match self.dl_mode(prepared) {
             Some(_) => Some(crate::dl::query::plan_status(self, prepared)),
             None => planned
@@ -1659,10 +1683,26 @@ pub(crate) fn in_readable_graph(
     })
 }
 
-/// Whether `prepared` reads every graph: only then does EXPLAIN report its operators. Their
-/// estimates, their order (chosen by those estimates), their row counts, the dictionary work
-/// they report and their times come from statistics and scans of every graph, the ones its
-/// reader may not read too; the rewrites, the answer's rows and its completeness don't.
-fn reads_everything(prepared: &PreparedQuery) -> bool {
-    crate::ReadScope::of(prepared.access().cloned()).reads_everything()
+/// An EXPLAIN of `prepared` as its reader may be told it (round 13, R13-diag). A reader of
+/// every graph is told everything. Another is told only what comes from its query and its
+/// answer: `redact` takes the operators (their estimates, the order and the operators those
+/// chose, their rows, the dictionary work they report, their times) and the rewrites (an
+/// estimate decides some, as eager aggregation), all read from statistics and scans of every
+/// graph; and a memory refusal keeps its kind and limit but not the bytes held and asked
+/// for, which a scan of graphs it may not read sized.
+fn for_its_reader<T>(
+    prepared: &PreparedQuery,
+    whole: StoreResult<T>,
+    redact: impl FnOnce(&mut T),
+) -> StoreResult<T> {
+    if crate::ReadScope::of(prepared.access().cloned()).reads_everything() {
+        return whole;
+    }
+    match whole {
+        Ok(mut whole) => {
+            redact(&mut whole);
+            Ok(whole)
+        }
+        Err(error) => Err(error.without_amounts()),
+    }
 }
