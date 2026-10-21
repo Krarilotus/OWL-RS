@@ -270,3 +270,28 @@ fn a_cached_result_equals_a_fresh_one() {
     assert_eq!(fresh, hit);
     drop(tx);
 }
+
+/// A default graph merged from every graph but some (SHACL's data graph without its shapes,
+/// `set_default_graph_excluding`) ranks among the literals of the graphs it reads alone: the
+/// left-out graph's many `beta`s change no score, as if it weren't there.
+#[test]
+fn a_merge_of_every_graph_but_some_ranks_without_them() {
+    let (plain, with_shapes) = (Engine::new(EngineConfig::default()).unwrap(), {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        base(&engine);
+        let mut tx = engine.transaction();
+        betas(&mut tx, Some("shapes"));
+        tx.commit().unwrap();
+        engine
+    });
+    base(&plain);
+    let mut dataset = nrese_sparql::QueryDatasetSpecification::new();
+    dataset.set_default_graph_excluding(vec![ex("shapes").into()]);
+    let excluding = QueryOptions {
+        dataset: Some(dataset),
+        ..QueryOptions::default()
+    };
+    let expected = rows(&plain.snapshot(), RANKED, &QueryOptions::default());
+    assert_eq!(rows(&with_shapes.snapshot(), RANKED, &excluding), expected);
+    assert_eq!(expected[0].0, "beta");
+}

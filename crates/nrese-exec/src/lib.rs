@@ -61,7 +61,7 @@ static MEASURED: measure::Measured<std::alloc::System> = measure::Measured(std::
 pub use join::RowLimit;
 pub use narrow::RepresentationLimit;
 pub use region::{BoundTooLarge, Pages, Region, Settled};
-pub use stop::{POLL_UNITS, Stop, StopSource, Ticker};
+pub use stop::{POLL_UNITS, Stop, StopCheck, StopSource, Ticker};
 pub use table::IdTable;
 
 /// A hash map keyed by term ids, with the fast hasher the operators use.

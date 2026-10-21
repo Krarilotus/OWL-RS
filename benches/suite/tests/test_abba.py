@@ -124,6 +124,21 @@ class Abba(unittest.TestCase):
         self.family["cases"][0]["min_samples"] = 4  # every series has 3 samples a pass
         self.assertEqual(self.verdict(self.round_(records(), name="few"))[0], abba.NO_VERDICT)
 
+    def test_a_family_may_name_its_sides_by_short_ids(self):
+        """lcp-passes (21 Oct 2026): sides named by 8 digits got "no verdict" on every pass of a
+        complete run, the passes recording the full revisions."""
+        a, b = (abba.git("rev-parse", rev) for rev in ("dcb3b0e2", "0251a486"))
+        self.path.write_text(FAMILY.replace(A, a[:8]).replace(B, b[:8]), encoding="utf-8")
+        family = abba.load_family(self.path)
+        self.assertEqual(family["sides"], {"a": a, "b": b})
+        self.family = family
+        with patch.dict(fixture.REVS, {"a": a, "a2": a, "b": b}):
+            self.assertEqual(self.verdict(self.round_(records(), name="short"))[0], abba.NO_LOSS)
+        self.path.write_text(FAMILY.replace(A, "abcdef1"), encoding="utf-8")
+        with self.assertRaises(abba.Invalid) as refused:
+            abba.load_family(self.path)
+        self.assertIn("side a: abcdef1 names no single commit", "\n".join(refused.exception.args[0]))
+
     def test_a_family_with_a_case_without_a_content_check_is_refused(self):
         self.path.write_text(FAMILY + '''
 [[case]]

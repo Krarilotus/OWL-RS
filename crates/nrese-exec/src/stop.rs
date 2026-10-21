@@ -79,12 +79,7 @@ impl StopSource {
 
     /// A ticker for one loop or task, after checking at once.
     pub fn ticker(&self) -> Result<Ticker, Stop> {
-        self.check()?;
-        Ok(Ticker {
-            source: self.clone(),
-            left: POLL_UNITS,
-            not_sync: PhantomData,
-        })
+        Ticker::new(self.clone())
     }
 
     /// [`Stop::Cancelled`] once the flag is set or the deadline has passed.
@@ -105,16 +100,52 @@ impl StopSource {
     }
 }
 
-/// The countdown of one sequential loop or parallel task: it polls its [`StopSource`] every
+/// What a [`Ticker`] polls: a [`StopSource`], or the caller's own stop condition.
+pub trait StopCheck {
+    /// The stop, if there is one now.
+    fn check(&self) -> Result<(), Stop>;
+}
+
+impl StopCheck for StopSource {
+    fn check(&self) -> Result<(), Stop> {
+        StopSource::check(self)
+    }
+}
+
+/// A caller's own stop condition, a closure that turns true to stop: [`Stop::Cancelled`],
+/// meaning stopped for a reason the closure's owner tells (the reasoner's stop combines its
+/// caller's cancellation with the process's memory limit, and reports which itself).
+impl<F: Fn() -> bool + Sync + ?Sized> StopCheck for &F {
+    fn check(&self) -> Result<(), Stop> {
+        if self() { Err(Stop::Cancelled) } else { Ok(()) }
+    }
+}
+
+/// The countdown of one sequential loop or parallel task: it polls its [`StopCheck`] every
 /// [`POLL_UNITS`] units ticked. `Send`, not `Sync`: each task has its own.
-#[derive(Debug)]
-pub struct Ticker {
-    source: StopSource,
+pub struct Ticker<C: StopCheck = StopSource> {
+    source: C,
     left: u32,
     not_sync: PhantomData<Cell<()>>,
 }
 
-impl Ticker {
+impl<C: StopCheck> std::fmt::Debug for Ticker<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ticker").field("left", &self.left).finish()
+    }
+}
+
+impl<C: StopCheck> Ticker<C> {
+    /// A ticker polling `check`, after checking at once.
+    pub fn new(check: C) -> Result<Self, Stop> {
+        check.check()?;
+        Ok(Self {
+            source: check,
+            left: POLL_UNITS,
+            not_sync: PhantomData,
+        })
+    }
+
     /// Counts `units` of work done; polls when the allowance runs out, then starts a new
     /// one. A tick past several intervals polls once.
     #[inline]
@@ -145,7 +176,7 @@ impl Ticker {
     #[inline(never)]
     fn poll(&mut self) -> Result<(), Stop> {
         self.left = POLL_UNITS;
-        self.source.check()
+        StopCheck::check(&self.source)
     }
 }
 
@@ -222,5 +253,27 @@ mod tests {
             shared: false,
         };
         assert_eq!(Stop::from(exceeded), Stop::Memory(exceeded));
+    }
+
+    /// A ticker over a closure stops within `POLL_UNITS` units of the closure turning true;
+    /// `Ticker::new` checks at once; true is `Stop::Cancelled`.
+    #[test]
+    fn a_closure_backed_ticker_polls_the_closure() {
+        let stopped = AtomicBool::new(false);
+        let check = || stopped.load(Ordering::Relaxed);
+        let closure: &(dyn Fn() -> bool + Sync) = &check;
+        assert_eq!(StopCheck::check(&closure), Ok(()));
+        let mut ticker = Ticker::new(closure).unwrap();
+        for _ in 0..1000 {
+            ticker.tick(1).unwrap();
+        }
+        stopped.store(true, Ordering::Relaxed);
+        let mut after = 0;
+        while ticker.tick(1).is_ok() {
+            after += 1;
+        }
+        assert!(after < POLL_UNITS, "{after} units after the stop");
+        assert_eq!(StopCheck::check(&closure), Err(Stop::Cancelled));
+        assert!(matches!(Ticker::new(closure), Err(Stop::Cancelled)));
     }
 }

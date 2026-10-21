@@ -702,10 +702,16 @@ impl<'a> Parser<'a> {
         out: &mut Vec<TripleOrPath>,
     ) -> ParseResult<()> {
         match verb {
-            Verb::Variable(p) => {
-                add_triple(subject, p.into(), object, out);
-                Ok(())
-            }
+            Verb::Variable(p) => match &self.options.path_variable {
+                Some((variable, path)) if *variable == p => {
+                    let path = path.clone();
+                    self.add_path(subject, path, object, out)
+                }
+                _ => {
+                    add_triple(subject, p.into(), object, out);
+                    Ok(())
+                }
+            },
             Verb::Path(path) => self.add_path(subject, path, object, out),
         }
     }
