@@ -326,12 +326,25 @@ fn search_budget(len: usize) -> u64 {
 /// a checksummed record of a plausible revision would also count as one: opening then fails
 /// closed, and loses no commit.
 fn intact_record_in(rest: &[u8], next: Expected, timed: bool, work: &mut Work) -> Search {
+    search_within(rest, next, timed, work, search_budget(rest.len()))
+}
+
+/// [`intact_record_in`] with a budget of `budget` bytes parsed or checksummed: every charge is
+/// checked before its work, so `work.verified` never passes it.
+fn search_within(rest: &[u8], next: Expected, timed: bool, work: &mut Work, budget: u64) -> Search {
     let n = rest.len();
-    let latest = next.revision + (n / SMALLEST) as u64;
+    let latest = next.revision.saturating_add((n / SMALLEST) as u64);
     let dictionary = next
         .dictionary
         .map(|start| start..=start.saturating_add((n / 4) as u64));
-    let budget = search_budget(n);
+    // Charges `cost`, or `false` if it doesn't fit the budget left.
+    let charge = |work: &mut Work, cost: u64| match work.verified.checked_add(cost) {
+        Some(total) if total <= budget => {
+            work.verified = total;
+            true
+        }
+        _ => false,
+    };
     let field =
         |tail: &[u8], at: usize| u64::from_le_bytes(tail[at..at + 8].try_into().expect("8 bytes"));
     for at in 0..n.saturating_sub(SMALLEST - 1) {
@@ -347,24 +360,23 @@ fn intact_record_in(rest: &[u8], next: Expected, timed: bool, work: &mut Work) -
         // By its length field, if that fits: its checksum (and decoding) cost its length.
         let len = u32::from_le_bytes(tail[..4].try_into().expect("4 bytes")) as usize;
         if (SMALLEST - FRAME_HEADER..=tail.len() - FRAME_HEADER).contains(&len) {
-            if work.verified + 2 * len as u64 > budget {
+            if !charge(work, 2 * len as u64) {
                 return Search::Exhausted;
             }
-            work.verified += 2 * len as u64;
             if matches!(decode_frame(tail), Frame::Record(..)) {
                 return Search::Found;
             }
         }
-        // By its payload's structure (a damaged length field), parsed no further than the
-        // budget left, then checksummed.
-        let room = (budget - work.verified) as usize;
-        let window = &tail[..tail.len().min(FRAME_HEADER + room)];
+        // By its payload's structure (a damaged length field): the parse reads no more than
+        // the budget left (its header included), then the payload is checksummed.
+        let room = usize::try_from(budget - work.verified).unwrap_or(usize::MAX);
+        let window = &tail[..tail.len().min(room)];
         match structural_len(window, timed) {
             Ok(size) => {
-                if work.verified + 2 * size as u64 > budget {
+                // Parsed (within the room), then checksummed.
+                if !charge(work, size as u64) || !charge(work, size as u64) {
                     return Search::Exhausted;
                 }
-                work.verified += 2 * size as u64;
                 let crc = u32::from_le_bytes(tail[4..8].try_into().expect("4 bytes"));
                 if crc32fast::hash(&tail[FRAME_HEADER..size]) == crc {
                     return Search::Found;
@@ -374,7 +386,11 @@ fn intact_record_in(rest: &[u8], next: Expected, timed: bool, work: &mut Work) -
             Err(parsed) if parsed >= window.len() && window.len() < tail.len() => {
                 return Search::Exhausted;
             }
-            Err(parsed) => work.verified += parsed as u64,
+            Err(parsed) => {
+                if !charge(work, parsed as u64) {
+                    return Search::Exhausted;
+                }
+            }
         }
     }
     Search::None
@@ -768,5 +784,48 @@ mod tests {
             Search::Found
         );
         assert!(work.verified <= search_budget(tail.len()), "{work:?}");
+    }
+
+    /// Whatever the budget, the search charges no byte past it and never underflows: every
+    /// budget from 0 up to what a damaged run of frames needs (a zeroed page among them,
+    /// failed structure parses reaching the budget's edge; Sol r2 N1-R2-2).
+    #[test]
+    fn no_budget_is_overdrawn() {
+        let mut frames = Vec::new();
+        for revision in 1..=40u64 {
+            let quad = crate::quad::EncodedQuad::from_components([revision, 2, 3, 0]);
+            encode_record(
+                &CommitRecord {
+                    revision,
+                    dictionary_start: 100,
+                    inserts: vec![quad; 3],
+                    committed_micros: Some(revision),
+                    ..CommitRecord::default()
+                },
+                &mut frames,
+            )
+            .unwrap();
+        }
+        // Damage: zeros over the first frames, so later ones are found only past them.
+        frames[..600].fill(0);
+        frames[3] = 1;
+        let next = Expected {
+            revision: 1,
+            dictionary: Some(100),
+        };
+        let needed = {
+            let mut work = Work::default();
+            assert_eq!(
+                intact_record_in(&frames, next, true, &mut work),
+                Search::Found
+            );
+            work.verified
+        };
+        for budget in 0..=needed + 64 {
+            let mut work = Work::default();
+            let found = search_within(&frames, next, true, &mut work, budget);
+            assert!(work.verified <= budget, "budget {budget}: {work:?}");
+            assert_ne!(found, Search::None, "budget {budget}");
+        }
     }
 }

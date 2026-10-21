@@ -496,6 +496,35 @@ fn a_stale_segment_name_hides_no_intact_record() {
     }
 }
 
+/// A damaged tail whose search runs out of budget at a failed structure parse is refused as
+/// corruption, never a panic (Sol r2 N1-R2-2: the parse could be charged past the budget,
+/// and the next subtraction underflowed). The fixture is Sol's: 200 frames of 40 quads, a
+/// 4 KiB page of them zeroed.
+#[test]
+fn an_exhausted_evidence_search_refuses_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = dir.path().join("wal");
+    fs::create_dir(&wal).unwrap();
+    let segment = wal.join(format!("{:020}.wal", 1));
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wal-budget-page20.wal"),
+        &segment,
+    )
+    .unwrap();
+    let mut meta = segment.into_os_string();
+    meta.push(".meta");
+    fs::write(meta, b"sync=every-commit\n").unwrap();
+    let opened = std::panic::catch_unwind(|| Engine::open(dir.path(), config()));
+    match opened {
+        Ok(Err(EngineError::Corruption(_))) => {}
+        Ok(other) => panic!(
+            "expected corruption, got {:?}",
+            other.map(|e| e.stats().revision)
+        ),
+        Err(_) => panic!("the evidence search panicked"),
+    }
+}
+
 /// A segment holds commits of one sync policy: reopening under another starts a new one,
 /// and each records its own.
 #[test]
