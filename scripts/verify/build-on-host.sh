@@ -19,9 +19,10 @@
 # The contract's one sweep, under the lock after every build or reuse: entries bin-* unused for 7
 # days and target-* and py-* unused for 14 go, then the least recently used until the cache fits
 # NRESE_HOST_CACHE_GB (40), by each entry's .last-used (written by whoever builds in or uses it);
-# never this commit's binary or this toolchain's target directory, never wt, bin, rustup or cargo.
-# Exact paths under the cache only. The cache /verify had before (~/fleet/cache/owlrs-verify)
-# goes as a whole at the first build after the change, unless a build of the old kind holds it.
+# never this commit's binary or this toolchain's target directory, never wt (but its legacy
+# wt/target, an older gate tree's Miri build, as the gates sweep it), bin, rustup or cargo. Exact
+# paths under the cache only. The entries of the cache /verify had before (~/fleet/cache/owlrs-verify)
+# go at every build, unless a build of the old kind holds that cache's lock, which stays.
 #
 # Results ($FLEET_OUT): build.log, build.json (commit, host, toolchain, built or reused, seconds,
 # the binary's SHA-256 and size, python3's version for the run job, the step's memory: its
@@ -71,15 +72,33 @@ if ! flock -n 9; then
   flock -w "${NRESE_VERIFY_LOCK_S:-1800}" 9 || { echo "the cache's lock wasn't free in time" >&2; exit 3; }
 fi
 
-# /verify's cache from before the host's one cache: gone as a whole (its binaries are built again
-# on demand), unless a build of the old kind holds its lock now; then a later build removes it.
+# /verify's cache from before the host's one cache: its entries go (binaries are built again on
+# demand), taken under its own lock, unless a build of the old kind holds it now; then a later build
+# removes them. The lock file itself stays (0 bytes): a build of the old kind waiting on it would
+# otherwise take a lock no later migration sees, and a second migration could remove the target it
+# builds in (Sol r3, finding 1). Builds of the old kind come from harness commits before 7fdb5b58.
 migrated=0
 if [ "$old" != "$cache" ] && [ -d "$old" ]; then
   exec 8> "$old/lock"
   if flock -n 8; then
-    migrated=$(du -s --block-size=1 -- "$old" | cut -f1)
-    rm -rf -- "$old"
-    echo "removed $old ($migrated bytes): /verify uses the host's one cache now"
+    while IFS= read -r -d '' entry; do
+      # Its size, the number before du's first tab (a name may hold anything, newlines too); an
+      # entry gone meanwhile has none and nothing to remove, one that can't be measured stops
+      # the build (Sol r4, finding 1).
+      entry_bytes=0
+      if du_line=$(du -s --block-size=1 -- "$entry" 2> /dev/null); then
+        entry_bytes=${du_line%%$'\t'*}
+        [[ $entry_bytes =~ ^[0-9]+$ ]] || { echo "can't read the size of $entry: '$entry_bytes'" >&2; exit 3; }
+      elif [ -e "$entry" ] || [ -L "$entry" ]; then
+        echo "can't measure $entry" >&2
+        exit 3
+      fi
+      rm -rf -- "$entry"
+      migrated=$((migrated + entry_bytes))
+    done < <(find "$old" -mindepth 1 -maxdepth 1 ! -name lock -print0)
+    if [ "$migrated" -gt 0 ]; then
+      echo "removed $old's entries ($migrated bytes): /verify uses the host's one cache now"
+    fi
   else
     echo "$old is held by a build of the old kind: left for a later build"
   fi
@@ -162,10 +181,12 @@ def mib(path):
 
 
 # The contract's sweep (Harness/notes/2026-10-20-host-cache-contract.md §6), as gate-job.sh runs it:
-# never what this build uses; wt, bin, rustup and cargo match none of the patterns.
+# never what this build uses; wt, bin, rustup and cargo match none of the patterns. The gates' legacy
+# wt/target (an older gate tree's Miri build in the worktree) is an entry too, as they sweep it.
 kept = {binary_dir, target}
-entries = [p for pattern in ("bin-*", "target-*", "py-*") for p in glob.glob(os.path.join(cache, pattern))
-           if os.path.isdir(p) and p not in kept]
+candidates = [p for pattern in ("bin-*", "target-*", "py-*") for p in glob.glob(os.path.join(cache, pattern))]
+candidates.append(os.path.join(cache, "wt", "target"))
+entries = [p for p in candidates if os.path.isdir(p) and p not in kept]
 before, removed = size(cache), []
 total = before
 for path in sorted(entries, key=last_used):  # least recently used first
