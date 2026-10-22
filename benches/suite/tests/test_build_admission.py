@@ -10,6 +10,7 @@ Run: python -m unittest discover -s benches/suite/tests -p test_build_admission.
 """
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import shutil
@@ -109,6 +110,72 @@ class Admission(unittest.TestCase):
 
     def ended(self, run):
         return int((self.out / f"{run}.ended").read_text())
+
+    def test_fleet_resource_projection_preserves_the_declared_peak(self):
+        self.free(64)
+        shutil.copy(ROOT / "scripts/lib/gate-job.sh", self.repo / "scripts/lib/gate-job.sh")
+        # Keep the real guard. Its existing helper interface only records the cap
+        # here: this fixture must not attach a new JobObject or compile Rust.
+        helper = self.repo / "scripts/lib/memory-cap.ps1"
+        helper.write_text('''param([int]$ProcessId, [double]$LimitGB, [string]$Registry)
+[IO.File]::WriteAllText((Join-Path $env:OUT ($env:RUN+'.cap')), $LimitGB.ToString([Globalization.CultureInfo]::InvariantCulture))
+Write-Output 'fixture-memory-job'
+''' + f"# {self.root.name}\n", encoding="utf-8")
+        self.stub("cargo", 'cat "$NRESE_BUILD_SLOT_DIR"/run/*/peak > "$OUT/$RUN.peak"\n' +
+                  (self.stubs / "cargo").read_text())
+        transport = self.root / "transport"
+        transport.mkdir()
+        (transport / "sitecustomize.py").write_text(
+            "import os,sys\nsys.stdout.reconfigure(newline=os.environ['RESOURCE_ENDING'])\n")
+        observe = '''set -T
+trap 'case "$BASH_COMMAND" in "export CARGO_BUILD_WARNINGS="*) printf "%s\\0" "$CARGO_BUILD_JOBS" "$NRESE_MEMORY_CAP_GB" "$NRESE_BUILD_PEAK_GB" > "$PROJECTION"; exit 0;; esac' DEBUG
+source scripts/lib/gate-job.sh "$@"
+'''
+        try:
+            # The actual failing whole-valued budget under both transports, and
+            # one fractional ask proving it is retained, never rounded to fit.
+            for run, ram, ending, expected in (("whole-lf", 24.0, "\n", "24"),
+                                               ("whole-crlf", 24.0, "\r\n", "24"),
+                                               ("fraction-crlf", 24.5, "\r\n", "24.5")):
+                with self.subTest(run=run):
+                    projection = self.out / (run + ".projection")
+                    prologue = self.out / (run + ".prologue")
+                    env = self.env(run, FLEET_JOB="resource-fixture", FLEET_STEP="1", FLEET_OUT=str(prologue),
+                        NRESE_GATE_REQUEST="request", NRESE_GATE_BOUNDED="1",
+                        NRESE_GATE_NEEDS=json.dumps([{"cores": 16, "ram_gb": ram}]),
+                        PYTHONPATH=transport.as_posix(), RESOURCE_ENDING=ending, PROJECTION=projection.as_posix(),
+                        PATH=str(Path(sys.executable).parent)+os.pathsep+str(Path(BASH).parent)+os.pathsep+self.env(run)["PATH"])
+                    done = subprocess.run([BASH, "-c", observe, "resource-prologue", "push", "tree", "list",
+                        "windows" if os.name == "nt" else "rest", "0", "request", "base", "flags", "compiler", "--"],
+                        cwd=self.repo, env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+                    (self.out / (run + ".prologue.log")).write_bytes(done.stdout + done.stderr)
+                    self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                    values = projection.read_bytes().split(b"\0")[:-1]
+                    projected = dict(zip(("CARGO_BUILD_JOBS", "NRESE_MEMORY_CAP_GB", "NRESE_BUILD_PEAK_GB"),
+                                         (value.decode() for value in values)))
+                    build = self.start(run, stderr=subprocess.PIPE, **projected)
+                    _, err = build.communicate(timeout=60)
+                    (self.out / (run + ".guard.log")).write_text(err)
+                    started = (self.out / (run + ".started")).exists()
+                    (self.out / (run + ".json")).write_text(json.dumps({"projected": projected,
+                        "code": build.returncode, "cargo_started": started, "stderr": err}))
+                    self.assertEqual(projected, {"CARGO_BUILD_JOBS": "16", "NRESE_MEMORY_CAP_GB": expected,
+                                                 "NRESE_BUILD_PEAK_GB": expected})
+                    if ram == 24.0:
+                        self.assertEqual(build.returncode, 0, err)
+                        self.assertEqual(self.started(run, within=1)[1], "16")
+                        self.assertEqual((self.out / (run + ".peak")).read_text().strip(), "24576")
+                    else:
+                        # Fractional native peak support is outside this fix;
+                        # unchanged admission refuses it before Cargo starts.
+                        self.assertNotEqual(build.returncode, 0)
+                        self.assertIn("invalid arithmetic operator", err)
+                        self.assertFalse(started)
+                    if os.name == "nt":
+                        self.assertEqual((self.out / (run + ".cap")).read_text(), expected)
+        finally:
+            if os.environ.get("FLEET_OUT"):
+                shutil.copytree(self.out, Path(os.environ["FLEET_OUT"]) / ("resource-fixture-" + self.root.name), dirs_exist_ok=True)
 
     def test_a_build_that_fits_above_the_floor_runs_though_the_machine_is_busy(self):
         # The orchestrator, 20 Oct 2026: BUSY stayed set for hours under the agents' own load. 12 GB
