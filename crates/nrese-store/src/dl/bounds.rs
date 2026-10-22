@@ -49,10 +49,50 @@ struct State {
     rules: bool,
 }
 
-/// The route the ontology's profile gives (`nrese_owl::profile`): an OWL 2 RL ontology
-/// to the RL rules alone.
+/// Whether the RL rules alone decide `ontology`: its profile is OWL 2 RL
+/// (`nrese_owl::profile`; theorem PR1 makes the rules complete for it), nothing in it is
+/// fatal, and no literal of its data axioms is ill-typed ([`ill_typed`]).
 fn routed_to_rules(ontology: &Ontology) -> bool {
     nrese_owl::profile::of_ontology(ontology).rl
+        && ontology.diagnostics.iter().all(|d| !d.is_fatal())
+        && !ontology.data.literals.values().any(|literal| {
+            ill_typed(
+                &literal.lexical,
+                literal.datatype.as_deref(),
+                literal.language.as_deref(),
+            )
+        })
+}
+
+/// Whether a literal is ill-typed: its datatype is in the OWL 2 datatype map and its
+/// lexical form isn't one of the datatype's, so it has no data value. The RL rules judge
+/// one only where a range asks (`dt-not-type`) and can't claim an ontology with one
+/// consistent; the route goes to the DL engines, which don't either. A datatype outside
+/// the map (`xsd:date`), and a value the map can't represent, are left as the RL rules
+/// leave them: opaque.
+fn ill_typed(lexical: &str, datatype: Option<&str>, language: Option<&str>) -> bool {
+    use nrese_xsd::owl::{Datatype, LiteralError, Value};
+    datatype
+        .and_then(Datatype::from_iri)
+        .is_some_and(|datatype| {
+            matches!(
+                Value::parse(lexical, datatype, language),
+                Err(LiteralError::IllTyped(_))
+            )
+        })
+}
+
+/// Whether a literal the commit inserts is ill-typed ([`ill_typed`]): the commit takes the
+/// full preparation, which routes the ontology.
+fn inserts_ill_typed(tx: &Transaction<'_>) -> bool {
+    tx.inserted().any(|quad| match tx.decode(quad.object) {
+        Some(nrese_rdf::Term::Literal(literal)) => ill_typed(
+            literal.value(),
+            Some(literal.datatype().as_str()),
+            literal.language(),
+        ),
+        _ => false,
+    })
 }
 
 /// U1's place on the RL route: not compiled.
@@ -163,6 +203,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     let asserted: Vec<Triple> = tx.inserted().chain(tx.deleted()).map(quad_triple).collect();
     if let Some(State { rules: true, .. }) = current
         && !asserted.iter().any(|t| changes_schema(tx, *t))
+        && !inserts_ill_typed(tx)
     {
         return Preparation {
             base,
@@ -230,7 +271,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     drop(state);
     source::intern_vocabulary(tx);
     let ontology = source::read_pending(tx);
-    if routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal()) {
+    if routed_to_rules(&ontology) {
         // The RL gate that ran before has decided the commit's consistency.
         return Preparation {
             base,
@@ -369,8 +410,7 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
             source::intern_vocabulary(&tx);
         }
         let ontology = source::read_snapshot(&snapshot);
-        let rules =
-            routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal());
+        let rules = routed_to_rules(&ontology);
         let upper = match rules {
             true => not_compiled(),
             false => {

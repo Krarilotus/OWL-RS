@@ -59,6 +59,10 @@ pub enum Guard {
     /// individuals) as one rule whose pairs are checked here, instead of a rule per pair
     /// ([`super::lists`]; its rules are symmetric in the two terms).
     SameList(Term, Term, SharedListIndex),
+    /// The rule's `NotEqual` and `NotIn` guards under equality by representatives, where a
+    /// value stands for every identity of its class: they hold if some choice of identities
+    /// satisfies them all ([`super::representatives::over_classes`]).
+    Classes(super::representatives::ClassGuards),
 }
 
 impl Guard {
@@ -74,6 +78,7 @@ impl Guard {
                 (Some(a), Some(b)) => a < b && index.together(a, b),
                 _ => true,
             },
+            Guard::Classes(guards) => guards.holds(&value),
         }
     }
 }
@@ -118,6 +123,11 @@ impl ListIndex {
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
+
+    /// Whether `member` is a member of a list.
+    pub fn contains(&self, member: u64) -> bool {
+        self.lists.contains_key(&member)
+    }
 }
 
 /// A [`ListIndex`] shared by the rules that ask it; compared by its contents, so that
@@ -145,6 +155,10 @@ impl SharedListIndex {
 
     pub fn together(&self, a: u64, b: u64) -> bool {
         self.index.together(a, b)
+    }
+
+    pub fn contains(&self, member: u64) -> bool {
+        self.index.contains(member)
     }
 }
 

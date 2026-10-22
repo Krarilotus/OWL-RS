@@ -27,6 +27,26 @@ fn an_rl_ontology_is_decided_by_the_rules_alone() {
     assert_eq!(rows, ["rex"]);
     assert!(status.is_complete());
     assert_eq!(status.paths, ["closed-predicates"]);
+    // `x owl:sameAs x` holds of every individual and neither bound has it (eq-ref isn't
+    // materialised): a read whose ends can be one term is sound only, when it runs and in
+    // its plan; two terms are decided.
+    for q in [
+        "ASK { :rex owl:sameAs :rex }",
+        "SELECT ?x { ?x owl:sameAs :rex }",
+    ] {
+        let (_, status) = query(&dl, q);
+        assert!(!status.is_complete(), "{q}");
+        let request = nrese_store::SparqlQueryRequest::all(format!("{}{q}", super::PREFIXES));
+        let prepared = dl.store().prepare_query(&request).expect("prepared");
+        let planned = dl
+            .store()
+            .plan_query(&prepared, &nrese_store::CancellationToken::new())
+            .expect("planned");
+        assert!(!planned.completeness.expect("a status").complete, "{q}");
+    }
+    let (rows, status) = query(&dl, "ASK { :ann owl:sameAs :rex }");
+    assert_eq!(rows, ["false"]);
+    assert!(status.is_complete(), "{:?}", status.reasons());
     let (rows, status) = query(
         &dl,
         "SELECT ?x { ?x a :Pet FILTER NOT EXISTS { ?x a :Plant } }",
@@ -68,4 +88,24 @@ fn an_axiom_outside_rl_takes_the_ontology_off_the_rules_route() {
     )
     .expect("its list removed");
     assert_eq!(dl.store().dl_bounds().last, "rules");
+}
+
+/// The RL route claims consistency only where the RL rules judge every literal: an
+/// ill-typed one (no data value; the rules judge it only under a range) takes the DL route,
+/// which doesn't claim it either, whether the ontology or a later commit brings it. A
+/// datatype outside the OWL 2 map (`xsd:date`) stays opaque, on the RL route.
+#[test]
+fn an_ill_typed_literal_leaves_the_rl_route() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":Dog rdfs:subClassOf :Animal . :rex a :Dog ; :born \"2020-01-01\"^^xsd:date .",
+    )
+    .expect("an RL ontology");
+    assert_eq!(dl.store().dl_bounds().last, "rules");
+    let status = dl.store().dl().status().expect("status");
+    assert_eq!(status.consistency.verdict.as_str(), "consistent");
+    insert(&dl, ":rex :age \"abc\"^^xsd:integer .").expect("no range judges it");
+    let status = dl.store().dl().status().expect("status");
+    assert_ne!(status.consistency.verdict.as_str(), "consistent");
 }
