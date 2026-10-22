@@ -7,6 +7,16 @@ use crate::config::env_names as names;
 use crate::config::source::ConfigSource;
 
 #[test]
+fn n7_federation_response_cap_uses_the_existing_file_setting_path() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("federation.toml");
+    fs::write(&path, "[federation]\nmax_response_bytes = \"1KiB\"\n").unwrap();
+    let source = load_file_source(&path).unwrap();
+    let value = source.get(names::FEDERATION_MAX_RESPONSE_BYTES).unwrap();
+    assert_eq!(crate::config::units::parse_size(&value).unwrap(), 1024);
+}
+
+#[test]
 fn file_config_maps_sections_to_runtime_keys() {
     let temp_dir = tempdir().expect("temp dir");
     let path = temp_dir.path().join("config.toml");

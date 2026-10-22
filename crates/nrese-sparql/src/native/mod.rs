@@ -1319,6 +1319,24 @@ pub(crate) fn own_bytes(snapshot: &Snapshot) -> usize {
     memory.used()
 }
 
+// The same read-refusal/cancellation source is borrowed by SERVICE transport,
+// decoded-result copying and response import; it never escapes into a pool task.
+impl nrese_exec::StopCheck for Context<'_> {
+    fn check(&self) -> Result<(), nrese_exec::Stop> {
+        if let Some(refused) = self.reads_refused.or_else(|| self.snapshot.read_refused()) {
+            return Err(nrese_exec::Stop::Memory(refused));
+        }
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(nrese_exec::Stop::Cancelled);
+        }
+        Ok(())
+    }
+}
+
 impl<'a> Context<'a> {
     /// Whether `triple` is a GeoSPARQL relation computed from geometries
     /// ([`spatial`]): not when only stated relations are read.
@@ -1516,13 +1534,7 @@ impl<'a> Context<'a> {
     /// Fails a cancelled query, and one a read refused memory to: what it read since may
     /// be incomplete ([`Snapshot::reading_within`]).
     fn check(&self) -> NativeResult<()> {
-        if let Some(refused) = self.reads_refused.or_else(|| self.snapshot.read_refused()) {
-            return Err(QueryEvaluationError::MemoryLimit(refused).into());
-        }
-        Ok(self
-            .cancellation
-            .as_ref()
-            .map_or(Ok(()), CancellationToken::check)?)
+        Ok(nrese_exec::StopCheck::check(self).map_err(QueryEvaluationError::from)?)
     }
 
     /// Charges a produced table against the query's memory budget.

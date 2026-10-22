@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
 use nrese_sparql::{
-    CancellationToken, QueryOptions, QueryResults, ServiceClient, ServiceResults, Services,
-    evaluate_query, explain_query,
+    CancellationToken, QueryEvaluationError, QueryOptions, QueryResults, ServiceClient,
+    ServiceResults, Services, evaluate_query, explain_query,
 };
 use nrese_sparql_syntax::SparqlParser;
 
@@ -31,27 +31,39 @@ impl ServiceClient for Endpoint {
         &self,
         endpoint: &str,
         query: &str,
-        _cancellation: Option<&CancellationToken>,
-    ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
+        budget: &Arc<nrese_exec::Budget>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ServiceResults, QueryEvaluationError> {
         assert_eq!(endpoint, REMOTE);
         self.queries.lock().unwrap().push(query.to_owned());
         if self.fail {
-            return Err("the endpoint is down".into());
+            return Err(QueryEvaluationError::Service("the endpoint is down".into()));
         }
-        let parsed = SparqlParser::new().parse_query(query)?;
+        let parsed = SparqlParser::new()
+            .parse_query(query)
+            .map_err(|e| QueryEvaluationError::Service(Box::new(e)))?;
+        let mut options = QueryOptions::default();
+        options.resources.memory = nrese_exec::Envelope::from_budget(Arc::clone(budget));
+        options.resources.cancellation = cancellation.cloned();
+        assert!(std::ptr::eq(&*options.resources.memory, &**budget));
         let snapshot = self.engine.snapshot();
-        let QueryResults::Solutions(solutions) =
-            evaluate_query(&snapshot, &parsed, &QueryOptions::default())?
+        let QueryResults::Solutions(solutions) = evaluate_query(&snapshot, &parsed, &options)?
         else {
-            return Err("not a SELECT".into());
+            return Err(QueryEvaluationError::Service("not a SELECT".into()));
         };
-        let variables = solutions.variables().to_vec();
-        let mut rows = Vec::new();
-        for solution in solutions {
-            let solution = solution?;
-            rows.push(variables.iter().map(|v| solution.get(v).cloned()).collect());
+        let mut result = ServiceResults::new(solutions.variables().to_vec(), budget);
+        let stop = nrese_exec::StopSource::new(cancellation.map(CancellationToken::flag), None);
+        let mut solutions = solutions;
+        loop {
+            stop.check().map_err(QueryEvaluationError::from)?;
+            let next = solutions.next();
+            stop.check().map_err(QueryEvaluationError::from)?;
+            let Some(solution) = next else {
+                break;
+            };
+            result.push_row(solution?.values(), &stop)?;
         }
-        Ok(ServiceResults { variables, rows })
+        Ok(result)
     }
 }
 
@@ -232,8 +244,8 @@ fn silent_services_fail_into_one_empty_solution() {
     }
 }
 
-/// Response modes exercise the existing public client API, including boxed typed
-/// errors and a client that notices cancellation only as it returns.
+/// Response modes exercise the existing public client API, including typed
+/// failures and a client that notices cancellation only as it returns.
 enum N7Mode {
     Engine(Engine),
     Nodes,
@@ -268,49 +280,48 @@ impl ServiceClient for N7Endpoint {
         &self,
         endpoint: &str,
         query: &str,
+        budget: &Arc<nrese_exec::Budget>,
         cancellation: Option<&CancellationToken>,
-    ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
-        use nrese_sparql::QueryEvaluationError;
+    ) -> Result<ServiceResults, QueryEvaluationError> {
         let number = {
             let mut queries = self.queries.lock().unwrap();
             queries.push((endpoint.to_owned(), query.to_owned()));
             queries.len()
         };
         if endpoint.ends_with("/bad") {
-            return Err("endpoint failed".into());
+            return Err(QueryEvaluationError::Service("endpoint failed".into()));
         }
         if endpoint.ends_with("/empty") {
-            return Ok(ServiceResults {
-                variables: vec![nrese_rdf::Variable::new_unchecked("answer")],
-                rows: vec![],
-            });
+            return Ok(ServiceResults::new(
+                vec![nrese_rdf::Variable::new_unchecked("answer")],
+                budget,
+            ));
         }
         match &self.mode {
-            N7Mode::Memory => Err(
-                QueryEvaluationError::MemoryLimit(nrese_exec::BudgetExceeded {
-                    limit: 1,
-                    requested: 2,
-                    used: 0,
-                    shared: false,
-                })
-                .into(),
-            ),
+            N7Mode::Memory => Err(budget
+                .charge(budget.remaining().saturating_add(1))
+                .unwrap_err()
+                .into()),
             N7Mode::Cancel(fail) => {
                 cancellation.expect("test supplies a token").cancel();
                 if *fail {
-                    Err("client stopped".into())
+                    Err(QueryEvaluationError::Service("client stopped".into()))
                 } else {
-                    Ok(ServiceResults::default())
+                    Ok(ServiceResults::new(Vec::new(), budget))
                 }
             }
             N7Mode::FailSecond => {
                 if number == 2 {
-                    return Err("later bind chunk failed".into());
+                    return Err(QueryEvaluationError::Service(
+                        "later bind chunk failed".into(),
+                    ));
                 }
-                Ok(ServiceResults {
-                    variables: vec![nrese_rdf::Variable::new_unchecked("answer")],
-                    rows: vec![vec![Some(Literal::new_simple_literal("prefix").into())]],
-                })
+                let mut result =
+                    ServiceResults::new(vec![nrese_rdf::Variable::new_unchecked("answer")], budget);
+                let stop =
+                    nrese_exec::StopSource::new(cancellation.map(CancellationToken::flag), None);
+                result.push_row(&[Some(Literal::new_simple_literal("prefix").into())], &stop)?;
+                Ok(result)
             }
             N7Mode::Nodes => {
                 let node = nrese_rdf::BlankNode::new_unchecked("remote");
@@ -320,32 +331,47 @@ impl ServiceClient for N7Endpoint {
                     nrese_rdf::Triple::new(ex("inner"), ex("q"), node.clone()),
                 );
                 let row = vec![Some(node.into()), Some(nested.into())];
-                Ok(ServiceResults {
-                    variables: vec![
+                let mut result = ServiceResults::new(
+                    vec![
                         nrese_rdf::Variable::new_unchecked("x"),
                         nrese_rdf::Variable::new_unchecked("t"),
                     ],
-                    rows: vec![row.clone(), row],
-                })
+                    budget,
+                );
+                let stop =
+                    nrese_exec::StopSource::new(cancellation.map(CancellationToken::flag), None);
+                result.push_row(&row, &stop)?;
+                result.push_row(&row, &stop)?;
+                Ok(result)
             }
             N7Mode::Engine(engine) => {
-                let parsed = SparqlParser::new().parse_query(query)?;
+                let parsed = SparqlParser::new()
+                    .parse_query(query)
+                    .map_err(|e| QueryEvaluationError::Service(Box::new(e)))?;
+                let mut options = QueryOptions::default();
+                options.resources.memory = nrese_exec::Envelope::from_budget(Arc::clone(budget));
+                options.resources.cancellation = cancellation.cloned();
+                assert!(std::ptr::eq(&*options.resources.memory, &**budget));
                 let snapshot = engine.snapshot();
                 let QueryResults::Solutions(solutions) =
-                    evaluate_query(&snapshot, &parsed, &QueryOptions::default())?
+                    evaluate_query(&snapshot, &parsed, &options)?
                 else {
-                    return Err("expected SELECT".into());
+                    return Err(QueryEvaluationError::Service("expected SELECT".into()));
                 };
-                let variables = solutions.variables().to_vec();
-                let mut out = Vec::new();
-                for row in solutions {
-                    let row = row?;
-                    out.push(variables.iter().map(|v| row.get(v).cloned()).collect());
+                let mut result = ServiceResults::new(solutions.variables().to_vec(), budget);
+                let stop =
+                    nrese_exec::StopSource::new(cancellation.map(CancellationToken::flag), None);
+                let mut solutions = solutions;
+                loop {
+                    stop.check().map_err(QueryEvaluationError::from)?;
+                    let next = solutions.next();
+                    stop.check().map_err(QueryEvaluationError::from)?;
+                    let Some(solution) = next else {
+                        break;
+                    };
+                    result.push_row(solution?.values(), &stop)?;
                 }
-                Ok(ServiceResults {
-                    variables,
-                    rows: out,
-                })
+                Ok(result)
             }
         }
     }
@@ -685,6 +711,7 @@ fn n7_silent_preserves_typed_stops_and_discards_partial_chunks() {
         let endpoint = N7Endpoint::new(mode);
         let mut options = endpoint.options();
         options.resources.cancellation = Some(CancellationToken::new());
+        options.resources.memory = nrese_exec::Envelope::new(Some(1 << 20), None);
         let snapshot = local.snapshot();
         let result = evaluate_query(&snapshot, &query, &options);
         if memory {
@@ -707,4 +734,109 @@ fn n7_silent_preserves_typed_stops_and_discards_partial_chunks() {
         rows(&local, &oracle, &QueryOptions::default()).unwrap()
     );
     assert_eq!(endpoint.queries.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn n7_nested_endpoint_bag_and_escaping_response_share_the_invocation_budget() {
+    let endpoint = Endpoint {
+        engine: engine(&[]),
+        queries: Mutex::default(),
+        fail: false,
+    };
+    let budget = Arc::new(nrese_exec::Budget::new(1 << 20));
+    let mut caller = nrese_exec::Reservation::new(Arc::clone(&budget));
+    caller.charge(64).unwrap();
+    let token = CancellationToken::new();
+    let response = endpoint
+        .select(
+            REMOTE,
+            "SELECT ?x WHERE { VALUES ?x { 1 1 UNDEF } }",
+            &budget,
+            Some(&token),
+        )
+        .unwrap();
+    assert_eq!(response.rows().len(), 3);
+    assert_eq!(response.rows()[0], response.rows()[1]);
+    assert_eq!(response.rows()[2], vec![None]);
+    assert!(budget.used() > 64);
+    // The nested Context is already gone, but the decoded response still owns
+    // admitted payload alongside the caller. It cannot spend that capacity again.
+    assert!(budget.charge(budget.remaining() + 1).is_err());
+    drop(endpoint);
+    drop(response);
+    assert_eq!(budget.used(), 64);
+    drop(caller);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn n7_nested_evaluation_preserves_its_original_actuator_and_memory_failure() {
+    struct Leaf {
+        actuator: CancellationToken,
+        root: Arc<nrese_exec::Budget>,
+        memory: bool,
+        called: std::sync::atomic::AtomicBool,
+    }
+    impl ServiceClient for Leaf {
+        fn select(
+            &self,
+            _: &str,
+            _: &str,
+            budget: &Arc<nrese_exec::Budget>,
+            cancellation: Option<&CancellationToken>,
+        ) -> Result<ServiceResults, QueryEvaluationError> {
+            let token = cancellation.expect("the nested evaluation keeps the caller token");
+            assert!(Arc::ptr_eq(&token.flag(), &self.actuator.flag()));
+            assert!(!Arc::ptr_eq(budget, &self.root)); // Native's ordinary child part.
+            assert!(self.root.used() >= budget.used());
+            self.called
+                .store(true, std::sync::atomic::Ordering::Release);
+            if self.memory {
+                // Refusal comes from this child's actual parent, not a fabricated
+                // error or an independent budget with an equal-sized limit.
+                Err(budget.charge(2 << 20).unwrap_err().into())
+            } else {
+                // The fixture retains the actuator; the leaf does not reconstruct
+                // one from a stop trait. The native closing check must see this
+                // even though the leaf returns a successful empty response.
+                self.actuator.cancel();
+                Ok(ServiceResults::new(Vec::new(), budget))
+            }
+        }
+    }
+    let nested = engine(&[]);
+    let snapshot = nested.snapshot();
+    let query = SparqlParser::new()
+        .parse_query(&format!(
+            "SELECT * WHERE {{ SERVICE SILENT <{REMOTE}> {{ BIND(1 AS ?x) }} }}"
+        ))
+        .unwrap();
+    for memory in [true, false] {
+        let budget = Arc::new(nrese_exec::Budget::new(1 << 20));
+        let token = CancellationToken::new();
+        let leaf = Arc::new(Leaf {
+            actuator: token.clone(),
+            root: Arc::clone(&budget),
+            memory,
+            called: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut options = QueryOptions::default();
+        options.resources.memory = nrese_exec::Envelope::from_budget(Arc::clone(&budget));
+        options.resources.cancellation = Some(token.clone());
+        options.services = Some(Services(leaf.clone()));
+        assert!(std::ptr::eq(&*options.resources.memory, &*budget));
+        let result = evaluate_query(&snapshot, &query, &options);
+        assert!(leaf.called.load(std::sync::atomic::Ordering::Acquire));
+        if memory {
+            assert!(
+                matches!(&result, Err(QueryEvaluationError::MemoryLimit(e)) if e.limit == 1 << 20)
+            );
+            assert!(!token.is_cancelled());
+        } else {
+            assert!(matches!(&result, Err(QueryEvaluationError::Cancelled)));
+            assert!(token.is_cancelled());
+        }
+        drop(result);
+        assert_eq!(budget.used(), 0);
+    }
 }
