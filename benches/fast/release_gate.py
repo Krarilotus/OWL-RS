@@ -224,7 +224,7 @@ def p50(values: list[float]) -> float:
 def evidence(passes: list[dict], case: str) -> dict:
     """One side's evidence of a case, pass by pass, each pass's block and layout beside it."""
     out = {"status": [], "expected": [], "failed_checks": [], "failed_routes": [], "unchecked": 0, "notes": [],
-           "samples": [], "blocks": [], "layouts": [],
+           "samples": [], "blocks": [], "layouts": [], "unsupported": [],
            "process": [], "estimator": set(), "lifetime": [], "anon_kernel": [], "live": [], "kinds": set(),
            "phases": [], "cgroup": [], "qps": [],
            "client_peaks": [], "cache_peaks": [], "rows": [], "counters": {}, "batched": {}}
@@ -234,6 +234,7 @@ def evidence(passes: list[dict], case: str) -> dict:
         record = next((r for r in p["report"]["records"] if r.get("case") == case), None)
         out["blocks"].append(p["report"].get("block", p["n"]))
         out["layouts"].append(p["report"].get("layout", 1))
+        out["unsupported"].append((p["report"].get("unsupported_dimensions") or {}).get(case, {}))
         if record is None:
             out["status"].append("missing")
             out["expected"].append("ok")
@@ -396,6 +397,8 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], f
         row["notes"].append(f"times as one p50 per process on both sides ({side}'s perf lab reports no samples)")
     key = "process" if adapted else "samples"
     series = sorted({s for rep in cand[key] + base[key] for s in rep})
+    from measurement_support import common_unsupported
+    row["not_compared"].update(common_unsupported(cand, base, series))
     for s in series:
         if s in excluded:
             continue
@@ -465,6 +468,9 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], f
 
 def describe(r: dict) -> str:
     if r.get("ratio") is None:
+        if r.get("nonpositive_blocks"):
+            return (f"{r['nonpositive_blocks']} paired blocks have collected non-positive medians; "
+                    "log ratio not resolved (not missing executions)")
         return f"{r.get('blocks', 0)} blocks with values on both sides"
     ci = f" [{r['ci'][0]:.4f}, {r['ci'][1]:.4f}]" if r.get("ci") else ""
     flip = f", sign-flip p {r['p_sign_flip']:.3g}" if r.get("p_sign_flip") is not None else ""
@@ -480,7 +486,7 @@ def worse_end(r: dict) -> float | None:
 
 
 def block_contrasts(base: list[list[float]], base_blocks: list, new: list[list[float]], new_blocks: list,
-                    layouts: dict) -> tuple[list[float], list, float, float]:
+                    layouts: dict, diagnostics: dict | None = None) -> tuple[list[float], list, float, float]:
     """Per block present on both sides: log(median of the candidate's values in it / median of the
     baseline's); the blocks' layouts; the medians of all the baseline's and candidate's values."""
     def by_block(values, blocks):
@@ -496,6 +502,8 @@ def block_contrasts(base: list[list[float]], base_blocks: list, new: list[list[f
             if mb > 0 and mn > 0:
                 contrasts.append(math.log(mn / mb))
                 lays.append(layouts.get(block, 1))
+            elif diagnostics is not None:
+                diagnostics["nonpositive_blocks"] = diagnostics.get("nonpositive_blocks", 0) + 1
     every_b = [v for vs in b_.values() for v in vs]
     every_n = [v for vs in n_.values() for v in vs]
     return contrasts, lays, (statistics.median(every_b) if every_b else None), \
@@ -513,12 +521,13 @@ def dimension(base: list[list[float]], base_blocks: list, new: list[list[float]]
               floor: float = 0.0) -> dict:
     """One dimension: its block contrasts and the one-sided test of a loss (gatestats.loss_test),
     its spread at least the host's A-A' floor."""
-    contrasts, lays, b, n = block_contrasts(base, base_blocks, new, new_blocks, layouts)
+    diagnostics = {}
+    contrasts, lays, b, n = block_contrasts(base, base_blocks, new, new_blocks, layouts, diagnostics)
     step = COUNTER_STEP[unit] if step is None else step
     r = gatestats.loss_test(contrasts, lays, higher_is_better, resolution=step, scale=b or 0, floor=floor)
     out = {"unit": unit, "higher_is_better": higher_is_better, "base": b, "new": n, "step": step, **r,
            "contrasts": [round(c, 6) for c in contrasts],
-           "ratio": math.exp(r["mean_log"]) if r["mean_log"] is not None else None}
+           "ratio": math.exp(r["mean_log"]) if r["mean_log"] is not None else None, **diagnostics}
     if r["ci"]:
         # The interval of new/base (gatestats tests the worse direction: undo its sign).
         lo, hi = r["ci"]
