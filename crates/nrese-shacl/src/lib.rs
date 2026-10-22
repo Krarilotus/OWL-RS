@@ -28,7 +28,7 @@ mod report;
 mod sparql;
 mod validate;
 
-pub use compile::{ShapeError, compile};
+pub use compile::{CompileError, ShapeError, ShapeErrors, compile};
 pub use graph::Selection;
 pub use incremental::validate_changes;
 pub use model::{Component, SH, Severity, ShapeRef, Shapes};

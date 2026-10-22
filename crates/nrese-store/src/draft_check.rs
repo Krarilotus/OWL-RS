@@ -279,10 +279,7 @@ fn check_shacl(inputs: &DraftInputs, limits: &DraftLimits) -> Checked {
     } = match store.validate_shacl(&ReadScope::All, &request) {
         Ok(validation) => validation,
         Err(StoreError::ShaclShapes(problems)) => {
-            return Err(failed(format!(
-                "invalid SHACL graph: {}",
-                problems.join("; ")
-            )));
+            return Err(failed(format!("invalid SHACL graph: {problems}")));
         }
         Err(error) => return Err(failed(format!("SHACL validation failed: {error}"))),
     };

@@ -53,7 +53,7 @@ fn shapes_selection(snapshot: &Snapshot) -> Selection {
 }
 
 fn compiled(snapshot: &Snapshot) -> Shapes {
-    compile(snapshot, shapes_selection(snapshot)).expect("shapes")
+    compile(snapshot, shapes_selection(snapshot), &Default::default()).expect("shapes")
 }
 
 const DEFAULT: Selection = Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
@@ -98,12 +98,16 @@ fn ill_formed_shapes_are_errors_that_name_the_shape() {
     ] {
         let engine = engine("ex:a ex:p ex:b .", shape);
         let snapshot = engine.snapshot();
-        let errors = compile(&snapshot, shapes_selection(&snapshot)).expect_err(shape);
+        let nrese_shacl::CompileError::Shapes(errors) =
+            compile(&snapshot, shapes_selection(&snapshot), &Default::default()).expect_err(shape)
+        else {
+            panic!("expected malformed shapes");
+        };
         assert!(
             errors.iter().any(|error| error.message.contains(expected)),
             "{shape}: {errors:?}"
         );
-        assert!(!errors[0].shape.is_empty());
+        assert!(!errors.errors()[0].shape.is_empty());
     }
 }
 
@@ -320,13 +324,16 @@ fn path_is_substituted_only_as_a_predicate() {
             ),
         );
         let snapshot = engine.snapshot();
-        match (compile(&snapshot, shapes_selection(&snapshot)), expected) {
+        match (
+            compile(&snapshot, shapes_selection(&snapshot), &Default::default()),
+            expected,
+        ) {
             (Ok(shapes), Ok(results)) => {
                 let report = validate(&snapshot, &shapes, DEFAULT);
                 assert!(report.failures.is_empty(), "{query}: {:?}", report.failures);
                 assert_eq!(report.results.len(), results, "{query}");
             }
-            (Err(errors), Err(problem)) => assert!(
+            (Err(nrese_shacl::CompileError::Shapes(errors)), Err(problem)) => assert!(
                 errors.iter().any(|error| error.message.contains(problem)),
                 "{query}: {errors:?}"
             ),
@@ -401,4 +408,118 @@ fn a_constraints_dataset_is_the_selection_whatever_its_form() {
             assert_eq!(results(selection), 1, "{clause}, {selection:?}");
         }
     }
+}
+
+#[test]
+fn compile_resources_invalid_diagnostics_stay_owned() {
+    let engine = engine("", "ex:S sh:targetNode ex:a ; sh:minCount \"many\" .");
+    let snapshot = engine.snapshot();
+    let memory = nrese_exec::Envelope::new(Some(64 * 1024), None);
+    let resources = nrese_sparql::Resources {
+        memory: memory.clone(),
+        ..Default::default()
+    };
+    let error = compile(&snapshot, shapes_selection(&snapshot), &resources).unwrap_err();
+    let nrese_shacl::CompileError::Shapes(errors) = error else {
+        panic!("malformed shapes");
+    };
+    assert_eq!(errors.errors().len(), 1);
+    assert_eq!(
+        errors.to_string(),
+        "shape <http://example.com/S>: sh:minCount isn't a non-negative integer"
+    );
+    drop(resources);
+    assert!(memory.used() >= errors.errors()[0].message.len());
+    drop(errors);
+    assert_eq!(memory.used(), 0);
+}
+
+#[test]
+fn compile_resources_cancelled_is_typed() {
+    let engine = engine("", "ex:S sh:targetNode ex:a ; sh:minCount 1 .");
+    let snapshot = engine.snapshot();
+    let token = nrese_sparql::CancellationToken::new();
+    token.cancel();
+    let memory = nrese_exec::Envelope::new(Some(64 * 1024), None);
+    let resources = nrese_sparql::Resources {
+        memory: memory.clone(),
+        cancellation: Some(token),
+        ..Default::default()
+    };
+    assert!(matches!(
+        compile(&snapshot, shapes_selection(&snapshot), &resources),
+        Err(nrese_shacl::CompileError::Evaluation(
+            nrese_sparql::QueryEvaluationError::Cancelled
+        ))
+    ));
+    assert_eq!(memory.used(), 0);
+    assert_eq!(memory.peak(), 0);
+}
+
+fn component_product(m: usize, k: usize) -> String {
+    let mut shapes = String::from(
+        "ex:C sh:validator [ sh:ask \"ASK { FILTER(false) }\" ; sh:message \"one message\" ]",
+    );
+    for parameter in 0..k {
+        shapes.push_str(&format!(" ; sh:parameter [ sh:path ex:p{parameter} ]"));
+    }
+    shapes.push_str(" . ex:S sh:targetNode ex:a");
+    for parameter in 0..k {
+        shapes.push_str(&format!(" ; ex:p{parameter} "));
+        for value in 0..m {
+            if value != 0 {
+                shapes.push_str(", ");
+            }
+            shapes.push_str(&value.to_string());
+        }
+    }
+    shapes.push_str(" .");
+    shapes
+}
+
+#[test]
+fn compile_resources_product_is_refused_before_emission() {
+    // 16^4 checks from only 64 input values: refusal is the full product admission.
+    let engine = engine("", &component_product(16, 4));
+    let snapshot = engine.snapshot();
+    let memory = nrese_exec::Envelope::new(Some(64 * 1024), None);
+    let resources = nrese_sparql::Resources {
+        memory: memory.clone(),
+        ..Default::default()
+    };
+    let error = compile(&snapshot, shapes_selection(&snapshot), &resources).unwrap_err();
+    let nrese_shacl::CompileError::Evaluation(nrese_sparql::QueryEvaluationError::MemoryLimit(
+        refused,
+    )) = error
+    else {
+        panic!("expected typed product refusal");
+    };
+    assert!(refused.requested >= 65536 * size_of::<usize>());
+    assert!(memory.peak() < 64 * 1024);
+    assert_eq!(memory.used(), 0);
+}
+
+#[test]
+fn compile_resources_success_holds_product_and_preserves_multiplicity() {
+    let engine = engine("", &component_product(3, 2));
+    let snapshot = engine.snapshot();
+    let memory = nrese_exec::Envelope::new(Some(1024 * 1024), None);
+    let resources = nrese_sparql::Resources {
+        memory: memory.clone(),
+        ..Default::default()
+    };
+    let shapes = compile(&snapshot, shapes_selection(&snapshot), &resources).unwrap();
+    drop(resources);
+    assert!(memory.used() >= 9 * (3 * size_of::<usize>() + 2 * size_of::<TermId>()));
+    let report = validate(&snapshot, &shapes, DEFAULT);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(report.results.len(), 9);
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|r| r.messages.len() == 1 && r.messages[0].value() == "one message")
+    );
+    drop(shapes);
+    assert_eq!(memory.used(), 0);
 }
