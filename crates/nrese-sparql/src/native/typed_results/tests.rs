@@ -106,3 +106,89 @@ fn aligning_zero_column_results_keeps_their_cardinality() {
     assert_eq!(pair.lower().len(), 2);
     assert_eq!(pair.upper().len(), 1);
 }
+
+/// C1's real public composition: unbound SELECT projection, identity alignment,
+/// explicit reserve and appended bag rows. Assert capacity before any append on old code.
+#[test]
+fn projected_unbound_column_is_safe_to_append() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let parser = nrese_sparql_syntax::SparqlParser::new();
+    let lower_query = parser.parse_query("SELECT ?x WHERE {}").unwrap();
+    let upper_query = parser
+        .parse_query("SELECT ?x WHERE { VALUES ?x { 7 7 UNDEF } }")
+        .unwrap();
+    let TypedResults::Solutions(lower) = evaluate(
+        engine.snapshot(),
+        &lower_query,
+        &crate::QueryOptions::default(),
+    )
+    .unwrap() else {
+        panic!("SELECT")
+    };
+    let TypedResults::Solutions(upper) = evaluate(
+        engine.snapshot(),
+        &upper_query,
+        &crate::QueryOptions::default(),
+    )
+    .unwrap() else {
+        panic!("SELECT")
+    };
+    assert_eq!((lower.len(), lower.table.width()), (1, 1));
+    assert_eq!(
+        lower.table.room_left(),
+        0,
+        "unbound projection has finite room before any append"
+    );
+    assert_eq!(lower.row(0), vec![None]);
+    let value = upper.row(0);
+    assert_eq!(value, upper.row(1));
+    assert_eq!(upper.row(2), vec![None]);
+    let actual = |table: &IdTable| table.memory_bytes();
+    assert_eq!(
+        lower.table.memory_bytes(),
+        4 * size_of::<Vec<u64>>() + lower.table.columns()[0].capacity() * 8,
+        "first-column header participates in recharge"
+    );
+    // Existing projection charge_ahead may retain a freed/unused header bound until
+    // alignment settles it. It must still cover the actual first-column allocation.
+    assert!(lower.table.charge() >= actual(&lower.table));
+    let budget = Arc::new(Budget::unlimited());
+    let mut unrelated = Reservation::new(Arc::clone(&budget));
+    unrelated.charge(13).unwrap();
+    let mut pair = lower.align(upper, Arc::clone(&budget)).unwrap();
+    assert_eq!(pair.lower().room_left(), 0);
+    assert_eq!(pair.lower().charge(), actual(pair.lower()));
+    assert_eq!(pair.upper().charge(), actual(pair.upper()));
+    assert_eq!(
+        budget.used(),
+        13 + pair.held.bytes() + pair.lower().charge() + pair.upper().charge()
+    );
+    pair.reserve_appends(3).unwrap();
+    assert_eq!(pair.lower().room_left(), 3);
+    for row in 0..3 {
+        pair.append_upper(row).unwrap();
+    }
+    assert_eq!((pair.lower().len(), pair.upper().len()), (4, 3));
+    assert_eq!(pair.lower().charge(), actual(pair.lower()));
+    assert_eq!(
+        budget.used(),
+        13 + pair.held.bytes() + pair.lower().charge() + pair.upper().charge()
+    );
+    let result = pair.into_lower();
+    assert_eq!(
+        budget.used(),
+        13 + result.table.charge() + result.aligned.as_ref().unwrap().bytes()
+    );
+    let QueryResults::Solutions(rows) = TypedResults::Solutions(result).into_results() else {
+        panic!("solutions")
+    };
+    let rows: Vec<_> = rows.map(|row| row.unwrap().values().to_vec()).collect();
+    assert_eq!(rows, vec![vec![None], value.clone(), value, vec![None]]);
+    assert_eq!(
+        budget.used(),
+        13,
+        "result and alignment release only their actual owners"
+    );
+    drop(unrelated);
+    assert_eq!(budget.used(), 0);
+}

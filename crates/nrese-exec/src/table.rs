@@ -478,11 +478,11 @@ impl IdTable {
     }
 
     /// Appends `row` within the room reserved ([`Self::reserve_rows`]): one check, then the
-    /// values written. Panics past the room.
+    /// values written. Panics past the room or if the row has the wrong width.
     #[inline]
     pub fn push_reserved(&mut self, row: &[u64]) {
         assert!(self.len < self.room, "past the rows reserved");
-        debug_assert_eq!(row.len(), self.width(), "row width");
+        assert_eq!(row.len(), self.width(), "row width");
         for (column, &value) in self.columns.iter_mut().zip(row) {
             // SAFETY: `room` is at most every column's capacity, and every column holds
             // `len` values.
@@ -756,6 +756,10 @@ impl IdTable {
         column.extend(values.into_iter().take(self.len));
         assert_eq!(column.len(), self.len, "push_column: rows differ");
         self.columns.push(column);
+        // The first actual column ends zero-width unlimited room. Subsequent columns
+        // have the existing room; record the actual header for recharge/settlement too.
+        self.room = rows;
+        self.header = self.columns.capacity() * size_of::<Vec<u64>>();
         Ok(())
     }
 
@@ -1117,6 +1121,200 @@ impl IdTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C1: fail on the room assertion before any row write on old code.
+    #[test]
+    fn first_column_changes_zero_width_room() {
+        if !crate::measure::alone() {
+            return;
+        }
+        for rows in [0, 1, 3] {
+            for charged in [false, true] {
+                let budget = Arc::new(Budget::unlimited());
+                let ((), excess) = crate::measure::measure_within(&budget, || {
+                    let mut table = if charged {
+                        let mut table = IdTable::charged(0, 0, &budget).unwrap();
+                        for _ in 0..rows {
+                            table.push_row(&[], &budget).unwrap();
+                        }
+                        table
+                    } else {
+                        IdTable::rows_only(rows)
+                    };
+                    assert_eq!(
+                        (table.len(), table.room, table.charge()),
+                        (rows, usize::MAX, 0)
+                    );
+                    table
+                        .push_column(std::iter::repeat_n(5, rows), &budget)
+                        .unwrap();
+                    assert_eq!(
+                        table.room, rows,
+                        "first column establishes finite room before writes"
+                    );
+                    assert_eq!(table.room_left(), 0);
+                    assert_eq!(table.column(0), &[5; 3][..rows]);
+                    let header = table.columns.capacity() * size_of::<Vec<u64>>();
+                    assert_eq!(
+                        (table.header, table.charge(), table.memory_bytes()),
+                        (header, header + rows * 8, header + rows * 8)
+                    );
+                    table.reserve_rows_exact(1, &budget).unwrap();
+                    table.push_reserved(&[7]);
+                    let pointer = table.columns[0].as_ptr();
+                    let room = table.room;
+                    table
+                        .push_column(std::iter::repeat_n(11, rows + 1), &budget)
+                        .unwrap();
+                    assert_eq!(
+                        (table.room, table.room_left()),
+                        (room, 0),
+                        "subsequent column keeps the bound"
+                    );
+                    assert_eq!(table.columns[0].as_ptr(), pointer);
+                    assert_eq!(table.charge(), header + 2 * room * 8);
+                    assert_eq!(table.charge(), table.memory_bytes());
+                    table.push_row(&[13, 17], &budget).unwrap();
+                    assert_eq!(
+                        (table.len(), table.get(rows, 0), table.get(rows, 1)),
+                        (rows + 2, 7, 11)
+                    );
+                    assert_eq!((table.get(rows + 1, 0), table.get(rows + 1, 1)), (13, 17));
+                    assert_eq!(table.charge(), table.memory_bytes());
+                    drop(table);
+                    assert_eq!((budget.used(), Arc::strong_count(&budget)), (0, 1));
+                });
+                assert_eq!(
+                    excess, 0,
+                    "all owner inputs and tokens are created inside measurement"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn first_column_admission_and_growth_refuse_without_changing_storage() {
+        if !crate::measure::alone() {
+            return;
+        }
+        let header = 4 * size_of::<Vec<u64>>();
+        for rows in [0, 1, 3] {
+            let budget = Arc::new(Budget::new(13 + header + rows * 8 - 1));
+            let mut unrelated = Reservation::new(&*budget);
+            unrelated.charge(13).unwrap();
+            let ((), excess) = crate::measure::measure_within(&budget, || {
+                let mut table = IdTable::rows_only(rows);
+                let error = table
+                    .push_column(std::iter::repeat_n(5, rows), &budget)
+                    .unwrap_err();
+                assert_eq!(
+                    (error.requested, error.used, error.limit, error.shared),
+                    (header + rows * 8, 13, budget.limit(), false)
+                );
+                assert_eq!(
+                    (
+                        table.len(),
+                        table.width(),
+                        table.room,
+                        table.header,
+                        table.charge(),
+                        table.columns.capacity()
+                    ),
+                    (rows, 0, usize::MAX, 0, 0, 0)
+                );
+                assert_eq!((budget.used(), budget.peak()), (13, 13));
+                drop(table);
+            });
+            assert_eq!((excess, budget.used()), (0, 13));
+            drop(unrelated);
+            for refuse in [false, true] {
+                let old = header + rows * 8;
+                let new = (rows + 1) * 8;
+                let limit = 13 + old + new - usize::from(refuse);
+                let budget = Arc::new(Budget::new(limit));
+                let mut unrelated = Reservation::new(&*budget);
+                unrelated.charge(13).unwrap();
+                let ((), excess) = crate::measure::measure_within(&budget, || {
+                    let mut table = IdTable::rows_only(rows);
+                    table
+                        .push_column(std::iter::repeat_n(5, rows), &budget)
+                        .unwrap();
+                    assert_eq!(table.room, rows, "finite before reserve or append");
+                    let pointer = table.columns[0].as_ptr();
+                    let outer = table.columns.as_ptr();
+                    let result = table.reserve_rows_exact(1, &budget);
+                    if refuse {
+                        let error = result.expect_err("new block must fit beside old storage");
+                        assert_eq!(
+                            (error.requested, error.used, error.limit, error.shared),
+                            (new, 13 + old, limit, false)
+                        );
+                        assert_eq!(
+                            (table.len(), table.room, table.room_left(), table.charge()),
+                            (rows, rows, 0, old)
+                        );
+                        assert_eq!(
+                            (table.columns[0].as_ptr(), table.columns[0].capacity()),
+                            (pointer, rows)
+                        );
+                        assert_eq!((budget.used(), budget.peak()), (13 + old, 13 + old));
+                    } else {
+                        result.expect("exact payload headroom, no duplicate header");
+                        assert_eq!(
+                            (table.room, table.room_left(), table.charge()),
+                            (rows + 1, 1, header + new)
+                        );
+                        assert_eq!((budget.used(), budget.peak()), (13 + header + new, limit));
+                        table.push_reserved(&[7]);
+                        assert_eq!((table.len(), table.get(rows, 0)), (rows + 1, 7));
+                    }
+                    assert_eq!(table.columns.as_ptr(), outer);
+                    assert_eq!(&table.column(0)[..rows], &[5; 3][..rows]);
+                    assert_eq!(table.charge(), table.memory_bytes());
+                    drop(table);
+                    assert_eq!((budget.used(), Arc::strong_count(&budget)), (13, 1));
+                });
+                assert_eq!((excess, budget.used()), (0, 13));
+                drop(unrelated);
+            }
+        }
+    }
+
+    /// Parent C2 must be executed in release: old debug_assert would otherwise mask it.
+    /// Reject the malformed first row before any read or subsequent write can observe UB.
+    #[test]
+    fn reserved_row_rejects_wrong_width_before_mutation() {
+        let budget = Arc::new(Budget::unlimited());
+        let mut scalar = IdTable::rows_only(0);
+        scalar.push_reserved(&[]);
+        assert_eq!(
+            (scalar.len(), scalar.width()),
+            (1, 0),
+            "legal zero-width bag"
+        );
+        for row in [&[][..], &[7, 11][..]] {
+            let mut table = IdTable::charged(1, 2, &budget).unwrap();
+            let charge = table.charge();
+            let pointer = table.columns[0].as_ptr();
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| table.push_reserved(row)));
+            assert!(result.is_err(), "wrong-width row rejected before mutation");
+            assert_eq!(
+                (
+                    table.len(),
+                    table.columns[0].len(),
+                    table.room,
+                    table.charge()
+                ),
+                (0, 0, 2, charge)
+            );
+            assert_eq!(table.columns[0].as_ptr(), pointer);
+            table.push_reserved(&[13]);
+            assert_eq!(table.column(0), &[13]);
+            drop(table);
+            assert_eq!(budget.used(), 0);
+        }
+    }
 
     /// Fails on r4: charged(width, 0) and empty from_rows allocate the header but return
     /// Ok without admission; nonempty from_rows exposes that allocation before refusal.
